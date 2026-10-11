@@ -67,7 +67,7 @@ export function previewLines(lines: DiffLine[], max: number): DiffLine[] {
       out.push(...lines.slice(i, i + keep), { kind: "gap", text: "…" });
       i = adds;
     } else {
-      out.push(...lines.slice(i, end));
+      out.push(...lines.slice(i, Math.min(end, i + max - out.length)));
       i = end;
     }
   }

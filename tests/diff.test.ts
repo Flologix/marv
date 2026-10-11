@@ -46,6 +46,13 @@ test("a collapsed preview keeps a change's additions in view: a long removal is 
   expect(previewLines(lines, 2)).toHaveLength(2);
 });
 
+test("a huge removal with nothing after it is cut to the preview, not spread whole into it", () => {
+  // Spreading every removed line into push() overflows the argument limit (a file of a million lines emptied).
+  const lines = Array.from({ length: 1_000_000 }, (_, i) => ({ kind: "del" as const, text: `old ${i + 1}`, oldLine: i + 1 }));
+  expect(previewLines(lines, 24)).toEqual(lines.slice(0, 24));
+  expect(previewLines(lines, MAX_SHOWN_DIFF)).toHaveLength(MAX_SHOWN_DIFF);
+});
+
 test("a big rewrite keeps the new file's start too, and counts what it left out", () => {
   const file = (prefix: string) => Array.from({ length: 500 }, (_, i) => `${prefix} ${i + 1}`).join("\n") + "\n";
   const all = diffText(file("old"), file("new")).lines;
