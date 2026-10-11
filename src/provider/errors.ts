@@ -37,17 +37,28 @@ export async function errorMessage(response: Response): Promise<string> {
   }
 }
 
+/** What a bad key or an unknown model tells the user to change: the TUI's commands, or the SDK's options. */
+export interface ErrorHints {
+  key: string;
+  model: string;
+}
+export const TUI_HINTS: ErrorHints = { key: "Run /setup to enter a new one.", model: "Pick another with /model." };
+export const SDK_HINTS: ErrorHints = {
+  key: "Pass another provider.apiKey to createSession() or configure().",
+  model: "Pass another provider.model to createSession() or configure().",
+};
+
 /** Turns a status code into something the user can act on. */
-export function httpError(status: number, detail: string, label: string, model: string): string {
+export function httpError(status: number, detail: string, label: string, model: string, hints = TUI_HINTS): string {
   const reason = (() => {
     switch (status) {
       case 401:
       case 403:
-        return `${label} rejected the API key. Run /setup to enter a new one.`;
+        return `${label} rejected the API key. ${hints.key}`;
       case 402:
         return `Your ${label} account is out of credits.`;
       case 404:
-        return `Model "${model}" wasn't found on ${label}. Pick another with /model.`;
+        return `Model "${model}" wasn't found on ${label}. ${hints.model}`;
       case 429:
         return `Rate limited by ${label}. Wait a moment and try again.`;
       default:

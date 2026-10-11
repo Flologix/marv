@@ -2,7 +2,7 @@
 // else that speaks POST /chat/completions with streaming). It translates
 // their stream into Marv's AgentEvents, so nothing above this file knows
 // which vendor (or which wire format) is on the other end.
-import { describeError, errorMessage, httpError, unreachable, type ErrorObject } from "./errors.ts";
+import { describeError, errorMessage, httpError, unreachable, type ErrorHints, type ErrorObject } from "./errors.ts";
 import { parseSSE } from "./sse.ts";
 import type { AgentEvent, ChatTurn, Provider, StreamOptions, ToolCall } from "./types.ts";
 
@@ -20,6 +20,8 @@ interface Options {
   body?: Record<string, unknown>;
   /** Appended when the server can't be reached at all. */
   offlineHint?: string;
+  /** What a bad key or an unknown model tells the user to change (default: the TUI's commands). */
+  hints?: ErrorHints;
 }
 
 /** A tool call as it streams in: id and name first, arguments in pieces. */
@@ -115,7 +117,7 @@ export class OpenAICompatProvider implements Provider {
     }
 
     if (!response.ok) {
-      yield { type: "error", message: httpError(response.status, await errorMessage(response), label, model) };
+      yield { type: "error", message: httpError(response.status, await errorMessage(response), label, model, this.options.hints) };
       return;
     }
 

@@ -2,7 +2,7 @@
 // instead of Ollama's OpenAI-compatible endpoint because only the native one
 // lets us set the context window (num_ctx): Ollama's default of 4096 tokens
 // is too small for an agent that reads files.
-import { errorMessage, httpError, unreachable } from "./errors.ts";
+import { errorMessage, httpError, unreachable, type ErrorHints } from "./errors.ts";
 import type { AgentEvent, ChatTurn, Provider, StreamOptions, ToolCall } from "./types.ts";
 
 const LABEL = "Ollama";
@@ -19,6 +19,8 @@ interface Options {
   contextLength: number;
   /** Let thinking models reason first. Off makes them answer directly. */
   thinking: boolean;
+  /** What an unknown model tells the user to change (default: the TUI's commands). */
+  hints?: ErrorHints;
 }
 
 /** One line of Ollama's stream. */
@@ -138,7 +140,7 @@ export class OllamaProvider implements Provider {
       if (response.ok) break;
       const detail = await errorMessage(response);
       if (response.status >= 500 && UNPARSABLE_CALL.test(detail) && attempt < 2 && !signal?.aborted) continue;
-      yield { type: "error", message: httpError(response.status, detail, LABEL, model) };
+      yield { type: "error", message: httpError(response.status, detail, LABEL, model, this.options.hints) };
       return;
     }
 
