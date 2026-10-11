@@ -91,6 +91,11 @@ export type LoopEvent =
   | { type: "empty_reply"; next: "retry" | "nudge" | "stop" }
   /** A reply hit the output limit: nothing in it ran. `continued`: the model was told and goes on (once per run). */
   | { type: "cut_off"; continued: boolean }
+  /**
+   * A mid-run compaction swapped the history for the summary (the session's `onFull`): the next request starts
+   * from the summary. Nothing was lost — the transcript isn't the history — but the client may want to say so.
+   */
+  | { type: "compacted" }
   | { type: "done"; reason: "end" | "length" | "aborted" | "declined" | "max_steps" | "error" };
 
 interface Options {
@@ -116,6 +121,12 @@ interface Options {
    * from Marv before the next request (like CUT_OFF_NOTE), or null. Never rejects. The session's typecheck uses it (src/diagnostics).
    */
   afterStep?: (results: ToolResult[]) => Promise<string | null>;
+  /**
+   * Checked after a step's tool calls are all answered, before `afterStep`: true when the context is nearly full
+   * and the history was just compacted (the next request starts from the summary), false otherwise. Never
+   * rejects. The session's automatic compaction uses it (src/session.ts).
+   */
+  onFull?: () => Promise<boolean>;
 }
 
 /**
@@ -249,6 +260,7 @@ export async function* runAgent({
   isParallel = () => false,
   maxParallel = MAX_PARALLEL,
   afterStep,
+  onFull,
 }: Options): AsyncGenerator<LoopEvent> {
   // Ids already in the conversation (a resumed session's too): a new call may not reuse one.
   const usedIds = new Set(history.flatMap((turn) => (turn.role === "assistant" ? (turn.toolCalls ?? []).map((c) => c.id) : [])));
@@ -427,6 +439,16 @@ export async function* runAgent({
     if (declined) {
       yield { type: "done", reason: "declined" };
       return;
+    }
+    // A long turn can fill the context by itself: compaction can't wait for the next user message. If it
+    // compacted, the history was swapped under this loop for the summary plus a "continue" note (a fresh,
+    // valid history), and the next request simply starts from it.
+    if (onFull && (await onFull())) {
+      yield { type: "compacted" };
+      if (signal.aborted) {
+        yield { type: "done", reason: "aborted" };
+        return;
+      }
     }
     if (afterStep) {
       const note = await afterStep(stepResults);

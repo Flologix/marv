@@ -9,7 +9,7 @@
 // keeps the provider's prompt cache hitting (see CLAUDE.md, "Prompt cache").
 import { agentArgs, answerAllCalls, DEFAULT_MAX_STEPS, runAgent, type LoopEvent } from "./agent.ts";
 import { GENERAL_PURPOSE, type AgentType } from "./agents.ts";
-import { COMPACT_AT, compactedHistory, summarize } from "./compact.ts";
+import { COMPACT_AT, compactedHistory, MID_TURN_NOTE, summarize } from "./compact.ts";
 import { diagnosticsNote } from "./diagnostics/tsc.ts";
 import { Diagnostics, type CheckResult } from "./diagnostics/turn.ts";
 import { EventQueue } from "./event-queue.ts";
@@ -227,6 +227,11 @@ export class MarvSession implements Session {
   private saved: SavedSession;
   private totals: Totals = emptyTotals();
   private last: Usage | undefined;
+  /**
+   * A mid-turn summary already failed this turn: don't ask for another one between later steps (each would be
+   * another paid request likely failing the same way). Reset when the turn ends; the next turn tries again.
+   */
+  private midTurnCompactFailed = false;
   /** "Yes, don't ask again" scopes, shared by the main agent and its subagents. */
   private readonly always = new Set<string>();
   /** Stops what's running (a turn or a compaction); null when idle. */
@@ -577,6 +582,39 @@ export class MarvSession implements Session {
     return Boolean(context && this.last && this.last.promptTokens + this.last.completionTokens >= context * COMPACT_AT);
   }
 
+  /** Whether compaction should be tried at all now: nearly full, and no mid-turn summary has failed this turn. */
+  private tryCompact(): boolean {
+    return this.nearlyFull() && !this.midTurnCompactFailed;
+  }
+
+  /**
+   * Whether the context is nearly full; when it is, summarizes the conversation and continues from the summary,
+   * right where the turn is (also between steps: a long turn can fill the window by itself). Emits nothing: the
+   * caller emits the status and the compaction event around it, so the App shows one notice per compaction.
+   */
+  private async compactIfFull(
+    provider: Provider,
+    factory: ProviderFactory,
+    info: ModelInfo | undefined,
+    stop: AbortController,
+    /** Between two steps of a turn (not before a user message): the summary then needs a "continue" note after it. */
+    midTurn: boolean,
+  ): Promise<CompactResult> {
+    if (!this.tryCompact()) return { compacted: false, reason: "empty", error: "The context isn't nearly full." };
+    const result = await this.summarizeInto(undefined, stop.signal, provider, factory, info);
+    if (result.compacted && midTurn) {
+      // The compacted history ends with the model's own "Got it", so mid-turn the next request needs an
+      // instruction to go on: it follows the summary here, before the loop's next request. Before a user message,
+      // that message is the instruction.
+      this.conversation.push({ role: "user", text: MID_TURN_NOTE });
+    } else if (!result.compacted) {
+      // A summary that failed isn't tried again within the turn: the next step would ask for the same expensive
+      // summary that just failed. The next turn (a new user message) tries again, as before.
+      this.midTurnCompactFailed = true;
+    }
+    return result;
+  }
+
   /** Summarizes the conversation and continues from the summary (src/compact.ts). Only what the model sees changes. */
   private async summarizeInto(
     focus: string | undefined,
@@ -598,7 +636,9 @@ export class MarvSession implements Session {
       onUsage: (usage) => this.count(usage, factory, info),
     });
     if ("error" in result) return { compacted: false, reason: signal.aborted ? "stopped" : "failed", error: result.error };
-    this.conversation = compactedHistory(result.summary);
+    // In place: runAgent holds this very array for the whole turn, so a compaction between its steps must
+    // rewrite it where it stands — replacing this.conversation would leave the loop on the full history.
+    this.conversation.splice(0, this.conversation.length, ...compactedHistory(result.summary));
     // From here the model sees the summary, not the turns before it: the trajectory needs it to say what the model saw.
     // The turn it follows only if that turn is in this file (after resume(), the last turn was in another one).
     const log = this.trajectory();
@@ -754,9 +794,9 @@ export class MarvSession implements Session {
       main = new AgentRecorder(record, { turn, agent: "main" });
 
       // Nearly out of context: summarize first, so this message (and what follows) fits.
-      if (this.nearlyFull()) {
+      if (this.tryCompact()) {
         emit({ type: "status", status: "compacting" });
-        const result = await this.summarizeInto(undefined, stop.signal, provider, factory, info);
+        const result = await this.compactIfFull(provider, factory, info, stop, false);
         emit({ type: "compaction", result });
         if (!result.compacted && result.reason === "stopped") {
           // Stopping meant "stop": the message too (it would run on the nearly full context).
@@ -834,6 +874,18 @@ export class MarvSession implements Session {
         isParallel: isParallelCall,
         maxSteps: this.init.maxSteps,
         afterStep: checks?.afterStep,
+        // A long turn can fill the window by itself: check between steps, and compact there too. The events say
+        // when ("Compacting the conversation…") and how it went, and the loop goes on from the summary.
+        onFull: async () => {
+          if (!this.tryCompact()) return false;
+          emit({ type: "status", status: "compacting" });
+          const result = await this.compactIfFull(provider, factory, info, stop, true);
+          emit({ type: "compaction", result });
+          if (result.compacted) return true;
+          // Esc during the summary meant "stop the turn", not "keep going on the old context".
+          if (result.reason === "stopped") stop.abort();
+          return false;
+        },
         // At the step limit, ask instead of stopping dead; with no one to ask, it stops there.
         onLimit: approve && (async (steps) => (await approve(stepLimitRequest(steps, this.init.maxSteps ?? DEFAULT_MAX_STEPS))) !== "no"),
       })) {
@@ -880,6 +932,7 @@ export class MarvSession implements Session {
       emit({ type: "error", message: `Error: ${err instanceof Error ? err.message : String(err)}` });
       reason = "error";
     } finally {
+      this.midTurnCompactFailed = false; // the next turn tries compaction again
       for (const sub of subRecorders.values()) sub.finish("interrupted");
       main?.finish("error"); // only if the loop threw: otherwise its done already ended the turn
       // Stop anything still running (a no-op after a normal end): subagents still running in a parallel group
