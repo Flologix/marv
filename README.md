@@ -22,7 +22,7 @@ Marv is written in TypeScript on [Bun](https://bun.sh), with an [Ink](https://gi
 - **Long conversations.** When the context window fills up, Marv summarizes the conversation and carries on (`/compact` does it on demand). Requests reuse the provider's prompt cache wherever possible.
 - **Trajectories and feedback.** Every turn is logged step by step (requests, replies, tool calls, subagents, timings, tokens) to `~/.marv/trajectories/`, with your ratings: `/good`, `/bad`, `/label`, and what your next message implies ("thanks, perfect" or "that's wrong"). `bun run stats` sums them up per model or Marv version, so you can measure whether a change made runs better.
 - **Type errors caught early.** After Marv changes files in a TypeScript project, it runs the project's own typecheck in the sandbox and tells the model about errors the change added, even in files it didn't touch (a project here means a `tsconfig.json` in the folder Marv starts in plus the project's own `typescript` or tsgo in that folder's `node_modules`; a global tsc isn't used), so it fixes broken callers before saying it's done. `/diagnostics off` turns it off.
-- **No dead stops.** After 25 steps without finishing, Marv asks whether to keep going instead of giving up.
+- **No dead stops.** After 25 steps without finishing, Marv asks whether to keep going instead of giving up. Raise the interval with `/steps 40` (or `maxSteps` in the config), or turn the asking off with `/steps off` — like Claude Code and Codex, a long run then just keeps going (subagents still stop at their own 50).
 - **Cost tracking.** OpenRouter's actual charge per request, plus context and cache use, in the status bar; `/cost` for the breakdown.
 - **Herdr aware.** Run Marv in a [Herdr](https://herdr.dev) pane and Herdr's sidebar shows whether it's working, waiting for your approval, or done, with nothing to set up.
 - **A comfortable TUI.** Streaming Markdown replies, mouse-wheel scrolling, drag-to-copy with auto-scroll, a `/` command menu, and Esc to interrupt.
@@ -93,6 +93,7 @@ Type what you want in plain language, for example:
 | `/label` | Tag the last turn (`/label refactor, tests`) |
 | `/mcp` | Show MCP servers and their tools; `/mcp trust` starts the project's |
 | `/diagnostics` | Show or set the typecheck after edits (`/diagnostics on`, `/diagnostics off`) |
+| `/steps` | Show or set the step limit (`/steps 40`, `/steps off` never asks) |
 | `/trajectories` | Show or set run logging (`/trajectories on`, `/trajectories off`) |
 | `/clear` | Start a fresh conversation (the old one stays saved) |
 | `/exit` | Quit |
@@ -188,10 +189,11 @@ Put it in `.marv/agents/<name>.md` (this project) or `~/.marv/agents/<name>.md` 
 |---|---|
 | `OPENROUTER_API_KEY` | Overrides the saved OpenRouter key |
 | `MARV_MODEL` | Overrides the saved model |
+| `MARV_MAX_STEPS` | Overrides the saved step limit (`0` or `off` never asks; `/steps`) |
 | `OLLAMA_HOST` | Where Ollama runs (default `localhost:11434`) |
 | `MARV_CONFIG_DIR` | Use a different folder instead of `~/.marv` |
 
-Ollama's context window defaults to 32k tokens (`contextLength` in the config file). That is large enough for an agent to read code, and fits in 12 GB of VRAM for 9-12B models.
+Ollama's context window defaults to 32k tokens (`contextLength` in the config file). That is large enough for an agent to read code, and fits in 12 GB of VRAM for 9-12B models. Marv never sets it past what the model was trained for (`/api/show`'s context length), so a model trained on 8k isn't run at 32k; the config value is only ever the upper bound.
 
 ## Using Marv from code
 
@@ -248,6 +250,8 @@ await session.close();
   you pass. `persist: true` saves the conversation where `marv -r` finds it, and `resume: id | "latest"` (with
   `persist`) continues one; `trajectories: true` logs every turn. `diagnostics` (on by default) typechecks
   TypeScript projects after the model's file changes and tells it about new errors; it needs the sandbox.
+  `maxSteps` (default 25) sets how many steps a turn runs before it stops or asks; `0` never asks or stops the
+  main agent (subagents keep their own limit).
 - **MCP servers in code:** `mcpServers: { name: { command, args } }` (`.mcp.json`'s format). These are trusted like
   your own: no trust prompt, started in your home folder (use an absolute path, or `${MARV_PROJECT_DIR}` for
   the project). So never pass config read from a repository you don't control; `sources: ["project"]` is the
@@ -256,9 +260,9 @@ await session.close();
   main agent (not to subagents). `input` must be a zod 4 schema (it's described to the model with
   `z.toJSONSchema`). A name of a built-in tool, one used twice, or one starting with `mcp__` (MCP servers'
   tools) makes `createSession` throw. A Provider of your own is used for everything, subagents included.
-- **Settings between turns.** `configure({ provider, thinking, sandbox, yolo, trajectories, diagnostics })`: a turn reads its settings
+- **Settings between turns.** `configure({ provider, thinking, sandbox, yolo, trajectories, diagnostics, maxSteps })`: a turn reads its settings
   when it starts, so a change during one applies from the next. It throws only for an invalid provider (an
-  unknown `kind`) or for turning yolo on in the home folder, and then nothing changed. `close()` stops what's running, waits for it, saves, and stops
+  unknown `kind`), a `maxSteps` that isn't a whole number of at least 0, or for turning yolo on in the home folder, and then nothing changed. `close()` stops what's running, waits for it, saves, and stops
   the MCP servers the session started; `send()` throws after it.
 - **Files.** `configDir` (default `~/.marv`) moves config, memory, `mcp.json`, sessions, trajectories,
   worktrees and MCP trust; personal skills and agents are still read from `~/.marv` in your home folder, as

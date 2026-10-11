@@ -4,7 +4,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { bash, formatOutput, looksLikeNetworkFailure, runCommand, touchesHiddenHome } from "../src/tools/bash.ts";
-import { sandboxArgs, sandboxAvailable } from "../src/sandbox.ts";
+import { hiddenPathFolders, sandboxArgs, sandboxAvailable } from "../src/sandbox.ts";
 
 describe("sandboxArgs", () => {
   const base = { root: "/home/me/proj", home: "/home/me", path: "/usr/bin", exists: (p: string) => p.endsWith(".bun") };
@@ -119,6 +119,24 @@ describe("sandboxArgs", () => {
     const args = sandboxArgs({ ...base, network: false, exists: (p) => p.endsWith(".marv/skills") }).join(" ");
     expect(args).toContain("--ro-bind /home/me/.marv/skills /home/me/.marv/skills");
     expect(args).not.toContain("/home/me/.marv /home/me/.marv");
+  });
+
+  test("mise's and asdf's tool folders are mounted when they exist (node from mise must run in the sandbox)", () => {
+    const args = sandboxArgs({ ...base, network: false, exists: (p) => p.endsWith(".local/share/mise") || p.endsWith(".asdf") }).join(" ");
+    expect(args).toContain("--ro-bind /home/me/.local/share/mise /home/me/.local/share/mise");
+    expect(args).toContain("--ro-bind /home/me/.asdf /home/me/.asdf");
+  });
+
+  test("hiddenPathFolders: PATH folders under the home folder the sandbox doesn't mount, and not those it does", () => {
+    // mise's installs, asdf's shims and .bun's bin are mounted now (TOOLCHAINS); rbenv's and a private tools
+    // folder aren't, and a missing folder has nothing to miss.
+    const path = "/home/me/.rbenv/shims:/home/me/.local/share/mise/installs/node/26.8.2/bin:/home/me/.asdf/shims:/home/me/.bun/bin:/home/me/.tools/bin:/usr/bin:/home/me/gone/bin";
+    expect(hiddenPathFolders(path, "/home/me", undefined, (p) => !p.includes("gone"))).toEqual(["/home/me/.rbenv/shims", "/home/me/.tools/bin"]);
+    expect(hiddenPathFolders("/usr/bin:/bin", "/home/me", undefined, () => true)).toEqual([]);
+    // Not absolute, or inside a toolchain folder the sandbox shows: nothing hidden.
+    expect(hiddenPathFolders("relative/bin:/home/me/.bun/bin/node", "/home/me", undefined, () => true)).toEqual([]);
+    // The project is mounted: its own bin folders (node_modules/.bin, bin/) aren't hidden.
+    expect(hiddenPathFolders("/home/me/app/node_modules/.bin:/home/me/app/bin:/home/me/.tools/bin", "/home/me", "/home/me/app", () => true)).toEqual(["/home/me/.tools/bin"]);
   });
 
   test("network can be allowed per command", () => {
@@ -313,8 +331,8 @@ describe("runCommand", () => {
         symlinkSync(elsewhere, join(root, "link"));
         const result = await run("echo never", { sandbox: true, readOnly: [join(root, "link")] });
         expect(result.exitCode).not.toBe(0);
+        // bwrap's own message, whatever its version words it (0.12: "...symlink"; Ubuntu 24.04's: "No such file or directory").
         expect(result.output).toStartWith("[sandbox failed to start: bwrap: ");
-        expect(result.output).toContain("symlink");
       } finally {
         await rm(elsewhere, { recursive: true, force: true });
       }
@@ -323,6 +341,28 @@ describe("runCommand", () => {
     test("has no network unless asked", async () => {
       const offline = await sandboxed("bun -e 'await fetch(\"http://1.1.1.1\", { signal: AbortSignal.timeout(2000) })' 2>&1; echo exit=$?");
       expect(offline.output).toMatch(/exit=[1-9]/);
+    });
+
+    test("a tool installed by mise or asdf runs (a fake home with node in both)", async () => {
+      const home = join(root, "home");
+      const miseBin = join(home, ".local/share/mise/installs/node/26.8.2/bin");
+      const asdfShims = join(home, ".asdf/shims");
+      for (const dir of [miseBin, asdfShims]) {
+        mkdirSync(dir, { recursive: true });
+        // `#!/usr/bin/env node` launchers (like node_modules/.bin/tsc) need node resolvable by name.
+        await writeFile(join(dir, "node"), "#!/bin/sh\necho mise-asdf-node ok", { mode: 0o755 });
+      }
+      const project = join(root, "project");
+      mkdirSync(project);
+      // runCommand takes the sandbox PATH from process.env.PATH; a fake home's folders only help if they're on it.
+      const realPath = process.env.PATH;
+      process.env.PATH = `${asdfShims}:${miseBin}:${process.env.PATH ?? "/usr/bin"}`;
+      try {
+        const result = await run("node", { sandbox: true, root: project, home });
+        expect(result.output).toContain("mise-asdf-node ok");
+      } finally {
+        process.env.PATH = realPath;
+      }
     });
   });
 });

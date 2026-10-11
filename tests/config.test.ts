@@ -44,12 +44,36 @@ describe("resolveConfig", () => {
   const file = { provider: "openrouter" as const, model: "z-ai/glm-5.3", apiKey: "sk-from-file" };
 
   test("uses the file and the preset endpoint when no env vars are set", () => {
-    expect(resolveConfig(file, {})).toEqual({ ...file, baseUrl: PRESETS.openrouter.baseUrl, apiKeySource: "file", thinking: false, contextLength: 32768, sandbox: true, yolo: true, trajectories: true, diagnostics: true });
+    expect(resolveConfig(file, {})).toEqual({ ...file, baseUrl: PRESETS.openrouter.baseUrl, apiKeySource: "file", thinking: false, contextLength: 32768, sandbox: true, yolo: true, trajectories: true, diagnostics: true, maxSteps: 25 });
   });
 
   test("diagnostics: on unless the file turns it off", () => {
     expect(resolveConfig(file, {}).diagnostics).toBe(true);
     expect(resolveConfig({ ...file, diagnostics: false }, {}).diagnostics).toBe(false);
+  });
+
+  test("maxSteps: the default is 25, the file sets the interval, 0 and \"off\" never ask", () => {
+    expect(resolveConfig(file, {}).maxSteps).toBe(25);
+    expect(resolveConfig({ ...file, maxSteps: 40 }, {}).maxSteps).toBe(40);
+    expect(resolveConfig({ ...file, maxSteps: 0 }, {}).maxSteps).toBe(0);
+    expect(resolveConfig({ ...file, maxSteps: "off" }, {}).maxSteps).toBe(0);
+  });
+
+  test("a maxSteps that isn't 0, off, or a whole number is rejected", async () => {
+    await mkdir(join(dir, "nested"), { recursive: true });
+    for (const maxSteps of [-1, 2.5, "sometimes", 1]) {
+      await writeFile(store.path, JSON.stringify({ provider: "openrouter", maxSteps }));
+      await expect(store.load()).rejects.toBeInstanceOf(ConfigError);
+    }
+  });
+
+  test("MARV_MAX_STEPS overrides the file, like MARV_MODEL; an unusable value is ignored", () => {
+    expect(resolveConfig(file, { MARV_MAX_STEPS: "50" }).maxSteps).toBe(50);
+    expect(resolveConfig({ ...file, maxSteps: 40 }, { MARV_MAX_STEPS: "0" }).maxSteps).toBe(0);
+    expect(resolveConfig(file, { MARV_MAX_STEPS: "OFF" }).maxSteps).toBe(0);
+    for (const junk of ["junk", "-5", "2.5", "1", ""]) {
+      expect(resolveConfig({ ...file, maxSteps: 40 }, { MARV_MAX_STEPS: junk }).maxSteps).toBe(40);
+    }
   });
 
   test("yolo mode is on unless the file turns it off", () => {

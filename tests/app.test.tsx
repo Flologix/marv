@@ -15,6 +15,7 @@ import type { ModelInfo } from "../src/provider/models.ts";
 import { SessionStore } from "../src/sessions.ts";
 import { loadMemory, memoryPaths, type MemoryPaths } from "../src/memory.ts";
 import { GENERAL_PURPOSE } from "../src/agents.ts";
+import { SUBAGENT_MAX_STEPS } from "../src/subagent.ts";
 import { projectKey } from "../src/paths.ts";
 import { TrajectoryStore } from "../src/trajectory.ts";
 import { McpManager } from "../src/mcp/manager.ts";
@@ -69,6 +70,7 @@ function renderApp(
   instructions?: string,
   skills: Skill[] = [],
   skillProblems: string[] = [],
+  hiddenPathFolders: string[] = [],
 ) {
   return render(
     <App
@@ -81,6 +83,7 @@ function renderApp(
       instructions={instructions}
       skills={skills}
       skillProblems={skillProblems}
+      hiddenPathFolders={hiddenPathFolders}
       splashMs={splashMs}
       makeProvider={makeProvider}
       copy={copy}
@@ -498,7 +501,7 @@ describe("App", () => {
 
     describe("at the step limit", () => {
       const reads = (n: number) =>
-        Array.from({ length: n }, (_, i) => [{ type: "tool_call", call: { id: `r${i}`, name: "read_file", arguments: '{"path":"notes.txt"}' } }, { type: "done" }] as AgentEvent[]);
+        Array.from({ length: n }, (_, i) => [{ type: "tool_call", call: { id: `r${i}`, name: "read_file", arguments: `{"path":"notes-${i}.txt"}` } }, { type: "done" }] as AgentEvent[]);
 
       test("it asks to keep going instead of stopping, and yes carries on", async () => {
         const model = new ScriptedProvider([...reads(25), reply("Finally done.")]);
@@ -526,6 +529,55 @@ describe("App", () => {
         expect(lastFrame()).toContain('Stopped at 25 steps, as you asked. Say "continue" to pick up where it left off.');
         expect(model.requests).toHaveLength(25);
       });
+
+      test("/steps off saves the config, and the run then goes past 25 steps without asking", async () => {
+        const model = new ScriptedProvider([...reads(30), reply("Finally done.")]);
+        const { lastFrame, stdin } = renderApp(LOCAL, 0, undefined, () => model);
+        await type(stdin, "/steps off");
+        await tick(100);
+        expect(await store.load()).toEqual({ ...LOCAL, maxSteps: 0 });
+        expect(lastFrame()).toContain("never asks");
+        await type(stdin, "read it a lot");
+        await until(() => lastFrame()!.includes("Finally done."));
+        expect(lastFrame()).not.toContain("Keep going?");
+        expect(model.requests).toHaveLength(31);
+        await type(stdin, "/steps");
+        await tick();
+        expect(lastFrame()).toContain("never asks");
+      });
+
+      test("/steps 40 moves the limit to 40 and saves it", async () => {
+        const model = new ScriptedProvider([...reads(40), reply("Finally done.")]);
+        const { lastFrame, stdin } = renderApp(LOCAL, 0, undefined, () => model);
+        await type(stdin, "/steps 40");
+        await tick(100);
+        expect(await store.load()).toEqual({ ...LOCAL, maxSteps: 40 });
+        expect(lastFrame()).toContain("Keep going? after 40 steps");
+        await type(stdin, "read it a lot");
+        await until(() => lastFrame()!.includes("Keep going? Marv has taken 40 steps"));
+        expect(model.requests).toHaveLength(40); // waiting: nothing more is sent until the answer
+        stdin.write(ENTER); // yes
+        await tick(150);
+        expect(lastFrame()).toContain("Finally done.");
+        expect(model.requests).toHaveLength(41);
+      });
+
+      test("/steps with a bad argument says so and changes nothing", async () => {
+        const { lastFrame, stdin } = renderApp(LOCAL, 0, undefined, () => new FakeProvider());
+        await type(stdin, "/steps maybe");
+        await tick(100);
+        expect(lastFrame()).toContain("Usage: /steps");
+      });
+    });
+
+    test("a reply stuck repeating itself is stopped with a notice, and the model goes on (review, #42)", async () => {
+      const looping: AgentEvent[] = [{ type: "text_delta", text: "Fix the test scripts now. ".repeat(60) }, { type: "done" }];
+      const model = new ScriptedProvider([looping, [{ type: "text_delta", text: "Trying another way." }, { type: "done" }]]);
+      const { lastFrame, stdin } = renderApp(LOCAL, 0, undefined, () => model);
+      await type(stdin, "go");
+      await until(() => lastFrame()!.includes("Trying another way."));
+      expect(lastFrame()).toContain("stuck repeating itself");
+      expect(lastFrame()).not.toContain("Fix the test scripts now. Fix the test scripts now.");
     });
 
     test("a change waits for approval, then runs and the model carries on", async () => {
@@ -710,6 +762,14 @@ describe("App", () => {
       const { lastFrame } = renderApp(LOCAL, 0, undefined, undefined, undefined, [], [".marv/skills/x/SKILL.md needs a description"]);
       await tick();
       expect(lastFrame()).toContain("1 skill couldn't be loaded (see /skills)");
+    });
+
+    test("PATH folders the sandbox hides are reported at startup", async () => {
+      const { lastFrame } = renderApp(LOCAL, 0, undefined, undefined, undefined, [], [], ["~/.local/share/mise/installs/node/26.8.2/bin"]);
+      await tick();
+      expect(lastFrame()).toContain("Your PATH has 1 folder the sandbox can't see");
+      expect(lastFrame()).toContain("~/.local/share/mise/installs/node/26.8.2/bin");
+      expect(lastFrame()).toContain("tsc and other node_modules scripts may not run");
     });
   });
 
@@ -1535,7 +1595,7 @@ describe("subagents", () => {
   test("if the loop fails mid-run, its entries end and a subagent still running can't bring the run back", async () => {
     const real = agentModule.runAgent;
     const spy = spyOn(agentModule, "runAgent").mockImplementation(async function* (options) {
-      if (options.maxSteps) return yield* real(options); // a subagent: the real loop
+      if (options.maxSteps === SUBAGENT_MAX_STEPS) return yield* real(options); // a subagent: the real loop
       const call = { id: "a1", name: "agent", arguments: JSON.stringify({ description: "write", prompt: "write one.txt" }) };
       yield { type: "tool_start", call, label: "general-purpose · write" };
       void options.runTool(call);

@@ -53,7 +53,9 @@ export type AgentEvent =
   | { type: "usage"; usage: Usage }
   /** `reason` is the vendor's stop reason, e.g. "stop", "tool_calls", "length". */
   | { type: "done"; reason?: string }
-  | { type: "error"; message: string };
+  | { type: "error"; message: string }
+  /** The provider is retrying after a dropped connection; `message` is shown in the status line. */
+  | { type: "retry"; attempt: number; max: number; message: string };
 
 export interface StreamOptions {
   /** Instructions sent ahead of the conversation ("You are Marv…"). */

@@ -26,7 +26,7 @@ const say = (text: string): AgentEvent[] => [
 ];
 const useTools = (...calls: ToolCall[]): AgentEvent[] => [...calls.map((c) => ({ type: "tool_call" as const, call: c })), { type: "done", reason: "tool_calls" }];
 const call = (id: string, name: string, args: Record<string, unknown>): ToolCall => ({ id, name, arguments: JSON.stringify(args) });
-const read = (id: string) => call(id, "read_file", { path: "notes.txt" });
+const read = (id: string) => call(id, "read_file", { path: id });
 const fixed = (provider: Provider, extra: Partial<ProviderFactory> = {}): ProviderFactory => ({ id: "test", model: "test-model", make: () => provider, ...extra });
 
 async function collect(events: AsyncIterable<SessionEvent>): Promise<SessionEvent[]> {
@@ -228,7 +228,33 @@ describe("approvals", () => {
   });
 
   test("a maxSteps that isn't a positive whole number throws", () => {
-    for (const maxSteps of [0, -1, 2.5, Number.NaN]) expect(() => makeSession(new ScriptedProvider([]), { maxSteps })).toThrow(/maxSteps/);
+    for (const maxSteps of [-1, 2.5, Number.NaN]) expect(() => makeSession(new ScriptedProvider([]), { maxSteps })).toThrow(/maxSteps/);
+  });
+
+  test("maxSteps 0 turns the asking off (the subagents' hard limit stays)", () => {
+    expect(() => makeSession(new ScriptedProvider([]), { maxSteps: 0 })).not.toThrow();
+  });
+
+  test("maxSteps 0 (off) runs past the default 25 without asking, even with an approver", async () => {
+    const provider = new ScriptedProvider([...Array.from({ length: 30 }, (_, i) => useTools(read(`c${i}`))), say("Finally done.")]);
+    const asked: ApprovalRequest[] = [];
+    const events = await collect(
+      makeSession(provider, { maxSteps: 0, approve: async (r) => (asked.push(r), "no") }).send("loop"),
+    );
+    expect(provider.requests).toHaveLength(31); // 30 tool steps, then the plain answer
+    expect(asked).toEqual([]);
+    expect(events.filter((e) => e.type === "step_limit")).toEqual([]);
+    expect(events).toContainEqual({ type: "done", reason: "end" });
+  });
+
+  test("configure({ maxSteps }) moves the limit from the next turn on", async () => {
+    const provider = new ScriptedProvider(Array.from({ length: 30 }, (_, i) => useTools(read(`c${i}`))));
+    const session = makeSession(provider);
+    await collect(session.send("first")); // stops at the default 25
+    session.configure({ maxSteps: 0 });
+    const events = await collect(session.send("loop"));
+    expect(events).toContainEqual({ type: "done", reason: "end" });
+    await session.close();
   });
 
   test("with an approver it asks at the step limit, in the continue scope", async () => {
@@ -289,6 +315,8 @@ describe("compaction", () => {
     const after = provider.requests[2]!.history;
     expect(after[0]!.text).toContain("SUMMARY of it all");
     expect(after.at(-1)).toEqual({ role: "user", text: "second" });
+    // Before a message, the message itself says what to do next: no mid-turn "continue" note in between.
+    expect(after.map((turn) => turn.role)).toEqual(["user", "assistant", "user"]);
   });
 
   test("stopping the compaction stops the turn, and the message isn't sent", async () => {
@@ -321,6 +349,65 @@ describe("compaction", () => {
     expect(provider.requests[1]!.history.at(-1)!.text).toContain("Focus especially on: the plan");
     await collect(session.send("next"));
     expect(provider.requests[2]!.history[0]!.text).toContain("THE SUMMARY");
+  });
+
+  test("a long turn compacts between steps, and continues from the summary", async () => {
+    const provider = new ScriptedProvider([[used(900), ...useTools(read("c1"))], say("SUMMARY of it all"), say("Finished.")], 1000);
+    const session = makeSession(provider);
+    const events = await collect(session.send("first"));
+    expect(events.filter((e) => e.type === "status" && e.status === "compacting")).toHaveLength(1);
+    expect(events).toContainEqual({ type: "compacted" });
+    expect(events).toContainEqual({ type: "compaction", result: { compacted: true, summary: "SUMMARY of it all", tokensBefore: 900 } });
+    expect(events.at(-1)).toMatchObject({ type: "turn_end", reason: "end" });
+    // The summary request carried the whole conversation, tool result included.
+    const summaryRequest = provider.requests[1]!.history;
+    expect(summaryRequest.at(-1)!.text).toContain("Summarize our conversation");
+    expect(summaryRequest.at(-2)!.role).toBe("tool");
+    // The next request starts from the summary: the conversation was swapped under the loop.
+    const after = provider.requests[2]!.history;
+    expect(after.map((t) => t.role)).toEqual(["user", "assistant", "user"]);
+    expect(after[0]!.text).toContain("SUMMARY of it all");
+    // The compacted history ends with the model's own "Got it.", so Marv's note to go on comes last:
+    // the next request must not end with an assistant turn.
+    expect(after.at(-1)!.text).toContain("Continue where you left off");
+    expect(answerProblems(after)).toEqual([]);
+  });
+
+  test("a failed mid-turn compaction leaves the history as it was, and the turn goes on", async () => {
+    const provider = new ScriptedProvider([[used(900), ...useTools(read("c1"))], [{ type: "error", message: "summary failed" }], [used(900), ...useTools(read("c2"))], say("Finished.")], 1000);
+    const session = makeSession(provider);
+    const events = await collect(session.send("first"));
+    expect(events).toContainEqual({ type: "compaction", result: { compacted: false, reason: "failed", error: "summary failed" } });
+    expect(events).toContainEqual({ type: "assistant", text: "Finished." });
+    expect(events.at(-1)).toMatchObject({ type: "turn_end", reason: "end" });
+    expect(provider.requests[2]!.history.at(-1)!.role).toBe("tool"); // not replaced by the summary
+    expect(answerProblems(provider.requests[2]!.history)).toEqual([]);
+    // Still nearly full after the next step, but the failed summary isn't tried again within the turn:
+    // every retry would be another paid request that likely fails the same way.
+    expect(events.filter((e) => e.type === "status" && e.status === "compacting")).toHaveLength(1);
+    const summaryRequests = provider.requests.filter((r) => (r.history.at(-1)?.text ?? "").startsWith("Summarize our conversation"));
+    expect(summaryRequests).toHaveLength(1);
+  });
+
+  test("stopping a mid-turn compaction stops the turn", async () => {
+    const first = new ScriptedProvider([[used(900), ...useTools(read("c1"))]]);
+    const hanging = new Hanging();
+    let requests = 0;
+    const provider: Provider = {
+      name: "first, then hanging",
+      contextLength: 1000,
+      stream: (history, options) => (++requests === 1 ? first.stream(history, options) : hanging.stream(history, options)),
+    };
+    const session = makeSession(provider);
+    const events: SessionEvent[] = [];
+    for await (const event of session.send("first")) {
+      events.push(event);
+      if (event.type === "status" && event.status === "compacting") session.interrupt();
+    }
+    expect(events).toContainEqual({ type: "compaction", result: { compacted: false, reason: "stopped", error: "Stopped." } });
+    // The turn was already running, so this is an abort, not the pre-message "interrupted".
+    expect(events.at(-1)).toMatchObject({ type: "turn_end", reason: "aborted" });
+    expect(requests).toBe(2); // the first answer and the summary: the loop never went on
   });
 });
 

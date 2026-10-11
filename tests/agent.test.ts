@@ -97,7 +97,7 @@ describe("runAgent", () => {
   });
 
   test("stops after maxSteps if the model never finishes", async () => {
-    const loop = Array.from({ length: 10 }, (_, i) => useTools(call(`c${i}`, "a.ts")));
+    const loop = Array.from({ length: 10 }, (_, i) => useTools(call(`c${i}`, `file-${i}.ts`)));
     const provider = new ScriptedProvider(loop);
     const events = await run(provider, [{ role: "user", text: "go" }], { maxSteps: 3 });
 
@@ -107,7 +107,7 @@ describe("runAgent", () => {
   });
 
   test("at the limit it asks whether to keep going: yes buys another maxSteps, no stops", async () => {
-    const loop = Array.from({ length: 10 }, (_, i) => useTools(call(`c${i}`, "a.ts")));
+    const loop = Array.from({ length: 10 }, (_, i) => useTools(call(`c${i}`, `file-${i}.ts`)));
     const provider = new ScriptedProvider(loop);
     const asked: number[] = [];
     const events = await run(provider, [{ role: "user", text: "go" }], {
@@ -244,6 +244,36 @@ describe("runAgent", () => {
     ]);
     const events = await run(provider, [{ role: "user", text: "go" }]);
     expect(events).toContainEqual({ type: "tool_call_delta", index: 0, name: "read_file", text: '{"path":' });
+  });
+
+  test("a retry event resets this step's text and calls so the retry doesn't duplicate them", async () => {
+    const toolCall = call("c1", "a.ts");
+    const provider = new ScriptedProvider([
+      [
+        { type: "text_delta", text: "Hel" },
+        { type: "tool_call", call: toolCall },
+        { type: "retry", attempt: 1, max: 2, message: "lost" },
+        { type: "text_delta", text: "Hello" },
+        { type: "tool_call", call: toolCall },
+        { type: "done", reason: "tool_calls" },
+      ],
+    ]);
+    const events: LoopEvent[] = [];
+    for await (const event of runAgent({
+      provider,
+      history: [{ role: "user", text: "go" }],
+      system: "SYSTEM",
+      tools: SPECS,
+      runTool: fakeTool,
+      signal: new AbortController().signal,
+    })) {
+      events.push(event);
+    }
+    const assistant = events.find((e) => e.type === "assistant") as { text: string } | undefined;
+    expect(assistant?.text).toBe("Hello");
+    const toolCalls = events.filter((e) => e.type === "tool_start");
+    expect(toolCalls).toHaveLength(1);
+    expect(events).toContainEqual({ type: "retry", attempt: 1, max: 2, message: "lost" });
   });
 
   describe("an empty reply (no text, no tool calls)", () => {
@@ -852,6 +882,13 @@ describe("every tool call gets exactly one result, in call order, however the ru
   });
 
   describe("the step limit", () => {
+    test("maxSteps 0 turns the limit off entirely: it runs to the end, no asking, no hard stop", async () => {
+      const { history, end, calls } = await drive([...steps(3), say("Done.")], {}, { maxSteps: 0 });
+      expect(calls).toHaveLength(15); // 3 steps × 5 calls, none cut off by a limit
+      expect(answerProblems(history)).toEqual([]);
+      expect(end).toEqual({ type: "done", reason: "end" });
+    });
+
     test("without onLimit: a hard stop", async () => {
       const { history, end, calls } = await drive(steps(5), {}, { maxSteps: 2 });
       expect(calls).toHaveLength(10);
@@ -884,6 +921,143 @@ describe("every tool call gets exactly one result, in call order, however the ru
       expect(stopped).toEqual({ how: "throw", event: { type: "step_limit", steps: 2, continued: true } });
       expect(events.at(-1)).toBe(stopped!.event);
       expect(answerProblems(history)).toEqual([]);
+    });
+  });
+
+  describe("text loop detection", () => {
+    const repeat = (sentence: string, n: number): AgentEvent[] => [
+      { type: "text_delta", text: Array.from({ length: n }, () => sentence).join("\n") },
+      { type: "done", reason: "stop" },
+    ];
+
+    test("a sentence repeated 8+ times in the reply is caught and the reply is dropped", async () => {
+      const provider = new ScriptedProvider([repeat("Fix the test scripts now.", 10), say("I'll do something else.")]);
+      const events = await run(provider, [{ role: "user", text: "go" }]);
+      expect(events).toContainEqual({ type: "text_loop", continued: true });
+      expect(provider.requests[1]!.history.at(-1)).toEqual({ role: "user", text: expect.stringContaining("stuck repeating") });
+      expect(events.at(-1)).toEqual({ type: "done", reason: "end" });
+    });
+
+    test("stopped while streaming: the rest isn't read, its tool call never runs, and none of it reaches the next request (review, #42)", async () => {
+      const sentence = "Fix the test scripts now. ";
+      const looping: AgentEvent[] = [
+        ...Array.from({ length: 60 }, (): AgentEvent => ({ type: "text_delta", text: sentence })),
+        { type: "tool_call", call: { id: "c9", name: "read_file", arguments: '{"path":"a.ts"}' } },
+        { type: "done", reason: "stop" },
+      ];
+      const provider = new ScriptedProvider([looping, say("I'll do something else.")]);
+      const events = await run(provider, [{ role: "user", text: "go" }]);
+      expect(events).toContainEqual({ type: "text_loop", continued: true });
+      expect(events.some((e) => e.type === "tool_start")).toBe(false);
+      // Stopped early: far fewer than 60 deltas were passed on.
+      expect(events.filter((e) => e.type === "text_delta").length).toBeLessThan(40);
+      const next = provider.requests[1]!.history;
+      expect(next.some((turn) => turn.text.includes(sentence.trim()))).toBe(false);
+      expect(next.at(-1)).toEqual({ role: "user", text: expect.stringContaining("stuck repeating") });
+    });
+
+    test("a second text loop in a row ends the run", async () => {
+      const provider = new ScriptedProvider([
+        repeat("Fix the test scripts now.", 10),
+        repeat("Fix the test scripts now.", 10),
+      ]);
+      const events = await run(provider, [{ role: "user", text: "go" }]);
+      expect(events.filter((e) => e.type === "text_loop")).toEqual([
+        { type: "text_loop", continued: true },
+        { type: "text_loop", continued: false },
+      ]);
+      expect(events.at(-1)).toEqual({ type: "done", reason: "loop" });
+    });
+
+    test("a step that answered resets the text-loop count", async () => {
+      const provider = new ScriptedProvider([
+        repeat("Fix the test scripts now.", 10),
+        useTools(call("c1", "a.ts")),
+        repeat("Fix the test scripts now.", 10),
+        say("Done."),
+      ]);
+      const events = await run(provider, [{ role: "user", text: "go" }]);
+      expect(events.filter((e) => e.type === "text_loop")).toEqual([
+        { type: "text_loop", continued: true },
+        { type: "text_loop", continued: true },
+      ]);
+      expect(events.at(-1)).toEqual({ type: "done", reason: "end" });
+    });
+
+    test("varied text (ordinary lists, code) doesn't trigger", async () => {
+      const text = [
+        "- Install dependencies with `bun install`.",
+        "- Run tests with `bun test`.",
+        "- Check types with `bun run typecheck`.",
+        "- Done at http://localhost:3000.",
+      ].join("\n");
+      const provider = new ScriptedProvider([
+        [{ type: "text_delta", text }, { type: "done", reason: "stop" }],
+        say("Done."),
+      ]);
+      const events = await run(provider, [{ role: "user", text: "go" }]);
+      expect(events.some((e) => "type" in e && e.type === "text_loop")).toBe(false);
+      expect(events.at(-1)).toEqual({ type: "done", reason: "end" });
+    });
+  });
+
+  describe("tool loop detection", () => {
+    const readCall = (id: string, path: string, extra: Record<string, unknown> = {}): ToolCall =>
+      ({ id, name: "read_file", arguments: JSON.stringify({ path, ...extra }) });
+
+    test("period-1: the same read_file call with the same result warns on the 4th call, stops on the 5th", async () => {
+      // A call counts as a repeat when it also got the same result as last time, which the first call can't have:
+      // calls 2, 3 and 4 are the three identical entries.
+      const provider = new ScriptedProvider([
+        useTools(readCall("c1", "a.ts")),
+        useTools(readCall("c2", "a.ts")),
+        useTools(readCall("c3", "a.ts")),
+        useTools(readCall("c4", "a.ts")),
+        useTools(readCall("c5", "a.ts")),
+      ]);
+      const events = await run(provider, [{ role: "user", text: "go" }]);
+      const loopEvents = events.filter((e) => e.type === "tool_loop");
+      expect(loopEvents).toEqual([
+        { type: "tool_loop", continued: true },
+        { type: "tool_loop", continued: false },
+      ]);
+      expect(events.at(-1)).toEqual({ type: "done", reason: "loop" });
+    });
+
+    test("period-2: read_file offset 95, 98, 95, 98… is caught", async () => {
+      // The exact pattern from issue #37: read_file with offset 95, then 98, alternating, each getting the same
+      // result as the last time it ran.
+      const offsets = [95, 98, 95, 98, 95, 98, 95];
+      const provider = new ScriptedProvider(offsets.map((offset, i) => useTools(readCall(`c${i}`, "src/tools/index.ts", { offset, limit: 40 }))));
+      const events = await run(provider, [{ role: "user", text: "go" }]);
+      const loopEvents = events.filter((e) => e.type === "tool_loop");
+      expect(loopEvents).toEqual([{ type: "tool_loop", continued: true }]);
+      expect(events.at(-1)).toEqual({ type: "done", reason: "end" }); // no more scripted steps after the warning
+    });
+
+    test("the same call getting a new result each time is new work, not a loop (review, #42)", async () => {
+      // A tool that hands out the next queued item on each identical call.
+      let n = 0;
+      const queue = async (c: ToolCall) => ({ output: `item ${++n}`, summary: "1 line", label: JSON.parse(c.arguments).path });
+      const provider = new ScriptedProvider(Array.from({ length: 6 }, (_, i) => useTools(readCall(`c${i}`, "queue"))));
+      const events = await run(provider, [{ role: "user", text: "go" }], { runTool: queue });
+      expect(events.some((e) => e.type === "tool_loop")).toBe(false);
+      expect(events.filter((e) => e.type === "tool_end")).toHaveLength(6);
+    });
+
+    test("a write tool between calls resets the loop counter", async () => {
+      const provider = new ScriptedProvider([
+        useTools(readCall("c1", "a.ts")),
+        useTools(readCall("c2", "a.ts")),
+        useTools({ id: "c3", name: "write_file", arguments: JSON.stringify({ path: "a.ts", content: "edited" }) }),
+        useTools(readCall("c4", "a.ts")),
+        useTools(readCall("c5", "a.ts")),
+        say("Done."),
+      ]);
+      const events = await run(provider, [{ role: "user", text: "go" }]);
+      // The write_file reset, so 4 and 5 are fresh: history stays too short to trigger.
+      expect(events.some((e) => e.type === "tool_loop")).toBe(false);
+      expect(events.at(-1)).toEqual({ type: "done", reason: "end" });
     });
   });
 });

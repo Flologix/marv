@@ -84,3 +84,25 @@ describe("a tool call still streaming", () => {
     expect(log.draft).toBeUndefined();
   });
 });
+
+test("a retry drops what the failed attempt drew and says why (review, #36)", () => {
+  const log = createAgentLog({ title: "t", prompt: "p" });
+  applyEvent(log, { type: "thinking_delta", text: "hmm" });
+  applyEvent(log, { type: "text_delta", text: "Half a rep" });
+  applyEvent(log, { type: "tool_call_delta", index: 0, name: "read_file", text: '{"pa' });
+  applyEvent(log, { type: "retry", attempt: 1, max: 2, message: "connection lost, retrying (1/2)…" });
+  expect(log.streaming).toBe("");
+  expect(log.thinking).toBe("");
+  expect(log.draft).toBeUndefined();
+  expect(log.messages.at(-1)).toMatchObject({ role: "system", text: "connection lost, retrying (1/2)…" });
+});
+
+test("loop warnings and stops are shown in a subagent's view (review, #42)", () => {
+  const log = createAgentLog({ title: "t", prompt: "p" });
+  applyEvent(log, { type: "text_delta", text: "Fix it now. Fix it now." });
+  applyEvent(log, { type: "text_loop", continued: true });
+  expect(log.streaming).toBe("");
+  expect(log.messages.at(-1)).toMatchObject({ role: "system", text: expect.stringContaining("repeating itself") });
+  applyEvent(log, { type: "tool_loop", continued: false });
+  expect(log.messages.at(-1)).toMatchObject({ role: "system", text: expect.stringContaining("Stopped") });
+});

@@ -1,6 +1,7 @@
 import { SUBAGENT_TOOLS, type AgentType } from "../agents.ts";
 import { maskKey, PRESETS, type Config } from "../config/config.ts";
 import { sandboxAvailable } from "../sandbox.ts";
+import { hiddenPathFoldersNotice } from "./sandbox-notice.ts";
 import type { McpServerStatus } from "../mcp/manager.ts";
 import type { Skill } from "../skills.ts";
 import { usageReport, type Totals } from "../usage.ts";
@@ -21,6 +22,11 @@ export type CommandAction =
   | { type: "yolo"; on: boolean }
   | { type: "trajectories"; on: boolean }
   | { type: "diagnostics"; on: boolean }
+  /**
+   * The step limit: show it (no `every`), set it to a whole number of steps (0 = never ask), or turn it
+   * off. The App saves it in the config and passes it to the session.
+   */
+  | { type: "steps"; every?: number }
   /** Trust and start the project's MCP servers. */
   | { type: "mcp-trust" }
   /** Rate or tag the last turn: 1 good, -1 bad, 0 labels only. */
@@ -51,6 +57,8 @@ export interface CommandContext {
   trajectoriesPath?: string;
   /** Tokens and cost so far, for /cost. */
   usage?: { totals: Totals; last: Usage | null; contextLength?: number };
+  /** PATH folders under the home folder the sandbox can't see, shortened (~) for display; empty when there are none. */
+  hiddenPathFolders?: string[];
 }
 
 interface Command {
@@ -140,11 +148,11 @@ export const commands: Command[] = [
   {
     name: "sandbox",
     description: "Show or set the bash sandbox (/sandbox on, /sandbox off)",
-    run: (args, { config }) => {
+    run: (args, { config, hiddenPathFolders = [] }) => {
       const arg = args.toLowerCase();
       if (arg === "on" || arg === "off") return { type: "sandbox", on: arg === "on" };
       if (arg) return { type: "print", text: "Usage: /sandbox, /sandbox on, or /sandbox off", isError: true };
-      return { type: "print", text: `Sandbox: ${sandboxStatus(config)}` };
+      return { type: "print", text: `Sandbox: ${sandboxStatus(config, hiddenPathFolders)}` };
     },
   },
   {
@@ -205,6 +213,24 @@ export const commands: Command[] = [
     },
   },
   {
+    name: "steps",
+    description: "Show or set the step limit (/steps 40, /steps off never asks)",
+    run: (args, { config }) => {
+      const arg = args.trim();
+      if (/^off$/i.test(arg)) return { type: "steps", every: 0 };
+      if (/^\d+$/.test(arg)) {
+        const every = Number(arg);
+        // A huge number would be Infinity, which the saved config can't hold (JSON writes null).
+        if (!Number.isSafeInteger(every)) return { type: "print", text: "That's too many steps; use /steps off to never ask.", isError: true };
+        // 1 would ask after every step; use /steps off for never asking.
+        if (every === 1) return { type: "print", text: "The smallest interval is 2 steps; /steps off never asks.", isError: true };
+        return { type: "steps", every };
+      }
+      if (arg) return { type: "print", text: "Usage: /steps, /steps <number>, or /steps off", isError: true };
+      return { type: "print", text: stepsStatus(config) };
+    },
+  },
+  {
     name: "clear",
     description: "Clear the conversation",
     run: () => ({ type: "clear" }),
@@ -253,6 +279,7 @@ function configText({ config, configPath }: CommandContext): string {
     `Yolo:      ${config.yolo ? "on" : "off"} (/yolo)`,
     `Trajectories: ${config.trajectories ? "on" : "off"} (/trajectories)`,
     `Diagnostics: ${config.diagnostics ? "on" : "off"} (/diagnostics)`,
+    `Steps: ${stepsStatus(config)}`,
     `Endpoint:  ${config.baseUrl}`,
     ...(config.provider === "ollama" ? [`Context:   ${config.contextLength.toLocaleString("en-US")} tokens (contextLength in the config file)`] : []),
     `API key:   ${key}`,
@@ -264,6 +291,13 @@ export function diagnosticsStatus(config: Config): string {
   return config.diagnostics
     ? "on: after the model changes files in a TypeScript project, Marv runs the project's typecheck (in the sandbox, read-only) and tells the model about new errors"
     : "off";
+}
+
+/** What the step limit does with this config, for /steps and the notice when it's changed. */
+export function stepsStatus(config: Config): string {
+  return config.maxSteps === 0
+    ? "off: Marv never asks to keep going, and a turn without an approver doesn't stop at a step limit either (subagents still stop at their own 50)."
+    : `Keep going? after ${config.maxSteps} steps (0, or off, never asks). Without someone to ask, the turn stops there.`;
 }
 
 export function trajectoriesStatus(config: Config, path = "~/.marv/trajectories"): string {
@@ -281,11 +315,11 @@ export function yoloStatus(config: Config): string {
     : `Yolo on: file edits run without asking. Commands still ask: ${config.sandbox ? "bubblewrap isn't available here" : "the sandbox is off"}, so nothing confines them.`;
 }
 
-function sandboxStatus(config: Config): string {
+function sandboxStatus(config: Config, hiddenPathFolders: string[] = []): string {
   if (!config.sandbox) return "off: bash commands run directly on your system (after approval)";
-  return sandboxAvailable()
-    ? "on: bash runs in bubblewrap (project writable, home hidden, no network unless asked)"
-    : "on, but bubblewrap isn't available here, so bash runs WITHOUT a sandbox";
+  if (!sandboxAvailable()) return "on, but bubblewrap isn't available here, so bash runs WITHOUT a sandbox";
+  const hidden = hiddenPathFolders.length ? ` ${hiddenPathFoldersNotice(hiddenPathFolders)}` : "";
+  return `on: bash runs in bubblewrap (project writable, home hidden, no network unless asked).${hidden}`;
 }
 
 const MCP_HELP = `No MCP servers yet. Add them to \`.mcp.json\` in the project, or \`~/.marv/mcp.json\` for every project (the same format as Claude Code's), then restart Marv:

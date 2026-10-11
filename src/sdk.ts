@@ -68,7 +68,8 @@ export interface SessionOptions {
   approve?: (request: ApprovalRequest) => Promise<Decision>;
   /**
    * Steps a turn runs before it stops (without `approve`) or asks `approve` whether to keep going (again at each
-   * multiple). Default 25. Unattended runs that should finish long tasks raise it.
+   * multiple). Default 25. Unattended runs that should finish long tasks raise it; 0 never asks and never stops
+   * the main agent (subagents keep their own limit).
    */
   maxSteps?: number;
   /**

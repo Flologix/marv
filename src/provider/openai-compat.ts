@@ -3,6 +3,7 @@
 // their stream into Marv's AgentEvents, so nothing above this file knows
 // which vendor (or which wire format) is on the other end.
 import { describeError, errorMessage, httpError, unreachable, type ErrorHints, type ErrorObject } from "./errors.ts";
+import { isNetworkError, retriableHttpStatus, sleepAbortable, parseRetryAfter, BACKOFFS } from "./retry.ts";
 import { parseSSE } from "./sse.ts";
 import type { AgentEvent, ChatTurn, Provider, StreamOptions, ToolCall } from "./types.ts";
 
@@ -98,29 +99,69 @@ export class OpenAICompatProvider implements Provider {
       ...this.options.body,
     };
 
-    let response: Response;
-    try {
-      response = await fetch(`${baseUrl}/chat/completions`, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
-          ...this.options.headers,
-        },
-        body: JSON.stringify(body),
-        signal,
-      });
-    } catch (err) {
+    // Retry loop: up to 3 attempts (original + 2 retries) with backoff, for network errors and
+    // retriable HTTP statuses (502, 503, 504, 429 with Retry-After).
+    // Esc (abort) stops the retries.
+    for (let attempt = 1; ; attempt++) {
       if (signal?.aborted) return;
-      yield { type: "error", message: unreachable(label, baseUrl, err, this.options.offlineHint) };
-      return;
-    }
 
-    if (!response.ok) {
+      if (attempt > 1) {
+        yield { type: "retry", attempt: attempt - 1, max: 2, message: `${label}: connection lost, retrying (${attempt - 1}/2)…` };
+      }
+
+      let response: Response;
+      try {
+        response = await fetch(`${baseUrl}/chat/completions`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+            ...this.options.headers,
+          },
+          body: JSON.stringify(body),
+          signal,
+        });
+      } catch (err) {
+        if (signal?.aborted) return;
+        if (attempt < 3 && isNetworkError(err)) {
+          if (await sleepAbortable(BACKOFFS[attempt - 1]! * 1000, signal)) return;
+          continue;
+        }
+        yield { type: "error", message: unreachable(label, baseUrl, err, this.options.offlineHint) };
+        return;
+      }
+
+      if (response.ok) {
+        // Stream the SSE body. If the connection drops mid-stream, retry from the top.
+        const result = yield* this.parseStream(response, label, signal);
+        if (result === "retry") {
+          if (attempt < 3) {
+            if (await sleepAbortable(BACKOFFS[attempt - 1]! * 1000, signal)) return;
+            continue;
+          }
+          yield { type: "error", message: `${label}: the stream ended early, before the reply was complete. Try again.` };
+          return;
+        }
+        return;
+      }
+
+      // HTTP-level error
+      if (retriableHttpStatus(response.status) && attempt < 3) {
+        const delay = parseRetryAfter(response.headers.get("Retry-After")) ?? BACKOFFS[attempt - 1]!;
+        if (await sleepAbortable(delay * 1000, signal)) return;
+        continue;
+      }
+
       yield { type: "error", message: httpError(response.status, await errorMessage(response), label, model, this.options.hints) };
       return;
     }
+  }
 
+  /**
+   * Parses the SSE response body. Returns "retry" if the stream broke off mid-way (a retriable
+   * connection drop), or undefined on success. Yields events as it goes.
+   */
+  private async *parseStream(response: Response, label: string, signal?: AbortSignal): AsyncGenerator<AgentEvent, "retry" | undefined, undefined> {
     // Tool calls arrive in fragments keyed by index; they're only complete at the end.
     const pending = new Map<number, ToolCall>();
     let reason: string | undefined;
@@ -137,7 +178,7 @@ export class OpenAICompatProvider implements Provider {
         // Errors can also arrive mid-stream, after the 200 status was already sent.
         if (chunk.error) {
           yield { type: "error", message: `${label}: ${describeError(chunk.error)}` };
-          return;
+          return undefined;
         }
         if (chunk.usage) {
           const { prompt_tokens = 0, completion_tokens = 0, prompt_tokens_details, cost } = chunk.usage;
@@ -174,19 +215,22 @@ export class OpenAICompatProvider implements Provider {
         }
       }
     } catch (err) {
-      if (signal?.aborted) return; // ctrl+c: the app says "Interrupted."
-      yield { type: "error", message: `${label}: the stream broke off (${(err as Error).message})` };
-      return;
+      if (signal?.aborted) return undefined;
+      // A connection drop mid-stream is retriable: the error is typically a socket closed or
+      // connection reset. Return "retry" so the caller can redo the entire request.
+      return "retry";
     }
 
     if (!complete) {
-      if (signal?.aborted) return;
-      yield { type: "error", message: `${label}: the stream ended early, before the reply was complete. Try again.` };
-      return;
+      if (signal?.aborted) return undefined;
+      // The stream ended cleanly but early (no [DONE] or finish_reason): a proxy closed it,
+      // or the server lost the connection. A retry would get a fresh response.
+      return "retry";
     }
     for (const [index, call] of [...pending].sort(([a], [b]) => a - b)) {
       yield { type: "tool_call", call: { ...call, id: call.id || `call_${index}` } };
     }
     yield { type: "done", reason };
+    return undefined;
   }
 }

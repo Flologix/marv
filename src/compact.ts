@@ -42,7 +42,13 @@ export async function summarize({ provider, history, system, tools, signal, focu
   let reason: string | undefined;
   for await (const event of provider.stream(request, { system, tools, signal })) {
     if (event.type === "text_delta") text += event.text;
-    else if (event.type === "tool_call") toolCall = true;
+    else if (event.type === "retry") {
+      // The connection dropped and the provider is asking again from the start: what the failed attempt sent
+      // isn't part of the summary that will replace the conversation.
+      text = "";
+      toolCall = false;
+      reason = undefined;
+    } else if (event.type === "tool_call") toolCall = true;
     else if (event.type === "done") reason = event.reason;
     else if (event.type === "usage") onUsage?.(event.usage);
     else if (event.type === "error") return { error: event.message };
@@ -63,3 +69,12 @@ export function compactedHistory(summary: string): ChatTurn[] {
     { role: "assistant", text: "Got it. I have the context from the summary and will continue from here." },
   ];
 }
+
+/**
+ * Appended after the compacted history when the compaction happened mid-turn (between two steps), where the next
+ * request would otherwise end with the compacted history's own assistant acknowledgement and the model would have
+ * no instruction to go on: this user turn tells it to. Not used when compacting before a user message — there the
+ * user's message itself follows the history.
+ */
+export const MID_TURN_NOTE =
+  "(Automatic note from Marv, the program running you) Your conversation was just compacted to save space in the middle of this task (everything before this point is summarized above). Continue where you left off.";

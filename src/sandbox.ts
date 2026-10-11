@@ -28,6 +28,8 @@ export const TOOLCHAINS = [
   ".rustup",
   ".local/bin",
   ".local/share/pnpm",
+  ".local/share/mise",
+  ".asdf",
   ".nvm",
   ".volta",
   ".deno",
@@ -37,6 +39,24 @@ export const TOOLCHAINS = [
   // Personal skills, so their scripts can run (the rest of ~/.marv, with the API key, stays hidden).
   ".marv/skills",
 ];
+
+/**
+ * PATH folders under the hidden home folder that no toolchain mount shows. A tool on PATH whose folder the sandbox
+ * hides (`env: 'node': No such file or directory`, exit 127) is otherwise a silent mystery — and silently skips
+ * Marv's own post-edit typecheck. Not the mounted ones, not inside the project, not folders that don't exist
+ * (nothing to miss). Sorted by path, so a notice lists them in a stable order.
+ */
+export function hiddenPathFolders(path: string, home: string, root?: string, exists: (path: string) => boolean = existsSync): string[] {
+  const found = new Set<string>();
+  for (const dir of path.split(":")) {
+    if (!isAbsolute(dir) || !contains(home, dir) || !exists(dir)) continue;
+    // The project is mounted (writable): its node_modules/.bin or bin/ aren't hidden.
+    if (root && contains(root, dir)) continue;
+    if (TOOLCHAINS.some((toolchain) => contains(join(home, toolchain), dir))) continue;
+    found.add(dir);
+  }
+  return [...found].sort();
+}
 
 interface SandboxOptions {
   root: string;
@@ -50,6 +70,11 @@ interface SandboxOptions {
    * which stays writable).
    */
   readOnly?: string[];
+  /**
+   * Extra folders outside the project the command may change, for a command the user approved: a git worktree's
+   * record and its repository's .git (in the hidden home folder), so an approved `git commit` works there.
+   */
+  writable?: string[];
   /**
    * Paths inside the project that don't exist yet and must stay that way: each gets an empty read-only folder
    * mounted on it (a project without .git, so a command can't create a repository whose config git would run
@@ -184,6 +209,7 @@ export function sandboxArgs({
   network,
   path,
   readOnly = [],
+  writable = [],
   placeholders = [],
   projectReadOnly = false,
   exists = existsSync,
@@ -200,6 +226,10 @@ export function sandboxArgs({
   for (const { dir, real } of extras.filter((e) => e.around)) args.push("--ro-bind", real, dir);
   args.push(projectReadOnly ? "--ro-bind" : "--bind", root, root);
   for (const { dir, real } of extras.filter((e) => !e.around)) args.push("--ro-bind", real, dir);
+  for (const dir of writable) {
+    const { real } = resolveExtra(dir, home, root);
+    args.push("--bind", real, dir);
+  }
   // A read-only project can't get the empty mount point bwrap creates, and nothing in it can create a .git anyway.
   if (!projectReadOnly) for (const path of placeholders) args.push("--tmpfs", path, "--remount-ro", path);
   // Last, on top of every other mount, so the empty file hides the real one and no later mount shows it again.

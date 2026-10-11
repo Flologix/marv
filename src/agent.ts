@@ -16,6 +16,7 @@
 // finished first.
 import type { ChatTurn, Provider, ToolCall, ToolSpec, Usage } from "./provider/types.ts";
 import type { ToolResult } from "./tools/types.ts";
+import { detectTextRepetition, makeToolKey, toolLoopDetected, type ToolLoopState } from "./repetition.ts";
 
 export const DEFAULT_MAX_STEPS = 25;
 export const MAX_PARALLEL = 4;
@@ -25,7 +26,8 @@ export const NOT_RUN = {
   aborted: "Interrupted by the user before this tool ran.",
   declined: "Not run: the user declined an earlier action.",
   cutOff:
-    "Not run: your reply hit the output limit before it finished, so this call may be incomplete. Redo it in smaller steps (for a big file: write_file the first part, then add the rest with edit_file).",
+    "Not run: your reply hit the output limit before it finished, so this call may be incomplete. Redo it in smaller steps (for a big file: write_file the first part, then add the rest with append: true).",
+  textLoop: "Not run: your reply was stuck repeating the same text, so it was dropped.",
 };
 
 /**
@@ -34,14 +36,14 @@ export const NOT_RUN = {
  * was still writing), and would likely try the same thing again.
  */
 export const CUT_OFF_NOTE =
-  "(Automatic note from Marv, the program running you) Your last reply hit the output limit and was cut off before it finished; nothing in it was run. Continue in smaller steps (for a big file: write_file the first part, then add the rest with edit_file).";
+  "(Automatic note from Marv, the program running you) Your last reply hit the output limit and was cut off before it finished; nothing in it was run. Continue in smaller steps (for a big file: write_file the first part, then add the rest with append: true).";
 
 /**
  * The same for a reply that reasoned and left nothing (thinking models). It either reasoned until the limit or
  * started a tool call that was cut off and dropped (Ollama drops an unfinished one): Marv can't tell which.
  */
 export const CUT_OFF_REASONING_NOTE =
-  "(Automatic note from Marv, the program running you) Your last reply used up the output limit, while reasoning or while writing a tool call (an unfinished call is dropped), so it did nothing. Reason briefly, and write a big file in parts (write_file the first part, then add the rest with edit_file).";
+  "(Automatic note from Marv, the program running you) Your last reply used up the output limit, while reasoning or while writing a tool call (an unfinished call is dropped), so it did nothing. Reason briefly, and write a big file in parts (write_file the first part, then add the rest with append: true).";
 
 /**
  * Told to the model after a second empty reply in a row (no text, no tool calls). The first is asked for again
@@ -50,6 +52,21 @@ export const CUT_OFF_REASONING_NOTE =
  */
 export const EMPTY_REPLY_NOTE =
   "(Automatic note from Marv, the program running you) Your last reply was empty: no text and no tool calls. If the task isn't finished, continue it with your tools; if it is, say what you did.";
+
+/**
+ * Told to the model when the reply text gets stuck repeating the same sentence
+ * many times in a row. The reply is dropped entirely.
+ */
+export const TEXT_LOOP_NOTE =
+  "(Automatic note from Marv, the program running you) Your last reply got stuck repeating one sentence and was stopped; nothing in it was used. Take the next concrete step.";
+
+/**
+ * Told to the model when tool calls repeat without progress. The result
+ * of the repeated call says this, so the model sees it in the tool result.
+ */
+export const TOOL_LOOP_NOTE =
+  (repeatCount: number, callName: string) =>
+    `Marv: you have made this exact call ${repeatCount} times in a row and it returned the same result; use what it returned, or try something else.`;
 
 /**
  * A copy of the history in which every tool call has a result: calls still waiting at the end (a run that was
@@ -91,7 +108,18 @@ export type LoopEvent =
   | { type: "empty_reply"; next: "retry" | "nudge" | "stop" }
   /** A reply hit the output limit: nothing in it ran. `continued`: the model was told and goes on (once per run). */
   | { type: "cut_off"; continued: boolean }
-  | { type: "done"; reason: "end" | "length" | "aborted" | "declined" | "max_steps" | "error" };
+  /** The reply was stuck repeating the same sentence and was stopped. `continued`: the model was told (once per run). */
+  | { type: "text_loop"; continued: boolean }
+  /** The same tool calls repeated without progress: the model was told (once), or the run was stopped. */
+  | { type: "tool_loop"; continued: boolean }
+  /**
+   * A mid-run compaction swapped the history for the summary (the session's `onFull`): the next request starts
+   * from the summary. Nothing was lost — the transcript isn't the history — but the client may want to say so.
+   */
+  | { type: "compacted" }
+  | { type: "done"; reason: "end" | "length" | "aborted" | "declined" | "max_steps" | "error" | "loop" }
+  /** The connection was lost and the provider is retrying with a fresh request. */
+  | { type: "retry"; attempt: number; max: number; message: string };
 
 interface Options {
   provider: Provider;
@@ -101,6 +129,7 @@ interface Options {
   tools: ToolSpec[];
   runTool: (call: ToolCall) => Promise<ToolResult & { label: string }>;
   signal: AbortSignal;
+  /** Steps before the limit is checked; 0 turns the limit off entirely (no asking, no hard stop). Default 25. */
   maxSteps?: number;
   /**
    * Asked each time the run reaches another multiple of maxSteps, after that
@@ -116,6 +145,12 @@ interface Options {
    * from Marv before the next request (like CUT_OFF_NOTE), or null. Never rejects. The session's typecheck uses it (src/diagnostics).
    */
   afterStep?: (results: ToolResult[]) => Promise<string | null>;
+  /**
+   * Checked after a step's tool calls are all answered, before `afterStep`: true when the context is nearly full
+   * and the history was just compacted (the next request starts from the summary), false otherwise. Never
+   * rejects. The session's automatic compaction uses it (src/session.ts).
+   */
+  onFull?: () => Promise<boolean>;
 }
 
 /**
@@ -249,6 +284,7 @@ export async function* runAgent({
   isParallel = () => false,
   maxParallel = MAX_PARALLEL,
   afterStep,
+  onFull,
 }: Options): AsyncGenerator<LoopEvent> {
   // Ids already in the conversation (a resumed session's too): a new call may not reuse one.
   const usedIds = new Set(history.flatMap((turn) => (turn.role === "assistant" ? (turn.toolCalls ?? []).map((c) => c.id) : [])));
@@ -256,10 +292,22 @@ export async function* runAgent({
   let cutOffs = 0;
   // Empty replies in a row (see EMPTY_REPLY_NOTE).
   let empties = 0;
+  // Text loops in a row.
+  let textLoops = 0;
+  // Tool-call loop state.
+  const toolLoop: ToolLoopState = { history: [], warned: false };
+  // What each call (tool and arguments) returned the last time it ran, hashed. A call repeated with the same result
+  // is a loop; one whose result changes each time (the next item from a queue) is doing new work.
+  const lastResult = new Map<string, string>();
+  const callKey = (call: ToolCall) => {
+    const key = makeToolKey(call);
+    return `${key.name}\u0000${key.args}`;
+  };
   for (let step = 0; ; step++) {
     // The step limit guards against a model that never finishes. With
     // onLimit, the user decides at each multiple whether it goes on.
-    if (step > 0 && step % maxSteps === 0) {
+    // maxSteps 0 (the guard off) never matches: 0 steps means never ask.
+    if (maxSteps > 0 && step > 0 && step % maxSteps === 0) {
       const continued = onLimit ? await onLimit(step) : false;
       if (onLimit) yield { type: "step_limit", steps: step, continued };
       if (signal.aborted) {
@@ -284,10 +332,20 @@ export async function* runAgent({
     let error: string | null = null;
     let stopReason: string | undefined;
 
-    for await (const event of provider.stream(history, { system, tools, signal })) {
+    // A reply stuck repeating itself is stopped while it streams, not after it ran its course.
+    let looped = false;
+    let checkedAt = 0;
+    stream: for await (const event of provider.stream(history, { system, tools, signal })) {
       switch (event.type) {
         case "text_delta":
           text += event.text;
+          if (text.length - checkedAt >= 400) {
+            checkedAt = text.length;
+            if (detectTextRepetition(text)) {
+              looped = true;
+              break stream;
+            }
+          }
           yield event;
           break;
         case "thinking_delta":
@@ -309,6 +367,15 @@ export async function* runAgent({
         case "error":
           error = event.message;
           break;
+        case "retry":
+          // The connection was lost and the provider is retrying from scratch:
+          // discard any partial text, calls and reasoning from the first attempt
+          // so the retry doesn't duplicate them.
+          text = "";
+          reasoned = false;
+          calls.length = 0;
+          yield event;
+          break;
       }
     }
 
@@ -326,6 +393,19 @@ export async function* runAgent({
       call.id = `${base}_${n}`;
       usedIds.add(call.id);
     }
+    // A reply stuck repeating itself (caught while it streamed, or at its end): it's dropped, so none of it reaches
+    // the history (its tool calls never ran and aren't in it either), and the model is told. Twice ends the run.
+    if (!looped && !signal.aborted && text && detectTextRepetition(text)) looped = true;
+    if (looped && !signal.aborted) {
+      const continued = ++textLoops === 1;
+      yield { type: "text_loop", continued };
+      if (continued) {
+        history.push({ role: "user", text: TEXT_LOOP_NOTE });
+        continue;
+      }
+      yield { type: "done", reason: "loop" };
+      return;
+    }
     // Nothing came back: no text (whitespace doesn't count) and nothing to run. Not after an error, a cut-off (handled
     // below) or an interrupt. Nothing goes into the history for it, so a retry is the same request (cached).
     if (!text.trim() && calls.length === 0 && !error && stopReason !== "length" && !signal.aborted) {
@@ -337,10 +417,13 @@ export async function* runAgent({
       return;
     }
     empties = 0;
+
     if (text || calls.length > 0) {
       history.push(calls.length > 0 ? { role: "assistant", text, toolCalls: calls } : { role: "assistant", text });
     }
     if (text) yield { type: "assistant", text };
+
+    textLoops = 0;
 
     if (error) {
       yield { type: "error", message: error };
@@ -367,6 +450,43 @@ export async function* runAgent({
       continue;
     }
     cutOffs = 0;
+
+    // Tool-call loop detection before running tools.
+    let toolLoopWarned = toolLoop.warned;
+    const toolLoopHit =
+      !signal.aborted &&
+      calls.length > 0 &&
+      toolLoopDetected(
+        toolLoop,
+        calls.map((call) => {
+          const key = makeToolKey(call);
+          return { ...key, args: `${key.args}\u0000${lastResult.get(callKey(call)) ?? ""}` };
+        }),
+      );
+    // The first time: warn instead of running the tools.
+    if (toolLoopHit && !toolLoopWarned) {
+      toolLoop.warned = true;
+      const note = TOOL_LOOP_NOTE(toolLoop.history.length, calls[0]!.name);
+      yield { type: "tool_loop", continued: true };
+      // Answer every call with the note.
+      let answered = 0;
+      for (const call of calls) {
+        history.push({ role: "tool", callId: call.id, name: call.name, text: note });
+        answered++;
+        yield { type: "tool_skipped", call, output: note };
+      }
+      continue;
+    }
+    // The second time: stop the turn.
+    if (toolLoopHit && toolLoopWarned) {
+      // Answer every call: the history must be valid.
+      for (const call of calls) history.push({ role: "tool", callId: call.id, name: call.name, text: NOT_RUN.cutOff });
+      yield { type: "tool_loop", continued: false };
+      for (const call of calls) yield { type: "tool_skipped", call, output: NOT_RUN.cutOff };
+      yield { type: "done", reason: "loop" };
+      return;
+    }
+
     if (calls.length === 0) {
       yield { type: "done", reason: signal.aborted ? "aborted" : "end" };
       return;
@@ -381,6 +501,7 @@ export async function* runAgent({
     let answered = 0;
     const answer = (call: ToolCall, text: string) => {
       history.push({ role: "tool", callId: call.id, name: call.name, text });
+      lastResult.set(callKey(call), Bun.hash(text).toString(36));
       answered++;
     };
     try {
@@ -427,6 +548,16 @@ export async function* runAgent({
     if (declined) {
       yield { type: "done", reason: "declined" };
       return;
+    }
+    // A long turn can fill the context by itself: compaction can't wait for the next user message. If it
+    // compacted, the history was swapped under this loop for the summary plus a "continue" note (a fresh,
+    // valid history), and the next request simply starts from it.
+    if (onFull && (await onFull())) {
+      yield { type: "compacted" };
+      if (signal.aborted) {
+        yield { type: "done", reason: "aborted" };
+        return;
+      }
     }
     if (afterStep) {
       const note = await afterStep(stepResults);

@@ -1,6 +1,11 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { OllamaProvider } from "../src/provider/ollama.ts";
 import type { AgentEvent } from "../src/provider/types.ts";
+import { retryTiming } from "../src/provider/retry.ts";
+
+// Retry waits (1 s, 4 s, 10 s, Retry-After) shrunk to milliseconds, so retry tests don't wait in real time.
+beforeAll(() => void (retryTiming.scale = 0.001));
+afterAll(() => void (retryTiming.scale = 1));
 
 // A local stand-in for Ollama's native /api/chat.
 let server: ReturnType<typeof Bun.serve> | undefined;
@@ -167,25 +172,36 @@ describe("OllamaProvider", () => {
 
   test("other server errors (out of memory, a failed load) aren't retried: a second try would only repeat them", async () => {
     let requests = 0;
-    const url = serve(() => (++requests, Response.json({ error: "model requires more system memory" }, { status: 500 })));
+    const url = serve((req) => {
+      if (new URL(req.url).pathname !== "/api/chat") return Response.json({}); // /api/show may fail; it changes nothing
+      return (++requests, Response.json({ error: "model requires more system memory" }, { status: 500 }));
+    });
     const events = await collect(provider(url).stream([{ role: "user", text: "hi" }]));
     expect(requests).toBe(1);
     expect(events).toEqual([{ type: "error", message: expect.stringContaining("more system memory") }]);
   });
 
   test("a server error (an unparsable tool call) is retried once; a second one is reported", async () => {
-    let requests = 0;
-    let url = serve(() =>
-      ++requests === 1 ? Response.json({ error: "XML syntax error on line 181: unexpected EOF" }, { status: 500 }) : ndjson(msg({ content: "ok" }), end),
+    /** Counts /api/chat requests; reply is what each one gets back. */
+    const counting = (reply: (n: number) => Response) => {
+      const count = { n: 0, url: "" };
+      count.url = serve((req) => {
+        if (new URL(req.url).pathname !== "/api/chat") return Response.json({}); // /api/show may fail; it changes nothing
+        return reply(++count.n); // a fresh Response per request: a body can only be sent once
+      });
+      return count;
+    };
+
+    const retried = counting((n) =>
+      n === 1 ? Response.json({ error: "XML syntax error on line 181: unexpected EOF" }, { status: 500 }) : ndjson(msg({ content: "ok" }), end),
     );
-    expect(await collect(provider(url).stream([{ role: "user", text: "hi" }]))).toContainEqual({ type: "text_delta", text: "ok" });
-    expect(requests).toBe(2);
+    expect(await collect(provider(retried.url).stream([{ role: "user", text: "hi" }]))).toContainEqual({ type: "text_delta", text: "ok" });
+    expect(retried.n).toBe(2);
     server!.stop(true);
 
-    requests = 0;
-    url = serve(() => (++requests, Response.json({ error: "XML syntax error on line 9: unexpected EOF" }, { status: 500 })));
-    const events = await collect(provider(url).stream([{ role: "user", text: "hi" }]));
-    expect(requests).toBe(2);
+    const twice = counting(() => Response.json({ error: "XML syntax error on line 9: unexpected EOF" }, { status: 500 }));
+    const events = await collect(provider(twice.url).stream([{ role: "user", text: "hi" }]));
+    expect(twice.n).toBe(2);
     expect(events).toEqual([{ type: "error", message: expect.stringContaining("XML syntax error") }]);
   });
 
@@ -210,17 +226,136 @@ describe("OllamaProvider", () => {
     ]);
   });
 
-  test("explains when Ollama isn't running", async () => {
+  test("explains when Ollama isn't running, after retries", async () => {
     const events = await collect(provider("http://localhost:1").stream([{ role: "user", text: "hi" }]));
-    expect(events).toEqual([{ type: "error", message: expect.stringContaining("Is Ollama running?") }]);
+    // Unable to connect is a network error, retried 3 times, then reported.
+    expect(events.filter((e) => e.type === "retry")).toHaveLength(2);
+    expect(events.some((e) => e.type === "error")).toBe(true);
+    expect((events.find((e) => e.type === "error") as { message: string }).message).toContain("Is Ollama running?");
+  }, { timeout: 20000 });
+
+  test("resends the request after an HTTP 503, succeeding on retry", async () => {
+    let attempts = 0;
+    const url = serve((req) => {
+      if (new URL(req.url).pathname !== "/api/chat") return Response.json({}); // /api/show may fail; it changes nothing
+      if (++attempts === 1) return new Response("Service Unavailable", { status: 503 });
+      return ndjson(end);
+    });
+    const events = await collect(provider(url).stream([{ role: "user", text: "hi" }]));
+    expect(attempts).toBe(2);
+    expect(events.filter((e) => e.type === "error")).toHaveLength(0);
   });
+
+  test("exhausts retries on repeated HTTP 503 and reports the error", async () => {
+    let attempts = 0;
+    const url = serve((req) => {
+      if (new URL(req.url).pathname !== "/api/chat") return Response.json({}); // /api/show may fail; it changes nothing
+      attempts++;
+      return new Response("Service Unavailable", { status: 503 });
+    });
+    const events = await collect(provider(url).stream([{ role: "user", text: "hi" }]));
+    expect(attempts).toBe(3);
+    expect(events.filter((e) => e.type === "retry")).toHaveLength(2);
+    expect(events.some((e) => e.type === "error")).toBe(true);
+    const errorEvent = events.find((e) => e.type === "error") as { message: string };
+    expect(errorEvent.message).toContain("having trouble");
+  }, { timeout: 20000 });
 
   test("exposes its context size", () => {
     expect(provider("http://localhost:11434").contextLength).toBe(32768);
   });
-  test("a stream that ends without its done line is an error, not a finished reply", async () => {
-    const url = serve(() => ndjson(msg({ content: "Writing the fi" })));
-    const events = await collect(provider(url).stream([{ role: "user", text: "hi" }]));
-    expect(events.map((e) => e.type)).toEqual(["text_delta", "error"]);
+
+  describe("never runs the model past its trained context length", () => {
+    /** Serves /api/show (reporting a trained context of `trained`) and /api/chat. */
+    const serving = (trained: number | Response) =>
+      serve((req) => {
+        if (new URL(req.url).pathname === "/api/show") return trained instanceof Response ? trained : Response.json({ model_info: { "qwen3.context_length": trained } });
+        return ndjson(end);
+      });
+
+    test("num_ctx is the configured window or the trained one, whichever is smaller", async () => {
+      const url = serving(8192);
+      await collect(provider(url).stream([{ role: "user", text: "hi" }]));
+      expect(lastRequest!.body.options.num_ctx).toBe(8192);
+      // The reply cap shrinks with the window (a quarter of it, thinking off).
+      expect(lastRequest!.body.options.num_predict).toBe(2048);
+    });
+
+    test("the configured window stays the upper bound: Ollama can't tell what fits in VRAM", async () => {
+      const url = serving(131072);
+      await collect(provider(url).stream([{ role: "user", text: "hi" }]));
+      expect(lastRequest!.body.options.num_ctx).toBe(32768);
+    });
+
+    test("a /api/show that fails (or says nothing) changes nothing", async () => {
+      let url = serving(new Response("boom", { status: 500 }));
+      await collect(provider(url).stream([{ role: "user", text: "hi" }]));
+      expect(lastRequest!.body.options.num_ctx).toBe(32768);
+      server!.stop(true);
+
+      url = serving(Response.json({ model_info: {} }));
+      await collect(provider(url).stream([{ role: "user", text: "hi" }]));
+      expect(lastRequest!.body.options.num_ctx).toBe(32768);
+    });
+
+    test("a failed /api/show is asked again on the next stream (Ollama may have been starting up)", async () => {
+      let shows = 0;
+      const url = serve((req) => {
+        if (new URL(req.url).pathname !== "/api/show") return ndjson(end);
+        return ++shows === 1 ? new Response("boom", { status: 500 }) : Response.json({ model_info: { "qwen3.context_length": 8192 } });
+      });
+      const p = provider(url);
+      await collect(p.stream([{ role: "user", text: "hi" }]));
+      expect(lastRequest!.body.options.num_ctx).toBe(32768);
+      await collect(p.stream([{ role: "user", text: "hi" }]));
+      expect(lastRequest!.body.options.num_ctx).toBe(8192);
+    });
+
+    test("asks /api/show once, for the model, then keeps the window (a different num_ctx reloads the model)", async () => {
+      const paths: string[] = [];
+      const url = serve((req) => {
+        paths.push(new URL(req.url).pathname);
+        return new URL(req.url).pathname === "/api/show"
+          ? Response.json({ model_info: { "qwen3.context_length": 8192 } })
+          : ndjson(end);
+      });
+      const p = provider(url);
+      await collect(p.stream([{ role: "user", text: "hi" }]));
+      await collect(p.stream([{ role: "user", text: "hi" }]));
+      expect(paths).toEqual(["/api/show", "/api/chat", "/api/chat"]);
+      expect(lastRequest!.body.options.num_ctx).toBe(8192);
+    });
+
+    test("reports the window it runs at, once known (before that, the configured one)", async () => {
+      const p = provider(serving(8192));
+      expect(p.contextLength).toBe(32768);
+      await collect(p.stream([{ role: "user", text: "hi" }]));
+      expect(p.contextLength).toBe(8192);
+    });
+
+    test("asks /api/show for the model it was given", async () => {
+      let showBody: unknown;
+      const url = serve((req) => {
+        if (new URL(req.url).pathname !== "/api/show") return ndjson(end);
+        return req.clone().json().then((body) => ((showBody = body), Response.json({ model_info: { "qwen3.context_length": 8192 } })));
+      });
+      await collect(provider(url).stream([{ role: "user", text: "hi" }]));
+      expect(showBody).toEqual({ model: "qwen3.5:9b" });
+      expect(lastRequest!.path).toBe("/api/chat");
+    });
   });
+  test("a stream that ends without its done line retries, then reports the error", async () => {
+    let attempts = 0;
+    const url = serve((req) => {
+      if (new URL(req.url).pathname !== "/api/chat") return Response.json({}); // /api/show may fail; it changes nothing
+      attempts++;
+      return ndjson(msg({ content: "Writing the fi" }));
+    });
+    const events = await collect(provider(url).stream([{ role: "user", text: "hi" }]));
+    expect(attempts).toBe(3);
+    // The text was shown each time it streamed, and retries happened.
+    expect(events.filter((e) => e.type === "text_delta").length).toBe(3);
+    expect(events.filter((e) => e.type === "retry")).toHaveLength(2);
+    expect(events.some((e) => e.type === "error")).toBe(true);
+  }, { timeout: 20000 });
 });

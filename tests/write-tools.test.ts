@@ -136,6 +136,69 @@ describe("write_file", () => {
     expect(asked[0]!.preview.diff!.some((l) => l.kind === "del")).toBe(true);
   });
 
+  describe("append: true", () => {
+    test("parallel appends to one file all land (review, #42): each read-change-write waits for the last", async () => {
+      await writeFile(join(root, "log.txt"), "start\n");
+      const lines = Array.from({ length: 12 }, (_, i) => `line ${i}`);
+      await Promise.all(lines.map((line) => run("write_file", { path: "log.txt", content: `${line}\n`, append: true })));
+      const text = await read("log.txt");
+      for (const line of lines) expect(text).toContain(`${line}\n`);
+      expect(text.split("\n").filter(Boolean)).toHaveLength(13);
+    });
+
+    test("an append and an edit on one file at the same time both land", async () => {
+      await writeFile(join(root, "mix.txt"), "alpha\n");
+      await Promise.all([
+        run("edit_file", { path: "mix.txt", old_string: "alpha", new_string: "ALPHA" }),
+        run("write_file", { path: "mix.txt", content: "omega\n", append: true }),
+      ]);
+      expect(await read("mix.txt")).toBe("ALPHA\nomega\n");
+    });
+
+    test("adds at the end instead of replacing", async () => {
+      await writeFile(join(root, "log.txt"), "first\n");
+      const result = await run("write_file", { path: "log.txt", content: "second\n", append: true });
+      expect(result.isError).toBeFalsy();
+      expect(await read("log.txt")).toBe("first\nsecond\n");
+      expect(result.output).toContain("Appended to log.txt");
+      expect(result.summary).toBe("+1 −0");
+      expect(asked[0]!.preview.title).toBe("Append log.txt");
+      expect(asked[0]!.preview.diff).toEqual([
+        { kind: "ctx", text: "first", oldLine: 1, newLine: 1 },
+        { kind: "add", text: "second", newLine: 2 },
+      ]);
+    });
+
+    test("a last line without a newline gets one first, and the result says so", async () => {
+      await writeFile(join(root, "no-eol.txt"), "no newline yet");
+      const result = await run("write_file", { path: "no-eol.txt", content: "more\n", append: true });
+      expect(result.isError).toBeFalsy();
+      expect(await read("no-eol.txt")).toBe("no newline yet\nmore\n");
+      expect(result.output).toContain("added a newline to its last line");
+    });
+
+    test("on a file that doesn't exist it just creates it", async () => {
+      const result = await run("write_file", { path: "new.txt", content: "x\n", append: true });
+      expect(result.isError).toBeFalsy();
+      expect(await read("new.txt")).toBe("x\n");
+      expect(asked[0]!.preview.title).toBe("Create new.txt");
+      expect(result.output).toContain("Created new.txt (1 lines)");
+    });
+
+    test("a CRLF file keeps its line endings", async () => {
+      await writeFile(join(root, "win.txt"), "a\r\n");
+      const result = await run("write_file", { path: "win.txt", content: "b\n", append: true });
+      expect(await read("win.txt")).toBe("a\r\nb\r\n");
+      expect(result.output).toContain("CRLF");
+    });
+
+    test("a CRLF file without a newline on its last line gets a CRLF one, not a bare \\n", async () => {
+      await writeFile(join(root, "win2.txt"), "a\r\nb");
+      await run("write_file", { path: "win2.txt", content: "c\n", append: true });
+      expect(await read("win2.txt")).toBe("a\r\nb\r\nc\r\n");
+    });
+  });
+
   test.each([
     ["../escape.ts", "outside the project"],
     ["/tmp/escape.ts", "outside the project"],
@@ -165,6 +228,11 @@ describe("a change that breaks the file's syntax", () => {
 
   test("write_file says so for a new file too", async () => {
     const result = await run("write_file", { path: "b.ts", content: "export function f(x: number) {\n  return x +;\n}\n" });
+    expect(result.output).toContain("b.ts doesn't parse");
+  });
+
+  test("append: true too", async () => {
+    const result = await run("write_file", { path: "b.ts", content: "broken(\n", append: true });
     expect(result.output).toContain("b.ts doesn't parse");
   });
 
@@ -250,6 +318,15 @@ describe("the diff a change carries (for the transcript)", () => {
     expect(result.diff!.lines).toEqual([
       { kind: "del", text: "old", oldLine: 1 },
       { kind: "add", text: "new", newLine: 1 },
+    ]);
+  });
+
+  test("write_file append: true carries what was added", async () => {
+    await writeFile(join(root, "b.txt"), "old\n");
+    const result = await run("write_file", { path: "b.txt", content: "new\n", append: true });
+    expect(result.diff!.lines).toEqual([
+      { kind: "ctx", text: "old", oldLine: 1, newLine: 1 },
+      { kind: "add", text: "new", newLine: 2 },
     ]);
   });
 });

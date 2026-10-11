@@ -1,9 +1,10 @@
-import { lstatSync, readlinkSync, realpathSync } from "node:fs";
+import { lstatSync, readFileSync, readlinkSync, realpathSync } from "node:fs";
 import { rmdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { z } from "zod";
 import { sandboxArgs, sandboxAvailable, TOOLCHAINS } from "../sandbox.ts";
+import { repairTimeoutSeconds } from "./repair.ts";
 import type { Tool } from "./types.ts";
 
 const DEFAULT_TIMEOUT_S = 120;
@@ -17,27 +18,75 @@ const isInside = (outer: string, inner: string) => {
  * empty read-only placeholder if it isn't (so it can't create one). bwrap can't mount on a symlink, so for a .git
  * that is one, the same goes for what it points to, when that's inside the project; outside it, the sandbox
  * already shows it read-only (or hides it, in the home folder).
+ *
+ * In a git worktree, .git is a file (`gitdir: <repo>/.git/worktrees/<name>`) and the repository's data lives
+ * outside the project, usually in the hidden home folder, so git found nothing. Both the worktree's own folder
+ * and the repository's common .git are shown read-only, and the .git file too, so a command can't repoint it.
+ * The project's files say where those are, so they're only trusted when they check out the way git checks
+ * them: the worktree folder sits in `<common>/worktrees/`, and its `gitdir` file points back at this .git.
+ * Otherwise a planted `gitdir: /home/me/.ssh` would show that folder to every command that runs without asking.
  */
 function gitGuard(root: string): { readOnly?: string[]; placeholders?: string[] } {
   const gitDir = join(root, ".git");
-  let isLink: boolean;
+  let stat: ReturnType<typeof lstatSync>;
   try {
-    isLink = lstatSync(gitDir).isSymbolicLink();
+    stat = lstatSync(gitDir);
   } catch {
     return { placeholders: [gitDir] };
   }
-  if (!isLink) return { readOnly: [gitDir] };
-  const target = resolve(dirname(gitDir), readlinkSync(gitDir));
-  const realRoot = realpathSync(root);
-  let real: string;
-  try {
-    real = realpathSync(target);
-  } catch {
-    // It leads nowhere yet: inside the project, keep that spot empty too.
-    return isInside(realRoot, target) || isInside(root, target) ? { placeholders: [target] } : {};
+  if (stat.isSymbolicLink()) {
+    const target = resolve(dirname(gitDir), readlinkSync(gitDir));
+    const realRoot = realpathSync(root);
+    let real: string;
+    try {
+      real = realpathSync(target);
+    } catch {
+      // It leads nowhere yet: inside the project, keep that spot empty too.
+      return isInside(realRoot, target) || isInside(root, target) ? { placeholders: [target] } : {};
+    }
+    return isInside(realRoot, real) ? { readOnly: [real] } : {};
   }
-  return isInside(realRoot, real) ? { readOnly: [real] } : {};
+  if (stat.isFile()) return { readOnly: [gitDir, ...worktreeGitDirs(gitDir)] };
+  return { readOnly: [gitDir] };
 }
+
+/** The real path, or the path itself when it doesn't resolve. */
+function realOrSelf(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return path;
+  }
+}
+
+/** For a project whose .git is a worktree's file: its trusted git folders (see worktreeGitDirs); else none. */
+function worktreeGit(root: string): string[] {
+  const gitFile = join(root, ".git");
+  try {
+    return lstatSync(gitFile).isFile() ? worktreeGitDirs(gitFile) : [];
+  } catch {
+    return [];
+  }
+}
+
+/** A worktree's own git folder and the repository's common .git, when its .git file checks out; else none. */
+function worktreeGitDirs(gitFile: string): string[] {
+  try {
+    const match = /^gitdir:\s*(.+?)\s*$/m.exec(readFileSync(gitFile, "utf8"));
+    if (!match) return [];
+    const adminDir = realpathSync(resolve(dirname(gitFile), match[1]!));
+    // git's own check: the worktree's record points back at this .git file.
+    const back = readFileSync(join(adminDir, "gitdir"), "utf8").trim();
+    if (realpathSync(resolve(adminDir, back)) !== realpathSync(gitFile)) return [];
+    const commonDir = realpathSync(resolve(adminDir, readFileSync(join(adminDir, "commondir"), "utf8").trim()));
+    // And it's one of that repository's worktrees.
+    if (dirname(adminDir) !== join(commonDir, "worktrees")) return [];
+    return [adminDir, commonDir];
+  } catch {
+    return []; // Missing or unreadable records: show nothing more (git fails, as before).
+  }
+}
+
 /** Appended when a confined command fails on the read-only .git, so the model learns how to do it. */
 const GIT_HINT = "Marv: .git is read-only for commands that run without asking. To change the repository, run the command again with git_write: true (the user is asked).";
 /**
@@ -46,7 +95,7 @@ const GIT_HINT = "Marv: .git is read-only for commands that run without asking. 
  * trajectories for real, and searched for them for 21 steps (trajectory, 2026-10-05).
  */
 const HOME_NOTE =
-  "Marv: in the sandbox the home folder is an empty stand-in: only toolchain folders (like ~/.bun), git config and ~/.marv/skills show through, read-only. " +
+  "Marv: in the sandbox the home folder is an empty stand-in: only toolchain folders (like ~/.bun, ~/.local/share/mise, ~/.asdf), git config and ~/.marv/skills show through, read-only. " +
   "Anything else there (Marv's own config, sessions and trajectories in ~/.marv included) is invisible, so a missing file or an empty folder under ~ says nothing about the real home folder.";
 
 const WORD_START = String.raw`(?:^|[\s=:'"(<>;|&])`;
@@ -114,6 +163,7 @@ interface RunOptions {
   timeoutMs: number;
   signal?: AbortSignal;
   readOnly?: string[];
+  writable?: string[];
   placeholders?: string[];
   /** Mount the project read-only (see SandboxOptions.projectReadOnly). */
   projectReadOnly?: boolean;
@@ -128,11 +178,11 @@ const hasSetsid = Bun.which("setsid") !== null;
  * Sandboxed: inside bwrap (see src/sandbox.ts). Not sandboxed: still with a
  * minimal environment, so API keys don't leak into commands.
  */
-export async function runCommand({ command, root, sandbox, network, timeoutMs, signal, readOnly, placeholders, projectReadOnly, home = homedir() }: RunOptions): Promise<CommandResult> {
+export async function runCommand({ command, root, sandbox, network, timeoutMs, signal, readOnly, writable, placeholders, projectReadOnly, home = homedir() }: RunOptions): Promise<CommandResult> {
   const path = process.env.PATH ?? "/usr/bin:/bin";
   const script = `exec 2>&1\n${command}`; // stderr into stdout, so the output stays in order
   const argv = sandbox
-    ? ["bwrap", ...sandboxArgs({ root, home, network, path, readOnly, placeholders, projectReadOnly }), "--", "bash", "-c", script]
+    ? ["bwrap", ...sandboxArgs({ root, home, network, path, readOnly, writable, placeholders, projectReadOnly }), "--", "bash", "-c", script]
     : // setsid: its own process group, so killing it also kills everything it started.
       [...(hasSetsid ? ["setsid"] : []), "bash", "-c", script];
 
@@ -220,7 +270,7 @@ export const bash: Tool<typeof input> = {
   name: "bash",
   description:
     "Run a shell command in the project folder, e.g. to run tests, a build, git status, or wc -l. " +
-    "It runs in a sandbox: only the project folder is writable, the home folder is an empty stand-in (toolchains like ~/.bun, git config and ~/.marv/skills show through, read-only; nothing else in it is visible), " +
+    "It runs in a sandbox: only the project folder is writable, the home folder is an empty stand-in (toolchains like ~/.bun, ~/.local/share/mise, ~/.asdf, git config and ~/.marv/skills show through, read-only; nothing else in it is visible), " +
     "and there's no network unless you set network: true. The user may be asked to approve a command; they always are for network: true or git_write: true. " +
     "Not interactive: commands can't prompt for input. " +
     // A model that wrote files with heredocs put the terminator on the same line as `&& ...`, read bash's warning
@@ -235,6 +285,17 @@ export const bash: Tool<typeof input> = {
   // In the sandbox, without network, and (as runTool confines it) with .git read-only, a command can only change the
   // project's own files. Without the sandbox, nothing limits it.
   autoSafe: ({ network, git_write }, { sandbox = true }) => sandbox && sandboxAvailable() && !network && !git_write,
+  // A timeout given in milliseconds (a whole multiple of 1000, above the
+  // maximum) was meant in seconds: divided and clamped (issue #10). Anything
+  // else could still be seconds, and fails with the ordinary error.
+  repair: (raw) => {
+    if (typeof raw !== "object" || raw === null) return null;
+    const { timeout } = raw as { timeout?: unknown };
+    if (typeof timeout !== "number") return null;
+    const fixed = repairTimeoutSeconds(timeout, MAX_TIMEOUT_S);
+    if (!fixed.note) return null;
+    return { input: { ...raw, timeout: fixed.seconds }, note: fixed.note };
+  },
 
   async preview({ command, network, timeout }, { sandbox = true }) {
     const sandboxed = sandbox && sandboxAvailable();
@@ -256,6 +317,13 @@ export const bash: Tool<typeof input> = {
     // (the user's next commit, their editor), so a planted hook would escape. Without a .git, it can't create one
     // either (an empty read-only placeholder sits there), or `git status` in that folder would run its config.
     const guard = confined ? gitGuard(root) : {};
+    // An approved command (yolo off, git_write, network) in a git worktree: it may change the repository like any
+    // approved command may change a .git inside the project, but it has to see it first. The same check as above
+    // decides whether the worktree's records are trusted.
+    // A folder the caller made read-only stays that way: a worktree subagent's shared .git is read-only even for
+    // its approved commands (no commits, hooks or config from a subagent; src/worktree.ts).
+    const kept = readOnly.map((dir) => realOrSelf(dir));
+    const approvedGit = confined ? [] : worktreeGit(root).filter((dir) => !kept.some((ro) => isInside(ro, realOrSelf(dir))));
     const sandboxed = sandbox && sandboxAvailable();
     let result: CommandResult;
     try {
@@ -267,6 +335,7 @@ export const bash: Tool<typeof input> = {
         timeoutMs: timeout * 1000,
         signal,
         readOnly: [...readOnly, ...(guard.readOnly ?? [])],
+        writable: approvedGit,
         placeholders: guard.placeholders,
       });
     } finally {

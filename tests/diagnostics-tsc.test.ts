@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { checkCommand, detectChecker, diagnosticsNote, formatError, MAX_REPORTED, newErrors, parseTsc, type TsError } from "../src/diagnostics/tsc.ts";
+import { checkCommand, detectChecker, diagnosticsNote, formatError, MAX_REPORTED, missingInterpreter, newErrors, parseTsc, type TsError } from "../src/diagnostics/tsc.ts";
 
 describe("parseTsc", () => {
   test("located errors, errors about the configuration, and continuation lines", () => {
@@ -93,6 +93,26 @@ describe("the note", () => {
     expect(note.split("\n")[0]).toBe(`Marv: the typecheck (tsc) after your changes found ${MAX_REPORTED + 3} new errors:`);
     expect(note.split("\n")).toHaveLength(1 + MAX_REPORTED + 1);
     expect(note.split("\n").at(-1)).toBe("and 3 more.");
+  });
+});
+
+describe("missingInterpreter", () => {
+  test("env's 'No such file or directory' for the shebang interpreter", () => {
+    expect(missingInterpreter("env: ‘node’: No such file or directory\n", 127)).toBe("node");
+    expect(missingInterpreter("env: 'node': No such file or directory\n", 127)).toBe("node"); // straight quotes too
+    expect(missingInterpreter("env: ‘python3’: No such file or directory", 127)).toBe("python3");
+  });
+
+  test("a direct exec failing with ENOENT", () => {
+    expect(missingInterpreter("exec: No such file or directory", 127)).toBeUndefined();
+  });
+
+  test("not other failures, other exit codes, or success", () => {
+    expect(missingInterpreter("error TS2304: Cannot find name 'x'.\n", 2)).toBeUndefined();
+    expect(missingInterpreter("env: ‘node’: No such file or directory\n", 2)).toBeUndefined();
+    expect(missingInterpreter("env: ‘node’: No such file or directory\n", 0)).toBeUndefined();
+    expect(missingInterpreter("", 127)).toBeUndefined();
+    expect(missingInterpreter("env: ‘node’: permission denied\n", 126)).toBeUndefined();
   });
 });
 

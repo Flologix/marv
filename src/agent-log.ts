@@ -67,6 +67,21 @@ export function applyEvent(log: AgentLog, event: LoopEvent, now = Date.now()): v
     case "text_delta":
       log.streaming += event.text;
       break;
+    case "text_loop":
+      log.streaming = "";
+      add({ role: "system", text: event.continued ? "✻ Stuck repeating itself: the reply was stopped and dropped, and the model was told." : "Stopped: still stuck repeating itself." });
+      break;
+    case "tool_loop":
+      add({ role: "system", text: event.continued ? "✻ The same tool call kept getting the same result: answered with a note instead." : "Stopped: still repeating the same tool call." });
+      break;
+    case "retry":
+      // The provider asks again from the start: drop what the failed attempt drew, and say why.
+      log.streaming = "";
+      log.thinking = "";
+      s.thinkingSince = null;
+      delete log.draft;
+      add({ role: "system", text: event.message });
+      break;
     case "assistant":
       noteThought();
       add({ role: "assistant", text: event.text });

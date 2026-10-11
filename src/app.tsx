@@ -6,7 +6,7 @@ import { applyEvent, createAgentLog, type AgentLog } from "./agent-log.ts";
 import { GENERAL_PURPOSE, type AgentType } from "./agents.ts";
 import { copyToClipboard } from "./clipboard.ts";
 import type { HerdrReporter } from "./herdr.ts";
-import { commands, diagnosticsStatus, isCommand, runCommand, trajectoriesStatus, yoloStatus } from "./commands/index.ts";
+import { commands, diagnosticsStatus, isCommand, runCommand, stepsStatus, trajectoriesStatus, yoloStatus } from "./commands/index.ts";
 import {
   needsSetup,
   PRESETS,
@@ -33,6 +33,7 @@ import type { TrajectoryStore } from "./trajectory.ts";
 import type { McpManager, McpServerStatus } from "./mcp/manager.ts";
 import type { AgentProgress, ApprovalRequest, Decision } from "./tools/types.ts";
 import { checkNotice } from "./diagnostics/turn.ts";
+import { hiddenPathFoldersNotice } from "./commands/sandbox-notice.ts";
 import type { CommandAction } from "./commands/index.ts";
 import type { Message } from "./types.ts";
 import { AgentView, AgentViewHeader } from "./ui/AgentView.tsx";
@@ -112,6 +113,8 @@ interface Props {
   /** Agent types the agent tool can start, and files that couldn't be loaded. */
   agents?: AgentType[];
   agentProblems?: string[];
+  /** PATH folders under the home folder the sandbox can't see, shortened (~) for display; said once at startup. */
+  hiddenPathFolders?: string[];
   /** Where subagents' worktrees go (~/.marv/worktrees/<project>); without it, no worktrees. */
   worktreesDir?: string;
   /** Running in a Herdr pane: Marv reports its state there (src/herdr.ts). */
@@ -144,6 +147,7 @@ export function App({
   memory,
   agents = DEFAULT_AGENTS,
   agentProblems = NO_PROBLEMS,
+  hiddenPathFolders = NO_PROBLEMS,
   worktreesDir,
   herdr,
 }: Props) {
@@ -305,6 +309,7 @@ export function App({
         sandbox: config.sandbox,
         yolo: config.yolo,
         diagnostics: config.diagnostics,
+        maxSteps: config.maxSteps,
         sessions,
         trajectories,
         logTrajectories: config.trajectories,
@@ -325,6 +330,7 @@ export function App({
       yolo: config.yolo,
       trajectories: config.trajectories,
       diagnostics: config.diagnostics,
+      maxSteps: config.maxSteps,
     });
     setSessionVersion((v) => v + 1);
   }, [config, session, makeProvider, loadModels]);
@@ -427,6 +433,13 @@ export function App({
       let thoughtMs = 0;
       // The tool call streaming in, if any: the latest one, when a reply has several.
       let draft: { index: number; name: string; args: string } | null = null;
+      // After a retry the waiting line shows its message; the new attempt's first output clears it.
+      let retrying = false;
+      const retried = () => {
+        if (!retrying) return;
+        retrying = false;
+        setWaitingFor(null);
+      };
       const noteThought = () => {
         if (thought) {
           const seconds = Math.max(1, Math.round((thoughtMs || Date.now() - stepStarted) / 1000));
@@ -514,20 +527,35 @@ export function App({
               break;
             }
             case "thinking_delta":
+              retried();
               thought += event.text;
               scheduleFlush();
               break;
             case "text_delta":
+              retried();
               if (thought && !thoughtMs) thoughtMs = Date.now() - stepStarted;
               reply += event.text;
               scheduleFlush();
               break;
             case "tool_call_delta":
+              retried();
               if (thought && !thoughtMs) thoughtMs = Date.now() - stepStarted;
               if (!draft || draft.index !== event.index) draft = { index: event.index, name: event.name, args: "" };
               draft.name = event.name || draft.name;
               draft.args += event.text;
               scheduleFlush();
+              break;
+            case "retry":
+              // The connection was lost and the provider is asking again from the start: what the failed attempt
+              // drew (reply, reasoning, a tool call being written) goes, and the waiting line says what happened
+              // until the new attempt streams.
+              reply = "";
+              thought = "";
+              thoughtMs = 0;
+              draft = null;
+              flush();
+              setWaitingFor(event.message);
+              retrying = true;
               break;
             case "assistant":
               flush(); // a step ended: show everything before moving on
@@ -589,6 +617,15 @@ export function App({
               // The run ending here is said by done ("length"); going on, the user should know why the model changes tack.
               if (event.continued) addMessage({ role: "system", text: "✻ The reply hit the model's output limit, so nothing in it ran. Marv told the model to continue in smaller steps." });
               break;
+            case "text_loop":
+              // The reply was stuck repeating itself: it was stopped and dropped. The partial reply on screen goes.
+              reply = "";
+              flush();
+              if (event.continued) addMessage({ role: "system", text: "✻ The reply got stuck repeating itself, so Marv stopped it, dropped it, and told the model to take another approach." });
+              break;
+            case "tool_loop":
+              if (event.continued) addMessage({ role: "system", text: "✻ The model kept making the same tool call and getting the same result, so Marv answered with a note instead of running it again." });
+              break;
             case "empty_reply":
               // A first empty reply is asked for again without a word: usually the provider dropped it.
               if (event.next === "nudge") addMessage({ role: "system", text: "✻ The model sent two empty replies in a row, so Marv asked it to continue." });
@@ -598,6 +635,7 @@ export function App({
               if (event.reason === "aborted") addMessage({ role: "system", text: "Interrupted." });
               if (event.reason === "declined") addMessage({ role: "system", text: "Stopped. Tell Marv what to do instead." });
               if (event.reason === "length") addMessage({ role: "system", text: "The reply was cut off at the model's output limit, so nothing in it ran." });
+              if (event.reason === "loop") addMessage({ role: "system", text: "Stopped: the model stayed stuck in a loop after Marv's note, so the task isn't finished. Say what to try instead, or \"continue\"." });
               break;
             case "turn_end":
               // Stopped before the loop began: while waiting for MCP servers (or compacting, which said so itself).
@@ -700,6 +738,7 @@ export function App({
       skillProblems,
       agents,
       agentProblems,
+      hiddenPathFolders,
       usage: { totals, last: usage, contextLength },
       trajectoriesPath: trajectories && shortenHome(join(trajectories.dir, projectKey(root))),
       mcp: { servers: mcp?.status() ?? [], problems: mcpProblems },
@@ -754,6 +793,21 @@ export function App({
       case "diagnostics":
         void saveConfig({ ...(file ?? { provider: config.provider }), diagnostics: action.on }, `Diagnostics ${diagnosticsStatus({ ...config, diagnostics: action.on })}`);
         break;
+      case "steps": {
+        // `/steps` with no argument only showed the setting; a number (0 included) and "off" save it. The env var
+        // keeps beating the file until the process ends, as with MARV_MODEL.
+        const every = action.every;
+        if (every === undefined) break;
+        const saved = { ...(file ?? { provider: config.provider }), maxSteps: every };
+        // MARV_MAX_STEPS still wins over the file: say what's saved, and what this session actually uses.
+        const effective = resolveConfig(saved, env).maxSteps;
+        const notice =
+          effective === every
+            ? stepsStatus({ ...config, maxSteps: every })
+            : `Saved, but MARV_MAX_STEPS=${env.MARV_MAX_STEPS} overrides it while it's set. Now: ${stepsStatus({ ...config, maxSteps: effective })}`;
+        void saveConfig(saved, notice);
+        break;
+      }
       case "feedback":
         rateLastTurn(action);
         break;
@@ -1034,6 +1088,12 @@ export function App({
     const count = skillProblems.length;
     addMessage({ role: "system", isError: true, text: `${count} skill${count === 1 ? "" : "s"} couldn't be loaded (see /skills):\n${skillProblems.join("\n")}` });
   }, [skillProblems, addMessage]);
+
+  // PATH folders the sandbox can't see (issue #34: node from mise made the typecheck fail silently).
+  useEffect(() => {
+    if (hiddenPathFolders.length === 0) return;
+    addMessage({ role: "system", text: hiddenPathFoldersNotice(hiddenPathFolders) });
+  }, [hiddenPathFolders, addMessage]);
 
   // MCP: config problems right away; once the servers have started, any that failed, and a project's servers
   // waiting to be trusted (they don't start until then).
