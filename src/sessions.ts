@@ -78,16 +78,21 @@ export class SessionStore {
     return join(this.dir, legacyProjectKey(root));
   }
 
+  /** Where a session is (or will be, once it has a user message) saved. */
+  file(root: string, id: string): string {
+    return join(this.folder(root), `${id}.json`);
+  }
+
   /** Saves (or overwrites) a session. Sessions without a user message aren't saved. */
   async save(session: SavedSession): Promise<void> {
     if (!session.transcript.some((m) => m.role === "user")) return;
-    await writePrivate(join(this.folder(session.root), `${session.id}.json`), JSON.stringify({ ...session, updatedAt: Date.now() }));
+    await writePrivate(this.file(session.root, session.id), JSON.stringify({ ...session, updatedAt: Date.now() }));
     // Saved under the old key before: it lives in the new folder from now on.
     await rm(join(this.legacyFolder(session.root), `${session.id}.json`), { force: true });
   }
 
   async load(root: string, id: string): Promise<SavedSession | null> {
-    return (await this.read(join(this.folder(root), `${id}.json`), root)) ?? (await this.read(join(this.legacyFolder(root), `${id}.json`), root));
+    return (await this.read(this.file(root, id), root)) ??(await this.read(join(this.legacyFolder(root), `${id}.json`), root));
   }
 
   /** A session file of this project, or null: missing, damaged, an old format, or (in a legacy folder) another project's. */

@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, realpathSync, mkdtempSync, rmSync, symlinkSync }
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { bash, formatOutput, runCommand, touchesHiddenHome } from "../src/tools/bash.ts";
+import { bash, formatOutput, looksLikeNetworkFailure, runCommand, touchesHiddenHome } from "../src/tools/bash.ts";
 import { sandboxArgs, sandboxAvailable } from "../src/sandbox.ts";
 
 describe("sandboxArgs", () => {
@@ -371,6 +371,71 @@ describe("bash's note about the hidden home folder", () => {
 
   test("isn't added without the sandbox, where the home folder is the real one", async () => {
     expect((await run(false)).output).not.toContain("Marv: ");
+  });
+});
+
+describe("looksLikeNetworkFailure", () => {
+  test("network errors in the output", () => {
+    expect(looksLikeNetworkFailure("./fetch.sh", "curl: (6) Could not resolve host: example.com")).toBe(true);
+    expect(looksLikeNetworkFailure("bun run x", "TypeError: getaddrinfo ETIMEOUT example.com")).toBe(true);
+    expect(looksLikeNetworkFailure("bun run x", 'code: "ConnectionRefused"')).toBe(true);
+    expect(looksLikeNetworkFailure("make", "dns error: Temporary failure in name resolution")).toBe(true);
+    expect(looksLikeNetworkFailure("python3 a.py", "OSError: [Errno 101] Network is unreachable")).toBe(true);
+    expect(looksLikeNetworkFailure("node a.js", "Error: connect ECONNREFUSED 1.2.3.4:443")).toBe(true);
+  });
+
+  test("commands that need the network, whatever they print", () => {
+    expect(looksLikeNetworkFailure("gh auth status", "The token in default is invalid.")).toBe(true);
+    expect(looksLikeNetworkFailure("cd app && git pull --rebase", "")).toBe(true);
+    expect(looksLikeNetworkFailure("git clone https://github.com/a/b", "")).toBe(true);
+    expect(looksLikeNetworkFailure("bun install", "error: lockfile had changes")).toBe(true);
+    expect(looksLikeNetworkFailure("npm i zod", "")).toBe(true);
+    expect(looksLikeNetworkFailure("ls; curl -sS https://x.dev", "")).toBe(true);
+  });
+
+  test("not ordinary failures", () => {
+    expect(looksLikeNetworkFailure("bun test", "1 fail\nexpect(received).toBe(expected)")).toBe(false);
+    expect(looksLikeNetworkFailure("git status", "fatal: not a git repository")).toBe(false);
+    expect(looksLikeNetworkFailure("git commit -m x", "nothing to commit")).toBe(false);
+    expect(looksLikeNetworkFailure("cat ghost.txt", "No such file or directory")).toBe(false);
+    expect(looksLikeNetworkFailure("bun run build", "error: Could not resolve: './missing.ts'")).toBe(false);
+    expect(looksLikeNetworkFailure("ls src/gh", "")).toBe(false);
+    // npx and bunx usually run a local tool; only a network error in their output counts.
+    expect(looksLikeNetworkFailure("npx tsc --noEmit", "src/a.ts(3,7): error TS2322: Type 'string' is not assignable to type 'number'.")).toBe(false);
+    expect(looksLikeNetworkFailure("bunx eslint .", "src/a.ts\n  3:7  error  'x' is defined but never used  no-unused-vars")).toBe(false);
+    expect(looksLikeNetworkFailure("bunx cowsay hi", "error: getaddrinfo EAI_AGAIN registry.npmjs.org")).toBe(true);
+  });
+});
+
+describe("bash's note about the blocked network", () => {
+  let root: string;
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), "marv-bash-"));
+  });
+  afterEach(() => rm(root, { recursive: true, force: true }));
+  const failing = "echo 'curl: (6) Could not resolve host: example.com'; exit 6";
+
+  test.if(sandboxAvailable())("is added when a sandboxed command without network fails like that", async () => {
+    const result = await bash.run({ command: failing }, { root, sandbox: true });
+    expect(result.output).toContain("Marv: this command ran in the sandbox without network");
+    expect(result.output).toContain("network: true");
+    expect(result.output.indexOf("Could not resolve")).toBeLessThan(result.output.indexOf("Marv: "));
+    expect(result.summary).toBe("exit 6 · 1 line of output");
+  });
+
+  test.if(sandboxAvailable())("is added for a tool that needs the network, like gh", async () => {
+    const result = await bash.run({ command: "gh() { echo 'The token in default is invalid.'; return 1; }; gh auth status" }, { root, sandbox: true });
+    expect(result.output).toContain("network: true");
+  });
+
+  test.if(sandboxAvailable())("isn't added when the command succeeded, had network, or wasn't found", async () => {
+    expect((await bash.run({ command: "echo 'Could not resolve host: x'" }, { root, sandbox: true })).output).not.toContain("Marv: ");
+    expect((await bash.run({ command: failing, network: true }, { root, sandbox: true })).output).not.toContain("Marv: ");
+    expect((await bash.run({ command: "echo 'gh: command not found'; exit 127" }, { root, sandbox: true })).output).not.toContain("Marv: ");
+  });
+
+  test("isn't added without the sandbox, where the network isn't blocked", async () => {
+    expect((await bash.run({ command: failing }, { root, sandbox: false })).output).not.toContain("Marv: ");
   });
 });
 

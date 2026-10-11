@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { dirname } from "node:path";
 import { z } from "zod";
 import { changeSummary, diffText, shownDiff } from "./diff.ts";
 import { applyEdit, closestLines, type Fuzzy } from "./edit-match.ts";
@@ -21,7 +22,11 @@ async function plan({ path, old_string, new_string, replace_all }: Input, { root
   if (confined) refuseGit(root, absolute);
   const shown = projectPath(root, absolute);
   if (isDirectory(absolute)) throw new ToolError(`"${shown}" is a directory.`);
-  if (!existsSync(absolute)) throw new ToolError(`File not found: ${shown}. Use write_file to create a new file.`);
+  if (!existsSync(absolute)) {
+    // Only where write_file would put it next to real files: a mistyped folder would become a stray copy.
+    const hint = isDirectory(dirname(absolute)) ? " Use write_file to create a new file." : "";
+    throw new ToolError(`File not found: ${shown}.${hint}`);
+  }
   requireRegularFile(absolute, shown);
   const file = Bun.file(absolute);
   const before = await file.text();

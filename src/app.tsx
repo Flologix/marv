@@ -5,6 +5,7 @@ import { agentArgs } from "./agent.ts";
 import { applyEvent, createAgentLog, type AgentLog } from "./agent-log.ts";
 import { GENERAL_PURPOSE, type AgentType } from "./agents.ts";
 import { copyToClipboard } from "./clipboard.ts";
+import type { HerdrReporter } from "./herdr.ts";
 import { commands, diagnosticsStatus, isCommand, runCommand, trajectoriesStatus, yoloStatus } from "./commands/index.ts";
 import {
   needsSetup,
@@ -113,6 +114,8 @@ interface Props {
   agentProblems?: string[];
   /** Where subagents' worktrees go (~/.marv/worktrees/<project>); without it, no worktrees. */
   worktreesDir?: string;
+  /** Running in a Herdr pane: Marv reports its state there (src/herdr.ts). */
+  herdr?: HerdrReporter;
 }
 
 // "model" is the /model picker: the setup screen, starting at the model step.
@@ -142,6 +145,7 @@ export function App({
   agents = DEFAULT_AGENTS,
   agentProblems = NO_PROBLEMS,
   worktreesDir,
+  herdr,
 }: Props) {
   const { exit } = useApp();
   const { columns, rows } = useWindowSize();
@@ -324,6 +328,14 @@ export function App({
     });
     setSessionVersion((v) => v + 1);
   }, [config, session, makeProvider, loadModels]);
+  // Herdr: blocked while an approval waits for you (the main agent's, a subagent's, or "Keep going?"), working
+  // while a turn or /compact runs, idle otherwise. Herdr's sidebar and `herdr agent wait` follow this.
+  const herdrState = approval ? "blocked" : busy ? "working" : "idle";
+  const herdrMessage = approval ? [approval.head.request.agent, approval.head.request.label].filter(Boolean).join(": ") : undefined;
+  useEffect(() => herdr?.state(herdrState, herdrMessage), [herdr, herdrState, herdrMessage]);
+  // The session id changes on /clear and on a resume.
+  const sessionId = session.id;
+  useEffect(() => void herdr?.session(sessionId, sessions?.file(root, sessionId)), [herdr, sessionId, sessions, root]);
   // What the model list said about the model (OpenRouter), and its context window.
   const info = session.modelInfo;
   const contextLength = session.contextLength;

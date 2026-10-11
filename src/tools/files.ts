@@ -1,6 +1,7 @@
 // Shared file helpers for the tools: confining paths to the project, and
 // listing the project's files.
 import { existsSync, lstatSync, realpathSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { runGit } from "../git.ts";
 import { ToolError } from "./types.ts";
@@ -14,11 +15,15 @@ const isInside = (root: string, path: string) => {
 };
 
 /**
- * Resolves a path the model gave us (relative to the project, or absolute) and
- * refuses anything outside the project, including via symlinks.
+ * Resolves a path the model gave us (relative to the project, absolute, or
+ * starting with `~/`) and refuses anything outside the project, including via
+ * symlinks. `~` is the home folder, as in a shell: taken literally, `~/.config/x`
+ * became `<project>/~/.config/x`, and a model told to create it would make a
+ * stray `~` folder.
  */
-export function resolveInProject(root: string, path: string): string {
-  const absolute = isAbsolute(path) ? resolve(path) : resolve(root, path);
+export function resolveInProject(root: string, path: string, home = homedir()): string {
+  const expanded = path === "~" || path.startsWith("~/") ? join(home, path.slice(1)) : path;
+  const absolute = isAbsolute(expanded) ? resolve(expanded) : resolve(root, expanded);
   const outside = new ToolError(
     `"${path}" is outside the project (${root}). Use a path relative to the project root, like "src/app.ts".`,
   );

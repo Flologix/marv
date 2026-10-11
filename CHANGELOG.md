@@ -9,10 +9,17 @@ What counts as Marv's public API: the SDK (`@flologixai/marv/sdk`), the `marv` c
 ### Added
 
 - After the model changes files in a TypeScript project, Marv runs the project's typecheck (in the sandbox, read-only) and tells the model about errors its changes added, anywhere in the project, so it fixes the callers it broke before saying it's done. `/diagnostics on|off`, config `diagnostics`, SDK option `diagnostics` (on by default). Needs the sandbox, a `tsconfig.json` in the folder Marv starts in, and the project's own `typescript` (or tsgo) in that folder's `node_modules` (a global tsc isn't used). The SDK also exports the `CheckResult` and `TsError` types.
+- Herdr support: in a [Herdr](https://herdr.dev) pane, Marv tells Herdr what it's doing, so Herdr's sidebar shows it working, waiting for your approval, or done, and `herdr agent list`, `get`, `read` and `wait` see it. Nothing to set up. Herdr 0.8.2 doesn't yet let `herdr agent prompt` or `send-keys` drive agents it doesn't have built in; `herdr pane send-text` and `send-keys` do.
 - SDK: `maxSteps` sets how many steps a turn runs before it stops (without `approve`) or asks whether to keep going (default 25).
+
+### Changed
+
+- When a sandboxed command without network fails in a way that looks like the missing network (DNS errors, refused connections, timeouts, or tools like `gh`, `curl`, `git fetch` and `npm install`), the model is told the sandbox blocked it and to retry with network on, instead of taking, say, `gh auth status`'s "invalid token" for real.
 
 ### Fixed
 
+- File tools read a path starting with `~/` as the home folder, not a folder named `~` in the project (outside the project it's refused, as any other path there). `edit_file` no longer suggests `write_file` for a missing file whose folder doesn't exist either, which led a model to create a stray copy instead of editing the real file.
+- A file rewritten with `write_file` showed only removed lines in the collapsed diff (and the approval prompt). It now shows the first few removed lines, then the start of the new file, also with ctrl+o for a rewrite of more than 400 lines.
 - SDK: a rejected API key or an unknown model no longer says to run `/setup` or `/model`; the error names the option to change instead (`provider.apiKey`, `provider.model`).
 - Ollama: the cap on each reply shrinks to the room the prompt leaves in the context window, so in a long conversation the prompt plus the reply no longer outgrow it (the cap had been a fixed share of the window, up to half with thinking on).
 
