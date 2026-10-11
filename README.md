@@ -191,7 +191,7 @@ Put it in `.marv/agents/<name>.md` (this project) or `~/.marv/agents/<name>.md` 
 | `OLLAMA_HOST` | Where Ollama runs (default `localhost:11434`) |
 | `MARV_CONFIG_DIR` | Use a different folder instead of `~/.marv` |
 
-Ollama's context window defaults to 32k tokens (`contextLength` in the config file). That is large enough for an agent to read code, and fits in 12 GB of VRAM for 9-12B models.
+Ollama's context window defaults to 32k tokens (`contextLength` in the config file). That is large enough for an agent to read code, and fits in 12 GB of VRAM for 9-12B models. Marv never sets it past what the model was trained for (`/api/show`'s context length), so a model trained on 8k isn't run at 32k; the config value is only ever the upper bound.
 
 ## Using Marv from code
 
