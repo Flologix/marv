@@ -14,6 +14,7 @@ What counts as Marv's public API: the SDK (`@flologixai/marv/sdk`), the `marv` c
 ### Fixed
 
 - SDK: a rejected API key or an unknown model no longer says to run `/setup` or `/model`; the error names the option to change instead (`provider.apiKey`, `provider.model`).
+- Ollama: the cap on each reply shrinks to the room the prompt leaves in the context window, so in a long conversation the prompt plus the reply no longer outgrow it (the cap had been a fixed share of the window, up to half with thinking on).
 
 ## [0.1.2] - 2026-10-08
 
