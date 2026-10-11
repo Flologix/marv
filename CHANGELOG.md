@@ -9,6 +9,7 @@ What counts as Marv's public API: the SDK (`@flologixai/marv/sdk`), the `marv` c
 ### Added
 
 - After the model changes files in a TypeScript project, Marv runs the project's typecheck (in the sandbox, read-only) and tells the model about errors its changes added, anywhere in the project, so it fixes the callers it broke before saying it's done. `/diagnostics on|off`, config `diagnostics`, SDK option `diagnostics` (on by default). Needs the sandbox, a `tsconfig.json` in the folder Marv starts in, and the project's own `typescript` (or tsgo) in that folder's `node_modules` (a global tsc isn't used). The SDK also exports the `CheckResult` and `TsError` types.
+- Herdr support: in a [Herdr](https://herdr.dev) pane, Marv tells Herdr what it's doing, so Herdr's sidebar shows it working, waiting for your approval, or done, and `herdr agent list`, `get`, `read` and `wait` see it. Nothing to set up. Herdr 0.8.2 doesn't yet let `herdr agent prompt` or `send-keys` drive agents it doesn't have built in; `herdr pane send-text` and `send-keys` do.
 - SDK: `maxSteps` sets how many steps a turn runs before it stops (without `approve`) or asks whether to keep going (default 25).
 
 ## [0.1.2] - 2026-10-08
