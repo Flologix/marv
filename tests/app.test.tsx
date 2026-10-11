@@ -501,7 +501,7 @@ describe("App", () => {
 
     describe("at the step limit", () => {
       const reads = (n: number) =>
-        Array.from({ length: n }, (_, i) => [{ type: "tool_call", call: { id: `r${i}`, name: "read_file", arguments: '{"path":"notes.txt"}' } }, { type: "done" }] as AgentEvent[]);
+        Array.from({ length: n }, (_, i) => [{ type: "tool_call", call: { id: `r${i}`, name: "read_file", arguments: `{"path":"notes-${i}.txt"}` } }, { type: "done" }] as AgentEvent[]);
 
       test("it asks to keep going instead of stopping, and yes carries on", async () => {
         const model = new ScriptedProvider([...reads(25), reply("Finally done.")]);

@@ -97,7 +97,7 @@ describe("runAgent", () => {
   });
 
   test("stops after maxSteps if the model never finishes", async () => {
-    const loop = Array.from({ length: 10 }, (_, i) => useTools(call(`c${i}`, "a.ts")));
+    const loop = Array.from({ length: 10 }, (_, i) => useTools(call(`c${i}`, `file-${i}.ts`)));
     const provider = new ScriptedProvider(loop);
     const events = await run(provider, [{ role: "user", text: "go" }], { maxSteps: 3 });
 
@@ -107,7 +107,7 @@ describe("runAgent", () => {
   });
 
   test("at the limit it asks whether to keep going: yes buys another maxSteps, no stops", async () => {
-    const loop = Array.from({ length: 10 }, (_, i) => useTools(call(`c${i}`, "a.ts")));
+    const loop = Array.from({ length: 10 }, (_, i) => useTools(call(`c${i}`, `file-${i}.ts`)));
     const provider = new ScriptedProvider(loop);
     const asked: number[] = [];
     const events = await run(provider, [{ role: "user", text: "go" }], {
@@ -921,6 +921,119 @@ describe("every tool call gets exactly one result, in call order, however the ru
       expect(stopped).toEqual({ how: "throw", event: { type: "step_limit", steps: 2, continued: true } });
       expect(events.at(-1)).toBe(stopped!.event);
       expect(answerProblems(history)).toEqual([]);
+    });
+  });
+
+  describe("text loop detection", () => {
+    const repeat = (sentence: string, n: number): AgentEvent[] => [
+      { type: "text_delta", text: Array.from({ length: n }, () => sentence).join("\n") },
+      { type: "done", reason: "stop" },
+    ];
+
+    test("a sentence repeated 8+ times in the reply is caught and the reply is dropped", async () => {
+      const provider = new ScriptedProvider([repeat("Fix the test scripts now.", 10), say("I'll do something else.")]);
+      const events = await run(provider, [{ role: "user", text: "go" }]);
+      expect(events).toContainEqual({ type: "text_loop", continued: true });
+      expect(provider.requests[1]!.history.at(-1)).toEqual({ role: "user", text: expect.stringContaining("stuck repeating") });
+      expect(events.at(-1)).toEqual({ type: "done", reason: "end" });
+    });
+
+    test("a second text loop in a row ends the run", async () => {
+      const provider = new ScriptedProvider([
+        repeat("Fix the test scripts now.", 10),
+        repeat("Fix the test scripts now.", 10),
+      ]);
+      const events = await run(provider, [{ role: "user", text: "go" }]);
+      expect(events.filter((e) => e.type === "text_loop")).toEqual([
+        { type: "text_loop", continued: true },
+        { type: "text_loop", continued: false },
+      ]);
+      expect(events.at(-1)).toEqual({ type: "done", reason: "loop" });
+    });
+
+    test("a step that answered resets the text-loop count", async () => {
+      const provider = new ScriptedProvider([
+        repeat("Fix the test scripts now.", 10),
+        useTools(call("c1", "a.ts")),
+        repeat("Fix the test scripts now.", 10),
+        say("Done."),
+      ]);
+      const events = await run(provider, [{ role: "user", text: "go" }]);
+      expect(events.filter((e) => e.type === "text_loop")).toEqual([
+        { type: "text_loop", continued: true },
+        { type: "text_loop", continued: true },
+      ]);
+      expect(events.at(-1)).toEqual({ type: "done", reason: "end" });
+    });
+
+    test("varied text (ordinary lists, code) doesn't trigger", async () => {
+      const text = [
+        "- Install dependencies with `bun install`.",
+        "- Run tests with `bun test`.",
+        "- Check types with `bun run typecheck`.",
+        "- Done at http://localhost:3000.",
+      ].join("\n");
+      const provider = new ScriptedProvider([
+        [{ type: "text_delta", text }, { type: "done", reason: "stop" }],
+        say("Done."),
+      ]);
+      const events = await run(provider, [{ role: "user", text: "go" }]);
+      expect(events.some((e) => "type" in e && e.type === "text_loop")).toBe(false);
+      expect(events.at(-1)).toEqual({ type: "done", reason: "end" });
+    });
+  });
+
+  describe("tool loop detection", () => {
+    const readCall = (id: string, path: string, extra: Record<string, unknown> = {}): ToolCall =>
+      ({ id, name: "read_file", arguments: JSON.stringify({ path, ...extra }) });
+
+    test("period-1: the same read_file call 4 times warns on the 3rd, stops on the 4th", async () => {
+      const provider = new ScriptedProvider([
+        useTools(readCall("c1", "a.ts")),
+        useTools(readCall("c2", "a.ts")),
+        useTools(readCall("c3", "a.ts")),
+        useTools(readCall("c4", "a.ts")),
+      ]);
+      const events = await run(provider, [{ role: "user", text: "go" }]);
+      // Step 3: 3 identical entries in history → detection, warn, skip tools, continue
+      // Step 4: detection again, already warned → stop
+      const loopEvents = events.filter((e) => e.type === "tool_loop");
+      expect(loopEvents).toEqual([
+        { type: "tool_loop", continued: true },
+        { type: "tool_loop", continued: false },
+      ]);
+      expect(events.at(-1)).toEqual({ type: "done", reason: "loop" });
+    });
+
+    test("period-2: read_file offset 95, 98, 95, 98, 95 is caught", async () => {
+      // The exact pattern from issue #37: read_file with offset 95, then 98, alternating.
+      const provider = new ScriptedProvider([
+        useTools(readCall("c1", "src/tools/index.ts", { offset: 95, limit: 40 })),
+        useTools(readCall("c2", "src/tools/index.ts", { offset: 98, limit: 40 })),
+        useTools(readCall("c3", "src/tools/index.ts", { offset: 95, limit: 40 })),
+        useTools(readCall("c4", "src/tools/index.ts", { offset: 98, limit: 40 })),
+        useTools(readCall("c5", "src/tools/index.ts", { offset: 95, limit: 40 })),
+      ]);
+      const events = await run(provider, [{ role: "user", text: "go" }]);
+      // Step 5: 5 entries A,B,A,B,A → cycleDetected
+      const loopEvents = events.filter((e) => e.type === "tool_loop");
+      expect(loopEvents).toEqual([{ type: "tool_loop", continued: true }]);
+      expect(events.at(-1)).toEqual({ type: "done", reason: "end" }); // no more scripted steps after the warning
+    });
+
+    test("a write tool between calls resets the loop counter", async () => {
+      const provider = new ScriptedProvider([
+        useTools(readCall("c1", "a.ts")),
+        useTools(readCall("c2", "a.ts")),
+        useTools({ id: "c3", name: "write_file", arguments: JSON.stringify({ path: "a.ts", content: "edited" }) }),
+        useTools(readCall("c4", "a.ts")),
+        useTools(readCall("c5", "a.ts")),
+        say("Done."),
+      ]);
+      const events = await run(provider, [{ role: "user", text: "go" }]);
+      // The write_file reset, so 4 and 5 are fresh: history stays too short to trigger.
+      expect(events.some((e) => e.type === "tool_loop")).toBe(false);
+      expect(events.at(-1)).toEqual({ type: "done", reason: "end" });
     });
   });
 });

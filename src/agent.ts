@@ -16,6 +16,7 @@
 // finished first.
 import type { ChatTurn, Provider, ToolCall, ToolSpec, Usage } from "./provider/types.ts";
 import type { ToolResult } from "./tools/types.ts";
+import { detectTextRepetition, makeToolKey, toolLoopDetected, type ToolLoopState } from "./repetition.ts";
 
 export const DEFAULT_MAX_STEPS = 25;
 export const MAX_PARALLEL = 4;
@@ -26,6 +27,7 @@ export const NOT_RUN = {
   declined: "Not run: the user declined an earlier action.",
   cutOff:
     "Not run: your reply hit the output limit before it finished, so this call may be incomplete. Redo it in smaller steps (for a big file: write_file the first part, then add the rest with append: true).",
+  textLoop: "Not run: your reply was stuck repeating the same text, so it was dropped.",
 };
 
 /**
@@ -50,6 +52,21 @@ export const CUT_OFF_REASONING_NOTE =
  */
 export const EMPTY_REPLY_NOTE =
   "(Automatic note from Marv, the program running you) Your last reply was empty: no text and no tool calls. If the task isn't finished, continue it with your tools; if it is, say what you did.";
+
+/**
+ * Told to the model when the reply text gets stuck repeating the same sentence
+ * many times in a row. The reply is dropped entirely.
+ */
+export const TEXT_LOOP_NOTE =
+  "(Automatic note from Marv, the program running you) Your last reply got stuck repeating one sentence and was stopped; nothing in it was used. Take the next concrete step.";
+
+/**
+ * Told to the model when tool calls repeat without progress. The result
+ * of the repeated call says this, so the model sees it in the tool result.
+ */
+export const TOOL_LOOP_NOTE =
+  (repeatCount: number, callName: string) =>
+    `Marv: you have made this exact call ${repeatCount} times in a row and it returned the same result; use what it returned, or try something else.`;
 
 /**
  * A copy of the history in which every tool call has a result: calls still waiting at the end (a run that was
@@ -91,12 +108,16 @@ export type LoopEvent =
   | { type: "empty_reply"; next: "retry" | "nudge" | "stop" }
   /** A reply hit the output limit: nothing in it ran. `continued`: the model was told and goes on (once per run). */
   | { type: "cut_off"; continued: boolean }
+  /** The reply was stuck repeating the same sentence and was stopped. `continued`: the model was told (once per run). */
+  | { type: "text_loop"; continued: boolean }
+  /** The same tool calls repeated without progress: the model was told (once), or the run was stopped. */
+  | { type: "tool_loop"; continued: boolean }
   /**
    * A mid-run compaction swapped the history for the summary (the session's `onFull`): the next request starts
    * from the summary. Nothing was lost — the transcript isn't the history — but the client may want to say so.
    */
   | { type: "compacted" }
-  | { type: "done"; reason: "end" | "length" | "aborted" | "declined" | "max_steps" | "error" }
+  | { type: "done"; reason: "end" | "length" | "aborted" | "declined" | "max_steps" | "error" | "loop" }
   /** The connection was lost and the provider is retrying with a fresh request. */
   | { type: "retry"; attempt: number; max: number; message: string };
 
@@ -271,6 +292,10 @@ export async function* runAgent({
   let cutOffs = 0;
   // Empty replies in a row (see EMPTY_REPLY_NOTE).
   let empties = 0;
+  // Text loops in a row.
+  let textLoops = 0;
+  // Tool-call loop state.
+  const toolLoop: ToolLoopState = { history: [], warned: false };
   for (let step = 0; ; step++) {
     // The step limit guards against a model that never finishes. With
     // onLimit, the user decides at each multiple whether it goes on.
@@ -362,10 +387,28 @@ export async function* runAgent({
       return;
     }
     empties = 0;
+
     if (text || calls.length > 0) {
       history.push(calls.length > 0 ? { role: "assistant", text, toolCalls: calls } : { role: "assistant", text });
     }
     if (text) yield { type: "assistant", text };
+
+    // Text loop detection: check after the assistant message is in history, so it's valid if we stop.
+    if (!signal.aborted && text && detectTextRepetition(text)) {
+      const continued = ++textLoops === 1;
+      // Answer every call: the reply is dropped, so none ran.
+      for (const call of calls) history.push({ role: "tool", callId: call.id, name: call.name, text: NOT_RUN.textLoop });
+      yield { type: "text_loop", continued };
+      for (const call of calls) yield { type: "tool_skipped", call, output: NOT_RUN.textLoop };
+      if (continued) {
+        // First time: tell the model and go on.
+        history.push({ role: "user", text: TEXT_LOOP_NOTE });
+        continue;
+      }
+      yield { type: "done", reason: "loop" };
+      return;
+    }
+    textLoops = 0;
 
     if (error) {
       yield { type: "error", message: error };
@@ -392,6 +435,34 @@ export async function* runAgent({
       continue;
     }
     cutOffs = 0;
+
+    // Tool-call loop detection before running tools.
+    let toolLoopWarned = toolLoop.warned;
+    const toolLoopHit = !signal.aborted && calls.length > 0 && toolLoopDetected(toolLoop, calls.map(makeToolKey));
+    // The first time: warn instead of running the tools.
+    if (toolLoopHit && !toolLoopWarned) {
+      toolLoop.warned = true;
+      const note = TOOL_LOOP_NOTE(toolLoop.history.length, calls[0]!.name);
+      yield { type: "tool_loop", continued: true };
+      // Answer every call with the note.
+      let answered = 0;
+      for (const call of calls) {
+        history.push({ role: "tool", callId: call.id, name: call.name, text: note });
+        answered++;
+        yield { type: "tool_skipped", call, output: note };
+      }
+      continue;
+    }
+    // The second time: stop the turn.
+    if (toolLoopHit && toolLoopWarned) {
+      // Answer every call: the history must be valid.
+      for (const call of calls) history.push({ role: "tool", callId: call.id, name: call.name, text: NOT_RUN.cutOff });
+      yield { type: "tool_loop", continued: false };
+      for (const call of calls) yield { type: "tool_skipped", call, output: NOT_RUN.cutOff };
+      yield { type: "done", reason: "loop" };
+      return;
+    }
+
     if (calls.length === 0) {
       yield { type: "done", reason: signal.aborted ? "aborted" : "end" };
       return;

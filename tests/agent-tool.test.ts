@@ -124,7 +124,7 @@ describe("the agent tool", () => {
   });
 
   test("a subagent at its step limit says to start a new one, not to say \"continue\" (its history is gone)", async () => {
-    const steps = Array.from({ length: SUBAGENT_MAX_STEPS }, (_, i) => useTool(`r${i}`, "read_file", { path: "notes.txt" }));
+    const steps = Array.from({ length: SUBAGENT_MAX_STEPS }, (_, i) => useTool(`r${i}`, "read_file", { path: `notes-${i}.txt` }));
     const { host } = makeHost(new ScriptedProvider(steps));
     const result = await runTool(agentCall({ description: "endless", prompt: "p" }), ctxWith(host).ctx);
     expect(result.output).toContain(`It hit its ${SUBAGENT_MAX_STEPS}-step limit before finishing`);
