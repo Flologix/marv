@@ -1,6 +1,11 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { OllamaProvider } from "../src/provider/ollama.ts";
 import type { AgentEvent } from "../src/provider/types.ts";
+import { retryTiming } from "../src/provider/retry.ts";
+
+// Retry waits (1 s, 4 s, 10 s, Retry-After) shrunk to milliseconds, so retry tests don't wait in real time.
+beforeAll(() => void (retryTiming.scale = 0.001));
+afterAll(() => void (retryTiming.scale = 1));
 
 // A local stand-in for Ollama's native /api/chat.
 let server: ReturnType<typeof Bun.serve> | undefined;
@@ -221,10 +226,40 @@ describe("OllamaProvider", () => {
     ]);
   });
 
-  test("explains when Ollama isn't running", async () => {
+  test("explains when Ollama isn't running, after retries", async () => {
     const events = await collect(provider("http://localhost:1").stream([{ role: "user", text: "hi" }]));
-    expect(events).toEqual([{ type: "error", message: expect.stringContaining("Is Ollama running?") }]);
+    // Unable to connect is a network error, retried 3 times, then reported.
+    expect(events.filter((e) => e.type === "retry")).toHaveLength(2);
+    expect(events.some((e) => e.type === "error")).toBe(true);
+    expect((events.find((e) => e.type === "error") as { message: string }).message).toContain("Is Ollama running?");
+  }, { timeout: 20000 });
+
+  test("resends the request after an HTTP 503, succeeding on retry", async () => {
+    let attempts = 0;
+    const url = serve((req) => {
+      if (new URL(req.url).pathname !== "/api/chat") return Response.json({}); // /api/show may fail; it changes nothing
+      if (++attempts === 1) return new Response("Service Unavailable", { status: 503 });
+      return ndjson(end);
+    });
+    const events = await collect(provider(url).stream([{ role: "user", text: "hi" }]));
+    expect(attempts).toBe(2);
+    expect(events.filter((e) => e.type === "error")).toHaveLength(0);
   });
+
+  test("exhausts retries on repeated HTTP 503 and reports the error", async () => {
+    let attempts = 0;
+    const url = serve((req) => {
+      if (new URL(req.url).pathname !== "/api/chat") return Response.json({}); // /api/show may fail; it changes nothing
+      attempts++;
+      return new Response("Service Unavailable", { status: 503 });
+    });
+    const events = await collect(provider(url).stream([{ role: "user", text: "hi" }]));
+    expect(attempts).toBe(3);
+    expect(events.filter((e) => e.type === "retry")).toHaveLength(2);
+    expect(events.some((e) => e.type === "error")).toBe(true);
+    const errorEvent = events.find((e) => e.type === "error") as { message: string };
+    expect(errorEvent.message).toContain("having trouble");
+  }, { timeout: 20000 });
 
   test("exposes its context size", () => {
     expect(provider("http://localhost:11434").contextLength).toBe(32768);
@@ -309,9 +344,18 @@ describe("OllamaProvider", () => {
       expect(lastRequest!.path).toBe("/api/chat");
     });
   });
-  test("a stream that ends without its done line is an error, not a finished reply", async () => {
-    const url = serve(() => ndjson(msg({ content: "Writing the fi" })));
+  test("a stream that ends without its done line retries, then reports the error", async () => {
+    let attempts = 0;
+    const url = serve((req) => {
+      if (new URL(req.url).pathname !== "/api/chat") return Response.json({}); // /api/show may fail; it changes nothing
+      attempts++;
+      return ndjson(msg({ content: "Writing the fi" }));
+    });
     const events = await collect(provider(url).stream([{ role: "user", text: "hi" }]));
-    expect(events.map((e) => e.type)).toEqual(["text_delta", "error"]);
-  });
+    expect(attempts).toBe(3);
+    // The text was shown each time it streamed, and retries happened.
+    expect(events.filter((e) => e.type === "text_delta").length).toBe(3);
+    expect(events.filter((e) => e.type === "retry")).toHaveLength(2);
+    expect(events.some((e) => e.type === "error")).toBe(true);
+  }, { timeout: 20000 });
 });

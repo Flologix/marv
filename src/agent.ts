@@ -96,7 +96,9 @@ export type LoopEvent =
    * from the summary. Nothing was lost — the transcript isn't the history — but the client may want to say so.
    */
   | { type: "compacted" }
-  | { type: "done"; reason: "end" | "length" | "aborted" | "declined" | "max_steps" | "error" };
+  | { type: "done"; reason: "end" | "length" | "aborted" | "declined" | "max_steps" | "error" }
+  /** The connection was lost and the provider is retrying with a fresh request. */
+  | { type: "retry"; attempt: number; max: number; message: string };
 
 interface Options {
   provider: Provider;
@@ -322,6 +324,15 @@ export async function* runAgent({
           break;
         case "error":
           error = event.message;
+          break;
+        case "retry":
+          // The connection was lost and the provider is retrying from scratch:
+          // discard any partial text, calls and reasoning from the first attempt
+          // so the retry doesn't duplicate them.
+          text = "";
+          reasoned = false;
+          calls.length = 0;
+          yield event;
           break;
       }
     }

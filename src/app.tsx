@@ -531,6 +531,15 @@ export function App({
               draft.args += event.text;
               scheduleFlush();
               break;
+            case "retry":
+              // The connection was lost and the provider is retrying: discard the partial reply
+              // and show the retry message in the waiting line.
+              reply = "";
+              setStreaming("");
+              if (draft) draft = null;
+              thought = "";
+              // The next ThinkingView will show the retry message.
+              break;
             case "assistant":
               flush(); // a step ended: show everything before moving on
               noteThought();
