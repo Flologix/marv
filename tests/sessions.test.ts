@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdir, mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -43,6 +43,20 @@ describe("SessionStore", () => {
     const list = await store.list("/home/me/proj");
     expect(list.map((s) => s.title)).toEqual(["a much longer request that goes on and on and on about…", "first task"]);
     expect(list[0]).toMatchObject({ messages: 2, model: "qwen3.5:9b" });
+  });
+
+  test("sessions saved in the same millisecond list in the order they were started (CI flake, #42)", async () => {
+    // save() stamps updatedAt with Date.now(): on a fast machine two saves share it, and the order fell back to how
+    // the folder listed the files.
+    const now = spyOn(Date, "now").mockReturnValue(9000);
+    try {
+      for (const [message, at] of [["started third", 3000], ["started first", 1000], ["started second", 2000]] as const) {
+        await store.save(session("/home/me/proj", message, at));
+      }
+    } finally {
+      now.mockRestore();
+    }
+    expect((await store.list("/home/me/proj")).map((s) => s.title)).toEqual(["started third", "started second", "started first"]);
   });
 
   test("latest returns the most recent session in this project", async () => {

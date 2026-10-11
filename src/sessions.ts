@@ -115,19 +115,21 @@ export class SessionStore {
     for (const folder of [this.folder(root), this.legacyFolder(root)]) {
       if (existsSync(folder)) for (const name of await readdir(folder)) if (name.endsWith(".json")) names.add(name);
     }
-    const summaries: SessionSummary[] = [];
+    const sessions: SavedSession[] = [];
     for (const name of names) {
       const session = await this.load(root, name.slice(0, -".json".length));
-      if (!session) continue;
-      summaries.push({
-        id: session.id,
-        title: titleOf(session),
-        updatedAt: session.updatedAt,
-        messages: session.transcript.filter((m) => m.role === "user" || m.role === "assistant").length,
-        model: session.model,
-      });
+      if (session) sessions.push(session);
     }
-    return summaries.sort((a, b) => b.updatedAt - a.updatedAt);
+    // Newest first. Two sessions saved in the same millisecond (updatedAt is the save's Date.now()) tie: the one
+    // started later comes first, not whichever file the folder happened to list first.
+    sessions.sort((a, b) => b.updatedAt - a.updatedAt || b.createdAt - a.createdAt);
+    return sessions.map((session) => ({
+      id: session.id,
+      title: titleOf(session),
+      updatedAt: session.updatedAt,
+      messages: session.transcript.filter((m) => m.role === "user" || m.role === "assistant").length,
+      model: session.model,
+    }));
   }
 
   async latest(root: string): Promise<SavedSession | null> {
