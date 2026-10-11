@@ -50,6 +50,15 @@ function gitGuard(root: string): { readOnly?: string[]; placeholders?: string[] 
   return { readOnly: [gitDir] };
 }
 
+/** The real path, or the path itself when it doesn't resolve. */
+function realOrSelf(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return path;
+  }
+}
+
 /** For a project whose .git is a worktree's file: its trusted git folders (see worktreeGitDirs); else none. */
 function worktreeGit(root: string): string[] {
   const gitFile = join(root, ".git");
@@ -311,7 +320,10 @@ export const bash: Tool<typeof input> = {
     // An approved command (yolo off, git_write, network) in a git worktree: it may change the repository like any
     // approved command may change a .git inside the project, but it has to see it first. The same check as above
     // decides whether the worktree's records are trusted.
-    const approvedGit = confined ? [] : worktreeGit(root);
+    // A folder the caller made read-only stays that way: a worktree subagent's shared .git is read-only even for
+    // its approved commands (no commits, hooks or config from a subagent; src/worktree.ts).
+    const kept = readOnly.map((dir) => realOrSelf(dir));
+    const approvedGit = confined ? [] : worktreeGit(root).filter((dir) => !kept.some((ro) => isInside(ro, realOrSelf(dir))));
     const sandboxed = sandbox && sandboxAvailable();
     let result: CommandResult;
     try {

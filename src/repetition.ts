@@ -105,21 +105,17 @@ export function makeToolKey(call: { name: string; arguments: string; id?: string
  * oldest entries are dropped as new ones arrive.
  */
 function cycleDetected(history: ToolCallKey[][]): boolean {
-  if (history.length < 3) return false;
+  // The most recent steps decide: what came before a loop started (the first call of it, which had no earlier
+  // result to repeat) doesn't hide the loop.
   const keys = history.map((calls) => JSON.stringify(calls));
-
-  // Period 1: all same.
-  if (keys.length >= 3 && keys.every((k) => k === keys[0]!)) return true;
-
-  // Period 2: A,B,A,B,A,B…  Must have at least 5 entries.
-  if (keys.length >= 5 && keys[0] === keys[2] && keys[1] === keys[3]) {
-    // Check the rest follow the pattern.
-    for (let i = 4; i < keys.length; i++) {
-      if (keys[i] !== keys[i % 2]!) return false;
-    }
+  const n = keys.length;
+  // Period 1: the last 3 steps are the same.
+  if (n >= 3 && keys[n - 1] === keys[n - 2] && keys[n - 2] === keys[n - 3]) return true;
+  // Period 2: the last 5 steps go A,B,A,B,A (with A ≠ B).
+  if (n >= 5 && keys[n - 1] !== keys[n - 2]) {
+    for (let i = n - 5; i < n - 2; i++) if (keys[i] !== keys[i + 2]) return false;
     return true;
   }
-
   return false;
 }
 

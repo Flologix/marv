@@ -617,6 +617,15 @@ export function App({
               // The run ending here is said by done ("length"); going on, the user should know why the model changes tack.
               if (event.continued) addMessage({ role: "system", text: "✻ The reply hit the model's output limit, so nothing in it ran. Marv told the model to continue in smaller steps." });
               break;
+            case "text_loop":
+              // The reply was stuck repeating itself: it was stopped and dropped. The partial reply on screen goes.
+              reply = "";
+              flush();
+              if (event.continued) addMessage({ role: "system", text: "✻ The reply got stuck repeating itself, so Marv stopped it, dropped it, and told the model to take another approach." });
+              break;
+            case "tool_loop":
+              if (event.continued) addMessage({ role: "system", text: "✻ The model kept making the same tool call and getting the same result, so Marv answered with a note instead of running it again." });
+              break;
             case "empty_reply":
               // A first empty reply is asked for again without a word: usually the provider dropped it.
               if (event.next === "nudge") addMessage({ role: "system", text: "✻ The model sent two empty replies in a row, so Marv asked it to continue." });
@@ -626,6 +635,7 @@ export function App({
               if (event.reason === "aborted") addMessage({ role: "system", text: "Interrupted." });
               if (event.reason === "declined") addMessage({ role: "system", text: "Stopped. Tell Marv what to do instead." });
               if (event.reason === "length") addMessage({ role: "system", text: "The reply was cut off at the model's output limit, so nothing in it ran." });
+              if (event.reason === "loop") addMessage({ role: "system", text: "Stopped: the model stayed stuck in a loop after Marv's note, so the task isn't finished. Say what to try instead, or \"continue\"." });
               break;
             case "turn_end":
               // Stopped before the loop began: while waiting for MCP servers (or compacting, which said so itself).

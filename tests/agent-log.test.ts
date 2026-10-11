@@ -96,3 +96,13 @@ test("a retry drops what the failed attempt drew and says why (review, #36)", ()
   expect(log.draft).toBeUndefined();
   expect(log.messages.at(-1)).toMatchObject({ role: "system", text: "connection lost, retrying (1/2)…" });
 });
+
+test("loop warnings and stops are shown in a subagent's view (review, #42)", () => {
+  const log = createAgentLog({ title: "t", prompt: "p" });
+  applyEvent(log, { type: "text_delta", text: "Fix it now. Fix it now." });
+  applyEvent(log, { type: "text_loop", continued: true });
+  expect(log.streaming).toBe("");
+  expect(log.messages.at(-1)).toMatchObject({ role: "system", text: expect.stringContaining("repeating itself") });
+  applyEvent(log, { type: "tool_loop", continued: false });
+  expect(log.messages.at(-1)).toMatchObject({ role: "system", text: expect.stringContaining("Stopped") });
+});

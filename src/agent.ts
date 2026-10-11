@@ -296,6 +296,13 @@ export async function* runAgent({
   let textLoops = 0;
   // Tool-call loop state.
   const toolLoop: ToolLoopState = { history: [], warned: false };
+  // What each call (tool and arguments) returned the last time it ran, hashed. A call repeated with the same result
+  // is a loop; one whose result changes each time (the next item from a queue) is doing new work.
+  const lastResult = new Map<string, string>();
+  const callKey = (call: ToolCall) => {
+    const key = makeToolKey(call);
+    return `${key.name}\u0000${key.args}`;
+  };
   for (let step = 0; ; step++) {
     // The step limit guards against a model that never finishes. With
     // onLimit, the user decides at each multiple whether it goes on.
@@ -325,10 +332,20 @@ export async function* runAgent({
     let error: string | null = null;
     let stopReason: string | undefined;
 
-    for await (const event of provider.stream(history, { system, tools, signal })) {
+    // A reply stuck repeating itself is stopped while it streams, not after it ran its course.
+    let looped = false;
+    let checkedAt = 0;
+    stream: for await (const event of provider.stream(history, { system, tools, signal })) {
       switch (event.type) {
         case "text_delta":
           text += event.text;
+          if (text.length - checkedAt >= 400) {
+            checkedAt = text.length;
+            if (detectTextRepetition(text)) {
+              looped = true;
+              break stream;
+            }
+          }
           yield event;
           break;
         case "thinking_delta":
@@ -376,6 +393,19 @@ export async function* runAgent({
       call.id = `${base}_${n}`;
       usedIds.add(call.id);
     }
+    // A reply stuck repeating itself (caught while it streamed, or at its end): it's dropped, so none of it reaches
+    // the history (its tool calls never ran and aren't in it either), and the model is told. Twice ends the run.
+    if (!looped && !signal.aborted && text && detectTextRepetition(text)) looped = true;
+    if (looped && !signal.aborted) {
+      const continued = ++textLoops === 1;
+      yield { type: "text_loop", continued };
+      if (continued) {
+        history.push({ role: "user", text: TEXT_LOOP_NOTE });
+        continue;
+      }
+      yield { type: "done", reason: "loop" };
+      return;
+    }
     // Nothing came back: no text (whitespace doesn't count) and nothing to run. Not after an error, a cut-off (handled
     // below) or an interrupt. Nothing goes into the history for it, so a retry is the same request (cached).
     if (!text.trim() && calls.length === 0 && !error && stopReason !== "length" && !signal.aborted) {
@@ -393,21 +423,6 @@ export async function* runAgent({
     }
     if (text) yield { type: "assistant", text };
 
-    // Text loop detection: check after the assistant message is in history, so it's valid if we stop.
-    if (!signal.aborted && text && detectTextRepetition(text)) {
-      const continued = ++textLoops === 1;
-      // Answer every call: the reply is dropped, so none ran.
-      for (const call of calls) history.push({ role: "tool", callId: call.id, name: call.name, text: NOT_RUN.textLoop });
-      yield { type: "text_loop", continued };
-      for (const call of calls) yield { type: "tool_skipped", call, output: NOT_RUN.textLoop };
-      if (continued) {
-        // First time: tell the model and go on.
-        history.push({ role: "user", text: TEXT_LOOP_NOTE });
-        continue;
-      }
-      yield { type: "done", reason: "loop" };
-      return;
-    }
     textLoops = 0;
 
     if (error) {
@@ -438,7 +453,16 @@ export async function* runAgent({
 
     // Tool-call loop detection before running tools.
     let toolLoopWarned = toolLoop.warned;
-    const toolLoopHit = !signal.aborted && calls.length > 0 && toolLoopDetected(toolLoop, calls.map(makeToolKey));
+    const toolLoopHit =
+      !signal.aborted &&
+      calls.length > 0 &&
+      toolLoopDetected(
+        toolLoop,
+        calls.map((call) => {
+          const key = makeToolKey(call);
+          return { ...key, args: `${key.args}\u0000${lastResult.get(callKey(call)) ?? ""}` };
+        }),
+      );
     // The first time: warn instead of running the tools.
     if (toolLoopHit && !toolLoopWarned) {
       toolLoop.warned = true;
@@ -477,6 +501,7 @@ export async function* runAgent({
     let answered = 0;
     const answer = (call: ToolCall, text: string) => {
       history.push({ role: "tool", callId: call.id, name: call.name, text });
+      lastResult.set(callKey(call), Bun.hash(text).toString(36));
       answered++;
     };
     try {

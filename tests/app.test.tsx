@@ -570,6 +570,16 @@ describe("App", () => {
       });
     });
 
+    test("a reply stuck repeating itself is stopped with a notice, and the model goes on (review, #42)", async () => {
+      const looping: AgentEvent[] = [{ type: "text_delta", text: "Fix the test scripts now. ".repeat(60) }, { type: "done" }];
+      const model = new ScriptedProvider([looping, [{ type: "text_delta", text: "Trying another way." }, { type: "done" }]]);
+      const { lastFrame, stdin } = renderApp(LOCAL, 0, undefined, () => model);
+      await type(stdin, "go");
+      await until(() => lastFrame()!.includes("Trying another way."));
+      expect(lastFrame()).toContain("stuck repeating itself");
+      expect(lastFrame()).not.toContain("Fix the test scripts now. Fix the test scripts now.");
+    });
+
     test("a change waits for approval, then runs and the model carries on", async () => {
       const model = new ScriptedProvider([writeCall("c1", "made.txt"), reply("Created it.")]);
       const { lastFrame, stdin } = renderApp(ASKS, 0, undefined, () => model);
