@@ -25,6 +25,21 @@ describe("summarize", () => {
     expect(request.history.at(-1)).toMatchObject({ role: "user", text: expect.stringContaining("Summarize") });
   });
 
+  test("a dropped connection mid-summary: only the retried attempt's text is the summary (review, #36)", async () => {
+    // The provider retries from the start after sending part of a summary: the parts must not be joined, since
+    // the summary replaces the whole conversation.
+    const model = new ScriptedProvider([
+      [
+        { type: "text_delta", text: "Summary: half of a fir" },
+        { type: "retry", attempt: 1, max: 2, message: "connection lost, retrying (1/2)…" },
+        { type: "text_delta", text: "Summary: scroll glide added." },
+        { type: "done" },
+      ],
+    ]);
+    const result = await summarize({ provider: model, history: HISTORY, system: "S", tools: [], signal: new AbortController().signal });
+    expect(result).toEqual({ summary: "Summary: scroll glide added." });
+  });
+
   test("passes along what to focus on", async () => {
     const model = new ScriptedProvider([say("ok")]);
     await summarize({ provider: model, history: HISTORY, system: "S", tools: [], signal: new AbortController().signal, focus: "the sandbox" });

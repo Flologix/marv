@@ -433,6 +433,13 @@ export function App({
       let thoughtMs = 0;
       // The tool call streaming in, if any: the latest one, when a reply has several.
       let draft: { index: number; name: string; args: string } | null = null;
+      // After a retry the waiting line shows its message; the new attempt's first output clears it.
+      let retrying = false;
+      const retried = () => {
+        if (!retrying) return;
+        retrying = false;
+        setWaitingFor(null);
+      };
       const noteThought = () => {
         if (thought) {
           const seconds = Math.max(1, Math.round((thoughtMs || Date.now() - stepStarted) / 1000));
@@ -520,15 +527,18 @@ export function App({
               break;
             }
             case "thinking_delta":
+              retried();
               thought += event.text;
               scheduleFlush();
               break;
             case "text_delta":
+              retried();
               if (thought && !thoughtMs) thoughtMs = Date.now() - stepStarted;
               reply += event.text;
               scheduleFlush();
               break;
             case "tool_call_delta":
+              retried();
               if (thought && !thoughtMs) thoughtMs = Date.now() - stepStarted;
               if (!draft || draft.index !== event.index) draft = { index: event.index, name: event.name, args: "" };
               draft.name = event.name || draft.name;
@@ -536,13 +546,16 @@ export function App({
               scheduleFlush();
               break;
             case "retry":
-              // The connection was lost and the provider is retrying: discard the partial reply
-              // and show the retry message in the waiting line.
+              // The connection was lost and the provider is asking again from the start: what the failed attempt
+              // drew (reply, reasoning, a tool call being written) goes, and the waiting line says what happened
+              // until the new attempt streams.
               reply = "";
-              setStreaming("");
-              if (draft) draft = null;
               thought = "";
-              // The next ThinkingView will show the retry message.
+              thoughtMs = 0;
+              draft = null;
+              flush();
+              setWaitingFor(event.message);
+              retrying = true;
               break;
             case "assistant":
               flush(); // a step ended: show everything before moving on

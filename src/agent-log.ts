@@ -67,6 +67,14 @@ export function applyEvent(log: AgentLog, event: LoopEvent, now = Date.now()): v
     case "text_delta":
       log.streaming += event.text;
       break;
+    case "retry":
+      // The provider asks again from the start: drop what the failed attempt drew, and say why.
+      log.streaming = "";
+      log.thinking = "";
+      s.thinkingSince = null;
+      delete log.draft;
+      add({ role: "system", text: event.message });
+      break;
     case "assistant":
       noteThought();
       add({ role: "assistant", text: event.text });
