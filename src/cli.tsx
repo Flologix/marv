@@ -7,6 +7,7 @@ import pkg from "../package.json";
 import { loadAgents } from "./agents.ts";
 import { App } from "./app.tsx";
 import { ConfigError, ConfigStore, defaultConfigDir, migrateLegacyConfig } from "./config/config.ts";
+import { HerdrReporter, herdrTarget } from "./herdr.ts";
 import { filterMouseInput, MOUSE_OFF, MOUSE_ON } from "./mouse.ts";
 import { projectKey, shortenHome } from "./paths.ts";
 import { loadInstructions } from "./prompt.ts";
@@ -93,6 +94,10 @@ if (process.stdin.isTTY && process.stdout.isTTY) {
   process.on("exit", () => process.stdout.write("\x1b[23;0t"));
 }
 
+// In a Herdr pane, Herdr shows what Marv is doing (src/herdr.ts).
+const herdrPane = herdrTarget(process.env);
+const herdr = herdrPane && new HerdrReporter(herdrPane);
+
 let flush: () => Promise<void> = async () => {};
 const instance = render(
   <App
@@ -112,6 +117,7 @@ const instance = render(
     trajectories={new TrajectoryStore(join(defaultConfigDir(process.env), "trajectories"))}
     mcp={mcp}
     mcpProblems={mcpProblems}
+    herdr={herdr}
     onFlush={(f) => (flush = f)}
     memory={memory}
     resume={args.includes("-c") || args.includes("--continue") ? "latest" : args.includes("-r") || args.includes("--resume") ? "pick" : undefined}
@@ -126,4 +132,6 @@ await instance.waitUntilExit();
 await Promise.race([flush(), Bun.sleep(2000)]);
 // Let servers shut down cleanly, but don't hang on one that won't.
 await Promise.race([mcp?.close(), Bun.sleep(2000)]);
+// Herdr stops showing an agent in this pane; no waiting on a Herdr that doesn't answer.
+await Promise.race([herdr?.release(), Bun.sleep(1000)]);
 process.exit(0);
