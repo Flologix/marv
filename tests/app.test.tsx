@@ -476,7 +476,8 @@ describe("App", () => {
       await type(stdin, "shout the file");
       await until(() => lastFrame()!.includes("Done."));
       expect(lastFrame()).toContain("1 - line 1");
-      expect(lastFrame()).toContain("… 45 more lines (ctrl+o)");
+      expect(lastFrame()).toContain("1 + LINE 1"); // a rewrite: the start of the new file, not only removals
+      expect(lastFrame()).toContain("… 46 more lines (ctrl+o)");
       stdin.write("\x0f"); // ctrl+o
       await until(() => lastFrame()!.includes("30 + LINE 30"));
       expect(lastFrame()).not.toContain("(ctrl+o)");

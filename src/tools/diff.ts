@@ -43,6 +43,40 @@ export function addedLines(content: string): DiffLine[] {
   return text === "" ? [] : text.split("\n").map((line, i) => ({ kind: "add" as const, text: line, newLine: i + 1 }));
 }
 
+/**
+ * At most `max` lines of a diff, for a collapsed view. In order, except that a change (removed lines, then added ones)
+ * that doesn't fit keeps only its first few removals (a fifth of `max`) and a "gap" before its additions: a full rewrite
+ * lists every old line first, and would otherwise show no line of the new file.
+ */
+export function previewLines(lines: DiffLine[], max: number): DiffLine[] {
+  const keep = Math.max(1, Math.floor(max / 5));
+  const out: DiffLine[] = [];
+  let i = 0;
+  while (i < lines.length && out.length < max) {
+    if (lines[i]!.kind !== "del") {
+      out.push(lines[i++]!);
+      continue;
+    }
+    let end = i;
+    while (end < lines.length && lines[end]!.kind === "del") end++;
+    // A gap right after removals is one of ours (a hunk ends in context), from a kept diff that was already cut.
+    const adds = lines[end]?.kind === "gap" ? end + 1 : end;
+    let next = adds;
+    while (next < lines.length && lines[next]!.kind === "add") next++;
+    if (end - i > keep && next > adds && next - i > max - out.length) {
+      out.push(...lines.slice(i, i + keep), { kind: "gap", text: "…" });
+      i = adds;
+    } else {
+      out.push(...lines.slice(i, end));
+      i = end;
+    }
+  }
+  return out.slice(0, max);
+}
+
+/** Lines of the file, not counting "…" gap markers. */
+export const fileLines = (lines: DiffLine[]) => lines.filter((l) => l.kind !== "gap").length;
+
 /** The most lines of one change a tool result keeps for the transcript (saved sessions hold them too). */
 export const MAX_SHOWN_DIFF = 400;
 
@@ -52,9 +86,11 @@ export const MAX_SHOWN_DIFF = 400;
  */
 export const MAX_SHOWN_LINE_CHARS = 500;
 
+/** What a result keeps: `previewLines`, so a big rewrite keeps the new file's start; `more` counts the file lines left out. */
 export function shownDiff(lines: DiffLine[]): DiffShown {
+  const kept = previewLines(lines, MAX_SHOWN_DIFF);
   return {
-    lines: lines.slice(0, MAX_SHOWN_DIFF).map((l) => (l.text.length > MAX_SHOWN_LINE_CHARS ? { ...l, text: l.text.slice(0, MAX_SHOWN_LINE_CHARS) } : l)),
-    more: Math.max(0, lines.length - MAX_SHOWN_DIFF),
+    lines: kept.map((l) => (l.text.length > MAX_SHOWN_LINE_CHARS ? { ...l, text: l.text.slice(0, MAX_SHOWN_LINE_CHARS) } : l)),
+    more: fileLines(lines) - fileLines(kept),
   };
 }

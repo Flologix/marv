@@ -18,6 +18,7 @@ What counts as Marv's public API: the SDK (`@flologixai/marv/sdk`), the `marv` c
 ### Fixed
 
 - File tools read a path starting with `~/` as the home folder, not a folder named `~` in the project (outside the project it's refused, as any other path there). `edit_file` no longer suggests `write_file` for a missing file whose folder doesn't exist either, which led a model to create a stray copy instead of editing the real file.
+- A file rewritten with `write_file` showed only removed lines in the collapsed diff (and the approval prompt). It now shows the first few removed lines, then the start of the new file, also with ctrl+o for a rewrite of more than 400 lines.
 
 ## [0.1.2] - 2026-10-08
 
