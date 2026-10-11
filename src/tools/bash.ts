@@ -1,4 +1,4 @@
-import { lstatSync, readlinkSync, realpathSync } from "node:fs";
+import { lstatSync, readFileSync, readlinkSync, realpathSync } from "node:fs";
 import { rmdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
@@ -18,27 +18,56 @@ const isInside = (outer: string, inner: string) => {
  * empty read-only placeholder if it isn't (so it can't create one). bwrap can't mount on a symlink, so for a .git
  * that is one, the same goes for what it points to, when that's inside the project; outside it, the sandbox
  * already shows it read-only (or hides it, in the home folder).
+ *
+ * In a git worktree, .git is a file (`gitdir: <repo>/.git/worktrees/<name>`) and the repository's data lives
+ * outside the project, usually in the hidden home folder, so git found nothing. Both the worktree's own folder
+ * and the repository's common .git are shown read-only, and the .git file too, so a command can't repoint it.
+ * The project's files say where those are, so they're only trusted when they check out the way git checks
+ * them: the worktree folder sits in `<common>/worktrees/`, and its `gitdir` file points back at this .git.
+ * Otherwise a planted `gitdir: /home/me/.ssh` would show that folder to every command that runs without asking.
  */
 function gitGuard(root: string): { readOnly?: string[]; placeholders?: string[] } {
   const gitDir = join(root, ".git");
-  let isLink: boolean;
+  let stat: ReturnType<typeof lstatSync>;
   try {
-    isLink = lstatSync(gitDir).isSymbolicLink();
+    stat = lstatSync(gitDir);
   } catch {
     return { placeholders: [gitDir] };
   }
-  if (!isLink) return { readOnly: [gitDir] };
-  const target = resolve(dirname(gitDir), readlinkSync(gitDir));
-  const realRoot = realpathSync(root);
-  let real: string;
-  try {
-    real = realpathSync(target);
-  } catch {
-    // It leads nowhere yet: inside the project, keep that spot empty too.
-    return isInside(realRoot, target) || isInside(root, target) ? { placeholders: [target] } : {};
+  if (stat.isSymbolicLink()) {
+    const target = resolve(dirname(gitDir), readlinkSync(gitDir));
+    const realRoot = realpathSync(root);
+    let real: string;
+    try {
+      real = realpathSync(target);
+    } catch {
+      // It leads nowhere yet: inside the project, keep that spot empty too.
+      return isInside(realRoot, target) || isInside(root, target) ? { placeholders: [target] } : {};
+    }
+    return isInside(realRoot, real) ? { readOnly: [real] } : {};
   }
-  return isInside(realRoot, real) ? { readOnly: [real] } : {};
+  if (stat.isFile()) return { readOnly: [gitDir, ...worktreeGitDirs(gitDir)] };
+  return { readOnly: [gitDir] };
 }
+
+/** A worktree's own git folder and the repository's common .git, when its .git file checks out; else none. */
+function worktreeGitDirs(gitFile: string): string[] {
+  try {
+    const match = /^gitdir:\s*(.+?)\s*$/m.exec(readFileSync(gitFile, "utf8"));
+    if (!match) return [];
+    const adminDir = realpathSync(resolve(dirname(gitFile), match[1]!));
+    // git's own check: the worktree's record points back at this .git file.
+    const back = readFileSync(join(adminDir, "gitdir"), "utf8").trim();
+    if (realpathSync(resolve(adminDir, back)) !== realpathSync(gitFile)) return [];
+    const commonDir = realpathSync(resolve(adminDir, readFileSync(join(adminDir, "commondir"), "utf8").trim()));
+    // And it's one of that repository's worktrees.
+    if (dirname(adminDir) !== join(commonDir, "worktrees")) return [];
+    return [adminDir, commonDir];
+  } catch {
+    return []; // Missing or unreadable records: show nothing more (git fails, as before).
+  }
+}
+
 /** Appended when a confined command fails on the read-only .git, so the model learns how to do it. */
 const GIT_HINT = "Marv: .git is read-only for commands that run without asking. To change the repository, run the command again with git_write: true (the user is asked).";
 /**
