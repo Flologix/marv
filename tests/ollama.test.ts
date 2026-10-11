@@ -94,6 +94,77 @@ describe("OllamaProvider", () => {
     expect(lastRequest!.body.options).toEqual({ num_ctx: 32768, num_predict: 16384, presence_penalty: 0 });
   });
 
+  describe("fits the reply cap to the room the prompt leaves", () => {
+    const history = [{ role: "user" as const, text: "x".repeat(4000) }];
+    /** The size the provider measures a prompt by: its messages (and tools) as JSON. */
+    const chars = (h: typeof history) => JSON.stringify({ messages: h.map((t) => ({ role: t.role, content: t.text })) }).length;
+    /** Serves replies that report a prompt of `tokens`. */
+    const reporting = (tokens: number) => serve(() => ndjson({ ...end, prompt_eval_count: tokens }));
+
+    test("before any usage is known, the share of the window alone", async () => {
+      const url = reporting(20000);
+      await collect(provider(url, true).stream(history));
+      expect(lastRequest!.body.options.num_predict).toBe(16384);
+    });
+
+    test("then at most the window minus the estimated prompt (with 5% headroom)", async () => {
+      const url = reporting(20000);
+      const p = provider(url, true);
+      await collect(p.stream(history));
+      await collect(p.stream(history));
+      // Same prompt: 20000 tokens, plus 5% → 21000; 32768 − 21000 leaves 11768 (the share alone would be 16384).
+      expect(lastRequest!.body.options.num_predict).toBe(11768);
+    });
+
+    test("a prompt that grew since is estimated at the measured tokens per character", async () => {
+      const url = reporting(20000);
+      const p = provider(url, true);
+      await collect(p.stream(history));
+      const longer = [...history, { role: "user" as const, text: "y".repeat(2000) }];
+      await collect(p.stream(longer));
+      const estimate = Math.ceil((chars(longer) * 20000 * 1.05) / chars(history));
+      expect(lastRequest!.body.options.num_predict).toBe(32768 - estimate);
+    });
+
+    test("a nearly full window still leaves a short reply, not zero or less", async () => {
+      const url = reporting(32000);
+      const p = provider(url);
+      await collect(p.stream(history));
+      await collect(p.stream(history));
+      expect(lastRequest!.body.options.num_predict).toBe(1024);
+    });
+
+    test("with room to spare, the share still caps it", async () => {
+      const url = reporting(1000);
+      const p = provider(url);
+      await collect(p.stream(history));
+      await collect(p.stream(history));
+      expect(lastRequest!.body.options.num_predict).toBe(8192);
+    });
+
+    test("a cache hit (Ollama counting only the new tokens) doesn't lower the estimate", async () => {
+      let tokens = 20000;
+      const url = serve(() => ndjson({ ...end, prompt_eval_count: tokens }));
+      const p = provider(url, true);
+      await collect(p.stream(history));
+      tokens = 50;
+      await collect(p.stream(history));
+      await collect(p.stream(history));
+      expect(lastRequest!.body.options.num_predict).toBe(11768);
+    });
+
+    test("a reply without a prompt count keeps the last measurement", async () => {
+      let tokens: number | undefined = 20000;
+      const url = serve(() => ndjson({ ...end, prompt_eval_count: tokens }));
+      const p = provider(url, true);
+      await collect(p.stream(history));
+      tokens = undefined;
+      await collect(p.stream(history));
+      await collect(p.stream(history));
+      expect(lastRequest!.body.options.num_predict).toBe(11768);
+    });
+  });
+
   test("other server errors (out of memory, a failed load) aren't retried: a second try would only repeat them", async () => {
     let requests = 0;
     const url = serve(() => (++requests, Response.json({ error: "model requires more system memory" }, { status: 500 })));

@@ -11,6 +11,10 @@ What counts as Marv's public API: the SDK (`@flologixai/marv/sdk`), the `marv` c
 - After the model changes files in a TypeScript project, Marv runs the project's typecheck (in the sandbox, read-only) and tells the model about errors its changes added, anywhere in the project, so it fixes the callers it broke before saying it's done. `/diagnostics on|off`, config `diagnostics`, SDK option `diagnostics` (on by default). Needs the sandbox, a `tsconfig.json` in the folder Marv starts in, and the project's own `typescript` (or tsgo) in that folder's `node_modules` (a global tsc isn't used). The SDK also exports the `CheckResult` and `TsError` types.
 - SDK: `maxSteps` sets how many steps a turn runs before it stops (without `approve`) or asks whether to keep going (default 25).
 
+### Fixed
+
+- Ollama: the cap on each reply shrinks to the room the prompt leaves in the context window, so in a long conversation the prompt plus the reply no longer outgrow it (the cap had been a fixed share of the window, up to half with thinking on).
+
 ## [0.1.2] - 2026-10-08
 
 ### Security

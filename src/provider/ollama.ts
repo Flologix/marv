@@ -8,6 +8,10 @@ import type { AgentEvent, ChatTurn, Provider, StreamOptions, ToolCall } from "./
 const LABEL = "Ollama";
 /** The most a reply may be (num_predict), whatever the context window; twice that with thinking on. */
 const MAX_REPLY_TOKENS = 8192;
+/** The least a reply gets, however full the window: below this a model can't finish even a short answer. */
+const MIN_REPLY_TOKENS = 1024;
+/** Headroom on the prompt estimate: tokens per character differ between what was measured and what was added. */
+const PROMPT_MARGIN = 1.05;
 /** How Ollama says it couldn't parse the tool call a model wrote ("qwen tool call parsing failed: XML syntax error…"). */
 const UNPARSABLE_CALL = /tool call|pars(e|ing)|XML syntax|unexpected EOF/i;
 
@@ -82,7 +86,28 @@ function toMessages(history: ChatTurn[], system?: string) {
 }
 
 export class OllamaProvider implements Provider {
+  /** The most tokens per character of prompt JSON measured so far (Ollama's prompt_eval_count over the request's size). */
+  private tokensPerChar: number | undefined;
+
   constructor(private readonly options: Options) {}
+
+  /**
+   * num_predict for a prompt of `chars` characters. A fixed share of the window (a quarter, half with thinking on:
+   * the cap counts reasoning too), but never more than the room the prompt leaves, or prompt plus reply outgrow
+   * num_ctx. The prompt's tokens aren't known until Ollama answers, so they're estimated from the last measured
+   * request's tokens per character (the new prompt is the last one plus whatever was added since). This instance
+   * is shared by the session and its subagents, so a ratio, unlike the last count itself, still fits whichever
+   * conversation comes next, or one just compacted. The highest ratio is kept: with a cached prefix Ollama can count
+   * only the newly evaluated tokens, which only ever lowers it. Before any measurement, the share alone.
+   */
+  private replyCap(chars: number): number {
+    const { contextLength, thinking } = this.options;
+    const share = thinking ? Math.min(2 * MAX_REPLY_TOKENS, Math.floor(contextLength / 2)) : Math.min(MAX_REPLY_TOKENS, Math.floor(contextLength / 4));
+    if (!this.tokensPerChar) return share;
+    const prompt = Math.ceil(chars * this.tokensPerChar * PROMPT_MARGIN);
+    // A nearly full window still gets a short reply; the 85% warning and compaction before the next turn make room.
+    return Math.max(Math.min(share, MIN_REPLY_TOKENS), Math.min(share, contextLength - prompt));
+  }
 
   get name() {
     return `ollama · ${this.options.model}`;
@@ -96,6 +121,13 @@ export class OllamaProvider implements Provider {
     const { model, contextLength, thinking } = this.options;
     const baseUrl = this.options.baseUrl.replace(/\/v1\/?$/, "").replace(/\/+$/, "");
 
+    const prompt = {
+      messages: toMessages(history, system),
+      ...(tools?.length
+        ? { tools: tools.map((t) => ({ type: "function", function: { name: t.name, description: t.description, parameters: t.parameters } })) }
+        : {}),
+    };
+    const chars = JSON.stringify(prompt).length;
     const body = JSON.stringify({
       model,
       stream: true,
@@ -106,17 +138,15 @@ export class OllamaProvider implements Provider {
         // A cap on each reply. Without one, a model that loses its way can generate for minutes (11k tokens
         // were measured), and Ollama sends nothing while it writes a tool call. A quarter of the window leaves
         // room for the conversation and still fits a whole file (a complete boids page took ~3.5k tokens).
-        // The cap counts reasoning too, so with thinking on a reply gets twice as much.
-        num_predict: thinking ? Math.min(2 * MAX_REPLY_TOKENS, Math.floor(contextLength / 2)) : Math.min(MAX_REPLY_TOKENS, Math.floor(contextLength / 4)),
+        // The cap counts reasoning too, so with thinking on a reply gets twice as much. It shrinks to the room the
+        // prompt leaves (replyCap). It changes per request, but it's an option, not part of the prompt: the cache holds.
+        num_predict: this.replyCap(chars),
         // Some models ship a presence penalty in their Modelfile (qwen3.5: 1.5). It punishes every token already
         // used, and code reuses tokens all the time: files came out garbled and cut off, and tool calls were left
         // unclosed. With 0 the same request wrote a complete file every time.
         presence_penalty: 0,
       },
-      messages: toMessages(history, system),
-      ...(tools?.length
-        ? { tools: tools.map((t) => ({ type: "function", function: { name: t.name, description: t.description, parameters: t.parameters } })) }
-        : {}),
+      ...prompt,
     });
 
     let response: Response;
@@ -165,6 +195,7 @@ export class OllamaProvider implements Provider {
         if (line.done) {
           complete = true;
           reason = line.done_reason;
+          if (line.prompt_eval_count) this.tokensPerChar = Math.max(this.tokensPerChar ?? 0, line.prompt_eval_count / chars);
           yield { type: "usage", usage: { promptTokens: line.prompt_eval_count ?? 0, completionTokens: line.eval_count ?? 0 } };
         }
       }
