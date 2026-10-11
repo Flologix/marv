@@ -114,7 +114,8 @@ describe("slash commands", () => {
     expect(runCommand("/steps off")).toEqual({ type: "steps", every: 0 });
     expect(runCommand("/steps 0")).toEqual({ type: "steps", every: 0 });
     expect(runCommand("/STEPS 50")).toEqual({ type: "steps", every: 50 });
-    for (const bad of ["maybe", "4.5", "-3", "1e2", "1 2", "1"]) {
+    // A number too big for the config (it would be saved as null and break loading) is refused.
+    for (const bad of ["maybe", "4.5", "-3", "1e2", "1 2", "1", "9".repeat(400)]) {
       expect(runCommand(`/steps ${bad}`)).toMatchObject({ type: "print", isError: true });
     }
     const show = run("/steps", { ...ctx, config: { ...ctx.config, maxSteps: 0 } });

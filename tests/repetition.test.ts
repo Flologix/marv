@@ -159,3 +159,10 @@ describe("toolLoopDetected", () => {
     expect(state.history).toHaveLength(1);
   });
 });
+describe("makeToolKey (review: nested arguments)", () => {
+  test("nested fields count, and key order at any depth doesn't", () => {
+    const key = (args: unknown) => makeToolKey({ name: "q", arguments: JSON.stringify(args) }).args;
+    expect(key({ filter: { id: 1 } })).not.toBe(key({ filter: { id: 2 } }));
+    expect(key({ a: 1, filter: { x: 1, y: [{ b: 2, a: 1 }] } })).toBe(key({ filter: { y: [{ a: 1, b: 2 }], x: 1 }, a: 1 }));
+  });
+});

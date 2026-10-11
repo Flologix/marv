@@ -131,10 +131,12 @@ describe("sandboxArgs", () => {
     // mise's installs, asdf's shims and .bun's bin are mounted now (TOOLCHAINS); rbenv's and a private tools
     // folder aren't, and a missing folder has nothing to miss.
     const path = "/home/me/.rbenv/shims:/home/me/.local/share/mise/installs/node/26.8.2/bin:/home/me/.asdf/shims:/home/me/.bun/bin:/home/me/.tools/bin:/usr/bin:/home/me/gone/bin";
-    expect(hiddenPathFolders(path, "/home/me", (p) => !p.includes("gone"))).toEqual(["/home/me/.rbenv/shims", "/home/me/.tools/bin"]);
-    expect(hiddenPathFolders("/usr/bin:/bin", "/home/me", () => true)).toEqual([]);
+    expect(hiddenPathFolders(path, "/home/me", undefined, (p) => !p.includes("gone"))).toEqual(["/home/me/.rbenv/shims", "/home/me/.tools/bin"]);
+    expect(hiddenPathFolders("/usr/bin:/bin", "/home/me", undefined, () => true)).toEqual([]);
     // Not absolute, or inside a toolchain folder the sandbox shows: nothing hidden.
-    expect(hiddenPathFolders("relative/bin:/home/me/.bun/bin/node", "/home/me", () => true)).toEqual([]);
+    expect(hiddenPathFolders("relative/bin:/home/me/.bun/bin/node", "/home/me", undefined, () => true)).toEqual([]);
+    // The project is mounted: its own bin folders (node_modules/.bin, bin/) aren't hidden.
+    expect(hiddenPathFolders("/home/me/app/node_modules/.bin:/home/me/app/bin:/home/me/.tools/bin", "/home/me", "/home/me/app", () => true)).toEqual(["/home/me/.tools/bin"]);
   });
 
   test("network can be allowed per command", () => {

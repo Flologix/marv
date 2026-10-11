@@ -114,7 +114,7 @@ const instance = render(
     instructions={instructions}
     skills={skills}
     skillProblems={skillProblems}
-    hiddenPathFolders={hiddenPathFolders(process.env.PATH ?? "", homedir()).map((dir) => shortenHome(dir))}
+    hiddenPathFolders={hiddenPathFolders(process.env.PATH ?? "", homedir(), root).map((dir) => shortenHome(dir))}
     agents={agents}
     agentProblems={agentProblems}
     worktreesDir={join(defaultConfigDir(process.env), "worktrees", projectKey(root))}

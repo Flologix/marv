@@ -34,7 +34,7 @@ No role exists only to produce text for another role. If a new role seems needed
 ## Definition of done (per issue)
 
 All of these, checked by the orchestrator, not taken from the worker's report:
-- `bun run typecheck` is clean and `bun test` passes on the merged `sprint-N` (known environment failures listed below excepted).
+- `bun run typecheck` is clean and `bun test` passes on the merged `sprint-N` (the only allowed exceptions are those under "Known environment quirks", each with its issue).
 - The orchestrator read the whole diff. Tests prove the change: for a bug, a test that fails without the fix (check by reverting only the fix, not the whole file).
 - Behavior changes that models feel (prompts, tool handling, loop logic) have a before/after `bun run eval` with the same models, tasks and repeats.
 - CHANGELOG (Unreleased) and the matching CLAUDE.md bullet are updated.
@@ -138,6 +138,4 @@ Marv takes over a role only after passing a measured gate, not on a date:
 
 ## Known environment quirks (remove when fixed)
 
-- `tests/diagnostics-e2e.test.ts` has two failures, and the ts-* eval tasks fail, on machines where node comes from mise or asdf: the sandbox can't see it (#34).
-- Inside the sandbox, `git` doesn't work in a git worktree (#35). Workers can't run `git status`; that's expected.
-- A dropped OpenRouter connection ends a worker's turn (#36): check reachability, then tell it to continue.
+None open. Sprint 1 fixed the three it started with: node from mise or asdf invisible in the sandbox (#34), git failing in a git worktree (#35), and a dropped connection ending a worker's turn (#36). A test that fails is a failure until shown otherwise; don't excuse it as "the environment".

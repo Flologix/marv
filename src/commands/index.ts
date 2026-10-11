@@ -220,6 +220,8 @@ export const commands: Command[] = [
       if (/^off$/i.test(arg)) return { type: "steps", every: 0 };
       if (/^\d+$/.test(arg)) {
         const every = Number(arg);
+        // A huge number would be Infinity, which the saved config can't hold (JSON writes null).
+        if (!Number.isSafeInteger(every)) return { type: "print", text: "That's too many steps; use /steps off to never ask.", isError: true };
         // 1 would ask after every step; use /steps off for never asking.
         if (every === 1) return { type: "print", text: "The smallest interval is 2 steps; /steps off never asks.", isError: true };
         return { type: "steps", every };

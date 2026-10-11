@@ -775,7 +775,14 @@ export function App({
         // keeps beating the file until the process ends, as with MARV_MODEL.
         const every = action.every;
         if (every === undefined) break;
-        void saveConfig({ ...(file ?? { provider: config.provider }), maxSteps: every }, stepsStatus({ ...config, maxSteps: every }));
+        const saved = { ...(file ?? { provider: config.provider }), maxSteps: every };
+        // MARV_MAX_STEPS still wins over the file: say what's saved, and what this session actually uses.
+        const effective = resolveConfig(saved, env).maxSteps;
+        const notice =
+          effective === every
+            ? stepsStatus({ ...config, maxSteps: every })
+            : `Saved, but MARV_MAX_STEPS=${env.MARV_MAX_STEPS} overrides it while it's set. Now: ${stepsStatus({ ...config, maxSteps: effective })}`;
+        void saveConfig(saved, notice);
         break;
       }
       case "feedback":

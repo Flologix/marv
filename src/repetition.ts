@@ -76,11 +76,21 @@ export interface ToolLoopState {
   warned: boolean;
 }
 
+/** The value with every object's keys sorted, at every depth (nothing dropped), so key order doesn't matter. */
+function sortKeys(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortKeys);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, sortKeys((value as Record<string, unknown>)[key])]));
+  }
+  return value;
+}
+
 export function makeToolKey(call: { name: string; arguments: string; id?: string }): ToolCallKey {
   let normalized: string;
   try {
-    const parsed = JSON.parse(call.arguments);
-    normalized = JSON.stringify(parsed, Object.keys(parsed).sort());
+    // Not JSON.stringify(parsed, sortedTopLevelKeys): a key list there filters nested objects too, so
+    // {"filter":{"id":1}} and {"filter":{"id":2}} would compare equal.
+    normalized = JSON.stringify(sortKeys(JSON.parse(call.arguments)));
   } catch {
     normalized = call.arguments;
   }

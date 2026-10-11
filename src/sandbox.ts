@@ -46,10 +46,12 @@ export const TOOLCHAINS = [
  * Marv's own post-edit typecheck. Not the mounted ones, not inside the project, not folders that don't exist
  * (nothing to miss). Sorted by path, so a notice lists them in a stable order.
  */
-export function hiddenPathFolders(path: string, home: string, exists: (path: string) => boolean = existsSync): string[] {
+export function hiddenPathFolders(path: string, home: string, root?: string, exists: (path: string) => boolean = existsSync): string[] {
   const found = new Set<string>();
   for (const dir of path.split(":")) {
     if (!isAbsolute(dir) || !contains(home, dir) || !exists(dir)) continue;
+    // The project is mounted (writable): its node_modules/.bin or bin/ aren't hidden.
+    if (root && contains(root, dir)) continue;
     if (TOOLCHAINS.some((toolchain) => contains(join(home, toolchain), dir))) continue;
     found.add(dir);
   }

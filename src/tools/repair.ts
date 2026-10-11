@@ -99,7 +99,8 @@ export function repairJsonArgs(args: string): JsonRepair | null {
           out += ch;
           continue;
         }
-        out += ESCAPES[ch] ?? ch;
+        // The short escapes where JSON has one; any other control character (a vertical tab, NUL…) as \u00XX.
+        out += ESCAPES[ch] ?? (ch.charCodeAt(0) < 0x20 ? `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}` : ch);
         continue;
       }
       if (ch === '"') inString = true;

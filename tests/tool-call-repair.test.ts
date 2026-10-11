@@ -86,6 +86,8 @@ describe("raw control characters in the arguments' JSON strings (#10)", () => {
 
   test("an escape sequence is left alone, and control characters outside strings don't rescue broken JSON", () => {
     expect(repairJsonArgs('{"a": "x\\ty"}')).toBeNull(); // backslash-t is already the valid encoding
+    // Control characters without a short escape (vertical tab, NUL) are encoded as \u00XX, so they parse too.
+    expect(repairJsonArgs('{"a": "x\u000by\u0000z"}')?.value).toEqual({ a: "x\u000by\u0000z" });
     expect(repairJsonArgs('{\n"a": 1}')).toBeNull(); // a raw newline between tokens is legal whitespace
     expect(repairJsonArgs("{not json\t}")).toBeNull(); // a tab outside strings doesn't make broken JSON parse
     const saved = repairJsonArgs('{"a": "x\ty"}');
