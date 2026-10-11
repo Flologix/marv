@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { filesUnder, isDirectory, projectPath, resolveInProject } from "./files.ts";
+import { repairPathField } from "./repair.ts";
 import { ToolError, type Tool } from "./types.ts";
 
 const MAX_RESULTS = 200;
@@ -16,6 +17,7 @@ export const glob: Tool<typeof input> = {
     "Respects .gitignore, so dependencies and build output are skipped. Use this to explore the project's structure.",
   input,
   label: ({ pattern, path }) => (path ? `${pattern} in ${path}` : pattern),
+  repair: (raw, { root }) => repairPathField(raw, root),
 
   async run({ pattern, path = "." }, { root, gitEnv }) {
     const dir = resolveInProject(root, path);

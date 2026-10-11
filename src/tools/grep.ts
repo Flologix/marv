@@ -1,6 +1,7 @@
 import { join } from "node:path";
 import { z } from "zod";
 import { filesUnder, isDirectory, isRegularFile, requireRegularFile, looksBinary, projectPath, resolveInProject } from "./files.ts";
+import { repairPathField } from "./repair.ts";
 import { ToolError, type Tool } from "./types.ts";
 
 const MAX_MATCHES = 100;
@@ -21,6 +22,7 @@ export const grep: Tool<typeof input> = {
     "Respects .gitignore. Use this to find where something is defined or used.",
   input,
   label: ({ pattern, path }) => (path ? `"${pattern}" in ${path}` : `"${pattern}"`),
+  repair: (raw, { root }) => repairPathField(raw, root),
 
   async run({ pattern, path = ".", glob, ignoreCase }, { root, signal, gitEnv }) {
     let regex: RegExp;

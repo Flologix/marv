@@ -6,6 +6,7 @@ import { addedLines, changeSummary, diffText, shownDiff } from "./diff.ts";
 import { lineEnding, withLineEnding } from "./edit-match.ts";
 import { brokenBy, syntaxNote } from "./syntax.ts";
 import { isDirectory, projectPath, refuseGit, requireRegularFile, resolveInProject, touchesGit } from "./files.ts";
+import { repairPathField } from "./repair.ts";
 import { ToolError, type Tool, type ToolContext } from "./types.ts";
 
 const input = z.object({
@@ -51,6 +52,7 @@ export const writeFile: Tool<typeof input> = {
   label: ({ path }) => path,
   scope: () => ({ key: "files", description: "file changes" }),
   autoSafe: ({ path }, { root }) => !touchesGit(root, path),
+  repair: (raw, { root }) => repairPathField(raw, root),
 
   async preview(args, ctx) {
     void ctx.beforeChange?.().catch(() => {});
