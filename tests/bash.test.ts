@@ -329,8 +329,8 @@ describe("runCommand", () => {
         symlinkSync(elsewhere, join(root, "link"));
         const result = await run("echo never", { sandbox: true, readOnly: [join(root, "link")] });
         expect(result.exitCode).not.toBe(0);
+        // bwrap's own message, whatever its version words it (0.12: "...symlink"; Ubuntu 24.04's: "No such file or directory").
         expect(result.output).toStartWith("[sandbox failed to start: bwrap: ");
-        expect(result.output).toContain("symlink");
       } finally {
         await rm(elsewhere, { recursive: true, force: true });
       }
