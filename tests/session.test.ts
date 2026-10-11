@@ -26,7 +26,7 @@ const say = (text: string): AgentEvent[] => [
 ];
 const useTools = (...calls: ToolCall[]): AgentEvent[] => [...calls.map((c) => ({ type: "tool_call" as const, call: c })), { type: "done", reason: "tool_calls" }];
 const call = (id: string, name: string, args: Record<string, unknown>): ToolCall => ({ id, name, arguments: JSON.stringify(args) });
-const read = (id: string) => call(id, "read_file", { path: "notes.txt" });
+const read = (id: string) => call(id, "read_file", { path: id });
 const fixed = (provider: Provider, extra: Partial<ProviderFactory> = {}): ProviderFactory => ({ id: "test", model: "test-model", make: () => provider, ...extra });
 
 async function collect(events: AsyncIterable<SessionEvent>): Promise<SessionEvent[]> {

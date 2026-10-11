@@ -53,6 +53,10 @@ export type TrajectoryRecord =
   | (Who & { type: "step_limit"; steps: number; continued: boolean })
   /** A reply hit the output limit, so nothing in it ran; `continued`: the model was told (CUT_OFF_NOTE) and went on. */
   | (Who & { type: "cut_off"; continued: boolean })
+  /** A reply was stuck repeating and was stopped; `continued`: the model was told (TEXT_LOOP_NOTE) and went on (once per run). */
+  | (Who & { type: "text_loop"; continued: boolean })
+  /** Tool calls repeated without progress; `continued`: the model was warned (once), then the run was stopped. */
+  | (Who & { type: "tool_loop"; continued: boolean })
   /** A reply had no text and no tool calls; `next`: asked again, nudged (EMPTY_REPLY_NOTE), or stopped there. */
   | (Who & { type: "empty_reply"; next: "retry" | "nudge" | "stop" })
   /** The typecheck after a step's file changes (src/diagnostics): how it went, and how many errors were new. */
@@ -195,6 +199,12 @@ export class AgentRecorder {
         break;
       case "cut_off":
         this.sink({ type: "cut_off", turn, agent, continued: event.continued });
+        break;
+      case "text_loop":
+        this.sink({ type: "text_loop", turn, agent, continued: event.continued });
+        break;
+      case "tool_loop":
+        this.sink({ type: "tool_loop", turn, agent, continued: event.continued });
         break;
       case "empty_reply":
         this.sink({ type: "empty_reply", turn, agent, next: event.next });
