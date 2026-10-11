@@ -23,6 +23,7 @@ What counts as Marv's public API: the SDK (`@flologixai/marv/sdk`), the `marv` c
 
 ### Fixed
 
+- In a git worktree (`.git` is a file pointing into the main repository's `.git`, usually in the hidden home folder), git now works in the sandbox: the worktree's record and the repository's `.git` are shown read-only, and the `.git` file can't be changed. They're only shown when the `.git` file checks out the way git checks it (the record points back at it, under `<repo>/.git/worktrees/`), so a planted `gitdir:` can't show an outside folder to commands that run without asking.
 - File tools read a path starting with `~/` as the home folder, not a folder named `~` in the project (outside the project it's refused, as any other path there). `edit_file` no longer suggests `write_file` for a missing file whose folder doesn't exist either, which led a model to create a stray copy instead of editing the real file.
 - A file rewritten with `write_file` showed only removed lines in the collapsed diff (and the approval prompt). It now shows the first few removed lines, then the start of the new file, also with ctrl+o for a rewrite of more than 400 lines.
 - SDK: a rejected API key or an unknown model no longer says to run `/setup` or `/model`; the error names the option to change instead (`provider.apiKey`, `provider.model`).
