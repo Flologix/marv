@@ -11,6 +11,10 @@ What counts as Marv's public API: the SDK (`@flologixai/marv/sdk`), the `marv` c
 - After the model changes files in a TypeScript project, Marv runs the project's typecheck (in the sandbox, read-only) and tells the model about errors its changes added, anywhere in the project, so it fixes the callers it broke before saying it's done. `/diagnostics on|off`, config `diagnostics`, SDK option `diagnostics` (on by default). Needs the sandbox, a `tsconfig.json` in the folder Marv starts in, and the project's own `typescript` (or tsgo) in that folder's `node_modules` (a global tsc isn't used). The SDK also exports the `CheckResult` and `TsError` types.
 - SDK: `maxSteps` sets how many steps a turn runs before it stops (without `approve`) or asks whether to keep going (default 25).
 
+### Changed
+
+- When a sandboxed command without network fails in a way that looks like the missing network (DNS errors, refused connections, timeouts, or tools like `gh`, `curl`, `git fetch` and `npm install`), the model is told the sandbox blocked it and to retry with network on, instead of taking, say, `gh auth status`'s "invalid token" for real.
+
 ### Fixed
 
 - File tools read a path starting with `~/` as the home folder, not a folder named `~` in the project (outside the project it's refused, as any other path there). `edit_file` no longer suggests `write_file` for a missing file whose folder doesn't exist either, which led a model to create a stray copy instead of editing the real file.
