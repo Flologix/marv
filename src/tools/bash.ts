@@ -76,7 +76,7 @@ const GIT_HINT = "Marv: .git is read-only for commands that run without asking. 
  * trajectories for real, and searched for them for 21 steps (trajectory, 2026-10-05).
  */
 const HOME_NOTE =
-  "Marv: in the sandbox the home folder is an empty stand-in: only toolchain folders (like ~/.bun), git config and ~/.marv/skills show through, read-only. " +
+  "Marv: in the sandbox the home folder is an empty stand-in: only toolchain folders (like ~/.bun, ~/.local/share/mise, ~/.asdf), git config and ~/.marv/skills show through, read-only. " +
   "Anything else there (Marv's own config, sessions and trajectories in ~/.marv included) is invisible, so a missing file or an empty folder under ~ says nothing about the real home folder.";
 
 const WORD_START = String.raw`(?:^|[\s=:'"(<>;|&])`;
@@ -250,7 +250,7 @@ export const bash: Tool<typeof input> = {
   name: "bash",
   description:
     "Run a shell command in the project folder, e.g. to run tests, a build, git status, or wc -l. " +
-    "It runs in a sandbox: only the project folder is writable, the home folder is an empty stand-in (toolchains like ~/.bun, git config and ~/.marv/skills show through, read-only; nothing else in it is visible), " +
+    "It runs in a sandbox: only the project folder is writable, the home folder is an empty stand-in (toolchains like ~/.bun, ~/.local/share/mise, ~/.asdf, git config and ~/.marv/skills show through, read-only; nothing else in it is visible), " +
     "and there's no network unless you set network: true. The user may be asked to approve a command; they always are for network: true or git_write: true. " +
     "Not interactive: commands can't prompt for input. " +
     // A model that wrote files with heredocs put the terminator on the same line as `&& ...`, read bash's warning

@@ -33,6 +33,7 @@ import type { TrajectoryStore } from "./trajectory.ts";
 import type { McpManager, McpServerStatus } from "./mcp/manager.ts";
 import type { AgentProgress, ApprovalRequest, Decision } from "./tools/types.ts";
 import { checkNotice } from "./diagnostics/turn.ts";
+import { hiddenPathFoldersNotice } from "./commands/sandbox-notice.ts";
 import type { CommandAction } from "./commands/index.ts";
 import type { Message } from "./types.ts";
 import { AgentView, AgentViewHeader } from "./ui/AgentView.tsx";
@@ -112,6 +113,8 @@ interface Props {
   /** Agent types the agent tool can start, and files that couldn't be loaded. */
   agents?: AgentType[];
   agentProblems?: string[];
+  /** PATH folders under the home folder the sandbox can't see, shortened (~) for display; said once at startup. */
+  hiddenPathFolders?: string[];
   /** Where subagents' worktrees go (~/.marv/worktrees/<project>); without it, no worktrees. */
   worktreesDir?: string;
   /** Running in a Herdr pane: Marv reports its state there (src/herdr.ts). */
@@ -144,6 +147,7 @@ export function App({
   memory,
   agents = DEFAULT_AGENTS,
   agentProblems = NO_PROBLEMS,
+  hiddenPathFolders = NO_PROBLEMS,
   worktreesDir,
   herdr,
 }: Props) {
@@ -711,6 +715,7 @@ export function App({
       skillProblems,
       agents,
       agentProblems,
+      hiddenPathFolders,
       usage: { totals, last: usage, contextLength },
       trajectoriesPath: trajectories && shortenHome(join(trajectories.dir, projectKey(root))),
       mcp: { servers: mcp?.status() ?? [], problems: mcpProblems },
@@ -1053,6 +1058,12 @@ export function App({
     const count = skillProblems.length;
     addMessage({ role: "system", isError: true, text: `${count} skill${count === 1 ? "" : "s"} couldn't be loaded (see /skills):\n${skillProblems.join("\n")}` });
   }, [skillProblems, addMessage]);
+
+  // PATH folders the sandbox can't see (issue #34: node from mise made the typecheck fail silently).
+  useEffect(() => {
+    if (hiddenPathFolders.length === 0) return;
+    addMessage({ role: "system", text: hiddenPathFoldersNotice(hiddenPathFolders) });
+  }, [hiddenPathFolders, addMessage]);
 
   // MCP: config problems right away; once the servers have started, any that failed, and a project's servers
   // waiting to be trusted (they don't start until then).

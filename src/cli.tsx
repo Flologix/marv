@@ -11,6 +11,9 @@ import { HerdrReporter, herdrTarget } from "./herdr.ts";
 import { filterMouseInput, MOUSE_OFF, MOUSE_ON } from "./mouse.ts";
 import { projectKey, shortenHome } from "./paths.ts";
 import { loadInstructions } from "./prompt.ts";
+// PATH folders under the home folder the sandbox hides are found once here and reported at startup (issue #34:
+// with node from mise, the post-edit typecheck and other node_modules scripts silently never ran).
+import { hiddenPathFolders } from "./sandbox.ts";
 import { loadSkills } from "./skills.ts";
 import { SessionStore } from "./sessions.ts";
 import { TrajectoryStore } from "./trajectory.ts";
@@ -111,6 +114,7 @@ const instance = render(
     instructions={instructions}
     skills={skills}
     skillProblems={skillProblems}
+    hiddenPathFolders={hiddenPathFolders(process.env.PATH ?? "", homedir()).map((dir) => shortenHome(dir))}
     agents={agents}
     agentProblems={agentProblems}
     worktreesDir={join(defaultConfigDir(process.env), "worktrees", projectKey(root))}

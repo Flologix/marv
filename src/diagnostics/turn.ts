@@ -7,7 +7,7 @@ import { printable } from "../printable.ts";
 import { sandboxAvailable } from "../sandbox.ts";
 import { MAX_CAPTURE, runCommand, type CommandResult } from "../tools/bash.ts";
 import type { ToolResult } from "../tools/types.ts";
-import { checkCommand, detectChecker, diagnosticsNote, formatError, newErrors, parseTsc, type TsError } from "./tsc.ts";
+import { checkCommand, detectChecker, diagnosticsNote, formatError, missingInterpreter, newErrors, parseTsc, type TsError } from "./tsc.ts";
 
 /** Per check. TypeScript 7 checks Marv itself (24k lines) in half a second; TypeScript 5 is about ten times slower. */
 export const CHECK_TIMEOUT_MS = 60_000;
@@ -20,10 +20,12 @@ export type CheckResult =
   /** It ran. `added`: the errors the model was told about (none: nothing was said). */
   | { status: "done"; ms: number; before: number; errors: number; added: TsError[] }
   /**
-   * It couldn't tell what's new, so nothing was said. `notify`: the session's first unreadable output, which the
-   * transcript says once (otherwise this stays silent forever).
+   * It couldn't tell what's new, so nothing was said. `notify`: the session's first such result, which the
+   * transcript says once (otherwise this stays silent forever). `missing-interpreter`: the run died because the
+   * compiler's shebang interpreter isn't in the sandbox (usually tsc's `node`, from a toolchain folder the sandbox
+   * hides, e.g. mise's or asdf's); `tool` names it, so the notice can say that instead of "unreadable".
    */
-  | { status: "failed"; ms: number; reason: "timeout" | "unreadable"; notify?: boolean }
+  | { status: "failed"; ms: number; reason: "timeout" | "unreadable" | "missing-interpreter"; tool?: string; notify?: boolean }
   /** No checks from here on (said once per session). */
   | { status: "off"; reason: "no-sandbox" | "timeouts" };
 
@@ -102,11 +104,16 @@ export class Diagnostics {
     const run = this.opts.run ?? sandboxed;
     // A check that failed (not one Esc stopped) makes checking unavailable for the rest of this turn.
     let unavailable = false;
-    // The first unreadable result of the session asks for a notice; later ones don't repeat it.
+    // The first unreadable-or-worse result of the session asks for a notice; later ones don't repeat it.
     const unreadable = (ms: number): CheckResult => {
       const notify = !this.toldUnreadable;
       this.toldUnreadable = true;
       return { status: "failed", ms, reason: "unreadable", ...(notify ? { notify } : {}) };
+    };
+    const notifyOnce = (): { notify?: boolean } => {
+      const notify = !this.toldUnreadable;
+      this.toldUnreadable = true;
+      return notify ? { notify } : {};
     };
     const check = async (): Promise<{ errors: TsError[]; ms: number } | null> => {
       const started = Date.now();
@@ -128,11 +135,14 @@ export class Diagnostics {
         if (this.timeouts === MAX_TIMEOUTS) tell({ status: "off", reason: "timeouts" });
         return null;
       }
+      // A `#!/usr/bin/env node` launcher whose node the sandbox can't see (hidden home, e.g. mise's): that's worth
+      // saying plainly, not as an unreadable output.
+      const missing = missingInterpreter(result.output, result.exitCode);
       // Output at the capture limit was cut off, maybe mid-list: what's left would make errors look fixed or new.
-      const errors = result.output.length >= MAX_CAPTURE ? null : parseTsc(result.output, result.exitCode);
+      const errors = !missing && result.output.length < MAX_CAPTURE ? parseTsc(result.output, result.exitCode) : null;
       if (!errors) {
         unavailable = true;
-        tell(unreadable(ms));
+        tell(missing ? { status: "failed", ms, reason: "missing-interpreter", tool: missing, ...notifyOnce() } : unreadable(ms));
         return null;
       }
       return { errors, ms };
@@ -173,6 +183,11 @@ export function checkNotice(result: CheckResult): string | null {
       : "✻ The typecheck timed out twice, so Marv stopped running it for this session.";
   }
   if (result.status === "failed") {
+    if (result.reason === "missing-interpreter") {
+      return result.notify
+        ? `✻ tsc needs ${result.tool}, which the sandbox can't see (Marv's sandbox hides the home folder except known toolchains). Marv can't tell the model about new type errors.`
+        : null;
+    }
     return result.reason === "unreadable" && result.notify ? "✻ Marv couldn't read the typecheck's output here, so it can't tell the model about new errors." : null;
   }
   if (result.status !== "done" || result.added.length === 0) return null;

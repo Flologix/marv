@@ -67,6 +67,13 @@ describe("slash commands", () => {
     expect(runCommand("/sandbox maybe")).toMatchObject({ type: "print", isError: true });
   });
 
+  test("/sandbox lists PATH folders the sandbox hides, if there are any", () => {
+    const action = run("/sandbox", { ...ctx, hiddenPathFolders: ["~/.asdf/shims"] });
+    if (action.type !== "print") throw new Error("expected print");
+    expect(action.text).toContain("Your PATH has 1 folder the sandbox can't see:");
+    expect(action.text).toContain("~/.asdf/shims");
+  });
+
   test("/yolo toggles, or takes on/off", () => {
     expect(runCommand("/yolo")).toEqual({ type: "yolo", on: false }); // on by default
     expect(run("/yolo", { ...ctx, config: { ...ctx.config, yolo: false } })).toEqual({ type: "yolo", on: true });
