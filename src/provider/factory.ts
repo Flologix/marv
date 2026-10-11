@@ -2,6 +2,7 @@
 // model, and on OpenRouter the provider is remade once the model list says whether the model's reasoning can be
 // turned off (/think). A factory makes them, and says what to record in saved sessions and trajectories.
 import { resolveConfig, type Config } from "../config/config.ts";
+import { SDK_HINTS } from "./errors.ts";
 import { createProvider } from "./index.ts";
 import { listModels, type ModelInfo } from "./models.ts";
 import type { Provider } from "./types.ts";
@@ -65,5 +66,6 @@ export function providerFactory(option: ProviderOption, thinking = false): Provi
       ? { provider: "openrouter" as const, apiKey: option.apiKey, model: option.model, baseUrl: option.baseUrl }
       : { provider: "ollama" as const, model: option.model, contextLength: option.contextLength };
   const env = option.kind === "ollama" && option.host ? { OLLAMA_HOST: option.host } : {};
-  return configFactory({ ...resolveConfig(file, env), thinking });
+  // Errors name the option to change: an SDK user has no /setup or /model.
+  return configFactory({ ...resolveConfig(file, env), thinking }, (config, info) => createProvider(config, info, SDK_HINTS));
 }

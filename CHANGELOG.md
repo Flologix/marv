@@ -20,6 +20,8 @@ What counts as Marv's public API: the SDK (`@flologixai/marv/sdk`), the `marv` c
 
 - File tools read a path starting with `~/` as the home folder, not a folder named `~` in the project (outside the project it's refused, as any other path there). `edit_file` no longer suggests `write_file` for a missing file whose folder doesn't exist either, which led a model to create a stray copy instead of editing the real file.
 - A file rewritten with `write_file` showed only removed lines in the collapsed diff (and the approval prompt). It now shows the first few removed lines, then the start of the new file, also with ctrl+o for a rewrite of more than 400 lines.
+- SDK: a rejected API key or an unknown model no longer says to run `/setup` or `/model`; the error names the option to change instead (`provider.apiKey`, `provider.model`).
+- Ollama: the cap on each reply shrinks to the room the prompt leaves in the context window, so in a long conversation the prompt plus the reply no longer outgrow it (the cap had been a fixed share of the window, up to half with thinking on).
 
 ## [0.1.2] - 2026-10-08
 

@@ -15,7 +15,9 @@ import { MarvSession, type SessionEvent, type SessionInit } from "../src/session
 import { SessionStore, type SavedSession } from "../src/sessions.ts";
 import { TrajectoryStore } from "../src/trajectory.ts";
 import type { ApprovalRequest, Decision } from "../src/tools/types.ts";
+import { answerProblems } from "./answered.ts";
 import { RoutedProvider, ScriptedProvider } from "./fake-provider.ts";
+import { sandboxAvailable } from "../src/sandbox.ts";
 import { z } from "zod";
 
 const say = (text: string): AgentEvent[] => [
@@ -342,6 +344,127 @@ describe("subagents", () => {
     expect(events).toContainEqual(expect.objectContaining({ type: "subagent_progress", callId: "a1" }));
     expect(events.at(-1)).toMatchObject({ type: "turn_end", reason: "end" });
   });
+});
+
+// Issue #5: every way a turn ends leaves each tool call answered once, in call order, with real subagents too.
+describe("every tool call gets a result, with parallel subagents", () => {
+  /** Each parent step: a read, two subagents (in parallel), a read. */
+  const parallel = (sub: Provider, steps = 1) => {
+    const parent = new ScriptedProvider([
+      ...Array.from({ length: steps }, (_, i) =>
+        useTools(read(`r${i}`), call(`a${i}`, "agent", { description: "one", prompt: "sub-task: one" }), call(`b${i}`, "agent", { description: "two", prompt: "sub-task: two" }), read(`z${i}`)),
+      ),
+      say("Next."),
+    ]);
+    return { parent, provider: new RoutedProvider({ "parent-task": parent, "sub-task": sub }) };
+  };
+
+  for (const how of ["break", "throw"] as const) {
+    test(`a client that ${how}s while subagents run`, async () => {
+      const { parent, provider } = parallel(new Hanging());
+      const session = makeSession(provider);
+      const failed = new Error("the client failed");
+      let stoppedAt: SessionEvent | undefined;
+      try {
+        for await (const event of session.send("parent-task: go")) {
+          if (event.type !== "subagent") continue;
+          stoppedAt = event;
+          if (how === "break") break;
+          throw failed;
+        }
+      } catch (err) {
+        if (err !== failed) throw err;
+      }
+      expect(stoppedAt).toMatchObject({ type: "subagent", callId: expect.stringMatching(/^[ab]0$/) });
+      expect(session.busy).toBe(false);
+      await collect(session.send("next"));
+      const next = parent.requests.at(-1)!.history;
+      expect(next.some((t) => t.role === "tool" && t.callId === "b0")).toBe(true);
+      expect(answerProblems(next)).toEqual([]);
+    });
+  }
+
+  test("an interrupt while subagents run", async () => {
+    const { parent, provider } = parallel(new Hanging());
+    const session = makeSession(provider);
+    const events: SessionEvent[] = [];
+    for await (const event of session.send("parent-task: go")) {
+      events.push(event);
+      if (event.type === "subagent") session.interrupt();
+    }
+    expect(events.at(-1)).toMatchObject({ type: "turn_end", reason: "aborted" });
+    await collect(session.send("next"));
+    expect(answerProblems(parent.requests.at(-1)!.history)).toEqual([]);
+  });
+
+  test("the step limit, with and without an approver", async () => {
+    for (const approve of [undefined, async () => "no" as const]) {
+      const { parent, provider } = parallel(new ScriptedProvider(Array.from({ length: 10 }, () => say("Done."))), 2);
+      const session = makeSession(provider, { maxSteps: 2, approve });
+      const events = await collect(session.send("parent-task: go"));
+      expect(events).toContainEqual({ type: "done", reason: "max_steps" });
+      await collect(session.send("next"));
+      expect(parent.requests).toHaveLength(3);
+      const next = parent.requests[2]!.history;
+      expect(next.filter((t) => t.role === "tool")).toHaveLength(8);
+      expect(answerProblems(next)).toEqual([]);
+    }
+  });
+});
+
+// Issue #5: with no approver, a worktree dispatch needs a yes no one can give, unless yolo vouches for it (the
+// sandbox works); then inside the worktree there's no auto-yes either, only what yolo vouches for runs.
+describe("a worktree subagent with no approver", () => {
+  const git = (...args: string[]) => Bun.spawnSync(["git", ...args], { cwd: project }).stdout.toString().trim();
+  let trees: string;
+  beforeEach(() => {
+    git("init", "-q", "-b", "main");
+    git("config", "user.email", "test@example.com");
+    git("config", "user.name", "Test");
+    git("add", "-A");
+    git("commit", "-q", "-m", "first");
+    trees = join(dir, "trees");
+  });
+  const dispatch = () => {
+    const sub = new ScriptedProvider([
+      useTools(call("w1", "write_file", { path: "new.txt", content: "new\n" }), call("b1", "bash", { command: "curl example.com", network: true })),
+      say("Added new.txt."),
+    ]);
+    const parent = new ScriptedProvider([useTools(call("a1", "agent", { description: "add file", prompt: "sub-task: add it", isolation: "worktree" })), say("Parent done.")]);
+    return { sub, parent, provider: new RoutedProvider({ "parent-task": parent, "sub-task": sub }) };
+  };
+  const agentResult = (events: SessionEvent[]) => events.find((e) => e.type === "tool_end" && e.call.id === "a1") as Extract<SessionEvent, { type: "tool_end" }>;
+
+  for (const [name, init] of [
+    ["yolo off", { yolo: false }],
+    ["yolo on, sandbox off", { yolo: true, sandbox: false }],
+  ] as const) {
+    test(`${name}: the dispatch is refused at once, nothing is created, and the turn goes on`, async () => {
+      const { sub, parent, provider } = dispatch();
+      const events = await collect(makeSession(provider, { worktreesDir: trees, ...init }).send("parent-task: go"));
+      expect(agentResult(events).result).toMatchObject({ isError: true, output: "agent needs the user's approval, and there's no one to ask." });
+      expect(sub.requests).toHaveLength(0);
+      expect(parent.requests).toHaveLength(2);
+      expect(existsSync(trees)).toBe(false);
+      expect(git("branch", "--list", "marv/*")).toBe("");
+      expect(events.at(-1)).toMatchObject({ type: "turn_end", reason: "end" });
+    }, 10_000);
+  }
+
+  test.if(sandboxAvailable())("yolo on with the sandbox: it runs; yolo-safe edits land on its branch, a network command is refused", async () => {
+    const { sub, provider } = dispatch();
+    const events = await collect(makeSession(provider, { worktreesDir: trees, yolo: true }).send("parent-task: go"));
+    const { result } = agentResult(events);
+    expect(result.isError).toBeFalsy();
+    expect(result.output).toStartWith("Added new.txt.");
+    const branch = /Marv: Branch (marv\/add-file-[0-9a-f]{4}): 1 commit/.exec(result.output)?.[1];
+    expect(branch).toBeDefined();
+    expect(git("show", `${branch}:new.txt`)).toBe("new");
+    expect(existsSync(join(project, "new.txt"))).toBe(false);
+    // Inside the worktree the curl had no one to ask: refused, as a result the subagent read.
+    expect(sub.requests[1]!.history.find((t) => t.role === "tool" && t.callId === "b1")).toMatchObject({ text: "bash needs the user's approval, and there's no one to ask." });
+    expect(events.at(-1)).toMatchObject({ type: "turn_end", reason: "end" });
+  }, 20_000);
 });
 
 describe("trajectories", () => {
