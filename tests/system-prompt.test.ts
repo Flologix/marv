@@ -20,7 +20,7 @@ describe("systemPrompt", () => {
   test("says to write files with the file tools, not shell heredocs (small models got lost in those), and so does bash", () => {
     const prompt = systemPrompt({ cwd: "~/proj", date: DATE, tools: ["read_file", "write_file", "bash"] });
     expect(prompt).toContain("never through bash (no heredocs or echo >)");
-    expect(prompt).toContain("write the first part with write_file, then add the rest with edit_file");
+    expect(prompt).toContain("write the first part with write_file, then add the rest with append: true");
     expect(bash.description).toContain("Don't write files with it (no heredocs or echo >): use write_file or edit_file");
   });
 

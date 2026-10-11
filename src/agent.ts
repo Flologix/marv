@@ -25,7 +25,7 @@ export const NOT_RUN = {
   aborted: "Interrupted by the user before this tool ran.",
   declined: "Not run: the user declined an earlier action.",
   cutOff:
-    "Not run: your reply hit the output limit before it finished, so this call may be incomplete. Redo it in smaller steps (for a big file: write_file the first part, then add the rest with edit_file).",
+    "Not run: your reply hit the output limit before it finished, so this call may be incomplete. Redo it in smaller steps (for a big file: write_file the first part, then add the rest with append: true).",
 };
 
 /**
@@ -34,14 +34,14 @@ export const NOT_RUN = {
  * was still writing), and would likely try the same thing again.
  */
 export const CUT_OFF_NOTE =
-  "(Automatic note from Marv, the program running you) Your last reply hit the output limit and was cut off before it finished; nothing in it was run. Continue in smaller steps (for a big file: write_file the first part, then add the rest with edit_file).";
+  "(Automatic note from Marv, the program running you) Your last reply hit the output limit and was cut off before it finished; nothing in it was run. Continue in smaller steps (for a big file: write_file the first part, then add the rest with append: true).";
 
 /**
  * The same for a reply that reasoned and left nothing (thinking models). It either reasoned until the limit or
  * started a tool call that was cut off and dropped (Ollama drops an unfinished one): Marv can't tell which.
  */
 export const CUT_OFF_REASONING_NOTE =
-  "(Automatic note from Marv, the program running you) Your last reply used up the output limit, while reasoning or while writing a tool call (an unfinished call is dropped), so it did nothing. Reason briefly, and write a big file in parts (write_file the first part, then add the rest with edit_file).";
+  "(Automatic note from Marv, the program running you) Your last reply used up the output limit, while reasoning or while writing a tool call (an unfinished call is dropped), so it did nothing. Reason briefly, and write a big file in parts (write_file the first part, then add the rest with append: true).";
 
 /**
  * Told to the model after a second empty reply in a row (no text, no tool calls). The first is asked for again
