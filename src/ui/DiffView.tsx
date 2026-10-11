@@ -2,6 +2,7 @@
 // and the transcript (after one), so both look the same.
 import { Box, Text } from "ink";
 import { printable } from "../printable.ts";
+import { fileLines, previewLines } from "../tools/diff.ts";
 import type { DiffLine } from "../tools/types.ts";
 import { theme } from "./theme.ts";
 
@@ -24,9 +25,8 @@ export function DiffView({
   hint?: string;
   indent?: number;
 }) {
-  const shown = max === undefined ? lines : lines.slice(0, max);
-  // "…" gap markers between hunks aren't lines of the file.
-  const hiddenHere = lines.slice(shown.length).filter((l) => l.kind !== "gap").length;
+  const shown = max === undefined ? lines : previewLines(lines, max);
+  const hiddenHere = fileLines(lines) - fileLines(shown);
   const hidden = hiddenHere + more;
   // Removed lines show their old number, the others their new one; one column wide enough for all of them, shown
   // or not, so the text doesn't shift when ctrl+o shows the rest.

@@ -476,7 +476,8 @@ describe("App", () => {
       await type(stdin, "shout the file");
       await until(() => lastFrame()!.includes("Done."));
       expect(lastFrame()).toContain("1 - line 1");
-      expect(lastFrame()).toContain("… 45 more lines (ctrl+o)");
+      expect(lastFrame()).toContain("1 + LINE 1"); // a rewrite: the start of the new file, not only removals
+      expect(lastFrame()).toContain("… 46 more lines (ctrl+o)");
       stdin.write("\x0f"); // ctrl+o
       await until(() => lastFrame()!.includes("30 + LINE 30"));
       expect(lastFrame()).not.toContain("(ctrl+o)");
@@ -1018,20 +1019,21 @@ describe("App", () => {
 
     test("/remember, /memory and /forget edit memory directly", async () => {
       const { lastFrame, stdin } = await renderWithMemory(new ScriptedProvider([]));
+      // Each message appears only after its file write, so waiting for it also waits for the file.
       await type(stdin, "/remember uses bun, not npm");
-      await tick();
+      await until(() => lastFrame()!.includes("Saved to personal memory."));
       await type(stdin, "/remember project: tests need Ollama running");
-      await tick();
+      await until(() => lastFrame()!.includes("Saved to project memory."));
       expect(lastFrame()).toContain("Saved to project memory.");
       expect(await loadMemory(paths)).toEqual({ personal: ["uses bun, not npm"], project: ["tests need Ollama running"] });
 
       await type(stdin, "/memory");
-      await tick();
+      await until(() => lastFrame()!.includes("• tests need Ollama running"));
       expect(lastFrame()).toContain("• uses bun, not npm");
       expect(lastFrame()).toContain("• tests need Ollama running");
 
       await type(stdin, "/forget ollama");
-      await tick();
+      await until(() => lastFrame()!.includes("Forgot:"));
       expect(lastFrame()).toContain("Forgot: tests need Ollama running");
       expect((await loadMemory(paths)).project).toEqual([]);
     });

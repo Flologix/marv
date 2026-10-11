@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { runTool, toolSpecs } from "../src/tools/index.ts";
-import { listProjectFiles } from "../src/tools/files.ts";
+import { listProjectFiles, resolveInProject } from "../src/tools/files.ts";
 import { ToolError } from "../src/tools/types.ts";
 import { z } from "zod";
 import type { ToolCall } from "../src/provider/types.ts";
@@ -87,6 +87,34 @@ describe("read_file", () => {
   test("doesn't dump binary files", async () => {
     const result = await run("read_file", { path: "logo.png" });
     expect(result.output).toBe("Binary file (7 bytes), not shown.");
+  });
+});
+
+describe("~/ paths (#22)", () => {
+  test("a leading ~/ is the home folder, not a folder named ~", () => {
+    expect(resolveInProject(root, "~/src/app.ts", root)).toBe(join(root, "src/app.ts"));
+    expect(resolveInProject(root, "~", root)).toBe(root);
+    expect(resolveInProject(root, "~src/app.ts", root)).toBe(join(root, "~src/app.ts")); // not ~user
+  });
+
+  test.each([
+    ["read_file", { path: "~/x.txt" }],
+    ["edit_file", { path: "~/x.txt", old_string: "a", new_string: "b" }],
+    ["write_file", { path: "~/x.txt", content: "hi\n" }],
+  ])("%s with ~/ outside the project is refused, and creates nothing", async (name, args) => {
+    expect(root.startsWith(homedir() + "/")).toBe(false); // the temp project isn't the home folder
+    const result = await run(name, args);
+    expect(result.isError).toBe(true);
+    expect(result.output).toContain("outside the project");
+    expect(result.output).not.toContain("write_file");
+    expect(existsSync(join(root, "~"))).toBe(false);
+  });
+
+  test("edit_file suggests write_file only when the folder exists", async () => {
+    const inFolder = await run("edit_file", { path: "src/new.ts", old_string: "a", new_string: "b" });
+    expect(inFolder.output).toBe("File not found: src/new.ts. Use write_file to create a new file.");
+    const noFolder = await run("edit_file", { path: "nope/new.ts", old_string: "a", new_string: "b" });
+    expect(noFolder.output).toBe("File not found: nope/new.ts.");
   });
 });
 
