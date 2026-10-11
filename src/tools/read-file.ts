@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import { z } from "zod";
 import { looksBinary, isDirectory, projectPath, requireRegularFile, resolveInProject } from "./files.ts";
+import { repairPathField } from "./repair.ts";
 import { ToolError, type Tool } from "./types.ts";
 
 const DEFAULT_LIMIT = 400;
@@ -26,6 +27,7 @@ export const readFile: Tool<typeof input> = {
     `Reads up to ${DEFAULT_LIMIT} lines at a time; use offset and limit to page through longer files.`,
   input,
   label: ({ path }) => path,
+  repair: (raw, { root }) => repairPathField(raw, root),
 
   async run({ path, offset = 1, limit = DEFAULT_LIMIT }, { root }) {
     const absolute = resolveInProject(root, path);

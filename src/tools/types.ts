@@ -141,6 +141,15 @@ export interface Tool<S extends z.ZodType = z.ZodType> {
    * outside the sandbox) and it can't reach the network. Absent: always ask.
    */
   autoSafe?(input: z.infer<S>, ctx: ToolContext): boolean;
+  /**
+   * A malformed call whose meaning is beyond doubt, fixed before the input is
+   * validated (issue #10): bash's `timeout` given in milliseconds, a project
+   * path written with a leading slash. Returns the input to use and what to
+   * tell the model (a "Marv:" note on the result), or null to leave the call
+   * as it is — anything it could still mean two ways is an error the model
+   * can recover from. Never throws.
+   */
+  repair?(raw: unknown, ctx: ToolContext): { input: unknown; note: string | null } | null;
   run(input: z.infer<S>, ctx: ToolContext): Promise<ToolResult>;
 }
 

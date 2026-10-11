@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { z } from "zod";
 import { sandboxArgs, sandboxAvailable, TOOLCHAINS } from "../sandbox.ts";
+import { repairTimeoutSeconds } from "./repair.ts";
 import type { Tool } from "./types.ts";
 
 const DEFAULT_TIMEOUT_S = 120;
@@ -235,6 +236,17 @@ export const bash: Tool<typeof input> = {
   // In the sandbox, without network, and (as runTool confines it) with .git read-only, a command can only change the
   // project's own files. Without the sandbox, nothing limits it.
   autoSafe: ({ network, git_write }, { sandbox = true }) => sandbox && sandboxAvailable() && !network && !git_write,
+  // A timeout given in milliseconds (a whole multiple of 1000, above the
+  // maximum) was meant in seconds: divided and clamped (issue #10). Anything
+  // else could still be seconds, and fails with the ordinary error.
+  repair: (raw) => {
+    if (typeof raw !== "object" || raw === null) return null;
+    const { timeout } = raw as { timeout?: unknown };
+    if (typeof timeout !== "number") return null;
+    const fixed = repairTimeoutSeconds(timeout, MAX_TIMEOUT_S);
+    if (!fixed.note) return null;
+    return { input: { ...raw, timeout: fixed.seconds }, note: fixed.note };
+  },
 
   async preview({ command, network, timeout }, { sandbox = true }) {
     const sandboxed = sandbox && sandboxAvailable();

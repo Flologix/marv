@@ -11,6 +11,7 @@ import { glob } from "./glob.ts";
 import { grep } from "./grep.ts";
 import { memory } from "./memory.ts";
 import { readFile } from "./read-file.ts";
+import { repairJsonArgs, withNote } from "./repair.ts";
 import { skill } from "./skill.ts";
 import { webFetch } from "./web-fetch.ts";
 import { writeFile } from "./write-file.ts";
@@ -49,13 +50,45 @@ export async function runTool(call: ToolCall, ctx: ToolContext, available: Tool[
   if (!tool) return fail(`Unknown tool "${call.name}". Available tools: ${available.map((t) => t.name).join(", ")}.`);
 
   let raw: unknown;
+  let jsonNote: string | null = null;
   try {
     raw = JSON.parse(call.arguments || "{}");
   } catch {
-    return fail(`The arguments for ${call.name} are not valid JSON: ${call.arguments}`);
+    // A weaker model puts literal tabs or newlines inside JSON strings (issue
+    // #10), which JSON.parse rejects. Escaping those is unambiguous; anything
+    // else stays an error the model can recover from.
+    const repaired = repairJsonArgs(call.arguments || "{}");
+    if (!repaired) return fail(`The arguments for ${call.name} are not valid JSON: ${call.arguments}`);
+    raw = repaired.value;
+    jsonNote = repaired.note;
   }
-  const parsed = tool.input.safeParse(raw);
-  if (!parsed.success) return fail(`Invalid input for ${call.name}:\n${z.prettifyError(parsed.error)}`);
+  // A tool's own repair of what it can read with certainty (bash's timeout in
+  // milliseconds, a path with a leading slash that only exists relative to the
+  // project), applied before validation so the call runs as meant.
+  let repairedInput: unknown = raw;
+  let repairNote: string | null = null;
+  try {
+    const perTool = tool.repair?.(raw, ctx);
+    if (perTool) {
+      repairedInput = perTool.input;
+      repairNote = perTool.note;
+    }
+  } catch {
+    repairedInput = raw; // A repair must never break a call that would have run.
+  }
+  // A repaired call says so in its result (a "Marv:" note): the model learns
+  // the right form instead of repeating the malformed one. The JSON repair and
+  // the tool's own repair can both fire in one call; their notes then go out
+  // together, separated by a blank line (or none, when neither fired).
+  const note = [jsonNote, repairNote].filter(Boolean).join("\n\n") || null;
+  // Every result from here on (a run, an approval's answer, a failure) carries
+  // the note, so the model reads what was repaired however the call ended.
+  const noted = (result: ToolResult & { label: string }): ToolResult & { label: string } => ({
+    ...result,
+    output: withNote(result.output, note),
+  });
+  const parsed = tool.input.safeParse(repairedInput);
+  if (!parsed.success) return noted(fail(`Invalid input for ${call.name}:\n${z.prettifyError(parsed.error)}`));
 
   const label = shortLabel(tool.label(parsed.data), ctx.root);
   try {
@@ -71,38 +104,38 @@ export async function runTool(call: ToolCall, ctx: ToolContext, available: Tool[
       // as the interrupt it was; `declined` stops the loop like any other stop
       // (runAgent checks the abort first, so the model reads "Interrupted").
       if (ctx.signal?.aborted) {
-        return { output: NOT_RUN.aborted, summary: "interrupted", declined: true, label, approval: "interrupted" };
+        return noted({ output: NOT_RUN.aborted, summary: "interrupted", declined: true, label, approval: "interrupted" });
       }
       // Yolo: a call the tool vouches for runs without asking, confined (bash
       // then can't touch .git). It still went through the preview above, so
       // a call that can't succeed fails the same way.
       if (ctx.yolo && tool.autoSafe?.(parsed.data, ctx)) {
-        return { ...(await tool.run(parsed.data, { ...ctx, callId: call.id, confined: true })), label, approval: "auto" };
+        return noted({ ...(await tool.run(parsed.data, { ...ctx, callId: call.id, confined: true })), label, approval: "auto" });
       }
       // No one to ask (a program using the SDK without an approver): refused, as an error the model can read and
       // work around, rather than a "no" that would stop the run.
-      if (!ctx.approve) return fail(`${call.name} needs the user's approval, and there's no one to ask.`, label);
+      if (!ctx.approve) return noted(fail(`${call.name} needs the user's approval, and there's no one to ask.`, label));
       const decision = await ctx.approve({ tool: call.name, label, preview, scope, ...network });
       // Esc at the prompt answers "no" and then aborts the run: that's an interrupt, and the model should read it
       // as one (like the calls queued behind it), not as "the user declined this, don't retry".
       if (decision === "no" && ctx.signal?.aborted) {
-        return { output: NOT_RUN.aborted, summary: "interrupted", declined: true, label, approval: "interrupted" };
+        return noted({ output: NOT_RUN.aborted, summary: "interrupted", declined: true, label, approval: "interrupted" });
       }
       if (decision === "no") {
-        return {
+        return noted({
           output: "The user declined this. Don't retry it: stop and wait for them to say how to proceed.",
           summary: "declined",
           declined: true,
           label,
           approval: "no",
-        };
+        });
       }
-      return { ...(await tool.run(parsed.data, { ...ctx, callId: call.id })), label, approval: decision };
+      return noted({ ...(await tool.run(parsed.data, { ...ctx, callId: call.id })), label, approval: decision });
     }
-    return { ...(await tool.run(parsed.data, { ...ctx, callId: call.id })), label };
+    return noted({ ...(await tool.run(parsed.data, { ...ctx, callId: call.id })), label });
   } catch (err) {
-    if (err instanceof ToolError) return fail(err.message, label);
-    return fail(`${call.name} failed: ${(err as Error).message}`, label);
+    if (err instanceof ToolError) return noted(fail(err.message, label));
+    return noted(fail(`${call.name} failed: ${(err as Error).message}`, label));
   }
 }
 
