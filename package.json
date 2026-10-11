@@ -42,7 +42,9 @@
     "stats": "bun scripts/trajectory-stats.ts",
     "typecheck": "tsc --noEmit",
     "eval": "bun evals/run.ts",
-    "release:build": "bun scripts/release.ts"
+    "release:build": "bun scripts/release.ts",
+    "review": "bun scripts/review-gate.ts",
+    "prepare": "git config core.hooksPath .githooks || true"
   },
   "dependencies": {
     "@babel/parser": "^7.29.9",

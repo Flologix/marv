@@ -1,0 +1,60 @@
+# Open Code Review on every pull request: inline comments on the diff, one
+# sticky summary comment, and a failing check when it finds a critical or
+# high-severity problem. Make "OCR review / review" a required status check
+# (Settings → Rules) so nothing merges past it, whoever (or whatever) wrote the PR.
+#
+# Setup:
+#   secret   OPENROUTER_API_KEY   the key OCR calls the model with
+#   variable OCR_MODEL            optional; an OpenRouter model id
+name: OCR review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: ocr-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Run Open Code Review
+        id: ocr
+        # v1.12.13, pinned by commit
+        uses: alibaba/open-code-review@fabbdb296b0d97e2140ada8d54ca7d6d6d1d7ad4
+        with:
+          llm_url: https://openrouter.ai/api/v1
+          llm_auth_token: ${{ secrets.OPENROUTER_API_KEY }}
+          llm_model: ${{ vars.OCR_MODEL || 'anthropic/claude-sonnet-5.5' }}
+          llm_use_anthropic: 'false'
+          # The default turns "thinking" off with an Anthropic-style field,
+          # which OpenRouter's OpenAI-style API doesn't take.
+          llm_extra_body: '{}'
+          sticky_summary: 'true'
+          # Every push reviews the whole PR, so a blocker that's still there
+          # still fails the check; comments already posted aren't posted again
+          # (they're counted in comments_skipped instead).
+          incremental: 'true'
+          # Medium and low findings go to the summary comment; only critical and
+          # high stay inline, so inline + skipped + failed is the blocker count.
+          route_severity_below: medium
+
+      - name: Fail on critical or high findings
+        env:
+          INLINE: ${{ steps.ocr.outputs.comments_inline }}
+          SKIPPED: ${{ steps.ocr.outputs.comments_skipped }}
+          FAILED: ${{ steps.ocr.outputs.comments_failed }}
+        run: |
+          blockers=$(( ${INLINE:-0} + ${SKIPPED:-0} + ${FAILED:-0} ))
+          if [ "$blockers" -gt 0 ]; then
+            echo "::error::Open Code Review found $blockers critical/high issue(s). See the inline comments on this PR."
+            exit 1
+          fi

@@ -25,10 +25,11 @@ No role exists only to produce text for another role. If a new role seems needed
    2. Write the brief to `TASK.md` in the worktree (template below). Start the worker (below) and send it "Read TASK.md and do the task it describes."
    3. Wait for events, don't poll in a tight loop (below).
    4. When the worker reports, **verify, then review** (definition of done). Fix in place what takes under ~15 minutes; otherwise send the worker one precise list of fixes.
-   5. Commit in the worker's worktree with explicit paths (never `TASK.md`), naming the worker and model in the message. Merge into `sprint-N` with `--no-ff`. Resolve CHANGELOG/CLAUDE.md conflicts by keeping both entries; check for conflict markers before committing.
-   6. Close the worker.
+   5. Commit in the worker's worktree with explicit paths (never `TASK.md`), naming the worker and model in the message.
+   6. **Open Code Review** that commit: `bun run review --base sprint-N` (`ocr` with the model in `~/.opencodereview/config.json`). Fix or send back every critical/high finding and judge the rest; a finding you reject gets one line in the sprint PR saying why. Then merge into `sprint-N` with `--no-ff`. Resolve CHANGELOG/CLAUDE.md conflicts by keeping both entries; check for conflict markers before committing.
+   7. Close the worker.
 4. Start the next wave only when the previous one is merged into `sprint-N` and the full suite passes there.
-5. **Ship:** push `sprint-N`, open one PR whose body says `Fixes #N` for every issue in it, wait for CI and the Greptile review, fix what they find. **The user merges.**
+5. **Ship:** push `sprint-N`, open one PR whose body says `Fixes #N` for every issue in it, wait for CI, the `OCR review` check and the Greptile review, fix what they find. **The user merges.**
 6. **Report** once, at the end (see Metrics). Then remove the sprint's worktrees.
 
 ## Definition of done (per issue)
