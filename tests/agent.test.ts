@@ -246,6 +246,36 @@ describe("runAgent", () => {
     expect(events).toContainEqual({ type: "tool_call_delta", index: 0, name: "read_file", text: '{"path":' });
   });
 
+  test("a retry event resets this step's text and calls so the retry doesn't duplicate them", async () => {
+    const toolCall = call("c1", "a.ts");
+    const provider = new ScriptedProvider([
+      [
+        { type: "text_delta", text: "Hel" },
+        { type: "tool_call", call: toolCall },
+        { type: "retry", attempt: 1, max: 2, message: "lost" },
+        { type: "text_delta", text: "Hello" },
+        { type: "tool_call", call: toolCall },
+        { type: "done", reason: "tool_calls" },
+      ],
+    ]);
+    const events: LoopEvent[] = [];
+    for await (const event of runAgent({
+      provider,
+      history: [{ role: "user", text: "go" }],
+      system: "SYSTEM",
+      tools: SPECS,
+      runTool: fakeTool,
+      signal: new AbortController().signal,
+    })) {
+      events.push(event);
+    }
+    const assistant = events.find((e) => e.type === "assistant") as { text: string } | undefined;
+    expect(assistant?.text).toBe("Hello");
+    const toolCalls = events.filter((e) => e.type === "tool_start");
+    expect(toolCalls).toHaveLength(1);
+    expect(events).toContainEqual({ type: "retry", attempt: 1, max: 2, message: "lost" });
+  });
+
   describe("an empty reply (no text, no tool calls)", () => {
     // Upstream hosts sometimes bill for a reply and send back nothing (OpenRouter's Novita and SiliconFlow for
     // qwen3-coder, gpt-oss-120b): the run ended as if the model had finished. A third of the failed eval runs.

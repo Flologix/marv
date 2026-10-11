@@ -3,6 +3,7 @@
 // lets us set the context window (num_ctx): Ollama's default of 4096 tokens
 // is too small for an agent that reads files.
 import { errorMessage, httpError, unreachable, type ErrorHints } from "./errors.ts";
+import { isNetworkError, retriableHttpStatus, sleepAbortable, parseRetryAfter, BACKOFFS } from "./retry.ts";
 import type { AgentEvent, ChatTurn, Provider, StreamOptions, ToolCall } from "./types.ts";
 
 const LABEL = "Ollama";
@@ -14,6 +15,7 @@ const MIN_REPLY_TOKENS = 1024;
 const PROMPT_MARGIN = 1.05;
 /** How Ollama says it couldn't parse the tool call a model wrote ("qwen tool call parsing failed: XML syntax error…"). */
 const UNPARSABLE_CALL = /tool call|pars(e|ing)|XML syntax|unexpected EOF/i;
+/** Backoff delays for network error retries: 1 s, 4 s, 10 s. */
 
 interface Options {
   /** Where Ollama listens, e.g. http://localhost:11434 (a trailing /v1 is ignored). */
@@ -203,12 +205,18 @@ export class OllamaProvider implements Provider {
       ...prompt,
     });
 
-    let response: Response;
-    // Ollama answers 500 when it can't parse the tool call the model wrote (an unclosed one), if the reply was
-    // only that call (with text or reasoning before it, the error comes in the stream instead). A second sample
-    // usually comes out whole, and nothing was shown yet, so it's retried once. Other 500s (out of memory, a
-    // model that won't load) would only fail again, more slowly.
+    // Retry loop: covers network errors, retriable HTTP statuses (502, 503, 504, 429),
+    // mid-stream drops, and (for Ollama) unparsable tool calls (once).
+    // `connRetries` counts only network/HTTP retries, not tool-call parse retries.
+    let connRetries = 0;
     for (let attempt = 1; ; attempt++) {
+      if (signal?.aborted) return;
+
+      if (attempt > 1 && connRetries > 0) {
+        yield { type: "retry", attempt: connRetries, max: 2, message: `${LABEL}: connection lost, retrying (${connRetries}/2)…` };
+      }
+
+      let response: Response;
       try {
         // timeout: false turns off Bun's own 300 s limit: Ollama sends nothing while the model writes a tool call,
         // so a long one looked like a dead connection. num_predict bounds the wait (minutes on a GPU, longer on a
@@ -216,16 +224,54 @@ export class OllamaProvider implements Provider {
         response = await fetch(`${baseUrl}/api/chat`, { method: "POST", headers: { "content-type": "application/json" }, body, signal, timeout: false });
       } catch (err) {
         if (signal?.aborted) return;
+        if (connRetries < 2 && isNetworkError(err)) {
+          connRetries++;
+          if (await sleepAbortable(BACKOFFS[connRetries - 1]! * 1000, signal)) return;
+          continue;
+        }
         yield { type: "error", message: unreachable(LABEL, baseUrl, err, "Is Ollama running? Start it with `ollama serve`.") };
         return;
       }
-      if (response.ok) break;
+
+      if (response.ok) {
+        // Stream the NDJSON body. If the connection drops mid-stream, retry from the top.
+        const result = yield* this.parseStream(response, chars, signal);
+        if (result === "retry") {
+          if (connRetries < 2) {
+            connRetries++;
+            if (await sleepAbortable(BACKOFFS[connRetries - 1]! * 1000, signal)) return;
+            continue;
+          }
+          yield { type: "error", message: `${LABEL}: the stream ended early, before the reply was complete. Try again.` };
+          return;
+        }
+        return;
+      }
+
+      // HTTP-level error
       const detail = await errorMessage(response);
+
+      // Existing retry for unparsable tool calls: only once.
       if (response.status >= 500 && UNPARSABLE_CALL.test(detail) && attempt < 2 && !signal?.aborted) continue;
+
+      // Retriable HTTP status (502, 503, 504) — retry with backoff.
+      if (retriableHttpStatus(response.status) && connRetries < 2) {
+        connRetries++;
+        const delay = parseRetryAfter(response.headers.get("Retry-After")) ?? BACKOFFS[connRetries - 1]!;
+        if (await sleepAbortable(delay * 1000, signal)) return;
+        continue;
+      }
+
       yield { type: "error", message: httpError(response.status, detail, LABEL, model, this.options.hints) };
       return;
     }
+  }
 
+  /**
+   * Parses the NDJSON response body. Returns "retry" if the stream broke off mid-way (a retriable
+   * connection drop), or undefined on success. Yields events as it goes.
+   */
+  private async *parseStream(response: Response, chars: number, signal?: AbortSignal): AsyncGenerator<AgentEvent, "retry" | undefined, undefined> {
     const calls: ToolCall[] = [];
     let reason: string | undefined;
     let complete = false;
@@ -233,7 +279,7 @@ export class OllamaProvider implements Provider {
       for await (const line of parseNDJSON(response.body!)) {
         if (line.error) {
           yield { type: "error", message: `${LABEL}: ${line.error}` };
-          return;
+          return undefined;
         }
         const { thinking: thought, content, tool_calls } = line.message ?? {};
         if (thought) yield { type: "thinking_delta", text: thought };
@@ -254,18 +300,18 @@ export class OllamaProvider implements Provider {
         }
       }
     } catch (err) {
-      if (signal?.aborted) return;
-      yield { type: "error", message: `${LABEL}: the stream broke off (${(err as Error).message})` };
-      return;
+      if (signal?.aborted) return undefined;
+      // A connection drop mid-stream is retriable.
+      return "retry";
     }
 
-    // Without its done line the reply is partial (a proxy closed the stream): don't pass it off as complete.
+    // Without its done line the reply is partial (a proxy closed the stream): retry.
     if (!complete) {
-      if (signal?.aborted) return;
-      yield { type: "error", message: `${LABEL}: the stream ended early, before the reply was complete. Try again.` };
-      return;
+      if (signal?.aborted) return undefined;
+      return "retry";
     }
     for (const call of calls) yield { type: "tool_call", call };
     yield { type: "done", reason };
+    return undefined;
   }
 }
