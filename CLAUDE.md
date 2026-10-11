@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Marv (the `marv` command) is a terminal coding agent (like Claude Code) written in TypeScript on **Bun** with an **Ink** (React-for-terminal) TUI. It is being built milestone by milestone; the roadmap lives in `~/.claude/plans/im-planning-on-making-staged-eclipse.md`. The owner is learning how agents work, so explain the *why* of each change.
 
+Issue work run by agents (a planner, an orchestrator, workers in Herdr worktrees) follows `ORCHESTRATION.md`: it binds the orchestrator, and a worker only needs its `TASK.md` brief.
+
 ## Commands
 
 ```sh
