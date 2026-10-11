@@ -50,6 +50,16 @@ function gitGuard(root: string): { readOnly?: string[]; placeholders?: string[] 
   return { readOnly: [gitDir] };
 }
 
+/** For a project whose .git is a worktree's file: its trusted git folders (see worktreeGitDirs); else none. */
+function worktreeGit(root: string): string[] {
+  const gitFile = join(root, ".git");
+  try {
+    return lstatSync(gitFile).isFile() ? worktreeGitDirs(gitFile) : [];
+  } catch {
+    return [];
+  }
+}
+
 /** A worktree's own git folder and the repository's common .git, when its .git file checks out; else none. */
 function worktreeGitDirs(gitFile: string): string[] {
   try {
@@ -144,6 +154,7 @@ interface RunOptions {
   timeoutMs: number;
   signal?: AbortSignal;
   readOnly?: string[];
+  writable?: string[];
   placeholders?: string[];
   /** Mount the project read-only (see SandboxOptions.projectReadOnly). */
   projectReadOnly?: boolean;
@@ -158,11 +169,11 @@ const hasSetsid = Bun.which("setsid") !== null;
  * Sandboxed: inside bwrap (see src/sandbox.ts). Not sandboxed: still with a
  * minimal environment, so API keys don't leak into commands.
  */
-export async function runCommand({ command, root, sandbox, network, timeoutMs, signal, readOnly, placeholders, projectReadOnly, home = homedir() }: RunOptions): Promise<CommandResult> {
+export async function runCommand({ command, root, sandbox, network, timeoutMs, signal, readOnly, writable, placeholders, projectReadOnly, home = homedir() }: RunOptions): Promise<CommandResult> {
   const path = process.env.PATH ?? "/usr/bin:/bin";
   const script = `exec 2>&1\n${command}`; // stderr into stdout, so the output stays in order
   const argv = sandbox
-    ? ["bwrap", ...sandboxArgs({ root, home, network, path, readOnly, placeholders, projectReadOnly }), "--", "bash", "-c", script]
+    ? ["bwrap", ...sandboxArgs({ root, home, network, path, readOnly, writable, placeholders, projectReadOnly }), "--", "bash", "-c", script]
     : // setsid: its own process group, so killing it also kills everything it started.
       [...(hasSetsid ? ["setsid"] : []), "bash", "-c", script];
 
@@ -297,6 +308,10 @@ export const bash: Tool<typeof input> = {
     // (the user's next commit, their editor), so a planted hook would escape. Without a .git, it can't create one
     // either (an empty read-only placeholder sits there), or `git status` in that folder would run its config.
     const guard = confined ? gitGuard(root) : {};
+    // An approved command (yolo off, git_write, network) in a git worktree: it may change the repository like any
+    // approved command may change a .git inside the project, but it has to see it first. The same check as above
+    // decides whether the worktree's records are trusted.
+    const approvedGit = confined ? [] : worktreeGit(root);
     const sandboxed = sandbox && sandboxAvailable();
     let result: CommandResult;
     try {
@@ -308,6 +323,7 @@ export const bash: Tool<typeof input> = {
         timeoutMs: timeout * 1000,
         signal,
         readOnly: [...readOnly, ...(guard.readOnly ?? [])],
+        writable: approvedGit,
         placeholders: guard.placeholders,
       });
     } finally {

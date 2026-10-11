@@ -71,6 +71,11 @@ interface SandboxOptions {
    */
   readOnly?: string[];
   /**
+   * Extra folders outside the project the command may change, for a command the user approved: a git worktree's
+   * record and its repository's .git (in the hidden home folder), so an approved `git commit` works there.
+   */
+  writable?: string[];
+  /**
    * Paths inside the project that don't exist yet and must stay that way: each gets an empty read-only folder
    * mounted on it (a project without .git, so a command can't create a repository whose config git would run
    * outside the sandbox). bwrap leaves the empty mount point behind; the caller removes it.
@@ -204,6 +209,7 @@ export function sandboxArgs({
   network,
   path,
   readOnly = [],
+  writable = [],
   placeholders = [],
   projectReadOnly = false,
   exists = existsSync,
@@ -220,6 +226,10 @@ export function sandboxArgs({
   for (const { dir, real } of extras.filter((e) => e.around)) args.push("--ro-bind", real, dir);
   args.push(projectReadOnly ? "--ro-bind" : "--bind", root, root);
   for (const { dir, real } of extras.filter((e) => !e.around)) args.push("--ro-bind", real, dir);
+  for (const dir of writable) {
+    const { real } = resolveExtra(dir, home, root);
+    args.push("--bind", real, dir);
+  }
   // A read-only project can't get the empty mount point bwrap creates, and nothing in it can create a .git anyway.
   if (!projectReadOnly) for (const path of placeholders) args.push("--tmpfs", path, "--remount-ro", path);
   // Last, on top of every other mount, so the empty file hides the real one and no later mount shows it again.

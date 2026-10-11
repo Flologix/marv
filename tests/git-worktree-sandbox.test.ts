@@ -67,3 +67,24 @@ sandboxed("a planted gitdir pointing anywhere else shows nothing", async () => {
   await writeFile(join(project, ".git"), `gitdir: ${fake}\n`);
   expect((await run(`cat ${join(secret, "id_ed25519")}`, project)).output).not.toContain("PRIVATE KEY");
 });
+
+/** The bash tool as it runs an approved call (yolo off, git_write, network): sandboxed, not confined. */
+const approved = (command: string, root = tree) => bash.run({ command }, { root, sandbox: true, confined: false });
+
+sandboxed("an approved command in a worktree can change the repository: git commit works (review, #42)", async () => {
+  await writeFile(join(tree, "a.txt"), "two\n");
+  const result = await approved("git -c user.email=t@t -c user.name=t commit -qam 'from the sandbox' && git log --oneline -1");
+  expect(result.output).toContain("from the sandbox");
+  const log = Bun.spawnSync(["git", "log", "--oneline", "wt"], { cwd: repo }).stdout.toString();
+  expect(log).toContain("from the sandbox");
+});
+
+sandboxed("a planted gitdir shows nothing to approved commands either", async () => {
+  const secret = join(base, "secret");
+  await mkdir(secret);
+  await writeFile(join(secret, "id_ed25519"), "PRIVATE KEY");
+  const project = join(base, "project");
+  await mkdir(project);
+  await writeFile(join(project, ".git"), `gitdir: ${secret}\n`);
+  expect((await approved(`cat ${join(secret, "id_ed25519")}`, project)).output).not.toContain("PRIVATE KEY");
+});
