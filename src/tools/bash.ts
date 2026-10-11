@@ -68,6 +68,28 @@ export function touchesHiddenHome(command: string, root: string, home: string): 
   }
   return false;
 }
+/**
+ * Appended when a sandboxed command without network fails in a way that looks like the network's missing. After a
+ * fresh `gh auth login`, `gh auth status` said the token was invalid, and the model walked the user through logging
+ * out and in again; with network on it worked straight away (issue #23).
+ */
+const NETWORK_NOTE =
+  "Marv: this command ran in the sandbox without network, and its failure looks like it may come from that: there, every connection and DNS lookup fails, so logins look invalid and servers look down. " +
+  "Before drawing conclusions, run it again with network: true.";
+/** Errors a blocked network produces: DNS, refused or unreachable connections, timeouts. */
+const NETWORK_ERRORS =
+  /could not resolve (?:host|hostname|proxy)|temporary failure in name resolution|name or service not known|getaddrinfo|\b(?:ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ECONNRESET|ENETUNREACH|EHOSTUNREACH|ETIMEDOUT|ETIMEOUT)\b|ConnectionRefused|network is unreachable|connection refused|connection timed out|failed to connect|unable to connect|dns error|no such host|error connecting to/i;
+/** Commands that need the network to do their job. */
+const NETWORK_COMMANDS =
+  /(?:^|[\s;&|(`])(?:gh|curl|wget|ssh|scp|rsync|ping|git\s+(?:fetch|pull|push|clone|ls-remote|submodule\s+update)|(?:npm|pnpm|yarn|bun)\s+(?:install|i|add|ci|update|upgrade|publish|view|info|outdated|create)|pip3?\s+install|uv\s+(?:sync|add|pip\s+install)|cargo\s+(?:install|fetch|update|add)|go\s+(?:get|mod\s+download)|docker\s+(?:pull|push|login))(?=$|[\s;&|)`])/;
+
+/**
+ * Whether a failed command's failure may come from the sandbox's missing network: its output has a network error,
+ * or the command is one that needs the network. A guess, for the note above only.
+ */
+export function looksLikeNetworkFailure(command: string, output: string): boolean {
+  return NETWORK_ERRORS.test(output) || NETWORK_COMMANDS.test(command);
+}
 const MAX_TIMEOUT_S = 600;
 /** Kept in memory per command; anything beyond is dropped (the middle is cut for the model anyway). */
 export const MAX_CAPTURE = 2_000_000;
@@ -259,6 +281,9 @@ export const bash: Tool<typeof input> = {
         ? "stopped"
         : `exit ${result.exitCode}${lines ? ` · ${lines} line${lines === 1 ? "" : "s"} of output` : ""}`;
     if (sandboxed && touchesHiddenHome(command, root, homedir())) result.output += `\n${HOME_NOTE}\n`;
+    // Not for a command that isn't there (127) or can't run (126): the network has nothing to do with those.
+    const failed = result.timedOut || (!result.aborted && result.exitCode !== 0 && result.exitCode !== 126 && result.exitCode !== 127);
+    if (sandboxed && !network && failed && looksLikeNetworkFailure(command, result.output)) result.output += `\n${NETWORK_NOTE}\n`;
     return { output: formatOutput(result), summary };
   },
 };
