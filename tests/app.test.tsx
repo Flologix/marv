@@ -70,6 +70,7 @@ function renderApp(
   instructions?: string,
   skills: Skill[] = [],
   skillProblems: string[] = [],
+  hiddenPathFolders: string[] = [],
 ) {
   return render(
     <App
@@ -82,6 +83,7 @@ function renderApp(
       instructions={instructions}
       skills={skills}
       skillProblems={skillProblems}
+      hiddenPathFolders={hiddenPathFolders}
       splashMs={splashMs}
       makeProvider={makeProvider}
       copy={copy}
@@ -750,6 +752,14 @@ describe("App", () => {
       const { lastFrame } = renderApp(LOCAL, 0, undefined, undefined, undefined, [], [".marv/skills/x/SKILL.md needs a description"]);
       await tick();
       expect(lastFrame()).toContain("1 skill couldn't be loaded (see /skills)");
+    });
+
+    test("PATH folders the sandbox hides are reported at startup", async () => {
+      const { lastFrame } = renderApp(LOCAL, 0, undefined, undefined, undefined, [], [], ["~/.local/share/mise/installs/node/26.8.2/bin"]);
+      await tick();
+      expect(lastFrame()).toContain("Your PATH has 1 folder the sandbox can't see");
+      expect(lastFrame()).toContain("~/.local/share/mise/installs/node/26.8.2/bin");
+      expect(lastFrame()).toContain("tsc and other node_modules scripts may not run");
     });
   });
 

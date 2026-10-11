@@ -128,6 +128,24 @@ describe("a turn's checks", () => {
     expect(results).toEqual([{ status: "failed", ms: expect.any(Number), reason: "unreadable", notify: true }]);
   });
 
+  test("a missing interpreter (node from mise, hidden by the sandbox) is its own failure", async () => {
+    const run = fake(ok(), { output: "env: ‘node’: No such file or directory\n", exitCode: 127, timedOut: false, aborted: false });
+    const { checks, results } = turn(new Diagnostics({ run, sandboxWorks: () => true }));
+    await checks.beforeChange();
+    expect(await checks.afterStep(changed)).toBeNull();
+    expect(results).toEqual([{ status: "failed", ms: expect.any(Number), reason: "missing-interpreter", tool: "node", notify: true }]);
+  });
+
+  test("a missing interpreter counts as unreadable for the repeat notices", async () => {
+    const lost: CommandResult = { output: "env: ‘node’: No such file or directory\n", exitCode: 127, timedOut: false, aborted: false };
+    const run = fake(ok(), lost, lost);
+    const { checks, results } = turn(new Diagnostics({ run, sandboxWorks: () => true }));
+    await checks.beforeChange();
+    await checks.afterStep(changed);
+    await checks.afterStep(changed);
+    expect(results.map((r) => (r as { notify?: boolean }).notify)).toEqual([true, undefined]);
+  });
+
   test("only the session's first unreadable result asks for a notice", async () => {
     const run = fake(ok(), failed("Segmentation fault\n"), failed("Segmentation fault\n"));
     const { checks, results } = turn(new Diagnostics({ run, sandboxWorks: () => true }));
@@ -302,6 +320,10 @@ describe("checkNotice", () => {
     expect(checkNotice({ status: "failed", ms: 5, reason: "timeout" })).toBeNull();
     expect(checkNotice({ status: "failed", ms: 5, reason: "unreadable" })).toBeNull();
     expect(checkNotice({ status: "failed", ms: 5, reason: "unreadable", notify: true })).toBe("✻ Marv couldn't read the typecheck's output here, so it can't tell the model about new errors.");
+    expect(checkNotice({ status: "failed", ms: 5, reason: "missing-interpreter", tool: "node" })).toBeNull();
+    expect(checkNotice({ status: "failed", ms: 5, reason: "missing-interpreter", tool: "node", notify: true })).toBe(
+      "✻ tsc needs node, which the sandbox can't see (Marv's sandbox hides the home folder except known toolchains). Marv can't tell the model about new type errors.",
+    );
     expect(checkNotice({ status: "off", reason: "no-sandbox" })).toContain("sandbox");
     expect(checkNotice({ status: "off", reason: "timeouts" })).toContain("stopped");
   });

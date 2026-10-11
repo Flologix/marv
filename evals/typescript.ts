@@ -2,8 +2,8 @@
 // post-edit check) finds it at node_modules/.bin/tsc, as in a real project. The runs have no network, so it's copied
 // from Marv's own node_modules. Not symlinked: the sandbox hides the home folder such a link would point into (and
 // `dereference` copies a package that is itself a link, as with Bun's isolated linker, as files). The launcher is
-// `#!/usr/bin/env node`, so the sandbox needs a system node (/usr/bin/node here; one under the home folder, e.g. nvm,
-// is hidden).
+// `#!/usr/bin/env node`, so the sandbox needs a node on PATH inside it: the system one (/usr/bin/node here) or one
+// from a home toolchain it mounts (mise, asdf); another one would be reported by the startup notice, not silent.
 import { cpSync, existsSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 

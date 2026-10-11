@@ -1,6 +1,7 @@
 import { SUBAGENT_TOOLS, type AgentType } from "../agents.ts";
 import { maskKey, PRESETS, type Config } from "../config/config.ts";
 import { sandboxAvailable } from "../sandbox.ts";
+import { hiddenPathFoldersNotice } from "./sandbox-notice.ts";
 import type { McpServerStatus } from "../mcp/manager.ts";
 import type { Skill } from "../skills.ts";
 import { usageReport, type Totals } from "../usage.ts";
@@ -56,6 +57,8 @@ export interface CommandContext {
   trajectoriesPath?: string;
   /** Tokens and cost so far, for /cost. */
   usage?: { totals: Totals; last: Usage | null; contextLength?: number };
+  /** PATH folders under the home folder the sandbox can't see, shortened (~) for display; empty when there are none. */
+  hiddenPathFolders?: string[];
 }
 
 interface Command {
@@ -145,11 +148,11 @@ export const commands: Command[] = [
   {
     name: "sandbox",
     description: "Show or set the bash sandbox (/sandbox on, /sandbox off)",
-    run: (args, { config }) => {
+    run: (args, { config, hiddenPathFolders = [] }) => {
       const arg = args.toLowerCase();
       if (arg === "on" || arg === "off") return { type: "sandbox", on: arg === "on" };
       if (arg) return { type: "print", text: "Usage: /sandbox, /sandbox on, or /sandbox off", isError: true };
-      return { type: "print", text: `Sandbox: ${sandboxStatus(config)}` };
+      return { type: "print", text: `Sandbox: ${sandboxStatus(config, hiddenPathFolders)}` };
     },
   },
   {
@@ -310,11 +313,11 @@ export function yoloStatus(config: Config): string {
     : `Yolo on: file edits run without asking. Commands still ask: ${config.sandbox ? "bubblewrap isn't available here" : "the sandbox is off"}, so nothing confines them.`;
 }
 
-function sandboxStatus(config: Config): string {
+function sandboxStatus(config: Config, hiddenPathFolders: string[] = []): string {
   if (!config.sandbox) return "off: bash commands run directly on your system (after approval)";
-  return sandboxAvailable()
-    ? "on: bash runs in bubblewrap (project writable, home hidden, no network unless asked)"
-    : "on, but bubblewrap isn't available here, so bash runs WITHOUT a sandbox";
+  if (!sandboxAvailable()) return "on, but bubblewrap isn't available here, so bash runs WITHOUT a sandbox";
+  const hidden = hiddenPathFolders.length ? ` ${hiddenPathFoldersNotice(hiddenPathFolders)}` : "";
+  return `on: bash runs in bubblewrap (project writable, home hidden, no network unless asked).${hidden}`;
 }
 
 const MCP_HELP = `No MCP servers yet. Add them to \`.mcp.json\` in the project, or \`~/.marv/mcp.json\` for every project (the same format as Claude Code's), then restart Marv:

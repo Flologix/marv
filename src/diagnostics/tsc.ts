@@ -95,6 +95,20 @@ export function formatError(e: TsError): string {
   return `${where}${e.code} ${e.message.replaceAll("\n", "\n  ")}`;
 }
 
+/** What `env` prints when the shebang interpreter isn't there (`env: ‘node’: No such file or directory`). */
+const MISSING = /^env: [‘'](.+?)[’']: No such file or directory$/m;
+
+/**
+ * The interpreter a failed check run couldn't find, when that's what went wrong (a `#!/usr/bin/env node` launcher
+ * whose `node` the sandbox can't see — it's under the hidden home, e.g. mise's). Its name, or undefined when the
+ * failure was something else (or the run succeeded). Exit 127 is "command not found"; 126 would be "found but
+ * can't run", which is a different problem.
+ */
+export function missingInterpreter(output: string, exitCode: number | null): string | undefined {
+  if (exitCode !== 127) return undefined;
+  return MISSING.exec(output)?.[1];
+}
+
 /** What the model is told: a message from Marv, like the cut-off and empty-reply notes. */
 export function diagnosticsNote(added: TsError[]): string {
   const shown = added.slice(0, MAX_REPORTED).map(formatError);

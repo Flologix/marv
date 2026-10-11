@@ -28,6 +28,8 @@ export const TOOLCHAINS = [
   ".rustup",
   ".local/bin",
   ".local/share/pnpm",
+  ".local/share/mise",
+  ".asdf",
   ".nvm",
   ".volta",
   ".deno",
@@ -37,6 +39,22 @@ export const TOOLCHAINS = [
   // Personal skills, so their scripts can run (the rest of ~/.marv, with the API key, stays hidden).
   ".marv/skills",
 ];
+
+/**
+ * PATH folders under the hidden home folder that no toolchain mount shows. A tool on PATH whose folder the sandbox
+ * hides (`env: 'node': No such file or directory`, exit 127) is otherwise a silent mystery — and silently skips
+ * Marv's own post-edit typecheck. Not the mounted ones, not inside the project, not folders that don't exist
+ * (nothing to miss). Sorted by path, so a notice lists them in a stable order.
+ */
+export function hiddenPathFolders(path: string, home: string, exists: (path: string) => boolean = existsSync): string[] {
+  const found = new Set<string>();
+  for (const dir of path.split(":")) {
+    if (!isAbsolute(dir) || !contains(home, dir) || !exists(dir)) continue;
+    if (TOOLCHAINS.some((toolchain) => contains(join(home, toolchain), dir))) continue;
+    found.add(dir);
+  }
+  return [...found].sort();
+}
 
 interface SandboxOptions {
   root: string;
