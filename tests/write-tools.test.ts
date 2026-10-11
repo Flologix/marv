@@ -137,6 +137,24 @@ describe("write_file", () => {
   });
 
   describe("append: true", () => {
+    test("parallel appends to one file all land (review, #42): each read-change-write waits for the last", async () => {
+      await writeFile(join(root, "log.txt"), "start\n");
+      const lines = Array.from({ length: 12 }, (_, i) => `line ${i}`);
+      await Promise.all(lines.map((line) => run("write_file", { path: "log.txt", content: `${line}\n`, append: true })));
+      const text = await read("log.txt");
+      for (const line of lines) expect(text).toContain(`${line}\n`);
+      expect(text.split("\n").filter(Boolean)).toHaveLength(13);
+    });
+
+    test("an append and an edit on one file at the same time both land", async () => {
+      await writeFile(join(root, "mix.txt"), "alpha\n");
+      await Promise.all([
+        run("edit_file", { path: "mix.txt", old_string: "alpha", new_string: "ALPHA" }),
+        run("write_file", { path: "mix.txt", content: "omega\n", append: true }),
+      ]);
+      expect(await read("mix.txt")).toBe("ALPHA\nomega\n");
+    });
+
     test("adds at the end instead of replacing", async () => {
       await writeFile(join(root, "log.txt"), "first\n");
       const result = await run("write_file", { path: "log.txt", content: "second\n", append: true });

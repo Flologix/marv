@@ -7,6 +7,7 @@ import { lineEnding, withLineEnding } from "./edit-match.ts";
 import { brokenBy, syntaxNote } from "./syntax.ts";
 import { isDirectory, projectPath, refuseGit, requireRegularFile, resolveInProject, touchesGit } from "./files.ts";
 import { repairPathField } from "./repair.ts";
+import { withFileLock } from "./file-lock.ts";
 import { ToolError, type Tool, type ToolContext } from "./types.ts";
 
 const input = z.object({
@@ -67,9 +68,13 @@ export const writeFile: Tool<typeof input> = {
     await ctx.beforeChange?.();
     // Esc while waiting for the baseline: it resolves on abort, but the user said stop, so nothing is written.
     if (ctx.signal?.aborted) return { output: "Interrupted before the change was written: nothing changed.", summary: "interrupted" };
-    const { absolute, shown, before, body, after, diff, newLineMissing, crlf } = await plan(args, ctx);
-    await mkdir(dirname(absolute), { recursive: true });
-    await Bun.write(absolute, after);
+    // Read and written as one step per file, so a parallel append (or edit) can't be lost.
+    const { absolute, shown, before, body, after, diff, newLineMissing, crlf } = await withFileLock(ctx.root, args.path, async () => {
+      const planned = await plan(args, ctx);
+      await mkdir(dirname(planned.absolute), { recursive: true });
+      await Bun.write(planned.absolute, planned.after);
+      return planned;
+    });
     const broken = await brokenBy(shown, before, after);
     const note = broken ? `\n\n${syntaxNote(shown, broken, after, before !== null)}` : "";
     const nl = newLineMissing ? "; added a newline to its last line first" : "";

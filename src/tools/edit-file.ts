@@ -8,6 +8,7 @@ import { brokenBy, syntaxNote } from "./syntax.ts";
 import { isDirectory, projectPath, refuseGit, requireRegularFile, resolveInProject, touchesGit } from "./files.ts";
 import { repairPathField } from "./repair.ts";
 import { ToolError, type Tool, type ToolContext } from "./types.ts";
+import { withFileLock } from "./file-lock.ts";
 
 const input = z.object({
   path: z.string().describe("File to edit, relative to the project root."),
@@ -93,8 +94,12 @@ export const editFile: Tool<typeof input> = {
     // Esc while waiting for the baseline: it resolves on abort, but the user said stop, so nothing is written.
     if (ctx.signal?.aborted) return { output: "Interrupted before the change was written: nothing changed.", summary: "interrupted" };
     // Planned again: the file may have changed while the user was deciding.
-    const { absolute, shown, before, after, count, fuzzy } = await plan(args, ctx);
-    await Bun.write(absolute, after);
+    // Read and written as one step per file, so a parallel edit (or append) can't be lost.
+    const { shown, before, after, count, fuzzy } = await withFileLock(ctx.root, args.path, async () => {
+      const planned = await plan(args, ctx);
+      await Bun.write(planned.absolute, planned.after);
+      return planned;
+    });
     const diff = diffText(before, after);
     const broken = await brokenBy(shown, before, after);
     return {
