@@ -19,7 +19,7 @@ interface Options {
   /** Where Ollama listens, e.g. http://localhost:11434 (a trailing /v1 is ignored). */
   baseUrl: string;
   model: string;
-  /** Context window to load the model with (num_ctx). */
+  /** Context window to load the model with (num_ctx); the upper bound: the model is never run past its trained length. */
   contextLength: number;
   /** Let thinking models reason first. Off makes them answer directly. */
   thinking: boolean;
@@ -90,8 +90,54 @@ function toMessages(history: ChatTurn[], system?: string) {
 export class OllamaProvider implements Provider {
   /** The most tokens per character of prompt JSON measured so far (Ollama's prompt_eval_count over the request's size). */
   private tokensPerChar: number | undefined;
+  /** The context length the model was trained for, once /api/show answered (undefined: it failed or said nothing). */
+  private trained: number | undefined;
+  /** The /api/show request in flight, so concurrent streams (the session and its subagents share this provider) ask only once. */
+  private showing: Promise<boolean> | undefined;
 
   constructor(private readonly options: Options) {}
+
+  /**
+   * The window the model runs at: the configured one, but never past what the model was trained for (num_ctx past
+   * it makes Ollama shift the window and lose the start of the prompt). The configured value stays the upper
+   * bound: Ollama can't tell how much of a larger window fits in VRAM.
+   */
+  private get window(): number {
+    return this.trained !== undefined ? Math.min(this.options.contextLength, this.trained) : this.options.contextLength;
+  }
+
+  /**
+   * Asks Ollama's /api/show once what the model was trained for (`model_info.<arch>.context_length`), before the
+   * first request so num_ctx is right from the start and never changes (a different num_ctx reloads the model).
+   * Asked once per provider: a successful answer is kept, and a failed or empty one is retried on the next stream
+   * (Ollama may have been starting up), until it answers. A server that never answers changes nothing.
+   */
+  private async askTrained(baseUrl: string, signal?: AbortSignal): Promise<void> {
+    const ask = (this.showing ??= (async () => {
+      try {
+        const response = await fetch(`${baseUrl}/api/show`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ model: this.options.model }),
+          // The stream's signal: Esc stops this fetch too; a rejection just leaves the window as configured.
+          signal,
+        });
+        if (!response.ok) return false;
+        const { model_info: info } = (await response.json()) as { model_info?: Record<string, unknown> };
+        const lengths = Object.entries(info ?? {})
+          .filter(([key, value]) => key.endsWith(".context_length") && typeof value === "number" && value > 0)
+          .map(([, value]) => value as number);
+        if (!lengths.length) return false;
+        this.trained = Math.max(...lengths);
+        return true;
+      } catch {
+        // No /api/show (an old Ollama, a proxy that only forwards /api/chat): run at the configured window.
+        return false;
+      }
+    })());
+    // A failed ask clears the field, so the next stream asks again; a successful one stays (asked once).
+    if (!(await ask) && this.showing === ask) this.showing = undefined;
+  }
 
   /**
    * num_predict for a prompt of `chars` characters. A fixed share of the window (a quarter, half with thinking on:
@@ -103,7 +149,8 @@ export class OllamaProvider implements Provider {
    * only the newly evaluated tokens, which only ever lowers it. Before any measurement, the share alone.
    */
   private replyCap(chars: number): number {
-    const { contextLength, thinking } = this.options;
+    const { thinking } = this.options;
+    const contextLength = this.window;
     const share = thinking ? Math.min(2 * MAX_REPLY_TOKENS, Math.floor(contextLength / 2)) : Math.min(MAX_REPLY_TOKENS, Math.floor(contextLength / 4));
     if (!this.tokensPerChar) return share;
     const prompt = Math.ceil(chars * this.tokensPerChar * PROMPT_MARGIN);
@@ -116,12 +163,17 @@ export class OllamaProvider implements Provider {
   }
 
   get contextLength() {
-    return this.options.contextLength;
+    // What the model actually runs at, once /api/show has answered (the usage bar, the 85% warning and compaction
+    // measure against it); the configured window until then.
+    return this.window;
   }
 
   async *stream(history: ChatTurn[], { system, tools, signal }: StreamOptions = {}): AsyncIterable<AgentEvent> {
-    const { model, contextLength, thinking } = this.options;
+    const { model, thinking } = this.options;
     const baseUrl = this.options.baseUrl.replace(/\/v1\/?$/, "").replace(/\/+$/, "");
+    // The trained context length is fetched once, before the first chat request, so num_ctx is right from the start.
+    await this.askTrained(baseUrl, signal);
+    const contextLength = this.window;
 
     const prompt = {
       messages: toMessages(history, system),
