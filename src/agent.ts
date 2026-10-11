@@ -106,6 +106,7 @@ interface Options {
   tools: ToolSpec[];
   runTool: (call: ToolCall) => Promise<ToolResult & { label: string }>;
   signal: AbortSignal;
+  /** Steps before the limit is checked; 0 turns the limit off entirely (no asking, no hard stop). Default 25. */
   maxSteps?: number;
   /**
    * Asked each time the run reaches another multiple of maxSteps, after that
@@ -271,7 +272,8 @@ export async function* runAgent({
   for (let step = 0; ; step++) {
     // The step limit guards against a model that never finishes. With
     // onLimit, the user decides at each multiple whether it goes on.
-    if (step > 0 && step % maxSteps === 0) {
+    // maxSteps 0 (the guard off) never matches: 0 steps means never ask.
+    if (maxSteps > 0 && step > 0 && step % maxSteps === 0) {
       const continued = onLimit ? await onLimit(step) : false;
       if (onLimit) yield { type: "step_limit", steps: step, continued };
       if (signal.aborted) {

@@ -228,7 +228,33 @@ describe("approvals", () => {
   });
 
   test("a maxSteps that isn't a positive whole number throws", () => {
-    for (const maxSteps of [0, -1, 2.5, Number.NaN]) expect(() => makeSession(new ScriptedProvider([]), { maxSteps })).toThrow(/maxSteps/);
+    for (const maxSteps of [-1, 2.5, Number.NaN]) expect(() => makeSession(new ScriptedProvider([]), { maxSteps })).toThrow(/maxSteps/);
+  });
+
+  test("maxSteps 0 turns the asking off (the subagents' hard limit stays)", () => {
+    expect(() => makeSession(new ScriptedProvider([]), { maxSteps: 0 })).not.toThrow();
+  });
+
+  test("maxSteps 0 (off) runs past the default 25 without asking, even with an approver", async () => {
+    const provider = new ScriptedProvider([...Array.from({ length: 30 }, (_, i) => useTools(read(`c${i}`))), say("Finally done.")]);
+    const asked: ApprovalRequest[] = [];
+    const events = await collect(
+      makeSession(provider, { maxSteps: 0, approve: async (r) => (asked.push(r), "no") }).send("loop"),
+    );
+    expect(provider.requests).toHaveLength(31); // 30 tool steps, then the plain answer
+    expect(asked).toEqual([]);
+    expect(events.filter((e) => e.type === "step_limit")).toEqual([]);
+    expect(events).toContainEqual({ type: "done", reason: "end" });
+  });
+
+  test("configure({ maxSteps }) moves the limit from the next turn on", async () => {
+    const provider = new ScriptedProvider(Array.from({ length: 30 }, (_, i) => useTools(read(`c${i}`))));
+    const session = makeSession(provider);
+    await collect(session.send("first")); // stops at the default 25
+    session.configure({ maxSteps: 0 });
+    const events = await collect(session.send("loop"));
+    expect(events).toContainEqual({ type: "done", reason: "end" });
+    await session.close();
   });
 
   test("with an approver it asks at the step limit, in the continue scope", async () => {

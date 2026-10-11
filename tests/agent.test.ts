@@ -852,6 +852,13 @@ describe("every tool call gets exactly one result, in call order, however the ru
   });
 
   describe("the step limit", () => {
+    test("maxSteps 0 turns the limit off entirely: it runs to the end, no asking, no hard stop", async () => {
+      const { history, end, calls } = await drive([...steps(3), say("Done.")], {}, { maxSteps: 0 });
+      expect(calls).toHaveLength(15); // 3 steps × 5 calls, none cut off by a limit
+      expect(answerProblems(history)).toEqual([]);
+      expect(end).toEqual({ type: "done", reason: "end" });
+    });
+
     test("without onLimit: a hard stop", async () => {
       const { history, end, calls } = await drive(steps(5), {}, { maxSteps: 2 });
       expect(calls).toHaveLength(10);

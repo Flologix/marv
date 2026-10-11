@@ -3,6 +3,7 @@ import { chmod, copyFile, mkdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { z } from "zod";
+import { DEFAULT_MAX_STEPS } from "../agent.ts";
 
 // Configuration comes from two layers, and the later one wins:
 //   1. ~/.marv/config.json  (written by the setup screen)
@@ -59,6 +60,16 @@ const FileConfigSchema = z.object({
   trajectories: z.boolean().optional(),
   /** Typecheck after the model changes files, and tell it about new errors (default on). */
   diagnostics: z.boolean().optional(),
+  /** Steps a turn runs before it asks whether to keep going; 0 (or "off") never asks. */
+  maxSteps: z
+    .union([z.number().int().min(0), z.literal("off")])
+    .optional()
+    .superRefine((v, ctx) => {
+      if (v === "off") return;
+      if (v === undefined) return;
+      // 1 is useless (it would ask after every step), so the floor is 2.
+      if (v === 1) ctx.addIssue({ code: "custom", message: "too small: the smallest interval is 2" });
+    }),
 });
 
 /** 32k fits fully on a 12 GB GPU for 9-12B models and holds a fair amount of code. */
@@ -80,6 +91,13 @@ export interface Config {
   yolo: boolean;
   trajectories: boolean;
   diagnostics: boolean;
+  /**
+   * Steps a turn runs before it asks whether to keep going (with an approver; without one it's a hard stop).
+   * 0 never asks — the guard is off, like Claude Code's and Codex's step limits — and 1 can't happen (it would ask
+   * after every step). Defaults to the agent loop's DEFAULT_MAX_STEPS (25). Subagents' own hard limit (50) is not
+   * touched by 0.
+   */
+  maxSteps: number;
 }
 
 export type Env = Record<string, string | undefined>;
@@ -88,6 +106,20 @@ export class ConfigError extends Error {}
 
 export function defaultConfigDir(env: Env): string {
   return env.MARV_CONFIG_DIR ?? join(homedir(), ".marv");
+}
+
+/**
+ * MARV_MAX_STEPS, like MARV_MODEL: an env var beats the saved file, so an orchestrator can start workers
+ * that never stop without editing anyone's config. "off" (case-insensitive) is 0, "0" is 0; anything
+ * unparsable or 1 is ignored (the file value, or the default, stands).
+ */
+function maxStepsFromEnv(value: string | undefined, fallback: number): number {
+  const text = value?.trim();
+  if (text === undefined || text === "") return fallback;
+  if (/^off$/i.test(text)) return 0;
+  const n = Number(text);
+  if (!Number.isInteger(n) || n < 0 || n === 1) return fallback;
+  return n;
 }
 
 /**
@@ -155,6 +187,7 @@ export function resolveConfig(file: FileConfig | null, env: Env): Config {
     yolo: file?.yolo ?? true,
     trajectories: file?.trajectories ?? true,
     diagnostics: file?.diagnostics ?? true,
+    maxSteps: maxStepsFromEnv(env.MARV_MAX_STEPS, file?.maxSteps === "off" ? 0 : (file?.maxSteps ?? DEFAULT_MAX_STEPS)),
   };
 }
 

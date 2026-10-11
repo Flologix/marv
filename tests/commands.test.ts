@@ -15,6 +15,7 @@ const ctx: CommandContext = {
     yolo: true,
     trajectories: true,
     diagnostics: true,
+    maxSteps: 25,
   },
   configPath: "~/.marv/config.json",
 };
@@ -50,7 +51,7 @@ describe("slash commands", () => {
   });
 
   test("/config says when no key is needed (Ollama)", () => {
-    const action = run("/config", { ...ctx, config: { provider: "ollama", model: "qwen3.5:9b", baseUrl: "http://localhost:11434", thinking: false, contextLength: 32768, sandbox: true, yolo: true, trajectories: true, diagnostics: true } });
+    const action = run("/config", { ...ctx, config: { provider: "ollama", model: "qwen3.5:9b", baseUrl: "http://localhost:11434", thinking: false, contextLength: 32768, sandbox: true, yolo: true, trajectories: true, diagnostics: true, maxSteps: 25 } });
     expect(action).toMatchObject({ type: "print", text: expect.stringContaining("API key:   not needed") });
   });
 
@@ -98,6 +99,19 @@ describe("slash commands", () => {
     expect(runCommand("/diagnostics")).toMatchObject({ type: "print", text: expect.stringContaining("typecheck") });
     expect(runCommand("/diagnostics maybe")).toMatchObject({ type: "print", isError: true });
     expect(runCommand("/config")).toMatchObject({ type: "print", text: expect.stringContaining("Diagnostics: on") });
+  });
+
+  test("/steps shows the setting, or sets and saves it", () => {
+    expect(runCommand("/steps")).toMatchObject({ type: "print", text: expect.stringContaining("after 25 steps") });
+    expect(runCommand("/steps 40")).toEqual({ type: "steps", every: 40 });
+    expect(runCommand("/steps off")).toEqual({ type: "steps", every: 0 });
+    expect(runCommand("/steps 0")).toEqual({ type: "steps", every: 0 });
+    expect(runCommand("/STEPS 50")).toEqual({ type: "steps", every: 50 });
+    for (const bad of ["maybe", "4.5", "-3", "1e2", "1 2", "1"]) {
+      expect(runCommand(`/steps ${bad}`)).toMatchObject({ type: "print", isError: true });
+    }
+    const show = run("/steps", { ...ctx, config: { ...ctx.config, maxSteps: 0 } });
+    expect(show).toMatchObject({ type: "print", text: expect.stringContaining("never asks") });
   });
 
   test("/mcp lists servers, their state and tools, or explains how to add one; /mcp trust starts the project's", () => {
