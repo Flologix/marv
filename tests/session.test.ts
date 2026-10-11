@@ -363,13 +363,19 @@ describe("every tool call gets a result, with parallel subagents", () => {
     test(`a client that ${how}s while subagents run`, async () => {
       const { parent, provider } = parallel(new Hanging());
       const session = makeSession(provider);
+      const failed = new Error("the client failed");
+      let stoppedAt: SessionEvent | undefined;
       try {
         for await (const event of session.send("parent-task: go")) {
           if (event.type !== "subagent") continue;
+          stoppedAt = event;
           if (how === "break") break;
-          throw new Error("the client failed");
+          throw failed;
         }
-      } catch {}
+      } catch (err) {
+        if (err !== failed) throw err;
+      }
+      expect(stoppedAt).toMatchObject({ type: "subagent", callId: expect.stringMatching(/^[ab]0$/) });
       expect(session.busy).toBe(false);
       await collect(session.send("next"));
       const next = parent.requests.at(-1)!.history;

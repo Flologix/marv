@@ -726,6 +726,9 @@ describe("every tool call gets exactly one result, in call order, however the ru
     stopAt?: (e: LoopEvent) => "break" | "throw" | undefined;
   }
 
+  /** What a consumer that throws throws: any other error is a real failure, and drive() passes it on. */
+  const CONSUMER_FAILED = new Error("the consumer failed");
+
   async function drive(script: AgentEvent[][], { abortOn, declineOn, stopAt }: Drive = {}, opts: Partial<Parameters<typeof runAgent>[0]> = {}) {
     const controller = new AbortController();
     const history: ChatTurn[] = [{ role: "user", text: "go" }];
@@ -747,20 +750,23 @@ describe("every tool call gets exactly one result, in call order, however the ru
       maxParallel: 2,
       ...opts,
     });
-    let thrown: unknown;
+    // Where the consumer stopped, if it did: a stop case must check it, or a stopAt that never matched would pass.
+    let stopped: { how: "break" | "throw"; event: LoopEvent } | undefined;
     try {
       for await (const event of loop) {
         events.push(event);
-        const stop = stopAt?.(event);
-        if (stop === "break") break;
-        if (stop === "throw") throw new Error("the consumer failed");
+        const how = stopAt?.(event);
+        if (!how) continue;
+        stopped = { how, event };
+        if (how === "break") break;
+        throw CONSUMER_FAILED;
       }
     } catch (err) {
-      thrown = err;
+      if (err !== CONSUMER_FAILED) throw err;
     }
     await Bun.sleep(50); // tools still running after the consumer left finish now: they must not add anything
     const calls = history.flatMap((t) => (t.role === "assistant" ? (t.toolCalls ?? []) : []));
-    return { history, events, thrown, calls, end: events.at(-1) };
+    return { history, events, stopped, calls, end: events.at(-1) };
   }
 
   test("a run that answers (the baseline)", async () => {
@@ -797,27 +803,28 @@ describe("every tool call gets exactly one result, in call order, however the ru
   });
 
   describe("a consumer that stops", () => {
-    const at = (type: LoopEvent["type"], id: string) => (e: LoopEvent) =>
-      e.type === type && "call" in e && e.call.id === id;
-    const cases: [string, (e: LoopEvent) => boolean][] = [
-      ["at a plain call's tool_start", at("tool_start", "s2r1")],
-      ["at a group's first tool_start (the other has a slot)", at("tool_start", "s2a")],
-      ["at a group's tool_end, with a call still running", at("tool_end", "s2a")],
-      ["at the last call's tool_end", at("tool_end", "s2r2")],
+    const cases: [string, LoopEvent["type"], string][] = [
+      ["at a plain call's tool_start", "tool_start", "s2r1"],
+      ["at a group's first tool_start (the other has a slot)", "tool_start", "s2a"],
+      ["at a group's tool_end, with a call still running", "tool_end", "s2a"],
+      ["at the last call's tool_end", "tool_end", "s2r2"],
     ];
-    for (const [name, match] of cases) {
+    for (const [name, type, id] of cases) {
       for (const how of ["break", "throw"] as const) {
         test(`${how}s ${name}`, async () => {
-          const { history, thrown } = await drive([...steps(2), say("never")], { stopAt: (e) => (match(e) ? how : undefined) });
-          expect(thrown !== undefined).toBe(how === "throw");
+          const match = (e: LoopEvent) => e.type === type && "call" in e && e.call.id === id;
+          const { history, stopped, events } = await drive([...steps(2), say("never")], { stopAt: (e) => (match(e) ? how : undefined) });
+          expect(stopped).toEqual({ how, event: expect.objectContaining({ type, call: expect.objectContaining({ id }) }) });
+          expect(events.at(-1)).toBe(stopped!.event); // nothing came after it
           expect(answerProblems(history)).toEqual([]);
         });
       }
     }
 
     test("at a tool_skipped after a no", async () => {
-      const { history, events } = await drive([...steps(2), say("never")], { declineOn: "s2r1", stopAt: (e) => (e.type === "tool_skipped" ? "break" : undefined) });
-      expect(events.at(-1)?.type).toBe("tool_skipped");
+      const { history, events, stopped } = await drive([...steps(2), say("never")], { declineOn: "s2r1", stopAt: (e) => (e.type === "tool_skipped" ? "break" : undefined) });
+      expect(stopped).toEqual({ how: "break", event: expect.objectContaining({ type: "tool_skipped", call: expect.objectContaining({ id: "s2a" }) }) });
+      expect(events.at(-1)).toBe(stopped!.event);
       expect(answerProblems(history)).toEqual([]);
     });
   });
@@ -837,7 +844,9 @@ describe("every tool call gets exactly one result, in call order, however the ru
     });
 
     test("a consumer that stops at a cut-off call's tool_skipped", async () => {
-      const { history } = await drive([cutOff(mixed("s1"))], { stopAt: (e) => (e.type === "tool_skipped" ? "throw" : undefined) });
+      const { history, events, stopped } = await drive([cutOff(mixed("s1"))], { stopAt: (e) => (e.type === "tool_skipped" ? "throw" : undefined) });
+      expect(stopped).toEqual({ how: "throw", event: expect.objectContaining({ type: "tool_skipped", call: expect.objectContaining({ id: "s1r1" }) }) });
+      expect(events.at(-1)).toBe(stopped!.event);
       expect(answerProblems(history)).toEqual([]);
     });
   });
@@ -871,8 +880,9 @@ describe("every tool call gets exactly one result, in call order, however the ru
     });
 
     test("a consumer that stops at the step_limit event", async () => {
-      const { history, events } = await drive(steps(5), { stopAt: (e) => (e.type === "step_limit" ? "throw" : undefined) }, { maxSteps: 2, onLimit: async () => true });
-      expect(events.at(-1)?.type).toBe("step_limit");
+      const { history, events, stopped } = await drive(steps(5), { stopAt: (e) => (e.type === "step_limit" ? "throw" : undefined) }, { maxSteps: 2, onLimit: async () => true });
+      expect(stopped).toEqual({ how: "throw", event: { type: "step_limit", steps: 2, continued: true } });
+      expect(events.at(-1)).toBe(stopped!.event);
       expect(answerProblems(history)).toEqual([]);
     });
   });
