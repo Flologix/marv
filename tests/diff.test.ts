@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { addedLines, diffText, MAX_SHOWN_DIFF, MAX_SHOWN_LINE_CHARS, shownDiff } from "../src/tools/diff.ts";
+import { addedLines, diffText, MAX_SHOWN_DIFF, MAX_SHOWN_LINE_CHARS, previewLines, shownDiff } from "../src/tools/diff.ts";
 
 test("diff lines carry line numbers: new for added and unchanged lines, old for removed ones, across hunks", () => {
   const before = Array.from({ length: 20 }, (_, i) => `line ${i + 1}`).join("\n") + "\n";
@@ -36,4 +36,27 @@ test("what a result keeps cuts each line short: a minified file's one huge line 
   const { lines } = shownDiff([{ kind: "add", text: long, newLine: 1 }, { kind: "ctx", text: "short", oldLine: 1, newLine: 2 }]);
   expect(lines[0]).toEqual({ kind: "add", text: long.slice(0, MAX_SHOWN_LINE_CHARS), newLine: 1 });
   expect(lines[1]).toEqual({ kind: "ctx", text: "short", oldLine: 1, newLine: 2 });
+});
+
+test("a collapsed preview keeps a change's additions in view: a long removal is cut to its first lines and a gap", () => {
+  const { lines } = diffText("a\nb\nc\nd\ne\nf\n", "x\ny\n");
+  expect(previewLines(lines, 5).map((l) => (l.kind === "gap" ? "…" : `${l.kind} ${l.text}`))).toEqual(["del a", "…", "add x", "add y"]);
+  // What fits is shown as it is, and nothing is ever longer than asked.
+  expect(previewLines(lines, 8)).toEqual(lines);
+  expect(previewLines(lines, 2)).toHaveLength(2);
+});
+
+test("a big rewrite keeps the new file's start too, and counts what it left out", () => {
+  const file = (prefix: string) => Array.from({ length: 500 }, (_, i) => `${prefix} ${i + 1}`).join("\n") + "\n";
+  const all = diffText(file("old"), file("new")).lines;
+  const { lines, more } = shownDiff(all);
+  expect(lines).toHaveLength(MAX_SHOWN_DIFF);
+  expect(lines.filter((l) => l.kind === "del")).toEqual(all.slice(0, MAX_SHOWN_DIFF / 5));
+  expect(lines[MAX_SHOWN_DIFF / 5]).toEqual({ kind: "gap", text: "…" });
+  expect(lines[MAX_SHOWN_DIFF / 5 + 1]).toEqual({ kind: "add", text: "new 1", newLine: 1 });
+  expect(more).toBe(1000 - (MAX_SHOWN_DIFF - 1));
+  // Collapsed again on screen, the kept diff still shows the new file's start, with one gap.
+  const preview = previewLines(lines, 15);
+  expect(preview.map((l) => l.kind)).toEqual(["del", "del", "del", "gap", ...Array(11).fill("add")]);
+  expect(preview[4]).toEqual({ kind: "add", text: "new 1", newLine: 1 });
 });
