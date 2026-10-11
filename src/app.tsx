@@ -6,7 +6,7 @@ import { applyEvent, createAgentLog, type AgentLog } from "./agent-log.ts";
 import { GENERAL_PURPOSE, type AgentType } from "./agents.ts";
 import { copyToClipboard } from "./clipboard.ts";
 import type { HerdrReporter } from "./herdr.ts";
-import { commands, diagnosticsStatus, isCommand, runCommand, trajectoriesStatus, yoloStatus } from "./commands/index.ts";
+import { commands, diagnosticsStatus, isCommand, runCommand, stepsStatus, trajectoriesStatus, yoloStatus } from "./commands/index.ts";
 import {
   needsSetup,
   PRESETS,
@@ -305,6 +305,7 @@ export function App({
         sandbox: config.sandbox,
         yolo: config.yolo,
         diagnostics: config.diagnostics,
+        maxSteps: config.maxSteps,
         sessions,
         trajectories,
         logTrajectories: config.trajectories,
@@ -325,6 +326,7 @@ export function App({
       yolo: config.yolo,
       trajectories: config.trajectories,
       diagnostics: config.diagnostics,
+      maxSteps: config.maxSteps,
     });
     setSessionVersion((v) => v + 1);
   }, [config, session, makeProvider, loadModels]);
@@ -754,6 +756,14 @@ export function App({
       case "diagnostics":
         void saveConfig({ ...(file ?? { provider: config.provider }), diagnostics: action.on }, `Diagnostics ${diagnosticsStatus({ ...config, diagnostics: action.on })}`);
         break;
+      case "steps": {
+        // `/steps` with no argument only showed the setting; a number (0 included) and "off" save it. The env var
+        // keeps beating the file until the process ends, as with MARV_MODEL.
+        const every = action.every;
+        if (every === undefined) break;
+        void saveConfig({ ...(file ?? { provider: config.provider }), maxSteps: every }, stepsStatus({ ...config, maxSteps: every }));
+        break;
+      }
       case "feedback":
         rateLastTurn(action);
         break;

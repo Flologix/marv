@@ -97,7 +97,8 @@ export interface SessionInit {
   approve?: (request: ApprovalRequest) => Promise<Decision>;
   /**
    * Steps a turn runs before it stops (without an approver) or asks whether to keep going (with one, again at each
-   * multiple). Default 25.
+   * multiple). Default 25. 0 never asks and never stops the main agent: the guard is off for the session's own
+   * turns, while subagents keep their own hard limit (SUBAGENT_MAX_STEPS, 50).
    */
   maxSteps?: number;
   /** Typecheck after each step that changed files (TypeScript projects, in the sandbox), and tell the model about new errors. Default true. */
@@ -201,7 +202,16 @@ export interface Session {
    * only for an invalid provider (an unknown kind) or for turning yolo on where it isn't allowed (cwd your home
    * folder or above it), and then nothing changed.
    */
-  configure(changes: { provider?: ProviderOption; thinking?: boolean; sandbox?: boolean; yolo?: boolean; trajectories?: boolean; diagnostics?: boolean }): void;
+  configure(changes: {
+    provider?: ProviderOption;
+    thinking?: boolean;
+    sandbox?: boolean;
+    yolo?: boolean;
+    trajectories?: boolean;
+    diagnostics?: boolean;
+    /** The main agent's step limit (0 never asks); subagents keep their own. */
+    maxSteps?: number;
+  }): void;
   /** Feedback on the last turn, in its trajectory. */
   rate(feedback: { score: 1 | -1 | 0; note?: string; labels?: string[] }): "rated" | "off" | "nothing";
   /** Saves the conversation now (it's also saved shortly after every turn). */
@@ -244,6 +254,11 @@ export class MarvSession implements Session {
   private system: string;
   private sandbox: boolean;
   private diagnostics: boolean;
+  /**
+   * The step limit for the main agent's turns; 0 never asks (and, without an approver, never stops). Subagents
+   * keep their own SUBAGENT_MAX_STEPS (50) whatever this is.
+   */
+  private maxSteps: number | undefined;
   private readonly checks: Diagnostics;
   private yolo: boolean;
   private logging: boolean;
@@ -265,8 +280,8 @@ export class MarvSession implements Session {
   constructor(private readonly init: SessionInit) {
     checkToolNames(init.tools ?? []);
     if (init.noYolo && (init.yolo ?? true)) throw new Error(init.noYolo);
-    if (init.maxSteps !== undefined && !(Number.isInteger(init.maxSteps) && init.maxSteps > 0)) {
-      throw new Error(`maxSteps must be a positive whole number, not ${init.maxSteps}`);
+    if (init.maxSteps !== undefined && !(Number.isInteger(init.maxSteps) && init.maxSteps >= 0)) {
+      throw new Error(`maxSteps must be a whole number of at least 0 (0 never asks), not ${init.maxSteps}`);
     }
     this.problems = init.problems ?? [];
     this.option = init.provider;
@@ -276,6 +291,7 @@ export class MarvSession implements Session {
     this.sandbox = init.sandbox ?? true;
     this.yolo = init.yolo ?? true;
     this.diagnostics = init.diagnostics ?? true;
+    this.maxSteps = init.maxSteps;
     this.checks = init.checks ?? new Diagnostics();
     this.logging = init.logTrajectories ?? true;
     this.memories = init.memory?.initial;
@@ -407,8 +423,15 @@ export class MarvSession implements Session {
     yolo?: boolean;
     trajectories?: boolean;
     diagnostics?: boolean;
+    maxSteps?: number;
   }): void {
     if (changes.yolo && this.init.noYolo) throw new Error(this.init.noYolo);
+    if (
+      changes.maxSteps !== undefined &&
+      !(Number.isInteger(changes.maxSteps) && changes.maxSteps >= 0)
+    ) {
+      throw new Error(`maxSteps must be a whole number of at least 0 (0 never asks), not ${changes.maxSteps}`);
+    }
     let remade: { option: ProviderFactory | ProviderOption; thinking: boolean; factory: ProviderFactory; provider: Provider; info: ModelInfo | undefined } | undefined;
     if (changes.provider !== undefined || changes.thinking !== undefined) {
       const option = changes.provider ?? this.option;
@@ -427,6 +450,7 @@ export class MarvSession implements Session {
       if (changes.diagnostics && !this.diagnostics) this.checks.reset();
       this.diagnostics = changes.diagnostics;
     }
+    if (changes.maxSteps !== undefined) this.maxSteps = changes.maxSteps;
     if (!remade) return;
     ({ option: this.option, thinking: this.thinking, factory: this.factory, provider: this.provider, info: this.info } = remade);
     this.lookup();
@@ -787,7 +811,7 @@ export class MarvSession implements Session {
       // naming its own model gets it from the same provider as the turn, and its usage is counted (local or not) as
       // that one's, priced with what the model list said about the turn's model.
       const { specs, tools } = this.offered();
-      const { sandbox, yolo, factory, provider, info, diagnostics } = this;
+      const { sandbox, yolo, factory, provider, info, diagnostics, maxSteps } = this;
       const log = this.trajectory();
       const record = (r: TrajectoryRecord) => log?.write(r);
       this.startTurnLog(log, turn, text, forModel, specs);
@@ -872,7 +896,7 @@ export class MarvSession implements Session {
           ),
         signal: stop.signal,
         isParallel: isParallelCall,
-        maxSteps: this.init.maxSteps,
+        maxSteps,
         afterStep: checks?.afterStep,
         // A long turn can fill the window by itself: check between steps, and compact there too. The events say
         // when ("Compacting the conversation…") and how it went, and the loop goes on from the summary.
@@ -887,7 +911,11 @@ export class MarvSession implements Session {
           return false;
         },
         // At the step limit, ask instead of stopping dead; with no one to ask, it stops there.
-        onLimit: approve && (async (steps) => (await approve(stepLimitRequest(steps, this.init.maxSteps ?? DEFAULT_MAX_STEPS))) !== "no"),
+        // maxSteps 0 (the guard off) makes onLimit undefined, so there is nothing to ask.
+        onLimit:
+          approve && maxSteps !== 0
+            ? async (steps) => (await approve(stepLimitRequest(steps, maxSteps ?? DEFAULT_MAX_STEPS))) !== "no"
+            : undefined,
       })) {
         main.event(event);
         switch (event.type) {

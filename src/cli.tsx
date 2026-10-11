@@ -40,6 +40,7 @@ Config:
   OPENROUTER_API_KEY    overrides the saved OpenRouter key
   OLLAMA_HOST           where Ollama runs (default localhost:11434)
   MARV_MODEL            overrides the saved model
+  MARV_MAX_STEPS        overrides the saved step limit (0 or off: never ask)
   MARV_CONFIG_DIR       use a different config directory`;
 
 const args = process.argv.slice(2);
