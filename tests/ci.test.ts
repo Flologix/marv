@@ -50,6 +50,23 @@ describe("the CI workflow", () => {
     expect(text).toContain("oven-sh/setup-bun");
   });
 
+  test("fails before the tests when bwrap can't start a sandbox, so a green run never skipped the sandbox tests", () => {
+    const text = yml();
+    const steps = text.split("\n");
+    const require = steps.findIndex((line) => line.includes("name: Require a working sandbox"));
+    const tests = steps.findIndex((line) => line.includes("run: bun test"));
+    expect(require).toBeGreaterThan(-1);
+    expect(require).toBeLessThan(tests);
+    expect(steps[require + 1]).toContain("bwrap ");
+  });
+
+  test("pins every action to a full commit hash, so a moved tag can't change what runs", () => {
+    const text = yml();
+    const uses = [...text.matchAll(/uses:\s*(\S+)/g)].map((m) => m[1]!);
+    expect(uses.length).toBeGreaterThan(0);
+    for (const action of uses) expect(action).toMatch(/@[0-9a-f]{40}$/);
+  });
+
   test("caches installs keyed on bun.lock", () => {
     const text = yml();
     expect(text).toContain("actions/cache");
