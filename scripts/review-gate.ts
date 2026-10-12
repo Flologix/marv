@@ -83,7 +83,8 @@ if (version.error || version.status !== 0) {
   console.error("review-gate: `ocr` isn't installed, so this push isn't reviewed. Install it with `npm i -g @alibaba-group/open-code-review`, then `ocr config provider`.");
   process.exit(0);
 }
-const ocrVersion = (version.stdout ?? "").trim();
+// The first line ("open-code-review v1.12.13 (…)"): the cache file is read line by line, so a key must be one line.
+const ocrVersion = (version.stdout ?? "").trim().split("\n")[0]!.trim();
 if (spawnSync("git", ["rev-parse", "--verify", "--quiet", `${base}^{commit}`]).status !== 0) fail(`base "${base}" isn't a commit here (fetch it, or pass --base)`);
 
 // --- Already-passed commits ---
