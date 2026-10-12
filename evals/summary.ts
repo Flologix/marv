@@ -74,7 +74,8 @@ const median = (values: number[]) => {
   return sorted.length % 2 ? sorted[mid]! : (sorted[mid - 1]! + sorted[mid]!) / 2;
 };
 
-const groupKey = (r: RunResult) => `${r.label}\u0000${r.model}`;
+// A proxied run and a direct one are compared, never blended: the proxy is part of the group.
+const groupKey = (r: RunResult) => `${r.label}\u0000${r.model}\u0000${r.baseUrl ?? ""}`;
 
 /** The proxy a run went through (`--base-url`), as "via localhost:8787"; nothing for OpenRouter's own API. */
 const via = (r: RunResult | undefined) => {
