@@ -44,6 +44,18 @@ describe("Approval", () => {
     expect(lastFrame()).toMatch(/❯ Yes\s+│/);
   });
 
+  test("once: Yes and No only, no 'don't ask again' (/mcp add: each install is its own decision)", async () => {
+    const onDecide = mock((_d: string) => {});
+    const { stdin, lastFrame } = render(<Approval request={{ ...COMMAND, once: true }} onDecide={onDecide} />);
+    expect(lastFrame()).not.toContain("don't ask again");
+    stdin.write(DOWN);
+    await tick();
+    expect(lastFrame()).toMatch(/❯ No/);
+    stdin.write(ENTER);
+    await tick();
+    expect(onDecide).toHaveBeenCalledWith("no");
+  });
+
   test("says which subagent is asking, and how many more are waiting", () => {
     const frame = render(<Approval request={{ ...EDIT, agent: "implementer · Task 2" }} waiting={2} onDecide={() => {}} />).lastFrame()!;
     expect(frame).toContain("[implementer · Task 2]");

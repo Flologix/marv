@@ -1,0 +1,32 @@
+{
+  "info": {
+    "name": "mcp-server-fetch",
+    "version": "2025.4.7",
+    "author": "Anthropic, PBC.",
+    "author_email": null,
+    "home_page": null,
+    "project_urls": {
+      "Issues": "https://github.com/modelcontextprotocol/servers/issues",
+      "Repository": "https://github.com/modelcontextprotocol/servers/tree/main/src/fetch"
+    },
+    "summary": "A Model Context Protocol server providing tools to fetch and convert web content for usage by LLMs",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 28000000,
+  "ownership": { "organization": null, "roles": [{ "role": "Owner", "user": "jspahrsummers" }] },
+  "releases": {
+    "0.1.0": [
+      { "filename": "mcp_server_fetch-0.1.0-py3-none-any.whl", "packagetype": "bdist_wheel", "upload_time_iso_8601": "2024-11-19T20:00:00.000000Z", "yanked": false, "yanked_reason": null }
+    ],
+    "2025.1.14": [
+      { "filename": "mcp_server_fetch-2025.1.14-py3-none-any.whl", "packagetype": "bdist_wheel", "upload_time_iso_8601": "2025-01-14T10:00:00.000000Z", "yanked": true, "yanked_reason": "broken build" }
+    ],
+    "2025.4.7": [
+      { "filename": "mcp_server_fetch-2025.4.7-py3-none-any.whl", "packagetype": "bdist_wheel", "upload_time_iso_8601": "2025-04-07T18:00:00.000000Z", "yanked": false, "yanked_reason": null },
+      { "filename": "mcp_server_fetch-2025.4.7.tar.gz", "packagetype": "sdist", "upload_time_iso_8601": "2025-04-07T18:00:02.000000Z", "yanked": false, "yanked_reason": null }
+    ]
+  },
+  "urls": [],
+  "vulnerabilities": []
+}

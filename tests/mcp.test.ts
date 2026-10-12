@@ -281,3 +281,63 @@ test("close() right after start() leaves no server connected or running", async 
   for (let i = 0; i < 50 && Bun.spawnSync(["pgrep", "-f", marker]).stdout.toString().trim(); i++) await Bun.sleep(100);
   expect(Bun.spawnSync(["pgrep", "-f", marker]).stdout.toString().trim()).toBe("");
 });
+
+describe("adding and removing servers while running (/mcp add, /mcp remove)", () => {
+  test("a manager created empty starts an added server; a turn starting meanwhile waits for it", async () => {
+    const m = manager([]);
+    await m.start();
+    expect(m.settled).toBe(true);
+    const adding = m.add(stdio("added"));
+    expect(m.settled).toBe(false);
+    let waited = false;
+    const ready = m.ready.then(() => (waited = true));
+    const status = await adding;
+    await ready;
+    expect(waited).toBe(true);
+    expect(m.settled).toBe(true);
+    expect(status).toMatchObject({ name: "added", state: "connected" });
+    expect(m.tools.map((t) => t.name)).toContain("mcp__added__echo");
+    expect(m.specs.map((s) => s.name)).toContain("mcp__added__echo");
+    const { result } = await call(m, "mcp__added__echo", { text: "hi" });
+    expect(result.output).toBe("echo: hi");
+  });
+
+  test("it starts in the home folder, like your other servers", async () => {
+    const m = manager([]);
+    await m.add(stdio("home"));
+    const { result } = await call(m, "mcp__home__cwd", {});
+    expect(realpathSync(result.output)).toBe(realpathSync(homedir()));
+  });
+
+  test("a name that's taken is refused; a server that fails says so in its status", async () => {
+    const m = manager([stdio("a")]);
+    await m.start();
+    await expect(m.add(stdio("a"))).rejects.toThrow(/already an MCP server named "a"/);
+    const failed = await m.add(stdio("broken", { transport: { type: "stdio", command: "/nonexistent/server" } }));
+    expect(failed.state).toBe("failed");
+    expect(m.settled).toBe(true);
+  });
+
+  test("remove stops it; its tools stay listed and calls fail clearly; a new conversation forgets them", async () => {
+    const m = manager([]);
+    await m.add(stdio("gone"));
+    const specs = m.specs.length;
+    await m.remove("gone");
+    expect(m.status()).toEqual([expect.objectContaining({ name: "gone", state: "removed" })]);
+    expect(m.specs.length).toBe(specs);
+    const { result } = await call(m, "mcp__gone__echo", { text: "hi" });
+    expect(result.isError).toBe(true);
+    expect(result.output).toContain("removed with /mcp remove");
+    await expect(m.remove("gone")).rejects.toThrow(/no MCP server named "gone"/);
+    m.forgetRemoved();
+    expect(m.specs).toEqual([]);
+    expect(m.status()).toEqual([]);
+  });
+
+  test("close() after add stops it", async () => {
+    const m = manager([]);
+    await m.add(stdio("x"));
+    await m.close();
+    await expect(m.add(stdio("y"))).rejects.toThrow(/closing/);
+  });
+});

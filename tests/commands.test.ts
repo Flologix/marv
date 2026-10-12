@@ -177,6 +177,26 @@ describe("slash commands", () => {
     expect(runCommand("/mcp nope")).toMatchObject({ type: "print", isError: true });
   });
 
+  test("/mcp add, search and remove", () => {
+    expect(runCommand("/mcp add x")).toEqual({ type: "mcp-add", args: "x" });
+    expect(runCommand('/mcp add weather --env KEY --header "A: Bearer ${T}"')).toEqual({ type: "mcp-add", args: 'weather --env KEY --header "A: Bearer ${T}"' });
+    expect(runCommand("/mcp search a b")).toEqual({ type: "mcp-search", words: "a b" });
+    expect(runCommand("/mcp remove x")).toEqual({ type: "mcp-remove", name: "x" });
+    for (const bad of ["/mcp add", "/mcp search", "/mcp remove", "/mcp remove a b", "/mcp trust x"]) {
+      const action = runCommand(bad);
+      expect(action).toMatchObject({ type: "print", isError: true });
+      expect((action as { text: string }).text).toContain("/mcp add <npm package");
+      expect((action as { text: string }).text).toContain("/mcp search <words>");
+      expect((action as { text: string }).text).toContain("/mcp remove <name>");
+    }
+    expect(runCommand("/mcp")).toMatchObject({ text: expect.stringContaining("/mcp add") });
+    const removed = run("/mcp", {
+      ...ctx,
+      mcp: { servers: [{ name: "gone", source: "personal", target: "npx -y x@1.0.0", reads: [], runsProjectFiles: [], state: "removed", tools: ["mcp__gone__a"] }], problems: [] },
+    });
+    expect(removed).toMatchObject({ text: expect.stringContaining("- **gone** (yours): removed") });
+  });
+
   test("/skills lists skills, or explains how to add one", () => {
     const review = { name: "review", description: "Review code.", body: "b", dir: "/x", files: [], source: "project" as const };
     const listed = run("/skills", { ...ctx, skills: [review], skillProblems: ["bad/SKILL.md needs a description"] });

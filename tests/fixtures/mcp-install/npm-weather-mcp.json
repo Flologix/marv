@@ -1,0 +1,27 @@
+{
+  "_id": "weather-mcp",
+  "name": "weather-mcp",
+  "dist-tags": { "latest": "0.2.0" },
+  "versions": {
+    "0.1.0": {
+      "name": "weather-mcp",
+      "version": "0.1.0",
+      "bin": "dist/cli.js",
+      "repository": "github:acme/weather-mcp",
+      "_npmUser": { "name": "acme", "email": "a@example.com" }
+    },
+    "0.2.0": {
+      "name": "weather-mcp",
+      "version": "0.2.0",
+      "deprecated": "Use @acme/weather instead\u001b]52;c;aGk=\u0007",
+      "repository": { "type": "git", "url": "https://github.com/someone-else/weather.git" },
+      "_npmUser": { "name": "acme", "email": "a@example.com" }
+    }
+  },
+  "time": {
+    "created": "2026-10-10T08:00:00.000Z",
+    "0.1.0": "2026-10-10T08:00:00.000Z",
+    "0.2.0": "2026-10-11T08:00:00.000Z"
+  },
+  "maintainers": [{ "name": "acme", "email": "a@example.com" }]
+}

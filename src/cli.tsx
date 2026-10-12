@@ -151,14 +151,13 @@ const root = process.cwd();
 const agentsMd = await readInstructions(root);
 const { skills, problems: skillProblems } = await loadSkills({ root, home: homedir() });
 const { agents, problems: agentProblems } = await loadAgents({ root, home: homedir() });
-// MCP servers start now, in the background; the first request waits for them (see McpManager).
+// MCP servers start now, in the background; the first request waits for them (see McpManager). Always a manager,
+// even with no servers, so /mcp add can start the first one without a restart.
 const { servers: mcpServers, problems: mcpProblems } = await loadMcpConfig({ root, configDir: defaultConfigDir(process.env), env: process.env });
-const mcp = mcpServers.length
-  ? new McpManager(mcpServers, { root, version: pkg.version, trust: new McpTrust(join(defaultConfigDir(process.env), "mcp-trust.json")) })
-  : undefined;
-void mcp?.start();
+const mcp = new McpManager(mcpServers, { root, version: pkg.version, trust: new McpTrust(join(defaultConfigDir(process.env), "mcp-trust.json")) });
+void mcp.start();
 // Local servers must not outlive Marv, however it exits.
-process.on("exit", () => mcp?.kill());
+process.on("exit", () => mcp.kill());
 const memoryAt = memoryPaths(defaultConfigDir(process.env), root);
 const memory = { paths: memoryAt, initial: await loadMemory(memoryAt) };
 
@@ -226,7 +225,7 @@ await instance.waitUntilExit();
 // The last turn and pending trajectory records reach the disk (quitting cancels the delayed save).
 await Promise.race([flush(), Bun.sleep(2000)]);
 // Let servers shut down cleanly, but don't hang on one that won't.
-await Promise.race([mcp?.close(), Bun.sleep(2000)]);
+await Promise.race([mcp.close(), Bun.sleep(2000)]);
 // Herdr stops showing an agent in this pane; no waiting on a Herdr that doesn't answer.
 await Promise.race([herdr?.release(), Bun.sleep(1000)]);
 process.exit(0);

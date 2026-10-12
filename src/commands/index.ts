@@ -33,6 +33,12 @@ export type CommandAction =
   | { type: "steps"; every?: number }
   /** Trust and start the project's MCP servers. */
   | { type: "mcp-trust" }
+  /** Work out a server's entry from a package, URL, GitHub repo or registry name, ask, write it and start it. */
+  | { type: "mcp-add"; args: string }
+  /** Look for servers in the MCP Registry. */
+  | { type: "mcp-search"; words: string }
+  /** Take one of your servers out of ~/.marv/mcp.json and stop it. */
+  | { type: "mcp-remove"; name: string }
   /** Rate or tag the last turn: 1 good, -1 bad, 0 labels only. */
   | { type: "feedback"; score: 1 | -1 | 0; note?: string; labels?: string[] }
   | { type: "resume" }
@@ -172,12 +178,14 @@ export const commands: Command[] = [
   },
   {
     name: "mcp",
-    description: "Show MCP servers and their tools (/mcp trust starts the project's)",
+    description: "Show MCP servers and their tools (/mcp add <package | URL | repo>, search, remove, trust)",
     run: (args, { mcp }) => {
-      const arg = args.trim().toLowerCase();
-      if (arg === "trust") return { type: "mcp-trust" };
-      if (arg) return { type: "print", text: "Usage: /mcp, or /mcp trust", isError: true };
-      return { type: "print", text: mcpText(mcp), markdown: true };
+      const trimmed = args.trim();
+      if (!trimmed) return { type: "print", text: mcpText(mcp), markdown: true };
+      const [sub = "", ...words] = trimmed.split(/\s+/);
+      const rest = trimmed.slice(sub.length).trim();
+      const run = MCP_SUBCOMMANDS[sub.toLowerCase()];
+      return (run && run(rest, words)) ?? { type: "print", text: MCP_USAGE, isError: true };
     },
   },
   {
@@ -376,7 +384,17 @@ function sandboxStatus(config: Config, hiddenPathFolders: string[] = []): string
   return `on: bash runs in bubblewrap (project writable, home hidden, no network unless asked).${hidden}`;
 }
 
-const MCP_HELP = `No MCP servers yet. Add them to \`.mcp.json\` in the project, or \`~/.marv/mcp.json\` for every project (the same format as Claude Code's), then restart Marv:
+const MCP_USAGE = `Usage: /mcp (list servers), /mcp add <npm package | pypi:<package> | https URL | GitHub repo | registry name> [--name <name>] [--env VAR] [--header "Name: Bearer \${VAR}"] [-- <server args>], /mcp search <words>, /mcp remove <name>, /mcp trust`;
+
+/** /mcp's subcommands: each gets the text after its name (and its words), and returns undefined for a usage error. */
+const MCP_SUBCOMMANDS: Record<string, (rest: string, words: string[]) => CommandAction | undefined> = {
+  trust: (rest) => (rest ? undefined : { type: "mcp-trust" }),
+  add: (rest) => (rest ? { type: "mcp-add", args: rest } : undefined),
+  search: (rest) => (rest ? { type: "mcp-search", words: rest } : undefined),
+  remove: (_, words) => (words.length === 1 ? { type: "mcp-remove", name: words[0]! } : undefined),
+};
+
+const MCP_HELP = `No MCP servers yet. Add one with \`/mcp add <npm package | URL | GitHub repo>\` (find one with \`/mcp search <words>\`), or by hand in \`.mcp.json\` in the project, or \`~/.marv/mcp.json\` for every project (the same format as Claude Code's), then restart Marv:
 
 \`\`\`json
 { "mcpServers": {
@@ -402,6 +420,8 @@ function mcpText(mcp: CommandContext["mcp"]): string {
       }
       case "connecting":
         return `${who}starting…`;
+      case "removed":
+        return `${who}removed (its tools stay listed, failing, until \`/clear\` or a restart)`;
       case "failed":
         return `${who}failed: ${s.error ?? "unknown error"}${s.stderr ? `\n\n  \`\`\`\n  ${s.stderr.split("\n").slice(-5).join("\n  ")}\n  \`\`\`` : ""}`;
     }

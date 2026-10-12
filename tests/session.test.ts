@@ -1229,6 +1229,46 @@ describe("deferred MCP tools (#14)", () => {
     expect(lastUser(provider, 3)).toBe(`${NOTE}\n- mcp__y__c: Does mcp__y__c.\n\nand now?`);
   });
 
+  test("/mcp add mid-conversation: an eager conversation offers the new specs from the next turn and stays eager", async () => {
+    const mcp = ready();
+    const provider = new ScriptedProvider([say("One."), say("Two.")]);
+    const session = makeSession(provider, { mcp, mcpTools: "eager" });
+    await collect(session.send("one"));
+    const added = fakeTool("mcp__y__c", { kind: "read" });
+    mcp.specs.push(...specsOf([added])); // what McpManager.add's rebuild does
+    mcp.tools.push(added);
+    await collect(session.send("two"));
+    const [first, second] = provider.requests;
+    expect(second!.options.tools!.map((t) => t.name)).toEqual([...first!.options.tools!.map((t) => t.name), "mcp__y__c"]);
+    expect(second!.options.tools!.map((t) => t.name)).not.toContain("tool_search");
+    expect(second!.options.system).toBe(first!.options.system);
+    expect(second!.history.slice(0, first!.history.length)).toEqual(first!.history);
+  });
+
+  test("/mcp add into a conversation with no MCP tools yet: the next turn decides, with the new server counted", async () => {
+    const mcp = fakeMcp(Promise.resolve(), [], []);
+    const provider = new ScriptedProvider([say("One."), say("Two.")]);
+    const session = makeSession(provider, { mcp, mcpTools: "deferred" });
+    await collect(session.send("one"));
+    mcp.specs.push(...specsOf(tools));
+    mcp.tools.push(...tools);
+    await collect(session.send("two"));
+    expect(provider.requests[0]!.options.tools!.map((t) => t.name)).toEqual(builtinNames);
+    expect(provider.requests[1]!.options.tools!.map((t) => t.name)).toEqual([...builtinNames, "tool_search", "mcp_call"]);
+    expect(lastUser(provider, 1)).toBe(`${NOTE}\n- mcp__x__a: Does mcp__x__a.\n- mcp__x__b: Does mcp__x__b.\n\ntwo`);
+    // The mcp__ paragraph was there from the start (a manager, even an empty one), so the system prompt didn't change.
+    expect(provider.requests[0]!.options.system).toContain("Tools named mcp__<server>__<tool>");
+    expect(provider.requests[1]!.options.system).toBe(provider.requests[0]!.options.system);
+  });
+
+  test("/clear forgets servers removed with /mcp remove", async () => {
+    let forgot = 0;
+    const mcp = Object.assign(ready(), { forgetRemoved: () => void forgot++ });
+    const session = makeSession(new ScriptedProvider([say("Hi.")]), { mcp });
+    await session.clear();
+    expect(forgot).toBe(1);
+  });
+
   test("a turn with nothing new adds nothing, and the transcript never shows the note", async () => {
     const provider = new ScriptedProvider([say("One."), say("Two.")]);
     const store = new SessionStore(join(dir, "sessions"));

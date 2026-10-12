@@ -21,6 +21,10 @@ import { projectKey } from "../src/paths.ts";
 import { TrajectoryStore } from "../src/trajectory.ts";
 import { McpManager } from "../src/mcp/manager.ts";
 import { McpTrust } from "../src/mcp/trust.ts";
+import type { Resolved } from "../src/mcp/install/index.ts";
+import type { Proposal } from "../src/mcp/install/proposal.ts";
+import type { RegistryHit } from "../src/mcp/install/registry.ts";
+import type { AddOptions } from "../src/mcp/install/source.ts";
 import { dns } from "../src/tools/web/address.ts";
 import { FakeProvider, RoutedProvider, ScriptedProvider } from "./fake-provider.ts";
 
@@ -1714,5 +1718,151 @@ describe("subagents", () => {
     await tick();
     expect(lastFrame()).toContain("1 agent file couldn't be loaded");
     expect(lastFrame()).toContain(".marv/agents/x.md needs a description");
+  });
+});
+
+describe("/mcp add, search and remove", () => {
+  const FIXTURE = join(import.meta.dir, "fixtures", "mcp-server.ts");
+  let managers: McpManager[] = [];
+  afterEach(async () => {
+    await Promise.all(managers.map((m) => m.close()));
+    managers = [];
+  });
+  const mcpFile = () => join(dir, "mcp.json");
+  const readMcpFile = async () => JSON.parse(await Bun.file(mcpFile()).text()) as { mcpServers: Record<string, unknown> };
+
+  function renderAdd(resolveMcp: (options: AddOptions) => Promise<Resolved>, extra: { searchMcp?: (words: string) => Promise<RegistryHit[]>; env?: Record<string, string> } = {}) {
+    const mcp = new McpManager([], { root: project, version: "9.9.9" }); // as cli.tsx makes it: even with no servers
+    managers.push(mcp);
+    void mcp.start();
+    const calls: AddOptions[] = [];
+    const app = render(
+      <App
+        store={store}
+        initialFile={LOCAL}
+        env={extra.env ?? {}}
+        version="9.9.9"
+        cwd="~/x"
+        root={project}
+        splashMs={0}
+        makeProvider={() => new FakeProvider()}
+        loadModels={async () => []}
+        mcp={mcp}
+        resolveMcp={async (options) => (calls.push(options), resolveMcp(options))}
+        searchMcp={extra.searchMcp}
+      />,
+    );
+    return { ...app, mcp, calls };
+  }
+  const fixtureProposal = (): Proposal => ({
+    name: "fixture",
+    entry: { command: process.execPath, args: [FIXTURE] },
+    facts: ["npm      fixture 1.0.0, published 2026-01-14 by someone"],
+    warnings: [],
+  });
+
+  test("shows one approval with the command and the JSON, and no 'don't ask again'; No writes nothing", async () => {
+    const { lastFrame, stdin, mcp, calls } = renderAdd(async () => fixtureProposal());
+    await type(stdin, "/mcp add fixture --env API_KEY");
+    await until(() => lastFrame()!.includes("Do you want to proceed?"));
+    const frame = lastFrame()!;
+    expect(calls).toEqual([{ source: "fixture", env: ["API_KEY"], headers: {}, args: [] }]);
+    expect(frame).toContain('Add MCP server "fixture" to ~/.marv/mcp.json');
+    expect(frame).toContain(`$ ${process.execPath}`);
+    expect(frame).toContain(FIXTURE);
+    expect(frame).toContain("fixture 1.0.0, published 2026-01-14");
+    expect(frame).toContain('writes   "fixture": {"command":');
+    expect(frame).toContain("runs outside the sandbox, with your permissions and network");
+    expect(frame).not.toContain("don't ask again");
+    stdin.write(DOWN);
+    await tick();
+    stdin.write(ENTER);
+    await until(() => lastFrame()!.includes("Not added"));
+    expect(existsSync(mcpFile())).toBe(false);
+    expect(mcp.status()).toEqual([]);
+  });
+
+  test("Yes writes exactly the entry shown (nothing after the approval changes it) and starts it", async () => {
+    const proposal = fixtureProposal();
+    const shown = structuredClone(proposal.entry);
+    const { lastFrame, stdin, mcp } = renderAdd(async () => proposal);
+    await type(stdin, "/mcp add fixture");
+    await until(() => lastFrame()!.includes("Do you want to proceed?"));
+    // Whatever happens to the proposal after it was shown (a late fetch, a bug) can't reach the file.
+    (proposal.entry as { args: string[] }).args.push("--evil");
+    stdin.write(ENTER);
+    await until(() => lastFrame()!.includes("connected · 8 tools"));
+    expect((await readMcpFile()).mcpServers).toEqual({ fixture: shown });
+    expect(lastFrame()).toContain("Added fixture to ~/.marv/mcp.json: connected · 8 tools");
+    expect(mcp.status()).toEqual([expect.objectContaining({ name: "fixture", source: "personal", state: "connected" })]);
+    expect(mcp.tools.map((t) => t.name)).toContain("mcp__fixture__echo");
+
+    // And /mcp remove takes it out again, keeping its tools listed for this conversation.
+    await type(stdin, "/mcp remove fixture");
+    await until(() => lastFrame()!.includes("Removed fixture"));
+    expect((await readMcpFile()).mcpServers).toEqual({});
+    expect(mcp.status()[0]!.state).toBe("removed");
+    expect(lastFrame()).toContain("Its tools stay listed (failing) until /clear");
+  });
+
+  test("a lookup that fails is shown and writes nothing", async () => {
+    const { lastFrame, stdin } = renderAdd(async () => {
+      throw new Error("There's no npm package named nope.");
+    });
+    await type(stdin, "/mcp add nope");
+    await until(() => lastFrame()!.includes("Couldn't add the server"));
+    expect(lastFrame()).toContain("There's no npm package named nope.");
+    expect(existsSync(mcpFile())).toBe(false);
+  });
+
+  test("a bad option is refused before anything is looked up", async () => {
+    const { lastFrame, stdin, calls } = renderAdd(async () => fixtureProposal());
+    await type(stdin, "/mcp add weather --env API_KEY=sk-123");
+    await until(() => lastFrame()!.includes("--env takes a variable's name"));
+    expect(calls).toEqual([]);
+  });
+
+  test("a name you already have is refused before asking", async () => {
+    await writeFile(mcpFile(), JSON.stringify({ mcpServers: { fixture: { command: "x" } } }));
+    const { lastFrame, stdin } = renderAdd(async () => fixtureProposal());
+    await type(stdin, "/mcp add fixture");
+    await until(() => lastFrame()!.includes("already have a server"));
+    expect(lastFrame()).not.toContain("Do you want to proceed?");
+    expect(lastFrame()).toContain("--name");
+  });
+
+  test("an unset ${VAR}: written, not started, and Marv says to set it and restart", async () => {
+    const proposal: Proposal = { ...fixtureProposal(), entry: { command: process.execPath, args: [FIXTURE], env: { NOT_SET_HERE: "${NOT_SET_HERE}" } } };
+    const { lastFrame, stdin, mcp } = renderAdd(async () => proposal);
+    await type(stdin, "/mcp add fixture");
+    await until(() => lastFrame()!.includes("Do you want to proceed?"));
+    expect(lastFrame()).toContain("NOT_SET_HERE (not set");
+    stdin.write(ENTER);
+    await until(() => lastFrame()!.includes("restart Marv"));
+    expect(lastFrame()).toContain("didn't start it: ${NOT_SET_HERE}");
+    expect((await readMcpFile()).mcpServers.fixture).toEqual(proposal.entry);
+    expect(mcp.status()).toEqual([]);
+  });
+
+  test("a README that names several servers lists the commands", async () => {
+    const { lastFrame, stdin } = renderAdd(async () => ({ choices: ["/mcp add weather-mcp", "/mcp add pypi:mcp-server-fetch"] }));
+    await type(stdin, "/mcp add https://github.com/acme/weather");
+    await until(() => lastFrame()!.includes("names several servers"));
+    expect(lastFrame()).toContain("/mcp add pypi:mcp-server-fetch");
+  });
+
+  test("/mcp search prints the registry's matches", async () => {
+    const { lastFrame, stdin } = renderAdd(async () => fixtureProposal(), {
+      searchMcp: async () => [{ name: "io.github.acme/weather", description: "Weather.", version: "1.0.0", repository: "github.com/acme/weather" }],
+    });
+    await type(stdin, "/mcp search weather");
+    await until(() => lastFrame()!.includes("/mcp add io.github.acme/weather"));
+    expect(lastFrame()).toContain("isn't curated");
+  });
+
+  test("/mcp remove refuses a server that isn't yours", async () => {
+    const { lastFrame, stdin } = renderAdd(async () => fixtureProposal());
+    await type(stdin, "/mcp remove nope");
+    await until(() => lastFrame()!.includes("no server named"));
   });
 });

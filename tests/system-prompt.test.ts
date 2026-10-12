@@ -67,6 +67,12 @@ describe("systemPrompt", () => {
     expect(systemPrompt({ cwd: "~/proj", date: DATE, tools: [], mcp: true })).toContain("mcp__<server>__<tool>");
   });
 
+  test("points the user to /mcp add for published servers", () => {
+    const prompt = systemPrompt({ cwd: "~/proj", date: DATE, tools: [] });
+    expect(prompt).toContain("/mcp add <npm package | pypi:<package> | https URL | GitHub repo>");
+    expect(prompt).toContain("/mcp search <words>");
+  });
+
   test("is identical for identical inputs (the prompt cache depends on it)", () => {
     const args = { cwd: "~/proj", date: DATE, tools: ["read_file"], instructions: "x" };
     expect(systemPrompt(args)).toBe(systemPrompt({ ...args }));

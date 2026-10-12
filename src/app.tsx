@@ -1,4 +1,4 @@
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Box, useApp, useInput, useWindowSize, type DOMElement } from "ink";
 import { agentArgs } from "./agent.ts";
@@ -31,6 +31,13 @@ import { timeAgo, type SessionStore, type SessionSummary } from "./sessions.ts";
 import { skillMessage, type Skill } from "./skills.ts";
 import type { TrajectoryStore } from "./trajectory.ts";
 import type { McpManager, McpServerStatus } from "./mcp/manager.ts";
+import { parseMcpServers } from "./mcp/config.ts";
+import { liveDeps, resolveAdd, type Resolved } from "./mcp/install/index.ts";
+import { addedNotice, approvalFor } from "./mcp/install/proposal.ts";
+import { searchRegistry, searchText, type RegistryHit } from "./mcp/install/registry.ts";
+import { parseAddArgs, type AddOptions } from "./mcp/install/source.ts";
+import { addPersonalServer, personalServerNames, removePersonalServer } from "./mcp/personal-file.ts";
+import { printable } from "./printable.ts";
 import type { AgentProgress, ApprovalRequest, Decision } from "./tools/types.ts";
 import { checkNotice } from "./diagnostics/turn.ts";
 import { projectCheckNotice, type ProjectCheckResult } from "./checks/kind.ts";
@@ -114,6 +121,9 @@ interface Props {
   mcp?: McpManager;
   /** MCP config files that couldn't be read, and why. */
   mcpProblems?: string[];
+  /** /mcp add's lookup and /mcp search: by default through Marv's own `get` (tests stub them, so nothing hits the network). */
+  resolveMcp?: (options: AddOptions, signal: AbortSignal) => Promise<Resolved>;
+  searchMcp?: (words: string, signal: AbortSignal) => Promise<RegistryHit[]>;
   /** Hands cli.tsx a function to run before the process exits: saves the session and flushes the trajectory. */
   onFlush?: (flush: () => Promise<void>) => void;
   /** Start by resuming: the latest session here (marv -c), or a picker (marv -r). */
@@ -154,6 +164,8 @@ export function App({
   trajectories,
   mcp,
   mcpProblems = NO_PROBLEMS,
+  resolveMcp,
+  searchMcp,
   onFlush,
   resume,
   memory,
@@ -843,6 +855,15 @@ export function App({
       case "mcp-trust":
         void trustMcp();
         break;
+      case "mcp-add":
+        void addMcp(action.args);
+        break;
+      case "mcp-search":
+        void findMcp(action.words);
+        break;
+      case "mcp-remove":
+        void removeMcp(action.name);
+        break;
       case "yolo":
         void saveConfig({ ...(file ?? { provider: config.provider }), yolo: action.on }, yoloStatus({ ...config, yolo: action.on }));
         break;
@@ -871,6 +892,125 @@ export function App({
     } catch (err) {
       addMessage({ role: "system", text: `Couldn't trust the servers: ${(err as Error).message}`, isError: true });
     }
+  };
+
+  // ~/.marv (or MARV_CONFIG_DIR): where config.json is, mcp.json is too.
+  const configDir = dirname(store.path);
+
+  /** Busy work outside a turn (/mcp add's lookup, /mcp search): Esc stops it, `label` shows where "Thinking…" would. */
+  const busyWith = async <T,>(label: string, work: (signal: AbortSignal) => Promise<T>): Promise<T> => {
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setStreaming("");
+    setWaitingFor(label);
+    try {
+      return await work(controller.signal);
+    } finally {
+      abortRef.current = null;
+      setStreaming(null);
+      setWaitingFor(null);
+    }
+  };
+
+  /**
+   * /mcp add: look the source up (all fetching happens here, before the approval), ask once with the exact entry,
+   * write that entry to ~/.marv/mcp.json, and start it. Nothing fetched after the yes changes what runs: the file
+   * gets the JSON the approval showed, parsed back.
+   */
+  const addMcp = async (args: string) => {
+    let options: AddOptions;
+    try {
+      options = parseAddArgs(args);
+    } catch (err) {
+      addMessage({ role: "system", isError: true, text: (err as Error).message });
+      return;
+    }
+    type Outcome = { choices: string[] } | { declined: string } | { added: string; entry: unknown } | { failed: string };
+    let outcome: Outcome;
+    try {
+      outcome = await busyWith(`Looking up ${printable(options.source)}…`, async (signal): Promise<Outcome> => {
+        const resolved = await (resolveMcp ?? ((o, s) => resolveAdd(o, liveDeps(env, s))))(options, signal);
+        if ("choices" in resolved) return resolved;
+        if ((await personalServerNames(configDir)).includes(resolved.name)) {
+          throw new Error(`You already have a server named "${resolved.name}": pick another with --name, or /mcp remove ${resolved.name} first.`);
+        }
+        if (signal.aborted) return { failed: "Stopped: nothing was added." };
+        const projectServers = (mcp?.status() ?? []).filter((s) => s.source === "project").map((s) => s.name);
+        const { request, json } = approvalFor(resolved, { env, projectServers });
+        if ((await approve(request)) !== "yes") return { declined: resolved.name };
+        const entry: unknown = JSON.parse(json);
+        await addPersonalServer(configDir, resolved.name, entry);
+        return { added: resolved.name, entry };
+      });
+    } catch (err) {
+      const stopped = (err as Error).name === "AbortError";
+      outcome = { failed: stopped ? "Stopped: nothing was added." : `Couldn't add the server: ${(err as Error).message}` };
+    }
+    if ("failed" in outcome) {
+      addMessage({ role: "system", isError: true, text: outcome.failed });
+      return;
+    }
+    if ("choices" in outcome) {
+      addMessage({ role: "system", markdown: true, text: `That README names several servers. Add one with:\n\n${outcome.choices.map((c) => `- \`${printable(c)}\``).join("\n")}` });
+      return;
+    }
+    if ("declined" in outcome) {
+      addMessage({ role: "system", text: `Not added: ${outcome.declined}.` });
+      return;
+    }
+    // Loaded exactly as at startup, so ${VAR}s are filled in the same way.
+    const { added: name, entry } = outcome;
+    const { servers, problems } = parseMcpServers({ [name]: entry }, { ...env, MARV_PROJECT_DIR: root });
+    const server = servers[0];
+    if (!server) {
+      addMessage({ role: "system", isError: true, text: `Added ${name} to ~/.marv/mcp.json, but didn't start it: ${problems[0]?.replace(/^"[^"]*" in mcpServers: /, "") ?? "it couldn't be loaded"}. Set it in your shell and restart Marv.` });
+      return;
+    }
+    if (!mcp) {
+      addMessage({ role: "system", text: `Added ${name} to ~/.marv/mcp.json. Restart Marv to start it.` });
+      return;
+    }
+    addMessage({ role: "system", text: `Starting ${name}…` });
+    try {
+      addMessage({ role: "system", ...addedNotice(await mcp.add(server)) });
+    } catch (err) {
+      addMessage({ role: "system", isError: true, text: `Added ${name} to ~/.marv/mcp.json, but didn't start it now: ${(err as Error).message} It starts when you restart Marv.` });
+    }
+  };
+
+  /** /mcp search: the MCP Registry's latest, active entries. */
+  const findMcp = async (words: string) => {
+    try {
+      const hits = await busyWith("Searching the MCP Registry…", (signal) => (searchMcp ?? ((w, s) => searchRegistry(w, liveDeps(env, s))))(words, signal));
+      addMessage({ role: "system", markdown: true, text: searchText(words, hits) });
+    } catch (err) {
+      addMessage({ role: "system", isError: true, text: `Couldn't search the MCP Registry: ${(err as Error).message}` });
+    }
+  };
+
+  /** /mcp remove: one of your servers out of ~/.marv/mcp.json, and stopped. No approval: the user typed it, and it takes capability away. */
+  const removeMcp = async (name: string) => {
+    if (!(await personalServerNames(configDir)).includes(name)) {
+      const project = mcp?.status().some((s) => s.name === name && s.source === "project");
+      addMessage({
+        role: "system",
+        isError: true,
+        text: project ? `"${name}" is this project's server: remove it from .mcp.json.` : `You have no server named "${name}" in ~/.marv/mcp.json (/mcp lists them).`,
+      });
+      return;
+    }
+    try {
+      await removePersonalServer(configDir, name);
+    } catch (err) {
+      addMessage({ role: "system", isError: true, text: (err as Error).message });
+      return;
+    }
+    const running = mcp?.status().some((s) => s.name === name && s.source === "personal" && s.state !== "removed");
+    if (running) await mcp!.remove(name).catch(() => {});
+    addMessage({
+      role: "system",
+      text: `Removed ${name} from ~/.marv/mcp.json${running ? " and stopped it. Its tools stay listed (failing) until /clear or a restart." : "."}`,
+    });
   };
 
   /** /good, /bad, /label: feedback on the latest turn of this session, in its trajectory. */

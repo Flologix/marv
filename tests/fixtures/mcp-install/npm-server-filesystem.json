@@ -1,0 +1,34 @@
+{
+  "_id": "@modelcontextprotocol/server-filesystem",
+  "name": "@modelcontextprotocol/server-filesystem",
+  "description": "MCP server for filesystem access",
+  "dist-tags": { "latest": "2026.1.14" },
+  "versions": {
+    "2025.8.21": {
+      "name": "@modelcontextprotocol/server-filesystem",
+      "version": "2025.8.21",
+      "bin": { "mcp-server-filesystem": "dist/index.js" },
+      "repository": { "type": "git", "url": "git+https://github.com/modelcontextprotocol/servers.git" },
+      "_npmUser": { "name": "jspahrsummers", "email": "justin@example.com" }
+    },
+    "2026.1.14": {
+      "name": "@modelcontextprotocol/server-filesystem",
+      "version": "2026.1.14",
+      "bin": { "mcp-server-filesystem": "dist/index.js" },
+      "repository": { "type": "git", "url": "git+https://github.com/modelcontextprotocol/servers.git" },
+      "_npmUser": { "name": "jspahrsummers", "email": "justin@example.com" }
+    }
+  },
+  "time": {
+    "created": "2024-11-21T19:14:54.330Z",
+    "modified": "2026-01-14T10:00:00.000Z",
+    "2025.8.21": "2025-08-21T12:00:00.000Z",
+    "2026.1.14": "2026-01-14T09:59:00.000Z"
+  },
+  "maintainers": [
+    { "name": "jspahrsummers", "email": "justin@example.com" },
+    { "name": "pcarleton", "email": "paul@example.com" }
+  ],
+  "repository": { "type": "git", "url": "git+https://github.com/modelcontextprotocol/servers.git" },
+  "license": "MIT"
+}
