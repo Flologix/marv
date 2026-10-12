@@ -5,7 +5,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { checksNote, parseRunner, violationKey, projectCheckNotice, ProjectChecks, runnerCommand, type ProjectCheckResult } from "../src/checks/kind.ts";
-import { concerns, loadChecks, type ProjectCheck } from "../src/checks/load.ts";
+import { concerns, loadChecks, parsePatternCheck, parseScriptCheck, type ProjectCheck } from "../src/checks/load.ts";
 import { Diagnostics, type RunCheck } from "../src/diagnostics/turn.ts";
 import type { AgentEvent, ToolCall } from "../src/provider/types.ts";
 import { sandboxAvailable } from "../src/sandbox.ts";
@@ -87,6 +87,25 @@ describe("loading .marv/checks/", () => {
     expect(problems.join("\n")).toContain('g.yaml: another check is already named "g"');
   });
 
+  test("a script's globs may hold brace lists: commas split patterns only outside braces", () => {
+    const check = parseScriptCheck("c", ".marv/checks/c.ts", "// glob: src/**/*.{ts,tsx}, lib/*.ts\n// exclude: src/{gen,vendor}/**\n");
+    expect(check).toMatchObject({ glob: ["src/**/*.{ts,tsx}", "lib/*.ts"], exclude: ["src/{gen,vendor}/**"] });
+    expect(concerns(check, "src/a.tsx")).toBe(true);
+    expect(concerns(check, "src/a.ts")).toBe(true);
+    expect(concerns(check, "src/vendor/a.ts")).toBe(false);
+  });
+
+  test("the README's example check loads and catches what it says", () => {
+    const readme = require("node:fs").readFileSync(join(import.meta.dir, "..", "README.md"), "utf8") as string;
+    const yaml = /## Checks[\s\S]*?```yaml\n([\s\S]*?)```/.exec(readme)![1]!;
+    const check = parsePatternCheck("imports", ".marv/checks/imports.yaml", yaml);
+    if (typeof check === "string") throw new Error(check);
+    const forbid = new RegExp(check.forbid!, check.flags);
+    expect(forbid.test(`import { a } from "./a";`)).toBe(true);
+    expect(forbid.test(`import { a } from './a';`)).toBe(true);
+    expect(forbid.test(`import { a } from "./a.ts";`)).toBe(false);
+  });
+
   test("a change concerns a check when its glob matches and its exclude doesn't, or when it's the check's own file", () => {
     const check: ProjectCheck = { kind: "script", name: "c", file: ".marv/checks/c.ts", glob: ["src/**/*.ts"], exclude: ["src/gen/**"] };
     expect(concerns(check, "src/a/b.ts")).toBe(true);
@@ -129,6 +148,14 @@ describe("the runner", () => {
     const [second] = (await runAll())!;
     expect(first).toEqual({ check: "flaky", message: "the check failed: exited with code 3", why: expect.stringMatching(/^its stderr ended: at \d/), failed: true });
     expect(violationKey(second!)).toBe(violationKey(first!));
+  });
+
+  test("a script's output is bounded: past 1 MB it's a failed check; past 500 violations the rest are dropped", async () => {
+    put(".marv/checks/flood.ts", 'const line = JSON.stringify({ message: "x".repeat(1000) });\nfor (let i = 0; i < 2000; i++) console.log(line);\n');
+    put(".marv/checks/many.ts", 'for (let i = 0; i < 600; i++) console.log(JSON.stringify({ file: `f${i}.ts`, message: "m" }));\n');
+    const found = (await runAll())!;
+    expect(found.filter((v) => v.check === "flood")).toEqual([{ check: "flood", message: "the check failed: printed more than 1 MB", failed: true }]);
+    expect(found.filter((v) => v.check === "many")).toHaveLength(500);
   });
 
   test("output that isn't the runner's whole report can't be read", () => {
@@ -216,6 +243,20 @@ describe("after a step", () => {
       [1, 1, 0],
       [1, 2, 1],
     ]);
+  });
+
+  test("a check edited during the turn runs its new definition", async () => {
+    put(".marv/checks/no-default.yaml", NO_DEFAULT);
+    put("src/old.ts", "console.log(1);\n");
+    const { run } = counting();
+    const { checks, results } = turn(new ProjectChecks({ run, sandboxWorks: () => true }));
+    await checks.beforeChange();
+    put(".marv/checks/no-default.yaml", "glob: 'src/**/*.ts'\nforbid: 'console\\.log'\nmessage: no console.log\n");
+    put("src/a.ts", "console.log(2);\n");
+    const note = await checks.afterStep([...edited(".marv/checks/no-default.yaml"), ...edited("src/a.ts")]);
+    expect(note).toContain("src/old.ts:1 [no-default] no console.log");
+    expect(note).toContain("src/a.ts:1 [no-default] no console.log");
+    expect(results.at(-1)).toMatchObject({ status: "done", before: 0, errors: 2 });
   });
 
   test("a project without checks runs nothing", async () => {
