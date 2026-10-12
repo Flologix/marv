@@ -7,6 +7,7 @@
 // One turn at a time: send() while a turn runs throws. The history is only appended to (compaction is the one
 // exception), and the system prompt and tool specs stay the same objects for a whole conversation: that's what
 // keeps the provider's prompt cache hitting (see CLAUDE.md, "Prompt cache").
+import { z } from "zod";
 import { agentArgs, answerAllCalls, DEFAULT_MAX_STEPS, runAgent, type LoopEvent } from "./agent.ts";
 import { GENERAL_PURPOSE, type AgentType } from "./agents.ts";
 import { COMPACT_AT, compactedHistory, MID_TURN_NOTE, summarize } from "./compact.ts";
@@ -16,6 +17,18 @@ import { combineChecks, Diagnostics, type CheckOutcome, type CheckResult, type T
 import { EventQueue } from "./event-queue.ts";
 import { classifyReply } from "./feedback.ts";
 import { runGit } from "./git.ts";
+import {
+  announcement,
+  asMcpCall,
+  chooseMode,
+  DEFERRED_NAMES,
+  DEFERRED_SPECS,
+  deferredTools,
+  MCP_TOOLS_SETTINGS,
+  type McpMode,
+  type McpToolsSetting,
+  type ModeChoice,
+} from "./mcp/deferred.ts";
 import type { McpManager } from "./mcp/manager.ts";
 import { loadMemory, type Memories, type MemoryPaths } from "./memory.ts";
 import { shortenHome } from "./paths.ts";
@@ -27,6 +40,7 @@ import { newSession, type SavedSession, type SessionStore } from "./sessions.ts"
 import type { Skill } from "./skills.ts";
 import { AgentRecorder, type Trajectory, type TrajectoryRecord, type TrajectoryStore } from "./trajectory.ts";
 import { isParallelCall, runTool, specOf, tools as builtinTools, toolSpecsFor } from "./tools/index.ts";
+import { withNote } from "./tools/repair.ts";
 import { pastedScopes } from "./tools/web-fetch.ts";
 import type { AgentHost, AgentProgress, ApprovalRequest, Decision, Tool } from "./tools/types.ts";
 import type { Message } from "./types.ts";
@@ -115,6 +129,12 @@ export interface SessionInit {
   checks?: boolean;
   /** The project checks' session state; tests pass one with a stand-in runner. */
   projectChecks?: ProjectChecks;
+  /**
+   * MCP tools' specs in every request ("eager"), or only their names, in a note, with tool_search and mcp_call to
+   * load and run them ("deferred", #14). Default "auto": deferred when the specs would cost more than min(4000
+   * tokens, 10% of the context window). Read when a conversation decides its mode (its first turn with MCP tools).
+   */
+  mcpTools?: McpToolsSetting;
   sandbox?: boolean;
   yolo?: boolean;
   /**
@@ -153,6 +173,13 @@ function gitHead(root: string): string | undefined {
   return head.ok ? head.out.trim() : undefined;
 }
 
+const ListingShape = z.object({ mode: z.enum(["deferred", "eager"]), announced: z.array(z.string()) });
+/** A saved session's MCP listing, or null for an old file or a hand edit (then nothing counts as announced). */
+function listingOf(value: unknown): { mode: McpMode; announced: string[] } | null {
+  const parsed = ListingShape.safeParse(value);
+  return parsed.success ? { mode: parsed.data.mode, announced: [...parsed.data.announced] } : null;
+}
+
 /** The step-limit question: asked like any approval, so the client's "stop everything" answers it too. */
 const stepLimitRequest = (steps: number, every: number): ApprovalRequest => ({
   tool: "continue",
@@ -167,12 +194,15 @@ const stepLimitRequest = (steps: number, every: number): ApprovalRequest => ({
 /**
  * Tools of the caller's own must have names of their own. runTool() runs the first tool with the call's name, so a
  * custom "bash" would be offered next to the built-in one (two specs with one name) while every call ran the
- * built-in; and `mcp__` names are where MCP servers' tools go. Checked before anything starts.
+ * built-in; `mcp__` names are where MCP servers' tools go, and tool_search and mcp_call are how a deferred
+ * conversation reaches them (#14). Checked before anything starts.
  */
 function checkToolNames(custom: Tool[]): void {
   const seen = new Set<string>();
   for (const { name } of custom) {
-    if (builtinTools.some((t) => t.name === name)) throw new Error(`A tool named "${name}" is already built in: give yours another name.`);
+    if (builtinTools.some((t) => t.name === name) || DEFERRED_NAMES.includes(name)) {
+      throw new Error(`A tool named "${name}" is already built in: give yours another name.`);
+    }
     if (name.startsWith("mcp__")) throw new Error(`Tool names starting with "mcp__" are for MCP servers' tools.`);
     if (seen.has(name)) throw new Error(`Two tools are named "${name}".`);
     seen.add(name);
@@ -222,6 +252,8 @@ export interface Session {
     checks?: boolean;
     /** The main agent's step limit (0 never asks); subagents keep their own. */
     maxSteps?: number;
+    /** How MCP tools are offered (#14); applies from the next conversation that decides (after clear()). */
+    mcpTools?: McpToolsSetting;
   }): void;
   /** Feedback on the last turn, in its trajectory. */
   rate(feedback: { score: 1 | -1 | 0; note?: string; labels?: string[] }): "rated" | "off" | "nothing";
@@ -289,6 +321,16 @@ export class MarvSession implements Session {
   private working: Promise<unknown> | null = null;
   /** close() was called: no new turns, compactions, clear() or resume() (idle() refuses them). */
   private closed = false;
+  private mcpTools: McpToolsSetting;
+  /**
+   * This conversation's MCP mode and the tools it has been told about (#14); null until a turn has MCP tools to
+   * decide on. Kept for the conversation (saved with it): switching modes would change the tool list.
+   */
+  private listing: { mode: McpMode; announced: string[] } | null = null;
+  /** MCP tools whose schema this conversation has seen (tool_search, or a rejected call): their errors don't repeat it. */
+  private readonly loaded = new Set<string>();
+  /** The running turn's MCP specs: what a mid-turn compaction announces again. */
+  private turnMcpSpecs: ToolSpec[] = [];
 
   constructor(private readonly init: SessionInit) {
     checkToolNames(init.tools ?? []);
@@ -296,6 +338,10 @@ export class MarvSession implements Session {
     if (init.maxSteps !== undefined && !(Number.isInteger(init.maxSteps) && init.maxSteps >= 0)) {
       throw new Error(`maxSteps must be a whole number of at least 0 (0 never asks), not ${init.maxSteps}`);
     }
+    if (init.mcpTools !== undefined && !MCP_TOOLS_SETTINGS.includes(init.mcpTools)) {
+      throw new Error(`mcpTools must be one of ${MCP_TOOLS_SETTINGS.join(", ")}, not ${init.mcpTools}`);
+    }
+    this.mcpTools = init.mcpTools ?? "auto";
     this.problems = init.problems ?? [];
     this.option = init.provider;
     this.thinking = init.thinking ?? false;
@@ -396,6 +442,8 @@ export class MarvSession implements Session {
     this.conversation = [];
     this.messages = [];
     this.last = undefined;
+    this.listing = null; // a new conversation decides its MCP mode again
+    this.loaded.clear();
     const memory = this.init.memory;
     const reload = (async () => {
       if (memory) this.memories = await loadMemory(memory.paths).catch(() => this.memories);
@@ -422,6 +470,8 @@ export class MarvSession implements Session {
     this.messages = [...saved.transcript];
     this.totals = saved.totals;
     this.last = undefined;
+    this.listing = listingOf(saved.mcp);
+    this.loaded.clear();
     return { id: saved.id, updatedAt: saved.updatedAt, model: saved.model, transcript: saved.transcript, totals: saved.totals };
   }
 
@@ -440,8 +490,12 @@ export class MarvSession implements Session {
     diagnostics?: boolean;
     checks?: boolean;
     maxSteps?: number;
+    mcpTools?: McpToolsSetting;
   }): void {
     if (changes.yolo && this.init.noYolo) throw new Error(this.init.noYolo);
+    if (changes.mcpTools !== undefined && !MCP_TOOLS_SETTINGS.includes(changes.mcpTools)) {
+      throw new Error(`mcpTools must be one of ${MCP_TOOLS_SETTINGS.join(", ")}, not ${changes.mcpTools}`);
+    }
     if (
       changes.maxSteps !== undefined &&
       !(Number.isInteger(changes.maxSteps) && changes.maxSteps >= 0)
@@ -471,6 +525,7 @@ export class MarvSession implements Session {
       this.projectChecksOn = changes.checks;
     }
     if (changes.maxSteps !== undefined) this.maxSteps = changes.maxSteps;
+    if (changes.mcpTools !== undefined) this.mcpTools = changes.mcpTools;
     if (!remade) return;
     ({ option: this.option, thinking: this.thinking, factory: this.factory, provider: this.provider, info: this.info } = remade);
     this.lookup();
@@ -498,6 +553,7 @@ export class MarvSession implements Session {
       conversation: answerAllCalls(this.conversation),
       transcript,
       totals: this.totals,
+      ...(this.listing ? { mcp: { mode: this.listing.mode, announced: [...this.listing.announced] } } : {}),
     };
     await store.save(this.saved);
   }
@@ -558,11 +614,41 @@ export class MarvSession implements Session {
     return custom ? `${base}\n\n${custom.append}` : base;
   }
 
-  /** What the model is offered: the built-in tools and the caller's, then the MCP servers' (fixed once they've started). */
+  /**
+   * What the model is offered: the built-in tools and the caller's, then the MCP servers' (fixed once they've
+   * started), or in a deferred conversation tool_search and mcp_call in their place (#14).
+   */
   private offered(): { specs: ToolSpec[]; tools: Tool[] } {
     const mcp = this.init.mcp;
     const tools = [...builtinTools, ...(this.init.tools ?? [])];
-    return mcp ? { specs: [...this.specs, ...mcp.specs], tools: [...tools, ...mcp.tools] } : { specs: this.specs, tools };
+    if (!mcp) return { specs: this.specs, tools };
+    // Deferred: two constant specs instead of the servers', whatever the servers do (prompt cache).
+    if (this.listing?.mode === "deferred") {
+      return { specs: [...this.specs, ...DEFERRED_SPECS], tools: [...tools, ...deferredTools({ tools: mcp.tools, specs: mcp.specs, loaded: this.loaded })] };
+    }
+    return { specs: [...this.specs, ...mcp.specs], tools: [...tools, ...mcp.tools] };
+  }
+
+  /** The first turn with MCP tools decides the conversation's mode; it's kept until clear() (switching would change the tool list). */
+  private decideMcp(): ModeChoice | null {
+    const mcp = this.init.mcp;
+    if (this.listing || !mcp?.specs.length) return null;
+    const choice = chooseMode(this.mcpTools, mcp.specs, this.contextLength);
+    this.listing = { mode: choice.mode, announced: [] };
+    return choice;
+  }
+
+  /** What the model hasn't been told about the MCP tools (new ones, gone ones), now marked as told; null when not deferred or nothing changed. */
+  private announce(specs: ToolSpec[]): string | null {
+    const listing = this.listing;
+    if (listing?.mode !== "deferred") return null;
+    const names = new Set(specs.map((s) => s.name));
+    const note = announcement(
+      specs.filter((s) => !listing.announced.includes(s.name)),
+      listing.announced.filter((n) => !names.has(n)),
+    );
+    listing.announced = [...names];
+    return note;
   }
 
   /** Reads the model list in the background: the context window, prices, and whether reasoning can be turned off. */
@@ -650,7 +736,8 @@ export class MarvSession implements Session {
       // The compacted history ends with the model's own "Got it", so mid-turn the next request needs an
       // instruction to go on: it follows the summary here, before the loop's next request. Before a user message,
       // that message is the instruction.
-      this.conversation.push({ role: "user", text: MID_TURN_NOTE });
+      const note = this.announce(this.turnMcpSpecs);
+      this.conversation.push({ role: "user", text: note ? `${MID_TURN_NOTE}\n\n${note}` : MID_TURN_NOTE });
     } else if (!result.compacted) {
       // A summary that failed isn't tried again within the turn: the next step would ask for the same expensive
       // summary that just failed. The next turn (a new user message) tries again, as before.
@@ -683,6 +770,10 @@ export class MarvSession implements Session {
     // In place: runAgent holds this very array for the whole turn, so a compaction between its steps must
     // rewrite it where it stands — replacing this.conversation would leave the loop on the full history.
     this.conversation.splice(0, this.conversation.length, ...compactedHistory(result.summary));
+    // A summary may drop the list of MCP tools: the next message announces them all again (the cache starts over
+    // here anyway), and schemas seen before it may be gone too.
+    if (this.listing) this.listing.announced = [];
+    this.loaded.clear();
     // From here the model sees the summary, not the turns before it: the trajectory needs it to say what the model saw.
     // The turn it follows only if that turn is in this file (after resume(), the last turn was in another one).
     const log = this.trajectory();
@@ -707,7 +798,7 @@ export class MarvSession implements Session {
   }
 
   /** The session's setup (once per file), what this message says about the last turn, and the new turn. */
-  private startTurnLog(log: Trajectory | null, turn: string, text: string, forModel: string, specs: ToolSpec[]): void {
+  private startTurnLog(log: Trajectory | null, turn: string, text: string, forModel: string, specs: ToolSpec[], mcpChoice: ModeChoice | null): void {
     if (log) {
       if (this.sessionLogged !== log.session) {
         log.write({
@@ -738,6 +829,7 @@ export class MarvSession implements Session {
         sandbox: this.sandbox,
         diagnostics: this.diagnostics,
         checks: this.projectChecksOn,
+        ...(mcpChoice ? { mcpTools: mcpChoice } : {}),
       });
     }
     // Only a logged turn can be rated: feedback for a turn the file never recorded would be an orphan.
@@ -831,11 +923,14 @@ export class MarvSession implements Session {
       // arriving and remaking the provider) apply from the next turn. That includes the factory, so a subagent
       // naming its own model gets it from the same provider as the turn, and its usage is counted (local or not) as
       // that one's, priced with what the model list said about the turn's model.
+      // The servers have settled: the first turn with MCP tools decides whether this conversation defers them (#14).
+      const mcpChoice = this.decideMcp();
+      this.turnMcpSpecs = mcp?.specs ?? [];
       const { specs, tools } = this.offered();
       const { sandbox, yolo, factory, provider, info, diagnostics, projectChecksOn, maxSteps } = this;
       const log = this.trajectory();
       const record = (r: TrajectoryRecord) => log?.write(r);
-      this.startTurnLog(log, turn, text, forModel, specs);
+      this.startTurnLog(log, turn, text, forModel, specs, mcpChoice);
       main = new AgentRecorder(record, { turn, agent: "main" });
 
       // Nearly out of context: summarize first, so this message (and what follows) fits.
@@ -850,7 +945,12 @@ export class MarvSession implements Session {
           return;
         }
       }
-      this.conversation.push({ role: "user", text: forModel });
+      // After a compaction above (which forgets what was announced), so the note then lists everything again. It
+      // goes at the start of the user's message, never as a message of its own (two user messages in a row), and
+      // never into the transcript.
+      const mcpNote = this.announce(this.turnMcpSpecs);
+      if (mcpNote) record({ type: "mcp_note", turn, text: mcpNote });
+      this.conversation.push({ role: "user", text: mcpNote ? `${mcpNote}\n\n${forModel}` : forModel });
       this.note("user", text);
       emit({ type: "status", status: "running" });
 
@@ -930,17 +1030,31 @@ export class MarvSession implements Session {
         },
       };
 
+      // A direct call to a deferred MCP tool runs as the mcp_call it meant (#14), and its result says so.
+      const mcpNames = new Set(this.listing?.mode === "deferred" ? this.turnMcpSpecs.map((s) => s.name) : []);
+      const rewritten = new Map<string, string>(); // call id → the repair's note
+
       for await (const event of runAgent({
         provider,
         history: this.conversation,
         system: this.system,
         tools: specs,
-        runTool: (call) =>
-          runTool(
+        rewriteCall: mcpNames.size
+          ? (call) => {
+              const fixed = asMcpCall(call, mcpNames);
+              if (fixed) rewritten.set(call.id, fixed.note);
+              return fixed?.call ?? null;
+            }
+          : undefined,
+        runTool: async (call) => {
+          const result = await runTool(
             call,
             { root: this.init.root, signal: stop.signal, approve, sandbox, yolo, skills: this.init.skills, memory: this.init.memory?.paths, agentHost, beforeChange: checks?.beforeChange },
             tools,
-          ),
+          );
+          const note = rewritten.get(call.id);
+          return note ? { ...result, output: withNote(result.output, note) } : result;
+        },
         signal: stop.signal,
         isParallel: isParallelCall,
         maxSteps,

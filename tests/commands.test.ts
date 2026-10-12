@@ -16,6 +16,7 @@ const ctx: CommandContext = {
     trajectories: true,
     diagnostics: true,
     checks: true,
+    mcpTools: "auto",
     maxSteps: 25,
   },
   configPath: "~/.marv/config.json",
@@ -52,7 +53,7 @@ describe("slash commands", () => {
   });
 
   test("/config says when no key is needed (Ollama)", () => {
-    const action = run("/config", { ...ctx, config: { provider: "ollama", model: "qwen3.5:9b", baseUrl: "http://localhost:11434", thinking: false, contextLength: 32768, sandbox: true, yolo: true, trajectories: true, diagnostics: true, checks: true, maxSteps: 25 } });
+    const action = run("/config", { ...ctx, config: { provider: "ollama", model: "qwen3.5:9b", baseUrl: "http://localhost:11434", thinking: false, contextLength: 32768, sandbox: true, yolo: true, trajectories: true, diagnostics: true, checks: true, mcpTools: "auto", maxSteps: 25 } });
     expect(action).toMatchObject({ type: "print", text: expect.stringContaining("API key:   not needed") });
   });
 

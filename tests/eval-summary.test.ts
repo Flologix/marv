@@ -83,6 +83,17 @@ describe("formatSummary", () => {
     expect(formatSummary([run()])).not.toMatch(/via/); // no proxy, no column
   });
 
+  test("prompt tokens per request: what deferred MCP tools (#14) should move", () => {
+    const rows = summarizeRuns([run({ requests: 2, promptTokens: 3000 }), run({ requests: 4, promptTokens: 9000 })]);
+    expect(rows[0]!.promptTokens).toBe(12_000);
+    expect(formatSummary([run({ requests: 2, promptTokens: 3000 }), run({ requests: 4, promptTokens: 9000 })])).toMatch(/prompt\/req[\s\S]*\b2000\b/);
+  });
+
+  test("MCP calls per run, a column only when a run made one", () => {
+    expect(formatSummary([run({ mcpCalls: 3 }), run({ mcpCalls: 1 })])).toMatch(/mcp\/run[\s\S]*\b2\.0\b/);
+    expect(formatSummary([run()])).not.toMatch(/mcp\/run/);
+  });
+
   test("no runs", () => {
     expect(formatSummary([])).toBe("No runs.");
   });

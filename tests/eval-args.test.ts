@@ -25,4 +25,9 @@ describe("parseArgs", () => {
     const args = parseArgs(["--models", "a", "--repeat", "2", "--budget", "1.5", "--concurrency", "3", "--timeout", "300", "--max-steps", "10"]);
     expect(args).toMatchObject({ repeat: 2, budget: 1.5, concurrency: 3, timeout: 300, maxSteps: 10 });
   });
+
+  test("--mcp and --mcp-tools are passed through raw (#14): the runner checks them", () => {
+    expect(parseArgs(["--models", "a", "--mcp", "servers.json", "--mcp-tools", "deferred"])).toMatchObject({ mcp: "servers.json", mcpTools: "deferred" });
+    expect(parseArgs(["--models", "a"])).toMatchObject({ mcp: undefined, mcpTools: undefined });
+  });
 });

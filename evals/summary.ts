@@ -50,6 +50,10 @@ export interface RunResult {
   marv?: string;
   /** Where the requests went, when not OpenRouter's own API (a proxy such as Headroom's, with --base-url). */
   baseUrl?: string;
+  /** How MCP tools were offered (--mcp-tools; #14), for runs with an MCP server. */
+  mcpTools?: string;
+  /** MCP tools run (mcp_call, or an mcp__ tool offered directly). */
+  mcpCalls?: number;
 }
 
 export interface SummaryRow {
@@ -61,6 +65,9 @@ export interface SummaryRow {
   editErrors: number;
   toolCalls: number;
   requests: number;
+  /** Prompt tokens over all requests: per request, what deferring MCP tools (#14) should move. */
+  promptTokens: number;
+  mcpCalls: number;
   cost: number;
   medianMs: number;
   /** The proxy host the runs went through (`--base-url`), empty for OpenRouter's own API. */
@@ -105,6 +112,8 @@ export function summarizeRuns(results: RunResult[]): SummaryRow[] {
       editErrors: edits.reduce((n, t) => n + t.errors, 0),
       toolCalls: tools.reduce((n, [, t]) => n + t.calls, 0),
       requests: runs.reduce((n, r) => n + r.requests, 0),
+      promptTokens: runs.reduce((n, r) => n + r.promptTokens, 0),
+      mcpCalls: runs.reduce((n, r) => n + (r.mcpCalls ?? 0), 0),
       cost: runs.reduce((n, r) => n + r.cost, 0),
       medianMs: median(runs.map((r) => r.ms)),
       via: via(runs[0]),
@@ -126,7 +135,9 @@ export function formatSummary(results: RunResult[]): string {
   const rows = summarizeRuns(results);
   // The proxy column appears only when a run went through one: same runs as before, same table otherwise.
   const showVia = rows.some((r) => r.via);
-  const head = ["label", "model", ...(showVia ? ["via"] : []), "runs", "pass", "edits", "edit fail", "steps/run", "tools/run", "$/run", "$ total", "median"];
+  // Likewise MCP calls: only runs with a server make any.
+  const showMcp = rows.some((r) => r.mcpCalls);
+  const head = ["label", "model", ...(showVia ? ["via"] : []), "runs", "pass", "edits", "edit fail", "steps/run", "tools/run", ...(showMcp ? ["mcp/run"] : []), "prompt/req", "$/run", "$ total", "median"];
   const overview = table([
     head,
     ...rows.map((r) => [
@@ -139,6 +150,8 @@ export function formatSummary(results: RunResult[]): string {
       pct(r.editErrors, r.editCalls),
       (r.requests / r.runs).toFixed(1),
       (r.toolCalls / r.runs).toFixed(1),
+      ...(showMcp ? [(r.mcpCalls / r.runs).toFixed(1)] : []),
+      r.requests ? String(Math.round(r.promptTokens / r.requests)) : "-",
       (r.cost / r.runs).toFixed(4),
       r.cost.toFixed(3),
       `${(r.medianMs / 1000).toFixed(0)}s`,

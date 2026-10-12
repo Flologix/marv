@@ -1,0 +1,78 @@
+{
+  "project": { "key": "UTIL", "name": "util-kit", "description": "Small JavaScript helpers: ranges, durations, reports." },
+  "users": [
+    { "login": "dana", "name": "Dana Okafor", "role": "maintainer" },
+    { "login": "lee", "name": "Lee Marsh", "role": "maintainer" },
+    { "login": "sam", "name": "Sam Ito", "role": "contributor" },
+    { "login": "you", "name": "You", "role": "contributor" }
+  ],
+  "labels": [
+    { "name": "bug", "description": "Something doesn't work as documented." },
+    { "name": "feature", "description": "Something new." },
+    { "name": "docs", "description": "Documentation only." },
+    { "name": "good first issue", "description": "Small and well described." }
+  ],
+  "milestones": [
+    { "title": "1.4", "due": "2026-11-01", "description": "Bug fixes and the report's machine-readable output." },
+    { "title": "2.0", "due": "2027-02-01", "description": "Breaking changes: ESM only, new duration parser." }
+  ],
+  "issues": [
+    {
+      "number": 3,
+      "title": "README: document the step argument",
+      "state": "closed",
+      "author": "sam",
+      "labels": ["docs"],
+      "body": "The README doesn't say that range() takes a step.",
+      "comments": [{ "author": "dana", "body": "Fixed in the docs." }]
+    },
+    {
+      "number": 7,
+      "title": "report: machine-readable output",
+      "state": "open",
+      "author": "lee",
+      "assignee": "you",
+      "labels": ["feature"],
+      "milestone": "1.4",
+      "body": "CI wants to read the task report. Could `src/report.js` print JSON as well as the text table? Please comment here when it's done, so I can wire it into CI.",
+      "comments": [{ "author": "dana", "body": "A flag on main() would do: text stays the default." }]
+    },
+    {
+      "number": 9,
+      "title": "contains() should include the end",
+      "state": "closed",
+      "author": "sam",
+      "labels": [],
+      "body": "contains(0, 5, 5) is false. Shouldn't it be true?",
+      "comments": [{ "author": "lee", "body": "Working as intended: ranges are half-open, [start, end), like range() itself." }]
+    },
+    {
+      "number": 11,
+      "title": "Durations over a day",
+      "state": "open",
+      "author": "dana",
+      "labels": ["feature"],
+      "milestone": "2.0",
+      "body": "Support a `d` unit for days in durations (\"2d4h\")."
+    },
+    {
+      "number": 12,
+      "title": "range() with a negative step includes the end",
+      "state": "open",
+      "author": "lee",
+      "assignee": "you",
+      "labels": ["bug", "good first issue"],
+      "milestone": "1.4",
+      "body": "`range(start, end, step)` is documented as end-exclusive, and it is for positive steps: `range(0, 5)` is `[0, 1, 2, 3, 4]`.\n\nWith a negative step it includes the end:\n\n```js\nrange(5, 0, -1)   // [5, 4, 3, 2, 1, 0], expected [5, 4, 3, 2, 1]\nrange(10, 0, -5)  // [10, 5, 0], expected [10, 5]\n```\n\nThe loop for negative steps in `src/range.js` compares with `>=` where it should compare with `>`.",
+      "comments": [{ "author": "dana", "body": "Confirmed. Positive steps are fine." }]
+    },
+    {
+      "number": 14,
+      "title": "Report: sort owners by name",
+      "state": "open",
+      "author": "sam",
+      "labels": ["feature"],
+      "body": "The text report lists owners in the order they first appear. Alphabetical would be easier to scan."
+    }
+  ]
+}

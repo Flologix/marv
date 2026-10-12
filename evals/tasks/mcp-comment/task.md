@@ -1,0 +1,1 @@
+Add a `--json` option to `main` in `src/report.js`: with it, main returns the summary as JSON (`JSON.stringify(summary, null, 2)`) instead of the text table; without it, nothing changes. Then comment on issue #7 in the project's issue tracker (the tracker MCP server) with a one-line summary of the change.

@@ -171,6 +171,24 @@ test("a tool named like a built-in, another of yours, or an MCP tool is refused,
   expect(running(marker)).toEqual([]);
 });
 
+test("mcpTools: \"deferred\" offers tool_search and mcp_call, and names the server's tools in the first message (#14)", async () => {
+  const marker = `deferred-${crypto.randomUUID()}`;
+  const provider = new ScriptedProvider([[{ type: "text_delta", text: "Hi." }, { type: "done", reason: "stop" }]]);
+  const session = await createSession({ cwd: root, provider, configDir, mcpTools: "deferred", mcpServers: { fx: { command: process.execPath, args: [FIXTURE, marker] } } });
+  try {
+    for await (const _ of session.send("hi"));
+    const names = provider.requests[0]!.options.tools!.map((t) => t.name);
+    expect(names).toContain("mcp_call");
+    expect(names.filter((n) => n.startsWith("mcp__"))).toEqual([]);
+    const message = provider.requests[0]!.history.at(-1)!.text;
+    expect(message).toStartWith("Marv: MCP tools you can use");
+    expect(message).toContain("- mcp__fx__echo: Echo the text back.");
+    expect(message).toEndWith("\n\nhi");
+  } finally {
+    await session.close();
+  }
+});
+
 // Yolo runs its safe edits before any approver is asked, so in the home folder (or above it) yolo is what's refused.
 test("with yolo on, the home folder (or anything above it) isn't a project, approver or not", async () => {
   const provider = new ScriptedProvider([]);

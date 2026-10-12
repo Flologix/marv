@@ -1061,3 +1061,23 @@ describe("every tool call gets exactly one result, in call order, however the ru
     });
   });
 });
+
+test("rewriteCall changes a call before it enters the history, and the call runs as rewritten", async () => {
+  const provider = new ScriptedProvider([
+    [{ type: "tool_call", call: { id: "c1", name: "mcp__x__ping", arguments: '{"a":1}' } }, { type: "done", reason: "tool_calls" }],
+    [{ type: "text_delta", text: "Done." }, { type: "done", reason: "stop" }],
+  ]);
+  const history: ChatTurn[] = [{ role: "user", text: "ping" }];
+  const ran: ToolCall[] = [];
+  for await (const _ of runAgent({
+    provider,
+    history,
+    system: "s",
+    tools: [],
+    signal: new AbortController().signal,
+    runTool: async (call) => (ran.push(call), { output: "ok", summary: "ok", label: call.name }),
+    rewriteCall: (call) => (call.name === "mcp__x__ping" ? { ...call, name: "mcp_call", arguments: `{"tool":"mcp__x__ping","arguments":${call.arguments}}` } : null),
+  }));
+  expect(ran.map((c) => c.name)).toEqual(["mcp_call"]);
+  expect(provider.requests[1]!.history[1]).toMatchObject({ role: "assistant", toolCalls: [{ id: "c1", name: "mcp_call", arguments: '{"tool":"mcp__x__ping","arguments":{"a":1}}' }] });
+});

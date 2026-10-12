@@ -17,6 +17,10 @@ export interface Args {
   diagnostics?: string;
   /** Where to send the requests instead of OpenRouter's own API (a local proxy, e.g. Headroom's). */
   baseUrl?: string;
+  /** A JSON file of MCP servers (Claude Code's format, `{ "mcpServers": … }`) connected in every run. */
+  mcp?: string;
+  /** Raw: auto, deferred or eager (#14); the runner rejects the rest. */
+  mcpTools?: string;
 }
 
 export function parseArgs(argv: string[]): Args {
@@ -44,5 +48,7 @@ export function parseArgs(argv: string[]): Args {
     maxSteps: number("max-steps", 50),
     diagnostics: option("diagnostics"),
     baseUrl: option("base-url"),
+    mcp: option("mcp"),
+    mcpTools: option("mcp-tools"),
   };
 }
