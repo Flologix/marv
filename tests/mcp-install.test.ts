@@ -235,7 +235,7 @@ describe("the MCP Registry", () => {
     expect(p.name).toBe("filesystem");
     expect(p.entry).toEqual({
       command: "npx",
-      args: ["-y", "@modelcontextprotocol/server-filesystem@2025.8.21", "--stdio", "--mode", "safe", "/data"],
+      args: ["-y", "@modelcontextprotocol/server-filesystem@2025.8.21", "stdio", "--mode", "safe", "/data"],
       env: { FS_TOKEN: "${FS_TOKEN}", FS_LEVEL: "${FS_LEVEL:-info}" },
     });
     expect(text(p)).toMatch(/2025\.8\.21, published 2025-08-21/); // npm's facts
@@ -260,6 +260,19 @@ describe("the MCP Registry", () => {
       url: "https://server.smithery.ai/github/mcp",
       headers: { Authorization: "Bearer ${SMITHERY_API_KEY}", "X-Api-Key": "${X_API_KEY}" },
     });
+  });
+
+  test("an argument value that looks like a flag is refused, naming it: it could pass options to npx/uvx", async () => {
+    await expect(resolveRegistry({ kind: "registry", name: "com.example/flag-arg" }, none, deps())).rejects.toThrow(
+      "com.example/flag-arg's entry gives the argument value --prefer-offline, which starts with \"-\": Marv only adds values that can't be read as options. Nothing was added.",
+    );
+    await expect(resolveRegistry({ kind: "registry", name: "com.example/flag-default" }, none, deps())).rejects.toThrow(/argument --mode the value --from=evil, which starts with "-"/);
+  });
+
+  test("a header with a fixed value is refused, as a typed --header with one is: only ${VAR} references are written", async () => {
+    await expect(resolveRegistry({ kind: "registry", name: "com.example/fixed-header" }, none, deps())).rejects.toThrow(
+      /com\.example\/fixed-header's entry gives the header Authorization a fixed value.*only \$\{VAR\} references.*--header "Authorization: Bearer \$\{TOKEN\}"/,
+    );
   });
 
   test("Docker only, deprecated, unknown", async () => {

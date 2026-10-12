@@ -205,6 +205,49 @@ describe("/mcp login", () => {
     expect(s.requests).toEqual([]);
   });
 
+  test("a server that was never started (untrusted) can't be logged out of or in, even with a login stored for it", async () => {
+    const s = fixture();
+    const config = remote(s.url, { source: "project" });
+    const m = manager([config], { trust: new McpTrust(join(dir, "trust.json")) });
+    await m.start();
+    const key = loginKey({ source: "project", url: s.url }, root);
+    await store.update(key, () => ({ server: "remote", tokens: { access_token: "a", refresh_token: "r", token_type: "Bearer" } }));
+    await expect(m.logout("remote")).rejects.toThrow("trust it first: /mcp trust");
+    expect(m.status()[0]!.state).toBe("untrusted");
+    expect(await store.get(key)).toBeDefined();
+    // runLogin checks trust itself, not only the state string.
+    (m as unknown as { connections: { state: string }[] }).connections[0]!.state = "needs-login";
+    await expect(logIn(m)).rejects.toThrow("trust it first: /mcp trust");
+    await expect(m.logout("remote")).rejects.toThrow("trust it first: /mcp trust");
+    expect(s.requests).toEqual([]);
+  });
+
+  test("a token store Marv can't read (a newer format) is never written over: the login fails, saying so", async () => {
+    const s = fixture();
+    const m = manager([remote(s.url)]);
+    await m.start();
+    await Bun.write(store.path, '{"v":2,"logins":{}}');
+    await expect(logIn(m)).rejects.toThrow(/won't write over it/);
+    expect(await Bun.file(store.path).text()).toBe('{"v":2,"logins":{}}');
+  });
+
+  test("a call while a login reconnects the server gets an answer or Marv's sentence, never the SDK's closed-client error", async () => {
+    const s = fixture();
+    const m = manager([remote(s.url)]);
+    await m.start();
+    await logIn(m);
+    const results: Promise<Awaited<ReturnType<typeof call>>>[] = [];
+    m.onChange = () => {
+      if (m.status()[0]!.state === "connecting") results.push(call(m, "mcp__remote__echo", { text: "during" }));
+    };
+    await logIn(m);
+    expect(results.length).toBeGreaterThan(0);
+    for (const r of await Promise.all(results)) {
+      expect(["echo: during", "remote's echo failed: the server is reconnecting after a login: call it again in a moment.", "remote needs a new login: the user can run /mcp login remote"]).toContain(r.output);
+    }
+    expect((await call(m, "mcp__remote__echo", { text: "after" })).output).toBe("echo: after");
+  });
+
   test("a stdio server, one with its own Authorization header, or an unknown name: refused, saying why", async () => {
     const s = fixture();
     const m = manager([
