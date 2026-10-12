@@ -63,7 +63,9 @@ const commits = prePush
   ? readFileSync(0, "utf8")
       .split("\n")
       .map((line) => line.split(" "))
-      .filter(([localRef, localSha]) => localRef?.startsWith("refs/heads/") && localSha && !ZERO.test(localSha))
+      // Each line is "<local ref> <local sha> <remote ref> <remote sha>". What lands on a branch is what counts: the
+      // remote ref, so `git push origin HEAD:refs/heads/fix` (a local ref of HEAD) is reviewed too.
+      .filter(([, localSha, remoteRef]) => remoteRef?.startsWith("refs/heads/") && localSha && !ZERO.test(localSha))
       .map(([, localSha]) => localSha!)
   : [git("rev-parse", "HEAD")];
 
@@ -130,7 +132,12 @@ for (const sha of new Set(commits)) {
     const mark = blockers.includes(f) ? "BLOCKING" : "note";
     console.log(`\n[${mark} · ${f.severity ?? "?"} · ${f.category ?? "?"}] ${f.path}${lines}\n${f.content}`);
   }
-  if (result.warnings?.length) console.error(`review-gate: ${result.warnings.length} file(s) couldn't be reviewed; see \`ocr session list\`.`);
+  // A file ocr couldn't review is a review that didn't finish: it blocks, and the commit isn't cached as passed.
+  if (result.warnings?.length) {
+    console.error(`review-gate: ${result.warnings.length} file(s) couldn't be reviewed, so ${sha.slice(0, 8)} isn't passed; see \`ocr session list\`, then push again.`);
+    failed = true;
+    continue;
+  }
 
   if (blockers.length) {
     console.error(
