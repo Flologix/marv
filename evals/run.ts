@@ -4,7 +4,6 @@
 //   bun evals/run.ts --verify                         every check fails on the task's repo and passes with its solution
 //   bun evals/run.ts --models a,b --label baseline    each model on each task (OPENROUTER_API_KEY, or ~/.marv's key)
 //         [--tasks x,y] [--repeat 2] [--budget 1.50] [--concurrency 4] [--timeout 300] [--max-steps 50] [--diagnostics on|off]
-//         [--base-url http://localhost:8787/v1]       send the requests there instead of OpenRouter's API (a proxy, e.g. Headroom's)
 //         [--mcp servers.json] [--mcp-tools auto|deferred|eager]   MCP servers for every run, and how they're offered (#14)
 //   bun evals/run.ts --report evals/results/a/results.jsonl evals/results/b/results.jsonl
 //
@@ -119,9 +118,6 @@ const maxSteps = args.maxSteps;
 const diagnosticsOption = args.diagnostics;
 if (diagnosticsOption !== undefined && diagnosticsOption !== "on" && diagnosticsOption !== "off") throw new Error("--diagnostics takes on or off");
 const diagnostics = diagnosticsOption !== "off";
-// A proxy stands between Marv and OpenRouter (e.g. Headroom's, which compresses what's sent); the provider sends
-// everything, cost and cached-token counts included, to its baseUrl instead.
-const baseUrl = args.baseUrl;
 // MCP servers for every run (Claude Code's format, or the bare record), and how they're offered (#14).
 const mcpTools = args.mcpTools;
 if (mcpTools !== undefined && !MCP_TOOLS.includes(mcpTools)) throw new Error(`--mcp-tools takes ${MCP_TOOLS.join(", ")}`);
@@ -179,7 +175,6 @@ async function runOne({ model, task, rep }: { model: string; task: string; rep: 
     editErrors: [],
     marv,
     diagnostics,
-    baseUrl,
     ...(withMcp ? { mcpTools: mcpTools ?? "auto", mcpCalls: 0 } : {}),
   };
   // What happened, for reading a run afterwards: replies, and every tool call with (the start of) what it returned.
@@ -188,7 +183,7 @@ async function runOne({ model, task, rep }: { model: string; task: string; rep: 
   try {
     const session = await createSession({
       cwd: dir,
-      provider: { kind: "openrouter", apiKey, model, baseUrl },
+      provider: { kind: "openrouter", apiKey, model },
       maxSteps,
       diagnostics,
       ...(withMcp ? { mcpServers, mcpTools: mcpTools as "auto" | "deferred" | "eager" | undefined } : {}),
@@ -278,7 +273,7 @@ async function worker() {
 
 console.log(
   `${jobs.length} runs (${models.length} models × ${tasks.length} tasks × ${repeat}), budget $${budget}, ${maxSteps} steps, diagnostics ${diagnostics ? "on" : "off"}` +
-    `${baseUrl ? `, via ${baseUrl}` : ""}${mcpTools ? `, MCP tools ${mcpTools}` : ""}, Marv ${marv} → ${out}`,
+    `${mcpTools ? `, MCP tools ${mcpTools}` : ""}, Marv ${marv} → ${out}`,
 );
 await Promise.all(Array.from({ length: Math.min(concurrency, jobs.length) }, worker));
 if (skipped.length) console.log(`\nBudget reached: ${skipped.length} runs not started.`);

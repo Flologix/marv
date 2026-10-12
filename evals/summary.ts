@@ -48,8 +48,6 @@ export interface RunResult {
   checkOutput?: string;
   /** Marv's git commit, and whether its working tree had changes. */
   marv?: string;
-  /** Where the requests went, when not OpenRouter's own API (a proxy such as Headroom's, with --base-url). */
-  baseUrl?: string;
   /** How MCP tools were offered (--mcp-tools; #14), for runs with an MCP server. */
   mcpTools?: string;
   /** MCP tools run (mcp_call, or an mcp__ tool offered directly). */
@@ -70,9 +68,7 @@ export interface SummaryRow {
   mcpCalls: number;
   cost: number;
   medianMs: number;
-  /** The proxy host the runs went through (`--base-url`), empty for OpenRouter's own API. */
-  via: string;
-  /** Which runs the row is (label, model and proxy), for the per-task grid. */
+  /** Which runs the row is (label and model), for the per-task grid. */
   group: string;
 }
 
@@ -83,18 +79,7 @@ const median = (values: number[]) => {
   return sorted.length % 2 ? sorted[mid]! : (sorted[mid - 1]! + sorted[mid]!) / 2;
 };
 
-// A proxied run and a direct one are compared, never blended: the proxy is part of the group.
-const groupKey = (r: RunResult) => `${r.label}\u0000${r.model}\u0000${r.baseUrl ?? ""}`;
-
-/** The proxy a run went through (`--base-url`), as "via localhost:8787"; nothing for OpenRouter's own API. */
-const via = (r: RunResult | undefined) => {
-  if (!r?.baseUrl) return "";
-  try {
-    return new URL(r.baseUrl).host;
-  } catch {
-    return r.baseUrl;
-  }
-};
+const groupKey = (r: RunResult) => `${r.label}\u0000${r.model}`;
 
 /** One row per label and model, in the order they first appear. */
 export function summarizeRuns(results: RunResult[]): SummaryRow[] {
@@ -116,7 +101,6 @@ export function summarizeRuns(results: RunResult[]): SummaryRow[] {
       mcpCalls: runs.reduce((n, r) => n + (r.mcpCalls ?? 0), 0),
       cost: runs.reduce((n, r) => n + r.cost, 0),
       medianMs: median(runs.map((r) => r.ms)),
-      via: via(runs[0]),
       group: groupKey(runs[0]!),
     };
   });
@@ -133,17 +117,14 @@ function table(rows: string[][]): string {
 export function formatSummary(results: RunResult[]): string {
   if (results.length === 0) return "No runs.";
   const rows = summarizeRuns(results);
-  // The proxy column appears only when a run went through one: same runs as before, same table otherwise.
-  const showVia = rows.some((r) => r.via);
   // Likewise MCP calls: only runs with a server make any.
   const showMcp = rows.some((r) => r.mcpCalls);
-  const head = ["label", "model", ...(showVia ? ["via"] : []), "runs", "pass", "edits", "edit fail", "steps/run", "tools/run", ...(showMcp ? ["mcp/run"] : []), "prompt/req", "$/run", "$ total", "median"];
+  const head = ["label", "model", "runs", "pass", "edits", "edit fail", "steps/run", "tools/run", ...(showMcp ? ["mcp/run"] : []), "prompt/req", "$/run", "$ total", "median"];
   const overview = table([
     head,
     ...rows.map((r) => [
       r.label,
       r.model,
-      ...(showVia ? [r.via || "-"] : []),
       String(r.runs),
       pct(r.passed, r.runs),
       String(r.editCalls),
@@ -159,7 +140,7 @@ export function formatSummary(results: RunResult[]): string {
   ]);
   const tasks = [...new Set(results.map((r) => r.task))].sort();
   const grid = table([
-    ["task", ...rows.map((r) => `${r.label}/${r.model}${r.via ? ` via ${r.via}` : ""}`)],
+    ["task", ...rows.map((r) => `${r.label}/${r.model}`)],
     ...tasks.map((task) => [
       task,
       ...rows.map((row) => {

@@ -69,20 +69,6 @@ describe("formatSummary", () => {
     expect(text).toMatch(/json\s+1\/1/);
   });
 
-  test("runs through a proxy and direct ones are separate rows, even with the same label and model", () => {
-    const rows = summarizeRuns([run(), run({ baseUrl: "http://localhost:8787/v1", cost: 5 })]);
-    expect(rows.map((r) => [r.via, r.runs])).toEqual([["", 1], ["localhost:8787", 1]]);
-    expect(formatSummary([run(), run({ baseUrl: "http://localhost:8787/v1" })])).toMatch(/via localhost:8787/);
-  });
-
-  test("a run with a baseUrl (a proxy) is shown as via <host>, a column only when one exists", () => {
-    const withProxy = formatSummary([run({ model: "m1", baseUrl: "http://localhost:8787/v1" }), run({ model: "m2" })]);
-    expect(withProxy).toMatch(/via/);
-    expect(withProxy).toMatch(/localhost:8787/);
-    expect(withProxy).toMatch(/m2\s+-\s/); // the other group went to OpenRouter's own API
-    expect(formatSummary([run()])).not.toMatch(/via/); // no proxy, no column
-  });
-
   test("prompt tokens per request: what deferred MCP tools (#14) should move", () => {
     const rows = summarizeRuns([run({ requests: 2, promptTokens: 3000 }), run({ requests: 4, promptTokens: 9000 })]);
     expect(rows[0]!.promptTokens).toBe(12_000);
