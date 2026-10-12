@@ -21,6 +21,8 @@ import { projectKey } from "../src/paths.ts";
 import { TrajectoryStore } from "../src/trajectory.ts";
 import { McpManager } from "../src/mcp/manager.ts";
 import { McpTrust } from "../src/mcp/trust.ts";
+import { McpTokenStore } from "../src/mcp/oauth-store.ts";
+import { oauthServer } from "./fixtures/oauth-server.ts";
 import type { Resolved } from "../src/mcp/install/index.ts";
 import type { Proposal } from "../src/mcp/install/proposal.ts";
 import type { RegistryHit } from "../src/mcp/install/registry.ts";
@@ -1329,6 +1331,7 @@ describe("MCP servers", () => {
       specs: [],
       status: () => [],
       untrusted: () => [],
+      loginable: () => [],
     };
     return { mcp: fake as unknown as McpManager, finish: () => ((fake.settled = true), finish()) };
   }
@@ -1394,6 +1397,158 @@ describe("MCP servers", () => {
     expect(frame).toContain("test (node mcp/server.js --key=${OPENROUTER_API_KEY} · env NODE_OPTIONS=--require=./x.js)");
     expect(frame).toContain("reads $OPENROUTER_API_KEY from your environment");
     expect(frame).toContain("runs this project's mcp/server.js");
+  });
+});
+
+describe("MCP logins (#18)", () => {
+  let managers: McpManager[] = [];
+  let fixtures: ReturnType<typeof oauthServer>[] = [];
+  afterEach(async () => {
+    await Promise.all(managers.map((m) => m.close()));
+    managers = [];
+    for (const f of fixtures) f.close();
+    fixtures = [];
+  });
+  const reply = (text: string) => [{ type: "text_delta", text }, { type: "done" }] as AgentEvent[];
+
+  function setup(model: Provider, extra: { sessions?: SessionStore } = {}) {
+    const fixture = oauthServer();
+    fixtures.push(fixture);
+    const mcp = new McpManager([{ name: "remote", source: "personal", key: "k", transport: { type: "http", url: fixture.url } }], {
+      root: project,
+      version: "9.9.9",
+      logins: new McpTokenStore(join(dir, "mcp-tokens.json")),
+    });
+    managers.push(mcp);
+    void mcp.start();
+    const opened: URL[] = [];
+    const app = render(
+      <App
+        store={store}
+        initialFile={LOCAL}
+        env={{}}
+        version="9.9.9"
+        cwd="~/x"
+        root={project}
+        splashMs={0}
+        makeProvider={() => model}
+        loadModels={async () => []}
+        mcp={mcp}
+        openUrl={(url) => void opened.push(url)}
+        sessions={extra.sessions}
+      />,
+    );
+    return { ...app, mcp, fixture, opened };
+  }
+  /** Where the authorization server sends the browser back (what a user would paste). */
+  const callbackFor = async (url: URL) => (await fetch(url, { redirect: "manual" })).headers.get("location")!;
+  const flat = (frame: string | undefined) => (frame ?? "").replace(/\s+/g, " ");
+
+  test("startup lists the server that needs a login in the MCP notice", async () => {
+    const { lastFrame } = setup(new ScriptedProvider([]));
+    await until(() => flat(lastFrame()).includes("needs a login"));
+    const frame = flat(lastFrame());
+    expect(frame).toContain("MCP · 1 note");
+    expect(frame).toContain("1 MCP server needs a login");
+    expect(frame).toContain("remote: /mcp login remote");
+  });
+
+  test("/mcp login shows the link, opens it, takes the pasted callback, and the code never reaches the model or the saved session", async () => {
+    const sessions = new SessionStore(join(dir, "sessions"));
+    const model = new ScriptedProvider([reply("Hi."), reply("Again.")]);
+    const { lastFrame, stdin, opened } = setup(model, { sessions });
+    await until(() => flat(lastFrame()).includes("needs a login"));
+    await type(stdin, "/mcp login remote");
+    await until(() => opened.length > 0);
+    const frame = flat(lastFrame());
+    expect(frame).toContain("Log in to remote at 127.0.0.1:");
+    expect(frame).toContain("paste its address here");
+    const pasted = await callbackFor(opened[0]!);
+    const code = new URL(pasted).searchParams.get("code")!;
+    expect(code).toStartWith("code-");
+    await type(stdin, pasted);
+    await until(() => flat(lastFrame()).includes("logged in · connected"));
+    expect(flat(lastFrame())).toContain("remote: logged in · connected · 8 tools");
+    expect(flat(lastFrame())).toContain("(login callback)");
+    expect(lastFrame()).not.toContain(code);
+    // Then an ordinary message: the model sees the new tools, never the callback.
+    await type(stdin, "hello");
+    await until(() => model.requests.length > 0 && flat(lastFrame()).includes("Hi."));
+    expect(model.requests[0]!.options.tools!.map((t) => t.name)).toContain("mcp__remote__echo");
+    expect(JSON.stringify(model.requests)).not.toContain(code);
+    expect(JSON.stringify(model.requests)).not.toContain("login callback");
+    await tick(400); // the session saves 200 ms after a turn
+    const files = readdirSync(join(dir, "sessions"), { recursive: true }).map(String).filter((f) => f.endsWith(".json"));
+    expect(files.length).toBeGreaterThan(0);
+    for (const f of files) expect(await Bun.file(join(dir, "sessions", f)).text()).not.toContain(code);
+  });
+
+  test("a callback address with no login waiting is never sent to the model", async () => {
+    const model = new ScriptedProvider([reply("Hi.")]);
+    const { lastFrame, stdin } = setup(model);
+    await until(() => flat(lastFrame()).includes("needs a login"));
+    await type(stdin, "http://127.0.0.1:5555/callback?code=code-secret&state=abc");
+    await until(() => flat(lastFrame()).includes("No login is waiting"));
+    expect(model.requests).toHaveLength(0);
+    expect(lastFrame()).not.toContain("code-secret");
+  });
+
+  test("logging in while a turn runs doesn't change that turn's tools; the next turn has them", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const requests: StreamOptions[] = [];
+    const steps: AgentEvent[][] = [
+      [{ type: "tool_call", call: { id: "t1", name: "glob", arguments: JSON.stringify({ pattern: "*.nothing" }) } }, { type: "done" }],
+      reply("Done."),
+      reply("Next."),
+    ];
+    const gated: Provider = {
+      name: "gated",
+      async *stream(_history: ChatTurn[], options: StreamOptions = {}) {
+        requests.push(options);
+        if (requests.length === 1) await gate;
+        for (const event of steps.shift()!) yield event;
+      },
+    };
+    const { lastFrame, stdin, opened } = setup(gated);
+    await until(() => flat(lastFrame()).includes("needs a login"));
+    await type(stdin, "/mcp login remote");
+    await until(() => opened.length > 0);
+    await type(stdin, "look around");
+    await until(() => requests.length === 1);
+    // The callback arrives mid-turn (pasted: the prompt takes it even while busy).
+    await type(stdin, await callbackFor(opened[0]!));
+    await until(() => flat(lastFrame()).includes("logged in · connected"));
+    release();
+    await until(() => flat(lastFrame()).includes("Done."));
+    const names = (o: StreamOptions) => o.tools!.map((t) => t.name);
+    expect(names(requests[1]!)).toEqual(names(requests[0]!));
+    expect(names(requests[0]!)).not.toContain("mcp__remote__echo");
+    await type(stdin, "and now?");
+    await until(() => requests.length === 3);
+    expect(names(requests[2]!)).toContain("mcp__remote__echo");
+  });
+
+  test("a login that runs out mid-session is told once", async () => {
+    const model = new ScriptedProvider([
+      [{ type: "tool_call", call: { id: "c1", name: "mcp__remote__lookup", arguments: JSON.stringify({ word: "x" }) } }, { type: "done" }] as AgentEvent[],
+      reply("It needs a login."),
+    ]);
+    const { lastFrame, stdin, opened, fixture } = setup(model);
+    await until(() => flat(lastFrame()).includes("needs a login"));
+    await type(stdin, "/mcp login remote");
+    await until(() => opened.length > 0);
+    await type(stdin, await callbackFor(opened[0]!));
+    await until(() => flat(lastFrame()).includes("logged in · connected"));
+    fixture.expire();
+    fixture.refuseRefresh();
+    await type(stdin, "echo x");
+    await until(() => flat(lastFrame()).includes("It needs a login."));
+    const frame = flat(lastFrame());
+    expect(frame).toContain("remote needs a new login: /mcp login remote");
+    expect(frame.split("remote needs a new login: /mcp login remote").length).toBe(2);
+    // What the model read is Marv's sentence.
+    expect(JSON.stringify(model.requests[1]!.history)).toContain("remote needs a new login: the user can run /mcp login remote");
   });
 });
 

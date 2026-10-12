@@ -5,7 +5,7 @@ import { displayOf } from "../src/mcp/config.ts";
 import { readmeCandidates, resolveGithub } from "../src/mcp/install/github.ts";
 import { resolveAdd } from "../src/mcp/install/index.ts";
 import { resolveNpm } from "../src/mcp/install/npm.ts";
-import { approvalFor, httpProposal, type Proposal, type ResolveDeps } from "../src/mcp/install/proposal.ts";
+import { addedNotice, approvalFor, httpProposal, type Proposal, type ResolveDeps } from "../src/mcp/install/proposal.ts";
 import { resolvePypi } from "../src/mcp/install/pypi.ts";
 import { resolveRegistry, searchRegistry } from "../src/mcp/install/registry.ts";
 import { parseAddArgs, parseSource, serverName } from "../src/mcp/install/source.ts";
@@ -184,6 +184,25 @@ describe("http", () => {
     const p = (await resolveAdd(parseAddArgs("https://mcp.linear.app/mcp"), deps())) as Proposal;
     expect(p).toMatchObject({ name: "linear", entry: { type: "http", url: "https://mcp.linear.app/mcp" } });
     expect(requests.length).toBe(before);
+  });
+  test("a remote server that asks for an OAuth login says so before it's added (#18), unless it has its own header", async () => {
+    const probed: string[] = [];
+    const probeLogin = async (url: string) => (probed.push(url), true);
+    const p = (await resolveAdd(parseAddArgs("https://mcp.linear.app/mcp"), deps({ probeLogin }))) as Proposal;
+    expect(probed).toEqual(["https://mcp.linear.app/mcp"]);
+    expect(text(p)).toContain("login    it asks for an OAuth login: after adding it, /mcp login linear");
+    const headed = (await resolveAdd(parseAddArgs('https://mcp.linear.app/mcp --header "Authorization: Bearer ${T}"'), deps({ probeLogin }))) as Proposal;
+    expect(probed).toHaveLength(1);
+    expect(text(headed)).not.toContain("OAuth");
+    const open = (await resolveAdd(parseAddArgs("https://mcp.linear.app/mcp"), deps({ probeLogin: async () => false }))) as Proposal;
+    expect(text(open)).not.toContain("OAuth");
+  });
+  test("addedNotice: a server that needs a login ends with /mcp login <name>", () => {
+    const status = { name: "linear", source: "personal" as const, target: "https://mcp.linear.app/mcp", reads: [], runsProjectFiles: [], tools: [] };
+    expect(addedNotice({ ...status, state: "needs-login" })).toEqual({
+      text: "Added linear to ~/.marv/mcp.json. It needs a login: /mcp login linear (Marv can use its tools from your next message after that).",
+      isError: false,
+    });
   });
   test("options that don't fit the source are refused", async () => {
     await expect(resolveAdd(parseAddArgs("https://mcp.linear.app/mcp --env X"), deps())).rejects.toThrow(/--header/);

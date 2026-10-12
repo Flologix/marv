@@ -21,14 +21,23 @@ interface Props {
 
 /**
  * Commands matching what's typed so far ("/se" → setup), prefix matches first.
- * Empty once there's a space, i.e. the user is typing arguments.
+ * Once there's a space the user is typing arguments, and only argument completions match: entries whose name has
+ * words ("mcp login github"), once everything before their last word is typed ("/mcp login "), so "/mcp " + Enter
+ * still runs /mcp.
  */
 export function matchCommands(value: string, commands: readonly CommandInfo[]): CommandInfo[] {
-  const match = /^\/(\S*)$/.exec(value);
-  if (!match) return [];
-  const typed = match[1]!.toLowerCase();
-  const prefix = commands.filter((c) => c.name.startsWith(typed));
-  const other = commands.filter((c) => !c.name.startsWith(typed) && c.name.includes(typed));
+  if (!value.startsWith("/")) return [];
+  const typed = value.slice(1).toLowerCase();
+  if (/\s/.test(typed)) {
+    return commands.filter((c) => {
+      const name = c.name.toLowerCase();
+      const parent = name.slice(0, name.lastIndexOf(" ") + 1);
+      return parent !== "" && typed.startsWith(parent) && name.startsWith(typed);
+    });
+  }
+  const single = commands.filter((c) => !c.name.includes(" "));
+  const prefix = single.filter((c) => c.name.startsWith(typed));
+  const other = single.filter((c) => !c.name.startsWith(typed) && c.name.includes(typed));
   return [...prefix, ...other];
 }
 

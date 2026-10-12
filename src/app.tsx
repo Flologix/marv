@@ -30,7 +30,8 @@ import { MarvSession, type CompactResult, type Resumed } from "./session.ts";
 import { timeAgo, type SessionStore, type SessionSummary } from "./sessions.ts";
 import { skillMessage, type Skill } from "./skills.ts";
 import type { TrajectoryStore } from "./trajectory.ts";
-import type { McpManager, McpServerStatus } from "./mcp/manager.ts";
+import type { McpLogin, McpManager, McpServerStatus } from "./mcp/manager.ts";
+import { canOpenBrowser, isCallback, openBrowser } from "./mcp/oauth.ts";
 import { parseMcpServers } from "./mcp/config.ts";
 import { liveDeps, resolveAdd, type Resolved } from "./mcp/install/index.ts";
 import { addedNotice, approvalFor } from "./mcp/install/proposal.ts";
@@ -96,6 +97,18 @@ function startupNotice(notes: { tone: NoticeTone; item: NoticeItem }[]): Notice 
   };
 }
 
+/** Opens a login's URL where a browser can open; elsewhere the transcript's link is all there is. */
+function defaultOpenUrl(url: URL) {
+  if (canOpenBrowser(process.env, process.platform)) openBrowser(url);
+}
+
+/** "github: logged in · connected · 41 tools", or why not: the end of /mcp login. */
+function loginResult(s: McpServerStatus): { text: string; isError: boolean } {
+  if (s.state === "connected") return { text: `${s.name}: logged in · connected · ${s.tools.length} tool${s.tools.length === 1 ? "" : "s"}. Marv can use them from your next message.`, isError: false };
+  if (s.state === "needs-login") return { text: `${s.name}: logged in, but the server still refused the token (see /mcp).`, isError: true };
+  return { text: `${s.name}: logged in, but it didn't connect: ${s.error ?? s.state} (see /mcp).`, isError: true };
+}
+
 // Defaults defined once, so they're the same objects on every render (the
 // effects that report problems depend on them).
 const DEFAULT_AGENTS: AgentType[] = [GENERAL_PURPOSE];
@@ -142,6 +155,11 @@ interface Props {
   /** /mcp add's lookup and /mcp search: by default through Marv's own `get` (tests stub them, so nothing hits the network). */
   resolveMcp?: (options: AddOptions, signal: AbortSignal) => Promise<Resolved>;
   searchMcp?: (words: string, signal: AbortSignal) => Promise<RegistryHit[]>;
+  /**
+   * /mcp login: opens the authorization URL in the browser. By default xdg-open/open where a browser can open (not
+   * over SSH, not without a display); tests inject their own, so no browser ever opens.
+   */
+  openUrl?: (url: URL) => void;
   /** Hands cli.tsx a function to run before the process exits: saves the session and flushes the trajectory. */
   onFlush?: (flush: () => Promise<void>) => void;
   /** Start by resuming: the latest session here (marv -c), or a picker (marv -r). */
@@ -184,6 +202,7 @@ export function App({
   mcpProblems = NO_PROBLEMS,
   resolveMcp,
   searchMcp,
+  openUrl = defaultOpenUrl,
   onFlush,
   resume,
   memory,
@@ -218,7 +237,22 @@ export function App({
   // Memory as of the start of this conversation, for the welcome banner (the session reloads it on /clear).
   const [memories, setMemories] = useState<Memories | undefined>(memory?.initial);
   // Skills show up in the / menu next to the built-in commands.
-  const menu = useMemo(() => [...commands, ...skills.map(({ name, description }) => ({ name, description }))], [skills]);
+  const baseMenu = useMemo(() => [...commands, ...skills.map(({ name, description }) => ({ name, description }))], [skills]);
+  // Server names after "/mcp login " and "/mcp logout " (the servers that can log in; read per render, they change).
+  const loginable = mcp?.loginable().join("\n") ?? "";
+  const menu = useMemo(
+    () => [
+      ...baseMenu,
+      ...loginable
+        .split("\n")
+        .filter(Boolean)
+        .flatMap((name) => [
+          { name: `mcp login ${name}`, description: `Log in to ${name} (OAuth, in your browser)` },
+          { name: `mcp logout ${name}`, description: `Forget ${name}'s login` },
+        ]),
+    ],
+    [baseMenu, loginable],
+  );
   // The session's numbers, for the status bar: the latest request's tokens (how full the context is), and the
   // whole session's (they survive /clear: that's money spent).
   const [usage, setUsage] = useState<Usage | null>(null);
@@ -772,7 +806,15 @@ export function App({
 
   const handleSubmit = (raw: string) => {
     const text = raw.trim();
-    if (!text || busy) return;
+    if (!text) return;
+    // A login's callback address (pasted from a browser that couldn't reach Marv) holds the authorization code: it
+    // goes to the login, never to the model, the prompt history or the saved transcript. Even during a turn.
+    if (isCallback(text)) {
+      setInput("");
+      pasteCallback(text);
+      return;
+    }
+    if (busy) return;
     if (loadingSession) {
       setNotice("Loading your last session…");
       return;
@@ -882,6 +924,12 @@ export function App({
       case "mcp-remove":
         void removeMcp(action.name);
         break;
+      case "mcp-login":
+        void loginMcp(action.server);
+        break;
+      case "mcp-logout":
+        void logoutMcp(action.server);
+        break;
       case "yolo":
         void saveConfig({ ...(file ?? { provider: config.provider }), yolo: action.on }, yoloStatus({ ...config, yolo: action.on }));
         break;
@@ -909,6 +957,79 @@ export function App({
       addMessage({ role: "system", text: lines.join("\n"), isError: started.some((s) => s.state !== "connected") });
     } catch (err) {
       addMessage({ role: "system", text: `Couldn't trust the servers: ${(err as Error).message}`, isError: true });
+    }
+  };
+
+  // The /mcp login waiting for its callback: a pasted callback address goes to it.
+  const pendingLogin = useRef<{ server: string; login: McpLogin } | null>(null);
+  // Servers already said to need a login (at startup or since), so a mid-session expiry is told once.
+  const toldNeedsLogin = useRef(new Set<string>());
+
+  /**
+   * /mcp login: not a turn (the prompt stays free, and a running turn keeps its tools). The browser opens where it
+   * can; the link is shown either way, with the paste fallback for a browser on another machine.
+   */
+  const loginMcp = async (name: string) => {
+    if (!mcp) return;
+    let login: McpLogin;
+    try {
+      login = mcp.login(name, {
+        authorize: (url) => {
+          addMessage({
+            role: "system",
+            text: `Log in to ${name} at ${url.host}: opening your browser… If it doesn't open, open this link and, if your browser then shows an error page, paste its address here:\n${url.href}`,
+          });
+          openUrl(url);
+        },
+      });
+    } catch (err) {
+      addMessage({ role: "system", isError: true, text: (err as Error).message });
+      return;
+    }
+    const mine = { server: name, login };
+    pendingLogin.current = mine;
+    toldNeedsLogin.current.add(name);
+    try {
+      const status = await login.done;
+      if (status.state === "connected") toldNeedsLogin.current.delete(name);
+      addMessage({ role: "system", ...loginResult(status) });
+    } catch (err) {
+      addMessage({ role: "system", isError: true, text: `${name}: not logged in: ${(err as Error).message}` });
+    } finally {
+      if (pendingLogin.current === mine) pendingLogin.current = null;
+    }
+  };
+
+  /** A pasted callback address: shown as "(login callback)", handed to the waiting login. */
+  const pasteCallback = (text: string) => {
+    addMessage({ role: "user", text: "(login callback)" });
+    const pending = pendingLogin.current;
+    if (!pending) {
+      addMessage({ role: "system", isError: true, text: "No login is waiting for that address (/mcp login <server> starts one). It wasn't sent to the model." });
+      return;
+    }
+    const check = pending.login.paste(text);
+    if (check.ok) addMessage({ role: "system", text: `Got it: finishing the login to ${pending.server}…` });
+    else if (check.why === "state" || check.why === "path") addMessage({ role: "system", isError: true, text: "That address isn't from this login: paste the address the browser ended up on after the latest /mcp login." });
+    else if (check.why === "used") addMessage({ role: "system", isError: true, text: "This login already has its callback." });
+    // An error= callback: login.done rejects with the reason, and loginMcp says so.
+  };
+
+  /** /mcp logout: revoke where the server can, forget the login. */
+  const logoutMcp = async (name: string) => {
+    if (!mcp) return;
+    toldNeedsLogin.current.add(name);
+    try {
+      const { revoked } = await mcp.logout(name);
+      const grant =
+        revoked === "revoked"
+          ? "The authorization server revoked the grant."
+          : revoked === "unsupported"
+            ? "The authorization server can't revoke it from here, so the grant still exists on its side: remove it in your account's settings there (usually under applications or integrations)."
+            : "Revoking the grant failed, so it may still exist on the authorization server's side: remove it in your account's settings there.";
+      addMessage({ role: "system", text: `Logged out of ${name}: its tokens are forgotten. ${grant}` });
+    } catch (err) {
+      addMessage({ role: "system", isError: true, text: (err as Error).message });
     }
   };
 
@@ -1305,7 +1426,21 @@ export function App({
       const status = mcp.status();
       const failed = status.filter((s) => s.state === "failed");
       const waiting = status.filter((s) => s.state === "untrusted");
-      if (failed.length === 0 && waiting.length === 0) return;
+      const login = status.filter((s) => s.state === "needs-login");
+      for (const s of login) toldNeedsLogin.current.add(s.name);
+      // From now on, a server whose login runs out mid-session (a refresh refused) is told once.
+      mcp.onChange = () => {
+        for (const s of mcp.status()) {
+          if (s.state === "needs-login" && !toldNeedsLogin.current.has(s.name)) {
+            toldNeedsLogin.current.add(s.name);
+            addMessage({ role: "system", text: "", notice: { title: "MCP", tone: "warning", items: [{ text: `${s.name} needs a new login: /mcp login ${s.name}`, detail: ["Its tools fail until then."] }] } });
+          } else if (s.state === "connected") {
+            toldNeedsLogin.current.delete(s.name);
+          }
+        }
+      };
+      const count = failed.length + waiting.length + login.length;
+      if (count === 0) return;
       const notes: NoticeItem[] = [];
       if (failed.length) notes.push({ text: `${failed.length} MCP server${failed.length === 1 ? "" : "s"} failed to start (see /mcp)`, detail: failed.map((s) => `${s.name}: ${s.error}`) });
       if (waiting.length)
@@ -1314,10 +1449,16 @@ export function App({
           // The trust decision is the security gate (a cloned repository's .mcp.json could run anything): say what's at stake.
           detail: [...waiting.map((s) => describeUntrusted(s)), "They'd run with your permissions, outside the sandbox. /mcp trust starts them."],
         });
-      addMessage({ role: "system", text: "", notice: { title: `MCP · ${failed.length + waiting.length} note${failed.length + waiting.length === 1 ? "" : "s"}`, tone: failed.length ? "error" : "warning", items: notes } });
+      if (login.length)
+        notes.push({
+          text: `${login.length} MCP server${login.length === 1 ? " needs" : "s need"} a login`,
+          detail: login.map((s) => `${s.name}: /mcp login ${s.name}`),
+        });
+      addMessage({ role: "system", text: "", notice: { title: `MCP · ${count} note${count === 1 ? "" : "s"}`, tone: failed.length ? "error" : "warning", items: notes } });
     });
     return () => {
       cancelled = true;
+      mcp.onChange = () => {};
     };
   }, [mcp, addMessage]);
 

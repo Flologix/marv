@@ -11,6 +11,7 @@ import pkg from "../package.json";
 import { defaultConfigDir } from "./config/config.ts";
 import { parseMcpServers, type McpServerConfig } from "./mcp/config.ts";
 import { McpManager } from "./mcp/manager.ts";
+import { McpTokenStore } from "./mcp/oauth-store.ts";
 import { McpTrust } from "./mcp/trust.ts";
 import { homeOrAbove, projectKey } from "./paths.ts";
 import type { ProviderOption } from "./provider/factory.ts";
@@ -153,7 +154,11 @@ export async function createSession(options: SessionOptions): Promise<Session> {
   // Creating the manager spawns nothing; start() does. So it only starts once the session exists (its constructor
   // can throw: an unknown provider kind, a tool name that's taken), and anything that fails after that closes the
   // session, servers included.
-  const mcp = servers.length ? new McpManager(servers, { root, version: pkg.version, trust: new McpTrust(join(configDir, "mcp-trust.json")) }) : undefined;
+  // Logins made with /mcp login in the TUI (same configDir) are used and refreshed; a library never starts one.
+  const tokensFile = join(configDir, "mcp-tokens.json");
+  const mcp = servers.length
+    ? new McpManager(servers, { root, version: pkg.version, trust: new McpTrust(join(configDir, "mcp-trust.json")), logins: new McpTokenStore(tokensFile) })
+    : undefined;
 
   const session = new MarvSession({
     root,
@@ -183,7 +188,12 @@ export async function createSession(options: SessionOptions): Promise<Session> {
     onWarning: options.onWarning,
     problems,
   });
-  void mcp?.start();
+  // A server that needs a login can't get one here (no prompt to paste into, no browser to open): say how, once.
+  void mcp?.start().then(() => {
+    for (const s of mcp.status()) {
+      if (s.state === "needs-login") options.onWarning?.(`MCP server "${s.name}" needs a login: run marv in a terminal and /mcp login ${s.name}; logins are stored in ${tokensFile}`);
+    }
+  });
   if (options.resume) {
     try {
       const resumed = await session.resume(options.resume);

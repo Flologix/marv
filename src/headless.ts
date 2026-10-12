@@ -164,6 +164,9 @@ export async function runHeadless(options: HeadlessOptions): Promise<number> {
       configDir,
       mcpTools: config.mcpTools,
       resume: options.resume,
+      // To stderr, so stdout stays the reply (or JSON): an MCP server that needs a login (/mcp login in the TUI), a
+      // trajectory that can't be written.
+      onWarning: (text) => console.error(`marv: ${text}`),
     });
   } catch (err) {
     console.error(`Failed to create session: ${err instanceof Error ? err.message : String(err)}`);

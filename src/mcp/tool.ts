@@ -9,6 +9,7 @@ import { z } from "zod";
 import type { ToolSpec } from "../provider/types.ts";
 import { ToolError, type Tool } from "../tools/types.ts";
 import type { McpServerConfig } from "./config.ts";
+import { LoginNeeded } from "./oauth.ts";
 
 /** What a server says about one of its tools (tools/list). */
 export interface McpToolInfo {
@@ -108,6 +109,8 @@ export function makeMcpTool(server: McpServerConfig, info: McpToolInfo, call: Mc
       try {
         result = await call(info.name, args, signal);
       } catch (err) {
+        // Marv's own sentence, as it is: the model should tell the user to log in, not retry.
+        if (err instanceof LoginNeeded) throw new ToolError(err.message);
         throw new ToolError(`${server.name}'s ${info.name} failed: ${err instanceof Error ? err.message : String(err)}`);
       }
       const output = formatMcpResult(result);
