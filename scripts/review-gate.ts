@@ -55,7 +55,8 @@ const git = (...a: string[]): string => {
 
 // --- Which commits to review ---
 // From the hook: every pushed ref, except deletions (all-zero sha) and tags.
-// Otherwise: HEAD.
+// Otherwise: HEAD. No branch refs on stdin is not an error: that's a push of
+// tags only, or of branch deletions, which add no code to review.
 const ZERO = /^0+$/;
 if (prePush && process.stdin.isTTY) fail("--pre-push reads the pushed refs from stdin; git's pre-push hook passes them");
 const commits = prePush
