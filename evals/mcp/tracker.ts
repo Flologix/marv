@@ -363,7 +363,7 @@ export function makeTracker(dataFile: string, outFile: string): McpServer {
     ({ format, fields: only }) => {
       if (format === "json") return text(issues.map(({ comments: _, ...i }) => i));
       const cell = { number: (i: Issue) => String(i.number), title: (i: Issue) => `"${i.title.replace(/"/g, '""')}"`, state: (i: Issue) => i.state };
-      const wanted = (only as string[] | undefined)?.filter((f): f is keyof typeof cell => f in cell);
+      const wanted = (only as string[] | undefined)?.filter((f): f is keyof typeof cell => Object.hasOwn(cell, f));
       const columns = wanted?.length ? wanted : (Object.keys(cell) as (keyof typeof cell)[]);
       return text([columns.join(","), ...issues.map((i) => columns.map((c) => cell[c](i)).join(","))].join("\n"));
     },

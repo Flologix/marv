@@ -47,6 +47,10 @@ test("get_issue reads the data; add_comment runs unasked and appends to the out 
   const csv = await run("mcp__tracker__export_issues", { format: "csv", fields: ["number", "state"] });
   expect(csv.isError).toBeFalsy();
   expect(csv.output.split("\n")[0]).toBe("number,state");
+  // A name that's only inherited (not a column) is ignored like any unknown one.
+  const odd = await run("mcp__tracker__export_issues", { format: "csv", fields: ["__proto__", "toString", "number"] });
+  expect(odd.isError).toBeFalsy();
+  expect(odd.output.split("\n")[0]).toBe("number");
   expect(existsSync(out)).toBe(false);
   expect((await run("mcp__tracker__add_comment", { number: 7, body: "Added --json." })).isError).toBeFalsy();
   expect((await run("mcp__tracker__add_comment", { number: 99, body: "x" })).isError).toBe(true);
