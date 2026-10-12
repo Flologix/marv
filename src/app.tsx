@@ -1165,7 +1165,11 @@ export function App({
       const notes: NoticeItem[] = [];
       if (failed.length) notes.push({ text: `${failed.length} MCP server${failed.length === 1 ? "" : "s"} failed to start (see /mcp)`, detail: failed.map((s) => `${s.name}: ${s.error}`) });
       if (waiting.length)
-        notes.push({ text: `${waiting.length} MCP server${waiting.length === 1 ? "" : "s"} waiting for /mcp trust`, detail: waiting.map((s) => describeUntrusted(s)) });
+        notes.push({
+          text: `This project's .mcp.json lists ${waiting.length} MCP server${waiting.length === 1 ? "" : "s"} you haven't trusted yet`,
+          // The trust decision is the security gate (a cloned repository's .mcp.json could run anything): say what's at stake.
+          detail: [...waiting.map((s) => describeUntrusted(s)), "They'd run with your permissions, outside the sandbox. /mcp trust starts them."],
+        });
       addMessage({ role: "system", text: "", notice: { title: `MCP · ${failed.length + waiting.length} note${failed.length + waiting.length === 1 ? "" : "s"}`, tone: failed.length ? "error" : "warning", items: notes } });
     });
     return () => {

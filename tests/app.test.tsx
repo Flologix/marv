@@ -1368,7 +1368,8 @@ describe("MCP servers", () => {
     await tick(300);
     expect(lastFrame()).toContain("1 MCP server (/mcp)");
     expect(lastFrame()).toContain("MCP · 1 note");
-    expect(lastFrame()).toContain("1 MCP server waiting for /mcp trust");
+    expect(lastFrame()).toContain("lists 1 MCP server you haven't trusted yet");
+    expect(lastFrame()).toContain("outside the sandbox");
     expect(lastFrame()).toContain("test (");
     await type(stdin, "/mcp trust");
     for (let i = 0; i < 100 && !lastFrame()!.includes("test: connected"); i++) await tick();
