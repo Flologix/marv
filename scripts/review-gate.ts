@@ -136,6 +136,8 @@ for (const sha of new Set(commits)) {
   // A file ocr couldn't review is a review that didn't finish: it blocks, and the commit isn't cached as passed.
   if (result.warnings?.length) {
     console.error(`review-gate: ${result.warnings.length} file(s) couldn't be reviewed, so ${sha.slice(0, 8)} isn't passed; see \`ocr session list\`, then push again.`);
+    // What ocr said, so a passing glitch (a model timeout) can be told from a file it can't review at all.
+    for (const w of result.warnings) console.error(`  ${JSON.stringify(w).slice(0, 300)}`);
     failed = true;
     continue;
   }
