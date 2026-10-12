@@ -468,6 +468,15 @@ describe("bash's note about the blocked network", () => {
     expect(result.output).toContain("network: true");
   });
 
+  test.if(sandboxAvailable())("a failed gh command is pointed at the GitHub MCP server, not at logging in again (issue #27)", async () => {
+    const result = await bash.run({ command: "gh() { echo 'The token in default is invalid.'; return 1; }; gh auth status" }, { root, sandbox: true });
+    expect(result.output).toContain("don't suggest gh auth login");
+    expect(result.output).toContain("~/.marv/mcp.json");
+    // The note is for gh specifically: another network-shaped failure says only "retry with network".
+    const curl = await bash.run({ command: failing }, { root, sandbox: true });
+    expect(curl.output).not.toContain("gh auth login");
+  });
+
   test.if(sandboxAvailable())("isn't added when the command succeeded, had network, or wasn't found", async () => {
     expect((await bash.run({ command: "echo 'Could not resolve host: x'" }, { root, sandbox: true })).output).not.toContain("Marv: ");
     expect((await bash.run({ command: failing, network: true }, { root, sandbox: true })).output).not.toContain("Marv: ");

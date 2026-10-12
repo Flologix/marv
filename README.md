@@ -16,6 +16,7 @@ Marv is written in TypeScript on [Bun](https://bun.sh), with an [Ink](https://gi
 - **Any model.** OpenRouter or a local Ollama model, with a searchable model picker showing prices. Switch with `/model`.
 - **MCP servers.** Connect any [Model Context Protocol](https://modelcontextprotocol.io) server, local or remote, in `.mcp.json` or `~/.marv/mcp.json` (Claude Code's format). Its tools join Marv's; calls ask first unless the server marks a tool read-only, since servers run outside the sandbox. A project's servers only start once you trust them (`/mcp trust`). With many tools connected, the model sees only their names and loads a tool's parameters when it needs one, so they don't cost thousands of tokens on every request (`"mcpTools": "eager"` in the config sends them all).
 - **Skills.** Drop a `SKILL.md` into `.marv/skills/` (or `~/.marv/skills/`) and Marv loads it when a task matches, or run it yourself with `/<skill-name>`.
+- **GitHub through MCP.** Work with issues and pull requests through GitHub's official MCP server: the token stays out of the sandbox and the model's reach, read-only tools run without asking, writes show an approval prompt first. See [Connect GitHub](#connect-github).
 - **Subagents.** Marv can hand a task to a fresh agent with its own context, which reports back when it's done, so the files it read don't fill up the conversation. Several can run in parallel, each in its own git worktree if they change files. Click one to watch its own transcript live. Agent types are Markdown files, compatible with Claude Code's.
 - **Memory.** Marv remembers your preferences and project facts across sessions. Every change it makes to its memory needs your approval.
 - **Sessions.** Every conversation is saved; `marv -c` continues the last one, `/resume` picks an earlier one.
@@ -151,6 +152,44 @@ description: How to write release notes for this project. Use when asked for rel
 ```
 
 Put it in `.marv/skills/<name>/` (this project) or `~/.marv/skills/<name>/` (all projects). Only each skill's name and description go into the system prompt; Marv loads the full instructions when a request matches. A skill folder can also hold scripts and reference files. Write descriptions that name the task and when to use it: that's how the model decides.
+
+## Connect GitHub
+
+Marv can work with your GitHub repositories — issues, pull requests, Actions runs — through GitHub's official MCP server ([github/github-mcp-server](https://github.com/github/github-mcp-server)). It runs outside the sandbox with its own token, so the model never sees the token, read-only tools run without asking, and anything that changes something (a comment, a merge, a push) shows you an approval prompt first.
+
+**Why not just use the `gh` CLI?** `gh` needs the network and your GitHub token, and the command sandbox deliberately has neither: there is no network, the home folder is hidden (`~/.config/gh` included, since a token there could be printed into command output, which goes to the model provider), and the environment starts empty. That's why a `gh` command in a session fails even when you're logged in — and why you shouldn't "fix" it by mounting `~/.config/gh` into the sandbox. The MCP server is the supported path: same capability, without the token or the network inside the sandbox. (A `web_fetch` of a public GitHub page works without any setup; it just can't authenticate or act.)
+
+### Set it up
+
+1. Create a **fine-grained** personal access token ([github.com/settings/personal-access-tokens/new](https://github.com/settings/personal-access-tokens/new)): "Public repositories" or selected repositories only — the ones Marv should touch — with repository permissions `contents: read`, `issues: read`, `pull requests: read`, and `metadata: read` (selected automatically). Add the write permissions you want Marv to be able to use, e.g. `issues: write` and `pull requests: write` for comments and merging; every write still asks you first. Don't reuse the token the `gh` CLI uses (usually a classic one with full `repo` and `workflow` scope): a fine-grained token on a few repos limits the blast radius if something goes wrong.
+2. Make the token available where Marv reads MCP config, without putting it in the file: export `MARV_GITHUB_TOKEN` in your shell (e.g. in `~/.profile`).
+3. Write the server to `~/.marv/mcp.json` (yours, every project; for one project's `.mcp.json` instead, Marv asks you to trust it with `/mcp trust` before it starts):
+
+```json
+{ "mcpServers": { "github": {
+  "command": "docker",
+  "args": ["run", "-i", "--rm", "-e", "GITHUB_PERSONAL_ACCESS_TOKEN", "ghcr.io/github/github-mcp-server"],
+  "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "${MARV_GITHUB_TOKEN}" }
+} } }
+```
+
+   `${MARV_GITHUB_TOKEN}` reads the environment variable, so the token never lands in the file. Needs [Docker](https://docs.docker.com/get-started/get-docker/); without it, [build the server from source](https://github.com/github/github-mcp-server?tab=readme-ov-file#build-from-source) and point `command`/`args` at the binary (`["<path>", "stdio"]`).
+
+4. Restart Marv and check `/mcp`: the server should be listed with its tools. Try "list the open PRs in owner/repo" — that runs without an approval prompt (read-only), while "comment on PR 7" shows one first.
+
+The official server registers dozens of tools. With many connected, Marv offers the model only their names and loads a tool's parameters when it needs one, so you don't have to trim — but limiting the toolsets still gives a small model a shorter list to choose from. The server takes `GITHUB_TOOLSETS` (or `--toolsets`), for example `default,actions` — the default is already `context`, `repos`, `issues`, `pull_requests`, `users`, which covers most issues/PR work; `GITHUB_TOOLSETS` wins when both are set:
+
+```json
+{ "mcpServers": { "github": {
+  "command": "docker",
+  "args": ["run", "-i", "--rm", "-e", "GITHUB_PERSONAL_ACCESS_TOKEN", "-e", "GITHUB_TOOLSETS", "ghcr.io/github/github-mcp-server"],
+  "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "${MARV_GITHUB_TOKEN}", "GITHUB_TOOLSETS": "default,actions" }
+} } }
+```
+
+To run it strictly read-only, add `"GITHUB_READ_ONLY": "1"` to that env object (`-e GITHUB_READ_ONLY` in args): the server then offers no write tools at all, so merging or commenting is impossible rather than merely approved.
+
+Copy the ready-made `github` skill into your personal skills to teach Marv the workflow: `mkdir -p ~/.marv/skills && cp -r examples/skills/github ~/.marv/skills/` (from a clone of this repository; the skill is [`examples/skills/github/SKILL.md`](examples/skills/github/SKILL.md)). It tells Marv to use the MCP tools instead of `gh`, to follow the branch → PR → merge-commit workflow, and never to ask for or print tokens.
 
 ## Agents
 
