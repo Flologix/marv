@@ -9,7 +9,7 @@
 //   2 — stopped: max steps, output limit, or loop (no final answer)
 //   3 — approval needed but couldn't get it (refused or declined/interrupted)
 import { ConfigError, ConfigStore, defaultConfigDir, migrateLegacyConfig, resolveConfig } from "./config/config.ts";
-import { createSession, type SessionEvent, type ApprovalRequest, type Decision } from "./sdk.ts";
+import { createSession, type SessionEvent, type ApprovalRequest, type Decision, type ProviderOption } from "./sdk.ts";
 import { TrajectoryStore } from "./trajectory.ts";
 
 export type OutputFormat = "text" | "json" | "stream-json";
@@ -139,12 +139,18 @@ export async function runHeadless(options: HeadlessOptions): Promise<number> {
   // Trajectories store: respect the config.trajectories setting.
   const trajectories: boolean | TrajectoryStore = config.trajectories;
 
+  // The SDK takes each provider's own options: Ollama's endpoint is `host` and it has a context length.
+  const provider: ProviderOption =
+    config.provider === "ollama"
+      ? { kind: "ollama", model: config.model, host: config.baseUrl, contextLength: config.contextLength }
+      : { kind: "openrouter", apiKey: config.apiKey ?? "", model: config.model, baseUrl: config.baseUrl };
+
   // Wrap createSession so a missing API key or bad config exits cleanly (no stack trace).
   let session: Awaited<ReturnType<typeof createSession>>;
   try {
     session = await createSession({
       cwd: root,
-      provider: { kind: config.provider, apiKey: config.apiKey ?? "", model: config.model, baseUrl: config.baseUrl },
+      provider,
       sources: ["user", "project"],
       approve,
       maxSteps,
@@ -192,6 +198,21 @@ async function collectAndOutput(
 
   const NO_APPROVER = "needs the user's approval, and there's no one to ask.";
 
+  /** Detect a refused call (no approver, or the user said no) and list it once. */
+  const noteRefused = (event: Extract<SessionEvent, { type: "tool_end" }>) => {
+    const { result } = event;
+    if (!(result.output.includes(NO_APPROVER) || result.approval === "no" || result.declined)) return;
+    const tool = event.call.name;
+    const label = result.label ?? tool;
+    const key = refusedCallKey({ tool, label });
+    if (seenRefused.has(key)) return;
+    seenRefused.add(key);
+    refused.push({ tool, label });
+  };
+
+  // With -c the session's totals include the resumed conversation's: the turn's usage is what this turn added.
+  const before = { ...session.usage().totals };
+
   for await (const event of session.send(options.prompt)) {
     allEvents.push(event);
 
@@ -221,19 +242,15 @@ async function collectAndOutput(
           process.stdout.write(line);
         }
         break;
+      case "subagent":
+        // A subagent's calls are the turn's work too: one refused there may be missing from its report.
+        if (event.event.type === "tool_end") noteRefused(event.event);
+        break;
       case "tool_end": {
         const tool = event.call.name;
         const label = event.result.label ?? event.call.name;
         const output = event.result.output;
-        // Detect a refused call: no approver, or the user said no.
-        const isRefused = output.includes(NO_APPROVER) || event.result.approval === "no" || event.result.declined;
-        if (isRefused) {
-          const key = refusedCallKey({ tool, label });
-          if (!seenRefused.has(key)) {
-            seenRefused.add(key);
-            refused.push({ tool, label });
-          }
-        }
+        noteRefused(event);
         if (format === "stream-json") {
           const line = JSON.stringify({
             type: "tool_end",
@@ -332,13 +349,13 @@ async function collectAndOutput(
   // Usage: the turn's totals (what was added across the whole turn), not just the last request.
   const usageInfo = session.usage();
   const totals = usageInfo.totals;
-  const hasRequests = totals.requests > 0;
+  const hasRequests = totals.requests > before.requests;
   const usageObj = hasRequests
     ? {
-        promptTokens: totals.promptTokens,
-        cachedTokens: totals.cachedTokens,
-        completionTokens: totals.completionTokens,
-        cost: totals.cost ?? 0,
+        promptTokens: totals.promptTokens - before.promptTokens,
+        cachedTokens: totals.cachedTokens - before.cachedTokens,
+        completionTokens: totals.completionTokens - before.completionTokens,
+        cost: (totals.cost ?? 0) - (before.cost ?? 0),
       }
     : undefined;
 

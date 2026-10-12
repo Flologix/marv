@@ -323,3 +323,118 @@ describe("CLI: spawning bun src/cli.tsx -p", () => {
     expect(stderr).toContain("nonexistent");
   });
 });
+describe("CLI: Greptile's findings on #45", () => {
+  let server: ReturnType<typeof Bun.serve> | undefined;
+  afterEach(() => server?.stop(true));
+
+  /** Each chat request gets the next response (the last repeats); `requests` keeps every chat request's body. */
+  const requests: Record<string, unknown>[] = [];
+  beforeEach(() => void (requests.length = 0));
+  function scripted(...responses: unknown[][]) {
+    let n = 0;
+    server = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        if (!new URL(req.url).pathname.endsWith("/chat/completions")) return Response.json({ data: [] });
+        requests.push((await req.json()) as Record<string, unknown>);
+        const events = [...responses[Math.min(n++, responses.length - 1)]!, "[DONE]"];
+        return new Response(events.map((e) => `data: ${typeof e === "string" ? e : JSON.stringify(e)}\n\n`).join(""), {
+          headers: { "content-type": "text/event-stream" },
+        });
+      },
+    });
+    return `http://localhost:${server.port}/v1`;
+  }
+  const delta = (content: string) => ({ choices: [{ delta: { content } }] });
+  const finish = (reason: string) => ({ choices: [{ delta: {}, finish_reason: reason }] });
+  const callChunk = (id: string, name: string, args: unknown) => ({
+    choices: [{ delta: { tool_calls: [{ index: 0, id, type: "function", function: { name, arguments: JSON.stringify(args) } }] } }],
+  });
+
+  async function writeConfig(cfg: Record<string, unknown>): Promise<void> {
+    await writeFile(join(configDir, "config.json"), JSON.stringify(cfg, null, 2) + "\n");
+  }
+  const openrouter = (baseUrl: string, overrides: Record<string, unknown> = {}) =>
+    writeConfig({ provider: "openrouter", model: "test-model", apiKey: "sk-test", baseUrl, ...overrides });
+
+  async function runCli(args: string[]): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+    const proc = Bun.spawn({
+      cmd: [process.execPath, join(import.meta.dir, "..", "src", "cli.tsx"), ...args],
+      env: { ...process.env, MARV_CONFIG_DIR: configDir, NO_COLOR: "1" },
+      cwd: root,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+    return { stdout, stderr, exitCode };
+  }
+
+  test("with --approve, the step limit still stops: no one can say 'keep going'", async () => {
+    const url = scripted([callChunk("c1", "read_file", { path: "." }), finish("tool_calls")]);
+    await openrouter(url);
+    const { stdout, stderr, exitCode } = await runCli(["-p", "loop", "--approve", "files", "--max-steps", "2", "--output", "json"]);
+    expect(exitCode).toBe(2);
+    expect(JSON.parse(stdout).reason).toBe("max_steps");
+    expect(requests).toHaveLength(2);
+    expect(stderr).toContain("without a final answer");
+  });
+
+  test("a configured Ollama host and context length reach the provider", async () => {
+    const bodies: Record<string, unknown>[] = [];
+    server = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        const path = new URL(req.url).pathname;
+        if (path === "/api/show") return Response.json({ model_info: { "llama.context_length": 131072 } });
+        if (path !== "/api/chat") return Response.json({ models: [] });
+        bodies.push((await req.json()) as Record<string, unknown>);
+        const lines = [{ message: { role: "assistant", content: "Hi from Ollama." }, done: false }, { done: true, done_reason: "stop", prompt_eval_count: 5, eval_count: 3 }];
+        return new Response(lines.map((l) => JSON.stringify(l) + "\n").join(""));
+      },
+    });
+    await writeConfig({ provider: "ollama", model: "m", baseUrl: `http://localhost:${server.port}`, contextLength: 4096 });
+    const { stdout, stderr, exitCode } = await runCli(["-p", "hi"]);
+    expect({ exitCode, stderr }).toMatchObject({ exitCode: 0 });
+    expect(stdout).toContain("Hi from Ollama.");
+    expect((bodies[0]!.options as { num_ctx: number }).num_ctx).toBe(4096);
+  });
+
+  test("a call refused inside a subagent counts: exit 3 and it's listed", async () => {
+    const url = scripted(
+      [callChunk("a1", "agent", { type: "general-purpose", description: "write it", prompt: "write x.txt" }), finish("tool_calls")],
+      [callChunk("w1", "write_file", { path: "x.txt", content: "hi" }), finish("tool_calls")],
+      [delta("All went fine."), finish("stop")],
+      [delta("Done."), finish("stop")],
+    );
+    await openrouter(url, { yolo: false });
+    const { stdout, exitCode } = await runCli(["-p", "write x.txt with a subagent", "--output", "json"]);
+    expect(exitCode).toBe(3);
+    expect(JSON.parse(stdout)).toMatchObject({ reason: "end", reply: "Done.", refused: [{ tool: "write_file" }] });
+    expect(existsSync(join(root, "x.txt"))).toBe(false);
+  });
+
+  test("with -c, usage is this turn's, not the resumed session's totals", async () => {
+    const usage = { choices: [], usage: { prompt_tokens: 100, completion_tokens: 10, cost: 0.01 } };
+    const url = scripted([delta("Hello."), finish("stop"), usage]);
+    await openrouter(url);
+    const first = await runCli(["-p", "hi", "--output", "json"]);
+    expect(JSON.parse(first.stdout).usage).toMatchObject({ promptTokens: 100, completionTokens: 10, cost: 0.01 });
+    const second = await runCli(["-p", "again", "-c", "--output", "json"]);
+    expect(second.exitCode).toBe(0);
+    expect(requests).toHaveLength(2);
+    // The resumed conversation went along (so it really continued), but only this turn's request is counted.
+    expect(JSON.stringify(requests[1]!.messages)).toContain("Hello.");
+    expect(JSON.parse(second.stdout).usage).toMatchObject({ promptTokens: 100, completionTokens: 10, cost: 0.01 });
+  });
+
+  for (const bad of ["abc", "-1", "2.5"]) {
+    test(`--max-steps ${bad} is refused, not replaced by the saved limit`, async () => {
+      const url = scripted([delta("Hello."), finish("stop")]);
+      await openrouter(url);
+      const { stderr, exitCode } = await runCli(["-p", "hi", "--max-steps", bad]);
+      expect(exitCode).toBe(1);
+      expect(stderr).toContain("--max-steps");
+      expect(requests).toHaveLength(0);
+    });
+  }
+});
