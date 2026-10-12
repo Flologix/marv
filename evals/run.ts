@@ -20,6 +20,7 @@ import { appendFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "./args.ts";
+import { copyFresh, writeFresh } from "./files.ts";
 import { defaultConfigDir } from "../src/config/config.ts";
 import { sandboxAvailable } from "../src/sandbox.ts";
 import { createSession, type McpServerEntry } from "../src/sdk.ts";
@@ -67,7 +68,7 @@ function workspace(task: string, ...extra: string[]): string {
 
 /** Copies the hidden check in and runs it (sandboxed, like the agent's own commands). */
 async function check(dir: string, task: string): Promise<{ pass: boolean; output: string }> {
-  cpSync(join(TASKS, task, "check"), dir, { recursive: true });
+  copyFresh(join(TASKS, task, "check"), dir); // after the model: a planted symlink must not be written through
   const result = await runCommand({ command: `${CHECK} 2>&1`, root: dir, sandbox: sandboxAvailable(), network: false, timeoutMs: 60_000 });
   return { pass: result.exitCode === 0, output: result.output };
 }
@@ -235,7 +236,7 @@ async function runOne({ model, task, rep }: { model: string; task: string; rep: 
     }
     if (timedOut) result.reason = "timeout";
     // What the tracker recorded, over anything the model wrote under that name itself.
-    if (tracker) writeFileSync(join(dir, COMMENTS), existsSync(comments) ? readFileSync(comments) : "[]");
+    if (tracker) writeFresh(join(dir, COMMENTS), existsSync(comments) ? readFileSync(comments) : "[]");
     const checked = await check(dir, task);
     result.pass = checked.pass;
     if (!checked.pass) result.checkOutput = short(checked.output.slice(-2000), 2000);

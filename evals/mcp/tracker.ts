@@ -82,7 +82,13 @@ export function makeTracker(dataFile: string, outFile: string): McpServer {
     server.registerTool(name, { description, inputSchema: read ? { ...inputSchema, fields } : inputSchema, annotations }, async (args) => {
       const result = run(args as Record<string, unknown>);
       const only = (args as { fields?: string[] }).fields;
-      return read && only?.length && !("isError" in result) ? text(pick(JSON.parse(result.content[0]!.text), only)) : result;
+      // A JSON answer is picked here; a tool that answers in another format (export_issues' CSV) picks its own.
+      if (!read || !only?.length || "isError" in result) return result;
+      try {
+        return text(pick(JSON.parse(result.content[0]!.text), only));
+      } catch {
+        return result;
+      }
     });
   };
 
@@ -354,10 +360,13 @@ export function makeTracker(dataFile: string, outFile: string): McpServer {
     "Export the project's issues as CSV or JSON, descriptions included. Large projects produce large exports: prefer list_issues or search_issues to find something.",
     { format: z.enum(["csv", "json"]).describe("The export's format."), state: z.enum(["open", "closed", "all"]).optional().describe("Which issues (default all)."), project },
     READ,
-    ({ format }) =>
-      format === "json"
-        ? text(issues.map(({ comments: _, ...i }) => i))
-        : text(["number,title,state", ...issues.map((i) => `${i.number},"${i.title.replace(/"/g, '""')}",${i.state}`)].join("\n")),
+    ({ format, fields: only }) => {
+      if (format === "json") return text(issues.map(({ comments: _, ...i }) => i));
+      const cell = { number: (i: Issue) => String(i.number), title: (i: Issue) => `"${i.title.replace(/"/g, '""')}"`, state: (i: Issue) => i.state };
+      const wanted = (only as string[] | undefined)?.filter((f): f is keyof typeof cell => f in cell);
+      const columns = wanted?.length ? wanted : (Object.keys(cell) as (keyof typeof cell)[]);
+      return text([columns.join(","), ...issues.map((i) => columns.map((c) => cell[c](i)).join(","))].join("\n"));
+    },
   );
   return server;
 }

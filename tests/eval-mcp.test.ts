@@ -43,6 +43,10 @@ test("get_issue reads the data; add_comment runs unasked and appends to the out 
   const run = (name: string, args: unknown) => runTool({ id: name, name, arguments: JSON.stringify(args) }, { root: dir }, m.tools);
   expect((await run("mcp__tracker__get_issue", { number: 12 })).output).toContain("negative step");
   expect(JSON.parse((await run("mcp__tracker__get_issue", { number: 12, fields: ["number", "state"] })).output)).toEqual({ number: 12, state: "open" });
+  // A CSV answer isn't JSON: fields picks its columns.
+  const csv = await run("mcp__tracker__export_issues", { format: "csv", fields: ["number", "state"] });
+  expect(csv.isError).toBeFalsy();
+  expect(csv.output.split("\n")[0]).toBe("number,state");
   expect(existsSync(out)).toBe(false);
   expect((await run("mcp__tracker__add_comment", { number: 7, body: "Added --json." })).isError).toBeFalsy();
   expect((await run("mcp__tracker__add_comment", { number: 99, body: "x" })).isError).toBe(true);
