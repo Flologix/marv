@@ -70,10 +70,9 @@ bun link                    # (once) puts `marv` on PATH (bin/marv → src/cli.t
 
 ## Code review (Open Code Review)
 
-Every push and every PR is reviewed by [Open Code Review](https://github.com/alibaba/open-code-review) (`ocr`), whoever wrote the change:
+Every push is reviewed locally by [Open Code Review](https://github.com/alibaba/open-code-review) (`ocr`, model and key in `~/.opencodereview/config.json`; currently OpenRouter's `glm-5.3-flash` with `extra_body: {"reasoning":{"effort":"low"}}`, since its default reasoning ran past ocr's 300 s request timeout), whoever wrote the change. PRs are reviewed on GitHub by Greptile; an OCR workflow for PRs is on the `ci/ocr-review` branch for later.
 
-- **Before pushing**: `.githooks/pre-push` (on after `bun install`) runs `bun run review` on each pushed commit against `origin/main`. A critical or high-severity finding refuses the push. Read the findings it prints, fix them, commit, and push again. Run `bun run review` yourself first to see them sooner. Don't bypass it with `--no-verify`; if a finding is wrong, say why in the PR description.
-- **On the PR**: the `OCR review` workflow posts inline comments and a summary, and fails the check while critical/high findings remain. Read them with `gh pr view <n> --comments` and `gh api repos/FlologixAI/marv/pulls/<n>/comments`, fix, and push.
+- **Before pushing**: `.githooks/pre-push` (on after `bun install`) runs `bun run review` on each pushed commit against `origin/main`. A critical or high-severity finding refuses the push. The gate fails closed: a review that didn't finish, unreadable output, or a finding with an unknown severity also blocks. `bun install` turns the hook on only when `core.hooksPath` isn't already set and not in CI. Read the findings it prints, fix them, commit, and push again. Run `bun run review` yourself first to see them sooner. Don't bypass it with `--no-verify`; if a finding is wrong, say why in the PR description.
 
 ## Conventions
 

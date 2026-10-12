@@ -44,7 +44,7 @@
     "eval": "bun evals/run.ts",
     "release:build": "bun scripts/release.ts",
     "review": "bun scripts/review-gate.ts",
-    "prepare": "git config core.hooksPath .githooks || true"
+    "prepare": "test -n \"$CI\" || test -n \"$(git config core.hooksPath)\" || git config core.hooksPath .githooks"
   },
   "dependencies": {
     "@babel/parser": "^7.29.9",

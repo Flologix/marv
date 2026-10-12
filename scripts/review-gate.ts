@@ -12,31 +12,52 @@
 // stdin, and each pushed commit is reviewed against origin/main.
 //
 // Needs `ocr` on PATH (`npm i -g @alibaba-group/open-code-review`) and a
-// configured model (`ocr config provider`, or OPENROUTER_API_KEY with
-// `ocr config set providers.openrouter...`). Skip once with `git push --no-verify`.
+// configured model in ~/.opencodereview/config.json (`ocr config provider`).
+// Skip once with `git push --no-verify`.
+//
+// It fails closed: a review that didn't run, didn't finish, or printed
+// something unreadable blocks the push, as does a finding whose severity it
+// doesn't know.
 import { spawnSync } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 type Finding = { path: string; start_line?: number; end_line?: number; content: string; severity?: string; category?: string };
-type Result = { status: string; message?: string; comments: Finding[]; warnings?: unknown[] };
+type Result = { status?: string; message?: string; comments?: Finding[] | null; warnings?: unknown[] };
+
+const SEVERITIES = ["critical", "high", "medium", "low"];
+
+const fail = (message: string): never => {
+  console.error(`review-gate: ${message}`);
+  process.exit(1);
+};
 
 // --- Command-line arguments ---
 const args = process.argv.slice(2);
 const option = (name: string, fallback: string): string => {
   const at = args.indexOf(name);
-  return at >= 0 ? args.splice(at, 2)[1] ?? fallback : fallback;
+  if (at < 0) return fallback;
+  const value = args[at + 1];
+  if (!value || value.startsWith("--")) fail(`${name} needs a value`);
+  args.splice(at, 2);
+  return value!;
 };
 const base = option("--base", "origin/main");
 const blocking = new Set(option("--block", "critical,high").split(","));
+for (const s of blocking) if (!SEVERITIES.includes(s)) fail(`unknown severity "${s}" in --block (use ${SEVERITIES.join(", ")})`);
 const prePush = args.includes("--pre-push");
 
-const git = (...a: string[]): string => spawnSync("git", a, { encoding: "utf8" }).stdout.trim();
+const git = (...a: string[]): string => {
+  const run = spawnSync("git", a, { encoding: "utf8" });
+  if (run.status !== 0) fail(`git ${a.join(" ")} failed: ${run.stderr.trim()}`);
+  return run.stdout.trim();
+};
 
 // --- Which commits to review ---
 // From the hook: every pushed ref, except deletions (all-zero sha) and tags.
 // Otherwise: HEAD.
 const ZERO = /^0+$/;
+if (prePush && process.stdin.isTTY) fail("--pre-push reads the pushed refs from stdin; git's pre-push hook passes them");
 const commits = prePush
   ? readFileSync(0, "utf8")
       .split("\n")
@@ -45,19 +66,22 @@ const commits = prePush
       .map(([, localSha]) => localSha!)
   : [git("rev-parse", "HEAD")];
 
+if (spawnSync("ocr", ["--version"]).error) {
+  fail("`ocr` isn't installed. Install it with `npm i -g @alibaba-group/open-code-review`, then `ocr config provider`.");
+}
+
 // --- Already-passed commits ---
 // A commit that passed once passes again: pushing it a second time (a retry, a
-// push to another remote) doesn't pay for a second review. The list lives in the
-// shared .git folder, so every worktree sees it.
+// push to another remote) doesn't pay for a second review. The key holds the
+// commit, where base was then (by sha, so a moved base reviews again), the
+// blocking severities and ocr's version. The list lives in the shared .git
+// folder, so every worktree sees it; a lost line under concurrent pushes only
+// costs a second review.
+const ocrVersion = spawnSync("ocr", ["--version"], { encoding: "utf8" }).stdout.trim();
 const cacheDir = join(git("rev-parse", "--path-format=absolute", "--git-common-dir"), "ocr-review");
 const passedFile = join(cacheDir, "passed");
 const passed = new Set(existsSync(passedFile) ? readFileSync(passedFile, "utf8").split("\n") : []);
-const key = (sha: string) => `${sha} ${base} ${[...blocking].sort().join(",")}`;
-
-if (spawnSync("ocr", ["--version"]).error) {
-  console.error("review-gate: `ocr` isn't installed. Install it with `npm i -g @alibaba-group/open-code-review`, then `ocr config provider`.");
-  process.exit(1);
-}
+const key = (sha: string) => `${sha} ${git("merge-base", base, sha)} ${[...blocking].sort().join(",")} ${ocrVersion}`;
 
 let failed = false;
 for (const sha of new Set(commits)) {
@@ -69,15 +93,22 @@ for (const sha of new Set(commits)) {
     encoding: "utf8",
     maxBuffer: 64 * 1024 * 1024,
   });
-  if (run.status !== 0) {
+  let result: Result | undefined;
+  try {
+    result = JSON.parse(run.stdout) as Result;
+  } catch {
+    // handled below: no result is a failed review
+  }
+  if (run.status !== 0 || !result || result.status !== "complete") {
     // Fail closed: a review that didn't run isn't a review that passed.
-    console.error(`review-gate: ocr failed (exit ${run.status}):\n${run.stderr.trim()}`);
+    console.error(`review-gate: ocr failed (exit ${run.status}, status ${result?.status ?? "unreadable"}):\n${run.stderr.trim()}`);
     failed = true;
     continue;
   }
-  const result = JSON.parse(run.stdout) as Result;
   const findings = result.comments ?? [];
-  const blockers = findings.filter((f) => blocking.has(f.severity ?? ""));
+  // An unknown severity blocks: the gate shouldn't pass what it can't rank.
+  const blocks = (f: Finding) => blocking.has(f.severity ?? "") || !SEVERITIES.includes(f.severity ?? "");
+  const blockers = findings.filter(blocks);
 
   // Every finding is printed, blocking ones first, in a form an agent can act
   // on: where it is, how bad it is, and what to change.
@@ -90,7 +121,7 @@ for (const sha of new Set(commits)) {
 
   if (blockers.length) {
     console.error(
-      `\nreview-gate: ${blockers.length} ${[...blocking].join("/")} finding(s) in ${sha.slice(0, 8)}. ` +
+      `\nreview-gate: ${blockers.length} blocking finding(s) in ${sha.slice(0, 8)} (${[...blocking].join("/")}, or unranked). ` +
         "Fix them (or explain in the PR why they're wrong) and push again.",
     );
     failed = true;
