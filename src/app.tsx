@@ -931,6 +931,10 @@ export function App({
       outcome = await busyWith(`Looking up ${printable(options.source)}…`, async (signal): Promise<Outcome> => {
         const resolved = await (resolveMcp ?? ((o, s) => resolveAdd(o, liveDeps(env, s))))(options, signal);
         if ("choices" in resolved) return resolved;
+        // Removed in this conversation: its tools stay listed until /clear, so it can't come back yet (McpManager.add).
+        if (mcp?.status().some((s) => s.name === resolved.name && s.state === "removed")) {
+          throw new Error(`"${resolved.name}" was removed in this conversation and its tools stay listed until the next one: /clear first, or pick another --name.`);
+        }
         if ((await personalServerNames(configDir)).includes(resolved.name)) {
           throw new Error(`You already have a server named "${resolved.name}": pick another with --name, or /mcp remove ${resolved.name} first.`);
         }

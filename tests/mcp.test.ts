@@ -334,6 +334,43 @@ describe("adding and removing servers while running (/mcp add, /mcp remove)", ()
     expect(m.status()).toEqual([]);
   });
 
+  test("a server removed while it's still connecting stays removed, and isn't left running", async () => {
+    const m = manager([]);
+    const adding = m.add(stdio("quick"));
+    // remove() while connect() is in flight: the race OCR found through trustAll's window.
+    await Promise.resolve();
+    const removing = m.remove("quick").catch(() => {});
+    await Promise.all([adding, removing]);
+    const state = m.status().find((s) => s.name === "quick")?.state;
+    expect(state === "removed" || state === undefined).toBe(true);
+    if (state === "removed") {
+      const { result } = await call(m, "mcp__quick__echo", { text: "hi" });
+      expect(result.isError).toBe(true);
+    }
+  });
+
+  test("connect() never marks a server removed meanwhile as connected", async () => {
+    const m = manager([]);
+    // Drive the private path directly: a connection marked removed before its connect finishes.
+    const c = { config: stdio("late"), state: "connecting", tools: [], stderr: [] } as never as { state: string };
+    (m as never as { connections: unknown[] }).connections.push(c);
+    const connecting = (m as never as { connect(c: unknown): Promise<void> }).connect(c);
+    c.state = "removed";
+    await connecting;
+    expect(c.state).toBe("removed");
+  });
+
+  test("a server removed in this conversation can't be added again until the next one (its tools stay listed)", async () => {
+    const m = manager([]);
+    await m.add(stdio("again"));
+    const specs = [...m.specs];
+    await m.remove("again");
+    await expect(m.add(stdio("again"))).rejects.toThrow(/removed in this conversation/);
+    expect(m.specs).toEqual(specs);
+    m.forgetRemoved();
+    expect((await m.add(stdio("again"))).state).toBe("connected");
+  });
+
   test("close() after add stops it", async () => {
     const m = manager([]);
     await m.add(stdio("x"));

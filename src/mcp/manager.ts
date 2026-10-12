@@ -100,22 +100,28 @@ export class McpManager {
    */
   async add(config: McpServerConfig): Promise<McpServerStatus> {
     if (this.closed) throw new Error("Marv is closing.");
-    if (this.connections.some((c) => c.config.name === config.name && c.state !== "removed")) {
-      throw new Error(`There's already an MCP server named "${config.name}".`);
+    const same = this.connections.find((c) => c.config.name === config.name);
+    // A server removed in this conversation keeps its tools listed (the list can't shrink under it), and the new
+    // one's tools would take the same names: it can come back in the next conversation.
+    if (same?.state === "removed") {
+      throw new Error(`"${config.name}" was removed in this conversation and its tools stay listed until the next one: /clear first, or pick another --name.`);
     }
-    // A server removed earlier this session: its stale tools make way for the new one's.
-    this.connections = this.connections.filter((c) => c.config.name !== config.name);
+    if (same) throw new Error(`There's already an MCP server named "${config.name}".`);
     const c: Connection = { config, state: "connecting", tools: [], stderr: [] };
     this.connections.push(c);
     const before = this.ready;
     this.settled = false;
-    this.ready = (async () => {
+    // Declared first: the wait below compares itself with this.ready once it's done.
+    let ready: Promise<void> | undefined = undefined;
+    ready = (async () => {
       await before;
       await this.connect(c);
       this.rebuild();
-      this.settled = true;
+      // Only the latest wait says the servers have settled: another add() may have started meanwhile.
+      if (this.ready === ready) this.settled = true;
     })();
-    await this.ready;
+    this.ready = ready;
+    await ready;
     return this.status().find((s) => s.name === config.name)!;
   }
 
@@ -258,6 +264,12 @@ export class McpManager {
       };
       // A tool listed twice (a server repeating a page) is still one tool.
       const unique = [...new Map(infos.map((info) => [info.name, info])).values()];
+      // Removed (/mcp remove) while this was connecting: it stays removed, and the server it started is stopped.
+      if ((c.state as Connection["state"]) === "removed") {
+        await client.close().catch(() => {});
+        this.onChange();
+        return;
+      }
       c.tools = unique.map((info) => makeMcpTool(c.config, info, call));
       c.state = "connected";
       // A server that exits later: its tools stay listed (the specs can't change), and calls fail with a clear error.
@@ -269,8 +281,10 @@ export class McpManager {
         }
       };
     } catch (err) {
-      c.state = "failed";
-      c.error = err instanceof Error ? err.message : String(err);
+      if ((c.state as Connection["state"]) !== "removed") {
+        c.state = "failed";
+        c.error = err instanceof Error ? err.message : String(err);
+      }
       await c.transport?.close().catch(() => {});
     }
     this.onChange();
