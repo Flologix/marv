@@ -8,7 +8,8 @@
 // Keyed by owner too: your servers share one login per URL across projects, while a project's server gets its own,
 // per project. Trusting a project's .mcp.json means "run this server", not "act as my account": a repository that
 // names your server's URL must not get your login by the trust you gave it for something else.
-import { closeSync, existsSync, openSync, statSync, unlinkSync, writeSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { closeSync, existsSync, linkSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import { z } from "zod";
@@ -59,6 +60,39 @@ export class UnusableTokenStore extends Error {
  * the lock (atomic on every local filesystem); a lock whose mtime is older than STALE_LOCK_MS is a crashed
  * process's and is taken over.
  */
+/**
+ * Removes the lock at `lock` only if it is still the one whose content was judged stale. It's renamed aside first
+ * (atomic: of several waiters, one gets it), then its content is compared: a lock created after the staleness check
+ * (another waiter took over and a process created a fresh one) is put back, not destroyed.
+ */
+export function takeOverStale(lock: string, staleContent: string): boolean {
+  const aside = `${lock}.${randomBytes(6).toString("hex")}`;
+  try {
+    renameSync(lock, aside);
+  } catch {
+    return false; // gone already, or another waiter moved it: try again
+  }
+  let content = "";
+  try {
+    content = readFileSync(aside, "utf8");
+  } catch {
+    // unreadable: treat as not the stale one
+  }
+  if (content === staleContent) {
+    unlinkSync(aside);
+    return true;
+  }
+  // A fresh lock was moved by mistake: put it back where its owner expects it (link fails if a new one appeared,
+  // in which case that one stands and this one is released).
+  try {
+    linkSync(aside, lock);
+  } catch {
+    // another lock exists now
+  }
+  unlinkSync(aside);
+  return false;
+}
+
 async function withFileLock<T>(path: string, fn: () => Promise<T>): Promise<T> {
   const lock = `${path}.lock`;
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
@@ -66,15 +100,17 @@ async function withFileLock<T>(path: string, fn: () => Promise<T>): Promise<T> {
   for (;;) {
     try {
       const fd = openSync(lock, "wx", 0o600);
-      writeSync(fd, String(process.pid));
+      // A token unique to this hold: a takeover checks it, so it never removes a lock created after its check.
+      writeSync(fd, `${process.pid} ${randomBytes(9).toString("hex")}`);
       closeSync(fd);
       break;
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
     }
     try {
-      // Known limit: two waiters that both find it stale can race here (one may remove the other's fresh lock).
-      if (Date.now() - statSync(lock).mtimeMs > STALE_LOCK_MS) unlinkSync(lock);
+      // The content first, then the age: if a fresh lock replaces the stale one in between, the content won't match.
+      const seen = readFileSync(lock, "utf8");
+      if (Date.now() - statSync(lock).mtimeMs > STALE_LOCK_MS) takeOverStale(lock, seen);
     } catch {
       // released meanwhile: try again
     }
