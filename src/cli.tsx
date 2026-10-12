@@ -19,6 +19,7 @@ import { SessionStore } from "./sessions.ts";
 import { TrajectoryStore } from "./trajectory.ts";
 import { loadMcpConfig } from "./mcp/config.ts";
 import { McpManager } from "./mcp/manager.ts";
+import { McpTokenStore } from "./mcp/oauth-store.ts";
 import { McpTrust } from "./mcp/trust.ts";
 import { loadMemory, memoryPaths } from "./memory.ts";
 import { renderOptions } from "./render-options.ts";
@@ -154,7 +155,13 @@ const { agents, problems: agentProblems } = await loadAgents({ root, home: homed
 // MCP servers start now, in the background; the first request waits for them (see McpManager). Always a manager,
 // even with no servers, so /mcp add can start the first one without a restart.
 const { servers: mcpServers, problems: mcpProblems } = await loadMcpConfig({ root, configDir: defaultConfigDir(process.env), env: process.env });
-const mcp = new McpManager(mcpServers, { root, version: pkg.version, trust: new McpTrust(join(defaultConfigDir(process.env), "mcp-trust.json")) });
+const mcp = new McpManager(mcpServers, {
+  root,
+  version: pkg.version,
+  trust: new McpTrust(join(defaultConfigDir(process.env), "mcp-trust.json")),
+  // OAuth logins (/mcp login), shared with marv -p and SDK sessions using the same config folder.
+  logins: new McpTokenStore(join(defaultConfigDir(process.env), "mcp-tokens.json")),
+});
 void mcp.start();
 // Local servers must not outlive Marv, however it exits.
 process.on("exit", () => mcp.kill());

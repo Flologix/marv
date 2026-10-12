@@ -5,7 +5,8 @@ import { get } from "../../tools/web/fetch.ts";
 import { fetchReadme } from "../../tools/web/github.ts";
 import { resolveGithub } from "./github.ts";
 import { resolveNpm } from "./npm.ts";
-import { httpProposal, type Choices, type Proposal, type ResolveDeps } from "./proposal.ts";
+import { fact, httpProposal, type Choices, type Proposal, type ResolveDeps } from "./proposal.ts";
+import { probeLogin } from "../oauth.ts";
 import { resolvePypi } from "./pypi.ts";
 import { resolveRegistry } from "./registry.ts";
 import { parseSource, serverName, type AddOptions } from "./source.ts";
@@ -13,6 +14,23 @@ import { parseSource, serverName, type AddOptions } from "./source.ts";
 export type Resolved = Proposal | Choices;
 
 export async function resolveAdd(options: AddOptions, deps: ResolveDeps): Promise<Resolved> {
+  const resolved = await resolveSource(options, deps);
+  return "choices" in resolved ? resolved : withLoginFact(resolved, deps);
+}
+
+/**
+ * A remote server that asks for an OAuth login (#18) says so in the approval, so "added" isn't mistaken for "working".
+ * Not one with its own Authorization header: that's how it logs in.
+ */
+async function withLoginFact(proposal: Proposal, deps: ResolveDeps): Promise<Proposal> {
+  const { entry } = proposal;
+  if (!("url" in entry) || !deps.probeLogin) return proposal;
+  if (Object.keys(entry.headers ?? {}).some((k) => k.toLowerCase() === "authorization")) return proposal;
+  if (!(await deps.probeLogin(entry.url, deps.signal))) return proposal;
+  return { ...proposal, facts: [...proposal.facts, fact("login", `it asks for an OAuth login: after adding it, /mcp login ${proposal.name}`)] };
+}
+
+async function resolveSource(options: AddOptions, deps: ResolveDeps): Promise<Resolved> {
   const source = parseSource(options.source);
   const opts = { name: options.name, env: options.env, headers: options.headers, args: options.args };
   if ((source.kind === "npm" || source.kind === "pypi") && Object.keys(options.headers).length) {
@@ -40,5 +58,7 @@ export function liveDeps(env: Env, signal?: AbortSignal): ResolveDeps {
     get,
     signal,
     readme: (owner, repo, s) => fetchReadme(owner, repo, { signal: s, ...(token ? { token } : {}) }),
+    // An unauthenticated read of the server's own metadata (5 s, no registration): only for a URL the user typed.
+    probeLogin: (url, s) => (s?.aborted ? Promise.resolve(false) : probeLogin(url)),
   };
 }

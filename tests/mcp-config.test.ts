@@ -119,3 +119,48 @@ describe("loadMcpConfig", () => {
     expect(problems).toEqual([expect.stringContaining("my server!")]);
   });
 });
+
+describe("an http server's oauth block (#18)", () => {
+  const entry = (oauth: unknown) => ({ remote: { type: "http", url: "https://mcp.example.com/mcp", oauth } });
+
+  test("parses to transport.oauth, the secret expanded; /mcp shows the client, never the secret", async () => {
+    await personal(entry({ clientId: "c", clientSecret: "${SECRET}", callbackPort: 33418, scope: "repo read:org" }));
+    const { servers, problems } = await loadMcpConfig({ root, configDir, env: { SECRET: "s3cr3t" } });
+    expect(problems).toEqual([]);
+    expect(servers[0]!.transport).toEqual({
+      type: "http",
+      url: "https://mcp.example.com/mcp",
+      oauth: { clientId: "c", clientSecret: "s3cr3t", callbackPort: 33418, scope: "repo read:org" },
+    });
+    expect(servers[0]!.display).toBe("https://mcp.example.com/mcp · oauth client c, port 33418, scope repo read:org");
+    expect(servers[0]!.display).not.toContain("s3cr3t");
+    expect(servers[0]!.reads).toEqual(["SECRET"]);
+  });
+
+  test("everything in it is optional", async () => {
+    await personal(entry({}));
+    const { servers, problems } = await loadMcpConfig({ root, configDir, env: {} });
+    expect(problems).toEqual([]);
+    expect(servers[0]!.transport).toEqual({ type: "http", url: "https://mcp.example.com/mcp", oauth: {} });
+  });
+
+  test("oauth on a stdio server, a port outside 1024-65535, or an unknown key is a problem", async () => {
+    await personal({
+      local: { command: "x", oauth: { clientId: "c" } },
+      low: { type: "http", url: "https://a.test/", oauth: { callbackPort: 80 } },
+      typo: { type: "http", url: "https://a.test/", oauth: { clientID: "c" } },
+      empty: { type: "http", url: "https://a.test/", oauth: { scope: "" } },
+    });
+    const { servers, problems } = await loadMcpConfig({ root, configDir, env: {} });
+    expect(servers).toEqual([]);
+    expect(problems).toHaveLength(4);
+    expect(problems[0]).toContain("oauth");
+  });
+
+  test("the trust key changes when oauth does", async () => {
+    await project(entry({ clientId: "a" }));
+    const before = (await loadMcpConfig({ root, configDir, env: {} })).servers[0]!.key;
+    await project(entry({ clientId: "b" }));
+    expect((await loadMcpConfig({ root, configDir, env: {} })).servers[0]!.key).not.toBe(before);
+  });
+});

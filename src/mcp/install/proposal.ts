@@ -38,6 +38,8 @@ export interface ResolveDeps {
   /** The README of a GitHub repository (null: it has none). */
   readme?: (owner: string, repo: string, signal?: AbortSignal) => Promise<string | null>;
   now?: () => Date;
+  /** Whether a remote server asks for an OAuth login (#18: probeLogin in src/mcp/oauth.ts); unset: not asked. */
+  probeLogin?: (url: string, signal?: AbortSignal) => Promise<boolean>;
 }
 
 /** What the user passed besides the source. */
@@ -132,6 +134,8 @@ export function addedNotice(status: McpServerStatus): { text: string; isError: b
       const n = status.tools.length;
       return { text: `Added ${status.name} to ${where}: connected · ${n} tool${n === 1 ? "" : "s"}. Marv can use ${n === 1 ? "it" : "them"} from your next message.`, isError: false };
     }
+    case "needs-login":
+      return { text: `Added ${status.name} to ${where}. It needs a login: /mcp login ${status.name} (Marv can use its tools from your next message after that).`, isError: false };
     default:
       return { text: `Added ${status.name} to ${where}, but it didn't start: ${status.error ?? status.state} (see /mcp; fix the entry or /mcp remove ${status.name}).`, isError: true };
   }

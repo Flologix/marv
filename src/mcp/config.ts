@@ -21,7 +21,19 @@ export const PERSONAL_FILE = "mcp.json";
 
 export type McpTransport =
   | { type: "stdio"; command: string; args?: string[]; env?: Record<string, string> }
-  | { type: "http"; url: string; headers?: Record<string, string> };
+  | { type: "http"; url: string; headers?: Record<string, string>; oauth?: McpOAuthConfig };
+
+/**
+ * How Marv logs in to a server that wants OAuth (#18), all optional. A server without dynamic client registration
+ * needs a client registered by hand: its id, its secret (a ${VAR}, like headers) and the port its redirect URI names.
+ * `scope` overrides the scope the server asks for.
+ */
+export interface McpOAuthConfig {
+  clientId?: string;
+  clientSecret?: string;
+  callbackPort?: number;
+  scope?: string;
+}
 
 export interface McpServerConfig {
   name: string;
@@ -50,10 +62,20 @@ const Stdio = z.object({
   env: strings.optional(),
   timeout: z.number().positive().optional(),
 });
+const OAuth = z
+  .object({
+    clientId: z.string().min(1).optional(),
+    clientSecret: z.string().min(1).optional(),
+    // A client registered by hand names one redirect URI; below 1024 needs root to listen on.
+    callbackPort: z.number().int().min(1024).max(65535).optional(),
+    scope: z.string().trim().min(1).optional(),
+  })
+  .strict();
 const Http = z.object({
   type: z.enum(["http", "streamable-http"]),
   url: z.string().min(1),
   headers: strings.optional(),
+  oauth: OAuth.optional(),
   timeout: z.number().positive().optional(),
 });
 const FileSchema = z.object({ mcpServers: z.record(z.string(), z.unknown()).optional() });
@@ -83,9 +105,15 @@ const listed = (values: Record<string, string> | undefined, sep: string) =>
 
 /** The raw config, as the user wrote it, on one line. */
 export function displayOf(raw: z.infer<typeof Stdio> | z.infer<typeof Http>): string {
-  if ("url" in raw) return [raw.url, raw.headers && `headers ${listed(raw.headers, ": ")}`].filter(Boolean).join(" · ");
+  if ("url" in raw) return [raw.url, raw.headers && `headers ${listed(raw.headers, ": ")}`, "oauth" in raw && raw.oauth && oauthShown(raw.oauth)].filter(Boolean).join(" · ");
   const env = raw.env && Object.keys(raw.env).length ? `env ${listed(raw.env, "=")}` : "";
   return [[raw.command, ...(raw.args ?? [])].join(" "), env].filter(Boolean).join(" · ");
+}
+
+/** "oauth client c, port 33418, scope repo": never the secret (it should be a ${VAR}, but a literal one mustn't show). */
+function oauthShown(o: McpOAuthConfig): string {
+  const parts = [o.clientId && `client ${o.clientId}`, o.callbackPort && `port ${o.callbackPort}`, o.scope && `scope ${o.scope}`].filter(Boolean);
+  return parts.length ? `oauth ${parts.join(", ")}` : "oauth";
 }
 
 /** The variables a config reads from the environment, in order (not MARV_PROJECT_DIR: that's Marv's own). */
@@ -131,12 +159,27 @@ function parseServer(name: string, raw: unknown, source: McpServerConfig["source
     const parsed = Http.safeParse(raw);
     if (!parsed.success) throw fail(z.prettifyError(parsed.error));
     try {
-      const { url, headers, timeout } = parsed.data;
-      return { name, source, key, timeout, display: displayOf(parsed.data), reads: readsOf(raw), transport: { type: "http", url: expand(url, env), ...(headers ? { headers: expandAll(headers, env) } : {}) } };
+      const { url, headers, timeout, oauth } = parsed.data;
+      return {
+        name,
+        source,
+        key,
+        timeout,
+        display: displayOf(parsed.data),
+        reads: readsOf(raw),
+        transport: {
+          type: "http",
+          url: expand(url, env),
+          ...(headers ? { headers: expandAll(headers, env) } : {}),
+          ...(oauth ? { oauth: { ...oauth, ...(oauth.clientSecret ? { clientSecret: expand(oauth.clientSecret, env) } : {}) } } : {}),
+        },
+      };
     } catch (err) {
       throw fail(err);
     }
   }
+  // Unknown keys of a stdio entry are dropped, but this one would otherwise look like it did something.
+  if (raw && typeof raw === "object" && "oauth" in raw) throw fail(new Error('"oauth" is only for http servers (a login to a remote server)'));
   const parsed = Stdio.safeParse(raw);
   if (!parsed.success) throw fail(z.prettifyError(parsed.error));
   try {

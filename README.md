@@ -93,7 +93,7 @@ Type what you want in plain language, for example:
 | `/yolo` | Run what the sandbox contains without asking (`/yolo on`, `/yolo off`) |
 | `/good`, `/bad` | Rate the last turn, with an optional note (`/bad edited the wrong file`) |
 | `/label` | Tag the last turn (`/label refactor, tests`) |
-| `/mcp` | Show MCP servers and their tools; `/mcp add <package \| URL \| repo>` adds one, `/mcp search <words>` finds one, `/mcp remove <name>` takes yours out, `/mcp trust` starts the project's |
+| `/mcp` | Show MCP servers and their tools; `/mcp add <package \| URL \| repo>` adds one, `/mcp search <words>` finds one, `/mcp remove <name>` takes yours out, `/mcp trust` starts the project's, `/mcp login <name>` logs in to a remote server (OAuth), `/mcp logout <name>` forgets the login |
 | `/diagnostics` | Show or set the typecheck after edits (`/diagnostics on`, `/diagnostics off`) |
 | `/checks` | List the project's checks and their last result (`/checks on`, `/checks off`) |
 | `/steps` | Show or set the step limit (`/steps 40`, `/steps off` never asks) |
@@ -174,7 +174,32 @@ Put it in `.marv/skills/<name>/` (this project) or `~/.marv/skills/<name>/` (all
 - **GitHub repos:** Marv reads the README (with `GITHUB_TOKEN` if set) and takes only a package name or an https URL from its config examples, nothing else from the block (no extra arguments, no `env` values; the variable names it uses are suggested as `--env`). Several candidates: you get the `/mcp add` commands to choose from.
 - **Its tools** reach the model from your next message. `/mcp remove <name>` takes one of your servers out and stops it; its tools stay listed (failing) until `/clear` or a restart. A project's servers stay in `.mcp.json`, edited by hand.
 
-Known limits: npx resolves a package's own dependencies by their version ranges when it first runs (there's no lockfile to pin them); a remote server is whatever its owner deploys at that URL; no Docker images and no building from source yet (a README that only shows those is reported, not followed); a PyPI package whose command has another name than the package needs a hand edit. A remote server that asks you to log in (OAuth) is what `/mcp login` is for, which comes next; until it lands, such a server shows as failed in `/mcp`.
+Known limits: npx resolves a package's own dependencies by their version ranges when it first runs (there's no lockfile to pin them); a remote server is whatever its owner deploys at that URL; no Docker images and no building from source yet (a README that only shows those is reported, not followed); a PyPI package whose command has another name than the package needs a hand edit.
+
+### Servers that need a login
+
+A remote server that wants an OAuth login, rather than a token in `headers`, shows as `needs login` at startup and in `/mcp`. Log in with:
+
+```sh
+/mcp login linear      # opens your browser; when it comes back, Marv stores the tokens and connects
+/mcp logout linear     # forgets the login, and revokes it where the server allows
+```
+
+- **Only you start a login.** Startup, a tool call and the model never open a browser or register Marv with a server; a server whose login runs out (its refresh token refused) says `needs login` again, and its tools fail with a message telling the model to ask you.
+- **The browser comes back to Marv** on `127.0.0.1` (a random port, PKCE, a random `state`). Over SSH or without a display Marv doesn't open a browser: it shows the link. Open it anywhere; if the browser then shows an error page (it couldn't reach `127.0.0.1` on that machine), paste the address it ended up on into Marv's prompt. That address goes to the login, never to the model, and the transcript shows `(login callback)`. A login gives up after 5 minutes; `/mcp login` again starts over.
+- **Tokens** are kept in `~/.marv/mcp-tokens.json` (0600), per server URL: your servers share one login across projects (renaming a server keeps it), and a project's server (from `.mcp.json`, trusted first) gets its own. The MCP SDK renews the access token with the refresh token when it runs out, also in `marv -p` and SDK sessions using the same config folder; they never start a login, and say which server needs one. Tokens never reach the model, the transcript, session files, trajectories or sandboxed commands.
+- **Servers without dynamic registration** need a client you register yourself (an OAuth app at the provider, with the redirect URI `http://127.0.0.1:<port>/callback`), in the server's entry:
+
+```json
+{ "mcpServers": { "example": {
+  "type": "http", "url": "https://mcp.example.com/mcp",
+  "oauth": { "clientId": "abc123", "clientSecret": "${EXAMPLE_CLIENT_SECRET}", "callbackPort": 33418, "scope": "read write" }
+} } }
+```
+
+  All of `oauth` is optional: `clientId` and `clientSecret` (a `${VAR}`, like headers; leave it out for a public client), `callbackPort` (the port of the redirect URI you registered), and `scope` (space-separated: the scope Marv asks for, instead of the one the server suggests). `/mcp` shows the client id and scope, never the secret. A server with its own `Authorization` header logs in with that, not with `/mcp login`.
+
+Known limits of logins: no login from the SDK or `marv -p` (log in once in the TUI); a client registered by hand needs its exact `callbackPort` free when you log in.
 
 ## Connect GitHub
 
@@ -205,6 +230,17 @@ Marv can work with your GitHub repositories — issues, pull requests, Actions r
 ```sh
 /mcp add https://api.githubcopilot.com/mcp/ --name github --header "Authorization: Bearer ${MARV_GITHUB_TOKEN}"
 ```
+
+**Or with an OAuth login instead of a token.** The token above is the simple path, and stays the recommended one. If you'd rather log in through the browser, GitHub's hosted server needs your own OAuth app (it offers no dynamic registration, and Marv ships no app of its own): create one under [Settings → Developer settings → OAuth Apps](https://github.com/settings/developers) with the callback URL `http://127.0.0.1:33418/callback`, export its secret as `MARV_GITHUB_CLIENT_SECRET`, and write:
+
+```json
+{ "mcpServers": { "github": {
+  "type": "http", "url": "https://api.githubcopilot.com/mcp/",
+  "oauth": { "clientId": "<your app's client id>", "clientSecret": "${MARV_GITHUB_CLIENT_SECRET}", "callbackPort": 33418 }
+} } }
+```
+
+Then `/mcp login github` (see [Servers that need a login](#servers-that-need-a-login); `"scope"` there narrows what the token may do, e.g. `"repo read:org"`).
 
 The official server registers dozens of tools. With many connected, Marv offers the model only their names and loads a tool's parameters when it needs one, so you don't have to trim — but limiting the toolsets still gives a small model a shorter list to choose from. The server takes `GITHUB_TOOLSETS` (or `--toolsets`), for example `default,actions` — the default is already `context`, `repos`, `issues`, `pull_requests`, `users`, which covers most issues/PR work; `GITHUB_TOOLSETS` wins when both are set:
 
@@ -269,6 +305,7 @@ After a step that changed files, Marv runs the checks whose glob matches one of 
 | `~/.marv/agents/` | Your personal agent types |
 | `~/.marv/mcp.json`, `.mcp.json` | MCP servers: yours, and the project's (`{"mcpServers": {"name": {"command": …} or {"type": "http", "url": …}}}`) |
 | `~/.marv/mcp-trust.json` | Which project MCP servers you've trusted |
+| `~/.marv/mcp-tokens.json` | MCP logins (`/mcp login`): OAuth clients and tokens, private (0600) |
 | `.marv/agents/` | The project's agent types |
 | `.marv/checks/` | The project's checks, run after the model's edits ([Checks](#checks)) |
 | `~/.marv/worktrees/<project>/` | Subagents' worktrees while they run (removed when each finishes; its branch stays) |
