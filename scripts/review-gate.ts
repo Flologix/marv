@@ -49,8 +49,8 @@ const prePush = args.includes("--pre-push");
 
 const git = (...a: string[]): string => {
   const run = spawnSync("git", a, { encoding: "utf8" });
-  if (run.status !== 0) fail(`git ${a.join(" ")} failed: ${run.stderr.trim()}`);
-  return run.stdout.trim();
+  if (run.status !== 0) fail(`git ${a.join(" ")} failed: ${(run.stderr ?? "").trim()}`);
+  return (run.stdout ?? "").trim();
 };
 
 // --- Which commits to review ---
@@ -66,9 +66,12 @@ const commits = prePush
       .map(([, localSha]) => localSha!)
   : [git("rev-parse", "HEAD")];
 
-if (spawnSync("ocr", ["--version"]).error) {
+const version = spawnSync("ocr", ["--version"], { encoding: "utf8" });
+if (version.error || version.status !== 0) {
   fail("`ocr` isn't installed. Install it with `npm i -g @alibaba-group/open-code-review`, then `ocr config provider`.");
 }
+const ocrVersion = (version.stdout ?? "").trim();
+if (spawnSync("git", ["rev-parse", "--verify", "--quiet", `${base}^{commit}`]).status !== 0) fail(`base "${base}" isn't a commit here (fetch it, or pass --base)`);
 
 // --- Already-passed commits ---
 // A commit that passed once passes again: pushing it a second time (a retry, a
@@ -77,7 +80,6 @@ if (spawnSync("ocr", ["--version"]).error) {
 // blocking severities and ocr's version. The list lives in the shared .git
 // folder, so every worktree sees it; a lost line under concurrent pushes only
 // costs a second review.
-const ocrVersion = spawnSync("ocr", ["--version"], { encoding: "utf8" }).stdout.trim();
 const cacheDir = join(git("rev-parse", "--path-format=absolute", "--git-common-dir"), "ocr-review");
 const passedFile = join(cacheDir, "passed");
 const passed = new Set(existsSync(passedFile) ? readFileSync(passedFile, "utf8").split("\n") : []);
@@ -95,13 +97,13 @@ for (const sha of new Set(commits)) {
   });
   let result: Result | undefined;
   try {
-    result = JSON.parse(run.stdout) as Result;
+    result = JSON.parse(run.stdout ?? "") as Result;
   } catch {
     // handled below: no result is a failed review
   }
   if (run.status !== 0 || !result || result.status !== "complete") {
     // Fail closed: a review that didn't run isn't a review that passed.
-    console.error(`review-gate: ocr failed (exit ${run.status}, status ${result?.status ?? "unreadable"}):\n${run.stderr.trim()}`);
+    console.error(`review-gate: ocr failed (exit ${run.status}, status ${result?.status ?? "unreadable"}):\n${(run.stderr ?? "").trim()}`);
     failed = true;
     continue;
   }
