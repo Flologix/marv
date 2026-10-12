@@ -6,6 +6,9 @@ import { ToolError, type Tool } from "./types.ts";
 
 const DEFAULT_LIMIT = 400;
 const MAX_LINE_CHARS = 500;
+// A read of a few lines gives each a share of this, so a long line (an AGENTS.md bullet, issue #40) can be read
+// whole with limit=1; a long read stays at MAX_LINE_CHARS per line (a minified file would otherwise flood it).
+const LINE_BUDGET_CHARS = 30_000;
 
 const input = z.object({
   path: z.string().describe("File path, relative to the project root (e.g. src/app.ts)."),
@@ -24,7 +27,7 @@ export const readFile: Tool<typeof input> = {
   name: "read_file",
   description:
     "Read a text file from the project. Returns each line as its line number, →, then the line exactly as in the file (what to copy into edit_file's old_string starts after the →). " +
-    `Reads up to ${DEFAULT_LIMIT} lines at a time; use offset and limit to page through longer files.`,
+    `Reads up to ${DEFAULT_LIMIT} lines at a time; use offset and limit to page through longer files. A line longer than ${MAX_LINE_CHARS} characters is cut short in a long read; limit=1 shows it whole.`,
   input,
   label: ({ path }) => path,
   repair: (raw, { root }) => repairPathField(raw, root),
@@ -47,11 +50,13 @@ export const readFile: Tool<typeof input> = {
     if (offset > total) throw new ToolError(`${shown} has only ${total} lines; offset ${offset} is past the end.`);
 
     const end = Math.min(total, offset + limit - 1);
+    const cap = Math.max(MAX_LINE_CHARS, Math.floor(LINE_BUDGET_CHARS / (end - offset + 1)));
     const numbered = lines
       .slice(offset - 1, end)
       .map((line, i) => {
-        const clipped = line.length > MAX_LINE_CHARS ? `${line.slice(0, MAX_LINE_CHARS)}… (line truncated)` : line;
-        return numberedLine(offset + i, clipped);
+        if (line.length <= cap) return numberedLine(offset + i, line);
+        const whole = line.length <= LINE_BUDGET_CHARS ? "reads it whole" : `reads ${LINE_BUDGET_CHARS} of them`;
+        return numberedLine(offset + i, `${line.slice(0, cap)}… (line truncated: ${line.length} characters; offset=${offset + i} and limit=1 ${whole})`);
       })
       .join("\n");
 
