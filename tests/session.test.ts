@@ -14,7 +14,11 @@ import type { CommandResult } from "../src/tools/bash.ts";
 import { MarvSession, type SessionEvent, type SessionInit } from "../src/session.ts";
 import { SessionStore, type SavedSession } from "../src/sessions.ts";
 import { TrajectoryStore } from "../src/trajectory.ts";
-import type { ApprovalRequest, Decision } from "../src/tools/types.ts";
+import type { ApprovalRequest, Decision, Tool } from "../src/tools/types.ts";
+import { toolSpecsFor } from "../src/tools/index.ts";
+import { MID_TURN_NOTE } from "../src/compact.ts";
+import { readInstructions } from "../src/prompt.ts";
+import { fakeTool } from "./mcp-fakes.ts";
 import { answerProblems } from "./answered.ts";
 import { RoutedProvider, ScriptedProvider } from "./fake-provider.ts";
 import { sandboxAvailable } from "../src/sandbox.ts";
@@ -267,8 +271,8 @@ describe("approvals", () => {
 });
 
 /** Stands in for McpManager: the parts a session uses. */
-function fakeMcp(ready: Promise<void>, specs: ToolSpec[] = []): McpManager {
-  const mcp = { settled: false, ready, specs, tools: [], status: () => [] };
+function fakeMcp(ready: Promise<void>, specs: ToolSpec[] = [], tools: Tool[] = []): McpManager {
+  const mcp = { settled: false, ready, specs, tools, status: () => [] };
   void ready.then(() => (mcp.settled = true));
   return mcp as unknown as McpManager;
 }
@@ -1083,7 +1087,7 @@ describe("diagnostics", () => {
   test("new errors after a step that changed a file reach the model, after the tool results", async () => {
     const { checks } = typescriptProject(ok, broken);
     const provider = new ScriptedProvider([useTools(write("c1")), say("Done.")]);
-    const events = await collect(makeSession(provider, { checks }).send("go"));
+    const events = await collect(makeSession(provider, { typecheck: checks }).send("go"));
     const second = provider.requests[1]!.history;
     expect(second.at(-2)?.role).toBe("tool");
     expect(second.at(-1)).toEqual({ role: "user", text: expect.stringContaining("src/b.ts:1:1 TS2304 Cannot find name 'x'.") });
@@ -1107,13 +1111,13 @@ describe("diagnostics", () => {
 
   test("the baseline is taken before the file is written, also in yolo mode", async () => {
     const { checks, sawFile } = typescriptProject(ok, ok);
-    await collect(makeSession(new ScriptedProvider([useTools(write("c1")), say("Done.")]), { checks }).send("go"));
+    await collect(makeSession(new ScriptedProvider([useTools(write("c1")), say("Done.")]), { typecheck: checks }).send("go"));
     expect(sawFile).toEqual([false, true]);
   });
 
   test("diagnostics: false runs nothing, and configure() turns it on from the next turn", async () => {
     const { checks, sawFile } = typescriptProject(ok, ok);
-    const session = makeSession(new ScriptedProvider([useTools(write("c1")), say("Done."), useTools(write("c2")), say("Done.")]), { checks, diagnostics: false });
+    const session = makeSession(new ScriptedProvider([useTools(write("c1")), say("Done."), useTools(write("c2")), say("Done.")]), { typecheck: checks, diagnostics: false });
     await collect(session.send("go"));
     expect(sawFile).toEqual([]);
     session.configure({ diagnostics: true });
@@ -1124,7 +1128,7 @@ describe("diagnostics", () => {
   test("the check is in the trajectory", async () => {
     const { checks } = typescriptProject(ok, broken);
     const trajectories = new TrajectoryStore(dir);
-    const session = makeSession(new ScriptedProvider([useTools(write("c1")), say("Done.")]), { checks, trajectories });
+    const session = makeSession(new ScriptedProvider([useTools(write("c1")), say("Done.")]), { typecheck: checks, trajectories });
     await collect(session.send("go"));
     await session.flush();
     const files = await Array.fromAsync(new Bun.Glob("**/*.jsonl").scan(dir));
@@ -1142,7 +1146,7 @@ describe("diagnostics", () => {
     const run: RunCheck = async () => (runs++ && (await Bun.sleep(500)), ok);
     const checks = new Diagnostics({ run, sandboxWorks: () => true });
     const trajectories = new TrajectoryStore(dir);
-    const session = makeSession(new ScriptedProvider([[usage, ...useTools(write("c1"))], [usage, ...say("Done.")]]), { checks, trajectories });
+    const session = makeSession(new ScriptedProvider([[usage, ...useTools(write("c1"))], [usage, ...say("Done.")]]), { typecheck: checks, trajectories });
     await collect(session.send("go"));
     await session.flush();
     const files = await Array.fromAsync(new Bun.Glob("**/*.jsonl").scan(dir));
@@ -1160,7 +1164,7 @@ describe("diagnostics", () => {
         super.reset();
       }
     }
-    const session = makeSession(new ScriptedProvider([]), { checks: new Spy() });
+    const session = makeSession(new ScriptedProvider([]), { typecheck: new Spy() });
     session.configure({ diagnostics: true });
     expect(resets).toBe(0);
     session.configure({ diagnostics: false });
@@ -1179,12 +1183,176 @@ describe("diagnostics", () => {
       return { output: "", exitCode: null, timedOut: false, aborted: true };
     };
     const checks = new Diagnostics({ run, sandboxWorks: () => true });
-    const session = makeSession(new ScriptedProvider([useTools(write("c1")), say("Fine.")]), { checks, yolo: false, approve: async () => "no" });
+    const session = makeSession(new ScriptedProvider([useTools(write("c1")), say("Fine.")]), { typecheck: checks, yolo: false, approve: async () => "no" });
     await collect(session.send("go"));
     expect(captured).toBeDefined();
     expect(captured!.aborted).toBe(true);
     const events = await collect(session.send("again"));
     expect(events.at(-1)).toMatchObject({ type: "turn_end" });
     expect(events.some((e) => e.type === "assistant")).toBe(true);
+  });
+});
+
+describe("deferred MCP tools (#14)", () => {
+  const used = (promptTokens: number): AgentEvent => ({ type: "usage", usage: { promptTokens, completionTokens: 0 } });
+  const tools = [fakeTool("mcp__x__a", { kind: "read" }), fakeTool("mcp__x__b", { kind: "read" })];
+  const specsOf = (ts: Tool[]): ToolSpec[] => ts.map((t) => ({ name: t.name, description: t.description, parameters: { type: "object", properties: {} } }));
+  const builtinNames = toolSpecsFor({ hasSkills: false }).map((s) => s.name);
+  const NOTE = "Marv: MCP tools you can use (not loaded: call tool_search with their names to see their parameters, then run one with mcp_call):";
+  const lastUser = (p: ScriptedProvider, i: number) => p.requests[i]!.history.findLast((t) => t.role === "user")!.text;
+  const ready = (ts: Tool[] = tools) => fakeMcp(Promise.resolve(), specsOf(ts), [...ts]);
+
+  test("the tool list and system prompt never change; only appended messages carry the list", async () => {
+    const mcp = ready(); // its own arrays: this test adds a tool to them, as /mcp trust would
+    const provider = new ScriptedProvider([
+      useTools(call("c1", "tool_search", { names: ["mcp__x__a"] })),
+      useTools(call("c2", "mcp_call", { tool: "mcp__x__a", arguments: {} })),
+      say("Done."),
+      say("Again."),
+    ]);
+    const session = makeSession(provider, { mcp, mcpTools: "deferred" });
+    await collect(session.send("use a"));
+    const late = fakeTool("mcp__y__c", { kind: "read" });
+    mcp.specs.push(...specsOf([late]));
+    mcp.tools.push(late);
+    await collect(session.send("and now?"));
+
+    const [first, ...rest] = provider.requests;
+    expect(first!.options.tools!.map((t) => t.name)).toEqual([...builtinNames, "tool_search", "mcp_call"]);
+    for (const [i, r] of rest.entries()) {
+      expect(r.options.tools).toEqual(first!.options.tools);
+      expect(r.options.system).toBe(first!.options.system);
+      expect(r.history.slice(0, provider.requests[i]!.history.length)).toEqual(provider.requests[i]!.history); // only appended
+    }
+    expect(lastUser(provider, 0)).toBe(`${NOTE}\n- mcp__x__a: Does mcp__x__a.\n- mcp__x__b: Does mcp__x__b.\n\nuse a`);
+    expect(provider.requests[2]!.history.findLast((t) => t.role === "tool")!.text).toBe("mcp__x__a got {}");
+    expect(lastUser(provider, 3)).toBe(`${NOTE}\n- mcp__y__c: Does mcp__y__c.\n\nand now?`);
+  });
+
+  test("a turn with nothing new adds nothing, and the transcript never shows the note", async () => {
+    const provider = new ScriptedProvider([say("One."), say("Two.")]);
+    const store = new SessionStore(join(dir, "sessions"));
+    const session = makeSession(provider, { mcp: ready(), mcpTools: "deferred", sessions: store });
+    await collect(session.send("one"));
+    await collect(session.send("two"));
+    expect(lastUser(provider, 1)).toBe("two");
+    await session.flush();
+    const saved = (await store.latest(project))!;
+    expect(saved.transcript.filter((m) => m.role === "user").map((m) => m.text)).toEqual(["one", "two"]);
+  });
+
+  test("the system prompt is the same whatever the mode", async () => {
+    const systemOf = async (mcpTools: "deferred" | "eager") => {
+      const provider = new ScriptedProvider([say("Hi.")]);
+      await collect(makeSession(provider, { mcp: ready(), mcpTools }).send("hi"));
+      return provider.requests[0]!.options.system;
+    };
+    expect(await systemOf("deferred")).toBe(await systemOf("eager"));
+  });
+
+  test("a server that settles late is still in the first note", async () => {
+    let start!: () => void;
+    const specs: ToolSpec[] = [];
+    const late: Tool[] = [];
+    const mcp = fakeMcp(new Promise<void>((resolve) => (start = resolve)), specs, late);
+    setTimeout(() => {
+      late.push(...tools);
+      specs.push(...specsOf(tools));
+      start();
+    }, 50);
+    const provider = new ScriptedProvider([say("Hi.")]);
+    await collect(makeSession(provider, { mcp, mcpTools: "deferred" }).send("hi"));
+    expect(lastUser(provider, 0)).toContain("- mcp__x__b");
+  });
+
+  test("a direct call to a listed tool runs as mcp_call, and the history says mcp_call", async () => {
+    const provider = new ScriptedProvider([useTools(call("c1", "mcp__x__a", { q: 1 })), say("Done.")]);
+    await collect(makeSession(provider, { mcp: ready(), mcpTools: "deferred" }).send("go"));
+    const history = provider.requests[1]!.history;
+    expect(history.find((t) => t.role === "assistant")).toMatchObject({ toolCalls: [{ name: "mcp_call" }] });
+    const result = history.find((t) => t.role === "tool")!.text;
+    expect(result).toContain('mcp__x__a got {"q":1}');
+    expect(result).toContain("Marv: mcp__x__a isn't offered as a tool of its own");
+  });
+
+  test("auto mode sends a few small tools as today", async () => {
+    const provider = new ScriptedProvider([say("Hi.")]);
+    await collect(makeSession(provider, { mcp: ready() }).send("hi"));
+    expect(provider.requests[0]!.options.tools!.map((t) => t.name)).toContain("mcp__x__a");
+    expect(lastUser(provider, 0)).toBe("hi");
+  });
+
+  test("compaction before a turn re-announces everything with that message", async () => {
+    const provider = new ScriptedProvider([[used(900), ...say("Big.")], say("Summary."), say("After.")], 1000);
+    const session = makeSession(provider, { mcp: ready(), mcpTools: "deferred" });
+    await collect(session.send("one"));
+    await collect(session.send("two"));
+    expect(lastUser(provider, 2)).toBe(`${NOTE}\n- mcp__x__a: Does mcp__x__a.\n- mcp__x__b: Does mcp__x__b.\n\ntwo`);
+  });
+
+  test("a mid-turn compaction re-announces after MID_TURN_NOTE", async () => {
+    const provider = new ScriptedProvider([[used(900), ...useTools(read("c1"))], say("SUMMARY"), say("Finished.")], 1000);
+    await collect(makeSession(provider, { mcp: ready(), mcpTools: "deferred" }).send("first"));
+    expect(lastUser(provider, 2)).toBe(`${MID_TURN_NOTE}\n\n${NOTE}\n- mcp__x__a: Does mcp__x__a.\n- mcp__x__b: Does mcp__x__b.`);
+  });
+
+  test("clear() starts over: the next message announces everything again", async () => {
+    const provider = new ScriptedProvider([say("One."), say("Two.")]);
+    const session = makeSession(provider, { mcp: ready(), mcpTools: "deferred" });
+    await collect(session.send("one"));
+    await session.clear();
+    await collect(session.send("two"));
+    expect(lastUser(provider, 1)).toStartWith(NOTE);
+  });
+
+  test("resume() keeps the mode and what was announced, and says what's gone", async () => {
+    const store = new SessionStore(join(dir, "sessions"));
+    const first = makeSession(new ScriptedProvider([say("Hi.")]), { mcp: ready(), mcpTools: "deferred", sessions: store });
+    await collect(first.send("hi"));
+    await first.flush();
+    const provider = new ScriptedProvider([say("Back.")]);
+    const second = makeSession(provider, { mcp: ready([tools[0]!]), mcpTools: "eager", sessions: store });
+    await second.resume("latest");
+    await collect(second.send("back"));
+    expect(provider.requests[0]!.options.tools!.map((t) => t.name)).toContain("mcp_call"); // the saved mode wins
+    expect(lastUser(provider, 0)).toBe("Marv: these MCP tools are no longer available: mcp__x__b.\n\nback");
+  });
+
+  test("the trajectory records the mode and the note", async () => {
+    const trajectories = new TrajectoryStore(join(dir, "trajectories"));
+    const session = makeSession(new ScriptedProvider([say("Hi.")]), { mcp: ready(), mcpTools: "deferred", trajectories });
+    await collect(session.send("hi"));
+    await session.flush();
+    const records = (await readFile(trajectories.open(project, session.id).path, "utf8")).trim().split("\n").map((l) => JSON.parse(l));
+    expect(records.find((r) => r.type === "turn_start").mcpTools).toMatchObject({ mode: "deferred", count: 2 });
+    expect(records.find((r) => r.type === "mcp_note").text).toStartWith(NOTE);
+  });
+
+  test("a caller's tool can't be named tool_search or mcp_call", () => {
+    expect(() => makeSession(new ScriptedProvider([]), { tools: [fakeTool("mcp_call")] })).toThrow(/mcp_call/);
+  });
+});
+
+describe("a long AGENTS.md (#40)", () => {
+  test("the model is told what was cut, reads it with read_file, and the system prompt stays the same every request", async () => {
+    const body = (title: string) => `## ${title}\n\n${"- a rule that matters here\n".repeat(400)}`;
+    await writeFile(join(project, "AGENTS.md"), `# Project\n\n${body("Commands")}\n${body("Architecture")}\n${body("Conventions")}`);
+    const { text, cut } = (await readInstructions(project))!;
+    const conventions = cut!.sections.find((s) => s.heading === "## Conventions")!;
+    const provider = new ScriptedProvider([
+      useTools(call("c1", "read_file", { path: "AGENTS.md", offset: conventions.line, limit: 1 })),
+      say("Read it."),
+      say("Second turn."),
+    ]);
+    const session = makeSession(provider, { instructions: text });
+    await collect(session.send("what are the conventions?"));
+    await collect(session.send("and again"));
+
+    expect(provider.requests).toHaveLength(3);
+    const system = provider.requests[0]!.options.system!;
+    expect(system).toContain(`- ## Conventions (line ${conventions.line})`);
+    for (const r of provider.requests) expect(r.options.system).toBe(system);
+    const result = provider.requests[1]!.history.find((t) => t.role === "tool");
+    expect(result).toMatchObject({ role: "tool", text: expect.stringContaining(`${conventions.line}→## Conventions`) });
   });
 });

@@ -60,7 +60,7 @@ function realOrSelf(path: string): string {
 }
 
 /** For a project whose .git is a worktree's file: its trusted git folders (see worktreeGitDirs); else none. */
-function worktreeGit(root: string): string[] {
+export function worktreeGit(root: string): string[] {
   const gitFile = join(root, ".git");
   try {
     return lstatSync(gitFile).isFile() ? worktreeGitDirs(gitFile) : [];
@@ -125,6 +125,12 @@ export function touchesHiddenHome(command: string, root: string, home: string): 
 const NETWORK_NOTE =
   "Marv: this command ran in the sandbox without network, and its failure looks like it may come from that: there, every connection and DNS lookup fails, so logins look invalid and servers look down. " +
   "Before drawing conclusions, run it again with network: true.";
+/**
+ * Appended to the note above when the failed command is `gh` (issue #27): the GitHub MCP server is the way to use
+ * GitHub, and the failure still isn't proof the login is stale, so "gh auth login" stays the wrong advice.
+ */
+const GH_NOTE =
+  "For GitHub, don't suggest gh auth login, and never mount gh's config into the sandbox (a token there must not reach command output): suggest the GitHub MCP server instead, which the user connects in ~/.marv/mcp.json — see Marv's README, \"Connect GitHub\".";
 /** Errors a blocked network produces: DNS, refused or unreachable connections, timeouts. */
 const NETWORK_ERRORS =
   /could not resolve (?:host|hostname|proxy)|temporary failure in name resolution|name or service not known|getaddrinfo|\b(?:ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ECONNRESET|ENETUNREACH|EHOSTUNREACH|ETIMEDOUT|ETIMEOUT)\b|ConnectionRefused|network is unreachable|connection refused|connection timed out|failed to connect|unable to connect|dns error|no such host|error connecting to/i;
@@ -352,7 +358,12 @@ export const bash: Tool<typeof input> = {
     if (sandboxed && touchesHiddenHome(command, root, homedir())) result.output += `\n${HOME_NOTE}\n`;
     // Not for a command that isn't there (127) or can't run (126): the network has nothing to do with those.
     const failed = result.timedOut || (!result.aborted && result.exitCode !== 0 && result.exitCode !== 126 && result.exitCode !== 127);
-    if (sandboxed && !network && failed && looksLikeNetworkFailure(command, result.output)) result.output += `\n${NETWORK_NOTE}\n`;
+    if (sandboxed && !network && failed && looksLikeNetworkFailure(command, result.output)) {
+      result.output += `\n${NETWORK_NOTE}\n`;
+      // A gh failure usually isn't the network, and the missing network isn't the fix: the MCP server is (#27).
+      // gh is a NETWORK_COMMAND, so the note above is already there for it; this adds what to do instead.
+      if (/(?:^|[\s;&|(`])gh(?=$|[\s;&|)`])/.test(command)) result.output += `\n${GH_NOTE}\n`;
+    }
     return { output: formatOutput(result), summary };
   },
 };

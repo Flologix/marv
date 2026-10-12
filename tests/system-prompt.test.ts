@@ -3,7 +3,8 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseMcpServers } from "../src/mcp/config.ts";
-import { loadInstructions, subagentPrompt, systemPrompt } from "../src/prompt.ts";
+import { instructionsCutNotice, loadInstructions, readInstructions, subagentPrompt, systemPrompt } from "../src/prompt.ts";
+import { readFile as readFileTool } from "../src/tools/read-file.ts";
 import { bash } from "../src/tools/bash.ts";
 
 const DATE = new Date("2026-10-03T12:00:00Z");
@@ -94,7 +95,64 @@ describe("loadInstructions", () => {
     await writeFile(join(root, "AGENTS.md"), "x".repeat(50_000));
     const text = (await loadInstructions(root))!;
     expect(text.length).toBeLessThan(21_000);
-    expect(text).toEndWith("(AGENTS.md was cut off here: it's longer than 20000 characters.)");
+    expect(text).toContain("AGENTS.md was cut off here");
+  });
+
+  // Issue #40: Marv's own AGENTS.md was 76k characters, and the model saw only the first 20k with no way to the rest.
+  describe("a file longer than the cap (#40)", () => {
+    // Three sections of ~11k characters each, a code fence with a "## " line inside it in the last one.
+    const section = (title: string) => `## ${title}\n\n${"- a rule that matters here\n".repeat(420)}`;
+    const long = `# Project\n\n${section("Commands")}\n${section("Architecture")}\n${section("Conventions")}\n\`\`\`md\n## not a heading\n\`\`\`\n\n## Prompt cache\n\n### Why\nNever edit the history.\n#### Too deep\n`;
+
+    test("is cut at a line, and the note lists the sections after the cut with their lines", async () => {
+      await writeFile(join(root, "AGENTS.md"), long);
+      const { text, cut } = (await readInstructions(root))!;
+      expect(text.length).toBeLessThan(21_000);
+      const lines = long.split("\n");
+      const conventions = lines.indexOf("## Conventions") + 1;
+      const cache = lines.indexOf("## Prompt cache") + 1;
+      expect(cut).toMatchObject({ chars: long.trim().length, totalLines: lines.length - 1 });
+      expect(cut!.sections).toEqual([
+        { heading: "## Conventions", line: conventions },
+        { heading: "## Prompt cache", line: cache },
+        { heading: "### Why", line: cache + 2 },
+      ]);
+      // What's shown ends with a whole line, and the note says where to go on from.
+      const shown = text.slice(0, text.indexOf("\n\n(AGENTS.md"));
+      expect(long.startsWith(`${shown}\n`)).toBe(true);
+      expect(cut!.nextLine).toBe(shown.split("\n").length + 1);
+      expect(text).toContain(`read_file with path AGENTS.md and offset ${cut!.nextLine}`);
+      expect(text).toContain(`- ## Conventions (line ${conventions})`);
+      expect(text).toContain(`- ## Prompt cache (line ${cache})`);
+      expect(text).not.toContain("not a heading");
+    });
+
+    test("read_file at the offset the note gives continues exactly where the prompt stopped", async () => {
+      await writeFile(join(root, "AGENTS.md"), long);
+      const { cut } = (await readInstructions(root))!;
+      const { output } = await readFileTool.run({ path: "AGENTS.md", offset: cut!.nextLine, limit: 1 }, { root } as never);
+      expect(output).toContain(`${cut!.nextLine}→${long.split("\n")[cut!.nextLine - 1]}`);
+    });
+
+    test("line numbers are the file's, also with blank lines before the text", async () => {
+      await writeFile(join(root, "AGENTS.md"), `\n\n${long}`);
+      const { cut } = (await readInstructions(root))!;
+      expect(cut!.sections[1]).toEqual({ heading: "## Prompt cache", line: long.split("\n").indexOf("## Prompt cache") + 3 });
+    });
+
+    test("a short file isn't cut", async () => {
+      await writeFile(join(root, "AGENTS.md"), "## Rules\nUse tabs.\n");
+      expect(await readInstructions(root)).toEqual({ text: "## Rules\nUse tabs." });
+    });
+
+    test("the startup notice says how much the model sees and what it reads on demand", async () => {
+      await writeFile(join(root, "AGENTS.md"), long);
+      const { cut } = (await readInstructions(root))!;
+      const notice = instructionsCutNotice(cut!);
+      expect(notice).toContain("AGENTS.md is longer than");
+      expect(notice).toContain("3 sections");
+      expect(notice).toContain("## Conventions");
+    });
   });
 });
 

@@ -15,6 +15,8 @@ const ctx: CommandContext = {
     yolo: true,
     trajectories: true,
     diagnostics: true,
+    checks: true,
+    mcpTools: "auto",
     maxSteps: 25,
   },
   configPath: "~/.marv/config.json",
@@ -51,7 +53,7 @@ describe("slash commands", () => {
   });
 
   test("/config says when no key is needed (Ollama)", () => {
-    const action = run("/config", { ...ctx, config: { provider: "ollama", model: "qwen3.5:9b", baseUrl: "http://localhost:11434", thinking: false, contextLength: 32768, sandbox: true, yolo: true, trajectories: true, diagnostics: true, maxSteps: 25 } });
+    const action = run("/config", { ...ctx, config: { provider: "ollama", model: "qwen3.5:9b", baseUrl: "http://localhost:11434", thinking: false, contextLength: 32768, sandbox: true, yolo: true, trajectories: true, diagnostics: true, checks: true, mcpTools: "auto", maxSteps: 25 } });
     expect(action).toMatchObject({ type: "print", text: expect.stringContaining("API key:   not needed") });
   });
 
@@ -98,6 +100,34 @@ describe("slash commands", () => {
     });
     expect(runCommand("/trajectories maybe")).toMatchObject({ type: "print", isError: true });
     expect(runCommand("/config")).toMatchObject({ type: "print", text: expect.stringContaining("Trajectories: on") });
+  });
+
+  test("/checks lists the project's checks, what couldn't load, and the last result; or turns them on and off", () => {
+    expect(runCommand("/checks off")).toEqual({ type: "checks", on: false });
+    expect(runCommand("/checks on")).toEqual({ type: "checks", on: true });
+    expect(runCommand("/checks maybe")).toMatchObject({ type: "print", isError: true });
+    expect(runCommand("/checks")).toMatchObject({ type: "print", markdown: true, text: expect.stringContaining("This project has none") });
+    const action = run("/checks", {
+      ...ctx,
+      checks: {
+        list: [
+          { kind: "pattern", name: "imports", file: ".marv/checks/imports.yaml", glob: ["src/**/*.ts"], exclude: [], forbid: "x", flags: "", message: "relative import without its extension" },
+          { kind: "script", name: "prompt-cache", file: ".marv/checks/prompt-cache.ts", glob: ["src/**/*.ts"], exclude: ["src/gen/**"] },
+        ],
+        problems: [".marv/checks/bad.yaml: needs a glob"],
+        last: { status: "done", ms: 120, before: 0, errors: 1, added: [{ check: "imports", file: "src/a.ts", line: 3, message: "relative import without its extension\u001b]52;c;x\u0007" }] },
+      },
+    });
+    if (action.type !== "print") throw new Error("expected print");
+    expect(action.text).toContain("`imports` *(forbids a pattern: relative import without its extension)*");
+    expect(action.text).toContain("`prompt-cache` *(script)*\n  src/**/*.ts · not src/gen/**");
+    expect(action.text).toContain("- .marv/checks/bad.yaml: needs a glob");
+    expect(action.text).toContain("**Last result:** 1 new (1 violation in all, 120 ms):\n- src/a.ts:3 [imports] relative import without its extension");
+    expect(action.text).not.toContain("\u001b");
+    const quiet = run("/checks", { ...ctx, config: { ...ctx.config, checks: false }, checks: { list: [], problems: [], last: { status: "off", reason: "no-sandbox" } } });
+    if (quiet.type !== "print") throw new Error("expected print");
+    expect(quiet.text).toStartWith("**Checks**: off.");
+    expect(quiet.text).toEndWith("**Last result:** off: they run only in the sandbox.");
   });
 
   test("/diagnostics says what it does, or turns it on and off", () => {

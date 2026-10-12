@@ -56,7 +56,12 @@ export interface ApprovalRequest {
 }
 
 /** yes: run it. always: run it, and everything in its scope this session. no: don't. */
-export type Decision = "yes" | "always" | "no";
+/**
+ * An approver's answer. "unavailable": there's no one who can approve this call (a headless run's `--approve` list
+ * doesn't cover it), refused like a call with no approver at all, as an error the model can work around; "no" is a
+ * person declining, which stops the run so they can say what to do instead.
+ */
+export type Decision = "yes" | "always" | "no" | "unavailable";
 
 export interface ToolContext {
   /** Absolute path of the project root; tools may not reach outside it. */
@@ -100,6 +105,8 @@ export interface ToolResult {
    * written to trajectories (they record named fields).
    */
   diff?: DiffShown;
+  /** The file a change wrote (with `diff`), relative to the project root: which project checks run after the step. */
+  changed?: string;
   isError?: boolean;
   /** The user said no: the agent stops so they can say what to do instead. */
   declined?: boolean;

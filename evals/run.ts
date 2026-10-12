@@ -4,40 +4,47 @@
 //   bun evals/run.ts --verify                         every check fails on the task's repo and passes with its solution
 //   bun evals/run.ts --models a,b --label baseline    each model on each task (OPENROUTER_API_KEY, or ~/.marv's key)
 //         [--tasks x,y] [--repeat 2] [--budget 1.50] [--concurrency 4] [--timeout 300] [--max-steps 50] [--diagnostics on|off]
+//         [--mcp servers.json] [--mcp-tools auto|deferred|eager]   MCP servers for every run, and how they're offered (#14)
 //   bun evals/run.ts --report evals/results/a/results.jsonl evals/results/b/results.jsonl
 //
 // A task is a folder: task.md (the request), repo/ (the starting files), check/ (tests copied in only after the
 // agent finishes, so it can neither see nor change them), solution/ (files that make the check pass, for --verify).
 // Each run gets a fresh git repository in a temp folder and a session with no approver, so what yolo mode allows
 // runs (edits, sandboxed bash without network) and everything else is refused, the way an unattended run would be.
+// A task with an mcp.json (`{ "server": "tracker", "data": "<file in evals/mcp/data>" }`) gets the tracker MCP server
+// (evals/mcp/tracker.ts); the comments it records are copied into the workspace as __tracker_comments__.json before
+// the check runs, the way check/ is.
 // --budget stops starting runs once the money spent (as OpenRouter reports it) reaches it; runs already going
 // finish, so it can be overshot by a few runs' worth.
 import { appendFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { parseArgs } from "./args.ts";
+import { copyFresh, writeFresh } from "./files.ts";
 import { defaultConfigDir } from "../src/config/config.ts";
 import { sandboxAvailable } from "../src/sandbox.ts";
-import { createSession } from "../src/sdk.ts";
+import { createSession, type McpServerEntry } from "../src/sdk.ts";
 import { runCommand } from "../src/tools/bash.ts";
-import { formatSummary, type RunResult } from "./summary.ts";
+import { eventCost, formatSummary, type RunResult } from "./summary.ts";
 import { addTypeScript, ranTypecheck } from "./typescript.ts";
 
 const TASKS = join(import.meta.dir, "tasks");
 const RESULTS = join(import.meta.dir, "results");
 const CHECK = "bun test ./__eval__.test.js";
+const TRACKER = join(import.meta.dir, "mcp", "tracker.ts");
+const MCP_DATA = join(import.meta.dir, "mcp", "data");
+/** Where the tracker's recorded comments go in the workspace, for the check (a task's solution/ has its own copy). */
+const COMMENTS = "__tracker_comments__.json";
+const MCP_TOOLS = ["auto", "deferred", "eager"];
 
-// --- Arguments ---
-const argv = process.argv.slice(2);
-const flag = (name: string) => argv.includes(`--${name}`);
-const option = (name: string) => {
-  const at = argv.indexOf(`--${name}`);
-  return at >= 0 ? argv[at + 1] : undefined;
-};
-const list = (name: string) => option(name)?.split(",").map((s) => s.trim()).filter(Boolean);
-
-const allTasks = readdirSync(TASKS).filter((name) => existsSync(join(TASKS, name, "task.md"))).sort();
-const tasks = list("tasks") ?? allTasks;
-for (const task of tasks) if (!allTasks.includes(task)) throw new Error(`No task "${task}" (have: ${allTasks.join(", ")})`);
+/** A task's MCP server, from its mcp.json; undefined for a task without one. */
+function taskMcp(task: string): { server: "tracker"; data: string } | undefined {
+  const file = join(TASKS, task, "mcp.json");
+  if (!existsSync(file)) return undefined;
+  const config = JSON.parse(readFileSync(file, "utf8")) as { server?: string; data?: string };
+  if (config.server !== "tracker" || !config.data) throw new Error(`${task}/mcp.json: expected { "server": "tracker", "data": "<file>" }`);
+  return { server: "tracker", data: config.data };
+}
 
 /** A fresh copy of the task's repo (plus `extra` folders on top), committed, in a temp folder. */
 function workspace(task: string, ...extra: string[]): string {
@@ -61,12 +68,19 @@ function workspace(task: string, ...extra: string[]): string {
 
 /** Copies the hidden check in and runs it (sandboxed, like the agent's own commands). */
 async function check(dir: string, task: string): Promise<{ pass: boolean; output: string }> {
-  cpSync(join(TASKS, task, "check"), dir, { recursive: true });
+  copyFresh(join(TASKS, task, "check"), dir); // after the model: a planted symlink must not be written through
   const result = await runCommand({ command: `${CHECK} 2>&1`, root: dir, sandbox: sandboxAvailable(), network: false, timeoutMs: 60_000 });
   return { pass: result.exitCode === 0, output: result.output };
 }
 
-if (flag("verify")) {
+const argv = process.argv.slice(2);
+const args = parseArgs(argv);
+
+const allTasks = readdirSync(TASKS).filter((name) => existsSync(join(TASKS, name, "task.md"))).sort();
+const tasks = args.tasks ?? allTasks;
+for (const task of tasks) if (!allTasks.includes(task)) throw new Error(`No task "${task}" (have: ${allTasks.join(", ")})`);
+
+if (args.verify) {
   let ok = true;
   for (const task of tasks) {
     const before = workspace(task);
@@ -84,28 +98,35 @@ if (flag("verify")) {
 const readResults = (path: string): RunResult[] =>
   readFileSync(path, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line) as RunResult);
 
-if (flag("report")) {
-  const files = argv.slice(argv.indexOf("--report") + 1).filter((a) => !a.startsWith("--"));
-  console.log(formatSummary(files.flatMap(readResults)));
+if (args.report.length) {
+  console.log(formatSummary(args.report.flatMap(readResults)));
   process.exit(0);
 }
 
 // --- Running ---
-const models = list("models");
+const models = args.models;
 if (!models?.length) throw new Error("--models a,b is required (OpenRouter model ids)");
-const label = option("label") ?? "run";
-const repeat = Number(option("repeat") ?? 1);
-const budget = Number(option("budget") ?? 1);
-const concurrency = Number(option("concurrency") ?? 4);
-const timeoutMs = Number(option("timeout") ?? 300) * 1000;
+const label = args.label ?? "run";
+const repeat = args.repeat;
+const budget = args.budget;
+const concurrency = args.concurrency;
+const timeoutMs = args.timeout * 1000;
 // Twice the interactive limit: at 25 steps the TUI asks "Keep going?", and a user would say yes once. With no one to
 // ask, 25 was a hard stop, and slow, careful models (one file per step, re-reading after each edit) were measured on
 // the limit instead of on their edits.
-const maxSteps = Number(option("max-steps") ?? 50);
+const maxSteps = args.maxSteps;
 // Marv's typecheck after file changes (on by default, as in the CLI); off for the comparison's other arm.
-const diagnosticsOption = option("diagnostics");
+const diagnosticsOption = args.diagnostics;
 if (diagnosticsOption !== undefined && diagnosticsOption !== "on" && diagnosticsOption !== "off") throw new Error("--diagnostics takes on or off");
 const diagnostics = diagnosticsOption !== "off";
+// MCP servers for every run (Claude Code's format, or the bare record), and how they're offered (#14).
+const mcpTools = args.mcpTools;
+if (mcpTools !== undefined && !MCP_TOOLS.includes(mcpTools)) throw new Error(`--mcp-tools takes ${MCP_TOOLS.join(", ")}`);
+const extraServers: Record<string, McpServerEntry> = (() => {
+  if (!args.mcp) return {};
+  const raw = JSON.parse(readFileSync(args.mcp, "utf8")) as { mcpServers?: Record<string, McpServerEntry> } & Record<string, McpServerEntry>;
+  return raw.mcpServers ?? raw;
+})();
 const savedKey = () => (JSON.parse(readFileSync(join(defaultConfigDir(process.env), "config.json"), "utf8")) as { apiKey?: string }).apiKey;
 const apiKey: string = process.env.OPENROUTER_API_KEY ?? savedKey() ?? "";
 if (!apiKey) throw new Error("No OpenRouter key: set OPENROUTER_API_KEY or run marv's /setup.");
@@ -129,20 +150,52 @@ const short = (text: string, max: number) => (text.length > max ? `${text.slice(
 async function runOne({ model, task, rep }: { model: string; task: string; rep: number }): Promise<RunResult> {
   const dir = workspace(task);
   const started = Date.now();
-  const result: RunResult = { label, model, task, rep, pass: false, reason: "error", requests: 0, promptTokens: 0, cachedTokens: 0, completionTokens: 0, cost: 0, ms: 0, tools: {}, editErrors: [], marv, diagnostics };
+  const tracker = taskMcp(task);
+  // The tracker's output lives beside the workspace, not in it: the model can't write it except through the server.
+  const trackerDir = tracker ? mkdtempSync(join(tmpdir(), `marv-eval-${task}-tracker-`)) : undefined;
+  const comments = trackerDir ? join(trackerDir, "out.json") : "";
+  const mcpServers: Record<string, McpServerEntry> = {
+    ...extraServers,
+    ...(tracker ? { tracker: { command: process.execPath, args: [TRACKER, join(MCP_DATA, tracker.data), comments] } } : {}),
+  };
+  const withMcp = Object.keys(mcpServers).length > 0;
+  const result: RunResult = {
+    label,
+    model,
+    task,
+    rep,
+    pass: false,
+    reason: "error",
+    requests: 0,
+    promptTokens: 0,
+    cachedTokens: 0,
+    completionTokens: 0,
+    cost: 0,
+    ms: 0,
+    tools: {},
+    editErrors: [],
+    marv,
+    diagnostics,
+    ...(withMcp ? { mcpTools: mcpTools ?? "auto", mcpCalls: 0 } : {}),
+  };
   // What happened, for reading a run afterwards: replies, and every tool call with (the start of) what it returned.
   const log: unknown[] = [];
   let timedOut = false;
   try {
-    const session = await createSession({ cwd: dir, provider: { kind: "openrouter", apiKey, model }, maxSteps, diagnostics });
+    const session = await createSession({
+      cwd: dir,
+      provider: { kind: "openrouter", apiKey, model },
+      maxSteps,
+      diagnostics,
+      ...(withMcp ? { mcpServers, mcpTools: mcpTools as "auto" | "deferred" | "eager" | undefined } : {}),
+    });
     const timer = setTimeout(() => {
       timedOut = true;
       session.interrupt();
     }, timeoutMs);
     try {
       for await (const event of session.send(readFileSync(join(TASKS, task, "task.md"), "utf8").trim())) {
-        if (event.type === "usage") spent += event.usage.cost ?? 0;
-        if (event.type === "subagent" && event.event.type === "usage") spent += event.event.usage.cost ?? 0;
+        spent += eventCost(event);
         if (event.type === "assistant") log.push({ assistant: event.text });
         if (event.type === "error") {
           result.error = event.message;
@@ -165,6 +218,7 @@ async function runOne({ model, task, rep }: { model: string; task: string; rep: 
           if (name === "edit_file" && event.result.isError) result.editErrors.push(short(event.result.output, 300));
           if (/^Marv: .* doesn't parse/m.test(event.result.output)) result.syntaxNotes = (result.syntaxNotes ?? 0) + 1;
           if (name === "bash" && ranTypecheck(event.call.arguments)) result.ranTypecheck = true;
+          if (name === "mcp_call" || name.startsWith("mcp__")) result.mcpCalls = (result.mcpCalls ?? 0) + 1;
           log.push({ tool: name, args: event.call.arguments, isError: event.result.isError ?? false, output: short(event.result.output, 3000) });
         }
       }
@@ -181,6 +235,8 @@ async function runOne({ model, task, rep }: { model: string; task: string; rep: 
       await session.close();
     }
     if (timedOut) result.reason = "timeout";
+    // What the tracker recorded, over anything the model wrote under that name itself.
+    if (tracker) writeFresh(join(dir, COMMENTS), existsSync(comments) ? readFileSync(comments) : "[]");
     const checked = await check(dir, task);
     result.pass = checked.pass;
     if (!checked.pass) result.checkOutput = short(checked.output.slice(-2000), 2000);
@@ -188,10 +244,11 @@ async function runOne({ model, task, rep }: { model: string; task: string; rep: 
     result.error = (err as Error).message;
   } finally {
     result.ms = Date.now() - started;
-    const diff = Bun.spawnSync(["git", "diff", "HEAD", "--", ".", ":!__eval__.test.js"], { cwd: dir }).stdout.toString();
+    const diff = Bun.spawnSync(["git", "diff", "HEAD", "--", ".", ":!__eval__.test.js", `:!${COMMENTS}`], { cwd: dir }).stdout.toString();
     mkdirSync(join(out, "logs", model.replace(/[^\w.-]+/g, "_")), { recursive: true });
     writeFileSync(join(out, "logs", model.replace(/[^\w.-]+/g, "_"), `${task}-${rep}.json`), JSON.stringify({ ...result, diff, log }, null, 2));
     rmSync(dir, { recursive: true, force: true });
+    if (trackerDir) rmSync(trackerDir, { recursive: true, force: true });
   }
   return result;
 }
@@ -215,7 +272,10 @@ async function worker() {
   }
 }
 
-console.log(`${jobs.length} runs (${models.length} models × ${tasks.length} tasks × ${repeat}), budget $${budget}, ${maxSteps} steps, diagnostics ${diagnostics ? "on" : "off"}, Marv ${marv} → ${out}`);
+console.log(
+  `${jobs.length} runs (${models.length} models × ${tasks.length} tasks × ${repeat}), budget $${budget}, ${maxSteps} steps, diagnostics ${diagnostics ? "on" : "off"}` +
+    `${mcpTools ? `, MCP tools ${mcpTools}` : ""}, Marv ${marv} → ${out}`,
+);
 await Promise.all(Array.from({ length: Math.min(concurrency, jobs.length) }, worker));
 if (skipped.length) console.log(`\nBudget reached: ${skipped.length} runs not started.`);
 console.log(`\n${formatSummary(readResults(resultsFile))}`);

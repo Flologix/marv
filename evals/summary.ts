@@ -1,6 +1,15 @@
 // What an eval run records, and the table that compares them. Pure: evals/run.ts does the running and the
 // reading of result files; this only counts.
 
+import type { SessionEvent } from "../src/sdk.ts";
+
+/** The cost one event carries (the turn's usage, or a subagent's): the runner adds it up as events arrive. */
+export function eventCost(event: SessionEvent): number {
+  if (event.type === "usage") return event.usage.cost ?? 0;
+  if (event.type === "subagent" && event.event.type === "usage") return event.event.usage.cost ?? 0;
+  return 0;
+}
+
 /** One model on one task, once: a line of an evals/results/*.jsonl file. */
 export interface RunResult {
   /** What's being compared, e.g. "baseline" or "fuzzy-edits" (--label). */
@@ -39,6 +48,10 @@ export interface RunResult {
   checkOutput?: string;
   /** Marv's git commit, and whether its working tree had changes. */
   marv?: string;
+  /** How MCP tools were offered (--mcp-tools; #14), for runs with an MCP server. */
+  mcpTools?: string;
+  /** MCP tools run (mcp_call, or an mcp__ tool offered directly). */
+  mcpCalls?: number;
 }
 
 export interface SummaryRow {
@@ -50,8 +63,13 @@ export interface SummaryRow {
   editErrors: number;
   toolCalls: number;
   requests: number;
+  /** Prompt tokens over all requests: per request, what deferring MCP tools (#14) should move. */
+  promptTokens: number;
+  mcpCalls: number;
   cost: number;
   medianMs: number;
+  /** Which runs the row is (label and model), for the per-task grid. */
+  group: string;
 }
 
 const median = (values: number[]) => {
@@ -79,8 +97,11 @@ export function summarizeRuns(results: RunResult[]): SummaryRow[] {
       editErrors: edits.reduce((n, t) => n + t.errors, 0),
       toolCalls: tools.reduce((n, [, t]) => n + t.calls, 0),
       requests: runs.reduce((n, r) => n + r.requests, 0),
+      promptTokens: runs.reduce((n, r) => n + r.promptTokens, 0),
+      mcpCalls: runs.reduce((n, r) => n + (r.mcpCalls ?? 0), 0),
       cost: runs.reduce((n, r) => n + r.cost, 0),
       medianMs: median(runs.map((r) => r.ms)),
+      group: groupKey(runs[0]!),
     };
   });
 }
@@ -96,7 +117,9 @@ function table(rows: string[][]): string {
 export function formatSummary(results: RunResult[]): string {
   if (results.length === 0) return "No runs.";
   const rows = summarizeRuns(results);
-  const head = ["label", "model", "runs", "pass", "edits", "edit fail", "steps/run", "tools/run", "$/run", "$ total", "median"];
+  // Likewise MCP calls: only runs with a server make any.
+  const showMcp = rows.some((r) => r.mcpCalls);
+  const head = ["label", "model", "runs", "pass", "edits", "edit fail", "steps/run", "tools/run", ...(showMcp ? ["mcp/run"] : []), "prompt/req", "$/run", "$ total", "median"];
   const overview = table([
     head,
     ...rows.map((r) => [
@@ -108,6 +131,8 @@ export function formatSummary(results: RunResult[]): string {
       pct(r.editErrors, r.editCalls),
       (r.requests / r.runs).toFixed(1),
       (r.toolCalls / r.runs).toFixed(1),
+      ...(showMcp ? [(r.mcpCalls / r.runs).toFixed(1)] : []),
+      r.requests ? String(Math.round(r.promptTokens / r.requests)) : "-",
       (r.cost / r.runs).toFixed(4),
       r.cost.toFixed(3),
       `${(r.medianMs / 1000).toFixed(0)}s`,
@@ -119,7 +144,7 @@ export function formatSummary(results: RunResult[]): string {
     ...tasks.map((task) => [
       task,
       ...rows.map((row) => {
-        const runs = results.filter((r) => groupKey(r) === `${row.label}\u0000${row.model}` && r.task === task);
+        const runs = results.filter((r) => groupKey(r) === row.group && r.task === task);
         return runs.length ? `${runs.filter((r) => r.pass).length}/${runs.length}` : "-";
       }),
     ]),

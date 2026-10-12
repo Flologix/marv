@@ -11,6 +11,7 @@ import { existsSync } from "node:fs";
 import { readdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
+import type { McpMode } from "./mcp/deferred.ts";
 import { legacyProjectKey, projectKey } from "./paths.ts";
 import { writePrivate } from "./private-file.ts";
 import type { ChatTurn } from "./provider/types.ts";
@@ -44,6 +45,8 @@ export interface SavedSession {
   /** What the user saw. */
   transcript: Message[];
   totals: Totals;
+  /** The conversation's MCP mode and the tools it has been told about (#14); absent before a turn had MCP tools. Checked by the session on resume. */
+  mcp?: { mode: McpMode; announced: string[] };
 }
 
 export interface SessionSummary {

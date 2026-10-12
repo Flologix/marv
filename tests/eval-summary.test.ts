@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { formatSummary, summarizeRuns, type RunResult } from "../evals/summary.ts";
+import { eventCost, formatSummary, summarizeRuns, type RunResult } from "../evals/summary.ts";
 
-const run = (over: Partial<RunResult>): RunResult => ({
+const run = (over: Partial<RunResult> = {}): RunResult => ({
   diagnostics: true,
   label: "base",
   model: "m1",
@@ -42,6 +42,19 @@ describe("summarizeRuns", () => {
   });
 });
 
+describe("eventCost", () => {
+  const usage = (cost: number) => ({ promptTokens: 10, cachedTokens: 5, completionTokens: 2, cost });
+  test("the turn's usage and a subagent's carry cost", () => {
+    expect(eventCost({ type: "usage", usage: usage(0.0002) })).toBeCloseTo(0.0002);
+    expect(eventCost({ type: "subagent", callId: "c1", event: { type: "usage", usage: usage(0.0001) } })).toBeCloseTo(0.0001);
+  });
+
+  test("the other events carry none", () => {
+    expect(eventCost({ type: "done", reason: "end" })).toBe(0);
+    expect(eventCost({ type: "subagent", callId: "c1", event: { type: "done", reason: "end" } })).toBe(0);
+  });
+});
+
 describe("formatSummary", () => {
   test("a row per group with pass and edit-failure percentages, then the per-task grid", () => {
     const text = formatSummary([
@@ -54,6 +67,17 @@ describe("formatSummary", () => {
     expect(text).toContain("25%"); // 1 of 4 edits failed
     expect(text).toMatch(/tabs\s+1\/2/);
     expect(text).toMatch(/json\s+1\/1/);
+  });
+
+  test("prompt tokens per request: what deferred MCP tools (#14) should move", () => {
+    const rows = summarizeRuns([run({ requests: 2, promptTokens: 3000 }), run({ requests: 4, promptTokens: 9000 })]);
+    expect(rows[0]!.promptTokens).toBe(12_000);
+    expect(formatSummary([run({ requests: 2, promptTokens: 3000 }), run({ requests: 4, promptTokens: 9000 })])).toMatch(/prompt\/req[\s\S]*\b2000\b/);
+  });
+
+  test("MCP calls per run, a column only when a run made one", () => {
+    expect(formatSummary([run({ mcpCalls: 3 }), run({ mcpCalls: 1 })])).toMatch(/mcp\/run[\s\S]*\b2\.0\b/);
+    expect(formatSummary([run()])).not.toMatch(/mcp\/run/);
   });
 
   test("no runs", () => {

@@ -46,8 +46,9 @@ export interface SessionOptions {
   systemPrompt?: string | { append: string };
   /**
    * Your own tools, offered to the main agent next to the built-in ones (subagents don't get them). `input` must be a
-   * zod 4 schema: it's described to the model with z.toJSONSchema. Names must be their own: one of a built-in tool,
-   * one used twice, or one starting with `mcp__` (MCP servers' tools) makes createSession throw.
+   * zod 4 schema: it's described to the model with z.toJSONSchema. Names must be their own: one of a built-in tool
+   * (tool_search and mcp_call included), one used twice, or one starting with `mcp__` (MCP servers' tools) makes
+   * createSession throw.
    */
   tools?: Tool[];
   /**
@@ -78,6 +79,18 @@ export interface SessionOptions {
    * sandbox it doesn't run (the compiler is the project's own code).
    */
   diagnostics?: boolean;
+  /**
+   * After a step that changed files, run the project's own checks (one file per rule in `.marv/checks/`: a pattern
+   * that must or must not appear, or a bun script) whose glob matches a changed file, in the sandbox, read-only, and
+   * tell the model about new violations with their why. Default true; nothing runs without that folder.
+   */
+  checks?: boolean;
+  /**
+   * MCP tools' specs in every request ("eager"), or only their names, in a note, with tool_search and mcp_call to
+   * load and run them ("deferred"). Default "auto": deferred when the specs would cost more than min(4000 tokens,
+   * 10% of the context window). Decided once per conversation, at its first turn with MCP tools.
+   */
+  mcpTools?: "auto" | "deferred" | "eager";
   /** Run bash in the bubblewrap sandbox (default true). */
   sandbox?: boolean;
   /** Run what the sandbox confines without asking (default true). Must be false when `cwd` is your home folder or above it. */
@@ -158,6 +171,8 @@ export async function createSession(options: SessionOptions): Promise<Session> {
     approve: options.approve,
     maxSteps: options.maxSteps,
     diagnostics: options.diagnostics,
+    checks: options.checks,
+    mcpTools: options.mcpTools,
     sandbox: options.sandbox,
     yolo: options.yolo,
     noYolo,
@@ -192,6 +207,8 @@ export { OpenAICompatProvider } from "./provider/openai-compat.ts";
 export type { LoopEvent } from "./agent.ts";
 export type { CheckResult } from "./diagnostics/turn.ts";
 export type { TsError } from "./diagnostics/tsc.ts";
+export type { ProjectCheckResult } from "./checks/kind.ts";
+export type { Violation } from "./checks/load.ts";
 export type { Totals } from "./usage.ts";
 export type { Message } from "./types.ts";
 export type { ModelInfo } from "./provider/models.ts";

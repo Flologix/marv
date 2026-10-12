@@ -60,6 +60,13 @@ const FileConfigSchema = z.object({
   trajectories: z.boolean().optional(),
   /** Typecheck after the model changes files, and tell it about new errors (default on). */
   diagnostics: z.boolean().optional(),
+  /** Run the project's own checks (.marv/checks/) after the model changes files (default on; nothing without the folder). */
+  checks: z.boolean().optional(),
+  /**
+   * MCP tools' specs in every request ("eager"), or only their names with tool_search and mcp_call to load and run
+   * them ("deferred"); "auto" (the default) defers past min(4000 tokens, 10% of the context window). #14.
+   */
+  mcpTools: z.enum(["auto", "deferred", "eager"]).optional(),
   /** Steps a turn runs before it asks whether to keep going; 0 (or "off") never asks. */
   maxSteps: z
     .union([z.number().int().min(0), z.literal("off")])
@@ -91,6 +98,9 @@ export interface Config {
   yolo: boolean;
   trajectories: boolean;
   diagnostics: boolean;
+  checks: boolean;
+  /** How MCP tools are offered (src/mcp/deferred.ts); a conversation decides once, at its first turn with MCP tools. */
+  mcpTools: "auto" | "deferred" | "eager";
   /**
    * Steps a turn runs before it asks whether to keep going (with an approver; without one it's a hard stop).
    * 0 never asks — the guard is off, like Claude Code's and Codex's step limits — and 1 can't happen (it would ask
@@ -187,6 +197,8 @@ export function resolveConfig(file: FileConfig | null, env: Env): Config {
     yolo: file?.yolo ?? true,
     trajectories: file?.trajectories ?? true,
     diagnostics: file?.diagnostics ?? true,
+    checks: file?.checks ?? true,
+    mcpTools: file?.mcpTools ?? "auto",
     maxSteps: maxStepsFromEnv(env.MARV_MAX_STEPS, file?.maxSteps === "off" ? 0 : (file?.maxSteps ?? DEFAULT_MAX_STEPS)),
   };
 }

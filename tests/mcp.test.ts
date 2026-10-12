@@ -5,6 +5,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import type { McpServerConfig } from "../src/mcp/config.ts";
+import { deferredTools } from "../src/mcp/deferred.ts";
 import { McpManager } from "../src/mcp/manager.ts";
 import { formatMcpResult, makeMcpTool, mcpToolName } from "../src/mcp/tool.ts";
 import { McpTrust } from "../src/mcp/trust.ts";
@@ -69,6 +70,19 @@ describe("a local (stdio) server", () => {
       preview: { title: "test: echo", text: '{\n  "text": "hi"\n}', note: 'MCP server "test" (yours) · runs outside the sandbox' },
       scope: { key: "mcp:test:echo", description: "test's echo" },
     });
+  });
+
+  test("deferred: tool_search and mcp_call reach the server's tools (#14)", async () => {
+    const m = manager([stdio()]);
+    await m.start();
+    const offered = deferredTools({ tools: m.tools, specs: m.specs, loaded: new Set() });
+    const asked: ApprovalRequest[] = [];
+    const run = (name: string, args: unknown) => runTool({ id: `m${nextId++}`, name, arguments: JSON.stringify(args) }, { root, approve: async (r) => (asked.push(r), "yes") }, offered);
+    expect((await run("tool_search", { query: "echo" })).output).toContain('"name":"mcp__test__echo"');
+    expect((await run("mcp_call", { tool: "mcp__test__echo", arguments: { text: "hi" } })).output).toBe("echo: hi");
+    expect(asked.map((r) => r.scope.key)).toEqual(["mcp:test:echo"]);
+    expect((await run("mcp_call", { tool: "mcp__test__lookup", arguments: { word: "w" } })).output).toBe("w: a word");
+    expect(asked).toHaveLength(1); // lookup is read-only
   });
 
   test("a tool the server marks read-only runs without asking", async () => {

@@ -25,10 +25,11 @@ No role exists only to produce text for another role. If a new role seems needed
    2. Write the brief to `TASK.md` in the worktree (template below). Start the worker (below) and send it "Read TASK.md and do the task it describes."
    3. Wait for events, don't poll in a tight loop (below).
    4. When the worker reports, **verify, then review** (definition of done). Fix in place what takes under ~15 minutes; otherwise send the worker one precise list of fixes.
-   5. Commit in the worker's worktree with explicit paths (never `TASK.md`), naming the worker and model in the message. Merge into `sprint-N` with `--no-ff`. Resolve CHANGELOG/CLAUDE.md conflicts by keeping both entries; check for conflict markers before committing.
-   6. Close the worker.
+   5. Commit in the worker's worktree with explicit paths (never `TASK.md`), naming the worker and model in the message.
+   6. **Open Code Review** that commit: `bun run review --base sprint-N` (`ocr` with the model in `~/.opencodereview/config.json`). Fix or send back every critical/high finding and judge the rest; a finding you reject gets one line in the sprint PR saying why. Then merge into `sprint-N` with `--no-ff`. Resolve CHANGELOG/CLAUDE.md conflicts by keeping both entries; check for conflict markers before committing.
+   7. Close the worker.
 4. Start the next wave only when the previous one is merged into `sprint-N` and the full suite passes there.
-5. **Ship:** push `sprint-N`, open one PR whose body says `Fixes #N` for every issue in it, wait for CI and the Greptile review, fix what they find. **The user merges.**
+5. **Ship:** push `sprint-N`, open one PR whose body says `Fixes #N` for every issue in it, wait for CI, the `OCR review` check and the Greptile review, fix what they find. **The user merges.**
 6. **Report** once, at the end (see Metrics). Then remove the sprint's worktrees.
 
 ## Definition of done (per issue)
@@ -91,6 +92,7 @@ At sprint start, the orchestrator may set the sprint's issues to In progress in 
 ## Working with Herdr
 
 - **Start a Marv worker:** `herdr pane run <pane> "bun ~/Projects/marv-worktrees/marv-runner/src/cli.tsx"`, then `herdr agent rename <pane> marv-<issue>`. `marv-runner` is a detached worktree at `origin/main`, so merging into `sprint-N` doesn't change the code the workers run. Set `MARV_MAX_STEPS=0` once #33 is on `main`.
+- **Running a Marv worker headless (once #38 is on main):** `marv -p "add a test for X" --output json` runs one turn and prints a JSON result (reply, stop reason, steps, tokens, cost). Same `--output text` (default, just the reply on stdout) and `--output stream-json` (each event as a JSON line). With no one to ask, yolo-safe calls run; everything else the model is told to try another way. `--approve git_write --approve network` allows more. Exit code 0 for a finished turn, non-zero for errors, stops or missing approvals.
 - **Start a Claude worker:** `herdr agent start <name> --kind claude --pane <pane> -- --permission-mode auto`.
 - **Send a Marv worker text:** `herdr pane send-text <pane> "…"`, then `herdr pane send-keys <pane> enter`. Herdr's `agent prompt` and `agent send-keys` don't accept Marv yet. Marv ignores Enter while it's working, so interrupt with `esc` first if you must redirect it.
 - **Wait for events:** `herdr agent wait <name> --until blocked` and the idle/done states. A watcher loop should check every 5–10 s, report only a state held for two checks in a row, and never match its own command when you clean it up. Once `marv -p` (#38) exists, run workers headless and read their JSON result instead.

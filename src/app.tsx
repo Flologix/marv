@@ -6,7 +6,7 @@ import { applyEvent, createAgentLog, type AgentLog } from "./agent-log.ts";
 import { GENERAL_PURPOSE, type AgentType } from "./agents.ts";
 import { copyToClipboard } from "./clipboard.ts";
 import type { HerdrReporter } from "./herdr.ts";
-import { commands, diagnosticsStatus, isCommand, runCommand, stepsStatus, trajectoriesStatus, yoloStatus } from "./commands/index.ts";
+import { checksStatus, commands, diagnosticsStatus, isCommand, runCommand, stepsStatus, trajectoriesStatus, yoloStatus } from "./commands/index.ts";
 import {
   needsSetup,
   PRESETS,
@@ -33,7 +33,10 @@ import type { TrajectoryStore } from "./trajectory.ts";
 import type { McpManager, McpServerStatus } from "./mcp/manager.ts";
 import type { AgentProgress, ApprovalRequest, Decision } from "./tools/types.ts";
 import { checkNotice } from "./diagnostics/turn.ts";
+import { projectCheckNotice, type ProjectCheckResult } from "./checks/kind.ts";
+import { loadChecks, type ProjectCheck } from "./checks/load.ts";
 import { hiddenPathFoldersNotice } from "./commands/sandbox-notice.ts";
+import { instructionsCutNotice, type InstructionsCut } from "./prompt.ts";
 import type { CommandAction } from "./commands/index.ts";
 import type { Message } from "./types.ts";
 import { AgentView, AgentViewHeader } from "./ui/AgentView.tsx";
@@ -72,6 +75,13 @@ function describeUntrusted(s: McpServerStatus): string {
 // effects that report problems depend on them).
 const DEFAULT_AGENTS: AgentType[] = [GENERAL_PURPOSE];
 const NO_PROBLEMS: string[] = [];
+
+/** The project's checks for /checks, read when it runs (a check can be added at any time); other commands skip the disk. */
+function checksOnDisk(root: string, text: string): { list: ProjectCheck[]; problems: string[] } {
+  if (!/^\/checks\b/.test(text.trim())) return { list: [], problems: [] };
+  const { checks, problems } = loadChecks(root);
+  return { list: checks, problems };
+}
 
 interface Props {
   store: ConfigStore;
@@ -115,6 +125,8 @@ interface Props {
   agentProblems?: string[];
   /** PATH folders under the home folder the sandbox can't see, shortened (~) for display; said once at startup. */
   hiddenPathFolders?: string[];
+  /** Where a too-long AGENTS.md was cut (issue #40); said once at startup. */
+  instructionsCut?: InstructionsCut;
   /** Where subagents' worktrees go (~/.marv/worktrees/<project>); without it, no worktrees. */
   worktreesDir?: string;
   /** Running in a Herdr pane: Marv reports its state there (src/herdr.ts). */
@@ -148,6 +160,7 @@ export function App({
   agents = DEFAULT_AGENTS,
   agentProblems = NO_PROBLEMS,
   hiddenPathFolders = NO_PROBLEMS,
+  instructionsCut,
   worktreesDir,
   herdr,
 }: Props) {
@@ -309,6 +322,8 @@ export function App({
         sandbox: config.sandbox,
         yolo: config.yolo,
         diagnostics: config.diagnostics,
+        checks: config.checks,
+        mcpTools: config.mcpTools,
         maxSteps: config.maxSteps,
         sessions,
         trajectories,
@@ -319,7 +334,9 @@ export function App({
         onWarning: (text) => addMessage({ role: "system", text, isError: true }),
       }),
   );
-  // Settings changed (setup, /model, /think, /sandbox, /yolo, /trajectories, /diagnostics): the session uses them from its next turn.
+  // The project checks' last pass, for /checks.
+  const lastChecks = useRef<ProjectCheckResult | undefined>(undefined);
+  // Settings changed (setup, /model, /think, /sandbox, /yolo, /trajectories, /diagnostics, /checks): the session uses them from its next turn.
   const configured = useRef(config);
   useEffect(() => {
     if (configured.current === config) return;
@@ -330,6 +347,8 @@ export function App({
       yolo: config.yolo,
       trajectories: config.trajectories,
       diagnostics: config.diagnostics,
+      checks: config.checks,
+      mcpTools: config.mcpTools,
       maxSteps: config.maxSteps,
     });
     setSessionVersion((v) => v + 1);
@@ -493,12 +512,18 @@ export function App({
           }
           switch (event.type) {
             case "status":
-              setWaitingFor(event.status === "waiting_for_mcp" ? "Waiting for MCP servers to start…" : event.status === "checking" ? "Checking types…" : null);
+              setWaitingFor(event.status === "waiting_for_mcp" ? "Waiting for MCP servers to start…" : event.status === "checking" ? "Checking…" : null);
               setCompacting(event.status === "compacting");
               if (event.status === "running") stepStarted = Date.now(); // the wait for the next reply starts after a check
               break;
             case "check": {
               const notice = checkNotice(event.result);
+              if (notice) addMessage({ role: "system", text: notice });
+              break;
+            }
+            case "checks": {
+              lastChecks.current = event.result;
+              const notice = projectCheckNotice(event.result);
               if (notice) addMessage({ role: "system", text: notice });
               break;
             }
@@ -742,6 +767,7 @@ export function App({
       usage: { totals, last: usage, contextLength },
       trajectoriesPath: trajectories && shortenHome(join(trajectories.dir, projectKey(root))),
       mcp: { servers: mcp?.status() ?? [], problems: mcpProblems },
+      checks: { ...checksOnDisk(root, text), last: lastChecks.current },
     });
     switch (action.type) {
       case "print":
@@ -789,6 +815,9 @@ export function App({
         break;
       case "trajectories":
         void saveConfig({ ...(file ?? { provider: config.provider }), trajectories: action.on }, `Trajectories ${trajectoriesStatus({ ...config, trajectories: action.on })}`);
+        break;
+      case "checks":
+        void saveConfig({ ...(file ?? { provider: config.provider }), checks: action.on }, `Checks ${checksStatus({ ...config, checks: action.on })}`);
         break;
       case "diagnostics":
         void saveConfig({ ...(file ?? { provider: config.provider }), diagnostics: action.on }, `Diagnostics ${diagnosticsStatus({ ...config, diagnostics: action.on })}`);
@@ -1094,6 +1123,11 @@ export function App({
     if (hiddenPathFolders.length === 0) return;
     addMessage({ role: "system", text: hiddenPathFoldersNotice(hiddenPathFolders) });
   }, [hiddenPathFolders, addMessage]);
+
+  // An AGENTS.md longer than the cap: the model gets its start and the rest's headings (issue #40).
+  useEffect(() => {
+    if (instructionsCut) addMessage({ role: "system", text: instructionsCutNotice(instructionsCut) });
+  }, [instructionsCut, addMessage]);
 
   // MCP: config problems right away; once the servers have started, any that failed, and a project's servers
   // waiting to be trusted (they don't start until then).

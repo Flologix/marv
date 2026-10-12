@@ -11,6 +11,7 @@ import { mouse } from "../src/mouse.ts";
 import type { AgentEvent, ChatTurn, Provider, StreamOptions } from "../src/provider/types.ts";
 import { selection } from "../src/selection.ts";
 import type { Skill } from "../src/skills.ts";
+import type { InstructionsCut } from "../src/prompt.ts";
 import type { ModelInfo } from "../src/provider/models.ts";
 import { SessionStore } from "../src/sessions.ts";
 import { loadMemory, memoryPaths, type MemoryPaths } from "../src/memory.ts";
@@ -71,6 +72,7 @@ function renderApp(
   skills: Skill[] = [],
   skillProblems: string[] = [],
   hiddenPathFolders: string[] = [],
+  instructionsCut?: InstructionsCut,
 ) {
   return render(
     <App
@@ -84,6 +86,7 @@ function renderApp(
       skills={skills}
       skillProblems={skillProblems}
       hiddenPathFolders={hiddenPathFolders}
+      instructionsCut={instructionsCut}
       splashMs={splashMs}
       makeProvider={makeProvider}
       copy={copy}
@@ -770,6 +773,15 @@ describe("App", () => {
       expect(lastFrame()).toContain("Your PATH has 1 folder the sandbox can't see");
       expect(lastFrame()).toContain("~/.local/share/mise/installs/node/26.8.2/bin");
       expect(lastFrame()).toContain("tsc and other node_modules scripts may not run");
+    });
+
+    test("an AGENTS.md that was cut off is reported once at startup (#40)", async () => {
+      const cut = { chars: 86_000, totalLines: 400, nextLine: 120, sections: [{ heading: "## Conventions", line: 300 }] };
+      const { lastFrame } = renderApp(LOCAL, 0, undefined, undefined, "x", [], [], [], cut);
+      await tick();
+      expect(lastFrame()).toContain("AGENTS.md is longer than 20,000 characters (86,000)");
+      expect(lastFrame()).toContain("## Conventions");
+      expect(lastFrame()!.split("AGENTS.md is longer").length).toBe(2);
     });
   });
 

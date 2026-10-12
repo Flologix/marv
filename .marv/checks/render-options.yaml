@@ -1,0 +1,8 @@
+# Ink's render options keep incrementalRendering on (CLAUDE.md, Rendering).
+glob: src/render-options.ts
+require: '^\s*incrementalRendering:\s*true\b'
+flags: m
+message: "incrementalRendering: true is missing from Ink's render options"
+why: >-
+  Without it, every update (each martian frame, each keystroke) erases and redraws the whole screen, which flickers
+  in terminals like GNOME Console. Keep it on.

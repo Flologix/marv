@@ -4,6 +4,9 @@ import { sandboxAvailable } from "../sandbox.ts";
 import { hiddenPathFoldersNotice } from "./sandbox-notice.ts";
 import type { McpServerStatus } from "../mcp/manager.ts";
 import type { Skill } from "../skills.ts";
+import { CHECKS_DIR, type ProjectCheck } from "../checks/load.ts";
+import { printable } from "../printable.ts";
+import { formatViolation, type ProjectCheckResult } from "../checks/kind.ts";
 import { usageReport, type Totals } from "../usage.ts";
 import type { Usage } from "../provider/types.ts";
 
@@ -22,6 +25,7 @@ export type CommandAction =
   | { type: "yolo"; on: boolean }
   | { type: "trajectories"; on: boolean }
   | { type: "diagnostics"; on: boolean }
+  | { type: "checks"; on: boolean }
   /**
    * The step limit: show it (no `every`), set it to a whole number of steps (0 = never ask), or turn it
    * off. The App saves it in the config and passes it to the session.
@@ -57,6 +61,8 @@ export interface CommandContext {
   trajectoriesPath?: string;
   /** Tokens and cost so far, for /cost. */
   usage?: { totals: Totals; last: Usage | null; contextLength?: number };
+  /** The project's checks (.marv/checks/) as they are on disk now, and the session's last check pass, for /checks. */
+  checks?: { list: ProjectCheck[]; problems: string[]; last?: ProjectCheckResult };
   /** PATH folders under the home folder the sandbox can't see, shortened (~) for display; empty when there are none. */
   hiddenPathFolders?: string[];
 }
@@ -203,6 +209,16 @@ export const commands: Command[] = [
     },
   },
   {
+    name: "checks",
+    description: "The project's checks from .marv/checks/ and their last result (/checks on, /checks off)",
+    run: (args, { config, checks }) => {
+      const arg = args.toLowerCase();
+      if (arg === "on" || arg === "off") return { type: "checks", on: arg === "on" };
+      if (arg) return { type: "print", text: "Usage: /checks, /checks on, or /checks off", isError: true };
+      return { type: "print", text: checksText(config, checks ?? { list: [], problems: [] }), markdown: true };
+    },
+  },
+  {
     name: "diagnostics",
     description: "Typecheck after the model's edits (/diagnostics on, /diagnostics off)",
     run: (args, { config }) => {
@@ -279,6 +295,7 @@ function configText({ config, configPath }: CommandContext): string {
     `Yolo:      ${config.yolo ? "on" : "off"} (/yolo)`,
     `Trajectories: ${config.trajectories ? "on" : "off"} (/trajectories)`,
     `Diagnostics: ${config.diagnostics ? "on" : "off"} (/diagnostics)`,
+    `Checks:    ${config.checks ? "on" : "off"} (/checks)`,
     `Steps: ${stepsStatus(config)}`,
     `Endpoint:  ${config.baseUrl}`,
     ...(config.provider === "ollama" ? [`Context:   ${config.contextLength.toLocaleString("en-US")} tokens (contextLength in the config file)`] : []),
@@ -291,6 +308,43 @@ export function diagnosticsStatus(config: Config): string {
   return config.diagnostics
     ? "on: after the model changes files in a TypeScript project, Marv runs the project's typecheck (in the sandbox, read-only) and tells the model about new errors"
     : "off";
+}
+
+export function checksStatus(config: Config): string {
+  return config.checks
+    ? `on: after the model changes files, Marv runs the project's checks (${CHECKS_DIR}/) that concern them (in the sandbox, read-only) and tells the model about new violations`
+    : "off";
+}
+
+/** /checks: the setting, each check, the files that couldn't be used, and the last pass. */
+export function checksText(config: Config, { list, problems, last }: { list: ProjectCheck[]; problems: string[]; last?: ProjectCheckResult }): string {
+  const parts = [`**Checks**: ${checksStatus(config)}.`];
+  if (list.length === 0 && problems.length === 0) {
+    parts.push(
+      `This project has none. Add one rule per file to \`${CHECKS_DIR}/\`: a \`.yaml\` with \`glob\`, \`forbid\` or \`require\` (a regular expression), \`message\` and \`why\`, or a \`.ts\` script (\`// glob: …\` comment first) that prints violations as JSON lines \`{file, line, message, why}\`.`,
+    );
+  } else {
+    parts.push(
+      list
+        .map((c) => {
+          const what = c.kind === "pattern" ? `${c.forbid !== undefined ? "forbids" : "requires"} a pattern: ${c.message}` : "script";
+          return `- \`${c.name}\` *(${what})*\n  ${c.glob.join(", ")}${c.exclude.length ? ` · not ${c.exclude.join(", ")}` : ""}`;
+        })
+        .join("\n"),
+    );
+  }
+  if (problems.length) parts.push("**Couldn't load:**", problems.map((p) => `- ${p}`).join("\n"));
+  parts.push(`**Last result:** ${lastChecksText(last)}`);
+  return parts.join("\n\n");
+}
+
+function lastChecksText(last: ProjectCheckResult | undefined): string {
+  if (!last) return "none yet this session (checks run after a step that changed a file they concern).";
+  if (last.status === "off") return last.reason === "no-sandbox" ? "off: they run only in the sandbox." : "off: they timed out twice this session.";
+  if (last.status === "failed") return last.reason === "missing-interpreter" ? `failed: ${last.tool} isn't in the sandbox.` : `failed (${last.reason}).`;
+  const total = `${last.errors} violation${last.errors === 1 ? "" : "s"} in all`;
+  if (last.added.length === 0) return `nothing new (${total}, ${last.ms} ms).`;
+  return [`${last.added.length} new (${total}, ${last.ms} ms):`, ...last.added.map((v) => `- ${printable(formatViolation(v))}`)].join("\n");
 }
 
 /** What the step limit does with this config, for /steps and the notice when it's changed. */
