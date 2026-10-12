@@ -30,6 +30,7 @@ What counts as Marv's public API: the SDK (`@flologixai/marv/sdk`), the `marv` c
 
 ### Changed
 
+- An `AGENTS.md` longer than 20,000 characters is no longer just cut off (issue #40): it's cut at a whole line, and in place of the rest the model gets the headings after the cut (`#` to `###`, with their line numbers) and is told to read them with `read_file` (`offset`) when its task touches them. Names up front, content on demand, as with skills, so the system prompt and the prompt cache stay small. Marv says once at startup that the file was cut and which sections the model gets by name. `read_file` now shows a long line whole when asked for one line (`limit: 1`; a read of a few lines shares 30,000 characters between them, a long read still cuts lines at 500), and the cut tells the model so; Marv's own AGENTS.md has bullets of several thousand characters on one line. Marv's own CLAUDE.md now puts Commands, Conventions and the prompt-cache rule before the architecture notes, which are grouped under `###` headings.
 - The waiting line says "Checking…" (not "Checking types…") while the checks after a step run. SDK: `SessionInit.checks` is now the project checks' switch; the typecheck's test hook is `SessionInit.typecheck`.
 - When a sandboxed command without network fails in a way that looks like the missing network (DNS errors, refused connections, timeouts, or tools like `gh`, `curl`, `git fetch` and `npm install`), the model is told the sandbox blocked it and to retry with network on, instead of taking, say, `gh auth status`'s "invalid token" for real.
 

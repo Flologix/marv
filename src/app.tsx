@@ -36,6 +36,7 @@ import { checkNotice } from "./diagnostics/turn.ts";
 import { projectCheckNotice, type ProjectCheckResult } from "./checks/kind.ts";
 import { loadChecks, type ProjectCheck } from "./checks/load.ts";
 import { hiddenPathFoldersNotice } from "./commands/sandbox-notice.ts";
+import { instructionsCutNotice, type InstructionsCut } from "./prompt.ts";
 import type { CommandAction } from "./commands/index.ts";
 import type { Message } from "./types.ts";
 import { AgentView, AgentViewHeader } from "./ui/AgentView.tsx";
@@ -124,6 +125,8 @@ interface Props {
   agentProblems?: string[];
   /** PATH folders under the home folder the sandbox can't see, shortened (~) for display; said once at startup. */
   hiddenPathFolders?: string[];
+  /** Where a too-long AGENTS.md was cut (issue #40); said once at startup. */
+  instructionsCut?: InstructionsCut;
   /** Where subagents' worktrees go (~/.marv/worktrees/<project>); without it, no worktrees. */
   worktreesDir?: string;
   /** Running in a Herdr pane: Marv reports its state there (src/herdr.ts). */
@@ -157,6 +160,7 @@ export function App({
   agents = DEFAULT_AGENTS,
   agentProblems = NO_PROBLEMS,
   hiddenPathFolders = NO_PROBLEMS,
+  instructionsCut,
   worktreesDir,
   herdr,
 }: Props) {
@@ -1119,6 +1123,11 @@ export function App({
     if (hiddenPathFolders.length === 0) return;
     addMessage({ role: "system", text: hiddenPathFoldersNotice(hiddenPathFolders) });
   }, [hiddenPathFolders, addMessage]);
+
+  // An AGENTS.md longer than the cap: the model gets its start and the rest's headings (issue #40).
+  useEffect(() => {
+    if (instructionsCut) addMessage({ role: "system", text: instructionsCutNotice(instructionsCut) });
+  }, [instructionsCut, addMessage]);
 
   // MCP: config problems right away; once the servers have started, any that failed, and a project's servers
   // waiting to be trusted (they don't start until then).

@@ -17,6 +17,7 @@ import { TrajectoryStore } from "../src/trajectory.ts";
 import type { ApprovalRequest, Decision, Tool } from "../src/tools/types.ts";
 import { toolSpecsFor } from "../src/tools/index.ts";
 import { MID_TURN_NOTE } from "../src/compact.ts";
+import { readInstructions } from "../src/prompt.ts";
 import { fakeTool } from "./mcp-fakes.ts";
 import { answerProblems } from "./answered.ts";
 import { RoutedProvider, ScriptedProvider } from "./fake-provider.ts";
@@ -1329,5 +1330,29 @@ describe("deferred MCP tools (#14)", () => {
 
   test("a caller's tool can't be named tool_search or mcp_call", () => {
     expect(() => makeSession(new ScriptedProvider([]), { tools: [fakeTool("mcp_call")] })).toThrow(/mcp_call/);
+  });
+});
+
+describe("a long AGENTS.md (#40)", () => {
+  test("the model is told what was cut, reads it with read_file, and the system prompt stays the same every request", async () => {
+    const body = (title: string) => `## ${title}\n\n${"- a rule that matters here\n".repeat(400)}`;
+    await writeFile(join(project, "AGENTS.md"), `# Project\n\n${body("Commands")}\n${body("Architecture")}\n${body("Conventions")}`);
+    const { text, cut } = (await readInstructions(project))!;
+    const conventions = cut!.sections.find((s) => s.heading === "## Conventions")!;
+    const provider = new ScriptedProvider([
+      useTools(call("c1", "read_file", { path: "AGENTS.md", offset: conventions.line, limit: 1 })),
+      say("Read it."),
+      say("Second turn."),
+    ]);
+    const session = makeSession(provider, { instructions: text });
+    await collect(session.send("what are the conventions?"));
+    await collect(session.send("and again"));
+
+    expect(provider.requests).toHaveLength(3);
+    const system = provider.requests[0]!.options.system!;
+    expect(system).toContain(`- ## Conventions (line ${conventions.line})`);
+    for (const r of provider.requests) expect(r.options.system).toBe(system);
+    const result = provider.requests[1]!.history.find((t) => t.role === "tool");
+    expect(result).toMatchObject({ role: "tool", text: expect.stringContaining(`${conventions.line}→## Conventions`) });
   });
 });

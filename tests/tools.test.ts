@@ -62,6 +62,18 @@ describe("read_file", () => {
     expect(result.summary).toBe("lines 10-12 of 50");
   });
 
+  // Issue #40: AGENTS.md bullets of several thousand characters on one line were unreadable past 500.
+  test("a long line is cut in a long read, and read whole with a small limit", async () => {
+    const long = `- **Topic**: ${"word ".repeat(1600)}end`;
+    await files({ "notes.md": `# Notes\n${long}\n${"short\n".repeat(300)}` });
+    const many = await run("read_file", { path: "notes.md" });
+    expect(many.output).not.toContain("end");
+    expect(many.output).toContain(`(line truncated: ${long.length} characters; offset=2 and limit=1 reads it whole)`);
+    const one = await run("read_file", { path: "notes.md", offset: 2, limit: 1 });
+    expect(one.output).toContain(`    2→${long}\n`);
+    expect((await run("read_file", { path: "notes.md", offset: 2, limit: 3 })).output).toContain(`${long}\n`);
+  });
+
   test("accepts an absolute path inside the project", async () => {
     expect((await run("read_file", { path: join(root, "package.json") })).output).toContain('"demo"');
   });

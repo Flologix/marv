@@ -102,16 +102,87 @@ Your tools: ${tools.join(", ")}. Look at the actual code before you change or ju
   return base + skillsSection(skills) + projectSection(instructions);
 }
 
+/** Where a too-long AGENTS.md was cut, for the startup notice (the model gets the same facts in the text). */
+export interface InstructionsCut {
+  /** The whole (trimmed) file's length. */
+  chars: number;
+  /** The file's line count, and the first line not in the prompt (read_file's numbering). */
+  totalLines: number;
+  nextLine: number;
+  /** The headings (`#` to `###`) after the cut, where read_file finds them. */
+  sections: { heading: string; line: number }[];
+}
+
+/** At most this many headings are listed; a file with more is mostly headings anyway. */
+const MAX_LISTED_SECTIONS = 60;
+
 /**
  * The project's AGENTS.md (the convention many coding agents share for
  * project-specific instructions), read once at startup. Capped so a huge
- * file can't eat the context window.
+ * file can't eat the context window, and cut at a whole line, with a note
+ * listing the sections after the cut and the offset read_file goes on
+ * from (issue #40: a 76k-character file was cut at 20k, and the model had no
+ * way to the rest). Names up front, content on demand, as skills do, so the
+ * system prompt (and the cache) stays small. Built once, so it's the same in
+ * every request.
  */
-export async function loadInstructions(root: string): Promise<string | undefined> {
+export async function readInstructions(root: string): Promise<{ text: string; cut?: InstructionsCut } | undefined> {
   const file = Bun.file(join(root, INSTRUCTIONS_FILE));
   if (!(await file.exists())) return undefined;
-  const text = (await file.text()).trim();
+  const raw = await file.text();
+  const text = raw.trim();
   if (!text) return undefined;
-  if (text.length <= MAX_INSTRUCTION_CHARS) return text;
-  return `${text.slice(0, MAX_INSTRUCTION_CHARS)}\n\n(${INSTRUCTIONS_FILE} was cut off here: it's longer than ${MAX_INSTRUCTION_CHARS} characters.)`;
+  if (text.length <= MAX_INSTRUCTION_CHARS) return { text };
+
+  // Line numbers are the file's, as read_file shows them: count the blank lines trim() took off the start.
+  const before = (raw.slice(0, raw.length - raw.trimStart().length).match(/\n/g) ?? []).length;
+  const lines = text.split("\n");
+  // Whole lines up to the cap; a first line longer than the cap is shown cut (read_file clips it too).
+  let shownLines = 0;
+  let length = 0;
+  while (shownLines < lines.length && length + lines[shownLines]!.length + 1 <= MAX_INSTRUCTION_CHARS) length += lines[shownLines++]!.length + 1;
+  const shown = shownLines > 0 ? lines.slice(0, shownLines).join("\n") : text.slice(0, MAX_INSTRUCTION_CHARS);
+  const cut: InstructionsCut = {
+    chars: text.length,
+    totalLines: before + lines.length,
+    nextLine: before + shownLines + 1,
+    sections: headingsAfter(lines, shownLines).map(({ heading, index }) => ({ heading, line: before + index + 1 })),
+  };
+  return { text: `${shown}\n\n${cutNote(cut)}`, cut };
+}
+
+/** The project's AGENTS.md as it goes into the system prompt (see readInstructions). */
+export async function loadInstructions(root: string): Promise<string | undefined> {
+  return (await readInstructions(root))?.text;
+}
+
+/** `#` to `###` headings from line `from` on (0-based), skipping lines inside code fences, which only look like headings. */
+function headingsAfter(lines: string[], from: number): { heading: string; index: number }[] {
+  const found: { heading: string; index: number }[] = [];
+  let fence: string | undefined;
+  lines.forEach((line, index) => {
+    const marker = /^ {0,3}(`{3,}|~{3,})/.exec(line)?.[1];
+    if (marker) {
+      if (!fence) fence = marker;
+      else if (marker[0] === fence[0] && marker.length >= fence.length && line.trim() === marker) fence = undefined;
+      return;
+    }
+    if (fence || index < from) return;
+    if (/^#{1,3} \S/.test(line)) found.push({ heading: line.trim(), index });
+  });
+  return found;
+}
+
+function cutNote({ nextLine, totalLines, sections }: InstructionsCut): string {
+  const listed = sections.slice(0, MAX_LISTED_SECTIONS).map(({ heading, line }) => `- ${heading} (line ${line})`);
+  if (sections.length > listed.length) listed.push(`- …and ${sections.length - listed.length} more`);
+  const list = listed.length ? ` Sections not shown:\n${listed.join("\n")}` : "";
+  return `(${INSTRUCTIONS_FILE} was cut off here: it's longer than ${MAX_INSTRUCTION_CHARS} characters. Lines ${nextLine}-${totalLines} aren't in this prompt. When your task touches what they cover, read them with read_file with path ${INSTRUCTIONS_FILE} and offset ${nextLine} (or a section's line) rather than working it out from the code.${list})`;
+}
+
+/** Said once at startup, so the user knows the model doesn't see the whole file. */
+export function instructionsCutNotice({ chars, nextLine, sections }: InstructionsCut): string {
+  const count = `${sections.length} section${sections.length === 1 ? "" : "s"}`;
+  const which = sections.length ? ` (${sections.slice(0, 5).map((s) => s.heading).join(", ")}${sections.length > 5 ? ", …" : ""})` : "";
+  return `${INSTRUCTIONS_FILE} is longer than ${MAX_INSTRUCTION_CHARS.toLocaleString("en-US")} characters (${chars.toLocaleString("en-US")}): the model gets lines 1-${nextLine - 1} up front, plus the ${count} after that${which} by name, which it reads with read_file when it needs them. Put what matters most first.`;
 }
