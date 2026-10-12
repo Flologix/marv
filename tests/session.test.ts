@@ -1083,7 +1083,7 @@ describe("diagnostics", () => {
   test("new errors after a step that changed a file reach the model, after the tool results", async () => {
     const { checks } = typescriptProject(ok, broken);
     const provider = new ScriptedProvider([useTools(write("c1")), say("Done.")]);
-    const events = await collect(makeSession(provider, { checks }).send("go"));
+    const events = await collect(makeSession(provider, { typecheck: checks }).send("go"));
     const second = provider.requests[1]!.history;
     expect(second.at(-2)?.role).toBe("tool");
     expect(second.at(-1)).toEqual({ role: "user", text: expect.stringContaining("src/b.ts:1:1 TS2304 Cannot find name 'x'.") });
@@ -1107,13 +1107,13 @@ describe("diagnostics", () => {
 
   test("the baseline is taken before the file is written, also in yolo mode", async () => {
     const { checks, sawFile } = typescriptProject(ok, ok);
-    await collect(makeSession(new ScriptedProvider([useTools(write("c1")), say("Done.")]), { checks }).send("go"));
+    await collect(makeSession(new ScriptedProvider([useTools(write("c1")), say("Done.")]), { typecheck: checks }).send("go"));
     expect(sawFile).toEqual([false, true]);
   });
 
   test("diagnostics: false runs nothing, and configure() turns it on from the next turn", async () => {
     const { checks, sawFile } = typescriptProject(ok, ok);
-    const session = makeSession(new ScriptedProvider([useTools(write("c1")), say("Done."), useTools(write("c2")), say("Done.")]), { checks, diagnostics: false });
+    const session = makeSession(new ScriptedProvider([useTools(write("c1")), say("Done."), useTools(write("c2")), say("Done.")]), { typecheck: checks, diagnostics: false });
     await collect(session.send("go"));
     expect(sawFile).toEqual([]);
     session.configure({ diagnostics: true });
@@ -1124,7 +1124,7 @@ describe("diagnostics", () => {
   test("the check is in the trajectory", async () => {
     const { checks } = typescriptProject(ok, broken);
     const trajectories = new TrajectoryStore(dir);
-    const session = makeSession(new ScriptedProvider([useTools(write("c1")), say("Done.")]), { checks, trajectories });
+    const session = makeSession(new ScriptedProvider([useTools(write("c1")), say("Done.")]), { typecheck: checks, trajectories });
     await collect(session.send("go"));
     await session.flush();
     const files = await Array.fromAsync(new Bun.Glob("**/*.jsonl").scan(dir));
@@ -1142,7 +1142,7 @@ describe("diagnostics", () => {
     const run: RunCheck = async () => (runs++ && (await Bun.sleep(500)), ok);
     const checks = new Diagnostics({ run, sandboxWorks: () => true });
     const trajectories = new TrajectoryStore(dir);
-    const session = makeSession(new ScriptedProvider([[usage, ...useTools(write("c1"))], [usage, ...say("Done.")]]), { checks, trajectories });
+    const session = makeSession(new ScriptedProvider([[usage, ...useTools(write("c1"))], [usage, ...say("Done.")]]), { typecheck: checks, trajectories });
     await collect(session.send("go"));
     await session.flush();
     const files = await Array.fromAsync(new Bun.Glob("**/*.jsonl").scan(dir));
@@ -1160,7 +1160,7 @@ describe("diagnostics", () => {
         super.reset();
       }
     }
-    const session = makeSession(new ScriptedProvider([]), { checks: new Spy() });
+    const session = makeSession(new ScriptedProvider([]), { typecheck: new Spy() });
     session.configure({ diagnostics: true });
     expect(resets).toBe(0);
     session.configure({ diagnostics: false });
@@ -1179,7 +1179,7 @@ describe("diagnostics", () => {
       return { output: "", exitCode: null, timedOut: false, aborted: true };
     };
     const checks = new Diagnostics({ run, sandboxWorks: () => true });
-    const session = makeSession(new ScriptedProvider([useTools(write("c1")), say("Fine.")]), { checks, yolo: false, approve: async () => "no" });
+    const session = makeSession(new ScriptedProvider([useTools(write("c1")), say("Fine.")]), { typecheck: checks, yolo: false, approve: async () => "no" });
     await collect(session.send("go"));
     expect(captured).toBeDefined();
     expect(captured!.aborted).toBe(true);

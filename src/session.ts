@@ -11,7 +11,8 @@ import { agentArgs, answerAllCalls, DEFAULT_MAX_STEPS, runAgent, type LoopEvent 
 import { GENERAL_PURPOSE, type AgentType } from "./agents.ts";
 import { COMPACT_AT, compactedHistory, MID_TURN_NOTE, summarize } from "./compact.ts";
 import { diagnosticsNote } from "./diagnostics/tsc.ts";
-import { Diagnostics, type CheckResult } from "./diagnostics/turn.ts";
+import { checksNote, ProjectChecks, type ProjectCheckResult } from "./checks/kind.ts";
+import { combineChecks, Diagnostics, type CheckOutcome, type CheckResult, type TurnChecks } from "./diagnostics/turn.ts";
 import { EventQueue } from "./event-queue.ts";
 import { classifyReply } from "./feedback.ts";
 import { runGit } from "./git.ts";
@@ -52,6 +53,8 @@ export type SessionEvent =
   | { type: "compaction"; result: CompactResult }
   /** The typecheck after a step's file changes (src/diagnostics): new errors, a failure, or that it's off. */
   | { type: "check"; result: CheckResult }
+  /** The project's own checks (.marv/checks/, src/checks) after a step's file changes: new violations, a failure, or that they're off. */
+  | { type: "checks"; result: ProjectCheckResult }
   /** Always last, exactly once, however the turn ended. */
   | { type: "turn_end"; turn: string; reason: TurnEndReason };
 
@@ -104,7 +107,14 @@ export interface SessionInit {
   /** Typecheck after each step that changed files (TypeScript projects, in the sandbox), and tell the model about new errors. Default true. */
   diagnostics?: boolean;
   /** The typecheck's session state; tests pass one with a stand-in runner. */
-  checks?: Diagnostics;
+  typecheck?: Diagnostics;
+  /**
+   * Run the project's own checks (.marv/checks/, in the sandbox) after each step that changed files a check
+   * concerns, and tell the model about new violations. Default true; nothing runs without that folder.
+   */
+  checks?: boolean;
+  /** The project checks' session state; tests pass one with a stand-in runner. */
+  projectChecks?: ProjectChecks;
   sandbox?: boolean;
   yolo?: boolean;
   /**
@@ -209,6 +219,7 @@ export interface Session {
     yolo?: boolean;
     trajectories?: boolean;
     diagnostics?: boolean;
+    checks?: boolean;
     /** The main agent's step limit (0 never asks); subagents keep their own. */
     maxSteps?: number;
   }): void;
@@ -254,12 +265,14 @@ export class MarvSession implements Session {
   private system: string;
   private sandbox: boolean;
   private diagnostics: boolean;
+  private projectChecksOn: boolean;
   /**
    * The step limit for the main agent's turns; 0 never asks (and, without an approver, never stops). Subagents
    * keep their own SUBAGENT_MAX_STEPS (50) whatever this is.
    */
   private maxSteps: number | undefined;
-  private readonly checks: Diagnostics;
+  private readonly typecheck: Diagnostics;
+  private readonly projectChecks: ProjectChecks;
   private yolo: boolean;
   private logging: boolean;
   private log: Trajectory | null = null;
@@ -292,7 +305,9 @@ export class MarvSession implements Session {
     this.yolo = init.yolo ?? true;
     this.diagnostics = init.diagnostics ?? true;
     this.maxSteps = init.maxSteps;
-    this.checks = init.checks ?? new Diagnostics();
+    this.projectChecksOn = init.checks ?? true;
+    this.typecheck = init.typecheck ?? new Diagnostics();
+    this.projectChecks = init.projectChecks ?? new ProjectChecks();
     this.logging = init.logTrajectories ?? true;
     this.memories = init.memory?.initial;
     // Built once, so every request sends byte-identical tool definitions (the skill tool only when there are skills).
@@ -423,6 +438,7 @@ export class MarvSession implements Session {
     yolo?: boolean;
     trajectories?: boolean;
     diagnostics?: boolean;
+    checks?: boolean;
     maxSteps?: number;
   }): void {
     if (changes.yolo && this.init.noYolo) throw new Error(this.init.noYolo);
@@ -447,8 +463,12 @@ export class MarvSession implements Session {
     if (changes.trajectories !== undefined) this.logging = changes.trajectories;
     if (changes.diagnostics !== undefined) {
       // Turned back on: forget what made checking give up (timeouts), so /diagnostics on really does.
-      if (changes.diagnostics && !this.diagnostics) this.checks.reset();
+      if (changes.diagnostics && !this.diagnostics) this.typecheck.reset();
       this.diagnostics = changes.diagnostics;
+    }
+    if (changes.checks !== undefined) {
+      if (changes.checks && !this.projectChecksOn) this.projectChecks.reset();
+      this.projectChecksOn = changes.checks;
     }
     if (changes.maxSteps !== undefined) this.maxSteps = changes.maxSteps;
     if (!remade) return;
@@ -717,6 +737,7 @@ export class MarvSession implements Session {
         yolo: this.yolo,
         sandbox: this.sandbox,
         diagnostics: this.diagnostics,
+        checks: this.projectChecksOn,
       });
     }
     // Only a logged turn can be rated: feedback for a turn the file never recorded would be an orphan.
@@ -811,7 +832,7 @@ export class MarvSession implements Session {
       // naming its own model gets it from the same provider as the turn, and its usage is counted (local or not) as
       // that one's, priced with what the model list said about the turn's model.
       const { specs, tools } = this.offered();
-      const { sandbox, yolo, factory, provider, info, diagnostics, maxSteps } = this;
+      const { sandbox, yolo, factory, provider, info, diagnostics, projectChecksOn, maxSteps } = this;
       const log = this.trajectory();
       const record = (r: TrajectoryRecord) => log?.write(r);
       this.startTurnLog(log, turn, text, forModel, specs);
@@ -834,38 +855,64 @@ export class MarvSession implements Session {
       emit({ type: "status", status: "running" });
 
       const approve = this.approver(stop.signal);
-      // The typecheck after file changes: a baseline before the first, a check after each step that made one.
-      const checks = diagnostics
-        ? this.checks.turn({
+      // The typecheck and the project's checks after file changes: a baseline before the first, a check after each
+      // step that made one. Both can run at once: "checking" lasts until the last of them is done.
+      let checking = 0;
+      const onStatus = (on: boolean) => {
+        checking += on ? 1 : -1;
+        if (on && checking === 1) emit({ type: "status", status: "checking" });
+        if (!on && checking === 0) {
+          emit({ type: "status", status: "running" });
+          main?.restartClock();
+        }
+      };
+      const checkRecord = <E>(result: CheckOutcome<E>, extra: { source?: "checks"; note?: (added: E[]) => string }): TrajectoryRecord =>
+        result.status === "done"
+          ? {
+              type: "check",
+              turn,
+              agent: "main",
+              ...(extra.source ? { source: extra.source } : {}),
+              status: "done",
+              ms: result.ms,
+              before: result.before,
+              errors: result.errors,
+              added: result.added.length,
+              ...(result.added.length && extra.note ? { note: extra.note(result.added) } : {}),
+            }
+          : result.status === "failed"
+            ? { type: "check", turn, agent: "main", ...(extra.source ? { source: extra.source } : {}), status: "failed", ms: result.ms, reason: result.reason }
+            : { type: "check", turn, agent: "main", ...(extra.source ? { source: extra.source } : {}), status: "off", reason: result.reason };
+      const parts: TurnChecks[] = [];
+      if (diagnostics) {
+        parts.push(
+          this.typecheck.turn({
             root: this.init.root,
             sandbox,
             signal: stop.signal,
-            onStatus: (checking) => {
-              emit({ type: "status", status: checking ? "checking" : "running" });
-              if (!checking) main?.restartClock();
-            },
+            onStatus,
             onResult: (result) => {
               emit({ type: "check", result });
-              record(
-                result.status === "done"
-                  ? {
-                      type: "check",
-                      turn,
-                      agent: "main",
-                      status: "done",
-                      ms: result.ms,
-                      before: result.before,
-                      errors: result.errors,
-                      added: result.added.length,
-                      ...(result.added.length ? { note: diagnosticsNote(result.added) } : {}),
-                    }
-                  : result.status === "failed"
-                    ? { type: "check", turn, agent: "main", status: "failed", ms: result.ms, reason: result.reason }
-                    : { type: "check", turn, agent: "main", status: "off", reason: result.reason },
-              );
+              record(checkRecord(result, { note: diagnosticsNote }));
             },
-          })
-        : undefined;
+          }),
+        );
+      }
+      if (projectChecksOn) {
+        parts.push(
+          this.projectChecks.turn({
+            root: this.init.root,
+            sandbox,
+            signal: stop.signal,
+            onStatus,
+            onResult: (result) => {
+              emit({ type: "checks", result });
+              record(checkRecord(result, { source: "checks", note: checksNote }));
+            },
+          }),
+        );
+      }
+      const checks = parts.length ? combineChecks(parts) : undefined;
       let subagents = 0;
       // What the agent tool needs to start subagents. Only the main agent gets one; what a subagent does reaches
       // this conversation only as its tool result, and the client through "subagent" events.

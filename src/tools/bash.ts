@@ -60,7 +60,7 @@ function realOrSelf(path: string): string {
 }
 
 /** For a project whose .git is a worktree's file: its trusted git folders (see worktreeGitDirs); else none. */
-function worktreeGit(root: string): string[] {
+export function worktreeGit(root: string): string[] {
   const gitFile = join(root, ".git");
   try {
     return lstatSync(gitFile).isFile() ? worktreeGitDirs(gitFile) : [];

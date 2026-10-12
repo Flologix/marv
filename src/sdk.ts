@@ -78,6 +78,12 @@ export interface SessionOptions {
    * sandbox it doesn't run (the compiler is the project's own code).
    */
   diagnostics?: boolean;
+  /**
+   * After a step that changed files, run the project's own checks (one file per rule in `.marv/checks/`: a pattern
+   * that must or must not appear, or a bun script) whose glob matches a changed file, in the sandbox, read-only, and
+   * tell the model about new violations with their why. Default true; nothing runs without that folder.
+   */
+  checks?: boolean;
   /** Run bash in the bubblewrap sandbox (default true). */
   sandbox?: boolean;
   /** Run what the sandbox confines without asking (default true). Must be false when `cwd` is your home folder or above it. */
@@ -158,6 +164,7 @@ export async function createSession(options: SessionOptions): Promise<Session> {
     approve: options.approve,
     maxSteps: options.maxSteps,
     diagnostics: options.diagnostics,
+    checks: options.checks,
     sandbox: options.sandbox,
     yolo: options.yolo,
     noYolo,
@@ -192,6 +199,8 @@ export { OpenAICompatProvider } from "./provider/openai-compat.ts";
 export type { LoopEvent } from "./agent.ts";
 export type { CheckResult } from "./diagnostics/turn.ts";
 export type { TsError } from "./diagnostics/tsc.ts";
+export type { ProjectCheckResult } from "./checks/kind.ts";
+export type { Violation } from "./checks/load.ts";
 export type { Totals } from "./usage.ts";
 export type { Message } from "./types.ts";
 export type { ModelInfo } from "./provider/models.ts";

@@ -108,6 +108,7 @@ export const editFile: Tool<typeof input> = {
         (broken ? `\n\n${syntaxNote(shown, broken, after, true)}` : ""),
       summary: changeSummary(diff),
       diff: shownDiff(diff.lines),
+      changed: shown,
     };
   },
 };
