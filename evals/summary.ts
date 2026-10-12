@@ -1,6 +1,15 @@
 // What an eval run records, and the table that compares them. Pure: evals/run.ts does the running and the
 // reading of result files; this only counts.
 
+import type { SessionEvent } from "../src/sdk.ts";
+
+/** The cost one event carries (the turn's usage, or a subagent's): the runner adds it up as events arrive. */
+export function eventCost(event: SessionEvent): number {
+  if (event.type === "usage") return event.usage.cost ?? 0;
+  if (event.type === "subagent" && event.event.type === "usage") return event.event.usage.cost ?? 0;
+  return 0;
+}
+
 /** One model on one task, once: a line of an evals/results/*.jsonl file. */
 export interface RunResult {
   /** What's being compared, e.g. "baseline" or "fuzzy-edits" (--label). */
@@ -39,6 +48,8 @@ export interface RunResult {
   checkOutput?: string;
   /** Marv's git commit, and whether its working tree had changes. */
   marv?: string;
+  /** Where the requests went, when not OpenRouter's own API (a proxy such as Headroom's, with --base-url). */
+  baseUrl?: string;
 }
 
 export interface SummaryRow {
@@ -52,6 +63,10 @@ export interface SummaryRow {
   requests: number;
   cost: number;
   medianMs: number;
+  /** The proxy host the runs went through (`--base-url`), empty for OpenRouter's own API. */
+  via: string;
+  /** Which runs the row is (label, model and proxy), for the per-task grid. */
+  group: string;
 }
 
 const median = (values: number[]) => {
@@ -61,7 +76,18 @@ const median = (values: number[]) => {
   return sorted.length % 2 ? sorted[mid]! : (sorted[mid - 1]! + sorted[mid]!) / 2;
 };
 
-const groupKey = (r: RunResult) => `${r.label}\u0000${r.model}`;
+// A proxied run and a direct one are compared, never blended: the proxy is part of the group.
+const groupKey = (r: RunResult) => `${r.label}\u0000${r.model}\u0000${r.baseUrl ?? ""}`;
+
+/** The proxy a run went through (`--base-url`), as "via localhost:8787"; nothing for OpenRouter's own API. */
+const via = (r: RunResult | undefined) => {
+  if (!r?.baseUrl) return "";
+  try {
+    return new URL(r.baseUrl).host;
+  } catch {
+    return r.baseUrl;
+  }
+};
 
 /** One row per label and model, in the order they first appear. */
 export function summarizeRuns(results: RunResult[]): SummaryRow[] {
@@ -81,6 +107,8 @@ export function summarizeRuns(results: RunResult[]): SummaryRow[] {
       requests: runs.reduce((n, r) => n + r.requests, 0),
       cost: runs.reduce((n, r) => n + r.cost, 0),
       medianMs: median(runs.map((r) => r.ms)),
+      via: via(runs[0]),
+      group: groupKey(runs[0]!),
     };
   });
 }
@@ -96,12 +124,15 @@ function table(rows: string[][]): string {
 export function formatSummary(results: RunResult[]): string {
   if (results.length === 0) return "No runs.";
   const rows = summarizeRuns(results);
-  const head = ["label", "model", "runs", "pass", "edits", "edit fail", "steps/run", "tools/run", "$/run", "$ total", "median"];
+  // The proxy column appears only when a run went through one: same runs as before, same table otherwise.
+  const showVia = rows.some((r) => r.via);
+  const head = ["label", "model", ...(showVia ? ["via"] : []), "runs", "pass", "edits", "edit fail", "steps/run", "tools/run", "$/run", "$ total", "median"];
   const overview = table([
     head,
     ...rows.map((r) => [
       r.label,
       r.model,
+      ...(showVia ? [r.via || "-"] : []),
       String(r.runs),
       pct(r.passed, r.runs),
       String(r.editCalls),
@@ -115,11 +146,11 @@ export function formatSummary(results: RunResult[]): string {
   ]);
   const tasks = [...new Set(results.map((r) => r.task))].sort();
   const grid = table([
-    ["task", ...rows.map((r) => `${r.label}/${r.model}`)],
+    ["task", ...rows.map((r) => `${r.label}/${r.model}${r.via ? ` via ${r.via}` : ""}`)],
     ...tasks.map((task) => [
       task,
       ...rows.map((row) => {
-        const runs = results.filter((r) => groupKey(r) === `${row.label}\u0000${row.model}` && r.task === task);
+        const runs = results.filter((r) => groupKey(r) === row.group && r.task === task);
         return runs.length ? `${runs.filter((r) => r.pass).length}/${runs.length}` : "-";
       }),
     ]),

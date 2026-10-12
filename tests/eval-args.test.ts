@@ -1,0 +1,28 @@
+import { describe, expect, test } from "bun:test";
+import { parseArgs } from "../evals/args.ts";
+
+describe("parseArgs", () => {
+  test("--base-url overrides the default (OpenRouter)", () => {
+    expect(parseArgs(["--models", "a", "--base-url", "http://localhost:8787/v1"]).baseUrl).toBe("http://localhost:8787/v1");
+  });
+
+  test("no --base-url is no override (the SDK defaults to OpenRouter)", () => {
+    expect(parseArgs(["--models", "a"]).baseUrl).toBeUndefined();
+    expect(parseArgs(["--models", "a", "--label", "x", "--report"]).baseUrl).toBeUndefined();
+  });
+
+  test("--report takes the URLs after the flag and ignores later flags", () => {
+    const args = parseArgs(["--report", "a.jsonl", "b.jsonl", "--label", "x"]);
+    expect(args.report).toEqual(["a.jsonl", "b.jsonl"]);
+  });
+
+  test("--tasks and --models split on commas", () => {
+    expect(parseArgs(["--tasks", "a, b,,c"]).tasks).toEqual(["a", "b", "c"]);
+    expect(parseArgs(["--models", "m1,m2"]).models).toEqual(["m1", "m2"]);
+  });
+
+  test("the numeric options are numbers", () => {
+    const args = parseArgs(["--models", "a", "--repeat", "2", "--budget", "1.5", "--concurrency", "3", "--timeout", "300", "--max-steps", "10"]);
+    expect(args).toMatchObject({ repeat: 2, budget: 1.5, concurrency: 3, timeout: 300, maxSteps: 10 });
+  });
+});

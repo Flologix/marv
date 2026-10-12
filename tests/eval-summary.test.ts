@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { formatSummary, summarizeRuns, type RunResult } from "../evals/summary.ts";
+import { eventCost, formatSummary, summarizeRuns, type RunResult } from "../evals/summary.ts";
 
-const run = (over: Partial<RunResult>): RunResult => ({
+const run = (over: Partial<RunResult> = {}): RunResult => ({
   diagnostics: true,
   label: "base",
   model: "m1",
@@ -42,6 +42,19 @@ describe("summarizeRuns", () => {
   });
 });
 
+describe("eventCost", () => {
+  const usage = (cost: number) => ({ promptTokens: 10, cachedTokens: 5, completionTokens: 2, cost });
+  test("the turn's usage and a subagent's carry cost", () => {
+    expect(eventCost({ type: "usage", usage: usage(0.0002) })).toBeCloseTo(0.0002);
+    expect(eventCost({ type: "subagent", callId: "c1", event: { type: "usage", usage: usage(0.0001) } })).toBeCloseTo(0.0001);
+  });
+
+  test("the other events carry none", () => {
+    expect(eventCost({ type: "done", reason: "end" })).toBe(0);
+    expect(eventCost({ type: "subagent", callId: "c1", event: { type: "done", reason: "end" } })).toBe(0);
+  });
+});
+
 describe("formatSummary", () => {
   test("a row per group with pass and edit-failure percentages, then the per-task grid", () => {
     const text = formatSummary([
@@ -54,6 +67,20 @@ describe("formatSummary", () => {
     expect(text).toContain("25%"); // 1 of 4 edits failed
     expect(text).toMatch(/tabs\s+1\/2/);
     expect(text).toMatch(/json\s+1\/1/);
+  });
+
+  test("runs through a proxy and direct ones are separate rows, even with the same label and model", () => {
+    const rows = summarizeRuns([run(), run({ baseUrl: "http://localhost:8787/v1", cost: 5 })]);
+    expect(rows.map((r) => [r.via, r.runs])).toEqual([["", 1], ["localhost:8787", 1]]);
+    expect(formatSummary([run(), run({ baseUrl: "http://localhost:8787/v1" })])).toMatch(/via localhost:8787/);
+  });
+
+  test("a run with a baseUrl (a proxy) is shown as via <host>, a column only when one exists", () => {
+    const withProxy = formatSummary([run({ model: "m1", baseUrl: "http://localhost:8787/v1" }), run({ model: "m2" })]);
+    expect(withProxy).toMatch(/via/);
+    expect(withProxy).toMatch(/localhost:8787/);
+    expect(withProxy).toMatch(/m2\s+-\s/); // the other group went to OpenRouter's own API
+    expect(formatSummary([run()])).not.toMatch(/via/); // no proxy, no column
   });
 
   test("no runs", () => {

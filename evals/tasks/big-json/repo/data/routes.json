@@ -1,0 +1,5330 @@
+{
+    "routes":
+    [
+        {
+            "handler": "home",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/area0/home"
+        },
+        {
+            "handler": "login",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/area1/:id/details"
+        },
+        {
+            "handler": "userItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/user"
+        },
+        {
+            "handler": "userPostsItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/orgs/:orgId/userPosts/:itemId"
+        },
+        {
+            "handler": "teamItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/team"
+        },
+        {
+            "handler": "teamMembersItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/teamMembers/:itemId"
+        },
+        {
+            "handler": "billing",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/area6/billing"
+        },
+        {
+            "handler": "invoices",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/area7/:id/events"
+        },
+        {
+            "handler": "webhooksItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/orgs/:orgId/webhooks"
+        },
+        {
+            "handler": "searchItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/orgs/:orgId/search/:itemId"
+        },
+        {
+            "handler": "uploadsItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/uploads"
+        },
+        {
+            "handler": "avatarsItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/spaces/:spaceId/avatars/:itemId"
+        },
+        {
+            "handler": "settings",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/area12/settings"
+        },
+        {
+            "handler": "tokens",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/area13/:id/preview"
+        },
+        {
+            "handler": "sessionsItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/orgs/:orgId/sessions"
+        },
+        {
+            "handler": "devicesItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/devices/:itemId"
+        },
+        {
+            "handler": "notificationsItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/spaces/:spaceId/notifications"
+        },
+        {
+            "handler": "exportsItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/exports/:itemId"
+        },
+        {
+            "handler": "imports",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/area18/imports"
+        },
+        {
+            "handler": "audit",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/area19/:id/settings"
+        },
+        {
+            "handler": "homeItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/orgs/:orgId/home"
+        },
+        {
+            "handler": "loginItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/login/:itemId"
+        },
+        {
+            "handler": "userItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/spaces/:spaceId/user"
+        },
+        {
+            "handler": "userPostsItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/userPosts/:itemId"
+        },
+        {
+            "handler": "team",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/area4/team"
+        },
+        {
+            "handler": "teamMembers",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/area5/:id/details"
+        },
+        {
+            "handler": "billingItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/billing"
+        },
+        {
+            "handler": "invoicesItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/orgs/:orgId/invoices/:itemId"
+        },
+        {
+            "handler": "webhooksItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/webhooks"
+        },
+        {
+            "handler": "searchItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/search/:itemId"
+        },
+        {
+            "handler": "uploads",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/area10/uploads"
+        },
+        {
+            "handler": "avatars",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/area11/:id/events"
+        },
+        {
+            "handler": "settingsItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/orgs/:orgId/settings"
+        },
+        {
+            "handler": "tokensItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/orgs/:orgId/tokens/:itemId"
+        },
+        {
+            "handler": "sessionsItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/sessions"
+        },
+        {
+            "handler": "devicesItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/spaces/:spaceId/devices/:itemId"
+        },
+        {
+            "handler": "notifications",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/area16/notifications"
+        },
+        {
+            "handler": "exports",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/area17/:id/preview"
+        },
+        {
+            "handler": "importsItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/orgs/:orgId/imports"
+        },
+        {
+            "handler": "auditItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/audit/:itemId"
+        },
+        {
+            "handler": "homeItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/spaces/:spaceId/home"
+        },
+        {
+            "handler": "loginItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/login/:itemId"
+        },
+        {
+            "handler": "user",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/area2/user"
+        },
+        {
+            "handler": "userPosts",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/area3/:id/settings"
+        },
+        {
+            "handler": "teamItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/orgs/:orgId/team"
+        },
+        {
+            "handler": "teamMembersItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/teamMembers/:itemId"
+        },
+        {
+            "handler": "billingItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/spaces/:spaceId/billing"
+        },
+        {
+            "handler": "invoicesItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/invoices/:itemId"
+        },
+        {
+            "handler": "webhooks",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/area8/webhooks"
+        },
+        {
+            "handler": "search",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/area9/:id/details"
+        },
+        {
+            "handler": "uploadsItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/uploads"
+        },
+        {
+            "handler": "avatarsItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/orgs/:orgId/avatars/:itemId"
+        },
+        {
+            "handler": "settingsItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/settings"
+        },
+        {
+            "handler": "tokensItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/tokens/:itemId"
+        },
+        {
+            "handler": "sessions",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/area14/sessions"
+        },
+        {
+            "handler": "devices",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/area15/:id/events"
+        },
+        {
+            "handler": "notificationsItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/orgs/:orgId/notifications"
+        },
+        {
+            "handler": "exportsItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/orgs/:orgId/exports/:itemId"
+        },
+        {
+            "handler": "importsItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/imports"
+        },
+        {
+            "handler": "auditItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/spaces/:spaceId/audit/:itemId"
+        },
+        {
+            "handler": "home",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/area0/home"
+        },
+        {
+            "handler": "login",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/area1/:id/preview"
+        },
+        {
+            "handler": "userItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/orgs/:orgId/user"
+        },
+        {
+            "handler": "userPostsItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/userPosts/:itemId"
+        },
+        {
+            "handler": "teamItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/spaces/:spaceId/team"
+        },
+        {
+            "handler": "teamMembersItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/teamMembers/:itemId"
+        },
+        {
+            "handler": "billing",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/area6/billing"
+        },
+        {
+            "handler": "invoices",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/area7/:id/settings"
+        },
+        {
+            "handler": "webhooksItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/orgs/:orgId/webhooks"
+        },
+        {
+            "handler": "searchItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/search/:itemId"
+        },
+        {
+            "handler": "uploadsItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/spaces/:spaceId/uploads"
+        },
+        {
+            "handler": "avatarsItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/avatars/:itemId"
+        },
+        {
+            "handler": "settings",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/area12/settings"
+        },
+        {
+            "handler": "tokens",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/area13/:id/details"
+        },
+        {
+            "handler": "sessionsItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/sessions"
+        },
+        {
+            "handler": "devicesItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/orgs/:orgId/devices/:itemId"
+        },
+        {
+            "handler": "notificationsItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/notifications"
+        },
+        {
+            "handler": "exportsItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/exports/:itemId"
+        },
+        {
+            "handler": "imports",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/area18/imports"
+        },
+        {
+            "handler": "audit",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/area19/:id/events"
+        },
+        {
+            "handler": "homeItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/orgs/:orgId/home"
+        },
+        {
+            "handler": "loginItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/orgs/:orgId/login/:itemId"
+        },
+        {
+            "handler": "userItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/user"
+        },
+        {
+            "handler": "userPostsItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/spaces/:spaceId/userPosts/:itemId"
+        },
+        {
+            "handler": "team",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/area4/team"
+        },
+        {
+            "handler": "teamMembers",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/area5/:id/preview"
+        },
+        {
+            "handler": "billingItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/orgs/:orgId/billing"
+        },
+        {
+            "handler": "invoicesItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/invoices/:itemId"
+        },
+        {
+            "handler": "webhooksItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/spaces/:spaceId/webhooks"
+        },
+        {
+            "handler": "searchItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/search/:itemId"
+        },
+        {
+            "handler": "uploads",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/area10/uploads"
+        },
+        {
+            "handler": "avatars",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/area11/:id/settings"
+        },
+        {
+            "handler": "settingsItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/orgs/:orgId/settings"
+        },
+        {
+            "handler": "tokensItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/tokens/:itemId"
+        },
+        {
+            "handler": "sessionsItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/spaces/:spaceId/sessions"
+        },
+        {
+            "handler": "devicesItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/devices/:itemId"
+        },
+        {
+            "handler": "notifications",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/area16/notifications"
+        },
+        {
+            "handler": "exports",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/area17/:id/details"
+        },
+        {
+            "handler": "importsItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/imports"
+        },
+        {
+            "handler": "auditItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/orgs/:orgId/audit/:itemId"
+        },
+        {
+            "handler": "homeItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/home"
+        },
+        {
+            "handler": "loginItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/login/:itemId"
+        },
+        {
+            "handler": "user",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/area2/user"
+        },
+        {
+            "handler": "userPosts",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/area3/:id/events"
+        },
+        {
+            "handler": "teamItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/orgs/:orgId/team"
+        },
+        {
+            "handler": "teamMembersItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/orgs/:orgId/teamMembers/:itemId"
+        },
+        {
+            "handler": "billingItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/billing"
+        },
+        {
+            "handler": "invoicesItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/spaces/:spaceId/invoices/:itemId"
+        },
+        {
+            "handler": "webhooks",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/area8/webhooks"
+        },
+        {
+            "handler": "search",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/area9/:id/preview"
+        },
+        {
+            "handler": "uploadsItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/orgs/:orgId/uploads"
+        },
+        {
+            "handler": "avatarsItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/avatars/:itemId"
+        },
+        {
+            "handler": "settingsItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/spaces/:spaceId/settings"
+        },
+        {
+            "handler": "tokensItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/tokens/:itemId"
+        },
+        {
+            "handler": "sessions",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/area14/sessions"
+        },
+        {
+            "handler": "devices",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/area15/:id/settings"
+        },
+        {
+            "handler": "notificationsItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/orgs/:orgId/notifications"
+        },
+        {
+            "handler": "exportsItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/exports/:itemId"
+        },
+        {
+            "handler": "importsItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/spaces/:spaceId/imports"
+        },
+        {
+            "handler": "auditItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/audit/:itemId"
+        },
+        {
+            "handler": "home",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/area0/home"
+        },
+        {
+            "handler": "login",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/area1/:id/details"
+        },
+        {
+            "handler": "userItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/user"
+        },
+        {
+            "handler": "userPostsItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/orgs/:orgId/userPosts/:itemId"
+        },
+        {
+            "handler": "teamItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/team"
+        },
+        {
+            "handler": "teamMembersItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/teamMembers/:itemId"
+        },
+        {
+            "handler": "billing",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/area6/billing"
+        },
+        {
+            "handler": "invoices",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/area7/:id/events"
+        },
+        {
+            "handler": "webhooksItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/orgs/:orgId/webhooks"
+        },
+        {
+            "handler": "searchItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/orgs/:orgId/search/:itemId"
+        },
+        {
+            "handler": "uploadsItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/uploads"
+        },
+        {
+            "handler": "avatarsItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/spaces/:spaceId/avatars/:itemId"
+        },
+        {
+            "handler": "settings",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/area12/settings"
+        },
+        {
+            "handler": "tokens",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/area13/:id/preview"
+        },
+        {
+            "handler": "sessionsItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/orgs/:orgId/sessions"
+        },
+        {
+            "handler": "devicesItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/devices/:itemId"
+        },
+        {
+            "handler": "notificationsItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/spaces/:spaceId/notifications"
+        },
+        {
+            "handler": "exportsItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/exports/:itemId"
+        },
+        {
+            "handler": "imports",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/area18/imports"
+        },
+        {
+            "handler": "audit",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/area19/:id/settings"
+        },
+        {
+            "handler": "homeItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/orgs/:orgId/home"
+        },
+        {
+            "handler": "loginItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/login/:itemId"
+        },
+        {
+            "handler": "userItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/spaces/:spaceId/user"
+        },
+        {
+            "handler": "userPostsItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/userPosts/:itemId"
+        },
+        {
+            "handler": "team",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/area4/team"
+        },
+        {
+            "handler": "teamMembers",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/area5/:id/details"
+        },
+        {
+            "handler": "billingItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/billing"
+        },
+        {
+            "handler": "invoicesItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/orgs/:orgId/invoices/:itemId"
+        },
+        {
+            "handler": "webhooksItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/webhooks"
+        },
+        {
+            "handler": "searchItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/search/:itemId"
+        },
+        {
+            "handler": "uploads",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/area10/uploads"
+        },
+        {
+            "handler": "avatars",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/area11/:id/events"
+        },
+        {
+            "handler": "settingsItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/orgs/:orgId/settings"
+        },
+        {
+            "handler": "tokensItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/orgs/:orgId/tokens/:itemId"
+        },
+        {
+            "handler": "sessionsItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/sessions"
+        },
+        {
+            "handler": "devicesItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/spaces/:spaceId/devices/:itemId"
+        },
+        {
+            "handler": "notifications",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/area16/notifications"
+        },
+        {
+            "handler": "exports",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/area17/:id/preview"
+        },
+        {
+            "handler": "importsItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/orgs/:orgId/imports"
+        },
+        {
+            "handler": "auditItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/audit/:itemId"
+        },
+        {
+            "handler": "homeItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/spaces/:spaceId/home"
+        },
+        {
+            "handler": "loginItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/login/:itemId"
+        },
+        {
+            "handler": "user",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/area2/user"
+        },
+        {
+            "handler": "userPosts",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/area3/:id/settings"
+        },
+        {
+            "handler": "teamItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/orgs/:orgId/team"
+        },
+        {
+            "handler": "teamMembersItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/teamMembers/:itemId"
+        },
+        {
+            "handler": "billingItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/spaces/:spaceId/billing"
+        },
+        {
+            "handler": "invoicesItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/invoices/:itemId"
+        },
+        {
+            "handler": "webhooks",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/area8/webhooks"
+        },
+        {
+            "handler": "search",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/area9/:id/details"
+        },
+        {
+            "handler": "uploadsItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/uploads"
+        },
+        {
+            "handler": "avatarsItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/orgs/:orgId/avatars/:itemId"
+        },
+        {
+            "handler": "settingsItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/settings"
+        },
+        {
+            "handler": "tokensItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/tokens/:itemId"
+        },
+        {
+            "handler": "sessions",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/area14/sessions"
+        },
+        {
+            "handler": "devices",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/area15/:id/events"
+        },
+        {
+            "handler": "notificationsItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/orgs/:orgId/notifications"
+        },
+        {
+            "handler": "exportsItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/orgs/:orgId/exports/:itemId"
+        },
+        {
+            "handler": "importsItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/imports"
+        },
+        {
+            "handler": "auditItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/spaces/:spaceId/audit/:itemId"
+        },
+        {
+            "handler": "home",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/area0/home"
+        },
+        {
+            "handler": "login",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/area1/:id/preview"
+        },
+        {
+            "handler": "userItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/orgs/:orgId/user"
+        },
+        {
+            "handler": "userPostsItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/userPosts/:itemId"
+        },
+        {
+            "handler": "teamItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/spaces/:spaceId/team"
+        },
+        {
+            "handler": "teamMembersItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/teamMembers/:itemId"
+        },
+        {
+            "handler": "billing",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/area6/billing"
+        },
+        {
+            "handler": "invoices",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/area7/:id/settings"
+        },
+        {
+            "handler": "webhooksItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/orgs/:orgId/webhooks"
+        },
+        {
+            "handler": "searchItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/search/:itemId"
+        },
+        {
+            "handler": "uploadsItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/spaces/:spaceId/uploads"
+        },
+        {
+            "handler": "avatarsItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/avatars/:itemId"
+        },
+        {
+            "handler": "settings",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/area12/settings"
+        },
+        {
+            "handler": "tokens",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/area13/:id/details"
+        },
+        {
+            "handler": "sessionsItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/sessions"
+        },
+        {
+            "handler": "devicesItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/orgs/:orgId/devices/:itemId"
+        },
+        {
+            "handler": "notificationsItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/notifications"
+        },
+        {
+            "handler": "exportsItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/exports/:itemId"
+        },
+        {
+            "handler": "imports",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/area18/imports"
+        },
+        {
+            "handler": "audit",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/area19/:id/events"
+        },
+        {
+            "handler": "homeItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/orgs/:orgId/home"
+        },
+        {
+            "handler": "loginItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/orgs/:orgId/login/:itemId"
+        },
+        {
+            "handler": "userItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/user"
+        },
+        {
+            "handler": "userPostsItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/spaces/:spaceId/userPosts/:itemId"
+        },
+        {
+            "handler": "team",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/area4/team"
+        },
+        {
+            "handler": "teamMembers",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/area5/:id/preview"
+        },
+        {
+            "handler": "billingItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/orgs/:orgId/billing"
+        },
+        {
+            "handler": "invoicesItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/invoices/:itemId"
+        },
+        {
+            "handler": "webhooksItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/spaces/:spaceId/webhooks"
+        },
+        {
+            "handler": "searchItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/search/:itemId"
+        },
+        {
+            "handler": "uploads",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/area10/uploads"
+        },
+        {
+            "handler": "avatars",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/area11/:id/settings"
+        },
+        {
+            "handler": "settingsItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/orgs/:orgId/settings"
+        },
+        {
+            "handler": "tokensItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/tokens/:itemId"
+        },
+        {
+            "handler": "sessionsItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/spaces/:spaceId/sessions"
+        },
+        {
+            "handler": "devicesItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/devices/:itemId"
+        },
+        {
+            "handler": "notifications",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/area16/notifications"
+        },
+        {
+            "handler": "exports",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/area17/:id/details"
+        },
+        {
+            "handler": "importsItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/imports"
+        },
+        {
+            "handler": "auditItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/orgs/:orgId/audit/:itemId"
+        },
+        {
+            "handler": "homeItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/home"
+        },
+        {
+            "handler": "loginItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/login/:itemId"
+        },
+        {
+            "handler": "user",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/area2/user"
+        },
+        {
+            "handler": "userPosts",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/area3/:id/events"
+        },
+        {
+            "handler": "teamItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/orgs/:orgId/team"
+        },
+        {
+            "handler": "teamMembersItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/orgs/:orgId/teamMembers/:itemId"
+        },
+        {
+            "handler": "billingItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/billing"
+        },
+        {
+            "handler": "invoicesItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/spaces/:spaceId/invoices/:itemId"
+        },
+        {
+            "handler": "webhooks",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/area8/webhooks"
+        },
+        {
+            "handler": "search",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/area9/:id/preview"
+        },
+        {
+            "handler": "uploadsItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/orgs/:orgId/uploads"
+        },
+        {
+            "handler": "avatarsItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/avatars/:itemId"
+        },
+        {
+            "handler": "settingsItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/spaces/:spaceId/settings"
+        },
+        {
+            "handler": "tokensItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/tokens/:itemId"
+        },
+        {
+            "handler": "sessions",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/area14/sessions"
+        },
+        {
+            "handler": "devices",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/area15/:id/settings"
+        },
+        {
+            "handler": "notificationsItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/orgs/:orgId/notifications"
+        },
+        {
+            "handler": "exportsItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/exports/:itemId"
+        },
+        {
+            "handler": "importsItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/spaces/:spaceId/imports"
+        },
+        {
+            "handler": "auditItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/audit/:itemId"
+        },
+        {
+            "handler": "home",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/area0/home"
+        },
+        {
+            "handler": "login",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/area1/:id/details"
+        },
+        {
+            "handler": "userItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/user"
+        },
+        {
+            "handler": "userPostsItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/orgs/:orgId/userPosts/:itemId"
+        },
+        {
+            "handler": "teamItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/team"
+        },
+        {
+            "handler": "teamMembersItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/teamMembers/:itemId"
+        },
+        {
+            "handler": "billing",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/area6/billing"
+        },
+        {
+            "handler": "invoices",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/area7/:id/events"
+        },
+        {
+            "handler": "webhooksItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/orgs/:orgId/webhooks"
+        },
+        {
+            "handler": "searchItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/orgs/:orgId/search/:itemId"
+        },
+        {
+            "handler": "uploadsItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/uploads"
+        },
+        {
+            "handler": "avatarsItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/spaces/:spaceId/avatars/:itemId"
+        },
+        {
+            "handler": "settings",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/area12/settings"
+        },
+        {
+            "handler": "tokens",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/area13/:id/preview"
+        },
+        {
+            "handler": "sessionsItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/orgs/:orgId/sessions"
+        },
+        {
+            "handler": "devicesItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/devices/:itemId"
+        },
+        {
+            "handler": "notificationsItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/spaces/:spaceId/notifications"
+        },
+        {
+            "handler": "exportsItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/exports/:itemId"
+        },
+        {
+            "handler": "imports",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/area18/imports"
+        },
+        {
+            "handler": "audit",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/area19/:id/settings"
+        },
+        {
+            "handler": "homeItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/orgs/:orgId/home"
+        },
+        {
+            "handler": "loginItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/login/:itemId"
+        },
+        {
+            "handler": "userItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/spaces/:spaceId/user"
+        },
+        {
+            "handler": "userPostsItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/userPosts/:itemId"
+        },
+        {
+            "handler": "team",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/area4/team"
+        },
+        {
+            "handler": "teamMembers",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/area5/:id/details"
+        },
+        {
+            "handler": "billingItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/billing"
+        },
+        {
+            "handler": "invoicesItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/orgs/:orgId/invoices/:itemId"
+        },
+        {
+            "handler": "webhooksItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/webhooks"
+        },
+        {
+            "handler": "searchItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/search/:itemId"
+        },
+        {
+            "handler": "uploads",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/area10/uploads"
+        },
+        {
+            "handler": "avatars",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/area11/:id/events"
+        },
+        {
+            "handler": "settingsItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/orgs/:orgId/settings"
+        },
+        {
+            "handler": "tokensItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/orgs/:orgId/tokens/:itemId"
+        },
+        {
+            "handler": "sessionsItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/sessions"
+        },
+        {
+            "handler": "devicesItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/spaces/:spaceId/devices/:itemId"
+        },
+        {
+            "handler": "notifications",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/area16/notifications"
+        },
+        {
+            "handler": "exports",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/area17/:id/preview"
+        },
+        {
+            "handler": "importsItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/orgs/:orgId/imports"
+        },
+        {
+            "handler": "auditItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/audit/:itemId"
+        },
+        {
+            "handler": "homeItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/spaces/:spaceId/home"
+        },
+        {
+            "handler": "loginItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/login/:itemId"
+        },
+        {
+            "handler": "user",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/area2/user"
+        },
+        {
+            "handler": "userPosts",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/area3/:id/settings"
+        },
+        {
+            "handler": "teamItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/orgs/:orgId/team"
+        },
+        {
+            "handler": "teamMembersItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/teamMembers/:itemId"
+        },
+        {
+            "handler": "billingItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/spaces/:spaceId/billing"
+        },
+        {
+            "handler": "invoicesItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/invoices/:itemId"
+        },
+        {
+            "handler": "webhooks",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/area8/webhooks"
+        },
+        {
+            "handler": "search",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/area9/:id/details"
+        },
+        {
+            "handler": "uploadsItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/uploads"
+        },
+        {
+            "handler": "avatarsItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/orgs/:orgId/avatars/:itemId"
+        },
+        {
+            "handler": "settingsItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/settings"
+        },
+        {
+            "handler": "tokensItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/tokens/:itemId"
+        },
+        {
+            "handler": "sessions",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/area14/sessions"
+        },
+        {
+            "handler": "devices",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/area15/:id/events"
+        },
+        {
+            "handler": "notificationsItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/orgs/:orgId/notifications"
+        },
+        {
+            "handler": "exportsItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/orgs/:orgId/exports/:itemId"
+        },
+        {
+            "handler": "importsItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/imports"
+        },
+        {
+            "handler": "auditItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/spaces/:spaceId/audit/:itemId"
+        },
+        {
+            "handler": "home",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/area0/home"
+        },
+        {
+            "handler": "login",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/area1/:id/preview"
+        },
+        {
+            "handler": "userItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/orgs/:orgId/user"
+        },
+        {
+            "handler": "userPostsItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/userPosts/:itemId"
+        },
+        {
+            "handler": "teamItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/spaces/:spaceId/team"
+        },
+        {
+            "handler": "teamMembersItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/teamMembers/:itemId"
+        },
+        {
+            "handler": "billing",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/area6/billing"
+        },
+        {
+            "handler": "invoices",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/area7/:id/settings"
+        },
+        {
+            "handler": "webhooksItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/orgs/:orgId/webhooks"
+        },
+        {
+            "handler": "searchItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/search/:itemId"
+        },
+        {
+            "handler": "uploadsItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/spaces/:spaceId/uploads"
+        },
+        {
+            "handler": "avatarsItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/avatars/:itemId"
+        },
+        {
+            "handler": "settings",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/area12/settings"
+        },
+        {
+            "handler": "tokens",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/area13/:id/details"
+        },
+        {
+            "handler": "sessionsItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/sessions"
+        },
+        {
+            "handler": "devicesItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/orgs/:orgId/devices/:itemId"
+        },
+        {
+            "handler": "notificationsItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/notifications"
+        },
+        {
+            "handler": "exportsItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/exports/:itemId"
+        },
+        {
+            "handler": "imports",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/area18/imports"
+        },
+        {
+            "handler": "audit",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/area19/:id/events"
+        },
+        {
+            "handler": "homeItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/orgs/:orgId/home"
+        },
+        {
+            "handler": "loginItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/orgs/:orgId/login/:itemId"
+        },
+        {
+            "handler": "userItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/user"
+        },
+        {
+            "handler": "userPostsItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/spaces/:spaceId/userPosts/:itemId"
+        },
+        {
+            "handler": "team",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/area4/team"
+        },
+        {
+            "handler": "teamMembers",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/area5/:id/preview"
+        },
+        {
+            "handler": "billingItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/orgs/:orgId/billing"
+        },
+        {
+            "handler": "invoicesItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/invoices/:itemId"
+        },
+        {
+            "handler": "webhooksItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/spaces/:spaceId/webhooks"
+        },
+        {
+            "handler": "searchItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/search/:itemId"
+        },
+        {
+            "handler": "uploads",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/area10/uploads"
+        },
+        {
+            "handler": "avatars",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/area11/:id/settings"
+        },
+        {
+            "handler": "settingsItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/orgs/:orgId/settings"
+        },
+        {
+            "handler": "tokensItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/tokens/:itemId"
+        },
+        {
+            "handler": "sessionsItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/spaces/:spaceId/sessions"
+        },
+        {
+            "handler": "devicesItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/devices/:itemId"
+        },
+        {
+            "handler": "notifications",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/area16/notifications"
+        },
+        {
+            "handler": "exports",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/area17/:id/details"
+        },
+        {
+            "handler": "importsItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/imports"
+        },
+        {
+            "handler": "auditItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/orgs/:orgId/audit/:itemId"
+        },
+        {
+            "handler": "homeItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/home"
+        },
+        {
+            "handler": "loginItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/login/:itemId"
+        },
+        {
+            "handler": "user",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/area2/user"
+        },
+        {
+            "handler": "userPosts",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/area3/:id/events"
+        },
+        {
+            "handler": "teamItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/orgs/:orgId/team"
+        },
+        {
+            "handler": "teamMembersItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/orgs/:orgId/teamMembers/:itemId"
+        },
+        {
+            "handler": "billingItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/billing"
+        },
+        {
+            "handler": "invoicesItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/spaces/:spaceId/invoices/:itemId"
+        },
+        {
+            "handler": "webhooks",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/area8/webhooks"
+        },
+        {
+            "handler": "search",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/area9/:id/preview"
+        },
+        {
+            "handler": "uploadsItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/orgs/:orgId/uploads"
+        },
+        {
+            "handler": "avatarsItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/avatars/:itemId"
+        },
+        {
+            "handler": "settingsItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/spaces/:spaceId/settings"
+        },
+        {
+            "handler": "tokensItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/tokens/:itemId"
+        },
+        {
+            "handler": "sessions",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/area14/sessions"
+        },
+        {
+            "handler": "devices",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/area15/:id/settings"
+        },
+        {
+            "handler": "notificationsItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/orgs/:orgId/notifications"
+        },
+        {
+            "handler": "exportsItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/exports/:itemId"
+        },
+        {
+            "handler": "importsItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/spaces/:spaceId/imports"
+        },
+        {
+            "handler": "auditItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/audit/:itemId"
+        },
+        {
+            "handler": "home",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/area0/home"
+        },
+        {
+            "handler": "login",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/area1/:id/details"
+        },
+        {
+            "handler": "userItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/user"
+        },
+        {
+            "handler": "userPostsItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/orgs/:orgId/userPosts/:itemId"
+        },
+        {
+            "handler": "teamItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/team"
+        },
+        {
+            "handler": "teamMembersItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/teamMembers/:itemId"
+        },
+        {
+            "handler": "billing",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/area6/billing"
+        },
+        {
+            "handler": "invoices",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/area7/:id/events"
+        },
+        {
+            "handler": "webhooksItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/orgs/:orgId/webhooks"
+        },
+        {
+            "handler": "searchItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/orgs/:orgId/search/:itemId"
+        },
+        {
+            "handler": "uploadsItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/uploads"
+        },
+        {
+            "handler": "avatarsItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/spaces/:spaceId/avatars/:itemId"
+        },
+        {
+            "handler": "settings",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/area12/settings"
+        },
+        {
+            "handler": "tokens",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/area13/:id/preview"
+        },
+        {
+            "handler": "sessionsItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/orgs/:orgId/sessions"
+        },
+        {
+            "handler": "devicesItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/devices/:itemId"
+        },
+        {
+            "handler": "notificationsItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/spaces/:spaceId/notifications"
+        },
+        {
+            "handler": "exportsItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/exports/:itemId"
+        },
+        {
+            "handler": "imports",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/area18/imports"
+        },
+        {
+            "handler": "audit",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/area19/:id/settings"
+        },
+        {
+            "handler": "homeItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/orgs/:orgId/home"
+        },
+        {
+            "handler": "loginItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/login/:itemId"
+        },
+        {
+            "handler": "userItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/spaces/:spaceId/user"
+        },
+        {
+            "handler": "userPostsItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/userPosts/:itemId"
+        },
+        {
+            "handler": "team",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/area4/team"
+        },
+        {
+            "handler": "teamMembers",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/area5/:id/details"
+        },
+        {
+            "handler": "billingItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/billing"
+        },
+        {
+            "handler": "invoicesItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/orgs/:orgId/invoices/:itemId"
+        },
+        {
+            "handler": "webhooksItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/webhooks"
+        },
+        {
+            "handler": "searchItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/search/:itemId"
+        },
+        {
+            "handler": "uploads",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/area10/uploads"
+        },
+        {
+            "handler": "avatars",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/area11/:id/events"
+        },
+        {
+            "handler": "settingsItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/orgs/:orgId/settings"
+        },
+        {
+            "handler": "tokensItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/orgs/:orgId/tokens/:itemId"
+        },
+        {
+            "handler": "sessionsItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/sessions"
+        },
+        {
+            "handler": "devicesItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/spaces/:spaceId/devices/:itemId"
+        },
+        {
+            "handler": "notifications",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/area16/notifications"
+        },
+        {
+            "handler": "exports",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/area17/:id/preview"
+        },
+        {
+            "handler": "importsItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/orgs/:orgId/imports"
+        },
+        {
+            "handler": "auditItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/audit/:itemId"
+        },
+        {
+            "handler": "homeItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/spaces/:spaceId/home"
+        },
+        {
+            "handler": "loginItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/login/:itemId"
+        },
+        {
+            "handler": "user",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/area2/user"
+        },
+        {
+            "handler": "userPosts",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/area3/:id/settings"
+        },
+        {
+            "handler": "teamItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/orgs/:orgId/team"
+        },
+        {
+            "handler": "teamMembersItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/teamMembers/:itemId"
+        },
+        {
+            "handler": "billingItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/spaces/:spaceId/billing"
+        },
+        {
+            "handler": "invoicesItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/invoices/:itemId"
+        },
+        {
+            "handler": "webhooks",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/area8/webhooks"
+        },
+        {
+            "handler": "search",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/area9/:id/details"
+        },
+        {
+            "handler": "uploadsItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/uploads"
+        },
+        {
+            "handler": "avatarsItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/orgs/:orgId/avatars/:itemId"
+        },
+        {
+            "handler": "settingsItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/settings"
+        },
+        {
+            "handler": "tokensItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/tokens/:itemId"
+        },
+        {
+            "handler": "sessions",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/area14/sessions"
+        },
+        {
+            "handler": "devices",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/area15/:id/events"
+        },
+        {
+            "handler": "notificationsItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/orgs/:orgId/notifications"
+        },
+        {
+            "handler": "exportsItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/orgs/:orgId/exports/:itemId"
+        },
+        {
+            "handler": "importsItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/imports"
+        },
+        {
+            "handler": "auditItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/spaces/:spaceId/audit/:itemId"
+        },
+        {
+            "handler": "home",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/area0/home"
+        },
+        {
+            "handler": "login",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/area1/:id/preview"
+        },
+        {
+            "handler": "userItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/orgs/:orgId/user"
+        },
+        {
+            "handler": "userPostsItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/userPosts/:itemId"
+        },
+        {
+            "handler": "teamItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/spaces/:spaceId/team"
+        },
+        {
+            "handler": "teamMembersItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/teamMembers/:itemId"
+        },
+        {
+            "handler": "billing",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/area6/billing"
+        },
+        {
+            "handler": "invoices",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/area7/:id/settings"
+        },
+        {
+            "handler": "webhooksItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/orgs/:orgId/webhooks"
+        },
+        {
+            "handler": "searchItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/search/:itemId"
+        },
+        {
+            "handler": "uploadsItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/spaces/:spaceId/uploads"
+        },
+        {
+            "handler": "avatarsItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/avatars/:itemId"
+        },
+        {
+            "handler": "settings",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/area12/settings"
+        },
+        {
+            "handler": "tokens",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/area13/:id/details"
+        },
+        {
+            "handler": "sessionsItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/sessions"
+        },
+        {
+            "handler": "devicesItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/orgs/:orgId/devices/:itemId"
+        },
+        {
+            "handler": "notificationsItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/notifications"
+        },
+        {
+            "handler": "exportsItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/exports/:itemId"
+        },
+        {
+            "handler": "imports",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/area18/imports"
+        },
+        {
+            "handler": "audit",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/area19/:id/events"
+        },
+        {
+            "handler": "homeItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/orgs/:orgId/home"
+        },
+        {
+            "handler": "loginItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/orgs/:orgId/login/:itemId"
+        },
+        {
+            "handler": "userItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/user"
+        },
+        {
+            "handler": "userPostsItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/spaces/:spaceId/userPosts/:itemId"
+        },
+        {
+            "handler": "team",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/area4/team"
+        },
+        {
+            "handler": "teamMembers",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/area5/:id/preview"
+        },
+        {
+            "handler": "billingItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/orgs/:orgId/billing"
+        },
+        {
+            "handler": "invoicesItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/invoices/:itemId"
+        },
+        {
+            "handler": "webhooksItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/spaces/:spaceId/webhooks"
+        },
+        {
+            "handler": "searchItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/search/:itemId"
+        },
+        {
+            "handler": "uploads",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/area10/uploads"
+        },
+        {
+            "handler": "avatars",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/area11/:id/settings"
+        },
+        {
+            "handler": "settingsItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/orgs/:orgId/settings"
+        },
+        {
+            "handler": "tokensItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/tokens/:itemId"
+        },
+        {
+            "handler": "sessionsItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/spaces/:spaceId/sessions"
+        },
+        {
+            "handler": "devicesItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/devices/:itemId"
+        },
+        {
+            "handler": "notifications",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/area16/notifications"
+        },
+        {
+            "handler": "exports",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/area17/:id/details"
+        },
+        {
+            "handler": "importsItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/imports"
+        },
+        {
+            "handler": "auditItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/orgs/:orgId/audit/:itemId"
+        },
+        {
+            "handler": "homeItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/home"
+        },
+        {
+            "handler": "loginItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/login/:itemId"
+        },
+        {
+            "handler": "user",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/area2/user"
+        },
+        {
+            "handler": "userPosts",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/area3/:id/events"
+        },
+        {
+            "handler": "teamItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/orgs/:orgId/team"
+        },
+        {
+            "handler": "teamMembersItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/orgs/:orgId/teamMembers/:itemId"
+        },
+        {
+            "handler": "billingItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/billing"
+        },
+        {
+            "handler": "invoicesItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/spaces/:spaceId/invoices/:itemId"
+        },
+        {
+            "handler": "webhooks",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/area8/webhooks"
+        },
+        {
+            "handler": "search",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/area9/:id/preview"
+        },
+        {
+            "handler": "uploadsItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/orgs/:orgId/uploads"
+        },
+        {
+            "handler": "avatarsItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/avatars/:itemId"
+        },
+        {
+            "handler": "settingsItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/spaces/:spaceId/settings"
+        },
+        {
+            "handler": "tokensItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/tokens/:itemId"
+        },
+        {
+            "handler": "sessions",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/area14/sessions"
+        },
+        {
+            "handler": "devices",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/area15/:id/settings"
+        },
+        {
+            "handler": "notificationsItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/orgs/:orgId/notifications"
+        },
+        {
+            "handler": "exportsItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/exports/:itemId"
+        },
+        {
+            "handler": "importsItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/spaces/:spaceId/imports"
+        },
+        {
+            "handler": "auditItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/audit/:itemId"
+        },
+        {
+            "handler": "home",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/area0/home"
+        },
+        {
+            "handler": "login",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/area1/:id/details"
+        },
+        {
+            "handler": "userItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/user"
+        },
+        {
+            "handler": "userPostsItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/orgs/:orgId/userPosts/:itemId"
+        },
+        {
+            "handler": "teamItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/team"
+        },
+        {
+            "handler": "teamMembersItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/teamMembers/:itemId"
+        },
+        {
+            "handler": "billing",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/area6/billing"
+        },
+        {
+            "handler": "invoices",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/area7/:id/events"
+        },
+        {
+            "handler": "webhooksItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/orgs/:orgId/webhooks"
+        },
+        {
+            "handler": "searchItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/orgs/:orgId/search/:itemId"
+        },
+        {
+            "handler": "uploadsItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/uploads"
+        },
+        {
+            "handler": "avatarsItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/spaces/:spaceId/avatars/:itemId"
+        },
+        {
+            "handler": "settings",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/area12/settings"
+        },
+        {
+            "handler": "tokens",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/area13/:id/preview"
+        },
+        {
+            "handler": "sessionsItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/orgs/:orgId/sessions"
+        },
+        {
+            "handler": "devicesItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/devices/:itemId"
+        },
+        {
+            "handler": "notificationsItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/spaces/:spaceId/notifications"
+        },
+        {
+            "handler": "exportsItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/exports/:itemId"
+        },
+        {
+            "handler": "imports",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/area18/imports"
+        },
+        {
+            "handler": "audit",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/area19/:id/settings"
+        },
+        {
+            "handler": "homeItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/orgs/:orgId/home"
+        },
+        {
+            "handler": "loginItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/login/:itemId"
+        },
+        {
+            "handler": "userItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/spaces/:spaceId/user"
+        },
+        {
+            "handler": "userPostsItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/userPosts/:itemId"
+        },
+        {
+            "handler": "team",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/area4/team"
+        },
+        {
+            "handler": "teamMembers",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/area5/:id/details"
+        },
+        {
+            "handler": "billingItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/billing"
+        },
+        {
+            "handler": "invoicesItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/orgs/:orgId/invoices/:itemId"
+        },
+        {
+            "handler": "webhooksItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/webhooks"
+        },
+        {
+            "handler": "searchItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/search/:itemId"
+        },
+        {
+            "handler": "uploads",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/area10/uploads"
+        },
+        {
+            "handler": "avatars",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/area11/:id/events"
+        },
+        {
+            "handler": "settingsItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/orgs/:orgId/settings"
+        },
+        {
+            "handler": "tokensItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/orgs/:orgId/tokens/:itemId"
+        },
+        {
+            "handler": "sessionsItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/sessions"
+        },
+        {
+            "handler": "devicesItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/spaces/:spaceId/devices/:itemId"
+        },
+        {
+            "handler": "notifications",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/area16/notifications"
+        },
+        {
+            "handler": "exports",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/area17/:id/preview"
+        },
+        {
+            "handler": "importsItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/orgs/:orgId/imports"
+        },
+        {
+            "handler": "auditItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/audit/:itemId"
+        },
+        {
+            "handler": "homeItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/spaces/:spaceId/home"
+        },
+        {
+            "handler": "loginItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/login/:itemId"
+        },
+        {
+            "handler": "user",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/area2/user"
+        },
+        {
+            "handler": "userPosts",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/area3/:id/settings"
+        },
+        {
+            "handler": "teamItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/orgs/:orgId/team"
+        },
+        {
+            "handler": "teamMembersItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/teamMembers/:itemId"
+        },
+        {
+            "handler": "billingItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/spaces/:spaceId/billing"
+        },
+        {
+            "handler": "invoicesItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/invoices/:itemId"
+        },
+        {
+            "handler": "webhooks",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/area8/webhooks"
+        },
+        {
+            "handler": "search",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/area9/:id/details"
+        },
+        {
+            "handler": "uploadsItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/uploads"
+        },
+        {
+            "handler": "avatarsItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/orgs/:orgId/avatars/:itemId"
+        },
+        {
+            "handler": "settingsItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/settings"
+        },
+        {
+            "handler": "tokensItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/tokens/:itemId"
+        },
+        {
+            "handler": "sessions",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/area14/sessions"
+        },
+        {
+            "handler": "devices",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/area15/:id/events"
+        },
+        {
+            "handler": "notificationsItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/orgs/:orgId/notifications"
+        },
+        {
+            "handler": "exportsItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/orgs/:orgId/exports/:itemId"
+        },
+        {
+            "handler": "importsItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/imports"
+        },
+        {
+            "handler": "auditItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/spaces/:spaceId/audit/:itemId"
+        },
+        {
+            "handler": "home",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/area0/home"
+        },
+        {
+            "handler": "login",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/area1/:id/preview"
+        },
+        {
+            "handler": "userItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/orgs/:orgId/user"
+        },
+        {
+            "handler": "userPostsItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/userPosts/:itemId"
+        },
+        {
+            "handler": "teamItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/spaces/:spaceId/team"
+        },
+        {
+            "handler": "teamMembersItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/teamMembers/:itemId"
+        },
+        {
+            "handler": "billing",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/area6/billing"
+        },
+        {
+            "handler": "invoices",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/area7/:id/settings"
+        },
+        {
+            "handler": "webhooksItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/orgs/:orgId/webhooks"
+        },
+        {
+            "handler": "searchItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/search/:itemId"
+        },
+        {
+            "handler": "uploadsItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/spaces/:spaceId/uploads"
+        },
+        {
+            "handler": "avatarsItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/avatars/:itemId"
+        },
+        {
+            "handler": "settings",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/area12/settings"
+        },
+        {
+            "handler": "tokens",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/area13/:id/details"
+        },
+        {
+            "handler": "sessionsItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/sessions"
+        },
+        {
+            "handler": "devicesItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/orgs/:orgId/devices/:itemId"
+        },
+        {
+            "handler": "notificationsItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/notifications"
+        },
+        {
+            "handler": "exportsItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/exports/:itemId"
+        },
+        {
+            "handler": "imports",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/area18/imports"
+        },
+        {
+            "handler": "audit",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/area19/:id/events"
+        },
+        {
+            "handler": "homeItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/orgs/:orgId/home"
+        },
+        {
+            "handler": "loginItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/orgs/:orgId/login/:itemId"
+        },
+        {
+            "handler": "userItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/user"
+        },
+        {
+            "handler": "userPostsItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/spaces/:spaceId/userPosts/:itemId"
+        },
+        {
+            "handler": "team",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/area4/team"
+        },
+        {
+            "handler": "teamMembers",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/area5/:id/preview"
+        },
+        {
+            "handler": "billingItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/orgs/:orgId/billing"
+        },
+        {
+            "handler": "invoicesItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/invoices/:itemId"
+        },
+        {
+            "handler": "webhooksItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/spaces/:spaceId/webhooks"
+        },
+        {
+            "handler": "searchItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/search/:itemId"
+        },
+        {
+            "handler": "uploads",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/area10/uploads"
+        },
+        {
+            "handler": "avatars",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/area11/:id/settings"
+        },
+        {
+            "handler": "settingsItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/orgs/:orgId/settings"
+        },
+        {
+            "handler": "tokensItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/tokens/:itemId"
+        },
+        {
+            "handler": "sessionsItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/spaces/:spaceId/sessions"
+        },
+        {
+            "handler": "devicesItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/devices/:itemId"
+        },
+        {
+            "handler": "notifications",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/area16/notifications"
+        },
+        {
+            "handler": "exports",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/area17/:id/details"
+        },
+        {
+            "handler": "importsItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/imports"
+        },
+        {
+            "handler": "auditItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/orgs/:orgId/audit/:itemId"
+        },
+        {
+            "handler": "homeItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/home"
+        },
+        {
+            "handler": "loginItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/login/:itemId"
+        },
+        {
+            "handler": "user",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/area2/user"
+        },
+        {
+            "handler": "userPosts",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/area3/:id/events"
+        },
+        {
+            "handler": "teamItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/orgs/:orgId/team"
+        },
+        {
+            "handler": "teamMembersItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/orgs/:orgId/teamMembers/:itemId"
+        },
+        {
+            "handler": "billingItem",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/billing"
+        },
+        {
+            "handler": "invoicesItem",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/spaces/:spaceId/invoices/:itemId"
+        },
+        {
+            "handler": "webhooks",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/area8/webhooks"
+        },
+        {
+            "handler": "search",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/area9/:id/preview"
+        },
+        {
+            "handler": "uploadsItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/orgs/:orgId/uploads"
+        },
+        {
+            "handler": "avatarsItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/avatars/:itemId"
+        },
+        {
+            "handler": "settingsItem",
+            "methods":
+            [
+                "GET"
+            ],
+            "path": "/spaces/:spaceId/settings"
+        },
+        {
+            "handler": "tokensItem",
+            "methods":
+            [
+                "GET",
+                "POST"
+            ],
+            "path": "/spaces/:spaceId/tokens/:itemId"
+        },
+        {
+            "handler": "sessions",
+            "methods":
+            [
+                "GET",
+                "POST",
+                "DELETE"
+            ],
+            "path": "/area14/sessions"
+        },
+        {
+            "handler": "devices",
+            "methods":
+            [
+                "GET",
+                "PATCH"
+            ],
+            "path": "/area15/:id/settings"
+        },
+        {
+            "handler": "notificationsItem",
+            "methods":
+            [
+                "POST"
+            ],
+            "path": "/orgs/:orgId/notifications"
+        },
+        {
+            "handler": "exportsItem",
+            "methods":
+            [
+                "GET",
+                "DELETE"
+            ],
+            "path": "/orgs/:orgId/exports/:itemId"
+        },
+        {
+            "handler": "importsItem",
+            "methods":
+            [
+                "PUT"
+            ],
+            "path": "/spaces/:spaceId/imports"
+        },
+        {
+            "handler": "auditItem",
+            "methods":
+            [
+                "GET",
+                "PUT",
+                "DELETE"
+            ],
+            "path": "/spaces/:spaceId/audit/:itemId"
+        }
+    ]
+}

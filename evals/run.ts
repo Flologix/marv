@@ -4,6 +4,7 @@
 //   bun evals/run.ts --verify                         every check fails on the task's repo and passes with its solution
 //   bun evals/run.ts --models a,b --label baseline    each model on each task (OPENROUTER_API_KEY, or ~/.marv's key)
 //         [--tasks x,y] [--repeat 2] [--budget 1.50] [--concurrency 4] [--timeout 300] [--max-steps 50] [--diagnostics on|off]
+//         [--base-url http://localhost:8787/v1]       send the requests there instead of OpenRouter's API (a proxy, e.g. Headroom's)
 //   bun evals/run.ts --report evals/results/a/results.jsonl evals/results/b/results.jsonl
 //
 // A task is a folder: task.md (the request), repo/ (the starting files), check/ (tests copied in only after the
@@ -15,29 +16,17 @@
 import { appendFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { parseArgs } from "./args.ts";
 import { defaultConfigDir } from "../src/config/config.ts";
 import { sandboxAvailable } from "../src/sandbox.ts";
 import { createSession } from "../src/sdk.ts";
 import { runCommand } from "../src/tools/bash.ts";
-import { formatSummary, type RunResult } from "./summary.ts";
+import { eventCost, formatSummary, type RunResult } from "./summary.ts";
 import { addTypeScript, ranTypecheck } from "./typescript.ts";
 
 const TASKS = join(import.meta.dir, "tasks");
 const RESULTS = join(import.meta.dir, "results");
 const CHECK = "bun test ./__eval__.test.js";
-
-// --- Arguments ---
-const argv = process.argv.slice(2);
-const flag = (name: string) => argv.includes(`--${name}`);
-const option = (name: string) => {
-  const at = argv.indexOf(`--${name}`);
-  return at >= 0 ? argv[at + 1] : undefined;
-};
-const list = (name: string) => option(name)?.split(",").map((s) => s.trim()).filter(Boolean);
-
-const allTasks = readdirSync(TASKS).filter((name) => existsSync(join(TASKS, name, "task.md"))).sort();
-const tasks = list("tasks") ?? allTasks;
-for (const task of tasks) if (!allTasks.includes(task)) throw new Error(`No task "${task}" (have: ${allTasks.join(", ")})`);
 
 /** A fresh copy of the task's repo (plus `extra` folders on top), committed, in a temp folder. */
 function workspace(task: string, ...extra: string[]): string {
@@ -66,7 +55,14 @@ async function check(dir: string, task: string): Promise<{ pass: boolean; output
   return { pass: result.exitCode === 0, output: result.output };
 }
 
-if (flag("verify")) {
+const argv = process.argv.slice(2);
+const args = parseArgs(argv);
+
+const allTasks = readdirSync(TASKS).filter((name) => existsSync(join(TASKS, name, "task.md"))).sort();
+const tasks = args.tasks ?? allTasks;
+for (const task of tasks) if (!allTasks.includes(task)) throw new Error(`No task "${task}" (have: ${allTasks.join(", ")})`);
+
+if (args.verify) {
   let ok = true;
   for (const task of tasks) {
     const before = workspace(task);
@@ -84,28 +80,30 @@ if (flag("verify")) {
 const readResults = (path: string): RunResult[] =>
   readFileSync(path, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line) as RunResult);
 
-if (flag("report")) {
-  const files = argv.slice(argv.indexOf("--report") + 1).filter((a) => !a.startsWith("--"));
-  console.log(formatSummary(files.flatMap(readResults)));
+if (args.report.length) {
+  console.log(formatSummary(args.report.flatMap(readResults)));
   process.exit(0);
 }
 
 // --- Running ---
-const models = list("models");
+const models = args.models;
 if (!models?.length) throw new Error("--models a,b is required (OpenRouter model ids)");
-const label = option("label") ?? "run";
-const repeat = Number(option("repeat") ?? 1);
-const budget = Number(option("budget") ?? 1);
-const concurrency = Number(option("concurrency") ?? 4);
-const timeoutMs = Number(option("timeout") ?? 300) * 1000;
+const label = args.label ?? "run";
+const repeat = args.repeat;
+const budget = args.budget;
+const concurrency = args.concurrency;
+const timeoutMs = args.timeout * 1000;
 // Twice the interactive limit: at 25 steps the TUI asks "Keep going?", and a user would say yes once. With no one to
 // ask, 25 was a hard stop, and slow, careful models (one file per step, re-reading after each edit) were measured on
 // the limit instead of on their edits.
-const maxSteps = Number(option("max-steps") ?? 50);
+const maxSteps = args.maxSteps;
 // Marv's typecheck after file changes (on by default, as in the CLI); off for the comparison's other arm.
-const diagnosticsOption = option("diagnostics");
+const diagnosticsOption = args.diagnostics;
 if (diagnosticsOption !== undefined && diagnosticsOption !== "on" && diagnosticsOption !== "off") throw new Error("--diagnostics takes on or off");
 const diagnostics = diagnosticsOption !== "off";
+// A proxy stands between Marv and OpenRouter (e.g. Headroom's, which compresses what's sent); the provider sends
+// everything, cost and cached-token counts included, to its baseUrl instead.
+const baseUrl = args.baseUrl;
 const savedKey = () => (JSON.parse(readFileSync(join(defaultConfigDir(process.env), "config.json"), "utf8")) as { apiKey?: string }).apiKey;
 const apiKey: string = process.env.OPENROUTER_API_KEY ?? savedKey() ?? "";
 if (!apiKey) throw new Error("No OpenRouter key: set OPENROUTER_API_KEY or run marv's /setup.");
@@ -129,20 +127,19 @@ const short = (text: string, max: number) => (text.length > max ? `${text.slice(
 async function runOne({ model, task, rep }: { model: string; task: string; rep: number }): Promise<RunResult> {
   const dir = workspace(task);
   const started = Date.now();
-  const result: RunResult = { label, model, task, rep, pass: false, reason: "error", requests: 0, promptTokens: 0, cachedTokens: 0, completionTokens: 0, cost: 0, ms: 0, tools: {}, editErrors: [], marv, diagnostics };
+  const result: RunResult = { label, model, task, rep, pass: false, reason: "error", requests: 0, promptTokens: 0, cachedTokens: 0, completionTokens: 0, cost: 0, ms: 0, tools: {}, editErrors: [], marv, diagnostics, baseUrl };
   // What happened, for reading a run afterwards: replies, and every tool call with (the start of) what it returned.
   const log: unknown[] = [];
   let timedOut = false;
   try {
-    const session = await createSession({ cwd: dir, provider: { kind: "openrouter", apiKey, model }, maxSteps, diagnostics });
+    const session = await createSession({ cwd: dir, provider: { kind: "openrouter", apiKey, model, baseUrl }, maxSteps, diagnostics });
     const timer = setTimeout(() => {
       timedOut = true;
       session.interrupt();
     }, timeoutMs);
     try {
       for await (const event of session.send(readFileSync(join(TASKS, task, "task.md"), "utf8").trim())) {
-        if (event.type === "usage") spent += event.usage.cost ?? 0;
-        if (event.type === "subagent" && event.event.type === "usage") spent += event.event.usage.cost ?? 0;
+        spent += eventCost(event);
         if (event.type === "assistant") log.push({ assistant: event.text });
         if (event.type === "error") {
           result.error = event.message;
@@ -215,7 +212,10 @@ async function worker() {
   }
 }
 
-console.log(`${jobs.length} runs (${models.length} models × ${tasks.length} tasks × ${repeat}), budget $${budget}, ${maxSteps} steps, diagnostics ${diagnostics ? "on" : "off"}, Marv ${marv} → ${out}`);
+console.log(
+  `${jobs.length} runs (${models.length} models × ${tasks.length} tasks × ${repeat}), budget $${budget}, ${maxSteps} steps, diagnostics ${diagnostics ? "on" : "off"}` +
+    `${baseUrl ? `, via ${baseUrl}` : ""}, Marv ${marv} → ${out}`,
+);
 await Promise.all(Array.from({ length: Math.min(concurrency, jobs.length) }, worker));
 if (skipped.length) console.log(`\nBudget reached: ${skipped.length} runs not started.`);
 console.log(`\n${formatSummary(readResults(resultsFile))}`);
