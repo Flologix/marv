@@ -38,7 +38,8 @@ export function parseRunner(output: string, exitCode: number | null): Violation[
     if (record.done === true) return i === lines.length - 1 ? found : null;
     if (typeof record.check !== "string") return null;
     if (typeof record.error === "string") {
-      found.push({ check: record.check, message: `the check failed: ${record.error}`, failed: true });
+      const why = typeof record.detail === "string" ? { why: `its stderr ended: ${record.detail}` } : {};
+      found.push({ check: record.check, message: `the check failed: ${record.error}`, ...why, failed: true });
       continue;
     }
     if (typeof record.message !== "string") return null;

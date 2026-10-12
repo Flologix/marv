@@ -17,8 +17,9 @@ for (const file of new Bun.Glob("src/**/*.{ts,tsx}").scanSync({ onlyFiles: true 
   lines.forEach((text, i) => {
     const declared = MEMBER.exec(text);
     if (declared) member = declared[1]!;
-    const builds = /\bbuildSystem\s*\(/.test(text) && !(declared && member === "buildSystem");
-    const assigns = file === "src/session.ts" && /\bthis\.system\s*=[^=]/.test(text);
+    const code = text.replace(/\/\/.*$/, "").replace(/^\s*\*.*$/, ""); // not comments that mention it
+    const builds = /\bbuildSystem\s*\(/.test(code) && !(declared && member === "buildSystem");
+    const assigns = file === "src/session.ts" && /\bthis\.system\s*=[^=]/.test(code);
     if (!builds && !assigns) return;
     if (file === "src/session.ts" && ALLOWED.has(member)) return;
     const what = builds ? "buildSystem() called" : "this.system assigned";

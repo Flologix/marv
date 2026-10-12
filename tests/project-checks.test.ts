@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { checksNote, parseRunner, projectCheckNotice, ProjectChecks, runnerCommand, type ProjectCheckResult } from "../src/checks/kind.ts";
+import { checksNote, parseRunner, violationKey, projectCheckNotice, ProjectChecks, runnerCommand, type ProjectCheckResult } from "../src/checks/kind.ts";
 import { concerns, loadChecks, type ProjectCheck } from "../src/checks/load.ts";
 import { Diagnostics, type RunCheck } from "../src/diagnostics/turn.ts";
 import type { AgentEvent, ToolCall } from "../src/provider/types.ts";
@@ -119,8 +119,16 @@ describe("the runner", () => {
     const found = await runAll();
     expect(found).toContainEqual({ check: "good", file: "src/a.ts", line: 2, message: "bad", why: "because" });
     expect(found).toContainEqual({ check: "good", message: "project-wide" });
-    expect(found).toContainEqual({ check: "crash", message: expect.stringMatching(/^the check failed: exited with code 1/), failed: true });
+    expect(found).toContainEqual({ check: "crash", message: "the check failed: exited with code 1", why: expect.stringContaining("boom"), failed: true });
     expect(found).toContainEqual({ check: "chatty", message: expect.stringContaining("printed a line that isn't a violation"), failed: true });
+  });
+
+  test("a script that keeps failing is the same problem each time, however its stderr varies", async () => {
+    put(".marv/checks/flaky.ts", 'console.error(`at ${Date.now()}.${Math.random()}`);\nprocess.exit(3);\n');
+    const [first] = (await runAll())!;
+    const [second] = (await runAll())!;
+    expect(first).toEqual({ check: "flaky", message: "the check failed: exited with code 3", why: expect.stringMatching(/^its stderr ended: at \d/), failed: true });
+    expect(violationKey(second!)).toBe(violationKey(first!));
   });
 
   test("output that isn't the runner's whole report can't be read", () => {

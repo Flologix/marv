@@ -10,7 +10,7 @@ export interface RunnerSpec {
 }
 
 /**
- * Prints one JSON line per violation (`{check, file?, line?, message, why?}`), `{check, error}` for a check that
+ * Prints one JSON line per violation (`{check, file?, line?, message, why?}`), `{check, error, detail?}` for a check that
  * failed, and `{done: true}` last, so output that stops early (a crash, the capture limit) can be told apart.
  */
 export async function runChecks(spec: RunnerSpec): Promise<void> {
@@ -63,9 +63,15 @@ export async function runChecks(spec: RunnerSpec): Promise<void> {
         const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
         const code = await proc.exited;
         clearTimeout(timer);
-        const lastLine = (text: string) => text.trim().split("\n").at(-1)?.slice(0, 200) ?? "";
+        // The line that says what went wrong: the first that mentions an error (bun ends a crash with its version).
+        const lastLine = (text: string) => {
+          const lines = text.trim().split("\n").filter((l) => l.trim());
+          return (lines.find((l) => /error/i.test(l)) ?? lines.at(-1) ?? "").slice(0, 200);
+        };
         if (timedOut) throw new Error(`timed out after ${spec.timeoutMs / 1000} s`);
-        if (code !== 0) throw new Error(`exited with code ${code}${stderr.trim() ? `: ${lastLine(stderr)}` : ""}`);
+        // The message stays the same from run to run (it's part of what makes a problem "the same one"); what stderr
+        // said, which can vary, goes in `detail`.
+        if (code !== 0) throw Object.assign(new Error(`exited with code ${code}`), stderr.trim() ? { detail: lastLine(stderr) } : {});
         const violations: { file?: string; line?: number; message: string; why?: string }[] = [];
         for (const raw of stdout.split("\n")) {
           if (!raw.trim()) continue;
@@ -91,7 +97,8 @@ export async function runChecks(spec: RunnerSpec): Promise<void> {
         for (const v of violations) report(v);
       }
     } catch (error) {
-      print({ check: check.name, error: String((error as Error)?.message ?? error) });
+      const detail = (error as { detail?: unknown })?.detail;
+      print({ check: check.name, error: String((error as Error)?.message ?? error), ...(typeof detail === "string" ? { detail } : {}) });
     }
   }
   print({ done: true });
