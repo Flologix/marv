@@ -364,7 +364,12 @@ async function collectAndOutput(
   return exitCodeFor(reason, refused.length);
 }
 
-/** The exit code for how a turn ended (TurnEndReason: a done reason or "interrupted") and how many calls were refused. */
+/**
+ * The exit code for how a turn ended (TurnEndReason: a done reason or "interrupted") and how many calls were refused.
+ * A refused call makes even a finished turn exit 3, on purpose (#38: "non-zero for … an approval it couldn't get"):
+ * the model may have worked around it, but whoever runs Marv should know it wanted to do something it couldn't
+ * (`refused` in the JSON says what), e.g. to rerun it with --approve.
+ */
 export function exitCodeFor(reason: string, refused: number): number {
   if (refused > 0) return 3;
   if (reason === "end" || reason === "stop") return 0;

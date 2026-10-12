@@ -114,9 +114,10 @@ export async function runTool(call: ToolCall, ctx: ToolContext, available: Tool[
       }
       // No one to ask (a program using the SDK without an approver): refused, as an error the model can read and
       // work around, rather than a "no" that would stop the run.
-      if (!ctx.approve) return noted(fail(`${call.name} needs the user's approval, and there's no one to ask.`, label));
+      const noOneToAsk = () => noted(fail(`${call.name} needs the user's approval, and there's no one to ask.`, label));
+      if (!ctx.approve) return noOneToAsk();
       const decision = await ctx.approve({ tool: call.name, label, preview, scope, ...network });
-      if (decision === "unavailable") return noted(fail(`${call.name} needs the user's approval, and there's no one to ask.`, label));
+      if (decision === "unavailable") return noOneToAsk();
       // Esc at the prompt answers "no" and then aborts the run: that's an interrupt, and the model should read it
       // as one (like the calls queued behind it), not as "the user declined this, don't retry".
       if (decision === "no" && ctx.signal?.aborted) {
