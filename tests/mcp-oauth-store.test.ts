@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loginKey, McpTokenStore } from "../src/mcp/oauth-store.ts";
@@ -38,7 +38,17 @@ describe("McpTokenStore", () => {
       writeFileSync(s.path, content);
       expect(await s.get(YOURS)).toBeUndefined();
     }
-    // And an update over a broken file starts afresh rather than failing.
+  });
+
+  test("an update never writes over a file it can't use (a newer format, a hand edit mid-way): it throws, saying so", async () => {
+    const s = store();
+    for (const content of ["{not json", "null", '{"v":1,"logins":[]}', '{"v":2,"logins":{"personal https://z.test/":{}}}', '"x"']) {
+      writeFileSync(s.path, content);
+      await expect(s.update(YOURS, (e) => ({ ...e, server: "x", tokens, savedAt: 1 }))).rejects.toThrow(/won't write over it/);
+      expect(readFileSync(s.path, "utf8")).toBe(content);
+    }
+    // An empty file holds nothing to lose: an update starts afresh.
+    writeFileSync(s.path, "");
     await s.update(YOURS, (e) => ({ ...e, server: "x", tokens, savedAt: 1 }));
     expect((await s.get(YOURS))?.tokens?.access_token).toBe("a1");
   });
@@ -71,5 +81,37 @@ describe("McpTokenStore", () => {
     ]);
     expect(await a.get("personal https://y.test/mcp")).toBeDefined();
     expect(await b.get(YOURS)).toBeDefined();
+  });
+
+  test("two Marv processes updating one file at once: every entry survives (a lock file held across read-modify-write)", async () => {
+    const s = store();
+    const writer = join(import.meta.dir, "fixtures", "token-store-writer.ts");
+    const run = (prefix: string) => Bun.spawn([process.execPath, writer, s.path, prefix, "40"], { stderr: "pipe" });
+    const children = [run("a"), run("b"), run("c")];
+    // This process joins in too.
+    for (let i = 0; i < 40; i++) await s.update(`d https://x.test/${i}`, (e) => ({ ...e, server: `d${i}` }));
+    for (const child of children) expect(await child.exited).toBe(0);
+    const logins = await s.all();
+    expect(Object.keys(logins)).toHaveLength(160);
+    expect(existsSync(`${s.path}.lock`)).toBe(false);
+  });
+
+  test("a lock left by a crashed process is taken over once it's stale; a live one is waited for", async () => {
+    const s = store();
+    writeFileSync(`${s.path}.lock`, "12345");
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(`${s.path}.lock`, old, old);
+    await s.update(YOURS, (e) => ({ ...e, server: "x" }));
+    expect((await s.get(YOURS))?.server).toBe("x");
+    expect(existsSync(`${s.path}.lock`)).toBe(false);
+
+    writeFileSync(`${s.path}.lock`, "12345");
+    let done = false;
+    const update = s.update(YOURS, (e) => ({ ...e!, server: "y" })).then(() => (done = true));
+    await Bun.sleep(100);
+    expect(done).toBe(false);
+    rmSync(`${s.path}.lock`);
+    await update;
+    expect((await s.get(YOURS))?.server).toBe("y");
   });
 });

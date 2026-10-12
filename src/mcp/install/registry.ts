@@ -102,7 +102,11 @@ function namespaceProof(name: string): string {
   return `the publisher proved it controls ${namespace.split(".").reverse().join(".")}`;
 }
 
-/** The registry's arguments: fixed values and defaults, then what the user gave after -- fills the required rest. */
+/**
+ * The registry's arguments: fixed values and defaults, then what the user gave after -- fills the required rest.
+ * A registry value that starts with "-" is refused: anyone can publish an entry, and a value like --from or -- could
+ * be read as an option to npx/uvx rather than the package. A named argument's own name (--mode) is the package's.
+ */
 function argsOf(inputs: Input[], given: string[], what: string): string[] {
   const args: string[] = [];
   const rest = [...given];
@@ -110,6 +114,9 @@ function argsOf(inputs: Input[], given: string[], what: string): string[] {
   for (const input of inputs) {
     const value = input.value ?? input.default;
     const named = input.type === "named" && input.name;
+    if (value?.startsWith("-")) {
+      throw new Error(`${what}'s entry gives ${named ? `the argument ${input.name} the value` : "the argument value"} ${value}, which starts with "-": Marv only adds values that can't be read as options. Nothing was added.`);
+    }
     if (value !== undefined) {
       args.push(...(named ? [input.name!, value] : [value]));
     } else if (input.isRequired) {
@@ -125,12 +132,19 @@ function argsOf(inputs: Input[], given: string[], what: string): string[] {
   return [...args, ...rest];
 }
 
-/** "Bearer {api_key}" → "Bearer ${API_KEY}"; a value-less header → ${HEADER_NAME}. Only references reach the file. */
-function headerValue(input: Input): string | undefined {
+/**
+ * "Bearer {api_key}" → "Bearer ${API_KEY}"; a value-less header → ${HEADER_NAME}; a secret's fixed value too. Only
+ * references reach the file, as with a typed --header: a fixed value is refused, so a registry entry can't plant a
+ * static Authorization or Cookie header in your config.
+ */
+function headerValue(input: Input, what: string, url: string): string | undefined {
   const variable = (text: string) => text.toUpperCase().replace(/[^A-Z0-9_]/g, "_").replace(/^(\d)/, "_$1");
   if (input.value === undefined) return input.isRequired ? `\${${variable(input.name ?? "TOKEN")}}` : undefined;
   if (/\{[^}]+\}/.test(input.value)) return input.value.replace(/\{([^}]+)\}/g, (_, name: string) => `\${${variable(name)}}`);
-  return input.isSecret ? `\${${variable(input.name ?? "TOKEN")}}` : input.value;
+  if (input.isSecret) return `\${${variable(input.name ?? "TOKEN")}}`;
+  throw new Error(
+    `${what}'s entry gives the header ${input.name} a fixed value: Marv writes only \${VAR} references into your config, so a registry entry can't plant a header. Nothing was added; to add it by its URL with your own: /mcp add ${url} --header "${input.name}: Bearer \${TOKEN}"`,
+  );
 }
 
 /** The registry's environment variables: required ones as ${NAME} (a default as ${NAME:-default}); optional ones are only named. */
@@ -193,7 +207,7 @@ export async function resolveRegistry(source: Extract<Source, { kind: "registry"
     if (parsed.kind !== "http") throw new Error(`${server.name}'s remote URL ${remote.url} isn't one Marv can add.`);
     const headers: Record<string, string> = {};
     for (const h of remote.headers ?? []) {
-      const value = h.name && /^[A-Za-z0-9-]+$/.test(h.name) ? headerValue(h) : undefined;
+      const value = h.name && /^[A-Za-z0-9-]+$/.test(h.name) ? headerValue(h, server.name, remote.url) : undefined;
       if (value !== undefined) headers[h.name!] = value;
     }
     Object.assign(headers, opts.headers);

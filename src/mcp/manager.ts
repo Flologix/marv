@@ -294,7 +294,7 @@ export class McpManager {
     const { name } = c.config;
     // Startup must have said which servers are trusted: a project's server gets no network contact before that.
     await this.ready;
-    if (c.state === "untrusted") throw new Error(`${name} is this project's server and isn't trusted yet: trust it first: /mcp trust`);
+    await this.requireTrusted(c);
     if ((c.state as McpState) === "removed") throw new Error(`${name} was removed with /mcp remove.`);
     const t = c.config.transport;
     if (t.type !== "http") throw new Error(`${name} is a local server: only remote (http) servers log in.`);
@@ -350,11 +350,19 @@ export class McpManager {
     return this.reconnect(c);
   }
 
+  /**
+   * Refuses a project server the user hasn't trusted: it gets no network contact (login, logout's revocation) and
+   * its state isn't touched. Asks the trust store itself, not only the state string another path may have set.
+   */
+  private async requireTrusted(c: Connection): Promise<void> {
+    const trusted = c.state !== "untrusted" && (this.opts.trust ? await this.opts.trust.isTrusted(this.opts.root, c.config).catch(() => false) : true);
+    if (!trusted) throw new Error(`${c.config.name} is this project's server and isn't trusted yet: trust it first: /mcp trust`);
+  }
+
   /** Reconnects one server (after a login), as add() starts one: a turn starting meanwhile waits for it. */
   private async reconnect(c: Connection): Promise<McpServerStatus> {
-    const old = c.client;
-    c.client = undefined;
-    await old?.close().catch(() => {});
+    // The old client stays in c.client until the new one is connected (connect() swaps and closes it), so a call
+    // in between never lands on a closed client.
     const before = this.ready;
     this.settled = false;
     let ready: Promise<void> | undefined = undefined;
@@ -378,6 +386,8 @@ export class McpManager {
     if (!c) throw new Error(`There's no MCP server named "${name}".`);
     const t = c.config.transport;
     if (t.type !== "http" || ownAuthorization(t) || !this.opts.logins) throw new Error(`${name} doesn't log in with /mcp login.`);
+    await this.ready;
+    await this.requireTrusted(c);
     if (this.pending?.server === name) this.pending.cancel(new Error("cancelled: /mcp logout"));
     const key = loginKey({ source: c.config.source, url: t.url }, this.opts.root);
     const entry = await this.opts.logins.get(key);
@@ -436,7 +446,8 @@ export class McpManager {
       }
       c.transport = transport;
       const client = new Client({ name: "marv", version: this.opts.version });
-      c.client = client;
+      // c.client is still the previous client (a login's reconnect) until this one is connected and listed.
+      const previous = c.client;
       await withTimeout(client.connect(transport), this.opts.connectTimeoutMs ?? CONNECT_TIMEOUT_MS, "connecting");
       // close() may have been called while this was connecting: don't leave the server running.
       if (this.closed) throw new Error("closed");
@@ -456,9 +467,10 @@ export class McpManager {
       const call = async (name: string, args: Record<string, unknown>, signal?: AbortSignal) => {
         if (c.state === "removed") throw new Error("the server was removed with /mcp remove (its tools go away in the next conversation)");
         if (c.state === "needs-login") throw new LoginNeeded(c.config.name);
+        // The current client: a login reconnects the server, and tools a running turn already holds use the new one.
+        const used = c.client ?? client;
         try {
-          // The current client: a login reconnects the server, and tools a running turn already holds use the new one.
-          return (await (c.client ?? client).callTool({ name, arguments: args }, undefined, {
+          return (await used.callTool({ name, arguments: args }, undefined, {
             signal,
             timeout,
             // A progress report restarts the timeout, so a long tool that keeps saying how far it got isn't cut off.
@@ -467,6 +479,9 @@ export class McpManager {
             onprogress: () => {},
           })) as McpCallResult;
         } catch (err) {
+          // The client was replaced or closed under the call (a login's reconnect): Marv's sentence for the state
+          // it's in now, never the SDK's "Not connected".
+          if (!wantsLogin(err) && (used !== c.client || c.state !== "connected")) throw stateError(c);
           // The token ran out and couldn't be refreshed: the passive provider refused to open a browser. The model
           // reads Marv's sentence, never the server's or the OAuth error's text.
           if (!wantsLogin(err) || ownAuthorization(t)) throw err;
@@ -487,7 +502,9 @@ export class McpManager {
         return;
       }
       c.tools = unique.map((info) => makeMcpTool(c.config, info, call));
+      c.client = client;
       c.state = "connected";
+      await previous?.close().catch(() => {});
       // A server that exits later: its tools stay listed (the specs can't change), and calls fail with a clear error.
       client.onclose = () => {
         // Not when a login replaced this client with a new one.
@@ -511,6 +528,12 @@ export class McpManager {
         c.error = err instanceof Error ? err.message : String(err);
       }
       await c.transport?.close().catch(() => {});
+      // A login's reconnect that failed: the previous client is no use either.
+      if (c.client) {
+        const old = c.client;
+        c.client = undefined;
+        await old.close().catch(() => {});
+      }
     }
     this.onChange();
   }
@@ -573,6 +596,15 @@ export class McpManager {
       }
     }
   }
+}
+
+/** What a call that lost its client tells the model: the server's state in Marv's words. */
+function stateError(c: Connection): Error {
+  const { name } = c.config;
+  if (c.state === "needs-login") return new LoginNeeded(name);
+  if (c.state === "removed") return new Error("the server was removed with /mcp remove (its tools go away in the next conversation)");
+  if (c.state === "failed") return new Error(`the server isn't available: ${c.error ?? "it failed"}`);
+  return new Error("the server is reconnecting after a login: call it again in a moment.");
 }
 
 /**
