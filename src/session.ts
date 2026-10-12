@@ -1075,7 +1075,12 @@ export class MarvSession implements Session {
         // maxSteps 0 (the guard off) makes onLimit undefined, so there is nothing to ask.
         onLimit:
           approve && maxSteps !== 0
-            ? async (steps) => (await approve(stepLimitRequest(steps, maxSteps ?? DEFAULT_MAX_STEPS))) !== "no"
+            ? async (steps) => {
+                // Only a yes goes on: "unavailable" (marv -p --approve answers that for anything outside its list)
+                // means no one could say so, and stops like a hard limit.
+                const answer = await approve(stepLimitRequest(steps, maxSteps ?? DEFAULT_MAX_STEPS));
+                return answer === "yes" || answer === "always" ? true : answer === "unavailable" ? "unavailable" : false;
+              }
             : undefined,
       })) {
         main.event(event);

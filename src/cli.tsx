@@ -84,12 +84,16 @@ function parseHeadlessArg(all: string[], flag: string): string | undefined {
   return i !== -1 && i + 1 < all.length ? all[i + 1]! : undefined;
 }
 
-/** Returns the integer value after `--flag`. */
+/** Returns the whole number (0 or more) after `--flag`, undefined when absent; exits on anything else (a typo must not quietly mean the saved setting). */
 function parseHeadlessInt(all: string[], flag: string): number | undefined {
   const value = parseHeadlessArg(all, flag);
   if (value === undefined) return undefined;
   const n = Number(value);
-  return Number.isInteger(n) && n >= 0 ? n : undefined;
+  if (value.trim() === "" || !Number.isInteger(n) || n < 0) {
+    console.error(`${flag} must be a whole number, 0 or more. Got: "${value}"`);
+    process.exit(1);
+  }
+  return n;
 }
 
 /** Returns all values after `--flag <scope>` repeated (e.g. `--approve git_write --approve network`). */

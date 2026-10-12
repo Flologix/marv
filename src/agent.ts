@@ -134,9 +134,10 @@ interface Options {
   /**
    * Asked each time the run reaches another multiple of maxSteps, after that
    * step's tool results are in (so the history is valid whatever the answer):
-   * true keeps going for another maxSteps. Without it, maxSteps is a hard stop.
+   * true keeps going for another maxSteps, false stops ("as you asked"). "unavailable" (no one could answer, like
+   * `marv -p --approve`'s approver) stops like a hard limit. Without it, maxSteps is a hard stop.
    */
-  onLimit?: (steps: number) => Promise<boolean>;
+  onLimit?: (steps: number) => Promise<boolean | "unavailable">;
   /**
    * Applied to each call of a reply before it enters the history (after ids are made unique): a call to run and
    * record instead, or null to keep it. The session turns a direct call to a deferred MCP tool into mcp_call (#14),
@@ -315,7 +316,8 @@ export async function* runAgent({
     // onLimit, the user decides at each multiple whether it goes on.
     // maxSteps 0 (the guard off) never matches: 0 steps means never ask.
     if (maxSteps > 0 && step > 0 && step % maxSteps === 0) {
-      const continued = onLimit ? await onLimit(step) : false;
+      const answer = onLimit ? await onLimit(step) : false;
+      const continued = answer === true;
       if (onLimit) yield { type: "step_limit", steps: step, continued };
       if (signal.aborted) {
         yield { type: "done", reason: "aborted" };
@@ -324,7 +326,7 @@ export async function* runAgent({
       if (!continued) {
         yield {
           type: "error",
-          message: onLimit
+          message: onLimit && answer !== "unavailable"
             ? `Stopped at ${step} steps, as you asked. Say "continue" to pick up where it left off.`
             : `Stopped after ${step} steps without a final answer. Say "continue" to pick up where it left off.`,
         };

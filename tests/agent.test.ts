@@ -902,6 +902,14 @@ describe("every tool call gets exactly one result, in call order, however the ru
       expect(end).toEqual({ type: "done", reason: "max_steps" });
     });
 
+    test("with onLimit: no one to answer (unavailable) stops like a hard limit", async () => {
+      const { history, end, events } = await drive(steps(5), {}, { maxSteps: 2, onLimit: async () => "unavailable" });
+      expect(answerProblems(history)).toEqual([]);
+      expect(events).toContainEqual({ type: "step_limit", steps: 2, continued: false });
+      expect(events).toContainEqual(expect.objectContaining({ type: "error", message: expect.stringContaining("without a final answer") }));
+      expect(end).toEqual({ type: "done", reason: "max_steps" });
+    });
+
     test("with onLimit: a yes goes on to the next limit", async () => {
       const { history, end, calls } = await drive(steps(5), {}, { maxSteps: 2, onLimit: async (n) => n < 4 });
       expect(calls).toHaveLength(20);
