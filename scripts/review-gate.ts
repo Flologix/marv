@@ -13,10 +13,10 @@
 //
 // Needs `ocr` on PATH (`npm i -g @alibaba-group/open-code-review`) and a
 // configured model in ~/.opencodereview/config.json (`ocr config provider`).
-// Skip once with `git push --no-verify`.
+// Skip once with `git push --no-verify` or `REVIEW_GATE=off git push`; without `ocr` installed it warns and passes.
 //
-// It fails closed: a review that didn't run, didn't finish, or printed
-// something unreadable blocks the push, as does a finding whose severity it
+// It fails closed once ocr is there: a review that didn't finish, or printed
+// something unreadable, blocks the push, as does a finding whose severity it
 // doesn't know.
 import { spawnSync } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
@@ -68,10 +68,18 @@ const commits = prePush
   : [git("rev-parse", "HEAD")];
 
 if (commits.length === 0) process.exit(0);
+// An explicit opt-out, for one push (`REVIEW_GATE=off git push`) or a machine that doesn't review.
+if (process.env.REVIEW_GATE === "off") {
+  console.error("review-gate: skipped (REVIEW_GATE=off).");
+  process.exit(0);
+}
 
+// Without ocr there's no review to fail: `bun install` turns the hook on for everyone, and a fresh clone or a
+// contributor without ocr must still be able to push. Said loudly; a review that ran and failed still blocks.
 const version = spawnSync("ocr", ["--version"], { encoding: "utf8" });
 if (version.error || version.status !== 0) {
-  fail("`ocr` isn't installed. Install it with `npm i -g @alibaba-group/open-code-review`, then `ocr config provider`.");
+  console.error("review-gate: `ocr` isn't installed, so this push isn't reviewed. Install it with `npm i -g @alibaba-group/open-code-review`, then `ocr config provider`.");
+  process.exit(0);
 }
 const ocrVersion = (version.stdout ?? "").trim();
 if (spawnSync("git", ["rev-parse", "--verify", "--quiet", `${base}^{commit}`]).status !== 0) fail(`base "${base}" isn't a commit here (fetch it, or pass --base)`);

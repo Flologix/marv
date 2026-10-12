@@ -22,3 +22,8 @@ describe("parseArgs", () => {
     expect(parseArgs(["--models", "a"])).toMatchObject({ mcp: undefined, mcpTools: undefined });
   });
 });
+
+test("a numeric option that isn't a number is an error, not a NaN", () => {
+  expect(() => parseArgs(["--timeout", "abc"])).toThrow('--timeout takes a number, not "abc"');
+  expect(() => parseArgs(["--repeat", "-1"])).toThrow("--repeat");
+});

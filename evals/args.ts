@@ -28,7 +28,12 @@ export function parseArgs(argv: string[]): Args {
   };
   const flag = (name: string) => argv.includes(`--${name}`);
   const list = (value?: string) => value?.split(",").map((s) => s.trim()).filter(Boolean);
-  const number = (name: string, fallback: number) => Number(option(name) ?? fallback);
+  const number = (name: string, fallback: number) => {
+    const value = Number(option(name) ?? fallback);
+    // `--timeout abc` would be NaN, and a NaN timeout interrupts every run at once: say so instead.
+    if (!Number.isFinite(value) || value < 0) throw new Error(`--${name} takes a number, not "${option(name)}"`);
+    return value;
+  };
   // The report's files, up to the next flag: `--label x` after them isn't part of the file list (its value would be).
   const at = argv.indexOf("--report");
   const rest = at >= 0 ? argv.slice(at + 1) : [];
