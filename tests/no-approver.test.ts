@@ -31,3 +31,10 @@ test("with yolo on, a call it doesn't vouch for is still refused when there's no
   expect(result).toMatchObject({ isError: true, output: "write_file needs the user's approval, and there's no one to ask." });
   expect(existsSync(join(root, ".git", "config"))).toBe(false);
 });
+
+test("an approver that answers \"unavailable\" refuses like no approver: an error the model can read, not a decline that stops the run", async () => {
+  const result = await runTool(write("a.txt"), { root, yolo: false, approve: async () => "unavailable" });
+  expect(result).toMatchObject({ isError: true, output: "write_file needs the user's approval, and there's no one to ask." });
+  expect(result.declined).toBeUndefined();
+  expect(existsSync(join(root, "a.txt"))).toBe(false);
+});

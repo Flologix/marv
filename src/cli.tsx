@@ -30,8 +30,20 @@ Usage:
   marv              start an interactive session
   marv -c           continue the latest session in this folder (--continue)
   marv -r           pick an earlier session to resume (--resume)
+  marv -p <prompt>  run one non-interactive turn and print the reply (--prompt)
+  marv -p -         read the prompt from stdin
+  marv run <prompt> alias for marv -p (run one non-interactive turn)
   marv --version    print the version
   marv --help       show this help
+
+Options for -p:
+  --output text         print the final reply as text (default)
+  --output json         print a result object as JSON
+  --output stream-json  print each event as a JSON line
+  --approve <scope>     auto-approve everything in this scope (e.g. git_write, network)
+  --max-steps <N>       steps before the turn stops (0 never stops; default: your config's maxSteps)
+  --model <name>        use a different model
+  -c, --continue        continue the latest saved session
 
 Config:
   ~/.marv/config.json   created by the setup screen (/setup to change it)
@@ -55,6 +67,79 @@ if (args.includes("--version") || args.includes("-v")) {
 if (args.includes("--help") || args.includes("-h")) {
   console.log(HELP);
   process.exit(0);
+}
+
+// `marv run <prompt>` as an alias for `marv -p <prompt>`.
+if (args[0] === "run") {
+  const rest = args.slice(1);
+  args.length = 0;
+  args.push("-p", ...(rest.length ? rest : ["-"]));
+}
+
+// Headless mode: `marv -p "<prompt>"` or `marv run` — one turn, no UI.
+
+/** Returns the value after `--flag` (or undefined if not present). */
+function parseHeadlessArg(all: string[], flag: string): string | undefined {
+  const i = all.findLastIndex((a) => a === flag);
+  return i !== -1 && i + 1 < all.length ? all[i + 1]! : undefined;
+}
+
+/** Returns the integer value after `--flag`. */
+function parseHeadlessInt(all: string[], flag: string): number | undefined {
+  const value = parseHeadlessArg(all, flag);
+  if (value === undefined) return undefined;
+  const n = Number(value);
+  return Number.isInteger(n) && n >= 0 ? n : undefined;
+}
+
+/** Returns all values after `--flag <scope>` repeated (e.g. `--approve git_write --approve network`). */
+function parseHeadlessList(all: string[], flag: string): string[] {
+  const scopes: string[] = [];
+  for (let i = 0; i < all.length; i++) {
+    if (all[i] === flag && i + 1 < all.length) {
+      scopes.push(all[i + 1]!);
+      i++; // skip the value
+    }
+  }
+  return scopes;
+}
+
+const promptIndex = args.findLastIndex((a) => a === "-p" || a === "--prompt");
+if (promptIndex !== -1) {
+  let prompt: string | undefined;
+  if (promptIndex + 1 < args.length) {
+    const value = args[promptIndex + 1]!;
+    if (value === "-") {
+      prompt = await Bun.stdin.text();
+    } else {
+      prompt = value;
+    }
+  } else {
+    console.error("-p needs a prompt (or - for stdin)");
+    process.exit(1);
+  }
+
+  if (!prompt) {
+    console.error("No prompt given. Usage: marv -p \"<prompt>\" or marv run <prompt>");
+    process.exit(1);
+  }
+
+  const outputFormatRaw = parseHeadlessArg(args, "--output") || "text";
+  if (!["text", "json", "stream-json"].includes(outputFormatRaw)) {
+    console.error(`--output must be one of: text, json, stream-json. Got: "${outputFormatRaw}"`);
+    process.exit(1);
+  }
+
+  const { runHeadless } = await import("./headless.ts");
+  const exitCode = await runHeadless({
+    prompt,
+    output: outputFormatRaw as "text" | "json" | "stream-json",
+    model: parseHeadlessArg(args, "--model") || parseHeadlessArg(args, "-m"),
+    maxSteps: parseHeadlessInt(args, "--max-steps"),
+    approveScopes: parseHeadlessList(args, "--approve"),
+    resume: args.includes("-c") || args.includes("--continue") ? "latest" : undefined,
+  });
+  process.exit(exitCode);
 }
 
 // The project is wherever Marv was started; the tools can't reach outside it.

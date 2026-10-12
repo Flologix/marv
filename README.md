@@ -216,6 +216,63 @@ After a step that changed files, Marv runs the checks whose glob matches one of 
 
 Ollama's context window defaults to 32k tokens (`contextLength` in the config file). That is large enough for an agent to read code, and fits in 12 GB of VRAM for 9-12B models. Marv never sets it past what the model was trained for (`/api/show`'s context length), so a model trained on 8k isn't run at 32k; the config value is only ever the upper bound.
 
+## Using Marv from scripts and other agents
+
+`marv -p "<prompt>"` (or `marv run <prompt>`) runs one non-interactive turn in the current folder and prints the
+reply to stdout. It loads the same project files and config the TUI does, so a worker started this way behaves
+like an interactive session.
+
+```sh
+# Print the model's reply as text (default)
+marv -p "add a test for the parser"
+
+# Same with "run" alias
+marv run "add a test for the parser"
+
+# Get a JSON result with reply, reason, steps and usage
+marv -p "what is the git log?" --output json
+
+# Follow events as they happen (stream-json)
+marv -p "update the README" --output stream-json
+
+# Read the prompt from stdin
+echo "refactor this file" | marv -p -
+
+# Allow git writes and network commands without asking
+marv -p "install the npm package" --approve git_write --approve network
+
+# Continue the latest saved session
+marv -p "now fix the other one" -c
+
+# Use a different model
+marv -p "audit the dependencies" --model "anthropic/claude-sonnet-5.5"
+```
+
+**Exit codes:**
+- `0` — the model finished normally (the turn ended with reason `end` or `stop`).
+- `1` — an error (the provider failed, or an internal error).
+- `2` — the turn stopped before finishing: the step limit was reached (`--max-steps`), a loop was detected, or
+  another reason the model didn't finish.
+- `3` — approval needed but couldn't be asked (no one to approve a non-yolo-safe call), or the user interrupted it.
+
+**Approvals.** With nobody to ask, what yolo mode allows (sandboxed commands without network, edits outside `.git`,
+read-only tools) runs; everything else is refused as an error the model can read and work around. Pass
+`--approve <scope>` to allow more: e.g. `--approve git_write --approve network`. The model doesn't stop, a refused
+call just returns an error.
+
+**Options for `-p`:**
+| Flag | Effect |
+|---|---|
+| `-p <prompt>` or `-p -` (stdin) | The prompt (required; `marv run <prompt>` is an alias) |
+| `--output text` | Print the final reply as text (default) |
+| `--output json` | Print a JSON object with `reply`, `reason`, `steps`, `usage` |
+| `--output stream-json` | Print a JSON line per event as it happens |
+| `--approve <scope>` | Auto-approve calls in this scope (repeatable) |
+| `--max-steps <N>` | Steps before the turn stops (`0` never stops) |
+| `--model <name>` | Use a different model |
+| `-c` / `--continue` | Continue the latest saved session |
+| `--version`, `--help` | Print version or help |
+
 ## Using Marv from code
 
 Marv's engine is a library too: `@flologixai/marv/sdk` gives your Bun program the same agent the terminal runs
