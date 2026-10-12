@@ -81,9 +81,9 @@ export const writeFile: Tool<typeof input> = {
     const crlfNote = crlf ? "; kept its CRLF line endings" : "";
     if (before === null) {
       const n = lineCount(body);
-      return { output: `Created ${shown} (${n} lines).${note}`, summary: `created · ${n} line${n === 1 ? "" : "s"}`, diff: shownDiff(addedLines(body)) };
+      return { output: `Created ${shown} (${n} lines).${note}`, summary: `created · ${n} line${n === 1 ? "" : "s"}`, diff: shownDiff(addedLines(body)), changed: shown };
     }
     const what = args.append ? "Appended to" : "Wrote";
-    return { output: `${what} ${shown} (${changeSummary(diff)} lines${nl}${crlfNote}).${note}`, summary: changeSummary(diff), diff: shownDiff(diff.lines) };
+    return { output: `${what} ${shown} (${changeSummary(diff)} lines${nl}${crlfNote}).${note}`, summary: changeSummary(diff), diff: shownDiff(diff.lines), changed: shown };
   },
 };

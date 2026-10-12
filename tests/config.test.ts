@@ -44,7 +44,12 @@ describe("resolveConfig", () => {
   const file = { provider: "openrouter" as const, model: "z-ai/glm-5.3", apiKey: "sk-from-file" };
 
   test("uses the file and the preset endpoint when no env vars are set", () => {
-    expect(resolveConfig(file, {})).toEqual({ ...file, baseUrl: PRESETS.openrouter.baseUrl, apiKeySource: "file", thinking: false, contextLength: 32768, sandbox: true, yolo: true, trajectories: true, diagnostics: true, maxSteps: 25 });
+    expect(resolveConfig(file, {})).toEqual({ ...file, baseUrl: PRESETS.openrouter.baseUrl, apiKeySource: "file", thinking: false, contextLength: 32768, sandbox: true, yolo: true, trajectories: true, diagnostics: true, checks: true, maxSteps: 25 });
+  });
+
+  test("checks: on unless the file turns them off", () => {
+    expect(resolveConfig(file, {}).checks).toBe(true);
+    expect(resolveConfig({ ...file, checks: false }, {}).checks).toBe(false);
   });
 
   test("diagnostics: on unless the file turns it off", () => {

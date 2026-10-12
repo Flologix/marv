@@ -100,6 +100,8 @@ export interface ToolResult {
    * written to trajectories (they record named fields).
    */
   diff?: DiffShown;
+  /** The file a change wrote (with `diff`), relative to the project root: which project checks run after the step. */
+  changed?: string;
   isError?: boolean;
   /** The user said no: the agent stops so they can say what to do instead. */
   declined?: boolean;

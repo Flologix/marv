@@ -31,7 +31,7 @@ export type TrajectoryRecord =
   /** Once per session (again on resume): what the runs that follow ran with. */
   | { type: "session"; root: string; marv: string; provider: string; model: string; system: string; tools: string[]; git?: string }
   /** The user's message; `forModel` when the model got something else (a /skill's instructions). */
-  | { type: "turn_start"; turn: string; text: string; forModel?: string; provider: string; model: string; yolo?: boolean; sandbox?: boolean; diagnostics?: boolean }
+  | { type: "turn_start"; turn: string; text: string; forModel?: string; provider: string; model: string; yolo?: boolean; sandbox?: boolean; diagnostics?: boolean; checks?: boolean }
   /** One model request: its tokens (and cost) and how long since the previous step ended. */
   | (Who & { type: "request"; step: number; usage: Usage; ms: number })
   /** A finished reply, with the reasoning before it (thinking models). */
@@ -59,8 +59,11 @@ export type TrajectoryRecord =
   | (Who & { type: "tool_loop"; continued: boolean })
   /** A reply had no text and no tool calls; `next`: asked again, nudged (EMPTY_REPLY_NOTE), or stopped there. */
   | (Who & { type: "empty_reply"; next: "retry" | "nudge" | "stop" })
-  /** The typecheck after a step's file changes (src/diagnostics): how it went, and how many errors were new. */
-  | (Who & { type: "check"; status: "done" | "failed" | "off"; ms?: number; before?: number; errors?: number; added?: number; reason?: string; note?: string })
+  /**
+   * A check after a step's file changes: the typecheck (src/diagnostics), or with `source: "checks"` the project's
+   * own checks (src/checks). How it went, and how many problems were new.
+   */
+  | (Who & { type: "check"; source?: "checks"; status: "done" | "failed" | "off"; ms?: number; before?: number; errors?: number; added?: number; reason?: string; note?: string })
   /** `agent` started a subagent with the agent tool call `call`; its records follow with `agent: subagent`. */
   | (Who & { type: "subagent_start"; subagent: string; call: string; agentType: string; description: string; prompt: string; isolation?: string })
   /** How an agent's run ended (for "main", the turn). */

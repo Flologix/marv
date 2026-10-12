@@ -73,7 +73,8 @@ export function parseTsc(output: string, exitCode: number | null): TsError[] | n
   return errors.length ? errors : null;
 }
 
-const key = (e: TsError) => `${e.file ?? ""}\u0000${e.code}\u0000${e.message}`;
+/** What makes two errors the same one: file, code and message, not line (edits move lines). */
+export const tsErrorKey = (e: TsError) => `${e.file ?? ""}\u0000${e.code}\u0000${e.message}`;
 
 /**
  * The errors in `now` that `before` didn't have. Matched by file, code and message, not line: edits move lines.
@@ -81,10 +82,10 @@ const key = (e: TsError) => `${e.file ?? ""}\u0000${e.code}\u0000${e.message}`;
  */
 export function newErrors(before: TsError[], now: TsError[]): TsError[] {
   const left = new Map<string, number>();
-  for (const e of before) left.set(key(e), (left.get(key(e)) ?? 0) + 1);
+  for (const e of before) left.set(tsErrorKey(e), (left.get(tsErrorKey(e)) ?? 0) + 1);
   return now.filter((e) => {
-    const n = left.get(key(e)) ?? 0;
-    if (n > 0) left.set(key(e), n - 1);
+    const n = left.get(tsErrorKey(e)) ?? 0;
+    if (n > 0) left.set(tsErrorKey(e), n - 1);
     return n === 0;
   });
 }

@@ -22,6 +22,7 @@ Marv is written in TypeScript on [Bun](https://bun.sh), with an [Ink](https://gi
 - **Long conversations.** When the context window fills up, Marv summarizes the conversation and carries on (`/compact` does it on demand). Requests reuse the provider's prompt cache wherever possible.
 - **Trajectories and feedback.** Every turn is logged step by step (requests, replies, tool calls, subagents, timings, tokens) to `~/.marv/trajectories/`, with your ratings: `/good`, `/bad`, `/label`, and what your next message implies ("thanks, perfect" or "that's wrong"). `bun run stats` sums them up per model or Marv version, so you can measure whether a change made runs better.
 - **Type errors caught early.** After Marv changes files in a TypeScript project, it runs the project's own typecheck in the sandbox and tells the model about errors the change added, even in files it didn't touch (a project here means a `tsconfig.json` in the folder Marv starts in plus the project's own `typescript` or tsgo in that folder's `node_modules`; a global tsc isn't used), so it fixes broken callers before saying it's done. `/diagnostics off` turns it off.
+- **Your project's rules, as checks.** Rules from your instructions ("imports use `.ts` extensions", "never call X outside Y") can live in `.marv/checks/` as code: after a step that changed files, Marv runs the checks those files concern, in the sandbox, and tells the model only the violations its change added, with the reason. An obeyed rule costs nothing; a broken one comes back when it matters. See [Checks](#checks).
 - **No dead stops.** After 25 steps without finishing, Marv asks whether to keep going instead of giving up. Raise the interval with `/steps 40` (or `maxSteps` in the config), or turn the asking off with `/steps off` — like Claude Code and Codex, a long run then just keeps going (subagents still stop at their own 50).
 - **Cost tracking.** OpenRouter's actual charge per request, plus context and cache use, in the status bar; `/cost` for the breakdown.
 - **Herdr aware.** Run Marv in a [Herdr](https://herdr.dev) pane and Herdr's sidebar shows whether it's working, waiting for your approval, or done, with nothing to set up.
@@ -93,6 +94,7 @@ Type what you want in plain language, for example:
 | `/label` | Tag the last turn (`/label refactor, tests`) |
 | `/mcp` | Show MCP servers and their tools; `/mcp trust` starts the project's |
 | `/diagnostics` | Show or set the typecheck after edits (`/diagnostics on`, `/diagnostics off`) |
+| `/checks` | List the project's checks and their last result (`/checks on`, `/checks off`) |
 | `/steps` | Show or set the step limit (`/steps 40`, `/steps off` never asks) |
 | `/trajectories` | Show or set run logging (`/trajectories on`, `/trajectories off`) |
 | `/clear` | Start a fresh conversation (the old one stays saved) |
@@ -167,6 +169,24 @@ You are a careful code reviewer. Read the diff, then the code around it…
 
 Put it in `.marv/agents/<name>.md` (this project) or `~/.marv/agents/<name>.md` (all projects); there's also a built-in `general-purpose` agent with every tool. A subagent starts with a fresh conversation that holds only the task it was given, and never gets the `agent` or `memory` tools. Only names and descriptions go into the system prompt, so write descriptions that say when to use the agent. A reference like `superpowers:code-reviewer` finds `code-reviewer`, so skills written for Claude Code work unchanged. `/agents` lists what loaded, and why any file didn't.
 
+## Checks
+
+A check is one rule of your project, in `.marv/checks/`, one file per rule. A simple rule is declarative (YAML or JSON):
+
+```yaml
+# .marv/checks/imports.yaml
+glob: ["src/**/*.{ts,tsx}"]      # the files it reads; it runs after a step that changed one of them
+exclude: src/generated/**        # optional
+forbid: 'from\s+["\'](\.{1,2}/[^"\']*?)(?<!\.tsx?)["\']'   # or require: a pattern each file must contain
+flags: m                         # optional: i, m, s, u
+message: relative import without its .ts extension
+why: Bun runs the sources as they are, and the published package is type-checked from src/.
+```
+
+A rule that needs code is a script, `.marv/checks/<name>.ts`, run with bun from the project's root. Its first comments say which changes concern it (`// glob: src/**/*.ts`; without one it runs after any change), and it prints one JSON line per violation, `{"file": "src/a.ts", "line": 3, "message": "…", "why": "…"}`, then exits 0 (any other exit is reported as the check failing).
+
+After a step that changed files, Marv runs the checks whose glob matches one of them and tells the model only what's new since the turn began (matched by check, file and message, not line), with each check's `why`. Checks are code from the repository, so like the typecheck they run only in the sandbox, with the project read-only and no network, never ask for approval, and don't run at all without the sandbox. `/checks` lists them, what couldn't be loaded, and the last result; `/checks off` (config `checks`, SDK option `checks`) turns them off. Marv's own repository has four in its `.marv/checks/`.
+
 ## Files and settings
 
 | Path | Contents |
@@ -182,6 +202,7 @@ Put it in `.marv/agents/<name>.md` (this project) or `~/.marv/agents/<name>.md` 
 | `~/.marv/mcp.json`, `.mcp.json` | MCP servers: yours, and the project's (`{"mcpServers": {"name": {"command": …} or {"type": "http", "url": …}}}`) |
 | `~/.marv/mcp-trust.json` | Which project MCP servers you've trusted |
 | `.marv/agents/` | The project's agent types |
+| `.marv/checks/` | The project's checks, run after the model's edits ([Checks](#checks)) |
 | `~/.marv/worktrees/<project>/` | Subagents' worktrees while they run (removed when each finishes; its branch stays) |
 | `AGENTS.md` | Project instructions, read into the system prompt at startup |
 
@@ -222,8 +243,8 @@ await session.close();
 - **Turns and events.** `send()` starts a turn at once and returns its events: `turn_start` first and
   `turn_end` last, exactly once however it ends, with the model's text, tool calls (`tool_start`/`tool_end`),
   subagents' events (`subagent`, tagged with the call that started them), `status` (waiting for MCP servers,
-  compacting, checking types, running), `check` (the typecheck after a file change: how many errors were new, a
-  failure, or that it's off), compaction, and `cut_off` (a reply hit the output limit, so nothing in it ran; the
+  compacting, checking, running), `check` (the typecheck after a file change: how many errors were new, a
+  failure, or that it's off), `checks` (the same for the project's checks, `.marv/checks/`), compaction, and `cut_off` (a reply hit the output limit, so nothing in it ran; the
   model is told and goes on, and a second one in a row ends the turn) in between. A file change's `tool_end`
   (`edit_file`, `write_file`) carries `result.diff`: what changed, as numbered lines, for display; the model
   never sees it. Leaving the loop early interrupts the turn (and waits until
@@ -250,6 +271,7 @@ await session.close();
   you pass. `persist: true` saves the conversation where `marv -r` finds it, and `resume: id | "latest"` (with
   `persist`) continues one; `trajectories: true` logs every turn. `diagnostics` (on by default) typechecks
   TypeScript projects after the model's file changes and tells it about new errors; it needs the sandbox.
+  `checks` (on by default; nothing runs without `.marv/checks/`) does the same with the project's own checks.
   `maxSteps` (default 25) sets how many steps a turn runs before it stops or asks; `0` never asks or stops the
   main agent (subagents keep their own limit).
 - **MCP servers in code:** `mcpServers: { name: { command, args } }` (`.mcp.json`'s format). These are trusted like
@@ -260,7 +282,7 @@ await session.close();
   main agent (not to subagents). `input` must be a zod 4 schema (it's described to the model with
   `z.toJSONSchema`). A name of a built-in tool, one used twice, or one starting with `mcp__` (MCP servers'
   tools) makes `createSession` throw. A Provider of your own is used for everything, subagents included.
-- **Settings between turns.** `configure({ provider, thinking, sandbox, yolo, trajectories, diagnostics, maxSteps })`: a turn reads its settings
+- **Settings between turns.** `configure({ provider, thinking, sandbox, yolo, trajectories, diagnostics, checks, maxSteps })`: a turn reads its settings
   when it starts, so a change during one applies from the next. It throws only for an invalid provider (an
   unknown `kind`), a `maxSteps` that isn't a whole number of at least 0, or for turning yolo on in the home folder, and then nothing changed. `close()` stops what's running, waits for it, saves, and stops
   the MCP servers the session started; `send()` throws after it.
