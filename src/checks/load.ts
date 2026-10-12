@@ -91,6 +91,25 @@ export function parsePatternCheck(name: string, file: string, text: string): Pat
   };
 }
 
+/** Glob patterns separated by commas or spaces; a comma inside braces (`*.{ts,tsx}`) belongs to its pattern. */
+function splitPatterns(text: string): string[] {
+  const patterns: string[] = [];
+  let current = "";
+  let depth = 0;
+  for (const char of text) {
+    if (char === "{") depth++;
+    else if (char === "}" && depth > 0) depth--;
+    else if (depth === 0 && (char === "," || /\s/.test(char))) {
+      if (current) patterns.push(current);
+      current = "";
+      continue;
+    }
+    current += char;
+  }
+  if (current) patterns.push(current);
+  return patterns;
+}
+
 /**
  * A script check's settings, from its leading `//` comments: `// glob: src/**\/*.ts, tests/**\/*.ts` (one or more
  * lines; without one it runs after any change) and `// exclude: …`.
@@ -104,7 +123,7 @@ export function parseScriptCheck(name: string, file: string, text: string): Scri
     if (!trimmed.startsWith("//")) break;
     const setting = /^\/\/\s*(glob|exclude)\s*:\s*(.*)$/.exec(trimmed);
     if (!setting) continue;
-    const values = setting[2]!.split(/[,\s]+/).filter(Boolean);
+    const values = splitPatterns(setting[2]!);
     (setting[1] === "glob" ? glob : exclude).push(...values);
   }
   return { kind: "script", name, file, glob: glob.length ? glob : ["**"], exclude };

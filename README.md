@@ -216,7 +216,7 @@ A check is one rule of your project, in `.marv/checks/`, one file per rule. A si
 # .marv/checks/imports.yaml
 glob: ["src/**/*.{ts,tsx}"]      # the files it reads; it runs after a step that changed one of them
 exclude: src/generated/**        # optional
-forbid: 'from\s+["\'](\.{1,2}/[^"\']*?)(?<!\.tsx?)["\']'   # or require: a pattern each file must contain
+forbid: 'from\s+["''](\.{1,2}/[^"'']*?)(?<!\.tsx?)["'']'   # or require: a pattern each file must contain
 flags: m                         # optional: i, m, s, u
 message: relative import without its .ts extension
 why: Bun runs the sources as they are, and the published package is type-checked from src/.

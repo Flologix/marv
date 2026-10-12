@@ -80,10 +80,13 @@ export function checksNote(added: Violation[]): string {
 /** The project's checks as a kind of check: loaded again each turn, so a check added mid-session counts. */
 export const projectChecks: CheckKind<Violation> = {
   prepare(root) {
-    const { checks } = loadChecks(root);
+    let { checks } = loadChecks(root);
     if (checks.length === 0) return null;
     return {
       pass(changed) {
+        // A check edited (or added) during the turn runs as it now reads; the baseline from before the edit stays
+        // what its new violations are compared with.
+        if (changed === null || changed.some((path) => path.startsWith(`${CHECKS_DIR}/`))) checks = loadChecks(root).checks;
         const run = changed === null ? checks : checks.filter((c) => changed.some((path) => concerns(c, path)));
         if (run.length === 0) return null;
         const names = new Set(run.map((c) => c.name));
