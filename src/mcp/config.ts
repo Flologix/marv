@@ -61,6 +61,9 @@ const FileSchema = z.object({ mcpServers: z.record(z.string(), z.unknown()).opti
 /** Server names become part of tool names (mcp__<server>__<tool>), which providers restrict. */
 const NAME = /^[A-Za-z0-9_-]{1,32}$/;
 
+/** A name parseServer accepts (see there for why "__" and a trailing "_" aren't). */
+export const validServerName = (name: string) => NAME.test(name) && !name.includes("__") && !name.endsWith("_");
+
 /** Fills in ${VAR} and ${VAR:-default}; throws naming the first variable that isn't set. */
 function expand(text: string, env: Env): string {
   return text.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}/g, (_, name: string, fallback?: string) => {
@@ -79,14 +82,14 @@ const listed = (values: Record<string, string> | undefined, sep: string) =>
     .join(", ");
 
 /** The raw config, as the user wrote it, on one line. */
-function displayOf(raw: z.infer<typeof Stdio> | z.infer<typeof Http>): string {
+export function displayOf(raw: z.infer<typeof Stdio> | z.infer<typeof Http>): string {
   if ("url" in raw) return [raw.url, raw.headers && `headers ${listed(raw.headers, ": ")}`].filter(Boolean).join(" · ");
   const env = raw.env && Object.keys(raw.env).length ? `env ${listed(raw.env, "=")}` : "";
   return [[raw.command, ...(raw.args ?? [])].join(" "), env].filter(Boolean).join(" · ");
 }
 
 /** The variables a config reads from the environment, in order (not MARV_PROJECT_DIR: that's Marv's own). */
-function readsOf(raw: unknown): string[] {
+export function readsOf(raw: unknown): string[] {
   const names = [...JSON.stringify(raw).matchAll(VARIABLE)].map((m) => m[1]!).filter((n) => n !== "MARV_PROJECT_DIR");
   return [...new Set(names)];
 }
@@ -214,6 +217,15 @@ export async function loadMcpConfig({
     }
   }
   return { servers, problems };
+}
+
+/**
+ * Throws what loading `raw` as server `name` would report, except an unset ${VAR} (that's the user's environment,
+ * not the entry): /mcp add checks an entry with it before writing it, so it never writes one Marv can't load.
+ */
+export function checkEntry(name: string, raw: unknown): void {
+  const anything = new Proxy({} as Env, { get: () => "x" });
+  parseServer(name, raw, "personal", anything, "mcp.json");
 }
 
 /**

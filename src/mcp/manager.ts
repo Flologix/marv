@@ -4,8 +4,8 @@
 // The tool list is fixed once the servers have settled (connected or failed):
 // every request must send the same tool definitions, or the provider's prompt
 // cache starts over. `ready` resolves when they have; the session's turn
-// waits for it before the first request. Only trusting a project's servers (/mcp trust)
-// adds tools later, which the user asked for.
+// waits for it before the first request. Only the user adds tools later: trusting a project's servers
+// (/mcp trust) or adding one (/mcp add). Removing one (/mcp remove) never takes tools away mid-conversation.
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -24,7 +24,8 @@ const STDERR_LINES = 20;
 /** Pages of tools/list read at most (a server listing hundreds of tools would swamp the context anyway). */
 const MAX_PAGES = 50;
 
-export type McpState = "untrusted" | "connecting" | "connected" | "failed";
+/** "removed": taken out with /mcp remove; its tools stay listed (the specs can't shrink) and their calls fail. */
+export type McpState = "untrusted" | "connecting" | "connected" | "failed" | "removed";
 
 export interface McpServerStatus {
   name: string;
@@ -90,6 +91,62 @@ export class McpManager {
     // "connecting" until start() has checked trust: calling them "untrusted" before that would let /mcp trust
     // start your own servers a second time.
     this.connections = servers.map((config) => ({ config, state: "connecting", tools: [], stderr: [] }));
+  }
+
+  /**
+   * Starts one more server now (/mcp add), as startup would (your own: in your home folder, the safe base
+   * environment). A turn that starts meanwhile waits for it, as for /mcp trust. Never rejects for a server
+   * that fails to start: its status says why.
+   */
+  async add(config: McpServerConfig): Promise<McpServerStatus> {
+    if (this.closed) throw new Error("Marv is closing.");
+    const same = this.connections.find((c) => c.config.name === config.name);
+    // A server removed in this conversation keeps its tools listed (the list can't shrink under it), and the new
+    // one's tools would take the same names: it can come back in the next conversation.
+    if (same?.state === "removed") {
+      throw new Error(`"${config.name}" was removed in this conversation and its tools stay listed until the next one: /clear first, or pick another --name.`);
+    }
+    if (same) throw new Error(`There's already an MCP server named "${config.name}".`);
+    const c: Connection = { config, state: "connecting", tools: [], stderr: [] };
+    this.connections.push(c);
+    const before = this.ready;
+    this.settled = false;
+    // Declared first: the wait below compares itself with this.ready once it's done.
+    let ready: Promise<void> | undefined = undefined;
+    ready = (async () => {
+      await before;
+      await this.connect(c);
+      this.rebuild();
+      // Only the latest wait says the servers have settled: another add() may have started meanwhile.
+      if (this.ready === ready) this.settled = true;
+    })();
+    this.ready = ready;
+    await ready;
+    return this.status().find((s) => s.name === config.name)!;
+  }
+
+  /**
+   * Stops a server (/mcp remove). Its tools stay in the tool list until the next conversation (an eager
+   * conversation's history may call them, and the list can't shrink under it), and their calls fail clearly.
+   */
+  async remove(name: string): Promise<void> {
+    const find = () => this.connections.find((x) => x.config.name === name && x.state !== "removed");
+    // One still starting is removed once it has settled, so connect() can't mark it connected afterwards.
+    if (find()?.state === "connecting") await this.ready;
+    const c = find();
+    if (!c) throw new Error(`There's no MCP server named "${name}" running.`);
+    c.state = "removed";
+    c.error = undefined;
+    this.onChange();
+    await c.client?.close().catch(() => {});
+  }
+
+  /** A new conversation: tools of servers removed with /mcp remove aren't offered any more. */
+  forgetRemoved(): void {
+    if (!this.connections.some((c) => c.state === "removed")) return;
+    this.connections = this.connections.filter((c) => c.state !== "removed");
+    this.rebuild();
+    this.onChange();
   }
 
   /** Starts every trusted server. Project servers the user hasn't trusted wait for /mcp trust. */
@@ -194,8 +251,9 @@ export class McpManager {
         seen.add(cursor);
       }
       const timeout = (c.config.timeout ?? DEFAULT_CALL_TIMEOUT_S) * 1000;
-      const call = (name: string, args: Record<string, unknown>, signal?: AbortSignal) =>
-        client.callTool({ name, arguments: args }, undefined, {
+      const call = (name: string, args: Record<string, unknown>, signal?: AbortSignal) => {
+        if (c.state === "removed") return Promise.reject(new Error("the server was removed with /mcp remove (its tools go away in the next conversation)"));
+        return client.callTool({ name, arguments: args }, undefined, {
           signal,
           timeout,
           // A progress report restarts the timeout, so a long tool that keeps saying how far it got isn't cut off.
@@ -203,8 +261,15 @@ export class McpManager {
           resetTimeoutOnProgress: true,
           onprogress: () => {},
         }) as Promise<McpCallResult>;
+      };
       // A tool listed twice (a server repeating a page) is still one tool.
       const unique = [...new Map(infos.map((info) => [info.name, info])).values()];
+      // Removed (/mcp remove) while this was connecting: it stays removed, and the server it started is stopped.
+      if ((c.state as Connection["state"]) === "removed") {
+        await client.close().catch(() => {});
+        this.onChange();
+        return;
+      }
       c.tools = unique.map((info) => makeMcpTool(c.config, info, call));
       c.state = "connected";
       // A server that exits later: its tools stay listed (the specs can't change), and calls fail with a clear error.
@@ -216,8 +281,10 @@ export class McpManager {
         }
       };
     } catch (err) {
-      c.state = "failed";
-      c.error = err instanceof Error ? err.message : String(err);
+      if ((c.state as Connection["state"]) !== "removed") {
+        c.state = "failed";
+        c.error = err instanceof Error ? err.message : String(err);
+      }
       await c.transport?.close().catch(() => {});
     }
     this.onChange();

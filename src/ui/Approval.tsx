@@ -62,9 +62,9 @@ export function Approval({
         <Text>Do you want to proceed?</Text>
         <Select
           items={[
-            { value: "yes", label: "Yes" },
-            { value: "always", label: `Yes, and don't ask again for ${scope.description} this session` },
-            { value: "no", label: "No, and tell Marv what to do instead", hint: "esc" },
+            { value: "yes" as const, label: "Yes" },
+            ...(request.once ? [] : [{ value: "always" as const, label: `Yes, and don't ask again for ${scope.description} this session` }]),
+            { value: "no" as const, label: request.once ? "No" : "No, and tell Marv what to do instead", hint: "esc" },
           ]}
           onSelect={onDecide}
         />

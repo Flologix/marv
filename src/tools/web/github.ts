@@ -84,6 +84,14 @@ export function parseGithub(url: URL): GithubLink | null {
   return null;
 }
 
+/** A repository's README as raw text, through the API (null: it has none). /mcp add reads it for a package name. */
+export async function fetchReadme(owner: string, repo: string, options: GithubOptions = {}): Promise<string | null> {
+  if (!OWNER.test(owner) || !REPO.test(repo)) throw new ToolError(`Not a GitHub repository: ${owner}/${repo}.`);
+  const got = await api(`/repos/${owner}/${repo}/readme`, options, "application/vnd.github.raw");
+  if (got.status === 404) return null;
+  return got.body;
+}
+
 export function fetchGithub(link: GithubLink, options: GithubOptions = {}): Promise<Page> {
   if (link.kind === "repo") return overview(link, options);
   if (link.kind === "tree") return folder(link, options);

@@ -14,7 +14,7 @@ Marv is written in TypeScript on [Bun](https://bun.sh), with an [Ink](https://gi
 - **Safe yolo mode (on by default).** Sandboxed commands and edits inside the project run without asking; anything the sandbox can't contain (network access, git commits and other repository changes, `.git` itself, memory) still shows you a colored diff or the exact command first: yes, yes for the rest of the session, or no (which stops Marv so you can redirect it). `/yolo off` asks for every change.
 - **Sandboxed commands.** On Linux, commands run in [bubblewrap](https://github.com/containers/bubblewrap): only the project folder is writable, your home folder (keys, SSH, Marv's own config) is hidden, there's no network unless a command asks for it, and API keys never reach the command.
 - **Any model.** OpenRouter or a local Ollama model, with a searchable model picker showing prices. Switch with `/model`.
-- **MCP servers.** Connect any [Model Context Protocol](https://modelcontextprotocol.io) server, local or remote, in `.mcp.json` or `~/.marv/mcp.json` (Claude Code's format). Its tools join Marv's; calls ask first unless the server marks a tool read-only, since servers run outside the sandbox. A project's servers only start once you trust them (`/mcp trust`). With many tools connected, the model sees only their names and loads a tool's parameters when it needs one, so they don't cost thousands of tokens on every request (`"mcpTools": "eager"` in the config sends them all).
+- **MCP servers.** Connect any [Model Context Protocol](https://modelcontextprotocol.io) server, local or remote, in `.mcp.json` or `~/.marv/mcp.json` (Claude Code's format). Its tools join Marv's; calls ask first unless the server marks a tool read-only, since servers run outside the sandbox. A project's servers only start once you trust them (`/mcp trust`). `/mcp add <npm package | URL | GitHub repo>` sets one up for you: it pins the version, shows you exactly what it will write, and starts it without a restart (see [Add an MCP server](#add-an-mcp-server)). With many tools connected, the model sees only their names and loads a tool's parameters when it needs one, so they don't cost thousands of tokens on every request (`"mcpTools": "eager"` in the config sends them all).
 - **Skills.** Drop a `SKILL.md` into `.marv/skills/` (or `~/.marv/skills/`) and Marv loads it when a task matches, or run it yourself with `/<skill-name>`.
 - **GitHub through MCP.** Work with issues and pull requests through GitHub's official MCP server: the token stays out of the sandbox and the model's reach, read-only tools run without asking, writes show an approval prompt first. See [Connect GitHub](#connect-github).
 - **Subagents.** Marv can hand a task to a fresh agent with its own context, which reports back when it's done, so the files it read don't fill up the conversation. Several can run in parallel, each in its own git worktree if they change files. Click one to watch its own transcript live. Agent types are Markdown files, compatible with Claude Code's.
@@ -93,7 +93,7 @@ Type what you want in plain language, for example:
 | `/yolo` | Run what the sandbox contains without asking (`/yolo on`, `/yolo off`) |
 | `/good`, `/bad` | Rate the last turn, with an optional note (`/bad edited the wrong file`) |
 | `/label` | Tag the last turn (`/label refactor, tests`) |
-| `/mcp` | Show MCP servers and their tools; `/mcp trust` starts the project's |
+| `/mcp` | Show MCP servers and their tools; `/mcp add <package \| URL \| repo>` adds one, `/mcp search <words>` finds one, `/mcp remove <name>` takes yours out, `/mcp trust` starts the project's |
 | `/diagnostics` | Show or set the typecheck after edits (`/diagnostics on`, `/diagnostics off`) |
 | `/checks` | List the project's checks and their last result (`/checks on`, `/checks off`) |
 | `/steps` | Show or set the step limit (`/steps 40`, `/steps off` never asks) |
@@ -153,6 +153,29 @@ description: How to write release notes for this project. Use when asked for rel
 
 Put it in `.marv/skills/<name>/` (this project) or `~/.marv/skills/<name>/` (all projects). Only each skill's name and description go into the system prompt; Marv loads the full instructions when a request matches. A skill folder can also hold scripts and reference files. Write descriptions that name the task and when to use it: that's how the model decides.
 
+## Add an MCP server
+
+`/mcp add` works out a server's entry, shows it to you once, writes it to `~/.marv/mcp.json` (yours, every project) and starts it in the running session:
+
+```sh
+/mcp add @modelcontextprotocol/server-filesystem -- ${MARV_PROJECT_DIR}     # an npm package (npm: prefix optional)
+/mcp add pypi:mcp-server-fetch                                              # a PyPI package (run with uvx)
+/mcp add https://mcp.example.com/mcp --header "Authorization: Bearer ${EXAMPLE_TOKEN}"   # a remote server
+/mcp add io.github.acme/weather                                             # a name from the official MCP Registry
+/mcp add https://github.com/acme/weather-mcp                                # a repo whose README names a package or URL
+/mcp search weather                                                         # look in the MCP Registry
+/mcp remove weather                                                         # take one of yours out again
+```
+
+- **Pinned.** A package is written as `npx -y <pkg>@<exact version>` or `uvx <pkg>@<exact version>`, resolved before you're asked (`name@1.2.3` asks for a version; it must exist). npm and PyPI never let a published version's files change.
+- **One approval, of exactly what's written.** The prompt shows the command line, the version and when it was published and by whom, the repository the package names (npm and PyPI don't check that field), the registry publisher's verified namespace, every environment variable the server reads (and whether it's set), and the JSON it writes. Warnings stand out: a deprecated or yanked version, a package first published in the last week, a GitHub README naming a package whose own repository is a different one. Yes writes that JSON as shown; nothing fetched afterwards changes it. There's no "don't ask again": each server is its own decision.
+- **Secrets stay in your environment.** `--env NAME` writes `"NAME": "${NAME}"`, and `--header` takes `"Name: Bearer ${VAR}"`; a value typed in (`--env KEY=sk-…`, a literal header) is refused, since the file sits on disk. A variable that isn't set means the entry is written but not started: set it in your shell and restart Marv.
+- **Options:** `--name <name>` (by default it comes from the package, `@modelcontextprotocol/server-filesystem` → `filesystem`, or the URL's host), and arguments for the server after `--`. A registry entry's fixed arguments and required variables are filled in; a required argument with no value goes after `--`.
+- **GitHub repos:** Marv reads the README (with `GITHUB_TOKEN` if set) and takes only a package name or an https URL from its config examples, nothing else from the block (no extra arguments, no `env` values; the variable names it uses are suggested as `--env`). Several candidates: you get the `/mcp add` commands to choose from.
+- **Its tools** reach the model from your next message. `/mcp remove <name>` takes one of your servers out and stops it; its tools stay listed (failing) until `/clear` or a restart. A project's servers stay in `.mcp.json`, edited by hand.
+
+Known limits: npx resolves a package's own dependencies by their version ranges when it first runs (there's no lockfile to pin them); a remote server is whatever its owner deploys at that URL; no Docker images and no building from source yet (a README that only shows those is reported, not followed); a PyPI package whose command has another name than the package needs a hand edit. A remote server that asks you to log in (OAuth) is what `/mcp login` is for, which comes next; until it lands, such a server shows as failed in `/mcp`.
+
 ## Connect GitHub
 
 Marv can work with your GitHub repositories — issues, pull requests, Actions runs — through GitHub's official MCP server ([github/github-mcp-server](https://github.com/github/github-mcp-server)). It runs outside the sandbox with its own token, so the model never sees the token, read-only tools run without asking, and anything that changes something (a comment, a merge, a push) shows you an approval prompt first.
@@ -176,6 +199,12 @@ Marv can work with your GitHub repositories — issues, pull requests, Actions r
    `${MARV_GITHUB_TOKEN}` reads the environment variable, so the token never lands in the file. Needs [Docker](https://docs.docker.com/get-started/get-docker/); without it, [build the server from source](https://github.com/github/github-mcp-server?tab=readme-ov-file#build-from-source) and point `command`/`args` at the binary (`["<path>", "stdio"]`).
 
 4. Restart Marv and check `/mcp`: the server should be listed with its tools. Try "list the open PRs in owner/repo" — that runs without an approval prompt (read-only), while "comment on PR 7" shows one first.
+
+**Or with `/mcp add`.** `/mcp add` doesn't run Docker images yet, so the setup above stays a hand edit. GitHub also hosts the same server remotely (check [its README](https://github.com/github/github-mcp-server) for which accounts can use it); that one `/mcp add` can set up and start without a restart, with the same token from your environment:
+
+```sh
+/mcp add https://api.githubcopilot.com/mcp/ --name github --header "Authorization: Bearer ${MARV_GITHUB_TOKEN}"
+```
 
 The official server registers dozens of tools. With many connected, Marv offers the model only their names and loads a tool's parameters when it needs one, so you don't have to trim — but limiting the toolsets still gives a small model a shorter list to choose from. The server takes `GITHUB_TOOLSETS` (or `--toolsets`), for example `default,actions` — the default is already `context`, `repos`, `issues`, `pull_requests`, `users`, which covers most issues/PR work; `GITHUB_TOOLSETS` wins when both are set:
 
