@@ -4,6 +4,7 @@ import type { Message } from "../types.ts";
 import { printable } from "../printable.ts";
 import { DiffView } from "./DiffView.tsx";
 import { Markdown } from "./Markdown.tsx";
+import { NoticeView } from "./NoticeView.tsx";
 import { theme } from "./theme.ts";
 
 /** A change's diff under its entry: enough to see what changed; ctrl+o shows the rest. */
@@ -32,7 +33,7 @@ export const MessageView = memo(function MessageView({
   streaming = false,
   showSteps = false,
 }: {
-  message: Pick<Message, "role" | "text" | "isError" | "tool" | "markdown">;
+  message: Pick<Message, "role" | "text" | "isError" | "tool" | "markdown" | "notice">;
   /** The assistant reply still coming in (parsed incrementally). */
   streaming?: boolean;
   /** ctrl+o: details (subagents' steps, whole diffs). */
@@ -97,6 +98,9 @@ export const MessageView = memo(function MessageView({
       );
     }
     case "system":
+      if (message.notice) {
+        return <NoticeView notice={message.notice} />;
+      }
       if (message.markdown) {
         return (
           <Box marginBottom={1} flexDirection="column">

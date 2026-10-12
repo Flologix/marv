@@ -761,27 +761,35 @@ describe("App", () => {
       expect(lastFrame()).not.toContain("off-by-one");
     });
 
-    test("skills that couldn't be loaded are reported at startup", async () => {
-      const { lastFrame } = renderApp(LOCAL, 0, undefined, undefined, undefined, [], [".marv/skills/x/SKILL.md needs a description"]);
-      await tick();
-      expect(lastFrame()).toContain("1 skill couldn't be loaded (see /skills)");
-    });
-
-    test("PATH folders the sandbox hides are reported at startup", async () => {
-      const { lastFrame } = renderApp(LOCAL, 0, undefined, undefined, undefined, [], [], ["~/.local/share/mise/installs/node/26.8.2/bin"]);
-      await tick();
-      expect(lastFrame()).toContain("Your PATH has 1 folder the sandbox can't see");
-      expect(lastFrame()).toContain("~/.local/share/mise/installs/node/26.8.2/bin");
-      expect(lastFrame()).toContain("tsc and other node_modules scripts may not run");
-    });
-
-    test("an AGENTS.md that was cut off is reported once at startup (#40)", async () => {
+    test("startup problems become ONE notice, one bullet each", async () => {
       const cut = { chars: 86_000, totalLines: 400, nextLine: 120, sections: [{ heading: "## Conventions", line: 300 }] };
-      const { lastFrame } = renderApp(LOCAL, 0, undefined, undefined, "x", [], [], [], cut);
+      const { lastFrame } = renderApp(LOCAL, 0, undefined, undefined, "x", [], [".marv/skills/x/SKILL.md needs a description"], ["~/.local/share/mise/installs/node/26.8.2/bin"], cut);
       await tick();
-      expect(lastFrame()).toContain("AGENTS.md is longer than 20,000 characters (86,000)");
-      expect(lastFrame()).toContain("## Conventions");
-      expect(lastFrame()!.split("AGENTS.md is longer").length).toBe(2);
+      const frame = lastFrame()!;
+      // Exactly one Startup notice, naming how many problems, and it holds them all as bullets.
+      expect(frame.split("Startup · 3 notes").length).toBe(2);
+      expect(frame).toContain("1 skill couldn't be loaded (see /skills)");
+      expect(frame).toContain("1 PATH folder is hidden from the sandbox");
+      expect(frame).toContain("~/.local/share/mise/installs/node/26.8.2/bin");
+      expect(frame).toContain("AGENTS.md is long");
+    });
+
+    test("the startup notice carries both a PATH and an AGENTS.md item", async () => {
+      const cut = { chars: 86_000, totalLines: 400, nextLine: 120, sections: [{ heading: "## Conventions", line: 300 }, { heading: "## Prompt cache", line: 340 }] };
+      const { lastFrame } = renderApp(LOCAL, 0, undefined, undefined, "x", [], [], ["~/.cache/.bun/bin"], cut);
+      await tick();
+      const frame = lastFrame()!;
+      expect(frame.split("Startup · 2 notes").length).toBe(2);
+      expect(frame).toContain("AGENTS.md is long: the model sees the first 20,000 of 86,000 characters");
+      expect(frame).toContain("Up front: lines 1-119");
+      expect(frame).toContain("1 PATH folder is hidden from the sandbox: ~/.cache/.bun/bin");
+      expect(frame).toContain("Move the tool to a folder the sandbox shows");
+    });
+
+    test("with no startup problems, there's no Startup notice", async () => {
+      const { lastFrame } = renderApp(LOCAL);
+      await tick();
+      expect(lastFrame()).not.toContain("Startup ·");
     });
   });
 
@@ -1359,7 +1367,10 @@ describe("MCP servers", () => {
     const { lastFrame, stdin } = renderWithMcp(new ScriptedProvider([]), new McpManager([server("project")], { root: project, version: "9.9.9", trust }));
     await tick(300);
     expect(lastFrame()).toContain("1 MCP server (/mcp)");
-    expect(lastFrame()).toContain("This project's .mcp.json lists MCP servers you haven't trusted yet: test");
+    expect(lastFrame()).toContain("MCP · 1 note");
+    expect(lastFrame()).toContain("lists 1 MCP server you haven't trusted yet");
+    expect(lastFrame()).toContain("outside the sandbox");
+    expect(lastFrame()).toContain("test (");
     await type(stdin, "/mcp trust");
     for (let i = 0; i < 100 && !lastFrame()!.includes("test: connected"); i++) await tick();
     expect(lastFrame()).toContain("test: connected · 8 tools");

@@ -92,6 +92,26 @@ describe("SessionStore", () => {
     expect((await store.list("/home/me/a-b")).map((s) => s.title)).toEqual(["my old task"]);
   });
 
+  test("a session with a notice message round-trips; an old one without one still loads", async () => {
+    const s = session("/home/me/proj", "task", 1000);
+    s.transcript.push({
+      id: 3,
+      role: "system",
+      text: "",
+      notice: { title: "Startup · 2 notes", tone: "warning", items: [{ text: "AGENTS.md is long", detail: ["Up front: lines 1-61"] }, { text: "1 PATH folder is hidden" }] },
+    });
+    await store.save(s);
+    const loaded = await store.load("/home/me/proj", s.id);
+    expect(loaded?.transcript.at(-1)).toMatchObject({
+      role: "system",
+      notice: { title: "Startup · 2 notes", tone: "warning", items: [{ text: "AGENTS.md is long", detail: ["Up front: lines 1-61"] }, { text: "1 PATH folder is hidden" }] },
+    });
+    // An old session (saved before notices existed) has no notice field and loads unchanged.
+    const old = session("/home/me/proj", "older", 2000);
+    await writeFile(join(dir, projectKey("/home/me/proj"), `${old.id}.json`), JSON.stringify(old));
+    expect((await store.load("/home/me/proj", old.id))?.transcript.at(-1)).toEqual(old.transcript.at(-1));
+  });
+
   test("overlapping saves of one session never leave it unreadable", async () => {
     const s = session("/home/me/proj", "task", 1000);
     for (let round = 0; round < 30; round++) {
