@@ -65,6 +65,8 @@ export interface SummaryRow {
   medianMs: number;
   /** The proxy host the runs went through (`--base-url`), empty for OpenRouter's own API. */
   via: string;
+  /** Which runs the row is (label, model and proxy), for the per-task grid. */
+  group: string;
 }
 
 const median = (values: number[]) => {
@@ -106,6 +108,7 @@ export function summarizeRuns(results: RunResult[]): SummaryRow[] {
       cost: runs.reduce((n, r) => n + r.cost, 0),
       medianMs: median(runs.map((r) => r.ms)),
       via: via(runs[0]),
+      group: groupKey(runs[0]!),
     };
   });
 }
@@ -143,11 +146,11 @@ export function formatSummary(results: RunResult[]): string {
   ]);
   const tasks = [...new Set(results.map((r) => r.task))].sort();
   const grid = table([
-    ["task", ...rows.map((r) => `${r.label}/${r.model}`)],
+    ["task", ...rows.map((r) => `${r.label}/${r.model}${r.via ? ` via ${r.via}` : ""}`)],
     ...tasks.map((task) => [
       task,
       ...rows.map((row) => {
-        const runs = results.filter((r) => groupKey(r) === `${row.label}\u0000${row.model}` && r.task === task);
+        const runs = results.filter((r) => groupKey(r) === row.group && r.task === task);
         return runs.length ? `${runs.filter((r) => r.pass).length}/${runs.length}` : "-";
       }),
     ]),

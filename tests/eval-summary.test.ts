@@ -72,6 +72,7 @@ describe("formatSummary", () => {
   test("runs through a proxy and direct ones are separate rows, even with the same label and model", () => {
     const rows = summarizeRuns([run(), run({ baseUrl: "http://localhost:8787/v1", cost: 5 })]);
     expect(rows.map((r) => [r.via, r.runs])).toEqual([["", 1], ["localhost:8787", 1]]);
+    expect(formatSummary([run(), run({ baseUrl: "http://localhost:8787/v1" })])).toMatch(/via localhost:8787/);
   });
 
   test("a run with a baseUrl (a proxy) is shown as via <host>, a column only when one exists", () => {
