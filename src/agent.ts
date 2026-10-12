@@ -137,6 +137,12 @@ interface Options {
    * true keeps going for another maxSteps. Without it, maxSteps is a hard stop.
    */
   onLimit?: (steps: number) => Promise<boolean>;
+  /**
+   * Applied to each call of a reply before it enters the history (after ids are made unique): a call to run and
+   * record instead, or null to keep it. The session turns a direct call to a deferred MCP tool into mcp_call (#14),
+   * so the history never names a tool that isn't offered.
+   */
+  rewriteCall?: (call: ToolCall) => ToolCall | null;
   /** Calls that may run at the same time as their neighbours (subagents). Default: none. */
   isParallel?: (call: ToolCall) => boolean;
   maxParallel?: number;
@@ -281,6 +287,7 @@ export async function* runAgent({
   signal,
   maxSteps = DEFAULT_MAX_STEPS,
   onLimit,
+  rewriteCall,
   isParallel = () => false,
   maxParallel = MAX_PARALLEL,
   afterStep,
@@ -393,6 +400,7 @@ export async function* runAgent({
       call.id = `${base}_${n}`;
       usedIds.add(call.id);
     }
+    if (rewriteCall) for (let i = 0; i < calls.length; i++) calls[i] = rewriteCall(calls[i]!) ?? calls[i]!;
     // A reply stuck repeating itself (caught while it streamed, or at its end): it's dropped, so none of it reaches
     // the history (its tool calls never ran and aren't in it either), and the model is told. Twice ends the run.
     if (!looped && !signal.aborted && text && detectTextRepetition(text)) looped = true;

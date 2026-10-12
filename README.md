@@ -14,7 +14,7 @@ Marv is written in TypeScript on [Bun](https://bun.sh), with an [Ink](https://gi
 - **Safe yolo mode (on by default).** Sandboxed commands and edits inside the project run without asking; anything the sandbox can't contain (network access, git commits and other repository changes, `.git` itself, memory) still shows you a colored diff or the exact command first: yes, yes for the rest of the session, or no (which stops Marv so you can redirect it). `/yolo off` asks for every change.
 - **Sandboxed commands.** On Linux, commands run in [bubblewrap](https://github.com/containers/bubblewrap): only the project folder is writable, your home folder (keys, SSH, Marv's own config) is hidden, there's no network unless a command asks for it, and API keys never reach the command.
 - **Any model.** OpenRouter or a local Ollama model, with a searchable model picker showing prices. Switch with `/model`.
-- **MCP servers.** Connect any [Model Context Protocol](https://modelcontextprotocol.io) server, local or remote, in `.mcp.json` or `~/.marv/mcp.json` (Claude Code's format). Its tools join Marv's; calls ask first unless the server marks a tool read-only, since servers run outside the sandbox. A project's servers only start once you trust them (`/mcp trust`).
+- **MCP servers.** Connect any [Model Context Protocol](https://modelcontextprotocol.io) server, local or remote, in `.mcp.json` or `~/.marv/mcp.json` (Claude Code's format). Its tools join Marv's; calls ask first unless the server marks a tool read-only, since servers run outside the sandbox. A project's servers only start once you trust them (`/mcp trust`). With many tools connected, the model sees only their names and loads a tool's parameters when it needs one, so they don't cost thousands of tokens on every request (`"mcpTools": "eager"` in the config sends them all).
 - **Skills.** Drop a `SKILL.md` into `.marv/skills/` (or `~/.marv/skills/`) and Marv loads it when a task matches, or run it yourself with `/<skill-name>`.
 - **Subagents.** Marv can hand a task to a fresh agent with its own context, which reports back when it's done, so the files it read don't fill up the conversation. Several can run in parallel, each in its own git worktree if they change files. Click one to watch its own transcript live. Agent types are Markdown files, compatible with Claude Code's.
 - **Memory.** Marv remembers your preferences and project facts across sessions. Every change it makes to its memory needs your approval.
@@ -277,12 +277,15 @@ await session.close();
 - **MCP servers in code:** `mcpServers: { name: { command, args } }` (`.mcp.json`'s format). These are trusted like
   your own: no trust prompt, started in your home folder (use an absolute path, or `${MARV_PROJECT_DIR}` for
   the project). So never pass config read from a repository you don't control; `sources: ["project"]` is the
-  way to use a repository's servers, and those still need trusting.
+  way to use a repository's servers, and those still need trusting. `mcpTools` (`"auto"` by default) says how
+  their tools are offered: `"eager"` sends every spec with every request, `"deferred"` only their names, with
+  `tool_search` and `mcp_call` to load and run them; `"auto"` defers when the specs would cost more than
+  min(4000 tokens, 10% of the context window).
 - **Your own tools:** `tools: [{ name, description, input: z.object({...}), label, run }]`, offered to the
   main agent (not to subagents). `input` must be a zod 4 schema (it's described to the model with
-  `z.toJSONSchema`). A name of a built-in tool, one used twice, or one starting with `mcp__` (MCP servers'
-  tools) makes `createSession` throw. A Provider of your own is used for everything, subagents included.
-- **Settings between turns.** `configure({ provider, thinking, sandbox, yolo, trajectories, diagnostics, checks, maxSteps })`: a turn reads its settings
+  `z.toJSONSchema`). A name of a built-in tool (`tool_search` and `mcp_call` included), one used twice, or one
+  starting with `mcp__` (MCP servers' tools) makes `createSession` throw. A Provider of your own is used for everything, subagents included.
+- **Settings between turns.** `configure({ provider, thinking, sandbox, yolo, trajectories, diagnostics, checks, maxSteps, mcpTools })`: a turn reads its settings
   when it starts, so a change during one applies from the next. It throws only for an invalid provider (an
   unknown `kind`), a `maxSteps` that isn't a whole number of at least 0, or for turning yolo on in the home folder, and then nothing changed. `close()` stops what's running, waits for it, saves, and stops
   the MCP servers the session started; `send()` throws after it.

@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { asMcpCall } from "../src/mcp/deferred.ts";
 import { runTool } from "../src/tools/index.ts";
 import { repairJsonArgs } from "../src/tools/repair.ts";
 import type { ToolCall } from "../src/provider/types.ts";
@@ -148,5 +149,28 @@ describe("a project path written with a leading slash (#10)", () => {
     const grepped = await run("grep", JSON.stringify({ pattern: "start", path: "/src" }));
     expect(grepped.output).toContain("src/pagination.js:1:");
     expect(grepped.output).toContain("Marv:");
+  });
+});
+
+describe("a direct call to a deferred MCP tool (#14)", () => {
+  const names = new Set(["mcp__x__ping"]);
+  test("becomes mcp_call, its raw arguments kept byte for byte", () => {
+    expect(asMcpCall({ id: "c", name: "mcp__x__ping", arguments: '{ "a": 1 }' }, names)).toEqual({
+      call: { id: "c", name: "mcp_call", arguments: '{"tool":"mcp__x__ping","arguments":{ "a": 1 }}' },
+      note: 'Marv: mcp__x__ping isn\'t offered as a tool of its own: it was run as mcp_call with tool "mcp__x__ping". Call MCP tools that way.',
+    });
+    expect(asMcpCall({ id: "c", name: "mcp__x__ping", arguments: "" }, names)?.call.arguments).toBe('{"tool":"mcp__x__ping","arguments":{}}');
+  });
+  test("arguments that aren't one object can't add keys to the mcp_call around them (another tool)", () => {
+    const sneaky = '{},"tool":"mcp__x__other"';
+    const raw = asMcpCall({ id: "c", name: "mcp__x__ping", arguments: sneaky }, names)!.call.arguments;
+    // Whatever runs, it names the tool that was called, and the arguments come as the text they were.
+    expect(JSON.parse(raw)).toEqual({ tool: "mcp__x__ping", arguments: sneaky });
+    // A raw tab inside a string is still left for the #10 repair, since what it repairs to is one object.
+    expect(asMcpCall({ id: "c", name: "mcp__x__ping", arguments: '{"a":"x\ty"}' }, names)!.call.arguments).toBe('{"tool":"mcp__x__ping","arguments":{"a":"x\ty"}}');
+  });
+  test("a name that isn't a configured MCP tool is left alone (an unknown-tool error)", () => {
+    expect(asMcpCall({ id: "c", name: "mcp__x__nope", arguments: "{}" }, names)).toBeNull();
+    expect(asMcpCall({ id: "c", name: "read_file", arguments: "{}" }, names)).toBeNull();
   });
 });

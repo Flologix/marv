@@ -319,6 +319,7 @@ export function App({
         yolo: config.yolo,
         diagnostics: config.diagnostics,
         checks: config.checks,
+        mcpTools: config.mcpTools,
         maxSteps: config.maxSteps,
         sessions,
         trajectories,
@@ -343,6 +344,7 @@ export function App({
       trajectories: config.trajectories,
       diagnostics: config.diagnostics,
       checks: config.checks,
+      mcpTools: config.mcpTools,
       maxSteps: config.maxSteps,
     });
     setSessionVersion((v) => v + 1);
