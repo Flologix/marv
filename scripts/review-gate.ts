@@ -67,6 +67,8 @@ const commits = prePush
       .map(([, localSha]) => localSha!)
   : [git("rev-parse", "HEAD")];
 
+if (commits.length === 0) process.exit(0);
+
 const version = spawnSync("ocr", ["--version"], { encoding: "utf8" });
 if (version.error || version.status !== 0) {
   fail("`ocr` isn't installed. Install it with `npm i -g @alibaba-group/open-code-review`, then `ocr config provider`.");
