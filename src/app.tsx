@@ -35,10 +35,10 @@ import type { AgentProgress, ApprovalRequest, Decision } from "./tools/types.ts"
 import { checkNotice } from "./diagnostics/turn.ts";
 import { projectCheckNotice, type ProjectCheckResult } from "./checks/kind.ts";
 import { loadChecks, type ProjectCheck } from "./checks/load.ts";
-import { hiddenPathFoldersNotice } from "./commands/sandbox-notice.ts";
-import { instructionsCutNotice, type InstructionsCut } from "./prompt.ts";
+import { hiddenPathFoldersItem } from "./commands/sandbox-notice.ts";
+import { instructionsCutItem, type InstructionsCut } from "./prompt.ts";
 import type { CommandAction } from "./commands/index.ts";
-import type { Message } from "./types.ts";
+import type { Message, Notice, NoticeItem, NoticeTone } from "./types.ts";
 import { AgentView, AgentViewHeader } from "./ui/AgentView.tsx";
 import { Approval } from "./ui/Approval.tsx";
 import { SessionPicker } from "./ui/SessionPicker.tsx";
@@ -69,6 +69,24 @@ function describeUntrusted(s: McpServerStatus): string {
     s.runsProjectFiles.length > 0 && `runs this project's ${s.runsProjectFiles.join(", ")} (and whatever those load)`,
   ].filter(Boolean);
   return `${s.name} (${s.target})${extras.length ? `, which ${extras.join(" and ")}` : ""}`;
+}
+
+/** How severe a tone is, so the startup notice can use its worst. */
+const TONE_RANK: Record<NoticeTone, number> = { info: 0, warning: 1, error: 2 };
+
+/** The worst of a set of tones (error beats warning beats info). */
+function worstTone(tones: NoticeTone[]): NoticeTone {
+  return tones.reduce((worst, tone) => (TONE_RANK[tone] > TONE_RANK[worst] ? tone : worst), "info");
+}
+
+/** Collates the startup notices known at once into one block: a bullet per notice, titled with how many there are. */
+function startupNotice(notes: { tone: NoticeTone; item: NoticeItem }[]): Notice | null {
+  if (notes.length === 0) return null;
+  return {
+    title: `Startup · ${notes.length} note${notes.length === 1 ? "" : "s"}`,
+    tone: worstTone(notes.map((n) => n.tone)),
+    items: notes.map((n) => n.item),
+  };
 }
 
 // Defaults defined once, so they're the same objects on every render (the
@@ -1111,56 +1129,49 @@ export function App({
     }
   }, [resume, sessions, phase, openPicker, resumeSession, showResumed, addMessage]);
 
-  // Skills that couldn't be loaded are reported once, not silently skipped.
+  // Startup problems known at once (skills, PATH, AGENTS.md cut, MCP config, agents) become ONE notice: a short
+  // headline per problem, one bullet each, the title saying how many. They never reach the model's conversation.
   useEffect(() => {
-    if (skillProblems.length === 0) return;
-    const count = skillProblems.length;
-    addMessage({ role: "system", isError: true, text: `${count} skill${count === 1 ? "" : "s"} couldn't be loaded (see /skills):\n${skillProblems.join("\n")}` });
-  }, [skillProblems, addMessage]);
+    const notes: { tone: NoticeTone; item: NoticeItem }[] = [];
+    if (skillProblems.length) {
+      const count = skillProblems.length;
+      notes.push({ tone: "error", item: { text: `${count} skill${count === 1 ? "" : "s"} couldn't be loaded (see /skills)`, detail: skillProblems } });
+    }
+    if (hiddenPathFolders.length) notes.push({ tone: "warning", item: hiddenPathFoldersItem(hiddenPathFolders) });
+    if (instructionsCut) notes.push({ tone: "info", item: instructionsCutItem(instructionsCut) });
+    if (mcpProblems.length) {
+      const count = mcpProblems.length;
+      notes.push({ tone: "error", item: { text: `${count} MCP config problem${count === 1 ? "" : "s"} (see /mcp)`, detail: mcpProblems } });
+    }
+    if (agentProblems.length) {
+      const count = agentProblems.length;
+      notes.push({ tone: "error", item: { text: `${count} agent file${count === 1 ? "" : "s"} couldn't be loaded (see /agents)`, detail: agentProblems } });
+    }
+    const notice = startupNotice(notes);
+    if (notice) addMessage({ role: "system", text: "", notice });
+  }, [skillProblems, hiddenPathFolders, instructionsCut, mcpProblems, agentProblems, addMessage]);
 
-  // PATH folders the sandbox can't see (issue #34: node from mise made the typecheck fail silently).
+  // MCP: once the servers have started, a block for any that failed, and a project's servers waiting to be
+  // trusted (they don't start until then). A separate notice, since it isn't known at startup.
   useEffect(() => {
-    if (hiddenPathFolders.length === 0) return;
-    addMessage({ role: "system", text: hiddenPathFoldersNotice(hiddenPathFolders) });
-  }, [hiddenPathFolders, addMessage]);
-
-  // An AGENTS.md longer than the cap: the model gets its start and the rest's headings (issue #40).
-  useEffect(() => {
-    if (instructionsCut) addMessage({ role: "system", text: instructionsCutNotice(instructionsCut) });
-  }, [instructionsCut, addMessage]);
-
-  // MCP: config problems right away; once the servers have started, any that failed, and a project's servers
-  // waiting to be trusted (they don't start until then).
-  useEffect(() => {
-    if (mcpProblems.length) addMessage({ role: "system", isError: true, text: `MCP config problems (see /mcp):\n${mcpProblems.join("\n")}` });
     if (!mcp) return;
     let cancelled = false;
     void mcp.ready.then(() => {
       if (cancelled) return;
       const status = mcp.status();
       const failed = status.filter((s) => s.state === "failed");
-      if (failed.length) {
-        addMessage({ role: "system", isError: true, text: `Couldn't start ${failed.map((s) => `MCP server ${s.name}: ${s.error}`).join("; ")} (see /mcp).` });
-      }
       const waiting = status.filter((s) => s.state === "untrusted");
-      if (waiting.length) {
-        addMessage({
-          role: "system",
-          text: `This project's .mcp.json lists MCP servers you haven't trusted yet: ${waiting.map(describeUntrusted).join("; ")}. They'd run with your permissions, outside the sandbox. /mcp trust starts them.`,
-        });
-      }
+      if (failed.length === 0 && waiting.length === 0) return;
+      const notes: NoticeItem[] = [];
+      if (failed.length) notes.push({ text: `${failed.length} MCP server${failed.length === 1 ? "" : "s"} failed to start (see /mcp)`, detail: failed.map((s) => `${s.name}: ${s.error}`) });
+      if (waiting.length)
+        notes.push({ text: `${waiting.length} MCP server${waiting.length === 1 ? "" : "s"} waiting for /mcp trust`, detail: waiting.map((s) => describeUntrusted(s)) });
+      addMessage({ role: "system", text: "", notice: { title: `MCP · ${failed.length + waiting.length} note${failed.length + waiting.length === 1 ? "" : "s"}`, tone: failed.length ? "error" : "warning", items: notes } });
     });
     return () => {
       cancelled = true;
     };
-  }, [mcp, mcpProblems, addMessage]);
-
-  // Agent files that couldn't be loaded, likewise.
-  useEffect(() => {
-    if (agentProblems.length === 0) return;
-    const count = agentProblems.length;
-    addMessage({ role: "system", isError: true, text: `${count} agent file${count === 1 ? "" : "s"} couldn't be loaded (see /agents):\n${agentProblems.join("\n")}` });
-  }, [agentProblems, addMessage]);
+  }, [mcp, addMessage]);
 
   const finishSplash = useCallback(() => setPhase("main"), []);
 

@@ -6,6 +6,7 @@
 // provider's prompt cache for everything after it.
 import { join } from "node:path";
 import { memorySection, type Memories } from "./memory.ts";
+import type { NoticeItem } from "./types.ts";
 
 export const INSTRUCTIONS_FILE = "AGENTS.md";
 const MAX_INSTRUCTION_CHARS = 20_000;
@@ -185,4 +186,20 @@ export function instructionsCutNotice({ chars, nextLine, sections }: Instruction
   const count = `${sections.length} section${sections.length === 1 ? "" : "s"}`;
   const which = sections.length ? ` (${sections.slice(0, 5).map((s) => s.heading).join(", ")}${sections.length > 5 ? ", …" : ""})` : "";
   return `${INSTRUCTIONS_FILE} is longer than ${MAX_INSTRUCTION_CHARS.toLocaleString("en-US")} characters (${chars.toLocaleString("en-US")}): the model gets lines 1-${nextLine - 1} up front, plus the ${count} after that${which} by name, which it reads with read_file when it needs them. Put what matters most first.`;
+}
+
+/** The startup notice's item for a cut AGENTS.md: a headline, then what the model sees and how to read the rest. */
+export function instructionsCutItem({ chars, nextLine, sections }: InstructionsCut): NoticeItem {
+  const names = sections.slice(0, 5).map((s) => s.heading.replace(/^#+\s*/, ""));
+  if (sections.length > 5) names.push("…");
+  return {
+    text: `${INSTRUCTIONS_FILE} is long: the model sees the first ${MAX_INSTRUCTION_CHARS.toLocaleString("en-US")} of ${chars.toLocaleString("en-US")} characters`,
+    detail: [
+      `Up front: lines 1-${nextLine - 1}`,
+      sections.length
+        ? `Read on demand (${sections.length} section${sections.length === 1 ? "" : "s"}): ${names.join(" · ")}`
+        : "Nothing else is listed; the file is mostly headings.",
+      "Put what matters most first.",
+    ],
+  };
 }
