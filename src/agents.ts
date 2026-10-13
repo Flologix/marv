@@ -29,7 +29,7 @@ export interface AgentType {
  * recursion) or `memory` (memory outlives the session, so only the main agent
  * changes it, with the user's approval).
  */
-export const SUBAGENT_TOOLS: readonly string[] = ["read_file", "glob", "grep", "web_fetch", "skill", "edit_file", "write_file", "bash"];
+export const SUBAGENT_TOOLS: readonly string[] = ["read_file", "glob", "grep", "web_fetch", "github", "skill", "edit_file", "write_file", "bash"];
 
 /** Claude Code's tool names, so agent files written for it work here. */
 const ALIASES: Record<string, string> = {

@@ -19,6 +19,7 @@ import { SessionStore } from "./sessions.ts";
 import { TrajectoryStore } from "./trajectory.ts";
 import { loadMcpConfig } from "./mcp/config.ts";
 import { McpManager } from "./mcp/manager.ts";
+import { githubAvailable, githubWanted } from "./tools/github/github.ts";
 import { McpTokenStore } from "./mcp/oauth-store.ts";
 import { McpTrust } from "./mcp/trust.ts";
 import { loadMemory, memoryPaths } from "./memory.ts";
@@ -149,6 +150,9 @@ if (promptIndex !== -1) {
 
 // The project is wherever Marv was started; the tools can't reach outside it.
 const root = process.cwd();
+// Whether to offer the github tool (#47): asked of gh once, alongside the rest of startup, since the tool list is
+// fixed for the session. At most 2 s (gh auth status asks GitHub; offline it falls back to gh's hosts.yml).
+const githubCheck = githubWanted(process.env) ? githubAvailable() : Promise.resolve(false);
 const agentsMd = await readInstructions(root);
 const { skills, problems: skillProblems } = await loadSkills({ root, home: homedir() });
 const { agents, problems: agentProblems } = await loadAgents({ root, home: homedir() });
@@ -196,6 +200,7 @@ if (process.stdin.isTTY && process.stdout.isTTY) {
 // In a Herdr pane, Herdr shows what Marv is doing (src/herdr.ts).
 const herdrPane = herdrTarget(process.env);
 const herdr = herdrPane && new HerdrReporter(herdrPane);
+const github = await githubCheck;
 
 let flush: () => Promise<void> = async () => {};
 const instance = render(
@@ -210,6 +215,7 @@ const instance = render(
     instructionsCut={agentsMd?.cut}
     skills={skills}
     skillProblems={skillProblems}
+    github={github}
     hiddenPathFolders={hiddenPathFolders(process.env.PATH ?? "", homedir(), root).map((dir) => shortenHome(dir))}
     agents={agents}
     agentProblems={agentProblems}

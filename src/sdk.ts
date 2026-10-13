@@ -20,6 +20,7 @@ import { MarvSession, type Session } from "./session.ts";
 import { SessionStore } from "./sessions.ts";
 import { loadSources, type Source } from "./sources.ts";
 import { TrajectoryStore } from "./trajectory.ts";
+import { githubAvailable } from "./tools/github/github.ts";
 import type { ApprovalRequest, Decision, Tool } from "./tools/types.ts";
 import type { Message } from "./types.ts";
 
@@ -107,6 +108,13 @@ export interface SessionOptions {
    * such calls are refused before your approver is asked.
    */
   hostCommands?: boolean;
+  /**
+   * Offer the github tool (gh with the user's login, outside the sandbox) when gh is on PATH and logged in, checked
+   * once here. Reads run without asking; writes and sensitive API reads go to your approver (`door: "github"`,
+   * scope `github:<command>`); what can never run (auth, config, extensions, --web, another host…) is refused.
+   * Default false.
+   */
+  github?: boolean;
   yolo?: boolean;
   /** Let thinking models reason before they answer (default false). */
   thinking?: boolean;
@@ -178,6 +186,8 @@ export async function createSession(options: SessionOptions): Promise<Session> {
     ? new McpManager(servers, { root, version: pkg.version, trust: new McpTrust(join(configDir, "mcp-trust.json")), logins: new McpTokenStore(tokensFile) })
     : undefined;
 
+  // Before the session: its tool list is fixed from the start (the prompt cache).
+  const github = options.github ? await githubAvailable() : false;
   const session = new MarvSession({
     root,
     provider: options.provider,
@@ -200,6 +210,7 @@ export async function createSession(options: SessionOptions): Promise<Session> {
     mcpTools: options.mcpTools,
     sandbox: options.sandbox,
     hostCommands: options.hostCommands,
+    github,
     yolo: options.yolo,
     noYolo,
     sessions: storeFor(options.persist, () => new SessionStore(join(configDir, "sessions"))),

@@ -184,7 +184,7 @@ describe("runTool", () => {
 
 describe("toolSpecs", () => {
   test("describe every tool with a JSON schema, without the $schema noise", () => {
-    expect(toolSpecs.map((t) => t.name)).toEqual(["read_file", "glob", "grep", "web_fetch", "skill", "edit_file", "write_file", "bash", "memory", "plan", "agent"]);
+    expect(toolSpecs.map((t) => t.name)).toEqual(["read_file", "glob", "grep", "web_fetch", "github", "skill", "edit_file", "write_file", "bash", "memory", "plan", "agent"]);
     for (const spec of toolSpecs) {
       expect(spec.description.length).toBeGreaterThan(20);
       expect(spec.parameters).toMatchObject({ type: "object" });

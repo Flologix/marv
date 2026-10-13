@@ -78,6 +78,8 @@ export interface Doors {
   /** bash with sandbox: false: only where the user approves each command at a terminal (the TUI, or the SDK's hostCommands). */
   host?: boolean;
   process?: boolean;
+  /** The github tool's writes and sensitive reads (#47): the main agent's, where the session offers the tool; a subagent only reads. */
+  github?: boolean;
 }
 
 /** yes: run it. always: run it, and everything in its scope this session. no: don't. */

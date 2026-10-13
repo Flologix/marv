@@ -12,6 +12,7 @@ import { ConfigError, ConfigStore, defaultConfigDir, migrateLegacyConfig, resolv
 import { TUI_HINTS } from "./provider/errors.ts";
 import { createSession, type SessionEvent, type ApprovalRequest, type Decision, type ProviderOption } from "./sdk.ts";
 import { NO_HOST_DOOR } from "./tools/bash.ts";
+import { githubWanted } from "./tools/github/github.ts";
 import { TrajectoryStore } from "./trajectory.ts";
 
 export type OutputFormat = "text" | "json" | "stream-json";
@@ -25,6 +26,8 @@ const APPROVE_PREFIXES: Record<string, string[]> = {
   files: ["files"],
   memory: ["memory"],
   agent_worktree: ["agent:worktree"],
+  // The github tool's writes and sensitive reads (#47); its reads need nothing.
+  github: ["github:"],
 };
 
 const ALL_APPROVE_NAMES = Object.keys(APPROVE_PREFIXES);
@@ -166,6 +169,8 @@ export async function runHeadless(options: HeadlessOptions): Promise<number> {
       checks: config.checks,
       configDir,
       mcpTools: config.mcpTools,
+      // gh with the user's login, when it's there (MARV_GITHUB=off hides it): reads run, writes need --approve github.
+      github: githubWanted(process.env),
       resume: options.resume,
       // A CLI user runs marv, not createSession(): a bad key should point at /setup or OPENROUTER_API_KEY, as the
       // TUI does (issue #54).
