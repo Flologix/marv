@@ -15,6 +15,9 @@ futures.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# HTTP: rustls only (a single static binary, no system OpenSSL).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+regex = "1"
 
 [lints]
 workspace = true

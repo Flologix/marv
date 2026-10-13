@@ -15,6 +15,10 @@ tokio.workspace = true
 futures.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
+# Trust keys and shortened tool names hash with SHA-256 (as Marv's node:crypto did).
+sha2 = "0.10.9"
+# Source URLs, OAuth callback and authorization URLs.
+url = "2.5.4"
 
 [lints]
 workspace = true

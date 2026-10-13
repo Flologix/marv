@@ -10,6 +10,9 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod printable;
+pub use printable::printable;
+
 /// A tool the model asked Marv to run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCall {
@@ -103,8 +106,9 @@ pub enum ProviderEvent {
     /// `reason` is the vendor's stop reason: "stop", "tool_calls", "length"…
     Done { reason: Option<String> },
     Error(String),
-    /// The provider is retrying after a dropped connection.
-    Retry { attempt: u32, max: u32, message: String },
+    /// The provider is retrying after a dropped connection. `continued`: the partial
+    /// reply was kept and the next attempt continues it, instead of starting over (Marv #64).
+    Retry { attempt: u32, max: u32, message: String, continued: bool },
 }
 
 /// Whether the model may call tools on a request. `None` is used for the

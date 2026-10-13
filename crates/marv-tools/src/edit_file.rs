@@ -1,0 +1,226 @@
+//! `edit_file`: replace text that matches exactly once (or every occurrence with `replace_all`).
+//!
+//! Ports Marv's `src/tools/edit-file.ts`. Matching is [`crate::edit_match`].
+//!
+//! - Planned twice: in the preview (so a call that can't succeed fails before anyone is asked) and again at apply
+//!   time, under the file lock, in case the file changed while the user decided.
+//! - Not found: the error shows the file's closest lines numbered like `read_file`, so the model can copy the real text
+//!   in its next call; it suggests `write_file` only when the parent folder exists (a mistyped folder would become a
+//!   stray copy).
+//! - A forgiving match says which one applied ([`fuzzy_note`]).
+//! - After the change, `syntax::broken_by` adds a `Marv:` note when the change broke the file's syntax.
+//! - Yolo: `auto_safe` outside `.git` (`touches_git`, through symlinks), re-checked at apply time (`refuse_git`).
+//! - marv-rs: a protected path (`marv_sandbox::protected_rule`) asks even in yolo.
+//! - Planned (#67): run the project's formatter on the changed file after the edit (sandboxed, project read-only
+//!   except that file), and report what it changed so the model's next `old_string` matches.
+
+use async_trait::async_trait;
+use serde::Deserialize;
+use serde_json::{Value, json};
+
+use crate::diff::diff_text;
+use crate::edit_match::{EditResult, Fuzzy, apply_edit, closest_lines};
+use crate::files::{is_directory, project_path, refuse_git, require_regular_file, resolve_in_project, touches_git};
+use crate::read_file::numbered_line;
+use crate::repair::repair_path_field;
+use crate::types::{Preview, Repaired, Scope, Tool, ToolContext, ToolError, ToolOutput};
+
+const MAX_CLOSEST_LINES: usize = 30;
+const MAX_CLOSEST_CHARS: usize = 500;
+
+/// What the result says after a forgiving match.
+pub fn fuzzy_note(fuzzy: Fuzzy) -> &'static str {
+    match fuzzy {
+        Fuzzy::TrailingWhitespace => "old_string matched once trailing whitespace was ignored.",
+        Fuzzy::Indentation => "old_string matched only with different indentation; new_string was re-indented to match the file.",
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditFileInput {
+    pub path: String,
+    pub old_string: String,
+    pub new_string: String,
+    pub replace_all: Option<bool>,
+}
+
+/// The file before and after.
+#[derive(Debug, Clone)]
+pub struct Plan {
+    pub absolute: std::path::PathBuf,
+    pub shown: String,
+    pub before: String,
+    pub after: String,
+    pub count: usize,
+    pub fuzzy: Option<Fuzzy>,
+}
+
+/// The not-found error, with the file's closest lines as they are now.
+pub fn not_found(shown: &str, text: &str, old_string: &str) -> String {
+    let head = format!("old_string was not found in {shown}, not even ignoring differences in whitespace and indentation.");
+    let Some((start, end)) = closest_lines(text, old_string) else {
+        return format!("{head} It must match the file exactly. Use read_file to see the current text, then try again.");
+    };
+    let last = end.min(start + MAX_CLOSEST_LINES - 1);
+    let lines: Vec<String> = text
+        .split('\n')
+        .map(|l| l.strip_suffix('\r').unwrap_or(l))
+        .skip(start - 1)
+        .take(last - start + 1)
+        .enumerate()
+        .map(|(i, line)| {
+            if line.chars().count() > MAX_CLOSEST_CHARS {
+                numbered_line(start + i, &format!("{}… (line truncated)", line.chars().take(MAX_CLOSEST_CHARS).collect::<String>()))
+            } else {
+                numbered_line(start + i, line)
+            }
+        })
+        .collect();
+    format!(
+        "{head} The closest text is lines {start}-{end}, as it is now:\n{}\nIf that's the part you meant, copy old_string from these lines exactly (what follows each →). Otherwise use read_file to find it.",
+        lines.join("\n")
+    )
+}
+
+/// The file before and after, or a ToolError the model can act on. Used for the preview and again when applying.
+pub async fn plan(input: &EditFileInput, ctx: &ToolContext) -> Result<Plan, ToolError> {
+    let absolute = resolve_in_project(ctx, &input.path)?;
+    if ctx.confined {
+        refuse_git(&ctx.root, &absolute)?;
+    }
+    let shown = project_path(&ctx.root, &absolute);
+    if is_directory(&absolute) {
+        return Err(ToolError(format!("\"{shown}\" is a directory.")));
+    }
+    if !absolute.exists() {
+        let hint = if absolute.parent().is_some_and(is_directory) { " Use write_file to create a new file." } else { "" };
+        return Err(ToolError(format!("File not found: {shown}.{hint}")));
+    }
+    require_regular_file(&absolute, &shown)?;
+    let before = tokio::fs::read_to_string(&absolute).await.map_err(|e| ToolError(format!("Couldn't read {shown}: {e}")))?;
+    match apply_edit(&before, &input.old_string, &input.new_string, input.replace_all.unwrap_or(false)) {
+        EditResult::Ambiguous { count } => Err(ToolError(format!(
+            "old_string appears {count} times in {shown}. Include more of the surrounding lines so it matches exactly once, or set replace_all to change all {count}."
+        ))),
+        EditResult::NotFound => Err(ToolError(not_found(&shown, &before, &input.old_string))),
+        EditResult::Applied { text, count, fuzzy } => Ok(Plan { absolute, shown, before, after: text, count, fuzzy }),
+    }
+}
+
+/// Starts the session's before-change hook without waiting (the typecheck baseline runs while the user decides).
+pub(crate) fn start_before_change(ctx: &ToolContext) {
+    if let Some(hook) = ctx.before_change.clone() {
+        tokio::spawn(async move { hook.before_change().await });
+    }
+}
+
+pub struct EditFile;
+
+#[async_trait]
+impl Tool for EditFile {
+    type Input = EditFileInput;
+
+    fn name(&self) -> &str {
+        "edit_file"
+    }
+    fn description(&self) -> &str {
+        "Change part of a file by replacing exact text: old_string must match the file exactly once (copy it from read_file, with its whitespace and indentation, and include enough lines to be unique), or set replace_all. Prefer this over write_file for existing files. The user may be asked to approve each change."
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File to edit, relative to the project root."},
+                "old_string": {"type": "string", "minLength": 1, "description": "The exact text to replace, copied from the file including whitespace and indentation."},
+                "new_string": {"type": "string", "description": "What to replace it with."},
+                "replace_all": {"type": "boolean", "description": "Replace every occurrence instead of exactly one."}
+            },
+            "required": ["path", "old_string", "new_string"],
+            "additionalProperties": false
+        })
+    }
+    fn kind(&self) -> marv_core::ToolKind {
+        marv_core::ToolKind::Write
+    }
+    fn check(&self, input: &EditFileInput) -> Result<(), String> {
+        if input.old_string.is_empty() { Err("old_string: must not be empty".into()) } else { Ok(()) }
+    }
+    fn label(&self, input: &EditFileInput) -> String {
+        input.path.clone()
+    }
+    fn scope(&self, _input: &EditFileInput) -> Option<Scope> {
+        Some(Scope { key: "files".into(), description: "file changes".into() })
+    }
+    fn auto_safe(&self, input: &EditFileInput, ctx: &ToolContext) -> bool {
+        !touches_git(ctx, &input.path)
+    }
+    fn protected_target(&self, input: &EditFileInput, ctx: &ToolContext) -> Option<marv_sandbox::ProtectedRule> {
+        protected_target(&input.path, ctx)
+    }
+    fn repair(&self, raw: &Value, ctx: &ToolContext) -> Option<Repaired> {
+        repair_path_field(raw, &ctx.root)
+    }
+
+    async fn preview(&self, input: &EditFileInput, ctx: &ToolContext) -> Result<Preview, ToolError> {
+        start_before_change(ctx);
+        let plan = plan(input, ctx).await?;
+        Ok(Preview { title: format!("Edit {}", plan.shown), diff: Some(diff_text(&plan.before, &plan.after, 3).lines), ..Default::default() })
+    }
+
+    async fn run(&self, _input: &EditFileInput, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        todo!("port: await before_change; aborted → 'Interrupted before the change was written: nothing changed.'; \
+             with_file_lock(plan + write); broken_by note; 'Edited <shown>: replaced N occurrence(s) (+a −r lines).' + fuzzy_note; \
+             diff = shown_diff, changed = shown; #67 formatter"
+        )
+    }
+}
+
+/// The protected rule a project path falls under (marv-rs); a path outside the project is left to `resolve_in_project`.
+pub(crate) fn protected_target(path: &str, ctx: &ToolContext) -> Option<marv_sandbox::ProtectedRule> {
+    let absolute = resolve_in_project(ctx, path).ok()?;
+    marv_sandbox::protected_rule(&ctx.root, &absolute).unwrap_or(Some(marv_sandbox::ProtectedRule::GitDir))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::TempDir;
+
+    fn input(path: &str, old: &str, new: &str) -> EditFileInput {
+        EditFileInput { path: path.into(), old_string: old.into(), new_string: new.into(), replace_all: None }
+    }
+
+    #[tokio::test]
+    async fn not_found_suggests_write_file_only_when_the_folder_exists() {
+        let root = TempDir::new("edit");
+        root.write("src/a.ts", "x");
+        let ctx = ToolContext::new(root.path());
+        assert_eq!(plan(&input("src/new.ts", "a", "b"), &ctx).await.unwrap_err().0, "File not found: src/new.ts. Use write_file to create a new file.");
+        assert_eq!(plan(&input("srcx/new.ts", "a", "b"), &ctx).await.unwrap_err().0, "File not found: srcx/new.ts.");
+    }
+
+    #[tokio::test]
+    async fn nothing_matches_shows_the_closest_lines() {
+        let root = TempDir::new("edit-closest");
+        root.write("greet.js", "function a() {\n  return 1;\n}\n\nfunction greet(name) {\n  return `Hello, ${name}!`;\n}\n");
+        let err = plan(&input("greet.js", "function greet(person) {\n  return `Hi, ${person}!`;\n}", "x"), &ToolContext::new(root.path())).await.unwrap_err();
+        assert!(err.0.contains("The closest text is lines 5-7, as it is now:\n    5→function greet(name) {"), "{}", err.0);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_matches_say_how_many() {
+        let root = TempDir::new("edit-ambiguous");
+        root.write("a.txt", "x\nx\n");
+        let err = plan(&input("a.txt", "x", "y"), &ToolContext::new(root.path())).await.unwrap_err();
+        assert!(err.0.starts_with("old_string appears 2 times in a.txt."));
+    }
+
+    #[test]
+    fn protected_files_are_flagged() {
+        let root = TempDir::new("edit-protected");
+        let ctx = ToolContext::new(root.path());
+        assert_eq!(protected_target("AGENTS.md", &ctx), Some(marv_sandbox::ProtectedRule::AgentInstructions));
+        assert_eq!(protected_target("src/a.ts", &ctx), None);
+    }
+}
