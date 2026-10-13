@@ -1,4 +1,4 @@
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Box, useApp, useInput, useWindowSize, type DOMElement } from "ink";
 import { agentArgs } from "./agent.ts";
@@ -30,15 +30,23 @@ import { MarvSession, type CompactResult, type Resumed } from "./session.ts";
 import { timeAgo, type SessionStore, type SessionSummary } from "./sessions.ts";
 import { skillMessage, type Skill } from "./skills.ts";
 import type { TrajectoryStore } from "./trajectory.ts";
-import type { McpManager, McpServerStatus } from "./mcp/manager.ts";
+import type { McpLogin, McpManager, McpServerStatus } from "./mcp/manager.ts";
+import { canOpenBrowser, isCallback, openBrowser } from "./mcp/oauth.ts";
+import { parseMcpServers } from "./mcp/config.ts";
+import { liveDeps, resolveAdd, type Resolved } from "./mcp/install/index.ts";
+import { addedNotice, approvalFor } from "./mcp/install/proposal.ts";
+import { searchRegistry, searchText, type RegistryHit } from "./mcp/install/registry.ts";
+import { parseAddArgs, type AddOptions } from "./mcp/install/source.ts";
+import { addPersonalServer, personalServerNames, removePersonalServer } from "./mcp/personal-file.ts";
+import { printable } from "./printable.ts";
 import type { AgentProgress, ApprovalRequest, Decision } from "./tools/types.ts";
 import { checkNotice } from "./diagnostics/turn.ts";
 import { projectCheckNotice, type ProjectCheckResult } from "./checks/kind.ts";
 import { loadChecks, type ProjectCheck } from "./checks/load.ts";
-import { hiddenPathFoldersNotice } from "./commands/sandbox-notice.ts";
-import { instructionsCutNotice, type InstructionsCut } from "./prompt.ts";
+import { hiddenPathFoldersItem } from "./commands/sandbox-notice.ts";
+import { instructionsCutItem, type InstructionsCut } from "./prompt.ts";
 import type { CommandAction } from "./commands/index.ts";
-import type { Message } from "./types.ts";
+import type { Message, Notice, NoticeItem, NoticeTone } from "./types.ts";
 import { AgentView, AgentViewHeader } from "./ui/AgentView.tsx";
 import { Approval } from "./ui/Approval.tsx";
 import { SessionPicker } from "./ui/SessionPicker.tsx";
@@ -69,6 +77,36 @@ function describeUntrusted(s: McpServerStatus): string {
     s.runsProjectFiles.length > 0 && `runs this project's ${s.runsProjectFiles.join(", ")} (and whatever those load)`,
   ].filter(Boolean);
   return `${s.name} (${s.target})${extras.length ? `, which ${extras.join(" and ")}` : ""}`;
+}
+
+/** How severe a tone is, so the startup notice can use its worst. */
+const TONE_RANK: Record<NoticeTone, number> = { info: 0, warning: 1, error: 2 };
+
+/** The worst of a set of tones (error beats warning beats info). */
+function worstTone(tones: NoticeTone[]): NoticeTone {
+  return tones.reduce((worst, tone) => (TONE_RANK[tone] > TONE_RANK[worst] ? tone : worst), "info");
+}
+
+/** Collates the startup notices known at once into one block: a bullet per notice, titled with how many there are. */
+function startupNotice(notes: { tone: NoticeTone; item: NoticeItem }[]): Notice | null {
+  if (notes.length === 0) return null;
+  return {
+    title: `Startup · ${notes.length} note${notes.length === 1 ? "" : "s"}`,
+    tone: worstTone(notes.map((n) => n.tone)),
+    items: notes.map((n) => n.item),
+  };
+}
+
+/** Opens a login's URL where a browser can open; elsewhere the transcript's link is all there is. */
+function defaultOpenUrl(url: URL) {
+  if (canOpenBrowser(process.env, process.platform)) openBrowser(url);
+}
+
+/** "github: logged in · connected · 41 tools", or why not: the end of /mcp login. */
+function loginResult(s: McpServerStatus): { text: string; isError: boolean } {
+  if (s.state === "connected") return { text: `${s.name}: logged in · connected · ${s.tools.length} tool${s.tools.length === 1 ? "" : "s"}. Marv can use them from your next message.`, isError: false };
+  if (s.state === "needs-login") return { text: `${s.name}: logged in, but the server still refused the token (see /mcp).`, isError: true };
+  return { text: `${s.name}: logged in, but it didn't connect: ${s.error ?? s.state} (see /mcp).`, isError: true };
 }
 
 // Defaults defined once, so they're the same objects on every render (the
@@ -114,6 +152,14 @@ interface Props {
   mcp?: McpManager;
   /** MCP config files that couldn't be read, and why. */
   mcpProblems?: string[];
+  /** /mcp add's lookup and /mcp search: by default through Marv's own `get` (tests stub them, so nothing hits the network). */
+  resolveMcp?: (options: AddOptions, signal: AbortSignal) => Promise<Resolved>;
+  searchMcp?: (words: string, signal: AbortSignal) => Promise<RegistryHit[]>;
+  /**
+   * /mcp login: opens the authorization URL in the browser. By default xdg-open/open where a browser can open (not
+   * over SSH, not without a display); tests inject their own, so no browser ever opens.
+   */
+  openUrl?: (url: URL) => void;
   /** Hands cli.tsx a function to run before the process exits: saves the session and flushes the trajectory. */
   onFlush?: (flush: () => Promise<void>) => void;
   /** Start by resuming: the latest session here (marv -c), or a picker (marv -r). */
@@ -154,6 +200,9 @@ export function App({
   trajectories,
   mcp,
   mcpProblems = NO_PROBLEMS,
+  resolveMcp,
+  searchMcp,
+  openUrl = defaultOpenUrl,
   onFlush,
   resume,
   memory,
@@ -188,7 +237,22 @@ export function App({
   // Memory as of the start of this conversation, for the welcome banner (the session reloads it on /clear).
   const [memories, setMemories] = useState<Memories | undefined>(memory?.initial);
   // Skills show up in the / menu next to the built-in commands.
-  const menu = useMemo(() => [...commands, ...skills.map(({ name, description }) => ({ name, description }))], [skills]);
+  const baseMenu = useMemo(() => [...commands, ...skills.map(({ name, description }) => ({ name, description }))], [skills]);
+  // Server names after "/mcp login " and "/mcp logout " (the servers that can log in; read per render, they change).
+  const loginable = mcp?.loginable().join("\n") ?? "";
+  const menu = useMemo(
+    () => [
+      ...baseMenu,
+      ...loginable
+        .split("\n")
+        .filter(Boolean)
+        .flatMap((name) => [
+          { name: `mcp login ${name}`, description: `Log in to ${name} (OAuth, in your browser)` },
+          { name: `mcp logout ${name}`, description: `Forget ${name}'s login` },
+        ]),
+    ],
+    [baseMenu, loginable],
+  );
   // The session's numbers, for the status bar: the latest request's tokens (how full the context is), and the
   // whole session's (they survive /clear: that's money spent).
   const [usage, setUsage] = useState<Usage | null>(null);
@@ -742,7 +806,15 @@ export function App({
 
   const handleSubmit = (raw: string) => {
     const text = raw.trim();
-    if (!text || busy) return;
+    if (!text) return;
+    // A login's callback address (pasted from a browser that couldn't reach Marv) holds the authorization code: it
+    // goes to the login, never to the model, the prompt history or the saved transcript. Even during a turn.
+    if (isCallback(text)) {
+      setInput("");
+      pasteCallback(text);
+      return;
+    }
+    if (busy) return;
     if (loadingSession) {
       setNotice("Loading your last session…");
       return;
@@ -843,6 +915,21 @@ export function App({
       case "mcp-trust":
         void trustMcp();
         break;
+      case "mcp-add":
+        void addMcp(action.args);
+        break;
+      case "mcp-search":
+        void findMcp(action.words);
+        break;
+      case "mcp-remove":
+        void removeMcp(action.name);
+        break;
+      case "mcp-login":
+        void loginMcp(action.server);
+        break;
+      case "mcp-logout":
+        void logoutMcp(action.server);
+        break;
       case "yolo":
         void saveConfig({ ...(file ?? { provider: config.provider }), yolo: action.on }, yoloStatus({ ...config, yolo: action.on }));
         break;
@@ -871,6 +958,206 @@ export function App({
     } catch (err) {
       addMessage({ role: "system", text: `Couldn't trust the servers: ${(err as Error).message}`, isError: true });
     }
+  };
+
+  // The /mcp login waiting for its callback: a pasted callback address goes to it.
+  const pendingLogin = useRef<{ server: string; login: McpLogin } | null>(null);
+  // Servers already said to need a login (at startup or since), so a mid-session expiry is told once.
+  const toldNeedsLogin = useRef(new Set<string>());
+
+  /**
+   * /mcp login: not a turn (the prompt stays free, and a running turn keeps its tools). The browser opens where it
+   * can; the link is shown either way, with the paste fallback for a browser on another machine.
+   */
+  const loginMcp = async (name: string) => {
+    if (!mcp) return;
+    let login: McpLogin;
+    try {
+      login = mcp.login(name, {
+        authorize: (url) => {
+          addMessage({
+            role: "system",
+            text: `Log in to ${name} at ${url.host}: opening your browser… If it doesn't open, open this link and, if your browser then shows an error page, paste its address here:\n${url.href}`,
+          });
+          openUrl(url);
+        },
+      });
+    } catch (err) {
+      addMessage({ role: "system", isError: true, text: (err as Error).message });
+      return;
+    }
+    const mine = { server: name, login };
+    pendingLogin.current = mine;
+    toldNeedsLogin.current.add(name);
+    try {
+      const status = await login.done;
+      if (status.state === "connected") toldNeedsLogin.current.delete(name);
+      addMessage({ role: "system", ...loginResult(status) });
+    } catch (err) {
+      addMessage({ role: "system", isError: true, text: `${name}: not logged in: ${(err as Error).message}` });
+    } finally {
+      if (pendingLogin.current === mine) pendingLogin.current = null;
+    }
+  };
+
+  /** A pasted callback address: shown as "(login callback)", handed to the waiting login. */
+  const pasteCallback = (text: string) => {
+    addMessage({ role: "user", text: "(login callback)" });
+    const pending = pendingLogin.current;
+    if (!pending) {
+      addMessage({ role: "system", isError: true, text: "No login is waiting for that address (/mcp login <server> starts one). It wasn't sent to the model." });
+      return;
+    }
+    const check = pending.login.paste(text);
+    if (check.ok) addMessage({ role: "system", text: `Got it: finishing the login to ${pending.server}…` });
+    else if (check.why === "state" || check.why === "path") addMessage({ role: "system", isError: true, text: "That address isn't from this login: paste the address the browser ended up on after the latest /mcp login." });
+    else if (check.why === "used") addMessage({ role: "system", isError: true, text: "This login already has its callback." });
+    // An error= callback: login.done rejects with the reason, and loginMcp says so.
+  };
+
+  /** /mcp logout: revoke where the server can, forget the login. */
+  const logoutMcp = async (name: string) => {
+    if (!mcp) return;
+    toldNeedsLogin.current.add(name);
+    try {
+      const { revoked } = await mcp.logout(name);
+      const grant =
+        revoked === "revoked"
+          ? "The authorization server revoked the grant."
+          : revoked === "unsupported"
+            ? "The authorization server can't revoke it from here, so the grant still exists on its side: remove it in your account's settings there (usually under applications or integrations)."
+            : "Revoking the grant failed, so it may still exist on the authorization server's side: remove it in your account's settings there.";
+      addMessage({ role: "system", text: `Logged out of ${name}: its tokens are forgotten. ${grant}` });
+    } catch (err) {
+      addMessage({ role: "system", isError: true, text: (err as Error).message });
+    }
+  };
+
+  // ~/.marv (or MARV_CONFIG_DIR): where config.json is, mcp.json is too.
+  const configDir = dirname(store.path);
+
+  /** Busy work outside a turn (/mcp add's lookup, /mcp search): Esc stops it, `label` shows where "Thinking…" would. */
+  const busyWith = async <T,>(label: string, work: (signal: AbortSignal) => Promise<T>): Promise<T> => {
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setStreaming("");
+    setWaitingFor(label);
+    try {
+      return await work(controller.signal);
+    } finally {
+      abortRef.current = null;
+      setStreaming(null);
+      setWaitingFor(null);
+    }
+  };
+
+  /**
+   * /mcp add: look the source up (all fetching happens here, before the approval), ask once with the exact entry,
+   * write that entry to ~/.marv/mcp.json, and start it. Nothing fetched after the yes changes what runs: the file
+   * gets the JSON the approval showed, parsed back.
+   */
+  const addMcp = async (args: string) => {
+    let options: AddOptions;
+    try {
+      options = parseAddArgs(args);
+    } catch (err) {
+      addMessage({ role: "system", isError: true, text: (err as Error).message });
+      return;
+    }
+    type Outcome = { choices: string[] } | { declined: string } | { added: string; entry: unknown } | { failed: string };
+    let outcome: Outcome;
+    try {
+      outcome = await busyWith(`Looking up ${printable(options.source)}…`, async (signal): Promise<Outcome> => {
+        const resolved = await (resolveMcp ?? ((o, s) => resolveAdd(o, liveDeps(env, s))))(options, signal);
+        if ("choices" in resolved) return resolved;
+        // Removed in this conversation: its tools stay listed until /clear, so it can't come back yet (McpManager.add).
+        if (mcp?.status().some((s) => s.name === resolved.name && s.state === "removed")) {
+          throw new Error(`"${resolved.name}" was removed in this conversation and its tools stay listed until the next one: /clear first, or pick another --name.`);
+        }
+        if ((await personalServerNames(configDir)).includes(resolved.name)) {
+          throw new Error(`You already have a server named "${resolved.name}": pick another with --name, or /mcp remove ${resolved.name} first.`);
+        }
+        // A project server with that name is running (or waiting for trust) under it: McpManager.add can't start a
+        // second one, and replacing it mid-conversation would swap the tools under the model. Another name is simpler.
+        if (mcp?.status().some((s) => s.name === resolved.name && s.source === "project")) {
+          throw new Error(`This project has a server named "${resolved.name}": pick another with --name.`);
+        }
+        if (signal.aborted) return { failed: "Stopped: nothing was added." };
+        const { request, json } = approvalFor(resolved, { env });
+        if ((await approve(request)) !== "yes") return { declined: resolved.name };
+        const entry: unknown = JSON.parse(json);
+        await addPersonalServer(configDir, resolved.name, entry);
+        return { added: resolved.name, entry };
+      });
+    } catch (err) {
+      const stopped = (err as Error).name === "AbortError";
+      outcome = { failed: stopped ? "Stopped: nothing was added." : `Couldn't add the server: ${(err as Error).message}` };
+    }
+    if ("failed" in outcome) {
+      addMessage({ role: "system", isError: true, text: outcome.failed });
+      return;
+    }
+    if ("choices" in outcome) {
+      addMessage({ role: "system", markdown: true, text: `That README names several servers. Add one with:\n\n${outcome.choices.map((c) => `- \`${printable(c)}\``).join("\n")}` });
+      return;
+    }
+    if ("declined" in outcome) {
+      addMessage({ role: "system", text: `Not added: ${outcome.declined}.` });
+      return;
+    }
+    // Loaded exactly as at startup, so ${VAR}s are filled in the same way.
+    const { added: name, entry } = outcome;
+    const { servers, problems } = parseMcpServers({ [name]: entry }, { ...env, MARV_PROJECT_DIR: root });
+    const server = servers[0];
+    if (!server) {
+      addMessage({ role: "system", isError: true, text: `Added ${name} to ~/.marv/mcp.json, but didn't start it: ${problems[0]?.replace(/^"[^"]*" in mcpServers: /, "") ?? "it couldn't be loaded"}. Set it in your shell and restart Marv.` });
+      return;
+    }
+    if (!mcp) {
+      addMessage({ role: "system", text: `Added ${name} to ~/.marv/mcp.json. Restart Marv to start it.` });
+      return;
+    }
+    addMessage({ role: "system", text: `Starting ${name}…` });
+    try {
+      addMessage({ role: "system", ...addedNotice(await mcp.add(server)) });
+    } catch (err) {
+      addMessage({ role: "system", isError: true, text: `Added ${name} to ~/.marv/mcp.json, but didn't start it now: ${(err as Error).message} It starts when you restart Marv.` });
+    }
+  };
+
+  /** /mcp search: the MCP Registry's latest, active entries. */
+  const findMcp = async (words: string) => {
+    try {
+      const hits = await busyWith("Searching the MCP Registry…", (signal) => (searchMcp ?? ((w, s) => searchRegistry(w, liveDeps(env, s))))(words, signal));
+      addMessage({ role: "system", markdown: true, text: searchText(words, hits) });
+    } catch (err) {
+      addMessage({ role: "system", isError: true, text: `Couldn't search the MCP Registry: ${(err as Error).message}` });
+    }
+  };
+
+  /** /mcp remove: one of your servers out of ~/.marv/mcp.json, and stopped. No approval: the user typed it, and it takes capability away. */
+  const removeMcp = async (name: string) => {
+    if (!(await personalServerNames(configDir)).includes(name)) {
+      const project = mcp?.status().some((s) => s.name === name && s.source === "project");
+      addMessage({
+        role: "system",
+        isError: true,
+        text: project ? `"${name}" is this project's server: remove it from .mcp.json.` : `You have no server named "${name}" in ~/.marv/mcp.json (/mcp lists them).`,
+      });
+      return;
+    }
+    try {
+      await removePersonalServer(configDir, name);
+    } catch (err) {
+      addMessage({ role: "system", isError: true, text: (err as Error).message });
+      return;
+    }
+    const running = mcp?.status().some((s) => s.name === name && s.source === "personal" && s.state !== "removed");
+    if (running) await mcp!.remove(name).catch(() => {});
+    addMessage({
+      role: "system",
+      text: `Removed ${name} from ~/.marv/mcp.json${running ? " and stopped it. Its tools stay listed (failing) until /clear or a restart." : "."}`,
+    });
   };
 
   /** /good, /bad, /label: feedback on the latest turn of this session, in its trajectory. */
@@ -1111,56 +1398,73 @@ export function App({
     }
   }, [resume, sessions, phase, openPicker, resumeSession, showResumed, addMessage]);
 
-  // Skills that couldn't be loaded are reported once, not silently skipped.
+  // Startup problems known at once (skills, PATH, AGENTS.md cut, MCP config, agents) become ONE notice: a short
+  // headline per problem, one bullet each, the title saying how many. They never reach the model's conversation.
   useEffect(() => {
-    if (skillProblems.length === 0) return;
-    const count = skillProblems.length;
-    addMessage({ role: "system", isError: true, text: `${count} skill${count === 1 ? "" : "s"} couldn't be loaded (see /skills):\n${skillProblems.join("\n")}` });
-  }, [skillProblems, addMessage]);
+    const notes: { tone: NoticeTone; item: NoticeItem }[] = [];
+    if (skillProblems.length) {
+      const count = skillProblems.length;
+      notes.push({ tone: "error", item: { text: `${count} skill${count === 1 ? "" : "s"} couldn't be loaded (see /skills)`, detail: skillProblems } });
+    }
+    if (hiddenPathFolders.length) notes.push({ tone: "warning", item: hiddenPathFoldersItem(hiddenPathFolders) });
+    if (instructionsCut) notes.push({ tone: "info", item: instructionsCutItem(instructionsCut) });
+    if (mcpProblems.length) {
+      const count = mcpProblems.length;
+      notes.push({ tone: "error", item: { text: `${count} MCP config problem${count === 1 ? "" : "s"} (see /mcp)`, detail: mcpProblems } });
+    }
+    if (agentProblems.length) {
+      const count = agentProblems.length;
+      notes.push({ tone: "error", item: { text: `${count} agent file${count === 1 ? "" : "s"} couldn't be loaded (see /agents)`, detail: agentProblems } });
+    }
+    const notice = startupNotice(notes);
+    if (notice) addMessage({ role: "system", text: "", notice });
+  }, [skillProblems, hiddenPathFolders, instructionsCut, mcpProblems, agentProblems, addMessage]);
 
-  // PATH folders the sandbox can't see (issue #34: node from mise made the typecheck fail silently).
+  // MCP: once the servers have started, a block for any that failed, and a project's servers waiting to be
+  // trusted (they don't start until then). A separate notice, since it isn't known at startup.
   useEffect(() => {
-    if (hiddenPathFolders.length === 0) return;
-    addMessage({ role: "system", text: hiddenPathFoldersNotice(hiddenPathFolders) });
-  }, [hiddenPathFolders, addMessage]);
-
-  // An AGENTS.md longer than the cap: the model gets its start and the rest's headings (issue #40).
-  useEffect(() => {
-    if (instructionsCut) addMessage({ role: "system", text: instructionsCutNotice(instructionsCut) });
-  }, [instructionsCut, addMessage]);
-
-  // MCP: config problems right away; once the servers have started, any that failed, and a project's servers
-  // waiting to be trusted (they don't start until then).
-  useEffect(() => {
-    if (mcpProblems.length) addMessage({ role: "system", isError: true, text: `MCP config problems (see /mcp):\n${mcpProblems.join("\n")}` });
     if (!mcp) return;
     let cancelled = false;
     void mcp.ready.then(() => {
       if (cancelled) return;
       const status = mcp.status();
       const failed = status.filter((s) => s.state === "failed");
-      if (failed.length) {
-        addMessage({ role: "system", isError: true, text: `Couldn't start ${failed.map((s) => `MCP server ${s.name}: ${s.error}`).join("; ")} (see /mcp).` });
-      }
       const waiting = status.filter((s) => s.state === "untrusted");
-      if (waiting.length) {
-        addMessage({
-          role: "system",
-          text: `This project's .mcp.json lists MCP servers you haven't trusted yet: ${waiting.map(describeUntrusted).join("; ")}. They'd run with your permissions, outside the sandbox. /mcp trust starts them.`,
+      const login = status.filter((s) => s.state === "needs-login");
+      for (const s of login) toldNeedsLogin.current.add(s.name);
+      // From now on, a server whose login runs out mid-session (a refresh refused) is told once.
+      mcp.onChange = () => {
+        for (const s of mcp.status()) {
+          if (s.state === "needs-login" && !toldNeedsLogin.current.has(s.name)) {
+            toldNeedsLogin.current.add(s.name);
+            addMessage({ role: "system", text: "", notice: { title: "MCP", tone: "warning", items: [{ text: `${s.name} needs a new login: /mcp login ${s.name}`, detail: ["Its tools fail until then."] }] } });
+          } else if (s.state === "connected") {
+            toldNeedsLogin.current.delete(s.name);
+          }
+        }
+      };
+      const count = failed.length + waiting.length + login.length;
+      if (count === 0) return;
+      const notes: NoticeItem[] = [];
+      if (failed.length) notes.push({ text: `${failed.length} MCP server${failed.length === 1 ? "" : "s"} failed to start (see /mcp)`, detail: failed.map((s) => `${s.name}: ${s.error}`) });
+      if (waiting.length)
+        notes.push({
+          text: `This project's .mcp.json lists ${waiting.length} MCP server${waiting.length === 1 ? "" : "s"} you haven't trusted yet`,
+          // The trust decision is the security gate (a cloned repository's .mcp.json could run anything): say what's at stake.
+          detail: [...waiting.map((s) => describeUntrusted(s)), "They'd run with your permissions, outside the sandbox. /mcp trust starts them."],
         });
-      }
+      if (login.length)
+        notes.push({
+          text: `${login.length} MCP server${login.length === 1 ? " needs" : "s need"} a login`,
+          detail: login.map((s) => `${s.name}: /mcp login ${s.name}`),
+        });
+      addMessage({ role: "system", text: "", notice: { title: `MCP · ${count} note${count === 1 ? "" : "s"}`, tone: failed.length ? "error" : "warning", items: notes } });
     });
     return () => {
       cancelled = true;
+      mcp.onChange = () => {};
     };
-  }, [mcp, mcpProblems, addMessage]);
-
-  // Agent files that couldn't be loaded, likewise.
-  useEffect(() => {
-    if (agentProblems.length === 0) return;
-    const count = agentProblems.length;
-    addMessage({ role: "system", isError: true, text: `${count} agent file${count === 1 ? "" : "s"} couldn't be loaded (see /agents):\n${agentProblems.join("\n")}` });
-  }, [agentProblems, addMessage]);
+  }, [mcp, addMessage]);
 
   const finishSplash = useCallback(() => setPhase("main"), []);
 

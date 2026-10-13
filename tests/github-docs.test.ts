@@ -24,22 +24,29 @@ describe("README's Connect GitHub section", () => {
   test("every config it shows parses as MCP config, reading the token from the environment", async () => {
     const blocks = jsonBlocks(await readme(), "Connect GitHub");
     expect(blocks.length).toBeGreaterThanOrEqual(2);
-    for (const [i, block] of blocks.entries()) {
+    let docker = 0;
+    for (const block of blocks) {
       const config = JSON.parse(block) as { mcpServers: Record<string, unknown> };
-      const { servers, problems } = parseMcpServers(config.mcpServers, { MARV_GITHUB_TOKEN: "token" });
+      const { servers, problems } = parseMcpServers(config.mcpServers, { MARV_GITHUB_TOKEN: "token", MARV_GITHUB_CLIENT_SECRET: "secret" });
       expect(problems).toEqual([]);
       expect(servers).toHaveLength(1);
       expect(servers[0]!.name).toBe("github");
       const transport = servers[0]!.transport;
-      if (transport.type !== "stdio") throw new Error("the GitHub server must be a stdio server");
+      if (transport.type === "http") {
+        // The OAuth login (#18): the hosted server, your own app's client, the secret from the environment.
+        expect(transport).toMatchObject({ url: "https://api.githubcopilot.com/mcp/", oauth: { clientSecret: "secret", callbackPort: 33418 } });
+        expect(servers[0]!.reads).toEqual(["MARV_GITHUB_CLIENT_SECRET"]);
+        continue;
+      }
       expect(transport).toMatchObject({
         command: "docker",
         env: { GITHUB_PERSONAL_ACCESS_TOKEN: "token" }, // ${MARV_GITHUB_TOKEN} was filled in
       });
       expect(transport.args?.join(" ")).toContain("ghcr.io/github/github-mcp-server");
       expect(servers[0]!.reads).toEqual(["MARV_GITHUB_TOKEN"]);
-      if (i > 0) expect(transport.args?.join(" ")).toContain("GITHUB_TOOLSETS");
+      if (docker++ > 0) expect(transport.args?.join(" ")).toContain("GITHUB_TOOLSETS");
     }
+    expect(docker).toBeGreaterThanOrEqual(2);
   });
 
   test("a missing token is reported naming the variable (what /mcp shows when the export is forgotten)", async () => {
@@ -51,6 +58,17 @@ describe("README's Connect GitHub section", () => {
 
   test("links the example skill", async () => {
     expect(await readme()).toContain("examples/skills/github/SKILL.md");
+  });
+});
+
+describe("README's Add an MCP server section", () => {
+  test("the login example parses, its client secret read from the environment (#18)", async () => {
+    const blocks = jsonBlocks(await readme(), "Add an MCP server");
+    expect(blocks).toHaveLength(1);
+    const config = JSON.parse(blocks[0]!) as { mcpServers: Record<string, unknown> };
+    const { servers, problems } = parseMcpServers(config.mcpServers, { EXAMPLE_CLIENT_SECRET: "s" });
+    expect(problems).toEqual([]);
+    expect(servers[0]!.transport).toMatchObject({ type: "http", oauth: { clientId: "abc123", clientSecret: "s", callbackPort: 33418, scope: "read write" } });
   });
 });
 

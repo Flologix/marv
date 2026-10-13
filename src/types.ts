@@ -17,6 +17,22 @@ export interface ToolStatus {
   diff?: DiffShown;
 }
 
+/** How important a notice is; its left bar, title and worst-of tone use its color. */
+export type NoticeTone = "info" | "warning" | "error";
+
+/** One bullet of a notice: a short headline, then (optionally) indented detail lines. */
+export interface NoticeItem {
+  text: string;
+  detail?: string[];
+}
+
+/** A distinct, colored block of startup and other issues (see NoticeView), transcript only, never sent to the model. */
+export interface Notice {
+  title: string;
+  tone: NoticeTone;
+  items: NoticeItem[];
+}
+
 export interface Message {
   id: number;
   role: Role;
@@ -26,5 +42,7 @@ export interface Message {
   isError?: boolean;
   /** Render a system message as Markdown (lists get hanging indents). */
   markdown?: boolean;
+  /** Renders a system message as a distinct notice block (a left bar, a colored title, bullets). */
+  notice?: Notice;
   tool?: ToolStatus;
 }

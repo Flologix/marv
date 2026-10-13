@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
@@ -10,6 +10,9 @@ import { homeOrAbove } from "../src/paths.ts";
 import type { AgentEvent } from "../src/provider/types.ts";
 import { sandboxAvailable } from "../src/sandbox.ts";
 import { ScriptedProvider } from "./fake-provider.ts";
+import { McpManager } from "../src/mcp/manager.ts";
+import { McpTokenStore } from "../src/mcp/oauth-store.ts";
+import { oauthServer } from "./fixtures/oauth-server.ts";
 
 let root: string;
 let configDir: string;
@@ -271,4 +274,95 @@ test.skipIf(!sandboxAvailable())("with no approver, a sandboxed command without 
   expect(events).toContainEqual(expect.objectContaining({ type: "tool_end", result: expect.objectContaining({ approval: "auto" }) }));
   expect(await readFile(join(root, "out.txt"), "utf8")).toBe("hi\n");
   await session.close();
+});
+
+describe("MCP logins (#18)", () => {
+  const lookup = (id: string): AgentEvent[] => [{ type: "tool_call", call: { id, name: "mcp__remote__lookup", arguments: JSON.stringify({ word: "w" }) } }, { type: "done", reason: "tool_calls" }];
+  const toolResult = (provider: ScriptedProvider, i: number) => JSON.stringify(provider.requests[i]!.history.at(-1));
+
+  test("a login stored in configDir is used, and refreshed", async () => {
+    const fixture = oauthServer();
+    try {
+      // Logged in once (as /mcp login does in the TUI), into configDir's store.
+      const tui = new McpManager([{ name: "remote", source: "personal", key: "k", transport: { type: "http", url: fixture.url } }], {
+        root,
+        version: "9.9.9",
+        logins: new McpTokenStore(join(configDir, "mcp-tokens.json")),
+      });
+      await tui.start();
+      await tui.login("remote", {
+        authorize: (url) => void fetch(url, { redirect: "manual" }).then((r) => fetch(r.headers.get("location")!)),
+      }).done;
+      await tui.close();
+      const before = fixture.paths().filter((p) => p === "/register" || p === "/authorize").length;
+
+      const provider = new ScriptedProvider([lookup("a"), say("ok"), lookup("b"), say("ok again")]);
+      const warnings: string[] = [];
+      const session = await createSession({ cwd: root, provider, configDir, mcpServers: { remote: { type: "http", url: fixture.url } }, onWarning: (w) => warnings.push(w) });
+      await collect(session.send("look"));
+      expect(toolResult(provider, 1)).toContain("w: a word");
+      fixture.expire();
+      await collect(session.send("again"));
+      expect(toolResult(provider, 3)).toContain("w: a word");
+      expect(warnings).toEqual([]);
+      expect(fixture.paths().filter((p) => p === "/register" || p === "/authorize")).toHaveLength(before);
+      await session.close();
+    } finally {
+      fixture.close();
+    }
+  });
+
+  test("a login refused mid-session: one warning, as at startup, however many calls fail", async () => {
+    const fixture = oauthServer();
+    try {
+      const tui = new McpManager([{ name: "remote", source: "personal", key: "k", transport: { type: "http", url: fixture.url } }], {
+        root,
+        version: "9.9.9",
+        logins: new McpTokenStore(join(configDir, "mcp-tokens.json")),
+      });
+      await tui.start();
+      await tui.login("remote", {
+        authorize: (url) => void fetch(url, { redirect: "manual" }).then((r) => fetch(r.headers.get("location")!)),
+      }).done;
+      await tui.close();
+
+      const provider = new ScriptedProvider([lookup("a"), say("ok"), lookup("b"), say("ok again"), lookup("c"), say("still")]);
+      const warnings: string[] = [];
+      const session = await createSession({ cwd: root, provider, configDir, mcpTools: "eager", mcpServers: { remote: { type: "http", url: fixture.url } }, onWarning: (w) => warnings.push(w) });
+      await collect(session.send("look"));
+      expect(warnings).toEqual([]);
+      fixture.expire();
+      fixture.refuseRefresh();
+      await collect(session.send("again"));
+      expect(toolResult(provider, 3)).toContain("remote needs a new login");
+      await collect(session.send("once more"));
+      expect(warnings).toEqual([
+        `MCP server "remote" needs a login: run marv in a terminal and /mcp login remote; logins are stored in ${join(configDir, "mcp-tokens.json")}`,
+      ]);
+      await session.close();
+    } finally {
+      fixture.close();
+    }
+  });
+
+  test("without a login: one warning saying how to log in; nothing is registered or opened", async () => {
+    const fixture = oauthServer();
+    try {
+      const provider = new ScriptedProvider([say("ok")]);
+      const warnings: string[] = [];
+      const session = await createSession({ cwd: root, provider, configDir, mcpTools: "eager", mcpServers: { remote: { type: "http", url: fixture.url } }, onWarning: (w) => warnings.push(w) });
+      await collect(session.send("look"));
+      expect(warnings).toEqual([
+        `MCP server "remote" needs a login: run marv in a terminal and /mcp login remote; logins are stored in ${join(configDir, "mcp-tokens.json")}`,
+      ]);
+      // It never connected, so it has no tools to offer (one whose login runs out mid-session keeps its tools, and
+      // their calls fail with "remote needs a new login: …": tests/mcp-login.test.ts).
+      expect(provider.requests[0]!.options.tools!.map((t) => t.name).filter((n) => n.startsWith("mcp__"))).toEqual([]);
+      expect(fixture.paths()).not.toContain("/register");
+      expect(fixture.paths()).not.toContain("/authorize");
+      await session.close();
+    } finally {
+      fixture.close();
+    }
+  });
 });

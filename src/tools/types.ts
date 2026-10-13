@@ -53,6 +53,8 @@ export interface ApprovalRequest {
   agent?: string;
   /** The action can reach the network (bash with network: true). */
   network?: boolean;
+  /** Yes or no only, no "don't ask again": each one is its own decision (/mcp add). */
+  once?: boolean;
 }
 
 /** yes: run it. always: run it, and everything in its scope this session. no: don't. */

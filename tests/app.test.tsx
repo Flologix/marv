@@ -19,8 +19,15 @@ import { GENERAL_PURPOSE } from "../src/agents.ts";
 import { SUBAGENT_MAX_STEPS } from "../src/subagent.ts";
 import { projectKey } from "../src/paths.ts";
 import { TrajectoryStore } from "../src/trajectory.ts";
+import type { McpServerConfig } from "../src/mcp/config.ts";
 import { McpManager } from "../src/mcp/manager.ts";
 import { McpTrust } from "../src/mcp/trust.ts";
+import { McpTokenStore } from "../src/mcp/oauth-store.ts";
+import { oauthServer } from "./fixtures/oauth-server.ts";
+import type { Resolved } from "../src/mcp/install/index.ts";
+import type { Proposal } from "../src/mcp/install/proposal.ts";
+import type { RegistryHit } from "../src/mcp/install/registry.ts";
+import type { AddOptions } from "../src/mcp/install/source.ts";
 import { dns } from "../src/tools/web/address.ts";
 import { FakeProvider, RoutedProvider, ScriptedProvider } from "./fake-provider.ts";
 
@@ -761,27 +768,35 @@ describe("App", () => {
       expect(lastFrame()).not.toContain("off-by-one");
     });
 
-    test("skills that couldn't be loaded are reported at startup", async () => {
-      const { lastFrame } = renderApp(LOCAL, 0, undefined, undefined, undefined, [], [".marv/skills/x/SKILL.md needs a description"]);
-      await tick();
-      expect(lastFrame()).toContain("1 skill couldn't be loaded (see /skills)");
-    });
-
-    test("PATH folders the sandbox hides are reported at startup", async () => {
-      const { lastFrame } = renderApp(LOCAL, 0, undefined, undefined, undefined, [], [], ["~/.local/share/mise/installs/node/26.8.2/bin"]);
-      await tick();
-      expect(lastFrame()).toContain("Your PATH has 1 folder the sandbox can't see");
-      expect(lastFrame()).toContain("~/.local/share/mise/installs/node/26.8.2/bin");
-      expect(lastFrame()).toContain("tsc and other node_modules scripts may not run");
-    });
-
-    test("an AGENTS.md that was cut off is reported once at startup (#40)", async () => {
+    test("startup problems become ONE notice, one bullet each", async () => {
       const cut = { chars: 86_000, totalLines: 400, nextLine: 120, sections: [{ heading: "## Conventions", line: 300 }] };
-      const { lastFrame } = renderApp(LOCAL, 0, undefined, undefined, "x", [], [], [], cut);
+      const { lastFrame } = renderApp(LOCAL, 0, undefined, undefined, "x", [], [".marv/skills/x/SKILL.md needs a description"], ["~/.local/share/mise/installs/node/26.8.2/bin"], cut);
       await tick();
-      expect(lastFrame()).toContain("AGENTS.md is longer than 20,000 characters (86,000)");
-      expect(lastFrame()).toContain("## Conventions");
-      expect(lastFrame()!.split("AGENTS.md is longer").length).toBe(2);
+      const frame = lastFrame()!;
+      // Exactly one Startup notice, naming how many problems, and it holds them all as bullets.
+      expect(frame.split("Startup · 3 notes").length).toBe(2);
+      expect(frame).toContain("1 skill couldn't be loaded (see /skills)");
+      expect(frame).toContain("1 PATH folder is hidden from the sandbox");
+      expect(frame).toContain("~/.local/share/mise/installs/node/26.8.2/bin");
+      expect(frame).toContain("AGENTS.md is long");
+    });
+
+    test("the startup notice carries both a PATH and an AGENTS.md item", async () => {
+      const cut = { chars: 86_000, totalLines: 400, nextLine: 120, sections: [{ heading: "## Conventions", line: 300 }, { heading: "## Prompt cache", line: 340 }] };
+      const { lastFrame } = renderApp(LOCAL, 0, undefined, undefined, "x", [], [], ["~/.cache/.bun/bin"], cut);
+      await tick();
+      const frame = lastFrame()!;
+      expect(frame.split("Startup · 2 notes").length).toBe(2);
+      expect(frame).toContain("AGENTS.md is long: the model sees the first 20,000 of 86,000 characters");
+      expect(frame).toContain("Up front: lines 1-119");
+      expect(frame).toContain("1 PATH folder is hidden from the sandbox: ~/.cache/.bun/bin");
+      expect(frame).toContain("Move the tool to a folder the sandbox shows");
+    });
+
+    test("with no startup problems, there's no Startup notice", async () => {
+      const { lastFrame } = renderApp(LOCAL);
+      await tick();
+      expect(lastFrame()).not.toContain("Startup ·");
     });
   });
 
@@ -1317,6 +1332,7 @@ describe("MCP servers", () => {
       specs: [],
       status: () => [],
       untrusted: () => [],
+      loginable: () => [],
     };
     return { mcp: fake as unknown as McpManager, finish: () => ((fake.settled = true), finish()) };
   }
@@ -1359,7 +1375,10 @@ describe("MCP servers", () => {
     const { lastFrame, stdin } = renderWithMcp(new ScriptedProvider([]), new McpManager([server("project")], { root: project, version: "9.9.9", trust }));
     await tick(300);
     expect(lastFrame()).toContain("1 MCP server (/mcp)");
-    expect(lastFrame()).toContain("This project's .mcp.json lists MCP servers you haven't trusted yet: test");
+    expect(lastFrame()).toContain("MCP · 1 note");
+    expect(lastFrame()).toContain("lists 1 MCP server you haven't trusted yet");
+    expect(lastFrame()).toContain("outside the sandbox");
+    expect(lastFrame()).toContain("test (");
     await type(stdin, "/mcp trust");
     for (let i = 0; i < 100 && !lastFrame()!.includes("test: connected"); i++) await tick();
     expect(lastFrame()).toContain("test: connected · 8 tools");
@@ -1379,6 +1398,158 @@ describe("MCP servers", () => {
     expect(frame).toContain("test (node mcp/server.js --key=${OPENROUTER_API_KEY} · env NODE_OPTIONS=--require=./x.js)");
     expect(frame).toContain("reads $OPENROUTER_API_KEY from your environment");
     expect(frame).toContain("runs this project's mcp/server.js");
+  });
+});
+
+describe("MCP logins (#18)", () => {
+  let managers: McpManager[] = [];
+  let fixtures: ReturnType<typeof oauthServer>[] = [];
+  afterEach(async () => {
+    await Promise.all(managers.map((m) => m.close()));
+    managers = [];
+    for (const f of fixtures) f.close();
+    fixtures = [];
+  });
+  const reply = (text: string) => [{ type: "text_delta", text }, { type: "done" }] as AgentEvent[];
+
+  function setup(model: Provider, extra: { sessions?: SessionStore } = {}) {
+    const fixture = oauthServer();
+    fixtures.push(fixture);
+    const mcp = new McpManager([{ name: "remote", source: "personal", key: "k", transport: { type: "http", url: fixture.url } }], {
+      root: project,
+      version: "9.9.9",
+      logins: new McpTokenStore(join(dir, "mcp-tokens.json")),
+    });
+    managers.push(mcp);
+    void mcp.start();
+    const opened: URL[] = [];
+    const app = render(
+      <App
+        store={store}
+        initialFile={LOCAL}
+        env={{}}
+        version="9.9.9"
+        cwd="~/x"
+        root={project}
+        splashMs={0}
+        makeProvider={() => model}
+        loadModels={async () => []}
+        mcp={mcp}
+        openUrl={(url) => void opened.push(url)}
+        sessions={extra.sessions}
+      />,
+    );
+    return { ...app, mcp, fixture, opened };
+  }
+  /** Where the authorization server sends the browser back (what a user would paste). */
+  const callbackFor = async (url: URL) => (await fetch(url, { redirect: "manual" })).headers.get("location")!;
+  const flat = (frame: string | undefined) => (frame ?? "").replace(/\s+/g, " ");
+
+  test("startup lists the server that needs a login in the MCP notice", async () => {
+    const { lastFrame } = setup(new ScriptedProvider([]));
+    await until(() => flat(lastFrame()).includes("needs a login"));
+    const frame = flat(lastFrame());
+    expect(frame).toContain("MCP · 1 note");
+    expect(frame).toContain("1 MCP server needs a login");
+    expect(frame).toContain("remote: /mcp login remote");
+  });
+
+  test("/mcp login shows the link, opens it, takes the pasted callback, and the code never reaches the model or the saved session", async () => {
+    const sessions = new SessionStore(join(dir, "sessions"));
+    const model = new ScriptedProvider([reply("Hi."), reply("Again.")]);
+    const { lastFrame, stdin, opened } = setup(model, { sessions });
+    await until(() => flat(lastFrame()).includes("needs a login"));
+    await type(stdin, "/mcp login remote");
+    await until(() => opened.length > 0);
+    const frame = flat(lastFrame());
+    expect(frame).toContain("Log in to remote at 127.0.0.1:");
+    expect(frame).toContain("paste its address here");
+    const pasted = await callbackFor(opened[0]!);
+    const code = new URL(pasted).searchParams.get("code")!;
+    expect(code).toStartWith("code-");
+    await type(stdin, pasted);
+    await until(() => flat(lastFrame()).includes("logged in · connected"));
+    expect(flat(lastFrame())).toContain("remote: logged in · connected · 8 tools");
+    expect(flat(lastFrame())).toContain("(login callback)");
+    expect(lastFrame()).not.toContain(code);
+    // Then an ordinary message: the model sees the new tools, never the callback.
+    await type(stdin, "hello");
+    await until(() => model.requests.length > 0 && flat(lastFrame()).includes("Hi."));
+    expect(model.requests[0]!.options.tools!.map((t) => t.name)).toContain("mcp__remote__echo");
+    expect(JSON.stringify(model.requests)).not.toContain(code);
+    expect(JSON.stringify(model.requests)).not.toContain("login callback");
+    await tick(400); // the session saves 200 ms after a turn
+    const files = readdirSync(join(dir, "sessions"), { recursive: true }).map(String).filter((f) => f.endsWith(".json"));
+    expect(files.length).toBeGreaterThan(0);
+    for (const f of files) expect(await Bun.file(join(dir, "sessions", f)).text()).not.toContain(code);
+  });
+
+  test("a callback address with no login waiting is never sent to the model", async () => {
+    const model = new ScriptedProvider([reply("Hi.")]);
+    const { lastFrame, stdin } = setup(model);
+    await until(() => flat(lastFrame()).includes("needs a login"));
+    await type(stdin, "http://127.0.0.1:5555/callback?code=code-secret&state=abc");
+    await until(() => flat(lastFrame()).includes("No login is waiting"));
+    expect(model.requests).toHaveLength(0);
+    expect(lastFrame()).not.toContain("code-secret");
+  });
+
+  test("logging in while a turn runs doesn't change that turn's tools; the next turn has them", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const requests: StreamOptions[] = [];
+    const steps: AgentEvent[][] = [
+      [{ type: "tool_call", call: { id: "t1", name: "glob", arguments: JSON.stringify({ pattern: "*.nothing" }) } }, { type: "done" }],
+      reply("Done."),
+      reply("Next."),
+    ];
+    const gated: Provider = {
+      name: "gated",
+      async *stream(_history: ChatTurn[], options: StreamOptions = {}) {
+        requests.push(options);
+        if (requests.length === 1) await gate;
+        for (const event of steps.shift()!) yield event;
+      },
+    };
+    const { lastFrame, stdin, opened } = setup(gated);
+    await until(() => flat(lastFrame()).includes("needs a login"));
+    await type(stdin, "/mcp login remote");
+    await until(() => opened.length > 0);
+    await type(stdin, "look around");
+    await until(() => requests.length === 1);
+    // The callback arrives mid-turn (pasted: the prompt takes it even while busy).
+    await type(stdin, await callbackFor(opened[0]!));
+    await until(() => flat(lastFrame()).includes("logged in · connected"));
+    release();
+    await until(() => flat(lastFrame()).includes("Done."));
+    const names = (o: StreamOptions) => o.tools!.map((t) => t.name);
+    expect(names(requests[1]!)).toEqual(names(requests[0]!));
+    expect(names(requests[0]!)).not.toContain("mcp__remote__echo");
+    await type(stdin, "and now?");
+    await until(() => requests.length === 3);
+    expect(names(requests[2]!)).toContain("mcp__remote__echo");
+  });
+
+  test("a login that runs out mid-session is told once", async () => {
+    const model = new ScriptedProvider([
+      [{ type: "tool_call", call: { id: "c1", name: "mcp__remote__lookup", arguments: JSON.stringify({ word: "x" }) } }, { type: "done" }] as AgentEvent[],
+      reply("It needs a login."),
+    ]);
+    const { lastFrame, stdin, opened, fixture } = setup(model);
+    await until(() => flat(lastFrame()).includes("needs a login"));
+    await type(stdin, "/mcp login remote");
+    await until(() => opened.length > 0);
+    await type(stdin, await callbackFor(opened[0]!));
+    await until(() => flat(lastFrame()).includes("logged in · connected"));
+    fixture.expire();
+    fixture.refuseRefresh();
+    await type(stdin, "echo x");
+    await until(() => flat(lastFrame()).includes("It needs a login."));
+    const frame = flat(lastFrame());
+    expect(frame).toContain("remote needs a new login: /mcp login remote");
+    expect(frame.split("remote needs a new login: /mcp login remote").length).toBe(2);
+    // What the model read is Marv's sentence.
+    expect(JSON.stringify(model.requests[1]!.history)).toContain("remote needs a new login: the user can run /mcp login remote");
   });
 });
 
@@ -1714,5 +1885,167 @@ describe("subagents", () => {
     await tick();
     expect(lastFrame()).toContain("1 agent file couldn't be loaded");
     expect(lastFrame()).toContain(".marv/agents/x.md needs a description");
+  });
+});
+
+describe("/mcp add, search and remove", () => {
+  const FIXTURE = join(import.meta.dir, "fixtures", "mcp-server.ts");
+  let managers: McpManager[] = [];
+  afterEach(async () => {
+    await Promise.all(managers.map((m) => m.close()));
+    managers = [];
+  });
+  const mcpFile = () => join(dir, "mcp.json");
+  const readMcpFile = async () => JSON.parse(await Bun.file(mcpFile()).text()) as { mcpServers: Record<string, unknown> };
+
+  function renderAdd(
+    resolveMcp: (options: AddOptions) => Promise<Resolved>,
+    extra: { searchMcp?: (words: string) => Promise<RegistryHit[]>; env?: Record<string, string>; servers?: McpServerConfig[] } = {},
+  ) {
+    const mcp = new McpManager(extra.servers ?? [], { root: project, version: "9.9.9" }); // as cli.tsx makes it: even with no servers
+    managers.push(mcp);
+    void mcp.start();
+    const calls: AddOptions[] = [];
+    const app = render(
+      <App
+        store={store}
+        initialFile={LOCAL}
+        env={extra.env ?? {}}
+        version="9.9.9"
+        cwd="~/x"
+        root={project}
+        splashMs={0}
+        makeProvider={() => new FakeProvider()}
+        loadModels={async () => []}
+        mcp={mcp}
+        resolveMcp={async (options) => (calls.push(options), resolveMcp(options))}
+        searchMcp={extra.searchMcp}
+      />,
+    );
+    return { ...app, mcp, calls };
+  }
+  const fixtureProposal = (): Proposal => ({
+    name: "fixture",
+    entry: { command: process.execPath, args: [FIXTURE] },
+    facts: ["npm      fixture 1.0.0, published 2026-01-14 by someone"],
+    warnings: [],
+  });
+
+  test("shows one approval with the command and the JSON, and no 'don't ask again'; No writes nothing", async () => {
+    const { lastFrame, stdin, mcp, calls } = renderAdd(async () => fixtureProposal());
+    await type(stdin, "/mcp add fixture --env API_KEY");
+    await until(() => lastFrame()!.includes("Do you want to proceed?"));
+    const frame = lastFrame()!;
+    expect(calls).toEqual([{ source: "fixture", env: ["API_KEY"], headers: {}, args: [] }]);
+    expect(frame).toContain('Add MCP server "fixture" to ~/.marv/mcp.json');
+    expect(frame).toContain(`$ ${process.execPath}`);
+    expect(frame).toContain(FIXTURE);
+    expect(frame).toContain("fixture 1.0.0, published 2026-01-14");
+    expect(frame).toContain('writes   "fixture": {"command":');
+    expect(frame).toContain("runs outside the sandbox, with your permissions and network");
+    expect(frame).not.toContain("don't ask again");
+    stdin.write(DOWN);
+    await tick();
+    stdin.write(ENTER);
+    await until(() => lastFrame()!.includes("Not added"));
+    expect(existsSync(mcpFile())).toBe(false);
+    expect(mcp.status()).toEqual([]);
+  });
+
+  test("Yes writes exactly the entry shown (nothing after the approval changes it) and starts it", async () => {
+    const proposal = fixtureProposal();
+    const shown = structuredClone(proposal.entry);
+    const { lastFrame, stdin, mcp } = renderAdd(async () => proposal);
+    await type(stdin, "/mcp add fixture");
+    await until(() => lastFrame()!.includes("Do you want to proceed?"));
+    // Whatever happens to the proposal after it was shown (a late fetch, a bug) can't reach the file.
+    (proposal.entry as { args: string[] }).args.push("--evil");
+    stdin.write(ENTER);
+    await until(() => lastFrame()!.includes("connected · 8 tools"));
+    expect((await readMcpFile()).mcpServers).toEqual({ fixture: shown });
+    expect(lastFrame()).toContain("Added fixture to ~/.marv/mcp.json: connected · 8 tools");
+    expect(mcp.status()).toEqual([expect.objectContaining({ name: "fixture", source: "personal", state: "connected" })]);
+    expect(mcp.tools.map((t) => t.name)).toContain("mcp__fixture__echo");
+
+    // And /mcp remove takes it out again, keeping its tools listed for this conversation.
+    await type(stdin, "/mcp remove fixture");
+    await until(() => lastFrame()!.includes("Removed fixture"));
+    expect((await readMcpFile()).mcpServers).toEqual({});
+    expect(mcp.status()[0]!.state).toBe("removed");
+    expect(lastFrame()).toContain("Its tools stay listed (failing) until /clear");
+  });
+
+  test("a lookup that fails is shown and writes nothing", async () => {
+    const { lastFrame, stdin } = renderAdd(async () => {
+      throw new Error("There's no npm package named nope.");
+    });
+    await type(stdin, "/mcp add nope");
+    await until(() => lastFrame()!.includes("Couldn't add the server"));
+    expect(lastFrame()).toContain("There's no npm package named nope.");
+    expect(existsSync(mcpFile())).toBe(false);
+  });
+
+  test("a bad option is refused before anything is looked up", async () => {
+    const { lastFrame, stdin, calls } = renderAdd(async () => fixtureProposal());
+    await type(stdin, "/mcp add weather --env API_KEY=sk-123");
+    await until(() => lastFrame()!.includes("--env takes a variable's name"));
+    expect(calls).toEqual([]);
+  });
+
+  test("a name you already have is refused before asking", async () => {
+    await writeFile(mcpFile(), JSON.stringify({ mcpServers: { fixture: { command: "x" } } }));
+    const { lastFrame, stdin } = renderAdd(async () => fixtureProposal());
+    await type(stdin, "/mcp add fixture");
+    await until(() => lastFrame()!.includes("already have a server"));
+    expect(lastFrame()).not.toContain("Do you want to proceed?");
+    expect(lastFrame()).toContain("--name");
+  });
+
+  test("a name this project's .mcp.json uses is refused before asking (its server is running under that name)", async () => {
+    const servers: McpServerConfig[] = [{ name: "fixture", source: "project", key: "k", transport: { type: "stdio", command: process.execPath, args: [FIXTURE] } }];
+    const { lastFrame, stdin, mcp } = renderAdd(async () => fixtureProposal(), { servers });
+    await mcp.ready;
+    await type(stdin, "/mcp add fixture");
+    await until(() => lastFrame()!.includes("Couldn't add the server"));
+    expect(lastFrame()).toContain('This project has a server named "fixture"');
+    expect(lastFrame()).toContain("--name");
+    expect(lastFrame()).not.toContain("Do you want to proceed?");
+    expect(existsSync(mcpFile())).toBe(false);
+    expect(mcp.status()).toEqual([expect.objectContaining({ name: "fixture", source: "project", state: "connected" })]);
+  });
+
+  test("an unset ${VAR}: written, not started, and Marv says to set it and restart", async () => {
+    const proposal: Proposal = { ...fixtureProposal(), entry: { command: process.execPath, args: [FIXTURE], env: { NOT_SET_HERE: "${NOT_SET_HERE}" } } };
+    const { lastFrame, stdin, mcp } = renderAdd(async () => proposal);
+    await type(stdin, "/mcp add fixture");
+    await until(() => lastFrame()!.includes("Do you want to proceed?"));
+    expect(lastFrame()).toContain("NOT_SET_HERE (not set");
+    stdin.write(ENTER);
+    await until(() => lastFrame()!.includes("restart Marv"));
+    expect(lastFrame()).toContain("didn't start it: ${NOT_SET_HERE}");
+    expect((await readMcpFile()).mcpServers.fixture).toEqual(proposal.entry);
+    expect(mcp.status()).toEqual([]);
+  });
+
+  test("a README that names several servers lists the commands", async () => {
+    const { lastFrame, stdin } = renderAdd(async () => ({ choices: ["/mcp add weather-mcp", "/mcp add pypi:mcp-server-fetch"] }));
+    await type(stdin, "/mcp add https://github.com/acme/weather");
+    await until(() => lastFrame()!.includes("names several servers"));
+    expect(lastFrame()).toContain("/mcp add pypi:mcp-server-fetch");
+  });
+
+  test("/mcp search prints the registry's matches", async () => {
+    const { lastFrame, stdin } = renderAdd(async () => fixtureProposal(), {
+      searchMcp: async () => [{ name: "io.github.acme/weather", description: "Weather.", version: "1.0.0", repository: "github.com/acme/weather" }],
+    });
+    await type(stdin, "/mcp search weather");
+    await until(() => lastFrame()!.includes("/mcp add io.github.acme/weather"));
+    expect(lastFrame()).toContain("isn't curated");
+  });
+
+  test("/mcp remove refuses a server that isn't yours", async () => {
+    const { lastFrame, stdin } = renderAdd(async () => fixtureProposal());
+    await type(stdin, "/mcp remove nope");
+    await until(() => lastFrame()!.includes("no server named"));
   });
 });

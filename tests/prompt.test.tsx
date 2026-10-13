@@ -115,6 +115,17 @@ test("matchCommands puts prefix matches first, then other matches", () => {
   expect(matchCommands("hi", COMMANDS)).toEqual([]);
 });
 
+test("an argument completion (\"mcp login github\") is offered once its command and subcommand are typed", () => {
+  const withArgs = [...COMMANDS, { name: "mcp", description: "" }, { name: "mcp login github", description: "" }, { name: "mcp login linear", description: "" }, { name: "mcp logout github", description: "" }];
+  expect(matchCommands("/mcp login ", withArgs).map((c) => c.name)).toEqual(["mcp login github", "mcp login linear"]);
+  expect(matchCommands("/mcp login l", withArgs).map((c) => c.name)).toEqual(["mcp login linear"]);
+  expect(matchCommands("/mcp logout ", withArgs).map((c) => c.name)).toEqual(["mcp logout github"]);
+  // Not before: "/mcp " + Enter must still run /mcp, and "/m" lists commands, not arguments.
+  expect(matchCommands("/mcp ", withArgs)).toEqual([]);
+  expect(matchCommands("/m", withArgs).map((c) => c.name)).toEqual(["model", "mcp"]);
+  expect(matchCommands("/mcp login github", withArgs).map((c) => c.name)).toEqual(["mcp login github"]);
+});
+
 test("ctrl+letter combinations don't type the letter", async () => {
   const onSubmit = mock();
   const { stdin } = render(<Harness onSubmit={onSubmit} />);

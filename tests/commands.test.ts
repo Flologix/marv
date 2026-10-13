@@ -177,6 +177,57 @@ describe("slash commands", () => {
     expect(runCommand("/mcp nope")).toMatchObject({ type: "print", isError: true });
   });
 
+  test("/mcp add, search and remove", () => {
+    expect(runCommand("/mcp add x")).toEqual({ type: "mcp-add", args: "x" });
+    expect(runCommand('/mcp add weather --env KEY --header "A: Bearer ${T}"')).toEqual({ type: "mcp-add", args: 'weather --env KEY --header "A: Bearer ${T}"' });
+    expect(runCommand("/mcp search a b")).toEqual({ type: "mcp-search", words: "a b" });
+    expect(runCommand("/mcp remove x")).toEqual({ type: "mcp-remove", name: "x" });
+    for (const bad of ["/mcp add", "/mcp search", "/mcp remove", "/mcp remove a b", "/mcp trust x"]) {
+      const action = runCommand(bad);
+      expect(action).toMatchObject({ type: "print", isError: true });
+      expect((action as { text: string }).text).toContain("/mcp add <npm package");
+      expect((action as { text: string }).text).toContain("/mcp search <words>");
+      expect((action as { text: string }).text).toContain("/mcp remove <name>");
+    }
+    expect(runCommand("/mcp")).toMatchObject({ text: expect.stringContaining("/mcp add") });
+    const removed = run("/mcp", {
+      ...ctx,
+      mcp: { servers: [{ name: "gone", source: "personal", target: "npx -y x@1.0.0", reads: [], runsProjectFiles: [], state: "removed", tools: ["mcp__gone__a"] }], problems: [] },
+    });
+    expect(removed).toMatchObject({ text: expect.stringContaining("- **gone** (yours): removed") });
+  });
+
+  test("/mcp login and logout (#18): an action for a server that can log in, a usage error naming them otherwise", () => {
+    const base = { source: "personal" as const, reads: [], runsProjectFiles: [] };
+    const withServers = {
+      ...ctx,
+      mcp: {
+        servers: [
+          { ...base, name: "github", target: "https://api.example.com/mcp", state: "connected" as const, tools: ["mcp__github__search"], login: { loggedIn: true, host: "github.com" } },
+          { ...base, name: "linear", target: "https://mcp.linear.test/mcp", state: "needs-login" as const, tools: [], login: { loggedIn: false } },
+          { ...base, name: "files", target: "npx -y files", state: "connected" as const, tools: [] },
+        ],
+        problems: [],
+      },
+    };
+    expect(run("/mcp login linear", withServers)).toEqual({ type: "mcp-login", server: "linear" });
+    expect(run("/mcp logout github", withServers)).toEqual({ type: "mcp-logout", server: "github" });
+    for (const bad of ["/mcp login", "/mcp login files", "/mcp login nope", "/mcp logout", "/mcp login a b"]) {
+      const action = run(bad, withServers);
+      expect(action).toMatchObject({ type: "print", isError: true });
+      expect((action as { text: string }).text).toContain("`github`, `linear`");
+    }
+    // No server can log in: say what can.
+    expect(run("/mcp login x", ctx)).toMatchObject({ type: "print", isError: true, text: expect.stringContaining("remote (http)") });
+    expect(runCommand("/mcp nope")).toMatchObject({ text: expect.stringContaining("/mcp login <name>") });
+
+    const listed = run("/mcp", withServers);
+    if (listed.type !== "print") throw new Error("expected print");
+    expect(listed.text).toContain("- **github** (yours): connected · 1 tool: `search` · logged in at github.com (renewed automatically)");
+    expect(listed.text).toContain("- **linear** (yours): needs login: `/mcp login linear`");
+    expect(listed.text).not.toContain("**files** (yours): connected · 0 tools · logged");
+  });
+
   test("/skills lists skills, or explains how to add one", () => {
     const review = { name: "review", description: "Review code.", body: "b", dir: "/x", files: [], source: "project" as const };
     const listed = run("/skills", { ...ctx, skills: [review], skillProblems: ["bad/SKILL.md needs a description"] });
@@ -227,4 +278,10 @@ describe("slash commands", () => {
     expect(text).toContain("tools: read_file, grep · model: small");
     expect(text).toContain("bad.md needs a description");
   });
+});
+
+test("/mcp with a name an object inherits (__proto__, constructor) is a usage error, not a crash", () => {
+  for (const sub of ["__proto__", "constructor", "toString", "hasOwnProperty"]) {
+    expect(runCommand(`/mcp ${sub}`)).toMatchObject({ type: "print", isError: true });
+  }
 });

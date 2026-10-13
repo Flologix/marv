@@ -444,6 +444,8 @@ export class MarvSession implements Session {
     this.last = undefined;
     this.listing = null; // a new conversation decides its MCP mode again
     this.loaded.clear();
+    // Servers removed with /mcp remove kept their tools listed for the old conversation's sake; not for a new one.
+    this.init.mcp?.forgetRemoved?.();
     const memory = this.init.memory;
     const reload = (async () => {
       if (memory) this.memories = await loadMemory(memory.paths).catch(() => this.memories);
@@ -609,7 +611,9 @@ export class MarvSession implements Session {
       skills: this.init.skills,
       memory: this.memories,
       agents: this.init.agents ?? DEFAULT_AGENTS,
-      mcp: Boolean(this.init.mcp?.status().length),
+      // Whenever there's a manager, even an empty one: a server added mid-conversation (/mcp add) is then covered
+      // without changing the system prompt (the prompt cache).
+      mcp: Boolean(this.init.mcp),
     });
     return custom ? `${base}\n\n${custom.append}` : base;
   }

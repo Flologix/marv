@@ -33,6 +33,16 @@ export type CommandAction =
   | { type: "steps"; every?: number }
   /** Trust and start the project's MCP servers. */
   | { type: "mcp-trust" }
+  /** Work out a server's entry from a package, URL, GitHub repo or registry name, ask, write it and start it. */
+  | { type: "mcp-add"; args: string }
+  /** Look for servers in the MCP Registry. */
+  | { type: "mcp-search"; words: string }
+  /** Take one of your servers out of ~/.marv/mcp.json and stop it. */
+  | { type: "mcp-remove"; name: string }
+  /** Log in to a remote MCP server (OAuth): opens the browser, waits for it outside any turn. */
+  | { type: "mcp-login"; server: string }
+  /** Forget (and revoke where possible) a remote MCP server's login. */
+  | { type: "mcp-logout"; server: string }
   /** Rate or tag the last turn: 1 good, -1 bad, 0 labels only. */
   | { type: "feedback"; score: 1 | -1 | 0; note?: string; labels?: string[] }
   | { type: "resume" }
@@ -172,12 +182,16 @@ export const commands: Command[] = [
   },
   {
     name: "mcp",
-    description: "Show MCP servers and their tools (/mcp trust starts the project's)",
+    description: "Show MCP servers and their tools (/mcp add <package | URL | repo>, search, remove, trust, login, logout)",
     run: (args, { mcp }) => {
-      const arg = args.trim().toLowerCase();
-      if (arg === "trust") return { type: "mcp-trust" };
-      if (arg) return { type: "print", text: "Usage: /mcp, or /mcp trust", isError: true };
-      return { type: "print", text: mcpText(mcp), markdown: true };
+      const trimmed = args.trim();
+      if (!trimmed) return { type: "print", text: mcpText(mcp), markdown: true };
+      const [sub = "", ...words] = trimmed.split(/\s+/);
+      const rest = trimmed.slice(sub.length).trim();
+      // Own keys only: "__proto__" or "constructor" would otherwise find Object.prototype's.
+      const key = sub.toLowerCase();
+      const run = Object.hasOwn(MCP_SUBCOMMANDS, key) ? MCP_SUBCOMMANDS[key] : undefined;
+      return (run && run(rest, words, mcp)) ?? { type: "print", text: MCP_USAGE, isError: true };
     },
   },
   {
@@ -376,7 +390,36 @@ function sandboxStatus(config: Config, hiddenPathFolders: string[] = []): string
   return `on: bash runs in bubblewrap (project writable, home hidden, no network unless asked).${hidden}`;
 }
 
-const MCP_HELP = `No MCP servers yet. Add them to \`.mcp.json\` in the project, or \`~/.marv/mcp.json\` for every project (the same format as Claude Code's), then restart Marv:
+const MCP_USAGE = `Usage: /mcp (list servers), /mcp add <npm package | pypi:<package> | https URL | GitHub repo | registry name> [--name <name>] [--env VAR] [--header "Name: Bearer \${VAR}"] [-- <server args>], /mcp search <words>, /mcp remove <name>, /mcp trust, /mcp login <name>, /mcp logout <name>`;
+
+/** /mcp's subcommands: each gets the text after its name (and its words), and returns undefined for a usage error. */
+const MCP_SUBCOMMANDS: Record<string, (rest: string, words: string[], mcp: CommandContext["mcp"]) => CommandAction | undefined> = {
+  trust: (rest) => (rest ? undefined : { type: "mcp-trust" }),
+  add: (rest) => (rest ? { type: "mcp-add", args: rest } : undefined),
+  search: (rest) => (rest ? { type: "mcp-search", words: rest } : undefined),
+  remove: (_, words) => (words.length === 1 ? { type: "mcp-remove", name: words[0]! } : undefined),
+  login: (_, words, mcp) => loginAction("mcp-login", words, mcp),
+  logout: (_, words, mcp) => loginAction("mcp-logout", words, mcp),
+};
+
+/** /mcp login|logout <server>: only a remote server that can log in (its status has `login`); otherwise say which can. */
+function loginAction(type: "mcp-login" | "mcp-logout", words: string[], mcp: CommandContext["mcp"]): CommandAction {
+  const can = (mcp?.servers ?? []).filter((s) => s.login).map((s) => s.name);
+  if (words.length === 1 && can.includes(words[0]!)) return { type, server: words[0]! };
+  const verb = type === "mcp-login" ? "login" : "logout";
+  const text = can.length
+    ? `Usage: /mcp ${verb} <name>, one of ${can.map((n) => `\`${n}\``).join(", ")}`
+    : `Usage: /mcp ${verb} <name>. No server here can log in: logins are for remote (http) servers without an Authorization header of their own.`;
+  return { type: "print", text, isError: true };
+}
+
+/** " · logged in at github.com": a remote server's login, never the token. */
+function loginText(s: McpServerStatus): string {
+  if (!s.login?.loggedIn) return "";
+  return ` · logged in${s.login.host ? ` at ${s.login.host}` : ""} (renewed automatically)`;
+}
+
+const MCP_HELP = `No MCP servers yet. Add one with \`/mcp add <npm package | URL | GitHub repo>\` (find one with \`/mcp search <words>\`), or by hand in \`.mcp.json\` in the project, or \`~/.marv/mcp.json\` for every project (the same format as Claude Code's), then restart Marv:
 
 \`\`\`json
 { "mcpServers": {
@@ -393,7 +436,7 @@ function mcpText(mcp: CommandContext["mcp"]): string {
       case "connected": {
         const tools = s.tools.map((t) => `\`${t.replace(`mcp__${s.name}__`, "")}\``).join(", ");
         const skipped = s.skipped?.length ? `; not offered (another server's tool has the name): ${s.skipped.map((t) => `\`${t}\``).join(", ")}` : "";
-        return `${who}connected · ${s.tools.length} tool${s.tools.length === 1 ? "" : "s"}${tools ? `: ${tools}` : ""}${skipped}`;
+        return `${who}connected · ${s.tools.length} tool${s.tools.length === 1 ? "" : "s"}${tools ? `: ${tools}` : ""}${loginText(s)}${skipped}`;
       }
       case "untrusted": {
         const reads = s.reads.length ? `; reads ${s.reads.map((v) => `\`$${v}\``).join(", ")} from your environment` : "";
@@ -402,6 +445,10 @@ function mcpText(mcp: CommandContext["mcp"]): string {
       }
       case "connecting":
         return `${who}starting…`;
+      case "needs-login":
+        return `${who}needs login: \`/mcp login ${s.name}\``;
+      case "removed":
+        return `${who}removed (its tools stay listed, failing, until \`/clear\` or a restart)`;
       case "failed":
         return `${who}failed: ${s.error ?? "unknown error"}${s.stderr ? `\n\n  \`\`\`\n  ${s.stderr.split("\n").slice(-5).join("\n  ")}\n  \`\`\`` : ""}`;
     }
