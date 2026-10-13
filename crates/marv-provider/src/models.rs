@@ -95,7 +95,23 @@ pub fn per_million(per_token: Option<&str>) -> Option<f64> {
 
 /// Reads a provider's model list. Errors are plain messages (`"<url> returned 503"`); the picker
 /// shows them.
-pub async fn list_models(_provider: ProviderKind, _base_url: &str, _client: &reqwest::Client) -> Result<Vec<ModelInfo>, String> {
+///
+/// The crate owns the HTTP client (one, shared), so callers without reqwest (marv-session's
+/// `ConfigFactory::load`, the TUI) can list models. `api_key` is sent as `Authorization: Bearer`
+/// when given; Marv's lists need none (OpenRouter's is public, Ollama's local), so its callers pass
+/// `None`.
+pub async fn list_models(provider: ProviderKind, base_url: &str, api_key: Option<&str>) -> Result<Vec<ModelInfo>, String> {
+    static CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(reqwest::Client::new);
+    list_models_with(&CLIENT, provider, base_url, api_key).await
+}
+
+/// [`list_models`] through a given client (tests point it at a local server).
+pub async fn list_models_with(
+    _client: &reqwest::Client,
+    _provider: ProviderKind,
+    _base_url: &str,
+    _api_key: Option<&str>,
+) -> Result<Vec<ModelInfo>, String> {
     todo!("port: listModels (OpenRouter /models via from_openrouter; Ollama /api/tags + /api/show capabilities)")
 }
 
