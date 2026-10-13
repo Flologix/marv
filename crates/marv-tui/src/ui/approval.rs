@@ -11,9 +11,9 @@
 //! open (`escape_cancels: false`): Esc then only closes the view. Every string from the request
 //! goes through `printable()`: a Trojan-Source command must not look like something else.
 //!
-//! The command and text wrap (the full payload is shown); diff lines are cut, not wrapped, as in
-//! `DiffView`. Each queued request gets a fresh `ApprovalView` (Marv keyed it by id), so the cursor
-//! starts on Yes for every one.
+//! The command and text wrap (the full payload is shown); the diff is drawn by `diff_view` (lines
+//! cut, not wrapped, numbered as in the transcript). Each queued request gets a fresh `ApprovalView`
+//! (Marv keyed it by id), so the cursor starts on Yes for every one.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use marv_core::printable;
@@ -23,10 +23,10 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Padding, Widget};
 
-use super::diff_view::mark;
-use super::select::{Select, SelectItem, truncate_end, wrap_all};
+use super::diff_view::{self, DiffOptions};
+use super::select::{Select, SelectItem, wrap_all};
 use super::theme;
-use crate::view::{ApprovalRequest, Decision, DiffKind, DiffLine};
+use crate::view::{ApprovalRequest, Decision};
 
 pub const MAX_DIFF_LINES: usize = 24;
 
@@ -44,46 +44,6 @@ pub struct ApprovalView {
     pub waiting: usize,
     pub escape_cancels: bool,
     pub select: Select<Decision>,
-}
-
-/// The preview's diff, at most `max` lines, the rest counted: numbered lines right-aligned in a
-/// column wide enough for *all* of them (a loop over the lines, not a max over a spread: a new
-/// file's preview holds all its lines), `+ `/`- ` marks, text cut rather than wrapped.
-///
-/// TODO(#9): a stand-in until `diff_view::render` is ported; then call
-/// `diff_view::render(lines, width, DiffOptions { max: Some(MAX_DIFF_LINES), ..Default::default() })`.
-fn diff_lines(lines: &[DiffLine], max: usize, width: u16) -> Vec<Line<'static>> {
-    let mut widest = 0;
-    for line in lines {
-        if let Some(n) = line.old_line.max(line.new_line) {
-            widest = widest.max(n);
-        }
-    }
-    let number_width = if widest > 0 { widest.to_string().len() } else { 0 };
-    let mut out: Vec<Line<'static>> = lines
-        .iter()
-        .take(max)
-        .map(|line| {
-            let style = match line.kind {
-                DiffKind::Add => Style::new().fg(theme::DIFF_ADD),
-                DiffKind::Del => Style::new().fg(theme::DIFF_DEL),
-                DiffKind::Ctx | DiffKind::Gap => Style::new(),
-            };
-            let mut spans = Vec::new();
-            if number_width > 0 {
-                let n = if line.kind == DiffKind::Del { line.old_line } else { line.new_line };
-                let n = n.map_or_else(String::new, |n| n.to_string());
-                spans.push(Span::styled(format!("{n:>number_width$} "), Style::new().fg(theme::DIM)));
-            }
-            let text = if line.kind == DiffKind::Gap { "…".to_string() } else { printable(&line.text).replace('\t', "  ") };
-            spans.push(Span::styled(format!("{}{text}", mark(line.kind)), style));
-            truncate_end(Line::from(spans), width)
-        })
-        .collect();
-    if lines.len() > max {
-        out.push(Line::styled(format!("… {} more lines", lines.len() - max), Style::new().fg(theme::DIM)));
-    }
-    out
 }
 
 impl ApprovalView {
@@ -134,7 +94,7 @@ impl ApprovalView {
                 lines.extend(printable(text).split('\n').map(|row| Line::raw(row.to_string())));
             }
             if !diff.is_empty() {
-                lines.extend(diff_lines(diff, MAX_DIFF_LINES, width));
+                lines.extend(diff_view::render(diff, width, DiffOptions { max: Some(MAX_DIFF_LINES), ..Default::default() }));
             }
         }
         if let Some(note) = &preview.note {
@@ -179,7 +139,7 @@ impl ApprovalView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::view::{Preview, Scope};
+    use crate::view::{DiffKind, DiffLine, Preview, Scope};
     use crossterm::event::KeyModifiers;
 
     fn edit() -> ApprovalRequest {

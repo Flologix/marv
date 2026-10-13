@@ -60,11 +60,13 @@
 //! the transcript and the turn's live state, the approval queue, the pickers and setup, the status
 //! bar, keys, mouse and selection.
 //!
-//! # Stand-ins until #9
-//! The rendering modules (`markdown`, `message_view`, `diff_view`, `notice_view`, `thinking_view`,
-//! `scroll_view`'s scrolling, `transcript`, `agent_view`) are ported by #9. Until then the
-//! private [`standin`] module draws entries as plain wrapped text, and the scroll/glide/culling
-//! arithmetic lives here. Each stand-in says which call replaces it.
+//! # Rendering
+//! The transcript ([`Transcript`]) caches each entry's lines (`message_view`, which draws Markdown,
+//! diffs and notices) and the scroll views ([`ScrollView`]) cull it to the viewport and glide. The
+//! live end is drawn each frame: the streaming reply through `message_view` with its
+//! [`StreamLexer`] (finished blocks are laid out once; only the unfinished end is parsed and wrapped
+//! again), then the waiting line (`ThinkingView`) or a tool call being written (`DraftView`). A
+//! subagent's view is an [`AgentView`] under its `AgentViewHeader`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
@@ -83,17 +85,20 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::mouse::{MouseEvent, WHEEL_ROWS};
 use crate::render_options::{FRAME_INTERVAL, TerminalGuard};
-use crate::selection::{SelectionEffect, SelectionStore, Viewport};
-use crate::ui::agent_view::AgentLog;
+use crate::selection::{SelectionEffect, SelectionStore};
+use crate::ui::agent_view::{self, AgentLog, AgentView, AgentViewHeader};
 use crate::ui::approval::{ApprovalOutcome, ApprovalView};
+use crate::ui::markdown::StreamLexer;
 use crate::ui::martian::MartianAnimation;
+use crate::ui::message_view;
 use crate::ui::prompt_input::{PromptInput, PromptOutcome};
-use crate::ui::scroll_view::{GLIDE_MS, ScrollView};
+use crate::ui::scroll_view::ScrollView;
 use crate::ui::session_picker::{PickerOutcome, SessionPicker};
 use crate::ui::setup::{Setup, SetupOutcome};
 use crate::ui::splash::Splash;
 use crate::ui::status_bar::{self, StatusBar};
-use crate::ui::thinking_view::SPINNER_MS;
+use crate::ui::thinking_view::{self, DraftView, ThinkingView};
+use crate::ui::transcript::{self, Transcript, TranscriptItem};
 use crate::view::{
     AgentProgress, ApprovalId, ApprovalRequest, CommandInfo, CompactOutcome, Decision, EmptyNext, Message, Role, SessionPort,
     SetupStart, StatusInfo, ToolState, ToolStatus, Totals, TurnEndReason, TurnStatus, UiEvent, WelcomeInfo,
@@ -190,24 +195,14 @@ struct Draft {
     args: String,
 }
 
-/// One transcript entry and its laid-out lines, cached per (width, show_steps) like Marv's `memo`.
-struct Entry {
-    item: Item,
-    cache: Option<(u16, bool, Vec<Line<'static>>)>,
+/// A transcript entry with this role and text (the App sets its id when it's added).
+fn message(role: Role, text: String) -> Message {
+    Message { id: 0, role, text, is_error: false, markdown: false, notice: None, tool: None }
 }
 
-enum Item {
-    Welcome,
-    Message(Box<Message>),
-}
-
-/// A subagent's log plus the bookkeeping Marv kept in a WeakMap beside it.
-/// TODO(#9): `AgentLog::new`/`AgentLog::apply` own this once agent_view is ported.
-struct SubLog {
-    log: AgentLog,
-    next_id: u64,
-    tools: HashMap<String, usize>,
-    thinking_since: Option<Instant>,
+/// One of Marv's own notes for the transcript (dim, or in the error colour).
+fn system_message(text: String, is_error: bool) -> Message {
+    Message { is_error, ..message(Role::System, text) }
 }
 
 /// What one turn keeps between its events (the locals of Marv's `send()`).
@@ -268,7 +263,7 @@ pub struct App {
     martian: MartianAnimation,
 
     // --- the transcript ---
-    entries: Vec<Entry>,
+    transcript: Transcript,
     next_id: u64,
     scroll: ScrollView,
     /// The subagent view's own scroll position (Marv keyed a second ScrollView by the view).
@@ -276,8 +271,10 @@ pub struct App {
     selection: SelectionStore,
     show_steps: bool,
     /// Each subagent's log, by its entry's message id. Only this session's runs: sessions don't save them.
-    agent_logs: HashMap<u64, SubLog>,
+    agent_logs: HashMap<u64, AgentLog>,
     viewing: Option<u64>,
+    /// The open subagent view's own state (its stream lexer, waiting line, laid-out entries).
+    agent_view: AgentView,
     /// Where each subagent entry was drawn (transcript rows), for hit-testing clicks.
     agent_rows: Vec<(u64, std::ops::Range<usize>)>,
 
@@ -296,10 +293,9 @@ pub struct App {
     busy_label: Option<String>,
     /// The waiting line's label and when it appeared (a new label restarts its clock).
     waiting: Option<(String, Instant)>,
-    /// The streaming reply's finished lines, laid out once: (width, bytes covered, lines). Only the
-    /// unfinished last line is wrapped again on each frame (the job `markdown::StreamLexer` does
-    /// for the real renderer, #9).
-    stream_cache: Option<(u16, String, Vec<Line<'static>>)>,
+    /// The streaming reply's lexer: its finished blocks are parsed and laid out once, so a frame
+    /// redoes only the unfinished end. It starts over by itself when a new reply replaces the text.
+    stream_lexer: StreamLexer,
 
     // --- status ---
     last_usage: Option<Usage>,
@@ -350,7 +346,7 @@ impl App {
             splash,
             commands,
             martian: MartianAnimation::new(now),
-            entries: vec![Entry { item: Item::Welcome, cache: None }],
+            transcript: Transcript::new(),
             next_id: 1,
             scroll: ScrollView::default(),
             view_scroll: ScrollView::default(),
@@ -358,6 +354,7 @@ impl App {
             show_steps: false,
             agent_logs: HashMap::new(),
             viewing: None,
+            agent_view: AgentView::default(),
             agent_rows: Vec::new(),
             turn: None,
             streaming: None,
@@ -370,7 +367,7 @@ impl App {
             compacting: false,
             busy_label: None,
             waiting: None,
-            stream_cache: None,
+            stream_lexer: StreamLexer::new(),
             last_usage: None,
             totals: Totals::default(),
             confirm_exit: None,
@@ -507,16 +504,14 @@ impl App {
         if self.welcome_visible && self.viewing.is_none() && self.martian.tick(now) {
             self.dirty = true;
         }
-        let scroll = if self.viewing.is_some() { &mut self.view_scroll } else { &mut self.scroll };
-        if glide_step(scroll, now) {
+        if self.active_scroll().tick(now) {
             self.dirty = true;
         }
         if let SelectionEffect::ScrollBy(rows) = self.selection.tick(now) {
             self.scroll_active(rows);
         }
-        if self.spinner_visible
-            && self.waiting.as_ref().is_some_and(|(_, since)| now >= next_spinner(*since, now - FRAME_INTERVAL))
-        {
+        // A spinner frame came due since the last frame was drawn.
+        if self.spinner_since().is_some_and(|since| now >= thinking_view::next_frame(since, now - FRAME_INTERVAL)) {
             self.dirty = true;
         }
         if self.confirm_exit.is_some_and(|until| now >= until) {
@@ -543,14 +538,24 @@ impl App {
         d.add(self.flush_at);
         d.add(if self.viewing.is_some() { self.view_scroll.deadline() } else { self.scroll.deadline() });
         d.add(self.selection.deadline());
-        if self.spinner_visible
-            && let Some((_, since)) = &self.waiting
-        {
-            d.add(Some(next_spinner(*since, Instant::now())));
-        }
+        d.add(self.spinner_since().map(|since| thinking_view::next_frame(since, Instant::now())));
         d.add(self.confirm_exit);
         d.add(self.flash.as_ref().map(|(_, until)| *until));
         d.next()
+    }
+
+    /// The clock of the waiting line on screen (the main one, or the open subagent view's), if one is.
+    fn spinner_since(&self) -> Option<Instant> {
+        if self.viewing.is_some() {
+            self.agent_view.waiting_since()
+        } else {
+            self.waiting.as_ref().filter(|_| self.spinner_visible).map(|(_, since)| *since)
+        }
+    }
+
+    /// The scroll view on screen: the subagent's view, or the transcript.
+    fn active_scroll(&mut self) -> &mut ScrollView {
+        if self.viewing.is_some() { &mut self.view_scroll } else { &mut self.scroll }
     }
 
     fn finish_splash(&mut self, now: Instant) {
@@ -568,26 +573,22 @@ impl App {
         let id = self.next_id;
         self.next_id += 1;
         message.id = id;
-        self.entries.push(Entry { item: Item::Message(Box::new(message)), cache: None });
+        self.transcript.push(message);
         self.dirty = true;
         id
     }
 
     fn system(&mut self, text: impl Into<String>) {
-        self.add_message(standin::system(text.into(), false));
+        self.add_message(system_message(text.into(), false));
     }
 
     fn system_error(&mut self, text: impl Into<String>) {
-        self.add_message(standin::system(text.into(), true));
+        self.add_message(system_message(text.into(), true));
     }
 
     fn update_tool(&mut self, id: u64, tool: ToolStatus) {
-        // Usually the last few entries: search from the end.
-        if let Some(entry) = self.entries.iter_mut().rev().find(|e| matches!(&e.item, Item::Message(m) if m.id == id)) {
-            if let Item::Message(m) = &mut entry.item {
-                m.tool = Some(tool);
-            }
-            entry.cache = None;
+        if let Some(m) = self.transcript.message_mut(id) {
+            m.tool = Some(tool);
             self.dirty = true;
         }
     }
@@ -597,7 +598,7 @@ impl App {
         self.agent_logs.clear();
         self.viewing = None;
         self.last_usage = None;
-        self.entries = vec![Entry { item: Item::Welcome, cache: None }];
+        self.transcript.clear();
         self.scroll.follow();
         self.dirty = true;
     }
@@ -607,6 +608,9 @@ impl App {
         self.selection.reset();
         self.viewing = id;
         self.view_scroll = ScrollView::default();
+        self.agent_view = AgentView::default();
+        // The transcript keeps its place while hidden; a glide on its way stops.
+        self.scroll.set_hidden(id.is_some());
         self.dirty = true;
     }
 
@@ -667,9 +671,7 @@ impl App {
                 self.next_id = self.next_id.max(highest + 1);
                 self.totals = resumed.totals;
                 self.last_usage = None;
-                self.entries = std::iter::once(Entry { item: Item::Welcome, cache: None })
-                    .chain(resumed.transcript.into_iter().map(|m| Entry { item: Item::Message(Box::new(m)), cache: None }))
-                    .collect();
+                self.transcript.replace(resumed.transcript);
                 let switched = if resumed.model != self.status.model {
                     format!(" (it used {}; continuing with {})", resumed.model, self.status.model)
                 } else {
@@ -741,7 +743,7 @@ impl App {
                 if let Some(&key) = t.logs.get(&call_id)
                     && let Some(log) = self.agent_logs.get_mut(&key)
                 {
-                    standin::apply_to_log(log, &event, now);
+                    log.apply(&event, now);
                     // Only the open view costs a draw; the others just keep their log.
                     if self.viewing == Some(key) {
                         t.log_changed = true;
@@ -796,7 +798,7 @@ impl App {
                 self.flush(); // a step ended: show everything before moving on
                 self.note_thought(now);
                 t = self.turn.take().expect("put back above");
-                self.add_message(standin::message(Role::Assistant, text));
+                self.add_message(message(Role::Assistant, text));
                 t.reply.clear();
                 self.streaming = Some(String::new());
             }
@@ -816,15 +818,13 @@ impl App {
                 t.progress.remove(&call_id);
                 t.ended.remove(&call_id);
                 t.logs.remove(&call_id);
-                let mut message = standin::message(Role::Tool, name);
-                message.tool = Some(ToolStatus { label: label.clone(), status: ToolState::Running, summary: None, steps: None, diff: None });
-                let line = self.add_message(message);
+                let status = ToolStatus { label: label.clone(), status: ToolState::Running, summary: None, steps: None, diff: None };
+                let line = self.add_message(Message { tool: Some(status), ..message(Role::Tool, name) });
                 t.tool_lines.insert(call_id.clone(), (line, label.clone()));
                 if agent {
-                    // TODO(#9): AgentLog::new(title, prompt) once agent_view is ported. `ToolStart` carries no
-                    // arguments, so the task (Marv's first user message) needs the engine to send it.
-                    let log = AgentLog { title: label, running: true, ..AgentLog::default() };
-                    self.agent_logs.insert(line, SubLog { log, next_id: 1, tools: HashMap::new(), thinking_since: None });
+                    // `ToolStart` carries no arguments, so the task (Marv's first user message) needs the engine to send
+                    // it (docs/subsystems/tui.md, gaps); until then the log starts without it.
+                    self.agent_logs.insert(line, AgentLog::new(label, String::new()));
                     t.logs.insert(call_id, line);
                 }
             }
@@ -841,7 +841,7 @@ impl App {
                     && let Some(log) = self.agent_logs.get_mut(&key)
                 {
                     // It may have ended before its loop started (a failed check): either way it's over now.
-                    log.log.running = false;
+                    log.running = false;
                     self.dirty = true;
                 }
                 self.tools_running = self.tools_running.saturating_sub(1);
@@ -935,7 +935,7 @@ impl App {
         }
         for key in t.logs.values() {
             if let Some(log) = self.agent_logs.get_mut(key) {
-                log.log.running = false;
+                log.running = false;
             }
         }
         // note_thought needs the turn's reasoning.
@@ -1196,23 +1196,24 @@ impl App {
         if text.starts_with('/') {
             self.port.run_command(text);
         } else {
-            self.add_message(standin::message(Role::User, text.clone()));
+            self.add_message(message(Role::User, text.clone()));
             self.start_turn(now);
             self.port.send(text);
         }
     }
 
     fn page(&mut self, direction: i32) {
-        let scroll = if self.viewing.is_some() { &mut self.view_scroll } else { &mut self.scroll };
-        // A page keeps one row of overlap.
-        let rows = (scroll.viewport_height as i32 - 1).max(1);
-        scroll_by(scroll, direction * rows);
+        let scroll = self.active_scroll();
+        if direction < 0 {
+            scroll.page_up()
+        } else {
+            scroll.page_down()
+        }
         self.dirty = true;
     }
 
     fn scroll_active(&mut self, rows: i32) {
-        let scroll = if self.viewing.is_some() { &mut self.view_scroll } else { &mut self.scroll };
-        scroll_by(scroll, rows);
+        self.active_scroll().scroll_by(rows);
         self.dirty = true;
     }
 
@@ -1228,8 +1229,7 @@ impl App {
         let effect = match event {
             MouseEvent::Scroll { step } => {
                 // The highlight is attached to the text, so it scrolls along.
-                let scroll = if self.viewing.is_some() { &mut self.view_scroll } else { &mut self.scroll };
-                glide_by(scroll, step as i32 * WHEEL_ROWS, now);
+                self.active_scroll().glide_by(step as i32 * WHEEL_ROWS, now);
                 self.dirty = true;
                 SelectionEffect::None
             }
@@ -1240,7 +1240,7 @@ impl App {
                 effect => {
                     // A click: on a subagent's entry, open its view.
                     let row = if self.viewing.is_some() { None } else { self.selection.row_at(x, y) };
-                    let id = row.and_then(|row| self.agent_rows.iter().find(|(_, rows)| rows.contains(&row)).map(|(id, _)| *id));
+                    let id = row.and_then(|row| transcript::agent_entry_at(row, &self.agent_rows));
                     if let Some(id) = id {
                         if self.agent_logs.contains_key(&id) {
                             self.open_view(Some(id));
@@ -1323,18 +1323,19 @@ impl App {
         } else {
             self.prompt.height(width, busy, &self.commands) + status_height
         };
-        let header = u16::from(self.viewing.is_some());
+        let header = if self.viewing.is_some() { agent_view::HEADER_HEIGHT } else { 0 };
         let panel_height = panel_height.min(area.height.saturating_sub(header + 1));
-        let transcript = Rect { height: area.height - panel_height - header, ..area };
-        let panel = Rect { y: transcript.bottom() + header, height: panel_height, ..area };
+        // A subagent's view has its header pinned above it.
+        let transcript = Rect { y: area.y + header, height: area.height - panel_height - header, ..area };
+        let panel = Rect { y: transcript.bottom(), height: panel_height, ..area };
 
         self.spinner_visible = false;
         if let Some(id) = self.viewing.filter(|id| self.agent_logs.contains_key(id)) {
-            let log = &self.agent_logs[&id].log;
-            buf.set_line(area.x, transcript.bottom(), &standin::agent_header(log, width), width);
-            let lines = standin::log_lines(log, width, self.show_steps);
+            let log = &self.agent_logs[&id];
+            AgentViewHeader { log }.render(Rect { height: 1.min(header), ..area }, buf);
+            let lines = self.agent_view.render(log, width, self.show_steps, now);
             self.welcome_visible = false;
-            let vp = draw_lines(&mut self.view_scroll, transcript, buf, &lines);
+            let vp = self.view_scroll.draw(transcript, buf, &lines);
             self.selection.set_viewport(vp);
         } else {
             self.draw_transcript(transcript, buf, now);
@@ -1371,73 +1372,37 @@ impl App {
     /// (from their cache) and drawn.
     fn draw_transcript(&mut self, area: Rect, buf: &mut Buffer, now: Instant) {
         let width = area.width;
-        let show_steps = self.show_steps;
         // Heights first (fills the caches: an unchanged entry is laid out once per width).
-        let mut heights = Vec::with_capacity(self.entries.len());
-        for entry in &mut self.entries {
-            let height = match &entry.item {
-                Item::Welcome => crate::ui::welcome::HEIGHT as usize + 1,
-                Item::Message(message) => {
-                    let fresh = matches!(&entry.cache, Some((w, s, _)) if *w == width && *s == show_steps);
-                    if !fresh {
-                        entry.cache = Some((width, show_steps, standin::message_lines(message, width, show_steps)));
-                    }
-                    entry.cache.as_ref().map_or(0, |(_, _, lines)| lines.len())
-                }
-            };
-            heights.push(height);
-        }
+        let mut heights = self.transcript.heights(width, self.show_steps);
+        let entries = heights.len();
         let tail = self.live_lines(width, now);
-        let content: usize = heights.iter().sum::<usize>() + tail.len();
-        self.scroll.content_height = content;
-        self.scroll.viewport_height = area.height;
+        heights.push(tail.len());
+        let shown = self.scroll.visible(&heights, area.height);
         let top = self.scroll.scroll_top();
-        let bottom = top + area.height as usize;
+        self.agent_rows = self.transcript.agent_entries(&heights[..entries]);
 
         self.welcome_visible = false;
-        self.agent_rows.clear();
-        let mut row = 0;
-        for (entry, &height) in self.entries.iter().zip(&heights) {
-            let rows = row..row + height;
-            if let Item::Message(m) = &entry.item
-                && m.role == Role::Tool
-                && m.text == "agent"
-            {
-                self.agent_rows.push((m.id, rows.clone()));
-            }
-            if rows.end > top && rows.start < bottom {
-                let welcome;
-                let lines: &[Line] = match &entry.item {
-                    Item::Welcome => {
-                        self.welcome_visible = true;
-                        welcome = standin::welcome_lines(&self.welcome, self.martian.frame(), width);
-                        &welcome
-                    }
-                    Item::Message(_) => entry.cache.as_ref().map_or(&[], |(_, _, lines)| lines.as_slice()),
-                };
-                for (i, line) in lines.iter().enumerate() {
-                    let at = row + i;
-                    if at >= top && at < bottom {
-                        buf.set_line(area.x, area.y + (at - top) as u16, line, width);
-                    }
+        let mut row: usize = heights[..shown.start].iter().sum();
+        for i in shown {
+            let welcome;
+            let lines: &[Line] = if i == entries {
+                self.spinner_visible = self.waiting.is_some();
+                &tail
+            } else if self.transcript.items[i] == TranscriptItem::Welcome {
+                self.welcome_visible = true;
+                welcome = transcript::welcome_lines(&self.welcome, self.martian.frame(), width);
+                &welcome
+            } else {
+                self.transcript.lines(i)
+            };
+            for (j, line) in lines.iter().enumerate() {
+                if let Some(y) = (row + j).checked_sub(top).filter(|y| *y < area.height as usize) {
+                    buf.set_line(area.x, area.y + y as u16, line, width);
                 }
             }
-            row += height;
+            row += heights[i];
         }
-        for (i, line) in tail.iter().enumerate() {
-            let at = row + i;
-            if at >= top && at < bottom {
-                buf.set_line(area.x, area.y + (at - top) as u16, line, width);
-                self.spinner_visible |= self.waiting.is_some();
-            }
-        }
-        self.selection.set_viewport(Viewport {
-            top: area.y,
-            height: area.height,
-            scroll_top: top,
-            content_height: content,
-            width,
-        });
+        self.selection.set_viewport(self.scroll.viewport(area.y, width));
     }
 
     /// The live end of the transcript: the reply streaming in, the waiting line, a tool call being written.
@@ -1446,35 +1411,19 @@ impl App {
         let Some(streaming) = &self.streaming else {
             self.waiting = self.busy_label.as_ref().map(|label| self.waiting_since(label.clone(), now));
             if let Some((label, since)) = &self.waiting {
-                lines.extend(standin::waiting_lines(label, "", None, false, *since, now, width));
+                lines.extend(ThinkingView { since: *since, label: label.clone(), code: false }.render("", None, now, width));
             }
             return lines;
         };
         if !streaming.is_empty() {
-            // Up to the last newline the reply only grows: lay that out once, then just the rest.
-            let cut = streaming.rfind('\n').map_or(0, |i| i + 1);
-            // A new step's reply (or a retry) can replace the text between two draws: check it's the same text.
-            let (done, mut finished) = match self.stream_cache.take() {
-                Some((w, prefix, lines)) if w == width && prefix.len() <= cut && streaming.starts_with(&prefix) => {
-                    (prefix.len(), lines)
-                }
-                _ => (0, Vec::new()),
-            };
-            if done < cut {
-                let first = finished.is_empty();
-                finished.extend(standin::reply_rows(&streaming[done..cut - 1], width, first));
-            }
-            lines.extend(finished.iter().cloned());
-            lines.extend(standin::reply_rows(&streaming[cut..], width, finished.is_empty()));
-            lines.push(Line::default());
-            self.stream_cache = Some((width, streaming[..cut].to_string(), finished));
-        } else {
-            self.stream_cache = None;
+            // The lexer keeps the finished blocks' lines: only the unfinished end is parsed and wrapped again.
+            let reply = message(Role::Assistant, streaming.clone());
+            lines.extend(message_view::render(&reply, width, false, Some(&mut self.stream_lexer)));
         }
         let label = if self.tools_running > 0 {
             None
         } else if let Some(draft) = &self.draft {
-            Some(standin::draft_label(&draft.name, &draft.args))
+            Some(thinking_view::draft_label(&draft.name, &draft.args))
         } else if streaming.is_empty() {
             Some(if self.compacting {
                 "Compacting the conversation…".to_string()
@@ -1486,12 +1435,10 @@ impl App {
         };
         self.waiting = label.map(|label| self.waiting_since(label, now));
         if let Some((label, since)) = &self.waiting {
+            let view = ThinkingView { since: *since, label: label.clone(), code: false };
             match &self.draft {
-                Some(draft) => {
-                    let preview = standin::draft_preview(&draft.name, &draft.args);
-                    lines.extend(standin::waiting_lines(label, &preview, Some(&draft.args), true, *since, now, width));
-                }
-                None => lines.extend(standin::waiting_lines(label, &self.thinking, None, false, *since, now, width)),
+                Some(draft) => lines.extend(DraftView::render(&view, &draft.name, &draft.args, now, width)),
+                None => lines.extend(view.render(&self.thinking, None, now, width)),
             }
         }
         lines
@@ -1528,500 +1475,11 @@ fn unix_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
 
-/// The next spinner frame after `now` for a waiting line shown since `since`.
-fn next_spinner(since: Instant, now: Instant) -> Instant {
-    let ms = SPINNER_MS.as_millis();
-    let elapsed = now.saturating_duration_since(since).as_millis();
-    since + Duration::from_millis(((elapsed / ms + 1) * ms) as u64)
-}
-
-// ----------------------------------------------------------------------------------------------
-// Scrolling. TODO(#9): ScrollView::scroll_by / glide_by / tick / visible own this once ported.
-// ----------------------------------------------------------------------------------------------
-
-/// Scrolls by `rows`; reaching the bottom resumes following.
-fn scroll_by(scroll: &mut ScrollView, rows: i32) {
-    let max = scroll.content_height.saturating_sub(scroll.viewport_height as usize);
-    let next = (scroll.scroll_top() as i64 + rows as i64).clamp(0, max as i64) as usize;
-    scroll.top = if next >= max { None } else { Some(next) };
-}
-
-/// A wheel notch: adds to the distance still to travel (reversing drops the rest); the first row
-/// moves at once.
-fn glide_by(scroll: &mut ScrollView, rows: i32, now: Instant) {
-    if scroll.glide_remaining.signum() == -rows.signum() {
-        scroll.glide_remaining = 0;
-    }
-    scroll.glide_remaining += rows;
-    scroll.glide_at = Some(now);
-    glide_step(scroll, now);
-}
-
-/// One glide step if due: a third of what's left (at least a row). True if it scrolled.
-fn glide_step(scroll: &mut ScrollView, now: Instant) -> bool {
-    match scroll.glide_at {
-        Some(at) if now >= at && scroll.glide_remaining != 0 => {
-            let left = scroll.glide_remaining;
-            let step = left.signum() * (left.abs() / 3).max(1);
-            scroll.glide_remaining -= step;
-            let before = scroll.scroll_top();
-            scroll_by(scroll, step);
-            scroll.glide_at = (scroll.glide_remaining != 0).then_some(now + GLIDE_MS);
-            if scroll.scroll_top() == before {
-                // At an end: nothing more to glide.
-                scroll.glide_remaining = 0;
-                scroll.glide_at = None;
-            }
-            true
-        }
-        Some(_) if scroll.glide_remaining == 0 => {
-            scroll.glide_at = None;
-            false
-        }
-        _ => false,
-    }
-}
-
-/// Draws already laid-out lines in a scroll view (the subagent view); returns its viewport.
-fn draw_lines(scroll: &mut ScrollView, area: Rect, buf: &mut Buffer, lines: &[Line<'static>]) -> Viewport {
-    scroll.content_height = lines.len();
-    scroll.viewport_height = area.height;
-    let top = scroll.scroll_top();
-    for (i, line) in lines.iter().skip(top).take(area.height as usize).enumerate() {
-        buf.set_line(area.x, area.y + i as u16, line, area.width);
-    }
-    Viewport { top: area.y, height: area.height, scroll_top: top, content_height: lines.len(), width: area.width }
-}
-
-/// Plain-text stand-ins for the renderers #9 ports. Each function names its replacement.
-mod standin {
-    use std::time::Instant;
-
-    use marv_core::printable;
-    use ratatui::buffer::Buffer;
-    use ratatui::layout::Rect;
-    use ratatui::style::{Modifier, Style};
-    use ratatui::text::{Line, Span};
-    use ratatui::widgets::Widget;
-
-    use super::{SubLog, is_step_end, round_secs};
-    use crate::ui::martian::FrameName;
-    use crate::ui::select::{truncate_end, wrap};
-    use crate::ui::status_bar::tokens;
-    use crate::ui::theme;
-    use crate::ui::thinking_view::{PREVIEW_LINES, SPINNER, SPINNER_MS, TAIL_CHARS, elapsed};
-    use crate::ui::welcome::{self, Welcome};
-    use crate::view::{DiffKind, Message, NoticeTone, Role, ToolState, ToolStatus, UiEvent, WelcomeInfo};
-    use marv_core::StopReason;
-
-    pub fn message(role: Role, text: String) -> Message {
-        Message { id: 0, role, text, is_error: false, markdown: false, notice: None, tool: None }
-    }
-
-    pub fn system(text: String, is_error: bool) -> Message {
-        Message { is_error, ..message(Role::System, text) }
-    }
-
-    /// `text` wrapped at `width - 2` beside a 2-column gutter (a hanging indent).
-    fn gutter(mark: &str, mark_style: Style, text: &str, style: Style, width: u16) -> Vec<Line<'static>> {
-        let mut out = Vec::new();
-        for (i, row) in printable(text)
-            .split('\n')
-            .flat_map(|l| wrap(&Line::styled(l.to_string(), style), width.saturating_sub(2)))
-            .enumerate()
-        {
-            let lead = if i == 0 { Span::styled(mark.to_string(), mark_style) } else { Span::raw("  ") };
-            out.push(Line::from([vec![lead], row.spans].concat()));
-        }
-        out
-    }
-
-    /// A streaming reply's rows: the `● ` gutter on the reply's first row, a hanging indent after.
-    /// TODO(#9): `message_view::render` with the reply's `StreamLexer`.
-    pub fn reply_rows(text: &str, width: u16, first: bool) -> Vec<Line<'static>> {
-        let mark = if first { "● " } else { "  " };
-        gutter(mark, Style::new().fg(theme::ASSISTANT), text, Style::new(), width)
-    }
-
-    fn plain(text: &str, style: Style, width: u16) -> Vec<Line<'static>> {
-        printable(text).split('\n').flat_map(|l| wrap(&Line::styled(l.to_string(), style), width)).collect()
-    }
-
-    /// One entry as lines, a blank line after. TODO(#9): `message_view::render(message, width, show_steps, None)`.
-    pub fn message_lines(m: &Message, width: u16, show_steps: bool) -> Vec<Line<'static>> {
-        let dim = Style::new().fg(theme::DIM);
-        let mut lines = match m.role {
-            Role::User => gutter("> ", Style::new().fg(theme::USER), &m.text, Style::new().fg(theme::USER), width),
-            Role::Assistant => gutter("● ", Style::new().fg(theme::ASSISTANT), &m.text, Style::new(), width),
-            Role::Tool => tool_lines(m, width, show_steps),
-            Role::System => match &m.notice {
-                Some(notice) => {
-                    let color = match notice.tone {
-                        NoticeTone::Info => theme::ACCENT,
-                        NoticeTone::Warning => theme::WARNING,
-                        NoticeTone::Error => theme::ERROR,
-                    };
-                    let mut lines = plain(&notice.title, Style::new().fg(color).add_modifier(Modifier::BOLD), width);
-                    for item in &notice.items {
-                        lines.extend(gutter("• ", Style::new().fg(color), &item.text, Style::new(), width));
-                        for detail in item.detail.iter().flatten() {
-                            lines.extend(gutter("  ", dim, detail, dim, width));
-                        }
-                    }
-                    lines
-                }
-                None if m.markdown => plain(&m.text, Style::new(), width),
-                None => plain(&m.text, Style::new().fg(if m.is_error { theme::ERROR } else { theme::DIM }), width),
-            },
-        };
-        lines.push(Line::default());
-        lines
-    }
-
-    /// `● name label`, `  ⎿ summary`, steps with ctrl+o, the diff collapsed to 15 lines.
-    fn tool_lines(m: &Message, width: u16, show_steps: bool) -> Vec<Line<'static>> {
-        let dim = Style::new().fg(theme::DIM);
-        let default = ToolStatus { label: String::new(), status: ToolState::Running, summary: None, steps: None, diff: None };
-        let tool = m.tool.as_ref().unwrap_or(&default);
-        let failed = tool.status == ToolState::Error;
-        let mut lines = vec![truncate_end(
-            Line::from(vec![
-                Span::styled("● ", Style::new().fg(if failed { theme::ERROR } else { theme::ACCENT })),
-                Span::styled(printable(&m.text), Style::new().add_modifier(Modifier::BOLD)),
-                Span::styled(format!(" {}", printable(&tool.label)), dim),
-            ]),
-            width,
-        )];
-        let summary = match (tool.status, &tool.summary) {
-            (ToolState::Running, None) => "running…".to_string(),
-            (_, summary) => summary.clone().unwrap_or_default(),
-        };
-        let color = match tool.status {
-            ToolState::Error => theme::ERROR,
-            ToolState::Declined => theme::WARNING,
-            _ => theme::DIM,
-        };
-        lines.push(truncate_end(Line::styled(format!("  ⎿ {}", printable(&summary)), Style::new().fg(color)), width));
-        if show_steps {
-            for step in tool.steps.iter().flatten() {
-                lines.push(truncate_end(Line::styled(format!("    · {}", printable(step)), dim), width));
-            }
-        }
-        if let Some(diff) = &tool.diff {
-            let max = if show_steps { usize::MAX } else { 15 };
-            for line in diff.lines.iter().take(max) {
-                let style = match line.kind {
-                    DiffKind::Add => Style::new().fg(theme::DIFF_ADD),
-                    DiffKind::Del => Style::new().fg(theme::DIFF_DEL),
-                    _ => Style::new(),
-                };
-                let text = if line.kind == DiffKind::Gap { "…".into() } else { printable(&line.text) };
-                lines.push(truncate_end(
-                    Line::styled(format!("    {}{text}", crate::ui::diff_view::mark(line.kind)), style),
-                    width,
-                ));
-            }
-            let more = diff.lines.len().saturating_sub(max) + diff.more;
-            if more > 0 {
-                let hint = if show_steps { "" } else { " (ctrl+o)" };
-                lines.push(Line::styled(format!("    … {more} more lines{hint}"), dim));
-            }
-        }
-        lines
-    }
-
-    /// The welcome banner as lines (its widget drawn into a scratch buffer), a blank line after.
-    pub fn welcome_lines(info: &WelcomeInfo, frame: FrameName, width: u16) -> Vec<Line<'static>> {
-        let area = Rect::new(0, 0, width, welcome::HEIGHT);
-        let mut buf = Buffer::empty(area);
-        Welcome { info, frame }.render(area, &mut buf);
-        let mut lines: Vec<Line<'static>> = (0..area.height)
-            .map(|y| {
-                let mut spans: Vec<Span<'static>> = Vec::new();
-                let mut x = 0;
-                while x < width {
-                    let cell = &buf[(x, y)];
-                    let style = cell.style();
-                    let symbol = cell.symbol().to_string();
-                    x += (unicode_width::UnicodeWidthStr::width(symbol.as_str()) as u16).max(1);
-                    match spans.last_mut() {
-                        Some(last) if last.style == style => last.content.to_mut().push_str(&symbol),
-                        _ => spans.push(Span::styled(symbol, style)),
-                    }
-                }
-                Line::from(spans)
-            })
-            .collect();
-        lines.push(Line::default());
-        lines
-    }
-
-    /// The waiting line: spinner, label, `(12s · ~400 tokens)`, and the reasoning's last lines.
-    /// TODO(#9): `ThinkingView::render` / `DraftView::render`.
-    pub fn waiting_lines(
-        label: &str,
-        thought: &str,
-        count: Option<&str>,
-        code: bool,
-        since: Instant,
-        now: Instant,
-        width: u16,
-    ) -> Vec<Line<'static>> {
-        let dim = Style::new().fg(theme::DIM);
-        let waited = now.saturating_duration_since(since);
-        let frame = SPINNER[(waited.as_millis() / SPINNER_MS.as_millis()) as usize % SPINNER.len()];
-        // An estimate (4 chars a token): the real count arrives with the reply's usage.
-        let estimate = count.unwrap_or(thought).trim().chars().count().div_ceil(4);
-        let mut shown = Vec::new();
-        if waited.as_millis() >= 1000 {
-            shown.push(elapsed(waited));
-        }
-        if estimate > 0 {
-            shown.push(format!("~{} tokens", tokens(estimate as u64)));
-        }
-        let suffix = if shown.is_empty() { String::new() } else { format!(" ({})", shown.join(" · ")) };
-        let mut lines = vec![truncate_end(
-            Line::from(vec![
-                Span::styled(frame, Style::new().fg(theme::ACCENT)),
-                Span::styled(format!(" {}{suffix}", printable(label)), dim),
-            ]),
-            width,
-        )];
-        // Only the end is shown, so only the end is cleaned up: a draft can be a 100k-character file.
-        let start = thought.char_indices().rev().nth(TAIL_CHARS.saturating_sub(1)).map_or(0, |(i, _)| i);
-        let tail = printable(&thought[start..]);
-        let rows: Vec<String> = tail
-            .split('\n')
-            .map(|l| if code { l.replace('\t', "  ").trim_end().to_string() } else { l.trim().to_string() })
-            .filter(|l| !l.trim().is_empty())
-            .collect();
-        for row in &rows[rows.len().saturating_sub(PREVIEW_LINES)..] {
-            lines.push(truncate_end(Line::styled(format!("  {row}"), dim.add_modifier(Modifier::ITALIC)), width));
-        }
-        lines.push(Line::default());
-        lines
-    }
-
-    /// The value of `key` in unfinished JSON, decoded as far as it has arrived (Marv `partialString`).
-    fn partial_string(json: &str, key: &str) -> Option<String> {
-        let needle = format!("\"{key}\"");
-        let at = json.find(&needle)? + needle.len();
-        let rest = json[at..].trim_start().strip_prefix(':')?.trim_start().strip_prefix('"')?;
-        let mut out = String::new();
-        let mut chars = rest.chars();
-        while let Some(c) = chars.next() {
-            match c {
-                '"' => break,
-                '\\' => match chars.next() {
-                    Some('n') => out.push('\n'),
-                    Some('t') => out.push('\t'),
-                    Some('r') => out.push('\r'),
-                    Some('u') => {
-                        // An escape cut in half (fewer than 4 hex digits) waits for the rest.
-                        let hex: String = chars.by_ref().take(4).collect();
-                        match u32::from_str_radix(&hex, 16).ok().filter(|_| hex.len() == 4).and_then(char::from_u32) {
-                            Some(c) => out.push(c),
-                            None => break,
-                        }
-                    }
-                    Some(other) => out.push(other),
-                    None => break,
-                },
-                c => out.push(c),
-            }
-        }
-        Some(out)
-    }
-
-    /// "Writing src/app.js…" (Marv `draftLabel`, `src/tool-draft.ts`).
-    pub fn draft_label(name: &str, args: &str) -> String {
-        let path =
-            partial_string(args, "path").map(|p| p.split('\n').next().unwrap_or_default().to_string()).filter(|p| !p.is_empty());
-        let path = path.as_deref().unwrap_or("a file");
-        match name {
-            "write_file" => format!("Writing {path}…"),
-            "edit_file" => format!("Editing {path}…"),
-            "bash" => "Writing a command…".into(),
-            "" => "Preparing a tool call…".into(),
-            name => format!("Preparing {name}…"),
-        }
-    }
-
-    /// The code written so far (Marv `draftPreview`).
-    pub fn draft_preview(name: &str, args: &str) -> String {
-        let key = match name {
-            "write_file" => "content",
-            "edit_file" => "new_string",
-            "bash" => "command",
-            _ => return String::new(),
-        };
-        partial_string(args, key).unwrap_or_default()
-    }
-
-    /// Pinned above a subagent's view. TODO(#9): `AgentViewHeader`.
-    pub fn agent_header(log: &crate::ui::agent_view::AgentLog, width: u16) -> Line<'static> {
-        let state = if log.running { "running" } else { "finished" };
-        truncate_end(
-            Line::from(vec![
-                Span::styled("● ", Style::new().fg(theme::ACCENT)),
-                Span::styled(format!("agent {} · {state}", printable(&log.title)), Style::new().add_modifier(Modifier::BOLD)),
-                Span::styled("  esc to go back", Style::new().fg(theme::DIM)),
-            ]),
-            width,
-        )
-    }
-
-    /// A subagent's log as lines. TODO(#9): `AgentView`.
-    pub fn log_lines(log: &crate::ui::agent_view::AgentLog, width: u16, show_steps: bool) -> Vec<Line<'static>> {
-        let mut lines: Vec<Line<'static>> = log.messages.iter().flat_map(|m| message_lines(m, width, show_steps)).collect();
-        if !log.streaming.is_empty() {
-            lines.extend(message_lines(&message(Role::Assistant, log.streaming.clone()), width, false));
-        }
-        if let Some((_, name, args)) = &log.draft {
-            lines.push(Line::styled(format!("  {}", draft_label(name, args)), Style::new().fg(theme::DIM)));
-        } else if log.running && log.streaming.is_empty() {
-            lines.push(Line::styled("  Thinking…", Style::new().fg(theme::DIM)));
-        }
-        lines
-    }
-
-    /// Folds a subagent's event into its log (Marv `applyEvent`, `src/agent-log.ts`).
-    /// TODO(#9): `AgentLog::apply`.
-    pub fn apply_to_log(sub: &mut SubLog, event: &UiEvent, now: Instant) {
-        let SubLog { log, next_id, tools, thinking_since } = sub;
-        let mut add = |log: &mut crate::ui::agent_view::AgentLog, m: Message| {
-            log.messages.push(Message { id: *next_id, ..m });
-            *next_id += 1;
-        };
-        // Like the main transcript: reasoning collapses to one line once the step moves on.
-        let note_thought = |log: &mut crate::ui::agent_view::AgentLog,
-                            since: &mut Option<Instant>,
-                            add: &mut dyn FnMut(&mut crate::ui::agent_view::AgentLog, Message)| {
-            if !log.thinking.is_empty() {
-                let seconds = round_secs(now - since.unwrap_or(now));
-                add(log, system(format!("✻ Thought for {seconds}s"), false));
-            }
-            log.thinking.clear();
-            *since = None;
-        };
-        // What streamed before an error or a stop isn't lost.
-        let keep_partial = |log: &mut crate::ui::agent_view::AgentLog,
-                            add: &mut dyn FnMut(&mut crate::ui::agent_view::AgentLog, Message)| {
-            if !log.streaming.is_empty() {
-                let text = std::mem::take(&mut log.streaming);
-                add(log, message(Role::Assistant, text));
-            }
-        };
-        if is_step_end(event) {
-            log.draft = None;
-        }
-        log.version += 1;
-        match event {
-            UiEvent::ToolCallDelta { index, name, text } => {
-                let draft = match &mut log.draft {
-                    Some(d) if d.0 == *index => d,
-                    _ => log.draft.insert((*index, name.clone(), String::new())),
-                };
-                if !name.is_empty() {
-                    draft.1.clone_from(name);
-                }
-                draft.2.push_str(text);
-            }
-            UiEvent::ThinkingDelta(text) => {
-                thinking_since.get_or_insert(now);
-                log.thinking.push_str(text);
-            }
-            UiEvent::TextDelta(text) => log.streaming.push_str(text),
-            UiEvent::TextLoop { continued } => {
-                log.streaming.clear();
-                let text = if *continued {
-                    "✻ Stuck repeating itself: the reply was stopped and dropped, and the model was told."
-                } else {
-                    "Stopped: still stuck repeating itself."
-                };
-                add(log, system(text.into(), false));
-            }
-            UiEvent::ToolLoop { continued } => {
-                let text = if *continued {
-                    "✻ The same tool call kept getting the same result: answered with a note instead."
-                } else {
-                    "Stopped: still repeating the same tool call."
-                };
-                add(log, system(text.into(), false));
-            }
-            UiEvent::Retry { message: text, .. } => {
-                // The provider asks again from the start: drop what the failed attempt drew, and say why.
-                log.streaming.clear();
-                log.thinking.clear();
-                *thinking_since = None;
-                log.draft = None;
-                add(log, system(text.clone(), false));
-            }
-            UiEvent::Assistant { text } => {
-                note_thought(log, thinking_since, &mut add);
-                add(log, message(Role::Assistant, text.clone()));
-                log.streaming.clear();
-            }
-            UiEvent::ToolStart { call_id, name, label } => {
-                note_thought(log, thinking_since, &mut add);
-                keep_partial(log, &mut add);
-                tools.insert(call_id.clone(), log.messages.len());
-                let mut m = message(Role::Tool, name.clone());
-                m.tool =
-                    Some(ToolStatus { label: label.clone(), status: ToolState::Running, summary: None, steps: None, diff: None });
-                add(log, m);
-            }
-            UiEvent::ToolEnd { call_id, status, .. } => {
-                if let Some(index) = tools.remove(call_id)
-                    && let Some(m) = log.messages.get_mut(index)
-                {
-                    m.tool = Some(status.clone());
-                }
-            }
-            UiEvent::Error(text) => {
-                note_thought(log, thinking_since, &mut add);
-                keep_partial(log, &mut add);
-                add(log, system(text.clone(), true));
-            }
-            UiEvent::Done(reason) => {
-                note_thought(log, thinking_since, &mut add);
-                keep_partial(log, &mut add);
-                let stopped = match reason {
-                    StopReason::Aborted => Some("Interrupted."),
-                    StopReason::Declined => Some("Stopped: the user declined."),
-                    StopReason::Length => Some("The reply was cut off at the model's output limit, so nothing in it ran."),
-                    StopReason::MaxSteps => Some("It hit its step limit."),
-                    _ => None,
-                };
-                if let Some(text) = stopped {
-                    add(log, system(text.into(), false));
-                }
-                log.running = false;
-            }
-            _ => {}
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn draft_label_and_preview_read_unfinished_json() {
-            let args = r#"{"path": "page.js", "content": "const a = 1;\nfunction draw() {\n  return a;"#;
-            assert_eq!(draft_label("write_file", args), "Writing page.js…");
-            assert_eq!(draft_preview("write_file", args), "const a = 1;\nfunction draw() {\n  return a;");
-            assert_eq!(draft_label("edit_file", r#"{"pa"#), "Editing a file…");
-            assert_eq!(draft_label("bash", ""), "Writing a command…");
-            assert_eq!(draft_label("grep", ""), "Preparing grep…");
-            assert_eq!(draft_preview("bash", r#"{"command": "echo é\u00"#), "echo é");
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::scroll_view::GLIDE_MS;
+    use crate::ui::thinking_view::SPINNER_MS;
     use crate::view::{DiffLine, DiffShown, Preview, ProviderId, Resumed, Scope, SessionSummary, SetupAnswer};
     use std::sync::Mutex;
     use tokio::sync::mpsc;
@@ -2431,7 +1889,7 @@ mod tests {
             h.frame();
         }
         let streamed = h.frame();
-        let whole = standin::message_lines(&standin::message(Role::Assistant, text.into()), 40, false);
+        let whole = message_view::render(&message(Role::Assistant, text.into()), 40, false, None);
         for line in &whole {
             assert!(streamed.contains(line.to_string().trim_end()), "{line}\n{streamed}");
         }
@@ -2650,7 +2108,7 @@ mod tests {
         let mut h = harness();
         h.height = 20;
         for i in 0..30 {
-            h.event(UiEvent::Message(standin::system(format!("note {i}"), false)));
+            h.event(UiEvent::Message(system_message(format!("note {i}"), false)));
         }
         assert!(h.frame().contains("note 29"));
         h.key(KeyCode::PageUp);
@@ -2666,7 +2124,7 @@ mod tests {
         let mut h = harness();
         h.height = 20;
         for i in 0..30 {
-            h.event(UiEvent::Message(standin::system(format!("note {i}"), false)));
+            h.event(UiEvent::Message(system_message(format!("note {i}"), false)));
         }
         h.frame();
         let bottom = h.app.scroll.scroll_top();
@@ -2832,7 +2290,7 @@ mod tests {
     #[test]
     fn a_restored_subagent_cant_be_opened() {
         let mut h = harness();
-        let mut agent = standin::message(Role::Tool, "agent".into());
+        let mut agent = message(Role::Tool, "agent".into());
         agent.id = 3;
         agent.tool = Some(ToolStatus {
             label: "old · run".into(),
@@ -2934,7 +2392,7 @@ mod tests {
     #[test]
     fn clear_empties_the_transcript_and_busy_shows_the_waiting_line() {
         let mut h = harness();
-        h.event(UiEvent::Message(standin::system("Hello there".into(), false)));
+        h.event(UiEvent::Message(system_message("Hello there".into(), false)));
         assert!(h.frame().contains("Hello there"));
         h.event(UiEvent::Clear);
         assert!(!h.frame().contains("Hello there"));
@@ -2953,7 +2411,7 @@ mod tests {
     #[test]
     fn engine_text_is_cleaned_before_it_is_drawn() {
         let mut h = harness();
-        h.event(UiEvent::Message(standin::system("evil\x1b[2J\u{202e}text".into(), true)));
+        h.event(UiEvent::Message(system_message("evil\x1b[2J\u{202e}text".into(), true)));
         h.typed("x");
         h.events([UiEvent::TextDelta("bad\x1b]0;title\x07reply".into())]);
         let buf = h.buffer();
@@ -2995,7 +2453,7 @@ mod tests {
         h.frame();
         assert!(h.app.deadline().is_some(), "the martian animates while it's on screen");
         for i in 0..20 {
-            h.event(UiEvent::Message(standin::system(format!("note {i}"), false)));
+            h.event(UiEvent::Message(system_message(format!("note {i}"), false)));
         }
         h.frame();
         assert!(!h.app.welcome_visible);
@@ -3011,7 +2469,7 @@ mod tests {
         let mut h = harness();
         h.height = 16;
         for i in 0..20 {
-            h.event(UiEvent::Message(standin::system(format!("note {i}"), false)));
+            h.event(UiEvent::Message(system_message(format!("note {i}"), false)));
         }
         h.typed("go");
         h.frame();

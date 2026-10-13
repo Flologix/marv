@@ -11,8 +11,9 @@
 //!   the `ignore` walker outside git), in place of Marv's line loop; the caps are Marv's. A file is read whole (at
 //!   most 1 MB), checked for a NUL in its first 8 KB like `read_file`, then searched line by line.
 //! - marv-rs: the regex dialect is Rust's (`regex`), not JavaScript's: the same syntax for everything a search
-//!   usually needs, but no lookaround and no backreferences. The schema says so, and so does the error for a pattern
-//!   that uses them, so the model can rewrite it.
+//!   usually needs, but no lookaround and no backreferences. The schema keeps Marv's words ("JavaScript syntax"),
+//!   so the requests match Marv's (the oracle, #11); the error for a pattern that uses them says so instead, and the
+//!   model rewrites it.
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -70,7 +71,7 @@ impl Tool for Grep {
         json!({
             "type": "object",
             "properties": {
-                "pattern": {"type": "string", "description": "Regular expression (Rust regex syntax: like JavaScript's, without lookaround or backreferences) to search for, e.g. \"function\\\\s+greet\"."},
+                "pattern": {"type": "string", "description": "Regular expression (JavaScript syntax) to search for, e.g. \"function\\\\s+greet\"."},
                 "path": {"type": "string", "description": "File or directory to search, relative to the project root. Default: the whole project."},
                 "glob": {"type": "string", "description": "Only search files matching this glob, e.g. \"*.ts\" or \"src/**/*.tsx\"."},
                 "ignoreCase": {"type": "boolean", "description": "Case-insensitive search."}

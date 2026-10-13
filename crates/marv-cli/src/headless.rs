@@ -191,9 +191,19 @@ impl Collector {
                         Some(json!({"type": "assistant", "text": text}))
                     }
                     L::ToolStart { call, label } => Some(json!({"type": "tool_start", "tool": call.name, "label": label})),
-                    L::ToolEnd { call, run } => Some(
-                        json!({"type": "tool_end", "tool": call.name, "label": run.label, "result": run.result.output, "error": run.result.is_error, "approval": run.approval}),
-                    ),
+                    L::ToolEnd { call, run } => {
+                        let mut line =
+                            json!({"type": "tool_end", "tool": call.name, "label": run.label, "result": run.result.output});
+                        // Marv's result has no isError when it isn't one and no approval when none was needed, and
+                        // JSON.stringify leaves those out.
+                        if run.result.is_error {
+                            line["error"] = true.into();
+                        }
+                        if run.approval != ApprovalRecord::None {
+                            line["approval"] = json!(run.approval);
+                        }
+                        Some(line)
+                    }
                     L::ToolSkipped { call, output } => Some(json!({"type": "tool_skipped", "tool": call.name, "reason": output})),
                     L::Done(reason) => {
                         self.reason = TurnEndReason::Done(*reason).as_str().into();
@@ -490,5 +500,20 @@ mod tests {
         assert_eq!((r.reply.as_str(), r.reason.as_str(), r.steps), ("done", "end", 2));
         assert_eq!(r.refused.unwrap(), vec![Refused { tool: "bash".into(), label: "rm".into() }]);
         assert_eq!(exit_code_for(&r.reason, 1), ExitCode::NeedsApproval);
+    }
+
+    // stream-json's tool_end as Marv writes it: no `error: false`, no `approval: "none"`.
+    #[test]
+    fn tool_end_leaves_out_what_marv_leaves_out() {
+        let mut c = Collector::default();
+        let call = marv_core::ToolCall { id: "1".into(), name: "read_file".into(), arguments: "{}".into() };
+        let ok = marv_agent::ToolRun::new(marv_core::ToolResult { output: "x".into(), summary: None, is_error: false }, "a.js");
+        let line = c.event(&SessionEvent::Loop(LoopEvent::ToolEnd { call: call.clone(), run: ok })).unwrap();
+        assert_eq!(line, serde_json::json!({"type": "tool_end", "tool": "read_file", "label": "a.js", "result": "x"}));
+        let mut failed =
+            marv_agent::ToolRun::new(marv_core::ToolResult { output: "no".into(), summary: None, is_error: true }, "a.js");
+        failed.approval = ApprovalRecord::Auto;
+        let line = c.event(&SessionEvent::Loop(LoopEvent::ToolEnd { call, run: failed })).unwrap();
+        assert_eq!((&line["error"], &line["approval"]), (&serde_json::json!(true), &serde_json::json!("auto")));
     }
 }

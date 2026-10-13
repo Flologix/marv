@@ -1,0 +1,4 @@
+// dropped partway, as in script.jsonl
+{"text": "`shout(text)` returns the te", "drop": true}
+// #64: the retry asks the model to continue, so it sends only the rest
+{"text": "xt in upper case."}

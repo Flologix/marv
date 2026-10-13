@@ -101,7 +101,6 @@ Approvals: the client supplies an `Arc<dyn marv_tools::Approver>` (`SessionInit:
 - **Frontmatter YAML** uses `serde_norway`. The YAML error wording differs from Bun's.
 - **Project-check patterns** are JavaScript regexes that run in the sandbox. They aren't compiled in Marv's process to validate them (Rust's regex dialect differs), so a bad pattern shows up as that check's `failed` violation.
 - **The check runner needs a redesign.** Marv sent TypeScript source to `bun -e` inside the sandbox. marv-rs has no TypeScript of its own. Plan: bind-mount the `marv` binary read-only and run a hidden `marv __run-checks`, which takes the spec on stdin and matches the patterns itself. `.ts` scripts still run with the project's bun.
-- **`send()` records the pasted sites, then `start()` runs the turn.** The session's tests start turns with `start()` while `marv_tools::web_fetch::pasted_scopes` is a stub.
 - **A panicking provider or tool** (Marv: one that throws) is caught around the turn's body (`catch_unwind`): the turn ends with `Error: <message>` and `TurnEnd`, and the session lives on.
 - **`working` is a token** cancelled when the turn's task (or `compact()`) has fully ended; `close()` waits on it. `compact()` frees the session from a drop guard, so a caller dropping its future can't leave it busy.
 - **Mesh:** the main agent's mesh tools are offered on a plug named `main` when the session has a switchboard; draining the inbox between steps waits for mesh v1 (`Switchboard::drain_inbox`).
@@ -118,12 +117,9 @@ Approvals: the client supplies an `Arc<dyn marv_tools::Approver>` (`SessionInit:
 
 ## Upstream gaps (other crates)
 
-Found by running the oracle (#11) with `pasted_scopes` stubbed out locally: the session itself drives all 25 non-MCP scenarios to the right files, events and requests; what still differs is in other crates.
+The oracle passes 25 of 28 against marv-rs (#11). What's left elsewhere:
 
-- **marv-tools:** `web_fetch::pasted_scopes` is todo, and `send()` calls it, so every `marv -p` panics before its turn. The grep spec's `pattern` description differs from Marv's ("Rust regex syntax…"; list it in oracle.md if deliberate), and read_file's `offset` lacks Marv's `"maximum": 9007199254740991`. Both differ in all 28 scenarios.
-- **marv-cli:** the `stream-json` `tool_end` always has `error` and `approval`; Marv leaves out `error: false` and `approval: "none"` (`headless.rs:195`).
-- **marv-mcp:** `McpManager::start`/`close` are todo (the three MCP scenarios panic), and a new manager reports `settled()` before `start()` ran, so `WaitingForMcp` would be skipped.
-- **marv-agent:** after `on_full` returns false with the turn cancelled (Esc during a mid-turn compaction) and no `after_step`, the loop still calls `provider.stream` once, with the cancelled token, before ending `Aborted`; Marv sent nothing. Also #64 (continue after a dropped stream) makes `dropped-stream` differ from the recording: the kept partial plus the replayed reply. List #64 in oracle.md, or re-record.
+- **marv-mcp:** `McpManager::start`/`close` are todo (the three MCP scenarios panic), and a new manager reports `settled()` before `start()` ran, so `WaitingForMcp` would be skipped (#6).
 - **marv-session (other modules):** `Checker::turn` and `combine_checks` for two kinds are todo (a turn with diagnostics or checks on panics into an `Error`), and so are `run_subagent` and `SessionAgentHost::preview` (the agent tool).
-- **marv-agent:** nothing fences tool output by provenance in the loop; the session does it in `tool_run_from`.
+- **marv-agent:** nothing fences tool output by provenance in the loop; the session does it in `tool_run_from`. After `on_full` (or anything else) cancels a turn, the loop checks the stop only after `after_step`, so the session always gives it one (a no-op without checks); otherwise it would send one more request.
 - **marv-tools:** `memory::{add,find,remove}_memory` are todo.
