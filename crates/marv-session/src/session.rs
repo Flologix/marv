@@ -744,23 +744,16 @@ impl MarvSession {
     /// own task (it must be inside a Tokio runtime); read the [`Turn`] for its events. Fails during a turn, or after
     /// `close()`.
     pub fn send(&self, text: &str, options: SendOptions) -> Result<Turn, SessionError> {
-        self.idle(&self.state())?;
-        // Sites the user pasted are theirs to fetch: only what they typed counts (not a /skill's instructions,
-        // a file or a page: links found there are where a planted instruction would send the model).
-        for key in marv_tools::web_fetch::pasted_scopes(text) {
-            self.inner.always.add(key);
-        }
-        self.start(text, options)
-    }
-
-    /// `send()` after the pasted sites are recorded: starts the turn's task. (Tests start turns here while
-    /// `pasted_scopes` is still a stub in marv-tools.)
-    fn start(&self, text: &str, options: SendOptions) -> Result<Turn, SessionError> {
         let stop = CancellationToken::new();
         let done = CancellationToken::new();
         {
             let mut s = self.state();
             self.idle(&s)?;
+            // Sites the user pasted are theirs to fetch: only what they typed counts (not a /skill's instructions,
+            // a file or a page: links found there are where a planted instruction would send the model).
+            for key in marv_tools::web_fetch::pasted_scopes(text) {
+                self.inner.always.add(key);
+            }
             s.running = true;
             s.current = Some(stop.clone());
             s.working = Some(done.clone());
@@ -992,7 +985,11 @@ impl MarvSession {
 
         let mut options = AgentOptions::new(provider.clone(), history, system, specs, runner.clone(), stop.clone());
         options.max_steps = max_steps.unwrap_or(marv_agent::agent::DEFAULT_MAX_STEPS);
-        options.after_step = checks.map(|c| c.after_step);
+        // Always one, even with no checks: the loop looks at the stop after `after_step`, so a stop during a mid-turn
+        // compaction (on_full) ends the turn there instead of sending one more request (Marv stopped before it).
+        options.after_step = Some(
+            checks.map_or_else(|| -> marv_agent::agent::AfterStep { Arc::new(|_| Box::pin(async { None })) }, |c| c.after_step),
+        );
         // A direct call to a deferred MCP tool runs as the mcp_call it meant (#14), and its result says so.
         let deferred = self.state().listing.as_ref().is_some_and(|l| l.mode == McpMode::Deferred);
         let mcp_names: HashSet<String> =
@@ -1933,8 +1930,7 @@ mod tests {
 }
 
 /// Ports `tests/session.test.ts` (the parts whose collaborators are ported: no subagents, worktrees, MCP manager
-/// lifecycle or typecheck runs yet). Turns start through `start()`: `send()` also calls
-/// `marv_tools::web_fetch::pasted_scopes`, still a stub in marv-tools.
+/// lifecycle or typecheck runs yet).
 #[cfg(test)]
 mod turn_tests {
     use super::*;
@@ -2142,7 +2138,7 @@ mod turn_tests {
     }
 
     fn go(session: &MarvSession, text: &str) -> Turn {
-        session.start(text, SendOptions::default()).unwrap()
+        session.send(text, SendOptions::default()).unwrap()
     }
     async fn collect(mut turn: Turn) -> Vec<SessionEvent> {
         let mut out = Vec::new();
@@ -2243,7 +2239,7 @@ mod turn_tests {
         let session = scripted(&dirs, &provider, |_| {});
         let first = go(&session, "one");
         assert!(session.busy());
-        assert!(session.start("two", SendOptions::default()).err().unwrap().to_string().contains("working"));
+        assert!(session.send("two", SendOptions::default()).err().unwrap().to_string().contains("working"));
         collect(first).await;
         assert!(!session.busy());
         collect(go(&session, "two")).await;
@@ -2271,7 +2267,7 @@ mod turn_tests {
         let dirs = Dirs::new();
         let session = make(&dirs, fixed(Arc::new(Hanging::default())), |_| {});
         let stop = CancellationToken::new();
-        let mut turn = session.start("go", SendOptions { cancel: Some(stop.clone()), ..Default::default() }).unwrap();
+        let mut turn = session.send("go", SendOptions { cancel: Some(stop.clone()), ..Default::default() }).unwrap();
         let mut events = Vec::new();
         while let Some(e) = turn.next().await {
             if kind(&e) == "text_delta" {
@@ -2516,15 +2512,11 @@ mod turn_tests {
         assert_eq!(after.iter().map(role_of).collect::<Vec<_>>(), ["user", "assistant", "user"]);
     }
 
-    /// The first request answers with `first`; every later one hangs until stopped. `requests` counts the ones sent
-    /// with a live token (one already cancelled ends at once, with nothing sent).
+    /// The first request answers with `first`; every later one hangs until stopped. `requests` counts them all.
     fn first_then_hanging(first: Vec<ProviderEvent>, requests: Arc<std::sync::atomic::AtomicUsize>) -> impl Provider {
         let first = Scripted::new(vec![first]);
         let hanging = Hanging::default();
         Hook(move |history: &[ChatTurn], options: &StreamOptions| {
-            if options.cancel.is_cancelled() {
-                return hanging.stream(history, options.clone());
-            }
             if requests.fetch_add(1, Ordering::SeqCst) == 0 {
                 first.stream(history, options.clone())
             } else {
@@ -2640,7 +2632,7 @@ mod turn_tests {
         assert_eq!(compactions(&events), [stopped()]);
         // The turn was already running, so this is an abort, not the pre-message "interrupted".
         assert_eq!(end_reason(&events), TurnEndReason::Done(StopReason::Aborted));
-        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(requests.load(Ordering::SeqCst), 2); // the first answer and the summary: the loop never went on
     }
 
     #[tokio::test]
@@ -2732,7 +2724,7 @@ mod turn_tests {
         let session = scripted(&dirs, &provider, |i| i.trajectories = Some(store.clone()));
         let stop = CancellationToken::new();
         stop.cancel();
-        let events = collect(session.start("hi", SendOptions { cancel: Some(stop), ..Default::default() }).unwrap()).await;
+        let events = collect(session.send("hi", SendOptions { cancel: Some(stop), ..Default::default() }).unwrap()).await;
         assert_eq!(end_reason(&events), TurnEndReason::Interrupted);
         assert!(provider.requests().is_empty());
         collect(go(&session, "thanks, perfect")).await;
@@ -2966,7 +2958,7 @@ mod turn_tests {
         // A timer armed after close() would fire within the save delay.
         assert!(session.state().save_timer.is_none());
         session.close().await; // twice is fine
-        assert_eq!(session.start("hi", SendOptions::default()).err().unwrap().to_string(), CLOSED);
+        assert_eq!(session.send("hi", SendOptions::default()).err().unwrap().to_string(), CLOSED);
         assert_eq!(session.compact(None).await.unwrap_err().to_string(), CLOSED);
         assert_eq!(session.clear().await.unwrap_err().to_string(), CLOSED);
         assert_eq!(session.resume(ResumeTarget::Latest).await.unwrap_err().to_string(), CLOSED);
