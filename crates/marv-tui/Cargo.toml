@@ -1,0 +1,16 @@
+[package]
+name = "marv-tui"
+description = "Terminal UI on ratatui: transcript, approvals, prompt, pickers, the martian."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+marv-core.workspace = true
+marv-session.workspace = true
+tokio.workspace = true
+futures.workspace = true
+anyhow.workspace = true
+
+[lints]
+workspace = true

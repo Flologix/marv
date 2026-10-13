@@ -1,0 +1,20 @@
+[package]
+name = "marv-mesh"
+description = "Switchboard, plugs and receptacles: wired comms lines between sandboxed agents."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio-util.workspace = true
+marv-core.workspace = true
+marv-sandbox.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
