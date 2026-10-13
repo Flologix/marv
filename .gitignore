@@ -3,3 +3,4 @@ node_modules/
 .DS_Store
 evals/results/
 release/
+test-results.xml
