@@ -17,6 +17,8 @@ marv-tools.workspace = true
 marv-provider.workspace = true
 marv-mesh.workspace = true
 marv-mcp.workspace = true
+# The TUI startup: hidden PATH folders and whether bubblewrap is here (`/sandbox`, `/yolo`).
+marv-sandbox.workspace = true
 # The TUI (launched by `marv` with no -p). marv-tui doesn't depend on marv-session; the bridge between its
 # `view::SessionPort`/`UiEvent` and the session's API is marv-cli's to write (see docs/subsystems/cli.md).
 marv-tui.workspace = true
