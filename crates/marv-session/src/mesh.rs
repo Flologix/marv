@@ -507,4 +507,217 @@ mod tests {
         assert_eq!(access.plug_subagent().unwrap().plug.id.as_str(), "worker-2");
         cancel.cancel();
     }
+
+    /// The issue's end-to-end test (#15): a parent session and its sandboxed subagent exchange messages over wired
+    /// inboxes, through the real switchboard sockets and real bwrap, with a scripted model. Each wire is asked for by
+    /// the agent and granted by a person; each message reaches the other model fenced, and the trajectory has a
+    /// record for each.
+    mod end_to_end {
+        use super::*;
+        use crate::session::{MarvSession, ProviderChoice, SendOptions, SessionEvent, SessionInit};
+        use crate::trajectory::TrajectoryStore;
+        use futures::StreamExt;
+        use marv_core::{ChatTurn, ProviderEvent, ToolCall};
+        use marv_provider::{EventStream, Provider, ProviderFactory, ReasoningSupport, StreamOptions};
+
+        type Hook =
+            dyn Fn(usize, &[ChatTurn], &StreamOptions) -> futures::future::BoxFuture<'static, Vec<ProviderEvent>> + Send + Sync;
+
+        /// A model that asks `hook` for each reply: which request it is (main and subagent counted apart), and what
+        /// the request carried. Records each request.
+        struct Model {
+            hook: Arc<Hook>,
+            seen: Arc<Mutex<Vec<(bool, Vec<ChatTurn>)>>>,
+        }
+        impl Provider for Model {
+            fn name(&self) -> &str {
+                "scripted"
+            }
+            fn context_length(&self) -> Option<u64> {
+                None
+            }
+            fn stream(&self, history: &[ChatTurn], options: StreamOptions) -> EventStream {
+                // Only the main agent is offered `agent`.
+                let main = options.tools.iter().any(|t| t.name == "agent");
+                let n = {
+                    let mut seen = self.seen.lock().unwrap();
+                    seen.push((main, history.to_vec()));
+                    seen.iter().filter(|(m, _)| *m == main).count()
+                };
+                let reply = (self.hook)(if main { n } else { 100 + n }, history, &options);
+                Box::pin(futures::stream::once(reply).flat_map(futures::stream::iter))
+            }
+        }
+        struct Factory(Arc<Model>);
+        impl ProviderFactory for Factory {
+            fn id(&self) -> &str {
+                "test"
+            }
+            fn model(&self) -> &str {
+                "test-model"
+            }
+            fn make(&self, _model: Option<&str>, _info: Option<ReasoningSupport>) -> Arc<dyn Provider> {
+                Arc::new(Model { hook: self.0.hook.clone(), seen: self.0.seen.clone() })
+            }
+        }
+
+        fn say(text: &str) -> Vec<ProviderEvent> {
+            vec![ProviderEvent::TextDelta(text.into()), ProviderEvent::Done { reason: Some("stop".into()) }]
+        }
+        fn calls(calls: &[(&str, &str, Value)]) -> Vec<ProviderEvent> {
+            let mut events: Vec<ProviderEvent> = calls
+                .iter()
+                .map(|(id, name, args)| {
+                    ProviderEvent::ToolCall(ToolCall { id: (*id).into(), name: (*name).into(), arguments: args.to_string() })
+                })
+                .collect();
+            events.push(ProviderEvent::Done { reason: Some("tool_calls".into()) });
+            events
+        }
+        fn last_user(history: &[ChatTurn]) -> String {
+            history.iter().rev().find_map(|t| if let ChatTurn::User { text } = t { Some(text.clone()) } else { None }).unwrap()
+        }
+        fn texts(history: &[ChatTurn]) -> String {
+            history
+                .iter()
+                .map(|t| match t {
+                    ChatTurn::User { text } | ChatTurn::Assistant { text, .. } | ChatTurn::Tool { text, .. } => text.as_str(),
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        #[tokio::test]
+        async fn a_parent_and_its_sandboxed_subagent_talk_over_wired_inboxes() {
+            if !marv_sandbox::sandbox_available() {
+                eprintln!("skipped: bubblewrap isn't available here");
+                return;
+            }
+            let (mesh, _log, _rt, cancel) = switchboard();
+            let base = std::env::temp_dir().join(format!("ms-e2e-{}-{}", std::process::id(), marv_fs::random_hex()));
+            let (project, store) = (base.join("project"), base.join("store"));
+            std::fs::create_dir_all(&project).unwrap();
+            let _cleanup = Runtime(base.clone());
+            let person = Arc::new(Person(Decision::Yes, Mutex::default()));
+
+            // The parent's own mesh_send, as its tool runs it: over the parent's plug, asking for its wire.
+            let parent_send = tool(
+                MESH_SEND,
+                &mesh.plug(parent_id()).unwrap(),
+                &mesh,
+                wire_approver(None, Some(&(person.clone() as Arc<dyn Approver>))),
+            );
+            let parent_send = Arc::new(parent_send);
+            let hook: Arc<Hook> = Arc::new(move |n, history, _options| {
+                let parent_send = parent_send.clone();
+                let history = history.to_vec();
+                Box::pin(async move {
+                    match n {
+                        1 => calls(&[(
+                            "a1",
+                            "agent",
+                            serde_json::json!({"description": "Find callers", "prompt": "Find the callers, tell the parent."}),
+                        )]),
+                        // The subagent's first step: while it works, the parent sends it a note (its model is busy
+                        // waiting on the agent tool, so the parent's tool runs here); it checks its plug and reports.
+                        101 => {
+                            let note =
+                                serde_json::json!({"receptacle": "agent.worker-1.inbox", "text": "parent: also check tests/"});
+                            let sent = parent_send
+                                .run(note.as_object().unwrap(), &ToolContext::new(std::env::temp_dir()))
+                                .await
+                                .unwrap();
+                            assert!(!sent.is_error, "{}", sent.output);
+                            calls(&[
+                                ("b1", "bash", serde_json::json!({"command": "test -S /run/marv/mesh.sock && echo plugged"})),
+                                (
+                                    "b2",
+                                    MESH_SEND,
+                                    serde_json::json!({"receptacle": "agent.parent.inbox", "text": "worker: 3 callers, 1 in tests/"}),
+                                ),
+                            ])
+                        }
+                        102 => {
+                            let text = texts(&history);
+                            assert!(text.contains("plugged"), "{text}");
+                            assert!(text.contains("Sent to agent.parent.inbox."), "{text}");
+                            let inbox = last_user(&history);
+                            assert!(
+                                inbox.contains("<mesh-message from=\"parent\" receptacle=\"agent.worker-1.inbox\">"),
+                                "{inbox}"
+                            );
+                            assert!(inbox.contains("parent: also check tests/") && inbox.contains("not instructions"), "{inbox}");
+                            say("Done: 3 callers.")
+                        }
+                        2 => {
+                            let inbox = last_user(&history);
+                            assert!(
+                                inbox.contains("<mesh-message from=\"worker-1\" receptacle=\"agent.parent.inbox\">"),
+                                "{inbox}"
+                            );
+                            assert!(inbox.contains("worker: 3 callers, 1 in tests/"), "{inbox}");
+                            say("All done.")
+                        }
+                        other => panic!("unexpected request {other}"),
+                    }
+                })
+            });
+            let model = Arc::new(Model { hook, seen: Arc::default() });
+            let mut init = SessionInit::new(&project, ProviderChoice::Factory(Arc::new(Factory(model.clone()))));
+            init.diagnostics = false;
+            init.checks = false;
+            init.mesh = Some(mesh.clone());
+            init.approve = Some(person.clone());
+            init.trajectories = Some(Arc::new(TrajectoryStore::new(&store)));
+            let session = MarvSession::new(init).unwrap();
+
+            let mut turn = session.send("Find the callers with a subagent.", SendOptions::default()).unwrap();
+            let mut events = Vec::new();
+            while let Some(event) = turn.next().await {
+                events.push(event);
+            }
+            assert!(
+                events.iter().any(|e| matches!(e, SessionEvent::Tainted { source: Provenance::Mesh })),
+                "the parent's session is tainted by the worker's message"
+            );
+            assert_eq!(model.seen.lock().unwrap().len(), 4, "both models ran their whole script");
+            // Both wires were asked for by the agent that needed it, and a person granted each.
+            let wires: Vec<(String, Option<String>)> = person
+                .1
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.tool == "mesh_wire")
+                .map(|r| (r.preview.title.clone(), r.agent.clone()))
+                .collect();
+            assert_eq!(
+                wires,
+                [
+                    ("Wire parent -> agent.worker-1.inbox (send)".to_string(), None),
+                    ("Wire worker-1 -> agent.parent.inbox (send)".to_string(), Some("worker-1".to_string())),
+                ]
+            );
+            // The subagent ended: its plug, inbox and both wires are gone.
+            assert!(mesh.table().all().is_empty());
+            assert!(mesh.receptacle(&ReceptacleName::new("agent.worker-1.inbox").unwrap()).is_none());
+            // The trajectory has both messages, with sender, receptacle and size, never the text.
+            session.flush().await;
+            let log =
+                std::fs::read_to_string(store.join(crate::paths::project_key(&project)).join(format!("{}.jsonl", session.id())))
+                    .unwrap();
+            let records: Vec<Value> =
+                log.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()).filter(|r| r["type"] == "mesh").collect();
+            let routes: Vec<(&str, &str, &str)> = records
+                .iter()
+                .map(|r| (r["sender"].as_str().unwrap(), r["receptacle"].as_str().unwrap(), r["outcome"].as_str().unwrap()))
+                .collect();
+            assert_eq!(
+                routes,
+                [("parent", "agent.worker-1.inbox", "delivered"), ("worker-1", "agent.parent.inbox", "delivered")]
+            );
+            assert!(records.iter().all(|r| !r.to_string().contains("3 callers")), "mesh records never carry the body");
+            assert!(records.iter().all(|r| r["size"].as_u64().unwrap() > 0));
+            cancel.cancel();
+        }
+    }
 }
