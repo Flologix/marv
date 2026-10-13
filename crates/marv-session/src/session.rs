@@ -2138,7 +2138,7 @@ mod turn_tests {
 
     fn make(dirs: &Dirs, factory: TestFactory, edit: impl FnOnce(&mut SessionInit)) -> MarvSession {
         let mut init = SessionInit::new(&dirs.project, ProviderChoice::Factory(Arc::new(factory)));
-        init.diagnostics = false; // Checker::turn isn't ported yet
+        init.diagnostics = false; // off unless a test turns them on (checks have their own tests, #13)
         init.checks = false;
         edit(&mut init);
         MarvSession::new(init).unwrap()
