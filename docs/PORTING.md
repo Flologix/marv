@@ -59,7 +59,7 @@ Each milestone ends with something you can run.
 6. **M6 Context.** Compaction v1, then v2 (#63), plus sessions on disk, resume and trajectories.
 7. **M7 MCP.** Manager lifecycle, OAuth, deferred tools, `/mcp add`. ✅ Done (#6).
 8. **M8 Mesh v1.** One Marv and its subagents over the switchboard socket, with wired inboxes. ✅ Done (#15): per-plug Unix sockets, wired inboxes, a plug per sandboxed subagent, wire approvals in the TUI.
-9. **M9 Mesh v2.** Several Marvs on one machine: discovery, cross-process wires, the Herdr adapter.
+9. **M9 Mesh v2.** Several Marvs on one machine: discovery, cross-process wires, the Herdr adapter. ✅ Done (#16): discovery sockets, `marv mesh ls|wire|plug`, cross-process wires approved on both ends, the Herdr pane adapter, an MCP shim for other agents.
 10. **M10 Release.** One static binary (musl), install script, and a `0.1.0` tag. Workflow and `install.sh` done (#19); no tag yet.
 
 Later:

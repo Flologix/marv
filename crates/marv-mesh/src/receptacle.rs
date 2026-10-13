@@ -9,7 +9,7 @@
 //! | Receptacle | What it is | Milestone |
 //! |---|---|---|
 //! | `agent.<name>.inbox` | an agent's message inbox | v1 |
-//! | `herdr.pane.send` / `herdr.pane.status` | a Herdr pane | v2 |
+//! | `herdr.pane.<pane>.send` / `herdr.pane.<pane>.status` | one Herdr agent pane (one approval covers one pane) | v2 |
 //! | `github.read` | the Marv #47 door | later |
 //! | `process.<name>` | a background dev server (Marv #51) | later |
 //! | `mesh.remote.<service>` | a service on an AgentMesh network | v3 |

@@ -16,8 +16,8 @@ The mesh gives sandboxed agents **deliberate, wired, auditable lines out**, with
   | Receptacle | What it is |
   |---|---|
   | `agent.<name>.inbox` | an agent's message inbox |
-  | `herdr.pane.send` | sends keystrokes or a prompt to a Herdr pane |
-  | `herdr.pane.status` | reads a Herdr pane's status |
+  | `herdr.pane.<pane>.send` | sends a prompt to one Herdr agent pane (only when that agent is idle or done, so it can't answer an approval) |
+  | `herdr.pane.<pane>.status` | reads one Herdr pane's status |
   | `github.read` | the Marv #47 door |
   | `process.<name>` | a background dev server (Marv #51) |
   | `mesh.remote.<service>` | anything published on an AgentMesh network |
@@ -57,7 +57,7 @@ Using MCP means:
    - `worker-N → agent.parent.inbox` (send);
    - `parent → agent.worker-N.inbox` (send);
    - optionally `worker-N → worker-M` for swarms, but only when wired.
-2. **Several Marvs on one machine: Herdr or tmux (v2).**
+2. **Several Marvs on one machine: Herdr or tmux (v2, done in #16; see `docs/subsystems/mesh.md` for where it refines this design).**
    - Each switchboard also listens on `$XDG_RUNTIME_DIR/marv/mesh/<session-id>.sock` (mode 0600, the user only).
    - `marv mesh ls` discovers them.
    - Cross-process wires are approved on **both** ends.
