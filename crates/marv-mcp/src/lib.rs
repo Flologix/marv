@@ -21,6 +21,7 @@
 //! This crate doesn't depend on `marv-tools`: [`tool::McpTool`] is plain data
 //! plus a call handle, and `marv-session` adapts it to the `Tool` trait.
 
+pub mod client;
 pub mod config;
 pub mod deferred;
 pub mod install;
@@ -66,6 +67,10 @@ pub enum McpError {
     LoginNeeded(#[from] oauth::LoginNeeded),
     #[error(transparent)]
     UnusableTokenStore(#[from] oauth_store::UnusableTokenStore),
+    /// A remote server answered 401 and its login couldn't fix it (none stored,
+    /// or the user has to go through the browser).
+    #[error("the server wants a login (HTTP 401)")]
+    Unauthorized,
     /// A server error, a dead connection, a timeout.
     #[error("{0}")]
     Server(String),
