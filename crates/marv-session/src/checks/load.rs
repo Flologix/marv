@@ -6,10 +6,11 @@
 //! leading `// glob:`/`// exclude:` comments are read as text, never run). Reading them runs nothing.
 //!
 //! Port notes:
-//! - Patterns are JavaScript regular expressions (the runner matches in the sandbox). Marv compiled them here only to
-//!   validate; Rust's `regex` has another dialect (no lookaround), so validation is left to the runner for now and a
-//!   bad pattern surfaces as that check's `failed` violation.
-//! - [`concerns`] needs a glob matcher with Bun.Glob's semantics (`globset` is the plan): todo.
+//! - Patterns are JavaScript regular expressions, compiled here only to validate (matching happens in the sandbox,
+//!   [`super::runner`]). Rust's `regex` has another dialect (no lookaround, no backreferences), so both use
+//!   `regress`, an ECMAScript engine: a rule that works in Marv works here.
+//! - Globs follow Bun.Glob (`globset` with `literal_separator`: `*` stays in its folder, `**` crosses folders). A glob
+//!   `globset` can't read matches nothing.
 
 use std::path::Path;
 
@@ -96,6 +97,11 @@ pub fn parse_pattern_check(name: &str, file: &str, text: &str) -> Result<Project
         Some(Value::String(f)) if f.chars().all(|c| "imsu".contains(c)) => f.clone(),
         Some(_) => return Err("has flags other than i, m, s and u".into()),
     };
+    let pattern = match &rule {
+        CheckRule::Forbid(p) | CheckRule::Require(p) => p,
+    };
+    // Compiled, never run, here: matching happens in the sandbox.
+    compile(pattern, &flags).map_err(|e| format!("has a regular expression that doesn't compile ({e})"))?;
     let message = d.get("message").and_then(Value::as_str).map(str::trim).filter(|m| !m.is_empty()).ok_or("needs a message")?;
     let why = match d.get("why") {
         None => None,
@@ -109,6 +115,21 @@ pub fn parse_pattern_check(name: &str, file: &str, text: &str) -> Result<Project
         exclude,
         body: CheckBody::Pattern { rule, flags, message: message.into(), why },
     })
+}
+
+/// A check's pattern as JavaScript compiles it (`flags` from `imsu`; the runner adds nothing: `regress` iterates
+/// matches itself, like `g`).
+pub fn compile(pattern: &str, flags: &str) -> Result<regress::Regex, regress::Error> {
+    regress::Regex::with_flags(pattern, flags)
+}
+
+/// Globs as Bun.Glob matches them; `None` when one can't be read.
+pub fn glob_set(patterns: &[String]) -> Option<globset::GlobSet> {
+    let mut set = globset::GlobSetBuilder::new();
+    for pattern in patterns {
+        set.add(globset::GlobBuilder::new(pattern).literal_separator(true).build().ok()?);
+    }
+    set.build().ok()
 }
 
 /// Glob patterns separated by commas or spaces; a comma inside braces (`*.{ts,tsx}`) belongs to its pattern.
@@ -218,7 +239,8 @@ pub fn concerns(check: &ProjectCheck, path: &str) -> bool {
     if path == check.file {
         return true;
     }
-    todo!("port: Bun.Glob matching of check.glob / check.exclude (globset)")
+    let matches = |patterns: &[String]| glob_set(patterns).is_some_and(|set| set.is_match(path));
+    matches(&check.glob) && !matches(&check.exclude)
 }
 
 #[cfg(test)]
@@ -253,5 +275,134 @@ mod tests {
         assert_eq!(c.glob, vec!["src/**/*.{ts,tsx}", "tests/**"]);
         assert_eq!(c.exclude, vec!["dist/**"]);
         assert_eq!(parse_script_check("s", "f", "run()").glob, vec!["**"]);
+    }
+
+    use crate::checks::Scratch;
+
+    const NO_DEFAULT: &str =
+        "glob: 'src/**/*.ts'\nforbid: 'export default'\nmessage: no default exports\nwhy: named exports are easier to find\n";
+
+    fn script(name: &str, glob: &[&str], exclude: &[&str]) -> ProjectCheck {
+        ProjectCheck {
+            name: name.into(),
+            file: format!(".marv/checks/{name}.ts"),
+            glob: glob.iter().map(|s| s.to_string()).collect(),
+            exclude: exclude.iter().map(|s| s.to_string()).collect(),
+            body: CheckBody::Script,
+        }
+    }
+
+    #[test]
+    fn no_folder_no_checks_no_problems() {
+        let dir = Scratch::new();
+        assert_eq!(load_checks(&dir.0), (vec![], vec![]));
+    }
+
+    #[test]
+    fn declarative_checks_and_scripts_with_their_leading_glob_comments() {
+        let dir = Scratch::new();
+        dir.put(".marv/checks/no-default.yaml", NO_DEFAULT);
+        dir.put(
+            ".marv/checks/license.json",
+            r#"{"glob":["src/**/*.ts"],"exclude":"src/gen/**","require":"^// SPDX","flags":"m","message":"no license header"}"#,
+        );
+        dir.put(
+            ".marv/checks/custom.ts",
+            "#!/usr/bin/env bun\n// glob: src/**/*.ts, lib/*.ts\n// exclude: src/gen/**\nconsole.log('x');\n// glob: ignored.ts\n",
+        );
+        dir.put(".marv/checks/anywhere.ts", "console.log('x');\n");
+        dir.put(".marv/checks/README.md", "notes, not a check");
+        let (checks, problems) = load_checks(&dir.0);
+        assert_eq!(problems, Vec::<String>::new());
+        assert_eq!(checks.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["anywhere", "custom", "license", "no-default"]);
+        let find = |name: &str| checks.iter().find(|c| c.name == name).unwrap().clone();
+        assert_eq!(
+            find("no-default"),
+            ProjectCheck {
+                name: "no-default".into(),
+                file: ".marv/checks/no-default.yaml".into(),
+                glob: vec!["src/**/*.ts".into()],
+                exclude: vec![],
+                body: CheckBody::Pattern {
+                    rule: CheckRule::Forbid("export default".into()),
+                    flags: String::new(),
+                    message: "no default exports".into(),
+                    why: Some("named exports are easier to find".into()),
+                },
+            }
+        );
+        let license = find("license");
+        assert_eq!(license.exclude, vec!["src/gen/**"]);
+        assert!(matches!(
+            license.body,
+            CheckBody::Pattern { rule: CheckRule::Require(ref p), ref flags, .. } if p == "^// SPDX" && flags == "m"
+        ));
+        assert_eq!(find("custom"), script("custom", &["src/**/*.ts", "lib/*.ts"], &["src/gen/**"]));
+        assert_eq!(find("anywhere").glob, vec!["**"]);
+    }
+
+    #[test]
+    fn broken_ones_are_skipped_and_say_why() {
+        let dir = Scratch::new();
+        dir.put(".marv/checks/a-no-glob.yaml", "forbid: x\nmessage: m\n");
+        dir.put(".marv/checks/b-both.yaml", "glob: x\nforbid: a\nrequire: b\nmessage: m\n");
+        dir.put(".marv/checks/c-bad-regex.yaml", "glob: x\nforbid: '('\nmessage: m\n");
+        dir.put(".marv/checks/d-no-message.yaml", "glob: x\nforbid: a\n");
+        dir.put(".marv/checks/e-flags.yaml", "glob: x\nforbid: a\nflags: g\nmessage: m\n");
+        dir.put(".marv/checks/f-yaml.yaml", "glob: [unclosed\n");
+        dir.put(".marv/checks/g.yaml", NO_DEFAULT);
+        dir.put(".marv/checks/g.ts", "");
+        let (checks, problems) = load_checks(&dir.0);
+        let kinds: Vec<String> = checks
+            .iter()
+            .map(|c| format!("{}:{}", c.name, if c.body == CheckBody::Script { "script" } else { "pattern" }))
+            .collect();
+        assert_eq!(kinds, ["g:script"]);
+        assert_eq!(problems.len(), 7);
+        let all = problems.join("\n");
+        for expected in [
+            "a-no-glob.yaml: needs a glob",
+            "b-both.yaml: needs exactly one of forbid and require",
+            "c-bad-regex.yaml: has a regular expression that doesn't compile",
+            "d-no-message.yaml: needs a message",
+            "e-flags.yaml: has flags other than",
+            "f-yaml.yaml: isn't valid YAML",
+            "g.yaml: another check is already named \"g\"",
+        ] {
+            assert!(all.contains(expected), "{expected} not in {all}");
+        }
+    }
+
+    #[test]
+    fn javascript_regular_expressions_are_accepted() {
+        // Lookaround and backreferences: `regex` would refuse these; Marv's checks may use them.
+        assert!(parse_pattern_check("x", "f", "glob: a\nforbid: '(?<!\\.)import(?= )'\nmessage: m\n").is_ok());
+        assert!(parse_pattern_check("x", "f", "glob: a\nforbid: '([\"''])x\\1'\nmessage: m\n").is_ok());
+    }
+
+    #[test]
+    fn a_scripts_globs_may_hold_brace_lists() {
+        let check = parse_script_check(
+            "c",
+            ".marv/checks/c.ts",
+            "// glob: src/**/*.{ts,tsx}, lib/*.ts\n// exclude: src/{gen,vendor}/**\n",
+        );
+        assert_eq!(check.glob, vec!["src/**/*.{ts,tsx}", "lib/*.ts"]);
+        assert_eq!(check.exclude, vec!["src/{gen,vendor}/**"]);
+        assert!(concerns(&check, "src/a.tsx"));
+        assert!(concerns(&check, "src/a.ts"));
+        assert!(!concerns(&check, "src/vendor/a.ts"));
+    }
+
+    #[test]
+    fn a_change_concerns_a_check_when_its_glob_matches_and_its_exclude_doesnt_or_its_own_file() {
+        let check = script("c", &["src/**/*.ts"], &["src/gen/**"]);
+        assert!(concerns(&check, "src/a/b.ts"));
+        assert!(concerns(&check, "src/a.ts"));
+        assert!(!concerns(&check, "src/gen/x.ts"));
+        assert!(!concerns(&check, "README.md"));
+        assert!(concerns(&check, ".marv/checks/c.ts"));
+        // `*` stays in its folder, as in Bun.Glob.
+        assert!(!concerns(&script("c", &["lib/*.ts"], &[]), "lib/a/b.ts"));
     }
 }

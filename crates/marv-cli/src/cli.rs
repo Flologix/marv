@@ -101,6 +101,9 @@ pub enum Command {
     /// Converts one web page: `{html, url}` JSON on stdin, the result on stdout (the web reader's own process).
     #[command(name = "__html-convert", hide = true)]
     HtmlConvert,
+    /// Runs the project's checks in the current folder (inside the sandbox): `marv_session::checks::runner`.
+    #[command(name = "__run-checks", hide = true)]
+    RunChecks { spec: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -131,6 +134,9 @@ pub enum Mode {
         spec: String,
     },
     HtmlConvert,
+    RunChecks {
+        spec: String,
+    },
 }
 
 impl Cli {
@@ -143,6 +149,7 @@ impl Cli {
             Some(Command::Mesh(MeshCommand::Ls)) => Mode::MeshLs,
             Some(Command::Mesh(MeshCommand::Wire { spec })) => Mode::MeshWire { spec: spec.join(" ") },
             Some(Command::HtmlConvert) => Mode::HtmlConvert,
+            Some(Command::RunChecks { spec }) => Mode::RunChecks { spec: spec.clone() },
             None => match &self.prompt {
                 Some(prompt) => Mode::Headless { prompt: prompt.clone() },
                 None => Mode::Interactive {
@@ -181,6 +188,7 @@ mod tests {
             Mode::MeshWire { spec: "worker-1 -> parent:inbox".into() }
         );
         assert_eq!(parse(&["__html-convert"]).mode(), Mode::HtmlConvert);
+        assert_eq!(parse(&["__run-checks", "{}"]).mode(), Mode::RunChecks { spec: "{}".into() });
     }
 
     #[test]

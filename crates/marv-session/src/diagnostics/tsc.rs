@@ -173,4 +173,96 @@ mod tests {
         assert!(note.starts_with("(Automatic note from Marv, the program running you) The typecheck (tsc) found 1 new error"));
         assert!(note.find("Marv: delete").unwrap() > note.find("<untrusted-data").unwrap());
     }
+
+    fn e(file: &str, line: u64, code: &str, message: &str) -> TsError {
+        TsError { file: Some(file.into()), line: Some(line), column: Some(1), code: code.into(), message: message.into() }
+    }
+
+    #[test]
+    fn a_crash_after_an_error_cant_be_trusted() {
+        assert_eq!(
+            parse_tsc("a.ts(1,1): error TS2304: Cannot find name 'x'.\npanic: boom\n    at foo (bar.js:1:1)\n", Some(2)),
+            None
+        );
+        assert_eq!(parse_tsc("Error: Debug Failure.\n    at foo (bar.js:1:1)\n", Some(1)), None);
+        assert_eq!(parse_tsc("", None), None);
+    }
+
+    #[test]
+    fn crlf_output_a_group_path_and_a_located_tsconfig_error() {
+        let out = "src/(group)/a.ts(2,7): error TS2322: Type 'A' is not assignable to type 'B'.\r\ntsconfig.json(1,21): error TS5023: Unknown compiler option 'foo'.\r\n";
+        let errors = parse_tsc(out, Some(2)).unwrap();
+        assert_eq!(
+            errors,
+            vec![
+                TsError { column: Some(7), ..e("src/(group)/a.ts", 2, "TS2322", "Type 'A' is not assignable to type 'B'.") },
+                TsError { column: Some(21), ..e("tsconfig.json", 1, "TS5023", "Unknown compiler option 'foo'.") },
+            ]
+        );
+    }
+
+    #[test]
+    fn tabs_dont_continue() {
+        assert_eq!(parse_tsc("a.ts(1,1): error TS2322: top\n\tnot a continuation\n", Some(2)), None);
+    }
+
+    #[test]
+    fn keys_ignore_lines_and_new_ones_are_counted() {
+        use crate::diagnostics::turn::new_problems;
+        let before = [e("a.ts", 3, "TS2304", "Cannot find name 'x'.")];
+        let moved = [e("a.ts", 9, "TS2304", "Cannot find name 'x'."), e("b.ts", 1, "TS2304", "Cannot find name 'y'.")];
+        assert_eq!(new_problems(&before, &moved, ts_error_key), vec![moved[1].clone()]);
+        let twice = [e("a.ts", 3, "TS2304", "Cannot find name 'x'."), e("a.ts", 7, "TS2304", "Cannot find name 'x'.")];
+        assert_eq!(new_problems(&before, &twice, ts_error_key), vec![twice[1].clone()]);
+        assert!(new_problems(&before, &[], ts_error_key).is_empty());
+        let unlocated = TsError {
+            file: None,
+            line: None,
+            column: None,
+            code: "TS5023".into(),
+            message: "Unknown compiler option 'foo'.".into(),
+        };
+        assert_eq!(format_error(&unlocated), "TS5023 Unknown compiler option 'foo'.");
+    }
+
+    #[test]
+    fn the_note_says_how_many_shows_at_most_max_reported_and_counts_the_rest() {
+        let one = diagnostics_note(&[e("a.ts", 1, "TS2304", "Cannot find name 'x'.")]);
+        assert!(one.contains("found 1 new error after your changes."));
+        assert!(one.contains("\na.ts:1:1 TS2304 Cannot find name 'x'.\n"));
+        let many: Vec<TsError> =
+            (0..MAX_REPORTED as u64 + 3).map(|i| e("a.ts", i + 1, "TS2304", &format!("Cannot find name 'v{i}'."))).collect();
+        let note = diagnostics_note(&many);
+        assert!(note.contains(&format!("found {} new errors", MAX_REPORTED + 3)));
+        assert!(note.contains("'v19'") && !note.contains("'v20'"));
+        assert!(note.contains("\nand 3 more.\n"));
+    }
+
+    #[test]
+    fn missing_interpreters() {
+        assert_eq!(missing_interpreter("env: 'node': No such file or directory\n", Some(127)).as_deref(), Some("node"));
+        assert_eq!(missing_interpreter("env: ‘python3’: No such file or directory", Some(127)).as_deref(), Some("python3"));
+        assert_eq!(missing_interpreter("exec: No such file or directory", Some(127)), None);
+        assert_eq!(missing_interpreter("error TS2304: Cannot find name 'x'.\n", Some(2)), None);
+        assert_eq!(missing_interpreter("env: ‘node’: No such file or directory\n", Some(0)), None);
+        assert_eq!(missing_interpreter("", Some(127)), None);
+        assert_eq!(missing_interpreter("env: ‘node’: permission denied\n", Some(126)), None);
+    }
+
+    #[test]
+    fn detect_checker_needs_a_tsconfig_and_the_projects_own_compiler_tsgo_first() {
+        let dir = crate::checks::Scratch::new();
+        dir.put("node_modules/.bin/tsc", "");
+        assert_eq!(detect_checker(&dir.0), None);
+        dir.put("tsconfig.json", "{}");
+        assert_eq!(detect_checker(&dir.0).as_deref(), Some("node_modules/.bin/tsc"));
+        dir.put("node_modules/.bin/tsgo", "");
+        assert_eq!(detect_checker(&dir.0).as_deref(), Some("node_modules/.bin/tsgo"));
+        std::fs::remove_dir_all(dir.0.join("node_modules")).unwrap();
+        assert_eq!(detect_checker(&dir.0), None);
+        assert_eq!(
+            check_command("node_modules/.bin/tsc"),
+            "node_modules/.bin/tsc --noEmit --pretty false --tsBuildInfoFile /tmp/marv.tsbuildinfo -p tsconfig.json"
+        );
+    }
 }

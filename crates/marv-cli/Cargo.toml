@@ -28,5 +28,8 @@ serde_json.workspace = true
 async-trait.workspace = true
 clap = { version = "4.6", features = ["derive"] }
 
+[dev-dependencies]
+tokio-util.workspace = true
+
 [lints]
 workspace = true

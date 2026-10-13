@@ -29,6 +29,11 @@ sha2 = "0.10"
 regex = "1.11"
 # YAML frontmatter (SKILL.md, agent files) and `.marv/checks/*.yaml`. Marv used `Bun.YAML`.
 serde_norway = "0.9"
+# `.marv/checks` patterns are JavaScript regular expressions (Marv ran them with `RegExp`): an ECMAScript engine,
+# not `regex`'s dialect.
+regress = "0.12"
+# `.marv/checks` globs, with Bun.Glob's semantics (`*` stays in its folder, `**` crosses them, `{a,b}`).
+globset = "0.4"
 # The home folder (`shorten_home`, `home_or_above`, personal skills and agents).
 dirs = "6.0"
 
