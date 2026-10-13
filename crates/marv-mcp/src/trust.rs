@@ -50,9 +50,18 @@ impl McpTrust {
     }
 
     /// Adds `servers`' keys to the project's list (no duplicates), written 0600
-    /// through the private-file writer (Marv's `writePrivate`).
-    pub fn trust(&self, _project_key: &str, _servers: &[McpServerConfig]) -> crate::Result<()> {
-        todo!("port: McpTrust.trust (read, merge keys as a set, marv_fs::write_private 0600 in a 0700 folder)")
+    /// through the private-file writer (Marv's `writePrivate`). A file of the
+    /// wrong shape trusted nothing, so it is replaced.
+    pub async fn trust(&self, project_key: &str, servers: &[McpServerConfig]) -> crate::Result<()> {
+        let mut all = self.read();
+        let keys = all.entry(project_key.to_string()).or_default();
+        for server in servers {
+            if !keys.contains(&server.key) {
+                keys.push(server.key.clone());
+            }
+        }
+        marv_fs::write_private(&self.path, &serde_json::to_string_pretty(&all)?).await?;
+        Ok(())
     }
 }
 
@@ -88,5 +97,33 @@ mod tests {
         assert!(!trust.is_trusted("p", &server(ServerSource::Project, "changed")));
         assert!(trust.is_trusted("x", &server(ServerSource::Personal, "any")));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn trusted_per_project_and_per_exact_config_kept_privately() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = crate::testutil::temp_dir("trust").join("mcp-trust.json");
+        let trust = McpTrust::new(&path);
+        assert!(!trust.is_trusted("p", &server(ServerSource::Project, "k1")));
+        trust.trust("p", &[server(ServerSource::Project, "k1")]).await.unwrap();
+        trust.trust("p", &[server(ServerSource::Project, "k1")]).await.unwrap();
+        assert!(trust.is_trusted("p", &server(ServerSource::Project, "k1")));
+        assert!(!trust.is_trusted("other", &server(ServerSource::Project, "k1"))); // another project
+        assert!(!trust.is_trusted("p", &server(ServerSource::Project, "k2"))); // its config changed
+        assert_eq!(trust.read()["p"], vec!["k1"]); // no duplicates
+        assert!(McpTrust::new(&path).is_trusted("p", &server(ServerSource::Project, "k1")));
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[tokio::test]
+    async fn a_wrong_shape_file_trusts_nothing_and_trusting_replaces_it() {
+        let path = crate::testutil::temp_dir("trust").join("mcp-trust.json");
+        for content in ["null", "[]", "5", "\"x\"", "{\"k\": 5}", "{\"k\": \"abc\"}", "{\"k\": [1, 2]}"] {
+            std::fs::write(&path, content).unwrap();
+            let trust = McpTrust::new(&path);
+            assert!(!trust.is_trusted("p", &server(ServerSource::Project, "abc")), "{content}");
+            trust.trust("p", &[server(ServerSource::Project, "k1")]).await.unwrap();
+            assert!(trust.is_trusted("p", &server(ServerSource::Project, "k1")), "{content}");
+        }
     }
 }

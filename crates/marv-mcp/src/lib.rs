@@ -21,6 +21,7 @@
 //! This crate doesn't depend on `marv-tools`: [`tool::McpTool`] is plain data
 //! plus a call handle, and `marv-session` adapts it to the `Tool` trait.
 
+pub mod client;
 pub mod config;
 pub mod deferred;
 pub mod install;
@@ -28,11 +29,31 @@ pub mod jsonrpc;
 pub mod manager;
 pub mod oauth;
 pub mod oauth_store;
+pub mod ordered;
 pub mod personal_file;
 pub mod tool;
 pub mod trust;
 
 mod text;
+
+#[cfg(test)]
+pub(crate) mod testutil {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A fresh, empty folder under the system temp dir (left for the OS to clean).
+    pub fn temp_dir(tag: &str) -> PathBuf {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "marv-mcp-{tag}-{}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst),
+            marv_fs::random_hex()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+}
 
 /// What MCP code reports. Messages are Marv's own sentences: the model or the
 /// user reads them as they are.
@@ -46,6 +67,10 @@ pub enum McpError {
     LoginNeeded(#[from] oauth::LoginNeeded),
     #[error(transparent)]
     UnusableTokenStore(#[from] oauth_store::UnusableTokenStore),
+    /// A remote server answered 401 and its login couldn't fix it (none stored,
+    /// or the user has to go through the browser).
+    #[error("the server wants a login (HTTP 401)")]
+    Unauthorized,
     /// A server error, a dead connection, a timeout.
     #[error("{0}")]
     Server(String),
