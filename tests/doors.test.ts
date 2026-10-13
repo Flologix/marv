@@ -134,7 +134,7 @@ describe("runTool and a door", () => {
 
 describe("doors are the main agent's", () => {
   test("subagentContext drops doors, whatever the parent has", () => {
-    const sub = subagentContext({ root: project, doors: { host: true, process: true } }, "general-purpose · x");
+    const sub = subagentContext({ root: project, doors: { host: true, process: true, github: true } }, "general-purpose · x");
     expect(sub.doors).toBeUndefined();
   });
 
@@ -146,9 +146,10 @@ describe("doors are the main agent's", () => {
       const session = makeSession(new ScriptedProvider([useTools(call("p", "probe")), say("Done.")]), { tools: [probe("probe")], hostCommands });
       await collect(session.send("go"));
     }
+    // Each door is decided on its own (the github tool's by SessionInit.github, #47).
     expect(seen).toEqual([
-      { host: false, process: sandboxAvailable() },
-      { host: true, process: sandboxAvailable() },
+      { host: false, process: sandboxAvailable(), github: false },
+      { host: true, process: sandboxAvailable(), github: false },
     ]);
   });
 });

@@ -171,10 +171,14 @@ const NETWORK_NOTE =
   "Before drawing conclusions, run it again with network: true.";
 /**
  * Appended to the note above when the failed command is `gh` (issue #27): the GitHub MCP server is the way to use
- * GitHub, and the failure still isn't proof the login is stale, so "gh auth login" stays the wrong advice.
+ * GitHub, and the failure still isn't proof the login is stale, so "gh auth login" stays the wrong advice. Where the
+ * session has the github tool (#47), that's the way instead (GH_TOOL_NOTE).
  */
-const GH_NOTE =
+export const GH_NOTE =
   "For GitHub, don't suggest gh auth login, and never mount gh's config into the sandbox (a token there must not reach command output): suggest the GitHub MCP server instead, which the user connects in ~/.marv/mcp.json — see Marv's README, \"Connect GitHub\".";
+/** GH_NOTE where the session has the github tool: gh with the user's login is one call away. */
+export const GH_TOOL_NOTE =
+  "For GitHub, use the github tool instead: it runs gh with the user's own login, outside the sandbox (in bash gh has no login, and that's on purpose). Don't suggest gh auth login, and never mount gh's config into the sandbox.";
 /** Errors a blocked network produces: DNS, refused or unreachable connections, timeouts. */
 const NETWORK_ERRORS =
   /could not resolve (?:host|hostname|proxy)|temporary failure in name resolution|name or service not known|getaddrinfo|\b(?:ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ECONNRESET|ENETUNREACH|EHOSTUNREACH|ETIMEDOUT|ETIMEOUT)\b|ConnectionRefused|network is unreachable|connection refused|connection timed out|failed to connect|unable to connect|dns error|no such host|error connecting to/i;
@@ -299,7 +303,7 @@ export async function runCommand({ command, root, sandbox, network, timeoutMs, s
 }
 
 /** A stream's text, up to MAX_CAPTURE characters (the rest is read and dropped). */
-async function capture(stream: ReadableStream<Uint8Array>): Promise<string> {
+export async function capture(stream: ReadableStream<Uint8Array>): Promise<string> {
   let text = "";
   const decoder = new TextDecoder();
   for await (const chunk of stream) {
@@ -471,7 +475,7 @@ export const bash: Tool<typeof input> = {
       result.output += `\n${NETWORK_NOTE}${lastResort}\n`;
       // A gh failure usually isn't the network, and the missing network isn't the fix: the MCP server is (#27).
       // gh is a NETWORK_COMMAND, so the note above is already there for it; this adds what to do instead.
-      if (/(?:^|[\s;&|(`])gh(?=$|[\s;&|)`])/.test(command)) result.output += `\n${GH_NOTE}\n`;
+      if (/(?:^|[\s;&|(`])gh(?=$|[\s;&|)`])/.test(command)) result.output += `\n${doors?.github ? GH_TOOL_NOTE : GH_NOTE}\n`;
     }
     return { output: formatOutput(result), summary };
   },

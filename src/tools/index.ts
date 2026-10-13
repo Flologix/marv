@@ -7,6 +7,7 @@ import { agent } from "./agent.ts";
 import { bash } from "./bash.ts";
 import { editFile } from "./edit-file.ts";
 import { projectPath } from "./files.ts";
+import { github } from "./github/github.ts";
 import { glob } from "./glob.ts";
 import { grep } from "./grep.ts";
 import { memory } from "./memory.ts";
@@ -19,7 +20,7 @@ import { webFetch } from "./web-fetch.ts";
 import { writeFile } from "./write-file.ts";
 import { ToolError, type Tool, type ToolContext, type ToolResult } from "./types.ts";
 
-export const tools: Tool[] = [readFile, glob, grep, webFetch, skill, editFile, writeFile, bash, processTool, memory, plan, agent] as Tool[];
+export const tools: Tool[] = [readFile, glob, grep, webFetch, github, skill, editFile, writeFile, bash, processTool, memory, plan, agent] as Tool[];
 
 /** Whether a call may run at the same time as its neighbours (subagents). */
 export const isParallelCall = (call: ToolCall) => tools.some((t) => t.name === call.name && t.parallel);
@@ -38,10 +39,13 @@ export function specOf(tool: Tool): ToolSpec {
 
 /**
  * The specs for a session: the skill tool only when there are skills to load, the plan tool unless the session
- * turned it off (#15), the process tool only where the session has that door (#51). Same objects every time (cache).
+ * turned it off (#15), the process tool only where the session has that door (#51), the github tool only where gh is
+ * there and logged in (#47). Same objects every time (cache).
  */
-export function toolSpecsFor({ hasSkills, plan = true, process = false }: { hasSkills: boolean; plan?: boolean; process?: boolean }): ToolSpec[] {
-  return toolSpecs.filter((spec) => (hasSkills || spec.name !== "skill") && (plan || spec.name !== "plan") && (process || spec.name !== "process"));
+export function toolSpecsFor({ hasSkills, plan = true, process = false, github = false }: { hasSkills: boolean; plan?: boolean; process?: boolean; github?: boolean }): ToolSpec[] {
+  return toolSpecs.filter(
+    (spec) => (hasSkills || spec.name !== "skill") && (plan || spec.name !== "plan") && (process || spec.name !== "process") && (github || spec.name !== "github"),
+  );
 }
 
 /**

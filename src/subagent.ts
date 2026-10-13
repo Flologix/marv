@@ -124,11 +124,15 @@ export async function runSubagent(input: SubagentInput, ctx: ToolContext): Promi
   // worktree is finished (its changes committed, its folder removed) however
   // the subagent ends: a reply, an error, ctrl+c, a "no", or a throw.
   try {
-    // Only subagent tools (never agent or memory, whatever the type lists),
-    // and skill only when there are skills to load.
+    // Only subagent tools (never agent or memory, whatever the type lists), skill only when there are skills to
+    // load, and github only where the session offers it (its main agent has the door; the subagent only reads).
     const hasSkills = (ctx.skills?.length ?? 0) > 0;
     const available = tools.filter(
-      (t) => SUBAGENT_TOOLS.includes(t.name) && type.tools.includes(t.name) && (t.name !== "skill" || hasSkills),
+      (t) =>
+        SUBAGENT_TOOLS.includes(t.name) &&
+        type.tools.includes(t.name) &&
+        (t.name !== "skill" || hasSkills) &&
+        (t.name !== "github" || Boolean(ctx.doors?.github)),
     );
     const names = available.map((t) => t.name);
     const subCtx = subagentContext(ctx, who, worktree);

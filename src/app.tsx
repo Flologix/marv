@@ -180,6 +180,8 @@ interface Props {
   worktreesDir?: string;
   /** Running in a Herdr pane: Marv reports its state there (src/herdr.ts). */
   herdr?: HerdrReporter;
+  /** gh is there and logged in (checked once at startup): the session offers the github tool (#47). */
+  github?: boolean;
 }
 
 // "model" is the /model picker: the setup screen, starting at the model step.
@@ -216,6 +218,7 @@ export function App({
   instructionsCut,
   worktreesDir,
   herdr,
+  github = false,
 }: Props) {
   const { exit } = useApp();
   const { columns, rows } = useWindowSize();
@@ -394,6 +397,7 @@ export function App({
         sandbox: config.sandbox,
         // The user approves each command at this terminal: bash may ask to run one on the host (#52).
         hostCommands: true,
+        github,
         yolo: config.yolo,
         diagnostics: config.diagnostics,
         checks: config.checks,

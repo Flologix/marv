@@ -165,6 +165,12 @@ export interface SessionInit {
   processes?: boolean;
   /** The background processes' manager (tests pass one with a fake home); default: one made on the first start. */
   processManager?: ProcessManager;
+  /**
+   * Offer the github tool (#47): gh with the user's login, outside the sandbox (reads run, writes ask). The caller
+   * checks once that gh is there and logged in (githubAvailable) before the session exists, since the tool list is
+   * fixed for the session (the prompt cache). Default false. Subagents get it for reads only.
+   */
+  github?: boolean;
   yolo?: boolean;
   /**
    * Yolo isn't allowed here, and why (the SDK sets it when the project is the home folder or above it, where yolo's
@@ -233,10 +239,12 @@ const stepLimitRequest = (steps: number, every: number): ApprovalRequest => ({
  * built-in; `mcp__` names are where MCP servers' tools go, and tool_search and mcp_call are how a deferred
  * conversation reaches them (#14). Checked before anything starts.
  */
-function checkToolNames(custom: Tool[]): void {
+function checkToolNames(custom: Tool[], github: boolean): void {
   const seen = new Set<string>();
   for (const { name } of custom) {
-    if (builtinTools.some((t) => t.name === name) || DEFERRED_NAMES.includes(name)) {
+    // The github tool is only built in where the session offers it (#47): elsewhere the name is free.
+    const builtin = builtinTools.some((t) => t.name === name && (github || name !== "github"));
+    if (builtin || DEFERRED_NAMES.includes(name)) {
       throw new Error(`A tool named "${name}" is already built in: give yours another name.`);
     }
     if (name.startsWith("mcp__")) throw new Error(`Tool names starting with "mcp__" are for MCP servers' tools.`);
@@ -329,7 +337,7 @@ export class MarvSession implements Session {
   private midTurnCompactFailed = false;
   /** The main agent's doors out of the sandbox: fixed for the session, since the prompt names them (cache). */
   private get doors(): Doors {
-    return { host: Boolean(this.init.hostCommands), process: this.processOn };
+    return { host: Boolean(this.init.hostCommands), process: this.processOn, github: Boolean(this.init.github) };
   }
   /** "Yes, don't ask again" scopes, shared by the main agent and its subagents. */
   private readonly always = new Set<string>();
@@ -390,7 +398,7 @@ export class MarvSession implements Session {
   private manager: ProcessManager | null = null;
 
   constructor(private readonly init: SessionInit) {
-    checkToolNames(init.tools ?? []);
+    checkToolNames(init.tools ?? [], Boolean(init.github));
     if (init.noYolo && (init.yolo ?? true)) throw new Error(init.noYolo);
     if (init.maxSteps !== undefined && !(Number.isInteger(init.maxSteps) && init.maxSteps >= 0)) {
       throw new Error(`maxSteps must be a whole number of at least 0 (0 never asks), not ${init.maxSteps}`);
@@ -418,7 +426,7 @@ export class MarvSession implements Session {
     this.manager = init.processManager ?? null;
     // Built once, so every request sends byte-identical tool definitions (the skill tool only when there are skills,
     // the plan tool unless it's off).
-    this.specs = [...toolSpecsFor({ hasSkills: (init.skills?.length ?? 0) > 0, plan: this.planOn, process: this.processOn }), ...(init.tools ?? []).map(specOf)];
+    this.specs = [...toolSpecsFor({ hasSkills: (init.skills?.length ?? 0) > 0, plan: this.planOn, process: this.processOn, github: Boolean(init.github) }), ...(init.tools ?? []).map(specOf)];
     this.system = this.buildSystem();
     this.saved = newSession(init.root, { provider: this.factory.id, model: this.factory.model });
     this.lookup();
@@ -721,7 +729,7 @@ export class MarvSession implements Session {
    */
   private offered(): { specs: ToolSpec[]; tools: Tool[] } {
     const mcp = this.init.mcp;
-    const builtin = builtinTools.filter((t) => (this.planOn || t.name !== "plan") && (this.processOn || t.name !== "process"));
+    const builtin = builtinTools.filter((t) => (this.planOn || t.name !== "plan") && (this.processOn || t.name !== "process") && (this.init.github || t.name !== "github"));
     const tools = [...builtin, ...(this.init.tools ?? [])];
     if (!mcp) return { specs: this.specs, tools };
     // Deferred: two constant specs instead of the servers', whatever the servers do (prompt cache).
