@@ -9,18 +9,21 @@
 //! - Folders are created as needed. Read and written as one step per file (`with_file_lock`), so a parallel append or
 //!   edit can't be lost.
 //! - Like `edit_file`: preview starts `before_change`, run awaits it (Esc meanwhile writes nothing), `.git` re-checked
-//!   at apply time when confined, syntax note after the change, protected paths ask even in yolo (marv-rs), formatter
-//!   after the write planned (#67).
+//!   at apply time when confined, syntax note after the change, protected paths ask even in yolo (marv-rs), and so
+//!   does a `package.json` write that changes a lifecycle script (the content rule); formatter after the write
+//!   planned (#67).
 
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::diff::{Diff, added_lines, diff_text};
-use crate::edit_file::{protected_target, start_before_change};
+use crate::diff::{Diff, added_lines, change_summary, diff_text, shown_diff};
+use crate::edit_file::{INTERRUPTED_BEFORE_WRITE, await_before_change, package_json, protected_target, start_before_change};
 use crate::edit_match::{line_ending, with_line_ending};
+use crate::file_lock::with_file_lock;
 use crate::files::{is_directory, project_path, refuse_git, require_regular_file, resolve_in_project, touches_git};
 use crate::repair::repair_path_field;
+use crate::syntax::{broken_by, syntax_note};
 use crate::types::{Preview, Repaired, Scope, Tool, ToolContext, ToolError, ToolOutput};
 
 #[derive(Debug, Deserialize)]
@@ -126,8 +129,14 @@ impl Tool for WriteFile {
         !touches_git(ctx, &input.path)
     }
     fn protected_target(&self, input: &WriteFileInput, ctx: &ToolContext) -> Option<marv_sandbox::ProtectedRule> {
-        protected_target(&input.path, ctx)
-        // TODO(port): package.json → marv_sandbox::protected::lifecycle_scripts_changed(before, after) (content rule).
+        protected_target(&input.path, ctx).or_else(|| {
+            // The content rule: a write to package.json that adds, removes or changes a lifecycle script.
+            let absolute = package_json(&input.path, ctx)?;
+            let before = std::fs::read_to_string(&absolute).ok();
+            let (_, after, _, _) = plan_text(before.as_deref(), &input.content, input.append.unwrap_or(false));
+            marv_sandbox::protected::lifecycle_scripts_changed(before.as_deref(), &after)
+                .then_some(marv_sandbox::ProtectedRule::PackageScripts)
+        })
     }
     fn repair(&self, raw: &Value, ctx: &ToolContext) -> Option<Repaired> {
         repair_path_field(raw, &ctx.root)
@@ -145,17 +154,639 @@ impl Tool for WriteFile {
         Ok(Preview { title: format!("{verb} {}", plan.shown), diff: Some(plan.diff.lines), ..Default::default() })
     }
 
-    async fn run(&self, _input: &WriteFileInput, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
-        todo!(
-            "port: await before_change; aborted → nothing written; with_file_lock(plan, mkdir -p, write); broken_by note; \
-             'Created <shown> (N lines).' / 'Wrote|Appended to <shown> (+a −r lines[; added a newline…][; kept its CRLF…]).'"
-        )
+    async fn run(&self, input: &WriteFileInput, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        if await_before_change(ctx).await {
+            return Ok(ToolOutput::ok(INTERRUPTED_BEFORE_WRITE, "interrupted"));
+        }
+        // Read and written as one step per file, so a parallel append (or edit) can't be lost.
+        let Plan { shown, before, body, after, diff, new_line_missing, crlf, .. } =
+            with_file_lock(&ctx.root, &input.path, || async {
+                let planned = plan(input, ctx).await?;
+                let failed = |e: std::io::Error| ToolError(format!("Couldn't write {}: {e}", planned.shown));
+                if let Some(dir) = planned.absolute.parent() {
+                    tokio::fs::create_dir_all(dir).await.map_err(failed)?;
+                }
+                tokio::fs::write(&planned.absolute, &planned.after).await.map_err(failed)?;
+                Ok::<_, ToolError>(planned)
+            })
+            .await?;
+        let note = match broken_by(&shown, before.as_deref(), &after).await {
+            Some(problem) => format!("\n\n{}", syntax_note(&shown, &problem, &after, before.is_some())),
+            None => String::new(),
+        };
+        let mut result = if before.is_none() {
+            let n = line_count(&body);
+            let mut result = ToolOutput::ok(
+                format!("Created {shown} ({n} lines).{note}"),
+                format!("created · {n} line{}", if n == 1 { "" } else { "s" }),
+            );
+            result.diff = Some(shown_diff(&added_lines(&body)));
+            result
+        } else {
+            let what = if input.append.unwrap_or(false) { "Appended to" } else { "Wrote" };
+            let nl = if new_line_missing { "; added a newline to its last line first" } else { "" };
+            let crlf_note = if crlf { "; kept its CRLF line endings" } else { "" };
+            let summary = change_summary(&diff);
+            let mut result = ToolOutput::ok(format!("{what} {shown} ({summary} lines{nl}{crlf_note}).{note}"), summary);
+            result.diff = Some(shown_diff(&diff.lines));
+            result
+        };
+        result.changed = Some(shown);
+        Ok(result)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::{ToolOutcome, builtin_tools, run_tool};
+    use crate::test_support::{TempDir, mkfifo};
+    use crate::types::{Approval, ApprovalRequest, Approver, BeforeChange, Decision, DiffKind, DiffLine};
+    use marv_core::ToolCall;
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::Notify;
+    use tokio_util::sync::CancellationToken;
+
+    /// Answers every request the same way and remembers what it was asked; `abort` stops the run as it answers (Esc).
+    struct Asker {
+        answer: Decision,
+        abort: Option<CancellationToken>,
+        asked: Mutex<Vec<ApprovalRequest>>,
+    }
+    #[async_trait]
+    impl Approver for Asker {
+        async fn approve(&self, request: ApprovalRequest) -> Decision {
+            self.asked.lock().unwrap().push(request);
+            if let Some(cancel) = &self.abort {
+                cancel.cancel();
+            }
+            self.answer
+        }
+    }
+
+    /// The project Marv's `tests/write-tools.test.ts` starts from, with an approver.
+    struct Fixture {
+        root: TempDir,
+        asker: Arc<Asker>,
+        ctx: ToolContext,
+    }
+    impl Fixture {
+        fn new(tag: &str) -> Self {
+            Self::answering(tag, Decision::Yes)
+        }
+        fn answering(tag: &str, answer: Decision) -> Self {
+            let root = TempDir::new(tag);
+            root.write("greet.ts", "export function greet(name: string) {\n  return `Hello, ${name}!`;\n}\n");
+            root.write("twice.ts", "x = 1;\nx = 1;\n");
+            let asker = Arc::new(Asker { answer, abort: None, asked: Mutex::new(Vec::new()) });
+            let mut ctx = ToolContext::new(root.path());
+            ctx.sandbox = Arc::new(marv_sandbox::Sandbox::from_env(false));
+            ctx.approver = Some(asker.clone());
+            Self { root, asker, ctx }
+        }
+        async fn run(&self, name: &str, args: Value) -> ToolOutcome {
+            run_with(&self.ctx, name, args).await
+        }
+        fn read(&self, path: &str) -> String {
+            std::fs::read_to_string(self.root.path().join(path)).unwrap()
+        }
+        fn exists(&self, path: &str) -> bool {
+            self.root.path().join(path).exists()
+        }
+        fn asked(&self) -> Vec<ApprovalRequest> {
+            self.asker.asked.lock().unwrap().clone()
+        }
+    }
+    async fn run_with(ctx: &ToolContext, name: &str, args: Value) -> ToolOutcome {
+        let call = ToolCall { id: "c".into(), name: name.into(), arguments: args.to_string() };
+        run_tool(&call, ctx, builtin_tools()).await
+    }
+    fn add(text: &str, n: usize) -> DiffLine {
+        DiffLine { kind: DiffKind::Add, text: text.into(), old_line: None, new_line: Some(n) }
+    }
+    fn del(text: &str, n: usize) -> DiffLine {
+        DiffLine { kind: DiffKind::Del, text: text.into(), old_line: Some(n), new_line: None }
+    }
+    fn ctx_line(text: &str, old: usize, new: usize) -> DiffLine {
+        DiffLine { kind: DiffKind::Ctx, text: text.into(), old_line: Some(old), new_line: Some(new) }
+    }
+
+    // edit_file
+
+    #[tokio::test]
+    async fn edit_replaces_exactly_one_match_after_showing_the_diff_for_approval() {
+        let f = Fixture::new("w-edit");
+        let out = f.run("edit_file", json!({"path": "greet.ts", "old_string": "Hello", "new_string": "Hi"})).await.result;
+        assert!(!out.is_error, "{}", out.output);
+        assert!(f.read("greet.ts").contains("`Hi, ${name}!`"));
+        assert_eq!(out.summary, "+1 −1");
+        assert_eq!(out.output, "Edited greet.ts: replaced 1 occurrence (+1 −1 lines).");
+        assert_eq!(out.changed.as_deref(), Some("greet.ts"));
+        let asked = f.asked();
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0].preview.title, "Edit greet.ts");
+        let diff = asked[0].preview.diff.clone().unwrap();
+        assert!(diff.contains(&del("  return `Hello, ${name}!`;", 2)));
+        assert!(diff.contains(&add("  return `Hi, ${name}!`;", 2)));
+    }
+
+    #[tokio::test]
+    async fn edit_doesnt_ask_when_the_text_isnt_there_and_says_how_to_fix_it() {
+        let f = Fixture::new("w-edit-missing");
+        let out = f.run("edit_file", json!({"path": "greet.ts", "old_string": "Goodbye", "new_string": "x"})).await.result;
+        assert!(out.is_error);
+        assert!(out.output.contains("not found") && out.output.contains("read_file"));
+        assert!(f.asked().is_empty());
+    }
+
+    #[tokio::test]
+    async fn edit_refuses_an_ambiguous_match_unless_replace_all_is_set() {
+        let f = Fixture::new("w-edit-ambiguous");
+        let out = f.run("edit_file", json!({"path": "twice.ts", "old_string": "x = 1;", "new_string": "x = 2;"})).await.result;
+        assert!(out.is_error && out.output.contains("2 times"));
+        assert!(f.asked().is_empty());
+        let all = f
+            .run("edit_file", json!({"path": "twice.ts", "old_string": "x = 1;", "new_string": "x = 2;", "replace_all": true}))
+            .await
+            .result;
+        assert!(!all.is_error);
+        assert!(all.output.starts_with("Edited twice.ts: replaced 2 occurrences"));
+        assert_eq!(f.read("twice.ts"), "x = 2;\nx = 2;\n");
+    }
+
+    #[tokio::test]
+    async fn a_declined_edit_changes_nothing() {
+        let f = Fixture::answering("w-edit-declined", Decision::No);
+        let out = f.run("edit_file", json!({"path": "greet.ts", "old_string": "Hello", "new_string": "Hi"})).await.result;
+        assert!(out.declined);
+        assert_eq!(out.summary, "declined");
+        assert!(f.read("greet.ts").contains("Hello"));
+    }
+
+    #[tokio::test]
+    async fn an_old_string_with_the_wrong_indentation_still_applies_reindented_and_says_so() {
+        let f = Fixture::new("w-edit-indent");
+        f.root.write("tabs.js", "function f() {\n\tif (x) {\n\t\treturn 1;\n\t}\n}\n");
+        let out = f
+            .run(
+                "edit_file",
+                json!({"path": "tabs.js", "old_string": "    if (x) {\n        return 1;\n    }", "new_string": "    if (x) {\n        return 2;\n    }"}),
+            )
+            .await
+            .result;
+        assert!(!out.is_error);
+        assert_eq!(f.read("tabs.js"), "function f() {\n\tif (x) {\n\t\treturn 2;\n\t}\n}\n");
+        assert!(out.output.contains("indentation"));
+        assert!(f.asked()[0].preview.diff.clone().unwrap().contains(&add("\t\treturn 2;", 3)));
+    }
+
+    #[tokio::test]
+    async fn an_old_string_with_curly_quotes_applies_and_says_so() {
+        // Marv #60.
+        let f = Fixture::new("w-edit-unicode");
+        f.root.write("q.js", "const a = \"x\";\n");
+        let out = f
+            .run("edit_file", json!({"path": "q.js", "old_string": "a = \u{201C}x\u{201D}", "new_string": "a = \"y\""}))
+            .await
+            .result;
+        assert!(!out.is_error, "{}", out.output);
+        assert_eq!(f.read("q.js"), "const a = \"y\";\n");
+        assert!(out.output.contains("typographic characters"));
+    }
+
+    #[tokio::test]
+    async fn when_nothing_matches_the_error_shows_the_closest_lines_as_they_are_now() {
+        let f = Fixture::new("w-edit-closest");
+        let out = f
+            .run("edit_file", json!({"path": "greet.ts", "old_string": "  return `Hi, ${name}!!`;", "new_string": "x"}))
+            .await
+            .result;
+        assert!(out.is_error);
+        assert!(out.output.contains("closest"));
+        assert!(out.output.contains("    2→  return `Hello, ${name}!`;"));
+    }
+
+    #[tokio::test]
+    async fn a_crlf_file_keeps_its_line_endings_from_edit_file_and_write_file() {
+        let f = Fixture::new("w-crlf");
+        f.root.write("win.js", "a();\r\nb();\r\n");
+        f.run("edit_file", json!({"path": "win.js", "old_string": "a();", "new_string": "a();\nc();"})).await;
+        assert_eq!(f.read("win.js"), "a();\r\nc();\r\nb();\r\n");
+        let written = f.run("write_file", json!({"path": "win.js", "content": "x();\ny();\n"})).await.result;
+        assert_eq!(f.read("win.js"), "x();\r\ny();\r\n");
+        assert!(written.output.contains("CRLF"));
+    }
+
+    #[tokio::test]
+    async fn all_file_changes_share_one_dont_ask_again_scope() {
+        let f = Fixture::new("w-scope");
+        f.run("edit_file", json!({"path": "greet.ts", "old_string": "Hello", "new_string": "Hi"})).await;
+        f.run("write_file", json!({"path": "new.ts", "content": "x"})).await;
+        assert_eq!(f.asked().iter().map(|r| r.scope.key.as_str()).collect::<Vec<_>>(), ["files", "files"]);
+    }
+
+    #[tokio::test]
+    async fn edit_file_refuses_a_fifo() {
+        let f = Fixture::new("w-fifo");
+        mkfifo(&f.root.path().join("pipe"));
+        let out = f.run("edit_file", json!({"path": "pipe", "old_string": "a", "new_string": "b"})).await.result;
+        assert!(out.is_error && out.output.contains("not a regular file"));
+    }
+
+    #[tokio::test]
+    async fn a_home_path_outside_the_project_is_refused_and_creates_nothing() {
+        // #22: `~/` is the home folder, not a folder named `~`.
+        let f = Fixture::new("w-home");
+        for (name, args) in [
+            ("edit_file", json!({"path": "~/x.txt", "old_string": "a", "new_string": "b"})),
+            ("write_file", json!({"path": "~/x.txt", "content": "hi\n"})),
+        ] {
+            let out = f.run(name, args).await.result;
+            assert!(out.is_error && out.output.contains("outside the project"), "{name}: {}", out.output);
+            assert!(!out.output.contains("write_file"));
+            assert!(!f.exists("~"));
+        }
+    }
+
+    // write_file
+
+    #[tokio::test]
+    async fn write_creates_a_new_file_and_its_folders() {
+        let f = Fixture::new("w-create");
+        let out = f.run("write_file", json!({"path": "src/deep/new.ts", "content": "export const a = 1;\n"})).await.result;
+        assert!(!out.is_error, "{}", out.output);
+        assert_eq!(f.read("src/deep/new.ts"), "export const a = 1;\n");
+        assert_eq!(out.summary, "created · 1 line");
+        assert_eq!(out.output, "Created src/deep/new.ts (1 lines).");
+        assert_eq!(f.asked()[0].preview.title, "Create src/deep/new.ts");
+    }
+
+    #[tokio::test]
+    async fn a_new_files_preview_carries_all_its_lines_and_no_note() {
+        let f = Fixture::new("w-preview");
+        let content: String = (1..=100).map(|i| format!("l{i}\n")).collect();
+        f.run("write_file", json!({"path": "big.ts", "content": content})).await;
+        let preview = f.asked()[0].preview.clone();
+        let diff = preview.diff.unwrap();
+        assert_eq!(diff.len(), 100);
+        assert_eq!(diff.last(), Some(&add("l100", 100)));
+        assert_eq!(preview.note, None);
+    }
+
+    #[tokio::test]
+    async fn an_absolute_path_inside_the_project_is_shown_relative_to_it() {
+        let f = Fixture::new("w-abs");
+        let out = f.run("write_file", json!({"path": f.root.path().join("abs.ts"), "content": "x"})).await;
+        assert_eq!(out.label, "abs.ts");
+        assert_eq!(f.asked()[0].label, "abs.ts");
+    }
+
+    #[tokio::test]
+    async fn overwriting_shows_what_changes() {
+        let f = Fixture::new("w-overwrite");
+        let out = f.run("write_file", json!({"path": "greet.ts", "content": "export const greet = () => 'hi';\n"})).await.result;
+        assert!(out.output.starts_with("Wrote greet.ts ("));
+        assert_eq!(f.asked()[0].preview.title, "Overwrite greet.ts");
+        assert!(f.asked()[0].preview.diff.clone().unwrap().iter().any(|l| l.kind == DiffKind::Del));
+    }
+
+    #[tokio::test]
+    async fn parallel_appends_to_one_file_all_land() {
+        // Review, #42: each read-change-write waits for the last.
+        let f = Fixture::new("w-parallel");
+        f.root.write("log.txt", "start\n");
+        let runs =
+            (0..12).map(|i| f.run("write_file", json!({"path": "log.txt", "content": format!("line {i}\n"), "append": true})));
+        futures::future::join_all(runs).await;
+        let text = f.read("log.txt");
+        for i in 0..12 {
+            assert!(text.contains(&format!("line {i}\n")));
+        }
+        assert_eq!(text.lines().count(), 13);
+    }
+
+    #[tokio::test]
+    async fn an_append_and_an_edit_on_one_file_at_the_same_time_both_land() {
+        let f = Fixture::new("w-mix");
+        f.root.write("mix.txt", "alpha\n");
+        tokio::join!(
+            f.run("edit_file", json!({"path": "mix.txt", "old_string": "alpha", "new_string": "ALPHA"})),
+            f.run("write_file", json!({"path": "mix.txt", "content": "omega\n", "append": true})),
+        );
+        assert_eq!(f.read("mix.txt"), "ALPHA\nomega\n");
+    }
+
+    #[tokio::test]
+    async fn append_adds_at_the_end_instead_of_replacing() {
+        let f = Fixture::new("w-append");
+        f.root.write("log.txt", "first\n");
+        let out = f.run("write_file", json!({"path": "log.txt", "content": "second\n", "append": true})).await.result;
+        assert!(!out.is_error);
+        assert_eq!(f.read("log.txt"), "first\nsecond\n");
+        assert_eq!(out.output, "Appended to log.txt (+1 −0 lines).");
+        assert_eq!(out.summary, "+1 −0");
+        let asked = f.asked();
+        assert_eq!(asked[0].preview.title, "Append log.txt");
+        assert_eq!(asked[0].preview.diff, Some(vec![ctx_line("first", 1, 1), add("second", 2)]));
+    }
+
+    #[tokio::test]
+    async fn an_append_to_a_last_line_without_a_newline_adds_one_first_and_says_so() {
+        let f = Fixture::new("w-no-eol");
+        f.root.write("no-eol.txt", "no newline yet");
+        let out = f.run("write_file", json!({"path": "no-eol.txt", "content": "more\n", "append": true})).await.result;
+        assert!(!out.is_error);
+        assert_eq!(f.read("no-eol.txt"), "no newline yet\nmore\n");
+        assert!(out.output.contains("added a newline to its last line"));
+    }
+
+    #[tokio::test]
+    async fn an_append_to_a_missing_file_just_creates_it() {
+        let f = Fixture::new("w-append-new");
+        let out = f.run("write_file", json!({"path": "new.txt", "content": "x\n", "append": true})).await.result;
+        assert!(!out.is_error);
+        assert_eq!(f.read("new.txt"), "x\n");
+        assert_eq!(f.asked()[0].preview.title, "Create new.txt");
+        assert!(out.output.contains("Created new.txt (1 lines)"));
+    }
+
+    #[tokio::test]
+    async fn an_append_to_a_crlf_file_keeps_crlf_including_the_added_newline() {
+        let f = Fixture::new("w-append-crlf");
+        f.root.write("win.txt", "a\r\n");
+        let out = f.run("write_file", json!({"path": "win.txt", "content": "b\n", "append": true})).await.result;
+        assert_eq!(f.read("win.txt"), "a\r\nb\r\n");
+        assert!(out.output.contains("CRLF"));
+        f.root.write("win2.txt", "a\r\nb");
+        f.run("write_file", json!({"path": "win2.txt", "content": "c\n", "append": true})).await;
+        assert_eq!(f.read("win2.txt"), "a\r\nb\r\nc\r\n");
+    }
+
+    #[tokio::test]
+    async fn refuses_paths_outside_the_project_and_symlinked_folders_out_of_it() {
+        let f = Fixture::new("w-escape");
+        for path in ["../escape.ts", "/tmp/escape.ts"] {
+            let out = f.run("write_file", json!({"path": path, "content": "x"})).await.result;
+            assert!(out.is_error && out.output.contains("outside the project"), "{path}");
+        }
+        assert!(f.asked().is_empty());
+        let outside = TempDir::new("w-outside");
+        std::os::unix::fs::symlink(outside.path(), f.root.path().join("linked")).unwrap();
+        let out = f.run("write_file", json!({"path": "linked/escape.ts", "content": "x"})).await.result;
+        assert!(out.is_error && out.output.contains("outside the project"));
+        assert!(!outside.path().join("escape.ts").exists());
+    }
+
+    #[tokio::test]
+    async fn a_folder_in_the_way_is_reported_not_overwritten() {
+        let f = Fixture::new("w-dir");
+        std::fs::create_dir(f.root.path().join("dir")).unwrap();
+        let out = f.run("write_file", json!({"path": "dir", "content": "x"})).await.result;
+        assert!(out.is_error && out.output.contains("is a directory"));
+    }
+
+    // A change that breaks the file's syntax
+
+    #[tokio::test]
+    async fn edit_file_applies_a_breaking_change_and_says_so_with_the_line() {
+        let f = Fixture::new("w-syntax-edit");
+        f.root.write("a.js", "export const a = 1;\nexport const b = 2;\n");
+        let out =
+            f.run("edit_file", json!({"path": "a.js", "old_string": "const b = 2;", "new_string": "const b = ;"})).await.result;
+        assert!(!out.is_error);
+        assert!(f.read("a.js").contains("const b = ;"));
+        assert!(out.output.contains("doesn't parse any more after this change"), "{}", out.output);
+        assert!(out.output.contains("    2→export const b = ;"));
+    }
+
+    #[tokio::test]
+    async fn write_file_says_so_for_a_new_file_and_an_append() {
+        let f = Fixture::new("w-syntax-write");
+        let out =
+            f.run("write_file", json!({"path": "b.ts", "content": "export function f(x: number) {\n  return x +;\n}\n"})).await;
+        assert!(out.result.output.contains("b.ts doesn't parse"));
+        let appended = f.run("write_file", json!({"path": "c.ts", "content": "broken(\n", "append": true})).await;
+        assert!(appended.result.output.contains("c.ts doesn't parse"));
+    }
+
+    #[tokio::test]
+    async fn a_file_that_was_already_broken_isnt_blamed_and_a_fine_change_says_nothing() {
+        let f = Fixture::new("w-syntax-broken");
+        f.root.write("c.js", "const a = ;\nconst b = 1;\n");
+        let out = f.run("edit_file", json!({"path": "c.js", "old_string": "const b = 1;", "new_string": "const b = 2;"})).await;
+        assert!(!out.result.output.contains("parse"));
+        let fine = f.run("edit_file", json!({"path": "greet.ts", "old_string": "Hello", "new_string": "Hi"})).await;
+        assert!(!fine.result.output.contains("parse"));
+    }
+
+    // Approval
+
+    #[tokio::test]
+    async fn read_only_tools_never_ask() {
+        let f = Fixture::new("w-read");
+        f.run("read_file", json!({"path": "greet.ts"})).await;
+        f.run("grep", json!({"pattern": "greet"})).await;
+        assert!(f.asked().is_empty());
+    }
+
+    #[tokio::test]
+    async fn bash_asks_shows_the_command_and_scopes_dont_ask_again_to_that_exact_command() {
+        let f = Fixture::new("w-bash");
+        let out = f.run("bash", json!({"command": "echo hi"})).await.result;
+        assert!(out.output.contains("hi"));
+        let asked = f.asked();
+        assert_eq!(asked[0].preview.command.as_deref(), Some("echo hi"));
+        assert_eq!(asked[0].scope, Scope { key: "bash:echo hi".into(), description: "this exact command".into() });
+    }
+
+    #[tokio::test]
+    async fn esc_at_an_approval_is_an_interrupt_not_the_users_no() {
+        let f = Fixture::new("w-esc");
+        let cancel = CancellationToken::new();
+        let asker = Arc::new(Asker { answer: Decision::No, abort: Some(cancel.clone()), asked: Mutex::new(Vec::new()) });
+        let ctx = ToolContext { cancel, approver: Some(asker), ..f.ctx.clone() };
+        let out = run_with(&ctx, "write_file", json!({"path": "x.ts", "content": "x"})).await.result;
+        assert!(out.output.contains("Interrupted"));
+        assert_eq!(out.summary, "interrupted");
+        assert!(out.declined);
+        assert_eq!(out.approval, Some(Approval::Interrupted));
+        assert!(!f.exists("x.ts"));
+    }
+
+    #[tokio::test]
+    async fn stopped_while_the_preview_was_made_interrupted_never_asked() {
+        let f = Fixture::new("w-stopped");
+        let ctx = f.ctx.clone();
+        ctx.cancel.cancel();
+        let out = run_with(&ctx, "write_file", json!({"path": "x.ts", "content": "x"})).await.result;
+        assert_eq!(out.summary, "interrupted");
+        assert_eq!(out.approval, Some(Approval::Interrupted));
+        assert!(f.asked().is_empty());
+    }
+
+    #[tokio::test]
+    async fn without_an_approver_changes_are_refused() {
+        let f = Fixture::new("w-no-approver");
+        let ctx = ToolContext { approver: None, ..f.ctx.clone() };
+        let out = run_with(&ctx, "write_file", json!({"path": "x.ts", "content": "x"})).await.result;
+        assert!(out.is_error);
+        assert!(!f.exists("x.ts"));
+    }
+
+    // The diff a change carries (for the transcript)
+
+    #[tokio::test]
+    async fn the_diff_a_change_carries() {
+        let f = Fixture::new("w-diff");
+        f.root.write("a.txt", "one\ntwo\nthree\n");
+        let edit = f.run("edit_file", json!({"path": "a.txt", "old_string": "two", "new_string": "TWO"})).await.result;
+        assert_eq!(
+            edit.diff,
+            Some(crate::DiffShown {
+                lines: vec![ctx_line("one", 1, 1), del("two", 2), add("TWO", 2), ctx_line("three", 3, 3)],
+                more: 0
+            })
+        );
+        // A new file is its lines as additions, capped.
+        let content: String = (1..=450).map(|i| format!("l{i}\n")).collect();
+        let big = f.run("write_file", json!({"path": "big.txt", "content": content})).await.result.diff.unwrap();
+        assert_eq!(big.lines[0], add("l1", 1));
+        assert_eq!((big.lines.len(), big.more), (400, 50));
+        // Overwriting shows what changed; an append carries what was added.
+        f.root.write("b.txt", "old\n");
+        let over = f.run("write_file", json!({"path": "b.txt", "content": "new\n"})).await.result.diff.unwrap();
+        assert_eq!(over.lines, vec![del("old", 1), add("new", 1)]);
+        f.root.write("c.txt", "old\n");
+        let appended =
+            f.run("write_file", json!({"path": "c.txt", "content": "new\n", "append": true})).await.result.diff.unwrap();
+        assert_eq!(appended.lines, vec![ctx_line("old", 1, 1), add("new", 2)]);
+    }
+
+    // before_change
+
+    /// A baseline that counts its starts and finishes when released (or, like the real one, on abort).
+    struct Baseline {
+        started: Mutex<usize>,
+        in_run: Notify,
+        release: Notify,
+    }
+    #[async_trait]
+    impl BeforeChange for Baseline {
+        async fn before_change(&self) {
+            let n = {
+                let mut started = self.started.lock().unwrap();
+                *started += 1;
+                *started
+            };
+            if n == 2 {
+                self.in_run.notify_one();
+            }
+            self.release.notified().await;
+        }
+    }
+
+    /// Records how many baselines had started when the user answered. It yields first, as a person takes a moment:
+    /// the preview spawns the baseline, which starts once the runtime gets to it (Marv's started synchronously).
+    struct CountingAsker(Arc<Baseline>, Mutex<Vec<usize>>);
+    #[async_trait]
+    impl Approver for CountingAsker {
+        async fn approve(&self, _request: ApprovalRequest) -> Decision {
+            tokio::task::yield_now().await;
+            self.1.lock().unwrap().push(*self.0.started.lock().unwrap());
+            Decision::Yes
+        }
+    }
+
+    const BEFORE_CHANGE_CASES: [(&str, &str); 2] = [
+        ("edit_file", r#"{"path": "greet.ts", "old_string": "Hello", "new_string": "Hi"}"#),
+        ("write_file", r#"{"path": "new.ts", "content": "export {};\n"}"#),
+    ];
+
+    #[tokio::test]
+    async fn the_preview_starts_before_change_and_the_file_is_written_only_once_it_is_done() {
+        for (name, args) in BEFORE_CHANGE_CASES {
+            let f = Fixture::new("w-baseline");
+            let baseline = Arc::new(Baseline { started: Mutex::new(0), in_run: Notify::new(), release: Notify::new() });
+            let asker = Arc::new(CountingAsker(baseline.clone(), Mutex::new(Vec::new())));
+            let ctx = ToolContext { approver: Some(asker.clone()), before_change: Some(baseline.clone()), ..f.ctx.clone() };
+            let pending = tokio::spawn({
+                let ctx = ctx.clone();
+                let args: Value = serde_json::from_str(args).unwrap();
+                async move { run_with(&ctx, name, args).await }
+            });
+            // The second start is run() reaching its await.
+            baseline.in_run.notified().await;
+            assert_eq!(*baseline.started.lock().unwrap(), 2);
+            assert_eq!(*asker.1.lock().unwrap(), [1]);
+            // Approved, but still waiting for the baseline: nothing written yet.
+            if name == "edit_file" {
+                assert!(f.read("greet.ts").contains("Hello"));
+            } else {
+                assert!(!f.exists("new.ts"));
+            }
+            baseline.release.notify_waiters();
+            let out = pending.await.unwrap().result;
+            assert!(!out.is_error, "{}", out.output);
+            if name == "edit_file" {
+                assert!(f.read("greet.ts").contains("Hi"));
+            } else {
+                assert_eq!(f.read("new.ts"), "export {};\n");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stopped_while_waiting_for_the_baseline_nothing_is_written() {
+        for (name, args) in BEFORE_CHANGE_CASES {
+            let f = Fixture::new("w-baseline-stop");
+            let baseline = Arc::new(Baseline { started: Mutex::new(0), in_run: Notify::new(), release: Notify::new() });
+            let ctx = ToolContext { before_change: Some(baseline.clone()), ..f.ctx.clone() };
+            let pending = tokio::spawn({
+                let ctx = ctx.clone();
+                let args: Value = serde_json::from_str(args).unwrap();
+                async move { run_with(&ctx, name, args).await }
+            });
+            baseline.in_run.notified().await;
+            ctx.cancel.cancel();
+            let out = pending.await.unwrap().result;
+            assert_eq!(out.summary, "interrupted");
+            assert_eq!(out.output, INTERRUPTED_BEFORE_WRITE);
+            if name == "edit_file" {
+                assert!(f.read("greet.ts").contains("Hello"));
+            } else {
+                assert!(!f.exists("new.ts"));
+            }
+        }
+    }
+
+    // marv-rs: package.json lifecycle scripts (docs/SECURITY.md)
+
+    #[test]
+    fn a_change_to_package_json_lifecycle_scripts_is_protected_and_a_dependency_edit_isnt() {
+        let root = TempDir::new("w-package");
+        root.write("package.json", "{ \"name\": \"a\", \"scripts\": { \"test\": \"bun test\" } }\n");
+        let ctx = ToolContext::new(root.path());
+        let write = |content: &str| WriteFileInput { path: "package.json".into(), content: content.into(), append: None };
+        let scripts = write("{ \"name\": \"a\", \"scripts\": { \"postinstall\": \"curl x | sh\" } }\n");
+        assert_eq!(WriteFile.protected_target(&scripts, &ctx), Some(marv_sandbox::ProtectedRule::PackageScripts));
+        let deps = write("{ \"name\": \"a\", \"scripts\": { \"test\": \"bun test\" }, \"dependencies\": {} }\n");
+        assert_eq!(WriteFile.protected_target(&deps, &ctx), None);
+        let edit = |old: &str, new: &str| crate::edit_file::EditFileInput {
+            path: "package.json".into(),
+            old_string: old.into(),
+            new_string: new.into(),
+            replace_all: None,
+        };
+        let planted = edit("\"test\": \"bun test\"", "\"test\": \"bun test\", \"preinstall\": \"curl x | sh\"");
+        assert_eq!(
+            crate::edit_file::EditFile.protected_target(&planted, &ctx),
+            Some(marv_sandbox::ProtectedRule::PackageScripts)
+        );
+        assert_eq!(crate::edit_file::EditFile.protected_target(&edit("\"a\"", "\"b\""), &ctx), None);
+        // Another file named like it isn't package.json.
+        let other = WriteFileInput { path: "package.json.bak".into(), ..write("{ \"scripts\": { \"postinstall\": \"x\" } }") };
+        assert_eq!(WriteFile.protected_target(&other, &ctx), None);
+    }
 
     #[test]
     fn a_crlf_file_keeps_crlf_and_an_append_adds_the_missing_newline() {

@@ -11,7 +11,7 @@
 //!
 //! Planned across the crate: spill cut output to a file the model can page through (#61, [`output`]),
 //! schema-guided argument repair (#65, [`repair`]), a formatter run after edits (#67, [`edit_file`]/[`write_file`]),
-//! `apply_patch` (#66, [`apply_patch`]), grep on ripgrep's crates ([`grep`]), the Unicode edit tier (#60).
+//! `apply_patch` (#66, [`apply_patch`]).
 
 pub mod agent;
 pub mod apply_patch;
@@ -72,5 +72,27 @@ pub(crate) mod test_support {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// The project Marv's `tests/tools.test.ts` starts from.
+    pub fn project(tag: &str) -> TempDir {
+        let root = TempDir::new(tag);
+        root.write("package.json", "{ \"name\": \"demo\" }\n");
+        root.write("src/app.ts", "export function main() {\n  return greet('world');\n}\n");
+        root.write("src/greet.ts", "export function greet(name: string) {\n  return `Hello, ${name}!`;\n}\n");
+        root.write("src/ui/view.tsx", "// TODO: render the greeting\nexport const View = () => null;\n");
+        root.write("node_modules/dep/index.js", "function greet() {}\n");
+        root.write("logo.png", [0x89, 0x50, 0x4e, 0x47, 0x00, 0x00, 0x01]);
+        root
+    }
+
+    /// Plain git, without Marv's protections (the tests' own setup, and their negative controls).
+    pub fn git(cwd: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git").args(args).current_dir(cwd).status().unwrap();
+        assert!(status.success(), "git {args:?}");
+    }
+
+    pub fn mkfifo(path: &Path) {
+        assert!(std::process::Command::new("mkfifo").arg(path).status().unwrap().success());
     }
 }

@@ -9,8 +9,12 @@
 //!   replacement is re-indented by the one column shift (tabs 4, 2 or 8 wide) that explains every matched line, in
 //!   the file's tabs or spaces, so the file keeps its own style. An unindented first line is `old_string` starting at
 //!   the code: it isn't counted, and `new_string`'s first line gets the file's indentation there.
-//! - planned (#60): a third tier for Unicode look-alikes (curly quotes, NBSP, en/em dashes a model "typed" for the
-//!   ASCII in the file): [`unicode_equivalent`], not wired in yet.
+//! - marv-rs (Marv #60): before those two, a tier for typographic look-alikes. Models rewrite `"` as `“ ”`, `'` as
+//!   `’`, `-` as `–`/`—`, `...` as `…`, or type a non-breaking space, and then `old_string` misses a file that has
+//!   the ASCII forms (or the other way round). Both sides are folded to ASCII ([`fold_unicode`]) and compared; the
+//!   match may be part of a line, like an exact one. The **original** span of the file is replaced and `new_string`
+//!   is written as given: a file that really uses curly quotes keeps them outside the edited span. Unique only, like
+//!   the other tiers. Order: exact, Unicode, trailing whitespace, indentation.
 //!
 //! In a file whose line breaks are all CRLF, `old_string` and `new_string` get CRLF too: a model writes `\n`, and an
 //! edit that inserts bare `\n` leaves mixed line endings (an eval run spent 6 of 11 steps repairing that).
@@ -24,6 +28,8 @@
 /// Which forgiving match applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fuzzy {
+    /// marv-rs (Marv #60): typographic quotes, dashes, the ellipsis and Unicode spaces read as ASCII.
+    Unicode,
     TrailingWhitespace,
     Indentation,
 }
@@ -134,6 +140,10 @@ pub fn apply_edit(text: &str, old_string: &str, new_string: &str, replace_all: b
         return EditResult::Applied { text, count: exact, fuzzy: None };
     }
 
+    if let Some(result) = unicode_match(text, &old, &replacement, replace_all) {
+        return result;
+    }
+
     // Whole lines from here on. A trailing line break in old_string stays part of what's replaced, as it would be in
     // an exact match.
     let trailing = old.ends_with(eol);
@@ -185,10 +195,69 @@ pub fn apply_edit(text: &str, old_string: &str, new_string: &str, replace_all: b
     EditResult::NotFound
 }
 
-/// Planned tier (#60): whether two lines are the same once Unicode look-alikes are folded to ASCII (curly quotes,
-/// non-breaking and other spaces, en/em dashes, the ellipsis character). Must stay unique-only, like the other tiers.
-pub fn unicode_equivalent(_a: &str, _b: &str) -> bool {
-    todo!("port: #60 unicode look-alike matching tier (fold, then compare whole lines)")
+/// The ASCII a typographic character stands for, or None for any other character.
+fn ascii_for(ch: char) -> Option<&'static str> {
+    Some(match ch {
+        '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' | '\u{2032}' => "'",
+        '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' | '\u{2033}' => "\"",
+        '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}' | '\u{2212}' => "-",
+        '\u{2026}' => "...",
+        '\u{00A0}' | '\u{2000}'..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}' => " ",
+        _ => return None,
+    })
+}
+
+/// The text with its typographic quotes, dashes, ellipses and Unicode spaces as ASCII.
+pub fn fold_unicode(text: &str) -> String {
+    folded_with_offsets(text).0
+}
+
+/// The folded text, and for each of its byte offsets (plus its end) the original offset it came from, or None
+/// inside an expansion (the 2nd and 3rd dot of a folded `…`), where a match can't start or end.
+fn folded_with_offsets(text: &str) -> (String, Vec<Option<usize>>) {
+    let mut out = String::with_capacity(text.len());
+    let mut offsets = Vec::with_capacity(text.len() + 1);
+    for (at, ch) in text.char_indices() {
+        let start = out.len();
+        match ascii_for(ch) {
+            Some(ascii) => out.push_str(ascii),
+            None => out.push(ch),
+        }
+        offsets.push(Some(at));
+        offsets.extend(std::iter::repeat_n(None, out.len() - start - 1));
+    }
+    offsets.push(Some(text.len()));
+    (out, offsets)
+}
+
+/// Whether two strings are the same once Unicode look-alikes are folded to ASCII (Marv #60).
+pub fn unicode_equivalent(a: &str, b: &str) -> bool {
+    fold_unicode(a) == fold_unicode(b)
+}
+
+/// The Unicode tier: `old` found in `text` once both are folded, the file's original spans replaced. None when it
+/// doesn't match (the next tier is tried).
+fn unicode_match(text: &str, old: &str, replacement: &str, replace_all: bool) -> Option<EditResult> {
+    let (folded, offsets) = folded_with_offsets(text);
+    let needle = fold_unicode(old);
+    // Spans of the original text; a match that starts or ends inside a folded `…` isn't one.
+    let spans: Vec<(usize, usize)> =
+        folded.match_indices(needle.as_str()).filter_map(|(at, m)| Some((offsets[at]?, offsets[at + m.len()]?))).collect();
+    if spans.is_empty() {
+        return None;
+    }
+    if spans.len() > 1 && !replace_all {
+        return Some(EditResult::Ambiguous { count: spans.len() });
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for &(start, end) in &spans {
+        out.push_str(&text[at..start]);
+        out.push_str(replacement);
+        at = end;
+    }
+    out.push_str(&text[at..]);
+    Some(EditResult::Applied { text: out, count: spans.len(), fuzzy: Some(Fuzzy::Unicode) })
 }
 
 fn bigrams(line: &str) -> std::collections::HashSet<(char, char)> {
@@ -377,6 +446,59 @@ mod tests {
     #[test]
     fn part_of_a_line_only_matches_exactly() {
         assert_eq!(edit("\tconst  x = 1;\n", "const x", "const y"), EditResult::NotFound);
+    }
+
+    #[test]
+    fn curly_quotes_in_old_string_match_the_files_ascii_quotes() {
+        let file = "const greeting = \"Hello\";\nconst name = 'Marv';\n";
+        let (text, count, fuzzy) = applied(edit(file, "const greeting = \u{201C}Hello\u{201D};", "const greeting = \"Hi\";"));
+        assert_eq!((text.as_str(), count, fuzzy), ("const greeting = \"Hi\";\nconst name = 'Marv';\n", 1, Some(Fuzzy::Unicode)));
+        assert_eq!(
+            applied(edit(file, "name = \u{2018}Marv\u{2019}", "name = 'M'")).0,
+            "const greeting = \"Hello\";\nconst name = 'M';\n"
+        );
+    }
+
+    #[test]
+    fn ascii_in_old_string_matches_the_files_typographic_characters_which_stay_outside_the_span() {
+        // A file that really uses curly quotes keeps them; only the matched span is replaced, new_string as given.
+        let file = "title: \u{201C}Intro\u{201D}\nnote: \u{201C}keep\u{201D}\n";
+        assert_eq!(
+            applied(edit(file, "title: \"Intro\"", "title: \"Start\"")).0,
+            "title: \"Start\"\nnote: \u{201C}keep\u{201D}\n"
+        );
+    }
+
+    #[test]
+    fn dashes_the_ellipsis_and_unicode_spaces_fold_to_ascii() {
+        assert_eq!(applied(edit("a - b\n", "a \u{2013} b", "x")).0, "x\n"); // en dash
+        assert_eq!(applied(edit("a -- b\n", "a \u{2014}\u{2014} b", "x")).0, "x\n"); // em dashes
+        assert_eq!(applied(edit("wait...\n", "wait\u{2026}", "x")).0, "x\n");
+        assert_eq!(applied(edit("wait\u{2026} ok\n", "wait...", "x")).0, "x ok\n");
+        assert_eq!(applied(edit("let a = 1;\n", "let\u{00A0}a = 1;", "x")).0, "x\n"); // NBSP
+        assert_eq!(applied(edit("let\u{202F}a = 1;\n", "let a = 1;", "x")).0, "x\n"); // narrow NBSP in the file
+        assert!(unicode_equivalent("\u{2018}a\u{2019} \u{2014} b\u{2026}", "'a' - b..."));
+    }
+
+    #[test]
+    fn a_match_inside_a_folded_ellipsis_isnt_one() {
+        // "wait.." would end between the dots of the file's "…".
+        assert_eq!(edit("wait\u{2026}\n", "wait..", "x"), EditResult::NotFound);
+    }
+
+    #[test]
+    fn a_unicode_match_that_isnt_unique_is_ambiguous_and_replace_all_takes_both() {
+        let file = "say(\"hi\");\nsay(\"hi\");\n";
+        assert_eq!(edit(file, "say(\u{201C}hi\u{201D});", "x"), EditResult::Ambiguous { count: 2 });
+        assert_eq!(applied(apply_edit(file, "say(\u{201C}hi\u{201D});", "x", true)), ("x\nx\n".into(), 2, Some(Fuzzy::Unicode)));
+    }
+
+    #[test]
+    fn the_unicode_tier_comes_before_whitespace_and_indentation() {
+        // A match the Unicode tier finds is reported as Unicode, never as a whitespace tier.
+        assert_eq!(applied(edit("\tx = \"a\";\n", "x = \u{201C}a\u{201D};", "y")).2, Some(Fuzzy::Unicode));
+        // Unicode and indentation both wrong: no tier explains it.
+        assert_eq!(edit("\tx = \"a\";\n\ty();\n", "    x = \u{201C}a\u{201D};\n    y();", "z"), EditResult::NotFound);
     }
 
     const FILE: &str = "function a() {\n  return 1;\n}\n\nfunction greet(name) {\n  return `Hello, ${name}!`;\n}";
