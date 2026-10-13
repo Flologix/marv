@@ -110,7 +110,7 @@ function repoName(root: string, signal?: AbortSignal): Promise<string | null> {
   if (!name) {
     name = runGh(["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"], root, signal, 10_000).then((r) =>
       r.exitCode === 0 && /^[\w.-]+\/[\w.-]+$/.test(r.output.trim()) ? r.output.trim() : null,
-    );
+    ).catch(() => null); // gh gone, or failed to spawn: unknown, like a failure (never a cached rejection)
     repoNames.set(root, name);
     // A failure isn't remembered: the next merge asks again.
     void name.then((n) => n ?? repoNames.delete(root));

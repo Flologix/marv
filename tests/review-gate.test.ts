@@ -316,3 +316,17 @@ test("a review with blockers and a file it couldn't review says both, blockers f
   expect(stderr).toContain("1 blocking finding(s)");
   expect(stderr.indexOf("blocking finding(s)")).toBeLessThan(stderr.indexOf("couldn't be reviewed"));
 });
+
+test("a comment_refiled warning (ocr moved a comment to the right file) doesn't hold a commit back", () => {
+  writeFileSync(
+    join(bin, "ocr"),
+    "#!/bin/sh\n" +
+      'if [ "$1" = "--version" ]; then printf \'open-code-review v1.0.0 (abc)\\n\'; exit 0; fi\n' +
+      'echo "review" >> "' + join(dir, "reviews") + '"\n' +
+      "echo '{\"status\":\"complete\",\"comments\":[],\"warnings\":[{\"type\":\"comment_refiled\",\"file\":\"b.ts\",\"message\":\"re-filed\"}]}'\n",
+  );
+  chmodSync(join(bin, "ocr"), 0o755);
+  const result = gate();
+  expect(result.stderr.toString()).toContain("passed");
+  expect(result.exitCode).toBe(0);
+});

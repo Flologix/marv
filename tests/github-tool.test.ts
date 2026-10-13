@@ -2,7 +2,7 @@
 // github door, gh is spawned without a shell and without Marv's keys, tokens are redacted, and the tool is offered
 // only where gh is there and logged in, in the same spec list every time (the prompt cache).
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, symlinkSync } from "node:fs";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -114,6 +114,19 @@ describe("the github tool", () => {
     const { env } = (await fakeGhCalls(log))[0]!;
     expect(env).toMatchObject({ OPENROUTER_API_KEY: null, MARV_SECRET: null, GH_DEBUG: null, GH_PROMPT_DISABLED: "1", GH_PAGER: "cat", NO_COLOR: "1" });
     expect(env).toMatchObject({ GIT_CONFIG_COUNT: "2", GIT_CONFIG_KEY_0: "core.hooksPath", GIT_CONFIG_VALUE_0: "/dev/null", GIT_CONFIG_KEY_1: "core.fsmonitor", GIT_CONFIG_VALUE_1: "false" });
+  });
+
+  test("gh missing while the repository is looked up isn't remembered: once it's back, a merge names the repository", async () => {
+    const { asked, approve } = recorder("no");
+    // git still there (the project's host comes from it), gh not: looking up the repository fails to spawn.
+    const gitOnly = join(root, ".git-only-bin");
+    mkdirSync(gitOnly);
+    symlinkSync(Bun.which("git")!, join(gitOnly, "git"));
+    process.env.PATH = gitOnly;
+    await runTool(call(["pr", "merge", "12"]), { root, yolo: true, approve, doors: { github: true } });
+    process.env.PATH = `${bin}:${saved.PATH}`;
+    await runTool(call(["pr", "merge", "12"], "g2"), { root, yolo: true, approve, doors: { github: true } });
+    expect(asked.at(-1)!.preview.warning).toBe("Visible to other people on github.com/o/r.");
   });
 
   test("gh talks to the project's host, whatever GH_HOST says: -R OWNER/REPO can't reach another one", async () => {

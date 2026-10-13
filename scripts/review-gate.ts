@@ -33,6 +33,8 @@ type Result = { status?: string; message?: string; comments?: Finding[] | null; 
 type Warning = { type?: string; message?: string };
 // Eval tasks' starting repos hold bugs planted on purpose (the model is meant to find them): never findings.
 const EXCLUDE = "evals/tasks/*/repo/**";
+/** ocr warnings that say nothing went unreviewed (comment_refiled: a comment moved to the file it describes). */
+const BENIGN_WARNINGS = new Set(["comment_refiled"]);
 
 const SEVERITIES = ["critical", "high", "medium", "low"];
 const TIMEOUT_S = Number(process.env.REVIEW_GATE_TIMEOUT_S ?? "1200");
@@ -163,7 +165,8 @@ const runReview = (from: string, to: string): ReviewOutcome => {
   }
 
   const findings = (result.comments ?? []) as Finding[];
-  const warnings = (result.warnings ?? []) as Warning[];
+  // Notes about how ocr filed its output, not files it couldn't review: they don't hold a commit back.
+  const warnings = ((result.warnings ?? []) as Warning[]).filter((w) => !BENIGN_WARNINGS.has(w.type ?? ""));
 
   // An unknown severity blocks: the gate shouldn't pass what it can't rank.
   const blocks = (f: Finding) => blocking.has(f.severity ?? "") || !SEVERITIES.includes(f.severity ?? "");
