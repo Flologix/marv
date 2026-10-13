@@ -1220,6 +1220,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "marv-oracle"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "marv-core",
+ "serde",
+ "serde_json",
+ "similar",
+]
+
+[[package]]
 name = "marv-provider"
 version = "0.0.1"
 dependencies = [

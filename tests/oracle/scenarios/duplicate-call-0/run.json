@@ -1,0 +1,4 @@
+{
+  "description": "Ollama numbers each step's calls from call_0: the second step's call_0 (and a repeat within the step) get ids of their own before the history sees them (agent.ts usedIds).",
+  "prompt": "What does this project contain?"
+}

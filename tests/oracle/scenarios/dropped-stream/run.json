@@ -1,0 +1,4 @@
+{
+  "description": "A stream that closes before its finish_reason and [DONE] is retried from scratch (after the 1 s backoff); the partial text is dropped.",
+  "prompt": "What does shout() do?"
+}

@@ -1,0 +1,4 @@
+{
+  "description": "With no --approve, a bash call that wants the network is refused (no one to ask); the turn still ends, but the exit code is 3 and the result lists the refused call.",
+  "prompt": "Install the dependencies."
+}

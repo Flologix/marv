@@ -1,0 +1,9 @@
+{"status":"running","type":"status"}
+{"label":"npm install","tool":"bash","type":"tool_start"}
+{"error":true,"label":"npm install","result":"bash needs the user's approval, and there's no one to ask.","tool":"bash","type":"tool_end"}
+{"text":"I couldn't install them: running npm with network ","type":"text_delta"}
+{"text":"access needs your approval. Run with `--approve ne","type":"text_delta"}
+{"text":"twork`.","type":"text_delta"}
+{"text":"I couldn't install them: running npm with network access needs your approval. Run with `--approve network`.","type":"assistant"}
+{"reason":"end","type":"done"}
+{"reason":"end","refused":[{"label":"npm install","tool":"bash"}],"reply":"I couldn't install them: running npm with network access needs your approval. Run with `--approve network`.","steps":2,"type":"result","usage":{"cachedTokens":0,"completionTokens":100,"cost":0.002,"promptTokens":2000}}

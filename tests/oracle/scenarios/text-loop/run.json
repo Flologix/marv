@@ -1,0 +1,4 @@
+{
+  "description": "A reply repeating one sentence is stopped while it streams: dropped from the history, the model is told once, and the next reply finishes.",
+  "prompt": "Is there a configuration file?"
+}
