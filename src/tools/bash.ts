@@ -3,6 +3,7 @@ import { rmdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { z } from "zod";
+import { relaySource, type RelayForward } from "../processes/relay.ts";
 import { sandboxArgs, sandboxAvailable, TOOLCHAINS } from "../sandbox.ts";
 import { repairTimeoutSeconds } from "./repair.ts";
 import { ToolError, type Tool } from "./types.ts";
@@ -26,7 +27,7 @@ const isInside = (outer: string, inner: string) => {
  * them: the worktree folder sits in `<common>/worktrees/`, and its `gitdir` file points back at this .git.
  * Otherwise a planted `gitdir: /home/me/.ssh` would show that folder to every command that runs without asking.
  */
-function gitGuard(root: string): { readOnly?: string[]; placeholders?: string[] } {
+export function gitGuard(root: string): { readOnly?: string[]; placeholders?: string[] } {
   const gitDir = join(root, ".git");
   let stat: ReturnType<typeof lstatSync>;
   try {
@@ -106,6 +107,11 @@ const HOME_NOTE =
 const BACKGROUND_NOTE =
   "Marv: anything this command started in the background was stopped when the command ended, and a server in the sandbox can't be reached from the user's browser (the sandbox has its own network namespace; with network: true its localhost is the host's). " +
   "Don't say a server is running for the user: to check one yourself, run it in the foreground within one command, query it there, and let the command end; to let the user try it, give them the command to run in their own terminal.";
+
+/** The same, where the session has the process door (#51): the way to keep one running is the process tool. */
+const BACKGROUND_NOTE_PROCESS =
+  "Marv: anything this command started in the background was stopped when the command ended, and a server in the sandbox can't be reached from the user's browser (the sandbox has its own network namespace; with network: true its localhost is the host's). " +
+  "Don't say a server is running for the user: to check one yourself, run it in the foreground within one command, query it there, and let the command end; to keep a server or watcher running for the user, use the process tool instead.";
 
 const WORD_START = String.raw`(?:^|[\s=:'"(<>;|&])`;
 /**
@@ -215,6 +221,11 @@ interface RunOptions {
   home?: string;
   /** Not sandboxed: this environment instead of the minimal one (the host door's, hostEnv). */
   env?: Record<string, string>;
+  /**
+   * Sandboxed, without network: the background processes' forwarded ports (#51), each reached through its socket
+   * folder, mounted read-only at /run/marv/<id>; a relay listens on the sandbox's 127.0.0.1:<port> for each.
+   */
+  forwards?: { port: number; id: string; dir: string }[];
 }
 
 const hasSetsid = Bun.which("setsid") !== null;
@@ -224,11 +235,21 @@ const hasSetsid = Bun.which("setsid") !== null;
  * Sandboxed: inside bwrap (see src/sandbox.ts). Not sandboxed: still with a
  * minimal environment, so API keys don't leak into commands.
  */
-export async function runCommand({ command, root, sandbox, network, timeoutMs, signal, readOnly, writable, placeholders, projectReadOnly, home = homedir(), env }: RunOptions): Promise<CommandResult> {
+export async function runCommand({ command, root, sandbox, network, timeoutMs, signal, readOnly, writable, placeholders, projectReadOnly, home = homedir(), env, forwards = [] }: RunOptions): Promise<CommandResult> {
   const path = process.env.PATH ?? "/usr/bin:/bin";
   const script = `exec 2>&1\n${command}`; // stderr into stdout, so the output stays in order
+  // With network the sandbox shares the host's 127.0.0.1, where the ports are forwarded already.
+  const relay = sandbox && !network && forwards.length > 0;
+  const binds = relay
+    ? [
+        { source: process.execPath, dest: "/run/marv-bun" },
+        ...[...new Map(forwards.map((f) => [f.id, f.dir])).entries()].map(([id, dir]) => ({ source: dir, dest: `/run/marv/${id}` })),
+      ]
+    : [];
+  const connect: RelayForward[] = forwards.map((f) => ({ port: f.port, socket: `/run/marv/${f.id}/fwd.sock` }));
+  const inner = relay ? ["/run/marv-bun", "-e", relaySource({ connect, argv: ["bash", "-c", script] })] : ["bash", "-c", script];
   const argv = sandbox
-    ? ["bwrap", ...sandboxArgs({ root, home, network, path, readOnly, writable, placeholders, projectReadOnly }), "--", "bash", "-c", script]
+    ? ["bwrap", ...sandboxArgs({ root, home, network, path, readOnly, writable, placeholders, projectReadOnly, binds }), "--", ...inner]
     : // setsid: its own process group, so killing it also kills everything it started.
       [...(hasSetsid ? ["setsid"] : []), "bash", "-c", script];
 
@@ -402,7 +423,7 @@ export const bash: Tool<typeof input> = {
     };
   },
 
-  async run({ command, network = false, timeout = DEFAULT_TIMEOUT_S, sandbox: flag }, { root, signal, sandbox = true, readOnly = [], confined, doors }) {
+  async run({ command, network = false, timeout = DEFAULT_TIMEOUT_S, sandbox: flag }, { root, signal, sandbox = true, readOnly = [], confined, doors, forwards }) {
     if (throughHost(flag, sandbox)) {
       // Checked again here, so no path to run() skips the door (preview refuses first).
       if (!doors?.host) throw new ToolError(NO_HOST_DOOR);
@@ -433,6 +454,7 @@ export const bash: Tool<typeof input> = {
         readOnly: [...readOnly, ...(guard.readOnly ?? [])],
         writable: approvedGit,
         placeholders: guard.placeholders,
+        forwards: forwards?.(),
       });
     } finally {
       // bwrap leaves a placeholder's empty mount point; rmdir only removes it while it's empty.
@@ -442,7 +464,7 @@ export const bash: Tool<typeof input> = {
     const summary = commandSummary(result, timeout);
     const lastResort = doors?.host ? ` ${HOST_LAST_RESORT}` : "";
     if (sandboxed && touchesHiddenHome(command, root, homedir())) result.output += `\n${HOME_NOTE}${lastResort}\n`;
-    if (sandboxed && backgroundsProcess(command)) result.output += `\n${BACKGROUND_NOTE}\n`;
+    if (sandboxed && backgroundsProcess(command)) result.output += `\n${doors?.process ? BACKGROUND_NOTE_PROCESS : BACKGROUND_NOTE}\n`;
     // Not for a command that isn't there (127) or can't run (126): the network has nothing to do with those.
     const failed = result.timedOut || (!result.aborted && result.exitCode !== 0 && result.exitCode !== 126 && result.exitCode !== 127);
     if (sandboxed && !network && failed && looksLikeNetworkFailure(command, result.output)) {

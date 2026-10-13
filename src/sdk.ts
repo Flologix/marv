@@ -107,6 +107,12 @@ export interface SessionOptions {
    * such calls are refused before your approver is asked.
    */
   hostCommands?: boolean;
+  /**
+   * Offer the process tool (#51): a dev server or watcher that keeps running in its own sandbox, its ports forwarded
+   * to 127.0.0.1, each start through your approver (`door: "process"`; scope `process:<command>`). Default true,
+   * where bubblewrap works. `session.close()` stops them all.
+   */
+  processes?: boolean;
   yolo?: boolean;
   /** Let thinking models reason before they answer (default false). */
   thinking?: boolean;
@@ -200,6 +206,7 @@ export async function createSession(options: SessionOptions): Promise<Session> {
     mcpTools: options.mcpTools,
     sandbox: options.sandbox,
     hostCommands: options.hostCommands,
+    processes: options.processes,
     yolo: options.yolo,
     noYolo,
     sessions: storeFor(options.persist, () => new SessionStore(join(configDir, "sessions"))),
@@ -253,6 +260,7 @@ export type { LoopEvent } from "./agent.ts";
 export type { CheckResult } from "./diagnostics/turn.ts";
 export type { TsError } from "./diagnostics/tsc.ts";
 export type { ProjectCheckResult } from "./checks/kind.ts";
+export type { ProcessInfo } from "./processes.ts";
 export type { Violation } from "./checks/load.ts";
 export type { Totals } from "./usage.ts";
 export type { Message } from "./types.ts";

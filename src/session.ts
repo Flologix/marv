@@ -40,6 +40,8 @@ import type { ChatTurn, Provider, ToolSpec, Usage } from "./provider/types.ts";
 import { newSession, type SavedSession, type SessionStore } from "./sessions.ts";
 import type { Skill } from "./skills.ts";
 import { AgentRecorder, type Trajectory, type TrajectoryRecord, type TrajectoryStore } from "./trajectory.ts";
+import { ProcessManager, type ProcessInfo } from "./processes.ts";
+import { sandboxAvailable } from "./sandbox.ts";
 import { isParallelCall, runTool, specOf, tools as builtinTools, toolSpecsFor } from "./tools/index.ts";
 import { withNote } from "./tools/repair.ts";
 import { pastedScopes } from "./tools/web-fetch.ts";
@@ -155,6 +157,14 @@ export interface SessionInit {
    * whatever the approver would say. The main agent only: subagents never get it.
    */
   hostCommands?: boolean;
+  /**
+   * Offer the process tool (#51): servers and watchers that keep running in their own sandbox, their ports forwarded
+   * to the user's 127.0.0.1, each start asked. Default true; offered only where bubblewrap works. Fixed for the
+   * session's life (it changes the tool list and the prompt). The main agent only.
+   */
+  processes?: boolean;
+  /** The background processes' manager (tests pass one with a fake home); default: one made on the first start. */
+  processManager?: ProcessManager;
   yolo?: boolean;
   /**
    * Yolo isn't allowed here, and why (the SDK sets it when the project is the home folder or above it, where yolo's
@@ -291,6 +301,10 @@ export interface Session {
   flush(): Promise<void>;
   /** Stops what's running, waits for it to wind down, flushes, and closes the MCP servers the session started. After it, send(), compact(), clear() and resume() refuse; calling it again is fine. */
   close(): Promise<void>;
+  /** The background processes the process tool started (#51); they outlive turns and clear(), and stop on close(). */
+  readonly processes: ProcessInfo[];
+  /** Stops a background process and everything it started; false when there's none of that name. */
+  stopProcess(name: string): Promise<boolean>;
 }
 
 export class MarvSession implements Session {
@@ -315,7 +329,7 @@ export class MarvSession implements Session {
   private midTurnCompactFailed = false;
   /** The main agent's doors out of the sandbox: fixed for the session, since the prompt names them (cache). */
   private get doors(): Doors {
-    return { host: Boolean(this.init.hostCommands) };
+    return { host: Boolean(this.init.hostCommands), process: this.processOn };
   }
   /** "Yes, don't ask again" scopes, shared by the main agent and its subagents. */
   private readonly always = new Set<string>();
@@ -367,6 +381,13 @@ export class MarvSession implements Session {
   private planItems: PlanItem[] | null = null;
   /** Whether this session offers the plan tool (decided at construction: it changes the tool list). */
   private readonly planOn: boolean;
+  /** Whether this session offers the process tool (#51; decided at construction: it changes the tool list and prompt). */
+  private readonly processOn: boolean;
+  /**
+   * The background processes, made on the first start. They belong to the session, not the conversation: they outlive
+   * turns, clear() and resume(), and stop on close().
+   */
+  private manager: ProcessManager | null = null;
 
   constructor(private readonly init: SessionInit) {
     checkToolNames(init.tools ?? []);
@@ -393,9 +414,11 @@ export class MarvSession implements Session {
     this.logging = init.logTrajectories ?? true;
     this.memories = init.memory?.initial;
     this.planOn = init.plan ?? true;
+    this.processOn = (init.processes ?? true) && sandboxAvailable();
+    this.manager = init.processManager ?? null;
     // Built once, so every request sends byte-identical tool definitions (the skill tool only when there are skills,
     // the plan tool unless it's off).
-    this.specs = [...toolSpecsFor({ hasSkills: (init.skills?.length ?? 0) > 0, plan: this.planOn }), ...(init.tools ?? []).map(specOf)];
+    this.specs = [...toolSpecsFor({ hasSkills: (init.skills?.length ?? 0) > 0, plan: this.planOn, process: this.processOn }), ...(init.tools ?? []).map(specOf)];
     this.system = this.buildSystem();
     this.saved = newSession(init.root, { provider: this.factory.id, model: this.factory.model });
     this.lookup();
@@ -622,6 +645,33 @@ export class MarvSession implements Session {
     await this.working?.catch(() => {});
     await this.flush();
     if (this.init.ownsMcp) await this.init.mcp?.close();
+    await this.manager?.closeAll();
+  }
+
+  /** The background processes (#51): name, command, ports, state. */
+  get processes(): ProcessInfo[] {
+    return this.manager?.list() ?? [];
+  }
+
+  /** Stops a background process and everything it started; false when there's none of that name. */
+  stopProcess(name: string): Promise<boolean> {
+    return this.manager?.stop(name) ?? Promise.resolve(false);
+  }
+
+  /** Stops every background process (Marv's exit); later starts refuse. close() does this too. */
+  async stopProcesses(): Promise<void> {
+    await this.manager?.closeAll();
+  }
+
+  /** Whether this session offers the process tool (bubblewrap works, and it wasn't turned off). */
+  get processesOffered(): boolean {
+    return this.processOn;
+  }
+
+  /** The process tool's host, making the manager on first use. */
+  private get processHost(): ProcessManager {
+    this.manager ??= new ProcessManager({ root: this.init.root, onChange: () => this.changed() });
+    return this.manager;
   }
 
   private get cwd(): string {
@@ -671,7 +721,8 @@ export class MarvSession implements Session {
    */
   private offered(): { specs: ToolSpec[]; tools: Tool[] } {
     const mcp = this.init.mcp;
-    const tools = [...(this.planOn ? builtinTools : builtinTools.filter((t) => t.name !== "plan")), ...(this.init.tools ?? [])];
+    const builtin = builtinTools.filter((t) => (this.planOn || t.name !== "plan") && (this.processOn || t.name !== "process"));
+    const tools = [...builtin, ...(this.init.tools ?? [])];
     if (!mcp) return { specs: this.specs, tools };
     // Deferred: two constant specs instead of the servers', whatever the servers do (prompt cache).
     if (this.listing?.mode === "deferred") {
@@ -1113,7 +1164,7 @@ export class MarvSession implements Session {
         runTool: async (call) => {
           const result = await runTool(
             call,
-            { root: this.init.root, signal: stop.signal, approve, sandbox, yolo, skills: this.init.skills, memory: this.init.memory?.paths, agentHost, plan, beforeChange: checks?.beforeChange, doors: this.doors },
+            { root: this.init.root, signal: stop.signal, approve, sandbox, yolo, skills: this.init.skills, memory: this.init.memory?.paths, agentHost, plan, beforeChange: checks?.beforeChange, doors: this.doors, processes: this.processOn ? this.processHost : undefined, forwards: () => this.manager?.forwards() ?? [] },
             tools,
           );
           const note = rewritten.get(call.id);

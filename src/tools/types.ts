@@ -2,6 +2,7 @@ import type { z } from "zod";
 import type { LoopEvent } from "../agent.ts";
 import type { AgentType } from "../agents.ts";
 import type { MemoryPaths } from "../memory.ts";
+import type { ProcessForward, ProcessManager } from "../processes.ts";
 import type { Provider, Usage } from "../provider/types.ts";
 import type { Skill } from "../skills.ts";
 
@@ -122,7 +123,17 @@ export interface ToolContext {
   plan?: PlanHost;
   /** The doors out of the sandbox this agent has (see Doors). Absent: none. */
   doors?: Doors;
+  /** The session's background processes (#51), for the process tool. Only the main agent has them. */
+  processes?: ProcessHost;
+  /**
+   * The running processes' forwarded ports: a sandboxed bash command (without network) gets a relay to each, so its
+   * `curl localhost:<port>` reaches the session's own servers. Subagents get this too (but not `processes`).
+   */
+  forwards?: () => ProcessForward[];
 }
+
+/** What the process tool runs through: the session's ProcessManager. */
+export type ProcessHost = Pick<ProcessManager, "start" | "logs" | "stop" | "list">;
 
 /** One item of the plan tool's checklist; at most one is in_progress at a time (the current item). */
 export interface PlanItem {

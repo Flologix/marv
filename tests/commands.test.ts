@@ -285,3 +285,20 @@ test("/mcp with a name an object inherits (__proto__, constructor) is a usage er
     expect(runCommand(`/mcp ${sub}`)).toMatchObject({ type: "print", isError: true });
   }
 });
+
+describe("/processes", () => {
+  const web = { name: "web", command: "bun run dev", network: false, state: "running" as const, exitCode: null, ports: [5173], notes: [], startedAt: Date.now() - 125_000 };
+  test("lists the session's background processes", () => {
+    expect(run("/processes", { ...ctx, processes: [web, { ...web, name: "old", state: "exited", exitCode: 1, ports: [] }] })).toEqual({
+      type: "print",
+      text: "web: running · http://localhost:5173 · up 2m · $ bun run dev\nold: exited (code 1) · up 2m · $ bun run dev",
+    });
+    expect(run("/processes", { ...ctx, processes: [] })).toMatchObject({ type: "print", text: expect.stringContaining("No background processes") });
+    expect(run("/processes", ctx)).toMatchObject({ type: "print", text: expect.stringContaining("need the bubblewrap sandbox") });
+  });
+  test("stop <name> is an action; anything else is usage", () => {
+    expect(run("/processes stop web", ctx)).toEqual({ type: "processes", stop: "web" });
+    expect(run("/processes stop", ctx)).toMatchObject({ isError: true, text: expect.stringContaining("Usage") });
+    expect(run("/processes kill web", ctx)).toMatchObject({ isError: true });
+  });
+});

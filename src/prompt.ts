@@ -68,7 +68,7 @@ const WEB_SECTION = `\n\n# Web\n\nweb_fetch reads a web page as Markdown, and a 
 
 // Fixed text, only with bash: the sandbox kills every process a command starts and hides its
 // localhost, so a model claimed a server was "up" and handed the user a dead link (issue #50).
-// When background processes can outlive a command (issue #51), this paragraph changes there too.
+// With the process door (#51), the door's own paragraph in "# Outside the sandbox" says this and where to go instead.
 const SANDBOX_LIMITS = `\n\n# Sandbox limits
 
 Every process a bash command starts ends when the command ends: nothing keeps running behind it. And a sandboxed command's \`localhost\` is its own, not the user's (with \`network: true\` it is the host's) — the user can't reach a server started inside the sandbox. So never start a dev server or a service "for the user", and don't say a server is running: to try one, run it yourself in your own terminal within the command, check it there, and stop it; to let the user try one, give them the command to run in their own terminal.`;

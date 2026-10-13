@@ -81,6 +81,12 @@ interface SandboxOptions {
    * outside the sandbox). bwrap leaves the empty mount point behind; the caller removes it.
    */
   placeholders?: string[];
+  /**
+   * Files or folders mounted at a path of their own, after /run is emptied (so a destination under /run works): the
+   * process door's relay (#51) needs Marv's bun at /run/marv-bun (read-only) and its socket folder at /run/marv
+   * (writable for the process that serves it, read-only for a command that only connects).
+   */
+  binds?: { source: string; dest: string; writable?: boolean }[];
   /** The project read-only too: for Marv's own checks, which run the project's code without asking (src/diagnostics). */
   projectReadOnly?: boolean;
   /** The file system, injectable for tests: whether a path exists (following symlinks), */
@@ -211,6 +217,7 @@ export function sandboxArgs({
   readOnly = [],
   writable = [],
   placeholders = [],
+  binds = [],
   projectReadOnly = false,
   exists = existsSync,
   stat = lstatKind,
@@ -218,6 +225,7 @@ export function sandboxArgs({
 }: SandboxOptions): string[] {
   const args = ["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", home];
   args.push(...runMounts(path, network, exists, realpath));
+  for (const { source, dest, writable } of binds) args.push(writable ? "--bind" : "--ro-bind", source, dest);
   const mounts = TOOLCHAINS.map((dir) => join(home, dir)).filter((full) => exists(full));
   for (const full of mounts) args.push("--ro-bind", full, full);
   // Bind the resolved path (what was checked), at the path the caller gave. A folder around the project goes

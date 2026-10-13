@@ -8,6 +8,8 @@ import { CHECKS_DIR, type ProjectCheck } from "../checks/load.ts";
 import { printable } from "../printable.ts";
 import { formatViolation, type ProjectCheckResult } from "../checks/kind.ts";
 import { usageReport, type Totals } from "../usage.ts";
+import type { ProcessInfo } from "../processes.ts";
+import { processLine } from "../tools/process.ts";
 import type { Usage } from "../provider/types.ts";
 
 // Slash commands are handled locally and never reach the LLM.
@@ -51,6 +53,8 @@ export type CommandAction =
   | { type: "memory" }
   /** Summarize the conversation so far and continue from the summary. */
   | { type: "compact"; focus?: string }
+  /** Stop one of the session's background processes (#51). */
+  | { type: "processes"; stop: string }
   /** The user ran a skill: /<name> <args>. */
   | { type: "skill"; skill: Skill; args: string }
   | { type: "exit" };
@@ -75,6 +79,8 @@ export interface CommandContext {
   checks?: { list: ProjectCheck[]; problems: string[]; last?: ProjectCheckResult };
   /** PATH folders under the home folder the sandbox can't see, shortened (~) for display; empty when there are none. */
   hiddenPathFolders?: string[];
+  /** The session's background processes, for /processes; undefined when the session doesn't offer the process tool. */
+  processes?: ProcessInfo[];
 }
 
 interface Command {
@@ -230,6 +236,18 @@ export const commands: Command[] = [
       if (arg === "on" || arg === "off") return { type: "checks", on: arg === "on" };
       if (arg) return { type: "print", text: "Usage: /checks, /checks on, or /checks off", isError: true };
       return { type: "print", text: checksText(config, checks ?? { list: [], problems: [] }), markdown: true };
+    },
+  },
+  {
+    name: "processes",
+    description: "Background processes the model started (/processes stop <name>)",
+    run: (args, { processes }) => {
+      const [sub = "", name, ...extra] = args.trim().split(/\s+/);
+      if (sub === "stop" && name && !extra.length) return { type: "processes", stop: name };
+      if (sub) return { type: "print", text: "Usage: /processes, or /processes stop <name>", isError: true };
+      if (!processes) return { type: "print", text: "Background processes aren't available here: they need the bubblewrap sandbox." };
+      if (!processes.length) return { type: "print", text: "No background processes. The model starts one with the process tool (a dev server, a watcher), and you're asked first." };
+      return { type: "print", text: processes.map((p) => printable(processLine(p))).join("\n") };
     },
   },
   {

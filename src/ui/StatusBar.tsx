@@ -28,13 +28,15 @@ interface Props {
   busy: boolean;
   /** Subagents running right now. */
   agents?: number;
+  /** Background processes running (#51): shown whenever there are any, since they keep running between turns. */
+  processes?: number;
   /** Yolo mode is on: always shown, so the user knows what runs without asking. */
   yolo?: boolean;
   /** A subagent's view is open: Esc closes it instead of interrupting. */
   viewing?: boolean;
 }
 
-export function StatusBar({ model, cwd, usage, confirmExit, notice, busy, agents = 0, yolo = false, viewing = false }: Props) {
+export function StatusBar({ model, cwd, usage, confirmExit, notice, busy, agents = 0, processes = 0, yolo = false, viewing = false }: Props) {
   const hint = confirmExit
     ? "Press ctrl+c again to exit"
     : notice
@@ -44,6 +46,7 @@ export function StatusBar({ model, cwd, usage, confirmExit, notice, busy, agents
       : "/help · PgUp/PgDn · ctrl+c exit";
   // On the left, which is never cut off, and whenever the hint is (busy is when it matters most).
   const showYolo = yolo && !confirmExit && !notice;
+  const running = processes && !confirmExit && !notice ? `${processes} running` : "";
 
   return (
     <Box paddingX={1} justifyContent="space-between">
@@ -51,6 +54,8 @@ export function StatusBar({ model, cwd, usage, confirmExit, notice, busy, agents
         <Text color={confirmExit ? theme.warning : theme.dim}>
           {showYolo && <Text color={theme.accent}>yolo</Text>}
           {showYolo && " · "}
+          {running && <Text color={theme.accent}>{running}</Text>}
+          {running && " · "}
           {hint}
         </Text>
       </Box>

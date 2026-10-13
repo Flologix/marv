@@ -25,6 +25,7 @@ const APPROVE_PREFIXES: Record<string, string[]> = {
   files: ["files"],
   memory: ["memory"],
   agent_worktree: ["agent:worktree"],
+  process: ["process:"],
 };
 
 const ALL_APPROVE_NAMES = Object.keys(APPROVE_PREFIXES);
@@ -87,6 +88,8 @@ export function buildApprover(
       const needs = [...(flags[1] ? ["network"] : []), ...(flags[2] ? ["git_write"] : [])];
       return needs.length > 0 && needs.every((n) => known.has(n)) ? ("yes" as const) : ("unavailable" as const);
     }
+    // A background process that shares the user's network needs network too, as a bash command with it does.
+    if (key.startsWith("process:net:")) return known.has("process") && known.has("network") ? ("yes" as const) : ("unavailable" as const);
     if (prefixes.some((prefix) => key === prefix || key.startsWith(prefix))) return "yes" as const;
     return "unavailable" as const;
   };

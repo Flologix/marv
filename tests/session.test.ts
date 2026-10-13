@@ -1197,7 +1197,7 @@ describe("deferred MCP tools (#14)", () => {
   const used = (promptTokens: number): AgentEvent => ({ type: "usage", usage: { promptTokens, completionTokens: 0 } });
   const tools = [fakeTool("mcp__x__a", { kind: "read" }), fakeTool("mcp__x__b", { kind: "read" })];
   const specsOf = (ts: Tool[]): ToolSpec[] => ts.map((t) => ({ name: t.name, description: t.description, parameters: { type: "object", properties: {} } }));
-  const builtinNames = toolSpecsFor({ hasSkills: false }).map((s) => s.name);
+  const builtinNames = toolSpecsFor({ hasSkills: false, process: sandboxAvailable() }).map((s) => s.name);
   const NOTE = "Marv: MCP tools you can use (not loaded: call tool_search with their names to see their parameters, then run one with mcp_call):";
   const lastUser = (p: ScriptedProvider, i: number) => p.requests[i]!.history.findLast((t) => t.role === "user")!.text;
   const ready = (ts: Tool[] = tools) => fakeMcp(Promise.resolve(), specsOf(ts), [...ts]);

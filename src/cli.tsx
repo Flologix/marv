@@ -198,6 +198,7 @@ const herdrPane = herdrTarget(process.env);
 const herdr = herdrPane && new HerdrReporter(herdrPane);
 
 let flush: () => Promise<void> = async () => {};
+let stopProcesses: () => Promise<void> = async () => {};
 const instance = render(
   <App
     store={store}
@@ -220,6 +221,7 @@ const instance = render(
     mcpProblems={mcpProblems}
     herdr={herdr}
     onFlush={(f) => (flush = f)}
+    onStopProcesses={(stop) => (stopProcesses = stop)}
     memory={memory}
     resume={args.includes("-c") || args.includes("--continue") ? "latest" : args.includes("-r") || args.includes("--resume") ? "pick" : undefined}
   />,
@@ -231,6 +233,9 @@ selection.repaint = instance.repaint;
 await instance.waitUntilExit();
 // The last turn and pending trajectory records reach the disk (quitting cancels the delayed save).
 await Promise.race([flush(), Bun.sleep(2000)]);
+// Background processes stop with Marv (#51): SIGTERM, then SIGKILL after 2 s; their sandboxes also die with Marv if
+// it's killed harder (bwrap's --die-with-parent).
+await Promise.race([stopProcesses(), Bun.sleep(2500)]);
 // Let servers shut down cleanly, but don't hang on one that won't.
 await Promise.race([mcp.close(), Bun.sleep(2000)]);
 // Herdr stops showing an agent in this pane; no waiting on a Herdr that doesn't answer.
