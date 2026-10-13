@@ -208,6 +208,13 @@ describe("http", () => {
     await expect(resolveAdd(parseAddArgs("https://mcp.linear.app/mcp --env X"), deps())).rejects.toThrow(/--header/);
     await expect(resolveAdd(parseAddArgs('weather-mcp --header "Authorization: Bearer ${X}"'), deps())).rejects.toThrow(/--env/);
   });
+  test("options that don't fit what a registry entry resolves to are refused too, never dropped", async () => {
+    // ai.smithery/github resolves to a remote server: --env and server arguments can't apply to it.
+    await expect(resolveAdd(parseAddArgs("ai.smithery/github --env X"), deps())).rejects.toThrow(/--header/);
+    await expect(resolveAdd(parseAddArgs("ai.smithery/github -- --verbose"), deps())).rejects.toThrow(/--header/);
+    // io.modelcontextprotocol/filesystem resolves to a package: a --header can't apply to it.
+    await expect(resolveAdd(parseAddArgs('io.modelcontextprotocol/filesystem --header "X-Key: ${K}" -- /tmp'), deps())).rejects.toThrow(/--env/);
+  });
 });
 
 describe("the MCP Registry", () => {

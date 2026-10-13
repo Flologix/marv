@@ -279,3 +279,9 @@ describe("slash commands", () => {
     expect(text).toContain("bad.md needs a description");
   });
 });
+
+test("/mcp with a name an object inherits (__proto__, constructor) is a usage error, not a crash", () => {
+  for (const sub of ["__proto__", "constructor", "toString", "hasOwnProperty"]) {
+    expect(runCommand(`/mcp ${sub}`)).toMatchObject({ type: "print", isError: true });
+  }
+});

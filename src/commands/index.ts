@@ -188,7 +188,9 @@ export const commands: Command[] = [
       if (!trimmed) return { type: "print", text: mcpText(mcp), markdown: true };
       const [sub = "", ...words] = trimmed.split(/\s+/);
       const rest = trimmed.slice(sub.length).trim();
-      const run = MCP_SUBCOMMANDS[sub.toLowerCase()];
+      // Own keys only: "__proto__" or "constructor" would otherwise find Object.prototype's.
+      const key = sub.toLowerCase();
+      const run = Object.hasOwn(MCP_SUBCOMMANDS, key) ? MCP_SUBCOMMANDS[key] : undefined;
       return (run && run(rest, words, mcp)) ?? { type: "print", text: MCP_USAGE, isError: true };
     },
   },
