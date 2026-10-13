@@ -321,7 +321,75 @@ describe("App", () => {
     expect(frame).toContain("It says to remember the milk.");
     // The real tool ran on the project and its output went back to the model.
     expect(model.requests[1]!.history.at(-1)).toEqual({ role: "tool", callId: "c1", name: "read_file", text: "    1→remember the milk" });
-    expect(model.requests[0]!.options.tools!.map((t) => t.name)).toEqual(["read_file", "glob", "grep", "web_fetch", "edit_file", "write_file", "bash", "memory", "agent"]);
+    expect(model.requests[0]!.options.tools!.map((t) => t.name)).toEqual(["read_file", "glob", "grep", "web_fetch", "edit_file", "write_file", "bash", "memory", "plan", "agent"]);
+  });
+
+  describe("the plan (#15)", () => {
+    const planCall = (id: string, items: { text: string; status: string }[]): AgentEvent[] => [
+      { type: "tool_call", call: { id, name: "plan", arguments: JSON.stringify({ items }) } },
+      { type: "done", reason: "tool_calls" },
+    ];
+    const reply = (text: string): AgentEvent[] => [{ type: "text_delta", text }, { type: "done" }];
+    const three = [
+      { text: "Read the report command", status: "done" },
+      { text: "Add the --json flag", status: "in_progress" },
+      { text: "Update README", status: "pending" },
+    ];
+    const allDone = three.map((i) => ({ ...i, status: "done" }));
+    /** The rows between the transcript and the prompt: the panel sits right above the prompt's line. */
+    const abovePrompt = (frame: string) => frame.slice(0, frame.lastIndexOf("╭")).trimEnd().split("\n").slice(-4).join("\n");
+
+    test("a plan call pins the panel above the prompt with the current item; an all-done one hides it", async () => {
+      const model = new ScriptedProvider([planCall("p1", three), reply("Working on it."), planCall("p2", allDone), reply("All done.")]);
+      const { lastFrame, stdin } = renderApp(LOCAL, 0, undefined, () => model);
+      await type(stdin, "do three things");
+      await until(() => lastFrame()!.includes("Working on it."));
+      const frame = lastFrame()!;
+      expect(frame).toContain("● plan Plan");
+      expect(frame).toContain("⎿ 1/3 done");
+      expect(abovePrompt(frame)).toContain(" Plan 1/3 ─");
+      expect(abovePrompt(frame)).toContain("▸ Add the --json flag");
+      await type(stdin, "finish");
+      await until(() => lastFrame()!.includes("All done."));
+      expect(lastFrame()).toContain("⎿ 3/3 done");
+      expect(lastFrame()).not.toContain(" Plan 3/3 ─");
+      expect(lastFrame()).not.toContain("▸ Add the --json flag");
+    });
+
+    test("/clear hides it", async () => {
+      const model = new ScriptedProvider([planCall("p1", three), reply("Working on it.")]);
+      const { lastFrame, stdin } = renderApp(LOCAL, 0, undefined, () => model);
+      await type(stdin, "do three things");
+      await until(() => lastFrame()!.includes("Working on it."));
+      expect(lastFrame()).toContain(" Plan 1/3 ─");
+      await type(stdin, "/clear");
+      await tick(100);
+      expect(lastFrame()).not.toContain(" Plan 1/3 ─");
+    });
+
+    test("not on a window under 20 rows", async () => {
+      const model = new ScriptedProvider([planCall("p1", three), reply("Working on it.")]);
+      const app = renderApp(LOCAL, 0, undefined, () => model);
+      Object.defineProperty(app.stdout, "rows", { value: 15, configurable: true });
+      app.stdout.emit("resize");
+      await type(app.stdin, "do three things");
+      await until(() => app.lastFrame()!.includes("⎿ 1/3 done"));
+      expect(app.lastFrame()).not.toContain(" Plan 1/3 ─");
+    });
+
+    test("a resumed session shows its saved plan", async () => {
+      const sessions = new SessionStore(join(dir, "sessions"));
+      const props = { store, initialFile: LOCAL, env: {}, version: "9.9.9", cwd: "~/x", root: project, splashMs: 0, loadModels: async () => [], sessions };
+      const first = render(<App {...props} makeProvider={() => new ScriptedProvider([planCall("p1", three), reply("Working on it.")])} />);
+      await type(first.stdin, "do three things");
+      await until(() => first.lastFrame()!.includes("Working on it."));
+      await tick(400); // saved 200 ms after the turn
+      first.unmount();
+      const second = render(<App {...props} makeProvider={() => new ScriptedProvider([])} resume="latest" />);
+      await until(() => second.lastFrame()!.includes("Resumed a session"));
+      expect(second.lastFrame()).toContain(" Plan 1/3 ─");
+      expect(second.lastFrame()).toContain("▸ Add the --json flag");
+    });
   });
 
   test("a failing tool shows its error, and the model gets it to recover from", async () => {

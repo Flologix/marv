@@ -1396,3 +1396,121 @@ describe("a long AGENTS.md (#40)", () => {
     expect(result).toMatchObject({ role: "tool", text: expect.stringContaining(`${conventions.line}→## Conventions`) });
   });
 });
+
+describe("the plan (#15)", () => {
+  const items = [
+    { text: "Read the report command", status: "done" },
+    { text: "Add the --json flag", status: "in_progress" },
+    { text: "Update README and CHANGELOG", status: "pending" },
+  ] as const;
+  const planCall = (id: string, list: readonly unknown[] = items) => call(id, "plan", { items: list });
+
+  test("a plan call sets session.plan; the system prompt and specs stay byte-identical", async () => {
+    const provider = new ScriptedProvider([useTools(planCall("p1")), say("Working."), say("More.")]);
+    const session = makeSession(provider);
+    expect(session.plan).toBeNull();
+    const events = await collect(session.send("do three things"));
+    expect(session.plan).toEqual([...items]);
+    const end = events.find((e) => e.type === "tool_end");
+    expect(end).toMatchObject({ result: { output: "Plan saved: 1 of 3 done; now: Add the --json flag.", plan: [...items] } });
+    // The model got only the line; the list is in its own call.
+    expect(provider.requests[1]!.history.at(-1)).toEqual({ role: "tool", callId: "p1", name: "plan", text: "Plan saved: 1 of 3 done; now: Add the --json flag." });
+    await collect(session.send("and then?"));
+    const [a, b, c] = provider.requests;
+    expect(a!.options.tools!.map((t) => t.name)).toContain("plan");
+    for (const r of [b!, c!]) {
+      expect(r.options.system).toBe(a!.options.system);
+      expect(r.options.tools).toBe(a!.options.tools);
+    }
+    expect(a!.options.system).toContain("keep a plan with the plan tool");
+  });
+
+  test("an empty list clears it; clear() drops it", async () => {
+    const session = makeSession(new ScriptedProvider([useTools(planCall("p1")), say("Ok."), useTools(planCall("p2", [])), say("Cleared."), useTools(planCall("p3")), say("Again.")]));
+    await collect(session.send("plan"));
+    expect(session.plan).not.toBeNull();
+    await collect(session.send("drop it"));
+    expect(session.plan).toBeNull();
+    await collect(session.send("plan again"));
+    expect(session.plan).not.toBeNull();
+    await session.clear();
+    expect(session.plan).toBeNull();
+  });
+
+  test("saved with the session, and restored by resume()", async () => {
+    const sessions = new SessionStore(dir);
+    const a = makeSession(new ScriptedProvider([useTools(planCall("p1")), say("Planned.")]), { sessions });
+    await collect(a.send("plan it"));
+    await a.flush();
+    expect((await sessions.load(project, a.id))?.plan).toEqual([...items]);
+    const b = makeSession(new ScriptedProvider([]), { sessions });
+    const resumed = await b.resume(a.id);
+    expect(resumed?.plan).toEqual([...items]);
+    expect(b.plan).toEqual([...items]);
+  });
+
+  test("a malformed saved plan is dropped; the session still loads", async () => {
+    const sessions = new SessionStore(dir);
+    const a = makeSession(new ScriptedProvider([say("Hi.")]), { sessions });
+    await collect(a.send("hi"));
+    await a.flush();
+    const file = sessions.file(project, a.id);
+    const saved = JSON.parse(await readFile(file, "utf8"));
+    await writeFile(file, JSON.stringify({ ...saved, plan: [{ text: "x", status: "started" }] }));
+    const b = makeSession(new ScriptedProvider([]), { sessions });
+    const resumed = await b.resume(a.id);
+    expect(resumed?.id).toBe(a.id);
+    expect(resumed?.plan).toBeNull();
+    expect(b.plan).toBeNull();
+  });
+
+  test("plan: false leaves it out of every request and the system prompt; a call to it is unknown", async () => {
+    const provider = new ScriptedProvider([useTools(planCall("p1")), say("Ok.")]);
+    const session = makeSession(provider, { plan: false });
+    const events = await collect(session.send("plan"));
+    for (const r of provider.requests) {
+      expect(r.options.tools!.map((t) => t.name)).not.toContain("plan");
+      expect(r.options.system).not.toContain("plan tool");
+    }
+    const end = events.find((e) => e.type === "tool_end");
+    expect(end?.type === "tool_end" && end.result.isError).toBe(true);
+    expect(end?.type === "tool_end" ? end.result.output : "").toStartWith('Unknown tool "plan"');
+    expect(session.plan).toBeNull();
+  });
+
+  test("a subagent is offered no plan, and its call to one fails", async () => {
+    const sub = new ScriptedProvider([useTools(planCall("s1")), say("Found them.")]);
+    const provider = new RoutedProvider({
+      "parent-task": new ScriptedProvider([useTools(call("a1", "agent", { description: "look around", prompt: "sub-task: find the notes" })), say("Parent done.")]),
+      "sub-task": sub,
+    });
+    const session = makeSession(provider);
+    await collect(session.send("parent-task: go"));
+    expect(sub.requests[0]!.options.tools!.map((t) => t.name)).not.toContain("plan");
+    expect(sub.requests[1]!.history.at(-1)!.text).toStartWith('Unknown tool "plan"');
+    expect(session.plan).toBeNull();
+  });
+
+  describe("compaction keeps it", () => {
+    const used = (promptTokens: number): AgentEvent => ({ type: "usage", usage: { promptTokens, completionTokens: 0 } });
+
+    test("mid-turn: the request after the summary has the plan, then MID_TURN_NOTE", async () => {
+      const provider = new ScriptedProvider([useTools(planCall("p1")), [used(900), ...useTools(read("c1"))], say("SUMMARY"), say("Finished.")], 1000);
+      const session = makeSession(provider);
+      await collect(session.send("long task"));
+      const after = provider.requests[3]!.history;
+      expect(after[0]!.text).toContain("SUMMARY\n\nYour plan (from the plan tool), as it stood:\n- [done] Read the report command\n- [in progress] Add the --json flag\n- [pending] Update README and CHANGELOG\nKeep updating it with the plan tool.");
+      expect(after.at(-1)!.text).toBe(MID_TURN_NOTE);
+    });
+
+    test("before a user message: the plan is in the first message, and the message follows", async () => {
+      const provider = new ScriptedProvider([useTools(planCall("p1")), [used(900), ...say("Paused.")], say("SUMMARY"), say("Going on.")], 1000);
+      const session = makeSession(provider);
+      await collect(session.send("long task"));
+      await collect(session.send("go on"));
+      const after = provider.requests[3]!.history;
+      expect(after[0]!.text).toContain("- [in progress] Add the --json flag");
+      expect(after.at(-1)).toEqual({ role: "user", text: "go on" });
+    });
+  });
+});

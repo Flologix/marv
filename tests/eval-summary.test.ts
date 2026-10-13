@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { eventCost, formatSummary, summarizeRuns, type RunResult } from "../evals/summary.ts";
+import { eventCost, formatSummary, planOutcome, summarizeRuns, testCounts, type RunResult } from "../evals/summary.ts";
 
 const run = (over: Partial<RunResult> = {}): RunResult => ({
   diagnostics: true,
@@ -82,5 +82,36 @@ describe("formatSummary", () => {
 
   test("no runs", () => {
     expect(formatSummary([])).toBe("No runs.");
+  });
+});
+
+describe("the plan tool's measures (#15)", () => {
+  const items = (...statuses: string[]) => JSON.stringify({ items: statuses.map((status, i) => ({ text: `s${i}`, status })) });
+
+  test("planCalls counts the calls; planOpen: the run ended with an answer while the last plan had unfinished items", () => {
+    expect(planOutcome([items("in_progress", "pending"), items("done", "in_progress")], "end")).toEqual({ planCalls: 2, planOpen: true });
+    expect(planOutcome([items("in_progress"), items("done", "done")], "end")).toEqual({ planCalls: 2, planOpen: false });
+    // Not an answer (out of steps, a timeout): unfinished, but not "let go stale".
+    expect(planOutcome([items("in_progress")], "max_steps")).toEqual({ planCalls: 1, planOpen: false });
+    expect(planOutcome([], "end")).toEqual({ planCalls: 0, planOpen: false });
+    // A malformed call (refused by the tool) isn't the plan.
+    expect(planOutcome([items("in_progress"), "{not json"], "end")).toEqual({ planCalls: 2, planOpen: true });
+  });
+
+  test("testsPassed and testsTotal from a bun test summary, absent when unreadable", () => {
+    expect(testCounts("(fail) x\n\n 5 pass\n 1 fail\n 9 expect() calls\nRan 6 tests across 1 file. [12.00ms]")).toEqual({ testsPassed: 5, testsTotal: 6 });
+    expect(testCounts(" 3 pass\n 0 fail\nRan 3 tests across 1 file.")).toEqual({ testsPassed: 3, testsTotal: 3 });
+    expect(testCounts("error: Cannot find module")).toEqual({});
+  });
+
+  test("formatSummary shows tests passed and plan calls when the runs have them", () => {
+    const text = formatSummary([
+      run({ plan: true, planCalls: 3, planOpen: true, testsPassed: 4, testsTotal: 5 }),
+      run({ plan: true, planCalls: 1, planOpen: false, testsPassed: 5, testsTotal: 5 }),
+    ]);
+    expect(text).toMatch(/tests[\s\S]*\b90%/);
+    expect(text).toMatch(/plan\/run[\s\S]*\b2\.0\b/);
+    expect(text).toMatch(/plan open[\s\S]*\b1\b/);
+    expect(formatSummary([run()])).not.toMatch(/plan\/run|tests/);
   });
 });

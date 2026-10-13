@@ -19,6 +19,8 @@ export interface Args {
   mcp?: string;
   /** Raw: auto, deferred or eager (#14); the runner rejects the rest. */
   mcpTools?: string;
+  /** The plan tool (#15): "on" (the default) or "off", the comparison's other arm. */
+  plan: "on" | "off";
 }
 
 export function parseArgs(argv: string[]): Args {
@@ -35,6 +37,8 @@ export function parseArgs(argv: string[]): Args {
     return value;
   };
   // The report's files, up to the next flag: `--label x` after them isn't part of the file list (its value would be).
+  const plan = option("plan") ?? "on";
+  if (plan !== "on" && plan !== "off") throw new Error(`--plan takes on or off, not "${plan}"`);
   const at = argv.indexOf("--report");
   const rest = at >= 0 ? argv.slice(at + 1) : [];
   const end = rest.findIndex((a) => a.startsWith("--"));
@@ -52,5 +56,6 @@ export function parseArgs(argv: string[]): Args {
     diagnostics: option("diagnostics"),
     mcp: option("mcp"),
     mcpTools: option("mcp-tools"),
+    plan,
   };
 }

@@ -24,6 +24,7 @@ Marv is written in TypeScript on [Bun](https://bun.sh), with an [Ink](https://gi
 - **Trajectories and feedback.** Every turn is logged step by step (requests, replies, tool calls, subagents, timings, tokens) to `~/.marv/trajectories/`, with your ratings: `/good`, `/bad`, `/label`, and what your next message implies ("thanks, perfect" or "that's wrong"). `bun run stats` sums them up per model or Marv version, so you can measure whether a change made runs better.
 - **Type errors caught early.** After Marv changes files in a TypeScript project, it runs the project's own typecheck in the sandbox and tells the model about errors the change added, even in files it didn't touch (a project here means a `tsconfig.json` in the folder Marv starts in plus the project's own `typescript` or tsgo in that folder's `node_modules`; a global tsc isn't used), so it fixes broken callers before saying it's done. `/diagnostics off` turns it off.
 - **Your project's rules, as checks.** Rules from your instructions ("imports use `.ts` extensions", "never call X outside Y") can live in `.marv/checks/` as code: after a step that changed files, Marv runs the checks those files concern, in the sandbox, and tells the model only the violations its change added, with the reason. An obeyed rule costs nothing; a broken one comes back when it matters. See [Checks](#checks).
+- **A plan for long tasks.** For a task with several steps (or a request with several asks in one paragraph), the model writes a checklist with its `plan` tool and ticks it off as it works. Marv pins it above the prompt (`Plan 2/5`, the current item highlighted) until every item is done, saves it with the session, and hands it back to the model after the conversation is compacted, so the README it was also asked to update isn't forgotten.
 - **No dead stops.** After 25 steps without finishing, Marv asks whether to keep going instead of giving up. Raise the interval with `/steps 40` (or `maxSteps` in the config), or turn the asking off with `/steps off` — like Claude Code and Codex, a long run then just keeps going (subagents still stop at their own 50).
 - **Cost tracking.** OpenRouter's actual charge per request, plus context and cache use, in the status bar; `/cost` for the breakdown.
 - **Herdr aware.** Run Marv in a [Herdr](https://herdr.dev) pane and Herdr's sidebar shows whether it's working, waiting for your approval, or done, with nothing to set up.
@@ -435,7 +436,9 @@ await session.close();
   TypeScript projects after the model's file changes and tells it about new errors; it needs the sandbox.
   `checks` (on by default; nothing runs without `.marv/checks/`) does the same with the project's own checks.
   `maxSteps` (default 25) sets how many steps a turn runs before it stops or asks; `0` never asks or stops the
-  main agent (subagents keep their own limit).
+  main agent (subagents keep their own limit). `plan` (on by default) offers the plan tool: `session.plan` is the
+  model's checklist (or `null`), and each change also arrives as a `tool_end`'s `result.plan`; `plan: false`
+  leaves the tool out for the whole session (it changes the tool list, so `configure()` can't toggle it).
 - **MCP servers in code:** `mcpServers: { name: { command, args } }` (`.mcp.json`'s format). These are trusted like
   your own: no trust prompt, started in your home folder (use an absolute path, or `${MARV_PROJECT_DIR}` for
   the project). So never pass config read from a repository you don't control; `sources: ["project"]` is the

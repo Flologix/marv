@@ -88,6 +88,11 @@ export interface SessionOptions {
    */
   checks?: boolean;
   /**
+   * Offer the plan tool: a checklist the model keeps for a long task (`session.plan` reads it, each change also
+   * arrives as a tool_end's `result.plan`). Default true. Fixed for the session, since it changes the tool list.
+   */
+  plan?: boolean;
+  /**
    * MCP tools' specs in every request ("eager"), or only their names, in a note, with tool_search and mcp_call to
    * load and run them ("deferred"). Default "auto": deferred when the specs would cost more than min(4000 tokens,
    * 10% of the context window). Decided once per conversation, at its first turn with MCP tools.
@@ -185,6 +190,7 @@ export async function createSession(options: SessionOptions): Promise<Session> {
     maxSteps: options.maxSteps,
     diagnostics: options.diagnostics,
     checks: options.checks,
+    plan: options.plan,
     mcpTools: options.mcpTools,
     sandbox: options.sandbox,
     yolo: options.yolo,
@@ -232,7 +238,7 @@ export type { Session, SessionEvent, TurnEndReason, CompactResult, Resumed } fro
 export type { ProviderOption } from "./provider/factory.ts";
 export type { Source } from "./sources.ts";
 export { ToolError } from "./tools/types.ts";
-export type { AgentHost, AgentProgress, Tool, ToolContext, ToolResult, ApprovalRequest, Decision, Preview, Scope, DiffLine, DiffShown } from "./tools/types.ts";
+export type { AgentHost, AgentProgress, Tool, ToolContext, ToolResult, ApprovalRequest, Decision, Preview, Scope, DiffLine, DiffShown, PlanItem } from "./tools/types.ts";
 export type { Provider, AgentEvent, ChatTurn, StreamOptions, ToolCall, ToolSpec, Usage } from "./provider/types.ts";
 export { OllamaProvider } from "./provider/ollama.ts";
 export { OpenAICompatProvider } from "./provider/openai-compat.ts";

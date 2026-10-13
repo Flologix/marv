@@ -10,6 +10,7 @@ import { projectPath } from "./files.ts";
 import { glob } from "./glob.ts";
 import { grep } from "./grep.ts";
 import { memory } from "./memory.ts";
+import { plan } from "./plan.ts";
 import { readFile } from "./read-file.ts";
 import { repairJsonArgs, withNote } from "./repair.ts";
 import { skill } from "./skill.ts";
@@ -17,7 +18,7 @@ import { webFetch } from "./web-fetch.ts";
 import { writeFile } from "./write-file.ts";
 import { ToolError, type Tool, type ToolContext, type ToolResult } from "./types.ts";
 
-export const tools: Tool[] = [readFile, glob, grep, webFetch, skill, editFile, writeFile, bash, memory, agent] as Tool[];
+export const tools: Tool[] = [readFile, glob, grep, webFetch, skill, editFile, writeFile, bash, memory, plan, agent] as Tool[];
 
 /** Whether a call may run at the same time as its neighbours (subagents). */
 export const isParallelCall = (call: ToolCall) => tools.some((t) => t.name === call.name && t.parallel);
@@ -34,9 +35,12 @@ export function specOf(tool: Tool): ToolSpec {
   return { name: tool.name, description: tool.description, parameters };
 }
 
-/** The specs for a session: the skill tool only when there are skills to load. Same objects every time (cache). */
-export function toolSpecsFor({ hasSkills }: { hasSkills: boolean }): ToolSpec[] {
-  return hasSkills ? toolSpecs : toolSpecs.filter((spec) => spec.name !== "skill");
+/**
+ * The specs for a session: the skill tool only when there are skills to load, the plan tool unless the session
+ * turned it off (#15). Same objects every time (cache).
+ */
+export function toolSpecsFor({ hasSkills, plan = true }: { hasSkills: boolean; plan?: boolean }): ToolSpec[] {
+  return toolSpecs.filter((spec) => (hasSkills || spec.name !== "skill") && (plan || spec.name !== "plan"));
 }
 
 /**

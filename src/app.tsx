@@ -39,7 +39,7 @@ import { searchRegistry, searchText, type RegistryHit } from "./mcp/install/regi
 import { parseAddArgs, type AddOptions } from "./mcp/install/source.ts";
 import { addPersonalServer, personalServerNames, removePersonalServer } from "./mcp/personal-file.ts";
 import { printable } from "./printable.ts";
-import type { AgentProgress, ApprovalRequest, Decision } from "./tools/types.ts";
+import type { AgentProgress, ApprovalRequest, Decision, PlanItem } from "./tools/types.ts";
 import { checkNotice } from "./diagnostics/turn.ts";
 import { projectCheckNotice, type ProjectCheckResult } from "./checks/kind.ts";
 import { loadChecks, type ProjectCheck } from "./checks/load.ts";
@@ -48,6 +48,7 @@ import { instructionsCutItem, type InstructionsCut } from "./prompt.ts";
 import type { CommandAction } from "./commands/index.ts";
 import type { Message, Notice, NoticeItem, NoticeTone } from "./types.ts";
 import { AgentView, AgentViewHeader } from "./ui/AgentView.tsx";
+import { PLAN_MIN_WINDOW, PlanView } from "./ui/PlanView.tsx";
 import { Approval } from "./ui/Approval.tsx";
 import { SessionPicker } from "./ui/SessionPicker.tsx";
 import { MessageView } from "./ui/MessageView.tsx";
@@ -276,6 +277,8 @@ export function App({
   const agentLogs = useRef(new Map<string, AgentLog>());
   // The subagent whose view is open, if any; `logVersion` moves when its log changed.
   const [viewing, setViewing] = useState<string | null>(null);
+  /** The plan tool's list (#15), pinned above the prompt while it has something left to do. */
+  const [plan, setPlan] = useState<readonly PlanItem[] | null>(null);
   const viewingRef = useRef(viewing);
   viewingRef.current = viewing;
   const [logVersion, setLogVersion] = useState(0);
@@ -453,6 +456,7 @@ export function App({
     agentLogs.current.clear();
     setViewing(null);
     setUsage(null);
+    setPlan(null);
     setItems([{ kind: "welcome", id: "welcome-0" }]);
   }, [session, addMessage]);
 
@@ -684,6 +688,8 @@ export function App({
               const summary = result.isError && result.summary === "error" ? result.output.split("\n")[0] : result.summary;
               const status = result.declined ? "declined" : result.isError ? "error" : "done";
               if (entry) updateMessage(entry.line, { tool: { label: result.label, status, summary, steps: callSteps, diff: result.diff } });
+              // The main agent's plan call: a new list (an empty one clears it). Subagents have no plan tool.
+              if (event.call.name === "plan" && result.plan) setPlan(result.plan.length ? result.plan : null);
               const log = logs.get(event.call.id);
               if (log) {
                 // It may have ended before its loop started (a failed check): either way it's over now.
@@ -1315,6 +1321,7 @@ export function App({
       selection.reset();
       agentLogs.current.clear();
       setViewing(null);
+      setPlan(resumed.plan);
       // Never lower it: an update still on its way for a message of this process must not hit a restored one.
       nextId.current = Math.max(nextId.current, Math.max(0, ...resumed.transcript.map((m) => m.id)) + 1);
       syncUsage();
@@ -1511,6 +1518,8 @@ export function App({
           <AgentView log={view} version={logVersion} showSteps={showSteps} />
         </ScrollView>
       )}
+
+      {rows >= PLAN_MIN_WINDOW && <PlanView items={plan} width={columns} />}
 
       <Box flexDirection="column" flexShrink={0}>
         {picker && !setupMode && !approval ? (

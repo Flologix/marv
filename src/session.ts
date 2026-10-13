@@ -43,7 +43,7 @@ import { AgentRecorder, type Trajectory, type TrajectoryRecord, type TrajectoryS
 import { isParallelCall, runTool, specOf, tools as builtinTools, toolSpecsFor } from "./tools/index.ts";
 import { withNote } from "./tools/repair.ts";
 import { pastedScopes } from "./tools/web-fetch.ts";
-import type { AgentHost, AgentProgress, ApprovalRequest, Decision, Tool } from "./tools/types.ts";
+import type { AgentHost, AgentProgress, ApprovalRequest, Decision, PlanHost, PlanItem, Tool } from "./tools/types.ts";
 import type { Message } from "./types.ts";
 import { addUsage, emptyTotals, type Totals } from "./usage.ts";
 
@@ -81,6 +81,8 @@ export interface Resumed {
   /** What the user saw (the client's transcript when it gave one, otherwise the messages and replies). */
   transcript: Message[];
   totals: Totals;
+  /** The plan tool's list as it was saved (#15), or null. */
+  plan: PlanItem[] | null;
 }
 
 export interface SessionInit {
@@ -136,6 +138,11 @@ export interface SessionInit {
   /** The project checks' session state; tests pass one with a stand-in runner. */
   projectChecks?: ProjectChecks;
   /**
+   * Offer the plan tool (#15): a checklist the main agent keeps for a long task. Default true. Fixed for the
+   * session's life, since it changes the tool list (prompt cache).
+   */
+  plan?: boolean;
+  /**
    * MCP tools' specs in every request ("eager"), or only their names, in a note, with tool_search and mcp_call to
    * load and run them ("deferred", #14). Default "auto": deferred when the specs would cost more than min(4000
    * tokens, 10% of the context window). Read when a conversation decides its mode (its first turn with MCP tools).
@@ -177,6 +184,13 @@ const stopped = (signal: AbortSignal) =>
 function gitHead(root: string): string | undefined {
   const head = runGit(root, ["rev-parse", "HEAD"], { timeoutMs: 2000 });
   return head.ok ? head.out.trim() : undefined;
+}
+
+const PlanShape = z.array(z.object({ text: z.string(), status: z.enum(["pending", "in_progress", "done"]) }));
+/** A saved session's plan, or null for none, an old file or a hand edit (the plan is dropped, the session still loads). */
+function planOf(value: unknown): PlanItem[] | null {
+  const parsed = PlanShape.safeParse(value);
+  return parsed.success && parsed.data.length ? parsed.data : null;
 }
 
 const ListingShape = z.object({ mode: z.enum(["deferred", "eager"]), announced: z.array(z.string()) });
@@ -231,6 +245,8 @@ export interface Session {
   readonly memory: Memories | undefined;
   /** Files and servers that couldn't be read, and why. */
   readonly problems: readonly string[];
+  /** The plan tool's list (#15), or null when there's none; each change also arrives as a tool_end's `result.plan`. */
+  readonly plan: readonly PlanItem[] | null;
   /** The last request's tokens (how full the context is), and the whole session's (survives clear()). */
   usage(): { last?: Usage; totals: Totals; contextLength?: number };
   /** Runs one turn and yields what happens; leaving the loop early interrupts it. Throws if a turn is running, or after close(). */
@@ -337,6 +353,10 @@ export class MarvSession implements Session {
   private readonly loaded = new Set<string>();
   /** The running turn's MCP specs: what a mid-turn compaction announces again. */
   private turnMcpSpecs: ToolSpec[] = [];
+  /** The plan tool's list (#15): set only by its calls, saved with the conversation, re-injected after compaction. */
+  private planItems: PlanItem[] | null = null;
+  /** Whether this session offers the plan tool (decided at construction: it changes the tool list). */
+  private readonly planOn: boolean;
 
   constructor(private readonly init: SessionInit) {
     checkToolNames(init.tools ?? []);
@@ -362,8 +382,10 @@ export class MarvSession implements Session {
     this.projectChecks = init.projectChecks ?? new ProjectChecks();
     this.logging = init.logTrajectories ?? true;
     this.memories = init.memory?.initial;
-    // Built once, so every request sends byte-identical tool definitions (the skill tool only when there are skills).
-    this.specs = [...toolSpecsFor({ hasSkills: (init.skills?.length ?? 0) > 0 }), ...(init.tools ?? []).map(specOf)];
+    this.planOn = init.plan ?? true;
+    // Built once, so every request sends byte-identical tool definitions (the skill tool only when there are skills,
+    // the plan tool unless it's off).
+    this.specs = [...toolSpecsFor({ hasSkills: (init.skills?.length ?? 0) > 0, plan: this.planOn }), ...(init.tools ?? []).map(specOf)];
     this.system = this.buildSystem();
     this.saved = newSession(init.root, { provider: this.factory.id, model: this.factory.model });
     this.lookup();
@@ -390,6 +412,10 @@ export class MarvSession implements Session {
   /** Memory as of the start of this conversation. */
   get memory(): Memories | undefined {
     return this.memories;
+  }
+  /** The plan tool's list, or null. */
+  get plan(): readonly PlanItem[] | null {
+    return this.planItems;
   }
 
   /** The last request's tokens (how full the context is), and the whole session's (survives clear()). */
@@ -449,6 +475,7 @@ export class MarvSession implements Session {
     this.messages = [];
     this.last = undefined;
     this.listing = null; // a new conversation decides its MCP mode again
+    this.planItems = null; // a new conversation, a new plan
     this.loaded.clear();
     // Servers removed with /mcp remove kept their tools listed for the old conversation's sake; not for a new one.
     this.init.mcp?.forgetRemoved?.();
@@ -479,8 +506,10 @@ export class MarvSession implements Session {
     this.totals = saved.totals;
     this.last = undefined;
     this.listing = listingOf(saved.mcp);
+    // The model needs nothing extra: its last plan call (or the summary holding the plan) is still in the conversation.
+    this.planItems = planOf(saved.plan);
     this.loaded.clear();
-    return { id: saved.id, updatedAt: saved.updatedAt, model: saved.model, transcript: saved.transcript, totals: saved.totals };
+    return { id: saved.id, updatedAt: saved.updatedAt, model: saved.model, transcript: saved.transcript, totals: saved.totals, plan: this.planItems };
   }
 
   /**
@@ -562,6 +591,7 @@ export class MarvSession implements Session {
       transcript,
       totals: this.totals,
       ...(this.listing ? { mcp: { mode: this.listing.mode, announced: [...this.listing.announced] } } : {}),
+      plan: this.planItems ?? undefined,
     };
     await store.save(this.saved);
   }
@@ -630,7 +660,7 @@ export class MarvSession implements Session {
    */
   private offered(): { specs: ToolSpec[]; tools: Tool[] } {
     const mcp = this.init.mcp;
-    const tools = [...builtinTools, ...(this.init.tools ?? [])];
+    const tools = [...(this.planOn ? builtinTools : builtinTools.filter((t) => t.name !== "plan")), ...(this.init.tools ?? [])];
     if (!mcp) return { specs: this.specs, tools };
     // Deferred: two constant specs instead of the servers', whatever the servers do (prompt cache).
     if (this.listing?.mode === "deferred") {
@@ -779,7 +809,7 @@ export class MarvSession implements Session {
     if ("error" in result) return { compacted: false, reason: signal.aborted ? "stopped" : "failed", error: result.error };
     // In place: runAgent holds this very array for the whole turn, so a compaction between its steps must
     // rewrite it where it stands — replacing this.conversation would leave the loop on the full history.
-    this.conversation.splice(0, this.conversation.length, ...compactedHistory(result.summary));
+    this.conversation.splice(0, this.conversation.length, ...compactedHistory(result.summary, this.planItems));
     // A summary may drop the list of MCP tools: the next message announces them all again (the cache starts over
     // here anyway), and schemas seen before it may be gone too.
     if (this.listing) this.listing.announced = [];
@@ -1026,6 +1056,14 @@ export class MarvSession implements Session {
       let subagents = 0;
       // What the agent tool needs to start subagents. Only the main agent gets one; what a subagent does reaches
       // this conversation only as its tool result, and the client through "subagent" events.
+      // Where the plan tool writes; only the main agent gets it (as it does agentHost), so subagents have no plan.
+      const plan: PlanHost | undefined = this.planOn
+        ? {
+            set: (items) => {
+              this.planItems = items.length ? items : null;
+            },
+          }
+        : undefined;
       const agentHost: AgentHost = {
         agents: this.init.agents ?? DEFAULT_AGENTS,
         cwd: this.cwd,
@@ -1059,7 +1097,7 @@ export class MarvSession implements Session {
         runTool: async (call) => {
           const result = await runTool(
             call,
-            { root: this.init.root, signal: stop.signal, approve, sandbox, yolo, skills: this.init.skills, memory: this.init.memory?.paths, agentHost, beforeChange: checks?.beforeChange },
+            { root: this.init.root, signal: stop.signal, approve, sandbox, yolo, skills: this.init.skills, memory: this.init.memory?.paths, agentHost, plan, beforeChange: checks?.beforeChange },
             tools,
           );
           const note = rewritten.get(call.id);

@@ -71,3 +71,19 @@ test("compactedHistory starts the model's history over from the summary", () => 
     { role: "assistant", text: expect.any(String) },
   ]);
 });
+
+test("compactedHistory appends an unfinished plan to the summary (#15); a finished or missing one changes nothing", () => {
+  const plain = compactedHistory("S");
+  expect(compactedHistory("S", null)).toEqual(plain);
+  expect(compactedHistory("S", [{ text: "All of it", status: "done" }])).toEqual(plain);
+  expect(compactedHistory("S", [])).toEqual(plain);
+  const withPlan = compactedHistory("S", [
+    { text: "Read", status: "done" },
+    { text: "Write", status: "in_progress" },
+    { text: "Docs", status: "pending" },
+  ]);
+  expect(withPlan[0]!.text).toBe(
+    `${plain[0]!.text}\n\nYour plan (from the plan tool), as it stood:\n- [done] Read\n- [in progress] Write\n- [pending] Docs\nKeep updating it with the plan tool.`,
+  );
+  expect(withPlan[1]).toEqual(plain[1]!);
+});
