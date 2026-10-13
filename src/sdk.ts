@@ -94,6 +94,12 @@ export interface SessionOptions {
    */
   plan?: boolean;
   /**
+   * Before a turn's first change, snapshot the project (git commits under a hidden ref, refs/marv/checkpoints/<session>,
+   * or a git dir of Marv's own in configDir outside a repository), and again when it ends, so `session.undoPlan()`
+   * and `session.undo(plan)` can put that turn's files back. Default true.
+   */
+  checkpoints?: boolean;
+  /**
    * MCP tools' specs in every request ("eager"), or only their names, in a note, with tool_search and mcp_call to
    * load and run them ("deferred"). Default "auto": deferred when the specs would cost more than min(4000 tokens,
    * 10% of the context window). Decided once per conversation, at its first turn with MCP tools.
@@ -213,6 +219,8 @@ export async function createSession(options: SessionOptions): Promise<Session> {
     diagnostics: options.diagnostics,
     checks: options.checks,
     plan: options.plan,
+    checkpoints: options.checkpoints,
+    checkpointsDir: join(configDir, "checkpoints", projectKey(root)),
     mcpTools: options.mcpTools,
     sandbox: options.sandbox,
     hostCommands: options.hostCommands,
@@ -272,6 +280,7 @@ export type { CheckResult } from "./diagnostics/turn.ts";
 export type { TsError } from "./diagnostics/tsc.ts";
 export type { ProjectCheckResult } from "./checks/kind.ts";
 export type { ProcessInfo } from "./processes.ts";
+export type { UndoFile, UndoPlan, UndoResult } from "./checkpoints/undo.ts";
 export type { Violation } from "./checks/load.ts";
 export type { Totals } from "./usage.ts";
 export type { Message } from "./types.ts";

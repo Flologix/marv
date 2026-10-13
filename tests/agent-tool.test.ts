@@ -455,6 +455,13 @@ describe("the agent tool", () => {
       expect(sub.gitEnv).toEqual(worktreeEnv(wt)); // git still sees the whole worktree
     });
 
+    test("the turn's checkpoint: a shared-folder subagent takes it, a worktree one doesn't", async () => {
+      const { host } = makeHost(new ScriptedProvider([]));
+      const checkpoint = async () => {};
+      expect(subagentContext({ ...parent(host), checkpoint }, "general-purpose · x").checkpoint).toBe(checkpoint);
+      expect(subagentContext({ ...parent(host), checkpoint }, "general-purpose · x", wt).checkpoint).toBeUndefined();
+    });
+
     test("in the shared folder: the project, nothing extra", async () => {
       const { host } = makeHost(new ScriptedProvider([]));
       const sub = subagentContext(parent(host), "general-purpose · x");

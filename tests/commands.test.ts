@@ -16,6 +16,7 @@ const ctx: CommandContext = {
     trajectories: true,
     diagnostics: true,
     checks: true,
+    checkpoints: true,
     mcpTools: "auto",
     maxSteps: 25,
   },
@@ -53,7 +54,7 @@ describe("slash commands", () => {
   });
 
   test("/config says when no key is needed (Ollama)", () => {
-    const action = run("/config", { ...ctx, config: { provider: "ollama", model: "qwen3.5:9b", baseUrl: "http://localhost:11434", thinking: false, contextLength: 32768, sandbox: true, yolo: true, trajectories: true, diagnostics: true, checks: true, mcpTools: "auto", maxSteps: 25 } });
+    const action = run("/config", { ...ctx, config: { provider: "ollama", model: "qwen3.5:9b", baseUrl: "http://localhost:11434", thinking: false, contextLength: 32768, sandbox: true, yolo: true, trajectories: true, diagnostics: true, checks: true, checkpoints: true, mcpTools: "auto", maxSteps: 25 } });
     expect(action).toMatchObject({ type: "print", text: expect.stringContaining("API key:   not needed") });
   });
 
@@ -128,6 +129,17 @@ describe("slash commands", () => {
     if (quiet.type !== "print") throw new Error("expected print");
     expect(quiet.text).toStartWith("**Checks**: off.");
     expect(quiet.text).toEndWith("**Last result:** off: they run only in the sandbox.");
+  });
+
+  test("/undo, and /checkpoints says what it does (and the last failure), or turns it on and off", () => {
+    expect(runCommand("/undo")).toEqual({ type: "undo" });
+    expect(runCommand("/undo 3")).toMatchObject({ type: "print", isError: true });
+    expect(runCommand("/checkpoints off")).toEqual({ type: "checkpoints", on: false });
+    expect(runCommand("/checkpoints on")).toEqual({ type: "checkpoints", on: true });
+    expect(runCommand("/checkpoints")).toMatchObject({ type: "print", text: expect.stringContaining("/undo") });
+    expect(run("/checkpoints", { ...ctx, checkpoints: { failure: "disk full" } })).toMatchObject({ text: expect.stringContaining("disk full") });
+    expect(run("/checkpoints", { ...ctx, config: { ...ctx.config, checkpoints: false } })).toMatchObject({ text: "Checkpoints: off" });
+    expect(runCommand("/checkpoints maybe")).toMatchObject({ type: "print", isError: true });
   });
 
   test("/diagnostics says what it does, or turns it on and off", () => {

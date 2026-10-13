@@ -94,6 +94,7 @@ export function makeMcpTool(server: McpServerConfig, info: McpToolInfo, call: Mc
     label: labelOf,
     // The server's own claim: you chose to run this server, so its read-only tools run freely.
     kind: readOnly ? "read" : "execute",
+    checkpoint: false, // it acts outside the project
     usesNetwork: () => true,
     scope: () => ({ key: `mcp:${server.name}:${info.name}`, description: `${server.name}'s ${info.name}` }),
     async preview(args) {

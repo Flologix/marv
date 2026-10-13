@@ -30,6 +30,7 @@ export const agent: Tool<typeof input> = {
     "Several agent calls in a row run in parallel (up to 4 at once). The available types are listed in the system prompt.",
   input,
   kind: "execute",
+  checkpoint: false, // a shared-folder subagent's own calls take the turn's checkpoint
   parallel: true,
   // Starting one in a worktree is the user's one approval for it; a
   // shared-folder subagent asks before each change it makes instead.

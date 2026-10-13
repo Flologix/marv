@@ -6,7 +6,7 @@ import { applyEvent, createAgentLog, type AgentLog } from "./agent-log.ts";
 import { GENERAL_PURPOSE, type AgentType } from "./agents.ts";
 import { copyToClipboard } from "./clipboard.ts";
 import type { HerdrReporter } from "./herdr.ts";
-import { checksStatus, commands, diagnosticsStatus, isCommand, runCommand, stepsStatus, trajectoriesStatus, yoloStatus } from "./commands/index.ts";
+import { checkpointsStatus, checksStatus, commands, diagnosticsStatus, isCommand, runCommand, stepsStatus, trajectoriesStatus, yoloStatus } from "./commands/index.ts";
 import {
   needsSetup,
   PRESETS,
@@ -26,7 +26,7 @@ import type { Provider, Usage } from "./provider/types.ts";
 import { selection } from "./selection.ts";
 import { costText, emptyTotals, tokens, type Totals } from "./usage.ts";
 import { addMemory, findMemory, loadMemory, removeMemory, type Memories, type MemoryPaths } from "./memory.ts";
-import { MarvSession, type CompactResult, type Resumed } from "./session.ts";
+import { MarvSession, type CompactResult, type Resumed, type SessionEvent } from "./session.ts";
 import { timeAgo, type SessionStore, type SessionSummary } from "./sessions.ts";
 import { skillMessage, type Skill } from "./skills.ts";
 import type { TrajectoryStore } from "./trajectory.ts";
@@ -41,6 +41,7 @@ import { addPersonalServer, personalServerNames, removePersonalServer } from "./
 import { printable } from "./printable.ts";
 import type { AgentProgress, ApprovalRequest, Decision, PlanItem } from "./tools/types.ts";
 import { checkNotice } from "./diagnostics/turn.ts";
+import { undoRequest, undoSummary, type UndoPlan, type UndoRefusal } from "./checkpoints/undo.ts";
 import { projectCheckNotice, type ProjectCheckResult } from "./checks/kind.ts";
 import { loadChecks, type ProjectCheck } from "./checks/load.ts";
 import { hiddenPathFoldersItem } from "./commands/sandbox-notice.ts";
@@ -115,6 +116,13 @@ function loginResult(s: McpServerStatus): { text: string; isError: boolean } {
 const DEFAULT_AGENTS: AgentType[] = [GENERAL_PURPOSE];
 const NO_PROBLEMS: string[] = [];
 
+/** What the waiting line says while a turn is between replies; nothing for the rest. */
+const WAITING_LABEL: Partial<Record<Extract<SessionEvent, { type: "status" }>["status"], string>> = {
+  waiting_for_mcp: "Waiting for MCP servers to start…",
+  checking: "Checking…",
+  checkpointing: "Saving a checkpoint…",
+};
+
 /** The project's checks for /checks, read when it runs (a check can be added at any time); other commands skip the disk. */
 function checksOnDisk(root: string, text: string): { list: ProjectCheck[]; problems: string[] } {
   if (!/^\/checks\b/.test(text.trim())) return { list: [], problems: [] };
@@ -178,6 +186,8 @@ interface Props {
   instructionsCut?: InstructionsCut;
   /** Where subagents' worktrees go (~/.marv/worktrees/<project>); without it, no worktrees. */
   worktreesDir?: string;
+  /** Marv's own git dir for checkpoints outside a repository (~/.marv/checkpoints/<project>); without it, none there. */
+  checkpointsDir?: string;
   /** Running in a Herdr pane: Marv reports its state there (src/herdr.ts). */
   herdr?: HerdrReporter;
   /** gh is there and logged in (checked once at startup): the session offers the github tool (#47). */
@@ -217,6 +227,7 @@ export function App({
   hiddenPathFolders = NO_PROBLEMS,
   instructionsCut,
   worktreesDir,
+  checkpointsDir,
   herdr,
   github = false,
 }: Props) {
@@ -401,6 +412,8 @@ export function App({
         yolo: config.yolo,
         diagnostics: config.diagnostics,
         checks: config.checks,
+        checkpoints: config.checkpoints,
+        checkpointsDir,
         mcpTools: config.mcpTools,
         maxSteps: config.maxSteps,
         sessions,
@@ -428,6 +441,7 @@ export function App({
       trajectories: config.trajectories,
       diagnostics: config.diagnostics,
       checks: config.checks,
+      checkpoints: config.checkpoints,
       mcpTools: config.mcpTools,
       maxSteps: config.maxSteps,
     });
@@ -593,9 +607,12 @@ export function App({
           }
           switch (event.type) {
             case "status":
-              setWaitingFor(event.status === "waiting_for_mcp" ? "Waiting for MCP servers to start…" : event.status === "checking" ? "Checking…" : null);
+              setWaitingFor(WAITING_LABEL[event.status] ?? null);
               setCompacting(event.status === "compacting");
               if (event.status === "running") stepStarted = Date.now(); // the wait for the next reply starts after a check
+              break;
+            case "checkpoint":
+              addMessage({ role: "system", isError: true, text: `This turn can't be undone: its checkpoint failed (${event.message}).` });
               break;
             case "check": {
               const notice = checkNotice(event.result);
@@ -860,6 +877,7 @@ export function App({
       mcp: { servers: mcp?.status() ?? [], problems: mcpProblems },
       checks: { ...checksOnDisk(root, text), last: lastChecks.current },
       processes: session.processesOffered ? session.processes : undefined,
+      checkpoints: session.checkpointProblem(),
     });
     switch (action.type) {
       case "print":
@@ -921,6 +939,12 @@ export function App({
         break;
       case "checks":
         void saveConfig({ ...(file ?? { provider: config.provider }), checks: action.on }, `Checks ${checksStatus({ ...config, checks: action.on })}`);
+        break;
+      case "checkpoints":
+        void saveConfig({ ...(file ?? { provider: config.provider }), checkpoints: action.on }, `Checkpoints ${checkpointsStatus({ ...config, checkpoints: action.on })}`);
+        break;
+      case "undo":
+        void undoTurn();
         break;
       case "diagnostics":
         void saveConfig({ ...(file ?? { provider: config.provider }), diagnostics: action.on }, `Diagnostics ${diagnosticsStatus({ ...config, diagnostics: action.on })}`);
@@ -1153,6 +1177,43 @@ export function App({
       addMessage({ role: "system", ...addedNotice(await mcp.add(server)) });
     } catch (err) {
       addMessage({ role: "system", isError: true, text: `Added ${name} to ~/.marv/mcp.json, but didn't start it now: ${(err as Error).message} It starts when you restart Marv.` });
+    }
+  };
+
+  /**
+   * /undo: the last turn's changes, shown like an approval (each file's diff), and on a yes put back. Outside a turn
+   * only (a turn could be writing the same files); nothing is written before the yes.
+   */
+  const undoTurn = async () => {
+    if (abortRef.current) {
+      addMessage({ role: "system", isError: true, text: "Marv is working: stop the current turn (Esc) before /undo." });
+      return;
+    }
+    let plan: UndoPlan | UndoRefusal;
+    try {
+      plan = await busyWith("Reading the checkpoints…", () => session.undoPlan());
+    } catch (err) {
+      addMessage({ role: "system", isError: true, text: `Couldn't read the checkpoints: ${(err as Error).message}` });
+      return;
+    }
+    if ("reason" in plan) {
+      if (plan.failed) addMessage({ role: "system", isError: true, text: `Couldn't undo: ${plan.reason}.` });
+      else addMessage({ role: "system", text: `Nothing to undo: ${plan.reason.replace(/^nothing to undo: /, "")}.` });
+      return;
+    }
+    if (plan.files.length === 0) {
+      addMessage({ role: "system", text: `Turn ${plan.turn} changed nothing in this project's folder, so there's nothing to undo.` });
+      return;
+    }
+    if ((await approve(undoRequest(plan))) !== "yes") {
+      addMessage({ role: "system", text: "Nothing was undone." });
+      return;
+    }
+    try {
+      const result = await busyWith("Undoing…", () => session.undo(plan));
+      addMessage({ role: "system", text: undoSummary(plan, result) });
+    } catch (err) {
+      addMessage({ role: "system", isError: true, text: `Couldn't undo: ${(err as Error).message}` });
     }
   };
 

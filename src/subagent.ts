@@ -85,6 +85,9 @@ export function subagentContext(ctx: ToolContext, who: string, worktree?: Worktr
     // Its sandboxed bash reaches the session's background processes like the main agent's (curl localhost:<port>);
     // starting one is the main agent's alone (no processes, no doors).
     forwards: ctx.forwards,
+    // A shared-folder subagent edits the same files in the same turn: the turn's one checkpoint covers it. A
+    // worktree's changes land on its branch, which is already the way back.
+    checkpoint: worktree ? undefined : ctx.checkpoint,
   };
 }
 

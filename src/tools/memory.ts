@@ -26,6 +26,7 @@ export const memory: Tool<typeof input> = {
     "and for project facts that aren't obvious from the code (project). Not for temporary task details or secrets. The user approves each change.",
   input,
   kind: "write",
+  checkpoint: false, // ~/.marv, not the project
   label: ({ action, text }) => `${action === "add" ? "remember" : "forget"}: ${text}`,
   scope: () => ({ key: "memory", description: "memory changes" }),
 

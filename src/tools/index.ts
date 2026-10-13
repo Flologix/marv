@@ -100,6 +100,15 @@ export async function runTool(call: ToolCall, ctx: ToolContext, available: Tool[
   if (!parsed.success) return noted(fail(`Invalid input for ${call.name}:\n${z.prettifyError(parsed.error)}`));
 
   const label = shortLabel(tool.label(parsed.data), ctx.root);
+  const interrupted = () => noted({ output: NOT_RUN.aborted, summary: "interrupted", declined: true, label, approval: "interrupted" as const });
+  // The turn's checkpoint, before anything that can change files runs (approved, yolo, or a tool that asks no one):
+  // whatever the call does, bash included, /undo can put back. It never fails the call; a stop meanwhile does.
+  const takesCheckpoint = tool.checkpoint ?? Boolean(tool.kind && tool.kind !== "read");
+  const checkpointed = async (): Promise<boolean> => {
+    if (!takesCheckpoint || !ctx.checkpoint) return true;
+    await ctx.checkpoint().catch(() => {});
+    return !ctx.signal?.aborted;
+  };
   try {
     // Tools that change something need the user's go-ahead. The preview runs
     // first, so a call that can't succeed fails here instead of being approved.
@@ -124,6 +133,7 @@ export async function runTool(call: ToolCall, ctx: ToolContext, available: Tool[
       // then can't touch .git). It still went through the preview above, so
       // a call that can't succeed fails the same way.
       if (ctx.yolo && tool.autoSafe?.(parsed.data, ctx)) {
+        if (!(await checkpointed())) return { ...interrupted(), ...doorResult };
         return noted({ ...(await tool.run(parsed.data, { ...ctx, callId: call.id, confined: true })), label, approval: "auto", ...doorResult });
       }
       // No one to ask (a program using the SDK without an approver): refused, as an error the model can read and
@@ -147,8 +157,10 @@ export async function runTool(call: ToolCall, ctx: ToolContext, available: Tool[
           ...doorResult,
         });
       }
+      if (!(await checkpointed())) return { ...interrupted(), approval: decision, ...doorResult };
       return noted({ ...(await tool.run(parsed.data, { ...ctx, callId: call.id })), label, approval: decision, ...doorResult });
     }
+    if (!(await checkpointed())) return interrupted();
     return noted({ ...(await tool.run(parsed.data, { ...ctx, callId: call.id })), label });
   } catch (err) {
     if (err instanceof ToolError) return noted(fail(err.message, label));

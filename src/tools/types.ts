@@ -36,6 +36,8 @@ export interface Preview {
   note?: string;
   /** Shown in the warning color, e.g. "runs WITHOUT a sandbox". */
   warning?: string;
+  /** Several files, each with its own diff (/undo: what goes back where). */
+  files?: { title: string; diff?: DiffShown; note?: string }[];
 }
 
 /** "Don't ask again this session" applies to everything with the same key. */
@@ -132,6 +134,12 @@ export interface ToolContext {
    * `curl localhost:<port>` reaches the session's own servers. Subagents get this too (but not `processes`).
    */
   forwards?: () => ProcessForward[];
+  /**
+   * The turn's checkpoint (src/checkpoints): a snapshot of the project before the turn's first change, so /undo can
+   * put it back. runTool awaits it after the approval and before running any call that can change files; one
+   * snapshot per turn, shared by every call and by shared-folder subagents. Never rejects (runTool ignores it if it does).
+   */
+  checkpoint?: () => Promise<void>;
 }
 
 /** What the process tool runs through: the session's ProcessManager. */
@@ -192,6 +200,12 @@ export interface Tool<S extends z.ZodType = z.ZodType> {
   kind?: "read" | "write" | "execute";
   /** Calls of this tool that come together in one reply run at the same time (subagents). */
   parallel?: boolean;
+  /**
+   * Whether runTool takes the turn's checkpoint before a call runs. Default: any `kind` but "read". False for tools
+   * that change nothing in the project (MCP servers act outside it, memory writes ~/.marv, a subagent's own calls
+   * take it themselves).
+   */
+  checkpoint?: boolean;
   /** Overrides `kind` for one call: whether it needs the user's approval. */
   needsApproval?(input: z.infer<S>): boolean;
   /** Whether this call can reach the network (approvals inside a worktree still ask then). */

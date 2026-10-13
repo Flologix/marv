@@ -362,3 +362,61 @@ describe("special files can't hang Marv", () => {
     expect(result.output).not.toContain("not a regular file");
   });
 });
+
+describe("the turn's checkpoint", () => {
+  const counting = () => {
+    const order: string[] = [];
+    return { order, checkpoint: async () => void order.push("checkpoint") };
+  };
+
+  test("taken before a change runs: approved, and in yolo", async () => {
+    const { order, checkpoint } = counting();
+    const approve = async () => (order.push("approve"), "yes" as const);
+    await runTool(call("write_file", { path: "new.txt", content: "x\n" }), { root, approve, checkpoint });
+    expect(order).toEqual(["approve", "checkpoint"]);
+    order.length = 0;
+    await runTool(call("edit_file", { path: "src/app.ts", old_string: "main", new_string: "start" }), { root, yolo: true, checkpoint });
+    expect(order).toEqual(["checkpoint"]);
+    await runTool(call("bash", { command: "true" }), { root, sandbox: false, approve: async () => "yes", checkpoint });
+    expect(order).toEqual(["checkpoint", "checkpoint"]);
+  });
+
+  test("not for reads, and not when declined, invalid or aborted", async () => {
+    const { order, checkpoint } = counting();
+    await runTool(call("read_file", { path: "src/app.ts" }), { root, checkpoint });
+    await runTool(call("glob", { pattern: "**/*.ts" }), { root, checkpoint });
+    await runTool(call("grep", { pattern: "greet" }), { root, checkpoint });
+    await runTool(call("write_file", { path: "a.txt", content: "x" }), { root, approve: async () => "no", checkpoint });
+    await runTool(call("write_file", { nope: true }), { root, approve: async () => "yes", checkpoint });
+    const stop = new AbortController();
+    stop.abort();
+    await runTool(call("write_file", { path: "a.txt", content: "x" }), { root, approve: async () => "yes", checkpoint, signal: stop.signal });
+    expect(order).toEqual([]);
+  });
+
+  test("not for a tool that changes nothing in the project", async () => {
+    const { order, checkpoint } = counting();
+    const outsider: Tool = {
+      name: "outsider",
+      description: "",
+      input: z.object({}),
+      label: () => "x",
+      kind: "execute",
+      checkpoint: false,
+      preview: async () => ({ title: "x" }),
+      run: async () => ({ output: "ok", summary: "ok" }),
+    };
+    await runTool(call("outsider", {}), { root, approve: async () => "yes", checkpoint }, [outsider]);
+    expect(order).toEqual([]);
+  });
+
+  test("a failing checkpoint doesn't fail the call", async () => {
+    const result = await runTool(call("write_file", { path: "b.txt", content: "x\n" }), {
+      root,
+      approve: async () => "yes",
+      checkpoint: () => Promise.reject(new Error("boom")),
+    });
+    expect(result.isError).toBeFalsy();
+    expect(existsSync(join(root, "b.txt"))).toBe(true);
+  });
+});
