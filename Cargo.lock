@@ -1390,6 +1390,7 @@ dependencies = [
  "marv-mcp",
  "marv-mesh",
  "marv-provider",
+ "marv-sandbox",
  "marv-session",
  "marv-tools",
  "marv-tui",
