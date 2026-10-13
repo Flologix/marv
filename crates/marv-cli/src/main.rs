@@ -92,5 +92,7 @@ fn main() -> ExitCode {
             Mode::HtmlConvert | Mode::RunChecks { .. } => unreachable!("handled before the runtime starts"),
         }
     });
+    // An HTML converter still running (a turn ended mid-fetch) would outlive Marv: stop it, as Marv's exit handler did.
+    marv_tools::web::convert::kill_running();
     ExitCode::from(u8::try_from(code).unwrap_or(1))
 }
