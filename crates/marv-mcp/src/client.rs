@@ -42,8 +42,8 @@ use url::Url;
 
 use crate::McpError;
 use crate::jsonrpc::{
-    CallToolParams, Implementation, InitializeParams, InitializeResult, ListToolsResult, Message, Notification,
-    PROTOCOL_VERSION, Request, RequestId, Response, RpcError, code, encode_line, method,
+    CallToolParams, Implementation, InitializeParams, InitializeResult, ListToolsResult, Message, Notification, PROTOCOL_VERSION,
+    Request, RequestId, Response, RpcError, code, encode_line, method,
 };
 use crate::oauth::{self, AuthResult, McpOAuthProvider};
 use crate::tool::McpCallResult;
@@ -257,6 +257,15 @@ impl Client {
         serde_json::from_value(raw).map_err(|e| McpError::Server(format!("the server's result isn't MCP: {e}")))
     }
 
+    /// A login's second step (the SDK transport's `finishAuth`): the code from the callback is exchanged for
+    /// tokens, which the provider saves (unless the login was cancelled meanwhile).
+    pub async fn finish_auth(&self, code: &str) -> crate::Result<()> {
+        let Wire::Http(w) = &self.inner.wire else { return Err(McpError::Server("only remote servers log in".into())) };
+        let Some(auth) = &w.auth else { return Err(McpError::Server("no login is in progress".into())) };
+        let mut provider = auth.lock().await;
+        oauth::auth(&mut provider, &w.url, None, Some(code)).await.map(|_| ())
+    }
+
     /// Cancelled once the connection is gone (the server exited, or [`Client::close`]).
     pub fn closed(&self) -> CancellationToken {
         self.inner.closed.clone()
@@ -268,7 +277,7 @@ impl Client {
             return Err(closed_error());
         }
         let id = RequestId::Number(inner.next_id.fetch_add(1, Ordering::SeqCst));
-        let (tx, mut rx) = oneshot::channel();
+        let (tx, mut rx) = oneshot::channel::<crate::Result<Value>>();
         lock(&inner.pending).insert(id.clone(), tx);
         let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
         if opts.reset_on_progress {
@@ -288,7 +297,7 @@ impl Client {
         let mut progress_open = opts.reset_on_progress;
         let (result, gave_up) = loop {
             tokio::select! {
-                r = &mut rx => break (r.unwrap_or_else(|_| Err(closed_error())), None),
+                r = &mut rx => break (r.unwrap_or_else(|_: oneshot::error::RecvError| Err(closed_error())), None),
                 p = progress_rx.recv(), if progress_open => match p {
                     Some(()) => deadline = tokio::time::Instant::now() + timeout,
                     None => progress_open = false,
@@ -303,7 +312,12 @@ impl Client {
         if let Some(reason) = gave_up {
             stop.cancel();
             let note = json!({ "requestId": id, "reason": reason });
-            Inner::send(inner, Message::Notification(Notification::new(method::CANCELLED, Some(note))), None, CancellationToken::new());
+            Inner::send(
+                inner,
+                Message::Notification(Notification::new(method::CANCELLED, Some(note))),
+                None,
+                CancellationToken::new(),
+            );
         }
         result
     }
@@ -324,12 +338,12 @@ impl Client {
             stdin.lock().await.take();
             let waited = tokio::time::Instant::now();
             loop {
-                let exited = lock(child).as_mut().is_none_or(|c| c.try_wait().map(|s| s.is_some()).unwrap_or(true));
+                let exited = lock(&*child).as_mut().is_none_or(|c| c.try_wait().map(|s| s.is_some()).unwrap_or(true));
                 if exited {
                     break;
                 }
                 if waited.elapsed() >= EXIT_GRACE {
-                    if let Some(c) = lock(child).as_mut() {
+                    if let Some(c) = lock(&*child).as_mut() {
                         let _ = c.start_kill();
                     }
                     break;
@@ -343,7 +357,7 @@ impl Client {
     /// Last resort, synchronous: kills a local server now.
     pub fn kill(&self) {
         if let Wire::Stdio { child, .. } = &self.inner.wire
-            && let Some(c) = lock(child).as_mut()
+            && let Some(c) = lock(&*child).as_mut()
         {
             let _ = c.start_kill();
         }

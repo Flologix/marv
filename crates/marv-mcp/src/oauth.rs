@@ -155,6 +155,11 @@ impl Abort {
         if self.aborted() { Err(McpError::Server(self.reason())) } else { Ok(()) }
     }
 
+    /// Whether `other` is this same login's abort.
+    pub fn same(&self, other: &Abort) -> bool {
+        Arc::ptr_eq(&self.reason, &other.reason)
+    }
+
     pub async fn aborted_now(&self) {
         self.token.cancelled().await
     }
