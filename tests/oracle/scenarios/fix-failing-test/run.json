@@ -1,0 +1,4 @@
+{
+  "description": "Read the test and the code, fix the code: median sorts a copy and averages the middle two.",
+  "prompt": "`bun test` fails. Fix the code, not the tests."
+}
