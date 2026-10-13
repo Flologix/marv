@@ -30,18 +30,26 @@
 //! - Without its `done` line the reply is partial (a proxy closed the stream): retry.
 //! - A base URL with a trailing `/v1` (older configs) is accepted.
 //! - #57: Ollama has no reasoning round-trip to keep; #59: no `tool_choice` (the note alone).
+//! - #64 (marv-rs, not in Marv yet): a drop after text arrived, before any tool call, continues
+//!   from the partial text like [`crate::openai_compat`] does; jitter on the backoff waits too.
+//!   Tool calls arrive whole but are only sent with the `done` line, so a drop after one starts over.
 
-use std::sync::LazyLock;
-use std::sync::Mutex;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Duration;
 
+use futures::StreamExt;
 use marv_core::{ChatTurn, ProviderEvent, ToolCall, ToolSpec, Usage};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
-use crate::errors::ErrorHints;
-use crate::openai_compat::Incomplete;
-use crate::retry::RetryTiming;
+use crate::errors::{ErrorHints, http_error, unreachable};
+use crate::openai_compat::{
+    Emit, Incomplete, Read, backoff, channel_stream, ended_early, is_network_failure, keep_or_restart, read_error, root_cause,
+    status_wait, until_cancelled, with_continuation,
+};
+use crate::retry::{MAX_ATTEMPTS, RetryTiming, retriable_http_status, sleep_abortable};
 use crate::{EventStream, Provider, StreamOptions};
 
 pub const LABEL: &str = "Ollama";
@@ -268,6 +276,17 @@ pub fn reply_cap(window: u64, thinking: bool, tokens_per_char: Option<f64>, char
     share.min(MIN_REPLY_TOKENS).max(share.min(room))
 }
 
+/// The whole `/api/chat` body: the settings, then the prompt.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatRequest<'a> {
+    pub model: &'a str,
+    pub stream: bool,
+    pub think: bool,
+    pub options: ChatOptions,
+    #[serde(flatten)]
+    pub prompt: &'a Prompt<'a>,
+}
+
 /// Ollama's `options`, in this order.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct ChatOptions {
@@ -323,6 +342,11 @@ impl LineAssembler {
         Ok(true)
     }
 
+    /// #64: a tool call already arrived (they're sent only with `done`, so a drop now starts over).
+    pub fn tool_call_in_progress(&self) -> bool {
+        !self.calls.is_empty()
+    }
+
     /// The body ended: the calls and `Done`, or [`Incomplete`] when the `done` line never came (retry).
     pub fn finish(self, out: &mut Vec<ProviderEvent>) -> Result<(), Incomplete> {
         if !self.complete {
@@ -337,34 +361,77 @@ impl LineAssembler {
 pub struct OllamaProvider {
     pub options: OllamaOptions,
     name: String,
+    shared: Arc<Shared>,
+    pub client: reqwest::Client,
+}
+
+/// What every stream of one provider shares (the session and its subagents use the same one).
+#[derive(Default)]
+struct Shared {
     measured: Mutex<Measured>,
     /// Held while `/api/show` is in flight, so concurrent streams ask only once.
     showing: tokio::sync::Mutex<()>,
-    pub client: reqwest::Client,
+}
+
+impl Shared {
+    fn measured(&self) -> Measured {
+        *self.measured.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn update(&self, f: impl FnOnce(&mut Measured)) {
+        f(&mut self.measured.lock().unwrap_or_else(|e| e.into_inner()));
+    }
 }
 
 impl OllamaProvider {
     pub fn new(options: OllamaOptions) -> Self {
         let name = format!("ollama · {}", options.model);
-        // Port note: no overall timeout (see the module notes); a connect timeout is fine.
-        Self {
-            options,
-            name,
-            measured: Mutex::new(Measured::default()),
-            showing: tokio::sync::Mutex::new(()),
-            client: reqwest::Client::new(),
-        }
-    }
-
-    fn measured(&self) -> Measured {
-        *self.measured.lock().unwrap_or_else(|e| e.into_inner())
+        // No overall or read timeout (see the module notes): Ollama sends nothing while the model
+        // writes a tool call. num_predict bounds the wait (minutes on a GPU, longer on a CPU), and
+        // cancel still stops it. A connect timeout is fine.
+        let client = reqwest::Client::builder().connect_timeout(Duration::from_secs(30)).build().unwrap_or_default();
+        Self { options, name, shared: Arc::default(), client }
     }
 
     /// Asks `/api/show` once what the model was trained for (see the module notes). Never fails:
     /// a failure leaves the window as configured and is asked again next stream.
-    pub async fn ask_trained(&self, _base_url: &str, _cancel: &tokio_util::sync::CancellationToken) {
-        let _guard = self.showing.lock().await;
-        todo!("port: askTrained (POST /api/show {{model}}, trained_context, store in measured.trained)")
+    pub async fn ask_trained(&self, base_url: &str, cancel: &CancellationToken) {
+        ask_trained(&self.client, &self.shared, base_url, &self.options.model, cancel).await;
+    }
+}
+
+#[derive(Serialize)]
+struct ShowRequest<'a> {
+    model: &'a str,
+}
+
+#[derive(Deserialize)]
+struct ShowResponse {
+    #[serde(default)]
+    model_info: Option<serde_json::Map<String, Value>>,
+}
+
+/// Asked before the first request so num_ctx is right from the start and never changes (a
+/// different num_ctx reloads the model). A successful answer is kept; a failed or empty one is
+/// asked again on the next stream (Ollama may have been starting up). A server that never
+/// answers changes nothing.
+async fn ask_trained(client: &reqwest::Client, shared: &Shared, base_url: &str, model: &str, cancel: &CancellationToken) {
+    let Some(_asking) = until_cancelled(cancel, shared.showing.lock()).await else { return };
+    // Another stream may have asked while this one waited.
+    if shared.measured().trained.is_some() {
+        return;
+    }
+    let ask = async {
+        let response = client.post(format!("{base_url}/api/show")).json(&ShowRequest { model }).send().await.ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        // No /api/show (an old Ollama, a proxy that only forwards /api/chat): run at the configured window.
+        trained_context(&response.json::<ShowResponse>().await.ok()?.model_info?)
+    };
+    // The stream's cancel stops this request too; that just leaves the window as configured.
+    if let Some(Some(trained)) = until_cancelled(cancel, ask).await {
+        shared.update(|m| m.trained = Some(trained));
     }
 }
 
@@ -376,14 +443,178 @@ impl Provider for OllamaProvider {
     /// What the model actually runs at, once `/api/show` answered (the usage bar, the 85% warning
     /// and compaction measure against it); the configured window until then.
     fn context_length(&self) -> Option<u64> {
-        Some(self.measured().window(self.options.context_length))
+        Some(self.shared.measured().window(self.options.context_length))
     }
 
-    fn stream(&self, _history: &[ChatTurn], _options: StreamOptions) -> EventStream {
-        todo!(
-            "port: OllamaProvider.stream — ask_trained first; body {{model, stream, think, options: ChatOptions, ..Prompt}}; \
-             retry loop (conn retries n/2, unparsable-call 500 once); NdjsonDecoder + LineAssembler; Measured::record"
-        )
+    fn stream(&self, history: &[ChatTurn], options: StreamOptions) -> EventStream {
+        // Copied now, so the caller can append to its history while the reply streams.
+        let outgoing = Outgoing { history: history.to_vec(), system: options.system, tools: options.tools };
+        let (client, shared, adapter, cancel) = (self.client.clone(), self.shared.clone(), self.options.clone(), options.cancel);
+        channel_stream(move |emit| run(client, shared, adapter, outgoing, cancel, emit))
+    }
+}
+
+/// What one stream sends, owned so the returned stream is `'static`.
+struct Outgoing {
+    history: Vec<ChatTurn>,
+    system: Option<String>,
+    tools: Vec<ToolSpec>,
+}
+
+impl Outgoing {
+    /// The body of the next attempt and its prompt's size in characters (what [`reply_cap`] and
+    /// [`Measured::record`] measure). #64: with the kept partial reply and the note, if any.
+    fn body(&mut self, o: &OllamaOptions, measured: Measured, kept: &str) -> (Vec<u8>, usize) {
+        let Self { history, system, tools } = self;
+        with_continuation(history, kept, |history| {
+            let prompt = Prompt::new(history, system.as_deref(), tools);
+            // UTF-16 units, as Marv's `JSON.stringify(prompt).length` counts them.
+            let chars = serde_json::to_string(&prompt).expect("a prompt is plain JSON").encode_utf16().count();
+            let window = measured.window(o.context_length);
+            let body = ChatRequest {
+                model: &o.model,
+                stream: true,
+                think: o.thinking,
+                options: ChatOptions {
+                    num_ctx: window,
+                    // A cap on each reply. Without one, a model that loses its way can generate for minutes (11k
+                    // tokens were measured), and Ollama sends nothing while it writes a tool call. It changes per
+                    // request, but it's an option, not part of the prompt: the cache holds.
+                    num_predict: reply_cap(window, o.thinking, measured.tokens_per_char, chars),
+                    presence_penalty: 0,
+                },
+                prompt: &prompt,
+            };
+            (serde_json::to_vec(&body).expect("a request body is plain JSON"), chars)
+        })
+    }
+}
+
+/// The retry loop: network errors, retriable statuses (502, 503, 504, 429) and drops, up to
+/// [`MAX_ATTEMPTS`] in all; and, apart from those, an unparsable tool call once.
+async fn run(
+    client: reqwest::Client,
+    shared: Arc<Shared>,
+    o: OllamaOptions,
+    mut outgoing: Outgoing,
+    cancel: CancellationToken,
+    emit: Emit,
+) {
+    let base_url = normalize_base_url(&o.base_url);
+    // The trained context length is fetched once, before the first chat request, so num_ctx is right from the start.
+    ask_trained(&client, &shared, &base_url, &o.model, &cancel).await;
+    let url = format!("{base_url}/api/chat");
+    let mut kept = String::new();
+    // Counts only network/HTTP retries, not the tool-call parse retry.
+    let mut conn_retries = 0;
+    let mut announce = false;
+    for attempt in 1.. {
+        if cancel.is_cancelled() {
+            return;
+        }
+        if announce {
+            emit.retry(LABEL, conn_retries, !kept.is_empty());
+            announce = false;
+        }
+
+        let (body, chars) = outgoing.body(&o, shared.measured(), &kept);
+        let request = client.post(&url).header(reqwest::header::CONTENT_TYPE, "application/json").body(body);
+        let Some(sent) = until_cancelled(&cancel, request.send()).await else { return };
+        let response = match sent {
+            Ok(response) => response,
+            Err(err) => {
+                if conn_retries < MAX_ATTEMPTS - 1 && is_network_failure(&err) {
+                    conn_retries += 1;
+                    announce = true;
+                    if sleep_abortable(backoff(o.timing, conn_retries), &cancel).await {
+                        return;
+                    }
+                    continue;
+                }
+                emit.send(ProviderEvent::Error(unreachable(LABEL, &base_url, &root_cause(&err), Some(OFFLINE_HINT))));
+                return;
+            }
+        };
+
+        let status = response.status().as_u16();
+        if response.status().is_success() {
+            // Stream the NDJSON body. If the connection drops mid-stream, retry (#64: or continue).
+            match read_reply(response, &shared, chars, &cancel, &emit).await {
+                Read::Finished => return,
+                Read::Dropped { text, tool_call_in_progress } => {
+                    keep_or_restart(&mut kept, &text, tool_call_in_progress);
+                    if conn_retries < MAX_ATTEMPTS - 1 {
+                        conn_retries += 1;
+                        announce = true;
+                        if sleep_abortable(backoff(o.timing, conn_retries), &cancel).await {
+                            return;
+                        }
+                        continue;
+                    }
+                    emit.send(ProviderEvent::Error(ended_early(LABEL)));
+                    return;
+                }
+            }
+        }
+
+        // HTTP-level error.
+        if retriable_http_status(status) && conn_retries < MAX_ATTEMPTS - 1 {
+            conn_retries += 1;
+            announce = true;
+            if sleep_abortable(status_wait(&response, o.timing, conn_retries), &cancel).await {
+                return;
+            }
+            continue;
+        }
+        let Some(detail) = read_error(response, &cancel).await else { return };
+        // An unparsable tool call: a re-sample usually comes out whole. Only once, and only first.
+        if status >= 500 && UNPARSABLE_CALL.is_match(&detail) && attempt < 2 {
+            continue;
+        }
+        emit.send(ProviderEvent::Error(http_error(status, &detail, LABEL, &o.model, o.hints)));
+        return;
+    }
+}
+
+/// Parses the NDJSON body, sending events as they come.
+async fn read_reply(response: reqwest::Response, shared: &Shared, chars: usize, cancel: &CancellationToken, emit: &Emit) -> Read {
+    let mut assembler = LineAssembler::default();
+    let mut decoder = NdjsonDecoder::default();
+    let mut text = String::new();
+    let mut out = Vec::new();
+    let mut body = Box::pin(response.bytes_stream());
+    loop {
+        let Some(next) = until_cancelled(cancel, body.next()).await else { return Read::Finished };
+        let (lines, ended) = match next {
+            Some(Ok(chunk)) => (decoder.push(&chunk), false),
+            None => (std::mem::take(&mut decoder).finish().into_iter().collect(), true),
+            // A connection drop mid-stream is retriable.
+            Some(Err(_)) => return Read::Dropped { text, tool_call_in_progress: assembler.tool_call_in_progress() },
+        };
+        for line in lines {
+            let handled = assembler.on_line(&line, &mut out);
+            emit.forward(&mut out, &mut text);
+            match handled {
+                Ok(true) => {}
+                Ok(false) => return Read::Finished,
+                // Invalid JSON: like a drop (Marv's JSON.parse throws into the same catch).
+                Err(_) => return Read::Dropped { text, tool_call_in_progress: assembler.tool_call_in_progress() },
+            }
+        }
+        if ended {
+            break;
+        }
+    }
+    let tool_call_in_progress = assembler.tool_call_in_progress();
+    let prompt_eval_count = assembler.prompt_eval_count;
+    match assembler.finish(&mut out) {
+        Ok(()) => {
+            shared.update(|m| m.record(prompt_eval_count, chars));
+            emit.forward(&mut out, &mut text);
+            Read::Finished
+        }
+        // Without its done line the reply is partial (a proxy closed the stream): retry.
+        Err(Incomplete) => Read::Dropped { text, tool_call_in_progress },
     }
 }
 

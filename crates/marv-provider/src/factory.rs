@@ -78,12 +78,22 @@ impl ProviderFactory for ConfigFactory {
         self.config.provider == ProviderKind::Ollama
     }
 
-    fn make(&self, _model: Option<&str>, _info: Option<ReasoningSupport>) -> Arc<dyn Provider> {
-        todo!("port: configFactory.make (config with `model` swapped in when given, then self.make)")
+    fn make(&self, model: Option<&str>, info: Option<ReasoningSupport>) -> Arc<dyn Provider> {
+        match model {
+            Some(model) => (self.make)(&ProviderConfig { model: model.to_string(), ..self.config.clone() }, info),
+            None => (self.make)(&self.config, info),
+        }
     }
 
+    /// OpenRouter's list has every model's context window, prices and reasoning; Ollama's knows
+    /// none of that. A list that fails to load says nothing about the model (`None`).
     fn lookup(&self) -> Option<BoxFuture<'static, Option<ModelInfo>>> {
-        todo!("port: configFactory.lookup (OpenRouter only: load the list, find config.model)")
+        if self.config.provider != ProviderKind::OpenRouter {
+            return None;
+        }
+        let models = (self.load)(self.config.provider, self.config.base_url.clone());
+        let model = self.config.model.clone();
+        Some(Box::pin(async move { models.await.ok()?.into_iter().find(|m| m.id == model) }))
     }
 }
 
