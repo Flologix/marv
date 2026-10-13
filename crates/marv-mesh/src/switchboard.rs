@@ -19,6 +19,11 @@
 //! wires get notifications (routing them comes last). v2 also listens on
 //! `$XDG_RUNTIME_DIR/marv/mesh/<session>.sock` ([`crate::discovery`]).
 //!
+//! Receptacles other than inboxes (v2: another Marv's inbox, a Herdr pane) are served by a [`Service`] offered with
+//! them ([`Switchboard::offer_service`]). Ones that appear while Marv runs (a Marv started later, a new Herdr pane)
+//! are found on demand by a [`Resolve`] ([`Switchboard::lookup`]). A wire to a service on another Marv is granted
+//! with [`Switchboard::grant`], which asks the other end's user too (both ends approve, `Grant::remote`).
+//!
 //! Inboxes (v1): a queue per agent, at most `DEFAULT_INBOX_DEPTH` unread (the
 //! oldest are kept, new ones refused, so a looping sender can't push out what
 //! the reader hasn't seen). The agent's next step reads them with
@@ -35,6 +40,7 @@ use std::os::unix::net::UnixListener as StdUnixListener;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use async_trait::async_trait;
 use marv_mcp::jsonrpc::{Message, Request, Response, code, decode_line, encode_line, method};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -43,11 +49,15 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio_util::sync::CancellationToken;
 
 use crate::MeshError;
+use crate::approval::WireRequest;
 use crate::limits::{DEFAULT_INBOX_DEPTH, RateLimiter};
 use crate::message::Envelope;
 use crate::plug::{MODE_META, MODES_META, Plug, PlugId, Reachable};
 use crate::receptacle::{Receptacle, ReceptacleKind, ReceptacleName};
-use crate::wire::{Wire, WireMode, WireTable};
+use crate::wire::{Approver, Wire, WireMode, WireTable};
+
+/// Receptacles on another Marv on this machine: `peer.<session>.<its receptacle>` ([`crate::discovery`]).
+pub const PEER_PREFIX: &str = "peer.";
 
 /// One JSON-RPC line, at most. Far above any wire's message limit; a client that sends more without a newline is
 /// cut off rather than buffered without end.
@@ -85,6 +95,28 @@ impl TrajectorySink for NoTrajectory {
     fn mesh(&self, _record: MeshRecord) {}
 }
 
+/// What serves a receptacle that isn't an inbox: another Marv's switchboard, a Herdr pane, a remote service. It runs
+/// on the host, in Marv, never in a sandbox, and only gets messages [`Switchboard::admit`] let through.
+#[async_trait]
+pub trait Service: Send + Sync {
+    /// Delivers one admitted message; a `call` returns its answer.
+    async fn deliver(&self, envelope: &Envelope) -> crate::Result<Option<Value>>;
+
+    /// For a receptacle on another Marv: asks that Marv's user to approve `from`'s wire, once this end's user did
+    /// (`local`), and returns who approved there. `None` (the default): the receptacle is this process's own, and
+    /// this end's approval is the only one.
+    async fn approve_remote(&self, _from: &PlugId, _mode: WireMode, _local: Approver) -> Option<crate::Result<Approver>> {
+        None
+    }
+}
+
+/// Finds receptacles that appear while Marv runs (another Marv started later, a new Herdr pane) when something asks
+/// for one by name.
+#[async_trait]
+pub trait Resolve: Send + Sync {
+    async fn resolve(&self, name: &ReceptacleName) -> Option<(Receptacle, Arc<dyn Service>)>;
+}
+
 pub struct Switchboard {
     /// This Marv's session id: message ids and the v2 discovery socket name.
     pub session: String,
@@ -95,6 +127,8 @@ pub struct Switchboard {
     runtime_dir: PathBuf,
     /// A plug was added while `serve` runs: it has a new socket to listen on.
     wake: tokio::sync::Notify,
+    /// Asked, in order, for a receptacle nobody offered yet ([`Self::lookup`]).
+    resolvers: Mutex<Vec<Arc<dyn Resolve>>>,
 }
 
 /// What changes: one short lock, never held across an await.
@@ -113,6 +147,8 @@ struct Board {
     stops: HashMap<PlugId, CancellationToken>,
     /// The last `worker-N` handed out ([`Switchboard::plug_next`]); never reused within a process.
     workers: u64,
+    /// What serves each receptacle that isn't an inbox.
+    services: HashMap<ReceptacleName, Arc<dyn Service>>,
 }
 
 fn now_ms() -> u64 {
@@ -131,6 +167,7 @@ impl Switchboard {
             trajectory: Mutex::new(trajectory),
             runtime_dir,
             wake: tokio::sync::Notify::new(),
+            resolvers: Mutex::default(),
         }
     }
 
@@ -160,6 +197,44 @@ impl Switchboard {
 
     pub fn receptacle(&self, name: &ReceptacleName) -> Option<Receptacle> {
         self.board().receptacles.get(name).cloned()
+    }
+
+    /// Offers a receptacle served by `service` (another Marv's inbox, a Herdr pane).
+    pub fn offer_service(&self, receptacle: Receptacle, service: Arc<dyn Service>) {
+        let mut board = self.board();
+        board.services.insert(receptacle.name.clone(), service);
+        board.receptacles.insert(receptacle.name.clone(), receptacle);
+    }
+
+    /// Asks `resolver` for receptacles nobody offered yet ([`Self::lookup`]).
+    pub fn add_resolver(&self, resolver: Arc<dyn Resolve>) {
+        self.resolvers.lock().unwrap_or_else(|e| e.into_inner()).push(resolver);
+    }
+
+    /// A receptacle by name: one already offered, else the first resolver that finds it (then offered from now on).
+    pub async fn lookup(&self, name: &ReceptacleName) -> Option<Receptacle> {
+        if let Some(r) = self.receptacle(name) {
+            return Some(r);
+        }
+        let resolvers = self.resolvers.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        for resolver in resolvers {
+            if let Some((receptacle, service)) = resolver.resolve(name).await {
+                self.offer_service(receptacle.clone(), service);
+                return Some(receptacle);
+            }
+        }
+        None
+    }
+
+    /// The agents plugged in here, by name.
+    pub fn agents(&self) -> Vec<PlugId> {
+        let mut agents: Vec<PlugId> = self.board().plugs.keys().cloned().collect();
+        agents.sort();
+        agents
+    }
+
+    pub fn has_plug(&self, id: &PlugId) -> bool {
+        self.board().plugs.contains_key(id)
     }
 
     /// The private runtime folder, made 0700 (it holds every plug's socket).
@@ -216,11 +291,34 @@ impl Switchboard {
         self.plug(id)
     }
 
-    /// Adds a wire the user approved (see [`crate::approval`]).
-    pub fn wire(&self, wire: Wire) -> crate::Result<()> {
+    /// Adds a wire the user approved (see [`crate::approval`]). A wire to another Marv's receptacle (`peer.*`, or
+    /// a peer or remote kind) is always cross-process, whoever built it: it counts only once the other end's
+    /// approval is in `Grant::remote`, so a one-ended grant can't reach another process.
+    pub fn wire(&self, mut wire: Wire) -> crate::Result<()> {
         let mut board = self.board();
-        let owner = board.receptacles.get(&wire.to).and_then(|r| r.owner.clone());
+        let receptacle = board.receptacles.get(&wire.to);
+        let owner = receptacle.and_then(|r| r.owner.clone());
+        let elsewhere = receptacle.is_some_and(|r| matches!(r.kind, ReceptacleKind::Peer { .. } | ReceptacleKind::Remote { .. }));
+        if elsewhere || wire.to.as_str().starts_with(PEER_PREFIX) {
+            wire.cross_process = true;
+        }
         board.table.add(wire, owner.as_ref())
+    }
+
+    /// Grants a wire a person on this end approved (`by`). For a receptacle on another Marv, that Marv's user is asked
+    /// as well ([`Service::approve_remote`]), and the wire is recorded only if they approve too.
+    pub async fn grant(&self, request: WireRequest, by: Approver) -> crate::Result<()> {
+        let service = self.board().services.get(&request.to).cloned();
+        let remote = match service {
+            Some(service) => service.approve_remote(&request.from, request.mode, by).await.transpose()?,
+            None => None,
+        };
+        let mut wire = request.grant(by);
+        if let Some(remote) = remote {
+            wire.cross_process = true;
+            wire.grant.remote = Some(remote);
+        }
+        self.wire(wire)
     }
 
     pub fn unwire(&self, from: &PlugId, to: &ReceptacleName, mode: WireMode) -> bool {
@@ -295,28 +393,45 @@ impl Switchboard {
         result.map(|()| envelope)
     }
 
-    /// Delivers an admitted message: into an inbox (v1); to a peer switchboard, a Herdr pane or the AgentMesh bridge
-    /// later (v2/v3). `call` waits for the response. A message that can't be delivered after all (its inbox filled
-    /// since `admit`, its agent ended) is logged again, refused, under the same id.
+    /// Delivers an admitted message: into an inbox (v1), or to the receptacle's [`Service`] (v2: a peer switchboard,
+    /// a Herdr pane). `call` waits for the response. A message that can't be delivered after all (its inbox filled
+    /// since `admit`, its agent ended, the other Marv went away) is logged again, refused, under the same id.
     pub async fn route(self: Arc<Self>, envelope: Envelope) -> crate::Result<Option<Value>> {
-        let result = {
+        enum Next {
+            Done(crate::Result<Option<Value>>),
+            Serve(Arc<dyn Service>),
+        }
+        let next = {
             let mut board = self.board();
             let kind = board.receptacles.get(&envelope.receptacle).map(|r| (r.kind.clone(), r.owner.clone()));
             match kind {
-                None => Err(MeshError::NoReceptacle(envelope.receptacle.to_string())),
+                None => Next::Done(Err(MeshError::NoReceptacle(envelope.receptacle.to_string()))),
                 Some((ReceptacleKind::Inbox, Some(owner))) if envelope.mode == WireMode::Send => {
-                    match board.inboxes.get_mut(&owner) {
+                    Next::Done(match board.inboxes.get_mut(&owner) {
                         Some(queue) if queue.len() < DEFAULT_INBOX_DEPTH => {
                             queue.push_back(envelope.clone());
                             Ok(None)
                         }
                         Some(_) => Err(MeshError::InboxFull(envelope.receptacle.to_string())),
                         None => Err(MeshError::NoReceptacle(envelope.receptacle.to_string())),
-                    }
+                    })
                 }
-                // `watch` routing, Herdr panes, peers and remote services: later milestones.
-                Some(_) => Err(MeshError::NotServed { receptacle: envelope.receptacle.to_string(), mode: envelope.mode }),
+                // `watch` on inboxes is still to come.
+                Some((ReceptacleKind::Inbox, _)) => {
+                    Next::Done(Err(MeshError::NotServed { receptacle: envelope.receptacle.to_string(), mode: envelope.mode }))
+                }
+                Some(_) => match board.services.get(&envelope.receptacle) {
+                    Some(service) => Next::Serve(service.clone()),
+                    None => {
+                        Next::Done(Err(MeshError::NotServed { receptacle: envelope.receptacle.to_string(), mode: envelope.mode }))
+                    }
+                },
             }
+        };
+        // A service is awaited outside the lock: it may talk to another process.
+        let result = match next {
+            Next::Done(result) => result,
+            Next::Serve(service) => service.deliver(&envelope).await,
         };
         if let Err(err) = &result {
             self.log(MeshRecord {

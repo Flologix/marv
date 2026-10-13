@@ -5,7 +5,8 @@
 //! marv -c / -r      continue the latest session here / pick one to resume
 //! marv -p <prompt>  one non-interactive turn (`-p -` reads stdin); `marv run <prompt>` is the same
 //! marv mesh ls      the live Marvs on this machine (mesh v2)
-//! marv mesh wire 'worker-1 -> parent:inbox'
+//! marv mesh wire 'alpha -> beta:inbox'
+//! marv mesh plug alpha --as claude   (an MCP server command: another agent plugs into alpha's switchboard)
 //! ```
 //!
 //! Port notes:
@@ -110,11 +111,19 @@ pub enum Command {
 pub enum MeshCommand {
     /// List the live Marv switchboards on this machine.
     Ls,
-    /// Wire a plug to a receptacle, e.g. `marv mesh wire 'worker-1 -> parent:inbox'`.
+    /// Ask for a wire, e.g. `marv mesh wire 'alpha -> beta:inbox'`; each Marv's user approves it.
     Wire {
-        /// `<agent> -> <receptacle>[:<mode>]`
+        /// `<marv>[/<agent>] -> <marv>[/<agent>]:inbox`, or `<marv>[/<agent>] -> <receptacle>[:<mode>]`
         #[arg(num_args = 1.., trailing_var_arg = true)]
         spec: Vec<String>,
+    },
+    /// Plug another agent into a Marv's switchboard over stdin/stdout (use it as an MCP server command).
+    Plug {
+        /// The Marv's name (`marv mesh ls`).
+        session: String,
+        /// The plug's name (default `ext-<pid>`).
+        #[arg(long = "as", value_name = "NAME")]
+        name: Option<String>,
     },
 }
 
@@ -133,6 +142,10 @@ pub enum Mode {
     MeshWire {
         spec: String,
     },
+    MeshPlug {
+        session: String,
+        name: Option<String>,
+    },
     HtmlConvert,
     RunChecks {
         spec: String,
@@ -148,6 +161,9 @@ impl Cli {
             }
             Some(Command::Mesh(MeshCommand::Ls)) => Mode::MeshLs,
             Some(Command::Mesh(MeshCommand::Wire { spec })) => Mode::MeshWire { spec: spec.join(" ") },
+            Some(Command::Mesh(MeshCommand::Plug { session, name })) => {
+                Mode::MeshPlug { session: session.clone(), name: name.clone() }
+            }
             Some(Command::HtmlConvert) => Mode::HtmlConvert,
             Some(Command::RunChecks { spec }) => Mode::RunChecks { spec: spec.clone() },
             None => match &self.prompt {
@@ -184,8 +200,12 @@ mod tests {
         assert_eq!(parse(&["run", "fix", "it"]).mode(), Mode::Headless { prompt: "fix it".into() });
         assert_eq!(parse(&["run"]).mode(), Mode::Headless { prompt: "-".into() });
         assert_eq!(
-            parse(&["mesh", "wire", "worker-1", "->", "parent:inbox"]).mode(),
-            Mode::MeshWire { spec: "worker-1 -> parent:inbox".into() }
+            parse(&["mesh", "wire", "alpha", "->", "beta:inbox"]).mode(),
+            Mode::MeshWire { spec: "alpha -> beta:inbox".into() }
+        );
+        assert_eq!(
+            parse(&["mesh", "plug", "alpha", "--as", "claude"]).mode(),
+            Mode::MeshPlug { session: "alpha".into(), name: Some("claude".into()) }
         );
         assert_eq!(parse(&["__html-convert"]).mode(), Mode::HtmlConvert);
         assert_eq!(parse(&["__run-checks", "{}"]).mode(), Mode::RunChecks { spec: "{}".into() });

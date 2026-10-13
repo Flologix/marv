@@ -577,6 +577,8 @@ pub struct Startup {
     pub sessions: Option<Arc<SessionStore>>,
     pub trajectories: Option<Arc<TrajectoryStore>>,
     pub herdr: Option<HerdrReporter>,
+    /// The process's switchboard (`mesh_cmd::start`), if it has one.
+    pub mesh: Option<marv_session::mesh::MeshHandle>,
     /// How a provider is made from the config (`create_provider`; tests: a scripted one).
     pub make_provider: MakeProvider,
     pub load_models: LoadModels,
@@ -629,6 +631,7 @@ impl Bridge {
         // The CLI started them, so the CLI closes them (on the way out).
         init.owns_mcp = false;
         init.approve = Some(Arc::new(TuiApprover(activity.clone())));
+        init.mesh = s.mesh.clone();
         init.max_steps = Some(config.max_steps);
         (init.sandbox, init.yolo, init.diagnostics, init.checks, init.mcp_tools) =
             (config.sandbox, config.yolo, config.diagnostics, config.checks, config.mcp_tools);
@@ -1315,6 +1318,11 @@ pub async fn run(resume: Option<bool>) -> anyhow::Result<i32> {
     .collect();
     // In a Herdr pane, Herdr shows what Marv is doing.
     let herdr = herdr_target(&env).map(|target| HerdrReporter::new(target, None));
+    // The mesh (v2): this Marv's switchboard, put on the mesh once the TUI can ask for wires (below).
+    let (mut mesh, mut mesh_note) = match crate::mesh_cmd::start(&env, &root) {
+        Ok(mesh) => (mesh, None),
+        Err(e) => (None, Some((format!("Not on the mesh: {e}"), true))),
+    };
 
     let cut = instructions.as_ref().and_then(|i| i.cut.clone());
     let (tx, rx) = unbounded_channel();
@@ -1339,13 +1347,35 @@ pub async fn run(resume: Option<bool>) -> anyhow::Result<i32> {
         sessions: Some(Arc::new(SessionStore::new(config_dir.join("sessions")))),
         trajectories: Some(Arc::new(TrajectoryStore::new(config_dir.join("trajectories")))),
         herdr: herdr.clone(),
+        mesh: mesh.as_ref().map(|m| m.handle.clone()),
         make_provider: Arc::new(|config, info| marv_provider::create_provider(config, info, None)),
         load_models: Arc::new(|kind, base_url| {
             Box::pin(async move { marv_provider::models::list_models(kind, &base_url, None).await })
         }),
     };
+    let notes = tx.clone();
     let bridge = Bridge::start(startup, tx)?;
     bridge.announce(cut.as_ref());
+    // Wires other processes ask for (`marv mesh wire`, another Marv) wait in the same approval queue, for a person.
+    if let Some(mesh) = &mut mesh {
+        let person = marv_session::mesh::PersonWires {
+            inner: Arc::new(TuiApprover(bridge.activity.clone())),
+            by: marv_mesh::wire::Approver::Tui,
+        };
+        mesh_note = Some(match mesh.open_door(Arc::new(person)) {
+            Ok(()) => (
+                format!(
+                    "On the mesh as {} (marv mesh ls; others reach you at peer.{}.agent.parent.inbox).",
+                    mesh.name, mesh.name
+                ),
+                false,
+            ),
+            Err(e) => (format!("Not on the mesh: {e}"), true),
+        });
+    }
+    if let Some((text, is_error)) = mesh_note {
+        let _ = notes.send(system(printable(&text), is_error));
+    }
     match resume {
         // Before the UI, so nothing typed lands in the conversation being swapped out.
         Some(true) => bridge.resume_latest().await,
@@ -1378,6 +1408,8 @@ pub async fn run(resume: Option<bool>) -> anyhow::Result<i32> {
     if let Some(herdr) = herdr {
         let _ = tokio::time::timeout(HERDR_RELEASE_TIMEOUT, herdr.release()).await;
     }
+    // Off the mesh: the door's socket goes, and the plugs' with the switchboard.
+    drop(mesh);
     result?;
     Ok(0)
 }
@@ -1505,6 +1537,7 @@ mod tests {
             sessions: Some(Arc::new(SessionStore::new(dirs.config.join("sessions")))),
             trajectories: None,
             herdr,
+            mesh: None,
             make_provider: Arc::new(move |_, _| provider.clone()),
             load_models: Arc::new(|_, _| {
                 Box::pin(async {

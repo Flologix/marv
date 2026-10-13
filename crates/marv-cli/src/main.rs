@@ -2,7 +2,7 @@
 //!
 //! - no arguments, `-c`, `-r`: the TUI ([`tui`]);
 //! - `-p <prompt>` / `run <prompt>`: one headless turn ([`headless`]), exit codes 0/1/2/3;
-//! - `mesh ls|wire`: the mesh ([`mesh_cmd`]);
+//! - `mesh ls|wire|plug`: the mesh ([`mesh_cmd`]);
 //! - `__html-convert` (hidden): the web reader's converter process (`marv_tools::web::html_convert_cli::main`);
 //! - `__run-checks <spec>` (hidden): the project checks' runner, inside the sandbox (`marv_session::checks::runner`).
 //!
@@ -82,6 +82,7 @@ fn main() -> ExitCode {
             }
             Mode::MeshLs => mesh_cmd::ls().await,
             Mode::MeshWire { spec } => mesh_cmd::wire(&spec).await,
+            Mode::MeshPlug { session, name } => mesh_cmd::plug(&session, name.as_deref()).await,
             Mode::Interactive { resume } => match tui::run(resume).await {
                 Ok(code) => code,
                 Err(e) => {

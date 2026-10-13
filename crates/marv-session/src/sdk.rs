@@ -79,6 +79,9 @@ pub struct SessionOptions {
     /// Where Marv keeps its files (default `~/.marv`, or `MARV_CONFIG_DIR` from the real environment).
     pub config_dir: Option<PathBuf>,
     pub on_warning: Option<Warn>,
+    /// The process's switchboard (marv-rs mesh; `crate::mesh::start`), and who grants its wires.
+    pub mesh: Option<crate::mesh::MeshHandle>,
+    pub wire_approver: Option<Arc<dyn crate::mesh::WireApprover>>,
 }
 
 /// Builds a [`MarvSession`] (Marv's `createSession`).
@@ -110,6 +113,8 @@ impl SessionBuilder {
                 resume: None,
                 config_dir: None,
                 on_warning: None,
+                mesh: None,
+                wire_approver: None,
             },
         }
     }
@@ -240,6 +245,8 @@ pub async fn create_session(options: SessionOptions) -> Result<MarvSession, Sess
     init.tools = options.tools;
     init.system_prompt = options.system_prompt;
     init.approve = options.approve;
+    init.mesh = options.mesh;
+    init.wire_approver = options.wire_approver;
     init.max_steps = options.max_steps;
     init.diagnostics = options.diagnostics;
     init.checks = options.checks;
