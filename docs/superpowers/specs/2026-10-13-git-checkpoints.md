@@ -76,7 +76,14 @@ git update-ref refs/marv/checkpoints/<session> <commit> <previous>
 - Session (`ScriptedProvider`): a turn with only `read_file` takes no checkpoint; a turn with `write_file` and a `bash` edit gets one pair covering both; a no-op bash turn's pair is dropped; parallel shared-folder subagents share one *before*; a failing snapshot doesn't stop the turn; the note reaches the next request's user message and every request still extends the previous one (`tests/agent.test.ts`'s cache check).
 - App: `/undo` preview, Yes restores, No changes nothing, refused during a turn.
 
-## Open questions for the user
+## Decided with the user (2026-10-13)
+
+1. **The hidden ref in the user's repository** (`refs/marv/checkpoints/<session>`), as proposed.
+2. **`/undo` doesn't rewind the conversation**: the conversation stays append-only and the model is told in a note, as proposed.
+3. **No `/redo` in v1**; the pre-undo snapshot makes an undo recoverable by hand.
+4. **`/undo` walks back one turn at a time**, as proposed.
+
+## Open questions (as asked; answers above)
 
 1. **Hidden ref in the user's repository, or Marv's own git dir everywhere?** The hidden ref is cheap (objects mostly exist; the index copy makes it fast) but shows up in `git log --all`, gitk, `git for-each-ref` and `git push --mirror`. A git dir under `~/.marv/checkpoints/` for every project leaves the repository untouched, at the cost of hashing the whole project once per session (a big repository: seconds and a copy of its contents). The spec picks the hidden ref; say if those listings are a problem for you.
 2. **Should `/undo` also rewind the conversation?** The spec keeps it (append-only, cache intact, the model told by a note). Rewinding (dropping the undone turn from the history, as Claude Code's rewind does) would break the "conversation is only appended to" rule and restart the cache.
