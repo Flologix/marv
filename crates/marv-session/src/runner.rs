@@ -230,10 +230,8 @@ impl AgentHost for SessionAgentHost {
         self.worktrees_dir.is_some()
     }
 
-    async fn preview(&self, _input: &AgentInput, _ctx: &ToolContext) -> Result<Preview, ToolError> {
-        todo!(
-            "port: the worktree dispatch preview (src/tools/agent.ts preview: inspect_repo, NOT_A_REPO, dirty count warning, sandbox note)"
-        )
+    async fn preview(&self, input: &AgentInput, ctx: &ToolContext) -> Result<Preview, ToolError> {
+        crate::subagent::preview(self, input, ctx).await
     }
 
     async fn run(&self, input: &AgentInput, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {

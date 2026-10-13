@@ -171,9 +171,7 @@ pub async fn create_worktree(root: &Path, base_dir: &Path, description: &str) ->
     let id: String = marv_fs::random_hex().chars().take(4).collect();
     let branch = branch_name(description, &id);
     let dir = base_dir.join(&branch["marv/".len()..]);
-    tokio::fs::create_dir_all(base_dir)
-        .await
-        .map_err(|e| ToolError::new(format!("Couldn't create a worktree: {e}")))?;
+    tokio::fs::create_dir_all(base_dir).await.map_err(|e| ToolError::new(format!("Couldn't create a worktree: {e}")))?;
     let dir_text = dir.to_string_lossy().into_owned();
     let (ok, out) = git(root, &["worktree", "add", "-q", "-b", &branch, &dir_text, "HEAD"], &[]).await;
     if !ok {
@@ -189,9 +187,7 @@ pub async fn create_worktree(root: &Path, base_dir: &Path, description: &str) ->
     let sub = repo.prefix.trim_end_matches('/');
     let work_dir = if sub.is_empty() { dir.clone() } else { dir.join(sub) };
     // A folder with no tracked files (e.g. a new package) isn't checked out: start it empty.
-    tokio::fs::create_dir_all(&work_dir)
-        .await
-        .map_err(|e| ToolError::new(format!("Couldn't create a worktree: {e}")))?;
+    tokio::fs::create_dir_all(&work_dir).await.map_err(|e| ToolError::new(format!("Couldn't create a worktree: {e}")))?;
     Ok(Worktree { dir, branch, base: repo.base, repo: root.to_path_buf(), git_dir, admin_dir, prefix: repo.prefix, work_dir })
 }
 
@@ -344,9 +340,7 @@ pub(crate) mod tests {
     }
 
     fn is_id_branch(branch: &str, slug: &str) -> bool {
-        branch
-            .strip_prefix(&format!("marv/{slug}-"))
-            .is_some_and(|id| id.len() == 4 && id.chars().all(|c| c.is_ascii_hexdigit()))
+        branch.strip_prefix(&format!("marv/{slug}-")).is_some_and(|id| id.len() == 4 && id.chars().all(|c| c.is_ascii_hexdigit()))
     }
 
     // Ported from tests/worktree.test.ts.
@@ -555,7 +549,7 @@ pub(crate) mod tests {
         let wt = create_worktree(&repo.0, &trees.0, "Locked").await.unwrap();
         let locked = wt.dir.join("locked");
         std::fs::create_dir(&locked).unwrap();
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0)).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
         let line = finish_worktree(&wt, "Locked", false).await;
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(line.contains(&format!("still in {}", wt.dir.display())), "{line}");
