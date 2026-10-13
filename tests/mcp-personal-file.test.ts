@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadMcpConfig } from "../src/mcp/config.ts";
@@ -62,4 +62,15 @@ test("remove takes out one server and keeps the rest", async () => {
   await removePersonalServer(d, "a");
   expect(Object.keys(file(d).mcpServers)).toEqual(["b"]);
   await expect(removePersonalServer(d, "nope")).rejects.toThrow(/no server "nope"/);
+});
+
+test("two Marv processes adding servers at once: every server survives (the read-change-write is locked)", async () => {
+  const d = dir();
+  const writer = join(import.meta.dir, "fixtures", "mcp-file-writer.ts");
+  const run = (prefix: string) => Bun.spawn([process.execPath, writer, d, prefix, "25"], { stderr: "pipe" });
+  const children = [run("a"), run("b")];
+  for (let i = 0; i < 25; i++) await addPersonalServer(d, `c${i}`, entry);
+  for (const child of children) expect(await child.exited).toBe(0);
+  expect(Object.keys(file(d).mcpServers)).toHaveLength(75);
+  expect(existsSync(join(d, "mcp.json.lock"))).toBe(false);
 });

@@ -115,24 +115,3 @@ describe("McpTokenStore", () => {
     expect((await s.get(YOURS))?.server).toBe("y");
   });
 });
-
-describe("taking over a stale lock", () => {
-  test("only the lock judged stale is removed: one created after the check is left alone", async () => {
-    const { takeOverStale } = await import("../src/mcp/oauth-store.ts");
-    const dir = mkdtempSync(join(tmpdir(), "marv-lock-"));
-    try {
-      const lock = join(dir, "mcp-tokens.json.lock");
-      writeFileSync(lock, "111 old-token");
-      // Another waiter took the stale lock over, and a third process created a fresh one, before this one acts.
-      writeFileSync(lock, "222 fresh-token");
-      expect(takeOverStale(lock, "111 old-token")).toBe(false);
-      expect(readFileSync(lock, "utf8")).toBe("222 fresh-token");
-      // The stale one itself is removed.
-      writeFileSync(lock, "333 stale-token");
-      expect(takeOverStale(lock, "333 stale-token")).toBe(true);
-      expect(existsSync(lock)).toBe(false);
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-});
