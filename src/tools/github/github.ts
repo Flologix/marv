@@ -221,6 +221,9 @@ export const github: Tool<typeof input> = {
   needsApproval: ({ args }) => classify(args, { host: null, anyHost: true }).kind !== "read",
   usesNetwork: () => true,
   door: () => "github",
+  // A sensitive read is asked every time, never remembered: its paths (secrets, keys, hooks, emails…) share one scope,
+  // so "don't ask again" for one would cover them all.
+  once: ({ args }, ctx) => classify(args, { host: projectHost(ctx.root) }).kind === "sensitive",
   scope: ({ args }, ctx) => {
     const c = classify(args, { host: projectHost(ctx.root) });
     const key = c.kind === "write" || c.kind === "sensitive" ? c.scope : "github:";

@@ -99,6 +99,9 @@ describe("the github tool", () => {
     expect(asked.map((r) => r.scope.key)).toEqual(["github:api sensitive", "github:api POST"]);
     expect(asked[0]!.preview.warning).toContain("webhook");
     expect(asked[1]!.preview.warning).toContain("Reads /etc/hostname on your machine");
+    // One sensitive path approved "always" must not cover the others (they share a key): each is asked every time.
+    expect(asked[0]!.once).toBe(true);
+    expect(asked[1]!.once).toBeUndefined();
   });
 
   test("gh is spawned without a shell: an argument arrives as written", async () => {
