@@ -6,6 +6,14 @@ What counts as Marv's public API: the SDK (`@flologixai/marv/sdk`), the `marv` c
 
 ## [Unreleased]
 
+### Added
+
+- Review gate (issue #49): `REVIEW_GATE_TIMEOUT_S` env var (default 1200 s) gives the whole `ocr` call a deadline, failing closed if it's hit; a `review_round_failed` warning (a model timeout on one batch) retries once before blocking; pushes on a branch with a previously-passed commit only review what's new since that commit, not the whole branch against base.
+
+### Changed
+
+- Review gate: when a commit on the branch already passed (same merge-base, blocking levels and ocr version), the next push reviews `<passed sha>..<sha>` instead of `<base>..<sha>`.
+
 ## [0.3.0] - 2026-10-12
 
 Everything since 0.1.2: Sprints 1–3 (0.2.0 was never released on its own). Highlights: headless mode (`marv -p`), MCP servers installed with `/mcp add` and logged in with `/mcp login`, deferred MCP tool loading, project checks, tool-call repair, retries for dropped connections, a loop guard, and the step limit.
