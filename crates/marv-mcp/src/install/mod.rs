@@ -15,9 +15,13 @@ pub mod proposal;
 pub mod pypi;
 pub mod registry;
 pub mod source;
+mod util;
 
 pub use proposal::{Choices, McpEntry, Proposal, ResolveDeps, ResolveOptions};
 pub use source::{AddOptions, Source, parse_add_args, parse_source, server_name};
+
+use crate::McpError;
+use util::{config, name_for};
 
 /// A proposal, or the commands to choose from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,15 +32,56 @@ pub enum Resolved {
 
 /// Resolves the source, then adds a `login` fact for a remote server that asks
 /// for an OAuth login (Marv #18), so "added" isn't mistaken for "working".
-pub async fn resolve_add(_options: &AddOptions, _deps: &dyn ResolveDeps) -> crate::Result<Resolved> {
-    todo!("port: resolveAdd (resolveSource by kind; header/env/args checks per kind; withLoginFact)")
+pub async fn resolve_add(options: &AddOptions, deps: &dyn ResolveDeps) -> crate::Result<Resolved> {
+    Ok(match resolve_source(options, deps).await? {
+        Resolved::Proposal(p) => Resolved::Proposal(with_login_fact(p, deps).await),
+        choices => choices,
+    })
 }
 
 /// A remote proposal without its own Authorization header that `probe_login`
 /// says wants a login gets the fact `login    it asks for an OAuth login: after
-/// adding it, /mcp login <name>`.
-pub async fn with_login_fact(_proposal: Proposal, _deps: &dyn ResolveDeps) -> Proposal {
-    todo!("port: withLoginFact")
+/// adding it, /mcp login <name>`. Not one with its own Authorization header:
+/// that's how it logs in.
+pub async fn with_login_fact(mut proposal: Proposal, deps: &dyn ResolveDeps) -> Proposal {
+    let McpEntry::Http { url, headers, .. } = &proposal.entry else { return proposal };
+    if headers.as_ref().is_some_and(|h| h.keys().any(|k| k.eq_ignore_ascii_case("authorization"))) {
+        return proposal;
+    }
+    if deps.probe_login(url, &deps.cancel()).await != Some(true) {
+        return proposal;
+    }
+    let text = format!("it asks for an OAuth login: after adding it, /mcp login {}", proposal.name);
+    proposal.facts.push(proposal::fact("login", &text));
+    proposal
+}
+
+async fn resolve_source(options: &AddOptions, deps: &dyn ResolveDeps) -> crate::Result<Resolved> {
+    let source = parse_source(&options.source).map_err(McpError::Config)?;
+    let opts = ResolveOptions {
+        name: options.name.clone(),
+        env: options.env.clone(),
+        headers: options.headers.clone(),
+        args: options.args.clone(),
+    };
+    if matches!(source, Source::Npm { .. } | Source::Pypi { .. }) && !options.headers.is_empty() {
+        return Err(config("--header is for remote (URL) servers; a local server reads its secrets from --env."));
+    }
+    let fitted = |r: Resolved| fits(r, options).map_err(McpError::Config);
+    match &source {
+        Source::Npm { name, version } => Ok(Resolved::Proposal(npm::resolve_npm(name, version.as_deref(), &opts, deps).await?.0)),
+        Source::Pypi { name, version } => {
+            Ok(Resolved::Proposal(pypi::resolve_pypi(name, version.as_deref(), &opts, deps).await?.0))
+        }
+        Source::Http { url } => {
+            if !options.env.is_empty() || !options.args.is_empty() {
+                return Err(config("--env and server arguments are for local servers; a remote one takes --header."));
+            }
+            Ok(Resolved::Proposal(proposal::http_proposal(url, name_for(&opts, &source)?, &options.headers)))
+        }
+        Source::Registry { name } => fitted(Resolved::Proposal(registry::resolve_registry(name, &opts, deps).await?)),
+        Source::Github { owner, repo } => fitted(github::resolve_github(owner, repo, &opts, deps).await?),
+    }
 }
 
 /// A registry entry or a README can resolve to either kind of server: options

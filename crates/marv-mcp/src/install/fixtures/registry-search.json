@@ -1,0 +1,35 @@
+{
+  "servers": [
+    {
+      "server": {
+        "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+        "name": "io.modelcontextprotocol/filesystem",
+        "description": "Secure file operations with configurable access controls.",
+        "repository": { "url": "https://github.com/modelcontextprotocol/servers", "source": "github", "subfolder": "src/filesystem" },
+        "version": "2026.1.14",
+        "packages": [{ "registryType": "npm", "identifier": "@modelcontextprotocol/server-filesystem", "version": "2026.1.14", "transport": { "type": "stdio" } }]
+      },
+      "_meta": { "io.modelcontextprotocol.registry/official": { "status": "active", "publishedAt": "2026-01-14T10:00:00Z", "updatedAt": "2026-01-14T10:00:00Z", "isLatest": true } }
+    },
+    {
+      "server": {
+        "name": "com.example/old-files",
+        "description": "Gone.",
+        "version": "1.0.0",
+        "packages": [{ "registryType": "npm", "identifier": "old-files", "version": "1.0.0", "transport": { "type": "stdio" } }]
+      },
+      "_meta": { "io.modelcontextprotocol.registry/official": { "status": "deleted", "isLatest": true } }
+    },
+    {
+      "server": {
+        "name": "com.pulsemcp/remote-filesystem",
+        "description": "MCP server for remote filesystem operations on cloud storage (Google Cloud Storage).",
+        "repository": { "url": "https://github.com/pulsemcp/mcp-servers", "source": "github", "subfolder": "experimental/remote-filesystem" },
+        "version": "0.1.5",
+        "packages": [{ "registryType": "npm", "registryBaseUrl": "https://registry.npmjs.org", "identifier": "remote-filesystem-mcp-server", "version": "0.1.5", "runtimeHint": "npx", "transport": { "type": "stdio" } }]
+      },
+      "_meta": { "io.modelcontextprotocol.registry/official": { "status": "active", "isLatest": true } }
+    }
+  ],
+  "metadata": { "nextCursor": "com.pulsemcp/remote-filesystem:0.1.5", "count": 3 }
+}
