@@ -27,19 +27,25 @@
 //! - A cancelled login (logout, remove, a new login, close) saves nothing, even
 //!   when its token exchange finishes late.
 
-use std::time::Duration;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde_json::Value;
+use base64::Engine;
+use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
+use crate::McpError;
 use crate::config::McpOAuthConfig;
-use crate::oauth_store::{Login, McpTokenStore};
+use crate::oauth_store::{Login, McpTokenStore, StoredClient, StoredDiscovery, StoredTokens};
 
 pub const REPOSITORY: &str = "https://github.com/FlologixAI/marv";
 pub const LOOPBACK: [&str; 3] = ["127.0.0.1", "localhost", "[::1]"];
 /// `probe_login` and `revoke` give up after this long.
 pub const NETWORK_TIMEOUT: Duration = Duration::from_secs(5);
+/// The MCP revision sent with discovery requests (`MCP-Protocol-Version`).
+const PROTOCOL_HEADER: &str = "mcp-protocol-version";
 
 /// A server needs the user to log in (again). Its message is Marv's own
 /// sentence, never a server's or an OAuth error body: it's what the model
@@ -50,9 +56,31 @@ pub struct LoginNeeded {
     pub server: String,
 }
 
-/// A login's `state`: 32 random bytes, base64url.
+fn random_bytes<const N: usize>() -> [u8; N] {
+    let mut bytes = [0u8; N];
+    getrandom::fill(&mut bytes).expect("the OS random number generator");
+    bytes
+}
+
+fn base64url(bytes: &[u8]) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// A login's `state`: 32 random bytes, base64url, so a callback without it
+/// (another page, a sandboxed command) is refused.
 pub fn new_state() -> String {
-    todo!("port: newState (32 bytes from the OS RNG, base64url without padding)")
+    base64url(&random_bytes::<32>())
+}
+
+/// A PKCE pair (RFC 7636, S256): the verifier (kept in memory) and its challenge (sent).
+pub fn pkce() -> (String, String) {
+    let verifier = base64url(&random_bytes::<32>());
+    let challenge = base64url(&Sha256::digest(verifier.as_bytes()));
+    (verifier, challenge)
+}
+
+pub(crate) fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
 
 /// The redirect URI a login on `port` names: 127.0.0.1, never `localhost`.
@@ -77,6 +105,61 @@ pub fn authorization_url_ok(url: &Url) -> bool {
     url.scheme() == "https" || (url.scheme() == "http" && is_loopback_host(url))
 }
 
+/// The client OAuth requests go through. It follows no redirects: a token or
+/// registration endpoint that redirects is refused rather than followed with
+/// the code, the refresh token or a secret.
+pub(crate) fn http() -> &'static reqwest::Client {
+    static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("an HTTP client")
+    });
+    &CLIENT
+}
+
+/// A login's cancellation: `/mcp remove`, `/mcp logout`, another login,
+/// closing, the timeout. The first reason given is the one reported.
+#[derive(Debug, Clone, Default)]
+pub struct Abort {
+    token: CancellationToken,
+    reason: Arc<Mutex<Option<String>>>,
+}
+
+impl Abort {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn abort(&self, reason: impl Into<String>) {
+        let mut slot = self.reason.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_none() {
+            *slot = Some(reason.into());
+        }
+        drop(slot);
+        self.token.cancel();
+    }
+
+    pub fn aborted(&self) -> bool {
+        self.token.is_cancelled()
+    }
+
+    pub fn reason(&self) -> String {
+        self.reason.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_else(|| "cancelled".into())
+    }
+
+    /// `Err(reason)` once aborted (Marv's `signal.throwIfAborted()`).
+    pub fn check(&self) -> crate::Result<()> {
+        if self.aborted() { Err(McpError::Server(self.reason())) } else { Ok(()) }
+    }
+
+    pub async fn aborted_now(&self) {
+        self.token.cancelled().await
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderMode {
     /// Startup, tool calls, the SDK: refresh only; never a browser, never a registration.
@@ -95,6 +178,10 @@ pub enum Invalidate {
     Discovery,
 }
 
+/// Hands the authorization URL to the login UI, to open or show.
+pub type Authorize = Arc<dyn Fn(Url) + Send + Sync>;
+
+#[derive(Clone)]
 pub struct ProviderOptions {
     pub store: McpTokenStore,
     /// The store key ([`crate::oauth_store::login_key`]: owner + URL).
@@ -109,22 +196,31 @@ pub struct ProviderOptions {
     /// The login's `state`; random when not given.
     pub state: Option<String>,
     /// Interactive: hands the authorization URL to the UI to open or show.
-    pub on_authorize: Option<Box<dyn Fn(Url) + Send + Sync>>,
-    /// Interactive: the login's cancellation. Once cancelled, nothing is saved.
-    pub cancel: Option<CancellationToken>,
+    pub on_authorize: Option<Authorize>,
+    /// Interactive: the login's cancellation. Once aborted, nothing is saved: a
+    /// token exchange that finishes late must not undo a logout or log a removed
+    /// server back in.
+    pub abort: Option<Abort>,
+}
+
+impl ProviderOptions {
+    /// A passive provider: what startup and tool calls use.
+    pub fn passive(store: McpTokenStore, key: String, server: String, port: Option<u16>, oauth: Option<McpOAuthConfig>) -> Self {
+        Self { store, key, server, mode: ProviderMode::Passive, port, oauth, state: None, on_authorize: None, abort: None }
+    }
 }
 
 /// Marv's side of an OAuth client: backed by the token store.
 pub struct McpOAuthProvider {
     pub opts: ProviderOptions,
-    /// PKCE verifier: memory only.
+    /// PKCE verifier: memory only (a login lives in one process, and the verifier is what makes a stolen code useless).
     verifier: Option<String>,
-    /// The refresh token `tokens()` last handed out.
+    /// The refresh token `tokens()` last handed out: what `invalidate_credentials` drops when it can't tell which failed.
     last_refresh: Option<String>,
     /// The refresh token the last refused refresh request sent: the one to drop.
     failed_refresh: Option<String>,
-    /// Interactive: the tokens this login got (a login starts afresh).
-    fresh: Option<Value>,
+    /// Interactive: the tokens this login got. A login starts afresh rather than reusing (or refreshing) stored ones.
+    fresh: Option<StoredTokens>,
     state: String,
 }
 
@@ -138,16 +234,17 @@ impl McpOAuthProvider {
         self.opts.oauth.as_ref().and_then(|o| o.callback_port).or(self.opts.port)
     }
 
-    /// Always defined (see the module docs).
+    /// Always defined: an undefined redirect URI made the SDK try a non-interactive (client credentials) grant.
     pub fn redirect_url(&self) -> String {
         redirect_url_for(self.port())
     }
 
     /// RFC 7591 client metadata: a public client (`token_endpoint_auth_method:
-    /// none`, PKCE stands in for a secret) unless the config gives a secret.
+    /// none`: nothing secret can live in a program the user runs, PKCE stands in
+    /// for it) unless the config gives a secret.
     pub fn client_metadata(&self) -> Value {
         let oauth = self.opts.oauth.clone().unwrap_or_default();
-        let mut meta = serde_json::json!({
+        let mut meta = json!({
             "client_name": "Marv",
             "client_uri": REPOSITORY,
             "redirect_uris": [self.redirect_url()],
@@ -161,62 +258,446 @@ impl McpOAuthProvider {
         meta
     }
 
+    /// The login's `state`: random, and the same for the whole login, so the callback can be checked against it.
     pub fn state(&self) -> &str {
         &self.state
     }
 
-    /// The configured client, or the one registered for Marv (from the store).
-    pub async fn client_information(&self) -> crate::Result<Option<Value>> {
-        let _ = (&self.verifier, &self.last_refresh, &self.failed_refresh, &self.fresh);
-        todo!("port: clientInformation (config clientId/secret first, else store.client)")
+    fn passive(&self) -> bool {
+        self.opts.mode == ProviderMode::Passive
     }
 
-    /// Passive: raises [`LoginNeeded`] (never registers in the background).
-    pub async fn save_client_information(&mut self, _info: Value) -> crate::Result<()> {
-        todo!("port: saveClientInformation (passive → LoginNeeded; interactive → store with port, unless cancelled)")
+    fn check_abort(&self) -> crate::Result<()> {
+        self.opts.abort.as_ref().map_or(Ok(()), Abort::check)
     }
 
-    /// Re-reads the store; interactive returns only this login's own tokens.
-    pub async fn tokens(&mut self) -> crate::Result<Option<Value>> {
-        todo!("port: tokens (re-read store, remember refresh token handed out)")
+    /// The configured client (config `clientId`/`clientSecret` first), or the one registered for Marv (from the store).
+    pub fn client_information(&self) -> Option<StoredClient> {
+        let oauth = self.opts.oauth.as_ref();
+        if let Some(id) = oauth.and_then(|o| o.client_id.clone()) {
+            let mut rest = Map::new();
+            if let Some(secret) = oauth.and_then(|o| o.client_secret.clone()) {
+                rest.insert("client_secret".into(), secret.into());
+                rest.insert("token_endpoint_auth_method".into(), "client_secret_post".into());
+            }
+            return Some(StoredClient { client_id: id, port: None, rest });
+        }
+        let client = self.opts.store.get(&self.opts.key)?.client?;
+        Some(StoredClient { port: None, ..client })
     }
 
-    pub async fn save_tokens(&mut self, _tokens: Value) -> crate::Result<()> {
-        todo!("port: saveTokens (skip when cancelled; store with savedAt)")
+    /// Passive: raises [`LoginNeeded`] (a background connection never registers
+    /// Marv with a server the user didn't log in to). Interactive: stored with
+    /// the port its redirect URI names, unless the login was cancelled.
+    pub async fn save_client_information(&self, info: StoredClient) -> crate::Result<()> {
+        // A configured client lives in the config (its secret too): nothing to store.
+        if self.opts.oauth.as_ref().is_some_and(|o| o.client_id.is_some()) {
+            return Ok(());
+        }
+        if self.passive() {
+            return Err(LoginNeeded { server: self.opts.server.clone() }.into());
+        }
+        self.check_abort()?;
+        let (server, port) = (self.opts.server.clone(), self.port());
+        self.opts
+            .store
+            .update(&self.opts.key, |e| {
+                self.check_abort()?;
+                let mut e = e.unwrap_or_else(|| Login::new(&server));
+                e.server = server;
+                e.client = Some(StoredClient { port, ..info });
+                Ok(Some(e))
+            })
+            .await
+    }
+
+    /// Read from the file every time: another Marv process may have refreshed
+    /// (and rotated) the tokens. Interactive: only this login's own tokens.
+    pub fn tokens(&mut self) -> Option<StoredTokens> {
+        if !self.passive() {
+            return self.fresh.clone();
+        }
+        let tokens = self.opts.store.get(&self.opts.key).and_then(|l| l.tokens);
+        self.last_refresh = tokens.as_ref().and_then(|t| t.refresh_token.clone());
+        tokens
+    }
+
+    /// Stored with when (for `/mcp`'s "expires at"); nothing once the login was cancelled.
+    pub async fn save_tokens(&mut self, tokens: StoredTokens) -> crate::Result<()> {
+        // Checked inside the update too: the abort may come while it waits for the file's lock.
+        self.check_abort()?;
+        if !self.passive() {
+            self.fresh = Some(tokens.clone());
+        }
+        let server = self.opts.server.clone();
+        let this = &*self;
+        this.opts
+            .store
+            .update(&this.opts.key, |e| {
+                this.check_abort()?;
+                let mut e = e.unwrap_or_else(|| Login::new(&server));
+                e.server = server;
+                e.tokens = Some(tokens);
+                e.saved_at = Some(now_ms());
+                Ok(Some(e))
+            })
+            .await
     }
 
     /// Passive: raises [`LoginNeeded`]. Interactive: rewrites `scope` from the
     /// config, checks [`authorization_url_ok`], hands the URL to `on_authorize`.
-    pub fn redirect_to_authorization(&self, _url: Url) -> crate::Result<()> {
-        todo!("port: redirectToAuthorization")
+    pub fn redirect_to_authorization(&self, mut url: Url) -> crate::Result<()> {
+        let Some(authorize) = self.opts.on_authorize.as_ref().filter(|_| !self.passive()) else {
+            return Err(LoginNeeded { server: self.opts.server.clone() }.into());
+        };
+        if !authorization_url_ok(&url) {
+            let host = url.host_str().unwrap_or_default();
+            return Err(McpError::Server(format!(
+                "the authorization server sent a login address Marv won't open ({}://{host})",
+                url.scheme()
+            )));
+        }
+        if let Some(scope) = self.opts.oauth.as_ref().and_then(|o| o.scope.clone()) {
+            let mut pairs: Vec<(String, String)> =
+                url.query_pairs().filter(|(k, _)| k != "scope").map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
+            pairs.push(("scope".into(), scope.clone()));
+            if scope.split_whitespace().any(|s| s == "offline_access") && !pairs.iter().any(|(k, _)| k == "prompt") {
+                pairs.push(("prompt".into(), "consent".into()));
+            }
+            url.query_pairs_mut().clear().extend_pairs(pairs);
+        }
+        authorize(url);
+        Ok(())
     }
 
+    /// In memory only.
     pub fn save_code_verifier(&mut self, verifier: String) {
         self.verifier = Some(verifier);
     }
 
     pub fn code_verifier(&self) -> crate::Result<&str> {
-        self.verifier.as_deref().ok_or_else(|| crate::McpError::Server("no PKCE verifier: the login didn't start here".into()))
+        self.verifier.as_deref().ok_or_else(|| McpError::Server("no login is in progress".into()))
     }
 
     /// Cached in the store, so a startup with tokens makes no discovery requests.
-    pub async fn discovery_state(&self) -> crate::Result<Option<Value>> {
-        todo!("port: discoveryState")
+    pub fn discovery_state(&self) -> Option<StoredDiscovery> {
+        self.opts.store.get(&self.opts.key).and_then(|l| l.discovery)
     }
 
-    pub async fn save_discovery_state(&self, _state: Value) -> crate::Result<()> {
-        todo!("port: saveDiscoveryState")
+    /// As `save_tokens`: a cancelled login writes nothing, checked again once the file's lock is held.
+    pub async fn save_discovery_state(&self, state: StoredDiscovery) -> crate::Result<()> {
+        self.check_abort()?;
+        let server = self.opts.server.clone();
+        self.opts
+            .store
+            .update(&self.opts.key, |e| {
+                self.check_abort()?;
+                let mut e = e.unwrap_or_else(|| Login::new(&server));
+                e.server = server;
+                e.discovery = Some(state);
+                Ok(Some(e))
+            })
+            .await
     }
 
     /// `Tokens` drops only the refresh token that failed (see module docs).
-    pub async fn invalidate_credentials(&mut self, _scope: Invalidate) -> crate::Result<()> {
-        todo!("port: invalidateCredentials")
+    pub async fn invalidate_credentials(&mut self, scope: Invalidate) -> crate::Result<()> {
+        if scope == Invalidate::Verifier {
+            self.verifier = None;
+            return Ok(());
+        }
+        let failed = self.failed_refresh.take().or_else(|| self.last_refresh.clone());
+        self.opts
+            .store
+            .update(&self.opts.key, |e| {
+                let Some(mut next) = e else { return Ok(None) };
+                if matches!(scope, Invalidate::All | Invalidate::Client) {
+                    next.client = None;
+                }
+                if matches!(scope, Invalidate::All | Invalidate::Discovery) {
+                    next.discovery = None;
+                }
+                // Another process may have refreshed since this one read the tokens: its newer refresh token is
+                // kept, and the retry refreshes with it. Only the one that failed here is dropped.
+                let stale = next.tokens.as_ref().map(|t| t.refresh_token.clone()) == Some(failed.clone());
+                if scope == Invalidate::All || (scope == Invalidate::Tokens && stale) {
+                    next.tokens = None;
+                    next.saved_at = None;
+                }
+                Ok(Some(next))
+            })
+            .await
     }
 
-    /// The HTTP client hook: notes the refresh token a refused refresh sent.
+    /// The refresh hook: notes the refresh token a refused refresh sent. Two
+    /// refreshes can run at once (two requests both got a 401): the one that
+    /// sent the stale token fails, and must not delete the tokens the other one
+    /// just saved.
     pub fn note_refused_refresh(&mut self, refresh_token: String) {
         self.failed_refresh = Some(refresh_token);
     }
+}
+
+/// What `auth` ended with: tokens saved, or the user was sent to the browser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthResult {
+    Authorized,
+    Redirect,
+}
+
+/// The `resource_metadata` a 401's `WWW-Authenticate: Bearer` header names (RFC 9728 §5.1).
+pub fn resource_metadata_of(www_authenticate: &str) -> Option<Url> {
+    let at = www_authenticate.find("resource_metadata=")? + "resource_metadata=".len();
+    let rest = &www_authenticate[at..];
+    let value = match rest.strip_prefix('"') {
+        Some(quoted) => &quoted[..quoted.find('"')?],
+        None => rest.split([',', ' ']).next()?,
+    };
+    Url::parse(value).ok()
+}
+
+/// One JSON object from a metadata URL: `Ok(None)` for an answer that isn't
+/// one (404 and the like: try the next URL), `Err` when the network failed.
+async fn metadata(url: &Url) -> Result<Option<Map<String, Value>>, reqwest::Error> {
+    let response = http().get(url.clone()).header(PROTOCOL_HEADER, crate::jsonrpc::PROTOCOL_VERSION).send().await?;
+    if !response.status().is_success() {
+        return Ok(None);
+    }
+    Ok(response.json::<Value>().await.ok().and_then(|v| if let Value::Object(m) = v { Some(m) } else { None }))
+}
+
+fn well_known(base: &Url, name: &str, path: &str) -> Option<Url> {
+    let path = path.trim_end_matches('/');
+    base.join(&format!("/.well-known/{name}{path}")).ok()
+}
+
+/// RFC 9728 protected-resource metadata: from the URL a 401 named, else the
+/// well-known URL for the server's path, then for its root.
+pub async fn discover_resource_metadata(server: &Url, named: Option<&Url>) -> Result<Option<(Url, Map<String, Value>)>, reqwest::Error> {
+    let candidates: Vec<Url> = match named {
+        Some(url) => vec![url.clone()],
+        None => {
+            let mut c = Vec::new();
+            if server.path() != "/" {
+                c.extend(well_known(server, "oauth-protected-resource", server.path()));
+            }
+            c.extend(well_known(server, "oauth-protected-resource", ""));
+            c
+        }
+    };
+    for url in candidates {
+        if let Some(meta) = metadata(&url).await? {
+            return Ok(Some((url, meta)));
+        }
+    }
+    Ok(None)
+}
+
+/// RFC 8414 (or OpenID) metadata of an authorization server.
+async fn discover_server_metadata(issuer: &Url) -> Option<Map<String, Value>> {
+    let path = issuer.path().trim_end_matches('/');
+    let urls: Vec<Option<Url>> = if path.is_empty() {
+        vec![well_known(issuer, "oauth-authorization-server", ""), well_known(issuer, "openid-configuration", "")]
+    } else {
+        vec![
+            well_known(issuer, "oauth-authorization-server", path),
+            well_known(issuer, "openid-configuration", path),
+            issuer.join(&format!("{path}/.well-known/openid-configuration")).ok(),
+        ]
+    };
+    for url in urls.into_iter().flatten() {
+        if let Ok(Some(meta)) = metadata(&url).await {
+            return Some(meta);
+        }
+    }
+    None
+}
+
+/// Why a token request failed: the server's OAuth error code, or anything else.
+enum TokenFailure {
+    OAuth(String),
+    Other(McpError),
+}
+
+impl From<McpError> for TokenFailure {
+    fn from(e: McpError) -> Self {
+        TokenFailure::Other(e)
+    }
+}
+
+/// A token endpoint request (the code exchange or a refresh), authenticated as the client.
+async fn token_request(endpoint: &Url, client: &StoredClient, mut form: Vec<(&str, String)>) -> Result<StoredTokens, TokenFailure> {
+    form.push(("client_id", client.client_id.clone()));
+    if let Some(secret) = client.rest.get("client_secret").and_then(Value::as_str) {
+        form.push(("client_secret", secret.to_string()));
+    }
+    let body = url::form_urlencoded::Serializer::new(String::new()).extend_pairs(form).finish();
+    let response = http()
+        .post(endpoint.clone())
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header("accept", "application/json")
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| McpError::Server(format!("the token request failed: {e}")))?;
+    let status = response.status();
+    let body: Value = response.json().await.unwrap_or(Value::Null);
+    if !status.is_success() {
+        return Err(match body.get("error").and_then(Value::as_str) {
+            Some(code) => TokenFailure::OAuth(code.to_string()),
+            None => TokenFailure::Other(McpError::Server(format!("the token endpoint answered {}", status.as_u16()))),
+        });
+    }
+    serde_json::from_value(body).map_err(|_| McpError::Server("the token endpoint's answer has no access_token".into()).into())
+}
+
+fn token_error(failure: TokenFailure) -> McpError {
+    match failure {
+        // The server's code only (a short word), never its description.
+        TokenFailure::OAuth(code) => McpError::Server(format!("the authorization server refused: {}", crate::text::truncate(&code, 64))),
+        TokenFailure::Other(e) => e,
+    }
+}
+
+fn endpoint(meta: &Map<String, Value>, name: &str, issuer: &Url, fallback: &str) -> crate::Result<Url> {
+    match meta.get(name).and_then(Value::as_str) {
+        Some(url) => Url::parse(url).map_err(|_| McpError::Server(format!("the authorization server's {name} isn't a URL"))),
+        None => issuer.join(fallback).map_err(|_| McpError::Server(format!("no {name}"))),
+    }
+}
+
+/// The OAuth flow for one server (the MCP SDK's `auth()`): discovery (cached
+/// in the store), the client (configured, stored, or registered: interactive
+/// only), then the code exchange when `code` is given, else a refresh when
+/// there's a refresh token, else the authorization redirect (PKCE S256).
+pub async fn auth(p: &mut McpOAuthProvider, server: &Url, named_metadata: Option<&Url>, code: Option<&str>) -> crate::Result<AuthResult> {
+    let net = |e: reqwest::Error| McpError::Server(format!("the login's discovery failed: {e}"));
+    let cached = p.discovery_state().filter(|d| d.rest.contains_key("authorizationServerMetadata"));
+    let (issuer, resource_meta, server_meta) = match cached {
+        Some(d) => {
+            let issuer = Url::parse(&d.authorization_server_url).map_err(|_| McpError::Server("stored discovery is broken".into()))?;
+            let object = |k: &str| d.rest.get(k).and_then(Value::as_object).cloned();
+            (issuer, object("resourceMetadata"), object("authorizationServerMetadata").unwrap_or_default())
+        }
+        None => {
+            // A server without RFC 9728 metadata: its own origin is the authorization server (the older spec).
+            let found = discover_resource_metadata(server, named_metadata).await.map_err(net)?;
+            let issuer = found
+                .as_ref()
+                .and_then(|(_, m)| m.get("authorization_servers")?.as_array()?.first()?.as_str().map(str::to_string))
+                .and_then(|u| Url::parse(&u).ok())
+                .unwrap_or_else(|| server.join("/").unwrap_or_else(|_| server.clone()));
+            let server_meta = discover_server_metadata(&issuer).await.unwrap_or_default();
+            let mut rest = Map::new();
+            if let Some((url, meta)) = &found {
+                rest.insert("resourceMetadataUrl".into(), url.as_str().into());
+                rest.insert("resourceMetadata".into(), Value::Object(meta.clone()));
+            }
+            rest.insert("authorizationServerMetadata".into(), Value::Object(server_meta.clone()));
+            p.save_discovery_state(StoredDiscovery { authorization_server_url: issuer.to_string(), rest }).await?;
+            (issuer, found.map(|(_, m)| m), server_meta)
+        }
+    };
+    let resource = resource_meta.as_ref().and_then(|m| m.get("resource")?.as_str().map(str::to_string));
+    let token_endpoint = endpoint(&server_meta, "token_endpoint", &issuer, "/token")?;
+
+    let client = match p.client_information() {
+        Some(client) => client,
+        None => {
+            if code.is_some() {
+                return Err(McpError::Server("the login lost its client registration: start it again".into()));
+            }
+            // marv-rs: refused before any request (the SDK registered first and failed to save after).
+            if p.passive() {
+                return Err(LoginNeeded { server: p.opts.server.clone() }.into());
+            }
+            let Some(register) = server_meta.get("registration_endpoint").and_then(Value::as_str) else {
+                return Err(McpError::Server("Incompatible auth server: does not support dynamic client registration".into()));
+            };
+            let register = Url::parse(register).map_err(|_| McpError::Server("the registration endpoint isn't a URL".into()))?;
+            let response = http()
+                .post(register)
+                .json(&p.client_metadata())
+                .send()
+                .await
+                .map_err(|e| McpError::Server(format!("dynamic client registration failed: {e}")))?;
+            if !response.status().is_success() {
+                return Err(McpError::Server(format!("dynamic client registration failed: HTTP {}", response.status().as_u16())));
+            }
+            let info: StoredClient = response
+                .json()
+                .await
+                .map_err(|_| McpError::Server("dynamic client registration answered without a client_id".into()))?;
+            p.save_client_information(info.clone()).await?;
+            info
+        }
+    };
+
+    if let Some(code) = code {
+        let mut form = vec![
+            ("grant_type", "authorization_code".to_string()),
+            ("code", code.to_string()),
+            ("code_verifier", p.code_verifier()?.to_string()),
+            ("redirect_uri", p.redirect_url()),
+        ];
+        form.extend(resource.clone().map(|r| ("resource", r)));
+        let tokens = token_request(&token_endpoint, &client, form).await.map_err(token_error)?;
+        p.save_tokens(tokens).await?;
+        return Ok(AuthResult::Authorized);
+    }
+
+    if let Some(refresh) = p.tokens().and_then(|t| t.refresh_token) {
+        let mut form = vec![("grant_type", "refresh_token".to_string()), ("refresh_token", refresh.clone())];
+        form.extend(resource.clone().map(|r| ("resource", r)));
+        match token_request(&token_endpoint, &client, form).await {
+            Ok(mut tokens) => {
+                // A server that doesn't rotate leaves the refresh token out: keep the one that worked.
+                tokens.refresh_token.get_or_insert(refresh);
+                p.save_tokens(tokens).await?;
+                return Ok(AuthResult::Authorized);
+            }
+            Err(TokenFailure::OAuth(code)) => {
+                p.note_refused_refresh(refresh);
+                match code.as_str() {
+                    "invalid_client" | "unauthorized_client" => p.invalidate_credentials(Invalidate::All).await?,
+                    "invalid_grant" => p.invalidate_credentials(Invalidate::Tokens).await?,
+                    _ => return Err(token_error(TokenFailure::OAuth(code))),
+                }
+            }
+            Err(other) => return Err(token_error(other)),
+        }
+    }
+
+    // A new authorization: passive providers refuse here (LoginNeeded).
+    if p.passive() {
+        return Err(LoginNeeded { server: p.opts.server.clone() }.into());
+    }
+    let (verifier, challenge) = pkce();
+    p.save_code_verifier(verifier);
+    let mut url = endpoint(&server_meta, "authorization_endpoint", &issuer, "/authorize")?;
+    let metadata = p.client_metadata();
+    let scope = metadata["scope"].as_str().map(str::to_string).or_else(|| {
+        let supported = resource_meta.as_ref()?.get("scopes_supported")?.as_array()?;
+        let scopes: Vec<&str> = supported.iter().filter_map(Value::as_str).collect();
+        (!scopes.is_empty()).then(|| scopes.join(" "))
+    });
+    {
+        let mut q = url.query_pairs_mut();
+        q.append_pair("response_type", "code")
+            .append_pair("client_id", &client.client_id)
+            .append_pair("code_challenge", &challenge)
+            .append_pair("code_challenge_method", "S256")
+            .append_pair("redirect_uri", &p.redirect_url())
+            .append_pair("state", p.state());
+        if let Some(scope) = &scope {
+            q.append_pair("scope", scope);
+        }
+        if let Some(resource) = &resource {
+            q.append_pair("resource", resource);
+        }
+    }
+    p.redirect_to_authorization(url)?;
+    Ok(AuthResult::Redirect)
 }
 
 /// The outcome of one callback address.
@@ -236,18 +717,37 @@ fn same(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// What a login waits for: one callback carrying its `state`.
+/// What a login waits for: one callback carrying its `state`. `check`
+/// decides about each address that arrives (from the browser, or pasted);
+/// [`CallbackExpectation::outcome`] gets the first valid one's code, or why the
+/// login failed.
 #[derive(Debug)]
 pub struct CallbackExpectation {
     state: String,
     used: bool,
     /// Set by an `error=` callback or a code-less one: the login fails with it.
     pub failure: Option<String>,
+    outcome: tokio::sync::watch::Sender<Option<Result<String, String>>>,
 }
 
 impl CallbackExpectation {
     pub fn new(state: impl Into<String>) -> Self {
-        Self { state: state.into(), used: false, failure: None }
+        Self { state: state.into(), used: false, failure: None, outcome: tokio::sync::watch::Sender::new(None) }
+    }
+
+    /// The code, or why there won't be one.
+    pub fn outcome(&self) -> tokio::sync::watch::Receiver<Option<Result<String, String>>> {
+        self.outcome.subscribe()
+    }
+
+    fn settle(&self, outcome: Result<String, String>) {
+        self.outcome.send_if_modified(|slot| {
+            if slot.is_some() {
+                return false;
+            }
+            *slot = Some(outcome);
+            true
+        });
     }
 
     /// Decides about one address (from the listener, or pasted).
@@ -270,21 +770,29 @@ impl CallbackExpectation {
             let ok =
                 !error.is_empty() && error.len() <= 64 && error.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b));
             let why = if ok { error } else { "error".into() };
-            self.failure = Some(format!("the authorization server refused the login ({why})"));
+            let failure = format!("the authorization server refused the login ({why})");
+            self.settle(Err(failure.clone()));
+            self.failure = Some(failure);
             return CallbackCheck::Refused { why };
         }
         match param("code").filter(|c| !c.is_empty()) {
-            Some(code) => CallbackCheck::Ok { code },
+            Some(code) => {
+                self.settle(Ok(code.clone()));
+                CallbackCheck::Ok { code }
+            }
             None => {
-                self.failure = Some("the authorization server came back without a code".into());
+                let failure = "the authorization server came back without a code".to_string();
+                self.settle(Err(failure.clone()));
+                self.failure = Some(failure);
                 refused("no code")
             }
         }
     }
 
     /// The login was cancelled: later callbacks are `used`.
-    pub fn cancel(&mut self) {
+    pub fn cancel(&mut self, why: &str) {
         self.used = true;
+        self.settle(Err(why.to_string()));
     }
 }
 
@@ -319,16 +827,94 @@ pub fn callback_page(check: &CallbackCheck) -> (u16, String) {
     }
 }
 
-/// The loopback listener: 127.0.0.1 only, `/callback` only.
+/// Decides about one address that reached the listener.
+pub type CallbackHandler = Arc<dyn Fn(&Url) -> CallbackCheck + Send + Sync>;
+
+/// The loopback listener the browser is sent back to: 127.0.0.1 only,
+/// `/callback` only. Stops when closed or dropped.
 pub struct Listener {
     pub port: u16,
     /// The preferred port was taken: the client has to be registered again.
     pub fell_back: bool,
+    stop: CancellationToken,
 }
 
-/// Listens on 127.0.0.1, `preferred` first, else any free port.
-pub async fn listen(_preferred: Option<u16>) -> crate::Result<Listener> {
-    todo!("port: listen (tokio TcpListener on 127.0.0.1, minimal HTTP GET handling, callback_page)")
+impl Listener {
+    pub fn close(&self) {
+        self.stop.cancel();
+    }
+}
+
+impl Drop for Listener {
+    fn drop(&mut self) {
+        self.stop.cancel();
+    }
+}
+
+/// Listens on 127.0.0.1, `preferred` first (the port a client was registered
+/// with), else any free port, and says it fell back.
+pub async fn listen(check: CallbackHandler, preferred: Option<u16>) -> crate::Result<Listener> {
+    use tokio::net::TcpListener;
+    let (listener, fell_back) = match preferred {
+        Some(port) => match TcpListener::bind(("127.0.0.1", port)).await {
+            Ok(l) => (l, false),
+            Err(_) => (TcpListener::bind(("127.0.0.1", 0)).await?, true),
+        },
+        None => (TcpListener::bind(("127.0.0.1", 0)).await?, false),
+    };
+    let port = listener.local_addr()?.port();
+    let stop = CancellationToken::new();
+    let stopped = stop.clone();
+    tokio::spawn(async move {
+        loop {
+            let accepted = tokio::select! {
+                _ = stopped.cancelled() => break,
+                a = listener.accept() => a,
+            };
+            let Ok((stream, _)) = accepted else { continue };
+            let check = check.clone();
+            tokio::spawn(async move {
+                let _ = tokio::time::timeout(Duration::from_secs(10), answer(stream, port, &*check)).await;
+            });
+        }
+    });
+    Ok(Listener { port, fell_back, stop })
+}
+
+/// One browser request: its target is checked, the page says what happened, and nothing else is read.
+async fn answer(
+    mut stream: tokio::net::TcpStream,
+    port: u16,
+    check: &(dyn Fn(&Url) -> CallbackCheck + Send + Sync),
+) -> std::io::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut head = Vec::new();
+    let mut buf = [0u8; 2048];
+    while !head.windows(4).any(|w| w == b"\r\n\r\n") && head.len() < 16 * 1024 {
+        let n = stream.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        head.extend_from_slice(&buf[..n]);
+    }
+    let line = String::from_utf8_lossy(&head).lines().next().unwrap_or_default().to_string();
+    let target = line.split(' ').nth(1).unwrap_or("/");
+    let verdict = Url::parse(&format!("http://127.0.0.1:{port}"))
+        .and_then(|base| base.join(target))
+        .map_or(CallbackCheck::Refused { why: "path".into() }, |url| check(&url));
+    let (status, body) = callback_page(&verdict);
+    let reason = match status {
+        200 => "OK",
+        404 => "Not Found",
+        _ => "Bad Request",
+    };
+    let kind = if status == 404 { "text/plain" } else { "text/html; charset=utf-8" };
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\ncontent-type: {kind}\r\ncontent-length: {}\r\ncache-control: no-store\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.shutdown().await
 }
 
 /// Whether a browser can open here: not over SSH, not without a display.
@@ -343,15 +929,44 @@ pub fn can_open_browser(env: &crate::Env, platform: &str) -> bool {
     }
 }
 
-/// Opens the URL with `xdg-open`/`open`: argv only, never a shell. Failures are ignored.
-pub fn open_browser(_url: &Url, _platform: &str) {
-    todo!("port: openBrowser (spawn detached, stdio null)")
+/// Opens the URL in the browser: the URL is one argument, never through a
+/// shell. Failures are ignored: the link is shown anyway.
+pub fn open_browser(url: &Url, platform: &str) {
+    open_browser_with(url, platform, &|argv| {
+        let _ = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    })
 }
 
-/// Whether a remote server would ask for a login: an unauthenticated RFC 9728
-/// metadata read. Never registers, never fails, gives up after 5 s.
-pub async fn probe_login(_url: &str, _cancel: CancellationToken) -> bool {
-    todo!("port: probeLogin")
+/// [`open_browser`] with its spawner given (tests).
+pub fn open_browser_with(url: &Url, platform: &str, spawn: &dyn Fn(&[String])) {
+    let opener = if matches!(platform, "macos" | "darwin") { "open" } else { "xdg-open" };
+    spawn(&[opener.to_string(), url.as_str().to_string()]);
+}
+
+/// Whether a remote server would ask for a login (for `/mcp add`, before it's
+/// installed): an unauthenticated RFC 9728 metadata read. Never registers,
+/// never fails, gives up after 5 s or when `cancel` fires (Esc during `/mcp add`).
+pub async fn probe_login(url: &str, cancel: CancellationToken) -> bool {
+    probe_login_within(url, NETWORK_TIMEOUT, cancel).await
+}
+
+pub async fn probe_login_within(url: &str, timeout: Duration, cancel: CancellationToken) -> bool {
+    let Ok(server) = Url::parse(url) else { return false };
+    let probe = async {
+        match discover_resource_metadata(&server, None).await {
+            Ok(Some((_, meta))) => meta.get("authorization_servers").and_then(Value::as_array).is_some_and(|a| !a.is_empty()),
+            _ => false,
+        }
+    };
+    tokio::select! {
+        found = tokio::time::timeout(timeout, probe) => found.unwrap_or(false),
+        _ = cancel.cancelled() => false,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -364,8 +979,48 @@ pub enum Revoked {
 
 /// RFC 7009 revocation of a login's refresh token, best effort, 5 s. The
 /// endpoint comes from the stored metadata and must pass [`authorization_url_ok`].
-pub async fn revoke(_login: &Login, _oauth: Option<&McpOAuthConfig>) -> Revoked {
-    todo!("port: revoke")
+///
+/// It isn't required to be on the authorization server's host: it comes from
+/// that server's own metadata (fetched by Marv during the login), and real
+/// providers put it elsewhere (Google: accounts.google.com issues,
+/// oauth2.googleapis.com/revoke revokes). The one way to point it somewhere
+/// else is to edit `~/.marv/mcp-tokens.json`, and whoever can do that already
+/// holds the tokens it would send.
+pub async fn revoke(login: &Login, oauth: Option<&McpOAuthConfig>) -> Revoked {
+    revoke_within(login, oauth, NETWORK_TIMEOUT).await
+}
+
+pub async fn revoke_within(login: &Login, oauth: Option<&McpOAuthConfig>, timeout: Duration) -> Revoked {
+    let endpoint = login
+        .discovery
+        .as_ref()
+        .and_then(|d| d.rest.get("authorizationServerMetadata")?.get("revocation_endpoint")?.as_str().map(str::to_string));
+    let tokens = login.tokens.as_ref();
+    let token = tokens.and_then(|t| t.refresh_token.clone()).or_else(|| tokens.map(|t| t.access_token.clone()));
+    let (Some(endpoint), Some(token)) = (endpoint, token) else { return Revoked::Unsupported };
+    let Ok(target) = Url::parse(&endpoint) else { return Revoked::Failed };
+    if !authorization_url_ok(&target) {
+        return Revoked::Failed;
+    }
+    let configured = oauth.and_then(|o| o.client_id.clone());
+    let hint = if tokens.is_some_and(|t| t.refresh_token.is_some()) { "refresh_token" } else { "access_token" };
+    let mut form = vec![("token", token), ("token_type_hint", hint.to_string())];
+    if let Some(id) = configured.clone().or_else(|| login.client.as_ref().map(|c| c.client_id.clone())) {
+        form.push(("client_id", id));
+    }
+    let secret = match configured {
+        Some(_) => oauth.and_then(|o| o.client_secret.clone()),
+        None => login.client.as_ref().and_then(|c| c.rest.get("client_secret")?.as_str().map(str::to_string)),
+    };
+    if let Some(secret) = secret {
+        form.push(("client_secret", secret));
+    }
+    let body = url::form_urlencoded::Serializer::new(String::new()).extend_pairs(form).finish();
+    let request = http().post(target).header("content-type", "application/x-www-form-urlencoded").body(body).send();
+    match tokio::time::timeout(timeout, request).await {
+        Ok(Ok(response)) if response.status().is_success() => Revoked::Revoked,
+        _ => Revoked::Failed,
+    }
 }
 
 #[cfg(test)]

@@ -50,6 +50,13 @@ pub struct Login {
     pub discovery: Option<StoredDiscovery>,
 }
 
+impl Login {
+    /// A login with nothing in it yet, saved under the server's name.
+    pub fn new(server: impl Into<String>) -> Self {
+        Self { server: server.into(), client: None, tokens: None, saved_at: None, discovery: None }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoredClient {
     pub client_id: String,
