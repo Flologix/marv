@@ -188,6 +188,32 @@ describe("a turn's checkpoints", () => {
     expect(refs().split("\n").length).toBe(2);
   });
 
+  test("resume() into a chain that can't be read: new turns go on a chain of their own, never numbered over its turns", async () => {
+    const sessions = new SessionStore(join(dir, "sessions"));
+    const store = new CheckpointStore({ root: project, session: "x" });
+    const session = makeSession(
+      new ScriptedProvider([useTools(write("w", "first.txt", "1\n")), say("ok"), useTools(write("w2", "again.txt", "2\n")), say("ok")]),
+      { sessions, checkpointStore: store },
+    );
+    await collect(session.send("first"));
+    const old = session.id;
+    await session.flush();
+    await session.clear();
+    const real = store.chain.bind(store);
+    store.chain = async () => {
+      throw new Error("the checkpoints can't be read (git timed out)");
+    };
+    await session.resume(old);
+    store.chain = real;
+    expect(session.checkpointProblem().failure).toContain("the turns before this resume can't be undone");
+    await collect(session.send("again"));
+    expect(store.ref).toStartWith(`refs/marv/checkpoints/${old}.`);
+    const plan = await session.undoPlan();
+    expect("reason" in plan ? plan.reason : [plan.turn, plan.label]).toEqual([1, "again"]);
+    // The old chain is untouched: its turn 1 is still "first".
+    expect(git(project, "log", "-1", "--format=%B", `refs/marv/checkpoints/${old}`)).toContain("first");
+  });
+
   test("a failing snapshot doesn't stop the turn, and says so once", async () => {
     const store = new CheckpointStore({ root: project, session: "x" });
     store.snapshot = async () => ({ ok: false, reason: "failed", message: "disk full", ms: 1 });

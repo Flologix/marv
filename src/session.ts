@@ -589,8 +589,14 @@ export class MarvSession implements Session {
     this.saveNow(); // the last turn's save may still be waiting: it belongs to the conversation being left
     this.saved = saved;
     this.newChain();
-    // Its chain, if it still exists: numbering goes on after its last checkpointed turn.
-    this.turnNumber = (await this.checkpoints.chain().catch(() => [])).reduce((max, c) => Math.max(max, c.turn), 0);
+    // Its chain, if it still exists: numbering goes on after its last checkpointed turn. One that can't be read is
+    // left as it is: this conversation's turns go on a chain of their own, so their numbers can't meet its turns.
+    try {
+      this.turnNumber = (await this.checkpoints.chain()).reduce((max, c) => Math.max(max, c.turn), 0);
+    } catch (error) {
+      this.checkpoints.setSession(`${saved.id}.${Date.now()}`);
+      this.checkpointFailure = `${(error as Error).message}: the turns before this resume can't be undone`;
+    }
     this.conversation = [...saved.conversation];
     this.messages = [...saved.transcript];
     this.totals = saved.totals;

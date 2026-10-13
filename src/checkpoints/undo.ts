@@ -90,7 +90,13 @@ export async function planUndo(
   const where = await store.locate();
   if ("error" in where) return { reason: `checkpoints can't be read: ${where.error}`, failed: true };
   const head = await store.head();
-  const pair = nextUndoable(await store.chain(), store.undoneTurns);
+  let chain: Checkpoint[];
+  try {
+    chain = await store.chain();
+  } catch (error) {
+    return { reason: (error as Error).message, failed: true };
+  }
+  const pair = nextUndoable(chain, store.undoneTurns);
   if (!head || !pair) return { reason: "nothing to undo: no turn in this session has changed files yet (or they're all undone)" };
   // Resolved as applyUndo resolves it, so the plan and the apply compare paths against the same root.
   const given = root ?? join(where.top, where.prefix);

@@ -221,7 +221,8 @@ export class CheckpointStore {
     const head = await this.head();
     if (!head) return [];
     const listed = await this.git(["rev-list", `--max-count=${max}`, "--format=%x1e%H%x00%T%x00%B", head]);
-    if (!listed.ok) return [];
+    // A chain that exists but can't be read isn't an empty one: numbering from 0 would collide with its turns.
+    if (!listed.ok) throw new Error(`the checkpoints can't be read (${listed.timedOut ? "git timed out" : listed.out.trim() || "git rev-list failed"})`);
     const chain: Checkpoint[] = [];
     for (const chunk of listed.out.split("\x1e").slice(1)) {
       const [sha = "", tree = "", message = ""] = chunk.split("\0");
