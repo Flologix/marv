@@ -208,6 +208,8 @@ pub struct SessionAgentHost {
     pub approver: Option<Arc<dyn Approver>>,
     pub always: AlwaysScopes,
     pub sink: Arc<dyn SubagentSink>,
+    /// The switchboard: each subagent gets a plug of its own (`crate::mesh::SubagentPlug`). None: no mesh.
+    pub mesh: Option<crate::mesh::MeshAccess>,
 }
 
 impl SessionAgentHost {

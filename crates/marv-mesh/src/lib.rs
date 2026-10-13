@@ -68,6 +68,12 @@ pub enum MeshError {
     RateLimited { receptacle: String, retry_ms: u64 },
     #[error("no receptacle named {0}")]
     NoReceptacle(String),
+    /// The inbox holds `DEFAULT_INBOX_DEPTH` unread messages: the oldest are kept, new ones refused.
+    #[error("{0} is full: its agent hasn't read its messages yet, try again later")]
+    InboxFull(String),
+    /// Wired, but nothing on this switchboard serves that kind of receptacle in that mode yet (v2/v3).
+    #[error("{receptacle} can't take a {mode} on this switchboard yet")]
+    NotServed { receptacle: String, mode: WireMode },
     #[error("{0}")]
     Io(String),
 }

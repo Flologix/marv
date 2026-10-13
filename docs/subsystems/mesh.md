@@ -14,12 +14,12 @@ The design is in `docs/MESH.md`, and the security rules are in `docs/SECURITY.md
 |---|---|---|
 | new | `wire.rs` | **Done, with tests.** `WireMode`, `Approver`, `Grant`, `Wire`, and `WireTable` (`add`, `remove`, `unplug`, `find`, `allows`, `check`, `from_plug`). |
 | new | `receptacle.rs` | **Done, with tests.** `ReceptacleName` (a checked name, compared exactly), `ReceptacleKind`, and `Receptacle::inbox`. |
-| new | `plug.rs` | `PlugId`, `Plug`, `SocketMount` (bound at `/run/marv/mesh.sock`), and `Reachable` are done and tested. Still todo: `PlugClient` (MCP client over the socket). |
+| new | `plug.rs` | **Done, with tests.** `PlugId`, `Plug`, `SocketMount` (bound at `/run/marv/mesh.sock`), `Reachable`, and `PlugClient` (MCP over the socket: `connect` as `marv-plug`, `list`, `call`, `send`; the mode rides in `tools/call`'s `_meta` as `marv/mode`). |
 | new | `message.rs` | **Done, with tests.** `Envelope` (sender, receptacle, mode, `Provenance::Mesh`, size) and `fenced()`. |
 | new | `limits.rs` | **Done, with tests.** `WireLimits` (size) and `RateLimiter` (a token bucket per wire, fed the time in ms). |
 | new | `approval.rs` | **Done, with tests.** `WireRequest`, `parse_approve_flag` (`--approve mesh:<receptacle>`), and `parse_wire_spec` (`a -> b:inbox`). |
-| new | `switchboard.rs` | Done and tested: `offer`, `plug`, `wire`, `unwire`, `unplug`, `reachable`, and `admit` (the policy check, logged as a `MeshRecord` either way). Shared as `Arc<Switchboard>`: `&self` methods over one short sync lock; `serve` and `route` take `Arc<Self>`. Still todo: `route`, `handle` (the MCP server), `serve` (the sockets) and `drain_inbox`. |
-| new | `tools.rs` | **Done, with tests.** The `mesh_list`, `mesh_call` and `mesh_send` specs, plus `kind_of`. |
+| new | `switchboard.rs` | **v1 done, with tests.** `offer`, `plug` (binds the plug's 0600 socket at once, in the 0700 runtime folder), `plug_next` (`worker-N`, never reused), `wire`, `unwire`, `unplug` (closes its socket and connections), `reachable`, `admit` (the policy check, logged as a `MeshRecord` either way), `route` (inbox sends; a late refusal is logged again under the same id), `deliver`, `handle` (`initialize`, `ping`, `tools/list`, `tools/call`), `serve` (every plug's socket, including plugs added later), `drain_inbox` and `set_trajectory`. Shared as `Arc<Switchboard>`. `watch` routing and the v2/v3 kinds answer `NotServed`. |
+| new | `tools.rs` | **Done, with tests.** The `mesh_list`, `mesh_call` and `mesh_send` specs, `kind_of`, and their bodies over a `PlugClient` (`target`, `list_text`, `fenced_answer`, `run`). |
 | new | `discovery.rs` | `mesh_dir` and `session_socket` are done and tested. Still todo: `list` (`marv mesh ls`). |
 | `src/herdr.ts` | `herdr.rs` | **Status reporting ported, with tests:** `herdr_target`, `build_request`, `HerdrReporter` (skips repeats, sends only the newest state, a rising seq, one retry) and `SocketSender`. Still todo: `HerdrAdapter`, for v2. |
 | new | `agentmesh_bridge.rs` | `endpoint_ok` (loopback only), `remote_receptacle` and `BridgeConfig` are done and tested. Still todo: `connect`, `call` and `publish`, for v3. |
@@ -39,11 +39,18 @@ Run `grep -rn 'todo!("port' crates/marv-mesh` to see what's left. Each mesh todo
 | Cross-process wires are approved on both ends. | A wire with `cross_process` counts only when `Grant.remote` is set. | `wire::cross_process_wires_need_both_ends` |
 | Mesh calls are Egress. | `tools::kind_of`: `mesh_call` and `mesh_send` are `Egress`, `mesh_list` is `Read`. | `tools::specs_are_constant_and_egress_where_data_leaves` |
 
-`tests/guards/` should gain one test per rule that drives the real switchboard over a socket once `serve` exists.
+End to end, from inside real bwrap through the mounted socket (`tests/guards/tests/mesh.rs`, a python3 MCP client; both skip without bwrap or python3):
+- `an_unwired_call_from_the_sandbox_is_refused_and_logged` (rules 1 and 3);
+- `a_sandboxed_subagent_reaches_the_parent_only_over_its_wire` (rule 5: only its wires, the sender is the socket, no wiring from a plug, no other socket reachable).
+
+The issue's integration test is `marv_session::mesh::tests::end_to_end`: a `MarvSession` with a scripted model starts a sandboxed subagent; the two exchange messages over wired inboxes, each wire asked for by the agent and granted by a person, each message fenced in the other's next request, both logged to the trajectory.
 
 ## Milestones
 
 ### v1: one Marv and its subagents
+
+**Status (#15):** done in `marv-mesh` and `marv-session`, except where noted. Left for other issues: `marv-cli` must create the switchboard (`marv_session::mesh::start`) and pass it as `SessionInit::mesh` (with `HeadlessWires` from `--approve mesh:<r>` in `marv -p`); `marv mesh wire` needs a way to reach the running Marv's switchboard (a control socket, v2's discovery); `watch` routing.
+
 - `Switchboard::serve`: one Unix socket per plug, mode 0600, in a private 0700 runtime folder, with newline-delimited JSON-RPC (`marv_mcp::jsonrpc`).
 - `Switchboard::handle`:
   - `initialize`;
@@ -74,6 +81,12 @@ Run `grep -rn 'todo!("port' crates/marv-mesh` to see what's left. Each mesh todo
 
 ## Port notes
 
+- **Plug sockets** live in `$XDG_RUNTIME_DIR/marv/plugs/<session>/<plug>.sock` (`marv_session::mesh::start`). Without `XDG_RUNTIME_DIR` there's no mesh: no `/tmp` fallback, as for discovery.
+- **The mode rides in `_meta`.** `tools/call` carries `"_meta": {"marv/mode": "send"}` (default `call`), and `tools/list` gives each receptacle's wired modes as `"_meta": {"marv/modes": [...]}`. A refusal is a tool result with `isError`, so the agent reads it.
+- **The model's tools use the socket too.** `MeshTool` runs in Marv, but it connects to its agent's own plug socket like anything in the sandbox would, so every message from a model goes through the same checks, identity and log.
+- **Asking for a wire.** A `mesh_send`/`mesh_call` on a receptacle that exists, takes the mode and isn't the agent's own asks the session's `WireApprover` first (a person: `once`, `must_ask`, tool `mesh_wire`); on a no, the message still goes to the switchboard, which refuses and logs it. A wire to an agent's own inbox is never asked for. Yolo may *use* a granted wire (`auto_safe` when wired; tainted sessions still ask), never grant one.
+- **Inboxes are read** before the turn's request (ahead of the user's message) and after each step (`with_inbox`, after the checks' note). Messages still unread when a subagent ends go with its plug. A message that arrives after a final answer waits for the next turn.
+
 - `herdr.rs` replaces Marv's single-flight promise with a `watch::Sender<bool>` for "sending" plus one drain task. The effect is the same: only the newest queued state is sent, and `settled()` waits for the drain. `state()` needs a Tokio runtime.
 - `HerdrReporter::release` drops any queued state, waits for the drain, then sends `pane.release_agent`. The CLI bounds it to 1 s, as in Marv.
 - `marv-mesh` depends on `marv-mcp`, but only for `jsonrpc` and `Env`.
@@ -81,23 +94,28 @@ Run `grep -rn 'todo!("port' crates/marv-mesh` to see what's left. Each mesh todo
 ## Interfaces other crates use
 
 ```rust
-// switchboard (marv-session owns one per process)
-// Shared as Arc<Switchboard>: every method takes &self; serve/route take Arc<Self>.
+// switchboard (marv-session owns one per process: marv_session::mesh::start(session, &env, cancel) -> Option<MeshHandle>)
+// Shared as Arc<Switchboard>: every method takes &self; serve/route/deliver/handle take the Arc.
 Switchboard::new(session, runtime_dir, Arc<dyn TrajectorySink>)
   .table() -> WireTable (snapshot); .receptacle(&name) -> Option<Receptacle> (clone)
-  .plug(PlugId) -> Plug                    // Plug::mount() -> SocketMount { host, guest: "/run/marv/mesh.sock" } for marv-sandbox
+  .plug(PlugId) -> Result<Plug>; .plug_next("worker") -> Result<Plug>   // Plug::mount() for marv-sandbox
   .offer(Receptacle); .wire(Wire) -> Result; .unwire(..); .unplug(&PlugId)
   .reachable(&PlugId) -> Vec<Reachable>    // mesh_list
   .admit(&from, &receptacle, mode, body, now_ms) -> Result<Envelope>
-  async Arc::clone(&sb).route(Envelope); async Arc::clone(&sb).serve(cancel); .drain_inbox(&PlugId) -> Vec<Envelope>
+  async Arc::clone(&sb).route(Envelope); async sb.deliver(&from, name, mode, body); async sb.handle(&from, Request)
+  async Arc::clone(&sb).serve(cancel); .drain_inbox(&PlugId) -> Vec<Envelope>; .set_trajectory(Arc<dyn TrajectorySink>)
 trait TrajectorySink { fn mesh(&self, MeshRecord); }
 
 // approvals (marv-tui / marv-cli)
 approval::{WireRequest, parse_approve_flag, parse_wire_spec}; wire::{Approver, Grant, Wire, WireMode, WireTable}
 Envelope::fenced() -> String              // what the receiving model sees; tag the turn Provenance::Mesh
 
-// model tools (marv-session wraps them)
-tools::{mesh_specs, kind_of, MESH_LIST, MESH_CALL, MESH_SEND}; plug::PlugClient
+// model tools (marv-session wraps them in mesh::MeshTool)
+tools::{mesh_specs, kind_of, target, run, MESH_LIST, MESH_CALL, MESH_SEND}; plug::PlugClient::{connect, list, call, send}
+
+// marv-session::mesh (for marv-cli and the TUI)
+start, log_to, PARENT, parent_id, WireApprover, PersonWires { inner, by }, HeadlessWires(Vec<ReceptacleName>), wire_approval,
+wire_approver, headless_grants, inbox_note, with_inbox, MeshAccess::plug_subagent -> SubagentPlug { tools, sandbox, after_step }
 
 // Herdr (marv-cli makes one, the App reports)
 herdr::{herdr_target(&env), HerdrReporter::new(target, None), .state(s, msg), async .session(id, path), async .release()}

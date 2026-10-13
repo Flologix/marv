@@ -10,6 +10,8 @@
 //! - `tests/provenance.rs`: provenance tagging and fencing, taint and egress, `must_ask` vs "always", subagents;
 //! - `tests/worktree.rs`: worktree subagents (`.git` read-only, Marv commits for them);
 //! - `tests/mcp.rs`: trust, package runners, ignored `instructions`;
+//! - `tests/mesh.rs`: the mesh from inside a sandbox (unwired calls refused and logged, a subagent reaches the parent
+//!   only over its wire);
 //! - `tests/images.rs`: images (not built yet: ignored).
 //!
 //! Every guard's doc comment says how it was proven: "reverted X → this test failed". A guard whose code isn't
