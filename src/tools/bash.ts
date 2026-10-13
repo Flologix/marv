@@ -5,7 +5,7 @@ import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { z } from "zod";
 import { sandboxArgs, sandboxAvailable, TOOLCHAINS } from "../sandbox.ts";
 import { repairTimeoutSeconds } from "./repair.ts";
-import type { Tool } from "./types.ts";
+import { ToolError, type Tool } from "./types.ts";
 
 const DEFAULT_TIMEOUT_S = 120;
 const isInside = (outer: string, inner: string) => {
@@ -213,6 +213,8 @@ interface RunOptions {
   projectReadOnly?: boolean;
   /** The home folder the sandbox hides (default: the user's); tests pass a fake one. */
   home?: string;
+  /** Not sandboxed: this environment instead of the minimal one (the host door's, hostEnv). */
+  env?: Record<string, string>;
 }
 
 const hasSetsid = Bun.which("setsid") !== null;
@@ -222,7 +224,7 @@ const hasSetsid = Bun.which("setsid") !== null;
  * Sandboxed: inside bwrap (see src/sandbox.ts). Not sandboxed: still with a
  * minimal environment, so API keys don't leak into commands.
  */
-export async function runCommand({ command, root, sandbox, network, timeoutMs, signal, readOnly, writable, placeholders, projectReadOnly, home = homedir() }: RunOptions): Promise<CommandResult> {
+export async function runCommand({ command, root, sandbox, network, timeoutMs, signal, readOnly, writable, placeholders, projectReadOnly, home = homedir(), env }: RunOptions): Promise<CommandResult> {
   const path = process.env.PATH ?? "/usr/bin:/bin";
   const script = `exec 2>&1\n${command}`; // stderr into stdout, so the output stays in order
   const argv = sandbox
@@ -237,7 +239,7 @@ export async function runCommand({ command, root, sandbox, network, timeoutMs, s
     // The command's own stderr goes to stdout (`exec 2>&1`), so only what comes before it lands here:
     // bwrap's own errors, e.g. when it can't set the sandbox up.
     stderr: "pipe",
-    env: sandbox ? { PATH: path } : { PATH: path, HOME: home, LANG: process.env.LANG ?? "C.UTF-8", TERM: "dumb" },
+    env: sandbox ? { PATH: path } : (env ?? { PATH: path, HOME: home, LANG: process.env.LANG ?? "C.UTF-8", TERM: "dumb" }),
   });
 
   let timedOut = false;
@@ -308,7 +310,38 @@ const input = z.object({
     .boolean()
     .optional()
     .describe("Set when the command changes the git repository (commit, checkout, merge, rebase, stash, branch, tag, init…). Otherwise .git may be read-only."),
+  // In the spec for every session (one bash spec: the prompt cache); refused in preview where the door is closed.
+  sandbox: z
+    .boolean()
+    .optional()
+    .describe(
+      "false runs the command on the user's machine, outside the sandbox, with their permissions; always asks. Only for what can't work in the sandbox (a system service, a tool under the home folder, hardware), after a sandboxed attempt failed.",
+    ),
 });
+
+/** Said when a call asks for the host where no one approves each command (marv -p, the SDK without hostCommands, subagents). */
+export const NO_HOST_DOOR = "Commands outside the sandbox can only run in Marv's terminal, with the user approving each one.";
+/** Added to the network and hidden-home notes where the host door is open: the last resort, which asks. */
+const HOST_LAST_RESORT = "If this can't work in the sandbox at all, bash with sandbox: false asks the user to run it on their machine.";
+
+/**
+ * Whether a call goes through the host door: it says sandbox: false where the sandbox is on and works. With the
+ * sandbox already off (/sandbox off, or no bubblewrap) the flag changes nothing: the call is an ordinary one.
+ */
+const throughHost = (sandboxFlag: boolean | undefined, sandbox = true) => sandboxFlag === false && sandbox && sandboxAvailable();
+
+/**
+ * The environment of a command on the host: the user's own (systemctl --user needs XDG_RUNTIME_DIR and D-Bus, a
+ * tool under the home folder its config), minus Marv's provider keys.
+ */
+export function hostEnv(env: NodeJS.ProcessEnv = process.env): Record<string, string> {
+  const kept: Record<string, string> = {};
+  for (const [name, value] of Object.entries(env)) {
+    if (value === undefined || name === "OPENROUTER_API_KEY" || name.startsWith("MARV_")) continue;
+    kept[name] = value;
+  }
+  return kept;
+}
 
 export const bash: Tool<typeof input> = {
   name: "bash",
@@ -324,11 +357,17 @@ export const bash: Tool<typeof input> = {
   input,
   kind: "execute",
   label: ({ command }) => command,
-  scope: ({ command, network, git_write }) => ({ key: `bash:${network ? "net:" : ""}${git_write ? "git:" : ""}${command}`, description: "this exact command" }),
-  usesNetwork: ({ network }) => Boolean(network),
+  // On the host, network and git_write mean nothing (it has both): one key, never remembered (`once`).
+  scope: ({ command, network, git_write, sandbox: flag }, { sandbox }) =>
+    throughHost(flag, sandbox)
+      ? { key: `bash:host:${command}`, description: "this exact command on your machine" }
+      : { key: `bash:${network ? "net:" : ""}${git_write ? "git:" : ""}${command}`, description: "this exact command" },
+  usesNetwork: ({ network, sandbox: flag }, { sandbox }) => Boolean(network) || throughHost(flag, sandbox),
+  door: ({ sandbox: flag }, { sandbox }) => (throughHost(flag, sandbox) ? "host" : undefined),
+  once: ({ sandbox: flag }, { sandbox }) => throughHost(flag, sandbox),
   // In the sandbox, without network, and (as runTool confines it) with .git read-only, a command can only change the
-  // project's own files. Without the sandbox, nothing limits it.
-  autoSafe: ({ network, git_write }, { sandbox = true }) => sandbox && sandboxAvailable() && !network && !git_write,
+  // project's own files. Without the sandbox, nothing limits it; on the host, everything is in reach.
+  autoSafe: ({ network, git_write, sandbox: flag }, { sandbox = true }) => sandbox && sandboxAvailable() && !network && !git_write && flag !== false,
   // A timeout given in milliseconds (a whole multiple of 1000, above the
   // maximum) was meant in seconds: divided and clamped (issue #10). Anything
   // else could still be seconds, and fails with the ordinary error.
@@ -341,7 +380,14 @@ export const bash: Tool<typeof input> = {
     return { input: { ...raw, timeout: fixed.seconds }, note: fixed.note };
   },
 
-  async preview({ command, network, timeout }, { sandbox = true }) {
+  async preview({ command, network, timeout, sandbox: flag }, { sandbox = true, doors }) {
+    if (throughHost(flag, sandbox)) {
+      // Refused before any ask where no one approves each command: an approver can be told to say yes to an exact
+      // scope key (marv -p --approve), so the door is the context's to open, not the approver's.
+      if (!doors?.host) throw new ToolError(NO_HOST_DOOR);
+      // The warning line is the door's (ApprovalRequest.door), so it's the same wherever the request is shown.
+      return { title: "Run a command on your machine", command, note: `asked every time${timeout ? ` · timeout ${timeout}s` : ""}` };
+    }
     const sandboxed = sandbox && sandboxAvailable();
     const notes = [sandboxed && "sandboxed", sandboxed && (network ? "network allowed" : "no network"), timeout && `timeout ${timeout}s`];
     return {
@@ -356,7 +402,13 @@ export const bash: Tool<typeof input> = {
     };
   },
 
-  async run({ command, network = false, timeout = DEFAULT_TIMEOUT_S }, { root, signal, sandbox = true, readOnly = [], confined }) {
+  async run({ command, network = false, timeout = DEFAULT_TIMEOUT_S, sandbox: flag }, { root, signal, sandbox = true, readOnly = [], confined, doors }) {
+    if (throughHost(flag, sandbox)) {
+      // Checked again here, so no path to run() skips the door (preview refuses first).
+      if (!doors?.host) throw new ToolError(NO_HOST_DOOR);
+      const result = await runCommand({ command, root, sandbox: false, network: true, timeoutMs: timeout * 1000, signal, env: hostEnv() });
+      return { output: formatOutput(result), summary: `${commandSummary(result, timeout)} · on your machine` };
+    }
     // A command that runs without asking sees .git read-only: git runs hooks and config from it outside any sandbox
     // (the user's next commit, their editor), so a planted hook would escape. Without a .git, it can't create one
     // either (an empty read-only placeholder sits there), or `git status` in that folder would run its config.
@@ -387,18 +439,14 @@ export const bash: Tool<typeof input> = {
       for (const path of guard.placeholders ?? []) await rmdir(path).catch(() => {});
     }
     if (confined && /\.git\b.*Read-only file system/.test(result.output)) result.output += `\n${GIT_HINT}\n`;
-    const lines = result.output.trimEnd() === "" ? 0 : result.output.trimEnd().split("\n").length;
-    const summary = result.timedOut
-      ? `timed out after ${timeout}s`
-      : result.aborted
-        ? "stopped"
-        : `exit ${result.exitCode}${lines ? ` · ${lines} line${lines === 1 ? "" : "s"} of output` : ""}`;
-    if (sandboxed && touchesHiddenHome(command, root, homedir())) result.output += `\n${HOME_NOTE}\n`;
+    const summary = commandSummary(result, timeout);
+    const lastResort = doors?.host ? ` ${HOST_LAST_RESORT}` : "";
+    if (sandboxed && touchesHiddenHome(command, root, homedir())) result.output += `\n${HOME_NOTE}${lastResort}\n`;
     if (sandboxed && backgroundsProcess(command)) result.output += `\n${BACKGROUND_NOTE}\n`;
     // Not for a command that isn't there (127) or can't run (126): the network has nothing to do with those.
     const failed = result.timedOut || (!result.aborted && result.exitCode !== 0 && result.exitCode !== 126 && result.exitCode !== 127);
     if (sandboxed && !network && failed && looksLikeNetworkFailure(command, result.output)) {
-      result.output += `\n${NETWORK_NOTE}\n`;
+      result.output += `\n${NETWORK_NOTE}${lastResort}\n`;
       // A gh failure usually isn't the network, and the missing network isn't the fix: the MCP server is (#27).
       // gh is a NETWORK_COMMAND, so the note above is already there for it; this adds what to do instead.
       if (/(?:^|[\s;&|(`])gh(?=$|[\s;&|)`])/.test(command)) result.output += `\n${GH_NOTE}\n`;
@@ -406,3 +454,13 @@ export const bash: Tool<typeof input> = {
     return { output: formatOutput(result), summary };
   },
 };
+
+/** A few words on how a command ended, for the transcript. */
+function commandSummary(result: CommandResult, timeout: number): string {
+  const lines = result.output.trimEnd() === "" ? 0 : result.output.trimEnd().split("\n").length;
+  return result.timedOut
+    ? `timed out after ${timeout}s`
+    : result.aborted
+      ? "stopped"
+      : `exit ${result.exitCode}${lines ? ` · ${lines} line${lines === 1 ? "" : "s"} of output` : ""}`;
+}

@@ -98,11 +98,16 @@ describe.if(sandboxAvailable())("guard: yolo never runs these without asking", (
     expect(ran()).toEqual(nothingRan);
   });
 
-  test("an extra sandbox: false argument from the model changes nothing (the sandbox isn't the model's to turn off)", async () => {
-    const result = await run({ what: "plain", name: "bash", args: { command: "touch net-ran", network: true, sandbox: false } }, {}, "no");
+  test("sandbox: false from the model is refused where the host door is closed, and asked every time where it's open (#52)", async () => {
+    const refused = await run({ what: "plain", name: "bash", args: { command: "touch net-ran", sandbox: false } }, {}, "yes");
+    expect(asked).toHaveLength(0);
+    expect(refused.isError).toBe(true);
+    expect(ran()).toEqual(nothingRan);
+    const result = await run({ what: "plain", name: "bash", args: { command: "touch net-ran", sandbox: false } }, { doors: { host: true } }, "no");
     expect(asked).toHaveLength(1);
-    expect(asked[0]!.preview.note).toContain("sandboxed");
+    expect(asked[0]).toMatchObject({ door: "host", once: true });
     expect(result.approval).toBe("no");
+    expect(ran()).toEqual(nothingRan);
   });
 
   test("control: a sandboxed command without network or git_write does run unasked (so the cases above test the guard, not a broken yolo)", async () => {

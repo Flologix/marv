@@ -56,6 +56,16 @@ describe("Approval", () => {
     expect(onDecide).toHaveBeenCalledWith("no");
   });
 
+  test("a door shows its warning line: one per door (#52)", () => {
+    const host = render(<Approval request={{ ...COMMAND, door: "host", once: true }} onDecide={() => {}} />).lastFrame()!;
+    expect(host).toContain("Runs OUTSIDE the sandbox, as you, with your files, network and credentials.");
+    expect(host).not.toContain("don't ask again");
+    expect(render(<Approval request={{ ...COMMAND, door: "github" }} onDecide={() => {}} />).lastFrame()).toContain("Visible to other people on GitHub");
+    expect(render(<Approval request={{ ...COMMAND, door: "process" }} onDecide={() => {}} />).lastFrame()).toContain("Keeps running after this turn, until stopped or Marv exits");
+    // An ordinary call has no door line.
+    expect(render(<Approval request={COMMAND} onDecide={() => {}} />).lastFrame()).not.toContain("OUTSIDE");
+  });
+
   test("says which subagent is asking, and how many more are waiting", () => {
     const frame = render(<Approval request={{ ...EDIT, agent: "implementer · Task 2" }} waiting={2} onDecide={() => {}} />).lastFrame()!;
     expect(frame).toContain("[implementer · Task 2]");

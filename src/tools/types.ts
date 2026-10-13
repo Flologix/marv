@@ -53,8 +53,31 @@ export interface ApprovalRequest {
   agent?: string;
   /** The action can reach the network (bash with network: true). */
   network?: boolean;
-  /** Yes or no only, no "don't ask again": each one is its own decision (/mcp add). */
+  /**
+   * Yes or no only, no "don't ask again": each one is its own decision (/mcp add, a door to the host). The session
+   * never answers one from its "don't ask again" scopes, nor adds one to them, whatever the client answers.
+   */
   once?: boolean;
+  /** The call leaves the sandbox through one of its doors: the prompt shows that door's warning line. */
+  door?: Door;
+}
+
+/**
+ * The narrow, named ways out of the sandbox, each with its own rule for what it can never do: `host` is bash with
+ * `sandbox: false` (one command on the user's machine, #52); `github` runs gh with the user's login (#47);
+ * `process` keeps a server running in its own sandbox (#51).
+ */
+export type Door = "github" | "process" | "host";
+
+/**
+ * The doors this agent may use where a door is gated by who's running, not by the approver (an approver can be
+ * told to say yes to an exact scope key: `marv -p --approve`). Set by the session for the main agent only; a
+ * subagent's context is built without it.
+ */
+export interface Doors {
+  /** bash with sandbox: false: only where the user approves each command at a terminal (the TUI, or the SDK's hostCommands). */
+  host?: boolean;
+  process?: boolean;
 }
 
 /** yes: run it. always: run it, and everything in its scope this session. no: don't. */
@@ -97,6 +120,8 @@ export interface ToolContext {
   beforeChange?: () => Promise<void>;
   /** Where the plan tool keeps its list (#15). Only the main agent has one, so subagents have no plan. */
   plan?: PlanHost;
+  /** The doors out of the sandbox this agent has (see Doors). Absent: none. */
+  doors?: Doors;
 }
 
 /** One item of the plan tool's checklist; at most one is in_progress at a time (the current item). */
@@ -135,6 +160,8 @@ export interface ToolResult {
    * it needed none.
    */
   approval?: "auto" | "interrupted" | Decision;
+  /** The door the call went through (for trajectories); absent for an ordinary call. */
+  door?: Door;
 }
 
 /**
@@ -155,11 +182,15 @@ export interface Tool<S extends z.ZodType = z.ZodType> {
   /** Overrides `kind` for one call: whether it needs the user's approval. */
   needsApproval?(input: z.infer<S>): boolean;
   /** Whether this call can reach the network (approvals inside a worktree still ask then). */
-  usesNetwork?(input: z.infer<S>): boolean;
+  usesNetwork?(input: z.infer<S>, ctx: ToolContext): boolean;
   /** What the approval prompt shows. Throw a ToolError here for a call that can't succeed, so the user isn't asked to approve it. */
   preview?(input: z.infer<S>, ctx: ToolContext): Promise<Preview>;
   /** What "don't ask again" covers. */
-  scope?(input: z.infer<S>): Scope;
+  scope?(input: z.infer<S>, ctx: ToolContext): Scope;
+  /** The door this call leaves the sandbox through, if any: copied onto its ApprovalRequest and its result. */
+  door?(input: z.infer<S>, ctx: ToolContext): Door | undefined;
+  /** Whether this call must be asked every time (ApprovalRequest.once): no "don't ask again", ever. */
+  once?(input: z.infer<S>, ctx: ToolContext): boolean;
   /**
    * Whether yolo mode may run this call without asking: what it can change is
    * confined to the project (never its .git, whose hooks and config git runs

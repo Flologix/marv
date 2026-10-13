@@ -43,7 +43,7 @@ import { AgentRecorder, type Trajectory, type TrajectoryRecord, type TrajectoryS
 import { isParallelCall, runTool, specOf, tools as builtinTools, toolSpecsFor } from "./tools/index.ts";
 import { withNote } from "./tools/repair.ts";
 import { pastedScopes } from "./tools/web-fetch.ts";
-import type { AgentHost, AgentProgress, ApprovalRequest, Decision, PlanHost, PlanItem, Tool } from "./tools/types.ts";
+import type { AgentHost, AgentProgress, ApprovalRequest, Decision, Doors, PlanHost, PlanItem, Tool } from "./tools/types.ts";
 import type { Message } from "./types.ts";
 import { addUsage, emptyTotals, type Totals } from "./usage.ts";
 
@@ -149,6 +149,12 @@ export interface SessionInit {
    */
   mcpTools?: McpToolsSetting;
   sandbox?: boolean;
+  /**
+   * Let bash run a command outside the sandbox (`sandbox: false`, #52), asked every time, never remembered. Only
+   * where someone approves each command (the TUI passes true); default false: there it's refused before any ask,
+   * whatever the approver would say. The main agent only: subagents never get it.
+   */
+  hostCommands?: boolean;
   yolo?: boolean;
   /**
    * Yolo isn't allowed here, and why (the SDK sets it when the project is the home folder or above it, where yolo's
@@ -307,6 +313,10 @@ export class MarvSession implements Session {
    * another paid request likely failing the same way). Reset when the turn ends; the next turn tries again.
    */
   private midTurnCompactFailed = false;
+  /** The main agent's doors out of the sandbox: fixed for the session, since the prompt names them (cache). */
+  private get doors(): Doors {
+    return { host: Boolean(this.init.hostCommands) };
+  }
   /** "Yes, don't ask again" scopes, shared by the main agent and its subagents. */
   private readonly always = new Set<string>();
   /** Stops what's running (a turn or a compaction); null when idle. */
@@ -650,6 +660,7 @@ export class MarvSession implements Session {
       // Whenever there's a manager, even an empty one: a server added mid-conversation (/mcp add) is then covered
       // without changing the system prompt (the prompt cache).
       mcp: Boolean(this.init.mcp),
+      doors: this.doors,
     });
     return custom ? `${base}\n\n${custom.append}` : base;
   }
@@ -721,10 +732,15 @@ export class MarvSession implements Session {
     const ask = this.init.approve;
     if (!ask) return undefined;
     return async (request) => {
-      if (this.always.has(request.scope.key)) return "yes";
+      // A `once` request (a door to the host, /mcp add) is its own decision every time: never answered from the
+      // "always" set, nor added to it, whatever the client answers (a client could offer "always" anyway).
+      if (!request.once && this.always.has(request.scope.key)) return "yes";
       if (signal.aborted) return "no";
       const decision = await Promise.race([ask(request), stopped(signal).then((): Decision => "no")]);
-      if (decision === "always") this.always.add(request.scope.key);
+      if (decision === "always") {
+        if (request.once) return "yes";
+        this.always.add(request.scope.key);
+      }
       return decision;
     };
   }
@@ -1097,7 +1113,7 @@ export class MarvSession implements Session {
         runTool: async (call) => {
           const result = await runTool(
             call,
-            { root: this.init.root, signal: stop.signal, approve, sandbox, yolo, skills: this.init.skills, memory: this.init.memory?.paths, agentHost, plan, beforeChange: checks?.beforeChange },
+            { root: this.init.root, signal: stop.signal, approve, sandbox, yolo, skills: this.init.skills, memory: this.init.memory?.paths, agentHost, plan, beforeChange: checks?.beforeChange, doors: this.doors },
             tools,
           );
           const note = rewritten.get(call.id);

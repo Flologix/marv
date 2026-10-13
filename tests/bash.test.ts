@@ -3,7 +3,9 @@ import { existsSync, mkdirSync, realpathSync, mkdtempSync, rmSync, symlinkSync }
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { backgroundsProcess, bash, formatOutput, looksLikeNetworkFailure, runCommand, touchesHiddenHome } from "../src/tools/bash.ts";
+import { backgroundsProcess, bash, formatOutput, looksLikeNetworkFailure, NO_HOST_DOOR, runCommand, touchesHiddenHome } from "../src/tools/bash.ts";
+import { runTool } from "../src/tools/index.ts";
+import type { ApprovalRequest } from "../src/tools/types.ts";
 import { hiddenPathFolders, sandboxArgs, sandboxAvailable } from "../src/sandbox.ts";
 
 describe("sandboxArgs", () => {
@@ -548,5 +550,84 @@ describe("formatOutput", () => {
 
   test("says when it timed out", () => {
     expect(formatOutput({ output: "partial", exitCode: null, timedOut: true, aborted: false, timeoutMs: 1000 })).toContain("[timed out after 1s]");
+  });
+});
+
+describe("bash with sandbox: false (the host door, #52)", () => {
+  let root: string;
+  let outside: string;
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), "marv-bash-host-"));
+    outside = await mkdtemp(join(tmpdir(), "marv-bash-host-outside-"));
+  });
+  afterEach(async () => {
+    await rm(root, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  });
+  const hostCall = (command: string, extra: Record<string, unknown> = {}) => ({ id: "h1", name: "bash", arguments: JSON.stringify({ command, sandbox: false, ...extra }) });
+
+  test("the flag is in the one bash spec, described as asking every time", () => {
+    expect(bash.input.shape.sandbox.description).toContain("false runs the command on the user's machine, outside the sandbox, with their permissions; always asks.");
+  });
+
+  test.if(sandboxAvailable())("asks with door host, once, scope bash:host:<command>, even in yolo; then runs on the host with the user's environment, minus Marv's keys", async () => {
+    const asked: ApprovalRequest[] = [];
+    const marker = join(outside, "ran");
+    const saved = { key: process.env.OPENROUTER_API_KEY, marv: process.env.MARV_MODEL };
+    process.env.OPENROUTER_API_KEY = "sk-secret";
+    process.env.MARV_MODEL = "m";
+    try {
+      const command = `touch ${marker}; echo "xdg=$XDG_RUNTIME_DIR key=$OPENROUTER_API_KEY model=$MARV_MODEL"`;
+      const result = await runTool(hostCall(command, { network: true, git_write: true }), {
+        root,
+        yolo: true,
+        doors: { host: true },
+        approve: async (r) => (asked.push(r), "yes"),
+      });
+      expect(asked).toHaveLength(1);
+      expect(asked[0]).toMatchObject({ door: "host", once: true, network: true, scope: { key: `bash:host:${command}` } });
+      expect(asked[0]!.preview).toMatchObject({ title: "Run a command on your machine", command });
+      expect(result).toMatchObject({ door: "host", approval: "yes" });
+      // The sandbox's /tmp is its own: the file shows up here only if the command ran on the host.
+      expect(existsSync(marker)).toBe(true);
+      expect(result.output).toContain(`xdg=${process.env.XDG_RUNTIME_DIR ?? ""} key= model=`);
+      expect(result.summary).toContain("on your machine");
+    } finally {
+      if (saved.key === undefined) delete process.env.OPENROUTER_API_KEY;
+      else process.env.OPENROUTER_API_KEY = saved.key;
+      if (saved.marv === undefined) delete process.env.MARV_MODEL;
+      else process.env.MARV_MODEL = saved.marv;
+    }
+  });
+
+  test.if(sandboxAvailable())("without the door, it's refused before anything is asked, and nothing runs", async () => {
+    const asked: ApprovalRequest[] = [];
+    const marker = join(outside, "ran");
+    const result = await runTool(hostCall(`touch ${marker}`), { root, yolo: true, approve: async (r) => (asked.push(r), "yes") });
+    expect(result).toMatchObject({ isError: true, output: NO_HOST_DOOR });
+    expect(asked).toEqual([]);
+    expect(existsSync(marker)).toBe(false);
+    // run() checks too, so no way around preview reaches the host.
+    await expect(bash.run({ command: `touch ${marker}`, sandbox: false }, { root })).rejects.toThrow(NO_HOST_DOOR);
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  test("with the sandbox already off, the flag changes nothing: an ordinary call, not refused", async () => {
+    const asked: ApprovalRequest[] = [];
+    const result = await runTool(hostCall("echo hi"), { root, sandbox: false, approve: async (r) => (asked.push(r), "yes") });
+    expect(result.output).toContain("hi");
+    expect(asked[0]!.door).toBeUndefined();
+    expect(asked[0]!.once).toBeUndefined();
+    expect(asked[0]!.preview.warning).toContain("the sandbox is off");
+    expect(asked[0]!.scope.key).toBe("bash:echo hi");
+    expect(asked[0]!.network).toBeUndefined();
+  });
+
+  test.if(sandboxAvailable())("the network and hidden-home notes suggest it as a last resort only where the door is open", async () => {
+    const failing = "echo \"curl: (6) Could not resolve host: example.com\"; exit 6";
+    const open = await bash.run({ command: failing }, { root, doors: { host: true } });
+    expect(open.output).toContain("bash with sandbox: false asks the user to run it on their machine");
+    const closed = await bash.run({ command: failing }, { root });
+    expect(closed.output).not.toContain("sandbox: false");
   });
 });

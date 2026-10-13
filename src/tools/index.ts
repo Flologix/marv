@@ -101,31 +101,36 @@ export async function runTool(call: ToolCall, ctx: ToolContext, available: Tool[
     const gated = tool.needsApproval ? tool.needsApproval(parsed.data) : Boolean(tool.kind && tool.kind !== "read");
     if (gated) {
       const preview = await tool.preview!(parsed.data, ctx);
-      const scope = tool.scope?.(parsed.data) ?? { key: call.name, description: call.name };
-      const network = tool.usesNetwork?.(parsed.data) ? { network: true } : {};
+      const scope = tool.scope?.(parsed.data, ctx) ?? { key: call.name, description: call.name };
+      const network = tool.usesNetwork?.(parsed.data, ctx) ? { network: true } : {};
+      // A door out of the sandbox (#47, #51, #52): the prompt shows its warning, the result and trajectory name it,
+      // and a `once` call is never remembered (the session's approver holds that, whatever the client answers).
+      const door = tool.door?.(parsed.data, ctx);
+      const doorFields = { ...(door ? { door } : {}), ...(tool.once?.(parsed.data, ctx) ? { once: true } : {}) };
+      const doorResult = door ? { door } : {};
       // Stopped while the preview was being made (a parallel subagent when the
       // user pressed Esc): don't raise a prompt for a run that's over. Summed up
       // as the interrupt it was; `declined` stops the loop like any other stop
       // (runAgent checks the abort first, so the model reads "Interrupted").
       if (ctx.signal?.aborted) {
-        return noted({ output: NOT_RUN.aborted, summary: "interrupted", declined: true, label, approval: "interrupted" });
+        return noted({ output: NOT_RUN.aborted, summary: "interrupted", declined: true, label, approval: "interrupted", ...doorResult });
       }
       // Yolo: a call the tool vouches for runs without asking, confined (bash
       // then can't touch .git). It still went through the preview above, so
       // a call that can't succeed fails the same way.
       if (ctx.yolo && tool.autoSafe?.(parsed.data, ctx)) {
-        return noted({ ...(await tool.run(parsed.data, { ...ctx, callId: call.id, confined: true })), label, approval: "auto" });
+        return noted({ ...(await tool.run(parsed.data, { ...ctx, callId: call.id, confined: true })), label, approval: "auto", ...doorResult });
       }
       // No one to ask (a program using the SDK without an approver): refused, as an error the model can read and
       // work around, rather than a "no" that would stop the run.
       const noOneToAsk = () => noted(fail(`${call.name} needs the user's approval, and there's no one to ask.`, label));
       if (!ctx.approve) return noOneToAsk();
-      const decision = await ctx.approve({ tool: call.name, label, preview, scope, ...network });
+      const decision = await ctx.approve({ tool: call.name, label, preview, scope, ...network, ...doorFields });
       if (decision === "unavailable") return noOneToAsk();
       // Esc at the prompt answers "no" and then aborts the run: that's an interrupt, and the model should read it
       // as one (like the calls queued behind it), not as "the user declined this, don't retry".
       if (decision === "no" && ctx.signal?.aborted) {
-        return noted({ output: NOT_RUN.aborted, summary: "interrupted", declined: true, label, approval: "interrupted" });
+        return noted({ output: NOT_RUN.aborted, summary: "interrupted", declined: true, label, approval: "interrupted", ...doorResult });
       }
       if (decision === "no") {
         return noted({
@@ -134,9 +139,10 @@ export async function runTool(call: ToolCall, ctx: ToolContext, available: Tool[
           declined: true,
           label,
           approval: "no",
+          ...doorResult,
         });
       }
-      return noted({ ...(await tool.run(parsed.data, { ...ctx, callId: call.id })), label, approval: decision });
+      return noted({ ...(await tool.run(parsed.data, { ...ctx, callId: call.id })), label, approval: decision, ...doorResult });
     }
     return noted({ ...(await tool.run(parsed.data, { ...ctx, callId: call.id })), label });
   } catch (err) {

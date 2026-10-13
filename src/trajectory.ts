@@ -21,7 +21,7 @@ import type { LoopEvent } from "./agent.ts";
 import type { ModeChoice } from "./mcp/deferred.ts";
 import { projectKey } from "./paths.ts";
 import type { ToolCall, Usage } from "./provider/types.ts";
-import type { Decision } from "./tools/types.ts";
+import type { Decision, Door } from "./tools/types.ts";
 
 export const FORMAT_VERSION = 1;
 
@@ -49,6 +49,8 @@ export type TrajectoryRecord =
       isError: boolean;
       declined: boolean;
       approval: "none" | "auto" | "interrupted" | Decision;
+      /** The door out of the sandbox the call went through (#47, #51, #52); absent for an ordinary call. */
+      door?: Door;
       ms: number;
     })
   | (Who & { type: "error"; message: string })
@@ -187,6 +189,7 @@ export class AgentRecorder {
           isError: Boolean(result.isError),
           declined: Boolean(result.declined),
           approval: result.approval ?? "none",
+          ...(result.door ? { door: result.door } : {}),
           ms: this.now() - started,
         });
         // The next request goes out once the last tool is done.
