@@ -18,10 +18,15 @@
 //! wired receptacle is a tool in `tools/list`; `tools/call` routes; `watch`
 //! wires get notifications. v2 also listens on
 //! `$XDG_RUNTIME_DIR/marv/mesh/<session>.sock` ([`crate::discovery`]).
+//!
+//! Shared, not locked by its users: the switchboard lives in an `Arc` and every method takes `&self`; `serve` and
+//! `route` take `Arc<Self>` because they outlive the call (the socket loop, a `call` waiting for its answer). Its
+//! tables sit behind one short synchronous lock, never held across an await, so serving never blocks wiring,
+//! `mesh_list` or the next message.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use marv_mcp::jsonrpc::{Request, Response};
 use serde::Serialize;
@@ -69,76 +74,84 @@ impl TrajectorySink for NoTrajectory {
 pub struct Switchboard {
     /// This Marv's session id: message ids and the v2 discovery socket name.
     pub session: String,
-    table: WireTable,
-    receptacles: HashMap<ReceptacleName, Receptacle>,
-    plugs: HashMap<PlugId, Plug>,
-    limiters: HashMap<(PlugId, ReceptacleName, WireMode), RateLimiter>,
+    board: Mutex<Board>,
     trajectory: Arc<dyn TrajectorySink>,
-    seq: u64,
     /// The private 0700 folder holding plug sockets.
     runtime_dir: PathBuf,
 }
 
+/// What changes: one short lock, never held across an await.
+#[derive(Default)]
+struct Board {
+    table: WireTable,
+    receptacles: HashMap<ReceptacleName, Receptacle>,
+    plugs: HashMap<PlugId, Plug>,
+    limiters: HashMap<(PlugId, ReceptacleName, WireMode), RateLimiter>,
+    seq: u64,
+}
+
 impl Switchboard {
     pub fn new(session: impl Into<String>, runtime_dir: PathBuf, trajectory: Arc<dyn TrajectorySink>) -> Self {
-        Self {
-            session: session.into(),
-            table: WireTable::new(),
-            receptacles: HashMap::new(),
-            plugs: HashMap::new(),
-            limiters: HashMap::new(),
-            trajectory,
-            seq: 0,
-            runtime_dir,
-        }
+        Self { session: session.into(), board: Mutex::default(), trajectory, runtime_dir }
     }
 
-    pub fn table(&self) -> &WireTable {
-        &self.table
+    fn board(&self) -> MutexGuard<'_, Board> {
+        self.board.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A snapshot of the wiring table.
+    pub fn table(&self) -> WireTable {
+        self.board().table.clone()
     }
 
     /// Offers a receptacle (an agent's inbox, a Herdr pane, a remote service).
-    pub fn offer(&mut self, receptacle: Receptacle) {
-        self.receptacles.insert(receptacle.name.clone(), receptacle);
+    pub fn offer(&self, receptacle: Receptacle) {
+        self.board().receptacles.insert(receptacle.name.clone(), receptacle);
     }
 
-    pub fn receptacle(&self, name: &ReceptacleName) -> Option<&Receptacle> {
-        self.receptacles.get(name)
+    pub fn receptacle(&self, name: &ReceptacleName) -> Option<Receptacle> {
+        self.board().receptacles.get(name).cloned()
     }
 
     /// A plug for a new agent and its inbox; its socket lives in the runtime folder.
     /// The agent starts with no wires.
-    pub fn plug(&mut self, id: PlugId) -> Plug {
+    pub fn plug(&self, id: PlugId) -> Plug {
         let plug = Plug { host_socket: self.runtime_dir.join(format!("{}.sock", id.as_str())), id: id.clone() };
-        self.offer(Receptacle::inbox(id.clone()));
-        self.plugs.insert(id, plug.clone());
+        let mut board = self.board();
+        let inbox = Receptacle::inbox(id.clone());
+        board.receptacles.insert(inbox.name.clone(), inbox);
+        board.plugs.insert(id, plug.clone());
         plug
     }
 
     /// Adds a wire the user approved (see [`crate::approval`]).
-    pub fn wire(&mut self, wire: Wire) -> crate::Result<()> {
-        let owner = self.receptacles.get(&wire.to).and_then(|r| r.owner.clone());
-        self.table.add(wire, owner.as_ref())
+    pub fn wire(&self, wire: Wire) -> crate::Result<()> {
+        let mut board = self.board();
+        let owner = board.receptacles.get(&wire.to).and_then(|r| r.owner.clone());
+        board.table.add(wire, owner.as_ref())
     }
 
-    pub fn unwire(&mut self, from: &PlugId, to: &ReceptacleName, mode: WireMode) -> bool {
-        self.limiters.remove(&(from.clone(), to.clone(), mode));
-        self.table.remove(from, to, mode)
+    pub fn unwire(&self, from: &PlugId, to: &ReceptacleName, mode: WireMode) -> bool {
+        let mut board = self.board();
+        board.limiters.remove(&(from.clone(), to.clone(), mode));
+        board.table.remove(from, to, mode)
     }
 
     /// An agent ended: its plug, inbox and wires go.
-    pub fn unplug(&mut self, id: &PlugId) {
-        self.table.unplug(id);
-        self.plugs.remove(id);
-        self.receptacles.remove(&ReceptacleName::inbox(id));
-        self.limiters.retain(|(from, to, _), _| from != id && to.inbox_owner() != Some(id.as_str()));
+    pub fn unplug(&self, id: &PlugId) {
+        let mut board = self.board();
+        board.table.unplug(id);
+        board.plugs.remove(id);
+        board.receptacles.remove(&ReceptacleName::inbox(id));
+        board.limiters.retain(|(from, to, _), _| from != id && to.inbox_owner() != Some(id.as_str()));
     }
 
     /// What `mesh_list` shows a plug: only what it's wired to.
     pub fn reachable(&self, from: &PlugId) -> Vec<Reachable> {
+        let board = self.board();
         let mut out: Vec<Reachable> = Vec::new();
-        for w in self.table.from_plug(from) {
-            let Some(r) = self.receptacles.get(&w.to) else { continue };
+        for w in board.table.from_plug(from) {
+            let Some(r) = board.receptacles.get(&w.to) else { continue };
             match out.iter_mut().find(|x| x.receptacle == w.to) {
                 Some(x) => x.modes.push(w.mode),
                 None => out.push(Reachable { receptacle: w.to.clone(), modes: vec![w.mode], description: r.description.clone() }),
@@ -149,17 +162,22 @@ impl Switchboard {
 
     /// The policy check every message goes through (module docs), logged either way.
     pub fn admit(
-        &mut self,
+        &self,
         from: &PlugId,
         receptacle: &ReceptacleName,
         mode: WireMode,
         body: Value,
         now_ms: u64,
     ) -> crate::Result<Envelope> {
-        self.seq += 1;
-        let envelope =
-            Envelope::new(format!("{}:{}", self.session, self.seq), from.clone(), receptacle.clone(), mode, body, now_ms);
-        let result = self.check(&envelope);
+        let (envelope, result) = {
+            let mut board = self.board();
+            board.seq += 1;
+            let id = format!("{}:{}", self.session, board.seq);
+            let envelope = Envelope::new(id, from.clone(), receptacle.clone(), mode, body, now_ms);
+            let result = board.check(&envelope);
+            (envelope, result)
+        };
+        // Logged outside the lock: the sink is the session's trajectory writer.
         self.trajectory.mesh(MeshRecord {
             at_ms: now_ms,
             id: result.is_ok().then(|| envelope.id.clone()),
@@ -175,6 +193,31 @@ impl Switchboard {
         result.map(|()| envelope)
     }
 
+    /// Delivers an admitted message: into an inbox, to a peer switchboard, a
+    /// Herdr pane or the AgentMesh bridge. `call` waits for the response.
+    pub async fn route(self: Arc<Self>, _envelope: Envelope) -> crate::Result<Option<Value>> {
+        todo!("port: mesh v1: route by ReceptacleKind (Inbox queue with DEFAULT_INBOX_DEPTH; Peer/HerdrPane v2; Remote v3)")
+    }
+
+    /// One MCP request from `from`'s socket: `initialize`, `tools/list`
+    /// (= [`Self::reachable`]), `tools/call` (= admit + route).
+    pub async fn handle(&self, _from: &PlugId, _request: Request) -> Response {
+        todo!("port: mesh v1: MCP server dispatch on the plug socket")
+    }
+
+    /// Listens on every plug's socket (0600, in the 0700 runtime folder) until cancelled. Each connection's task holds
+    /// its own clone of the `Arc`.
+    pub async fn serve(self: Arc<Self>, _cancel: tokio_util::sync::CancellationToken) -> crate::Result<()> {
+        todo!("port: mesh v1: tokio UnixListener per plug, newline-delimited JSON-RPC, identity = which socket")
+    }
+
+    /// The inbox's unread messages for an agent's next turn (oldest first).
+    pub fn drain_inbox(&self, _agent: &PlugId) -> Vec<Envelope> {
+        todo!("port: mesh v1: inbox queue")
+    }
+}
+
+impl Board {
     fn check(&mut self, e: &Envelope) -> crate::Result<()> {
         let r = self.receptacles.get(&e.receptacle).ok_or_else(|| MeshError::NoReceptacle(e.receptacle.to_string()))?;
         let not_wired = || MeshError::NotWired { from: e.sender.to_string(), receptacle: e.receptacle.to_string(), mode: e.mode };
@@ -188,28 +231,6 @@ impl Switchboard {
             .entry((e.sender.clone(), e.receptacle.clone(), e.mode))
             .or_insert_with(|| RateLimiter::new(limits, e.at_ms))
             .take(e.receptacle.as_str(), e.at_ms)
-    }
-
-    /// Delivers an admitted message: into an inbox, to a peer switchboard, a
-    /// Herdr pane or the AgentMesh bridge. `call` waits for the response.
-    pub async fn route(&mut self, _envelope: Envelope) -> crate::Result<Option<Value>> {
-        todo!("port: mesh v1: route by ReceptacleKind (Inbox queue with DEFAULT_INBOX_DEPTH; Peer/HerdrPane v2; Remote v3)")
-    }
-
-    /// One MCP request from `from`'s socket: `initialize`, `tools/list`
-    /// (= [`Self::reachable`]), `tools/call` (= admit + route).
-    pub async fn handle(&mut self, _from: &PlugId, _request: Request) -> Response {
-        todo!("port: mesh v1: MCP server dispatch on the plug socket")
-    }
-
-    /// Listens on every plug's socket (0600, in the 0700 runtime folder) until cancelled.
-    pub async fn serve(&mut self, _cancel: tokio_util::sync::CancellationToken) -> crate::Result<()> {
-        todo!("port: mesh v1: tokio UnixListener per plug, newline-delimited JSON-RPC, identity = which socket")
-    }
-
-    /// The inbox's unread messages for an agent's next turn (oldest first).
-    pub fn drain_inbox(&mut self, _agent: &PlugId) -> Vec<Envelope> {
-        todo!("port: mesh v1: inbox queue")
     }
 }
 
@@ -234,15 +255,31 @@ mod tests {
 
     fn board() -> (Switchboard, Arc<Log>) {
         let log = Arc::new(Log::default());
-        let mut sb = Switchboard::new("s1", "/tmp/marv-mesh-test".into(), log.clone());
+        let sb = Switchboard::new("s1", "/tmp/marv-mesh-test".into(), log.clone());
         sb.plug(id("parent"));
         sb.plug(id("worker-1"));
         (sb, log)
     }
 
     #[test]
+    fn shared_without_a_lock_around_it() {
+        fn shared<T: Send + Sync>(_: &T) {}
+        let (sb, _) = board();
+        let sb = Arc::new(sb);
+        shared(&sb);
+        let inbox = ReceptacleName::inbox(&id("parent"));
+        let other = sb.clone();
+        std::thread::spawn(move || {
+            other.wire(Wire::new(id("worker-1"), inbox, WireMode::Send, Grant::local(Approver::Tui))).unwrap();
+        })
+        .join()
+        .unwrap();
+        assert_eq!(sb.reachable(&id("worker-1")).len(), 1);
+    }
+
+    #[test]
     fn unwired_messages_are_refused_and_logged() {
-        let (mut sb, log) = board();
+        let (sb, log) = board();
         let inbox = ReceptacleName::inbox(&id("parent"));
         let err = sb.admit(&id("worker-1"), &inbox, WireMode::Send, Value::from("hi"), 0).unwrap_err();
         assert!(matches!(err, MeshError::NotWired { .. }));
@@ -255,7 +292,7 @@ mod tests {
 
     #[test]
     fn a_wired_message_is_admitted_as_mesh_text() {
-        let (mut sb, log) = board();
+        let (sb, log) = board();
         let inbox = ReceptacleName::inbox(&id("parent"));
         sb.wire(Wire::new(id("worker-1"), inbox.clone(), WireMode::Send, Grant::local(Approver::Tui))).unwrap();
         let e = sb.admit(&id("worker-1"), &inbox, WireMode::Send, Value::from("done"), 5).unwrap();
@@ -270,7 +307,7 @@ mod tests {
 
     #[test]
     fn agents_cant_wire_their_own_inbox() {
-        let (mut sb, _) = board();
+        let (sb, _) = board();
         let own = ReceptacleName::inbox(&id("worker-1"));
         assert!(matches!(
             sb.wire(Wire::new(id("worker-1"), own, WireMode::Send, Grant::local(Approver::Cli))),
@@ -280,7 +317,7 @@ mod tests {
 
     #[test]
     fn per_wire_limits_apply() {
-        let (mut sb, _) = board();
+        let (sb, _) = board();
         let inbox = ReceptacleName::inbox(&id("parent"));
         let mut w = Wire::new(id("worker-1"), inbox.clone(), WireMode::Send, Grant::local(Approver::Tui));
         w.limits = WireLimits { max_message_bytes: 8, per_minute: 1, burst: 1 };
@@ -298,7 +335,7 @@ mod tests {
 
     #[test]
     fn unplugging_removes_wires_both_ways() {
-        let (mut sb, _) = board();
+        let (sb, _) = board();
         let to_parent = ReceptacleName::inbox(&id("parent"));
         let to_worker = ReceptacleName::inbox(&id("worker-1"));
         sb.wire(Wire::new(id("worker-1"), to_parent, WireMode::Send, Grant::local(Approver::Tui))).unwrap();
