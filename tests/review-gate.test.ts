@@ -330,3 +330,23 @@ test("a comment_refiled warning (ocr moved a comment to the right file) doesn't 
   expect(result.stderr.toString()).toContain("passed");
   expect(result.exitCode).toBe(0);
 });
+
+test("a retry that fails outright says so, and blocks", () => {
+  writeFileSync(join(dir, "retry_ctrl"), "1\n");
+  writeFileSync(
+    join(bin, "ocr"),
+    "#!/bin/sh\n" +
+      'if [ "$1" = "--version" ]; then printf \'open-code-review v1.0.0 (abc)\\n\'; exit 0; fi\n' +
+      'if [ -f "' + join(dir, "retry_ctrl") + '" ]; then\n' +
+      '  rm -f "' + join(dir, "retry_ctrl") + '"\n' +
+      "  echo '{\"status\":\"complete\",\"comments\":[],\"warnings\":[{\"type\":\"review_round_failed\",\"message\":\"model timeout\"}]}'\n" +
+      "  exit 0\n" +
+      "fi\n" +
+      "echo 'provider down' >&2; exit 1\n",
+  );
+  chmodSync(join(bin, "ocr"), 0o755);
+  const result = gate();
+  expect(result.exitCode).not.toBe(0);
+  expect(result.stderr.toString()).toContain("provider down");
+  expect(result.stderr.toString()).toContain("failed too");
+});

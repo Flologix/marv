@@ -138,6 +138,13 @@ describe("the github tool", () => {
     expect((await fakeGhCalls(log)).at(-1)!.env.GH_HOST).toBe("github.com");
   });
 
+  test("a project whose origin names no host: gh gets github.com, never the user's own GH_HOST", async () => {
+    process.env.GH_HOST = "ghe.example.com";
+    Bun.spawnSync(["git", "remote", "set-url", "origin", "/srv/repos/local.git"], { cwd: root });
+    await runTool(call(["pr", "view", "1", "-R", "someone/else"]), { root, doors: { github: true } });
+    expect((await fakeGhCalls(log)).at(-1)!.env.GH_HOST).toBe("github.com");
+  });
+
   test("tokens in gh's output and errors are redacted, and the result says how many", async () => {
     process.env.FAKE_GH_OUTPUT = `body: ghp_${"A".repeat(36)}`;
     process.env.FAKE_GH_STDERR = `warning: github_pat_${"b".repeat(30)}`;

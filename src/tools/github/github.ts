@@ -123,9 +123,8 @@ async function runGh(args: string[], root: string, signal: AbortSignal | undefin
   // gh resolves a bare OWNER/REPO (and a folder without a GitHub remote) against GH_HOST: pinned to the project's
   // host, the one allow.ts checks every named host against, so the user's own GH_HOST can't point it elsewhere.
   const env = ghEnv();
-  const host = projectHost(root);
-  if (host) env.GH_HOST = host;
-  else delete env.GH_HOST;
+  // A project whose origin names no host gets github.com, never the user's own default.
+  env.GH_HOST = projectHost(root) ?? "github.com";
   const gh = Bun.which("gh", { PATH: env.PATH ?? "" });
   if (!gh) throw new ToolError("gh isn't on PATH anymore: install it again, or use the GitHub MCP server.");
   const proc = Bun.spawn([gh, ...args], { cwd: root, env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });

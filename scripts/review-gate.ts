@@ -265,6 +265,7 @@ for (const sha of new Set(commits)) {
         continue;
       }
       // The retry also had warnings or failed: block, saying what it said.
+      if (retry.failed) console.error(`review-gate: the retry of ${sha.slice(0, 8)} failed too (see above), so it isn't passed; push again.`);
       if (!retry.failed) {
         console.error(`review-gate: ${retry.warnings.length} file(s) couldn't be reviewed on retry, so ${sha.slice(0, 8)} isn't passed; see \`ocr session list\`, then push again.`);
         for (const w of retry.warnings) console.error(`  ${JSON.stringify(w).slice(0, 300)}`);
