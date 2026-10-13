@@ -39,3 +39,9 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 todo = "allow"
+
+# Release binaries (#19): one static binary per target, built once per tag, so the slow settings are worth it.
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

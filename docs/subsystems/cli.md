@@ -13,6 +13,7 @@ Spec: the startup bullet of Marv's `CLAUDE.md` ("`bin/marv` is the `bin` entryâ€
 | `src/cli.tsx` (TUI startup), `src/app.tsx` (engine side), Herdr reporting | `tui.rs` | **Ported and tested (#14):** the startup sequence, the bridge (`Bridge`/`Port`: `SessionPort` over `MarvSession`), `map_event`/`map_loop`, the command actions, setup, resume, the startup notice, `TuiApprover`, Herdr states. Tests: `herdr.test.tsx`'s App-in-a-pane case, approvals (yes/no/Esc), resume, commands, `/compact` and `/clear`, first-run setup, the mappings. See "The TUI bridge" below |
 | `src/headless.ts` | `headless.rs` | **Ported and tested:** `build_approver` (`ScopeApprover`, `mesh:` grants), `exit_code_for`, `HeadlessResult`, `Collector` (step counting, refused calls including subagents', stream-json lines), `text_output` (printable), `collect_and_output`, `run_headless` |
 | `bin/marv` | (none) | Not needed. It only renamed the `bun` process to `marv`, and a native binary is already called `marv` |
+| `scripts/release.ts` | `.github/workflows/release.yml`, `packaging/package.sh`, `install.sh` | **Done and tested (#19):** static musl binaries on a `v*` tag, SHA-256 sums, the installer and the `marv` â†’ `marv-ts` switch. See "Release and install" below |
 | (new) | `mesh_cmd.rs` | `ls` checks `XDG_RUNTIME_DIR`, and `wire` parses the spec (`parse_wire_spec`). Both bodies are todo (mesh v2 and v1) |
 
 `grep -rn 'todo!("port' crates/marv-cli` lists what's left.
@@ -33,6 +34,19 @@ Spec: the startup bullet of Marv's `CLAUDE.md` ("`bin/marv` is the `bin` entryâ€
 - **`--approve mesh:<receptacle>`** is split off by `marv_session::mesh::headless_grants`. It pre-approves wires to that receptacle and nothing else. The other names keep Marv's `APPROVE_PREFIXES`. Wiring the grants into the switchboard is todo (mesh v1).
 - **`__run-checks <spec>`** (#13) calls `marv_session::checks::runner::main` before the runtime starts: the project checks' runner, which the session runs inside the sandbox with this binary mounted read-only. Tested in the real sandbox by `tests/run_checks.rs`.
 - **`__html-convert`** calls `marv_tools::web::html_convert_cli::main()`, which is still todo in marv-tools.
+
+## Release and install (#19)
+
+Marv's `scripts/release.ts` built an npm package: it bundled the CLI with its patched dependencies and wrote a bash launcher. None of that applies to one native binary, so nothing of it is ported line by line. What carries over is its check that the result stands alone. Here that's the workflow's "Check it's static" step (`file` must say statically linked).
+
+- **`.github/workflows/release.yml`** runs on a `v*` tag; `workflow_dispatch` is a dry run without the release. It builds `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` with `cargo zigbuild` from one x86_64 runner, because zig's cc cross-compiles ring's C with no sysroot or Docker. It smoke-tests the x86_64 binary (`--version` and the installer tests against it), then attaches `marv-<target>.tar.gz`, the `.sha256` files, `SHA256SUMS` and `install.sh` to the release. macOS is a commented job.
+- **Asset names have no version**, so `releases/latest/download/<asset>` always names the newest build.
+- **`packaging/package.sh <target> <binary> <out>`** packs `marv`, `LICENSE` and `README.md`. It is reproducible: same binary, same bytes.
+- **`install.sh`** (POSIX sh) downloads and checks the asset against `SHA256SUMS` before touching anything. It installs to `$PREFIX/bin/marv` (default `~/.local`) by a staged copy and an atomic rename. Options: `--prefix`, `--version`, `--from <local build>`, `--uninstall`. `MARV_RELEASE_URL` and `MARV_TARGET` exist for tests and mirrors.
+- **The command switch.** A `marv` that isn't marv-rs is moved to `marv-ts`, and the installer says so. A symlink (npm's bin) is moved as a link. If `marv-ts` also exists, the installer refuses and changes nothing. `--uninstall` removes marv-rs only and moves `marv-ts` back. Both directions are idempotent.
+- **"Is marv-rs" is decided without running the file:** native executable magic (ELF or Mach-O) plus the bytes `marv-session`. Panic locations keep the crate source paths even in a stripped release build.
+- **Release profile** (root `Cargo.toml`): `lto = true`, `codegen-units = 1`, `strip = true`. The x86_64 musl binary is about 12 MB.
+- **Tests:** `packaging/test-install.sh` runs in the release workflow. It works in temp dirs with a fake release over `file://`, a fake TS launcher, and a fake marv-rs binary (or a real one via `MARV_TEST_BINARY`). It covers fresh installs, the switch and re-running it, symlinks, `--version`, a bad or missing checksum, the conflict, `--from` refusals, uninstalling (twice), and arguments. It isn't in `ci.yml` yet; that file isn't #19's.
 
 ## The TUI bridge (`tui.rs`)
 
