@@ -13,7 +13,7 @@ use marv_mcp::deferred::McpMode;
 use serde::{Deserialize, Serialize};
 
 use crate::paths::{legacy_project_key, project_key};
-use crate::private_file::{random_hex, write_private};
+use marv_fs::{random_hex, write_private};
 use crate::types::{Message, Role};
 use crate::usage::Totals;
 

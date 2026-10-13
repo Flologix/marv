@@ -1186,12 +1186,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "marv-fs"
+version = "0.0.1"
+dependencies = [
+ "futures",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
 name = "marv-mcp"
 version = "0.0.1"
 dependencies = [
  "async-trait",
  "futures",
  "marv-core",
+ "marv-fs",
  "marv-sandbox",
  "serde",
  "serde_json",
@@ -1257,6 +1268,7 @@ dependencies = [
  "futures",
  "marv-agent",
  "marv-core",
+ "marv-fs",
  "marv-mcp",
  "marv-mesh",
  "marv-provider",

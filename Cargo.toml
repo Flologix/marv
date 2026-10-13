@@ -13,6 +13,7 @@ rust-version = "1.99"
 [workspace.dependencies]
 # Internal crates
 marv-core = { path = "crates/marv-core" }
+marv-fs = { path = "crates/marv-fs" }
 marv-provider = { path = "crates/marv-provider" }
 marv-agent = { path = "crates/marv-agent" }
 marv-tools = { path = "crates/marv-tools" }

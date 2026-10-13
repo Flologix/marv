@@ -542,7 +542,7 @@ mod tests {
 
     #[test]
     fn store_round_trips_privately() {
-        let dir = std::env::temp_dir().join(format!("marv-config-{}-{}", std::process::id(), crate::private_file::random_hex()));
+        let dir = std::env::temp_dir().join(format!("marv-config-{}-{}", std::process::id(), marv_fs::random_hex()));
         let store = ConfigStore::new(&dir.join("nested"));
         assert!(store.load().unwrap().is_none());
         let f = FileConfig { model: Some("openai/gpt-5.6-sol".into()), max_steps: Some(MaxStepsSetting::Off), ..file() };

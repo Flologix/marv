@@ -544,7 +544,7 @@ mod tests {
 
     #[tokio::test]
     async fn writes_stamped_lines_privately() {
-        let dir = std::env::temp_dir().join(format!("marv-traj-{}-{}", std::process::id(), crate::private_file::random_hex()));
+        let dir = std::env::temp_dir().join(format!("marv-traj-{}-{}", std::process::id(), marv_fs::random_hex()));
         let log = TrajectoryStore::new(&dir).open(Path::new("/p"), "s1");
         std::fs::create_dir_all(log.path.parent().unwrap()).unwrap();
         std::fs::write(&log.path, "{\"half").unwrap(); // a crash's leftovers
