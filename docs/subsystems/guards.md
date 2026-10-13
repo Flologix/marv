@@ -27,7 +27,7 @@ Each guard's doc comment says how it was proven: the guard was reverted, and the
 | Web/MCP/mesh/image content taints | `provenance.rs::outside_content_taints_the_session` | Proven |
 | Tainted: network bash asks | `provenance.rs::tainted_network_bash_must_ask` | Proven |
 | Tainted: every MCP call asks, `readOnlyHint` too | `provenance.rs::tainted_mcp_calls_ask_even_read_only_ones` | Proven (two locks: both reverted) |
-| Tainted: web requests to a new prefix | `provenance.rs::tainted_web_fetch_to_a_new_prefix_asks` | Ignored: needs #5 |
+| Tainted: web requests to a new prefix; "always" covers a prefix, not the site | `provenance.rs::tainted_web_fetch_to_a_new_prefix_asks` | Proven (#5; three reverts) |
 | Tainted: mesh calls on unapproved wires | `provenance.rs::mesh_egress_is_default_deny_and_asks_once_tainted` | Proven |
 | Tainted: writes to protected paths | `sandbox.rs::protected_paths_ask_even_in_yolo` (`must_ask`) | Proven |
 | `must_ask` never answered by "always" | `provenance.rs::always_never_answers_must_ask` | Proven |
@@ -39,6 +39,10 @@ Each guard's doc comment says how it was proven: the guard was reverted, and the
 | Project MCP servers need trust; hash covers entry and files | `mcp.rs::project_servers_need_trust_covering_entry_and_files` | Proven |
 | `npx`/`uvx` outside the project | `mcp.rs::package_runners_start_outside_the_project` | Proven |
 | Server `instructions` ignored | `mcp.rs::server_instructions_never_leave_the_parser` | Proven (a source check until the manager connects, M7) |
+| Hidden web text: hiding classes | `web.rs::text_hidden_by_a_class_is_dropped` | Proven (#5) |
+| Hidden web text: off-screen and zero-size styles | `web.rs::text_hidden_off_screen_or_in_a_zero_size_box_is_dropped` | Proven (#5) |
+| Hidden web text: zero-width and tag characters | `web.rs::invisible_characters_never_reach_the_model` | Proven (#5) |
+| Hidden web text: HTML comments in raw Markdown | `web.rs::html_comments_in_raw_markdown_are_dropped` | Proven (#5) |
 | Images: any image taints | `images.rs::an_image_taints` | Proven |
 | Images: sources, quarantined reader, sandboxed decoding | `images.rs::*` | Ignored: needs vision |
 
@@ -46,4 +50,5 @@ Each guard's doc comment says how it was proven: the guard was reverted, and the
 
 - **Found by the suite:** dangling symlinks. `innocent.sh -> .envrc`, where `.envrc` didn't exist yet, wasn't seen as protected, and `write_file` through `out.sh -> /elsewhere/x` wrote outside the project. Both are fixed in `paths::real_with_missing` (sandbox.md). Nested `.git` folders read-only for confined commands are proven by marv-tools' `an_approved_git_write_keeps_its_new_repository_and_confined_commands_see_nested_git_read_only`.
 - **Fake homes live in `/var/tmp`** (`TempDir::outside_tmp`): the sandbox replaces `/tmp` with its own, so a fake home there would look hidden even without the home tmpfs.
+- **The web guards use a local server** (`marv_guards::serve`) and a `WebFetch` that lets private addresses through: the guards never fetch the internet.
 - **The lock-file guard** reads `Cargo.lock` at run time. To prove it, the test binary was built first, because cargo prunes an unused lock entry before it runs a test.

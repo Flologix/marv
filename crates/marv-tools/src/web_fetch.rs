@@ -15,7 +15,10 @@
 //! - A redirect to another site isn't followed: the model gets the target and calls again, which asks, so an open
 //!   redirect on an approved site can't carry the query string elsewhere.
 //! - marv-rs: `kind` Egress and `provenance` Web: the result taints the session, and after taint every new URL
-//!   prefix asks even if the site was approved with "always" (docs/SECURITY.md).
+//!   prefix asks even if the site was approved with "always" (docs/SECURITY.md). "Always" on a tainted call approves
+//!   its [`url_prefix`] (the S6 item: a prefix, not the whole domain); `run_tool` checks it through `egress_url`.
+//! - marv-rs: what web_fetch returns has its invisible characters stripped ([`crate::web::hidden::strip_invisible`]:
+//!   zero-width and tag characters can spell instructions no reviewer sees).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -26,7 +29,11 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::types::{Preview, Scope, Tool, ToolContext, ToolError, ToolOutput};
-use crate::web::fetch::{Page, parse_url};
+use crate::web::address::{CheckOptions, check_address};
+use crate::web::convert::{ConvertOptions, Converter};
+use crate::web::fetch::{GetOptions, Page, fetch_page, parse_url};
+use crate::web::github::{GithubOptions, fetch_github, parse_github};
+use crate::web::hidden::strip_invisible;
 
 pub const PAGE_CHARS: usize = 30_000;
 pub const CACHE_PAGES: usize = 8;
@@ -48,6 +55,31 @@ pub fn domain_of(url: &str) -> String {
 
 pub fn web_scope(url: &str) -> String {
     format!("web:{}", domain_of(url))
+}
+
+/// The URL as a tainted session's approvals see it: no query or fragment, the path ending in `/` (so
+/// `https://docs.rs/regex` is under the prefix `https://docs.rs/regex/` and `https://docs.rs/regexp` isn't).
+pub fn egress_key(url: &str) -> Option<String> {
+    let parsed = parse_url(url).ok()?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return None;
+    }
+    let path = parsed.path();
+    let slash = if path.ends_with('/') { "" } else { "/" };
+    Some(format!("{}{path}{slash}", parsed.origin().ascii_serialization()))
+}
+
+/// The prefix "always" covers once the session is tainted: the origin and the first path segment
+/// (`https://docs.rs/regex/` for `https://docs.rs/regex/latest/regex/`), not the whole domain (marv-rs S6). A link to
+/// the site's root covers that origin.
+pub fn url_prefix(url: &str) -> Option<String> {
+    let key = egress_key(url)?;
+    let parsed = url::Url::parse(&key).ok()?;
+    let origin = parsed.origin().ascii_serialization();
+    match parsed.path_segments().and_then(|mut s| s.next()).filter(|s| !s.is_empty()) {
+        Some(first) => Some(format!("{origin}/{first}/")),
+        None => Some(format!("{origin}/")),
+    }
 }
 
 /// The scopes of the links in what the user typed (outside fenced blocks and inline code: a pasted script's hosts
@@ -176,8 +208,11 @@ pub struct WebOptions {
     pub allow_http: bool,
     pub api_base: Option<String>,
     pub raw_base: Option<String>,
-    /// Default: GITHUB_TOKEN, else GH_TOKEN, from the real environment. Sent to GitHub's API host only.
+    /// Default: GITHUB_TOKEN, else GH_TOKEN, from the real environment. Sent to GitHub's API host only. `Some("")`:
+    /// none.
     pub token: Option<String>,
+    /// Tests only: the page converter (default: this binary's `__html-convert`).
+    pub converter: Option<Converter>,
 }
 
 struct Cached {
@@ -226,6 +261,40 @@ pub struct WebFetch {
     pub cache: PageCache,
     /// What `needs_approval` found for a call (by URL), for `run` (Marv: a WeakMap on the parsed input).
     approved_reads: Mutex<HashMap<String, Page>>,
+}
+
+impl WebFetch {
+    /// The tool with its network settings (tests point it at a local server).
+    pub fn new(options: WebOptions) -> Self {
+        Self { options, ..Self::default() }
+    }
+
+    fn get_options(&self, first: &url::Url) -> GetOptions {
+        // A redirect to another site isn't followed: the URL (and its query) could carry data to a site the user
+        // never approved. The model gets the target and calls again, which asks if that site is new.
+        let site = domain_of(first.as_str());
+        GetOptions {
+            allow_private: self.options.allow_private,
+            allow_http: self.options.allow_http,
+            follow_redirect: Some(std::sync::Arc::new(move |_from: &url::Url, to: &url::Url| domain_of(to.as_str()) == site)),
+            convert: ConvertOptions { converter: self.options.converter.clone(), ..ConvertOptions::default() },
+            ..GetOptions::default()
+        }
+    }
+
+    fn token(&self) -> Option<String> {
+        self.options
+            .token
+            .clone()
+            .or_else(|| ["GITHUB_TOKEN", "GH_TOKEN"].iter().find_map(|k| std::env::var(k).ok().filter(|t| !t.is_empty())))
+    }
+}
+
+/// The page as the model reads it, tagged as web content (it taints the session).
+fn web_result(page: &Page, offset: usize) -> Result<ToolOutput, ToolError> {
+    let mut result = paged(page, offset, PAGE_CHARS)?;
+    result.provenance = marv_core::Provenance::Web;
+    Ok(result)
 }
 
 #[async_trait]
@@ -279,16 +348,67 @@ impl Tool for WebFetch {
         Some(Scope { key: web_scope(&input.url), description: format!("fetching from {}", domain_of(&input.url)) })
     }
 
-    async fn preview(&self, _input: &WebFetchInput, _ctx: &ToolContext) -> Result<Preview, ToolError> {
-        todo!(
-            "port: parse_url, check_address (a private address fails here, so nobody is asked), Preview 'Fetch a web page' / href / 'GET · fetched by Marv, not in the sandbox'"
-        )
+    fn egress_url(&self, input: &WebFetchInput) -> Option<String> {
+        egress_key(&input.url)
     }
 
-    async fn run(&self, _input: &WebFetchInput, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
-        todo!(
-            "port: approved/cached page → paged; else github::fetch_github or fetch::fetch_page with same-site redirects only; 'pass an http:// URL' hint; remember; paged"
-        )
+    async fn preview(&self, input: &WebFetchInput, ctx: &ToolContext) -> Result<Preview, ToolError> {
+        let parsed = parse_url(&input.url)?;
+        // A private address fails here, so nobody is asked to approve it.
+        let check = CheckOptions { allow_private: self.options.allow_private, ..CheckOptions::default() };
+        check_address(&parsed, &check, &ctx.cancel).await?;
+        Ok(Preview {
+            title: "Fetch a web page".into(),
+            text: Some(parsed.to_string()),
+            note: Some("GET · fetched by Marv, not in the sandbox".into()),
+            ..Preview::default()
+        })
+    }
+
+    async fn run(&self, input: &WebFetchInput, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let offset = input.offset.unwrap_or(0);
+        let parsed = parse_url(&input.url)?;
+        // Reading on (offset > 0) reuses the page fetched a moment ago instead of downloading and converting it again;
+        // offset 0 always fetches fresh. What needs_approval found wins: an entry expiring between the two mustn't
+        // turn a read nobody was asked about into a download.
+        let approved = self.approved_reads.lock().unwrap_or_else(|e| e.into_inner()).remove(&input.url);
+        let cached = approved.or_else(|| if offset > 0 { self.cache.get(&input.url) } else { None });
+        if let Some(page) = cached {
+            return web_result(&page, offset);
+        }
+        let get = self.get_options(&parsed);
+        let mut page = match parse_github(&parsed) {
+            Some(link) => {
+                let options = GithubOptions {
+                    get,
+                    token: self.token(),
+                    api_base: self.options.api_base.clone(),
+                    raw_base: self.options.raw_base.clone(),
+                    max_bytes: None,
+                };
+                fetch_github(&link, &options, &ctx.cancel).await?
+            }
+            None => match fetch_page(parsed.as_str(), &get, &ctx.cancel).await {
+                Ok(page) => page,
+                Err(err) => {
+                    // "example.com" got https from parse_url; a site that only serves http fails to connect, and the
+                    // model can't tell why.
+                    static SCHEME: std::sync::LazyLock<regex::Regex> =
+                        std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)^[a-z][a-z0-9+.-]*://").unwrap());
+                    if !SCHEME.is_match(input.url.trim()) && err.0.starts_with("Couldn't fetch ") {
+                        return Err(ToolError(format!("{} If the site only serves http, pass an http:// URL.", err.0)));
+                    }
+                    return Err(err);
+                }
+            },
+        };
+        page.text = strip_invisible(&page.text);
+        page.title = page.title.map(|t| strip_invisible(&t));
+        if page.text.chars().count() <= CACHE_MAX_CHARS {
+            let fin = url::Url::parse(&page.url).map(|u| u.to_string()).unwrap_or_else(|_| page.url.clone());
+            self.cache.remember(&[parsed.to_string(), fin], page.clone());
+        }
+        web_result(&page, offset)
     }
 }
 
@@ -380,5 +500,303 @@ mod tests {
         }
         assert!(cache.get("https://a.com/").is_none()); // the oldest went
         assert!(WebFetch::default().needs_approval(&WebFetchInput { url: "https://p1.com/".into(), offset: None }) == Some(true));
+    }
+
+    use crate::types::{ApprovalRequest, Approver, Decision};
+    use crate::web::test_server::{Response, TestServer};
+    use crate::{ToolRef, run_tool};
+    use marv_core::{Provenance, ToolCall};
+    use std::sync::Arc;
+    use std::sync::Mutex as StdMutex;
+
+    const PAGE: &str = "Words worth reading on this page. ";
+
+    fn html_page() -> String {
+        format!("<html><head><title>Post</title></head><body><article><p>{}</p></article></body></html>", PAGE.repeat(10))
+    }
+
+    struct Asked {
+        decision: Decision,
+        requests: StdMutex<Vec<ApprovalRequest>>,
+    }
+
+    impl Asked {
+        fn new(decision: Decision) -> Arc<Self> {
+            Arc::new(Self { decision, requests: StdMutex::new(Vec::new()) })
+        }
+        fn count(&self) -> usize {
+            self.requests.lock().unwrap().len()
+        }
+    }
+
+    #[async_trait]
+    impl Approver for Asked {
+        async fn approve(&self, request: ApprovalRequest) -> Decision {
+            self.requests.lock().unwrap().push(request);
+            self.decision
+        }
+    }
+
+    fn local_tool() -> Arc<WebFetch> {
+        Arc::new(WebFetch::new(WebOptions {
+            allow_private: true,
+            token: Some(String::new()),
+            converter: Some(crate::web::convert::tests::test_converter()),
+            ..WebOptions::default()
+        }))
+    }
+
+    fn ctx(approver: &Arc<Asked>) -> ToolContext {
+        ToolContext { approver: Some(approver.clone()), ..ToolContext::new(std::env::temp_dir()) }
+    }
+
+    fn call(url: &str, offset: Option<usize>) -> ToolCall {
+        ToolCall { id: "w1".into(), name: "web_fetch".into(), arguments: json!({"url": url, "offset": offset}).to_string() }
+    }
+
+    async fn fetch(tool: &Arc<WebFetch>, url: &str, offset: Option<usize>, ctx: &ToolContext) -> crate::ToolOutcome {
+        let tools: Vec<ToolRef> = vec![tool.clone()];
+        run_tool(&call(url, offset), ctx, &tools).await
+    }
+
+    async fn long_server(text: &'static str) -> TestServer {
+        TestServer::start(move |_| Response::text(text.repeat(70_000), "text/plain")).await
+    }
+
+    #[tokio::test]
+    async fn asks_per_site_shows_the_full_url_and_returns_the_page_as_web_content() {
+        let html = html_page();
+        let s = TestServer::start(move |_| Response::text(html.clone(), "text/html")).await;
+        let asked = Asked::new(Decision::Yes);
+        let ctx = ctx(&asked);
+        let out = fetch(&local_tool(), &format!("{}/post?q=1", s.base()), None, &ctx).await;
+        let requests = asked.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].scope, Scope { key: "web:localhost".into(), description: "fetching from localhost".into() });
+        assert_eq!(requests[0].preview.text.as_deref(), Some(format!("{}/post?q=1", s.base()).as_str()));
+        assert!(requests[0].network);
+        assert_eq!(out.label, format!("localhost:{}/post?q=1", s.port));
+        assert!(out.result.output.starts_with(&format!("Fetched {}/post?q=1 · Post\n\n", s.base())), "{}", out.result.output);
+        assert!(out.result.output.contains("Words worth reading"));
+        assert_eq!(out.result.provenance, Provenance::Web);
+        assert!(ctx.taint.is_tainted(), "a web result taints the session");
+    }
+
+    #[tokio::test]
+    async fn yolo_doesnt_skip_the_question() {
+        let s = TestServer::start(|_| Response::text("hi", "text/plain")).await;
+        let asked = Asked::new(Decision::Yes);
+        let yolo = ToolContext { yolo: true, ..ctx(&asked) };
+        fetch(&local_tool(), &format!("{}/", s.base()), None, &yolo).await;
+        assert_eq!(asked.count(), 1);
+    }
+
+    #[tokio::test]
+    async fn reading_on_with_offset_reuses_the_page_instead_of_fetching_it_again() {
+        let s = long_server("x").await;
+        let tool = local_tool();
+        let asked = Asked::new(Decision::Yes);
+        let url = format!("{}/long.txt", s.base());
+        fetch(&tool, &url, None, &ctx(&asked)).await;
+        let next = fetch(&tool, &url, Some(30_000), &ctx(&asked)).await;
+        assert!(next.result.output.contains("characters 30000-60000 of 70000"));
+        assert_eq!(s.requests(), 1);
+        fetch(&tool, &url, None, &ctx(&asked)).await; // offset 0: fresh
+        assert_eq!(s.requests(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_private_address_fails_before_anyone_is_asked() {
+        let asked = Asked::new(Decision::Yes);
+        let out = fetch(&Arc::new(WebFetch::default()), "http://127.0.0.1:9222/json", None, &ctx(&asked)).await;
+        assert!(out.result.is_error);
+        assert!(out.result.output.contains("Refused: 127.0.0.1 is a private address"), "{}", out.result.output);
+        assert_eq!(asked.count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_cached_read_doesnt_ask_again_an_uncached_offset_does() {
+        let s = long_server("x").await;
+        let tool = local_tool();
+        let asked = Asked::new(Decision::Yes);
+        let url = format!("{}/long.txt", s.base());
+        let uncached = fetch(&tool, &url, Some(30_000), &ctx(&asked)).await;
+        assert_eq!(asked.count(), 1); // nothing cached yet: this fetches, so it asks
+        assert!(uncached.result.output.contains("characters 30000-60000 of 70000"));
+        fetch(&tool, &url, None, &ctx(&asked)).await;
+        assert_eq!(asked.count(), 2);
+        fetch(&tool, &url, Some(30_000), &ctx(&asked)).await;
+        assert_eq!(asked.count(), 2); // from the cache
+    }
+
+    #[tokio::test]
+    async fn only_the_8_most_recent_pages_are_kept() {
+        let s = TestServer::start(|req| Response::text(format!("{:.<100}", format!("page {}", req.path)), "text/plain")).await;
+        let tool = local_tool();
+        let asked = Asked::new(Decision::Yes);
+        for i in 0..9 {
+            fetch(&tool, &format!("{}/p{i}", s.base()), None, &ctx(&asked)).await;
+        }
+        assert_eq!(s.requests(), 9);
+        fetch(&tool, &format!("{}/p8", s.base()), Some(10), &ctx(&asked)).await;
+        assert_eq!(s.requests(), 9); // newest: cached
+        fetch(&tool, &format!("{}/p0", s.base()), Some(10), &ctx(&asked)).await;
+        assert_eq!(s.requests(), 10); // oldest: evicted, fetched again
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_another_site_isnt_followed_the_model_gets_the_target() {
+        let other = TestServer::start(|_| Response::text("other", "text/plain")).await;
+        let other_port = other.port;
+        let here =
+            TestServer::start(move |req| Response::redirect(&format!("http://127.0.0.1:{other_port}/c{}", req.search), 302))
+                .await;
+        let asked = Asked::new(Decision::Yes);
+        let out = fetch(&local_tool(), &format!("{}/r?secret=x", here.base()), None, &ctx(&asked)).await;
+        assert_eq!(other.requests(), 0);
+        assert!(!out.result.is_error);
+        assert!(
+            out.result.output.contains(&format!(
+                "redirects to http://127.0.0.1:{other_port}/c?secret=x, on another site: call web_fetch with that URL"
+            )),
+            "{}",
+            out.result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn a_redirect_within_the_same_site_is_followed_and_its_final_url_hits_the_cache() {
+        let port = Arc::new(std::sync::OnceLock::<u16>::new());
+        let p = port.clone();
+        let s = TestServer::start(move |req| {
+            if req.path == "/a" {
+                Response::redirect(&format!("http://localhost:{}/b", p.get().unwrap()), 301)
+            } else {
+                Response::text("y".repeat(70_000), "text/plain")
+            }
+        })
+        .await;
+        port.set(s.port).unwrap();
+        let tool = local_tool();
+        let asked = Asked::new(Decision::Yes);
+        let first = fetch(&tool, &format!("{}/a", s.base()), None, &ctx(&asked)).await;
+        assert!(first.result.output.starts_with(&format!("Fetched {}/b", s.base())), "{}", &first.result.output[..80]);
+        let next = fetch(&tool, &format!("{}/b", s.base()), Some(30_000), &ctx(&asked)).await;
+        assert!(next.result.output.contains("characters 30000-60000 of 70000"));
+        assert_eq!(asked.count(), 1);
+        assert_eq!(s.requests(), 2); // /a and its redirect target /b, once
+    }
+
+    #[tokio::test]
+    async fn a_github_link_goes_through_the_api_with_the_tools_token() {
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let log = seen.clone();
+        let api = TestServer::start(move |req| {
+            log.lock().unwrap().push(req.header("authorization"));
+            if req.path.ends_with("/contents/a.txt") {
+                Response::text("file body", "text/plain")
+            } else {
+                Response::new(404, "{}").header("content-type", "application/json")
+            }
+        })
+        .await;
+        let tool = Arc::new(WebFetch::new(WebOptions {
+            allow_private: true,
+            allow_http: true,
+            api_base: Some(api.base()),
+            raw_base: Some(format!("{}/raw", api.base())),
+            token: Some("from-option".into()),
+            converter: None,
+        }));
+        let asked = Asked::new(Decision::Yes);
+        let out = fetch(&tool, "github.com/o/r/blob/main/a.txt", None, &ctx(&asked)).await;
+        assert!(out.result.output.contains("file body"), "{}", out.result.output);
+        assert_eq!(*seen.lock().unwrap(), [Some("Bearer from-option".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn a_page_that_leaves_the_cache_between_the_question_and_the_read_is_read_from_what_was_approved() {
+        let s = long_server("z").await;
+        let tool = local_tool();
+        let asked = Asked::new(Decision::Yes);
+        let url = format!("{}/z", s.base());
+        fetch(&tool, &url, None, &ctx(&asked)).await;
+        let input = WebFetchInput { url: url.clone(), offset: Some(30_000) };
+        assert_eq!(tool.needs_approval(&input), Some(false));
+        for i in 0..CACHE_PAGES {
+            tool.cache.remember(&[format!("https://p{i}.example/")], page("other")); // the entry is evicted now
+        }
+        drop(s); // and a fetch would fail: the read must use what was approved
+        let out = tool.run(&input, &ToolContext::new(std::env::temp_dir())).await.unwrap();
+        assert!(out.output.contains("characters 30000-60000 of 70000"));
+    }
+
+    #[tokio::test]
+    async fn a_403_says_the_site_may_block_automated_readers() {
+        let s = TestServer::start(|_| Response::new(403, "no")).await;
+        let asked = Asked::new(Decision::Yes);
+        let out = fetch(&local_tool(), &format!("{}/", s.base()), None, &ctx(&asked)).await;
+        assert!(out.result.is_error);
+        assert!(out.result.output.contains("403"));
+        assert!(
+            out.result
+                .output
+                .contains("The site may block automated readers: ask the user to paste the content, or try another source.")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_connection_to_an_address_typed_without_a_scheme_suggests_http() {
+        let s = TestServer::start(|_| Response::text("hi", "text/plain")).await; // plain http: https to it fails
+        let asked = Asked::new(Decision::Yes);
+        let bare = fetch(&local_tool(), &format!("localhost:{}/", s.port), None, &ctx(&asked)).await;
+        assert!(bare.result.is_error);
+        assert!(bare.result.output.contains("If the site only serves http, pass an http:// URL."), "{}", bare.result.output);
+        let explicit = fetch(&local_tool(), &format!("https://localhost:{}/", s.port), None, &ctx(&asked)).await;
+        assert!(explicit.result.is_error);
+        assert!(!explicit.result.output.contains("only serves http"));
+    }
+
+    // ---- marv-rs ---------------------------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn invisible_characters_never_reach_the_model() {
+        let s = TestServer::start(|_| {
+            Response::text(
+                "Read\u{200B}me\u{E0049}\u{E0067}\u{E006E}\u{E006F}\u{E0072}\u{E0065} please\u{2060}",
+                "text/plain; charset=utf-8",
+            )
+        })
+        .await;
+        let asked = Asked::new(Decision::Yes);
+        let out = fetch(&local_tool(), &format!("{}/t.txt", s.base()), None, &ctx(&asked)).await;
+        assert!(out.result.output.ends_with("Readme please"), "{:?}", out.result.output);
+    }
+
+    #[test]
+    fn a_url_prefix_is_the_origin_and_first_segment_not_the_domain() {
+        assert_eq!(url_prefix("https://docs.rs/regex/latest/regex/?x=1").as_deref(), Some("https://docs.rs/regex/"));
+        assert_eq!(url_prefix("docs.rs/regex").as_deref(), Some("https://docs.rs/regex/"));
+        assert_eq!(url_prefix("https://evil.example/?q=secret").as_deref(), Some("https://evil.example/"));
+        assert_eq!(egress_key("https://docs.rs/regex?q=1").as_deref(), Some("https://docs.rs/regex/"));
+        assert_eq!(egress_key("https://docs.rs/regexp").as_deref(), Some("https://docs.rs/regexp/"));
+        assert!(!egress_key("https://docs.rs/regexp").unwrap().starts_with(&url_prefix("https://docs.rs/regex").unwrap()));
+        assert_eq!(egress_key("file:///etc/passwd"), None);
+    }
+
+    #[tokio::test]
+    async fn once_tainted_always_covers_the_url_prefix_not_the_site() {
+        let s = TestServer::start(|_| Response::text("ok", "text/plain")).await;
+        let asked = Asked::new(Decision::Always);
+        let ctx = ToolContext { yolo: true, ..ctx(&asked) };
+        ctx.taint.mark(Provenance::Mcp);
+        let tool = local_tool();
+        fetch(&tool, &format!("{}/docs/a", s.base()), None, &ctx).await;
+        assert!(asked.requests.lock().unwrap()[0].must_ask);
+        let under = fetch(&tool, &format!("{}/docs/b?x=1", s.base()), None, &ctx).await;
+        assert!(!under.result.is_error, "{}", under.result.output);
+        assert_eq!(asked.count(), 1, "a URL under the approved prefix asked again");
+        fetch(&tool, &format!("{}/other/c", s.base()), None, &ctx).await;
+        assert_eq!(asked.count(), 2, "same site, new prefix: asks");
     }
 }

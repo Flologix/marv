@@ -12,6 +12,7 @@
 //! - `tests/mcp.rs`: trust, package runners, ignored `instructions`;
 //! - `tests/mesh.rs`: the mesh from inside a sandbox (unwired calls refused and logged, a subagent reaches the parent
 //!   only over its wire);
+//! - `tests/web.rs`: what a reader doesn't see never reaches the model (hidden text in web pages);
 //! - `tests/images.rs`: images (not built yet: ignored).
 //!
 //! Every guard's doc comment says how it was proven: "reverted X → this test failed". A guard whose code isn't
@@ -145,4 +146,30 @@ impl Approver for Recorder {
 /// A tool call with JSON arguments.
 pub fn call(name: &str, args: serde_json::Value) -> ToolCall {
     ToolCall { id: "call_guard".into(), name: name.into(), arguments: args.to_string() }
+}
+
+/// A local web server (the guards never fetch the internet): every request gets `body` as `content_type`. Returns
+/// `http://localhost:<port>`. It runs until the test process ends.
+pub fn serve(body: &'static str, content_type: &'static str) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut head = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => head.extend_from_slice(&buf[..n]),
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    format!("http://localhost:{port}")
 }

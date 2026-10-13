@@ -10,14 +10,22 @@
 //!   prompt-injection channel), bounded work.
 //! - [`plain`]: the linear, quote-aware plain-text fallback.
 //!
-//! Known limits (as in Marv): DNS rebinding (the name is checked, then the HTTP client resolves it again; planned: pin
-//! the checked address in the client's resolver), CSS-class hiding isn't detected, the budget is spent in document
-//! order.
+//! - [`hidden`] (marv-rs): hiding classes, invisible characters, Markdown comments.
+//!
+//! marv-rs closes two of Marv's known limits: the connection is pinned to the checked address (DNS rebinding), and
+//! the common frameworks' hiding classes are detected (stylesheets still aren't evaluated). Still as in Marv: the
+//! budget is spent in document order.
+
+/// What a web call says when the user stopped the run (Esc) during it.
+pub const STOPPED: &str = "Stopped by the user.";
 
 pub mod address;
 pub mod convert;
 pub mod fetch;
 pub mod github;
+pub mod hidden;
 pub mod html;
 pub mod html_convert_cli;
 pub mod plain;
+#[cfg(test)]
+pub(crate) mod test_server;

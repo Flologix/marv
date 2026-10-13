@@ -31,6 +31,12 @@ oxc_diagnostics = "0.154.0"
 serde_yaml_ng = "0.10.0"
 nix = { version = "0.31.3", features = ["signal"] }
 marv-fs.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+dom_smoothie = "0.18.2"
+dom_query = "0.28"
+flate2 = "1"
+brotli = "8"
+encoding_rs = "0.8"
 
 [lints]
 workspace = true

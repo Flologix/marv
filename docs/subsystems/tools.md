@@ -25,14 +25,15 @@ Spec: the **Tools**, **Web**, **Skills**, **Memory**, **Subagents** and **Yolo m
 | `src/tools/memory.ts` (+ bullet edits from `src/memory.ts`) | `memory.rs` | **Ported and tested:** the tool, and `add_memory`/`find_memory`/`remove_memory` (line-by-line edits, 0600 through `marv_fs::write_private`) |
 | `src/tools/agent.ts` | `agent.rs` | Ported (it delegates to `AgentHost`, which marv-session implements) |
 | `src/tools/syntax.ts` | `syntax.rs` | **Ported and tested:** `syntax_error` (oxc parser + semantic checks for JS/TS, serde_json, serde_yaml_ng over every document, `python3 -I`), `broken_by`, `syntax_note` |
-| `src/tools/web-fetch.ts` | `web_fetch.rs` | Ported and tested: `domain_of`, `web_scope`, `paged`, the page cache, `needs_approval`, `pasted_scopes` (#11; Marv's fence regex uses backreferences, so the fence pass is a scanner). The spec's `offset` has zod's `maximum` (2^53 − 1), as Marv's does. Todo: `preview`, `run` |
-| `src/tools/web/address.ts` | `web/address.rs` | Ported and tested: `is_private_address`. Todo: `check_address` |
-| `src/tools/web/fetch.ts` | `web/fetch.rs` | Ported and tested: `parse_url`, `sends_headers`, `redirect_note`. Todo: `get`, `fetch_page` (using reqwest with a pinned resolver) |
-| `src/tools/web/github.ts` | `web/github.rs` | Constants and `safe_segment`. Todo: `parse_github`, `fetch_github`, `fetch_readme` |
-| `src/tools/web/html.ts` | `web/html.rs` | Types and limits. Todo: `html_to_markdown` |
-| `src/tools/web/plain.ts` | `web/plain.rs` | Ported: `one_line`. Todo: `is_hidden_style`, `plain_text` |
-| `src/tools/web/convert.ts` | `web/convert.rs` | Todo: re-exec `marv __html-convert` |
-| `src/tools/web/html-convert-cli.ts` | `web/html_convert_cli.rs` | Types. Todo: `main` (marv-cli wires the subcommand) |
+| `src/tools/web-fetch.ts` | `web_fetch.rs` | **Ported and tested** (#5; `web-fetch-tool.test.ts` through `run_tool`, a local server only): `preview` (the address check fails before anyone is asked), `run` (cache, same-site redirects, GitHub, the "pass an http:// URL" hint), `pasted_scopes` (#11; a fence scanner, Rust's regex has no backreferences), the `offset` `maximum` (2^53 − 1). marv-rs: `Provenance::Web`; invisible characters stripped; `egress_url`/`url_prefix` for tainted sessions. Not ported: the env-var half of Marv's token test (setting env vars needs `unsafe` in Rust 2024) |
+| `src/tools/web/address.ts` | `web/address.rs` | **Ported and tested.** `check_address` takes a `Resolve` (tests swap it in, as Marv's spy did) and returns the addresses it approved |
+| `src/tools/web/fetch.ts` | `web/fetch.rs` | **Ported and tested.** `get` on reqwest (no redirects, no decompression: gzip/deflate/br inflated by hand under the cap), the connection pinned to `check_address`'s answer; `fetch_page`. marv-rs: HTML comments stripped from Markdown served as it is |
+| `src/tools/web/github.ts` | `web/github.rs` | **Ported and tested.** marv-rs: a README's HTML comments are stripped; the rate-limit reset is shown as `HH:MM UTC` (Marv: local time) |
+| `src/tools/web/html.ts` | `web/html.rs` | **Ported and tested.** dom_query (html5ever) for the DOM, dom_smoothie for Readability, and a port of turndown 7.2 + turndown-plugin-gfm as the Markdown writer. marv-rs: hiding classes and off-screen styles dropped, invisible characters stripped |
+| `src/tools/web/plain.ts` | `web/plain.rs` | **Ported and tested** (`plainText` tests from `web-html-convert.test.ts`). marv-rs: `is_hidden_style` knows the off-screen and zero-size tricks; hiding classes count as hidden |
+| `src/tools/web/convert.ts` | `web/convert.rs` | **Ported and tested:** re-execs this binary as `marv __html-convert` (empty environment, temp dir, SIGKILLed and reaped before it returns). Tests use the test binary itself as the converter |
+| `src/tools/web/html-convert-cli.ts` | `web/html_convert_cli.rs` | **Ported:** `main` (marv-cli routes `__html-convert` to it) |
+| (new, marv-rs) | `web/hidden.rs` | Hiding classes, invisible characters, Markdown comments (docs/SECURITY.md; guards in `tests/guards/tests/web.rs`) |
 | (new) | `output.rs` | Ported: the 30k cut (10k head + 20k tail). Todo: spill the cut to a file (#61) |
 | (new, #66) | `apply_patch.rs` | The plan and its types only. Not registered |
 
@@ -95,7 +96,9 @@ pub const INTERRUPTED: &str;  // must equal marv-agent's NOT_RUN.aborted
   - In a tainted session, egress (`ToolKind::Egress` or `uses_network`) skips yolo, and its `ApprovalRequest` has `must_ask` set, so the session's "always" wrapper must not answer it.
   - Protected paths do the same, through `protected_target`.
   - A result whose `provenance` taints marks the session.
-  - `web_fetch` is `Egress` with `Provenance::Web`.
+  - `web_fetch` is `Egress` with `Provenance::Web`. In a tainted session, a URL under a prefix the user approved runs as approved, and "always" on a tainted request approves the URL's prefix (`web_fetch::url_prefix`: origin plus first path segment), not the whole site (the S6 item). `Tool::egress_url` is the hook `run_tool` uses.
+  - Hidden text in web pages (#5): the screen-reader and hiding classes of the common CSS frameworks, off-screen and zero-size inline styles, zero-width/tag/variation-selector/bidi characters, and HTML comments in raw Markdown never reach the model, on both conversions.
+  - web_fetch connects to the addresses `check_address` approved (reqwest's `resolve_to_addrs`), which closes Marv's DNS-rebinding gap.
   - Skill files are read only after a realpath check.
   - The Unicode edit tier (Marv #60, still open there): exact, then Unicode, then trailing whitespace, then indentation.
   - `edit_file` and `write_file` ask even in yolo for a `package.json` change that adds, removes or changes a lifecycle script (`ProtectedRule::PackageScripts`).
@@ -107,5 +110,8 @@ pub const INTERRUPTED: &str;  // must equal marv-agent's NOT_RUN.aborted
   - spill cut output to a file (#61, `output::spill_cut`);
   - schema-guided arg repair (#65, `repair`);
   - a formatter after edits (#67, `edit_file`/`write_file`);
-  - `apply_patch` (#66);
-  - a pinned DNS resolver for web fetches (closes Marv's DNS-rebinding limit).
+  - `apply_patch` (#66).
+- **Web port notes:**
+  - The converter is SIGKILLed on timeout, Esc or completion, and reaped before `convert_html` returns. Marv's exit handler (kill converters still running when Marv exits) is `convert::kill_running()`, for marv-cli's exit path. Dropping the future kills the child too (`kill_on_drop`).
+  - Readability is dom_smoothie, not Mozilla's: same patterns, slightly different scoring. Marv's tests pass unchanged.
+  - Unconverted tests: the "main thread stays free" timing (a Rust converter runs in another process by design) and the exit-handler test.
