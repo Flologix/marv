@@ -317,8 +317,12 @@ function defaultSpawn(argv: string[]) {
  * Whether a remote server would ask for a login (for /mcp add, before it's installed): an unauthenticated read of
  * its protected-resource metadata (RFC 9728). Never registers, never throws, gives up after `timeoutMs`.
  */
-export async function probeLogin(url: string, { timeoutMs = 5000, fetchFn = fetch }: { timeoutMs?: number; fetchFn?: typeof fetch } = {}): Promise<boolean> {
-  const signal = AbortSignal.timeout(timeoutMs);
+export async function probeLogin(
+  url: string,
+  { timeoutMs = 5000, fetchFn = fetch, signal: caller }: { timeoutMs?: number; fetchFn?: typeof fetch; signal?: AbortSignal } = {},
+): Promise<boolean> {
+  // The caller's signal too (Esc during /mcp add), not only the timeout.
+  const signal = caller ? AbortSignal.any([AbortSignal.timeout(timeoutMs), caller]) : AbortSignal.timeout(timeoutMs);
   const limited = ((input: string | URL | Request, init?: RequestInit) => fetchFn(input, { ...init, signal })) as typeof fetch;
   try {
     const meta = await discoverOAuthProtectedResourceMetadata(url, undefined, limited);

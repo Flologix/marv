@@ -45,10 +45,25 @@ async function resolveSource(options: AddOptions, deps: ResolveDeps): Promise<Re
       if (options.env.length || options.args.length) throw new Error("--env and server arguments are for local servers; a remote one takes --header.");
       return httpProposal(source, { name: options.name ?? serverName(source), headers: options.headers });
     case "registry":
-      return resolveRegistry(source, opts, deps);
+      return fits(await resolveRegistry(source, opts, deps), options);
     case "github":
-      return resolveGithub(source, opts, deps);
+      return fits(await resolveGithub(source, opts, deps), options);
   }
+}
+
+/**
+ * A registry entry or a README can resolve to either kind of server: options that don't apply to the one it resolved
+ * to are refused, as for a typed URL or package, never silently dropped.
+ */
+function fits(resolved: Resolved, options: AddOptions): Resolved {
+  if (!("entry" in resolved)) return resolved;
+  if ("url" in resolved.entry && (options.env.length || options.args.length)) {
+    throw new Error(`${options.source} is a remote server: --env and server arguments are for local servers; a remote one takes --header.`);
+  }
+  if (!("url" in resolved.entry) && Object.keys(options.headers).length) {
+    throw new Error(`${options.source} is a local server: --header is for remote (URL) servers; a local server reads its secrets from --env.`);
+  }
+  return resolved;
 }
 
 /** The real network: Marv's own `get`, and GitHub's API with the user's GITHUB_TOKEN (sent to the API host only). */
@@ -59,6 +74,6 @@ export function liveDeps(env: Env, signal?: AbortSignal): ResolveDeps {
     signal,
     readme: (owner, repo, s) => fetchReadme(owner, repo, { signal: s, ...(token ? { token } : {}) }),
     // An unauthenticated read of the server's own metadata (5 s, no registration): only for a URL the user typed.
-    probeLogin: (url, s) => (s?.aborted ? Promise.resolve(false) : probeLogin(url)),
+    probeLogin: (url, s) => (s?.aborted ? Promise.resolve(false) : probeLogin(url, s ? { signal: s } : {})),
   };
 }

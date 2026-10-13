@@ -238,3 +238,14 @@ describe("the browser", () => {
     ]);
   });
 });
+
+test("probeLogin stops when the caller's signal does (Esc during /mcp add), not only at its timeout", async () => {
+  const { probeLogin } = await import("../src/mcp/oauth.ts");
+  const stop = new AbortController();
+  const hanging = ((_: unknown, init?: RequestInit) =>
+    new Promise((_r, reject) => init?.signal?.addEventListener("abort", () => reject(new Error("aborted"))))) as unknown as typeof fetch;
+  const started = Date.now();
+  setTimeout(() => stop.abort(), 50);
+  expect(await probeLogin("https://mcp.example.com/mcp", { timeoutMs: 5000, fetchFn: hanging, signal: stop.signal })).toBe(false);
+  expect(Date.now() - started).toBeLessThan(1000);
+});
