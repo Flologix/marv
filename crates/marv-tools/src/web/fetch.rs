@@ -10,8 +10,9 @@
 //!   ignores the scheme, so a redirect from https to http on the same host would otherwise send a token in clear.
 //! - A refused redirect returns the 3xx with `location`, and [`redirect_note`] tells the model where it leads.
 //! - 403/429/503 say the site may block automated readers; only a name that doesn't exist says "check the address".
-//! - Port plan: `reqwest` with redirects disabled, rustls, and a resolver pinned to the address `check_address`
-//!   approved (closes Marv's DNS-rebinding gap).
+//! - marv-rs: `reqwest` with redirects disabled, rustls, no automatic decompression, and each connection pinned to the
+//!   addresses `check_address` approved (`resolve_to_addrs`), which closes Marv's DNS-rebinding gap.
+//! - marv-rs: Markdown served as it is loses its HTML comments ([`crate::web::hidden::strip_markdown_comments`]).
 
 use std::io::Read;
 use std::net::{IpAddr, SocketAddr};

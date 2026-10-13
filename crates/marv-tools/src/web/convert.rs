@@ -10,9 +10,9 @@
 //!   wouldn't read the project's `bunfig.toml` / `.env`; marv-rs is one static binary, but the rule stays).
 //! - SIGKILLed on timeout ([`CONVERT_TIMEOUT_MS`] = 15 s), abort, completion or Marv's exit; on timeout or failure the
 //!   page comes back as plain text (`plain: true`, reason `timeout`/`error`).
-//! - Port plan: re-exec the marv binary itself (`std::env::current_exe()`) with a hidden `__html-convert` subcommand
-//!   that calls [`crate::web::html_convert_cli::main`]; marv-cli wires the subcommand. Threads can't be killed in Rust
-//!   either, which is why this stays a process.
+//! - marv-rs re-execs its own binary (`std::env::current_exe()`) as the hidden `marv __html-convert`, which calls
+//!   [`crate::web::html_convert_cli::main`]. Threads can't be killed in Rust either, which is why this stays a process.
+//!   The reply is the last line of stdout. Tests use the test binary itself as the converter ([`Converter`]).
 
 use std::path::PathBuf;
 use std::sync::Mutex;

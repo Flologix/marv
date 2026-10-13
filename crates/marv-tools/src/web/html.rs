@@ -11,9 +11,10 @@
 //!   `opacity:0`, `[hidden]`, `aria-hidden`), form controls, svg and scripts are removed (hidden text is the classic
 //!   prompt-injection channel); links and images are kept only for http/https/mailto after resolving (`<base href>`
 //!   honoured); the title is one line of at most 200 chars.
-//! - Port plan: `html5ever`/`scraper` for the DOM, a Readability port (`readability` crate or `dom_smoothie`), and a
-//!   Markdown writer with GFM tables (`htmd`); keep the same limits and the same hidden-element rules, with Marv's
-//!   tests as fixtures.
+//! - marv-rs: `dom_query` (html5ever) is the DOM, `dom_smoothie` (a Readability port) finds the article, and the
+//!   Markdown writer is a port of turndown 7.2 with turndown-plugin-gfm (atx headings, fenced code, `-` bullets), so
+//!   Marv's tests pass as they are. Hiding classes and off-screen styles count as hidden too
+//!   ([`crate::web::hidden`]), and the output has its invisible characters stripped.
 
 use crate::web::hidden::{is_hidden_class, strip_invisible};
 use crate::web::plain::{MAX_CHARS, is_hidden_style, one_line};
