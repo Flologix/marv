@@ -49,6 +49,7 @@ marv-rs is held to TypeScript Marv's recordings except where it differs on purpo
 
 The differences:
 - **#64 continue after a dropped stream** (`dropped-stream`, `expect.marv-rs/` and `script.marv-rs.jsonl`). The retry sends the partial reply as an assistant turn plus `DROPPED_STREAM_NOTE`, and the model's scripted answer is only the rest ("xt in upper case."). The result says the sentence once, the second request extends the first (the prefix rule holds), and the files and exit code are Marv's. With Marv's script, whose retry repeats the whole reply, the text would be doubled.
+- **Fenced check notes** (`ts-new-type-error`, `expect.marv-rs/`, declared under #41: the fix is marv-rs's, docs/SECURITY.md). The typecheck's note is Marv's own sentence, then tsc's output inside `<untrusted-data source="project">`, where Marv began it `Marv:`. Only `requests.jsonl` differs (requests 4 and 5); events, files and exit code are Marv's.
 - **#58 parallel read-only calls** (every scenario, no override). The `tool_start`s of a reply's reads come together, and their `tool_end`s arrive as each finishes, which varies from run to run, so a recording can't pin it. For marv-rs, `compare::calls_in_order` puts each run of consecutive tool events back in call order (each start, then its end, matched by tool and label) in both logs before comparing. A sequential log is unchanged by it. The results, requests, files and exit code are still compared as they are.
 
 ## Marv behaviours the recordings pin

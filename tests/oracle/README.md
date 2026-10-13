@@ -85,6 +85,7 @@ All 17 of Marv's `evals/tasks/*`, with a scripted model instead of a real one. T
 | `ts-make-async` | a change that ripples through callers: parallel reads, a `write_file` rewrite, edits in several files per step |
 | `ts-rename-export` | a rename across five TypeScript files, then `git status` (the project has a `.gitignore`) |
 | `ts-required-field` | an `old_string` that isn't in the file gets the closest lines back; the retry lands |
+| `ts-new-type-error` | the typecheck after an edit (diagnostics on, a stand-in `tsc`): a renamed export breaks its caller, the note names it, the next step fixes it. marv-rs fences the note (`deliberate`) |
 | `mcp-fix-from-issue` | deferred MCP tools: `tool_search` loads a spec, `mcp_call` runs it, the fix follows |
 | `mcp-comment` | the model calls `mcp__tracker__add_comment` by name: Marv runs it as `mcp_call` and says so; the comment is recorded |
 | `mcp-unused` | a configured server whose tools are only announced; a plain edit |
