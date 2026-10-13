@@ -241,7 +241,8 @@ test("REVIEW_GATE_FULL=1 reviews the whole branch even after an earlier pass", (
     env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" },
   });
   expect(gate({ REVIEW_GATE_FULL: "1" }).exitCode).toBe(0);
-  expect(reviewsLog().at(-1)).toContain("from:main");
+  const mainSha = Bun.spawnSync(["git", "rev-parse", "main"], { cwd: repo }).stdout.toString().trim();
+  expect(reviewsLog().at(-1)).toContain(`from:${mainSha} `); // the merge-base, which is main here
   // And a commit that already passed is reviewed again, in full.
   const before = reviewsLog().length;
   expect(gate({ REVIEW_GATE_FULL: "1" }).exitCode).toBe(0);
@@ -259,4 +260,21 @@ test("eval tasks' starting repos are excluded from the review (their bugs are pl
   chmodSync(join(bin, "ocr"), 0o755);
   expect(gate().exitCode).toBe(0);
   expect(reviewsLog()[0]).toContain("--exclude evals/tasks/*/repo/**");
+});
+
+test("a branch behind its base is reviewed from the merge-base, not the base's tip (the base's new work isn't its diff)", () => {
+  writeOcr();
+  const run = (...a: string[]) =>
+    Bun.spawnSync(["git", "-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgSign=false", ...a], {
+      cwd: repo,
+      env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" },
+    }).stdout.toString().trim();
+  const mergeBase = run("merge-base", "main", "work");
+  run("checkout", "-q", "main");
+  writeFileSync(join(repo, "other.txt"), "another branch's work, merged into the base\n");
+  run("add", ".");
+  run("commit", "-qm", "base moves on");
+  run("checkout", "-q", "work");
+  expect(gate().exitCode).toBe(0);
+  expect(reviewsLog()[0]).toStartWith(`from:${mergeBase} `);
 });

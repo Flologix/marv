@@ -208,7 +208,7 @@ for (const sha of new Set(commits)) {
   // that commit.
   const mergeBase = git("merge-base", base, sha);
   const kp = keyParts(sha);
-  let from: string = base;
+  let from: string = mergeBase; // the base may have moved on since the branch left it: review only the branch's own work
   // Newest first: the passed file is appended to, so its last matching line is the latest pass.
   for (const line of process.env.REVIEW_GATE_FULL === "1" ? [] : [...passedLines].reverse()) {
     const rec = parseRecord(line);
