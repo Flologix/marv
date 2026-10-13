@@ -57,7 +57,7 @@ use crate::event_queue::EventQueue;
 use crate::feedback::classify_reply;
 use crate::mcp_tools::{McpCallTool, McpHandle, McpToolAdapter, ToolSearchTool};
 use crate::memory::{Memories, MemoryPaths};
-use crate::mesh::{MeshHandle, MeshTool, WireApprover};
+use crate::mesh::{MeshAccess, MeshHandle, MeshTool, WireApprover};
 use crate::prompt::{Listed, PromptInput, system_prompt};
 use crate::runner::{AlwaysScopes, SessionAgentHost, SessionApprover, SessionToolRunner, SubagentSink, step_limit_request};
 use crate::sessions::{McpListing, SavedSession, SessionStore, new_session};
@@ -607,6 +607,10 @@ impl MarvSession {
     /// Builds a session. Fails (and changes nothing) for a taken tool name, or yolo where `no_yolo` forbids it.
     pub fn new(init: SessionInit) -> Result<Self, SessionError> {
         check_tool_names(&init.tools).map_err(SessionError::Invalid)?;
+        // The main agent's plug (`agent.parent.inbox`), bound now so it's there before the first turn.
+        if let Some(mesh) = &init.mesh {
+            mesh.plug(crate::mesh::parent_id()).map_err(|e| SessionError::Invalid(format!("The mesh: {e}")))?;
+        }
         if let Some(why) = &init.no_yolo
             && init.yolo
         {
@@ -718,6 +722,10 @@ impl MarvSession {
     pub fn mesh(&self) -> Option<MeshHandle> {
         self.inner.init.mesh.clone()
     }
+    /// Who grants wires: `wire_approver`, else a person through the client's approver (never yolo).
+    fn wire_approver(&self) -> Option<Arc<dyn WireApprover>> {
+        crate::mesh::wire_approver(self.inner.init.wire_approver.clone(), self.inner.init.approve.as_ref())
+    }
     /// The system prompt this conversation sends (byte-stable until `clear()`).
     pub fn system_prompt(&self) -> String {
         self.state().system.clone()
@@ -794,8 +802,8 @@ impl MarvSession {
     /// `after_step` (checks), `wrap_up_at_limit` → forward `Loop` events (usage → totals; assistant → transcript;
     /// agent `ToolStart` → `subagent_start` record) → drain mesh inbox between steps → finally: reset
     /// `mid_turn_compact_failed`, finish recorders, cancel the stop, free the session, schedule the save, `TurnEnd`.
-    ///
-    /// Port note: mesh inbox draining between steps waits for mesh v1 (`Switchboard::drain_inbox` is still todo).
+    /// marv-rs: the parent's mesh inbox is read before the user message (its messages go in first, fenced) and
+    /// after each step (`crate::mesh::with_inbox`).
     async fn run_turn(
         &self,
         text: String,
@@ -907,6 +915,10 @@ impl MarvSession {
             )
         };
         let log = self.trajectory();
+        let mut tainted = self.inner.taint.sources().len();
+        if let Some(mesh) = &init.mesh {
+            crate::mesh::log_to(mesh, log.as_ref());
+        }
         let record: Record = {
             let log = log.clone();
             Arc::new(move |r: TrajectoryRecord| {
@@ -942,6 +954,12 @@ impl MarvSession {
             Some(note) => format!("{note}\n\n{for_model}"),
             None => for_model.to_string(),
         };
+        // Mesh messages that came in since the last step: before the user's message, fenced as data.
+        let inbox = init.mesh.as_ref().and_then(|m| crate::mesh::inbox_note(m, &crate::mesh::parent_id(), &self.inner.taint));
+        let message = match inbox {
+            Some(inbox) => format!("{inbox}\n\n{message}"),
+            None => message,
+        };
         lock(&history).push(ChatTurn::User { text: message });
         self.note(Role::User, text);
         emit(SessionEvent::Status(TurnStatus::Running));
@@ -969,6 +987,7 @@ impl MarvSession {
             approver: init.approve.clone(),
             always: self.inner.always.clone(),
             sink,
+            mesh: init.mesh.clone().map(|mesh| MeshAccess { mesh, approver: self.wire_approver() }),
         });
         let mut ctx = ToolContext::new(&init.root);
         ctx.sandbox = Arc::new(marv_sandbox::Sandbox::from_env(sandbox));
@@ -990,6 +1009,11 @@ impl MarvSession {
         options.after_step = Some(
             checks.map_or_else(|| -> marv_agent::agent::AfterStep { Arc::new(|_| Box::pin(async { None })) }, |c| c.after_step),
         );
+        if let Some(mesh) = &init.mesh {
+            let taint = self.inner.taint.clone();
+            options.after_step =
+                Some(crate::mesh::with_inbox(options.after_step.take(), mesh.clone(), crate::mesh::parent_id(), taint));
+        }
         // A direct call to a deferred MCP tool runs as the mcp_call it meant (#14), and its result says so.
         let deferred = self.state().listing.as_ref().is_some_and(|l| l.mode == McpMode::Deferred);
         let mcp_names: HashSet<String> =
@@ -1051,13 +1075,14 @@ impl MarvSession {
 
         let mut reason = TurnEndReason::Done(StopReason::Error);
         let mut subagents = 0;
-        let mut tainted = self.inner.taint.sources().len();
         let mut events = std::pin::pin!(marv_agent::run_agent(options));
         while let Some(event) = events.next().await {
             if let Some(main) = lock(main).as_mut() {
                 main.event(&event);
             }
-            let mut ended_call = false;
+            // After a call's result, or the mesh inbox read before the turn or between steps: anything but a delta.
+            let check_taint =
+                !matches!(event, LoopEvent::TextDelta(_) | LoopEvent::ThinkingDelta(_) | LoopEvent::ToolCallDelta { .. });
             match &event {
                 LoopEvent::Usage(usage) => {
                     self.state().last = Some(*usage);
@@ -1084,14 +1109,13 @@ impl MarvSession {
                     if let Some(mut sub) = lock(subs).remove(&call.id) {
                         sub.finish(if run.result.is_error { "error" } else { "end" });
                     }
-                    ended_call = true;
                 }
                 LoopEvent::Done(r) => reason = TurnEndReason::Done(*r),
                 _ => {}
             }
             emit(SessionEvent::Loop(event));
             // marv-rs: a result that tainted the session (web, MCP, mesh, image) is shown and logged once.
-            if ended_call {
+            if check_taint {
                 let sources = self.inner.taint.sources();
                 for source in sources.iter().skip(tainted) {
                     record(TrajectoryRecord::Taint { turn: Some(turn.into()), source: *source });
@@ -1604,9 +1628,9 @@ impl MarvSession {
         let mut tools: Vec<ToolRef> = marv_tools::builtin_tools().to_vec();
         tools.extend(init.tools.iter().cloned());
         if let Some(mesh) = &init.mesh
-            && let Ok(plug) = marv_mesh::PlugId::new("main")
+            && let Ok(plug) = mesh.plug(crate::mesh::parent_id())
         {
-            tools.extend(MeshTool::all(&plug, mesh).into_iter().map(|t| Arc::new(t) as ToolRef));
+            tools.extend(MeshTool::all(&plug, mesh, self.wire_approver()).into_iter().map(|t| Arc::new(t) as ToolRef));
         }
         let Some(mcp) = &init.mcp else { return (specs, tools) };
         let taint = self.inner.taint.clone();

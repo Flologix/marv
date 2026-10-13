@@ -326,7 +326,13 @@ async fn drive(
     let approver = host.approver.clone().map(|inner| {
         Arc::new(SessionApprover { inner, always: host.always.for_subagent(), cancel: ctx.cancel.clone() }) as Arc<dyn Approver>
     });
-    let sub_ctx = subagent_context(ctx, who, worktree, approver);
+    let mut sub_ctx = subagent_context(ctx, who, worktree, approver);
+    // marv-rs: a plug of its own (no wires), mounted in its sandbox, unplugged when it ends (docs/MESH.md). One that
+    // can't be bound leaves it without the mesh, not without its task.
+    let plug = host.mesh.as_ref().and_then(|mesh| mesh.plug_subagent().ok());
+    if let Some(plug) = &plug {
+        sub_ctx.sandbox = plug.sandbox(&sub_ctx.sandbox);
+    }
     let system = subagent_prompt(&SubagentPromptInput {
         cwd: worktree.map_or_else(|| host.cwd.clone(), |w| shorten_home(&w.work_dir, &home_dir())),
         tools: names.clone(),
@@ -340,12 +346,16 @@ async fn drive(
         worktree: worktree.map(|w| (w.branch.clone(), w.base.clone())),
         date: iso_date(now_ms()),
     });
+    let mut available = available;
+    available.extend(plug.iter().flat_map(|p| p.tools()));
     let specs = available.iter().map(|t| t.spec()).collect();
+    let taint = sub_ctx.taint.clone();
     let runner = Arc::new(SessionToolRunner::new(sub_ctx, Arc::new(available)));
     let history: History = Arc::new(Mutex::new(vec![ChatTurn::User { text: input.prompt.clone() }]));
     let mut options =
         AgentOptions::new(host.provider_for(agent_type.model.as_deref()), history, system, specs, runner, ctx.cancel.clone());
     options.max_steps = SUBAGENT_MAX_STEPS;
+    options.after_step = plug.as_ref().map(|p| p.after_step(None, taint));
 
     tally.report();
     let events = run_agent(options);
@@ -634,6 +644,7 @@ mod run_tests {
                 approver: None,
                 always: AlwaysScopes::default(),
                 sink: Arc::new(Sink(seen.clone())),
+                mesh: None,
             };
             (Arc::new(host), seen)
         }
