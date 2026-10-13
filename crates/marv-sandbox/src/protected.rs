@@ -120,7 +120,8 @@ pub fn rule_for_relative(rel: &Path) -> Option<ProtectedRule> {
 pub fn protected_rule(root: &Path, path: &Path) -> Result<Option<ProtectedRule>, SandboxError> {
     let absolute = normalize(&root.join(path));
     let real_root = std::fs::canonicalize(root)?;
-    let real = leads_to(&absolute)?;
+    // Through a dangling symlink too: a write through `innocent.sh -> .envrc` creates `.envrc` (#8).
+    let real = real_with_missing(&absolute)?;
     let outside = || SandboxError::OutsideProject { path: path.display().to_string(), root: root.display().to_string() };
     let real_rel = real.strip_prefix(&real_root).map_err(|_| outside())?;
     let lexical_rel = absolute.strip_prefix(root).map_err(|_| outside())?;
@@ -134,23 +135,6 @@ pub fn protected_rule(root: &Path, path: &Path) -> Result<Option<ProtectedRule>,
         }
     }
     Ok(None)
-}
-
-/// Where a write to `path` would land: its real path, following a final symlink even when it dangles. A write through
-/// a dangling `innocent.sh -> .envrc` creates `.envrc`, but `real_with_missing` stops at the nearest folder that
-/// exists and so judged it by the link's own name (found by the guard suite, #8).
-fn leads_to(path: &Path) -> std::io::Result<PathBuf> {
-    let mut current = path.to_path_buf();
-    for _ in 0..40 {
-        match std::fs::symlink_metadata(&current) {
-            Ok(meta) if meta.file_type().is_symlink() && !current.exists() => {
-                let target = std::fs::read_link(&current)?;
-                current = normalize(&current.parent().unwrap_or(Path::new("/")).join(target));
-            }
-            _ => return real_with_missing(&current),
-        }
-    }
-    Err(std::io::Error::other(format!("{}: too many levels of symbolic links", path.display())))
 }
 
 /// Whether a change to `path` must ask even in yolo. Fails closed: anything that can't be checked is protected.
