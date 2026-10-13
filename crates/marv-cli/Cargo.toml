@@ -29,9 +29,12 @@ serde.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
 clap = { version = "4.6", features = ["derive"] }
+# The mesh's switchboard is served until its token is cancelled (`mesh_cmd::Mesh`).
+tokio-util.workspace = true
 
 [dev-dependencies]
-tokio-util.workspace = true
+# The two-Marv mesh test (tests/mesh.rs): the oracle's fake OpenAI-compatible server.
+marv-oracle = { path = "../marv-oracle" }
 
 [lints]
 workspace = true

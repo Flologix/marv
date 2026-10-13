@@ -84,6 +84,8 @@ pub fn build_approver(names: &[String]) -> Result<HeadlessApprovals, String> {
             }
         }
     }
+    // A pre-approved receptacle's mesh tool calls are approved too (scope `mesh:<receptacle>:<mode>`).
+    prefixes.extend(mesh.iter().map(|r| format!("mesh:{r}:")));
     let approver = (!prefixes.is_empty()).then(|| Arc::new(ScopeApprover { prefixes }) as Arc<dyn Approver>);
     Ok((approver, mesh))
 }
@@ -322,7 +324,7 @@ pub struct HeadlessOptions {
 /// Runs one headless turn and writes the result to stdout. Returns the exit code.
 pub async fn run_headless(options: HeadlessOptions) -> ExitCode {
     use marv_session::config::{ConfigStore, Env, default_config_dir, migrate_legacy_config, resolve_config};
-    let (approve, _mesh_grants) = match build_approver(&options.approve) {
+    let (approve, mesh_grants) = match build_approver(&options.approve) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("{e}");
@@ -367,7 +369,7 @@ pub async fn run_headless(options: HeadlessOptions) -> ExitCode {
             return ExitCode::Error;
         }
     };
-    let mut builder = marv_session::SessionBuilder::new(root, provider)
+    let mut builder = marv_session::SessionBuilder::new(root.clone(), provider)
         .sources(&[marv_session::sources::Source::User, marv_session::sources::Source::Project])
         .max_steps(options.max_steps.unwrap_or(config.max_steps))
         .yolo(config.yolo)
@@ -375,6 +377,26 @@ pub async fn run_headless(options: HeadlessOptions) -> ExitCode {
         .trajectories(if config.trajectories { marv_session::sdk::Store::Default } else { marv_session::sdk::Store::Off });
     if let Some(approve) = approve {
         builder = builder.approve(approve);
+    }
+    // The mesh, when asked for (`--approve mesh:<r>` or `MARV_MESH_NAME`): otherwise a one-off `marv -p` isn't on it
+    // and its model isn't offered the mesh tools. Wires are granted only for the listed receptacles, from this run's
+    // own agents or from another Marv (its door).
+    let wants_mesh = !mesh_grants.is_empty() || env.get("MARV_MESH_NAME").is_some_and(|n| !n.is_empty());
+    let mut mesh = None;
+    if wants_mesh {
+        match crate::mesh_cmd::start(&env, &root) {
+            Ok(Some(mut started)) => {
+                let wires: Arc<dyn marv_session::mesh::WireApprover> = Arc::new(marv_session::mesh::HeadlessWires(mesh_grants));
+                if let Err(e) = started.open_door(wires.clone()) {
+                    eprintln!("marv: the mesh: {}", printable(&e));
+                }
+                builder.options.mesh = Some(started.handle.clone());
+                builder.options.wire_approver = Some(wires);
+                mesh = Some(started);
+            }
+            Ok(None) => eprintln!("marv: the mesh needs XDG_RUNTIME_DIR; running without it."),
+            Err(e) => eprintln!("marv: the mesh: {}", printable(&e)),
+        }
     }
     if options.resume_latest {
         builder = builder.resume(marv_session::ResumeTarget::Latest);
@@ -404,6 +426,7 @@ pub async fn run_headless(options: HeadlessOptions) -> ExitCode {
         }
     };
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), session.close()).await;
+    drop(mesh);
     code
 }
 
@@ -442,12 +465,16 @@ mod tests {
         assert_eq!(a.approve(request("memory")).await, Decision::Unavailable);
     }
 
-    #[test]
-    fn unknown_scopes_are_errors_and_mesh_flags_are_grants() {
+    #[tokio::test]
+    async fn unknown_scopes_are_errors_and_mesh_flags_are_grants() {
         assert!(build_approver(&["custom_scope".into()]).err().unwrap().contains("Unknown --approve scope \"custom_scope\""));
         let (approver, mesh) = build_approver(&["mesh:agent.parent.inbox".into()]).unwrap();
-        assert!(approver.is_none());
         assert_eq!(mesh.len(), 1);
+        // The receptacle's own mesh calls are approved, nothing else.
+        let approver = approver.unwrap();
+        assert_eq!(approver.approve(request("mesh:agent.parent.inbox:send")).await, Decision::Yes);
+        assert_eq!(approver.approve(request("mesh:agent.parent.inbox2:send")).await, Decision::Unavailable);
+        assert_eq!(approver.approve(request("bash:net:curl")).await, Decision::Unavailable);
     }
 
     #[test]

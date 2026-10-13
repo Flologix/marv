@@ -1389,6 +1389,7 @@ dependencies = [
  "marv-core",
  "marv-mcp",
  "marv-mesh",
+ "marv-oracle",
  "marv-provider",
  "marv-sandbox",
  "marv-session",

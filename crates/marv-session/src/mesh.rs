@@ -127,6 +127,17 @@ impl WireApprover for HeadlessWires {
     }
 }
 
+/// The session's wire approver as the door's (mesh v2, `marv_mesh::discovery::open_door`): the same person, or the
+/// same `--approve mesh:<receptacle>` list, answers wires asked for from other processes.
+pub struct DoorWires(pub Arc<dyn WireApprover>);
+
+#[async_trait]
+impl marv_mesh::discovery::PeerApprover for DoorWires {
+    async fn approve_wire(&self, request: WireRequest) -> Option<WireBy> {
+        self.0.approve_wire(request).await
+    }
+}
+
 /// The session's wire approver: the client's own, else a person through the client's tool approver.
 pub fn wire_approver(own: Option<Arc<dyn WireApprover>>, approve: Option<&Arc<dyn Approver>>) -> Option<Arc<dyn WireApprover>> {
     own.or_else(|| approve.map(|inner| Arc::new(PersonWires { inner: inner.clone(), by: WireBy::Tui }) as Arc<dyn WireApprover>))
@@ -257,17 +268,23 @@ impl MeshTool {
     /// No wire yet: asks a person for one, when one could be granted (the receptacle exists, takes the mode, and
     /// isn't this agent's own). Whatever the answer, the message then goes to the switchboard, which refuses and
     /// logs it if there's still no wire.
-    async fn ask_for_wire(&self, receptacle: &ReceptacleName, mode: WireMode) {
+    /// mesh v2: the receptacle may be found on demand (another Marv's inbox, a Herdr pane), and a wire to another
+    /// Marv is granted only once that Marv's user approves too (`Switchboard::grant`). If they don't, the message
+    /// goes on and is refused; the far end's answer is what the agent reads (`Err` from here).
+    async fn ask_for_wire(&self, receptacle: &ReceptacleName, mode: WireMode) -> Result<(), String> {
         if self.mesh.table().allows(&self.plug, receptacle, mode) {
-            return;
+            return Ok(());
         }
-        let Some(r) = self.mesh.receptacle(receptacle) else { return };
+        let Some(r) = self.mesh.lookup(receptacle).await else { return Ok(()) };
         let own = r.owner.as_ref() == Some(&self.plug) || receptacle.inbox_owner() == Some(self.plug.as_str());
-        let Some(approver) = self.approver.as_ref().filter(|_| r.supports(mode) && !own) else { return };
+        let Some(approver) = self.approver.as_ref().filter(|_| r.supports(mode) && !own) else { return Ok(()) };
         let request = WireRequest { from: self.plug.clone(), to: receptacle.clone(), mode, asked_by: self.plug.clone() };
-        if let Some(by) = approver.approve_wire(request.clone()).await {
-            // A refusal here (a self-wire) leaves it unwired: the switchboard says so.
-            let _ = self.mesh.wire(request.grant(by));
+        let Some(by) = approver.approve_wire(request.clone()).await else { return Ok(()) };
+        match self.mesh.grant(request, by).await {
+            Ok(()) => Ok(()),
+            // A self-wire leaves it unwired, and the switchboard says so; the far end saying no is said here.
+            Err(marv_mesh::MeshError::SelfWire(_)) => Ok(()),
+            Err(err) => Err(err.to_string()),
         }
     }
 }
@@ -331,8 +348,10 @@ impl Tool for MeshTool {
     }
     async fn run(&self, input: &Self::Input, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let target = self.target(input);
-        if let Some((receptacle, mode)) = &target {
-            self.ask_for_wire(receptacle, *mode).await;
+        if let Some((receptacle, mode)) = &target
+            && let Err(err) = self.ask_for_wire(receptacle, *mode).await
+        {
+            return Ok(ToolOutput::error(err));
         }
         let result = match PlugClient::connect(&self.socket).await {
             Ok(mut client) => marv_mesh::tools::run(&mut client, self.name, input).await,
