@@ -66,25 +66,26 @@ export function buildApprover(
 ): [{ (request: ApprovalRequest): Promise<Decision> } | undefined, string[]] {
   if (!names.length) return [undefined, []];
   const problems: string[] = [];
-  // Collect the scope-key prefixes each name maps to.
-  const matchPrefixes: string[] = [];
-  for (const name of names) {
-    if (APPROVE_PREFIXES[name]) {
-      matchPrefixes.push(...APPROVE_PREFIXES[name]);
-    } else {
-      // Also accept an exact scope key directly.
-      matchPrefixes.push(name);
-    }
-    if (!APPROVE_PREFIXES[name] && !ALL_APPROVE_NAMES.includes(name)) {
-      problems.push(`Unknown --approve scope "${name}". Known: ${ALL_APPROVE_NAMES.join(", ")}`);
-    }
-  }
+  const known = new Set(names.filter((n) => APPROVE_PREFIXES[n]));
+  // Anything else is an exact scope key: it approves that key and nothing more (never a prefix of others).
+  const exact = new Set(names.filter((n) => !APPROVE_PREFIXES[n]));
+  for (const name of exact) problems.push(`Unknown --approve scope "${name}". Known: ${ALL_APPROVE_NAMES.join(", ")}`);
+  // Prefixes for the names that aren't about bash's flags (web:, mcp:, files, memory, agent:worktree).
+  const prefixes = [...known].filter((n) => n !== "git_write" && n !== "network").flatMap((n) => APPROVE_PREFIXES[n]!);
   // Answer "yes" (not "always") so each call is asked individually, even for the same tool. Anything outside the
   // list is "unavailable", not "no": refused as an error the model can work around, as with no --approve at all,
   // rather than a decline that ends the turn.
   const approve = async (request: ApprovalRequest): Promise<Decision> => {
     const key = request.scope.key;
-    if (matchPrefixes.some((prefix) => key === prefix || key.startsWith(prefix))) return "yes" as const;
+    if (exact.has(key)) return "yes" as const;
+    // A bash call needs every door its flags open (bash:[net:][git:]<command>): git_write alone doesn't approve a
+    // command that also has network (curl … | sh with git_write: true), nor network alone a git write.
+    const flags = /^bash:(net:)?(git:)?/.exec(key);
+    if (flags) {
+      const needs = [...(flags[1] ? ["network"] : []), ...(flags[2] ? ["git_write"] : [])];
+      return needs.length > 0 && needs.every((n) => known.has(n)) ? ("yes" as const) : ("unavailable" as const);
+    }
+    if (prefixes.some((prefix) => key === prefix || key.startsWith(prefix))) return "yes" as const;
     return "unavailable" as const;
   };
   return [approve, problems];
