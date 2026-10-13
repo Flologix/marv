@@ -17,7 +17,7 @@ Spec: `tests/oracle/README.md`; Marv's `evals/run.ts` (the workspace setup), `ev
 | `evals/mcp/tracker.ts` | `tracker.rs` | **Done and tested:** all 25 tools, the specs byte for byte from the TypeScript's `tools/list`, answers as `JSON.stringify(…, null, 2)` in its key order, comments to `out.json` |
 | (new) | `lib.rs`, `main.rs`, `tests/oracle.rs` | **Done:** `check_all` (parallel), the `marv-oracle check\|record\|tracker` CLI, the ignored `oracle` test (`MARV_ORACLE_BIN`, `MARV_ORACLE_RECORD`), and checks that every recording is complete, keeps the prefix rule and holds no `.gitignore` |
 
-23 scenarios are recorded from TypeScript Marv (`7df450f`), which passes all of them. marv-rs fails all of them today: `marv -p` isn't ported (#11).
+28 scenarios are recorded from TypeScript Marv (`7df450f`), which passes all of them: all 17 of Marv's eval tasks and 11 loop edge cases. The `SECURITY.md` guards are #8. marv-rs fails all of them today: `marv -p` isn't ported (#11).
 
 ## Port notes
 
@@ -34,6 +34,7 @@ Spec: `tests/oracle/README.md`; Marv's `evals/run.ts` (the workspace setup), `ev
 - **`.gitignore` in a project** is stored as `gitignore.oracle` (in `project/` and `expect/files/`) and renamed by the runner: under its real name it would apply to this repository and hide the scenario's own files. The non-ignored test fails if one slips in.
 - **The tracker** is a subcommand of the `marv-oracle` binary (`marv-oracle tracker <data> <out>`), found next to the test (`target/<profile>/`). Its specs are the TypeScript tracker's `tools/list` answer, byte for byte (`tests/oracle/mcp/tracker-tools.json`). It doesn't validate arguments against the schemas, which the TypeScript's SDK does with zod; scripted calls send valid ones.
 - **Not planned: a declined approval.** `marv -p` never asks: with no `--approve`, a call outside yolo is refused ("there's no one to ask", `refused-approval`), and `--approve` answers "yes" or "unavailable", never "no". A decline only happens in the TUI.
+- **No test runs in the scripts.** The eval tasks' real models run `bun test`, but its output carries timings and Bun's version, which no normalization makes stable. The scripts read the tests instead, and use `git diff --stat` where a check is wanted.
 - **`.gitattributes`** in `tests/oracle/` turns off line-ending conversion, so the CRLF and trailing-space fixtures stay byte-exact.
 - **Output goes through `marv_core::printable()`**: diffs and stderr carry model and tool text.
 

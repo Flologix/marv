@@ -1,0 +1,8 @@
+// every caller
+{"tool_calls": [{"name": "grep", "arguments": {"pattern": "createServer\\("}}]}
+// the signature and the callers
+{"tool_calls": [{"name": "edit_file", "arguments": {"path": "src/server.js", "old_string": "export function createServer(port, host = \"localhost\") {", "new_string": "export function createServer({ port, host = \"localhost\" }) {"}}, {"name": "edit_file", "arguments": {"path": "src/main.js", "old_string": "createServer(Number(env.PORT ?? 3000), env.HOST ?? \"0.0.0.0\")", "new_string": "createServer({ port: Number(env.PORT ?? 3000), host: env.HOST ?? \"0.0.0.0\" })"}}, {"name": "edit_file", "arguments": {"path": "src/dev.js", "old_string": "createServer(5173)", "new_string": "createServer({ port: 5173 })"}}, {"name": "edit_file", "arguments": {"path": "scripts/smoke.js", "old_string": "[createServer(8080), createServer(8443, \"example.test\")]", "new_string": "[createServer({ port: 8080 }), createServer({ port: 8443, host: \"example.test\" })]"}}]}
+// check
+{"tool_calls": [{"name": "bash", "arguments": {"command": "git diff --stat"}}]}
+// done
+{"text": "`createServer` takes `{ port, host }` (host still defaults to \"localhost\"); `main`, `dev` and `scripts/smoke.js` pass an object."}

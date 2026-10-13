@@ -1,0 +1,4 @@
+{
+  "description": "One bug behind several failures: grep for the report's format, read the function, remove the filter that drops every other entry.",
+  "prompt": "`bun test` fails: the nightly report is missing entries. One bug in src/ is behind every failure. Fix the code, not the tests."
+}

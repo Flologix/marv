@@ -63,7 +63,7 @@ Each scenario is a directory under `scenarios/`:
 
 ## Scenarios
 
-Seeded from Marv's `evals/tasks/*` (the editing tasks, with a scripted model instead of a real one):
+All 17 of Marv's `evals/tasks/*`, with a scripted model instead of a real one. The scripts don't run `bun test`, as a real model would: its output carries timings and Bun's version. Reads, grep and `git diff` stand in for it.
 
 | Scenario | What it checks |
 |---|---|
@@ -73,6 +73,11 @@ Seeded from Marv's `evals/tasks/*` (the editing tasks, with a scripted model ins
 | `trailing-whitespace` | `old_string` without the file's trailing spaces still matches, and the file keeps them |
 | `json-edit` | glob, two reads in one step, an edit to JSON |
 | `rename-across-files` | grep, five `replace_all` edits in one step, grep again |
+| `add-feature` | a function from its doc comment: parallel reads, the body edited in (non-ASCII in `new_string`), the export added |
+| `fix-failing-test` | read the test and the code, fix the code |
+| `failing-suite` | one bug behind several failures: grep, a ranged read (`offset`/`limit`), one edit |
+| `long-file` | a file past `read_file`'s 400 lines: the read stops with a note, grep, a ranged read, a one-character fix |
+| `refactor-signature` | a signature change and its callers in `src/` and `scripts/`, then `git diff --stat` |
 | `ts-make-async` | a change that ripples through callers: parallel reads, a `write_file` rewrite, edits in several files per step |
 | `ts-rename-export` | a rename across five TypeScript files, then `git status` (the project has a `.gitignore`) |
 | `ts-required-field` | an `old_string` that isn't in the file gets the closest lines back; the retry lands |
@@ -97,6 +102,5 @@ The loop's edge cases:
 | `mid-turn-compaction` | a step past 85% of the context window triggers a summary request (same prefix), then the turn goes on from the summary |
 
 ## Still to write
-- `add-feature`, `fix-failing-test`, `failing-suite`, `long-file`, `refactor-signature` from Marv's evals.
-- Every guard in `docs/SECURITY.md`.
+- Every guard in `docs/SECURITY.md` (#8).
 - Not planned: a declined approval. `marv -p` never asks: with no `--approve` a call outside yolo is refused ("there's no one to ask", see `refused-approval`), and `--approve` answers "yes" or "unavailable", never "no". A decline needs the TUI.
