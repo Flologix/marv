@@ -180,7 +180,12 @@ export class McpOAuthProvider implements OAuthClientProvider {
   }
 
   saveDiscoveryState(state: OAuthDiscoveryState): Promise<void> {
-    return this.opts.store.update(this.opts.key, (e) => ({ ...e, server: this.opts.server, discovery: state }) as Login);
+    // As saveTokens: a cancelled login writes nothing, checked again once the file's lock is held.
+    if (this.opts.signal?.aborted) return Promise.reject(this.opts.signal.reason);
+    return this.opts.store.update(this.opts.key, (e) => {
+      this.opts.signal?.throwIfAborted();
+      return { ...e, server: this.opts.server, discovery: state } as Login;
+    });
   }
 
   async invalidateCredentials(scope: "all" | "client" | "tokens" | "verifier" | "discovery"): Promise<void> {
@@ -348,6 +353,11 @@ export async function probeLogin(
 /**
  * Revokes a login's refresh token (RFC 7009), best effort: "revoked", "unsupported" (the server lists no revocation
  * endpoint, so the grant stays on its side) or "failed".
+ *
+ * The endpoint isn't required to be on the authorization server's host: it comes from that server's own metadata
+ * (fetched by Marv during the login), and real providers put it elsewhere (Google: accounts.google.com issues,
+ * oauth2.googleapis.com/revoke revokes). The one way to point it somewhere else is to edit ~/.marv/mcp-tokens.json,
+ * and whoever can do that already holds the tokens it would send.
  */
 export async function revoke(login: Login, oauth: McpOAuthConfig | undefined, { timeoutMs = 5000 } = {}): Promise<"revoked" | "unsupported" | "failed"> {
   const meta = (login.discovery as { authorizationServerMetadata?: { revocation_endpoint?: string } } | undefined)?.authorizationServerMetadata;

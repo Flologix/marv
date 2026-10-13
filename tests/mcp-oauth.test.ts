@@ -249,3 +249,22 @@ test("probeLogin stops when the caller's signal does (Esc during /mcp add), not 
   expect(await probeLogin("https://mcp.example.com/mcp", { timeoutMs: 5000, fetchFn: hanging, signal: stop.signal })).toBe(false);
   expect(Date.now() - started).toBeLessThan(1000);
 });
+
+test("a cancelled login saves no discovery state either (like tokens and the client)", async () => {
+  const { McpOAuthProvider } = await import("../src/mcp/oauth.ts");
+  const { McpTokenStore } = await import("../src/mcp/oauth-store.ts");
+  const { mkdtempSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const dir = mkdtempSync(join(tmpdir(), "marv-disc-"));
+  try {
+    const store = new McpTokenStore(join(dir, "mcp-tokens.json"));
+    const stop = new AbortController();
+    const provider = new McpOAuthProvider({ store, key: "personal https://x/", server: "x", mode: "interactive", signal: stop.signal, onAuthorize: () => {} });
+    stop.abort(new Error("cancelled: /mcp logout"));
+    await expect(provider.saveDiscoveryState({ authorizationServerUrl: "https://auth.example/" } as never)).rejects.toThrow(/cancelled/);
+    expect(await store.get("personal https://x/")).toBeUndefined();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
