@@ -35,6 +35,8 @@ const TRACKER = join(import.meta.dir, "mcp", "tracker.ts");
 const MCP_DATA = join(import.meta.dir, "mcp", "data");
 /** Where the tracker's recorded comments go in the workspace, for the check (a task's solution/ has its own copy). */
 const COMMENTS = "__tracker_comments__.json";
+/** Where the model's final reply goes in the workspace, for a check that reads it (issue #50). */
+const REPLY_FILE = "__eval_reply__.md";
 const MCP_TOOLS = ["auto", "deferred", "eager"];
 
 /** A task's MCP server, from its mcp.json; undefined for a task without one. */
@@ -180,6 +182,9 @@ async function runOne({ model, task, rep }: { model: string; task: string; rep: 
   };
   // What happened, for reading a run afterwards: replies, and every tool call with (the start of) what it returned.
   const log: unknown[] = [];
+  // The model's final reply, written into the workspace for the check (a reply-reading task's check reads it there;
+  // REPLY_FILE, also excluded from the diff).
+  let reply = "";
   let timedOut = false;
   try {
     const session = await createSession({
@@ -196,7 +201,10 @@ async function runOne({ model, task, rep }: { model: string; task: string; rep: 
     try {
       for await (const event of session.send(readFileSync(join(TASKS, task, "task.md"), "utf8").trim())) {
         spent += eventCost(event);
-        if (event.type === "assistant") log.push({ assistant: event.text });
+        if (event.type === "assistant") {
+          reply = event.text;
+          log.push({ assistant: event.text });
+        }
         if (event.type === "error") {
           result.error = event.message;
           log.push({ error: event.message });
@@ -237,6 +245,7 @@ async function runOne({ model, task, rep }: { model: string; task: string; rep: 
     if (timedOut) result.reason = "timeout";
     // What the tracker recorded, over anything the model wrote under that name itself.
     if (tracker) writeFresh(join(dir, COMMENTS), existsSync(comments) ? readFileSync(comments) : "[]");
+    if (reply) writeFresh(join(dir, REPLY_FILE), reply);
     const checked = await check(dir, task);
     result.pass = checked.pass;
     if (!checked.pass) result.checkOutput = short(checked.output.slice(-2000), 2000);
@@ -244,7 +253,7 @@ async function runOne({ model, task, rep }: { model: string; task: string; rep: 
     result.error = (err as Error).message;
   } finally {
     result.ms = Date.now() - started;
-    const diff = Bun.spawnSync(["git", "diff", "HEAD", "--", ".", ":!__eval__.test.js", `:!${COMMENTS}`], { cwd: dir }).stdout.toString();
+    const diff = Bun.spawnSync(["git", "diff", "HEAD", "--", ".", ":!__eval__.test.js", `:!${COMMENTS}`, `:!${REPLY_FILE}`], { cwd: dir }).stdout.toString();
     mkdirSync(join(out, "logs", model.replace(/[^\w.-]+/g, "_")), { recursive: true });
     writeFileSync(join(out, "logs", model.replace(/[^\w.-]+/g, "_"), `${task}-${rep}.json`), JSON.stringify({ ...result, diff, log }, null, 2));
     rmSync(dir, { recursive: true, force: true });

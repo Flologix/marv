@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, realpathSync, mkdtempSync, rmSync, symlinkSync }
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { bash, formatOutput, looksLikeNetworkFailure, runCommand, touchesHiddenHome } from "../src/tools/bash.ts";
+import { backgroundsProcess, bash, formatOutput, looksLikeNetworkFailure, runCommand, touchesHiddenHome } from "../src/tools/bash.ts";
 import { hiddenPathFolders, sandboxArgs, sandboxAvailable } from "../src/sandbox.ts";
 
 describe("sandboxArgs", () => {
@@ -485,6 +485,49 @@ describe("bash's note about the blocked network", () => {
 
   test("isn't added without the sandbox, where the network isn't blocked", async () => {
     expect((await bash.run({ command: failing }, { root, sandbox: false })).output).not.toContain("Marv: ");
+  });
+});
+
+describe("backgroundsProcess / bash's note about a command's backgrounded processes", () => {
+  test("sees a trailing &, nohup, setsid, disown and serve/dev/start commands", () => {
+    expect(backgroundsProcess("node server.cjs &")).toBe(true);
+    expect(backgroundsProcess("nohup node server.cjs > log 2>&1")).toBe(true);
+    expect(backgroundsProcess("setsid nohup node server.cjs &")).toBe(true);
+    expect(backgroundsProcess("bun run dev & disown")).toBe(true);
+    expect(backgroundsProcess("bunx serve -l 4789")).toBe(true);
+    expect(backgroundsProcess("npm run dev")).toBe(true);
+  });
+
+  test("not for ordinary foreground commands", () => {
+    expect(backgroundsProcess("bun test")).toBe(false);
+    expect(backgroundsProcess("git push origin main")).toBe(false);
+    expect(backgroundsProcess("echo 'run it with &'")).toBe(false);
+    expect(backgroundsProcess("cat a && b")).toBe(false);
+    expect(backgroundsProcess("echo start; ls")).toBe(false);
+    // `wait` alone, or a comment after &, doesn't background anything; `wait` after a real & does.
+    expect(backgroundsProcess("echo done # not &")).toBe(false);
+    expect(backgroundsProcess("bun run dev & wait")).toBe(true);
+  });
+});
+
+describe("bash's note about a sandboxed command that backgrounded processes (issue #50)", () => {
+  let root: string;
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), "marv-bash-"));
+  });
+  afterEach(() => rm(root, { recursive: true, force: true }));
+
+  test.if(sandboxAvailable())("is added when a sandboxed command leaves processes in the background", async () => {
+    const result = await bash.run({ command: "echo started; sleep 30 &" }, { root, sandbox: true });
+    expect(result.output).toContain("Marv: ");
+    expect(result.output).toContain("stopped when the command ended");
+    expect(result.output.indexOf("started")).toBeLessThan(result.output.indexOf("Marv: "));
+    expect(result.summary).toBe("exit 0 · 1 line of output");
+  });
+
+  test.if(sandboxAvailable())("isn't added without the sandbox, or for a foreground command", async () => {
+    expect((await bash.run({ command: "echo started; true &" }, { root, sandbox: false })).output).not.toContain("Marv: ");
+    expect((await bash.run({ command: "echo started" }, { root, sandbox: true })).output).not.toContain("Marv: ");
   });
 });
 

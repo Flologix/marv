@@ -97,8 +97,46 @@ const GIT_HINT = "Marv: .git is read-only for commands that run without asking. 
 const HOME_NOTE =
   "Marv: in the sandbox the home folder is an empty stand-in: only toolchain folders (like ~/.bun, ~/.local/share/mise, ~/.asdf), git config and ~/.marv/skills show through, read-only. " +
   "Anything else there (Marv's own config, sessions and trajectories in ~/.marv included) is invisible, so a missing file or an empty folder under ~ says nothing about the real home folder.";
+/**
+ * Appended when a sandboxed command leaves processes running in the background: each command runs
+ * in its own PID namespace, so everything it started is killed when it ends, and (without network)
+ * its localhost isn't the user's anyway. A model started a dev server detached, curled it
+ * successfully inside the sandbox, and told the user "the server's up" with a dead link (issue #50).
+ */
+const BACKGROUND_NOTE =
+  "Marv: anything this command started in the background was stopped when the command ended, and a server in the sandbox can't be reached from the user's browser (the sandbox has its own network namespace; with network: true its localhost is the host's). " +
+  "Don't say a server is running for the user: to check one yourself, run it in the foreground within one command, query it there, and let the command end; to let the user try it, give them the command to run in their own terminal.";
 
 const WORD_START = String.raw`(?:^|[\s=:'"(<>;|&])`;
+/**
+ * Whether a command leaves processes running in the background, as far as its text can say: a
+ * background `&` (an unquoted one, outside `&&`), `nohup`/`setsid`/`disown`, or a command whose
+ * very job is to keep serving (`dev`, `start`, `serve` — as the command or a `run`/package-runner
+ * script, not as an argument like `echo start`). A guess, for the note below only.
+ */
+export function backgroundsProcess(command: string): boolean {
+  const clean = command
+    .replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, " ") // quoted text, including any & in it
+    .replace(/(^|\s)#[^\n]*/g, "$1") // comments
+    .replace(/&&/g, " ")
+    .replace(/(\d)>&(\d)/g, "$1=$2"); // 2>&1 isn't backgrounding
+  if (/(?:^|[\s;|])&(?=$|[\s#])/.test(clean)) return true;
+  return clean
+    .split(/[;|\n&]/)
+    .some((segment) => {
+      const words = segment.trim().split(/\s+/).filter(Boolean);
+      if (!words.length) return false;
+      const [head, second, third] = words;
+      if (head === undefined) return false;
+      if (/^(?:nohup|setsid|disown)$/.test(head)) return true;
+      if (/^(?:dev|start|serve)$/.test(head)) return true;
+      if (/^(?:npm|pnpm|yarn|bun|npx|bunx)$/.test(head)) {
+        if (second === "run") return /^(?:dev|start|serve)$/.test(third ?? "");
+        return /^(?:dev|start|serve)$/.test(second ?? "");
+      }
+      return false;
+    });
+}
 const WORD_END = String.raw`(?=$|[/\s'");|&<>])`;
 const PATH_REST = String.raw`([^\s'";|&<>()]*)`;
 const escapeRegex = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -356,6 +394,7 @@ export const bash: Tool<typeof input> = {
         ? "stopped"
         : `exit ${result.exitCode}${lines ? ` · ${lines} line${lines === 1 ? "" : "s"} of output` : ""}`;
     if (sandboxed && touchesHiddenHome(command, root, homedir())) result.output += `\n${HOME_NOTE}\n`;
+    if (sandboxed && backgroundsProcess(command)) result.output += `\n${BACKGROUND_NOTE}\n`;
     // Not for a command that isn't there (127) or can't run (126): the network has nothing to do with those.
     const failed = result.timedOut || (!result.aborted && result.exitCode !== 0 && result.exitCode !== 126 && result.exitCode !== 127);
     if (sandboxed && !network && failed && looksLikeNetworkFailure(command, result.output)) {

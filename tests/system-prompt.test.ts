@@ -73,6 +73,16 @@ describe("systemPrompt", () => {
     expect(prompt).toContain("/mcp search <words>");
   });
 
+  test("tells the model the sandbox kills a command's processes and hides its localhost (issue #50)", () => {
+    const prompt = systemPrompt({ cwd: "~/proj", date: DATE, tools: ["bash"] });
+    expect(prompt).toContain("ends when the command ends");
+    expect(prompt).toContain("localhost");
+    expect(prompt).toContain("don't say a server is running");
+    expect(prompt).toContain("run it yourself in your own terminal");
+    // Not for a session without bash (no sandbox to explain).
+    expect(systemPrompt({ cwd: "~/proj", date: DATE, tools: ["read_file"] })).not.toContain("ends with the command");
+  });
+
   test("is identical for identical inputs (the prompt cache depends on it)", () => {
     const args = { cwd: "~/proj", date: DATE, tools: ["read_file"], instructions: "x" };
     expect(systemPrompt(args)).toBe(systemPrompt({ ...args }));
