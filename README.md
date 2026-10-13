@@ -362,7 +362,7 @@ marv -p "audit the dependencies" --model "anthropic/claude-sonnet-5.5"
 
 **Approvals.** With nobody to ask, what yolo mode allows (sandboxed commands without network, edits outside `.git`,
 read-only tools) runs; everything else is refused as an error the model can read and work around. Pass
-`--approve <scope>` to allow more: e.g. `--approve git_write --approve network`. The model doesn't stop, a refused
+`--approve <scope>` to allow more: e.g. `--approve git_write --approve network`. A command that needs both (a `git push`) needs both named: `--approve git_write` alone never approves a command that also uses the network. The model doesn't stop, a refused
 call just returns an error.
 
 **Options for `-p`:**

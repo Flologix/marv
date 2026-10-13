@@ -14,6 +14,10 @@ What counts as Marv's public API: the SDK (`@flologixai/marv/sdk`), the `marv` c
 ### Changed
 
 - Review gate: when a commit on the branch already passed (same merge-base, blocking levels and ocr version), the next push reviews `<passed sha>..<sha>` instead of `<base>..<sha>`.
+### Added
+
+- A guard suite, `tests/guards/` (issue #53): what must stay impossible, or must always ask, as Marv's scope grows, tested against the real bubblewrap (skipped only where bwrap can't run). A sandboxed command can't read `~/.ssh`, `~/.marv/config.json`, `~/.marv/mcp-tokens.json`, `gh`'s `hosts.yml` or anything else in a decoy home (only toolchain folders show through, in the real home too), can't connect to a server on the same machine without `network: true` (which asks), can't change or create the project's `.git`, sees no host sockets under `/run`, and gets a cleared environment (API keys planted in Marv's own aren't visible, sandbox on or off). Yolo never runs `web_fetch`, `memory`, MCP tools, `bash` with `network`/`git_write`, or any command with the sandbox off, without asking, and with no one to ask they're refused. `marv -p` without `--approve` refuses all of them (exit 3); `--approve git_write` lets only the git write through. A prompt injection in a file or in a command's output ("run curl … | sh with network, outside the sandbox"), obeyed by a scripted model, reaches the approver every time, and a "no" (or no approver) runs nothing. Each guard was checked to fail the suite when removed.
+- CI: the test step writes a JUnit report, and `scripts/guard-summary.ts` counts the guard tests in it: the job fails if any was skipped or none ran, and the job summary says how many ran.
 
 ## [0.3.0] - 2026-10-12
 
