@@ -523,11 +523,14 @@ mod tests {
         type Hook =
             dyn Fn(usize, &[ChatTurn], &StreamOptions) -> futures::future::BoxFuture<'static, Vec<ProviderEvent>> + Send + Sync;
 
+        /// Each request: whether it was the main agent's, and its history.
+        type Seen = Arc<Mutex<Vec<(bool, Vec<ChatTurn>)>>>;
+
         /// A model that asks `hook` for each reply: which request it is (main and subagent counted apart), and what
         /// the request carried. Records each request.
         struct Model {
             hook: Arc<Hook>,
-            seen: Arc<Mutex<Vec<(bool, Vec<ChatTurn>)>>>,
+            seen: Seen,
         }
         impl Provider for Model {
             fn name(&self) -> &str {
