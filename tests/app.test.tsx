@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { existsSync, readdirSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { createServer } from "node:net";
 import { join } from "node:path";
 import { cleanup, render } from "ink-testing-library";
 import * as agentModule from "../src/agent.ts";
@@ -322,7 +323,7 @@ describe("App", () => {
     expect(frame).toContain("It says to remember the milk.");
     // The real tool ran on the project and its output went back to the model.
     expect(model.requests[1]!.history.at(-1)).toEqual({ role: "tool", callId: "c1", name: "read_file", text: "    1→remember the milk" });
-    expect(model.requests[0]!.options.tools!.map((t) => t.name)).toEqual(["read_file", "glob", "grep", "web_fetch", "edit_file", "write_file", "bash", "memory", "plan", "agent"]);
+    expect(model.requests[0]!.options.tools!.map((t) => t.name)).toEqual(["read_file", "glob", "grep", "web_fetch", "edit_file", "write_file", "bash", ...(sandboxAvailable() ? ["process"] : []), "memory", "plan", "agent"]);
   });
 
   describe("the plan (#15)", () => {
@@ -579,6 +580,35 @@ describe("App", () => {
       stdin.write(ENTER);
       await until(() => lastFrame()!.includes("Ran it."));
       expect(existsSync(join(project, "host-ran"))).toBe(true);
+    });
+
+    test.if(sandboxAvailable())("process start asks with the process door's warning; the status bar counts it; /processes lists and stops it (#51)", async () => {
+      const server = createServer();
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      const port = (server.address() as { port: number }).port;
+      await new Promise((resolve) => server.close(resolve));
+      const command = `/run/marv-bun -e 'Bun.serve({ port: ${port}, hostname: "127.0.0.1", fetch: () => new Response("app page") })'`;
+      const model = new ScriptedProvider([
+        [{ type: "tool_call", call: { id: "p1", name: "process", arguments: JSON.stringify({ action: "start", command, name: "web" }) } }, { type: "done" }],
+        reply("It's up."),
+      ]);
+      const { lastFrame, stdin } = renderApp(LOCAL, 0, undefined, () => model);
+      await type(stdin, "start the server");
+      await until(() => lastFrame()!.includes("Do you want to proceed?"));
+      expect(lastFrame()).toContain("Start a background process (web)");
+      expect(lastFrame()).toContain("Keeps running after this turn");
+      stdin.write(ENTER);
+      await until(() => lastFrame()!.includes("It's up."));
+      expect(lastFrame()).toContain("1 running");
+      expect(await (await fetch(`http://127.0.0.1:${port}/`)).text()).toBe("app page");
+      await type(stdin, "/processes");
+      await until(() => lastFrame()!.includes(`web: running · http://localhost:${port}`));
+      await type(stdin, "/processes stop web");
+      await until(() => lastFrame()!.includes("Stopped web."));
+      await until(() => !lastFrame()!.includes("1 running"));
+      await expect(fetch(`http://127.0.0.1:${port}/`)).rejects.toThrow();
+      await type(stdin, "/processes stop web");
+      await until(() => lastFrame()!.includes('No background process named "web"'));
     });
 
     test("/yolo off turns it off and saves it; then changes ask", async () => {

@@ -163,6 +163,8 @@ interface Props {
   openUrl?: (url: URL) => void;
   /** Hands cli.tsx a function to run before the process exits: saves the session and flushes the trajectory. */
   onFlush?: (flush: () => Promise<void>) => void;
+  /** Hands cli.tsx a function that stops the background processes (#51) on the way out: nothing outlives Marv. */
+  onStopProcesses?: (stop: () => Promise<void>) => void;
   /** Start by resuming: the latest session here (marv -c), or a picker (marv -r). */
   resume?: "latest" | "pick";
   /** Where memory lives, and what it held at startup. */
@@ -205,6 +207,7 @@ export function App({
   searchMcp,
   openUrl = defaultOpenUrl,
   onFlush,
+  onStopProcesses,
   resume,
   memory,
   agents = DEFAULT_AGENTS,
@@ -405,6 +408,8 @@ export function App({
         onWarning: (text) => addMessage({ role: "system", text, isError: true }),
       }),
   );
+  // Background processes running (#51), for the status bar; the session's onChange re-renders when one starts or ends.
+  const processesRunning = session.processes.filter((p) => p.state === "running").length;
   // The project checks' last pass, for /checks.
   const lastChecks = useRef<ProjectCheckResult | undefined>(undefined);
   // Settings changed (setup, /model, /think, /sandbox, /yolo, /trajectories, /diagnostics, /checks): the session uses them from its next turn.
@@ -850,6 +855,7 @@ export function App({
       trajectoriesPath: trajectories && shortenHome(join(trajectories.dir, projectKey(root))),
       mcp: { servers: mcp?.status() ?? [], problems: mcpProblems },
       checks: { ...checksOnDisk(root, text), last: lastChecks.current },
+      processes: session.processesOffered ? session.processes : undefined,
     });
     switch (action.type) {
       case "print":
@@ -881,6 +887,17 @@ export function App({
       case "compact":
         void compact(action.focus);
         break;
+      case "processes": {
+        const name = action.stop;
+        void session.stopProcess(name).then((stopped) =>
+          addMessage(
+            stopped
+              ? { role: "system", text: `Stopped ${name}.` }
+              : { role: "system", text: `No background process named "${name}". /processes lists them.`, isError: true },
+          ),
+        );
+        break;
+      }
       case "resume":
         void openPicker();
         break;
@@ -1316,6 +1333,9 @@ export function App({
   useEffect(() => {
     onFlush?.(() => session.flush());
   }, [onFlush, session]);
+  useEffect(() => {
+    onStopProcesses?.(() => session.stopProcesses());
+  }, [onStopProcesses, session]);
 
   const WORKING = "Marv is working: stop the current turn (Esc) before resuming another session.";
 
@@ -1538,7 +1558,7 @@ export function App({
               onCancel={cancelAll}
               escapeCancels={!view}
             />
-            <StatusBar model={session.providerName} cwd={cwd} confirmExit={false} notice={notice} busy agents={agentsRunning} yolo={config.yolo} viewing={Boolean(view)} />
+            <StatusBar model={session.providerName} cwd={cwd} confirmExit={false} notice={notice} busy agents={agentsRunning} processes={processesRunning} yolo={config.yolo} viewing={Boolean(view)} />
           </>
         ) : setupMode ? (
           <Setup
@@ -1567,6 +1587,7 @@ export function App({
               notice={notice}
               busy={busy}
               agents={agentsRunning}
+              processes={processesRunning}
               yolo={config.yolo}
               viewing={Boolean(view)}
             />

@@ -82,6 +82,9 @@ export function subagentContext(ctx: ToolContext, who: string, worktree?: Worktr
     readOnly: worktree ? [...(worktree.prefix ? [worktree.dir] : []), worktree.gitDir] : undefined,
     gitEnv: worktree && worktreeEnv(worktree),
     approve: subagentApprove(ctx.approve, who, Boolean(worktree) && sandboxed),
+    // Its sandboxed bash reaches the session's background processes like the main agent's (curl localhost:<port>);
+    // starting one is the main agent's alone (no processes, no doors).
+    forwards: ctx.forwards,
   };
 }
 

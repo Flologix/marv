@@ -6,6 +6,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
+import { sandboxAvailable } from "../src/sandbox.ts";
 import type { AgentEvent, Provider, ToolCall } from "../src/provider/types.ts";
 import type { ProviderFactory } from "../src/provider/factory.ts";
 import { MarvSession, type SessionEvent, type SessionInit } from "../src/session.ts";
@@ -145,6 +146,9 @@ describe("doors are the main agent's", () => {
       const session = makeSession(new ScriptedProvider([useTools(call("p", "probe")), say("Done.")]), { tools: [probe("probe")], hostCommands });
       await collect(session.send("go"));
     }
-    expect(seen).toEqual([{ host: false }, { host: true }]);
+    expect(seen).toEqual([
+      { host: false, process: sandboxAvailable() },
+      { host: true, process: sandboxAvailable() },
+    ]);
   });
 });
