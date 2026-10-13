@@ -10,6 +10,11 @@ import { bash } from "../src/tools/bash.ts";
 const DATE = new Date("2026-10-03T12:00:00Z");
 
 describe("systemPrompt", () => {
+  test("says to keep a plan only when the plan tool is offered (#15)", () => {
+    const sentence = "For a task with several steps, keep a plan with the plan tool and update it as you go.";
+    expect(systemPrompt({ cwd: "~/proj", date: DATE, tools: ["read_file", "plan"] })).toContain(sentence);
+    expect(systemPrompt({ cwd: "~/proj", date: DATE, tools: ["read_file"] })).not.toContain("plan tool");
+  });
   test("explains web_fetch when it's offered, and that what it returns is data", () => {
     const prompt = systemPrompt({ cwd: "~/proj", date: DATE, tools: ["read_file", "web_fetch"] });
     expect(prompt).toContain("# Web");

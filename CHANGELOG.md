@@ -6,6 +6,11 @@ What counts as Marv's public API: the SDK (`@flologixai/marv/sdk`), the `marv` c
 
 ## [Unreleased]
 
+### Added
+
+- The plan tool (issue #15): for a long task, the model keeps a checklist with `plan`, sending the whole list each time (items `pending`, `in_progress` or `done`, at most one in progress, at most 20). No approval: it changes nothing outside the session. The TUI pins it between the transcript and the prompt while something is left to do (`Plan 2/5`, at most 6 rows, the current item highlighted; hidden on windows under 20 rows), and each call is an ordinary transcript entry (`2/5 done`). The plan is saved with the session and restored by `/resume` and `marv -c`, dropped by `/clear`, and appended to the summary after a compaction, so what's left survives it. Main agent only: subagents get no plan tool. The prompt cache holds: the tool spec and the system prompt's one sentence are fixed per session, and the model sees the plan only through its own calls. SDK: option `plan` (default true; `false` leaves the tool out for the session), `session.plan`, `Resumed.plan`, the `PlanItem` type.
+- Evals: `--plan on|off`, two tasks where forgetting part of the request is the failure (`multi-ask`: five asks in one paragraph, a hidden test per ask; `callback-to-promise`: a callback API and its seven callers across five files, converted to async/await, with a compatibility wrapper), and new `RunResult` fields: `planCalls`, `planOpen` (the run answered with the plan unfinished), and `testsPassed`/`testsTotal` from the check's `bun test` summary for partial credit. `--report` shows a `tests` column, and `plan/run` and `plan open` when the runs recorded them.
+
 ## [0.3.0] - 2026-10-12
 
 Everything since 0.1.2: Sprints 1–3 (0.2.0 was never released on its own). Highlights: headless mode (`marv -p`), MCP servers installed with `/mcp add` and logged in with `/mcp login`, deferred MCP tool loading, project checks, tool-call repair, retries for dropped connections, a loop guard, and the step limit.

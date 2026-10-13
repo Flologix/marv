@@ -366,3 +366,18 @@ describe("MCP logins (#18)", () => {
     }
   });
 });
+
+test("plan: false leaves the plan tool out; by default it's offered and session.plan reads it (#15)", async () => {
+  const items = [{ text: "Step one", status: "in_progress" }];
+  const on = new ScriptedProvider([[{ type: "tool_call", call: { id: "p1", name: "plan", arguments: JSON.stringify({ items }) } }, { type: "done", reason: "tool_calls" }], say("Ok.")]);
+  const a = await createSession({ cwd: root, provider: on, configDir });
+  await collect(a.send("go"));
+  expect(on.requests[0]!.options.tools!.map((t) => t.name)).toContain("plan");
+  expect(a.plan).toEqual(items as sdk.PlanItem[]);
+  await a.close();
+  const off = new ScriptedProvider([say("Ok.")]);
+  const b = await createSession({ cwd: root, provider: off, configDir, plan: false });
+  await collect(b.send("go"));
+  expect(off.requests[0]!.options.tools!.map((t) => t.name)).not.toContain("plan");
+  await b.close();
+});

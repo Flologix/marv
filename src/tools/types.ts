@@ -95,6 +95,20 @@ export interface ToolContext {
    * baseline sees the project as it was. Never rejects.
    */
   beforeChange?: () => Promise<void>;
+  /** Where the plan tool keeps its list (#15). Only the main agent has one, so subagents have no plan. */
+  plan?: PlanHost;
+}
+
+/** One item of the plan tool's checklist; at most one is in_progress at a time (the current item). */
+export interface PlanItem {
+  text: string;
+  status: "pending" | "in_progress" | "done";
+}
+
+/** What the plan tool writes through: the session's state. */
+export interface PlanHost {
+  /** The whole list, replacing the previous one; empty clears the plan. */
+  set(items: PlanItem[]): void;
 }
 
 export interface ToolResult {
@@ -109,6 +123,8 @@ export interface ToolResult {
   diff?: DiffShown;
   /** The file a change wrote (with `diff`), relative to the project root: which project checks run after the step. */
   changed?: string;
+  /** The plan tool's list after the call, for the screen only (like `diff`: never sent to the model or a trajectory; the call already holds it). */
+  plan?: PlanItem[];
   isError?: boolean;
   /** The user said no: the agent stops so they can say what to do instead. */
   declined?: boolean;

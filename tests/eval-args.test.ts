@@ -27,3 +27,9 @@ test("a numeric option that isn't a number is an error, not a NaN", () => {
   expect(() => parseArgs(["--timeout", "abc"])).toThrow('--timeout takes a number, not "abc"');
   expect(() => parseArgs(["--repeat", "-1"])).toThrow("--repeat");
 });
+
+test("--plan takes on or off (#15), default on", () => {
+  expect(parseArgs(["--models", "a"]).plan).toBe("on");
+  expect(parseArgs(["--models", "a", "--plan", "off"]).plan).toBe("off");
+  expect(() => parseArgs(["--plan", "maybe"])).toThrow("--plan takes on or off");
+});

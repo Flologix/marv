@@ -15,6 +15,7 @@ import type { McpMode } from "./mcp/deferred.ts";
 import { legacyProjectKey, projectKey } from "./paths.ts";
 import { writePrivate } from "./private-file.ts";
 import type { ChatTurn } from "./provider/types.ts";
+import type { PlanItem } from "./tools/types.ts";
 import type { Message } from "./types.ts";
 import { emptyTotals, type Totals } from "./usage.ts";
 
@@ -47,6 +48,8 @@ export interface SavedSession {
   totals: Totals;
   /** The conversation's MCP mode and the tools it has been told about (#14); absent before a turn had MCP tools. Checked by the session on resume. */
   mcp?: { mode: McpMode; announced: string[] };
+  /** The plan tool's list (#15), when one is set. Checked by the session on resume: a bad one is dropped, not the session. */
+  plan?: PlanItem[];
 }
 
 export interface SessionSummary {

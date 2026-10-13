@@ -3,7 +3,7 @@
 //
 //   bun evals/run.ts --verify                         every check fails on the task's repo and passes with its solution
 //   bun evals/run.ts --models a,b --label baseline    each model on each task (OPENROUTER_API_KEY, or ~/.marv's key)
-//         [--tasks x,y] [--repeat 2] [--budget 1.50] [--concurrency 4] [--timeout 300] [--max-steps 50] [--diagnostics on|off]
+//         [--tasks x,y] [--repeat 2] [--budget 1.50] [--concurrency 4] [--timeout 300] [--max-steps 50] [--diagnostics on|off] [--plan on|off]
 //         [--mcp servers.json] [--mcp-tools auto|deferred|eager]   MCP servers for every run, and how they're offered (#14)
 //   bun evals/run.ts --report evals/results/a/results.jsonl evals/results/b/results.jsonl
 //
@@ -25,7 +25,7 @@ import { defaultConfigDir } from "../src/config/config.ts";
 import { sandboxAvailable } from "../src/sandbox.ts";
 import { createSession, type McpServerEntry } from "../src/sdk.ts";
 import { runCommand } from "../src/tools/bash.ts";
-import { eventCost, formatSummary, type RunResult } from "./summary.ts";
+import { eventCost, formatSummary, planOutcome, testCounts, type RunResult } from "./summary.ts";
 import { addTypeScript, ranTypecheck } from "./typescript.ts";
 
 const TASKS = join(import.meta.dir, "tasks");
@@ -119,6 +119,8 @@ const maxSteps = args.maxSteps;
 const diagnosticsOption = args.diagnostics;
 if (diagnosticsOption !== undefined && diagnosticsOption !== "on" && diagnosticsOption !== "off") throw new Error("--diagnostics takes on or off");
 const diagnostics = diagnosticsOption !== "off";
+// The plan tool (#15): on by default, as in the CLI; off for the comparison's other arm.
+const plan = args.plan !== "off";
 // MCP servers for every run (Claude Code's format, or the bare record), and how they're offered (#14).
 const mcpTools = args.mcpTools;
 if (mcpTools !== undefined && !MCP_TOOLS.includes(mcpTools)) throw new Error(`--mcp-tools takes ${MCP_TOOLS.join(", ")}`);
@@ -177,7 +179,9 @@ async function runOne({ model, task, rep }: { model: string; task: string; rep: 
     marv,
     diagnostics,
     ...(withMcp ? { mcpTools: mcpTools ?? "auto", mcpCalls: 0 } : {}),
+    plan,
   };
+  const planCalls: string[] = [];
   // What happened, for reading a run afterwards: replies, and every tool call with (the start of) what it returned.
   const log: unknown[] = [];
   let timedOut = false;
@@ -187,6 +191,7 @@ async function runOne({ model, task, rep }: { model: string; task: string; rep: 
       provider: { kind: "openrouter", apiKey, model },
       maxSteps,
       diagnostics,
+      plan,
       ...(withMcp ? { mcpServers, mcpTools: mcpTools as "auto" | "deferred" | "eager" | undefined } : {}),
     });
     const timer = setTimeout(() => {
@@ -219,6 +224,7 @@ async function runOne({ model, task, rep }: { model: string; task: string; rep: 
           if (/^Marv: .* doesn't parse/m.test(event.result.output)) result.syntaxNotes = (result.syntaxNotes ?? 0) + 1;
           if (name === "bash" && ranTypecheck(event.call.arguments)) result.ranTypecheck = true;
           if (name === "mcp_call" || name.startsWith("mcp__")) result.mcpCalls = (result.mcpCalls ?? 0) + 1;
+          if (name === "plan") planCalls.push(event.call.arguments);
           log.push({ tool: name, args: event.call.arguments, isError: event.result.isError ?? false, output: short(event.result.output, 3000) });
         }
       }
@@ -235,10 +241,12 @@ async function runOne({ model, task, rep }: { model: string; task: string; rep: 
       await session.close();
     }
     if (timedOut) result.reason = "timeout";
+    if (plan) Object.assign(result, planOutcome(planCalls, result.reason));
     // What the tracker recorded, over anything the model wrote under that name itself.
     if (tracker) writeFresh(join(dir, COMMENTS), existsSync(comments) ? readFileSync(comments) : "[]");
     const checked = await check(dir, task);
     result.pass = checked.pass;
+    Object.assign(result, testCounts(checked.output));
     if (!checked.pass) result.checkOutput = short(checked.output.slice(-2000), 2000);
   } catch (err) {
     result.error = (err as Error).message;
@@ -273,7 +281,7 @@ async function worker() {
 }
 
 console.log(
-  `${jobs.length} runs (${models.length} models × ${tasks.length} tasks × ${repeat}), budget $${budget}, ${maxSteps} steps, diagnostics ${diagnostics ? "on" : "off"}` +
+  `${jobs.length} runs (${models.length} models × ${tasks.length} tasks × ${repeat}), budget $${budget}, ${maxSteps} steps, diagnostics ${diagnostics ? "on" : "off"}, plan ${plan ? "on" : "off"}` +
     `${mcpTools ? `, MCP tools ${mcpTools}` : ""}, Marv ${marv} → ${out}`,
 );
 await Promise.all(Array.from({ length: Math.min(concurrency, jobs.length) }, worker));
