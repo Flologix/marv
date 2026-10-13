@@ -15,6 +15,8 @@
 //! middle/right are ignored, modifiers stripped). The SGR cases in `mouse.test.ts` become tests of
 //! [`from_crossterm`].
 
+use crossterm::event::{MouseButton, MouseEventKind};
+
 /// Turns on 1002 + 1006 (written raw by `render_options::TerminalGuard`; see why there).
 pub const MOUSE_ON: &str = "\x1b[?1002h\x1b[?1006h";
 /// Turns them off again, in reverse order.
@@ -45,8 +47,78 @@ pub enum MouseEvent {
 }
 
 /// Marv's view of a crossterm mouse event: wheel notches and the left button; None for the rest
-/// (middle/right buttons, plain motion, horizontal wheel).
+/// (middle/right buttons, plain motion, horizontal wheel). crossterm's cells are already 0-based
+/// (Marv subtracted 1 from the SGR column and row), and modifiers are ignored.
 pub fn from_crossterm(event: crossterm::event::MouseEvent) -> Option<MouseEvent> {
-    let _ = event;
-    todo!("port: decode() from mouse.ts over crossterm::event::MouseEventKind (left button only, wheel = Scroll)")
+    let (x, y) = (event.column, event.row);
+    match event.kind {
+        MouseEventKind::ScrollUp => Some(MouseEvent::Scroll { step: -1 }),
+        MouseEventKind::ScrollDown => Some(MouseEvent::Scroll { step: 1 }),
+        MouseEventKind::Down(MouseButton::Left) => Some(MouseEvent::Press { x, y }),
+        MouseEventKind::Drag(MouseButton::Left) => Some(MouseEvent::Drag { x, y }),
+        MouseEventKind::Up(MouseButton::Left) => Some(MouseEvent::Release { x, y }),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyModifiers, MouseEvent as Raw};
+
+    fn raw(kind: MouseEventKind, column: u16, row: u16, modifiers: KeyModifiers) -> Raw {
+        Raw { kind, column, row, modifiers }
+    }
+
+    #[test]
+    fn turns_wheel_events_into_scroll_steps_negative_is_up() {
+        let none = KeyModifiers::NONE;
+        let got: Vec<_> = [MouseEventKind::ScrollUp, MouseEventKind::ScrollUp, MouseEventKind::ScrollDown]
+            .into_iter()
+            .filter_map(|k| from_crossterm(raw(k, 9, 4, none)))
+            .collect();
+        assert_eq!(got, [MouseEvent::Scroll { step: -1 }, MouseEvent::Scroll { step: -1 }, MouseEvent::Scroll { step: 1 }]);
+    }
+
+    #[test]
+    fn reports_left_button_press_drag_and_release_with_0_based_cells() {
+        // SGR "\x1b[<0;3;4M\x1b[<32;7;4M\x1b[<0;9;5m": crossterm already makes these 0-based.
+        let none = KeyModifiers::NONE;
+        let got: Vec<_> = [
+            raw(MouseEventKind::Down(MouseButton::Left), 2, 3, none),
+            raw(MouseEventKind::Drag(MouseButton::Left), 6, 3, none),
+            raw(MouseEventKind::Up(MouseButton::Left), 8, 4, none),
+        ]
+        .into_iter()
+        .filter_map(from_crossterm)
+        .collect();
+        assert_eq!(got, [MouseEvent::Press { x: 2, y: 3 }, MouseEvent::Drag { x: 6, y: 3 }, MouseEvent::Release { x: 8, y: 4 }]);
+    }
+
+    #[test]
+    fn ignores_middle_and_right_buttons_and_plain_motion() {
+        let none = KeyModifiers::NONE;
+        for kind in [
+            MouseEventKind::Down(MouseButton::Middle),
+            MouseEventKind::Down(MouseButton::Right),
+            MouseEventKind::Up(MouseButton::Right),
+            MouseEventKind::Drag(MouseButton::Right),
+            MouseEventKind::Moved,
+            MouseEventKind::ScrollLeft,
+            MouseEventKind::ScrollRight,
+        ] {
+            assert_eq!(from_crossterm(raw(kind, 2, 3, none)), None, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn still_recognizes_events_with_modifier_keys_held() {
+        // SGR 80 = wheel up + ctrl; 16 = left press + ctrl.
+        let ctrl = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+        assert_eq!(from_crossterm(raw(MouseEventKind::ScrollUp, 0, 0, ctrl)), Some(MouseEvent::Scroll { step: -1 }));
+        assert_eq!(
+            from_crossterm(raw(MouseEventKind::Down(MouseButton::Left), 0, 0, ctrl)),
+            Some(MouseEvent::Press { x: 0, y: 0 })
+        );
+    }
 }
