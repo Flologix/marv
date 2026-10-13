@@ -28,6 +28,7 @@ pub mod jsonrpc;
 pub mod manager;
 pub mod oauth;
 pub mod oauth_store;
+pub mod ordered;
 pub mod personal_file;
 pub mod tool;
 pub mod trust;

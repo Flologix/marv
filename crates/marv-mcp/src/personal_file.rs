@@ -13,118 +13,13 @@
 
 use std::path::{Path, PathBuf};
 
-use serde::de::{Deserializer, MapAccess, SeqAccess, Visitor};
-use serde::ser::{SerializeMap, SerializeSeq, Serializer};
-use serde::{Deserialize, Serialize};
-use serde_json::{Number, Value};
+use serde_json::Value;
 
 use crate::config::{PERSONAL_FILE, check_entry};
+use crate::ordered::Ordered;
 
 pub fn personal_file(config_dir: &Path) -> PathBuf {
     config_dir.join(PERSONAL_FILE)
-}
-
-/// JSON with every object's key order kept (marv-rs): serde_json's `Value`
-/// sorts keys (its `preserve_order` feature would change hashing elsewhere, the
-/// trust keys among them), and a write must not reorder the user's file.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Ordered {
-    Null,
-    Bool(bool),
-    Number(Number),
-    String(String),
-    Array(Vec<Ordered>),
-    Object(Vec<(String, Ordered)>),
-}
-
-impl Ordered {
-    fn from_value(v: Value) -> Ordered {
-        match v {
-            Value::Null => Ordered::Null,
-            Value::Bool(b) => Ordered::Bool(b),
-            Value::Number(n) => Ordered::Number(n),
-            Value::String(s) => Ordered::String(s),
-            Value::Array(a) => Ordered::Array(a.into_iter().map(Ordered::from_value).collect()),
-            Value::Object(o) => Ordered::Object(o.into_iter().map(|(k, v)| (k, Ordered::from_value(v))).collect()),
-        }
-    }
-}
-
-impl Serialize for Ordered {
-    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        match self {
-            Ordered::Null => s.serialize_unit(),
-            Ordered::Bool(b) => s.serialize_bool(*b),
-            Ordered::Number(n) => n.serialize(s),
-            Ordered::String(t) => s.serialize_str(t),
-            Ordered::Array(items) => {
-                let mut seq = s.serialize_seq(Some(items.len()))?;
-                for item in items {
-                    seq.serialize_element(item)?;
-                }
-                seq.end()
-            }
-            Ordered::Object(fields) => {
-                let mut map = s.serialize_map(Some(fields.len()))?;
-                for (k, v) in fields {
-                    map.serialize_entry(k, v)?;
-                }
-                map.end()
-            }
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for Ordered {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        struct V;
-        impl<'de> Visitor<'de> for V {
-            type Value = Ordered;
-            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("JSON")
-            }
-            fn visit_unit<E>(self) -> Result<Ordered, E> {
-                Ok(Ordered::Null)
-            }
-            fn visit_bool<E>(self, b: bool) -> Result<Ordered, E> {
-                Ok(Ordered::Bool(b))
-            }
-            fn visit_i64<E>(self, n: i64) -> Result<Ordered, E> {
-                Ok(Ordered::Number(n.into()))
-            }
-            fn visit_u64<E>(self, n: u64) -> Result<Ordered, E> {
-                Ok(Ordered::Number(n.into()))
-            }
-            fn visit_f64<E>(self, n: f64) -> Result<Ordered, E> {
-                Ok(Number::from_f64(n).map_or(Ordered::Null, Ordered::Number))
-            }
-            fn visit_str<E>(self, t: &str) -> Result<Ordered, E> {
-                Ok(Ordered::String(t.to_string()))
-            }
-            fn visit_string<E>(self, t: String) -> Result<Ordered, E> {
-                Ok(Ordered::String(t))
-            }
-            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Ordered, A::Error> {
-                let mut items = Vec::new();
-                while let Some(item) = seq.next_element()? {
-                    items.push(item);
-                }
-                Ok(Ordered::Array(items))
-            }
-            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Ordered, A::Error> {
-                let mut fields: Vec<(String, Ordered)> = Vec::new();
-                while let Some((k, v)) = map.next_entry::<String, Ordered>()? {
-                    // A repeated key: the last one counts, as in JSON.parse.
-                    match fields.iter_mut().find(|(key, _)| *key == k) {
-                        Some(slot) => slot.1 = v,
-                        None => fields.push((k, v)),
-                    }
-                }
-                Ok(Ordered::Object(fields))
-            }
-        }
-        d.deserialize_any(V)
-    }
 }
 
 /// The file's top-level object, in its key order.

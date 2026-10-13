@@ -473,7 +473,10 @@ fn well_known(base: &Url, name: &str, path: &str) -> Option<Url> {
 
 /// RFC 9728 protected-resource metadata: from the URL a 401 named, else the
 /// well-known URL for the server's path, then for its root.
-pub async fn discover_resource_metadata(server: &Url, named: Option<&Url>) -> Result<Option<(Url, Map<String, Value>)>, reqwest::Error> {
+pub async fn discover_resource_metadata(
+    server: &Url,
+    named: Option<&Url>,
+) -> Result<Option<(Url, Map<String, Value>)>, reqwest::Error> {
     let candidates: Vec<Url> = match named {
         Some(url) => vec![url.clone()],
         None => {
@@ -526,7 +529,11 @@ impl From<McpError> for TokenFailure {
 }
 
 /// A token endpoint request (the code exchange or a refresh), authenticated as the client.
-async fn token_request(endpoint: &Url, client: &StoredClient, mut form: Vec<(&str, String)>) -> Result<StoredTokens, TokenFailure> {
+async fn token_request(
+    endpoint: &Url,
+    client: &StoredClient,
+    mut form: Vec<(&str, String)>,
+) -> Result<StoredTokens, TokenFailure> {
     form.push(("client_id", client.client_id.clone()));
     if let Some(secret) = client.rest.get("client_secret").and_then(Value::as_str) {
         form.push(("client_secret", secret.to_string()));
@@ -554,7 +561,9 @@ async fn token_request(endpoint: &Url, client: &StoredClient, mut form: Vec<(&st
 fn token_error(failure: TokenFailure) -> McpError {
     match failure {
         // The server's code only (a short word), never its description.
-        TokenFailure::OAuth(code) => McpError::Server(format!("the authorization server refused: {}", crate::text::truncate(&code, 64))),
+        TokenFailure::OAuth(code) => {
+            McpError::Server(format!("the authorization server refused: {}", crate::text::truncate(&code, 64)))
+        }
         TokenFailure::Other(e) => e,
     }
 }
@@ -570,12 +579,18 @@ fn endpoint(meta: &Map<String, Value>, name: &str, issuer: &Url, fallback: &str)
 /// in the store), the client (configured, stored, or registered: interactive
 /// only), then the code exchange when `code` is given, else a refresh when
 /// there's a refresh token, else the authorization redirect (PKCE S256).
-pub async fn auth(p: &mut McpOAuthProvider, server: &Url, named_metadata: Option<&Url>, code: Option<&str>) -> crate::Result<AuthResult> {
+pub async fn auth(
+    p: &mut McpOAuthProvider,
+    server: &Url,
+    named_metadata: Option<&Url>,
+    code: Option<&str>,
+) -> crate::Result<AuthResult> {
     let net = |e: reqwest::Error| McpError::Server(format!("the login's discovery failed: {e}"));
     let cached = p.discovery_state().filter(|d| d.rest.contains_key("authorizationServerMetadata"));
     let (issuer, resource_meta, server_meta) = match cached {
         Some(d) => {
-            let issuer = Url::parse(&d.authorization_server_url).map_err(|_| McpError::Server("stored discovery is broken".into()))?;
+            let issuer =
+                Url::parse(&d.authorization_server_url).map_err(|_| McpError::Server("stored discovery is broken".into()))?;
             let object = |k: &str| d.rest.get(k).and_then(Value::as_object).cloned();
             (issuer, object("resourceMetadata"), object("authorizationServerMetadata").unwrap_or_default())
         }
