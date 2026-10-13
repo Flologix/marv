@@ -138,6 +138,8 @@ interface ReviewOutcome {
 const runReview = (from: string, to: string): ReviewOutcome => {
   const run = spawnSync("ocr", ["review", "--from", from, "--to", to, "--format", "json", "--audience", "agent", "--exclude", EXCLUDE], {
     encoding: "utf8",
+    // No stdin: run in the background, the gate's own stdin may be a closed pipe, and ocr died of it (exit 141).
+    stdio: ["ignore", "pipe", "pipe"],
     maxBuffer: 64 * 1024 * 1024,
     timeout: TIMEOUT_S * 1000,
   });
