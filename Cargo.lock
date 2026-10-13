@@ -1422,10 +1422,14 @@ name = "marv-mcp"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "futures",
+ "getrandom 0.3.4",
  "marv-core",
  "marv-fs",
+ "marv-oracle",
  "marv-sandbox",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",

@@ -34,6 +34,25 @@ pub mod trust;
 
 mod text;
 
+#[cfg(test)]
+pub(crate) mod testutil {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A fresh, empty folder under the system temp dir (left for the OS to clean).
+    pub fn temp_dir(tag: &str) -> PathBuf {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "marv-mcp-{tag}-{}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst),
+            marv_fs::random_hex()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+}
+
 /// What MCP code reports. Messages are Marv's own sentences: the model or the
 /// user reads them as they are.
 #[derive(Debug, thiserror::Error)]
