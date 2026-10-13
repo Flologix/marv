@@ -170,7 +170,7 @@ impl McpTokenStore {
     /// the file lock; refuses with [`UnusableTokenStore`] rather than write over
     /// a file it can't read.
     pub async fn update(&self, _key: &str, _f: impl FnOnce(Option<Login>) -> Option<Login> + Send) -> crate::Result<()> {
-        todo!("port: McpTokenStore.update (withFileLock, read, refuse unusable, writePrivate)")
+        todo!("port: McpTokenStore.update (marv_fs::with_file_lock, read, refuse unusable, marv_fs::write_private)")
     }
 
     pub async fn remove(&self, key: &str) -> crate::Result<()> {

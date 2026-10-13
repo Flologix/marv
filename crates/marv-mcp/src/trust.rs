@@ -52,7 +52,7 @@ impl McpTrust {
     /// Adds `servers`' keys to the project's list (no duplicates), written 0600
     /// through the private-file writer (Marv's `writePrivate`).
     pub fn trust(&self, _project_key: &str, _servers: &[McpServerConfig]) -> crate::Result<()> {
-        todo!("port: McpTrust.trust (read, merge keys as a set, writePrivate 0600 in a 0700 folder)")
+        todo!("port: McpTrust.trust (read, merge keys as a set, marv_fs::write_private 0600 in a 0700 folder)")
     }
 }
 

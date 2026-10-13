@@ -692,7 +692,7 @@ impl MarvSession {
         }
         // Servers removed with /mcp remove kept their tools listed for the old conversation's sake; not for this one.
         if let Some(mcp) = &self.inner.init.mcp {
-            mcp.write().await.forget_removed();
+            mcp.forget_removed();
         }
         let system = self.build_system();
         self.state().system = system;
@@ -883,7 +883,7 @@ impl MarvSession {
         if self.inner.init.owns_mcp
             && let Some(mcp) = &self.inner.init.mcp
         {
-            mcp.write().await.close().await;
+            mcp.close().await;
         }
     }
 

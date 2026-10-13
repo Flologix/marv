@@ -22,10 +22,9 @@ use marv_tools::{Preview, Scope, Tool, ToolContext, ToolError, ToolOutput};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-/// The session's MCP servers. `McpManager`'s lifecycle methods take `&mut self` and `ready()` is async, so it's shared
-/// behind an async lock (upstream gap: an internally synchronized manager would let `/mcp` read status while a turn
-/// waits for `ready()`).
-pub type McpHandle = Arc<tokio::sync::RwLock<McpManager>>;
+/// The session's MCP servers. `McpManager` synchronizes itself (`&self` methods), so `/mcp` reads its status while a
+/// turn waits on `ready()`.
+pub type McpHandle = Arc<McpManager>;
 
 /// One MCP tool as a Marv tool.
 pub struct McpToolAdapter {
