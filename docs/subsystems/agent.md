@@ -8,7 +8,7 @@ Spec: Marv `CLAUDE.md` bullets **Agent loop** and **Compaction**, `src/agent.ts`
 
 | Marv (TS) | Rust module | Status |
 |---|---|---|
-| `src/agent.ts` | `agent.rs` | Constants and notes (verbatim) ported. Ported and tested: `answer_all_calls`, `agent_label`, `agent_args`, `label_of`, `used_ids`/`make_ids_unique`, `call_groups`, `StepReply` (stream fold and outcome), `EmptyNext`, the step-limit helpers, and the `Drop` guard. **The loop body (`LoopState::advance`) is todo.** |
+| `src/agent.ts` | `agent.rs` | Constants and notes (verbatim) ported. ported, all of `tests/agent.test.ts` ported (against `ScriptedProvider` and a fake `ToolRunner`), plus tests for #58 default grouping, #59 wrap-up and `on_full` |
 | `src/repetition.ts` | `repetition.rs` | ported, all tests ported |
 | `src/compact.ts` | `compact.rs` | `summarize`, `summary_request`, `compacted_history`, `MID_TURN_NOTE` ported, tests ported; v2 (#63) helpers todo |
 | `tests/fake-provider.ts` | `testing.rs` (`ScriptedProvider`, test-only) | ported (scripted replies + recorded requests) |
@@ -58,16 +58,10 @@ pub type RewriteCall = Arc<dyn Fn(&ToolCall) -> Option<ToolCall> + Send + Sync>;
 - **Text-loop check:** every 400 *bytes* of text while streaming (Marv counts UTF-16 units), and once at the end. The repetition thresholds count `char`s. `StepReply::apply` resets the check position on `Retry` too; Marv didn't (a harmless lag), and this is noted in the module doc.
 - **Result hashes** for tool-loop detection use `std::hash::DefaultHasher` (Marv: `Bun.hash`). They're only compared within one run.
 - **Tool-loop keys** are canonical JSON with keys sorted at every depth, printed by hand so serde_json's `preserve_order` feature can't change them.
-- **Port these tests next** with `ScriptedProvider` and a fake `ToolRunner`, from `tests/agent.test.ts`:
-  - every request extends the previous one;
-  - the step limit and `on_limit`;
-  - unique ids end to end;
-  - interrupt and decline in groups;
-  - empty replies and cut-offs;
-  - `after_step` ordering;
-  - text and tool loops;
-  - `rewrite_call`;
-  - parallel order and the `MAX_PARALLEL` cap.
+- **One transition per `advance()`.** Phases: `Top` (step limit) → `Request` → `Streaming` → decide → `Tools` → `Full` (`on_full`) → `AfterStep`. `next_event` loops `advance` until something is queued, so nothing after an event happens before the consumer pulls again (e.g. no request after a `StepLimit` it stopped at).
+- **A group mirrors Marv's `runGroup`:** reserved calls queue a `GroupEvent::Start`; delivering it queues the `ToolStart` and marks the call `announced`; the next `advance` launches it and polls it once (`now_or_never`), so a cancel or approval inside the tool happens before the next `ToolStart` is considered. A `Start` delivered after a cancel or "no" becomes `ToolSkipped`.
+- **Kept from Marv as is** (worth a look, not changed here): a reply with calls that ends in a provider `Error` puts its calls in the history unanswered (the session's `answer_all_calls` covers saving), and the second tool loop answers its calls with `not_run::CUT_OFF`'s text.
+- **Tests:** `ScriptedProvider` replies with an empty `Done` after its script (Marv: "(script ended)"), so a test that runs past its script sees empty-reply retries first; the tests that count requests script their last reply.
 - **Two compaction failure rules live in the session** (`midTurnCompactFailed`): a summary that failed mid-turn isn't asked for again that turn, and Esc during the summary stops the turn (the loop checks for abort right after `on_full`).
 
 ## Planned improvements (Marv issues)
@@ -78,9 +72,9 @@ pub type RewriteCall = Arc<dyn Fn(&ToolCall) -> Option<ToolCall> + Send + Sync>;
   - Results are still appended in call order.
   - Out of scope: starting tools while the reply is still streaming.
 - **#57 reasoning round-trip:** `StepReply` keeps `ProviderEvent::Reasoning` and puts it on the assistant `ChatTurn` (tested). Sessions must save and restore it; old sessions without it still load (`#[serde(default)]` in marv-core).
-- **#59 wrap-up at the step limit:**
+- **#59 wrap-up at the step limit (done):**
   - With `wrap_up_at_limit`, a hard stop (no `on_limit`, or `Unavailable`) first sends `STEP_LIMIT_NOTE` with `ToolChoice::None`. Tools are still sent, so the cached prefix holds.
-  - Any call the reply makes anyway is answered "Not run".
+  - Any call the reply makes anyway is answered `not_run::STEP_LIMIT`. An `on_limit` "no" (`Stop`) gets no wrap-up.
   - The run still ends `Done(MaxSteps)`, so headless still exits 2.
 - **#64 continue after a dropped stream:**
   - `LoopEvent::Retry { continued }` is in place. When the provider signals a continuable drop, keep the partial text as the assistant turn and append `DROPPED_STREAM_NOTE` instead of discarding it.
