@@ -9,6 +9,7 @@
 //   2 — stopped: max steps, output limit, or loop (no final answer)
 //   3 — approval needed but couldn't get it (refused or declined/interrupted)
 import { ConfigError, ConfigStore, defaultConfigDir, migrateLegacyConfig, resolveConfig } from "./config/config.ts";
+import { TUI_HINTS } from "./provider/errors.ts";
 import { createSession, type SessionEvent, type ApprovalRequest, type Decision, type ProviderOption } from "./sdk.ts";
 import { TrajectoryStore } from "./trajectory.ts";
 
@@ -165,6 +166,9 @@ export async function runHeadless(options: HeadlessOptions): Promise<number> {
       configDir,
       mcpTools: config.mcpTools,
       resume: options.resume,
+      // A CLI user runs marv, not createSession(): a bad key should point at /setup or OPENROUTER_API_KEY, as the
+      // TUI does (issue #54).
+      errorHints: TUI_HINTS,
       // To stderr, so stdout stays the reply (or JSON): an MCP server that needs a login (/mcp login in the TUI), a
       // trajectory that can't be written.
       onWarning: (text) => console.error(`marv: ${text}`),
