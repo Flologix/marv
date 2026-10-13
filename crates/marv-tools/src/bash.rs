@@ -19,6 +19,11 @@
 //! - Scope `bash:[net:][git:]<command>` ("this exact command"); `auto_safe` only sandboxed, without network or
 //!   `git_write`. The description tells the model not to write files with heredocs: a model put the terminator on the
 //!   same line as `&& …`, read bash's warning as truncation, and retried for 10 steps.
+//! - marv-rs: protected files (docs/SECURITY.md). Existing ones are mounted read-only by the sandbox at any level; a
+//!   command that runs without asking also sees nested `.git` folders read-only. bwrap can only mount what exists, so
+//!   a sandboxed command's *new* protected files (a `.envrc`, a nested `AGENTS.md`) are found by a scan after it
+//!   (`protected_snapshot` before, `scan_created` after the placeholders are gone), removed and reported in a
+//!   `Marv:` note. A new `.git` is kept when the user approved a `git_write` command (`git init`, a submodule).
 //! - marv-rs: `uses_network` calls ask after taint even in yolo; the approval for a network command will list the
 //!   scripts written this session that the command runs (docs/SECURITY.md).
 
@@ -35,6 +40,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use marv_sandbox::git_guard::{GitGuard, git_guard, worktree_git};
 use marv_sandbox::notes::{GH_NOTE, GIT_HINT, HOME_NOTE, NETWORK_NOTE, looks_like_network_failure, runs_gh, touches_hidden_home};
 use marv_sandbox::paths::is_inside;
+use marv_sandbox::protected::{ProtectedRule, created_note, nested_git_dirs, protected_snapshot, revert_created, scan_created};
 
 use crate::output::cut_for_model;
 use crate::repair::repair_timeout_field;
@@ -307,6 +313,12 @@ impl Tool for Bash {
         let sandboxed = ctx.sandbox.active();
         let mut read_only = ctx.read_only.clone();
         read_only.extend(guard.read_only);
+        // A vendored repository's .git runs its config and hooks when the user works there, like the project's own.
+        if ctx.confined && sandboxed {
+            read_only.extend(nested_git_dirs(&ctx.root));
+        }
+        // What's protected now, to find what the command adds (bwrap can only mount what exists).
+        let before = sandboxed.then(|| protected_snapshot(&ctx.root));
         let options = RunOptions {
             command: input.command.clone(),
             root: ctx.root.clone(),
@@ -322,6 +334,18 @@ impl Tool for Bash {
         // bwrap leaves a placeholder's empty mount point; remove_dir only removes it while it's empty.
         for path in &guard.placeholders {
             let _ = tokio::fs::remove_dir(path).await;
+        }
+        // After the placeholders are gone: an empty .git mount point left behind would read as created.
+        if let Some(before) = &before {
+            let mut created = scan_created(&ctx.root, before);
+            // A repository an approved git_write command made (`git init`, a submodule) is the user's to keep.
+            if input.git_write.unwrap_or(false) && !ctx.confined {
+                created.retain(|c| c.rule != ProtectedRule::GitDir);
+            }
+            revert_created(&ctx.root, &mut created);
+            if let Some(note) = created_note(&created) {
+                result.output.push_str(&format!("\n{note}\n"));
+            }
         }
         if ctx.confined && GIT_READ_ONLY.is_match(&result.output) {
             result.output.push_str(&format!("\n{GIT_HINT}\n"));
@@ -492,6 +516,49 @@ mod tests {
         assert!(!result.output.contains("DOCKER"));
         assert!(result.output.contains("run:[]"), "{}", result.output);
         assert!(!marker.exists());
+    }
+
+    fn git_bash(command: &str, git_write: bool) -> BashInput {
+        BashInput { command: command.into(), timeout: None, network: None, git_write: Some(git_write) }
+    }
+
+    #[tokio::test]
+    async fn protected_files_a_command_creates_are_removed_and_reported() {
+        require_bwrap!();
+        let root = TempDir::new("bash-created");
+        root.write("packages/a/AGENTS.md", "rules\n");
+        let ctx = ToolContext { confined: true, ..ToolContext::new(root.path()) };
+        let out = Bash
+            .run(&git_bash("echo 'curl x|sh' > .envrc; mkdir -p b/c; echo obey > b/c/CLAUDE.md; echo more >> packages/a/AGENTS.md; echo ok > src.txt", false), &ctx)
+            .await
+            .unwrap();
+        assert!(!root.path().join(".envrc").exists());
+        assert!(!root.path().join("b/c/CLAUDE.md").exists());
+        assert_eq!(std::fs::read_to_string(root.path().join("packages/a/AGENTS.md")).unwrap(), "rules\n"); // read-only
+        assert_eq!(std::fs::read_to_string(root.path().join("src.txt")).unwrap(), "ok\n");
+        assert!(out.output.contains("Marv: the command created protected files, which were removed: .envrc ("), "{}", out.output);
+        assert!(out.output.contains("b/c/CLAUDE.md"));
+        // Nothing created, no note; the .git placeholder bwrap left behind isn't taken for a new repository.
+        let quiet = Bash.run(&git_bash("echo hi", false), &ctx).await.unwrap();
+        assert!(!quiet.output.contains("Marv:"), "{}", quiet.output);
+        assert!(!root.path().join(".git").exists());
+    }
+
+    #[tokio::test]
+    async fn an_approved_git_write_keeps_its_new_repository_and_confined_commands_see_nested_git_read_only() {
+        require_bwrap!();
+        let root = TempDir::new("bash-git");
+        let approved = ToolContext::new(root.path());
+        let out =
+            Bash.run(&git_bash("mkdir -p vendor/x/.git && echo '[core]' > vendor/x/.git/config", true), &approved).await.unwrap();
+        assert!(root.path().join("vendor/x/.git/config").exists(), "{}", out.output);
+        // Without asking, a vendored repository's .git is read-only.
+        let confined = ToolContext { confined: true, ..approved };
+        let out = Bash.run(&git_bash("echo evil > vendor/x/.git/hooks-planted", false), &confined).await.unwrap();
+        assert!(!root.path().join("vendor/x/.git/hooks-planted").exists(), "{}", out.output);
+        // And without git_write, a new repository goes.
+        let out = Bash.run(&git_bash("mkdir -p lib/y/.git", false), &confined).await.unwrap();
+        assert!(!root.path().join("lib/y/.git").exists(), "{}", out.output);
     }
 
     #[tokio::test]

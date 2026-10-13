@@ -6,8 +6,11 @@
 //!
 //! - A leading `~/` is the home folder, as in a shell: taken literally, `~/.config/x` became `<project>/~/.config/x`,
 //!   and a model told to create it would make a stray `~` folder. `~src` is not `~user`: it stays literal.
-//! - A symlink inside the project can still point outside it. For a path that doesn't exist yet (a new file), the
-//!   nearest folder that does is checked: a new file in a symlinked folder would land wherever that folder points.
+//! - A symlink inside the project can still point outside it. Every symlink on the way is followed
+//!   ([`real_with_missing`]): a new file in a symlinked folder lands wherever that folder points, and a write through
+//!   a symlink whose target doesn't exist yet creates that target (marv-rs fix, #8: Marv judged such a link by the
+//!   nearest existing folder, so a dangling link could write outside the project). A dangling link into `.git` is
+//!   refused outright.
 //! - `.git` is judged through symlinks too: git runs its hooks and config outside any sandbox, so yolo never changes
 //!   it without asking, and the check is repeated at apply time (`refuse_git`) since a parallel command could point a
 //!   symlink into it meanwhile.
@@ -39,24 +42,62 @@ pub fn is_inside(root: &Path, path: &Path) -> bool {
     path.starts_with(root)
 }
 
-/// The nearest path at or above `path` that exists (following symlinks, like `existsSync`).
-pub fn nearest_existing(path: &Path) -> PathBuf {
-    let mut existing = path.to_path_buf();
-    while !existing.exists() {
-        match existing.parent() {
-            Some(parent) => existing = parent.to_path_buf(),
-            None => break,
+/// Where a path really leads, for one that may not exist yet: every symlink on the way followed, *including one whose
+/// target doesn't exist yet* (a write through it creates that target), and the missing rest as written.
+///
+/// marv-rs fix (found by the guard suite, #8): this used to canonicalize the nearest ancestor that exists, and
+/// `exists()` follows symlinks, so a dangling `out.sh -> /elsewhere/planted.sh` read as a new file in the project and
+/// `write_file` created `/elsewhere/planted.sh`. Likewise `innocent.sh -> .envrc` wasn't seen as protected.
+pub fn real_with_missing(path: &Path) -> std::io::Result<PathBuf> {
+    let absolute = if path.is_absolute() { path.to_path_buf() } else { std::env::current_dir()?.join(path) };
+    // Components still to walk, last first; `out` has no symlinks in it, so `..` can pop it.
+    let mut pending: Vec<std::ffi::OsString> = Vec::new();
+    push_components(&mut pending, &absolute);
+    let mut out = PathBuf::from("/");
+    let mut hops = 0;
+    while let Some(name) = pending.pop() {
+        if name == ".." {
+            out.pop();
+            continue;
+        }
+        let next = out.join(&name);
+        match std::fs::symlink_metadata(&next) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                hops += 1;
+                if hops > 40 {
+                    return Err(std::io::Error::other(format!("{}: too many levels of symbolic links", path.display())));
+                }
+                let target = std::fs::read_link(&next)?;
+                if target.is_absolute() {
+                    out = PathBuf::from("/");
+                }
+                push_components(&mut pending, &target);
+            }
+            Ok(_) => out = next,
+            // Missing: the rest is taken as written (nothing below it can be a symlink yet).
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound || e.kind() == std::io::ErrorKind::NotADirectory => out = next,
+            Err(e) => return Err(e),
         }
     }
-    existing
+    Ok(out)
 }
 
-/// Where a path really leads, for one that may not exist yet: the real path of its nearest existing ancestor, plus
-/// the rest as written.
-pub fn real_with_missing(path: &Path) -> std::io::Result<PathBuf> {
-    let existing = nearest_existing(path);
-    let rest = path.strip_prefix(&existing).unwrap_or(Path::new(""));
-    Ok(std::fs::canonicalize(&existing)?.join(rest))
+/// Pushes `path`'s normal and `..` components onto `pending` so they pop first, in order.
+fn push_components(pending: &mut Vec<std::ffi::OsString>, path: &Path) {
+    let names: Vec<std::ffi::OsString> = path
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(name) => Some(name.to_os_string()),
+            Component::ParentDir => Some("..".into()),
+            _ => None,
+        })
+        .collect();
+    pending.extend(names.into_iter().rev());
+}
+
+/// Whether the last component of `path` is a symlink whose target doesn't exist (yet).
+pub fn is_dangling_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) && !path.exists()
 }
 
 /// `~` and `~/x` expanded to the home folder; anything else as written.
@@ -80,9 +121,16 @@ pub fn resolve_in_project(root: &Path, path: &str, home: &Path) -> Result<PathBu
         return Err(outside());
     }
     let real_root = std::fs::canonicalize(root)?;
-    let real = std::fs::canonicalize(nearest_existing(&absolute))?;
+    let real = real_with_missing(&absolute)?;
     if !is_inside(&real_root, &real) {
         return Err(outside());
+    }
+    // A dangling link into .git: writing through it would create a hook or config git runs outside the sandbox, and
+    // nothing about the link's own name says .git (a link that resolves goes through `touches_git` instead).
+    if is_dangling_symlink(&absolute)
+        && real.strip_prefix(&real_root).ok().and_then(|rel| rel.components().next()).is_some_and(|c| c.as_os_str() == ".git")
+    {
+        return Err(SandboxError::IntoGit(path.to_string()));
     }
     Ok(absolute)
 }
@@ -186,6 +234,22 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     #[test]
+    fn real_with_missing_follows_every_symlink_even_dangling_ones() {
+        let dir = TempDir::new("real");
+        let d = dir.path();
+        fs::create_dir_all(d.join("a/b")).unwrap();
+        symlink(d.join("a"), d.join("la")).unwrap();
+        symlink("../nowhere/x", d.join("a/b/dangling")).unwrap();
+        symlink("loop2", d.join("loop1")).unwrap();
+        symlink("loop1", d.join("loop2")).unwrap();
+        assert_eq!(real_with_missing(&d.join("la/b")).unwrap(), d.join("a/b"));
+        assert_eq!(real_with_missing(&d.join("la/b/new/file")).unwrap(), d.join("a/b/new/file"));
+        assert_eq!(real_with_missing(&d.join("la/b/dangling")).unwrap(), d.join("a/nowhere/x"));
+        assert_eq!(real_with_missing(&d.join("a/../la/./b")).unwrap(), d.join("a/b"));
+        assert!(real_with_missing(&d.join("loop1")).is_err());
+    }
+
+    #[test]
     fn normalize_resolves_dots_lexically() {
         assert_eq!(normalize(Path::new("/a/b/../c/./d")), PathBuf::from("/a/c/d"));
         assert_eq!(normalize(Path::new("/../x")), PathBuf::from("/x"));
@@ -218,6 +282,16 @@ mod tests {
         assert!(resolve_in_project(root.path(), "link.txt", Path::new("/nowhere")).is_err());
         // A new file in a symlinked folder would land outside: judged by the nearest existing folder.
         assert!(resolve_in_project(root.path(), "dir/new.txt", Path::new("/nowhere")).is_err());
+        // A dangling link: a write through it would create its target, outside (#8).
+        symlink(outside.path().join("planted.sh"), root.path().join("out.sh")).unwrap();
+        assert!(resolve_in_project(root.path(), "out.sh", Path::new("/nowhere")).is_err());
+        // …or inside the project, which is fine, unless it's in .git.
+        symlink(root.path().join("later.txt"), root.path().join("in.txt")).unwrap();
+        assert_eq!(resolve_in_project(root.path(), "in.txt", Path::new("/nowhere")).unwrap(), root.path().join("in.txt"));
+        fs::create_dir_all(root.path().join(".git/hooks")).unwrap();
+        symlink(root.path().join(".git/hooks/pre-commit"), root.path().join("hook.sh")).unwrap();
+        assert!(matches!(resolve_in_project(root.path(), "hook.sh", Path::new("/nowhere")), Err(SandboxError::IntoGit(_))));
+        assert!(touches_git(root.path(), "hook.sh", Path::new("/nowhere")));
     }
 
     #[test]
