@@ -104,7 +104,14 @@ Each door adds to `tests/guards/` (real bubblewrap, gated by `sandboxAvailable()
 
 **Evals** (`evals/tasks/`, run with and without the doors via a new `--doors on|off`): `dev-server-claim` (#50: doesn't claim, or really serves), `serve-and-check` (start, fetch, report what the page says), `e2e-against-server` (tests that need the server up), `watch-and-rebuild` (a watcher rebuilds after an edit), `github-read` (a fake `gh` and canned PRs/CI: the summary names the failing check). Checks look at the host side (a real `fetch` of the port after the run, the fake `gh`'s log). Run on 2 models before release, with a budget.
 
-## Open questions for the user
+## Decided with the user (2026-10-13)
+
+1. **GitHub writes in `marv -p` are allowed with `--approve github`**, as proposed; reads need nothing.
+2. **Sensitive `gh api` reads ask**, as proposed.
+3. **Processes keep running across `/clear`**, as proposed.
+4. **SDK `hostCommands: true` is offered**, as proposed.
+
+## Open questions (as asked; answers above)
 
 1. **github writes in `marv -p`:** allowed with `--approve github` (as proposed), or never from headless?
 2. **`gh api` sensitive reads:** ask (proposed), or refuse outright?
