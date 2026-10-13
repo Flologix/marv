@@ -13,7 +13,7 @@ Spec: Marv `CLAUDE.md` bullets **Provider seam** and **createProvider**, `src/pr
 | `src/provider/sse.ts` | `sse.rs` (`SseDecoder`, `parse_sse`) | ported, tests ported |
 | `src/provider/retry.ts` | `retry.rs` | ported, tests ported (`sleep_abortable` on a `CancellationToken`); `drop_recovery` (#64) added |
 | `src/provider/errors.ts` | `errors.rs` | ported and tested (`error_message` is pure: the caller reads the body first); `is_context_overflow` (#63) todo |
-| `src/provider/models.ts` | `models.rs` | `from_openrouter`, `per_million` and `format_price` ported and tested; `list_models` (HTTP) todo |
+| `src/provider/models.ts` | `models.rs` | `from_openrouter`, `per_million` and `format_price` ported and tested; `list_models(kind, base_url, api_key)` owns its client (`list_models_with` takes one); the HTTP body is todo |
 | `src/provider/openai-compat.ts` | `openai_compat.rs` | wire types, `to_messages`, `request_body` and the `ReplyAssembler` (chunk → events) ported and tested; the HTTP/retry loop in `stream` is todo |
 | `src/provider/ollama.ts` | `ollama.rs` | `NdjsonDecoder`, `to_messages`, `reply_cap`, `Measured`, `trained_context`, `LineAssembler` ported and tested; `ask_trained` and `stream` are todo |
 | `src/provider/factory.ts` | `factory.rs` | `ProviderFactory` trait, `ProviderOption`, `CustomFactory` ported; `ConfigFactory::{make, lookup}` todo; `providerFactory` moves to `marv-session` |

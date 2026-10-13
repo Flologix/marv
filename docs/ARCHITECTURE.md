@@ -38,6 +38,7 @@ marv-rs is a from-scratch Rust rebuild of [Marv](https://github.com/FlologixAI/m
 | Crate | What it owns | Marv (TS) source |
 |---|---|---|
 | `marv-core` | `ChatTurn`, `ToolCall`, `ProviderEvent`, `Usage`, `ToolKind`, `Provenance`, `StopReason` | `src/provider/types.ts`, `src/types.ts` |
+| `marv-fs` | Private (0600, atomic) writes and the cross-process file lock, below marv-mcp and marv-session | `src/private-file.ts`, `src/file-lock.ts` |
 | `marv-provider` | `Provider` trait, OpenAI-compatible (OpenRouter) and Ollama adapters, SSE/NDJSON, retry, errors, model list, cache breakpoints | `src/provider/*` |
 | `marv-agent` | The loop (`run_agent`), repetition guards, cut-off handling, compaction | `src/agent.ts`, `src/repetition.ts`, `src/compact.ts` |
 | `marv-tools` | `Tool` trait, registry and `run_tool` (approval, yolo, repair), built-in tools, edit matching, syntax checks, diffs | `src/tools/*` |

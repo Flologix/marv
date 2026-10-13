@@ -27,7 +27,7 @@ use marv_mesh::switchboard::{MeshRecord, TrajectorySink};
 use serde::Serialize;
 
 use crate::paths::project_key;
-use crate::runner::{ApprovalRecord, ToolDisplay};
+use crate::runner::ApprovalRecord;
 
 pub const FORMAT_VERSION: u32 = 1;
 
@@ -430,11 +430,7 @@ impl AgentRecorder {
             }
             LoopEvent::ToolEnd { call, run } => {
                 let started = self.tool_starts.remove(&call.id).unwrap_or(now);
-                let approval = run
-                    .display
-                    .as_ref()
-                    .and_then(|d| d.downcast_ref::<ToolDisplay>())
-                    .map_or(ApprovalRecord::None, |d| d.approval);
+                let approval = run.approval;
                 (self.sink)(TrajectoryRecord::Tool {
                     who,
                     call: call.clone(),
@@ -544,7 +540,7 @@ mod tests {
 
     #[tokio::test]
     async fn writes_stamped_lines_privately() {
-        let dir = std::env::temp_dir().join(format!("marv-traj-{}-{}", std::process::id(), crate::private_file::random_hex()));
+        let dir = std::env::temp_dir().join(format!("marv-traj-{}-{}", std::process::id(), marv_fs::random_hex()));
         let log = TrajectoryStore::new(&dir).open(Path::new("/p"), "s1");
         std::fs::create_dir_all(log.path.parent().unwrap()).unwrap();
         std::fs::write(&log.path, "{\"half").unwrap(); // a crash's leftovers

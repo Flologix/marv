@@ -212,7 +212,7 @@ pub async fn create_session(options: SessionOptions) -> Result<MarvSession, Sess
         // Logins made with /mcp login in the TUI (same config dir) are used and refreshed; a library never starts one.
         let _servers = servers;
         todo!(
-            "port: McpManager::new(servers, ManagerOptions {{ trust: mcp-trust.json, logins: mcp-tokens.json, … }}), onChange login warnings, start()"
+            "port: McpManager::new(servers, ManagerOptions {{ trust: mcp-trust.json, logins: mcp-tokens.json, … }}), set_on_change login warnings, start()"
         )
     };
 

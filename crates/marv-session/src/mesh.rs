@@ -22,9 +22,9 @@ use marv_mesh::{PlugId, ReceptacleName};
 use marv_tools::{Tool, ToolContext, ToolError, ToolOutput};
 use serde_json::Value;
 
-/// The process's switchboard. `route`/`serve` take `&mut self` (upstream gap: `serve` holding `&mut` for the life of
-/// the socket loop blocks every other use; it should take `Arc<Self>` with interior mutability).
-pub type MeshHandle = Arc<tokio::sync::Mutex<Switchboard>>;
+/// The process's switchboard. It synchronizes itself (`&self`; `serve`/`route` take the `Arc`), so serving never
+/// blocks wiring or `mesh_list`.
+pub type MeshHandle = Arc<Switchboard>;
 
 /// Asks a person for a wire. `true` grants it. Never answered by yolo.
 #[async_trait]

@@ -13,4 +13,4 @@ pub mod repetition;
 #[cfg(test)]
 pub(crate) mod testing;
 
-pub use agent::{AgentOptions, History, LimitAnswer, LoopEvent, ToolRun, ToolRunner, run_agent};
+pub use agent::{AgentOptions, ApprovalRecord, History, LimitAnswer, LoopEvent, ToolRun, ToolRunner, run_agent};

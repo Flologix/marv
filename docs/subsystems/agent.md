@@ -30,6 +30,7 @@ pub trait ToolRunner: Send + Sync {                              // implemented 
 pub struct ToolRun {
     pub result: ToolResult, pub label: String, pub declined: bool,
     pub provenance: Provenance, pub changed: Option<String>,
+    pub approval: ApprovalRecord,                                 // None | Auto | Interrupted | Yes | Always | No | Unavailable
     pub display: Option<Arc<dyn Any + Send + Sync>>,             // e.g. marv-tools' DiffShown; never sent to the model
 }
 
@@ -42,7 +43,7 @@ pub type AfterStep  = Arc<dyn Fn(Vec<ToolRun>) -> BoxFuture<'static, Option<Stri
 pub type RewriteCall = Arc<dyn Fn(&ToolCall) -> Option<ToolCall> + Send + Sync>;
 ```
 
-- **The session adapts marv-tools.** It wraps `run_tool` and converts `ToolOutput` into `ToolRun`: `into_core()` for `result`, plus `declined`, `provenance` and `changed`, with the `diff` in `display`. marv-agent doesn't depend on marv-tools. (A comment in marv-tools says it does; that's stale.)
+- **The session adapts marv-tools.** It wraps `run_tool` and converts `ToolOutput` into `ToolRun`: `into_core()` for `result`, plus `declined`, `provenance`, `changed` and `approval` (how it was approved: trajectories and `marv -p` read it), with the `diff` in `display`. marv-agent doesn't depend on marv-tools. (A comment in marv-tools says it does; that's stale.)
 - **`not_run::ABORTED`** must equal marv-tools' `INTERRUPTED`; both are `"Interrupted by the user before this tool ran."`.
 - **`run_tool` should return `Err` rarely.** An `Err` becomes `"<name> failed: <err>"` with `is_error`, and the run goes on.
 

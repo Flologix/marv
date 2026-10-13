@@ -16,14 +16,14 @@ Spec: the **MCP servers** bullet in Marv's `CLAUDE.md`, `src/mcp/**`, and the te
 | Marv (TS) | Rust module | Status |
 |---|---|---|
 | `src/mcp/config.ts` | `config.rs` | **Ported, with tests.** Covers `${VAR}`/`${VAR:-d}` expansion, `reads_of`, `display_of`, `parse_server` (stdio, http, a strict `oauth` block, `sse` refused, name rules), `project_files` (the trust-key input), `load_mcp_config` (file order kept, so a project server can't take your server's name), `check_entry` and `parse_mcp_servers`. |
-| `src/mcp/trust.ts` | `trust.rs` | `read` and `is_trusted` are ported and tested. `trust()` (the write) is todo: it needs the private-file writer. |
+| `src/mcp/trust.ts` | `trust.rs` | `read` and `is_trusted` are ported and tested. `trust()` (the write) is todo (through `marv_fs::write_private`). |
 | `src/mcp/tool.ts` | `tool.rs` | **Ported, with tests.** Covers `mcp_tool_name`, `format_mcp_result` (30k cap; images and audio named, not sent), `acceptable_schema`, `label_of`, `McpTool` (kind/scope/preview/run) and `make_mcp_tool`. |
 | `src/mcp/deferred.ts` | `deferred.rs` | **Ported, with tests:** `one_line`, `announcement`, `choose_mode`, `search_tools`, `tool_search_output`, `unknown_tool_error`, `schema_hint`, `arguments_as_object`, `as_mcp_call`, `deferred_specs`. The `mcp_call` runner belongs in `marv-session`, which owns `run_tool`. |
-| `src/mcp/manager.ts` | `manager.rs` | Types and pure helpers are ported and tested: `cwd_for`, `server_env`, `own_authorization`, `login_status`, `state_error`, `login_error`, `status`, `rebuild`, `forget_removed`, `loginable`. Still todo: `start`, `ready`, `add`, `remove`, `trust_all`, `login`, `logout`, `close` and `kill`. |
+| `src/mcp/manager.ts` | `manager.rs` | Types and pure helpers are ported and tested: `cwd_for`, `server_env`, `own_authorization`, `login_status`, `state_error`, `login_error`, `status`, `rebuild`, `forget_removed`, `loginable`, `ready` (a watch on `settled`), `set_on_change`. Shared as `Arc<McpManager>` with `&self` methods (state behind a short sync lock). Still todo: `start`, `ready`, `add`, `remove`, `trust_all`, `login`, `logout`, `close` and `kill`. |
 | (the MCP SDK) | `jsonrpc.rs` | Our own JSON-RPC 2.0 and MCP types (initialize, tools/list, tools/call) with line framing, plus a `Transport` trait. Tested. marv-mesh shares it. |
 | `src/mcp/oauth.ts` | `oauth.rs` | Ported and tested: `LoginNeeded`, `redirect_url_for`, `authorization_url_ok`, `CallbackExpectation` (state compared in constant time, used once), `is_callback`, `callback_page`, `can_open_browser`, and the provider's metadata and redirect. Still todo: the protocol (`new_state`, the store-backed provider methods, `listen`, `open_browser`, `probe_login`, `revoke`). |
-| `src/mcp/oauth-store.ts` | `oauth_store.rs` | Ported and tested: `login_key`, `Login` (extra fields kept), and reads (unreadable or wrong shape means no logins). Still todo: `update` and `remove`, which need the file lock. |
-| `src/mcp/personal-file.ts` | `personal_file.rs` | `read` and `personal_server_names` are ported and tested. Add and remove are todo (they need the file lock and the private-file writer). |
+| `src/mcp/oauth-store.ts` | `oauth_store.rs` | Ported and tested: `login_key`, `Login` (extra fields kept), and reads (unreadable or wrong shape means no logins). Still todo: `update` and `remove` (through `marv_fs::with_file_lock`). |
+| `src/mcp/personal-file.ts` | `personal_file.rs` | `read` and `personal_server_names` are ported and tested. Add and remove are todo (through `marv_fs::with_file_lock` and `write_private`). |
 | `src/mcp/install/index.ts` | `install/mod.rs` | `fits` is ported. Still todo: `resolve_add` and `with_login_fact`. |
 | `src/mcp/install/source.ts` | `install/source.rs` | **Ported, with tests:** `parse_source`, `server_name`, `split_words`, `parse_add_args`. |
 | `src/mcp/install/proposal.ts` | `install/proposal.rs` | **Ported, with tests:** `McpEntry`, `fact`, `env_entries`, `repo_of`, `http_proposal`, `approval_for` (returns `AddApproval`; the session maps it to `ApprovalRequest { once: true }`), `added_notice`. `ResolveDeps` is a trait. |
@@ -65,10 +65,12 @@ pub struct McpServerConfig { name, source: ServerSource, transport: McpTransport
 pub type Env = BTreeMap<String, String>;
 
 // manager (session owns one; the TUI's /mcp reads status())
-McpManager::new(servers, ManagerOptions { root, project_key, home, version, trust, logins, env, connect_timeout, login_timeout })
+// Every method takes &self: no lock around it (/mcp reads status() while a turn waits on ready()).
+McpManager::new(servers, ManagerOptions { root, project_key, home, version, trust, logins, env, connect_timeout, login_timeout }) -> Arc<McpManager>
 async start(); async ready(); tools() -> Arc<Vec<McpTool>>; specs() -> Arc<Vec<ToolSpec>>; settled();
-async add(cfg); async remove(name); forget_removed(); untrusted(); async trust_all(); loginable();
-login(name, authorize) -> McpLogin { paste, done }; async logout(name) -> Revoked; status() -> Vec<McpServerStatus>;
+set_on_change(Fn() + Send + Sync)   // Marv's onChange: the UI's notices, the SDK's "needs login" warnings
+async add(cfg); async remove(name); forget_removed(); untrusted() -> Vec<McpServerConfig>; async trust_all(); loginable();
+login(self: &Arc<Self>, name, authorize) -> McpLogin { paste, done }; async logout(name) -> Revoked; status() -> Vec<McpServerStatus>;
 async close(); kill();
 
 // tool (marv-session wraps in Tool)

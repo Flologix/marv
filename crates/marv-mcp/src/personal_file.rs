@@ -47,12 +47,14 @@ pub fn read(path: &Path) -> Result<Map<String, Value>, String> {
 /// Adds `entry` as server `name`, exactly as given. Refuses a taken name, an
 /// unreadable file and an entry `config::check_entry` rejects.
 pub async fn add_personal_server(_config_dir: &Path, _name: &str, _entry: Value) -> crate::Result<()> {
-    todo!("port: addPersonalServer (withFileLock; check_entry; read; refuse taken name; writePrivate with trailing newline)")
+    todo!(
+        "port: addPersonalServer (marv_fs::with_file_lock; check_entry; read; refuse taken name; marv_fs::write_private with trailing newline)"
+    )
 }
 
 /// Removes server `name`, keeping everything else.
 pub async fn remove_personal_server(_config_dir: &Path, _name: &str) -> crate::Result<()> {
-    todo!("port: removePersonalServer (withFileLock; read; refuse missing; writePrivate)")
+    todo!("port: removePersonalServer (marv_fs::with_file_lock; read; refuse missing; marv_fs::write_private)")
 }
 
 /// The names in your `mcp.json`, or none when it can't be read (for `/mcp remove`'s check).

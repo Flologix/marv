@@ -250,6 +250,22 @@ pub fn call_groups(calls: &[ToolCall], concurrent: impl Fn(&ToolCall) -> bool) -
     groups
 }
 
+/// How a call that needed approval got it, as trajectories and `marv -p` record it. The loop never reads it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApprovalRecord {
+    /// It needed none.
+    #[default]
+    None,
+    /// Yolo ran it.
+    Auto,
+    Interrupted,
+    Yes,
+    Always,
+    No,
+    Unavailable,
+}
+
 /// A finished tool call, as the loop needs it.
 #[derive(Debug, Clone)]
 pub struct ToolRun {
@@ -264,6 +280,8 @@ pub struct ToolRun {
     pub provenance: Provenance,
     /// The file a change wrote (project-relative): which project checks/diagnostics `after_step` runs.
     pub changed: Option<String>,
+    /// How it was approved (trajectories, `marv -p`'s `tool_end` and refusals). Never sent to the model.
+    pub approval: ApprovalRecord,
     /// Display-only payload the loop never reads (marv-tools' `DiffShown`); the UI downcasts it.
     /// Never sent to the model.
     pub display: Option<Arc<dyn std::any::Any + Send + Sync>>,
@@ -272,7 +290,15 @@ pub struct ToolRun {
 impl ToolRun {
     /// A plain result with no extras.
     pub fn new(result: ToolResult, label: impl Into<String>) -> Self {
-        Self { result, label: label.into(), declined: false, provenance: Provenance::Project, changed: None, display: None }
+        Self {
+            result,
+            label: label.into(),
+            declined: false,
+            provenance: Provenance::Project,
+            changed: None,
+            approval: ApprovalRecord::None,
+            display: None,
+        }
     }
 }
 

@@ -418,11 +418,8 @@ pub fn provider_factory(option: ProviderOption, thinking: bool) -> Arc<dyn Provi
     Arc::new(ConfigFactory {
         config: config.provider_config(),
         make: Arc::new(|config, info| marv_provider::create_provider(config, info, Some(marv_provider::errors::SDK_HINTS))),
-        load: Arc::new(|_kind, _base_url| {
-            todo!(
-                "port: the SDK's model list: marv_provider::models::list_models needs a reqwest::Client marv-session can't make (upstream gap)"
-            )
-        }),
+        // Marv's model lists need no key (OpenRouter's is public, Ollama's local).
+        load: Arc::new(|kind, base_url| Box::pin(async move { marv_provider::models::list_models(kind, &base_url, None).await })),
     })
 }
 
@@ -542,7 +539,7 @@ mod tests {
 
     #[test]
     fn store_round_trips_privately() {
-        let dir = std::env::temp_dir().join(format!("marv-config-{}-{}", std::process::id(), crate::private_file::random_hex()));
+        let dir = std::env::temp_dir().join(format!("marv-config-{}-{}", std::process::id(), marv_fs::random_hex()));
         let store = ConfigStore::new(&dir.join("nested"));
         assert!(store.load().unwrap().is_none());
         let f = FileConfig { model: Some("openai/gpt-5.6-sol".into()), max_steps: Some(MaxStepsSetting::Off), ..file() };

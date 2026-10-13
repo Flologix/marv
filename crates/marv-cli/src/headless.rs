@@ -26,9 +26,9 @@ use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 use marv_agent::LoopEvent;
 use marv_core::printable;
+use marv_session::ApprovalRecord;
 use marv_session::Totals;
 use marv_session::session::{SessionEvent, TurnEndReason};
-use marv_session::{ApprovalRecord, ToolDisplay};
 use marv_tools::{ApprovalRequest, Approver, Decision};
 use serde::Serialize;
 
@@ -155,8 +155,7 @@ impl Collector {
         else {
             return;
         };
-        let approval = run.display.as_ref().and_then(|d| d.downcast_ref::<ToolDisplay>()).map(|d| d.approval);
-        if !(run.result.output.contains(NO_APPROVER) || approval == Some(ApprovalRecord::No) || run.declined) {
+        if !(run.result.output.contains(NO_APPROVER) || run.approval == ApprovalRecord::No || run.declined) {
             return;
         }
         let refused =
@@ -192,17 +191,9 @@ impl Collector {
                         Some(json!({"type": "assistant", "text": text}))
                     }
                     L::ToolStart { call, label } => Some(json!({"type": "tool_start", "tool": call.name, "label": label})),
-                    L::ToolEnd { call, run } => {
-                        let approval = run
-                            .display
-                            .as_ref()
-                            .and_then(|d| d.downcast_ref::<ToolDisplay>())
-                            .map(|d| d.approval)
-                            .unwrap_or_default();
-                        Some(
-                            json!({"type": "tool_end", "tool": call.name, "label": run.label, "result": run.result.output, "error": run.result.is_error, "approval": approval}),
-                        )
-                    }
+                    L::ToolEnd { call, run } => Some(
+                        json!({"type": "tool_end", "tool": call.name, "label": run.label, "result": run.result.output, "error": run.result.is_error, "approval": run.approval}),
+                    ),
                     L::ToolSkipped { call, output } => Some(json!({"type": "tool_skipped", "tool": call.name, "reason": output})),
                     L::Done(reason) => {
                         self.reason = TurnEndReason::Done(*reason).as_str().into();

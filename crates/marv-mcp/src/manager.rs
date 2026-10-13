@@ -20,6 +20,11 @@
 //!   (a passive provider, and none at all without stored tokens, so nobody is
 //!   sent discovery or registration in the background).
 //! - Local servers are closed on exit, and killed as a last resort.
+//! - **Shared, not locked by its users** (marv-rs): every method takes `&self` and the manager lives in an `Arc`
+//!   (`new` returns one; `login` takes `&Arc<Self>` because the login outlives the call). Its state sits behind a
+//!   short synchronous lock never held across an await, and `settled` is a watch channel, so `/mcp` can read
+//!   `status()` while a turn waits on `ready()`. [`McpManager::set_on_change`] is Marv's `onChange`: told when a
+//!   server's state changes (the UI's notices, the SDK's "needs login" warnings).
 //!
 //! **Differences from Marv (security fixes, 2026-10-12 audit):**
 //! - **`npx`/`uvx` never run in the project folder**, even for a trusted project
@@ -33,7 +38,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use marv_core::ToolSpec;
@@ -211,22 +216,32 @@ struct Connection {
     login: Option<McpLoginStatus>,
 }
 
+/// Told when a server's state changes (Marv's `onChange`).
+pub type OnChange = Arc<dyn Fn() + Send + Sync>;
+
 /// The session's MCP servers. One per Marv process (the TUI hands it to its
-/// session; the SDK's session owns its own).
+/// session; the SDK's session owns its own). Shared as an `Arc` (module docs).
 pub struct McpManager {
     opts: ManagerOptions,
+    state: Mutex<State>,
+    /// Whether every server Marv may start has connected or failed; `ready()` waits on it.
+    settled: tokio::sync::watch::Sender<bool>,
+    on_change: Mutex<Option<OnChange>>,
+}
+
+/// What changes: one short lock, never held across an await.
+struct State {
     connections: Vec<Connection>,
     /// Every tool of every connected server, in config order. Replaced, never changed.
     tools: Arc<Vec<McpTool>>,
     specs: Arc<Vec<ToolSpec>>,
-    settled: bool,
     closed: bool,
     /// The login under way (one at a time).
     pending: Option<(String, CancellationToken)>,
 }
 
 impl McpManager {
-    pub fn new(servers: Vec<McpServerConfig>, opts: ManagerOptions) -> Self {
+    pub fn new(servers: Vec<McpServerConfig>, opts: ManagerOptions) -> Arc<Self> {
         // "connecting" until start() has checked trust: calling them "untrusted" before that would let /mcp trust
         // start your own servers a second time.
         let connections = servers
@@ -241,65 +256,95 @@ impl McpManager {
                 login: None,
             })
             .collect();
-        Self { opts, connections, tools: Arc::default(), specs: Arc::default(), settled: true, closed: false, pending: None }
+        let state = State { connections, tools: Arc::default(), specs: Arc::default(), closed: false, pending: None };
+        Arc::new(Self {
+            opts,
+            state: Mutex::new(state),
+            settled: tokio::sync::watch::Sender::new(true),
+            on_change: Mutex::new(None),
+        })
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Marv's `onChange`: `f` is told whenever a server's state changes (replacing any earlier one). Called without
+    /// the manager's lock held, so it may read `status()`.
+    pub fn set_on_change(&self, f: impl Fn() + Send + Sync + 'static) {
+        *self.on_change.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(f));
+    }
+
+    /// Tells the `on_change` hook. Never call it with the state lock held.
+    #[allow(dead_code)] // the lifecycle bodies (start, add, login, …) call it once ported
+    fn changed(&self) {
+        let f = self.on_change.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(f) = f {
+            f();
+        }
     }
 
     /// The current tools and specs (the arrays are replaced, never changed, so a turn holds a consistent set).
     pub fn tools(&self) -> Arc<Vec<McpTool>> {
-        self.tools.clone()
+        self.state().tools.clone()
     }
     pub fn specs(&self) -> Arc<Vec<ToolSpec>> {
-        self.specs.clone()
+        self.state().specs.clone()
     }
     /// Whether every server Marv may start has connected or failed.
     pub fn settled(&self) -> bool {
-        self.settled
+        *self.settled.borrow()
     }
 
     /// Starts every trusted server; never fails (a failing trust check means "not trusted").
-    pub async fn start(&mut self) {
-        let _ = (&self.opts, &mut self.connections, self.closed, &self.pending);
-        todo!("port: McpManager.start (trust check per server, parallel connect, rebuild, settled)")
+    pub async fn start(&self) {
+        let state = self.state();
+        let _ = (&self.opts, state.closed, &state.pending);
+        drop(state);
+        todo!("port: McpManager.start (trust check per server, parallel connect, rebuild, settled.send_replace, changed)")
     }
 
     /// Resolves once the servers have settled (a turn waits on it: `status: waiting_for_mcp`).
     pub async fn ready(&self) {
-        todo!("port: McpManager.ready (watch channel on settled)")
+        let mut settled = self.settled.subscribe();
+        // The sender lives as long as `self`, so this only ends once settled.
+        let _ = settled.wait_for(|settled| *settled).await;
     }
 
     /// `/mcp add`: starts one more server now, in your home folder. Refuses a
     /// name in use, or one removed in this conversation (its tools stay listed).
-    pub async fn add(&mut self, _config: McpServerConfig) -> crate::Result<McpServerStatus> {
+    pub async fn add(&self, _config: McpServerConfig) -> crate::Result<McpServerStatus> {
         todo!("port: McpManager.add")
     }
 
     /// `/mcp remove`: stops it; its tools stay listed and fail clearly. Cancels its pending login.
-    pub async fn remove(&mut self, _name: &str) -> crate::Result<()> {
+    pub async fn remove(&self, _name: &str) -> crate::Result<()> {
         todo!("port: McpManager.remove")
     }
 
     /// A new conversation: tools of removed servers aren't offered any more.
-    pub fn forget_removed(&mut self) {
-        if !self.connections.iter().any(|c| c.state == McpState::Removed) {
+    pub fn forget_removed(&self) {
+        let mut state = self.state();
+        if !state.connections.iter().any(|c| c.state == McpState::Removed) {
             return;
         }
-        self.connections.retain(|c| c.state != McpState::Removed);
-        self.rebuild();
+        state.connections.retain(|c| c.state != McpState::Removed);
+        state.rebuild();
     }
 
     /// Project servers waiting for the user's trust.
-    pub fn untrusted(&self) -> Vec<&McpServerConfig> {
-        self.connections.iter().filter(|c| c.state == McpState::Untrusted).map(|c| &c.config).collect()
+    pub fn untrusted(&self) -> Vec<McpServerConfig> {
+        self.state().connections.iter().filter(|c| c.state == McpState::Untrusted).map(|c| c.config.clone()).collect()
     }
 
     /// `/mcp trust`: trusts the waiting project servers (this exact config) and starts them.
-    pub async fn trust_all(&mut self) -> crate::Result<Vec<McpServerStatus>> {
+    pub async fn trust_all(&self) -> crate::Result<Vec<McpServerStatus>> {
         todo!("port: McpManager.trustAll")
     }
 
     /// Remote servers that can log in (no Authorization header of their own), by name.
     pub fn loginable(&self) -> Vec<String> {
-        self.connections.iter().filter(|c| Self::can_login(c)).map(|c| c.config.name.clone()).collect()
+        self.state().connections.iter().filter(|c| Self::can_login(c)).map(|c| c.config.name.clone()).collect()
     }
 
     fn can_login(c: &Connection) -> bool {
@@ -309,18 +354,20 @@ impl McpManager {
     }
 
     /// `/mcp login <name>`: refuses untrusted (before any network contact),
-    /// stdio and own-header servers; one login at a time; [`LOGIN_TIMEOUT`].
-    pub fn login(&mut self, _name: &str, _authorize: Box<dyn Fn(url::Url) + Send + Sync>) -> crate::Result<McpLogin> {
+    /// stdio and own-header servers; one login at a time; [`LOGIN_TIMEOUT`]. Takes the `Arc`: the login runs on after
+    /// this returns (listener, token exchange, reconnect).
+    pub fn login(self: &Arc<Self>, _name: &str, _authorize: Box<dyn Fn(url::Url) + Send + Sync>) -> crate::Result<McpLogin> {
         todo!("port: McpManager.login (listener, interactive provider, expectCallback, finishAuth, reconnect)")
     }
 
     /// `/mcp logout <name>`: revokes (best effort), removes the stored login, `needs-login`.
-    pub async fn logout(&mut self, _name: &str) -> crate::Result<Revoked> {
+    pub async fn logout(&self, _name: &str) -> crate::Result<Revoked> {
         todo!("port: McpManager.logout")
     }
 
     pub fn status(&self) -> Vec<McpServerStatus> {
-        self.connections
+        self.state()
+            .connections
             .iter()
             .map(|c| {
                 let tools: Vec<String> = c.tools.iter().map(|t| t.name.clone()).filter(|n| !c.skipped.contains(n)).collect();
@@ -341,6 +388,18 @@ impl McpManager {
             .collect()
     }
 
+    /// Stops every server (on exit); cancels a pending login.
+    pub async fn close(&self) {
+        todo!("port: McpManager.close")
+    }
+
+    /// Last resort on exit, synchronous: local servers must not outlive Marv.
+    pub fn kill(&self) {
+        todo!("port: McpManager.kill (SIGKILL each stdio child)")
+    }
+}
+
+impl State {
     /// New arrays, so anything holding the old ones keeps a consistent set.
     /// Across servers the first one keeps a tool name; the others say so in `/mcp`.
     fn rebuild(&mut self) {
@@ -356,16 +415,6 @@ impl McpManager {
         }
         self.specs = Arc::new(all.iter().map(|t| t.spec.clone()).collect());
         self.tools = Arc::new(all);
-    }
-
-    /// Stops every server (on exit); cancels a pending login.
-    pub async fn close(&mut self) {
-        todo!("port: McpManager.close")
-    }
-
-    /// Last resort on exit, synchronous: local servers must not outlive Marv.
-    pub fn kill(&mut self) {
-        todo!("port: McpManager.kill (SIGKILL each stdio child)")
     }
 }
 
@@ -421,6 +470,57 @@ mod tests {
         );
         assert_eq!(m.loginable().len(), 1);
         assert_eq!(m.status()[1].login, Some(McpLoginStatus::default()));
+    }
+
+    fn manager() -> Arc<McpManager> {
+        McpManager::new(
+            vec![server(ServerSource::Personal, json!({"type": "http", "url": "https://y"}))],
+            ManagerOptions {
+                root: "/p".into(),
+                project_key: "p".into(),
+                home: "/h".into(),
+                version: "0".into(),
+                trust: None,
+                logins: None,
+                env: Default::default(),
+                connect_timeout: CONNECT_TIMEOUT,
+                login_timeout: LOGIN_TIMEOUT,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn shared_status_reads_while_a_turn_waits_for_ready() {
+        let m = manager();
+        m.settled.send_replace(false);
+        let waiting = tokio::spawn({
+            let m = m.clone();
+            async move { m.ready().await }
+        });
+        tokio::task::yield_now().await;
+        // `/mcp` reads through the same Arc while the turn waits.
+        assert_eq!(m.status().len(), 1);
+        assert!(!m.settled() && !waiting.is_finished());
+        m.settled.send_replace(true);
+        waiting.await.unwrap();
+        m.ready().await; // settled: returns at once
+    }
+
+    #[test]
+    fn on_change_is_told_and_can_read_status() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let m = manager();
+        m.changed(); // no hook yet: nothing happens
+        let told = Arc::new(AtomicUsize::new(0));
+        m.set_on_change({
+            let (m, told) = (Arc::downgrade(&m), told.clone());
+            move || {
+                assert_eq!(m.upgrade().unwrap().status().len(), 1); // not called under the lock
+                told.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        m.changed();
+        assert_eq!(told.load(Ordering::SeqCst), 1);
     }
 
     #[test]

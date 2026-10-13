@@ -96,7 +96,7 @@ pub const INTERRUPTED: &str;  // must equal marv-agent's NOT_RUN.aborted
   - Skill files are read only after a realpath check.
 - **Not here, by design:**
   - Skill and agent-type loading, the memory paths, and subagents: all in marv-session.
-  - Marv's cross-process `withFileLock`: in marv-session's private-file module.
+  - Marv's cross-process `withFileLock` (`src/file-lock.ts`): in marv-fs (`marv_fs::with_file_lock`).
 - **The `agent` tool** reaches subagents only through `AgentHost`, because marv-tools can't depend on marv-agent.
 - **Planned:**
   - spill cut output to a file (#61, `output::spill_cut`);
