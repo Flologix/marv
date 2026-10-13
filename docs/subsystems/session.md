@@ -8,9 +8,9 @@ Spec: the **Config**, **Session**, **SDK**, **Skills**, **Memory**, **Subagents*
 
 | Marv (TS) | Rust module | Status |
 |---|---|---|
-| `src/session.ts` | `session.rs` | **Types and API are done:** `SessionEvent`, `TurnStatus`, `TurnEndReason`, `CompactResult`, `SessionInit`, `Configure`, `SendOptions`, `Turn` (a `Stream`; dropping it interrupts), `SessionError`, `check_tool_names`. **Ported and tested:** the constructor, the getters, `send` (starts the turn task), `interrupt`, `clear`, `resume`, `configure` (all or nothing), `rate`, `save`/`snapshot` (`answer_all_calls`), `flush`, `close`, `build_system`, `lookup`, `count`, `nearly_full`. **Todo:** `run_turn` (its order is documented on the function), `compact`, `save_now` |
-| `src/sdk.ts` | `sdk.rs` | `SessionBuilder`, `SessionOptions`, `Store`, `no_yolo_reason` and `create_session` are ported, with checks tested. Todo: making and starting the `McpManager` |
-| `src/config/config.ts` (+ `providerFactory` from `src/provider/factory.ts`) | `config.rs` | **Ported and tested:** `preset` (Marv's `PRESETS`), `FileConfig::from_value`/`to_value`, `resolve_config`, `max_steps_from_env`, `ollama_url`, `needs_setup`, `mask_key`, `default_config_dir`, `ConfigStore` (0600), `migrate_legacy_config`, `provider_factory`. Todo: the SDK factory's model list (`load`) |
+| `src/session.ts` | `session.rs` | **Types and API are done:** `SessionEvent`, `TurnStatus`, `TurnEndReason`, `CompactResult`, `SessionInit`, `Configure`, `SendOptions`, `Turn` (a `Stream`; dropping it interrupts), `SessionError`, `check_tool_names`. **Ported and tested:** the constructor, the getters, `send` (starts the turn task), `interrupt`, `clear`, `resume`, `configure` (all or nothing), `rate`, `save`/`snapshot` (`answer_all_calls`), `flush`, `close`, `build_system`, `lookup`, `count`, `nearly_full`, `run_turn` (#11: MCP wait, the turn's settings, trajectory and implicit feedback, compaction before and between steps, the deferred-MCP note and rewrite, the checks hooks, the step-limit question, the subagent sink, `Tainted`), `compact`/`summarize_into`, `save_now`/`schedule_save`/`flush` (writes for a conversation left behind are awaited). Tests: the `session.test.ts` cases whose collaborators exist (`turn_tests`). **Not yet testable:** subagents, worktrees, the MCP wait and deferred mode (needs `McpManager::start`), diagnostics (needs `Checker::turn`) |
+| `src/sdk.ts` | `sdk.rs` | **Ported:** `SessionBuilder`, `SessionOptions`, `Store`, `no_yolo_reason`, `create_session` (with the `McpManager`: trust file, logins, the needs-login warning once per server, started in the background), checks tested |
+| `src/config/config.ts` (+ `providerFactory` from `src/provider/factory.ts`) | `config.rs` | **Ported and tested:** `preset` (Marv's `PRESETS`), `FileConfig::from_value`/`to_value`, `resolve_config`, `max_steps_from_env`, `ollama_url`, `needs_setup`, `mask_key`, `default_config_dir`, `ConfigStore` (0600), `migrate_legacy_config`, `provider_factory`. The SDK factory's model list is `marv_provider::models::list_models` (#2) |
 | `src/prompt.ts` | `prompt.rs` | **Ported and tested:** `system_prompt`, `subagent_prompt`, `cut_instructions`/`read_instructions` (the 20k cut, headings after the cut, fences skipped), `instructions_cut_notice`, `instructions_cut_item`. Plan #62 `instruction_files` is a stub |
 | `src/sessions.ts` | `sessions.rs` | **Ported and tested:** `SavedSession` (Marv's field names), `new_session`, `title_of`, `time_ago`, `SessionStore` (save, load, list, latest, the legacy folder) |
 | `src/trajectory.ts` | `trajectory.rs` | **Ported and tested:** `TrajectoryRecord` (Marv's JSON shapes, plus `mesh` and `taint`), `TrajectoryStore`, `Trajectory` (an ordered writer thread, fresh line after a crash, the first error reported once), `AgentRecorder`, `MeshSink` |
@@ -37,7 +37,7 @@ Spec: the **Config**, **Session**, **SDK**, **Skills**, **Memory**, **Subagents*
 | `src/tool-draft.ts` | `tool_draft.rs` | **Ported and tested** |
 | `src/types.ts` | `types.rs` | **Done** (`Message`, `Role`, `ToolStatus`, `Notice`): the transcript is saved with sessions |
 | (new) | `runner.rs` | **Done and tested:** `SessionToolRunner`, `tool_run_from`, `ToolDisplay`, `approval_record` (`ApprovalRecord` lives in marv-agent, re-exported), `SessionApprover`, `AlwaysScopes`, `step_limit_request`, `SessionAgentHost` (except `preview`) |
-| (new) | `mcp_tools.rs` | `McpToolAdapter` is done (its kind follows the taint). `ToolSearchTool` and `McpCallTool` are skeletons with `run` todo |
+| (new) | `mcp_tools.rs` | **Done:** `McpToolAdapter` (its kind follows the taint), `ToolSearchTool` and `McpCallTool` (`run_tool` with the real tool, the closest names, the schema once, the #10 string-arguments repair). Tested without a connected server |
 | (new) | `mesh.rs` | `MeshHandle`, `WireApprover`, `headless_grants` (tested), and `MeshTool` with `run` todo |
 | (new) | `provenance.rs` | **Done and tested:** `fence`, `project_note` |
 | (new) | `time.rs` | **Done and tested:** `now_ms`, `iso`, `iso_date` |
@@ -101,6 +101,10 @@ Approvals: the client supplies an `Arc<dyn marv_tools::Approver>` (`SessionInit:
 - **Frontmatter YAML** uses `serde_norway`. The YAML error wording differs from Bun's.
 - **Project-check patterns** are JavaScript regexes that run in the sandbox. They aren't compiled in Marv's process to validate them (Rust's regex dialect differs), so a bad pattern shows up as that check's `failed` violation.
 - **The check runner needs a redesign.** Marv sent TypeScript source to `bun -e` inside the sandbox. marv-rs has no TypeScript of its own. Plan: bind-mount the `marv` binary read-only and run a hidden `marv __run-checks`, which takes the spec on stdin and matches the patterns itself. `.ts` scripts still run with the project's bun.
+- **`send()` records the pasted sites, then `start()` runs the turn.** The session's tests start turns with `start()` while `marv_tools::web_fetch::pasted_scopes` is a stub.
+- **A panicking provider or tool** (Marv: one that throws) is caught around the turn's body (`catch_unwind`): the turn ends with `Error: <message>` and `TurnEnd`, and the session lives on.
+- **`working` is a token** cancelled when the turn's task (or `compact()`) has fully ended; `close()` waits on it. `compact()` frees the session from a drop guard, so a caller dropping its future can't leave it busy.
+- **Mesh:** the main agent's mesh tools are offered on a plug named `main` when the session has a switchboard; draining the inbox between steps waits for mesh v1 (`Switchboard::drain_inbox`).
 - **Trajectory usage** is written with Marv's camelCase field names (`UsageRecord`). `marv_core::Usage` serializes in snake_case, so it isn't used directly.
 
 ## marv-rs behaviour changes
@@ -114,5 +118,12 @@ Approvals: the client supplies an `Arc<dyn marv_tools::Approver>` (`SessionInit:
 
 ## Upstream gaps (other crates)
 
+Found by running the oracle (#11) with `pasted_scopes` stubbed out locally: the session itself drives all 25 non-MCP scenarios to the right files, events and requests; what still differs is in other crates.
+
+- **marv-tools:** `web_fetch::pasted_scopes` is todo, and `send()` calls it, so every `marv -p` panics before its turn. The grep spec's `pattern` description differs from Marv's ("Rust regex syntax…"; list it in oracle.md if deliberate), and read_file's `offset` lacks Marv's `"maximum": 9007199254740991`. Both differ in all 28 scenarios.
+- **marv-cli:** the `stream-json` `tool_end` always has `error` and `approval`; Marv leaves out `error: false` and `approval: "none"` (`headless.rs:195`).
+- **marv-mcp:** `McpManager::start`/`close` are todo (the three MCP scenarios panic), and a new manager reports `settled()` before `start()` ran, so `WaitingForMcp` would be skipped.
+- **marv-agent:** after `on_full` returns false with the turn cancelled (Esc during a mid-turn compaction) and no `after_step`, the loop still calls `provider.stream` once, with the cancelled token, before ending `Aborted`; Marv sent nothing. Also #64 (continue after a dropped stream) makes `dropped-stream` differ from the recording: the kept partial plus the replayed reply. List #64 in oracle.md, or re-record.
+- **marv-session (other modules):** `Checker::turn` and `combine_checks` for two kinds are todo (a turn with diagnostics or checks on panics into an `Error`), and so are `run_subagent` and `SessionAgentHost::preview` (the agent tool).
 - **marv-agent:** nothing fences tool output by provenance in the loop; the session does it in `tool_run_from`.
-- **marv-tools:** `web_fetch::pasted_scopes` and `memory::{add,find,remove}_memory` are todo, and `send()` calls `pasted_scopes`.
+- **marv-tools:** `memory::{add,find,remove}_memory` are todo.

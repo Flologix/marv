@@ -1418,6 +1418,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "marv-guards"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "marv-core",
+ "marv-mcp",
+ "marv-mesh",
+ "marv-oracle",
+ "marv-sandbox",
+ "marv-session",
+ "marv-tools",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "marv-mcp"
 version = "0.0.1"
 dependencies = [
