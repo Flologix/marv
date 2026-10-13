@@ -8,11 +8,9 @@
 // Keyed by owner too: your servers share one login per URL across projects, while a project's server gets its own,
 // per project. Trusting a project's .mcp.json means "run this server", not "act as my account": a repository that
 // names your server's URL must not get your login by the trust you gave it for something else.
-import { randomBytes } from "node:crypto";
-import { closeSync, existsSync, linkSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeSync } from "node:fs";
-import { mkdir } from "node:fs/promises";
-import { dirname } from "node:path";
+import { existsSync } from "node:fs";
 import { z } from "zod";
+import { withFileLock } from "../file-lock.ts";
 import { projectKey } from "../paths.ts";
 import { writePrivate } from "../private-file.ts";
 
@@ -39,92 +37,10 @@ export function loginKey(server: { source: "personal" | "project"; url: string }
   return server.source === "personal" ? `personal ${server.url}` : `project:${projectKey(root)} ${server.url}`;
 }
 
-/** Read-modify-writes in this process, per file, one after the other (two managers can share one file). */
-const queues = new Map<string, Promise<unknown>>();
-
-/** A lock older than this was left by a process that died mid-update (an update takes milliseconds). */
-const STALE_LOCK_MS = 10_000;
-/** How long an update waits for another process's lock: long enough to outlast a stale one. */
-const LOCK_WAIT_MS = STALE_LOCK_MS + 5_000;
-
 /** Why update() refused: the file exists but this Marv can't read it, so writing would destroy what it holds. */
 export class UnusableTokenStore extends Error {
   constructor(path: string) {
     super(`${path} can't be read or is a format this Marv doesn't know (a newer version, or a hand edit): Marv won't write over it. Fix or remove the file, then log in again.`);
-  }
-}
-
-/**
- * Holds `<store>.lock` across one read-modify-write, so two Marv processes can't both read the same snapshot and
- * the later write drop what the other just saved (a rotated token, a registration, a logout). O_EXCL creation is
- * the lock (atomic on every local filesystem); a lock whose mtime is older than STALE_LOCK_MS is a crashed
- * process's and is taken over.
- */
-/**
- * Removes the lock at `lock` only if it is still the one whose content was judged stale. It's renamed aside first
- * (atomic: of several waiters, one gets it), then its content is compared: a lock created after the staleness check
- * (another waiter took over and a process created a fresh one) is put back, not destroyed.
- */
-export function takeOverStale(lock: string, staleContent: string): boolean {
-  const aside = `${lock}.${randomBytes(6).toString("hex")}`;
-  try {
-    renameSync(lock, aside);
-  } catch {
-    return false; // gone already, or another waiter moved it: try again
-  }
-  let content = "";
-  try {
-    content = readFileSync(aside, "utf8");
-  } catch {
-    // unreadable: treat as not the stale one
-  }
-  if (content === staleContent) {
-    unlinkSync(aside);
-    return true;
-  }
-  // A fresh lock was moved by mistake: put it back where its owner expects it (link fails if a new one appeared,
-  // in which case that one stands and this one is released).
-  try {
-    linkSync(aside, lock);
-  } catch {
-    // another lock exists now
-  }
-  unlinkSync(aside);
-  return false;
-}
-
-async function withFileLock<T>(path: string, fn: () => Promise<T>): Promise<T> {
-  const lock = `${path}.lock`;
-  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-  const started = Date.now();
-  for (;;) {
-    try {
-      const fd = openSync(lock, "wx", 0o600);
-      // A token unique to this hold: a takeover checks it, so it never removes a lock created after its check.
-      writeSync(fd, `${process.pid} ${randomBytes(9).toString("hex")}`);
-      closeSync(fd);
-      break;
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-    }
-    try {
-      // The content first, then the age: if a fresh lock replaces the stale one in between, the content won't match.
-      const seen = readFileSync(lock, "utf8");
-      if (Date.now() - statSync(lock).mtimeMs > STALE_LOCK_MS) takeOverStale(lock, seen);
-    } catch {
-      // released meanwhile: try again
-    }
-    if (Date.now() - started > LOCK_WAIT_MS) throw new Error(`${lock} is held by another Marv process: try again in a moment.`);
-    await Bun.sleep(5 + Math.random() * 20);
-  }
-  try {
-    return await fn();
-  } finally {
-    try {
-      unlinkSync(lock);
-    } catch {
-      // already gone (taken over as stale): nothing to release
-    }
   }
 }
 
@@ -164,26 +80,19 @@ export class McpTokenStore {
   }
 
   /**
-   * Replaces one entry with what `fn` makes of it; `undefined` removes it. Queued per file in this process and
-   * locked across processes; throws UnusableTokenStore rather than write over a file it can't read.
+   * Replaces one entry with what `fn` makes of it; `undefined` removes it. Held under `<store>.lock`
+   * (src/file-lock.ts), so two Marv processes can't both read one snapshot and drop each other's update; throws
+   * UnusableTokenStore rather than write over a file it can't read.
    */
   update(key: string, fn: (entry: Login | undefined) => Login | undefined): Promise<void> {
-    const previous = queues.get(this.path) ?? Promise.resolve();
-    const next = previous
-      .catch(() => {})
-      .then(() =>
-        withFileLock(this.path, async () => {
-          const file = await this.read();
-          if (file === "unusable") throw new UnusableTokenStore(this.path);
-          const entry = fn(file.logins[key]);
-          if (entry) file.logins[key] = entry;
-          else delete file.logins[key];
-          await writePrivate(this.path, JSON.stringify(file, null, 2));
-        }),
-      );
-    queues.set(this.path, next);
-    void next.catch(() => {}).finally(() => queues.get(this.path) === next && queues.delete(this.path));
-    return next;
+    return withFileLock(this.path, async () => {
+      const file = await this.read();
+      if (file === "unusable") throw new UnusableTokenStore(this.path);
+      const entry = fn(file.logins[key]);
+      if (entry) file.logins[key] = entry;
+      else delete file.logins[key];
+      await writePrivate(this.path, JSON.stringify(file, null, 2));
+    });
   }
 
   remove(key: string): Promise<void> {

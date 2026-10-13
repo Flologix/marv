@@ -3,20 +3,22 @@
 // never overwritten (it's yours to fix). Never the project's .mcp.json: that one is shared with the repository.
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import { withFileLock } from "../file-lock.ts";
 import { writePrivate } from "../private-file.ts";
 import { checkEntry, PERSONAL_FILE } from "./config.ts";
 
 type McpFile = Record<string, unknown> & { mcpServers?: Record<string, unknown> };
 
-/** One change at a time: two adds right after each other must both land (each re-reads the file). */
-let queue: Promise<unknown> = Promise.resolve();
-const serial = <T>(work: () => Promise<T>): Promise<T> => {
-  const next = queue.catch(() => {}).then(work);
-  queue = next;
-  return next;
-};
-
 export const personalFile = (configDir: string) => join(configDir, PERSONAL_FILE);
+
+/**
+ * One change at a time, across Marv processes too: the whole read-change-write holds `mcp.json.lock`
+ * (src/file-lock.ts), so two terminals adding servers at once both land, and a remove can't undo an add.
+ */
+const locked = <T>(configDir: string, work: (path: string) => Promise<T>): Promise<T> => {
+  const path = personalFile(configDir);
+  return withFileLock(path, () => work(path));
+};
 
 /** The file as it is right now; missing is empty. Anything Marv can't safely change throws. */
 async function read(path: string): Promise<McpFile> {
@@ -41,9 +43,8 @@ const write = (path: string, file: McpFile) => writePrivate(path, `${JSON.string
  * an entry Marv couldn't load. Written 0600: it may hold header references.
  */
 export function addPersonalServer(configDir: string, name: string, entry: unknown): Promise<void> {
-  return serial(async () => {
+  return locked(configDir, async (path) => {
     checkEntry(name, entry);
-    const path = personalFile(configDir);
     const file = await read(path);
     if (file.mcpServers && Object.hasOwn(file.mcpServers, name)) {
       throw new Error(`You already have a server named "${name}" in ${path}: pick another with --name, or /mcp remove ${name} first.`);
@@ -54,8 +55,7 @@ export function addPersonalServer(configDir: string, name: string, entry: unknow
 
 /** Removes server `name`, keeping everything else. */
 export function removePersonalServer(configDir: string, name: string): Promise<void> {
-  return serial(async () => {
-    const path = personalFile(configDir);
+  return locked(configDir, async (path) => {
     const file = await read(path);
     if (!file.mcpServers || !Object.hasOwn(file.mcpServers, name)) throw new Error(`There's no server "${name}" in ${path}.`);
     const { [name]: _, ...rest } = file.mcpServers;
