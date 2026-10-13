@@ -18,7 +18,7 @@ The design is in `docs/MESH.md`, and the security rules are in `docs/SECURITY.md
 | new | `message.rs` | **Done, with tests.** `Envelope` (sender, receptacle, mode, `Provenance::Mesh`, size) and `fenced()`. |
 | new | `limits.rs` | **Done, with tests.** `WireLimits` (size) and `RateLimiter` (a token bucket per wire, fed the time in ms). |
 | new | `approval.rs` | **Done, with tests.** `WireRequest`, `parse_approve_flag` (`--approve mesh:<receptacle>`), and `parse_wire_spec` (`a -> b:inbox`). |
-| new | `switchboard.rs` | Done and tested: `offer`, `plug`, `wire`, `unwire`, `unplug`, `reachable`, and `admit` (the policy check, logged as a `MeshRecord` either way). Still todo: `route`, `handle` (the MCP server), `serve` (the sockets) and `drain_inbox`. |
+| new | `switchboard.rs` | Done and tested: `offer`, `plug`, `wire`, `unwire`, `unplug`, `reachable`, and `admit` (the policy check, logged as a `MeshRecord` either way). Shared as `Arc<Switchboard>`: `&self` methods over one short sync lock; `serve` and `route` take `Arc<Self>`. Still todo: `route`, `handle` (the MCP server), `serve` (the sockets) and `drain_inbox`. |
 | new | `tools.rs` | **Done, with tests.** The `mesh_list`, `mesh_call` and `mesh_send` specs, plus `kind_of`. |
 | new | `discovery.rs` | `mesh_dir` and `session_socket` are done and tested. Still todo: `list` (`marv mesh ls`). |
 | `src/herdr.ts` | `herdr.rs` | **Status reporting ported, with tests:** `herdr_target`, `build_request`, `HerdrReporter` (skips repeats, sends only the newest state, a rising seq, one retry) and `SocketSender`. Still todo: `HerdrAdapter`, for v2. |
@@ -82,12 +82,14 @@ Run `grep -rn 'todo!("port' crates/marv-mesh` to see what's left. Each mesh todo
 
 ```rust
 // switchboard (marv-session owns one per process)
+// Shared as Arc<Switchboard>: every method takes &self; serve/route take Arc<Self>.
 Switchboard::new(session, runtime_dir, Arc<dyn TrajectorySink>)
+  .table() -> WireTable (snapshot); .receptacle(&name) -> Option<Receptacle> (clone)
   .plug(PlugId) -> Plug                    // Plug::mount() -> SocketMount { host, guest: "/run/marv/mesh.sock" } for marv-sandbox
   .offer(Receptacle); .wire(Wire) -> Result; .unwire(..); .unplug(&PlugId)
   .reachable(&PlugId) -> Vec<Reachable>    // mesh_list
   .admit(&from, &receptacle, mode, body, now_ms) -> Result<Envelope>
-  async .route(Envelope); async .serve(cancel); .drain_inbox(&PlugId) -> Vec<Envelope>
+  async Arc::clone(&sb).route(Envelope); async Arc::clone(&sb).serve(cancel); .drain_inbox(&PlugId) -> Vec<Envelope>
 trait TrajectorySink { fn mesh(&self, MeshRecord); }
 
 // approvals (marv-tui / marv-cli)

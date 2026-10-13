@@ -12,6 +12,7 @@ grep -rn 'todo!("port' crates/<crate>             # in one crate
 | Crate | Doc | Pure logic already ported, with tests | Left (`todo!`) |
 |---|---|---|---|
 | marv-core | — | All: types, `printable` | — |
+| marv-fs | [fs.md](subsystems/fs.md) | All: `write_private`, `with_file_lock` (cross-process) | — |
 | marv-provider | [provider.md](subsystems/provider.md) | SSE/NDJSON, retry helpers, errors, model list, request bodies, cache breakpoints (#56), reasoning round-trip (#57) | HTTP streaming loops, `create_provider`, model lookup |
 | marv-agent | [agent.md](subsystems/agent.md) | Repetition guards, per-step stream fold, call grouping for parallel reads (#58), compaction v1 | The loop body (`LoopState::advance`), compaction v2 (#63) |
 | marv-sandbox | [sandbox.md](subsystems/sandbox.md) | All: bwrap args, stand-in home, protected paths, taint, realpath containment | — |
@@ -25,11 +26,9 @@ grep -rn 'todo!("port' crates/<crate>             # in one crate
 Try the martian: `cargo run -p marv-tui --example martian` (q to quit).
 
 ## Cross-crate API gaps to fix early
-- **marv-mcp `McpManager`:** lifecycle methods take `&mut self`, so the session holds it in an `RwLock`, and `/mcp` blocks while a turn waits on `ready()`. Move to interior mutability, and add an `on_change` hook (needed for "needs login" warnings).
-- **marv-mesh `Switchboard::serve`/`route`:** they take `&mut self`. Make them take `Arc<Self>` with interior mutability.
-- **marv-provider `list_models`:** it needs a caller-supplied `reqwest::Client`. Add an owning `list_models(kind, base_url)`.
-- **marv-agent `ToolRun`:** add an `approval` field. The session carries it in `display` for now.
-- **Shared file helpers:** `private_file` and `file_lock` are needed by both marv-mcp and marv-session. Move them into a small crate below both (or into marv-core behind a feature).
+None open. Issue #1 closed the skeleton's: marv-fs (`private_file`, `file_lock`) below marv-mcp and marv-session, a self-synchronized `McpManager` (`Arc`, `&self`, `set_on_change`) and `Switchboard` (`serve`/`route` on `Arc<Self>`), an owning `list_models(kind, base_url, api_key)`, and `ToolRun::approval`.
+
+## Cross-crate seams (by design)
 - **The session ↔ TUI bridge:** marv-cli maps `SessionEvent` to `UiEvent` and implements `SessionPort` on `MarvSession`. See cli.md.
 - **Draft labels:** `tool_draft` lives in marv-session; the TUI's draft view uses it through `UiEvent::ToolCallDelta`.
 

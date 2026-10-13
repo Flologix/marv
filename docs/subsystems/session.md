@@ -28,8 +28,7 @@ Spec: the **Config**, **Session**, **SDK**, **Skills**, **Memory**, **Subagents*
 | `src/diagnostics/tsc.ts` | `diagnostics/tsc.rs` | **Ported and tested** (`parse_tsc`, `new_errors` via `new_problems`, `format_error`, `missing_interpreter`, `diagnostics_note` (fenced), `detect_checker`, `check_command`) |
 | `src/diagnostics/turn.ts` | `diagnostics/turn.rs` | **Ported:** `CheckOutcome`, `CheckKind`, `Typecheck`, `new_problems`, `changed_files`, `TurnChecks`, `Checker::reset`, `check_notice`. **Todo:** `Checker::turn`, and `combine_checks` for two or more kinds |
 | `src/feedback.ts` | `feedback.rs` | **Ported and tested** (`classify_reply`; the lookarounds are emulated) |
-| `src/file-lock.ts` | `file_lock.rs` | Types only. Todo: `with_file_lock` |
-| `src/private-file.ts` | `private_file.rs` | **Ported and tested** (`write_private`: 0600 in a 0700 folder, unique temp file, queued per path) |
+| `src/file-lock.ts`, `src/private-file.ts` | — | Moved to marv-fs (`docs/subsystems/fs.md`): marv-mcp needs them too |
 | `src/paths.ts` | `paths.rs` | **Ported and tested** (`project_key`, `legacy_project_key`, `shorten_home`, `home_or_above`) |
 | `src/sources.ts` | `sources.rs` | **Ported** (`load_sources`) |
 | `src/event-queue.ts` | `event_queue.rs` | **Ported and tested** (an unbounded channel with one reader) |
@@ -37,7 +36,7 @@ Spec: the **Config**, **Session**, **SDK**, **Skills**, **Memory**, **Subagents*
 | `src/commands/index.ts`, `sandbox-notice.ts` | `commands.rs` | **Ported and tested:** every command, `run_command`, `help_text`, the `/config`, `/checks`, `/mcp`, `/skills` and `/agents` texts, and the status lines |
 | `src/tool-draft.ts` | `tool_draft.rs` | **Ported and tested** |
 | `src/types.ts` | `types.rs` | **Done** (`Message`, `Role`, `ToolStatus`, `Notice`): the transcript is saved with sessions |
-| (new) | `runner.rs` | **Done and tested:** `SessionToolRunner`, `tool_run_from`, `ToolDisplay`, `ApprovalRecord`, `SessionApprover`, `AlwaysScopes`, `step_limit_request`, `SessionAgentHost` (except `preview`) |
+| (new) | `runner.rs` | **Done and tested:** `SessionToolRunner`, `tool_run_from`, `ToolDisplay`, `approval_record` (`ApprovalRecord` lives in marv-agent, re-exported), `SessionApprover`, `AlwaysScopes`, `step_limit_request`, `SessionAgentHost` (except `preview`) |
 | (new) | `mcp_tools.rs` | `McpToolAdapter` is done (its kind follows the taint). `ToolSearchTool` and `McpCallTool` are skeletons with `run` todo |
 | (new) | `mesh.rs` | `MeshHandle`, `WireApprover`, `headless_grants` (tested), and `MeshTool` with `run` todo |
 | (new) | `provenance.rs` | **Done and tested:** `fence`, `project_note` |
@@ -71,7 +70,7 @@ pub enum SessionEvent {
     Tainted { source: Provenance },                      // marv-rs: show it in the status bar
     TurnEnd { turn: String, reason: TurnEndReason },     // always last; Done(StopReason) | Interrupted
 }
-// ToolRun::display downcasts to marv_session::ToolDisplay { diff: Option<DiffShown>, approval: ApprovalRecord }.
+// ToolRun::approval is an ApprovalRecord; ToolRun::display downcasts to marv_session::ToolDisplay { diff: Option<DiffShown> }.
 // Notices: diagnostics::check_notice(&CheckResult), checks::project_check_notice(&ProjectCheckResult) (both printable).
 
 // Between turns
@@ -115,9 +114,5 @@ Approvals: the client supplies an `Arc<dyn marv_tools::Approver>` (`SessionInit:
 
 ## Upstream gaps (other crates)
 
-- **marv-mcp:** `McpManager`'s lifecycle methods take `&mut self` and `ready()` is async. The session shares it as `Arc<tokio::sync::RwLock<McpManager>>` (`McpHandle`), so `/mcp status` waits while a turn waits on `ready()`. An internally synchronized manager (`&self` methods) would fix that. There is also no `onChange` hook yet, which the SDK's "needs a login" warnings need.
-- **marv-mesh:** `Switchboard::serve(&mut self)` holds the switchboard for the whole socket loop, and `route` takes `&mut self` too. `serve` should take `Arc<Self>` with interior mutability.
-- **marv-provider:** `models::list_models` needs a `reqwest::Client` from the caller. `ConfigFactory::load` (the SDK path) can't make one without a reqwest dependency in marv-session. Suggest `list_models(kind, base_url)` with the provider crate owning the client.
-- **marv-agent:** `ToolRun` has no `approval` field. The session carries it in `display` (`ToolDisplay`) so trajectories and headless can read it. A first-class `approval: Option<…>` would be cleaner. Nothing fences tool output by provenance in the loop; the session does it in `tool_run_from`.
+- **marv-agent:** nothing fences tool output by provenance in the loop; the session does it in `tool_run_from`.
 - **marv-tools:** `web_fetch::pasted_scopes` and `memory::{add,find,remove}_memory` are todo, and `send()` calls `pasted_scopes`.
-- **Shared file helpers:** `private_file` and `file_lock` are needed by marv-mcp (trust, token store, personal file), which can't depend on marv-session. They belong in a small crate below both (or in marv-sandbox).
