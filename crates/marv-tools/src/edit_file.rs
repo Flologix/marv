@@ -7,10 +7,13 @@
 //! - Not found: the error shows the file's closest lines numbered like `read_file`, so the model can copy the real text
 //!   in its next call; it suggests `write_file` only when the parent folder exists (a mistyped folder would become a
 //!   stray copy).
-//! - A forgiving match says which one applied ([`fuzzy_note`]).
+//! - A forgiving match says which one applied ([`fuzzy_note`]), the Unicode tier (#60) included.
 //! - After the change, `syntax::broken_by` adds a `Marv:` note when the change broke the file's syntax.
 //! - Yolo: `auto_safe` outside `.git` (`touches_git`, through symlinks), re-checked at apply time (`refuse_git`).
-//! - marv-rs: a protected path (`marv_sandbox::protected_rule`) asks even in yolo.
+//! - marv-rs: a protected path (`marv_sandbox::protected_rule`) asks even in yolo, and so does a `package.json` edit
+//!   that changes a lifecycle script (the content rule, `marv_sandbox::protected::lifecycle_scripts_changed`).
+//! - `run` awaits `before_change` (or Esc), then plans again and writes under [`with_file_lock`], so a parallel
+//!   edit or append on the same file can't be lost.
 //! - Planned (#67): run the project's formatter on the changed file after the edit (sandboxed, project read-only
 //!   except that file), and report what it changed so the model's next `old_string` matches.
 
@@ -18,11 +21,13 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::diff::diff_text;
+use crate::diff::{change_summary, diff_text, shown_diff};
 use crate::edit_match::{EditResult, Fuzzy, apply_edit, closest_lines};
+use crate::file_lock::with_file_lock;
 use crate::files::{is_directory, project_path, refuse_git, require_regular_file, resolve_in_project, touches_git};
 use crate::read_file::numbered_line;
 use crate::repair::repair_path_field;
+use crate::syntax::{broken_by, syntax_note};
 use crate::types::{Preview, Repaired, Scope, Tool, ToolContext, ToolError, ToolOutput};
 
 const MAX_CLOSEST_LINES: usize = 30;
@@ -31,6 +36,9 @@ const MAX_CLOSEST_CHARS: usize = 500;
 /// What the result says after a forgiving match.
 pub fn fuzzy_note(fuzzy: Fuzzy) -> &'static str {
     match fuzzy {
+        Fuzzy::Unicode => {
+            "old_string matched once typographic characters (curly quotes, dashes, …, Unicode spaces) were read as ASCII."
+        }
         Fuzzy::TrailingWhitespace => "old_string matched once trailing whitespace was ignored.",
         Fuzzy::Indentation => "old_string matched only with different indentation; new_string was re-indented to match the file.",
     }
@@ -118,6 +126,21 @@ pub(crate) fn start_before_change(ctx: &ToolContext) {
     }
 }
 
+/// What a change returns when Esc came while it waited for the baseline.
+pub(crate) const INTERRUPTED_BEFORE_WRITE: &str = "Interrupted before the change was written: nothing changed.";
+
+/// Awaits the session's before-change hook, or Esc. True: stopped, so nothing may be written (the hook resolves on
+/// abort, but the user said stop).
+pub(crate) async fn await_before_change(ctx: &ToolContext) -> bool {
+    if let Some(hook) = &ctx.before_change {
+        tokio::select! {
+            () = hook.before_change() => {}
+            () = ctx.cancel.cancelled() => {}
+        }
+    }
+    ctx.aborted()
+}
+
 pub struct EditFile;
 
 #[async_trait]
@@ -160,6 +183,7 @@ impl Tool for EditFile {
     }
     fn protected_target(&self, input: &EditFileInput, ctx: &ToolContext) -> Option<marv_sandbox::ProtectedRule> {
         protected_target(&input.path, ctx)
+            .or_else(|| package_scripts_changed(input, ctx).then_some(marv_sandbox::ProtectedRule::PackageScripts))
     }
     fn repair(&self, raw: &Value, ctx: &ToolContext) -> Option<Repaired> {
         repair_path_field(raw, &ctx.root)
@@ -175,13 +199,53 @@ impl Tool for EditFile {
         })
     }
 
-    async fn run(&self, _input: &EditFileInput, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
-        todo!(
-            "port: await before_change; aborted → 'Interrupted before the change was written: nothing changed.'; \
-             with_file_lock(plan + write); broken_by note; 'Edited <shown>: replaced N occurrence(s) (+a −r lines).' + fuzzy_note; \
-             diff = shown_diff, changed = shown; #67 formatter"
-        )
+    async fn run(&self, input: &EditFileInput, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        if await_before_change(ctx).await {
+            return Ok(ToolOutput::ok(INTERRUPTED_BEFORE_WRITE, "interrupted"));
+        }
+        // Planned again: the file may have changed while the user was deciding. Read and written as one step per
+        // file, so a parallel edit (or append) can't be lost.
+        let Plan { shown, before, after, count, fuzzy, .. } = with_file_lock(&ctx.root, &input.path, || async {
+            let planned = plan(input, ctx).await?;
+            tokio::fs::write(&planned.absolute, &planned.after)
+                .await
+                .map_err(|e| ToolError(format!("Couldn't write {}: {e}", planned.shown)))?;
+            Ok::<_, ToolError>(planned)
+        })
+        .await?;
+        let diff = diff_text(&before, &after, 3);
+        let note = fuzzy.map(|f| format!(" {}", fuzzy_note(f))).unwrap_or_default();
+        let broken = match broken_by(&shown, Some(&before), &after).await {
+            Some(problem) => format!("\n\n{}", syntax_note(&shown, &problem, &after, true)),
+            None => String::new(),
+        };
+        let plural = if count == 1 { "" } else { "s" };
+        let summary = change_summary(&diff);
+        let mut result = ToolOutput::ok(
+            format!("Edited {shown}: replaced {count} occurrence{plural} ({summary} lines).{note}{broken}"),
+            summary,
+        );
+        result.diff = Some(shown_diff(&diff.lines));
+        result.changed = Some(shown);
+        Ok(result)
     }
+}
+
+/// marv-rs: an edit to a `package.json` that changes a lifecycle script asks even in yolo (`docs/SECURITY.md`). The
+/// edit is planned on the file as it is now; one that can't apply asks nothing here (its preview fails).
+fn package_scripts_changed(input: &EditFileInput, ctx: &ToolContext) -> bool {
+    let Some(absolute) = package_json(&input.path, ctx) else { return false };
+    let Ok(before) = std::fs::read_to_string(&absolute) else { return false };
+    match apply_edit(&before, &input.old_string, &input.new_string, input.replace_all.unwrap_or(false)) {
+        EditResult::Applied { text, .. } => marv_sandbox::protected::lifecycle_scripts_changed(Some(&before), &text),
+        _ => false,
+    }
+}
+
+/// The resolved path when `path` names a `package.json` inside the project.
+pub(crate) fn package_json(path: &str, ctx: &ToolContext) -> Option<std::path::PathBuf> {
+    let absolute = resolve_in_project(ctx, path).ok()?;
+    (absolute.file_name()? == "package.json").then_some(absolute)
 }
 
 /// The protected rule a project path falls under (marv-rs); a path outside the project is left to `resolve_in_project`.

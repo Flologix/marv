@@ -7,8 +7,10 @@
 //! - Files are listed with `git ls-files -z --cached --others --exclude-standard` (so `.gitignore` applies) through
 //!   `runGit` (a 20 s timeout, no hooks or fsmonitor, inherited `GIT_*` dropped, `ToolContext::git_env` pins a worktree
 //!   subagent's git paths). A timeout is an error, never the unfiltered walk (it would return node_modules); `--cached`
-//!   includes deleted-but-staged files, so each is checked to exist. Outside a repo: a walk that skips
-//!   [`IGNORED_DIRS`] and special files.
+//!   includes deleted-but-staged files, so each is checked to exist. Outside a repo: a walk (ripgrep's `ignore`
+//!   walker, with its own filters off: [`IGNORED_DIRS`] decides, not a stray `.gitignore`) that skips special files.
+//! - Port note: `runGit` lives in marv-session's git module in the port, which marv-tools can't depend on, so the
+//!   listing has its own [`run_git`] with the same rules (`NO_PROGRAMS`, no inherited `GIT_*`, stdin closed).
 //! - `read_file`, `edit_file`, `write_file` and `grep` refuse special files (FIFOs, devices): reading one would block
 //!   forever, and Esc can't cancel it. A missing path is called missing, not special.
 //! - Binary: a NUL byte in the first 8 KB (crude but standard).
@@ -37,13 +39,72 @@ pub fn touches_git(ctx: &ToolContext, path: &str) -> bool {
     marv_sandbox::touches_git(&ctx.root, path, &ctx.home)
 }
 
+/// Hooks and fsmonitor are how a repository makes git run a program; Marv's own git calls turn both off.
+pub const NO_PROGRAMS: &[&str] = &["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"];
+
+/// How one of Marv's own git calls ended (`GitResult`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitResult {
+    pub ok: bool,
+    /// stdout when it succeeded, stderr when it failed; not trimmed.
+    pub out: String,
+    pub timed_out: bool,
+}
+
+/// Runs git outside the sandbox, in a folder an agent could have tampered with: it never runs the repository's
+/// programs (hooks, fsmonitor), never waits for input, never waits forever, and doesn't inherit `GIT_*` variables (a
+/// parent git or hook could have set `GIT_DIR`, `GIT_INDEX_FILE`…); `pinned` is added on top.
+pub async fn run_git(cwd: &Path, args: &[&str], pinned: &[(String, String)], timeout: Duration) -> GitResult {
+    let mut command = tokio::process::Command::new("git");
+    command.args(NO_PROGRAMS).args(args).current_dir(cwd);
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("GIT_") {
+            command.env_remove(key);
+        }
+    }
+    command.envs(pinned.iter().map(|(k, v)| (k, v)));
+    // Nothing may wait for input: there's no one to type it.
+    command.stdin(std::process::Stdio::null()).kill_on_drop(true);
+    match tokio::time::timeout(timeout, command.output()).await {
+        Err(_) => GitResult { ok: false, out: String::new(), timed_out: true },
+        Ok(Err(e)) => GitResult { ok: false, out: e.to_string(), timed_out: false },
+        Ok(Ok(output)) => {
+            let ok = output.status.success();
+            let out = String::from_utf8_lossy(if ok { &output.stdout } else { &output.stderr }).into_owned();
+            GitResult { ok, out, timed_out: false }
+        }
+    }
+}
+
 /// Every file in the project, project-relative and sorted (`git ls-files`, or the walk outside a repo).
-pub async fn list_project_files(
-    _root: &Path,
-    _git_env: &[(String, String)],
-    _timeout: Duration,
-) -> Result<Vec<String>, ToolError> {
-    todo!("port: listProjectFiles via runGit (marv-session's git module or a local run_git) with the walk fallback")
+pub async fn list_project_files(root: &Path, git_env: &[(String, String)], timeout: Duration) -> Result<Vec<String>, ToolError> {
+    let git = run_git(root, &["ls-files", "-z", "--cached", "--others", "--exclude-standard"], git_env, timeout).await;
+    // No fallback to the walk: it would return node_modules and other ignored folders unfiltered.
+    if git.timed_out {
+        return Err(ToolError::new("Listing the project's files timed out (a special file such as a FIFO may be blocking git)."));
+    }
+    let mut paths: Vec<String> = if git.ok {
+        // --cached includes deleted-but-staged files.
+        git.out.split('\0').filter(|p| !p.is_empty() && root.join(p).exists()).map(str::to_string).collect()
+    } else {
+        let root = root.to_path_buf();
+        tokio::task::spawn_blocking(move || walk(&root)).await.unwrap_or_default()
+    };
+    paths.sort();
+    Ok(paths)
+}
+
+/// The project's files outside a git repo: everything but [`IGNORED_DIRS`] and special files.
+fn walk(root: &Path) -> Vec<String> {
+    let walker = ignore::WalkBuilder::new(root)
+        .standard_filters(false)
+        .filter_entry(|entry| entry.depth() == 0 || !IGNORED_DIRS.iter().any(|d| entry.file_name() == *d))
+        .build();
+    walker
+        .filter_map(Result::ok)
+        .filter(|entry| entry.depth() > 0 && !entry.file_type().is_some_and(|t| t.is_dir()) && is_regular_file(entry.path()))
+        .filter_map(|entry| entry.path().strip_prefix(root).ok().map(|rel| rel.to_string_lossy().into_owned()))
+        .collect()
 }
 
 /// Files under `dir` (project-relative, `.` for everything).
@@ -83,6 +144,112 @@ pub fn looks_binary(bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TempDir, git, mkfifo, project};
+
+    async fn list(root: &Path, git_env: &[(String, String)]) -> Vec<String> {
+        list_project_files(root, git_env, LIST_TIMEOUT).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn outside_git_the_walk_skips_ignored_folders_and_special_files() {
+        let root = project("list-walk");
+        root.write("dist/out.js", "x");
+        root.write(".env", "x");
+        mkfifo(&root.path().join("src/pipe"));
+        assert_eq!(
+            list(root.path(), &[]).await,
+            [".env", "logo.png", "package.json", "src/app.ts", "src/greet.ts", "src/ui/view.tsx"]
+        );
+    }
+
+    #[tokio::test]
+    async fn inside_git_gitignore_decides_and_deleted_but_staged_files_are_left_out() {
+        let root = project("list-git");
+        git(root.path(), &["init", "-q"]);
+        root.write(".gitignore", "node_modules/\nsrc/ui/\n");
+        git(root.path(), &["add", "src/app.ts"]);
+        std::fs::remove_file(root.path().join("src/app.ts")).unwrap();
+        assert_eq!(list(root.path(), &[]).await, [".gitignore", "logo.png", "package.json", "src/greet.ts"]);
+    }
+
+    #[tokio::test]
+    async fn core_fsmonitor_in_the_projects_own_config_isnt_run() {
+        let root = TempDir::new("list-fsmonitor");
+        let outside = TempDir::new("list-fsmonitor-out");
+        let pwned = outside.path().join("PWNED");
+        git(root.path(), &["init", "-q"]);
+        git(root.path(), &["config", "core.fsmonitor", &format!("touch {}", pwned.display())]);
+        root.write("a.txt", "a\n");
+        // Negative control: plain git, without Marv's protections, does run the program.
+        let _ = std::process::Command::new("git").args(["ls-files", "--others"]).current_dir(root.path()).output();
+        assert!(pwned.exists());
+        std::fs::remove_file(&pwned).unwrap();
+        // (git passes the hook its version and a token, so the control's `touch` also made two files here.)
+        assert!(list(root.path(), &[]).await.contains(&"a.txt".to_string()));
+        assert!(!pwned.exists());
+    }
+
+    #[tokio::test]
+    async fn core_fsmonitor_in_a_per_worktree_config_isnt_run() {
+        let root = TempDir::new("list-worktree-config");
+        let outside = TempDir::new("list-worktree-config-out");
+        let pwned = outside.path().join("PWNED");
+        git(root.path(), &["init", "-q"]);
+        git(root.path(), &["config", "extensions.worktreeConfig", "true"]);
+        root.write(".git/config.worktree", format!("[core]\n\tfsmonitor = touch {}\n", pwned.display()));
+        root.write("w.txt", "w\n");
+        assert_eq!(list(root.path(), &[]).await, ["w.txt"]);
+        assert!(!pwned.exists());
+    }
+
+    #[tokio::test]
+    async fn with_git_env_a_redirected_git_file_is_ignored() {
+        let root = TempDir::new("list-git-env");
+        let outside = TempDir::new("list-git-env-out");
+        let pwned = outside.path().join("PWNED");
+        // Two usable repositories outside the work folder. Only the fake one hides hidden.txt.
+        let real = outside.path().join("real.git");
+        let fake = outside.path().join("fake.git");
+        for dir in [&real, &fake] {
+            git(outside.path(), &["init", "-q", "--bare", &dir.display().to_string()]);
+            git(dir, &["config", "core.bare", "false"]);
+        }
+        git(&fake, &["config", "core.fsmonitor", &format!("touch {}", pwned.display())]);
+        std::fs::write(fake.join("info/exclude"), "hidden.txt\n").unwrap();
+        // The .git file in the work folder points to the fake one.
+        root.write(".git", format!("gitdir: {}\n", fake.display()));
+        root.write("shown.txt", "s\n");
+        root.write("hidden.txt", "h\n");
+
+        // Unpinned, git follows the .git file: the fake repository's view.
+        let followed = list(root.path(), &[]).await;
+        assert!(followed.contains(&"shown.txt".to_string()) && !followed.contains(&"hidden.txt".to_string()));
+
+        // Pinned to the real repository: its view (hidden.txt isn't excluded there).
+        let pin = |k: &str, v: &Path| (k.to_string(), v.display().to_string());
+        let pinned =
+            list(root.path(), &[pin("GIT_DIR", &real), pin("GIT_COMMON_DIR", &real), pin("GIT_WORK_TREE", root.path())]).await;
+        assert!(pinned.contains(&"shown.txt".to_string()) && pinned.contains(&"hidden.txt".to_string()));
+        assert!(!pwned.exists());
+    }
+
+    #[tokio::test]
+    async fn a_fifo_named_gitignore_makes_the_listing_time_out_with_a_tool_error_quickly() {
+        let root = TempDir::new("list-fifo");
+        git(root.path(), &["init", "-q"]);
+        mkfifo(&root.path().join(".gitignore"));
+        let started = std::time::Instant::now();
+        let err = list_project_files(root.path(), &[], Duration::from_millis(300)).await.unwrap_err();
+        assert!(err.0.contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[tokio::test]
+    async fn files_under_a_folder() {
+        let root = project("list-under");
+        assert_eq!(files_under(root.path(), "src/ui", &[]).await.unwrap(), ["src/ui/view.tsx"]);
+        assert_eq!(files_under(root.path(), "src", &[]).await.unwrap().len(), 3);
+    }
 
     #[test]
     fn binary_is_a_nul_in_the_first_8k() {
