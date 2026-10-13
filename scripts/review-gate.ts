@@ -31,6 +31,8 @@ import { join } from "node:path";
 type Finding = { path: string; start_line?: number; end_line?: number; content: string; severity?: string; category?: string };
 type Result = { status?: string; message?: string; comments?: Finding[] | null; warnings?: unknown[] };
 type Warning = { type?: string; message?: string };
+// Eval tasks' starting repos hold bugs planted on purpose (the model is meant to find them): never findings.
+const EXCLUDE = "evals/tasks/*/repo/**";
 
 const SEVERITIES = ["critical", "high", "medium", "low"];
 const TIMEOUT_S = Number(process.env.REVIEW_GATE_TIMEOUT_S ?? "1200");
@@ -134,7 +136,7 @@ interface ReviewOutcome {
   result: Result | undefined;
 }
 const runReview = (from: string, to: string): ReviewOutcome => {
-  const run = spawnSync("ocr", ["review", "--from", from, "--to", to, "--format", "json", "--audience", "agent"], {
+  const run = spawnSync("ocr", ["review", "--from", from, "--to", to, "--format", "json", "--audience", "agent", "--exclude", EXCLUDE], {
     encoding: "utf8",
     maxBuffer: 64 * 1024 * 1024,
     timeout: TIMEOUT_S * 1000,

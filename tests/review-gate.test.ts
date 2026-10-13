@@ -247,3 +247,16 @@ test("REVIEW_GATE_FULL=1 reviews the whole branch even after an earlier pass", (
   expect(gate({ REVIEW_GATE_FULL: "1" }).exitCode).toBe(0);
   expect(reviewsLog().length).toBe(before + 1);
 });
+
+test("eval tasks' starting repos are excluded from the review (their bugs are planted)", () => {
+  writeFileSync(
+    join(bin, "ocr"),
+    "#!/bin/sh\n" +
+      'if [ "$1" = "--version" ]; then printf \'open-code-review v1.0.0 (abc)\\n\'; exit 0; fi\n' +
+      'echo "$@" >> "' + join(dir, "reviews") + '"\n' +
+      "echo '{\"status\":\"complete\",\"comments\":[]}'\n",
+  );
+  chmodSync(join(bin, "ocr"), 0o755);
+  expect(gate().exitCode).toBe(0);
+  expect(reviewsLog()[0]).toContain("--exclude evals/tasks/*/repo/**");
+});
