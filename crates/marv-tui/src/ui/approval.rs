@@ -7,6 +7,10 @@
 //! behind the head), and the choice: Yes / Yes, and don't ask again for <scope> this session /
 //! No, and tell Marv what to do instead (esc). `once` requests offer only Yes / No.
 //!
+//! marv-rs: a mesh wire request (`tool: "mesh_wire"`, built by marv-session's `mesh::wire_approval`) comes through
+//! the same queue: `once` (yes or no; a wire is never remembered as a scope), labeled with the agent that asked,
+//! showing who, to what, which mode and the limits, with the taint warning.
+//!
 //! Esc declines this and everything waiting and stops the run, except while a subagent's view is
 //! open (`escape_cancels: false`): Esc then only closes the view. Every string from the request
 //! goes through `printable()`: a Trojan-Source command must not look like something else.
@@ -215,6 +219,41 @@ mod tests {
         view.on_key(key(KeyCode::Down));
         assert!(frame(&view).contains("❯ No · esc"));
         assert_eq!(view.on_key(key(KeyCode::Enter)), Some(ApprovalOutcome::Decide(Decision::No)));
+    }
+
+    #[test]
+    fn a_mesh_wire_request_shows_the_whole_wire_and_yes_or_no_only() {
+        // What marv-session's `mesh::wire_approval` sends for `worker-1`'s first send to the parent.
+        let wire = ApprovalRequest {
+            tool: "mesh_wire".into(),
+            label: "Wire worker-1 -> agent.parent.inbox (send)".into(),
+            scope: Scope {
+                key: "mesh-wire:worker-1:agent.parent.inbox:send".into(),
+                description: "worker-1 -> agent.parent.inbox".into(),
+            },
+            preview: Preview {
+                title: "Wire worker-1 -> agent.parent.inbox (send)".into(),
+                text: Some(
+                    "worker-1 asks to send to agent.parent.inbox.\nLimits: 32768 bytes a message, 30 a minute (bursts of 10)."
+                        .into(),
+                ),
+                note: Some("The wire lasts until either agent ends.".into()),
+                warning: Some(
+                    "What arrives through it is data from another agent: the receiving session counts as tainted.".into(),
+                ),
+                ..Default::default()
+            },
+            agent: Some("worker-1".into()),
+            network: false,
+            once: true,
+        };
+        let mut view = ApprovalView::new(wire, 0, true);
+        let f = frame(&view);
+        for part in ["[worker-1]", "Wire worker-1 -> agent.parent.inbox (send)", "32768 bytes a message", "⚠ What arrives"] {
+            assert!(f.contains(part), "{part}\n{f}");
+        }
+        assert!(!f.contains("don't ask again"), "{f}");
+        assert_eq!(view.on_key(key(KeyCode::Enter)), Some(ApprovalOutcome::Decide(Decision::Yes)));
     }
 
     #[test]
