@@ -22,12 +22,16 @@
 //! `${MARV_PROJECT_DIR}` points at the project) and win a name clash with the config files. Never pass config read
 //! from a repository you don't control: that's what `Source::Project` (still trust-gated) is for. The session is
 //! built before the MCP servers start (its constructor can fail), and everything is closed if anything after fails.
+//! The servers start in the background (`McpManager::start`); the first turn waits for them.
 //! Env vars (`OPENROUTER_API_KEY`, `MARV_MODEL`) are ignored: a library uses what it's given.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use marv_mcp::deferred::McpToolsSetting;
+use marv_mcp::manager::{CONNECT_TIMEOUT, LOGIN_TIMEOUT, ManagerOptions, McpManager, McpState};
+use marv_mcp::oauth_store::McpTokenStore;
+use marv_mcp::trust::McpTrust;
 use marv_provider::ProviderOption;
 use marv_tools::{Approver, ToolRef};
 use serde_json::Value;
@@ -206,15 +210,24 @@ pub async fn create_session(options: SessionOptions) -> Result<MarvSession, Sess
             servers.push(server);
         }
     }
-    let mcp: Option<crate::mcp_tools::McpHandle> = if servers.is_empty() {
-        None
-    } else {
-        // Logins made with /mcp login in the TUI (same config dir) are used and refreshed; a library never starts one.
-        let _servers = servers;
-        todo!(
-            "port: McpManager::new(servers, ManagerOptions {{ trust: mcp-trust.json, logins: mcp-tokens.json, … }}), set_on_change login warnings, start()"
+    // Logins made with /mcp login in the TUI (same config dir) are used and refreshed; a library never starts one.
+    let tokens_file = config_dir.join("mcp-tokens.json");
+    let mcp: Option<crate::mcp_tools::McpHandle> = (!servers.is_empty()).then(|| {
+        McpManager::new(
+            servers,
+            ManagerOptions {
+                root: root.clone(),
+                project_key: project_key(&root),
+                home: home.clone(),
+                version: env!("CARGO_PKG_VERSION").into(),
+                trust: Some(McpTrust::new(config_dir.join("mcp-trust.json"))),
+                logins: Some(McpTokenStore::new(&tokens_file)),
+                env: env.clone(),
+                connect_timeout: CONNECT_TIMEOUT,
+                login_timeout: LOGIN_TIMEOUT,
+            },
         )
-    };
+    });
 
     let mut init = SessionInit::new(root.clone(), ProviderChoice::Option(options.provider));
     init.thinking = options.thinking;
@@ -238,9 +251,41 @@ pub async fn create_session(options: SessionOptions) -> Result<MarvSession, Sess
     init.trajectories = store_for(&options.trajectories, || TrajectoryStore::new(config_dir.join("trajectories")));
     init.worktrees_dir = Some(config_dir.join("worktrees").join(project_key(&root)));
     init.transcript = options.transcript;
-    init.on_warning = options.on_warning;
+    init.on_warning = options.on_warning.clone();
     init.problems = problems;
     let session = MarvSession::new(init)?;
+    if let Some(mcp) = &session.mcp() {
+        // A server that needs a login is told once (again only after it connected meanwhile).
+        let warned = std::sync::Mutex::new(std::collections::HashSet::new());
+        let (weak, warn) = (Arc::downgrade(mcp), options.on_warning.clone());
+        mcp.set_on_change(move || {
+            let Some(mcp) = weak.upgrade() else { return };
+            let mut warned = warned.lock().unwrap_or_else(|e| e.into_inner());
+            for s in mcp.status() {
+                if s.state != McpState::NeedsLogin {
+                    if s.state == McpState::Connected {
+                        warned.remove(&s.name);
+                    }
+                    continue;
+                }
+                if !warned.insert(s.name.clone()) {
+                    continue;
+                }
+                if let Some(warn) = &warn {
+                    let text = format!(
+                        "MCP server \"{}\" needs a login: run marv in a terminal and /mcp login {}; logins are stored in {}",
+                        s.name,
+                        s.name,
+                        tokens_file.display()
+                    );
+                    // The caller's handler must not break the manager's state change.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| warn(text)));
+                }
+            }
+        });
+        let mcp = mcp.clone();
+        tokio::spawn(async move { mcp.start().await });
+    }
     if let Some(target) = options.resume {
         let latest = target == ResumeTarget::Latest;
         match session.resume(target.clone()).await {
