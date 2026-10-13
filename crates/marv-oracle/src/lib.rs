@@ -17,6 +17,10 @@
 //! MARV_ORACLE_BIN=~/Projects/marv/bin/marv MARV_ORACLE_RECORD=1 cargo test -p marv-oracle -- --ignored  # record
 //! MARV_ORACLE_BIN=target/debug/marv cargo test -p marv-oracle -- --ignored                               # check
 //! ```
+//!
+//! [`Target`]: checking holds marv-rs to `expect/` except where `run.json` declares a deliberate
+//! difference (`expect.marv-rs/`, see [`scenario`]); TypeScript Marv is checked with
+//! `MARV_ORACLE_TARGET=marv`.
 
 pub mod compare;
 pub mod normalize;
@@ -30,7 +34,7 @@ pub mod tracker;
 use std::path::Path;
 
 use compare::{Mismatch, compare, load_expect, write_expect};
-use scenario::Scenario;
+use scenario::{Scenario, Target};
 
 /// How one scenario went.
 #[derive(Debug)]
@@ -55,15 +59,23 @@ pub fn binary() -> std::path::PathBuf {
 }
 
 /// Every scenario under `root` through `bin`, in parallel (each has its own server and folders).
-pub fn check_all(scenarios: &[Scenario], bin: &Path, record: bool) -> Vec<(String, Verdict)> {
+pub fn check_all(scenarios: &[Scenario], bin: &Path, record: bool, target: Target) -> Vec<(String, Verdict)> {
     std::thread::scope(|scope| {
-        let handles: Vec<_> = scenarios.iter().map(|s| scope.spawn(move || (s.name.clone(), check(s, bin, record)))).collect();
+        let handles: Vec<_> =
+            scenarios.iter().map(|s| scope.spawn(move || (s.name.clone(), check(s, bin, record, target)))).collect();
         handles.into_iter().map(|h| h.join().expect("a scenario thread panicked")).collect()
     })
 }
 
-/// Runs `scenario` through `bin`; with `record`, saves the run as its `expect/` instead of diffing.
-pub fn check(scenario: &Scenario, bin: &Path, record: bool) -> Verdict {
+/// Runs `scenario` through `bin`, which is `target`; with `record`, saves the run as `target`'s
+/// expected outcome instead of diffing. marv-rs records only where `run.json` declares a deliberate
+/// difference: everywhere else the recording is TypeScript Marv's.
+pub fn check(scenario: &Scenario, bin: &Path, record: bool, target: Target) -> Verdict {
+    if record && target == Target::MarvRs && scenario.run.deliberate.is_none() {
+        return Verdict::Error("marv-rs records only scenarios whose run.json declares a deliberate difference".into());
+    }
+    let expect = scenario.expect_for(target);
+    let scenario = &scenario.for_target(target);
     let outcome = match runner::run(scenario, bin) {
         Ok(outcome) => outcome,
         Err(err) => return Verdict::Error(err.to_string()),
@@ -92,14 +104,22 @@ pub fn check(scenario: &Scenario, bin: &Path, record: bool) -> Verdict {
         if outcome.timed_out || outcome.unused_replies > 0 || prefix_mismatch.is_some() {
             return Verdict::Fail { mismatches: prefix_mismatch.into_iter().collect(), stderr: outcome.stderr, notes };
         }
-        return match write_expect(&scenario.expect(), &outcome) {
+        return match write_expect(&expect, &outcome) {
             Ok(()) => Verdict::Recorded,
             Err(err) => Verdict::Error(err.to_string()),
         };
     }
-    let expected = match load_expect(&scenario.expect()) {
+    let expected = match load_expect(&expect) {
         Ok(expected) => expected,
         Err(err) => return Verdict::Error(format!("no recording: {err}")),
+    };
+    let (expected, outcome) = match target {
+        // #58: marv-rs's parallel reads, compared in call order (see `compare::calls_in_order`).
+        Target::MarvRs => (
+            compare::Expected { events: compare::calls_in_order(&expected.events), ..expected },
+            runner::Outcome { events: compare::calls_in_order(&outcome.events), ..outcome },
+        ),
+        Target::Marv => (expected, outcome),
     };
     let mut mismatches = compare(&expected, &outcome);
     mismatches.extend(prefix_mismatch);

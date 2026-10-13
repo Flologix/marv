@@ -3,6 +3,12 @@
 //! The layout is the one `tests/oracle/README.md` plans. `run.json` replaces Marv's eval `task.md`
 //! (`evals/run.ts`): besides the prompt it carries the `marv -p` flags and config, because a
 //! scripted model needs no hidden check; `expect/` is the check.
+//!
+//! A deliberate marv-rs difference (a security fix, a Sprint 5 item) is declared in `run.json`
+//! (`deliberate`: the issue and why). Only then does checking marv-rs ([`Target::MarvRs`]) read
+//! `expect.marv-rs/` instead of `expect/`, and serve `script.marv-rs.jsonl` when the difference
+//! changes what the model is asked (#64 asks it to continue, so its scripted answer differs too).
+//! TypeScript Marv is always held to `expect/`.
 
 use std::path::{Path, PathBuf};
 
@@ -45,6 +51,44 @@ pub struct RunSpec {
     /// after a compaction, which starts the cache over on purpose.
     #[serde(default)]
     pub prefix_resets: Vec<usize>,
+    /// marv-rs differs from Marv here on purpose: checked against `expect.marv-rs/`.
+    pub deliberate: Option<Deliberate>,
+}
+
+/// `{"issue": 64, "why": "…"}`: the Marv issue the difference implements, and what it changes.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Deliberate {
+    pub issue: u32,
+    pub why: String,
+}
+
+/// Which Marv a run checks or records: TypeScript Marv (the recordings in `expect/`), or marv-rs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    Marv,
+    MarvRs,
+}
+
+impl Target {
+    /// `marv` or `marv-rs`.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "marv" => Some(Self::Marv),
+            "marv-rs" => Some(Self::MarvRs),
+            _ => None,
+        }
+    }
+
+    /// `MARV_ORACLE_TARGET`; without it, checking means marv-rs and recording means TypeScript Marv.
+    pub fn from_env(record: bool) -> anyhow::Result<Self> {
+        match std::env::var("MARV_ORACLE_TARGET") {
+            Ok(name) => {
+                Self::parse(&name).ok_or_else(|| anyhow::anyhow!("MARV_ORACLE_TARGET must be marv or marv-rs, not {name:?}"))
+            }
+            Err(_) => Ok(if record { Self::Marv } else { Self::MarvRs }),
+        }
+    }
 }
 
 /// `{"server": "tracker", "data": "tracker.json"}`: the tracker ([`crate::tracker`]) serving a data
@@ -69,6 +113,8 @@ pub struct Scenario {
     pub dir: PathBuf,
     pub run: RunSpec,
     pub replies: Vec<Reply>,
+    /// `script.marv-rs.jsonl`, for a deliberate difference that changes what the model is asked.
+    pub marv_rs_replies: Option<Vec<Reply>>,
 }
 
 impl Scenario {
@@ -77,7 +123,36 @@ impl Scenario {
         let read = |file: &str| std::fs::read_to_string(dir.join(file)).map_err(|err| anyhow::anyhow!("{name}/{file}: {err}"));
         let run: RunSpec = serde_json::from_str(&read("run.json")?).map_err(|err| anyhow::anyhow!("{name}/run.json: {err}"))?;
         let replies = parse_script(&read("script.jsonl")?).map_err(|err| anyhow::anyhow!("{name}/{err}"))?;
-        Ok(Scenario { name, dir: dir.to_path_buf(), run, replies })
+        let marv_rs_replies = match dir.join(MARV_RS_SCRIPT).is_file() {
+            true => Some(parse_script(&read(MARV_RS_SCRIPT)?).map_err(|err| anyhow::anyhow!("{name}/{err}"))?),
+            false => None,
+        };
+        let has_override = dir.join(MARV_RS_EXPECT).exists() || marv_rs_replies.is_some();
+        match (&run.deliberate, has_override) {
+            (Some(_), false) => {
+                anyhow::bail!("{name}: run.json declares a deliberate difference, but there's no {MARV_RS_EXPECT}/")
+            }
+            (None, true) => anyhow::bail!("{name}: {MARV_RS_EXPECT}/ or {MARV_RS_SCRIPT} without a `deliberate` in run.json"),
+            _ => {}
+        }
+        Ok(Scenario { name, dir: dir.to_path_buf(), run, replies, marv_rs_replies })
+    }
+
+    /// The scenario as `target` runs it: marv-rs gets its own script for a deliberate difference.
+    pub fn for_target(&self, target: Target) -> Scenario {
+        let mut scenario = self.clone();
+        if let (Target::MarvRs, Some(replies)) = (target, &self.marv_rs_replies) {
+            scenario.replies = replies.clone();
+        }
+        scenario
+    }
+
+    /// Where `target`'s expected outcome is: `expect.marv-rs/` for marv-rs where a difference is declared.
+    pub fn expect_for(&self, target: Target) -> PathBuf {
+        match (target, &self.run.deliberate) {
+            (Target::MarvRs, Some(_)) => self.dir.join(MARV_RS_EXPECT),
+            _ => self.expect(),
+        }
     }
 
     pub fn project(&self) -> PathBuf {
@@ -88,6 +163,10 @@ impl Scenario {
         self.dir.join("expect")
     }
 }
+
+/// marv-rs's expected outcome where it differs on purpose, and its script when the model is asked something else.
+pub const MARV_RS_EXPECT: &str = "expect.marv-rs";
+pub const MARV_RS_SCRIPT: &str = "script.marv-rs.jsonl";
 
 /// Every scenario under `root` (each subdirectory with a `run.json`), by name.
 pub fn load_all(root: &Path) -> anyhow::Result<Vec<Scenario>> {
