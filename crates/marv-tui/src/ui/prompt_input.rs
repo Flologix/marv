@@ -21,7 +21,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Padding, Widget};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
 
 use super::select::truncate_end;
 use super::theme;
@@ -294,6 +294,7 @@ impl PromptInput {
     /// Display width of the text, for tests.
     #[cfg(test)]
     fn shown(&self) -> String {
+        use unicode_width::UnicodeWidthChar;
         self.value.chars().filter(|c| c.width().unwrap_or(0) > 0).collect()
     }
 }

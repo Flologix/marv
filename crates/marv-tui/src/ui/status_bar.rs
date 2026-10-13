@@ -31,7 +31,7 @@ use crate::view::{StatusInfo, Totals};
 pub fn tokens(n: u64) -> String {
     /// `tenths` as "12.3", or "12" when the tenth is 0 (Marv strips ".0").
     fn tenths(t: u64) -> String {
-        if t % 10 == 0 { format!("{}", t / 10) } else { format!("{}.{}", t / 10, t % 10) }
+        if t.is_multiple_of(10) { format!("{}", t / 10) } else { format!("{}.{}", t / 10, t % 10) }
     }
     if n < 1000 {
         n.to_string()
