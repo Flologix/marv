@@ -46,6 +46,7 @@ use crate::jsonrpc::{
     Request, RequestId, Response, RpcError, code, encode_line, method,
 };
 use crate::oauth::{self, AuthResult, McpOAuthProvider};
+use crate::ordered::Ordered;
 use crate::tool::McpCallResult;
 
 /// The SDK's request-timeout error, as the model saw it from Marv.
@@ -86,7 +87,9 @@ pub struct RequestOptions {
     pub cancel: Option<CancellationToken>,
 }
 
-type Pending = HashMap<RequestId, oneshot::Sender<crate::Result<Value>>>;
+/// A response's result, and the response's text as the server sent it (key order kept, see [`Client::list_tools`]).
+type Reply = (Value, String);
+type Pending = HashMap<RequestId, oneshot::Sender<crate::Result<Reply>>>;
 
 /// A live connection. Cheap to share: calls from several turns go through one client.
 pub struct Client {
@@ -166,8 +169,9 @@ impl Client {
                         Ok(0) | Err(_) => break,
                         Ok(_) => {
                             // A line that isn't a message (a server logging to stdout) is skipped, as the SDK does.
-                            if let Ok(message) = crate::jsonrpc::decode_line(&String::from_utf8_lossy(&line)) {
-                                Inner::dispatch(&reader, message);
+                            let text = String::from_utf8_lossy(&line);
+                            if let Ok(message) = crate::jsonrpc::decode_line(&text) {
+                                Inner::dispatch(&reader, message, text.trim_end().to_string());
                             }
                         }
                     }
@@ -238,11 +242,25 @@ impl Client {
         Ok(protocol_version)
     }
 
-    pub async fn list_tools(&self, cursor: Option<&str>, timeout: Duration) -> crate::Result<ListToolsResult> {
+    /// One page of tools, and each tool's `inputSchema` with the server's key order (serde_json's `Value` sorts
+    /// keys; `tool_search` shows a schema as the server wrote it, as Marv did).
+    pub async fn list_tools(
+        &self,
+        cursor: Option<&str>,
+        timeout: Duration,
+    ) -> crate::Result<(ListToolsResult, Vec<Option<Ordered>>)> {
         let params = cursor.map(|c| json!({ "cursor": c }));
         let opts = RequestOptions { timeout: Some(timeout), ..Default::default() };
-        let raw = self.request(method::TOOLS_LIST, params, opts).await?;
-        serde_json::from_value(raw).map_err(|e| McpError::Server(format!("the server's tool list isn't MCP: {e}")))
+        let (raw, text) = self.request_raw(method::TOOLS_LIST, params, opts).await?;
+        let result: ListToolsResult =
+            serde_json::from_value(raw).map_err(|e| McpError::Server(format!("the server's tool list isn't MCP: {e}")))?;
+        let ordered = serde_json::from_str::<Ordered>(&text).ok();
+        let tools = ordered.as_ref().and_then(|o| o.get("result")?.get("tools")).and_then(|t| match t {
+            Ordered::Array(items) => Some(items.as_slice()),
+            _ => None,
+        });
+        let schemas = (0..result.tools.len()).map(|i| tools.and_then(|t| t.get(i)?.get("inputSchema").cloned())).collect();
+        Ok((result, schemas))
     }
 
     /// One tool call; progress restarts `timeout`, `cancel` gives up (and tells the server).
@@ -273,13 +291,18 @@ impl Client {
         self.inner.closed.clone()
     }
 
-    pub async fn request(&self, method: &str, mut params: Option<Value>, opts: RequestOptions) -> crate::Result<Value> {
+    pub async fn request(&self, method: &str, params: Option<Value>, opts: RequestOptions) -> crate::Result<Value> {
+        self.request_raw(method, params, opts).await.map(|(value, _)| value)
+    }
+
+    /// [`Client::request`], plus the response's text as the server sent it.
+    pub async fn request_raw(&self, method: &str, mut params: Option<Value>, opts: RequestOptions) -> crate::Result<Reply> {
         let inner = &self.inner;
         if inner.closed.is_cancelled() {
             return Err(closed_error());
         }
         let id = RequestId::Number(inner.next_id.fetch_add(1, Ordering::SeqCst));
-        let (tx, mut rx) = oneshot::channel::<crate::Result<Value>>();
+        let (tx, mut rx) = oneshot::channel::<crate::Result<Reply>>();
         lock(&inner.pending).insert(id.clone(), tx);
         let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
         if opts.reset_on_progress {
@@ -429,13 +452,13 @@ impl Inner {
     }
 
     /// One message from the server.
-    fn dispatch(inner: &Arc<Inner>, message: Message) {
+    fn dispatch(inner: &Arc<Inner>, message: Message, raw: String) {
         match message {
             Message::Response(Response { id, result, error, .. }) => {
                 if let Some(tx) = lock(&inner.pending).remove(&id) {
                     let _ = tx.send(match error {
                         Some(e) => Err(rpc_error(e)),
-                        None => Ok(result.unwrap_or(Value::Null)),
+                        None => Ok((result.unwrap_or(Value::Null), raw)),
                     });
                 }
             }
@@ -533,13 +556,16 @@ impl HttpWire {
             if text.trim().is_empty() {
                 return Ok(());
             }
-            let messages: Vec<Message> = match serde_json::from_str::<Value>(&text) {
-                Ok(Value::Array(items)) => items.into_iter().filter_map(|v| serde_json::from_value(v).ok()).collect(),
-                Ok(v) => serde_json::from_value(v).into_iter().collect(),
+            // Read with its key order kept, so each message's own text can go along with it.
+            let raws: Vec<String> = match serde_json::from_str::<Ordered>(&text) {
+                Ok(Ordered::Array(items)) => items.iter().filter_map(|i| serde_json::to_string(i).ok()).collect(),
+                Ok(_) => vec![text.trim().to_string()],
                 Err(_) => return Err(McpError::Server("the server's answer isn't JSON".into())),
             };
-            for m in messages {
-                Inner::dispatch(inner, m);
+            for raw in raws {
+                if let Ok(m) = serde_json::from_str::<Message>(&raw) {
+                    Inner::dispatch(inner, m, raw);
+                }
             }
             return Ok(());
         }
@@ -571,9 +597,10 @@ async fn read_events(inner: &Arc<Inner>, response: reqwest::Response, sent: &Mes
             if data.is_empty() {
                 continue;
             }
-            let Ok(message) = serde_json::from_str::<Message>(&data.join("\n")) else { continue };
+            let raw = data.join("\n");
+            let Ok(message) = serde_json::from_str::<Message>(&raw) else { continue };
             let done = matches!(&message, Message::Response(r) if Some(&r.id) == wanted.as_ref());
-            Inner::dispatch(inner, message);
+            Inner::dispatch(inner, message, raw);
             if done {
                 return Ok(());
             }

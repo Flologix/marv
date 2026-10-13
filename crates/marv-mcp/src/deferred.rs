@@ -20,11 +20,11 @@
 //!   parsed ([`arguments_as_object`]), each with a `Marv:` note.
 //! - Subagents get neither MCP tools nor these two.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use marv_core::{ToolCall, ToolSpec};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 use crate::text::{printable, truncate};
 
@@ -86,7 +86,7 @@ pub fn deferred_specs() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {
                     "tool": {"type": "string", "description": "The MCP tool's name, mcp__<server>__<tool>."},
-                    "arguments": {"type": "object", "additionalProperties": {}, "description": "Its arguments, as an object matching its parameters (see tool_search)."}
+                    "arguments": {"type": "object", "propertyNames": {"type": "string"}, "additionalProperties": {}, "description": "Its arguments, as an object matching its parameters (see tool_search)."}
                 },
                 "required": ["tool"],
                 "additionalProperties": false
@@ -213,6 +213,29 @@ pub fn search_tools<'a>(specs: &'a [ToolSpec], input: &SearchInput) -> (Vec<&'a 
 /// `tool_search`'s output: one compact JSON line per spec (`readOnly` marked),
 /// then notes. Marks the found names as `loaded`. `read_only` says whether a
 /// tool is `readOnlyHint`.
+/// Tool name → its parameters, and the same as the server ordered them (written by the manager as it lists tools).
+/// `ToolSpec::parameters` is a `serde_json::Value`, which sorts keys; `tool_search` shows a schema with the server's
+/// order, as Marv did (and the oracle compares that text). Used only while it still matches the spec's parameters.
+static SCHEMA_ORDER: std::sync::LazyLock<std::sync::Mutex<HashMap<String, (Value, String)>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Remembers how the server ordered `spec`'s parameters (see `tool_search_output`).
+pub fn remember_schema_order(spec: &ToolSpec, ordered: &crate::ordered::Ordered) {
+    if let Ok(text) = serde_json::to_string(ordered) {
+        let mut map = SCHEMA_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+        map.insert(spec.name.clone(), (spec.parameters.clone(), text));
+    }
+}
+
+/// `spec`'s parameters as JSON text: in the server's order when known.
+fn parameters_text(spec: &ToolSpec) -> String {
+    let map = SCHEMA_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+    match map.get(&spec.name) {
+        Some((value, text)) if *value == spec.parameters => text.clone(),
+        _ => spec.parameters.to_string(),
+    }
+}
+
 pub fn tool_search_output(
     specs: &[ToolSpec],
     input: &SearchInput,
@@ -223,14 +246,15 @@ pub fn tool_search_output(
     let mut lines: Vec<String> = Vec::new();
     for s in &found {
         loaded.insert(s.name.clone());
-        let mut obj = Map::new();
-        obj.insert("name".into(), s.name.clone().into());
-        obj.insert("description".into(), s.description.clone().into());
-        obj.insert("parameters".into(), s.parameters.clone());
-        if read_only(&s.name) {
-            obj.insert("readOnly".into(), true.into());
-        }
-        lines.push(Value::Object(obj).to_string());
+        // Written by hand: Marv's `JSON.stringify` order (name, description, parameters, readOnly).
+        let text = |t: &str| Value::from(t).to_string();
+        let read_only = if read_only(&s.name) { ",\"readOnly\":true" } else { "" };
+        lines.push(format!(
+            "{{\"name\":{},\"description\":{},\"parameters\":{}{read_only}}}",
+            text(&s.name),
+            text(&s.description),
+            parameters_text(s)
+        ));
     }
     if !unknown.is_empty() {
         lines.push(format!("Marv: no MCP tool is named {}.", unknown.join(", ")));

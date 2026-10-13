@@ -35,6 +35,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::McpError;
 use crate::config::{McpServerConfig, ServerSource};
+use crate::ordered::Ordered;
 use crate::text::{sha256_hex, truncate};
 
 /// Tool names longer than this are rejected by OpenAI-compatible APIs.
@@ -202,6 +203,30 @@ pub fn acceptable_schema(schema: &Map<String, Value>) -> Value {
     rest.insert("type".into(), "object".into());
     rest.entry("properties").or_insert_with(|| Value::Object(Map::new()));
     Value::Object(rest)
+}
+
+/// [`acceptable_schema`] with the server's key order kept (Marv's `{ ...rest, type: "object", properties }`):
+/// `type` and `properties` stay where the server put them, or come last.
+pub fn acceptable_schema_ordered(schema: &Ordered) -> Ordered {
+    let open = || {
+        Ordered::Object(vec![("type".into(), Ordered::String("object".into())), ("properties".into(), Ordered::Object(vec![]))])
+    };
+    let Some(fields) = schema.as_object() else { return open() };
+    let mut rest: Vec<(String, Ordered)> = fields.iter().filter(|(k, _)| k != "$schema").cloned().collect();
+    let ty = rest.iter().find(|(k, _)| k == "type").map(|(_, v)| v);
+    let plain = ty.is_none_or(|t| t.as_str() == Some("object"))
+        && !rest.iter().any(|(k, _)| ["anyOf", "oneOf", "allOf"].contains(&k.as_str()));
+    if !plain {
+        return open();
+    }
+    for (key, value) in [("type", Ordered::String("object".into())), ("properties", Ordered::Object(vec![]))] {
+        match rest.iter_mut().find(|(k, _)| k == key) {
+            Some(slot) if key == "type" => slot.1 = value,
+            Some(_) => {}
+            None => rest.push((key.into(), value)),
+        }
+    }
+    Ordered::Object(rest)
 }
 
 /// What the approval shows for a call.

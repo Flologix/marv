@@ -48,11 +48,14 @@ use tokio_util::sync::CancellationToken;
 
 use crate::client::{Client, HttpOptions, Stderr, StdioOptions};
 use crate::config::{McpServerConfig, McpTransport, ServerSource};
+use crate::deferred::remember_schema_order;
 use crate::oauth::{
     Abort, Authorize, CallbackCheck, CallbackExpectation, CallbackHandler, LoginNeeded, McpOAuthProvider, ProviderMode,
     ProviderOptions, Revoked, listen, new_state, revoke,
 };
 use crate::oauth_store::{Login, McpTokenStore, login_key};
+use crate::ordered::Ordered;
+use crate::tool::acceptable_schema_ordered;
 use crate::tool::{McpCallResult, McpCaller, McpTool, McpToolInfo, make_mcp_tool};
 use crate::trust::McpTrust;
 
@@ -983,9 +986,9 @@ impl McpManager {
                     (Ok(_), Err(_)) => unreachable!("listed only with a client"),
                     (Ok(infos), Ok(client)) => {
                         // A tool listed twice (a server repeating a page) is still one tool: its first place, its last listing.
-                        let mut unique: Vec<McpToolInfo> = vec![];
+                        let mut unique: Vec<(McpToolInfo, Option<Ordered>)> = vec![];
                         for info in infos {
-                            match unique.iter_mut().find(|u| u.name == info.name) {
+                            match unique.iter_mut().find(|u| u.0.name == info.0.name) {
                                 Some(slot) => *slot = info,
                                 None => unique.push(info),
                             }
@@ -999,7 +1002,16 @@ impl McpManager {
                             timeout,
                             own_authorization: own,
                         });
-                        c.tools = unique.into_iter().map(|info| make_mcp_tool(&config, info, caller.clone())).collect();
+                        c.tools = unique
+                            .into_iter()
+                            .map(|(info, schema)| {
+                                let tool = make_mcp_tool(&config, info, caller.clone());
+                                if let Some(schema) = schema {
+                                    remember_schema_order(&tool.spec, &acceptable_schema_ordered(&schema));
+                                }
+                                tool
+                            })
+                            .collect();
                         to_close.extend(c.client.replace(client.clone()));
                         c.state = McpState::Connected;
                         // A server that exits later: its tools stay listed (the specs can't change), and calls fail
@@ -1054,7 +1066,7 @@ impl McpManager {
 
     /// Initialize, then the tool list. A server can keep saying there's another page (the same cursor, or an
     /// endless list): stop at a cursor seen before or after [`MAX_PAGES`], or startup would never settle.
-    async fn handshake(&self, client: &Client) -> crate::Result<Vec<McpToolInfo>> {
+    async fn handshake(&self, client: &Client) -> crate::Result<Vec<(McpToolInfo, Option<Ordered>)>> {
         let limit = self.opts.connect_timeout;
         // The requests' own timeouts are longer: Marv's sentence ("connecting timed out after 60s") wins.
         let slack = limit * 2;
@@ -1067,8 +1079,8 @@ impl McpManager {
         let mut seen = std::collections::HashSet::new();
         let mut cursor: Option<String> = None;
         for _ in 0..MAX_PAGES {
-            let page = within(limit, "listing tools", client.list_tools(cursor.as_deref(), slack)).await?;
-            infos.extend(page.tools);
+            let (page, schemas) = within(limit, "listing tools", client.list_tools(cursor.as_deref(), slack)).await?;
+            infos.extend(page.tools.into_iter().zip(schemas));
             match page.next_cursor {
                 Some(next) if seen.insert(next.clone()) => cursor = Some(next),
                 _ => break,
