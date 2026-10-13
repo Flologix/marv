@@ -6,6 +6,10 @@ What counts as Marv's public API: the SDK (`@flologixai/marv/sdk`), the `marv` c
 
 ## [Unreleased]
 
+### Fixed
+
+- Headless mode (`marv -p`) shows the CLI's advice in provider errors, not the SDK's (issue #54): a rejected key now says "Run /setup to enter a new one." like the TUI, instead of "Pass another provider.apiKey to createSession()". A CLI user runs `marv`, not `createSession()`. The advice is an internal option on `createSession` (default unchanged: the SDK's options).
+
 ## [0.3.0] - 2026-10-12
 
 Everything since 0.1.2: Sprints 1–3 (0.2.0 was never released on its own). Highlights: headless mode (`marv -p`), MCP servers installed with `/mcp add` and logged in with `/mcp login`, deferred MCP tool loading, project checks, tool-call repair, retries for dropped connections, a loop guard, and the step limit.

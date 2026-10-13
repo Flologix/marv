@@ -306,6 +306,15 @@ describe("CLI: spawning bun src/cli.tsx -p", () => {
     expect((first as any).type).toBeString();
   });
 
+  test("a rejected API key prints the CLI's advice, not the SDK's (issue #54)", async () => {
+    const url = serve(() => Response.json({ error: { message: "No cookie auth credentials found" } }, { status: 401 }));
+    await writeConfig(url);
+    const { stderr, exitCode } = await runCli(["-p", "hi", "--output", "json"]);
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("OpenRouter rejected the API key. Run /setup to enter a new one.");
+    expect(stderr).not.toContain("createSession()");
+  });
+
   test("invalid --output exits 1", async () => {
     const { stdout, stderr, exitCode } = await runCli(["-p", "hi", "--output", "xml"]);
     expect(exitCode).toBe(1);

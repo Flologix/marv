@@ -34,6 +34,7 @@ import { loadMemory, type Memories, type MemoryPaths } from "./memory.ts";
 import { shortenHome } from "./paths.ts";
 import { systemPrompt } from "./prompt.ts";
 import { isFactory, providerFactory, type ProviderFactory, type ProviderOption } from "./provider/factory.ts";
+import type { ErrorHints } from "./provider/errors.ts";
 import type { ModelInfo } from "./provider/models.ts";
 import type { ChatTurn, Provider, ToolSpec, Usage } from "./provider/types.ts";
 import { newSession, type SavedSession, type SessionStore } from "./sessions.ts";
@@ -90,6 +91,11 @@ export interface SessionInit {
   provider: ProviderFactory | ProviderOption;
   /** For a ProviderOption: let thinking models reason first. (A factory has it built in.) */
   thinking?: boolean;
+  /**
+   * What a bad key or an unknown model tells the user to change (the TUI's commands, or the SDK's options). Only
+   * read with a ProviderOption: the default is the SDK's advice, and the CLI's headless mode passes the TUI's.
+   */
+  errorHints?: ErrorHints;
   /** Marv's version, for trajectories. */
   version?: string;
   /** The project's AGENTS.md. */
@@ -345,7 +351,7 @@ export class MarvSession implements Session {
     this.problems = init.problems ?? [];
     this.option = init.provider;
     this.thinking = init.thinking ?? false;
-    this.factory = isFactory(init.provider) ? init.provider : providerFactory(init.provider, this.thinking);
+    this.factory = isFactory(init.provider) ? init.provider : providerFactory(init.provider, this.thinking, init.errorHints);
     this.provider = this.factory.make();
     this.sandbox = init.sandbox ?? true;
     this.yolo = init.yolo ?? true;
@@ -508,7 +514,7 @@ export class MarvSession implements Session {
     if (changes.provider !== undefined || changes.thinking !== undefined) {
       const option = changes.provider ?? this.option;
       const thinking = changes.thinking ?? this.thinking;
-      const factory = isFactory(option) ? option : providerFactory(option, thinking); // throws for an unknown kind
+      const factory = isFactory(option) ? option : providerFactory(option, thinking, this.init.errorHints); // throws for an unknown kind
       // Same model (a /think or /yolo): what the list said about it still holds, so the provider keeps its reasoning switch.
       const info = factory.id === this.factory.id && factory.model === this.factory.model ? this.info : undefined;
       const provider = factory.make(undefined, info?.reasoning ? { reasoning: info.reasoning } : undefined);

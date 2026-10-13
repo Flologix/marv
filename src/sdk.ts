@@ -14,6 +14,7 @@ import { McpManager } from "./mcp/manager.ts";
 import { McpTokenStore } from "./mcp/oauth-store.ts";
 import { McpTrust } from "./mcp/trust.ts";
 import { homeOrAbove, projectKey } from "./paths.ts";
+import type { ErrorHints } from "./provider/errors.ts";
 import type { ProviderOption } from "./provider/factory.ts";
 import { MarvSession, type Session } from "./session.ts";
 import { SessionStore } from "./sessions.ts";
@@ -118,6 +119,12 @@ export interface SessionOptions {
   configDir?: string;
   /** Something you should hear about that isn't a turn's event (a trajectory that can't be written). */
   onWarning?: (text: string) => void;
+  /**
+   * Not public SDK surface: what a bad key or an unknown model tells the user to change. Default: this SDK's
+   * options. Marv's own headless mode (`marv -p`, src/headless.ts) passes the TUI's advice instead, since its
+   * user runs `marv`, not `createSession()` (issue #54).
+   */
+  errorHints?: ErrorHints;
 }
 
 /** true → the default store; a store → that one; false or absent → none. */
@@ -164,6 +171,7 @@ export async function createSession(options: SessionOptions): Promise<Session> {
     root,
     provider: options.provider,
     thinking: options.thinking,
+    errorHints: options.errorHints,
     version: pkg.version,
     instructions: loaded.instructions,
     skills: loaded.skills,
