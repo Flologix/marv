@@ -3,9 +3,10 @@
 //! - no arguments, `-c`, `-r`: the TUI ([`tui`]);
 //! - `-p <prompt>` / `run <prompt>`: one headless turn ([`headless`]), exit codes 0/1/2/3;
 //! - `mesh ls|wire`: the mesh ([`mesh_cmd`]);
-//! - `__html-convert` (hidden): the web reader's converter process (`marv_tools::web::html_convert_cli::main`).
+//! - `__html-convert` (hidden): the web reader's converter process (`marv_tools::web::html_convert_cli::main`);
+//! - `__run-checks <spec>` (hidden): the project checks' runner, inside the sandbox (`marv_session::checks::runner`).
 //!
-//! The HTML converter runs before the Tokio runtime starts: it's a short stdin → stdout process.
+//! Both hidden ones run before the Tokio runtime starts: they're short processes of their own.
 
 mod cli;
 mod headless;
@@ -41,6 +42,9 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(_) => ExitCode::from(1),
         };
+    }
+    if let Mode::RunChecks { spec } = &mode {
+        return marv_session::checks::runner::main(spec);
     }
     let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(rt) => rt,
@@ -85,7 +89,7 @@ fn main() -> ExitCode {
                     1
                 }
             },
-            Mode::HtmlConvert => unreachable!("handled before the runtime starts"),
+            Mode::HtmlConvert | Mode::RunChecks { .. } => unreachable!("handled before the runtime starts"),
         }
     });
     ExitCode::from(u8::try_from(code).unwrap_or(1))

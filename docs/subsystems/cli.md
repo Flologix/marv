@@ -1,6 +1,6 @@
 # marv-cli
 
-The `marv` binary. It covers argument parsing, headless `marv -p`, the `marv mesh` commands, the hidden `__html-convert` converter process, and launching the TUI.
+The `marv` binary. It covers argument parsing, headless `marv -p`, the `marv mesh` commands, the hidden `__html-convert` converter process and `__run-checks` checks runner, and launching the TUI.
 
 Spec: the startup bullet of Marv's `CLAUDE.md` ("`bin/marv` is the `bin` entryâ€¦"), `src/cli.tsx`, `src/headless.ts`, `bin/marv`, and `tests/headless.test.ts`.
 
@@ -8,7 +8,7 @@ Spec: the startup bullet of Marv's `CLAUDE.md` ("`bin/marv` is the `bin` entryâ€
 
 | Marv (TS) | Rust module | Status |
 |---|---|---|
-| `src/cli.tsx` (argv) | `cli.rs` | **Done and tested:** the clap `Cli` (`-p/--prompt`, `run`, `--output text\|json\|stream-json`, repeated `--approve` including `mesh:<r>`, `--max-steps`, `-m/--model`, `-c/--continue`, `-r/--resume`, `-v/--version`, `-h/--help`), the `mesh ls\|wire` and hidden `__html-convert` subcommands, and `Cli::mode()` |
+| `src/cli.tsx` (argv) | `cli.rs` | **Done and tested:** the clap `Cli` (`-p/--prompt`, `run`, `--output text\|json\|stream-json`, repeated `--approve` including `mesh:<r>`, `--max-steps`, `-m/--model`, `-c/--continue`, `-r/--resume`, `-v/--version`, `-h/--help`), the `mesh ls\|wire` and hidden `__html-convert` and `__run-checks` subcommands, and `Cli::mode()` |
 | `src/cli.tsx` (dispatch) | `main.rs` | **Done:** exit codes, stdin for `-p -`, and the converter process run before the Tokio runtime starts |
 | `src/cli.tsx` (TUI startup), `src/app.tsx` (engine side), Herdr reporting | `tui.rs` | **Ported and tested (#14):** the startup sequence, the bridge (`Bridge`/`Port`: `SessionPort` over `MarvSession`), `map_event`/`map_loop`, the command actions, setup, resume, the startup notice, `TuiApprover`, Herdr states. Tests: `herdr.test.tsx`'s App-in-a-pane case, approvals (yes/no/Esc), resume, commands, `/compact` and `/clear`, first-run setup, the mappings. See "The TUI bridge" below |
 | `src/headless.ts` | `headless.rs` | **Ported and tested:** `build_approver` (`ScopeApprover`, `mesh:` grants), `exit_code_for`, `HeadlessResult`, `Collector` (step counting, refused calls including subagents', stream-json lines), `text_output` (printable), `collect_and_output`, `run_headless` |
@@ -31,6 +31,7 @@ Spec: the startup bullet of Marv's `CLAUDE.md` ("`bin/marv` is the `bin` entryâ€
 - **Argument errors exit 1.** Clap's default is 2, which would read as "stopped". `main` uses `Cli::try_parse()` and maps only help and version to 0.
 - **Text output goes through `marv_core::printable()`.** This fixes a Marv 0.3.0 bug: Marv wrote the reply raw, so a model could send OSC 52 clipboard writes, retitle the terminal, or hide text behind bidi overrides. Errors and warnings on stderr go through `printable()` as well. JSON output is escaped by `serde_json`.
 - **`--approve mesh:<receptacle>`** is split off by `marv_session::mesh::headless_grants`. It pre-approves wires to that receptacle and nothing else. The other names keep Marv's `APPROVE_PREFIXES`. Wiring the grants into the switchboard is todo (mesh v1).
+- **`__run-checks <spec>`** (#13) calls `marv_session::checks::runner::main` before the runtime starts: the project checks' runner, which the session runs inside the sandbox with this binary mounted read-only. Tested in the real sandbox by `tests/run_checks.rs`.
 - **`__html-convert`** calls `marv_tools::web::html_convert_cli::main()`, which is still todo in marv-tools.
 
 ## The TUI bridge (`tui.rs`)
