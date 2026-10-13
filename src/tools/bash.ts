@@ -355,14 +355,26 @@ const HOST_LAST_RESORT = "If this can't work in the sandbox at all, bash with sa
  */
 const throughHost = (sandboxFlag: boolean | undefined, sandbox = true) => sandboxFlag === false && sandbox && sandboxAvailable();
 
+/** Names that hold a secret: tokens, passwords, API and access keys, credentials (SSH_AUTH_SOCK is a socket: kept). */
+const SECRET_NAME = /(?:^|_)(?:TOKEN|SECRET|PASSWORD|PASSWD|PASS|PWD|API_?KEY|KEY|KEY_ID|PRIVATE_KEY|CREDENTIALS?)(?:_|$)|PASSWORD/i;
+/** A URL with a password in it (postgres://user:pass@host). */
+const CREDENTIAL_URL = /^[a-z][a-z0-9+.-]*:\/\/[^/\s:@]+:[^/\s@]+@/i;
+
 /**
- * The environment of a command on the host: the user's own (systemctl --user needs XDG_RUNTIME_DIR and D-Bus, a
- * tool under the home folder its config), minus Marv's provider keys.
+ * Whether a variable must stay out of a command that runs outside the sandbox: what it prints reaches the model,
+ * the transcript and the trajectory. Marv's own (MARV_*, the provider key) and anything that looks like a secret.
+ */
+export const secretVariable = (name: string, value: string) =>
+  name === "OPENROUTER_API_KEY" || name.startsWith("MARV_") || (name !== "PWD" && name !== "OLDPWD" && SECRET_NAME.test(name)) || CREDENTIAL_URL.test(value);
+
+/**
+ * The environment of a command on the host: the user's own (systemctl --user needs XDG_RUNTIME_DIR and D-Bus, ssh
+ * its agent, a tool under the home folder its config), minus Marv's keys and anything secret (secretVariable).
  */
 export function hostEnv(env: NodeJS.ProcessEnv = process.env): Record<string, string> {
   const kept: Record<string, string> = {};
   for (const [name, value] of Object.entries(env)) {
-    if (value === undefined || name === "OPENROUTER_API_KEY" || name.startsWith("MARV_")) continue;
+    if (value === undefined || secretVariable(name, value)) continue;
     kept[name] = value;
   }
   return kept;

@@ -381,8 +381,22 @@ export class ProcessManager {
     });
     return new Promise((resolve) => {
       server.once("error", () => resolve(null));
-      server.listen({ port, host: "127.0.0.1", exclusive: true }, () => resolve(server));
+      server.listen({ port, host: "127.0.0.1", exclusive: true }, () => {
+        // From here on an error (EMFILE, say) would throw from the server and take Marv down: the port goes instead.
+        server.removeAllListeners("error");
+        server.on("error", (error) => this.dropPort(entry, port, server, error));
+        resolve(server);
+      });
     });
+  }
+
+  /** A forwarder that failed after it started: closed, its port no longer listed, and the model told why. */
+  private dropPort(entry: Entry, port: number, server: Server, error: Error): void {
+    server.close();
+    entry.listeners = entry.listeners.filter((listener) => listener !== server);
+    entry.info.ports = entry.info.ports.filter((p) => p !== port);
+    entry.info.notes.push(`port ${port} stopped being forwarded (${error.message}): restart the process to forward it again.`);
+    this.changed();
   }
 
   /** What a process holds on the host: its poll, listeners, connections, socket folder and .git placeholder. */

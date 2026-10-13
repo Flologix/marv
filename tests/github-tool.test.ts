@@ -20,7 +20,7 @@ let bin: string;
 let root: string;
 let log: string;
 const saved: Record<string, string | undefined> = {};
-const ENV = ["PATH", "FAKE_GH_LOG", "FAKE_GH_OUTPUT", "FAKE_GH_LOGGED_IN", "FAKE_GH_HANG", "FAKE_GH_EXIT", "FAKE_GH_STDERR", "OPENROUTER_API_KEY", "MARV_SECRET", "GH_DEBUG", "GH_CONFIG_DIR", "FAKE_GH_NO_REPO"];
+const ENV = ["PATH", "FAKE_GH_LOG", "FAKE_GH_OUTPUT", "FAKE_GH_LOGGED_IN", "FAKE_GH_HANG", "FAKE_GH_EXIT", "FAKE_GH_STDERR", "OPENROUTER_API_KEY", "MARV_SECRET", "GH_DEBUG", "GH_CONFIG_DIR", "FAKE_GH_NO_REPO", "GH_HOST"];
 
 beforeEach(async () => {
   for (const name of ENV) saved[name] = process.env[name];
@@ -114,6 +114,12 @@ describe("the github tool", () => {
     const { env } = (await fakeGhCalls(log))[0]!;
     expect(env).toMatchObject({ OPENROUTER_API_KEY: null, MARV_SECRET: null, GH_DEBUG: null, GH_PROMPT_DISABLED: "1", GH_PAGER: "cat", NO_COLOR: "1" });
     expect(env).toMatchObject({ GIT_CONFIG_COUNT: "2", GIT_CONFIG_KEY_0: "core.hooksPath", GIT_CONFIG_VALUE_0: "/dev/null", GIT_CONFIG_KEY_1: "core.fsmonitor", GIT_CONFIG_VALUE_1: "false" });
+  });
+
+  test("gh talks to the project's host, whatever GH_HOST says: -R OWNER/REPO can't reach another one", async () => {
+    process.env.GH_HOST = "ghe.example.com";
+    await runTool(call(["pr", "view", "1", "-R", "someone/else"]), { root, doors: { github: true } });
+    expect((await fakeGhCalls(log)).at(-1)!.env.GH_HOST).toBe("github.com");
   });
 
   test("tokens in gh's output and errors are redacted, and the result says how many", async () => {

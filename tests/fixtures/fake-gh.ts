@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 /** The environment variables the log keeps: what tests check gh got (or didn't). */
-const LOGGED_ENV = ["OPENROUTER_API_KEY", "MARV_SECRET", "GH_PROMPT_DISABLED", "GH_PAGER", "NO_COLOR", "GH_DEBUG", "GIT_DIR", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "GIT_CONFIG_KEY_1", "GIT_CONFIG_VALUE_1"];
+const LOGGED_ENV = ["GH_HOST", "GH_ENTERPRISE_TOKEN", "OPENROUTER_API_KEY", "MARV_SECRET", "GH_PROMPT_DISABLED", "GH_PAGER", "NO_COLOR", "GH_DEBUG", "GIT_DIR", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "GIT_CONFIG_KEY_1", "GIT_CONFIG_VALUE_1"];
 
 export interface FakeGhCall {
   args: string[];

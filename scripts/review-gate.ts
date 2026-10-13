@@ -234,7 +234,8 @@ for (const sha of new Set(commits)) {
   printFindings(outcome.findings, blockers);
 
   // Retry once when the only problem is a model timeout on a batch (modelTimeout: warnings, all review_round_failed)
-  if (!outcome.failed && outcome.modelTimeout) {
+  if (!outcome.failed && outcome.modelTimeout && blockers.length === 0) {
+    // (A first attempt that already found blockers blocks: a retry that happens to find none mustn't pass it.)
     {
       console.error(`review-gate: ${sha.slice(0, 8)} had model-timeout warnings only, retrying…`);
       const retry = runReview(from, sha);

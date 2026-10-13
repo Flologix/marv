@@ -18,9 +18,12 @@ const AUTH_CHECK_MS = 2_000;
 
 export const NO_SUBAGENT_WRITES = "Only the main agent can change GitHub (or read its sensitive API paths): a subagent's github calls are reads.";
 
+/** The variables gh reads a token from: hostEnv drops them as secrets, and gh gets them back. */
+const GH_TOKENS = ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"];
+
 /**
  * The environment gh runs with: the user's own (gh finds its config and keyring through HOME, XDG_* and D-Bus, and
- * GH_TOKEN if they use one) minus Marv's provider keys, debug switches that print requests, and inherited GIT_*
+ * GH_TOKEN if they use one) minus Marv's keys and other secrets (hostEnv), debug switches that print requests, and inherited GIT_*
  * variables (gh runs git to find the repository). Never interactive, no pager, no color; and the git it runs never
  * runs the repository's programs (hooks, fsmonitor), which a sandboxed command may have written.
  */
@@ -37,8 +40,12 @@ export function ghEnv(env: NodeJS.ProcessEnv = process.env): Record<string, stri
     gitConfig[`GIT_CONFIG_KEY_${i}`] = key!;
     gitConfig[`GIT_CONFIG_VALUE_${i}`] = value!;
   });
+  // gh's own login, for a user who keeps it in the environment (its output is redacted of token shapes).
+  const tokens: Record<string, string> = {};
+  for (const name of GH_TOKENS) if (env[name]) tokens[name] = env[name]!;
   return {
     ...kept,
+    ...tokens,
     ...gitConfig,
     GH_PROMPT_DISABLED: "1",
     GH_PAGER: "cat",
@@ -113,7 +120,12 @@ function repoName(root: string, signal?: AbortSignal): Promise<string | null> {
 
 /** Runs gh with argv (no shell), stdout then stderr, capped like bash's. */
 async function runGh(args: string[], root: string, signal: AbortSignal | undefined, timeoutMs = TIMEOUT_MS): Promise<CommandResult> {
+  // gh resolves a bare OWNER/REPO (and a folder without a GitHub remote) against GH_HOST: pinned to the project's
+  // host, the one allow.ts checks every named host against, so the user's own GH_HOST can't point it elsewhere.
   const env = ghEnv();
+  const host = projectHost(root);
+  if (host) env.GH_HOST = host;
+  else delete env.GH_HOST;
   const gh = Bun.which("gh", { PATH: env.PATH ?? "" });
   if (!gh) throw new ToolError("gh isn't on PATH anymore: install it again, or use the GitHub MCP server.");
   const proc = Bun.spawn([gh, ...args], { cwd: root, env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });

@@ -278,3 +278,25 @@ test("a branch behind its base is reviewed from the merge-base, not the base's t
   expect(gate().exitCode).toBe(0);
   expect(reviewsLog()[0]).toStartWith(`from:${mergeBase} `);
 });
+
+test("a first review with blockers isn't retried away: a model timeout beside a blocker still blocks", () => {
+  writeFileSync(join(dir, "retry_ctrl"), "1\n");
+  writeFileSync(
+    join(bin, "ocr"),
+    "#!/bin/sh\n" +
+      'if [ "$1" = "--version" ]; then printf \'open-code-review v1.0.0 (abc)\\n\'; exit 0; fi\n' +
+      'echo "review" >> "' + join(dir, "reviews") + '"\n' +
+      'if [ -f "' + join(dir, "retry_ctrl") + '" ]; then\n' +
+      '  rm -f "' + join(dir, "retry_ctrl") + '"\n' +
+      "  echo '{\"status\":\"complete\",\"comments\":[{\"severity\":\"high\",\"path\":\"a.txt\",\"start_line\":1,\"content\":\"a real bug\"}],\"warnings\":[{\"type\":\"review_round_failed\",\"message\":\"model timeout on a batch\"}]}'\n" +
+      "  exit 0\n" +
+      "fi\n" +
+      "echo '{\"status\":\"complete\",\"comments\":[]}'\n",
+  );
+  chmodSync(join(bin, "ocr"), 0o755);
+  expect(gate().exitCode).not.toBe(0);
+  expect(reviewsLog().length).toBe(1);
+  // Not cached as passed: the next push reviews it again.
+  gate();
+  expect(reviewsLog().length).toBe(2);
+});

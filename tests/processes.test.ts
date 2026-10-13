@@ -82,6 +82,20 @@ describe.if(sandboxAvailable())("ProcessManager (in a real sandbox)", () => {
     expect(await manager.stop(started.info.name)).toBe(false);
   });
 
+  test("a forwarder that fails later is closed and its port dropped, with a note; Marv doesn't crash", async () => {
+    const port = await freePort();
+    const started = await manager.start({ command: serve([port]), name: "web" });
+    expect(started.info.ports).toEqual([port]);
+    const entry = (manager as unknown as { entries: Map<string, { listeners: Server[] }> }).entries.get("web")!;
+    // With no handler, an 'error' on a net.Server throws: here it would take the test (and Marv) down.
+    entry.listeners[0]!.emit("error", new Error("EMFILE: too many open files"));
+    expect(entry.listeners).toEqual([]);
+    const info = manager.list().find((p) => p.name === "web")!;
+    expect(info.ports).toEqual([]);
+    expect(info.notes.join()).toContain(`port ${port} stopped being forwarded (EMFILE: too many open files)`);
+    await expect(fetch(`http://127.0.0.1:${port}/`)).rejects.toThrow();
+  });
+
   test("a port taken on the host isn't forwarded, and the model is told", async () => {
     const port = await freePort();
     const blocker = createServer();
