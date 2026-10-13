@@ -14,19 +14,19 @@ Spec: Marv `CLAUDE.md` bullets **Rendering**, **Mouse**, **Selection**, **Replie
 | `src/ui/Welcome.tsx` | `ui/welcome.rs` | **Ported.** Bordered banner, martian beside centred text, loaded line. Test from `martian.test.tsx`. |
 | `src/ui/theme.ts` | `ui/theme.rs` | **Ported** (all colours). |
 | `src/render-options.ts` | `render_options.rs` | **Ported.** `TerminalGuard` (raw mode, alternate screen, 1002+1006 mouse, restores on drop and on panic), `MAX_FPS`. |
-| `src/app.tsx` | `app.rs` | **Ported (#10).** The event loop (`select!` over `EventStream`, the `UiEvent` channel and `sleep_until(Deadlines)`; draws only when dirty, capped at 60 fps, in synchronized output), 33 ms stream batching, the turn's event switch, the approval queue (head + "N more waiting", Always covers the same scope, Esc/ctrl+c decline all), keys (Esc, ctrl+c ladder, ctrl+o, PgUp/PgDn), mouse (wheel glide, drag-select, release copies, click opens a subagent's view), setup/picker/approval/prompt panels, status bar. App tests from `app.test.tsx` that are UI-side are ported against a fake `SessionPort`; the engine-side ones (commands, config, MCP, memory, sessions on disk) belong to marv-session. Until #9 lands, a private `standin` module draws entries, the waiting line, drafts and the agent view as plain wrapped text, and the scroll/glide arithmetic lives in `app.rs`; each stand-in names its replacement (`TODO(#9)`). |
+| `src/app.tsx` | `app.rs` | **Ported (#10; renderers wired in #9).** The event loop (`select!` over `EventStream`, the `UiEvent` channel and `sleep_until(Deadlines)`; draws only when dirty, capped at 60 fps, in synchronized output), 33 ms stream batching, the turn's event switch, the approval queue (head + "N more waiting", Always covers the same scope, Esc/ctrl+c decline all), keys (Esc, ctrl+c ladder, ctrl+o, PgUp/PgDn), mouse (wheel glide, drag-select, release copies, click opens a subagent's view), setup/picker/approval/prompt panels, status bar. App tests from `app.test.tsx` that are UI-side are ported against a fake `SessionPort`; the engine-side ones (commands, config, MCP, memory, sessions on disk) belong to marv-session. The transcript, the live reply, the waiting line, drafts and the subagent view are drawn by the #9 renderers below (the #10 stand-ins are gone); the subagent view's header now sits above the view, as in Marv. |
 | `src/mouse.ts` | `mouse.rs` | **Ported.** `from_crossterm`; the SGR cases of `mouse.test.ts` as tests over crossterm events (`filterMouseInput`'s split-code tests have no counterpart: crossterm parses). |
 | `src/selection.ts` | `selection.rs` | **Ported.** `SelectionStore` over ratatui `Buffer` cells (`transform_buffer` remembers rows and sets `REVERSED`), `whole_cells`, auto-scroll as a deadline. All `selection.test.ts` cases ported (the repaint-batching one is the loop's drain-then-draw). |
 | `src/clipboard.ts` | `clipboard.rs` | **Ported.** Platform tools via `tokio::process`, OSC 52 fallback. Tests ported. |
-| `src/ui/Markdown.tsx` | `ui/markdown.rs` | `render` (runs `printable()` and dispatches to the stream lexer) done; `lex`, `StreamLexer::parse`, `layout` todo |
-| `src/ui/MessageView.tsx` | `ui/message_view.rs` | user entry done; assistant/tool/system todo |
-| `src/ui/DiffView.tsx` | `ui/diff_view.rs` | `mark` done; `render` todo |
-| `src/ui/NoticeView.tsx` | `ui/notice_view.rs` | `tone_color`, `worst_tone` done; `render` todo |
-| `src/ui/ThinkingView.tsx` | `ui/thinking_view.rs` | `elapsed` done; `ThinkingView`/`DraftView` todo |
-| `src/ui/ScrollView.tsx` | `ui/scroll_view.rs` | `scroll_top`/`follow` done; scrolling, glide, culling todo |
-| `src/ui/Transcript.tsx` | `ui/transcript.rs` | `agent_entry_at` done; layout cache todo |
-| `src/ui/AgentView.tsx` + `src/agent-log.ts` | `ui/agent_view.rs` | todo |
-| `src/ui/Approval.tsx` | `ui/approval.rs` | **Ported.** Full payload, wrapped; the diff through a stand-in until `diff_view::render` (#9). All `approval.test.tsx` cases ported. |
+| `src/ui/Markdown.tsx` | `ui/markdown.rs` | **Ported (#9).** pulldown-cmark → owned `Block`s (styles resolved into `Run`s), `layout` with Ink's wrapping (wrap-ansi `hard`), `StreamLexer` (Marv's boundary scan; also keeps each finished block's lines per width). All `markdown.test.tsx` cases, including the random streamed-prefix property (blocks *and* laid-out lines equal parsing whole), plus wrapping, autolink and escape tests. |
+| `src/ui/MessageView.tsx` | `ui/message_view.rs` | **Ported (#9).** 2-column gutter, tool lines, steps, collapsed diffs, notices, Markdown system messages; `has_details` keys the ctrl+o cache. All `messageview.test.tsx` cases through ratatui's `TestBackend`. |
+| `src/ui/DiffView.tsx` | `ui/diff_view.rs` | **Ported (#9).** With local copies of `previewLines`/`fileLines` (see notes). All `diffview.test.tsx` cases. Also draws the approval prompt's diff. |
+| `src/ui/NoticeView.tsx` | `ui/notice_view.rs` | **Ported (#9).** Bar on every row, hanging indents. All `noticeview.test.tsx` cases (colours checked on spans). |
+| `src/ui/ThinkingView.tsx` | `ui/thinking_view.rs` | **Ported (#9).** `ThinkingView`, `DraftView`, `next_frame` (the spinner's deadline), and a copy of `tool-draft.ts` (see notes). `thinking-view.test.tsx` and `tool-draft.test.ts` cases. |
+| `src/ui/ScrollView.tsx` | `ui/scroll_view.rs` | **Ported (#9).** Follow/pin, pages, the glide as a deadline (Marv's `ceil` third), hidden keeps its place and stops a glide, `visible` culls entries to the viewport, `draw` for laid-out lines. All `scrollview.test.tsx` cases. |
+| `src/ui/Transcript.tsx` | `ui/transcript.rs` | **Ported (#9).** `Transcript` (items + per-entry line cache keyed by width and ctrl+o), `agent_entries`/`agent_entry_at`, `welcome_lines`. The `render-performance.test.tsx` keystroke case (600 entries, 120×45). |
+| `src/ui/AgentView.tsx` + `src/agent-log.ts` | `ui/agent_view.rs` | **Ported (#9).** `AgentLog::new/apply`, `AgentViewHeader`, `AgentView` (its own stream lexer, waiting line clock, entry cache, spinner deadline). All `agent-log.test.ts` cases plus view and header tests. |
+| `src/ui/Approval.tsx` | `ui/approval.rs` | **Ported.** Full payload, wrapped; the diff through `diff_view::render` (#9). All `approval.test.tsx` cases ported. |
 | `src/ui/Select.tsx` | `ui/select.rs` | **Ported**, plus the panels' shared `wrap`/`truncate_end` (Ink's word wrap and `truncate-end`). |
 | `src/ui/SessionPicker.tsx` | `ui/session_picker.rs` | **Ported**, with `time_ago`. Tests. |
 | `src/ui/ModelPicker.tsx` | `ui/model_picker.rs` | **Ported**, with `format_price`. `setup.test.tsx` picker cases ported. |
@@ -68,7 +68,9 @@ pub trait SessionPort: Send + Sync {          // every method returns at once; r
 - **Clipboard.** It uses platform tools, then falls back to OSC 52 (`base64` crate). We chose this over `arboard`: no X or Wayland libraries in the static binary, and it works over ssh.
 - **printable().** View-model text is raw. The function that draws it calls `marv_core::printable` (`markdown::render`, `message_view::render`, `splash`, `welcome`, approvals, the status bar, agent titles), so the model's conversation is never modified.
 - **Martian timing.** Marv re-armed `setTimeout` after each render, so it drifted. `MartianAnimation` adds each step's ms to the previous deadline, so it doesn't drift, and it resyncs instead of replaying when woken more than one loop late.
-- **Not in this crate:** `src/commands/*` (the engine runs them and sends the UI-side results), `src/tool-draft.ts` (`draftLabel`/`draftPreview`, which `DraftView` needs: to be decided between engine and TUI), and Herdr reporting (marv-cli).
+- **Not in this crate:** `src/commands/*` (the engine runs them and sends the UI-side results) and Herdr reporting (marv-cli).
+- **Two kept copies (#9).** marv-tui depends only on marv-core, so it can't call marv-session's `tool_draft` or marv-tools' `preview_lines`/`file_lines`. `thinking_view` keeps `draft_label`/`draft_preview` (no `regex`) and `diff_view` keeps `preview_lines`/`file_lines` over the view's `DiffLine`, each with the original's tests. To drop them: have the engine send the draft's label and preview in `UiEvent::ToolCallDelta`, and move the two diff helpers to marv-core.
+- **Rendering differences from Ink (#9).** Markdown is parsed by pulldown-cmark, not marked: it has no GFM bare-URL autolinks, so `markdown::autolink` finds `http(s)://` URLs in text (`www.` and emails aren't linked). Wrapping follows wrap-ansi as Ink called it, except that the row after an exactly full row doesn't start with the separating space. Tabs are drawn as two spaces (a buffer cell is one column). The quote bar `▎` marks a quote's first row only, as Ink drew it. A diff line that serde can't read fails the whole message's parse (Marv filtered bad lines while drawing); the engine's session loader handles that.
 
 ## The shell (#10): measured CPU and known gaps
 
@@ -79,7 +81,9 @@ pub trait SessionPort: Send + Sync {          // every method returns at once; r
 | release | 0.0 / 0.0 / 0.0 % | 0.0 / 1.5 / 2.0 % | 5.0 / 1.5 / 1.0 % |
 | debug | 0.0 / 0.5 / 0.0 % | 9.9 / 16.0 / 14.5 % | 9.9 / 14.0 / 14.5 % |
 
-The streaming reply's finished lines are laid out once (only the unfinished last line is re-wrapped each frame); without that, debug climbed past 30% as the reply grew. Re-measure when #9's Markdown renderer replaces the stand-ins.
+The streaming reply's finished lines are laid out once (only the unfinished last line is re-wrapped each frame); without that, debug climbed past 30% as the reply grew.
+
+**Re-measured with #9's renderers** (same method; release): idle 0.0 / 0.0 / 0.0 %; streaming, first seconds 0.0 / 2.0 / 1.5 %; 20 s in 5.0 / 2.0 / 2.0 %. The stream lexer keeps each finished Markdown block's lines, so a frame parses and wraps only the unfinished end.
 
 **No `terminal.clear()` at start:** it asks the terminal for the cursor position, and a terminal that never answers (a bare pty) would stop the TUI starting. The alternate screen starts blank.
 
