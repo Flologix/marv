@@ -189,9 +189,16 @@ const isAncestor = (maybeAncestor: string, sha: string): boolean => {
 
 let failed = false;
 for (const sha of new Set(commits)) {
-  if (passed.has(key(sha))) continue;
+  // REVIEW_GATE_FULL=1 reviews again what passed before (the full-sprint run before a PR).
+  if (process.env.REVIEW_GATE_FULL !== "1" && passed.has(key(sha))) continue;
 
   // Determine the review range: <from>..<sha>
+  //
+  // What a pass record means: "this commit passed the gate", not "ocr reviewed origin/main..sha in one go". With an
+  // earlier pass on the branch, only the commits since it are reviewed (ocr still sees each changed file whole), so
+  // the chain of passes covers every change once. That's the trade #49 makes on purpose: a small fix on a big branch
+  // costs a small review. Whole-branch review still happens where it's cheap to wait for it: the sprint PR (Greptile)
+  // and the full-sprint run before the PR (REVIEW_GATE_FULL=1 reviews from the base whatever passed before).
   // If there's a passed commit on this branch (an ancestor of sha) with the
   // same merge-base, blocking and ocr version, review only what's new since
   // that commit.
@@ -199,7 +206,7 @@ for (const sha of new Set(commits)) {
   const kp = keyParts(sha);
   let from: string = base;
   // Newest first: the passed file is appended to, so its last matching line is the latest pass.
-  for (const line of [...passedLines].reverse()) {
+  for (const line of process.env.REVIEW_GATE_FULL === "1" ? [] : [...passedLines].reverse()) {
     const rec = parseRecord(line);
     if (
       rec && rec.blocking === kp.blocking &&
@@ -222,9 +229,9 @@ for (const sha of new Set(commits)) {
   );
   printFindings(outcome.findings, blockers);
 
-  // Retry once when the only problem is a model timeout on a batch
-  if (!outcome.failed && outcome.modelTimeout && outcome.warnings.length > 0) {
-    if (outcome.warnings.every((w) => w.type === "review_round_failed")) {
+  // Retry once when the only problem is a model timeout on a batch (modelTimeout: warnings, all review_round_failed)
+  if (!outcome.failed && outcome.modelTimeout) {
+    {
       console.error(`review-gate: ${sha.slice(0, 8)} had model-timeout warnings only, retrying…`);
       const retry = runReview(from, sha);
       const retryBlockers = retry.findings.filter(

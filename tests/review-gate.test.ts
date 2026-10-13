@@ -231,3 +231,19 @@ test("a retry that completes with a file ocr couldn't review still blocks, and i
   expect(gate().exitCode).toBe(1);
   expect(reviewsLog().length).toBe(3);
 });
+
+test("REVIEW_GATE_FULL=1 reviews the whole branch even after an earlier pass", () => {
+  writeOcr();
+  expect(gate().exitCode).toBe(0);
+  writeFileSync(join(repo, "a.txt"), "e\n");
+  Bun.spawnSync(["git", "-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgSign=false", "commit", "-qam", "more"], {
+    cwd: repo,
+    env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" },
+  });
+  expect(gate({ REVIEW_GATE_FULL: "1" }).exitCode).toBe(0);
+  expect(reviewsLog().at(-1)).toContain("from:main");
+  // And a commit that already passed is reviewed again, in full.
+  const before = reviewsLog().length;
+  expect(gate({ REVIEW_GATE_FULL: "1" }).exitCode).toBe(0);
+  expect(reviewsLog().length).toBe(before + 1);
+});
