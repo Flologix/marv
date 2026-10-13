@@ -1,0 +1,7 @@
+{
+  "routes": [
+    { "path": "/", "handler": "home", "methods": ["GET"] },
+    { "path": "/login", "handler": "login", "methods": ["GET", "POST"] },
+    { "path": "/users/:id", "handler": "user", "methods": ["GET"] }
+  ]
+}

@@ -1,0 +1,11 @@
+{"status":"running","type":"status"}
+{"continued":true,"type":"cut_off"}
+{"reason":"Not run: your reply hit the output limit before it finished, so this call may be incomplete. Redo it in smaller steps (for a big file: write_file the first part, then add the rest with append: true).","tool":"write_file","type":"tool_skipped"}
+{"text":"I'll write it in parts.","type":"text_delta"}
+{"text":"I'll write it in parts.","type":"assistant"}
+{"label":"src/numbers.js","tool":"write_file","type":"tool_start"}
+{"approval":"auto","label":"src/numbers.js","result":"Created src/numbers.js (10 lines).","tool":"write_file","type":"tool_end"}
+{"text":"Wrote the first part of `src/numbers.js`.","type":"text_delta"}
+{"text":"Wrote the first part of `src/numbers.js`.","type":"assistant"}
+{"reason":"end","type":"done"}
+{"reason":"end","reply":"Wrote the first part of `src/numbers.js`.","steps":3,"type":"result","usage":{"cachedTokens":0,"completionTokens":150,"cost":0.003,"promptTokens":3000}}

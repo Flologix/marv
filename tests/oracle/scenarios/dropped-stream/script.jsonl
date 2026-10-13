@@ -1,0 +1,4 @@
+// dropped partway
+{"text": "`shout(text)` returns the te", "drop": true}
+// the retry
+{"text": "`shout(text)` returns the text in upper case."}

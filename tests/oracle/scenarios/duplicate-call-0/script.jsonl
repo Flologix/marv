@@ -1,0 +1,6 @@
+// call_0
+{"tool_calls": [{"id": "call_0", "name": "glob", "arguments": {"pattern": "**/*.js"}}]}
+// call_0 again, twice in one step
+{"tool_calls": [{"id": "call_0", "name": "read_file", "arguments": {"path": "src/math.js"}}, {"id": "call_0", "name": "read_file", "arguments": {"path": "src/strings.js"}}]}
+// answer
+{"text": "Two modules: `add` in `src/math.js` and `shout` in `src/strings.js`."}

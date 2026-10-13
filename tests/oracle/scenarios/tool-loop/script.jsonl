@@ -1,0 +1,10 @@
+// read 1
+{"tool_calls": [{"name": "read_file", "arguments": {"path": "src/math.js"}}]}
+// read 2
+{"tool_calls": [{"name": "read_file", "arguments": {"path": "src/math.js"}}]}
+// read 3
+{"tool_calls": [{"name": "read_file", "arguments": {"path": "src/math.js"}}]}
+// read 4
+{"tool_calls": [{"name": "read_file", "arguments": {"path": "src/math.js"}}]}
+// read 5
+{"tool_calls": [{"name": "read_file", "arguments": {"path": "src/math.js"}}]}

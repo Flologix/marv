@@ -1,0 +1,6 @@
+// stuck repeating itself
+{"text": "Let me think. I will check the configuration file now. I will check the configuration file now. I will check the configuration file now. I will check the configuration file now. I will check the configuration file now. I will check the configuration file now. I will check the configuration file now. I will check the configuration file now. I will check the configuration file now. I will check the configuration file now. I will check the configuration file now. I will check the configuration file now. "}
+// recovers
+{"tool_calls": [{"name": "glob", "arguments": {"pattern": "**/config*"}}]}
+// answer
+{"text": "No, there's no configuration file in this project."}

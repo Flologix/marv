@@ -1,0 +1,4 @@
+{
+  "description": "grep, then replace_all edits across five files in one step, then grep again to check.",
+  "prompt": "Rename fetchUserData to loadUser everywhere in the project: the code, error messages and the README."
+}

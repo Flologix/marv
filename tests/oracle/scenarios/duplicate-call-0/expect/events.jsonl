@@ -1,0 +1,12 @@
+{"status":"running","type":"status"}
+{"label":"**/*.js","tool":"glob","type":"tool_start"}
+{"label":"**/*.js","result":"src/math.js\nsrc/strings.js","tool":"glob","type":"tool_end"}
+{"label":"src/math.js","tool":"read_file","type":"tool_start"}
+{"label":"src/math.js","result":"    1→export function add(a, b) {\n    2→  return a + b;\n    3→}","tool":"read_file","type":"tool_end"}
+{"label":"src/strings.js","tool":"read_file","type":"tool_start"}
+{"label":"src/strings.js","result":"    1→export function shout(text) {\n    2→  return text.toUpperCase();\n    3→}","tool":"read_file","type":"tool_end"}
+{"text":"Two modules: `add` in `src/math.js` and `shout` in","type":"text_delta"}
+{"text":" `src/strings.js`.","type":"text_delta"}
+{"text":"Two modules: `add` in `src/math.js` and `shout` in `src/strings.js`.","type":"assistant"}
+{"reason":"end","type":"done"}
+{"reason":"end","reply":"Two modules: `add` in `src/math.js` and `shout` in `src/strings.js`.","steps":3,"type":"result","usage":{"cachedTokens":0,"completionTokens":150,"cost":0.003,"promptTokens":3000}}

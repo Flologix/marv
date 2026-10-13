@@ -1,0 +1,9 @@
+{"status":"running","type":"status"}
+{"label":"src/config.js","tool":"read_file","type":"tool_start"}
+{"label":"src/config.js","result":"    1→// Default settings for the HTTP client.   \n    2→export const defaults = {   \n    3→  baseUrl: \"https://api.example.com\",  \n    4→  timeout: 30,    \n    5→  headers: {  \n    6→    \"user-agent\": \"example-client/1.0\", \n    7→  },  \n    8→};   \n    9→\n   10→// Settings for one client: the defaults, with what was passed on top.  \n   11→export function getConfig(overrides = {}) {  \n   12→  return { ...defaults, ...overrides, headers: { ...defaults.headers, ...overrides.headers } };  \n   13→}","tool":"read_file","type":"tool_end"}
+{"label":"src/config.js","tool":"edit_file","type":"tool_start"}
+{"approval":"auto","label":"src/config.js","result":"Edited src/config.js: replaced 1 occurrence (+3 −2 lines). old_string matched once trailing whitespace was ignored.","tool":"edit_file","type":"tool_end"}
+{"text":"Timeout is 60 and retries default to 3.","type":"text_delta"}
+{"text":"Timeout is 60 and retries default to 3.","type":"assistant"}
+{"reason":"end","type":"done"}
+{"reason":"end","reply":"Timeout is 60 and retries default to 3.","steps":3,"type":"result","usage":{"cachedTokens":0,"completionTokens":150,"cost":0.003,"promptTokens":3000}}

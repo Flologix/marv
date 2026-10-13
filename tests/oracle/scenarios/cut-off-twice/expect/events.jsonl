@@ -1,0 +1,9 @@
+{"status":"running","type":"status"}
+{"continued":true,"type":"cut_off"}
+{"reason":"Not run: your reply hit the output limit before it finished, so this call may be incomplete. Redo it in smaller steps (for a big file: write_file the first part, then add the rest with append: true).","tool":"write_file","type":"tool_skipped"}
+{"text":"Here is the whole file again:","type":"text_delta"}
+{"text":"Here is the whole file again:","type":"assistant"}
+{"continued":false,"type":"cut_off"}
+{"reason":"Not run: your reply hit the output limit before it finished, so this call may be incomplete. Redo it in smaller steps (for a big file: write_file the first part, then add the rest with append: true).","tool":"write_file","type":"tool_skipped"}
+{"reason":"length","type":"done"}
+{"reason":"length","reply":"Here is the whole file again:","steps":2,"type":"result","usage":{"cachedTokens":0,"completionTokens":100,"cost":0.002,"promptTokens":2000}}

@@ -1,0 +1,4 @@
+{
+  "description": "Two cut-offs in a row end the run with reason length, exit 2: a model stuck on a reply too big for the limit.",
+  "prompt": "Write src/numbers.js with 200 numbered constants."
+}
