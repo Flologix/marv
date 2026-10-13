@@ -160,8 +160,11 @@ async function removeEmptyFolders(root: string, path: string): Promise<void> {
 }
 
 /** Writes `content` at `absolute` as git `mode` says (a file, an executable, a symlink), replacing what's there without following it. */
-async function put(absolute: string, { mode, content }: { mode: string; content: Uint8Array }): Promise<void> {
+async function put(root: string, absolute: string, { mode, content }: { mode: string; content: Uint8Array }): Promise<void> {
   await mkdir(dirname(absolute), { recursive: true });
+  // Checked again now that the folders exist: one swapped for a symlink since unsafeParent looked is refused.
+  const real = await realpath(dirname(absolute)).catch(() => null);
+  if (!real || !inside(root, real)) throw new Error("its folder now leads outside the project");
   const temp = join(dirname(absolute), `.marv-undo-${process.pid}-${Math.random().toString(36).slice(2, 8)}`);
   if (mode === "120000") {
     await symlink(new TextDecoder().decode(content), temp);
@@ -212,7 +215,7 @@ export async function applyUndo(store: CheckpointStore, plan: UndoPlan, { root }
         await removeEmptyFolders(projectRoot, file.path);
         result.deleted.push(file.path);
       } else {
-        await put(absolute, target);
+        await put(projectRoot, absolute, target);
         (file.action === "recreate" ? result.recreated : result.restored).push(file.path);
       }
     } catch (error) {
