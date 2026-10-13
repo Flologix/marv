@@ -3,6 +3,7 @@
 //! ```sh
 //! marv-oracle check  [--bin <marv>] [scenario…]   # diff against expect/ (exit 1 on any difference)
 //! marv-oracle record [--bin <marv>] [scenario…]   # save each run as its expect/ (from TypeScript Marv)
+//! marv-oracle tracker <data.json> <out.json>      # the tracker MCP server (stdio), for the MCP scenarios
 //! ```
 //!
 //! The binary defaults to `MARV_ORACLE_BIN`, then this workspace's `target/debug/marv`; scenarios to
@@ -18,8 +19,21 @@ fn main() -> ExitCode {
     let record = match args.next().as_deref() {
         Some("check") => false,
         Some("record") => true,
+        Some("tracker") => {
+            let (Some(data), Some(out)) = (args.next(), args.next()) else {
+                eprintln!("usage: marv-oracle tracker <data.json> <out.json>");
+                return ExitCode::FAILURE;
+            };
+            return match marv_oracle::tracker::serve(&PathBuf::from(data), &PathBuf::from(out)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    eprintln!("tracker: {err}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
         _ => {
-            eprintln!("usage: marv-oracle check|record [--bin <marv>] [scenario…]");
+            eprintln!("usage: marv-oracle check|record [--bin <marv>] [scenario…] | tracker <data.json> <out.json>");
             return ExitCode::FAILURE;
         }
     };

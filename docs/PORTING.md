@@ -22,7 +22,7 @@ grep -rn 'todo!("port' crates/<crate>             # in one crate
 | marv-session | [session.md](subsystems/session.md) | Config and presets, system prompt with AGENTS.md cut, session store, trajectories, usage, memory, skills/agent loaders (symlink-safe), frontmatter, slash commands, `SessionToolRunner` (always ≠ must_ask), fenced check notes | `run_turn`, compaction call, subagents and worktrees, checks runner (`marv __run-checks`), MCP/mesh tool bodies |
 | marv-tui | [tui.md](subsystems/tui.md) | The martian (byte-exact frames, deadline animation, widget), theme, splash, welcome, terminal guard, `SessionPort`/`UiEvent` boundary | App loop and drawing, Markdown, transcript, approvals, prompt input, pickers, selection, clipboard |
 | marv-cli | [cli.md](subsystems/cli.md) | clap args, approvals list (incl. `mesh:<r>`), exit codes, headless collector, printable output | `tui::run` (the session ↔ TUI bridge), `mesh ls`/`mesh wire` |
-| marv-oracle (dev) | [oracle.md](subsystems/oracle.md) | All: fake OpenAI-compatible server, scenario runner, normalization, diff; 15 scenarios recorded from TypeScript Marv (which passes them) | More scenarios: the other eval tasks, a declined approval, compaction, the `SECURITY.md` guards |
+| marv-oracle (dev) | [oracle.md](subsystems/oracle.md) | All: fake OpenAI-compatible server, scenario runner, normalization, canonical request diff, the prefix-rule check, the tracker MCP fixture; 23 scenarios recorded from TypeScript Marv (which passes them) | Five more eval tasks, the `SECURITY.md` guards |
 
 Try the martian: `cargo run -p marv-tui --example martian` (q to quit).
 
@@ -52,7 +52,7 @@ Each milestone ends with something you can run.
 
    Test it with a tiny `examples/chat.rs`.
 2. **M2 Act.** Port the agent loop body, then the edit/write/glob/grep/bash `run` bodies, then `SessionToolRunner`. Then `marv -p "…"` with `--output text|json|stream-json` edits files, sandboxed, and the exit codes match Marv.
-3. **M3 Oracle.** The harness and the first 15 scenarios, recorded from TypeScript Marv's evals plus the loop edge cases, are done (#7: `crates/marv-oracle`, `tests/oracle/`, see its README). Left: make them pass once `marv -p` works (#11), and add more. **Everything after this is checked against the oracle.**
+3. **M3 Oracle.** The harness and the first 23 scenarios, recorded from TypeScript Marv's evals plus the loop edge cases, are done (#7: `crates/marv-oracle`, `tests/oracle/`, see its README). Left: make them pass once `marv -p` works (#11), and add more. **Everything after this is checked against the oracle.**
 4. **M4 Guards.** One test per `docs/SECURITY.md` rule in `tests/guards/`, each proven by reverting its guard. Includes the placeholder or post-command scan for protected files a command creates (see sandbox.md).
 5. **M5 TUI.** Transcript, prompt input, approvals, diff view, status bar, pickers and the martian. **Measure CPU while idle and while streaming:** the target is under 2% idle and under 15% streaming (Marv #68).
 6. **M6 Context.** Compaction v1, then v2 (#63), plus sessions on disk, resume and trajectories.
@@ -80,6 +80,6 @@ Each one is recorded in the module doc that makes it:
   - no runtime reading the project's bunfig/.env.
 - **Sprint 5 items built in from the start:** #56, #57, #58, #59, #64, plus the #63 structure.
 - **Serialization:**
-  - schema keys are sorted. This is still byte-stable, but differs from Marv's key order; turn on serde_json `preserve_order` if the oracle compares request bytes with TypeScript Marv's;
+  - schema keys are sorted. This is still byte-stable, but differs from Marv's key order; the oracle compares requests with TypeScript Marv's as canonical JSON and checks only each run's own requests byte for byte (the prefix rule), so this passes without `preserve_order` (oracle.md);
   - lengths are counted in `char`s.
 - **MCP trust:** the key is canonical JSON, so project servers need trusting once more.

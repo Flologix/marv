@@ -1,0 +1,4 @@
+{
+  "description": "A rename across five TypeScript files with replace_all, checked with git status (the project has a .gitignore, stored as gitignore.oracle).",
+  "prompt": "Rename formatPrice (in src/format.ts) to formatMoney everywhere. No formatPrice should be left anywhere in src/, including what src/index.ts exports."
+}

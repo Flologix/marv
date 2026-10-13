@@ -10,7 +10,8 @@ use std::path::Path;
 use serde_json::Value;
 use similar::TextDiff;
 
-use crate::runner::{Outcome, read_tree};
+use crate::runner::{Outcome, read_tree, write_file};
+use crate::scenario::{real_path, stored_path};
 
 /// A recording.
 #[derive(Debug, Clone, PartialEq)]
@@ -40,7 +41,7 @@ pub fn load_expect(dir: &Path) -> anyhow::Result<Expected> {
     Ok(Expected {
         events: read("events.jsonl")?,
         requests: read("requests.jsonl")?,
-        files: read_tree(&dir.join("files"), false)?,
+        files: read_tree(&dir.join("files"), false)?.into_iter().map(|(rel, bytes)| (real_path(&rel), bytes)).collect(),
         exit_code,
     })
 }
@@ -57,11 +58,7 @@ pub fn write_expect(dir: &Path, outcome: &Outcome) -> anyhow::Result<()> {
     std::fs::write(dir.join("exit_code"), code + "\n")?;
     let staged = dir.join("files");
     for (rel, bytes) in &outcome.files {
-        let path = staged.join(rel);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(path, bytes)?;
+        write_file(&staged.join(stored_path(rel)), bytes)?;
     }
     Ok(())
 }
@@ -121,8 +118,8 @@ fn unified(expected: &str, actual: &str) -> String {
     TextDiff::from_lines(expected, actual).unified_diff().context_radius(3).header("expect", "actual").to_string()
 }
 
-/// Requests are compared as bytes. Where two bodies differ, they're diffed pretty-printed; where
-/// they're the same JSON in other bytes, that is said outright: the prompt cache keys on bytes.
+/// Requests are compared as canonical JSON ([`crate::runner::canonical_request`]); two that differ
+/// are diffed pretty-printed, one value per line.
 fn requests_diff(expected: &str, actual: &str) -> String {
     let (exp, act): (Vec<&str>, Vec<&str>) = (expected.lines().collect(), actual.lines().collect());
     let mut out = String::new();
@@ -144,19 +141,8 @@ fn requests_diff(expected: &str, actual: &str) -> String {
                 .and_then(|v| serde_json::to_string_pretty(&v).ok())
                 .map_or(s.to_string(), |p| p + "\n")
         };
-        let (pa, pb) = (pretty(a), pretty(b));
         out.push_str(&format!("request {}:\n", i + 1));
-        if pa == pb {
-            let at = a.bytes().zip(b.bytes()).position(|(x, y)| x != y).unwrap_or(a.len().min(b.len()));
-            let around = |s: &str| s.get(at.saturating_sub(40)..(at + 40).min(s.len())).unwrap_or("").to_string();
-            out.push_str(&format!(
-                "  same JSON, different bytes (key order or formatting) from byte {at}:\n  expect …{}…\n  actual …{}…\n",
-                around(a),
-                around(b)
-            ));
-        } else {
-            out.push_str(&unified(&pa, &pb));
-        }
+        out.push_str(&unified(&pretty(a), &pretty(b)));
     }
     out
 }
@@ -169,6 +155,7 @@ mod tests {
         Outcome {
             events: events.into(),
             requests: requests.into(),
+            raw_requests: requests.lines().map(String::from).collect(),
             files: files.iter().map(|(k, v)| (k.to_string(), v.as_bytes().to_vec())).collect(),
             exit_code: code,
             stderr: String::new(),
@@ -197,11 +184,11 @@ mod tests {
     }
 
     #[test]
-    fn key_order_in_a_request_is_called_out() {
+    fn a_changed_request_is_diffed_pretty() {
         let want = outcome("", "{\"a\":1,\"b\":2}\n", &[], Some(0));
-        let got = outcome("", "{\"b\":2,\"a\":1}\n", &[], Some(0));
+        let got = outcome("", "{\"a\":1,\"b\":3}\n", &[], Some(0));
         let diff = &compare(&expected(&want), &got)[0].diff;
-        assert!(diff.contains("same JSON, different bytes"), "{diff}");
+        assert!(diff.contains("request 1:") && diff.contains("-  \"b\": 2") && diff.contains("+  \"b\": 3"), "{diff}");
     }
 
     #[test]
@@ -212,8 +199,9 @@ mod tests {
     #[test]
     fn expect_round_trips() {
         let dir = std::env::temp_dir().join(format!("marv-oracle-unit-expect-{}", std::process::id()));
-        let o = outcome("{}\n", "{}\n", &[("src/a.js", "a\r\n")], None);
+        let o = outcome("{}\n", "{}\n", &[("src/a.js", "a\r\n"), (".gitignore", "node_modules/\n")], None);
         write_expect(&dir, &o).unwrap();
+        assert!(dir.join("files/gitignore.oracle").is_file() && !dir.join("files/.gitignore").exists());
         let loaded = load_expect(&dir).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(loaded, expected(&o));

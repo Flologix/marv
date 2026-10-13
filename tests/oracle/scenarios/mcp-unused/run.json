@@ -1,0 +1,8 @@
+{
+  "description": "An MCP server is configured but the task doesn't need it: its tools are only announced (deferred), and the run is a plain edit.",
+  "prompt": "Implement parseDuration in src/duration.js as its comment describes (\"1h30m\" gives 5400), and export it from src/index.js.",
+  "mcp": {
+    "server": "tracker",
+    "data": "tracker.json"
+  }
+}
