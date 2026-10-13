@@ -1,3 +1,4 @@
+import { redact } from "./github/redact.ts";
 import { lstatSync, readFileSync, readlinkSync, realpathSync } from "node:fs";
 import { rmdir } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -444,7 +445,10 @@ export const bash: Tool<typeof input> = {
       // Checked again here, so no path to run() skips the door (preview refuses first).
       if (!doors?.host) throw new ToolError(NO_HOST_DOOR);
       const result = await runCommand({ command, root, sandbox: false, network: true, timeoutMs: timeout * 1000, signal, env: hostEnv() });
-      return { output: formatOutput(result), summary: `${commandSummary(result, timeout)} · on your machine` };
+      // A second line behind hostEnv's filter: token shapes in what the command printed never reach the model.
+      const shown = redact(formatOutput(result));
+      const note = shown.count ? `\nMarv: ${shown.count} token${shown.count === 1 ? " was" : "s were"} redacted from this output.` : "";
+      return { output: shown.text + note, summary: `${commandSummary(result, timeout)} · on your machine${shown.count ? ` · ${shown.count} redacted` : ""}` };
     }
     // A command that runs without asking sees .git read-only: git runs hooks and config from it outside any sandbox
     // (the user's next commit, their editor), so a planted hook would escape. Without a .git, it can't create one

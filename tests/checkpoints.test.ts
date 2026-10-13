@@ -175,6 +175,7 @@ describe("stale locks (a git killed mid-snapshot)", () => {
     writeFileSync(indexLock, "");
     const old = new Date(Date.now() - 3_600_000);
     utimesSync(indexLock, old, old);
+    utimesSync(refLock, old, old);
     expect((await s.snapshot({ turn: 1, kind: "after", label: "" })).ok).toBe(true);
     expect(existsSync(refLock) || existsSync(indexLock)).toBe(false);
 
@@ -183,11 +184,16 @@ describe("stale locks (a git killed mid-snapshot)", () => {
     expect(existsSync(indexLock)).toBe(true);
   });
 
-  test("in a repository, this session's ref lock is cleared", async () => {
+  test("in a repository, this session's ref lock is cleared once it's old", async () => {
     const repo = makeRepo();
     const s = store(repo);
     expect((await s.snapshot({ turn: 1, kind: "before", label: "" })).ok).toBe(true);
-    writeFileSync(join(repo, ".git", "refs", "marv", "checkpoints", "s1.lock"), "");
+    const lock = join(repo, ".git", "refs", "marv", "checkpoints", "s1.lock");
+    writeFileSync(lock, "");
+    // A fresh one may be a live git's (another Marv resumed this session): left alone, so this snapshot fails.
+    expect((await s.snapshot({ turn: 1, kind: "after", label: "" })).ok).toBe(false);
+    const old = new Date(Date.now() - 3_600_000);
+    utimesSync(lock, old, old);
     expect((await s.snapshot({ turn: 1, kind: "after", label: "" })).ok).toBe(true);
   });
 });

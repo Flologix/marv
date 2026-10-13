@@ -67,17 +67,21 @@ export interface StoreOptions {
 /** An index lock older than this was left by a git that was killed (runGitAsync's timeouts are far shorter). */
 const STALE_LOCK_MS = 10 * 60_000;
 
+/** A ref lock older than this was left by a killed git: update-ref holds one for milliseconds. */
+const STALE_REF_LOCK_MS = 60_000;
+
 /**
  * Locks a killed git left behind (runGitAsync SIGKILLs on a timeout or a stop), which would fail every later
- * snapshot. This session's ref lock is always stale here: its snapshots run one at a time. Marv's own index outside
- * a repository is shared by every Marv on the project, so its lock goes only once it's old.
+ * snapshot. Each goes only once it's old enough that no live git can hold it: another Marv may have resumed the
+ * same session, and Marv's own index outside a repository is shared by every Marv on the project.
  */
 async function clearStaleLocks(where: Location, ref: string): Promise<void> {
-  await rm(join(where.gitDir, `${ref}.lock`), { force: true });
-  if (where.kind !== "own") return;
-  const lock = join(where.gitDir, "marv-index.lock");
-  const info = await stat(lock).catch(() => null);
-  if (info && Date.now() - info.mtimeMs > STALE_LOCK_MS) await rm(lock, { force: true });
+  const stale = async (lock: string, ms: number) => {
+    const info = await stat(lock).catch(() => null);
+    if (info && Date.now() - info.mtimeMs > ms) await rm(lock, { force: true });
+  };
+  await stale(join(where.gitDir, `${ref}.lock`), STALE_REF_LOCK_MS);
+  if (where.kind === "own") await stale(join(where.gitDir, "marv-index.lock"), STALE_LOCK_MS);
 }
 
 export class CheckpointStore {

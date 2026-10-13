@@ -570,6 +570,15 @@ describe("bash with sandbox: false (the host door, #52)", () => {
     expect(bash.input.shape.sandbox.description).toContain("false runs the command on the user's machine, outside the sandbox, with their permissions; always asks.");
   });
 
+  test.if(sandboxAvailable())("token shapes a host command prints are redacted, and the result says so", async () => {
+    const token = `ghp_${"A".repeat(36)}`;
+    const result = await runTool(hostCall(`echo "deploy key ${token}"`), { root, doors: { host: true }, approve: async () => "yes" });
+    expect(result.output).not.toContain(token);
+    expect(result.output).toContain("deploy key [redacted token]");
+    expect(result.output).toContain("Marv: 1 token was redacted from this output.");
+    expect(result.summary).toContain("1 redacted");
+  });
+
   test.if(sandboxAvailable())("asks with door host, once, scope bash:host:<command>, even in yolo; then runs on the host with the user's environment, minus Marv's keys", async () => {
     const asked: ApprovalRequest[] = [];
     const marker = join(outside, "ran");
