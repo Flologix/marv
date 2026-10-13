@@ -225,6 +225,7 @@ export const github: Tool<typeof input> = {
     if (NAMES_REPO.has(c.command)) {
       const repo = repoFlag(args) ?? (await repoName(ctx.root, ctx.signal));
       if (repo) where = `Visible to other people on ${repo.split("/").length === 2 ? `${projectHost(ctx.root) ?? "github.com"}/${repo}` : repo}.`;
+      else where = "Couldn't tell which repository: gh picks it from this folder.";
     }
     const files = fieldFiles(args);
     const warning = [where, files.length ? `Reads ${files.join(", ")} on your machine and sends it to GitHub.` : undefined].filter(Boolean).join(" · ") || undefined;

@@ -1,7 +1,7 @@
 // A stand-in for the GitHub CLI (#47): tests put it on PATH as `gh` (installFakeGh), so the github tool runs it
 // exactly as it would run gh, and nothing reaches GitHub. It logs every argv (and a few environment variables) as a
 // JSON line to $FAKE_GH_LOG, answers `auth status` per $FAKE_GH_LOGGED_IN ("1": logged in; $FAKE_GH_HANG: never
-// answers), `repo view --json nameWithOwner` with o/r, and anything else with $FAKE_GH_OUTPUT (default: its argv),
+// answers), `repo view --json nameWithOwner` with o/r ($FAKE_GH_NO_REPO=1: fails), and anything else with $FAKE_GH_OUTPUT (default: its argv),
 // $FAKE_GH_STDERR on stderr, and exit code $FAKE_GH_EXIT.
 import { appendFileSync } from "node:fs";
 import { chmod, mkdtemp, writeFile } from "node:fs/promises";
@@ -46,6 +46,7 @@ if (import.meta.main) {
     process.exit(process.env.FAKE_GH_LOGGED_IN === "1" ? 0 : 1);
   }
   if (args[0] === "repo" && args[1] === "view" && args.includes("nameWithOwner")) {
+    if (process.env.FAKE_GH_NO_REPO === "1") process.exit(1);
     console.log("o/r");
     process.exit(0);
   }

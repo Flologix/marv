@@ -20,7 +20,7 @@ let bin: string;
 let root: string;
 let log: string;
 const saved: Record<string, string | undefined> = {};
-const ENV = ["PATH", "FAKE_GH_LOG", "FAKE_GH_OUTPUT", "FAKE_GH_LOGGED_IN", "FAKE_GH_HANG", "FAKE_GH_EXIT", "FAKE_GH_STDERR", "OPENROUTER_API_KEY", "MARV_SECRET", "GH_DEBUG", "GH_CONFIG_DIR"];
+const ENV = ["PATH", "FAKE_GH_LOG", "FAKE_GH_OUTPUT", "FAKE_GH_LOGGED_IN", "FAKE_GH_HANG", "FAKE_GH_EXIT", "FAKE_GH_STDERR", "OPENROUTER_API_KEY", "MARV_SECRET", "GH_DEBUG", "GH_CONFIG_DIR", "FAKE_GH_NO_REPO"];
 
 beforeEach(async () => {
   for (const name of ENV) saved[name] = process.env[name];
@@ -76,6 +76,13 @@ describe("the github tool", () => {
     expect(asked[0]!.preview.warning).toBe("Visible to other people on github.com/o/r.");
     expect(result.approval).toBe("yes");
     expect((await fakeGhCalls(log)).map((c) => c.args).at(-1)).toEqual(["pr", "merge", "12", "--squash"]);
+  });
+
+  test("a merge whose repository can't be told says so, rather than naming none", async () => {
+    process.env.FAKE_GH_NO_REPO = "1";
+    const { asked, approve } = recorder("no");
+    await runTool(call(["pr", "merge", "12"]), { root, yolo: true, approve, doors: { github: true } });
+    expect(asked[0]!.preview.warning).toBe("Couldn't tell which repository: gh picks it from this folder.");
   });
 
   test("a declined write never reaches gh", async () => {
