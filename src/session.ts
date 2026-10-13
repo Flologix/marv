@@ -10,6 +10,9 @@
 import { z } from "zod";
 import { agentArgs, answerAllCalls, DEFAULT_MAX_STEPS, runAgent, type LoopEvent } from "./agent.ts";
 import { GENERAL_PURPOSE, type AgentType } from "./agents.ts";
+import { CheckpointStore, type SnapshotResult } from "./checkpoints/store.ts";
+import { CheckpointTurn } from "./checkpoints/turn.ts";
+import { applyUndo, planUndo, undoNote, type UndoPlan, type UndoResult } from "./checkpoints/undo.ts";
 import { COMPACT_AT, compactedHistory, MID_TURN_NOTE, summarize } from "./compact.ts";
 import { diagnosticsNote } from "./diagnostics/tsc.ts";
 import { checksNote, ProjectChecks, type ProjectCheckResult } from "./checks/kind.ts";
@@ -56,8 +59,13 @@ export type CompactResult =
 export type SessionEvent =
   /** Always first. */
   | { type: "turn_start"; turn: string }
-  /** What the turn is doing between the model's replies: `running` once the message is sent, and again after each `checking`. */
-  | { type: "status"; status: "waiting_for_mcp" | "compacting" | "checking" | "running" }
+  /**
+   * What the turn is doing between the model's replies: `running` once the message is sent, and again after each
+   * `checking` or `checkpointing` (a checkpoint snapshot taking longer than 300 ms).
+   */
+  | { type: "status"; status: "waiting_for_mcp" | "compacting" | "checking" | "checkpointing" | "running" }
+  /** The turn's checkpoint (#16) couldn't be saved: the turn goes on, but /undo can't take it back. Once per turn. */
+  | { type: "checkpoint"; status: "failed"; message: string }
   /** The main agent, exactly as runAgent yields them. */
   | LoopEvent
   /** A subagent's loop event; `callId` is the agent tool call that started it. */
@@ -129,6 +137,15 @@ export interface SessionInit {
   checks?: boolean;
   /** The project checks' session state; tests pass one with a stand-in runner. */
   projectChecks?: ProjectChecks;
+  /**
+   * Snapshot the project before each turn's first change and after the turn (git commits under a hidden ref, #16),
+   * so undoPlan()/undo() can put a turn's files back. Default true.
+   */
+  checkpoints?: boolean;
+  /** Marv's own git dir for a project outside a git repository (~/.marv/checkpoints/<project>); without it, such a project gets no checkpoints. */
+  checkpointsDir?: string;
+  /** The checkpoints' store; tests pass one. */
+  checkpointStore?: CheckpointStore;
   /**
    * MCP tools' specs in every request ("eager"), or only their names, in a note, with tool_search and mcp_call to
    * load and run them ("deferred", #14). Default "auto": deferred when the specs would cost more than min(4000
@@ -250,11 +267,23 @@ export interface Session {
     trajectories?: boolean;
     diagnostics?: boolean;
     checks?: boolean;
+    /** Checkpoints before each turn's changes (#16), for undo(). */
+    checkpoints?: boolean;
     /** The main agent's step limit (0 never asks); subagents keep their own. */
     maxSteps?: number;
     /** How MCP tools are offered (#14); applies from the next conversation that decides (after clear()). */
     mcpTools?: McpToolsSetting;
   }): void;
+  /**
+   * What undo() would do: the newest turn of this conversation that changed files and isn't undone yet, each path
+   * and its diff, or why there's nothing to undo. Rejects during a turn.
+   */
+  undoPlan(): Promise<UndoPlan | { reason: string }>;
+  /**
+   * Puts a planned turn's files back (after a snapshot of how they are now), and tells the model at the start of the
+   * next message. Rejects during a turn, and if the plan is stale.
+   */
+  undo(plan: UndoPlan): Promise<UndoResult>;
   /** Feedback on the last turn, in its trajectory. */
   rate(feedback: { score: 1 | -1 | 0; note?: string; labels?: string[] }): "rated" | "off" | "nothing";
   /** Saves the conversation now (it's also saved shortly after every turn). */
@@ -331,6 +360,18 @@ export class MarvSession implements Session {
   private readonly loaded = new Set<string>();
   /** The running turn's MCP specs: what a mid-turn compaction announces again. */
   private turnMcpSpecs: ToolSpec[] = [];
+  private checkpointsOn: boolean;
+  private readonly checkpoints: CheckpointStore;
+  /** This conversation's turns, counted: a checkpoint's turn number ("Undo turn 3"). */
+  private turnNumber = 0;
+  /** The paths each turn's tools said they changed (by turn number): an undo lists the ones git ignores. */
+  private reported = new Map<number, Set<string>>();
+  /** Why the last checkpoint failed, for undoPlan()'s answer; cleared by one that worked. */
+  private checkpointFailure: string | undefined;
+  /** What the model hasn't been told about an undo yet: it starts the next user message. */
+  private pendingNote: string | null = null;
+  /** Old chains are pruned once per session, at its first turn. */
+  private pruned = false;
 
   constructor(private readonly init: SessionInit) {
     checkToolNames(init.tools ?? []);
@@ -355,11 +396,14 @@ export class MarvSession implements Session {
     this.typecheck = init.typecheck ?? new Diagnostics();
     this.projectChecks = init.projectChecks ?? new ProjectChecks();
     this.logging = init.logTrajectories ?? true;
+    this.checkpointsOn = init.checkpoints ?? true;
     this.memories = init.memory?.initial;
     // Built once, so every request sends byte-identical tool definitions (the skill tool only when there are skills).
     this.specs = [...toolSpecsFor({ hasSkills: (init.skills?.length ?? 0) > 0 }), ...(init.tools ?? []).map(specOf)];
     this.system = this.buildSystem();
     this.saved = newSession(init.root, { provider: this.factory.id, model: this.factory.model });
+    this.checkpoints = init.checkpointStore ?? new CheckpointStore({ root: init.root, ownDir: init.checkpointsDir, session: this.saved.id });
+    this.checkpoints.setSession(this.saved.id);
     this.lookup();
   }
 
@@ -439,6 +483,7 @@ export class MarvSession implements Session {
     this.idle();
     this.saveNow(); // the last turn's save may still be waiting: it must go to the old file, with the old conversation
     this.saved = newSession(this.init.root, { provider: this.factory.id, model: this.factory.model });
+    this.newChain();
     this.conversation = [];
     this.messages = [];
     this.last = undefined;
@@ -468,6 +513,9 @@ export class MarvSession implements Session {
     this.idle();
     this.saveNow(); // the last turn's save may still be waiting: it belongs to the conversation being left
     this.saved = saved;
+    this.newChain();
+    // Its chain, if it still exists: numbering goes on after its last checkpointed turn.
+    this.turnNumber = (await this.checkpoints.chain().catch(() => [])).reduce((max, c) => Math.max(max, c.turn), 0);
     this.conversation = [...saved.conversation];
     this.messages = [...saved.transcript];
     this.totals = saved.totals;
@@ -491,6 +539,7 @@ export class MarvSession implements Session {
     trajectories?: boolean;
     diagnostics?: boolean;
     checks?: boolean;
+    checkpoints?: boolean;
     maxSteps?: number;
     mcpTools?: McpToolsSetting;
   }): void {
@@ -526,11 +575,48 @@ export class MarvSession implements Session {
       if (changes.checks && !this.projectChecksOn) this.projectChecks.reset();
       this.projectChecksOn = changes.checks;
     }
+    if (changes.checkpoints !== undefined) this.checkpointsOn = changes.checkpoints;
     if (changes.maxSteps !== undefined) this.maxSteps = changes.maxSteps;
     if (changes.mcpTools !== undefined) this.mcpTools = changes.mcpTools;
     if (!remade) return;
     ({ option: this.option, thinking: this.thinking, factory: this.factory, provider: this.provider, info: this.info } = remade);
     this.lookup();
+  }
+
+  /** /undo's preview: what undo() would put back, or why there's nothing to. Rejects during a turn. */
+  async undoPlan(): Promise<UndoPlan | { reason: string }> {
+    this.idle();
+    if (!this.checkpointsOn) return { reason: "checkpoints are off (/checkpoints on turns them on)" };
+    if (this.checkpoints.off) return { reason: `checkpoints are off for this project: ${this.checkpoints.off}` };
+    const plan = await planUndo(this.checkpoints, { reported: (turn) => [...(this.reported.get(turn) ?? [])] });
+    if ("reason" in plan) {
+      const where = await this.checkpoints.locate();
+      if ("error" in where) return { reason: `no checkpoints here: ${where.error}` };
+      if (this.checkpointFailure) return { reason: `${plan.reason}; the last checkpoint failed: ${this.checkpointFailure}` };
+    }
+    return plan;
+  }
+
+  /** /undo's yes: puts the plan's files back, and tells the model in the next message. Rejects during a turn. */
+  async undo(plan: UndoPlan): Promise<UndoResult> {
+    this.idle();
+    this.running = true; // no turn may start while files are being written back
+    try {
+      const result = await this.track(applyUndo(this.checkpoints, plan));
+      const log = this.trajectory();
+      log?.write({ type: "checkpoint", turn: this.lastTurn?.id ?? "", kind: "pre-undo", ok: true, sha: result.preUndo, files: result.preUndoFiles, ms: result.preUndoMs });
+      log?.write({ type: "undo", turn: plan.turn, paths: [...result.restored, ...result.recreated, ...result.deleted], skipped: result.refused.map((r) => r.path) });
+      const note = undoNote(plan, result);
+      if (note) this.pendingNote = this.pendingNote ? `${this.pendingNote}\n\n${note}` : note;
+      return result;
+    } finally {
+      this.running = false;
+    }
+  }
+
+  /** For /checkpoints: why the last checkpoint failed, or why checkpoints are off for this project. */
+  checkpointProblem(): { failure?: string; off?: string } {
+    return { ...(this.checkpointFailure ? { failure: this.checkpointFailure } : {}), ...(this.checkpoints.off ? { off: this.checkpoints.off } : {}) };
   }
 
   /** /good, /bad, /label: feedback on the last turn, in its trajectory. */
@@ -576,6 +662,15 @@ export class MarvSession implements Session {
     await this.working?.catch(() => {});
     await this.flush();
     if (this.init.ownsMcp) await this.init.mcp?.close();
+  }
+
+  /** A conversation was swapped (clear, resume): its own chain, numbering and undo note. */
+  private newChain(): void {
+    this.checkpoints.setSession(this.saved.id);
+    this.turnNumber = 0;
+    this.reported.clear();
+    this.pendingNote = null;
+    this.checkpointFailure = undefined;
   }
 
   private get cwd(): string {
@@ -897,6 +992,8 @@ export class MarvSession implements Session {
     emit({ type: "turn_start", turn });
     let reason: TurnEndReason = "error";
     let main: AgentRecorder | undefined;
+    let checkpointTurn: CheckpointTurn | undefined;
+    let checkpointFailed = false;
     // Subagents' recorders, by call id; ids are unique within the turn.
     const subRecorders = new Map<string, AgentRecorder>();
     try {
@@ -931,7 +1028,7 @@ export class MarvSession implements Session {
       const mcpChoice = this.decideMcp();
       this.turnMcpSpecs = mcp?.specs ?? [];
       const { specs, tools } = this.offered();
-      const { sandbox, yolo, factory, provider, info, diagnostics, projectChecksOn, maxSteps } = this;
+      const { sandbox, yolo, factory, provider, info, diagnostics, projectChecksOn, maxSteps, checkpointsOn } = this;
       const log = this.trajectory();
       const record = (r: TrajectoryRecord) => log?.write(r);
       this.startTurnLog(log, turn, text, forModel, specs, mcpChoice);
@@ -954,9 +1051,47 @@ export class MarvSession implements Session {
       // never into the transcript.
       const mcpNote = this.announce(this.turnMcpSpecs);
       if (mcpNote) record({ type: "mcp_note", turn, text: mcpNote });
-      this.conversation.push({ role: "user", text: mcpNote ? `${mcpNote}\n\n${forModel}` : forModel });
+      // An undo since the last turn: the model hears of it here, in the message Marv sends anyway (the cache holds).
+      const undoNote = this.pendingNote;
+      this.pendingNote = null;
+      this.conversation.push({ role: "user", text: [undoNote, mcpNote, forModel].filter(Boolean).join("\n\n") });
       this.note("user", text);
       emit({ type: "status", status: "running" });
+
+      // The turn's checkpoint pair (#16): the before is taken by the first call that can change files.
+      const number = ++this.turnNumber;
+      if (checkpointsOn && !this.pruned) {
+        this.pruned = true;
+        this.checkpoints.prune({ keep: 20, days: 14 }).catch(() => {});
+      }
+      const reported = new Set<string>();
+      this.reported.set(number, reported);
+      const snapshotRecord = (kind: "before" | "after", r: SnapshotResult) =>
+        record(
+          r.ok
+            ? { type: "checkpoint", turn, kind, ok: true, sha: r.sha, files: r.files, ms: r.ms }
+            : { type: "checkpoint", turn, kind, ok: false, ms: r.ms, message: r.message },
+        );
+      checkpointTurn = checkpointsOn
+        ? new CheckpointTurn({
+            store: this.checkpoints,
+            turn: number,
+            label: text,
+            onSnapshot: (kind, r) => {
+              snapshotRecord(kind, r);
+              if (r.ok) this.checkpointFailure = undefined;
+            },
+            onFailed: (message) => {
+              this.checkpointFailure = message;
+              if (!checkpointFailed) emit({ type: "checkpoint", status: "failed", message });
+              checkpointFailed = true;
+            },
+            onSlow: (on) => emit({ type: "status", status: on ? "checkpointing" : "running" }),
+          })
+        : undefined;
+      const noteChanged = (event: LoopEvent) => {
+        if (event.type === "tool_end" && event.result.changed) reported.add(event.result.changed);
+      };
 
       const approve = this.approver(stop.signal);
       // The typecheck and the project's checks after file changes: a baseline before the first, a check after each
@@ -1029,6 +1164,7 @@ export class MarvSession implements Session {
         onUsage: (usage) => this.count(usage, factory, info),
         onProgress: (callId, progress) => emit({ type: "subagent_progress", callId, progress }),
         onEvent: (callId, event) => {
+          noteChanged(event);
           subRecorders.get(callId)?.event(event);
           emit({ type: "subagent", callId, event });
         },
@@ -1053,7 +1189,7 @@ export class MarvSession implements Session {
         runTool: async (call) => {
           const result = await runTool(
             call,
-            { root: this.init.root, signal: stop.signal, approve, sandbox, yolo, skills: this.init.skills, memory: this.init.memory?.paths, agentHost, beforeChange: checks?.beforeChange },
+            { root: this.init.root, signal: stop.signal, approve, sandbox, yolo, skills: this.init.skills, memory: this.init.memory?.paths, agentHost, beforeChange: checks?.beforeChange, checkpoint: checkpointTurn?.checkpoint },
             tools,
           );
           const note = rewritten.get(call.id);
@@ -1088,6 +1224,7 @@ export class MarvSession implements Session {
             : undefined,
       })) {
         main.event(event);
+        noteChanged(event);
         switch (event.type) {
           case "usage":
             this.last = event.usage;
@@ -1137,6 +1274,8 @@ export class MarvSession implements Session {
       // would otherwise carry on unseen, and could still ask for approvals.
       stop.abort();
       signal?.removeEventListener("abort", onAbort);
+      // The after snapshot, however the turn ended, once every call is answered (a pair that changed nothing goes).
+      if (checkpointTurn) await checkpointTurn.finish().catch(() => undefined);
       // The session is free before turn_end goes out, so a client can send the next message as soon as it sees it,
       // and a turn nobody reads frees it too. (A newer turn can't have started yet: send() refuses while running.)
       if (this.current === stop) this.current = null;

@@ -6,6 +6,8 @@ import { Select } from "./Select.tsx";
 import { theme } from "./theme.ts";
 
 const MAX_DIFF_LINES = 24;
+/** Each of several files' diffs (/undo), so a few files fit on the screen at once. */
+const MAX_FILE_DIFF_LINES = 8;
 
 /**
  * Asks before a tool changes something: what it will do (a diff, or the
@@ -53,6 +55,15 @@ export function Approval({
           {diff.length > 0 && <DiffView lines={diff} max={MAX_DIFF_LINES} />}
         </Box>
       )}
+      {preview.files?.map((file, i) => (
+        <Box key={i} flexDirection="column" marginTop={1}>
+          <Text>
+            {printable(file.title)}
+            {file.note && <Text color={theme.dim}> · {printable(file.note)}</Text>}
+          </Text>
+          {file.diff && file.diff.lines.length > 0 && <DiffView lines={file.diff.lines} more={file.diff.more} max={MAX_FILE_DIFF_LINES} indent={2} />}
+        </Box>
+      ))}
 
       {preview.note && <Text color={theme.dim}>{printable(preview.note)}</Text>}
       {preview.warning && <Text color={theme.warning}>⚠ {printable(preview.warning)}</Text>}

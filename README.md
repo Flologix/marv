@@ -24,6 +24,7 @@ Marv is written in TypeScript on [Bun](https://bun.sh), with an [Ink](https://gi
 - **Trajectories and feedback.** Every turn is logged step by step (requests, replies, tool calls, subagents, timings, tokens) to `~/.marv/trajectories/`, with your ratings: `/good`, `/bad`, `/label`, and what your next message implies ("thanks, perfect" or "that's wrong"). `bun run stats` sums them up per model or Marv version, so you can measure whether a change made runs better.
 - **Type errors caught early.** After Marv changes files in a TypeScript project, it runs the project's own typecheck in the sandbox and tells the model about errors the change added, even in files it didn't touch (a project here means a `tsconfig.json` in the folder Marv starts in plus the project's own `typescript` or tsgo in that folder's `node_modules`; a global tsc isn't used), so it fixes broken callers before saying it's done. `/diagnostics off` turns it off.
 - **Your project's rules, as checks.** Rules from your instructions ("imports use `.ts` extensions", "never call X outside Y") can live in `.marv/checks/` as code: after a step that changed files, Marv runs the checks those files concern, in the sandbox, and tells the model only the violations its change added, with the reason. An obeyed rule costs nothing; a broken one comes back when it matters. See [Checks](#checks).
+- **Undo a turn.** Before a turn's first change Marv snapshots the project's files, and `/undo` shows what that turn changed (each file's diff) and, on a yes, puts those files back: edits, new files and deleted ones, whether a tool or a `bash` command made them. Your branch, index and stash are never touched. See [Undo](#undo).
 - **No dead stops.** After 25 steps without finishing, Marv asks whether to keep going instead of giving up. Raise the interval with `/steps 40` (or `maxSteps` in the config), or turn the asking off with `/steps off` — like Claude Code and Codex, a long run then just keeps going (subagents still stop at their own 50).
 - **Cost tracking.** OpenRouter's actual charge per request, plus context and cache use, in the status bar; `/cost` for the breakdown.
 - **Herdr aware.** Run Marv in a [Herdr](https://herdr.dev) pane and Herdr's sidebar shows whether it's working, waiting for your approval, or done, with nothing to set up.
@@ -94,6 +95,8 @@ Type what you want in plain language, for example:
 | `/good`, `/bad` | Rate the last turn, with an optional note (`/bad edited the wrong file`) |
 | `/label` | Tag the last turn (`/label refactor, tests`) |
 | `/mcp` | Show MCP servers and their tools; `/mcp add <package \| URL \| repo>` adds one, `/mcp search <words>` finds one, `/mcp remove <name>` takes yours out, `/mcp trust` starts the project's, `/mcp login <name>` logs in to a remote server (OAuth), `/mcp logout <name>` forgets the login |
+| `/undo` | Show what the last turn changed and, on a yes, put those files back; again for the turn before ([Undo](#undo)) |
+| `/checkpoints` | Show or set the snapshots `/undo` needs (`/checkpoints on`, `/checkpoints off`) |
 | `/diagnostics` | Show or set the typecheck after edits (`/diagnostics on`, `/diagnostics off`) |
 | `/checks` | List the project's checks and their last result (`/checks on`, `/checks off`) |
 | `/steps` | Show or set the step limit (`/steps 40`, `/steps off` never asks) |
@@ -291,6 +294,14 @@ A rule that needs code is a script, `.marv/checks/<name>.ts`, run with bun from 
 
 After a step that changed files, Marv runs the checks whose glob matches one of them and tells the model only what's new since the turn began (matched by check, file and message, not line), with each check's `why`. Checks are code from the repository, so like the typecheck they run only in the sandbox, with the project read-only and no network, never ask for approval, and don't run at all without the sandbox. `/checks` lists them, what couldn't be loaded, and the last result; `/checks off` (config `checks`, SDK option `checks`) turns them off. Marv's own repository has four in its `.marv/checks/`.
 
+## Undo
+
+Every turn that changes files gets two snapshots: one just before its first change (any `edit_file`, `write_file` or `bash` command, a subagent's in the shared folder too) and one when the turn ends, however it ends. They're git commits written through a temporary index, so your index, `HEAD`, branches and stash stay exactly as they were. In a repository they're kept under a hidden ref, `refs/marv/checkpoints/<session>`, which `git branch`, `git status`, `git push` and `git fetch` don't show (`git log --all` and `git push --mirror` do); outside a repository, in a git folder of Marv's own under `~/.marv/checkpoints/` (up to 20,000 files and 200 MB of new content; past that, checkpoints are off for that project for the session).
+
+`/undo` takes the newest turn not yet undone and shows each file it changed with its diff: restored, deleted (the turn created it) or recreated (the turn deleted it). Files you edited since the turn ended are marked; they're restored too. Nothing is written before you say yes. Before writing, Marv takes one more snapshot, so an undo can itself be undone by hand (`git checkout <sha> -- file`, the sha from `git log refs/marv/checkpoints/<session>`). `/undo` again goes one more turn back. The conversation isn't rewound: the model is told what was undone at the start of your next message.
+
+What `/undo` can't put back: files git ignores (`.env`, `node_modules/`, build output; they're listed as "not restored"), anything outside the project folder, and anything a command did outside files (a database, a server, a push). Changes you make yourself while a turn runs count as that turn's. A repository's clean filters (git-lfs) run when Marv snapshots, as they do on your `git status`. At a session's first turn, refs older than 14 days beyond the 20 newest sessions are deleted; git's own gc collects their objects later. `/checkpoints off` (config `checkpoints`, SDK `checkpoints`) turns it all off.
+
 ## Files and settings
 
 | Path | Contents |
@@ -308,6 +319,7 @@ After a step that changed files, Marv runs the checks whose glob matches one of 
 | `~/.marv/mcp-tokens.json` | MCP logins (`/mcp login`): OAuth clients and tokens, private (0600) |
 | `.marv/agents/` | The project's agent types |
 | `.marv/checks/` | The project's checks, run after the model's edits ([Checks](#checks)) |
+| `~/.marv/checkpoints/<project>/` | `/undo`'s snapshots for a project that isn't a git repository (in a repository they're under `refs/marv/checkpoints/`) |
 | `~/.marv/worktrees/<project>/` | Subagents' worktrees while they run (removed when each finishes; its branch stays) |
 | `AGENTS.md` | Project instructions, read into the system prompt at startup |
 
@@ -405,7 +417,8 @@ await session.close();
 - **Turns and events.** `send()` starts a turn at once and returns its events: `turn_start` first and
   `turn_end` last, exactly once however it ends, with the model's text, tool calls (`tool_start`/`tool_end`),
   subagents' events (`subagent`, tagged with the call that started them), `status` (waiting for MCP servers,
-  compacting, checking, running), `check` (the typecheck after a file change: how many errors were new, a
+  compacting, checking, checkpointing, running), `checkpoint` (the turn's snapshot failed, so it can't be
+  undone), `check` (the typecheck after a file change: how many errors were new, a
   failure, or that it's off), `checks` (the same for the project's checks, `.marv/checks/`), compaction, and `cut_off` (a reply hit the output limit, so nothing in it ran; the
   model is told and goes on, and a second one in a row ends the turn) in between. A file change's `tool_end`
   (`edit_file`, `write_file`) carries `result.diff`: what changed, as numbered lines, for display; the model
@@ -434,6 +447,9 @@ await session.close();
   `persist`) continues one; `trajectories: true` logs every turn. `diagnostics` (on by default) typechecks
   TypeScript projects after the model's file changes and tells it about new errors; it needs the sandbox.
   `checks` (on by default; nothing runs without `.marv/checks/`) does the same with the project's own checks.
+  `checkpoints` (on by default) snapshots the project around each turn that changes files: `session.undoPlan()`
+  returns what undoing the last turn would do (each file, its diff) or why there's nothing to, and
+  `session.undo(plan)` does it and tells the model at the start of the next message.
   `maxSteps` (default 25) sets how many steps a turn runs before it stops or asks; `0` never asks or stops the
   main agent (subagents keep their own limit).
 - **MCP servers in code:** `mcpServers: { name: { command, args } }` (`.mcp.json`'s format). These are trusted like

@@ -214,6 +214,7 @@ const instance = render(
     agents={agents}
     agentProblems={agentProblems}
     worktreesDir={join(defaultConfigDir(process.env), "worktrees", projectKey(root))}
+    checkpointsDir={join(defaultConfigDir(process.env), "checkpoints", projectKey(root))}
     sessions={new SessionStore(join(defaultConfigDir(process.env), "sessions"))}
     trajectories={new TrajectoryStore(join(defaultConfigDir(process.env), "trajectories"))}
     mcp={mcp}

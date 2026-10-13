@@ -82,6 +82,9 @@ export function subagentContext(ctx: ToolContext, who: string, worktree?: Worktr
     readOnly: worktree ? [...(worktree.prefix ? [worktree.dir] : []), worktree.gitDir] : undefined,
     gitEnv: worktree && worktreeEnv(worktree),
     approve: subagentApprove(ctx.approve, who, Boolean(worktree) && sandboxed),
+    // A shared-folder subagent edits the same files in the same turn: the turn's one checkpoint covers it. A
+    // worktree's changes land on its branch, which is already the way back.
+    checkpoint: worktree ? undefined : ctx.checkpoint,
   };
 }
 

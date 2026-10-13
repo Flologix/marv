@@ -2049,3 +2049,92 @@ describe("/mcp add, search and remove", () => {
     await until(() => lastFrame()!.includes("no server named"));
   });
 });
+
+describe("/undo", () => {
+  const git = (...args: string[]) => Bun.spawnSync(["git", ...args], { cwd: project }).stdout.toString().trim();
+  beforeEach(() => {
+    git("init", "-q", "-b", "main");
+    git("add", "-A");
+    git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "first");
+  });
+  const writeTurn = () =>
+    new ScriptedProvider([
+      [{ type: "tool_call", call: { id: "w", name: "write_file", arguments: JSON.stringify({ path: "notes.txt", content: "buy bread\n" }) } }, { type: "done", reason: "tool_calls" }],
+      [{ type: "text_delta", text: "Changed the note." }, { type: "done", reason: "stop" }],
+    ]);
+  const read = (path: string) => Bun.file(join(project, path)).text();
+
+  test("shows the turn's files and diffs; Yes puts them back", async () => {
+    const provider = writeTurn();
+    const { lastFrame, stdin } = renderApp(LOCAL, 0, undefined, () => provider);
+    await tick();
+    await type(stdin, "change the note");
+    await until(() => lastFrame()!.includes("Changed the note."));
+    expect(await read("notes.txt")).toBe("buy bread\n");
+    await type(stdin, "/undo");
+    await until(() => lastFrame()!.includes("Do you want to proceed?"));
+    const frame = lastFrame()!;
+    expect(frame).toContain('Undo turn 1 ("change the note")? 1 file');
+    expect(frame).toContain("Restore notes.txt");
+    expect(frame).toContain("- buy bread");
+    expect(frame).toContain("+ remember the milk");
+    expect(frame).not.toContain("don't ask again");
+    stdin.write(ENTER);
+    await until(() => lastFrame()!.includes("↶ Undid turn 1"));
+    expect(lastFrame()).toContain("↶ Undid turn 1: 1 file restored");
+    expect(await read("notes.txt")).toBe("remember the milk\n");
+    // Nothing more to undo.
+    await type(stdin, "/undo");
+    await until(() => lastFrame()!.includes("Nothing to undo"));
+  });
+
+  test("No changes nothing", async () => {
+    const provider = writeTurn();
+    const { lastFrame, stdin } = renderApp(LOCAL, 0, undefined, () => provider);
+    await tick();
+    await type(stdin, "change the note");
+    await until(() => lastFrame()!.includes("Changed the note."));
+    await type(stdin, "/undo");
+    await until(() => lastFrame()!.includes("Do you want to proceed?"));
+    stdin.write(DOWN);
+    await tick();
+    stdin.write(ENTER);
+    await until(() => lastFrame()!.includes("Nothing was undone."));
+    expect(await read("notes.txt")).toBe("buy bread\n");
+  });
+
+  test("with nothing to undo it says why", async () => {
+    const { lastFrame, stdin } = renderApp(LOCAL);
+    await tick();
+    await type(stdin, "/undo");
+    await until(() => lastFrame()!.includes("Nothing to undo"));
+    expect(lastFrame()).toContain("no turn in this session has changed files yet");
+  });
+
+  test("refused during a turn", async () => {
+    class WriteThenHang implements Provider {
+      readonly name = "hang";
+      n = 0;
+      async *stream(_h: ChatTurn[], { signal }: StreamOptions = {}): AsyncIterable<AgentEvent> {
+        if (this.n++ === 0) {
+          yield { type: "tool_call", call: { id: "w", name: "write_file", arguments: JSON.stringify({ path: "notes.txt", content: "x\n" }) } };
+          yield { type: "done", reason: "tool_calls" };
+          return;
+        }
+        yield { type: "text_delta", text: "Still working" };
+        await new Promise<void>((resolve) => signal?.addEventListener("abort", () => resolve(), { once: true }));
+        yield { type: "done" };
+      }
+    }
+    const { lastFrame, stdin } = renderApp(LOCAL, 0, undefined, () => new WriteThenHang());
+    await tick();
+    await type(stdin, "go");
+    await until(() => lastFrame()!.includes("Still working"));
+    await type(stdin, "/undo");
+    await tick(200);
+    expect(lastFrame()).not.toContain("Do you want to proceed?");
+    expect(await read("notes.txt")).toBe("x\n");
+    stdin.write("\x1b");
+    await tick(200);
+  });
+});

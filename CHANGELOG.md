@@ -6,6 +6,10 @@ What counts as Marv's public API: the SDK (`@flologixai/marv/sdk`), the `marv` c
 
 ## [Unreleased]
 
+### Added
+
+- `/undo` puts back the files the last turn changed (issue #16). Before a turn's first call that can change files (`edit_file`, `write_file`, `bash`, a shared-folder subagent's), Marv snapshots the project's files as a git commit written through a temporary index, and again when the turn ends; a turn that changed nothing keeps none. In a repository the snapshots live under a hidden ref, `refs/marv/checkpoints/<session>`, never your branch, index or stash; outside one, in a git folder of Marv's own under `~/.marv/checkpoints/`. `/undo` shows the turn's files and their diffs (restored, deleted, recreated; files you edited since are marked, files git ignores are listed as not restored) and asks yes or no; on a yes it snapshots the current state first (so the undo can be undone by hand), writes each file back itself (no checkout filters, no following symlinks out of the project), and tells the model at the start of your next message. `/undo` again goes one turn further back. `/checkpoints on|off` (config `checkpoints`) turns it on and off; the SDK has `checkpoints`, `session.undoPlan()` and `session.undo(plan)`. Trajectories get `checkpoint` and `undo` records. Old sessions' refs are pruned at a session's first turn (the 20 newest and the last 14 days are kept).
+
 ## [0.3.0] - 2026-10-12
 
 Everything since 0.1.2: Sprints 1–3 (0.2.0 was never released on its own). Highlights: headless mode (`marv -p`), MCP servers installed with `/mcp add` and logged in with `/mcp login`, deferred MCP tool loading, project checks, tool-call repair, retries for dropped connections, a loop guard, and the step limit.

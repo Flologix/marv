@@ -7,7 +7,7 @@ import { runGit } from "../git.ts";
 import { ToolError } from "./types.ts";
 
 /** Skipped when the project isn't a git repo (inside one, .gitignore decides). */
-const IGNORED_DIRS = new Set([".git", "node_modules", "dist", "build", "out", "coverage", ".next", ".cache", "target", ".venv", "__pycache__"]);
+export const IGNORED_DIRS = new Set([".git", "node_modules", "dist", "build", "out", "coverage", ".next", ".cache", "target", ".venv", "__pycache__"]);
 
 const isInside = (root: string, path: string) => {
   const rel = relative(root, path);

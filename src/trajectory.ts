@@ -71,6 +71,10 @@ export type TrajectoryRecord =
   | (Who & { type: "subagent_start"; subagent: string; call: string; agentType: string; description: string; prompt: string; isolation?: string })
   /** How an agent's run ended (for "main", the turn). */
   | (Who & { type: "agent_end"; reason: string; steps: number; tools: number; ms: number })
+  /** A checkpoint snapshot (src/checkpoints, #16): which, its commit and file count, or why it failed. */
+  | { type: "checkpoint"; turn: string; kind: "before" | "after" | "pre-undo"; ok: boolean; sha?: string; files?: number; ms: number; message?: string }
+  /** /undo (#16): the turn it took back (its number in the checkpoints), the paths written, and those left alone. */
+  | { type: "undo"; turn: number; paths: string[]; skipped: string[] }
   /** The conversation was replaced by a summary (what the model sees from here on). */
   | { type: "compact"; turn?: string; summary: string }
   /** About a turn: 1 good, -1 bad, 0 just labeled. */
