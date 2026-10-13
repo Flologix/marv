@@ -42,9 +42,22 @@ pub struct TempDir(PathBuf);
 
 impl TempDir {
     pub fn new(tag: &str) -> Self {
+        Self::new_in(&std::env::temp_dir(), tag)
+    }
+    /// A folder the host's user can write outside `/tmp` (which the sandbox replaces with its own): `/var/tmp`. A fake
+    /// home there is what a missing home tmpfs would expose; a file there is what a writable `/` would let a command
+    /// change. Falls back to the temp folder where `/var/tmp` isn't writable.
+    pub fn outside_tmp(tag: &str) -> Self {
+        let var_tmp = Path::new("/var/tmp");
+        let probe = var_tmp.join(format!(".marv-guards-probe-{}", std::process::id()));
+        let writable = std::fs::write(&probe, "").and_then(|()| std::fs::remove_file(&probe)).is_ok();
+        let parent = if writable { var_tmp.to_path_buf() } else { std::env::temp_dir() };
+        Self::new_in(&parent, tag)
+    }
+    fn new_in(parent: &Path, tag: &str) -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("marv-guards-{tag}-{}-{n}", std::process::id()));
+        let dir = parent.join(format!("marv-guards-{tag}-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         Self(std::fs::canonicalize(dir).unwrap())

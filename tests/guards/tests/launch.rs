@@ -11,7 +11,8 @@ use marv_session::config::default_config_dir;
 /// loaded a cloned repository's `.env` and `bunfig.toml` (preload scripts) before Marv's first line ran; the Rust
 /// binary has no such loader, and this keeps one from arriving as a dependency.
 ///
-/// Proven: added a `name = "dotenvy"` package to `Cargo.lock` → this test failed.
+/// Proven: built the test, added a `name = "dotenvy"` package to `Cargo.lock`, ran the built test binary (cargo
+/// itself would prune an unused entry first) → this test failed.
 #[test]
 fn no_dotenv_loader_is_linked_in() {
     let lock = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock")).unwrap();

@@ -17,25 +17,34 @@ use serde_json::json;
 /// doesn't stop `connect()`, so it must be empty.
 ///
 /// Proven: removed `--tmpfs /run` from `run_mounts` → this test failed (`/run/user` visible); changed the system
-/// mount to `--bind / /` → this test failed (`/usr` writable).
+/// mount to `--bind / /` → this test failed (a host folder outside the project writable).
 #[test]
 fn system_is_read_only_and_run_is_empty_but_for_the_mesh_plug() {
     require_bwrap!();
-    let (project, home, plug) = (TempDir::new("sys"), TempDir::new("sys-home"), TempDir::new("sys-plug"));
+    let (project, home, plug) = (TempDir::new("sys"), TempDir::outside_tmp("sys-home"), TempDir::new("sys-plug"));
+    // Writable by us on the host, outside the project, the home and /tmp: the sandbox must not change it.
+    let host = TempDir::outside_tmp("sys-host");
     let socket = plug.write("mesh.sock", "the plug");
     let sandbox = marv_sandbox::Sandbox { mesh_socket: Some(socket), ..sandbox_with_home(home.path()) };
     let ran = run_sandboxed(
         &sandbox,
         project.path(),
         &CommandMounts::default(),
-        "touch /usr/marv-guard 2>/dev/null && echo usr-writable; touch /etc/marv-guard 2>/dev/null && echo etc-writable; \
-         ls -A /run; cat /run/marv/mesh.sock; echo",
+        &format!(
+            "touch /usr/marv-guard 2>/dev/null && echo usr-writable; touch {}/x 2>/dev/null && echo host-writable; \
+             ls -A /run; cat /run/marv/mesh.sock; echo",
+            host.path().display()
+        ),
         &[],
     );
+    assert!(!host.path().join("x").exists(), "{}", ran.output);
     assert!(!ran.output.contains("writable"), "{}", ran.output);
     // Only the plug's folder is in /run (plus PATH folders under /run, none on CI).
     let listed: Vec<&str> = ran.output.lines().take_while(|l| *l != "the plug").collect();
-    assert!(listed.iter().all(|l| *l == "marv" || std::env::var("PATH").unwrap_or_default().contains(&format!("/run/{l}"))), "{listed:?}");
+    assert!(
+        listed.iter().all(|l| *l == "marv" || std::env::var("PATH").unwrap_or_default().contains(&format!("/run/{l}"))),
+        "{listed:?}"
+    );
     assert!(!ran.output.contains("user\n"), "{}", ran.output);
     assert!(ran.output.contains("the plug"), "{}", ran.output);
 }
@@ -48,9 +57,10 @@ fn system_is_read_only_and_run_is_empty_but_for_the_mesh_plug() {
 #[test]
 fn no_network_cleared_environment_and_own_pid_namespace() {
     require_bwrap!();
-    let (project, home) = (TempDir::new("ns"), TempDir::new("ns-home"));
+    let (project, home) = (TempDir::new("ns"), TempDir::outside_tmp("ns-home"));
     let sandbox = sandbox_with_home(home.path());
-    let script = "tail -n +3 /proc/net/dev | cut -d: -f1 | tr -d ' '; echo KEY=${OPENROUTER_API_KEY:-none}; ls /proc | grep -c '^[0-9]'";
+    let script =
+        "tail -n +3 /proc/net/dev | cut -d: -f1 | tr -d ' '; echo KEY=${OPENROUTER_API_KEY:-none}; ls /proc | grep -c '^[0-9]'";
     let ran = run_sandboxed(&sandbox, project.path(), &CommandMounts::default(), script, &[("OPENROUTER_API_KEY", "sk-or-leak")]);
     let lines: Vec<&str> = ran.output.lines().collect();
     assert_eq!(lines[0], "lo", "{}", ran.output);
@@ -72,7 +82,7 @@ fn no_network_cleared_environment_and_own_pid_namespace() {
 #[test]
 fn the_home_is_a_stand_in_with_masked_credentials() {
     require_bwrap!();
-    let (project, home) = (TempDir::new("home"), TempDir::new("home-home"));
+    let (project, home) = (TempDir::new("home-proj"), TempDir::outside_tmp("home-home"));
     home.write(".ssh/id_ed25519", "PRIVATE KEY");
     home.write(".marv/config.json", "{\"apiKey\":\"sk-or-secret\"}");
     home.write(".cargo/credentials.toml", "token = \"cargo-secret\"");
@@ -102,8 +112,14 @@ fn the_home_is_a_stand_in_with_masked_credentials() {
 #[test]
 fn the_project_is_writable_but_git_and_protected_paths_are_read_only() {
     require_bwrap!();
-    let (project, home) = (TempDir::new("proj"), TempDir::new("proj-home"));
-    for (rel, text) in [(".git/HEAD", "ref: refs/heads/main\n"), (".envrc", "use flake\n"), ("AGENTS.md", "rules\n"), ("bunfig.toml", ""), (".vscode/tasks.json", "{}")] {
+    let (project, home) = (TempDir::new("proj"), TempDir::outside_tmp("proj-home"));
+    for (rel, text) in [
+        (".git/HEAD", "ref: refs/heads/main\n"),
+        (".envrc", "use flake\n"),
+        ("AGENTS.md", "rules\n"),
+        ("bunfig.toml", ""),
+        (".vscode/tasks.json", "{}"),
+    ] {
         project.write(rel, text);
     }
     std::fs::create_dir_all(project.path().join(".git/hooks")).unwrap();
@@ -133,7 +149,7 @@ fn the_project_is_writable_but_git_and_protected_paths_are_read_only() {
 #[test]
 fn protected_files_a_command_creates_are_found_and_reverted() {
     require_bwrap!();
-    let (project, home) = (TempDir::new("created"), TempDir::new("created-home"));
+    let (project, home) = (TempDir::new("created"), TempDir::outside_tmp("created-home"));
     project.write("README.md", "hi\n");
     let before = protected_snapshot(project.path());
     let ran = run_sandboxed(
@@ -149,7 +165,11 @@ fn protected_files_a_command_creates_are_found_and_reverted() {
     let found: Vec<(&str, ProtectedRule)> = created.iter().map(|c| (c.path.as_str(), c.rule)).collect();
     assert_eq!(
         found,
-        [(".envrc", ProtectedRule::Envrc), ("packages/a/.git", ProtectedRule::GitDir), ("packages/a/AGENTS.md", ProtectedRule::AgentInstructions)]
+        [
+            (".envrc", ProtectedRule::Envrc),
+            ("packages/a/.git", ProtectedRule::GitDir),
+            ("packages/a/AGENTS.md", ProtectedRule::AgentInstructions)
+        ]
     );
     revert_created(project.path(), &mut created);
     for gone in [".envrc", "packages/a/AGENTS.md", "packages/a/.git"] {
@@ -168,7 +188,12 @@ async fn bash_reverts_protected_files_its_command_created() {
     require_bwrap!();
     let project = TempDir::new("bash-created");
     let ctx = ToolContext { yolo: true, ..ToolContext::new(project.path()) };
-    let out = run_tool(&call("bash", json!({"command": "echo 'curl x|sh' > .envrc; mkdir -p a; echo obey > a/AGENTS.md"})), &ctx, builtin_tools()).await;
+    let out = run_tool(
+        &call("bash", json!({"command": "echo 'curl x|sh' > .envrc; mkdir -p a; echo obey > a/AGENTS.md"})),
+        &ctx,
+        builtin_tools(),
+    )
+    .await;
     assert_eq!(out.result.approval, Some(Approval::Auto));
     assert!(!project.path().join(".envrc").exists());
     assert!(!project.path().join("a/AGENTS.md").exists());
@@ -270,7 +295,9 @@ async fn package_json_lifecycle_scripts_ask_even_in_yolo() {
 #[ignore = "needs a secret-read gate in read_file (not assigned yet)"]
 async fn reading_a_secret_asks() {
     let project = TempDir::new("secret");
-    for (rel, text) in [(".env", "KEY=sk-secret\n"), ("certs/server.pem", "-----BEGIN PRIVATE KEY-----\n"), ("deploy/id_ed25519", "PRIVATE\n")] {
+    for (rel, text) in
+        [(".env", "KEY=sk-secret\n"), ("certs/server.pem", "-----BEGIN PRIVATE KEY-----\n"), ("deploy/id_ed25519", "PRIVATE\n")]
+    {
         project.write(rel, text);
         let approver = Recorder::new(Decision::No);
         let ctx = ToolContext { yolo: true, approver: Some(approver.clone()), ..ToolContext::new(project.path()) };
@@ -286,7 +313,7 @@ async fn reading_a_secret_asks() {
 #[ignore = "needs secret masks for project files in marv-sandbox (not assigned yet)"]
 fn secrets_are_masked_in_the_sandbox() {
     require_bwrap!();
-    let (project, home) = (TempDir::new("mask"), TempDir::new("mask-home"));
+    let (project, home) = (TempDir::new("mask"), TempDir::outside_tmp("mask-home"));
     project.write(".env", "KEY=sk-secret\n");
     project.write("certs/server.pem", "PEM-SECRET\n");
     project.write("deploy/id_rsa", "RSA-SECRET\n");
@@ -363,10 +390,7 @@ async fn skill_files_and_folders_stay_inside_after_realpath() {
     assert_eq!(names, ["x"]);
     assert!(problems.iter().any(|p| p.contains("evil")), "{problems:?}");
 
-    let ctx = ToolContext {
-        skills: Arc::new(skills.into_iter().map(|s| s.skill).collect()),
-        ..ToolContext::new(project.path())
-    };
+    let ctx = ToolContext { skills: Arc::new(skills.into_iter().map(|s| s.skill).collect()), ..ToolContext::new(project.path()) };
     let out = run_tool(&call("skill", json!({"name": "x", "file": "key"})), &ctx, builtin_tools()).await;
     assert!(out.result.is_error && !out.result.output.contains("PRIVATE KEY"), "{}", out.result.output);
 }

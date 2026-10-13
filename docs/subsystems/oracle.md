@@ -17,7 +17,7 @@ Spec: `tests/oracle/README.md`; Marv's `evals/run.ts` (the workspace setup), `ev
 | `evals/mcp/tracker.ts` | `tracker.rs` | **Done and tested:** all 25 tools, the specs byte for byte from the TypeScript's `tools/list`, answers as `JSON.stringify(…, null, 2)` in its key order, comments to `out.json` |
 | (new) | `lib.rs`, `main.rs`, `tests/oracle.rs` | **Done:** `check_all` (parallel), the `marv-oracle check\|record\|tracker` CLI, the ignored `oracle` test (`MARV_ORACLE_BIN`, `MARV_ORACLE_RECORD`), and checks that every recording is complete, keeps the prefix rule and holds no `.gitignore` |
 
-28 scenarios are recorded from TypeScript Marv (`7df450f`), which passes all of them: all 17 of Marv's eval tasks and 11 loop edge cases. The `SECURITY.md` guards are #8. marv-rs fails all of them today: `marv -p` isn't ported (#11).
+28 scenarios are recorded from TypeScript Marv (`7df450f`), which passes all of them: all 17 of Marv's eval tasks and 11 loop edge cases. The `SECURITY.md` guards are in `tests/guards/` (#8, guards.md). marv-rs fails all of them today: `marv -p` isn't ported (#11).
 
 ## Port notes
 

@@ -39,7 +39,10 @@ fn project_servers_need_trust_covering_entry_and_files() {
     assert!(!trust.is_trusted("proj", &project_servers(project.path(), config.path())[0]), "the file changed");
     project.write("server.js", "console.log('ok')\n");
     assert!(trust.is_trusted("proj", &project_servers(project.path(), config.path())[0]));
-    project.write(".mcp.json", &json!({"mcpServers": {"tracker": {"command": "node", "args": ["server.js", "--evil"]}}}).to_string());
+    project.write(
+        ".mcp.json",
+        &json!({"mcpServers": {"tracker": {"command": "node", "args": ["server.js", "--evil"]}}}).to_string(),
+    );
     assert!(!trust.is_trusted("proj", &project_servers(project.path(), config.path())[0]), "the entry changed");
 }
 

@@ -21,7 +21,7 @@ Spec: the **Sandbox** and **Yolo mode** bullets in Marv's `CLAUDE.md`, `src/sand
 | `src/tools/files.ts` (`resolveInProject`, `insideGitDir`, `touchesGit`, `refuseGit`, `projectPath`) | `paths.rs` | **Ported and tested.** New: `resolve_within`, the realpath containment check for skill files, with a symlink test |
 | `src/tools/bash.ts` (`gitGuard`, `worktreeGit`, `worktreeGitDirs`) | `git_guard.rs` | **Ported and tested** |
 | `src/tools/bash.ts` (`GIT_HINT`, `HOME_NOTE`, `NETWORK_NOTE`, `GH_NOTE`, `touchesHiddenHome`, `looksLikeNetworkFailure`) | `notes.rs` | **Ported and tested** (regex has no lookahead, so the word ends are checked by hand) |
-| new (`docs/SECURITY.md`) | `protected.rs` | **Done and tested:** `PROTECTED_PATHS`, `rule_for_relative`, `protected_rule`/`is_protected` (realpath, fails closed), `hooks_path`, `lifecycle_scripts_changed`, `protected_mounts` (top level only) |
+| new (`docs/SECURITY.md`) | `protected.rs` | **Done and tested:** `PROTECTED_PATHS`, `rule_for_relative`, `protected_rule`/`is_protected` (realpath, a dangling final symlink followed, fails closed), `hooks_path`, `lifecycle_scripts_changed`, `protected_mounts` (top level only), and the post-command scan: `protected_snapshot`, `scan_created`, `revert_created`, `created_note` (#8) |
 | new (`docs/SECURITY.md`) | `taint.rs` | **Done and tested:** `TaintState` (`mark`, `is_tainted`, `must_ask`, approved prefixes, `for_subagent`) |
 | — | `lib.rs` | `Sandbox` (the session's handle: `from_env`, `active`, `command`), `CommandMounts`, `SandboxError` |
 
@@ -50,6 +50,11 @@ pub fn project_path(root: &Path, absolute: &Path) -> String;
 pub fn is_protected(root: &Path, path: &Path) -> bool;                            // fails closed
 pub fn protected_rule(root: &Path, path: &Path) -> Result<Option<ProtectedRule>, SandboxError>;
 pub fn protected::lifecycle_scripts_changed(before: Option<&str>, after: &str) -> bool;
+// After a command (#8): snapshot before, scan after (bwrap placeholders removed first), then revert and tell the model.
+pub fn protected::protected_snapshot(root: &Path) -> ProtectedSnapshot;
+pub fn protected::scan_created(root: &Path, before: &ProtectedSnapshot) -> Vec<CreatedProtected>;  // { path, rule, reverted }
+pub fn protected::revert_created(root: &Path, created: &mut [CreatedProtected]);
+pub fn protected::created_note(created: &[CreatedProtected]) -> Option<String>;               // the `Marv:` note
 
 pub struct TaintState;  // mark(Provenance) -> bool, is_tainted(), sources(), must_ask(ToolKind, uses_network), approve_prefix, prefix_approved, for_subagent
 pub fn git_guard::git_guard(root: &Path) -> GitGuard;  // { read_only, placeholders }
@@ -73,15 +78,16 @@ pub fn notes::{looks_like_network_failure, runs_gh, touches_hidden_home}; pub co
   9. placeholders;
   10. credential masks, last.
 - **Protected paths** are a marv-rs addition.
-  - **Gap:** `protected_mounts` binds only the top-level protected entries that exist, plus the `core.hooksPath` folder. A command can still create a new `.envrc`, or an `AGENTS.md` deeper in the tree.
-  - **Fix planned:**
-    - placeholders for the top-level names;
-    - a scan after each command for new protected files, which then need approval to keep.
+  - `protected_mounts` binds only the top-level protected entries that exist, plus the `core.hooksPath` folder; bwrap can only mount what exists.
+  - **Created files (#8):** `scan_created` compares the project with a `protected_snapshot` taken before the command and finds every new protected entry at any level: a new `.envrc`, a nested `AGENTS.md` or `.git`, a file in a nested `.vscode/`, the missing hooks folder. Only the topmost new entry is reported. `revert_created` removes them (a symlink itself, never its target; nothing whose folder now leads outside the project), and `created_note` tells the model. Existing `.git` folders aren't walked (git_guard's job). Chosen over placeholders: placeholders cover only the names at the top level and leave mount points behind.
+  - **Not wired yet:** bash's `run` (marv-tools) must take the snapshot before `run_command` and scan after removing the placeholders; the guard `bash_reverts_protected_files_its_command_created` is ignored until it does.
+  - **Still a gap:** a protected file that already exists below the top level (say `packages/a/AGENTS.md`) isn't mounted read-only, and the scan only sees new entries, so a command can still *change* it. The scan walks the whole project (including `node_modules`) twice per command.
+  - **Dangling symlinks (#8):** `protected_rule` follows a final symlink that leads nowhere yet (`leads_to`): a write through `innocent.sh -> .envrc` creates `.envrc`, and `real_with_missing` judged it by the link's name. `resolve_in_project` has the same gap, so a write through a dangling link leaving the project lands outside it; that guard is ignored until `paths.rs` is fixed.
   - `.git` is left to `git_guard`, because an approved `git_write` command must be able to write it.
 - **Taint** is a marv-rs addition.
   - `run_tool` in marv-tools sets `must_ask`.
   - The session's "always" wrapper must honour it.
-  - Guard tests go in `tests/guards/`, which belongs to the workspace, not this crate.
+  - Guard tests are in `tests/guards/` (the `marv-guards` crate, see guards.md).
 - **Known limits** (as in Marv):
   - With network on, the sandbox shares the host's network namespace, so abstract sockets are reachable. Such calls always ask.
   - Tokens inside whole config files (`~/.gitconfig`) can't be masked.

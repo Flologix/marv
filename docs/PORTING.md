@@ -22,7 +22,8 @@ grep -rn 'todo!("port' crates/<crate>             # in one crate
 | marv-session | [session.md](subsystems/session.md) | Config and presets, system prompt with AGENTS.md cut, session store, trajectories, usage, memory, skills/agent loaders (symlink-safe), frontmatter, slash commands, `SessionToolRunner` (always ≠ must_ask), fenced check notes | `run_turn`, compaction call, subagents and worktrees, checks runner (`marv __run-checks`), MCP/mesh tool bodies |
 | marv-tui | [tui.md](subsystems/tui.md) | The martian (byte-exact frames, deadline animation, widget), theme, splash, welcome, terminal guard, `SessionPort`/`UiEvent` boundary | App loop and drawing, Markdown, transcript, approvals, prompt input, pickers, selection, clipboard |
 | marv-cli | [cli.md](subsystems/cli.md) | clap args, approvals list (incl. `mesh:<r>`), exit codes, headless collector, printable output | `tui::run` (the session ↔ TUI bridge), `mesh ls`/`mesh wire` |
-| marv-oracle (dev) | [oracle.md](subsystems/oracle.md) | All: fake OpenAI-compatible server, scenario runner, normalization, canonical request diff, the prefix-rule check, the tracker MCP fixture; 28 scenarios recorded from TypeScript Marv (which passes them): all 17 eval tasks plus 11 loop edge cases | The `SECURITY.md` guards (#8) |
+| marv-guards (dev) | [guards.md](subsystems/guards.md) | One test per `docs/SECURITY.md` rule (#8), each proven by reverting its guard; real-bwrap tests; the post-command scan for created protected files | Ignored until their code lands: headless output (#11), web prefixes (#5), bash calling the scan, secret reads and masks, the network approval's script list, the dangling-symlink fix in `resolve_in_project`, images |
+| marv-oracle (dev) | [oracle.md](subsystems/oracle.md) | All: fake OpenAI-compatible server, scenario runner, normalization, canonical request diff, the prefix-rule check, the tracker MCP fixture; 28 scenarios recorded from TypeScript Marv (which passes them): all 17 eval tasks plus 11 loop edge cases | — |
 
 Try the martian: `cargo run -p marv-tui --example martian` (q to quit).
 
@@ -52,8 +53,8 @@ Each milestone ends with something you can run.
 
    Test it with a tiny `examples/chat.rs`.
 2. **M2 Act.** Port the agent loop body, then the edit/write/glob/grep/bash `run` bodies, then `SessionToolRunner`. Then `marv -p "…"` with `--output text|json|stream-json` edits files, sandboxed, and the exit codes match Marv.
-3. **M3 Oracle.** The harness and 28 scenarios, recorded from TypeScript Marv's evals plus the loop edge cases, are done (#7: `crates/marv-oracle`, `tests/oracle/`, see its README). Left: make them pass once `marv -p` works (#11); the `SECURITY.md` guards are #8. **Everything after this is checked against the oracle.**
-4. **M4 Guards.** One test per `docs/SECURITY.md` rule in `tests/guards/`, each proven by reverting its guard. Includes the placeholder or post-command scan for protected files a command creates (see sandbox.md).
+3. **M3 Oracle.** The harness and 28 scenarios, recorded from TypeScript Marv's evals plus the loop edge cases, are done (#7: `crates/marv-oracle`, `tests/oracle/`, see its README). Left: make them pass once `marv -p` works (#11). The `SECURITY.md` guards are M4 (#8). **Everything after this is checked against the oracle.**
+4. **M4 Guards.** ✅ One test per `docs/SECURITY.md` rule in `tests/guards/` (#8, guards.md), each proven by reverting its guard, plus the post-command scan for protected files a command creates (sandbox.md). Rules whose code isn't written yet have ignored guards that name what they need.
 5. **M5 TUI.** Transcript, prompt input, approvals, diff view, status bar, pickers and the martian. **Measure CPU while idle and while streaming:** the target is under 2% idle and under 15% streaming (Marv #68).
 6. **M6 Context.** Compaction v1, then v2 (#63), plus sessions on disk, resume and trajectories.
 7. **M7 MCP.** Manager lifecycle, OAuth, deferred tools, `/mcp add`.

