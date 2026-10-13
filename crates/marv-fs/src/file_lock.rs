@@ -235,10 +235,8 @@ pub async fn take_over_stale(lock: &Path, stale: Duration) -> std::io::Result<bo
     if !is_stale(lock, stale).unwrap_or(false) {
         return Ok(false);
     }
-    let removed = under_guard(lock, stale, || {
-        is_stale(lock, stale).unwrap_or(false) && std::fs::remove_file(lock).is_ok()
-    })
-    .await?;
+    let removed =
+        under_guard(lock, stale, || is_stale(lock, stale).unwrap_or(false) && std::fs::remove_file(lock).is_ok()).await?;
     Ok(removed.unwrap_or(false))
 }
 
@@ -300,7 +298,7 @@ mod tests {
     async fn a_dropped_hold_still_releases_its_lock() {
         let path = dir().join("f.json");
         let lock = with_suffix(&path, ".lock");
-        let hold = with_file_lock(&path, LockOptions::default(), || std::future::pending::<()>());
+        let hold = with_file_lock(&path, LockOptions::default(), std::future::pending::<()>);
         assert!(tokio::time::timeout(Duration::from_millis(50), hold).await.is_err());
         for _ in 0..100 {
             if !lock.exists() {

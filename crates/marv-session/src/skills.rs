@@ -160,8 +160,7 @@ mod tests {
     use super::*;
 
     fn temp(tag: &str) -> PathBuf {
-        let d =
-            std::env::temp_dir().join(format!("marv-skills-{tag}-{}-{}", std::process::id(), marv_fs::random_hex()));
+        let d = std::env::temp_dir().join(format!("marv-skills-{tag}-{}-{}", std::process::id(), marv_fs::random_hex()));
         std::fs::create_dir_all(&d).unwrap();
         std::fs::canonicalize(d).unwrap()
     }

@@ -6,7 +6,7 @@
 //!   A direct call to a deferred MCP tool was rewritten to `mcp_call` before it entered the history; its result gets
 //!   the repair's `Marv:` note ([`SessionToolRunner::note_rewrite`]).
 //! - [`tool_run_from`]: `ToolOutput` → `ToolRun` (`into_core()` for the result, plus declined, provenance, changed,
-//!   and a [`ToolDisplay`] the UI and trajectories downcast for the diff and how it was approved). Output from a
+//!   how it was approved, and a [`ToolDisplay`] the UI downcasts for the diff). Output from a
 //!   tainting source (web, MCP, image) is fenced as data (`crate::provenance`); mesh messages come fenced already.
 //! - [`SessionApprover`]: the client's approver with the session's "don't ask again" scopes (Marv's `approver()`):
 //!   "always" scopes answer later requests in the same scope, **except a request with `must_ask`** (tainted egress,
@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+pub use marv_agent::ApprovalRecord;
 use marv_agent::{LoopEvent, ToolRun, ToolRunner};
 use marv_core::{MarvError, Provenance, ToolCall, ToolKind, Usage};
 use marv_provider::{Provider, ProviderFactory};
@@ -28,39 +29,21 @@ use marv_tools::{
     AgentHost, AgentProgress, Approval, ApprovalRequest, Approver, Decision, DiffShown, Preview, ToolContext, ToolError,
     ToolOutcome, ToolOutput, ToolRef,
 };
-use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
 use crate::agents::AgentType;
 use crate::provenance::fence;
 
-/// How a call that needed approval got it, as trajectories record it.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ApprovalRecord {
-    /// It needed none.
-    #[default]
-    None,
-    /// Yolo ran it.
-    Auto,
-    Interrupted,
-    Yes,
-    Always,
-    No,
-    Unavailable,
-}
-
-impl From<Option<Approval>> for ApprovalRecord {
-    fn from(approval: Option<Approval>) -> Self {
-        match approval {
-            None => Self::None,
-            Some(Approval::Auto) => Self::Auto,
-            Some(Approval::Interrupted) => Self::Interrupted,
-            Some(Approval::Decided(Decision::Yes)) => Self::Yes,
-            Some(Approval::Decided(Decision::Always)) => Self::Always,
-            Some(Approval::Decided(Decision::No)) => Self::No,
-            Some(Approval::Decided(Decision::Unavailable)) => Self::Unavailable,
-        }
+/// How a call was approved, as `ToolRun::approval` records it.
+pub fn approval_record(approval: Option<Approval>) -> ApprovalRecord {
+    match approval {
+        None => ApprovalRecord::None,
+        Some(Approval::Auto) => ApprovalRecord::Auto,
+        Some(Approval::Interrupted) => ApprovalRecord::Interrupted,
+        Some(Approval::Decided(Decision::Yes)) => ApprovalRecord::Yes,
+        Some(Approval::Decided(Decision::Always)) => ApprovalRecord::Always,
+        Some(Approval::Decided(Decision::No)) => ApprovalRecord::No,
+        Some(Approval::Decided(Decision::Unavailable)) => ApprovalRecord::Unavailable,
     }
 }
 
@@ -70,14 +53,14 @@ impl From<Option<Approval>> for ApprovalRecord {
 pub struct ToolDisplay {
     /// What a file change did (edit_file, write_file).
     pub diff: Option<DiffShown>,
-    pub approval: ApprovalRecord,
 }
 
 /// The loop's view of a finished call. `note`: a repair's note for a rewritten call (deferred MCP, #14).
 pub fn tool_run_from(outcome: ToolOutcome, note: Option<&str>) -> ToolRun {
     let ToolOutcome { result, label } = outcome;
-    let display = ToolDisplay { diff: result.diff.clone(), approval: result.approval.into() };
+    let display = ToolDisplay { diff: result.diff.clone() };
     let (declined, provenance, changed) = (result.declined, result.provenance, result.changed.clone());
+    let approval = approval_record(result.approval);
     let mut core = result.into_core();
     // Tainting sources are data, fenced (docs/SECURITY.md); mesh envelopes are fenced by the switchboard already.
     if provenance.taints() && provenance != Provenance::Mesh && !core.is_error {
@@ -86,7 +69,7 @@ pub fn tool_run_from(outcome: ToolOutcome, note: Option<&str>) -> ToolRun {
     if let Some(note) = note {
         core.output = marv_tools::repair::with_note(&core.output, Some(note));
     }
-    ToolRun { result: core, label, declined, provenance, changed, display: Some(Arc::new(display)) }
+    ToolRun { result: core, label, declined, provenance, changed, approval, display: Some(Arc::new(display)) }
 }
 
 /// The loop's tool runner for one turn (main agent or subagent).
@@ -332,8 +315,7 @@ mod tests {
         out.approval = Some(Approval::Decided(Decision::Yes));
         let run = tool_run_from(ToolOutcome { result: out, label: "docs.rs".into() }, None);
         assert!(run.result.output.starts_with("<untrusted-data source=\"web\""));
-        let display = run.display.as_ref().unwrap().downcast_ref::<ToolDisplay>().unwrap();
-        assert_eq!(display.approval, ApprovalRecord::Yes);
+        assert_eq!(run.approval, ApprovalRecord::Yes);
         let plain = tool_run_from(ToolOutcome { result: ToolOutput::ok("x", "1 line"), label: "a".into() }, Some("Marv: fixed"));
         assert!(plain.result.output.starts_with('x'));
         assert!(plain.result.output.contains("Marv: fixed"));
