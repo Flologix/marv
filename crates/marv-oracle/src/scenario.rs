@@ -34,6 +34,26 @@ pub struct RunSpec {
     pub git: bool,
     /// Kill the binary after this long (default [`DEFAULT_TIMEOUT_SECS`]).
     pub timeout_secs: Option<u64>,
+    /// What `GET /models` lists, in OpenRouter's format (`{"id", "context_length",
+    /// "supported_parameters": ["tools"]}`). Empty by default: Marv then knows no context window,
+    /// and never compacts.
+    #[serde(default)]
+    pub models: Vec<Value>,
+    /// An MCP server for the run, as Marv's eval tasks' `mcp.json` names it.
+    pub mcp: Option<McpFixture>,
+    /// 1-based requests allowed to break the prefix rule (see [`crate::prefix`]): the first request
+    /// after a compaction, which starts the cache over on purpose.
+    #[serde(default)]
+    pub prefix_resets: Vec<usize>,
+}
+
+/// `{"server": "tracker", "data": "tracker.json"}`: the tracker ([`crate::tracker`]) serving a data
+/// file from `tests/oracle/mcp/`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpFixture {
+    pub server: String,
+    pub data: String,
 }
 
 fn yes() -> bool {
@@ -83,4 +103,42 @@ pub fn load_all(root: &Path) -> anyhow::Result<Vec<Scenario>> {
 /// `tests/oracle/scenarios` in this workspace.
 pub fn default_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/oracle/scenarios")
+}
+
+/// `tests/oracle/mcp` in this workspace: the MCP fixtures' data.
+pub fn mcp_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/oracle/mcp")
+}
+
+/// Files stored under another name in `project/` and `expect/files/`: a `.gitignore` there would
+/// also apply to this repository, and hide the very files the scenario needs.
+const RENAMED: [(&str, &str); 1] = [(".gitignore", "gitignore.oracle")];
+
+/// A path as a project has it, from the name it's stored under.
+pub fn real_path(stored: &str) -> String {
+    map_name(stored, |name| RENAMED.iter().find(|(_, s)| *s == name).map(|(real, _)| *real))
+}
+
+/// A path as it's stored, from the name a project has.
+pub fn stored_path(real: &str) -> String {
+    map_name(real, |name| RENAMED.iter().find(|(r, _)| *r == name).map(|(_, stored)| *stored))
+}
+
+fn map_name(path: &str, map: impl Fn(&str) -> Option<&'static str>) -> String {
+    let (dir, name) = path.rsplit_once('/').map_or(("", path), |(d, n)| (d, n));
+    let name = map(name).unwrap_or(name);
+    if dir.is_empty() { name.to_string() } else { format!("{dir}/{name}") }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gitignore_is_stored_under_another_name() {
+        assert_eq!(stored_path(".gitignore"), "gitignore.oracle");
+        assert_eq!(stored_path("sub/.gitignore"), "sub/gitignore.oracle");
+        assert_eq!(real_path("sub/gitignore.oracle"), "sub/.gitignore");
+        assert_eq!(real_path("src/a.ts"), "src/a.ts");
+    }
 }

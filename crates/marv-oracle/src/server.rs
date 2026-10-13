@@ -30,6 +30,8 @@ pub struct Recorded {
 #[derive(Default)]
 struct State {
     replies: Vec<Reply>,
+    /// What `GET /models` lists.
+    models: Vec<Value>,
     /// How many chat requests have been answered.
     answered: usize,
     requests: Vec<Recorded>,
@@ -43,11 +45,11 @@ pub struct FakeServer {
 }
 
 impl FakeServer {
-    /// Starts serving `replies` on a free local port.
-    pub fn start(replies: Vec<Reply>) -> anyhow::Result<FakeServer> {
+    /// Starts serving `replies` (and `models` at `GET /models`) on a free local port.
+    pub fn start(replies: Vec<Reply>, models: Vec<Value>) -> anyhow::Result<FakeServer> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
-        let state = Arc::new(Mutex::new(State { replies, ..State::default() }));
+        let state = Arc::new(Mutex::new(State { replies, models, ..State::default() }));
         let stop = Arc::new(AtomicBool::new(false));
         let thread = {
             let (state, stop) = (state.clone(), stop.clone());
@@ -149,9 +151,13 @@ fn handle(stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
         };
         write_response(&mut out, response)
     } else {
-        state.lock().unwrap().requests.push(Recorded { method: method.clone(), path, body });
+        let models = {
+            let mut state = state.lock().unwrap();
+            state.requests.push(Recorded { method: method.clone(), path, body });
+            state.models.clone()
+        };
         if method == "GET" && route.ends_with("/models") {
-            write_status(&mut out, 200, None, &json!({"data": []}).to_string())
+            write_status(&mut out, 200, None, &json!({"data": models}).to_string())
         } else {
             write_status(&mut out, 404, None, &json!({"error": {"message": "oracle: not found"}}).to_string())
         }
@@ -210,7 +216,7 @@ mod tests {
 
     #[test]
     fn replays_the_script_in_order_and_records_bodies() {
-        let server = FakeServer::start(parse_script("{\"text\": \"one\"}\n{\"text\": \"two\"}").unwrap()).unwrap();
+        let server = FakeServer::start(parse_script("{\"text\": \"one\"}\n{\"text\": \"two\"}").unwrap(), Vec::new()).unwrap();
         let first = request(&server, "POST", "/v1/chat/completions", r#"{"model":"m","n":1}"#);
         assert!(first.starts_with("HTTP/1.1 200"), "{first}");
         assert!(first.contains(r#""content":"one""#) && first.ends_with("data: [DONE]\n\n"), "{first}");
@@ -223,21 +229,27 @@ mod tests {
 
     #[test]
     fn a_request_past_the_script_gets_a_500() {
-        let server = FakeServer::start(Vec::new()).unwrap();
+        let server = FakeServer::start(Vec::new(), Vec::new()).unwrap();
         let response = request(&server, "POST", "/v1/chat/completions", "{}");
         assert!(response.starts_with("HTTP/1.1 500") && response.contains("no reply for request 1"), "{response}");
     }
 
     #[test]
     fn scripted_status_with_retry_after() {
-        let server = FakeServer::start(parse_script(r#"{"status": 429, "retry_after": "2"}"#).unwrap()).unwrap();
+        let server = FakeServer::start(parse_script(r#"{"status": 429, "retry_after": "2"}"#).unwrap(), Vec::new()).unwrap();
         let response = request(&server, "POST", "/v1/chat/completions", "{}");
         assert!(response.starts_with("HTTP/1.1 429") && response.contains("retry-after: 2\r\n"), "{response}");
     }
 
     #[test]
+    fn models_lists_what_the_scenario_gives() {
+        let server = FakeServer::start(Vec::new(), vec![json!({"id": "m", "context_length": 10000})]).unwrap();
+        assert!(request(&server, "GET", "/v1/models", "").ends_with(r#"{"data":[{"context_length":10000,"id":"m"}]}"#));
+    }
+
+    #[test]
     fn models_is_an_empty_list_and_the_rest_404() {
-        let server = FakeServer::start(Vec::new()).unwrap();
+        let server = FakeServer::start(Vec::new(), Vec::new()).unwrap();
         assert!(request(&server, "GET", "/v1/models", "").ends_with(r#"{"data":[]}"#));
         assert!(request(&server, "GET", "/v1/other", "").starts_with("HTTP/1.1 404"));
         assert_eq!(server.requests().len(), 2);

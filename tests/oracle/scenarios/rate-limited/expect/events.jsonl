@@ -1,0 +1,5 @@
+{"status":"running","type":"status"}
+{"text":"`add(a, b)` returns `a + b`.","type":"text_delta"}
+{"text":"`add(a, b)` returns `a + b`.","type":"assistant"}
+{"reason":"end","type":"done"}
+{"reason":"end","reply":"`add(a, b)` returns `a + b`.","steps":1,"type":"result","usage":{"cachedTokens":0,"completionTokens":50,"cost":0.001,"promptTokens":1000}}

@@ -20,7 +20,20 @@ fn every_scenario_is_well_formed_and_recorded() {
     for s in &all {
         assert!(s.project().is_dir(), "{}: no project/", s.name);
         assert!(!s.replies.is_empty(), "{}: empty script", s.name);
-        marv_oracle::compare::load_expect(&s.expect()).unwrap_or_else(|err| panic!("{}: {err}", s.name));
+        let expect = marv_oracle::compare::load_expect(&s.expect()).unwrap_or_else(|err| panic!("{}: {err}", s.name));
+        // The recordings keep the prefix rule too (canonical JSON keeps each message's bytes stable
+        // from one request to the next, as long as the sender did).
+        let bodies: Vec<String> = expect.requests.lines().map(String::from).collect();
+        assert_eq!(marv_oracle::prefix::prefix_breaks(&bodies, &s.run.prefix_resets), [], "{}", s.name);
+        // A .gitignore in this repository would apply to marv-rs itself.
+        for dir in [s.project(), s.expect()] {
+            assert!(
+                !marv_oracle::runner::read_tree(&dir, false).unwrap().keys().any(|k| k.ends_with(".gitignore")),
+                "{}: a .gitignore in {}",
+                s.name,
+                dir.display()
+            );
+        }
     }
 }
 

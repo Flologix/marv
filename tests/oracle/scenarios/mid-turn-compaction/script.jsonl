@@ -1,0 +1,6 @@
+// a read that fills the window
+{"tool_calls": [{"name": "read_file", "arguments": {"path": "src/math.js"}}], "usage": {"prompt_tokens": 9000, "completion_tokens": 100}}
+// the summary
+{"text": "The user asked what add() returns. I read src/math.js: `add(a, b)` returns `a + b`. Next: answer."}
+// goes on from the summary
+{"text": "`add(a, b)` returns `a + b`."}

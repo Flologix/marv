@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Map, Value, json};
 
 use crate::normalize::Normalizer;
-use crate::scenario::{DEFAULT_TIMEOUT_SECS, Scenario};
+use crate::scenario::{DEFAULT_TIMEOUT_SECS, Scenario, mcp_root, real_path};
 use crate::server::{FakeServer, Recorded};
 
 /// The model every scenario's config names. Nothing serves it: the fake server answers any model.
@@ -50,8 +50,10 @@ pub fn default_config(base_url: &str) -> Map<String, Value> {
 pub struct Outcome {
     /// `events.jsonl`: the `stream-json` log, one canonical JSON line per event.
     pub events: String,
-    /// `requests.jsonl`: each chat request's body, bytes as sent (after scrubbing).
+    /// `requests.jsonl`: each chat request's body as canonical JSON (see [`canonical_request`]).
     pub requests: String,
+    /// The same bodies, bytes as sent (after scrubbing): what the prefix rule reads.
+    pub raw_requests: Vec<String>,
     /// The project afterwards (`.git` left out), by `/`-separated path.
     pub files: BTreeMap<String, Vec<u8>>,
     /// `None` when the binary was killed (timeout) or died of a signal.
@@ -64,6 +66,9 @@ pub struct Outcome {
     pub unused_replies: usize,
     pub timed_out: bool,
 }
+
+/// Where the tracker's comments land in the project, as in Marv's evals (`evals/run.ts`).
+pub const TRACKER_COMMENTS: &str = "__tracker_comments__.json";
 
 /// A temp directory removed on drop.
 struct TempDir(PathBuf);
@@ -97,15 +102,34 @@ pub fn run(scenario: &Scenario, bin: &Path) -> anyhow::Result<Outcome> {
     for dir in [&home, &config_dir, &project] {
         std::fs::create_dir_all(dir)?;
     }
-    copy_dir(&scenario.project(), &project)?;
+    for (rel, bytes) in read_tree(&scenario.project(), false)? {
+        write_file(&project.join(real_path(&rel)), &bytes)?;
+    }
     if scenario.run.git {
         git_init(&project, &home)?;
     }
 
-    let server = FakeServer::start(scenario.replies.clone())?;
+    let server = FakeServer::start(scenario.replies.clone(), scenario.run.models.clone())?;
     let mut config = default_config(&server.base_url());
     config.extend(scenario.run.config.clone());
     std::fs::write(config_dir.join("config.json"), serde_json::to_string_pretty(&Value::Object(config))? + "\n")?;
+
+    // The tracker's data and output live beside the project, not in it: the model can only reach
+    // them through the server (as in Marv's evals).
+    let mut mcp_out = None;
+    let oracle = oracle_binary();
+    if let Some(fixture) = &scenario.run.mcp {
+        anyhow::ensure!(fixture.server == "tracker", "{}: the only MCP fixture is \"tracker\"", scenario.name);
+        let oracle = oracle.as_ref().map_err(|err| anyhow::anyhow!("{err}"))?;
+        let dir = temp.0.join("tracker");
+        std::fs::create_dir_all(&dir)?;
+        let data = dir.join(&fixture.data);
+        std::fs::copy(mcp_root().join(&fixture.data), &data)?;
+        let out = dir.join("out.json");
+        let servers = json!({"mcpServers": {"tracker": {"command": oracle, "args": ["tracker", data, out]}}});
+        std::fs::write(config_dir.join("mcp.json"), serde_json::to_string_pretty(&servers)? + "\n")?;
+        mcp_out = Some(out);
+    }
 
     let mut command = Command::new(bin);
     command.args(["-p", &scenario.run.prompt, "--output", "stream-json"]);
@@ -156,6 +180,11 @@ pub fn run(scenario: &Scenario, bin: &Path) -> anyhow::Result<Outcome> {
         std::thread::sleep(Duration::from_millis(20));
     };
     let (stdout, stderr) = (stdout.join().unwrap_or_default(), stderr.join().unwrap_or_default());
+    if let Some(out) = &mcp_out {
+        // What the tracker recorded, over anything the model wrote under that name itself.
+        let comments = std::fs::read(out).unwrap_or_else(|_| b"[]".to_vec());
+        write_file(&project.join(TRACKER_COMMENTS), &comments)?;
+    }
 
     let mut normalizer = Normalizer::new();
     normalizer.add(&project.to_string_lossy(), "<project>");
@@ -163,15 +192,20 @@ pub fn run(scenario: &Scenario, bin: &Path) -> anyhow::Result<Outcome> {
     normalizer.add(&config_dir.to_string_lossy(), "<config>");
     normalizer.add(&temp.0.to_string_lossy(), "<tmp>");
     normalizer.add(&format!("127.0.0.1:{}", server.port()), "127.0.0.1:<port>");
+    if let Ok(oracle) = &oracle {
+        normalizer.add(&oracle.to_string_lossy(), "<oracle>");
+    }
 
     let recorded = server.requests();
     let is_chat = |r: &Recorded| r.method == "POST" && r.path.split('?').next().unwrap_or("").ends_with("/chat/completions");
-    let requests: String = recorded.iter().filter(|r| is_chat(r)).map(|r| normalizer.text(&r.body) + "\n").collect();
+    let raw_requests: Vec<String> = recorded.iter().filter(|r| is_chat(r)).map(|r| normalizer.text(&r.body)).collect();
+    let requests = raw_requests.iter().map(|body| canonical_request(body) + "\n").collect();
     let other_requests = recorded.iter().filter(|r| !is_chat(r)).map(|r| format!("{} {}", r.method, r.path)).collect();
 
     Ok(Outcome {
         events: normalizer.events(&stdout),
         requests,
+        raw_requests,
         files: read_tree(&project, true)?,
         exit_code: status.code(),
         stderr: normalizer.text(&stderr),
@@ -213,13 +247,70 @@ pub fn read_tree(root: &Path, skip_git: bool) -> anyhow::Result<BTreeMap<String,
 
 pub fn copy_dir(from: &Path, to: &Path) -> anyhow::Result<()> {
     for (rel, bytes) in read_tree(from, false)? {
-        let path = to.join(&rel);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(path, bytes)?;
+        write_file(&to.join(&rel), &bytes)?;
     }
     Ok(())
+}
+
+/// Writes `bytes` to `path`, creating its folders.
+pub fn write_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, bytes)?;
+    Ok(())
+}
+
+/// A request body compared with another Marv's: canonical JSON (keys sorted, as serde_json writes
+/// a `Value`), with `cache_control` breakpoints (#56) taken out. The prompt cache needs each run's
+/// own requests to be byte-stable ([`crate::prefix`]), not marv-rs's bytes to equal Marv's, so
+/// key order and breakpoints are left to each implementation; everything else must be the same.
+pub fn canonical_request(body: &str) -> String {
+    let Ok(mut value) = serde_json::from_str::<Value>(body) else { return body.to_string() };
+    if let Some(messages) = value.get_mut("messages").and_then(Value::as_array_mut) {
+        for message in messages {
+            let Some(content) = message.get_mut("content") else { continue };
+            // A marked message carries its text as one part; unmarked it's the plain string.
+            if let Some([part]) = content.as_array().map(Vec::as_slice)
+                && part.get("type") == Some(&json!("text"))
+                && part.get("cache_control").is_some()
+                && part.as_object().is_some_and(|p| p.len() == 3)
+                && let Some(text) = part.get("text").cloned()
+            {
+                *content = text;
+            }
+        }
+    }
+    strip_cache_control(&mut value);
+    value.to_string()
+}
+
+fn strip_cache_control(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.remove("cache_control");
+            map.values_mut().for_each(strip_cache_control);
+        }
+        Value::Array(items) => items.iter_mut().for_each(strip_cache_control),
+        _ => {}
+    }
+}
+
+/// The `marv-oracle` binary, which serves the MCP fixtures (`marv-oracle tracker …`): this process
+/// when it is that binary, else the one Cargo built next to this test.
+pub fn oracle_binary() -> anyhow::Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    let name = format!("marv-oracle{}", std::env::consts::EXE_SUFFIX);
+    if exe.file_name().is_some_and(|n| n == name.as_str()) {
+        return Ok(exe);
+    }
+    // Integration tests run from target/<profile>/deps; the binary is in target/<profile>.
+    exe.ancestors()
+        .skip(1)
+        .take(2)
+        .map(|dir| dir.join(&name))
+        .find(|path| path.is_file())
+        .ok_or_else(|| anyhow::anyhow!("no {name} binary next to {} (cargo build -p marv-oracle)", exe.display()))
 }
 
 /// `git init` and one commit, with fixed names and dates so the commit is the same every run.
@@ -269,6 +360,17 @@ mod tests {
         let tree = read_tree(&b, true).unwrap();
         assert_eq!(tree.keys().collect::<Vec<_>>(), vec!["src/deep/x.js"]);
         assert_eq!(tree["src/deep/x.js"], b"x\r\n");
+    }
+
+    #[test]
+    fn canonical_requests_sort_keys_and_drop_breakpoints() {
+        let marked = r#"{"stream":true,"model":"m","messages":[{"role":"system","content":[{"type":"text","text":"S","cache_control":{"type":"ephemeral"}}]},{"role":"user","content":"hi"}]}"#;
+        let plain = r#"{"model":"m","messages":[{"content":"S","role":"system"},{"content":"hi","role":"user"}],"stream":true}"#;
+        assert_eq!(canonical_request(marked), canonical_request(plain));
+        assert_eq!(
+            canonical_request(plain),
+            r#"{"messages":[{"content":"S","role":"system"},{"content":"hi","role":"user"}],"model":"m","stream":true}"#
+        );
     }
 
     #[test]

@@ -1,0 +1,21 @@
+{
+  "description": "A step that fills the context (9100 of 10000 tokens, past COMPACT_AT 0.85) is followed by a summary request with the same prefix; the history is replaced by the summary and a continue note, and the turn goes on. The request after it starts the cache over (prefix_resets).",
+  "prompt": "What does add() return?",
+  "models": [
+    {
+      "id": "oracle/scripted",
+      "name": "Oracle (scripted)",
+      "context_length": 10000,
+      "supported_parameters": [
+        "tools"
+      ],
+      "pricing": {
+        "prompt": "0",
+        "completion": "0"
+      }
+    }
+  ],
+  "prefix_resets": [
+    3
+  ]
+}

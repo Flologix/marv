@@ -1,0 +1,9 @@
+{"status":"running","type":"status"}
+{"label":"src/math.js","tool":"read_file","type":"tool_start"}
+{"label":"src/math.js","result":"    1→export function add(a, b) {\n    2→  return a + b;\n    3→}","tool":"read_file","type":"tool_end"}
+{"status":"compacting","type":"status"}
+{"compacted":true,"type":"compaction"}
+{"text":"`add(a, b)` returns `a + b`.","type":"text_delta"}
+{"text":"`add(a, b)` returns `a + b`.","type":"assistant"}
+{"reason":"end","type":"done"}
+{"reason":"end","reply":"`add(a, b)` returns `a + b`.","steps":2,"type":"result","usage":{"cachedTokens":0,"completionTokens":200,"cost":0.002,"promptTokens":11000}}

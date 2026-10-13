@@ -15,7 +15,7 @@ path = "src/main.rs"
 marv-core.workspace = true
 anyhow.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 similar = "2.7"
 
 [lints]
