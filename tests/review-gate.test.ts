@@ -210,3 +210,24 @@ test("mixed findings with retry: only model timeouts are retried", () => {
   // Only 1 review attempt (no retry)
   expect(reviewsLog().length).toBe(1);
 });
+test("a retry that completes with a file ocr couldn't review still blocks, and isn't cached as passed", () => {
+  writeFileSync(join(dir, "retry_ctrl"), "1\n");
+  writeFileSync(
+    join(bin, "ocr"),
+    "#!/bin/sh\n" +
+      'if [ "$1" = "--version" ]; then printf \'open-code-review v1.0.0 (abc)\\nbuilt at: 2026-01-01\\nhttps://example.com\\n\'; exit 0; fi\n' +
+      'echo review >> "' + join(dir, "reviews") + '"\n' +
+      'if [ -f "' + join(dir, "retry_ctrl") + '" ]; then\n' +
+      '  rm -f "' + join(dir, "retry_ctrl") + '"\n' +
+      "  echo '{\"status\":\"complete\",\"comments\":[],\"warnings\":[{\"type\":\"review_round_failed\",\"message\":\"model timeout\"}]}'\n" +
+      "  exit 0\n" +
+      "fi\n" +
+      // The retry completes, but a file couldn't be reviewed (not a model timeout).
+      "echo '{\"status\":\"complete\",\"comments\":[],\"warnings\":[{\"type\":\"file_failed\",\"message\":\"x.ts\"}]}'\n",
+  );
+  chmodSync(join(bin, "ocr"), 0o755);
+  expect(gate().exitCode).toBe(1);
+  // Not cached: the next push reviews again.
+  expect(gate().exitCode).toBe(1);
+  expect(reviewsLog().length).toBe(3);
+});

@@ -232,8 +232,9 @@ for (const sha of new Set(commits)) {
       );
       printFindings(retry.findings, retryBlockers);
 
-      if (!retry.failed && !retry.modelTimeout) {
-        // Retry succeeded: use retry's outcome
+      // A retry passes only when it finished cleanly: no warnings of any kind (a file it couldn't review is a review
+      // that didn't finish, as on the first attempt) and no blockers.
+      if (!retry.failed && retry.warnings.length === 0) {
         if (retryBlockers.length === 0) {
           console.error(`review-gate: ${sha.slice(0, 8)} passed on retry (${retry.findings.length} non-blocking note(s)).`);
           mkdirSync(cacheDir, { recursive: true });
@@ -248,7 +249,13 @@ for (const sha of new Set(commits)) {
         failed = true;
         continue;
       }
-      // Retry also had issues: fall through to handle as a failure
+      // The retry also had warnings or failed: block, saying what it said.
+      if (!retry.failed) {
+        console.error(`review-gate: ${retry.warnings.length} file(s) couldn't be reviewed on retry, so ${sha.slice(0, 8)} isn't passed; see \`ocr session list\`, then push again.`);
+        for (const w of retry.warnings) console.error(`  ${JSON.stringify(w).slice(0, 300)}`);
+      }
+      failed = true;
+      continue;
     }
   }
 
