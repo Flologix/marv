@@ -53,11 +53,11 @@ Each milestone ends with something you can run.
 
    Test it with a tiny `examples/chat.rs`.
 2. **M2 Act.** Port the agent loop body, then the edit/write/glob/grep/bash `run` bodies, then `SessionToolRunner`. Then `marv -p "…"` with `--output text|json|stream-json` edits files, sandboxed, and the exit codes match Marv. ✅ Done (#3 loop, #4 tools, #11 session): `marv -p` edits files sandboxed with Marv's exit codes.
-3. **M3 Oracle.** ✅ The harness and 28 scenarios (#7, `crates/marv-oracle`, `tests/oracle/`). **marv-rs passes 25/28**; the 3 MCP scenarios wait for #6. Deliberate marv-rs differences (#64 dropped-stream continue, #58 parallel reads) are declared per scenario (oracle.md). **Everything after this is checked against the oracle.**
+3. **M3 Oracle.** ✅ The harness and 30 scenarios (#7, `crates/marv-oracle`, `tests/oracle/`). **marv-rs passes 30/30**, and so does TypeScript Marv against its own recordings. Deliberate marv-rs differences are declared per scenario (oracle.md): #64 dropped-stream continue, #58 parallel reads, and fenced MCP results and check notes (SECURITY.md). **Everything after this is checked against the oracle.**
 4. **M4 Guards.** ✅ One test per `docs/SECURITY.md` rule in `tests/guards/` (#8, guards.md), each proven by reverting its guard, plus the post-command scan for protected files a command creates (sandbox.md). Rules whose code isn't written yet have ignored guards that name what they need.
 5. **M5 TUI.** Transcript, prompt input, approvals, diff view, status bar, pickers and the martian. **Measure CPU while idle and while streaming:** the target is under 2% idle and under 15% streaming (Marv #68). Shell (#10), `examples/fake_session` in a pty, `top -b -n 3 -d 2`: release idle 0.0%, streaming 1–5%; debug idle ≤0.5%, streaming 10–16%. Re-measure once #9's renderers replace the stand-ins. With #9's renderers: release idle 0.0%, streaming 0–5%.
 6. **M6 Context.** Compaction v1, then v2 (#63), plus sessions on disk, resume and trajectories.
-7. **M7 MCP.** Manager lifecycle, OAuth, deferred tools, `/mcp add`.
+7. **M7 MCP.** Manager lifecycle, OAuth, deferred tools, `/mcp add`. ✅ Done (#6).
 8. **M8 Mesh v1.** One Marv and its subagents over the switchboard socket, with wired inboxes.
 9. **M9 Mesh v2.** Several Marvs on one machine: discovery, cross-process wires, the Herdr adapter.
 10. **M10 Release.** One static binary (musl), install script, and a `0.1.0` tag.
