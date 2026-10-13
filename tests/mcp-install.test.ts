@@ -345,7 +345,7 @@ describe("the approval", () => {
     warnings: ["brand new"],
   };
   test("shows the command and the exact JSON written, every variable read, and never offers 'don't ask again'", () => {
-    const { request, json } = approvalFor(proposal, { env: { GITHUB_TOKEN: "x" }, projectServers: ["filesystem"] });
+    const { request, json } = approvalFor(proposal, { env: { GITHUB_TOKEN: "x" } });
     expect(json).toBe(JSON.stringify(proposal.entry));
     expect(request.preview.command).toBe(displayOf(proposal.entry));
     expect(request.preview.text).toContain(JSON.stringify(proposal.entry));
@@ -353,7 +353,6 @@ describe("the approval", () => {
     expect(request.preview.text).toMatch(/reads +GITHUB_TOKEN \(set\)/);
     expect(request.preview.text).toMatch(/reads +HOME_DIR \(not set: it won't start until you set it and restart Marv\)/);
     expect(request.preview.text).not.toMatch(/reads +MARV_PROJECT_DIR/);
-    expect(request.preview.text).toMatch(/this project's \.mcp\.json also has a server "filesystem": it will be ignored/);
     expect(request.preview.warning).toBe("brand new");
     expect(request.once).toBe(true);
     expect(approvalFor(proposal, { env: {} }).request.scope.key).not.toBe(request.scope.key);

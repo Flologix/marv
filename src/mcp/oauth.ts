@@ -53,6 +53,11 @@ export interface ProviderOptions {
   state?: string;
   /** Interactive: the authorization URL, for the login UI to open or show. */
   onAuthorize?: (url: URL) => void;
+  /**
+   * Interactive: the login's cancellation (/mcp remove, /mcp logout, another login, closing). Once aborted, nothing
+   * is saved: a token exchange that finishes late must not undo a logout or log a removed server back in.
+   */
+  signal?: AbortSignal;
 }
 
 export class McpOAuthProvider implements OAuthClientProvider {
@@ -112,7 +117,10 @@ export class McpOAuthProvider implements OAuthClientProvider {
     if (this.opts.oauth?.clientId) return;
     // A background connection never registers Marv with a server the user didn't log in to.
     if (this.opts.mode === "passive") throw new LoginNeeded(this.opts.server);
-    return this.opts.store.update(this.opts.key, (e) => ({ ...e, server: this.opts.server, client: { ...info, port: this.port } }) as Login);
+    return this.opts.store.update(this.opts.key, (e) => {
+      this.opts.signal?.throwIfAborted();
+      return { ...e, server: this.opts.server, client: { ...info, port: this.port } } as Login;
+    });
   }
 
   /** Read from the file every time: another Marv process may have refreshed (and rotated) the tokens. */
@@ -124,8 +132,13 @@ export class McpOAuthProvider implements OAuthClientProvider {
   }
 
   saveTokens(tokens: OAuthTokens): Promise<void> {
+    // Checked inside the update too: the abort may come while it waits for the file's lock.
+    if (this.opts.signal?.aborted) return Promise.reject(this.opts.signal.reason);
     if (this.opts.mode === "interactive") this.fresh = tokens;
-    return this.opts.store.update(this.opts.key, (e) => ({ ...e, server: this.opts.server, tokens, savedAt: Date.now() }) as Login);
+    return this.opts.store.update(this.opts.key, (e) => {
+      this.opts.signal?.throwIfAborted();
+      return { ...e, server: this.opts.server, tokens, savedAt: Date.now() } as Login;
+    });
   }
 
   redirectToAuthorization(url: URL): void {

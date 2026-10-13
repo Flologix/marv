@@ -1077,9 +1077,13 @@ export function App({
         if ((await personalServerNames(configDir)).includes(resolved.name)) {
           throw new Error(`You already have a server named "${resolved.name}": pick another with --name, or /mcp remove ${resolved.name} first.`);
         }
+        // A project server with that name is running (or waiting for trust) under it: McpManager.add can't start a
+        // second one, and replacing it mid-conversation would swap the tools under the model. Another name is simpler.
+        if (mcp?.status().some((s) => s.name === resolved.name && s.source === "project")) {
+          throw new Error(`This project has a server named "${resolved.name}": pick another with --name.`);
+        }
         if (signal.aborted) return { failed: "Stopped: nothing was added." };
-        const projectServers = (mcp?.status() ?? []).filter((s) => s.source === "project").map((s) => s.name);
-        const { request, json } = approvalFor(resolved, { env, projectServers });
+        const { request, json } = approvalFor(resolved, { env });
         if ((await approve(request)) !== "yes") return { declined: resolved.name };
         const entry: unknown = JSON.parse(json);
         await addPersonalServer(configDir, resolved.name, entry);

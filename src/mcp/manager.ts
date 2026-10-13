@@ -132,7 +132,11 @@ export class McpManager {
   onChange: () => void = () => {};
   private closed = false;
   private connections: Connection[];
-  /** The login waiting for its callback (one at a time: a new /mcp login or /mcp logout cancels it). */
+  /**
+   * The login under way (one at a time): /mcp remove, /mcp logout, a new /mcp login and close() cancel it, from the
+   * wait for the browser to the reconnect. Its signal is checked after the code arrives, before tokens are saved
+   * and before the reconnect, so a cancelled login never logs a removed server back in or undoes a logout.
+   */
   private pending?: { server: string; cancel(err: Error): void };
 
   constructor(
@@ -194,6 +198,7 @@ export class McpManager {
     if (find()?.state === "connecting") await this.ready;
     const c = find();
     if (!c) throw new Error(`There's no MCP server named "${name}" running.`);
+    if (this.pending?.server === name) this.pending.cancel(new Error("cancelled: /mcp remove"));
     c.state = "removed";
     c.error = undefined;
     this.onChange();
@@ -273,9 +278,15 @@ export class McpManager {
     this.pending?.cancel(new Error("cancelled: another login started"));
     const state = newState();
     const callback = expectCallback(state);
-    const pending = { server: name, cancel: (err: Error) => callback.cancel(err) };
+    const controller = new AbortController();
+    const cancel = (err: Error) => {
+      if (controller.signal.aborted) return;
+      controller.abort(err);
+      callback.cancel(err);
+    };
+    const pending = { server: name, cancel };
     this.pending = pending;
-    const done = this.runLogin(c, ui, state, callback).finally(() => {
+    const done = this.runLogin(c, ui, state, callback, controller.signal, cancel).finally(() => {
       if (this.pending === pending) this.pending = undefined;
     });
     return {
@@ -290,11 +301,19 @@ export class McpManager {
     };
   }
 
-  private async runLogin(c: Connection, ui: { authorize(url: URL): void }, state: string, callback: ReturnType<typeof expectCallback>): Promise<McpServerStatus> {
+  private async runLogin(
+    c: Connection,
+    ui: { authorize(url: URL): void },
+    state: string,
+    callback: ReturnType<typeof expectCallback>,
+    signal: AbortSignal,
+    cancel: (err: Error) => void,
+  ): Promise<McpServerStatus> {
     const { name } = c.config;
     // Startup must have said which servers are trusted: a project's server gets no network contact before that.
     await this.ready;
     await this.requireTrusted(c);
+    signal.throwIfAborted();
     if ((c.state as McpState) === "removed") throw new Error(`${name} was removed with /mcp remove.`);
     const t = c.config.transport;
     if (t.type !== "http") throw new Error(`${name} is a local server: only remote (http) servers log in.`);
@@ -307,7 +326,7 @@ export class McpManager {
     // A registered client's redirect URI names its port, and not every server accepts another loopback port.
     const listener = listen((url) => callback.check(url), t.oauth?.callbackPort ?? stored?.client?.port);
     const timeoutMs = this.opts.loginTimeoutMs ?? LOGIN_TIMEOUT_MS;
-    const timer = setTimeout(() => callback.cancel(new Error(`the login timed out after ${timeoutMs >= 60_000 ? `${Math.round(timeoutMs / 60_000)} minutes` : `${Math.round(timeoutMs / 1000)} s`}`)), timeoutMs);
+    const timer = setTimeout(() => cancel(new Error(`the login timed out after ${timeoutMs >= 60_000 ? `${Math.round(timeoutMs / 60_000)} minutes` : `${Math.round(timeoutMs / 1000)} s`}`)), timeoutMs);
     const client = new Client({ name: "marv", version: this.opts.version });
     try {
       if (listener.fellBack && t.oauth?.callbackPort) throw new Error(`port ${t.oauth.callbackPort} (oauth.callbackPort) is taken: close what uses it and try again.`);
@@ -322,6 +341,7 @@ export class McpManager {
         port: listener.port,
         oauth: t.oauth,
         state,
+        signal,
         onAuthorize: (url) => {
           redirected = true;
           ui.authorize(url);
@@ -333,12 +353,16 @@ export class McpManager {
       try {
         await Promise.race([withTimeout(client.connect(transport), this.opts.connectTimeoutMs ?? CONNECT_TIMEOUT_MS, "connecting"), stopped]);
       } catch (err) {
+        signal.throwIfAborted();
         if (!(err instanceof UnauthorizedError) || !redirected) throw loginError(err);
       }
       // Connected without asking for a login: the reconnect below is all there is to do.
       if (redirected) {
         const code = await callback.code;
+        signal.throwIfAborted();
+        // The provider checks the signal again before it saves the tokens the exchange returns.
         await transport.finishAuth(code).catch((err) => {
+          signal.throwIfAborted();
           throw loginError(err);
         });
       }
@@ -347,6 +371,7 @@ export class McpManager {
       listener.close();
       await client.close().catch(() => {});
     }
+    signal.throwIfAborted();
     return this.reconnect(c);
   }
 
@@ -361,6 +386,7 @@ export class McpManager {
 
   /** Reconnects one server (after a login), as add() starts one: a turn starting meanwhile waits for it. */
   private async reconnect(c: Connection): Promise<McpServerStatus> {
+    if (c.state === "removed") throw new Error(`${c.config.name} was removed with /mcp remove.`);
     // The old client stays in c.client until the new one is connected (connect() swaps and closes it), so a call
     // in between never lands on a closed client.
     const before = this.ready;
@@ -421,6 +447,8 @@ export class McpManager {
   }
 
   private async connect(c: Connection): Promise<void> {
+    // Removed stays removed: nothing (a login's reconnect, a late start) brings a server back mid-conversation.
+    if (c.state === "removed") return;
     if (this.closed) {
       c.state = "failed";
       c.error = "closed";

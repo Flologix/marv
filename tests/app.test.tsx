@@ -19,6 +19,7 @@ import { GENERAL_PURPOSE } from "../src/agents.ts";
 import { SUBAGENT_MAX_STEPS } from "../src/subagent.ts";
 import { projectKey } from "../src/paths.ts";
 import { TrajectoryStore } from "../src/trajectory.ts";
+import type { McpServerConfig } from "../src/mcp/config.ts";
 import { McpManager } from "../src/mcp/manager.ts";
 import { McpTrust } from "../src/mcp/trust.ts";
 import { McpTokenStore } from "../src/mcp/oauth-store.ts";
@@ -1897,8 +1898,11 @@ describe("/mcp add, search and remove", () => {
   const mcpFile = () => join(dir, "mcp.json");
   const readMcpFile = async () => JSON.parse(await Bun.file(mcpFile()).text()) as { mcpServers: Record<string, unknown> };
 
-  function renderAdd(resolveMcp: (options: AddOptions) => Promise<Resolved>, extra: { searchMcp?: (words: string) => Promise<RegistryHit[]>; env?: Record<string, string> } = {}) {
-    const mcp = new McpManager([], { root: project, version: "9.9.9" }); // as cli.tsx makes it: even with no servers
+  function renderAdd(
+    resolveMcp: (options: AddOptions) => Promise<Resolved>,
+    extra: { searchMcp?: (words: string) => Promise<RegistryHit[]>; env?: Record<string, string>; servers?: McpServerConfig[] } = {},
+  ) {
+    const mcp = new McpManager(extra.servers ?? [], { root: project, version: "9.9.9" }); // as cli.tsx makes it: even with no servers
     managers.push(mcp);
     void mcp.start();
     const calls: AddOptions[] = [];
@@ -1995,6 +1999,19 @@ describe("/mcp add, search and remove", () => {
     await until(() => lastFrame()!.includes("already have a server"));
     expect(lastFrame()).not.toContain("Do you want to proceed?");
     expect(lastFrame()).toContain("--name");
+  });
+
+  test("a name this project's .mcp.json uses is refused before asking (its server is running under that name)", async () => {
+    const servers: McpServerConfig[] = [{ name: "fixture", source: "project", key: "k", transport: { type: "stdio", command: process.execPath, args: [FIXTURE] } }];
+    const { lastFrame, stdin, mcp } = renderAdd(async () => fixtureProposal(), { servers });
+    await mcp.ready;
+    await type(stdin, "/mcp add fixture");
+    await until(() => lastFrame()!.includes("Couldn't add the server"));
+    expect(lastFrame()).toContain('This project has a server named "fixture"');
+    expect(lastFrame()).toContain("--name");
+    expect(lastFrame()).not.toContain("Do you want to proceed?");
+    expect(existsSync(mcpFile())).toBe(false);
+    expect(mcp.status()).toEqual([expect.objectContaining({ name: "fixture", source: "project", state: "connected" })]);
   });
 
   test("an unset ${VAR}: written, not started, and Marv says to set it and restart", async () => {
