@@ -34,6 +34,8 @@ Each guard's doc comment says how it was proven: the guard was reverted, and the
 | Approvals show the full payload | `provenance.rs::approvals_show_the_full_payload` | Proven |
 | A network approval lists scripts written this session | `provenance.rs::a_network_approval_lists_the_scripts_it_runs` | Ignored: not built yet |
 | Subagents don't inherit network/web/mesh approvals | `provenance.rs::subagents_inherit_taint_but_no_egress_approvals` | Proven |
+| A worktree subagent's `.git` is read-only; Marv commits for it | `worktree.rs::a_worktree_subagents_git_is_read_only_and_marv_commits_for_it` | Proven (real bwrap, #12) |
+| … Marv's commit trusts nothing the worktree says | `worktree.rs::marvs_commit_trusts_nothing_the_worktree_says` | Proven (#12) |
 | Project MCP servers need trust; hash covers entry and files | `mcp.rs::project_servers_need_trust_covering_entry_and_files` | Proven |
 | `npx`/`uvx` outside the project | `mcp.rs::package_runners_start_outside_the_project` | Proven |
 | Server `instructions` ignored | `mcp.rs::server_instructions_never_leave_the_parser` | Proven (a source check until the manager connects, M7) |

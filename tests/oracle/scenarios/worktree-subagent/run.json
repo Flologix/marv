@@ -1,0 +1,5 @@
+{
+  "description": "A subagent with isolation: \"worktree\" edits a file on its own branch: the dispatch runs without asking (yolo, sandboxed), its edit is auto-approved inside the worktree, Marv commits for it, and the main checkout is untouched. Requests 2-3 are the subagent's own conversation, so 2 (its first) and 4 (the main agent's next) don't extend the request before them.",
+  "prompt": "Have a subagent in its own worktree change the greeting to say goodbye.",
+  "prefix_resets": [2, 4]
+}

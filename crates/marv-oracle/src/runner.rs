@@ -195,6 +195,9 @@ pub fn run(scenario: &Scenario, bin: &Path) -> anyhow::Result<Outcome> {
     if let Ok(oracle) = &oracle {
         normalizer.add(&oracle.to_string_lossy(), "<oracle>");
     }
+    for (from, to) in worktree_names(&project, &config_dir) {
+        normalizer.add(&from, &to);
+    }
 
     let recorded = server.requests();
     let is_chat = |r: &Recorded| r.method == "POST" && r.path.split('?').next().unwrap_or("").ends_with("/chat/completions");
@@ -341,7 +344,37 @@ fn git_init(project: &Path, home: &Path) -> anyhow::Result<()> {
     git(&["init", "-q"])?;
     git(&["add", "-A"])?;
     git(&["commit", "-q", "--allow-empty", "-m", "start"])?;
+    // Marv commits for a worktree subagent (#12), and the run's git has no global config to name an author.
+    git(&["config", "user.name", "oracle"])?;
+    git(&["config", "user.email", "oracle@localhost"])?;
     Ok(())
+}
+
+/// Worktree subagents (#12): their branch and folder end in a random id (`marv/<slug>-ab12`), and their folders sit
+/// under the project's key (`<config>/worktrees/<key>/`), a hash of the temp path. Found after the run: the key
+/// folder stays, and so does a branch with commits (one without is deleted, and never named again after it was).
+fn worktree_names(project: &Path, config_dir: &Path) -> Vec<(String, String)> {
+    let mut names = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(config_dir.join("worktrees")) {
+        for entry in entries.flatten() {
+            names.push((entry.file_name().to_string_lossy().into_owned(), "<project-key>".to_string()));
+        }
+    }
+    let branches = Command::new("git")
+        .args(["for-each-ref", "--format=%(refname:short)", "refs/heads/marv/"])
+        .current_dir(project)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output();
+    for branch in
+        branches.iter().flat_map(|out| String::from_utf8_lossy(&out.stdout).lines().map(str::to_string).collect::<Vec<_>>())
+    {
+        let name = branch.trim_start_matches("marv/");
+        if let Some((slug, _id)) = name.rsplit_once('-') {
+            names.push((name.to_string(), format!("{slug}-<id>")));
+        }
+    }
+    names
 }
 
 #[cfg(test)]

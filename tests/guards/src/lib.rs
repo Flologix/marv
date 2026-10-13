@@ -8,6 +8,7 @@
 //! - `tests/sandbox.rs`: bubblewrap, the stand-in home, protected paths (asks and read-only mounts, and the scan for
 //!   ones a command creates), secrets, realpath containment;
 //! - `tests/provenance.rs`: provenance tagging and fencing, taint and egress, `must_ask` vs "always", subagents;
+//! - `tests/worktree.rs`: worktree subagents (`.git` read-only, Marv commits for them);
 //! - `tests/mcp.rs`: trust, package runners, ignored `instructions`;
 //! - `tests/images.rs`: images (not built yet: ignored).
 //!
