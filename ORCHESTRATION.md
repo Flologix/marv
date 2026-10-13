@@ -29,7 +29,7 @@ No role exists only to produce text for another role. If a new role seems needed
    6. **Open Code Review** that commit: `bun run review --base sprint-N` (`ocr` with the model in `~/.opencodereview/config.json`). Fix or send back every critical/high finding and judge the rest; a finding you reject gets one line in the sprint PR saying why. Then merge into `sprint-N` with `--no-ff`. Resolve CHANGELOG/CLAUDE.md conflicts by keeping both entries; check for conflict markers before committing.
    7. Close the worker.
 4. Start the next wave only when the previous one is merged into `sprint-N` and the full suite passes there.
-5. **Ship:** push `sprint-N`, open one PR whose body says `Fixes #N` for every issue in it, wait for CI, the `OCR review` check and the Greptile review, fix what they find. **The user merges.**
+5. **Ship:** first a full review of the whole sprint (`REVIEW_GATE_FULL=1 bun run review --base origin/main`: the pre-push gate otherwise reviews only what's new since the last pass); then push `sprint-N`, open one PR whose body says `Fixes #N` for every issue in it, wait for CI, the `OCR review` check and the Greptile review, fix what they find. **The user merges.**
 6. **Report** once, at the end (see Metrics). Then remove the sprint's worktrees.
 
 ## Definition of done (per issue)

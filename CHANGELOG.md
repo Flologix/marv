@@ -7,6 +7,13 @@ What counts as Marv's public API: the SDK (`@flologixai/marv/sdk`), the `marv` c
 ## [Unreleased]
 
 - Marv tells the model what the sandbox can't do (issue #50): the system prompt (with bash offered) explains that every process a command starts ends when the command ends and that a sandboxed command's `localhost` isn't the user's (with `network: true` it's the host's), so never claim a server is running for the user — give them the command to run in their own terminal. And a sandboxed bash command whose text looks like it leaves processes running in the background (`&`, `nohup`, `setsid`, `disown`, a `dev`/`start`/`serve` run; `backgroundsProcess()` in `src/tools/bash.ts`) gets a `Marv:` note on its result saying they were stopped when it ended and the user can't reach a server in the sandbox. Both after measured failures: models started a dev server detached, curled it inside the sandbox, and told the user "the server's up" with a dead link. Eval task `dev-server-claim`: its check reads the model's final reply (the runner now writes it into the workspace as `__eval_reply__.md`), which must not claim the server is up and must give the user a command to run.
+### Added
+
+- Review gate (issue #49): `REVIEW_GATE_TIMEOUT_S` env var (default 1200 s) gives the whole `ocr` call a deadline, failing closed if it's hit; a `review_round_failed` warning (a model timeout on one batch) retries once before blocking; pushes on a branch with a previously-passed commit only review what's new since that commit, not the whole branch against base.
+
+### Changed
+
+- Review gate: when a commit on the branch already passed (same merge-base, blocking levels and ocr version), the next push reviews `<passed sha>..<sha>` instead of `<base>..<sha>`.
 
 ## [0.3.0] - 2026-10-12
 
