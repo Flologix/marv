@@ -132,12 +132,38 @@ pub fn reasoning_for(thinking: bool, reasoning: Option<ReasoningSupport>) -> Opt
 /// - OpenRouter: [`openai_compat::OpenAiCompatProvider`] named `openrouter · <model>`, with the
 ///   `X-Title: Marv` attribution header and, when [`reasoning_for`] says so, `body.reasoning`.
 /// - Ollama: [`ollama::OllamaProvider`] with `context_length` and `thinking` from the config.
-pub fn create_provider(
-    _config: &ProviderConfig,
-    _model: Option<ReasoningSupport>,
-    _hints: Option<ErrorHints>,
-) -> Arc<dyn Provider> {
-    todo!("port: createProvider (src/provider/index.ts): build OpenAiCompatProvider / OllamaProvider from the config")
+pub fn create_provider(config: &ProviderConfig, model: Option<ReasoningSupport>, hints: Option<ErrorHints>) -> Arc<dyn Provider> {
+    let hints = hints.unwrap_or_default();
+    match config.provider {
+        ProviderKind::OpenRouter => {
+            let mut body = serde_json::Map::new();
+            if let Some(reasoning) = reasoning_for(config.thinking, model) {
+                body.insert("reasoning".into(), serde_json::json!(reasoning));
+            }
+            Arc::new(openai_compat::OpenAiCompatProvider::new(openai_compat::OpenAiCompatOptions {
+                name: format!("openrouter · {}", config.model),
+                label: ProviderKind::OpenRouter.label().into(),
+                base_url: config.base_url.clone(),
+                model: config.model.clone(),
+                api_key: config.api_key.clone(),
+                // Optional attribution: shows "Marv" in your OpenRouter activity log.
+                headers: vec![("X-Title".into(), "Marv".into())],
+                body,
+                offline_hint: None,
+                hints,
+                timing: Default::default(),
+            }))
+        }
+        // Ollama's native API, so the context window can be set (its default is 4096 tokens).
+        ProviderKind::Ollama => Arc::new(ollama::OllamaProvider::new(ollama::OllamaOptions {
+            base_url: config.base_url.clone(),
+            model: config.model.clone(),
+            context_length: config.context_length,
+            thinking: config.thinking,
+            hints,
+            timing: Default::default(),
+        })),
+    }
 }
 
 #[cfg(test)]

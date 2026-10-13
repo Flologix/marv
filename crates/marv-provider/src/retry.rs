@@ -11,9 +11,11 @@
 //! - Tests don't wait in real time: Marv scales every wait with a global `retryTiming.scale`;
 //!   here a [`RetryTiming`] is passed in through the adapter's options instead (no global state).
 //!
-//! Planned (Marv #64, not in Marv yet): jitter, more attempts for 429/overloaded (about 6, capped
-//! by total wait), `Retry-After` honoured up to a few minutes, and **continue after a dropped
-//! stream** instead of starting over ([`drop_recovery`]).
+//! Marv #64 (marv-rs only, not in Marv yet): backoff jitter and **continue after a dropped stream**
+//! instead of starting over ([`drop_recovery`]) are implemented; the loop helpers that use them
+//! (`backoff`, `jittered`, `status_wait`, `keep_or_restart`) currently live in `openai_compat.rs`
+//! and belong here. Still planned: more attempts for 429/overloaded (about 6, capped by total
+//! wait), `Retry-After` honoured up to a few minutes.
 
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -104,7 +106,7 @@ pub fn parse_retry_after(value: Option<&str>) -> Option<u64> {
     Some(seconds.min(MAX_RETRY_AFTER))
 }
 
-/// What to do when a stream drops mid-reply (Marv #64, planned).
+/// What to do when a stream drops mid-reply (Marv #64).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DropRecovery {
     /// Redo the whole request; the loop discards the partial reply (today's behaviour).

@@ -132,8 +132,9 @@ pub fn tool_loop_note(repeat_count: usize, _call_name: &str) -> String {
 /// Marv #59: the wrap-up request's note at a hard step limit.
 pub const STEP_LIMIT_NOTE: &str = "(Automatic note from Marv, the program running you) You've reached the step limit. Don't call tools. Reply with what you finished, what's left, and the next step.";
 
-/// Marv #64 (planned): sent after a partial reply kept from a dropped stream.
-pub const DROPPED_STREAM_NOTE: &str = "(Automatic note from Marv, the program running you) The previous response was interrupted. Continue from where you left off.";
+/// Marv #64: sent after a partial reply kept from a dropped stream. The provider owns the continue
+/// request (it owns retries), so the text lives there; re-exported for the loop's tests and docs.
+pub use marv_provider::openai_compat::DROPPED_STREAM_NOTE;
 
 /// A copy of the history in which every tool call has a result: calls still waiting at the end
 /// (a run cut short, e.g. by quitting while it wound down) get "not run". Without one the API

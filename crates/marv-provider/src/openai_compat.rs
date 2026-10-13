@@ -21,10 +21,11 @@
 //! - Retry loop: up to [`crate::retry::MAX_ATTEMPTS`] for network errors and 429/502/503/504
 //!   (Retry-After honoured); a `Retry` event (`attempt`/`max` = n/2) precedes each new attempt;
 //!   cancel stops the retries and ends quietly.
-//! - OpenRouter keeps the HTTP client's normal timeout: it sends keep-alives while working, so
-//!   the limit only catches dead connections.
+//! - OpenRouter keeps a timeout, but per read (300 s) rather than for the whole reply: it sends
+//!   keep-alives while it works, so the limit only catches dead connections.
+//! - Cancel ends the stream quietly (no `Error` event), also during a backoff wait.
 //!
-//! Planned:
+//! marv-rs changes (not in Marv yet):
 //! - **#56 cache_control breakpoints**: for `anthropic/*` and `google/gemini-*` (decided by model
 //!   id in [`needs_cache_breakpoints`]), mark the system prompt and the history's last message
 //!   with `cache_control: {type: "ephemeral"}` (at most 4). Earlier messages keep identical bytes;
@@ -32,17 +33,39 @@
 //! - **#57 reasoning round-trip**: collect `reasoning_details` from the stream, emit them as
 //!   [`ProviderEvent::Reasoning`], and send them back on the assistant message in later requests.
 //! - **#59 `tool_choice: "none"`** for the wrap-up reply at the step limit (tools still sent).
-//! - **#64 continue after a dropped stream** (see [`crate::retry::drop_recovery`]).
+//! - **#64 continue after a dropped stream**: a drop after text arrived, with no tool call
+//!   mid-stream ([`crate::retry::drop_recovery`]), sends the next attempt with the partial text as
+//!   an assistant turn plus [`DROPPED_STREAM_NOTE`], and its `Retry` event says `continued: true`
+//!   (the loop keeps the text and appends the rest). A drop inside a tool call starts over
+//!   (`continued: false`, the loop discards the attempt). Status and connection retries repeat the
+//!   last request, so they say `continued` when partial text is being kept.
+//! - **#64 jitter**: backoff waits get up to [`JITTER`] (25%) added at random, so clients dropped by
+//!   one outage don't all come back at the same moment. `Retry-After` waits are taken as given.
 
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::time::Duration;
 
+use futures::{FutureExt, StreamExt};
 use marv_core::{ChatTurn, ProviderEvent, ToolCall, ToolChoice, ToolSpec, Usage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
-use crate::errors::{ErrorHints, ErrorObject, describe_error};
-use crate::retry::RetryTiming;
+use crate::errors::{ErrorHints, ErrorObject, describe_error, error_message, http_error, unreachable};
+use crate::retry::{
+    BACKOFFS, DropRecovery, MAX_ATTEMPTS, RetryTiming, drop_recovery, is_network_error, parse_retry_after, retriable_http_status,
+    sleep_abortable,
+};
+use crate::sse::parse_sse;
 use crate::{EventStream, Provider, StreamOptions};
+
+/// Marv #64: sent after the partial reply kept from a dropped stream. The same text as
+/// `marv_agent::DROPPED_STREAM_NOTE` (marv-agent depends on this crate, so it can't be imported).
+pub const DROPPED_STREAM_NOTE: &str = "(Automatic note from Marv, the program running you) The previous response was interrupted. Continue from where you left off.";
+
+/// Marv #64: the most a backoff wait is lengthened at random (a share of it).
+pub const JITTER: f64 = 0.25;
 
 #[derive(Debug, Clone, Default)]
 pub struct OpenAiCompatOptions {
@@ -438,13 +461,19 @@ impl ReplyAssembler {
 /// The OpenAI-compatible adapter.
 pub struct OpenAiCompatProvider {
     pub options: OpenAiCompatOptions,
-    /// Shared connection pool; built with rustls and the default timeouts (see the module notes).
+    /// Shared connection pool; built with rustls and the timeouts in the module notes.
     pub client: reqwest::Client,
 }
 
 impl OpenAiCompatProvider {
     pub fn new(options: OpenAiCompatOptions) -> Self {
-        Self { options, client: reqwest::Client::new() }
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(30))
+            // Per read, not for the whole reply: keep-alives arrive while the model works.
+            .read_timeout(Duration::from_secs(300))
+            .build()
+            .unwrap_or_default();
+        Self { options, client }
     }
 }
 
@@ -458,13 +487,286 @@ impl Provider for OpenAiCompatProvider {
         None
     }
 
-    fn stream(&self, _history: &[ChatTurn], _options: StreamOptions) -> EventStream {
-        todo!(
-            "port: OpenAICompatProvider.stream — serialize request_body now; then the retry loop \
-             (POST {{base_url}}/chat/completions, bearer key, extra headers), parse_sse + ReplyAssembler, \
-             Retry events n/2, http_error/unreachable messages, quiet end on cancel"
-        )
+    fn stream(&self, history: &[ChatTurn], options: StreamOptions) -> EventStream {
+        // The API is stateless: every request carries the whole conversation. It's copied now, so
+        // the caller can append to its history while the reply streams (and #64 can extend it).
+        let outgoing = Outgoing {
+            history: history.to_vec(),
+            system: options.system,
+            tools: options.tools,
+            tool_choice: options.tool_choice,
+        };
+        let (client, adapter, cancel) = (self.client.clone(), self.options.clone(), options.cancel);
+        channel_stream(move |emit| run(client, adapter, outgoing, cancel, emit))
     }
+}
+
+/// What one stream sends, owned so the returned stream is `'static`.
+struct Outgoing {
+    history: Vec<ChatTurn>,
+    system: Option<String>,
+    tools: Vec<ToolSpec>,
+    tool_choice: ToolChoice,
+}
+
+impl Outgoing {
+    /// The body of the next attempt (#64: with the kept partial reply and the note, if any).
+    fn body(&mut self, options: &OpenAiCompatOptions, kept: &str) -> Vec<u8> {
+        let Self { history, system, tools, tool_choice } = self;
+        with_continuation(history, kept, |history| {
+            let body = request_body(options, history, system.as_deref(), tools, *tool_choice);
+            serde_json::to_vec(&body).expect("a request body is plain JSON")
+        })
+    }
+}
+
+/// Marv #64: runs `f` on the history with, when `kept` isn't empty, the partial reply as an
+/// assistant turn and [`DROPPED_STREAM_NOTE`] after it. The history is left as it was.
+pub(crate) fn with_continuation<R>(history: &mut Vec<ChatTurn>, kept: &str, f: impl FnOnce(&[ChatTurn]) -> R) -> R {
+    if kept.is_empty() {
+        return f(history);
+    }
+    history.push(ChatTurn::Assistant { text: kept.to_string(), tool_calls: Vec::new(), reasoning: None });
+    history.push(ChatTurn::User { text: DROPPED_STREAM_NOTE.to_string() });
+    let result = f(history);
+    history.truncate(history.len() - 2);
+    result
+}
+
+/// The retry loop: up to [`MAX_ATTEMPTS`] for network errors, drops and 429/502/503/504.
+async fn run(client: reqwest::Client, o: OpenAiCompatOptions, mut outgoing: Outgoing, cancel: CancellationToken, emit: Emit) {
+    let label = o.label.as_str();
+    let url = format!("{}/chat/completions", o.base_url);
+    // #64: the partial reply kept from dropped attempts; the next request continues it.
+    let mut kept = String::new();
+    for attempt in 1.. {
+        if cancel.is_cancelled() {
+            return;
+        }
+        if attempt > 1 {
+            emit.retry(label, attempt - 1, !kept.is_empty());
+        }
+
+        let mut request = client.post(&url).header(reqwest::header::CONTENT_TYPE, "application/json");
+        if let Some(key) = &o.api_key {
+            request = request.bearer_auth(key);
+        }
+        for (name, value) in &o.headers {
+            request = request.header(name, value);
+        }
+        let Some(sent) = until_cancelled(&cancel, request.body(outgoing.body(&o, &kept)).send()).await else { return };
+        let response = match sent {
+            Ok(response) => response,
+            Err(err) => {
+                if attempt < MAX_ATTEMPTS && is_network_failure(&err) {
+                    if sleep_abortable(backoff(o.timing, attempt), &cancel).await {
+                        return;
+                    }
+                    continue;
+                }
+                emit.send(ProviderEvent::Error(unreachable(label, &o.base_url, &root_cause(&err), o.offline_hint.as_deref())));
+                return;
+            }
+        };
+
+        let status = response.status().as_u16();
+        if response.status().is_success() {
+            // Stream the SSE body. If the connection drops mid-stream, retry (#64: or continue).
+            match read_reply(response, label, &cancel, &emit).await {
+                Read::Finished => return,
+                Read::Dropped { text, tool_call_in_progress } => {
+                    keep_or_restart(&mut kept, &text, tool_call_in_progress);
+                    if attempt < MAX_ATTEMPTS {
+                        if sleep_abortable(backoff(o.timing, attempt), &cancel).await {
+                            return;
+                        }
+                        continue;
+                    }
+                    emit.send(ProviderEvent::Error(ended_early(label)));
+                    return;
+                }
+            }
+        }
+
+        // HTTP-level error.
+        if retriable_http_status(status) && attempt < MAX_ATTEMPTS {
+            if sleep_abortable(status_wait(&response, o.timing, attempt), &cancel).await {
+                return;
+            }
+            continue;
+        }
+        let Some(detail) = read_error(response, &cancel).await else { return };
+        emit.send(ProviderEvent::Error(http_error(status, &detail, label, &o.model, o.hints)));
+        return;
+    }
+}
+
+/// How one response's body went.
+pub(crate) enum Read {
+    /// Complete, or an error event was sent, or cancelled: the stream is over.
+    Finished,
+    /// It broke off before the reply was complete: retry. `text` is what this attempt streamed.
+    Dropped { text: String, tool_call_in_progress: bool },
+}
+
+/// Parses the SSE body, sending events as they come.
+async fn read_reply(response: reqwest::Response, label: &str, cancel: &CancellationToken, emit: &Emit) -> Read {
+    let mut assembler = ReplyAssembler::new(label);
+    let mut text = String::new();
+    let mut out = Vec::new();
+    let mut data = Box::pin(parse_sse(Box::pin(response.bytes_stream())));
+    loop {
+        let Some(next) = until_cancelled(cancel, data.next()).await else { return Read::Finished };
+        let flow = match next {
+            None => break,
+            // A connection drop mid-stream is retriable: typically a socket closed or reset.
+            Some(Err(_)) => Flow::Broken,
+            Some(Ok(data)) => assembler.on_data(&data, &mut out),
+        };
+        emit.forward(&mut out, &mut text);
+        match flow {
+            Flow::Continue => {}
+            Flow::Done => break,
+            Flow::Stop => return Read::Finished,
+            Flow::Broken => return Read::Dropped { text, tool_call_in_progress: assembler.tool_call_in_progress() },
+        }
+    }
+    let tool_call_in_progress = assembler.tool_call_in_progress();
+    // The stream ended cleanly but early (no [DONE] or finish_reason): a proxy closed it, or the
+    // server lost the connection. A retry gets a fresh response.
+    let finished = assembler.finish(&mut out);
+    emit.forward(&mut out, &mut text);
+    match finished {
+        Ok(()) => Read::Finished,
+        Err(Incomplete) => Read::Dropped { text, tool_call_in_progress },
+    }
+}
+
+// ---- Shared by both adapters' retry loops. ----
+
+/// Marv #64: after a drop, keep the attempt's text for a continue request, or forget everything
+/// kept and start over.
+pub(crate) fn keep_or_restart(kept: &mut String, text: &str, tool_call_in_progress: bool) {
+    match drop_recovery(!kept.is_empty() || !text.is_empty(), tool_call_in_progress) {
+        DropRecovery::Continue => kept.push_str(text),
+        DropRecovery::Restart => kept.clear(),
+    }
+}
+
+/// After the last attempt broke off too.
+pub(crate) fn ended_early(label: &str) -> String {
+    format!("{label}: the stream ended early, before the reply was complete. Try again.")
+}
+
+/// The wait before retry number `retry` (1-based): its backoff, with jitter (#64).
+pub(crate) fn backoff(timing: RetryTiming, retry: u32) -> Duration {
+    let seconds = BACKOFFS[(retry as usize - 1).min(BACKOFFS.len() - 1)];
+    jittered(timing.wait(seconds), random_fraction())
+}
+
+/// `wait` lengthened by `fraction` (0 to 1) of [`JITTER`].
+pub fn jittered(wait: Duration, fraction: f64) -> Duration {
+    wait.mul_f64(1.0 + JITTER * fraction.clamp(0.0, 1.0))
+}
+
+/// A number in [0, 1) from std's randomly keyed hasher (no RNG crate for one number per retry).
+fn random_fraction() -> f64 {
+    use std::hash::BuildHasher;
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let bits = std::collections::hash_map::RandomState::new().hash_one(nanos);
+    (bits >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// The wait before retrying a retriable status: `Retry-After` when it's whole seconds, else the backoff.
+pub(crate) fn status_wait(response: &reqwest::Response, timing: RetryTiming, retry: u32) -> Duration {
+    let retry_after = response.headers().get(reqwest::header::RETRY_AFTER).and_then(|v| v.to_str().ok());
+    parse_retry_after(retry_after).map_or_else(|| backoff(timing, retry), |seconds| timing.wait(seconds))
+}
+
+/// The message in an error response's body. `None`: cancelled while reading it.
+pub(crate) async fn read_error(response: reqwest::Response, cancel: &CancellationToken) -> Option<String> {
+    let content_type = response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).map(str::to_string);
+    let status_text = response.status().canonical_reason().unwrap_or_default();
+    let body = until_cancelled(cancel, response.text()).await?.unwrap_or_default();
+    Some(error_message(content_type.as_deref(), status_text, &body))
+}
+
+/// Whether a failed request is worth retrying: a connection or timeout error, or one whose
+/// wording says so (hyper's differs from Bun's, so the whole chain is checked).
+pub(crate) fn is_network_failure(err: &reqwest::Error) -> bool {
+    err.is_connect() || err.is_timeout() || is_network_error(&error_chain(err))
+}
+
+/// Every message in an error's chain, joined with ": ".
+fn error_chain(err: &dyn std::error::Error) -> String {
+    let mut messages = vec![err.to_string()];
+    let mut source = err.source();
+    while let Some(inner) = source {
+        messages.push(inner.to_string());
+        source = inner.source();
+    }
+    messages.join(": ")
+}
+
+/// The innermost message ("Connection refused (os error 111)"): reqwest's own repeats the URL.
+pub(crate) fn root_cause(err: &dyn std::error::Error) -> String {
+    let mut cause = err;
+    while let Some(inner) = cause.source() {
+        cause = inner;
+    }
+    cause.to_string()
+}
+
+/// Runs `future` unless `cancel` fires first (`None`).
+pub(crate) async fn until_cancelled<T>(cancel: &CancellationToken, future: impl Future<Output = T>) -> Option<T> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => None,
+        value = future => Some(value),
+    }
+}
+
+/// Where a running stream sends its events.
+pub(crate) struct Emit(futures::channel::mpsc::UnboundedSender<ProviderEvent>);
+
+impl Emit {
+    pub(crate) fn send(&self, event: ProviderEvent) {
+        // The receiver is gone only when the stream was dropped, and then this future is too.
+        let _ = self.0.unbounded_send(event);
+    }
+
+    /// Sends the events in `out`, adding their text to `text` (#64: what a drop would keep).
+    pub(crate) fn forward(&self, out: &mut Vec<ProviderEvent>, text: &mut String) {
+        for event in out.drain(..) {
+            if let ProviderEvent::TextDelta(t) = &event {
+                text.push_str(t);
+            }
+            self.send(event);
+        }
+    }
+
+    /// The `Retry` event before a new attempt (`retry`/`MAX_ATTEMPTS - 1`).
+    pub(crate) fn retry(&self, label: &str, retry: u32, continued: bool) {
+        let max = MAX_ATTEMPTS - 1;
+        self.send(ProviderEvent::Retry {
+            attempt: retry,
+            max,
+            message: format!("{label}: connection lost, retrying ({retry}/{max})…"),
+            continued,
+        });
+    }
+}
+
+/// A `'static` event stream fed by `produce`. The producer runs inside the stream (no spawned
+/// task): dropping the stream drops the request with it.
+pub(crate) fn channel_stream<F, Fut>(produce: F) -> EventStream
+where
+    F: FnOnce(Emit) -> Fut,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let (tx, rx) = futures::channel::mpsc::unbounded();
+    let producer = produce(Emit(tx)).into_stream().filter_map(|()| futures::future::ready(None));
+    Box::pin(futures::stream::select(rx, producer))
 }
 
 #[cfg(test)]

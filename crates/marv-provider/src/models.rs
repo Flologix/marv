@@ -107,12 +107,77 @@ pub async fn list_models(provider: ProviderKind, base_url: &str, api_key: Option
 
 /// [`list_models`] through a given client (tests point it at a local server).
 pub async fn list_models_with(
-    _client: &reqwest::Client,
-    _provider: ProviderKind,
-    _base_url: &str,
-    _api_key: Option<&str>,
+    client: &reqwest::Client,
+    provider: ProviderKind,
+    base_url: &str,
+    api_key: Option<&str>,
 ) -> Result<Vec<ModelInfo>, String> {
-    todo!("port: listModels (OpenRouter /models via from_openrouter; Ollama /api/tags + /api/show capabilities)")
+    match provider {
+        ProviderKind::OpenRouter => {
+            // Public endpoint, no key needed. Prices come back in USD per token.
+            let list: OpenRouterList = get_json(client, &format!("{base_url}/models"), api_key, None).await?;
+            Ok(from_openrouter(list.data))
+        }
+        ProviderKind::Ollama => {
+            // Ollama's native API (not the /v1 compatibility layer) lists local models and, per
+            // model, its capabilities.
+            let origin = reqwest::Url::parse(base_url).map_err(|e| format!("{base_url}: {e}"))?.origin().ascii_serialization();
+            let tags: OllamaTags = get_json(client, &format!("{origin}/api/tags"), api_key, None).await?;
+            let show = format!("{origin}/api/show");
+            let models = tags.models.into_iter().map(|OllamaTag { name }| {
+                let show = &show;
+                async move {
+                    let body = serde_json::json!({ "model": name });
+                    let info: Option<OllamaShow> = get_json(client, show, api_key, Some(&body)).await.ok();
+                    let tools = info.and_then(|i| i.capabilities).map(|c| c.iter().any(|c| c == "tools"));
+                    ModelInfo { id: name, tools, local: true, ..Default::default() }
+                }
+            });
+            Ok(futures::future::join_all(models).await)
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct OpenRouterList {
+    data: Vec<OpenRouterModel>,
+}
+
+#[derive(Deserialize)]
+struct OllamaTags {
+    models: Vec<OllamaTag>,
+}
+
+#[derive(Deserialize)]
+struct OllamaTag {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct OllamaShow {
+    #[serde(default)]
+    capabilities: Option<Vec<String>>,
+}
+
+/// GET `url` (POST with `body`) and parse the JSON answer; any failure is a plain message.
+async fn get_json<T: serde::de::DeserializeOwned>(
+    client: &reqwest::Client,
+    url: &str,
+    api_key: Option<&str>,
+    body: Option<&serde_json::Value>,
+) -> Result<T, String> {
+    let mut request = match body {
+        Some(body) => client.post(url).json(body),
+        None => client.get(url),
+    };
+    if let Some(key) = api_key {
+        request = request.bearer_auth(key);
+    }
+    let response = request.send().await.map_err(|e| format!("{url}: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("{url} returned {}", response.status().as_u16()));
+    }
+    response.json().await.map_err(|e| format!("{url}: {e}"))
 }
 
 /// `n` rounded to `digits` significant digits, then printed shortest (JS `Number(n.toPrecision(d))`).

@@ -9,25 +9,27 @@ Spec: Marv `CLAUDE.md` bullets **Provider seam** and **createProvider**, `src/pr
 | Marv (TS) | Rust module | Status |
 |---|---|---|
 | `src/provider/types.ts` | `lib.rs` (`Provider`, `StreamOptions`, `EventStream`) + `marv-core` (events, turns) | ported |
-| `src/provider/index.ts` | `lib.rs` (`reasoning_for`, `create_provider`, `ProviderConfig`, `ProviderKind`) | `reasoning_for` ported and tested; `create_provider` todo |
+| `src/provider/index.ts` | `lib.rs` (`reasoning_for`, `create_provider`, `ProviderConfig`, `ProviderKind`) | ported; `provider-index.test.ts` ported in `tests/factory.rs` |
 | `src/provider/sse.ts` | `sse.rs` (`SseDecoder`, `parse_sse`) | ported, tests ported |
-| `src/provider/retry.ts` | `retry.rs` | ported, tests ported (`sleep_abortable` on a `CancellationToken`); `drop_recovery` (#64) added |
+| `src/provider/retry.ts` | `retry.rs` | ported, tests ported (`sleep_abortable` on a `CancellationToken`); `drop_recovery` (#64) added. The loops' shared pieces (jittered `backoff`, `status_wait`, `keep_or_restart`) live in `openai_compat.rs` for now |
 | `src/provider/errors.ts` | `errors.rs` | ported and tested (`error_message` is pure: the caller reads the body first); `is_context_overflow` (#63) todo |
-| `src/provider/models.ts` | `models.rs` | `from_openrouter`, `per_million` and `format_price` ported and tested; `list_models(kind, base_url, api_key)` owns its client (`list_models_with` takes one); the HTTP body is todo |
-| `src/provider/openai-compat.ts` | `openai_compat.rs` | wire types, `to_messages`, `request_body` and the `ReplyAssembler` (chunk → events) ported and tested; the HTTP/retry loop in `stream` is todo |
-| `src/provider/ollama.ts` | `ollama.rs` | `NdjsonDecoder`, `to_messages`, `reply_cap`, `Measured`, `trained_context`, `LineAssembler` ported and tested; `ask_trained` and `stream` are todo |
-| `src/provider/factory.ts` | `factory.rs` | `ProviderFactory` trait, `ProviderOption`, `CustomFactory` ported; `ConfigFactory::{make, lookup}` todo; `providerFactory` moves to `marv-session` |
+| `src/provider/models.ts` | `models.rs` | ported; `list_models(kind, base_url, api_key)` owns its client (`list_models_with` takes one); `models.test.ts` ported in `tests/models.rs` |
+| `src/provider/openai-compat.ts` | `openai_compat.rs` | ported: wire types, `to_messages`, `request_body`, `ReplyAssembler`, and the HTTP/retry loop with #64; `openai-compat.test.ts` ported in `tests/openai_compat.rs` |
+| `src/provider/ollama.ts` | `ollama.rs` | ported, including `ask_trained` and the HTTP/retry loop with #64; `ollama.test.ts` ported in `tests/ollama.rs` |
+| `src/provider/factory.ts` | `factory.rs` | ported (`ConfigFactory`, `CustomFactory`); `providerFactory` moves to `marv-session`; `provider-factory.test.ts` ported in `tests/factory.rs` (the SDK hint cases through `create_provider`) |
 
-`grep -rn 'todo!("port' crates/marv-provider` lists what's left.
+`grep -rn 'todo!("port' crates/marv-provider` lists what's left (only `is_context_overflow`, #63).
+
+Try it: `OPENROUTER_API_KEY=… cargo run -p marv-provider --example chat -- "hi"`, or `MARV_PROVIDER=ollama MARV_MODEL=qwen3.5:9b` for a local Ollama.
 
 ## Port notes
 
 - **HTTP:** `reqwest` 0.12 with `rustls-tls`, `stream` and `json`, and no default features. That means no OpenSSL and a single static binary. `Response::bytes_stream()` feeds `sse::parse_sse` (OpenRouter) or `ollama::NdjsonDecoder` (Ollama). Build one `reqwest::Client` per provider and reuse it.
 - **Timeouts:**
-  - OpenRouter keeps a normal timeout. It sends keep-alives while it works, so the timeout only catches dead connections.
+  - OpenRouter keeps a timeout: 30 s to connect, 300 s per read (reqwest's `read_timeout`, not a total one). It sends keep-alives while it works, so the timeout only catches dead connections.
   - Ollama must not have a total timeout: it sends nothing while the model writes a tool call, and Bun's 300 s limit cut long calls off. A connect timeout is fine.
 - **Cancel:** every `stream` races its I/O against `StreamOptions::cancel` with `tokio::select!`. A cancelled stream ends quietly, with no `Error` event. That includes a cancel during a backoff wait (`retry::sleep_abortable`).
-- **`stream` returns a `'static` stream.** Serialize the request body before returning (`request_body` / `ollama::Prompt`) so the caller can keep appending to its history. Build the returned stream with `futures::stream::unfold` or a channel. Don't add a generator crate unless it pays for itself.
+- **`stream` returns a `'static` stream.** The adapter copies the history before returning, so the caller can keep appending to its own (and #64 can extend the copy). The returned stream is a channel fed by the retry loop's future (`openai_compat::channel_stream`): the future runs inside the stream, with no spawned task, so dropping the stream drops the request.
 - **Prompt cache:**
   - Request bodies are typed `Serialize` structs, so field order is byte order. Don't route them through `serde_json::Value`: another crate could switch on serde_json's `preserve_order` feature through feature unification and silently change key order.
   - `ToolCall::arguments` is sent as the raw text (OpenAI). Ollama needs an object, so it's parsed there; Ollama's cache is local, and Marv does the same.
@@ -45,7 +47,7 @@ Spec: Marv `CLAUDE.md` bullets **Provider seam** and **createProvider**, `src/pr
   - A failed or empty answer leaves the window as configured and is asked again on the next stream.
   - The configured `context_length` is always the upper bound.
 - **`RetryTiming`** replaces Marv's global `retryTiming.scale`. Pass it in the adapter options; tests set `scale` to something like 0.001.
-- **Tests that need a server** (the retry loop, headers, the `Authorization` header only when a key is set, `X-Title`, aborts) port `tests/openai-compat.test.ts` and `tests/ollama.test.ts` against a local `tokio::net::TcpListener`. Hand-roll a tiny HTTP/1.1 responder, or add `axum` as a dev-dependency.
+- **Tests that need a server** run against `tests/support/mod.rs`: a hand-rolled HTTP/1.1 responder on 127.0.0.1 (chunked bodies that can end cleanly, drop the connection mid-body, or hang). The oracle's fake server is script-driven, so it didn't fit.
 
 ## Planned improvements (Marv issues, not in Marv yet)
 
@@ -60,8 +62,11 @@ Spec: Marv `CLAUDE.md` bullets **Provider seam** and **createProvider**, `src/pr
   - Open question: OpenRouter may split one block over several chunks (same `index`). Check whether the blocks must be merged before they're sent back.
 - **#59 `tool_choice: "none"`** is in `ChatRequest` and is sent only for `ToolChoice::None`. Auto requests keep their bytes. Ollama has no equivalent, so it relies on the note.
 - **#63 overflow recovery:** `errors::is_context_overflow` is a stub. Collect real OpenRouter and Ollama overflow messages first.
-- **#64 continue after a dropped stream:**
-  - `retry::drop_recovery` decides between continue (text received and no tool call in flight) and restart.
-  - `ReplyAssembler::{text_received, tool_call_in_progress}` provide its inputs.
-  - Telling the loop needs `marv_core::ProviderEvent::Retry` to carry a `continued: bool`, or a new variant. **This is a marv-core change, still to request.**
-  - Also planned: jitter, about 6 attempts for 429/overloaded, and longer `Retry-After`.
+- **#64 continue after a dropped stream (done in both adapters):**
+  - `retry::drop_recovery` decides: a drop after text arrived, with no tool call in progress (`ReplyAssembler::tool_call_in_progress`; Ollama: a call already arrived), continues; anything else restarts.
+  - Continue: the next attempt sends the history, then the partial text as an assistant turn, then `openai_compat::DROPPED_STREAM_NOTE`. Its `Retry` event says `continued: true`, so the loop keeps the text and appends the rest. Partial text accumulates over several continued drops.
+  - Restart: the original request again, with `continued: false`, and the loop discards the attempt.
+  - A status or connection retry repeats the last request, and says `continued` when partial text is being kept.
+  - `DROPPED_STREAM_NOTE` is duplicated from `marv_agent` (agent depends on provider). `marv_agent` should re-export the provider's.
+  - **Jitter:** backoff waits get up to 25% added at random (`openai_compat::JITTER`, `jittered`); `Retry-After` waits are taken as given.
+  - Still planned: about 6 attempts for 429/overloaded, and a longer `Retry-After`. Marv's tests expect 3 attempts for 429, so this waits for the spec.
