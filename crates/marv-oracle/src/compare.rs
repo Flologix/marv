@@ -63,6 +63,59 @@ pub fn write_expect(dir: &Path, outcome: &Outcome) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// marv-rs runs a reply's read-only calls at the same time (#58, deliberate): their `tool_start`s
+/// come together and their `tool_end`s as each finishes, which varies from run to run. Marv ran
+/// them one by one. So for marv-rs each run of consecutive tool events is put back in call order
+/// (each start followed by its end, matched by tool and label) before the logs are compared. A log
+/// where every start is already followed by its end comes back unchanged, so this only ever undoes
+/// the interleaving: the calls, their results, the requests and the files are still compared as
+/// they are.
+pub fn calls_in_order(events: &str) -> String {
+    let lines: Vec<&str> = events.lines().collect();
+    let kind = |line: &str| -> Option<(String, Value, Value)> {
+        let v: Value = serde_json::from_str(line).ok()?;
+        let t = v.get("type")?.as_str()?;
+        (t == "tool_start" || t == "tool_end").then(|| (t.to_string(), v["tool"].clone(), v["label"].clone()))
+    };
+    let mut out: Vec<&str> = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        let mut j = i;
+        while j < lines.len() && kind(lines[j]).is_some() {
+            j += 1;
+        }
+        if j == i {
+            out.push(lines[i]);
+            i += 1;
+            continue;
+        }
+        let run: Vec<(usize, (String, Value, Value))> = (i..j).map(|k| (k, kind(lines[k]).unwrap())).collect();
+        let mut used = vec![false; run.len()];
+        for (n, (k, (t, tool, label))) in run.iter().enumerate() {
+            if t != "tool_start" {
+                continue;
+            }
+            used[n] = true;
+            out.push(lines[*k]);
+            let end = run.iter().enumerate().position(|(m, (_, (t2, tool2, label2)))| {
+                m > n && !used[m] && t2 == "tool_end" && tool2 == tool && label2 == label
+            });
+            if let Some(m) = end {
+                used[m] = true;
+                out.push(lines[run[m].0]);
+            }
+        }
+        // Ends with no start before them (shouldn't happen) stay where they were, in order.
+        out.extend(run.iter().zip(&used).filter(|(_, u)| !**u).map(|((k, _), _)| lines[*k]));
+        i = j;
+    }
+    let mut text = out.join("\n");
+    if events.ends_with('\n') {
+        text.push('\n');
+    }
+    text
+}
+
 /// Every part of `actual` that differs from `expected`. Empty means it passed.
 pub fn compare(expected: &Expected, actual: &Outcome) -> Vec<Mismatch> {
     let mut out = Vec::new();
@@ -194,6 +247,20 @@ mod tests {
     #[test]
     fn crlf_and_trailing_space_show() {
         assert_eq!(visible("a \r\nb\t\nc"), "a·␍\nb→\nc⏎(no newline)\n");
+    }
+
+    #[test]
+    fn parallel_calls_are_put_back_in_call_order() {
+        let start = |l: &str| format!(r#"{{"label":"{l}","tool":"read_file","type":"tool_start"}}"#);
+        let end = |l: &str| format!(r#"{{"label":"{l}","result":"{l}!","tool":"read_file","type":"tool_end"}}"#);
+        let text = r#"{"text":"x","type":"text_delta"}"#;
+        let sequential = [text.to_string(), start("a"), end("a"), start("b"), end("b"), text.to_string()].join("\n") + "\n";
+        let parallel = [text.to_string(), start("a"), start("b"), end("b"), end("a"), text.to_string()].join("\n") + "\n";
+        assert_eq!(calls_in_order(&parallel), sequential);
+        assert_eq!(calls_in_order(&sequential), sequential, "a sequential log is unchanged");
+        // A different result still differs.
+        let wrong = parallel.replace("\"result\":\"a!\"", "\"result\":\"nope\"");
+        assert_ne!(calls_in_order(&wrong), sequential);
     }
 
     #[test]

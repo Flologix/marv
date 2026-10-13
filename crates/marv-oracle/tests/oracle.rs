@@ -5,7 +5,11 @@
 //! MARV_ORACLE_BIN=~/Projects/marv/bin/marv cargo test -p marv-oracle -- --ignored --nocapture
 //! MARV_ORACLE_RECORD=1 MARV_ORACLE_BIN=~/Projects/marv/bin/marv cargo test -p marv-oracle -- --ignored   # re-record
 //! ```
+//!
+//! `MARV_ORACLE_TARGET` (`marv` or `marv-rs`) says which one the binary is: by default checking means
+//! marv-rs and recording TypeScript Marv (see `marv_oracle::scenario::Target`).
 
+use marv_oracle::scenario::Target;
 use marv_oracle::{Verdict, binary, check_all, report, scenario};
 
 fn scenarios() -> Vec<scenario::Scenario> {
@@ -20,13 +24,24 @@ fn every_scenario_is_well_formed_and_recorded() {
     for s in &all {
         assert!(s.project().is_dir(), "{}: no project/", s.name);
         assert!(!s.replies.is_empty(), "{}: empty script", s.name);
-        let expect = marv_oracle::compare::load_expect(&s.expect()).unwrap_or_else(|err| panic!("{}: {err}", s.name));
-        // The recordings keep the prefix rule too (canonical JSON keeps each message's bytes stable
-        // from one request to the next, as long as the sender did).
-        let bodies: Vec<String> = expect.requests.lines().map(String::from).collect();
-        assert_eq!(marv_oracle::prefix::prefix_breaks(&bodies, &s.run.prefix_resets), [], "{}", s.name);
+        // A deliberate marv-rs difference has its own complete recording, checked the same way.
+        let expects = [s.expect(), s.expect_for(Target::MarvRs)];
+        let expects = if expects[0] == expects[1] { &expects[..1] } else { &expects[..] };
+        for dir in expects {
+            let expect = marv_oracle::compare::load_expect(dir).unwrap_or_else(|err| panic!("{}: {err}", s.name));
+            // The recordings keep the prefix rule too (canonical JSON keeps each message's bytes stable
+            // from one request to the next, as long as the sender did).
+            let bodies: Vec<String> = expect.requests.lines().map(String::from).collect();
+            assert_eq!(marv_oracle::prefix::prefix_breaks(&bodies, &s.run.prefix_resets), [], "{}", s.name);
+        }
+        if let Some(d) = &s.run.deliberate {
+            assert!(d.issue > 0 && !d.why.trim().is_empty(), "{}: a deliberate difference needs its issue and why", s.name);
+        }
         // A .gitignore in this repository would apply to marv-rs itself.
-        for dir in [s.project(), s.expect()] {
+        for dir in [s.project(), s.expect(), s.expect_for(Target::MarvRs)] {
+            if !dir.exists() {
+                continue;
+            }
             assert!(
                 !marv_oracle::runner::read_tree(&dir, false).unwrap().keys().any(|k| k.ends_with(".gitignore")),
                 "{}: a .gitignore in {}",
@@ -43,7 +58,8 @@ fn oracle() {
     let bin = binary();
     assert!(bin.exists(), "no binary at {} (build marv, or set MARV_ORACLE_BIN)", bin.display());
     let record = std::env::var_os("MARV_ORACLE_RECORD").is_some();
-    let results = check_all(&scenarios(), &bin, record);
+    let target = Target::from_env(record).unwrap();
+    let results = check_all(&scenarios(), &bin, record, target);
     let mut failed = Vec::new();
     for (name, verdict) in &results {
         print!("{}", report(name, verdict));
@@ -64,7 +80,7 @@ fn a_wrong_binary_fails_with_a_diff() {
     std::fs::write(&bin, "#!/bin/sh\necho '{\"type\":\"done\",\"reason\":\"end\"}'\necho stray > stray.txt\nexit 0\n").unwrap();
     std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     let scenario = scenarios().into_iter().find(|s| s.name == "step-limit").unwrap();
-    let verdict = marv_oracle::check(&scenario, &bin, false);
+    let verdict = marv_oracle::check(&scenario, &bin, false, Target::MarvRs);
     std::fs::remove_dir_all(&dir).unwrap();
     let Verdict::Fail { mismatches, notes, .. } = &verdict else { panic!("expected a failure, got {verdict:?}") };
     let parts: Vec<&str> = mismatches.iter().map(|m| m.part.as_str()).collect();

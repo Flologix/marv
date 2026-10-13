@@ -25,7 +25,7 @@ Spec: the **Tools**, **Web**, **Skills**, **Memory**, **Subagents** and **Yolo m
 | `src/tools/memory.ts` (+ bullet edits from `src/memory.ts`) | `memory.rs` | **Ported and tested:** the tool, and `add_memory`/`find_memory`/`remove_memory` (line-by-line edits, 0600 through `marv_fs::write_private`) |
 | `src/tools/agent.ts` | `agent.rs` | Ported (it delegates to `AgentHost`, which marv-session implements) |
 | `src/tools/syntax.ts` | `syntax.rs` | **Ported and tested:** `syntax_error` (oxc parser + semantic checks for JS/TS, serde_json, serde_yaml_ng over every document, `python3 -I`), `broken_by`, `syntax_note` |
-| `src/tools/web-fetch.ts` | `web_fetch.rs` | Ported and tested: `domain_of`, `web_scope`, `paged`, the page cache, `needs_approval`. Todo: `pasted_scopes`, `preview`, `run` |
+| `src/tools/web-fetch.ts` | `web_fetch.rs` | Ported and tested: `domain_of`, `web_scope`, `paged`, the page cache, `needs_approval`, `pasted_scopes` (#11; Marv's fence regex uses backreferences, so the fence pass is a scanner). The spec's `offset` has zod's `maximum` (2^53 − 1), as Marv's does. Todo: `preview`, `run` |
 | `src/tools/web/address.ts` | `web/address.rs` | Ported and tested: `is_private_address`. Todo: `check_address` |
 | `src/tools/web/fetch.ts` | `web/fetch.rs` | Ported and tested: `parse_url`, `sends_headers`, `redirect_note`. Todo: `get`, `fetch_page` (using reqwest with a pinned resolver) |
 | `src/tools/web/github.ts` | `web/github.rs` | Constants and `safe_segment`. Todo: `parse_github`, `fetch_github`, `fetch_readme` |
@@ -87,7 +87,7 @@ pub const INTERRUPTED: &str;  // must equal marv-agent's NOT_RUN.aborted
 
 - **Typed input in place of zod.** Each tool deserializes into its own `Input` struct (`deny_unknown_fields`), plus `check()` for ranges. The error text is serde's, after `Invalid input for <tool>:`. Marv's text came from `z.prettifyError`, so error wording can differ.
 - **Schema key order.** `serde_json` without `preserve_order` sorts object keys. The specs are still byte-stable, which is what the prompt cache needs, but the key order differs from Marv's. Turn on `preserve_order` workspace-wide if the oracle compares bytes.
-- **grep's regex dialect is Rust's** (`regex`, through `grep-regex`), not JavaScript's: no lookaround and no backreferences. The schema's description says so, and the `Invalid regex` error for such a pattern says to rewrite it without them. `fancy-regex` would add both, but it doesn't plug into ripgrep's searcher.
+- **grep's regex dialect is Rust's** (`regex`, through `grep-regex`), not JavaScript's: no lookaround and no backreferences. The schema's description keeps Marv's "JavaScript syntax" (byte-identical requests, checked by the oracle, #11); the `Invalid regex` error for such a pattern says to rewrite it without them. `fancy-regex` would add both, but it doesn't plug into ripgrep's searcher.
 - **The JS/TS syntax check is oxc**, not `@babel/parser`: parser errors, then the semantic pass's (a redeclared `const`). Messages are oxc's wording. The column is 1-based, in chars, from the primary label.
 - **bash outside the sandbox** runs in its own process group (`process_group(0)`) instead of under `setsid`. A timeout or Esc kills the group with `killpg` (the `nix` crate, no `unsafe`). `run_command` returns `[sandbox failed to start: …]` when marv-sandbox refuses a mount, as it does when bwrap fails.
 - **Lengths count `char`s.** Marv counted UTF-16 units: line caps, page offsets, the 30k cut. The two differ only outside the BMP.
