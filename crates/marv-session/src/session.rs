@@ -2550,8 +2550,9 @@ mod turn_tests {
                         }
                     };
                     let message: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-                    let reply = match message["method"].as_str().unwrap_or_default() {
-                        "initialize" => {
+                    let method = message["method"].as_str().unwrap_or_default();
+                    let reply = match method {
+                        m if m == marv_mcp::jsonrpc::method::INITIALIZE => {
                             let _ = gate.wait_for(|open| *open).await;
                             Some(
                                 json!({"protocolVersion": "2025-06-18", "capabilities": {}, "serverInfo": {"name": "x", "version": "1"}}),

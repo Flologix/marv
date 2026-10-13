@@ -250,6 +250,9 @@ pub struct McpTool {
     pub server: String,
     pub source: ServerSource,
     pub info: McpToolInfo,
+    /// `spec.parameters` as JSON text, in the server's key order when known ([`McpTool::with_schema_order`]):
+    /// `tool_search` shows it as Marv did (`ToolSpec::parameters` is a `serde_json::Value`, which sorts keys).
+    pub parameters_text: String,
     caller: Arc<dyn McpCaller>,
 }
 
@@ -260,6 +263,18 @@ impl std::fmt::Debug for McpTool {
 }
 
 impl McpTool {
+    /// Keeps the server's key order for `parameters_text`, given the schema as the server sent it. Ignored unless it
+    /// is the same schema as the spec's.
+    pub fn with_schema_order(mut self, schema: &Ordered) -> Self {
+        let ordered = acceptable_schema_ordered(schema);
+        if let Ok(text) = serde_json::to_string(&ordered)
+            && serde_json::from_str::<Value>(&text).ok().as_ref() == Some(&self.spec.parameters)
+        {
+            self.parameters_text = text;
+        }
+        self
+    }
+
     /// The server's own claim, `readOnlyHint`.
     pub fn read_only(&self) -> bool {
         self.info.annotations.as_ref().and_then(|a| a.read_only_hint) == Some(true)
@@ -345,7 +360,8 @@ pub fn make_mcp_tool(server: &McpServerConfig, info: McpToolInfo, caller: Arc<dy
     let description = format!("(MCP server \"{}\") {about}", server.name).trim().to_string();
     let spec =
         ToolSpec { name: name.clone(), description: description.clone(), parameters: acceptable_schema(&info.input_schema) };
-    McpTool { name, description, spec, server: server.name.clone(), source: server.source, info, caller }
+    let parameters_text = spec.parameters.to_string();
+    McpTool { name, description, spec, server: server.name.clone(), source: server.source, info, parameters_text, caller }
 }
 
 #[cfg(test)]
