@@ -9,10 +9,18 @@
 //!   public); `localhost` and `*.localhost` count as 127.0.0.1 without a lookup.
 //! - Only "no such name" blames the address; a failing resolver is the network's fault, and the message says so.
 //! - Lookups time out after [`DNS_TIMEOUT_MS`] = 10 s and stop with the run (Esc).
+//! - marv-rs: [`check_address`] returns the addresses it approved, and the download connects to those only (Marv
+//!   resolved the name a second time, so a DNS answer could change in between: rebinding).
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio_util::sync::CancellationToken;
+use url::{Host, Url};
 
 use crate::types::ToolError;
+use crate::web::STOPPED;
 
 pub const DNS_TIMEOUT_MS: u64 = 10_000;
 
@@ -70,15 +78,108 @@ pub fn is_private_address(address: &str) -> bool {
     }
 }
 
+/// Why a lookup failed: only "no such name" blames the address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LookupError {
+    NotFound,
+    /// The resolver itself failed (no network, DNS not answering).
+    Failed,
+}
+
+/// Name resolution, a trait so tests (which have no network) can replace it.
+#[async_trait::async_trait]
+pub trait Resolve: Send + Sync {
+    async fn lookup(&self, host: &str) -> Result<Vec<IpAddr>, LookupError>;
+}
+
+/// The system's resolver (getaddrinfo, through tokio).
+pub struct SystemResolver;
+
+#[async_trait::async_trait]
+impl Resolve for SystemResolver {
+    async fn lookup(&self, host: &str) -> Result<Vec<IpAddr>, LookupError> {
+        match tokio::net::lookup_host((host, 0)).await {
+            Ok(addrs) => Ok(addrs.map(|a| a.ip()).collect()),
+            Err(err) => {
+                // getaddrinfo's EAI_NONAME / EAI_NODATA; anything else (EAI_AGAIN…) is the network's fault.
+                let message = err.to_string().to_lowercase();
+                let not_found = ["not known", "no address associated", "nodename nor servname", "no such host"]
+                    .iter()
+                    .any(|m| message.contains(m));
+                Err(if not_found { LookupError::NotFound } else { LookupError::Failed })
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct CheckOptions {
+    /// Tests only: let a local server through the address check (the scheme check stays).
+    pub allow_private: bool,
+    pub dns_timeout: Duration,
+    /// Default: [`SystemResolver`].
+    pub resolver: Option<Arc<dyn Resolve>>,
+}
+
+impl Default for CheckOptions {
+    fn default() -> Self {
+        Self { allow_private: false, dns_timeout: Duration::from_millis(DNS_TIMEOUT_MS), resolver: None }
+    }
+}
+
 /// Refuses a URL web_fetch mustn't fetch: anything but http(s), or a host that is, or resolves to, a private address.
-pub async fn check_address(
-    _url: &url::Url,
-    _allow_private: bool,
-    _cancel: &tokio_util::sync::CancellationToken,
-) -> Result<(), ToolError> {
-    todo!(
-        "port: checkAddress: scheme check, localhost shortcut, tokio::net::lookup_host with DNS_TIMEOUT_MS and cancel, fail closed, the 'Refused: … a private address' message"
-    )
+/// The URL parser has already normalized odd spellings of an address (0x7f.1, 2130706433 → 127.0.0.1). `cancel` is
+/// the run's: stopping it stops a slow lookup too.
+///
+/// Returns the addresses the name resolved to (none for an address, or with `allow_private`): marv-rs connects to
+/// exactly those, so a second lookup can't answer differently (Marv's DNS-rebinding gap).
+pub async fn check_address(url: &Url, options: &CheckOptions, cancel: &CancellationToken) -> Result<Vec<IpAddr>, ToolError> {
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return Err(ToolError(format!("Only http and https links can be fetched, not {}.", url.scheme())));
+    }
+    if options.allow_private {
+        return Ok(Vec::new());
+    }
+    let (host, addresses, resolved) = match url.host() {
+        Some(Host::Ipv4(ip)) => (ip.to_string(), vec![ip.to_string()], Vec::new()),
+        Some(Host::Ipv6(ip)) => (ip.to_string(), vec![ip.to_string()], Vec::new()),
+        Some(Host::Domain(name)) => {
+            // Look up exactly the name the connection will use (a trailing dot is a different, absolute name); the
+            // dot-less lowercase form is only for comparing and for messages.
+            let host = name.trim_end_matches('.').to_ascii_lowercase();
+            if host == "localhost" || host.ends_with(".localhost") {
+                (host, vec!["127.0.0.1".to_string()], Vec::new())
+            } else {
+                let resolver: Arc<dyn Resolve> = options.resolver.clone().unwrap_or_else(|| Arc::new(SystemResolver));
+                let ips = tokio::select! {
+                    () = cancel.cancelled() => return Err(ToolError(STOPPED.into())),
+                    () = tokio::time::sleep(options.dns_timeout) => {
+                        return Err(ToolError(format!("Couldn't resolve {host}: timed out.")));
+                    }
+                    answer = resolver.lookup(name) => match answer {
+                        Ok(ips) => ips,
+                        Err(LookupError::NotFound) => return Err(ToolError(format!("Couldn't resolve {host}: check the address."))),
+                        Err(LookupError::Failed) => {
+                            return Err(ToolError(format!("Couldn't resolve {host}: no network, or DNS isn't answering?")));
+                        }
+                    },
+                };
+                // No answer is no proof the name is public: fail closed.
+                if ips.is_empty() {
+                    return Err(ToolError(format!("Couldn't resolve {host}: check the address.")));
+                }
+                (host, ips.iter().map(IpAddr::to_string).collect(), ips)
+            }
+        }
+        None => return Err(ToolError(format!("Not a valid URL: {url}. Give the full address, e.g. https://example.com/page."))),
+    };
+    if let Some(blocked) = addresses.iter().find(|a| is_private_address(a)) {
+        let subject = if *blocked == host { format!("{host} is") } else { format!("{host} is {blocked},") };
+        return Err(ToolError(format!(
+            "Refused: {subject} a private address (this machine or its network). To reach a local server, use bash with network: true (it asks first)."
+        )));
+    }
+    Ok(resolved)
 }
 
 #[cfg(test)]
@@ -146,5 +247,154 @@ mod tests {
         ] {
             assert!(!is_private_address(ip), "{ip} is public");
         }
+    }
+
+    /// A resolver with fixed answers, counting its lookups.
+    struct Fake {
+        answer: Result<Vec<&'static str>, LookupError>,
+        hang: bool,
+        asked: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Resolve for Fake {
+        async fn lookup(&self, host: &str) -> Result<Vec<IpAddr>, LookupError> {
+            self.asked.lock().unwrap().push(host.to_string());
+            if self.hang {
+                std::future::pending::<()>().await;
+            }
+            self.answer.clone().map(|ips| ips.iter().map(|ip| ip.parse().unwrap()).collect())
+        }
+    }
+
+    fn fake(answer: Result<Vec<&'static str>, LookupError>) -> Arc<Fake> {
+        Arc::new(Fake { answer, hang: false, asked: Default::default() })
+    }
+
+    async fn check_with(url: &str, resolver: &Arc<Fake>) -> Result<Vec<IpAddr>, ToolError> {
+        let options = CheckOptions { resolver: Some(resolver.clone()), ..CheckOptions::default() };
+        check_address(&Url::parse(url).unwrap(), &options, &CancellationToken::new()).await
+    }
+
+    async fn check(url: &str) -> Result<Vec<IpAddr>, ToolError> {
+        check_with(url, &fake(Err(LookupError::Failed))).await
+    }
+
+    #[tokio::test]
+    async fn only_http_and_https() {
+        assert_eq!(check("file:///etc/passwd").await.unwrap_err().0, "Only http and https links can be fetched, not file.");
+        assert!(check("ftp://example.com/").await.unwrap_err().0.ends_with("not ftp."));
+    }
+
+    #[tokio::test]
+    async fn refuses_private_addresses_however_theyre_written() {
+        for url in [
+            "http://127.0.0.1:9222/json",
+            "http://0x7f.1/",
+            "http://2130706433/",
+            "http://[::1]/",
+            "http://[::ffff:127.0.0.1]/",
+            "http://10.0.0.1/",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://127.0.0.1./",
+            "http://[::FFFF:127.0.0.1]/",
+        ] {
+            assert!(check(url).await.unwrap_err().0.contains("a private address"), "{url}");
+        }
+        assert_eq!(
+            check("http://127.0.0.1:9222/json").await.unwrap_err().0,
+            "Refused: 127.0.0.1 is a private address (this machine or its network). To reach a local server, use bash with network: true (it asks first)."
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_localhost_without_asking_dns() {
+        let dns = fake(Ok(vec!["93.184.215.14"]));
+        assert!(
+            check_with("http://localhost:3000/", &dns)
+                .await
+                .unwrap_err()
+                .0
+                .starts_with("Refused: localhost is 127.0.0.1, a private address")
+        );
+        assert!(check_with("http://app.localhost/", &dns).await.unwrap_err().0.contains("a private address"));
+        assert!(dns.asked.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn refuses_a_name_that_resolves_to_a_private_address_even_among_public_ones() {
+        let dns = fake(Ok(vec!["93.184.215.14", "192.168.1.5"]));
+        assert!(
+            check_with("https://sneaky.example/", &dns)
+                .await
+                .unwrap_err()
+                .0
+                .starts_with("Refused: sneaky.example is 192.168.1.5, a private address")
+        );
+        let v6 = fake(Ok(vec!["2606:4700::1", "fe80::1"]));
+        assert!(check_with("https://sneaky.example/", &v6).await.unwrap_err().0.contains("a private address"));
+    }
+
+    #[tokio::test]
+    async fn lets_a_public_site_through_and_returns_what_it_resolved_to() {
+        let dns = fake(Ok(vec!["93.184.215.14"]));
+        assert_eq!(check_with("https://example.com/page", &dns).await.unwrap(), ["93.184.215.14".parse::<IpAddr>().unwrap()]);
+        assert_eq!(*dns.asked.lock().unwrap(), ["example.com"]);
+    }
+
+    #[tokio::test]
+    async fn a_name_that_doesnt_resolve_and_a_lookup_that_failed_for_another_reason() {
+        assert_eq!(
+            check_with("https://nope.invalid/", &fake(Err(LookupError::NotFound))).await.unwrap_err().0,
+            "Couldn't resolve nope.invalid: check the address."
+        );
+        assert_eq!(
+            check("https://example.com/").await.unwrap_err().0,
+            "Couldn't resolve example.com: no network, or DNS isn't answering?"
+        );
+        assert_eq!(
+            check_with("https://empty.example/", &fake(Ok(vec![]))).await.unwrap_err().0,
+            "Couldn't resolve empty.example: check the address."
+        ); // fail closed
+    }
+
+    #[tokio::test]
+    async fn looks_up_the_name_the_connection_will_use_trailing_dot_kept() {
+        let dns = fake(Ok(vec!["93.184.215.14"]));
+        check_with("https://Example.com./", &dns).await.unwrap();
+        assert_eq!(*dns.asked.lock().unwrap(), ["example.com."]); // the URL lowercases the host; the dot stays
+    }
+
+    #[tokio::test]
+    async fn a_lookup_that_never_answers_is_cut_off_and_an_aborted_run_stops_it() {
+        assert_eq!(DNS_TIMEOUT_MS, 10_000);
+        let slow = Arc::new(Fake { answer: Ok(vec![]), hang: true, asked: Default::default() });
+        let options =
+            CheckOptions { resolver: Some(slow.clone()), dns_timeout: Duration::from_millis(20), ..CheckOptions::default() };
+        let url = Url::parse("https://slow.example/").unwrap();
+        assert_eq!(
+            check_address(&url, &options, &CancellationToken::new()).await.unwrap_err().0,
+            "Couldn't resolve slow.example: timed out."
+        );
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let options = CheckOptions { resolver: Some(slow), ..CheckOptions::default() };
+        let started = std::time::Instant::now();
+        assert_eq!(check_address(&url, &options, &cancel).await.unwrap_err().0, STOPPED);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn allow_private_skips_the_address_check_not_the_scheme_check() {
+        let options = CheckOptions { allow_private: true, ..CheckOptions::default() };
+        let token = CancellationToken::new();
+        assert!(check_address(&Url::parse("http://127.0.0.1/").unwrap(), &options, &token).await.is_ok());
+        assert!(
+            check_address(&Url::parse("file:///x").unwrap(), &options, &token)
+                .await
+                .unwrap_err()
+                .0
+                .starts_with("Only http and https")
+        );
     }
 }

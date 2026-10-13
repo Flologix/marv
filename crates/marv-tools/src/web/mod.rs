@@ -14,10 +14,16 @@
 //! the checked address in the client's resolver), CSS-class hiding isn't detected, the budget is spent in document
 //! order.
 
+/// What a web call says when the user stopped the run (Esc) during it.
+pub const STOPPED: &str = "Stopped by the user.";
+
 pub mod address;
 pub mod convert;
 pub mod fetch;
 pub mod github;
+pub mod hidden;
 pub mod html;
 pub mod html_convert_cli;
 pub mod plain;
+#[cfg(test)]
+pub(crate) mod test_server;

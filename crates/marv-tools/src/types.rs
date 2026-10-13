@@ -377,6 +377,11 @@ pub trait Tool: Send + Sync + 'static {
     fn repair(&self, _raw: &Value, _ctx: &ToolContext) -> Option<Repaired> {
         None
     }
+    /// marv-rs: the URL this call reaches (web_fetch), as `TaintState`'s prefixes are matched against. In a tainted
+    /// session a URL under a prefix the user approved runs without asking, and "always" approves the URL's prefix.
+    fn egress_url(&self, _input: &Self::Input) -> Option<String> {
+        None
+    }
     async fn run(&self, input: &Self::Input, ctx: &ToolContext) -> Result<ToolOutput, ToolError>;
 }
 
@@ -403,6 +408,7 @@ pub trait DynTool: Send + Sync {
     fn auto_safe(&self, input: In<'_>, ctx: &ToolContext) -> bool;
     fn protected_target(&self, input: In<'_>, ctx: &ToolContext) -> Option<ProtectedRule>;
     fn repair(&self, raw: &Value, ctx: &ToolContext) -> Option<Repaired>;
+    fn egress_url(&self, input: In<'_>) -> Option<String>;
     async fn run(&self, input: In<'_>, ctx: &ToolContext) -> Result<ToolOutput, ToolError>;
 }
 
@@ -459,6 +465,9 @@ impl<T: Tool> DynTool for T {
     }
     fn repair(&self, raw: &Value, ctx: &ToolContext) -> Option<Repaired> {
         Tool::repair(self, raw, ctx)
+    }
+    fn egress_url(&self, input: In<'_>) -> Option<String> {
+        Tool::egress_url(self, typed::<T>(input))
     }
     async fn run(&self, input: In<'_>, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         Tool::run(self, typed::<T>(input), ctx).await

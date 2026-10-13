@@ -16,7 +16,8 @@
 //!
 //! marv-rs additions (docs/SECURITY.md): a tainted session's egress (`ToolKind::Egress` or `uses_network`) and any
 //! write to a protected path are gated, skip yolo, and reach the approver with `must_ask` set; a result whose
-//! provenance taints marks the session.
+//! provenance taints marks the session. A web request (`egress_url`) under a URL prefix the user approved after the
+//! taint runs as approved; "always" on a tainted one approves its prefix (`web_fetch::url_prefix`), not the site.
 
 use std::path::MAIN_SEPARATOR;
 use std::sync::{Arc, OnceLock};
@@ -141,8 +142,11 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
 
     let network = tool.uses_network(input);
     let protected = tool.protected_target(input, ctx);
-    let must_ask = protected.is_some() || ctx.taint.must_ask(tool.kind(), network);
-    let gated = must_ask || tool.needs_approval(input).unwrap_or(tool.kind() != ToolKind::Read);
+    // A web request under a URL prefix the user approved after the taint (docs/SECURITY.md) runs as approved.
+    let egress_url = tool.egress_url(input).filter(|_| ctx.taint.is_tainted());
+    let prefix_approved = egress_url.as_deref().is_some_and(|url| ctx.taint.prefix_approved(url));
+    let must_ask = protected.is_some() || (ctx.taint.must_ask(tool.kind(), network) && !prefix_approved);
+    let gated = must_ask || (!prefix_approved && tool.needs_approval(input).unwrap_or(tool.kind() != ToolKind::Read));
     if !gated {
         return finish(tool.run(input, &per_call).await, None);
     }
@@ -192,7 +196,16 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
             result.approval = Some(Approval::Decided(Decision::No));
             noted(ToolOutcome { result, label: label.clone() })
         }
-        decision => finish(tool.run(input, &per_call).await, Some(Approval::Decided(decision))),
+        decision => {
+            // "Always" on a tainted web request covers its URL prefix, not the whole site (marv-rs S6).
+            if decision == Decision::Always
+                && must_ask
+                && let Some(prefix) = egress_url.as_deref().and_then(crate::web_fetch::url_prefix)
+            {
+                ctx.taint.approve_prefix(&prefix);
+            }
+            finish(tool.run(input, &per_call).await, Some(Approval::Decided(decision)))
+        }
     }
 }
 
