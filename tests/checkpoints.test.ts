@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CheckpointStore, parseMessage } from "../src/checkpoints/store.ts";
 import { applyUndo, nextUndoable, planUndo, undoSummary } from "../src/checkpoints/undo.ts";
-import { lstatSync, readlinkSync, unlinkSync } from "node:fs";
+import { lstatSync, readlinkSync, unlinkSync, utimesSync } from "node:fs";
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -158,6 +158,37 @@ describe("snapshot", () => {
     expect(small.off).toContain("too large");
     const sized = new CheckpointStore({ root: big, ownDir: tempDir(), session: "s1", limits: { files: 100, bytes: 3 } });
     expect(await sized.snapshot({ turn: 1, kind: "before", label: "" })).toMatchObject({ ok: false, reason: "too-large" });
+  });
+});
+
+describe("stale locks (a git killed mid-snapshot)", () => {
+  test("this session's ref lock and an old marv-index.lock are cleared; a fresh index lock (another Marv) is left alone", async () => {
+    const plain = tempDir();
+    const own = tempDir();
+    writeFileSync(join(plain, "a.txt"), "a\n");
+    const s = store(plain, "s1", own);
+    expect((await s.snapshot({ turn: 1, kind: "before", label: "" })).ok).toBe(true);
+    const gitDir = join(own, "git");
+    const refLock = join(gitDir, "refs", "marv", "checkpoints", "s1.lock");
+    const indexLock = join(gitDir, "marv-index.lock");
+    writeFileSync(refLock, "");
+    writeFileSync(indexLock, "");
+    const old = new Date(Date.now() - 3_600_000);
+    utimesSync(indexLock, old, old);
+    expect((await s.snapshot({ turn: 1, kind: "after", label: "" })).ok).toBe(true);
+    expect(existsSync(refLock) || existsSync(indexLock)).toBe(false);
+
+    writeFileSync(indexLock, "");
+    expect((await s.snapshot({ turn: 2, kind: "before", label: "" })).ok).toBe(false);
+    expect(existsSync(indexLock)).toBe(true);
+  });
+
+  test("in a repository, this session's ref lock is cleared", async () => {
+    const repo = makeRepo();
+    const s = store(repo);
+    expect((await s.snapshot({ turn: 1, kind: "before", label: "" })).ok).toBe(true);
+    writeFileSync(join(repo, ".git", "refs", "marv", "checkpoints", "s1.lock"), "");
+    expect((await s.snapshot({ turn: 1, kind: "after", label: "" })).ok).toBe(true);
   });
 });
 

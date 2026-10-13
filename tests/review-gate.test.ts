@@ -300,3 +300,19 @@ test("a first review with blockers isn't retried away: a model timeout beside a 
   gate();
   expect(reviewsLog().length).toBe(2);
 });
+
+test("a review with blockers and a file it couldn't review says both, blockers first", () => {
+  writeFileSync(
+    join(bin, "ocr"),
+    "#!/bin/sh\n" +
+      'if [ "$1" = "--version" ]; then printf \'open-code-review v1.0.0 (abc)\\n\'; exit 0; fi\n' +
+      'echo "review" >> "' + join(dir, "reviews") + '"\n' +
+      "echo '{\"status\":\"complete\",\"comments\":[{\"severity\":\"high\",\"path\":\"a.txt\",\"start_line\":1,\"content\":\"a real bug\"}],\"warnings\":[{\"type\":\"file_skipped\",\"message\":\"too big\"}]}'\n",
+  );
+  chmodSync(join(bin, "ocr"), 0o755);
+  const result = gate();
+  expect(result.exitCode).not.toBe(0);
+  const stderr = result.stderr.toString();
+  expect(stderr).toContain("1 blocking finding(s)");
+  expect(stderr.indexOf("blocking finding(s)")).toBeLessThan(stderr.indexOf("couldn't be reviewed"));
+});

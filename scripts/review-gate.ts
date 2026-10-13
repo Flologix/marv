@@ -276,23 +276,22 @@ for (const sha of new Set(commits)) {
     continue;
   }
 
-  if (outcome.warnings.length) {
-    console.error(`review-gate: ${outcome.warnings.length} file(s) couldn't be reviewed, so ${sha.slice(0, 8)} isn't passed; see \`ocr session list\`, then push again.`);
-    for (const w of outcome.warnings) console.error(`  ${JSON.stringify(w).slice(0, 300)}`);
-    failed = true;
-    continue;
-  }
-
+  // Blockers first, so a review with both says what to fix; then whatever it couldn't review.
   if (outcome.blocked) {
     console.error(
       `\nreview-gate: ${blockers.length} blocking finding(s) in ${sha.slice(0, 8)} (${[...blocking].join("/")}, or unranked). ` +
         "Fix them (or explain in the PR why they're wrong) and push again.",
     );
     failed = true;
-  } else {
-    console.error(`review-gate: ${sha.slice(0, 8)} passed (${outcome.findings.length} non-blocking note(s)).`);
-    mkdirSync(cacheDir, { recursive: true });
-    appendFileSync(passedFile, `${key(sha)}\n`);
   }
+  if (outcome.warnings.length) {
+    console.error(`review-gate: ${outcome.warnings.length} file(s) couldn't be reviewed, so ${sha.slice(0, 8)} isn't passed; see \`ocr session list\`, then push again.`);
+    for (const w of outcome.warnings) console.error(`  ${JSON.stringify(w).slice(0, 300)}`);
+    failed = true;
+  }
+  if (outcome.blocked || outcome.warnings.length) continue;
+  console.error(`review-gate: ${sha.slice(0, 8)} passed (${outcome.findings.length} non-blocking note(s)).`);
+  mkdirSync(cacheDir, { recursive: true });
+  appendFileSync(passedFile, `${key(sha)}\n`);
 }
 process.exit(failed ? 1 : 0);
