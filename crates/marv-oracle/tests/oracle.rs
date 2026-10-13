@@ -35,7 +35,11 @@ fn every_scenario_is_well_formed_and_recorded() {
             assert_eq!(marv_oracle::prefix::prefix_breaks(&bodies, &s.run.prefix_resets), [], "{}", s.name);
         }
         if let Some(d) = &s.run.deliberate {
-            assert!(d.issue > 0 && !d.why.trim().is_empty(), "{}: a deliberate difference needs its issue and why", s.name);
+            assert!(
+                d.well_formed(),
+                "{}: a deliberate difference needs one reason (an issue or a SECURITY.md section) and why",
+                s.name
+            );
         }
         // A .gitignore in this repository would apply to marv-rs itself.
         for dir in [s.project(), s.expect(), s.expect_for(Target::MarvRs)] {

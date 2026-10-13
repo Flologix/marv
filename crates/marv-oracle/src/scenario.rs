@@ -55,12 +55,30 @@ pub struct RunSpec {
     pub deliberate: Option<Deliberate>,
 }
 
-/// `{"issue": 64, "why": "…"}`: the Marv issue the difference implements, and what it changes.
+/// `{"issue": 64, "why": "…"}`: the Marv issue the difference implements, and what it changes. A marv-rs security
+/// rule that no Marv issue asked for cites its `docs/SECURITY.md` section instead:
+/// `{"security": "Provenance and taint", "why": "…"}`. Exactly one of the two.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Deliberate {
-    pub issue: u32,
+    #[serde(default)]
+    pub issue: Option<u32>,
+    /// The `docs/SECURITY.md` section (its heading) the difference follows.
+    #[serde(default)]
+    pub security: Option<String>,
     pub why: String,
+}
+
+impl Deliberate {
+    /// Names exactly one reason (a Marv issue, or a SECURITY.md section) and says why.
+    pub fn well_formed(&self) -> bool {
+        let reason = match (&self.issue, &self.security) {
+            (Some(n), None) => *n > 0,
+            (None, Some(section)) => !section.trim().is_empty(),
+            _ => false,
+        };
+        reason && !self.why.trim().is_empty()
+    }
 }
 
 /// Which Marv a run checks or records: TypeScript Marv (the recordings in `expect/`), or marv-rs.
@@ -212,6 +230,18 @@ fn map_name(path: &str, map: impl Fn(&str) -> Option<&'static str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_deliberate_difference_names_one_reason() {
+        let d = |v: serde_json::Value| serde_json::from_value::<Deliberate>(v).unwrap().well_formed();
+        assert!(d(serde_json::json!({"issue": 64, "why": "w"})));
+        assert!(d(serde_json::json!({"security": "Provenance and taint", "why": "w"})));
+        assert!(!d(serde_json::json!({"issue": 64, "security": "Provenance and taint", "why": "w"})));
+        assert!(!d(serde_json::json!({"why": "w"})));
+        assert!(!d(serde_json::json!({"issue": 0, "why": "w"})));
+        assert!(!d(serde_json::json!({"security": " ", "why": "w"})));
+        assert!(!d(serde_json::json!({"issue": 64, "why": " "})));
+    }
 
     #[test]
     fn gitignore_is_stored_under_another_name() {

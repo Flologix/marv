@@ -427,6 +427,8 @@ struct State {
     working: Option<CancellationToken>,
     /// The running turn's MCP specs: what a mid-turn compaction announces again.
     turn_mcp_specs: Arc<Vec<ToolSpec>>,
+    /// A turn has waited for the MCP servers (see `turn_body`): only the first turn always does.
+    mcp_waited: bool,
 }
 
 struct Inner {
@@ -655,6 +657,7 @@ impl MarvSession {
             flushing: Vec::new(),
             working: None,
             turn_mcp_specs: Arc::default(),
+            mcp_waited: false,
         };
         let inner = Inner {
             specs,
@@ -866,14 +869,21 @@ impl MarvSession {
         // MCP servers still starting: their tools must be in place before the first request (the list can't change
         // after it, or the prompt cache would start over). Interrupting the wait ends the turn. A failed start still
         // settles: the turn goes on with whatever tools there are.
-        if let Some(mcp) = &init.mcp
-            && !mcp.settled()
-        {
-            emit(SessionEvent::Status(TurnStatus::WaitingForMcp));
-            tokio::select! {
-                _ = mcp.ready() => {}
-                _ = stop.cancelled() => return TurnEndReason::Interrupted,
+        //
+        // marv-rs: the first turn with MCP servers always goes through the wait (and says so), settled or not. In
+        // Marv the first turn's check always came before startup could finish (connecting takes I/O, the check
+        // doesn't); here startup runs on another thread, and a server that connects in a few milliseconds raced the
+        // check, so `waiting_for_mcp` came and went from run to run. A wait on settled servers returns at once.
+        if let Some(mcp) = &init.mcp {
+            let first = !self.state().mcp_waited && !mcp.status().is_empty();
+            if first || !mcp.settled() {
+                emit(SessionEvent::Status(TurnStatus::WaitingForMcp));
+                tokio::select! {
+                    _ = mcp.ready() => {}
+                    _ = stop.cancelled() => return TurnEndReason::Interrupted,
+                }
             }
+            self.state().mcp_waited = true;
         }
         // Stopped before the message was even sent (an already-cancelled token, or interrupt() during the wait): it
         // isn't sent, so the conversation stays as it was, and nothing is logged (a turn the model never saw would
@@ -2482,8 +2492,165 @@ mod turn_tests {
     }
 
     // ---- MCP servers ----
-    // Port note: "waits for them, and offers their tools" and "interrupting the wait" need an McpManager that hasn't
-    // settled; McpManager::start is still todo in marv-mcp, so there's no way to make one yet.
+
+    use serde_json::json;
+
+    /// A manager over `servers` (yours), not started.
+    fn mcp_manager(dirs: &Dirs, servers: Vec<serde_json::Value>) -> McpHandle {
+        use marv_mcp::config::{ServerSource, parse_server};
+        use marv_mcp::manager::{CONNECT_TIMEOUT, LOGIN_TIMEOUT, ManagerOptions, McpManager};
+        let configs = servers
+            .iter()
+            .enumerate()
+            .map(|(i, raw)| parse_server(&format!("s{i}"), raw, ServerSource::Personal, &|_| None, "test").unwrap())
+            .collect();
+        McpManager::new(
+            configs,
+            ManagerOptions {
+                root: dirs.project.clone(),
+                project_key: "p".into(),
+                home: dirs.dir.clone(),
+                version: "0".into(),
+                trust: None,
+                logins: None,
+                env: Default::default(),
+                connect_timeout: CONNECT_TIMEOUT,
+                login_timeout: LOGIN_TIMEOUT,
+            },
+        )
+    }
+
+    /// A Streamable HTTP MCP server with one tool, `ping`, that answers `initialize` only once `gate` opens.
+    async fn gated_mcp_server(gate: tokio::sync::watch::Receiver<bool>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://127.0.0.1:{}/mcp", listener.local_addr().unwrap().port());
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut gate = gate.clone();
+                tokio::spawn(async move {
+                    let mut data = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    let body = loop {
+                        let n = stream.read(&mut buf).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        data.extend_from_slice(&buf[..n]);
+                        let text = String::from_utf8_lossy(&data).to_string();
+                        let Some((head, body)) = text.split_once("\r\n\r\n") else { continue };
+                        let length = head
+                            .lines()
+                            .find_map(|l| {
+                                l.to_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        if body.len() >= length {
+                            break body.to_string();
+                        }
+                    };
+                    let message: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+                    let reply = match message["method"].as_str().unwrap_or_default() {
+                        "initialize" => {
+                            let _ = gate.wait_for(|open| *open).await;
+                            Some(
+                                json!({"protocolVersion": "2025-06-18", "capabilities": {}, "serverInfo": {"name": "x", "version": "1"}}),
+                            )
+                        }
+                        "tools/list" => {
+                            Some(json!({"tools": [{"name": "ping", "description": "Ping.", "inputSchema": {"type": "object"}}]}))
+                        }
+                        _ => None,
+                    };
+                    let response = match reply {
+                        Some(result) => {
+                            let body = json!({"jsonrpc": "2.0", "id": message["id"], "result": result}).to_string();
+                            format!(
+                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                                body.len()
+                            )
+                        }
+                        None => "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".into(),
+                    };
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn the_first_request_waits_for_them_and_offers_their_tools() {
+        let dirs = Dirs::new();
+        let (open, gate) = tokio::sync::watch::channel(false);
+        let url = gated_mcp_server(gate).await;
+        let mcp = mcp_manager(&dirs, vec![json!({"type": "http", "url": url})]);
+        let provider = Scripted::new(vec![say("Pong.")]);
+        let session = scripted(&dirs, &provider, |init| init.mcp = Some(mcp.clone()));
+        tokio::spawn({
+            let mcp = mcp.clone();
+            async move { mcp.start().await }
+        });
+        let mut turn = go(&session, "ping");
+        let mut waited = false;
+        while let Some(event) = turn.next().await {
+            if matches!(event, SessionEvent::Status(TurnStatus::WaitingForMcp)) {
+                assert!(provider.requests().is_empty());
+                waited = true;
+                open.send_replace(true);
+            }
+        }
+        assert!(waited);
+        assert!(provider.requests()[0].1.tools.iter().any(|t| t.name == "mcp__s0__ping"));
+        session.close().await;
+    }
+
+    #[tokio::test]
+    async fn interrupting_the_wait_ends_the_turn_before_anything_is_sent() {
+        let dirs = Dirs::new();
+        let (_never, gate) = tokio::sync::watch::channel(false);
+        let url = gated_mcp_server(gate).await;
+        let mcp = mcp_manager(&dirs, vec![json!({"type": "http", "url": url})]);
+        let provider = Scripted::new(vec![say("never")]);
+        let session = scripted(&dirs, &provider, |init| init.mcp = Some(mcp.clone()));
+        tokio::spawn({
+            let mcp = mcp.clone();
+            async move { mcp.start().await }
+        });
+        let mut turn = go(&session, "ping");
+        let mut events = Vec::new();
+        while let Some(event) = turn.next().await {
+            if matches!(event, SessionEvent::Status(_)) {
+                session.interrupt();
+            }
+            events.push(event);
+        }
+        assert_eq!(kinds(&events), ["turn_start", "status", "turn_end"]);
+        assert!(matches!(events.last(), Some(SessionEvent::TurnEnd { reason: TurnEndReason::Interrupted, .. })));
+        assert!(provider.requests().is_empty());
+    }
+
+    /// The race the oracle hit about once in fifteen runs: servers that settle before the first turn checks (here,
+    /// one that fails at once, awaited before the message). The first turn still says it waited; later ones don't.
+    #[tokio::test]
+    async fn the_first_turn_with_mcp_servers_always_goes_through_the_wait() {
+        let dirs = Dirs::new();
+        let mcp = mcp_manager(&dirs, vec![json!({"command": "/nonexistent/marv-mcp-test-server"})]);
+        mcp.start().await;
+        assert!(mcp.settled());
+        let provider = Scripted::new(vec![say("One."), say("Two.")]);
+        let session = scripted(&dirs, &provider, |init| init.mcp = Some(mcp.clone()));
+        let first = collect(go(&session, "first")).await;
+        assert_eq!(statuses(&first, TurnStatus::WaitingForMcp), 1);
+        let second = collect(go(&session, "second")).await;
+        assert_eq!(statuses(&second, TurnStatus::WaitingForMcp), 0);
+        // A manager without servers (the TUI's, before /mcp add) never waits.
+        let dirs = Dirs::new();
+        let empty = mcp_manager(&dirs, vec![]);
+        let provider = Scripted::new(vec![say("One.")]);
+        let session = scripted(&dirs, &provider, |init| init.mcp = Some(empty));
+        assert_eq!(statuses(&collect(go(&session, "first")).await, TurnStatus::WaitingForMcp), 0);
+    }
 
     // ---- compaction ----
 
