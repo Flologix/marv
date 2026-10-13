@@ -354,6 +354,18 @@ describe("undo", () => {
     expect(second.turn).toBe(1);
   });
 
+  test("a saved copy that can't be read stops the plan, rather than writing the file back empty", async () => {
+    const repo = makeRepo();
+    writeFileSync(join(repo, "lost.txt"), "only copy in the checkpoints\n");
+    const s = store(repo);
+    await turn(s, 1, () => writeFileSync(join(repo, "lost.txt"), "changed\n"));
+    const blob = git(repo, "rev-parse", `${(await s.chain()).find((c) => c.kind === "before")!.sha}:lost.txt`).trim();
+    rmSync(join(repo, ".git", "objects", blob.slice(0, 2), blob.slice(2)));
+    const plan = await planUndo(s);
+    expect(plan).toMatchObject({ failed: true, reason: expect.stringContaining("lost.txt") });
+    expect(readFileSync(join(repo, "lost.txt"), "utf8")).toBe("changed\n");
+  });
+
   test("a plan made before another checkpoint is refused", async () => {
     const repo = makeRepo();
     const s = store(repo);

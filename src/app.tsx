@@ -41,7 +41,7 @@ import { addPersonalServer, personalServerNames, removePersonalServer } from "./
 import { printable } from "./printable.ts";
 import type { AgentProgress, ApprovalRequest, Decision } from "./tools/types.ts";
 import { checkNotice } from "./diagnostics/turn.ts";
-import { undoRequest, undoSummary, type UndoPlan } from "./checkpoints/undo.ts";
+import { undoRequest, undoSummary, type UndoPlan, type UndoRefusal } from "./checkpoints/undo.ts";
 import { projectCheckNotice, type ProjectCheckResult } from "./checks/kind.ts";
 import { loadChecks, type ProjectCheck } from "./checks/load.ts";
 import { hiddenPathFoldersItem } from "./commands/sandbox-notice.ts";
@@ -1158,7 +1158,7 @@ export function App({
       addMessage({ role: "system", isError: true, text: "Marv is working: stop the current turn (Esc) before /undo." });
       return;
     }
-    let plan: UndoPlan | { reason: string };
+    let plan: UndoPlan | UndoRefusal;
     try {
       plan = await busyWith("Reading the checkpoints…", () => session.undoPlan());
     } catch (err) {
@@ -1166,7 +1166,8 @@ export function App({
       return;
     }
     if ("reason" in plan) {
-      addMessage({ role: "system", text: `Nothing to undo: ${plan.reason.replace(/^nothing to undo: /, "")}.` });
+      if (plan.failed) addMessage({ role: "system", isError: true, text: `Couldn't undo: ${plan.reason}.` });
+      else addMessage({ role: "system", text: `Nothing to undo: ${plan.reason.replace(/^nothing to undo: /, "")}.` });
       return;
     }
     if (plan.files.length === 0) {

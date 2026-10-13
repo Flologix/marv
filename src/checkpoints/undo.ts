@@ -50,6 +50,9 @@ export interface UndoResult {
   markerFailed?: string;
 }
 
+/** Why there's no plan: nothing to undo, or (failed) the checkpoints couldn't be read. */
+export type UndoRefusal = { reason: string; failed?: true };
+
 /** Larger files are named in the preview, not diffed. */
 const MAX_DIFFED_BYTES = 1024 * 1024;
 
@@ -83,15 +86,17 @@ async function current(absolute: string): Promise<{ mode: string; content: Uint8
 export async function planUndo(
   store: CheckpointStore,
   { reported = [], root }: { reported?: string[] | ((turn: number) => string[]); root?: string } = {},
-): Promise<UndoPlan | { reason: string }> {
+): Promise<UndoPlan | UndoRefusal> {
   const where = await store.locate();
-  if ("error" in where) return { reason: `checkpoints can't be read: ${where.error}` };
+  if ("error" in where) return { reason: `checkpoints can't be read: ${where.error}`, failed: true };
   const head = await store.head();
   const pair = nextUndoable(await store.chain(), store.undoneTurns);
   if (!head || !pair) return { reason: "nothing to undo: no turn in this session has changed files yet (or they're all undone)" };
-  const projectRoot = root ?? join(where.top, where.prefix);
+  // Resolved as applyUndo resolves it, so the plan and the apply compare paths against the same root.
+  const given = root ?? join(where.top, where.prefix);
+  const projectRoot = await realpath(given).catch(() => given);
   const listed = await store.git(["diff-tree", "-r", "-z", "--no-renames", pair.before.sha, pair.after.sha, "--", await store.pathspec()]);
-  if (!listed.ok) return { reason: `git diff-tree failed: ${listed.out.trim()}` };
+  if (!listed.ok) return { reason: `git diff-tree failed: ${listed.out.trim()}`, failed: true };
   const fields = listed.out.split("\0");
   const files: UndoFile[] = [];
   const targets = new Map<string, { mode: string; content: Uint8Array } | null>();
@@ -106,9 +111,16 @@ export async function planUndo(
       notRestored.push(path);
       continue;
     }
-    const blob = async (sha: string) => (await store.git(["cat-file", "blob", sha])).bytes;
-    const before = status === "A" ? null : { mode: oldMode, content: await blob(oldSha) };
-    const after = status === "D" ? null : { mode: newMode, content: await blob(newSha) };
+    // A copy that can't be read (pruned, corrupt) stops the plan: read as empty, it would be written back as an empty file.
+    const blob = async (sha: string) => {
+      const read = await store.git(["cat-file", "blob", sha]);
+      return read.ok ? read.bytes : null;
+    };
+    const beforeBytes = status === "A" ? undefined : await blob(oldSha);
+    const afterBytes = status === "D" ? undefined : await blob(newSha);
+    if (beforeBytes === null || afterBytes === null) return { reason: `the saved copy of ${path} can't be read from the checkpoints`, failed: true };
+    const before = beforeBytes === undefined ? null : { mode: oldMode, content: beforeBytes };
+    const after = afterBytes === undefined ? null : { mode: newMode, content: afterBytes };
     const now = await current(join(projectRoot, path));
     const changedSince = after === null ? now !== null : now === null || now.mode !== after.mode || !sameBytes(now.content, after.content);
     const action: UndoAction = status === "A" ? "delete" : status === "D" ? "recreate" : "restore";

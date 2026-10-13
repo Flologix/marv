@@ -12,7 +12,7 @@ import { agentArgs, answerAllCalls, DEFAULT_MAX_STEPS, runAgent, type LoopEvent 
 import { GENERAL_PURPOSE, type AgentType } from "./agents.ts";
 import { CheckpointStore, type SnapshotResult } from "./checkpoints/store.ts";
 import { CheckpointTurn } from "./checkpoints/turn.ts";
-import { applyUndo, planUndo, undoNote, type UndoPlan, type UndoResult } from "./checkpoints/undo.ts";
+import { applyUndo, planUndo, undoNote, type UndoPlan, type UndoRefusal, type UndoResult } from "./checkpoints/undo.ts";
 import { COMPACT_AT, compactedHistory, MID_TURN_NOTE, summarize } from "./compact.ts";
 import { diagnosticsNote } from "./diagnostics/tsc.ts";
 import { checksNote, ProjectChecks, type ProjectCheckResult } from "./checks/kind.ts";
@@ -278,7 +278,7 @@ export interface Session {
    * What undo() would do: the newest turn of this conversation that changed files and isn't undone yet, each path
    * and its diff, or why there's nothing to undo. Rejects during a turn.
    */
-  undoPlan(): Promise<UndoPlan | { reason: string }>;
+  undoPlan(): Promise<UndoPlan | UndoRefusal>;
   /**
    * Puts a planned turn's files back (after a snapshot of how they are now), and tells the model at the start of the
    * next message. Rejects during a turn, and if the plan is stale.
@@ -584,7 +584,7 @@ export class MarvSession implements Session {
   }
 
   /** /undo's preview: what undo() would put back, or why there's nothing to. Rejects during a turn. */
-  async undoPlan(): Promise<UndoPlan | { reason: string }> {
+  async undoPlan(): Promise<UndoPlan | UndoRefusal> {
     this.idle();
     if (!this.checkpointsOn) return { reason: "checkpoints are off (/checkpoints on turns them on)" };
     if (this.checkpoints.off) return { reason: `checkpoints are off for this project: ${this.checkpoints.off}` };
