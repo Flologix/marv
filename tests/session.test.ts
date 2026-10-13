@@ -1018,6 +1018,12 @@ describe("final review fixes", () => {
     expect(() => makeSession(new ScriptedProvider([]), { tools: [custom("skill")] })).toThrow(/"skill" is already built in/);
   });
 
+  test("plan and process are free names where the session doesn't offer them (plan: false, processes: false)", () => {
+    expect(() => makeSession(new ScriptedProvider([]), { tools: [custom("plan")] })).toThrow(/"plan" is already built in/);
+    expect(() => makeSession(new ScriptedProvider([]), { tools: [custom("plan")], plan: false })).not.toThrow();
+    expect(() => makeSession(new ScriptedProvider([]), { tools: [custom("process")], processes: false })).not.toThrow();
+  });
+
   test("two tools of your own can't share a name", () => {
     expect(() => makeSession(new ScriptedProvider([]), { tools: [custom("x"), custom("x")] })).toThrow('Two tools are named "x".');
   });

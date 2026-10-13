@@ -256,11 +256,12 @@ const stepLimitRequest = (steps: number, every: number): ApprovalRequest => ({
  * built-in; `mcp__` names are where MCP servers' tools go, and tool_search and mcp_call are how a deferred
  * conversation reaches them (#14). Checked before anything starts.
  */
-function checkToolNames(custom: Tool[], github: boolean): void {
+function checkToolNames(custom: Tool[], offered: { github: boolean; plan: boolean; process: boolean }): void {
   const seen = new Set<string>();
+  // The github, plan and process tools are built in only where the session offers them: elsewhere the name is free.
+  const optional: Record<string, boolean> = { github: offered.github, plan: offered.plan, process: offered.process };
   for (const { name } of custom) {
-    // The github tool is only built in where the session offers it (#47): elsewhere the name is free.
-    const builtin = builtinTools.some((t) => t.name === name && (github || name !== "github"));
+    const builtin = builtinTools.some((t) => t.name === name && (optional[name] ?? true));
     if (builtin || DEFERRED_NAMES.includes(name)) {
       throw new Error(`A tool named "${name}" is already built in: give yours another name.`);
     }
@@ -439,7 +440,7 @@ export class MarvSession implements Session {
   private pruned = false;
 
   constructor(private readonly init: SessionInit) {
-    checkToolNames(init.tools ?? [], Boolean(init.github));
+    checkToolNames(init.tools ?? [], { github: Boolean(init.github), plan: init.plan ?? true, process: (init.processes ?? true) && sandboxAvailable() });
     if (init.noYolo && (init.yolo ?? true)) throw new Error(init.noYolo);
     if (init.maxSteps !== undefined && !(Number.isInteger(init.maxSteps) && init.maxSteps >= 0)) {
       throw new Error(`maxSteps must be a whole number of at least 0 (0 never asks), not ${init.maxSteps}`);
