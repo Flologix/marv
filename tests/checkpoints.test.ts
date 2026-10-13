@@ -3,7 +3,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CheckpointStore, parseMessage } from "../src/checkpoints/store.ts";
-import { applyUndo, nextUndoable, planUndo } from "../src/checkpoints/undo.ts";
+import { applyUndo, nextUndoable, planUndo, undoSummary } from "../src/checkpoints/undo.ts";
 import { lstatSync, readlinkSync, unlinkSync } from "node:fs";
 
 const dirs: string[] = [];
@@ -333,6 +333,25 @@ describe("undo", () => {
     await applyUndo(s, second);
     expect(readFileSync(join(repo, "a.txt"), "utf8")).toBe("one\n");
     expect(await planUndo(s)).toMatchObject({ reason: expect.stringContaining("nothing") });
+  });
+
+  test("a failed undo marker still counts: the next /undo goes one turn further back, and the summary says so", async () => {
+    const repo = makeRepo();
+    const s = store(repo);
+    await turn(s, 1, () => writeFileSync(join(repo, "a.txt"), "two\n"));
+    await turn(s, 2, () => writeFileSync(join(repo, "a.txt"), "three\n"));
+    const first = await planUndo(s);
+    if ("reason" in first) throw new Error(first.reason);
+    const real = s.snapshot.bind(s);
+    s.snapshot = async (options) => (options.kind === "undo" ? { ok: false, reason: "failed", message: "disk full", ms: 0 } : real(options));
+    const applied = await applyUndo(s, first);
+    s.snapshot = real;
+    expect(applied.markerFailed).toBe("disk full");
+    expect(undoSummary(first, applied)).toContain("couldn't be recorded (disk full)");
+    writeFileSync(join(repo, "a.txt"), "edited by the user\n");
+    const second = await planUndo(s);
+    if ("reason" in second) throw new Error(second.reason);
+    expect(second.turn).toBe(1);
   });
 
   test("a plan made before another checkpoint is refused", async () => {

@@ -79,9 +79,16 @@ export class CheckpointStore {
     this.session = options.session;
   }
 
+  /**
+   * Turns undone whose `undo` marker couldn't be written: without one the chain still shows the turn as the newest
+   * undoable one, and a second /undo would put its files back again over what's there now.
+   */
+  readonly undoneTurns = new Set<number>();
+
   /** A new conversation (clear) or an old one (resume): its own chain. */
   setSession(id: string): void {
     this.session = id;
+    this.undoneTurns.clear();
   }
 
   get ref(): string {

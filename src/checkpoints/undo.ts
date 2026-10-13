@@ -46,14 +46,16 @@ export interface UndoResult {
   preUndo: string;
   preUndoMs: number;
   preUndoFiles: number;
+  /** Why the `undo` marker wasn't written (the turn is kept as undone in memory, for this session only). */
+  markerFailed?: string;
 }
 
 /** Larger files are named in the preview, not diffed. */
 const MAX_DIFFED_BYTES = 1024 * 1024;
 
-/** The newest turn that has a pair and hasn't been undone. */
-export function nextUndoable(chain: Checkpoint[]): { before: Checkpoint; after: Checkpoint } | null {
-  const undone = new Set(chain.filter((c) => c.kind === "undo").map((c) => c.turn));
+/** The newest turn that has a pair and hasn't been undone (by a marker on the chain, or in `alsoUndone`). */
+export function nextUndoable(chain: Checkpoint[], alsoUndone: ReadonlySet<number> = new Set()): { before: Checkpoint; after: Checkpoint } | null {
+  const undone = new Set([...chain.filter((c) => c.kind === "undo").map((c) => c.turn), ...alsoUndone]);
   for (const [i, after] of chain.entries()) {
     if (after.kind !== "after" || undone.has(after.turn)) continue;
     const before = chain.slice(i + 1).find((c) => c.kind === "before" && c.turn === after.turn);
@@ -85,7 +87,7 @@ export async function planUndo(
   const where = await store.locate();
   if ("error" in where) return { reason: `checkpoints can't be read: ${where.error}` };
   const head = await store.head();
-  const pair = nextUndoable(await store.chain());
+  const pair = nextUndoable(await store.chain(), store.undoneTurns);
   if (!head || !pair) return { reason: "nothing to undo: no turn in this session has changed files yet (or they're all undone)" };
   const projectRoot = root ?? join(where.top, where.prefix);
   const listed = await store.git(["diff-tree", "-r", "-z", "--no-renames", pair.before.sha, pair.after.sha, "--", await store.pathspec()]);
@@ -217,7 +219,12 @@ export async function applyUndo(store: CheckpointStore, plan: UndoPlan, { root }
       refuse((error as Error).message);
     }
   }
-  await store.snapshot({ turn: plan.turn, kind: "undo", label: plan.label });
+  const marker = await store.snapshot({ turn: plan.turn, kind: "undo", label: plan.label });
+  if (!marker.ok) {
+    // The files are already written: the turn is undone either way, so the next /undo must not pick it again.
+    store.undoneTurns.add(plan.turn);
+    result.markerFailed = marker.message;
+  }
   return result;
 }
 
@@ -276,5 +283,6 @@ export function undoSummary(plan: UndoPlan, result: UndoResult): string {
   const parts = [`↶ Undid turn ${plan.turn}: ${plural(done, "file")} restored`];
   if (result.refused.length) parts.push(`not written: ${result.refused.map((r) => `${r.path} (${r.reason})`).join(", ")}`);
   if (plan.notRestored.length) parts.push(`left as they are (ignored by git): ${plan.notRestored.join(", ")}`);
+  if (result.markerFailed) parts.push(`the undo couldn't be recorded (${result.markerFailed}): after a restart /undo may offer this turn again`);
   return parts.join("; ");
 }
