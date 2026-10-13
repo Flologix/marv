@@ -103,6 +103,8 @@ struct Inner {
     wire: Wire,
 }
 
+// One per connection: its size doesn't matter.
+#[allow(clippy::large_enum_variant)]
 enum Wire {
     Stdio { stdin: tokio::sync::Mutex<Option<ChildStdin>>, child: Mutex<Option<Child>> },
     Http(HttpWire),
@@ -216,8 +218,10 @@ impl Client {
         }
     }
 
-    /// The MCP handshake. A server's `instructions` are dropped here: they never reach the prompt.
-    pub async fn initialize(&self, version: &str, timeout: Duration) -> crate::Result<InitializeResult> {
+    /// The MCP handshake: the protocol version the server answered with. Nothing else of its answer leaves here:
+    /// a server's instructions are stranger-written text that would speak with the system prompt's authority
+    /// (docs/SECURITY.md, "MCP"), so they never reach the prompt.
+    pub async fn initialize(&self, version: &str, timeout: Duration) -> crate::Result<String> {
         let params = InitializeParams {
             protocol_version: PROTOCOL_VERSION.into(),
             capabilities: json!({}),
@@ -225,15 +229,13 @@ impl Client {
         };
         let opts = RequestOptions { timeout: Some(timeout), ..Default::default() };
         let raw = self.request(method::INITIALIZE, Some(serde_json::to_value(params)?), opts).await?;
-        let mut result: InitializeResult = serde_json::from_value(raw)
+        let InitializeResult { protocol_version, .. } = serde_json::from_value(raw)
             .map_err(|e| McpError::Server(format!("the server's initialize answer isn't MCP: {e}")))?;
-        // Stranger-written text that would speak with the system prompt's authority (docs/SECURITY.md, "MCP").
-        result.instructions = None;
         if let Wire::Http(w) = &self.inner.wire {
-            *lock(&w.protocol) = Some(result.protocol_version.clone());
+            *lock(&w.protocol) = Some(protocol_version.clone());
         }
         self.notify(method::INITIALIZED, None).await?;
-        Ok(result)
+        Ok(protocol_version)
     }
 
     pub async fn list_tools(&self, cursor: Option<&str>, timeout: Duration) -> crate::Result<ListToolsResult> {
@@ -338,12 +340,12 @@ impl Client {
             stdin.lock().await.take();
             let waited = tokio::time::Instant::now();
             loop {
-                let exited = lock(&*child).as_mut().is_none_or(|c| c.try_wait().map(|s| s.is_some()).unwrap_or(true));
+                let exited = lock(child).as_mut().is_none_or(|c| c.try_wait().map(|s| s.is_some()).unwrap_or(true));
                 if exited {
                     break;
                 }
                 if waited.elapsed() >= EXIT_GRACE {
-                    if let Some(c) = lock(&*child).as_mut() {
+                    if let Some(c) = lock(child).as_mut() {
                         let _ = c.start_kill();
                     }
                     break;
@@ -357,7 +359,7 @@ impl Client {
     /// Last resort, synchronous: kills a local server now.
     pub fn kill(&self) {
         if let Wire::Stdio { child, .. } = &self.inner.wire
-            && let Some(c) = lock(&*child).as_mut()
+            && let Some(c) = lock(child).as_mut()
         {
             let _ = c.start_kill();
         }

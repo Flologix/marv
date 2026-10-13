@@ -1099,4 +1099,327 @@ mod tests {
     fn login_needed_is_marvs_sentence() {
         assert_eq!(LoginNeeded { server: "x".into() }.to_string(), "x needs a new login: the user can run /mcp login x");
     }
+
+    // ---- ports of tests/mcp-oauth.test.ts ----
+
+    use crate::oauth_store::{StoredClient, StoredDiscovery, StoredTokens};
+    use serde_json::json;
+
+    const KEY: &str = "personal https://x.test/mcp";
+
+    fn new_store() -> McpTokenStore {
+        McpTokenStore::new(crate::testutil::temp_dir("oauth").join("mcp-tokens.json"))
+    }
+
+    fn provider(
+        mode: ProviderMode,
+        port: Option<u16>,
+        oauth: Option<McpOAuthConfig>,
+        store: Option<McpTokenStore>,
+    ) -> McpOAuthProvider {
+        McpOAuthProvider::new(ProviderOptions {
+            store: store.unwrap_or_else(new_store),
+            key: KEY.into(),
+            server: "x".into(),
+            mode,
+            port,
+            oauth,
+            state: None,
+            on_authorize: None,
+            abort: None,
+        })
+    }
+
+    fn seen() -> (Authorize, Arc<Mutex<Vec<Url>>>) {
+        let seen = Arc::new(Mutex::new(vec![]));
+        let s = seen.clone();
+        (Arc::new(move |u| s.lock().unwrap().push(u)), seen)
+    }
+
+    fn tokens(v: serde_json::Value) -> StoredTokens {
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn redirect_url_is_loopback_and_the_metadata_a_public_client() {
+        let p = provider(ProviderMode::Interactive, Some(50214), None, None);
+        assert_eq!(p.redirect_url(), "http://127.0.0.1:50214/callback");
+        let meta = p.client_metadata();
+        assert_eq!(meta["client_name"], "Marv");
+        assert_eq!(meta["redirect_uris"], json!(["http://127.0.0.1:50214/callback"]));
+        assert_eq!(meta["grant_types"], json!(["authorization_code", "refresh_token"]));
+        assert_eq!(meta["response_types"], json!(["code"]));
+        assert_eq!(meta["token_endpoint_auth_method"], "none");
+        // Passive, with no port known: still defined.
+        assert_eq!(provider(ProviderMode::Passive, None, None, None).redirect_url(), "http://127.0.0.1/callback");
+    }
+
+    #[tokio::test]
+    async fn passive_never_redirects_or_registers() {
+        let store = new_store();
+        let p = provider(ProviderMode::Passive, None, None, Some(store.clone()));
+        let login_needed = |r: crate::Result<()>| matches!(r, Err(McpError::LoginNeeded(_)));
+        assert!(login_needed(p.redirect_to_authorization(Url::parse("https://as.test/authorize").unwrap())));
+        let client = StoredClient { client_id: "x".into(), port: None, rest: Default::default() };
+        assert!(login_needed(p.save_client_information(client).await));
+        assert!(store.get(KEY).is_none());
+    }
+
+    #[test]
+    fn interactive_hands_an_https_or_loopback_url_to_the_ui_and_refuses_anything_else() {
+        let (authorize, seen) = seen();
+        let mut p = provider(ProviderMode::Interactive, Some(1), None, None);
+        p.opts.on_authorize = Some(authorize);
+        p.redirect_to_authorization(Url::parse("https://as.test/authorize?x=1").unwrap()).unwrap();
+        p.redirect_to_authorization(Url::parse("http://127.0.0.1:4000/authorize").unwrap()).unwrap();
+        for bad in ["file:///etc/passwd", "http://evil.test/authorize", "javascript:alert(1)"] {
+            assert!(p.redirect_to_authorization(Url::parse(bad).unwrap()).is_err(), "{bad}");
+        }
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_registered_client_is_stored_with_its_port() {
+        let store = new_store();
+        let p = provider(ProviderMode::Interactive, Some(50214), None, Some(store.clone()));
+        let info: StoredClient =
+            serde_json::from_value(json!({"client_id": "dyn", "redirect_uris": ["http://127.0.0.1:50214/callback"]})).unwrap();
+        p.save_client_information(info.clone()).await.unwrap();
+        let stored = store.get(KEY).unwrap().client.unwrap();
+        assert_eq!((stored.client_id.as_str(), stored.port), ("dyn", Some(50214)));
+        assert_eq!(p.client_information(), Some(info));
+    }
+
+    #[tokio::test]
+    async fn a_configured_client_secret_and_port() {
+        let plain = provider(
+            ProviderMode::Passive,
+            None,
+            Some(McpOAuthConfig { client_id: Some("c".into()), ..Default::default() }),
+            None,
+        );
+        assert_eq!(serde_json::to_value(plain.client_information().unwrap()).unwrap(), json!({"client_id": "c"}));
+        let oauth = McpOAuthConfig {
+            client_id: Some("c".into()),
+            client_secret: Some("s".into()),
+            callback_port: Some(33418),
+            ..Default::default()
+        };
+        let store = new_store();
+        let secret = provider(ProviderMode::Interactive, Some(9), Some(oauth), Some(store.clone()));
+        assert_eq!(
+            serde_json::to_value(secret.client_information().unwrap()).unwrap(),
+            json!({"client_id": "c", "client_secret": "s", "token_endpoint_auth_method": "client_secret_post"})
+        );
+        assert_eq!(secret.redirect_url(), "http://127.0.0.1:33418/callback");
+        assert_eq!(secret.client_metadata()["token_endpoint_auth_method"], "client_secret_post");
+        // Saving it doesn't store the secret.
+        secret.save_client_information(secret.client_information().unwrap()).await.unwrap();
+        assert!(store.get(KEY).is_none());
+    }
+
+    #[test]
+    fn a_config_scope_overrides_the_scope_in_the_authorization_url() {
+        let (authorize, seen) = seen();
+        let oauth = McpOAuthConfig { scope: Some("repo read:org".into()), ..Default::default() };
+        let mut p = provider(ProviderMode::Interactive, Some(1), Some(oauth), None);
+        p.opts.on_authorize = Some(authorize.clone());
+        assert_eq!(p.client_metadata()["scope"], "repo read:org");
+        p.redirect_to_authorization(Url::parse("https://as.test/authorize?scope=everything&state=s").unwrap()).unwrap();
+        let mut q = provider(ProviderMode::Interactive, Some(1), None, None);
+        q.opts.on_authorize = Some(authorize);
+        q.redirect_to_authorization(Url::parse("https://as.test/authorize?scope=everything").unwrap()).unwrap();
+        let seen = seen.lock().unwrap();
+        let param = |u: &Url, k: &str| u.query_pairs().find(|(q, _)| q == k).map(|(_, v)| v.into_owned());
+        assert_eq!(param(&seen[0], "scope").as_deref(), Some("repo read:org"));
+        assert_eq!(param(&seen[0], "state").as_deref(), Some("s"));
+        assert_eq!(param(&seen[1], "scope").as_deref(), Some("everything"));
+        // offline_access asks for consent (a refresh token).
+        let (authorize, seen) = self::seen();
+        let mut r = provider(
+            ProviderMode::Interactive,
+            Some(1),
+            Some(McpOAuthConfig { scope: Some("a offline_access".into()), ..Default::default() }),
+            None,
+        );
+        r.opts.on_authorize = Some(authorize);
+        r.redirect_to_authorization(Url::parse("https://as.test/authorize").unwrap()).unwrap();
+        assert_eq!(param(&seen.lock().unwrap()[0], "prompt").as_deref(), Some("consent"));
+    }
+
+    #[tokio::test]
+    async fn tokens_rereads_the_store_and_save_tokens_records_when() {
+        let store = new_store();
+        let mut p = provider(ProviderMode::Passive, None, None, Some(store.clone()));
+        assert!(p.tokens().is_none());
+        store
+            .update(KEY, |_| {
+                let mut l = Login::new("x");
+                l.tokens = Some(tokens(json!({"access_token": "a1", "token_type": "Bearer", "refresh_token": "r1"})));
+                Ok(Some(l))
+            })
+            .await
+            .unwrap();
+        assert_eq!(p.tokens().unwrap().access_token, "a1");
+        let before = now_ms();
+        p.save_tokens(tokens(json!({"access_token": "a2", "token_type": "Bearer", "refresh_token": "r2", "expires_in": 60})))
+            .await
+            .unwrap();
+        let saved = store.get(KEY).unwrap();
+        assert_eq!(saved.tokens.unwrap().access_token, "a2");
+        assert!(saved.saved_at.unwrap() >= before);
+    }
+
+    async fn rotate(store: &McpTokenStore, refresh: &str) {
+        let refresh = refresh.to_string();
+        store
+            .update(KEY, move |e| {
+                let mut l = e.unwrap_or_else(|| Login::new("x"));
+                l.tokens = Some(tokens(json!({"access_token": "a", "token_type": "Bearer", "refresh_token": refresh})));
+                Ok(Some(l))
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalidating_tokens_keeps_a_refresh_token_another_process_saved_meanwhile() {
+        let store = new_store();
+        rotate(&store, "r1").await;
+        let mut p = provider(ProviderMode::Passive, None, None, Some(store.clone()));
+        assert_eq!(p.tokens().unwrap().refresh_token.as_deref(), Some("r1"));
+        // Another Marv refreshed (rotating r1 → r2) after this one read r1.
+        rotate(&store, "r2").await;
+        p.invalidate_credentials(Invalidate::Tokens).await.unwrap();
+        assert_eq!(p.tokens().unwrap().refresh_token.as_deref(), Some("r2"));
+        // Now r2 is the one that failed: it goes.
+        p.invalidate_credentials(Invalidate::Tokens).await.unwrap();
+        assert!(p.tokens().is_none());
+        assert_eq!(store.get(KEY).unwrap().server, "x");
+    }
+
+    #[tokio::test]
+    async fn the_stale_one_of_two_refreshes_keeps_the_newer_tokens() {
+        let store = new_store();
+        rotate(&store, "r1").await;
+        let mut p = provider(ProviderMode::Passive, None, None, Some(store.clone()));
+        p.tokens(); // both attempts read r1
+        p.save_tokens(tokens(json!({"access_token": "a2", "token_type": "Bearer", "refresh_token": "r2"}))).await.unwrap();
+        p.tokens(); // a request's header read r2 meanwhile
+        // The second attempt sent r1, which the server refused.
+        p.note_refused_refresh("r1".into());
+        p.invalidate_credentials(Invalidate::Tokens).await.unwrap();
+        assert_eq!(store.get(KEY).unwrap().tokens.unwrap().refresh_token.as_deref(), Some("r2"));
+    }
+
+    #[tokio::test]
+    async fn the_verifier_stays_in_memory_and_discovery_is_stored() {
+        let store = new_store();
+        let mut p = provider(ProviderMode::Interactive, Some(1), None, Some(store.clone()));
+        assert!(p.code_verifier().is_err());
+        p.save_code_verifier("v".into());
+        assert_eq!(p.code_verifier().unwrap(), "v");
+        let discovery = StoredDiscovery { authorization_server_url: "https://as.test/".into(), rest: Default::default() };
+        p.save_discovery_state(discovery.clone()).await.unwrap();
+        assert_eq!(provider(ProviderMode::Passive, None, None, Some(store.clone())).discovery_state(), Some(discovery));
+        assert!(!serde_json::to_string(&store.get(KEY)).unwrap().contains("\"v\""));
+    }
+
+    #[test]
+    fn state_is_random_and_stable_for_one_login() {
+        let p = provider(ProviderMode::Interactive, Some(1), None, None);
+        assert_eq!(p.state(), p.state());
+        assert_ne!(p.state(), provider(ProviderMode::Interactive, Some(1), None, None).state());
+        assert!(p.state().len() >= 40);
+        let (verifier, challenge) = pkce();
+        assert!(verifier.len() >= 43 && challenge.len() == 43 && verifier != challenge);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_login_saves_no_discovery_tokens_or_client() {
+        let store = new_store();
+        let abort = Abort::new();
+        let mut p = provider(ProviderMode::Interactive, Some(1), None, Some(store.clone()));
+        p.opts.abort = Some(abort.clone());
+        abort.abort("cancelled: /mcp logout");
+        let d = StoredDiscovery { authorization_server_url: "https://auth.example/".into(), rest: Default::default() };
+        assert_eq!(p.save_discovery_state(d).await.unwrap_err().to_string(), "cancelled: /mcp logout");
+        assert!(p.save_tokens(tokens(json!({"access_token": "a"}))).await.is_err());
+        assert!(
+            p.save_client_information(StoredClient { client_id: "c".into(), port: None, rest: Default::default() })
+                .await
+                .is_err()
+        );
+        assert!(store.get(KEY).is_none());
+    }
+
+    #[test]
+    fn the_resource_metadata_a_401_names() {
+        let h = r#"Bearer error="invalid_token", resource_metadata="https://x.test/.well-known/oauth-protected-resource/mcp""#;
+        assert_eq!(resource_metadata_of(h).unwrap().as_str(), "https://x.test/.well-known/oauth-protected-resource/mcp");
+        assert!(resource_metadata_of("Bearer").is_none());
+    }
+
+    #[tokio::test]
+    async fn the_outcome_is_the_first_valid_code_or_why_not() {
+        let at = |q: &str| Url::parse(&format!("http://127.0.0.1:1/callback?{q}")).unwrap();
+        let mut cb = CallbackExpectation::new("s3cret");
+        let outcome = cb.outcome();
+        assert_eq!(cb.check(&at("code=c&state=nope")), CallbackCheck::Refused { why: "state".into() });
+        assert_eq!(cb.check(&at("code=c")), CallbackCheck::Refused { why: "state".into() });
+        assert!(outcome.borrow().is_none());
+        assert_eq!(cb.check(&at("code=c&state=s3cret")), CallbackCheck::Ok { code: "c".into() });
+        assert_eq!(*outcome.borrow(), Some(Ok("c".into())));
+        let mut refused = CallbackExpectation::new("s3cret");
+        assert_eq!(
+            refused.check(&at("error=access_denied&state=s3cret")),
+            CallbackCheck::Refused { why: "access_denied".into() }
+        );
+        assert!(refused.outcome().borrow().clone().unwrap().unwrap_err().contains("access_denied"));
+        let mut cancelled = CallbackExpectation::new("s");
+        cancelled.cancel("cancelled: /mcp remove");
+        assert_eq!(cancelled.check(&at("code=c&state=s")), CallbackCheck::Refused { why: "used".into() });
+        assert_eq!(*cancelled.outcome().borrow(), Some(Err("cancelled: /mcp remove".into())));
+    }
+
+    #[tokio::test]
+    async fn the_listener_answers_the_browser_and_hands_over_the_code() {
+        let exp = Arc::new(Mutex::new(CallbackExpectation::new("st")));
+        let outcome = exp.lock().unwrap().outcome();
+        let e = exp.clone();
+        let listener = listen(Arc::new(move |u| e.lock().unwrap().check(u)), None).await.unwrap();
+        assert!(listener.port > 0 && !listener.fell_back);
+        let get = |path: &str| reqwest::get(format!("http://127.0.0.1:{}{path}", listener.port));
+        assert_eq!(get("/elsewhere").await.unwrap().status(), 404);
+        assert_eq!(get("/callback?code=x&state=other").await.unwrap().status(), 400);
+        let ok = get("/callback?code=good&state=st").await.unwrap();
+        assert_eq!(ok.status(), 200);
+        assert!(ok.text().await.unwrap().contains("You can close this tab"));
+        assert_eq!(*outcome.borrow(), Some(Ok("good".into())));
+        listener.close();
+    }
+
+    #[tokio::test]
+    async fn a_taken_preferred_port_falls_back_and_says_so() {
+        let busy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = busy.local_addr().unwrap().port();
+        let listener = listen(Arc::new(|_| CallbackCheck::Refused { why: "state".into() }), Some(port)).await.unwrap();
+        assert_ne!(listener.port, port);
+        assert!(listener.fell_back);
+    }
+
+    #[test]
+    fn open_browser_passes_the_url_as_one_argument_no_shell() {
+        let spawned = Mutex::new(vec![]);
+        let spawn = |argv: &[String]| spawned.lock().unwrap().push(argv.to_vec());
+        open_browser_with(&Url::parse("https://as.test/a?b=1&c=$(rm -rf ~)").unwrap(), "linux", &spawn);
+        open_browser_with(&Url::parse("https://as.test/").unwrap(), "macos", &spawn);
+        assert_eq!(
+            spawned.into_inner().unwrap(),
+            vec![
+                vec!["xdg-open".to_string(), "https://as.test/a?b=1&c=$(rm%20-rf%20~)".to_string()],
+                vec!["open".to_string(), "https://as.test/".to_string()],
+            ]
+        );
+    }
 }
