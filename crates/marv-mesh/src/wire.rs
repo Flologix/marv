@@ -20,10 +20,10 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::MeshError;
 use crate::limits::WireLimits;
 use crate::plug::PlugId;
 use crate::receptacle::ReceptacleName;
-use crate::MeshError;
 
 /// How a wire may be used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -161,7 +161,11 @@ impl WireTable {
 
     /// [`Self::find`], as the error the model reads when there's no wire.
     pub fn check(&self, from: &PlugId, receptacle: &ReceptacleName, mode: WireMode) -> crate::Result<&Wire> {
-        self.find(from, receptacle, mode).ok_or_else(|| MeshError::NotWired { from: from.to_string(), receptacle: receptacle.to_string(), mode })
+        self.find(from, receptacle, mode).ok_or_else(|| MeshError::NotWired {
+            from: from.to_string(),
+            receptacle: receptacle.to_string(),
+            mode,
+        })
     }
 
     /// Every usable wire from a plug (`mesh_list`, `tools/list`).
@@ -195,7 +199,10 @@ mod tests {
             assert!(!table.allows(&id("worker-1"), &name("agent.parent.inbox"), mode));
         }
         let err = table.check(&id("worker-1"), &name("agent.parent.inbox"), WireMode::Send).unwrap_err();
-        assert_eq!(err.to_string(), "not wired: worker-1 has no send wire to agent.parent.inbox (the user wires it: /mesh wire, or marv mesh wire)");
+        assert_eq!(
+            err.to_string(),
+            "not wired: worker-1 has no send wire to agent.parent.inbox (the user wires it: /mesh wire, or marv mesh wire)"
+        );
     }
 
     #[test]
@@ -229,7 +236,12 @@ mod tests {
         let mut table = WireTable::new();
         table.add(wire("parent", "mesh.remote.weather", WireMode::Call), None).unwrap();
         assert!(!table.allows(&id("parent"), &name("mesh.remote.weather"), WireMode::Call));
-        let both = Wire::new(id("parent"), name("mesh.remote.weather"), WireMode::Call, Grant { local: Approver::Cli, remote: Some(Approver::Tui) });
+        let both = Wire::new(
+            id("parent"),
+            name("mesh.remote.weather"),
+            WireMode::Call,
+            Grant { local: Approver::Cli, remote: Some(Approver::Tui) },
+        );
         table.add(both, None).unwrap();
         assert!(table.allows(&id("parent"), &name("mesh.remote.weather"), WireMode::Call));
         assert_eq!(table.all().len(), 1, "replaced, not duplicated");

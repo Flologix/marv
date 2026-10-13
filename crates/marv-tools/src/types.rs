@@ -416,7 +416,11 @@ impl<T: Tool> DynTool for T {
         Tool::name(self)
     }
     fn spec(&self) -> ToolSpec {
-        ToolSpec { name: Tool::name(self).to_string(), description: Tool::description(self).to_string(), parameters: Tool::schema(self) }
+        ToolSpec {
+            name: Tool::name(self).to_string(),
+            description: Tool::description(self).to_string(),
+            parameters: Tool::schema(self),
+        }
     }
     fn kind(&self) -> ToolKind {
         Tool::kind(self)

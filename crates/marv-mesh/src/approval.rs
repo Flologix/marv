@@ -6,10 +6,10 @@
 //! Yolo never wires anything. The approval shows the full request: who, to
 //! what, which mode, the limits.
 
+use crate::MeshError;
 use crate::plug::PlugId;
 use crate::receptacle::ReceptacleName;
 use crate::wire::{Approver, Grant, Wire, WireMode};
-use crate::MeshError;
 
 /// A wire someone wants: what the approval shows.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,7 +42,9 @@ pub fn parse_approve_flag(value: &str) -> Option<crate::Result<ReceptacleName>> 
 /// `marv mesh wire a -> b:inbox` / `a -> herdr.pane.send:call`: the arguments
 /// as (from, receptacle, mode). `b:inbox` is short for `agent.b.inbox` with mode `send`.
 pub fn parse_wire_spec(spec: &str) -> crate::Result<(PlugId, ReceptacleName, WireMode)> {
-    let usage = || MeshError::BadName(format!("\"{spec}\": write a wire as <agent> -> <receptacle>[:<mode>], e.g. worker-1 -> parent:inbox"));
+    let usage = || {
+        MeshError::BadName(format!("\"{spec}\": write a wire as <agent> -> <receptacle>[:<mode>], e.g. worker-1 -> parent:inbox"))
+    };
     let (from, to) = spec.split_once("->").ok_or_else(usage)?;
     let from = PlugId::new(from.trim())?;
     let to = to.trim();

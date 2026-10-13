@@ -54,7 +54,10 @@ pub struct AgentMeshBridge {
 impl AgentMeshBridge {
     pub fn new(config: BridgeConfig) -> crate::Result<Self> {
         if !endpoint_ok(&config.endpoint) {
-            return Err(crate::MeshError::BadName(format!("{}: the AgentMesh bridge only connects to a local agentmesh-node (127.0.0.1)", config.endpoint)));
+            return Err(crate::MeshError::BadName(format!(
+                "{}: the AgentMesh bridge only connects to a local agentmesh-node (127.0.0.1)",
+                config.endpoint
+            )));
         }
         Ok(Self { config })
     }

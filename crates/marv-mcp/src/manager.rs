@@ -151,7 +151,8 @@ pub fn cwd_for(config: &McpServerConfig, root: &Path, home: &Path) -> PathBuf {
 
 /// A stdio server's environment: [`SAFE_ENV`] from Marv's own, plus its `env`.
 pub fn server_env(outer: &crate::Env, own: &BTreeMap<String, String>) -> BTreeMap<String, String> {
-    let mut env: BTreeMap<String, String> = SAFE_ENV.iter().filter_map(|k| outer.get(*k).map(|v| (k.to_string(), v.clone()))).collect();
+    let mut env: BTreeMap<String, String> =
+        SAFE_ENV.iter().filter_map(|k| outer.get(*k).map(|v| (k.to_string(), v.clone()))).collect();
     env.extend(own.iter().map(|(k, v)| (k.clone(), v.clone())));
     env
 }
@@ -160,7 +161,9 @@ pub fn server_env(outer: &crate::Env, own: &BTreeMap<String, String>) -> BTreeMa
 pub fn state_error(name: &str, state: McpState, error: Option<&str>) -> crate::McpError {
     match state {
         McpState::NeedsLogin => LoginNeeded { server: name.into() }.into(),
-        McpState::Removed => crate::McpError::Server("the server was removed with /mcp remove (its tools go away in the next conversation)".into()),
+        McpState::Removed => {
+            crate::McpError::Server("the server was removed with /mcp remove (its tools go away in the next conversation)".into())
+        }
         McpState::Failed => crate::McpError::Server(format!("the server isn't available: {}", error.unwrap_or("it failed"))),
         _ => crate::McpError::Server("the server is reconnecting after a login: call it again in a moment.".into()),
     }
@@ -228,7 +231,15 @@ impl McpManager {
         // start your own servers a second time.
         let connections = servers
             .into_iter()
-            .map(|config| Connection { config, state: McpState::Connecting, tools: vec![], skipped: vec![], error: None, stderr: vec![], login: None })
+            .map(|config| Connection {
+                config,
+                state: McpState::Connecting,
+                tools: vec![],
+                skipped: vec![],
+                error: None,
+                stderr: vec![],
+                login: None,
+            })
             .collect();
         Self { opts, connections, tools: Arc::default(), specs: Arc::default(), settled: true, closed: false, pending: None }
     }
@@ -292,7 +303,9 @@ impl McpManager {
     }
 
     fn can_login(c: &Connection) -> bool {
-        matches!(c.config.transport, McpTransport::Http { .. }) && !own_authorization(&c.config.transport) && c.state != McpState::Removed
+        matches!(c.config.transport, McpTransport::Http { .. })
+            && !own_authorization(&c.config.transport)
+            && c.state != McpState::Removed
     }
 
     /// `/mcp login <name>`: refuses untrusted (before any network contact),
@@ -371,13 +384,19 @@ mod tests {
         let (root, home) = (Path::new("/p"), Path::new("/h"));
         assert_eq!(cwd_for(&server(ServerSource::Project, json!({"command": "node", "args": ["s.js"]})), root, home), root);
         assert_eq!(cwd_for(&server(ServerSource::Project, json!({"command": "npx", "args": ["-y", "pkg"]})), root, home), home);
-        assert_eq!(cwd_for(&server(ServerSource::Project, json!({"command": "/usr/bin/uvx", "args": ["pkg"]})), root, home), home);
+        assert_eq!(
+            cwd_for(&server(ServerSource::Project, json!({"command": "/usr/bin/uvx", "args": ["pkg"]})), root, home),
+            home
+        );
         assert_eq!(cwd_for(&server(ServerSource::Personal, json!({"command": "node"})), root, home), home);
     }
 
     #[test]
     fn stdio_servers_get_no_api_keys() {
-        let outer: crate::Env = [("PATH", "/bin"), ("OPENROUTER_API_KEY", "sk"), ("HOME", "/h")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let outer: crate::Env = [("PATH", "/bin"), ("OPENROUTER_API_KEY", "sk"), ("HOME", "/h")]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         let env = server_env(&outer, &[("TOKEN".to_string(), "t".to_string())].into());
         assert_eq!(env.keys().collect::<Vec<_>>(), vec!["HOME", "PATH", "TOKEN"]);
     }
@@ -406,7 +425,10 @@ mod tests {
 
     #[test]
     fn messages_in_marvs_words() {
-        assert_eq!(state_error("x", McpState::NeedsLogin, None).to_string(), "x needs a new login: the user can run /mcp login x");
+        assert_eq!(
+            state_error("x", McpState::NeedsLogin, None).to_string(),
+            "x needs a new login: the user can run /mcp login x"
+        );
         assert!(login_error("Incompatible auth server: does not support dynamic client registration").contains("oauth.clientId"));
     }
 }

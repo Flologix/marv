@@ -57,7 +57,8 @@ Keep names, paths, numbers and error messages exact. Write it as notes for yours
 pub const MID_TURN_NOTE: &str = "(Automatic note from Marv, the program running you) Your conversation was just compacted to save space in the middle of this task (everything before this point is summarized above). Continue where you left off.";
 
 /// What the history starts with after compacting.
-pub const COMPACTED_PREFIX: &str = "This conversation was compacted to save space. Here is a summary of everything before this point:\n\n";
+pub const COMPACTED_PREFIX: &str =
+    "This conversation was compacted to save space. Here is a summary of everything before this point:\n\n";
 /// The model's acknowledgement of the summary.
 pub const COMPACTED_ACK: &str = "Got it. I have the context from the summary and will continue from here.";
 
@@ -146,7 +147,8 @@ pub fn should_compact(prompt_tokens: u64, context_length: Option<u64>) -> bool {
 // ---- Compaction v2 (Marv #63, planned; spec first) ----
 
 /// #63: the structured summary's sections, in order (opencode's template). Relevant Files: ≤ 15.
-pub const V2_SECTIONS: [&str; 7] = ["Objective", "Requirements", "Decisions", "Work State", "Next Move", "Relevant Files", "Important Context"];
+pub const V2_SECTIONS: [&str; 7] =
+    ["Objective", "Requirements", "Decisions", "Work State", "Next Move", "Relevant Files", "Important Context"];
 /// #63: tokens of the newest history kept verbatim after the summary.
 pub const V2_TAIL_TOKENS: u64 = 15_000;
 /// #63: after an overflow, the window shares to compact down to, in turn.
@@ -177,7 +179,11 @@ mod tests {
             ChatTurn::User { text: "make the scroll smoother".into() },
             ChatTurn::Assistant {
                 text: "".into(),
-                tool_calls: vec![marv_core::ToolCall { id: "c1".into(), name: "read_file".into(), arguments: r#"{"path":"src/ui/ScrollView.tsx"}"#.into() }],
+                tool_calls: vec![marv_core::ToolCall {
+                    id: "c1".into(),
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"src/ui/ScrollView.tsx"}"#.into(),
+                }],
                 reasoning: None,
             },
             ChatTurn::Tool { call_id: "c1".into(), name: "read_file".into(), text: "…file contents…".into() },
@@ -189,8 +195,22 @@ mod tests {
         vec![ProviderEvent::TextDelta(text.into()), ProviderEvent::Done { reason: None }]
     }
 
-    async fn run(provider: &ScriptedProvider, history: &[ChatTurn], tools: &[ToolSpec], focus: Option<&str>) -> Result<String, String> {
-        summarize(SummarizeOptions { provider, history, system: "SYSTEM", tools, cancel: CancellationToken::new(), focus, on_usage: None }).await
+    async fn run(
+        provider: &ScriptedProvider,
+        history: &[ChatTurn],
+        tools: &[ToolSpec],
+        focus: Option<&str>,
+    ) -> Result<String, String> {
+        summarize(SummarizeOptions {
+            provider,
+            history,
+            system: "SYSTEM",
+            tools,
+            cancel: CancellationToken::new(),
+            focus,
+            on_usage: None,
+        })
+        .await
     }
 
     #[tokio::test]
@@ -222,7 +242,9 @@ mod tests {
     async fn passes_along_what_to_focus_on() {
         let model = ScriptedProvider::new(vec![say("ok")]);
         run(&model, &history(), &[], Some("the sandbox")).await.unwrap();
-        assert!(matches!(model.requests()[0].0.last(), Some(ChatTurn::User { text }) if text.contains("Focus especially on: the sandbox")));
+        assert!(
+            matches!(model.requests()[0].0.last(), Some(ChatTurn::User { text }) if text.contains("Focus especially on: the sandbox"))
+        );
     }
 
     #[tokio::test]

@@ -34,10 +34,13 @@ pub fn read(path: &Path) -> Result<Map<String, Value>, String> {
         Err(e) => return Err(format!("Couldn't read {}: {e}", path.display())),
     };
     let shown = path.display();
-    let data: Value = serde_json::from_str(&text).map_err(|_| format!("Couldn't read {shown} (it isn't valid JSON): fix it by hand first, Marv won't overwrite it."))?;
+    let data: Value = serde_json::from_str(&text)
+        .map_err(|_| format!("Couldn't read {shown} (it isn't valid JSON): fix it by hand first, Marv won't overwrite it."))?;
     match data {
         Value::Object(map) if map.get("mcpServers").is_none_or(Value::is_object) => Ok(map),
-        _ => Err(format!("Couldn't read {shown} (it should be {{\"mcpServers\": {{…}}}}): fix it by hand first, Marv won't overwrite it.")),
+        _ => Err(format!(
+            "Couldn't read {shown} (it should be {{\"mcpServers\": {{…}}}}): fix it by hand first, Marv won't overwrite it."
+        )),
     }
 }
 

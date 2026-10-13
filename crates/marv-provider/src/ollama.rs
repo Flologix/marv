@@ -55,7 +55,8 @@ pub const PROMPT_MARGIN: f64 = 1.05;
 pub const OFFLINE_HINT: &str = "Is Ollama running? Start it with `ollama serve`.";
 
 /// How Ollama says it couldn't parse the tool call a model wrote ("qwen tool call parsing failed: XML syntax error…").
-pub static UNPARSABLE_CALL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)tool call|pars(e|ing)|XML syntax|unexpected EOF").unwrap());
+pub static UNPARSABLE_CALL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)tool call|pars(e|ing)|XML syntax|unexpected EOF").unwrap());
 
 #[derive(Debug, Clone, Default)]
 pub struct OllamaOptions {
@@ -193,7 +194,10 @@ pub fn to_messages(history: &[ChatTurn], system: Option<&str>) -> Vec<WireMessag
             ChatTurn::Assistant { text, tool_calls, .. } => WireMessage::Assistant {
                 content: text.clone(),
                 tool_calls: (!tool_calls.is_empty()).then(|| {
-                    tool_calls.iter().map(|c| WireToolCall { function: WireFunction { name: c.name.clone(), arguments: parse(&c.arguments) } }).collect()
+                    tool_calls
+                        .iter()
+                        .map(|c| WireToolCall { function: WireFunction { name: c.name.clone(), arguments: parse(&c.arguments) } })
+                        .collect()
                 }),
             },
             ChatTurn::Tool { name, text, .. } => WireMessage::Tool { tool_name: name.clone(), content: text.clone() },
@@ -343,7 +347,13 @@ impl OllamaProvider {
     pub fn new(options: OllamaOptions) -> Self {
         let name = format!("ollama · {}", options.model);
         // Port note: no overall timeout (see the module notes); a connect timeout is fine.
-        Self { options, name, measured: Mutex::new(Measured::default()), showing: tokio::sync::Mutex::new(()), client: reqwest::Client::new() }
+        Self {
+            options,
+            name,
+            measured: Mutex::new(Measured::default()),
+            showing: tokio::sync::Mutex::new(()),
+            client: reqwest::Client::new(),
+        }
     }
 
     fn measured(&self) -> Measured {
@@ -440,7 +450,8 @@ mod tests {
     #[test]
     fn trained_context_reads_model_info() {
         let info: serde_json::Map<String, Value> =
-            serde_json::from_str(r#"{"general.architecture":"qwen3","qwen3.context_length":40960,"x.context_length":0}"#).unwrap();
+            serde_json::from_str(r#"{"general.architecture":"qwen3","qwen3.context_length":40960,"x.context_length":0}"#)
+                .unwrap();
         assert_eq!(trained_context(&info), Some(40960));
         assert_eq!(trained_context(&Default::default()), None);
     }

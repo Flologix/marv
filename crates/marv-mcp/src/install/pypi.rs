@@ -17,6 +17,11 @@ pub fn project_url(base: &str, name: &str, version: Option<&str>) -> String {
 }
 
 /// The proposal, plus the repository among `project_urls`, if one looks like it.
-pub async fn resolve_pypi(_name: &str, _version: Option<&str>, _opts: &ResolveOptions, _deps: &dyn ResolveDeps) -> crate::Result<(Proposal, Option<String>)> {
+pub async fn resolve_pypi(
+    _name: &str,
+    _version: Option<&str>,
+    _opts: &ResolveOptions,
+    _deps: &dyn ResolveDeps,
+) -> crate::Result<(Proposal, Option<String>)> {
     todo!("port: resolvePypi (JSON API, yanked check, facts, uvx pkg@ver + args)")
 }

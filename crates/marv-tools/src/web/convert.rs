@@ -21,6 +21,10 @@ pub const CONVERT_TIMEOUT_MS: u64 = 15_000;
 
 /// The page as Markdown, or its plain text if converting took too long or failed. Errors only if the run was stopped
 /// or the process couldn't start; either way the child has exited when this returns.
-pub async fn convert_html(_html: &str, _url: &str, _cancel: &tokio_util::sync::CancellationToken) -> Result<Markdown, crate::types::ToolError> {
+pub async fn convert_html(
+    _html: &str,
+    _url: &str,
+    _cancel: &tokio_util::sync::CancellationToken,
+) -> Result<Markdown, crate::types::ToolError> {
     todo!("port: convertHtml (spawn current_exe __html-convert, JSON over stdin/stdout, kill_on_drop, timeout → plain_text)")
 }

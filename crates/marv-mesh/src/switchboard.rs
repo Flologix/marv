@@ -27,12 +27,12 @@ use marv_mcp::jsonrpc::{Request, Response};
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::MeshError;
 use crate::limits::RateLimiter;
 use crate::message::Envelope;
 use crate::plug::{Plug, PlugId, Reachable};
 use crate::receptacle::{Receptacle, ReceptacleName};
 use crate::wire::{Wire, WireMode, WireTable};
-use crate::MeshError;
 
 /// What happened to one message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -148,9 +148,17 @@ impl Switchboard {
     }
 
     /// The policy check every message goes through (module docs), logged either way.
-    pub fn admit(&mut self, from: &PlugId, receptacle: &ReceptacleName, mode: WireMode, body: Value, now_ms: u64) -> crate::Result<Envelope> {
+    pub fn admit(
+        &mut self,
+        from: &PlugId,
+        receptacle: &ReceptacleName,
+        mode: WireMode,
+        body: Value,
+        now_ms: u64,
+    ) -> crate::Result<Envelope> {
         self.seq += 1;
-        let envelope = Envelope::new(format!("{}:{}", self.session, self.seq), from.clone(), receptacle.clone(), mode, body, now_ms);
+        let envelope =
+            Envelope::new(format!("{}:{}", self.session, self.seq), from.clone(), receptacle.clone(), mode, body, now_ms);
         let result = self.check(&envelope);
         self.trajectory.mesh(MeshRecord {
             at_ms: now_ms,
@@ -264,7 +272,10 @@ mod tests {
     fn agents_cant_wire_their_own_inbox() {
         let (mut sb, _) = board();
         let own = ReceptacleName::inbox(&id("worker-1"));
-        assert!(matches!(sb.wire(Wire::new(id("worker-1"), own, WireMode::Send, Grant::local(Approver::Cli))), Err(MeshError::SelfWire(_))));
+        assert!(matches!(
+            sb.wire(Wire::new(id("worker-1"), own, WireMode::Send, Grant::local(Approver::Cli))),
+            Err(MeshError::SelfWire(_))
+        ));
     }
 
     #[test]
@@ -274,9 +285,15 @@ mod tests {
         let mut w = Wire::new(id("worker-1"), inbox.clone(), WireMode::Send, Grant::local(Approver::Tui));
         w.limits = WireLimits { max_message_bytes: 8, per_minute: 1, burst: 1 };
         sb.wire(w).unwrap();
-        assert!(matches!(sb.admit(&id("worker-1"), &inbox, WireMode::Send, Value::from("x".repeat(20)), 0), Err(MeshError::TooLarge { .. })));
+        assert!(matches!(
+            sb.admit(&id("worker-1"), &inbox, WireMode::Send, Value::from("x".repeat(20)), 0),
+            Err(MeshError::TooLarge { .. })
+        ));
         sb.admit(&id("worker-1"), &inbox, WireMode::Send, Value::from("a"), 0).unwrap();
-        assert!(matches!(sb.admit(&id("worker-1"), &inbox, WireMode::Send, Value::from("b"), 1), Err(MeshError::RateLimited { .. })));
+        assert!(matches!(
+            sb.admit(&id("worker-1"), &inbox, WireMode::Send, Value::from("b"), 1),
+            Err(MeshError::RateLimited { .. })
+        ));
     }
 
     #[test]

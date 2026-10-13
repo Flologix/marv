@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use tokio::sync::watch;
 
 use crate::plug::PlugId;
@@ -70,7 +70,8 @@ pub struct HerdrTarget {
 pub fn herdr_target(env: &marv_mcp::Env) -> Option<HerdrTarget> {
     let socket_path = env.get("HERDR_SOCKET_PATH").filter(|s| !s.is_empty())?;
     let pane_id = env.get("HERDR_PANE_ID").filter(|s| !s.is_empty())?;
-    (env.get("HERDR_ENV").map(String::as_str) == Some("1")).then(|| HerdrTarget { socket_path: socket_path.clone(), pane_id: pane_id.clone() })
+    (env.get("HERDR_ENV").map(String::as_str) == Some("1"))
+        .then(|| HerdrTarget { socket_path: socket_path.clone(), pane_id: pane_id.clone() })
 }
 
 /// Sends one request; true once Herdr answered. Never fails.
@@ -132,7 +133,12 @@ impl HerdrReporter {
         let send = send.unwrap_or_else(|| Arc::new(SocketSender { socket_path: target.socket_path.clone() }));
         let now_us = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros() as u64);
         let (sending, _) = watch::channel(false);
-        Self { target, send, inner: Arc::new(Mutex::new(Inner { seq: now_us, session_ref: Map::new(), last: None, queued: None })), sending: Arc::new(sending) }
+        Self {
+            target,
+            send,
+            inner: Arc::new(Mutex::new(Inner { seq: now_us, session_ref: Map::new(), last: None, queued: None })),
+            sending: Arc::new(sending),
+        }
     }
 
     fn next_seq(inner: &mut Inner) -> u64 {
@@ -274,16 +280,22 @@ mod tests {
     #[test]
     fn target_needs_all_three_variables() {
         let env = |pairs: &[(&str, &str)]| pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<marv_mcp::Env>();
-        assert_eq!(herdr_target(&env(&[("HERDR_ENV", "1"), ("HERDR_SOCKET_PATH", "/s"), ("HERDR_PANE_ID", "p")]))
-            .map(|t| t.pane_id), Some("p".into()));
+        assert_eq!(
+            herdr_target(&env(&[("HERDR_ENV", "1"), ("HERDR_SOCKET_PATH", "/s"), ("HERDR_PANE_ID", "p")])).map(|t| t.pane_id),
+            Some("p".into())
+        );
         assert!(herdr_target(&env(&[("HERDR_ENV", "0"), ("HERDR_SOCKET_PATH", "/s"), ("HERDR_PANE_ID", "p")])).is_none());
         assert!(herdr_target(&env(&[("HERDR_ENV", "1"), ("HERDR_PANE_ID", "p")])).is_none());
     }
 
     #[test]
     fn requests_speak_herdrs_protocol() {
-        let r = build_request(&target(), "pane.report_agent", [("state".to_string(), Value::from("idle"))].into_iter().collect(), 7);
-        assert_eq!(r, json!({"id": "herdr:marv:7", "method": "pane.report_agent", "params": {"pane_id": "p1", "source": "herdr:marv", "agent": "marv", "seq": 7, "state": "idle"}}));
+        let r =
+            build_request(&target(), "pane.report_agent", [("state".to_string(), Value::from("idle"))].into_iter().collect(), 7);
+        assert_eq!(
+            r,
+            json!({"id": "herdr:marv:7", "method": "pane.report_agent", "params": {"pane_id": "p1", "source": "herdr:marv", "agent": "marv", "seq": 7, "state": "idle"}})
+        );
     }
 
     #[tokio::test]

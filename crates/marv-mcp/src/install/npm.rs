@@ -24,8 +24,15 @@ pub fn packument_url(base: &str, name: &str) -> String {
 }
 
 /// The proposal, plus the package's repository (for the GitHub resolver's check).
-pub async fn resolve_npm(_name: &str, _version: Option<&str>, _opts: &ResolveOptions, _deps: &dyn ResolveDeps) -> crate::Result<(Proposal, Option<String>)> {
-    todo!("port: resolveNpm (packument, dist-tags.latest or requested version, facts/warnings, npx -y pkg@ver + args, env_entries)")
+pub async fn resolve_npm(
+    _name: &str,
+    _version: Option<&str>,
+    _opts: &ResolveOptions,
+    _deps: &dyn ResolveDeps,
+) -> crate::Result<(Proposal, Option<String>)> {
+    todo!(
+        "port: resolveNpm (packument, dist-tags.latest or requested version, facts/warnings, npx -y pkg@ver + args, env_entries)"
+    )
 }
 
 #[cfg(test)]

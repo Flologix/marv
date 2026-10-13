@@ -17,7 +17,7 @@ pub mod registry;
 pub mod source;
 
 pub use proposal::{Choices, McpEntry, Proposal, ResolveDeps, ResolveOptions};
-pub use source::{parse_add_args, parse_source, server_name, AddOptions, Source};
+pub use source::{AddOptions, Source, parse_add_args, parse_source, server_name};
 
 /// A proposal, or the commands to choose from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,10 +44,16 @@ pub async fn with_login_fact(_proposal: Proposal, _deps: &dyn ResolveDeps) -> Pr
 pub fn fits(resolved: Resolved, options: &AddOptions) -> Result<Resolved, String> {
     let Resolved::Proposal(p) = &resolved else { return Ok(resolved) };
     if p.entry.is_remote() && (!options.env.is_empty() || !options.args.is_empty()) {
-        return Err(format!("{} is a remote server: --env and server arguments are for local servers; a remote one takes --header.", options.source));
+        return Err(format!(
+            "{} is a remote server: --env and server arguments are for local servers; a remote one takes --header.",
+            options.source
+        ));
     }
     if !p.entry.is_remote() && !options.headers.is_empty() {
-        return Err(format!("{} is a local server: --header is for remote (URL) servers; a local server reads its secrets from --env.", options.source));
+        return Err(format!(
+            "{} is a local server: --header is for remote (URL) servers; a local server reads its secrets from --env.",
+            options.source
+        ));
     }
     Ok(resolved)
 }

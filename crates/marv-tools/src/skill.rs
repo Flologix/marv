@@ -30,7 +30,9 @@ pub fn read_skill_file(skill: &Skill, file: &str) -> Result<String, ToolError> {
             let files = if skill.files.is_empty() { "none".to_string() } else { skill.files.join(", ") };
             ToolError(format!("The {} skill has no file \"{file}\". Its files: {files}.", skill.name))
         }
-        marv_sandbox::SandboxError::OutsideDir { .. } => ToolError(format!("\"{file}\" is outside the {} skill's folder.", skill.name)),
+        marv_sandbox::SandboxError::OutsideDir { .. } => {
+            ToolError(format!("\"{file}\" is outside the {} skill's folder.", skill.name))
+        }
         other => ToolError(other.to_string()),
     })?;
     if !crate::files::is_regular_file(&path) {
@@ -134,6 +136,9 @@ mod tests {
         let link = read_skill_file(&skill, "key").unwrap_err();
         assert!(link.0.contains("outside the pdf skill's folder"), "{}", link.0);
         assert!(!link.0.contains("PRIVATE"));
-        assert_eq!(read_skill_file(&skill, "missing.md").unwrap_err().0, "The pdf skill has no file \"missing.md\". Its files: reference.md.");
+        assert_eq!(
+            read_skill_file(&skill, "missing.md").unwrap_err().0,
+            "The pdf skill has no file \"missing.md\". Its files: reference.md."
+        );
     }
 }

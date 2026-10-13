@@ -98,17 +98,28 @@ pub enum ProviderEvent {
     ThinkingDelta(String),
     /// A piece of a tool call as it streams, for display only (a long write_file
     /// being written). The call itself still arrives whole as [`ProviderEvent::ToolCall`].
-    ToolCallDelta { index: usize, name: String, text: String },
+    ToolCallDelta {
+        index: usize,
+        name: String,
+        text: String,
+    },
     ToolCall(ToolCall),
     /// Opaque reasoning payload to keep on the assistant turn.
     Reasoning(Reasoning),
     Usage(Usage),
     /// `reason` is the vendor's stop reason: "stop", "tool_calls", "length"…
-    Done { reason: Option<String> },
+    Done {
+        reason: Option<String>,
+    },
     Error(String),
     /// The provider is retrying after a dropped connection. `continued`: the partial
     /// reply was kept and the next attempt continues it, instead of starting over (Marv #64).
-    Retry { attempt: u32, max: u32, message: String, continued: bool },
+    Retry {
+        attempt: u32,
+        max: u32,
+        message: String,
+        continued: bool,
+    },
 }
 
 /// Whether the model may call tools on a request. `None` is used for the
@@ -208,7 +219,10 @@ mod tests {
             reasoning: None,
         };
         let json = serde_json::to_string(&turn).unwrap();
-        assert_eq!(json, r#"{"role":"assistant","text":"hi","toolCalls":[{"id":"c1","name":"read_file","arguments":"{\"path\":\"a\"}"}]}"#);
+        assert_eq!(
+            json,
+            r#"{"role":"assistant","text":"hi","toolCalls":[{"id":"c1","name":"read_file","arguments":"{\"path\":\"a\"}"}]}"#
+        );
         assert_eq!(serde_json::from_str::<ChatTurn>(&json).unwrap(), turn);
     }
 

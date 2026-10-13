@@ -115,7 +115,9 @@ pub fn repair_project_path(root: &Path, path: &str) -> (String, RepairNote) {
     }
     (
         relative.to_string(),
-        Some(format!("Marv: the path was written with a leading slash ({path}): used {relative}, which is where the file is in this project.")),
+        Some(format!(
+            "Marv: the path was written with a leading slash ({path}): used {relative}, which is where the file is in this project."
+        )),
     )
 }
 
@@ -126,7 +128,10 @@ pub fn repair_timeout_seconds(timeout: f64, max_seconds: u64) -> (f64, RepairNot
     let max = max_seconds as f64;
     if timeout.fract() == 0.0 && timeout >= 1000.0 && timeout % 1000.0 == 0.0 && timeout > max {
         let seconds = (timeout / 1000.0).min(max);
-        return (seconds, Some(format!("Marv: the timeout was given in milliseconds ({timeout}): used {seconds} s. Give timeout in seconds.")));
+        return (
+            seconds,
+            Some(format!("Marv: the timeout was given in milliseconds ({timeout}): used {seconds} s. Give timeout in seconds.")),
+        );
     }
     (timeout, None)
 }
@@ -169,7 +174,9 @@ mod tests {
     fn raw_control_characters_inside_strings_are_escaped() {
         let saved = repair_json_args("{\"a\": \"x\ty\"}").unwrap();
         assert_eq!(saved.value, json!({"a": "x\ty"})); // the string's value is what the model meant
-        assert!(saved.note.unwrap().starts_with("Marv: the arguments contained 1 raw control character inside JSON strings (tab)"));
+        assert!(
+            saved.note.unwrap().starts_with("Marv: the arguments contained 1 raw control character inside JSON strings (tab)")
+        );
         let two = repair_json_args("{\"old\": \"\tconst a;\", \"new\": \"\tconst b;\"}").unwrap();
         assert!(two.note.unwrap().contains("2 raw control characters"));
     }
@@ -187,12 +194,20 @@ mod tests {
     #[test]
     fn a_millisecond_timeout_is_divided_and_capped() {
         assert_eq!(repair_timeout_seconds(100_000.0, 600).0, 100.0);
-        assert!(repair_timeout_seconds(100_000.0, 600).1.unwrap().contains("Marv: the timeout was given in milliseconds (100000): used 100 s"));
+        assert!(
+            repair_timeout_seconds(100_000.0, 600)
+                .1
+                .unwrap()
+                .contains("Marv: the timeout was given in milliseconds (100000): used 100 s")
+        );
         assert_eq!(repair_timeout_seconds(1000.0, 600).0, 1.0);
         assert_eq!(repair_timeout_seconds(900_000.0, 600).0, 600.0);
         assert_eq!(repair_timeout_seconds(750.0, 600), (750.0, None)); // could still be seconds
         assert_eq!(repair_timeout_seconds(2.0, 600), (2.0, None));
-        assert_eq!(repair_timeout_field(&json!({"command": "x", "timeout": 100000}), 600).unwrap().input, json!({"command": "x", "timeout": 100}));
+        assert_eq!(
+            repair_timeout_field(&json!({"command": "x", "timeout": 100000}), 600).unwrap().input,
+            json!({"command": "x", "timeout": 100})
+        );
     }
 
     #[test]
@@ -202,7 +217,10 @@ mod tests {
         std::fs::write(root.join("src/pagination.js"), "x").unwrap();
         let (path, note) = repair_project_path(&root, "/src/pagination.js");
         assert_eq!(path, "src/pagination.js");
-        assert!(note.unwrap().contains("Marv: the path was written with a leading slash (/src/pagination.js): used src/pagination.js"));
+        assert!(
+            note.unwrap()
+                .contains("Marv: the path was written with a leading slash (/src/pagination.js): used src/pagination.js")
+        );
         assert_eq!(repair_project_path(&root, "/etc/hosts").1, None); // exists as written
         assert_eq!(repair_project_path(&root, "/missing/thing.ts").1, None);
         assert_eq!(repair_project_path(&root, "/../secret.txt").1, None);

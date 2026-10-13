@@ -78,7 +78,9 @@ pub fn from_openrouter(data: Vec<OpenRouterModel>) -> Vec<ModelInfo> {
                 price_cache_read: pricing.input_cache_read.as_deref().and_then(|p| per_million(Some(p))),
                 context: m.context_length,
                 local: false,
-                reasoning: m.reasoning.map(|r| if r.mandatory == Some(true) { ReasoningSupport::Mandatory } else { ReasoningSupport::Optional }),
+                reasoning: m
+                    .reasoning
+                    .map(|r| if r.mandatory == Some(true) { ReasoningSupport::Mandatory } else { ReasoningSupport::Optional }),
                 id: m.id,
             }
         })

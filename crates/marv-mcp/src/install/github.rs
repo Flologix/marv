@@ -37,7 +37,12 @@ pub fn source_text(source: &Source) -> String {
     }
 }
 
-pub async fn resolve_github(_owner: &str, _repo: &str, _opts: &ResolveOptions, _deps: &dyn ResolveDeps) -> crate::Result<Result<Proposal, Choices>> {
+pub async fn resolve_github(
+    _owner: &str,
+    _repo: &str,
+    _opts: &ResolveOptions,
+    _deps: &dyn ResolveDeps,
+) -> crate::Result<Result<Proposal, Choices>> {
     todo!("port: resolveGithub")
 }
 

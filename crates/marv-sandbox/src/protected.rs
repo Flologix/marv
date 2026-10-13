@@ -53,14 +53,34 @@ pub struct ProtectedPath {
 pub const PROTECTED_PATHS: &[ProtectedPath] = &[
     ProtectedPath { rule: ProtectedRule::GitDir, pattern: ".git/", why: "git runs its hooks and config outside the sandbox" },
     ProtectedPath { rule: ProtectedRule::HooksPath, pattern: "core.hooksPath", why: "git runs these hooks outside the sandbox" },
-    ProtectedPath { rule: ProtectedRule::EnvFile, pattern: ".env*", why: "dotenv loaders read it in your shell, and it often holds secrets" },
+    ProtectedPath {
+        rule: ProtectedRule::EnvFile,
+        pattern: ".env*",
+        why: "dotenv loaders read it in your shell, and it often holds secrets",
+    },
     ProtectedPath { rule: ProtectedRule::Envrc, pattern: ".envrc", why: "direnv runs it in your shell" },
-    ProtectedPath { rule: ProtectedRule::Bunfig, pattern: "bunfig.toml", why: "bun runs its preload scripts for every bun command" },
-    ProtectedPath { rule: ProtectedRule::McpJson, pattern: ".mcp.json", why: "it names programs Marv starts outside the sandbox" },
-    ProtectedPath { rule: ProtectedRule::AgentInstructions, pattern: "AGENTS.md, CLAUDE.md", why: "every future session follows them" },
+    ProtectedPath {
+        rule: ProtectedRule::Bunfig,
+        pattern: "bunfig.toml",
+        why: "bun runs its preload scripts for every bun command",
+    },
+    ProtectedPath {
+        rule: ProtectedRule::McpJson,
+        pattern: ".mcp.json",
+        why: "it names programs Marv starts outside the sandbox",
+    },
+    ProtectedPath {
+        rule: ProtectedRule::AgentInstructions,
+        pattern: "AGENTS.md, CLAUDE.md",
+        why: "every future session follows them",
+    },
     ProtectedPath { rule: ProtectedRule::MarvDir, pattern: ".marv/**", why: "Marv's project config, skills, agents and checks" },
     ProtectedPath { rule: ProtectedRule::EditorConfig, pattern: ".vscode/, .idea/", why: "your editor runs its tasks" },
-    ProtectedPath { rule: ProtectedRule::PackageScripts, pattern: "package.json scripts", why: "install and lifecycle scripts run on your next install" },
+    ProtectedPath {
+        rule: ProtectedRule::PackageScripts,
+        pattern: "package.json scripts",
+        why: "install and lifecycle scripts run on your next install",
+    },
 ];
 
 impl ProtectedRule {
@@ -170,7 +190,9 @@ pub fn lifecycle_scripts_changed(before: Option<&str>, after: &str) -> bool {
     let scripts = |text: &str| -> Option<Vec<(String, serde_json::Value)>> {
         let value: serde_json::Value = serde_json::from_str(text).ok()?;
         let map = value.get("scripts").and_then(|s| s.as_object());
-        Some(LIFECYCLE_SCRIPTS.iter().filter_map(|k| map.and_then(|m| m.get(*k)).map(|v| ((*k).to_string(), v.clone()))).collect())
+        Some(
+            LIFECYCLE_SCRIPTS.iter().filter_map(|k| map.and_then(|m| m.get(*k)).map(|v| ((*k).to_string(), v.clone()))).collect(),
+        )
     };
     let Some(now) = scripts(after) else { return true };
     match before.map(scripts) {

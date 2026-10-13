@@ -143,7 +143,10 @@ mod tests {
         assert!(!looks_like_network_failure("cat ghost.txt", "No such file or directory"));
         assert!(!looks_like_network_failure("bun run build", "error: Could not resolve: './missing.ts'"));
         assert!(!looks_like_network_failure("ls src/gh", ""));
-        assert!(!looks_like_network_failure("npx tsc --noEmit", "src/a.ts(3,7): error TS2322: Type 'string' is not assignable to type 'number'."));
+        assert!(!looks_like_network_failure(
+            "npx tsc --noEmit",
+            "src/a.ts(3,7): error TS2322: Type 'string' is not assignable to type 'number'."
+        ));
         assert!(looks_like_network_failure("bunx cowsay hi", "error: getaddrinfo EAI_AGAIN registry.npmjs.org"));
     }
 }

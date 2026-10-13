@@ -169,7 +169,8 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
     }
     let no_one_to_ask = || noted(fail(format!("{} needs the user's approval, and there's no one to ask.", call.name), &label));
     let Some(approver) = &ctx.approver else { return no_one_to_ask() };
-    let scope = tool.scope(input).unwrap_or_else(|| crate::types::Scope { key: call.name.clone(), description: call.name.clone() });
+    let scope =
+        tool.scope(input).unwrap_or_else(|| crate::types::Scope { key: call.name.clone(), description: call.name.clone() });
     let request = ApprovalRequest {
         tool: call.name.clone(),
         label: label.clone(),
@@ -348,7 +349,10 @@ mod tests {
     #[test]
     fn builtin_specs_are_in_marvs_order_and_skill_is_optional() {
         let names: Vec<&str> = tool_specs().iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, ["read_file", "glob", "grep", "web_fetch", "skill", "edit_file", "write_file", "bash", "memory", "agent"]);
+        assert_eq!(
+            names,
+            ["read_file", "glob", "grep", "web_fetch", "skill", "edit_file", "write_file", "bash", "memory", "agent"]
+        );
         assert!(!tool_specs_for(false).iter().any(|s| s.name == "skill"));
         assert_eq!(tool_specs_for(true).len(), 10);
         let agent = ToolCall { id: "1".into(), name: "agent".into(), arguments: "{}".into() };

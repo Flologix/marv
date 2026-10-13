@@ -21,7 +21,8 @@ use crate::types::{ToolContext, ToolError};
 pub use marv_sandbox::paths::{project_path, refuse_git};
 
 /// Skipped when the project isn't a git repo (inside one, `.gitignore` decides).
-pub const IGNORED_DIRS: &[&str] = &[".git", "node_modules", "dist", "build", "out", "coverage", ".next", ".cache", "target", ".venv", "__pycache__"];
+pub const IGNORED_DIRS: &[&str] =
+    &[".git", "node_modules", "dist", "build", "out", "coverage", ".next", ".cache", "target", ".venv", "__pycache__"];
 
 /// Long enough for a big repository, short enough that a blocked git (a FIFO named `.gitignore`) gives up.
 pub const LIST_TIMEOUT: Duration = Duration::from_secs(20);
@@ -37,7 +38,11 @@ pub fn touches_git(ctx: &ToolContext, path: &str) -> bool {
 }
 
 /// Every file in the project, project-relative and sorted (`git ls-files`, or the walk outside a repo).
-pub async fn list_project_files(_root: &Path, _git_env: &[(String, String)], _timeout: Duration) -> Result<Vec<String>, ToolError> {
+pub async fn list_project_files(
+    _root: &Path,
+    _git_env: &[(String, String)],
+    _timeout: Duration,
+) -> Result<Vec<String>, ToolError> {
     todo!("port: listProjectFiles via runGit (marv-session's git module or a local run_git) with the walk fallback")
 }
 

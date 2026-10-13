@@ -22,6 +22,14 @@ async-trait.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
+# Project keys (`paths::project_key`): Marv's sha256 of the root, first 10 hex digits.
+sha2 = "0.10"
+# Pure helpers ported with their regexes (tool drafts, AGENTS.md headings, feedback).
+regex = "1.11"
+# YAML frontmatter (SKILL.md, agent files) and `.marv/checks/*.yaml`. Marv used `Bun.YAML`.
+serde_norway = "0.9"
+# The home folder (`shorten_home`, `home_or_above`, personal skills and agents).
+dirs = "6.0"
 
 [lints]
 workspace = true

@@ -33,9 +33,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
+use crate::McpError;
 use crate::config::{McpServerConfig, ServerSource};
 use crate::text::{sha256_hex, truncate};
-use crate::McpError;
 
 /// Tool names longer than this are rejected by OpenAI-compatible APIs.
 pub const MAX_NAME: usize = 64;
@@ -140,7 +140,11 @@ pub fn format_mcp_result(result: &McpCallResult) -> String {
             "text" => block.text.clone().unwrap_or_default(),
             "image" | "audio" => {
                 let kb = (block.data.as_ref().map_or(0, String::len) as f64 * 3.0 / 4.0 / 1024.0).round();
-                format!("[{} ({}), {kb} KB, not shown: Marv passes text only]", block.kind, block.mime_type.as_deref().unwrap_or("unknown type"))
+                format!(
+                    "[{} ({}), {kb} KB, not shown: Marv passes text only]",
+                    block.kind,
+                    block.mime_type.as_deref().unwrap_or("unknown type")
+                )
             }
             "resource" => {
                 let r = block.resource.clone().unwrap_or_default();
@@ -155,9 +159,10 @@ pub fn format_mcp_result(result: &McpCallResult) -> String {
         .collect();
     let mut text = parts.join("\n");
     if text.is_empty()
-        && let Some(s) = &result.structured_content {
-            text = serde_json::to_string_pretty(s).unwrap_or_default();
-        }
+        && let Some(s) = &result.structured_content
+    {
+        text = serde_json::to_string_pretty(s).unwrap_or_default();
+    }
     if text.is_empty() {
         text = "(no output)".into();
     }
@@ -189,7 +194,8 @@ pub fn acceptable_schema(schema: &Map<String, Value>) -> Value {
     let mut rest = schema.clone();
     rest.remove("$schema");
     let ty = rest.get("type");
-    let plain = (ty.is_none() || ty == Some(&Value::from("object"))) && !["anyOf", "oneOf", "allOf"].iter().any(|k| rest.contains_key(*k));
+    let plain = (ty.is_none() || ty == Some(&Value::from("object")))
+        && !["anyOf", "oneOf", "allOf"].iter().any(|k| rest.contains_key(*k));
     if !plain {
         return serde_json::json!({"type": "object", "properties": {}});
     }
@@ -278,7 +284,11 @@ impl McpTool {
         };
         let title = self.info.annotations.as_ref().and_then(|a| a.title.clone()).unwrap_or_else(|| self.info.name.clone());
         let whose = if self.source == ServerSource::Project { "this project's .mcp.json" } else { "yours" };
-        McpPreview { title: format!("{}: {title}", self.server), text, note: format!("MCP server \"{}\" ({whose}) · runs outside the sandbox", self.server) }
+        McpPreview {
+            title: format!("{}: {title}", self.server),
+            text,
+            note: format!("MCP server \"{}\" ({whose}) · runs outside the sandbox", self.server),
+        }
     }
 
     /// Runs the call. `Err` is the tool error text the model reads.
@@ -302,9 +312,14 @@ impl McpTool {
 pub fn make_mcp_tool(server: &McpServerConfig, info: McpToolInfo, caller: Arc<dyn McpCaller>) -> McpTool {
     let name = mcp_tool_name(&server.name, &info.name);
     let about = info.description.as_deref().unwrap_or("").trim();
-    let about = if about.chars().count() > MAX_DESCRIPTION { format!("{}…", about.chars().take(MAX_DESCRIPTION).collect::<String>()) } else { about.to_string() };
+    let about = if about.chars().count() > MAX_DESCRIPTION {
+        format!("{}…", about.chars().take(MAX_DESCRIPTION).collect::<String>())
+    } else {
+        about.to_string()
+    };
     let description = format!("(MCP server \"{}\") {about}", server.name).trim().to_string();
-    let spec = ToolSpec { name: name.clone(), description: description.clone(), parameters: acceptable_schema(&info.input_schema) };
+    let spec =
+        ToolSpec { name: name.clone(), description: description.clone(), parameters: acceptable_schema(&info.input_schema) };
     McpTool { name, description, spec, server: server.name.clone(), source: server.source, info, caller }
 }
 
@@ -328,14 +343,30 @@ mod tests {
         let r = McpCallResult {
             content: vec![
                 ContentBlock { kind: "text".into(), text: Some("hi".into()), ..Default::default() },
-                ContentBlock { kind: "image".into(), mime_type: Some("image/png".into()), data: Some("A".repeat(4096)), ..Default::default() },
-                ContentBlock { kind: "resource_link".into(), uri: Some("file:///a".into()), name: Some("a".into()), ..Default::default() },
+                ContentBlock {
+                    kind: "image".into(),
+                    mime_type: Some("image/png".into()),
+                    data: Some("A".repeat(4096)),
+                    ..Default::default()
+                },
+                ContentBlock {
+                    kind: "resource_link".into(),
+                    uri: Some("file:///a".into()),
+                    name: Some("a".into()),
+                    ..Default::default()
+                },
                 ContentBlock { kind: "weird".into(), ..Default::default() },
             ],
             ..Default::default()
         };
-        assert_eq!(format_mcp_result(&r), "hi\n[image (image/png), 3 KB, not shown: Marv passes text only]\n[link: file:///a (a)]\n[weird content, not shown]");
-        let big = McpCallResult { content: vec![ContentBlock { kind: "text".into(), text: Some("y".repeat(40_000)), ..Default::default() }], ..Default::default() };
+        assert_eq!(
+            format_mcp_result(&r),
+            "hi\n[image (image/png), 3 KB, not shown: Marv passes text only]\n[link: file:///a (a)]\n[weird content, not shown]"
+        );
+        let big = McpCallResult {
+            content: vec![ContentBlock { kind: "text".into(), text: Some("y".repeat(40_000)), ..Default::default() }],
+            ..Default::default()
+        };
         let out = format_mcp_result(&big);
         assert!(out.contains("(10000 characters omitted)"));
         assert_eq!(out.chars().filter(|&c| c == 'y').count(), MAX_OUTPUT);
@@ -349,7 +380,10 @@ mod tests {
         let s = |v: Value| acceptable_schema(v.as_object().unwrap());
         assert_eq!(s(json!({"$schema": "x", "type": "object"})), json!({"type": "object", "properties": {}}));
         assert_eq!(s(json!({"anyOf": [{}]})), json!({"type": "object", "properties": {}}));
-        assert_eq!(s(json!({"properties": {"a": {"type": "string"}}, "required": ["a"]})), json!({"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]}));
+        assert_eq!(
+            s(json!({"properties": {"a": {"type": "string"}}, "required": ["a"]})),
+            json!({"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]})
+        );
     }
 
     struct Never;
@@ -366,20 +400,33 @@ mod tests {
 
     #[test]
     fn read_only_hint_is_egress_once_tainted() {
-        let info = McpToolInfo { name: "get".into(), description: Some("Gets.".into()), input_schema: Map::new(), annotations: Some(McpToolAnnotations { read_only_hint: Some(true), title: None }) };
+        let info = McpToolInfo {
+            name: "get".into(),
+            description: Some("Gets.".into()),
+            input_schema: Map::new(),
+            annotations: Some(McpToolAnnotations { read_only_hint: Some(true), title: None }),
+        };
         let tool = make_mcp_tool(&server(), info, Arc::new(Never));
         assert_eq!(tool.kind(false), ToolKind::Read);
         assert_eq!(tool.kind(true), ToolKind::Egress);
         assert!(!tool.auto_safe());
         assert_eq!(tool.description, "(MCP server \"gh\") Gets.");
-        let plain = make_mcp_tool(&server(), McpToolInfo { name: "put".into(), description: None, input_schema: Map::new(), annotations: None }, Arc::new(Never));
+        let plain = make_mcp_tool(
+            &server(),
+            McpToolInfo { name: "put".into(), description: None, input_schema: Map::new(), annotations: None },
+            Arc::new(Never),
+        );
         assert_eq!(plain.kind(false), ToolKind::Execute);
         assert_eq!(plain.description, "(MCP server \"gh\")");
     }
 
     #[tokio::test]
     async fn login_needed_reaches_the_model_as_marvs_sentence() {
-        let tool = make_mcp_tool(&server(), McpToolInfo { name: "put".into(), description: None, input_schema: Map::new(), annotations: None }, Arc::new(Never));
+        let tool = make_mcp_tool(
+            &server(),
+            McpToolInfo { name: "put".into(), description: None, input_schema: Map::new(), annotations: None },
+            Arc::new(Never),
+        );
         let err = tool.run(Map::new(), CancellationToken::new()).await.unwrap_err();
         assert_eq!(err, "gh needs a new login: the user can run /mcp login gh");
     }
@@ -389,7 +436,11 @@ mod tests {
         let args = json!({"n": 3, "q": "x".repeat(80)});
         assert_eq!(label_of(args.as_object().unwrap()).chars().count(), 60);
         assert_eq!(label_of(json!({"n": 3}).as_object().unwrap()), "{\"n\":3}");
-        let tool = make_mcp_tool(&server(), McpToolInfo { name: "put".into(), description: None, input_schema: Map::new(), annotations: None }, Arc::new(Never));
+        let tool = make_mcp_tool(
+            &server(),
+            McpToolInfo { name: "put".into(), description: None, input_schema: Map::new(), annotations: None },
+            Arc::new(Never),
+        );
         let p = tool.preview(&Map::new());
         assert_eq!(p.text, None);
         assert_eq!(p.note, "MCP server \"gh\" (this project's .mcp.json) · runs outside the sandbox");

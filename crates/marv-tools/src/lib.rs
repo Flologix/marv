@@ -35,10 +35,12 @@ pub mod web;
 pub mod web_fetch;
 pub mod write_file;
 
-pub use registry::{DECLINED, INTERRUPTED, ToolOutcome, ToolRef, builtin_tools, is_parallel_call, run_tool, tool_specs, tool_specs_for};
+pub use registry::{
+    DECLINED, INTERRUPTED, ToolOutcome, ToolRef, builtin_tools, is_parallel_call, run_tool, tool_specs, tool_specs_for,
+};
 pub use types::{
-    AgentHost, AgentProgress, Approval, ApprovalRequest, Approver, BeforeChange, Decision, DiffKind, DiffLine, DiffShown, DynTool,
-    MemoryPaths, Preview, Repaired, Scope, Skill, Tool, ToolContext, ToolError, ToolOutput,
+    AgentHost, AgentProgress, Approval, ApprovalRequest, Approver, BeforeChange, Decision, DiffKind, DiffLine, DiffShown,
+    DynTool, MemoryPaths, Preview, Repaired, Scope, Skill, Tool, ToolContext, ToolError, ToolOutput,
 };
 
 #[cfg(test)]

@@ -71,8 +71,14 @@ pub fn is_private_address(address: &str) -> bool {
 }
 
 /// Refuses a URL web_fetch mustn't fetch: anything but http(s), or a host that is, or resolves to, a private address.
-pub async fn check_address(_url: &url::Url, _allow_private: bool, _cancel: &tokio_util::sync::CancellationToken) -> Result<(), ToolError> {
-    todo!("port: checkAddress: scheme check, localhost shortcut, tokio::net::lookup_host with DNS_TIMEOUT_MS and cancel, fail closed, the 'Refused: … a private address' message")
+pub async fn check_address(
+    _url: &url::Url,
+    _allow_private: bool,
+    _cancel: &tokio_util::sync::CancellationToken,
+) -> Result<(), ToolError> {
+    todo!(
+        "port: checkAddress: scheme check, localhost shortcut, tokio::net::lookup_host with DNS_TIMEOUT_MS and cancel, fail closed, the 'Refused: … a private address' message"
+    )
 }
 
 #[cfg(test)]
@@ -82,10 +88,39 @@ mod tests {
     #[test]
     fn private_addresses() {
         for ip in [
-            "127.0.0.1", "127.0.0.2", "10.0.0.1", "172.16.5.4", "172.31.255.255", "192.168.1.5", "169.254.169.254", "100.64.0.1", "0.0.0.0",
-            "224.0.0.1", "255.255.255.255", "::", "::1", "[::1]", "fe80::1", "fe80::1%eth0", "fc00::1", "fd12:3456::1", "ff02::1",
-            "::ffff:127.0.0.1", "::ffff:7f00:1", "::ffff:192.168.0.1", "64:ff9b::a00:1", "not an address", "192.0.0.1", "198.18.0.1",
-            "198.19.255.255", "64:ff9b:1::a00:1", "::ffff:0:8.8.8.8", "2002:7f00:1::", "2002:c0a8:101::", "fec0::1", "feff::1",
+            "127.0.0.1",
+            "127.0.0.2",
+            "10.0.0.1",
+            "172.16.5.4",
+            "172.31.255.255",
+            "192.168.1.5",
+            "169.254.169.254",
+            "100.64.0.1",
+            "0.0.0.0",
+            "224.0.0.1",
+            "255.255.255.255",
+            "::",
+            "::1",
+            "[::1]",
+            "fe80::1",
+            "fe80::1%eth0",
+            "fc00::1",
+            "fd12:3456::1",
+            "ff02::1",
+            "::ffff:127.0.0.1",
+            "::ffff:7f00:1",
+            "::ffff:192.168.0.1",
+            "64:ff9b::a00:1",
+            "not an address",
+            "192.0.0.1",
+            "198.18.0.1",
+            "198.19.255.255",
+            "64:ff9b:1::a00:1",
+            "::ffff:0:8.8.8.8",
+            "2002:7f00:1::",
+            "2002:c0a8:101::",
+            "fec0::1",
+            "feff::1",
         ] {
             assert!(is_private_address(ip), "{ip} is private");
         }
@@ -94,8 +129,20 @@ mod tests {
     #[test]
     fn public_addresses() {
         for ip in [
-            "93.184.215.14", "8.8.8.8", "172.32.0.1", "100.128.0.1", "2606:4700::6810:84e5", "::ffff:8.8.8.8", "172.15.255.255",
-            "100.63.255.255", "169.253.0.1", "223.255.255.255", "198.17.255.255", "198.20.0.1", "64:ff9b::808:808", "2002:808:808::",
+            "93.184.215.14",
+            "8.8.8.8",
+            "172.32.0.1",
+            "100.128.0.1",
+            "2606:4700::6810:84e5",
+            "::ffff:8.8.8.8",
+            "172.15.255.255",
+            "100.63.255.255",
+            "169.253.0.1",
+            "223.255.255.255",
+            "198.17.255.255",
+            "198.20.0.1",
+            "64:ff9b::808:808",
+            "2002:808:808::",
         ] {
             assert!(!is_private_address(ip), "{ip} is public");
         }

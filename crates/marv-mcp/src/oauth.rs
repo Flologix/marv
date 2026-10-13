@@ -222,9 +222,13 @@ impl McpOAuthProvider {
 /// The outcome of one callback address.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallbackCheck {
-    Ok { code: String },
+    Ok {
+        code: String,
+    },
     /// `path`, `state`, `used`, `no code`, or the server's short error code.
-    Refused { why: String },
+    Refused {
+        why: String,
+    },
 }
 
 /// Constant-time comparison (Marv: `timingSafeEqual`).
@@ -263,7 +267,8 @@ impl CallbackExpectation {
         self.used = true;
         if let Some(error) = param("error") {
             // The server's text goes to the screen only as a short code (access_denied, …).
-            let ok = !error.is_empty() && error.len() <= 64 && error.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b));
+            let ok =
+                !error.is_empty() && error.len() <= 64 && error.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b));
             let why = if ok { error } else { "error".into() };
             self.failure = Some(format!("the authorization server refused the login ({why})"));
             return CallbackCheck::Refused { why };
@@ -298,13 +303,19 @@ pub fn is_callback(text: &str) -> bool {
 /// What the browser is shown: (status, html). Nothing from the request is echoed.
 pub fn callback_page(check: &CallbackCheck) -> (u16, String) {
     let page = |title: &str, text: &str| {
-        format!("<!doctype html><meta charset=\"utf-8\"><title>Marv: {title}</title><body style=\"font-family:sans-serif;margin:3em\"><h1>{title}</h1><p>{text}</p>")
+        format!(
+            "<!doctype html><meta charset=\"utf-8\"><title>Marv: {title}</title><body style=\"font-family:sans-serif;margin:3em\"><h1>{title}</h1><p>{text}</p>"
+        )
     };
     match check {
         CallbackCheck::Ok { .. } => (200, page("Logged in", "You can close this tab and go back to Marv.")),
         CallbackCheck::Refused { why } if why == "path" => (404, "Not found".into()),
-        CallbackCheck::Refused { why } if why == "state" || why == "used" => (400, page("Not this login", "This isn't the login Marv is waiting for.")),
-        CallbackCheck::Refused { .. } => (400, page("Login failed", "The login was refused. Marv says why; you can close this tab.")),
+        CallbackCheck::Refused { why } if why == "state" || why == "used" => {
+            (400, page("Not this login", "This isn't the login Marv is waiting for."))
+        }
+        CallbackCheck::Refused { .. } => {
+            (400, page("Login failed", "The login was refused. Marv says why; you can close this tab."))
+        }
     }
 }
 

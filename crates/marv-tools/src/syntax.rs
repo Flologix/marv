@@ -33,7 +33,9 @@ pub struct SyntaxProblem {
 /// JSON files that may have comments and trailing commas (JSONC), which a JSON parser rejects.
 pub fn is_jsonc(path: &str) -> bool {
     let base = Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let config = ["tsconfig", "jsconfig"].iter().any(|stem| base == format!("{stem}.json") || (base.starts_with(&format!("{stem}.")) && base.ends_with(".json")));
+    let config = ["tsconfig", "jsconfig"]
+        .iter()
+        .any(|stem| base == format!("{stem}.json") || (base.starts_with(&format!("{stem}.")) && base.ends_with(".json")));
     config || path.ends_with(".jsonc") || path.starts_with(".vscode/") || path.contains("/.vscode/")
 }
 
@@ -68,7 +70,11 @@ pub fn syntax_note(shown: &str, problem: &SyntaxProblem, after: &str, existed: b
         .line
         .and_then(|n| after.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).nth(n - 1).map(|line| (n, line)))
         .map(|(n, line)| {
-            let shown_line = if line.chars().count() > 500 { format!("{}…", line.chars().take(500).collect::<String>()) } else { line.to_string() };
+            let shown_line = if line.chars().count() > 500 {
+                format!("{}…", line.chars().take(500).collect::<String>())
+            } else {
+                line.to_string()
+            };
             format!("\n{}", numbered_line(n, &shown_line))
         })
         .unwrap_or_default();
@@ -95,6 +101,9 @@ mod tests {
     fn the_note_quotes_the_broken_line() {
         let problem = SyntaxProblem { message: "Unexpected token".into(), line: Some(2), column: Some(5) };
         let note = syntax_note("a.ts", &problem, "ok\nbad (\n", true);
-        assert_eq!(note, "Marv: a.ts doesn't parse any more after this change: Unexpected token at line 2, column 5.\n    2→bad (\nFix it before going on (if you're sure the syntax is valid for this project, ignore this).");
+        assert_eq!(
+            note,
+            "Marv: a.ts doesn't parse any more after this change: Unexpected token at line 2, column 5.\n    2→bad (\nFix it before going on (if you're sure the syntax is valid for this project, ignore this)."
+        );
     }
 }

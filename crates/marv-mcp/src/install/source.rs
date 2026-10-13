@@ -72,7 +72,10 @@ fn version_ok(v: &str) -> bool {
 /// io.github.acme/weather: a reverse-DNS namespace, a slash, and a name.
 fn registry_name(text: &str) -> bool {
     let Some((ns, name)) = text.split_once('/') else { return false };
-    let ok = |s: &str, extra: &[u8]| s.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric) && s.bytes().all(|c| c.is_ascii_alphanumeric() || extra.contains(&c));
+    let ok = |s: &str, extra: &[u8]| {
+        s.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
+            && s.bytes().all(|c| c.is_ascii_alphanumeric() || extra.contains(&c))
+    };
     ok(ns, b".-") && ok(name, b"._-")
 }
 
@@ -132,9 +135,16 @@ fn loopback(url: &Url) -> bool {
 
 /// GitHub's owner and repository name rules (Marv: `parseGithub` in `tools/web/github.ts`).
 fn github_repo(owner: &str, repo: &str) -> bool {
-    let owner_ok = !owner.is_empty() && owner.len() <= 39 && !owner.starts_with('-') && owner.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-');
+    let owner_ok = !owner.is_empty()
+        && owner.len() <= 39
+        && !owner.starts_with('-')
+        && owner.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-');
     let repo = repo.strip_suffix(".git").unwrap_or(repo);
-    let repo_ok = !repo.is_empty() && repo != "." && repo != ".." && repo.len() <= 100 && repo.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c));
+    let repo_ok = !repo.is_empty()
+        && repo != "."
+        && repo != ".."
+        && repo.len() <= 100
+        && repo.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c));
     owner_ok && repo_ok
 }
 
@@ -281,7 +291,9 @@ pub fn parse_add_args(text: &str) -> Result<AddOptions, String> {
             "--name" => {
                 let name = value()?;
                 if !valid_server_name(&name) {
-                    return Err(format!("\"{name}\" can't be a server name: use letters, digits, - and _ (at most 32), without \"__\" or a trailing \"_\"."));
+                    return Err(format!(
+                        "\"{name}\" can't be a server name: use letters, digits, - and _ (at most 32), without \"__\" or a trailing \"_\"."
+                    ));
                 }
                 options.name = Some(name);
             }
@@ -318,7 +330,11 @@ pub fn parse_add_args(text: &str) -> Result<AddOptions, String> {
             w if w.starts_with("--") => return Err(format!("Unknown option {w}. Usage: {ADD_USAGE}")),
             w => match &source {
                 None => source = Some(w.to_string()),
-                Some(first) => return Err(format!("Only one source at a time (\"{first}\", then \"{w}\"); server arguments go after --. Usage: {ADD_USAGE}")),
+                Some(first) => {
+                    return Err(format!(
+                        "Only one source at a time (\"{first}\", then \"{w}\"); server arguments go after --. Usage: {ADD_USAGE}"
+                    ));
+                }
             },
         }
         i += 1;
@@ -339,10 +355,19 @@ mod tests {
     fn sources_in_order() {
         assert_eq!(parse_source("@scope/pkg@1.2.3").unwrap(), npm_src("@scope/pkg", Some("1.2.3")));
         assert_eq!(parse_source("npm:pkg").unwrap(), npm_src("pkg", None));
-        assert_eq!(parse_source("pypi:mcp-server-git@0.6.2").unwrap(), Source::Pypi { name: "mcp-server-git".into(), version: Some("0.6.2".into()) });
+        assert_eq!(
+            parse_source("pypi:mcp-server-git@0.6.2").unwrap(),
+            Source::Pypi { name: "mcp-server-git".into(), version: Some("0.6.2".into()) }
+        );
         assert_eq!(parse_source("io.github.acme/weather").unwrap(), Source::Registry { name: "io.github.acme/weather".into() });
-        assert_eq!(parse_source("https://github.com/acme/tool/tree/main").unwrap(), Source::Github { owner: "acme".into(), repo: "tool".into() });
-        assert_eq!(parse_source("https://mcp.example.com/mcp").unwrap(), Source::Http { url: "https://mcp.example.com/mcp".into() });
+        assert_eq!(
+            parse_source("https://github.com/acme/tool/tree/main").unwrap(),
+            Source::Github { owner: "acme".into(), repo: "tool".into() }
+        );
+        assert_eq!(
+            parse_source("https://mcp.example.com/mcp").unwrap(),
+            Source::Http { url: "https://mcp.example.com/mcp".into() }
+        );
         assert!(parse_source("http://127.0.0.2:3000/mcp").is_ok());
         assert!(parse_source("http://example.com/mcp").unwrap_err().starts_with("Use https"));
         for bad in ["UPPER", "a b/c d", "ftp://x/y", "http://github.com/a/b"] {

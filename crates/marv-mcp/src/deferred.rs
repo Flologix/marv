@@ -102,12 +102,14 @@ pub fn one_line(description: &str) -> String {
     let text = printable(description);
     let mut about = text.as_str();
     if let Some(rest) = about.strip_prefix("(MCP server \"")
-        && let Some(close) = rest.find("\")") {
-            about = rest[close + 2..].trim_start();
-        }
+        && let Some(close) = rest.find("\")")
+    {
+        about = rest[close + 2..].trim_start();
+    }
     let about = about.split_whitespace().collect::<Vec<_>>().join(" ");
     let chars: Vec<char> = about.chars().collect();
-    let end = (0..chars.len()).find(|&i| matches!(chars[i], '.' | '!' | '?') && chars.get(i + 1).is_none_or(|c| c.is_whitespace()));
+    let end =
+        (0..chars.len()).find(|&i| matches!(chars[i], '.' | '!' | '?') && chars.get(i + 1).is_none_or(|c| c.is_whitespace()));
     let sentence: String = match end {
         Some(i) => chars[..=i].iter().collect(),
         None => about,
@@ -155,7 +157,8 @@ pub struct ModeChoice {
 /// only when it saves at least half.
 pub fn choose_mode(setting: McpToolsSetting, specs: &[ToolSpec], context_length: Option<u64>) -> ModeChoice {
     let spec_tokens = estimate_tokens(&serde_json::to_string(specs).unwrap_or_default());
-    let deferred_tokens = estimate_tokens(&serde_json::to_string(&deferred_specs()).unwrap_or_default()) + estimate_tokens(&announcement(specs, &[]).unwrap_or_default());
+    let deferred_tokens = estimate_tokens(&serde_json::to_string(&deferred_specs()).unwrap_or_default())
+        + estimate_tokens(&announcement(specs, &[]).unwrap_or_default());
     let limit = context_length.map_or(DEFER_TOKENS, |c| DEFER_TOKENS.min(c as f64 * DEFER_SHARE));
     let defer = match setting {
         McpToolsSetting::Deferred => true,
@@ -187,7 +190,8 @@ pub fn search_tools<'a>(specs: &'a [ToolSpec], input: &SearchInput) -> (Vec<&'a 
         }
     }
     let query = input.query.as_deref().unwrap_or("").to_lowercase();
-    let words: Vec<&str> = query.split(|c: char| !c.is_ascii_lowercase() && !c.is_ascii_digit()).filter(|w| !w.is_empty()).collect();
+    let words: Vec<&str> =
+        query.split(|c: char| !c.is_ascii_lowercase() && !c.is_ascii_digit()).filter(|w| !w.is_empty()).collect();
     if !words.is_empty() {
         let mut scored: Vec<(usize, usize, &ToolSpec)> = specs
             .iter()
@@ -209,7 +213,12 @@ pub fn search_tools<'a>(specs: &'a [ToolSpec], input: &SearchInput) -> (Vec<&'a 
 /// `tool_search`'s output: one compact JSON line per spec (`readOnly` marked),
 /// then notes. Marks the found names as `loaded`. `read_only` says whether a
 /// tool is `readOnlyHint`.
-pub fn tool_search_output(specs: &[ToolSpec], input: &SearchInput, loaded: &mut HashSet<String>, read_only: &dyn Fn(&str) -> bool) -> (String, String) {
+pub fn tool_search_output(
+    specs: &[ToolSpec],
+    input: &SearchInput,
+    loaded: &mut HashSet<String>,
+    read_only: &dyn Fn(&str) -> bool,
+) -> (String, String) {
     let (found, unknown) = search_tools(specs, input);
     let mut lines: Vec<String> = Vec::new();
     for s in &found {
@@ -259,7 +268,10 @@ pub fn arguments_as_object(raw: &Value) -> Option<(Value, &'static str)> {
     }
     let mut out = raw.as_object()?.clone();
     out.insert("arguments".into(), parsed);
-    Some((Value::Object(out), "Marv: mcp_call's arguments came as a JSON string; it was read as the object inside. Pass arguments as an object."))
+    Some((
+        Value::Object(out),
+        "Marv: mcp_call's arguments came as a JSON string; it was read as the object inside. Pass arguments as an object.",
+    ))
 }
 
 /// Whether `text` is exactly one JSON object. Port note: Marv also accepted
@@ -285,7 +297,10 @@ pub fn as_mcp_call(call: &ToolCall, mcp_names: &HashSet<String>) -> Option<(Tool
     let name = Value::from(call.name.as_str()).to_string();
     Some((
         ToolCall { id: call.id.clone(), name: "mcp_call".into(), arguments: format!("{{\"tool\":{name},\"arguments\":{args}}}") },
-        format!("Marv: {} isn't offered as a tool of its own: it was run as mcp_call with tool \"{}\". Call MCP tools that way.", call.name, call.name),
+        format!(
+            "Marv: {} isn't offered as a tool of its own: it was run as mcp_call with tool \"{}\". Call MCP tools that way.",
+            call.name, call.name
+        ),
     ))
 }
 
@@ -318,7 +333,11 @@ mod tests {
         assert_eq!(choose_mode(McpToolsSetting::Auto, &few, None).mode, McpMode::Eager);
         assert_eq!(choose_mode(McpToolsSetting::Deferred, &few, None).mode, McpMode::Deferred);
         let big: Vec<ToolSpec> = (0..40)
-            .map(|i| ToolSpec { name: format!("mcp__s__t{i}"), description: "Does a thing.".into(), parameters: json!({"type": "object", "properties": {"x": {"type": "string", "description": "y".repeat(400)}}}) })
+            .map(|i| ToolSpec {
+                name: format!("mcp__s__t{i}"),
+                description: "Does a thing.".into(),
+                parameters: json!({"type": "object", "properties": {"x": {"type": "string", "description": "y".repeat(400)}}}),
+            })
             .collect();
         assert_eq!(choose_mode(McpToolsSetting::Auto, &big, None).mode, McpMode::Deferred);
         assert_eq!(choose_mode(McpToolsSetting::Eager, &big, None).mode, McpMode::Eager);
@@ -326,16 +345,27 @@ mod tests {
 
     #[test]
     fn search_finds_names_then_words() {
-        let specs = vec![spec("mcp__gh__issues", "List issues"), spec("mcp__gh__prs", "List pull requests"), spec("mcp__fs__read", "Read a file")];
-        let (found, unknown) = search_tools(&specs, &SearchInput { names: vec!["mcp__fs__read".into(), "nope".into()], query: Some("pull list".into()) });
+        let specs = vec![
+            spec("mcp__gh__issues", "List issues"),
+            spec("mcp__gh__prs", "List pull requests"),
+            spec("mcp__fs__read", "Read a file"),
+        ];
+        let (found, unknown) = search_tools(
+            &specs,
+            &SearchInput { names: vec!["mcp__fs__read".into(), "nope".into()], query: Some("pull list".into()) },
+        );
         let names: Vec<_> = found.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["mcp__fs__read", "mcp__gh__prs", "mcp__gh__issues"]);
         assert_eq!(unknown, vec!["nope"]);
         let mut loaded = HashSet::new();
-        let (out, summary) = tool_search_output(&specs, &SearchInput { names: vec!["mcp__gh__prs".into()], query: None }, &mut loaded, &|_| true);
+        let (out, summary) =
+            tool_search_output(&specs, &SearchInput { names: vec!["mcp__gh__prs".into()], query: None }, &mut loaded, &|_| true);
         assert!(out.contains("\"readOnly\":true") && loaded.contains("mcp__gh__prs"));
         assert_eq!(summary, "1 tool");
-        assert_eq!(unknown_tool_error(&specs, "mcp__gh__issue"), "No MCP tool is named \"mcp__gh__issue\". Closest: mcp__gh__issues, mcp__gh__prs.");
+        assert_eq!(
+            unknown_tool_error(&specs, "mcp__gh__issue"),
+            "No MCP tool is named \"mcp__gh__issue\". Closest: mcp__gh__issues, mcp__gh__prs."
+        );
     }
 
     #[test]

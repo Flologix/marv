@@ -1,0 +1,222 @@
+//! The command line. Ports the argument handling of Marv's `src/cli.tsx` (and `bin/marv`).
+//!
+//! ```text
+//! marv              start an interactive session
+//! marv -c / -r      continue the latest session here / pick one to resume
+//! marv -p <prompt>  one non-interactive turn (`-p -` reads stdin); `marv run <prompt>` is the same
+//! marv mesh ls      the live Marvs on this machine (mesh v2)
+//! marv mesh wire 'worker-1 -> parent:inbox'
+//! ```
+//!
+//! Port notes:
+//! - `bin/marv` existed only to rename the process from `bun` to `marv`; a native binary is already `marv`.
+//! - Marv parsed argv by hand (last `-p` wins, `--flag value` anywhere); clap gives the same flags. **Argument errors
+//!   exit 1** (Marv's code for a bad option), not clap's default 2, which `marv -p` uses for "stopped".
+//! - `--version`/`-v` and `--help`/`-h` exit 0, as in Marv.
+//! - `__html-convert` is hidden: the web reader re-executes `marv __html-convert` to convert a page in a process of
+//!   its own (a conversion that crashes is an answer, not a crash).
+
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
+
+pub const AFTER_HELP: &str = "Config:
+  ~/.marv/config.json   created by the setup screen (/setup to change it)
+  ~/.marv/sessions/     saved conversations, one folder per project
+  ~/.marv/trajectories/ every turn, step by step, with your ratings (/trajectories)
+  ~/.marv/agents/       your subagent types (a project's go in .marv/agents/)
+  ~/.marv/mcp.json      your MCP servers (a project's go in .mcp.json; /mcp)
+  ~/.marv/worktrees/    subagents' worktrees while they run
+  OPENROUTER_API_KEY    overrides the saved OpenRouter key
+  OLLAMA_HOST           where Ollama runs (default localhost:11434)
+  MARV_MODEL            overrides the saved model
+  MARV_MAX_STEPS        overrides the saved step limit (0 or off: never ask)
+  MARV_CONFIG_DIR       use a different config directory (read from the environment only)
+
+Exit codes for -p: 0 finished, 1 error, 2 stopped (step limit, output limit, loop), 3 an approval it couldn't get";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum OutputFormat {
+    /// The final reply as text (default).
+    Text,
+    /// A result object as JSON.
+    Json,
+    /// Each event as a JSON line.
+    StreamJson,
+}
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "marv",
+    about = "Marv: a terminal coding agent",
+    version,
+    disable_version_flag = true,
+    after_help = AFTER_HELP
+)]
+pub struct Cli {
+    /// Print the version.
+    #[arg(short = 'v', long = "version", action = ArgAction::Version)]
+    pub version: Option<bool>,
+
+    /// Run one non-interactive turn and print the reply (`-` reads the prompt from stdin).
+    #[arg(short = 'p', long = "prompt", value_name = "PROMPT", allow_hyphen_values = true)]
+    pub prompt: Option<String>,
+
+    /// How -p prints its result.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub output: OutputFormat,
+
+    /// Auto-approve a scope in -p (git_write, network, web, mcp, files, memory, agent_worktree, mesh:<receptacle>).
+    #[arg(long = "approve", value_name = "SCOPE")]
+    pub approve: Vec<String>,
+
+    /// Steps before the turn stops (0 never stops; default: your config's maxSteps).
+    #[arg(long = "max-steps", value_name = "N")]
+    pub max_steps: Option<u32>,
+
+    /// Use a different model.
+    #[arg(short = 'm', long)]
+    pub model: Option<String>,
+
+    /// Continue the latest session in this folder.
+    #[arg(short = 'c', long = "continue")]
+    pub continue_: bool,
+
+    /// Pick an earlier session to resume.
+    #[arg(short = 'r', long)]
+    pub resume: bool,
+
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Alias for -p: run one non-interactive turn (no prompt: read stdin).
+    Run {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        prompt: Vec<String>,
+    },
+    /// The mesh: wires between sandboxed agents.
+    #[command(subcommand)]
+    Mesh(MeshCommand),
+    /// Converts one web page: `{html, url}` JSON on stdin, the result on stdout (the web reader's own process).
+    #[command(name = "__html-convert", hide = true)]
+    HtmlConvert,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum MeshCommand {
+    /// List the live Marv switchboards on this machine.
+    Ls,
+    /// Wire a plug to a receptacle, e.g. `marv mesh wire 'worker-1 -> parent:inbox'`.
+    Wire {
+        /// `<agent> -> <receptacle>[:<mode>]`
+        #[arg(num_args = 1.., trailing_var_arg = true)]
+        spec: Vec<String>,
+    },
+}
+
+/// What the process should do, resolved from the arguments.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// The TUI. `resume`: `Some(true)` for -c (latest), `Some(false)` for -r (pick).
+    Interactive {
+        resume: Option<bool>,
+    },
+    /// `-p`/`run`. `prompt` is `-` for stdin.
+    Headless {
+        prompt: String,
+    },
+    MeshLs,
+    MeshWire {
+        spec: String,
+    },
+    HtmlConvert,
+}
+
+impl Cli {
+    /// `marv run <prompt>` is `marv -p <prompt>` (no prompt: stdin).
+    pub fn mode(&self) -> Mode {
+        match &self.command {
+            Some(Command::Run { prompt }) => {
+                Mode::Headless { prompt: if prompt.is_empty() { "-".into() } else { prompt.join(" ") } }
+            }
+            Some(Command::Mesh(MeshCommand::Ls)) => Mode::MeshLs,
+            Some(Command::Mesh(MeshCommand::Wire { spec })) => Mode::MeshWire { spec: spec.join(" ") },
+            Some(Command::HtmlConvert) => Mode::HtmlConvert,
+            None => match &self.prompt {
+                Some(prompt) => Mode::Headless { prompt: prompt.clone() },
+                None => Mode::Interactive {
+                    resume: if self.continue_ {
+                        Some(true)
+                    } else if self.resume {
+                        Some(false)
+                    } else {
+                        None
+                    },
+                },
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once("marv").chain(args.iter().copied())).unwrap()
+    }
+
+    #[test]
+    fn modes() {
+        assert_eq!(parse(&[]).mode(), Mode::Interactive { resume: None });
+        assert_eq!(parse(&["-c"]).mode(), Mode::Interactive { resume: Some(true) });
+        assert_eq!(parse(&["-r"]).mode(), Mode::Interactive { resume: Some(false) });
+        assert_eq!(parse(&["-p", "fix it"]).mode(), Mode::Headless { prompt: "fix it".into() });
+        assert_eq!(parse(&["-p", "-"]).mode(), Mode::Headless { prompt: "-".into() });
+        assert_eq!(parse(&["run", "fix", "it"]).mode(), Mode::Headless { prompt: "fix it".into() });
+        assert_eq!(parse(&["run"]).mode(), Mode::Headless { prompt: "-".into() });
+        assert_eq!(
+            parse(&["mesh", "wire", "worker-1", "->", "parent:inbox"]).mode(),
+            Mode::MeshWire { spec: "worker-1 -> parent:inbox".into() }
+        );
+        assert_eq!(parse(&["__html-convert"]).mode(), Mode::HtmlConvert);
+    }
+
+    #[test]
+    fn headless_flags() {
+        let cli = parse(&[
+            "-p",
+            "x",
+            "--output",
+            "stream-json",
+            "--approve",
+            "git_write",
+            "--approve",
+            "mesh:agent.parent.inbox",
+            "--max-steps",
+            "0",
+            "-m",
+            "m",
+            "-c",
+        ]);
+        assert_eq!(cli.output, OutputFormat::StreamJson);
+        assert_eq!(cli.approve, vec!["git_write", "mesh:agent.parent.inbox"]);
+        assert_eq!((cli.max_steps, cli.model.as_deref(), cli.continue_), (Some(0), Some("m"), true));
+    }
+
+    #[test]
+    fn bad_values_are_errors() {
+        let bad = |args: &[&str]| Cli::try_parse_from(std::iter::once("marv").chain(args.iter().copied())).is_err();
+        assert!(bad(&["-p", "x", "--output", "yaml"]));
+        assert!(bad(&["-p", "x", "--max-steps", "-1"]));
+        assert!(bad(&["-p", "x", "--max-steps", "2.5"]));
+        assert!(bad(&["-p"]));
+    }
+
+    #[test]
+    fn the_command_line_is_well_formed() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+    }
+}

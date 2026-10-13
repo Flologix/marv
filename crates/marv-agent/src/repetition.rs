@@ -269,13 +269,20 @@ mod tests {
 
     #[test]
     fn a_burst_at_the_end_of_a_long_reply_is_caught() {
-        let text = format!("{}{}", "Varied words go here and there. ".chars().cycle().take(10_000).collect::<String>().replace('.', ","), "Fix the test scripts now. ".repeat(10));
+        let text = format!(
+            "{}{}",
+            "Varied words go here and there. ".chars().cycle().take(10_000).collect::<String>().replace('.', ","),
+            "Fix the test scripts now. ".repeat(10)
+        );
         assert!(detect_text_repetition(&text));
     }
 
     #[test]
     fn parsed_json_arguments_are_normalized() {
-        assert_eq!(make_tool_key("read_file", r#"{"path": "a.ts"}"#), ToolCallKey { name: "read_file".into(), args: r#"{"path":"a.ts"}"#.into() });
+        assert_eq!(
+            make_tool_key("read_file", r#"{"path": "a.ts"}"#),
+            ToolCallKey { name: "read_file".into(), args: r#"{"path":"a.ts"}"#.into() }
+        );
     }
 
     #[test]
@@ -285,14 +292,20 @@ mod tests {
 
     #[test]
     fn differently_ordered_keys_are_normalized() {
-        assert_eq!(make_tool_key("read_file", r#"{"path": "a.ts", "offset": 1}"#), make_tool_key("read_file", r#"{"offset": 1, "path": "a.ts"}"#));
+        assert_eq!(
+            make_tool_key("read_file", r#"{"path": "a.ts", "offset": 1}"#),
+            make_tool_key("read_file", r#"{"offset": 1, "path": "a.ts"}"#)
+        );
     }
 
     #[test]
     fn nested_fields_count_and_key_order_at_any_depth_does_not() {
         let key = |args: &str| make_tool_key("q", args).args;
         assert_ne!(key(r#"{"filter":{"id":1}}"#), key(r#"{"filter":{"id":2}}"#));
-        assert_eq!(key(r#"{"a":1,"filter":{"x":1,"y":[{"b":2,"a":1}]}}"#), key(r#"{"filter":{"y":[{"a":1,"b":2}],"x":1},"a":1}"#));
+        assert_eq!(
+            key(r#"{"a":1,"filter":{"x":1,"y":[{"b":2,"a":1}]}}"#),
+            key(r#"{"filter":{"y":[{"a":1,"b":2}],"x":1},"a":1}"#)
+        );
     }
 
     fn read(args: &str) -> ToolCallKey {

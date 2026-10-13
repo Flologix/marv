@@ -19,8 +19,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::receptacle::{valid_segment, ReceptacleName};
 use crate::MeshError;
+use crate::receptacle::{ReceptacleName, valid_segment};
 
 /// Where a sandboxed agent finds its plug.
 pub const SANDBOX_SOCKET: &str = "/run/marv/mesh.sock";

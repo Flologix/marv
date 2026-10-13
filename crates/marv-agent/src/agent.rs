@@ -75,11 +75,13 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use futures::Stream;
 use futures::future::BoxFuture;
-use marv_core::{ChatTurn, MarvError, Provenance, ProviderEvent, Reasoning, StopReason, ToolCall, ToolKind, ToolResult, ToolSpec, Usage};
+use marv_core::{
+    ChatTurn, MarvError, Provenance, ProviderEvent, Reasoning, StopReason, ToolCall, ToolKind, ToolResult, ToolSpec, Usage,
+};
 use marv_provider::Provider;
 use tokio_util::sync::CancellationToken;
 
-use crate::repetition::{detect_text_repetition, ToolLoopState};
+use crate::repetition::{ToolLoopState, detect_text_repetition};
 
 pub const DEFAULT_MAX_STEPS: u32 = 25;
 /// Subagents' own hard limit (Marv `SUBAGENT_MAX_STEPS`, in `src/subagent.ts`).
@@ -115,7 +117,9 @@ pub const TEXT_LOOP_NOTE: &str = "(Automatic note from Marv, the program running
 
 /// The result of each repeated call when tool calls repeat without progress.
 pub fn tool_loop_note(repeat_count: usize, _call_name: &str) -> String {
-    format!("Marv: you have made this exact call {repeat_count} times in a row and it returned the same result; use what it returned, or try something else.")
+    format!(
+        "Marv: you have made this exact call {repeat_count} times in a row and it returned the same result; use what it returned, or try something else."
+    )
 }
 
 /// Marv #59 (planned): the wrap-up request's note at a hard step limit.
@@ -319,29 +323,60 @@ pub enum LoopEvent {
     ThinkingDelta(String),
     Usage(Usage),
     /// One step's reply text is complete.
-    Assistant { text: String },
+    Assistant {
+        text: String,
+    },
     /// A piece of a tool call still streaming, for display only: nothing runs yet.
-    ToolCallDelta { index: usize, name: String, text: String },
-    ToolStart { call: ToolCall, label: String },
-    ToolEnd { call: ToolCall, run: ToolRun },
+    ToolCallDelta {
+        index: usize,
+        name: String,
+        text: String,
+    },
+    ToolStart {
+        call: ToolCall,
+        label: String,
+    },
+    ToolEnd {
+        call: ToolCall,
+        run: ToolRun,
+    },
     /// A call answered without running (after a no, an interrupt, a cut-off or a loop): no ToolStart came first.
-    ToolSkipped { call: ToolCall, output: String },
+    ToolSkipped {
+        call: ToolCall,
+        output: String,
+    },
     Error(String),
     /// It reached a multiple of `max_steps` and asked `on_limit` whether to keep going.
-    StepLimit { steps: u32, continued: bool },
-    EmptyReply { next: EmptyNext },
+    StepLimit {
+        steps: u32,
+        continued: bool,
+    },
+    EmptyReply {
+        next: EmptyNext,
+    },
     /// A reply hit the output limit: nothing in it ran. `continued`: the model was told and goes on.
-    CutOff { continued: bool },
+    CutOff {
+        continued: bool,
+    },
     /// The reply was stuck repeating one sentence and was dropped. `continued`: the model was told.
-    TextLoop { continued: bool },
+    TextLoop {
+        continued: bool,
+    },
     /// The same tool calls repeated without progress: the model was told (once), or the run stopped.
-    ToolLoop { continued: bool },
+    ToolLoop {
+        continued: bool,
+    },
     /// A mid-run compaction swapped the history for the summary (`on_full`).
     Compacted,
     Done(StopReason),
     /// The connection was lost and the provider is retrying. `continued` (#64): the partial reply
     /// was kept and the model asked to continue, instead of starting over.
-    Retry { attempt: u32, max: u32, message: String, continued: bool },
+    Retry {
+        attempt: u32,
+        max: u32,
+        message: String,
+        continued: bool,
+    },
 }
 
 /// `on_limit`'s answer.
@@ -407,7 +442,14 @@ pub struct AgentOptions {
 
 impl AgentOptions {
     /// Options with Marv's defaults: 25 steps, 4 in parallel, no hooks.
-    pub fn new(provider: Arc<dyn Provider>, history: History, system: String, tools: Vec<ToolSpec>, runner: Arc<dyn ToolRunner>, cancel: CancellationToken) -> Self {
+    pub fn new(
+        provider: Arc<dyn Provider>,
+        history: History,
+        system: String,
+        tools: Vec<ToolSpec>,
+        runner: Arc<dyn ToolRunner>,
+        cancel: CancellationToken,
+    ) -> Self {
         Self {
             provider,
             history,
@@ -672,7 +714,10 @@ mod tests {
         assert_eq!(answered[..3], history[..]);
         assert!(matches!(&answered[3], ChatTurn::Tool { call_id, text, .. } if call_id == "c2" && text.contains("Interrupted")));
         assert_eq!(answered.len(), 4);
-        let done = vec![ChatTurn::User { text: "hi".into() }, ChatTurn::Assistant { text: "hello".into(), tool_calls: vec![], reasoning: None }];
+        let done = vec![
+            ChatTurn::User { text: "hi".into() },
+            ChatTurn::Assistant { text: "hello".into(), tool_calls: vec![], reasoning: None },
+        ];
         assert_eq!(answer_all_calls(&done), done);
     }
 
@@ -692,7 +737,11 @@ mod tests {
     #[test]
     fn labels_before_a_call_runs() {
         assert_eq!(label_of(&call("c", "src/app.ts")), "src/app.ts");
-        let agent = ToolCall { id: "c".into(), name: "agent".into(), arguments: r#"{"type":"explore","description":"Find the config"}"#.into() };
+        let agent = ToolCall {
+            id: "c".into(),
+            name: "agent".into(),
+            arguments: r#"{"type":"explore","description":"Find the config"}"#.into(),
+        };
         assert_eq!(label_of(&agent), "explore · Find the config");
         let untyped = ToolCall { arguments: r#"{"description":"x"}"#.into(), ..agent.clone() };
         assert_eq!(label_of(&untyped), "general-purpose · x");
@@ -707,7 +756,10 @@ mod tests {
             AgentArgs { prompt: "p".into(), kind: "explore".into(), description: "d".into(), isolation: Some("worktree".into()) }
         );
         for junk in ["null", "[]", "3", "nope"] {
-            assert_eq!(agent_args(junk), AgentArgs { prompt: "".into(), kind: "general-purpose".into(), description: "".into(), isolation: None });
+            assert_eq!(
+                agent_args(junk),
+                AgentArgs { prompt: "".into(), kind: "general-purpose".into(), description: "".into(), isolation: None }
+            );
         }
     }
 
@@ -732,7 +784,10 @@ mod tests {
 
     #[test]
     fn empty_replies_retry_then_nudge_then_stop() {
-        assert_eq!([0, 1, 2, 3].map(EmptyNext::for_count), [EmptyNext::Retry, EmptyNext::Nudge, EmptyNext::Stop, EmptyNext::Stop]);
+        assert_eq!(
+            [0, 1, 2, 3].map(EmptyNext::for_count),
+            [EmptyNext::Retry, EmptyNext::Nudge, EmptyNext::Stop, EmptyNext::Stop]
+        );
     }
 
     fn fold(events: Vec<ProviderEvent>) -> (StepReply, Vec<LoopEvent>) {
@@ -774,7 +829,12 @@ mod tests {
 
     #[test]
     fn outcomes_empty_error_cut_off_tools() {
-        let empty = fold(vec![ProviderEvent::ThinkingDelta("hm".into()), ProviderEvent::TextDelta("  ".into()), ProviderEvent::Done { reason: None }]).0;
+        let empty = fold(vec![
+            ProviderEvent::ThinkingDelta("hm".into()),
+            ProviderEvent::TextDelta("  ".into()),
+            ProviderEvent::Done { reason: None },
+        ])
+        .0;
         assert_eq!(empty.outcome(false), StepOutcome::Empty);
         assert_ne!(empty.outcome(true), StepOutcome::Empty, "not after an interrupt");
         assert_eq!(empty.assistant_turn(), Some(ChatTurn::Assistant { text: "  ".into(), tool_calls: vec![], reasoning: None }));
@@ -783,7 +843,8 @@ mod tests {
         let cut = fold(vec![ProviderEvent::ThinkingDelta("hm".into()), ProviderEvent::Done { reason: Some("length".into()) }]).0;
         assert_eq!(cut.outcome(false), StepOutcome::CutOff);
         assert_eq!(cut.cut_off_note(), CUT_OFF_REASONING_NOTE);
-        let tools = fold(vec![ProviderEvent::ToolCall(call("c", "a")), ProviderEvent::Done { reason: Some("tool_calls".into()) }]).0;
+        let tools =
+            fold(vec![ProviderEvent::ToolCall(call("c", "a")), ProviderEvent::Done { reason: Some("tool_calls".into()) }]).0;
         assert_eq!(tools.outcome(false), StepOutcome::Tools);
     }
 
@@ -791,7 +852,10 @@ mod tests {
     fn reasoning_is_kept_on_the_assistant_turn() {
         let reasoning = Reasoning(serde_json::json!([{"type": "reasoning.text"}]));
         let (reply, _) = fold(vec![ProviderEvent::TextDelta("ok".into()), ProviderEvent::Reasoning(reasoning.clone())]);
-        assert_eq!(reply.assistant_turn(), Some(ChatTurn::Assistant { text: "ok".into(), tool_calls: vec![], reasoning: Some(reasoning) }));
+        assert_eq!(
+            reply.assistant_turn(),
+            Some(ChatTurn::Assistant { text: "ok".into(), tool_calls: vec![], reasoning: Some(reasoning) })
+        );
     }
 
     #[test]
@@ -808,7 +872,14 @@ mod tests {
         }
         let history: History = Arc::new(Mutex::new(vec![]));
         let provider = Arc::new(crate::testing::ScriptedProvider::new(vec![]));
-        let mut state = LoopState::new(AgentOptions::new(provider, history.clone(), "S".into(), vec![], Arc::new(NoTools), CancellationToken::new()));
+        let mut state = LoopState::new(AgentOptions::new(
+            provider,
+            history.clone(),
+            "S".into(),
+            vec![],
+            Arc::new(NoTools),
+            CancellationToken::new(),
+        ));
         state.in_flight = InFlight { calls: vec![call("c1", "a"), call("c2", "b")], answered: 1 };
         drop(state);
         let history = history.lock().unwrap();

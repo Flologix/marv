@@ -23,9 +23,43 @@ pub const TREE_BYTES: usize = 16 * 1024 * 1024;
 pub const SLASH_HINT: &str = " If the branch name has a slash in it, the link is ambiguous: use the commit hash instead.";
 /// github.com/<these>/… are GitHub's own pages, not repositories.
 pub const NOT_OWNERS: &[&str] = &[
-    "about", "account", "apps", "codespaces", "collections", "copilot", "customer-stories", "dashboard", "enterprise", "events", "explore",
-    "features", "issues", "join", "login", "marketplace", "new", "notifications", "organizations", "orgs", "pricing", "pulls", "readme",
-    "resources", "search", "security", "settings", "signup", "site", "solutions", "sponsors", "stars", "team", "topics", "trending", "users", "watching",
+    "about",
+    "account",
+    "apps",
+    "codespaces",
+    "collections",
+    "copilot",
+    "customer-stories",
+    "dashboard",
+    "enterprise",
+    "events",
+    "explore",
+    "features",
+    "issues",
+    "join",
+    "login",
+    "marketplace",
+    "new",
+    "notifications",
+    "organizations",
+    "orgs",
+    "pricing",
+    "pulls",
+    "readme",
+    "resources",
+    "search",
+    "security",
+    "settings",
+    "signup",
+    "site",
+    "solutions",
+    "sponsors",
+    "stars",
+    "team",
+    "topics",
+    "trending",
+    "users",
+    "watching",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,7 +71,11 @@ pub enum GithubLink {
 
 /// A decoded path or folder segment we're willing to put in a URL.
 pub fn safe_segment(seg: &str) -> bool {
-    !seg.is_empty() && seg != "." && seg != ".." && !seg.contains('/') && !seg.chars().any(|c| (c as u32) < 0x20 || c as u32 == 0x7f)
+    !seg.is_empty()
+        && seg != "."
+        && seg != ".."
+        && !seg.contains('/')
+        && !seg.chars().any(|c| (c as u32) < 0x20 || c as u32 == 0x7f)
 }
 
 /// The repository, folder or file a github.com link points to; None for anything else (issues, PRs…).

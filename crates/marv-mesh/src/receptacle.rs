@@ -18,9 +18,9 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::MeshError;
 use crate::plug::PlugId;
 use crate::wire::WireMode;
-use crate::MeshError;
 
 /// Longest receptacle name.
 pub const MAX_NAME: usize = 128;

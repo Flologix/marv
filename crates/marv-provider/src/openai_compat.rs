@@ -40,7 +40,7 @@ use marv_core::{ChatTurn, ProviderEvent, ToolCall, ToolChoice, ToolSpec, Usage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::errors::{describe_error, ErrorHints, ErrorObject};
+use crate::errors::{ErrorHints, ErrorObject, describe_error};
 use crate::retry::RetryTiming;
 use crate::{EventStream, Provider, StreamOptions};
 
@@ -209,7 +209,8 @@ fn mark(message: &mut WireMessage) {
     if let WireContent::Text(t) = content {
         // An empty text part is rejected by Anthropic: leave such a message unmarked.
         if !t.is_empty() {
-            *content = WireContent::Parts(vec![WirePart { kind: "text", text: std::mem::take(t), cache_control: Some(EPHEMERAL) }]);
+            *content =
+                WireContent::Parts(vec![WirePart { kind: "text", text: std::mem::take(t), cache_control: Some(EPHEMERAL) }]);
         }
     }
 }
@@ -338,7 +339,14 @@ pub struct ReplyAssembler {
 
 impl ReplyAssembler {
     pub fn new(label: impl Into<String>) -> Self {
-        Self { label: label.into(), pending: BTreeMap::new(), reason: None, complete: false, reasoning: Vec::new(), text_received: false }
+        Self {
+            label: label.into(),
+            pending: BTreeMap::new(),
+            reason: None,
+            complete: false,
+            reasoning: Vec::new(),
+            text_received: false,
+        }
     }
 
     /// #64: a tool call is mid-stream (a drop now can't be continued).
@@ -384,7 +392,11 @@ impl ReplyAssembler {
         }
         for fragment in delta.tool_calls {
             let index = fragment.index.unwrap_or(self.pending.len());
-            let call = self.pending.entry(index).or_insert_with(|| ToolCall { id: String::new(), name: String::new(), arguments: String::new() });
+            let call = self.pending.entry(index).or_insert_with(|| ToolCall {
+                id: String::new(),
+                name: String::new(),
+                arguments: String::new(),
+            });
             let function = fragment.function.unwrap_or_default();
             // The first time a call's name is known, it's worth telling the screen even before any arguments.
             let named = call.name.is_empty() && function.name.as_deref().is_some_and(|n| !n.is_empty());
@@ -511,7 +523,9 @@ mod tests {
     fn breakpoints_mark_system_and_tail_and_keep_earlier_bytes() {
         let marked = to_messages(&history(), Some("SYS"), true);
         let s = json(&marked);
-        assert!(s.starts_with(r#"[{"role":"system","content":[{"type":"text","text":"SYS","cache_control":{"type":"ephemeral"}}]}"#));
+        assert!(
+            s.starts_with(r#"[{"role":"system","content":[{"type":"text","text":"SYS","cache_control":{"type":"ephemeral"}}]}"#)
+        );
         assert!(s.ends_with(r#"{"role":"tool","tool_call_id":"c1","content":[{"type":"text","text":"contents","cache_control":{"type":"ephemeral"}}]}]"#));
         // Everything between the breakpoints is byte-identical to the unmarked request.
         let plain = to_messages(&history(), Some("SYS"), false);
@@ -548,17 +562,29 @@ mod tests {
 
     #[test]
     fn streams_text_deltas_and_ends_with_done() {
-        let (events, result) = run(&[r#"{"choices":[{"delta":{"content":"Hel"}}]}"#, r#"{"choices":[{"delta":{"content":"lo"},"finish_reason":"stop"}]}"#, "[DONE]"]);
+        let (events, result) = run(&[
+            r#"{"choices":[{"delta":{"content":"Hel"}}]}"#,
+            r#"{"choices":[{"delta":{"content":"lo"},"finish_reason":"stop"}]}"#,
+            "[DONE]",
+        ]);
         assert_eq!(result, Ok(()));
         assert_eq!(
             events,
-            vec![ProviderEvent::TextDelta("Hel".into()), ProviderEvent::TextDelta("lo".into()), ProviderEvent::Done { reason: Some("stop".into()) }]
+            vec![
+                ProviderEvent::TextDelta("Hel".into()),
+                ProviderEvent::TextDelta("lo".into()),
+                ProviderEvent::Done { reason: Some("stop".into()) }
+            ]
         );
     }
 
     #[test]
     fn streams_reasoning_as_thinking_deltas_from_either_field_name() {
-        let (events, _) = run(&[r#"{"choices":[{"delta":{"reasoning":"a"}}]}"#, r#"{"choices":[{"delta":{"reasoning_content":"b"}}]}"#, "[DONE]"]);
+        let (events, _) = run(&[
+            r#"{"choices":[{"delta":{"reasoning":"a"}}]}"#,
+            r#"{"choices":[{"delta":{"reasoning_content":"b"}}]}"#,
+            "[DONE]",
+        ]);
         assert_eq!(events[..2], [ProviderEvent::ThinkingDelta("a".into()), ProviderEvent::ThinkingDelta("b".into())]);
     }
 
@@ -570,8 +596,12 @@ mod tests {
             r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":"}}]}}]}"#,
             r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"a.ts\"}"}}]},"finish_reason":"tool_calls"}]}"#,
         ]);
-        let calls: Vec<_> = events.iter().filter_map(|e| if let ProviderEvent::ToolCall(c) = e { Some(c.clone()) } else { None }).collect();
-        assert_eq!(calls, vec![call("c1", r#"{"path":"a.ts"}"#), ToolCall { id: "call_1".into(), name: "glob".into(), arguments: "{}".into() }]);
+        let calls: Vec<_> =
+            events.iter().filter_map(|e| if let ProviderEvent::ToolCall(c) = e { Some(c.clone()) } else { None }).collect();
+        assert_eq!(
+            calls,
+            vec![call("c1", r#"{"path":"a.ts"}"#), ToolCall { id: "call_1".into(), name: "glob".into(), arguments: "{}".into() }]
+        );
         // The name alone is shown at once; then each argument fragment.
         assert_eq!(events[0], ProviderEvent::ToolCallDelta { index: 0, name: "read_file".into(), text: "".into() });
         assert_eq!(events.last(), Some(&ProviderEvent::Done { reason: Some("tool_calls".into()) }));
@@ -579,8 +609,14 @@ mod tests {
 
     #[test]
     fn usage_with_cached_tokens_and_cost() {
-        let (events, _) = run(&[r#"{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":80},"cost":0.002}}"#, "[DONE]"]);
-        assert_eq!(events[0], ProviderEvent::Usage(Usage { prompt_tokens: 100, completion_tokens: 5, cached_tokens: Some(80), cost: Some(0.002) }));
+        let (events, _) = run(&[
+            r#"{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":80},"cost":0.002}}"#,
+            "[DONE]",
+        ]);
+        assert_eq!(
+            events[0],
+            ProviderEvent::Usage(Usage { prompt_tokens: 100, completion_tokens: 5, cached_tokens: Some(80), cost: Some(0.002) })
+        );
     }
 
     #[test]
@@ -589,7 +625,10 @@ mod tests {
             r#"{"choices":[{"delta":{"content":"partial"}}]}"#,
             r#"{"error":{"message":"Provider returned error","metadata":{"provider_name":"Anthropic","raw":"tool_use ids must be unique"}}}"#,
         ]);
-        assert_eq!(events.last(), Some(&ProviderEvent::Error("TestRouter: Provider returned error: Anthropic: tool_use ids must be unique".into())));
+        assert_eq!(
+            events.last(),
+            Some(&ProviderEvent::Error("TestRouter: Provider returned error: Anthropic: tool_use ids must be unique".into()))
+        );
     }
 
     #[test]
@@ -600,7 +639,8 @@ mod tests {
 
     #[test]
     fn reasoning_details_are_kept_for_the_assistant_turn() {
-        let (events, _) = run(&[r#"{"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.text","text":"hm"}]}}]}"#, "[DONE]"]);
+        let (events, _) =
+            run(&[r#"{"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.text","text":"hm"}]}}]}"#, "[DONE]"]);
         assert!(matches!(&events[0], ProviderEvent::Reasoning(r) if r.0[0]["text"] == "hm"));
     }
 }

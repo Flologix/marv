@@ -133,9 +133,11 @@ pub fn repo_of(url: Option<&str>) -> Option<String> {
         owned = s.to_string();
     }
     if let Some(idx) = owned.find("://")
-        && owned[..idx].bytes().all(|c| c.is_ascii_alphabetic() || c == b'+') && idx > 0 {
-            owned = owned[idx + 3..].to_string();
-        }
+        && owned[..idx].bytes().all(|c| c.is_ascii_alphabetic() || c == b'+')
+        && idx > 0
+    {
+        owned = owned[idx + 3..].to_string();
+    }
     let mut shown = owned.strip_prefix("www.").unwrap_or(&owned);
     shown = shown.strip_suffix(".git").unwrap_or(shown);
     let shown = shown.trim_end_matches('/');
@@ -178,7 +180,9 @@ pub fn approval_for(proposal: &Proposal, is_set: &dyn Fn(&str) -> bool) -> Resul
     let Proposal { name, entry, .. } = proposal;
     let json = serde_json::to_string(entry).expect("entries serialize");
     if printable(&json) != json || json.chars().any(is_bidi) {
-        return Err(format!("The entry for \"{name}\" contains control characters, so it can't be shown exactly as it would be written: not added."));
+        return Err(format!(
+            "The entry for \"{name}\" contains control characters, so it can't be shown exactly as it would be written: not added."
+        ));
     }
     let value = entry.to_value();
     let remote = entry.is_remote();
@@ -187,7 +191,11 @@ pub fn approval_for(proposal: &Proposal, is_set: &dyn Fn(&str) -> bool) -> Resul
         lines.insert(0, fact("url", &display_of(&value)));
     }
     for variable in reads_of(&value) {
-        let state = if is_set(&variable) { format!("{variable} (set)") } else { format!("{variable} (not set: it won't start until you set it and restart Marv)") };
+        let state = if is_set(&variable) {
+            format!("{variable} (set)")
+        } else {
+            format!("{variable} (not set: it won't start until you set it and restart Marv)")
+        };
         lines.push(fact("reads", &state));
     }
     lines.push(fact("writes", &format!("{}: {json}", serde_json::Value::from(name.as_str()))));
@@ -203,7 +211,8 @@ pub fn approval_for(proposal: &Proposal, is_set: &dyn Fn(&str) -> bool) -> Resul
         } else {
             "runs outside the sandbox, with your permissions and network, started in your home folder"
         },
-        warning: (!proposal.warnings.is_empty()).then(|| proposal.warnings.iter().map(|w| printable(w)).collect::<Vec<_>>().join("\n")),
+        warning: (!proposal.warnings.is_empty())
+            .then(|| proposal.warnings.iter().map(|w| printable(w)).collect::<Vec<_>>().join("\n")),
         scope_key: format!("mcp-add:{n}"),
         scope_description: format!("adding {name}"),
     };
@@ -218,15 +227,30 @@ pub fn added_notice(status: &McpServerStatus) -> (String, bool) {
             let n = status.tools.len();
             let s = if n == 1 { "" } else { "s" };
             let them = if n == 1 { "it" } else { "them" };
-            (format!("Added {} to {where_}: connected · {n} tool{s}. Marv can use {them} from your next message.", status.name), false)
+            (
+                format!(
+                    "Added {} to {where_}: connected · {n} tool{s}. Marv can use {them} from your next message.",
+                    status.name
+                ),
+                false,
+            )
         }
         McpState::NeedsLogin => (
-            format!("Added {} to {where_}. It needs a login: /mcp login {} (Marv can use its tools from your next message after that).", status.name, status.name),
+            format!(
+                "Added {} to {where_}. It needs a login: /mcp login {} (Marv can use its tools from your next message after that).",
+                status.name, status.name
+            ),
             false,
         ),
         _ => {
             let why = status.error.clone().unwrap_or_else(|| format!("{:?}", status.state).to_lowercase());
-            (format!("Added {} to {where_}, but it didn't start: {why} (see /mcp; fix the entry or /mcp remove {}).", status.name, status.name), true)
+            (
+                format!(
+                    "Added {} to {where_}, but it didn't start: {why} (see /mcp; fix the entry or /mcp remove {}).",
+                    status.name, status.name
+                ),
+                true,
+            )
         }
     }
 }
@@ -247,7 +271,11 @@ mod tests {
     fn the_approval_shows_exactly_what_is_written() {
         let p = Proposal {
             name: "w".into(),
-            entry: McpEntry::Stdio { command: "npx".into(), args: vec!["-y".into(), "w@1.0.0".into()], env: Some(env_entries(&["KEY".into()])) },
+            entry: McpEntry::Stdio {
+                command: "npx".into(),
+                args: vec!["-y".into(), "w@1.0.0".into()],
+                env: Some(env_entries(&["KEY".into()])),
+            },
             facts: vec![fact("npm", "w 1.0.0\n published")],
             warnings: vec![],
         };

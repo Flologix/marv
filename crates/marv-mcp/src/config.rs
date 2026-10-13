@@ -36,12 +36,12 @@
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
-use serde::de::{Deserializer, MapAccess, Visitor};
 use serde::Deserialize;
+use serde::de::{Deserializer, MapAccess, Visitor};
 use serde_json::Value;
 
-use crate::text::sha256_hex;
 use crate::Env;
+use crate::text::sha256_hex;
 
 /// The project's file, at its root.
 pub const PROJECT_FILE: &str = ".mcp.json";
@@ -275,13 +275,22 @@ fn parse_oauth(raw: &Value, lookup: &dyn Fn(&str) -> Option<String>) -> Result<M
     let Value::Object(map) = raw else { return Err("oauth must be an object".into()) };
     let mut o = McpOAuthConfig::default();
     for (key, value) in map {
-        let text = || value.as_str().filter(|s| !s.trim().is_empty()).map(str::to_string).ok_or_else(|| format!("oauth.{key} must be a non-empty string"));
+        let text = || {
+            value
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| format!("oauth.{key} must be a non-empty string"))
+        };
         match key.as_str() {
             "clientId" => o.client_id = Some(text()?),
             "clientSecret" => o.client_secret = Some(expand(&text()?, lookup)?),
             "scope" => o.scope = Some(text()?.trim().to_string()),
             "callbackPort" => {
-                let port = value.as_u64().filter(|p| (1024..=65535).contains(p)).ok_or("oauth.callbackPort must be a whole number from 1024 to 65535")?;
+                let port = value
+                    .as_u64()
+                    .filter(|p| (1024..=65535).contains(p))
+                    .ok_or("oauth.callbackPort must be a whole number from 1024 to 65535")?;
                 o.callback_port = Some(port as u16);
             }
             other => return Err(format!("oauth: unknown key \"{other}\"")),
@@ -296,7 +305,13 @@ fn canonical(raw: &Value) -> String {
 }
 
 /// One entry of an `mcpServers` map as a server. `where_` names the file in messages.
-pub fn parse_server(name: &str, raw: &Value, source: ServerSource, lookup: &dyn Fn(&str) -> Option<String>, where_: &str) -> Result<McpServerConfig, String> {
+pub fn parse_server(
+    name: &str,
+    raw: &Value,
+    source: ServerSource,
+    lookup: &dyn Fn(&str) -> Option<String>,
+    where_: &str,
+) -> Result<McpServerConfig, String> {
     if !name_chars_ok(name) {
         return Err(format!("\"{name}\" in {where_}: use letters, digits, - and _ (at most 32)"));
     }
@@ -325,11 +340,16 @@ pub fn parse_server(name: &str, raw: &Value, source: ServerSource, lookup: &dyn 
     };
     match kind {
         Some("http" | "streamable-http") => {
-            let url = map.get("url").and_then(Value::as_str).filter(|u| !u.is_empty()).ok_or_else(|| fail("url must be a non-empty string".into()))?;
+            let url = map
+                .get("url")
+                .and_then(Value::as_str)
+                .filter(|u| !u.is_empty())
+                .ok_or_else(|| fail("url must be a non-empty string".into()))?;
             let headers = str_map(map.get("headers"), "headers").map_err(fail)?;
             let oauth = map.get("oauth").map(|o| parse_oauth(o, lookup)).transpose().map_err(fail)?;
             let url = expand(url, lookup).map_err(fail)?;
-            let headers = headers.into_iter().map(|(k, v)| Ok((k, expand(&v, lookup)?))).collect::<Result<_, String>>().map_err(fail)?;
+            let headers =
+                headers.into_iter().map(|(k, v)| Ok((k, expand(&v, lookup)?))).collect::<Result<_, String>>().map_err(fail)?;
             Ok(base(McpTransport::Http { url, headers, oauth }))
         }
         None | Some("stdio") => {
@@ -337,10 +357,17 @@ pub fn parse_server(name: &str, raw: &Value, source: ServerSource, lookup: &dyn 
             if map.contains_key("oauth") {
                 return Err(fail("\"oauth\" is only for http servers (a login to a remote server)".into()));
             }
-            let command = map.get("command").and_then(Value::as_str).filter(|c| !c.is_empty()).ok_or_else(|| fail("command must be a non-empty string".into()))?;
+            let command = map
+                .get("command")
+                .and_then(Value::as_str)
+                .filter(|c| !c.is_empty())
+                .ok_or_else(|| fail("command must be a non-empty string".into()))?;
             let args = match map.get("args") {
                 None => Vec::new(),
-                Some(Value::Array(a)) => a.iter().map(|v| v.as_str().map(str::to_string).ok_or_else(|| fail("args must be strings".into()))).collect::<Result<_, _>>()?,
+                Some(Value::Array(a)) => a
+                    .iter()
+                    .map(|v| v.as_str().map(str::to_string).ok_or_else(|| fail("args must be strings".into())))
+                    .collect::<Result<_, _>>()?,
                 Some(_) => return Err(fail("args must be a list of strings".into())),
             };
             let env = str_map(map.get("env"), "env").map_err(fail)?;
@@ -438,7 +465,12 @@ struct FileShape {
     mcp_servers: Option<OrderedEntries>,
 }
 
-fn read_file(path: &Path, source: ServerSource, lookup: &dyn Fn(&str) -> Option<String>, problems: &mut Vec<String>) -> Vec<McpServerConfig> {
+fn read_file(
+    path: &Path,
+    source: ServerSource,
+    lookup: &dyn Fn(&str) -> Option<String>,
+    problems: &mut Vec<String>,
+) -> Vec<McpServerConfig> {
     let shown = path.display();
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
@@ -483,12 +515,21 @@ pub fn load_mcp_config(root: &Path, config_dir: &Path, env: &Env, include: Inclu
     let root_text = root.to_string_lossy().into_owned();
     let lookup = |name: &str| if name == PROJECT_DIR_VAR { Some(root_text.clone()) } else { env.get(name).cloned() };
     let project_path = root.join(PROJECT_FILE);
-    let project = if include.project { read_file(&project_path, ServerSource::Project, &lookup, &mut problems) } else { Vec::new() };
-    let personal = if include.personal { read_file(&config_dir.join(PERSONAL_FILE), ServerSource::Personal, &lookup, &mut problems) } else { Vec::new() };
+    let project =
+        if include.project { read_file(&project_path, ServerSource::Project, &lookup, &mut problems) } else { Vec::new() };
+    let personal = if include.personal {
+        read_file(&config_dir.join(PERSONAL_FILE), ServerSource::Personal, &lookup, &mut problems)
+    } else {
+        Vec::new()
+    };
     let mut servers = personal;
     for server in project {
         if servers.iter().any(|p| p.name == server.name) {
-            problems.push(format!("\"{}\" in {} was ignored: you have a server of your own with that name.", server.name, project_path.display()));
+            problems.push(format!(
+                "\"{}\" in {} was ignored: you have a server of your own with that name.",
+                server.name,
+                project_path.display()
+            ));
         } else {
             servers.push(server);
         }
@@ -562,14 +603,32 @@ mod tests {
     fn parses_stdio_and_http_and_refuses_sse() {
         let e = env(&[("T", "secret")]);
         let lookup = |n: &str| e.get(n).cloned();
-        let s = parse_server("files", &json!({"command": "npx", "args": ["-y", "pkg"], "env": {"K": "${T}"}}), ServerSource::Project, &lookup, "f").unwrap();
-        assert_eq!(s.transport, McpTransport::Stdio { command: "npx".into(), args: vec!["-y".into(), "pkg".into()], env: env(&[("K", "secret")]) });
+        let s = parse_server(
+            "files",
+            &json!({"command": "npx", "args": ["-y", "pkg"], "env": {"K": "${T}"}}),
+            ServerSource::Project,
+            &lookup,
+            "f",
+        )
+        .unwrap();
+        assert_eq!(
+            s.transport,
+            McpTransport::Stdio { command: "npx".into(), args: vec!["-y".into(), "pkg".into()], env: env(&[("K", "secret")]) }
+        );
         assert_eq!(s.display, "npx -y pkg · env K=${T}");
-        let h = parse_server("docs", &json!({"type": "http", "url": "https://x/mcp", "headers": {"Authorization": "Bearer ${T}"}}), ServerSource::Personal, &lookup, "f").unwrap();
+        let h = parse_server(
+            "docs",
+            &json!({"type": "http", "url": "https://x/mcp", "headers": {"Authorization": "Bearer ${T}"}}),
+            ServerSource::Personal,
+            &lookup,
+            "f",
+        )
+        .unwrap();
         assert!(matches!(&h.transport, McpTransport::Http { headers, .. } if headers["Authorization"] == "Bearer secret"));
         assert_eq!(h.display, "https://x/mcp · headers Authorization: Bearer ${T}");
         assert!(!h.display.contains("secret"));
-        let err = parse_server("old", &json!({"type": "sse", "url": "https://x"}), ServerSource::Personal, &lookup, "f").unwrap_err();
+        let err =
+            parse_server("old", &json!({"type": "sse", "url": "https://x"}), ServerSource::Personal, &lookup, "f").unwrap_err();
         assert!(err.contains("sse transport isn't supported"));
     }
 
@@ -582,7 +641,11 @@ mod tests {
         let McpTransport::Http { oauth: Some(o), .. } = &s.transport else { panic!() };
         assert_eq!(o.client_secret.as_deref(), Some("shh"));
         assert_eq!(s.display, "https://x · oauth client c, port 33418, scope repo");
-        for bad in [json!({"command": "x", "oauth": {}}), json!({"type": "http", "url": "u", "oauth": {"callbackPort": 80}}), json!({"type": "http", "url": "u", "oauth": {"what": 1}})] {
+        for bad in [
+            json!({"command": "x", "oauth": {}}),
+            json!({"type": "http", "url": "u", "oauth": {"callbackPort": 80}}),
+            json!({"type": "http", "url": "u", "oauth": {"what": 1}}),
+        ] {
             assert!(parse_server("x", &bad, ServerSource::Personal, &lookup, "f").is_err(), "{bad}");
         }
     }
@@ -592,7 +655,10 @@ mod tests {
         let root = temp("key");
         std::fs::create_dir_all(root.join("mcp")).unwrap();
         std::fs::write(root.join("mcp/server.js"), "v1").unwrap();
-        let file = |cmd: &str| std::fs::write(root.join(PROJECT_FILE), json!({"mcpServers": {"s": {"command": "node", "args": [cmd]}}}).to_string()).unwrap();
+        let file = |cmd: &str| {
+            std::fs::write(root.join(PROJECT_FILE), json!({"mcpServers": {"s": {"command": "node", "args": [cmd]}}}).to_string())
+                .unwrap()
+        };
         let load = || load_mcp_config(&root, &root.join("nohome"), &Env::new(), Include::default()).servers.remove(0);
         file("mcp/server.js");
         let first = load();
@@ -602,7 +668,10 @@ mod tests {
         assert_ne!(first.key, edited.key, "editing the script drops trust");
         file("../outside.js");
         assert!(load().runs_project_files.is_empty());
-        let (files, _) = project_files(&root, &McpTransport::Stdio { command: "node".into(), args: vec!["--import=./mcp/server.js".into()], env: BTreeMap::new() });
+        let (files, _) = project_files(
+            &root,
+            &McpTransport::Stdio { command: "node".into(), args: vec!["--import=./mcp/server.js".into()], env: BTreeMap::new() },
+        );
         assert_eq!(files, vec!["mcp/server.js"]);
     }
 
@@ -612,7 +681,8 @@ mod tests {
         let home = root.join("home");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::write(home.join(PERSONAL_FILE), r#"{"mcpServers": {"b": {"command": "x"}, "a": {"command": "y"}}}"#).unwrap();
-        std::fs::write(root.join(PROJECT_FILE), r#"{"mcpServers": {"a": {"command": "evil"}, "c": {"command": "${UNSET}"}}}"#).unwrap();
+        std::fs::write(root.join(PROJECT_FILE), r#"{"mcpServers": {"a": {"command": "evil"}, "c": {"command": "${UNSET}"}}}"#)
+            .unwrap();
         let loaded = load_mcp_config(&root, &home, &Env::new(), Include::default());
         let names: Vec<_> = loaded.servers.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["b", "a"], "file order, yours first");
@@ -625,7 +695,8 @@ mod tests {
     #[test]
     fn marv_project_dir_is_the_project() {
         let root = temp("pd");
-        std::fs::write(root.join(PROJECT_FILE), r#"{"mcpServers": {"p": {"command": "x", "args": ["${MARV_PROJECT_DIR}"]}}}"#).unwrap();
+        std::fs::write(root.join(PROJECT_FILE), r#"{"mcpServers": {"p": {"command": "x", "args": ["${MARV_PROJECT_DIR}"]}}}"#)
+            .unwrap();
         let s = load_mcp_config(&root, &root, &Env::new(), Include { personal: false, project: true }).servers.remove(0);
         assert!(matches!(s.transport, McpTransport::Stdio { ref args, .. } if args[0] == root.to_string_lossy()));
         assert!(s.reads.is_empty());

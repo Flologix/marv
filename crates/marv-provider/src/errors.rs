@@ -115,9 +115,7 @@ pub fn http_error(status: u16, detail: &str, label: &str, model: &str, hints: Er
 
 /// The server couldn't be reached at all. `hint`: e.g. "Is Ollama running? Start it with `ollama serve`."
 pub fn unreachable(label: &str, base_url: &str, err: &str, hint: Option<&str>) -> String {
-    let origin = reqwest::Url::parse(base_url)
-        .map(|u| u.origin().ascii_serialization())
-        .unwrap_or_else(|_| base_url.to_string());
+    let origin = reqwest::Url::parse(base_url).map(|u| u.origin().ascii_serialization()).unwrap_or_else(|_| base_url.to_string());
     let hint = hint.map(|h| format!(" {h}")).unwrap_or_default();
     format!("Can't reach {label} at {origin}.{hint} ({err})")
 }
@@ -147,9 +145,14 @@ mod tests {
 
     #[test]
     fn sdk_hints_name_the_option_to_change() {
-        assert!(http_error(401, "", "OpenRouter", "m", TUI_HINTS).starts_with("OpenRouter rejected the API key. Run /setup to enter a new one."));
-        assert!(http_error(401, "", "OpenRouter", "m", SDK_HINTS)
-            .starts_with("OpenRouter rejected the API key. Pass another provider.apiKey to createSession() or configure()."));
+        assert!(
+            http_error(401, "", "OpenRouter", "m", TUI_HINTS)
+                .starts_with("OpenRouter rejected the API key. Run /setup to enter a new one.")
+        );
+        assert!(
+            http_error(401, "", "OpenRouter", "m", SDK_HINTS)
+                .starts_with("OpenRouter rejected the API key. Pass another provider.apiKey to createSession() or configure().")
+        );
     }
 
     #[test]
@@ -173,7 +176,10 @@ mod tests {
     fn openrouter_wrapped_errors_keep_the_upstream_detail() {
         let err = ErrorObject {
             message: Some("Provider returned error".into()),
-            metadata: Some(ErrorMetadata { provider_name: Some("Anthropic".into()), raw: Some("tool_use ids must be unique".into()) }),
+            metadata: Some(ErrorMetadata {
+                provider_name: Some("Anthropic".into()),
+                raw: Some("tool_use ids must be unique".into()),
+            }),
         };
         assert_eq!(describe_error(&err), "Provider returned error: Anthropic: tool_use ids must be unique");
         assert_eq!(describe_error(&ErrorObject::default()), "unknown error");

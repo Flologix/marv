@@ -36,7 +36,9 @@ pub fn git_guard(root: &Path) -> GitGuard {
             Ok(real) if is_inside(&real_root, &real) => GitGuard { read_only: vec![real], ..Default::default() },
             Ok(_) => GitGuard::default(),
             // It leads nowhere yet: inside the project, keep that spot empty too.
-            Err(_) if is_inside(&real_root, &target) || is_inside(root, &target) => GitGuard { placeholders: vec![target], ..Default::default() },
+            Err(_) if is_inside(&real_root, &target) || is_inside(root, &target) => {
+                GitGuard { placeholders: vec![target], ..Default::default() }
+            }
             Err(_) => GitGuard::default(),
         };
     }

@@ -36,7 +36,13 @@ pub struct Grep;
 
 /// "1 match", "2 matches", "1 file", "3 files".
 pub fn plural(n: usize, word: &str) -> String {
-    let suffix = if n == 1 { "" } else if word.ends_with('h') { "es" } else { "s" };
+    let suffix = if n == 1 {
+        ""
+    } else if word.ends_with('h') {
+        "es"
+    } else {
+        "s"
+    };
     format!("{n} {word}{suffix}")
 }
 
@@ -74,7 +80,9 @@ impl Tool for Grep {
     }
 
     async fn run(&self, _input: &GrepInput, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
-        todo!("port: compile regex ('Invalid regex: …'), list files (symlinks out and special files skipped), scan with ripgrep's searcher, cap output, summary '<n> matches in <m> files'")
+        todo!(
+            "port: compile regex ('Invalid regex: …'), list files (symlinks out and special files skipped), scan with ripgrep's searcher, cap output, summary '<n> matches in <m> files'"
+        )
     }
 }
 

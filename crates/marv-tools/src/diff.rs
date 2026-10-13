@@ -68,7 +68,10 @@ pub fn added_lines(content: &str) -> Vec<DiffLine> {
     if text.is_empty() {
         return vec![];
     }
-    text.split('\n').enumerate().map(|(i, line)| DiffLine { kind: DiffKind::Add, text: line.into(), old_line: None, new_line: Some(i + 1) }).collect()
+    text.split('\n')
+        .enumerate()
+        .map(|(i, line)| DiffLine { kind: DiffKind::Add, text: line.into(), old_line: None, new_line: Some(i + 1) })
+        .collect()
 }
 
 /// At most `max` lines of a diff, for a collapsed view (see the module doc).
@@ -173,7 +176,10 @@ mod tests {
     #[test]
     fn a_collapsed_preview_keeps_a_changes_additions_in_view() {
         let lines = diff_text("a\nb\nc\nd\ne\nf\n", "x\ny\n", 3).lines;
-        let shown: Vec<String> = preview_lines(&lines, 5).iter().map(|l| if l.kind == DiffKind::Gap { "…".into() } else { format!("{:?} {}", l.kind, l.text) }).collect();
+        let shown: Vec<String> = preview_lines(&lines, 5)
+            .iter()
+            .map(|l| if l.kind == DiffKind::Gap { "…".into() } else { format!("{:?} {}", l.kind, l.text) })
+            .collect();
         assert_eq!(shown, ["Del a", "…", "Add x", "Add y"]);
         assert_eq!(preview_lines(&lines, 8), lines);
         assert_eq!(preview_lines(&lines, 2).len(), 2);

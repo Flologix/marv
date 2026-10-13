@@ -60,7 +60,8 @@ pub fn parse_url(text: &str) -> Result<Url, ToolError> {
         slashes || ["mailto:", "file:", "data:", "javascript:"].iter().any(|s| lower.starts_with(s))
     };
     let with_scheme = if has_scheme { text.to_string() } else { format!("https://{text}") };
-    Url::parse(&with_scheme).map_err(|_| ToolError(format!("Not a valid URL: {text}. Give the full address, e.g. https://example.com/page.")))
+    Url::parse(&with_scheme)
+        .map_err(|_| ToolError(format!("Not a valid URL: {text}. Give the full address, e.g. https://example.com/page.")))
 }
 
 /// Credentials go only where the user's URL pointed, and only over https.
@@ -75,7 +76,10 @@ pub fn redirect_note(got: &Got) -> Option<String> {
     }
     let location = got.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("location"))?.1.as_str();
     let target = Url::parse(&got.url).ok()?.join(location).ok()?;
-    Some(format!("{} redirects to {target}, on another site: call web_fetch with that URL to follow it (the user may be asked).", got.url))
+    Some(format!(
+        "{} redirects to {target}, on another site: call web_fetch with that URL to follow it (the user may be asked).",
+        got.url
+    ))
 }
 
 /// GETs a URL, following redirects by hand so each one is checked.

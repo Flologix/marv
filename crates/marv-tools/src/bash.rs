@@ -63,8 +63,14 @@ pub struct RunOptions {
 }
 
 /// Runs a shell command in the project folder with stdout and stderr combined (also used by diagnostics and checks).
-pub async fn run_command(_options: RunOptions, _sandbox: &marv_sandbox::Sandbox, _cancel: &tokio_util::sync::CancellationToken) -> CommandResult {
-    todo!("port: runCommand: Sandbox::command or setsid bash -c, env cleared, capture both pipes to MAX_CAPTURE, timeout/abort → SIGKILL (process group outside bwrap), sandbox-failed-to-start message")
+pub async fn run_command(
+    _options: RunOptions,
+    _sandbox: &marv_sandbox::Sandbox,
+    _cancel: &tokio_util::sync::CancellationToken,
+) -> CommandResult {
+    todo!(
+        "port: runCommand: Sandbox::command or setsid bash -c, env cleared, capture both pipes to MAX_CAPTURE, timeout/abort → SIGKILL (process group outside bwrap), sandbox-failed-to-start message"
+    )
 }
 
 /// The command's result as the model sees it: output (start and end if long), then how it ended.
@@ -175,8 +181,10 @@ impl Tool for Bash {
     }
 
     async fn run(&self, _input: &BashInput, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
-        todo!("port: git_guard when confined, worktree_git writable when approved, run_command, rmdir placeholders, \
-             GIT_HINT / HOME_NOTE / NETWORK_NOTE / GH_NOTE, summary 'exit N · L lines of output' | 'timed out after Ns' | 'stopped'")
+        todo!(
+            "port: git_guard when confined, worktree_git writable when approved, run_command, rmdir placeholders, \
+             GIT_HINT / HOME_NOTE / NETWORK_NOTE / GH_NOTE, summary 'exit N · L lines of output' | 'timed out after Ns' | 'stopped'"
+        )
     }
 }
 
@@ -196,7 +204,12 @@ mod tests {
 
     #[test]
     fn says_when_it_timed_out_or_was_stopped() {
-        let timed_out = CommandResult { output: "partial".into(), timed_out: true, timeout: Some(Duration::from_secs(1)), ..Default::default() };
+        let timed_out = CommandResult {
+            output: "partial".into(),
+            timed_out: true,
+            timeout: Some(Duration::from_secs(1)),
+            ..Default::default()
+        };
         assert!(format_output(&timed_out).contains("[timed out after 1s]"));
         let stopped = CommandResult { aborted: true, ..Default::default() };
         assert!(format_output(&stopped).ends_with("[stopped by the user]"));

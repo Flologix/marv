@@ -47,7 +47,9 @@ impl Envelope {
     pub fn text(&self) -> String {
         match &self.body {
             Value::String(s) => s.clone(),
-            Value::Object(o) if o.len() == 1 && o.get("text").is_some_and(Value::is_string) => o["text"].as_str().unwrap_or_default().to_string(),
+            Value::Object(o) if o.len() == 1 && o.get("text").is_some_and(Value::is_string) => {
+                o["text"].as_str().unwrap_or_default().to_string()
+            }
             other => other.to_string(),
         }
     }
@@ -68,7 +70,14 @@ mod tests {
     use super::*;
 
     fn env(body: Value) -> Envelope {
-        Envelope::new("s:1".into(), PlugId::new("worker-1").unwrap(), ReceptacleName::new("agent.parent.inbox").unwrap(), WireMode::Send, body, 0)
+        Envelope::new(
+            "s:1".into(),
+            PlugId::new("worker-1").unwrap(),
+            ReceptacleName::new("agent.parent.inbox").unwrap(),
+            WireMode::Send,
+            body,
+            0,
+        )
     }
 
     #[test]

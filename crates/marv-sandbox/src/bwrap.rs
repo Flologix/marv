@@ -106,9 +106,8 @@ fn resolve_extra(dir: &Path, home: &Path, root: &Path, fs: &dyn FsProbe) -> Resu
     if !dir.is_absolute() {
         return Err(SandboxError::Mount(format!("Extra sandbox folder {} must be an absolute path.", dir.display())));
     }
-    let real = fs
-        .realpath(dir)
-        .map_err(|_| SandboxError::Mount(format!("Extra sandbox folder {} doesn't exist.", dir.display())))?;
+    let real =
+        fs.realpath(dir).map_err(|_| SandboxError::Mount(format!("Extra sandbox folder {} doesn't exist.", dir.display())))?;
     let real_home = fs.realpath(home).unwrap_or_else(|_| home.to_path_buf());
     let real_root = fs.realpath(root).unwrap_or_else(|_| root.to_path_buf());
     // Mounting the home folder or a parent of it (even read-only) would expose the hidden home, with the API key in it.
@@ -120,7 +119,10 @@ fn resolve_extra(dir: &Path, home: &Path, root: &Path, fs: &dyn FsProbe) -> Resu
     }
     // Read-only over the project itself would leave nothing writable.
     if real == real_root {
-        return Err(SandboxError::Mount(format!("Refusing to make {} read-only in the sandbox: it is the project folder.", dir.display())));
+        return Err(SandboxError::Mount(format!(
+            "Refusing to make {} read-only in the sandbox: it is the project folder.",
+            dir.display()
+        )));
     }
     let around = contains(&real, &real_root);
     Ok((real, around))
@@ -162,7 +164,15 @@ pub fn sandbox_args(opts: &SandboxOptions, fs: &dyn FsProbe) -> Result<Vec<OsStr
     let home = opts.home.as_os_str();
     let mut args: Vec<OsString> = Vec::new();
     let mut push = |items: &[&std::ffi::OsStr]| args.extend(items.iter().map(|s| s.to_os_string()));
-    push(&["--ro-bind".as_ref(), "/".as_ref(), "/".as_ref(), "--dev".as_ref(), "/dev".as_ref(), "--proc".as_ref(), "/proc".as_ref()]);
+    push(&[
+        "--ro-bind".as_ref(),
+        "/".as_ref(),
+        "/".as_ref(),
+        "--dev".as_ref(),
+        "/dev".as_ref(),
+        "--proc".as_ref(),
+        "/proc".as_ref(),
+    ]);
     push(&["--tmpfs".as_ref(), "/tmp".as_ref(), "--tmpfs".as_ref(), home]);
     args.extend(run_mounts(&opts.path, opts.network, fs));
     // The mesh plug (marv-rs): after the empty /run, which would hide it otherwise. A read-only bind wouldn't stop
@@ -218,7 +228,8 @@ pub fn sandbox_args(opts: &SandboxOptions, fs: &dyn FsProbe) -> Result<Vec<OsStr
         args.push("--unshare-net".into());
     }
     let lang = if opts.lang.is_empty() { "C.UTF-8" } else { &opts.lang };
-    let flags: [&std::ffi::OsStr; 4] = ["--unshare-pid".as_ref(), "--die-with-parent".as_ref(), "--new-session".as_ref(), "--clearenv".as_ref()];
+    let flags: [&std::ffi::OsStr; 4] =
+        ["--unshare-pid".as_ref(), "--die-with-parent".as_ref(), "--new-session".as_ref(), "--clearenv".as_ref()];
     args.extend(flags.iter().map(|s| s.to_os_string()));
     for (key, value) in [
         ("PATH", opts.path.as_str()),
@@ -326,7 +337,10 @@ mod tests {
 
     #[test]
     fn project_read_only_and_placeholders() {
-        let ro = joined(&SandboxOptions { project_read_only: true, placeholders: vec!["/home/me/proj/.git".into()], ..base() }, &default_fs());
+        let ro = joined(
+            &SandboxOptions { project_read_only: true, placeholders: vec!["/home/me/proj/.git".into()], ..base() },
+            &default_fs(),
+        );
         assert!(ro.contains("--ro-bind /home/me/proj /home/me/proj"));
         assert!(!ro.contains("--bind /home/me/proj /home/me/proj"));
         assert!(!ro.contains("--tmpfs /home/me/proj/.git")); // bwrap can't create them in a read-only project
@@ -425,6 +439,9 @@ mod tests {
         };
         let args = joined(&opts, &default_fs());
         assert!(args.find("--bind /home/me/proj").unwrap() < args.find("--ro-bind /home/me/proj/.envrc").unwrap());
-        assert!(args.find("--tmpfs /run").unwrap() < args.find(&format!("--bind /run/user/1000/marv/mesh-1.sock {MESH_SOCKET}")).unwrap());
+        assert!(
+            args.find("--tmpfs /run").unwrap()
+                < args.find(&format!("--bind /run/user/1000/marv/mesh-1.sock {MESH_SOCKET}")).unwrap()
+        );
     }
 }

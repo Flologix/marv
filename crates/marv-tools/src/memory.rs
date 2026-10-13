@@ -130,7 +130,12 @@ impl Tool for Memory {
         let path = path_for(input.scope, ctx)?;
         let note = Some(shorten_home(path, &ctx.home));
         if input.action == MemoryAction::Add {
-            return Ok(Preview { title: format!("Remember ({})", input.scope.where_()), text: Some(input.text.clone()), note, ..Default::default() });
+            return Ok(Preview {
+                title: format!("Remember ({})", input.scope.where_()),
+                text: Some(input.text.clone()),
+                note,
+                ..Default::default()
+            });
         }
         // Check the match now, so the user isn't asked to approve a removal that can't happen.
         let found = find_memory(path, &input.text).await;
@@ -141,7 +146,12 @@ impl Tool for Memory {
                 format!("{} memories match \"{}\"; use more of the text.", found.len(), input.text)
             }));
         }
-        Ok(Preview { title: format!("Forget ({})", input.scope.where_()), text: found.into_iter().next(), note, ..Default::default() })
+        Ok(Preview {
+            title: format!("Forget ({})", input.scope.where_()),
+            text: found.into_iter().next(),
+            note,
+            ..Default::default()
+        })
     }
 
     async fn run(&self, input: &MemoryInput, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
@@ -165,7 +175,10 @@ mod tests {
 
     #[test]
     fn home_is_shortened_and_labels_say_what_happens() {
-        assert_eq!(shorten_home(Path::new("/home/me/.marv/memory/personal.md"), Path::new("/home/me")), "~/.marv/memory/personal.md");
+        assert_eq!(
+            shorten_home(Path::new("/home/me/.marv/memory/personal.md"), Path::new("/home/me")),
+            "~/.marv/memory/personal.md"
+        );
         assert_eq!(shorten_home(Path::new("/srv/x"), Path::new("/home/me")), "/srv/x");
         let input = MemoryInput { action: MemoryAction::Remove, scope: MemoryScope::Project, text: "uses bun".into() };
         assert_eq!(Memory.label(&input), "forget: uses bun");

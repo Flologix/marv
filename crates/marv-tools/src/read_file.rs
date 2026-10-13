@@ -63,7 +63,11 @@ pub fn render(text: &str, offset: usize, limit: usize, shown: &str) -> Result<To
             if len <= cap {
                 return numbered_line(n, line);
             }
-            let whole = if len <= LINE_BUDGET_CHARS { "reads it whole".to_string() } else { format!("reads {LINE_BUDGET_CHARS} of them") };
+            let whole = if len <= LINE_BUDGET_CHARS {
+                "reads it whole".to_string()
+            } else {
+                format!("reads {LINE_BUDGET_CHARS} of them")
+            };
             let head: String = line.chars().take(cap).collect();
             numbered_line(n, &format!("{head}… (line truncated: {len} characters; offset={n} and limit=1 {whole})"))
         })
@@ -190,7 +194,12 @@ mod tests {
         root.write("src/a.ts", "x");
         root.write("logo.png", b"\x89PNG\0\0\0");
         std::os::unix::fs::symlink(outside.path().join("secret.txt"), root.path().join("link.txt")).unwrap();
-        for (path, message) in [("../outside.txt", "outside the project"), ("/etc/hostname", "outside the project"), ("missing.ts", "File not found: missing.ts"), ("src", "is a directory")] {
+        for (path, message) in [
+            ("../outside.txt", "outside the project"),
+            ("/etc/hostname", "outside the project"),
+            ("missing.ts", "File not found: missing.ts"),
+            ("src", "is a directory"),
+        ] {
             let out = run(&root, json!({ "path": path })).await;
             assert!(out.result.is_error && out.result.output.contains(message), "{path}: {}", out.result.output);
         }

@@ -57,6 +57,8 @@ impl Tool for Glob {
     }
 
     async fn run(&self, _input: &GlobInput, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
-        todo!("port: resolve dir (not a directory → error), files_under, globset match relative to base, cap at MAX_RESULTS, 'No files match.' / 'N files'")
+        todo!(
+            "port: resolve dir (not a directory → error), files_under, globset match relative to base, cap at MAX_RESULTS, 'No files match.' / 'N files'"
+        )
     }
 }

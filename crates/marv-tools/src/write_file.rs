@@ -146,7 +146,8 @@ impl Tool for WriteFile {
     }
 
     async fn run(&self, _input: &WriteFileInput, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
-        todo!("port: await before_change; aborted → nothing written; with_file_lock(plan, mkdir -p, write); broken_by note; \
+        todo!(
+            "port: await before_change; aborted → nothing written; with_file_lock(plan, mkdir -p, write); broken_by note; \
              'Created <shown> (N lines).' / 'Wrote|Appended to <shown> (+a −r lines[; added a newline…][; kept its CRLF…]).'"
         )
     }

@@ -71,7 +71,10 @@ pub fn not_found(shown: &str, text: &str, old_string: &str) -> String {
         .enumerate()
         .map(|(i, line)| {
             if line.chars().count() > MAX_CLOSEST_CHARS {
-                numbered_line(start + i, &format!("{}… (line truncated)", line.chars().take(MAX_CLOSEST_CHARS).collect::<String>()))
+                numbered_line(
+                    start + i,
+                    &format!("{}… (line truncated)", line.chars().take(MAX_CLOSEST_CHARS).collect::<String>()),
+                )
             } else {
                 numbered_line(start + i, line)
             }
@@ -165,11 +168,16 @@ impl Tool for EditFile {
     async fn preview(&self, input: &EditFileInput, ctx: &ToolContext) -> Result<Preview, ToolError> {
         start_before_change(ctx);
         let plan = plan(input, ctx).await?;
-        Ok(Preview { title: format!("Edit {}", plan.shown), diff: Some(diff_text(&plan.before, &plan.after, 3).lines), ..Default::default() })
+        Ok(Preview {
+            title: format!("Edit {}", plan.shown),
+            diff: Some(diff_text(&plan.before, &plan.after, 3).lines),
+            ..Default::default()
+        })
     }
 
     async fn run(&self, _input: &EditFileInput, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
-        todo!("port: await before_change; aborted → 'Interrupted before the change was written: nothing changed.'; \
+        todo!(
+            "port: await before_change; aborted → 'Interrupted before the change was written: nothing changed.'; \
              with_file_lock(plan + write); broken_by note; 'Edited <shown>: replaced N occurrence(s) (+a −r lines).' + fuzzy_note; \
              diff = shown_diff, changed = shown; #67 formatter"
         )
@@ -196,7 +204,10 @@ mod tests {
         let root = TempDir::new("edit");
         root.write("src/a.ts", "x");
         let ctx = ToolContext::new(root.path());
-        assert_eq!(plan(&input("src/new.ts", "a", "b"), &ctx).await.unwrap_err().0, "File not found: src/new.ts. Use write_file to create a new file.");
+        assert_eq!(
+            plan(&input("src/new.ts", "a", "b"), &ctx).await.unwrap_err().0,
+            "File not found: src/new.ts. Use write_file to create a new file."
+        );
         assert_eq!(plan(&input("srcx/new.ts", "a", "b"), &ctx).await.unwrap_err().0, "File not found: srcx/new.ts.");
     }
 
@@ -204,7 +215,12 @@ mod tests {
     async fn nothing_matches_shows_the_closest_lines() {
         let root = TempDir::new("edit-closest");
         root.write("greet.js", "function a() {\n  return 1;\n}\n\nfunction greet(name) {\n  return `Hello, ${name}!`;\n}\n");
-        let err = plan(&input("greet.js", "function greet(person) {\n  return `Hi, ${person}!`;\n}", "x"), &ToolContext::new(root.path())).await.unwrap_err();
+        let err = plan(
+            &input("greet.js", "function greet(person) {\n  return `Hi, ${person}!`;\n}", "x"),
+            &ToolContext::new(root.path()),
+        )
+        .await
+        .unwrap_err();
         assert!(err.0.contains("The closest text is lines 5-7, as it is now:\n    5→function greet(name) {"), "{}", err.0);
     }
 

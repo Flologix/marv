@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 
 pub use bwrap::{FileKind, FsProbe, MESH_SOCKET, RealFs, SandboxOptions, sandbox_args, sandbox_available};
 pub use paths::{project_path, resolve_in_project, resolve_within, touches_git};
-pub use protected::{ProtectedPath, ProtectedRule, PROTECTED_PATHS, is_protected, protected_rule};
+pub use protected::{PROTECTED_PATHS, ProtectedPath, ProtectedRule, is_protected, protected_rule};
 pub use taint::TaintState;
 
 /// Why a path or a mount was refused. The messages go to the model as they are (tools wrap them in a

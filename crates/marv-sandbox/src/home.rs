@@ -109,7 +109,12 @@ mod tests {
         assert!(hidden_path_folders("relative/bin:/home/me/.bun/bin/node", home, None, &|_| true).is_empty());
         // The project is mounted: its own bin folders aren't hidden.
         assert_eq!(
-            hidden_path_folders("/home/me/app/node_modules/.bin:/home/me/app/bin:/home/me/.tools/bin", home, Some(Path::new("/home/me/app")), &|_| true),
+            hidden_path_folders(
+                "/home/me/app/node_modules/.bin:/home/me/app/bin:/home/me/.tools/bin",
+                home,
+                Some(Path::new("/home/me/app")),
+                &|_| true
+            ),
             vec![PathBuf::from("/home/me/.tools/bin")]
         );
     }

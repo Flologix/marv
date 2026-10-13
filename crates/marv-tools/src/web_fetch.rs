@@ -33,7 +33,8 @@ pub const CACHE_PAGES: usize = 8;
 pub const CACHE_MS: u64 = 10 * 60_000;
 pub const CACHE_MAX_CHARS: usize = 1_000_000;
 /// GitHub's other hosts count as github.com: one "don't ask again" covers them all.
-pub const GITHUB_HOSTS: &[&str] = &["api.github.com", "raw.githubusercontent.com", "gist.github.com", "gist.githubusercontent.com"];
+pub const GITHUB_HOSTS: &[&str] =
+    &["api.github.com", "raw.githubusercontent.com", "gist.github.com", "gist.githubusercontent.com"];
 
 /// The site an approval covers: the host, lowercased, without `www.` or a trailing dot. Ports and http/https share a
 /// domain's scope, like Claude Code's per-domain rule.
@@ -52,7 +53,9 @@ pub fn web_scope(url: &str) -> String {
 /// The scopes of the links in what the user typed (outside fenced blocks and inline code: a pasted script's hosts
 /// are what an injected instruction would send data to).
 pub fn pasted_scopes(_text: &str) -> Vec<String> {
-    todo!("port: pastedScopes: strip CommonMark fences (closed or not, ``` and ~~~) and closed inline code, then http(s) links → web_scope, deduped in order")
+    todo!(
+        "port: pastedScopes: strip CommonMark fences (closed or not, ``` and ~~~) and closed inline code, then http(s) links → web_scope, deduped in order"
+    )
 }
 
 fn chars(n: usize) -> String {
@@ -80,7 +83,8 @@ pub fn paged(page: &Page, offset: usize, size: usize) -> Result<ToolOutput, Tool
     let note = page.note.as_ref().map(|n| format!("\n({n})")).unwrap_or_default();
     let body: String = page.text.chars().skip(offset).take(end - offset).collect();
     let body = if body.is_empty() { "(empty page)".to_string() } else { body };
-    let summary = if partial { format!("{} of {}", chars(end - offset).replace(" chars", ""), chars(total)) } else { chars(total) };
+    let summary =
+        if partial { format!("{} of {}", chars(end - offset).replace(" chars", ""), chars(total)) } else { chars(total) };
     Ok(ToolOutput::ok(format!("{header}{note}\n\n{body}"), summary))
 }
 
@@ -119,10 +123,7 @@ impl PageCache {
     pub fn get(&self, url: &str) -> Option<Page> {
         let key = parse_url(url).ok()?.to_string();
         let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        entries
-            .iter()
-            .find(|c| c.keys.contains(&key) && c.at.elapsed() < Duration::from_millis(CACHE_MS))
-            .map(|c| c.page.clone())
+        entries.iter().find(|c| c.keys.contains(&key) && c.at.elapsed() < Duration::from_millis(CACHE_MS)).map(|c| c.page.clone())
     }
 
     /// Keeps a page under every key (one entry, counted once toward the limit).
@@ -204,11 +205,15 @@ impl Tool for WebFetch {
     }
 
     async fn preview(&self, _input: &WebFetchInput, _ctx: &ToolContext) -> Result<Preview, ToolError> {
-        todo!("port: parse_url, check_address (a private address fails here, so nobody is asked), Preview 'Fetch a web page' / href / 'GET · fetched by Marv, not in the sandbox'")
+        todo!(
+            "port: parse_url, check_address (a private address fails here, so nobody is asked), Preview 'Fetch a web page' / href / 'GET · fetched by Marv, not in the sandbox'"
+        )
     }
 
     async fn run(&self, _input: &WebFetchInput, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
-        todo!("port: approved/cached page → paged; else github::fetch_github or fetch::fetch_page with same-site redirects only; 'pass an http:// URL' hint; remember; paged")
+        todo!(
+            "port: approved/cached page → paged; else github::fetch_github or fetch::fetch_page with same-site redirects only; 'pass an http:// URL' hint; remember; paged"
+        )
     }
 }
 
@@ -236,9 +241,18 @@ mod tests {
         assert_eq!((short.output.as_str(), short.summary.as_str()), ("Fetched https://e.com/ · T\n\nhello", "5 chars"));
         let long = page(&format!("{}{}{}", "a".repeat(30_000), "b".repeat(30_000), "c".repeat(10_000)));
         let first = paged(&long, 0, PAGE_CHARS).unwrap();
-        assert!(first.output.starts_with("Fetched https://e.com/ · T · characters 0-30000 of 70000 (offset: 30000 for the next part)\n\naaa"));
+        assert!(
+            first
+                .output
+                .starts_with("Fetched https://e.com/ · T · characters 0-30000 of 70000 (offset: 30000 for the next part)\n\naaa")
+        );
         assert_eq!(first.summary, "30.0k of 70.0k chars");
-        assert!(paged(&long, 60_000, PAGE_CHARS).unwrap().output.starts_with("Fetched https://e.com/ · T · characters 60000-70000 of 70000\n\nccc"));
+        assert!(
+            paged(&long, 60_000, PAGE_CHARS)
+                .unwrap()
+                .output
+                .starts_with("Fetched https://e.com/ · T · characters 60000-70000 of 70000\n\nccc")
+        );
         assert_eq!(paged(&long, 70_000, PAGE_CHARS).unwrap_err().0, "offset 70000 is past the end (70000 characters).");
         let empty = Page { url: "https://e.com/".into(), title: None, text: String::new(), note: Some("Whole page.".into()) };
         assert_eq!(paged(&empty, 0, PAGE_CHARS).unwrap().output, "Fetched https://e.com/\n(Whole page.)\n\n(empty page)");

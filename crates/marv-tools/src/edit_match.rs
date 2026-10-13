@@ -73,7 +73,8 @@ fn reindenter(file_lines: &[&str], old_lines: &[&str]) -> Option<Reindent> {
         .collect();
     let tabs = file_lines.iter().any(|l| leading(l).contains('\t'));
     for width in [4usize, 2, 8] {
-        let mut shifts: Vec<isize> = pairs.iter().map(|(l, o)| columns(leading(l), width) as isize - columns(leading(o), width) as isize).collect();
+        let mut shifts: Vec<isize> =
+            pairs.iter().map(|(l, o)| columns(leading(l), width) as isize - columns(leading(o), width) as isize).collect();
         shifts.sort_unstable();
         shifts.dedup();
         if shifts.len() > 1 {
@@ -196,7 +197,12 @@ fn bigrams(line: &str) -> std::collections::HashSet<(char, char)> {
 }
 
 /// 0 (nothing in common) to 1 (the same, ignoring surrounding whitespace).
-fn similarity(a: &str, b: &str, set_a: &std::collections::HashSet<(char, char)>, set_b: &std::collections::HashSet<(char, char)>) -> f64 {
+fn similarity(
+    a: &str,
+    b: &str,
+    set_a: &std::collections::HashSet<(char, char)>,
+    set_b: &std::collections::HashSet<(char, char)>,
+) -> f64 {
     if a == b {
         return 1.0;
     }
@@ -271,7 +277,10 @@ mod tests {
     fn a_crlf_file_keeps_crlf_in_what_an_edit_inserts() {
         // A model's edit put bare \n into a CRLF file; it then spent 6 steps repairing it (eval, 2026-10-06).
         let result = edit("a\r\nreturn x;\r\nb\r\n", "return x;", "if (!x) return 0;\nreturn x;");
-        assert_eq!(result, EditResult::Applied { text: "a\r\nif (!x) return 0;\r\nreturn x;\r\nb\r\n".into(), count: 1, fuzzy: None });
+        assert_eq!(
+            result,
+            EditResult::Applied { text: "a\r\nif (!x) return 0;\r\nreturn x;\r\nb\r\n".into(), count: 1, fuzzy: None }
+        );
     }
 
     #[test]
@@ -311,14 +320,21 @@ mod tests {
 
     #[test]
     fn spaces_for_tabs_are_matched_and_reindented_with_tabs() {
-        let (text, _, fuzzy) = applied(edit(TABBED, "    if (x) {\n        return 1;\n    }", "    if (x) {\n        return 2;\n    }\n    return 0;"));
+        let (text, _, fuzzy) = applied(edit(
+            TABBED,
+            "    if (x) {\n        return 1;\n    }",
+            "    if (x) {\n        return 2;\n    }\n    return 0;",
+        ));
         assert_eq!(text, "function f() {\n\tif (x) {\n\t\treturn 2;\n\t}\n\treturn 0;\n}\n");
         assert_eq!(fuzzy, Some(Fuzzy::Indentation));
     }
 
     #[test]
     fn two_space_indentation_for_a_tab_file_works_too() {
-        assert_eq!(applied(edit(TABBED, "  if (x) {\n    return 1;\n  }", "  if (x) {\n    return 3;\n  }")).0, "function f() {\n\tif (x) {\n\t\treturn 3;\n\t}\n}\n");
+        assert_eq!(
+            applied(edit(TABBED, "  if (x) {\n    return 1;\n  }", "  if (x) {\n    return 3;\n  }")).0,
+            "function f() {\n\tif (x) {\n\t\treturn 3;\n\t}\n}\n"
+        );
     }
 
     #[test]
@@ -331,7 +347,10 @@ mod tests {
 
     #[test]
     fn blank_lines_in_new_string_stay_empty() {
-        assert_eq!(applied(edit(TABBED, "  if (x) {\n    return 1;\n  }", "  if (x) {\n\n    return 1;\n  }")).0, "function f() {\n\tif (x) {\n\n\t\treturn 1;\n\t}\n}\n");
+        assert_eq!(
+            applied(edit(TABBED, "  if (x) {\n    return 1;\n  }", "  if (x) {\n\n    return 1;\n  }")).0,
+            "function f() {\n\tif (x) {\n\n\t\treturn 1;\n\t}\n}\n"
+        );
     }
 
     #[test]
