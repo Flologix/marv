@@ -33,7 +33,7 @@ No run reaches a real model or spends money: every request goes to the fake serv
    - `MARV_CONFIG_DIR` is a throwaway folder whose `config.json` selects provider `openrouter`, the server's `baseUrl` and a dummy key. Trajectories, diagnostics and checks are off unless `run.json` turns them on;
    - `HOME` is a throwaway folder too, so personal skills in `~/.marv` don't reach the system prompt;
    - `OPENROUTER_API_KEY`, `MARV_MODEL` and `MARV_MAX_STEPS` are not passed on: they beat the config file.
-5. What it did is normalized (temp paths become `<project>`, `<home>`, `<config>`, `<tmp>`; the port `<port>`; the tracker's binary `<oracle>`; today's date `<date>`) and compared with `expect/`.
+5. What it did is normalized (temp paths become `<project>`, `<home>`, `<config>`, `<tmp>`; the port `<port>`; the tracker's binary `<oracle>`; today's date `<date>`; a worktree subagent's random id `<slug>-<id>` and the project key in its folder `<project-key>`) and compared with `expect/`.
 6. The run's own requests are checked against the prompt-cache prefix rule (below).
 
 A recording is refused when the run timed out, left scripted replies unused or broke the prefix rule: those are broken scenarios, not behaviour.
@@ -100,6 +100,7 @@ The loop's edge cases:
 | `dropped-stream` | a stream that closes early is retried from scratch, after the 1 s backoff |
 | `rate-limited` | an HTTP 429 with `Retry-After: 1` is retried after that wait |
 | `mid-turn-compaction` | a step past 85% of the context window triggers a summary request (same prefix), then the turn goes on from the summary |
+| `worktree-subagent` | an `agent` call with `isolation: "worktree"` (#12): the subagent edits its worktree's copy, Marv commits for it (`marv: <description>`), the main checkout is untouched, and `git log --all` shows the commit. Requests 2–3 are the subagent's own conversation (`prefix_resets` 2 and 4) |
 
 ## Still to write
 - Every guard in `docs/SECURITY.md` (#8).
