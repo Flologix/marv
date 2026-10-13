@@ -29,6 +29,7 @@ import type { Proposal } from "../src/mcp/install/proposal.ts";
 import type { RegistryHit } from "../src/mcp/install/registry.ts";
 import type { AddOptions } from "../src/mcp/install/source.ts";
 import { dns } from "../src/tools/web/address.ts";
+import { sandboxAvailable } from "../src/sandbox.ts";
 import { FakeProvider, RoutedProvider, ScriptedProvider } from "./fake-provider.ts";
 
 const ENTER = "\r";
@@ -494,6 +495,22 @@ describe("App", () => {
       stdin.write("\x0f"); // ctrl+o
       await until(() => lastFrame()!.includes("30 + LINE 30"));
       expect(lastFrame()).not.toContain("(ctrl+o)");
+    });
+
+    test.if(sandboxAvailable())("bash with sandbox: false asks in yolo, with the host door's warning and no 'don't ask again', and runs on yes (#52)", async () => {
+      const hostCall = (id: string) =>
+        [{ type: "tool_call", call: { id, name: "bash", arguments: JSON.stringify({ command: "touch host-ran", sandbox: false }) } }, { type: "done" }] as AgentEvent[];
+      const model = new ScriptedProvider([hostCall("h1"), reply("Ran it.")]);
+      const { lastFrame, stdin } = renderApp(LOCAL, 0, undefined, () => model);
+      await type(stdin, "check the service");
+      await until(() => lastFrame()!.includes("Do you want to proceed?"));
+      expect(lastFrame()).toContain("Run a command on your machine");
+      expect(lastFrame()).toContain("Runs OUTSIDE the sandbox, as you, with your files, network and credentials.");
+      expect(lastFrame()).not.toContain("don't ask again");
+      expect(existsSync(join(project, "host-ran"))).toBe(false);
+      stdin.write(ENTER);
+      await until(() => lastFrame()!.includes("Ran it."));
+      expect(existsSync(join(project, "host-ran"))).toBe(true);
     });
 
     test("/yolo off turns it off and saves it; then changes ask", async () => {

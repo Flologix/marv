@@ -95,6 +95,12 @@ export interface SessionOptions {
   /** Run bash in the bubblewrap sandbox (default true). */
   sandbox?: boolean;
   /** Run what the sandbox confines without asking (default true). Must be false when `cwd` is your home folder or above it. */
+  /**
+   * Let bash run a command on the host, outside the sandbox (`sandbox: false`), when your approver says yes. Asked
+   * every time (the request has `door: "host"` and `once: true`; an "always" counts as one yes). Default false:
+   * such calls are refused before your approver is asked.
+   */
+  hostCommands?: boolean;
   yolo?: boolean;
   /** Let thinking models reason before they answer (default false). */
   thinking?: boolean;
@@ -179,6 +185,7 @@ export async function createSession(options: SessionOptions): Promise<Session> {
     checks: options.checks,
     mcpTools: options.mcpTools,
     sandbox: options.sandbox,
+    hostCommands: options.hostCommands,
     yolo: options.yolo,
     noYolo,
     sessions: storeFor(options.persist, () => new SessionStore(join(configDir, "sessions"))),
@@ -224,7 +231,7 @@ export type { Session, SessionEvent, TurnEndReason, CompactResult, Resumed } fro
 export type { ProviderOption } from "./provider/factory.ts";
 export type { Source } from "./sources.ts";
 export { ToolError } from "./tools/types.ts";
-export type { AgentHost, AgentProgress, Tool, ToolContext, ToolResult, ApprovalRequest, Decision, Preview, Scope, DiffLine, DiffShown } from "./tools/types.ts";
+export type { AgentHost, AgentProgress, Tool, ToolContext, ToolResult, ApprovalRequest, Decision, Door, Preview, Scope, DiffLine, DiffShown } from "./tools/types.ts";
 export type { Provider, AgentEvent, ChatTurn, StreamOptions, ToolCall, ToolSpec, Usage } from "./provider/types.ts";
 export { OllamaProvider } from "./provider/ollama.ts";
 export { OpenAICompatProvider } from "./provider/openai-compat.ts";

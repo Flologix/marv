@@ -10,6 +10,7 @@
 //   3 — approval needed but couldn't get it (refused or declined/interrupted)
 import { ConfigError, ConfigStore, defaultConfigDir, migrateLegacyConfig, resolveConfig } from "./config/config.ts";
 import { createSession, type SessionEvent, type ApprovalRequest, type Decision, type ProviderOption } from "./sdk.ts";
+import { NO_HOST_DOOR } from "./tools/bash.ts";
 import { TrajectoryStore } from "./trajectory.ts";
 
 export type OutputFormat = "text" | "json" | "stream-json";
@@ -196,7 +197,8 @@ async function collectAndOutput(
   let lastAssistantText: string | undefined;
   const allEvents: SessionEvent[] = [];
   const errors: string[] = [];
-  // Calls that were refused (no approver, output matches "there's no one to ask").
+  // Calls that were refused (no approver, output matches "there's no one to ask"; or a command for the host, which
+  // headless never runs, whatever --approve says: #52).
   const refused: { tool: string; label: string }[] = [];
   const seenRefused = new Set<string>();
 
@@ -205,7 +207,8 @@ async function collectAndOutput(
   /** Detect a refused call (no approver, or the user said no) and list it once. */
   const noteRefused = (event: Extract<SessionEvent, { type: "tool_end" }>) => {
     const { result } = event;
-    if (!(result.output.includes(NO_APPROVER) || result.approval === "no" || result.declined)) return;
+    const refusedHere = result.output.includes(NO_APPROVER) || (result.isError && result.output.includes(NO_HOST_DOOR));
+    if (!(refusedHere || result.approval === "no" || result.declined)) return;
     const tool = event.call.name;
     const label = result.label ?? tool;
     const key = refusedCallKey({ tool, label });

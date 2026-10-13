@@ -18,6 +18,8 @@ export interface GroupStats {
   rated: number;
   good: number;
   bad: number;
+  /** Tool calls through each door out of the sandbox (host, github, process), subagents' included. */
+  doors: Record<string, number>;
 }
 
 export type GroupBy = "model" | "marv";
@@ -29,6 +31,7 @@ interface Turn {
   end?: Rec;
   explicit?: number;
   implicit?: number;
+  doors: Record<string, number>;
 }
 
 /** Groups turns by model (as of the turn) or by Marv version (as of its session), and sums them up. */
@@ -37,11 +40,12 @@ export function summarize(records: Rec[], by: GroupBy = "model"): Map<string, Gr
   const turns = new Map<string, Turn>();
   for (const r of records) {
     if (r.type === "session") marvOf.set(r.session, r.marv);
-    else if (r.type === "turn_start") turns.set(r.turn, { group: by === "model" ? r.model : (marvOf.get(r.session) ?? "unknown"), tokens: 0 });
+    else if (r.type === "turn_start") turns.set(r.turn, { group: by === "model" ? r.model : (marvOf.get(r.session) ?? "unknown"), tokens: 0, doors: {} });
     const t = turns.get(r.turn);
     if (!t) continue;
     if (r.type === "request") t.tokens += r.usage.promptTokens + r.usage.completionTokens;
     else if (r.type === "agent_end" && r.agent === "main") t.end = r;
+    else if (r.type === "tool" && r.door) t.doors[r.door] = (t.doors[r.door] ?? 0) + 1;
     else if (r.type === "feedback" && r.score !== 0) {
       if (r.source === "explicit") t.explicit = r.score; // the latest one counts
       else t.implicit = r.score;
@@ -56,6 +60,8 @@ export function summarize(records: Rec[], by: GroupBy = "model"): Map<string, Gr
     for (const t of list) if (t.end) ended[t.end.reason] = (ended[t.end.reason] ?? 0) + 1;
     const scores = list.map((t) => t.explicit ?? t.implicit).filter((s) => s !== undefined);
     const finished = list.filter((t) => t.end);
+    const doors: Record<string, number> = {};
+    for (const t of list) for (const [door, n] of Object.entries(t.doors)) doors[door] = (doors[door] ?? 0) + n;
     stats.set(group, {
       turns: list.length,
       ended,
@@ -65,6 +71,7 @@ export function summarize(records: Rec[], by: GroupBy = "model"): Map<string, Gr
       rated: scores.length,
       good: scores.filter((s) => s > 0).length,
       bad: scores.filter((s) => s < 0).length,
+      doors,
     });
   }
   return stats;
@@ -79,7 +86,7 @@ function median(values: number[]): number {
 
 /** A plain-text table, one row per group. */
 export function formatStats(stats: Map<string, GroupStats>): string {
-  const header = ["", "turns", "good", "rated", "tokens/turn", "tools/turn", "median", "ended"];
+  const header = ["", "turns", "good", "rated", "tokens/turn", "tools/turn", "median", "ended", "doors"];
   const rows = [...stats].map(([group, s]) => [
     group,
     String(s.turns),
@@ -91,6 +98,9 @@ export function formatStats(stats: Map<string, GroupStats>): string {
     Object.entries(s.ended)
       .map(([reason, n]) => `${reason} ${n}`)
       .join(", "),
+    Object.entries(s.doors)
+      .map(([door, n]) => `${door} ${n}`)
+      .join(", ") || "-",
   ]);
   const widths = header.map((_, i) => Math.max(...[header, ...rows].map((row) => row[i]!.length)));
   return [header, ...rows].map((row) => row.map((cell, i) => cell.padEnd(widths[i]!)).join("  ").trimEnd()).join("\n");

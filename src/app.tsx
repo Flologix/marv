@@ -316,11 +316,13 @@ export function App({
       const [head, ...rest] = approvals.current;
       if (!head) return;
       let remaining = rest;
-      if (decision === "always") {
-        // The session remembers the scope from now on; requests already waiting in it are covered too.
+      if (decision === "always" && !head.request.once) {
+        // The session remembers the scope from now on; requests already waiting in it are covered too, except the
+        // ones asked every time (`once`: a door to the host).
         const key = head.request.scope.key;
-        for (const pending of rest) if (pending.request.scope.key === key) pending.resolve("yes");
-        remaining = rest.filter((pending) => pending.request.scope.key !== key);
+        const covered = (pending: (typeof rest)[number]) => pending.request.scope.key === key && !pending.request.once;
+        for (const pending of rest) if (covered(pending)) pending.resolve("yes");
+        remaining = rest.filter((pending) => !covered(pending));
       }
       approvals.current = remaining;
       showApprovals();
@@ -384,6 +386,8 @@ export function App({
         mcp,
         approve,
         sandbox: config.sandbox,
+        // The user approves each command at this terminal: bash may ask to run one on the host (#52).
+        hostCommands: true,
         yolo: config.yolo,
         diagnostics: config.diagnostics,
         checks: config.checks,
