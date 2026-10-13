@@ -1,6 +1,6 @@
 {
   "name": "@flologixai/marv",
-  "version": "0.1.2",
+  "version": "0.3.0",
   "description": "A terminal coding agent",
   "private": true,
   "license": "MIT",

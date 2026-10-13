@@ -6,6 +6,10 @@ What counts as Marv's public API: the SDK (`@flologixai/marv/sdk`), the `marv` c
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-12
+
+Everything since 0.1.2: Sprints 1–3 (0.2.0 was never released on its own). Highlights: headless mode (`marv -p`), MCP servers installed with `/mcp add` and logged in with `/mcp login`, deferred MCP tool loading, project checks, tool-call repair, retries for dropped connections, a loop guard, and the step limit.
+
 ### Added
 
 - `/mcp login <server>` logs in to a remote MCP server that asks for an OAuth login, instead of a token in `headers` (issue #18). Marv opens your browser (or, over SSH or without a display, shows the link: paste the address the browser ends up on into the prompt; it goes to the login, never to the model, and shows as `(login callback)`), receives the code on `127.0.0.1` with PKCE and a random `state`, stores the tokens in `~/.marv/mcp-tokens.json` (0600, per server URL; a project's server gets its own login) and connects; new tools reach the model from the next message, as `/mcp trust`'s do. The MCP SDK renews the access token by itself, also across several Marv processes sharing the file. Only `/mcp login` opens a browser or registers Marv with a server: at startup a server without a login shows as `needs login` (in the MCP notice and `/mcp`), and one whose refresh is refused mid-session says so once and its tools fail with "`<server>` needs a new login: the user can run /mcp login `<server>`". `/mcp logout <server>` forgets the login and revokes it where the server allows. Servers without dynamic registration take your own client in the entry: `"oauth": { "clientId", "clientSecret": "${VAR}", "callbackPort", "scope" }` (`scope` overrides the scope the server suggests). `/mcp add` says when a remote server will need a login, and ends with "/mcp login `<name>`". The SDK and `marv -p` use and refresh stored logins, and warn about a server that needs one (`onWarning`, once per server: at startup or when its login runs out mid-turn). The README's "Connect GitHub" keeps the token as the simple path and shows the OAuth-app alternative. Two Marv processes never lose each other's logins (`mcp-tokens.json` is locked across each update with `mcp-tokens.json.lock`: one holder at a time, a holder refreshes it while it works and removes only its own, and a lock untouched for 10 s is a crashed process's, taken over under a second guard file so two waiters can't both take it), and a token file Marv can't read (a newer format, a hand edit) is never written over: the login fails, saying so. A call that arrives while a login reconnects the server goes to the old connection or gets Marv's sentence, never a closed-client error; an untrusted project server refuses `/mcp logout` as it does `/mcp login`. A login cancelled by `/mcp remove`, `/mcp logout`, a new `/mcp login` or quitting stays cancelled even after the browser came back: a token exchange that finishes late saves nothing and never brings a removed server back.
@@ -84,6 +88,8 @@ The first public release, on npm as `@flologixai/marv`.
 - The SDK: `createSession()` from `@flologixai/marv/sdk` runs Marv from code, without the UI.
 - Evals: `bun run eval` runs real models on small tasks with hidden checks.
 
-[Unreleased]: https://github.com/FlologixAI/marv/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/FlologixAI/marv/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/FlologixAI/marv/compare/v0.1.2...v0.3.0
+[0.1.2]: https://github.com/FlologixAI/marv/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/FlologixAI/marv/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/FlologixAI/marv/releases/tag/v0.1.0
