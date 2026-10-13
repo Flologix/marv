@@ -204,38 +204,57 @@ pub fn lifecycle_scripts_changed(before: Option<&str>, after: &str) -> bool {
     }
 }
 
-/// Protected paths that exist at the project's top level (and the hooks folder), mounted read-only on top of the
-/// writable project. `.git` is left to `git_guard` (an approved `git_write` command must write it).
+/// Every protected path that exists in the project, at any level (and the hooks folder), mounted read-only on top of
+/// the writable project: `.envrc`, but also `packages/a/AGENTS.md` and `apps/web/.vscode/`. Only the topmost protected
+/// entry is mounted (a protected folder covers what's in it). Found with the scan's walker, so the same folders are
+/// skipped ([`SKIPPED_DIRS`]). `.git` folders are left to `git_guard` (an approved `git_write` command must write
+/// them); bash makes nested ones read-only for confined commands ([`nested_git_dirs`]).
 ///
 /// bwrap can only mount what exists, so a command can still *create* `.envrc` or a nested `AGENTS.md`: those are
-/// caught after the command by [`scan_created`].
+/// caught after the command by [`scan_created`]. A mount point can't be removed, so a command can't delete a folder
+/// that holds a protected file either.
 pub fn protected_mounts(root: &Path) -> Vec<PathBuf> {
+    let hooks = hooks_rel(root);
     let mut mounts = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(root) {
-        let mut names: Vec<_> = entries.flatten().map(|e| e.file_name()).collect();
-        names.sort();
-        for name in names {
-            let rel = Path::new(&name);
-            match rule_for_relative(rel) {
-                Some(ProtectedRule::GitDir) | None => {}
-                Some(_) => {
-                    let path = root.join(rel);
-                    // bwrap can't mount on a symlink; its target is checked by the path rules instead.
-                    if std::fs::symlink_metadata(&path).is_ok_and(|m| !m.file_type().is_symlink()) {
-                        mounts.push(path);
-                    }
-                }
+    walk(root, Path::new(""), &mut |rel, _| match walk_rule(rel, hooks.as_deref()) {
+        Some(ProtectedRule::GitDir) => false,
+        Some(_) => {
+            let path = root.join(rel);
+            // bwrap can't mount on a symlink; its target is checked by the path rules instead.
+            if std::fs::symlink_metadata(&path).is_ok_and(|m| !m.file_type().is_symlink()) {
+                mounts.push(path);
             }
+            false
         }
-    }
+        None => true,
+    });
+    // A hooks folder under a skipped folder (`node_modules/…`) isn't walked, but git runs it all the same.
     if let Some(hooks) = hooks_path(root)
         && hooks.starts_with(root)
         && hooks.is_dir()
-        && !mounts.contains(&hooks)
+        && !mounts.iter().any(|m| hooks.starts_with(m))
     {
         mounts.push(hooks);
     }
     mounts
+}
+
+/// The project's nested `.git` folders (a vendored repository, a submodule's `.git` file), which bash mounts read-only
+/// for a command that runs without asking: git runs their config and hooks when the user works in that folder. The
+/// project's own `.git` is `git_guard`'s.
+pub fn nested_git_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    walk(root, Path::new(""), &mut |rel, _| {
+        if rule_for_relative(rel) == Some(ProtectedRule::GitDir) {
+            let path = root.join(rel);
+            if rel != Path::new(".git") && std::fs::symlink_metadata(&path).is_ok_and(|m| !m.file_type().is_symlink()) {
+                found.push(path);
+            }
+            return false;
+        }
+        true
+    });
+    found
 }
 
 /// The protected entries that existed before a command ran, project-relative. Taken by [`protected_snapshot`].
@@ -274,7 +293,19 @@ fn hooks_rel(root: &Path) -> Option<PathBuf> {
     hooks_path(root).and_then(|h| normalize(&h).strip_prefix(root).ok().map(Path::to_path_buf))
 }
 
-/// Walks the project without following symlinks. `visit(rel, is_dir)` returns whether to descend into a folder.
+/// Folders the walker never goes into, at any level. Their own entry is still visited (a *new* `.git` is reported),
+/// but nothing inside them:
+/// - `node_modules` and `target`: dependencies and build output, often hundreds of thousands of files, and Marv
+///   loads nothing from them (`AGENTS.md` and skills are read from the project's own folders, `.envrc`/`.env` by
+///   direnv and dotenv loaders from the folder the user is in). Walking them three times per command would make
+///   every command slow. A file planted there matters only if something loads it from there, which the user does by
+///   working inside `node_modules`, and that is out of reach for any scan.
+/// - `.git`: git's own data; what changes there is `git_guard`'s business, and an approved `git_write` command must
+///   change it.
+pub const SKIPPED_DIRS: &[&str] = &["node_modules", "target", ".git"];
+
+/// Walks the project without following symlinks. `visit(rel, is_dir)` returns whether to descend into a folder;
+/// [`SKIPPED_DIRS`] never are.
 fn walk(root: &Path, rel: &Path, visit: &mut dyn FnMut(&Path, bool) -> bool) {
     let Ok(entries) = std::fs::read_dir(root.join(rel)) else { return };
     let mut names: Vec<_> = entries.flatten().map(|e| e.file_name()).collect();
@@ -283,14 +314,14 @@ fn walk(root: &Path, rel: &Path, visit: &mut dyn FnMut(&Path, bool) -> bool) {
         let child = rel.join(&name);
         let Ok(meta) = std::fs::symlink_metadata(root.join(&child)) else { continue };
         let is_dir = meta.is_dir(); // false for a symlink: never followed
-        if visit(&child, is_dir) && is_dir {
+        let skipped = is_dir && name.to_str().is_some_and(|n| SKIPPED_DIRS.contains(&n));
+        if visit(&child, is_dir) && is_dir && !skipped {
             walk(root, &child, visit);
         }
     }
 }
 
-/// Every protected entry in the project, before a command runs (see [`scan_created`]). Existing `.git` folders aren't
-/// walked into: what changes there is `git_guard`'s business, and an approved `git_write` command must change it.
+/// Every protected entry in the project, before a command runs (see [`scan_created`]). [`SKIPPED_DIRS`] aren't walked.
 pub fn protected_snapshot(root: &Path) -> ProtectedSnapshot {
     let hooks = hooks_rel(root);
     let mut found = BTreeSet::new();
@@ -313,9 +344,8 @@ pub fn protected_snapshot(root: &Path) -> ProtectedSnapshot {
 /// removes them. Bash calls it after every sandboxed command, once bwrap's placeholder mount points are removed (an
 /// empty `.git` placeholder left behind would read as created).
 ///
-/// Known limits: a protected file that already existed below the top level (mounted only at the top) can still be
-/// *changed*; the scan only sees what's new. It walks the whole project (`node_modules` too, skipping only existing
-/// `.git` folders), twice per command.
+/// Existing protected files, at any level, are mounted read-only ([`protected_mounts`]), so the scan only needs what's
+/// new. It skips [`SKIPPED_DIRS`] (see there why).
 pub fn scan_created(root: &Path, before: &ProtectedSnapshot) -> Vec<CreatedProtected> {
     let hooks = hooks_rel(root);
     let mut created = Vec::new();
@@ -522,5 +552,37 @@ mod tests {
         assert!(note.starts_with("Marv: the command created protected files, which were removed: .env.local ("));
         assert!(note.contains(".envrc (direnv runs it in your shell)"));
         assert_eq!(created_note(&[]), None);
+    }
+
+    #[test]
+    fn existing_protected_paths_at_any_level_are_mounted_but_not_inside_skipped_folders() {
+        let root = TempDir::new("nested-mounts");
+        let r = root.path();
+        for rel in [".envrc", "packages/a/AGENTS.md", "apps/web/.vscode/tasks.json", "apps/web/.vscode/launch.json", "src/a.ts"] {
+            fs::create_dir_all(r.join(rel).parent().unwrap()).unwrap();
+            fs::write(r.join(rel), "x").unwrap();
+        }
+        for rel in ["node_modules/pkg/AGENTS.md", "target/debug/.env", "vendor/x/.git/config", ".git/hooks/x/AGENTS.md"] {
+            fs::create_dir_all(r.join(rel).parent().unwrap()).unwrap();
+            fs::write(r.join(rel), "x").unwrap();
+        }
+        symlink(r.join("src/a.ts"), r.join("src/CLAUDE.md")).unwrap();
+        assert_eq!(protected_mounts(r), vec![r.join(".envrc"), r.join("apps/web/.vscode"), r.join("packages/a/AGENTS.md")]);
+        assert_eq!(nested_git_dirs(r), vec![r.join("vendor/x/.git")]);
+    }
+
+    #[test]
+    fn the_scan_skips_node_modules_target_and_git_but_reports_a_new_git() {
+        let root = TempDir::new("scan-skip");
+        let r = root.path();
+        fs::create_dir_all(r.join(".git")).unwrap();
+        let before = protected_snapshot(r);
+        for rel in ["node_modules/x/.envrc", "target/release/.envrc", ".git/x/.envrc", "a/b/c/d/e/.envrc"] {
+            fs::create_dir_all(r.join(rel).parent().unwrap()).unwrap();
+            fs::write(r.join(rel), "x").unwrap();
+        }
+        fs::create_dir_all(r.join("lib/node_modules_extra/.git")).unwrap();
+        let found: Vec<String> = scan_created(r, &before).into_iter().map(|c| c.path).collect();
+        assert_eq!(found, ["a/b/c/d/e/.envrc", "lib/node_modules_extra/.git"]);
     }
 }
