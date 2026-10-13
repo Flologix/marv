@@ -33,6 +33,8 @@ export function oauthServer(opts: OAuthServerOptions = {}) {
   const scopes: (string | null)[] = [];
   const registrations: Record<string, unknown>[] = [];
   let refuseRefresh = false;
+  /** While set, the code exchange waits for it (a login whose callback came back but whose tokens haven't yet). */
+  let tokenGate: Promise<void> | undefined;
 
   const issue = () => {
     const tokens = { access_token: `at-${random()}`, refresh_token: `rt-${random()}`, token_type: "Bearer", expires_in: 3600 };
@@ -106,6 +108,7 @@ export function oauthServer(opts: OAuthServerOptions = {}) {
           if (!client) return json({ error: "invalid_client" }, 401);
           if (client.secret && form.get("client_secret") !== client.secret) return json({ error: "invalid_client" }, 401);
           if (form.get("grant_type") === "authorization_code") {
+            await tokenGate;
             const grant = codes.get(form.get("code") ?? "");
             codes.delete(form.get("code") ?? "");
             const verifier = form.get("code_verifier") ?? "";
@@ -153,6 +156,15 @@ export function oauthServer(opts: OAuthServerOptions = {}) {
     /** Refresh tokens are refused from now on (invalid_grant): the user has to log in again. */
     refuseRefresh: () => {
       refuseRefresh = true;
+    },
+    /** Holds every code exchange until the returned function is called. */
+    holdTokens: () => {
+      let release!: () => void;
+      tokenGate = new Promise((res) => (release = res));
+      return () => {
+        tokenGate = undefined;
+        release();
+      };
     },
     /** Paths requested, without the method. */
     paths: () => requests.map((r) => r.split(" ")[1]!),

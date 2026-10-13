@@ -88,7 +88,7 @@ const BIDI = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/;
  * The approval for a proposal, and the JSON it shows: the App writes exactly that JSON (parsed back), so what was
  * shown and what's written can't drift. `once`: no "don't ask again", every install is its own decision.
  */
-export function approvalFor(proposal: Proposal, ctx: { env: Env; projectServers?: string[] }): { request: ApprovalRequest; json: string } {
+export function approvalFor(proposal: Proposal, ctx: { env: Env }): { request: ApprovalRequest; json: string } {
   const { name, entry } = proposal;
   const json = JSON.stringify(entry);
   // The screen shows text through printable(): an entry it would change (C1 controls, which JSON doesn't escape) or
@@ -100,7 +100,6 @@ export function approvalFor(proposal: Proposal, ctx: { env: Env; projectServers?
   for (const variable of readsOf(entry)) {
     lines.push(fact("reads", ctx.env[variable] === undefined ? `${variable} (not set: it won't start until you set it and restart Marv)` : `${variable} (set)`));
   }
-  if (ctx.projectServers?.includes(name)) lines.push(fact("note", `this project's .mcp.json also has a server "${name}": it will be ignored, yours wins`));
   lines.push(fact("writes", `${JSON.stringify(name)}: ${json}`));
   return {
     json,

@@ -188,12 +188,26 @@ export async function createSession(options: SessionOptions): Promise<Session> {
     onWarning: options.onWarning,
     problems,
   });
-  // A server that needs a login can't get one here (no prompt to paste into, no browser to open): say how, once.
-  void mcp?.start().then(() => {
-    for (const s of mcp.status()) {
-      if (s.state === "needs-login") options.onWarning?.(`MCP server "${s.name}" needs a login: run marv in a terminal and /mcp login ${s.name}; logins are stored in ${tokensFile}`);
-    }
-  });
+  // A server that needs a login can't get one here (no prompt to paste into, no browser to open): say how, once per
+  // server, whether it needed one at startup or its login ran out mid-session (a refused refresh flips it then).
+  if (mcp) {
+    const warned = new Set<string>();
+    mcp.onChange = () => {
+      for (const s of mcp.status()) {
+        if (s.state !== "needs-login") {
+          // Connected again (another process logged in): a later expiry is worth saying again.
+          if (s.state === "connected") warned.delete(s.name);
+          continue;
+        }
+        if (warned.has(s.name)) continue;
+        warned.add(s.name);
+        try {
+          options.onWarning?.(`MCP server "${s.name}" needs a login: run marv in a terminal and /mcp login ${s.name}; logins are stored in ${tokensFile}`);
+        } catch {} // the caller's handler must not break the manager's state change
+      }
+    };
+    void mcp.start();
+  }
   if (options.resume) {
     try {
       const resumed = await session.resume(options.resume);

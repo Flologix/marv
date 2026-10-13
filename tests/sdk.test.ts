@@ -312,6 +312,39 @@ describe("MCP logins (#18)", () => {
     }
   });
 
+  test("a login refused mid-session: one warning, as at startup, however many calls fail", async () => {
+    const fixture = oauthServer();
+    try {
+      const tui = new McpManager([{ name: "remote", source: "personal", key: "k", transport: { type: "http", url: fixture.url } }], {
+        root,
+        version: "9.9.9",
+        logins: new McpTokenStore(join(configDir, "mcp-tokens.json")),
+      });
+      await tui.start();
+      await tui.login("remote", {
+        authorize: (url) => void fetch(url, { redirect: "manual" }).then((r) => fetch(r.headers.get("location")!)),
+      }).done;
+      await tui.close();
+
+      const provider = new ScriptedProvider([lookup("a"), say("ok"), lookup("b"), say("ok again"), lookup("c"), say("still")]);
+      const warnings: string[] = [];
+      const session = await createSession({ cwd: root, provider, configDir, mcpTools: "eager", mcpServers: { remote: { type: "http", url: fixture.url } }, onWarning: (w) => warnings.push(w) });
+      await collect(session.send("look"));
+      expect(warnings).toEqual([]);
+      fixture.expire();
+      fixture.refuseRefresh();
+      await collect(session.send("again"));
+      expect(toolResult(provider, 3)).toContain("remote needs a new login");
+      await collect(session.send("once more"));
+      expect(warnings).toEqual([
+        `MCP server "remote" needs a login: run marv in a terminal and /mcp login remote; logins are stored in ${join(configDir, "mcp-tokens.json")}`,
+      ]);
+      await session.close();
+    } finally {
+      fixture.close();
+    }
+  });
+
   test("without a login: one warning saying how to log in; nothing is registered or opened", async () => {
     const fixture = oauthServer();
     try {

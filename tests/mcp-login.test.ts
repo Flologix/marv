@@ -287,6 +287,86 @@ describe("/mcp login", () => {
   });
 });
 
+describe("a cancelled login stays cancelled", () => {
+  const tokens = async (url: string) => (await store.get(loginKey({ source: "personal", url }, root)))?.tokens;
+  const exchanges = (s: ReturnType<typeof fixture>) => s.paths().filter((p) => p === "/token").length;
+
+  test("/mcp remove while the browser is out: the login is cancelled, a late callback does nothing, the server stays removed", async () => {
+    const s = fixture();
+    const m = manager([remote(s.url)]);
+    await m.start();
+    let location: Promise<string> | undefined;
+    const login = m.login("remote", { authorize: (url) => void (location = redirectOf(url)) });
+    while (!location) await Bun.sleep(5);
+    const href = await location;
+    await m.remove("remote");
+    await expect(login.done).rejects.toThrow("cancelled: /mcp remove");
+    expect(login.paste(href).ok).toBe(false);
+    await Bun.sleep(50);
+    expect(m.status()[0]!.state).toBe("removed");
+    expect(s.paths()).not.toContain("/token");
+    m.forgetRemoved();
+    expect(m.status()).toEqual([]);
+  });
+
+  test("/mcp remove after the callback, while the code is exchanged: no tokens saved, no reconnect", async () => {
+    const s = fixture();
+    const m = manager([remote(s.url)]);
+    await m.start();
+    const release = s.holdTokens();
+    const login = m.login("remote", { authorize: (url) => void browse(url) });
+    while (exchanges(s) === 0) await Bun.sleep(5);
+    await m.remove("remote");
+    release();
+    await expect(login.done).rejects.toThrow("cancelled: /mcp remove");
+    expect(await tokens(s.url)).toBeUndefined();
+    expect(m.status()[0]!.state).toBe("removed");
+    m.forgetRemoved();
+    expect(m.status()).toEqual([]);
+  });
+
+  test("/mcp logout while a new login's code is exchanged: the late tokens don't undo the logout", async () => {
+    const s = fixture();
+    const m = manager([remote(s.url)]);
+    await m.start();
+    await logIn(m);
+    const before = exchanges(s);
+    const release = s.holdTokens();
+    const login = m.login("remote", { authorize: (url) => void browse(url) });
+    while (exchanges(s) === before) await Bun.sleep(5);
+    expect(await m.logout("remote")).toEqual({ revoked: "revoked" });
+    release();
+    await expect(login.done).rejects.toThrow("cancelled: /mcp logout");
+    expect(await tokens(s.url)).toBeUndefined();
+    expect(m.status()[0]!.state).toBe("needs-login");
+  });
+
+  test("a login superseded while its code is exchanged saves nothing and doesn't reconnect", async () => {
+    const s = fixture();
+    const m = manager([remote(s.url)]);
+    await m.start();
+    const release = s.holdTokens();
+    const first = m.login("remote", { authorize: (url) => void browse(url) });
+    while (exchanges(s) === 0) await Bun.sleep(5);
+    const second = m.login("remote", { authorize: () => {} });
+    second.done.catch(() => {});
+    release();
+    await expect(first.done).rejects.toThrow("cancelled: another login started");
+    expect(await tokens(s.url)).toBeUndefined();
+    expect(m.status()[0]!.state).toBe("needs-login");
+  });
+
+  test("connecting never brings a removed server back", async () => {
+    const s = fixture({ open: true });
+    const m = manager([remote(s.url)]);
+    await m.start();
+    await m.remove("remote");
+    const connections = (m as unknown as { connections: unknown[]; connect(c: unknown): Promise<void> }).connections;
+    await (m as unknown as { connect(c: unknown): Promise<void> }).connect(connections[0]);
+    expect(m.status()[0]!.state).toBe("removed");
+  });
+});
+
 describe("refresh", () => {
   test("an expired access token is refreshed transparently, and the store holds the new tokens", async () => {
     const s = fixture();
