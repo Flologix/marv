@@ -14,7 +14,7 @@ grep -rn 'todo!("port' crates/<crate>             # in one crate
 | marv-core | — | All: types, `printable` | — |
 | marv-fs | [fs.md](subsystems/fs.md) | All: `write_private`, `with_file_lock` (cross-process) | — |
 | marv-provider | [provider.md](subsystems/provider.md) | SSE/NDJSON, retry helpers, errors, model list, request bodies, cache breakpoints (#56), reasoning round-trip (#57) | HTTP streaming loops, `create_provider`, model lookup |
-| marv-agent | [agent.md](subsystems/agent.md) | Repetition guards, per-step stream fold, call grouping for parallel reads (#58), compaction v1 | The loop body (`LoopState::advance`), compaction v2 (#63) |
+| marv-agent | [agent.md](subsystems/agent.md) | The loop (`run_agent`, all of `agent.test.ts`), repetition guards, parallel reads (#58), wrap-up at the step limit (#59), compaction v1 | Compaction v2 (#63), continue after a dropped stream (#64) |
 | marv-sandbox | [sandbox.md](subsystems/sandbox.md) | All: bwrap args, stand-in home, protected paths, taint, realpath containment | — |
 | marv-tools | [tools.md](subsystems/tools.md) | `run_tool` approval flow with taint and protected paths, edit matching, repair, diff, `read_file`, `skill` | `run` for edit/write/glob/grep/bash, web_fetch, unicode tier (#60), spill (#61), `apply_patch` (#66) |
 | marv-mcp | [mcp.md](subsystems/mcp.md) | Config, trust key, deferred tools, tool wrapping, JSON-RPC, install proposals | Manager lifecycle, OAuth flow, locked writes, package resolvers |
