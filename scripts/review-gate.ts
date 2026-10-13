@@ -218,7 +218,7 @@ for (const sha of new Set(commits)) {
     if (
       rec && rec.blocking === kp.blocking &&
       rec.version === kp.version && rec.mergeBase === mergeBase &&
-      isAncestor(rec.sha, sha)
+      rec.sha !== sha && isAncestor(rec.sha, sha) // never an empty range
     ) {
       from = rec.sha;
       break; // the newest passed ancestor: the smallest range still covering everything new

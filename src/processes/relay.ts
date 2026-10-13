@@ -31,8 +31,10 @@ export function relaySource(spec: RelaySpec): string {
 }
 
 export async function relayMain(spec: RelaySpec): Promise<void> {
-  const net = require("node:net") as typeof import("node:net");
-  const os = require("node:os") as typeof import("node:os");
+  // getBuiltinModule, not require: the published CLI is a bundle, and a bundler rewrites require() into a helper
+  // (__require) that doesn't exist where this source runs on its own (tests/process-relay.test.ts).
+  const net = process.getBuiltinModule("node:net") as typeof import("node:net");
+  const os = process.getBuiltinModule("node:os") as typeof import("node:os");
   const MAX_LINE = 16;
   type Socket = import("node:net").Socket;
 

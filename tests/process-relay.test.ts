@@ -112,3 +112,21 @@ describe.if(sandboxAvailable())("the relay (in a real sandbox)", () => {
     expect(line).toBe("4789");
   });
 });
+
+// The published CLI is a Bun.build bundle (scripts/release.ts): the relay's source is relayMain.toString() of the
+// bundled function, so it must still run on its own after bundling (a bundler turns require() into __require).
+test("the relay's source still runs after bundling, as in the published CLI", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "marv-relay-bundle-"));
+  try {
+    const built = await Bun.build({ entrypoints: [join(import.meta.dir, "..", "src", "processes", "relay.ts")], outdir: dir, target: "bun" });
+    expect(built.success).toBe(true);
+    const bundled = (await import(join(dir, "relay.js"))) as typeof import("../src/processes/relay.ts");
+    const source = bundled.relaySource({ listen: join(dir, "r.sock"), argv: ["bash", "-c", "echo relay-ran"] });
+    const run = Bun.spawnSync(["bun", "-e", source], { timeout: 10_000 });
+    expect(run.stderr.toString()).toBe("");
+    expect(run.stdout.toString()).toContain("relay-ran");
+    expect(run.exitCode).toBe(0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

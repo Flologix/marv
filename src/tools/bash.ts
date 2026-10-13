@@ -445,7 +445,8 @@ export const bash: Tool<typeof input> = {
       // Checked again here, so no path to run() skips the door (preview refuses first).
       if (!doors?.host) throw new ToolError(NO_HOST_DOOR);
       const result = await runCommand({ command, root, sandbox: false, network: true, timeoutMs: timeout * 1000, signal, env: hostEnv() });
-      // A second line behind hostEnv's filter: token shapes in what the command printed never reach the model.
+      // A second line behind hostEnv's filter, for GitHub's token shapes only (redact()): other secrets a command
+      // prints itself aren't caught, which is why each host command is shown and asked first.
       const shown = redact(formatOutput(result));
       const note = shown.count ? `\nMarv: ${shown.count} token${shown.count === 1 ? " was" : "s were"} redacted from this output.` : "";
       return { output: shown.text + note, summary: `${commandSummary(result, timeout)} · on your machine${shown.count ? ` · ${shown.count} redacted` : ""}` };
