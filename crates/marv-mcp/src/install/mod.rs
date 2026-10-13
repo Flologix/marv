@@ -114,4 +114,84 @@ mod tests {
         assert!(fits(remote.clone(), &opts).unwrap_err().contains("is a remote server"));
         assert!(fits(remote, &AddOptions::default()).is_ok());
     }
+
+    use util::fake::Fake;
+
+    async fn add(text: &str, deps: &Fake) -> crate::Result<Proposal> {
+        match resolve_add(&parse_add_args(text).unwrap(), deps).await? {
+            Resolved::Proposal(p) => Ok(p),
+            Resolved::Choices(c) => panic!("choices: {c:?}"),
+        }
+    }
+
+    fn text(p: &Proposal) -> String {
+        [p.facts.clone(), p.warnings.clone()].concat().join("\n")
+    }
+
+    #[tokio::test]
+    async fn a_url_through_resolve_add_fetches_nothing() {
+        let deps = Fake::default();
+        let p = add("https://mcp.linear.app/mcp", &deps).await.unwrap();
+        assert_eq!(p.name, "linear");
+        assert_eq!(p.entry.to_value(), serde_json::json!({"type": "http", "url": "https://mcp.linear.app/mcp"}));
+        assert!(deps.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_remote_server_that_asks_for_a_login_says_so_unless_it_has_its_own_header() {
+        let deps = Fake { probe: Some(true), ..Fake::default() };
+        let p = add("https://mcp.linear.app/mcp", &deps).await.unwrap();
+        assert_eq!(*deps.probed.lock().unwrap(), ["https://mcp.linear.app/mcp"]);
+        assert!(text(&p).contains("login    it asks for an OAuth login: after adding it, /mcp login linear"));
+        let headed = add(r#"https://mcp.linear.app/mcp --header "Authorization: Bearer ${T}""#, &deps).await.unwrap();
+        assert_eq!(deps.probed.lock().unwrap().len(), 1);
+        assert!(!text(&headed).contains("OAuth"));
+        let open = add("https://mcp.linear.app/mcp", &Fake { probe: Some(false), ..Fake::default() }).await.unwrap();
+        assert!(!text(&open).contains("OAuth"));
+        // No prober (the SDK, tests): nothing is said.
+        assert!(!text(&add("https://mcp.linear.app/mcp", &Fake::default()).await.unwrap()).contains("OAuth"));
+    }
+
+    #[tokio::test]
+    async fn options_that_dont_fit_the_source_are_refused() {
+        let deps = Fake::default();
+        assert!(add("https://mcp.linear.app/mcp --env X", &deps).await.unwrap_err().to_string().contains("--header"));
+        let e = add(r#"weather-mcp --header "Authorization: Bearer ${X}""#, &deps).await.unwrap_err();
+        assert!(e.to_string().contains("--env"));
+    }
+
+    #[tokio::test]
+    async fn options_that_dont_fit_what_a_registry_entry_resolves_to_are_refused_never_dropped() {
+        let deps = Fake::default();
+        // ai.smithery/github resolves to a remote server: --env and server arguments can't apply to it.
+        assert!(add("ai.smithery/github --env X", &deps).await.unwrap_err().to_string().contains("--header"));
+        assert!(add("ai.smithery/github -- --verbose", &deps).await.unwrap_err().to_string().contains("--header"));
+        // io.modelcontextprotocol/filesystem resolves to a package: a --header can't apply to it.
+        let e = add(r#"io.modelcontextprotocol/filesystem --header "X-Key: ${K}" -- /tmp"#, &deps).await.unwrap_err();
+        assert!(e.to_string().contains("--env"));
+    }
+
+    #[test]
+    fn a_server_that_needs_a_login_ends_with_mcp_login_its_name() {
+        let status = crate::manager::McpServerStatus {
+            name: "linear".into(),
+            source: crate::config::ServerSource::Personal,
+            target: "https://mcp.linear.app/mcp".into(),
+            reads: vec![],
+            runs_project_files: vec![],
+            state: crate::manager::McpState::NeedsLogin,
+            tools: vec![],
+            error: None,
+            stderr: None,
+            skipped: vec![],
+            login: None,
+        };
+        assert_eq!(
+            proposal::added_notice(&status),
+            (
+                "Added linear to ~/.marv/mcp.json. It needs a login: /mcp login linear (Marv can use its tools from your next message after that).".into(),
+                false
+            )
+        );
+    }
 }
