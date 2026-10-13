@@ -20,13 +20,14 @@
 //!   parsed ([`arguments_as_object`]), each with a `Marv:` note.
 //! - Subagents get neither MCP tools nor these two.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use marv_core::{ToolCall, ToolSpec};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::text::{printable, truncate};
+use crate::tool::McpTool;
 
 /// The config/SDK setting `mcpTools`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -213,47 +214,24 @@ pub fn search_tools<'a>(specs: &'a [ToolSpec], input: &SearchInput) -> (Vec<&'a 
 /// `tool_search`'s output: one compact JSON line per spec (`readOnly` marked),
 /// then notes. Marks the found names as `loaded`. `read_only` says whether a
 /// tool is `readOnlyHint`.
-/// Tool name → its parameters, and the same as the server ordered them (written by the manager as it lists tools).
-/// `ToolSpec::parameters` is a `serde_json::Value`, which sorts keys; `tool_search` shows a schema with the server's
-/// order, as Marv did (and the oracle compares that text). Used only while it still matches the spec's parameters.
-static SCHEMA_ORDER: std::sync::LazyLock<std::sync::Mutex<HashMap<String, (Value, String)>>> =
-    std::sync::LazyLock::new(Default::default);
-
-/// Remembers how the server ordered `spec`'s parameters (see `tool_search_output`).
-pub fn remember_schema_order(spec: &ToolSpec, ordered: &crate::ordered::Ordered) {
-    if let Ok(text) = serde_json::to_string(ordered) {
-        let mut map = SCHEMA_ORDER.lock().unwrap_or_else(|e| e.into_inner());
-        map.insert(spec.name.clone(), (spec.parameters.clone(), text));
-    }
-}
-
-/// `spec`'s parameters as JSON text: in the server's order when known.
-fn parameters_text(spec: &ToolSpec) -> String {
-    let map = SCHEMA_ORDER.lock().unwrap_or_else(|e| e.into_inner());
-    match map.get(&spec.name) {
-        Some((value, text)) if *value == spec.parameters => text.clone(),
-        _ => spec.parameters.to_string(),
-    }
-}
-
-pub fn tool_search_output(
-    specs: &[ToolSpec],
-    input: &SearchInput,
-    loaded: &mut HashSet<String>,
-    read_only: &dyn Fn(&str) -> bool,
-) -> (String, String) {
-    let (found, unknown) = search_tools(specs, input);
+/// `tool_search`'s answer over the turn's MCP tools: each found tool's name, description and schema (in the
+/// server's key order, as Marv printed it), one compact JSON object per line.
+pub fn tool_search_output(tools: &[McpTool], input: &SearchInput, loaded: &mut HashSet<String>) -> (String, String) {
+    let specs: Vec<ToolSpec> = tools.iter().map(|t| t.spec.clone()).collect();
+    let (found, unknown) = search_tools(&specs, input);
     let mut lines: Vec<String> = Vec::new();
     for s in &found {
         loaded.insert(s.name.clone());
+        let tool = tools.iter().find(|t| t.name == s.name);
         // Written by hand: Marv's `JSON.stringify` order (name, description, parameters, readOnly).
         let text = |t: &str| Value::from(t).to_string();
-        let read_only = if read_only(&s.name) { ",\"readOnly\":true" } else { "" };
+        let read_only = if tool.is_some_and(McpTool::read_only) { ",\"readOnly\":true" } else { "" };
+        let parameters = tool.map_or_else(|| s.parameters.to_string(), |t| t.parameters_text.clone());
         lines.push(format!(
             "{{\"name\":{},\"description\":{},\"parameters\":{}{read_only}}}",
             text(&s.name),
             text(&s.description),
-            parameters_text(s)
+            parameters
         ));
     }
     if !unknown.is_empty() {
@@ -367,6 +345,56 @@ mod tests {
         assert_eq!(choose_mode(McpToolsSetting::Eager, &big, None).mode, McpMode::Eager);
     }
 
+    /// `gh`'s tools, each with a schema whose keys the server sent out of alphabetical order.
+    fn tools_of(names: &[(&str, bool)]) -> Vec<McpTool> {
+        use crate::tool::{McpCallResult, McpCaller, McpToolInfo, make_mcp_tool};
+        struct Never;
+        #[async_trait::async_trait]
+        impl McpCaller for Never {
+            async fn call(
+                &self,
+                _: &str,
+                _: serde_json::Map<String, Value>,
+                _: tokio_util::sync::CancellationToken,
+            ) -> crate::Result<McpCallResult> {
+                Err(crate::McpError::Server("never".into()))
+            }
+        }
+        let server = crate::config::parse_server(
+            "gh",
+            &serde_json::json!({"command": "x"}),
+            crate::config::ServerSource::Personal,
+            &|_| None,
+            "f",
+        )
+        .unwrap();
+        let raw = r#"{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"number"}},"required":["zeta"]}"#;
+        names
+            .iter()
+            .map(|(name, read_only)| {
+                let mut info: McpToolInfo = serde_json::from_value(serde_json::json!({
+                    "name": name, "description": "List things", "inputSchema": serde_json::from_str::<Value>(raw).unwrap(),
+                }))
+                .unwrap();
+                if *read_only {
+                    info.annotations = Some(crate::tool::McpToolAnnotations { read_only_hint: Some(true), title: None });
+                }
+                make_mcp_tool(&server, info, std::sync::Arc::new(Never)).with_schema_order(&serde_json::from_str(raw).unwrap())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tool_search_shows_the_schema_in_the_servers_order() {
+        let tools = tools_of(&[("prs", false)]);
+        let (out, _) =
+            tool_search_output(&tools, &SearchInput { names: vec!["mcp__gh__prs".into()], query: None }, &mut HashSet::new());
+        assert_eq!(
+            out,
+            r#"{"name":"mcp__gh__prs","description":"(MCP server \"gh\") List things","parameters":{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"number"}},"required":["zeta"]}}"#
+        );
+    }
+
     #[test]
     fn search_finds_names_then_words() {
         let specs = vec![
@@ -382,10 +410,14 @@ mod tests {
         assert_eq!(names, vec!["mcp__fs__read", "mcp__gh__prs", "mcp__gh__issues"]);
         assert_eq!(unknown, vec!["nope"]);
         let mut loaded = HashSet::new();
+        let tools = tools_of(&[("prs", true), ("issues", false)]);
         let (out, summary) =
-            tool_search_output(&specs, &SearchInput { names: vec!["mcp__gh__prs".into()], query: None }, &mut loaded, &|_| true);
+            tool_search_output(&tools, &SearchInput { names: vec!["mcp__gh__prs".into()], query: None }, &mut loaded);
         assert!(out.contains("\"readOnly\":true") && loaded.contains("mcp__gh__prs"));
         assert_eq!(summary, "1 tool");
+        let (out, _) =
+            tool_search_output(&tools, &SearchInput { names: vec!["mcp__gh__issues".into()], query: None }, &mut loaded);
+        assert!(!out.contains("readOnly"));
         assert_eq!(
             unknown_tool_error(&specs, "mcp__gh__issue"),
             "No MCP tool is named \"mcp__gh__issue\". Closest: mcp__gh__issues, mcp__gh__prs."

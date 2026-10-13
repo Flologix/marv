@@ -48,14 +48,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::client::{Client, HttpOptions, Stderr, StdioOptions};
 use crate::config::{McpServerConfig, McpTransport, ServerSource};
-use crate::deferred::remember_schema_order;
 use crate::oauth::{
     Abort, Authorize, CallbackCheck, CallbackExpectation, CallbackHandler, LoginNeeded, McpOAuthProvider, ProviderMode,
     ProviderOptions, Revoked, listen, new_state, revoke,
 };
 use crate::oauth_store::{Login, McpTokenStore, login_key};
 use crate::ordered::Ordered;
-use crate::tool::acceptable_schema_ordered;
 use crate::tool::{McpCallResult, McpCaller, McpTool, McpToolInfo, make_mcp_tool};
 use crate::trust::McpTrust;
 
@@ -1006,10 +1004,10 @@ impl McpManager {
                             .into_iter()
                             .map(|(info, schema)| {
                                 let tool = make_mcp_tool(&config, info, caller.clone());
-                                if let Some(schema) = schema {
-                                    remember_schema_order(&tool.spec, &acceptable_schema_ordered(&schema));
+                                match schema {
+                                    Some(schema) => tool.with_schema_order(&schema),
+                                    None => tool,
                                 }
-                                tool
                             })
                             .collect();
                         to_close.extend(c.client.replace(client.clone()));

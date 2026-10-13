@@ -101,12 +101,11 @@ impl Tool for ToolSearchTool {
         if input.names.is_empty() { input.query.clone().unwrap_or_default() } else { input.names.join(", ") }
     }
     async fn run(&self, input: &Self::Input, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
-        let (tools, specs) = (self.mcp.tools(), self.mcp.specs());
-        let read_only = |name: &str| tools.iter().any(|t| t.name == name && t.read_only());
+        let tools = self.mcp.tools();
         // Compact JSON: a loaded schema costs what its spec would have, once instead of in every request.
         let (output, summary) = {
             let mut loaded = self.loaded.lock().unwrap_or_else(|e| e.into_inner());
-            tool_search_output(&specs, input, &mut loaded, &read_only)
+            tool_search_output(&tools, input, &mut loaded)
         };
         Ok(ToolOutput::ok(output, summary))
     }

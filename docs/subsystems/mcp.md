@@ -59,7 +59,7 @@ These come from `docs/SECURITY.md` ("MCP") and the 2026-10-12 audit.
 - **No standalone GET stream** on Streamable HTTP: Marv reacted to no server-initiated message (list changes, sampling), so only POSTs are made. A server's request on a POST's stream gets "method not found" (a ping is answered).
 - **Passive providers refuse before registering.** The SDK sent the registration request and then failed to save it in a background connection; marv-rs raises `LoginNeeded` before any request.
 - **Timeouts.** `connecting timed out after Ns` / `listing tools timed out after Ns` wrap the handshake; a call's timeout (`timeout` in the config, 120 s) restarts on progress and ends with the SDK's `MCP error -32001: Request timed out`.
-- **Schema key order.** `ToolSpec::parameters` sorts keys (serde_json); `tool_search` prints a tool's schema in the server's order through a small registry the manager fills as it lists tools (`deferred::remember_schema_order`). A cleaner API would pass `McpTool`s to `tool_search_output`; that needs `marv-session/src/mcp_tools.rs`.
+- **Schema key order.** `ToolSpec::parameters` sorts keys (serde_json); `tool_search` prints a tool's schema in the server's order, as Marv did. The manager keeps the server's text in `McpTool::parameters_text` (`with_schema_order`), and `tool_search_output` takes the turn's `McpTool`s.
 - **Logins and tests.** OAuth is tested against a fake authorization server (`tests/support`), never a real one.
 - **`as_mcp_call` and JSON repair.** It accepts only text that is exactly one JSON object. Marv also accepted text that #10's `repairJsonArgs` turns into one; pass that in once `marv-tools` exposes it.
 - **Char counts.** Lengths and the 30k cap count Unicode scalar values. Marv counted UTF-16 units, so results differ only for astral-plane text.
@@ -90,7 +90,7 @@ McpTool { name, description, spec, server, source, info, .. }
 
 // deferred (session: decide once per conversation, save ModeChoice.mode)
 choose_mode(setting, &specs, context_len) -> ModeChoice; deferred_specs(); announcement(&added, &gone);
-tool_search_output(..); unknown_tool_error(..); schema_hint(spec); as_mcp_call(call, &names); arguments_as_object(raw)
+tool_search_output(&tools, input, &mut loaded); unknown_tool_error(..); schema_hint(spec); as_mcp_call(call, &names); arguments_as_object(raw)
 
 // oauth / store (TUI: is_callback() before sending a message to the model)
 oauth::is_callback(text); oauth::LoginNeeded; oauth_store::{McpTokenStore, login_key}
