@@ -357,10 +357,7 @@ pub fn revert_created(root: &Path, created: &mut [CreatedProtected]) {
     let Ok(real_root) = std::fs::canonicalize(root) else { return };
     for entry in created.iter_mut() {
         let path = root.join(&entry.path);
-        let parent_inside = path
-            .parent()
-            .and_then(|p| std::fs::canonicalize(p).ok())
-            .is_some_and(|p| is_inside(&real_root, &p));
+        let parent_inside = path.parent().and_then(|p| std::fs::canonicalize(p).ok()).is_some_and(|p| is_inside(&real_root, &p));
         let Ok(meta) = std::fs::symlink_metadata(&path) else {
             entry.reverted = true; // already gone
             continue;
