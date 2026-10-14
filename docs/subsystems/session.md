@@ -126,6 +126,8 @@ Approvals: the client supplies an `Arc<dyn marv_tools::Approver>` (`SessionInit:
 - **Subagents don't inherit network, web, MCP or mesh approvals** (`AlwaysScopes::for_subagent`). Their taint is `TaintState::for_subagent()`. In a worktree, `SubagentApprover` never auto-approves `must_ask`.
 - **The config dir comes only from the real environment.** The CLI builds `Env` from `std::env::vars()`. No project file is ever consulted.
 - **Skills, agent files and checks are read only after a realpath containment check** (`marv_sandbox::resolve_within`, or `symlink_metadata` for checks). A symlink out of the project is refused and reported.
+  - Exception (#75): a personal skill folder linked to a folder only root can change (`system_owned`: it and every parent owned by root, not group/world-writable) loads from the real target, so `Skill::dir` is that target and the `skill` tool reads there (outside the sandbox, confined by `resolve_within`). `/skills` shows it as `personal: omarchy → /usr/share/…`. A project skill's link is always refused. Tests inject the ownership check (`load_skills_with`, `only_root_can_change`).
+  - Started in `~`, `.marv/skills` and `~/.marv/skills` are the same folder (compared after canonicalize): it's scanned once, as personal skills, so each problem is reported once.
 - **A background process's new protected files are removed when it ends** (#24): the same scan bash runs after a command (`protected_snapshot` at the start, `scan_created`/`revert_created` when it stops or exits, the note in its `notes`). Marv had no such scan.
 - **New events and records:** `SessionEvent::Tainted`, plus the `taint` and `mesh` trajectory records.
 

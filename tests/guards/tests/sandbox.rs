@@ -410,7 +410,8 @@ async fn no_write_through_a_dangling_symlink_out_of_the_project() {
 /// (`ln -s ~/.ssh/id_ed25519 .marv/skills/x/key`), and skill folders the loader follows.
 ///
 /// Proven: made `resolve_within` skip its realpath check → failed (the key read); made `load_skills` use
-/// `dir.join(folder)` instead of `resolve_within` → failed (the outside skill loaded).
+/// `dir.join(folder)` instead of `resolve_within` → failed (the outside skill loaded); made `system_owned` return
+/// true → failed (the personal link to a temp folder loaded).
 #[tokio::test]
 async fn skill_files_and_folders_stay_inside_after_realpath() {
     let (project, outside) = (TempDir::new("skills"), TempDir::new("skills-out"));
@@ -429,4 +430,54 @@ async fn skill_files_and_folders_stay_inside_after_realpath() {
     let ctx = ToolContext { skills: Arc::new(skills.into_iter().map(|s| s.skill).collect()), ..ToolContext::new(project.path()) };
     let out = run_tool(&call("skill", json!({"name": "x", "file": "key"})), &ctx, builtin_tools()).await;
     assert!(out.result.is_error && !out.result.output.contains("PRIVATE KEY"), "{}", out.result.output);
+
+    // A personal skill folder linked to a folder the user can write is refused too: only a folder root alone can
+    // change may be linked in (#75).
+    let home = TempDir::new("skills-home");
+    std::fs::create_dir_all(home.path().join(".marv/skills")).unwrap();
+    std::os::unix::fs::symlink(outside.path().join("evil"), home.path().join(".marv/skills/evil")).unwrap();
+    let (skills, problems) = marv_session::skills::load_skills(None, Some(home.path()));
+    assert!(skills.is_empty() && problems.iter().any(|p| p.contains("evil")), "{problems:?}");
+}
+
+/// The one exception (#75): a **personal** skill folder that is a symlink to a folder only root can change (Omarchy's
+/// `~/.marv/skills/omarchy -> /usr/share/omarchy/…`) loads from its real path. The same link in a project is
+/// refused, a folder the user (or a group, or everyone) can write is no system folder, nor is one under such a
+/// parent, and a link inside the system folder still can't lead out of it.
+///
+/// Proven: made `load_skills_with` accept the link for project skills too → failed (the project's loaded); made
+/// `only_root_can_change` check only the folder, not its parents → failed; dropped its `mode & 0o022` → failed;
+/// made `read_skill_file` skip `resolve_within` → failed (the key read).
+#[tokio::test]
+async fn only_personal_skills_may_link_to_a_folder_only_root_can_change() {
+    use marv_session::skills::{SkillSource, load_skills_with, only_root_can_change};
+    let (home, project, system, private) =
+        (TempDir::new("sys-home"), TempDir::new("sys-project"), TempDir::new("sys"), TempDir::new("sys-private"));
+    private.write("id_ed25519", "PRIVATE KEY\n");
+    system.write("omarchy/SKILL.md", "---\nname: omarchy\ndescription: Omarchy.\n---\nBody.\n");
+    let target = std::fs::canonicalize(system.path().join("omarchy")).unwrap();
+    std::os::unix::fs::symlink(private.path().join("id_ed25519"), target.join("key")).unwrap();
+    for base in [home.path(), project.path()] {
+        std::fs::create_dir_all(base.join(".marv/skills")).unwrap();
+        std::os::unix::fs::symlink(&target, base.join(".marv/skills/omarchy")).unwrap();
+    }
+    // Tests can't make root-owned folders: the ownership check is injected, and its rule tested below.
+    let is_target = |p: &Path| p == target;
+
+    let (skills, problems) = load_skills_with(None, Some(home.path()), &is_target);
+    assert!(problems.is_empty(), "{problems:?}");
+    assert_eq!((skills.len(), skills[0].source, &skills[0].skill.dir), (1, SkillSource::Personal, &target));
+    let ctx = ToolContext { skills: Arc::new(skills.into_iter().map(|s| s.skill).collect()), ..ToolContext::new(home.path()) };
+    let out = run_tool(&call("skill", json!({"name": "omarchy", "file": "key"})), &ctx, builtin_tools()).await;
+    assert!(out.result.is_error && !out.result.output.contains("PRIVATE KEY"), "{}", out.result.output);
+
+    let (skills, problems) = load_skills_with(Some(project.path()), None, &is_target);
+    assert!(skills.is_empty() && problems.iter().any(|p| p.contains("omarchy")), "{problems:?}");
+
+    let real = Path::new("/usr/share/omarchy");
+    let all_root = |p: &Path| Some((0, if p == Path::new("/") { 0o40555 } else { 0o40755 }));
+    assert!(only_root_can_change(real, &all_root));
+    assert!(!only_root_can_change(real, &|p| Some(if p == Path::new("/usr") { (1000, 0o40755) } else { (0, 0o40755) })));
+    assert!(!only_root_can_change(real, &|p| Some(if p == Path::new("/usr") { (0, 0o40777) } else { (0, 0o40755) })));
+    assert!(!only_root_can_change(real, &|p| Some(if p == real { (0, 0o40775) } else { (0, 0o40755) })));
 }
