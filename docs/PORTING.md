@@ -34,13 +34,11 @@ None open. Issue #1 closed the skeleton's: marv-fs (`private_file`, `file_lock`)
 - **The session ↔ TUI bridge:** marv-cli maps `SessionEvent` to `UiEvent` and implements `SessionPort` on `MarvSession`. See cli.md.
 - **Draft labels:** `tool_draft` lives in marv-session; the TUI's draft view uses it through `UiEvent::ToolCallDelta`.
 
-## Sprint 4 features (Marv 0.4.0) still to add to the skeleton
-These features merge in Marv after this skeleton was cut at 0.3.0:
-- the plan tool (#15);
-- checkpoints and `/undo` (#16);
-- the doors: `github` tool (#47), background processes (#51), `sandbox: false` (#52).
-
-Add modules for them once Marv's sprint-4 PR merges. In marv-rs, the doors become mesh receptacles (`github.read`, `process.<name>`).
+## Sprint 4 features (Marv 0.4.0): ported
+Marv's Sprint 4 (FlologixAI/marv#71, 9bb4a34) is in, and the oracle is recorded from it (30/30):
+- the plan tool (#15, marv-rs #21);
+- checkpoints and `/undo` (#16, #22);
+- the doors (#23, #24): the `github` tool (#47), host bash `sandbox: false` (#52) and the `process` tool (#51), with Marv's door warnings, `once` approvals and guards for each. They are tools as in Marv; exposing them as mesh receptacles (`github.read`, `process.<name>`) is later work.
 
 ## Build order (milestones)
 
