@@ -25,15 +25,20 @@
 //! `/undo` (Marv #16): the session's `undo_plan()`, its files and diffs asked through the same approval queue (`once`),
 //! then `undo()` and `undo_summary`'s line; refused while a turn runs.
 //!
+//! MCP (Marv #6, #18, #46): `/mcp trust` trusts the project's waiting servers (for their exact config) and starts them;
+//! `/mcp add` looks the source up (all fetching before the approval, Esc stops it), asks once (yes or no) with the
+//! exact JSON, writes that JSON to `~/.marv/mcp.json` and starts the server without a restart; `/mcp search` asks the
+//! MCP Registry; `/mcp remove` takes one of yours out and stops it (no approval: the user typed it, and it takes
+//! capability away); `/mcp login` opens the browser where one can open, shows the link either way, and takes a pasted
+//! callback address ([`SessionPort::login_callback`]) for a browser on another machine; `/mcp logout` revokes where
+//! the server can and forgets the tokens. None of them is a turn. Once the servers have started, one notice says
+//! which failed, which wait for trust and which need a login; a login that runs out later is told once.
+//!
 //! Port notes (marv-rs):
 //! - `marv -c` resumes before the UI starts, so a message can't be typed into the session being swapped out (Marv held
 //!   `send` with "Loading your last session…"); the App gets `Resumed` as its first event.
 //! - The saved transcript is the session's default (the messages and the replies): the App owns the transcript the
 //!   user sees and the boundary has no way to read it back. Tool entries and notices aren't restored on resume.
-//! - `/mcp add|search|remove|trust|login|logout` say they aren't available yet: `McpManager`'s methods are still being
-//!   ported (#6). `/mcp` (the list) works.
-//! - The MCP manager is only made when a config lists servers (Marv always made one, so `/mcp add` could start the
-//!   first): its `start`/`close` aren't ported yet (#6), and with none to start there's nothing to wait for.
 //! - A `must_ask` request (tainted egress, a protected path) carries its protected rule's reason into the preview's
 //!   warning line, since the view's `ApprovalRequest` has no `protected` field.
 
@@ -49,6 +54,11 @@ use futures::StreamExt;
 use futures::future::BoxFuture;
 use marv_agent::LoopEvent;
 use marv_core::{StopReason, printable};
+use marv_mcp::install::proposal::{ResolveDeps, added_notice, approval_for};
+use marv_mcp::install::{Resolved, parse_add_args, resolve_add};
+use marv_mcp::manager::{McpServerStatus, McpState};
+use marv_mcp::oauth::{Authorize, CallbackCheck, Revoked};
+use marv_mcp::personal_file::{add_personal_server, personal_server_names, remove_personal_server};
 use marv_mesh::herdr::{HerdrReporter, HerdrState, herdr_target};
 use marv_provider::ProviderKind;
 use marv_provider::factory::{ConfigFactory, LoadModels, MakeProvider};
@@ -75,8 +85,10 @@ use marv_tui::view::{
     self, ApprovalId, CommandInfo, Notice, NoticeItem, NoticeTone, ProviderId, Role, SessionPort, SetupAnswer, SetupContext,
     SetupStart, StatusInfo, UiEvent, WelcomeInfo,
 };
+use serde_json::Value;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 
 /// How long the MCP servers get to shut down on the way out.
 const MCP_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -86,7 +98,10 @@ const PROCESSES_STOP_TIMEOUT: Duration = Duration::from_millis(2500);
 const HERDR_RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
 const WORKING: &str = "Marv is working: stop the current turn (Esc) before resuming another session.";
 const NEXT_TIME: &str = "Marv will use it from the next conversation (/clear starts one).";
-const MCP_NOT_YET: &str = "That /mcp command isn't available in marv-rs yet (the MCP manager is still being ported).";
+const NOT_ADDED: &str = "Stopped: nothing was added.";
+
+/// `/mcp add`'s lookup and `/mcp search`: the network, given the lookup's Esc (tests: the install fixtures).
+pub type McpDeps = Arc<dyn Fn(CancellationToken) -> Arc<dyn ResolveDeps> + Send + Sync>;
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Mapping: engine types → the TUI's view types
@@ -488,6 +503,135 @@ fn counted(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
+/// An untrusted project server, for the trust notice: what it runs, what it reads from your environment, and which
+/// project files.
+fn describe_untrusted(s: &McpServerStatus) -> String {
+    let mut extras = Vec::new();
+    if !s.reads.is_empty() {
+        let reads: Vec<String> = s.reads.iter().map(|v| format!("${v}")).collect();
+        extras.push(format!("reads {} from your environment", reads.join(", ")));
+    }
+    if !s.runs_project_files.is_empty() {
+        extras.push(format!("runs this project's {} (and whatever those load)", s.runs_project_files.join(", ")));
+    }
+    let which = if extras.is_empty() { String::new() } else { format!(", which {}", extras.join(" and ")) };
+    format!("{} ({}){which}", s.name, s.target)
+}
+
+/// Once the servers have started: a note for any that failed, a project's servers waiting to be trusted (the trust
+/// decision is the security gate: a cloned repository's .mcp.json could run anything, so it says what's at stake), and
+/// those that need a login. None when there's nothing to say.
+fn mcp_notice(status: &[McpServerStatus]) -> Option<Notice> {
+    let of = |state: McpState| status.iter().filter(|s| s.state == state).collect::<Vec<_>>();
+    let (failed, waiting, login) = (of(McpState::Failed), of(McpState::Untrusted), of(McpState::NeedsLogin));
+    let mut items = Vec::new();
+    if !failed.is_empty() {
+        items.push(NoticeItem {
+            text: format!("{} failed to start (see /mcp)", counted(failed.len(), "MCP server", "MCP servers")),
+            detail: Some(failed.iter().map(|s| format!("{}: {}", s.name, s.error.as_deref().unwrap_or_default())).collect()),
+        });
+    }
+    if !waiting.is_empty() {
+        let mut detail: Vec<String> = waiting.iter().map(|s| describe_untrusted(s)).collect();
+        detail.push("They'd run with your permissions, outside the sandbox. /mcp trust starts them.".into());
+        items.push(NoticeItem {
+            text: format!(
+                "This project's .mcp.json lists {} you haven't trusted yet",
+                counted(waiting.len(), "MCP server", "MCP servers")
+            ),
+            detail: Some(detail),
+        });
+    }
+    if !login.is_empty() {
+        items.push(NoticeItem {
+            text: format!("{} a login", counted(login.len(), "MCP server needs", "MCP servers need")),
+            detail: Some(login.iter().map(|s| format!("{}: /mcp login {}", s.name, s.name)).collect()),
+        });
+    }
+    let count = failed.len() + waiting.len() + login.len();
+    (count > 0).then(|| Notice {
+        title: format!("MCP · {count} note{}", if count == 1 { "" } else { "s" }),
+        tone: if failed.is_empty() { NoticeTone::Warning } else { NoticeTone::Error },
+        items,
+    })
+}
+
+/// "github: logged in · connected · 41 tools", or why not: the end of /mcp login.
+fn login_result(s: &McpServerStatus) -> (String, bool) {
+    match s.state {
+        McpState::Connected => {
+            let n = s.tools.len();
+            let tools = format!("{n} tool{}", if n == 1 { "" } else { "s" });
+            (format!("{}: logged in · connected · {tools}. Marv can use them from your next message.", s.name), false)
+        }
+        McpState::NeedsLogin => (format!("{}: logged in, but the server still refused the token (see /mcp).", s.name), true),
+        state => {
+            let why = s.error.clone().unwrap_or_else(|| format!("{state:?}").to_lowercase());
+            (format!("{}: logged in, but it didn't connect: {why} (see /mcp).", s.name), true)
+        }
+    }
+}
+
+fn logout_text(name: &str, revoked: Revoked) -> String {
+    let grant = match revoked {
+        Revoked::Revoked => "The authorization server revoked the grant.",
+        Revoked::Unsupported => {
+            "The authorization server can't revoke it from here, so the grant still exists on its side: remove it in your account's settings there (usually under applications or integrations)."
+        }
+        Revoked::Failed => {
+            "Revoking the grant failed, so it may still exist on the authorization server's side: remove it in your account's settings there."
+        }
+    };
+    format!("Logged out of {name}: its tokens are forgotten. {grant}")
+}
+
+/// Where a login's URL points, as `URL.host` says it: the host, and the port when it isn't the scheme's.
+fn url_host(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    authority.rsplit_once('@').map_or(authority, |(_, h)| h).to_string()
+}
+
+/// The MCP manager, as startup makes it: always (so `/mcp add` can start the first server), starting in the
+/// background. The config's problems are for the startup notice.
+pub fn start_mcp(root: &Path, home: &Path, config_dir: &Path, env: &Env) -> (McpHandle, Vec<String>) {
+    let loaded =
+        marv_mcp::config::load_mcp_config(root, config_dir, env, marv_mcp::config::Include { personal: true, project: true });
+    let mcp = marv_mcp::manager::McpManager::new(
+        loaded.servers,
+        marv_mcp::manager::ManagerOptions {
+            root: root.to_path_buf(),
+            project_key: project_key(root),
+            home: home.to_path_buf(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            trust: Some(marv_mcp::trust::McpTrust::new(config_dir.join("mcp-trust.json"))),
+            // OAuth logins (/mcp login), shared with marv -p and SDK sessions using the same config folder.
+            logins: Some(marv_mcp::oauth_store::McpTokenStore::new(config_dir.join("mcp-tokens.json"))),
+            env: env.clone(),
+            connect_timeout: marv_mcp::manager::CONNECT_TIMEOUT,
+            login_timeout: marv_mcp::manager::LOGIN_TIMEOUT,
+        },
+    );
+    let starting = mcp.clone();
+    tokio::spawn(async move { starting.start().await });
+    (mcp, loaded.problems)
+}
+
+/// The `/mcp login` waiting for its callback: a pasted callback address goes to it.
+struct PendingLogin {
+    id: u64,
+    server: String,
+    paste: Box<dyn FnMut(&str) -> CallbackCheck + Send>,
+}
+
+/// What `/mcp add`'s lookup and approval came to.
+enum AddOutcome {
+    Choices(Vec<String>),
+    Declined(String),
+    Added(String, Value),
+    Failed(String),
+}
+
 // ---------------------------------------------------------------------------------------------------------------------
 // Approvals and Herdr
 // ---------------------------------------------------------------------------------------------------------------------
@@ -632,6 +776,10 @@ pub struct Startup {
     /// How a provider is made from the config (`create_provider`; tests: a scripted one).
     pub make_provider: MakeProvider,
     pub load_models: LoadModels,
+    /// `/mcp add`'s lookup and `/mcp search` (live: [`marv_session::mcp_install::LiveDeps`]).
+    pub mcp_deps: McpDeps,
+    /// `/mcp login`: opens the authorization URL where a browser can open (tests: their own, so none ever opens).
+    pub open_url: Authorize,
 }
 
 /// The TUI's `SessionPort` over a [`MarvSession`].
@@ -659,6 +807,16 @@ pub struct Bridge {
     last_checks: Mutex<Option<ProjectCheckResult>>,
     make_provider: MakeProvider,
     load_models: LoadModels,
+    /// ~/.marv (or MARV_CONFIG_DIR): where config.json is, mcp.json is too.
+    config_dir: PathBuf,
+    mcp_deps: McpDeps,
+    open_url: Authorize,
+    /// Busy work outside a turn (/mcp add's lookup, /mcp search): Esc stops it.
+    busy_work: Mutex<Option<CancellationToken>>,
+    pending_login: Mutex<Option<PendingLogin>>,
+    next_login: AtomicU64,
+    /// Servers already said to need a login (at startup or since), so a mid-session expiry is told once.
+    told_needs_login: Mutex<std::collections::HashSet<String>>,
 }
 
 fn factory(config: &Config, make: &MakeProvider, load: &LoadModels) -> ProviderChoice {
@@ -736,6 +894,13 @@ impl Bridge {
             last_checks: Mutex::default(),
             make_provider: s.make_provider,
             load_models: s.load_models,
+            config_dir: s.config_dir,
+            mcp_deps: s.mcp_deps,
+            open_url: s.open_url,
+            busy_work: Mutex::default(),
+            pending_login: Mutex::default(),
+            next_login: AtomicU64::new(0),
+            told_needs_login: Mutex::default(),
         });
         *changed.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(&bridge));
         Ok(bridge)
@@ -1242,13 +1407,310 @@ impl Bridge {
                 self.emit(UiEvent::Message(message(Role::User, line)));
                 self.run_turn(line.to_string(), Some(for_model));
             }
-            CommandAction::McpTrust
-            | CommandAction::McpAdd { .. }
-            | CommandAction::McpSearch { .. }
-            | CommandAction::McpRemove { .. }
-            | CommandAction::McpLogin { .. }
-            | CommandAction::McpLogout { .. } => self.emit(system(MCP_NOT_YET, true)),
+            CommandAction::McpTrust => self.trust_mcp().await,
+            CommandAction::McpAdd { args } => self.add_mcp(&args).await,
+            CommandAction::McpSearch { words } => self.find_mcp(&words).await,
+            CommandAction::McpRemove { name } => self.remove_mcp(&name).await,
+            CommandAction::McpLogin { server } => self.login_mcp(&server).await,
+            CommandAction::McpLogout { server } => self.logout_mcp(&server).await,
             CommandAction::Exit => self.emit(UiEvent::Exit),
+        }
+    }
+
+    // ---- MCP (Marv #6, #18, #46) ----
+
+    /// Once the servers have started: one notice for those that failed, wait for trust or need a login; from then on
+    /// a server whose login runs out mid-session (a refresh refused) is told once.
+    pub fn watch_mcp(self: &Arc<Self>) {
+        let Some(mcp) = self.mcp.clone() else { return };
+        let me = Arc::downgrade(self);
+        tokio::spawn(async move {
+            mcp.ready().await;
+            let Some(bridge) = me.upgrade() else { return };
+            let status = mcp.status();
+            {
+                let mut told = bridge.told_needs_login.lock().unwrap_or_else(|e| e.into_inner());
+                told.extend(status.iter().filter(|s| s.state == McpState::NeedsLogin).map(|s| s.name.clone()));
+            }
+            let watched = me.clone();
+            let manager = Arc::downgrade(&mcp);
+            mcp.set_on_change(move || {
+                let (Some(bridge), Some(mcp)) = (watched.upgrade(), manager.upgrade()) else { return };
+                for s in mcp.status() {
+                    let mut told = bridge.told_needs_login.lock().unwrap_or_else(|e| e.into_inner());
+                    if s.state == McpState::NeedsLogin && told.insert(s.name.clone()) {
+                        drop(told);
+                        bridge.emit(notice_message(Notice {
+                            title: "MCP".into(),
+                            tone: NoticeTone::Warning,
+                            items: vec![NoticeItem {
+                                text: format!("{} needs a new login: /mcp login {}", s.name, s.name),
+                                detail: Some(vec!["Its tools fail until then.".into()]),
+                            }],
+                        }));
+                    } else if s.state == McpState::Connected {
+                        told.remove(&s.name);
+                    }
+                }
+            });
+            if let Some(notice) = mcp_notice(&status) {
+                bridge.emit(notice_message(notice));
+            }
+        });
+    }
+
+    /// Busy work outside a turn: Esc stops it (`abort` cancels its token), `label` shows where "Thinking…" would.
+    async fn busy_with<T>(&self, label: String, work: impl AsyncFnOnce(CancellationToken) -> T) -> T {
+        let cancel = CancellationToken::new();
+        *self.busy_work.lock().unwrap_or_else(|e| e.into_inner()) = Some(cancel.clone());
+        self.activity.set_busy(true);
+        self.emit(UiEvent::Busy(Some(label)));
+        let result = work(cancel).await;
+        self.emit(UiEvent::Busy(None));
+        self.activity.set_busy(false);
+        *self.busy_work.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        result
+    }
+
+    /// /mcp trust: the project's servers the user hasn't trusted yet, trusted (for this exact config) and started.
+    async fn trust_mcp(&self) {
+        let waiting = self.mcp.as_ref().map(|m| m.untrusted()).unwrap_or_default();
+        let Some(mcp) = self.mcp.as_ref().filter(|_| !waiting.is_empty()) else {
+            return self.emit(system("No MCP servers are waiting to be trusted (/mcp lists them).", false));
+        };
+        let names: Vec<&str> = waiting.iter().map(|s| s.name.as_str()).collect();
+        self.emit(system(format!("Starting {}…", names.join(", ")), false));
+        match mcp.trust_all().await {
+            Ok(started) => {
+                let lines: Vec<String> = started
+                    .iter()
+                    .map(|s| match s.state {
+                        McpState::Connected => format!("{}: connected · {} tools", s.name, s.tools.len()),
+                        _ => format!("{}: failed: {}", s.name, s.error.as_deref().unwrap_or_default()),
+                    })
+                    .collect();
+                let failed = started.iter().any(|s| s.state != McpState::Connected);
+                self.emit(system(lines.join("\n"), failed));
+            }
+            Err(e) => self.emit(system(format!("Couldn't trust the servers: {e}"), true)),
+        }
+    }
+
+    /// /mcp add: look the source up (all fetching happens here, before the approval), ask once with the exact entry,
+    /// write that entry to ~/.marv/mcp.json, and start it. Nothing fetched after the yes changes what runs: the file
+    /// gets the JSON the approval showed, parsed back.
+    async fn add_mcp(&self, args: &str) {
+        let options = match parse_add_args(args) {
+            Ok(options) => options,
+            Err(e) => return self.emit(system(e, true)),
+        };
+        let label = format!("Looking up {}…", printable(&options.source));
+        let outcome = self
+            .busy_with(label, async |cancel: CancellationToken| {
+                let looked_up = self.look_up_and_ask(&options, &cancel).await;
+                looked_up.unwrap_or_else(|e| {
+                    // Esc: the lookup's error is the stop, not the source's fault.
+                    AddOutcome::Failed(if cancel.is_cancelled() {
+                        NOT_ADDED.into()
+                    } else {
+                        format!("Couldn't add the server: {e}")
+                    })
+                })
+            })
+            .await;
+        let (name, entry) = match outcome {
+            AddOutcome::Failed(text) => return self.emit(system(text, true)),
+            AddOutcome::Choices(choices) => {
+                let list: Vec<String> = choices.iter().map(|c| format!("- `{}`", printable(c))).collect();
+                let text = format!("That README names several servers. Add one with:\n\n{}", list.join("\n"));
+                return self.emit(UiEvent::Message(view::Message { markdown: true, ..message(Role::System, text) }));
+            }
+            AddOutcome::Declined(name) => return self.emit(system(format!("Not added: {name}."), false)),
+            AddOutcome::Added(name, entry) => (name, entry),
+        };
+        // Loaded exactly as at startup, so ${VAR}s are filled in the same way.
+        let mut env = self.env.clone();
+        env.insert("MARV_PROJECT_DIR".into(), self.root.to_string_lossy().into_owned());
+        let loaded = marv_mcp::config::parse_mcp_servers(&[(name.clone(), entry)], &env);
+        let Some(server) = loaded.servers.into_iter().next() else {
+            let prefix = format!("\"{name}\" in mcpServers: ");
+            let why = loaded.problems.first().map_or("it couldn't be loaded", |p| p.strip_prefix(&prefix).unwrap_or(p));
+            let text =
+                format!("Added {name} to ~/.marv/mcp.json, but didn't start it: {why}. Set it in your shell and restart Marv.");
+            return self.emit(system(text, true));
+        };
+        let Some(mcp) = &self.mcp else {
+            return self.emit(system(format!("Added {name} to ~/.marv/mcp.json. Restart Marv to start it."), false));
+        };
+        self.emit(system(format!("Starting {name}…"), false));
+        match mcp.add(server).await {
+            Ok(status) => {
+                let (text, is_error) = added_notice(&status);
+                self.emit(system(text, is_error));
+            }
+            Err(e) => self.emit(system(
+                format!("Added {name} to ~/.marv/mcp.json, but didn't start it now: {e} It starts when you restart Marv."),
+                true,
+            )),
+        }
+    }
+
+    /// /mcp add's lookup, its checks and its question; on a yes, the entry written.
+    async fn look_up_and_ask(
+        &self,
+        options: &marv_mcp::install::AddOptions,
+        cancel: &CancellationToken,
+    ) -> Result<AddOutcome, String> {
+        let deps = (self.mcp_deps)(cancel.clone());
+        let proposal = match resolve_add(options, &*deps).await.map_err(|e| e.to_string())? {
+            Resolved::Choices(c) => return Ok(AddOutcome::Choices(c.choices)),
+            Resolved::Proposal(p) => p,
+        };
+        let name = proposal.name.clone();
+        let status = self.mcp.as_ref().map(|m| m.status()).unwrap_or_default();
+        // Removed in this conversation: its tools stay listed until /clear, so it can't come back yet (McpManager::add).
+        if status.iter().any(|s| s.name == name && s.state == McpState::Removed) {
+            return Err(format!(
+                "\"{name}\" was removed in this conversation and its tools stay listed until the next one: /clear first, or pick another --name."
+            ));
+        }
+        if personal_server_names(&self.config_dir).contains(&name) {
+            return Err(format!(
+                "You already have a server named \"{name}\": pick another with --name, or /mcp remove {name} first."
+            ));
+        }
+        // A project server with that name is running (or waiting for trust) under it: McpManager::add can't start a
+        // second one, and replacing it mid-conversation would swap the tools under the model. Another name is simpler.
+        if status.iter().any(|s| s.name == name && s.source == marv_mcp::config::ServerSource::Project) {
+            return Err(format!("This project has a server named \"{name}\": pick another with --name."));
+        }
+        if cancel.is_cancelled() {
+            return Ok(AddOutcome::Failed(NOT_ADDED.into()));
+        }
+        let (approval, json) = approval_for(&proposal, &|v| self.env.contains_key(v))?;
+        let request = marv_session::mcp_install::add_request(&approval);
+        let asked = marv_tools::Approver::approve(&TuiApprover(self.activity.clone()), request).await;
+        if asked != marv_tools::Decision::Yes {
+            return Ok(AddOutcome::Declined(name));
+        }
+        let entry: Value = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+        add_personal_server(&self.config_dir, &name, entry.clone()).await.map_err(|e| e.to_string())?;
+        Ok(AddOutcome::Added(name, entry))
+    }
+
+    /// /mcp search: the MCP Registry's latest, active entries.
+    async fn find_mcp(&self, words: &str) {
+        let found = self
+            .busy_with("Searching the MCP Registry…".into(), async |cancel: CancellationToken| {
+                let deps = (self.mcp_deps)(cancel);
+                marv_mcp::install::registry::search_registry(words, &*deps).await
+            })
+            .await;
+        match found {
+            Ok(hits) => {
+                let text = marv_mcp::install::registry::search_text(words, &hits);
+                self.emit(UiEvent::Message(view::Message { markdown: true, ..message(Role::System, text) }));
+            }
+            Err(e) => self.emit(system(format!("Couldn't search the MCP Registry: {e}"), true)),
+        }
+    }
+
+    /// /mcp remove: one of your servers out of ~/.marv/mcp.json, and stopped. No approval: the user typed it, and it
+    /// takes capability away.
+    async fn remove_mcp(&self, name: &str) {
+        let status = self.mcp.as_ref().map(|m| m.status()).unwrap_or_default();
+        if !personal_server_names(&self.config_dir).iter().any(|n| n == name) {
+            let project = status.iter().any(|s| s.name == name && s.source == marv_mcp::config::ServerSource::Project);
+            let text = if project {
+                format!("\"{name}\" is this project's server: remove it from .mcp.json.")
+            } else {
+                format!("You have no server named \"{name}\" in ~/.marv/mcp.json (/mcp lists them).")
+            };
+            return self.emit(system(text, true));
+        }
+        if let Err(e) = remove_personal_server(&self.config_dir, name).await {
+            return self.emit(system(e.to_string(), true));
+        }
+        let running = status
+            .iter()
+            .any(|s| s.name == name && s.source == marv_mcp::config::ServerSource::Personal && s.state != McpState::Removed);
+        if running && let Some(mcp) = &self.mcp {
+            let _ = mcp.remove(name).await;
+        }
+        let stopped = if running { " and stopped it. Its tools stay listed (failing) until /clear or a restart." } else { "." };
+        self.emit(system(format!("Removed {name} from ~/.marv/mcp.json{stopped}"), false));
+    }
+
+    /// /mcp login: not a turn (the prompt stays free, and a running turn keeps its tools). The browser opens where it
+    /// can; the link is shown either way, with the paste fallback for a browser on another machine. Tokens are never
+    /// shown.
+    async fn login_mcp(&self, name: &str) {
+        let Some(mcp) = &self.mcp else { return };
+        let (tx, open, server) = (self.activity.tx.clone(), self.open_url.clone(), name.to_string());
+        let authorize: Authorize = Arc::new(move |url| {
+            let text = format!(
+                "Log in to {server} at {}: opening your browser… If it doesn't open, open this link and, if your browser then shows an error page, paste its address here:\n{url}",
+                url_host(url.as_str())
+            );
+            let _ = tx.send(system(text, false));
+            open(url);
+        });
+        let login = match mcp.login(name, authorize) {
+            Ok(login) => login,
+            Err(e) => return self.emit(system(e.to_string(), true)),
+        };
+        let id = self.next_login.fetch_add(1, Ordering::SeqCst);
+        *self.pending_login.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(PendingLogin { id, server: name.to_string(), paste: login.paste });
+        self.told_needs_login.lock().unwrap_or_else(|e| e.into_inner()).insert(name.to_string());
+        match login.done.await {
+            Ok(Ok(status)) => {
+                if status.state == McpState::Connected {
+                    self.told_needs_login.lock().unwrap_or_else(|e| e.into_inner()).remove(name);
+                }
+                let (text, is_error) = login_result(&status);
+                self.emit(system(text, is_error));
+            }
+            Ok(Err(e)) => self.emit(system(format!("{name}: not logged in: {e}"), true)),
+            Err(_) => self.emit(system(format!("{name}: not logged in: the login stopped"), true)),
+        }
+        let mut pending = self.pending_login.lock().unwrap_or_else(|e| e.into_inner());
+        if pending.as_ref().is_some_and(|p| p.id == id) {
+            *pending = None;
+        }
+    }
+
+    /// A pasted callback address: shown as "(login callback)", handed to the waiting login.
+    fn paste_callback(&self, text: &str) {
+        self.emit(UiEvent::Message(message(Role::User, "(login callback)")));
+        let mut pending = self.pending_login.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(login) = pending.as_mut() else {
+            drop(pending);
+            let text = "No login is waiting for that address (/mcp login <server> starts one). It wasn't sent to the model.";
+            return self.emit(system(text, true));
+        };
+        let check = (login.paste)(text);
+        let server = login.server.clone();
+        drop(pending);
+        match check {
+            CallbackCheck::Ok { .. } => self.emit(system(format!("Got it: finishing the login to {server}…"), false)),
+            CallbackCheck::Refused { why } if why == "state" || why == "path" => self.emit(system(
+                "That address isn't from this login: paste the address the browser ended up on after the latest /mcp login.",
+                true,
+            )),
+            CallbackCheck::Refused { why } if why == "used" => self.emit(system("This login already has its callback.", true)),
+            // An error= callback: the login's `done` fails with the reason, and login_mcp says so.
+            CallbackCheck::Refused { .. } => {}
+        }
+    }
+
+    /// /mcp logout: revoke where the server can, forget the login.
+    async fn logout_mcp(&self, name: &str) {
+        let Some(mcp) = &self.mcp else { return };
+        self.told_needs_login.lock().unwrap_or_else(|e| e.into_inner()).insert(name.to_string());
+        match mcp.logout(name).await {
+            Ok(revoked) => self.emit(system(logout_text(name, revoked), false)),
+            Err(e) => self.emit(system(e.to_string(), true)),
         }
     }
 
@@ -1324,6 +1786,17 @@ impl SessionPort for Port {
 
     fn abort(&self) {
         self.0.session.interrupt();
+        if let Some(work) = self.0.busy_work.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            work.cancel();
+        }
+    }
+
+    fn login_callback(&self, text: &str) -> bool {
+        if !marv_mcp::oauth::is_callback(text) {
+            return false;
+        }
+        self.0.paste_callback(text.trim());
+        true
     }
 
     fn load_models(&self, provider: ProviderId) {
@@ -1398,29 +1871,7 @@ pub async fn run(resume: Option<bool>) -> anyhow::Result<i32> {
     let (skills, skill_problems) = marv_session::skills::load_skills(Some(&root), Some(&home));
     let (agents, agent_problems) = marv_session::agents::load_agents(Some(&root), Some(&home));
     // MCP servers start now, in the background; the first request waits for them.
-    let loaded =
-        marv_mcp::config::load_mcp_config(&root, &config_dir, &env, marv_mcp::config::Include { personal: true, project: true });
-    let mcp: Option<McpHandle> = (!loaded.servers.is_empty()).then(|| {
-        marv_mcp::manager::McpManager::new(
-            loaded.servers,
-            marv_mcp::manager::ManagerOptions {
-                root: root.clone(),
-                project_key: project_key(&root),
-                home: home.clone(),
-                version: env!("CARGO_PKG_VERSION").into(),
-                trust: Some(marv_mcp::trust::McpTrust::new(config_dir.join("mcp-trust.json"))),
-                // OAuth logins (/mcp login), shared with marv -p and SDK sessions using the same config folder.
-                logins: Some(marv_mcp::oauth_store::McpTokenStore::new(config_dir.join("mcp-tokens.json"))),
-                env: env.clone(),
-                connect_timeout: marv_mcp::manager::CONNECT_TIMEOUT,
-                login_timeout: marv_mcp::manager::LOGIN_TIMEOUT,
-            },
-        )
-    });
-    if let Some(mcp) = &mcp {
-        let mcp = mcp.clone();
-        tokio::spawn(async move { mcp.start().await });
-    }
+    let (mcp, mcp_problems) = start_mcp(&root, &home, &config_dir, &env);
     let paths = memory_paths(&config_dir, &root);
     let memories = load_memory(&paths).await.unwrap_or_default();
 
@@ -1457,6 +1908,18 @@ pub async fn run(resume: Option<bool>) -> anyhow::Result<i32> {
 
     let cut = instructions.as_ref().and_then(|i| i.cut.clone());
     let github = github_check.await.unwrap_or(false);
+    let mcp_deps: McpDeps = {
+        let env = env.clone();
+        Arc::new(move |cancel| Arc::new(marv_session::mcp_install::LiveDeps::new(env.clone(), cancel)) as Arc<dyn ResolveDeps>)
+    };
+    let open_url: Authorize = {
+        let env = env.clone();
+        Arc::new(move |url| {
+            if marv_mcp::oauth::can_open_browser(&env, std::env::consts::OS) {
+                marv_mcp::oauth::open_browser(&url, std::env::consts::OS);
+            }
+        })
+    };
     let (tx, rx) = unbounded_channel();
     let startup = Startup {
         root: root.clone(),
@@ -1472,8 +1935,8 @@ pub async fn run(resume: Option<bool>) -> anyhow::Result<i32> {
         agents,
         agent_problems,
         memory: Some((paths, memories)),
-        mcp: mcp.clone(),
-        mcp_problems: loaded.problems,
+        mcp: Some(mcp.clone()),
+        mcp_problems,
         hidden_path_folders: hidden,
         sandbox_available: marv_sandbox::bwrap::sandbox_available(),
         github,
@@ -1485,10 +1948,13 @@ pub async fn run(resume: Option<bool>) -> anyhow::Result<i32> {
         load_models: Arc::new(|kind, base_url| {
             Box::pin(async move { marv_provider::models::list_models(kind, &base_url, None).await })
         }),
+        mcp_deps,
+        open_url,
     };
     let notes = tx.clone();
     let bridge = Bridge::start(startup, tx)?;
     bridge.announce(cut.as_ref());
+    bridge.watch_mcp();
     // Wires other processes ask for (`marv mesh wire`, another Marv) wait in the same approval queue, for a person.
     if let Some(mesh) = &mut mesh {
         let person = marv_session::mesh::PersonWires {
@@ -1537,7 +2003,7 @@ pub async fn run(resume: Option<bool>) -> anyhow::Result<i32> {
     // if it's killed harder (bwrap's --die-with-parent).
     let _ = tokio::time::timeout(PROCESSES_STOP_TIMEOUT, bridge.session().stop_processes()).await;
     // Let servers shut down cleanly, but don't hang on one that won't.
-    if let Some(mcp) = mcp {
+    {
         let _ = tokio::time::timeout(MCP_CLOSE_TIMEOUT, tokio::spawn(async move { mcp.close().await })).await;
     }
     // Herdr stops showing an agent in this pane; no waiting on a Herdr that doesn't answer.
@@ -1681,6 +2147,8 @@ mod tests {
                     Ok(vec![marv_provider::ModelInfo { id: "qwen3.5:9b".into(), local: true, ..Default::default() }])
                 })
             }),
+            mcp_deps: Arc::new(|_| panic!("no network in tests")),
+            open_url: Arc::new(|_| panic!("no browser in tests")),
         }
     }
 
@@ -2020,7 +2488,7 @@ mod tests {
         assert_eq!(texts(&[next(&mut rx).await]), ["Forgot: use tabs"]);
 
         port.run_command("/mcp trust".into());
-        assert!(matches!(next(&mut rx).await, UiEvent::Message(m) if m.is_error && m.text == MCP_NOT_YET));
+        assert_eq!(texts(&[next(&mut rx).await]), ["No MCP servers are waiting to be trusted (/mcp lists them)."]);
         port.run_command("/nope".into());
         assert!(matches!(next(&mut rx).await, UiEvent::Message(m) if m.is_error && m.text.starts_with("Unknown command: /nope")));
         port.run_command("/good".into());
@@ -2158,6 +2626,672 @@ mod tests {
         let failed = marv_agent::ToolRun::new(ToolResult { output: "x".into(), summary: None, is_error: true }, "Plan");
         let out = map_event(SessionEvent::Loop(LoopEvent::ToolEnd { call, run: failed }), &mut map, &t, &last);
         assert!(!out.iter().any(|e| matches!(e, UiEvent::Plan(_))));
+    }
+
+    // Marv tests/app.test.tsx "MCP servers", "MCP logins (#18)" and "/mcp add, search and remove" (#27). Nothing
+    // leaves the machine: npm, PyPI, the registry and GitHub are the install fixtures, `npx` is a shell script that
+    // logs how it was run and speaks MCP over stdio, the OAuth server is a local fake, and the browser is a test's.
+    mod mcp {
+        use super::*;
+        use marv_mcp::install::proposal::{Fetched, ResolveDeps};
+        use std::collections::HashMap as Map;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio_util::sync::CancellationToken;
+
+        const NPM_FILESYSTEM: &str = include_str!("../../marv-mcp/src/install/fixtures/npm-server-filesystem.json");
+        const REGISTRY_SEARCH: &str = include_str!("../../marv-mcp/src/install/fixtures/registry-search.json");
+
+        /// The resolvers' network, from the fixtures.
+        #[derive(Default)]
+        struct Net {
+            asked: Mutex<Vec<String>>,
+            readme: Option<String>,
+        }
+        #[async_trait]
+        impl ResolveDeps for Net {
+            async fn get(&self, url: &str, _a: &str, _m: usize, _c: &CancellationToken) -> marv_mcp::Result<Fetched> {
+                self.asked.lock().unwrap().push(url.to_string());
+                let body = if url.starts_with("http://fake/npm/@modelcontextprotocol%2Fserver-filesystem")
+                    || url.starts_with("http://fake/npm/@modelcontextprotocol/server-filesystem")
+                {
+                    NPM_FILESYSTEM
+                } else if url.starts_with("http://fake/registry/v0/servers?") {
+                    REGISTRY_SEARCH
+                } else {
+                    return Ok(Fetched { status: 404, body: "{\"error\":\"Not found\"}".into() });
+                };
+                Ok(Fetched { status: 200, body: body.into() })
+            }
+            async fn readme(&self, _o: &str, _r: &str, _c: &CancellationToken) -> marv_mcp::Result<Option<String>> {
+                Ok(self.readme.clone())
+            }
+            fn npm_registry(&self) -> &str {
+                "http://fake/npm"
+            }
+            fn pypi(&self) -> &str {
+                "http://fake/pypi"
+            }
+            fn registry(&self) -> &str {
+                "http://fake/registry"
+            }
+            fn now_ms(&self) -> u64 {
+                1_791_806_400_000 // 2026-10-12T12:00:00Z, as the fixtures expect
+            }
+            fn cancel(&self) -> CancellationToken {
+                CancellationToken::new()
+            }
+        }
+
+        /// A stdio MCP server in sh with one tool, `read`; it logs its name and arguments to `log`. The handshake is
+        /// told by its `protocolVersion` (tests/guards' `server_instructions_never_leave_the_parser` keeps the
+        /// method's name out of this crate).
+        fn fake_server(path: &Path, log: &Path) {
+            let script = format!(
+                r#"#!/bin/sh
+echo "$(basename "$0") $*" >> '{}'
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"protocolVersion"'*) printf '{{"jsonrpc":"2.0","id":%s,"result":{{"protocolVersion":"2025-06-18","capabilities":{{"tools":{{}}}},"serverInfo":{{"name":"fake","version":"1.0.0"}}}}}}\n' "$id" ;;
+    *'"method":"tools/list"'*) printf '{{"jsonrpc":"2.0","id":%s,"result":{{"tools":[{{"name":"read","description":"Reads.","inputSchema":{{"type":"object","properties":{{}}}}}}]}}}}\n' "$id" ;;
+    *) [ -n "$id" ] && printf '{{"jsonrpc":"2.0","id":%s,"result":{{}}}}\n' "$id" ;;
+  esac
+done
+"#,
+                log.display()
+            );
+            std::fs::write(path, script).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        struct Mcp {
+            port: Port,
+            rx: UnboundedReceiver<UiEvent>,
+            mcp: McpHandle,
+            opened: Arc<Mutex<Vec<String>>>,
+            net: Arc<Net>,
+            log: PathBuf,
+            bin: PathBuf,
+        }
+
+        impl Mcp {
+            fn bridge(&self) -> &Arc<Bridge> {
+                &self.port.0
+            }
+            /// Events until a message containing `part`; their texts.
+            async fn says(&mut self, part: &str) -> Vec<String> {
+                let seen = until(&mut self.rx, |e| matches!(e, UiEvent::Message(m) if m.text.contains(part))).await;
+                texts(&seen)
+            }
+            /// Events until a notice whose items mention `part`; that notice.
+            async fn notice(&mut self, part: &str) -> Notice {
+                let has = |e: &UiEvent| {
+                    matches!(e, UiEvent::Message(view::Message { notice: Some(n), .. })
+                    if n.items.iter().any(|i| i.text.contains(part)))
+                };
+                let seen = until(&mut self.rx, has).await;
+                let Some(UiEvent::Message(view::Message { notice: Some(n), .. })) = seen.last() else { unreachable!() };
+                n.clone()
+            }
+            async fn approval(&mut self) -> (ApprovalId, view::ApprovalRequest) {
+                let seen = until(&mut self.rx, |e| matches!(e, UiEvent::Approval { .. })).await;
+                let Some(UiEvent::Approval { id, request }) = seen.last() else { unreachable!() };
+                (*id, request.clone())
+            }
+            fn mcp_file(&self, dirs: &Dirs) -> Value {
+                serde_json::from_str(&std::fs::read_to_string(dirs.config.join("mcp.json")).unwrap()).unwrap()
+            }
+            fn ran(&self) -> String {
+                std::fs::read_to_string(&self.log).unwrap_or_default()
+            }
+        }
+
+        /// A bridge as `run` makes it: an MCP manager even with no servers, so `/mcp add` can start the first.
+        fn start(dirs: &Dirs, project_servers: Option<Value>, net: Net) -> Mcp {
+            let bin = dirs.base.join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let log = dirs.base.join("ran.log");
+            fake_server(&bin.join("npx"), &log);
+            fake_server(&bin.join("fake-mcp"), &log);
+            if let Some(servers) = project_servers {
+                std::fs::write(dirs.project.join(".mcp.json"), json!({ "mcpServers": servers }).to_string()).unwrap();
+            }
+            let mut s = startup(dirs, Some(asks()), vec![], None);
+            s.env = [
+                ("PATH".to_string(), format!("{}:/usr/bin:/bin", bin.display())),
+                ("OPENROUTER_API_KEY".to_string(), "sk-or-test".to_string()),
+            ]
+            .into();
+            let (mcp, problems) = start_mcp(&s.root, &s.home, &s.config_dir, &s.env);
+            assert_eq!(problems, Vec::<String>::new());
+            s.mcp = Some(mcp.clone());
+            let net = Arc::new(net);
+            let deps = net.clone();
+            s.mcp_deps = Arc::new(move |_cancel| deps.clone() as Arc<dyn ResolveDeps>);
+            let opened = Arc::new(Mutex::new(Vec::new()));
+            let o = opened.clone();
+            s.open_url = Arc::new(move |url| o.lock().unwrap().push(url.to_string()));
+            let (tx, rx) = unbounded_channel();
+            let bridge = Bridge::start(s, tx).unwrap();
+            bridge.watch_mcp();
+            Mcp { port: Port(bridge), rx, mcp, opened, net, log, bin }
+        }
+
+        use serde_json::json;
+
+        #[tokio::test]
+        async fn a_projects_server_waits_for_mcp_trust_and_says_so() {
+            let dirs = Dirs::new();
+            let fake = dirs.base.join("bin/fake-mcp");
+            let mut t = start(
+                &dirs,
+                Some(json!({ "test": { "command": fake, "args": ["--key=${OPENROUTER_API_KEY}"] } })),
+                Net::default(),
+            );
+            let notice = t.notice("you haven't trusted yet").await;
+            assert_eq!((notice.title.as_str(), notice.tone), ("MCP · 1 note", NoticeTone::Warning));
+            assert_eq!(notice.items[0].text, "This project's .mcp.json lists 1 MCP server you haven't trusted yet");
+            let detail = notice.items[0].detail.clone().unwrap();
+            assert!(detail[0].starts_with("test ("), "{detail:?}");
+            assert!(detail[0].ends_with(", which reads $OPENROUTER_API_KEY from your environment"), "{detail:?}");
+            assert_eq!(detail[1], "They'd run with your permissions, outside the sandbox. /mcp trust starts them.");
+            assert!(t.ran().is_empty(), "nothing ran before the trust");
+
+            t.port.run_command("/mcp trust".into());
+            let said = t.says("test: connected").await;
+            assert!(said.contains(&"Starting test…".to_string()), "{said:?}");
+            assert_eq!(said.last().unwrap(), "test: connected · 1 tools");
+            assert!(t.ran().starts_with("fake-mcp --key="));
+            let trust = marv_mcp::trust::McpTrust::new(dirs.config.join("mcp-trust.json"));
+            let include = marv_mcp::config::Include { personal: true, project: true };
+            let env = t.bridge().env.clone();
+            let config = marv_mcp::config::load_mcp_config(&dirs.project, &dirs.config, &env, include).servers.remove(0);
+            assert!(trust.is_trusted(&project_key(&dirs.project), &config));
+            t.port.run_command("/mcp trust".into());
+            t.says("No MCP servers are waiting to be trusted (/mcp lists them).").await;
+            t.mcp.close().await;
+        }
+
+        #[tokio::test]
+        async fn mcp_add_shows_one_approval_with_the_command_and_the_json_and_no_writes_nothing() {
+            let dirs = Dirs::new();
+            let mut t = start(&dirs, None, Net::default());
+            t.port.run_command("/mcp add @modelcontextprotocol/server-filesystem".into());
+            let (id, request) = t.approval().await;
+            assert!(request.once, "no \"don't ask again\"");
+            assert_eq!(request.preview.title, "Add MCP server \"filesystem\" to ~/.marv/mcp.json (yours, every project)");
+            assert_eq!(request.preview.command.as_deref(), Some("npx -y @modelcontextprotocol/server-filesystem@2026.1.14"));
+            let text = request.preview.text.clone().unwrap();
+            assert!(text.contains("2026.1.14, published 2026-01-14"), "{text}");
+            assert!(text.contains("writes   \"filesystem\": {\"command\":\"npx\""), "{text}");
+            assert!(
+                request
+                    .preview
+                    .note
+                    .as_deref()
+                    .unwrap()
+                    .starts_with("runs outside the sandbox, with your permissions and network")
+            );
+            t.port.answer(id, view::Decision::No);
+            t.says("Not added: filesystem.").await;
+            assert!(!dirs.config.join("mcp.json").exists());
+            assert!(t.mcp.status().is_empty());
+            assert!(t.ran().is_empty());
+        }
+
+        #[tokio::test]
+        async fn yes_writes_exactly_the_entry_shown_starts_it_and_mcp_remove_takes_it_out() {
+            let dirs = Dirs::new();
+            let mut t = start(&dirs, None, Net::default());
+            t.port.run_command("/mcp add @modelcontextprotocol/server-filesystem".into());
+            let seen = until(&mut t.rx, |e| matches!(e, UiEvent::Approval { .. })).await;
+            assert!(seen.contains(&UiEvent::Busy(Some("Looking up @modelcontextprotocol/server-filesystem…".into()))));
+            let Some(UiEvent::Approval { id, request }) = seen.last() else { unreachable!() };
+            let shown = request.preview.text.clone().unwrap();
+            t.port.answer(*id, view::Decision::Yes);
+            let said = t.says("connected · 1 tool").await;
+            assert!(said.contains(&"Starting filesystem…".to_string()));
+            assert_eq!(
+                said.last().unwrap(),
+                "Added filesystem to ~/.marv/mcp.json: connected · 1 tool. Marv can use it from your next message."
+            );
+            let written = t.mcp_file(&dirs)["mcpServers"]["filesystem"].clone();
+            let shown_json = shown.rsplit_once("writes   \"filesystem\": ").unwrap().1;
+            assert_eq!(serde_json::from_str::<Value>(shown_json).unwrap(), written, "exactly the entry shown");
+            let home = dirs.base.join("home");
+            assert_eq!(t.ran().trim(), "npx -y @modelcontextprotocol/server-filesystem@2026.1.14");
+            assert!(home.is_dir());
+            let status = t.mcp.status();
+            assert_eq!(
+                (status[0].name.as_str(), status[0].source, status[0].state),
+                ("filesystem", marv_mcp::config::ServerSource::Personal, marv_mcp::manager::McpState::Connected)
+            );
+            assert!(t.mcp.specs().iter().any(|s| s.name == "mcp__filesystem__read"));
+
+            // A name you already have is refused before asking.
+            t.port.run_command("/mcp add @modelcontextprotocol/server-filesystem".into());
+            let said = t.says("Couldn't add the server").await;
+            assert!(said.last().unwrap().contains("You already have a server named \"filesystem\""));
+            assert!(said.last().unwrap().contains("--name"));
+
+            t.port.run_command("/mcp remove filesystem".into());
+            let said = t.says("Removed filesystem").await;
+            assert_eq!(
+                said.last().unwrap(),
+                "Removed filesystem from ~/.marv/mcp.json and stopped it. Its tools stay listed (failing) until /clear or a restart."
+            );
+            assert_eq!(t.mcp_file(&dirs)["mcpServers"], json!({}));
+            assert_eq!(t.mcp.status()[0].state, marv_mcp::manager::McpState::Removed);
+            // Removed in this conversation: it can't come back until the next one.
+            t.port.run_command("/mcp add @modelcontextprotocol/server-filesystem".into());
+            let said = t.says("Couldn't add the server").await;
+            assert!(said.last().unwrap().contains("was removed in this conversation"), "{said:?}");
+            t.mcp.close().await;
+        }
+
+        #[tokio::test]
+        async fn lookups_that_fail_bad_options_and_unset_variables() {
+            let dirs = Dirs::new();
+            let mut t = start(&dirs, None, Net::default());
+            t.port.run_command("/mcp add nope".into());
+            let said = t.says("Couldn't add the server").await;
+            assert!(said.last().unwrap().contains("no npm package named nope"), "{said:?}");
+            assert!(!dirs.config.join("mcp.json").exists());
+
+            let asked = t.net.asked.lock().unwrap().len();
+            t.port.run_command("/mcp add weather --env API_KEY=sk-123".into());
+            t.says("--env takes a variable's name").await;
+            assert_eq!(t.net.asked.lock().unwrap().len(), asked, "nothing was looked up");
+
+            // An unset ${VAR}: written, not started, and Marv says to set it and restart.
+            t.port.run_command("/mcp add @modelcontextprotocol/server-filesystem --env NOT_SET_HERE".into());
+            let (id, request) = t.approval().await;
+            assert!(request.preview.text.unwrap().contains("NOT_SET_HERE (not set"));
+            t.port.answer(id, view::Decision::Yes);
+            let said = t.says("restart Marv").await;
+            assert_eq!(
+                said.last().unwrap(),
+                "Added filesystem to ~/.marv/mcp.json, but didn't start it: ${NOT_SET_HERE} isn't set. Set it in your shell and restart Marv."
+            );
+            assert_eq!(t.mcp_file(&dirs)["mcpServers"]["filesystem"]["env"], json!({"NOT_SET_HERE": "${NOT_SET_HERE}"}));
+            assert!(t.mcp.status().is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_name_this_projects_mcp_json_uses_is_refused_before_asking() {
+            let dirs = Dirs::new();
+            let fake = dirs.base.join("bin/fake-mcp");
+            let mut t = start(&dirs, Some(json!({ "filesystem": { "command": fake } })), Net::default());
+            t.notice("you haven't trusted yet").await;
+            t.port.run_command("/mcp add @modelcontextprotocol/server-filesystem".into());
+            let said = t.says("Couldn't add the server").await;
+            assert!(said.last().unwrap().contains("This project has a server named \"filesystem\": pick another with --name."));
+            assert!(!dirs.config.join("mcp.json").exists());
+            // And /mcp remove points at the project's file.
+            t.port.run_command("/mcp remove filesystem".into());
+            t.says("\"filesystem\" is this project's server: remove it from .mcp.json.").await;
+            t.port.run_command("/mcp remove nope".into());
+            t.says("You have no server named \"nope\" in ~/.marv/mcp.json (/mcp lists them).").await;
+        }
+
+        #[tokio::test]
+        async fn a_readme_naming_several_servers_lists_them_and_search_prints_the_registrys_matches() {
+            let dirs = Dirs::new();
+            let servers = json!({"mcpServers": {"a": {"command": "npx", "args": ["-y", "weather-mcp"]}, "b": {"command": "uvx", "args": ["mcp-server-fetch"]}}});
+            let readme = format!("# Weather\n\n```json\n{servers}\n```\n");
+            let mut t = start(&dirs, None, Net { readme: Some(readme), ..Net::default() });
+            t.port.run_command("/mcp add https://github.com/acme/weather".into());
+            let seen = until(&mut t.rx, |e| matches!(e, UiEvent::Message(m) if m.text.contains("names several servers"))).await;
+            let Some(UiEvent::Message(m)) = seen.last() else { unreachable!() };
+            assert!(m.markdown);
+            assert!(m.text.contains("- `/mcp add weather-mcp`"), "{}", m.text);
+            assert!(m.text.contains("- `/mcp add pypi:mcp-server-fetch`"), "{}", m.text);
+
+            t.port.run_command("/mcp search filesystem".into());
+            let seen = until(&mut t.rx, |e| matches!(e, UiEvent::Message(m) if m.text.contains("MCP Registry"))).await;
+            assert!(seen.contains(&UiEvent::Busy(Some("Searching the MCP Registry…".into()))));
+            let said = texts(&seen);
+            assert!(said.last().unwrap().contains("isn't curated"));
+            assert!(said.last().unwrap().contains("`/mcp add io.modelcontextprotocol/filesystem`"));
+        }
+
+        #[tokio::test]
+        async fn esc_stops_a_lookup_and_nothing_is_added() {
+            let dirs = Dirs::new();
+            let mut t = start(&dirs, None, Net::default());
+            t.port.run_command("/mcp add @modelcontextprotocol/server-filesystem".into());
+            let (id, _) = t.approval().await;
+            // Esc at the approval: the App declines it and aborts.
+            t.port.answer(id, view::Decision::No);
+            t.port.abort();
+            let said = t.says("filesystem").await;
+            assert!(said.last().unwrap() == "Not added: filesystem." || said.last().unwrap() == "Stopped: nothing was added.");
+            assert!(!dirs.config.join("mcp.json").exists());
+        }
+
+        // ---- logins (Marv #18), against a local OAuth server ----
+
+        /// An MCP server that is its own OAuth authorization server: metadata, registration, an `/authorize` that
+        /// redirects straight back, `/token`, `/revoke`. Tokens are random; `/mcp` wants one.
+        struct OAuth {
+            base: String,
+            revoked: Arc<Mutex<Vec<String>>>,
+            /// Every token stops working and refreshes are refused (a login that ran out).
+            expired: Arc<AtomicBool>,
+        }
+
+        async fn oauth_server() -> OAuth {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+            let (tokens, revoked) = (Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(Vec::new())));
+            let expired = Arc::new(AtomicBool::new(false));
+            let (b, tk, rv, ex) = (base.clone(), tokens.clone(), revoked.clone(), expired.clone());
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let (b, tk, rv, ex) = (b.clone(), tk.clone(), rv.clone(), ex.clone());
+                    tokio::spawn(async move {
+                        let _ = oauth_one(stream, &b, &tk, &rv, ex.load(Ordering::SeqCst)).await;
+                    });
+                }
+            });
+            OAuth { base, revoked, expired }
+        }
+
+        fn form(body: &str) -> Map<String, String> {
+            url_pairs(body)
+        }
+
+        fn url_pairs(query: &str) -> Map<String, String> {
+            query.split('&').filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.to_string(), percent_decode(v))).collect()
+        }
+
+        fn percent_decode(v: &str) -> String {
+            let b = v.replace('+', " ").into_bytes();
+            let mut out = Vec::new();
+            let mut i = 0;
+            while i < b.len() {
+                if b[i] == b'%'
+                    && let Some(n) =
+                        std::str::from_utf8(&b[i + 1..(i + 3).min(b.len())]).ok().and_then(|h| u8::from_str_radix(h, 16).ok())
+                {
+                    out.push(n);
+                    i += 3;
+                    continue;
+                }
+                out.push(b[i]);
+                i += 1;
+            }
+            String::from_utf8_lossy(&out).into_owned()
+        }
+
+        fn percent_encode(v: &str) -> String {
+            v.bytes()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || b"-._~".contains(&c) { (c as char).to_string() } else { format!("%{c:02X}") }
+                })
+                .collect()
+        }
+
+        async fn oauth_one(
+            mut stream: tokio::net::TcpStream,
+            base: &str,
+            tokens: &Mutex<Vec<String>>,
+            revoked: &Mutex<Vec<String>>,
+            expired: bool,
+        ) -> std::io::Result<()> {
+            let (method, target, headers, body) = read_request(&mut stream).await?;
+            let (path, query) = target.split_once('?').unwrap_or((&target, ""));
+            let json = |status: u16, v: Value| {
+                (status, vec![("content-type".to_string(), "application/json".to_string())], v.to_string())
+            };
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let random = || format!("{:08x}", NEXT.fetch_add(1, Ordering::SeqCst) * 2_654_435_761 % 4_294_967_291);
+            let (status, extra, body) = match (method.as_str(), path) {
+                ("POST", "/mcp") => {
+                    let auth = headers.get("authorization").cloned().unwrap_or_default();
+                    let ok =
+                        !expired && auth.strip_prefix("Bearer ").is_some_and(|t| tokens.lock().unwrap().iter().any(|k| k == t));
+                    if !ok {
+                        let www = format!("Bearer resource_metadata=\"{base}/.well-known/oauth-protected-resource/mcp\"");
+                        (401, vec![("www-authenticate".to_string(), www)], "unauthorized".to_string())
+                    } else {
+                        let message: Value = serde_json::from_str(&body).unwrap_or_default();
+                        let result = match message["method"].as_str().unwrap_or_default() {
+                            // The handshake (see `fake_server`).
+                            _ if message["params"]["protocolVersion"].is_string() => {
+                                json!({"protocolVersion": message["params"]["protocolVersion"], "capabilities": {"tools": {}}, "serverInfo": {"name": "remote", "version": "1"}})
+                            }
+                            "tools/list" => {
+                                json!({"tools": [{"name": "echo", "description": "Echo.", "inputSchema": {"type": "object", "properties": {}}}]})
+                            }
+                            _ => json!({}),
+                        };
+                        match message.get("id") {
+                            Some(id) => json(200, json!({"jsonrpc": "2.0", "id": id, "result": result})),
+                            None => (202, vec![], String::new()),
+                        }
+                    }
+                }
+                (_, "/.well-known/oauth-protected-resource/mcp" | "/.well-known/oauth-protected-resource") => {
+                    json(200, json!({"resource": format!("{base}/mcp"), "authorization_servers": [base]}))
+                }
+                (_, "/.well-known/oauth-authorization-server") => json(
+                    200,
+                    json!({
+                        "issuer": base,
+                        "authorization_endpoint": format!("{base}/authorize"),
+                        "token_endpoint": format!("{base}/token"),
+                        "registration_endpoint": format!("{base}/register"),
+                        "revocation_endpoint": format!("{base}/revoke"),
+                        "response_types_supported": ["code"],
+                        "code_challenge_methods_supported": ["S256"],
+                    }),
+                ),
+                ("POST", "/register") => {
+                    let mut v: Value = serde_json::from_str(&body).unwrap_or_default();
+                    v["client_id"] = format!("client-{}", random()).into();
+                    json(201, v)
+                }
+                ("GET", "/authorize") => {
+                    let q = url_pairs(query);
+                    let back = format!(
+                        "{}?code=code-{}&state={}",
+                        q.get("redirect_uri").cloned().unwrap_or_default(),
+                        random(),
+                        percent_encode(q.get("state").map_or("", String::as_str))
+                    );
+                    (302, vec![("location".to_string(), back)], String::new())
+                }
+                ("POST", "/token") if expired => json(400, json!({"error": "invalid_grant"})),
+                ("POST", "/token") => {
+                    let (a, r) = (format!("at-{}", random()), format!("rt-{}", random()));
+                    tokens.lock().unwrap().push(a.clone());
+                    json(200, json!({"access_token": a, "refresh_token": r, "token_type": "Bearer", "expires_in": 3600}))
+                }
+                ("POST", "/revoke") => {
+                    revoked.lock().unwrap().push(form(&body).get("token").cloned().unwrap_or_default());
+                    (200, vec![], String::new())
+                }
+                _ => (404, vec![], "not found".to_string()),
+            };
+            let mut out = format!("HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n", body.len());
+            for (k, v) in extra {
+                out.push_str(&format!("{k}: {v}\r\n"));
+            }
+            out.push_str("\r\n");
+            out.push_str(&body);
+            stream.write_all(out.as_bytes()).await?;
+            stream.shutdown().await
+        }
+
+        async fn read_request(
+            stream: &mut tokio::net::TcpStream,
+        ) -> std::io::Result<(String, String, Map<String, String>, String)> {
+            let mut data = Vec::new();
+            let mut buf = [0u8; 4096];
+            let end = loop {
+                if let Some(i) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break i;
+                }
+                let n = stream.read(&mut buf).await?;
+                if n == 0 {
+                    return Err(std::io::ErrorKind::UnexpectedEof.into());
+                }
+                data.extend_from_slice(&buf[..n]);
+            };
+            let head = String::from_utf8_lossy(&data[..end]).to_string();
+            let mut lines = head.split("\r\n");
+            let mut first = lines.next().unwrap_or_default().split(' ');
+            let (method, target) = (first.next().unwrap_or_default().to_string(), first.next().unwrap_or("/").to_string());
+            let headers: Map<String, String> =
+                lines.filter_map(|l| l.split_once(':')).map(|(k, v)| (k.trim().to_lowercase(), v.trim().to_string())).collect();
+            let length: usize = headers.get("content-length").and_then(|l| l.parse().ok()).unwrap_or(0);
+            let mut body = data[end + 4..].to_vec();
+            while body.len() < length {
+                let n = stream.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                body.extend_from_slice(&buf[..n]);
+            }
+            Ok((method, target, headers, String::from_utf8_lossy(&body).into_owned()))
+        }
+
+        /// A GET without following redirects: the `location` it answers with.
+        async fn location(url: &str) -> String {
+            let rest = url.strip_prefix("http://").unwrap();
+            let (host, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+            let mut stream = tokio::net::TcpStream::connect(host).await.unwrap();
+            let request = format!("GET {path} HTTP/1.1\r\nhost: {host}\r\nconnection: close\r\n\r\n");
+            stream.write_all(request.as_bytes()).await.unwrap();
+            let mut answer = String::new();
+            stream.read_to_string(&mut answer).await.unwrap();
+            answer.split("\r\n").find_map(|l| l.strip_prefix("location: ")).map(str::to_string).unwrap_or_default()
+        }
+
+        async fn opened(t: &Mcp) -> String {
+            for _ in 0..1000 {
+                if let Some(url) = t.opened.lock().unwrap().first().cloned() {
+                    return url;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            panic!("the login never opened anything");
+        }
+
+        async fn remote(dirs: &Dirs) -> (Mcp, OAuth) {
+            let server = oauth_server().await;
+            std::fs::write(
+                dirs.config.join("mcp.json"),
+                json!({"mcpServers": {"remote": {"type": "http", "url": format!("{}/mcp", server.base)}}}).to_string(),
+            )
+            .unwrap();
+            (start(dirs, None, Net::default()), server)
+        }
+
+        #[tokio::test]
+        async fn startup_lists_the_server_that_needs_a_login_and_the_menu_offers_login_and_logout() {
+            let dirs = Dirs::new();
+            let (mut t, _server) = remote(&dirs).await;
+            let notice = t.notice("needs a login").await;
+            assert_eq!(notice.title, "MCP · 1 note");
+            assert_eq!(notice.items[0].text, "1 MCP server needs a login");
+            assert_eq!(notice.items[0].detail.as_deref(), Some(&["remote: /mcp login remote".to_string()][..]));
+            let menu: Vec<String> = t.port.commands().into_iter().map(|c| c.name).collect();
+            assert!(menu.contains(&"mcp login remote".to_string()) && menu.contains(&"mcp logout remote".to_string()));
+        }
+
+        #[tokio::test]
+        async fn mcp_login_shows_the_link_opens_it_takes_the_pasted_callback_and_the_code_stays_out() {
+            let dirs = Dirs::new();
+            let (mut t, server) = remote(&dirs).await;
+            t.notice("needs a login").await;
+            t.port.run_command("/mcp login remote".into());
+            let said = t.says("Log in to remote at 127.0.0.1:").await;
+            assert!(said.last().unwrap().contains("paste its address here:\nhttp://127.0.0.1:"), "{said:?}");
+            let url = opened(&t).await;
+            assert!(url.starts_with(&format!("{}/authorize?", server.base)));
+            let pasted = location(&url).await;
+            let code = pasted.split("code=").nth(1).unwrap().split('&').next().unwrap().to_string();
+            assert!(code.starts_with("code-"));
+            assert!(t.port.login_callback(&pasted));
+            let seen = until(&mut t.rx, |e| matches!(e, UiEvent::Message(m) if m.text.contains("logged in · connected"))).await;
+            assert!(
+                seen.iter().any(|e| matches!(e, UiEvent::Message(m) if m.role == Role::User && m.text == "(login callback)"))
+            );
+            assert!(texts(&seen).contains(&"Got it: finishing the login to remote…".to_string()));
+            assert_eq!(
+                texts(&seen).last().unwrap(),
+                "remote: logged in · connected · 1 tool. Marv can use them from your next message."
+            );
+            assert!(!format!("{seen:?}").contains(&code), "the code is never shown");
+            assert!(t.mcp.specs().iter().any(|s| s.name == "mcp__remote__echo"));
+
+            // The same address again: this login has had its callback.
+            assert!(t.port.login_callback(&pasted));
+            t.says("No login is waiting for that address (/mcp login <server> starts one). It wasn't sent to the model.").await;
+
+            t.port.run_command("/mcp logout remote".into());
+            let said = t.says("Logged out of remote").await;
+            assert_eq!(
+                said.last().unwrap(),
+                "Logged out of remote: its tokens are forgotten. The authorization server revoked the grant."
+            );
+            assert_eq!(server.revoked.lock().unwrap().len(), 1);
+            assert_eq!(t.mcp.status()[0].state, marv_mcp::manager::McpState::NeedsLogin);
+            t.port.run_command("/mcp logout remote".into());
+            t.says("remote isn't logged in.").await;
+            t.mcp.close().await;
+        }
+
+        async fn logged_in(t: &mut Mcp) {
+            t.notice("needs a login").await;
+            t.port.run_command("/mcp login remote".into());
+            let url = opened(t).await;
+            assert!(t.port.login_callback(&location(&url).await));
+            t.says("logged in · connected").await;
+        }
+
+        #[tokio::test]
+        async fn a_login_that_runs_out_mid_session_is_told_once() {
+            let dirs = Dirs::new();
+            let (mut t, server) = remote(&dirs).await;
+            logged_in(&mut t).await;
+            server.expired.store(true, Ordering::SeqCst);
+            let echo = t.mcp.tools().iter().find(|tool| tool.name == "mcp__remote__echo").cloned().unwrap();
+            for _ in 0..2 {
+                let failed = echo.run(Default::default(), CancellationToken::new()).await;
+                assert!(failed.unwrap_err().to_string().contains("remote needs a new login: the user can run /mcp login remote"));
+            }
+            let notice = t.notice("needs a new login").await;
+            assert_eq!(notice.items[0].text, "remote needs a new login: /mcp login remote");
+            assert_eq!(notice.items[0].detail.as_deref(), Some(&["Its tools fail until then.".to_string()][..]));
+            t.port.run_command("/exit".into());
+            let rest = until(&mut t.rx, |e| *e == UiEvent::Exit).await;
+            assert!(!format!("{rest:?}").contains("needs a new login"), "told once: {rest:?}");
+            t.mcp.close().await;
+        }
+
+        #[tokio::test]
+        async fn a_callback_with_no_login_waiting_is_refused_and_ordinary_text_isnt_taken() {
+            let dirs = Dirs::new();
+            let mut t = start(&dirs, None, Net::default());
+            assert!(!t.port.login_callback("hello"));
+            assert!(t.port.login_callback("http://127.0.0.1:5555/callback?code=code-secret&state=abc"));
+            let seen = until(&mut t.rx, |e| matches!(e, UiEvent::Message(m) if m.text.starts_with("No login is waiting"))).await;
+            assert!(!format!("{seen:?}").contains("code-secret"));
+        }
+
+        #[tokio::test]
+        async fn a_login_to_an_unknown_server_says_so() {
+            let dirs = Dirs::new();
+            let mut t = start(&dirs, None, Net::default());
+            t.port.run_command("/mcp login nope".into());
+            let seen = until(&mut t.rx, |e| matches!(e, UiEvent::Message(_))).await;
+            assert!(matches!(seen.last(), Some(UiEvent::Message(m)) if m.is_error), "{seen:?}");
+            let _ = (&t.bin, &t.bridge());
+        }
     }
 
     #[test]
