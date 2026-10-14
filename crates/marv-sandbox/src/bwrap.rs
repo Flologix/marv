@@ -235,14 +235,19 @@ pub fn sandbox_args(opts: &SandboxOptions, fs: &dyn FsProbe) -> Result<Vec<OsStr
     // Marv's runtime folder, empty wherever $XDG_RUNTIME_DIR points (marv-rs): a socket a command could see is one it
     // could connect to (a read-only mount doesn't stop connect()), and a plug's socket carries that plug's identity
     // and wires. After the project, toolchain and PATH mounts, so none of them shows it again. The relay and mesh
-    // binds have their own destinations under /run/marv, which this never covers. Under /run it's already gone (the
-    // empty /run above keeps only PATH folders, never /run/user/<uid>), and a mount there would only make bwrap
-    // create its mount point in that empty /run.
+    // binds have their own destinations under /run/marv, which this never covers. Under /run it's already gone unless
+    // something is mounted again over the empty /run around it: the project (a drive under /run/media) or a PATH
+    // folder kept there. Otherwise a mount would only make bwrap create its mount point in that empty /run.
+    let shown_again = |real: &Path| {
+        real.starts_with(&opts.root)
+            || opts.read_only.iter().chain(&opts.writable).any(|d| real.starts_with(d))
+            || opts.path.split(':').any(|d| d.starts_with("/run/") && real.starts_with(d))
+    };
     for dir in &opts.hidden {
         if let Ok(real) = fs.realpath(dir)
             && fs.exists(&real)
             && real.is_absolute()
-            && !real.starts_with("/run")
+            && (!real.starts_with("/run") || shown_again(&real))
         {
             args.extend(["--tmpfs".into(), real.into_os_string()]);
         }
@@ -355,6 +360,15 @@ mod tests {
         assert!(hidden > project && hidden > toolchain, "{args}");
         assert!(args.contains("--tmpfs /var/tmp/xdg/marv"), "{args}");
         assert!(!args.contains("--tmpfs /run/user/1000/marv"), "already hidden by the empty /run: {args}");
+        // Under /run only where the project (a drive under /run/media) or a kept PATH folder shows it again.
+        let media = SandboxOptions {
+            root: "/run/media/me/usb/proj".into(),
+            hidden: vec!["/run/media/me/usb/proj/xdg/marv".into(), "/run/user/1000/marv".into()],
+            ..base()
+        };
+        let args = joined(&media, &fs);
+        assert!(args.contains("--tmpfs /run/media/me/usb/proj/xdg/marv"), "{args}");
+        assert!(!args.contains("--tmpfs /run/user/1000/marv"), "{args}");
         // A folder that doesn't exist yet gets nothing (bwrap can't create a mount point on the read-only root).
         let none = joined(&SandboxOptions { hidden: vec!["/run/user/1000/marv".into()], ..base() }, &default_fs());
         assert!(!none.contains("/run/user/1000/marv"), "{none}");
