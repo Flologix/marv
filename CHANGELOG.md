@@ -14,10 +14,12 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ### Changed
 
+- **Subagent reports are cut at 30k characters**, like other tool output, with the whole report saved to a file the parent can read. Before, a long report went into the parent's context whole.
 - **`mesh_list` names the other Marvs on this machine**, with the inbox a `mesh_send` would use and a note that the user has to wire it first. Before, the model only saw "nothing is wired", and answered "who's on the mesh?" with nobody while `marv mesh ls` listed several. Names only: their folders and panes stay in `marv mesh ls`.
 
 ### Added
 
+- **Cut tool output is saved to a file the model can read (#61).** When bash, the github tool, an MCP result or a subagent's report is cut, the whole output goes to `~/.marv/tool-output/<session>/<call id>.txt` (0600), and the marker names it. `read_file` and `grep` can read that session's folder and nothing else outside the project; bash can't see it. Folders older than 7 days are deleted, and the store is kept under 256 MiB.
 - **Real-model evals (#73).** `evals/bench.py` runs Marv's 20 eval tasks through `marv -p`, and through `claude -p` for comparison, grades them with each task's hidden tests, and reports pass rate, time, requests, tool calls, tokens and cost. See `evals/README.md`.
 
 ## [0.4.0] - 2026-10-14
