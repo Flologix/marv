@@ -14,11 +14,12 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ### Changed
 
+- **Fewer requests spent only on the plan (#85).** The prompt and the `plan` tool now ask for a plan only for a task of four or more steps, and say to send each plan update in the same reply as the next tool call, never in a reply of its own. On a GLM bench, 33 of Marv's 47 plan calls were requests of their own: 192 s, about 7% of all request time. `marv -p` keeps the nudge (the plan steers the model and comes back after compaction, and batched it costs nothing).
 - **`mesh_list` names the other Marvs on this machine**, with the inbox a `mesh_send` would use and a note that the user has to wire it first. Before, the model only saw "nothing is wired", and answered "who's on the mesh?" with nobody while `marv mesh ls` listed several. Names only: their folders and panes stay in `marv mesh ls`.
 
 ### Added
 
-- **Real-model evals (#73).** `evals/bench.py` runs Marv's 20 eval tasks through `marv -p`, and through `claude -p` for comparison, grades them with each task's hidden tests, and reports pass rate, time, requests, tool calls, tokens and cost. See `evals/README.md`.
+- **Real-model evals (#73).** `evals/bench.py` runs Marv's 20 eval tasks through `marv -p`, and through `claude -p` for comparison, grades them with each task's hidden tests, and reports pass rate, time, requests, tool calls, tokens and cost. See `evals/README.md`. It also counts plan-only requests (a reply whose only calls were plan updates, #85), from the trajectory, for older runs too.
 
 ## [0.4.0] - 2026-10-14
 

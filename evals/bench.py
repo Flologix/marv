@@ -78,6 +78,27 @@ def parse_lines(text):
         except ValueError: continue
 
 
+PLAN_TOOLS = {"plan", "TodoWrite"}
+
+
+def plan_only(trajectory):
+    """Marv's requests whose only calls were plan updates (#85), from its trajectory: (count, ms). A main-agent
+    `request` event is followed by the `tool` events of the calls in its reply."""
+    count, ms, current = 0, 0, None
+    def close():
+        nonlocal count, ms
+        if current and current[1] and current[1] <= PLAN_TOOLS: count, ms = count + 1, ms + (current[0] or 0)
+    for e in trajectory:
+        if e.get("agent", "main") != "main": continue
+        if e.get("type") == "request":
+            close()
+            current = (e.get("ms"), set())
+        elif e.get("type") == "tool" and current is not None:
+            current[1].add((e.get("call") or {}).get("name"))
+    close()
+    return count, ms
+
+
 def run_claude(ws, prompt, servers, logdir, a):
     cmd = ["claude", "-p", prompt, "--model", a.claude_model, "--output-format", "stream-json", "--verbose",
            "--setting-sources", "project", "--strict-mcp-config", "--mcp-config", json.dumps({"mcpServers": servers or {}}),
@@ -91,12 +112,12 @@ def run_claude(ws, prompt, servers, logdir, a):
     (logdir / "stream.jsonl").write_text(p.stdout)
     (logdir / "stderr.txt").write_text(p.stderr)
     r = dict(tools=Counter(), toolErrors=0, reply="", exit=p.returncode)
-    messages = set()
+    messages = defaultdict(set)
     for e in parse_lines(p.stdout):
         if e.get("type") == "assistant":
-            messages.add(e["message"].get("id"))
+            calls = messages[e["message"].get("id")]
             for b in e["message"]["content"]:
-                if b["type"] == "tool_use": r["tools"][b["name"]] += 1
+                if b["type"] == "tool_use": r["tools"][b["name"]] += 1; calls.add(b["name"])
         elif e.get("type") == "user":
             for b in e["message"].get("content", []):
                 if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("is_error"): r["toolErrors"] += 1
@@ -107,6 +128,7 @@ def run_claude(ws, prompt, servers, logdir, a):
                      promptTokens=u.get("input_tokens", 0) + cached + created, cachedTokens=cached,
                      completionTokens=u.get("output_tokens", 0), agentMs=e.get("duration_ms"))
     r["requests"] = len(messages)
+    r["planOnly"] = sum(1 for calls in messages.values() if calls and calls <= PLAN_TOOLS)
     return r
 
 
@@ -140,6 +162,7 @@ def run_marv(ws, prompt, servers, logdir, a):
         for e in parse_lines(traj.read_text()):
             if e.get("type") == "tool" and e.get("isError"): r["toolErrors"] += 1
             if e.get("type") == "agent_end" and e.get("agent") == "main": r["agentMs"] = e.get("ms")
+        r["planOnly"], r["planOnlyMs"] = plan_only(parse_lines(traj.read_text()))
     return r
 
 
@@ -239,20 +262,35 @@ class Run:
 
 
 def report(dirs):
-    rows = [json.loads(l) for d in dirs for l in (Path(d) / "results.jsonl").read_text().splitlines() if l]
+    rows = []
+    for d in dirs:
+        for l in (Path(d) / "results.jsonl").read_text().splitlines():
+            if not l: continue
+            r = json.loads(l)
+            # A run from before #85's counter: count from its trajectory.
+            traj = Path(d) / "logs" / r["harness"] / f"{r['task']}-{r['rep']}" / "trajectory.jsonl"
+            if "planOnly" not in r and r["harness"] == "marv" and traj.exists():
+                r["planOnly"], r["planOnlyMs"] = plan_only(parse_lines(traj.read_text()))
+            rows.append(r)
     groups = defaultdict(list)
     for r in rows: groups[(r["harness"], r.get("model", ""))].append(r)
     med = lambda xs: sorted(xs)[len(xs) // 2] if xs else 0
-    print(f"{'harness':8} {'model':28} {'runs':>4} {'pass':>5} {'med s':>6} {'req':>5} {'tools':>6} {'tool err':>8} "
+    print(f"{'harness':8} {'model':28} {'runs':>4} {'pass':>5} {'med s':>6} {'req':>5} {'plan-only':>9} {'tools':>6} {'tool err':>8} "
           f"{'in tok':>8} {'cached':>7} {'out tok':>8} {'$/run':>7}")
     for (h, m), rs in sorted(groups.items()):
         n = len(rs)
         avg = lambda k: sum(r.get(k) or 0 for r in rs) / n
         prompt = sum(r.get("promptTokens") or 0 for r in rs)
         print(f"{h:8} {m:28} {n:4} {sum(r['pass_'] for r in rs) / n:5.0%} {med([r['ms'] / 1000 for r in rs]):6.1f} "
-              f"{avg('requests'):5.1f} {sum(sum(r['tools'].values()) for r in rs) / n:6.1f} {sum(r.get('toolErrors', 0) for r in rs):8} "
+              f"{avg('requests'):5.1f} {avg('planOnly'):9.2f} {sum(sum(r['tools'].values()) for r in rs) / n:6.1f} {sum(r.get('toolErrors', 0) for r in rs):8} "
               f"{avg('promptTokens'):8.0f} {(sum(r.get('cachedTokens') or 0 for r in rs) / prompt if prompt else 0):7.0%} "
               f"{avg('completionTokens'):8.0f} {avg('cost'):7.4f}")
+    for (h, m), rs in sorted(groups.items()):
+        only = sum(r.get("planOnly") or 0 for r in rs)
+        if only:
+            ms = sum(r.get("planOnlyMs") or 0 for r in rs)
+            print(f"\n{h} {m}: {only} plan-only requests (a reply whose only calls were plan updates)"
+                  + (f", {ms / 1000:.0f}s" if ms else ""))
     print("\nTool calls:")
     for (h, m), rs in sorted(groups.items()):
         c = Counter()
