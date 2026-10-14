@@ -39,8 +39,9 @@ is true of Marv (its sandbox keeps the server in) and not of Claude Code.
 
 ## What you get
 
-`evals/results/<time>-<label>/results.jsonl` has a line per run: pass, seconds, requests, tool calls by name, tool
-errors, tokens (prompt, cached, completion), cost, and the check's output when it failed. `logs/<harness>/<task>-<rep>/`
+`evals/results/<time>-<label>/results.jsonl` has a line per run: pass, seconds, requests, plan-only requests (`planOnly`,
+`planOnlyMs`: replies whose only calls were plan updates, #85; `--report` counts them from the trajectory for older
+runs), tool calls by name, tool errors, tokens (prompt, cached, completion), cost, and the check's output when it failed. `logs/<harness>/<task>-<rep>/`
 keeps the stream, Marv's trajectory, stderr and the diff. Marv's cost is what OpenRouter charged; Claude Code's is its
 own estimate at API prices.
 
