@@ -36,6 +36,17 @@ Each guard's doc comment says how it was proven: the guard was reverted, and the
 | Subagents don't inherit network/web/mesh approvals | `provenance.rs::subagents_inherit_taint_but_no_egress_approvals` | Proven |
 | A worktree subagent's `.git` is read-only; Marv commits for it | `worktree.rs::a_worktree_subagents_git_is_read_only_and_marv_commits_for_it` | Proven (real bwrap, #12) |
 | … Marv's commit trusts nothing the worktree says | `worktree.rs::marvs_commit_trusts_nothing_the_worktree_says` | Proven (#12) |
+| github: what gh can never do never reaches it, whatever the approver says | `github.rs::what_can_never_run_never_reaches_gh_and_isnt_asked` | Proven (fake gh) |
+| github: writes and sensitive reads ask in yolo; a no runs nothing | `github.rs::writes_and_sensitive_reads_ask_in_yolo_and_a_no_runs_nothing` | Proven |
+| github: a token never reaches the model, events, saved session or trajectory | `github.rs::a_token_in_ghs_output_never_reaches_the_model_the_events_the_saved_session_or_the_trajectory` | Proven |
+| github: a subagent only reads | `github.rs::a_subagent_reads_but_its_write_is_refused_even_with_the_approver_saying_yes` | Proven |
+| github: not offered where gh is logged out | `github.rs::not_offered_where_gh_is_logged_out_not_even_to_subagents` | Proven |
+| github: `marv -p` needs `--approve github` for a write | `github.rs::headless_a_write_is_refused_without_approve_github` | Proven (the marv binary) |
+| host: asks in yolo, as the host door, `once` | `host.rs::asks_in_yolo_with_the_host_door_and_once` | Proven (real bwrap) |
+| host: "always" never covers a second call | `host.rs::never_uses_always_two_calls_two_asks` | Proven (real bwrap) |
+| host: refused before any ask without `host_commands` | `host.rs::a_session_without_host_commands_refuses_it_before_its_approver_is_asked` | Proven (real bwrap) |
+| host: a subagent can't | `host.rs::a_subagent_cant_even_where_the_session_has_the_door` | Proven (real bwrap) |
+| host: `marv -p` refuses it with every `--approve` name | `host.rs::headless_refuses_it_with_every_approve_name` | Proven (two layers, both reverted) |
 | Project MCP servers need trust; hash covers entry and files | `mcp.rs::project_servers_need_trust_covering_entry_and_files` | Proven |
 | `npx`/`uvx` outside the project | `mcp.rs::package_runners_start_outside_the_project` | Proven |
 | Server `instructions` ignored | `mcp.rs::server_instructions_never_leave_the_parser` | Proven (a source check until the manager connects, M7) |
@@ -51,4 +62,5 @@ Each guard's doc comment says how it was proven: the guard was reverted, and the
 - **Found by the suite:** dangling symlinks. `innocent.sh -> .envrc`, where `.envrc` didn't exist yet, wasn't seen as protected, and `write_file` through `out.sh -> /elsewhere/x` wrote outside the project. Both are fixed in `paths::real_with_missing` (sandbox.md). Nested `.git` folders read-only for confined commands are proven by marv-tools' `an_approved_git_write_keeps_its_new_repository_and_confined_commands_see_nested_git_read_only`.
 - **Fake homes live in `/var/tmp`** (`TempDir::outside_tmp`): the sandbox replaces `/tmp` with its own, so a fake home there would look hidden even without the home tmpfs.
 - **The web guards use a local server** (`marv_guards::serve`) and a `WebFetch` that lets private addresses through: the guards never fetch the internet.
+- **The doors' guards** (`github.rs`, `host.rs`): gh is a fake on PATH (`marv_tools::github::fake`, a shell script that logs every argv); never the real gh. The SDK guards that need it in the environment re-run themselves in a child process with it set (`marv_guards::in_child_with_env`: Rust can't change its own environment without `unsafe`). The `marv -p` guards run the binary `cargo test --workspace` builds (`marv_oracle::binary()`), against `marv_oracle`'s fake OpenRouter on port 0.
 - **The lock-file guard** reads `Cargo.lock` at run time. To prove it, the test binary was built first, because cargo prunes an unused lock entry before it runs a test.
