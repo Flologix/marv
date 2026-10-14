@@ -287,6 +287,26 @@ struct Door {
     approver: Arc<dyn PeerApprover>,
 }
 
+/// Removes the sockets of Marvs that are gone: a door's socket outlives a Marv that was killed or crashed (the guard's
+/// drop never ran), and the folder filled up with them. Only a refused connection counts as gone (nothing listens on
+/// that socket any more); a slow or busy Marv keeps its socket. The folder is this user's and private
+/// ([`private_folder`]), so these are all this user's Marvs.
+fn sweep_dead(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_socket = entry.file_type().is_ok_and(|t| std::os::unix::fs::FileTypeExt::is_socket(&t));
+        if !is_socket || path.extension().is_none_or(|e| e != "sock") {
+            continue;
+        }
+        if let Err(e) = std::os::unix::net::UnixStream::connect(&path)
+            && e.kind() == std::io::ErrorKind::ConnectionRefused
+        {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
 /// Opens `sb`'s door at `<dir>/<sb.session>.sock` (0600, in the 0700 folder), serves it until the guard drops, and
 /// lets `sb` find the other Marvs' inboxes in `dir` ([`PeerResolver`]). Refuses when a live Marv already has the
 /// name; a dead one's socket is replaced. Needs a Tokio runtime.
@@ -296,6 +316,7 @@ pub fn open_door(sb: Arc<Switchboard>, dir: &Path, info: DoorInfo, approver: Arc
         .filter(|_| name.len() <= MAX_SESSION_NAME)
         .ok_or_else(|| MeshError::BadName(format!("\"{name}\" isn't a mesh name")))?;
     private_folder(dir)?;
+    sweep_dead(dir);
     if std::fs::symlink_metadata(&socket).is_ok() {
         if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
             return Err(MeshError::Io(format!("a Marv named \"{name}\" is already on the mesh (set MARV_MESH_NAME)")));
@@ -308,6 +329,7 @@ pub fn open_door(sb: Arc<Switchboard>, dir: &Path, info: DoorInfo, approver: Arc
         .map_err(|e| io(&socket.display().to_string(), e))?;
     listener.set_nonblocking(true).map_err(|e| io("the door", e))?;
     let listener = UnixListener::from_std(listener).map_err(|e| io("the door", e))?;
+    sb.set_peer_dir(dir.to_path_buf());
     sb.add_resolver(Arc::new(PeerResolver { dir: dir.to_path_buf(), own: name }));
     let door = Arc::new(Door { sb, dir: dir.to_path_buf(), info, approver });
     let cancel = CancellationToken::new();
@@ -637,6 +659,18 @@ mod tests {
 
     fn mode(p: &Path) -> u32 {
         std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    #[tokio::test]
+    async fn opening_a_door_sweeps_dead_marvs_sockets_only() {
+        let mesh = Runtime::new();
+        let _alpha = marv("alpha", &mesh.0, Person::new(None));
+        drop(std::os::unix::net::UnixListener::bind(mesh.0.join("dead.sock")).unwrap());
+        std::fs::write(mesh.0.join("notes.sock"), "not a socket").unwrap();
+        let beta = marv("beta", &mesh.0, Person::new(None));
+        assert!(!mesh.0.join("dead.sock").exists(), "nothing listens there: swept");
+        assert!(mesh.0.join("alpha.sock").exists() && mesh.0.join("notes.sock").exists());
+        assert_eq!(beta.sb.peer_dir(), Some(mesh.0.clone()));
     }
 
     #[tokio::test]

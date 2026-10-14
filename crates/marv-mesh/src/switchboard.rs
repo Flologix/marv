@@ -129,6 +129,9 @@ pub struct Switchboard {
     wake: tokio::sync::Notify,
     /// Asked, in order, for a receptacle nobody offered yet ([`Self::lookup`]).
     resolvers: Mutex<Vec<Arc<dyn Resolve>>>,
+    /// The folder of the machine's switchboards, once this one's door is open (`discovery::open_door`): where
+    /// `mesh_list` finds the other Marvs.
+    peer_dir: Mutex<Option<PathBuf>>,
 }
 
 /// What changes: one short lock, never held across an await.
@@ -168,7 +171,16 @@ impl Switchboard {
             runtime_dir,
             wake: tokio::sync::Notify::new(),
             resolvers: Mutex::default(),
+            peer_dir: Mutex::default(),
         }
+    }
+
+    /// Where the other Marvs' doors are (set when this one's door opens).
+    pub fn set_peer_dir(&self, dir: PathBuf) {
+        *self.peer_dir.lock().unwrap_or_else(|e| e.into_inner()) = Some(dir);
+    }
+    pub fn peer_dir(&self) -> Option<PathBuf> {
+        self.peer_dir.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     fn board(&self) -> MutexGuard<'_, Board> {
