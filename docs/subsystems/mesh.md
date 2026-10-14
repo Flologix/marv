@@ -30,7 +30,7 @@ Run `grep -rn 'todo!("port' crates/marv-mesh` to see what's left. Each mesh todo
 
 | Rule (MESH.md) | Where | Guard test (in-crate) |
 |---|---|---|
-| 1. Nothing is wired by default. Only the user wires, and yolo never does. | `WireTable::allows` returns false on an empty table. `Approver` (`Tui`, `Cli` or `Headless`) has no variant for an agent or for yolo. | `wire::default_deny`, `switchboard::unwired_messages_are_refused_and_logged` |
+| 1. Nothing is wired by default. Only the user wires, and yolo never does. | `WireTable::allows` returns false on an empty table. `Approver` (`Tui`, `Cli` or `Headless`) has no variant for an agent or for yolo. The one prompt for a call and its new wire (#77) is asked of the person, `once` and `must_ask`, in yolo too. | `wire::default_deny`, `switchboard::unwired_messages_are_refused_and_logged`, guards' `mesh::the_one_prompt_for_a_call_and_its_new_wire_is_a_persons_yes_or_no` |
 | A grant goes by name only. | Exact match on `PlugId`, `ReceptacleName` and `WireMode`, with no wildcards. Names are validated (lowercase, dot-separated). | `wire::a_wire_allows_exactly_its_plug_receptacle_and_mode`, `approval::approve_flags` |
 | 2. Mesh text is data. | `Envelope.provenance` is always `Provenance::Mesh`, which taints. `fenced()` defuses a `</mesh-message` inside the body. | `message::*` |
 | 3. Every message is logged. | `Switchboard::admit` writes a `MeshRecord` (sender, receptacle, mode, size, outcome; never the body) for each message, delivered or refused. | `switchboard::unwired_messages_are_refused_and_logged` |
@@ -90,7 +90,7 @@ v1's integration test is `marv_session::mesh::tests::end_to_end`: a `MarvSession
 1. In two Herdr panes, start two Marvs (TUI), each in its own project: `MARV_MESH_NAME=api marv` and `MARV_MESH_NAME=web marv`. Each shows "On the mesh as …".
 2. In a third pane: `marv mesh ls`. Both are listed, with their panes, and the Herdr agent panes with their `herdr.pane.*` names.
 3. Ask for a wire: `marv mesh wire 'api -> web:inbox'`. `api` asks you to approve `Wire parent -> peer.web.agent.parent.inbox (send)`; then `web` asks about `Wire peer-api -> agent.parent.inbox (send)`. Say yes in both.
-   (Or let the agent ask: tell `api` "use mesh_send to tell peer.web.agent.parent.inbox that the API is ready". The same two approvals come up.)
+   (Or let the agent ask: tell `api` "use mesh_send to tell peer.web.agent.parent.inbox that the API is ready". `api` asks once, for the message and the wire together ("Yes (wire it)"); then `web` asks about its side, as above.)
 4. In `api`: "tell peer.web.agent.parent.inbox that the API is ready". `web` reads it fenced, from `peer-api`, at its next turn (send `web` any prompt, e.g. "any messages?"), and its session is tainted.
 5. Herdr: in `api`, "use mesh_call on herdr.pane.<web's pane>.status" (the name from `marv mesh ls`). Approve the wire (`api -> herdr.pane.….status:call`); the answer is the pane's agent and state. `herdr.pane.….send` types a prompt into an idle agent's pane, as if you typed it.
 6. Claude Code in another pane: add an MCP server with command `marv` and args `["mesh", "plug", "web", "--as", "claude"]`, then `marv mesh wire 'web/claude -> web:inbox'` and approve it in `web`. Restart the MCP server so Claude Code lists the new tool (`agent_parent_inbox`; list-changed notifications are still to come).
@@ -105,7 +105,9 @@ v1's integration test is `marv_session::mesh::tests::end_to_end`: a `MarvSession
 - **Plug sockets** live in `$XDG_RUNTIME_DIR/marv/plugs/<session>/<plug>.sock` (`marv_session::mesh::start`). Without `XDG_RUNTIME_DIR` there's no mesh: no `/tmp` fallback, as for discovery.
 - **The mode rides in `_meta`.** `tools/call` carries `"_meta": {"marv/mode": "send"}` (default `call`), and `tools/list` gives each receptacle's wired modes as `"_meta": {"marv/modes": [...]}`. A refusal is a tool result with `isError`, so the agent reads it.
 - **The model's tools use the socket too.** `MeshTool` runs in Marv, but it connects to its agent's own plug socket like anything in the sandbox would, so every message from a model goes through the same checks, identity and log.
-- **Asking for a wire.** A `mesh_send`/`mesh_call` on a receptacle that exists, takes the mode and isn't the agent's own asks the session's `WireApprover` first (a person: `once`, `must_ask`, tool `mesh_wire`); on a no, the message still goes to the switchboard, which refuses and logs it. A wire to an agent's own inbox is never asked for. Yolo may *use* a granted wire (`auto_safe` when wired; tainted sessions still ask), never grant one.
+- **Asking for a wire.** A `mesh_send`/`mesh_call` on a receptacle that exists, takes the mode and isn't the agent's own asks the session's `WireApprover` first. A wire to an agent's own inbox is never asked for. Yolo may *use* a granted wire (`auto_safe` when wired; tainted sessions still ask), never grant one.
+  - **One prompt per new wire (#77).** Through `run_tool`, such a call is approved by `MeshTool::approve_itself` (`Tool::approve_itself`, which stands in for the registry's prompt) asking `WireApprover::approve_call`: for a person (`PersonWires`, the client's own approver, never the session's "always" layer or yolo) one prompt, `mesh::call_wire_approval` (tool `mesh_wire_call`, `once`, `must_ask`), with the payload, the wire, its limits and the taint warning. The TUI offers "Yes (wire it)" and "No" only. Yes grants the wire (`Switchboard::grant`; the far end asks its own user) and runs the call over it; no is a declined call, and nothing is wired or sent. A round trip between two Marvs' users is four prompts (it was six).
+  - Where the approver can't show both (`HeadlessWires` for `--approve mesh:<receptacle>`, an SDK client's own `wire_approver`), the call is approved as any other (in `marv -p`, by the `mesh:<receptacle>:` scope `--approve mesh:<receptacle>` adds) and the wire asked for apart (`approve_wire`: `once`, `must_ask`, tool `mesh_wire`); on a no, the message still goes to the switchboard, which refuses and logs it. The far end's prompt and `marv mesh wire` are this `mesh_wire` prompt too.
 - **Inboxes are read** before the turn's request (ahead of the user's message) and after each step (`with_inbox`, after the checks' note). Messages still unread when a subagent ends go with its plug. A message that arrives after a final answer waits for the next turn.
 
 - **Mesh names (v2).** A process is on the mesh as `MARV_MESH_NAME`, else its project folder's name and four hex digits (`api-3f9a`). The name belongs to the process, not the conversation (session ids change with `/clear` and resume, and have uppercase letters), and is at most 43 characters so `peer-<name>` stays one segment.
@@ -142,7 +144,8 @@ Envelope::fenced() -> String              // what the receiving model sees; tag 
 tools::{mesh_specs, kind_of, target, run, MESH_LIST, MESH_CALL, MESH_SEND}; plug::PlugClient::{connect, list, call, send}
 
 // marv-session::mesh (for marv-cli and the TUI)
-start, log_to, PARENT, parent_id, WireApprover, PersonWires { inner, by }, HeadlessWires(Vec<ReceptacleName>), wire_approval,
+start, log_to, PARENT, parent_id, WireApprover { approve_wire, approve_call }, CallWire, PersonWires { inner, by },
+HeadlessWires(Vec<ReceptacleName>), wire_approval, call_wire_approval, MESH_WIRE_CALL,
 wire_approver, headless_grants, inbox_note, with_inbox, MeshAccess::plug_subagent -> SubagentPlug { tools, sandbox, after_step }
 
 // Herdr (marv-cli makes one, the App reports)

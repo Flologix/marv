@@ -12,8 +12,9 @@
 //!   model names it.
 //! - Flow: parse JSON (else `repair_json_args`) → schema-guided repair (#65, [`schema_repaired`]) → the tool's
 //!   `repair` → validate → label → if gated: preview (a
-//!   `ToolError` fails the call before anyone is asked) → aborted? interrupted → yolo + `auto_safe`: run confined →
-//!   no approver: "no one to ask" → approve: unavailable / no (aborted → interrupted) / yes / always → run.
+//!   `ToolError` fails the call before anyone is asked) → aborted? interrupted → the tool's own prompt
+//!   (`approve_itself`, #77; never for a protected path) → else yolo + `auto_safe`: run confined → no approver: "no
+//!   one to ask" → approve → either answer: unavailable / no (aborted → interrupted) / yes / always → run.
 //! - Right before any run (ungated, yolo or approved), the turn's checkpoint (#16) when the tool takes one
 //!   (`Tool::checkpoint`); a stop while it's taken returns "interrupted" instead of running.
 //! - Every repaired call's result carries the repair notes, however the call ended.
@@ -212,31 +213,45 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
     if ctx.aborted() {
         return interrupted(Approval::Interrupted);
     }
-    // Yolo: a call the tool vouches for runs without asking, confined (bash then can't touch .git).
-    if ctx.yolo && !must_ask && tool.auto_safe(input, ctx) {
-        if !checkpointed().await {
-            return interrupted(Approval::Interrupted);
-        }
-        let confined = ToolContext { confined: true, ..per_call };
-        return finish(tool.run(input, &confined).await, Some(Approval::Auto));
-    }
     let no_one_to_ask = || noted(fail(format!("{} needs the user's approval, and there's no one to ask.", call.name), &label));
-    let Some(approver) = &ctx.approver else { return no_one_to_ask() };
-    let scope =
-        tool.scope(input, ctx).unwrap_or_else(|| crate::types::Scope { key: call.name.clone(), description: call.name.clone() });
-    let request = ApprovalRequest {
-        tool: call.name.clone(),
-        label: label.clone(),
-        preview,
-        scope,
-        agent: None,
-        network,
-        once: tool.once(input, ctx),
-        must_ask,
-        protected,
-        door,
+    // #77: a call the tool asks a person about itself, in one prompt (a mesh call and the new wire it needs). Never
+    // for a protected path, whose warning only the registry's prompt carries.
+    let own = match protected {
+        None => tool.approve_itself(input, &per_call, &preview).await,
+        Some(_) => None,
     };
-    match approver.approve(request).await {
+    let decision = match own {
+        Some(Err(err)) => return noted(fail(err.0, &label)),
+        Some(Ok(decision)) => decision,
+        None => {
+            // Yolo: a call the tool vouches for runs without asking, confined (bash then can't touch .git).
+            if ctx.yolo && !must_ask && tool.auto_safe(input, ctx) {
+                if !checkpointed().await {
+                    return interrupted(Approval::Interrupted);
+                }
+                let confined = ToolContext { confined: true, ..per_call };
+                return finish(tool.run(input, &confined).await, Some(Approval::Auto));
+            }
+            let Some(approver) = &ctx.approver else { return no_one_to_ask() };
+            let scope = tool
+                .scope(input, ctx)
+                .unwrap_or_else(|| crate::types::Scope { key: call.name.clone(), description: call.name.clone() });
+            let request = ApprovalRequest {
+                tool: call.name.clone(),
+                label: label.clone(),
+                preview,
+                scope,
+                agent: None,
+                network,
+                once: tool.once(input, ctx),
+                must_ask,
+                protected,
+                door,
+            };
+            approver.approve(request).await
+        }
+    };
+    match decision {
         Decision::Unavailable => no_one_to_ask(),
         // Esc at the prompt answers "no" and then aborts the run: an interrupt, not "don't retry".
         Decision::No if ctx.aborted() => interrupted(Approval::Interrupted),
@@ -321,6 +336,21 @@ mod tests {
                 return Err(ToolError::new("can't"));
             }
             Ok(Preview { title: "Echo".into(), ..Default::default() })
+        }
+        // "self yes" / "self no" / "self err": the tool's own prompt answers (#77).
+        async fn approve_itself(
+            &self,
+            input: &EchoInput,
+            _ctx: &ToolContext,
+            preview: &Preview,
+        ) -> Option<Result<Decision, ToolError>> {
+            assert_eq!(preview.title, "Echo", "the registry's preview is handed over");
+            match input.text.as_str() {
+                "self yes" => Some(Ok(Decision::Yes)),
+                "self no" => Some(Ok(Decision::No)),
+                "self err" => Some(Err(ToolError::new("the far end said no"))),
+                _ => None,
+            }
         }
         async fn run(&self, input: &EchoInput, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
             let mut out = ToolOutput::ok(format!("{}{}", input.text, if ctx.confined { " (confined)" } else { "" }), "ok");
@@ -441,6 +471,29 @@ mod tests {
         assert_eq!(yes.result.output, "x");
         assert_eq!(yes.result.approval, Some(Approval::Decided(Decision::Yes)));
         assert_eq!(approver.1.lock().unwrap()[0].scope.key, "echo");
+    }
+
+    /// #77: a call the tool asks about itself isn't asked again by the registry, tainted or in yolo; its answer is the
+    /// call's (no declines and stops, an error fails the call), and it's recorded as decided.
+    #[tokio::test]
+    async fn a_call_the_tool_asks_about_itself_is_asked_once() {
+        let t = tools(ToolKind::Egress, true);
+        let approver = Arc::new(Answer(Decision::Yes, Mutex::new(vec![])));
+        let asking = ToolContext { approver: Some(approver.clone()), yolo: true, ..ctx() };
+        asking.taint.mark(Provenance::Mesh);
+        let yes = run_tool(&call(r#"{"text": "self yes"}"#), &asking, &t).await;
+        assert_eq!(yes.result.output, "self yes", "not confined: not yolo's");
+        assert_eq!(yes.result.approval, Some(Approval::Decided(Decision::Yes)));
+        let no = run_tool(&call(r#"{"text": "self no"}"#), &asking, &t).await;
+        assert!(no.result.declined);
+        assert_eq!(no.result.output, DECLINED);
+        let err = run_tool(&call(r#"{"text": "self err"}"#), &asking, &t).await;
+        assert!(err.result.is_error);
+        assert_eq!(err.result.output, "the far end said no");
+        assert!(approver.1.lock().unwrap().is_empty(), "the registry asked no one");
+        // Any other call is asked as before.
+        run_tool(&call(r#"{"text": "x"}"#), &asking, &t).await;
+        assert_eq!(approver.1.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

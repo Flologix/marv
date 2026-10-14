@@ -234,3 +234,80 @@ fn marvs_runtime_folder_is_empty_in_the_sandbox_even_inside_the_project() {
     // On the host the files are still there: only the sandbox's view is empty.
     assert!(project.path().join("xdg/marv/plugs/s/parent.sock").exists());
 }
+
+/// Answers every approval with its decision, keeping what it was asked.
+struct Person(marv_tools::Decision, Mutex<Vec<marv_tools::ApprovalRequest>>);
+#[async_trait::async_trait]
+impl marv_tools::Approver for Person {
+    async fn approve(&self, request: marv_tools::ApprovalRequest) -> marv_tools::Decision {
+        self.1.lock().unwrap().push(request);
+        self.0
+    }
+}
+
+/// **A new wire is granted only by a person, in one prompt that never offers "always"** (rule 1; #77). A `mesh_send`
+/// that needs a new wire is one prompt for the message and the wire. In yolo, with "always" already given for that
+/// receptacle's calls and for the wire's scope, the person is still asked, once, yes or no only (`once`, `must_ask`),
+/// and only their yes wires it: an "always" answer is one yes and remembered for nothing, a no wires and sends nothing.
+/// Without anyone to ask (headless, no `--approve mesh:<receptacle>`) it's refused.
+///
+/// Proven: set `once` and `must_ask` false in `call_wire_approval` → this test failed (the prompt could offer
+/// "always" and be answered from it); made `MeshTool::approve_itself` grant the wire unasked in yolo → failed (nobody
+/// was asked, the wire was there).
+#[tokio::test]
+async fn the_one_prompt_for_a_call_and_its_new_wire_is_a_persons_yes_or_no() {
+    use marv_session::mesh::{HeadlessWires, MESH_WIRE_CALL, MeshTool, WireApprover, wire_approver};
+    use marv_session::runner::{AlwaysScopes, SessionApprover};
+    use marv_tools::{Approval, Decision, ToolRef};
+    let runtime = TempDir::new("mesh-77");
+    let mesh = Arc::new(Switchboard::new("g", runtime.path().join("plugs"), Arc::new(Log::default())));
+    let cancel = CancellationToken::new();
+    tokio::spawn(Arc::clone(&mesh).serve(cancel.clone()));
+    mesh.plug(parent_id()).unwrap();
+    let inbox = ReceptacleName::new("agent.parent.inbox").unwrap();
+    let call = marv_core::ToolCall {
+        id: "c1".into(),
+        name: "mesh_send".into(),
+        arguments: r#"{"receptacle": "agent.parent.inbox", "text": "found it"}"#.into(),
+    };
+    let tools = |plug: &marv_mesh::plug::Plug, wires: Option<Arc<dyn WireApprover>>| -> Vec<ToolRef> {
+        MeshTool::all(plug, &mesh, wires).into_iter().map(|t| Arc::new(t) as ToolRef).collect()
+    };
+
+    for (answer, wired) in [(Decision::Always, true), (Decision::No, false)] {
+        let worker = mesh.plug_next("worker").unwrap();
+        let person = Arc::new(Person(answer, Mutex::default()));
+        let always = AlwaysScopes::default();
+        always.add("mesh:agent.parent.inbox:send");
+        always.add(format!("mesh-wire:{}:agent.parent.inbox:send", worker.id));
+        let mut ctx = marv_tools::ToolContext::new(std::env::temp_dir());
+        ctx.yolo = true;
+        ctx.approver = Some(Arc::new(SessionApprover { inner: person.clone(), always, cancel: CancellationToken::new() }));
+        let wires = wire_approver(None, Some(&(person.clone() as Arc<dyn marv_tools::Approver>)));
+        let out = marv_tools::run_tool(&call, &ctx, &tools(&worker, wires)).await;
+
+        let asked = person.1.lock().unwrap().clone();
+        assert_eq!(asked.len(), 1, "one prompt, asked of the person: {asked:?}");
+        assert_eq!(asked[0].tool, MESH_WIRE_CALL);
+        assert!(asked[0].once && asked[0].must_ask, "yes or no, and a person answers");
+        assert_eq!(asked[0].preview.text.as_deref(), Some("found it"), "the payload is on it");
+        assert_eq!(mesh.table().allows(&worker.id, &inbox, WireMode::Send), wired, "{answer:?}: {}", out.result.output);
+        assert_eq!(mesh.drain_inbox(&parent_id()).len(), usize::from(wired));
+        if wired {
+            let by = mesh.table().all().iter().find(|w| w.from == worker.id).map(|w| w.grant.local);
+            assert_eq!(by, Some(Approver::Tui));
+            assert_eq!(out.result.approval, Some(Approval::Decided(Decision::Yes)), "always counts as one yes");
+        } else {
+            assert!(out.result.declined, "{}", out.result.output);
+        }
+    }
+
+    // Headless without `--approve mesh:<receptacle>`: nobody to ask, refused, nothing wired.
+    let worker = mesh.plug_next("worker").unwrap();
+    let ctx = marv_tools::ToolContext::new(std::env::temp_dir());
+    let out = marv_tools::run_tool(&call, &ctx, &tools(&worker, Some(Arc::new(HeadlessWires(Vec::new()))))).await;
+    assert!(out.result.is_error, "{}", out.result.output);
+    assert!(!mesh.table().allows(&worker.id, &inbox, WireMode::Send));
+    assert!(mesh.drain_inbox(&parent_id()).is_empty());
+    cancel.cancel();
+}

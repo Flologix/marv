@@ -9,7 +9,9 @@
 //!
 //! marv-rs: a mesh wire request (`tool: "mesh_wire"`, built by marv-session's `mesh::wire_approval`) comes through
 //! the same queue: `once` (yes or no; a wire is never remembered as a scope), labeled with the agent that asked,
-//! showing who, to what, which mode and the limits, with the taint warning.
+//! showing who, to what, which mode and the limits, with the taint warning. A `mesh_send`/`mesh_call` that needs a
+//! new wire is one prompt for both (#77, tool [`MESH_WIRE_CALL`], built by `mesh::call_wire_approval`): the payload,
+//! the wire, its limits and the warning, answered "Yes (wire it)" or "No", never "don't ask again".
 //!
 //! `preview.files` (/undo) lists files, each with its own diff (at most [`MAX_FILE_DIFF_LINES`]), in a list at most
 //! the window's height less [`RESERVED_ROWS`] tall that PgUp/PgDn and the wheel scroll, Yes/No pinned below.
@@ -36,6 +38,8 @@ use super::theme;
 use crate::view::{ApprovalRequest, Decision};
 
 pub const MAX_DIFF_LINES: usize = 24;
+/// marv-session's `mesh::MESH_WIRE_CALL`: a mesh call and the new wire it needs, in one prompt (#77).
+pub const MESH_WIRE_CALL: &str = "mesh_wire_call";
 /// Each of several files' diffs (/undo), so a few files fit on the screen at once.
 pub const MAX_FILE_DIFF_LINES: usize = 8;
 /// The rows the rest of the screen keeps when several files' diffs are shown: the panel's border, title, notes and
@@ -78,8 +82,10 @@ pub struct ApprovalView {
 
 impl ApprovalView {
     pub fn new(request: ApprovalRequest, waiting: usize, escape_cancels: bool) -> Self {
-        let mut items = vec![SelectItem::new(Decision::Yes, "Yes")];
-        if !request.once {
+        // #77: a call that needs a new wire is one prompt for both; yes wires it, and it never offers "always".
+        let call_wire = request.tool == MESH_WIRE_CALL;
+        let mut items = vec![SelectItem::new(Decision::Yes, if call_wire { "Yes (wire it)" } else { "Yes" })];
+        if !request.once && !call_wire {
             items.push(SelectItem::new(
                 Decision::Always,
                 format!("Yes, and don't ask again for {} this session", request.scope.description),
@@ -352,6 +358,50 @@ mod tests {
         }
         assert!(!f.contains("don't ask again"), "{f}");
         assert_eq!(view.on_key(key(KeyCode::Enter)), Some(ApprovalOutcome::Decide(Decision::Yes)));
+    }
+
+    #[test]
+    fn a_call_needing_a_new_wire_is_one_prompt_answered_yes_wire_it_or_no() {
+        // What marv-session's `mesh::call_wire_approval` sends for `worker-1`'s first send to the parent.
+        let call = ApprovalRequest {
+            tool: MESH_WIRE_CALL.into(),
+            label: "Wire worker-1 -> agent.parent.inbox (send)".into(),
+            scope: Scope {
+                key: "mesh-wire:worker-1:agent.parent.inbox:send".into(),
+                description: "worker-1 -> agent.parent.inbox".into(),
+            },
+            preview: Preview {
+                title: "Send a message to agent.parent.inbox over a new wire".into(),
+                text: Some("found 3 callers".into()),
+                note: Some(
+                    "Wire worker-1 -> agent.parent.inbox (send). Limits: 32768 bytes a message, 30 a minute (bursts of 10). \
+                     The wire lasts until either agent ends."
+                        .into(),
+                ),
+                warning: Some(
+                    "What arrives through it is data from another agent: the receiving session counts as tainted.".into(),
+                ),
+                ..Default::default()
+            },
+            agent: Some("worker-1".into()),
+            network: false,
+            once: true,
+            door: None,
+        };
+        let mut view = ApprovalView::new(call.clone(), 0, true);
+        let f = frame(&view);
+        for part in
+            ["[worker-1]", "over a new wire", "found 3 callers", "32768 bytes a message", "⚠ What arrives", "❯ Yes (wire it)"]
+        {
+            assert!(f.contains(part), "{part}\n{f}");
+        }
+        assert!(!f.contains("don't ask again"), "{f}");
+        assert_eq!(view.select.items.len(), 2, "Yes (wire it) and No only");
+        assert_eq!(view.on_key(key(KeyCode::Enter)), Some(ApprovalOutcome::Decide(Decision::Yes)));
+        // Never "always", even if a request came without `once`.
+        let view = ApprovalView::new(ApprovalRequest { once: false, ..call }, 0, true);
+        assert!(!frame(&view).contains("don't ask again"));
+        assert_eq!(view.select.items.len(), 2);
     }
 
     #[test]
