@@ -178,7 +178,8 @@ def check(ws, task):
         if dst.is_symlink() or dst.is_file(): dst.unlink()
         elif dst.exists(): shutil.rmtree(dst)
         (shutil.copytree if entry.is_dir() else shutil.copy)(entry, dst)
-    cmd = sandboxed([shutil.which("bun"), "test", "./__eval__.test.js"], ws)
+    # By its real path: a link to it under the home is hidden in the sandbox.
+    cmd = sandboxed([str(Path(shutil.which("bun")).resolve()), "test", "./__eval__.test.js"], ws)
     try:
         p = subprocess.run(cmd, cwd=ws, capture_output=True, text=True, timeout=120)
         return p.returncode == 0, (p.stdout + p.stderr)[-2000:]
@@ -208,6 +209,11 @@ class Run:
         except subprocess.TimeoutExpired:
             res["reason"] = "timeout"
         res["ms"] = int((time.time() - started) * 1000)
+        # What the agent changed, new files too (staged), before the check runs anything. Git runs sandboxed: the
+        # repository's config is the agent's to write (a core.fsmonitor or filter command would run on the host).
+        git_in_ws = lambda *args: subprocess.run(sandboxed(["/usr/bin/git", *args], ws), cwd=ws, capture_output=True, text=True)
+        git_in_ws("add", "-A")
+        (logdir / "diff.patch").write_text(git_in_ws("diff", "--cached", "HEAD").stdout)
         if servers:
             recorded = tdir / "out.json"
             write_fresh(ws / COMMENTS, recorded.read_text() if recorded.exists() else "[]")
@@ -217,11 +223,6 @@ class Run:
             write_fresh(ws / REPLY_FILE, res["reply"])
         res["pass_"], output = check(ws, task)
         if not res["pass_"]: res["checkOutput"] = output
-        # New files too: staged, so the diff shows them (the workspace is deleted next).
-        subprocess.run(["git", "add", "-A"], cwd=ws, capture_output=True)
-        diff = subprocess.run(["git", "diff", "--cached", "HEAD", "--", ".", ":!__eval__.test.js", f":!{COMMENTS}", f":!{REPLY_FILE}"],
-                              cwd=ws, capture_output=True, text=True).stdout
-        (logdir / "diff.patch").write_text(diff)
         shutil.rmtree(ws, ignore_errors=True)
         shutil.rmtree(tdir, ignore_errors=True)
         res["tools"] = dict(res["tools"])
