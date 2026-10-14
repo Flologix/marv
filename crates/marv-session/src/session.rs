@@ -285,6 +285,9 @@ pub struct SessionInit {
     /// for each conversation (the first, after `clear()`, on `resume()`), their output sent once at the start of its
     /// first message. Never in subagents. Default: none.
     pub hooks: Vec<HookCommand>,
+    /// A one-shot run (`marv -p`): the session ends with the reply, and its background processes with it (#86).
+    /// Default false.
+    pub one_shot: bool,
 }
 
 impl SessionInit {
@@ -331,6 +334,7 @@ impl SessionInit {
             processes: true,
             process_manager: None,
             hooks: Vec::new(),
+            one_shot: false,
         }
     }
 }
@@ -864,6 +868,7 @@ impl MarvSession {
                 process_on.then(|| {
                     let mut options = ProcessManagerOptions::new(&init.root);
                     options.on_change = init.on_change.clone();
+                    options.one_shot = init.one_shot;
                     ProcessManager::new(options)
                 })
             }),
