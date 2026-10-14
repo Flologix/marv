@@ -22,6 +22,7 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ### Added
 
+- **Tool arguments are repaired against the tool's schema (#65).** A number or boolean sent as a string (`"limit": "20"`), an object or list sent as a JSON string, a single value where a list is wanted, `null` for an optional field, and a field the tool doesn't have (another harness's `head_limit`) no longer cost an error round trip: the call runs with the repaired arguments, and the result says what was repaired in a `Marv:` note, so the model learns. Only cases with one reading are repaired; `"20abc"` for a number still fails as before. MCP tools get the type repairs only (unknown keys are dropped only when the schema forbids them), on direct calls and through `mcp_call`, so `get_issue` with `{"number": "12"}` reaches the server as `12`. And an MCP call missing a required field, or with a string shorter than its `minLength`, is refused with the field's name before the server is called, instead of, say, posting an empty comment.
 - **Real-model evals (#73).** `evals/bench.py` runs Marv's 20 eval tasks through `marv -p`, and through `claude -p` for comparison, grades them with each task's hidden tests, and reports pass rate, time, requests, tool calls, tokens and cost. See `evals/README.md`.
 
 ## [0.4.0] - 2026-10-14
