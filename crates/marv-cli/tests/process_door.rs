@@ -87,6 +87,10 @@ fn marv_p_starts_a_dev_server_bash_curls_it_the_host_reaches_it_and_nothing_outl
         .env("HOME", dir.0.join("home"))
         .env("MARV_CONFIG_DIR", dir.0.join("config"))
         .env("XDG_RUNTIME_DIR", dir.0.join("run"))
+        // No GitHub probe (`gh auth status`), which this test doesn't need: where `gh` is a wrapper that installs gh
+        // on first use (mise), the probe's timeout kills the wrapper and not the installer, which keeps writing
+        // ~40 MB into the fake home after it was removed (#89).
+        .env("MARV_GITHUB", "off")
         .env("TERM", "dumb")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

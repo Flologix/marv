@@ -99,7 +99,7 @@ The loop's edge cases:
 | `cut-off-twice` | two cut-offs in a row end the run (`length`, exit 2) |
 | `text-loop` | a reply repeating one sentence is stopped while it streams and dropped; the model is told once |
 | `tool-loop` | the same call with the same result: warned once, then the turn ends (`loop`, exit 2) |
-| `step-limit` | `--max-steps 3` with no one to ask: stops after 3 steps (exit 2) |
+| `step-limit` | `--max-steps 3` with no one to ask: stops after 3 steps (exit 2); marv-rs first asks for a tools-off wrap-up (#59, deliberate) |
 | `empty-reply` | an empty reply is retried, a second one nudged, the third answers |
 | `refused-approval` | a network command with no `--approve` is refused; the turn ends but exits 3 and lists it |
 | `dropped-stream` | a stream that closes early is retried from scratch, after the 1 s backoff |
