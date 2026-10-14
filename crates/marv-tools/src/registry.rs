@@ -10,7 +10,8 @@
 //! - `run_tool` never fails: bad JSON, invalid input and `ToolError`s become error results the model can recover from.
 //!   `available` is what this agent was offered (a subagent gets fewer tools); anything else is unknown, even if the
 //!   model names it.
-//! - Flow: parse JSON (else `repair_json_args`) → the tool's `repair` → validate → label → if gated: preview (a
+//! - Flow: parse JSON (else `repair_json_args`) → schema-guided repair (#65, [`schema_repaired`]) → the tool's
+//!   `repair` → validate → label → if gated: preview (a
 //!   `ToolError` fails the call before anyone is asked) → aborted? interrupted → yolo + `auto_safe`: run confined →
 //!   no approver: "no one to ask" → approve: unavailable / no (aborted → interrupted) / yes / always → run.
 //! - Right before any run (ungated, yolo or approved), the turn's checkpoint (#16) when the tool takes one
@@ -29,6 +30,7 @@ use marv_core::{ToolCall, ToolKind, ToolSpec};
 use serde_json::Value;
 
 use crate::repair::{repair_json_args, with_note};
+use crate::schema_repair::{RepairMode, repair_args, repair_note};
 use crate::types::{Approval, ApprovalRequest, Decision, DynTool, ToolContext, ToolOutput};
 
 /// A tool as the registry holds it.
@@ -103,6 +105,18 @@ fn short_label(label: String, ctx: &ToolContext) -> String {
     label
 }
 
+/// `raw` repaired against `tool`'s schema (#65), and the repairs' `Marv:` note. The value to parse, never the call's
+/// stored arguments: `ToolCall::arguments` stays as the model sent it (prompt cache).
+pub fn schema_repaired(tool: &dyn DynTool, raw: Value) -> (Value, Option<String>) {
+    // What a built-in tool already accepts isn't a mistake, even where it strays from the schema (`null` for an
+    // `Option` field): a note there would be noise. An MCP tool's input is any object, so its parse can't tell.
+    if tool.repair_mode() == RepairMode::Builtin && tool.parse(raw.clone()).is_ok() {
+        return (raw, None);
+    }
+    let (value, fixes) = repair_args(&tool.spec().parameters, raw, tool.repair_mode());
+    (value, repair_note(&fixes))
+}
+
 /// Runs a call. Never fails: every failure becomes a result the model can read and recover from.
 pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef]) -> ToolOutcome {
     let fail = |output: String, label: &str| ToolOutcome { result: ToolOutput::error(output), label: label.to_string() };
@@ -121,12 +135,14 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
             None => return fail(format!("The arguments for {} are not valid JSON: {}", call.name, call.arguments), &call.name),
         },
     };
-    // A tool's own repair of what it can read with certainty, before validation.
-    let (input_value, repair_note) = match tool.repair(&raw, ctx) {
+    // Generic schema mistakes (a number as a string, another harness's field), then the tool's own repair of what
+    // it can read with certainty, before validation. Both repair this value: `call` is never touched (prompt cache).
+    let (raw, schema_note) = schema_repaired(tool.as_ref(), raw);
+    let (input_value, tool_note) = match tool.repair(&raw, ctx) {
         Some(repaired) => (repaired.input, repaired.note),
         None => (raw, None),
     };
-    let note = [json_note, repair_note].into_iter().flatten().collect::<Vec<_>>().join("\n\n");
+    let note = [json_note, schema_note, tool_note].into_iter().flatten().collect::<Vec<_>>().join("\n\n");
     let note = (!note.is_empty()).then_some(note);
     let noted = |mut outcome: ToolOutcome| {
         outcome.result.output = with_note(&outcome.result.output, note.as_deref());
@@ -348,6 +364,47 @@ mod tests {
         assert!(!out.result.is_error);
         assert!(out.result.output.starts_with("a\tb\n\nMarv: the arguments contained 1 raw control character"));
         assert_eq!(out.label, "a\tb");
+    }
+
+    /// #65 through `run_tool`, with Marv's own tools: repaired calls run and say so, valid ones get no note, an
+    /// ambiguous one fails as it did before, and the stored call is the model's bytes.
+    #[tokio::test]
+    async fn schema_mistakes_are_repaired_with_a_note_and_the_call_is_left_as_sent() {
+        let root = crate::test_support::project("schema-repair");
+        let ctx = ToolContext::new(root.path());
+        let run = |name: &str, args: &str| {
+            let call = ToolCall { id: "c".into(), name: name.into(), arguments: args.into() };
+            let ctx = ctx.clone();
+            async move {
+                let out = run_tool(&call, &ctx, builtin_tools()).await;
+                (out, call)
+            }
+        };
+        // #73 multi-ask: grep with another harness's head_limit.
+        let (out, call) = run("grep", r#"{"pattern": "greet", "head_limit": 30}"#).await;
+        assert!(!out.result.is_error, "{}", out.result.output);
+        assert!(out.result.output.contains("src/greet.ts"));
+        assert!(out.result.output.ends_with(
+            "\n\nMarv: the arguments didn't match the tool's schema and were repaired before the call: unknown field \"head_limit\" was dropped. Send them as the schema says next time."
+        ));
+        assert_eq!(call.arguments, r#"{"pattern": "greet", "head_limit": 30}"#); // prompt cache: never rewritten
+        let (out, _) = run("read_file", r#"{"path": "src/app.ts", "limit": "1", "offset": null}"#).await;
+        assert!(!out.result.is_error, "{}", out.result.output);
+        assert!(out.result.output.contains("\"limit\" was the string \"1\": read as the integer 1"));
+        assert!(out.result.output.contains("\"offset\" was null: left out (it's optional)"));
+        // Valid: no note at all.
+        let (out, _) = run("read_file", r#"{"path": "src/app.ts", "limit": 1}"#).await;
+        assert!(!out.result.output.contains("Marv:"), "{}", out.result.output);
+        // Ambiguous: today's error, no note.
+        let (out, _) = run("read_file", r#"{"path": "src/app.ts", "limit": "20abc"}"#).await;
+        assert!(out.result.is_error);
+        assert!(out.result.output.starts_with("Invalid input for read_file:\ninvalid type: string \"20abc\", expected"));
+        assert!(!out.result.output.contains("Marv:"));
+        // Schema repair and a tool's own repair both apply (a leading-slash path), notes in that order.
+        let (out, _) = run("read_file", r#"{"path": "/src/app.ts", "limit": "1"}"#).await;
+        assert!(!out.result.is_error, "{}", out.result.output);
+        let (schema, path) = (out.result.output.find("schema").unwrap(), out.result.output.find("leading slash").unwrap());
+        assert!(schema < path);
     }
 
     #[tokio::test]
