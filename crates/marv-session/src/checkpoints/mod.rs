@@ -17,7 +17,9 @@ pub(crate) mod test_support {
 
     pub(crate) use crate::worktree::tests::{Temp, sh_git as git};
 
-    /// A temp folder, removed on drop.
+    /// A temp folder, removed on drop. Bind it to a variable that lives as long as its user: as a temporary in an
+    /// argument (`store(.., &temp("cp-own"))`) it is removed at the end of that statement, the store then recreates it
+    /// on its first write, and nothing removes it again (#89).
     pub(crate) fn temp(tag: &str) -> Temp {
         Temp::new(tag)
     }
