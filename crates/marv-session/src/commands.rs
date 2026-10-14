@@ -99,6 +99,10 @@ pub enum CommandAction {
     Compact {
         focus: Option<String>,
     },
+    /// marv-rs #78: let a message on a wired inbox start a turn while idle (`mesh.wake`). Showing it is a `Print`.
+    MeshWake {
+        on: bool,
+    },
     /// Stop one of the session's background processes (Marv #51).
     Processes {
         stop: String,
@@ -119,6 +123,15 @@ fn markdown(text: impl Into<String>) -> CommandAction {
 }
 fn error(text: impl Into<String>) -> CommandAction {
     CommandAction::Print { text: text.into(), is_error: true, markdown: false }
+}
+
+/// The mesh as `/mesh` shows it (marv-rs): who this Marv is on it and what's wired to its inbox.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MeshStatus {
+    /// Its name on the machine's mesh (others reach it at `peer.<name>.agent.parent.inbox`), when its door is open.
+    pub name: Option<String>,
+    /// The wires into the main agent's inbox, as `from -> receptacle`: the only messages that can wake it.
+    pub wired: Vec<String>,
 }
 
 /// Read-only facts a command may need.
@@ -144,6 +157,8 @@ pub struct CommandContext<'a> {
     pub sandbox_available: bool,
     /// The session's background processes, for /processes; None when the session doesn't offer the process tool.
     pub processes: Option<&'a [marv_tools::ProcessInfo]>,
+    /// The session's switchboard as `/mesh` shows it; None when this Marv isn't on the mesh.
+    pub mesh: Option<&'a MeshStatus>,
 }
 
 pub struct Command {
@@ -370,6 +385,23 @@ pub fn commands() -> &'static [Command] {
             },
         },
         Command {
+            name: "mesh",
+            // Shows the wires, or turns wake on/off: wake only acts on an idle session, so the palette may run it.
+            while_busy: true,
+            description: "The mesh: what's wired to Marv's inbox (/mesh wake on lets a message start a turn while idle)",
+            run: |args, ctx| {
+                let words: Vec<String> = args.split_whitespace().map(str::to_lowercase).collect();
+                let words: Vec<&str> = words.iter().map(String::as_str).collect();
+                match words[..] {
+                    [] => markdown(mesh_text(ctx)),
+                    ["wake", "on"] => CommandAction::MeshWake { on: true },
+                    ["wake", "off"] => CommandAction::MeshWake { on: false },
+                    ["wake"] => print(format!("Mesh wake: {}", mesh_wake_status(ctx.config))),
+                    _ => error("Usage: /mesh, /mesh wake, /mesh wake on, or /mesh wake off"),
+                }
+            },
+        },
+        Command {
             name: "undo",
             while_busy: false,
             description: "Put back the files the last turn changed (shows them first)",
@@ -585,6 +617,7 @@ fn config_text(ctx: &CommandContext) -> String {
         format!("Checks:    {} (/checks)", if c.checks { "on" } else { "off" }),
         format!("Checkpoints: {} (/checkpoints, /undo)", if c.checkpoints { "on" } else { "off" }),
         format!("Steps: {}", steps_status(c)),
+        format!("Mesh wake: {} (/mesh)", if c.mesh_wake { "on" } else { "off" }),
         format!("Endpoint:  {}", c.base_url),
     ];
     if c.provider == marv_provider::ProviderKind::Ollama {
@@ -601,6 +634,42 @@ pub fn diagnostics_status(config: &Config) -> String {
     } else {
         "off".into()
     }
+}
+
+/// `/mesh wake` (#78).
+pub fn mesh_wake_status(config: &Config) -> String {
+    if config.mesh_wake {
+        format!(
+            "on: a message on a wired inbox starts a turn while Marv is idle (at most {} a minute per wire; never during a turn or while an approval waits, and never in marv -p). The message is read as data from another agent, never as your instructions, and the conversation counts as tainted",
+            crate::mesh::WAKES_PER_MINUTE
+        )
+    } else {
+        "off: messages wait in the inbox until your next turn (/mesh wake on lets one start a turn while Marv is idle)".into()
+    }
+}
+
+fn mesh_text(ctx: &CommandContext) -> String {
+    let mut parts = Vec::new();
+    match ctx.mesh {
+        None => parts.push("**Mesh**: this Marv isn't on the mesh.".to_string()),
+        Some(mesh) => {
+            parts.push(match &mesh.name {
+                Some(name) => {
+                    let name = printable(name);
+                    format!("**Mesh**: on the mesh as `{name}` (others reach you at `peer.{name}.agent.parent.inbox`).")
+                }
+                None => "**Mesh**: this session's own switchboard (not on the machine's mesh).".to_string(),
+            });
+            parts.push(if mesh.wired.is_empty() {
+                "Nothing is wired to Marv's inbox.".to_string()
+            } else {
+                let list = mesh.wired.iter().map(|w| format!("- `{}`", printable(w))).collect::<Vec<_>>().join("\n");
+                format!("Wired to Marv's inbox:\n{list}")
+            });
+        }
+    }
+    parts.push(format!("**Wake**: {}.", mesh_wake_status(ctx.config)));
+    parts.join("\n\n")
 }
 
 pub fn checkpoints_status(config: &Config) -> String {
@@ -947,8 +1016,37 @@ mod tests {
             hidden_path_folders: &[],
             sandbox_available: true,
             processes: None,
+            mesh: None,
         };
         f(&ctx)
+    }
+
+    #[test]
+    fn mesh_shows_the_wires_and_wake_and_turns_wake_on_and_off() {
+        with(|ctx| {
+            assert_eq!(run_command("/mesh wake on", ctx), CommandAction::MeshWake { on: true });
+            assert_eq!(run_command("/mesh wake OFF", ctx), CommandAction::MeshWake { on: false });
+            for bad in ["/mesh wake maybe", "/mesh frob", "/mesh wake on now"] {
+                assert!(matches!(run_command(bad, ctx), CommandAction::Print { is_error: true, .. }), "{bad}");
+            }
+            let CommandAction::Print { text, is_error: false, .. } = run_command("/mesh", ctx) else { panic!() };
+            assert!(text.contains("isn't on the mesh") && text.contains("**Wake**: off"), "{text}");
+            let CommandAction::Print { text, .. } = run_command("/mesh wake", ctx) else { panic!() };
+            assert!(text.starts_with("Mesh wake: off"), "{text}");
+            let CommandAction::Print { text, .. } = run_command("/config", ctx) else { panic!() };
+            assert!(text.contains("Mesh wake: off (/mesh)"), "{text}");
+
+            let on = Config { mesh_wake: true, ..ctx.config.clone() };
+            let status = MeshStatus {
+                name: Some("beta".into()),
+                wired: vec!["peer-alpha -> agent.parent.inbox".into(), "x\u{1b}[2J -> agent.parent.inbox".into()],
+            };
+            let shown = CommandContext { config: &on, mesh: Some(&status), ..ctx.clone() };
+            let CommandAction::Print { text, .. } = run_command("/mesh", &shown) else { panic!() };
+            assert!(text.contains("on the mesh as `beta`") && text.contains("- `peer-alpha -> agent.parent.inbox`"), "{text}");
+            assert!(!text.contains('\u{1b}'), "printable: {text}");
+            assert!(text.contains("**Wake**: on") && text.contains("at most 3 a minute per wire"), "{text}");
+        });
     }
 
     #[test]
