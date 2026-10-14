@@ -49,6 +49,8 @@
 //!   "Always" also answers the queued requests with the same scope key.
 //! - **ctrl+c:** interrupt a reply → clear the prompt → "Press ctrl+c again to exit"
 //!   ([`EXIT_CONFIRM_MS`]) → exit. ctrl+o toggles details (subagents' steps, whole diffs).
+//! - **ctrl+k** (#44): the command palette over the prompt (`ui::command_palette`); the prompt keeps its text.
+//!   Never over an approval, the picker or setup; an approval arriving closes it.
 //! - **Live tool drafts:** a streaming tool call is kept as the latest draft (dropped at a step's
 //!   end, [`STEP_ENDS`]) and shown by `DraftView` as `Writing src/app.js… (8s · ~400 tokens)`.
 //! - **Subagent view:** subagents' events fold into per-call `AgentLog`s; a click on an agent entry
@@ -94,6 +96,7 @@ use crate::render_options::{FRAME_INTERVAL, TerminalGuard};
 use crate::selection::{SelectionEffect, SelectionStore};
 use crate::ui::agent_view::{self, AgentLog, AgentView, AgentViewHeader};
 use crate::ui::approval::{ApprovalOutcome, ApprovalView};
+use crate::ui::command_palette::{self, CommandPalette, PaletteOutcome};
 use crate::ui::markdown::StreamLexer;
 use crate::ui::martian::MartianAnimation;
 use crate::ui::message_view;
@@ -319,6 +322,8 @@ pub struct App {
 
     // --- the bottom panel ---
     prompt: PromptInput,
+    /// The ctrl+k palette (#44), over the prompt: the prompt keeps its text underneath.
+    palette: Option<CommandPalette>,
     approvals: VecDeque<Pending>,
     approval: Option<(ApprovalId, ApprovalView)>,
     picker: Option<SessionPicker>,
@@ -388,6 +393,7 @@ impl App {
             confirm_exit: None,
             flash: None,
             prompt: PromptInput::default(),
+            palette: None,
             approvals: VecDeque::new(),
             approval: None,
             picker: None,
@@ -495,7 +501,10 @@ impl App {
             }
             Event::Paste(text) => {
                 if self.phase == Phase::Main && self.setup.is_none() && self.approval.is_none() && self.picker.is_none() {
-                    self.prompt.paste(&text);
+                    match &mut self.palette {
+                        Some(palette) => palette.paste(&text),
+                        None => self.prompt.paste(&text),
+                    }
                     self.dirty = true;
                 }
             }
@@ -638,6 +647,9 @@ impl App {
     pub fn apply(&mut self, event: UiEvent, now: Instant) {
         match event {
             UiEvent::Approval { id, request } => {
+                // The approval takes the keyboard, as it does from the prompt: a key meant for the palette must not
+                // answer it. The prompt's text is still there underneath.
+                self.palette = None;
                 self.approvals.push_back(Pending { id, request });
                 self.show_approvals();
             }
@@ -1153,6 +1165,20 @@ impl App {
             return;
         }
 
+        // ctrl+k: the palette, from the prompt (empty, half-typed, or while a reply streams). Never over an approval
+        // or the session picker: they keep the keyboard.
+        if key.code == KeyCode::Char('k') && ctrl && self.palette.is_none() {
+            if self.approval.is_none() && self.picker.is_none() {
+                let entries = command_palette::entries(&self.commands, &self.port.settings());
+                self.palette = Some(CommandPalette::new(entries));
+            }
+            return;
+        }
+        if self.palette.is_some() && self.approval.is_none() {
+            self.on_palette_key(key);
+            return;
+        }
+
         // What the panels see is this key's state, before the App's own handlers change it (as in
         // Marv, where every useInput saw the same render).
         let viewing_before = self.viewing.is_some();
@@ -1213,6 +1239,51 @@ impl App {
             let busy = self.busy();
             if let Some(PromptOutcome::Submit(text)) = self.prompt.on_key(key, busy, &self.commands) {
                 self.submit(&text, now);
+            }
+        }
+    }
+
+    /// A key while the palette is open. Esc closes it (it doesn't stop a reply: that's the next Esc), PgUp/PgDn
+    /// and ctrl+o still work, ctrl+c closes it and interrupts a reply.
+    fn on_palette_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::PageUp => return self.page(-1),
+            KeyCode::PageDown => return self.page(1),
+            KeyCode::Char('o') if ctrl => {
+                self.show_steps = !self.show_steps;
+                return;
+            }
+            KeyCode::Char('c') if ctrl => {
+                self.palette = None;
+                if self.busy() {
+                    self.decline_all();
+                    self.port.abort();
+                }
+                return;
+            }
+            _ => {}
+        }
+        let busy = self.busy();
+        let Some(palette) = &mut self.palette else { return };
+        match palette.on_key(key, busy) {
+            None => {}
+            Some(PaletteOutcome::Close) => self.palette = None,
+            // As the slash command: the engine saves and announces it. The prompt keeps what was typed.
+            Some(PaletteOutcome::Run(line)) => {
+                self.palette = None;
+                self.scroll.follow();
+                self.port.run_command(line);
+            }
+            Some(PaletteOutcome::Prefill(text)) => {
+                self.palette = None;
+                // What was typed stays reachable with ↑.
+                let typed = self.prompt.value.trim().to_string();
+                if !typed.is_empty() && typed != text.trim() {
+                    self.prompt.remember(&typed);
+                }
+                self.prompt.history_index = None;
+                self.prompt.set(text);
             }
         }
     }
@@ -1375,6 +1446,7 @@ impl App {
         if let Some((_, view)) = &mut self.approval {
             view.set_window_rows(area.height);
         }
+        let header = if self.viewing.is_some() { agent_view::HEADER_HEIGHT } else { 0 };
         let panel_height = if let Some(picker) = self.picker.as_ref().filter(|_| self.setup.is_none() && self.approval.is_none())
         {
             picker.height()
@@ -1382,10 +1454,11 @@ impl App {
             view.height(width) + status_height
         } else if let Some(setup) = &self.setup {
             setup.height(width)
+        } else if let Some(palette) = &self.palette {
+            palette.height(area.height.saturating_sub(header + 1 + status_height)) + status_height
         } else {
             self.prompt.height(width, busy, &self.commands) + status_height
         };
-        let header = if self.viewing.is_some() { agent_view::HEADER_HEIGHT } else { 0 };
         let panel_height = panel_height.min(area.height.saturating_sub(header + 1));
         // The plan sits between the transcript and the panel (in a subagent's view too: it's the main agent's plan).
         let plan = if area.height >= PLAN_MIN_WINDOW { plan_view::render(self.plan.as_deref(), width) } else { Vec::new() };
@@ -1431,6 +1504,9 @@ impl App {
             StatusBar { confirm_exit: false, busy: true, usage: None, ..bar }.render(status_area, buf);
         } else if let Some(setup) = &self.setup {
             setup.render(panel, buf);
+        } else if let Some(palette) = &self.palette {
+            palette.render(above_status, buf, busy);
+            bar.render(status_area, buf);
         } else {
             self.prompt.render(above_status, buf, busy, &self.commands);
             bar.render(status_area, buf);
@@ -1566,7 +1642,9 @@ mod tests {
     use super::*;
     use crate::ui::scroll_view::GLIDE_MS;
     use crate::ui::thinking_view::SPINNER_MS;
-    use crate::view::{DiffLine, DiffShown, Preview, ProviderId, Resumed, Scope, SessionSummary, SetupAnswer};
+    use crate::view::{
+        DiffLine, DiffShown, Preview, ProviderId, Resumed, Scope, SessionSummary, SettingAction, SettingInfo, SetupAnswer,
+    };
     use std::sync::Mutex;
     use tokio::sync::mpsc;
 
@@ -1624,7 +1702,28 @@ mod tests {
 
     impl SessionPort for FakePort {
         fn commands(&self) -> Vec<CommandInfo> {
-            vec![CommandInfo { name: "help".into(), description: "Show available commands".into() }]
+            vec![
+                CommandInfo { while_busy: true, ..CommandInfo::new("help", "Show available commands") },
+                CommandInfo::new("undo", "Put back the files the last turn changed"),
+            ]
+        }
+        fn settings(&self) -> Vec<SettingInfo> {
+            vec![
+                SettingInfo {
+                    name: "Yolo".into(),
+                    value: "on".into(),
+                    description: "Run what the sandbox confines without asking".into(),
+                    action: SettingAction::Run("/yolo off".into()),
+                    while_busy: true,
+                },
+                SettingInfo {
+                    name: "Step limit".into(),
+                    value: "25".into(),
+                    description: "Show or set the step limit".into(),
+                    action: SettingAction::Prefill("/steps ".into()),
+                    while_busy: false,
+                },
+            ]
         }
         fn send(&self, text: String) {
             self.calls.lock().unwrap().push(Call::Send(text));
@@ -2731,5 +2830,134 @@ mod tests {
         assert!(frame.contains("Resumed a session"));
         assert!(frame.contains(" Plan 1/3 ─"));
         assert!(frame.contains("▸ Add the --json flag"));
+    }
+
+    // --- the ctrl+k palette (#44) ---
+
+    /// Types without submitting.
+    fn type_only(h: &mut Harness, text: &str) {
+        for c in text.chars() {
+            h.key(KeyCode::Char(c));
+        }
+    }
+
+    #[test]
+    fn ctrl_k_opens_the_palette_over_half_typed_text_and_esc_brings_the_text_back() {
+        let mut h = harness();
+        type_only(&mut h, "fix the bu");
+        h.ctrl('k');
+        let frame = h.frame();
+        assert!(frame.contains("Search commands, skills, settings and keys"), "{frame}");
+        assert!(frame.contains("Yolo: on"), "{frame}");
+        assert!(frame.contains("ctrl+o"), "{frame}");
+        assert!(!frame.contains("fix the bu"), "{frame}");
+        // Typing goes to the search, not the prompt.
+        type_only(&mut h, "help");
+        assert!(h.frame().contains("❯ help"));
+        h.key(ESC);
+        let frame = h.frame();
+        assert!(frame.contains("> fix the bu"), "{frame}");
+        assert!(!frame.contains("Search commands"), "{frame}");
+        assert_eq!(h.app.prompt.value, "fix the bu");
+        assert!(h.calls().is_empty(), "{:?}", h.calls());
+        // ctrl+k from an empty prompt too, and ctrl+k again closes it.
+        let mut h = harness();
+        h.ctrl('k');
+        assert!(h.frame().contains("Search commands"));
+        h.ctrl('k');
+        assert!(!h.frame().contains("Search commands"));
+    }
+
+    #[test]
+    fn the_palette_filters_and_enter_on_a_toggle_runs_its_command_and_keeps_the_typed_text() {
+        let mut h = harness();
+        type_only(&mut h, "half");
+        h.ctrl('k');
+        type_only(&mut h, "sandbox confines");
+        let frame = h.frame();
+        assert!(frame.contains("❯ Yolo: on"), "{frame}");
+        assert!(!frame.contains("Show available commands"), "{frame}");
+        h.key(ENTER);
+        assert_eq!(h.calls(), [Call::Command("/yolo off".into())]);
+        assert_eq!(h.app.prompt.value, "half");
+        assert!(!h.frame().contains("Search commands"));
+        // Not in the prompt's history: the user didn't type it.
+        assert!(h.app.prompt.history.is_empty());
+    }
+
+    #[test]
+    fn a_value_setting_prefills_its_command_and_the_typed_text_stays_in_the_history() {
+        let mut h = harness();
+        type_only(&mut h, "draft message");
+        h.ctrl('k');
+        type_only(&mut h, "step");
+        h.key(ENTER);
+        assert_eq!(h.app.prompt.value, "/steps ");
+        assert!(h.calls().is_empty());
+        h.key(KeyCode::Up);
+        assert_eq!(h.app.prompt.value, "draft message");
+    }
+
+    #[test]
+    fn while_a_reply_streams_the_palette_runs_what_can_and_esc_only_closes_it() {
+        let mut h = harness();
+        h.typed("hello");
+        h.events([UiEvent::TextDelta("Working on".into())]);
+        assert!(h.app.busy());
+        h.ctrl('k');
+        type_only(&mut h, "undo");
+        assert!(h.frame().contains("(after the reply)"));
+        h.key(ENTER);
+        assert!(h.frame().contains("/undo can run after the reply"));
+        // Esc closes the palette; the reply carries on.
+        h.key(ESC);
+        assert!(!h.calls().contains(&Call::Abort));
+        assert!(h.app.busy());
+        // A setting that applies from the next turn runs now.
+        h.ctrl('k');
+        type_only(&mut h, "yolo");
+        h.key(ENTER);
+        assert_eq!(h.calls().last(), Some(&Call::Command("/yolo off".into())));
+        // The prompt's `/` menu stays hidden while busy, as before.
+        type_only(&mut h, "/");
+        assert!(!h.frame().contains("Show available commands"));
+    }
+
+    #[test]
+    fn ctrl_k_never_opens_over_an_approval_and_an_approval_closes_the_palette() {
+        let mut h = harness();
+        h.typed("make a file");
+        h.events([UiEvent::Approval { id: ApprovalId(1), request: write_request("made.txt", None) }]);
+        h.ctrl('k');
+        let frame = h.frame();
+        assert!(!frame.contains("Search commands"), "{frame}");
+        assert!(frame.contains("Create made.txt"), "{frame}");
+        assert!(!h.calls().iter().any(|c| matches!(c, Call::Answer(..))));
+        h.key(ENTER);
+        assert!(h.calls().contains(&Call::Answer(1, Decision::Yes)));
+
+        // Open, then an approval arrives: it takes over, and an Enter answers it, not the palette.
+        let mut h = harness();
+        h.typed("make a file");
+        h.ctrl('k');
+        type_only(&mut h, "yolo");
+        h.events([UiEvent::Approval { id: ApprovalId(2), request: write_request("other.txt", None) }]);
+        let frame = h.frame();
+        assert!(!frame.contains("Search commands"), "{frame}");
+        assert!(frame.contains("Create other.txt"), "{frame}");
+        h.key(ENTER);
+        assert!(h.calls().contains(&Call::Answer(2, Decision::Yes)));
+        assert!(!h.calls().contains(&Call::Command("/yolo off".into())));
+    }
+
+    #[test]
+    fn a_paste_goes_to_the_palette_search_while_it_is_open() {
+        let mut h = harness();
+        type_only(&mut h, "kept");
+        h.ctrl('k');
+        h.app.on_event(Event::Paste("yolo".into()), h.now);
+        assert!(h.frame().contains("❯ Yolo: on"));
+        h.key(ESC);
+        assert_eq!(h.app.prompt.value, "kept");
     }
 }

@@ -18,6 +18,7 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ### Added
 
+- **Command palette on ctrl+k (#44).** One fuzzy search over the slash commands, skills, settings and keyboard shortcuts, matched on name and description and grouped by kind. It opens at any time from the prompt: what you've typed stays and comes back on Esc, and while a reply streams the entries that don't need to wait (showing things, most toggles) still run, while the others say "after the reply". Settings show their current values: Enter on `Yolo: off`, `Sandbox: on`, `Thinking: …` and the other toggles flips it, saved and announced exactly as the slash command does; `Model` opens the model picker and `Step limit` puts `/steps ` in the prompt. Shortcuts are listed, not run. It never opens over an approval, and an approval closes it. The `/` menu and the palette share one list, so a new command shows up in both. `/help` and the README's Keys table mention it.
 - **Real-model evals (#73).** `evals/bench.py` runs Marv's 20 eval tasks through `marv -p`, and through `claude -p` for comparison, grades them with each task's hidden tests, and reports pass rate, time, requests, tool calls, tokens and cost. See `evals/README.md`.
 
 ## [0.4.0] - 2026-10-14

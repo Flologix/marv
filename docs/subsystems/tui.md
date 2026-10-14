@@ -32,6 +32,7 @@ Spec: Marv `CLAUDE.md` bullets **Rendering**, **Mouse**, **Selection**, **Replie
 | `src/ui/SessionPicker.tsx` | `ui/session_picker.rs` | **Ported**, with `time_ago`. Tests. |
 | `src/ui/ModelPicker.tsx` | `ui/model_picker.rs` | **Ported**, with `format_price`. `setup.test.tsx` picker cases ported. |
 | `src/ui/Setup.tsx` | `ui/setup.rs` | **Ported.** Answers with `SetupAnswer` (`api_key: None` keeps the saved key; the engine owns the file, the env and the endpoint). All `setup.test.tsx` cases ported. |
+| — (new, Marv #44) | `ui/command_palette.rs` | **Done (#44).** The ctrl+k palette: `entries` (the `/` menu's `CommandInfo`s, then `SettingInfo`s from `SessionPort::settings`, then `SHORTCUTS`), `fuzzy_score` (every query word must match the name or the description; name before description, a word's start before its middle, letters in order last), `search` (grouped by kind, groups by their best match), `CommandPalette` (↑/↓, Enter, Tab completes a command into the prompt, Esc and ctrl+k close). See "The command palette" below. Tests: matching, grouping, the entry list, drawing; and in `app.rs` open over half-typed text, filter, Enter on a toggle, Esc restoring the text, a value prefilling, busy, the approval cases, paste. |
 | `src/ui/PromptInput.tsx` | `ui/prompt_input.rs` | **Ported.** Owns its value (the App clears it on an accepted submit). All `prompt.test.tsx` cases ported. |
 | `src/ui/StatusBar.tsx` | `ui/status_bar.rs` | **Ported**, with `tokens`, `format_usage` (cache-hit rate), `cost_text` (integer rounding to match JS's halves-up). Tests. #24: `N running` (background processes, `StatusInfo::processes`) after yolo, idle or busy, as Marv's #51; the TUI bridge sends a fresh `StatusInfo` when the process manager reports a change |
 
@@ -41,7 +42,8 @@ Spec: Marv `CLAUDE.md` bullets **Rendering**, **Mouse**, **Selection**, **Replie
 
 ```rust
 pub trait SessionPort: Send + Sync {          // every method returns at once; results come back as UiEvents
-    fn commands(&self) -> Vec<CommandInfo>;   // the `/` menu
+    fn commands(&self) -> Vec<CommandInfo>;   // the `/` menu and the ctrl+k palette (kind, while_busy)
+    fn settings(&self) -> Vec<SettingInfo>;   // the palette's settings, values as they are now (default: none)
     fn send(&self, text: String);             // start a turn
     fn run_command(&self, line: String);      // a slash command; UI-side results as events
     fn answer(&self, id: ApprovalId, decision: Decision);
@@ -72,6 +74,16 @@ pub trait SessionPort: Send + Sync {          // every method returns at once; r
 - **Not in this crate:** `src/commands/*` (the engine runs them and sends the UI-side results) and Herdr reporting (marv-cli).
 - **Two kept copies (#9).** marv-tui depends only on marv-core, so it can't call marv-session's `tool_draft` or marv-tools' `preview_lines`/`file_lines`. `thinking_view` keeps `draft_label`/`draft_preview` (no `regex`) and `diff_view` keeps `preview_lines`/`file_lines` over the view's `DiffLine`, each with the original's tests. To drop them: have the engine send the draft's label and preview in `UiEvent::ToolCallDelta`, and move the two diff helpers to marv-core.
 - **Rendering differences from Ink (#9).** Markdown is parsed by pulldown-cmark, not marked: it has no GFM bare-URL autolinks, so `markdown::autolink` finds `http(s)://` URLs in text (`www.` and emails aren't linked). Wrapping follows wrap-ansi as Ink called it, except that the row after an exactly full row doesn't start with the separating space. Tabs are drawn as two spaces (a buffer cell is one column). The quote bar `▎` marks a quote's first row only, as Ink drew it. A diff line that serde can't read fails the whole message's parse (Marv filtered bad lines while drawing); the engine's session loader handles that.
+
+## The command palette (#44)
+
+ctrl+k opens it from the prompt, empty or half-typed, idle or while a reply streams. It replaces the prompt panel while open; the prompt keeps its text underneath, so Esc (or ctrl+k again) goes back to it as it was. Choosing a command or a toggle doesn't touch the typed text either. A value setting that prefills (`Step limit` → `/steps `) does replace it, and the replaced text goes into the prompt history (↑ brings it back).
+
+- **ctrl+k was free.** `PromptInput` types nothing for ctrl/alt + a letter (ink-text-input's behaviour, kept), and the App bound only ctrl+c and ctrl+o; there is no kill-line to shadow. Setup (which has its own text fields) still gets every key first.
+- **Never over an approval** (nor the session picker or setup): ctrl+k does nothing there, and an approval that arrives while the palette is open closes it, so a key meant for the palette can't answer the approval.
+- **One list.** The `/` menu and the palette are built from `SessionPort::commands()`; `CommandInfo` gained `kind` (command or skill) and `while_busy`. Settings come from marv-session's settings table (`commands::settings()`, next to the commands), which borrows each command's description. A toggle's action is the command line that flips it (`/yolo off`) and a picker's is its command (`/model`), so the palette sends `SessionPort::run_command` exactly what typing would: the saving and the notice stay in the command's action.
+- **While busy.** Entries whose command only shows something or sets a value from the next turn (`Command::while_busy`: `/help`, `/cost`, `/config`, the toggles that are read at turn start…) run during a reply; the rest are dimmed with "(after the reply)", and Enter says so. Esc in the palette only closes it (the next Esc stops the reply); ctrl+c closes it and interrupts.
+- **Shortcuts** are `command_palette::SHORTCUTS`, listed and not run; keep them in step with README's Keys table and `/help` (marv-session can't see this crate, so `help_text` has its own short list).
 
 ## The shell (#10): measured CPU and known gaps
 

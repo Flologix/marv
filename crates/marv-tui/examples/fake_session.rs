@@ -269,7 +269,7 @@ impl SessionPort for Fake {
             ("exit", "Quit"),
         ]
         .into_iter()
-        .map(|(name, description)| CommandInfo { name: name.into(), description: description.into() })
+        .map(|(name, description)| CommandInfo { while_busy: name == "help", ..CommandInfo::new(name, description) })
         .collect()
     }
 
