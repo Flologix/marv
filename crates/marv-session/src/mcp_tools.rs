@@ -144,8 +144,12 @@ impl Tool for McpCallTool {
     fn schema(&self) -> Value {
         marv_mcp::deferred::deferred_specs()[1].parameters.clone()
     }
+    /// Execute even once tainted: the real tool is Egress then and asks, with `must_ask` and its own scope
+    /// (`mcp:<server>:<tool>`). An Egress wrapper was gated as well, under the bare scope `mcp_call`, which
+    /// `marv -p --approve mcp` doesn't cover: every MCP call after the first MCP read was refused there, and the TUI
+    /// asked twice.
     fn kind(&self) -> ToolKind {
-        if self.taint.is_tainted() { ToolKind::Egress } else { ToolKind::Execute }
+        ToolKind::Execute
     }
     fn checkpoint(&self) -> bool {
         false
@@ -243,5 +247,30 @@ mod tests {
         let repaired = call.repair(&json!({ "tool": "mcp__a__b", "arguments": "{\"x\":1}" }), &ctx).unwrap();
         assert_eq!(repaired.input, json!({ "tool": "mcp__a__b", "arguments": { "x": 1 } }));
         assert!(repaired.note.unwrap().contains("came as a JSON string"));
+    }
+
+    struct Recording(std::sync::Mutex<Vec<String>>);
+    #[async_trait]
+    impl marv_tools::Approver for Recording {
+        async fn approve(&self, request: marv_tools::ApprovalRequest) -> marv_tools::Decision {
+            self.0.lock().unwrap().push(request.scope.key);
+            marv_tools::Decision::Unavailable
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tainted_mcp_call_wrapper_leaves_the_asking_to_the_real_tool() {
+        let approver = Arc::new(Recording(std::sync::Mutex::new(vec![])));
+        let ctx = ToolContext { approver: Some(approver.clone()), ..ToolContext::new("/nonexistent/p") };
+        ctx.taint.mark(Provenance::Mcp);
+        let call = McpCallTool { mcp: empty(), taint: ctx.taint.clone(), loaded: Arc::default() };
+        assert_eq!(call.kind(), ToolKind::Execute);
+        let tools: Vec<ToolRef> = vec![Arc::new(call)];
+        let args = json!({ "tool": "mcp__gh__nope", "arguments": {} }).to_string();
+        let out =
+            marv_tools::run_tool(&ToolCall { id: "c1".into(), name: "mcp_call".into(), arguments: args }, &ctx, &tools).await;
+        // Reaches the lookup (no such tool here) without an approval under the wrapper's own name.
+        assert_eq!(out.result.output, "No MCP tool is named \"mcp__gh__nope\".");
+        assert!(approver.0.lock().unwrap().is_empty());
     }
 }

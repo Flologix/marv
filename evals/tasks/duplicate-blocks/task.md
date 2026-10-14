@@ -1,0 +1,1 @@
+Only admins may delete: handleDelete in src/handlers.js should answer status 403 with body { error: "admins only" } when the signed-in user isn't an admin (req.user.isAdmin). Create and update stay as they are.

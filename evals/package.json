@@ -1,0 +1,8 @@
+{
+  "name": "marv-evals",
+  "private": true,
+  "description": "The compiler the TypeScript eval tasks run (copied into each task's repo by bench.py).",
+  "devDependencies": {
+    "typescript": "7.0.2"
+  }
+}
