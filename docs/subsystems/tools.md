@@ -38,7 +38,7 @@ Spec: the **Tools**, **Web**, **Skills**, **Memory**, **Subagents** and **Yolo m
 | `src/tools/web/convert.ts` | `web/convert.rs` | **Ported and tested:** re-execs this binary as `marv __html-convert` (empty environment, temp dir, SIGKILLed and reaped before it returns). Tests use the test binary itself as the converter |
 | `src/tools/web/html-convert-cli.ts` | `web/html_convert_cli.rs` | **Ported:** `main` (marv-cli routes `__html-convert` to it) |
 | (new, marv-rs) | `web/hidden.rs` | Hiding classes, invisible characters, Markdown comments (docs/SECURITY.md; guards in `tests/guards/tests/web.rs`) |
-| (new) | `output.rs` | Ported: the 30k cut (10k head + 20k tail). Todo: spill the cut to a file (#61) |
+| (new) | `output.rs` | **Done:** the 30k cut (10k head + 20k tail); #61: a cut bash, github, MCP or subagent result is saved whole to `~/.marv/tool-output/<session>/<call id>.txt` (`spill_cut`, `cut_for_call`, `ToolContext::tool_output`) and the marker names it; `read_file` and `grep` read exactly that folder (`files::resolve_readable`); `clean_tool_output` (7 days, 256 MiB). web_fetch pages instead of cutting, so it saves nothing |
 | (new, #66) | `apply_patch.rs` | The plan and its types only. Not registered |
 
 `grep -rn 'todo!("port' crates/marv-tools` lists what's left.
@@ -111,7 +111,6 @@ pub const INTERRUPTED: &str;  // must equal marv-agent's NOT_RUN.aborted
   - Marv's cross-process `withFileLock` (`src/file-lock.ts`): in marv-fs (`marv_fs::with_file_lock`).
 - **The `agent` tool** reaches subagents only through `AgentHost`, because marv-tools can't depend on marv-agent.
 - **Planned:**
-  - spill cut output to a file (#61, `output::spill_cut`);
   - schema-guided arg repair (#65, `repair`);
   - a formatter after edits (#67, `edit_file`/`write_file`);
   - `apply_patch` (#66).
