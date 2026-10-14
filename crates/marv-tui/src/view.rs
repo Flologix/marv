@@ -370,12 +370,55 @@ pub struct SetupAnswer {
     pub api_key: Option<String>,
 }
 
-/// A slash command for the `/` menu.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A slash command for the `/` menu and the ctrl+k palette (#44): both are built from the one list
+/// [`SessionPort::commands`] returns, so a new command or skill shows up in both.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CommandInfo {
     /// Without the slash; may have words ("mcp login github") for argument completions.
     pub name: String,
     pub description: String,
+    /// A built-in command or a skill: the palette groups them apart.
+    pub kind: CommandKind,
+    /// The palette may run it while a reply streams (it only shows something, or changes a setting
+    /// from the next turn on). Everything else waits for an idle session.
+    pub while_busy: bool,
+}
+
+impl CommandInfo {
+    /// A built-in command that needs an idle session.
+    pub fn new(name: impl Into<String>, description: impl Into<String>) -> Self {
+        Self { name: name.into(), description: description.into(), ..Self::default() }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CommandKind {
+    #[default]
+    Command,
+    Skill,
+}
+
+/// A setting the palette shows with its current value (#44): `Yolo: on`, `Model: z-ai/glm-5.3-flash`.
+/// The engine builds these from its settings table, next to the commands, and says what choosing one
+/// does as a command line, so the change goes the way the slash command goes (saved, announced).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingInfo {
+    /// "Yolo", "Step limit".
+    pub name: String,
+    /// "on", "z-ai/glm-5.3-flash", "25".
+    pub value: String,
+    pub description: String,
+    pub action: SettingAction,
+    /// Choosing it is fine while a reply streams.
+    pub while_busy: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettingAction {
+    /// Run this command line: a toggle's flip (`/yolo off`) or a value's picker (`/model`).
+    Run(String),
+    /// Put this in the prompt for the user to finish (`/steps `).
+    Prefill(String),
 }
 
 /// A running subagent's state for its transcript entry (Marv `AgentProgress`).
@@ -569,6 +612,12 @@ pub trait SessionPort: Send + Sync {
     /// The commands for the `/` menu (stable for the session; read once).
     fn commands(&self) -> Vec<CommandInfo>;
 
+    /// The settings the ctrl+k palette lists, with their values as they are now (asked each time the
+    /// palette opens, so they're never stale).
+    fn settings(&self) -> Vec<SettingInfo> {
+        Vec::new()
+    }
+
     /// Starts a turn with the user's message. A message while busy is the engine's to refuse
     /// (it answers with a system [`UiEvent::Message`]); the UI also doesn't send one.
     fn send(&self, text: String);
@@ -604,6 +653,12 @@ pub trait SessionPort: Send + Sync {
     /// never reaches the model, the prompt history or the transcript, even during a turn. True: the engine took it
     /// (what happened comes back as events).
     fn login_callback(&self, _text: &str) -> bool {
+        false
+    }
+
+    /// Whether `text` is such a callback, without taking it: the palette (#113) keeps a draft in the prompt history
+    /// only when it isn't one.
+    fn is_login_callback(&self, _text: &str) -> bool {
         false
     }
 }

@@ -129,7 +129,7 @@ Type what you want in plain language, for example:
 | `/clear` | Start a fresh conversation (the old one stays saved) |
 | `/exit` | Quit |
 
-Type `/` to open the command menu: ↑/↓ to choose, Enter to run, Tab or → to complete.
+Type `/` to open the command menu: ↑/↓ to choose, Enter to run, Tab or → to complete. Or press ctrl+k for the command palette: it opens over what you've typed (Esc brings it back) and while a reply streams, searches commands, skills, settings and keys by name and description, and shows each setting's current value (`Yolo: off`, `Model: …`): Enter on a toggle flips it as its command would.
 
 ### Keys
 
@@ -137,6 +137,7 @@ Type `/` to open the command menu: ↑/↓ to choose, Enter to run, Tab or → t
 |---|---|
 | Esc | Stop a reply or a running tool (in a subagent's view: go back) |
 | ctrl+c | Stop / clear the input / press twice to quit |
+| ctrl+k | Command palette: search commands, skills, settings (with their values) and keys; Enter flips a toggle |
 | ctrl+o | Show or hide details: what subagents did, and whole diffs |
 | Click a subagent | Open its own transcript, live |
 | PgUp / PgDn, mouse wheel | Scroll the conversation |

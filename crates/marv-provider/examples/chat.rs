@@ -83,7 +83,10 @@ async fn main() {
                 failed = true;
             }
             ProviderEvent::Done { reason } => eprintln!("\n[done: {}]", reason.as_deref().map(printable).unwrap_or_default()),
-            ProviderEvent::ToolCallDelta { .. } | ProviderEvent::ToolCall(_) | ProviderEvent::Reasoning(_) => {}
+            ProviderEvent::ToolCallDelta { .. }
+            | ProviderEvent::ToolCall(_)
+            | ProviderEvent::Reasoning(_)
+            | ProviderEvent::Discard { .. } => {}
         }
     }
     println!();

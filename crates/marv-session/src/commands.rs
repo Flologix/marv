@@ -148,6 +148,10 @@ pub struct CommandContext<'a> {
 
 pub struct Command {
     pub name: &'static str,
+    /// The ctrl+k palette may run it while a reply streams (#44): it only shows something, or changes a setting from
+    /// the next turn on ([`crate::MarvSession::configure`]). Anything that starts a turn, opens a picker, touches the
+    /// conversation or the files waits for an idle session. Decide it for each new command.
+    pub while_busy: bool,
     pub description: &'static str,
     pub run: fn(&str, &CommandContext) -> CommandAction,
 }
@@ -164,25 +168,38 @@ fn on_off(args: &str, usage: &str) -> Result<Option<bool>, CommandAction> {
 /// Every built-in command, in `/help` order.
 pub fn commands() -> &'static [Command] {
     static COMMANDS: &[Command] = &[
-        Command { name: "help", description: "Show available commands", run: |_, _| print(help_text()) },
-        Command { name: "config", description: "Show the current configuration", run: |_, ctx| print(config_text(ctx)) },
-        Command { name: "setup", description: "Change provider, model, or API key", run: |_, _| CommandAction::Setup },
+        Command { name: "help", while_busy: true, description: "Show available commands", run: |_, _| print(help_text()) },
+        Command {
+            name: "config",
+            while_busy: true,
+            description: "Show the current configuration",
+            run: |_, ctx| print(config_text(ctx)),
+        },
+        Command {
+            name: "setup",
+            while_busy: false,
+            description: "Change provider, model, or API key",
+            run: |_, _| CommandAction::Setup,
+        },
         Command {
             name: "model",
+            while_busy: false,
             description: "Switch model (/model to pick, /model <id> to set)",
             run: |args, _| CommandAction::Model { id: (!args.is_empty()).then(|| args.to_string()) },
         },
         Command {
             name: "think",
+            while_busy: true,
             description: "Toggle model thinking (/think on, /think off)",
             run: |args, ctx| match on_off(args, "Usage: /think, /think on, or /think off") {
                 Ok(on) => CommandAction::Thinking { on: on.unwrap_or(!ctx.config.thinking) },
                 Err(e) => e,
             },
         },
-        Command { name: "memory", description: "Show what Marv remembers", run: |_, _| CommandAction::Memory },
+        Command { name: "memory", while_busy: true, description: "Show what Marv remembers", run: |_, _| CommandAction::Memory },
         Command {
             name: "remember",
+            while_busy: false,
             description: "Save a note to memory (/remember <note>, or /remember project: <note>)",
             run: |args, _| {
                 let lower = args.to_lowercase();
@@ -198,6 +215,7 @@ pub fn commands() -> &'static [Command] {
         },
         Command {
             name: "forget",
+            while_busy: false,
             description: "Remove a memory (/forget <text from it>)",
             run: |args, _| {
                 if args.trim().is_empty() {
@@ -209,12 +227,19 @@ pub fn commands() -> &'static [Command] {
         },
         Command {
             name: "compact",
+            while_busy: false,
             description: "Summarize the conversation to free up context (/compact <what to keep>)",
             run: |args, _| CommandAction::Compact { focus: (!args.is_empty()).then(|| args.to_string()) },
         },
-        Command { name: "resume", description: "Pick up an earlier session in this project", run: |_, _| CommandAction::Resume },
+        Command {
+            name: "resume",
+            while_busy: false,
+            description: "Pick up an earlier session in this project",
+            run: |_, _| CommandAction::Resume,
+        },
         Command {
             name: "cost",
+            while_busy: true,
             description: "Show tokens used and cost so far",
             run: |_, ctx| {
                 print(
@@ -225,16 +250,19 @@ pub fn commands() -> &'static [Command] {
         },
         Command {
             name: "agents",
+            while_busy: true,
             description: "List the subagent types Marv can start",
             run: |_, ctx| markdown(agents_text(ctx.agents, ctx.agent_problems)),
         },
         Command {
             name: "skills",
+            while_busy: true,
             description: "List the skills Marv can use",
             run: |_, ctx| markdown(skills_text(ctx.skills, ctx.skill_problems)),
         },
         Command {
             name: "sandbox",
+            while_busy: true,
             description: "Show or set the bash sandbox (/sandbox on, /sandbox off)",
             run: |args, ctx| match on_off(args, "Usage: /sandbox, /sandbox on, or /sandbox off") {
                 Ok(Some(on)) => CommandAction::Sandbox { on },
@@ -246,6 +274,7 @@ pub fn commands() -> &'static [Command] {
         },
         Command {
             name: "yolo",
+            while_busy: true,
             description: "Run what the sandbox confines without asking (/yolo on, /yolo off)",
             run: |args, ctx| match on_off(args, "Usage: /yolo, /yolo on, or /yolo off") {
                 Ok(on) => CommandAction::Yolo { on: on.unwrap_or(!ctx.config.yolo) },
@@ -254,11 +283,13 @@ pub fn commands() -> &'static [Command] {
         },
         Command {
             name: "mcp",
+            while_busy: false,
             description: "Show MCP servers and their tools (/mcp add <package | URL | repo>, search, remove, trust, login, logout)",
             run: |args, ctx| mcp_command(args.trim(), ctx),
         },
         Command {
             name: "good",
+            while_busy: false,
             description: "Rate the last turn as good (/good <optional note>)",
             run: |args, _| CommandAction::Feedback {
                 score: 1,
@@ -268,6 +299,7 @@ pub fn commands() -> &'static [Command] {
         },
         Command {
             name: "bad",
+            while_busy: false,
             description: "Rate the last turn as bad (/bad <what went wrong>)",
             run: |args, _| CommandAction::Feedback {
                 score: -1,
@@ -277,6 +309,7 @@ pub fn commands() -> &'static [Command] {
         },
         Command {
             name: "label",
+            while_busy: false,
             description: "Tag the last turn (/label refactor, tests)",
             run: |args, _| {
                 let labels: Vec<String> =
@@ -290,6 +323,7 @@ pub fn commands() -> &'static [Command] {
         },
         Command {
             name: "trajectories",
+            while_busy: false,
             description: "Show or set run logging (/trajectories on, /trajectories off)",
             run: |args, ctx| match on_off(args, "Usage: /trajectories, /trajectories on, or /trajectories off") {
                 Ok(Some(on)) => CommandAction::Trajectories { on },
@@ -299,6 +333,7 @@ pub fn commands() -> &'static [Command] {
         },
         Command {
             name: "checks",
+            while_busy: true,
             description: "The project's checks from .marv/checks/ and their last result (/checks on, /checks off)",
             run: |args, ctx| match on_off(args, "Usage: /checks, /checks on, or /checks off") {
                 Ok(Some(on)) => CommandAction::Checks { on },
@@ -308,6 +343,7 @@ pub fn commands() -> &'static [Command] {
         },
         Command {
             name: "processes",
+            while_busy: true,
             description: "Background processes the model started (/processes stop <name>)",
             run: |args, ctx| {
                 let words: Vec<&str> = args.split_whitespace().collect();
@@ -335,6 +371,7 @@ pub fn commands() -> &'static [Command] {
         },
         Command {
             name: "undo",
+            while_busy: false,
             description: "Put back the files the last turn changed (shows them first)",
             run: |args, _| {
                 if args.trim().is_empty() {
@@ -346,6 +383,7 @@ pub fn commands() -> &'static [Command] {
         },
         Command {
             name: "checkpoints",
+            while_busy: false,
             description: "Snapshots before each turn's changes, for /undo (/checkpoints on, /checkpoints off)",
             run: |args, ctx| match on_off(args, "Usage: /checkpoints, /checkpoints on, or /checkpoints off") {
                 Ok(Some(on)) => CommandAction::Checkpoints { on },
@@ -365,6 +403,7 @@ pub fn commands() -> &'static [Command] {
         },
         Command {
             name: "diagnostics",
+            while_busy: true,
             description: "Typecheck after the model's edits (/diagnostics on, /diagnostics off)",
             run: |args, ctx| match on_off(args, "Usage: /diagnostics, /diagnostics on, or /diagnostics off") {
                 Ok(Some(on)) => CommandAction::Diagnostics { on },
@@ -374,6 +413,7 @@ pub fn commands() -> &'static [Command] {
         },
         Command {
             name: "steps",
+            while_busy: true,
             description: "Show or set the step limit (/steps 40, /steps off never asks)",
             run: |args, ctx| {
                 let arg = args.trim();
@@ -394,10 +434,97 @@ pub fn commands() -> &'static [Command] {
                 print(steps_status(ctx.config))
             },
         },
-        Command { name: "clear", description: "Clear the conversation", run: |_, _| CommandAction::Clear },
-        Command { name: "exit", description: "Quit Marv", run: |_, _| CommandAction::Exit },
+        Command { name: "clear", while_busy: false, description: "Clear the conversation", run: |_, _| CommandAction::Clear },
+        Command { name: "exit", while_busy: false, description: "Quit Marv", run: |_, _| CommandAction::Exit },
     ];
     COMMANDS
+}
+
+/// How the ctrl+k palette changes a setting (#44).
+#[derive(Clone, Copy)]
+pub enum SettingEdit {
+    /// On or off: choosing it runs `/<command> on` or `/<command> off`, the flip of what it is now.
+    Toggle(fn(&Config) -> bool),
+    /// Choosing it runs `/<command>`, which opens its picker. The value as shown.
+    Pick(fn(&Config) -> String),
+    /// Choosing it puts `/<command> ` in the prompt to finish. The value as shown.
+    Type(fn(&Config) -> String),
+}
+
+/// A setting the palette shows with its value. Changing it is its command's job, so the saving and the notice stay in
+/// one place ([`CommandAction`]).
+pub struct Setting {
+    /// As the palette shows it: "Yolo", "Step limit".
+    pub name: &'static str,
+    /// The command that shows and sets it, without the slash.
+    pub command: &'static str,
+    pub edit: SettingEdit,
+}
+
+/// What choosing a setting does, as a command line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettingChoice {
+    Run(String),
+    Prefill(String),
+}
+
+fn on_off_text(on: bool) -> String {
+    (if on { "on" } else { "off" }).into()
+}
+
+/// The settings the palette lists, the toggles first. A new one needs only a line here (and its command).
+pub fn settings() -> &'static [Setting] {
+    use SettingEdit::{Pick, Toggle, Type};
+    static SETTINGS: &[Setting] = &[
+        Setting { name: "Yolo", command: "yolo", edit: Toggle(|c| c.yolo) },
+        Setting { name: "Sandbox", command: "sandbox", edit: Toggle(|c| c.sandbox) },
+        Setting { name: "Thinking", command: "think", edit: Toggle(|c| c.thinking) },
+        Setting { name: "Diagnostics", command: "diagnostics", edit: Toggle(|c| c.diagnostics) },
+        Setting { name: "Checks", command: "checks", edit: Toggle(|c| c.checks) },
+        Setting { name: "Checkpoints", command: "checkpoints", edit: Toggle(|c| c.checkpoints) },
+        Setting { name: "Trajectories", command: "trajectories", edit: Toggle(|c| c.trajectories) },
+        Setting { name: "Model", command: "model", edit: Pick(|c| c.model.clone()) },
+        Setting {
+            name: "Step limit",
+            command: "steps",
+            edit: Type(|c| if c.max_steps == 0 { "off".into() } else { c.max_steps.to_string() }),
+        },
+    ];
+    SETTINGS
+}
+
+impl Setting {
+    fn command_entry(&self) -> Option<&'static Command> {
+        commands().iter().find(|c| c.name == self.command)
+    }
+
+    /// Its value now: "on", "z-ai/glm-5.3-flash", "25".
+    pub fn value(&self, config: &Config) -> String {
+        match self.edit {
+            SettingEdit::Toggle(get) => on_off_text(get(config)),
+            SettingEdit::Pick(get) | SettingEdit::Type(get) => get(config),
+        }
+    }
+
+    /// Its command's description, so the two never drift.
+    pub fn description(&self) -> &'static str {
+        self.command_entry().map_or("", |c| c.description)
+    }
+
+    /// What choosing it does: a toggle runs its flip, a pick its command, a typed value prefills its command.
+    pub fn choice(&self, config: &Config) -> SettingChoice {
+        match self.edit {
+            SettingEdit::Toggle(get) => SettingChoice::Run(format!("/{} {}", self.command, on_off_text(!get(config)))),
+            SettingEdit::Pick(_) => SettingChoice::Run(format!("/{}", self.command)),
+            SettingEdit::Type(_) => SettingChoice::Prefill(format!("/{} ", self.command)),
+        }
+    }
+
+    /// Choosing it is fine while a reply streams: a toggle whose command is. A picker takes the keyboard, and a
+    /// prefilled command can't be sent until the reply ends.
+    pub fn while_busy(&self) -> bool {
+        matches!(self.edit, SettingEdit::Toggle(_)) && self.command_entry().is_some_and(|c| c.while_busy)
+    }
 }
 
 pub fn is_command(input: &str) -> bool {
@@ -428,6 +555,7 @@ pub fn help_text() -> String {
             "Shortcuts:",
             "  ↑/↓       input history",
             "  esc       stop a reply or tool",
+            "  ctrl+k    command palette: commands, skills, settings and keys",
             "  ctrl+o    show subagents' steps and whole diffs",
             "  ctrl+c    clear input · press twice to exit",
         ]
@@ -821,6 +949,79 @@ mod tests {
             processes: None,
         };
         f(&ctx)
+    }
+
+    #[test]
+    fn every_setting_is_set_by_a_command_and_a_toggle_runs_the_same_action_as_typing_it() {
+        for setting in settings() {
+            assert!(commands().iter().any(|c| c.name == setting.command), "{} has no command", setting.name);
+            assert!(!setting.description().is_empty());
+        }
+        let config = |yolo: bool| {
+            let mut c = resolve_config(None, &Env::new());
+            c.yolo = yolo;
+            c.max_steps = 25;
+            c
+        };
+        let yolo = settings().iter().find(|s| s.name == "Yolo").unwrap();
+        assert_eq!(yolo.value(&config(true)), "on");
+        assert_eq!(yolo.choice(&config(true)), SettingChoice::Run("/yolo off".into()));
+        assert_eq!(yolo.choice(&config(false)), SettingChoice::Run("/yolo on".into()));
+        assert!(yolo.while_busy());
+        // The choice is a command line: it goes the way the slash command goes.
+        for setting in settings().iter().filter(|s| matches!(s.edit, SettingEdit::Toggle(_))) {
+            for on in [true, false] {
+                let mut c = config(false);
+                match setting.command {
+                    "yolo" => c.yolo = on,
+                    "sandbox" => c.sandbox = on,
+                    "think" => c.thinking = on,
+                    "diagnostics" => c.diagnostics = on,
+                    "checks" => c.checks = on,
+                    "checkpoints" => c.checkpoints = on,
+                    "trajectories" => c.trajectories = on,
+                    other => panic!("a new toggle: {other}"),
+                }
+                assert_eq!(setting.value(&c), if on { "on" } else { "off" });
+                let SettingChoice::Run(line) = setting.choice(&c) else { panic!("a toggle runs") };
+                let action = with(|ctx| run_command(&line, &CommandContext { config: &c, ..ctx.clone() }));
+                let flipped = match action {
+                    CommandAction::Yolo { on }
+                    | CommandAction::Sandbox { on }
+                    | CommandAction::Thinking { on }
+                    | CommandAction::Diagnostics { on }
+                    | CommandAction::Checks { on }
+                    | CommandAction::Checkpoints { on }
+                    | CommandAction::Trajectories { on } => on,
+                    other => panic!("{line}: {other:?}"),
+                };
+                assert_eq!(flipped, !on, "{line}");
+            }
+        }
+        let model = settings().iter().find(|s| s.name == "Model").unwrap();
+        assert_eq!(model.choice(&config(false)), SettingChoice::Run("/model".into()));
+        assert!(!model.while_busy());
+        let steps = settings().iter().find(|s| s.name == "Step limit").unwrap();
+        assert_eq!(steps.value(&config(false)), "25");
+        assert_eq!(steps.value(&Config { max_steps: 0, ..config(false) }), "off");
+        assert_eq!(steps.choice(&config(false)), SettingChoice::Prefill("/steps ".into()));
+        assert!(!steps.while_busy());
+    }
+
+    #[test]
+    fn only_commands_that_show_something_or_set_from_the_next_turn_run_during_a_reply() {
+        let busy: Vec<&str> = commands().iter().filter(|c| c.while_busy).map(|c| c.name).collect();
+        for name in ["undo", "clear", "resume", "compact", "setup", "model", "mcp", "exit", "good", "trajectories"] {
+            assert!(!busy.contains(&name), "/{name} needs an idle session");
+        }
+        for name in ["help", "cost", "config", "yolo", "think", "steps"] {
+            assert!(busy.contains(&name), "/{name} can run during a reply");
+        }
+    }
+
+    #[test]
+    fn help_mentions_the_palette() {
+        assert!(help_text().contains("ctrl+k    command palette"));
     }
 
     #[test]
