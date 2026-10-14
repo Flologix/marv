@@ -255,6 +255,8 @@ fn compact_outcome(result: CompactResult) -> view::CompactOutcome {
 pub fn map_loop(event: &LoopEvent, totals: &dyn Fn() -> view::Totals) -> Option<UiEvent> {
     use LoopEvent as L;
     Some(match event {
+        // #96: the error right after it says what happened.
+        L::Discarded { .. } => return None,
         L::TextDelta(text) => UiEvent::TextDelta(text.clone()),
         L::ThinkingDelta(text) => UiEvent::ThinkingDelta(text.clone()),
         L::Usage(usage) => UiEvent::Usage { last: *usage, totals: totals() },

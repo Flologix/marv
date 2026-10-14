@@ -407,6 +407,10 @@ pub enum LoopEvent {
     /// A mid-run compaction swapped the history for the summary (`on_full`).
     Compacted,
     Done(StopReason),
+    /// The provider threw the reply away without retrying (#96: it degenerated again); an `Error` follows.
+    Discarded {
+        cause: marv_core::RetryCause,
+    },
     /// The connection was lost and the provider is retrying. `continued` (#64): the partial reply
     /// was kept and the model asked to continue, instead of starting over. `cause`: why (#88, #96).
     Retry {
@@ -567,15 +571,25 @@ impl StepReply {
                 // the retry doesn't duplicate them. A continued retry (#64) keeps the partial text:
                 // the next attempt appends to it.
                 if !continued {
-                    self.text.clear();
-                    self.checked_at = 0;
-                    self.reasoned = false;
-                    self.reasoning = None;
-                    self.calls.clear();
+                    self.discard();
                 }
                 Some(LoopEvent::Retry { attempt, max, message, continued, cause })
             }
+            // #96: the same, with no attempt after it (an error follows): nothing of it reaches the history.
+            ProviderEvent::Discard { cause } => {
+                self.discard();
+                Some(LoopEvent::Discarded { cause })
+            }
         }
+    }
+
+    /// Forgets this attempt's text, calls and reasoning.
+    fn discard(&mut self) {
+        self.text.clear();
+        self.checked_at = 0;
+        self.reasoned = false;
+        self.reasoning = None;
+        self.calls.clear();
     }
 
     pub fn cut_off(&self) -> bool {
@@ -1381,6 +1395,22 @@ mod tests {
             }
         }
         (reply, out)
+    }
+
+    #[test]
+    fn a_discard_resets_the_steps_text_and_calls_before_the_error() {
+        // #96: the second degenerate reply.
+        let (reply, events) = fold(vec![
+            ProviderEvent::ThinkingDelta("\n\n".into()),
+            ProviderEvent::TextDelta("Half".into()),
+            ProviderEvent::ToolCall(call("c1", "a")),
+            ProviderEvent::Discard { cause: marv_core::RetryCause::Degenerate { discarded: 6 } },
+            ProviderEvent::Error("degenerated again".into()),
+        ]);
+        assert_eq!(reply.text, "");
+        assert!(reply.calls.is_empty());
+        assert!(events.iter().any(|e| matches!(e, LoopEvent::Discarded { .. })));
+        assert_eq!(reply.outcome(false), StepOutcome::Error("degenerated again".into()));
     }
 
     #[test]

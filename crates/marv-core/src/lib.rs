@@ -122,6 +122,11 @@ pub enum ProviderEvent {
         continued: bool,
         cause: RetryCause,
     },
+    /// Throw away everything this reply has streamed so far (text, reasoning, calls), with no new attempt after it:
+    /// an `Error` follows. Marv #96: the second degenerate reply, which must not end up in the history.
+    Discard {
+        cause: RetryCause,
+    },
 }
 
 /// Why a provider retries a request.

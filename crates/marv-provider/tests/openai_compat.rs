@@ -450,12 +450,38 @@ async fn a_degenerate_reply_is_aborted_and_asked_again_once_with_a_note() {
 }
 
 #[tokio::test]
+async fn a_newline_flood_in_reasoning_details_alone_is_aborted_too() {
+    // #96: a model that reasons only in `reasoning_details` blocks, with no plain `reasoning` field.
+    let server = FakeServer::start(counting(|n| {
+        if n == 1 {
+            let block = json!({"choices": [{"delta": {"reasoning_details": [{"type": "reasoning.text", "text": "\n".repeat(512), "index": 0}]}}]});
+            let mut events: Vec<Value> = (0..128).map(|_| block.clone()).collect();
+            events.extend([stop(), done()]);
+            Reply::sse(&events)
+        } else {
+            Reply::sse(&[delta("ok"), stop(), done()])
+        }
+    }))
+    .await;
+    let events = collect(provider(&v1(&server), None).stream(&hi(), StreamOptions::default())).await;
+    assert!(matches!(causes(&events)[..], [RetryCause::Degenerate { discarded }] if discarded >= 16 * 1024), "{events:?}");
+    assert!(events.contains(&text("ok")));
+}
+
+#[tokio::test]
 async fn a_reply_that_degenerates_again_ends_the_turn_with_a_clear_error() {
     let server = FakeServer::start(|_| newline_flood()).await;
     let events = collect(provider(&v1(&server), None).stream(&hi(), StreamOptions::default())).await;
     assert_eq!(server.requests().len(), 2, "one retry only");
     assert_eq!(causes(&events).len(), 1);
     assert!(error_of(&events).starts_with("TestRouter: the model's reply degenerated again"), "{}", error_of(&events));
+    // The second attempt is thrown away too (nothing of it reaches the history), with its bytes, right before the error.
+    let n = events.len();
+    assert!(
+        matches!(&events[n - 2], ProviderEvent::Discard { cause: RetryCause::Degenerate { discarded } } if *discarded > 0),
+        "{:?}",
+        &events[n - 2..]
+    );
     assert!(!events.iter().any(|e| matches!(e, ProviderEvent::Done { .. })));
 }
 
@@ -509,6 +535,22 @@ async fn a_prompt_too_big_to_fit_beside_max_tokens_is_sent_without_it_this_time_
     let provider = capped(&v1(&server), Some(32_000));
     let events = collect(provider.stream(&hi(), StreamOptions::default())).await;
     assert!(events.contains(&text("ok")));
+    collect(provider.stream(&hi(), StreamOptions::default())).await;
+    let sent: Vec<_> = server.requests().iter().map(|r| r.json().get("max_tokens").cloned()).collect();
+    assert_eq!(sent, [Some(json!(32_000)), None, Some(json!(32_000))]);
+    // A refusal that names the field but doesn't say it's unsupported drops it for that request only.
+    let first = Arc::new(AtomicUsize::new(0));
+    let seen = first.clone();
+    let server = FakeServer::start(move |r| {
+        if r.json().get("max_tokens").is_some() && seen.fetch_add(1, Ordering::SeqCst) == 0 {
+            Reply::json(400, json!({"error": {"message": "max_tokens exceeds the remaining context"}}))
+        } else {
+            Reply::sse(&[delta("ok"), stop(), done()])
+        }
+    })
+    .await;
+    let provider = capped(&v1(&server), Some(32_000));
+    collect(provider.stream(&hi(), StreamOptions::default())).await;
     collect(provider.stream(&hi(), StreamOptions::default())).await;
     let sent: Vec<_> = server.requests().iter().map(|r| r.json().get("max_tokens").cloned()).collect();
     assert_eq!(sent, [Some(json!(32_000)), None, Some(json!(32_000))]);

@@ -105,7 +105,7 @@ pub async fn summarize(options: SummarizeOptions<'_>) -> Result<String, String> 
     while let Some(event) = events.next().await {
         match event {
             ProviderEvent::TextDelta(t) => text.push_str(&t),
-            ProviderEvent::Retry { .. } => {
+            ProviderEvent::Retry { .. } | ProviderEvent::Discard { .. } => {
                 // The provider is asking again from the start: drop what the failed attempt sent.
                 text.clear();
                 tool_call = false;

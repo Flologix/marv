@@ -80,12 +80,16 @@ impl DegenerateGuard {
                 self.streamed += t.len() as u64;
                 self.text.push(t)
             }
-            ProviderEvent::ThinkingDelta(t) => {
-                self.streamed += t.len() as u64;
-                self.reasoning.push(t)
-            }
+            ProviderEvent::ThinkingDelta(t) => self.check_reasoning(t),
             _ => false,
         }
+    }
+
+    /// Looks at reasoning that arrived some other way (OpenRouter's `reasoning_details` blocks, when the chunk has no
+    /// plain `reasoning`); true when it has degenerated.
+    pub fn check_reasoning(&mut self, text: &str) -> bool {
+        self.streamed += text.len() as u64;
+        self.reasoning.push(text)
     }
 
     /// How many bytes of text and reasoning this attempt streamed (all thrown away when it degenerates).

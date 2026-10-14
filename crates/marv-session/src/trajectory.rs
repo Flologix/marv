@@ -96,6 +96,11 @@ impl RetryRecord {
     /// Counts one `Retry` from the provider.
     pub fn add(&mut self, cause: RetryCause) {
         self.retries += 1;
+        self.discard(cause);
+    }
+
+    /// What a thrown-away attempt says, retried or not (#96: the second degenerate reply isn't).
+    pub fn discard(&mut self, cause: RetryCause) {
         match cause {
             RetryCause::Dropped => {}
             RetryCause::Stalled => self.stalled = true,
@@ -485,6 +490,20 @@ impl AgentRecorder {
         }
         let who = self.who.clone();
         let now = (self.now)();
+        // Everything but the stream's own events comes after the reply ended: its retries are closed then, usage or
+        // not, so they can't land on a later request's record (a provider that sends no usage).
+        let reply_ended = !matches!(
+            event,
+            LoopEvent::TextDelta(_)
+                | LoopEvent::ThinkingDelta(_)
+                | LoopEvent::ToolCallDelta { .. }
+                | LoopEvent::Usage(_)
+                | LoopEvent::Retry { .. }
+                | LoopEvent::Discarded { .. }
+        );
+        if reply_ended && !matches!(event, LoopEvent::Error(_)) {
+            self.retry = RetryRecord::default();
+        }
         match event {
             LoopEvent::ThinkingDelta(text) => self.thinking.push_str(text),
             LoopEvent::Usage(usage) => {
@@ -542,6 +561,10 @@ impl AgentRecorder {
             LoopEvent::Error(message) => {
                 let retry = std::mem::take(&mut self.retry);
                 (self.sink)(TrajectoryRecord::Error { who, message: message.clone(), retry })
+            }
+            LoopEvent::Discarded { cause } => {
+                self.retry.discard(*cause);
+                self.thinking.clear();
             }
             LoopEvent::Retry { continued, cause, .. } => {
                 self.retry.add(*cause);
@@ -662,6 +685,38 @@ mod tests {
         );
         // The discarded attempt's reasoning isn't recorded as the reply's.
         assert!(!records.iter().any(|r| r["type"] == "assistant"), "{records:?}");
+    }
+
+    #[test]
+    fn a_reply_without_usage_closes_its_retries_and_a_second_degenerate_reply_leaves_nothing() {
+        let (mut rec, out) = recorder();
+        let usage = || LoopEvent::Usage(Usage { prompt_tokens: 1, completion_tokens: 1, cached_tokens: None, cost: None });
+        // A retried reply from a provider that sends no usage, then a clean request.
+        rec.event(&LoopEvent::Retry { attempt: 1, max: 2, message: "m".into(), continued: true, cause: RetryCause::Stalled });
+        rec.event(&LoopEvent::Assistant { text: "ok".into() });
+        rec.event(&usage());
+        // #96: degenerate, retried, degenerate again: both attempts' bytes counted, none of their reasoning kept.
+        rec.event(&LoopEvent::ThinkingDelta("\n\n".into()));
+        rec.event(&LoopEvent::Retry {
+            attempt: 1,
+            max: 1,
+            message: "m".into(),
+            continued: false,
+            cause: RetryCause::Degenerate { discarded: 2 },
+        });
+        rec.event(&LoopEvent::ThinkingDelta("\n\n\n".into()));
+        rec.event(&LoopEvent::Discarded { cause: RetryCause::Degenerate { discarded: 3 } });
+        rec.event(&LoopEvent::Error("degenerated again".into()));
+        rec.finish("error");
+        let records: Vec<serde_json::Value> = out.lock().unwrap().iter().map(|r| serde_json::to_value(r).unwrap()).collect();
+        let request = records.iter().find(|r| r["type"] == "request").unwrap();
+        assert!(request.get("retries").is_none() && request.get("stalled").is_none(), "{request}");
+        let error = records.iter().find(|r| r["type"] == "error").unwrap();
+        assert_eq!((&error["retries"], &error["discardedBytes"]), (&serde_json::json!(1), &serde_json::json!(5)), "{error}");
+        assert!(
+            !records.iter().any(|r| r["thinking"].as_str().is_some_and(|t| t.contains('\n'))),
+            "the runaway reasoning isn't recorded: {records:?}"
+        );
     }
 
     #[tokio::test]

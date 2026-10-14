@@ -90,9 +90,14 @@ pub fn max_tokens_for(max_output: Option<u64>) -> u64 {
 static MAX_TOKENS_REFUSED: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"(?i)max_tokens|max_completion_tokens|max output tokens|in the output").unwrap());
 
-/// Names the field itself: the provider doesn't take it at all, so later requests leave it out too.
+/// Names the field and says it isn't supported at all: later requests leave it out too. Any other refusal ("max_tokens
+/// exceeds the remaining context") drops it for that request only.
 static NAMES_MAX_TOKENS: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"(?i)max_tokens|max_completion_tokens").unwrap());
+static UNSUPPORTED: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)unsupported|not supported|unknown (parameter|field|argument)|unrecognized|extra inputs are not permitted|not allowed")
+        .unwrap()
+});
 
 #[derive(Debug, Clone, Default)]
 pub struct OpenAiCompatOptions {
@@ -398,6 +403,9 @@ pub struct ReplyAssembler {
     /// An error the provider sent mid-stream that a fresh attempt may get past (`errors::transient`): retried like a
     /// drop, and reported in full if every attempt ends this way.
     pub upstream: Option<String>,
+    /// #96: readable reasoning that came only in `reasoning_details` blocks (no plain `reasoning` in the chunk), for
+    /// the degenerate guard. The blocks themselves are kept as they are.
+    pub detail_text: String,
 }
 
 impl ReplyAssembler {
@@ -410,6 +418,7 @@ impl ReplyAssembler {
             reasoning: Vec::new(),
             text_received: false,
             upstream: None,
+            detail_text: String::new(),
         }
     }
 
@@ -450,7 +459,18 @@ impl ReplyAssembler {
             self.complete = true;
         }
         let Some(delta) = choice.delta else { return Flow::Continue };
-        if let Some(thinking) = delta.reasoning.or(delta.reasoning_content).filter(|t| !t.is_empty()) {
+        let thinking = delta.reasoning.or(delta.reasoning_content).filter(|t| !t.is_empty());
+        if thinking.is_none() {
+            // #96: a model that reasons only in blocks would otherwise get past the degenerate guard.
+            for block in delta.reasoning_details.iter().flatten() {
+                for field in ["text", "summary"] {
+                    if let Some(t) = block.get(field).and_then(Value::as_str) {
+                        self.detail_text.push_str(t);
+                    }
+                }
+            }
+        }
+        if let Some(thinking) = thinking {
             out.push(ProviderEvent::ThinkingDelta(thinking));
         }
         // Port note (#57): OpenRouter may split one block over several chunks (same `index`);
@@ -599,7 +619,8 @@ pub(crate) fn with_continuation<R>(
 }
 
 /// #96: after a reply degenerated, retry once (`true`: the caller sends the next attempt at once) or end the stream.
-/// Either way what the attempt streamed is thrown away: the retry starts over, with [`DEGENERATE_NOTE`].
+/// Either way what the attempt streamed is thrown away: the retry starts over, with [`DEGENERATE_NOTE`]; the second
+/// time a `Discard` goes before the error.
 pub(crate) fn after_degenerate(
     label: &str,
     discarded: u64,
@@ -609,6 +630,9 @@ pub(crate) fn after_degenerate(
     emit: &Emit,
 ) -> bool {
     if *degenerate_retries >= 1 {
+        // Thrown away like the first one, so none of it ends up in the history or the trajectory.
+        kept.clear();
+        emit.send(ProviderEvent::Discard { cause: RetryCause::Degenerate { discarded } });
         emit.send(ProviderEvent::Error(format!(
             "{label}: the model's reply degenerated again (whitespace, or the same short piece over and over), so Marv \
              stopped it. Try again, or switch to another model."
@@ -721,7 +745,7 @@ async fn run(
         let Some(detail) = read_error(response, &cancel).await else { return };
         // #96: a provider that won't take max_tokens (or can't fit it beside this prompt) gets the request without it.
         if (400..500).contains(&status) && o.max_tokens.is_some() && MAX_TOKENS_REFUSED.is_match(&detail) {
-            if NAMES_MAX_TOKENS.is_match(&detail) {
+            if NAMES_MAX_TOKENS.is_match(&detail) && UNSUPPORTED.is_match(&detail) {
                 refused.store(true, Ordering::Relaxed);
             }
             o.max_tokens = None;
@@ -798,7 +822,8 @@ async fn read_reply(
             Some(Ok(data)) => assembler.on_data(&data, &mut out),
         };
         // #96: a reply that turned into whitespace or one repeated piece is aborted (dropping the response closes it).
-        if out.iter().any(|event| guard.check(event)) {
+        let details = std::mem::take(&mut assembler.detail_text);
+        if out.iter().any(|event| guard.check(event)) || (!details.is_empty() && guard.check_reasoning(&details)) {
             return Read::Degenerate { discarded: guard.streamed() };
         }
         emit.forward(&mut out, &mut text);
