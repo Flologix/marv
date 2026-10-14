@@ -1813,6 +1813,10 @@ impl SessionPort for Port {
         }
     }
 
+    fn is_login_callback(&self, text: &str) -> bool {
+        marv_mcp::oauth::is_callback(text)
+    }
+
     fn login_callback(&self, text: &str) -> bool {
         if !marv_mcp::oauth::is_callback(text) {
             return false;

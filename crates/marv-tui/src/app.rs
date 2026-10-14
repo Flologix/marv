@@ -1302,9 +1302,10 @@ impl App {
             }
             Some(PaletteOutcome::Prefill(text)) => {
                 self.palette = None;
-                // What was typed stays reachable with ↑.
+                // What was typed stays reachable with ↑, unless it's a login callback: it holds an authorization
+                // code and never goes in the history.
                 let typed = self.prompt.value.trim().to_string();
-                if !typed.is_empty() && typed != text.trim() {
+                if !typed.is_empty() && typed != text.trim() && !self.port.is_login_callback(&typed) {
                     self.prompt.remember(&typed);
                 }
                 self.prompt.history_index = None;
@@ -1773,6 +1774,9 @@ mod tests {
         }
         fn flush(&self) -> BoxFuture<'static, ()> {
             Box::pin(async {})
+        }
+        fn is_login_callback(&self, text: &str) -> bool {
+            text.starts_with("http://127.0.0.1:5555/callback?")
         }
         fn login_callback(&self, text: &str) -> bool {
             let taken = text.starts_with("http://127.0.0.1:5555/callback?");
@@ -2935,6 +2939,20 @@ mod tests {
         assert!(h.calls().is_empty());
         h.key(KeyCode::Up);
         assert_eq!(h.app.prompt.value, "draft message");
+    }
+
+    // #113 review: a drafted login callback holds an authorization code, so prefilling over it never keeps it.
+    #[test]
+    fn a_prefill_over_a_drafted_login_callback_keeps_it_out_of_the_history() {
+        let mut h = harness();
+        h.app.on_event(Event::Paste("http://127.0.0.1:5555/callback?code=code-secret&state=abc".into()), h.now);
+        h.ctrl('k');
+        type_only(&mut h, "step");
+        h.key(ENTER);
+        assert_eq!(h.app.prompt.value, "/steps ");
+        h.key(KeyCode::Up);
+        assert!(!h.app.prompt.value.contains("code-secret"), "{}", h.app.prompt.value);
+        assert!(!h.frame().contains("code-secret"));
     }
 
     #[test]

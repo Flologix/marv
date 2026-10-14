@@ -655,6 +655,12 @@ pub trait SessionPort: Send + Sync {
     fn login_callback(&self, _text: &str) -> bool {
         false
     }
+
+    /// Whether `text` is such a callback, without taking it: the palette (#113) keeps a draft in the prompt history
+    /// only when it isn't one.
+    fn is_login_callback(&self, _text: &str) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
