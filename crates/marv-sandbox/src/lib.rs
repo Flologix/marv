@@ -11,6 +11,7 @@
 //! - [`paths`]: every path is checked after `realpath`; nothing follows a symlink out of its root (skills included).
 //! - [`protected`]: paths that ask even in yolo and are read-only inside the sandbox.
 //! - [`home`]: the stand-in home: toolchain folders, credential masks, hidden PATH folders.
+//! - [`host_env`]: the environment of what runs outside the sandbox (host commands, gh), secrets stripped.
 //! - [`bwrap`]: the bubblewrap argument builder (and the mesh plug at `/run/marv/mesh.sock`).
 //! - [`git_guard`]: `.git` read-only or a placeholder for commands that run without asking; worktree records.
 //! - [`notes`]: the `Marv:` notes bash appends (stand-in home, missing network, gh, read-only .git).
@@ -19,6 +20,7 @@
 pub mod bwrap;
 pub mod git_guard;
 pub mod home;
+pub mod host_env;
 pub mod notes;
 pub mod paths;
 pub mod protected;
