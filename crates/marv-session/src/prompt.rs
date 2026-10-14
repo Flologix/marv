@@ -151,14 +151,16 @@ fn listed(items: &[Listed]) -> String {
     items.iter().map(|i| format!("- {}: {}", i.name, i.description)).collect::<Vec<_>>().join("\n")
 }
 
+/// When a skill is worth loading (#84). "When a request matches one of these, load it before you start" let a skill whose
+/// description claims every task ("use when starting any conversation", "you MUST use this before any creative work")
+/// win every time: on GLM, a one-line fix ran a whole test-driven loop, 2.3× slower, in 23 of 62 eval runs.
+pub const SKILLS_INTRO: &str = "Skills are detailed instructions for particular kinds of tasks. Load one with the skill tool when the task is clearly the kind it describes, before you start, then follow it. Judge by the task, not by how broadly a skill's description claims to apply: a small, direct request (a quick fix, a rename, a question about the code) doesn't need one, so just do it.";
+
 fn skills_section(skills: &[Listed]) -> String {
     if skills.is_empty() {
         return String::new();
     }
-    format!(
-        "\n\n# Skills\n\nSkills are detailed instructions for particular kinds of tasks. When a request matches one of these, load it with the skill tool before you start, then follow it:\n\n{}",
-        listed(skills)
-    )
+    format!("\n\n# Skills\n\n{SKILLS_INTRO}\n\n{}", listed(skills))
 }
 
 /// The instructions' headings (#62). Text that starts with one came from [`render_instructions`] and goes in as it is;
@@ -729,6 +731,17 @@ mod tests {
         assert!(notice.contains("AGENTS.md is longer than 20,000 characters"));
         assert!(notice.contains("3 sections"));
         assert!(notice.contains("## Conventions"));
+    }
+
+    #[test]
+    fn skills_are_for_tasks_that_clearly_need_them() {
+        // #84: "load it before you start" made a skill that claims every task run on a one-line fix.
+        assert!(!system_prompt(&input()).contains("# Skills"));
+        let tdd = Listed { name: "tdd".into(), description: "You MUST use this before writing any code.".into() };
+        let p = system_prompt(&PromptInput { skills: vec![tdd], ..input() });
+        assert!(p.contains(&format!("# Skills\n\n{SKILLS_INTRO}\n\n- tdd: You MUST use this before writing any code.")));
+        assert!(SKILLS_INTRO.contains("Judge by the task, not by how broadly a skill's description claims to apply"));
+        assert!(!SKILLS_INTRO.contains("When a request matches one of these"));
     }
 
     #[test]

@@ -18,7 +18,8 @@ use marv_mcp::deferred::{SearchInput, arguments_as_object, schema_hint, tool_sea
 use marv_mcp::manager::McpManager;
 use marv_mcp::tool::McpTool;
 use marv_sandbox::TaintState;
-use marv_tools::{Preview, Repaired, Scope, Tool, ToolContext, ToolError, ToolOutput, ToolRef};
+use marv_tools::schema_repair::check_required;
+use marv_tools::{Preview, RepairMode, Repaired, Scope, Tool, ToolContext, ToolError, ToolOutput, ToolRef};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
@@ -58,6 +59,15 @@ impl Tool for McpToolAdapter {
     }
     fn label(&self, input: &Self::Input) -> String {
         self.tool.label(input)
+    }
+    /// #65: type coercions only against the server's schema (a server may take keys it doesn't list).
+    fn repair_mode(&self) -> RepairMode {
+        RepairMode::Mcp
+    }
+    /// #65 (bench #73: `add_comment` without its `body` posted an empty comment): a missing required field or a
+    /// string under its `minLength` is refused here, naming the field, instead of trusting the server to check.
+    fn check(&self, input: &Self::Input) -> Result<(), String> {
+        check_required(&self.tool.spec.parameters, &Value::Object(input.clone()))
     }
     fn uses_network(&self, _input: &Self::Input) -> bool {
         self.tool.uses_network()
@@ -173,14 +183,7 @@ impl Tool for McpCallTool {
         let Some(tool) = tools.iter().find(|t| t.name == input.tool) else {
             return Err(ToolError::new(unknown_tool_error(&specs, &input.tool)));
         };
-        let adapter: ToolRef = Arc::new(McpToolAdapter { tool: tool.clone(), taint: self.taint.clone() });
-        let arguments = if input.arguments.is_null() { Value::Object(Map::new()) } else { input.arguments.clone() };
-        let call = ToolCall {
-            id: ctx.call_id.clone().unwrap_or_else(|| "mcp_call".into()),
-            name: tool.name.clone(),
-            arguments: arguments.to_string(),
-        };
-        let mut result = marv_tools::run_tool(&call, ctx, &[adapter]).await.result;
+        let mut result = run_through_mcp_call(tool, &self.taint, &input.arguments, ctx).await;
         // A guess at the arguments that the server rejected: show the schema once, so a guess costs one step, not two.
         if result.is_error
             && !result.declined
@@ -191,6 +194,20 @@ impl Tool for McpCallTool {
         }
         Ok(result)
     }
+}
+
+/// What `mcp_call` runs: the real tool through `run_tool`, so its repair (#65: coerced to the server's schema, with
+/// the note), check, approval, scope and label apply as for a direct call. The `ToolCall` built here is never stored:
+/// the history keeps the model's `mcp_call` as it came.
+async fn run_through_mcp_call(tool: &McpTool, taint: &Arc<TaintState>, arguments: &Value, ctx: &ToolContext) -> ToolOutput {
+    let adapter: ToolRef = Arc::new(McpToolAdapter { tool: tool.clone(), taint: taint.clone() });
+    let arguments = if arguments.is_null() { Value::Object(Map::new()) } else { arguments.clone() };
+    let call = ToolCall {
+        id: ctx.call_id.clone().unwrap_or_else(|| "mcp_call".into()),
+        name: tool.name.clone(),
+        arguments: arguments.to_string(),
+    };
+    marv_tools::run_tool(&call, ctx, &[adapter]).await.result
 }
 
 /// Ports the `deferredTools` cases of `tests/mcp-deferred.test.ts` that need no connected server (`McpManager::start`
@@ -272,5 +289,107 @@ mod tests {
         // Reaches the lookup (no such tool here) without an approval under the wrapper's own name.
         assert_eq!(out.result.output, "No MCP tool is named \"mcp__gh__nope\".");
         assert!(approver.0.lock().unwrap().is_empty());
+    }
+
+    /// A tracker's tools (bench #73), whose server records what it was called with.
+    struct Tracker(std::sync::Mutex<Vec<Map<String, Value>>>);
+    #[async_trait]
+    impl marv_mcp::tool::McpCaller for Tracker {
+        async fn call(
+            &self,
+            _tool: &str,
+            args: Map<String, Value>,
+            _cancel: tokio_util::sync::CancellationToken,
+        ) -> marv_mcp::Result<marv_mcp::tool::McpCallResult> {
+            self.0.lock().unwrap().push(args);
+            Ok(serde_json::from_value(json!({"content": [{"type": "text", "text": "ok"}]})).unwrap())
+        }
+    }
+
+    fn tracker_tool(name: &str, schema: Value, server: Arc<Tracker>) -> McpTool {
+        let config = marv_mcp::config::parse_server(
+            "tracker",
+            &json!({"command": "x"}),
+            marv_mcp::config::ServerSource::Personal,
+            &|_| None,
+            "f",
+        )
+        .unwrap();
+        let info = serde_json::from_value(json!({"name": name, "inputSchema": schema})).unwrap();
+        marv_mcp::tool::make_mcp_tool(&config, info, server)
+    }
+
+    fn approving() -> ToolContext {
+        struct Yes;
+        #[async_trait]
+        impl marv_tools::Approver for Yes {
+            async fn approve(&self, _request: marv_tools::ApprovalRequest) -> marv_tools::Decision {
+                marv_tools::Decision::Yes
+            }
+        }
+        ToolContext { approver: Some(Arc::new(Yes)), ..ToolContext::new("/nonexistent/p") }
+    }
+
+    /// #65 on both MCP paths (a direct call to the tool, and `mcp_call`): a string where the schema says integer is
+    /// coerced with a note (the bench's `{"number": "12"}` reached the server unchanged: "No issue #undefined").
+    #[tokio::test]
+    async fn mcp_arguments_are_coerced_to_the_schema_on_both_paths() {
+        let server = Arc::new(Tracker(std::sync::Mutex::new(vec![])));
+        let schema = json!({"type": "object", "properties": {"number": {"type": "integer"}}, "required": ["number"]});
+        let tool = tracker_tool("get_issue", schema, server.clone());
+        let taint = Arc::new(TaintState::new());
+        let ctx = approving();
+        let direct: ToolRef = Arc::new(McpToolAdapter { tool: tool.clone(), taint: taint.clone() });
+        let call = ToolCall { id: "c1".into(), name: tool.name.clone(), arguments: r#"{"number": "12", "x": null}"#.into() };
+        let out = marv_tools::run_tool(&call, &ctx, &[direct]).await.result;
+        assert!(!out.is_error, "{}", out.output);
+        assert!(out.output.contains("\"number\" was the string \"12\": read as the integer 12"));
+        assert_eq!(call.arguments, r#"{"number": "12", "x": null}"#); // the stored call is as the model sent it
+        let via = run_through_mcp_call(&tool, &taint, &json!({"number": "12"}), &ctx).await;
+        assert!(!via.is_error && via.output.contains("read as the integer 12"), "{}", via.output);
+        // Unknown keys and nulls pass through: this schema doesn't close the object.
+        let seen = server.0.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![
+                json!({"number": 12, "x": null}).as_object().unwrap().clone(),
+                json!({"number": 12}).as_object().unwrap().clone()
+            ]
+        );
+        // Valid: no note.
+        let ok = run_through_mcp_call(&tool, &taint, &json!({"number": 3}), &ctx).await;
+        assert!(!ok.output.contains("Marv:"), "{}", ok.output);
+        // Ambiguous: sent as it came (the server decides).
+        run_through_mcp_call(&tool, &taint, &json!({"number": "12abc"}), &ctx).await;
+        assert_eq!(server.0.lock().unwrap().last().unwrap()["number"], "12abc");
+    }
+
+    /// Bench #73: `add_comment` without its `body` posted an empty comment. Refused before the server is called.
+    #[tokio::test]
+    async fn a_missing_required_field_or_a_short_string_never_reaches_the_server() {
+        let server = Arc::new(Tracker(std::sync::Mutex::new(vec![])));
+        let schema = json!({
+            "type": "object",
+            "properties": {"number": {"type": "integer"}, "body": {"type": "string", "minLength": 1}},
+            "required": ["number", "body"],
+            "additionalProperties": false
+        });
+        let tool = tracker_tool("add_comment", schema, server.clone());
+        let taint = Arc::new(TaintState::new());
+        let ctx = approving();
+        let out = run_through_mcp_call(&tool, &taint, &json!({"number": 12}), &ctx).await;
+        assert!(out.is_error);
+        assert_eq!(
+            out.output,
+            "Invalid input for mcp__tracker__add_comment:\nmissing required field \"body\". The MCP server was not called."
+        );
+        let out = run_through_mcp_call(&tool, &taint, &json!({"number": 12, "body": ""}), &ctx).await;
+        assert!(out.output.contains("field \"body\" must be at least 1 character long"), "{}", out.output);
+        assert!(server.0.lock().unwrap().is_empty());
+        // additionalProperties: false: an unknown key is dropped (with a note) and the call goes through.
+        let out = run_through_mcp_call(&tool, &taint, &json!({"number": "12", "body": "hi", "head_limit": 3}), &ctx).await;
+        assert!(!out.is_error, "{}", out.output);
+        assert!(out.output.contains("unknown field \"head_limit\" was dropped"));
+        assert_eq!(server.0.lock().unwrap().as_slice(), [json!({"number": 12, "body": "hi"}).as_object().unwrap().clone()]);
     }
 }

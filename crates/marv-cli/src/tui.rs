@@ -2092,7 +2092,7 @@ mod tests {
         }
     }
 
-    /// A temp project with notes.txt and a config folder; removed on drop.
+    /// A temp project with notes.txt and a config folder; removed when the test ends.
     struct Dirs {
         base: PathBuf,
         project: PathBuf,
@@ -2115,7 +2115,23 @@ mod tests {
     impl Drop for Dirs {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.base);
+            // And again when the test's thread ends: the session's background work (the checkpoint store's prune and
+            // its `git gc`) can still be running when the test's body ends, and recreated the folder after it was
+            // removed (#89). The thread ends after its runtime has shut down and killed that work.
+            AT_TEST_END.with(|later| later.borrow_mut().push(RemoveOnDrop(self.base.clone())));
         }
+    }
+
+    struct RemoveOnDrop(PathBuf);
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    thread_local! {
+        // Dropped when the test's thread ends (libtest gives each test its own thread), passed or panicked.
+        static AT_TEST_END: std::cell::RefCell<Vec<RemoveOnDrop>> = const { std::cell::RefCell::new(Vec::new()) };
     }
 
     /// Ollama with yolo off: every change asks.

@@ -38,20 +38,23 @@ mod text;
 
 #[cfg(test)]
 pub(crate) mod testutil {
+    use std::cell::RefCell;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// A fresh, empty folder under the system temp dir (left for the OS to clean).
+    thread_local! {
+        // The folders this test made, removed when its thread ends. libtest runs each test on its own thread, so that
+        // is the end of the test, passed or panicked. Callers get a plain PathBuf (many hand it on by value into a
+        // store or a manager), so the guard can't live with them. #89: these used to be "left for the OS to clean",
+        // and nothing ever did; test runs filled the /tmp quota.
+        static KEPT: RefCell<Vec<tempfile::TempDir>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// A fresh, empty folder under the system temp dir, removed when the test ends.
     pub fn temp_dir(tag: &str) -> PathBuf {
-        static N: AtomicUsize = AtomicUsize::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "marv-mcp-{tag}-{}-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::SeqCst),
-            marv_fs::random_hex()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        let dir = tempfile::Builder::new().prefix(&format!("marv-mcp-{tag}-")).tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        KEPT.with(|kept| kept.borrow_mut().push(dir));
+        path
     }
 }
 

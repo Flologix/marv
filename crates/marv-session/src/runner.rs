@@ -126,7 +126,9 @@ impl ToolRunner for SessionToolRunner {
         let tool = self.tools.iter().find(|t| t.name() == call.name);
         let asks = tool.is_some_and(|t| {
             let raw = serde_json::from_str(if call.arguments.is_empty() { "{}" } else { &call.arguments });
-            raw.ok().and_then(|raw| t.parse(raw).ok()).is_some_and(|input| t.needs_approval(input.as_ref()) == Some(true))
+            // Judged on the arguments `run_tool` will parse: repaired against the schema (#65).
+            let raw = raw.ok().map(|raw| marv_tools::schema_repaired(t.as_ref(), raw).0);
+            raw.and_then(|raw| t.parse(raw).ok()).is_some_and(|input| t.needs_approval(input.as_ref()) == Some(true))
         });
         (self.kind(call) == ToolKind::Read && !asks) || marv_tools::is_parallel_call(call, &self.tools)
     }
