@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Real-model evals (#73): Marv's eval tasks run through `marv -p`, and through `claude -p` for comparison.
+"""Real-model evals (#73): Marv's eval tasks run through `marv -p`, and through `claude -p` or `opencode run` for comparison.
 
   python3 -I evals/bench.py --verify                     every check fails on the task's repo and passes with its solution
-  python3 -I evals/bench.py --harness marv,claude --repeat 5 [--tasks a,b] [--label haiku] [--budget 1.00]
+  python3 -I evals/bench.py --harness marv,claude,opencode --repeat 5 [--tasks a,b] [--label haiku] [--budget 1.00]
         [--marv-model anthropic/claude-haiku-5.5] [--claude-model claude-haiku-5-5] [--marv-bin target/release/marv]
         [--concurrency 6] [--timeout 300]
   python3 -I evals/bench.py --report evals/results/<run>  [<run> …]
@@ -36,6 +36,9 @@ CLAUDE_TOOLS = "Read,Edit,Write,Glob,Grep,Bash,TodoWrite,mcp__tracker"
 # Tasks that don't measure the same thing for Claude Code. dev-server-claim checks that the reply doesn't tell the
 # user a server is up: true of Marv, whose sandbox the server can't leave, false of Claude Code's unsandboxed one.
 CLAUDE_SKIP = {"dev-server-claim"}
+# opencode has no sandbox either.
+SKIP = {"claude": CLAUDE_SKIP, "opencode": CLAUDE_SKIP}
+RUNNERS = {"claude": "run_claude", "marv": "run_marv", "opencode": "run_opencode"}
 
 
 def git(cwd, *args):
@@ -143,6 +146,75 @@ def run_marv(ws, prompt, servers, logdir, a):
     return r
 
 
+def opencode_bin():
+    """The opencode binary itself. mise's wrapper script (`mise x opencode`) reads mise's config from XDG_CONFIG_HOME,
+    which each run points at a throwaway folder, so through it every run reinstalls opencode first (~50 s, and the
+    parallel installs race)."""
+    try:
+        p = subprocess.run(["mise", "which", "opencode"], capture_output=True, text=True)
+        if p.returncode == 0 and p.stdout.strip(): return p.stdout.strip()
+    except FileNotFoundError:
+        pass
+    return "opencode"
+
+
+def opencode_bin():
+    """The opencode binary itself. mise's wrapper script (`mise x opencode`) reads mise's config from XDG_CONFIG_HOME,
+    which each run points at a throwaway folder, so through it every run reinstalls opencode first (~50 s, and the
+    parallel installs race)."""
+    try:
+        p = subprocess.run(["mise", "which", "opencode"], capture_output=True, text=True)
+        if p.returncode == 0 and p.stdout.strip(): return p.stdout.strip()
+    except FileNotFoundError:
+        pass
+    return "opencode"
+
+
+def run_opencode(ws, prompt, servers, logdir, a):
+    """opencode on the same OpenRouter model as Marv. Its config and data folders are throwaway (your own config,
+    plugins, MCP servers and sessions stay out), `--pure` skips external plugins and `--auto` approves everything: it has
+    no sandbox. The cost is opencode's own estimate from its price list."""
+    tmp = Path(tempfile.mkdtemp(prefix="marv-bench-opencode-"))
+    env = {k: v for k, v in os.environ.items() if not k.startswith("OPENCODE")}
+    env.update(OPENROUTER_API_KEY=a.key, XDG_CONFIG_HOME=str(tmp / "config"), XDG_DATA_HOME=str(tmp / "data"),
+               XDG_STATE_HOME=str(tmp / "state"), XDG_CACHE_HOME=str(tmp / "cache"))
+    config = {"$schema": "https://opencode.ai/config.json", "autoupdate": False, "share": "disabled"}
+    if servers:
+        config["mcp"] = {n: {"type": "local", "command": [s["command"], *s["args"]], "enabled": True} for n, s in servers.items()}
+    env["OPENCODE_CONFIG_CONTENT"] = json.dumps(config)
+    cmd = [a.opencode_bin, "run", "--pure", "--auto", "--format", "json", "-m", f"openrouter/{a.marv_model}", "--dir", str(ws), prompt]
+    try:
+        p = subprocess.run(cmd, cwd=ws, capture_output=True, text=True, timeout=a.timeout, env=env)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    (logdir / "stream.jsonl").write_text(p.stdout)
+    (logdir / "stderr.txt").write_text(p.stderr)
+    r = dict(tools=Counter(), toolErrors=0, reply="", exit=p.returncode, requests=0, promptTokens=0, cachedTokens=0,
+             completionTokens=0, cost=0.0, reason="end" if p.returncode == 0 else "error")
+    texts, first = [], None
+    for e in parse_lines(p.stdout):
+        part, kind = e.get("part") or {}, e.get("type")
+        if first is None and e.get("timestamp"): first = e["timestamp"]
+        if kind == "tool_use":
+            r["tools"][part.get("tool")] += 1
+            if (part.get("state") or {}).get("status") == "error": r["toolErrors"] += 1
+        elif kind == "text":
+            texts.append(part.get("text") or "")
+        elif kind == "step_finish":
+            t = part.get("tokens") or {}
+            cache = t.get("cache") or {}
+            r["requests"] += 1
+            r["promptTokens"] += (t.get("input") or 0) + (cache.get("read") or 0) + (cache.get("write") or 0)
+            r["cachedTokens"] += cache.get("read") or 0
+            r["completionTokens"] += (t.get("output") or 0) + (t.get("reasoning") or 0)
+            r["cost"] += part.get("cost") or 0
+            if first and e.get("timestamp"): r["agentMs"] = e["timestamp"] - first
+        elif kind == "error":
+            r["reason"] = "error"
+    r["reply"] = texts[-1] if texts else ""
+    return r
+
+
 def write_fresh(path, text):
     """Writes `text` to `path`, replacing whatever is there: a symlink the model planted under that name is removed,
     never written through (it could point at a file of yours), and the write refuses anything that appears meanwhile."""
@@ -205,7 +277,7 @@ class Run:
                    task=task, rep=rep, label=self.a.label, pass_=False, tools=Counter())
         started = time.time()
         try:
-            res.update((run_claude if harness == "claude" else run_marv)(ws, prompt, servers, logdir, self.a))
+            res.update(globals()[RUNNERS[harness]](ws, prompt, servers, logdir, self.a))
         except subprocess.TimeoutExpired:
             res["reason"] = "timeout"
         res["ms"] = int((time.time() - started) * 1000)
@@ -233,7 +305,7 @@ class Run:
             self.spent += res.get("cost") or 0
             self.done += 1
             with open(self.out / "results.jsonl", "a") as f: f.write(json.dumps(res) + "\n")
-            print(f"[{self.done}/{total}] ${self.spent:.3f}  {'PASS' if res['pass_'] else 'fail'}  {harness:6} {task}#{rep}  "
+            print(f"[{self.done}/{total}] ${self.spent:.3f}  {'PASS' if res['pass_'] else 'fail'}  {harness:8} {task}#{rep}  "
                   f"{res['ms'] / 1000:.0f}s · {res.get('requests', 0)} requests · {sum(res['tools'].values())} tools · {res.get('reason')}",
                   flush=True)
 
@@ -283,6 +355,7 @@ def main():
     ap.add_argument("--marv-model", default="anthropic/claude-haiku-5.5")
     ap.add_argument("--claude-model", default="claude-haiku-5-5")
     ap.add_argument("--marv-bin", default=str(ROOT / "target/release/marv") if (ROOT / "target/release/marv").exists() else "marv")
+    ap.add_argument("--opencode-bin", default=opencode_bin())
     ap.add_argument("--tracker", default=str(ROOT / "target/debug/marv-oracle"))
     a = ap.parse_args()
     if a.report: return report(a.report)
@@ -311,12 +384,14 @@ def main():
         sys.exit(0 if ok else 1)
 
     harnesses = a.harness.split(",")
-    if "marv" in harnesses:
+    for h in harnesses:
+        if h not in RUNNERS: sys.exit(f'No harness "{h}" (have: {", ".join(RUNNERS)})')
+    if "marv" in harnesses or "opencode" in harnesses:
         a.key = os.environ.get("OPENROUTER_API_KEY") or json.loads((Path.home() / ".marv/config.json").read_text()).get("apiKey")
         if not a.key: sys.exit("No OpenRouter key: set OPENROUTER_API_KEY or run marv's /setup.")
     if any((TASKS / t / "mcp.json").exists() for t in tasks) and not Path(a.tracker).exists():
         sys.exit(f"No tracker at {a.tracker}: run `cargo build -p marv-oracle` (or pass --tracker).")
-    jobs = [(h, t, rep) for rep in range(a.repeat) for t in tasks for h in harnesses if not (h == "claude" and t in CLAUDE_SKIP)]
+    jobs = [(h, t, rep) for rep in range(a.repeat) for t in tasks for h in harnesses if t not in SKIP.get(h, ())]
     out = EVALS / "results" / f"{time.strftime('%Y-%m-%dT%H-%M-%S')}-{a.label}"
     out.mkdir(parents=True)
     print(f"{len(jobs)} runs ({', '.join(harnesses)} × {len(tasks)} tasks × {a.repeat}), budget ${a.budget} → {out}", flush=True)
