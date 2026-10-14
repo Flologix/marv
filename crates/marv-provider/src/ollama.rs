@@ -44,10 +44,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+use crate::degenerate::DegenerateGuard;
 use crate::errors::{ErrorHints, http_error, unreachable};
 use crate::openai_compat::{
-    Emit, Incomplete, Read, backoff, channel_stream, ended_early, is_network_failure, keep_or_restart, read_error, root_cause,
-    status_wait, until_cancelled, with_continuation,
+    DropCause, Emit, Incomplete, Read, after_degenerate, backoff, channel_stream, is_network_failure, keep_or_restart,
+    read_error, root_cause, status_wait, until_cancelled, with_continuation,
 };
 use crate::retry::{MAX_ATTEMPTS, RetryTiming, retriable_http_status, sleep_abortable};
 use crate::{EventStream, Provider, StreamOptions};
@@ -448,7 +449,7 @@ impl Provider for OllamaProvider {
 
     fn stream(&self, history: &[ChatTurn], options: StreamOptions) -> EventStream {
         // Copied now, so the caller can append to its history while the reply streams.
-        let outgoing = Outgoing { history: history.to_vec(), system: options.system, tools: options.tools };
+        let outgoing = Outgoing { history: history.to_vec(), system: options.system, tools: options.tools, note: None };
         let (client, shared, adapter, cancel) = (self.client.clone(), self.shared.clone(), self.options.clone(), options.cancel);
         channel_stream(move |emit| run(client, shared, adapter, outgoing, cancel, emit))
     }
@@ -459,14 +460,16 @@ struct Outgoing {
     history: Vec<ChatTurn>,
     system: Option<String>,
     tools: Vec<ToolSpec>,
+    /// #96: sent after the history once a reply degenerated.
+    note: Option<&'static str>,
 }
 
 impl Outgoing {
     /// The body of the next attempt and its prompt's size in characters (what [`reply_cap`] and
     /// [`Measured::record`] measure). #64: with the kept partial reply and the note, if any.
     fn body(&mut self, o: &OllamaOptions, measured: Measured, kept: &str) -> (Vec<u8>, usize) {
-        let Self { history, system, tools } = self;
-        with_continuation(history, kept, |history| {
+        let Self { history, system, tools, note } = self;
+        with_continuation(history, *note, kept, |history| {
             let prompt = Prompt::new(history, system.as_deref(), tools);
             // UTF-16 units, as Marv's `JSON.stringify(prompt).length` counts them.
             let chars = serde_json::to_string(&prompt).expect("a prompt is plain JSON").encode_utf16().count();
@@ -505,15 +508,16 @@ async fn run(
     ask_trained(&client, &shared, &base_url, &o.model, &cancel).await;
     let url = format!("{base_url}/api/chat");
     let mut kept = String::new();
-    // Counts only network/HTTP retries, not the tool-call parse retry.
+    // Counts only network/HTTP retries, not the tool-call parse retry (nor #96's degenerate one).
     let mut conn_retries = 0;
+    let mut degenerate_retries = 0;
     let mut announce = false;
     for attempt in 1.. {
         if cancel.is_cancelled() {
             return;
         }
         if announce {
-            emit.retry(LABEL, conn_retries, !kept.is_empty());
+            emit.retry(LABEL, conn_retries, !kept.is_empty(), Default::default());
             announce = false;
         }
 
@@ -541,7 +545,13 @@ async fn run(
             // Stream the NDJSON body. If the connection drops mid-stream, retry (#64: or continue).
             match read_reply(response, &shared, chars, &cancel, &emit).await {
                 Read::Finished => return,
-                Read::Dropped { text, tool_call_in_progress } => {
+                Read::Degenerate { discarded } => {
+                    if !after_degenerate(LABEL, discarded, &mut degenerate_retries, &mut kept, &mut outgoing.note, &emit) {
+                        return;
+                    }
+                    continue;
+                }
+                Read::Dropped { text, tool_call_in_progress, cause } => {
                     keep_or_restart(&mut kept, &text, tool_call_in_progress);
                     if conn_retries < MAX_ATTEMPTS - 1 {
                         conn_retries += 1;
@@ -551,7 +561,7 @@ async fn run(
                         }
                         continue;
                     }
-                    emit.send(ProviderEvent::Error(ended_early(LABEL)));
+                    emit.send(ProviderEvent::Error(cause.final_message(LABEL)));
                     return;
                 }
             }
@@ -579,6 +589,7 @@ async fn run(
 /// Parses the NDJSON body, sending events as they come.
 async fn read_reply(response: reqwest::Response, shared: &Shared, chars: usize, cancel: &CancellationToken, emit: &Emit) -> Read {
     let mut assembler = LineAssembler::default();
+    let mut guard = DegenerateGuard::default();
     let mut decoder = NdjsonDecoder::default();
     let mut text = String::new();
     let mut out = Vec::new();
@@ -589,16 +600,32 @@ async fn read_reply(response: reqwest::Response, shared: &Shared, chars: usize, 
             Some(Ok(chunk)) => (decoder.push(&chunk), false),
             None => (std::mem::take(&mut decoder).finish().into_iter().collect(), true),
             // A connection drop mid-stream is retriable.
-            Some(Err(_)) => return Read::Dropped { text, tool_call_in_progress: assembler.tool_call_in_progress() },
+            Some(Err(_)) => {
+                return Read::Dropped {
+                    text,
+                    tool_call_in_progress: assembler.tool_call_in_progress(),
+                    cause: DropCause::Dropped,
+                };
+            }
         };
         for line in lines {
             let handled = assembler.on_line(&line, &mut out);
+            // #96: a reply that turned into whitespace or one repeated piece is aborted.
+            if out.iter().any(|event| guard.check(event)) {
+                return Read::Degenerate { discarded: guard.streamed() };
+            }
             emit.forward(&mut out, &mut text);
             match handled {
                 Ok(true) => {}
                 Ok(false) => return Read::Finished,
                 // Invalid JSON: like a drop (Marv's JSON.parse throws into the same catch).
-                Err(_) => return Read::Dropped { text, tool_call_in_progress: assembler.tool_call_in_progress() },
+                Err(_) => {
+                    return Read::Dropped {
+                        text,
+                        tool_call_in_progress: assembler.tool_call_in_progress(),
+                        cause: DropCause::Dropped,
+                    };
+                }
             }
         }
         if ended {
@@ -614,7 +641,7 @@ async fn read_reply(response: reqwest::Response, shared: &Shared, chars: usize, 
             Read::Finished
         }
         // Without its done line the reply is partial (a proxy closed the stream): retry.
-        Err(Incomplete) => Read::Dropped { text, tool_call_in_progress },
+        Err(Incomplete) => Read::Dropped { text, tool_call_in_progress, cause: DropCause::Dropped },
     }
 }
 
