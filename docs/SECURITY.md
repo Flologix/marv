@@ -45,6 +45,7 @@ Narrow, named ways out, each asked for and each with its own rule for what it ca
   - web requests to a new URL prefix;
   - mesh calls on unapproved wires;
   - writes to protected paths.
+- **A mesh message that wakes an idle Marv (#78, opt-in `mesh.wake`) is read the same way:** only on a wire the user granted, fenced as another agent's data, tainting the session before the woken turn's first request, never as a user message. So that turn's egress asks like any tainted turn's, in yolo too. Never while an approval waits, at most 3 wake-ups a minute per wire, and never in `marv -p`.
 - **Taint lasts as long as the text does.** It's saved with the session and restored on resume (`marv -c`, `/resume`); an older session file is judged by its tool calls, erring on the tainted side. A subagent's taint taints its parent: its report can carry the outside text back.
 - **Marv's runtime folder is empty in every sandbox.** `$XDG_RUNTIME_DIR/marv` (the mesh's plug and discovery sockets, the process door's relays) is an empty tmpfs in every command's sandbox, mounted after the project and toolchains, wherever it is: a sandboxed command that could see a plug's socket could connect to it and use that plug's wires. And the mesh refuses a runtime dir outside `/run`, `/tmp` and the home folder.
 - **Approvals show the full payload.** A network approval lists the scripts written this session that the command will run.
