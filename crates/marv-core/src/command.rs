@@ -8,8 +8,9 @@
 //!   after a backslash);
 //! - setup before the work is kept (`cd a && make` and `cd b && make` are different work), and so is the first
 //!   part that isn't setup (`cd`, `pushd`, `set`, `export`, a bare `VAR=value`);
-//! - after it, the key ends at `&&` (what follows never runs when the work fails), `;`, `&` or a newline (what
-//!   follows runs anyway and doesn't change whether the work failed);
+//! - after it, a list joined by `&&`, `;`, `&` or a newline that only reads ([`is_read_only_command`]: `&& du -sh`,
+//!   `; ls`, `& wait`) is dropped; any other list is kept (`make && ./app --a` and `make && ./app --b` are different
+//!   work once `make` passes);
 //! - `|| true` and `|| :` are dropped (they only hide the failure); any other `|| …` is kept;
 //! - pipe stages that only show part of the output are dropped (`| tail -2`, `| head`, `| wc -l`, `| cat`, `| less`);
 //!   any other stage is kept (`| grep missing` is different work from `| tail`);
@@ -46,24 +47,36 @@ impl Sep {
 
 /// The key of `command` (see the module notes).
 pub fn command_key(command: &str) -> String {
+    let all = parts(command);
     let mut out = String::new();
     let mut working = false;
-    for (sep, part) in parts(command) {
-        if working {
-            match sep {
-                Sep::And | Sep::Semi | Sep::Amp | Sep::Start => break,
-                Sep::Pipe if is_display_stage(&part) => continue,
-                Sep::Or if matches!(part.as_str(), "true" | ":") => continue,
-                Sep::Pipe | Sep::Or => {}
+    let mut start = 0;
+    while start < all.len() {
+        // One list: the parts up to the next `&&`, `;` or `&`, joined by `|` and `||`.
+        let end = (start + 1..all.len()).find(|&i| matches!(all[i].0, Sep::And | Sep::Semi | Sep::Amp)).unwrap_or(all.len());
+        let list = &all[start..end];
+        start = end;
+        // After the work, a list that only reads (`&& du -sh`, `; ls`, `& wait`) can't change whether the work failed;
+        // any other one is more work (`cargo build && ./app --a` and `… --b` differ when the build passes).
+        if working && list.iter().all(|(_, part)| is_read_only_command(part)) {
+            continue;
+        }
+        for (i, (sep, part)) in list.iter().enumerate() {
+            if working && i > 0 {
+                match sep {
+                    Sep::Pipe if is_display_stage(part) => continue,
+                    Sep::Or if matches!(part.as_str(), "true" | ":") => continue,
+                    _ => {}
+                }
             }
+            working |= !is_setup(part);
+            if !out.is_empty() {
+                out.push(' ');
+                out.push_str(sep.text());
+                out.push(' ');
+            }
+            out.push_str(part);
         }
-        working |= !is_setup(&part);
-        if !out.is_empty() {
-            out.push(' ');
-            out.push_str(sep.text());
-            out.push(' ');
-        }
-        out.push_str(&part);
     }
     out
 }
@@ -73,11 +86,11 @@ pub fn command_key(command: &str) -> String {
 /// failing-command guard only (a successful command that may have changed things resets it); never for a security
 /// decision.
 pub fn is_read_only_command(command: &str) -> bool {
-    const READERS: [&str; 46] = [
+    const READERS: [&str; 47] = [
         "echo", "printf", "pwd", "whoami", "id", "groups", "ls", "cat", "head", "tail", "wc", "grep", "egrep", "fgrep", "rg",
         "ag", "which", "type", "command", "env", "printenv", "date", "uname", "hostname", "stat", "file", "du", "df", "tree",
         "realpath", "readlink", "basename", "dirname", "test", "[", "true", "false", ":", "sleep", "sort", "uniq", "cut", "tr",
-        "diff", "cmp", "less",
+        "diff", "cmp", "less", "wait",
     ];
     const GIT_READERS: [&str; 10] =
         ["status", "log", "diff", "show", "rev-parse", "ls-files", "describe", "blame", "grep", "remote"];
@@ -94,7 +107,11 @@ pub fn is_read_only_command(command: &str) -> bool {
             let Some(head) = words.next() else { return true };
             match head {
                 "git" => words.next().is_some_and(|sub| GIT_READERS.contains(&sub)),
-                "find" => !part.contains("-delete") && !part.contains("-exec"),
+                "find" => !part.contains("-delete") && !part.contains("-exec") && !part.contains("-ok"),
+                // Wrappers that run another command: only their reading forms.
+                "env" => words.all(|w| w.starts_with('-') || is_assignment(w)),
+                "command" => words.next().is_some_and(|w| w == "-v" || w == "-V"),
+                "sort" => !part.contains(" -o") && !part.contains("--output"),
                 _ => READERS.contains(&head),
             }
         })
@@ -217,7 +234,12 @@ mod tests {
     #[test]
     fn different_work_has_different_keys() {
         assert_ne!(command_key("cd a && make"), command_key("cd b && make"));
-        assert_eq!(command_key("cd a && make && make install"), "cd a && make");
+        assert_eq!(command_key("cd a && make && make install"), "cd a && make && make install");
+        // Once the work passes, what follows it is the work: a read-only tail is all that's dropped.
+        assert_ne!(command_key("cargo build && ./app --a"), command_key("cargo build && ./app --b"));
+        assert_ne!(command_key("npm install && npm test"), command_key("npm install && npm run build"));
+        assert_ne!(command_key("cargo build && cargo test"), command_key("cargo build"));
+        assert_eq!(command_key("cargo build && ls target && du -sh target | tail -1"), "cargo build");
         assert_ne!(command_key("cat build.log | grep missing"), command_key("cat build.log | tail"));
         assert_eq!(command_key("cat build.log | grep missing | head -3"), "cat build.log | grep missing");
         assert_ne!(command_key("make || make clean"), command_key("make"));
@@ -252,6 +274,9 @@ mod tests {
             "git status",
             "git log -3",
             "find . -name '*.rs'",
+            "env",
+            "env | grep PATH",
+            "command -v tokei",
         ] {
             assert!(is_read_only_command(command), "{command}");
         }
@@ -263,6 +288,9 @@ mod tests {
             "find . -delete",
             "ls && rm -rf build",
             "pip install -r requirements.txt",
+            "env CI=1 npm install",
+            "command npm install",
+            "sort -o out.txt in.txt",
             "",
         ] {
             assert!(!is_read_only_command(command), "{command}");

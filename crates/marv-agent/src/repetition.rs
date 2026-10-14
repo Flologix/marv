@@ -17,8 +17,8 @@
 //!   that can't succeed varies its tail (`&& du -sh`, `|| true`, `| tail -2`), so neither guard saw a `git clone`
 //!   re-sent 11 times. [`FailureLoopState`] remembers each bash command by [`marv_core::command::command_key`] (plus
 //!   its `network`/`sandbox: false` flags) with its failure's signature ([`failure_signature`]: its first error-like
-//!   line). Once a command failed the same way [`FAILURE_REPEATS`] (2) times in a row with no `edit_file` or
-//!   `write_file` call since, another try is a loop. Low on false positives: a different error, a success, or a file
+//!   line). Once a command failed the same way [`FAILURE_REPEATS`] (2) times in a row with no call since that may
+//!   have changed things (any tool but bash and the [`READ_ONLY_TOOLS`]), another try is a loop. Low on false positives: a different error, a success, or a file
 //!   edit resets it (a model re-running tests after an edit is never caught), and other commands in between (probes
 //!   like `echo test`) neither count nor reset.
 //!
@@ -198,8 +198,10 @@ pub fn tool_loop_detected(state: &mut ToolLoopState, calls: Vec<ToolCallKey>) ->
 
 /// Failures of the same command, with the same signature, that make another try a loop.
 pub const FAILURE_REPEATS: usize = 2;
-/// Tools that change files: a call to one forgets every failure (the next try may fare differently).
-pub const EDIT_TOOLS: [&str; 2] = ["edit_file", "write_file"];
+/// Tools that only read: a call to one keeps the failures. Any other tool besides bash (`edit_file`, `write_file`, a
+/// subagent that edits, `process` starting the server a test needed, an MCP tool) may have changed what the command
+/// fails on, so a call to it forgets every failure (the next try may fare differently).
+pub const READ_ONLY_TOOLS: [&str; 6] = ["read_file", "glob", "grep", "web_fetch", "plan", "skill"];
 /// A signature is cut to this many characters.
 const SIGNATURE_CHARS: usize = 160;
 
@@ -294,18 +296,20 @@ struct Failures {
     count: usize,
 }
 
-/// Failing bash commands since the last file edit (see the module notes).
+/// Failing bash commands since the last call that may have changed things (see the module notes).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct FailureLoopState {
     failures: std::collections::HashMap<String, Failures>,
 }
 
 impl FailureLoopState {
-    /// Notes a call's result: an edit forgets everything; a bash command's failure counts (the same signature as
+    /// Notes a call's result: a call that may change things (an edit, a subagent, `process`) forgets everything; a bash command's failure counts (the same signature as
     /// last time: one more; another: the first), its success forgets it.
     pub fn record(&mut self, name: &str, arguments: &str, result: &str) {
-        if EDIT_TOOLS.contains(&name) {
-            self.failures.clear();
+        if name != "bash" {
+            if !READ_ONLY_TOOLS.contains(&name) {
+                self.failures.clear();
+            }
             return;
         }
         let Some(key) = command_call_key(name, arguments) else { return };
@@ -340,7 +344,7 @@ impl FailureLoopState {
 /// The result of a call that wasn't run because its command keeps failing the same way.
 pub fn failing_command_note(count: usize, shown: &str) -> String {
     format!(
-        "Marv: not run. This command already failed {count} times in a row the same way (\"{shown}\"), with no file edited in between, so another try would fail too (a different tail on the command doesn't change that). Use what it said: change the approach, do without it, or tell the user what's in the way."
+        "Marv: not run. This command already failed {count} times in a row the same way (\"{shown}\"), with nothing changed in between, so another try would fail too (a different tail on the command doesn't change that). Use what it said: change the approach, do without it, or tell the user what's in the way."
     )
 }
 
@@ -645,6 +649,17 @@ mod tests {
         let mut installed = twice();
         installed.record("bash", &bash("npm install"), "added 3 packages\n\n[exit code 0]");
         assert!(installed.repeated("bash", &test).is_none());
+        // So does any tool that may change things, like a subagent that fixed the code or a server started for the
+        // tests; a read doesn't.
+        for tool in ["agent", "process", "mcp_call"] {
+            let mut other = twice();
+            other.record(tool, r#"{"prompt": "fix the tests"}"#, "Done: fixed src/a.rs");
+            assert!(other.repeated("bash", &test).is_none(), "{tool}");
+        }
+        let mut read = twice();
+        read.record("read_file", r#"{"path": "src/a.rs"}"#, "fn a() {}");
+        read.record("grep", r#"{"pattern": "a"}"#, "src/a.rs:1: fn a() {}");
+        assert!(read.repeated("bash", &test).is_some());
         // A failed install changed nothing that counts.
         let mut failed = twice();
         failed.record("bash", &bash("npm install"), "npm ERR! network\n\n[exit code 1]");
