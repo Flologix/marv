@@ -10,13 +10,16 @@
 //!
 //! Later, on demand ([`NestedInstructions`]): the first time read_file, edit_file or write_file touches a path below a
 //! folder (under the project root) with its own `AGENTS.md` (or `CLAUDE.md`), its text is appended to that tool's
-//! result as a `Marv:` note, once per conversation per file. A note on a tool result leaves the system prompt, and so
+//! result as a `Marv:` note, once per conversation per file (a compaction, `clear` and `resume` start over: the
+//! results that carried them are gone). A note on a tool result leaves the system prompt, and so
 //! the prompt cache, alone.
 //!
 //! Security (docs/SECURITY.md, "every path is checked after realpath"): a project, parent or nested file is read only
 //! where its real path stays inside the project (a parent's: inside the git root, or its own folder without one), and
 //! only when it's a regular file (a FIFO named `AGENTS.md` would hang startup), so a symlinked `AGENTS.md` can't put
-//! `~/.ssh/id_ed25519` into the prompt. Marv 0.4.0 read `<root>/AGENTS.md` through any symlink. The user's own file
+//! `~/.ssh/id_ed25519` into the prompt. Inside that boundary, a target that's a secret (`.env*`, `*.pem`, `id_*`:
+//! secrets need approval to read) or under a [`SKIPPED_DIRS`] folder (`pkg/AGENTS.md -> ../node_modules/x/rules.md`:
+//! not a protected path, so a command can change it unnoticed) is refused too. Marv 0.4.0 read `<root>/AGENTS.md` through any symlink. The user's own file
 //! may be a symlink anywhere (a dotfiles manager's): `~/.marv` is theirs. Nested files under [`SKIPPED_DIRS`]
 //! (`node_modules`, `target`, `.git`) are never read: those aren't protected paths (a sandboxed command can write
 //! there unnoticed) and a dependency's `AGENTS.md` isn't the project's. At most [`MAX_FILE_BYTES`] of a file is read.
@@ -26,7 +29,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use marv_sandbox::protected::SKIPPED_DIRS;
+use marv_sandbox::protected::{SKIPPED_DIRS, is_secret_name};
 
 use crate::paths::{home_or_above, shorten_home};
 use crate::prompt::{
@@ -122,8 +125,16 @@ fn read_checked(path: &Path, within: Option<&Path>) -> Result<Option<String>, St
     let real = std::fs::canonicalize(path).map_err(|_| "it's a link to nothing".to_string())?;
     if let Some(within) = within {
         let boundary = std::fs::canonicalize(within).unwrap_or_else(|_| within.to_path_buf());
-        if !real.starts_with(&boundary) {
+        let Ok(rel) = real.strip_prefix(&boundary) else {
             return Err(format!("it links outside {}", boundary.display()));
+        };
+        // A skipped folder isn't a protected path: a sandboxed command can change what's there unnoticed.
+        if let Some(skipped) = rel.components().filter_map(|c| c.as_os_str().to_str()).find(|n| SKIPPED_DIRS.contains(n)) {
+            return Err(format!("it leads into {skipped}/, which commands can change unnoticed"));
+        }
+        // Secrets need approval to read (docs/SECURITY.md); an instruction file is read without asking.
+        if let Some(name) = rel.file_name().and_then(|n| n.to_str()).filter(|n| is_secret_name(n)) {
+            return Err(format!("it leads to a secret ({name})"));
         }
     }
     if !std::fs::metadata(&real).is_ok_and(|m| m.is_file()) {
@@ -156,12 +167,15 @@ impl NestedInstructions {
 
     /// The note for a tool that touched `touched` (absolute, lexical, inside `root`): the instruction files of the
     /// folders below `root` that hold it, outermost first, that this conversation hasn't had yet. Each is marked as
-    /// given. A touched instruction file counts as given (the model has it now). `None`: nothing new.
-    pub fn note_for(&self, root: &Path, touched: &Path) -> Option<String> {
+    /// given. A touched instruction file counts as given when `tool` showed it (read_file) or wrote it (write_file);
+    /// after edit_file, whose result doesn't show it, its note comes as for any file there. `None`: nothing new.
+    pub fn note_for(&self, root: &Path, touched: &Path, tool: &str) -> Option<String> {
         let rel = touched.strip_prefix(root).ok()?;
         let real_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
         let mut folders: Vec<&Path> = rel.ancestors().skip(1).filter(|f| !f.as_os_str().is_empty()).collect();
         folders.reverse();
+        // read_file showed the touched file and write_file's model wrote it; edit_file's result shows neither.
+        let shows_itself = tool == "read_file" || tool == "write_file";
         let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
         let mut notes = Vec::new();
         for folder in folders {
@@ -178,7 +192,7 @@ impl NestedInstructions {
             };
             seen.insert(folder.to_path_buf());
             let file_rel = folder.join(name);
-            if rel == file_rel {
+            if rel == file_rel && shows_itself {
                 continue;
             }
             let shown = file_rel.to_string_lossy().into_owned();
@@ -190,8 +204,9 @@ impl NestedInstructions {
                 ));
             }
         }
-        // The file the tool touched, in its own folder: the model has it.
-        if let Some(name) = rel.file_name().and_then(|n| n.to_str())
+        // The file the tool touched, in its own folder: the model has it (read or written).
+        if shows_itself
+            && let Some(name) = rel.file_name().and_then(|n| n.to_str())
             && (name == INSTRUCTIONS_FILE || name == CLAUDE_FILE)
             && let Some(folder) = rel.parent()
             && !folder.as_os_str().is_empty()
@@ -347,19 +362,19 @@ mod tests {
         fs::write(root.join("pkg/AGENTS.md"), "pkg rules").unwrap();
         fs::write(root.join("pkg/sub/CLAUDE.md"), "sub rules").unwrap();
         let nested = NestedInstructions::default();
-        let note = nested.note_for(&root, &root.join("pkg/sub/a.rs")).unwrap();
+        let note = nested.note_for(&root, &root.join("pkg/sub/a.rs"), "read_file").unwrap();
         assert!(note.starts_with("Marv: pkg/AGENTS.md has instructions for the files in pkg/"));
         assert!(note.find("pkg rules").unwrap() < note.find("Marv: pkg/sub/CLAUDE.md").unwrap());
         assert!(note.contains("sub rules"));
         // The root's own file is the system prompt's.
         assert!(!note.contains("root rules"));
         // Exactly once per conversation.
-        assert_eq!(nested.note_for(&root, &root.join("pkg/sub/b.rs")), None);
-        assert_eq!(nested.note_for(&root, &root.join("pkg/c.rs")), None);
-        assert_eq!(nested.note_for(&root, &root.join("top.rs")), None);
+        assert_eq!(nested.note_for(&root, &root.join("pkg/sub/b.rs"), "read_file"), None);
+        assert_eq!(nested.note_for(&root, &root.join("pkg/c.rs"), "read_file"), None);
+        assert_eq!(nested.note_for(&root, &root.join("top.rs"), "read_file"), None);
         // A new conversation gets it again.
         nested.reset();
-        assert!(nested.note_for(&root, &root.join("pkg/x.rs")).unwrap().contains("pkg rules"));
+        assert!(nested.note_for(&root, &root.join("pkg/x.rs"), "read_file").unwrap().contains("pkg rules"));
     }
 
     #[test]
@@ -368,8 +383,8 @@ mod tests {
         fs::create_dir_all(root.join("pkg")).unwrap();
         fs::write(root.join("pkg/AGENTS.md"), "pkg rules").unwrap();
         let nested = NestedInstructions::default();
-        assert_eq!(nested.note_for(&root, &root.join("pkg/AGENTS.md")), None);
-        assert_eq!(nested.note_for(&root, &root.join("pkg/a.rs")), None);
+        assert_eq!(nested.note_for(&root, &root.join("pkg/AGENTS.md"), "read_file"), None);
+        assert_eq!(nested.note_for(&root, &root.join("pkg/a.rs"), "read_file"), None);
     }
 
     #[test]
@@ -381,10 +396,10 @@ mod tests {
         fs::write(home.join("secret"), "PRIVATE KEY").unwrap();
         symlink(home.join("secret"), root.join("pkg/AGENTS.md")).unwrap();
         let nested = NestedInstructions::default();
-        assert_eq!(nested.note_for(&root, &root.join("node_modules/dep/index.js")), None);
-        assert_eq!(nested.note_for(&root, &root.join("pkg/a.rs")), None);
+        assert_eq!(nested.note_for(&root, &root.join("node_modules/dep/index.js"), "read_file"), None);
+        assert_eq!(nested.note_for(&root, &root.join("pkg/a.rs"), "read_file"), None);
         // Outside the root: nothing.
-        assert_eq!(nested.note_for(&root, &home.join("elsewhere.rs")), None);
+        assert_eq!(nested.note_for(&root, &home.join("elsewhere.rs"), "read_file"), None);
     }
 
     #[test]
@@ -397,8 +412,64 @@ mod tests {
         let input = PromptInput { cwd: "~/p".into(), instructions: text, date: "2026-10-14".into(), ..Default::default() };
         let before = system_prompt(&input);
         let nested = NestedInstructions::default();
-        assert!(nested.note_for(&root, &root.join("pkg/a.rs")).is_some());
+        assert!(nested.note_for(&root, &root.join("pkg/a.rs"), "read_file").is_some());
         assert_eq!(system_prompt(&input), before);
         assert!(!before.contains("pkg rules"));
+    }
+
+    #[test]
+    fn an_instruction_file_linking_to_a_secret_is_not_read() {
+        // Inside the boundary, but a secret (docs/SECURITY.md: secrets need approval to read).
+        let (home, mono, root) = layout("secret");
+        fs::write(root.join(".env"), "KEY=sk-secret").unwrap();
+        fs::create_dir_all(root.join("certs")).unwrap();
+        fs::write(root.join("certs/server.pem"), "-----BEGIN PRIVATE KEY-----").unwrap();
+        fs::create_dir_all(mono.join("deploy")).unwrap();
+        fs::write(mono.join("deploy/id_ed25519"), "PRIVATE").unwrap();
+        symlink(root.join("certs/server.pem"), root.join("CLAUDE.md")).unwrap();
+        symlink(mono.join("deploy/id_ed25519"), mono.join("AGENTS.md")).unwrap();
+        fs::create_dir_all(root.join("pkg")).unwrap();
+        symlink(root.join(".env"), root.join("pkg/AGENTS.md")).unwrap();
+        let loaded = load_instructions(&root, &home, false, true);
+        assert!(loaded.instructions.is_none(), "{:?}", loaded.instructions);
+        assert_eq!(loaded.problems.len(), 2, "{:?}", loaded.problems);
+        assert!(loaded.problems.iter().all(|p| p.contains("secret")), "{:?}", loaded.problems);
+        assert_eq!(NestedInstructions::default().note_for(&root, &root.join("pkg/a.rs"), "read_file"), None);
+    }
+
+    #[test]
+    fn an_instruction_file_linking_into_a_skipped_folder_is_not_read() {
+        // node_modules, target, .git: a sandboxed command can change what's there unnoticed.
+        let (home, mono, root) = layout("skiptarget");
+        fs::create_dir_all(root.join("node_modules/dep")).unwrap();
+        fs::write(root.join("node_modules/dep/rules.md"), "dep rules").unwrap();
+        fs::create_dir_all(mono.join("target")).unwrap();
+        fs::write(mono.join("target/rules.md"), "built rules").unwrap();
+        symlink(root.join("node_modules/dep/rules.md"), root.join("AGENTS.md")).unwrap();
+        symlink(mono.join("target/rules.md"), mono.join("AGENTS.md")).unwrap();
+        fs::create_dir_all(root.join("pkg")).unwrap();
+        symlink(root.join("node_modules/dep/rules.md"), root.join("pkg/AGENTS.md")).unwrap();
+        let loaded = load_instructions(&root, &home, false, true);
+        assert!(loaded.instructions.is_none(), "{:?}", loaded.instructions);
+        assert_eq!(loaded.problems.len(), 2, "{:?}", loaded.problems);
+        assert_eq!(NestedInstructions::default().note_for(&root, &root.join("pkg/a.rs"), "read_file"), None);
+    }
+
+    #[test]
+    fn editing_an_instruction_file_still_gives_its_folders_note() {
+        // edit_file's result doesn't show the file: the rules come with it (after the edit). read_file shows them, and
+        // write_file's model wrote them.
+        let (_home, _, root) = layout("editself");
+        fs::create_dir_all(root.join("pkg")).unwrap();
+        fs::write(root.join("pkg/AGENTS.md"), "pkg rules, edited").unwrap();
+        let nested = NestedInstructions::default();
+        let note = nested.note_for(&root, &root.join("pkg/AGENTS.md"), "edit_file").unwrap();
+        assert!(note.contains("pkg rules, edited"));
+        assert_eq!(nested.note_for(&root, &root.join("pkg/a.rs"), "read_file"), None);
+        for tool in ["read_file", "write_file"] {
+            let nested = NestedInstructions::default();
+            assert_eq!(nested.note_for(&root, &root.join("pkg/AGENTS.md"), tool), None, "{tool}");
+            assert_eq!(nested.note_for(&root, &root.join("pkg/a.rs"), "read_file"), None, "{tool}");
+        }
     }
 }

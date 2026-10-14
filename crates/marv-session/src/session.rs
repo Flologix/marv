@@ -554,7 +554,8 @@ struct Inner {
     processes: Option<ProcessManager>,
     /// The project's checkpoints (#16); its ref follows the conversation (`State::chain_id`).
     checkpoints: Arc<CheckpointStore>,
-    /// Nested instruction files the main agent's conversation has had (#62); emptied with it (`clear`, `resume`).
+    /// Nested instruction files the main agent's conversation has had (#62); emptied with it (`clear`, `resume`) and
+    /// by a compaction (the summary replaces the results that carried them).
     nested: Arc<crate::instructions::NestedInstructions>,
     state: Mutex<State>,
 }
@@ -1573,6 +1574,8 @@ impl MarvSession {
             s.last = None;
         }
         lock(&self.inner.loaded).clear();
+        // The summary replaces the tool results that carried nested instruction files (#62): give them again.
+        self.inner.nested.reset();
         // From here the model sees the summary, not the turns before it: the trajectory needs it to say what the model
         // saw. The turn it follows only if that turn is in this file (after resume(), the last turn was in another one).
         if let Some(log) = self.trajectory() {
@@ -3190,6 +3193,23 @@ mod turn_tests {
         assert!(text_of(provider.requests()[1].0.last().unwrap()).contains("Focus especially on: the plan"));
         collect(go(&session, "next")).await;
         assert!(text_of(&provider.requests()[2].0[0]).contains("THE SUMMARY"));
+    }
+
+    #[tokio::test]
+    async fn a_compaction_forgets_which_nested_instruction_files_were_given() {
+        // The summary replaces the tool results that carried them (#62): the next touch gives them again.
+        let dirs = Dirs::new();
+        std::fs::create_dir_all(dirs.project.join("pkg")).unwrap();
+        std::fs::write(dirs.project.join("pkg/AGENTS.md"), "pkg rules").unwrap();
+        let provider = Scripted::new(vec![say("Answer."), say("THE SUMMARY")]);
+        let session = scripted(&dirs, &provider, |_| {});
+        let root = session.inner.init.root.clone();
+        let touch = || session.inner.nested.note_for(&root, &root.join("pkg/a.rs"), "read_file");
+        assert!(touch().is_some());
+        assert!(touch().is_none());
+        collect(go(&session, "first")).await;
+        assert!(matches!(session.compact(None).await.unwrap(), CompactResult::Compacted { .. }));
+        assert!(touch().is_some_and(|n| n.contains("pkg rules")));
     }
 
     #[tokio::test]

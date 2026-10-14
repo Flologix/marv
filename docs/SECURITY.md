@@ -26,7 +26,7 @@ These rules are requirements for the Rust build from day one. They come from a s
   - `.vscode/`, `.idea/`;
   - `package.json` lifecycle `scripts`.
 - **Secrets** (`.env*`, `*.pem`, `id_*`) need approval to read, and are masked in the sandbox.
-- **Every path is checked after `realpath`.** No tool follows a symlink out of its root. That includes skill files, which the old code read outside the sandbox, and instruction files (`AGENTS.md`/`CLAUDE.md`: the project's, its parents', nested ones; only the user's own `~/.marv/AGENTS.md` may link anywhere).
+- **Every path is checked after `realpath`.** No tool follows a symlink out of its root. That includes skill files, which the old code read outside the sandbox, and instruction files (`AGENTS.md`/`CLAUDE.md`: the project's, its parents', nested ones), which also never lead to a secret or into `node_modules`/`target`/`.git`; only the user's own `~/.marv/AGENTS.md` may link anywhere.
 
 ## Doors out of the sandbox
 Narrow, named ways out, each asked for and each with its own rule for what it can never do (Marv Sprint 4).

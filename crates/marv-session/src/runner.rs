@@ -104,7 +104,7 @@ impl SessionToolRunner {
         let path = args.get("path")?.as_str()?;
         let (path, _) = marv_tools::repair::repair_project_path(&self.ctx.root, path);
         let touched = marv_sandbox::resolve_in_project(&self.ctx.root, &path, &self.ctx.home).ok()?;
-        nested.note_for(&self.ctx.root, &touched)
+        nested.note_for(&self.ctx.root, &touched, &call.name)
     }
 
     /// Remembers that `call_id` was rewritten (its result gets `note`).
