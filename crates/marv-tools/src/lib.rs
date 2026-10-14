@@ -10,7 +10,7 @@
 //! - [`run_tool`] → [`ToolOutcome`] (never fails), [`builtin_tools`], [`tool_specs_for`], [`is_parallel_call`].
 //!
 //! Planned across the crate: spill cut output to a file the model can page through (#61, [`output`]),
-//! schema-guided argument repair (#65, [`repair`]), a formatter run after edits (#67, [`edit_file`]/[`write_file`]),
+//! a formatter run after edits (#67, [`edit_file`]/[`write_file`]),
 //! `apply_patch` (#66, [`apply_patch`]).
 
 pub mod agent;
@@ -32,6 +32,7 @@ pub mod read_file;
 pub mod registry;
 pub mod relay;
 pub mod repair;
+pub mod schema_repair;
 pub mod skill;
 pub mod syntax;
 pub mod types;
@@ -40,8 +41,10 @@ pub mod web_fetch;
 pub mod write_file;
 
 pub use registry::{
-    DECLINED, INTERRUPTED, ToolOutcome, ToolRef, builtin_tools, is_parallel_call, run_tool, tool_specs, tool_specs_for,
+    DECLINED, INTERRUPTED, ToolOutcome, ToolRef, builtin_tools, is_parallel_call, run_tool, schema_repaired, tool_specs,
+    tool_specs_for,
 };
+pub use schema_repair::RepairMode;
 pub use types::{
     AgentHost, AgentProgress, Approval, ApprovalRequest, Approver, BeforeChange, Checkpoint, Decision, DiffKind, DiffLine,
     DiffShown, DynTool, MemoryPaths, PlanHost, PlanItem, PlanStatus, Preview, PreviewFile, ProcessForward, ProcessForwards,

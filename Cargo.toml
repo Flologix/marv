@@ -11,6 +11,7 @@ repository = "https://github.com/FlologixAI/marv"
 rust-version = "1.99"
 
 [workspace.dependencies]
+socket2 = "0.6"
 # Internal crates
 marv-core = { path = "crates/marv-core" }
 marv-fs = { path = "crates/marv-fs" }
@@ -33,6 +34,8 @@ tokio-util = "0.7"
 futures = "0.3"
 async-trait = "0.1"
 tracing = "0.1"
+# Test temp folders that are removed when the test ends (#89).
+tempfile = "3"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

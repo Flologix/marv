@@ -1,5 +1,9 @@
 {
   "description": "--max-steps 3 with no one to ask: the turn stops after three steps without an answer, exit 2.",
   "prompt": "Look through every file.",
-  "max_steps": 3
+  "max_steps": 3,
+  "deliberate": {
+    "issue": 59,
+    "why": "marv-rs asks for a wrap-up reply at the step limit when no one can say \"keep going\": one more request with Marv's note and tool_choice \"none\" (the tools still sent, so the prefix holds). Its reply is the result's reply; the reason stays max_steps and the exit code 2."
+  }
 }

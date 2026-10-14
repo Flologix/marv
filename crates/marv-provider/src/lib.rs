@@ -22,6 +22,7 @@ use futures::Stream;
 use marv_core::{ChatTurn, ProviderEvent, ToolChoice, ToolSpec};
 use tokio_util::sync::CancellationToken;
 
+pub mod degenerate;
 pub mod errors;
 pub mod factory;
 pub mod models;
@@ -126,18 +127,19 @@ pub fn reasoning_for(thinking: bool, reasoning: Option<ReasoningSupport>) -> Opt
 }
 
 /// The one place that maps a config to a concrete [`Provider`]. `model`: what the model list says
-/// about it (only its reasoning support is used). `hints`: what a bad key or an unknown model
+/// about it (its reasoning support, and #96 its output limit). `hints`: what a bad key or an unknown model
 /// tells the user to change (the TUI's commands by default; the SDK passes [`errors::SDK_HINTS`]).
 ///
 /// - OpenRouter: [`openai_compat::OpenAiCompatProvider`] named `openrouter · <model>`, with the
-///   `X-Title: Marv` attribution header and, when [`reasoning_for`] says so, `body.reasoning`.
+///   `X-Title: Marv` attribution header and, when [`reasoning_for`] says so, `body.reasoning`;
+///   `max_tokens` from [`openai_compat::max_tokens_for`] (#96) and the idle timeout (#88).
 /// - Ollama: [`ollama::OllamaProvider`] with `context_length` and `thinking` from the config.
-pub fn create_provider(config: &ProviderConfig, model: Option<ReasoningSupport>, hints: Option<ErrorHints>) -> Arc<dyn Provider> {
+pub fn create_provider(config: &ProviderConfig, model: Option<&ModelInfo>, hints: Option<ErrorHints>) -> Arc<dyn Provider> {
     let hints = hints.unwrap_or_default();
     match config.provider {
         ProviderKind::OpenRouter => {
             let mut body = serde_json::Map::new();
-            if let Some(reasoning) = reasoning_for(config.thinking, model) {
+            if let Some(reasoning) = reasoning_for(config.thinking, model.and_then(|m| m.reasoning)) {
                 body.insert("reasoning".into(), serde_json::json!(reasoning));
             }
             Arc::new(openai_compat::OpenAiCompatProvider::new(openai_compat::OpenAiCompatOptions {
@@ -152,6 +154,9 @@ pub fn create_provider(config: &ProviderConfig, model: Option<ReasoningSupport>,
                 offline_hint: None,
                 hints,
                 timing: Default::default(),
+                idle_timeout: Some(openai_compat::STREAM_IDLE_TIMEOUT),
+                // #96: so the provider ends a runaway reply. Ollama has its own cap (`num_predict`).
+                max_tokens: Some(openai_compat::max_tokens_for(model.and_then(|m| m.max_output))),
             }))
         }
         // Ollama's native API, so the context window can be set (its default is 4096 tokens).

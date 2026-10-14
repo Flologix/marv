@@ -33,7 +33,8 @@ fn hi() -> Vec<ChatTurn> {
 async fn body_sent(thinking: bool, reasoning: Option<ReasoningSupport>) -> Value {
     let server =
         FakeServer::start(|_| Reply::sse(&[json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}), json!("[DONE]")])).await;
-    let provider = create_provider(&openrouter(&format!("{}/v1", server.url()), thinking), reasoning, None);
+    let info = reasoning.map(|r| ModelInfo { id: "acme/m".into(), reasoning: Some(r), ..Default::default() });
+    let provider = create_provider(&openrouter(&format!("{}/v1", server.url()), thinking), info.as_ref(), None);
     provider.stream(&hi(), StreamOptions::default()).collect::<Vec<_>>().await;
     server.last().json()
 }
@@ -57,6 +58,25 @@ async fn think_off_turns_it_off_only_where_its_optional() {
 async fn for_a_model_marv_knows_nothing_about_yet_nothing_is_sent_either_way() {
     assert_eq!(body_sent(true, None).await.get("reasoning"), None);
     assert_eq!(body_sent(false, None).await.get("reasoning"), None);
+}
+
+#[tokio::test]
+async fn openrouter_caps_the_reply_at_the_models_output_limit_or_a_default() {
+    // #96: so the provider ends a runaway reply.
+    let server = FakeServer::start(|_| Reply::sse(&[json!("[DONE]")])).await;
+    let config = openrouter(&format!("{}/v1", server.url()), false);
+    let sent = |info: Option<ModelInfo>| {
+        let provider = create_provider(&config, info.as_ref(), None);
+        async move {
+            provider.stream(&hi(), StreamOptions::default()).collect::<Vec<_>>().await;
+        }
+    };
+    sent(None).await;
+    assert_eq!(server.last().json()["max_tokens"], json!(32_000), "unknown model: the default");
+    sent(Some(ModelInfo { max_output: Some(8192), ..Default::default() })).await;
+    assert_eq!(server.last().json()["max_tokens"], json!(8192), "the model's own limit");
+    sent(Some(ModelInfo { max_output: Some(128_000), ..Default::default() })).await;
+    assert_eq!(server.last().json()["max_tokens"], json!(32_000), "never more than the default");
 }
 
 #[tokio::test]
@@ -93,7 +113,7 @@ async fn config_factory_uses_the_maker_and_model_list_it_was_given() {
     let factory = ConfigFactory {
         config: config.clone(),
         make: Arc::new(move |c: &ProviderConfig, info| {
-            seen.lock().unwrap().push((c.model.clone(), c.thinking, info));
+            seen.lock().unwrap().push((c.model.clone(), c.thinking, info.and_then(|i: &ModelInfo| i.reasoning)));
             create_provider(c, info, None)
         }),
         load: Arc::new(|_, _| {
@@ -108,7 +128,7 @@ async fn config_factory_uses_the_maker_and_model_list_it_was_given() {
     assert_eq!((factory.id(), factory.model(), factory.local()), ("openrouter", "a/b", false));
     factory.make(None, None);
     factory.make(Some("c/d"), None);
-    factory.make(None, Some(ReasoningSupport::Optional));
+    factory.make(None, Some(&ModelInfo { reasoning: Some(ReasoningSupport::Optional), ..Default::default() }));
     assert_eq!(
         *made.lock().unwrap(),
         [("a/b".into(), true, None), ("c/d".into(), true, None), ("a/b".into(), true, Some(ReasoningSupport::Optional))]

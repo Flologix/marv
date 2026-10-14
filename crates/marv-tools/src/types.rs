@@ -9,6 +9,8 @@
 //! - `preview` runs before the approval: a [`ToolError`] there means the call can't succeed, so the user is never
 //!   asked to approve it.
 //! - `repair` (issue #10) fixes a malformed call whose meaning is beyond doubt, before validation; never fails.
+//! - `repair_mode` (#65): how far `run_tool`'s schema-guided repair ([`crate::schema_repair`]) goes for this tool;
+//!   built-in by default, MCP tools only coerce types.
 //! - `ToolOutput::diff` and `ToolOutput::plan` are for the screen only: never sent to the model (the loop appends `output`) nor written to
 //!   trajectories (they record named fields).
 //! - `ToolContext::before_change` is started (not awaited) by the edit tools' preview and awaited in `run` before
@@ -36,6 +38,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
+
+use crate::schema_repair::RepairMode;
 
 /// An expected failure (bad path, missing file); its message goes to the model as is.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -537,6 +541,11 @@ pub trait Tool: Send + Sync + 'static {
     fn repair(&self, _raw: &Value, _ctx: &ToolContext) -> Option<Repaired> {
         None
     }
+    /// How far `run_tool` repairs the arguments against `schema` (#65). Default: a built-in tool, whose schema is
+    /// exactly what it accepts.
+    fn repair_mode(&self) -> RepairMode {
+        RepairMode::Builtin
+    }
     /// marv-rs: the URL this call reaches (web_fetch), as `TaintState`'s prefixes are matched against. In a tainted
     /// session a URL under a prefix the user approved runs without asking, and "always" approves the URL's prefix.
     fn egress_url(&self, _input: &Self::Input) -> Option<String> {
@@ -578,6 +587,7 @@ pub trait DynTool: Send + Sync {
     fn auto_safe(&self, input: In<'_>, ctx: &ToolContext) -> bool;
     fn protected_target(&self, input: In<'_>, ctx: &ToolContext) -> Option<ProtectedRule>;
     fn repair(&self, raw: &Value, ctx: &ToolContext) -> Option<Repaired>;
+    fn repair_mode(&self) -> RepairMode;
     fn egress_url(&self, input: In<'_>) -> Option<String>;
     fn door(&self, input: In<'_>, ctx: &ToolContext) -> Option<Door>;
     fn once(&self, input: In<'_>, ctx: &ToolContext) -> bool;
@@ -640,6 +650,9 @@ impl<T: Tool> DynTool for T {
     }
     fn repair(&self, raw: &Value, ctx: &ToolContext) -> Option<Repaired> {
         Tool::repair(self, raw, ctx)
+    }
+    fn repair_mode(&self) -> RepairMode {
+        Tool::repair_mode(self)
     }
     fn egress_url(&self, input: In<'_>) -> Option<String> {
         Tool::egress_url(self, typed::<T>(input))

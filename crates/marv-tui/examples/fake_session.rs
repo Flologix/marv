@@ -269,7 +269,7 @@ impl SessionPort for Fake {
             ("exit", "Quit"),
         ]
         .into_iter()
-        .map(|(name, description)| CommandInfo { name: name.into(), description: description.into() })
+        .map(|(name, description)| CommandInfo { while_busy: name == "help", ..CommandInfo::new(name, description) })
         .collect()
     }
 
@@ -465,7 +465,7 @@ async fn main() -> anyhow::Result<()> {
         welcome: WelcomeInfo {
             version: "0.0.1".into(),
             cwd: "~/Projects/demo".into(),
-            instructions: true,
+            instructions: vec!["AGENTS.md".into()],
             skills: 2,
             memories: 1,
             mcp_servers: 0,

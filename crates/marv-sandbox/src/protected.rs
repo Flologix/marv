@@ -115,6 +115,14 @@ pub fn rule_for_relative(rel: &Path) -> Option<ProtectedRule> {
     }
 }
 
+/// Whether a file name is a secret's, as docs/SECURITY.md lists them: `.env*`, `*.pem`, `id_*` (case-insensitively, as
+/// [`rule_for_relative`]). Secrets need approval to read; marv-rs #62 refuses an instruction file that links to one.
+/// The read_file gate (guard `reading_a_secret_asks`) is meant to use this too.
+pub fn is_secret_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    (lower.starts_with(".env") && lower != ".envrc") || lower.ends_with(".pem") || lower.starts_with("id_")
+}
+
 /// The rule protecting `path` (absolute, or relative to `root`), checked on the path as written and on where it
 /// really leads. A path that leads outside the project is an error (`resolve_in_project` refuses it anyway).
 pub fn protected_rule(root: &Path, path: &Path) -> Result<Option<ProtectedRule>, SandboxError> {
@@ -428,6 +436,13 @@ mod tests {
         assert_eq!(rule("bunfig.toml"), Some(ProtectedRule::Bunfig));
         assert_eq!(rule(".mcp.json"), Some(ProtectedRule::McpJson));
         assert_eq!(rule("AGENTS.md"), Some(ProtectedRule::AgentInstructions));
+        // Secrets (docs/SECURITY.md), a different list: .envrc is protected but not a secret.
+        for name in [".env", ".env.local", "server.pem", "KEY.PEM", "id_ed25519", "id_rsa.pub"] {
+            assert!(is_secret_name(name), "{name}");
+        }
+        for name in [".envrc", "AGENTS.md", "pem.md", "ids.txt", "rules.md"] {
+            assert!(!is_secret_name(name), "{name}");
+        }
         assert_eq!(rule("packages/a/CLAUDE.md"), Some(ProtectedRule::AgentInstructions));
         assert_eq!(rule("docs/agents.md"), Some(ProtectedRule::AgentInstructions));
         assert_eq!(rule(".marv/checks/x.yaml"), Some(ProtectedRule::MarvDir));
