@@ -3398,6 +3398,61 @@ mod turn_tests {
         assert!(!options.system.as_deref().unwrap().contains("github runs the GitHub CLI"));
     }
 
+    /// A door of any kind, as the github and host doors are: it asks, once.
+    struct DoorTool;
+    #[async_trait::async_trait]
+    impl marv_tools::Tool for DoorTool {
+        type Input = serde_json::Value;
+        fn name(&self) -> &str {
+            "d"
+        }
+        fn description(&self) -> &str {
+            "A door for tests."
+        }
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn kind(&self) -> marv_core::ToolKind {
+            marv_core::ToolKind::Execute
+        }
+        fn label(&self, _input: &Self::Input) -> String {
+            "d".into()
+        }
+        fn door(&self, _input: &Self::Input, _ctx: &marv_tools::ToolContext) -> Option<marv_core::Door> {
+            Some(marv_core::Door::Host)
+        }
+        fn once(&self, _input: &Self::Input, _ctx: &marv_tools::ToolContext) -> bool {
+            true
+        }
+        async fn run(
+            &self,
+            _input: &Self::Input,
+            _ctx: &marv_tools::ToolContext,
+        ) -> Result<marv_tools::ToolOutput, marv_tools::ToolError> {
+            Ok(marv_tools::ToolOutput::ok("ran", "ran"))
+        }
+    }
+
+    // Marv's tests/doors.test.ts: the trajectory's tool record names the door.
+    #[tokio::test]
+    async fn the_trajectorys_tool_record_names_the_door() {
+        let dirs = Dirs::new();
+        let store = Arc::new(TrajectoryStore::new(&dirs.dir));
+        let calls = vec![call("c1", "d", serde_json::json!({})), call("c2", "read_file", serde_json::json!({"path": "nope"}))];
+        let provider = Scripted::new(vec![use_tools(calls), say("Done.")]);
+        let session = scripted(&dirs, &provider, |i| {
+            i.tools = vec![Arc::new(DoorTool)];
+            i.approve = Some(answer(Decision::Yes));
+            i.yolo = false;
+            i.trajectories = Some(store.clone());
+        });
+        collect(go(&session, "go")).await;
+        let log = records(&store, &dirs.project, &session).await;
+        let tools: Vec<&serde_json::Value> = log.iter().filter(|r| r["type"] == "tool").collect();
+        assert_eq!((tools[0]["door"].as_str(), tools[0]["approval"].as_str()), (Some("host"), Some("yes")));
+        assert!(tools[1].get("door").is_none());
+    }
+
     #[tokio::test]
     async fn a_session_with_host_commands_names_the_host_door_in_the_prompt() {
         let dirs = Dirs::new();

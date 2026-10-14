@@ -59,7 +59,7 @@ pub struct ToolDisplay {
 pub fn tool_run_from(outcome: ToolOutcome, note: Option<&str>) -> ToolRun {
     let ToolOutcome { result, label } = outcome;
     let display = ToolDisplay { diff: result.diff.clone() };
-    let (declined, provenance, changed) = (result.declined, result.provenance, result.changed.clone());
+    let (declined, provenance, changed, door) = (result.declined, result.provenance, result.changed.clone(), result.door);
     let approval = approval_record(result.approval);
     let mut core = result.into_core();
     // Tainting sources are data, fenced (docs/SECURITY.md); mesh envelopes are fenced by the switchboard already.
@@ -69,7 +69,7 @@ pub fn tool_run_from(outcome: ToolOutcome, note: Option<&str>) -> ToolRun {
     if let Some(note) = note {
         core.output = marv_tools::repair::with_note(&core.output, Some(note));
     }
-    ToolRun { result: core, label, declined, provenance, changed, approval, display: Some(Arc::new(display)) }
+    ToolRun { result: core, label, declined, provenance, changed, approval, door, display: Some(Arc::new(display)) }
 }
 
 /// The loop's tool runner for one turn (main agent or subagent).

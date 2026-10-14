@@ -126,6 +126,9 @@ pub enum TrajectoryRecord {
         is_error: bool,
         declined: bool,
         approval: ApprovalRecord,
+        /// The door out of the sandbox the call went through (Marv #47, #51, #52); absent for an ordinary call.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        door: Option<marv_core::Door>,
         ms: u64,
     },
     Error {
@@ -439,6 +442,7 @@ impl AgentRecorder {
                     is_error: run.result.is_error,
                     declined: run.declined,
                     approval,
+                    door: run.door,
                     ms: now - started,
                 });
                 // The next request goes out once the last tool is done.
@@ -453,6 +457,7 @@ impl AgentRecorder {
                 is_error: false,
                 declined: true,
                 approval: ApprovalRecord::None,
+                door: None,
                 ms: 0,
             }),
             LoopEvent::Error(message) => (self.sink)(TrajectoryRecord::Error { who, message: message.clone() }),
