@@ -9,8 +9,7 @@
 //!   [`BeforeChange`];
 //! - [`run_tool`] → [`ToolOutcome`] (never fails), [`builtin_tools`], [`tool_specs_for`], [`is_parallel_call`].
 //!
-//! Planned across the crate: spill cut output to a file the model can page through (#61, [`output`]),
-//! a formatter run after edits (#67, [`edit_file`]/[`write_file`]),
+//! Planned across the crate: a formatter run after edits (#67, [`edit_file`]/[`write_file`]),
 //! `apply_patch` (#66, [`apply_patch`]).
 
 pub mod agent;

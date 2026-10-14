@@ -10,7 +10,8 @@
 //!   it** (no `autoSafe`: nothing contains what it does).
 //! - Results: text blocks joined, images/audio *named but not sent* (Marv passes
 //!   text only; images are a taint and exfiltration risk, docs/SECURITY.md),
-//!   structured content as JSON, capped at 30k chars (head and tail kept).
+//!   structured content as JSON, capped at 30k chars (head and tail kept). The session's adapter runs
+//!   [`McpTool::run_whole`] and cuts it itself, saving a cut result whole (#61).
 //! - A server error or a dead connection becomes a tool error; a
 //!   [`crate::oauth::LoginNeeded`] passes Marv's own sentence through as is, so
 //!   the model tells the user to log in rather than retrying.
@@ -132,8 +133,13 @@ pub fn mcp_tool_name(server: &str, tool: &str) -> String {
     format!("{}_{hash}", &name[..name.len().min(MAX_NAME - 9)])
 }
 
-/// The model reads text: images and other binary blocks are named, not sent.
+/// The model reads text: images and other binary blocks are named, not sent. Capped at [`MAX_OUTPUT`].
 pub fn format_mcp_result(result: &McpCallResult) -> String {
+    cut_mcp_output(&mcp_result_text(result))
+}
+
+/// The result as text, whole ([`format_mcp_result`] before the cap): the session saves a cut one (#61).
+pub fn mcp_result_text(result: &McpCallResult) -> String {
     let parts: Vec<String> = result
         .content
         .iter()
@@ -167,13 +173,18 @@ pub fn format_mcp_result(result: &McpCallResult) -> String {
     if text.is_empty() {
         text = "(no output)".into();
     }
-    let len = text.chars().count();
-    if len > MAX_OUTPUT {
-        let head: String = text.chars().take(MAX_OUTPUT / 3).collect();
-        let tail: String = text.chars().skip(len - 2 * MAX_OUTPUT / 3).collect();
-        text = format!("{head}\n\n… ({} characters omitted) …\n\n{tail}", len - MAX_OUTPUT);
-    }
     text
+}
+
+/// The first third and the last two thirds of [`MAX_OUTPUT`].
+pub fn cut_mcp_output(text: &str) -> String {
+    let len = text.chars().count();
+    if len <= MAX_OUTPUT {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(MAX_OUTPUT / 3).collect();
+    let tail: String = text.chars().skip(len - 2 * MAX_OUTPUT / 3).collect();
+    format!("{head}\n\n… ({} characters omitted) …\n\n{tail}", len - MAX_OUTPUT)
 }
 
 /// For the transcript: the first non-empty string argument, or the arguments as JSON, at most 60 chars.
@@ -333,13 +344,20 @@ impl McpTool {
 
     /// Runs the call. `Err` is the tool error text the model reads.
     pub async fn run(&self, args: Map<String, Value>, cancel: CancellationToken) -> Result<ToolResult, String> {
+        let mut result = self.run_whole(args, cancel).await?;
+        result.output = cut_mcp_output(&result.output);
+        Ok(result)
+    }
+
+    /// [`McpTool::run`] without the cap: the session cuts it, saving the whole output (#61).
+    pub async fn run_whole(&self, args: Map<String, Value>, cancel: CancellationToken) -> Result<ToolResult, String> {
         let result = match self.caller.call(&self.info.name, args, cancel).await {
             Ok(r) => r,
             // Marv's own sentence, as it is: the model should tell the user to log in, not retry.
             Err(McpError::LoginNeeded(e)) => return Err(e.to_string()),
             Err(e) => return Err(format!("{}'s {} failed: {e}", self.server, self.info.name)),
         };
-        let output = format_mcp_result(&result);
+        let output = mcp_result_text(&result);
         if result.is_error {
             return Ok(ToolResult { output, summary: Some("error".into()), is_error: true });
         }
