@@ -236,9 +236,6 @@ impl Drop for SubagentPlug {
 }
 
 /// One of the three mesh tools for an agent's plug.
-/// How long `mesh_list` waits for the other Marvs to say who they are; past it, the list goes without them.
-const PEERS_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
-
 pub struct MeshTool {
     /// `mesh_list`, `mesh_call` or `mesh_send`.
     pub name: &'static str,
@@ -374,10 +371,11 @@ impl Tool for MeshTool {
         };
         // The list also names the other Marvs on the machine: a model asked "who's on the mesh?" otherwise only
         // learns that nothing is wired, while `marv mesh ls` shows several.
-        // Bounded, and over when the turn is stopped: a hung Marv delays the list by PEERS_TIMEOUT at most.
+        // `list` probes every door at once, each for DOOR_TIMEOUT at most, so a hung Marv delays the list by that
+        // and drops out alone; a stopped turn stops waiting.
         let peers = match self.mesh.peer_dir().filter(|_| self.name == MESH_LIST) {
             Some(dir) => tokio::select! {
-                found = tokio::time::timeout(PEERS_TIMEOUT, marv_mesh::discovery::list(&dir)) => found.ok().and_then(Result::ok),
+                found = marv_mesh::discovery::list(&dir) => found.ok(),
                 _ = ctx.cancel.cancelled() => None,
             },
             None => None,
@@ -547,6 +545,9 @@ mod tests {
         let out = list.run(&serde_json::Map::new(), &stopped).await.unwrap();
         assert!(started.elapsed() < std::time::Duration::from_millis(500), "{:?}", started.elapsed());
         assert!(out.output.starts_with("Nothing is wired to you"), "{}", out.output);
+        // Not stopped: the hung Marv drops out alone, and the one that answered is still listed.
+        let out = list.run(&serde_json::Map::new(), &ToolContext::new(std::env::temp_dir())).await.unwrap();
+        assert!(out.output.contains("- web: peer.web.agent.parent.inbox") && !out.output.contains("hung"), "{}", out.output);
         cancel.cancel();
         web_cancel.cancel();
     }

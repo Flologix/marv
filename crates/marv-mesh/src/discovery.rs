@@ -291,24 +291,20 @@ struct Door {
     approver: Arc<dyn PeerApprover>,
 }
 
-/// How long a door's socket has to take a connection before the Marv behind it counts as busy (alive) rather than gone.
-const PROBE_TIMEOUT: Duration = Duration::from_millis(200);
-
-/// Whether nothing listens on `socket` any more (the connection is refused). A connect to a live Marv whose backlog is
-/// full blocks, so it runs on a thread of its own, and a Marv that doesn't take it within [`PROBE_TIMEOUT`] is busy,
-/// not gone (the thread finishes when the backlog drains).
+/// Whether nothing listens on `socket` any more (the connection is refused). The connect is non-blocking: a live Marv
+/// whose backlog is full answers "would block" at once instead of holding this one up, and counts as alive.
 fn nobody_listens(socket: &Path) -> bool {
-    let (tx, rx) = std::sync::mpsc::channel();
-    let path = socket.to_path_buf();
-    std::thread::spawn(move || {
-        let _ = tx.send(std::os::unix::net::UnixStream::connect(&path).err().map(|e| e.kind()));
-    });
-    matches!(rx.recv_timeout(PROBE_TIMEOUT), Ok(Some(std::io::ErrorKind::ConnectionRefused)))
+    use socket2::{Domain, SockAddr, Socket, Type};
+    let (Ok(probe), Ok(addr)) = (Socket::new(Domain::UNIX, Type::STREAM, None), SockAddr::unix(socket)) else { return false };
+    if probe.set_nonblocking(true).is_err() {
+        return false;
+    }
+    matches!(probe.connect(&addr), Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused)
 }
 
 /// Removes the sockets of Marvs that are gone: a door's socket outlives a Marv that was killed or crashed (the guard's
 /// drop never ran), and the folder filled up with them. Only a refused connection counts as gone ([`nobody_listens`]);
-/// a slow or busy Marv keeps its socket. The folder is this user's and private ([`private_folder`]), so these are all
+/// a busy Marv keeps its socket. The folder is this user's and private ([`private_folder`]), so these are all
 /// this user's Marvs. Called with the folder's lock held ([`open_door`]), so no other Marv is replacing a socket.
 fn sweep_dead(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };

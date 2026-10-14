@@ -11,6 +11,7 @@ repository = "https://github.com/FlologixAI/marv"
 rust-version = "1.99"
 
 [workspace.dependencies]
+socket2 = "0.6"
 # Internal crates
 marv-core = { path = "crates/marv-core" }
 marv-fs = { path = "crates/marv-fs" }
