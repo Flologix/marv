@@ -331,6 +331,12 @@ mod tests {
         assert_eq!(a.approve(request("bash", false)).await, Decision::No);
     }
 
+    // #81: the agent's failing-command guard knows bash's network note by its start (marv-agent has no sandbox).
+    #[test]
+    fn the_agent_recognizes_bashs_network_note() {
+        assert!(marv_sandbox::notes::NETWORK_NOTE.starts_with(marv_agent::repetition::NETWORK_NOTE_START));
+    }
+
     #[test]
     fn subagents_dont_inherit_egress_scopes() {
         let always = AlwaysScopes::default();

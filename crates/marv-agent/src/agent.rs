@@ -31,7 +31,9 @@
 //! - **Tool loops**: a period-1/2 cycle of identical calls *with identical results*: the first
 //!   time every call is answered with [`tool_loop_note`] instead of running; the second time the
 //!   calls are answered and the run ends `Loop`. marv-rs (#81): a bash command that already failed the same way
-//!   twice since the last file edit, whatever its tail, counts as one too ([`crate::repetition::FailureLoopState`]).
+//!   twice since the last change, whatever its tail, isn't run again ([`crate::repetition::FailureLoopState`]),
+//!   checked as each call is about to run, so an edit earlier in the same reply counts: the note the first time,
+//!   the run ends `Loop` (the step's remaining calls not run) the next.
 //! - **Empty replies** (no text, whitespace doesn't count, no calls; not failed, cut off or
 //!   cancelled): the first is asked for again unchanged (nothing enters the history, so the cache
 //!   holds; OpenRouter's upstream hosts sometimes bill for a reply and send nothing, a third of
@@ -771,7 +773,10 @@ pub struct LoopState {
     /// result is a loop; one whose result changes each time (the next item from a queue) is new work.
     last_result: std::collections::HashMap<(String, String), u64>,
     /// Bash commands failing the same way since the last edit (#81): another try is a loop, whatever its tail.
+    /// Checked as each call is about to run, after the calls before it in the reply were recorded.
     failures: FailureLoopState,
+    /// A failing command was tried again after the warning: the step's remaining calls don't run, the run ends `Loop`.
+    failure_stop: bool,
     in_flight: InFlight,
 }
 
@@ -791,6 +796,7 @@ impl LoopState {
             tool_loop: ToolLoopState::default(),
             last_result: Default::default(),
             failures: FailureLoopState::default(),
+            failure_stop: false,
             in_flight: InFlight::default(),
         }
     }
@@ -1058,16 +1064,10 @@ impl LoopState {
                 .collect();
             tool_loop_detected(&mut self.tool_loop, keys)
         };
-        // #81: a command that keeps failing the same way is a loop too (bash resets the history above).
-        let failing = calls.iter().find_map(|c| self.failures.repeated(&c.name, &c.arguments)).filter(|_| !aborted);
-        let hit = hit || failing.is_some();
         // The first time: every call is answered with the note instead of running.
         if hit && !warned {
             self.tool_loop.warned = true;
-            let note = match &failing {
-                Some((count, shown)) => failing_command_note(*count, shown),
-                None => tool_loop_note(self.tool_loop.history.len(), &calls[0].name),
-            };
+            let note = tool_loop_note(self.tool_loop.history.len(), &calls[0].name);
             for call in &calls {
                 self.push_result(call, &note);
             }
@@ -1134,6 +1134,8 @@ impl LoopState {
             Some(not_run::ABORTED)
         } else if tools.declined {
             Some(not_run::DECLINED)
+        } else if self.failure_stop {
+            Some(not_run::CUT_OFF)
         } else {
             None
         };
@@ -1162,9 +1164,20 @@ impl LoopState {
         // user quit) never sees a tool run that it can't show or stop.
         if let Some(k) = group.announced.take() {
             let call = self.in_flight.calls[group.range.start + k].clone();
-            let runner = self.options.runner.clone();
-            let cancel = self.options.cancel.clone();
-            group.running.push(Box::pin(async move { (k, runner.run(call, cancel).await) }));
+            // #81: a command that keeps failing the same way isn't run again: the note the first time, the end of
+            // the run the next (the tool-loop guard's `warned`).
+            if let Some((count, shown)) = self.failures.repeated(&call.name, &call.arguments) {
+                let continued = !self.tool_loop.warned;
+                self.tool_loop.warned = true;
+                self.failure_stop |= !continued;
+                self.emit(LoopEvent::ToolLoop { continued });
+                let run = not_run_record(&call, &failing_command_note(count, &shown));
+                group.running.push(Box::pin(async move { (k, Ok(run)) }));
+            } else {
+                let runner = self.options.runner.clone();
+                let cancel = self.options.cancel.clone();
+                group.running.push(Box::pin(async move { (k, runner.run(call, cancel).await) }));
+            }
             // Polled once right away, so whatever the tool does first (asking for approval, say)
             // happens before the next call is considered.
             if let Some(Some((k, result))) = group.running.next().now_or_never() {
@@ -1258,6 +1271,8 @@ impl LoopState {
         } else if tools.declined {
             // The user said no: stop here and let them say what to do instead.
             self.finish(StopReason::Declined);
+        } else if self.failure_stop {
+            self.finish(StopReason::Loop);
         } else {
             self.phase = Phase::Full(std::mem::take(&mut tools.runs));
         }
@@ -3140,6 +3155,39 @@ mod tests {
             matches!(t, ChatTurn::Tool { text, .. } if text.starts_with("Marv: not run. This command already failed 2 times"))
         });
         assert!(noted, "{turns:?}");
+    }
+
+    // Greptile on #111: each call is checked when it's about to run, after the calls before it in the reply.
+    #[tokio::test]
+    async fn an_edit_earlier_in_the_same_reply_resets_the_failures_before_the_retry_runs() {
+        let edit = ToolCall {
+            id: "e".into(),
+            name: "edit_file".into(),
+            arguments: serde_json::json!({"path": "a.rs", "old": "x", "new": "y"}).to_string(),
+        };
+        let script = vec![
+            use_tools(&[bash_call("c1", "cargo test")]),
+            use_tools(&[bash_call("c2", "cargo test")]),
+            use_tools(&[edit, bash_call("c3", "cargo test")]),
+            say("Done."),
+        ];
+        let (bash_runs, edits) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (b, e) = (bash_runs.clone(), edits.clone());
+        let run: RunFn = Arc::new(move |c, _| {
+            let out = if c.name == "bash" {
+                b.fetch_add(1, Ordering::SeqCst);
+                "error[E0308]: mismatched types\n\n[exit code 101]"
+            } else {
+                e.fetch_add(1, Ordering::SeqCst);
+                "Edited a.rs"
+            };
+            Box::pin(async move { Ok(ok(out, c.id.clone())) })
+        });
+        let runner = FakeRunner { run, parallel: |_| false };
+        let events = collect(options(Arc::new(ScriptedProvider::new(script)), &history(vec![user("go")]), runner)).await;
+        assert!(tool_loops(&events).is_empty());
+        assert_eq!((edits.load(Ordering::SeqCst), bash_runs.load(Ordering::SeqCst)), (1, 3));
+        assert_eq!(end(&events), Some(StopReason::End));
     }
 
     #[tokio::test]

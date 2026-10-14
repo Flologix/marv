@@ -42,7 +42,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use marv_sandbox::git_guard::{GitGuard, git_guard, worktree_git};
 use marv_sandbox::notes::{
     BACKGROUND_NOTE, BACKGROUND_NOTE_PROCESS, ESCALATED_NOTE, GH_NOTE, GH_TOOL_NOTE, GIT_HINT, HOME_NOTE, NETWORK_NOTE,
-    backgrounds_process, looks_like_network_failure, runs_gh, touches_hidden_home,
+    backgrounds_process, hidden_network_failure, looks_like_network_failure, runs_gh, touches_hidden_home,
 };
 use marv_sandbox::paths::is_inside;
 use marv_sandbox::protected::{ProtectedRule, created_note, nested_git_dirs, protected_snapshot, revert_created, scan_created};
@@ -568,7 +568,9 @@ impl Tool for Bash {
         }
         // Not for a command that isn't there (127) or can't run (126): the network has nothing to do with those.
         let failed = result.timed_out || (!result.aborted && !matches!(result.exit_code, Some(0 | 126 | 127)));
-        if sandboxed && !network && failed && looks_like_network_failure(&input.command, &result.output) {
+        // `|| true` hides a failure like a pipe does (#81): a network command that printed a network error counts.
+        let hidden = !failed && !result.aborted && hidden_network_failure(&input.command, &result.output);
+        if sandboxed && !network && (failed && looks_like_network_failure(&input.command, &result.output) || hidden) {
             result.output.push_str(&format!("\n{NETWORK_NOTE}{last_resort}\n"));
             // A retry without network asks for it instead (#81, `repair`).
             ctx.network_failures.record(&input.command);
@@ -1028,6 +1030,24 @@ mod tests {
         let with_network = BashInput { network: Some(true), ..bash(FAILING) };
         assert!(!Bash.run(&with_network, &ctx).await.unwrap().output.contains("Marv: "));
         assert!(!Bash.run(&bash("echo 'gh: command not found'; exit 127"), &ctx).await.unwrap().output.contains("Marv: "));
+    }
+
+    // #81 (Greptile on #111): `git clone … || true` failed like the network and said exit 0.
+    #[tokio::test]
+    async fn the_network_note_is_added_when_or_true_hid_a_network_commands_failure() {
+        require_bwrap!();
+        let root = TempDir::new("bash-note-net-hidden");
+        let ctx = tool_ctx(&root, true);
+        let hidden = "curl() { echo 'curl: (6) Could not resolve host: x'; return 6; }; curl x || true";
+        let result = Bash.run(&bash(hidden), &ctx).await.unwrap();
+        assert!(result.output.ends_with("[exit code 0]"), "{}", result.output);
+        assert!(result.output.contains(NETWORK_NOTE), "{}", result.output);
+        assert!(ctx.network_failures.contains(hidden));
+        // Not for a command that isn't a network one, nor without the `||`.
+        let echo = Bash.run(&bash("echo 'Could not resolve host: x' || true"), &ctx).await.unwrap();
+        assert!(!echo.output.contains("Marv: "), "{}", echo.output);
+        let plain = Bash.run(&bash("curl() { echo 'Could not resolve host: x'; }; curl x"), &ctx).await.unwrap();
+        assert!(!plain.output.contains("Marv: "), "{}", plain.output);
     }
 
     #[tokio::test]

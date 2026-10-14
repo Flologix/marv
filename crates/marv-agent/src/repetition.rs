@@ -203,6 +203,10 @@ pub const EDIT_TOOLS: [&str; 2] = ["edit_file", "write_file"];
 /// A signature is cut to this many characters.
 const SIGNATURE_CHARS: usize = 160;
 
+/// How bash's network note (`marv_sandbox::notes::NETWORK_NOTE`, #23) starts; marv-agent doesn't depend on
+/// marv-sandbox, so marv-session's tests hold the two together.
+pub const NETWORK_NOTE_START: &str = "Marv: this command ran in the sandbox without network";
+
 /// A line that says something failed, whatever the exit code (`git clone … || true` still printed it).
 fn strong_error(lower: &str) -> bool {
     const STARTS: [&str; 5] = ["fatal:", "error:", "error[", "npm err!", "err!"];
@@ -243,7 +247,11 @@ fn normalize_line(line: &str) -> String {
 pub fn failure_signature(result: &str) -> Option<(String, String)> {
     let lines: Vec<&str> = result.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with("Marv:")).collect();
     let ending = lines.iter().rev().find(|l| l.starts_with("[exit code ") || l.starts_with("[timed out")).copied();
-    let failed = ending != Some("[exit code 0]");
+    // A command that exited 0 worked (`grep -i error app.log` prints errors and succeeds), unless bash's network note
+    // says `|| true` hid a failure like the missing network's.
+    if ending == Some("[exit code 0]") && !result.contains(NETWORK_NOTE_START) {
+        return None;
+    }
     let pick = |line: &str| {
         let shown: String = line.chars().take(SIGNATURE_CHARS).collect();
         Some((normalize_line(&shown), shown))
@@ -251,7 +259,7 @@ pub fn failure_signature(result: &str) -> Option<(String, String)> {
     if let Some(line) = lines.iter().find(|l| strong_error(&l.to_lowercase())) {
         return pick(line);
     }
-    if !failed {
+    if ending == Some("[exit code 0]") {
         return None;
     }
     if let Some(line) = lines.iter().find(|l| weak_error(&l.to_lowercase())) {
@@ -259,6 +267,11 @@ pub fn failure_signature(result: &str) -> Option<(String, String)> {
     }
     let last = lines.iter().rev().find(|l| Some(**l) != ending).copied().unwrap_or("");
     pick(&format!("{} {last}", ending.unwrap_or("")))
+}
+
+/// A bash call's command.
+fn command_of(arguments: &str) -> Option<String> {
+    serde_json::from_str::<Value>(arguments).ok()?.get("command")?.as_str().map(str::to_string)
 }
 
 /// The failing-command key of a call: bash only, by its command's key and the flags that change where it runs.
@@ -296,7 +309,16 @@ impl FailureLoopState {
             return;
         }
         let Some(key) = command_call_key(name, arguments) else { return };
+        // Only Marv's own words (the note of a call this guard didn't run): nothing ran, nothing to learn.
+        if result.lines().map(str::trim).all(|l| l.is_empty() || l.starts_with("Marv:")) {
+            return;
+        }
         match failure_signature(result) {
+            // A success that may have changed things (`npm install`) gives every command a fresh start; a probe
+            // that only reads (`echo test`, `whoami`) changes nothing.
+            None if !command_of(arguments).is_some_and(|c| marv_core::command::is_read_only_command(&c)) => {
+                self.failures.clear();
+            }
             None => {
                 self.failures.remove(&key);
             }
@@ -513,9 +535,11 @@ mod tests {
         let (normalized, shown) = failure_signature(OFFLINE).unwrap();
         assert!(shown.starts_with("fatal: unable to access"));
         assert_eq!(normalized, shown.to_lowercase());
-        // Whatever the exit code: `|| true` hid it, the output didn't.
+        // Exit 0 isn't a failure, unless bash's network note says `|| true` hid one.
         let hidden = OFFLINE.replace("[exit code 128]", "[exit code 0]");
-        assert_eq!(failure_signature(&hidden).unwrap().1, shown);
+        assert!(failure_signature(&hidden).is_none());
+        let noted = OFFLINE.replace("[exit code 128]", &format!("{NETWORK_NOTE_START}.\n\n[exit code 0]"));
+        assert_eq!(failure_signature(&noted).unwrap().1, shown);
         // Line numbers and durations don't make it new.
         assert_eq!(
             failure_signature("error: x.rs:12 broke\n\n[exit code 1]").unwrap().0,
@@ -577,5 +601,53 @@ mod tests {
         assert!(other.repeated("bash", &test).is_none());
         other.record("bash", &test, "error[E0425]: cannot find value\n\n[exit code 101]");
         assert!(other.repeated("bash", &test).is_some());
+    }
+
+    // Greptile on #111: the guard must never block useful work.
+
+    #[test]
+    fn a_successful_read_of_error_text_never_counts() {
+        let mut state = FailureLoopState::default();
+        let grep = bash("grep -i error app.log");
+        for _ in 0..4 {
+            state.record("bash", &grep, "error: disk full at 10:42\nerror: retrying\n\n[exit code 0]");
+        }
+        assert!(state.repeated("bash", &grep).is_none());
+        assert!(failure_signature("fatal: something\n\n[exit code 0]").is_none());
+    }
+
+    #[test]
+    fn a_clone_hidden_by_or_true_still_counts_when_it_carries_the_network_note() {
+        let hidden = format!(
+            "fatal: unable to access 'https://github.com/x/y/': Could not resolve host: github.com\n\n{NETWORK_NOTE_START}, and its failure looks like it may come from that.\n\n[exit code 0]"
+        );
+        let mut state = FailureLoopState::default();
+        let clone = bash("git clone https://github.com/x/y || true");
+        state.record("bash", &clone, &hidden);
+        state.record("bash", &clone, &hidden);
+        assert!(state.repeated("bash", &bash("git clone https://github.com/x/y")).is_some());
+    }
+
+    #[test]
+    fn a_successful_command_that_may_change_things_resets_every_count_a_probe_doesnt() {
+        let test = bash("npm test");
+        let failing = "error: 3 tests failed\n\n[exit code 1]";
+        let twice = || {
+            let mut state = FailureLoopState::default();
+            state.record("bash", &test, failing);
+            state.record("bash", &test, failing);
+            state
+        };
+        let mut probed = twice();
+        probed.record("bash", &bash("echo test"), "test\n\n[exit code 0]");
+        probed.record("bash", &bash("whoami"), "me\n\n[exit code 0]");
+        assert!(probed.repeated("bash", &test).is_some());
+        let mut installed = twice();
+        installed.record("bash", &bash("npm install"), "added 3 packages\n\n[exit code 0]");
+        assert!(installed.repeated("bash", &test).is_none());
+        // A failed install changed nothing that counts.
+        let mut failed = twice();
+        failed.record("bash", &bash("npm install"), "npm ERR! network\n\n[exit code 1]");
+        assert!(failed.repeated("bash", &test).is_some());
     }
 }

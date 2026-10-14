@@ -109,6 +109,13 @@ pub fn looks_like_network_failure(command: &str, output: &str) -> bool {
     network_errors().is_match(output) || network_commands().is_match(command)
 }
 
+/// Whether a command that exited 0 hid a failure like the missing network's behind `||` (`git clone … || true`, #81):
+/// it has a `||`, it's a command that needs the network, and its output has a network error. Stricter than
+/// [`looks_like_network_failure`], since nothing failed as far as the exit code says.
+pub fn hidden_network_failure(command: &str, output: &str) -> bool {
+    command.contains("||") && network_commands().is_match(command) && network_errors().is_match(output)
+}
+
 /// Whether the command runs `gh` (the gh note follows the network note).
 pub fn runs_gh(command: &str) -> bool {
     gh_command().is_match(command)
