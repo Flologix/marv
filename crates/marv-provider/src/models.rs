@@ -36,6 +36,8 @@ pub struct ModelInfo {
     /// Runs on this machine (Ollama).
     pub local: bool,
     pub reasoning: Option<ReasoningSupport>,
+    /// Marv #96: the most tokens one reply may have (OpenRouter's `top_provider.max_completion_tokens`), when known.
+    pub max_output: Option<u64>,
 }
 
 /// One entry of OpenRouter's `/models` list (only the fields Marv reads).
@@ -50,6 +52,14 @@ pub struct OpenRouterModel {
     pub supported_parameters: Option<Vec<String>>,
     #[serde(default)]
     pub reasoning: Option<OpenRouterReasoning>,
+    #[serde(default)]
+    pub top_provider: Option<OpenRouterTopProvider>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct OpenRouterTopProvider {
+    #[serde(default)]
+    pub max_completion_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -81,6 +91,7 @@ pub fn from_openrouter(data: Vec<OpenRouterModel>) -> Vec<ModelInfo> {
                 reasoning: m
                     .reasoning
                     .map(|r| if r.mandatory == Some(true) { ReasoningSupport::Mandatory } else { ReasoningSupport::Optional }),
+                max_output: m.top_provider.and_then(|t| t.max_completion_tokens).filter(|&n| n > 0),
                 id: m.id,
             }
         })
@@ -223,7 +234,7 @@ mod tests {
     #[test]
     fn openrouter_list_keeps_tool_capable_non_batch_models() {
         let json = r#"[
-            {"id":"a/tools","context_length":1000,"pricing":{"prompt":"0.000002","completion":"0.00001","input_cache_read":"0.0000002"},"supported_parameters":["tools"],"reasoning":{"mandatory":true}},
+            {"id":"a/tools","context_length":1000,"pricing":{"prompt":"0.000002","completion":"0.00001","input_cache_read":"0.0000002"},"supported_parameters":["tools"],"reasoning":{"mandatory":true},"top_provider":{"max_completion_tokens":800}},
             {"id":"a/tools:batch","supported_parameters":["tools"]},
             {"id":"a/chat","supported_parameters":["temperature"]},
             {"id":"a/opt","supported_parameters":["tools"],"reasoning":{}}
@@ -237,5 +248,7 @@ mod tests {
         assert_eq!(models[0].reasoning, Some(ReasoningSupport::Mandatory));
         assert_eq!(models[1].reasoning, Some(ReasoningSupport::Optional));
         assert_eq!(models[1].price_in, None);
+        // #96: the output limit, when the list knows it.
+        assert_eq!((models[0].max_output, models[1].max_output), (Some(800), None));
     }
 }
