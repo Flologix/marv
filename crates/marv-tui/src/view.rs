@@ -402,7 +402,7 @@ pub enum UiEvent {
         turn: String,
     },
     Status(TurnStatus),
-    /// Streamed reply text. The UI batches these (see `app` STREAM_FLUSH_MS).
+    /// Streamed reply text. The UI batches these (see `app`: revealed at a pace, `REVEAL_MS`).
     TextDelta(String),
     /// The model's private reasoning, previewed by `ThinkingView`.
     ThinkingDelta(String),

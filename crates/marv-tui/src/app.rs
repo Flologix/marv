@@ -26,11 +26,16 @@
 //!   didn't change the martian's pose) draws nothing. Draws are capped at
 //!   `render_options::MAX_FPS`; ratatui then writes only the changed cells, wrapped in
 //!   synchronized output.
-//! - **Batch streamed text (~30 fps).** Deltas are appended to a pending buffer and reach the
-//!   transcript state at most every [`STREAM_FLUSH_MS`] (33 ms, Marv's value: Ink drew at most 30
-//!   frames/s, and updating on every token re-parsed the whole Markdown reply for frames nobody
-//!   saw). Step ends ([`STEP_ENDS`]) flush at once; subagents' progress joins the same flush. The
-//!   loop drains every queued `UiEvent` before drawing, so a burst of tokens is one frame.
+//! - **Reveal streamed text at a pace.** Deltas are appended to a pending buffer, and the reply and
+//!   the reasoning are revealed from it a share at a time, one share per frame: each frame shows
+//!   1/7 of what's still hidden (at least [`REVEAL_MIN_CHARS`]), so a burst drains over about
+//!   [`REVEAL_MS`]. Providers send tokens in clumps (one network read every 50–150 ms), and Marv
+//!   drew each clump at once every 33 ms, so text came in jerks; spreading each clump over the
+//!   frames until the next one makes it flow. **This is a deliberate difference from Marv**, which
+//!   batched at a fixed 33 ms. A backlog over [`REVEAL_CATCH_UP`] characters (a huge chunk, or a
+//!   resumed stream) is shown at once rather than replayed. Step ends ([`STEP_ENDS`]) show
+//!   everything at once; subagents' progress and tool drafts join each reveal unpaced. The loop
+//!   drains every queued `UiEvent` before drawing, so a burst of tokens is one frame.
 //! - **Cull the viewport.** Marv patched Ink to skip drawing nodes outside the visible rows (a
 //!   60-entry session took ~270 ms per keystroke unpatched, ~30 ms patched). Here each transcript
 //!   entry caches its wrapped lines per width (memoised like Marv's `MessageView`), the scroll view
@@ -109,8 +114,13 @@ use marv_core::{StopReason, Usage};
 pub const EXIT_CONFIRM_MS: Duration = Duration::from_millis(1500);
 /// How long a status bar flash ("Copied 3 lines") stays.
 pub const NOTICE_MS: Duration = Duration::from_millis(2000);
-/// Streamed text reaches the transcript at most this often (~30 fps).
-pub const STREAM_FLUSH_MS: Duration = Duration::from_millis(33);
+/// A burst of streamed text is revealed over about this long (see the module docs): long enough to
+/// cover the gap between a provider's network reads, short enough that the reply never lags far.
+pub const REVEAL_MS: Duration = Duration::from_millis(120);
+/// The least a reveal step shows, so the end of a burst doesn't crawl out one character at a time.
+pub const REVEAL_MIN_CHARS: usize = 2;
+/// More hidden than this is shown at once: replaying it would leave the reply seconds behind.
+pub const REVEAL_CATCH_UP: usize = 2000;
 /// How long `run` waits for `SessionPort::flush` after the terminal is restored.
 pub const FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -496,7 +506,7 @@ impl App {
             self.finish_splash(now);
         }
         if self.flush_at.is_some_and(|at| now >= at) {
-            self.flush();
+            self.show_streamed(Some(now));
         }
         if self.phase != Phase::Main {
             return;
@@ -968,15 +978,29 @@ impl App {
     }
 
     fn schedule_flush(&mut self, now: Instant) {
-        self.flush_at.get_or_insert(now + STREAM_FLUSH_MS);
+        self.flush_at.get_or_insert(now + FRAME_INTERVAL);
     }
 
-    /// Streamed text, reasoning, the draft and subagents' progress reach the screen.
+    /// Everything streamed so far reaches the screen at once (a step ended).
     fn flush(&mut self) {
+        self.show_streamed(None);
+    }
+
+    /// Streamed text, reasoning, the draft and subagents' progress reach the screen. `paced`: the
+    /// reply and reasoning show only their next share ([`next_reveal`]), and if more is hidden the
+    /// next share is due a frame from `now`.
+    fn show_streamed(&mut self, paced: Option<Instant>) {
         self.flush_at = None;
         let Some(mut t) = self.turn.take() else { return };
-        self.streaming = Some(t.reply.clone());
-        self.thinking.clone_from(&t.thought);
+        let (reply, reply_behind) = next_reveal(self.streaming.as_deref().unwrap_or(""), &t.reply, paced.is_some());
+        let (thought, thought_behind) = next_reveal(&self.thinking, &t.thought, paced.is_some());
+        self.streaming = Some(reply.to_owned());
+        self.thinking = thought.to_owned();
+        if let Some(now) = paced
+            && (reply_behind || thought_behind)
+        {
+            self.flush_at = Some(now + FRAME_INTERVAL);
+        }
         self.draft.clone_from(&t.draft);
         t.log_changed = false;
         let progress: Vec<_> = t.progress.drain().collect();
@@ -1475,6 +1499,23 @@ fn unix_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
 
+/// What to show of `full` when `shown` is on screen, and whether more is still hidden after it.
+/// Unpaced: all of it. Paced: a seventh of what's hidden (`REVEAL_MS` over the frame interval), at
+/// least [`REVEAL_MIN_CHARS`], or all of it past [`REVEAL_CATCH_UP`]. Text that no longer starts
+/// with `shown` (a new step's reply, a retry) is revealed from its start. Cuts on char boundaries.
+fn next_reveal<'a>(shown: &str, full: &'a str, paced: bool) -> (&'a str, bool) {
+    let start = if full.starts_with(shown) { shown.len() } else { 0 };
+    let hidden = &full[start..];
+    let behind = hidden.chars().count();
+    if !paced || behind <= REVEAL_MIN_CHARS || behind > REVEAL_CATCH_UP {
+        return (full, false);
+    }
+    let frames = (REVEAL_MS.as_micros() / FRAME_INTERVAL.as_micros()).max(1) as usize;
+    let n = behind.div_ceil(frames).max(REVEAL_MIN_CHARS);
+    let end = start + hidden.char_indices().nth(n).map_or(hidden.len(), |(i, _)| i);
+    (&full[..end], end < full.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1494,11 +1535,27 @@ mod tests {
     }
 
     #[test]
+    fn a_reveal_shows_a_share_of_what_is_hidden_on_char_boundaries() {
+        // Unpaced, or nearly caught up: everything.
+        assert_eq!(next_reveal("", "hello world", false), ("hello world", false));
+        assert_eq!(next_reveal("hello wor", "hello world", true), ("hello world", false));
+        // Paced: a seventh of the 70 hidden chars.
+        let full = "x".repeat(70);
+        assert_eq!(next_reveal("", &full, true), (&full[..10], true));
+        // Never fewer than the minimum, and a cut never splits a char.
+        let (shown, more) = next_reveal("", "éééééééé", true);
+        assert_eq!((shown, more), ("éé", true));
+        // A huge backlog isn't replayed; text that doesn't continue what's shown starts over.
+        let big = "y".repeat(REVEAL_CATCH_UP + 1);
+        assert_eq!(next_reveal("", &big, true), (big.as_str(), false));
+        assert_eq!(next_reveal("old reply", &full, true), (&full[..10], true));
+    }
+
+    #[test]
     fn step_ends_match_marv() {
         assert!(is_step_end(&UiEvent::Assistant { text: String::new() }));
         assert!(is_step_end(&UiEvent::Done(marv_core::StopReason::End)));
         assert!(!is_step_end(&UiEvent::TextDelta("x".into())));
-        assert_eq!(STREAM_FLUSH_MS, Duration::from_millis(33));
     }
 
     // --- a fake engine ---
@@ -1602,8 +1659,19 @@ mod tests {
             for e in events {
                 self.event(e);
             }
-            // Past the stream flush.
-            self.advance(40);
+            self.settle();
+        }
+
+        /// Frame by frame until the streamed text is all revealed (bounded: a reveal always ends).
+        fn settle(&mut self) {
+            self.advance(FRAME_INTERVAL.as_millis() as u64 + 1);
+            for _ in 0..200 {
+                if self.app.flush_at.is_none() {
+                    return;
+                }
+                self.advance(FRAME_INTERVAL.as_millis() as u64 + 1);
+            }
+            panic!("the reveal never finished");
         }
 
         fn key(&mut self, code: KeyCode) {
@@ -1730,10 +1798,14 @@ mod tests {
         h.event(UiEvent::TurnStart { turn: "t".into() });
         h.event(UiEvent::TextDelta("You said: ".into()));
         h.event(UiEvent::TextDelta("hello world".into()));
-        // Not shown until the flush: tokens reach the screen at most every 33 ms.
+        // Not shown until the next frame, and then a share at a time.
         assert!(!h.frame().contains("You said"));
-        assert_eq!(h.app.deadline(), Some(h.now + STREAM_FLUSH_MS).min(h.app.deadline()));
-        h.advance(33);
+        assert_eq!(h.app.deadline(), Some(h.now + FRAME_INTERVAL).min(h.app.deadline()));
+        h.advance(17);
+        let first = h.frame();
+        assert!(first.contains("● You"), "{first}");
+        assert!(!first.contains("You said"), "{first}");
+        h.settle();
         assert!(h.frame().contains("● You said: hello world"));
         h.events([UiEvent::Assistant { text: "You said: hello world".into() }, UiEvent::Done(StopReason::End), turn_end()]);
         let frame = h.frame();
