@@ -483,7 +483,7 @@ mod run_tests {
     use std::path::{Path, PathBuf};
 
     use marv_core::{ProviderEvent, ToolCall, Usage};
-    use marv_provider::{EventStream, Provider, ProviderFactory, ReasoningSupport, StreamOptions};
+    use marv_provider::{EventStream, Provider, ProviderFactory, StreamOptions};
     use marv_sandbox::sandbox_available;
     use marv_tools::ToolOutcome;
     use tokio_util::sync::CancellationToken;
@@ -578,7 +578,7 @@ mod run_tests {
         fn model(&self) -> &str {
             "test-model"
         }
-        fn make(&self, model: Option<&str>, _info: Option<ReasoningSupport>) -> Arc<dyn Provider> {
+        fn make(&self, model: Option<&str>, _info: Option<&marv_provider::ModelInfo>) -> Arc<dyn Provider> {
             lock(&self.models).push(model.map(str::to_string));
             self.provider.clone()
         }
