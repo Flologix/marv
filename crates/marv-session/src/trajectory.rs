@@ -100,6 +100,9 @@ pub enum TrajectoryRecord {
     },
     /// Deferred MCP tools (#14): the note at the start of the turn's message.
     McpNote { turn: String, text: String },
+    /// marv-rs (#108): a session-start hook whose output starts the turn's message (`exit_code` null: killed or
+    /// couldn't start; `bytes`: its whole output, before the cut).
+    Hook { turn: String, command: String, exit_code: Option<i32>, timed_out: bool, bytes: usize, ms: u64 },
     /// One model request: its tokens and how long since the previous step ended.
     Request {
         #[serde(flatten)]

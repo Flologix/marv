@@ -18,6 +18,7 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ### Added
 
+- **Session-start hooks (#108).** `"hooks": {"sessionStart": ["bd ready", {"command": "…", "timeout": 5}]}` in `~/.marv/config.json` runs those commands whenever a conversation starts (Marv's start, `marv -p`, `/clear`, a resume; never in subagents) and sends their output to the model once, at the start of the first message, labelled with each command. It stays out of the system prompt, so the prompt cache still holds. Each hook has a timeout (default 15 s) and an 8 KB output cap; a failure or a timeout is a one-line note and never blocks the start. The TUI shows one line per hook; trajectories get a `hook` record. Hook output is quoted as data and taints the conversation, like a web page or an MCP result (network commands, web, MCP and mesh calls ask from then on, even in yolo), because what a command prints can come from anyone; `"trusted": true` on a hook opts it out, and a hook that prints nothing taints nothing. Hooks are read only from your own config: a project's `.marv/config.json` naming `hooks` is refused with a startup note and never run.
 - **Real-model evals (#73).** `evals/bench.py` runs Marv's 20 eval tasks through `marv -p`, and through `claude -p` for comparison, grades them with each task's hidden tests, and reports pass rate, time, requests, tool calls, tokens and cost. See `evals/README.md`.
 
 ## [0.4.0] - 2026-10-14

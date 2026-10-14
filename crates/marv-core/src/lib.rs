@@ -193,13 +193,16 @@ pub enum Provenance {
     Mesh,
     Subagent,
     Image,
+    /// A session-start hook's output (#108): the user chose the command, not what it prints (`bd ready` lists issue
+    /// titles anyone can file). A hook marked `trusted` in the user's config doesn't taint.
+    Hook,
 }
 
 impl Provenance {
     /// Whether text from this source taints the session (exfiltration-capable
     /// calls ask from then on, even in yolo).
     pub fn taints(self) -> bool {
-        matches!(self, Self::Web | Self::Mcp | Self::Mesh | Self::Image)
+        matches!(self, Self::Web | Self::Mcp | Self::Mesh | Self::Image | Self::Hook)
     }
 }
 

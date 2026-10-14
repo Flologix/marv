@@ -423,10 +423,17 @@ pub async fn run_headless(options: HeadlessOptions) -> ExitCode {
     if options.resume_latest {
         builder = builder.resume(marv_session::ResumeTarget::Latest);
     }
+    let user_config = ConfigStore::new(&config_dir).path;
     let o = &mut builder.options;
     (o.sandbox, o.thinking, o.diagnostics, o.checks, o.mcp_tools, o.config_dir) =
         (config.sandbox, config.thinking, config.diagnostics, config.checks, config.mcp_tools, Some(config_dir));
     o.checkpoints = config.checkpoints;
+    // Session-start hooks (#108): from the user's own config file only; a project's naming some is told, never run.
+    let refused;
+    (o.hooks, refused) = marv_session::hooks::session_start_hooks(&root, &user_config, file.as_ref());
+    if let Some(refused) = refused {
+        eprintln!("marv: {refused}");
+    }
     // To stderr, so stdout stays the reply: an MCP server that needs a login, a trajectory that can't be written.
     o.on_warning = Some(Arc::new(|text: String| eprintln!("marv: {}", printable(&text))));
     let session = match builder.build().await {
@@ -436,6 +443,11 @@ pub async fn run_headless(options: HeadlessOptions) -> ExitCode {
             return ExitCode::Error;
         }
     };
+    // The hooks (started by a resume already, else now) go with this prompt; one that failed is a line on stderr.
+    session.run_start_hooks();
+    for run in session.start_hooks_done().await.unwrap_or_default().iter().filter(|r| !r.ok()) {
+        eprintln!("marv: session-start hook {}", printable(&run.line()));
+    }
     // With -c the totals include the resumed conversation's: the turn's usage is what this turn added.
     let before = session.usage().totals;
     let code = match session.send(&options.prompt, marv_session::SendOptions::default()) {

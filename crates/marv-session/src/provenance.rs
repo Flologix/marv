@@ -29,6 +29,7 @@ pub fn source_name(provenance: Provenance) -> &'static str {
         Provenance::Mesh => "mesh",
         Provenance::Subagent => "subagent",
         Provenance::Image => "image",
+        Provenance::Hook => "hook",
     }
 }
 
