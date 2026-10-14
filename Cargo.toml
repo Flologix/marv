@@ -34,6 +34,8 @@ tokio-util = "0.7"
 futures = "0.3"
 async-trait = "0.1"
 tracing = "0.1"
+# Test temp folders that are removed when the test ends (#89).
+tempfile = "3"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
