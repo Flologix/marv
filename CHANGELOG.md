@@ -9,6 +9,12 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 ### Fixed
 
 - **`marv -p --approve mcp` approves MCP calls after an MCP read again.** Once a session had read anything from an MCP server, a call made through `mcp_call` (the deferred tools) was refused as "needs the user's approval", because the wrapper asked under its own name instead of the real tool's scope (`mcp:<server>:<tool>`); in the TUI it asked twice. The real tool still asks once the session is tainted, even in yolo, and without `--approve mcp` the call is still refused.
+- **`mesh_list` no longer taints the session when nothing is wired.** Every `mesh_list` result counted as text from another agent, so asking "who's on the mesh?" made every later network command, web request and MCP call ask first, though no other agent had said anything. Now only a list that names wired receptacles (whose descriptions can come from another Marv) taints, as a call's answer and an inbox message do.
+- **A Marv that was killed no longer leaves its mesh socket behind.** `$XDG_RUNTIME_DIR/marv/mesh/` collected a socket for every Marv that didn't exit cleanly; a Marv joining the mesh now removes the sockets nothing listens on.
+
+### Changed
+
+- **`mesh_list` names the other Marvs on this machine**, with the inbox a `mesh_send` would use and a note that the user has to wire it first. Before, the model only saw "nothing is wired", and answered "who's on the mesh?" with nobody while `marv mesh ls` listed several. Names only: their folders and panes stay in `marv mesh ls`.
 
 ### Added
 

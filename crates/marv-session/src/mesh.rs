@@ -354,7 +354,7 @@ impl Tool for MeshTool {
     fn auto_safe(&self, input: &Self::Input, _ctx: &ToolContext) -> bool {
         self.wired(input)
     }
-    async fn run(&self, input: &Self::Input, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+    async fn run(&self, input: &Self::Input, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let target = self.target(input);
         if let Some((receptacle, mode)) = &target
             && let Err(err) = self.ask_for_wire(receptacle, *mode).await
@@ -365,15 +365,38 @@ impl Tool for MeshTool {
             Ok(mut client) => marv_mesh::tools::run(&mut client, self.name, input).await,
             Err(err) => Err(err),
         };
-        Ok(match result {
-            // A send's acknowledgement is Marv's sentence; a list or a call's answer comes from the mesh (taints).
-            Ok(text) if self.name == MESH_SEND => ToolOutput::ok(text, "sent"),
-            Ok(text) => ToolOutput {
-                provenance: Provenance::Mesh,
-                ..ToolOutput::ok(text, if self.name == MESH_LIST { "listed" } else { "answered" })
+        let mut answer = match result {
+            Ok(answer) => answer,
+            Err(err) => return Ok(ToolOutput::error(err.to_string())),
+        };
+        // The list also names the other Marvs on the machine: a model asked "who's on the mesh?" otherwise only
+        // learns that nothing is wired, while `marv mesh ls` shows several.
+        // `list` probes every door at once, each for DOOR_TIMEOUT at most, so a hung Marv delays the list by that
+        // and drops out alone; a stopped turn stops waiting.
+        let peers = match self.mesh.peer_dir().filter(|_| self.name == MESH_LIST) {
+            Some(dir) => tokio::select! {
+                found = marv_mesh::discovery::list(&dir) => found.ok(),
+                _ = ctx.cancel.cancelled() => None,
             },
-            Err(err) => ToolOutput::error(err.to_string()),
-        })
+            None => None,
+        };
+        if let Some(peers) = peers
+            && let Some(text) = marv_mesh::tools::peers_text(&self.mesh.session, &peers)
+        {
+            answer.text = format!("{}\n\n{text}", answer.text);
+        }
+        let summary = match self.name {
+            MESH_SEND => "sent",
+            MESH_LIST => "listed",
+            _ => "answered",
+        };
+        // A send's acknowledgement, an empty list and the peers' names are Marv's sentences; a call's answer and the
+        // descriptions of wired receptacles come from the mesh (taints).
+        let mut out = ToolOutput::ok(answer.text, summary);
+        if answer.from_mesh {
+            out.provenance = Provenance::Mesh;
+        }
+        Ok(out)
     }
 }
 
@@ -467,6 +490,66 @@ mod tests {
         assert!(inbox_note(&mesh, &parent.id, &taint).is_none());
         assert_eq!(log.0.lock().unwrap().len(), 2);
         cancel.cancel();
+    }
+
+    struct NoOne;
+    #[async_trait]
+    impl marv_mesh::discovery::PeerApprover for NoOne {
+        async fn approve_wire(&self, _request: WireRequest) -> Option<WireBy> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn mesh_list_names_the_other_marvs_and_taints_only_with_wired_descriptions() {
+        use marv_mesh::discovery::{DoorInfo, open_door};
+        let (mesh, _log, _rt, cancel) = switchboard();
+        let parent = mesh.plug(parent_id()).unwrap();
+        let web_rt = Runtime(std::env::temp_dir().join(format!("ms-web-{}", std::process::id())));
+        let web = Arc::new(Switchboard::new("web", web_rt.0.clone(), Arc::new(Log::default())));
+        web.plug(parent_id()).unwrap();
+        let web_cancel = CancellationToken::new();
+        tokio::spawn(Arc::clone(&web).serve(web_cancel.clone()));
+        let folder = Runtime(std::env::temp_dir().join(format!("ms-mesh-{}", std::process::id())));
+        let info = DoorInfo { cwd: "/work".into(), pane: None };
+        let _own = open_door(mesh.clone(), &folder.0, info.clone(), Arc::new(NoOne)).unwrap();
+        let _web = open_door(web.clone(), &folder.0, info, Arc::new(NoOne)).unwrap();
+
+        let list = tool(MESH_LIST, &parent, &mesh, None);
+        let out = list.run(&serde_json::Map::new(), &ToolContext::new(std::env::temp_dir())).await.unwrap();
+        assert!(out.output.starts_with("Nothing is wired to you"), "{}", out.output);
+        assert!(out.output.contains("- web: peer.web.agent.parent.inbox") && !out.output.contains("- s:"), "{}", out.output);
+        assert_eq!(out.provenance, Provenance::Project, "Marv's own words: no taint");
+
+        // Once something is wired, its description is listed, and that can come from another Marv: it taints.
+        let worker = mesh.plug_next(WORKER).unwrap();
+        let wire = WireRequest {
+            from: worker.id.clone(),
+            to: ReceptacleName::new("agent.parent.inbox").unwrap(),
+            mode: WireMode::Send,
+            asked_by: worker.id.clone(),
+        };
+        mesh.grant(wire, WireBy::Tui).await.unwrap();
+        let out = tool(MESH_LIST, &worker, &mesh, None)
+            .run(&serde_json::Map::new(), &ToolContext::new(std::env::temp_dir()))
+            .await
+            .unwrap();
+        assert!(out.output.starts_with("You're wired to:"), "{}", out.output);
+        assert_eq!(out.provenance, Provenance::Mesh);
+
+        // A Marv that never answers its door doesn't hold the list up past a stopped turn.
+        let _hung = std::os::unix::net::UnixListener::bind(folder.0.join("hung.sock")).unwrap();
+        let stopped = ToolContext::new(std::env::temp_dir());
+        stopped.cancel.cancel();
+        let started = std::time::Instant::now();
+        let out = list.run(&serde_json::Map::new(), &stopped).await.unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_millis(500), "{:?}", started.elapsed());
+        assert!(out.output.starts_with("Nothing is wired to you"), "{}", out.output);
+        // Not stopped: the hung Marv drops out alone, and the one that answered is still listed.
+        let out = list.run(&serde_json::Map::new(), &ToolContext::new(std::env::temp_dir())).await.unwrap();
+        assert!(out.output.contains("- web: peer.web.agent.parent.inbox") && !out.output.contains("hung"), "{}", out.output);
+        cancel.cancel();
+        web_cancel.cancel();
     }
 
     #[tokio::test]
