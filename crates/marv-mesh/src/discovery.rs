@@ -684,11 +684,24 @@ mod tests {
         std::fs::metadata(p).unwrap().permissions().mode() & 0o777
     }
 
+    /// Whether nothing listens on `socket` within a second. A listener closed here can live on for a moment: a child
+    /// that another test is spawning holds a copy of it until its exec.
+    fn gone_soon(socket: &Path) -> bool {
+        (0..100).any(|_| {
+            let gone = nobody_listens(socket);
+            if !gone {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            gone
+        })
+    }
+
     #[tokio::test]
     async fn opening_a_door_sweeps_dead_marvs_sockets_only() {
         let mesh = Runtime::new();
         let _alpha = marv("alpha", &mesh.0, Person::new(None));
         drop(std::os::unix::net::UnixListener::bind(mesh.0.join("dead.sock")).unwrap());
+        assert!(gone_soon(&mesh.0.join("dead.sock")));
         std::fs::write(mesh.0.join("notes.sock"), "not a socket").unwrap();
         let beta = marv("beta", &mesh.0, Person::new(None));
         assert!(!mesh.0.join("dead.sock").exists(), "nothing listens there: swept");
@@ -698,7 +711,7 @@ mod tests {
         let busy = std::os::unix::net::UnixListener::bind(mesh.0.join("busy.sock")).unwrap();
         assert!(!nobody_listens(&mesh.0.join("busy.sock")));
         drop(busy);
-        assert!(nobody_listens(&mesh.0.join("busy.sock")));
+        assert!(gone_soon(&mesh.0.join("busy.sock")));
     }
 
     #[tokio::test]
