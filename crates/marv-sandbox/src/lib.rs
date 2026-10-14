@@ -27,7 +27,7 @@ pub mod taint;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-pub use bwrap::{FileKind, FsProbe, MESH_SOCKET, RealFs, SandboxOptions, sandbox_args, sandbox_available};
+pub use bwrap::{Bind, FileKind, FsProbe, MESH_SOCKET, RealFs, SandboxOptions, sandbox_args, sandbox_available};
 pub use paths::{project_path, resolve_in_project, resolve_within, touches_git};
 pub use protected::{PROTECTED_PATHS, ProtectedPath, ProtectedRule, is_protected, protected_rule};
 pub use taint::TaintState;
@@ -78,6 +78,8 @@ pub struct CommandMounts {
     pub writable: Vec<PathBuf>,
     pub placeholders: Vec<PathBuf>,
     pub project_read_only: bool,
+    /// Mounts of their own (the process door's relay, Marv #51).
+    pub binds: Vec<Bind>,
 }
 
 impl Sandbox {
@@ -101,6 +103,11 @@ impl Sandbox {
     /// The full argv for `script` in the project: `bwrap <args> -- bash -c script`. Protected paths that exist
     /// are mounted read-only (`protected::protected_mounts`).
     pub fn command(&self, root: &Path, mounts: &CommandMounts, script: &str) -> Result<Vec<OsString>, SandboxError> {
+        self.command_argv(root, mounts, &["bash".into(), "-c".into(), script.into()])
+    }
+
+    /// The full argv for `inner` in the project: `bwrap <args> -- inner…` (the process door runs its relay there).
+    pub fn command_argv(&self, root: &Path, mounts: &CommandMounts, inner: &[OsString]) -> Result<Vec<OsString>, SandboxError> {
         let options = SandboxOptions {
             root: root.to_path_buf(),
             home: self.home.clone(),
@@ -113,10 +120,12 @@ impl Sandbox {
             project_read_only: mounts.project_read_only,
             protected: protected::protected_mounts(root),
             mesh_socket: self.mesh_socket.clone(),
+            binds: mounts.binds.clone(),
         };
         let mut argv: Vec<OsString> = vec!["bwrap".into()];
         argv.extend(sandbox_args(&options, &RealFs)?);
-        argv.extend(["--".into(), "bash".into(), "-c".into(), script.into()]);
+        argv.push("--".into());
+        argv.extend(inner.iter().cloned());
         Ok(argv)
     }
 }
