@@ -17,6 +17,7 @@
 //! `marv_core::printable()`.
 
 pub mod agents;
+pub mod checkpoints;
 pub mod checks;
 pub mod commands;
 pub mod config;
