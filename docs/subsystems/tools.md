@@ -16,7 +16,7 @@ Spec: the **Tools**, **Web**, **Skills**, **Memory**, **Subagents** and **Yolo m
 | `src/tools/file-lock.ts` | `file_lock.rs` | **Ported and tested** (a per-path tokio mutex; an entry is dropped once nothing waits on it) |
 | `src/tools/files.ts` | `files.rs` (+ `marv_sandbox::paths`) | **Ported and tested.** The path rules live in marv-sandbox. Here: regular-file checks, `looks_binary`, `list_project_files` (git ls-files through a local `run_git` with `NO_PROGRAMS`, no inherited `GIT_*`, `git_env` pinned, a timeout that errors; the `ignore` walker outside git) |
 | `src/tools/read-file.ts` | `read_file.rs` | **Ported and tested** (end to end through `run_tool`) |
-| `src/tools/skill.ts` | `skill.rs` | **Ported and tested**, including the realpath fix (symlink test) |
+| `src/tools/skill.ts` | `skill.rs` | **Ported and tested**, including the realpath fix (symlink test). #84: the description adds "small, direct requests don't need one" |
 | `src/tools/edit-file.ts` | `edit_file.rs` | **Ported and tested** (end to end through `run_tool`): `run` awaits `before_change` (or Esc), plans again and writes under the file lock, syntax note, fuzzy notes. marv-rs: the `package.json` lifecycle-scripts content rule. Todo: formatter (#67) |
 | `src/tools/write-file.ts` | `write_file.rs` | **Ported and tested** (end to end, `write-tools.test.ts`): create/overwrite/append, CRLF, folders, parallel appends, syntax note, `before_change`. marv-rs: the `package.json` lifecycle-scripts content rule. Todo: formatter (#67) |
 | `src/tools/glob.ts` | `glob.rs` | **Ported and tested.** `globset` with `literal_separator`, checked against Bun.Glob's answers |
