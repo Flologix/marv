@@ -1,0 +1,14 @@
+{"status":"running","type":"status"}
+{"label":"**/*.{js,json}","tool":"glob","type":"tool_start"}
+{"label":"**/*.{js,json}","result":"data/routes.json\npackage.json\nsrc/router.js","tool":"glob","type":"tool_end"}
+{"label":"data/routes.json","tool":"read_file","type":"tool_start"}
+{"label":"data/routes.json","result":"    1→{\n    2→  \"routes\": [\n    3→    { \"path\": \"/\", \"handler\": \"home\", \"methods\": [\"GET\"] },\n    4→    { \"path\": \"/login\", \"handler\": \"login\", \"methods\": [\"GET\", \"POST\"] },\n    5→    { \"path\": \"/users/:id\", \"handler\": \"user\", \"methods\": [\"GET\"] }\n    6→  ]\n    7→}","tool":"read_file","type":"tool_end"}
+{"label":"src/router.js","tool":"read_file","type":"tool_start"}
+{"label":"src/router.js","result":"    1→import { readFileSync } from \"node:fs\";\n    2→\n    3→const { routes } = JSON.parse(readFileSync(new URL(\"../data/routes.json\", import.meta.url), \"utf8\"));\n    4→\n    5→// The route for a method and path, with its :params, or null.\n    6→export function match(method, path) {\n    7→  const parts = path.split(\"/\").filter(Boolean);\n    8→  for (const route of routes) {\n    9→    const pattern = route.path.split(\"/\").filter(Boolean);\n   10→    if (pattern.length !== parts.length || !route.methods.includes(method)) continue;\n   11→    const params = {};\n   12→    if (pattern.every((p, i) => (p.startsWith(\":\") ? ((params[p.slice(1)] = parts[i]), true) : p === parts[i]))) {\n   13→      return { handler: route.handler, params };\n   14→    }\n   15→  }\n   16→  return null;\n   17→}","tool":"read_file","type":"tool_end"}
+{"label":"data/routes.json","tool":"edit_file","type":"tool_start"}
+{"approval":"auto","label":"data/routes.json","result":"Edited data/routes.json: replaced 1 occurrence (+2 −1 lines).","tool":"edit_file","type":"tool_end"}
+{"text":"Added `/users/:id/posts` (GET) and DELETE on `/use","type":"text_delta"}
+{"text":"rs/:id`.","type":"text_delta"}
+{"text":"Added `/users/:id/posts` (GET) and DELETE on `/users/:id`.","type":"assistant"}
+{"reason":"end","type":"done"}
+{"reason":"end","reply":"Added `/users/:id/posts` (GET) and DELETE on `/users/:id`.","steps":4,"type":"result","usage":{"cachedTokens":0,"completionTokens":200,"cost":0.004,"promptTokens":4000}}

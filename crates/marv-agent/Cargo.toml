@@ -1,0 +1,21 @@
+[package]
+name = "marv-agent"
+description = "The agent loop, repetition guards and compaction."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio-util.workspace = true
+marv-core.workspace = true
+marv-provider.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

@@ -1,1 +1,0 @@
-readSync in src/store.ts is going away: make loadSettings (src/settings.ts) use the async read() instead, so loadSettings becomes async, delete readSync, and update everything that uses it, directly or through other functions, so it still works.

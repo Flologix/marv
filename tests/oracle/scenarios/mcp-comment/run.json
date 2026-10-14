@@ -1,0 +1,12 @@
+{
+  "description": "A change, then a comment through the tracker. The model calls mcp__tracker__add_comment by its own name: Marv runs it as mcp_call and says so. The comment lands in __tracker_comments__.json.",
+  "prompt": "Add a `--json` option to `main` in `src/report.js`: with it, main returns the summary as JSON (`JSON.stringify(summary, null, 2)`) instead of the text table; without it, nothing changes. Then comment on issue #7 in the project's issue tracker (the tracker MCP server) with a one-line summary of the change.",
+  "mcp": {
+    "server": "tracker",
+    "data": "tracker.json"
+  },
+  "deliberate": {
+    "security": "Provenance and taint",
+    "why": "marv-rs fences every MCP result as data for the model (docs/SECURITY.md, \"Provenance and taint\": text that isn't from the user or Marv is fenced), so the tool results the model reads, and the events that show them, are wrapped in <untrusted-data source=\"mcp\" …>. Files, tool calls and the exit code are Marv's."
+  }
+}

@@ -1,0 +1,4 @@
+{
+  "compilerOptions": { "target": "ESNext", "module": "Preserve", "allowImportingTsExtensions": true, "noEmit": true, "strict": true },
+  "include": ["src"]
+}

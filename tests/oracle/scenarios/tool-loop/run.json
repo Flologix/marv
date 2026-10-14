@@ -1,0 +1,4 @@
+{
+  "description": "The same read with the same result, step after step: the first loop is answered with a warning instead of running, the second ends the turn (reason loop, exit 2).",
+  "prompt": "What does add() return?"
+}

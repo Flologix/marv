@@ -1,0 +1,6 @@
+[
+  {
+    "issue": 7,
+    "body": "Done: `main` takes `--json` and returns the summary as JSON; the text table stays the default."
+  }
+]

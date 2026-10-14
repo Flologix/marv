@@ -1,5 +1,0 @@
-#!/bin/sh
-# Reviews every pushed commit with Open Code Review and refuses the push when
-# it finds a critical or high-severity problem. See scripts/review-gate.ts.
-# Turned on by `bun install` (package.json "prepare" sets core.hooksPath).
-exec bun "$(git rev-parse --show-toplevel)/scripts/review-gate.ts" --pre-push

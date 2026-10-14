@@ -1,0 +1,2 @@
+# Scenario files are fixtures: CRLF, tabs and trailing spaces are what they test. Git keeps their bytes as they are.
+* -text

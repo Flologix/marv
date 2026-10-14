@@ -1,0 +1,29 @@
+[package]
+name = "marv-tui"
+description = "Terminal UI on ratatui: transcript, approvals, prompt, pickers, the martian."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# marv-tui deliberately does NOT depend on marv-session: the engine implements
+# `view::SessionPort` and sends `view::UiEvent`s, so the two can be built in parallel
+# (and a daemon protocol can sit between them later). See docs/subsystems/tui.md.
+[dependencies]
+marv-core.workspace = true
+tokio.workspace = true
+futures.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+ratatui = "0.30.2"
+crossterm = { version = "0.29.0", features = ["event-stream"] }
+unicode-width = "0.2.2"
+unicode-segmentation = "1.12.0"
+pulldown-cmark = { version = "0.13.4", default-features = false }
+# OSC 52 clipboard fallback (Marv's `osc52`), instead of arboard: it works over ssh and needs no X/Wayland libs.
+base64 = "0.22.1"
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

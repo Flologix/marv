@@ -1,0 +1,4 @@
+{
+  "description": "A change that ripples through callers: two parallel reads, a full rewrite with write_file, edits across files in one step, then a second round for the callers' callers. project/.gitignore is stored as gitignore.oracle.",
+  "prompt": "readSync in src/store.ts is going away: make loadSettings (src/settings.ts) use the async read() instead, so loadSettings becomes async, delete readSync, and update everything that uses it, directly or through other functions, so it still works."
+}

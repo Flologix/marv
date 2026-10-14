@@ -1,0 +1,23 @@
+[package]
+name = "marv-provider"
+description = "Provider trait and adapters: OpenRouter (OpenAI-compatible) and Ollama."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio-util.workspace = true
+marv-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# HTTP: rustls only (a single static binary, no system OpenSSL).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+regex = "1"
+
+[lints]
+workspace = true

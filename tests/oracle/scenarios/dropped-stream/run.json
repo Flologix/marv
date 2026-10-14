@@ -1,0 +1,8 @@
+{
+  "description": "A stream that closes before its finish_reason and [DONE] is retried from scratch (after the 1 s backoff); the partial text is dropped.",
+  "prompt": "What does shout() do?",
+  "deliberate": {
+    "issue": 64,
+    "why": "marv-rs continues after a dropped stream instead of starting over: the retry sends the partial text as an assistant turn and asks the model to continue, and the reply is the partial text plus the rest, said once."
+  }
+}

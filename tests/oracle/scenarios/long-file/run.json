@@ -1,0 +1,4 @@
+{
+  "description": "A file longer than read_file's default 400 lines: the whole-file read stops with a note, grep finds the line, a read with offset and limit shows it, a one-character edit.",
+  "prompt": "formatDuration in src/format.js gets the hours wrong: formatDuration(3725) should be \"1h 2m 5s\". Fix it."
+}

@@ -1,0 +1,4 @@
+{
+  "description": "An empty reply is retried as the same request, a second one gets a nudge, and the third reply answers.",
+  "prompt": "What does add() return?"
+}

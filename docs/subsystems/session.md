@@ -1,0 +1,139 @@
+# marv-session
+
+The UI-free engine: Marv's `MarvSession` and everything around it. It covers config, the system prompt, sessions on disk, trajectories, usage, memory, skills, agent types, subagents, worktrees, git, project checks, diagnostics, slash commands (the engine side) and the SDK. The TUI, headless `marv -p` and the SDK all drive it. It never imports the TUI.
+
+Spec: the **Config**, **Session**, **SDK**, **Skills**, **Memory**, **Subagents**, **Worktrees**, **Diagnostics**, **Project checks**, **Slash commands**, **Tokens and cost**, **Project keys**, **Private files**, **Sessions**, **Trajectories** and **Compaction** bullets in Marv's `CLAUDE.md`, and the matching `tests/*.test.ts`.
+
+## Modules
+
+| Marv (TS) | Rust module | Status |
+|---|---|---|
+| `src/session.ts` | `session.rs` | **Types and API are done:** `SessionEvent`, `TurnStatus`, `TurnEndReason`, `CompactResult`, `SessionInit`, `Configure`, `SendOptions`, `Turn` (a `Stream`; dropping it interrupts), `SessionError`, `check_tool_names`. **Ported and tested:** the constructor, the getters, `send` (starts the turn task), `interrupt`, `clear`, `resume`, `configure` (all or nothing), `rate`, `save`/`snapshot` (`answer_all_calls`), `flush`, `close`, `build_system`, `lookup`, `count`, `nearly_full`, `run_turn` (#11: MCP wait, the turn's settings, trajectory and implicit feedback, compaction before and between steps, the plan (#21: `plan()`, `SessionInit::plan`, the main agent's `PlanHost`, dropped by `clear`, saved and restored by `resume` unless plan is off, handed to compaction while open), the deferred-MCP note and rewrite, the checks hooks, the step-limit question, the subagent sink, `Tainted`), `compact`/`summarize_into`, `save_now`/`schedule_save`/`flush` (writes for a conversation left behind are awaited). Tests: the `session.test.ts` cases whose collaborators exist (`turn_tests`). **Not yet testable:** subagents, worktrees, the MCP wait and deferred mode (needs `McpManager::start`) **Checkpoints (#22, Marv #16):** a `CheckpointTurn` per turn (`ToolContext::checkpoint`; the after in `run_turn` before `TurnEnd`), `Checkpointing` status and `CheckpointFailed` once, the undo note before the user's message, `undo_plan`/`undo`/`checkpoint_problem`, the chain per conversation (clear, resume, a recovery chain when it can't be read), `SessionInit::{checkpoints, checkpoints_dir, checkpoint_store}`, `Configure::checkpoints`; tests: `checkpoints/session_tests.rs` (all of `session-checkpoints.test.ts`). Sprint 4 (marv-rs #23): `SessionInit::{host_commands, github}`, the main agent's host and github doors on its context, github offered (specs, tools, prompt, the reserved name) only where set |
+| `src/sdk.ts` | `sdk.rs` | **Ported:** `SessionBuilder`, `SessionOptions`, `Store`, `no_yolo_reason`, `create_session` (`plan: false` leaves the plan tool out, #21; with the `McpManager`: trust file, logins, the needs-login warning once per server, started in the background), checks tested. `SessionOptions::checkpoints` (Marv's own git dir in `config_dir/checkpoints/<project>`), with `sdk.test.ts`'s checkpoints case. #23: `host_commands`, `github` (gh asked once, before the session; `github_known` when the caller already asked: `marv -p` asks before it joins the mesh) |
+| `src/config/config.ts` (+ `providerFactory` from `src/provider/factory.ts`) | `config.rs` | **Ported and tested:** `preset` (Marv's `PRESETS`), `FileConfig::from_value`/`to_value`, `resolve_config`, `max_steps_from_env`, `ollama_url`, `needs_setup`, `mask_key`, `default_config_dir`, `ConfigStore` (0600), `migrate_legacy_config`, `provider_factory`. The SDK factory's model list is `marv_provider::models::list_models` (#2). `checkpoints` (#22, default on) |
+| `src/prompt.ts` | `prompt.rs` | **Ported and tested:** `system_prompt`, `subagent_prompt`, `cut_instructions`/`read_instructions` (the 20k cut, headings after the cut, fences skipped), `instructions_cut_notice`, `instructions_cut_item`, `PLAN_SENTENCE` (#21: at the end of the tools paragraph only when `plan` is offered). Plan #62 `instruction_files` is a stub. `PromptDoors` and `outside_section` (Marv's `DOOR_PARAGRAPHS`, byte for byte; the process door's paragraph replaces `# Sandbox limits`, #24). **Deliberate differences:** `# Sandbox limits` (Marv #50) and the marv-rs-only `# Your situation` (no screen, no multiplexer, say what you can't do, keep replies short; the home-folder note when cwd is `~`). The oracle leaves `# Your situation` out of its request comparison (`MARV_RS_SECTIONS`). #23: the github and host paragraphs (`github`/`host` set by the session), the subagent's github sentence |
+| `src/processes.ts` | `processes/mod.rs` | **Ported and tested (#24, Marv #51):** `ProcessManager` (`start`, `logs`, `stop`, `list`, `forwards`, `close_all`), `parse_net_tcp`, `listening_ports`, `name_from`, `kill_running` (Marv's exit path, a panic included). `tests/processes.test.ts` is ported as `tests/processes.rs` and `tests/process_exit.rs` (real sandbox) plus the unit tests; `process-tool.test.ts`'s session cases as `tests/process_tool.rs`. `processes/fixture.rs` and `src/bin/marv-process-fixture.rs` stand in for `marv` in those tests (relay, test server, a parent to SIGKILL) |
+| `src/sessions.ts` | `sessions.rs` | **Ported and tested:** `SavedSession` (Marv's field names), `new_session`, `title_of`, `time_ago`, `SessionStore` (save, load, list, latest, the legacy folder), `plan` (#21: kept as JSON, `plan_items()` drops a bad one, not the session). `checkpoints` (`SavedCheckpoints`: the chain id and reported paths) and `pendingNote` (#22), shape-checked on resume the same way |
+| `src/trajectory.ts` | `trajectory.rs` | **Ported and tested:** `TrajectoryRecord` (Marv's JSON shapes, plus `mesh` and `taint`; `checkpoint` and `undo`, #22), `TrajectoryStore`, `Trajectory` (an ordered writer thread, fresh line after a crash, the first error reported once), `AgentRecorder`, `MeshSink`; a tool record's `door` (#23) |
+| `src/trajectory-stats.ts` | `trajectory_stats.rs` | **Ported and tested** (`summarize`, `format_stats`) |
+| `src/usage.ts` | `usage.rs` | **Ported and tested** (`Totals`, `add_usage`, `estimate_cost`, `tokens`, `cost_text`, `usage_report`) |
+| `src/memory.ts` | `memory.rs` | **Ported and tested:** paths, `entries_of`, `load_memory` (moves the legacy file), `memory_section`. `add/find/remove_memory` are re-exported from `marv_tools::memory`, where they're still todo |
+| `src/skills.ts` | `skills.rs` | **Ported and tested** (`load_skills`, `read_skill`, `skill_message`), with the realpath fix |
+| `src/agents.ts` | `agents.rs` | **Ported and tested** (`load_agents`, `parse_agent`, `parse_tools`, `find_agent`, `general_purpose`) |
+| `src/subagent.ts` (+ the preview in `src/tools/agent.ts`) | `subagent.rs` | **Ported and tested (#12):** github only where the session offers it, for reads (no doors in a subagent's context; marv-rs #23).  `stopped_text`, `resolve_type`, `SubagentApprover`, `subagent_context`, `subagent_report`, `run_subagent`, `preview` (the worktree dispatch's approval). `tests/agent-tool.test.ts` is ported (`run_tests`) through `marv_tools::run_tool` with a scripted model, real git and, where bwrap works, the real sandbox |
+| `src/worktree.ts` | `worktree.rs` | **Ported and tested (#12):** `Worktree`, `worktree_env`, `branch_name`, `inspect_repo`, `create_worktree`, `finish_worktree` (Marv's own git dir for the commit, the nested-repo walk, unsigned commits, only this worktree's folder and record removed). `tests/worktree.test.ts` is ported; guards in `tests/guards/tests/worktree.rs` |
+| `src/git.ts` | `git.rs` | **Ported and tested** (`run_git`, async with a timeout; `git_environment`; `git_head`; `run_git_async` (#22): stdout's bytes, Marv's own stdin, a stop; all of `git.test.ts`) |
+| `src/checkpoints/store.ts` | `checkpoints/store.rs` | **Ported and tested (#22):** `CheckpointStore` (`locate`, `snapshot` through a temporary index, `keep_own_bytes`/`may_convert`, `drop_to`, `chain`, `prune`, stale locks cleared once old, `OWN_LIMITS`), `checkpoint_message`, `parse_message`. The store parts of `checkpoints.test.ts` |
+| `src/checkpoints/turn.ts` | `checkpoints/turn.rs` | **Ported and tested (#22):** `CheckpointTurn` (implements `marv_tools::Checkpoint`), `CheckpointOutcome`, `SLOW_MS`; all of `checkpoint-turn.test.ts` |
+| `src/checkpoints/undo.ts` | `checkpoints/undo.rs` | **Ported and tested (#22):** `next_undoable`, `plan_undo`, `apply_undo`, `undo_note`, `undo_request`, `undo_summary`. The undo parts of `checkpoints.test.ts` |
+| `src/checks/load.ts` | `checks/load.rs` | **Ported and tested** (#13): `parse_pattern_check` (patterns compiled with `regress` to validate), `parse_script_check`, `split_patterns`, `load_checks`, `concerns` (`globset`, Bun.Glob semantics) |
+| `src/checks/kind.ts` | `checks/kind.rs` | **Ported and tested** (#13): `runner_command` (redesigned: `marv __run-checks`), `parse_runner`, `violation_key`, `format_violation`, `checks_note` (fenced), `project_check_notice`, `ProjectChecksKind`. The `project-checks.test.ts` loading, runner and after-a-step cases are ported (the after-a-step ones with the runner in-process); the session cases are covered by `run_turn` through `after_step`, and the starter-check cases need Marv's own `.marv/checks` (not ported) |
+| `src/checks/runner.ts` | `checks/runner.rs` | **Ported and tested** (#13): `run_checks` and `main`, run by the hidden `marv __run-checks <spec>` (see the notes). A sandboxed run: `crates/marv-cli/tests/run_checks.rs` |
+| `src/diagnostics/tsc.ts` | `diagnostics/tsc.rs` | **Ported and tested** (`parse_tsc`, `new_errors` via `new_problems`, `format_error`, `missing_interpreter`, `diagnostics_note` (fenced), `detect_checker`, `check_command`; all of `diagnostics-tsc.test.ts`) |
+| `src/diagnostics/turn.ts` | `diagnostics/turn.rs` | **Ported and tested** (#13): `CheckOutcome`, `CheckKind`, `Typecheck`, `new_problems`, `changed_files`, `TurnChecks`, `Checker::turn`/`reset`, the sandboxed runner (`sandboxed`, `sandboxed_options`), `combine_checks`, `check_notice`; all of `diagnostics-turn.test.ts`. The `diagnostics-e2e.test.ts` path (real tsc in the sandbox) is the oracle's `ts-new-type-error` |
+| `src/feedback.ts` | `feedback.rs` | **Ported and tested** (`classify_reply`; the lookarounds are emulated) |
+| `src/file-lock.ts`, `src/private-file.ts` | — | Moved to marv-fs (`docs/subsystems/fs.md`): marv-mcp needs them too |
+| `src/paths.ts` | `paths.rs` | **Ported and tested** (`project_key`, `legacy_project_key`, `shorten_home`, `home_or_above`) |
+| `src/sources.ts` | `sources.rs` | **Ported** (`load_sources`) |
+| `src/event-queue.ts` | `event_queue.rs` | **Ported and tested** (an unbounded channel with one reader) |
+| `src/frontmatter.ts` | `frontmatter.rs` | **Ported and tested** (`serde_norway`) |
+| `src/commands/index.ts`, `sandbox-notice.ts` | `commands.rs` | **Ported and tested:** every command, `run_command`, `help_text`, the `/config`, `/checks`, `/mcp`, `/skills` and `/agents` texts, and the status lines; `/undo` and `/checkpoints` (#22). #24: `/processes` (list, `stop <name>`; `CommandContext::processes`) |
+| `src/tool-draft.ts` | `tool_draft.rs` | **Ported and tested** |
+| `src/types.ts` | `types.rs` | **Done** (`Message`, `Role`, `ToolStatus`, `Notice`): the transcript is saved with sessions |
+| (new) | `runner.rs` | **Done and tested:** `SessionToolRunner` (a read-kind call that asks, the github tool's writes, isn't run concurrently: approvals one at a time, a no stops the rest), `tool_run_from`, `ToolDisplay`, `approval_record` (`ApprovalRecord` lives in marv-agent, re-exported), `SessionApprover`, `AlwaysScopes`, `step_limit_request`, `SessionAgentHost` (`preview` and `run` delegate to `subagent.rs`) |
+| `src/mcp/install/index.ts` (`liveDeps`), `proposal.ts` (the request) | `mcp_install.rs` | **Done, with tests (#27):** `LiveDeps` (`ResolveDeps` over `marv_tools::web::fetch::get`, `fetch_readme` with `GITHUB_TOKEN`/`GH_TOKEN`, `oauth::probe_login`), `add_request` (`AddApproval` → `ApprovalRequest { once: true, must_ask: true }`). Used by the TUI's `/mcp add` and `/mcp search` |
+| (new) | `mcp_tools.rs` | **Done:** `McpToolAdapter` (its kind follows the taint), `ToolSearchTool` and `McpCallTool` (`run_tool` with the real tool, the closest names, the schema once, the #10 string-arguments repair). Tested without a connected server |
+| (new) | `mesh.rs` | **Done, with tests (#15).** `start`, `log_to`, `MeshTool` (over the agent's plug socket; asks for a missing wire), `WireApprover` with `PersonWires` and `HeadlessWires`, `wire_approval`, `headless_grants`, the inbox drain (`inbox_note`, `with_inbox`) and `SubagentPlug`. The end-to-end test (parent and sandboxed subagent over wired inboxes, real bwrap) is `mesh::tests::end_to_end`. Mesh v2 (#16): `MeshTool` finds receptacles on demand (`Switchboard::lookup`: another Marv's inbox, a Herdr pane) and grants through `Switchboard::grant`, so a wire to another Marv waits for that Marv's user and their no is the tool's error; `DoorWires` answers the door with the session's wire approver; `SessionOptions::{mesh, wire_approver}` for `marv -p` |
+| (new) | `provenance.rs` | **Done and tested:** `fence`, `project_note` |
+| (new) | `time.rs` | **Done and tested:** `now_ms`, `iso`, `iso_date` |
+
+`grep -rn 'todo!("port' crates/marv-session` lists what's left.
+
+## The API clients use
+
+```rust
+// Making one: the TUI builds a SessionInit itself; the SDK and `marv -p` use the builder.
+SessionInit::new(root, ProviderChoice::Factory(factory) | ProviderChoice::Option(option)) // then set fields
+MarvSession::new(init) -> Result<MarvSession, SessionError>         // Clone (an Arc inside)
+SessionBuilder::new(cwd, ProviderOption).sources(&[..]).approve(a).yolo(b).persist(Store::Default)
+    .trajectories(..).resume(ResumeTarget::Latest).max_steps(n).build().await -> Result<MarvSession, SessionError>
+
+// Turns. send() must run inside a Tokio runtime. A Turn is a Stream; dropping it interrupts the turn.
+session.send(&str, SendOptions { for_model, cancel }) -> Result<Turn, SessionError>
+turn.next().await -> Option<SessionEvent>;  turn.interrupt();  turn.finish().await  // interrupt + wait for cleanup
+session.interrupt()
+
+pub enum SessionEvent {
+    TurnStart { turn: String },                          // always first
+    Status(TurnStatus),                                  // WaitingForMcp | Compacting | Checking | Running
+    Loop(marv_agent::LoopEvent),                         // the main agent
+    Subagent { call_id: String, event: LoopEvent },
+    SubagentProgress { call_id: String, progress: marv_tools::AgentProgress },
+    Compaction(CompactResult),                           // Compacted { summary, tokens_before } | NotCompacted { reason, error }
+    Check(CheckResult),                                  // the typecheck: CheckOutcome<TsError>
+    Checks(ProjectCheckResult),                          // project checks: CheckOutcome<Violation>
+    Tainted { source: Provenance },                      // marv-rs: show it in the status bar
+    TurnEnd { turn: String, reason: TurnEndReason },     // always last; Done(StopReason) | Interrupted
+}
+// ToolRun::approval is an ApprovalRecord; ToolRun::display downcasts to marv_session::ToolDisplay { diff: Option<DiffShown> }.
+// Notices: diagnostics::check_notice(&CheckResult), checks::project_check_notice(&ProjectCheckResult) (both printable).
+
+// Between turns
+session.compact(Option<&str>).await -> Result<CompactResult, SessionError>
+session.clear().await -> Result<(), SessionError>
+session.resume(ResumeTarget::Latest | ResumeTarget::Id(String)).await -> Result<Option<Resumed>, SessionError>
+session.configure(Configure { provider, thinking, sandbox, yolo, trajectories, diagnostics, checks, max_steps, mcp_tools }) -> Result<(), SessionError>
+session.rate(Feedback { score, note, labels }) -> RateOutcome
+session.save().await -> Result<(), SessionError>;  session.flush().await;  session.close().await
+
+// Reads
+session.id() -> String; busy() -> bool; provider_name() -> String; context_length() -> Option<u64>
+model_info() -> Option<ModelInfo>; memory() -> Option<Memories>; problems() -> &[String]
+usage() -> UsageSnapshot { last, totals, context_length }; tainted() -> Vec<Provenance>
+mcp() -> Option<McpHandle>; mesh() -> Option<MeshHandle>; system_prompt() -> String; conversation() -> Vec<ChatTurn>
+
+// Commands (pure): commands::run_command(line, &CommandContext) -> CommandAction; commands::commands() for the / menu
+```
+
+Approvals: the client supplies an `Arc<dyn marv_tools::Approver>` (`SessionInit::approve`). The TUI answers it from its approval queue. The session wraps it in `SessionApprover`.
+
+## Port notes
+
+- **Shared state.** `MarvSession` is an `Arc` around one `Mutex<State>`. The lock is never held across an `.await`. The conversation is a `marv_agent::History` (`Arc<Mutex<Vec<ChatTurn>>>`), so a mid-turn compaction swaps it in place, as Marv's `splice` did.
+- **A turn runs on its own Tokio task** and pushes into an `EventQueue`. `Turn` reads the queue. Dropping a `Turn` cancels its token, which is Marv's `break`. To wait for the cleanup, use `Turn::finish().await`: `Drop` can't await.
+- **Lengths count `char`s** (Marv counted UTF-16 units). This affects the AGENTS.md cut, titles and the 500-character memory entries.
+- **Token formatting** (`usage::tokens`) uses integer half-up rounding, to match JavaScript's `toFixed` on ties.
+- **Frontmatter YAML** uses `serde_norway`. The YAML error wording differs from Bun's.
+- **Project-check patterns** are JavaScript regexes. Rust's `regex` has another dialect (no lookaround, no backreferences), so they're validated at load and matched in the sandbox with `regress`, an ECMAScript engine. Globs use `globset` with `literal_separator` (Bun.Glob: `*` stays in its folder).
+- **The check runner is redesigned (#13).** Marv sent TypeScript source to `bun -e` inside the sandbox; marv-rs has no TypeScript of its own. The command is `'<marv>' __run-checks '{"checks":[names],"timeoutMs":30000}'`, with the `marv` binary (`current_exe`) mounted read-only (`CheckPass::read_only`). The runner loads the named checks from the read-only project itself, matches the patterns, and runs `.ts` scripts with bun from the sandbox's `PATH` (30 s each, 1 MB of stdout, 500 violations, 16k of stderr, as Marv's). Without bun it ends as `bun -e` did, `bun: command not found` with exit 127, so the missing-interpreter notice still applies.
+- **Project checks are loaded on every pass**, not once per turn and again only after a change to `.marv/checks/`: a check changed some other way (bash) also runs as it now reads.
+- **`RunCheck` takes a `CheckRun`** (command, root, extra read-only paths, timeout) and a cancel token. Marv's runner could throw; here a spawn failure comes back as unreadable output (`[couldn't start the command: …]`), which is reported the same way.
+- **A panicking provider or tool** (Marv: one that throws) is caught around the turn's body (`catch_unwind`): the turn ends with `Error: <message>` and `TurnEnd`, and the session lives on.
+- **`working` is a token** cancelled when the turn's task (or `compact()`) has fully ended; `close()` waits on it. `compact()` frees the session from a drop guard, so a caller dropping its future can't leave it busy.
+- **Mesh (#15):** with a switchboard, the main agent's plug is `parent` (bound in `MarvSession::new`); its inbox is read before each turn's message and after each step, fenced, tainting the session (`Tainted` is now checked after every non-delta loop event, not only after calls). Each subagent gets its own `worker-N` plug, mounted in its sandbox, with the mesh tools and an inbox read between steps; `SessionAgentHost::mesh` carries the switchboard and wire approver. Wires come from `SessionInit::wire_approver`, else a person through `SessionInit::approve` (never the "always" layer or yolo).
+- **Subagents (#12).** `run_subagent` wraps the subagent's loop and `finish_worktree` in `catch_unwind`: a panicking provider or tool (Marv: one that throws) still gets its worktree committed and its branch reported, and a panic while finishing reports `couldn't finish the worktree (…); it's at <dir>.` `finish_worktree` itself never fails: every problem becomes the line the parent reads. A subagent's approver is `SubagentApprover` → `SessionApprover` (its own `AlwaysScopes::for_subagent`, the turn's stop) → the client's. Its tools are `builtin_tools()` ∩ `SUBAGENT_TOOLS` ∩ the type's, in the built-in order (the prompt cache), with `skill` only when there are skills.
+- **Worktree git is async** (`run_git` on `tokio::process`), like the nested-repo walk and the folder's removal; Marv's git calls were synchronous. Two cases aren't ported as written: `worktree.test.ts`'s "inherited `GIT_*` variables" sets `GIT_INDEX_FILE` in the test process (here `git_environment` takes the outer environment as a parameter and is tested in `git.rs`), and `agent-tool.test.ts`'s "if finishing the worktree throws" mocks `finishWorktree` (not possible without a seam; the panic path is covered by the panicking-provider test).
+- **The process door (#24, Marv #51).** `SessionInit::processes` (default true; offered only where bubblewrap works, fixed for the session: it changes the tool list and the prompt) and `process_manager` (tests pass one with a fake home; default: one made with the session, which makes its folder at the first start). The main agent's context gets `doors.process` and the process host; every agent's (subagents' too) gets `forwards`, so its sandboxed bash reaches the servers. Processes outlive turns, `clear()` and `resume()`; `close()` and `stop_processes()` stop them; `processes()`, `stop_process()` and `processes_offered()` are for the client. The SDK's `SessionOptions::processes` mirrors Marv's `processes` option. Without the door, `process` is free as a custom tool name and not offered.
+- **The relay is a hidden subcommand, `marv __relay <spec>` (#24).** Marv sent `relayMain`'s source to `bun -e` inside the sandbox, mounting its own bun at `/run/marv-bun`; the review caught that the published bundle rewrote its `require` into a `__require` that didn't exist there. marv-rs compiles the relay in (`marv_tools::relay`, where bash can use it too) and mounts its own binary (`current_exe`, or a test's fixture via `set_relay_exe`) read-only at `/run/marv-bin`, as `__run-checks` does. The spec is JSON (`{"listen": …}` or `{"connect": [{port, socket}]}`, plus `argv`).
+- **`--die-with-parent` follows the thread** that spawned bwrap (`PR_SET_PDEATHSIG`): processes are spawned from async tasks (runtime workers, or the `block_on` thread), never from a blocking-pool thread that may exit while idle.
+- **Checkpoints (#22).** Marv's tests replaced `store.snapshot` and `store.chain` on the instance; here `CheckpointStore::fake` (`Fake`: a snapshot answer per kind, a delay, a chain error) does it. `marv_tools::Checkpoint::checkpoint` returns nothing, so "a failing checkpoint doesn't fail the call" can't happen by type; the registry test checks a stop while it's taken instead. Paths come back from git as UTF-8 (lossy): a path that isn't UTF-8 keeps what `add -A` stored. `undo_plan()` is `Result<Result<UndoPlan, UndoRefusal>, SessionError>` (the outer error is a busy or closed session); `undo()` fails with `SessionError::Undo` for a stale plan or a failed pre-undo snapshot. Mesh tools take no checkpoint (another agent changes its own project), like MCP tools, `memory` and `agent`.
+- **Trajectory usage** is written with Marv's camelCase field names (`UsageRecord`). `marv_core::Usage` serializes in snake_case, so it isn't used directly.
+
+## marv-rs behaviour changes
+
+- **Fenced project text (fixes a Marv 0.3.0 bug).** The typecheck and project-check notes are now an automatic note in Marv's own words, followed by the project's output inside `<untrusted-data source="project">`. Before, they began `Marv:` and quoted project text verbatim. Guard: `tests/guards/tests/checks.rs`; the oracle's `ts-new-type-error` declares it (`deliberate`, under #41). Results from web, MCP and image tools are fenced the same way in `tool_run_from`. Mesh messages arrive already fenced.
+- **"Always" doesn't answer `must_ask` requests** (tainted egress, protected paths): `SessionApprover`. Guard test: `runner::tests::must_ask_requests_are_never_answered_from_always`.
+- **Subagents don't inherit network, web, MCP or mesh approvals** (`AlwaysScopes::for_subagent`). Their taint is `TaintState::for_subagent()`. In a worktree, `SubagentApprover` never auto-approves `must_ask`.
+- **The config dir comes only from the real environment.** The CLI builds `Env` from `std::env::vars()`. No project file is ever consulted.
+- **Skills, agent files and checks are read only after a realpath containment check** (`marv_sandbox::resolve_within`, or `symlink_metadata` for checks). A symlink out of the project is refused and reported.
+- **A background process's new protected files are removed when it ends** (#24): the same scan bash runs after a command (`protected_snapshot` at the start, `scan_created`/`revert_created` when it stops or exits, the note in its `notes`). Marv had no such scan.
+- **New events and records:** `SessionEvent::Tainted`, plus the `taint` and `mesh` trajectory records.
+
+## Upstream gaps (other crates)
+
+The oracle passes 26 of 29 against marv-rs (#13 added `ts-new-type-error`). What's left elsewhere:
+
+- **marv-mcp:** resolved by #6 (manager lifecycle; the first turn with servers always waits, so `WaitingForMcp` is never skipped).
+- **marv-session (other modules):** resolved: checks and diagnostics (#13), `run_subagent` and `SessionAgentHost::preview` (#12).
+- **marv-agent:** nothing fences tool output by provenance in the loop; the session does it in `tool_run_from`. After `on_full` (or anything else) cancels a turn, the loop checks the stop only after `after_step`, so the session always gives it one (a no-op without checks); otherwise it would send one more request.
+- **marv-tools:** `memory::{add,find,remove}_memory` are todo.

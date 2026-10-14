@@ -1,0 +1,22 @@
+[package]
+name = "marv-oracle"
+description = "The oracle: a fake OpenAI-compatible server and a scenario runner that diffs any marv binary against recordings."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "marv-oracle"
+path = "src/main.rs"
+
+[dependencies]
+# printable(): a diff carries model and tool text, which never reaches the terminal raw.
+marv-core.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
+similar = "2.7"
+
+[lints]
+workspace = true

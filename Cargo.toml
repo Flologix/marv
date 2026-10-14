@@ -1,0 +1,47 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "tests/guards"]
+
+[workspace.package]
+version = "0.4.0"
+edition = "2024"
+license = "MIT"
+authors = ["FlologixAI"]
+repository = "https://github.com/FlologixAI/marv"
+rust-version = "1.99"
+
+[workspace.dependencies]
+# Internal crates
+marv-core = { path = "crates/marv-core" }
+marv-fs = { path = "crates/marv-fs" }
+marv-provider = { path = "crates/marv-provider" }
+marv-agent = { path = "crates/marv-agent" }
+marv-tools = { path = "crates/marv-tools" }
+marv-sandbox = { path = "crates/marv-sandbox" }
+marv-mcp = { path = "crates/marv-mcp" }
+marv-session = { path = "crates/marv-session" }
+marv-mesh = { path = "crates/marv-mesh" }
+marv-tui = { path = "crates/marv-tui" }
+
+# External
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+futures = "0.3"
+async-trait = "0.1"
+tracing = "0.1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+todo = "allow"
+
+# Release binaries (#19): one static binary per target, built once per tag, so the slow settings are worth it.
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

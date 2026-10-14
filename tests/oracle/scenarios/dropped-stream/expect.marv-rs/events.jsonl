@@ -1,0 +1,6 @@
+{"status":"running","type":"status"}
+{"text":"`shout(text)` returns the te","type":"text_delta"}
+{"text":"xt in upper case.","type":"text_delta"}
+{"text":"`shout(text)` returns the text in upper case.","type":"assistant"}
+{"reason":"end","type":"done"}
+{"reason":"end","reply":"`shout(text)` returns the text in upper case.","steps":1,"type":"result","usage":{"cachedTokens":0,"completionTokens":50,"cost":0.001,"promptTokens":1000}}
