@@ -7,6 +7,9 @@
 //!   ("/se" → "/setup"), Tab or → completes it plus a space so arguments can follow, Esc hides the
 //!   menu until the text changes. Hidden while busy.
 //! - Placeholder "Type a message, or / for commands"; the border dims while busy.
+//! - New in marv-rs: after a turn, a suggested next message ([`PromptInput::suggest`]) shows in the empty prompt
+//!   instead of the placeholder. Tab or → takes it into the line; typing anything drops it. Enter on the empty line
+//!   still sends nothing: a suggestion is only ever sent after the user took it and pressed Enter.
 //! - The user's own text is drawn as typed, but pasted text can carry escapes: `printable()` it too.
 //! - Editing is ink-text-input's: ←/→ move the cursor (also with ctrl held), Backspace deletes
 //!   before it; ctrl/alt + a letter types nothing (ctrl+o, ctrl+a). Home/End and Delete are extras.
@@ -69,6 +72,8 @@ pub struct PromptInput {
     pub menu_index: usize,
     /// Esc hides the menu until the text changes again.
     pub dismissed_at: Option<String>,
+    /// The suggested next message, shown while the line is empty.
+    pub suggestion: Option<String>,
 }
 
 impl PromptInput {
@@ -77,6 +82,13 @@ impl PromptInput {
         self.value = value.into();
         self.cursor = self.value.chars().count();
         self.menu_index = 0;
+    }
+
+    /// Offers `text` as the next message, while the line is empty (one typed meanwhile wins).
+    pub fn suggest(&mut self, text: &str) {
+        if self.value.is_empty() {
+            self.suggestion = Some(text.to_string());
+        }
     }
 
     /// Adds a submission to the history (not twice in a row), as the App does on submit.
@@ -106,6 +118,22 @@ impl PromptInput {
     }
 
     pub fn on_key(&mut self, key: KeyEvent, busy: bool, commands: &[CommandInfo]) -> Option<PromptOutcome> {
+        if self.value.is_empty()
+            && !busy
+            && matches!(key.code, KeyCode::Tab | KeyCode::Right)
+            && let Some(suggestion) = self.suggestion.take()
+        {
+            self.set(suggestion);
+            return None;
+        }
+        let outcome = self.edit(key, busy, commands);
+        if !self.value.is_empty() {
+            self.suggestion = None;
+        }
+        outcome
+    }
+
+    fn edit(&mut self, key: KeyEvent, busy: bool, commands: &[CommandInfo]) -> Option<PromptOutcome> {
         let matches = self.menu(busy, commands);
         let highlighted = (!matches.is_empty()).then(|| matches[self.menu_index.min(matches.len() - 1)]);
         if let Some(highlighted) = highlighted {
@@ -182,6 +210,9 @@ impl PromptInput {
     pub fn paste(&mut self, text: &str) {
         let text: String = text.chars().map(|c| if c == '\n' || c == '\r' { ' ' } else { c }).collect();
         self.type_text(&text);
+        if !self.value.is_empty() {
+            self.suggestion = None;
+        }
     }
 
     /// The text rows inside the box: `> ` then the text, wrapped by cell with a hanging indent,
@@ -190,7 +221,9 @@ impl PromptInput {
         let accent = Style::new().fg(theme::ACCENT);
         let cursor_style = Style::new().add_modifier(Modifier::REVERSED);
         if self.value.is_empty() {
-            let placeholder = if busy { "" } else { PLACEHOLDER };
+            // The model's words: printable() like everything it writes.
+            let suggested = self.suggestion.as_deref().map(|s| format!("{}  (tab)", printable(s)));
+            let placeholder = if busy { "" } else { suggested.as_deref().unwrap_or(PLACEHOLDER) };
             let mut chars = placeholder.chars();
             let first = chars.next().map_or_else(|| " ".to_string(), |c| c.to_string());
             let line = Line::from(vec![
@@ -512,6 +545,31 @@ mod tests {
         let frame = h.frame();
         assert_eq!(h.prompt.height(60, false, &h.commands), 4);
         assert!(frame.lines().nth(2).unwrap().starts_with("│   xxx"), "{frame}");
+    }
+
+    #[test]
+    fn a_suggestion_shows_in_the_empty_prompt_and_tab_takes_it_but_never_sends_it() {
+        let mut h = Harness::new(&[]);
+        h.prompt.suggest("run the tests\x1b[2J");
+        assert!(h.frame().contains("> run the tests  (tab)"), "the escape isn't drawn: {}", h.frame());
+        h.press(&[KeyCode::Enter]);
+        assert_eq!(h.submitted, [""], "Enter sends the empty line (which the App ignores), not the suggestion");
+        h.press(&[KeyCode::Tab]);
+        assert_eq!(h.prompt.value, "run the tests\x1b[2J");
+        assert_eq!(h.prompt.suggestion, None);
+        h.prompt.set("");
+        // Typing drops it, and it doesn't come back when the line is emptied again.
+        h.prompt.suggest("commit this");
+        h.typed("n");
+        assert_eq!(h.prompt.suggestion, None);
+        h.press(&[KeyCode::Backspace]);
+        assert!(h.frame().contains("> Type a message"), "{}", h.frame());
+        // → takes it too; one that arrives after typing started is dropped.
+        h.prompt.suggest("commit this");
+        h.press(&[KeyCode::Right]);
+        assert_eq!(h.prompt.value, "commit this");
+        h.prompt.suggest("something else");
+        assert_eq!(h.prompt.suggestion, None);
     }
 
     #[test]

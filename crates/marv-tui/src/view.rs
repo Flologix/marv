@@ -436,6 +436,8 @@ pub enum UiEvent {
     TurnStart {
         turn: String,
     },
+    /// After a turn: the user's likely next message, for the empty prompt (Tab takes it).
+    Suggestion(String),
     Status(TurnStatus),
     /// Streamed reply text. The UI batches these (see `app`: revealed at a pace, `REVEAL_MS`).
     TextDelta(String),

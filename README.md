@@ -142,6 +142,7 @@ Type `/` to open the command menu: ↑/↓ to choose, Enter to run, Tab or → t
 | PgUp / PgDn, mouse wheel | Scroll the conversation |
 | Drag with the mouse | Select text; it's copied when you let go (drag past the edge to scroll) |
 | ↑ / ↓ | Previous inputs |
+| Tab or → (empty input) | Take the suggested next message shown in the prompt; Enter then sends it |
 
 ### Command-line options
 
@@ -380,7 +381,7 @@ Not yet: `watch` (subscribing to events), unwiring across processes (a wire to a
 | `$XDG_RUNTIME_DIR/marv/` | The mesh's sockets and background processes' relays, while Marv runs |
 | `AGENTS.md` | Project instructions, read into the system prompt at startup |
 
-`~/.marv/config.json` also takes `sandbox`, `yolo`, `thinking`, `trajectories`, `diagnostics`, `checks`, `checkpoints` (each `true` or `false`), `maxSteps`, `mcpTools` (`auto`, `deferred` or `eager`), `contextLength` (Ollama) and `baseUrl` (e.g. Ollama on another machine). The slash commands write most of them for you.
+`~/.marv/config.json` also takes `sandbox`, `yolo`, `thinking`, `trajectories`, `diagnostics`, `checks`, `checkpoints`, `suggestions` (each `true` or `false`), `maxSteps`, `mcpTools` (`auto`, `deferred` or `eager`), `contextLength` (Ollama) and `baseUrl` (e.g. Ollama on another machine). The slash commands write most of them for you.
 
 | Environment variable | Effect |
 |---|---|

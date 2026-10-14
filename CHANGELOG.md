@@ -6,6 +6,11 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+### Added
+
+- **A suggested next message after each turn.** When a reply finishes, Marv asks the model what you'd most likely send next and shows it, dim, in the empty prompt: Tab or → takes it into the line, Enter then sends it; typing anything drops it. It's one short extra request on the conversation's own cached prefix, never added to the conversation, and counted in the totals. Not asked in a tainted session (web, MCP or mesh content could steer it), after an error or a stop, or with `suggestions: false` in the config.
+- **Real-model evals (#73).** `evals/bench.py` runs Marv's 20 eval tasks through `marv -p`, and through `claude -p` for comparison, grades them with each task's hidden tests, and reports pass rate, time, requests, tool calls, tokens and cost. See `evals/README.md`.
+
 ### Fixed
 
 - **`marv -p --approve mcp` approves MCP calls after an MCP read again.** Once a session had read anything from an MCP server, a call made through `mcp_call` (the deferred tools) was refused as "needs the user's approval", because the wrapper asked under its own name instead of the real tool's scope (`mcp:<server>:<tool>`); in the TUI it asked twice. The real tool still asks once the session is tainted, even in yolo, and without `--approve mcp` the call is still refused.
@@ -15,10 +20,6 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 ### Changed
 
 - **`mesh_list` names the other Marvs on this machine**, with the inbox a `mesh_send` would use and a note that the user has to wire it first. Before, the model only saw "nothing is wired", and answered "who's on the mesh?" with nobody while `marv mesh ls` listed several. Names only: their folders and panes stay in `marv mesh ls`.
-
-### Added
-
-- **Real-model evals (#73).** `evals/bench.py` runs Marv's 20 eval tasks through `marv -p`, and through `claude -p` for comparison, grades them with each task's hidden tests, and reports pass rate, time, requests, tool calls, tokens and cost. See `evals/README.md`.
 
 ## [0.4.0] - 2026-10-14
 

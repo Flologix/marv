@@ -817,6 +817,8 @@ pub struct Bridge {
     next_login: AtomicU64,
     /// Servers already said to need a login (at startup or since), so a mid-session expiry is told once.
     told_needs_login: Mutex<std::collections::HashSet<String>>,
+    /// The next-step suggestion being asked for after a turn: a new turn, a command or Esc stops it.
+    suggesting: Mutex<Option<CancellationToken>>,
 }
 
 fn factory(config: &Config, make: &MakeProvider, load: &LoadModels) -> ProviderChoice {
@@ -901,6 +903,7 @@ impl Bridge {
             pending_login: Mutex::default(),
             next_login: AtomicU64::new(0),
             told_needs_login: Mutex::default(),
+            suggesting: Mutex::default(),
         });
         *changed.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(&bridge));
         Ok(bridge)
@@ -1067,6 +1070,7 @@ impl Bridge {
 
     /// Runs one turn's events through the mapping, on its own task.
     fn run_turn(self: &Arc<Self>, text: String, for_model: Option<String>) {
+        self.stop_suggesting();
         // Working from before the turn's task starts, so Herdr hears it before anything the turn asks.
         self.activity.set_busy(true);
         let turn = match self.session.send(&text, SendOptions { for_model, cancel: None }) {
@@ -1087,8 +1091,10 @@ impl Bridge {
             let totals_fn = move || totals(&usage_of.usage().totals);
             let last_of = me.session.clone();
             let last_fn = move || last_of.usage().last;
+            let mut finished = false;
             while let Some(event) = turn.next().await {
                 let end = matches!(event, SessionEvent::TurnEnd { .. });
+                finished |= matches!(event, SessionEvent::TurnEnd { reason: TurnEndReason::Done(StopReason::End), .. });
                 if end {
                     me.activity.set_busy(false);
                 }
@@ -1103,7 +1109,44 @@ impl Bridge {
                 *me.last_checks.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
             }
             me.activity.set_busy(false);
+            // Only after a reply that finished: not after an error, a stop or the step limit.
+            if finished {
+                me.suggest_next();
+            }
         });
+    }
+
+    /// Asks for the user's next message in the background and offers it to the prompt (`Session::suggest`), unless
+    /// `suggestions` is off in the config. A new turn, a command or Esc stops it ([`Self::stop_suggesting`]).
+    fn suggest_next(self: &Arc<Self>) {
+        if !self.config().suggestions {
+            return;
+        }
+        let cancel = CancellationToken::new();
+        if let Some(old) = self.suggesting.lock().unwrap_or_else(|e| e.into_inner()).replace(cancel.clone()) {
+            old.cancel();
+        }
+        let me = self.clone();
+        tokio::spawn(async move {
+            let suggestion = me.session.suggest(cancel.clone()).await;
+            if cancel.is_cancelled() {
+                return;
+            }
+            // Its tokens and cost count like any request's.
+            let usage = me.session.usage();
+            if let Some(last) = usage.last {
+                me.emit(UiEvent::Usage { last, totals: totals(&usage.totals) });
+            }
+            if let Some(text) = suggestion {
+                me.emit(UiEvent::Suggestion(text));
+            }
+        });
+    }
+
+    fn stop_suggesting(&self) {
+        if let Some(cancel) = self.suggesting.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            cancel.cancel();
+        }
     }
 
     /// `/compact [focus]`: shown as a turn (its waiting line, Esc stops it), reported like an automatic one.
@@ -1775,6 +1818,7 @@ impl SessionPort for Port {
     }
 
     fn run_command(&self, line: String) {
+        self.0.stop_suggesting();
         let bridge = self.0.clone();
         let action = bridge.command_action(&line);
         tokio::spawn(async move { bridge.apply(&line, action).await });
@@ -1785,6 +1829,7 @@ impl SessionPort for Port {
     }
 
     fn abort(&self) {
+        self.0.stop_suggesting();
         self.0.session.interrupt();
         if let Some(work) = self.0.busy_work.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
             work.cancel();
@@ -2112,6 +2157,8 @@ mod tests {
             yolo: Some(false),
             diagnostics: Some(false),
             checks: Some(false),
+            // A suggestion is one more request after each turn: off, so each test's scripted replies stay its turns'.
+            suggestions: Some(false),
             ..FileConfig::default()
         }
     }
@@ -2434,6 +2481,29 @@ mod tests {
         port.send("hello".into());
         let seen = until(&mut rx, |e| matches!(e, UiEvent::TurnEnd { .. })).await;
         assert!(seen.iter().any(|e| matches!(e, UiEvent::Assistant { text } if text == "again")));
+    }
+
+    #[tokio::test]
+    async fn after_a_finished_turn_the_next_message_is_suggested_unless_thats_off() {
+        let dirs = Dirs::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let on = FileConfig { suggestions: Some(true), ..asks() };
+        let port = Port(Bridge::start(startup(&dirs, Some(on), vec![say("Fixed it."), say("run the tests")], None), tx).unwrap());
+        port.send("fix it".into());
+        let events = until(&mut rx, |e| matches!(e, UiEvent::Suggestion(_))).await;
+        assert!(matches!(events.last(), Some(UiEvent::Suggestion(t)) if t == "run the tests"), "{events:?}");
+        assert!(events.iter().any(|e| matches!(e, UiEvent::TurnEnd { .. })), "after the turn");
+
+        let dirs = Dirs::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let port =
+            Port(Bridge::start(startup(&dirs, Some(asks()), vec![say("Fixed it."), say("run the tests")], None), tx).unwrap());
+        port.send("fix it".into());
+        until(&mut rx, |e| matches!(e, UiEvent::TurnEnd { .. })).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        while let Ok(event) = rx.try_recv() {
+            assert!(!matches!(event, UiEvent::Suggestion(_)), "suggestions are off");
+        }
     }
 
     #[tokio::test]

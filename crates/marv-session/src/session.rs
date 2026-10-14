@@ -1465,6 +1465,35 @@ impl MarvSession {
         Ok(self.summarize_into(focus, &stop, &provider, factory.as_ref(), info.as_ref()).await)
     }
 
+    /// The user's likely next message (`marv_agent::suggest`), for the TUI's empty prompt; `None` when there's nothing
+    /// to suggest. Asked only while idle, on the conversation's own prefix (the prompt cache), and never added to it.
+    /// Never in a tainted session: text from the web, an MCP server or another agent could steer it, and a suggestion
+    /// is one key away from being sent as the user's own message.
+    pub async fn suggest(&self, cancel: CancellationToken) -> Option<String> {
+        let (provider, factory, info, conversation, system) = {
+            let s = self.state();
+            if self.idle(&s).is_err() {
+                return None;
+            }
+            (s.provider.clone(), s.factory.clone(), s.info.clone(), s.conversation.clone(), s.system.clone())
+        };
+        if !self.tainted().is_empty() {
+            return None;
+        }
+        let history = lock(&conversation).clone();
+        let tools = self.offered().0;
+        let on_usage = |usage: Usage| self.count(&usage, factory.as_ref(), info.as_ref());
+        marv_agent::suggest::suggest(marv_agent::suggest::SuggestOptions {
+            provider: provider.as_ref(),
+            history: &history,
+            system: &system,
+            tools: &tools,
+            cancel,
+            on_usage: Some(&on_usage),
+        })
+        .await
+    }
+
     /// Whether compaction should be tried at all now: nearly full, and no mid-turn summary has failed this turn.
     fn try_compact(&self) -> bool {
         self.nearly_full() && !self.state().mid_turn_compact_failed
@@ -3155,6 +3184,30 @@ mod turn_tests {
         assert_eq!(compactions(&events), [stopped()]);
         assert_eq!(end_reason(&events), TurnEndReason::Interrupted);
         assert_eq!(requests.load(Ordering::SeqCst), 2); // the first answer and the summary: "second" was never sent
+    }
+
+    #[tokio::test]
+    async fn a_suggestion_rides_the_conversation_without_joining_it_and_never_when_tainted() {
+        let dirs = Dirs::new();
+        let provider =
+            Scripted::new(vec![say("Fixed it."), with(used(500), say("run the tests")), say("Ran them."), say("commit this")]);
+        let session = scripted(&dirs, &provider, |_| {});
+        assert_eq!(session.suggest(CancellationToken::new()).await, None, "nothing to go on yet");
+        collect(go(&session, "fix it")).await;
+        let before = session.usage().totals.requests;
+        assert_eq!(session.suggest(CancellationToken::new()).await.as_deref(), Some("run the tests"));
+        assert_eq!(session.usage().totals.requests, before + 1, "the suggestion's request counts");
+        let (sent, _) = &provider.requests()[1];
+        assert_eq!(text_of(sent.last().unwrap()), marv_agent::suggest::INSTRUCTIONS);
+        // The next turn goes on from the conversation as it was: no instruction, no suggestion in it.
+        collect(go(&session, "run the tests")).await;
+        let next = &provider.requests()[2].0;
+        assert!(next.iter().all(|t| text_of(t) != marv_agent::suggest::INSTRUCTIONS), "{next:?}");
+        assert_eq!(next.len(), 3);
+        // Tainted: not even asked.
+        session.inner.taint.mark(Provenance::Web);
+        assert_eq!(session.suggest(CancellationToken::new()).await, None);
+        assert_eq!(provider.requests().len(), 3);
     }
 
     #[tokio::test]

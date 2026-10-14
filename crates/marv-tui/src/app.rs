@@ -712,6 +712,20 @@ impl App {
                 self.plan = (!items.is_empty()).then_some(items);
                 self.dirty = true;
             }
+            // After the turn, outside it: through apply_turn they would start a turn that never ends. Late (the user
+            // started typing, or another turn started): dropped.
+            UiEvent::Suggestion(text) => {
+                if !self.busy() {
+                    self.prompt.suggest(&text);
+                    self.dirty = true;
+                }
+            }
+            // A request outside a turn (the suggestion's) still counts.
+            UiEvent::Usage { last, totals } if self.turn.is_none() => {
+                self.last_usage = Some(last);
+                self.totals = totals;
+                self.dirty = true;
+            }
             event => self.apply_turn(event, now),
         }
     }
@@ -738,7 +752,7 @@ impl App {
             }
         };
         match event {
-            UiEvent::TurnStart { .. } => {}
+            UiEvent::TurnStart { .. } => self.prompt.suggestion = None,
             UiEvent::Status(status) => {
                 self.waiting_for = match status {
                     TurnStatus::WaitingForMcp => Some("Waiting for MCP servers to start…".into()),
@@ -1998,6 +2012,20 @@ mod tests {
         };
         h.events([UiEvent::Usage { last, totals }, turn_end()]);
         assert!(h.frame().contains("1.2k tokens · 83% cached · $0.042 · ollama/qwen3.5:9b · ~/x"));
+    }
+
+    #[test]
+    fn a_suggestion_after_the_turn_fills_the_prompt_without_starting_a_turn() {
+        let mut h = harness();
+        h.typed("go");
+        h.events([UiEvent::TextDelta("Done.".into()), turn_end()]);
+        let totals = Totals { requests: 2, ..Default::default() };
+        let last = h.app.last_usage.unwrap_or_default();
+        h.events([UiEvent::Usage { last, totals }, UiEvent::Suggestion("run the tests".into())]);
+        assert!(!h.app.busy() && h.app.turn.is_none(), "no turn started by the late events");
+        let frame = h.frame();
+        assert!(frame.contains("> run the tests  (tab)"), "{frame}");
+        assert!(!frame.contains("Thinking"), "{frame}");
     }
 
     #[test]
