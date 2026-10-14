@@ -157,8 +157,8 @@ def sandboxed(cmd, ws):
     home = Path.home()
     out = ["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", str(home)]
     path = []
-    # Bun runs the check, and node runs tsc (`#!/usr/bin/env node`) in the TypeScript tasks.
-    for tool in ("bun", "node"):
+    # Bun runs the check, node runs tsc (`#!/usr/bin/env node`) in the TypeScript tasks, git takes the diff.
+    for tool in ("bun", "node", "git"):
         found = shutil.which(tool)
         if not found: continue
         exe = Path(found).resolve()
@@ -211,9 +211,11 @@ class Run:
         res["ms"] = int((time.time() - started) * 1000)
         # What the agent changed, new files too (staged), before the check runs anything. Git runs sandboxed: the
         # repository's config is the agent's to write (a core.fsmonitor or filter command would run on the host).
-        git_in_ws = lambda *args: subprocess.run(sandboxed(["/usr/bin/git", *args], ws), cwd=ws, capture_output=True, text=True)
-        git_in_ws("add", "-A")
-        (logdir / "diff.patch").write_text(git_in_ws("diff", "--cached", "HEAD").stdout)
+        git = str(Path(shutil.which("git")).resolve())
+        git_in_ws = lambda *args: subprocess.run(sandboxed([git, *args], ws), cwd=ws, capture_output=True, text=True)
+        staged, diff = git_in_ws("add", "-A"), git_in_ws("diff", "--cached", "HEAD")
+        failed = next((p for p in (staged, diff) if p.returncode != 0), None)
+        (logdir / "diff.patch").write_text(diff.stdout if not failed else f"# the diff failed: {failed.stderr.strip()}\n")
         if servers:
             recorded = tdir / "out.json"
             write_fresh(ws / COMMENTS, recorded.read_text() if recorded.exists() else "[]")
