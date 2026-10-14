@@ -13,8 +13,8 @@ python3 -I evals/bench.py --harness marv,claude --repeat 5 --label haiku --budge
 python3 -I evals/bench.py --report evals/results/<run> [<run> …]  # the tables again, or several runs side by side
 ```
 
-Needs Python 3, Bun (it runs the checks, and `bun install` in `evals/` fetches the TypeScript compiler on first use),
-git, and bubblewrap to sandbox the checks. Marv uses the OpenRouter key from `OPENROUTER_API_KEY` or `~/.marv`;
+Needs Python 3.10+, Bun (it runs the checks, and `bun install` in `evals/` fetches the TypeScript compiler on first use),
+git, and bubblewrap: the checks run model-written code, so they run only in bubblewrap (no network, cleared environment, empty home, only the workspace writable). Marv uses the OpenRouter key from `OPENROUTER_API_KEY` or `~/.marv`;
 Claude Code its own login.
 
 Options: `--tasks a,b`, `--marv-model` (default `anthropic/claude-haiku-5.5`), `--claude-model` (default

@@ -9,8 +9,8 @@
 
 A task is a folder in evals/tasks: task.md (the request), repo/ (the starting files), check/ (hidden tests, copied in
 only after the agent finishes), solution/ (files that make the check pass, for --verify). Each run gets a fresh git
-repository in a temp folder. The check is `bun test ./__eval__.test.js`, in bubblewrap when there is one (no network,
-only the workspace writable): it runs code the model wrote.
+repository in a temp folder. The check is `bun test ./__eval__.test.js`, only ever in bubblewrap (no network, a cleared
+environment, an empty home, only the workspace writable): it runs code the model wrote.
 
 Marv runs with a throwaway MARV_CONFIG_DIR (provider OpenRouter, the key from OPENROUTER_API_KEY or ~/.marv), so your
 own MCP servers, skills and settings stay out; `--approve files,process,mcp`. Claude Code runs with project settings
@@ -143,6 +143,34 @@ def run_marv(ws, prompt, servers, logdir, a):
     return r
 
 
+def write_fresh(path, text):
+    """Writes `text` to `path`, replacing whatever is there: a symlink the model planted under that name is removed,
+    never written through (it could point at a file of yours), and the write refuses anything that appears meanwhile."""
+    if path.is_symlink() or path.is_file(): path.unlink()
+    elif path.exists(): shutil.rmtree(path)
+    with open(path, "x") as f: f.write(text)
+
+
+def sandboxed(cmd, ws):
+    """`cmd` in bubblewrap: no network, a cleared environment, an empty home and /tmp, and only the workspace writable
+    (the check runs code the model wrote). Bun's own folder comes back read-only when it lives under the home."""
+    home = Path.home()
+    out = ["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", str(home)]
+    path = []
+    # Bun runs the check, and node runs tsc (`#!/usr/bin/env node`) in the TypeScript tasks.
+    for tool in ("bun", "node"):
+        found = shutil.which(tool)
+        if not found: continue
+        exe = Path(found).resolve()
+        path.append(str(exe.parent))
+        if home in exe.parents:
+            install = exe.parent.parent  # ~/.bun, ~/.local/share/mise/installs/node/<v>: that install only
+            out += ["--ro-bind", str(install), str(install)]
+    return out + ["--bind", str(ws), str(ws), "--unshare-all", "--die-with-parent", "--clearenv",
+                  "--setenv", "PATH", ":".join([*path, "/usr/bin", "/bin"]), "--setenv", "HOME", str(home),
+                  "--chdir", str(ws), *cmd]
+
+
 def check(ws, task):
     """Copies the hidden check in (replacing whatever the model left under its names) and runs it."""
     for entry in (TASKS / task / "check").iterdir():
@@ -150,10 +178,7 @@ def check(ws, task):
         if dst.is_symlink() or dst.is_file(): dst.unlink()
         elif dst.exists(): shutil.rmtree(dst)
         (shutil.copytree if entry.is_dir() else shutil.copy)(entry, dst)
-    cmd = [shutil.which("bun") or "bun", "test", "./__eval__.test.js"]
-    if shutil.which("bwrap"):
-        cmd = ["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp",
-               "--bind", str(ws), str(ws), "--unshare-net", "--unshare-pid", "--die-with-parent", "--chdir", str(ws), *cmd]
+    cmd = sandboxed([shutil.which("bun"), "test", "./__eval__.test.js"], ws)
     try:
         p = subprocess.run(cmd, cwd=ws, capture_output=True, text=True, timeout=120)
         return p.returncode == 0, (p.stdout + p.stderr)[-2000:]
@@ -185,14 +210,16 @@ class Run:
         res["ms"] = int((time.time() - started) * 1000)
         if servers:
             recorded = tdir / "out.json"
-            (ws / COMMENTS).write_text(recorded.read_text() if recorded.exists() else "[]")
+            write_fresh(ws / COMMENTS, recorded.read_text() if recorded.exists() else "[]")
         # Only for a check that reads the reply: anywhere else it's one more file in the repo (it would still name
         # what a rename task removed, say).
         if res.get("reply") and any(REPLY_FILE in f.read_text() for f in (TASKS / task / "check").rglob("*.js")):
-            (ws / REPLY_FILE).write_text(res["reply"])
+            write_fresh(ws / REPLY_FILE, res["reply"])
         res["pass_"], output = check(ws, task)
         if not res["pass_"]: res["checkOutput"] = output
-        diff = subprocess.run(["git", "diff", "HEAD", "--", ".", ":!__eval__.test.js", f":!{COMMENTS}", f":!{REPLY_FILE}"],
+        # New files too: staged, so the diff shows them (the workspace is deleted next).
+        subprocess.run(["git", "add", "-A"], cwd=ws, capture_output=True)
+        diff = subprocess.run(["git", "diff", "--cached", "HEAD", "--", ".", ":!__eval__.test.js", f":!{COMMENTS}", f":!{REPLY_FILE}"],
                               cwd=ws, capture_output=True, text=True).stdout
         (logdir / "diff.patch").write_text(diff)
         shutil.rmtree(ws, ignore_errors=True)
@@ -257,6 +284,8 @@ def main():
     a = ap.parse_args()
     if a.report: return report(a.report)
 
+    for tool in ("bun", "bwrap", "git"):
+        if not shutil.which(tool): sys.exit(f"bench.py needs {tool} (the checks run model-written code, in bubblewrap only).")
     if not (EVALS / "node_modules/typescript").exists():
         subprocess.run(["bun", "install", "--frozen-lockfile"], cwd=EVALS, check=True)
     all_tasks = sorted(p.name for p in TASKS.iterdir() if (p / "task.md").exists())
@@ -274,7 +303,8 @@ def main():
             shutil.rmtree(after, ignore_errors=True)
             good = not b and s
             ok &= good
-            print(f"{'ok ' if good else 'BAD'} {t}{' (passes before any change)' if b else ''}{'' if s else ' (solution fails)\n' + output}")
+            note = (" (passes before any change)" if b else "") + ("" if s else " (solution fails)\n" + output)
+            print(f"{'ok ' if good else 'BAD'} {t}{note}")
         sys.exit(0 if ok else 1)
 
     harnesses = a.harness.split(",")
