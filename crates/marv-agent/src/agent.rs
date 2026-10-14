@@ -474,7 +474,8 @@ pub struct AgentOptions {
     /// Checked after a step's calls are all answered, before `after_step`.
     pub on_full: Option<OnFull>,
     pub after_step: Option<AfterStep>,
-    /// #59 (planned): one tools-off wrap-up reply before a hard stop at the step limit.
+    /// #59: one tools-off wrap-up reply before a hard stop at the step limit (no `on_limit`, or it answered
+    /// `Unavailable`). The session sets it for the main agent and subagents.
     pub wrap_up_at_limit: bool,
 }
 

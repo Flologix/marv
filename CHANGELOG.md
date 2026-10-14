@@ -14,6 +14,7 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ### Changed
 
+- **At the step limit, `marv -p` and subagents reply with a wrap-up instead of stopping dead (#59).** When no one can say "keep going" (a subagent at its 50 steps, `marv -p` with or without `--approve`), Marv asks the model once more, with tools off, to say what it finished, what's left and the next step. That summary is what `marv -p` prints and what the parent agent reads as the subagent's report. The exit code is still 2 and the reason still `max_steps`; the tools are still sent, so the prompt cache holds. A call the model makes anyway is not run. The TUI's "Keep going?" is unchanged.
 - **`mesh_list` names the other Marvs on this machine**, with the inbox a `mesh_send` would use and a note that the user has to wire it first. Before, the model only saw "nothing is wired", and answered "who's on the mesh?" with nobody while `marv mesh ls` listed several. Names only: their folders and panes stay in `marv mesh ls`.
 
 ### Added

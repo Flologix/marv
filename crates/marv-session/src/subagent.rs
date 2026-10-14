@@ -366,6 +366,9 @@ async fn drive(
     let mut options =
         AgentOptions::new(host.provider_for(agent_type.model.as_deref()), history, system, specs, runner, ctx.cancel.clone());
     options.max_steps = SUBAGENT_MAX_STEPS;
+    // No one can say "keep going" to a subagent: at its limit it gets one tools-off request to report what it finished
+    // and what's left, so the parent reads a summary rather than only the limit (#59).
+    options.wrap_up_at_limit = true;
     options.after_step = plug.as_ref().map(|p| p.after_step(None, taint));
 
     tally.report();
@@ -799,6 +802,35 @@ mod run_tests {
         assert!(out.result.output.contains(&format!("It hit its {SUBAGENT_MAX_STEPS}-step limit before finishing")));
         assert!(out.result.output.contains("start a new subagent"));
         assert!(!out.result.output.contains("continue"), "{}", out.result.output);
+    }
+
+    #[tokio::test]
+    async fn at_its_step_limit_it_reports_a_wrap_up_instead_of_the_bare_limit() {
+        // #59: no one can say "keep going" to a subagent, so its last request asks for a summary, tools off (still
+        // sent: the cached prefix holds). The summary is its report; Marv's limit line follows it.
+        let f = Fixture::new();
+        let mut steps: Vec<_> = (0..SUBAGENT_MAX_STEPS)
+            .map(|i| use_tool(&format!("r{i}"), "read_file", serde_json::json!({"path": format!("notes-{i}.txt")})))
+            .collect();
+        steps.push(say("Checked 50 files. Left: the tests. Next step: run them."));
+        let provider = Scripted::new(steps);
+        let (host, _) = f.host(provider.clone(), vec![general_purpose()], true);
+        let ctx = ctx_with(host, &Asker::yes(), &f.root.0);
+        let out = run(agent_call(serde_json::json!({"description": "endless", "prompt": "p"}), "a1"), &ctx).await;
+
+        let requests = provider.requests();
+        let last = SUBAGENT_MAX_STEPS as usize;
+        assert_eq!(requests.len(), last + 1);
+        assert_eq!(requests[last].1.tool_choice, marv_core::ToolChoice::None);
+        assert_eq!(provider.tool_names(last), provider.tool_names(last - 1));
+        assert_eq!(requests[last].0.last(), Some(&ChatTurn::User { text: marv_agent::agent::STEP_LIMIT_NOTE.into() }));
+        assert!(
+            out.result.output.starts_with("Checked 50 files. Left: the tests. Next step: run them.\n\n[Marv: It hit its"),
+            "{}",
+            out.result.output
+        );
+        assert!(out.result.is_error);
+        assert!(out.result.summary.starts_with("stopped ·"));
     }
 
     #[tokio::test]

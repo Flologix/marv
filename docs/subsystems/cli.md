@@ -24,7 +24,7 @@ Spec: the startup bullet of Marv's `CLAUDE.md` ("`bin/marv` is the `bin` entryâ€
 |---|---|
 | 0 | The model answered normally (`end`) |
 | 1 | An error: bad config, a provider failure, a bad argument, or an unknown `--approve` |
-| 2 | Stopped: step limit, output limit, or a loop |
+| 2 | Stopped: step limit, output limit, or a loop. At the step limit the reply is the model's wrap-up (what it finished, what's left, the next step; #59) |
 | 3 | An approval it couldn't get: a refused call (even if the turn finished), a decline, or an interrupt |
 
 ## Port notes
