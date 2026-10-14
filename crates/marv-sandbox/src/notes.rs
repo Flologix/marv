@@ -8,7 +8,8 @@
 //!   home was readable, took the missing config and trajectories for real, and searched for them for 21 steps.
 //! - The network note (issue #23): after a fresh `gh auth login`, `gh auth status` without network said the token was
 //!   invalid, and the model walked the user through logging out and in again.
-//! - The gh note (issue #27): the GitHub MCP server is the way to GitHub; never mount gh's config into the sandbox.
+//! - The gh note (issue #27): the GitHub MCP server is the way to GitHub; never mount gh's config into the sandbox. Where
+//!   the session has the github tool (Marv #47), `GH_TOOL_NOTE` points there instead.
 //! - Rust's `regex` has no lookahead: Marv's `(?=…)` word ends are consuming groups here (only `is_match` is used), and
 //!   `touches_hidden_home` checks the character after `~` by hand.
 
@@ -31,6 +32,9 @@ pub const NETWORK_NOTE: &str = "Marv: this command ran in the sandbox without ne
 
 /// Added to the network note when the failed command is `gh`.
 pub const GH_NOTE: &str = "For GitHub, don't suggest gh auth login, and never mount gh's config into the sandbox (a token there must not reach command output): suggest the GitHub MCP server instead, which the user connects in ~/.marv/mcp.json — see Marv's README, \"Connect GitHub\".";
+
+/// [`GH_NOTE`] where the session has the github tool (Marv #47): gh with the user's login is one call away.
+pub const GH_TOOL_NOTE: &str = "For GitHub, use the github tool instead: it runs gh with the user's own login, outside the sandbox (in bash gh has no login, and that's on purpose). Don't suggest gh auth login, and never mount gh's config into the sandbox.";
 
 /// Appended when a sandboxed command leaves processes running in the background: each command runs in its own PID
 /// namespace, so everything it started is killed when it ends, and (without network) its localhost isn't the user's

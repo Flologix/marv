@@ -39,15 +39,16 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 
 use marv_sandbox::git_guard::{GitGuard, git_guard, worktree_git};
 use marv_sandbox::notes::{
-    BACKGROUND_NOTE, BACKGROUND_NOTE_PROCESS, GH_NOTE, GIT_HINT, HOME_NOTE, NETWORK_NOTE, backgrounds_process,
+    BACKGROUND_NOTE, BACKGROUND_NOTE_PROCESS, GH_NOTE, GH_TOOL_NOTE, GIT_HINT, HOME_NOTE, NETWORK_NOTE, backgrounds_process,
     looks_like_network_failure, runs_gh, touches_hidden_home,
 };
 use marv_sandbox::paths::is_inside;
 use marv_sandbox::protected::{ProtectedRule, created_note, nested_git_dirs, protected_snapshot, revert_created, scan_created};
 
+use crate::github::redact::{redact, redacted_note};
 use crate::output::cut_for_model;
 use crate::repair::repair_timeout_field;
-use crate::types::{Preview, Repaired, Scope, Tool, ToolContext, ToolError, ToolOutput};
+use crate::types::{Door, Preview, Repaired, Scope, Tool, ToolContext, ToolError, ToolOutput};
 
 pub const DEFAULT_TIMEOUT_S: u64 = 120;
 pub const MAX_TIMEOUT_S: u64 = 600;
@@ -77,6 +78,8 @@ pub struct RunOptions {
     pub writable: Vec<PathBuf>,
     pub placeholders: Vec<PathBuf>,
     pub project_read_only: bool,
+    /// Not sandboxed: this environment instead of the minimal one (the host door's, `host_env`).
+    pub env: Option<std::collections::BTreeMap<String, String>>,
     /// Sandboxed, without network: the background processes' forwarded ports (Marv #51), each reached through its
     /// socket folder, mounted read-only at `/run/marv/<id>`; a relay listens on the sandbox's 127.0.0.1:<port> for each.
     pub forwards: Vec<crate::types::ProcessForward>,
@@ -124,6 +127,7 @@ pub async fn run_command(
         writable,
         placeholders,
         project_read_only,
+        env,
         forwards,
     } = options;
     let started = |output: String| CommandResult { output, exit_code: None, timeout: Some(timeout), ..Default::default() };
@@ -150,7 +154,10 @@ pub async fn run_command(
     } else {
         let mut cmd = tokio::process::Command::new("bash");
         cmd.arg("-c").arg(&script).env_clear();
-        cmd.env("PATH", &sandbox.path).env("HOME", &sandbox.home).env("LANG", &sandbox.lang).env("TERM", "dumb");
+        match env {
+            Some(env) => cmd.envs(env),
+            None => cmd.env("PATH", &sandbox.path).env("HOME", &sandbox.home).env("LANG", &sandbox.lang).env("TERM", "dumb"),
+        };
         // Its own process group, so killing it also kills everything it started.
         cmd.process_group(0);
         cmd
@@ -213,7 +220,7 @@ pub async fn run_command(
 }
 
 /// A stream's text, up to about [`MAX_CAPTURE`] (whole chunks are kept while under it; the rest is read and dropped).
-async fn capture(mut stream: impl AsyncRead + Unpin) -> String {
+pub(crate) async fn capture(mut stream: impl AsyncRead + Unpin) -> String {
     let mut kept = Vec::new();
     let mut chunk = vec![0u8; 64 * 1024];
     loop {
@@ -256,6 +263,38 @@ pub struct BashInput {
     pub timeout: Option<u64>,
     pub network: Option<bool>,
     pub git_write: Option<bool>,
+    /// `false`: the host door (#52), one command on the user's machine. In the spec for every session (one bash spec:
+    /// the prompt cache); refused in preview where the door is closed.
+    pub sandbox: Option<bool>,
+}
+
+/// Said when a call asks for the host where no one approves each command (marv -p, the SDK without hostCommands,
+/// subagents).
+pub const NO_HOST_DOOR: &str = "Commands outside the sandbox can only run in Marv's terminal, with the user approving each one.";
+/// Added to the network and hidden-home notes where the host door is open: the last resort, which asks.
+const HOST_LAST_RESORT: &str =
+    "If this can't work in the sandbox at all, bash with sandbox: false asks the user to run it on their machine.";
+
+/// Whether a call goes through the host door: it says sandbox: false where the sandbox is on and works. With the
+/// sandbox already off (/sandbox off, or no bubblewrap) the flag changes nothing: the call is an ordinary one.
+fn through_host(input: &BashInput, ctx: &ToolContext) -> bool {
+    input.sandbox == Some(false) && ctx.sandbox.active()
+}
+
+/// A few words on how a command ended, for the transcript.
+fn command_summary(result: &CommandResult, timeout: u64) -> String {
+    let trimmed = result.output.trim_end();
+    let lines = if trimmed.is_empty() { 0 } else { trimmed.split('\n').count() };
+    if result.timed_out {
+        format!("timed out after {timeout}s")
+    } else if result.aborted {
+        "stopped".to_string()
+    } else {
+        let code = result.exit_code.map_or("null".to_string(), |c| c.to_string());
+        let output =
+            if lines > 0 { format!(" · {lines} line{} of output", if lines == 1 { "" } else { "s" }) } else { String::new() };
+        format!("exit {code}{output}")
+    }
 }
 
 pub struct Bash;
@@ -277,7 +316,8 @@ impl Tool for Bash {
                 "command": {"type": "string", "minLength": 1, "description": "The shell command (bash). Runs in the project folder."},
                 "timeout": {"type": "integer", "minimum": 1, "maximum": MAX_TIMEOUT_S, "description": format!("Seconds before it's stopped. Default {DEFAULT_TIMEOUT_S}.")},
                 "network": {"type": "boolean", "description": "Allow network access (e.g. to install packages). Off by default."},
-                "git_write": {"type": "boolean", "description": "Set when the command changes the git repository (commit, checkout, merge, rebase, stash, branch, tag, init…). Otherwise .git may be read-only."}
+                "git_write": {"type": "boolean", "description": "Set when the command changes the git repository (commit, checkout, merge, rebase, stash, branch, tag, init…). Otherwise .git may be read-only."},
+                "sandbox": {"type": "boolean", "description": "false runs the command on the user's machine, outside the sandbox, with their permissions; always asks. Only for what can't work in the sandbox (a system service, a tool under the home folder, hardware), after a sandboxed attempt failed."}
             },
             "required": ["command"],
             "additionalProperties": false
@@ -301,21 +341,58 @@ impl Tool for Bash {
     fn uses_network(&self, input: &BashInput) -> bool {
         input.network.unwrap_or(false)
     }
+    fn uses_network_in(&self, input: &BashInput, ctx: &ToolContext) -> bool {
+        input.network.unwrap_or(false) || through_host(input, ctx)
+    }
     fn scope(&self, input: &BashInput) -> Option<Scope> {
         let net = if input.network.unwrap_or(false) { "net:" } else { "" };
         let git = if input.git_write.unwrap_or(false) { "git:" } else { "" };
         Some(Scope { key: format!("bash:{net}{git}{}", input.command), description: "this exact command".into() })
     }
+    /// On the host, network and git_write mean nothing (it has both): one key, never remembered (`once`).
+    fn scope_in(&self, input: &BashInput, ctx: &ToolContext) -> Option<Scope> {
+        if through_host(input, ctx) {
+            return Some(Scope {
+                key: format!("bash:host:{}", input.command),
+                description: "this exact command on your machine".into(),
+            });
+        }
+        self.scope(input)
+    }
+    fn door(&self, input: &BashInput, ctx: &ToolContext) -> Option<Door> {
+        through_host(input, ctx).then_some(Door::Host)
+    }
+    fn once(&self, input: &BashInput, ctx: &ToolContext) -> bool {
+        through_host(input, ctx)
+    }
     /// In the sandbox, without network, and (as run_tool confines it) with .git read-only, a command can only change
-    /// the project's own files. Without the sandbox, nothing limits it.
+    /// the project's own files. Without the sandbox, nothing limits it; on the host, everything is in reach.
     fn auto_safe(&self, input: &BashInput, ctx: &ToolContext) -> bool {
-        ctx.sandbox.active() && !input.network.unwrap_or(false) && !input.git_write.unwrap_or(false)
+        ctx.sandbox.active()
+            && !input.network.unwrap_or(false)
+            && !input.git_write.unwrap_or(false)
+            && input.sandbox != Some(false)
     }
     fn repair(&self, raw: &Value, _ctx: &ToolContext) -> Option<Repaired> {
         repair_timeout_field(raw, MAX_TIMEOUT_S)
     }
 
     async fn preview(&self, input: &BashInput, ctx: &ToolContext) -> Result<Preview, ToolError> {
+        if through_host(input, ctx) {
+            // Refused before any ask where no one approves each command: an approver can be told to say yes to an
+            // exact scope key (marv -p --approve), so the door is the context's to open, not the approver's.
+            if !ctx.doors.host {
+                return Err(ToolError::new(NO_HOST_DOOR));
+            }
+            // The warning line is the door's (ApprovalRequest::door), so it's the same wherever the request is shown.
+            let timeout = input.timeout.map(|t| format!(" · timeout {t}s")).unwrap_or_default();
+            return Ok(Preview {
+                title: "Run a command on your machine".into(),
+                command: Some(input.command.clone()),
+                note: Some(format!("asked every time{timeout}")),
+                ..Default::default()
+            });
+        }
         let sandboxed = ctx.sandbox.active();
         let mut notes = Vec::new();
         if sandboxed {
@@ -344,6 +421,28 @@ impl Tool for Bash {
     async fn run(&self, input: &BashInput, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let network = input.network.unwrap_or(false);
         let timeout = input.timeout.unwrap_or(DEFAULT_TIMEOUT_S);
+        if through_host(input, ctx) {
+            // Checked again here, so no path to run() skips the door (preview refuses first).
+            if !ctx.doors.host {
+                return Err(ToolError::new(NO_HOST_DOOR));
+            }
+            let options = RunOptions {
+                command: input.command.clone(),
+                root: ctx.root.clone(),
+                network: true,
+                timeout: Duration::from_secs(timeout),
+                env: Some(marv_sandbox::host_env::host_env_now()),
+                ..Default::default()
+            };
+            let result = run_command(options, &ctx.sandbox, &ctx.cancel).await;
+            // A second line behind host_env's filter, for GitHub's token shapes only (redact()): other secrets a
+            // command prints itself aren't caught, which is why each host command is shown and asked first.
+            let shown = redact(&format_output(&result));
+            let note = if shown.count > 0 { format!("\n{}", redacted_note(shown.count)) } else { String::new() };
+            let redacted = if shown.count > 0 { format!(" · {} redacted", shown.count) } else { String::new() };
+            let summary = format!("{} · on your machine{redacted}", command_summary(&result, timeout));
+            return Ok(ToolOutput::ok(shown.text + &note, summary));
+        }
         // A command that runs without asking sees .git read-only: git runs hooks and config from it outside any
         // sandbox (the user's next commit, their editor), so a planted hook would escape. Without a .git, it can't
         // create one either (an empty read-only placeholder sits there), or `git status` in that folder would run its
@@ -378,6 +477,7 @@ impl Tool for Bash {
             writable: approved_git,
             placeholders: guard.placeholders.clone(),
             project_read_only: false,
+            env: None,
             forwards: ctx.forwards.as_ref().map(|f| f.forwards()).unwrap_or_default(),
         };
         let mut result = run_command(options, &ctx.sandbox, &ctx.cancel).await;
@@ -400,23 +500,10 @@ impl Tool for Bash {
         if ctx.confined && GIT_READ_ONLY.is_match(&result.output) {
             result.output.push_str(&format!("\n{GIT_HINT}\n"));
         }
-        let trimmed = result.output.trim_end();
-        let lines = if trimmed.is_empty() { 0 } else { trimmed.split('\n').count() };
-        let summary = if result.timed_out {
-            format!("timed out after {timeout}s")
-        } else if result.aborted {
-            "stopped".to_string()
-        } else {
-            let code = result.exit_code.map_or("null".to_string(), |c| c.to_string());
-            let output = if lines > 0 {
-                format!(" · {lines} line{} of output", if lines == 1 { "" } else { "s" })
-            } else {
-                String::new()
-            };
-            format!("exit {code}{output}")
-        };
+        let summary = command_summary(&result, timeout);
+        let last_resort = if ctx.doors.host { format!(" {HOST_LAST_RESORT}") } else { String::new() };
         if sandboxed && touches_hidden_home(&input.command, &ctx.root, &ctx.sandbox.home) {
-            result.output.push_str(&format!("\n{HOME_NOTE}\n"));
+            result.output.push_str(&format!("\n{HOME_NOTE}{last_resort}\n"));
         }
         // Everything a command backgrounds dies with it (Marv #50); with the process door, that's the way instead (#51).
         if sandboxed && backgrounds_process(&input.command) {
@@ -426,11 +513,13 @@ impl Tool for Bash {
         // Not for a command that isn't there (127) or can't run (126): the network has nothing to do with those.
         let failed = result.timed_out || (!result.aborted && !matches!(result.exit_code, Some(0 | 126 | 127)));
         if sandboxed && !network && failed && looks_like_network_failure(&input.command, &result.output) {
-            result.output.push_str(&format!("\n{NETWORK_NOTE}\n"));
+            result.output.push_str(&format!("\n{NETWORK_NOTE}{last_resort}\n"));
             // A gh failure usually isn't the network, and the missing network isn't the fix: the MCP server is (#27).
-            // gh is a network command, so the note above is already there for it; this adds what to do instead.
+            // gh is a network command, so the note above is already there for it; this adds what to do instead. Where
+            // the session has the github tool (#47), that's the way instead.
             if runs_gh(&input.command) {
-                result.output.push_str(&format!("\n{GH_NOTE}\n"));
+                let gh = if ctx.doors.github { GH_TOOL_NOTE } else { GH_NOTE };
+                result.output.push_str(&format!("\n{gh}\n"));
             }
         }
         Ok(ToolOutput::ok(format_output(&result), summary))
@@ -574,7 +663,7 @@ mod tests {
     }
 
     fn git_bash(command: &str, git_write: bool) -> BashInput {
-        BashInput { command: command.into(), timeout: None, network: None, git_write: Some(git_write) }
+        BashInput { command: command.into(), timeout: None, network: None, git_write: Some(git_write), sandbox: None }
     }
 
     #[tokio::test]
@@ -724,7 +813,7 @@ mod tests {
         ctx
     }
     fn bash(command: &str) -> BashInput {
-        BashInput { command: command.into(), timeout: None, network: None, git_write: None }
+        BashInput { command: command.into(), timeout: None, network: None, git_write: None, sandbox: None }
     }
 
     #[tokio::test]
@@ -850,9 +939,152 @@ mod tests {
         assert!(result.output.ends_with("[timed out after 1s]"));
     }
 
+    // The host door (#52): bash with sandbox: false. Ports the host parts of Marv's tests/bash.test.ts.
+
+    struct Answer(Decision, std::sync::Mutex<Vec<crate::types::ApprovalRequest>>);
+    #[async_trait]
+    impl crate::types::Approver for Answer {
+        async fn approve(&self, request: crate::types::ApprovalRequest) -> Decision {
+            self.1.lock().unwrap().push(request);
+            self.0
+        }
+    }
+    use crate::types::Decision;
+
+    fn host_call(command: &str, extra: Value) -> marv_core::ToolCall {
+        let mut args = json!({"command": command, "sandbox": false});
+        args.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        marv_core::ToolCall { id: "h1".into(), name: "bash".into(), arguments: args.to_string() }
+    }
+    fn asking(root: &TempDir, decision: Decision, host: bool) -> (ToolContext, std::sync::Arc<Answer>) {
+        let answer = std::sync::Arc::new(Answer(decision, Default::default()));
+        let mut ctx = tool_ctx(root, true);
+        ctx.approver = Some(answer.clone());
+        ctx.doors.host = host;
+        (ctx, answer)
+    }
+    fn tools() -> Vec<crate::ToolRef> {
+        vec![std::sync::Arc::new(Bash)]
+    }
+
+    #[test]
+    fn the_flag_is_in_the_one_bash_spec_described_as_asking_every_time() {
+        let schema = Bash.schema();
+        assert!(
+            schema["properties"]["sandbox"]["description"].as_str().unwrap().contains(
+                "false runs the command on the user's machine, outside the sandbox, with their permissions; always asks."
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn token_shapes_a_host_command_prints_are_redacted_and_the_result_says_so() {
+        require_bwrap!();
+        let root = TempDir::new("bash-host-redact");
+        let token = format!("ghp_{}", "A".repeat(36));
+        let (ctx, _) = asking(&root, Decision::Yes, true);
+        let out = crate::run_tool(&host_call(&format!("echo \"deploy key {token}\""), json!({})), &ctx, &tools()).await;
+        assert!(!out.result.output.contains(&token));
+        assert!(out.result.output.contains("deploy key [redacted token]"));
+        assert!(out.result.output.contains("Marv: 1 token was redacted from this output."));
+        assert!(out.result.summary.contains("1 redacted"), "{}", out.result.summary);
+    }
+
+    #[tokio::test]
+    async fn host_asks_with_door_host_once_and_its_scope_even_in_yolo_then_runs_with_the_users_env_minus_marvs_keys() {
+        require_bwrap!();
+        let name =
+            "bash::tests::host_asks_with_door_host_once_and_its_scope_even_in_yolo_then_runs_with_the_users_env_minus_marvs_keys";
+        if !crate::test_support::in_child_with_env(name, &[("OPENROUTER_API_KEY", "sk-secret"), ("MARV_MODEL", "m")]) {
+            return;
+        }
+        let root = TempDir::new("bash-host");
+        let outside = TempDir::new("bash-host-outside");
+        let marker = outside.path().join("ran");
+        let command =
+            format!("touch {}; echo \"xdg=$XDG_RUNTIME_DIR key=$OPENROUTER_API_KEY model=$MARV_MODEL\"", marker.display());
+        let (mut ctx, answer) = asking(&root, Decision::Yes, true);
+        ctx.yolo = true;
+        let out = crate::run_tool(&host_call(&command, json!({"network": true, "git_write": true})), &ctx, &tools()).await;
+        let asked = answer.1.lock().unwrap().clone();
+        assert_eq!(asked.len(), 1);
+        let r = &asked[0];
+        assert_eq!((r.door, r.once, r.network), (Some(Door::Host), true, true));
+        assert_eq!(r.scope.key, format!("bash:host:{command}"));
+        assert_eq!(r.preview.title, "Run a command on your machine");
+        assert_eq!(r.preview.command.as_deref(), Some(command.as_str()));
+        assert_eq!(out.result.door, Some(Door::Host));
+        assert_eq!(out.result.approval, Some(crate::Approval::Decided(Decision::Yes)));
+        // The sandbox's /tmp is its own: the file shows up here only if the command ran on the host.
+        assert!(marker.exists());
+        let xdg = std::env::var("XDG_RUNTIME_DIR").unwrap_or_default();
+        assert!(out.result.output.contains(&format!("xdg={xdg} key= model=")), "{}", out.result.output);
+        assert!(out.result.summary.contains("on your machine"));
+    }
+
+    #[tokio::test]
+    async fn without_the_door_its_refused_before_anything_is_asked_and_nothing_runs() {
+        require_bwrap!();
+        let root = TempDir::new("bash-host-closed");
+        let outside = TempDir::new("bash-host-closed-outside");
+        let marker = outside.path().join("ran");
+        let (mut ctx, answer) = asking(&root, Decision::Yes, false);
+        ctx.yolo = true;
+        let out = crate::run_tool(&host_call(&format!("touch {}", marker.display()), json!({})), &ctx, &tools()).await;
+        assert!(out.result.is_error);
+        assert_eq!(out.result.output, NO_HOST_DOOR);
+        assert!(answer.1.lock().unwrap().is_empty());
+        assert!(!marker.exists());
+        // run() checks too, so no way around preview reaches the host.
+        let direct = BashInput { sandbox: Some(false), ..bash(&format!("touch {}", marker.display())) };
+        assert_eq!(Bash.run(&direct, &tool_ctx(&root, true)).await.unwrap_err().0, NO_HOST_DOOR);
+        assert!(!marker.exists());
+    }
+
+    #[tokio::test]
+    async fn with_the_sandbox_already_off_the_flag_changes_nothing() {
+        let root = TempDir::new("bash-host-off");
+        let (mut ctx, answer) = asking(&root, Decision::Yes, false);
+        ctx.sandbox = std::sync::Arc::new(Sandbox::from_env(false));
+        let out = crate::run_tool(&host_call("echo hi", json!({})), &ctx, &tools()).await;
+        assert!(out.result.output.contains("hi"), "{}", out.result.output);
+        let asked = answer.1.lock().unwrap().clone();
+        let r = &asked[0];
+        assert_eq!((r.door, r.once, r.network), (None, false, false));
+        assert!(r.preview.warning.as_deref().unwrap().contains("the sandbox is off"));
+        assert_eq!(r.scope.key, "bash:echo hi");
+    }
+
+    #[tokio::test]
+    async fn the_network_and_hidden_home_notes_suggest_it_as_a_last_resort_only_where_the_door_is_open() {
+        require_bwrap!();
+        let root = TempDir::new("bash-host-notes");
+        let mut open = tool_ctx(&root, true);
+        open.doors.host = true;
+        let last_resort = "bash with sandbox: false asks the user to run it on their machine";
+        assert!(Bash.run(&bash(FAILING), &open).await.unwrap().output.contains(last_resort));
+        assert!(Bash.run(&bash("ls ~/.marv"), &open).await.unwrap().output.contains(last_resort));
+        assert!(!Bash.run(&bash(FAILING), &tool_ctx(&root, true)).await.unwrap().output.contains("sandbox: false"));
+    }
+
+    /// Marv's tests/github-tool.test.ts, "bash's gh note".
+    #[tokio::test]
+    async fn the_gh_note_points_to_the_github_tool_where_the_session_has_it_to_the_mcp_server_where_it_doesnt() {
+        require_bwrap!();
+        let root = TempDir::new("bash-gh-note");
+        let mut with = tool_ctx(&root, true);
+        with.doors.github = true;
+        let gh = bash("gh pr list || exit 1");
+        assert!(Bash.run(&gh, &with).await.unwrap().output.contains(GH_TOOL_NOTE));
+        let without = Bash.run(&gh, &tool_ctx(&root, true)).await.unwrap().output;
+        assert!(without.contains(GH_NOTE));
+        assert!(!without.contains(GH_TOOL_NOTE));
+    }
+
     #[test]
     fn scope_and_label() {
-        let input = BashInput { command: "bun test".into(), timeout: None, network: Some(true), git_write: Some(true) };
+        let input =
+            BashInput { command: "bun test".into(), timeout: None, network: Some(true), git_write: Some(true), sandbox: None };
         assert_eq!(Bash.scope(&input).unwrap().key, "bash:net:git:bun test");
         assert!(Bash.uses_network(&input));
     }

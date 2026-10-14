@@ -317,13 +317,17 @@ async fn drive(
     tally: &mut Tally,
     run: &mut SubagentRun,
 ) {
-    // Only subagent tools (never agent or memory, whatever the type lists), and skill only when there are skills.
+    // Only subagent tools (never agent or memory, whatever the type lists), skill only when there are skills, and
+    // github only where the session offers it (its main agent has the door; the subagent only reads, #47).
     let has_skills = !ctx.skills.is_empty();
     let available: Vec<ToolRef> = marv_tools::builtin_tools()
         .iter()
         .filter(|t| {
             let name = t.name();
-            SUBAGENT_TOOLS.contains(&name) && agent_type.tools.iter().any(|n| n == name) && (name != "skill" || has_skills)
+            SUBAGENT_TOOLS.contains(&name)
+                && agent_type.tools.iter().any(|n| n == name)
+                && (name != "skill" || has_skills)
+                && (name != "github" || ctx.doors.github)
         })
         .cloned()
         .collect();
@@ -1287,6 +1291,15 @@ mod run_tests {
         assert_eq!(sub.root, PathBuf::from("/proj"));
         assert!(sub.read_only.is_empty() && sub.git_env.is_empty());
         assert!(sub.agent_host.is_none() && sub.memory.is_none());
+    }
+
+    /// Marv's tests/doors.test.ts: the doors are the main agent's (#47, #52).
+    #[test]
+    fn a_subagents_context_has_no_doors_whatever_the_parent_has() {
+        let mut p = parent();
+        p.doors = marv_tools::types::Doors { host: true, process: true, github: true };
+        let sub = subagent_context(&p, "general-purpose · x", None, None);
+        assert_eq!(sub.doors, marv_tools::types::Doors::default());
     }
 
     /// The turn's one checkpoint covers a shared-folder subagent's edits; a worktree's branch is its own way back (#16).

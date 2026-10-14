@@ -622,6 +622,8 @@ pub struct Startup {
     /// Shortened for display.
     pub hidden_path_folders: Vec<String>,
     pub sandbox_available: bool,
+    /// gh is there and logged in (checked once at startup): the session offers the github tool (#47).
+    pub github: bool,
     pub sessions: Option<Arc<SessionStore>>,
     pub trajectories: Option<Arc<TrajectoryStore>>,
     pub herdr: Option<HerdrReporter>,
@@ -683,6 +685,9 @@ impl Bridge {
         init.max_steps = Some(config.max_steps);
         (init.sandbox, init.yolo, init.diagnostics, init.checks, init.mcp_tools) =
             (config.sandbox, config.yolo, config.diagnostics, config.checks, config.mcp_tools);
+        // The person at this terminal approves each command on the host (#52); gh where it's logged in (#47).
+        init.host_commands = true;
+        init.github = s.github;
         init.no_yolo = marv_session::sdk::no_yolo_reason(&s.root, &s.home);
         if init.no_yolo.is_some() {
             init.yolo = false;
@@ -1381,6 +1386,13 @@ pub async fn run(resume: Option<bool>) -> anyhow::Result<i32> {
     // The project is wherever Marv was started; the tools can't reach outside it.
     let cwd = std::env::current_dir()?;
     let root = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+    // Whether to offer the github tool (#47): asked of gh once, alongside the rest of startup, since the tool list is
+    // fixed for the session. At most 2 s (gh auth status asks GitHub; offline it falls back to gh's hosts.yml).
+    let github_check = {
+        let wanted = marv_tools::github::github_wanted(env.get("MARV_GITHUB").map(String::as_str));
+        let pairs: Vec<(String, String)> = env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        tokio::spawn(async move { wanted && marv_tools::github::github_available(&pairs, marv_tools::github::AUTH_CHECK).await })
+    };
     let config_dir = default_config_dir(&env, &home);
     let instructions = read_instructions(&root);
     let (skills, skill_problems) = marv_session::skills::load_skills(Some(&root), Some(&home));
@@ -1444,6 +1456,7 @@ pub async fn run(resume: Option<bool>) -> anyhow::Result<i32> {
     };
 
     let cut = instructions.as_ref().and_then(|i| i.cut.clone());
+    let github = github_check.await.unwrap_or(false);
     let (tx, rx) = unbounded_channel();
     let startup = Startup {
         root: root.clone(),
@@ -1463,6 +1476,7 @@ pub async fn run(resume: Option<bool>) -> anyhow::Result<i32> {
         mcp_problems: loaded.problems,
         hidden_path_folders: hidden,
         sandbox_available: marv_sandbox::bwrap::sandbox_available(),
+        github,
         sessions: Some(Arc::new(SessionStore::new(config_dir.join("sessions")))),
         trajectories: Some(Arc::new(TrajectoryStore::new(config_dir.join("trajectories")))),
         herdr: herdr.clone(),
@@ -1656,6 +1670,7 @@ mod tests {
             mcp_problems: Vec::new(),
             hidden_path_folders: Vec::new(),
             sandbox_available: false,
+            github: false,
             sessions: Some(Arc::new(SessionStore::new(dirs.config.join("sessions")))),
             trajectories: None,
             herdr,
@@ -1837,6 +1852,44 @@ mod tests {
         let at = |s: &str| states.iter().position(|x| x == s).unwrap();
         assert!(at("working") < at("blocked"));
         assert_eq!(states.last().unwrap(), "idle");
+    }
+
+    fn calls(id: &str, name: &str, args: serde_json::Value) -> Vec<ProviderEvent> {
+        vec![
+            ProviderEvent::ToolCall(ToolCall { id: id.into(), name: name.into(), arguments: args.to_string() }),
+            ProviderEvent::Done { reason: Some("tool_calls".into()) },
+        ]
+    }
+
+    // Marv #47, #52: in the TUI a host command and a github write each ask, with their door (the approval shows the
+    // door's warning line, marv_tui::ui::approval::door_warning). Yolo on: neither runs unasked.
+    #[tokio::test]
+    async fn a_host_command_and_a_github_write_ask_with_their_door() {
+        if !marv_sandbox::sandbox_available() {
+            eprintln!("skipped: bubblewrap isn't available here");
+            return;
+        }
+        let dirs = Dirs::new();
+        let outside = dirs.base.join("outside-marker");
+        let replies = vec![
+            // A "no" ends the turn there: no reply follows either call.
+            calls("h1", "bash", serde_json::json!({"command": format!("touch {}", outside.display()), "sandbox": false})),
+            calls("g1", "github", serde_json::json!({"args": ["pr", "comment", "1", "--body", "hi"]})),
+        ];
+        let mut start = startup(&dirs, Some(FileConfig { yolo: Some(true), ..asks() }), replies, None);
+        start.github = true;
+        let (tx, mut rx) = unbounded_channel();
+        let bridge = Bridge::start(start, tx).unwrap();
+        let port = Port(bridge.clone());
+        for (door, tool, once) in [(marv_core::Door::Host, "bash", true), (marv_core::Door::Github, "github", false)] {
+            port.send("go".into());
+            let seen = until(&mut rx, |e| matches!(e, UiEvent::Approval { .. })).await;
+            let Some(UiEvent::Approval { id, request }) = seen.last() else { unreachable!() };
+            assert_eq!((request.tool.as_str(), request.door, request.once), (tool, Some(door), once));
+            port.answer(*id, view::Decision::No);
+            until(&mut rx, |e| matches!(e, UiEvent::TurnEnd { .. })).await;
+        }
+        assert!(!outside.exists());
     }
 
     #[tokio::test]

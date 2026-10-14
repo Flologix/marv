@@ -13,7 +13,9 @@
 //! - `tests/mesh.rs`: the mesh from inside a sandbox (unwired calls refused and logged, a subagent reaches the parent
 //!   only over its wire);
 //! - `tests/web.rs`: what a reader doesn't see never reaches the model (hidden text in web pages);
-//! - `tests/images.rs`: images (not built yet: ignored).
+//! - `tests/images.rs`: images (not built yet: ignored);
+//! - `tests/github.rs`, `tests/host.rs`: the doors out of the sandbox (Marv #47, #52): what gh can never do, what
+//!   asks, tokens kept out of everything; host commands asked every time and only where someone approves each one.
 //!
 //! Every guard's doc comment says how it was proven: "reverted X → this test failed". A guard whose code isn't
 //! written yet is `#[ignore = "needs …"]` with the body it will run.
@@ -172,4 +174,152 @@ pub fn serve(body: &'static str, content_type: &'static str) -> String {
         }
     });
     format!("http://localhost:{port}")
+}
+
+/// Runs the test `name` (an integration test's function name) again in a child process with `env` added, asserts it
+/// passed there, and returns false; in that child it returns true, and the test's body runs. The doors read the real
+/// environment (a fake gh first on PATH), and Rust can't change its own environment without `unsafe`.
+pub fn in_child_with_env(name: &str, env: &[(&str, &str)]) -> bool {
+    if std::env::var("MARV_GUARD_CHILD").as_deref() == Ok(name) {
+        return true;
+    }
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([name, "--exact", "--nocapture", "--test-threads=1"])
+        .env("MARV_GUARD_CHILD", name)
+        .envs(env.iter().copied())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success() && stdout.contains("1 passed"), "{name} in a child:\n{stdout}\n{stderr}");
+    false
+}
+
+/// A model that replays one scripted reply per request (Marv's `ScriptedProvider`) and records each request.
+#[derive(Default)]
+pub struct Scripted {
+    replies: Mutex<std::collections::VecDeque<Vec<marv_core::ProviderEvent>>>,
+    pub requests: Mutex<Vec<(Vec<marv_core::ChatTurn>, marv_provider::StreamOptions)>>,
+}
+
+impl Scripted {
+    pub fn new(replies: Vec<Vec<marv_core::ProviderEvent>>) -> Arc<Self> {
+        Arc::new(Self { replies: Mutex::new(replies.into()), requests: Mutex::default() })
+    }
+}
+
+impl marv_provider::Provider for Scripted {
+    fn name(&self) -> &str {
+        "scripted"
+    }
+    fn context_length(&self) -> Option<u64> {
+        None
+    }
+    fn stream(&self, history: &[marv_core::ChatTurn], options: marv_provider::StreamOptions) -> marv_provider::EventStream {
+        self.requests.lock().unwrap().push((history.to_vec(), options));
+        let reply = self.replies.lock().unwrap().pop_front().unwrap_or_else(|| say("(script ended)"));
+        Box::pin(futures::stream::iter(reply))
+    }
+}
+
+/// A reply that says `text` and stops.
+pub fn say(text: &str) -> Vec<marv_core::ProviderEvent> {
+    vec![marv_core::ProviderEvent::TextDelta(text.into()), marv_core::ProviderEvent::Done { reason: Some("stop".into()) }]
+}
+
+/// A reply that makes these calls.
+pub fn use_tools(calls: Vec<ToolCall>) -> Vec<marv_core::ProviderEvent> {
+    let mut events: Vec<marv_core::ProviderEvent> = calls.into_iter().map(marv_core::ProviderEvent::ToolCall).collect();
+    events.push(marv_core::ProviderEvent::Done { reason: Some("tool_calls".into()) });
+    events
+}
+
+/// A tool call with its own id.
+pub fn tool_call(id: &str, name: &str, args: serde_json::Value) -> ToolCall {
+    ToolCall { id: id.into(), name: name.into(), arguments: args.to_string() }
+}
+
+/// What one SDK turn did: every event, and the main agent's call results in order.
+pub struct TurnRun {
+    pub events: Vec<marv_session::session::SessionEvent>,
+    pub results: Vec<marv_core::ToolResult>,
+}
+
+/// One SDK turn (yolo on, the default) in `root` with `model`, Marv's files in `config_dir`; `edit` sets the rest.
+pub async fn sdk_turn(
+    root: &Path,
+    config_dir: &Path,
+    model: Arc<Scripted>,
+    edit: impl FnOnce(&mut marv_session::sdk::SessionOptions),
+) -> TurnRun {
+    use futures::StreamExt;
+    let mut builder = marv_session::SessionBuilder::new(root, marv_provider::ProviderOption::Custom(model));
+    builder.options.config_dir = Some(config_dir.to_path_buf());
+    builder.options.diagnostics = false;
+    builder.options.checks = false;
+    edit(&mut builder.options);
+    let session = builder.build().await.expect("a session");
+    let mut turn = session.send("check the project", marv_session::SendOptions::default()).expect("a turn");
+    let mut events = Vec::new();
+    while let Some(event) = turn.next().await {
+        events.push(event);
+    }
+    session.flush().await;
+    session.close().await;
+    let results = events
+        .iter()
+        .filter_map(|e| match e {
+            marv_session::session::SessionEvent::Loop(marv_agent::LoopEvent::ToolEnd { run, .. }) => Some(run.result.clone()),
+            _ => None,
+        })
+        .collect();
+    TurnRun { events, results }
+}
+
+/// What `marv -p` printed as JSON, and its exit code.
+pub struct Headless {
+    pub code: Option<i32>,
+    pub result: serde_json::Value,
+}
+
+/// Runs the real `marv -p "do it" --output json` in `root` (the binary `cargo test --workspace` builds, or
+/// `MARV_ORACLE_BIN`) against a fake OpenRouter that makes `calls` and then says "Done.". `env` is all the
+/// environment it gets (with `MARV_CONFIG_DIR` and `HOME` set here).
+pub fn headless(
+    root: &Path,
+    config_dir: &Path,
+    calls: Vec<marv_oracle::script::ScriptCall>,
+    approve: &[&str],
+    env: &[(&str, &str)],
+) -> Headless {
+    use marv_oracle::script::Reply;
+    let bin = marv_oracle::binary();
+    assert!(bin.exists(), "no marv binary at {} (cargo build -p marv-cli, or set MARV_ORACLE_BIN)", bin.display());
+    let replies = vec![Reply { tool_calls: calls, ..Reply::default() }, Reply { text: "Done.".into(), ..Reply::default() }];
+    let server =
+        marv_oracle::server::FakeServer::start(replies, vec![serde_json::json!({"id": marv_oracle::runner::MODEL})]).unwrap();
+    let config = serde_json::Value::Object(marv_oracle::runner::default_config(&server.base_url()));
+    std::fs::create_dir_all(config_dir).unwrap();
+    std::fs::write(config_dir.join("config.json"), config.to_string()).unwrap();
+    let home = config_dir.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let mut cmd = std::process::Command::new(bin);
+    cmd.args(["-p", "do it", "--output", "json"]);
+    for name in approve {
+        cmd.args(["--approve", name]);
+    }
+    let out = cmd
+        .current_dir(root)
+        .env_clear()
+        .env("HOME", &home)
+        .env("MARV_CONFIG_DIR", config_dir)
+        .env("NO_COLOR", "1")
+        .envs(env.iter().copied())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let result = serde_json::from_str(&stdout).unwrap_or_else(|_| {
+        panic!("marv -p printed no JSON (exit {:?}):\n{stdout}\n{}", out.status.code(), String::from_utf8_lossy(&out.stderr))
+    });
+    Headless { code: out.status.code(), result }
 }

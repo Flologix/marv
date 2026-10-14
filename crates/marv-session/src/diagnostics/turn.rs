@@ -102,6 +102,7 @@ pub fn sandboxed_options(run: &CheckRun) -> RunOptions {
         writable: Vec::new(),
         placeholders: Vec::new(),
         project_read_only: true,
+        env: None,
         forwards: Vec::new(),
     }
 }

@@ -21,6 +21,7 @@ pub mod edit_file;
 pub mod edit_match;
 pub mod file_lock;
 pub mod files;
+pub mod github;
 pub mod glob;
 pub mod grep;
 pub mod memory;
@@ -94,6 +95,26 @@ pub(crate) mod test_support {
     pub fn git(cwd: &Path, args: &[&str]) {
         let status = std::process::Command::new("git").args(args).current_dir(cwd).status().unwrap();
         assert!(status.success(), "git {args:?}");
+    }
+
+    /// Runs the test `name` (its path in this crate, e.g. `bash::tests::x`) again in a child process with `env`
+    /// added, asserts it passed there, and returns false; in that child it returns true, and the test's body runs.
+    /// A test needs a variable in Marv's own environment (a provider key that must not leak), and Rust can't change
+    /// its own environment without `unsafe`.
+    pub fn in_child_with_env(name: &str, env: &[(&str, &str)]) -> bool {
+        if std::env::var("MARV_TEST_CHILD").as_deref() == Ok(name) {
+            return true;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([name, "--exact", "--nocapture", "--test-threads=1"])
+            .env("MARV_TEST_CHILD", name)
+            .envs(env.iter().copied())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success() && stdout.contains("1 passed"), "{name} in a child:\n{stdout}\n{stderr}");
+        false
     }
 
     pub fn mkfifo(path: &Path) {

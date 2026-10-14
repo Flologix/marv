@@ -19,7 +19,8 @@ use crate::skills::{cap_body, valid_name};
 
 /// What subagents may use. Never `agent` (no subagents of subagents: no runaway recursion) or `memory` (memory
 /// outlives the session, so only the main agent changes it, with the user's approval).
-pub const SUBAGENT_TOOLS: [&str; 8] = ["read_file", "glob", "grep", "web_fetch", "skill", "edit_file", "write_file", "bash"];
+pub const SUBAGENT_TOOLS: [&str; 9] =
+    ["read_file", "glob", "grep", "web_fetch", "github", "skill", "edit_file", "write_file", "bash"];
 
 /// Claude Code's model shorthands: not ids on Marv's providers, so they mean the session's model, like `inherit`.
 const CLAUDE_CODE_MODELS: [&str; 4] = ["inherit", "sonnet", "opus", "haiku"];
@@ -195,7 +196,7 @@ mod tests {
         assert!(parse_tools(Some(&json!(["agent"])), "f").unwrap_err().contains("subagents can't use \"agent\""));
         assert!(parse_tools(Some(&json!("memory")), "f").is_err());
         assert!(parse_tools(Some(&json!(3)), "f").unwrap_err().contains("should be a list"));
-        assert_eq!(parse_tools(None, "f").unwrap().len(), 8);
+        assert_eq!(parse_tools(None, "f").unwrap().len(), 9);
     }
 
     #[test]
