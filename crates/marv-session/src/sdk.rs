@@ -82,6 +82,10 @@ pub struct SessionOptions {
     /// The process's switchboard (marv-rs mesh; `crate::mesh::start`), and who grants its wires.
     pub mesh: Option<crate::mesh::MeshHandle>,
     pub wire_approver: Option<Arc<dyn crate::mesh::WireApprover>>,
+    /// Offer the process tool (Marv #51): a dev server or watcher that keeps running in its own sandbox, its ports
+    /// forwarded to 127.0.0.1, each start through your approver (`door: process`; scope `process:<command>`). Default
+    /// true, where bubblewrap works. `close()` stops them all.
+    pub processes: bool,
 }
 
 /// Builds a [`MarvSession`] (Marv's `createSession`).
@@ -115,6 +119,7 @@ impl SessionBuilder {
                 on_warning: None,
                 mesh: None,
                 wire_approver: None,
+                processes: true,
             },
         }
     }
@@ -141,6 +146,10 @@ impl SessionBuilder {
     }
     pub fn resume(mut self, target: ResumeTarget) -> Self {
         self.options.resume = Some(target);
+        self
+    }
+    pub fn processes(mut self, on: bool) -> Self {
+        self.options.processes = on;
         self
     }
     pub fn max_steps(mut self, steps: u32) -> Self {
@@ -260,6 +269,7 @@ pub async fn create_session(options: SessionOptions) -> Result<MarvSession, Sess
     init.transcript = options.transcript;
     init.on_warning = options.on_warning.clone();
     init.problems = problems;
+    init.processes = options.processes;
     let session = MarvSession::new(init)?;
     if let Some(mcp) = &session.mcp() {
         // A server that needs a login is told once (again only after it connected meanwhile).

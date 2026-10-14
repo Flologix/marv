@@ -95,6 +95,9 @@ pub fn subagent_context(
     ctx.yolo = parent.yolo;
     ctx.skills = parent.skills.clone();
     ctx.taint = Arc::new(parent.taint.for_subagent());
+    // Its sandboxed bash reaches the session's background processes like the main agent's (curl localhost:<port>);
+    // starting one is the main agent's alone (no processes, no doors).
+    ctx.forwards = parent.forwards.clone();
     if let Some(wt) = worktree {
         ctx.read_only = if wt.prefix.is_empty() { vec![wt.git_dir.clone()] } else { vec![wt.dir.clone(), wt.git_dir.clone()] };
         ctx.git_env = worktree_env(wt);

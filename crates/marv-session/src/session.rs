@@ -45,7 +45,7 @@ use marv_mcp::deferred::{
 };
 use marv_provider::{ModelInfo, Provider, ProviderFactory, ProviderOption};
 use marv_sandbox::TaintState;
-use marv_tools::{AgentProgress, Approver, Decision, ToolContext, ToolRef};
+use marv_tools::{AgentProgress, Approver, Decision, ProcessInfo, ToolContext, ToolRef};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_util::sync::CancellationToken;
 
@@ -58,6 +58,7 @@ use crate::feedback::classify_reply;
 use crate::mcp_tools::{McpCallTool, McpHandle, McpToolAdapter, ToolSearchTool};
 use crate::memory::{Memories, MemoryPaths};
 use crate::mesh::{MeshAccess, MeshHandle, MeshTool, WireApprover};
+use crate::processes::{ProcessManager, ProcessManagerOptions};
 use crate::prompt::{Listed, PromptInput, system_prompt};
 use crate::runner::{AlwaysScopes, SessionAgentHost, SessionApprover, SessionToolRunner, SubagentSink, step_limit_request};
 use crate::sessions::{McpListing, SavedSession, SessionStore, new_session};
@@ -237,6 +238,12 @@ pub struct SessionInit {
     pub on_warning: Option<Warn>,
     /// Config files that couldn't be read, for the client to show.
     pub problems: Vec<String>,
+    /// Offer the process tool (Marv #51): servers and watchers that keep running in their own sandbox, their ports
+    /// forwarded to the user's 127.0.0.1, each start asked. Default true; offered only where bubblewrap works. Fixed
+    /// for the session's life (it changes the tool list and the prompt). The main agent only.
+    pub processes: bool,
+    /// The background processes' manager (tests pass one with a fake home); default: one made with the session.
+    pub process_manager: Option<ProcessManager>,
 }
 
 impl SessionInit {
@@ -273,6 +280,8 @@ impl SessionInit {
             on_change: None,
             on_warning: None,
             problems: Vec::new(),
+            processes: true,
+            process_manager: None,
         }
     }
 }
@@ -443,6 +452,12 @@ struct Inner {
     loaded: Arc<Mutex<HashSet<String>>>,
     typecheck: Arc<Checker<TsError>>,
     project_checks: Arc<Checker<Violation>>,
+    /// Whether this session offers the process tool (Marv #51; decided at construction: it changes the tool list and
+    /// the prompt).
+    process_on: bool,
+    /// The background processes. They belong to the session, not the conversation: they outlive turns, `clear()` and
+    /// `resume()`, and stop on `close()`.
+    processes: Option<ProcessManager>,
     state: Mutex<State>,
 }
 
@@ -608,7 +623,10 @@ impl SubagentSink for TurnSink {
 impl MarvSession {
     /// Builds a session. Fails (and changes nothing) for a taken tool name, or yolo where `no_yolo` forbids it.
     pub fn new(init: SessionInit) -> Result<Self, SessionError> {
-        check_tool_names(&init.tools).map_err(SessionError::Invalid)?;
+        let process_on = init.processes && marv_sandbox::sandbox_available();
+        // The process tool is built in only where the session offers it: elsewhere the name is free (Marv).
+        let custom: Vec<ToolRef> = init.tools.iter().filter(|t| process_on || t.name() != "process").cloned().collect();
+        check_tool_names(&custom).map_err(SessionError::Invalid)?;
         // The main agent's plug (`agent.parent.inbox`), bound now so it's there before the first turn.
         if let Some(mesh) = &init.mesh {
             mesh.plug(crate::mesh::parent_id()).map_err(|e| SessionError::Invalid(format!("The mesh: {e}")))?;
@@ -622,6 +640,7 @@ impl MarvSession {
         let provider = factory.make(None, None);
         let has_skills = !init.skills.is_empty();
         let mut specs = marv_tools::tool_specs_for(has_skills);
+        specs.retain(|s| process_on || s.name != "process");
         specs.extend(init.tools.iter().map(|t| t.spec()));
         if init.mesh.is_some() {
             specs.extend(marv_mesh::tools::mesh_specs());
@@ -671,6 +690,14 @@ impl MarvSession {
             loaded: Arc::default(),
             typecheck: Arc::new(Checker::new(Arc::new(crate::diagnostics::turn::Typecheck), None)),
             project_checks: Arc::new(Checker::new(Arc::new(crate::checks::kind::ProjectChecksKind), None)),
+            process_on,
+            processes: init.process_manager.clone().or_else(|| {
+                process_on.then(|| {
+                    let mut options = ProcessManagerOptions::new(&init.root);
+                    options.on_change = init.on_change.clone();
+                    ProcessManager::new(options)
+                })
+            }),
             state: Mutex::new(state),
             init,
         };
@@ -1010,6 +1037,13 @@ impl MarvSession {
         ctx.agent_host = Some(host);
         ctx.before_change = checks.as_ref().map(|c| c.before_change.clone());
         ctx.taint = self.inner.taint.clone();
+        // The process door (Marv #51): the main agent's alone. Subagents get the forwards (their bash reaches the
+        // servers), never the processes.
+        ctx.doors.process = self.inner.process_on;
+        if self.inner.process_on {
+            ctx.processes = self.inner.processes.clone().map(|m| Arc::new(m) as Arc<dyn marv_tools::ProcessHost>);
+        }
+        ctx.forwards = self.inner.processes.clone().map(|m| Arc::new(m) as Arc<dyn marv_tools::ProcessForwards>);
         let runner = Arc::new(SessionToolRunner::new(ctx, Arc::new(tools)));
 
         let mut options = AgentOptions::new(provider.clone(), history, system, specs, runner.clone(), stop.clone());
@@ -1592,6 +1626,34 @@ impl MarvSession {
         {
             mcp.close().await;
         }
+        if let Some(processes) = &self.inner.processes {
+            processes.close_all().await;
+        }
+    }
+
+    /// The background processes (Marv #51): name, command, ports, state.
+    pub fn processes(&self) -> Vec<ProcessInfo> {
+        self.inner.processes.as_ref().map(ProcessManager::list).unwrap_or_default()
+    }
+
+    /// Stops a background process and everything it started; false when there's none of that name.
+    pub async fn stop_process(&self, name: &str) -> bool {
+        match &self.inner.processes {
+            Some(processes) => processes.stop(name).await,
+            None => false,
+        }
+    }
+
+    /// Stops every background process (Marv's exit); later starts refuse. `close()` does this too.
+    pub async fn stop_processes(&self) {
+        if let Some(processes) = &self.inner.processes {
+            processes.close_all().await;
+        }
+    }
+
+    /// Whether this session offers the process tool (bubblewrap works, and it wasn't turned off).
+    pub fn processes_offered(&self) -> bool {
+        self.inner.process_on
     }
 
     fn cwd(&self) -> String {
@@ -1622,6 +1684,7 @@ impl MarvSession {
             // Whenever there's a manager, even an empty one: a server added mid-conversation is then covered without
             // changing the system prompt (the prompt cache).
             mcp: init.mcp.is_some(),
+            doors: crate::prompt::PromptDoors { process: self.inner.process_on, ..Default::default() },
             date: crate::time::iso_date(crate::time::now_ms()),
         });
         match &init.system_prompt {
@@ -1636,6 +1699,7 @@ impl MarvSession {
         let init = &self.inner.init;
         let mut specs = self.inner.specs.clone();
         let mut tools: Vec<ToolRef> = marv_tools::builtin_tools().to_vec();
+        tools.retain(|t| self.inner.process_on || t.name() != "process");
         tools.extend(init.tools.iter().cloned());
         if let Some(mesh) = &init.mesh
             && let Ok(plug) = mesh.plug(crate::mesh::parent_id())
