@@ -45,12 +45,42 @@ pub struct SavedSession {
     /// Absent before a turn had MCP tools. A malformed value is dropped on load (`mcp_listing_of`), not fatal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp: Option<serde_json::Value>,
+    /// The conversation's checkpoint chain (#16): its id (the session's own, or the one a resume started when the old
+    /// chain couldn't be read) and, per turn number, the paths its tools reported changing (an undo preview lists
+    /// those it can't restore). Absent in older files; checked on resume (`saved_checkpoints`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoints: Option<serde_json::Value>,
+    /// A note for the model not yet sent (an undo's, #16): it leads the next user message. Checked on resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_note: Option<serde_json::Value>,
+}
+
+/// A saved session's checkpoint chain and its turns' reported paths (#16).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SavedCheckpoints {
+    pub chain: String,
+    pub reported: Vec<(u32, Vec<String>)>,
 }
 
 impl SavedSession {
     /// The conversation's MCP listing, or `None` for an old file or a hand edit (then nothing counts as announced).
     pub fn mcp_listing(&self) -> Option<McpListing> {
         self.mcp.as_ref().and_then(|v| serde_json::from_value(v.clone()).ok())
+    }
+
+    /// The checkpoint chain and reported paths, or `None` for an old file or a hand edit (a chain id that isn't
+    /// `[\w.-]+`, a turn that isn't a positive whole number).
+    pub fn saved_checkpoints(&self) -> Option<SavedCheckpoints> {
+        let saved: SavedCheckpoints = serde_json::from_value(self.checkpoints.clone()?).ok()?;
+        let id_ok =
+            !saved.chain.is_empty() && saved.chain.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-');
+        (id_ok && saved.reported.iter().all(|(turn, _)| *turn > 0)).then_some(saved)
+    }
+
+    /// The undo note not yet sent, or `None` (absent, empty, or not a string).
+    pub fn pending_note(&self) -> Option<String> {
+        self.pending_note.as_ref().and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(String::from)
     }
 }
 
@@ -78,6 +108,8 @@ pub fn new_session(root: &Path, provider: &str, model: &str, now_ms: u64) -> Sav
         transcript: Vec::new(),
         totals: Totals::default(),
         mcp: None,
+        checkpoints: None,
+        pending_note: None,
     }
 }
 

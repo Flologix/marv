@@ -9,6 +9,9 @@ pub mod turn;
 pub mod undo;
 
 #[cfg(test)]
+mod session_tests;
+
+#[cfg(test)]
 pub(crate) mod test_support {
     use std::path::Path;
 

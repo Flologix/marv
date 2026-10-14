@@ -50,6 +50,9 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_util::sync::CancellationToken;
 
 use crate::agents::{AgentType, general_purpose};
+use crate::checkpoints::store::{CheckpointKind, CheckpointStore, SnapshotResult, StoreOptions};
+use crate::checkpoints::turn::CheckpointTurn;
+use crate::checkpoints::undo::{UndoPlan, UndoRefusal, UndoResult, apply_undo, plan_undo, undo_note};
 use crate::checks::{ProjectCheckResult, Violation};
 use crate::diagnostics::turn::{CheckOutcome, Checker, FailReason, OffReason, TurnChecks, TurnOptions, combine_checks};
 use crate::diagnostics::{CheckResult, TsError};
@@ -60,7 +63,7 @@ use crate::memory::{Memories, MemoryPaths};
 use crate::mesh::{MeshAccess, MeshHandle, MeshTool, WireApprover};
 use crate::prompt::{Listed, PromptInput, system_prompt};
 use crate::runner::{AlwaysScopes, SessionAgentHost, SessionApprover, SessionToolRunner, SubagentSink, step_limit_request};
-use crate::sessions::{McpListing, SavedSession, SessionStore, new_session};
+use crate::sessions::{McpListing, SavedCheckpoints, SavedSession, SessionStore, new_session};
 use crate::skills::LoadedSkill;
 use crate::trajectory::{AgentRecorder, CheckStatus, Trajectory, TrajectoryRecord, TrajectoryStore, Who};
 use crate::types::{Message, Role};
@@ -79,7 +82,9 @@ pub enum TurnStatus {
     Compacting,
     /// A step's typecheck or project checks are running.
     Checking,
-    /// The message is sent (again after each `Checking`).
+    /// The turn's checkpoint snapshot is taking longer than 300 ms (#16): "Saving a checkpoint…".
+    Checkpointing,
+    /// The message is sent (again after each `Checking` or `Checkpointing`).
     Running,
 }
 
@@ -145,6 +150,10 @@ pub enum SessionEvent {
     Check(CheckResult),
     /// The project's own checks after a step's file changes.
     Checks(ProjectCheckResult),
+    /// The turn's checkpoint (#16) couldn't be saved: the turn goes on, but /undo can't take it back. Once per turn.
+    CheckpointFailed {
+        message: String,
+    },
     /// marv-rs: the session just became tainted by this source (show it; egress asks from now on, even in yolo).
     Tainted {
         source: Provenance,
@@ -219,6 +228,14 @@ pub struct SessionInit {
     pub max_steps: Option<u32>,
     pub diagnostics: bool,
     pub checks: bool,
+    /// Snapshot the project before each turn's first change and after the turn (git commits under a hidden ref, #16),
+    /// so `undo_plan()`/`undo()` can put a turn's files back. Default true.
+    pub checkpoints: bool,
+    /// Marv's own git dir for a project outside a git repository (`~/.marv/checkpoints/<project>`); without it, such
+    /// a project gets no checkpoints.
+    pub checkpoints_dir: Option<PathBuf>,
+    /// The checkpoints' store; tests pass one.
+    pub checkpoint_store: Option<Arc<CheckpointStore>>,
     pub mcp_tools: McpToolsSetting,
     pub sandbox: bool,
     pub yolo: bool,
@@ -261,6 +278,9 @@ impl SessionInit {
             max_steps: None,
             diagnostics: true,
             checks: true,
+            checkpoints: true,
+            checkpoints_dir: None,
+            checkpoint_store: None,
             mcp_tools: McpToolsSetting::Auto,
             sandbox: true,
             yolo: true,
@@ -287,6 +307,8 @@ pub struct Configure {
     pub trajectories: Option<bool>,
     pub diagnostics: Option<bool>,
     pub checks: Option<bool>,
+    /// Checkpoints before each turn's changes (#16), for `undo()`.
+    pub checkpoints: Option<bool>,
     /// The main agent's step limit (0 never asks).
     pub max_steps: Option<u32>,
     /// Applies from the next conversation that decides (after `clear()`).
@@ -342,8 +364,18 @@ pub enum SessionError {
     /// A bad option (a taken tool name, yolo where it isn't allowed), as Marv's sentence.
     #[error("{0}")]
     Invalid(String),
+    /// An undo that couldn't be applied (a stale plan, a failed snapshot first), as Marv's sentence.
+    #[error("{0}")]
+    Undo(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+/// For /checkpoints: why the last checkpoint failed, or why checkpoints are off for this project.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CheckpointProblem {
+    pub failure: Option<String>,
+    pub off: Option<String>,
 }
 
 /// One running turn's events. Dropping it interrupts the turn (like breaking out of Marv's `for await`).
@@ -429,6 +461,43 @@ struct State {
     turn_mcp_specs: Arc<Vec<ToolSpec>>,
     /// A turn has waited for the MCP servers (see `turn_body`): only the first turn always does.
     mcp_waited: bool,
+    checkpoints: bool,
+    /// This conversation's turns, counted: a checkpoint's turn number ("Undo turn 3").
+    turn_number: u32,
+    /// The paths each turn's tools said they changed (by turn number): an undo lists the ones git ignores.
+    reported: std::collections::BTreeMap<u32, Vec<String>>,
+    /// Why the last checkpoint failed, for `undo_plan()`'s answer; cleared by one that worked.
+    checkpoint_failure: Option<String>,
+    /// What the model hasn't been told about an undo yet: it starts the next user message.
+    pending_note: Option<String>,
+    /// The checkpoint chain this conversation's turns go on: its id, unless a resume couldn't read that chain. Saved.
+    chain_id: String,
+    /// Old chains are pruned once per session, at its first turn.
+    pruned: bool,
+}
+
+impl State {
+    /// A conversation was swapped (clear, resume): its own chain, numbering and undo note.
+    fn new_chain(&mut self, store: &CheckpointStore) {
+        self.chain_id = self.saved.id.clone();
+        store.set_session(&self.chain_id);
+        self.turn_number = 0;
+        self.reported.clear();
+        self.pending_note = None;
+        self.checkpoint_failure = None;
+    }
+
+    /// A path a turn's tool reported changing (`ToolOutput::changed`), main agent or subagent.
+    fn note_changed(&mut self, turn: u32, event: &LoopEvent) {
+        if let LoopEvent::ToolEnd { run, .. } = event
+            && let Some(changed) = &run.changed
+        {
+            let paths = self.reported.entry(turn).or_default();
+            if !paths.contains(changed) {
+                paths.push(changed.clone());
+            }
+        }
+    }
 }
 
 struct Inner {
@@ -443,6 +512,8 @@ struct Inner {
     loaded: Arc<Mutex<HashSet<String>>>,
     typecheck: Arc<Checker<TsError>>,
     project_checks: Arc<Checker<Violation>>,
+    /// The project's checkpoints (#16); its ref follows the conversation (`State::chain_id`).
+    checkpoints: Arc<CheckpointStore>,
     state: Mutex<State>,
 }
 
@@ -481,6 +552,9 @@ fn factory_of(choice: &ProviderChoice, thinking: bool) -> Arc<dyn ProviderFactor
         ProviderChoice::Option(o) => crate::config::provider_factory(o.clone(), thinking),
     }
 }
+
+/// The running turn's checkpoint pair, finished by `run_turn` however the turn ends.
+type Pair = Arc<Mutex<Option<Arc<CheckpointTurn>>>>;
 
 /// Where a turn's events go (the queue), dropped after `TurnEnd`.
 type Emit = Arc<dyn Fn(SessionEvent) + Send + Sync>;
@@ -562,6 +636,15 @@ fn check_record<E>(
     TrajectoryRecord::Check { who, source, status, ms, before, errors, added, reason, note: told }
 }
 
+/// A checkpoint snapshot's trajectory record.
+fn checkpoint_record(turn: &str, kind: CheckpointKind, result: &SnapshotResult) -> TrajectoryRecord {
+    let (ok, sha, files, message) = match result {
+        SnapshotResult::Ok { sha, files, .. } => (true, Some(sha.clone()), Some(*files), None),
+        SnapshotResult::Failed { message, .. } => (false, None, None, Some(message.clone())),
+    };
+    TrajectoryRecord::Checkpoint { turn: turn.into(), kind: kind.as_str(), ok, sha, files, ms: result.ms(), message }
+}
+
 /// Frees the session when a `compact()` ends, however it ends.
 struct Free<'a> {
     session: &'a MarvSession,
@@ -588,6 +671,8 @@ struct TurnSink {
     info: Option<ModelInfo>,
     emit: Emit,
     subs: Recorders,
+    /// The turn's checkpoint number: what shared-folder subagents' changes are reported under.
+    turn_number: u32,
 }
 
 impl SubagentSink for TurnSink {
@@ -598,6 +683,7 @@ impl SubagentSink for TurnSink {
         (self.emit)(SessionEvent::SubagentProgress { call_id: call_id.into(), progress });
     }
     fn event(&self, call_id: &str, event: &LoopEvent) {
+        self.session.state().note_changed(self.turn_number, event);
         if let Some(sub) = lock(&self.subs).get_mut(call_id) {
             sub.event(event);
         }
@@ -627,6 +713,11 @@ impl MarvSession {
             specs.extend(marv_mesh::tools::mesh_specs());
         }
         let saved = new_session(&init.root, factory.id(), factory.model(), crate::time::now_ms());
+        let checkpoints = init.checkpoint_store.clone().unwrap_or_else(|| {
+            Arc::new(CheckpointStore::new(StoreOptions::new(&init.root, init.checkpoints_dir.clone(), saved.id.clone())))
+        });
+        checkpoints.set_session(&saved.id);
+        let chain_id = saved.id.clone();
         let memories = init.memory.as_ref().map(|(_, m)| m.clone());
         let state = State {
             factory,
@@ -662,6 +753,13 @@ impl MarvSession {
             working: None,
             turn_mcp_specs: Arc::default(),
             mcp_waited: false,
+            checkpoints: init.checkpoints,
+            turn_number: 0,
+            reported: Default::default(),
+            checkpoint_failure: None,
+            pending_note: None,
+            chain_id,
+            pruned: false,
         };
         let inner = Inner {
             specs,
@@ -671,6 +769,7 @@ impl MarvSession {
             loaded: Arc::default(),
             typecheck: Arc::new(Checker::new(Arc::new(crate::diagnostics::turn::Typecheck), None)),
             project_checks: Arc::new(Checker::new(Arc::new(crate::checks::kind::ProjectChecksKind), None)),
+            checkpoints,
             state: Mutex::new(state),
             init,
         };
@@ -829,7 +928,8 @@ impl MarvSession {
         let main: Recorder = Arc::default();
         // Subagents' recorders, by call id; ids are unique within the turn.
         let subs: Recorders = Arc::default();
-        let work = AssertUnwindSafe(self.turn_body(&turn, &text, &for_model, &stop, &emit, &main, &subs));
+        let pair: Pair = Arc::default();
+        let work = AssertUnwindSafe(self.turn_body(&turn, &text, &for_model, &stop, &emit, &main, &subs, &pair));
         let reason = match work.catch_unwind().await {
             Ok(reason) => reason,
             Err(panic) => {
@@ -849,6 +949,11 @@ impl MarvSession {
         // Stop anything still running (a no-op after a normal end): subagents still running in a parallel group would
         // otherwise carry on unseen, and could still ask for approvals.
         stop.cancel();
+        // The after snapshot, however the turn ended, once every call is answered (a pair that changed nothing goes).
+        let pair = lock(&pair).take();
+        if let Some(pair) = pair {
+            pair.finish().await;
+        }
         // The session is free before TurnEnd goes out, so a client can send the next message as soon as it sees it,
         // and a turn nobody reads frees it too. (A newer turn can't have started yet: send() refuses while running.)
         {
@@ -872,6 +977,7 @@ impl MarvSession {
         emit: &Emit,
         main: &Recorder,
         subs: &Recorders,
+        pair: &Pair,
     ) -> TurnEndReason {
         let init = &self.inner.init;
         // MCP servers still starting: their tools must be in place before the first request (the list can't change
@@ -970,9 +1076,32 @@ impl MarvSession {
             Some(inbox) => format!("{inbox}\n\n{message}"),
             None => message,
         };
+        // An undo since the last turn: the model hears of it here, in the message Marv sends anyway (the cache holds).
+        let undo = self.state().pending_note.take();
+        let message = match undo {
+            Some(note) => format!("{note}\n\n{message}"),
+            None => message,
+        };
         lock(&history).push(ChatTurn::User { text: message });
         self.note(Role::User, text);
         emit(SessionEvent::Status(TurnStatus::Running));
+
+        // The turn's checkpoint pair (#16): the before is taken by the first call that can change files.
+        let (number, checkpoints_on, prune) = {
+            let mut s = self.state();
+            s.turn_number += 1;
+            let number = s.turn_number;
+            s.reported.insert(number, Vec::new());
+            let prune = s.checkpoints && !s.pruned;
+            s.pruned |= prune;
+            (number, s.checkpoints, prune)
+        };
+        if prune {
+            let store = self.inner.checkpoints.clone();
+            tokio::spawn(async move { store.prune(20, 14).await });
+        }
+        let checkpoint = checkpoints_on.then(|| Arc::new(self.checkpoint_turn(number, text, turn, emit, &record)));
+        *lock(pair) = checkpoint.clone();
 
         let approve: Option<Arc<dyn Approver>> = init.approve.clone().map(|inner| {
             Arc::new(SessionApprover { inner, always: self.inner.always.clone(), cancel: stop.clone() }) as Arc<dyn Approver>
@@ -984,6 +1113,7 @@ impl MarvSession {
             info: info.clone(),
             emit: emit.clone(),
             subs: subs.clone(),
+            turn_number: number,
         });
         // What the agent tool needs to start subagents. Only the main agent gets one; what a subagent does reaches
         // this conversation only as its tool result, and the client through Subagent events.
@@ -1009,6 +1139,7 @@ impl MarvSession {
         ctx.memory = init.memory.as_ref().map(|(paths, _)| paths.for_tools());
         ctx.agent_host = Some(host);
         ctx.before_change = checks.as_ref().map(|c| c.before_change.clone());
+        ctx.checkpoint = checkpoint.map(|c| c as Arc<dyn marv_tools::Checkpoint>);
         ctx.taint = self.inner.taint.clone();
         let runner = Arc::new(SessionToolRunner::new(ctx, Arc::new(tools)));
 
@@ -1090,6 +1221,7 @@ impl MarvSession {
             if let Some(main) = lock(main).as_mut() {
                 main.event(&event);
             }
+            self.state().note_changed(number, &event);
             // After a call's result, or the mesh inbox read before the turn or between steps: anything but a delta.
             let check_taint =
                 !matches!(event, LoopEvent::TextDelta(_) | LoopEvent::ThinkingDelta(_) | LoopEvent::ToolCallDelta { .. });
@@ -1201,6 +1333,32 @@ impl MarvSession {
             }));
         }
         combine_checks(parts)
+    }
+
+    /// The turn's checkpoint pair: its snapshots go to the trajectory, a failure is said once (and kept for
+    /// `undo_plan()` and /checkpoints), and a slow before shows as `Checkpointing`.
+    fn checkpoint_turn(&self, number: u32, label: &str, turn: &str, emit: &Emit, record: &Record) -> CheckpointTurn {
+        let (session, record, turn) = (self.clone(), record.clone(), turn.to_string());
+        let on_snapshot = move |kind: CheckpointKind, r: &SnapshotResult| {
+            record(checkpoint_record(&turn, kind, r));
+            if r.ok() {
+                session.state().checkpoint_failure = None;
+            }
+        };
+        let (session, failed_emit, said) = (self.clone(), emit.clone(), AtomicBool::new(false));
+        let on_failed = move |message: String| {
+            session.state().checkpoint_failure = Some(message.clone());
+            if !said.swap(true, Ordering::SeqCst) {
+                failed_emit(SessionEvent::CheckpointFailed { message });
+            }
+        };
+        let slow_emit = emit.clone();
+        let on_slow =
+            move |on: bool| slow_emit(SessionEvent::Status(if on { TurnStatus::Checkpointing } else { TurnStatus::Running }));
+        CheckpointTurn::new(self.inner.checkpoints.clone(), number, label)
+            .on_snapshot(Arc::new(on_snapshot))
+            .on_failed(Arc::new(on_failed))
+            .on_slow(Arc::new(on_slow))
     }
 
     /// Stops the running turn or compaction (Esc). Approvals still waiting are answered "no".
@@ -1339,6 +1497,7 @@ impl MarvSession {
             // The last turn's save may still be waiting: it must go to the old file, with the old conversation.
             self.save_now(&mut s, transcript);
             s.saved = new_session(&self.inner.init.root, s.factory.id(), s.factory.model(), crate::time::now_ms());
+            s.new_chain(&self.inner.checkpoints);
             s.conversation = Arc::default();
             s.messages.clear();
             s.last = None;
@@ -1376,27 +1535,133 @@ impl MarvSession {
             ResumeTarget::Id(id) => store.load(root, id).await,
         };
         let Some(saved) = saved else { return Ok(None) };
-        let transcript = self.transcript();
-        let mut s = self.state();
-        // A turn may have started while it loaded: swapping the conversation under it would mix the two.
-        self.idle(&s)?;
-        // The last turn's save may still be waiting: it belongs to the conversation being left.
-        self.save_now(&mut s, transcript);
-        lock(&self.inner.loaded).clear();
-        s.conversation = Arc::new(Mutex::new(saved.conversation.clone()));
-        s.messages = saved.transcript.clone();
-        s.totals = saved.totals.clone();
-        s.last = None;
-        s.listing = saved.mcp_listing();
-        let resumed = Resumed {
-            id: saved.id.clone(),
-            updated_at: saved.updated_at,
-            model: saved.model.clone(),
-            transcript: saved.transcript.clone(),
-            totals: saved.totals.clone(),
+        let (resumed, id) = {
+            let transcript = self.transcript();
+            let mut s = self.state();
+            // A turn may have started while it loaded: swapping the conversation under it would mix the two.
+            self.idle(&s)?;
+            // The last turn's save may still be waiting: it belongs to the conversation being left.
+            self.save_now(&mut s, transcript);
+            lock(&self.inner.loaded).clear();
+            s.conversation = Arc::new(Mutex::new(saved.conversation.clone()));
+            s.messages = saved.transcript.clone();
+            s.totals = saved.totals.clone();
+            s.last = None;
+            s.listing = saved.mcp_listing();
+            let resumed = Resumed {
+                id: saved.id.clone(),
+                updated_at: saved.updated_at,
+                model: saved.model.clone(),
+                transcript: saved.transcript.clone(),
+                totals: saved.totals.clone(),
+            };
+            let (saved_checkpoints, pending_note, id) = (saved.saved_checkpoints(), saved.pending_note(), saved.id.clone());
+            s.saved = saved;
+            s.new_chain(&self.inner.checkpoints);
+            // Its chain (the saved one: a recovery below may have replaced the session's own), if it still exists:
+            // numbering goes on after its last checkpointed turn, and an undo preview still knows what each turn reported.
+            if let Some(saved) = saved_checkpoints {
+                s.chain_id = saved.chain;
+                self.inner.checkpoints.set_session(&s.chain_id);
+                s.reported = saved.reported.into_iter().collect();
+            }
+            // An undo's note the model hadn't been sent yet: it still leads the next message (the conversation is
+            // untouched).
+            s.pending_note = pending_note;
+            (resumed, id)
         };
-        s.saved = saved;
+        // One that can't be read is left as it is: this conversation's turns go on a chain of their own, so their
+        // numbers can't meet its turns. Its id is saved with the session, so the next resume finds those turns.
+        let chain = self.inner.checkpoints.chain().await;
+        let mut s = self.state();
+        match chain {
+            Ok(chain) => s.turn_number = chain.iter().map(|c| c.turn).max().unwrap_or(0),
+            Err(error) => {
+                s.chain_id = format!("{id}.{}", crate::time::now_ms());
+                self.inner.checkpoints.set_session(&s.chain_id);
+                s.reported.clear();
+                s.checkpoint_failure = Some(format!("{error}: the turns before this resume can't be undone"));
+            }
+        }
         Ok(Some(resumed))
+    }
+
+    /// /undo's preview: what `undo()` would put back, or why there's nothing to. Fails during a turn.
+    pub async fn undo_plan(&self) -> Result<Result<UndoPlan, UndoRefusal>, SessionError> {
+        let (on, failure) = {
+            let s = self.state();
+            self.idle(&s)?;
+            (s.checkpoints, s.checkpoint_failure.clone())
+        };
+        let refusal = |reason: String| Ok(Err(UndoRefusal { reason, failed: false }));
+        if !on {
+            return refusal("checkpoints are off (/checkpoints on turns them on)".into());
+        }
+        let store = &self.inner.checkpoints;
+        if let Some(off) = store.off() {
+            return refusal(format!("checkpoints are off for this project: {off}"));
+        }
+        let reported = |turn: u32| self.state().reported.get(&turn).cloned().unwrap_or_default();
+        let plan = plan_undo(store, reported, None).await;
+        if let Err(refused) = &plan {
+            if let Err(error) = store.locate().await {
+                return refusal(format!("no checkpoints here: {error}"));
+            }
+            if let Some(failure) = failure {
+                return Ok(Err(UndoRefusal {
+                    reason: format!("{}; the last checkpoint failed: {failure}", refused.reason),
+                    failed: refused.failed,
+                }));
+            }
+        }
+        Ok(plan)
+    }
+
+    /// /undo's yes: puts the plan's files back (after a snapshot of how they are now), and tells the model at the
+    /// start of the next message. Fails during a turn, and if the plan is stale.
+    pub async fn undo(&self, plan: &UndoPlan) -> Result<UndoResult, SessionError> {
+        {
+            let mut s = self.state();
+            self.idle(&s)?;
+            s.running = true; // no turn may start while files are being written back
+        }
+        struct Free<'a>(&'a MarvSession);
+        impl Drop for Free<'_> {
+            fn drop(&mut self) {
+                self.0.state().running = false;
+                self.0.schedule_save(); // the note waits in the session file, in case Marv exits before the next message
+            }
+        }
+        let _free = Free(self);
+        let result = apply_undo(&self.inner.checkpoints, plan, None).await.map_err(SessionError::Undo)?;
+        if let Some(log) = self.trajectory() {
+            let turn = self.state().last_turn.as_ref().map(|(turn, _)| turn.clone()).unwrap_or_default();
+            log.write(&TrajectoryRecord::Checkpoint {
+                turn,
+                kind: CheckpointKind::PreUndo.as_str(),
+                ok: true,
+                sha: Some(result.pre_undo.clone()),
+                files: Some(result.pre_undo_files),
+                ms: result.pre_undo_ms,
+                message: None,
+            });
+            let paths = result.restored.iter().chain(&result.recreated).chain(&result.deleted).cloned().collect();
+            let skipped = result.refused.iter().map(|r| r.path.clone()).collect();
+            log.write(&TrajectoryRecord::Undo { turn: plan.turn, paths, skipped });
+        }
+        if let Some(note) = undo_note(plan, &result) {
+            let mut s = self.state();
+            s.pending_note = Some(match s.pending_note.take() {
+                Some(earlier) => format!("{earlier}\n\n{note}"),
+                None => note,
+            });
+        }
+        Ok(result)
+    }
+
+    /// For /checkpoints: why the last checkpoint failed, or why checkpoints are off for this project.
+    pub fn checkpoint_problem(&self) -> CheckpointProblem {
+        CheckpointProblem { failure: self.state().checkpoint_failure.clone(), off: self.inner.checkpoints.off() }
     }
 
     /// New settings, from the next turn. All or nothing: the new provider is made first; yolo where `no_yolo`
@@ -1441,6 +1706,9 @@ impl MarvSession {
                 self.inner.project_checks.reset();
             }
             s.checks = v;
+        }
+        if let Some(v) = changes.checkpoints {
+            s.checkpoints = v;
         }
         if let Some(v) = changes.max_steps {
             s.max_steps = Some(v);
@@ -1505,6 +1773,12 @@ impl MarvSession {
         saved.transcript = transcript.unwrap_or_else(|| s.messages.clone());
         saved.totals = s.totals.clone();
         saved.mcp = s.listing.as_ref().and_then(|l| serde_json::to_value(l).ok());
+        let checkpoints = SavedCheckpoints {
+            chain: s.chain_id.clone(),
+            reported: s.reported.iter().map(|(turn, paths)| (*turn, paths.clone())).collect(),
+        };
+        saved.checkpoints = serde_json::to_value(checkpoints).ok();
+        saved.pending_note = s.pending_note.clone().map(serde_json::Value::String);
         s.saved = saved.clone();
         saved
     }

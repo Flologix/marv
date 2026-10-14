@@ -67,6 +67,10 @@ pub struct SessionOptions {
     pub max_steps: Option<u32>,
     pub diagnostics: bool,
     pub checks: bool,
+    /// Before a turn's first change, snapshot the project (git commits under a hidden ref,
+    /// `refs/marv/checkpoints/<session>`, or a git dir of Marv's own in `config_dir` outside a repository), and again
+    /// when it ends, so `session.undo_plan()` and `session.undo(plan)` can put that turn's files back. Default true.
+    pub checkpoints: bool,
     pub mcp_tools: McpToolsSetting,
     pub sandbox: bool,
     pub yolo: bool,
@@ -103,6 +107,7 @@ impl SessionBuilder {
                 max_steps: None,
                 diagnostics: true,
                 checks: true,
+                checkpoints: true,
                 mcp_tools: McpToolsSetting::Auto,
                 sandbox: true,
                 yolo: true,
@@ -250,6 +255,8 @@ pub async fn create_session(options: SessionOptions) -> Result<MarvSession, Sess
     init.max_steps = options.max_steps;
     init.diagnostics = options.diagnostics;
     init.checks = options.checks;
+    init.checkpoints = options.checkpoints;
+    init.checkpoints_dir = Some(config_dir.join("checkpoints").join(project_key(&root)));
     init.mcp_tools = options.mcp_tools;
     init.sandbox = options.sandbox;
     init.yolo = options.yolo;
