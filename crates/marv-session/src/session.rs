@@ -518,6 +518,10 @@ struct State {
     hook_runs: Option<Vec<HookRun>>,
     /// The runs haven't been sent to the model yet (they go once, in the next user message).
     hooks_unsent: bool,
+    /// Kills the current round's commands (a newer round, or `close()`).
+    hook_stop: Option<CancellationToken>,
+    /// The current round's task: `close()` waits for it.
+    hook_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl State {
@@ -834,6 +838,8 @@ impl MarvSession {
             hooks_done: None,
             hook_runs: None,
             hooks_unsent: false,
+            hook_stop: None,
+            hook_task: None,
         };
         let inner = Inner {
             specs,
@@ -1635,41 +1641,52 @@ impl MarvSession {
     /// no-op without hooks). Must run inside a Tokio runtime. A client calls it as it starts, to show the hooks at once
     /// ([`Self::start_hooks_done`]); otherwise the first turn starts them. `clear()` and `resume()` start a new round.
     pub fn run_start_hooks(&self) {
-        if self.inner.init.hooks.is_empty() || self.state().hooks_started {
-            return;
-        }
-        self.restart_hooks();
+        self.start_round(false);
     }
 
-    /// A new round of hooks for a new conversation; a round still running is dropped (its commands finish or time
-    /// out on their own, their output unused).
+    /// A new round of hooks for a new conversation: `clear()`, `resume()`. A round still running is stopped (its
+    /// commands killed, their output unused).
     fn restart_hooks(&self) {
+        self.start_round(true);
+    }
+
+    /// Starts a round: always with `again`, else only if this conversation's hasn't started. Checked and claimed under
+    /// one lock, so two callers at once can't both start the commands (Greptile on #115). Nothing after `close()`.
+    fn start_round(&self, again: bool) {
         let hooks = self.inner.init.hooks.clone();
         let done = CancellationToken::new();
-        let round = {
-            let mut s = self.state();
-            s.hook_round += 1;
-            s.hooks_started = !hooks.is_empty();
-            s.hooks_done = (!hooks.is_empty()).then(|| done.clone());
-            s.hook_runs = None;
-            s.hooks_unsent = false;
-            s.hook_round
-        };
+        let stop = CancellationToken::new();
+        let mut s = self.state();
+        if s.closed || (!again && (hooks.is_empty() || s.hooks_started)) {
+            return;
+        }
+        s.hook_round += 1;
+        let round = s.hook_round;
+        s.hooks_started = !hooks.is_empty();
+        s.hooks_done = (!hooks.is_empty()).then(|| done.clone());
+        s.hook_runs = None;
+        s.hooks_unsent = false;
+        if let Some(old) = s.hook_stop.take() {
+            old.cancel();
+        }
+        s.hook_task = None; // stopped above; it ends on its own
         if hooks.is_empty() {
             return;
         }
+        s.hook_stop = Some(stop.clone());
         let (session, root) = (self.clone(), self.inner.init.root.clone());
-        tokio::spawn(async move {
-            let runs = crate::hooks::run_hooks(&hooks, &root).await;
+        // Spawned with the lock held, so the task's handle is in place before anyone can look for it.
+        s.hook_task = Some(tokio::spawn(async move {
+            let runs = crate::hooks::run_hooks(&hooks, &root, &stop).await;
             {
                 let mut s = session.state();
-                if s.hook_round == round {
+                if s.hook_round == round && !stop.is_cancelled() {
                     s.hook_runs = Some(runs);
                     s.hooks_unsent = true;
                 }
             }
             done.cancel();
-        });
+        }));
     }
 
     /// The current round of session-start hooks, once it has finished: `None` without hooks, or when a newer round
@@ -2066,8 +2083,16 @@ impl MarvSession {
             if let Some(stop) = &s.current {
                 stop.cancel();
             }
-            s.working.take()
+            (s.working.take(), s.hook_stop.take(), s.hook_task.take())
         };
+        let (working, hook_stop, hook_task) = working;
+        // Session-start hooks still running are killed (with what they started) and waited for (Greptile on #115).
+        if let Some(stop) = hook_stop {
+            stop.cancel();
+        }
+        if let Some(task) = hook_task {
+            let _ = task.await;
+        }
         // A turn's end saves its conversation (and arms a save timer): waiting for it means that save is part of
         // this flush, rather than one that lands after close() returned.
         if let Some(done) = working {
@@ -4467,5 +4492,65 @@ mod turn_tests {
         assert_eq!(taint.len(), 1);
         assert_eq!(taint[0]["source"], "hook");
         assert!(taint[0]["turn"].is_string());
+    }
+
+    // Greptile on #115: the first round is checked and claimed under one lock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_starts_run_each_hook_once() {
+        let dirs = Dirs::new();
+        let session = scripted(&dirs, &Scripted::new(vec![]), |i| i.hooks = counting(&dirs));
+        let barrier = Arc::new(tokio::sync::Barrier::new(16));
+        let starts: Vec<_> = (0..16)
+            .map(|_| {
+                let (session, barrier) = (session.clone(), barrier.clone());
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    session.run_start_hooks();
+                })
+            })
+            .collect();
+        for start in starts {
+            start.await.unwrap();
+        }
+        assert_eq!(session.start_hooks_done().await.unwrap().len(), 1);
+        assert_eq!(runs(&dirs), 1);
+    }
+
+    /// A hook still running after 3 s writes `late`: only killing its group stops that.
+    fn slow(dirs: &Dirs) -> HookCommand {
+        let late = dirs.dir.join("late");
+        HookCommand {
+            timeout: std::time::Duration::from_secs(60),
+            ..hook(&format!("(sleep 3; touch '{}') >/dev/null 2>&1 & sleep 60", late.display()))
+        }
+    }
+
+    // Greptile on #115: close() stops session-start hooks still running, with what they started, and waits for them.
+    #[tokio::test]
+    async fn close_kills_a_running_hook_and_its_group() {
+        let dirs = Dirs::new();
+        let session = scripted(&dirs, &Scripted::new(vec![]), |i| i.hooks = vec![slow(&dirs)]);
+        session.run_start_hooks();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let started = std::time::Instant::now();
+        session.close().await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+        assert_eq!(session.start_hooks_done().await, None, "a stopped round has no results");
+        session.run_start_hooks(); // nothing starts after close()
+        tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
+        assert!(!dirs.dir.join("late").exists(), "the hook's group outlived close()");
+    }
+
+    #[tokio::test]
+    async fn a_replaced_round_is_stopped() {
+        let dirs = Dirs::new();
+        let session = scripted(&dirs, &Scripted::new(vec![]), |i| i.hooks = vec![slow(&dirs)]);
+        session.run_start_hooks();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        session.clear().await.unwrap(); // a new round: the first one's commands are killed
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        session.close().await;
+        tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
+        assert!(!dirs.dir.join("late").exists());
     }
 }

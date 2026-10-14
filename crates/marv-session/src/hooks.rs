@@ -201,8 +201,9 @@ pub fn cap_output(text: &str, cap: usize) -> &str {
     &text[..end]
 }
 
-/// Runs one hook in `root`: bash, outside the sandbox, the host door's environment.
-pub async fn run_hook(hook: &HookCommand, root: &Path) -> HookRun {
+/// Runs one hook in `root`: bash, outside the sandbox, the host door's environment. `stop` kills it and everything it
+/// started (the session's `close()`, or a newer round replacing this one).
+pub async fn run_hook(hook: &HookCommand, root: &Path, stop: &CancellationToken) -> HookRun {
     let started = Instant::now();
     let options = marv_tools::bash::RunOptions {
         command: hook.command.clone(),
@@ -212,7 +213,7 @@ pub async fn run_hook(hook: &HookCommand, root: &Path) -> HookRun {
         env: Some(marv_sandbox::host_env::host_env_now()),
         ..Default::default()
     };
-    let result = marv_tools::bash::run_command(options, &marv_sandbox::Sandbox::from_env(false), &CancellationToken::new()).await;
+    let result = marv_tools::bash::run_command(options, &marv_sandbox::Sandbox::from_env(false), stop).await;
     let bytes = result.output.len();
     HookRun {
         command: hook.command.clone(),
@@ -226,11 +227,15 @@ pub async fn run_hook(hook: &HookCommand, root: &Path) -> HookRun {
     }
 }
 
-/// Runs the hooks in order (each waits for the one before: `bd ready` after a `bd sync` sees its result).
-pub async fn run_hooks(hooks: &[HookCommand], root: &Path) -> Vec<HookRun> {
+/// Runs the hooks in order (each waits for the one before: `bd ready` after a `bd sync` sees its result). After
+/// `stop`, the one running is killed and the rest don't start.
+pub async fn run_hooks(hooks: &[HookCommand], root: &Path, stop: &CancellationToken) -> Vec<HookRun> {
     let mut runs = Vec::with_capacity(hooks.len());
     for hook in hooks {
-        runs.push(run_hook(hook, root).await);
+        if stop.is_cancelled() {
+            break;
+        }
+        runs.push(run_hook(hook, root, stop).await);
     }
     runs
 }
@@ -359,7 +364,7 @@ mod tests {
     #[tokio::test]
     async fn a_hook_runs_in_the_project_with_its_output_and_exit_code() {
         let root = temp();
-        let run = run_hook(&HookCommand::new("pwd; echo oops >&2"), &root).await;
+        let run = run_hook(&HookCommand::new("pwd; echo oops >&2"), &root, &CancellationToken::new()).await;
         assert!(run.ok(), "{run:?}");
         assert_eq!(run.output, format!("{}\noops\n", root.display()));
         assert_eq!(run.bytes, run.output.len());
@@ -370,7 +375,7 @@ mod tests {
     #[tokio::test]
     async fn a_failing_hook_is_a_one_line_note() {
         let root = temp();
-        let run = run_hook(&HookCommand::new("echo nope; exit 3"), &root).await;
+        let run = run_hook(&HookCommand::new("echo nope; exit 3"), &root, &CancellationToken::new()).await;
         assert_eq!((run.exit_code, run.timed_out), (Some(3), false));
         assert_eq!(run.line(), "echo nope; exit 3: failed (exit 3), 1 line");
         let note = hooks_note(std::slice::from_ref(&run)).unwrap();
@@ -387,7 +392,7 @@ mod tests {
             trusted: false,
         };
         let started = Instant::now();
-        let run = run_hook(&hook, &root).await;
+        let run = run_hook(&hook, &root, &CancellationToken::new()).await;
         // The background sleep holds the output pipe: only killing the whole group lets it end now.
         assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
         assert!(run.timed_out && run.exit_code.is_none(), "{run:?}");
@@ -396,10 +401,45 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // Greptile on #115: a hook that closes its output and keeps running still times out on time, with its group.
+    #[tokio::test]
+    async fn a_hook_that_closes_its_output_still_times_out_with_its_group() {
+        let root = temp();
+        let hook = HookCommand {
+            command: "(sleep 3; touch late) >/dev/null 2>&1 & exec >/dev/null 2>&1; sleep 60".into(),
+            timeout: Duration::from_secs(1),
+            trusted: false,
+        };
+        let started = Instant::now();
+        let run = run_hook(&hook, &root, &CancellationToken::new()).await;
+        assert!(run.timed_out, "{run:?}");
+        assert!(started.elapsed() < Duration::from_millis(2500), "{:?}", started.elapsed());
+        tokio::time::sleep(Duration::from_millis(3000)).await;
+        assert!(!root.join("late").exists(), "the hook's group outlived its timeout");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_stop_kills_the_running_hook_and_skips_the_rest() {
+        let root = temp();
+        let stop = CancellationToken::new();
+        let later = stop.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            later.cancel();
+        });
+        let started = Instant::now();
+        let runs = run_hooks(&[HookCommand::new("sleep 30"), HookCommand::new("touch never")], &root, &stop).await;
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        assert_eq!(runs.len(), 1);
+        assert!(!root.join("never").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[tokio::test]
     async fn output_is_cut_to_the_cap() {
         let root = temp();
-        let run = run_hook(&HookCommand::new("head -c 20000 /dev/zero | tr '\\0' x"), &root).await;
+        let run = run_hook(&HookCommand::new("head -c 20000 /dev/zero | tr '\\0' x"), &root, &CancellationToken::new()).await;
         assert_eq!((run.output.len(), run.bytes), (OUTPUT_CAP, 20000));
         assert!(run.line().contains("cut to 8 KB"), "{}", run.line());
         let note = hooks_note(&[run]).unwrap();

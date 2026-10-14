@@ -209,7 +209,19 @@ pub async fn run_command(
             }
         }
     };
-    let status = child.wait().await.ok();
+    // The pipes can close long before the command ends (`exec >/dev/null 2>&1; sleep 60`): the timeout and the stop
+    // stay armed until it has exited, or such a command would hold the turn (or a hook) past its timeout.
+    let status = loop {
+        if timed_out || aborted {
+            break child.wait().await.ok();
+        }
+        tokio::select! {
+            status = child.wait() => break status.ok(),
+            () = &mut deadline => timed_out = true,
+            () = cancel.cancelled() => aborted = true,
+        }
+        kill(&mut child);
+    };
     let exit_code = if timed_out || aborted { None } else { status.and_then(|s| s.code()) };
     let mut output = output;
     // Without this, a sandbox that never started looks like a command that silently failed.
@@ -608,6 +620,50 @@ mod tests {
         let started = std::time::Instant::now();
         assert!(run_command(second, &Sandbox::from_env(true), &CancellationToken::new()).await.timed_out);
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    /// A command that closes its output pipes and keeps running: the timeout still holds, and kills its whole group
+    /// (Greptile on #115: `run_command` waited for the child outside its timeout once the pipes had closed).
+    const CLOSES_ITS_PIPES: &str = "(sleep 3; touch late) >/dev/null 2>&1 & exec >/dev/null 2>&1; sleep 60";
+
+    async fn times_out_after_closing_its_pipes(sandbox: bool) {
+        let root = TempDir::new("bash-closed");
+        let options = RunOptions { sandbox, timeout: Duration::from_secs(1), ..options(CLOSES_ITS_PIPES, root.path()) };
+        let started = std::time::Instant::now();
+        let result = run_command(options, &Sandbox::from_env(true), &CancellationToken::new()).await;
+        assert!(result.timed_out && result.exit_code.is_none(), "{result:?}");
+        let took = started.elapsed();
+        assert!(took >= Duration::from_millis(900) && took < Duration::from_millis(2500), "{took:?}");
+        // Its background job was in the group (the sandbox) that died: it never gets to write.
+        tokio::time::sleep(Duration::from_millis(3000)).await;
+        assert!(!root.path().join("late").exists(), "the command's group outlived its timeout");
+    }
+
+    #[tokio::test]
+    async fn the_timeout_holds_after_the_command_closes_its_pipes() {
+        times_out_after_closing_its_pipes(false).await;
+    }
+
+    #[tokio::test]
+    async fn the_timeout_holds_after_a_sandboxed_command_closes_its_pipes() {
+        require_bwrap!();
+        times_out_after_closing_its_pipes(true).await;
+    }
+
+    #[tokio::test]
+    async fn a_stop_holds_after_the_command_closes_its_pipes() {
+        let root = TempDir::new("bash-closed-stop");
+        let cancel = CancellationToken::new();
+        let stop = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            stop.cancel();
+        });
+        let started = std::time::Instant::now();
+        let options = RunOptions { timeout: Duration::from_secs(60), ..options(CLOSES_ITS_PIPES, root.path()) };
+        let result = run_command(options, &Sandbox::from_env(true), &cancel).await;
+        assert!(result.aborted && result.exit_code.is_none(), "{result:?}");
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
     }
 
     #[tokio::test]
