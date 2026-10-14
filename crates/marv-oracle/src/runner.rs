@@ -272,7 +272,11 @@ pub fn canonical_request(body: &str) -> String {
     let Ok(mut value) = serde_json::from_str::<Value>(body) else { return body.to_string() };
     if let Some(messages) = value.get_mut("messages").and_then(Value::as_array_mut) {
         for message in messages {
+            let system = message.get("role") == Some(&json!("system"));
             let Some(content) = message.get_mut("content") else { continue };
+            if system {
+                strip_sections(content);
+            }
             // A marked message carries its text as one part; unmarked it's the plain string.
             if let Some([part]) = content.as_array().map(Vec::as_slice)
                 && part.get("type") == Some(&json!("text"))
@@ -286,6 +290,31 @@ pub fn canonical_request(body: &str) -> String {
     }
     strip_cache_control(&mut value);
     value.to_string()
+}
+
+/// System-prompt sections marv-rs adds and Marv doesn't (deliberate differences, one place for all scenarios): the
+/// oracle drops them from both sides before comparing, so the rest of the prompt is still checked byte for byte. The
+/// raw requests (the prefix rule) keep them. `# Sandbox limits` is Marv's own from 0.4.0 (#50); listed until the
+/// recordings come from 0.4.0.
+pub const MARV_RS_SECTIONS: &[&str] = &["# Sandbox limits", "# Your situation"];
+
+/// Removes each of [`MARV_RS_SECTIONS`] (from its `\n\n<heading>\n\n` to the next `\n\n# ` heading, or the end) from a
+/// system message's text, plain or in parts.
+fn strip_sections(content: &mut Value) {
+    match content {
+        Value::String(text) => {
+            for heading in MARV_RS_SECTIONS {
+                let marker = format!("\n\n{heading}\n\n");
+                if let Some(start) = text.find(&marker) {
+                    let after = start + marker.len();
+                    let end = text[after..].find("\n\n# ").map_or(text.len(), |i| after + i);
+                    text.replace_range(start..end, "");
+                }
+            }
+        }
+        Value::Array(parts) => parts.iter_mut().filter_map(|p| p.get_mut("text")).for_each(strip_sections),
+        _ => {}
+    }
 }
 
 fn strip_cache_control(value: &mut Value) {
@@ -393,6 +422,18 @@ mod tests {
         let tree = read_tree(&b, true).unwrap();
         assert_eq!(tree.keys().collect::<Vec<_>>(), vec!["src/deep/x.js"]);
         assert_eq!(tree["src/deep/x.js"], b"x\r\n");
+    }
+
+    #[test]
+    fn marv_rs_only_prompt_sections_are_left_out_of_the_comparison() {
+        let body = json!({"messages": [
+            {"role": "system", "content": "You are Marv.\n\n# Sandbox limits\n\nEnds.\n\n# Your situation\n\nNo screen.\n\n# MCP servers\n\nSetup."},
+            {"role": "user", "content": "# Your situation"},
+        ]})
+        .to_string();
+        let canonical: Value = serde_json::from_str(&canonical_request(&body)).unwrap();
+        assert_eq!(canonical["messages"][0]["content"], "You are Marv.\n\n# MCP servers\n\nSetup.");
+        assert_eq!(canonical["messages"][1]["content"], "# Your situation");
     }
 
     #[test]

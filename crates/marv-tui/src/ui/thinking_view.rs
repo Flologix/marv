@@ -8,6 +8,14 @@
 //! looking like a hang. Only the last [`TAIL_CHARS`] are cleaned and split: a draft can be a
 //! 100k-character file.
 //!
+//! **The reasoning preview eases (marv-rs; Marv cut each line at the width).** Reasoning is long
+//! paragraphs: cut at the width, a row sat frozen on a paragraph's start until its newline, then all
+//! three rows jumped. Here reasoning is word-wrapped to the width and the last [`PREVIEW_LINES`]
+//! wrapped rows are shown, so with the app's paced reveal the text types along a row and the rows
+//! scroll up one at a time. Once the preview has text it keeps all [`PREVIEW_LINES`] rows (blank ones
+//! below while it fills), so the prompt under it doesn't jump as rows arrive. Code (drafts) keeps
+//! its lines and indentation, cut at the width.
+//!
 //! [`DraftView`]: a tool call still streaming (a write_file's content streams for minutes; a
 //! trajectory had 18k tokens) shows `Writing src/app.js… (8s · ~400 tokens)` and the code's last
 //! lines with their indentation (tabs → 2 spaces). Ollama sends nothing while writing a call, so it
@@ -28,6 +36,7 @@ use marv_core::printable;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use super::markdown::wrap_text;
 use super::select::truncate_end;
 use super::status_bar::tokens;
 use super::theme;
@@ -88,14 +97,26 @@ impl ThinkingView {
         // Only the end is shown, so only the end is cleaned up: a draft can be a 100k-character file.
         let start = thought.char_indices().rev().nth(TAIL_CHARS.saturating_sub(1)).map_or(0, |(i, _)| i);
         let tail = printable(&thought[start..]);
-        let rows: Vec<String> = tail
+        let style = dim.add_modifier(Modifier::ITALIC);
+        let hard = tail
             .split('\n')
             .map(|l| if self.code { l.replace('\t', "  ").trim_end().to_string() } else { l.trim().to_string() })
-            .filter(|l| !l.trim().is_empty())
-            .collect();
-        for row in &rows[rows.len().saturating_sub(PREVIEW_LINES)..] {
-            let style = dim.add_modifier(Modifier::ITALIC);
-            lines.push(truncate_end(Line::from(Span::styled(format!("  {row}"), style)), width));
+            .filter(|l| !l.trim().is_empty());
+        let rows: Vec<Line<'static>> = if self.code {
+            hard.map(|row| truncate_end(Line::from(Span::styled(format!("  {row}"), style)), width)).collect()
+        } else {
+            hard.flat_map(|row| wrap_text(&row, style, width.saturating_sub(2).max(1)))
+                .map(|row| {
+                    let mut spans = vec![Span::styled("  ", style)];
+                    spans.extend(row.spans);
+                    Line::from(spans)
+                })
+                .collect()
+        };
+        let shown = &rows[rows.len().saturating_sub(PREVIEW_LINES)..];
+        lines.extend(shown.iter().cloned());
+        if !shown.is_empty() && !self.code {
+            lines.extend((shown.len()..PREVIEW_LINES).map(|_| Line::default()));
         }
         lines.push(Line::default());
         lines
@@ -214,6 +235,29 @@ pub fn draft_preview(name: &str, args: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rows(lines: &[Line<'_>]) -> Vec<String> {
+        lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect()
+    }
+
+    #[test]
+    fn reasoning_wraps_and_shows_its_last_rows_and_keeps_its_height() {
+        let t = Instant::now();
+        let view = ThinkingView::new("Thinking…", t);
+        // One long paragraph: its end shows, wrapped, not its start cut at the width.
+        let thought = "one two three four five six seven eight nine ten eleven twelve";
+        let shown = rows(&view.render(thought, None, t, 16));
+        assert_eq!(shown.len(), 1 + PREVIEW_LINES + 1, "{shown:?}");
+        assert!(shown[PREVIEW_LINES].contains("twelve"), "{shown:?}");
+        assert!(!shown.iter().any(|r| r.contains("one two")), "{shown:?}");
+        // While it fills, blank rows hold the height.
+        let short = rows(&view.render("just started", None, t, 40));
+        assert_eq!(short.len(), 1 + PREVIEW_LINES + 1, "{short:?}");
+        assert_eq!(short[1].trim(), "just started");
+        assert!(short[2].is_empty() && short[3].is_empty());
+        // No reasoning yet: just the waiting line.
+        assert_eq!(view.render("", None, t, 40).len(), 2);
+    }
 
     fn text(lines: &[Line]) -> Vec<String> {
         lines.iter().map(|l| l.to_string()).collect()

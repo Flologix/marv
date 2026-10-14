@@ -80,6 +80,8 @@ Each one is recorded in the module doc that makes it:
   - `printable()` in headless output;
   - no runtime reading the project's bunfig/.env.
 - **Sprint 5 items built in from the start:** #56, #57, #58, #59, #64, plus the #63 structure.
+- **Situational prompt:** Marv #50's `# Sandbox limits`, ported early, plus a marv-rs `# Your situation` section (what the model can't see or do, short replies). The oracle skips both sections when it compares requests.
+- **TUI streaming:** text is revealed at a pace (a burst drains over ~120 ms) instead of in 33 ms clumps, and the reasoning preview is wrapped with a fixed height.
 - **Serialization:**
   - schema keys are sorted. This is still byte-stable, but differs from Marv's key order; the oracle compares requests with TypeScript Marv's as canonical JSON and checks only each run's own requests byte for byte (the prefix rule), so this passes without `preserve_order` (oracle.md);
   - lengths are counted in `char`s.
