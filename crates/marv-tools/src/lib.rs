@@ -47,8 +47,9 @@ pub use registry::{
 pub use schema_repair::RepairMode;
 pub use types::{
     AgentHost, AgentProgress, Approval, ApprovalRequest, Approver, BeforeChange, Checkpoint, Decision, DiffKind, DiffLine,
-    DiffShown, DynTool, MemoryPaths, PlanHost, PlanItem, PlanStatus, Preview, PreviewFile, ProcessForward, ProcessForwards,
-    ProcessHost, ProcessInfo, ProcessState, Repaired, Scope, Skill, StartResult, Tool, ToolContext, ToolError, ToolOutput,
+    DiffShown, DynTool, MemoryPaths, NetworkFailures, PlanHost, PlanItem, PlanStatus, Preview, PreviewFile, ProcessForward,
+    ProcessForwards, ProcessHost, ProcessInfo, ProcessState, Repaired, Scope, Skill, StartResult, Tool, ToolContext, ToolError,
+    ToolOutput,
 };
 
 #[cfg(test)]

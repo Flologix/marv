@@ -20,7 +20,7 @@ Spec: the **Sandbox** and **Yolo mode** bullets in Marv's `CLAUDE.md`, `src/sand
 | `src/sandbox.ts` (`TOOLCHAINS`, `CREDENTIALS`, `credentialMasks`, `hiddenPathFolders`) | `home.rs` | **Ported and tested** |
 | `src/tools/files.ts` (`resolveInProject`, `insideGitDir`, `touchesGit`, `refuseGit`, `projectPath`) | `paths.rs` | **Ported and tested.** New: `resolve_within`, the realpath containment check for skill files, with a symlink test |
 | `src/tools/bash.ts` (`gitGuard`, `worktreeGit`, `worktreeGitDirs`) | `git_guard.rs` | **Ported and tested** |
-| `src/tools/bash.ts` (`GIT_HINT`, `HOME_NOTE`, `NETWORK_NOTE`, `GH_NOTE`, `GH_TOOL_NOTE`, `BACKGROUND_NOTE`, `BACKGROUND_NOTE_PROCESS`, `touchesHiddenHome`, `backgroundsProcess`, `looksLikeNetworkFailure`) | `notes.rs` | **Ported and tested** (regex has no lookahead, so the word ends are checked by hand, and `backgrounds_process`'s `&` lookahead is a consuming group). The background notes and `backgrounds_process` (Marv #50, #51) came with #24 |
+| `src/tools/bash.ts` (`GIT_HINT`, `HOME_NOTE`, `NETWORK_NOTE`, `GH_NOTE`, `GH_TOOL_NOTE`, `BACKGROUND_NOTE`, `BACKGROUND_NOTE_PROCESS`, `touchesHiddenHome`, `backgroundsProcess`, `looksLikeNetworkFailure`) | `notes.rs` | **Ported and tested** (regex has no lookahead, so the word ends are checked by hand, and `backgrounds_process`'s `&` lookahead is a consuming group). The background notes and `backgrounds_process` (Marv #50, #51) came with #24. marv-rs #81: `ESCALATED_NOTE`, on a retry bash ran with network because the same command already got `NETWORK_NOTE` |
 | new (`docs/SECURITY.md`) | `protected.rs` | **Done and tested:** `PROTECTED_PATHS`, `rule_for_relative`, `protected_rule`/`is_protected` (realpath, a dangling final symlink followed, fails closed), `hooks_path`, `lifecycle_scripts_changed`, `protected_mounts` (top level only), and the post-command scan: `protected_snapshot`, `scan_created`, `revert_created`, `created_note` (#8); `is_secret_name` (docs/SECURITY.md's secret names: `.env*` but `.envrc`, `*.pem`, `id_*`; used by instruction files, #62; the read_file gate is still to come) |
 | `src/tools/bash.ts` (`secretVariable`, `hostEnv`) | `host_env.rs` | **Ported and tested** (marv-rs #23, Marv #52; `host-env.test.ts`): the environment of what runs on the host, Marv's keys and secret-looking variables stripped |
 | new (`docs/SECURITY.md`) | `taint.rs` | **Done and tested:** `TaintState` (`mark`, `is_tainted`, `must_ask`, approved prefixes, `for_subagent`) |
@@ -60,7 +60,7 @@ pub fn protected::created_note(created: &[CreatedProtected]) -> Option<String>; 
 pub struct TaintState;  // mark(Provenance) -> bool, is_tainted(), sources(), must_ask(ToolKind, uses_network), approve_prefix, prefix_approved, for_subagent
 pub fn git_guard::git_guard(root: &Path) -> GitGuard;  // { read_only, placeholders }
 pub fn home::hidden_path_folders(path: &str, home: &Path, root: Option<&Path>, exists: &dyn Fn(&Path) -> bool) -> Vec<PathBuf>;
-pub fn notes::{looks_like_network_failure, runs_gh, touches_hidden_home}; pub const notes::{GIT_HINT, HOME_NOTE, NETWORK_NOTE, GH_NOTE};
+pub fn notes::{looks_like_network_failure, runs_gh, touches_hidden_home}; pub const notes::{GIT_HINT, HOME_NOTE, NETWORK_NOTE, ESCALATED_NOTE, GH_NOTE};
 ```
 
 ## Port notes
