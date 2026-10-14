@@ -32,6 +32,7 @@ use marv_tools::{
 use tokio_util::sync::CancellationToken;
 
 use crate::agents::AgentType;
+use crate::approvals;
 use crate::provenance::fence;
 
 /// How a call was approved, as `ToolRun::approval` records it.
@@ -148,27 +149,53 @@ impl ToolRunner for SessionToolRunner {
     }
 }
 
-/// "Yes, don't ask again" scopes, shared by the main agent's turns (and, filtered, its subagents).
+/// "Yes, don't ask again" scopes, shared by the main agent's turns (and, filtered, its subagents). Two kinds:
+/// - what a person answered "always" to, remembered as the request's exact scope key (`add`);
+/// - what the session was pre-approved (#98: the config's `"approve"`, or the TUI's `--approve`): scope-key
+///   *prefixes* (`seed`), which answer anything whose key they cover — the same matching `marv -p --approve` uses
+///   ([`approvals::prefix_covers`]), so a scope name means one thing everywhere.
+///
+/// A `must_ask` request (tainted egress, a protected path) is never answered from either (`SessionApprover`).
 #[derive(Debug, Clone, Default)]
-pub struct AlwaysScopes(Arc<Mutex<HashSet<String>>>);
+pub struct AlwaysScopes {
+    exact: Arc<Mutex<HashSet<String>>>,
+    seeds: Arc<Mutex<HashSet<String>>>,
+}
 
 /// Scope prefixes a subagent never inherits: what reaches the network or leaves the sandbox.
 pub const NOT_INHERITED: [&str; 4] = ["bash:net:", "web:", "mcp:", "mesh:"];
 
 impl AlwaysScopes {
     pub fn contains(&self, key: &str) -> bool {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).contains(key)
+        let seeds = self.seeds.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect::<Vec<_>>();
+        self.exact.lock().unwrap_or_else(|e| e.into_inner()).contains(key) || approvals::prefix_covers(&seeds, key)
     }
+
+    /// A person's "always": the exact scope key, as today.
     pub fn add(&self, key: impl Into<String>) {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).insert(key.into());
+        self.exact.lock().unwrap_or_else(|e| e.into_inner()).insert(key.into());
     }
+
+    /// Pre-approved scope-key prefixes (#98), from the config's `"approve"` / the TUI's `--approve`.
+    pub fn seed(&self, prefixes: &[String]) {
+        self.seeds.lock().unwrap_or_else(|e| e.into_inner()).extend(prefixes.iter().cloned());
+    }
+
     pub fn clear(&self) {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.exact.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.seeds.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
-    /// A subagent's own set: the parent's scopes without network, web, MCP or mesh ones (docs/SECURITY.md).
+
+    /// A subagent's own set: the parent's scopes (remembered and seeded) without network, web, MCP or mesh ones
+    /// (docs/SECURITY.md) — so a worker never inherits the config's egress pre-approvals either.
     pub fn for_subagent(&self) -> Self {
-        let parent = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        Self(Arc::new(Mutex::new(parent.iter().filter(|k| !NOT_INHERITED.iter().any(|p| k.starts_with(p))).cloned().collect())))
+        let keep = |keys: &HashSet<String>| -> HashSet<String> {
+            keys.iter().filter(|k| !NOT_INHERITED.iter().any(|p| k.starts_with(p))).cloned().collect()
+        };
+        Self {
+            exact: Arc::new(Mutex::new(keep(&self.exact.lock().unwrap_or_else(|e| e.into_inner())))),
+            seeds: Arc::new(Mutex::new(keep(&self.seeds.lock().unwrap_or_else(|e| e.into_inner())))),
+        }
     }
 }
 
@@ -373,6 +400,50 @@ mod tests {
                 && !sub.contains("web:docs.rs")
                 && !sub.contains("mcp:gh:search")
                 && !sub.contains("mesh:agent.x.inbox")
+        );
+    }
+
+    // #98: the config's (or the TUI's --approve) pre-approved scopes seed "always" prefixes, which answer their
+    // keys like a person's "always" would.
+    #[tokio::test]
+    async fn seeded_scopes_answer_their_keys_but_nothing_else() {
+        let inner = Arc::new(Counting(Mutex::default(), Decision::Yes));
+        let always = AlwaysScopes::default();
+        always.seed(&["web:".into(), "bash:net:".into()]);
+        let a = SessionApprover { inner: inner.clone(), always: always.clone(), cancel: CancellationToken::new() };
+        assert_eq!(a.approve(request("web:docs.rs", false)).await, Decision::Yes);
+        assert_eq!(a.approve(request("bash:net:curl example.com", false)).await, Decision::Yes);
+        assert_eq!(inner.0.lock().unwrap().len(), 0, "nobody was asked");
+        assert_eq!(a.approve(request("github:pr merge", false)).await, Decision::Yes);
+        assert_eq!(inner.0.lock().unwrap().len(), 1, "an unseeded scope asks");
+    }
+
+    // Guard (#98, docs/SECURITY.md): a config approve scope never covers what asks even in yolo — a must_ask
+    // request (tainted egress, a protected path) reaches the person every time, seeds or not.
+    #[tokio::test]
+    async fn seeded_scopes_never_answer_must_ask() {
+        let inner = Arc::new(Counting(Mutex::default(), Decision::Yes));
+        let always = AlwaysScopes::default();
+        always.seed(&["web:".into(), "bash:net:".into()]);
+        let a = SessionApprover { inner: inner.clone(), always, cancel: CancellationToken::new() };
+        assert_eq!(a.approve(request("web:docs.rs", true)).await, Decision::Yes);
+        assert_eq!(a.approve(request("web:docs.rs", true)).await, Decision::Yes);
+        assert_eq!(inner.0.lock().unwrap().len(), 2, "the person was asked both times");
+    }
+
+    // Guard (#98, docs/SECURITY.md): subagents don't inherit the config's network/web/MCP/mesh pre-approvals, the
+    // same as for_subagent today. A seeded "files" (no egress) stays.
+    #[test]
+    fn subagents_dont_inherit_seeded_egress_scopes() {
+        let always = AlwaysScopes::default();
+        always.seed(&["web:".into(), "bash:net:".into(), "mcp:".into(), "mesh:agent.x.inbox:".into(), "files".into()]);
+        let sub = always.for_subagent();
+        assert!(sub.contains("files"));
+        assert!(
+            !sub.contains("web:docs.rs")
+                && !sub.contains("bash:net:curl")
+                && !sub.contains("mcp:gh:search")
+                && !sub.contains("mesh:agent.x.inbox:send")
         );
     }
 

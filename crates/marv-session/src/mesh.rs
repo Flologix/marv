@@ -21,7 +21,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use marv_agent::agent::AfterStep;
 use marv_core::{Provenance, ToolKind};
-use marv_mesh::approval::{WireRequest, parse_approve_flag};
+use marv_mesh::approval::WireRequest;
 use marv_mesh::limits::WireLimits;
 use marv_mesh::plug::{Plug, PlugClient};
 use marv_mesh::switchboard::{Switchboard, TrajectorySink};
@@ -145,20 +145,6 @@ impl marv_mesh::discovery::PeerApprover for DoorWires {
 /// The session's wire approver: the client's own, else a person through the client's tool approver.
 pub fn wire_approver(own: Option<Arc<dyn WireApprover>>, approve: Option<&Arc<dyn Approver>>) -> Option<Arc<dyn WireApprover>> {
     own.or_else(|| approve.map(|inner| Arc::new(PersonWires { inner: inner.clone(), by: WireBy::Tui }) as Arc<dyn WireApprover>))
-}
-
-/// `--approve mesh:<receptacle>` flags → the receptacles pre-approved for headless `send`s, and the other flags (for
-/// `buildApprover`). A malformed receptacle name is an error naming the flag.
-pub fn headless_grants(flags: &[String]) -> Result<(Vec<ReceptacleName>, Vec<String>), String> {
-    let (mut receptacles, mut rest) = (Vec::new(), Vec::new());
-    for flag in flags {
-        match parse_approve_flag(flag) {
-            Some(Ok(name)) => receptacles.push(name),
-            Some(Err(err)) => return Err(format!("--approve {flag}: {err}")),
-            None => rest.push(flag.clone()),
-        }
-    }
-    Ok((receptacles, rest))
 }
 
 /// The unread messages in `agent`'s inbox, fenced, as one note for the model; marks the session tainted (Mesh).
@@ -432,10 +418,11 @@ mod tests {
 
     #[test]
     fn mesh_flags_are_split_from_the_rest() {
-        let (grants, rest) = headless_grants(&["git_write".into(), "mesh:agent.parent.inbox".into()]).unwrap();
+        // The split moved to `approvals::parse_approvals` (#98); a mesh flag stays a wire grant, the rest expand.
+        let (grants, prefixes) = crate::approvals::parse_approvals(&["git_write".into(), "mesh:agent.parent.inbox".into()]).unwrap();
         assert_eq!(grants.len(), 1);
-        assert_eq!(rest, vec!["git_write"]);
-        assert!(headless_grants(&["mesh:Not A Name".into()]).is_err());
+        assert!(prefixes.contains(&"bash:git:".to_string()));
+        assert!(crate::approvals::parse_approvals(&["mesh:Not A Name".into()]).is_err());
     }
 
     #[derive(Default)]

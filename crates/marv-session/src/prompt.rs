@@ -56,6 +56,11 @@ pub struct PromptInput {
     pub mcp: bool,
     /// The doors out of the sandbox this session has: the "# Outside the sandbox" section names only these.
     pub doors: PromptDoors,
+    /// Pre-approved scopes this session (#98), as the config/`--approve` names them ("web", "network"…). Empty
+    /// when nothing is: the section says nothing extra then.
+    pub pre_approved: Vec<String>,
+    /// Extra writable sandbox folders (#98), outside the project, shortened for display ("~/Projects/x/.beads").
+    pub writable: Vec<String>,
     /// `YYYY-MM-DD`.
     pub date: String,
 }
@@ -122,14 +127,30 @@ pub const SITUATION_HEADING: &str = "# Your situation";
 /// promised to open a terminal tab "outside the sandbox", called an unrelated MCP tool to try, read `../hack.py` for
 /// `~/hack.py`, and closed every reply with a menu of options. Fixed per session (`home`: the working directory is the
 /// home folder itself), so the prompt cache holds.
-pub fn situation_section(home: bool) -> String {
+///
+/// #98: also what's pre-approved this session and which folders outside the project are writable (the model plans
+/// around them instead of asking), each only when set.
+pub fn situation_section(home: bool, pre_approved: &[String], writable: &[String]) -> String {
     let home = if home {
         " The working directory is the user's home folder itself, so here the home folder is the project: its files are visible and writable, and a path like ~/notes.txt is notes.txt."
     } else {
         ""
     };
+    let approved = if pre_approved.is_empty() {
+        ""
+    } else {
+        &format!(" Pre-approved for this session (they run without asking): {}.", pre_approved.join(", "))
+    };
+    let folders = if writable.is_empty() {
+        ""
+    } else {
+        &format!(
+            " Folders writable in your sandbox besides the project (set in config): {}.",
+            writable.iter().map(|d| format!("`{d}`")).collect::<Vec<_>>().join(", ")
+        )
+    };
     format!(
-        "\n\n{SITUATION_HEADING}\n\nYou work only through your tools. You have no screen: you can't open a window, a terminal, a tab or a pane, or show the user anything live. The user sees your messages and a one-line summary of each tool call, not its output, so quote what matters. A program that draws (a TUI, an animation, a game) shows nothing here: to check that it runs, run it briefly with timeout; for the user to see it, give them the command to run in their own terminal. Commands don't run inside the user's terminal or its multiplexer (Herdr, tmux): those variables and sockets aren't in the sandbox, so a script that needs them fails here.{home}\n\nKnow your limits before you start. When none of your tools can do what's asked, say so in a sentence and give the user the exact command to run, instead of trying tools that weren't made for it: a tool does only what its description says, and is never a way around a limit. Keep replies short: answer first, don't narrate what you're about to do, and don't end with a menu of options or offers. Ask a question only when you need the answer to go on."
+        "\n\n{SITUATION_HEADING}\n\nYou work only through your tools. You have no screen: you can't open a window, a terminal, a tab or a pane, or show the user anything live. The user sees your messages and a one-line summary of each tool call, not its output, so quote what matters. A program that draws (a TUI, an animation, a game) shows nothing here: to check that it runs, run it briefly with timeout; for the user to see it, give them the command to run in their own terminal. Commands don't run inside the user's terminal or its multiplexer (Herdr, tmux): those variables and sockets aren't in the sandbox, so a script that needs them fails here.{home}\n\nKnow your limits before you start. When none of your tools can do what's asked, say so in a sentence and give the user the exact command to run, instead of trying tools that weren't made for it: a tool does only what its description says, and is never a way around a limit. Keep replies short: answer first, don't narrate what you're about to do, and don't end with a menu of options or offers. Ask a question only when you need the answer to go on.{approved}{folders}"
     )
 }
 
@@ -203,7 +224,7 @@ pub fn system_prompt(input: &PromptInput) -> String {
     // With the process door, its paragraph says what this one did (and where to go instead).
     let limits = if input.tools.iter().any(|t| t == "bash") && !input.doors.process { SANDBOX_LIMITS } else { "" };
     let outside = outside_section(&input.doors);
-    let situation = situation_section(input.cwd == "~");
+    let situation = situation_section(input.cwd == "~", &input.pre_approved, &input.writable);
     format!(
         "{base}{limits}{outside}{situation}{remembered}{}{agents}{web}{MCP_SETUP}{}{}",
         skills_section(&input.skills),
@@ -613,6 +634,26 @@ mod tests {
         assert!(prompt.contains("use process (start, logs, stop, list)"));
         // Right after the tools paragraphs, where the limits were, before marv-rs's own section.
         assert!(prompt.find("# Outside the sandbox").unwrap() < prompt.find(SITUATION_HEADING).unwrap());
+    }
+
+    // #98: the situation section lists what's pre-approved and which extra folders are writable — each only when
+    // set, and byte-stable for the same input (the prompt cache).
+    #[test]
+    fn the_situation_section_lists_pre_approved_scopes_and_writable_folders() {
+        let none = situation_section(false, &[], &[]);
+        assert!(!none.contains("Pre-approved"), "{none}");
+        assert!(!none.contains("writable in your sandbox"), "{none}");
+        let some = situation_section(false, &["web".into(), "network".into()], &["~/Projects/marv/.beads".into()]);
+        assert!(some.contains("Pre-approved for this session (they run without asking): web, network."), "{some}");
+        assert!(some.contains("Folders writable in your sandbox besides the project (set in config): `~/Projects/marv/.beads`."), "{some}");
+        assert_eq!(some, situation_section(false, &["web".into(), "network".into()], &["~/Projects/marv/.beads".into()]));
+        // In the full prompt the sections stay fixed per session (the input's).
+        let mut listed = input();
+        listed.pre_approved = vec!["github".into()];
+        listed.writable = vec!["~/x".into()];
+        let prompt = system_prompt(&listed);
+        assert!(prompt.contains("Pre-approved for this session (they run without asking): github."));
+        assert!(prompt.contains("`~/x`"));
     }
 
     #[test]

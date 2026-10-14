@@ -105,6 +105,12 @@ pub struct SessionOptions {
     /// forwarded to 127.0.0.1, each start through your approver (`door: process`; scope `process:<command>`). Default
     /// true, where bubblewrap works. `close()` stops them all.
     pub processes: bool,
+    /// Pre-approved scopes (#98): `--approve`-style names ("web", "network"…) that seed the session's "always"
+    /// scopes, and are listed in the prompt. A subagent inherits the egress ones never. Default: none.
+    pub pre_approved: Vec<String>,
+    /// Extra writable sandbox folders (#98), e.g. bd's database folder: canonical paths, already checked
+    /// (`marv_sandbox::resolve_writable`), bound read-write into every command's sandbox. Default: none.
+    pub writable: Vec<PathBuf>,
 }
 
 /// Builds a [`MarvSession`] (Marv's `createSession`).
@@ -144,6 +150,8 @@ impl SessionBuilder {
                 mesh: None,
                 wire_approver: None,
                 processes: true,
+                pre_approved: Vec::new(),
+                writable: Vec::new(),
             },
         }
     }
@@ -174,6 +182,16 @@ impl SessionBuilder {
     }
     pub fn processes(mut self, on: bool) -> Self {
         self.options.processes = on;
+        self
+    }
+    /// Pre-approved scopes (#98): `--approve` names ("web", "network"…) seeded as "always" for the session.
+    pub fn pre_approve(mut self, names: &[String]) -> Self {
+        self.options.pre_approved = names.to_vec();
+        self
+    }
+    /// Extra writable sandbox folders (#98), already checked (`marv_sandbox::resolve_writable`).
+    pub fn writable(mut self, folders: Vec<PathBuf>) -> Self {
+        self.options.writable = folders;
         self
     }
     pub fn max_steps(mut self, steps: u32) -> Self {
@@ -315,6 +333,8 @@ pub async fn create_session(options: SessionOptions) -> Result<MarvSession, Sess
     init.on_warning = options.on_warning.clone();
     init.problems = problems;
     init.processes = options.processes;
+    init.pre_approved = options.pre_approved;
+    init.writable = options.writable;
     let session = MarvSession::new(init)?;
     if let Some(mcp) = &session.mcp() {
         // A server that needs a login is told once (again only after it connected meanwhile).

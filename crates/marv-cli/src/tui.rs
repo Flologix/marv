@@ -771,6 +771,12 @@ pub struct Startup {
     /// Shortened for display.
     pub hidden_path_folders: Vec<String>,
     pub sandbox_available: bool,
+    /// Pre-approved scopes (#98): the config's "approve" and the run's --approve, seeded as "always".
+    pub pre_approved: Vec<String>,
+    /// Extra writable sandbox folders (#98), resolved (canonical, refused ones left out).
+    pub writable: Vec<PathBuf>,
+    /// Problems with those two (an unknown scope name, a refused writable folder), for the startup notice.
+    pub approval_problems: Vec<String>,
     /// gh is there and logged in (checked once at startup): the session offers the github tool (#47).
     pub github: bool,
     pub sessions: Option<Arc<SessionStore>>,
@@ -809,6 +815,9 @@ pub struct Bridge {
     mcp_problems: Vec<String>,
     hidden_path_folders: Vec<String>,
     sandbox_available: bool,
+    pre_approved: Vec<String>,
+    writable: Vec<PathBuf>,
+    approval_problems: Vec<String>,
     sessions: Option<Arc<SessionStore>>,
     trajectories_dir: Option<PathBuf>,
     last_checks: Mutex<Option<ProjectCheckResult>>,
@@ -851,6 +860,10 @@ impl Bridge {
         init.max_steps = Some(config.max_steps);
         (init.sandbox, init.yolo, init.diagnostics, init.checks, init.mcp_tools) =
             (config.sandbox, config.yolo, config.diagnostics, config.checks, config.mcp_tools);
+        // #98: the config's "approve" and this run's --approve seed the session's "always" scopes; the writable
+        // folders are resolved and checked already (refused ones are in approval_problems, not here).
+        init.pre_approved = s.pre_approved.clone();
+        init.writable = s.writable.clone();
         // The person at this terminal approves each command on the host (#52); gh where it's logged in (#47).
         init.host_commands = true;
         init.github = s.github;
@@ -898,6 +911,9 @@ impl Bridge {
             mcp_problems: s.mcp_problems,
             hidden_path_folders: s.hidden_path_folders,
             sandbox_available: s.sandbox_available,
+            pre_approved: s.pre_approved,
+            writable: s.writable,
+            approval_problems: s.approval_problems,
             sessions: s.sessions,
             trajectories_dir,
             last_checks: Mutex::default(),
@@ -984,6 +1000,42 @@ impl Bridge {
         }
         if !self.hidden_path_folders.is_empty() {
             notes.push((NoticeTone::Warning, hidden_path_folders_item(&self.hidden_path_folders)));
+        }
+        // #98: what's pre-approved and which extra folders are writable — so the user sees what Marv won't ask
+        // about (and what a problem with those settings means).
+        if !self.approval_problems.is_empty() {
+            notes.push((
+                NoticeTone::Warning,
+                NoticeItem {
+                    text: "A problem with your pre-approved scopes or writable folders".into(),
+                    detail: Some(self.approval_problems.clone()),
+                },
+            ));
+        }
+        if !self.pre_approved.is_empty() {
+            notes.push((
+                NoticeTone::Info,
+                NoticeItem {
+                    text: format!("Pre-approved for this session: {}", self.pre_approved.join(", ")),
+                    detail: Some(vec![
+                        "They run without asking, like \"always\" at the start of the session.".into(),
+                        "Protected paths, package.json lifecycle scripts, mesh wires and tainted egress still ask.".into(),
+                    ]),
+                },
+            ));
+        }
+        if !self.writable.is_empty() {
+            let shown: Vec<String> = self.writable.iter().map(|d| shorten_home(d, &self.home)).collect();
+            notes.push((
+                NoticeTone::Info,
+                NoticeItem {
+                    text: format!(
+                        "Writable in the sandbox besides the project: {}",
+                        shown.iter().map(|d| format!("`{d}`")).collect::<Vec<_>>().join(", ")
+                    ),
+                    detail: Some(vec!["Commands can write there without asking; nothing else outside the project.".into()]),
+                },
+            ));
         }
         if let Some(cut) = cut {
             let item = instructions_cut_item(cut);
@@ -1892,7 +1944,28 @@ impl SessionPort for Port {
 // ---------------------------------------------------------------------------------------------------------------------
 
 /// Runs the interactive session. `resume`: `Some(true)` for -c (latest), `Some(false)` for -r (pick).
-pub async fn run(resume: Option<bool>) -> anyhow::Result<i32> {
+/// Pre-approved scopes (#98): the config's "approve" and this run's --approve, merged and deduped, seeded as
+/// "always" for the session through the session's own path (so must_ask and taint still win; a subagent inherits
+/// neither). An unknown name is a problem for the startup notice, never a silent approval.
+pub fn merge_pre_approved(mut from_config: Vec<String>, from_cli: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut problems = Vec::new();
+    for name in from_cli {
+        match marv_session::approvals::parse_approvals(std::slice::from_ref(name)) {
+            Ok(_) if !from_config.contains(name) => from_config.push(name.clone()),
+            Ok(_) => {}
+            Err(problem) => problems.push(problem),
+        }
+    }
+    (from_config, problems)
+}
+
+/// Extra writable sandbox folders (#98): resolved once here (refused entries are problems, never mounts).
+pub fn resolve_writable(config: &[String], home: &Path, root: &Path) -> (Vec<PathBuf>, Vec<String>) {
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from);
+    marv_sandbox::resolve_writable(config, home, root, runtime.as_deref())
+}
+
+pub async fn run(resume: Option<bool>, approve: Vec<String>) -> anyhow::Result<i32> {
     // The real environment only (docs/SECURITY.md): never a project's .env.
     let env: Env = std::env::vars().collect();
     let home = home_dir();
@@ -1928,8 +2001,11 @@ pub async fn run(resume: Option<bool>) -> anyhow::Result<i32> {
             return Ok(1);
         }
     };
-    // PATH folders under the home folder the sandbox hides are found once here and reported at startup (Marv #34:
-    // with node from mise, the post-edit typecheck and other node_modules scripts silently never ran).
+    let config = resolve_config(file.as_ref(), &env);
+    // Pre-approved scopes (#98) and the writable folders, resolved once (refused ones are problems, not mounts).
+    let (pre_approved, mut approval_problems) = merge_pre_approved(config.approve.clone(), &approve);
+    let (writable, writable_problems) = resolve_writable(&config.writable, &home, &root);
+    approval_problems.extend(writable_problems);
     let hidden = marv_sandbox::home::hidden_path_folders(
         env.get("PATH").map(String::as_str).unwrap_or_default(),
         &home,
@@ -1981,6 +2057,9 @@ pub async fn run(resume: Option<bool>) -> anyhow::Result<i32> {
         mcp_problems,
         hidden_path_folders: hidden,
         sandbox_available: marv_sandbox::bwrap::sandbox_available(),
+        pre_approved,
+        writable,
+        approval_problems,
         github,
         sessions: Some(Arc::new(SessionStore::new(config_dir.join("sessions")))),
         trajectories: Some(Arc::new(TrajectoryStore::new(config_dir.join("trajectories")))),
@@ -2067,6 +2146,18 @@ mod tests {
     use serde_json::Value;
     use std::collections::VecDeque;
     use std::sync::atomic::AtomicUsize;
+
+    // #98: the TUI's --approve merges with the config's "approve" list; an unknown name is a problem, and the
+    // valid ones still stand.
+    #[test]
+    fn the_tui_merges_config_and_cli_approve_scopes() {
+        let (scopes, problems) = merge_pre_approved(vec!["web".into()], &["network".to_string(), "web".to_string()]);
+        assert_eq!(scopes, ["web", "network"], "deduped, cli after config");
+        assert!(problems.is_empty());
+        let (scopes, problems) = merge_pre_approved(vec!["web".into()], &["netwrk".to_string()]);
+        assert_eq!(scopes, ["web"], "the typo doesn't reach the session");
+        assert!(problems[0].contains("Unknown --approve scope"), "{:?}", problems);
+    }
     use tokio::sync::mpsc::UnboundedReceiver;
 
     /// Replays one scripted reply per request (Marv's `tests/fake-provider.ts`).
@@ -2195,6 +2286,9 @@ mod tests {
             mcp_problems: Vec::new(),
             hidden_path_folders: Vec::new(),
             sandbox_available: false,
+            pre_approved: Vec::new(),
+            writable: Vec::new(),
+            approval_problems: Vec::new(),
             github: false,
             sessions: Some(Arc::new(SessionStore::new(dirs.config.join("sessions")))),
             trajectories: None,
@@ -2625,6 +2719,40 @@ mod tests {
         assert!(texts(&seen)[0].starts_with("Saved to ") && texts(&seen)[0].ends_with("· Ollama · qwen3.5:9b"));
         let saved = ConfigStore::new(&dirs.config).load().unwrap().unwrap();
         assert_eq!((saved.provider, saved.model.as_deref()), (Some(ProviderKind::Ollama), Some("qwen3.5:9b")));
+    }
+
+    // #98: the startup notice names what's pre-approved, which extra folders are writable, and any problem.
+    #[tokio::test]
+    async fn the_startup_notice_names_pre_approved_scopes_and_writable_folders() {
+        let dirs = Dirs::new();
+        let mut s = startup(&dirs, None, vec![], None);
+        s.pre_approved = vec!["web".into(), "network".into()];
+        s.writable = vec![dirs.config.join("beads")];
+        s.approval_problems = vec!["Refusing writable sandbox folder \"~/.ssh\": it is, or holds, a protected path.".into()];
+        let (tx, mut rx) = unbounded_channel();
+        let bridge = Bridge::start(s, tx).unwrap();
+        bridge.announce(None);
+        let seen = until(&mut rx, |e| matches!(e, UiEvent::OpenSetup(_))).await;
+        let (texts, details): (Vec<String>, Vec<String>) = seen
+            .iter()
+            .filter_map(|e| if let UiEvent::Message(m) = e { m.notice.as_ref() } else { None })
+            .map(|n| {
+                (
+                    n.items.iter().map(|i| i.text.clone()).collect::<Vec<_>>().join("\n"),
+                    n.items.iter().flat_map(|i| i.detail.clone().unwrap_or_default()).collect::<Vec<_>>().join("\n"),
+                )
+            })
+            .fold((Vec::new(), Vec::new()), |(mut a, mut b), (t, d)| { a.push(t); b.push(d); (a, b) });
+        let text = texts.join("\n");
+        let detail = details.join("\n");
+        assert!(text.contains("Pre-approved for this session: web, network"), "{text}");
+        assert!(text.contains("Writable in the sandbox besides the project"), "{text}");
+        assert!(text.contains("A problem with your pre-approved scopes or writable folders"), "{text}");
+        assert!(detail.contains("Refusing writable sandbox folder"), "{detail}");
+        assert!(
+            detail.contains("Protected paths, package.json lifecycle scripts, mesh wires and tainted egress still ask"),
+            "{detail}"
+        );
     }
 
     #[test]

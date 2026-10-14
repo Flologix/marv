@@ -280,6 +280,12 @@ pub struct SessionInit {
     pub processes: bool,
     /// The background processes' manager (tests pass one with a fake home); default: one made with the session.
     pub process_manager: Option<ProcessManager>,
+    /// Pre-approved scopes (#98): the config's `"approve"` (and the TUI's `--approve`) scope names. They seed the
+    /// session's "always" scopes and are listed in the prompt; a subagent inherits neither (`NOT_INHERITED`).
+    pub pre_approved: Vec<String>,
+    /// Extra writable sandbox folders (#98): the config's `"writable"`, resolved (`writable::resolve`) and
+    /// canonical, bound read-write into every command's sandbox. Empty: the project is the only writable place.
+    pub writable: Vec<PathBuf>,
 }
 
 impl SessionInit {
@@ -325,6 +331,8 @@ impl SessionInit {
             problems: Vec::new(),
             processes: true,
             process_manager: None,
+            pre_approved: Vec::new(),
+            writable: Vec::new(),
         }
     }
 }
@@ -748,7 +756,7 @@ impl SubagentSink for TurnSink {
 
 impl MarvSession {
     /// Builds a session. Fails (and changes nothing) for a taken tool name, or yolo where `no_yolo` forbids it.
-    pub fn new(init: SessionInit) -> Result<Self, SessionError> {
+    pub fn new(mut init: SessionInit) -> Result<Self, SessionError> {
         let process_on = init.processes && marv_sandbox::sandbox_available();
         // The process tool is built in only where the session offers it: elsewhere the name is free (Marv).
         let custom: Vec<ToolRef> = init.tools.iter().filter(|t| process_on || t.name() != "process").cloned().collect();
@@ -823,9 +831,17 @@ impl MarvSession {
             chain_id,
             pruned: false,
         };
+        // The config's pre-approved scopes (#98) seed the "always" layer: they mean "always, for this session",
+        // through the same path a person's "always" takes, so must_ask and taint still win. An unknown name is a
+        // problem (shown), not a silent approval.
+        let always = AlwaysScopes::default();
+        match crate::approvals::seed_prefixes(&init.pre_approved) {
+            Ok(prefixes) => always.seed(&prefixes),
+            Err(problem) => init.problems.push(problem),
+        }
         let inner = Inner {
             specs,
-            always: AlwaysScopes::default(),
+            always,
             taint: Arc::new(TaintState::new()),
             skills: Arc::new(init.skills.iter().map(|s| s.skill.clone()).collect()),
             loaded: Arc::default(),
@@ -1207,7 +1223,11 @@ impl MarvSession {
             mesh: init.mesh.clone().map(|mesh| MeshAccess { mesh, approver: self.wire_approver() }),
         });
         let mut ctx = ToolContext::new(&init.root);
-        ctx.sandbox = Arc::new(marv_sandbox::Sandbox::from_env(sandbox));
+        let mut sandbox = marv_sandbox::Sandbox::from_env(sandbox);
+        // The config's extra writable folders (#98) ride in every command's sandbox (an approved command's own
+        // writable mounts, e.g. a worktree's .git, still go on top).
+        sandbox.writable = init.writable.clone();
+        ctx.sandbox = Arc::new(sandbox);
         ctx.home = ctx.sandbox.home.clone();
         ctx.cancel = stop.clone();
         ctx.approver = approve.clone();
@@ -2042,6 +2062,9 @@ impl MarvSession {
             // changing the system prompt (the prompt cache).
             mcp: init.mcp.is_some(),
             doors: crate::prompt::PromptDoors { github: init.github, process: self.inner.process_on, host: init.host_commands },
+            // #98: what's pre-approved, and which folders outside the project are writable — fixed per session.
+            pre_approved: init.pre_approved.clone(),
+            writable: init.writable.iter().map(|d| crate::paths::shorten_home(d, &crate::paths::home_dir())).collect(),
             date: crate::time::iso_date(crate::time::now_ms()),
         });
         match &init.system_prompt {

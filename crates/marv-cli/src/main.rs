@@ -93,7 +93,7 @@ fn main() -> ExitCode {
             Mode::MeshLs => mesh_cmd::ls().await,
             Mode::MeshWire { spec } => mesh_cmd::wire(&spec).await,
             Mode::MeshPlug { session, name } => mesh_cmd::plug(&session, name.as_deref()).await,
-            Mode::Interactive { resume } => match tui::run(resume).await {
+            Mode::Interactive { resume, approve } => match tui::run(resume, approve).await {
                 Ok(code) => code,
                 Err(e) => {
                     eprintln!("marv: {}", marv_core::printable(&e.to_string()));

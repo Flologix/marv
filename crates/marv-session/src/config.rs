@@ -89,6 +89,14 @@ pub struct FileConfig {
     pub checkpoints: Option<bool>,
     pub mcp_tools: Option<McpToolsSetting>,
     pub max_steps: Option<MaxStepsSetting>,
+    /// Pre-approved approval scopes (#98), the names `--approve` takes ("web", "network", "github", …). "Always"
+    /// for the session, in the TUI and in `-p`; never covers protected paths, lifecycle scripts, mesh wires or
+    /// tainted egress.
+    pub approve: Option<Vec<String>>,
+    /// Extra writable sandbox folders (#98), e.g. `~/Projects/marv/.beads`: bind-mounted read-write so a tool
+    /// keeping its state outside the project runs inside the sandbox. Refused at startup for the home, `/`,
+    /// `~/.ssh`, `~/.marv`, anything holding credentials (marv_sandbox::writable).
+    pub writable: Option<Vec<String>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -115,6 +123,27 @@ impl FileConfig {
             Some(Value::Bool(b)) => Some(*b),
             Some(_) => {
                 problems.push(format!("{key}: expected a boolean"));
+                None
+            }
+        };
+        let string_list = |key: &str, problems: &mut Vec<String>| match map.get(key) {
+            None | Some(Value::Null) => None,
+            Some(Value::Array(items)) => {
+                let mut out = Vec::new();
+                let mut ok = true;
+                for item in items {
+                    match item.as_str().filter(|s| !s.is_empty()) {
+                        Some(s) => out.push(s.to_string()),
+                        None => ok = false,
+                    }
+                }
+                if !ok {
+                    problems.push(format!("{key}: expected a list of non-empty strings"));
+                }
+                (!out.is_empty()).then_some(out)
+            }
+            Some(_) => {
+                problems.push(format!("{key}: expected a list of strings"));
                 None
             }
         };
@@ -180,6 +209,8 @@ impl FileConfig {
             checkpoints: boolean("checkpoints", &mut problems),
             mcp_tools,
             max_steps,
+            approve: string_list("approve", &mut problems),
+            writable: string_list("writable", &mut problems),
         };
         if problems.is_empty() { Ok(config) } else { Err(problems.join("\n")) }
     }
@@ -205,6 +236,8 @@ impl FileConfig {
         put("checks", self.checks.map(Value::from));
         put("checkpoints", self.checkpoints.map(Value::from));
         put("mcpTools", self.mcp_tools.and_then(|m| serde_json::to_value(m).ok()));
+        put("approve", self.approve.clone().map(Value::from));
+        put("writable", self.writable.clone().map(Value::from));
         put(
             "maxSteps",
             self.max_steps.map(|m| match m {
@@ -241,6 +274,10 @@ pub struct Config {
     pub mcp_tools: McpToolsSetting,
     /// 0 never asks; 1 can't happen. Subagents' own hard limit (50) is not touched by 0.
     pub max_steps: u32,
+    /// Pre-approved scopes (#98), the `--approve` names the config listed. Empty: nothing pre-approved.
+    pub approve: Vec<String>,
+    /// Extra writable sandbox folders (#98), as the config wrote them (`~` still to expand).
+    pub writable: Vec<String>,
 }
 
 impl Config {
@@ -328,6 +365,8 @@ pub fn resolve_config(file: Option<&FileConfig>, env: &Env) -> Config {
         checkpoints: file.and_then(|f| f.checkpoints).unwrap_or(true),
         mcp_tools: file.and_then(|f| f.mcp_tools).unwrap_or_default(),
         max_steps: max_steps_from_env(env.get("MARV_MAX_STEPS").map(String::as_str), file_steps),
+        approve: file.and_then(|f| f.approve.clone()).unwrap_or_default(),
+        writable: file.and_then(|f| f.writable.clone()).unwrap_or_default(),
     }
 }
 
@@ -493,6 +532,43 @@ mod tests {
             assert!(FileConfig::from_value(&json!({"provider": "openrouter", "maxSteps": bad})).is_err());
         }
         assert!(FileConfig::from_value(&json!({"mcpTools": "sometimes"})).is_err());
+    }
+
+    // #98: the config's pre-approved scopes and extra writable folders.
+    #[test]
+    fn approve_and_writable_lists_are_read_and_saved() {
+        let f = FileConfig::from_value(&json!({
+            "provider": "openrouter",
+            "approve": ["web", "network"],
+            "writable": ["~/Projects/marv/.beads"],
+        }))
+        .unwrap();
+        assert_eq!(f.approve.clone().unwrap(), ["web", "network"]);
+        let c = resolve_config(Some(&f), &Env::new());
+        assert_eq!(c.approve, ["web", "network"]);
+        assert_eq!(c.writable, ["~/Projects/marv/.beads"]);
+        // Round-trips as saved (the setup screen writes the file back).
+        let saved = FileConfig::from_value(&f.to_value()).unwrap();
+        assert_eq!(saved, f);
+        // Nothing set: empty, not an error.
+        let none = resolve_config(Some(&file()), &Env::new());
+        assert!(none.approve.is_empty() && none.writable.is_empty());
+    }
+
+    #[test]
+    fn bad_approve_and_writable_lists_are_rejected() {
+        for bad in [
+            json!("web"),
+            json!(3),
+            json!([""]),
+            json!(["web", 7]),
+        ] {
+            for key in ["approve", "writable"] {
+                let mut raw = json!({"provider": "openrouter"});
+                raw[key] = bad.clone();
+                assert!(FileConfig::from_value(&raw).is_err(), "{bad}");
+            }
+        }
     }
 
     #[test]
