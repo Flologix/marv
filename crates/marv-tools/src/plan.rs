@@ -154,7 +154,9 @@ mod tests {
         // #85: on the GLM bench 33 of 47 plan calls were requests of their own (7% of request time).
         let d = Plan.description();
         assert!(d.starts_with("Keep a checklist for a task of four or more steps"));
-        assert!(d.contains("in the same reply as your next tool call; only the final update, marking the last items done, may go alone"));
+        assert!(d.contains(
+            "in the same reply as your next tool call; only the final update, marking the last items done, may go alone"
+        ));
     }
 
     fn call(items: Value) -> ToolCall {
