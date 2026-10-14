@@ -439,6 +439,10 @@ impl ReplyAssembler {
         if let Some(error) = &chunk.error {
             let message = format!("{}: {}", self.label, describe_error(error));
             if crate::errors::transient(error) {
+                // The reply already finished (a finish_reason came): nothing is lost, so don't resend it.
+                if self.complete {
+                    return Flow::Done;
+                }
                 self.upstream = Some(message);
                 return Flow::Broken;
             }
@@ -1174,6 +1178,18 @@ mod tests {
         // A request the provider refuses isn't retried: same code family, different meaning.
         let (_, result) = run(&[r#"{"error":{"code":400,"message":"Provider returned error"}}"#]);
         assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn a_transient_error_after_the_reply_finished_doesnt_resend_it() {
+        // #112 review: finish_reason came, then an upstream error before [DONE]: the reply stands.
+        let (events, result) = run(&[
+            r#"{"choices":[{"delta":{"content":"All done."},"finish_reason":"stop"}]}"#,
+            r#"{"error":{"code":502,"message":"The operation was aborted"}}"#,
+        ]);
+        assert_eq!(result, Ok(()));
+        assert!(!events.iter().any(|e| matches!(e, ProviderEvent::Error(_))), "{events:?}");
+        assert!(events.iter().any(|e| matches!(e, ProviderEvent::TextDelta(t) if t == "All done.")), "{events:?}");
     }
 
     #[test]
