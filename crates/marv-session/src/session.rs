@@ -244,6 +244,15 @@ pub struct SessionInit {
     pub checkpoint_store: Option<Arc<CheckpointStore>>,
     pub mcp_tools: McpToolsSetting,
     pub sandbox: bool,
+    /// Let bash run a command on the host (`sandbox: false`, the host door, Marv #52), asked every time. Only where
+    /// someone approves each command at a terminal (the TUI sets it); default false: there it's refused before any
+    /// ask, whatever the approver would say. The main agent only: subagents never get it.
+    pub host_commands: bool,
+    /// Offer the github tool (#47): gh with the user's login, outside the sandbox (reads run, writes ask). The caller
+    /// checks once that gh is there and logged in (`marv_tools::github::github_available`) before the session
+    /// exists, since the tool list is fixed for the session (the prompt cache). Default false. Subagents get it for
+    /// reads only.
+    pub github: bool,
     pub yolo: bool,
     /// Yolo isn't allowed here, and why (the project is the home folder or above it).
     pub no_yolo: Option<String>,
@@ -296,6 +305,8 @@ impl SessionInit {
             checkpoint_store: None,
             mcp_tools: McpToolsSetting::Auto,
             sandbox: true,
+            host_commands: false,
+            github: false,
             yolo: true,
             no_yolo: None,
             sessions: None,
@@ -548,13 +559,15 @@ pub struct MarvSession {
 
 /// Tools of the caller's own must have names of their own: `run_tool` runs the first tool with the call's name, so a
 /// custom "bash" would be offered next to the built-in one while every call ran the built-in; `mcp__` names are MCP
-/// servers'; `tool_search`/`mcp_call` are a deferred conversation's. `plan` is built in only where the session offers
-/// it (`plan`): elsewhere the name is free.
-pub fn check_tool_names(custom: &[ToolRef], plan: bool) -> Result<(), String> {
+/// servers'; `tool_search`/`mcp_call` are a deferred conversation's. `plan` and `github` are built in only where the
+/// session offers them (`plan`, `github`): elsewhere the name is free.
+pub fn check_tool_names(custom: &[ToolRef], plan: bool, github: bool) -> Result<(), String> {
     let mut seen = std::collections::HashSet::new();
     for tool in custom {
         let name = tool.name();
-        if marv_tools::builtin_tools().iter().any(|t| t.name() == name && (plan || name != "plan"))
+        if marv_tools::builtin_tools()
+            .iter()
+            .any(|t| t.name() == name && (plan || name != "plan") && (github || name != "github"))
             || DEFERRED_NAMES.contains(&name)
             || [marv_mesh::tools::MESH_LIST, marv_mesh::tools::MESH_CALL, marv_mesh::tools::MESH_SEND].contains(&name)
         {
@@ -730,7 +743,7 @@ impl MarvSession {
         let process_on = init.processes && marv_sandbox::sandbox_available();
         // The process tool is built in only where the session offers it: elsewhere the name is free (Marv).
         let custom: Vec<ToolRef> = init.tools.iter().filter(|t| process_on || t.name() != "process").cloned().collect();
-        check_tool_names(&custom, init.plan).map_err(SessionError::Invalid)?;
+        check_tool_names(&custom, init.plan, init.github).map_err(SessionError::Invalid)?;
         // The main agent's plug (`agent.parent.inbox`), bound now so it's there before the first turn.
         if let Some(mesh) = &init.mesh {
             mesh.plug(crate::mesh::parent_id()).map_err(|e| SessionError::Invalid(format!("The mesh: {e}")))?;
@@ -744,8 +757,8 @@ impl MarvSession {
         let provider = factory.make(None, None);
         let has_skills = !init.skills.is_empty();
         // Built once, so every request sends byte-identical tool definitions (the skill tool only when there are
-        // skills, the plan tool unless it's off).
-        let mut specs = marv_tools::tool_specs_for(has_skills, init.plan);
+        // skills, the plan tool unless it's off, github only where gh is logged in).
+        let mut specs = marv_tools::tool_specs_for(has_skills, init.plan, init.github);
         specs.retain(|s| process_on || s.name != "process");
         specs.extend(init.tools.iter().map(|t| t.spec()));
         if init.mesh.is_some() {
@@ -1198,6 +1211,9 @@ impl MarvSession {
         ctx.before_change = checks.as_ref().map(|c| c.before_change.clone());
         ctx.checkpoint = checkpoint.map(|c| c as Arc<dyn marv_tools::Checkpoint>);
         ctx.taint = self.inner.taint.clone();
+        // The main agent's doors out of the sandbox, fixed for the session (the prompt names them: the cache).
+        ctx.doors.host = init.host_commands;
+        ctx.doors.github = init.github;
         // The process door (Marv #51): the main agent's alone. Subagents get the forwards (their bash reaches the
         // servers), never the processes.
         ctx.doors.process = self.inner.process_on;
@@ -1996,7 +2012,7 @@ impl MarvSession {
             // Whenever there's a manager, even an empty one: a server added mid-conversation is then covered without
             // changing the system prompt (the prompt cache).
             mcp: init.mcp.is_some(),
-            doors: crate::prompt::PromptDoors { process: self.inner.process_on, ..Default::default() },
+            doors: crate::prompt::PromptDoors { github: init.github, process: self.inner.process_on, host: init.host_commands },
             date: crate::time::iso_date(crate::time::now_ms()),
         });
         match &init.system_prompt {
@@ -2010,9 +2026,15 @@ impl MarvSession {
     fn offered(&self) -> (Vec<ToolSpec>, Vec<ToolRef>) {
         let init = &self.inner.init;
         let mut specs = self.inner.specs.clone();
+        // The plan, process and github tools only where the session offers them: elsewhere the model can't call
+        // them, even by name.
         let mut tools: Vec<ToolRef> = marv_tools::builtin_tools()
             .iter()
-            .filter(|t| (init.plan || t.name() != "plan") && (self.inner.process_on || t.name() != "process"))
+            .filter(|t| {
+                (init.plan || t.name() != "plan")
+                    && (self.inner.process_on || t.name() != "process")
+                    && (init.github || t.name() != "github")
+            })
             .cloned()
             .collect();
         tools.extend(init.tools.iter().cloned());
@@ -2311,14 +2333,17 @@ mod tests {
     #[test]
     fn custom_tool_names_must_be_their_own() {
         let tools = |names: &[&'static str]| names.iter().map(|n| Arc::new(Named(n)) as ToolRef).collect::<Vec<_>>();
-        assert!(check_tool_names(&tools(&["deploy"]), true).is_ok());
-        assert!(check_tool_names(&tools(&["bash"]), true).unwrap_err().contains("already built in"));
-        assert!(check_tool_names(&tools(&["mcp_call"]), true).unwrap_err().contains("already built in"));
-        assert!(check_tool_names(&tools(&["mcp__x__y"]), true).unwrap_err().contains("mcp__"));
-        assert!(check_tool_names(&tools(&["a", "a"]), true).unwrap_err().contains("Two tools"));
+        assert!(check_tool_names(&tools(&["deploy"]), true, false).is_ok());
+        assert!(check_tool_names(&tools(&["bash"]), true, false).unwrap_err().contains("already built in"));
+        assert!(check_tool_names(&tools(&["mcp_call"]), true, false).unwrap_err().contains("already built in"));
+        assert!(check_tool_names(&tools(&["mcp__x__y"]), true, false).unwrap_err().contains("mcp__"));
+        assert!(check_tool_names(&tools(&["a", "a"]), true, false).unwrap_err().contains("Two tools"));
         // plan is a free name where the session doesn't offer it (#15).
-        assert!(check_tool_names(&tools(&["plan"]), true).unwrap_err().contains("\"plan\" is already built in"));
-        assert!(check_tool_names(&tools(&["plan"]), false).is_ok());
+        assert!(check_tool_names(&tools(&["plan"]), true, false).unwrap_err().contains("\"plan\" is already built in"));
+        assert!(check_tool_names(&tools(&["plan"]), false, false).is_ok());
+        // So is github (#47).
+        assert!(check_tool_names(&tools(&["github"]), true, false).is_ok());
+        assert!(check_tool_names(&tools(&["github"]), true, true).unwrap_err().contains("already built in"));
         let s = session(|i| i.tools = tools(&["deploy"])).unwrap();
         let _: &[ToolSpec] = &s.inner.specs;
         assert_eq!(s.inner.specs.last().unwrap().name, "deploy");
@@ -3687,6 +3712,157 @@ mod turn_tests {
         let events = collect(go(&session, "write it")).await;
         assert!(events.iter().any(|e| matches!(e, SessionEvent::Loop(LoopEvent::Assistant { text }) if text == "Refused.")));
         assert!(!dirs.project.join("out.txt").exists());
+    }
+
+    // ---- the doors out of the sandbox (Marv #47, #52; tests/doors.test.ts, tests/github-tool.test.ts) ----
+
+    /// Records the doors each call's context has.
+    struct Probe(Arc<Mutex<Vec<marv_tools::types::Doors>>>);
+    #[async_trait::async_trait]
+    impl marv_tools::Tool for Probe {
+        type Input = serde_json::Value;
+        fn name(&self) -> &str {
+            "probe"
+        }
+        fn description(&self) -> &str {
+            "probe"
+        }
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn label(&self, _input: &Self::Input) -> String {
+            "probe".into()
+        }
+        async fn run(
+            &self,
+            _input: &Self::Input,
+            ctx: &marv_tools::ToolContext,
+        ) -> Result<marv_tools::ToolOutput, marv_tools::ToolError> {
+            lock(&self.0).push(ctx.doors);
+            Ok(marv_tools::ToolOutput::ok("", ""))
+        }
+    }
+
+    #[tokio::test]
+    async fn the_main_agent_has_the_host_door_only_with_host_commands_and_the_github_door_only_with_github() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        for (host, github) in [(false, false), (true, false), (false, true)] {
+            let dirs = Dirs::new();
+            let provider = Scripted::new(vec![use_tools(vec![call("p", "probe", serde_json::json!({}))]), say("Done.")]);
+            let session = scripted(&dirs, &provider, |i| {
+                i.tools = vec![Arc::new(Probe(seen.clone()))];
+                i.host_commands = host;
+                i.github = github;
+            });
+            collect(go(&session, "go")).await;
+        }
+        let doors: Vec<(bool, bool)> = lock(&seen).iter().map(|d| (d.host, d.github)).collect();
+        assert_eq!(doors, [(false, false), (true, false), (false, true)]);
+    }
+
+    #[tokio::test]
+    async fn a_session_with_github_offers_it_names_its_door_in_the_prompt_and_sends_the_same_specs_each_request() {
+        let dirs = Dirs::new();
+        let provider = Scripted::new(vec![say("a"), say("b")]);
+        let session = scripted(&dirs, &provider, |i| i.github = true);
+        collect(go(&session, "one")).await;
+        collect(go(&session, "two")).await;
+        let requests = provider.requests();
+        let (first, second) = (&requests[0].1, &requests[1].1);
+        assert!(first.tools.iter().any(|t| t.name == "github"));
+        assert_eq!(first.tools, second.tools);
+        let system = first.system.as_deref().unwrap();
+        assert!(system.contains("# Outside the sandbox"));
+        assert!(system.contains("github runs the GitHub CLI (gh) with the user's own login"));
+
+        let dirs = Dirs::new();
+        let without = Scripted::new(vec![say("a")]);
+        let plain = scripted(&dirs, &without, |_| {});
+        collect(go(&plain, "one")).await;
+        let options = &without.requests()[0].1;
+        assert!(!options.tools.iter().any(|t| t.name == "github"));
+        assert!(!options.system.as_deref().unwrap().contains("github runs the GitHub CLI"));
+    }
+
+    /// A door of any kind, as the github and host doors are: it asks, once.
+    struct DoorTool;
+    #[async_trait::async_trait]
+    impl marv_tools::Tool for DoorTool {
+        type Input = serde_json::Value;
+        fn name(&self) -> &str {
+            "d"
+        }
+        fn description(&self) -> &str {
+            "A door for tests."
+        }
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn kind(&self) -> marv_core::ToolKind {
+            marv_core::ToolKind::Execute
+        }
+        fn label(&self, _input: &Self::Input) -> String {
+            "d".into()
+        }
+        fn door(&self, _input: &Self::Input, _ctx: &marv_tools::ToolContext) -> Option<marv_core::Door> {
+            Some(marv_core::Door::Host)
+        }
+        fn once(&self, _input: &Self::Input, _ctx: &marv_tools::ToolContext) -> bool {
+            true
+        }
+        async fn run(
+            &self,
+            _input: &Self::Input,
+            _ctx: &marv_tools::ToolContext,
+        ) -> Result<marv_tools::ToolOutput, marv_tools::ToolError> {
+            Ok(marv_tools::ToolOutput::ok("ran", "ran"))
+        }
+    }
+
+    // Marv's tests/doors.test.ts: the trajectory's tool record names the door.
+    #[tokio::test]
+    async fn the_trajectorys_tool_record_names_the_door() {
+        let dirs = Dirs::new();
+        let store = Arc::new(TrajectoryStore::new(&dirs.dir));
+        let calls = vec![call("c1", "d", serde_json::json!({})), call("c2", "read_file", serde_json::json!({"path": "nope"}))];
+        let provider = Scripted::new(vec![use_tools(calls), say("Done.")]);
+        let session = scripted(&dirs, &provider, |i| {
+            i.tools = vec![Arc::new(DoorTool)];
+            i.approve = Some(answer(Decision::Yes));
+            i.yolo = false;
+            i.trajectories = Some(store.clone());
+        });
+        collect(go(&session, "go")).await;
+        let log = records(&store, &dirs.project, &session).await;
+        let tools: Vec<&serde_json::Value> = log.iter().filter(|r| r["type"] == "tool").collect();
+        assert_eq!((tools[0]["door"].as_str(), tools[0]["approval"].as_str()), (Some("host"), Some("yes")));
+        assert!(tools[1].get("door").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_session_with_host_commands_names_the_host_door_in_the_prompt() {
+        let dirs = Dirs::new();
+        let provider = Scripted::new(vec![say("a")]);
+        let session = scripted(&dirs, &provider, |i| i.host_commands = true);
+        collect(go(&session, "one")).await;
+        assert!(provider.requests()[0].1.system.as_deref().unwrap().contains("bash with sandbox: false runs one command"));
+    }
+
+    #[tokio::test]
+    async fn a_session_without_github_doesnt_run_it_even_when_the_model_names_it() {
+        let dirs = Dirs::new();
+        let provider =
+            Scripted::new(vec![use_tools(vec![call("g1", "github", serde_json::json!({"args": ["pr", "list"]}))]), say("ok")]);
+        let session = scripted(&dirs, &provider, |_| {});
+        let events = collect(go(&session, "go")).await;
+        let output = events
+            .iter()
+            .find_map(|e| match e {
+                SessionEvent::Loop(LoopEvent::ToolEnd { run, .. }) => Some(run.result.output.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(output.contains("Unknown tool \"github\""), "{output}");
     }
 
     // ---- the plan (#15) ----

@@ -47,6 +47,19 @@ Narrow, named ways out, each asked for and each with its own rule for what it ca
 - **Approvals show the full payload.** A network approval lists the scripts written this session that the command will run.
 - **Subagents don't inherit** network, web or mesh approvals.
 
+## The doors out of the sandbox (Marv Sprint 4)
+Narrow, named ways out, each with what it can never do. A call through one carries its door on the approval (the prompt shows the door's warning line), on its result and in the trajectory. The doors are the main agent's: a subagent's context has none.
+- **github** (Marv #47) runs gh with the user's login, outside the sandbox:
+  - never: `auth`, `config`, `extension`, `alias`, an unknown first word (an alias or extension), `secret`/`variable`/`ssh-key`/`gpg-key`, `--web`, `gh api --input`/`--verbose`, downloads, `repo clone`, `pr checkout`, another GitHub host than the project's. Refused before anyone is asked, whatever the approver says;
+  - writes, other API methods, fields, graphql and sensitive API reads (secrets, keys, hooks, emails…) ask, in yolo too; a sensitive read is asked every time (`once`);
+  - gh is spawned without a shell, without Marv's keys or debug switches, with `GH_HOST` pinned to the project's host (github.com where origin names none), and its git never runs the repository's programs;
+  - GitHub token shapes are redacted from what gh prints before the model, the events, the saved session or the trajectory see it;
+  - a subagent only reads; offered only where gh is there and logged in; `marv -p` needs `--approve github` for a write.
+- **host** (Marv #52) is bash with `sandbox: false`, one command on the user's machine:
+  - asked every time (`once`: "always" never covers another), in yolo too;
+  - only where someone approves each command at a terminal (the TUI; the SDK's `host_commands`): refused before any ask in `marv -p`, in an SDK session without `host_commands`, and for a subagent;
+  - its environment is the user's minus Marv's keys and anything secret-looking (`marv_sandbox::host_env`); token shapes are redacted from its output.
+
 ## MCP
 - Project servers need trust. The hash covers the entry and the files its command runs.
 - `npx`/`uvx` run outside the project folder.

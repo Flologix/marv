@@ -290,6 +290,9 @@ pub struct ToolRun {
     pub changed: Option<String>,
     /// How it was approved (trajectories, `marv -p`'s `tool_end` and refusals). Never sent to the model.
     pub approval: ApprovalRecord,
+    /// The door out of the sandbox the call went through (Marv #47, #51, #52), for trajectories; None for an
+    /// ordinary call.
+    pub door: Option<marv_core::Door>,
     /// Display-only payload the loop never reads (marv-tools' `DiffShown`); the UI downcasts it.
     /// Never sent to the model.
     pub display: Option<Arc<dyn std::any::Any + Send + Sync>>,
@@ -305,6 +308,7 @@ impl ToolRun {
             provenance: Provenance::Project,
             changed: None,
             approval: ApprovalRecord::None,
+            door: None,
             display: None,
         }
     }

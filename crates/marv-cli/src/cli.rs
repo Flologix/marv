@@ -65,7 +65,7 @@ pub struct Cli {
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     pub output: OutputFormat,
 
-    /// Auto-approve a scope in -p (git_write, network, web, mcp, files, memory, agent_worktree, process,
+    /// Auto-approve a scope in -p (git_write, network, web, mcp, files, memory, agent_worktree, process, github,
     /// mesh:<receptacle>).
     #[arg(long = "approve", value_name = "SCOPE")]
     pub approve: Vec<String>,

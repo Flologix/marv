@@ -5,7 +5,8 @@
 //! - Tool specs are built once, so every request sends byte-identical definitions in a stable order (anything else
 //!   breaks the prompt cache). Note: `serde_json` without `preserve_order` sorts object keys, so a schema's key order
 //!   differs from Marv's (zod's insertion order); it's still byte-stable, which is what the cache needs.
-//! - `skill` is offered only when skills exist, `plan` unless the session turned it off (#15) (`tool_specs_for`).
+//! - `skill` is offered only when skills exist, `plan` unless the session turned it off (#15), `github` only where the
+//!   session has it (#47) (`tool_specs_for`).
 //! - `run_tool` never fails: bad JSON, invalid input and `ToolError`s become error results the model can recover from.
 //!   `available` is what this agent was offered (a subagent gets fewer tools); anything else is unknown, even if the
 //!   model names it.
@@ -39,9 +40,9 @@ pub const INTERRUPTED: &str = "Interrupted by the user before this tool ran.";
 pub const DECLINED: &str = "The user declined this. Don't retry it: stop and wait for them to say how to proceed.";
 
 /// Marv's built-in tools, in Marv's order (the order of the specs the model sees):
-/// read_file, glob, grep, web_fetch, skill, edit_file, write_file, bash, memory, plan, agent.
-/// `apply_patch` (#66) isn't registered until it's built; Marv's github (after web_fetch) and process (after bash)
-/// come with their own ports.
+/// read_file, glob, grep, web_fetch, github, skill, edit_file, write_file, bash, process, memory, plan, agent.
+/// `github` is offered only where the session has it ([`tool_specs_for`]). `apply_patch` (#66) isn't registered until
+/// it's built.
 pub fn builtin_tools() -> &'static [ToolRef] {
     static TOOLS: OnceLock<Vec<ToolRef>> = OnceLock::new();
     TOOLS.get_or_init(|| {
@@ -50,6 +51,7 @@ pub fn builtin_tools() -> &'static [ToolRef] {
             Arc::new(crate::glob::Glob),
             Arc::new(crate::grep::Grep),
             Arc::new(crate::web_fetch::WebFetch::default()),
+            Arc::new(crate::github::Github::default()),
             Arc::new(crate::skill::SkillTool),
             Arc::new(crate::edit_file::EditFile),
             Arc::new(crate::write_file::WriteFile),
@@ -74,10 +76,15 @@ pub fn tool_specs() -> &'static [ToolSpec] {
 }
 
 /// The specs for a session: the skill tool only when there are skills to load, the plan tool unless the session
-/// turned it off (#15; decided at construction, since it changes the tool list). The process tool is in it: a session
-/// without the process door (Marv #51) drops it.
-pub fn tool_specs_for(has_skills: bool, plan: bool) -> Vec<ToolSpec> {
-    tool_specs().iter().filter(|s| (has_skills || s.name != "skill") && (plan || s.name != "plan")).cloned().collect()
+/// turned it off (#15; decided at construction, since it changes the tool list), the github tool only where gh is
+/// there and logged in (#47). The process tool is in it: a session without the process door (Marv #51) drops it. Same
+/// values every time (cache).
+pub fn tool_specs_for(has_skills: bool, plan: bool, github: bool) -> Vec<ToolSpec> {
+    tool_specs()
+        .iter()
+        .filter(|s| (has_skills || s.name != "skill") && (plan || s.name != "plan") && (github || s.name != "github"))
+        .cloned()
+        .collect()
 }
 
 /// A finished call: the result and the transcript label.
@@ -151,7 +158,7 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
         noted(ToolOutcome { result, label: label.clone() })
     };
 
-    let network = tool.uses_network(input);
+    let network = tool.uses_network(input, ctx);
     let protected = tool.protected_target(input, ctx);
     // A web request under a URL prefix the user approved after the taint (docs/SECURITY.md) runs as approved.
     let egress_url = tool.egress_url(input).filter(|_| ctx.taint.is_tainted());
@@ -200,7 +207,7 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
     let no_one_to_ask = || noted(fail(format!("{} needs the user's approval, and there's no one to ask.", call.name), &label));
     let Some(approver) = &ctx.approver else { return no_one_to_ask() };
     let scope =
-        tool.scope(input).unwrap_or_else(|| crate::types::Scope { key: call.name.clone(), description: call.name.clone() });
+        tool.scope(input, ctx).unwrap_or_else(|| crate::types::Scope { key: call.name.clone(), description: call.name.clone() });
     let request = ApprovalRequest {
         tool: call.name.clone(),
         label: label.clone(),
@@ -425,6 +432,7 @@ mod tests {
                 "glob",
                 "grep",
                 "web_fetch",
+                "github",
                 "skill",
                 "edit_file",
                 "write_file",
@@ -435,10 +443,13 @@ mod tests {
                 "agent"
             ]
         );
-        assert!(!tool_specs_for(false, true).iter().any(|s| s.name == "skill"));
-        assert_eq!(tool_specs_for(true, true).len(), 12);
-        assert!(!tool_specs_for(true, false).iter().any(|s| s.name == "plan"));
-        assert_eq!(tool_specs_for(true, false).len(), 11);
+        assert!(!tool_specs_for(false, true, true).iter().any(|s| s.name == "skill"));
+        assert_eq!(tool_specs_for(true, true, true).len(), 13);
+        assert!(!tool_specs_for(true, false, true).iter().any(|s| s.name == "plan"));
+        assert_eq!(tool_specs_for(true, false, true).len(), 12);
+        // github only where it's offered (#47), the same values every time (cache).
+        assert!(!tool_specs_for(true, true, false).iter().any(|s| s.name == "github"));
+        assert_eq!(tool_specs_for(true, true, true), tool_specs_for(true, true, true));
         let agent = ToolCall { id: "1".into(), name: "agent".into(), arguments: "{}".into() };
         assert!(is_parallel_call(&agent, builtin_tools()));
     }

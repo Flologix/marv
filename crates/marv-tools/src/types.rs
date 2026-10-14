@@ -506,6 +506,10 @@ pub trait Tool: Send + Sync + 'static {
     fn uses_network(&self, _input: &Self::Input) -> bool {
         false
     }
+    /// `uses_network` for a call in `ctx` (as `scope_in`). Default: `uses_network`.
+    fn uses_network_in(&self, input: &Self::Input, _ctx: &ToolContext) -> bool {
+        self.uses_network(input)
+    }
     /// What the approval prompt shows. A `ToolError` here means the call can't succeed: nobody is asked.
     async fn preview(&self, _input: &Self::Input, _ctx: &ToolContext) -> Result<Preview, ToolError> {
         Ok(Preview { title: self.name().to_string(), ..Preview::default() })
@@ -513,6 +517,12 @@ pub trait Tool: Send + Sync + 'static {
     /// What "don't ask again" covers. Default: the tool's name.
     fn scope(&self, _input: &Self::Input) -> Option<Scope> {
         None
+    }
+    /// `scope` for a call in `ctx` (Marv passes the context to `scope` since Sprint 4: bash's host door depends on
+    /// the session's sandbox). Default: `scope`. marv-rs keeps both so the tools that don't need the context don't
+    /// change.
+    fn scope_in(&self, input: &Self::Input, _ctx: &ToolContext) -> Option<Scope> {
+        self.scope(input)
     }
     /// Whether yolo may run this call without asking: what it can change is confined to the project (never its
     /// `.git`) and it can't reach the network. Default: always ask.
@@ -562,9 +572,9 @@ pub trait DynTool: Send + Sync {
     fn parse(&self, raw: Value) -> Result<ParsedInput, String>;
     fn label(&self, input: In<'_>) -> String;
     fn needs_approval(&self, input: In<'_>) -> Option<bool>;
-    fn uses_network(&self, input: In<'_>) -> bool;
+    fn uses_network(&self, input: In<'_>, ctx: &ToolContext) -> bool;
     async fn preview(&self, input: In<'_>, ctx: &ToolContext) -> Result<Preview, ToolError>;
-    fn scope(&self, input: In<'_>) -> Option<Scope>;
+    fn scope(&self, input: In<'_>, ctx: &ToolContext) -> Option<Scope>;
     fn auto_safe(&self, input: In<'_>, ctx: &ToolContext) -> bool;
     fn protected_target(&self, input: In<'_>, ctx: &ToolContext) -> Option<ProtectedRule>;
     fn repair(&self, raw: &Value, ctx: &ToolContext) -> Option<Repaired>;
@@ -613,14 +623,14 @@ impl<T: Tool> DynTool for T {
     fn needs_approval(&self, input: In<'_>) -> Option<bool> {
         Tool::needs_approval(self, typed::<T>(input))
     }
-    fn uses_network(&self, input: In<'_>) -> bool {
-        Tool::uses_network(self, typed::<T>(input))
+    fn uses_network(&self, input: In<'_>, ctx: &ToolContext) -> bool {
+        Tool::uses_network_in(self, typed::<T>(input), ctx)
     }
     async fn preview(&self, input: In<'_>, ctx: &ToolContext) -> Result<Preview, ToolError> {
         Tool::preview(self, typed::<T>(input), ctx).await
     }
-    fn scope(&self, input: In<'_>) -> Option<Scope> {
-        Tool::scope(self, typed::<T>(input))
+    fn scope(&self, input: In<'_>, ctx: &ToolContext) -> Option<Scope> {
+        Tool::scope_in(self, typed::<T>(input), ctx)
     }
     fn auto_safe(&self, input: In<'_>, ctx: &ToolContext) -> bool {
         Tool::auto_safe(self, typed::<T>(input), ctx)
