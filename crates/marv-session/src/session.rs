@@ -208,8 +208,13 @@ pub struct SessionInit {
     pub thinking: bool,
     /// Marv's version, for trajectories.
     pub version: String,
-    /// The project's AGENTS.md, as it goes into the prompt (`prompt::read_instructions`).
+    /// The instruction files, as they go into the prompt (`instructions::load_instructions`, which gives each its
+    /// heading); plain text of your own goes under "# Project instructions (from AGENTS.md)".
     pub instructions: Option<String>,
+    /// Append a folder's own `AGENTS.md`/`CLAUDE.md` (below the root) to the first read_file, edit_file or write_file
+    /// result there, once per conversation (#62; `crate::instructions::NestedInstructions`). Default false: an SDK
+    /// session reads the project's files only when it asks for the `Project` source; the CLI sets it.
+    pub nested_instructions: bool,
     pub skills: Vec<LoadedSkill>,
     /// Agent types the agent tool can start (default: general-purpose).
     pub agents: Vec<AgentType>,
@@ -286,6 +291,7 @@ impl SessionInit {
             thinking: false,
             version: env!("CARGO_PKG_VERSION").into(),
             instructions: None,
+            nested_instructions: false,
             skills: Vec::new(),
             agents: vec![general_purpose()],
             memory: None,
@@ -548,6 +554,8 @@ struct Inner {
     processes: Option<ProcessManager>,
     /// The project's checkpoints (#16); its ref follows the conversation (`State::chain_id`).
     checkpoints: Arc<CheckpointStore>,
+    /// Nested instruction files the main agent's conversation has had (#62); emptied with it (`clear`, `resume`).
+    nested: Arc<crate::instructions::NestedInstructions>,
     state: Mutex<State>,
 }
 
@@ -820,6 +828,7 @@ impl MarvSession {
             taint: Arc::new(TaintState::new()),
             skills: Arc::new(init.skills.iter().map(|s| s.skill.clone()).collect()),
             loaded: Arc::default(),
+            nested: Arc::default(),
             typecheck: Arc::new(Checker::new(Arc::new(crate::diagnostics::turn::Typecheck), None)),
             project_checks: Arc::new(Checker::new(Arc::new(crate::checks::kind::ProjectChecksKind), None)),
             process_on,
@@ -1187,6 +1196,7 @@ impl MarvSession {
             agents: Arc::new(init.agents.clone()),
             cwd: self.cwd(),
             instructions: init.instructions.clone(),
+            nested_instructions: init.nested_instructions,
             worktrees_dir: init.worktrees_dir.clone(),
             factory: factory.clone(),
             provider: provider.clone(),
@@ -1221,7 +1231,11 @@ impl MarvSession {
             ctx.processes = self.inner.processes.clone().map(|m| Arc::new(m) as Arc<dyn marv_tools::ProcessHost>);
         }
         ctx.forwards = self.inner.processes.clone().map(|m| Arc::new(m) as Arc<dyn marv_tools::ProcessForwards>);
-        let runner = Arc::new(SessionToolRunner::new(ctx, Arc::new(tools)));
+        let mut runner = SessionToolRunner::new(ctx, Arc::new(tools));
+        if init.nested_instructions {
+            runner.nested = Some(self.inner.nested.clone());
+        }
+        let runner = Arc::new(runner);
 
         let mut options = AgentOptions::new(provider.clone(), history, system, specs, runner.clone(), stop.clone());
         options.max_steps = max_steps.unwrap_or(marv_agent::agent::DEFAULT_MAX_STEPS);
@@ -1586,6 +1600,7 @@ impl MarvSession {
             s.plan = None; // a new conversation, a new plan
         }
         lock(&self.inner.loaded).clear();
+        self.inner.nested.reset();
         if let Some((paths, _)) = &self.inner.init.memory
             && let Ok(memories) = crate::memory::load_memory(paths).await
         {
@@ -1625,6 +1640,8 @@ impl MarvSession {
             // The last turn's save may still be waiting: it belongs to the conversation being left.
             self.save_now(&mut s, transcript);
             lock(&self.inner.loaded).clear();
+            // The saved conversation may lack a note this one had: give them again (a repeat is harmless).
+            self.inner.nested.reset();
             s.conversation = Arc::new(Mutex::new(saved.conversation.clone()));
             s.messages = saved.transcript.clone();
             s.totals = saved.totals.clone();

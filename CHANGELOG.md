@@ -8,6 +8,7 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ### Fixed
 
+- **A symlinked `AGENTS.md` can no longer pull a file from outside the project into the prompt.** Marv 0.4.0 read `<project>/AGENTS.md` through any symlink, so `AGENTS.md -> ~/.ssh/id_ed25519` sent the key to the model provider. Instruction files are now read only where their real path stays inside the project (#62).
 - **`marv -p --approve mcp` approves MCP calls after an MCP read again.** Once a session had read anything from an MCP server, a call made through `mcp_call` (the deferred tools) was refused as "needs the user's approval", because the wrapper asked under its own name instead of the real tool's scope (`mcp:<server>:<tool>`); in the TUI it asked twice. The real tool still asks once the session is tainted, even in yolo, and without `--approve mcp` the call is still refused.
 - **`mesh_list` no longer taints the session when nothing is wired.** Every `mesh_list` result counted as text from another agent, so asking "who's on the mesh?" made every later network command, web request and MCP call ask first, though no other agent had said anything. Now only a list that names wired receptacles (whose descriptions can come from another Marv) taints, as a call's answer and an inbox message do.
 - **A Marv that was killed no longer leaves its mesh socket behind.** `$XDG_RUNTIME_DIR/marv/mesh/` collected a socket for every Marv that didn't exit cleanly; a Marv joining the mesh now removes the sockets nothing listens on.
@@ -18,6 +19,7 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ### Added
 
+- **More instruction files (#62).** Besides the project's `AGENTS.md`, Marv now reads the project's `CLAUDE.md` when there's no `AGENTS.md` (never both), the `AGENTS.md` of each parent folder up to the git root (a monorepo's `packages/` and root files), and your own `~/.marv/AGENTS.md` for every project. Each comes under its own heading with its path, nearest first; the 20,000-character limit now covers them all, the project's file first. A folder below the project with its own `AGENTS.md` or `CLAUDE.md` gets it into the conversation the first time `read_file`, `edit_file` or `write_file` touches a file there, once, as a note on that result (the system prompt, and so the prompt cache, never changes). Subagents get the same files, yours included. The startup notice lists the files when there's more than the project's `AGENTS.md`, and the welcome banner counts them. An instruction file whose real path leads out of the project (a parent's: out of the git root), or that isn't a regular file, isn't read, and the startup notice says why; files under `node_modules`, `target` and `.git` are never read.
 - **Real-model evals (#73).** `evals/bench.py` runs Marv's 20 eval tasks through `marv -p`, and through `claude -p` for comparison, grades them with each task's hidden tests, and reports pass rate, time, requests, tool calls, tokens and cost. See `evals/README.md`.
 
 ## [0.4.0] - 2026-10-14

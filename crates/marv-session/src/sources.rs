@@ -1,9 +1,10 @@
 //! What a session can read from disk, by where it lives (the SDK's `sources`). Ports Marv's `src/sources.ts`.
 //!
-//! - `User`: your `~/.marv`: personal skills and agents, memory (personal and this project's: both your own files,
-//!   never in the repository), and your MCP servers (`mcp.json`).
-//! - `Project`: the repository: `AGENTS.md`, `.marv/skills`, `.marv/agents`, and `.mcp.json` (whose servers still
-//!   start only once trusted, with `/mcp trust` in the CLI).
+//! - `User`: your `~/.marv`: your own `AGENTS.md` (#62), personal skills and agents, memory (personal and this
+//!   project's: both your own files, never in the repository), and your MCP servers (`mcp.json`).
+//! - `Project`: the repository: `AGENTS.md` (or `CLAUDE.md`) and the parent folders' `AGENTS.md` up to the git root
+//!   (#62), `.marv/skills`, `.marv/agents`, and `.mcp.json` (whose servers still start only once trusted, with
+//!   `/mcp trust` in the CLI). Nested `AGENTS.md` files come with the tool results that touch their folders.
 //!
 //! The CLI loads both. A program using the SDK loads neither unless it asks: a library mustn't quietly read your
 //! files, or start a repository's servers.
@@ -14,8 +15,9 @@ use marv_mcp::config::{Include, McpServerConfig, load_mcp_config};
 
 use crate::agents::{AgentType, load_agents};
 use crate::config::Env;
+use crate::instructions::load_instructions;
 use crate::memory::{Memories, MemoryPaths, load_memory, memory_paths};
-use crate::prompt::{Instructions, read_instructions};
+use crate::prompt::Instructions;
 use crate::skills::{LoadedSkill, load_skills};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,5 +61,7 @@ pub async fn load_sources(root: &Path, sources: &[Source], config_dir: &Path, ho
     } else {
         None
     };
-    Loaded { instructions: if project { read_instructions(root) } else { None }, skills, agents, memory, mcp_servers, problems }
+    let loaded = load_instructions(root, home, user, project);
+    problems.extend(loaded.problems);
+    Loaded { instructions: loaded.instructions, skills, agents, memory, mcp_servers, problems }
 }

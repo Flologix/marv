@@ -1,8 +1,8 @@
 //! Launching the TUI: the interactive half of Marv's `src/cli.tsx`, the engine half of `src/app.tsx` (commands,
 //! config, setup, resume, startup notices), and the App's Herdr reporting (`src/herdr.ts` is marv-mesh's `herdr.rs`).
 //!
-//! Startup, in Marv's order: the project root is the current folder; read AGENTS.md once (cut at 20k, the cut notice
-//! goes to the UI); load skills and agents (project + personal; problems shown at startup); load the MCP config and
+//! Startup, in Marv's order: the project root is the current folder; read AGENTS.md once (#62: or CLAUDE.md, plus the
+//! parents' and ~/.marv's, cut at 20k in all; the cut and the list of files go to the startup notice); load skills and agents (project + personal; problems shown at startup); load the MCP config and
 //! start the manager in the background; memory; migrate `~/.ekko` (default location only); load the config file (a
 //! broken one exits 1 with "Fix the file, or delete it to run setup again."); hidden PATH folders for the startup
 //! notice; Herdr reporting in a Herdr pane; then the UI. On the way out: `session.flush()` (the App awaits it after
@@ -69,10 +69,11 @@ use marv_session::config::{
     preset, resolve_config,
 };
 use marv_session::diagnostics::check_notice;
+use marv_session::instructions::load_instructions;
 use marv_session::mcp_tools::McpHandle;
 use marv_session::memory::{Memories, MemoryPaths, load_memory, memory_paths};
 use marv_session::paths::{home_dir, project_key, shorten_home};
-use marv_session::prompt::{Instructions, instructions_cut_item, read_instructions};
+use marv_session::prompt::{InstructionSource, Instructions, instruction_sources_item, instructions_cut_item};
 use marv_session::sessions::SessionStore;
 use marv_session::skills::LoadedSkill;
 use marv_session::trajectory::TrajectoryStore;
@@ -756,6 +757,8 @@ pub struct Startup {
     pub env: Env,
     pub version: String,
     pub instructions: Option<Instructions>,
+    /// Instruction files found but not read, and why (#62: a symlink out of the project, not a regular file).
+    pub instruction_problems: Vec<String>,
     pub skills: Vec<LoadedSkill>,
     pub skill_problems: Vec<String>,
     pub agents: Vec<marv_session::agents::AgentType>,
@@ -792,7 +795,9 @@ pub struct Bridge {
     file: Mutex<Option<FileConfig>>,
     env: Env,
     version: String,
-    instructions: bool,
+    /// The instruction files in the prompt (#62), for the welcome banner and the startup notice.
+    instruction_sources: Vec<InstructionSource>,
+    instruction_problems: Vec<String>,
     skills: Vec<LoadedSkill>,
     skill_problems: Vec<String>,
     agents: Vec<marv_session::agents::AgentType>,
@@ -832,6 +837,7 @@ impl Bridge {
         init.cwd = Some(shorten_home(&s.root, &s.home));
         init.version = s.version.clone();
         init.instructions = s.instructions.as_ref().map(|i| i.text.clone());
+        init.nested_instructions = true;
         init.skills = s.skills.clone();
         init.agents = s.agents.clone();
         init.memory = s.memory.clone();
@@ -879,7 +885,8 @@ impl Bridge {
             file: Mutex::new(s.file),
             env: s.env,
             version: s.version,
-            instructions: s.instructions.is_some(),
+            instruction_sources: s.instructions.map(|i| i.sources).unwrap_or_default(),
+            instruction_problems: s.instruction_problems,
             skills: s.skills,
             skill_problems: s.skill_problems,
             agents: s.agents,
@@ -947,7 +954,7 @@ impl Bridge {
         WelcomeInfo {
             version: self.version.clone(),
             cwd: self.cwd(),
-            instructions: self.instructions,
+            instructions: self.instruction_sources.iter().filter(|s| !s.left_out()).map(|s| s.shown.clone()).collect(),
             skills: self.skills.len(),
             memories,
             mcp_servers: self.mcp.as_ref().map_or(0, |m| m.status().len()),
@@ -979,6 +986,11 @@ impl Bridge {
         if let Some(cut) = cut {
             let item = instructions_cut_item(cut);
             notes.push((NoticeTone::Info, NoticeItem { text: item.text, detail: item.detail }));
+        }
+        // Which instruction files the model has (#62), when it's more than the project's AGENTS.md.
+        if let Some(item) = instruction_sources_item(&self.instruction_sources, &self.instruction_problems) {
+            let tone = if self.instruction_problems.is_empty() { NoticeTone::Info } else { NoticeTone::Warning };
+            notes.push((tone, NoticeItem { text: item.text, detail: item.detail }));
         }
         if !self.mcp_problems.is_empty() {
             let n = self.mcp_problems.len();
@@ -1867,7 +1879,8 @@ pub async fn run(resume: Option<bool>) -> anyhow::Result<i32> {
         tokio::spawn(async move { wanted && marv_tools::github::github_available(&pairs, marv_tools::github::AUTH_CHECK).await })
     };
     let config_dir = default_config_dir(&env, &home);
-    let instructions = read_instructions(&root);
+    let loaded_instructions = load_instructions(&root, &home, true, true);
+    let instructions = loaded_instructions.instructions;
     let (skills, skill_problems) = marv_session::skills::load_skills(Some(&root), Some(&home));
     let (agents, agent_problems) = marv_session::agents::load_agents(Some(&root), Some(&home));
     // MCP servers start now, in the background; the first request waits for them.
@@ -1930,6 +1943,7 @@ pub async fn run(resume: Option<bool>) -> anyhow::Result<i32> {
         env,
         version: env!("CARGO_PKG_VERSION").into(),
         instructions,
+        instruction_problems: loaded_instructions.problems,
         skills,
         skill_problems,
         agents,
@@ -2127,6 +2141,7 @@ mod tests {
             env: Env::new(),
             version: "9.9.9".into(),
             instructions: None,
+            instruction_problems: Vec::new(),
             skills: Vec::new(),
             skill_problems: Vec::new(),
             agents: vec![marv_session::agents::general_purpose()],

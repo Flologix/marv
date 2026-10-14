@@ -32,6 +32,7 @@ Each guard's doc comment says how it was proven: the guard was reverted, and the
 | Every path checked after `realpath` | `sandbox.rs::no_tool_follows_a_symlink_out_of_the_project` | Proven |
 | … a dangling symlink out of the project or into `.git` | `sandbox.rs::no_write_through_a_dangling_symlink_out_of_the_project` | Proven |
 | … skill files and folders | `sandbox.rs::skill_files_and_folders_stay_inside_after_realpath` | Proven |
+| … instruction files: project, parent and nested `AGENTS.md`/`CLAUDE.md` | `sandbox.rs::instruction_files_stay_inside_after_realpath` | Proven (#62) |
 | Results tagged; outside text fenced, never Marv's voice | `provenance.rs::outside_text_is_tagged_and_fenced_as_data` | Proven |
 | Web/MCP/mesh/image content taints | `provenance.rs::outside_content_taints_the_session` | Proven |
 | Tainted: network bash asks | `provenance.rs::tainted_network_bash_must_ask` | Proven |

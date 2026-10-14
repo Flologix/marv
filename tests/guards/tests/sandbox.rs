@@ -430,3 +430,30 @@ async fn skill_files_and_folders_stay_inside_after_realpath() {
     let out = run_tool(&call("skill", json!({"name": "x", "file": "key"})), &ctx, builtin_tools()).await;
     assert!(out.result.is_error && !out.result.output.contains("PRIVATE KEY"), "{}", out.result.output);
 }
+
+/// **That includes instruction files** (#62): the project's `AGENTS.md`/`CLAUDE.md`, a parent folder's, and a nested
+/// one a tool result carries are read only where their real path stays inside the project (a parent's: the git
+/// root), so `ln -s ~/.ssh/id_ed25519 AGENTS.md` can't put the key into the prompt or a tool result. Marv 0.4.0 read
+/// `<root>/AGENTS.md` through any symlink.
+///
+/// Proven: made `instructions::read_checked` skip its `within` check → failed (the key in the prompt and the note).
+#[test]
+fn instruction_files_stay_inside_after_realpath() {
+    let (home, outside) = (TempDir::new("instr-home"), TempDir::new("instr-out"));
+    outside.write("id_ed25519", "PRIVATE KEY\n");
+    let mono = home.path().join("mono");
+    let root = mono.join("app");
+    std::fs::create_dir_all(root.join("pkg")).unwrap();
+    std::fs::create_dir_all(mono.join(".git")).unwrap();
+    let key = outside.path().join("id_ed25519");
+    for link in [root.join("AGENTS.md"), mono.join("AGENTS.md"), root.join("pkg/AGENTS.md")] {
+        std::os::unix::fs::symlink(&key, link).unwrap();
+    }
+
+    let loaded = marv_session::instructions::load_instructions(&root, home.path(), true, true);
+    assert!(loaded.instructions.is_none(), "{:?}", loaded.instructions);
+    assert_eq!(loaded.problems.len(), 2, "{:?}", loaded.problems);
+    let nested = marv_session::instructions::NestedInstructions::default();
+    let note = nested.note_for(&root, &root.join("pkg/a.rs"));
+    assert!(!note.is_some_and(|n| n.contains("PRIVATE KEY")));
+}
