@@ -308,6 +308,10 @@ impl Tool for MeshTool {
     fn kind(&self) -> ToolKind {
         kind_of(self.name).unwrap_or(ToolKind::Egress)
     }
+    /// Another agent changes its own project, not this one's files: no checkpoint (#16).
+    fn checkpoint(&self) -> bool {
+        false
+    }
     fn provenance(&self) -> Provenance {
         Provenance::Mesh
     }
