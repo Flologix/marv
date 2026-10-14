@@ -131,15 +131,29 @@ A second pure helper, `overflow_window(message) -> Option<u64>`, parses the stat
 **Loop hook (marv-agent):** a new optional `AgentOptions::on_overflow: Option<OnOverflow>`.
 
 ```rust
-pub type OnOverflow = Arc<dyn Fn(String /* error */, u32 /* attempt, from 0 */) -> BoxFuture<'static, bool> + Send + Sync>;
+pub type OnOverflow = Arc<dyn Fn(String /* error */, u32 /* attempt, from 0 */) -> BoxFuture<'static, OverflowOutcome> + Send + Sync>;
+
+pub enum OverflowOutcome {
+    /// The history was made to fit: retry the step.
+    Recovered,
+    /// Recovery gave up. The message is what the user should read: the session's own explanation
+    /// (§3.5, "When the fixed content doesn't fit"), or the provider error that stopped it.
+    Failed(String),
+    /// Esc during recovery.
+    Stopped,
+}
 ```
 
 In `LoopState::decide`, `StepOutcome::Error(message)` where `is_context_overflow(&message)` and `on_overflow` is set:
 - Nothing from the failed reply enters the history. It has no text or calls. If it somehow has partial text, that is dropped too, as for a `Retry`. Today `decide` pushes `reply.assistant_turn()` before matching `StepOutcome::Error`, so the overflow check has to come before that push.
 - Emit `LoopEvent::Overflow { attempt }` (new) instead of `LoopEvent::Error`.
-- `on_overflow(message, attempt)`: if it returns true, `Phase::Request` again (same step, the step counter is not advanced); if false, the error path as today (`LoopEvent::Error`, `StopReason::Error`).
-- `attempt` counts per step and resets after a step that got a reply. At most `V2_OVERFLOW_TARGETS.len() + 1` = 4 recoveries per step.
-- A cancel during the hook ends `Aborted`, as `on_full` does.
+- `on_overflow(message, attempt)`:
+  - `Recovered` → `Phase::Request` again (same step; the step counter is not advanced).
+  - `Failed(text)` → emit `LoopEvent::Error(text)` (the hook's text, not the raw provider message) and `finish(StopReason::Error)`. The session's turn ends `TurnEndReason::Done(StopReason::Error)`, so headless exits as for any provider error.
+  - `Stopped` → `finish(StopReason::Aborted)`, no `Error` event, as Esc during `on_full`.
+- No hook set → today's path with the raw message (`LoopEvent::Error(message)`, `StopReason::Error`).
+- `attempt` counts per step and resets after a step that got a reply. At most `V2_OVERFLOW_TARGETS.len() + 2` = 5 recoveries per step (levels 0–3 and the whole-window last attempt); the hook call after that returns `Failed`.
+- A cancel during the hook ends `Aborted` whatever the hook returns, as `on_full` does (the loop checks `aborted()` after the hook).
 
 marv-agent depends on marv-provider already, so it can call `is_context_overflow` directly.
 
@@ -159,7 +173,13 @@ marv-agent depends on marv-provider already, so it can call `is_context_overflow
   - `budget = target × window − fixed − reply_reserve`.
 
   Level 3 sends no summary request, but the retried step still sends the system prompt and tools, so its budget is `0.35 × window − estimate(system) − estimate(tool specs) − reply_reserve`. The tools stay in recovery requests, even though there is no cache to keep. **Assumption:** some upstreams reject a history containing tool calls when no tools are defined.
-- **When the fixed cost alone doesn't fit.** If a level's `budget` is below `MIN_HISTORY_BUDGET` (1,024 tokens), that level is skipped, not run with an empty history. If level 3's budget is below it too, then the system prompt and tool definitions by themselves don't fit the window. Recovery stops at once: the hook returns false, and the turn ends with a clear error instead of `LoopEvent::Error(<raw provider text>)`: "The system prompt and tool definitions alone (about N tokens) don't fit this model's context window (M tokens). Pick a model with a larger window (/model), or offer fewer MCP tools (/mcp)." There is no drop loop: every level is tried at most once per hook call, so the number of requests is bounded.
+- **A level that is too small is skipped.** If a level's `budget` is below `MIN_HISTORY_BUDGET` (1,024 tokens), the level is skipped rather than run with an empty history.
+- **When the fixed content doesn't fit.** Let `fixed_step = estimate(system) + estimate(tool specs)`: what every retried step sends whatever the history. If level 3's budget (at 35%) is also below the minimum, there are three cases, checked in order:
+  1. **The fixed content exceeds the window** (`fixed_step ≥ window`). No history can help. The hook returns `Failed("The system prompt and tool definitions alone (about N tokens) are larger than this model's context window (M tokens). Pick a model with a larger window (/model), or turn off MCP servers or tools you don't need (/mcp).")`.
+  2. **The fixed content fits but leaves no usable room** (`window − fixed_step − reply_reserve < MIN_HISTORY_BUDGET`). It returns `Failed("After the system prompt and tool definitions (about N tokens) and room for the reply, only about K tokens of this model's M-token window are left for the conversation, which is too little to go on. Pick a model with a larger window (/model), or turn off MCP servers or tools you don't need (/mcp).")`.
+  3. **The fixed content fits, but the 35% target leaves no room.** One **last attempt** at level 3 uses the whole window: `budget = window − fixed_step − reply_reserve`. It is the same drop with no request. If even that step overflows again, the next hook call has nothing left to try and returns `Failed` with case 2's message, using the measured numbers.
+
+  There is no drop loop: every level, including the last attempt, is tried at most once per step, so the number of requests is bounded.
 - **Window when unknown** (custom provider, model list not loaded): `overflow_window(message)`. If that fails too, the size of the request that overflowed (`estimate_tokens` of the history) stands in for the window.
 - **An overflow during an ordinary 85% summary** (`summarize` returns `Err(msg)` with `is_context_overflow(msg)`) goes straight to level 0 instead of `NotCompacted`.
 
@@ -170,17 +190,18 @@ marv-agent depends on marv-provider already, so it can call `is_context_overflow
 ```text
 level = attempt                        (0..=3)
 loop:
-  if level == 3: drop to fit (no request); return true   ← or false if the fixed cost doesn't fit
+  if level == 3: drop to fit (no request); return Recovered   ← or the whole-window last attempt / Failed (§3.5)
   budget too small? → level += 1; continue
   summarize(fit_for_summary(history, budget), …)
-    Ok(summary)                 → install the v2 history; return true (the loop retries the step)
+    Ok(summary)                 → install the v2 history; return Recovered (the loop retries the step)
     Err(e) if overflow(e)       → level += 1; continue    ← our token estimate was off: try smaller
-    Err(_) if cancelled         → Stopped: cancel the turn; return false
-    Err(e)                      → return false (the turn ends with e, as today)
+    Err(_) if cancelled         → return Stopped
+    Err(e)                      → return Failed(e)        (the turn ends with e, as today)
 ```
 
 - If the retried **agent** request overflows again after a successful recovery, the loop calls the hook with `attempt + 1`. Recovery then starts one level lower than the level that last succeeded (the session remembers it for the step), so a step never repeats a level.
-- Altogether, a step makes at most 3 summary requests and 4 agent requests before it gives up.
+- **No template nudge during overflow recovery.** A recovery summary that ignores the template is accepted as it is and logged `structured: false`. A nudge would be one more request per level, each of which could overflow too. So each level sends exactly one summary request.
+- Altogether, a step makes at most 3 summary requests and 6 agent requests (the original, one after each of levels 0–2, one after level 3, and one after the last attempt) before it gives up.
 - Every recovery emits `SessionEvent::Compaction(…)`, so the user sees a notice. A new `CompactResult::Compacted` field `trigger: Auto | Manual | Overflow { level }` tells the UI and trajectory which it was.
 - Before the turn's first request the same hook applies: an overflow there is caught by the loop like any other step.
 - The `mid_turn_compact_failed` rule doesn't block overflow recovery: the alternative is a dead turn.
@@ -258,7 +279,11 @@ Session (`crates/marv-session/src/session.rs` tests, the "Done when" fake-provid
   - the retried step succeeds.
 
   Expected: one hook call, 3 summary requests, each smaller than the last (the recorded requests' estimated sizes go down); `Compaction { trigger: Overflow { level: 3 } }`; the turn ends `Done(End)`.
-- **The fixed cost doesn't fit:** a system prompt larger than the window. The hook returns false without sending a summary request, and the turn ends with the "system prompt and tool definitions alone" error, after a bounded number of requests (1).
+- **The fixed content exceeds the window:** a system prompt larger than the window. The hook returns `Failed` without sending a summary request. The loop emits `LoopEvent::Error` with the "larger than this model's context window" text (not the provider's), and the turn ends `Done(Error)` after 1 request.
+- **The fixed content fits but leaves no room:** the system prompt and tools fit, but the window minus the reply reserve leaves less than `MIN_HISTORY_BUDGET`. The result is `Failed` with the "only about K tokens … left" text; no summary request, no drop; `Done(Error)`.
+- **The 35% target is too small, but the whole window has room:** level 3's 35% budget is below the minimum, the whole-window budget isn't. The last attempt drops to the whole-window budget, the retried step succeeds, and the turn ends `Done(End)`.
+- **No nudge in recovery:** a recovery summary without the template headings is accepted with `structured: false`. The recorded requests show exactly one summary request per level. In the "all the way down" test, the total is still 3 summary requests.
+- `OverflowOutcome` in the loop: `Recovered` → the same step is requested again; `Failed(text)` → `LoopEvent::Error(text)` + `Done(Error)`; `Stopped` → `Done(Aborted)` with no `Error` event.
 - A non-overflow error during a recovery summary (rate limited) ends the turn with that error; Esc during it → `Interrupted`.
 - Rolling: a second compaction's request contains the rolling instruction; `State::summary` is replaced; save, then resume, keeps it.
 - Mid-turn with a tail: the history ends with the tail then `MID_TURN_NOTE`; the next request is valid (every call answered).

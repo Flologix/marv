@@ -128,7 +128,10 @@ Paths are relative to the project root. Give about 3 lines of context above and 
     - a Move destination that is also another op's path;
     - two Moves to one destination;
     - Add plus Update of one path.
-  - Paths are compared after `resolve_in_project` (realpath), so `a.ts` and `./src/../a.ts` are the same path.
+  - **The duplicate key is `(realpath(parent folder), file name)`**, not the path as written. That way a destination that doesn't exist yet is covered.
+    - When the parent folder doesn't exist yet either (an Add that creates folders): take the realpath of the deepest existing ancestor, then the remaining components appended as written. `..` is refused there (`resolve_in_project` already refuses an escape).
+    - So `a.ts`, `./src/../a.ts`, and `link/a.ts` where `link → src`, all key to the same file, whether or not it exists.
+    - The file name itself is compared as is. A final-component symlink is followed by `resolve_in_project`'s own rules, as for `edit_file`.
 - **A Move onto an existing file is an error** ("`*** Move to: <dest>`: <dest> already exists; delete it first or update it instead"). The patch never overwrites by moving. This is checked in the plan (preview) and again under the locks.
 
 **Applying a hunk.** Per file, a cursor starts at 0:
@@ -245,7 +248,13 @@ Apply:
   - Update A with Move to B, plus Add B;
   - two Moves to B;
   - Update A with Move to B, plus Delete B;
-  - Update A plus Update `./A` (the same file after realpath).
+  - Update A plus Update `./A` (the same file after realpath);
+  - **through a symlinked folder** (`link → src`):
+    - Update `src/a.ts` plus Update `link/a.ts` (an existing file);
+    - Add `src/new.ts` plus Add `link/new.ts` (a file that doesn't exist yet: the parent-realpath key catches it);
+    - Update `src/a.ts` with Move to `link/b.ts`, plus Add `src/b.ts`.
+
+    All three are rejected as duplicates with nothing written.
 
 Through `run_tool`, end to end, like `edit_file`'s:
 - an approval is asked once, with `Preview::files`, one per file;
