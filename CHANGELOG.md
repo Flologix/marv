@@ -11,6 +11,7 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 - **`marv -p --approve mcp` approves MCP calls after an MCP read again.** Once a session had read anything from an MCP server, a call made through `mcp_call` (the deferred tools) was refused as "needs the user's approval", because the wrapper asked under its own name instead of the real tool's scope (`mcp:<server>:<tool>`); in the TUI it asked twice. The real tool still asks once the session is tainted, even in yolo, and without `--approve mcp` the call is still refused.
 - **`mesh_list` no longer taints the session when nothing is wired.** Every `mesh_list` result counted as text from another agent, so asking "who's on the mesh?" made every later network command, web request and MCP call ask first, though no other agent had said anything. Now only a list that names wired receptacles (whose descriptions can come from another Marv) taints, as a call's answer and an inbox message do.
 - **A Marv that was killed no longer leaves its mesh socket behind.** `$XDG_RUNTIME_DIR/marv/mesh/` collected a socket for every Marv that didn't exit cleanly; a Marv joining the mesh now removes the sockets nothing listens on.
+- **The Herdr adapter tests no longer fail under load (#92).** Their fake `herdr` script could be run while another test's child process still had it open from being written, and Linux refused with "Text file busy". The tests now wait until the script can be run. This was in the tests only: Marv's behaviour hasn't changed.
 
 ### Changed
 
