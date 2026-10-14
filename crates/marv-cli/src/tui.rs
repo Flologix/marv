@@ -826,8 +826,24 @@ pub struct Bridge {
     mesh_name: Mutex<Option<String>>,
     /// Wake-ups per wire this minute (#78, `mesh.wake`).
     wake_limit: Mutex<marv_session::mesh::WakeLimit>,
-    /// Stops [`Bridge::watch_mesh`] when the bridge goes.
+    /// Stops [`Bridge::watch_mesh`] when the App leaves ([`Bridge::close_mesh`]) or the bridge goes.
     mesh_watch: CancellationToken,
+    /// Who may start a turn (#78): user submissions and wake-ups go through this one lock, so a wake can't start
+    /// once a submission is on its way, and a submission that meets a running turn waits for it instead of failing.
+    gate: Mutex<Gate>,
+}
+
+/// [`Bridge::gate`]'s state.
+#[derive(Default)]
+struct Gate {
+    /// A turn started through the gate is running (until its events are forwarded, and the next queued one starts).
+    turn: bool,
+    /// That turn is a wake-up: the App may not have seen it start yet.
+    woken: bool,
+    /// Input submitted while a turn ran (the App hadn't seen it start, or had just seen it end): run in order next.
+    queued: std::collections::VecDeque<(String, Option<String>)>,
+    /// The App has left: no wake-ups, no queued input.
+    closing: bool,
 }
 
 impl Drop for Bridge {
@@ -921,6 +937,7 @@ impl Bridge {
             mesh_name: Mutex::default(),
             wake_limit: Mutex::default(),
             mesh_watch: CancellationToken::new(),
+            gate: Mutex::default(),
         });
         *changed.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(&bridge));
         Ok(bridge)
@@ -1087,19 +1104,60 @@ impl Bridge {
 
     /// Runs one turn's events through the mapping, on its own task.
     fn run_turn(self: &Arc<Self>, text: String, for_model: Option<String>) {
-        // Working from before the turn's task starts, so Herdr hears it before anything the turn asks.
-        self.activity.set_busy(true);
+        {
+            let mut gate = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+            if gate.closing {
+                return;
+            }
+            // A turn is running that the App didn't know of when this was typed (a wake-up whose start hadn't reached
+            // it, or the end just shown while the next one is being handed over): this goes next, never lost.
+            if gate.turn {
+                gate.queued.push_back((text, for_model));
+                if gate.woken {
+                    self.emit(system("A mesh message woke Marv just now: yours goes next, when that turn ends.", false));
+                }
+                return;
+            }
+            gate.turn = true;
+            // Working from before the turn's task starts, so Herdr hears it before anything the turn asks.
+            self.activity.set_busy(true);
+        }
+        self.start_claimed(text, for_model);
+    }
+
+    /// Sends a message on a gate already taken for it.
+    fn start_claimed(self: &Arc<Self>, text: String, for_model: Option<String>) {
         let turn = match self.session.send(&text, SendOptions { for_model, cancel: None }) {
             Ok(turn) => turn,
             Err(e) => {
-                self.activity.set_busy(false);
-                // The App started its turn on submit: end it.
+                // The App started its turn on submit: end it (this one, the rejected turn: no other turn's end).
                 self.emit(system(e.to_string(), true));
                 self.emit(UiEvent::TurnEnd { turn: String::new(), reason: view::TurnEndReason::Loop(StopReason::Error) });
+                self.finished();
                 return;
             }
         };
         self.forward(turn);
+    }
+
+    /// The gate's turn is over: the next queued input starts on the same gate (nothing can slip in between), or the
+    /// bridge is free.
+    fn finished(self: &Arc<Self>) {
+        let next = {
+            let mut gate = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+            gate.woken = false;
+            match gate.queued.pop_front().filter(|_| !gate.closing) {
+                Some(next) => Some(next),
+                None => {
+                    gate.turn = false;
+                    self.activity.set_busy(false);
+                    None
+                }
+            }
+        };
+        if let Some((text, for_model)) = next {
+            self.start_claimed(text, for_model);
+        }
     }
 
     /// A running turn's events through the mapping, on its own task; not busy once it ends.
@@ -1114,9 +1172,6 @@ impl Bridge {
             let last_fn = move || last_of.usage().last;
             while let Some(event) = turn.next().await {
                 let end = matches!(event, SessionEvent::TurnEnd { .. });
-                if end {
-                    me.activity.set_busy(false);
-                }
                 for ui in map_event(event, &mut map, &totals_fn, &last_fn) {
                     me.emit(ui);
                 }
@@ -1127,7 +1182,8 @@ impl Bridge {
             if let Some(result) = map.last_checks {
                 *me.last_checks.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
             }
-            me.activity.set_busy(false);
+            // After the end went out: input the App sends on seeing it is queued and starts here, in order.
+            me.finished();
         });
     }
 
@@ -1475,11 +1531,20 @@ impl Bridge {
     /// reads it fenced and tainting (`MarvSession::wake`), with who woke it shown first. A wire over
     /// `WAKES_PER_MINUTE` is told once, and its messages wait too.
     fn wake(self: &Arc<Self>) {
-        if !self.config().mesh_wake || self.activity.busy.load(Ordering::SeqCst) || self.activity.waiting() || self.session.busy()
-        {
+        if !self.config().mesh_wake {
             return;
         }
         let Some(mesh) = self.session.mesh() else { return };
+        // Decided and claimed under the gate: a submission on its way has the gate first, and one after waits.
+        let mut gate = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+        if gate.closing
+            || gate.turn
+            || self.activity.busy.load(Ordering::SeqCst)
+            || self.activity.waiting()
+            || self.session.busy()
+        {
+            return;
+        }
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
         let check = marv_session::mesh::wake_check(&mesh, &mut self.wake_limit.lock().unwrap_or_else(|e| e.into_inner()), now);
         for wire in &check.limited {
@@ -1494,14 +1559,25 @@ impl Bridge {
             ));
         }
         let Some(by) = check.wake else { return };
+        (gate.turn, gate.woken) = (true, true);
         self.activity.set_busy(true);
+        drop(gate);
         match self.session.wake(&by) {
             Ok(Some(turn)) => {
                 self.emit(system(by.line(), false));
                 self.forward(turn);
             }
-            Ok(None) | Err(_) => self.activity.set_busy(false),
+            Ok(None) | Err(_) => self.finished(),
         }
+    }
+
+    /// The App is leaving (#78): no wake-up starts from now on, queued input is dropped, and the watcher stops. Before
+    /// the App's flush and the shutdown's interrupt, so nothing starts a turn after the terminal has closed.
+    pub fn close_mesh(&self) {
+        let mut gate = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+        gate.closing = true;
+        gate.queued.clear();
+        self.mesh_watch.cancel();
     }
 
     // ---- MCP (Marv #6, #18, #46) ----
@@ -1943,6 +2019,8 @@ impl SessionPort for Port {
     }
 
     fn flush(&self) -> BoxFuture<'static, ()> {
+        // The App is on its way out: nothing new may start (a mesh wake, queued input).
+        self.0.close_mesh();
         let session = self.0.session.clone();
         Box::pin(async move { session.flush().await })
     }
@@ -2103,7 +2181,9 @@ pub async fn run(resume: Option<bool>) -> anyhow::Result<i32> {
         let _ = write!(std::io::stdout(), "\x1b[23;0t");
         let _ = std::io::stdout().flush();
     }
-    // Stop a turn still running: its tools mustn't outlive the UI.
+    // No wake-up from here on (the App's flush did this already, unless it failed first), then stop a turn still
+    // running: its tools mustn't outlive the UI.
+    bridge.close_mesh();
     bridge.session().interrupt();
     // Background processes stop with Marv (#51): SIGTERM, then SIGKILL after 2 s; their sandboxes also die with Marv
     // if it's killed harder (bwrap's --die-with-parent).
@@ -2540,6 +2620,114 @@ mod tests {
             let seen = quiet(&mut rx).await;
             assert!(!started(&seen) && texts(&seen).is_empty(), "told once: {seen:?}");
             assert_eq!(mesh.unread(), 2);
+        }
+
+        /// A model whose first reply waits until `release` is notified; records each request's last user message.
+        #[derive(Default)]
+        struct Gated {
+            release: Arc<tokio::sync::Notify>,
+            held: AtomicBool,
+            replies: Mutex<VecDeque<Vec<ProviderEvent>>>,
+            seen: Mutex<Vec<String>>,
+        }
+        impl Provider for Gated {
+            fn name(&self) -> &str {
+                "gated"
+            }
+            fn context_length(&self) -> Option<u64> {
+                None
+            }
+            fn stream(&self, history: &[ChatTurn], _options: StreamOptions) -> EventStream {
+                let last =
+                    history.iter().rev().find_map(|t| if let ChatTurn::User { text } = t { Some(text.clone()) } else { None });
+                self.seen.lock().unwrap().push(last.unwrap_or_default());
+                let reply = self.replies.lock().unwrap().pop_front().unwrap_or_else(|| say("(script ended)"));
+                let (hold, release) = (!self.held.swap(true, Ordering::SeqCst), self.release.clone());
+                Box::pin(
+                    futures::stream::once(async move {
+                        if hold {
+                            release.notified().await;
+                        }
+                        futures::stream::iter(reply)
+                    })
+                    .flatten(),
+                )
+            }
+        }
+
+        fn gated_bridge(dirs: &Dirs, mesh: &Mesh, model: Arc<Gated>) -> (Arc<Bridge>, UnboundedReceiver<UiEvent>) {
+            let (tx, rx) = unbounded_channel();
+            let mut s = startup(dirs, Some(wakes()), vec![], None);
+            s.mesh = Some(mesh.sb.clone());
+            s.make_provider = Arc::new(move |_, _| model.clone() as Arc<dyn Provider>);
+            let bridge = Bridge::start(s, tx).unwrap();
+            bridge.watch_mesh();
+            (bridge, rx)
+        }
+        fn ends(events: &[UiEvent]) -> Vec<String> {
+            events.iter().filter_map(|e| if let UiEvent::TurnEnd { turn, .. } = e { Some(turn.clone()) } else { None }).collect()
+        }
+
+        /// Greptile on #110: the user presses Enter after a wake took the session but before the App saw its
+        /// TurnStart. The input isn't lost and the woken turn isn't ended for the App: it runs when the wake ends.
+        #[tokio::test]
+        async fn input_typed_while_a_wake_starts_runs_after_it() {
+            let (dirs, mesh) = (Dirs::new(), mesh());
+            let model = Arc::new(Gated::default());
+            model.replies.lock().unwrap().extend([say("worker-1 says hi."), say("Here's your answer.")]);
+            let (bridge, mut rx) = gated_bridge(&dirs, &mesh, model.clone());
+            mesh.wire().await;
+            mesh.send("hi").await;
+            until(&mut rx, |e| matches!(e, UiEvent::TurnStart { .. })).await;
+            // The woken turn is waiting on its model: the App submits as if idle.
+            Port(bridge.clone()).send("what's new?".into());
+            let seen = quiet(&mut rx).await;
+            assert!(ends(&seen).is_empty(), "nothing ends the woken turn: {seen:?}");
+            assert!(texts(&seen).iter().any(|t| t.contains("yours goes next")), "{seen:?}");
+            model.release.notify_one();
+            let seen = until(&mut rx, |e| matches!(e, UiEvent::Assistant { text } if text == "Here's your answer.")).await;
+            let seen = [seen, until(&mut rx, |e| matches!(e, UiEvent::TurnEnd { .. })).await].concat();
+            let ended = ends(&seen);
+            assert_eq!(ended.len(), 2, "{seen:?}");
+            assert!(ended.iter().all(|t| !t.is_empty()), "only real turns end: {ended:?}");
+            assert!(seen.iter().any(|e| matches!(e, UiEvent::Assistant { text } if text == "worker-1 says hi.")));
+            let asked = model.seen.lock().unwrap().clone();
+            assert_eq!(asked.len(), 2, "{asked:?}");
+            assert!(asked[1].ends_with("what's new?"), "{asked:?}");
+        }
+
+        /// The other way round: a submission on its way first, a message then can't start a turn alongside it.
+        #[tokio::test]
+        async fn a_wake_never_starts_while_a_submission_runs() {
+            let (dirs, mesh) = (Dirs::new(), mesh());
+            let model = Arc::new(Gated::default());
+            model.replies.lock().unwrap().extend([say("done")]);
+            let (bridge, mut rx) = gated_bridge(&dirs, &mesh, model.clone());
+            mesh.wire().await;
+            Port(bridge.clone()).send("go".into());
+            until(&mut rx, |e| matches!(e, UiEvent::TurnStart { .. })).await;
+            mesh.send("hi").await;
+            let seen = quiet(&mut rx).await;
+            assert!(!texts(&seen).iter().any(|t| t == WOKEN), "{seen:?}");
+            model.release.notify_one();
+            let seen = until(&mut rx, |e| matches!(e, UiEvent::TurnEnd { .. })).await;
+            assert!(!texts(&seen).iter().any(|t| t == WOKEN));
+            assert_eq!(model.seen.lock().unwrap().len(), 1);
+        }
+
+        /// Greptile on #110: once the App is leaving (its flush), a message starts no turn.
+        #[tokio::test]
+        async fn no_wake_after_the_app_exits() {
+            let (dirs, mesh) = (Dirs::new(), mesh());
+            let (bridge, mut rx) = bridge(&dirs, wakes(), vec![say("x")], &mesh);
+            mesh.wire().await;
+            Port(bridge.clone()).flush().await;
+            mesh.send("hi").await;
+            assert!(!started(&quiet(&mut rx).await), "no turn after exit");
+            assert_eq!(mesh.unread(), 1);
+            // And a wake asked for directly is refused too.
+            bridge.wake();
+            assert!(!started(&quiet(&mut rx).await));
         }
 
         #[tokio::test]
