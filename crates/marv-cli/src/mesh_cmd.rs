@@ -24,7 +24,7 @@ use marv_mesh::discovery::{
     CONNECT, DoorClient, DoorGuard, DoorInfo, PLUG, PeerSwitchboard, check_socket, mesh_dir, mesh_name, open_door,
     peer_receptacle, session_socket,
 };
-use marv_mesh::herdr::{HerdrAdapter, HerdrPanes, PaneAction, herdr_target, pane_receptacle};
+use marv_mesh::herdr::{HerdrAdapter, PaneAction, herdr_target, pane_receptacle};
 use marv_mesh::plug::{MODE_META, MODES_META};
 use marv_mesh::{PlugId, ReceptacleName, WireMode};
 use marv_session::mesh::{DoorWires, MeshHandle, PARENT, WireApprover};
@@ -71,8 +71,7 @@ pub fn start(env: &marv_mcp::Env, root: &Path) -> Result<Option<Mesh>, String> {
     let handle = marv_session::mesh::start(&name, env, cancel.clone()).ok_or("no XDG_RUNTIME_DIR")?;
     let pane = herdr_target(env).map(|t| t.pane_id);
     if let Some(own) = &pane {
-        let adapter = HerdrAdapter::new("herdr", Some(own.clone()));
-        handle.add_resolver(Arc::new(HerdrPanes(Arc::new(adapter))));
+        handle.set_herdr(Arc::new(HerdrAdapter::new("herdr", Some(own.clone()))));
     }
     Ok(Some(Mesh { handle, name, root: root.to_path_buf(), pane, dir, door: None, cancel }))
 }
