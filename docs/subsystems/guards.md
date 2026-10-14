@@ -34,6 +34,7 @@ Each guard's doc comment says how it was proven: the guard was reverted, and the
 | … skill files and folders | `sandbox.rs::skill_files_and_folders_stay_inside_after_realpath` | Proven |
 | … instruction files: project, parent and nested `AGENTS.md`/`CLAUDE.md` | `sandbox.rs::instruction_files_stay_inside_after_realpath` | Proven (#62) |
 | … and inside the project, never a secret or a `node_modules`/`target`/`.git` target | `sandbox.rs::instruction_files_never_read_secrets_or_skipped_folders` | Proven (#62, two reverts) |
+| Saved tool outputs: read_file/grep read only the session's folder; no writes, bash can't see it | `sandbox.rs::only_reading_tools_reach_the_sessions_saved_outputs_and_nothing_else_outside` | Proven (#61; two reverts; bash part real bwrap) |
 | Results tagged; outside text fenced, never Marv's voice | `provenance.rs::outside_text_is_tagged_and_fenced_as_data` | Proven |
 | Web/MCP/mesh/image content taints | `provenance.rs::outside_content_taints_the_session` | Proven |
 | Tainted: network bash asks | `provenance.rs::tainted_network_bash_must_ask` | Proven |
@@ -44,6 +45,7 @@ Each guard's doc comment says how it was proven: the guard was reverted, and the
 | `must_ask` never answered by "always" | `provenance.rs::always_never_answers_must_ask` | Proven |
 | Approvals show the full payload | `provenance.rs::approvals_show_the_full_payload` | Proven |
 | A network approval lists scripts written this session | `provenance.rs::a_network_approval_lists_the_scripts_it_runs` | Ignored: not built yet |
+| A mesh message that wakes an idle Marv is fenced and taints; its turn's egress asks (#78) | `mesh.rs::a_woken_turn_reads_its_message_fenced_and_tainted_and_egress_asks` | Proven |
 | Subagents don't inherit network/web/mesh approvals | `provenance.rs::subagents_inherit_taint_but_no_egress_approvals` | Proven |
 | A worktree subagent's `.git` is read-only; Marv commits for it | `worktree.rs::a_worktree_subagents_git_is_read_only_and_marv_commits_for_it` | Proven (real bwrap, #12) |
 | … Marv's commit trusts nothing the worktree says | `worktree.rs::marvs_commit_trusts_nothing_the_worktree_says` | Proven (#12) |

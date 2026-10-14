@@ -27,7 +27,7 @@ Marv is written in Rust and ships as one static binary. Nothing else runs it: no
 - **Trajectories and feedback.** Every turn is logged step by step (requests, replies, tool calls, subagents, timings, tokens) to `~/.marv/trajectories/`, with your ratings: `/good`, `/bad`, `/label`, and what your next message implies ("thanks, perfect" or "that's wrong").
 - **Type errors caught early.** After Marv changes files in a TypeScript project, it runs the project's own typecheck in the sandbox and tells the model about errors the change added, even in files it didn't touch (a project here means a `tsconfig.json` in the folder Marv starts in plus the project's own `typescript` or tsgo in that folder's `node_modules`; a global tsc isn't used), so it fixes broken callers before saying it's done. `/diagnostics off` turns it off.
 - **Your project's rules, as checks.** Rules from your instructions ("imports use `.ts` extensions", "never call X outside Y") can live in `.marv/checks/` as code: after a step that changed files, Marv runs the checks those files concern, in the sandbox, and tells the model only the violations its change added, with the reason. See [Checks](#checks).
-- **A plan for long tasks.** For a task with several steps (or a request with several asks in one paragraph), the model writes a checklist with its `plan` tool and ticks it off as it works. Marv pins it above the prompt (`Plan 2/5`, the current item highlighted) until every item is done, saves it with the session, and hands it back to the model after the conversation is compacted.
+- **A plan for long tasks.** For a task of four or more steps (or a request with several asks in one paragraph), the model writes a checklist with its `plan` tool and ticks it off as it works, updating it alongside its other tool calls rather than in requests of its own. Marv pins it above the prompt (`Plan 2/5`, the current item highlighted) until every item is done, saves it with the session, and hands it back to the model after the conversation is compacted.
 - **Undo a turn.** Before a turn's first change Marv snapshots the project's files, and `/undo` shows what that turn changed (each file's diff) and, on a yes, puts those files back: edits, new files and deleted ones, whether a tool or a `bash` command made them. Your branch, index and stash are never touched. See [Undo](#undo).
 - **No dead stops.** After 25 steps without finishing, Marv asks whether to keep going instead of giving up. Raise the interval with `/steps 40` (or `maxSteps` in the config), or turn the asking off with `/steps off` (subagents still stop at their own 50).
 - **Cost tracking.** OpenRouter's actual charge per request, plus context and cache use, in the status bar; `/cost` for the breakdown.
@@ -143,6 +143,7 @@ Type `/` to open the command menu: ↑/↓ to choose, Enter to run, Tab or → t
 | PgUp / PgDn, mouse wheel | Scroll the conversation |
 | Drag with the mouse | Select text; it's copied when you let go (drag past the edge to scroll) |
 | ↑ / ↓ | Previous inputs |
+| Tab or → (empty input) | Take the suggested next message shown in the prompt; Enter then sends it |
 
 ### Command-line options
 
@@ -208,7 +209,7 @@ Servers go in `~/.marv/mcp.json` (yours, every project) or the project's `.mcp.j
 - Local servers (stdio) and remote ones (Streamable HTTP) both work. An optional `timeout` sets the seconds per call (default 120). The old `sse` transport isn't supported.
 - Servers start in the background when Marv does, and the first request waits for them. Restart Marv after editing a config by hand (`/mcp add` starts its server at once).
 - A project server can't take the name of one of yours, and starts only once you trust it with `/mcp trust` (see [Safety model](#safety-model)). Once the servers have started, an "MCP" notice lists those that failed, those waiting for trust (what each runs and reads from your environment) and those that need a login. Trust given by Marv 0.3.0 doesn't carry over (the trust key changed).
-- With many tools connected (specs that would cost more than 4,000 tokens per request, or 10% of the context window if that is less), the model gets their names and two tools to look one up and call it. `"mcpTools": "eager"` in `~/.marv/config.json` sends every spec with every request instead, `"deferred"` always sends names only.
+- With many tools connected (specs that would cost more than 8,000 tokens per request, or 10% of the context window if that is less), the model gets their names and two tools to look one up and call it. `"mcpTools": "eager"` in `~/.marv/config.json` sends every spec with every request instead, `"deferred"` always sends names only.
 
 ### Add an MCP server
 
@@ -381,7 +382,9 @@ Not yet: `watch` (subscribing to events), unwiring across processes (a wire to a
 | `$XDG_RUNTIME_DIR/marv/` | The mesh's sockets and background processes' relays, while Marv runs |
 | `AGENTS.md` | Project instructions, read into the system prompt at startup |
 
-`~/.marv/config.json` also takes `sandbox`, `yolo`, `thinking`, `trajectories`, `diagnostics`, `checks`, `checkpoints` (each `true` or `false`), `maxSteps`, `mcpTools` (`auto`, `deferred` or `eager`), `contextLength` (Ollama) and `baseUrl` (e.g. Ollama on another machine). The slash commands write most of them for you.
+`~/.marv/config.json` also takes `sandbox`, `yolo`, `thinking`, `trajectories`, `diagnostics`, `checks`, `checkpoints`, `suggestions` (each `true` or `false`), `maxSteps`, `mcpTools` (`auto`, `deferred` or `eager`), `contextLength` (Ollama) and `baseUrl` (e.g. Ollama on another machine). The slash commands write most of them for you.
+
+**Session-start hooks.** `"hooks": {"sessionStart": ["bd ready", {"command": "git status -s", "timeout": 5}]}` runs those commands, in order, whenever a conversation starts: when Marv starts (the TUI and `marv -p`), after `/clear` and on a resume (never in subagents). They run like your own shell command: bash, in the project folder, outside the sandbox, with your environment minus Marv's keys and secret-looking variables. Each has a timeout in seconds (default 15) and its output is cut to 8 KB. Their output goes to the model once, at the start of your first message, labelled with each command and quoted as data; the TUI shows one line per hook. Like a web page or an MCP result, hook output **taints the conversation**: from then on anything that can send data out asks first, even in yolo, because what a command prints (issue titles in `bd ready`, say) can come from anyone. Add `"trusted": true` to a hook (`{"command": "date", "trusted": true}`) when you vouch for its output; a hook that prints nothing taints nothing. A hook that fails or times out is a one-line note and never stops Marv from starting. Hooks are read **only from your own `~/.marv/config.json`**: a project's `.marv/config.json` naming `hooks` is refused with a startup note and never run, so cloning a repository can't make Marv run its commands.
 
 | Environment variable | Effect |
 |---|---|
