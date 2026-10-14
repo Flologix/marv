@@ -13,12 +13,13 @@ use regex::Regex;
 
 /// Names that hold a secret: tokens, passwords, API and access keys, credentials (SSH_AUTH_SOCK is a socket: kept).
 static SECRET_NAME: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(?:^|_)(?:TOKEN|SECRET|PASSWORD|PASSWD|PASS|PWD|API_?KEY|KEY|KEY_ID|PRIVATE_KEY|CREDENTIALS?)(?:_|$)|PASSWORD")
-        .unwrap()
+    Regex::new(
+        r"(?i)(?:^|_)(?:TOKEN|SECRET|PASSWORD|PASSWD|PASS|PWD|API_?KEY|KEY|KEY_ID|PRIVATE_KEY|CREDENTIALS?)(?:_|$)|PASSWORD",
+    )
+    .unwrap()
 });
 /// A URL with a password in it (postgres://user:pass@host).
-static CREDENTIAL_URL: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)^[a-z][a-z0-9+.-]*://[^/\s:@]+:[^/\s@]+@").unwrap());
+static CREDENTIAL_URL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^[a-z][a-z0-9+.-]*://[^/\s:@]+:[^/\s@]+@").unwrap());
 
 /// Whether a variable must stay out of a command that runs outside the sandbox: Marv's own (MARV_*, the provider
 /// key) and anything that looks like a secret.

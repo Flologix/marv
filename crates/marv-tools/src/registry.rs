@@ -144,7 +144,7 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
         noted(ToolOutcome { result, label: label.clone() })
     };
 
-    let network = tool.uses_network(input);
+    let network = tool.uses_network(input, ctx);
     let protected = tool.protected_target(input, ctx);
     // A web request under a URL prefix the user approved after the taint (docs/SECURITY.md) runs as approved.
     let egress_url = tool.egress_url(input).filter(|_| ctx.taint.is_tainted());
@@ -179,7 +179,7 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
     let no_one_to_ask = || noted(fail(format!("{} needs the user's approval, and there's no one to ask.", call.name), &label));
     let Some(approver) = &ctx.approver else { return no_one_to_ask() };
     let scope =
-        tool.scope(input).unwrap_or_else(|| crate::types::Scope { key: call.name.clone(), description: call.name.clone() });
+        tool.scope(input, ctx).unwrap_or_else(|| crate::types::Scope { key: call.name.clone(), description: call.name.clone() });
     let request = ApprovalRequest {
         tool: call.name.clone(),
         label: label.clone(),
