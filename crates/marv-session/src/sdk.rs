@@ -284,6 +284,8 @@ pub async fn create_session(options: SessionOptions) -> Result<MarvSession, Sess
     let mut init = SessionInit::new(root.clone(), ProviderChoice::Option(options.provider));
     init.thinking = options.thinking;
     init.instructions = loaded.instructions.map(|i| i.text);
+    // Nested AGENTS.md files are the project's too (#62).
+    init.nested_instructions = options.sources.contains(&Source::Project);
     init.skills = loaded.skills;
     init.agents = loaded.agents;
     init.memory = loaded.memory;

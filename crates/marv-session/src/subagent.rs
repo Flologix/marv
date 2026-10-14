@@ -8,6 +8,13 @@
 //! Its tool context is built from scratch ([`subagent_context`]), so nothing is inherited by accident: no agent host
 //! (no nesting), no memory, no call id. Yolo carries over. marv-rs: its taint is `TaintState::for_subagent` and it
 //! **doesn't inherit network, web or mesh approvals** (docs/SECURITY.md): its "always" scopes start empty.
+//!
+//! Instruction files (#62): a subagent gets the same ones as the main agent, the user's own `~/.marv/AGENTS.md`
+//! included. They're the user's rules for any work done for them (a subagent edits the same files, runs the same
+//! tests, and "never commit" or "use pnpm" holds for it too), the text is already in the main agent's context, and
+//! its prompt is built once, so its cache holds. Nested files come on demand as for the main agent, from a fresh
+//! record (its context starts empty: a file the main agent already had is news to it). In a worktree, the nested
+//! files are the worktree's.
 
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
@@ -368,11 +375,18 @@ async fn drive(
     let specs = available.iter().map(|t| t.spec()).collect();
     let taint = sub_ctx.taint.clone();
     let child_taint = sub_ctx.taint.clone();
-    let runner = Arc::new(SessionToolRunner::new(sub_ctx, Arc::new(available)));
+    let mut runner = SessionToolRunner::new(sub_ctx, Arc::new(available));
+    if host.nested_instructions {
+        runner.nested = Some(Arc::default());
+    }
+    let runner = Arc::new(runner);
     let history: History = Arc::new(Mutex::new(vec![ChatTurn::User { text: input.prompt.clone() }]));
     let mut options =
         AgentOptions::new(host.provider_for(agent_type.model.as_deref()), history, system, specs, runner, ctx.cancel.clone());
     options.max_steps = SUBAGENT_MAX_STEPS;
+    // No one can say "keep going" to a subagent: at its limit it gets one tools-off request to report what it finished
+    // and what's left, so the parent reads a summary rather than only the limit (#59).
+    options.wrap_up_at_limit = true;
     options.after_step = plug.as_ref().map(|p| p.after_step(None, taint));
 
     tally.report();
@@ -476,7 +490,7 @@ mod run_tests {
     use std::path::{Path, PathBuf};
 
     use marv_core::{ProviderEvent, ToolCall, Usage};
-    use marv_provider::{EventStream, Provider, ProviderFactory, ReasoningSupport, StreamOptions};
+    use marv_provider::{EventStream, Provider, ProviderFactory, StreamOptions};
     use marv_sandbox::sandbox_available;
     use marv_tools::ToolOutcome;
     use tokio_util::sync::CancellationToken;
@@ -571,7 +585,7 @@ mod run_tests {
         fn model(&self) -> &str {
             "test-model"
         }
-        fn make(&self, model: Option<&str>, _info: Option<ReasoningSupport>) -> Arc<dyn Provider> {
+        fn make(&self, model: Option<&str>, _info: Option<&marv_provider::ModelInfo>) -> Arc<dyn Provider> {
             lock(&self.models).push(model.map(str::to_string));
             self.provider.clone()
         }
@@ -660,6 +674,7 @@ mod run_tests {
                 agents: Arc::new(agents),
                 cwd: "~/proj".into(),
                 instructions: None,
+                nested_instructions: false,
                 worktrees_dir: worktrees.then(|| self.trees.0.clone()),
                 factory: Arc::new(Factory { provider: provider.clone(), models: seen.models.clone() }),
                 provider,
@@ -829,6 +844,35 @@ mod run_tests {
         assert!(out.result.output.contains(&format!("It hit its {SUBAGENT_MAX_STEPS}-step limit before finishing")));
         assert!(out.result.output.contains("start a new subagent"));
         assert!(!out.result.output.contains("continue"), "{}", out.result.output);
+    }
+
+    #[tokio::test]
+    async fn at_its_step_limit_it_reports_a_wrap_up_instead_of_the_bare_limit() {
+        // #59: no one can say "keep going" to a subagent, so its last request asks for a summary, tools off (still
+        // sent: the cached prefix holds). The summary is its report; Marv's limit line follows it.
+        let f = Fixture::new();
+        let mut steps: Vec<_> = (0..SUBAGENT_MAX_STEPS)
+            .map(|i| use_tool(&format!("r{i}"), "read_file", serde_json::json!({"path": format!("notes-{i}.txt")})))
+            .collect();
+        steps.push(say("Checked 50 files. Left: the tests. Next step: run them."));
+        let provider = Scripted::new(steps);
+        let (host, _) = f.host(provider.clone(), vec![general_purpose()], true);
+        let ctx = ctx_with(host, &Asker::yes(), &f.root.0);
+        let out = run(agent_call(serde_json::json!({"description": "endless", "prompt": "p"}), "a1"), &ctx).await;
+
+        let requests = provider.requests();
+        let last = SUBAGENT_MAX_STEPS as usize;
+        assert_eq!(requests.len(), last + 1);
+        assert_eq!(requests[last].1.tool_choice, marv_core::ToolChoice::None);
+        assert_eq!(provider.tool_names(last), provider.tool_names(last - 1));
+        assert_eq!(requests[last].0.last(), Some(&ChatTurn::User { text: marv_agent::agent::STEP_LIMIT_NOTE.into() }));
+        assert!(
+            out.result.output.starts_with("Checked 50 files. Left: the tests. Next step: run them.\n\n[Marv: It hit its"),
+            "{}",
+            out.result.output
+        );
+        assert!(out.result.is_error);
+        assert!(out.result.summary.starts_with("stopped ·"));
     }
 
     #[tokio::test]

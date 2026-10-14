@@ -43,6 +43,12 @@ pub enum End {
     Drop,
     /// Nothing more is sent and the connection stays open.
     Hang,
+    /// The connection is reset (TCP RST) mid-body, the way a broken TLS session or a middlebox ends it.
+    Reset,
+    /// The connection is reset right after the request arrives, before any response: the send itself fails.
+    ResetBeforeReply,
+    /// After the chunks, nothing is sent for this long, then the body ends cleanly (an idle stream).
+    StallThenComplete(Duration),
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +58,8 @@ pub struct Reply {
     /// Sent one by one, as separate chunks.
     pub chunks: Vec<Vec<u8>>,
     pub end: End,
+    /// A wait before each chunk after the first (a stream that trickles in).
+    pub pace: Duration,
 }
 
 impl Reply {
@@ -61,6 +69,7 @@ impl Reply {
             headers: vec![("content-type".into(), content_type.into())],
             chunks: vec![body.into()],
             end: End::Complete,
+            pace: Duration::ZERO,
         }
     }
 
@@ -81,17 +90,34 @@ impl Reply {
                 other => format!("data: {other}\n\n").into_bytes(),
             })
             .collect();
-        Self { status: 200, headers: vec![("content-type".into(), "text/event-stream".into())], chunks, end: End::Complete }
+        Self {
+            status: 200,
+            headers: vec![("content-type".into(), "text/event-stream".into())],
+            chunks,
+            end: End::Complete,
+            pace: Duration::ZERO,
+        }
     }
 
     /// Ollama's NDJSON: one JSON object per line, one chunk each.
     pub fn ndjson(lines: &[Value]) -> Self {
         let chunks = lines.iter().map(|l| format!("{l}\n").into_bytes()).collect();
-        Self { status: 200, headers: vec![("content-type".into(), "application/x-ndjson".into())], chunks, end: End::Complete }
+        Self {
+            status: 200,
+            headers: vec![("content-type".into(), "application/x-ndjson".into())],
+            chunks,
+            end: End::Complete,
+            pace: Duration::ZERO,
+        }
     }
 
     pub fn header(mut self, name: &str, value: &str) -> Self {
         self.headers.push((name.into(), value.into()));
+        self
+    }
+
+    pub fn paced(mut self, pace: Duration) -> Self {
+        self.pace = pace;
         self
     }
 
@@ -156,6 +182,10 @@ async fn serve(mut socket: TcpStream, handler: Arc<Handler>, seen: Arc<Mutex<Vec
     let Some(request) = read_request(&mut socket).await else { return };
     seen.lock().unwrap().push(request.clone());
     let reply = handler(&request);
+    if reply.end == End::ResetBeforeReply {
+        let _ = socket.set_zero_linger();
+        return;
+    }
     let mut head = format!("HTTP/1.1 {} {}\r\n", reply.status, reason(reply.status));
     for (name, value) in &reply.headers {
         head.push_str(&format!("{name}: {value}\r\n"));
@@ -164,7 +194,10 @@ async fn serve(mut socket: TcpStream, handler: Arc<Handler>, seen: Arc<Mutex<Vec
     if socket.write_all(head.as_bytes()).await.is_err() {
         return;
     }
-    for chunk in &reply.chunks {
+    for (i, chunk) in reply.chunks.iter().enumerate() {
+        if i > 0 && !reply.pace.is_zero() {
+            tokio::time::sleep(reply.pace).await;
+        }
         let mut framed = format!("{:x}\r\n", chunk.len()).into_bytes();
         framed.extend_from_slice(chunk);
         framed.extend_from_slice(b"\r\n");
@@ -181,6 +214,16 @@ async fn serve(mut socket: TcpStream, handler: Arc<Handler>, seen: Arc<Mutex<Vec
             let _ = socket.shutdown().await;
         }
         End::Hang => tokio::time::sleep(Duration::from_secs(600)).await,
+        End::Reset => {
+            // Dropping a socket with a zero linger sends RST instead of FIN.
+            let _ = socket.set_zero_linger();
+        }
+        End::ResetBeforeReply => unreachable!("handled before the head"),
+        End::StallThenComplete(wait) => {
+            tokio::time::sleep(wait).await;
+            let _ = socket.write_all(b"0\r\n\r\n").await;
+            let _ = socket.shutdown().await;
+        }
     }
 }
 

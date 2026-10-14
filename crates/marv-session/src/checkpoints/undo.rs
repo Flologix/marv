@@ -587,7 +587,8 @@ mod tests {
     async fn eol_crlf_a_crlf_file_comes_back_crlf_and_isnt_called_changed_since() {
         let crlf = "one\r\ntwo\r\n";
         let repo = repo_with(&[], "*.txt text eol=crlf\n", &[("w.txt", crlf)]);
-        let s = store(&repo.0, &temp("cp-own"));
+        let cp_own = temp("cp-own");
+        let s = store(&repo.0, &cp_own);
         turn(&s, 1, || write(repo.0.join("w.txt"), "one\r\nTWO\r\n"), "").await;
         let plan = undo_back(&s).await;
         assert_eq!(lines(&plan.files.iter().find(|f| f.path == "w.txt").unwrap().diff), ["ctx:one\r", "del:TWO\r", "add:two\r"]);
@@ -597,7 +598,8 @@ mod tests {
     #[tokio::test]
     async fn core_autocrlf_lf_stays_lf_crlf_stays_crlf_also_when_deleted() {
         let repo = repo_with(&[("core.autocrlf", "true")], "", &[("lf.txt", "lf\n"), ("crlf.txt", "crlf\r\n")]);
-        let s = store(&repo.0, &temp("cp-own"));
+        let cp_own = temp("cp-own");
+        let s = store(&repo.0, &cp_own);
         turn(
             &s,
             1,
@@ -624,7 +626,8 @@ mod tests {
             &[("asset.bin", "real content\n")],
         );
         let _ = std::fs::remove_file(&marker);
-        let s = store(&repo.0, &temp("cp-own"));
+        let cp_own = temp("cp-own");
+        let s = store(&repo.0, &cp_own);
         turn(&s, 1, || write(repo.0.join("asset.bin"), "other bytes!\n"), "").await;
         undo_back(&s).await;
         assert_eq!(read(repo.0.join("asset.bin")), "real content\n");
@@ -636,7 +639,8 @@ mod tests {
         let plain = temp("cp-plain");
         write(plain.0.join(".gitattributes"), "*.txt text eol=crlf\n");
         write(plain.0.join("w.txt"), "x\r\ny\r\n");
-        let s = store(&plain.0, &temp("cp-own"));
+        let cp_own = temp("cp-own");
+        let s = store(&plain.0, &cp_own);
         turn(&s, 1, || write(plain.0.join("w.txt"), "z\r\n"), "").await;
         undo_back(&s).await;
         assert_eq!(read(plain.0.join("w.txt")), "x\r\ny\r\n");
@@ -649,7 +653,8 @@ mod tests {
     #[tokio::test]
     async fn a_file_edited_since_is_marked_and_restored_reported_paths_in_neither_tree_arent_restored() {
         let repo = make_repo(true);
-        let s = store(&repo.0, &temp("cp-own"));
+        let cp_own = temp("cp-own");
+        let s = store(&repo.0, &cp_own);
         turn(
             &s,
             1,
@@ -676,7 +681,8 @@ mod tests {
         write(repo.0.join("sub/f.txt"), "f\n");
         git(&repo.0, &["add", "-A"]);
         git(&repo.0, &["commit", "-q", "-m", "sub"]);
-        let s = store(&repo.0, &temp("cp-own"));
+        let cp_own = temp("cp-own");
+        let s = store(&repo.0, &cp_own);
         turn(&s, 1, || write(repo.0.join("sub/f.txt"), "changed\n"), "").await;
         std::fs::remove_dir_all(repo.0.join("sub")).unwrap();
         std::os::unix::fs::symlink(&outside.0, repo.0.join("sub")).unwrap();
@@ -690,7 +696,8 @@ mod tests {
     #[tokio::test]
     async fn a_binary_file_is_named_not_diffed() {
         let repo = make_repo(true);
-        let s = store(&repo.0, &temp("cp-own"));
+        let cp_own = temp("cp-own");
+        let s = store(&repo.0, &cp_own);
         turn(&s, 1, || write(repo.0.join("img.bin"), [0u8, 1, 2, 0]), "").await;
         let plan = plan(&s).await;
         assert_eq!(plan.files.len(), 1);
@@ -702,7 +709,8 @@ mod tests {
     #[tokio::test]
     async fn pre_undo_snapshot_and_undo_marker_two_undos_walk_back_two_turns() {
         let repo = make_repo(true);
-        let s = store(&repo.0, &temp("cp-own"));
+        let cp_own = temp("cp-own");
+        let s = store(&repo.0, &cp_own);
         turn(&s, 1, || write(repo.0.join("a.txt"), "two\n"), "").await;
         turn(&s, 2, || write(repo.0.join("a.txt"), "three\n"), "").await;
         let first = plan(&s).await;
@@ -727,7 +735,8 @@ mod tests {
     #[tokio::test]
     async fn a_failed_undo_marker_still_counts_the_next_undo_goes_further_back_and_the_summary_says_so() {
         let repo = make_repo(true);
-        let s = store(&repo.0, &temp("cp-own"));
+        let cp_own = temp("cp-own");
+        let s = store(&repo.0, &cp_own);
         turn(&s, 1, || write(repo.0.join("a.txt"), "two\n"), "").await;
         turn(&s, 2, || write(repo.0.join("a.txt"), "three\n"), "").await;
         let first = plan(&s).await;
@@ -750,7 +759,8 @@ mod tests {
     async fn a_saved_copy_that_cant_be_read_stops_the_plan_rather_than_writing_the_file_back_empty() {
         let repo = make_repo(true);
         write(repo.0.join("lost.txt"), "only copy in the checkpoints\n");
-        let s = store(&repo.0, &temp("cp-own"));
+        let cp_own = temp("cp-own");
+        let s = store(&repo.0, &cp_own);
         turn(&s, 1, || write(repo.0.join("lost.txt"), "changed\n"), "").await;
         let before = s.chain().await.unwrap().into_iter().find(|c| c.kind == CheckpointKind::Before).unwrap();
         let blob = git(&repo.0, &["rev-parse", &format!("{}:lost.txt", before.sha)]);
@@ -763,7 +773,8 @@ mod tests {
     #[tokio::test]
     async fn a_plan_made_before_another_checkpoint_is_refused() {
         let repo = make_repo(true);
-        let s = store(&repo.0, &temp("cp-own"));
+        let cp_own = temp("cp-own");
+        let s = store(&repo.0, &cp_own);
         turn(&s, 1, || write(repo.0.join("a.txt"), "two\n"), "").await;
         let stale = plan(&s).await;
         turn(&s, 2, || write(repo.0.join("a.txt"), "three\n"), "").await;
@@ -775,7 +786,8 @@ mod tests {
     async fn a_subfolder_projects_paths_are_relative_to_it() {
         let repo = make_repo(true);
         std::fs::create_dir(repo.0.join("pkg")).unwrap();
-        let s = store(&repo.0.join("pkg"), &temp("cp-own"));
+        let cp_own = temp("cp-own");
+        let s = store(&repo.0.join("pkg"), &cp_own);
         turn(&s, 1, || write(repo.0.join("pkg/x.txt"), "x\n"), "").await;
         let plan = plan(&s).await;
         let paths: Vec<&str> = plan.files.iter().map(|f| f.path.as_str()).collect();

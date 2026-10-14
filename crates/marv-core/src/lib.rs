@@ -114,12 +114,32 @@ pub enum ProviderEvent {
     Error(String),
     /// The provider is retrying after a dropped connection. `continued`: the partial
     /// reply was kept and the next attempt continues it, instead of starting over (Marv #64).
+    /// `cause`: why (trajectories count stalls and degenerate replies, Marv #88, #96).
     Retry {
         attempt: u32,
         max: u32,
         message: String,
         continued: bool,
+        cause: RetryCause,
     },
+    /// Throw away everything this reply has streamed so far (text, reasoning, calls), with no new attempt after it:
+    /// an `Error` follows. Marv #96: the second degenerate reply, which must not end up in the history.
+    Discard {
+        cause: RetryCause,
+    },
+}
+
+/// Why a provider retries a request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RetryCause {
+    /// The connection dropped or failed, the server answered a temporary error, or the stream broke off.
+    #[default]
+    Dropped,
+    /// Marv #88: the stream went silent (no bytes at all) for longer than the idle timeout.
+    Stalled,
+    /// Marv #96: the reply degenerated (whitespace, or one short piece over and over) and was thrown away;
+    /// `discarded` is how many bytes of text and reasoning that attempt had streamed.
+    Degenerate { discarded: u64 },
 }
 
 /// Whether the model may call tools on a request. `None` is used for the
