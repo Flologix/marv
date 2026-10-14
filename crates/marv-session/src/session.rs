@@ -3858,6 +3858,69 @@ mod turn_tests {
         assert!(tools[1].get("door").is_none());
     }
 
+    // ---- saved tool outputs (#61) ----
+
+    #[tokio::test]
+    async fn a_failing_test_runs_long_output_is_cut_and_the_model_greps_the_saved_file_for_the_failing_test() {
+        let dirs = Dirs::new();
+        let store = Arc::new(TrajectoryStore::new(dirs.dir.join("trajectories")));
+        // 10000 lines of 22 characters: 220k, the failing test in the middle, where the cut drops it.
+        let run_tests =
+            "seq -f 'test case_%05g ... ok' 1 10000 | sed 's/^test case_05000 ... ok$/test parser::quotes FAILED/'; exit 1";
+        let provider = Scripted::new(vec![use_tools(vec![call("b1", "bash", serde_json::json!({"command": run_tests}))])]);
+        let session = scripted(&dirs, &provider, |i| {
+            i.sandbox = false;
+            i.approve = Some(answer(Decision::Yes));
+            i.tool_output_dir = Some(dirs.dir.join("tool-output"));
+            i.trajectories = Some(store.clone());
+        });
+        let saved = dirs.dir.join("tool-output").join(session.id()).join("b1.txt");
+        let grep = call("g1", "grep", serde_json::json!({"pattern": "FAILED", "path": saved}));
+        lock(&provider.steps).extend([use_tools(vec![grep]), say("parser::quotes fails.")]);
+        let events = collect(go(&session, "run the tests")).await;
+        let results: Vec<String> = events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::Loop(LoopEvent::ToolEnd { run, .. }) => Some(run.result.output.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert!(results[0].contains(&format!("characters omitted; full output: {} — read_file it, or grep it", saved.display())));
+        assert!(!results[0].contains("FAILED") && results[0].ends_with("test case_10000 ... ok\n\n[exit code 1]"));
+        assert!(results[0].chars().count() < 31_000);
+        assert_eq!(results[1], format!("{}:5000:test parser::quotes FAILED", saved.display()));
+
+        // The trajectory has what the model saw: the path, not the saved content.
+        let log = records(&store, &dirs.project, &session).await;
+        let bash = log.iter().find(|r| r["type"] == "tool" && r["call"]["id"] == "b1").expect("bash's record");
+        let recorded = bash.to_string();
+        assert!(recorded.contains(&saved.display().to_string()) && !recorded.contains("case_05001"), "{}", &recorded[..300]);
+    }
+
+    #[tokio::test]
+    async fn old_saved_outputs_are_cleaned_up_when_a_session_starts() {
+        let dirs = Dirs::new();
+        let store = dirs.dir.join("tool-output");
+        for (name, days) in [("old-session", 30), ("recent-session", 1)] {
+            std::fs::create_dir_all(store.join(name)).unwrap();
+            std::fs::write(store.join(name).join("b1.txt"), "output").unwrap();
+            let when = std::time::SystemTime::now() - std::time::Duration::from_secs(days * 86_400);
+            std::fs::File::open(store.join(name)).unwrap().set_modified(when).unwrap();
+        }
+        let provider = Scripted::new(vec![]);
+        let _session = scripted(&dirs, &provider, |i| i.tool_output_dir = Some(store.clone()));
+        // On a thread of its own: wait for it.
+        for _ in 0..200 {
+            if !store.join("old-session").exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!store.join("old-session").exists());
+        assert!(store.join("recent-session/b1.txt").exists());
+    }
+
     #[tokio::test]
     async fn a_session_with_host_commands_names_the_host_door_in_the_prompt() {
         let dirs = Dirs::new();
