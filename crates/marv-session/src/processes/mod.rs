@@ -78,6 +78,9 @@ pub struct ProcessManagerOptions {
     pub poll: Duration,
     pub start_wait: Duration,
     pub stop_grace: Duration,
+    /// A one-shot session (`marv -p`): its processes end when Marv exits after the reply, and the process tool says so
+    /// (#86).
+    pub one_shot: bool,
 }
 
 impl ProcessManagerOptions {
@@ -90,6 +93,7 @@ impl ProcessManagerOptions {
             poll: POLL,
             start_wait: START_WAIT,
             stop_grace: STOP_GRACE,
+            one_shot: false,
         }
     }
 }
@@ -770,6 +774,9 @@ impl ProcessHost for ProcessManager {
     }
     fn list(&self) -> Vec<ProcessInfo> {
         ProcessManager::list(self)
+    }
+    fn one_shot(&self) -> bool {
+        self.shared.options.one_shot
     }
 }
 

@@ -385,6 +385,8 @@ pub async fn run_headless(options: HeadlessOptions) -> ExitCode {
         .sources(&[marv_session::sources::Source::User, marv_session::sources::Source::Project])
         .max_steps(options.max_steps.unwrap_or(config.max_steps))
         .yolo(config.yolo)
+        // Marv exits after the reply and stops its background processes (main.rs): the process tool says so (#86).
+        .one_shot(true)
         .persist(marv_session::sdk::Store::Default)
         .trajectories(if config.trajectories { marv_session::sdk::Store::Default } else { marv_session::sdk::Store::Off });
     if let Some(approve) = approve {

@@ -228,14 +228,17 @@ impl Tool for ProcessTool {
                 }
                 let command = input.command.as_deref().unwrap_or("");
                 let started = processes.start(command, input.name.as_deref(), input.network.unwrap_or(false)).await?;
-                Ok(start_output(&started.info, &started.output))
+                Ok(start_output(&started.info, &started.output, processes.one_shot()))
             }
         }
     }
 }
 
+/// In a one-shot run the process dies with Marv, right after the reply: the model may use it, never promise it (#86).
+pub const ONE_SHOT_NOTE: &str = "This is a one-shot run (marv -p): when Marv exits after your reply it stops every process it started, so this one won't be running by the time the user reads it. Use it for your own checks now (curl it, read its logs), then stop it. Don't tell the user it's up or that you left it running: give them the command to run it themselves.";
+
 /// What the model reads after a start.
-fn start_output(info: &ProcessInfo, output: &str) -> ToolOutput {
+fn start_output(info: &ProcessInfo, output: &str, one_shot: bool) -> ToolOutput {
     let mut parts = vec![format!("Process {}: {}.", info.name, state(info))];
     if info.state == ProcessState::Exited {
         parts.push("It ended at once: nothing is running. Fix the problem its output shows, then start it again.".into());
@@ -251,6 +254,9 @@ fn start_output(info: &ProcessInfo, output: &str) -> ToolOutput {
     }
     for note in &info.notes {
         parts.push(format!("Note: {note}"));
+    }
+    if one_shot && info.state == ProcessState::Running {
+        parts.push(ONE_SHOT_NOTE.into());
     }
     parts.push(if output.is_empty() { "No output yet.".into() } else { format!("First output:\n{output}") });
     let summary = match info.state {
@@ -452,7 +458,7 @@ mod tests {
 
     #[test]
     fn a_start_that_ended_at_once_or_didnt_listen_says_so() {
-        let exited = start_output(&info("x", ProcessState::Exited, vec![]), "");
+        let exited = start_output(&info("x", ProcessState::Exited, vec![]), "", false);
         assert_eq!(
             exited.output,
             "Process x: exited (code 1).\nIt ended at once: nothing is running. Fix the problem its output shows, then start it again.\nNo output yet."
@@ -460,9 +466,22 @@ mod tests {
         assert_eq!(exited.summary, "exited (code 1)");
         let mut quiet = info("q", ProcessState::Running, vec![]);
         quiet.notes = vec!["port 80 isn't forwarded.".into()];
-        let quiet = start_output(&quiet, "hi");
+        let quiet = start_output(&quiet, "hi", false);
         assert!(quiet.output.contains("hasn't listened on a port yet (waited 10 s)"));
         assert!(quiet.output.contains("\nNote: port 80 isn't forwarded.\nFirst output:\nhi"));
         assert_eq!(quiet.summary, "running");
+    }
+
+    #[test]
+    fn a_one_shot_run_says_the_process_ends_with_it() {
+        // #86: in `marv -p` the model read "Forwarded to the user's machine" and told the user the server was up; Marv
+        // then exited and stopped it.
+        let running = info("dev", ProcessState::Running, vec![4789]);
+        let once = start_output(&running, "", true);
+        assert!(once.output.contains("Forwarded to the user's machine: http://localhost:4789"));
+        assert!(once.output.contains(ONE_SHOT_NOTE), "{}", once.output);
+        assert!(!start_output(&running, "", false).output.contains(ONE_SHOT_NOTE));
+        // Nothing is running to warn about.
+        assert!(!start_output(&info("x", ProcessState::Exited, vec![]), "", true).output.contains(ONE_SHOT_NOTE));
     }
 }

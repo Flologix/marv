@@ -105,6 +105,9 @@ pub struct SessionOptions {
     /// forwarded to 127.0.0.1, each start through your approver (`door: process`; scope `process:<command>`). Default
     /// true, where bubblewrap works. `close()` stops them all.
     pub processes: bool,
+    /// A one-shot run, like `marv -p`: the process tool tells the model its processes end when the run does (#86).
+    /// Default false.
+    pub one_shot: bool,
 }
 
 /// Builds a [`MarvSession`] (Marv's `createSession`).
@@ -144,6 +147,7 @@ impl SessionBuilder {
                 mesh: None,
                 wire_approver: None,
                 processes: true,
+                one_shot: false,
             },
         }
     }
@@ -174,6 +178,10 @@ impl SessionBuilder {
     }
     pub fn processes(mut self, on: bool) -> Self {
         self.options.processes = on;
+        self
+    }
+    pub fn one_shot(mut self, on: bool) -> Self {
+        self.options.one_shot = on;
         self
     }
     pub fn max_steps(mut self, steps: u32) -> Self {
@@ -313,6 +321,7 @@ pub async fn create_session(options: SessionOptions) -> Result<MarvSession, Sess
     init.on_warning = options.on_warning.clone();
     init.problems = problems;
     init.processes = options.processes;
+    init.one_shot = options.one_shot;
     let session = MarvSession::new(init)?;
     if let Some(mcp) = &session.mcp() {
         // A server that needs a login is told once (again only after it connected meanwhile).

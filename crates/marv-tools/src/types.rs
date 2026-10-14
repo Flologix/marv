@@ -214,6 +214,10 @@ pub trait ProcessHost: Send + Sync {
     /// Stops it and forgets it; false when there's none of that name.
     async fn stop(&self, name: &str) -> bool;
     fn list(&self) -> Vec<ProcessInfo>;
+    /// A one-shot session (`marv -p`): Marv stops every process when it exits after the reply (#86).
+    fn one_shot(&self) -> bool {
+        false
+    }
 }
 
 /// The running processes' forwarded ports, as bash's relay needs them (Marv's `ToolContext.forwards`).

@@ -275,6 +275,9 @@ pub struct SessionInit {
     pub processes: bool,
     /// The background processes' manager (tests pass one with a fake home); default: one made with the session.
     pub process_manager: Option<ProcessManager>,
+    /// A one-shot run (`marv -p`): the session ends with the reply, and its background processes with it (#86).
+    /// Default false.
+    pub one_shot: bool,
 }
 
 impl SessionInit {
@@ -319,6 +322,7 @@ impl SessionInit {
             problems: Vec::new(),
             processes: true,
             process_manager: None,
+            one_shot: false,
         }
     }
 }
@@ -827,6 +831,7 @@ impl MarvSession {
                 process_on.then(|| {
                     let mut options = ProcessManagerOptions::new(&init.root);
                     options.on_change = init.on_change.clone();
+                    options.one_shot = init.one_shot;
                     ProcessManager::new(options)
                 })
             }),
