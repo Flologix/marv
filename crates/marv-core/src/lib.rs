@@ -10,6 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod command;
 pub mod printable;
 pub use printable::printable;
 

@@ -26,6 +26,8 @@
 //!   `Marv:` note. A new `.git` is kept when the user approved a `git_write` command (`git init`, a submodule).
 //! - marv-rs: `uses_network` calls ask after taint even in yolo; the approval for a network command will list the
 //!   scripts written this session that the command runs (docs/SECURITY.md).
+//! - marv-rs #81: a pipe can't hide a failure ([`PIPE_CHECK`]), and a sandboxed retry of a command whose failure
+//!   looked like the missing network runs with `network: true`, asked like any network command (`repair`).
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -39,8 +41,8 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 
 use marv_sandbox::git_guard::{GitGuard, git_guard, worktree_git};
 use marv_sandbox::notes::{
-    BACKGROUND_NOTE, BACKGROUND_NOTE_PROCESS, GH_NOTE, GH_TOOL_NOTE, GIT_HINT, HOME_NOTE, NETWORK_NOTE, backgrounds_process,
-    looks_like_network_failure, runs_gh, touches_hidden_home,
+    BACKGROUND_NOTE, BACKGROUND_NOTE_PROCESS, ESCALATED_NOTE, GH_NOTE, GH_TOOL_NOTE, GIT_HINT, HOME_NOTE, NETWORK_NOTE,
+    backgrounds_process, looks_like_network_failure, runs_gh, touches_hidden_home,
 };
 use marv_sandbox::paths::is_inside;
 use marv_sandbox::protected::{ProtectedRule, created_note, nested_git_dirs, protected_snapshot, revert_created, scan_created};
@@ -83,6 +85,9 @@ pub struct RunOptions {
     /// Sandboxed, without network: the background processes' forwarded ports (Marv #51), each reached through its
     /// socket folder, mounted read-only at `/run/marv/<id>`; a relay listens on the sandbox's 127.0.0.1:<port> for each.
     pub forwards: Vec<crate::types::ProcessForward>,
+    /// [`PIPE_CHECK`] (#81): on for the bash tool's commands only. Off for diagnostics and the user's checks, whose
+    /// `grep -r TODO src | wc -l` or `diff a b | head` must keep the exit code bash gives them.
+    pub pipe_check: bool,
 }
 
 /// The relay in front of a sandboxed command without network while processes run (Marv #51): their socket folders
@@ -109,6 +114,33 @@ fn relay_for(
     Some((binds, crate::relay::sandbox_argv(&spec)))
 }
 
+/// Issue #81: a pipe's exit code is its last stage's, so `git clone … | tail -2` failing without network read as
+/// exit 0, three times. Not `set -o pipefail`: under it an early stage killed by SIGPIPE when a later one stops
+/// reading (`yes | head`, `git log | head -5`) fails the pipe with 141, and in the middle of a command that changes
+/// what runs (`git log | head && git status` would skip `git status`). Instead an EXIT trap looks at the stages of
+/// the command's *last* pipe after it ran, so nothing about how the command runs changes: when the command ended
+/// with status 0 but an earlier stage of that pipe exited with something other than 0 or 141 (SIGPIPE: a reader that
+/// stopped early, how `| head` works), it says so in a `Marv:` line and exits with that stage's code. The command's
+/// own word wins: an explicit `exit` (its status is what the command said), its own `set -o pipefail`, its own EXIT
+/// trap (which replaces this one), and any `||` in it (`a | b || true`: `true` never runs when `b` succeeds, yet the
+/// command said a failure is fine; a guess from the text, so a quoted `||` turns the check off too, never on).
+/// `set -x` doesn't trace the check. Exit 1 is still reported (`pytest | tail`, `npm test | tail`), but the line says
+/// that grep, rg and diff use it for "no match" or "the files differ". Only for the bash tool (`RunOptions::pipe_check`).
+const PIPE_CHECK: &str = r#"trap '{ __marv_st=$? __marv_ps=("${PIPESTATUS[@]}") __marv_cmd=$BASH_COMMAND; set +x; } 2>/dev/null
+if [ "$__marv_st" = 0 ] && [ "${__marv_cmd%% *}" != exit ]; then
+  __marv_i=$(( ${#__marv_ps[@]} - 2 ))
+  while [ "$__marv_i" -ge 0 ]; do
+    __marv_c=${__marv_ps[$__marv_i]}
+    if [ "$__marv_c" != 0 ] && [ "$__marv_c" != 141 ]; then
+      __marv_why=
+      [ "$__marv_c" = 1 ] && __marv_why=" (grep, rg and diff exit 1 when nothing matched or the files differ; that may be all it means)"
+      printf "\nMarv: stage %s of the last pipe in the command exited with code %s%s (its stages: %s). A pipe only reports its last stage, which hid that, so it is reported as the exit code of the command.\n" "$(( __marv_i + 1 ))" "$__marv_c" "$__marv_why" "${__marv_ps[*]}"
+      exit "$__marv_c"
+    fi
+    __marv_i=$(( __marv_i - 1 ))
+  done
+fi' EXIT"#;
+
 /// Runs a shell command in the project folder with stdout and stderr combined (also used by diagnostics and checks).
 /// Sandboxed: inside bwrap (`marv_sandbox::Sandbox::command`). Not sandboxed: still with a minimal environment, so
 /// API keys don't leak into commands. `sandbox` gives the home folder, `PATH` and `LANG` (tests pass a fake home).
@@ -129,9 +161,13 @@ pub async fn run_command(
         project_read_only,
         env,
         forwards,
+        pipe_check,
     } = options;
     let started = |output: String| CommandResult { output, exit_code: None, timeout: Some(timeout), ..Default::default() };
-    let script = format!("exec 2>&1\n{command}"); // stderr into stdout, so the output stays in order
+    // stderr into stdout, so the output stays in order; then the check that a pipe didn't hide a failure (#81).
+    // A command with `||` handles failures itself (`… | tail -2 || true`): left as it is.
+    let check = if pipe_check && !command.contains("||") { PIPE_CHECK } else { "" };
+    let script = format!("exec 2>&1\n{check}\n{command}");
     let mut cmd = if sandboxed {
         let relay = if network { None } else { relay_for(&forwards, &script) };
         let mut mounts =
@@ -373,8 +409,26 @@ impl Tool for Bash {
             && !input.git_write.unwrap_or(false)
             && input.sandbox != Some(false)
     }
-    fn repair(&self, raw: &Value, _ctx: &ToolContext) -> Option<Repaired> {
-        repair_timeout_field(raw, MAX_TIMEOUT_S)
+    /// The timeout given in milliseconds (#10), and the escalation of #81: a sandboxed command without network whose
+    /// key ([`marv_core::command::command_key`]) already failed like the missing network runs with `network: true`
+    /// instead, so it goes through the approval for network like any network command (asked, or an "always" for its
+    /// exact scope; tainted: asked every time; nobody to ask: refused before it runs). Never silently: a network
+    /// command is never `auto_safe`. The call in the history stays as the model sent it; the result says why.
+    fn repair(&self, raw: &Value, ctx: &ToolContext) -> Option<Repaired> {
+        let timed = repair_timeout_field(raw, MAX_TIMEOUT_S);
+        let current = timed.as_ref().map_or(raw, |r| &r.input);
+        let object = current.as_object()?;
+        let escalate = ctx.sandbox.active()
+            && object.get("network").and_then(Value::as_bool) != Some(true)
+            && object.get("sandbox").and_then(Value::as_bool) != Some(false)
+            && object.get("command").and_then(Value::as_str).is_some_and(|c| ctx.network_failures.contains(c));
+        if !escalate {
+            return timed;
+        }
+        let mut input = current.clone();
+        input["network"] = json!(true);
+        let note = [timed.and_then(|r| r.note), Some(ESCALATED_NOTE.to_string())].into_iter().flatten().collect::<Vec<_>>();
+        Some(Repaired { input, note: Some(note.join("\n\n")) })
     }
 
     async fn preview(&self, input: &BashInput, ctx: &ToolContext) -> Result<Preview, ToolError> {
@@ -432,6 +486,7 @@ impl Tool for Bash {
                 network: true,
                 timeout: Duration::from_secs(timeout),
                 env: Some(marv_sandbox::host_env::host_env_now()),
+                pipe_check: true,
                 ..Default::default()
             };
             let result = run_command(options, &ctx.sandbox, &ctx.cancel).await;
@@ -479,6 +534,7 @@ impl Tool for Bash {
             project_read_only: false,
             env: None,
             forwards: ctx.forwards.as_ref().map(|f| f.forwards()).unwrap_or_default(),
+            pipe_check: true,
         };
         let mut result = run_command(options, &ctx.sandbox, &ctx.cancel).await;
         // bwrap leaves a placeholder's empty mount point; remove_dir only removes it while it's empty.
@@ -514,6 +570,8 @@ impl Tool for Bash {
         let failed = result.timed_out || (!result.aborted && !matches!(result.exit_code, Some(0 | 126 | 127)));
         if sandboxed && !network && failed && looks_like_network_failure(&input.command, &result.output) {
             result.output.push_str(&format!("\n{NETWORK_NOTE}{last_resort}\n"));
+            // A retry without network asks for it instead (#81, `repair`).
+            ctx.network_failures.record(&input.command);
             // A gh failure usually isn't the network, and the missing network isn't the fix: the MCP server is (#27).
             // gh is a network command, so the note above is already there for it; this adds what to do instead. Where
             // the session has the github tool (#47), that's the way instead.
@@ -573,6 +631,15 @@ mod tests {
     async fn run(command: &str, root: &Path) -> CommandResult {
         run_command(options(command, root), &Sandbox::from_env(true), &CancellationToken::new()).await
     }
+    /// As the bash tool runs it, with the pipe check (#81).
+    async fn checked(command: &str, root: &Path) -> CommandResult {
+        let options = RunOptions { pipe_check: true, ..options(command, root) };
+        run_command(options, &Sandbox::from_env(true), &CancellationToken::new()).await
+    }
+    async fn checked_sandboxed(command: &str, root: &Path) -> CommandResult {
+        let options = RunOptions { pipe_check: true, sandbox: true, ..options(command, root) };
+        run_command(options, &Sandbox::from_env(true), &CancellationToken::new()).await
+    }
     async fn sandboxed(command: &str, root: &Path) -> CommandResult {
         run_command(RunOptions { sandbox: true, ..options(command, root) }, &Sandbox::from_env(true), &CancellationToken::new())
             .await
@@ -584,6 +651,73 @@ mod tests {
         let result = run("echo out; echo err >&2; exit 3", root.path()).await;
         assert_eq!(result.output, "out\nerr\n");
         assert_eq!(result.exit_code, Some(3));
+    }
+
+    // Issue #81: `git clone … | tail -2` failed without network and was reported as exit 0, three times.
+    #[tokio::test]
+    async fn a_pipe_cant_hide_a_failed_stage() {
+        let root = TempDir::new("bash-pipe");
+        let hidden = checked("sh -c 'echo fatal: could not resolve; exit 128' | tail -2", root.path()).await;
+        assert_eq!(hidden.exit_code, Some(128), "{}", hidden.output);
+        assert!(hidden.output.starts_with("fatal: could not resolve\n"), "{}", hidden.output);
+        assert!(
+            hidden.output.contains("Marv: stage 1 of the last pipe in the command exited with code 128"),
+            "{}",
+            hidden.output
+        );
+        // The last stage's own failure is the pipe's status anyway, as before.
+        assert_eq!(checked("true | false", root.path()).await.exit_code, Some(1));
+        // Under the user's own pipefail, unchanged.
+        assert_eq!(checked("set -o pipefail; false | true", root.path()).await.exit_code, Some(1));
+        // And in the sandbox, where #81 hit it.
+        if sandbox_available() {
+            assert_eq!(checked_sandboxed("sh -c 'exit 5' | cat", root.path()).await.exit_code, Some(5));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_early_stage_stopped_by_sigpipe_or_an_explicit_ending_isnt_a_failure() {
+        let root = TempDir::new("bash-pipe-ok");
+        // `yes` dies of SIGPIPE (141) once head has its line: that's how `| head` works, not a failure.
+        let head = checked("yes | head -1", root.path()).await;
+        assert_eq!((head.exit_code, head.output.as_str()), (Some(0), "y\n"));
+        // Only the last pipe counts, and the command's own word wins: `|| true`, an explicit exit.
+        assert_eq!(checked("false | true || true", root.path()).await.exit_code, Some(0));
+        assert_eq!(checked("false | true; exit 0", root.path()).await.exit_code, Some(0));
+        assert_eq!(checked("false | true; echo next", root.path()).await.output, "next\n");
+        assert_eq!(checked("exit 3", root.path()).await.exit_code, Some(3));
+        // Tracing the command doesn't trace Marv's check.
+        let traced = checked("set -x; echo hi | cat", root.path()).await;
+        assert!(!traced.output.contains("__marv"), "{}", traced.output);
+        // A command's own EXIT trap still runs (and then Marv's check is off).
+        assert_eq!(checked("trap 'echo bye' EXIT; echo hi", root.path()).await.output, "hi\nbye\n");
+    }
+
+    #[tokio::test]
+    async fn only_the_bash_tool_has_the_pipe_check() {
+        let root = TempDir::new("bash-pipe-tool");
+        // run_command for diagnostics and checks: a pipe's status as bash gives it.
+        let plain = run("false | true", root.path()).await;
+        assert_eq!((plain.exit_code, plain.output.as_str()), (Some(0), ""));
+        let tool = Bash.run(&bash("false | true"), &tool_ctx(&root, false)).await.unwrap();
+        assert!(tool.output.ends_with("[exit code 1]"), "{}", tool.output);
+        assert!(tool.output.contains("Marv: stage 1 of the last pipe"), "{}", tool.output);
+    }
+
+    #[tokio::test]
+    async fn exit_1_from_an_early_stage_says_it_may_only_mean_no_match() {
+        let root = TempDir::new("bash-pipe-grep");
+        root.write("a.txt", "hello\n");
+        let no_match = checked("grep nothing-here a.txt | head -1", root.path()).await;
+        assert_eq!(no_match.exit_code, Some(1), "{}", no_match.output);
+        assert!(
+            no_match.output.contains("grep, rg and diff exit 1 when nothing matched or the files differ"),
+            "{}",
+            no_match.output
+        );
+        // Another code is a plain failure.
+        let failed = checked("sh -c 'exit 2' | cat", root.path()).await;
+        assert!(!failed.output.contains("nothing matched"), "{}", failed.output);
     }
 
     #[tokio::test]
@@ -1079,6 +1213,81 @@ mod tests {
         let without = Bash.run(&gh, &tool_ctx(&root, true)).await.unwrap().output;
         assert!(without.contains(GH_NOTE));
         assert!(!without.contains(GH_TOOL_NOTE));
+    }
+
+    // Issue #81: the model ignored the network note and re-sent the same clone 11 times without network.
+
+    /// Fails like a sandbox without network, and leaves `ran` behind to show it ran.
+    const OFFLINE: &str = "touch ran; echo 'fatal: unable to access: Could not resolve host: github.com'; exit 128";
+    fn sandboxed_call(command: &str) -> marv_core::ToolCall {
+        marv_core::ToolCall { id: "n1".into(), name: "bash".into(), arguments: json!({"command": command}).to_string() }
+    }
+
+    #[tokio::test]
+    async fn a_retry_of_a_network_looking_failure_asks_the_user_for_network() {
+        require_bwrap!();
+        let root = TempDir::new("bash-escalate");
+        let (ctx, answer) = asking(&root, Decision::Yes, false);
+        let first = crate::run_tool(&sandboxed_call(OFFLINE), &ctx, &tools()).await;
+        assert!(first.result.output.contains(NETWORK_NOTE), "{}", first.result.output);
+        // The retry differs only in its tail: it runs with network, asked as a network command.
+        let retry = crate::run_tool(&sandboxed_call(&format!("{OFFLINE} && du -sh .")), &ctx, &tools()).await;
+        let asked = answer.1.lock().unwrap().clone();
+        assert_eq!(asked.iter().map(|r| r.network).collect::<Vec<_>>(), [false, true]);
+        assert_eq!(asked[1].scope.key, format!("bash:net:{OFFLINE} && du -sh ."));
+        assert!(asked[1].preview.note.as_deref().unwrap().contains("network allowed"));
+        assert!(retry.result.output.contains(ESCALATED_NOTE), "{}", retry.result.output);
+        // With network, the network note isn't added again.
+        assert!(!retry.result.output.contains(NETWORK_NOTE), "{}", retry.result.output);
+    }
+
+    #[tokio::test]
+    async fn with_no_one_to_approve_network_the_retry_is_refused_and_doesnt_run() {
+        require_bwrap!();
+        let root = TempDir::new("bash-escalate-headless");
+        // marv -p without --approve network: yolo runs the sandboxed command, nobody approves network.
+        let ctx = ToolContext { yolo: true, ..tool_ctx(&root, true) };
+        crate::run_tool(&sandboxed_call(OFFLINE), &ctx, &tools()).await;
+        std::fs::remove_file(root.path().join("ran")).unwrap();
+        let retry = crate::run_tool(&sandboxed_call(OFFLINE), &ctx, &tools()).await;
+        assert!(retry.result.is_error, "{}", retry.result.output);
+        assert!(retry.result.output.contains("there's no one to ask"), "{}", retry.result.output);
+        assert!(retry.result.output.contains(ESCALATED_NOTE), "{}", retry.result.output);
+        assert!(!root.path().join("ran").exists(), "the retry didn't run without network");
+    }
+
+    // docs/SECURITY.md: a tainted session's network asks every time, even in yolo; escalating doesn't change that.
+    #[tokio::test]
+    async fn in_a_tainted_session_the_escalated_retry_must_ask_even_in_yolo() {
+        require_bwrap!();
+        let root = TempDir::new("bash-escalate-taint");
+        let (mut ctx, answer) = asking(&root, Decision::Yes, false);
+        ctx.yolo = true;
+        ctx.taint.mark(marv_core::Provenance::Web);
+        crate::run_tool(&sandboxed_call(OFFLINE), &ctx, &tools()).await;
+        crate::run_tool(&sandboxed_call(OFFLINE), &ctx, &tools()).await;
+        let asked = answer.1.lock().unwrap().clone();
+        assert_eq!(asked.iter().map(|r| (r.network, r.must_ask)).collect::<Vec<_>>(), [(true, true)]);
+    }
+
+    #[tokio::test]
+    async fn another_command_or_one_that_failed_otherwise_isnt_escalated() {
+        require_bwrap!();
+        let root = TempDir::new("bash-escalate-none");
+        let (mut ctx, answer) = asking(&root, Decision::Yes, false);
+        ctx.yolo = true;
+        crate::run_tool(&sandboxed_call(OFFLINE), &ctx, &tools()).await;
+        crate::run_tool(&sandboxed_call("echo other; exit 1"), &ctx, &tools()).await;
+        crate::run_tool(&sandboxed_call("echo other; exit 1"), &ctx, &tools()).await;
+        // Without the sandbox, the network was never missing.
+        let mut open = ctx.clone();
+        open.sandbox = std::sync::Arc::new(Sandbox::from_env(false));
+        open.network_failures = Default::default();
+        open.yolo = false;
+        crate::run_tool(&sandboxed_call(OFFLINE), &open, &tools()).await;
+        crate::run_tool(&sandboxed_call(OFFLINE), &open, &tools()).await;
+        let asked = answer.1.lock().unwrap().clone();
+        assert!(asked.iter().all(|r| !r.network), "{asked:?}");
     }
 
     #[test]

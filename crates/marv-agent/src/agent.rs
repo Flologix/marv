@@ -30,7 +30,8 @@
 //!   run `Loop`. A step that answered resets the count.
 //! - **Tool loops**: a period-1/2 cycle of identical calls *with identical results*: the first
 //!   time every call is answered with [`tool_loop_note`] instead of running; the second time the
-//!   calls are answered and the run ends `Loop`.
+//!   calls are answered and the run ends `Loop`. marv-rs (#81): a bash command that already failed the same way
+//!   twice since the last file edit, whatever its tail, counts as one too ([`crate::repetition::FailureLoopState`]).
 //! - **Empty replies** (no text, whitespace doesn't count, no calls; not failed, cut off or
 //!   cancelled): the first is asked for again unchanged (nothing enters the history, so the cache
 //!   holds; OpenRouter's upstream hosts sometimes bill for a reply and send nothing, a third of
@@ -86,7 +87,9 @@ use marv_core::{
 use marv_provider::{EventStream, Provider, StreamOptions};
 use tokio_util::sync::CancellationToken;
 
-use crate::repetition::{ToolCallKey, ToolLoopState, detect_text_repetition, make_tool_key, tool_loop_detected};
+use crate::repetition::{
+    FailureLoopState, ToolCallKey, ToolLoopState, detect_text_repetition, failing_command_note, make_tool_key, tool_loop_detected,
+};
 
 pub const DEFAULT_MAX_STEPS: u32 = 25;
 /// Subagents' own hard limit (Marv `SUBAGENT_MAX_STEPS`, in `src/subagent.ts`).
@@ -767,6 +770,8 @@ pub struct LoopState {
     /// (tool, normalized args) → hash of what it returned last time. A call repeated with the same
     /// result is a loop; one whose result changes each time (the next item from a queue) is new work.
     last_result: std::collections::HashMap<(String, String), u64>,
+    /// Bash commands failing the same way since the last edit (#81): another try is a loop, whatever its tail.
+    failures: FailureLoopState,
     in_flight: InFlight,
 }
 
@@ -785,6 +790,7 @@ impl LoopState {
             text_loops: 0,
             tool_loop: ToolLoopState::default(),
             last_result: Default::default(),
+            failures: FailureLoopState::default(),
             in_flight: InFlight::default(),
         }
     }
@@ -829,6 +835,7 @@ impl LoopState {
     fn answer(&mut self, call: &ToolCall, text: &str) {
         self.push_result(call, text);
         self.last_result.insert(Self::call_key(call), result_hash(text));
+        self.failures.record(&call.name, &call.arguments, text);
         self.in_flight.answered += 1;
     }
 
@@ -1051,10 +1058,16 @@ impl LoopState {
                 .collect();
             tool_loop_detected(&mut self.tool_loop, keys)
         };
+        // #81: a command that keeps failing the same way is a loop too (bash resets the history above).
+        let failing = calls.iter().find_map(|c| self.failures.repeated(&c.name, &c.arguments)).filter(|_| !aborted);
+        let hit = hit || failing.is_some();
         // The first time: every call is answered with the note instead of running.
         if hit && !warned {
             self.tool_loop.warned = true;
-            let note = tool_loop_note(self.tool_loop.history.len(), &calls[0].name);
+            let note = match &failing {
+                Some((count, shown)) => failing_command_note(*count, shown),
+                None => tool_loop_note(self.tool_loop.history.len(), &calls[0].name),
+            };
             for call in &calls {
                 self.push_result(call, &note);
             }
@@ -3091,6 +3104,64 @@ mod tests {
         // The write_file reset, so 4 and 5 are fresh: history stays too short to trigger.
         assert!(tool_loops(&events).is_empty());
         assert_eq!(end(&events), Some(StopReason::End));
+    }
+
+    // Issue #81: a clone that can't work without network, re-sent with another tail each time.
+    fn bash_call(id: &str, command: &str) -> ToolCall {
+        ToolCall { id: id.into(), name: "bash".into(), arguments: serde_json::json!({ "command": command }).to_string() }
+    }
+    /// Every bash command fails like a clone without network, counting how many ran.
+    fn offline(ran: Arc<AtomicUsize>) -> FakeRunner {
+        let run: RunFn = Arc::new(move |c, _| {
+            ran.fetch_add(1, Ordering::SeqCst);
+            let out = "fatal: unable to access 'https://github.com/x/y/': Could not resolve host: github.com\n\n[exit code 128]";
+            Box::pin(async move { Ok(ok(out, c.id.clone())) })
+        });
+        FakeRunner { run, parallel: |_| false }
+    }
+    const CLONE: &str = "git clone https://github.com/x/y";
+
+    #[tokio::test]
+    async fn a_command_failing_the_same_way_with_another_tail_each_time_warns_then_stops() {
+        let tails = ["2>&1 | tail -2", "&& du -sh y", "|| true", "&& command -v tokei", "; ls"];
+        let mut script: Vec<_> =
+            tails.iter().enumerate().map(|(i, t)| use_tools(&[bash_call(&format!("c{i}"), &format!("{CLONE} {t}"))])).collect();
+        // A probe in between doesn't hide it.
+        script.insert(1, use_tools(&[bash_call("p", "echo test")]));
+        let ran = Arc::new(AtomicUsize::new(0));
+        let history = history(vec![user("go")]);
+        let events = collect(options(Arc::new(ScriptedProvider::new(script)), &history, offline(ran.clone()))).await;
+        assert_eq!(tool_loops(&events), [true, false]);
+        assert_eq!(end(&events), Some(StopReason::Loop));
+        // The two clones and the probe ran; the third clone got the note, the fourth stopped the run.
+        assert_eq!(ran.load(Ordering::SeqCst), 3);
+        let turns = history.lock().unwrap();
+        let noted = turns.iter().any(|t| {
+            matches!(t, ChatTurn::Tool { text, .. } if text.starts_with("Marv: not run. This command already failed 2 times"))
+        });
+        assert!(noted, "{turns:?}");
+    }
+
+    #[tokio::test]
+    async fn re_running_a_failing_command_after_an_edit_isnt_a_loop() {
+        let write = ToolCall {
+            id: "w".into(),
+            name: "write_file".into(),
+            arguments: serde_json::json!({"path": "a.rs", "content": "fixed"}).to_string(),
+        };
+        let script = vec![
+            use_tools(&[bash_call("c1", CLONE)]),
+            use_tools(&[bash_call("c2", CLONE)]),
+            use_tools(&[write]),
+            use_tools(&[bash_call("c3", CLONE)]),
+            say("Done."),
+        ];
+        let ran = Arc::new(AtomicUsize::new(0));
+        let events =
+            collect(options(Arc::new(ScriptedProvider::new(script)), &history(vec![user("go")]), offline(ran.clone()))).await;
+        assert!(tool_loops(&events).is_empty());
+        assert_eq!(end(&events), Some(StopReason::End));
+        assert_eq!(ran.load(Ordering::SeqCst), 4);
     }
 
     #[tokio::test]

@@ -13,6 +13,14 @@
 //!   so the same call returning something new each time (the next item of a queue) is new work.
 //! - Arguments are normalized with keys sorted **at every depth**: Marv once filtered nested
 //!   objects with a key list, so `{"filter":{"id":1}}` and `{"filter":{"id":2}}` compared equal.
+//! - **Failing commands** (marv-rs, #81): bash resets the tool-call history above, and a model retrying a command
+//!   that can't succeed varies its tail (`&& du -sh`, `|| true`, `| tail -2`), so neither guard saw a `git clone`
+//!   re-sent 11 times. [`FailureLoopState`] remembers each bash command by [`marv_core::command::command_key`] (plus
+//!   its `network`/`sandbox: false` flags) with its failure's signature ([`failure_signature`]: its first error-like
+//!   line). Once a command failed the same way [`FAILURE_REPEATS`] (2) times in a row with no `edit_file` or
+//!   `write_file` call since, another try is a loop. Low on false positives: a different error, a success, or a file
+//!   edit resets it (a model re-running tests after an edit is never caught), and other commands in between (probes
+//!   like `echo test`) neither count nor reset.
 //!
 //! Port note: Marv measures lengths in UTF-16 units; here the text thresholds count `char`s.
 
@@ -186,6 +194,132 @@ pub fn tool_loop_detected(state: &mut ToolLoopState, calls: Vec<ToolCallKey>) ->
         state.history.remove(0);
     }
     cycle_detected(&state.history)
+}
+
+/// Failures of the same command, with the same signature, that make another try a loop.
+pub const FAILURE_REPEATS: usize = 2;
+/// Tools that change files: a call to one forgets every failure (the next try may fare differently).
+pub const EDIT_TOOLS: [&str; 2] = ["edit_file", "write_file"];
+/// A signature is cut to this many characters.
+const SIGNATURE_CHARS: usize = 160;
+
+/// A line that says something failed, whatever the exit code (`git clone … || true` still printed it).
+fn strong_error(lower: &str) -> bool {
+    const STARTS: [&str; 5] = ["fatal:", "error:", "error[", "npm err!", "err!"];
+    const CONTAINS: [&str; 13] = [
+        "could not resolve",
+        "temporary failure in name resolution",
+        "name or service not known",
+        "network is unreachable",
+        "connection refused",
+        "connection timed out",
+        "failed to connect",
+        "unable to access",
+        "no route to host",
+        "permission denied",
+        "no such file or directory",
+        "command not found",
+        "no one to ask",
+    ];
+    STARTS.iter().any(|s| lower.starts_with(s)) || CONTAINS.iter().any(|c| lower.contains(c))
+}
+
+/// A line that may say what failed, counted only when the command did fail ("0 failed" in a passing run isn't one).
+fn weak_error(lower: &str) -> bool {
+    const WORDS: [&str; 8] = ["error", "failed", "failure", "cannot", "can't", "unable", "not found", "denied"];
+    WORDS.iter().any(|w| lower.contains(w))
+}
+
+/// Lowercased, digits as `#`, whitespace collapsed: a line number or a duration doesn't make a new error.
+fn normalize_line(line: &str) -> String {
+    let mapped: String = line.chars().map(|c| if c.is_ascii_digit() { '#' } else { c.to_ascii_lowercase() }).collect();
+    mapped.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// What a bash result's failure looks like, or `None` when it didn't fail. Marv's own `Marv:` lines are skipped. Its
+/// first line that says something failed whatever the exit code (`fatal:`, `could not resolve host`, …); for a failed
+/// one (an exit code other than 0, a timeout, or no ending at all: refused, declined), else its first line with an
+/// error word, else its ending and last line. Each as `(normalized, shown)`.
+pub fn failure_signature(result: &str) -> Option<(String, String)> {
+    let lines: Vec<&str> = result.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with("Marv:")).collect();
+    let ending = lines.iter().rev().find(|l| l.starts_with("[exit code ") || l.starts_with("[timed out")).copied();
+    let failed = ending != Some("[exit code 0]");
+    let pick = |line: &str| {
+        let shown: String = line.chars().take(SIGNATURE_CHARS).collect();
+        Some((normalize_line(&shown), shown))
+    };
+    if let Some(line) = lines.iter().find(|l| strong_error(&l.to_lowercase())) {
+        return pick(line);
+    }
+    if !failed {
+        return None;
+    }
+    if let Some(line) = lines.iter().find(|l| weak_error(&l.to_lowercase())) {
+        return pick(line);
+    }
+    let last = lines.iter().rev().find(|l| Some(**l) != ending).copied().unwrap_or("");
+    pick(&format!("{} {last}", ending.unwrap_or("")))
+}
+
+/// The failing-command key of a call: bash only, by its command's key and the flags that change where it runs.
+pub fn command_call_key(name: &str, arguments: &str) -> Option<String> {
+    if name != "bash" {
+        return None;
+    }
+    let args = serde_json::from_str::<Value>(arguments).ok()?;
+    let command = args.get("command")?.as_str()?;
+    let net = if args.get("network").and_then(Value::as_bool) == Some(true) { "net:" } else { "" };
+    let host = if args.get("sandbox").and_then(Value::as_bool) == Some(false) { "host:" } else { "" };
+    Some(format!("{net}{host}{}", marv_core::command::command_key(command)))
+}
+
+/// One command's failures in a row: (normalized signature, the line shown, how many times).
+#[derive(Debug, Clone, PartialEq)]
+struct Failures {
+    signature: String,
+    shown: String,
+    count: usize,
+}
+
+/// Failing bash commands since the last file edit (see the module notes).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FailureLoopState {
+    failures: std::collections::HashMap<String, Failures>,
+}
+
+impl FailureLoopState {
+    /// Notes a call's result: an edit forgets everything; a bash command's failure counts (the same signature as
+    /// last time: one more; another: the first), its success forgets it.
+    pub fn record(&mut self, name: &str, arguments: &str, result: &str) {
+        if EDIT_TOOLS.contains(&name) {
+            self.failures.clear();
+            return;
+        }
+        let Some(key) = command_call_key(name, arguments) else { return };
+        match failure_signature(result) {
+            None => {
+                self.failures.remove(&key);
+            }
+            Some((signature, shown)) => {
+                let count = self.failures.get(&key).filter(|f| f.signature == signature).map_or(0, |f| f.count);
+                self.failures.insert(key, Failures { signature, shown, count: count + 1 });
+            }
+        }
+    }
+
+    /// For a call that would be another try of a command that already failed the same way [`FAILURE_REPEATS`]
+    /// times: how many times, and the line its failure showed.
+    pub fn repeated(&self, name: &str, arguments: &str) -> Option<(usize, String)> {
+        let key = command_call_key(name, arguments)?;
+        self.failures.get(&key).filter(|f| f.count >= FAILURE_REPEATS).map(|f| (f.count, f.shown.clone()))
+    }
+}
+
+/// The result of a call that wasn't run because its command keeps failing the same way.
+pub fn failing_command_note(count: usize, shown: &str) -> String {
+    format!(
+        "Marv: not run. This command already failed {count} times in a row the same way (\"{shown}\"), with no file edited in between, so another try would fail too (a different tail on the command doesn't change that). Use what it said: change the approach, do without it, or tell the user what's in the way."
+    )
 }
 
 #[cfg(test)]
@@ -365,5 +499,83 @@ mod tests {
         tool_loop_detected(&mut state, vec![read("a")]);
         tool_loop_detected(&mut state, vec![read("a"), read("b")]);
         assert_eq!(state.history.len(), 1);
+    }
+
+    // Issue #81: failing commands whose tail differs.
+
+    fn bash(command: &str) -> String {
+        serde_json::json!({ "command": command }).to_string()
+    }
+    const OFFLINE: &str = "Cloning into 'marv'...\nfatal: unable to access 'https://github.com/FlologixAI/marv/': Could not resolve host: github.com\n\n[exit code 128]";
+
+    #[test]
+    fn the_signature_is_the_first_line_that_says_what_failed() {
+        let (normalized, shown) = failure_signature(OFFLINE).unwrap();
+        assert!(shown.starts_with("fatal: unable to access"));
+        assert_eq!(normalized, shown.to_lowercase());
+        // Whatever the exit code: `|| true` hid it, the output didn't.
+        let hidden = OFFLINE.replace("[exit code 128]", "[exit code 0]");
+        assert_eq!(failure_signature(&hidden).unwrap().1, shown);
+        // Line numbers and durations don't make it new.
+        assert_eq!(
+            failure_signature("error: x.rs:12 broke\n\n[exit code 1]").unwrap().0,
+            failure_signature("error: x.rs:13 broke\n\n[exit code 1]").unwrap().0
+        );
+        // Marv's notes aren't the command's output.
+        assert!(failure_signature("ok\n\n[exit code 0]\n\nMarv: this command failed before").is_none());
+    }
+
+    #[test]
+    fn a_passing_run_has_no_signature_even_with_error_words_in_it() {
+        assert!(failure_signature("test result: ok. 12 passed; 0 failed\n\n[exit code 0]").is_none());
+        assert!(failure_signature("(no output)\n\n[exit code 0]").is_none());
+        // A failed one without error words is its ending and last line; one without an ending (refused) its line.
+        assert_eq!(failure_signature("(no output)\n\n[exit code 1]").unwrap().1, "[exit code 1] (no output)");
+        assert!(failure_signature("bash needs the user's approval, and there's no one to ask.").is_some());
+    }
+
+    #[test]
+    fn the_same_failure_twice_makes_the_next_try_a_loop_whatever_its_tail() {
+        let mut state = FailureLoopState::default();
+        state.record("bash", &bash("git clone https://github.com/FlologixAI/marv 2>&1 | tail -2"), OFFLINE);
+        assert!(state.repeated("bash", &bash("git clone https://github.com/FlologixAI/marv")).is_none());
+        // A probe in between neither counts nor resets.
+        state.record("bash", &bash("echo test"), "test\n\n[exit code 0]");
+        state.record("bash", &bash("git clone https://github.com/FlologixAI/marv && du -sh marv"), OFFLINE);
+        let (count, shown) = state.repeated("bash", &bash("git clone https://github.com/FlologixAI/marv || true")).unwrap();
+        assert_eq!(count, 2);
+        assert!(shown.contains("Could not resolve host"));
+        assert!(failing_command_note(count, &shown).starts_with("Marv: not run. This command already failed 2 times"));
+        // With network it's another command; so is another clone.
+        assert!(
+            state.repeated("bash", r#"{"command": "git clone https://github.com/FlologixAI/marv", "network": true}"#).is_none()
+        );
+        assert!(state.repeated("bash", &bash("git clone https://github.com/FlologixAI/other")).is_none());
+        assert!(state.repeated("read_file", r#"{"path": "a"}"#).is_none());
+    }
+
+    #[test]
+    fn an_edit_a_success_or_another_error_resets_it() {
+        let test = bash("cargo test");
+        let failing = "error[E0308]: mismatched types\n\n[exit code 101]";
+        let twice = || {
+            let mut state = FailureLoopState::default();
+            state.record("bash", &test, failing);
+            state.record("bash", &test, failing);
+            assert!(state.repeated("bash", &test).is_some());
+            state
+        };
+        // Re-running the tests after an edit is never a loop.
+        let mut edited = twice();
+        edited.record("edit_file", r#"{"path": "src/a.rs"}"#, "Edited src/a.rs");
+        assert!(edited.repeated("bash", &test).is_none());
+        let mut passed = twice();
+        passed.record("bash", &test, "test result: ok\n\n[exit code 0]");
+        assert!(passed.repeated("bash", &test).is_none());
+        let mut other = twice();
+        other.record("bash", &test, "error[E0425]: cannot find value\n\n[exit code 101]");
+        assert!(other.repeated("bash", &test).is_none());
+        other.record("bash", &test, "error[E0425]: cannot find value\n\n[exit code 101]");
+        assert!(other.repeated("bash", &test).is_some());
     }
 }
