@@ -598,13 +598,16 @@ mod tests {
                 pane("w1:p4", None, "unknown"),
             ];
             let agents = json!({"result": {"agents": panes.iter().filter(|p| p.get("agent").is_some()).collect::<Vec<_>>()}});
-            let get = |p: &Value| format!("'{}') echo '{}';;", p["pane_id"].as_str().unwrap(), json!({"result": {"pane": p}}));
+            let get = |p: &Value| {
+                format!("'{}') printf '%s\\n' '{}';;", p["pane_id"].as_str().unwrap(), json!({"result": {"pane": p}}))
+            };
+            // printf, not echo: dash (Ubuntu's sh) turns the \n in the JSON into a newline.
             let script = format!(
                 "#!/bin/sh\necho \"$@\" >> '{log}'\ncase \"$1 $2\" in\n\
-                 'agent list') echo '{agents}';;\n\
-                 'pane get') case \"$3\" in\n{gets}\n*) echo '{{\"error\":{{\"code\":\"pane_not_found\",\"message\":\"pane $3 not found\"}}}}'; exit 1;;\nesac;;\n\
-                 'pane read') echo '{{\"result\":{{\"text\":\"line1\\nline2\"}}}}';;\n\
-                 *) echo '{{\"result\":{{}}}}';;\nesac\n",
+                 'agent list') printf '%s\\n' '{agents}';;\n\
+                 'pane get') case \"$3\" in\n{gets}\n*) printf '%s\\n' '{{\"error\":{{\"code\":\"pane_not_found\",\"message\":\"pane $3 not found\"}}}}'; exit 1;;\nesac;;\n\
+                 'pane read') printf '%s\\n' '{{\"result\":{{\"text\":\"line1\\nline2\"}}}}';;\n\
+                 *) printf '%s\\n' '{{\"result\":{{}}}}';;\nesac\n",
                 log = log.display(),
                 gets = panes.iter().map(get).collect::<Vec<_>>().join("\n"),
             );
