@@ -1169,8 +1169,15 @@ impl Bridge {
                 }
             }
         };
-        if let Some((text, for_model)) = next {
-            self.start_claimed(text, for_model);
+        match next {
+            Some((text, for_model)) => self.start_claimed(text, for_model),
+            // Idle again: a message that rang the mail bell while busy, after the turn's last inbox read (its final
+            // reply runs no `after_step`), would otherwise wait for some later message. `wake` checks everything
+            // again (on, closing, approvals, the rate limit, which also bounds a wake that keeps failing).
+            None => {
+                let me = self.clone();
+                tokio::spawn(async move { me.wake() });
+            }
         }
     }
 
@@ -2771,7 +2778,29 @@ mod tests {
             model.release.notify_one();
             let seen = until(&mut rx, |e| matches!(e, UiEvent::TurnEnd { .. })).await;
             assert!(!texts(&seen).iter().any(|t| t == WOKEN));
-            assert_eq!(model.seen.lock().unwrap().len(), 1);
+            assert!(model.seen.lock().unwrap().len() <= 2);
+        }
+
+        /// A message that lands after a turn's last inbox read (here, during its final reply: no step follows, so it
+        /// isn't drained) rang the mail bell while busy. Once that turn ends and Marv is idle, it wakes a turn: it
+        /// doesn't sit unread until some other message arrives.
+        #[tokio::test]
+        async fn a_message_that_lands_during_a_turns_last_reply_wakes_once_it_ends() {
+            let (dirs, mesh) = (Dirs::new(), mesh());
+            let model = Arc::new(Gated::default());
+            model.replies.lock().unwrap().extend([say("done"), say("worker-1 says hi.")]);
+            let (bridge, mut rx) = gated_bridge(&dirs, &mesh, model.clone());
+            mesh.wire().await;
+            Port(bridge.clone()).send("go".into());
+            until(&mut rx, |e| matches!(e, UiEvent::TurnStart { .. })).await;
+            mesh.send("hi").await;
+            quiet(&mut rx).await;
+            model.release.notify_one();
+            until(&mut rx, |e| matches!(e, UiEvent::TurnEnd { .. })).await;
+            let seen = until(&mut rx, |e| matches!(e, UiEvent::TurnEnd { .. })).await;
+            assert!(texts(&seen).iter().any(|t| t == WOKEN), "{seen:?}");
+            assert!(seen.iter().any(|e| matches!(e, UiEvent::Assistant { text } if text == "worker-1 says hi.")));
+            assert_eq!(mesh.unread(), 0);
         }
 
         /// Greptile on #110: once the App is leaving (its flush), a message starts no turn.
