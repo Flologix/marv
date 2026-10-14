@@ -55,6 +55,8 @@ jobs:
           echo "TEMP_BEFORE=$(find /tmp -maxdepth 1 \( -name 'marv-*' -o -name 'mx-*' \) ! -name "marv-$(id -u)" | wc -l)" >> "$GITHUB_ENV"
       - run: cargo test --workspace --no-fail-fast
       - name: Fail if the tests left temp folders
+        # Also after failed tests: a failing test is the likeliest to leave its folder behind.
+        if: ${{ !cancelled() && env.TEMP_BEFORE != '' }}
         run: |
           left=$(find /tmp -maxdepth 1 \( -name 'marv-*' -o -name 'mx-*' \) ! -name "marv-$(id -u)" | sort)
           after=$(printf '%s' "$left" | grep -c . || true)
