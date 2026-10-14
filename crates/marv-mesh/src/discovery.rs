@@ -63,9 +63,11 @@ pub const DOOR_TIMEOUT: Duration = Duration::from_secs(2);
 pub const MAX_SESSION_NAME: usize = 43;
 const PEER_PLUG: &str = "peer-";
 
-/// `$XDG_RUNTIME_DIR/marv/mesh`, or `None` without a runtime dir.
+/// `$XDG_RUNTIME_DIR/marv/mesh`, or `None` without a runtime dir, or with one a sandboxed command could see
+/// (`marv_sandbox::hidden_in_sandbox`).
 pub fn mesh_dir(env: &marv_mcp::Env) -> Option<PathBuf> {
-    let base = env.get("XDG_RUNTIME_DIR").filter(|d| Path::new(d).is_absolute())?;
+    let home = env.get("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"));
+    let base = env.get("XDG_RUNTIME_DIR").filter(|d| marv_sandbox::hidden_in_sandbox(Path::new(d), &home))?;
     Some(Path::new(base).join("marv").join("mesh"))
 }
 

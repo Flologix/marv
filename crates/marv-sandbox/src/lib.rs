@@ -34,6 +34,23 @@ pub use paths::{project_path, resolve_in_project, resolve_within, touches_git};
 pub use protected::{PROTECTED_PATHS, ProtectedPath, ProtectedRule, is_protected, protected_rule};
 pub use taint::TaintState;
 
+/// Whether every sandbox hides `dir`: it is (by its real path) under `/run`, `/tmp` or the home folder, which each
+/// command sees as empty tmpfs. The mesh keeps its sockets only in such a folder: a socket a sandboxed command could
+/// see is one it could connect to (a read-only mount doesn't stop `connect()`), and a plug's socket carries that
+/// plug's identity and wires. A runtime dir elsewhere (`XDG_RUNTIME_DIR=/var/tmp/…`) is refused, not used.
+pub fn hidden_in_sandbox(dir: &std::path::Path, home: &std::path::Path) -> bool {
+    let real = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let dir = real(dir);
+    if !dir.is_absolute() {
+        return false;
+    }
+    let home = real(home);
+    let under = |base: &std::path::Path| dir.starts_with(base) && dir != base;
+    under(std::path::Path::new("/run"))
+        || under(std::path::Path::new("/tmp"))
+        || (home != std::path::Path::new("/") && under(&home))
+}
+
 /// Why a path or a mount was refused. The messages go to the model as they are (tools wrap them in a
 /// `ToolError`), so they say what to do instead.
 #[derive(Debug, thiserror::Error)]
@@ -129,5 +146,22 @@ impl Sandbox {
         argv.push("--".into());
         argv.extend(inner.iter().cloned());
         Ok(argv)
+    }
+}
+
+#[cfg(test)]
+mod hidden_tests {
+    use super::*;
+
+    #[test]
+    fn only_folders_the_sandbox_hides_hold_the_mesh() {
+        let home = std::path::Path::new("/home/me");
+        assert!(hidden_in_sandbox(std::path::Path::new("/run/user/1000"), home));
+        assert!(hidden_in_sandbox(std::path::Path::new("/tmp/marv-1000"), home));
+        assert!(hidden_in_sandbox(std::path::Path::new("/home/me/.run"), home));
+        for visible in ["/var/tmp/xdg", "/srv/run", "/run", "/tmp", "/home/me", "relative/dir"] {
+            assert!(!hidden_in_sandbox(std::path::Path::new(visible), home), "{visible}");
+        }
+        assert!(!hidden_in_sandbox(std::path::Path::new("/anything"), std::path::Path::new("/")), "a home of / hides nothing");
     }
 }

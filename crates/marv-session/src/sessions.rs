@@ -57,6 +57,10 @@ pub struct SavedSession {
     /// A note for the model not yet sent (an undo's, #16): it leads the next user message. Checked on resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_note: Option<serde_json::Value>,
+    /// marv-rs: what tainted the conversation (web, MCP, mesh, image), restored on resume: the outside text is still
+    /// in it. Absent in older files: `taint_sources` then infers it from the conversation's tool calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub taint: Option<Vec<marv_core::Provenance>>,
 }
 
 /// A saved session's checkpoint chain and its turns' reported paths (#16).
@@ -68,6 +72,30 @@ pub struct SavedCheckpoints {
 }
 
 impl SavedSession {
+    /// The taint to restore on resume. Saved files say it; an older file (or one from TypeScript Marv) is judged by
+    /// its conversation, erring on the tainted side: a web or github call counts as web content, an MCP or mesh call
+    /// as theirs, and a subagent's report (which could carry either) as web content.
+    pub fn taint_sources(&self) -> Vec<marv_core::Provenance> {
+        use marv_core::Provenance;
+        if let Some(saved) = &self.taint {
+            return saved.clone();
+        }
+        let mut sources = Vec::new();
+        for turn in &self.conversation {
+            let marv_core::ChatTurn::Tool { name, .. } = turn else { continue };
+            let source = match name.as_str() {
+                "web_fetch" | "github" | "agent" => Provenance::Web,
+                n if n.starts_with("mcp") => Provenance::Mcp,
+                n if n.starts_with("mesh") => Provenance::Mesh,
+                _ => continue,
+            };
+            if !sources.contains(&source) {
+                sources.push(source);
+            }
+        }
+        sources
+    }
+
     /// The saved plan, or `None` for none, an old file or a hand edit (the plan is dropped, the session still loads).
     pub fn plan_items(&self) -> Option<Vec<marv_tools::PlanItem>> {
         let items: Vec<marv_tools::PlanItem> = serde_json::from_value(self.plan.clone()?).ok()?;
@@ -121,6 +149,7 @@ pub fn new_session(root: &Path, provider: &str, model: &str, now_ms: u64) -> Sav
         plan: None,
         checkpoints: None,
         pending_note: None,
+        taint: None,
     }
 }
 

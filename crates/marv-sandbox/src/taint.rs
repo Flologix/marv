@@ -75,6 +75,26 @@ impl TaintState {
     }
 
     /// A subagent's state: tainted like its parent, with no approvals.
+    /// A resumed conversation's taint: exactly these sources, in order, and no approved prefixes (approvals were the
+    /// last process's). The conversation still holds the outside text that tainted it, so a resume must restore this.
+    pub fn restore(&self, sources: &[Provenance]) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.sources.clear();
+        inner.approved_prefixes.clear();
+        for source in sources.iter().copied().filter(|s| s.taints()) {
+            if !inner.sources.contains(&source) {
+                inner.sources.push(source);
+            }
+        }
+    }
+
+    /// What tainted `child` (a subagent) taints this one too: its report can carry that text back.
+    pub fn absorb(&self, child: &TaintState) {
+        for source in child.sources() {
+            self.mark(source);
+        }
+    }
+
     pub fn for_subagent(&self) -> TaintState {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         TaintState { inner: Mutex::new(Inner { sources: inner.sources.clone(), approved_prefixes: BTreeSet::new() }) }
@@ -83,6 +103,22 @@ impl TaintState {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn restore_sets_exactly_the_saved_sources_and_absorb_carries_a_childs_up() {
+        let t = TaintState::new();
+        t.mark(Provenance::Mcp);
+        t.approve_prefix("https://docs.rs/");
+        t.restore(&[Provenance::Web, Provenance::User, Provenance::Web]);
+        assert_eq!(t.sources(), [Provenance::Web], "only tainting sources, once each");
+        assert!(!t.prefix_approved("https://docs.rs/serde"), "approvals were the last process's");
+        let parent = TaintState::new();
+        let child = parent.for_subagent();
+        child.mark(Provenance::Mesh);
+        assert!(!parent.is_tainted());
+        parent.absorb(&child);
+        assert_eq!(parent.sources(), [Provenance::Mesh]);
+    }
+
     use super::*;
 
     #[test]

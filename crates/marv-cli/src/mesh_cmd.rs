@@ -93,7 +93,9 @@ fn env() -> marv_mcp::Env {
 }
 
 fn no_runtime_dir(command: &str) -> i32 {
-    eprintln!("marv mesh {command} needs XDG_RUNTIME_DIR: Marv never puts the mesh in a world-readable folder.");
+    eprintln!(
+        "marv mesh {command} needs XDG_RUNTIME_DIR under /run, /tmp or your home folder: Marv puts the mesh only where sandboxed commands can't see it."
+    );
     1
 }
 

@@ -12,6 +12,18 @@ use serde_json::json;
 
 // ---- bubblewrap ----------------------------------------------------------------------------------------------
 
+/// **CI never passes on skipped guards.** The sandbox guards skip where bubblewrap can't start a sandbox (a machine
+/// without it, a runner that blocks user namespaces), which would let a green run skip Marv's main boundary. CI sets
+/// `MARV_REQUIRE_SANDBOX=1`, and then this fails unless the sandbox really runs.
+///
+/// Proven: ran with `MARV_REQUIRE_SANDBOX=1` and `PATH` without bwrap → this test failed.
+#[test]
+fn where_the_sandbox_is_required_it_really_runs() {
+    if std::env::var_os("MARV_REQUIRE_SANDBOX").is_some_and(|v| v == "1") {
+        assert!(marv_sandbox::sandbox_available(), "MARV_REQUIRE_SANDBOX=1, but bubblewrap can't start a sandbox here");
+    }
+}
+
 /// **Read-only system directories and an empty `/run`, except the mesh plug.** `/run` holds the user's D-Bus
 /// (`systemd-run --user` starts programs outside the sandbox), the SSH/GPG agents and docker; a read-only mount
 /// doesn't stop `connect()`, so it must be empty.

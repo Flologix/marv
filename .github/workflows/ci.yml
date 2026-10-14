@@ -1,21 +1,49 @@
+# CI for Marv: format, check, clippy and the tests, on every pull request and push to main. No secrets: nothing here
+# calls a real model.
+#
+# The sandbox is Marv's main safety boundary, and its tests (the guards in tests/guards among them) skip where
+# bubblewrap can't start a sandbox. So they are made to run, not skip: bubblewrap is installed, the AppArmor rule that
+# stops Ubuntu 24.04's runners from creating unprivileged user namespaces (which bwrap needs) is lifted for the runner,
+# a probe fails the job before the tests if bwrap still can't start, and MARV_REQUIRE_SANDBOX=1 makes the guard
+# `where_the_sandbox_is_required_it_really_runs` fail rather than let a skipped run pass.
 name: CI
 
-on:
+"on":
   push:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      MARV_REQUIRE_SANDBOX: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      - name: Install bubblewrap (sandbox tests)
-        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      - name: Install bubblewrap and allow user namespaces
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      # Fail here, with bwrap's own error, rather than let the sandbox tests skip.
+      - name: Require a working sandbox
+        run: bwrap --ro-bind / / --unshare-net --unshare-pid -- true
+      # git (repositories, file listings) and python3 (some tests' servers and fixtures) come with the runner image;
+      # this fails loudly if that ever changes.
+      - name: Check the tools the tests need
+        run: git --version && python3 --version
       - run: cargo fmt --all --check
       - run: cargo check --workspace --all-targets
       - run: cargo clippy --workspace --all-targets -- -D warnings

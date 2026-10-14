@@ -49,9 +49,12 @@ pub fn parent_id() -> PlugId {
 }
 
 /// A switchboard for session `session`, its plug sockets in `$XDG_RUNTIME_DIR/marv/plugs/<session>` (0700), served
-/// until `cancel`. `None` without a runtime dir: plugs never fall back to a world-readable `/tmp`.
+/// until `cancel`. `None` without a runtime dir: plugs never fall back to a world-readable `/tmp`. Nor with a runtime
+/// dir every sandbox doesn't hide: a worker that could see `parent.sock` could connect to it and use the parent's
+/// wires (`marv_sandbox::hidden_in_sandbox`).
 pub fn start(session: &str, env: &marv_mcp::Env, cancel: CancellationToken) -> Option<MeshHandle> {
-    let base = env.get("XDG_RUNTIME_DIR").filter(|d| std::path::Path::new(d).is_absolute())?;
+    let home = env.get("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"));
+    let base = env.get("XDG_RUNTIME_DIR").filter(|d| marv_sandbox::hidden_in_sandbox(std::path::Path::new(d), &home))?;
     let dir = PathBuf::from(base).join("marv").join("plugs").join(session);
     let mesh = Arc::new(Switchboard::new(session, dir, Arc::new(marv_mesh::switchboard::NoTrajectory)));
     tokio::spawn(Arc::clone(&mesh).serve(cancel));

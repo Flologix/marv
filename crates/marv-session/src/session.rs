@@ -1634,6 +1634,9 @@ impl MarvSession {
             // conversation. A session without the plan tool restores none: compaction would tell the model to keep
             // updating it.
             s.plan = if self.inner.init.plan { saved.plan_items() } else { None };
+            // marv-rs: the conversation still holds the web, MCP or mesh text that tainted it, so its taint comes back
+            // with it (docs/SECURITY.md): egress keeps asking after `marv -c`.
+            self.inner.taint.restore(&saved.taint_sources());
             let resumed = Resumed {
                 id: saved.id.clone(),
                 updated_at: saved.updated_at,
@@ -1867,6 +1870,7 @@ impl MarvSession {
         };
         saved.checkpoints = serde_json::to_value(checkpoints).ok();
         saved.pending_note = s.pending_note.clone().map(serde_json::Value::String);
+        saved.taint = Some(self.inner.taint.sources());
         s.saved = saved.clone();
         saved
     }
@@ -3939,6 +3943,46 @@ mod turn_tests {
         assert!(session.plan().is_some());
         session.clear().await.unwrap();
         assert_eq!(session.plan(), None);
+    }
+
+    // Guard (docs/SECURITY.md, taint): the outside text is still in a resumed conversation, so its taint comes back,
+    // whether the file says it or (an older file) its tool calls do; a clean saved session resumes clean.
+    #[tokio::test]
+    async fn resume_restores_the_conversations_taint() {
+        let dirs = Dirs::new();
+        let sessions = Arc::new(SessionStore::new(&dirs.dir));
+        let saved = |id: &str, tool: &str, taint: Option<Vec<Provenance>>| {
+            let mut s = crate::sessions::new_session(&dirs.project, "openrouter", "test-model", 1_000);
+            s.id = id.into();
+            s.conversation = vec![
+                ChatTurn::User { text: "look it up".into() },
+                ChatTurn::Assistant {
+                    text: String::new(),
+                    tool_calls: vec![ToolCall { id: "c1".into(), name: tool.into(), arguments: "{}".into() }],
+                    reasoning: None,
+                },
+                ChatTurn::Tool { call_id: "c1".into(), name: tool.into(), text: "outside text".into() },
+            ];
+            s.transcript = vec![Message::new(1, Role::User, "look it up")];
+            s.taint = taint;
+            s
+        };
+        sessions.save(&saved("marked", "read_file", Some(vec![Provenance::Mesh]))).await.unwrap();
+        sessions.save(&saved("older", "web_fetch", None)).await.unwrap();
+        sessions.save(&saved("clean", "read_file", Some(vec![]))).await.unwrap();
+        let b = scripted(&dirs, &Scripted::new(vec![]), |i| i.sessions = Some(sessions.clone()));
+        b.resume(ResumeTarget::Id("marked".into())).await.unwrap().unwrap();
+        assert_eq!(b.tainted(), [Provenance::Mesh]);
+        b.resume(ResumeTarget::Id("older".into())).await.unwrap().unwrap();
+        assert_eq!(b.tainted(), [Provenance::Web]);
+        b.resume(ResumeTarget::Id("clean".into())).await.unwrap().unwrap();
+        assert!(b.tainted().is_empty());
+        // And it's saved: a session's file records what tainted it.
+        let a = scripted(&dirs, &Scripted::new(vec![say("ok")]), |i| i.sessions = Some(sessions.clone()));
+        a.inner.taint.mark(Provenance::Web);
+        collect(go(&a, "hi")).await;
+        a.flush().await;
+        assert_eq!(sessions.load(&dirs.project, &a.id()).await.unwrap().taint, Some(vec![Provenance::Web]));
     }
 
     #[tokio::test]

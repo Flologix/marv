@@ -360,6 +360,7 @@ async fn drive(
     available.extend(plug.iter().flat_map(|p| p.tools()));
     let specs = available.iter().map(|t| t.spec()).collect();
     let taint = sub_ctx.taint.clone();
+    let child_taint = sub_ctx.taint.clone();
     let runner = Arc::new(SessionToolRunner::new(sub_ctx, Arc::new(available)));
     let history: History = Arc::new(Mutex::new(vec![ChatTurn::User { text: input.prompt.clone() }]));
     let mut options =
@@ -406,6 +407,10 @@ async fn drive(
             }
             _ => {}
         }
+        // marv-rs: what tainted the subagent taints its parent too: its report can carry that text (or instructions
+        // from it) back, and the parent's egress must ask from then on (docs/SECURITY.md). Each step, so a parent
+        // that's stopped mid-run is marked too.
+        ctx.taint.absorb(&child_taint);
     }
 }
 

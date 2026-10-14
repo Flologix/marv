@@ -414,7 +414,9 @@ pub async fn run_headless(options: HeadlessOptions) -> ExitCode {
                 builder.options.wire_approver = Some(wires);
                 mesh = Some(started);
             }
-            Ok(None) => eprintln!("marv: the mesh needs XDG_RUNTIME_DIR; running without it."),
+            Ok(None) => {
+                eprintln!("marv: the mesh needs XDG_RUNTIME_DIR under /run, /tmp or your home folder; running without it.")
+            }
             Err(e) => eprintln!("marv: the mesh: {}", printable(&e)),
         }
     }
