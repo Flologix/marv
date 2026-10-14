@@ -2,7 +2,7 @@
 //!
 //! Sending every MCP tool's full spec with every request costs thousands of
 //! tokens once a few servers are connected, and gives small models dozens of
-//! tools to choose from. Past a threshold, the model is offered two constant
+//! tools to choose from. Past a threshold ([`DEFER_TOKENS`], 8k in marv-rs, #87), the model is offered two constant
 //! tools instead, `tool_search` (a tool's full spec, as a tool result) and
 //! `mcp_call` (runs one), and learns the MCP tools' names from a note from Marv
 //! at the start of the turn's user message.
@@ -11,7 +11,9 @@
 //!   server trusted or added mid-session reaches the model only through an
 //!   appended note ([`announcement`]). The mode is decided once per
 //!   conversation ([`choose_mode`]) and saved with it; a conversation never
-//!   switches.
+//!   switches. A direct (eager) conversation's list only grows when the user
+//!   adds a server mid-session (`/mcp add`, `trust`, `login`), the new tools
+//!   after the old ones; it never turns deferred, however big it gets.
 //! - `mcp_call` never asks by itself: it hands the call to `run_tool` with the
 //!   real MCP tool, so its preview, approval, scope, no-`autoSafe` and label
 //!   apply unchanged (and the taint rule: Egress once tainted).
@@ -50,7 +52,12 @@ pub enum McpMode {
 /// A listed tool's description, at most.
 pub const MAX_LINE: usize = 100;
 /// Defer when the MCP specs cost more than this many tokens per request…
-pub const DEFER_TOKENS: f64 = 4000.0;
+///
+/// **Difference from Marv (marv-rs #87):** Marv deferred past 4000. The eval tracker (25 tools, 4.7k tokens) was
+/// deferred there, and each tool group then cost a `tool_search` round trip (2–3 per task, 5–10 s on a fast model)
+/// to save under 4k tokens a request, most of it a cached prefix. Up to 8k, the specs go in directly; past it
+/// (170 tools) deferral still pays. `mcpTools: "deferred"` / `"eager"` override it either way.
+pub const DEFER_TOKENS: f64 = 8000.0;
 /// …or more than this share of the context window, whichever is less.
 pub const DEFER_SHARE: f64 = 0.1;
 /// Specs `tool_search` returns at most.
@@ -334,7 +341,7 @@ mod tests {
         let few = vec![spec("mcp__a__b", "short")];
         assert_eq!(choose_mode(McpToolsSetting::Auto, &few, None).mode, McpMode::Eager);
         assert_eq!(choose_mode(McpToolsSetting::Deferred, &few, None).mode, McpMode::Deferred);
-        let big: Vec<ToolSpec> = (0..40)
+        let big: Vec<ToolSpec> = (0..80)
             .map(|i| ToolSpec {
                 name: format!("mcp__s__t{i}"),
                 description: "Does a thing.".into(),
@@ -343,6 +350,30 @@ mod tests {
             .collect();
         assert_eq!(choose_mode(McpToolsSetting::Auto, &big, None).mode, McpMode::Deferred);
         assert_eq!(choose_mode(McpToolsSetting::Eager, &big, None).mode, McpMode::Eager);
+    }
+
+    /// One tool whose spec list costs exactly `tokens` by [`estimate_tokens`] (the description pads it).
+    fn costing(tokens: usize) -> Vec<ToolSpec> {
+        let mut specs = vec![spec("mcp__s__t", "")];
+        let base = serde_json::to_string(&specs).unwrap().chars().count();
+        specs[0].description = "x".repeat(tokens * 4 - base);
+        assert_eq!(estimate_tokens(&serde_json::to_string(&specs).unwrap()), tokens);
+        specs
+    }
+
+    /// marv-rs #87: up to 8k tokens of specs are offered directly (the 25-tool tracker, ~4.7k, was deferred under
+    /// Marv's 4000), past it deferred; a small context window still defers sooner (10% of it).
+    #[test]
+    fn auto_offers_up_to_8k_tokens_directly() {
+        assert_eq!(DEFER_TOKENS, 8000.0);
+        let mode = |tokens, context| choose_mode(McpToolsSetting::Auto, &costing(tokens), context).mode;
+        assert_eq!(mode(4700, None), McpMode::Eager);
+        assert_eq!(mode(8000, None), McpMode::Eager);
+        assert_eq!(mode(8001, None), McpMode::Deferred);
+        assert_eq!(mode(8000, Some(1_000_000)), McpMode::Eager);
+        assert_eq!(mode(8001, Some(1_000_000)), McpMode::Deferred);
+        assert_eq!(mode(4700, Some(32_000)), McpMode::Deferred);
+        assert_eq!(mode(3200, Some(32_000)), McpMode::Eager);
     }
 
     /// `gh`'s tools, each with a schema whose keys the server sent out of alphabetical order.

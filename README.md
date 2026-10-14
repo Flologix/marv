@@ -209,7 +209,7 @@ Servers go in `~/.marv/mcp.json` (yours, every project) or the project's `.mcp.j
 - Local servers (stdio) and remote ones (Streamable HTTP) both work. An optional `timeout` sets the seconds per call (default 120). The old `sse` transport isn't supported.
 - Servers start in the background when Marv does, and the first request waits for them. Restart Marv after editing a config by hand (`/mcp add` starts its server at once).
 - A project server can't take the name of one of yours, and starts only once you trust it with `/mcp trust` (see [Safety model](#safety-model)). Once the servers have started, an "MCP" notice lists those that failed, those waiting for trust (what each runs and reads from your environment) and those that need a login. Trust given by Marv 0.3.0 doesn't carry over (the trust key changed).
-- With many tools connected (specs that would cost more than 4,000 tokens per request, or 10% of the context window if that is less), the model gets their names and two tools to look one up and call it. `"mcpTools": "eager"` in `~/.marv/config.json` sends every spec with every request instead, `"deferred"` always sends names only.
+- With many tools connected (specs that would cost more than 8,000 tokens per request, or 10% of the context window if that is less), the model gets their names and two tools to look one up and call it. `"mcpTools": "eager"` in `~/.marv/config.json` sends every spec with every request instead, `"deferred"` always sends names only.
 
 ### Add an MCP server
 
