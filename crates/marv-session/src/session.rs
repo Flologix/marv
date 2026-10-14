@@ -3103,12 +3103,41 @@ mod turn_tests {
 
     /// A Streamable HTTP MCP server with one tool, `ping`, that answers `initialize` only once `gate` opens.
     async fn gated_mcp_server(gate: tokio::sync::watch::Receiver<bool>) -> String {
+        let tools = json!([{"name": "ping", "description": "Ping.", "inputSchema": {"type": "object"}}]);
+        mcp_server(gate, tools).await
+    }
+
+    /// An open MCP server offering `tools` (`tools/list`'s array); every call answers "ok".
+    async fn open_mcp_server(tools: serde_json::Value) -> String {
+        let (open, gate) = tokio::sync::watch::channel(true);
+        std::mem::forget(open); // the gate stays open for the test's life
+        mcp_server(gate, tools).await
+    }
+
+    /// `n` tools named `t0…`, each with a schema of about `pad` characters: their specs cost about `n * pad / 4`
+    /// tokens. The first is marked `readOnlyHint`.
+    fn padded_tools(n: usize, pad: usize) -> serde_json::Value {
+        let tools: Vec<serde_json::Value> = (0..n)
+            .map(|i| {
+                let mut tool = json!({"name": format!("t{i}"), "description": "Does a thing.", "inputSchema": {"type": "object",
+                    "properties": {"x": {"type": "string", "description": "y".repeat(pad)}}}});
+                if i == 0 {
+                    tool["annotations"] = json!({"readOnlyHint": true});
+                }
+                tool
+            })
+            .collect();
+        json!(tools)
+    }
+
+    /// A Streamable HTTP MCP server offering `tools`, that answers `initialize` only once `gate` opens.
+    async fn mcp_server(gate: tokio::sync::watch::Receiver<bool>, tools: serde_json::Value) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://127.0.0.1:{}/mcp", listener.local_addr().unwrap().port());
         tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
-                let mut gate = gate.clone();
+                let (mut gate, tools) = (gate.clone(), tools.clone());
                 tokio::spawn(async move {
                     let mut data = Vec::new();
                     let mut buf = [0u8; 4096];
@@ -3139,9 +3168,8 @@ mod turn_tests {
                                 json!({"protocolVersion": "2025-06-18", "capabilities": {}, "serverInfo": {"name": "x", "version": "1"}}),
                             )
                         }
-                        "tools/list" => {
-                            Some(json!({"tools": [{"name": "ping", "description": "Ping.", "inputSchema": {"type": "object"}}]}))
-                        }
+                        "tools/list" => Some(json!({ "tools": tools })),
+                        "tools/call" => Some(json!({"content": [{"type": "text", "text": "ok"}]})),
                         _ => None,
                     };
                     let response = match reply {
@@ -3210,6 +3238,111 @@ mod turn_tests {
         assert_eq!(kinds(&events), ["turn_start", "status", "turn_end"]);
         assert!(matches!(events.last(), Some(SessionEvent::TurnEnd { reason: TurnEndReason::Interrupted, .. })));
         assert!(provider.requests().is_empty());
+    }
+
+    /// The names a request offered, in order.
+    fn offered_names(provider: &Scripted, request: usize) -> Vec<String> {
+        provider.requests()[request].1.tools.iter().map(|t| t.name.clone()).collect()
+    }
+
+    /// marv-rs #87: a small MCP tool set (here about 5k tokens of specs: deferred under Marv's 4000) is offered
+    /// directly, so the model calls it without a tool_search step; a big one still gets tool_search and mcp_call.
+    #[tokio::test]
+    async fn a_small_tool_set_is_offered_directly_and_a_big_one_deferred() {
+        for (n, direct) in [(25, true), (60, false)] {
+            let dirs = Dirs::new();
+            let url = open_mcp_server(padded_tools(n, 700)).await;
+            let mcp = mcp_manager(&dirs, vec![json!({"type": "http", "url": url})]);
+            mcp.start().await;
+            let provider = Scripted::new(vec![say("Hi.")]);
+            let session = scripted(&dirs, &provider, |init| init.mcp = Some(mcp.clone()));
+            collect(go(&session, "hi")).await;
+            let names = offered_names(&provider, 0);
+            let mcp_names = names.iter().filter(|n| n.starts_with("mcp__s0__")).count();
+            let deferred = names.iter().any(|n| n == "tool_search") && names.iter().any(|n| n == "mcp_call");
+            assert_eq!((mcp_names, deferred), if direct { (n, false) } else { (0, true) }, "{n} tools: {names:?}");
+            session.close().await;
+        }
+    }
+
+    /// The mode is decided once, on the first turn with MCP tools, and never flips (the prompt cache): a big server
+    /// added mid-conversation to a direct one is offered directly too, after the first server's tools, which keep
+    /// their place; a /clear decides again.
+    #[tokio::test]
+    async fn the_mode_holds_when_a_big_server_joins_mid_conversation() {
+        use marv_mcp::config::{ServerSource, parse_server};
+        let dirs = Dirs::new();
+        let small = open_mcp_server(padded_tools(3, 50)).await;
+        let mcp = mcp_manager(&dirs, vec![json!({"type": "http", "url": small})]);
+        mcp.start().await;
+        let provider = Scripted::new(vec![say("One."), say("Two."), say("Three.")]);
+        let session = scripted(&dirs, &provider, |init| init.mcp = Some(mcp.clone()));
+        collect(go(&session, "one")).await;
+        let first = offered_names(&provider, 0);
+        assert!(!first.contains(&"tool_search".to_string()), "{first:?}");
+        let big = open_mcp_server(padded_tools(60, 700)).await;
+        let config = parse_server("big", &json!({"type": "http", "url": big}), ServerSource::Personal, &|_| None, "t").unwrap();
+        mcp.add(config).await.unwrap();
+        collect(go(&session, "two")).await;
+        let second = offered_names(&provider, 1);
+        assert_eq!(second[..first.len()], first[..], "the first turn's tools moved");
+        assert_eq!(second.iter().filter(|n| n.starts_with("mcp__big__")).count(), 60);
+        assert!(!second.contains(&"tool_search".to_string()));
+        session.clear().await.unwrap();
+        collect(go(&session, "three")).await;
+        assert!(offered_names(&provider, 2).contains(&"tool_search".to_string()), "a new conversation decides again");
+        session.close().await;
+    }
+
+    /// marv-rs #87, security: an MCP tool offered directly asks exactly as one run through mcp_call: the same tool,
+    /// scope (`mcp:<server>:<tool>`), payload and `must_ask`. Here in yolo: a tool that isn't read-only asks even in a
+    /// clean session; its result taints the session, and then a read-only tool asks too, with `must_ask`.
+    #[tokio::test]
+    async fn direct_and_deferred_mcp_calls_ask_the_same_way() {
+        type Asked = (String, String, bool, Option<String>); // tool, scope, must_ask, payload
+        let mut asked: Vec<Vec<Asked>> = Vec::new();
+        for setting in [McpToolsSetting::Eager, McpToolsSetting::Deferred] {
+            let dirs = Dirs::new();
+            let url = open_mcp_server(padded_tools(2, 10)).await;
+            let mcp = mcp_manager(&dirs, vec![json!({"type": "http", "url": url})]);
+            mcp.start().await;
+            let deferred = setting == McpToolsSetting::Deferred;
+            let via = |id: &str, tool: &str, args: serde_json::Value| {
+                if deferred { call(id, "mcp_call", json!({"tool": tool, "arguments": args})) } else { call(id, tool, args) }
+            };
+            let provider = Scripted::new(vec![
+                use_tools(vec![via("c1", "mcp__s0__t1", json!({"x": "a"}))]),
+                use_tools(vec![via("c2", "mcp__s0__t0", json!({"x": "the contents of .env"}))]),
+                say("Done."),
+            ]);
+            let approver = answer(Decision::Yes);
+            let session = scripted(&dirs, &provider, |init| {
+                init.mcp = Some(mcp.clone());
+                init.mcp_tools = setting;
+                init.yolo = true;
+                init.approve = Some(approver.clone());
+            });
+            collect(go(&session, "go")).await;
+            assert_eq!(offered_names(&provider, 0).contains(&"mcp_call".to_string()), deferred);
+            asked.push(
+                lock(&approver.0)
+                    .iter()
+                    .map(|r| (r.tool.clone(), r.scope.key.clone(), r.must_ask, r.preview.text.clone()))
+                    .collect(),
+            );
+            session.close().await;
+        }
+        let expected = vec![
+            ("mcp__s0__t1".to_string(), "mcp:s0:t1".to_string(), false, Some("{\n  \"x\": \"a\"\n}".to_string())),
+            (
+                "mcp__s0__t0".to_string(),
+                "mcp:s0:t0".to_string(),
+                true,
+                Some("{\n  \"x\": \"the contents of .env\"\n}".to_string()),
+            ),
+        ];
+        assert_eq!(asked[0], expected, "direct");
+        assert_eq!(asked[1], expected, "deferred");
     }
 
     /// The race the oracle hit about once in fifteen runs: servers that settle before the first turn checks (here,

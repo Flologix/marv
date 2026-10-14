@@ -205,6 +205,27 @@ async fn the_oracles_25_tool_tracker_over_http() {
     assert_eq!((add.kind(false), add.kind(true)), (ToolKind::Read, ToolKind::Egress));
 }
 
+/// marv-rs #87: the tracker (25 tools, about 4.7k tokens of specs) is offered directly in `auto` mode: deferring
+/// it cost a `tool_search` step per tool group for a prompt that is small anyway. Under Marv's old 4000-token limit
+/// it was deferred.
+#[tokio::test]
+async fn the_trackers_25_tools_are_offered_directly() {
+    use marv_mcp::deferred::{DEFER_TOKENS, McpMode, McpToolsSetting, choose_mode};
+    let (dir, root) = (temp_dir("tracker-direct"), temp_dir("root"));
+    let server = tracker_server(&dir).await;
+    let m = manager(vec![remote("tracker", &format!("{}/mcp", server.base()), json!({}))], Opts::new(root.clone()));
+    m.start().await;
+    let specs = m.specs();
+    assert_eq!(specs.len(), 25);
+    let choice = choose_mode(McpToolsSetting::Auto, &specs, Some(128_000));
+    assert!(choice.spec_tokens > 4000 && (choice.spec_tokens as f64) < DEFER_TOKENS, "{choice:?}");
+    assert_eq!(choice.mode, McpMode::Eager);
+    m.close().await;
+    for d in [dir, root] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
 #[tokio::test]
 async fn a_tool_list_that_never_ends_doesnt_hang_startup() {
     let paging = config("paging", ServerSource::Personal, json!({"command": FIXTURE, "args": ["paging"]}));
