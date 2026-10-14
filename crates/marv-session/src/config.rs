@@ -89,6 +89,8 @@ pub struct FileConfig {
     pub checkpoints: Option<bool>,
     pub mcp_tools: Option<McpToolsSetting>,
     pub max_steps: Option<MaxStepsSetting>,
+    /// `mesh.wake` (marv-rs #78): a message on a wired inbox starts a turn while the TUI is idle (default off).
+    pub mesh_wake: Option<bool>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -165,6 +167,22 @@ impl FileConfig {
                 }
             },
         };
+        // `"mesh": {"wake": true}`: the mesh's settings, one object (only `wake` so far).
+        let mesh_wake = match map.get("mesh") {
+            None | Some(Value::Null) => None,
+            Some(Value::Object(mesh)) => match mesh.get("wake") {
+                None | Some(Value::Null) => None,
+                Some(Value::Bool(b)) => Some(*b),
+                Some(_) => {
+                    problems.push("mesh.wake: expected a boolean".into());
+                    None
+                }
+            },
+            Some(_) => {
+                problems.push("mesh: expected an object, like {\"wake\": true}".into());
+                None
+            }
+        };
         let config = Self {
             provider,
             model: string("model", &mut problems),
@@ -180,6 +198,7 @@ impl FileConfig {
             checkpoints: boolean("checkpoints", &mut problems),
             mcp_tools,
             max_steps,
+            mesh_wake,
         };
         if problems.is_empty() { Ok(config) } else { Err(problems.join("\n")) }
     }
@@ -212,6 +231,7 @@ impl FileConfig {
                 MaxStepsSetting::Every(n) => Value::from(n),
             }),
         );
+        put("mesh", self.mesh_wake.map(|wake| serde_json::json!({ "wake": wake })));
         Value::Object(map)
     }
 }
@@ -241,6 +261,8 @@ pub struct Config {
     pub mcp_tools: McpToolsSetting,
     /// 0 never asks; 1 can't happen. Subagents' own hard limit (50) is not touched by 0.
     pub max_steps: u32,
+    /// `mesh.wake` (#78): off unless the file turns it on.
+    pub mesh_wake: bool,
 }
 
 impl Config {
@@ -328,6 +350,7 @@ pub fn resolve_config(file: Option<&FileConfig>, env: &Env) -> Config {
         checkpoints: file.and_then(|f| f.checkpoints).unwrap_or(true),
         mcp_tools: file.and_then(|f| f.mcp_tools).unwrap_or_default(),
         max_steps: max_steps_from_env(env.get("MARV_MAX_STEPS").map(String::as_str), file_steps),
+        mesh_wake: file.and_then(|f| f.mesh_wake).unwrap_or(false),
     }
 }
 
@@ -496,6 +519,19 @@ mod tests {
     }
 
     #[test]
+    fn mesh_wake_is_off_unless_the_file_turns_it_on() {
+        assert!(!resolve_config(None, &Env::new()).mesh_wake);
+        assert!(!resolve_config(Some(&file()), &Env::new()).mesh_wake);
+        let f = FileConfig::from_value(&json!({"provider": "openrouter", "mesh": {"wake": true}})).unwrap();
+        assert_eq!(f.mesh_wake, Some(true));
+        assert!(resolve_config(Some(&f), &Env::new()).mesh_wake);
+        assert_eq!(f.to_value()["mesh"], json!({"wake": true}));
+        assert!(file().to_value().get("mesh").is_none(), "unset stays out of the file");
+        assert!(FileConfig::from_value(&json!({"mesh": {"wake": "yes"}})).is_err());
+        assert!(FileConfig::from_value(&json!({"mesh": true})).is_err());
+    }
+
+    #[test]
     fn a_provider_marv_no_longer_has_is_dropped_so_setup_opens() {
         let f = FileConfig::from_value(&json!({"provider": "echo", "apiKey": "sk-or-keep"})).unwrap();
         assert_eq!(f, FileConfig { api_key: Some("sk-or-keep".into()), ..FileConfig::default() });
@@ -549,7 +585,12 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("marv-config-{}-{}", std::process::id(), marv_fs::random_hex()));
         let store = ConfigStore::new(&dir.join("nested"));
         assert!(store.load().unwrap().is_none());
-        let f = FileConfig { model: Some("openai/gpt-5.6-sol".into()), max_steps: Some(MaxStepsSetting::Off), ..file() };
+        let f = FileConfig {
+            model: Some("openai/gpt-5.6-sol".into()),
+            max_steps: Some(MaxStepsSetting::Off),
+            mesh_wake: Some(true),
+            ..file()
+        };
         store.save(&f).unwrap();
         assert_eq!(store.load().unwrap(), Some(f));
         assert_eq!(std::fs::metadata(&store.path).unwrap().permissions().mode() & 0o777, 0o600);

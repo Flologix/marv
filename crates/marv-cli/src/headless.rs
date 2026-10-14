@@ -15,6 +15,8 @@
 //! everything else: refused as an error the model can work around, not a decline that ends the turn. With
 //! `--approve`, the step limit still stops: nobody can say "keep going". marv-rs: `--approve mesh:<receptacle>`
 //! pre-approves wires to that receptacle (docs/MESH.md); it never covers anything else, and yolo never wires.
+//! A mesh message never starts a turn here (`mesh.wake`, #78, is the TUI's): the one turn reads what's in the inbox
+//! when it starts and between steps, and anything later waits for whoever runs the next one.
 //!
 //! **Bug fix (Marv 0.3.0):** Marv's text output wrote the model's reply to the terminal raw, so a reply could carry
 //! escape sequences (OSC 52 clipboard writes, title changes, cursor moves) or bidi overrides. Text output and stderr
