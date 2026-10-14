@@ -168,6 +168,8 @@ async fn start_asks_in_yolo_always_covers_that_command_only_logs_list_stop_never
         "{}",
         started.result.output
     );
+    // Not a one-shot session: the process outlives the reply, so no "it ends with the run" (#86).
+    assert!(!started.result.output.contains(marv_tools::process::ONE_SHOT_NOTE), "{}", started.result.output);
     assert!(stopped.result.output.contains("Stopped a"));
     assert_eq!(stopped.approval, ApprovalRecord::None);
     assert_eq!(again.approval, ApprovalRecord::Yes); // from "always"
@@ -277,7 +279,7 @@ async fn processes_false_and_no_prompt_paragraph_or_tool_without_the_door() {
 
 #[tokio::test]
 async fn an_sdk_session_that_started_a_server_leaves_nothing_running_after_close() {
-    // As marv -p runs.
+    // As marv -p runs: one-shot (headless.rs), so the start tells the model the server ends with the run (#86).
     require_bwrap!();
     let dirs = Dirs::new("ptool-sdk");
     support::options(&dirs, 0); // the relay fixture
@@ -289,11 +291,13 @@ async fn an_sdk_session_that_started_a_server_leaves_nothing_running_after_close
     ]);
     let session = SessionBuilder::new(&dirs.root, ProviderOption::Custom(provider.clone()))
         .approve(Asked::new(Decision::Yes))
+        .one_shot(true)
         .build()
         .await
         .unwrap();
     let runs = results(&turn(&session, "start it").await);
     assert!(runs[0].result.output.contains(&format!("http://localhost:{port}")), "{}", runs[0].result.output);
+    assert!(runs[0].result.output.contains(marv_tools::process::ONE_SHOT_NOTE), "{}", runs[0].result.output);
     assert!(!pgrep(&marker).is_empty());
     session.close().await;
     assert!(pgrep(&marker).is_empty());
