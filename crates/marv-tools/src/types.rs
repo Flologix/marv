@@ -372,6 +372,9 @@ pub struct ToolContext {
     /// The running processes' forwarded ports: a sandboxed bash command (without network) gets a relay to each, so
     /// its `curl localhost:<port>` reaches the session's own servers. Subagents get this too (but not `processes`).
     pub forwards: Option<Arc<dyn ProcessForwards>>,
+    /// This session's folder of saved outputs (#61, `~/.marv/tool-output/<session>`): a cut result is saved there
+    /// whole, and `read_file` and `grep` may read it (only it, read-only). None: cuts aren't saved.
+    pub tool_output: Option<PathBuf>,
 }
 
 impl ToolContext {
@@ -399,6 +402,7 @@ impl ToolContext {
             doors: Doors::default(),
             processes: None,
             forwards: None,
+            tool_output: None,
         }
     }
 
