@@ -33,12 +33,15 @@
 //! - #64 (marv-rs, not in Marv yet): a drop after text arrived, before any tool call, continues
 //!   from the partial text like [`crate::openai_compat`] does; jitter on the backoff waits too.
 //!   Tool calls arrive whole but are only sent with the `done` line, so a drop after one starts over.
+//! - #90 (marv-rs): the `done` line carries usage and `done_reason` together, so the Usage event
+//!   sends both ([`marv_core::ReplyEnd`]); with `StreamOptions::debug_raw`, the NDJSON lines are
+//!   collected and sent with them (the trajectory's `request` record).
 
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use futures::StreamExt;
-use marv_core::{ChatTurn, ProviderEvent, ToolCall, ToolSpec, Usage};
+use marv_core::{ChatTurn, ProviderEvent, ReplyEnd, ToolCall, ToolSpec, Usage};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -303,14 +306,29 @@ pub struct LineAssembler {
     calls: Vec<ToolCall>,
     reason: Option<String>,
     complete: bool,
+    /// #90: the raw response lines, when debug recording is on (`with_debug`); sent on the
+    /// Usage event at the `done` line.
+    raw: Option<Vec<String>>,
     /// The prompt count of the `done` line, for [`Measured::record`].
     pub prompt_eval_count: Option<u64>,
 }
 
 impl LineAssembler {
+    pub fn new() -> Self {
+        Self::with_debug(false)
+    }
+
+    /// `debug_raw` (#90): also collect the raw response lines (sent in the Usage event).
+    pub fn with_debug(debug_raw: bool) -> Self {
+        Self { raw: debug_raw.then(Vec::new), ..Default::default() }
+    }
+
     /// Handles one line. Returns `false` when the stream must stop here (an error event was
     /// emitted). A line that isn't valid JSON is `Err` (treated like a dropped connection: retry).
     pub fn on_line(&mut self, line: &str, out: &mut Vec<ProviderEvent>) -> Result<bool, serde_json::Error> {
+        if let Some(raw) = &mut self.raw {
+            raw.push(line.to_string());
+        }
         let line: Line = serde_json::from_str(line)?;
         if let Some(error) = line.error {
             out.push(ProviderEvent::Error(format!("{LABEL}: {error}")));
@@ -333,12 +351,19 @@ impl LineAssembler {
             self.complete = true;
             self.reason = line.done_reason;
             self.prompt_eval_count = line.prompt_eval_count;
-            out.push(ProviderEvent::Usage(Usage {
-                prompt_tokens: line.prompt_eval_count.unwrap_or(0),
-                completion_tokens: line.eval_count.unwrap_or(0),
-                cached_tokens: None,
-                cost: None,
-            }));
+            out.push(ProviderEvent::Usage(
+                Usage {
+                    prompt_tokens: line.prompt_eval_count.unwrap_or(0),
+                    completion_tokens: line.eval_count.unwrap_or(0),
+                    cached_tokens: None,
+                    cost: None,
+                },
+                // The done line carries usage and done_reason together (#90); the raw lines join them.
+                ReplyEnd {
+                    finish_reason: self.reason.clone(),
+                    raw_response: self.raw.take().as_ref().map(|raw| raw.join("\n")),
+                },
+            ));
         }
         Ok(true)
     }
@@ -450,8 +475,9 @@ impl Provider for OllamaProvider {
     fn stream(&self, history: &[ChatTurn], options: StreamOptions) -> EventStream {
         // Copied now, so the caller can append to its history while the reply streams.
         let outgoing = Outgoing { history: history.to_vec(), system: options.system, tools: options.tools, note: None };
+        let debug_raw = options.debug_raw;
         let (client, shared, adapter, cancel) = (self.client.clone(), self.shared.clone(), self.options.clone(), options.cancel);
-        channel_stream(move |emit| run(client, shared, adapter, outgoing, cancel, emit))
+        channel_stream(move |emit| run(client, shared, adapter, outgoing, cancel, debug_raw, emit))
     }
 }
 
@@ -501,6 +527,7 @@ async fn run(
     o: OllamaOptions,
     mut outgoing: Outgoing,
     cancel: CancellationToken,
+    debug_raw: bool,
     emit: Emit,
 ) {
     let base_url = normalize_base_url(&o.base_url);
@@ -543,7 +570,7 @@ async fn run(
         let status = response.status().as_u16();
         if response.status().is_success() {
             // Stream the NDJSON body. If the connection drops mid-stream, retry (#64: or continue).
-            match read_reply(response, &shared, chars, &cancel, &emit).await {
+            match read_reply(response, &shared, chars, &cancel, debug_raw, &emit).await {
                 Read::Finished => return,
                 Read::Degenerate { discarded } => {
                     if !after_degenerate(LABEL, discarded, &mut degenerate_retries, &mut kept, &mut outgoing.note, &emit) {
@@ -587,8 +614,15 @@ async fn run(
 }
 
 /// Parses the NDJSON body, sending events as they come.
-async fn read_reply(response: reqwest::Response, shared: &Shared, chars: usize, cancel: &CancellationToken, emit: &Emit) -> Read {
-    let mut assembler = LineAssembler::default();
+async fn read_reply(
+    response: reqwest::Response,
+    shared: &Shared,
+    chars: usize,
+    cancel: &CancellationToken,
+    debug_raw: bool,
+    emit: &Emit,
+) -> Read {
+    let mut assembler = LineAssembler::with_debug(debug_raw);
     let mut guard = DegenerateGuard::default();
     let mut decoder = NdjsonDecoder::default();
     let mut text = String::new();
@@ -758,10 +792,42 @@ mod tests {
             vec![
                 ProviderEvent::ThinkingDelta("hm".into()),
                 ProviderEvent::TextDelta("hi".into()),
-                ProviderEvent::Usage(Usage { prompt_tokens: 10, completion_tokens: 2, cached_tokens: None, cost: None }),
+                ProviderEvent::Usage(
+                    Usage { prompt_tokens: 10, completion_tokens: 2, cached_tokens: None, cost: None },
+                    ReplyEnd { finish_reason: Some("stop".into()), raw_response: None }
+                ),
                 ProviderEvent::ToolCall(ToolCall { id: "call_0".into(), name: "glob".into(), arguments: r#"{"p":1}"#.into() }),
                 ProviderEvent::Done { reason: Some("stop".into()) },
             ]
+        );
+    }
+
+    // #90: with debug recording on, the raw NDJSON lines ride the Usage event; without, raw_response stays None.
+    #[test]
+    fn the_raw_lines_are_collected_only_behind_the_debug_flag() {
+        let lines = [r#"{"message":{"content":"hi"}}"#, r#"{"done":true,"done_reason":"stop","prompt_eval_count":10,"eval_count":2}"#];
+        let mut off = LineAssembler::new();
+        let mut out = Vec::new();
+        for line in &lines {
+            assert!(off.on_line(line, &mut out).unwrap());
+        }
+        off.finish(&mut out).unwrap();
+        assert!(out.iter().all(|e| !matches!(e, ProviderEvent::Usage(_, end) if end.raw_response.is_some())));
+
+        let mut on = LineAssembler::with_debug(true);
+        let mut out = Vec::new();
+        for line in &lines {
+            assert!(on.on_line(line, &mut out).unwrap());
+        }
+        on.finish(&mut out).unwrap();
+        let end =
+            out.iter().find_map(|e| if let ProviderEvent::Usage(_, end) = e { Some(end) } else { None }).expect("the Usage event");
+        assert_eq!(
+            end,
+            &ReplyEnd {
+                finish_reason: Some("stop".into()),
+                raw_response: Some(format!("{}\n{}", lines[0], lines[1]))
+            }
         );
     }
 

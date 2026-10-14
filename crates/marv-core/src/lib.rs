@@ -106,7 +106,9 @@ pub enum ProviderEvent {
     ToolCall(ToolCall),
     /// Opaque reasoning payload to keep on the assistant turn.
     Reasoning(Reasoning),
-    Usage(Usage),
+    /// One request's usage and how it ended (#90): the vendor's finish reason ("stop",
+    /// "tool_calls", "length"…), and, when debug recording was on, the raw response.
+    Usage(Usage, ReplyEnd),
     /// `reason` is the vendor's stop reason: "stop", "tool_calls", "length"…
     Done {
         reason: Option<String>,
@@ -164,7 +166,7 @@ pub enum StopReason {
     Loop,
 }
 
-/// What a tool hands back to the loop.
+/// How much a tool hands back to the loop.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ToolResult {
     /// What the model reads.
@@ -172,6 +174,24 @@ pub struct ToolResult {
     /// One line for the transcript ("42 lines", "exit 0").
     pub summary: Option<String>,
     pub is_error: bool,
+}
+
+/// How a request ended (#90), sent with the usage on [`ProviderEvent::Usage`]: the vendor's
+/// finish reason always (a reply that "finished" while Marv parsed no tool call out of it is
+/// what a diagnostic looks for), and the raw response only when the provider was asked to
+/// collect it (`StreamOptions::debug_raw`, `MARV_DEBUG_RAW`): the last attempt's payloads.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ReplyEnd {
+    pub finish_reason: Option<String>,
+    /// The raw response payloads (debug recording only; the prompt cache and the loop never read it).
+    pub raw_response: Option<String>,
+}
+
+impl ReplyEnd {
+    /// The end every non-debug caller records: just the vendor's finish reason.
+    pub fn reason(reason: Option<String>) -> Self {
+        Self { finish_reason: reason, raw_response: None }
+    }
 }
 
 /// How much a tool call can do, which decides approval, yolo and parallelism.

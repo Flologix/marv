@@ -923,6 +923,12 @@ impl App {
                     self.system("✻ The reply got stuck repeating itself, so Marv stopped it, dropped it, and told the model to take another approach.");
                 }
             }
+            UiEvent::AnnouncedStep { continued } => {
+                if continued {
+                    // The model said what it would do next and stopped: Marv nudged it once, like a user would.
+                    self.system("✻ The reply announced its next step but made no tool call, so Marv told the model to continue.");
+                }
+            }
             UiEvent::ToolLoop { continued } => {
                 if continued {
                     self.system("✻ The model kept making the same tool call and getting the same result, so Marv answered with a note instead of running it again.");

@@ -41,6 +41,10 @@
 //!   last request, so they say `continued` when partial text is being kept.
 //! - **#64 jitter**: backoff waits get up to [`JITTER`] (25%) added at random, so clients dropped by
 //!   one outage don't all come back at the same moment. `Retry-After` waits are taken as given.
+//! - **#90 how a request ended**: the usage chunk is held and sent with the finish reason in
+//!   [`ReplyAssembler::finish`] (the finish-reason chunk often arrives after the usage chunk),
+//!   as [`marv_core::ReplyEnd`]; the trajectory's `request` record carries both. The raw
+//!   response payloads are collected only when `StreamOptions::debug_raw` was on (`MARV_DEBUG_RAW`).
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -49,7 +53,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use futures::{FutureExt, StreamExt};
-use marv_core::{ChatTurn, ProviderEvent, RetryCause, ToolCall, ToolChoice, ToolSpec, Usage};
+use marv_core::{ChatTurn, ProviderEvent, ReplyEnd, RetryCause, ToolCall, ToolChoice, ToolSpec, Usage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -398,6 +402,12 @@ pub struct ReplyAssembler {
     complete: bool,
     /// #57: reasoning blocks in arrival order.
     reasoning: Vec<Value>,
+    /// The usage chunk, sent with the finish reason in [`Self::finish`] (#90): the usage chunk
+    /// often arrives before the finish_reason chunk, and the record wants both together.
+    usage: Option<Usage>,
+    /// #90: every `data` payload of this attempt, when debug recording is on. The last
+    /// attempt's payload list is "the raw last response" — a retried attempt starts fresh.
+    raw: Option<Vec<String>>,
     /// #64: what a dropped stream had already delivered.
     pub text_received: bool,
     /// An error the provider sent mid-stream that a fresh attempt may get past (`errors::transient`): retried like a
@@ -410,12 +420,19 @@ pub struct ReplyAssembler {
 
 impl ReplyAssembler {
     pub fn new(label: impl Into<String>) -> Self {
+        Self::with_debug(label, false)
+    }
+
+    /// `debug_raw` (#90): also collect the raw response payloads (sent in the Usage event).
+    pub fn with_debug(label: impl Into<String>, debug_raw: bool) -> Self {
         Self {
             label: label.into(),
             pending: BTreeMap::new(),
             reason: None,
             complete: false,
             reasoning: Vec::new(),
+            usage: None,
+            raw: debug_raw.then(Vec::new),
             text_received: false,
             upstream: None,
             detail_text: String::new(),
@@ -429,6 +446,11 @@ impl ReplyAssembler {
 
     /// Handles one SSE event's data, pushing what it yields onto `out`.
     pub fn on_data(&mut self, data: &str, out: &mut Vec<ProviderEvent>) -> Flow {
+        // #90: the payload itself is the raw response when debug recording is on (even an
+        // unparsable one: that's exactly what the recording is for).
+        if let Some(raw) = &mut self.raw {
+            raw.push(data.to_string());
+        }
         if data == "[DONE]" {
             self.complete = true;
             return Flow::Done;
@@ -450,12 +472,13 @@ impl ReplyAssembler {
             return Flow::Stop;
         }
         if let Some(u) = chunk.usage {
-            out.push(ProviderEvent::Usage(Usage {
+            // Held for finish(): the finish reason may still arrive in a later chunk.
+            self.usage = Some(Usage {
                 prompt_tokens: u.prompt_tokens,
                 completion_tokens: u.completion_tokens,
                 cached_tokens: u.prompt_tokens_details.and_then(|d| d.cached_tokens),
                 cost: u.cost,
-            }));
+            });
         }
         let Some(choice) = chunk.choices.into_iter().next() else { return Flow::Continue };
         if let Some(reason) = choice.finish_reason {
@@ -509,8 +532,9 @@ impl ReplyAssembler {
         Flow::Continue
     }
 
-    /// The body ended. Complete: the assembled calls (in index order), the reasoning (#57) and
-    /// `Done`. Not complete (no `[DONE]` nor `finish_reason`): [`Incomplete`], retry.
+    /// The body ended. Complete: the assembled calls (in index order), the reasoning (#57),
+    /// the usage with how the reply ended (#90), and `Done`. Not complete (no `[DONE]` nor
+    /// `finish_reason`): [`Incomplete`], retry.
     pub fn finish(self, out: &mut Vec<ProviderEvent>) -> Result<(), Incomplete> {
         if !self.complete {
             return Err(Incomplete);
@@ -523,6 +547,18 @@ impl ReplyAssembler {
         }
         if !self.reasoning.is_empty() {
             out.push(ProviderEvent::Reasoning(marv_core::Reasoning(Value::Array(self.reasoning))));
+        }
+        // Only with a usage chunk (no phantom requests for servers that don't report usage:
+        // the loop counts steps by this event). Raw recording rides on it; a server that
+        // sends no usage gives the run no request record, as before.
+        if let Some(usage) = self.usage {
+            out.push(ProviderEvent::Usage(
+                usage,
+                ReplyEnd {
+                    finish_reason: self.reason.clone(),
+                    raw_response: self.raw.as_ref().map(|raw| raw.join("\n")),
+                },
+            ));
         }
         out.push(ProviderEvent::Done { reason: self.reason });
         Ok(())
@@ -570,12 +606,13 @@ impl Provider for OpenAiCompatProvider {
             tool_choice: options.tool_choice,
             note: None,
         };
+        let debug_raw = options.debug_raw;
         let (client, mut adapter, cancel) = (self.client.clone(), self.options.clone(), options.cancel);
         if self.max_tokens_refused.load(Ordering::Relaxed) {
             adapter.max_tokens = None;
         }
         let refused = self.max_tokens_refused.clone();
-        channel_stream(move |emit| run(client, adapter, outgoing, refused, cancel, emit))
+        channel_stream(move |emit| run(client, adapter, outgoing, refused, cancel, debug_raw, emit))
     }
 }
 
@@ -665,6 +702,7 @@ async fn run(
     mut outgoing: Outgoing,
     refused: Arc<AtomicBool>,
     cancel: CancellationToken,
+    debug_raw: bool,
     emit: Emit,
 ) {
     let label = o.label.clone();
@@ -713,7 +751,7 @@ async fn run(
         let status = response.status().as_u16();
         if response.status().is_success() {
             // Stream the SSE body. If the connection drops mid-stream, retry (#64: or continue).
-            match read_reply(response, label, o.idle_timeout, &cancel, &emit).await {
+            match read_reply(response, label, o.idle_timeout, &cancel, debug_raw, &emit).await {
                 Read::Finished => return,
                 Read::Degenerate { discarded } => {
                     if !after_degenerate(label, discarded, &mut degenerate_retries, &mut kept, &mut outgoing.note, &emit) {
@@ -802,9 +840,10 @@ async fn read_reply(
     label: &str,
     idle: Option<Duration>,
     cancel: &CancellationToken,
+    debug_raw: bool,
     emit: &Emit,
 ) -> Read {
-    let mut assembler = ReplyAssembler::new(label);
+    let mut assembler = ReplyAssembler::with_debug(label, debug_raw);
     let mut guard = DegenerateGuard::default();
     let mut text = String::new();
     let mut out = Vec::new();
@@ -1078,7 +1117,10 @@ mod tests {
     }
 
     fn run(chunks: &[&str]) -> (Vec<ProviderEvent>, Result<(), Incomplete>) {
-        let mut assembler = ReplyAssembler::new("TestRouter");
+        run_with(ReplyAssembler::new("TestRouter"), chunks)
+    }
+
+    fn run_with(mut assembler: ReplyAssembler, chunks: &[&str]) -> (Vec<ProviderEvent>, Result<(), Incomplete>) {
         let mut out = Vec::new();
         for data in chunks {
             match assembler.on_data(data, &mut out) {
@@ -1147,7 +1189,60 @@ mod tests {
         ]);
         assert_eq!(
             events[0],
-            ProviderEvent::Usage(Usage { prompt_tokens: 100, completion_tokens: 5, cached_tokens: Some(80), cost: Some(0.002) })
+            ProviderEvent::Usage(Usage { prompt_tokens: 100, completion_tokens: 5, cached_tokens: Some(80), cost: Some(0.002) }, ReplyEnd::default())
+        );
+    }
+
+    // #90: the finish reason rides the Usage event, even when the usage chunk arrives before
+    // the finish_reason chunk (OpenRouter's order).
+    #[test]
+    fn usage_carries_the_finish_reason() {
+        let (events, _) = run(&[
+            r#"{"choices":[{"delta":{"content":"Now checking issue #7 before commenting:"}}]}"#,
+            r#"{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":5}}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            "[DONE]",
+        ]);
+        assert_eq!(
+            events[1],
+            ProviderEvent::Usage(
+                Usage { prompt_tokens: 100, completion_tokens: 5, cached_tokens: None, cost: None },
+                ReplyEnd { finish_reason: Some("stop".into()), raw_response: None }
+            )
+        );
+        assert_eq!(events[2], ProviderEvent::Done { reason: Some("stop".into()) });
+    }
+
+    // #90: the raw response payloads are collected only when the stream was asked to, and are
+    // what the debug flag's request record gets ("the raw last response" = the last attempt's).
+    #[test]
+    fn the_raw_response_is_collected_only_behind_the_debug_flag() {
+        let chunks = [
+            r#"{"choices":[{"delta":{"content":"hi"}}]}"#,
+            r#"{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":5}}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            "[DONE]",
+        ];
+        let (off, _) = run_with(ReplyAssembler::new("T"), &chunks);
+        assert_eq!(
+            off,
+            [
+                ProviderEvent::TextDelta("hi".into()),
+                ProviderEvent::Usage(
+                    Usage { prompt_tokens: 100, completion_tokens: 5, cached_tokens: None, cost: None },
+                    ReplyEnd { finish_reason: Some("stop".into()), raw_response: None }
+                ),
+                ProviderEvent::Done { reason: Some("stop".into()) }
+            ]
+        );
+        let (on, _) = run_with(ReplyAssembler::with_debug("T", true), &chunks);
+        let last = on.iter().find_map(|e| if let ProviderEvent::Usage(_, end) = e { Some(end) } else { None }).unwrap();
+        assert_eq!(
+            last,
+            &ReplyEnd {
+                finish_reason: Some("stop".into()),
+                raw_response: Some(format!("{}\n{}\n{}\n{}", chunks[0], chunks[1], chunks[2], chunks[3]))
+            }
         );
     }
 

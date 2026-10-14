@@ -140,6 +140,12 @@ def run_marv(ws, prompt, servers, logdir, a):
         for e in parse_lines(traj.read_text()):
             if e.get("type") == "tool" and e.get("isError"): r["toolErrors"] += 1
             if e.get("type") == "agent_end" and e.get("agent") == "main": r["agentMs"] = e.get("ms")
+            # #90: the model said what it would do next, made no tool call, and Marv said continue.
+            if e.get("type") == "announced_step": r["announcedSteps"] = r.get("announcedSteps", 0) + 1
+            # #90: how the model's requests ended, for the misparse diagnosis (finishReason null → "none").
+            if e.get("type") == "request":
+                r.setdefault("finishReasons", Counter())[e.get("finishReason") or "none"] += 1
+    r["finishReasons"] = dict(r.get("finishReasons", {}))
     return r
 
 
@@ -244,19 +250,27 @@ def report(dirs):
     for r in rows: groups[(r["harness"], r.get("model", ""))].append(r)
     med = lambda xs: sorted(xs)[len(xs) // 2] if xs else 0
     print(f"{'harness':8} {'model':28} {'runs':>4} {'pass':>5} {'med s':>6} {'req':>5} {'tools':>6} {'tool err':>8} "
-          f"{'in tok':>8} {'cached':>7} {'out tok':>8} {'$/run':>7}")
+          f"{'ann step':>8} {'in tok':>8} {'cached':>7} {'out tok':>8} {'$/run':>7}")
     for (h, m), rs in sorted(groups.items()):
         n = len(rs)
         avg = lambda k: sum(r.get(k) or 0 for r in rs) / n
         prompt = sum(r.get("promptTokens") or 0 for r in rs)
         print(f"{h:8} {m:28} {n:4} {sum(r['pass_'] for r in rs) / n:5.0%} {med([r['ms'] / 1000 for r in rs]):6.1f} "
               f"{avg('requests'):5.1f} {sum(sum(r['tools'].values()) for r in rs) / n:6.1f} {sum(r.get('toolErrors', 0) for r in rs):8} "
+              f"{sum(r.get('announcedSteps', 0) for r in rs):8} "
               f"{avg('promptTokens'):8.0f} {(sum(r.get('cachedTokens') or 0 for r in rs) / prompt if prompt else 0):7.0%} "
               f"{avg('completionTokens'):8.0f} {avg('cost'):7.4f}")
     print("\nTool calls:")
     for (h, m), rs in sorted(groups.items()):
         c = Counter()
         for r in rs: c.update(r["tools"])
+        print(f"  {h} {m}: " + ", ".join(f"{k} {v}" for k, v in c.most_common()))
+    # #90: how the model's requests ended. "none" (no finish reason at all), or a reason that
+    # promises a tool call on a turn that ended "end", is what a misparse looks like.
+    print("\nFinish reasons:")
+    for (h, m), rs in sorted(groups.items()):
+        c = Counter()
+        for r in rs: c.update(r.get("finishReasons") or {})
         print(f"  {h} {m}: " + ", ".join(f"{k} {v}" for k, v in c.most_common()))
     print("\nPer task (passes/runs, median seconds):")
     keys = sorted(groups)

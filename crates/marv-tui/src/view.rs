@@ -529,6 +529,10 @@ pub enum UiEvent {
     TextLoop {
         continued: bool,
     },
+    /// #90: the reply announced its next step but made no tool call; Marv said continue.
+    AnnouncedStep {
+        continued: bool,
+    },
     ToolLoop {
         continued: bool,
     },

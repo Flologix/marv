@@ -51,6 +51,10 @@ pub struct StreamOptions {
     pub tool_choice: ToolChoice,
     /// Cancelled by ctrl+c to stop the reply and the HTTP request behind it.
     pub cancel: CancellationToken,
+    /// #90: when on, the adapter collects the raw response payloads and sends them back on the
+    /// [`marv_core::ProviderEvent::Usage`] event, for the trajectory's `request` record. Off by
+    /// default; the session turns it on from `MARV_DEBUG_RAW`.
+    pub debug_raw: bool,
 }
 
 pub trait Provider: Send + Sync {

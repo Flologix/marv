@@ -76,3 +76,7 @@ Try it: `OPENROUTER_API_KEY=… cargo run -p marv-provider --example chat -- "hi
   - `DROPPED_STREAM_NOTE` is duplicated from `marv_agent` (agent depends on provider). `marv_agent` should re-export the provider's.
   - **Jitter:** backoff waits get up to 25% added at random (`openai_compat::JITTER`, `jittered`); `Retry-After` waits are taken as given.
   - Still planned: about 6 attempts for 429/overloaded, and a longer `Retry-After`. Marv's tests expect 3 attempts for 429, so this waits for the spec.
+- **#90 how a request ended (marv-rs):**
+  - `ProviderEvent::Usage` is `(Usage, marv_core::ReplyEnd)`: the vendor's finish reason always, `raw_response` only when `StreamOptions::debug_raw` was on (`MARV_DEBUG_RAW`, the trajectory's `request` record carries both).
+  - OpenRouter: the usage chunk is held and emitted in `ReplyAssembler::finish`, after the tool calls — the finish-reason chunk often arrives after the usage chunk, and the record wants both together. Only with a usage chunk (no phantom requests for servers that don't report usage). Ollama: the `done` line carries usage and `done_reason` together, so it emits there.
+  - "The raw last response" is the last attempt's payloads (OpenRouter: the SSE `data` payloads; Ollama: the NDJSON lines) — a retried attempt starts fresh, so a dropped attempt's partial payloads are discarded with it. An unparsable payload is collected too: that's what the recording is for.

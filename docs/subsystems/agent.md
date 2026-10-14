@@ -9,6 +9,7 @@ Spec: Marv `CLAUDE.md` bullets **Agent loop** and **Compaction**, `src/agent.ts`
 | Marv (TS) | Rust module | Status |
 |---|---|---|
 | `src/agent.ts` | `agent.rs` | Constants and notes (verbatim) ported. ported, all of `tests/agent.test.ts` ported (against `ScriptedProvider` and a fake `ToolRunner`), plus tests for #58 default grouping, #59 wrap-up and `on_full` |
+| — (marv-rs #90) | `announce.rs` | marv-rs only: the announced-next-step detector (`announces_next_step`) and `ANNOUNCED_STEP_NOTE`. A plain answer that announces its next step ("Now checking issue #7 before commenting:") but makes no tool call ends the run halfway; the loop says "continue" once per turn (a second announcement ends the run, still logged). Conservative on purpose: a dangling `:` at the reply's end, a last sentence starting "let me …" (never "let me know …"), or "now <verb>ing" from a closed verb list; questions, summaries and code blocks never fire. See the `agent.rs` header bullet |
 | `src/repetition.ts` | `repetition.rs` | ported, all tests ported |
 | `src/compact.ts` | `compact.rs` | `summarize`, `summary_request`, `compacted_history` (with the open plan's text appended, #21: it takes the text, not the items, as marv-agent doesn't depend on marv-tools), `MID_TURN_NOTE` ported, tests ported; v2 (#63) helpers todo |
 | `tests/fake-provider.ts` | `testing.rs` (`ScriptedProvider`, test-only) | ported (scripted replies + recorded requests) |
@@ -81,6 +82,9 @@ pub type RewriteCall = Arc<dyn Fn(&ToolCall) -> Option<ToolCall> + Send + Sync>;
   - `LoopEvent::Retry { continued }` is in place. When the provider signals a continuable drop, keep the partial text as the assistant turn and append `DROPPED_STREAM_NOTE` instead of discarding it.
   - **This needs `marv_core::ProviderEvent::Retry` to gain `continued: bool`** (a marv-core change, still to request).
   - `Retry` also carries `cause: marv_core::RetryCause` (#88 stall, #96 degenerate reply); the loop passes it on in `LoopEvent::Retry` for the trajectory and otherwise treats every cause the same.
+- **#90 announced next step, no tool call (marv-rs, done):**
+  - `announce::announces_next_step` runs when a plain answer (no calls, not aborted) is about to end the run in `run_calls`. It fires at most once per turn (`LoopState::announced`): the first announce­ment pushes `ANNOUNCED_STEP_NOTE` and takes one more step; a second emits `AnnouncedStep { continued: false }` and ends the run as before — both logged (`LoopEvent::AnnouncedStep`, the TUI's `✻` line, the trajectory's `announced_step` record).
+  - It only looks at the reply's last line: a dangling `:`, a last sentence starting "let me " (not "let me know "), or "now " + a closed progressive-verb list. Questions, summaries (long last sentences), odd fence counts (a reply cut inside a code block) never fire; the table tests pin both sides.
 - **#63 compaction v2 (spec first; nothing is settled):**
   - `V2_SECTIONS` (structured template), `V2_TAIL_TOKENS` = 15k (verbatim tail), `V2_OVERFLOW_TARGETS` = 70/50/35%;
   - `tail_start` (never splits a call from its result) and `rolling_update_request` are todo;

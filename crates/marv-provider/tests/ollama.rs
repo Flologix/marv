@@ -99,7 +99,10 @@ async fn streams_thinking_and_text_then_usage_and_done() {
             ProviderEvent::ThinkingDelta("Hmm.".into()),
             ProviderEvent::TextDelta("Hel".into()),
             ProviderEvent::TextDelta("lo".into()),
-            ProviderEvent::Usage(Usage { prompt_tokens: 298, completion_tokens: 26, cached_tokens: None, cost: None }),
+            ProviderEvent::Usage(
+                Usage { prompt_tokens: 298, completion_tokens: 26, cached_tokens: None, cost: None },
+                marv_core::ReplyEnd { finish_reason: Some("stop".into()), raw_response: None },
+            ),
             ProviderEvent::Done { reason: Some("stop".into()) },
         ]
     );

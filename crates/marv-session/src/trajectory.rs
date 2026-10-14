@@ -153,6 +153,11 @@ pub enum TrajectoryRecord {
     McpNote { turn: String, text: String },
     /// One model request: its tokens and how long since the previous step ended; `retries`, `stalled`, `degenerate`
     /// and `discardedBytes` when it took more than one try (#88, #96).
+    /// #90: `finish_reason` is the provider's stop reason ("stop", "tool_calls", "length"…) —
+    /// a turn that ends on an announced next step with `finish_reason: "stop"` is cause 1
+    /// (the model stopped), `"tool_calls"` with no `tool` record after it is cause 2 (a call
+    /// Marv didn't parse). `raw_response` holds the raw response payloads, but only when the
+    /// run recorded with `MARV_DEBUG_RAW`.
     Request {
         #[serde(flatten)]
         who: Who,
@@ -161,6 +166,9 @@ pub enum TrajectoryRecord {
         ms: u64,
         #[serde(flatten)]
         retry: RetryRecord,
+        finish_reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        raw_response: Option<String>,
     },
     /// A finished reply, with the reasoning before it.
     Assistant {
@@ -206,6 +214,13 @@ pub enum TrajectoryRecord {
         continued: bool,
     },
     TextLoop {
+        #[serde(flatten)]
+        who: Who,
+        continued: bool,
+    },
+    /// #90: the reply announced its next step but made no tool call. `continued`: Marv told it
+    /// to go on (once per turn); a second announcement ends the run, still recorded.
+    AnnouncedStep {
         #[serde(flatten)]
         who: Who,
         continued: bool,
@@ -497,7 +512,7 @@ impl AgentRecorder {
             LoopEvent::TextDelta(_)
                 | LoopEvent::ThinkingDelta(_)
                 | LoopEvent::ToolCallDelta { .. }
-                | LoopEvent::Usage(_)
+                | LoopEvent::Usage(..)
                 | LoopEvent::Retry { .. }
                 | LoopEvent::Discarded { .. }
         );
@@ -506,7 +521,7 @@ impl AgentRecorder {
         }
         match event {
             LoopEvent::ThinkingDelta(text) => self.thinking.push_str(text),
-            LoopEvent::Usage(usage) => {
+            LoopEvent::Usage(usage, end) => {
                 self.steps += 1;
                 let retry = std::mem::take(&mut self.retry);
                 (self.sink)(TrajectoryRecord::Request {
@@ -515,6 +530,8 @@ impl AgentRecorder {
                     usage: usage.into(),
                     ms: now - self.step_start,
                     retry,
+                    finish_reason: end.finish_reason.clone(),
+                    raw_response: end.raw_response.clone(),
                 });
             }
             LoopEvent::Assistant { text } => {
@@ -579,6 +596,7 @@ impl AgentRecorder {
             }
             LoopEvent::CutOff { continued } => (self.sink)(TrajectoryRecord::CutOff { who, continued: *continued }),
             LoopEvent::TextLoop { continued } => (self.sink)(TrajectoryRecord::TextLoop { who, continued: *continued }),
+            LoopEvent::AnnouncedStep { continued } => (self.sink)(TrajectoryRecord::AnnouncedStep { who, continued: *continued }),
             LoopEvent::ToolLoop { continued } => (self.sink)(TrajectoryRecord::ToolLoop { who, continued: *continued }),
             LoopEvent::EmptyReply { next } => {
                 let next = match next {
@@ -634,7 +652,10 @@ mod tests {
         let (mut rec, out) = recorder();
         let call = ToolCall { id: "c1".into(), name: "read_file".into(), arguments: "{}".into() };
         rec.event(&LoopEvent::ThinkingDelta("hmm".into()));
-        rec.event(&LoopEvent::Usage(Usage { prompt_tokens: 10, completion_tokens: 2, cached_tokens: None, cost: None }));
+        rec.event(&LoopEvent::Usage(
+            Usage { prompt_tokens: 10, completion_tokens: 2, cached_tokens: None, cost: None },
+            marv_core::ReplyEnd { finish_reason: Some("stop".into()), raw_response: None },
+        ));
         rec.event(&LoopEvent::ToolStart { call: call.clone(), label: "a".into() });
         rec.event(&LoopEvent::ToolEnd {
             call,
@@ -649,6 +670,10 @@ mod tests {
         let types: Vec<String> =
             records.iter().map(|r| serde_json::to_value(r).unwrap()["type"].as_str().unwrap().to_string()).collect();
         assert_eq!(types, vec!["request", "assistant", "tool", "agent_end"]);
+        // #90: the request record carries the provider's finish reason.
+        let request = serde_json::to_value(&records[0]).unwrap();
+        assert_eq!((request["type"].as_str(), request["finishReason"].as_str(), request["step"].as_u64()), (Some("request"), Some("stop"), Some(1)));
+        assert!(request.get("rawResponse").is_none());
         let tool = serde_json::to_value(&records[2]).unwrap();
         assert_eq!(tool["approval"], "none");
         assert_eq!(tool["isError"], false);
@@ -661,7 +686,7 @@ mod tests {
         // #88, #96
         let (mut rec, out) = recorder();
         let retry = |continued, cause| LoopEvent::Retry { attempt: 1, max: 2, message: "m".into(), continued, cause };
-        let usage = || LoopEvent::Usage(Usage { prompt_tokens: 1, completion_tokens: 1, cached_tokens: None, cost: None });
+        let usage = || LoopEvent::Usage(Usage { prompt_tokens: 1, completion_tokens: 1, cached_tokens: None, cost: None }, marv_core::ReplyEnd::default());
         rec.event(&LoopEvent::ThinkingDelta("\n\n\n".into()));
         rec.event(&retry(false, RetryCause::Degenerate { discarded: 3 }));
         rec.event(&retry(true, RetryCause::Stalled));
@@ -690,7 +715,7 @@ mod tests {
     #[test]
     fn a_reply_without_usage_closes_its_retries_and_a_second_degenerate_reply_leaves_nothing() {
         let (mut rec, out) = recorder();
-        let usage = || LoopEvent::Usage(Usage { prompt_tokens: 1, completion_tokens: 1, cached_tokens: None, cost: None });
+        let usage = || LoopEvent::Usage(Usage { prompt_tokens: 1, completion_tokens: 1, cached_tokens: None, cost: None }, marv_core::ReplyEnd::default());
         // A retried reply from a provider that sends no usage, then a clean request.
         rec.event(&LoopEvent::Retry { attempt: 1, max: 2, message: "m".into(), continued: true, cause: RetryCause::Stalled });
         rec.event(&LoopEvent::Assistant { text: "ok".into() });
@@ -717,6 +742,25 @@ mod tests {
             !records.iter().any(|r| r["thinking"].as_str().is_some_and(|t| t.contains('\n'))),
             "the runaway reasoning isn't recorded: {records:?}"
         );
+    }
+
+    // #90: the raw response reaches the request record only when debug recording was on, and an
+    // unknown finish reason stays null (never dropped, so "why did it stop" is always answerable).
+    #[test]
+    fn the_request_record_keeps_the_debug_raw_and_an_unknown_finish_reason() {
+        let (mut rec, out) = recorder();
+        rec.event(&LoopEvent::Usage(
+            Usage::default(),
+            marv_core::ReplyEnd { finish_reason: None, raw_response: Some("{\"choices\":[{\"delta\":{}}]}".into()) },
+        ));
+        rec.event(&LoopEvent::Usage(Usage::default(), marv_core::ReplyEnd::default()));
+        let records = out.lock().unwrap();
+        let debugged = serde_json::to_value(&records[0]).unwrap();
+        assert_eq!(debugged["finishReason"], serde_json::Value::Null);
+        assert_eq!(debugged["rawResponse"], "{\"choices\":[{\"delta\":{}}]}");
+        let plain = serde_json::to_value(&records[1]).unwrap();
+        assert_eq!(plain["finishReason"], serde_json::Value::Null);
+        assert!(plain.get("rawResponse").is_none());
     }
 
     #[tokio::test]

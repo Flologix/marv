@@ -1240,6 +1240,8 @@ impl MarvSession {
 
         let mut options = AgentOptions::new(provider.clone(), history, system, specs, runner.clone(), stop.clone());
         options.max_steps = max_steps.unwrap_or(marv_agent::agent::DEFAULT_MAX_STEPS);
+        // #90: with debug recording on, the providers collect the raw response payloads for the trajectory.
+        options.debug_raw = crate::config::debug_raw();
         // Always one, even with no checks: the loop looks at the stop after `after_step`, so a stop during a mid-turn
         // compaction (on_full) ends the turn there instead of sending one more request (Marv stopped before it).
         options.after_step = Some(
@@ -1326,7 +1328,7 @@ impl MarvSession {
             let check_taint =
                 !matches!(event, LoopEvent::TextDelta(_) | LoopEvent::ThinkingDelta(_) | LoopEvent::ToolCallDelta { .. });
             match &event {
-                LoopEvent::Usage(usage) => {
+                LoopEvent::Usage(usage, _) => {
                     self.state().last = Some(*usage);
                     self.count(usage, factory.as_ref(), info.as_ref());
                 }
@@ -2406,7 +2408,7 @@ mod tests {
 mod turn_tests {
     use super::*;
     use futures::future::BoxFuture;
-    use marv_core::ProviderEvent;
+    use marv_core::{ProviderEvent, ReplyEnd};
     use marv_provider::{EventStream, ReasoningSupport, StreamOptions};
     use marv_tools::ApprovalRequest;
     use std::path::Path;
@@ -2548,7 +2550,7 @@ mod turn_tests {
         call(id, "read_file", serde_json::json!({ "path": id }))
     }
     fn used(prompt_tokens: u64) -> ProviderEvent {
-        ProviderEvent::Usage(Usage { prompt_tokens, completion_tokens: 0, cached_tokens: None, cost: None })
+        ProviderEvent::Usage(Usage { prompt_tokens, completion_tokens: 0, cached_tokens: None, cost: None }, ReplyEnd::default())
     }
     fn text_of(turn: &ChatTurn) -> &str {
         match turn {
@@ -2625,7 +2627,7 @@ mod turn_tests {
             SessionEvent::Loop(LoopEvent::TextDelta(_)) => "text_delta",
             SessionEvent::Loop(LoopEvent::Assistant { .. }) => "assistant",
             SessionEvent::Loop(LoopEvent::Done(_)) => "done",
-            SessionEvent::Loop(LoopEvent::Usage(_)) => "usage",
+            SessionEvent::Loop(LoopEvent::Usage(..)) => "usage",
             SessionEvent::Loop(LoopEvent::ToolStart { .. }) => "tool_start",
             SessionEvent::Loop(LoopEvent::ToolEnd { .. }) => "tool_end",
             SessionEvent::Loop(LoopEvent::Error(_)) => "error",
@@ -2770,7 +2772,7 @@ mod turn_tests {
     async fn usage_adds_up_and_the_last_requests_size_is_kept() {
         let dirs = Dirs::new();
         let mut events =
-            vec![ProviderEvent::Usage(Usage { prompt_tokens: 100, completion_tokens: 20, cached_tokens: None, cost: None })];
+            vec![ProviderEvent::Usage(Usage { prompt_tokens: 100, completion_tokens: 20, cached_tokens: None, cost: None }, ReplyEnd::default())];
         events.extend(say("Hi."));
         let provider = Scripted::new(vec![events]);
         let session = make(&dirs, TestFactory { local: true, ..fixed(Arc::new(provider)) }, |_| {});
@@ -3415,6 +3417,37 @@ mod turn_tests {
         assert_eq!(feedback["turn"], log[1]["turn"]);
     }
 
+    // #90: the request records carry the provider's finish reason; a reply that announced its
+    // next step without a tool call is recorded as an `announced_step` and the turn went on.
+    #[tokio::test]
+    async fn the_trajectory_records_the_finish_reason_and_an_announced_step() {
+        let dirs = Dirs::new();
+        let store = Arc::new(TrajectoryStore::new(&dirs.dir));
+        let provider = Scripted::new(vec![
+            with(
+                ProviderEvent::Usage(
+                    Usage { prompt_tokens: 100, completion_tokens: 5, cached_tokens: None, cost: None },
+                    ReplyEnd { finish_reason: Some("stop".into()), raw_response: None },
+                ),
+                vec![ProviderEvent::TextDelta("Both modes work. Now let me look at issue #7 and comment:".into())],
+            ),
+            say("Commented."),
+        ]);
+        let session = scripted(&dirs, &provider, |i| i.trajectories = Some(store.clone()));
+        collect(go(&session, "comment on the issue")).await;
+        let log = records(&store, &dirs.project, &session).await;
+        let request = log.iter().find(|r| r["type"] == "request").unwrap();
+        assert_eq!(request["finishReason"], "stop");
+        let announced = log.iter().find(|r| r["type"] == "announced_step").unwrap();
+        assert_eq!(announced["continued"], true);
+        // The turn did not stop at the announcement: the next request went out and it ended done.
+        assert_eq!(
+            log.iter().find(|r| r["type"] == "agent_end").map(|r| r["reason"].as_str().unwrap()),
+            Some("end")
+        );
+        assert!(session.conversation().iter().any(|t| matches!(t, ChatTurn::User { text } if text == marv_agent::agent::ANNOUNCED_STEP_NOTE)));
+    }
+
     #[tokio::test]
     async fn rate_rates_the_last_turn_and_says_why_when_it_cant() {
         let dirs = Dirs::new();
@@ -3767,12 +3800,10 @@ mod turn_tests {
                     .configure(Configure { provider: Some(ProviderChoice::Factory(Arc::new(switched))), ..Default::default() })
                     .unwrap();
             }
-            let mut events = vec![ProviderEvent::Usage(Usage {
-                prompt_tokens: 1_000_000,
-                completion_tokens: 500_000,
-                cached_tokens: None,
-                cost: None,
-            })];
+            let mut events = vec![ProviderEvent::Usage(
+                Usage { prompt_tokens: 1_000_000, completion_tokens: 500_000, cached_tokens: None, cost: None },
+                ReplyEnd::default(),
+            )];
             events.extend(say("Hi."));
             Box::pin(futures::stream::iter(events))
         });
