@@ -25,6 +25,7 @@ pub mod glob;
 pub mod grep;
 pub mod memory;
 pub mod output;
+pub mod process;
 pub mod read_file;
 pub mod registry;
 pub mod relay;
