@@ -16,6 +16,15 @@ Each guard's doc comment says how it was proven: the guard was reverted, and the
 | Project writable, `.git` and protected paths read-only (at any level) | `sandbox.rs::the_project_is_writable_but_git_and_protected_paths_are_read_only` | Proven (real bwrap) |
 | Protected files a command *creates* (at any depth outside `node_modules`/`target`/`.git`) | `sandbox.rs::protected_files_a_command_creates_are_found_and_reverted` | Proven (real bwrap) |
 | … through the `bash` tool | `sandbox.rs::bash_reverts_protected_files_its_command_created` | Proven (real bwrap) |
+| Process door: can't write outside the project | `process.rs::a_process_cant_write_outside_the_project` | Proven (real bwrap, #24) |
+| Process door: can't change `.git` | `process.rs::a_process_cant_change_the_projects_git` | Proven (real bwrap, #24) |
+| Process door: can't read the real home | `process.rs::a_process_cant_read_the_real_home` | Proven (real bwrap, #24) |
+| Process door: no host `127.0.0.1` without `network: true` | `process.rs::a_process_cant_reach_the_hosts_localhost_without_network` | Proven (real bwrap, #24) |
+| Process door: forwarded ports on the host's `127.0.0.1` only | `process.rs::a_forwarded_port_is_on_the_hosts_127_0_0_1_only` | Proven (real bwrap, #24) |
+| Process door: dies on stop | `process.rs::a_process_dies_on_stop` | Proven (real bwrap, #24) |
+| Process door: dies when Marv is SIGKILLed | `process.rs::a_process_dies_when_marv_is_sigkilled` | Proven (real bwrap, #24) |
+| Process door: a start asks even in yolo; a no starts nothing | `process.rs::a_start_asks_even_in_yolo_and_a_no_starts_nothing` | Proven (#24) |
+| Process door: a subagent can't start one | `process.rs::a_subagents_context_cant_start_one` | Proven (#24) |
 | Protected paths ask even in yolo (every pattern, any level, through a symlink) | `sandbox.rs::protected_paths_ask_even_in_yolo` | Proven |
 | `package.json` lifecycle scripts | `sandbox.rs::package_json_lifecycle_scripts_ask_even_in_yolo` | Proven (#4) |
 | Secrets need approval to read | `sandbox.rs::reading_a_secret_asks` | Ignored: no secret-read gate yet |
@@ -62,5 +71,6 @@ Each guard's doc comment says how it was proven: the guard was reverted, and the
 - **Found by the suite:** dangling symlinks. `innocent.sh -> .envrc`, where `.envrc` didn't exist yet, wasn't seen as protected, and `write_file` through `out.sh -> /elsewhere/x` wrote outside the project. Both are fixed in `paths::real_with_missing` (sandbox.md). Nested `.git` folders read-only for confined commands are proven by marv-tools' `an_approved_git_write_keeps_its_new_repository_and_confined_commands_see_nested_git_read_only`.
 - **Fake homes live in `/var/tmp`** (`TempDir::outside_tmp`): the sandbox replaces `/tmp` with its own, so a fake home there would look hidden even without the home tmpfs.
 - **The web guards use a local server** (`marv_guards::serve`) and a `WebFetch` that lets private addresses through: the guards never fetch the internet.
+- **The process door's guards** run `marv-guards-fixture` (`src/bin/`) as the relay, in place of `marv __relay`: a library's tests can't run the `marv` binary. The same fixture serves the forwarded test page from inside the sandbox and plays the parent that gets SIGKILLed. Each guard was proven by a scripted revert (one at a time, file restored after).
 - **The doors' guards** (`github.rs`, `host.rs`): gh is a fake on PATH (`marv_tools::github::fake`, a shell script that logs every argv); never the real gh. The SDK guards that need it in the environment re-run themselves in a child process with it set (`marv_guards::in_child_with_env`: Rust can't change its own environment without `unsafe`). The `marv -p` guards run the binary `cargo test --workspace` builds (`marv_oracle::binary()`), against `marv_oracle`'s fake OpenRouter on port 0.
 - **The lock-file guard** reads `Cargo.lock` at run time. To prove it, the test binary was built first, because cargo prunes an unused lock entry before it runs a test.

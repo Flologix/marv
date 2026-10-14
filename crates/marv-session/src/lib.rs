@@ -17,6 +17,7 @@
 //! `marv_core::printable()`.
 
 pub mod agents;
+pub mod checkpoints;
 pub mod checks;
 pub mod commands;
 pub mod config;
@@ -29,6 +30,7 @@ pub mod mcp_tools;
 pub mod memory;
 pub mod mesh;
 pub mod paths;
+pub mod processes;
 pub mod prompt;
 pub mod provenance;
 pub mod runner;
@@ -46,11 +48,13 @@ pub mod types;
 pub mod usage;
 pub mod worktree;
 
+pub use checkpoints::undo::{UndoFile, UndoPlan, UndoRefusal, UndoResult, undo_request, undo_summary};
 pub use runner::{ApprovalRecord, SessionAgentHost, SessionApprover, SessionToolRunner, ToolDisplay};
 pub use sdk::{SessionBuilder, SessionOptions, create_session};
 pub use session::{
-    CompactFailure, CompactResult, Configure, Feedback, MarvSession, ProviderChoice, RateOutcome, ResumeTarget, Resumed,
-    SendOptions, SessionError, SessionEvent, SessionInit, SystemPrompt, Turn, TurnEndReason, TurnStatus, UsageSnapshot,
+    CheckpointProblem, CompactFailure, CompactResult, Configure, Feedback, MarvSession, ProviderChoice, RateOutcome,
+    ResumeTarget, Resumed, SendOptions, SessionError, SessionEvent, SessionInit, SystemPrompt, Turn, TurnEndReason, TurnStatus,
+    UsageSnapshot,
 };
 pub use types::{Message, Role};
 pub use usage::Totals;

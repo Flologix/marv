@@ -103,6 +103,7 @@ pub fn sandboxed_options(run: &CheckRun) -> RunOptions {
         placeholders: Vec::new(),
         project_read_only: true,
         env: None,
+        forwards: Vec::new(),
     }
 }
 
@@ -524,7 +525,7 @@ pub(crate) mod testing {
             "a.ts",
         );
         run.changed = path.map(String::from);
-        run.display = Some(Arc::new(crate::runner::ToolDisplay { diff: Some(Default::default()) }));
+        run.display = Some(Arc::new(crate::runner::ToolDisplay { diff: Some(Default::default()), plan: None }));
         run
     }
 

@@ -11,6 +11,9 @@
 //! the same queue: `once` (yes or no; a wire is never remembered as a scope), labeled with the agent that asked,
 //! showing who, to what, which mode and the limits, with the taint warning.
 //!
+//! `preview.files` (/undo) lists files, each with its own diff (at most [`MAX_FILE_DIFF_LINES`]), in a list at most
+//! the window's height less [`RESERVED_ROWS`] tall that PgUp/PgDn and the wheel scroll, Yes/No pinned below.
+//!
 //! Esc declines this and everything waiting and stops the run, except while a subagent's view is
 //! open (`escape_cancels: false`): Esc then only closes the view. Every string from the request
 //! goes through `printable()`: a Trojan-Source command must not look like something else.
@@ -33,6 +36,13 @@ use super::theme;
 use crate::view::{ApprovalRequest, Decision};
 
 pub const MAX_DIFF_LINES: usize = 24;
+/// Each of several files' diffs (/undo), so a few files fit on the screen at once.
+pub const MAX_FILE_DIFF_LINES: usize = 8;
+/// The rows the rest of the screen keeps when several files' diffs are shown: the panel's border, title, notes and
+/// choices, the status bar, a little transcript. The file list gets what's left (at least [`MIN_FILES_ROWS`]) and
+/// scrolls, so a big /undo never pushes Yes/No off the screen.
+pub const RESERVED_ROWS: u16 = 16;
+pub const MIN_FILES_ROWS: u16 = 4;
 
 /// One warning line per door out of the sandbox, in the warning colour: what saying yes lets out (Marv's
 /// `DOOR_WARNINGS`). A door's own detail (the repository a github write is visible on) comes in its preview's warning,
@@ -59,6 +69,11 @@ pub struct ApprovalView {
     pub waiting: usize,
     pub escape_cancels: bool,
     pub select: Select<Decision>,
+    /// The window's height, which limits a file list (the App sets it as it draws; tests pick one).
+    window_rows: u16,
+    /// The file list's first shown row, and its last possible one as last drawn.
+    files_top: usize,
+    files_max: std::cell::Cell<usize>,
 }
 
 impl ApprovalView {
@@ -72,14 +87,67 @@ impl ApprovalView {
         }
         let no = if request.once { "No" } else { "No, and tell Marv what to do instead" };
         items.push(SelectItem::new(Decision::No, no).hint("esc"));
-        Self { request, waiting, escape_cancels, select: Select::new(items, None) }
+        let window_rows = crossterm::terminal::size().map_or(24, |(_, rows)| rows);
+        Self {
+            request,
+            waiting,
+            escape_cancels,
+            select: Select::new(items, None),
+            window_rows,
+            files_top: 0,
+            files_max: std::cell::Cell::new(0),
+        }
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Option<ApprovalOutcome> {
         if key.code == KeyCode::Esc {
             return self.escape_cancels.then_some(ApprovalOutcome::CancelAll);
         }
+        // A file list (/undo) scrolls with PgUp/PgDn: the transcript stays put meanwhile.
+        if self.has_files() && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
+            let page = self.files_rows() as i32;
+            self.scroll_files(if key.code == KeyCode::PageUp { -page } else { page });
+            return None;
+        }
         self.select.on_key(key).map(ApprovalOutcome::Decide)
+    }
+
+    /// Whether the request lists files (/undo): PgUp/PgDn and the wheel scroll them, not the transcript.
+    pub fn has_files(&self) -> bool {
+        self.request.preview.files.as_ref().is_some_and(|f| !f.is_empty())
+    }
+
+    pub fn set_window_rows(&mut self, rows: u16) {
+        self.window_rows = rows;
+    }
+
+    /// Moves the file list by `rows` (negative: up), within what was last drawn.
+    pub fn scroll_files(&mut self, rows: i32) {
+        let top = (self.files_top as i64 + rows as i64).clamp(0, self.files_max.get() as i64);
+        self.files_top = top as usize;
+    }
+
+    fn files_rows(&self) -> u16 {
+        self.window_rows.saturating_sub(RESERVED_ROWS).max(MIN_FILES_ROWS)
+    }
+
+    /// The files' titles (with their notes) and diffs, wrapped at `width`.
+    fn file_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let dim = Style::new().fg(theme::DIM);
+        let mut lines = Vec::new();
+        for file in self.request.preview.files.iter().flatten() {
+            lines.push(Line::default());
+            let mut title = vec![Span::raw(printable(&file.title))];
+            if let Some(note) = &file.note {
+                title.push(Span::styled(format!(" · {}", printable(note)), dim));
+            }
+            lines.push(Line::from(title));
+            if let Some(diff) = file.diff.as_ref().filter(|d| !d.lines.is_empty()) {
+                let options = DiffOptions { max: Some(MAX_FILE_DIFF_LINES), more: diff.more, indent: 2, ..Default::default() };
+                lines.extend(diff_view::render(&diff.lines, width, options));
+            }
+        }
+        wrap_all(&lines, width)
     }
 
     /// The box's content at an inner width of `width`.
@@ -110,6 +178,18 @@ impl ApprovalView {
             }
             if !diff.is_empty() {
                 lines.extend(diff_view::render(diff, width, DiffOptions { max: Some(MAX_DIFF_LINES), ..Default::default() }));
+            }
+        }
+        if self.has_files() {
+            // At most files_rows tall, scrolled with PgUp/PgDn or the wheel.
+            let files = self.file_lines(width);
+            let rows = self.files_rows() as usize;
+            let max = files.len().saturating_sub(rows);
+            self.files_max.set(max);
+            let top = self.files_top.min(max);
+            lines.extend(files.iter().skip(top).take(rows).cloned());
+            if max > 0 {
+                lines.push(Line::styled("PgUp/PgDn or the wheel scroll the files", dim));
             }
         }
         if let Some(note) = &preview.note {
@@ -409,5 +489,79 @@ mod tests {
         let view = ApprovalView::new(request, 0, true);
         let f = frame(&view);
         assert_eq!(f.matches("word").count(), 40);
+    }
+
+    // Ports tests/approval.test.tsx "Approval: an undo of many files" (Greptile on Marv #71).
+    fn undo(files: usize) -> ApprovalRequest {
+        use crate::view::{DiffShown, PreviewFile};
+        let diff = |n: usize| DiffShown {
+            lines: (1..=8)
+                .map(|i| DiffLine { kind: DiffKind::Add, text: format!("file {n} line {i}"), old_line: None, new_line: Some(i) })
+                .collect(),
+            more: 0,
+        };
+        ApprovalRequest {
+            tool: "undo".into(),
+            label: "turn 3".into(),
+            once: true,
+            scope: Scope { key: "undo".into(), description: "undo".into() },
+            preview: Preview {
+                title: "Undo turn 3".into(),
+                files: Some(
+                    (1..=files)
+                        .map(|i| PreviewFile { title: format!("restore src/file{i}.ts"), diff: Some(diff(i)), note: None })
+                        .collect(),
+                ),
+                note: Some(format!("{files} files")),
+                ..Default::default()
+            },
+            agent: None,
+            network: false,
+            door: None,
+        }
+    }
+
+    #[test]
+    fn the_file_list_fits_the_window_and_scrolls_yes_and_no_stay_visible() {
+        let mut view = ApprovalView::new(undo(12), 0, true);
+        view.set_window_rows(30);
+        let first = frame(&view);
+        assert!(first.split('\n').count() <= 30, "{first}");
+        assert!(first.contains("restore src/file1.ts"));
+        assert!(!first.contains("restore src/file12.ts"));
+        assert!(first.contains("❯ Yes"));
+        assert!(first.contains("No"));
+        assert!(first.contains("PgUp/PgDn or the wheel scroll the files"));
+        for _ in 0..20 {
+            assert_eq!(view.on_key(key(KeyCode::PageDown)), None);
+        }
+        let last = frame(&view);
+        assert!(last.split('\n').count() <= 30, "{last}");
+        assert!(last.contains("restore src/file12.ts"), "{last}");
+        assert!(last.contains("file 12 line 8"));
+        assert!(last.contains("❯ Yes"));
+        assert!(last.contains("No"));
+        view.scroll_files(-3); // the wheel: three rows up
+        assert!(!frame(&view).contains("file 12 line 8"));
+        for _ in 0..20 {
+            view.on_key(key(KeyCode::PageUp));
+        }
+        assert!(frame(&view).contains("restore src/file1.ts"));
+    }
+
+    #[test]
+    fn a_few_files_are_all_shown_with_their_notes_and_no_scroll_hint() {
+        let mut request = undo(2);
+        if let Some(files) = request.preview.files.as_mut() {
+            files[1].diff = None;
+            files[1].note = Some("binary".into());
+        }
+        let mut view = ApprovalView::new(request, 0, true);
+        view.set_window_rows(40);
+        let f = frame(&view);
+        assert!(f.contains("restore src/file1.ts") && f.contains("file 1 line 8"), "{f}");
+        assert!(f.contains("restore src/file2.ts · binary"), "{f}");
+        assert!(!f.contains("PgUp/PgDn"));
+        assert!(!f.contains("don't ask again"));
     }
 }

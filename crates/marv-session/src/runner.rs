@@ -53,12 +53,14 @@ pub fn approval_record(approval: Option<Approval>) -> ApprovalRecord {
 pub struct ToolDisplay {
     /// What a file change did (edit_file, write_file).
     pub diff: Option<DiffShown>,
+    /// The plan tool's list after the call (#15; empty: cleared). The model has it in its own call.
+    pub plan: Option<Vec<marv_tools::PlanItem>>,
 }
 
 /// The loop's view of a finished call. `note`: a repair's note for a rewritten call (deferred MCP, #14).
 pub fn tool_run_from(outcome: ToolOutcome, note: Option<&str>) -> ToolRun {
     let ToolOutcome { result, label } = outcome;
-    let display = ToolDisplay { diff: result.diff.clone() };
+    let display = ToolDisplay { diff: result.diff.clone(), plan: result.plan.clone() };
     let (declined, provenance, changed, door) = (result.declined, result.provenance, result.changed.clone(), result.door);
     let approval = approval_record(result.approval);
     let mut core = result.into_core();

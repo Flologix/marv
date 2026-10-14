@@ -15,7 +15,7 @@ These rules are requirements for marv-rs from day one. They come from the 2026-1
 
 ## Sandbox (`marv-sandbox`)
 - **bubblewrap**, with:
-  - read-only system directories and an empty `/run` (except the mesh plug, `/run/marv/mesh.sock`);
+  - read-only system directories and an empty `/run` (except the mesh plug, `/run/marv/mesh.sock`, and the process door's relay: Marv's binary at `/run/marv-bin` and socket folders under `/run/marv`);
   - a stand-in home, with toolchains re-mounted read-only and credential files masked;
   - the project writable, with `.git` and **protected paths** read-only;
   - no network unless approved (`--unshare-net`), a cleared environment, and its own PID namespace.
@@ -27,6 +27,14 @@ These rules are requirements for marv-rs from day one. They come from the 2026-1
   - `package.json` lifecycle `scripts`.
 - **Secrets** (`.env*`, `*.pem`, `id_*`) need approval to read, and are masked in the sandbox.
 - **Every path is checked after `realpath`.** No tool follows a symlink out of its root. That includes skill files, which the old code read outside the sandbox.
+
+## Doors out of the sandbox
+Narrow, named ways out, each asked for and each with its own rule for what it can never do (Marv Sprint 4).
+- **Process (#24, Marv #51):** a dev server or watcher that keeps running across turns.
+  - It runs in its own sandbox, like a bash command's: it can't write outside the project, change `.git`, read the real home, or reach the host's network or `127.0.0.1` unless started with `network: true`.
+  - Its ports are forwarded to the host's `127.0.0.1` only, never another interface.
+  - Starting one asks, even in yolo; only the main agent can (a subagent's context has no door, refused before any ask).
+  - It dies on stop, when Marv exits or panics, and when Marv is killed (`--die-with-parent`).
 
 ## Provenance and taint (`marv-core::Provenance`)
 - **Every tool result is tagged with its source.** Text that isn't from the user or Marv is fenced as data for the model. Project checks and diagnostics are quoted, never spoken in Marv's voice.

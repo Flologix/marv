@@ -20,6 +20,10 @@
 //!   "Got it", so the next request would otherwise end with an assistant message and the model
 //!   would have no instruction to go on.
 //! - The summary request counts toward tokens and cost (`on_usage`).
+//! - The plan (#15): the summary replaces the plan calls the model made, so the session's own copy is appended to
+//!   the summary's message when it has something left to do, as structured text rather than the model's paraphrase.
+//!   Marv's `compactedHistory(summary, plan)` takes the items; marv-agent doesn't depend on marv-tools, so here it
+//!   takes the plan's text (`marv_tools::plan::plan_text`), and the session passes it only for an open plan.
 //!
 //! Planned — **compaction v2 (Marv #63, spec first; nothing here is settled):**
 //! - a structured template ([`V2_SECTIONS`]), with one nudge if the reply ignores it;
@@ -131,10 +135,12 @@ pub async fn summarize(options: SummarizeOptions<'_>) -> Result<String, String> 
     if summary.is_empty() { Err("The model returned an empty summary.".into()) } else { Ok(summary.to_string()) }
 }
 
-/// The model's history after compacting: the summary, acknowledged.
-pub fn compacted_history(summary: &str) -> Vec<ChatTurn> {
+/// The model's history after compacting: the summary, acknowledged, with the plan's text when one has something left
+/// to do (`plan`: `marv_tools::plan::plan_text`).
+pub fn compacted_history(summary: &str, plan: Option<&str>) -> Vec<ChatTurn> {
+    let kept = plan.map(|plan| format!("\n\n{plan}")).unwrap_or_default();
     vec![
-        ChatTurn::User { text: format!("{COMPACTED_PREFIX}{summary}") },
+        ChatTurn::User { text: format!("{COMPACTED_PREFIX}{summary}{kept}") },
         ChatTurn::Assistant { text: COMPACTED_ACK.into(), tool_calls: vec![], reasoning: None },
     ]
 }
@@ -274,10 +280,19 @@ mod tests {
 
     #[test]
     fn compacted_history_starts_over_from_the_summary() {
-        let h = compacted_history("the summary");
+        let h = compacted_history("the summary", None);
         assert!(matches!(&h[0], ChatTurn::User { text } if text.contains("the summary")));
         assert!(matches!(&h[1], ChatTurn::Assistant { tool_calls, .. } if tool_calls.is_empty()));
         assert_eq!(h.len(), 2);
+    }
+
+    #[test]
+    fn compacted_history_appends_the_plans_text_to_the_summary() {
+        let plain = compacted_history("S", None);
+        let with_plan = compacted_history("S", Some("Your plan…"));
+        let (ChatTurn::User { text: a }, ChatTurn::User { text: b }) = (&plain[0], &with_plan[0]) else { panic!() };
+        assert_eq!(*b, format!("{a}\n\nYour plan…"));
+        assert_eq!(plain[1], with_plan[1]);
     }
 
     #[test]

@@ -75,6 +75,10 @@ impl Tool for Agent {
     fn kind(&self) -> marv_core::ToolKind {
         marv_core::ToolKind::Execute
     }
+    /// A subagent's own calls take the turn's checkpoint (shared-folder) or land on its worktree's branch.
+    fn checkpoint(&self) -> bool {
+        false
+    }
     fn provenance(&self) -> marv_core::Provenance {
         marv_core::Provenance::Subagent
     }

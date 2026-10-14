@@ -79,6 +79,33 @@ pub struct RunOptions {
     pub project_read_only: bool,
     /// Not sandboxed: this environment instead of the minimal one (the host door's, `host_env`).
     pub env: Option<std::collections::BTreeMap<String, String>>,
+    /// Sandboxed, without network: the background processes' forwarded ports (Marv #51), each reached through its
+    /// socket folder, mounted read-only at `/run/marv/<id>`; a relay listens on the sandbox's 127.0.0.1:<port> for each.
+    pub forwards: Vec<crate::types::ProcessForward>,
+}
+
+/// The relay in front of a sandboxed command without network while processes run (Marv #51): their socket folders
+/// and Marv's binary mounted, and the command run by `marv __relay`. With network the sandbox shares the host's
+/// 127.0.0.1, where the ports are forwarded already. None: the command runs as it is.
+fn relay_for(
+    forwards: &[crate::types::ProcessForward],
+    script: &str,
+) -> Option<(Vec<marv_sandbox::Bind>, Vec<std::ffi::OsString>)> {
+    use crate::relay::{RelayForward, RelaySpec, SOCKET_DIR, SOCKET_NAME};
+    if forwards.is_empty() {
+        return None;
+    }
+    let mut binds = vec![crate::relay::exe_bind()?];
+    for forward in forwards {
+        let dest = PathBuf::from(format!("{SOCKET_DIR}/{}", forward.id));
+        if !binds.iter().any(|b| b.dest == dest) {
+            binds.push(marv_sandbox::Bind { source: forward.dir.clone(), dest, writable: false });
+        }
+    }
+    let connect =
+        forwards.iter().map(|f| RelayForward { port: f.port, socket: format!("{SOCKET_DIR}/{}/{SOCKET_NAME}", f.id) }).collect();
+    let spec = RelaySpec { listen: None, connect, argv: vec!["bash".into(), "-c".into(), script.into()] };
+    Some((binds, crate::relay::sandbox_argv(&spec)))
 }
 
 /// Runs a shell command in the project folder with stdout and stderr combined (also used by diagnostics and checks).
@@ -100,12 +127,22 @@ pub async fn run_command(
         placeholders,
         project_read_only,
         env,
+        forwards,
     } = options;
     let started = |output: String| CommandResult { output, exit_code: None, timeout: Some(timeout), ..Default::default() };
     let script = format!("exec 2>&1\n{command}"); // stderr into stdout, so the output stays in order
     let mut cmd = if sandboxed {
-        let mounts = marv_sandbox::CommandMounts { network, read_only, writable, placeholders, project_read_only };
-        let argv = match sandbox.command(&root, &mounts, &script) {
+        let relay = if network { None } else { relay_for(&forwards, &script) };
+        let mut mounts =
+            marv_sandbox::CommandMounts { network, read_only, writable, placeholders, project_read_only, binds: vec![] };
+        let argv = match relay {
+            Some((binds, inner)) => {
+                mounts.binds = binds;
+                sandbox.command_argv(&root, &mounts, &inner)
+            }
+            None => sandbox.command(&root, &mounts, &script),
+        };
+        let argv = match argv {
             Ok(argv) => argv,
             // A mount that can't be made safely: the command never starts, and the model is told why.
             Err(e) => return started(format!("[sandbox failed to start: {e}]\n")),
@@ -440,6 +477,7 @@ impl Tool for Bash {
             placeholders: guard.placeholders.clone(),
             project_read_only: false,
             env: None,
+            forwards: ctx.forwards.as_ref().map(|f| f.forwards()).unwrap_or_default(),
         };
         let mut result = run_command(options, &ctx.sandbox, &ctx.cancel).await;
         // bwrap leaves a placeholder's empty mount point; remove_dir only removes it while it's empty.

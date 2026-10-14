@@ -26,8 +26,11 @@ pub mod glob;
 pub mod grep;
 pub mod memory;
 pub mod output;
+pub mod plan;
+pub mod process;
 pub mod read_file;
 pub mod registry;
+pub mod relay;
 pub mod repair;
 pub mod skill;
 pub mod syntax;
@@ -40,8 +43,9 @@ pub use registry::{
     DECLINED, INTERRUPTED, ToolOutcome, ToolRef, builtin_tools, is_parallel_call, run_tool, tool_specs, tool_specs_for,
 };
 pub use types::{
-    AgentHost, AgentProgress, Approval, ApprovalRequest, Approver, BeforeChange, Decision, DiffKind, DiffLine, DiffShown,
-    DynTool, MemoryPaths, Preview, Repaired, Scope, Skill, Tool, ToolContext, ToolError, ToolOutput,
+    AgentHost, AgentProgress, Approval, ApprovalRequest, Approver, BeforeChange, Checkpoint, Decision, DiffKind, DiffLine,
+    DiffShown, DynTool, MemoryPaths, PlanHost, PlanItem, PlanStatus, Preview, PreviewFile, ProcessForward, ProcessForwards,
+    ProcessHost, ProcessInfo, ProcessState, Repaired, Scope, Skill, StartResult, Tool, ToolContext, ToolError, ToolOutput,
 };
 
 #[cfg(test)]

@@ -4,9 +4,14 @@
 //! - `-p <prompt>` / `run <prompt>`: one headless turn ([`headless`]), exit codes 0/1/2/3;
 //! - `mesh ls|wire|plug`: the mesh ([`mesh_cmd`]);
 //! - `__html-convert` (hidden): the web reader's converter process (`marv_tools::web::html_convert_cli::main`);
-//! - `__run-checks <spec>` (hidden): the project checks' runner, inside the sandbox (`marv_session::checks::runner`).
+//! - `__run-checks <spec>` (hidden): the project checks' runner, inside the sandbox (`marv_session::checks::runner`);
+//! - `__relay <spec>` (hidden): the process door's relay, inside a sandbox (`marv_tools::relay`, Marv #51).
 //!
-//! Both hidden ones run before the Tokio runtime starts: they're short processes of their own.
+//! The hidden ones run before the Tokio runtime starts: they're processes of their own.
+//!
+//! Background processes (Marv #51) never outlive Marv: the TUI and `-p` stop them on the way out (SIGTERM, then
+//! SIGKILL), and whatever is left is SIGKILLed when `main` ends, a panic included
+//! (`marv_session::processes::kill_running`); if Marv is killed harder, bwrap's `--die-with-parent` takes them.
 
 mod cli;
 mod headless;
@@ -46,6 +51,9 @@ fn main() -> ExitCode {
     if let Mode::RunChecks { spec } = &mode {
         return marv_session::checks::runner::main(spec);
     }
+    if let Mode::Relay { spec } = &mode {
+        return marv_tools::relay::main(spec);
+    }
     let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(rt) => rt,
         Err(e) => {
@@ -53,6 +61,8 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    // Dropped last thing before the runtime, or while a panic unwinds out of it.
+    let _processes = StopProcesses;
     let code = runtime.block_on(async move {
         match mode {
             Mode::Headless { prompt } => {
@@ -90,10 +100,21 @@ fn main() -> ExitCode {
                     1
                 }
             },
-            Mode::HtmlConvert | Mode::RunChecks { .. } => unreachable!("handled before the runtime starts"),
+            Mode::HtmlConvert | Mode::RunChecks { .. } | Mode::Relay { .. } => {
+                unreachable!("handled before the runtime starts")
+            }
         }
     });
     // An HTML converter still running (a turn ended mid-fetch) would outlive Marv: stop it, as Marv's exit handler did.
     marv_tools::web::convert::kill_running();
     ExitCode::from(u8::try_from(code).unwrap_or(1))
+}
+
+/// SIGKILLs the background processes still running when it's dropped: at the end of `main`, or on a panic.
+struct StopProcesses;
+
+impl Drop for StopProcesses {
+    fn drop(&mut self) {
+        marv_session::processes::kill_running();
+    }
 }

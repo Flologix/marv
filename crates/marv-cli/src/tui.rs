@@ -22,6 +22,9 @@
 //! id changes (`/clear`, a resume). The App has no hook for its own state, so the bridge tracks what it handed out:
 //! approvals not yet answered, and work it started.
 //!
+//! `/undo` (Marv #16): the session's `undo_plan()`, its files and diffs asked through the same approval queue (`once`),
+//! then `undo()` and `undo_summary`'s line; refused while a turn runs.
+//!
 //! Port notes (marv-rs):
 //! - `marv -c` resumes before the UI starts, so a message can't be typed into the session being swapped out (Marv held
 //!   `send` with "Loading your last session…"); the App gets `Resumed` as its first event.
@@ -77,6 +80,8 @@ use tokio::sync::oneshot;
 
 /// How long the MCP servers get to shut down on the way out.
 const MCP_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Background processes get SIGTERM, then SIGKILL after 2 s (Marv #51).
+const PROCESSES_STOP_TIMEOUT: Duration = Duration::from_millis(2500);
 /// How long Herdr gets to hear that Marv left the pane.
 const HERDR_RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
 const WORKING: &str = "Marv is working: stop the current turn (Esc) before resuming another session.";
@@ -122,6 +127,16 @@ pub fn approval_request(request: &marv_tools::ApprovalRequest) -> view::Approval
             text: p.text.clone(),
             note: p.note.clone(),
             warning,
+            files: p.files.as_ref().map(|files| {
+                files
+                    .iter()
+                    .map(|f| view::PreviewFile {
+                        title: f.title.clone(),
+                        diff: f.diff.as_ref().map(diff_shown),
+                        note: f.note.clone(),
+                    })
+                    .collect()
+            }),
         },
         scope: view::Scope { key: request.scope.key.clone(), description: request.scope.description.clone() },
         agent: request.agent.clone(),
@@ -184,6 +199,26 @@ pub fn tool_status(run: &marv_agent::ToolRun) -> view::ToolStatus {
         .and_then(|d| d.diff.as_ref())
         .map(diff_shown);
     view::ToolStatus { label: run.label.clone(), status, summary, steps: None, diff }
+}
+
+/// A plan call's list, for the screen (`ToolDisplay::plan`); `None` for a call that failed.
+fn plan_of(run: &marv_agent::ToolRun) -> Option<Vec<view::PlanItem>> {
+    let display = run.display.as_ref()?.downcast_ref::<marv_session::ToolDisplay>()?;
+    display.plan.as_deref().map(view_plan)
+}
+
+fn view_plan(items: &[marv_tools::PlanItem]) -> Vec<view::PlanItem> {
+    items
+        .iter()
+        .map(|i| view::PlanItem {
+            text: i.text.clone(),
+            status: match i.status {
+                marv_tools::PlanStatus::Pending => view::PlanStatus::Pending,
+                marv_tools::PlanStatus::InProgress => view::PlanStatus::InProgress,
+                marv_tools::PlanStatus::Done => view::PlanStatus::Done,
+            },
+        })
+        .collect()
 }
 
 fn compact_outcome(result: CompactResult) -> view::CompactOutcome {
@@ -277,6 +312,7 @@ pub fn map_event(
             TurnStatus::WaitingForMcp => view::TurnStatus::WaitingForMcp,
             TurnStatus::Compacting => view::TurnStatus::Compacting,
             TurnStatus::Checking => view::TurnStatus::Checking,
+            TurnStatus::Checkpointing => view::TurnStatus::Checkpointing,
             TurnStatus::Running => view::TurnStatus::Running,
         })],
         SessionEvent::Loop(event) => {
@@ -286,7 +322,15 @@ pub fn map_event(
             {
                 map.titles.insert(call.id.clone(), label.clone());
             }
-            map_loop(&event, totals).into_iter().collect()
+            let mut out: Vec<UiEvent> = map_loop(&event, totals).into_iter().collect();
+            // The main agent's plan call: its new list, pinned above the prompt (#15). Subagents have no plan tool.
+            if let LoopEvent::ToolEnd { call, run } = &event
+                && call.name == "plan"
+                && let Some(items) = plan_of(run)
+            {
+                out.push(UiEvent::Plan(items));
+            }
+            out
         }
         SessionEvent::Subagent { call_id, event } => {
             let title = map.titles.get(&call_id).cloned().unwrap_or_default();
@@ -314,6 +358,9 @@ pub fn map_event(
             notice.map(|text| system(text, false)).into_iter().collect()
         }
         SessionEvent::Tainted { source } => vec![system(tainted_text(source), false)],
+        SessionEvent::CheckpointFailed { message } => {
+            vec![system(format!("This turn can't be undone: its checkpoint failed ({message})."), true)]
+        }
         SessionEvent::TurnEnd { turn, reason } => vec![UiEvent::TurnEnd {
             turn,
             reason: match reason {
@@ -649,6 +696,8 @@ impl Bridge {
         init.trajectories = s.trajectories.clone();
         init.log_trajectories = config.trajectories;
         init.worktrees_dir = Some(s.config_dir.join("worktrees").join(project_key(&s.root)));
+        init.checkpoints = config.checkpoints;
+        init.checkpoints_dir = Some(s.config_dir.join("checkpoints").join(project_key(&s.root)));
         let (on_change, on_warning) = (tx.clone(), tx.clone());
         // The model's info arrived (its context window): the status bar is asked again via `status_info`, below.
         let changed = Arc::new(Mutex::new(None::<std::sync::Weak<Bridge>>));
@@ -824,6 +873,7 @@ impl Bridge {
             model: resumed.model,
             transcript: resumed.transcript.iter().filter_map(transcript_message).collect(),
             totals: totals(&resumed.totals),
+            plan: resumed.plan.as_deref().map(view_plan),
         }));
         self.emit(UiEvent::StatusInfo(self.status_info()));
     }
@@ -910,6 +960,51 @@ impl Bridge {
         });
     }
 
+    /// /undo: the last turn's changes, shown like an approval (each file's diff), and on a yes put back. Outside a
+    /// turn only (a turn could be writing the same files); nothing is written before the yes.
+    fn undo(self: &Arc<Self>) {
+        if self.activity.busy.load(Ordering::SeqCst) || self.session.busy() {
+            return self.emit(system("Marv is working: stop the current turn (Esc) before /undo.", true));
+        }
+        let me = self.clone();
+        self.activity.set_busy(true);
+        tokio::spawn(async move {
+            me.undo_now().await;
+            me.activity.set_busy(false);
+        });
+    }
+
+    async fn undo_now(&self) {
+        self.emit(UiEvent::Busy(Some("Reading the checkpoints…".into())));
+        let plan = self.session.undo_plan().await;
+        self.emit(UiEvent::Busy(None));
+        let plan = match plan {
+            Err(e) => return self.emit(system(format!("Couldn't read the checkpoints: {e}"), true)),
+            Ok(Err(refusal)) if refusal.failed => return self.emit(system(format!("Couldn't undo: {}.", refusal.reason), true)),
+            Ok(Err(refusal)) => {
+                let why = refusal.reason.strip_prefix("nothing to undo: ").unwrap_or(&refusal.reason);
+                return self.emit(system(format!("Nothing to undo: {why}."), false));
+            }
+            Ok(Ok(plan)) => plan,
+        };
+        if plan.files.is_empty() {
+            let text = format!("Turn {} changed nothing in this project's folder, so there's nothing to undo.", plan.turn);
+            return self.emit(system(text, false));
+        }
+        let request = marv_session::undo_request(&plan);
+        let asked = marv_tools::Approver::approve(&TuiApprover(self.activity.clone()), request).await;
+        if asked != marv_tools::Decision::Yes {
+            return self.emit(system("Nothing was undone.", false));
+        }
+        self.emit(UiEvent::Busy(Some("Undoing…".into())));
+        let undone = self.session.undo(&plan).await;
+        self.emit(UiEvent::Busy(None));
+        match undone {
+            Ok(result) => self.emit(system(marv_session::undo_summary(&plan, &result), false)),
+            Err(e) => self.emit(system(format!("Couldn't undo: {e}"), true)),
+        }
+    }
+
     /// Saves the config, has the session use it from its next turn, and says `notice`.
     fn save_config(&self, next: FileConfig, notice: String) {
         if let Err(e) = self.store.save(&next) {
@@ -926,6 +1021,7 @@ impl Bridge {
             trajectories: Some(config.trajectories),
             diagnostics: Some(config.diagnostics),
             checks: Some(config.checks),
+            checkpoints: Some(config.checkpoints),
             max_steps: Some(config.max_steps),
             mcp_tools: Some(config.mcp_tools),
         });
@@ -1095,6 +1191,11 @@ impl Bridge {
                 let status = commands::checks_status(&Config { checks: on, ..config.clone() });
                 self.save_config(self.with_file(|f| f.checks = Some(on)), format!("Checks {status}"));
             }
+            CommandAction::Checkpoints { on } => {
+                let status = commands::checkpoints_status(&Config { checkpoints: on, ..config.clone() });
+                self.save_config(self.with_file(|f| f.checkpoints = Some(on)), format!("Checkpoints {status}"));
+            }
+            CommandAction::Undo => self.undo(),
             CommandAction::Steps { every } => {
                 let saved = self.with_file(|f| f.max_steps = Some(MaxStepsSetting::Every(every)));
                 // MARV_MAX_STEPS still wins over the file: say what's saved, and what this session actually uses.
@@ -1121,6 +1222,17 @@ impl Bridge {
             CommandAction::Remember { scope, text } => self.remember(scope, &text).await,
             CommandAction::Forget { text } => self.forget(&text).await,
             CommandAction::Compact { focus } => self.compact(focus),
+            CommandAction::Processes { stop } => {
+                let me = self.clone();
+                tokio::spawn(async move {
+                    let stopped = me.session.stop_process(&stop).await;
+                    me.emit(if stopped {
+                        system(format!("Stopped {}.", printable(&stop)), false)
+                    } else {
+                        system(format!("No background process named \"{}\". /processes lists them.", printable(&stop)), true)
+                    });
+                });
+            }
             CommandAction::Skill { name, args } => {
                 let Some(skill) = self.skills.iter().find(|s| s.skill.name == name) else { return };
                 let for_model = marv_session::skills::skill_message(&skill.skill, &args);
@@ -1150,6 +1262,8 @@ impl Bridge {
             if wants_checks { marv_session::checks::load_checks(&self.root) } else { (Vec::new(), Vec::new()) };
         let last_checks = self.last_checks.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let trajectories_path = self.trajectories_dir.as_ref().map(|d| shorten_home(d, &self.home));
+        let processes = self.session.processes();
+        let checkpoint_problem = self.session.checkpoint_problem();
         let ctx = CommandContext {
             config: &config,
             config_path: shorten_home(&self.store.path, &self.home),
@@ -1161,8 +1275,10 @@ impl Bridge {
             trajectories_path,
             usage: Some((&usage.totals, usage.last.as_ref(), usage.context_length)),
             checks: Some((&checks, &check_problems, last_checks.as_ref())),
+            checkpoints: Some(&checkpoint_problem),
             hidden_path_folders: &self.hidden_path_folders,
             sandbox_available: self.sandbox_available,
+            processes: self.session.processes_offered().then_some(&processes[..]),
         };
         commands::run_command(line, &ctx)
     }
@@ -1415,6 +1531,9 @@ pub async fn run(resume: Option<bool>) -> anyhow::Result<i32> {
     }
     // Stop a turn still running: its tools mustn't outlive the UI.
     bridge.session().interrupt();
+    // Background processes stop with Marv (#51): SIGTERM, then SIGKILL after 2 s; their sandboxes also die with Marv
+    // if it's killed harder (bwrap's --die-with-parent).
+    let _ = tokio::time::timeout(PROCESSES_STOP_TIMEOUT, bridge.session().stop_processes()).await;
     // Let servers shut down cleanly, but don't hang on one that won't.
     if let Some(mcp) = mcp {
         let _ = tokio::time::timeout(MCP_CLOSE_TIMEOUT, tokio::spawn(async move { mcp.close().await })).await;
@@ -1583,6 +1702,108 @@ mod tests {
 
     fn texts(events: &[UiEvent]) -> Vec<String> {
         events.iter().filter_map(|e| if let UiEvent::Message(m) = e { Some(m.text.clone()) } else { None }).collect()
+    }
+
+    // Marv tests/app.test.tsx "/undo" (#16): the project is a temp git repository; turns write notes.txt.
+    mod undo {
+        use super::*;
+
+        fn repo(dirs: &Dirs) {
+            for args in [
+                &["init", "-q", "-b", "main"][..],
+                &["add", "-A"],
+                &["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgSign=false", "commit", "-q", "-m", "first"],
+            ] {
+                std::process::Command::new("git").args(args).current_dir(&dirs.project).output().unwrap();
+            }
+        }
+
+        fn note(dirs: &Dirs) -> String {
+            std::fs::read_to_string(dirs.project.join("notes.txt")).unwrap()
+        }
+
+        fn is_message(e: &UiEvent, part: &str) -> bool {
+            matches!(e, UiEvent::Message(m) if m.text.contains(part))
+        }
+
+        /// A bridge whose first turn ("change the note") wrote notes.txt, approved.
+        async fn after_a_turn(dirs: &Dirs) -> (Port, UnboundedReceiver<UiEvent>) {
+            repo(dirs);
+            let replies = vec![write("w", "notes.txt", "buy bread\n"), say("Changed the note.")];
+            let (tx, mut rx) = unbounded_channel();
+            let port = Port(Bridge::start(startup(dirs, Some(asks()), replies, None), tx).unwrap());
+            port.send("change the note".into());
+            let seen = until(&mut rx, |e| matches!(e, UiEvent::Approval { .. })).await;
+            let Some(UiEvent::Approval { id, .. }) = seen.last() else { unreachable!() };
+            port.answer(*id, view::Decision::Yes);
+            until(&mut rx, |e| matches!(e, UiEvent::TurnEnd { .. })).await;
+            assert_eq!(note(dirs), "buy bread\n");
+            (port, rx)
+        }
+
+        #[tokio::test]
+        async fn shows_the_turns_files_and_diffs_yes_puts_them_back() {
+            let dirs = Dirs::new();
+            let (port, mut rx) = after_a_turn(&dirs).await;
+            port.run_command("/undo".into());
+            let seen = until(&mut rx, |e| matches!(e, UiEvent::Approval { .. })).await;
+            let Some(UiEvent::Approval { id, request }) = seen.last() else { unreachable!() };
+            assert_eq!(request.preview.title, "Undo turn 1 (\"change the note\")? 1 file");
+            assert!(request.once, "no \"don't ask again\"");
+            let files = request.preview.files.as_ref().unwrap();
+            assert_eq!(files[0].title, "Restore notes.txt");
+            let lines: Vec<(view::DiffKind, &str)> =
+                files[0].diff.as_ref().unwrap().lines.iter().map(|l| (l.kind, l.text.as_str())).collect();
+            assert_eq!(lines, [(view::DiffKind::Del, "buy bread"), (view::DiffKind::Add, "hi")]);
+            port.answer(*id, view::Decision::Yes);
+            until(&mut rx, |e| is_message(e, "↶ Undid turn 1: 1 file restored")).await;
+            assert_eq!(note(&dirs), "hi\n");
+            // Nothing more to undo.
+            port.run_command("/undo".into());
+            until(&mut rx, |e| is_message(e, "Nothing to undo")).await;
+        }
+
+        #[tokio::test]
+        async fn no_changes_nothing() {
+            let dirs = Dirs::new();
+            let (port, mut rx) = after_a_turn(&dirs).await;
+            port.run_command("/undo".into());
+            let seen = until(&mut rx, |e| matches!(e, UiEvent::Approval { .. })).await;
+            let Some(UiEvent::Approval { id, .. }) = seen.last() else { unreachable!() };
+            port.answer(*id, view::Decision::No);
+            until(&mut rx, |e| is_message(e, "Nothing was undone.")).await;
+            assert_eq!(note(&dirs), "buy bread\n");
+        }
+
+        #[tokio::test]
+        async fn with_nothing_to_undo_it_says_why() {
+            let dirs = Dirs::new();
+            repo(&dirs);
+            let (tx, mut rx) = unbounded_channel();
+            let port = Port(Bridge::start(startup(&dirs, Some(asks()), vec![], None), tx).unwrap());
+            port.run_command("/undo".into());
+            let seen = until(&mut rx, |e| is_message(e, "Nothing to undo")).await;
+            assert!(texts(&seen).last().unwrap().contains("no turn in this session has changed files yet"));
+        }
+
+        #[tokio::test]
+        async fn refused_during_a_turn() {
+            let dirs = Dirs::new();
+            repo(&dirs);
+            let replies = vec![write("w", "notes.txt", "x\n"), say("Done.")];
+            let (tx, mut rx) = unbounded_channel();
+            let port = Port(Bridge::start(startup(&dirs, Some(asks()), replies, None), tx).unwrap());
+            port.send("go".into());
+            let seen = until(&mut rx, |e| matches!(e, UiEvent::Approval { .. })).await;
+            let Some(UiEvent::Approval { id, .. }) = seen.last() else { unreachable!() };
+            // The turn waits at its approval: /undo now is refused, and asks nothing.
+            port.run_command("/undo".into());
+            let seen = until(&mut rx, |e| is_message(e, "before /undo")).await;
+            assert!(!seen.iter().any(|e| matches!(e, UiEvent::Approval { .. })));
+            port.answer(*id, view::Decision::Yes);
+            until(&mut rx, |e| matches!(e, UiEvent::TurnEnd { .. })).await;
+            assert_eq!(note(&dirs), "x\n");
+        }
     }
 
     // Marv tests/herdr.test.tsx: "App in a Herdr pane".
@@ -1874,6 +2095,29 @@ mod tests {
         assert!(matches!(&out[1], UiEvent::Subagent { title, .. } if title == "general-purpose · fix"));
         let tainted = map_event(SessionEvent::Tainted { source: marv_core::Provenance::Web }, &mut map, &t, &last);
         assert!(texts(&tainted)[0].contains("a web page"));
+    }
+
+    #[test]
+    fn the_main_agents_plan_call_pins_its_list_and_a_subagents_doesnt() {
+        let call = ToolCall { id: "p1".into(), name: "plan".into(), arguments: "{}".into() };
+        let mut run = marv_agent::ToolRun::new(
+            ToolResult { output: "Plan saved: 0 of 1 done; now: A.".into(), summary: Some("0/1 done".into()), is_error: false },
+            "Plan",
+        );
+        let items = vec![marv_tools::PlanItem { text: "A".into(), status: marv_tools::PlanStatus::InProgress }];
+        run.display = Some(Arc::new(marv_session::ToolDisplay { diff: None, plan: Some(items) }));
+        let mut map = TurnMap::default();
+        let (t, last) = (view::Totals::default, || None);
+        let ended = LoopEvent::ToolEnd { call: call.clone(), run: run.clone() };
+        let out = map_event(SessionEvent::Loop(ended.clone()), &mut map, &t, &last);
+        let expected = vec![view::PlanItem { text: "A".into(), status: view::PlanStatus::InProgress }];
+        assert!(matches!(&out[..], [UiEvent::ToolEnd { .. }, UiEvent::Plan(items)] if *items == expected));
+        let sub = map_event(SessionEvent::Subagent { call_id: "a1".into(), event: ended }, &mut map, &t, &last);
+        assert!(!sub.iter().any(|e| matches!(e, UiEvent::Plan(_))));
+        // A failed call (no list) changes nothing.
+        let failed = marv_agent::ToolRun::new(ToolResult { output: "x".into(), summary: None, is_error: true }, "Plan");
+        let out = map_event(SessionEvent::Loop(LoopEvent::ToolEnd { call, run: failed }), &mut map, &t, &last);
+        assert!(!out.iter().any(|e| matches!(e, UiEvent::Plan(_))));
     }
 
     #[test]
