@@ -103,6 +103,9 @@ pub struct SandboxOptions {
     /// socket folder at `/run/marv` (writable for the process that serves it, read-only for a command that only
     /// connects).
     pub binds: Vec<Bind>,
+    /// Marv's own runtime folders (`$XDG_RUNTIME_DIR/marv`: the mesh's plug and discovery sockets, the process
+    /// door's relays), each an empty tmpfs in the sandbox wherever it is (marv-rs).
+    pub hidden: Vec<PathBuf>,
 }
 
 /// One of [`SandboxOptions::binds`]: `source` on the host, at `dest` in the sandbox.
@@ -229,6 +232,21 @@ pub fn sandbox_args(opts: &SandboxOptions, fs: &dyn FsProbe) -> Result<Vec<OsStr
             args.extend(["--tmpfs".into(), path.clone().into_os_string(), "--remount-ro".into(), path.clone().into_os_string()]);
         }
     }
+    // Marv's runtime folder, empty wherever $XDG_RUNTIME_DIR points (marv-rs): a socket a command could see is one it
+    // could connect to (a read-only mount doesn't stop connect()), and a plug's socket carries that plug's identity
+    // and wires. After the project, toolchain and PATH mounts, so none of them shows it again. The relay and mesh
+    // binds have their own destinations under /run/marv, which this never covers. Under /run it's already gone (the
+    // empty /run above keeps only PATH folders, never /run/user/<uid>), and a mount there would only make bwrap
+    // create its mount point in that empty /run.
+    for dir in &opts.hidden {
+        if let Ok(real) = fs.realpath(dir)
+            && fs.exists(&real)
+            && real.is_absolute()
+            && !real.starts_with("/run")
+        {
+            args.extend(["--tmpfs".into(), real.into_os_string()]);
+        }
+    }
     // Last, on top of every other mount, so the empty file hides the real one and no later mount shows it again.
     let mut masks: Vec<PathBuf> = Vec::new();
     for file in CREDENTIALS {
@@ -320,6 +338,26 @@ mod tests {
     }
     fn strings(opts: &SandboxOptions, fs: &dyn FsProbe) -> Vec<String> {
         sandbox_args(opts, fs).unwrap().into_iter().map(|s| s.to_string_lossy().into_owned()).collect()
+    }
+
+    #[test]
+    fn marvs_runtime_folder_is_an_empty_tmpfs_after_the_project_and_toolchains() {
+        // Under the project (which is mounted writable) and under a folder outside the hidden ones: hidden all the same.
+        let fs = Fake::new(|p| p.ends_with(".bun") || p.contains("marv"));
+        let opts = SandboxOptions {
+            hidden: vec!["/home/me/proj/xdg/marv".into(), "/var/tmp/xdg/marv".into(), "/run/user/1000/marv".into()],
+            ..base()
+        };
+        let args = joined(&opts, &fs);
+        let project = args.find("--bind /home/me/proj /home/me/proj").unwrap();
+        let toolchain = args.find("--ro-bind /home/me/.bun").unwrap();
+        let hidden = args.find("--tmpfs /home/me/proj/xdg/marv").expect("hidden in the project");
+        assert!(hidden > project && hidden > toolchain, "{args}");
+        assert!(args.contains("--tmpfs /var/tmp/xdg/marv"), "{args}");
+        assert!(!args.contains("--tmpfs /run/user/1000/marv"), "already hidden by the empty /run: {args}");
+        // A folder that doesn't exist yet gets nothing (bwrap can't create a mount point on the read-only root).
+        let none = joined(&SandboxOptions { hidden: vec!["/run/user/1000/marv".into()], ..base() }, &default_fs());
+        assert!(!none.contains("/run/user/1000/marv"), "{none}");
     }
 
     #[test]

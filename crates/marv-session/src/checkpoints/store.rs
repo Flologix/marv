@@ -394,7 +394,15 @@ impl CheckpointStore {
             }
             temp.0 = Some(dir.clone());
             let index = dir.join("index");
-            let _ = std::fs::copy(where_.git_dir.join("index"), &index); // a new repository has none: start empty
+            let user_index = where_.git_dir.join("index");
+            // A new repository has none: start empty. The copy keeps the index's own modification time: git treats an
+            // entry whose file changed in the same timestamp tick as the index was written as "racy" and re-reads it,
+            // and a copy stamped now would hide that, so a same-size edit could be missed.
+            if std::fs::copy(&user_index, &index).is_ok()
+                && let Ok(modified) = std::fs::metadata(&user_index).and_then(|m| m.modified())
+            {
+                let _ = std::fs::File::options().write(true).open(&index).and_then(|f| f.set_modified(modified));
+            }
             index
         } else {
             let index = where_.git_dir.join("marv-index"); // Marv's own: kept, for its stat cache

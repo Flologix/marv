@@ -45,7 +45,7 @@ Narrow, named ways out, each asked for and each with its own rule for what it ca
   - mesh calls on unapproved wires;
   - writes to protected paths.
 - **Taint lasts as long as the text does.** It's saved with the session and restored on resume (`marv -c`, `/resume`); an older session file is judged by its tool calls, erring on the tainted side. A subagent's taint taints its parent: its report can carry the outside text back.
-- **The mesh's sockets live only where every sandbox hides them** (`/run`, `/tmp` or the home folder): a sandboxed command that could see a plug's socket could connect to it and use that plug's wires. A runtime dir elsewhere turns the mesh off.
+- **Marv's runtime folder is empty in every sandbox.** `$XDG_RUNTIME_DIR/marv` (the mesh's plug and discovery sockets, the process door's relays) is an empty tmpfs in every command's sandbox, mounted after the project and toolchains, wherever it is: a sandboxed command that could see a plug's socket could connect to it and use that plug's wires. And the mesh refuses a runtime dir outside `/run`, `/tmp` and the home folder.
 - **Approvals show the full payload.** A network approval lists the scripts written this session that the command will run.
 - **Subagents don't inherit** network, web or mesh approvals.
 

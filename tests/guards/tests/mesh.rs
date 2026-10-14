@@ -196,3 +196,41 @@ async fn a_sandboxed_subagent_reaches_the_parent_only_over_its_wire() {
     assert!(m.mesh.drain_inbox(&PlugId::new("worker-2").unwrap()).is_empty());
     assert_eq!(m.mesh.table().all().len(), 2, "nothing wired from inside");
 }
+
+/// **Marv's runtime folder is empty in every sandbox, wherever `XDG_RUNTIME_DIR` points.** A sandboxed command that
+/// could see a plug's socket could connect to it and act with that plug's identity and wires (a read-only mount
+/// doesn't stop `connect()`). The mesh also refuses a runtime dir outside `/run`, `/tmp` and the home folder
+/// (`marv_sandbox::hidden_in_sandbox`); this holds even where one is inside the project, which is mounted writable.
+///
+/// Proven: removed the `--tmpfs` over `SandboxOptions::hidden` in `sandbox_args` → this test failed (the plug listed).
+#[test]
+fn marvs_runtime_folder_is_empty_in_the_sandbox_even_inside_the_project() {
+    marv_guards::require_bwrap!();
+    let (project, home) = (marv_guards::TempDir::new("rt-proj"), marv_guards::TempDir::outside_tmp("rt-home"));
+    let outside = marv_guards::TempDir::outside_tmp("rt-xdg");
+    project.write("xdg/marv/plugs/s/parent.sock", "the parent's plug");
+    outside.write("marv/plugs/s/parent.sock", "the parent's plug");
+    let sandbox = marv_sandbox::Sandbox {
+        hidden: vec![project.path().join("xdg/marv"), outside.path().join("marv")],
+        ..marv_guards::sandbox_with_home(home.path())
+    };
+    let ran = marv_guards::run_sandboxed(
+        &sandbox,
+        project.path(),
+        &marv_sandbox::CommandMounts::default(),
+        &format!(
+            "ls -A {}/xdg/marv | wc -l; ls -A {}/marv | wc -l; cat {}/xdg/marv/plugs/s/parent.sock {}/marv/plugs/s/parent.sock 2>/dev/null; echo end",
+            project.path().display(),
+            outside.path().display(),
+            project.path().display(),
+            outside.path().display()
+        ),
+        &[],
+    );
+    let counts: Vec<&str> = ran.output.lines().take(2).map(str::trim).collect();
+    assert_eq!(counts, ["0", "0"], "{}", ran.output);
+    assert!(!ran.output.contains("the parent's plug"), "{}", ran.output);
+    assert!(ran.output.contains("end"), "{}", ran.output);
+    // On the host the files are still there: only the sandbox's view is empty.
+    assert!(project.path().join("xdg/marv/plugs/s/parent.sock").exists());
+}

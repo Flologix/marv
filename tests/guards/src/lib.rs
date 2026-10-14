@@ -97,6 +97,7 @@ pub fn sandbox_with_home(home: &Path) -> Sandbox {
         path: std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
         lang: "C.UTF-8".into(),
         mesh_socket: None,
+        hidden: Vec::new(),
     }
 }
 

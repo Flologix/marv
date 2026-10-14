@@ -87,6 +87,8 @@ pub struct Sandbox {
     pub lang: String,
     /// The mesh plug's host-side socket, bound at [`MESH_SOCKET`] (`docs/MESH.md`). None: no mesh.
     pub mesh_socket: Option<PathBuf>,
+    /// Folders every command sees empty: Marv's runtime folder (`$XDG_RUNTIME_DIR/marv`, see `SandboxOptions::hidden`).
+    pub hidden: Vec<PathBuf>,
 }
 
 /// One command's mounts beyond the session's: see [`SandboxOptions`] for what each means.
@@ -111,6 +113,11 @@ impl Sandbox {
             path: std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
             lang: std::env::var("LANG").unwrap_or_else(|_| "C.UTF-8".into()),
             mesh_socket: None,
+            hidden: std::env::var_os("XDG_RUNTIME_DIR")
+                .map(PathBuf::from)
+                .filter(|d| d.is_absolute())
+                .map(|d| vec![d.join("marv")])
+                .unwrap_or_default(),
         }
     }
 
@@ -140,6 +147,7 @@ impl Sandbox {
             protected: protected::protected_mounts(root),
             mesh_socket: self.mesh_socket.clone(),
             binds: mounts.binds.clone(),
+            hidden: self.hidden.clone(),
         };
         let mut argv: Vec<OsString> = vec!["bwrap".into()];
         argv.extend(sandbox_args(&options, &RealFs)?);
