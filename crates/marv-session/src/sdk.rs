@@ -309,6 +309,7 @@ pub async fn create_session(options: SessionOptions) -> Result<MarvSession, Sess
     init.sessions = store_for(&options.persist, || SessionStore::new(config_dir.join("sessions")));
     init.trajectories = store_for(&options.trajectories, || TrajectoryStore::new(config_dir.join("trajectories")));
     init.worktrees_dir = Some(config_dir.join("worktrees").join(project_key(&root)));
+    init.tool_output_dir = Some(config_dir.join(marv_tools::output::TOOL_OUTPUT_DIR));
     init.transcript = options.transcript;
     init.on_warning = options.on_warning.clone();
     init.problems = problems;

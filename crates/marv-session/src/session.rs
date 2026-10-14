@@ -261,6 +261,9 @@ pub struct SessionInit {
     pub log_trajectories: bool,
     /// `~/.marv/worktrees/<project>`; without it, no worktrees.
     pub worktrees_dir: Option<PathBuf>,
+    /// `~/.marv/tool-output` (#61): a cut tool result is saved whole in `<dir>/<session id>/`, which read_file and grep
+    /// may read; old sessions' folders are cleaned up when the session is made. Without it, cuts aren't saved.
+    pub tool_output_dir: Option<PathBuf>,
     /// What the user saw, saved with the session (the TUI's transcript); default: the messages and replies.
     pub transcript: Option<TranscriptFn>,
     /// Something a UI shows changed outside a turn (the model's info arrived, memory reloaded).
@@ -313,6 +316,7 @@ impl SessionInit {
             trajectories: None,
             log_trajectories: true,
             worktrees_dir: None,
+            tool_output_dir: None,
             transcript: None,
             on_change: None,
             on_warning: None,
@@ -835,6 +839,15 @@ impl MarvSession {
             init,
         };
         let session = Self { inner: Arc::new(inner) };
+        // Startup is when old saved outputs go (#61): on a thread of its own, so a big store never delays the session.
+        if let Some(dir) = session.inner.init.tool_output_dir.clone() {
+            let id = session.id();
+            std::thread::spawn(move || {
+                let keep = std::time::Duration::from_secs(marv_tools::output::KEEP_DAYS * 86_400);
+                let max = marv_tools::output::MAX_TOTAL_BYTES;
+                marv_tools::output::clean_tool_output(&dir, keep, max, Some(&id), std::time::SystemTime::now());
+            });
+        }
         let system = session.build_system();
         session.state().system = system;
         session.lookup();
@@ -1203,6 +1216,8 @@ impl MarvSession {
         ctx.yolo = yolo;
         ctx.skills = self.inner.skills.clone();
         ctx.memory = init.memory.as_ref().map(|(paths, _)| paths.for_tools());
+        // The session's id now (a resume changes it): its cut outputs are saved, and readable, there (#61).
+        ctx.tool_output = init.tool_output_dir.as_ref().map(|dir| dir.join(self.id()));
         ctx.agent_host = Some(host);
         // Where the plan tool writes; only the main agent gets it (as it does agent_host), so subagents have no plan.
         if init.plan {

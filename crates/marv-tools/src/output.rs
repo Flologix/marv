@@ -78,8 +78,7 @@ pub fn spill_cut(text: &str, dir: &Path, call_id: &str) -> std::io::Result<Strin
 /// or the plain cut where there's none or the save fails.
 pub fn cut_for_call(text: &str, ctx: &ToolContext) -> String {
     match &ctx.tool_output {
-        Some(dir) => spill_cut(text, dir, ctx.call_id.as_deref().unwrap_or("call"))
-            .unwrap_or_else(|_| cut_for_model(text)),
+        Some(dir) => spill_cut(text, dir, ctx.call_id.as_deref().unwrap_or("call")).unwrap_or_else(|_| cut_for_model(text)),
         None => cut_for_model(text),
     }
 }

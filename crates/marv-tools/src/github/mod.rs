@@ -32,7 +32,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::bash::{CommandResult, capture, format_output};
+use crate::bash::{CommandResult, capture, format_output_with};
+use crate::output::cut_for_call;
 use crate::types::{Door, Preview, Scope, Tool, ToolContext, ToolError, ToolOutput};
 use allow::{Classified, ClassifyContext, classify, origin_host};
 use redact::{redact, redacted_note};
@@ -466,8 +467,10 @@ impl Tool for Github {
     async fn run(&self, input: &GithubInput, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let env = self.env();
         self.judge(&input.args, ctx, &env).await?; // Again here: a read that names a host never went through the preview.
-        let result = run_gh(&input.args, &ctx.root, &env, &ctx.cancel, TIMEOUT).await?;
-        let shown = redact(&format_output(&result));
+        let mut result = run_gh(&input.args, &ctx.root, &env, &ctx.cancel, TIMEOUT).await?;
+        // Redacted before the cut, so a cut output saved whole (#61) is redacted too.
+        let shown = redact(&result.output);
+        result.output = shown.text;
         let trimmed = result.output.trim_end();
         let lines = if trimmed.is_empty() { 0 } else { trimmed.split('\n').count() };
         let status = if result.timed_out {
@@ -485,7 +488,7 @@ impl Tool for Github {
             n => format!(" · {n} tokens redacted"),
         };
         let note = if shown.count > 0 { format!("\n\n{}", redacted_note(shown.count)) } else { String::new() };
-        Ok(ToolOutput::ok(shown.text + &note, status + &redacted))
+        Ok(ToolOutput::ok(format_output_with(&result, |t| cut_for_call(t, ctx)) + &note, status + &redacted))
     }
 }
 

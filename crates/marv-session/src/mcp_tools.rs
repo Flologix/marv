@@ -2,6 +2,7 @@
 //! of marv-tools, so the session adapts its plain `McpTool`s, and runs the deferred pair from `src/mcp/deferred.ts`).
 //!
 //! - [`McpToolAdapter`]: `mcp__<server>__<tool>`, the server's own schema, provenance MCP (taints), never yolo-safe.
+//!   Its result is cut here (the same 10k head and 20k tail as marv-mcp's cap), and a cut one is saved whole (#61).
 //!   Its kind reads the session's taint *at call time*: `readOnlyHint` tools run freely only while the session is
 //!   clean; once tainted every MCP call is Egress and asks, even in yolo, even after an "always".
 //! - [`ToolSearchTool`] / [`McpCallTool`]: a deferred conversation's two constant specs (#14). `mcp_call` hands the
@@ -18,6 +19,7 @@ use marv_mcp::deferred::{SearchInput, arguments_as_object, schema_hint, tool_sea
 use marv_mcp::manager::McpManager;
 use marv_mcp::tool::McpTool;
 use marv_sandbox::TaintState;
+use marv_tools::output::cut_for_call;
 use marv_tools::{Preview, Repaired, Scope, Tool, ToolContext, ToolError, ToolOutput, ToolRef};
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -74,8 +76,9 @@ impl Tool for McpToolAdapter {
         self.tool.auto_safe() // never: yolo doesn't skip an MCP call
     }
     async fn run(&self, input: &Self::Input, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
-        let result = self.tool.run(input.clone(), ctx.cancel.clone()).await.map_err(ToolError::new)?;
-        let mut out = ToolOutput::ok(result.output, result.summary.unwrap_or_default());
+        let result = self.tool.run_whole(input.clone(), ctx.cancel.clone()).await.map_err(ToolError::new)?;
+        // Cut here, not in marv-mcp: a cut result is saved whole for read_file and grep (#61).
+        let mut out = ToolOutput::ok(cut_for_call(&result.output, ctx), result.summary.unwrap_or_default());
         out.is_error = result.is_error;
         out.provenance = Provenance::Mcp;
         Ok(out)
@@ -247,6 +250,48 @@ mod tests {
         let repaired = call.repair(&json!({ "tool": "mcp__a__b", "arguments": "{\"x\":1}" }), &ctx).unwrap();
         assert_eq!(repaired.input, json!({ "tool": "mcp__a__b", "arguments": { "x": 1 } }));
         assert!(repaired.note.unwrap().contains("came as a JSON string"));
+    }
+
+    struct Long;
+    #[async_trait]
+    impl marv_mcp::tool::McpCaller for Long {
+        async fn call(
+            &self,
+            _tool: &str,
+            _args: Map<String, Value>,
+            _cancel: tokio_util::sync::CancellationToken,
+        ) -> marv_mcp::Result<marv_mcp::tool::McpCallResult> {
+            let text = format!("first\n{}\nlast", "y".repeat(40_000));
+            let block = marv_mcp::tool::ContentBlock { kind: "text".into(), text: Some(text), ..Default::default() };
+            Ok(marv_mcp::tool::McpCallResult { content: vec![block], ..Default::default() })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_long_mcp_result_is_cut_and_saved_whole() {
+        let server = marv_mcp::config::parse_server(
+            "gh",
+            &json!({"command": "x"}),
+            marv_mcp::config::ServerSource::Project,
+            &|_| None,
+            "f",
+        )
+        .unwrap();
+        let info =
+            marv_mcp::tool::McpToolInfo { name: "logs".into(), description: None, input_schema: Map::new(), annotations: None };
+        let adapter = McpToolAdapter {
+            tool: marv_mcp::tool::make_mcp_tool(&server, info, Arc::new(Long)),
+            taint: Arc::new(TaintState::new()),
+        };
+        let store = std::env::temp_dir().join(format!("marv-mcp-spill-{}", std::process::id()));
+        let ctx =
+            ToolContext { tool_output: Some(store.join("s")), call_id: Some("m1".into()), ..ToolContext::new("/nonexistent/p") };
+        let out = adapter.run(&Map::new(), &ctx).await.unwrap();
+        let saved = store.join("s/m1.txt");
+        assert!(out.output.starts_with("first\n") && out.output.ends_with("\nlast"));
+        assert!(out.output.contains(&format!("characters omitted; full output: {}", saved.display())));
+        assert_eq!(std::fs::read_to_string(&saved).unwrap(), format!("first\n{}\nlast", "y".repeat(40_000)));
+        std::fs::remove_dir_all(store).unwrap();
     }
 
     struct Recording(std::sync::Mutex<Vec<String>>);
