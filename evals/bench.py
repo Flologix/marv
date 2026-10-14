@@ -81,18 +81,42 @@ def parse_lines(text):
         except ValueError: continue
 
 
+def agent_run(cmd, ws, logdir, timeout, env=None):
+    """Runs the agent and saves its stream and stderr, also when it times out: then it's killed and `timedOut` is set,
+    and what it printed until then is still parsed (a stuck run is the one worth reading)."""
+    proc = subprocess.Popen(cmd, cwd=ws, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+        timed_out = False
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        out, err = proc.communicate()
+        timed_out = True
+    (logdir / "stream.jsonl").write_text(out or "")
+    (logdir / "stderr.txt").write_text(err or "")
+    return subprocess.CompletedProcess(cmd, None if timed_out else proc.returncode, out or "", err or ""), timed_out
+
+
+def isolated_home(a, env, tmp):
+    """Without --user-skills, a throwaway HOME: personal skills and agents come from the home whatever the config dir
+    (Marv's ~/.marv/skills, opencode's ~/.claude/skills and ~/.agents/skills), and one harness would carry a set the
+    other doesn't (#84)."""
+    if a.user_skills: return
+    home = tmp / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    env["HOME"] = str(home)
+
+
 def run_claude(ws, prompt, servers, logdir, a):
     cmd = ["claude", "-p", prompt, "--model", a.claude_model, "--output-format", "stream-json", "--verbose",
            "--setting-sources", "project", "--strict-mcp-config", "--mcp-config", json.dumps({"mcpServers": servers or {}}),
            "--allowedTools", CLAUDE_TOOLS, "--no-session-persistence"]
     try:
-        p = subprocess.run(cmd, cwd=ws, capture_output=True, text=True, timeout=a.timeout)
+        p, timed_out = agent_run(cmd, ws, logdir, a.timeout)
     finally:
         # Claude Code leaves an empty ~/.claude/projects/<workspace>/ behind even without session persistence.
         project = Path.home() / ".claude/projects" / re.sub(r"[^A-Za-z0-9]", "-", str(ws))
         if project.is_dir(): subprocess.run(["find", str(project), "-depth", "-type", "d", "-empty", "-delete"])
-    (logdir / "stream.jsonl").write_text(p.stdout)
-    (logdir / "stderr.txt").write_text(p.stderr)
     r = dict(tools=Counter(), toolErrors=0, reply="", exit=p.returncode)
     messages = set()
     for e in parse_lines(p.stdout):
@@ -110,6 +134,7 @@ def run_claude(ws, prompt, servers, logdir, a):
                      promptTokens=u.get("input_tokens", 0) + cached + created, cachedTokens=cached,
                      completionTokens=u.get("output_tokens", 0), agentMs=e.get("duration_ms"))
     r["requests"] = len(messages)
+    if timed_out: r["reason"] = "timeout"
     return r
 
 
@@ -119,12 +144,11 @@ def run_marv(ws, prompt, servers, logdir, a):
     if servers: (cfg / "mcp.json").write_text(json.dumps({"mcpServers": servers}))
     env = {k: v for k, v in os.environ.items() if k not in ("OPENROUTER_API_KEY", "MARV_MODEL", "MARV_MAX_STEPS")}
     env["MARV_CONFIG_DIR"] = str(cfg)
+    isolated_home(a, env, cfg)
     cmd = [a.marv_bin, "-p", prompt, "-m", a.marv_model, "--output", "stream-json", "--max-steps", "50",
            "--approve", "files", "--approve", "process", "--approve", "mcp"]
     try:
-        p = subprocess.run(cmd, cwd=ws, capture_output=True, text=True, timeout=a.timeout, env=env)
-        (logdir / "stream.jsonl").write_text(p.stdout)
-        (logdir / "stderr.txt").write_text(p.stderr)
+        p, timed_out = agent_run(cmd, ws, logdir, a.timeout, env)
         for t in (cfg / "trajectories").rglob("*.jsonl"): shutil.copy(t, logdir / "trajectory.jsonl")
     finally:
         shutil.rmtree(cfg, ignore_errors=True)
@@ -143,19 +167,10 @@ def run_marv(ws, prompt, servers, logdir, a):
         for e in parse_lines(traj.read_text()):
             if e.get("type") == "tool" and e.get("isError"): r["toolErrors"] += 1
             if e.get("type") == "agent_end" and e.get("agent") == "main": r["agentMs"] = e.get("ms")
+            # A timed-out run has no result event: count its steps from the trajectory.
+            if timed_out and e.get("type") == "request" and e.get("agent") == "main": r["requests"] = r.get("requests", 0) + 1
+    if timed_out: r["reason"] = "timeout"
     return r
-
-
-def opencode_bin():
-    """The opencode binary itself. mise's wrapper script (`mise x opencode`) reads mise's config from XDG_CONFIG_HOME,
-    which each run points at a throwaway folder, so through it every run reinstalls opencode first (~50 s, and the
-    parallel installs race)."""
-    try:
-        p = subprocess.run(["mise", "which", "opencode"], capture_output=True, text=True)
-        if p.returncode == 0 and p.stdout.strip(): return p.stdout.strip()
-    except FileNotFoundError:
-        pass
-    return "opencode"
 
 
 def opencode_bin():
@@ -178,17 +193,16 @@ def run_opencode(ws, prompt, servers, logdir, a):
     env = {k: v for k, v in os.environ.items() if not k.startswith("OPENCODE")}
     env.update(OPENROUTER_API_KEY=a.key, XDG_CONFIG_HOME=str(tmp / "config"), XDG_DATA_HOME=str(tmp / "data"),
                XDG_STATE_HOME=str(tmp / "state"), XDG_CACHE_HOME=str(tmp / "cache"))
+    isolated_home(a, env, tmp)
     config = {"$schema": "https://opencode.ai/config.json", "autoupdate": False, "share": "disabled"}
     if servers:
         config["mcp"] = {n: {"type": "local", "command": [s["command"], *s["args"]], "enabled": True} for n, s in servers.items()}
     env["OPENCODE_CONFIG_CONTENT"] = json.dumps(config)
     cmd = [a.opencode_bin, "run", "--pure", "--auto", "--format", "json", "-m", f"openrouter/{a.marv_model}", "--dir", str(ws), prompt]
     try:
-        p = subprocess.run(cmd, cwd=ws, capture_output=True, text=True, timeout=a.timeout, env=env)
+        p, timed_out = agent_run(cmd, ws, logdir, a.timeout, env)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    (logdir / "stream.jsonl").write_text(p.stdout)
-    (logdir / "stderr.txt").write_text(p.stderr)
     r = dict(tools=Counter(), toolErrors=0, reply="", exit=p.returncode, requests=0, promptTokens=0, cachedTokens=0,
              completionTokens=0, cost=0.0, reason="end" if p.returncode == 0 else "error")
     texts, first = [], None
@@ -212,6 +226,7 @@ def run_opencode(ws, prompt, servers, logdir, a):
         elif kind == "error":
             r["reason"] = "error"
     r["reply"] = texts[-1] if texts else ""
+    if timed_out: r["reason"] = "timeout"
     return r
 
 
@@ -356,6 +371,7 @@ def main():
     ap.add_argument("--claude-model", default="claude-haiku-5-5")
     ap.add_argument("--marv-bin", default=str(ROOT / "target/release/marv") if (ROOT / "target/release/marv").exists() else "marv")
     ap.add_argument("--opencode-bin", default=opencode_bin())
+    ap.add_argument("--user-skills", action="store_true", help="keep your HOME, and with it your personal skills (Marv, opencode)")
     ap.add_argument("--tracker", default=str(ROOT / "target/debug/marv-oracle"))
     a = ap.parse_args()
     if a.report: return report(a.report)

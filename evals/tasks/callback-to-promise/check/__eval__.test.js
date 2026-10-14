@@ -95,8 +95,11 @@ test("no callbacks are left in the code or the tests (loadCallback aside)", () =
   expect(tests.length).toBeGreaterThanOrEqual(3);
   for (const [name, text] of [...src, ...tests]) {
     // Comments may describe the old API; the wrapper is the one callback allowed (up to the next blank line).
-    const bare = text.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
-    const code = name === "src/store.js" ? bare.replace(/export\s+(async\s+)?(function|const|let)\s+loadCallback[\s\S]*?(\n\s*\n|$)/, "") : bare;
+    // Strings don't count either (a test's "cb.json" isn't a callback), and a test may call the wrapper with one.
+    const bare = text.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "").replace(/(["'`])(?:\\.|(?!\1)[^\\\n])*\1/g, '""');
+    const code = name === "src/store.js"
+      ? bare.replace(/export\s+(async\s+)?(function|const|let)\s+loadCallback[\s\S]*?(\n\s*\n|$)/, "")
+      : bare.replace(/\bloadCallback\s*\(.*$/gm, "");
     expect({ name, callbacks: /\((err\w*|e), /.test(code) || /\bdone\)/.test(code) || /\bcb\b/.test(code) }).toEqual({ name, callbacks: false });
   }
 });
