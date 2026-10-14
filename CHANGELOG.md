@@ -15,6 +15,7 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 ### Changed
 
 - **`mesh_list` names the other Marvs on this machine**, with the inbox a `mesh_send` would use and a note that the user has to wire it first. Before, the model only saw "nothing is wired", and answered "who's on the mesh?" with nobody while `marv mesh ls` listed several. Names only: their folders and panes stay in `marv mesh ls`.
+- **`mesh_list` shows the agents in Herdr panes that can be wired, and your own address (#76).** In Herdr it lists each agent pane with the agent Herdr sees there, its state, the Marv in it if any, and its `herdr.pane.<pane>.send` and `.status` receptacles, under "Can be wired", so a model asked to get another agent to do something uses the mesh (one approval) instead of guessing names or running the `herdr` CLI itself. It also says the caller's inbox and the name another Marv sends to (`peer.<marv>.agent.<agent>.inbox`), so it can tell a peer where to reply. With nothing wired, its hint now names the forms that reach another Marv or a Herdr pane, not `agent.<name>.inbox`. Only plain identifiers from Herdr are shown (a pane's given name and folder stay in `marv mesh ls`), so the list doesn't taint the session; a slow or missing Herdr is skipped after 1.5 s. `mesh_call`'s example receptacle is a real one now (`herdr.pane.w1-p2.status`).
 
 ### Added
 
