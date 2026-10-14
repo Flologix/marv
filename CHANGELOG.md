@@ -14,6 +14,7 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ### Changed
 
+- **Small MCP tool sets are offered directly (#87).** Marv now defers MCP tools (`tool_search`, then `mcp_call`) only when their specs would cost more than 8,000 tokens per request (was 4,000), or 10% of the context window if that is less. A server like the eval tracker (25 tools, about 4,700 tokens) is called in one step instead of a `tool_search` round trip per tool group. Approvals, "don't ask again" scopes (`mcp:<server>:<tool>`), `--approve mcp` and the taint rules are the same either way. The choice is still made once per conversation, on its first turn with MCP tools, and kept: a server added later joins a direct conversation's tool list after the others and never switches it to deferred. `"mcpTools": "eager"` or `"deferred"` still overrides it.
 - **`mesh_list` names the other Marvs on this machine**, with the inbox a `mesh_send` would use and a note that the user has to wire it first. Before, the model only saw "nothing is wired", and answered "who's on the mesh?" with nobody while `marv mesh ls` listed several. Names only: their folders and panes stay in `marv mesh ls`.
 
 ### Added

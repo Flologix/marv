@@ -5,6 +5,9 @@
     "server": "tracker",
     "data": "tracker.json"
   },
+  "config": {
+    "mcpTools": "deferred"
+  },
   "deliberate": {
     "security": "Provenance and taint",
     "why": "marv-rs fences every MCP result as data for the model (docs/SECURITY.md, \"Provenance and taint\": text that isn't from the user or Marv is fenced), so the tool results the model reads, and the events that show them, are wrapped in <untrusted-data source=\"mcp\" …>. Files, tool calls and the exit code are Marv's."
