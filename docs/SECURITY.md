@@ -26,7 +26,7 @@ These rules are requirements for the Rust build from day one. They come from a s
   - `.vscode/`, `.idea/`;
   - `package.json` lifecycle `scripts`.
 - **Secrets** (`.env*`, `*.pem`, `id_*`) need approval to read, and are masked in the sandbox.
-- **Every path is checked after `realpath`.** No tool follows a symlink out of its root. That includes skill files, which the old code read outside the sandbox.
+- **Every path is checked after `realpath`.** No tool follows a symlink out of its root. That includes skill files, which the old code read outside the sandbox, and instruction files (`AGENTS.md`/`CLAUDE.md`: the project's, its parents', nested ones), which also never lead to a secret or into `node_modules`/`target`/`.git`; only the user's own `~/.marv/AGENTS.md` may link anywhere.
   - The one exception: a **personal** skill folder (`~/.marv/skills/<name>`) may be a symlink to a folder only root can change, such as Omarchy's `/usr/share/omarchy/…` (#75). That folder and every folder above it must be owned by root and not group- or world-writable. The skill is read from the link's real target, and its `SKILL.md` and files can't lead out of that folder. A project's skill folder never may.
 
 ## Doors out of the sandbox

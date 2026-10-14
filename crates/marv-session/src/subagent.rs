@@ -8,6 +8,13 @@
 //! Its tool context is built from scratch ([`subagent_context`]), so nothing is inherited by accident: no agent host
 //! (no nesting), no memory, no call id. Yolo carries over. marv-rs: its taint is `TaintState::for_subagent` and it
 //! **doesn't inherit network, web or mesh approvals** (docs/SECURITY.md): its "always" scopes start empty.
+//!
+//! Instruction files (#62): a subagent gets the same ones as the main agent, the user's own `~/.marv/AGENTS.md`
+//! included. They're the user's rules for any work done for them (a subagent edits the same files, runs the same
+//! tests, and "never commit" or "use pnpm" holds for it too), the text is already in the main agent's context, and
+//! its prompt is built once, so its cache holds. Nested files come on demand as for the main agent, from a fresh
+//! record (its context starts empty: a file the main agent already had is news to it). In a worktree, the nested
+//! files are the worktree's.
 
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
@@ -361,7 +368,11 @@ async fn drive(
     let specs = available.iter().map(|t| t.spec()).collect();
     let taint = sub_ctx.taint.clone();
     let child_taint = sub_ctx.taint.clone();
-    let runner = Arc::new(SessionToolRunner::new(sub_ctx, Arc::new(available)));
+    let mut runner = SessionToolRunner::new(sub_ctx, Arc::new(available));
+    if host.nested_instructions {
+        runner.nested = Some(Arc::default());
+    }
+    let runner = Arc::new(runner);
     let history: History = Arc::new(Mutex::new(vec![ChatTurn::User { text: input.prompt.clone() }]));
     let mut options =
         AgentOptions::new(host.provider_for(agent_type.model.as_deref()), history, system, specs, runner, ctx.cancel.clone());
@@ -653,6 +664,7 @@ mod run_tests {
                 agents: Arc::new(agents),
                 cwd: "~/proj".into(),
                 instructions: None,
+                nested_instructions: false,
                 worktrees_dir: worktrees.then(|| self.trees.0.clone()),
                 factory: Arc::new(Factory { provider: provider.clone(), models: seen.models.clone() }),
                 provider,
