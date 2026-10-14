@@ -116,6 +116,7 @@ v1's integration test is `marv_session::mesh::tests::end_to_end`: a `MarvSession
 - **`marv -p` is on the mesh only when asked** (`--approve mesh:<r>` or `MARV_MESH_NAME`); the TUI always is, with `XDG_RUNTIME_DIR`.
 - `herdr.rs` replaces Marv's single-flight promise with a `watch::Sender<bool>` for "sending" plus one drain task. The effect is the same: only the newest queued state is sent, and `settled()` waits for the drain. `state()` needs a Tokio runtime.
 - `HerdrReporter::release` drops any queued state, waits for the drain, then sends `pane.release_agent`. The CLI bounds it to 1 s, as in Marv.
+- The adapter tests run a fake `herdr` script written into a temp folder. `FakeHerdr::new` runs it once (`--ready`) before handing it out, retrying while Linux says "Text file busy" (#92). That happens when another test's thread forks while the script is still being written: the child holds the write handle until it execs, and the adapter's first command used to fail under load. No production timeout was involved, and the real `herdr` is never a file that was just written.
 - `marv-mesh` depends on `marv-mcp`, but only for `jsonrpc` and `Env`.
 
 ## Interfaces other crates use

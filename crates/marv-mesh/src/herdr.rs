@@ -615,7 +615,7 @@ mod tests {
             };
             // printf, not echo: dash (Ubuntu's sh) turns the \n in the JSON into a newline.
             let script = format!(
-                "#!/bin/sh\necho \"$@\" >> '{log}'\ncase \"$1 $2\" in\n\
+                "#!/bin/sh\n[ \"$1\" = --ready ] && exit 0\necho \"$@\" >> '{log}'\ncase \"$1 $2\" in\n\
                  'agent list') printf '%s\\n' '{agents}';;\n\
                  'pane get') case \"$3\" in\n{gets}\n*) printf '%s\\n' '{{\"error\":{{\"code\":\"pane_not_found\",\"message\":\"pane $3 not found\"}}}}'; exit 1;;\nesac;;\n\
                  'pane read') printf '%s\\n' '{{\"result\":{{\"text\":\"line1\\nline2\"}}}}';;\n\
@@ -626,6 +626,7 @@ mod tests {
             let program = dir.0.join("herdr");
             std::fs::write(&program, script).unwrap();
             std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+            wait_until_runnable(&program);
             Self { dir }
         }
         fn adapter(&self) -> Arc<HerdrAdapter> {
@@ -633,6 +634,24 @@ mod tests {
         }
         fn log(&self) -> String {
             std::fs::read_to_string(self.dir.0.join("log")).unwrap_or_default()
+        }
+    }
+
+    /// Waits until a script just written can be run (#92). While `std::fs::write` had it open, another test's thread
+    /// may have forked to spawn its own child; that child holds a copy of the write handle until it execs, and Linux
+    /// refuses to run a file open for writing ("Text file busy", ETXTBSY). Under load that gap is long enough for the
+    /// adapter's first `herdr` to fail. No new holder can appear once the write is closed, so the first run that
+    /// starts means every later one will too.
+    fn wait_until_runnable(program: &std::path::Path) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            match std::process::Command::new(program).arg("--ready").status() {
+                Ok(status) => return assert!(status.success(), "fake herdr --ready: {status}"),
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Err(e) => panic!("fake herdr didn't run: {e}"),
+            }
         }
     }
 
