@@ -69,23 +69,50 @@ pub fn check_required(schema: &Value, args: &Value) -> Result<(), String> {
 }
 
 fn check_object(schema: &Value, value: &Value, path: &str, errors: &mut Vec<String>) {
-    let (Some(schema), Some(object)) = (schema.as_object(), value.as_object()) else { return };
-    for name in schema.get("required").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
-        if object.get(name).is_none_or(Value::is_null) {
-            errors.push(format!("missing required field \"{}\"", join(path, name)));
-        }
+    let Some(schema) = schema.as_object() else { return };
+    // A string under its minLength, wherever it sits (a field, or a list's item).
+    if let (Some(text), Some(min)) = (value.as_str(), schema.get("minLength").and_then(Value::as_u64))
+        && (text.chars().count() as u64) < min
+    {
+        let unit = if min == 1 { "character" } else { "characters" };
+        errors.push(format!("field \"{path}\" must be at least {min} {unit} long"));
     }
-    let Some(properties) = schema.get("properties").and_then(Value::as_object) else { return };
-    for (name, field) in properties {
-        let Some(value) = object.get(name) else { continue };
-        let at = join(path, name);
-        if let (Some(text), Some(min)) = (value.as_str(), field.get("minLength").and_then(Value::as_u64))
-            && (text.chars().count() as u64) < min
-        {
-            let unit = if min == 1 { "character" } else { "characters" };
-            errors.push(format!("field \"{at}\" must be at least {min} {unit} long"));
+    match value {
+        Value::Object(object) => {
+            let properties = schema.get("properties").and_then(Value::as_object);
+            for name in schema.get("required").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
+                // `null` is missing only where the field's schema says it can't be null: `["string", "null"]`, or a
+                // field we can't read (no type, a combinator), may take it.
+                let null_refused = || {
+                    properties
+                        .and_then(|p| p.get(name))
+                        .and_then(Value::as_object)
+                        .and_then(types_of)
+                        .is_some_and(|ts| !ts.is_empty() && !ts.contains(&"null"))
+                };
+                match object.get(name) {
+                    None => errors.push(format!("missing required field \"{}\"", join(path, name))),
+                    Some(Value::Null) if null_refused() => {
+                        errors.push(format!("missing required field \"{}\"", join(path, name)))
+                    }
+                    _ => {}
+                }
+            }
+            for (name, field) in properties.into_iter().flatten() {
+                if let Some(value) = object.get(name) {
+                    check_object(field, value, &join(path, name), errors);
+                }
+            }
         }
-        check_object(field, value, &at, errors);
+        // A list's items are checked as well: a batch tool's `comments: [{"body": ""}]` (#65 review).
+        Value::Array(items) => {
+            if let Some(item_schema) = schema.get("items").filter(|s| s.is_object()) {
+                for (i, item) in items.iter().enumerate() {
+                    check_object(item_schema, item, &format!("{path}[{i}]"), errors);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -208,8 +235,12 @@ fn descend(schema: &Map<String, Value>, value: Value, path: &str, mode: RepairMo
             let required: Vec<&str> =
                 schema.get("required").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
             // Built-in schemas are exactly what serde accepts: absent means closed. An MCP schema is open unless it says.
-            let closed =
-                matches!((mode, schema.get("additionalProperties")), (_, Some(Value::Bool(false))) | (RepairMode::Builtin, None));
+            // `patternProperties` names keys by pattern: a key outside `properties` may still be valid, so none is dropped.
+            let closed = !schema.contains_key("patternProperties")
+                && matches!(
+                    (mode, schema.get("additionalProperties")),
+                    (_, Some(Value::Bool(false))) | (RepairMode::Builtin, None)
+                );
             let mut out = Map::new();
             for (name, field) in object {
                 let at = join(path, &name);
@@ -401,6 +432,10 @@ mod tests {
         let (got, fixes) = repair_args(&closed, json!({"number": 1, "extra": true}), RepairMode::Mcp);
         assert_eq!(got, json!({"number": 1}));
         assert_eq!(fixes, vec!["unknown field \"extra\" was dropped".to_string()]);
+        // patternProperties names more keys: closed or not, nothing outside `properties` is dropped.
+        closed["patternProperties"] = json!({"^label_": {"type": "string"}});
+        let input = json!({"number": 1, "label_name": "x"});
+        assert_eq!(repair_args(&closed, input.clone(), RepairMode::Mcp), (input, vec![]));
     }
 
     #[test]
@@ -451,6 +486,21 @@ mod tests {
         assert!(err.contains("missing required field \"meta.tag\""));
         let err = check_required(&schema, &json!({"number": 1, "body": "x", "meta": {"tag": "a"}})).unwrap_err();
         assert!(err.contains("field \"meta.tag\" must be at least 2 characters long"));
+        // A required field whose schema allows null may be null; one that doesn't is missing.
+        let nullable = json!({"type": "object", "properties": {"v": {"type": ["string", "null"]}, "w": {"type": "string"}}, "required": ["v", "w"]});
+        assert_eq!(check_required(&nullable, &json!({"v": null, "w": "x"})), Ok(()));
+        assert!(check_required(&nullable, &json!({"v": "a", "w": null})).unwrap_err().contains("missing required field \"w\""));
+        // Inside a list's items too (a batch-comment tool).
+        let batch = json!({"type": "object", "properties": {"comments": {"type": "array", "items": schema.clone(), "minItems": 1}, "tags": {"type": "array", "items": {"type": "string", "minLength": 1}}}});
+        let err = check_required(
+            &batch,
+            &json!({"comments": [{"number": 1, "body": "ok"}, {"number": 2, "body": ""}, {}], "tags": ["a", ""]}),
+        )
+        .unwrap_err();
+        assert!(err.contains("field \"comments[1].body\" must be at least 1 character long"), "{err}");
+        assert!(err.contains("missing required field \"comments[2].body\""), "{err}");
+        assert!(err.contains("field \"tags[1]\" must be"), "{err}");
+        assert!(!err.contains("comments[0]"), "{err}");
         // An open schema has nothing to check.
         assert_eq!(check_required(&json!({"type": "object", "properties": {}}), &json!({})), Ok(()));
     }
