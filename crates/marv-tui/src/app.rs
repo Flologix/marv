@@ -731,6 +731,7 @@ impl App {
                 self.waiting_for = match status {
                     TurnStatus::WaitingForMcp => Some("Waiting for MCP servers to start…".into()),
                     TurnStatus::Checking => Some("Checking…".into()),
+                    TurnStatus::Checkpointing => Some("Saving a checkpoint…".into()),
                     _ => None,
                 };
                 self.compacting = status == TurnStatus::Compacting;
@@ -1170,8 +1171,9 @@ impl App {
                 }
                 return;
             }
-            KeyCode::PageUp => self.page(-1),
-            KeyCode::PageDown => self.page(1),
+            // An approval listing files (/undo) scrolls that list instead: the transcript stays put.
+            KeyCode::PageUp if !self.files_shown() => self.page(-1),
+            KeyCode::PageDown if !self.files_shown() => self.page(1),
             _ => {}
         }
 
@@ -1226,6 +1228,11 @@ impl App {
         }
     }
 
+    /// An approval listing files (/undo) is up: PgUp/PgDn and the wheel scroll the list, not the transcript.
+    fn files_shown(&self) -> bool {
+        self.setup.is_none() && self.approval.as_ref().is_some_and(|(_, view)| view.has_files())
+    }
+
     fn page(&mut self, direction: i32) {
         let scroll = self.active_scroll();
         if direction < 0 {
@@ -1251,6 +1258,13 @@ impl App {
             return;
         }
         let effect = match event {
+            MouseEvent::Scroll { step } if self.files_shown() => {
+                if let Some((_, view)) = &mut self.approval {
+                    view.scroll_files(step as i32 * WHEEL_ROWS);
+                }
+                self.dirty = true;
+                SelectionEffect::None
+            }
             MouseEvent::Scroll { step } => {
                 // The highlight is attached to the text, so it scrolls along.
                 self.active_scroll().glide_by(step as i32 * WHEEL_ROWS, now);
@@ -1337,6 +1351,9 @@ impl App {
         let width = area.width;
         let busy = self.busy();
         let status_height = 1;
+        if let Some((_, view)) = &mut self.approval {
+            view.set_window_rows(area.height);
+        }
         let panel_height = if let Some(picker) = self.picker.as_ref().filter(|_| self.setup.is_none() && self.approval.is_none())
         {
             picker.height()
