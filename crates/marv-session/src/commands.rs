@@ -386,6 +386,8 @@ pub fn commands() -> &'static [Command] {
         },
         Command {
             name: "mesh",
+            // Shows the wires, or turns wake on/off: wake only acts on an idle session, so the palette may run it.
+            while_busy: true,
             description: "The mesh: what's wired to Marv's inbox (/mesh wake on lets a message start a turn while idle)",
             run: |args, ctx| {
                 let words: Vec<String> = args.split_whitespace().map(str::to_lowercase).collect();
