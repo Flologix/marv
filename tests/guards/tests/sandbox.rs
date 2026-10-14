@@ -503,6 +503,33 @@ async fn the_writable_folder_is_writable_and_nothing_else_new_is() {
     assert!(!other.path().join("y").exists());
 }
 
+/// **A `writable` entry is never one whose parent a sandboxed command can change** (#119 review): one in the project
+/// (writable already) or inside another entry is left out. Otherwise a command swaps the entry's parent for a
+/// symlink, and the next command's bwrap resolves it and binds the real folder it leads to (another repository's
+/// `.git/hooks` here) read-write.
+///
+/// Proven: dropped the in-project skip in `marv_sandbox::writable::resolve` → this failed (the other repository's
+/// hook was written).
+#[tokio::test]
+async fn a_writable_entry_in_the_project_cant_be_swapped_for_a_symlink() {
+    require_bwrap!();
+    let (project, home) = (TempDir::new("wrt-swap"), TempDir::outside_tmp("wrt-swap-home"));
+    let other = TempDir::outside_tmp("wrt-swap-other");
+    std::fs::create_dir_all(other.path().join(".git/hooks")).unwrap();
+    std::fs::create_dir_all(project.path().join("tools/hooks")).unwrap();
+    let entry = project.path().join("tools/hooks");
+    let (accepted, problems) =
+        marv_sandbox::resolve_writable(&[entry.display().to_string()], home.path(), project.path(), None, None);
+    assert!(problems.is_empty(), "{problems:?}");
+    let sandbox = Sandbox { writable: accepted, ..sandbox_with_home(home.path()) };
+    let swap = format!("mv tools tools.old && ln -s {} tools && echo swapped", other.path().join(".git").display());
+    let ran = run_sandboxed(&sandbox, project.path(), &CommandMounts::default(), &swap, &[]);
+    assert!(ran.output.contains("swapped"), "{}", ran.output);
+    let plant = format!("echo pwned > {}/pre-commit 2>/dev/null; echo", entry.display());
+    run_sandboxed(&sandbox, project.path(), &CommandMounts::default(), &plant, &[]);
+    assert!(!other.path().join(".git/hooks/pre-commit").exists(), "another repository's hook was planted");
+}
+
 // ---- realpath --------------------------------------------------------------------------------------------------
 
 /// **Every path is checked after `realpath`; no tool follows a symlink out of its root.** A project symlink to a file

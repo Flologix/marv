@@ -24,6 +24,11 @@
 //!   config's hooks, the API key, the tool-output files;
 //! - anything missing or not a folder: bwrap can't mount it.
 //!
+//! Left out quietly (not refused: one config serves every project): an entry in the project, which is writable
+//! already, and one inside another accepted entry. A sandboxed command can change their parents, and bwrap resolves a
+//! mount point's parents when the next command starts: a parent swapped for a symlink would bind the real folder it
+//! leads to read-write.
+//!
 //! What survives is passed to [`crate::Sandbox`] (`writable`), which bwrap binds read-write; the per-command
 //! writable mounts (an approved `git_write` command's worktree records, under `~/.marv/worktrees`) keep their own
 //! path, which must stay allowed — that's why the refusal happens here and not for every bwrap mount.
@@ -165,14 +170,24 @@ pub fn resolve(
     runtime: Option<&Path>,
     config_dir: Option<&Path>,
 ) -> (Vec<PathBuf>, Vec<String>) {
-    let (mut accepted, mut problems) = (Vec::new(), Vec::new());
+    let (mut accepted, mut problems) = (Vec::<PathBuf>::new(), Vec::new());
+    let real_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     for entry in entries {
         match resolve_entry(entry, home, root, runtime, config_dir) {
+            // The project, or a folder in it, is writable already. Left out, not a problem (one global config,
+            // many projects): bound again on top it would add nothing but a mount whose parent a sandboxed command
+            // can change — bwrap resolves the mount point's parents when the next command starts, so a parent
+            // swapped for a symlink would bind the real folder rw wherever the symlink leads. (The project itself
+            // would also stop every command: the sandbox refuses an extra mount over the project.)
+            Ok(real) if real.starts_with(&real_root) => {}
             Ok(real) if !accepted.contains(&real) => accepted.push(real),
             Ok(_) => {}
             Err(problem) => problems.push(problem),
         }
     }
+    // A folder inside another accepted one is covered by it, and the same parent-swap applies: only the outer one.
+    let outer = accepted.clone();
+    accepted.retain(|dir| !outer.iter().any(|other| other != dir && dir.starts_with(other)));
     (accepted, problems)
 }
 
@@ -360,6 +375,22 @@ mod tests {
         std::fs::create_dir_all(runtime.join("marv/mesh")).unwrap();
         let why = with_runtime(home.path(), root.path(), "~/xdg/marv/mesh", &runtime).unwrap_err();
         assert!(why.contains("runtime sockets"), "{why}");
+    }
+
+    // #119 review: the project and folders in it are writable already, and a folder inside another entry is covered by
+    // it. Mounting either again would let a sandboxed command swap the mount point's parent for a symlink, and the next
+    // command's bwrap would bind wherever it leads read-write. Left out, quietly (one config serves every project).
+    #[test]
+    fn folders_in_the_project_or_in_another_entry_are_left_out() {
+        let home = TempDir::new("writable-home9");
+        let project = home.path().join("Projects/p");
+        std::fs::create_dir_all(project.join("tools/hooks")).unwrap();
+        std::fs::create_dir_all(home.path().join("shared/cache")).unwrap();
+        let entries: Vec<String> =
+            ["~/Projects/p", "~/Projects/p/tools/hooks", "~/shared/cache", "~/shared"].iter().map(|s| s.to_string()).collect();
+        let (ok, problems) = resolve(&entries, home.path(), &project, None, None);
+        assert_eq!(ok, [home.path().join("shared")], "only the outer folder outside the project");
+        assert!(problems.is_empty(), "{problems:?}");
     }
 
     // #98 review: Marv's config folder is refused wherever MARV_CONFIG_DIR puts it — a visible one isn't caught by the
