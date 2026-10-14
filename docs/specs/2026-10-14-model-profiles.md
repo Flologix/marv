@@ -122,7 +122,14 @@ Paths are relative to the project root. Give about 3 lines of context above and 
 - `*** Add File: p`: every following line must start with `+`.
 - `*** Delete File: p`: no body.
 - `*** Update File: p`, optional `*** Move to: q`, then one or more hunks. Each hunk is an optional `@@ <context>` header, then lines starting with ` `, `-` or `+`. An optional `*** End of File` anchors the last hunk at the end of the file.
-- The same path twice, or Add plus Update of one path, is an error.
+- **Every path is the target of at most one operation, and this is checked before anything is written** (all or nothing):
+  - A target is an Add path, an Update path (or its Move destination when it has one), or a Delete path. A Move's *source* counts as touched too.
+  - Two operations touching the same path is an error. That includes:
+    - a Move destination that is also another op's path;
+    - two Moves to one destination;
+    - Add plus Update of one path.
+  - Paths are compared after `resolve_in_project` (realpath), so `a.ts` and `./src/../a.ts` are the same path.
+- **A Move onto an existing file is an error** ("`*** Move to: <dest>`: <dest> already exists; delete it first or update it instead"). The patch never overwrites by moving. This is checked in the plan (preview) and again under the locks.
 
 **Applying a hunk.** Per file, a cursor starts at 0:
 1. If the hunk has an `@@ <context>` header, find the first line at or after the cursor that matches it, using `edit_match`'s tiers line by line; the search starts after that line.
@@ -136,7 +143,7 @@ Paths are relative to the project root. Give about 3 lines of context above and 
 
 **Writing.** The file locks for all touched paths (sources and move targets) are taken in sorted path order, through a new `file_lock::with_file_locks(root, paths, f)`, so two patches can't deadlock. Then:
 - adds and updates are written with `tokio::fs::write`, as `edit_file` does;
-- a move writes the target, then removes the source;
+- a move writes the destination (which the plan checked doesn't exist, and checks again under its lock), then removes the source;
 - deletes go last.
 
 An I/O error part-way is reported per file ("applied: a, b; failed: c: <err>") with `is_error`. The turn's checkpoint (#16) was taken before the run, so `/undo` restores the lot. **To verify in M3:** the checkpoint store restores a file the turn *deleted* (a test).
@@ -201,7 +208,10 @@ No per-profile prompt config. Addenda live in code, with their eval evidence in 
   - `.vscode/`, `.idea/`.
 
   Any one of them makes the whole call `must_ask`. A Move *into* a protected path, and a Delete of one, count.
-- **`package.json` lifecycle scripts** \*: the content rule (`marv_sandbox::protected::lifecycle_scripts_changed`) runs on every `package.json` the patch adds or updates, before and after.
+- **`package.json` lifecycle scripts** \*: the content rule (`marv_sandbox::protected::lifecycle_scripts_changed`) runs on every **resulting** `package.json`, whether added, updated, or the **destination of a Move**.
+  - It compares the destination path's current contents (none, since Moves onto existing files are refused) with the new contents written there.
+  - Updating `template.json` and moving it to `package.json` with a `postinstall` script triggers the rule. The source's old contents never stand in for "before".
+- **Every protected-path and content rule is judged on destinations.** `protected_target` and the content rules look at each path as it will be after the patch (a Move destination), not only at the paths as written in the op headers. Moving a harmless file to `.envrc`, `AGENTS.md` or `.git/hooks/x` is a protected write. Moving a protected file away (source `.envrc`) is protected too: it deletes the original.
 - **Yolo:** `auto_safe` only if every path is `auto_safe` for `edit_file` (`!touches_git`).
 - **Taint:** `apply_patch` is `ToolKind::Write`, not egress; a tainted session doesn't change that, as for `edit_file`. Protected writes in a tainted session are `must_ask` and "always" never answers them (the existing rule) \*.
 - **Approval:** one approval for the whole patch, scope `files` (same key as the edit tools, so "always" for file changes covers it, as it covers both edit tools today). The preview fills `Preview::files` with one `PreviewFile` per file (its diff, or "delete", or "move a → b"), so the user sees every file before saying yes. A Delete shows the removed content as the diff.
@@ -211,7 +221,8 @@ No per-profile prompt config. Addenda live in code, with their eval evidence in 
 - **Size:** a patch over 1 MB (input) is refused before parsing (a guard against pathological input; the arguments are already bounded by the model's output limit).
 - New guards (each proven by reverting it):
   - \* `apply_patch_protected_paths_ask_even_in_yolo`: every pattern, as Add, Update, Delete and Move target;
-  - \* `apply_patch_package_json_lifecycle_scripts_ask_even_in_yolo`;
+  - \* `apply_patch_package_json_lifecycle_scripts_ask_even_in_yolo`, including **Update `template.json` + Move to `package.json`** with a new `postinstall` (must ask; reverting the destination check makes it pass silently);
+  - \* `apply_patch_moves_are_judged_by_destination`: a harmless file moved to each protected pattern (`.envrc`, `AGENTS.md`, `.marv/x`, `.vscode/settings.json`, `.git/hooks/pre-commit`) asks even in yolo, and so does a protected file moved away;
   - \* `apply_patch_no_path_out_of_the_project`: `../`, absolute outside, a symlink out, a dangling symlink, a Move target out;
   - \* a bad hunk in file 2 of 3 writes nothing (all-or-nothing): a test in `apply_patch.rs`, not a SECURITY rule.
 
@@ -229,6 +240,12 @@ Apply:
 - a pure addition at `@@` and at EOF;
 - not found shows the closest lines; two hunks in order; a hunk whose context is before the previous hunk's (error);
 - Move plus Update; Delete of a missing file (error); Add of an existing file (error, "use Update File").
+- A Move onto an existing file → error, and nothing is written, not even the patch's other files. The same when the destination appears between preview and run (the check under the lock).
+- Two operations targeting one path → error with nothing written. Cases:
+  - Update A with Move to B, plus Add B;
+  - two Moves to B;
+  - Update A with Move to B, plus Delete B;
+  - Update A plus Update `./A` (the same file after realpath).
 
 Through `run_tool`, end to end, like `edit_file`'s:
 - an approval is asked once, with `Preview::files`, one per file;
@@ -253,7 +270,7 @@ Session:
 - resume keeps the saved `edit_tools`;
 - the trajectory `session` record has `profile`.
 
-Guards: §5's four.
+Guards: the ones listed in §5 (protected paths, lifecycle scripts including the move-to-package.json case, moves judged by destination, no path out of the project, plus the all-or-nothing test).
 
 ## 7. Eval plan (no runs without approval: they cost money)
 

@@ -59,8 +59,12 @@ Assistant COMPACTED_ACK                     ← only when the tail is empty or s
 
 - Walk back from the end, summing an estimate per turn (chars / 4, as `usage::estimate_tokens`; tool calls count their name + arguments). Stop before the turn that would push the sum over `tail_tokens`.
 - **Snap to a safe boundary:** move the start *earlier* to the nearest index whose turn is `User` or `Assistant`. A `Tool` turn is never first, so a result is never split from the assistant turn that called it. Moving earlier can exceed the budget by one step's results; the cap below bounds it.
-- **Cap:** if snapping would make the tail larger than `2 × tail_tokens`, or the tail would be the whole history, return `history.len()` (no tail). A giant tool result then goes into the summary, not the tail.
-- `tail_start == 0` (the whole history fits the tail) means there is nothing worth compacting: `CompactFailure::Empty`, "Nothing to compact yet.", as for an empty history today. Exception: overflow recovery (§3.5), which shrinks the tail instead.
+- **Return values.** The cases are checked in this order:
+  1. **Already fits:** the whole history's estimate is ≤ `tail_tokens` (an empty history included) → `0`. This is the only way to get `0`. It means there is nothing worth compacting: `CompactFailure::Empty`, "Nothing to compact yet.", as for an empty history today.
+  2. **Pulled in by snapping:** the history doesn't fit, but snapping moved the start back to index 0 → `history.len()` (no tail). Everything gets summarized.
+  3. **Over the cap:** the snapped tail is larger than `2 × tail_tokens` → `history.len()` (no tail). A giant tool result then goes into the summary, not the tail.
+  4. **Otherwise:** the snapped index, which is `> 0` and `< history.len()`.
+- **Overflow recovery (§3.5)** never calls `tail_start` with the full budget on a history that just overflowed. It passes the level's smaller budget, or `0` at level 2, and a budget of `0` returns `history.len()`. Case 1 only applies when the budget is above zero: an empty history with budget `0` is still `0`.
 - Pure, in `marv-agent/src/compact.rs`. The 4-chars estimate moves into `marv-core` as `estimate_tokens` (types-only crate, no I/O), and the two existing copies use it.
 
 ### 3.3 Structured template and rolling update
@@ -139,7 +143,7 @@ In `LoopState::decide`, `StepOutcome::Error(message)` where `is_context_overflow
 
 marv-agent depends on marv-provider already, so it can call `is_context_overflow` directly.
 
-**Session hook (marv-session):** `attempt` picks the level:
+**Session hook (marv-session):** `attempt` picks the **starting** level. Within one hook call, the session walks down the levels itself (§3.5.1), so a summary request that overflows doesn't end the recovery:
 
 | attempt | What the session does |
 |---|---|
@@ -149,8 +153,34 @@ marv-agent depends on marv-provider already, so it can call `is_context_overflow
 | 3 | **No summary:** keep the previous summary (if any) + the newest exchanges that fit `0.35 × window`, drop the rest, and add a note: "(Automatic note from Marv) Older messages were dropped to fit the context window; ask the user if you need something from them." |
 
 - **Cutting down for the summary request** (`fit_for_summary(history, budget) -> Vec<ChatTurn>`, pure, in compact.rs): drop the oldest whole exchanges after the previous summary (never splitting call/result). Any single tool result still larger than `budget / 4` is shortened to head + tail with `[… cut for the summary …]`, reusing `marv_tools::output`'s head/tail shape. This request is never a cache hit; that is accepted, because it only happens after an error.
+- **The budget is for the history only; the fixed cost comes off first.** A summary request also sends the system prompt, the tool schemas and the summary instruction, and the reply needs room. So:
+  - `fixed = estimate(system) + estimate(tool specs as sent, JSON) + estimate(instruction text, rolling or full, with any focus)`;
+  - `reply_reserve = min(8192, window / 8)`;
+  - `budget = target × window − fixed − reply_reserve`.
+
+  Level 3 sends no summary request, but the retried step still sends the system prompt and tools, so its budget is `0.35 × window − estimate(system) − estimate(tool specs) − reply_reserve`. The tools stay in recovery requests, even though there is no cache to keep. **Assumption:** some upstreams reject a history containing tool calls when no tools are defined.
+- **When the fixed cost alone doesn't fit.** If a level's `budget` is below `MIN_HISTORY_BUDGET` (1,024 tokens), that level is skipped, not run with an empty history. If level 3's budget is below it too, then the system prompt and tool definitions by themselves don't fit the window. Recovery stops at once: the hook returns false, and the turn ends with a clear error instead of `LoopEvent::Error(<raw provider text>)`: "The system prompt and tool definitions alone (about N tokens) don't fit this model's context window (M tokens). Pick a model with a larger window (/model), or offer fewer MCP tools (/mcp)." There is no drop loop: every level is tried at most once per hook call, so the number of requests is bounded.
 - **Window when unknown** (custom provider, model list not loaded): `overflow_window(message)`. If that fails too, the size of the request that overflowed (`estimate_tokens` of the history) stands in for the window.
 - **An overflow during an ordinary 85% summary** (`summarize` returns `Err(msg)` with `is_context_overflow(msg)`) goes straight to level 0 instead of `NotCompacted`.
+
+#### 3.5.1 When a recovery summary itself overflows
+
+`summarize` returns its error to the session, not to the loop, so the session handles it inside the same hook call:
+
+```text
+level = attempt                        (0..=3)
+loop:
+  if level == 3: drop to fit (no request); return true   ← or false if the fixed cost doesn't fit
+  budget too small? → level += 1; continue
+  summarize(fit_for_summary(history, budget), …)
+    Ok(summary)                 → install the v2 history; return true (the loop retries the step)
+    Err(e) if overflow(e)       → level += 1; continue    ← our token estimate was off: try smaller
+    Err(_) if cancelled         → Stopped: cancel the turn; return false
+    Err(e)                      → return false (the turn ends with e, as today)
+```
+
+- If the retried **agent** request overflows again after a successful recovery, the loop calls the hook with `attempt + 1`. Recovery then starts one level lower than the level that last succeeded (the session remembers it for the step), so a step never repeats a level.
+- Altogether, a step makes at most 3 summary requests and 4 agent requests before it gives up.
 - Every recovery emits `SessionEvent::Compaction(…)`, so the user sees a notice. A new `CompactResult::Compacted` field `trigger: Auto | Manual | Overflow { level }` tells the UI and trajectory which it was.
 - Before the turn's first request the same hook applies: an overflow there is caught by the loop like any other step.
 - The `mid_turn_compact_failed` rule doesn't block overflow recovery: the alternative is a dead turn.
@@ -194,12 +224,19 @@ Overflow recovery isn't switchable: it only acts where today's behaviour is a de
 ## 6. Test plan
 
 Unit tests (`crates/marv-agent/src/compact.rs`, `ScriptedProvider`):
-- `tail_start`: never starts at a `Tool` turn; the budget is respected; snapping moves earlier; the 2× cap gives no tail; an all-fits history → 0; empty → 0.
+- `tail_start`, one test per return case (§3.2):
+  - already fits → `0`;
+  - empty with budget > 0 → `0`; empty with budget 0 → `0`;
+  - doesn't fit, snapped back to index 0 → `len`;
+  - over the 2× cap → `len`;
+  - budget `0` on a non-empty history → `len`;
+  - otherwise the snapped index, never at a `Tool` turn; the budget is respected and snapping moves earlier.
 - `compacted_history` v2: the ACK is present iff the tail is empty or starts with `User`; tail turns are `==` the originals; the plan text sits between the summary and the ACK, as today.
 - `summary_request(…, rolling)`: full vs rolling instruction; the prefix equals the history (cache); focus is appended.
 - Template check: 5/7 headings pass, 4/7 trigger exactly one nudge, the nudge request's prefix = the first request + the reply, a second unstructured reply is accepted with `structured: false`.
 - All existing `compact.rs` tests keep passing under `compaction: "v1"`, and v2 equivalents are added.
 - `fit_for_summary`: drops oldest whole exchanges, keeps the previous summary, shortens a giant result, never splits call/result.
+- The budget: the system prompt, tool specs, instruction and reply reserve are subtracted (a large system prompt gives a smaller history). A level whose budget is below `MIN_HISTORY_BUDGET` is skipped.
 
 Provider (`crates/marv-provider/src/errors.rs`):
 - `is_context_overflow` against **real captured messages** (fixtures in `crates/marv-provider/tests/fixtures/overflow/*.txt`, one per upstream), plus negatives: 429 text, "tool_use ids must be unique", the 404 model message, the HTML page.
@@ -214,6 +251,15 @@ Loop (`crates/marv-agent/src/agent.rs`):
 Session (`crates/marv-session/src/session.rs` tests, the "Done when" fake-provider test):
 - **The issue's acceptance test:** a fake provider answers the first request with an OpenRouter overflow error, then a summary, then a reply. The turn ends `Done(End)` with one `Compaction { trigger: Overflow { level: 0 } }` and no user action.
 - Climbing levels: overflow, overflow, overflow → level 3 drop, and the turn still finishes.
+- **The summary request overflows, all the way down:**
+  - the agent request overflows;
+  - the level 0, 1 and 2 summary requests each overflow too;
+  - level 3 drops old messages without a request;
+  - the retried step succeeds.
+
+  Expected: one hook call, 3 summary requests, each smaller than the last (the recorded requests' estimated sizes go down); `Compaction { trigger: Overflow { level: 3 } }`; the turn ends `Done(End)`.
+- **The fixed cost doesn't fit:** a system prompt larger than the window. The hook returns false without sending a summary request, and the turn ends with the "system prompt and tool definitions alone" error, after a bounded number of requests (1).
+- A non-overflow error during a recovery summary (rate limited) ends the turn with that error; Esc during it → `Interrupted`.
 - Rolling: a second compaction's request contains the rolling instruction; `State::summary` is replaced; save, then resume, keeps it.
 - Mid-turn with a tail: the history ends with the tail then `MID_TURN_NOTE`; the next request is valid (every call answered).
 - Plan carried: the existing `mid_turn_compaction_keeps_the_plan_then_the_mid_turn_note` and friends pass in v2.
