@@ -27,6 +27,7 @@ These rules are requirements for the Rust build from day one. They come from a s
   - `package.json` lifecycle `scripts`.
 - **Secrets** (`.env*`, `*.pem`, `id_*`) need approval to read, and are masked in the sandbox.
 - **Every path is checked after `realpath`.** No tool follows a symlink out of its root. That includes skill files, which the old code read outside the sandbox.
+- **The one read outside the project is the session's saved tool outputs (#61).** `read_file` and `grep` may read the files in `~/.marv/tool-output/<session>/`, and nothing else outside the project. Writing tools can't, and bash can't see the folder at all.
 
 ## Doors out of the sandbox
 Narrow, named ways out, each asked for and each with its own rule for what it can never do (Marv Sprint 4).
