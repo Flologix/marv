@@ -95,6 +95,9 @@ pub fn subagent_context(
     ctx.yolo = parent.yolo;
     ctx.skills = parent.skills.clone();
     ctx.taint = Arc::new(parent.taint.for_subagent());
+    // Its sandboxed bash reaches the session's background processes like the main agent's (curl localhost:<port>);
+    // starting one is the main agent's alone (no processes, no doors).
+    ctx.forwards = parent.forwards.clone();
     // A shared-folder subagent edits the same files in the same turn: the turn's one checkpoint covers it (#16). A
     // worktree's changes land on its branch, which is already the way back.
     ctx.checkpoint = if worktree.is_some() { None } else { parent.checkpoint.clone() };

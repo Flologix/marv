@@ -54,6 +54,7 @@ pub fn builtin_tools() -> &'static [ToolRef] {
             Arc::new(crate::edit_file::EditFile),
             Arc::new(crate::write_file::WriteFile),
             Arc::new(crate::bash::Bash),
+            Arc::new(crate::process::ProcessTool),
             Arc::new(crate::memory::Memory),
             Arc::new(crate::plan::Plan),
             Arc::new(crate::agent::Agent),
@@ -73,7 +74,8 @@ pub fn tool_specs() -> &'static [ToolSpec] {
 }
 
 /// The specs for a session: the skill tool only when there are skills to load, the plan tool unless the session
-/// turned it off (#15; decided at construction, since it changes the tool list).
+/// turned it off (#15; decided at construction, since it changes the tool list). The process tool is in it: a session
+/// without the process door (Marv #51) drops it.
 pub fn tool_specs_for(has_skills: bool, plan: bool) -> Vec<ToolSpec> {
     tool_specs().iter().filter(|s| (has_skills || s.name != "skill") && (plan || s.name != "plan")).cloned().collect()
 }
@@ -418,12 +420,25 @@ mod tests {
         let names: Vec<&str> = tool_specs().iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
             names,
-            ["read_file", "glob", "grep", "web_fetch", "skill", "edit_file", "write_file", "bash", "memory", "plan", "agent"]
+            [
+                "read_file",
+                "glob",
+                "grep",
+                "web_fetch",
+                "skill",
+                "edit_file",
+                "write_file",
+                "bash",
+                "process",
+                "memory",
+                "plan",
+                "agent"
+            ]
         );
         assert!(!tool_specs_for(false, true).iter().any(|s| s.name == "skill"));
-        assert_eq!(tool_specs_for(true, true).len(), 11);
+        assert_eq!(tool_specs_for(true, true).len(), 12);
         assert!(!tool_specs_for(true, false).iter().any(|s| s.name == "plan"));
-        assert_eq!(tool_specs_for(true, false).len(), 10);
+        assert_eq!(tool_specs_for(true, false).len(), 11);
         let agent = ToolCall { id: "1".into(), name: "agent".into(), arguments: "{}".into() };
         assert!(is_parallel_call(&agent, builtin_tools()));
     }

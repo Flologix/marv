@@ -80,6 +80,8 @@ use tokio::sync::oneshot;
 
 /// How long the MCP servers get to shut down on the way out.
 const MCP_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Background processes get SIGTERM, then SIGKILL after 2 s (Marv #51).
+const PROCESSES_STOP_TIMEOUT: Duration = Duration::from_millis(2500);
 /// How long Herdr gets to hear that Marv left the pane.
 const HERDR_RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
 const WORKING: &str = "Marv is working: stop the current turn (Esc) before resuming another session.";
@@ -1215,6 +1217,17 @@ impl Bridge {
             CommandAction::Remember { scope, text } => self.remember(scope, &text).await,
             CommandAction::Forget { text } => self.forget(&text).await,
             CommandAction::Compact { focus } => self.compact(focus),
+            CommandAction::Processes { stop } => {
+                let me = self.clone();
+                tokio::spawn(async move {
+                    let stopped = me.session.stop_process(&stop).await;
+                    me.emit(if stopped {
+                        system(format!("Stopped {}.", printable(&stop)), false)
+                    } else {
+                        system(format!("No background process named \"{}\". /processes lists them.", printable(&stop)), true)
+                    });
+                });
+            }
             CommandAction::Skill { name, args } => {
                 let Some(skill) = self.skills.iter().find(|s| s.skill.name == name) else { return };
                 let for_model = marv_session::skills::skill_message(&skill.skill, &args);
@@ -1244,6 +1257,7 @@ impl Bridge {
             if wants_checks { marv_session::checks::load_checks(&self.root) } else { (Vec::new(), Vec::new()) };
         let last_checks = self.last_checks.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let trajectories_path = self.trajectories_dir.as_ref().map(|d| shorten_home(d, &self.home));
+        let processes = self.session.processes();
         let checkpoint_problem = self.session.checkpoint_problem();
         let ctx = CommandContext {
             config: &config,
@@ -1259,6 +1273,7 @@ impl Bridge {
             checkpoints: Some(&checkpoint_problem),
             hidden_path_folders: &self.hidden_path_folders,
             sandbox_available: self.sandbox_available,
+            processes: self.session.processes_offered().then_some(&processes[..]),
         };
         commands::run_command(line, &ctx)
     }
@@ -1502,6 +1517,9 @@ pub async fn run(resume: Option<bool>) -> anyhow::Result<i32> {
     }
     // Stop a turn still running: its tools mustn't outlive the UI.
     bridge.session().interrupt();
+    // Background processes stop with Marv (#51): SIGTERM, then SIGKILL after 2 s; their sandboxes also die with Marv
+    // if it's killed harder (bwrap's --die-with-parent).
+    let _ = tokio::time::timeout(PROCESSES_STOP_TIMEOUT, bridge.session().stop_processes()).await;
     // Let servers shut down cleanly, but don't hang on one that won't.
     if let Some(mcp) = mcp {
         let _ = tokio::time::timeout(MCP_CLOSE_TIMEOUT, tokio::spawn(async move { mcp.close().await })).await;

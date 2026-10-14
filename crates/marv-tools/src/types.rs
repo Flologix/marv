@@ -161,6 +161,66 @@ pub struct Doors {
     pub github: bool,
 }
 
+/// For a sandboxed bash command: a running process's forwarded port, and where its socket folder is (Marv #51).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessForward {
+    pub port: u16,
+    /// A short id, for the folder's mount point (`/run/marv/<id>`).
+    pub id: String,
+    /// The socket folder on the host.
+    pub dir: PathBuf,
+}
+
+/// A background process's state (Marv's `ProcessInfo["state"]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProcessState {
+    Running,
+    Exited,
+}
+
+/// A background process, as the process tool and `/processes` show it (Marv #51).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessInfo {
+    pub name: String,
+    pub command: String,
+    /// Started with network: it shares the host's network, so its ports are the host's (nothing is forwarded).
+    pub network: bool,
+    pub state: ProcessState,
+    /// When it exited: its code (128 + n when a signal ended it).
+    pub exit_code: Option<i32>,
+    /// Ports the user can open on their 127.0.0.1 (forwarded, or the host's own with network).
+    pub ports: Vec<u16>,
+    /// What wasn't forwarded, and why ("port 4789 is in use on the user's machine…").
+    pub notes: Vec<String>,
+    /// Milliseconds since the epoch.
+    pub started_at: u64,
+}
+
+/// What a start hands back: the process, and the first lines of its output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartResult {
+    pub info: ProcessInfo,
+    pub output: String,
+}
+
+/// What the process tool runs through: the session's process manager (marv-session's `ProcessManager`). Only the main
+/// agent's context has one. Marv's `ProcessHost`.
+#[async_trait]
+pub trait ProcessHost: Send + Sync {
+    async fn start(&self, command: &str, name: Option<&str>, network: bool) -> Result<StartResult, ToolError>;
+    /// Its last `lines` lines of output (at most `MAX_LOG_LINES`).
+    fn logs(&self, name: &str, lines: usize) -> Result<String, ToolError>;
+    /// Stops it and forgets it; false when there's none of that name.
+    async fn stop(&self, name: &str) -> bool;
+    fn list(&self) -> Vec<ProcessInfo>;
+}
+
+/// The running processes' forwarded ports, as bash's relay needs them (Marv's `ToolContext.forwards`).
+pub trait ProcessForwards: Send + Sync {
+    fn forwards(&self) -> Vec<ProcessForward>;
+}
+
 /// An approver's answer. `Unavailable`: no one can approve this call (a headless run's `--approve` list doesn't
 /// cover it), refused like a call with no approver at all, as an error the model can work around; `No` is a person
 /// declining, which stops the run so they can say what to do instead.
@@ -307,6 +367,11 @@ pub struct ToolContext {
     pub taint: Arc<TaintState>,
     /// The doors out of the sandbox this agent has (see [`Doors`]). Default: none.
     pub doors: Doors,
+    /// The session's background processes (Marv #51), for the process tool. Only the main agent has them.
+    pub processes: Option<Arc<dyn ProcessHost>>,
+    /// The running processes' forwarded ports: a sandboxed bash command (without network) gets a relay to each, so
+    /// its `curl localhost:<port>` reaches the session's own servers. Subagents get this too (but not `processes`).
+    pub forwards: Option<Arc<dyn ProcessForwards>>,
 }
 
 impl ToolContext {
@@ -332,6 +397,8 @@ impl ToolContext {
             checkpoint: None,
             taint: Arc::new(TaintState::new()),
             doors: Doors::default(),
+            processes: None,
+            forwards: None,
         }
     }
 

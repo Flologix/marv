@@ -65,7 +65,8 @@ pub struct Cli {
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     pub output: OutputFormat,
 
-    /// Auto-approve a scope in -p (git_write, network, web, mcp, files, memory, agent_worktree, mesh:<receptacle>).
+    /// Auto-approve a scope in -p (git_write, network, web, mcp, files, memory, agent_worktree, process,
+    /// mesh:<receptacle>).
     #[arg(long = "approve", value_name = "SCOPE")]
     pub approve: Vec<String>,
 
@@ -105,6 +106,9 @@ pub enum Command {
     /// Runs the project's checks in the current folder (inside the sandbox): `marv_session::checks::runner`.
     #[command(name = "__run-checks", hide = true)]
     RunChecks { spec: String },
+    /// The process door's relay, inside a sandbox (Marv #51): `marv_tools::relay`.
+    #[command(name = "__relay", hide = true)]
+    Relay { spec: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -150,6 +154,9 @@ pub enum Mode {
     RunChecks {
         spec: String,
     },
+    Relay {
+        spec: String,
+    },
 }
 
 impl Cli {
@@ -166,6 +173,7 @@ impl Cli {
             }
             Some(Command::HtmlConvert) => Mode::HtmlConvert,
             Some(Command::RunChecks { spec }) => Mode::RunChecks { spec: spec.clone() },
+            Some(Command::Relay { spec }) => Mode::Relay { spec: spec.clone() },
             None => match &self.prompt {
                 Some(prompt) => Mode::Headless { prompt: prompt.clone() },
                 None => Mode::Interactive {
@@ -209,6 +217,7 @@ mod tests {
         );
         assert_eq!(parse(&["__html-convert"]).mode(), Mode::HtmlConvert);
         assert_eq!(parse(&["__run-checks", "{}"]).mode(), Mode::RunChecks { spec: "{}".into() });
+        assert_eq!(parse(&["__relay", "{}"]).mode(), Mode::Relay { spec: "{}".into() });
     }
 
     #[test]

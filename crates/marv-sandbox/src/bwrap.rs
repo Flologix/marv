@@ -98,6 +98,19 @@ pub struct SandboxOptions {
     pub protected: Vec<PathBuf>,
     /// The mesh plug's host socket, bound at [`MESH_SOCKET`] (marv-rs).
     pub mesh_socket: Option<PathBuf>,
+    /// Files or folders mounted at a path of their own, after `/run` is emptied (so a destination under `/run`
+    /// works): the process door's relay (Marv #51) needs Marv's own binary at `/run/marv-bin` (read-only) and its
+    /// socket folder at `/run/marv` (writable for the process that serves it, read-only for a command that only
+    /// connects).
+    pub binds: Vec<Bind>,
+}
+
+/// One of [`SandboxOptions::binds`]: `source` on the host, at `dest` in the sandbox.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bind {
+    pub source: PathBuf,
+    pub dest: PathBuf,
+    pub writable: bool,
 }
 
 /// The real path of an extra folder after checking that mounting it is safe, and whether it holds the project (then
@@ -179,6 +192,10 @@ pub fn sandbox_args(opts: &SandboxOptions, fs: &dyn FsProbe) -> Result<Vec<OsStr
     // connect() anyway, and the plug only speaks the switchboard's protocol (docs/MESH.md).
     if let Some(socket) = &opts.mesh_socket {
         args.extend(["--bind".into(), socket.clone().into_os_string(), MESH_SOCKET.into()]);
+    }
+    for bind in &opts.binds {
+        let flag = if bind.writable { "--bind" } else { "--ro-bind" };
+        args.extend([flag.into(), bind.source.clone().into_os_string(), bind.dest.clone().into_os_string()]);
     }
     let mounts: Vec<PathBuf> = TOOLCHAINS.iter().map(|dir| opts.home.join(dir)).filter(|full| fs.exists(full)).collect();
     for full in &mounts {
@@ -428,6 +445,22 @@ mod tests {
             assert!(sandbox_args(&SandboxOptions { read_only: vec![bad.into()], ..base() }, &fs).is_err(), "{bad}");
         }
         assert!(sandbox_args(&SandboxOptions { read_only: vec!["relative".into()], ..base() }, &fs).is_err());
+    }
+
+    #[test]
+    fn binds_go_after_the_empty_run_read_only_unless_writable() {
+        let opts = SandboxOptions {
+            binds: vec![
+                Bind { source: "/opt/marv".into(), dest: "/run/marv-bin".into(), writable: false },
+                Bind { source: "/run/user/1000/marv/1-ab/p1".into(), dest: "/run/marv".into(), writable: true },
+            ],
+            ..base()
+        };
+        let args = joined(&opts, &default_fs());
+        let run = args.find("--tmpfs /run").unwrap();
+        assert!(run < args.find("--ro-bind /opt/marv /run/marv-bin").unwrap());
+        assert!(run < args.find("--bind /run/user/1000/marv/1-ab/p1 /run/marv").unwrap());
+        assert!(!args.contains("--ro-bind /run/user/1000/marv/1-ab/p1"));
     }
 
     #[test]
