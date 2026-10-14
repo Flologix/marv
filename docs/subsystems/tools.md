@@ -1,6 +1,6 @@
 # marv-tools
 
-The `Tool` trait, the registry and `run_tool` (preview, approval, yolo, repair), and Marv's built-in tools: `read_file`, `glob`, `grep`, `web_fetch`, `skill`, `edit_file`, `write_file`, `bash`, `memory` and `agent`. It also holds edit matching, syntax checks, diffs and the web readers. The sandbox and the path rules live in `marv-sandbox`. Tools reach them through `files.rs`.
+The `Tool` trait, the registry and `run_tool` (preview, approval, yolo, repair), and Marv's built-in tools: `read_file`, `glob`, `grep`, `web_fetch`, `skill`, `edit_file`, `write_file`, `bash`, `memory`, `plan` and `agent`. It also holds edit matching, syntax checks, diffs and the web readers. The sandbox and the path rules live in `marv-sandbox`. Tools reach them through `files.rs`.
 
 Spec: the **Tools**, **Web**, **Skills**, **Memory**, **Subagents** and **Yolo mode** bullets in Marv's `CLAUDE.md`, `src/tools/**`, and `tests/{tools,edit-match,tool-call-repair,diff,bash,web-*,write-tools,agent-tool,skills}.test.ts`.
 
@@ -23,6 +23,7 @@ Spec: the **Tools**, **Web**, **Skills**, **Memory**, **Subagents** and **Yolo m
 | `src/tools/grep.ts` | `grep.rs` | **Ported and tested.** ripgrep's `grep-regex` + `grep-searcher`; Marv's caps (100 matches, 300 chars a line, 1 MB files, binary skipped). Regex dialect: Rust's (see port notes) |
 | `src/tools/bash.ts` | `bash.rs` (+ `output.rs`, `marv_sandbox::{notes,git_guard}`) | **Ported and tested**, bwrap tests included (they skip when bwrap is missing): `run_command` (bwrap or its own process group, a built environment, both pipes at once, timeout/Esc kill the group), `run` (git guard, worktree folders, placeholders removed, `GIT_HINT`/home/network/gh notes); marv-rs (#8): the post-command scan for protected files a sandboxed command creates (reverted, with a `Marv:` note; a new `.git` kept after an approved `git_write`), nested `.git` read-only when confined |
 | `src/tools/memory.ts` (+ bullet edits from `src/memory.ts`) | `memory.rs` | **Ported and tested:** the tool, and `add_memory`/`find_memory`/`remove_memory` (line-by-line edits, 0600 through `marv_fs::write_private`) |
+| `src/tools/plan.ts` | `plan.rs` | **Ported and tested (#21, Marv #15):** the tool (whole-list replace, `check` for 20 items, 1–200 characters, one `in_progress`), `plan_progress`, `plan_open`, `plan_text` (compaction's plan text: marv-agent can't depend on marv-tools, so it lives here). `PlanItem`/`PlanStatus`/`PlanHost`, `ToolContext::plan` and `ToolOutput::plan` in `types.rs`. All `plan-tool.test.ts` cases |
 | `src/tools/agent.ts` | `agent.rs` | Ported (it delegates to `AgentHost`, which marv-session implements) |
 | `src/tools/syntax.ts` | `syntax.rs` | **Ported and tested:** `syntax_error` (oxc parser + semantic checks for JS/TS, serde_json, serde_yaml_ng over every document, `python3 -I`), `broken_by`, `syntax_note` |
 | `src/tools/web-fetch.ts` | `web_fetch.rs` | **Ported and tested** (#5; `web-fetch-tool.test.ts` through `run_tool`, a local server only): `preview` (the address check fails before anyone is asked), `run` (cache, same-site redirects, GitHub, the "pass an http:// URL" hint), `pasted_scopes` (#11; a fence scanner, Rust's regex has no backreferences), the `offset` `maximum` (2^53 − 1). marv-rs: `Provenance::Web`; invisible characters stripped; `egress_url`/`url_prefix` for tainted sessions. Not ported: the env-var half of Marv's token test (setting env vars needs `unsafe` in Rust 2024) |
@@ -77,12 +78,12 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
 pub struct ToolOutcome { pub result: ToolOutput, pub label: String }
 impl ToolOutput { pub fn into_core(self) -> marv_core::ToolResult }
 pub fn builtin_tools() -> &'static [ToolRef];
-pub fn tool_specs_for(has_skills: bool) -> Vec<ToolSpec>;
+pub fn tool_specs_for(has_skills: bool, plan: bool) -> Vec<ToolSpec>;
 pub fn is_parallel_call(call: &ToolCall, available: &[ToolRef]) -> bool;
 pub const INTERRUPTED: &str;  // must equal marv-agent's NOT_RUN.aborted
 ```
 
-`ToolContext` fields: `root`, `home`, `cancel: CancellationToken`, `approver: Option<Arc<dyn Approver>>`, `sandbox: Arc<marv_sandbox::Sandbox>`, `yolo`, `confined`, `skills: Arc<Vec<Skill>>`, `memory: Option<MemoryPaths>`, `call_id`, `read_only`, `agent_host`, `git_env`, `before_change`, `taint: Arc<TaintState>`. `ToolContext::new(root)` gives Marv's defaults.
+`ToolContext` fields: `root`, `home`, `cancel: CancellationToken`, `approver: Option<Arc<dyn Approver>>`, `sandbox: Arc<marv_sandbox::Sandbox>`, `yolo`, `confined`, `skills: Arc<Vec<Skill>>`, `memory: Option<MemoryPaths>`, `call_id`, `read_only`, `agent_host`, `plan: Option<Arc<dyn PlanHost>>` (the main agent's only), `git_env`, `before_change`, `taint: Arc<TaintState>`. `ToolContext::new(root)` gives Marv's defaults.
 
 ## Port notes
 

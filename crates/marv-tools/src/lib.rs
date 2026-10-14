@@ -25,6 +25,7 @@ pub mod glob;
 pub mod grep;
 pub mod memory;
 pub mod output;
+pub mod plan;
 pub mod read_file;
 pub mod registry;
 pub mod repair;
@@ -40,7 +41,8 @@ pub use registry::{
 };
 pub use types::{
     AgentHost, AgentProgress, Approval, ApprovalRequest, Approver, BeforeChange, Decision, DiffKind, DiffLine, DiffShown,
-    DynTool, MemoryPaths, Preview, Repaired, Scope, Skill, Tool, ToolContext, ToolError, ToolOutput,
+    DynTool, MemoryPaths, PlanHost, PlanItem, PlanStatus, Preview, Repaired, Scope, Skill, Tool, ToolContext, ToolError,
+    ToolOutput,
 };
 
 #[cfg(test)]

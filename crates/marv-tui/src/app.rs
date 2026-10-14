@@ -3,8 +3,9 @@
 //!
 //! # Layout (as in Marv)
 //! Full screen in the alternate screen: the transcript takes the leftover height and scrolls itself
-//! (`ui::scroll_view`), and below it, pinned, one of: the session picker, an approval (+ status
-//! bar), setup, or the prompt + status bar. A subagent's view (opened by clicking its entry) hides
+//! (`ui::scroll_view`), and below it, pinned, the plan while it has something left to do (#15,
+//! `ui::plan_view`; not on a window under `PLAN_MIN_WINDOW` rows), then one of: the session picker, an
+//! approval (+ status bar), setup, or the prompt + status bar. A subagent's view (opened by clicking its entry) hides
 //! the main transcript, keeps its scroll position, and adds `AgentViewHeader`. Before all that the
 //! splash shows for `splash_ms` (any key skips it).
 //!
@@ -96,6 +97,7 @@ use crate::ui::approval::{ApprovalOutcome, ApprovalView};
 use crate::ui::markdown::StreamLexer;
 use crate::ui::martian::MartianAnimation;
 use crate::ui::message_view;
+use crate::ui::plan_view::{self, PLAN_MIN_WINDOW};
 use crate::ui::prompt_input::{PromptInput, PromptOutcome};
 use crate::ui::scroll_view::ScrollView;
 use crate::ui::session_picker::{PickerOutcome, SessionPicker};
@@ -105,8 +107,8 @@ use crate::ui::status_bar::{self, StatusBar};
 use crate::ui::thinking_view::{self, DraftView, ThinkingView};
 use crate::ui::transcript::{self, Transcript, TranscriptItem};
 use crate::view::{
-    AgentProgress, ApprovalId, ApprovalRequest, CommandInfo, CompactOutcome, Decision, EmptyNext, Message, Role, SessionPort,
-    SetupStart, StatusInfo, ToolState, ToolStatus, Totals, TurnEndReason, TurnStatus, UiEvent, WelcomeInfo,
+    AgentProgress, ApprovalId, ApprovalRequest, CommandInfo, CompactOutcome, Decision, EmptyNext, Message, PlanItem, Role,
+    SessionPort, SetupStart, StatusInfo, ToolState, ToolStatus, Totals, TurnEndReason, TurnStatus, UiEvent, WelcomeInfo,
 };
 use marv_core::{StopReason, Usage};
 
@@ -297,6 +299,8 @@ pub struct App {
     flush_at: Option<Instant>,
     tools_running: usize,
     agents_running: usize,
+    /// The plan tool's list (#15), pinned above the prompt while it has something left to do.
+    plan: Option<Vec<PlanItem>>,
     waiting_for: Option<String>,
     compacting: bool,
     /// Work outside a turn (`UiEvent::Busy`), shown on the waiting line.
@@ -373,6 +377,7 @@ impl App {
             flush_at: None,
             tools_running: 0,
             agents_running: 0,
+            plan: None,
             waiting_for: None,
             compacting: false,
             busy_label: None,
@@ -608,6 +613,7 @@ impl App {
         self.agent_logs.clear();
         self.viewing = None;
         self.last_usage = None;
+        self.plan = None;
         self.transcript.clear();
         self.scroll.follow();
         self.dirty = true;
@@ -681,6 +687,7 @@ impl App {
                 self.next_id = self.next_id.max(highest + 1);
                 self.totals = resumed.totals;
                 self.last_usage = None;
+                self.plan = resumed.plan;
                 self.transcript.replace(resumed.transcript);
                 let switched = if resumed.model != self.status.model {
                     format!(" (it used {}; continuing with {})", resumed.model, self.status.model)
@@ -700,6 +707,11 @@ impl App {
                 self.dirty = true;
             }
             UiEvent::Exit => self.exit = true,
+            // The main agent's plan call: a new list (an empty one clears it). Subagents have no plan tool.
+            UiEvent::Plan(items) => {
+                self.plan = (!items.is_empty()).then_some(items);
+                self.dirty = true;
+            }
             event => self.apply_turn(event, now),
         }
     }
@@ -1349,9 +1361,13 @@ impl App {
         };
         let header = if self.viewing.is_some() { agent_view::HEADER_HEIGHT } else { 0 };
         let panel_height = panel_height.min(area.height.saturating_sub(header + 1));
+        // The plan sits between the transcript and the panel (in a subagent's view too: it's the main agent's plan).
+        let plan = if area.height >= PLAN_MIN_WINDOW { plan_view::render(self.plan.as_deref(), width) } else { Vec::new() };
+        let plan_height = (plan.len() as u16).min(area.height.saturating_sub(header + panel_height + 1));
         // A subagent's view has its header pinned above it.
-        let transcript = Rect { y: area.y + header, height: area.height - panel_height - header, ..area };
-        let panel = Rect { y: transcript.bottom(), height: panel_height, ..area };
+        let transcript = Rect { y: area.y + header, height: area.height - panel_height - plan_height - header, ..area };
+        let plan_area = Rect { y: transcript.bottom(), height: plan_height, ..area };
+        let panel = Rect { y: plan_area.bottom(), height: panel_height, ..area };
 
         self.spinner_visible = false;
         if let Some(id) = self.viewing.filter(|id| self.agent_logs.contains_key(id)) {
@@ -1366,6 +1382,9 @@ impl App {
         }
         // Remember the visible rows' text and draw the highlight (Marv's transformOutput).
         self.selection.transform_buffer(buf);
+        for (row, line) in plan.iter().take(plan_height as usize).enumerate() {
+            buf.set_line(plan_area.x, plan_area.y + row as u16, line, plan_area.width);
+        }
 
         let bar = StatusBar {
             info: Some(&self.status),
@@ -2378,6 +2397,7 @@ mod tests {
             model: "other".into(),
             transcript: vec![agent],
             totals: Totals::default(),
+            plan: None,
         }));
         assert!(h.frame().contains("(it used other; continuing with ollama/qwen3.5:9b)"));
         h.click_on("agent old · run");
@@ -2551,5 +2571,109 @@ mod tests {
         h.events([UiEvent::TextDelta("streaming".into())]);
         h.frame();
         assert_eq!(h.app.deadline(), None, "no waiting line once text streams");
+    }
+
+    // --- the plan (#15) ---
+
+    fn plan(statuses: &[crate::view::PlanStatus]) -> Vec<PlanItem> {
+        let texts = ["Read the report command", "Add the --json flag", "Update README"];
+        statuses
+            .iter()
+            .enumerate()
+            .map(|(i, s)| PlanItem {
+                text: texts.get(i).map_or_else(|| format!("step {}", i + 1), |t| t.to_string()),
+                status: *s,
+            })
+            .collect()
+    }
+    /// The rows between the transcript and the prompt: the panel sits right above the prompt's box.
+    fn above_prompt(frame: &str) -> String {
+        let lines: Vec<&str> = frame.lines().collect();
+        let prompt = lines.iter().rposition(|l| l.contains("Type a message")).expect("the prompt is on screen");
+        // The prompt's top border is the line above its text; the panel is at most PLAN_ROWS rows.
+        lines[prompt.saturating_sub(1 + plan_view::PLAN_ROWS)..prompt - 1].join("\n")
+    }
+
+    #[test]
+    fn a_plan_call_pins_the_panel_above_the_prompt_and_an_all_done_one_hides_it() {
+        use crate::view::PlanStatus::{Done, InProgress, Pending};
+        let mut h = harness();
+        h.events([
+            tool_start("p1", "plan", "Plan"),
+            tool_end("p1", "plan", "Plan", "1/3 done"),
+            UiEvent::Plan(plan(&[Done, InProgress, Pending])),
+            UiEvent::Assistant { text: "Working on it.".into() },
+            turn_end(),
+        ]);
+        let frame = h.frame();
+        assert!(frame.contains("1/3 done"));
+        let above = above_prompt(&frame);
+        assert!(above.contains(" Plan 1/3 ─"), "{frame}");
+        assert!(above.contains("▸ Add the --json flag"), "{frame}");
+        h.events([
+            tool_start("p2", "plan", "Plan"),
+            tool_end("p2", "plan", "Plan", "3/3 done"),
+            UiEvent::Plan(plan(&[Done, Done, Done])),
+            turn_end(),
+        ]);
+        let frame = h.frame();
+        assert!(frame.contains("3/3 done"));
+        assert!(!frame.contains(" Plan 3/3 ─"));
+        assert!(!frame.contains("▸ Add the --json flag"));
+    }
+
+    #[test]
+    fn an_empty_plan_or_clear_hides_it() {
+        use crate::view::PlanStatus::{Done, InProgress, Pending};
+        let mut h = harness();
+        h.event(UiEvent::Plan(plan(&[Done, InProgress, Pending])));
+        assert!(h.frame().contains(" Plan 1/3 ─"));
+        h.event(UiEvent::Plan(vec![]));
+        assert!(!h.frame().contains(" Plan "));
+        h.event(UiEvent::Plan(plan(&[Done, InProgress, Pending])));
+        h.event(UiEvent::Clear);
+        assert!(!h.frame().contains(" Plan 1/3 ─"));
+    }
+
+    #[test]
+    fn not_on_a_window_under_20_rows() {
+        use crate::view::PlanStatus::{Done, InProgress, Pending};
+        let mut h = harness();
+        h.height = 19;
+        h.event(UiEvent::Plan(plan(&[Done, InProgress, Pending])));
+        assert!(!h.frame().contains(" Plan 1/3 ─"));
+        h.height = 20;
+        assert!(h.frame().contains(" Plan 1/3 ─"));
+    }
+
+    #[test]
+    fn the_collapsed_rows_with_12_items() {
+        use crate::view::PlanStatus::{Done, InProgress, Pending};
+        let mut h = harness();
+        let mut statuses = vec![Done; 4];
+        statuses.push(InProgress);
+        statuses.extend([Pending; 7]);
+        h.event(UiEvent::Plan(plan(&statuses)));
+        let above = above_prompt(&h.frame());
+        assert!(above.contains("▸ step 5"));
+        assert!(above.ends_with("  +4 more"), "{above}");
+    }
+
+    #[test]
+    fn a_resumed_session_shows_its_saved_plan() {
+        use crate::view::PlanStatus::{Done, InProgress, Pending};
+        let mut h = harness();
+        h.event(UiEvent::Resumed(Resumed {
+            id: "s".into(),
+            updated_at: 0,
+            model: "ollama/qwen3.5:9b".into(),
+            transcript: vec![],
+            totals: Totals::default(),
+            plan: Some(plan(&[Done, InProgress, Pending])),
+        }));
+        let frame = h.frame();
+        assert!(frame.contains("Resumed a session"));
+        assert!(frame.contains(" Plan 1/3 ─"));
+        assert!(frame.contains("▸ Add the --json flag"));
     }
 }

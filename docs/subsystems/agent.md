@@ -10,7 +10,7 @@ Spec: Marv `CLAUDE.md` bullets **Agent loop** and **Compaction**, `src/agent.ts`
 |---|---|---|
 | `src/agent.ts` | `agent.rs` | Constants and notes (verbatim) ported. ported, all of `tests/agent.test.ts` ported (against `ScriptedProvider` and a fake `ToolRunner`), plus tests for #58 default grouping, #59 wrap-up and `on_full` |
 | `src/repetition.ts` | `repetition.rs` | ported, all tests ported |
-| `src/compact.ts` | `compact.rs` | `summarize`, `summary_request`, `compacted_history`, `MID_TURN_NOTE` ported, tests ported; v2 (#63) helpers todo |
+| `src/compact.ts` | `compact.rs` | `summarize`, `summary_request`, `compacted_history` (with the open plan's text appended, #21: it takes the text, not the items, as marv-agent doesn't depend on marv-tools), `MID_TURN_NOTE` ported, tests ported; v2 (#63) helpers todo |
 | `tests/fake-provider.ts` | `testing.rs` (`ScriptedProvider`, test-only) | ported (scripted replies + recorded requests) |
 
 `grep -rn 'todo!("port' crates/marv-agent` lists what's left.
