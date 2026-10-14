@@ -965,6 +965,56 @@ mod tests {
         cancel.cancel();
     }
 
+    /// #77: a turn stopped (Esc) while the one prompt waits doesn't leave it waiting: the call is interrupted, the
+    /// prompt is dropped, and nothing is wired or sent.
+    #[tokio::test]
+    async fn a_stop_while_the_one_prompt_waits_is_an_interrupt_with_no_wire() {
+        struct Waiting(tokio::sync::Notify, Mutex<usize>);
+        #[async_trait]
+        impl Approver for Waiting {
+            async fn approve(&self, _request: ApprovalRequest) -> Decision {
+                *self.1.lock().unwrap() += 1;
+                self.0.notify_one();
+                std::future::pending().await
+            }
+        }
+        let (mesh, log, _rt, cancel) = switchboard();
+        mesh.plug(parent_id()).unwrap();
+        let worker = mesh.plug_next(WORKER).unwrap();
+        let person = Arc::new(Waiting(tokio::sync::Notify::new(), Mutex::default()));
+        let mut ctx = ToolContext::new(std::env::temp_dir());
+        ctx.approver = Some(person.clone());
+        let tools: Vec<ToolRef> =
+            MeshTool::all(&worker, &mesh, wire_approver(None, Some(&(person.clone() as Arc<dyn Approver>))))
+                .into_iter()
+                .map(|t| Arc::new(t) as ToolRef)
+                .collect();
+        let call = marv_core::ToolCall {
+            id: "c1".into(),
+            name: MESH_SEND.into(),
+            arguments: r#"{"receptacle": "agent.parent.inbox", "text": "hi"}"#.into(),
+        };
+        let stop = ctx.cancel.clone();
+        let asked = person.0.notified();
+        let run = marv_tools::run_tool(&call, &ctx, &tools);
+        let out = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(run, async {
+                asked.await;
+                stop.cancel();
+            })
+            .0
+        })
+        .await
+        .expect("a stop answers the waiting prompt");
+        assert_eq!(*person.1.lock().unwrap(), 1, "asked once");
+        assert!(out.result.declined, "{}", out.result.output);
+        assert_eq!(out.result.output, marv_tools::INTERRUPTED);
+        assert!(mesh.table().all().is_empty());
+        assert!(log.0.lock().unwrap().is_empty(), "nothing went to the switchboard");
+        assert!(mesh.drain_inbox(&parent_id()).is_empty());
+        cancel.cancel();
+    }
+
     /// #77 with #78: a wire made in the one prompt wakes the session only when the user said yes to it (granted by
     /// the TUI's person, like a wire asked for apart). A no leaves no wire and nothing to wake on.
     #[tokio::test]
