@@ -307,11 +307,11 @@ pub const MARV_RS_SECTIONS: &[&str] = &["# Your situation"];
 /// `PLAN_SENTENCE`) and plan tool description (`marv_tools::plan::PLAN_DESCRIPTION`).
 pub const MARV_RS_TEXT: &[(&str, &str)] = &[
     (
-        " For a task of four or more steps, keep a plan with the plan tool; send each update in the same reply as your next tool call, never in a reply of its own.",
+        " For a task of four or more steps, keep a plan with the plan tool; send each update in the same reply as your next tool call; only the final one, marking the plan done, may go alone.",
         " For a task with several steps, keep a plan with the plan tool and update it as you go.",
     ),
     (
-        "Keep a checklist for a task of four or more steps, or when the user asks for several things. Write the plan before starting; mark an item in_progress before working on it and done as soon as it is; add items you discover and remove ones that turn out unnecessary. Send the whole list every time (it replaces the previous one), in the same reply as your next tool call, never in a reply of its own. Skip it for a short task or a question.",
+        "Keep a checklist for a task of four or more steps, or when the user asks for several things. Write the plan before starting; mark an item in_progress before working on it and done as soon as it is; add items you discover and remove ones that turn out unnecessary. Send the whole list every time (it replaces the previous one), in the same reply as your next tool call; only the final update, marking the last items done, may go alone. Skip it for a short task or a question.",
         "Keep a checklist for a task of three or more steps, or when the user asks for several things. Write the plan before starting; mark an item in_progress before working on it and done as soon as it is; add items you discover and remove ones that turn out unnecessary. Send the whole list every time (it replaces the previous one). Skip it for a one-step task or a question.",
     ),
 ];

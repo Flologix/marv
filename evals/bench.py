@@ -99,6 +99,16 @@ def plan_only(trajectory):
     return count, ms
 
 
+def claude_plan_only(stream):
+    """Claude Code's replies whose only calls were TodoWrite (#85), from its stream-json output."""
+    messages = defaultdict(set)
+    for e in parse_lines(stream):
+        if e.get("type") == "assistant":
+            calls = messages[e["message"].get("id")]
+            calls.update(b["name"] for b in e["message"]["content"] if b["type"] == "tool_use")
+    return sum(1 for calls in messages.values() if calls and calls <= PLAN_TOOLS)
+
+
 def run_claude(ws, prompt, servers, logdir, a):
     cmd = ["claude", "-p", prompt, "--model", a.claude_model, "--output-format", "stream-json", "--verbose",
            "--setting-sources", "project", "--strict-mcp-config", "--mcp-config", json.dumps({"mcpServers": servers or {}}),
@@ -128,7 +138,7 @@ def run_claude(ws, prompt, servers, logdir, a):
                      promptTokens=u.get("input_tokens", 0) + cached + created, cachedTokens=cached,
                      completionTokens=u.get("output_tokens", 0), agentMs=e.get("duration_ms"))
     r["requests"] = len(messages)
-    r["planOnly"] = sum(1 for calls in messages.values() if calls and calls <= PLAN_TOOLS)
+    r["planOnly"] = claude_plan_only(p.stdout)
     return r
 
 
@@ -267,10 +277,12 @@ def report(dirs):
         for l in (Path(d) / "results.jsonl").read_text().splitlines():
             if not l: continue
             r = json.loads(l)
-            # A run from before #85's counter: count from its trajectory.
-            traj = Path(d) / "logs" / r["harness"] / f"{r['task']}-{r['rep']}" / "trajectory.jsonl"
-            if "planOnly" not in r and r["harness"] == "marv" and traj.exists():
-                r["planOnly"], r["planOnlyMs"] = plan_only(parse_lines(traj.read_text()))
+            # A run from before #85's counter: count from its saved trajectory or stream (else it stays unmeasured).
+            logs = Path(d) / "logs" / r["harness"] / f"{r['task']}-{r['rep']}"
+            if "planOnly" not in r and r["harness"] == "marv" and (logs / "trajectory.jsonl").exists():
+                r["planOnly"], r["planOnlyMs"] = plan_only(parse_lines((logs / "trajectory.jsonl").read_text()))
+            elif "planOnly" not in r and r["harness"] == "claude" and (logs / "stream.jsonl").exists():
+                r["planOnly"] = claude_plan_only((logs / "stream.jsonl").read_text())
             rows.append(r)
     groups = defaultdict(list)
     for r in rows: groups[(r["harness"], r.get("model", ""))].append(r)
@@ -280,9 +292,12 @@ def report(dirs):
     for (h, m), rs in sorted(groups.items()):
         n = len(rs)
         avg = lambda k: sum(r.get(k) or 0 for r in rs) / n
+        # Runs without a measurement don't count as zero plan-only requests.
+        measured = [r["planOnly"] for r in rs if r.get("planOnly") is not None]
+        plan_avg = f"{sum(measured) / len(measured):9.2f}" if measured else f"{'n/a':>9}"
         prompt = sum(r.get("promptTokens") or 0 for r in rs)
         print(f"{h:8} {m:28} {n:4} {sum(r['pass_'] for r in rs) / n:5.0%} {med([r['ms'] / 1000 for r in rs]):6.1f} "
-              f"{avg('requests'):5.1f} {avg('planOnly'):9.2f} {sum(sum(r['tools'].values()) for r in rs) / n:6.1f} {sum(r.get('toolErrors', 0) for r in rs):8} "
+              f"{avg('requests'):5.1f} {plan_avg} {sum(sum(r['tools'].values()) for r in rs) / n:6.1f} {sum(r.get('toolErrors', 0) for r in rs):8} "
               f"{avg('promptTokens'):8.0f} {(sum(r.get('cachedTokens') or 0 for r in rs) / prompt if prompt else 0):7.0%} "
               f"{avg('completionTokens'):8.0f} {avg('cost'):7.4f}")
     for (h, m), rs in sorted(groups.items()):

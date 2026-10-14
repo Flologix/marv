@@ -14,7 +14,7 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ### Changed
 
-- **Fewer requests spent only on the plan (#85).** The prompt and the `plan` tool now ask for a plan only for a task of four or more steps, and say to send each plan update in the same reply as the next tool call, never in a reply of its own. On a GLM bench, 33 of Marv's 47 plan calls were requests of their own: 192 s, about 7% of all request time. `marv -p` keeps the nudge (the plan steers the model and comes back after compaction, and batched it costs nothing).
+- **Fewer requests spent only on the plan (#85).** The prompt and the `plan` tool now ask for a plan only for a task of four or more steps, and say to send each plan update in the same reply as the next tool call, never in a reply of its own (only the final update, marking the plan done, may go alone). On a GLM bench, 33 of Marv's 47 plan calls were requests of their own: 192 s, about 7% of all request time. `marv -p` keeps the nudge (the plan steers the model and comes back after compaction, and batched it costs nothing).
 - **`mesh_list` names the other Marvs on this machine**, with the inbox a `mesh_send` would use and a note that the user has to wire it first. Before, the model only saw "nothing is wired", and answered "who's on the mesh?" with nobody while `marv mesh ls` listed several. Names only: their folders and panes stay in `marv mesh ls`.
 
 ### Added

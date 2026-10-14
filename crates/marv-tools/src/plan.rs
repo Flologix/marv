@@ -58,7 +58,7 @@ pub fn plan_text(items: &[PlanItem]) -> String {
 /// Deliberate difference (marv-rs #85): Marv's says "a task of three or more steps" and nothing about when to send
 /// it. On the GLM bench 33 of 47 plan calls were requests of their own, so: four or more steps, and each update in
 /// the same reply as the next tool call. The oracle maps it back to Marv's (`marv_oracle::runner::MARV_RS_TEXT`).
-pub const PLAN_DESCRIPTION: &str = "Keep a checklist for a task of four or more steps, or when the user asks for several things. Write the plan before starting; mark an item in_progress before working on it and done as soon as it is; add items you discover and remove ones that turn out unnecessary. Send the whole list every time (it replaces the previous one), in the same reply as your next tool call, never in a reply of its own. Skip it for a short task or a question.";
+pub const PLAN_DESCRIPTION: &str = "Keep a checklist for a task of four or more steps, or when the user asks for several things. Write the plan before starting; mark an item in_progress before working on it and done as soon as it is; add items you discover and remove ones that turn out unnecessary. Send the whole list every time (it replaces the previous one), in the same reply as your next tool call; only the final update, marking the last items done, may go alone. Skip it for a short task or a question.";
 
 pub struct Plan;
 
@@ -154,7 +154,7 @@ mod tests {
         // #85: on the GLM bench 33 of 47 plan calls were requests of their own (7% of request time).
         let d = Plan.description();
         assert!(d.starts_with("Keep a checklist for a task of four or more steps"));
-        assert!(d.contains("in the same reply as your next tool call, never in a reply of its own"));
+        assert!(d.contains("in the same reply as your next tool call; only the final update, marking the last items done, may go alone"));
     }
 
     fn call(items: Value) -> ToolCall {
