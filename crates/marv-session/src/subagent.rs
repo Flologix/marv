@@ -95,6 +95,9 @@ pub fn subagent_context(
     ctx.yolo = parent.yolo;
     ctx.skills = parent.skills.clone();
     ctx.taint = Arc::new(parent.taint.for_subagent());
+    // A shared-folder subagent edits the same files in the same turn: the turn's one checkpoint covers it (#16). A
+    // worktree's changes land on its branch, which is already the way back.
+    ctx.checkpoint = if worktree.is_some() { None } else { parent.checkpoint.clone() };
     if let Some(wt) = worktree {
         ctx.read_only = if wt.prefix.is_empty() { vec![wt.git_dir.clone()] } else { vec![wt.dir.clone(), wt.git_dir.clone()] };
         ctx.git_env = worktree_env(wt);
@@ -1281,6 +1284,20 @@ mod run_tests {
         assert_eq!(sub.root, PathBuf::from("/proj"));
         assert!(sub.read_only.is_empty() && sub.git_env.is_empty());
         assert!(sub.agent_host.is_none() && sub.memory.is_none());
+    }
+
+    /// The turn's one checkpoint covers a shared-folder subagent's edits; a worktree's branch is its own way back (#16).
+    #[test]
+    fn the_turns_checkpoint_goes_to_a_shared_folder_subagent_not_a_worktrees() {
+        struct Nothing;
+        #[async_trait]
+        impl marv_tools::Checkpoint for Nothing {
+            async fn checkpoint(&self) {}
+        }
+        let mut parent = parent();
+        parent.checkpoint = Some(Arc::new(Nothing));
+        assert!(subagent_context(&parent, "general-purpose · x", None, None).checkpoint.is_some());
+        assert!(subagent_context(&parent, "general-purpose · x", Some(&wt()), None).checkpoint.is_none());
     }
 
     #[tokio::test]

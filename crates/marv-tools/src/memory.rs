@@ -206,6 +206,10 @@ impl Tool for Memory {
     fn kind(&self) -> marv_core::ToolKind {
         marv_core::ToolKind::Write
     }
+    /// Memory lives in ~/.marv, outside the project: nothing for /undo to put back.
+    fn checkpoint(&self) -> bool {
+        false
+    }
     fn check(&self, input: &MemoryInput) -> Result<(), String> {
         if input.text.is_empty() { Err("text: must not be empty".into()) } else { Ok(()) }
     }

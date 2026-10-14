@@ -158,6 +158,18 @@ pub struct Preview {
     pub note: Option<String>,
     /// Shown in the warning colour, e.g. "runs WITHOUT a sandbox".
     pub warning: Option<String>,
+    /// Several files, each with its own diff (/undo: what goes back where).
+    pub files: Option<Vec<PreviewFile>>,
+}
+
+/// One file of [`Preview::files`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PreviewFile {
+    /// "Restore src/app.ts".
+    pub title: String,
+    pub diff: Option<DiffShown>,
+    /// "binary", "too large to show", "changed since".
+    pub note: Option<String>,
 }
 
 /// "Don't ask again this session" applies to everything with the same key.
@@ -383,6 +395,8 @@ pub enum TurnStatus {
     WaitingForMcp,
     Compacting,
     Checking,
+    /// The turn's checkpoint is taking a while (#16): "Saving a checkpoint…".
+    Checkpointing,
     Running,
 }
 

@@ -40,9 +40,9 @@ pub use registry::{
     DECLINED, INTERRUPTED, ToolOutcome, ToolRef, builtin_tools, is_parallel_call, run_tool, tool_specs, tool_specs_for,
 };
 pub use types::{
-    AgentHost, AgentProgress, Approval, ApprovalRequest, Approver, BeforeChange, Decision, DiffKind, DiffLine, DiffShown,
-    DynTool, MemoryPaths, PlanHost, PlanItem, PlanStatus, Preview, Repaired, Scope, Skill, Tool, ToolContext, ToolError,
-    ToolOutput,
+    AgentHost, AgentProgress, Approval, ApprovalRequest, Approver, BeforeChange, Checkpoint, Decision, DiffKind, DiffLine,
+    DiffShown, DynTool, MemoryPaths, PlanHost, PlanItem, PlanStatus, Preview, PreviewFile, Repaired, Scope, Skill, Tool,
+    ToolContext, ToolError, ToolOutput,
 };
 
 #[cfg(test)]

@@ -13,6 +13,8 @@
 //!   trajectories (they record named fields).
 //! - `ToolContext::before_change` is started (not awaited) by the edit tools' preview and awaited in `run` before
 //!   writing: the session takes the typecheck's baseline there, so it sees the project as it was.
+//! - `ToolContext::checkpoint` (#16) is awaited by `run_tool` after the approval (or yolo) and before running any
+//!   call whose tool takes one (`Tool::checkpoint`); `Preview::files` is /undo's list of files, each with its diff.
 //!
 //! marv-rs changes (docs/SECURITY.md):
 //! - `ToolKind::Egress` and `uses_network`: once the session is tainted ([`marv_sandbox::TaintState`]) such calls ask
@@ -102,6 +104,18 @@ pub struct Preview {
     pub note: Option<String>,
     /// Shown in the warning color, e.g. "runs WITHOUT a sandbox".
     pub warning: Option<String>,
+    /// Several files, each with its own diff (/undo: what goes back where).
+    pub files: Option<Vec<PreviewFile>>,
+}
+
+/// One file of a [`Preview::files`] list.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PreviewFile {
+    /// "Restore src/app.ts".
+    pub title: String,
+    pub diff: Option<DiffShown>,
+    /// "binary", "too large to show", "changed since".
+    pub note: Option<String>,
 }
 
 /// "Don't ask again this session" applies to everything with the same key.
@@ -180,6 +194,14 @@ pub trait Approver: Send + Sync {
 #[async_trait]
 pub trait BeforeChange: Send + Sync {
     async fn before_change(&self);
+}
+
+/// The turn's checkpoint (marv-session's `checkpoints`): a snapshot of the project before the turn's first change, so
+/// /undo can put it back. `run_tool` awaits it after the approval and before running any call whose tool takes one
+/// ([`Tool::checkpoint`]); one snapshot per turn, shared by every call and by shared-folder subagents. Never fails.
+#[async_trait]
+pub trait Checkpoint: Send + Sync {
+    async fn checkpoint(&self);
 }
 
 /// A loaded skill, as the `skill` tool needs it. Loading (`src/skills.ts`) lives in marv-session.
@@ -279,6 +301,8 @@ pub struct ToolContext {
     /// Pins where git looks for this agent's file listing (a worktree subagent).
     pub git_env: Vec<(String, String)>,
     pub before_change: Option<Arc<dyn BeforeChange>>,
+    /// The turn's checkpoint (see [`Checkpoint`]); separate from `before_change`, the checks' baseline.
+    pub checkpoint: Option<Arc<dyn Checkpoint>>,
     /// The session's taint (marv-rs).
     pub taint: Arc<TaintState>,
     /// The doors out of the sandbox this agent has (see [`Doors`]). Default: none.
@@ -305,6 +329,7 @@ impl ToolContext {
             plan: None,
             git_env: Vec::new(),
             before_change: None,
+            checkpoint: None,
             taint: Arc::new(TaintState::new()),
             doors: Doors::default(),
         }
@@ -394,6 +419,12 @@ pub trait Tool: Send + Sync + 'static {
     fn parallel(&self) -> bool {
         false
     }
+    /// Whether `run_tool` takes the turn's checkpoint before a call runs. Default: a kind that changes files (Write,
+    /// Execute; marv-rs's Egress is Marv's "read" web_fetch or an MCP or mesh tool). False for tools that change
+    /// nothing in the project (MCP servers act outside it, memory writes ~/.marv, a subagent's own calls take it).
+    fn checkpoint(&self) -> bool {
+        matches!(self.kind(), ToolKind::Write | ToolKind::Execute)
+    }
     /// Checks serde can't express (zod's `.min()`, `.max()`, `.int()` ranges). The message follows "Invalid input for <tool>:".
     fn check(&self, _input: &Self::Input) -> Result<(), String> {
         Ok(())
@@ -459,6 +490,7 @@ pub trait DynTool: Send + Sync {
     fn kind(&self) -> ToolKind;
     fn provenance(&self) -> Provenance;
     fn parallel(&self) -> bool;
+    fn checkpoint(&self) -> bool;
     /// Deserialize and check; the error is the text after "Invalid input for <tool>:".
     fn parse(&self, raw: Value) -> Result<ParsedInput, String>;
     fn label(&self, input: In<'_>) -> String;
@@ -499,6 +531,9 @@ impl<T: Tool> DynTool for T {
     }
     fn parallel(&self) -> bool {
         Tool::parallel(self)
+    }
+    fn checkpoint(&self) -> bool {
+        Tool::checkpoint(self)
     }
     fn parse(&self, raw: Value) -> Result<ParsedInput, String> {
         let input: T::Input = serde_json::from_value(raw).map_err(|e| e.to_string())?;
