@@ -185,6 +185,26 @@ pub fn tool_status(run: &marv_agent::ToolRun) -> view::ToolStatus {
     view::ToolStatus { label: run.label.clone(), status, summary, steps: None, diff }
 }
 
+/// A plan call's list, for the screen (`ToolDisplay::plan`); `None` for a call that failed.
+fn plan_of(run: &marv_agent::ToolRun) -> Option<Vec<view::PlanItem>> {
+    let display = run.display.as_ref()?.downcast_ref::<marv_session::ToolDisplay>()?;
+    display.plan.as_deref().map(view_plan)
+}
+
+fn view_plan(items: &[marv_tools::PlanItem]) -> Vec<view::PlanItem> {
+    items
+        .iter()
+        .map(|i| view::PlanItem {
+            text: i.text.clone(),
+            status: match i.status {
+                marv_tools::PlanStatus::Pending => view::PlanStatus::Pending,
+                marv_tools::PlanStatus::InProgress => view::PlanStatus::InProgress,
+                marv_tools::PlanStatus::Done => view::PlanStatus::Done,
+            },
+        })
+        .collect()
+}
+
 fn compact_outcome(result: CompactResult) -> view::CompactOutcome {
     match result {
         CompactResult::Compacted { summary, tokens_before } => view::CompactOutcome::Compacted { summary, tokens_before },
@@ -285,7 +305,15 @@ pub fn map_event(
             {
                 map.titles.insert(call.id.clone(), label.clone());
             }
-            map_loop(&event, totals).into_iter().collect()
+            let mut out: Vec<UiEvent> = map_loop(&event, totals).into_iter().collect();
+            // The main agent's plan call: its new list, pinned above the prompt (#15). Subagents have no plan tool.
+            if let LoopEvent::ToolEnd { call, run } = &event
+                && call.name == "plan"
+                && let Some(items) = plan_of(run)
+            {
+                out.push(UiEvent::Plan(items));
+            }
+            out
         }
         SessionEvent::Subagent { call_id, event } => {
             let title = map.titles.get(&call_id).cloned().unwrap_or_default();
@@ -818,6 +846,7 @@ impl Bridge {
             model: resumed.model,
             transcript: resumed.transcript.iter().filter_map(transcript_message).collect(),
             totals: totals(&resumed.totals),
+            plan: resumed.plan.as_deref().map(view_plan),
         }));
         self.emit(UiEvent::StatusInfo(self.status_info()));
     }
@@ -1819,6 +1848,29 @@ mod tests {
         assert!(matches!(&out[1], UiEvent::Subagent { title, .. } if title == "general-purpose · fix"));
         let tainted = map_event(SessionEvent::Tainted { source: marv_core::Provenance::Web }, &mut map, &t, &last);
         assert!(texts(&tainted)[0].contains("a web page"));
+    }
+
+    #[test]
+    fn the_main_agents_plan_call_pins_its_list_and_a_subagents_doesnt() {
+        let call = ToolCall { id: "p1".into(), name: "plan".into(), arguments: "{}".into() };
+        let mut run = marv_agent::ToolRun::new(
+            ToolResult { output: "Plan saved: 0 of 1 done; now: A.".into(), summary: Some("0/1 done".into()), is_error: false },
+            "Plan",
+        );
+        let items = vec![marv_tools::PlanItem { text: "A".into(), status: marv_tools::PlanStatus::InProgress }];
+        run.display = Some(Arc::new(marv_session::ToolDisplay { diff: None, plan: Some(items) }));
+        let mut map = TurnMap::default();
+        let (t, last) = (view::Totals::default, || None);
+        let ended = LoopEvent::ToolEnd { call: call.clone(), run: run.clone() };
+        let out = map_event(SessionEvent::Loop(ended.clone()), &mut map, &t, &last);
+        let expected = vec![view::PlanItem { text: "A".into(), status: view::PlanStatus::InProgress }];
+        assert!(matches!(&out[..], [UiEvent::ToolEnd { .. }, UiEvent::Plan(items)] if *items == expected));
+        let sub = map_event(SessionEvent::Subagent { call_id: "a1".into(), event: ended }, &mut map, &t, &last);
+        assert!(!sub.iter().any(|e| matches!(e, UiEvent::Plan(_))));
+        // A failed call (no list) changes nothing.
+        let failed = marv_agent::ToolRun::new(ToolResult { output: "x".into(), summary: None, is_error: true }, "Plan");
+        let out = map_event(SessionEvent::Loop(LoopEvent::ToolEnd { call, run: failed }), &mut map, &t, &last);
+        assert!(!out.iter().any(|e| matches!(e, UiEvent::Plan(_))));
     }
 
     #[test]

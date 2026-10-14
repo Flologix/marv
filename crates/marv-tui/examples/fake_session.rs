@@ -393,6 +393,7 @@ impl SessionPort for Fake {
             model: "ollama/qwen3.5:9b".into(),
             transcript,
             totals: Totals::default(),
+            plan: None,
         }));
     }
 
