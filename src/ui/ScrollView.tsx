@@ -20,6 +20,8 @@ interface Props {
   onViewport?: (viewport: Viewport, scrollBy: (rows: number) => void) => void;
   /** Kept mounted but not shown (and not scrolled by keys or the wheel): it keeps its scroll position for when it's back. */
   hidden?: boolean;
+  /** Start at the top rather than following the bottom (a list read from its start, like /undo's files). */
+  fromTop?: boolean;
 }
 
 // The alternate screen has no terminal scrollback, so Marv scrolls its own
@@ -29,7 +31,7 @@ interface Props {
 // It follows the bottom (like a chat) until you press PgUp or scroll up. Then
 // it stays where you scrolled, even while a reply streams in, until you scroll
 // back down or `followKey` changes.
-export function ScrollView({ children, followKey = 0, isActive: active = true, onViewport, hidden = false }: Props) {
+export function ScrollView({ children, followKey = 0, isActive: active = true, onViewport, hidden = false, fromTop = false }: Props) {
   const isActive = active && !hidden;
   const viewportRef = useRef(null);
   const contentRef = useRef(null);
@@ -44,8 +46,8 @@ export function ScrollView({ children, followKey = 0, isActive: active = true, o
   const { viewport, content } = measuredNow ? { viewport: measuredViewport, content: measuredContent } : lastMeasured.current;
 
   // null = following the bottom; otherwise the row pinned to the top.
-  const [top, setTop] = useState<number | null>(null);
-  useEffect(() => setTop(null), [followKey]);
+  const [top, setTop] = useState<number | null>(fromTop ? 0 : null);
+  useEffect(() => setTop(fromTop ? 0 : null), [followKey]);
 
   // Clamp on every render: the maximum changes as content grows or the terminal resizes.
   const maxTop = Math.max(0, content.height - viewport.clientHeight);

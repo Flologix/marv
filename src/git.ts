@@ -48,19 +48,20 @@ export interface GitAsyncResult extends GitResult {
 
 /**
  * runGit without blocking the event loop: a snapshot of a big tree (checkpoints) takes seconds, and the UI must keep
- * drawing meanwhile. The same rules (no hooks or fsmonitor, no inherited GIT_*, no stdin, a timeout), and an abort
- * kills it too. A git that's killed isn't waited for: a child it started (an alias, a filter) may hold its pipes open.
+ * drawing meanwhile. The same rules (no hooks or fsmonitor, no inherited GIT_*, no stdin but Marv's own `input`, a
+ * timeout), and an abort kills it too. A git that's killed isn't waited for: a child it started (an alias, a filter) may hold its pipes open.
  */
 export async function runGitAsync(
   cwd: string,
   args: string[],
-  { env, timeoutMs = GIT_TIMEOUT_MS, signal }: { env?: Record<string, string>; timeoutMs?: number; signal?: AbortSignal } = {},
+  { env, timeoutMs = GIT_TIMEOUT_MS, signal, input }: { env?: Record<string, string>; timeoutMs?: number; signal?: AbortSignal; input?: string } = {},
 ): Promise<GitAsyncResult> {
   const killed: GitAsyncResult = { ok: false, out: "", bytes: new Uint8Array(), timedOut: false };
   if (signal?.aborted) return killed;
-  let proc: ReturnType<typeof Bun.spawn<"ignore", "pipe", "pipe">>;
+  let proc: ReturnType<typeof Bun.spawn<"ignore" | Uint8Array, "pipe", "pipe">>;
   try {
-    proc = Bun.spawn(["git", ...NO_PROGRAMS, ...args], { cwd, env: gitEnvironment(env), stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+    const stdin: "ignore" | Uint8Array = input === undefined ? "ignore" : new TextEncoder().encode(input);
+    proc = Bun.spawn(["git", ...NO_PROGRAMS, ...args], { cwd, env: gitEnvironment(env), stdin, stdout: "pipe", stderr: "pipe" });
   } catch (error) {
     return { ...killed, out: (error as Error).message };
   }

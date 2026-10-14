@@ -156,3 +156,44 @@ describe("Approval", () => {
     expect(onDecide).toHaveBeenCalledWith("no");
   });
 });
+
+describe("Approval: an undo of many files (Greptile on #71)", () => {
+  const PAGE_DOWN = "\x1b[6~";
+  const diff = (n: number) => ({
+    lines: Array.from({ length: 8 }, (_, i) => ({ kind: "add" as const, text: `file ${n} line ${i + 1}`, newLine: i + 1 })),
+    more: 0,
+  });
+  const UNDO: ApprovalRequest = {
+    tool: "undo",
+    label: "turn 3",
+    once: true,
+    scope: { key: "undo", description: "undo" },
+    preview: {
+      title: "Undo turn 3",
+      files: Array.from({ length: 12 }, (_, i) => ({ title: `restore src/file${i + 1}.ts`, diff: diff(i + 1) })),
+      note: "12 files",
+    },
+  };
+
+  test("the file list fits the window and scrolls; Yes and No stay visible", async () => {
+    const { stdin, lastFrame } = render(<Approval request={UNDO} onDecide={() => {}} windowRows={30} />);
+    await tick();
+    const first = lastFrame()!;
+    expect(first.split("\n").length).toBeLessThanOrEqual(30);
+    expect(first).toContain("restore src/file1.ts");
+    expect(first).not.toContain("restore src/file12.ts");
+    expect(first).toMatch(/❯ Yes/);
+    expect(first).toContain("No");
+    for (let i = 0; i < 20; i++) {
+      stdin.write(PAGE_DOWN);
+      await tick(5);
+    }
+    await tick();
+    const last = lastFrame()!;
+    expect(last.split("\n").length).toBeLessThanOrEqual(30);
+    expect(last).toContain("restore src/file12.ts");
+    expect(last).toContain("file 12 line 8");
+    expect(last).toMatch(/❯ Yes/);
+    expect(last).toContain("No");
+  });
+});

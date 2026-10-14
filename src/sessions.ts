@@ -50,6 +50,14 @@ export interface SavedSession {
   mcp?: { mode: McpMode; announced: string[] };
   /** The plan tool's list (#15), when one is set. Checked by the session on resume: a bad one is dropped, not the session. */
   plan?: PlanItem[];
+  /**
+   * The conversation's checkpoint chain (#16): its id (the session's own, or the one a resume started when the old
+   * chain couldn't be read) and, per turn number, the paths its tools reported changing (an undo preview lists those
+   * it can't restore). Absent in older files. Checked by the session on resume.
+   */
+  checkpoints?: { chain: string; reported: [number, string[]][] };
+  /** A note for the model not yet sent (an undo's, #16): it leads the next user message. Checked on resume. */
+  pendingNote?: string;
 }
 
 export interface SessionSummary {

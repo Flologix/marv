@@ -170,6 +170,7 @@ export async function runHeadless(options: HeadlessOptions): Promise<number> {
       trajectories,
       diagnostics: config.diagnostics,
       checks: config.checks,
+      checkpoints: config.checkpoints,
       configDir,
       mcpTools: config.mcpTools,
       // gh with the user's login, when it's there (MARV_GITHUB=off hides it): reads run, writes need --approve github.

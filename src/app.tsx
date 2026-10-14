@@ -1577,9 +1577,11 @@ export function App({
 
   const view = viewing ? agentLogs.current.get(viewing) : undefined;
 
+  // An approval listing files (/undo) scrolls that list with PgUp/PgDn and the wheel: the transcript stays put.
+  const filesShown = Boolean(approval && !setupMode && approval.head.request.preview.files?.length);
   return (
     <Box flexDirection="column" height={rows} width={columns}>
-      <ScrollView followKey={followKey} isActive={setupMode === null} onViewport={selection.setViewport} hidden={view !== undefined}>
+      <ScrollView followKey={followKey} isActive={setupMode === null && !filesShown} onViewport={selection.setViewport} hidden={view !== undefined}>
         <Transcript
           items={items}
           version={version}
@@ -1603,7 +1605,7 @@ export function App({
 
       {view && <AgentViewHeader log={view} />}
       {view && (
-        <ScrollView key={viewing} isActive={setupMode === null} onViewport={selection.setViewport}>
+        <ScrollView key={viewing} isActive={setupMode === null && !filesShown} onViewport={selection.setViewport}>
           <AgentView log={view} version={logVersion} showSteps={showSteps} />
         </ScrollView>
       )}

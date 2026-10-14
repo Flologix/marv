@@ -25,6 +25,14 @@ What counts as Marv's public API: the SDK (`@flologixai/marv/sdk`), the `marv` c
 
 ### Fixed
 
+- Greptile's findings on the Sprint 4 PR (#71):
+  - `/undo` puts back a file's own bytes: a checkpoint used to keep what `git add` stores, so a CRLF file (`eol=crlf`, `core.autocrlf`) came back with LF and an LFS file as its pointer. Files git's clean side changed (a blob whose size differs from the file, or a path with a `filter`, `ident` or `working-tree-encoding` attribute) are hashed again from the file with `--no-filters`; nothing is smudged on the way back. Skipped (a few milliseconds) where no attributes file or `core.autocrlf` could convert anything.
+  - Two SDK sessions in one program each get their own socket folder for background processes (`$XDG_RUNTIME_DIR/marv/<pid>-<random>`); they used to share `p1/fwd.sock`, and closing one removed the other's.
+  - The `/undo` approval's file list is at most the window's height less the panel's own rows, and scrolls (PgUp/PgDn, the wheel); Yes and No stay on screen.
+  - `marv -p` honors `checkpoints: false` in the config (`/checkpoints off`).
+  - An undo's note for the model, the conversation's checkpoint chain (after a resume that couldn't read the old one) and the paths each turn reported changing are saved with the session, so a resume after a restart still tells the model about the undo, finds the turns made since, and still lists the files an undo can't restore. Older session files load as before.
+  - A session made with `plan: false` doesn't restore a saved plan on resume (compaction would have told the model to keep updating it).
+  - Evals: `planOpen` reads the plan from the calls the tool accepted; a refused call still counts in `planCalls`.
 - Headless mode (`marv -p`) shows the CLI's advice in provider errors, not the SDK's (issue #54): a rejected key now says "Run /setup to enter a new one." like the TUI, instead of "Pass another provider.apiKey to createSession()". A CLI user runs `marv`, not `createSession()`. The advice is an internal option on `createSession` (default unchanged: the SDK's options).
 
 ## [0.3.0] - 2026-10-12

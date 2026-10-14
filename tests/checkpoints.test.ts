@@ -304,6 +304,80 @@ describe("undo", () => {
     expect(result.restored.length + result.deleted.length + result.recreated.length).toBe(6);
   });
 
+  describe("the working file's own bytes, not what git's filters store (Greptile on #71)", () => {
+    /** Commits `files` and `.gitattributes` in a fresh repository with `config` set first. */
+    function repoWith(config: string[][], attributes: string, files: Record<string, string>): string {
+      const repo = makeRepo();
+      for (const [key, value] of config) git(repo, "config", key!, value!);
+      writeFileSync(join(repo, ".gitattributes"), attributes);
+      for (const [path, content] of Object.entries(files)) writeFileSync(join(repo, path), content);
+      git(repo, "add", "-A");
+      git(repo, "commit", "-q", "-m", "attributes");
+      return repo;
+    }
+    async function undoBack(s: CheckpointStore) {
+      const plan = await planUndo(s);
+      if ("reason" in plan) throw new Error(plan.reason);
+      expect(plan.files.every((f) => !f.changedSince)).toBe(true);
+      expect((await applyUndo(s, plan)).refused).toEqual([]);
+      return plan;
+    }
+
+    test("eol=crlf: a CRLF file comes back CRLF, and isn't called changed since", async () => {
+      const crlf = "one\r\ntwo\r\n";
+      const repo = repoWith([], "*.txt text eol=crlf\n", { "w.txt": crlf });
+      const s = store(repo);
+      await turn(s, 1, () => writeFileSync(join(repo, "w.txt"), "one\r\nTWO\r\n"));
+      const plan = await undoBack(s);
+      expect(plan.files.find((f) => f.path === "w.txt")!.diff!.lines.map((l) => `${l.kind}:${l.text}`)).toEqual(["ctx:one\r", "del:TWO\r", "add:two\r"]);
+      expect(readFileSync(join(repo, "w.txt"), "utf8")).toBe(crlf);
+    });
+
+    test("core.autocrlf=true: a file with LF stays LF, a CRLF one CRLF, also when it was deleted", async () => {
+      const repo = repoWith([["core.autocrlf", "true"]], "", { "lf.txt": "lf\n", "crlf.txt": "crlf\r\n" });
+      const s = store(repo);
+      await turn(s, 1, () => {
+        writeFileSync(join(repo, "lf.txt"), "changed\n");
+        unlinkSync(join(repo, "crlf.txt"));
+      });
+      await undoBack(s);
+      expect(readFileSync(join(repo, "lf.txt"), "utf8")).toBe("lf\n");
+      expect(readFileSync(join(repo, "crlf.txt"), "utf8")).toBe("crlf\r\n");
+    });
+
+    test("a clean filter (an LFS pointer, here one that keeps the size): the file's own content comes back, no smudge run", async () => {
+      const marker = join(tempDir(), "smudged");
+      const repo = repoWith(
+        [
+          ["filter.fake.clean", "tr a-z A-Z"],
+          ["filter.fake.smudge", `touch ${marker}; tr A-Z a-z`],
+        ],
+        "*.bin filter=fake\n",
+        { "asset.bin": "real content\n" },
+      );
+      rmSync(marker, { force: true });
+      const s = store(repo);
+      await turn(s, 1, () => writeFileSync(join(repo, "asset.bin"), "other bytes!\n"));
+      await undoBack(s);
+      expect(readFileSync(join(repo, "asset.bin"), "utf8")).toBe("real content\n");
+      expect(existsSync(marker)).toBe(false);
+    });
+
+    test("outside a repository too (the project's .gitattributes applies to Marv's own git dir)", async () => {
+      const plain = tempDir();
+      writeFileSync(join(plain, ".gitattributes"), "*.txt text eol=crlf\n");
+      writeFileSync(join(plain, "w.txt"), "x\r\ny\r\n");
+      const s = store(plain);
+      await turn(s, 1, () => writeFileSync(join(plain, "w.txt"), "z\r\n"));
+      await undoBack(s);
+      expect(readFileSync(join(plain, "w.txt"), "utf8")).toBe("x\r\ny\r\n");
+      // A second turn reuses what the first hashed: still the file's own bytes.
+      await turn(s, 2, () => writeFileSync(join(plain, "w.txt"), "q\r\n"));
+      await undoBack(s);
+      expect(readFileSync(join(plain, "w.txt"), "utf8")).toBe("x\r\ny\r\n");
+    });
+  });
+
   test("a file edited since the turn is marked, and still restored; reported paths in neither tree aren't restored", async () => {
     const repo = makeRepo();
     const s = store(repo);

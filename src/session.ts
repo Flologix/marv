@@ -232,6 +232,16 @@ function planOf(value: unknown): PlanItem[] | null {
   return parsed.success && parsed.data.length ? parsed.data : null;
 }
 
+const CheckpointsShape = z.object({
+  chain: z.string().regex(/^[\w.-]+$/),
+  reported: z.array(z.tuple([z.number().int().positive(), z.array(z.string())])),
+});
+/** A saved session's checkpoint chain and reported paths, or null for an old file or a hand edit. */
+function checkpointsOf(value: unknown): z.infer<typeof CheckpointsShape> | null {
+  const parsed = CheckpointsShape.safeParse(value);
+  return parsed.success ? parsed.data : null;
+}
+
 const ListingShape = z.object({ mode: z.enum(["deferred", "eager"]), announced: z.array(z.string()) });
 /** A saved session's MCP listing, or null for an old file or a hand edit (then nothing counts as announced). */
 function listingOf(value: unknown): { mode: McpMode; announced: string[] } | null {
@@ -436,6 +446,8 @@ export class MarvSession implements Session {
   private checkpointFailure: string | undefined;
   /** What the model hasn't been told about an undo yet: it starts the next user message. */
   private pendingNote: string | null = null;
+  /** The checkpoint chain this conversation's turns go on: its id, unless a resume couldn't read that chain. Saved. */
+  private chainId: string;
   /** Old chains are pruned once per session, at its first turn. */
   private pruned = false;
 
@@ -473,7 +485,8 @@ export class MarvSession implements Session {
     this.system = this.buildSystem();
     this.saved = newSession(init.root, { provider: this.factory.id, model: this.factory.model });
     this.checkpoints = init.checkpointStore ?? new CheckpointStore({ root: init.root, ownDir: init.checkpointsDir, session: this.saved.id });
-    this.checkpoints.setSession(this.saved.id);
+    this.chainId = this.saved.id;
+    this.checkpoints.setSession(this.chainId);
     this.lookup();
   }
 
@@ -589,21 +602,34 @@ export class MarvSession implements Session {
     this.saveNow(); // the last turn's save may still be waiting: it belongs to the conversation being left
     this.saved = saved;
     this.newChain();
-    // Its chain, if it still exists: numbering goes on after its last checkpointed turn. One that can't be read is
-    // left as it is: this conversation's turns go on a chain of their own, so their numbers can't meet its turns.
+    // Its chain (the saved one: a recovery below may have replaced the session's own), if it still exists: numbering
+    // goes on after its last checkpointed turn, and an undo preview still knows what each turn reported changing.
+    const checkpoints = checkpointsOf(saved.checkpoints);
+    if (checkpoints) {
+      this.chainId = checkpoints.chain;
+      this.checkpoints.setSession(this.chainId);
+      for (const [turn, paths] of checkpoints.reported) this.reported.set(turn, new Set(paths));
+    }
+    // One that can't be read is left as it is: this conversation's turns go on a chain of their own, so their numbers
+    // can't meet its turns. Its id is saved with the session, so the next resume finds those turns.
     try {
       this.turnNumber = (await this.checkpoints.chain()).reduce((max, c) => Math.max(max, c.turn), 0);
     } catch (error) {
-      this.checkpoints.setSession(`${saved.id}.${Date.now()}`);
+      this.chainId = `${saved.id}.${Date.now()}`;
+      this.checkpoints.setSession(this.chainId);
+      this.reported.clear();
       this.checkpointFailure = `${(error as Error).message}: the turns before this resume can't be undone`;
     }
+    // An undo's note the model hadn't been sent yet: it still leads the next message (the conversation is untouched).
+    if (typeof saved.pendingNote === "string" && saved.pendingNote) this.pendingNote = saved.pendingNote;
     this.conversation = [...saved.conversation];
     this.messages = [...saved.transcript];
     this.totals = saved.totals;
     this.last = undefined;
     this.listing = listingOf(saved.mcp);
     // The model needs nothing extra: its last plan call (or the summary holding the plan) is still in the conversation.
-    this.planItems = planOf(saved.plan);
+    // A session without the plan tool restores none: compaction would tell the model to keep updating it.
+    this.planItems = this.planOn ? planOf(saved.plan) : null;
     this.loaded.clear();
     return { id: saved.id, updatedAt: saved.updatedAt, model: saved.model, transcript: saved.transcript, totals: saved.totals, plan: this.planItems };
   }
@@ -694,6 +720,7 @@ export class MarvSession implements Session {
       return result;
     } finally {
       this.running = false;
+      this.scheduleSave(); // the note waits in the session file, in case Marv exits before the next message
     }
   }
 
@@ -726,6 +753,8 @@ export class MarvSession implements Session {
       totals: this.totals,
       ...(this.listing ? { mcp: { mode: this.listing.mode, announced: [...this.listing.announced] } } : {}),
       plan: this.planItems ?? undefined,
+      checkpoints: { chain: this.chainId, reported: [...this.reported].map(([turn, paths]): [number, string[]] => [turn, [...paths]]) },
+      pendingNote: this.pendingNote ?? undefined,
     };
     await store.save(this.saved);
   }
@@ -777,7 +806,8 @@ export class MarvSession implements Session {
 
   /** A conversation was swapped (clear, resume): its own chain, numbering and undo note. */
   private newChain(): void {
-    this.checkpoints.setSession(this.saved.id);
+    this.chainId = this.saved.id;
+    this.checkpoints.setSession(this.chainId);
     this.turnNumber = 0;
     this.reported.clear();
     this.pendingNote = null;

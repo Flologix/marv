@@ -125,6 +125,23 @@ describe.if(sandboxAvailable())("ProcessManager (in a real sandbox)", () => {
     }
   });
 
+  test("two managers in one program (two SDK sessions) each get their own socket folder; closing one leaves the other's (Greptile on #71)", async () => {
+    const [portA, portB] = await Promise.all([freePort(), freePort()]);
+    // The same parent folder, as two sessions in one process get by default.
+    const other = new ProcessManager({ root, home, runtimeDir: runtime, pollMs: 100, startWaitMs: 1000 });
+    try {
+      const a = await manager.start({ command: serve([portA], "from a") });
+      const b = await other.start({ command: serve([portB], "from b") });
+      expect(a.info.ports).toEqual([portA]);
+      expect(b.info.ports).toEqual([portB]);
+      expect(await (await fetch(`http://127.0.0.1:${portB}/`)).text()).toBe("from b");
+      await manager.closeAll();
+      expect(await (await fetch(`http://127.0.0.1:${portB}/`)).text()).toBe("from b");
+    } finally {
+      await other.closeAll();
+    }
+  });
+
   test("an exited process stays listed with its code and logs, until replaced", async () => {
     const started = await manager.start({ command: "echo bye; exit 3", name: "short" });
     expect(started.info).toMatchObject({ state: "exited", exitCode: 3 });

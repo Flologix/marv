@@ -214,6 +214,93 @@ describe("a turn's checkpoints", () => {
     expect(git(project, "log", "-1", "--format=%B", `refs/marv/checkpoints/${old}`)).toContain("first");
   });
 
+  test("the replacement chain is saved: a later resume finds the turns made after the recovery (Greptile on #71)", async () => {
+    const sessions = new SessionStore(join(dir, "sessions"));
+    const store = new CheckpointStore({ root: project, session: "x" });
+    const session = makeSession(
+      new ScriptedProvider([useTools(write("w", "first.txt", "1\n")), say("ok"), useTools(write("w2", "again.txt", "2\n")), say("ok")]),
+      { sessions, checkpointStore: store },
+    );
+    await collect(session.send("first"));
+    const old = session.id;
+    await session.flush();
+    await session.clear();
+    const real = store.chain.bind(store);
+    store.chain = async () => {
+      throw new Error("the checkpoints can't be read (git timed out)");
+    };
+    await session.resume(old);
+    store.chain = real;
+    await collect(session.send("again"));
+    await session.flush();
+    // Another process (or a restart) resumes it: the chain it reads is the one "again" went on.
+    const later = makeSession(new ScriptedProvider([]), { sessions });
+    await later.resume(old);
+    const plan = await later.undoPlan();
+    expect("reason" in plan ? plan.reason : [plan.turn, plan.label]).toEqual([1, "again"]);
+  });
+
+  test("an undo's note for the model survives a restart before the next message (Greptile on #71)", async () => {
+    const sessions = new SessionStore(join(dir, "sessions"));
+    const session = makeSession(new ScriptedProvider([useTools(write("w", "a.txt", "changed\n")), say("changed it")]), { sessions });
+    await collect(session.send("add the parser"));
+    const plan = await session.undoPlan();
+    if ("reason" in plan) throw new Error(plan.reason);
+    await session.undo(plan);
+    await session.close();
+    const saved = (await sessions.load(project, session.id))!;
+
+    const provider = new ScriptedProvider([say("ok"), say("ok")]);
+    const resumed = makeSession(provider, { sessions });
+    await resumed.resume(session.id);
+    await collect(resumed.send("what now?"));
+    const history = provider.requests[0]!.history;
+    // The saved conversation is sent unchanged (the prompt cache), and the note leads the new message.
+    expect(history.slice(0, saved.conversation.length)).toEqual(saved.conversation);
+    const last = history.at(-1)!;
+    expect(last.role === "user" && last.text).toStartWith('Marv: the user undid your changes from an earlier turn ("add the parser")');
+    expect(last.role === "user" && last.text).toEndWith("what now?");
+    // Told once: not saved again after it was sent.
+    await resumed.flush();
+    const again = makeSession(provider, { sessions });
+    await again.resume(session.id);
+    await collect(again.send("and now?"));
+    const next = provider.requests.at(-1)!.history.at(-1)!;
+    expect(next.role === "user" && next.text).toBe("and now?");
+  });
+
+  test("a resumed undo preview still names the reported files it can't restore (Greptile on #71)", async () => {
+    writeFileSync(join(project, ".gitignore"), "ignored.txt\n");
+    git(project, "add", "-A");
+    git(project, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "ignore");
+    const sessions = new SessionStore(join(dir, "sessions"));
+    const session = makeSession(new ScriptedProvider([useTools(write("w", "a.txt", "two\n"), write("w2", "ignored.txt", "x\n")), say("done")]), {
+      sessions,
+    });
+    await collect(session.send("change both"));
+    const before = await session.undoPlan();
+    expect("reason" in before ? before.reason : before.notRestored).toEqual(["ignored.txt"]);
+    await session.close();
+    const resumed = makeSession(new ScriptedProvider([]), { sessions });
+    await resumed.resume(session.id);
+    const after = await resumed.undoPlan();
+    expect("reason" in after ? after.reason : after.notRestored).toEqual(["ignored.txt"]);
+  });
+
+  test("an old session file without the checkpoint fields still resumes", async () => {
+    const sessions = new SessionStore(join(dir, "sessions"));
+    const session = makeSession(new ScriptedProvider([useTools(write("w", "a.txt", "two\n")), say("done")]), { sessions });
+    await collect(session.send("change it"));
+    await session.close();
+    const file = sessions.file(project, session.id);
+    const { checkpoints: _c, pendingNote: _p, ...old } = JSON.parse(readFileSync(file, "utf8"));
+    writeFileSync(file, JSON.stringify(old));
+    const resumed = makeSession(new ScriptedProvider([]), { sessions });
+    expect((await resumed.resume(session.id))?.id).toBe(session.id);
+    const plan = await resumed.undoPlan();
+    expect("reason" in plan ? plan.reason : plan.label).toBe("change it");
+  });
+
   test("a failing snapshot doesn't stop the turn, and says so once", async () => {
     const store = new CheckpointStore({ root: project, session: "x" });
     store.snapshot = async () => ({ ok: false, reason: "failed", message: "disk full", ms: 1 });
