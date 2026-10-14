@@ -40,6 +40,7 @@ use crate::config::{Env, default_config_dir};
 use crate::paths::{home_dir, home_or_above, project_key};
 use crate::session::{MarvSession, ProviderChoice, ResumeTarget, SessionError, SessionInit, SystemPrompt, TranscriptFn, Warn};
 use crate::sessions::SessionStore;
+use marv_tools::formatter::FormatterSetting;
 use crate::sources::{Source, load_sources};
 use crate::trajectory::TrajectoryStore;
 
@@ -70,6 +71,8 @@ pub struct SessionOptions {
     pub plan: bool,
     pub diagnostics: bool,
     pub checks: bool,
+    /// The formatter the edit tools run after a change (#67). Default on (detect from the project's config).
+    pub formatter: FormatterSetting,
     /// Before a turn's first change, snapshot the project (git commits under a hidden ref,
     /// `refs/marv/checkpoints/<session>`, or a git dir of Marv's own in `config_dir` outside a repository), and again
     /// when it ends, so `session.undo_plan()` and `session.undo(plan)` can put that turn's files back. Default true.
@@ -127,6 +130,7 @@ impl SessionBuilder {
                 plan: true,
                 diagnostics: true,
                 checks: true,
+                formatter: FormatterSetting::Auto,
                 checkpoints: true,
                 mcp_tools: McpToolsSetting::Auto,
                 sandbox: true,
@@ -300,6 +304,7 @@ pub async fn create_session(options: SessionOptions) -> Result<MarvSession, Sess
     init.plan = options.plan;
     init.diagnostics = options.diagnostics;
     init.checks = options.checks;
+    init.formatter = options.formatter;
     init.checkpoints = options.checkpoints;
     init.checkpoints_dir = Some(config_dir.join("checkpoints").join(project_key(&root)));
     init.mcp_tools = options.mcp_tools;

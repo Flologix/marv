@@ -10,8 +10,7 @@
 //! - [`run_tool`] → [`ToolOutcome`] (never fails), [`builtin_tools`], [`tool_specs_for`], [`is_parallel_call`].
 //!
 //! Planned across the crate: spill cut output to a file the model can page through (#61, [`output`]),
-//! a formatter run after edits (#67, [`edit_file`]/[`write_file`]),
-//! `apply_patch` (#66, [`apply_patch`]).
+//! `apply_patch` (#66, [`apply_patch`]). The formatter run after edits (#67) is in [`formatter`].
 
 pub mod agent;
 pub mod apply_patch;
@@ -21,6 +20,7 @@ pub mod edit_file;
 pub mod edit_match;
 pub mod file_lock;
 pub mod files;
+pub mod formatter;
 pub mod github;
 pub mod glob;
 pub mod grep;
@@ -50,6 +50,7 @@ pub use types::{
     DiffShown, DynTool, MemoryPaths, PlanHost, PlanItem, PlanStatus, Preview, PreviewFile, ProcessForward, ProcessForwards,
     ProcessHost, ProcessInfo, ProcessState, Repaired, Scope, Skill, StartResult, Tool, ToolContext, ToolError, ToolOutput,
 };
+pub use formatter::{FormatOutcome, Formatter, FormatterSetting, ProjectFormatter};
 
 #[cfg(test)]
 pub(crate) mod test_support {

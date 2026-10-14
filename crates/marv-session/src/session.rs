@@ -26,6 +26,8 @@
 //!   ([`crate::runner::SessionApprover`]).
 //! - It owns the process's MCP manager ([`McpHandle`], when `owns_mcp`) and mesh switchboard ([`MeshHandle`]).
 //! - The typecheck's and project checks' notes are fenced as project data, never in Marv's voice.
+//! - The project's formatter (#67): the setting (config `formatter`) goes onto each turn's tool context, where the
+//!   edit tools run it on the files they write (`marv_tools::formatter`); subagents inherit the hook.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, Hasher};
@@ -46,6 +48,7 @@ use marv_mcp::deferred::{
 use marv_provider::{ModelInfo, Provider, ProviderFactory, ProviderOption};
 use marv_sandbox::TaintState;
 use marv_tools::{AgentProgress, Approver, Decision, PlanHost, PlanItem, ProcessInfo, ToolContext, ToolRef};
+use marv_tools::formatter::FormatterSetting;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_util::sync::CancellationToken;
 
@@ -239,6 +242,8 @@ pub struct SessionInit {
     pub plan: bool,
     pub diagnostics: bool,
     pub checks: bool,
+    /// The formatter the edit tools run after a change (#67). Default on (detect from the project's config).
+    pub formatter: FormatterSetting,
     /// Snapshot the project before each turn's first change and after the turn (git commits under a hidden ref, #16),
     /// so `undo_plan()`/`undo()` can put a turn's files back. Default true.
     pub checkpoints: bool,
@@ -306,6 +311,7 @@ impl SessionInit {
             plan: true,
             diagnostics: true,
             checks: true,
+            formatter: FormatterSetting::Auto,
             checkpoints: true,
             checkpoints_dir: None,
             checkpoint_store: None,
@@ -473,6 +479,7 @@ struct State {
     yolo: bool,
     diagnostics: bool,
     checks: bool,
+    formatter: FormatterSetting,
     max_steps: Option<u32>,
     logging: bool,
     mcp_tools: McpToolsSetting,
@@ -801,6 +808,7 @@ impl MarvSession {
             yolo: init.yolo,
             diagnostics: init.diagnostics,
             checks: init.checks,
+            formatter: init.formatter.clone(),
             max_steps: init.max_steps,
             logging: init.log_trajectories,
             mcp_tools: init.mcp_tools,
@@ -1091,7 +1099,7 @@ impl MarvSession {
         let turn_specs = init.mcp.as_ref().map(|m| m.specs()).unwrap_or_default();
         self.state().turn_mcp_specs = turn_specs.clone();
         let (specs, tools) = self.offered();
-        let (sandbox, yolo, factory, provider, info, diagnostics, checks_on, max_steps, history, system) = {
+        let (sandbox, yolo, factory, provider, info, diagnostics, checks_on, formatter, max_steps, history, system) = {
             let s = self.state();
             (
                 s.sandbox,
@@ -1101,6 +1109,7 @@ impl MarvSession {
                 s.info.clone(),
                 s.diagnostics,
                 s.checks,
+                s.formatter.clone(),
                 s.max_steps,
                 s.conversation.clone(),
                 s.system.clone(),
@@ -1220,6 +1229,9 @@ impl MarvSession {
             ctx.plan = Some(Arc::new(SessionPlan(self.clone())));
         }
         ctx.before_change = checks.as_ref().map(|c| c.before_change.clone());
+        // The project's formatter (#67): the edit tools run it on each file they write, inside the sandbox (it's the
+        // project's own code). Off by config, and nothing runs where the sandbox is off either.
+        ctx.formatter = marv_tools::formatter::ProjectFormatter::hook(&formatter, sandbox);
         ctx.checkpoint = checkpoint.map(|c| c as Arc<dyn marv_tools::Checkpoint>);
         ctx.taint = self.inner.taint.clone();
         // The main agent's doors out of the sandbox, fixed for the session (the prompt names them: the cache).
@@ -3957,6 +3969,78 @@ mod turn_tests {
         let tools: Vec<&serde_json::Value> = log.iter().filter(|r| r["type"] == "tool").collect();
         assert_eq!((tools[0]["door"].as_str(), tools[0]["approval"].as_str()), (Some("host"), Some("yes")));
         assert!(tools[1].get("door").is_none());
+    }
+
+    // The project's formatter (#67): what an edit lands as (formatted) is what the model is told about.
+
+    #[tokio::test]
+    async fn the_session_formats_what_an_edit_lands_and_tells_the_model() {
+        if !marv_sandbox::sandbox_available() {
+            eprintln!("skipped: bubblewrap isn't available here");
+            return;
+        }
+        let dirs = Dirs::new();
+        // A fake prettier that rewrites double quotes to single ones — writing in place, no temp file in the
+        // read-only project folder (the command substitution reads before the redirect truncates).
+        let script = "#!/bin/sh\nfor f in \"$@\"; do case \"$f\" in --*) ;; *) printf '%s\\n' \"$(tr '\"' \"'\" < \"$f\")\" > \"$f\" ;; esac; done\n";
+        std::fs::create_dir_all(dirs.project.join("node_modules/.bin")).unwrap();
+        std::fs::write(dirs.project.join("node_modules/.bin/prettier"), script).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dirs.project.join("node_modules/.bin/prettier"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(dirs.project.join(".prettierrc"), "{ \"singleQuote\": true }").unwrap();
+        std::fs::write(dirs.project.join("a.js"), "const a = \"hi\";\n").unwrap();
+        let provider = Scripted::new(vec![
+            use_tools(vec![call(
+                "c1",
+                "edit_file",
+                serde_json::json!({
+                    "path": "a.js",
+                    "old_string": "const a = \"hi\";",
+                    "new_string": "const b = \"there\";"
+                }),
+            )]),
+            say("Done."),
+        ]);
+        let session = scripted(&dirs, &provider, |i| i.formatter = FormatterSetting::Auto);
+        let events = collect(go(&session, "edit it")).await;
+        // The file on disk is formatted.
+        let content = std::fs::read_to_string(dirs.project.join("a.js")).unwrap();
+        assert_eq!(content, "const b = 'there';\n", "{events:?}");
+        // The model was told, and the result it saw is the formatted one.
+        let tool = events.iter().find_map(|e| match e {
+            SessionEvent::Loop(LoopEvent::ToolEnd { run, .. }) => Some(run.result.clone()),
+            _ => None,
+        });
+        assert!(
+            tool.clone()
+                .unwrap()
+                .output
+                .contains("the project's formatter then reformatted it (+1 −1 lines beyond this edit)"),
+            "{tool:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_formatter_the_config_turned_off_changes_nothing() {
+        let dirs = Dirs::new();
+        std::fs::create_dir_all(dirs.project.join("node_modules/.bin")).unwrap();
+        std::fs::write(dirs.project.join("node_modules/.bin/prettier"), "#!/bin/sh\ntrue\n").unwrap();
+        std::fs::write(dirs.project.join(".prettierrc"), "{}").unwrap();
+        std::fs::write(dirs.project.join("a.js"), "hi\n").unwrap();
+        let provider = Scripted::new(vec![
+            use_tools(vec![call(
+                "c1",
+                "edit_file",
+                serde_json::json!({ "path": "a.js", "old_string": "hi", "new_string": "there" }),
+            )]),
+            say("Done."),
+        ]);
+        let session = scripted(&dirs, &provider, |i| {
+            i.formatter = FormatterSetting::Off;
+            i.sandbox = true;
+        });
+        collect(go(&session, "edit it")).await;
+        assert_eq!(std::fs::read_to_string(dirs.project.join("a.js")).unwrap(), "there\n");
     }
 
     #[tokio::test]

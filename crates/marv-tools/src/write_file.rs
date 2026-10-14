@@ -10,8 +10,8 @@
 //!   edit can't be lost.
 //! - Like `edit_file`: preview starts `before_change`, run awaits it (Esc meanwhile writes nothing), `.git` re-checked
 //!   at apply time when confined, syntax note after the change, protected paths ask even in yolo (marv-rs), and so
-//!   does a `package.json` write that changes a lifecycle script (the content rule); formatter after the write
-//!   planned (#67).
+//!   does a `package.json` write that changes a lifecycle script (the content rule); and like `edit_file` (#67), the
+//!   project's formatter runs on the written file before the notes, and the diff shows the file as it is now.
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -158,40 +158,51 @@ impl Tool for WriteFile {
         if await_before_change(ctx).await {
             return Ok(ToolOutput::ok(INTERRUPTED_BEFORE_WRITE, "interrupted"));
         }
-        // Read and written as one step per file, so a parallel append (or edit) can't be lost.
-        let Plan { shown, before, body, after, diff, new_line_missing, crlf, .. } =
-            with_file_lock(&ctx.root, &input.path, || async {
-                let planned = plan(input, ctx).await?;
-                let failed = |e: std::io::Error| ToolError(format!("Couldn't write {}: {e}", planned.shown));
-                if let Some(dir) = planned.absolute.parent() {
-                    tokio::fs::create_dir_all(dir).await.map_err(failed)?;
-                }
-                tokio::fs::write(&planned.absolute, &planned.after).await.map_err(failed)?;
-                Ok::<_, ToolError>(planned)
-            })
-            .await?;
-        let note = match broken_by(&shown, before.as_deref(), &after).await {
-            Some(problem) => format!("\n\n{}", syntax_note(&shown, &problem, &after, before.is_some())),
+        // Read, written and formatted as one step per file, so a parallel append (or edit) can't be lost.
+        let (planned, formatted) = with_file_lock(&ctx.root, &input.path, || async {
+            let planned = plan(input, ctx).await?;
+            let failed = |e: std::io::Error| ToolError(format!("Couldn't write {}: {e}", planned.shown));
+            if let Some(dir) = planned.absolute.parent() {
+                tokio::fs::create_dir_all(dir).await.map_err(failed)?;
+            }
+            tokio::fs::write(&planned.absolute, &planned.after).await.map_err(failed)?;
+            // #67: the project's formatter runs before anything is said; its failure is a note, not an error.
+            let formatted = crate::formatter::after_write(ctx, &planned.shown, &planned.absolute, &planned.after).await;
+            Ok::<_, ToolError>((planned, formatted))
+        })
+        .await?;
+        let after = &formatted.content;
+        // The diff, the summary and the notes describe the file as it is on disk now (formatted).
+        let diff = match &planned.before {
+            None => Diff { lines: added_lines(after), added: 0, removed: 0 },
+            Some(b) => diff_text(b, after, 3),
+        };
+        let notes = crate::formatter::notes(&formatted, &planned.after);
+        let broken = match broken_by(&planned.shown, planned.before.as_deref(), after).await {
+            Some(problem) => format!("\n\n{}", syntax_note(&planned.shown, &problem, after, planned.before.is_some())),
             None => String::new(),
         };
-        let mut result = if before.is_none() {
-            let n = line_count(&body);
+        let mut result = if planned.before.is_none() {
+            let n = line_count(after);
             let mut result = ToolOutput::ok(
-                format!("Created {shown} ({n} lines).{note}"),
+                format!("Created {} ({n} lines).{notes}{broken}", planned.shown),
                 format!("created · {n} line{}", if n == 1 { "" } else { "s" }),
             );
-            result.diff = Some(shown_diff(&added_lines(&body)));
+            result.diff = Some(shown_diff(&added_lines(after)));
             result
         } else {
             let what = if input.append.unwrap_or(false) { "Appended to" } else { "Wrote" };
-            let nl = if new_line_missing { "; added a newline to its last line first" } else { "" };
-            let crlf_note = if crlf { "; kept its CRLF line endings" } else { "" };
+            let nl = if planned.new_line_missing { "; added a newline to its last line first" } else { "" };
+            let crlf_note = if planned.crlf { "; kept its CRLF line endings" } else { "" };
             let summary = change_summary(&diff);
-            let mut result = ToolOutput::ok(format!("{what} {shown} ({summary} lines{nl}{crlf_note}).{note}"), summary);
+            let mut result = ToolOutput::ok(
+                format!("{what} {} ({summary} lines{nl}{crlf_note}).{notes}{broken}", planned.shown),
+                summary,
+            );
             result.diff = Some(shown_diff(&diff.lines));
             result
         };
-        result.changed = Some(shown);
+        result.changed = Some(planned.shown.clone());
         Ok(result)
     }
 }
@@ -577,6 +588,107 @@ mod tests {
         assert!(!out.result.output.contains("parse"));
         let fine = f.run("edit_file", json!({"path": "greet.ts", "old_string": "Hello", "new_string": "Hi"})).await;
         assert!(!fine.result.output.contains("parse"));
+    }
+
+    // The project's formatter after the change (#67)
+
+    /// A project whose formatter rewrites double quotes to single ones (a fake prettier; `testing::` holds it), with
+    /// the hook built over the real run path, executed unsandboxed like every command in these tests.
+    fn formatting_fixture(tag: &str, config: bool) -> (Fixture, ToolContext) {
+        let f = Fixture::new(tag);
+        crate::formatter::testing::bin(
+            &f.root,
+            "prettier",
+            "#!/bin/sh\nfor f in \"$@\"; do case \"$f\" in --*) ;; *) tr '\"' \"'\" < \"$f\" > \"$f.fmt\" && mv \"$f.fmt\" \"$f\" ;; esac; done\n",
+        );
+        if config {
+            f.root.write(".prettierrc", "{ \"singleQuote\": true }");
+        }
+        let mut ctx = f.ctx.clone();
+        ctx.formatter = Some(Arc::new(crate::formatter::ProjectFormatter::new(
+            crate::formatter::FormatterSetting::Auto,
+            true,
+            Some(crate::formatter::testing::run_unsandboxed()),
+        )));
+        (f, ctx)
+    }
+
+    #[tokio::test]
+    async fn an_edit_with_double_quotes_lands_formatted_and_the_result_shows_it() {
+        let (f, ctx) = formatting_fixture("w-fmt-edit", true);
+        f.root.write("a.js", "const a = \"hi\";\n");
+        let out =
+            run_with(&ctx, "edit_file", json!({"path": "a.js", "old_string": "const a = \"hi\";", "new_string": "const b = \"there\";"}))
+                .await
+                .result;
+        assert!(!out.is_error, "{}", out.output);
+        // What landed is the formatted file.
+        assert_eq!(f.read("a.js"), "const b = 'there';\n");
+        // The tool result shows the formatted lines (what the file holds, not what the edit wrote).
+        let diff = out.diff.unwrap();
+        assert!(diff.lines.iter().any(|l| l.text == "const b = 'there';" && l.kind == DiffKind::Add), "{diff:?}");
+        assert!(!diff.lines.iter().any(|l| l.text == "const b = \"there\";"));
+        assert_eq!(out.summary, "+1 −1");
+        // And the note says formatting changed lines beyond the edit.
+        assert!(
+            out.output.contains("the project's formatter then reformatted it (+1 −1 lines beyond this edit)"),
+            "{}",
+            out.output
+        );
+        // The approved preview showed the unformatted diff: formatting happens after the approval.
+        let preview = f.asked()[0].preview.clone();
+        assert!(preview.diff.unwrap().iter().any(|l| l.text == "const b = \"there\";" && l.kind == DiffKind::Add));
+    }
+
+    #[tokio::test]
+    async fn no_formatter_config_means_no_change() {
+        let (f, ctx) = formatting_fixture("w-fmt-none", false);
+        f.root.write("a.js", "const a = \"hi\";\n");
+        let out =
+            run_with(&ctx, "edit_file", json!({"path": "a.js", "old_string": "const a = \"hi\";", "new_string": "const b = \"there\";"}))
+                .await
+                .result;
+        assert!(!out.is_error, "{}", out.output);
+        assert_eq!(f.read("a.js"), "const b = \"there\";\n");
+        assert!(out.diff.unwrap().lines.iter().any(|l| l.text == "const b = \"there\";"));
+        assert!(!out.output.contains("formatter"), "{}", out.output);
+    }
+
+    #[tokio::test]
+    async fn a_created_file_is_formatted_and_counted_after_formatting() {
+        let (f, ctx) = formatting_fixture("w-fmt-create", true);
+        let out = run_with(&ctx, "write_file", json!({"path": "new.js", "content": "const a = \"x\";\n"})).await.result;
+        assert!(!out.is_error, "{}", out.output);
+        assert_eq!(f.read("new.js"), "const a = 'x';\n");
+        assert!(out.output.contains("Created new.js (1 lines)"), "{}", out.output);
+        assert!(out.output.contains("the project's formatter then reformatted it"), "{}", out.output);
+        assert!(out.diff.unwrap().lines.iter().any(|l| l.text == "const a = 'x';"));
+    }
+
+    #[tokio::test]
+    async fn a_failing_formatter_is_a_note_not_an_error() {
+        let f = Fixture::new("w-fmt-fail");
+        crate::formatter::testing::bin(&f.root, "prettier", "#!/bin/sh\necho 'a.js: SyntaxError' >&2\nexit 2\n");
+        f.root.write(".prettierrc", "{}");
+        let mut ctx = f.ctx.clone();
+        ctx.formatter = Some(Arc::new(crate::formatter::ProjectFormatter::new(
+            crate::formatter::FormatterSetting::Auto,
+            true,
+            Some(crate::formatter::testing::run_unsandboxed()),
+        )));
+        f.root.write("a.js", "const a = \"hi\";\n");
+        let out =
+            run_with(&ctx, "edit_file", json!({"path": "a.js", "old_string": "const a = \"hi\";", "new_string": "const b = \"there\";"}))
+                .await
+                .result;
+        // The edit landed; the formatter's failure is a note.
+        assert!(!out.is_error, "{}", out.output);
+        assert_eq!(f.read("a.js"), "const b = \"there\";\n");
+        assert!(
+            out.output.contains("the project's formatter failed: it failed with exit code 2:\na.js: SyntaxError (the file keeps what this edit wrote)."),
+            "{}",
+            out.output
+        );
     }
 
     // Approval
