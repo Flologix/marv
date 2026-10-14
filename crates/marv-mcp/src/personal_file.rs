@@ -123,8 +123,7 @@ mod tests {
 
     #[test]
     fn a_file_marv_cant_read_is_an_error_not_empty() {
-        let dir = std::env::temp_dir().join(format!("marv-personal-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testutil::temp_dir("personal");
         let path = personal_file(&dir);
         let _ = std::fs::remove_file(&path);
         assert!(read(&path).unwrap().is_empty());

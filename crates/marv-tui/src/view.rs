@@ -251,8 +251,8 @@ pub struct StatusInfo {
 pub struct WelcomeInfo {
     pub version: String,
     pub cwd: String,
-    /// An AGENTS.md was loaded.
-    pub instructions: bool,
+    /// The instruction files the model has, as shown ("AGENTS.md", "~/.marv/AGENTS.md"; #62).
+    pub instructions: Vec<String>,
     pub skills: usize,
     pub memories: usize,
     pub mcp_servers: usize,

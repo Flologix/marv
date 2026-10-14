@@ -66,6 +66,10 @@ impl Machine {
             .env("MARV_CONFIG_DIR", self.0.join(format!("config-{name}")))
             .env("XDG_RUNTIME_DIR", self.run_dir())
             .env("MARV_MESH_NAME", name)
+            // No GitHub probe (`gh auth status`), which this test doesn't need: where `gh` is a wrapper that installs
+            // gh on first use (mise), the probe's timeout kills the wrapper and not the installer, which keeps writing
+            // ~40 MB into the fake home after it was removed (#89).
+            .env("MARV_GITHUB", "off")
             .env("TERM", "dumb")
             .env("LANG", "C.UTF-8")
             .stdin(Stdio::null())

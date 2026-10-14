@@ -89,7 +89,8 @@ fn a_wrong_binary_fails_with_a_diff() {
     let Verdict::Fail { mismatches, notes, .. } = &verdict else { panic!("expected a failure, got {verdict:?}") };
     let parts: Vec<&str> = mismatches.iter().map(|m| m.part.as_str()).collect();
     assert_eq!(parts, ["exit_code", "events.jsonl", "requests.jsonl", "files/stray.txt"]);
-    assert!(notes.iter().any(|n| n == "3 scripted replies were never asked for"), "{notes:?}");
+    // marv-rs serves step-limit's own script: its 4th reply is the wrap-up at the limit (#59).
+    assert!(notes.iter().any(|n| n == "4 scripted replies were never asked for"), "{notes:?}");
     let text = report(&scenario.name, &verdict);
     assert!(
         text.contains("FAIL     step-limit")
