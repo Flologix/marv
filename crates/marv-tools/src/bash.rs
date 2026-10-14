@@ -164,7 +164,7 @@ pub async fn run_command(
 }
 
 /// A stream's text, up to about [`MAX_CAPTURE`] (whole chunks are kept while under it; the rest is read and dropped).
-async fn capture(mut stream: impl AsyncRead + Unpin) -> String {
+pub(crate) async fn capture(mut stream: impl AsyncRead + Unpin) -> String {
     let mut kept = Vec::new();
     let mut chunk = vec![0u8; 64 * 1024];
     loop {
