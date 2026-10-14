@@ -752,12 +752,13 @@ fn skills_text(skills: &[LoadedSkill], problems: &[String]) -> String {
             skills
                 .iter()
                 .map(|s| {
-                    format!(
-                        "- `/{}`: {}{}",
-                        s.skill.name,
-                        printable(&s.skill.description),
-                        if s.source == SkillSource::Personal { " *(personal)*" } else { "" }
-                    )
+                    // A skill linked to a system folder shows where it really is (#75): it's read from there.
+                    let note = match (&s.link, s.source) {
+                        (Some(link), _) => format!(" *(personal: {})*", printable(link)),
+                        (None, SkillSource::Personal) => " *(personal)*".to_string(),
+                        (None, SkillSource::Project) => String::new(),
+                    };
+                    format!("- `/{}`: {}{note}", s.skill.name, printable(&s.skill.description))
                 })
                 .collect::<Vec<_>>()
                 .join("\n"),
@@ -820,6 +821,31 @@ mod tests {
             processes: None,
         };
         f(&ctx)
+    }
+
+    #[test]
+    fn skills_shows_where_a_linked_system_skill_really_is() {
+        let skill = |name: &str, source, link: Option<&str>| LoadedSkill {
+            skill: marv_tools::Skill {
+                name: name.into(),
+                description: "D.".into(),
+                dir: "/x".into(),
+                body: String::new(),
+                files: vec![],
+            },
+            source,
+            link: link.map(Into::into),
+        };
+        let skills = [
+            skill("notes", SkillSource::Project, None),
+            skill("omarchy", SkillSource::Personal, Some("omarchy → /usr/share/omarchy/skills/omarchy\x1b[2J")),
+            skill("todo", SkillSource::Personal, None),
+        ];
+        let text = skills_text(&skills, &[]);
+        assert!(text.contains("- `/notes`: D.\n"), "{text}");
+        assert!(text.contains("- `/omarchy`: D. *(personal: omarchy → /usr/share/omarchy/skills/omarchy)*"), "{text}");
+        assert!(text.contains("- `/todo`: D. *(personal)*"), "{text}");
+        assert!(!text.contains('\x1b'));
     }
 
     #[test]

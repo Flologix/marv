@@ -208,8 +208,13 @@ pub struct SessionInit {
     pub thinking: bool,
     /// Marv's version, for trajectories.
     pub version: String,
-    /// The project's AGENTS.md, as it goes into the prompt (`prompt::read_instructions`).
+    /// The instruction files, as they go into the prompt (`instructions::load_instructions`, which gives each its
+    /// heading); plain text of your own goes under "# Project instructions (from AGENTS.md)".
     pub instructions: Option<String>,
+    /// Append a folder's own `AGENTS.md`/`CLAUDE.md` (below the root) to the first read_file, edit_file or write_file
+    /// result there, once per conversation (#62; `crate::instructions::NestedInstructions`). Default false: an SDK
+    /// session reads the project's files only when it asks for the `Project` source; the CLI sets it.
+    pub nested_instructions: bool,
     pub skills: Vec<LoadedSkill>,
     /// Agent types the agent tool can start (default: general-purpose).
     pub agents: Vec<AgentType>,
@@ -286,6 +291,7 @@ impl SessionInit {
             thinking: false,
             version: env!("CARGO_PKG_VERSION").into(),
             instructions: None,
+            nested_instructions: false,
             skills: Vec::new(),
             agents: vec![general_purpose()],
             memory: None,
@@ -548,6 +554,9 @@ struct Inner {
     processes: Option<ProcessManager>,
     /// The project's checkpoints (#16); its ref follows the conversation (`State::chain_id`).
     checkpoints: Arc<CheckpointStore>,
+    /// Nested instruction files the main agent's conversation has had (#62); emptied with it (`clear`, `resume`) and
+    /// by a compaction (the summary replaces the results that carried them).
+    nested: Arc<crate::instructions::NestedInstructions>,
     state: Mutex<State>,
 }
 
@@ -820,6 +829,7 @@ impl MarvSession {
             taint: Arc::new(TaintState::new()),
             skills: Arc::new(init.skills.iter().map(|s| s.skill.clone()).collect()),
             loaded: Arc::default(),
+            nested: Arc::default(),
             typecheck: Arc::new(Checker::new(Arc::new(crate::diagnostics::turn::Typecheck), None)),
             project_checks: Arc::new(Checker::new(Arc::new(crate::checks::kind::ProjectChecksKind), None)),
             process_on,
@@ -1187,6 +1197,7 @@ impl MarvSession {
             agents: Arc::new(init.agents.clone()),
             cwd: self.cwd(),
             instructions: init.instructions.clone(),
+            nested_instructions: init.nested_instructions,
             worktrees_dir: init.worktrees_dir.clone(),
             factory: factory.clone(),
             provider: provider.clone(),
@@ -1221,7 +1232,11 @@ impl MarvSession {
             ctx.processes = self.inner.processes.clone().map(|m| Arc::new(m) as Arc<dyn marv_tools::ProcessHost>);
         }
         ctx.forwards = self.inner.processes.clone().map(|m| Arc::new(m) as Arc<dyn marv_tools::ProcessForwards>);
-        let runner = Arc::new(SessionToolRunner::new(ctx, Arc::new(tools)));
+        let mut runner = SessionToolRunner::new(ctx, Arc::new(tools));
+        if init.nested_instructions {
+            runner.nested = Some(self.inner.nested.clone());
+        }
+        let runner = Arc::new(runner);
 
         let mut options = AgentOptions::new(provider.clone(), history, system, specs, runner.clone(), stop.clone());
         options.max_steps = max_steps.unwrap_or(marv_agent::agent::DEFAULT_MAX_STEPS);
@@ -1293,6 +1308,11 @@ impl MarvSession {
                 })
             }));
         }
+
+        // With no one to say "keep going" (no approver: `marv -p`; or one that answers "unavailable": `marv -p
+        // --approve`), the limit first gets one tools-off wrap-up reply (#59), the headless reply. After the user's "no"
+        // the loop stops without it.
+        options.wrap_up_at_limit = true;
 
         let mut reason = TurnEndReason::Done(StopReason::Error);
         let mut subagents = 0;
@@ -1559,6 +1579,8 @@ impl MarvSession {
             s.last = None;
         }
         lock(&self.inner.loaded).clear();
+        // The summary replaces the tool results that carried nested instruction files (#62): give them again.
+        self.inner.nested.reset();
         // From here the model sees the summary, not the turns before it: the trajectory needs it to say what the model
         // saw. The turn it follows only if that turn is in this file (after resume(), the last turn was in another one).
         if let Some(log) = self.trajectory() {
@@ -1586,6 +1608,7 @@ impl MarvSession {
             s.plan = None; // a new conversation, a new plan
         }
         lock(&self.inner.loaded).clear();
+        self.inner.nested.reset();
         if let Some((paths, _)) = &self.inner.init.memory
             && let Ok(memories) = crate::memory::load_memory(paths).await
         {
@@ -1625,6 +1648,8 @@ impl MarvSession {
             // The last turn's save may still be waiting: it belongs to the conversation being left.
             self.save_now(&mut s, transcript);
             lock(&self.inner.loaded).clear();
+            // The saved conversation may lack a note this one had: give them again (a repeat is harmless).
+            self.inner.nested.reset();
             s.conversation = Arc::new(Mutex::new(saved.conversation.clone()));
             s.messages = saved.transcript.clone();
             s.totals = saved.totals.clone();
@@ -2874,12 +2899,85 @@ mod turn_tests {
         let dirs = Dirs::new();
         let provider = Scripted::new(reads(30));
         let events = collect(go(&scripted(&dirs, &provider, |_| {}), "loop")).await;
-        assert_eq!(provider.requests().len(), 25);
+        // 25 steps, then the wrap-up request (#59).
+        assert_eq!(provider.requests().len(), 26);
         assert!(has_done(&events, StopReason::MaxSteps));
         let provider = Scripted::new(reads(40));
         let events = collect(go(&scripted(&dirs, &provider, |i| i.max_steps = Some(30)), "loop")).await;
-        assert_eq!(provider.requests().len(), 30);
+        assert_eq!(provider.requests().len(), 31);
         assert!(has_done(&events, StopReason::MaxSteps));
+    }
+
+    /// The text of the turn's last `Assistant` event.
+    fn last_reply(events: &[SessionEvent]) -> Option<String> {
+        events.iter().rev().find_map(|e| match e {
+            SessionEvent::Loop(LoopEvent::Assistant { text }) => Some(text.clone()),
+            _ => None,
+        })
+    }
+
+    #[tokio::test]
+    async fn with_no_one_to_ask_the_step_limit_gets_a_tools_off_wrap_up_reply() {
+        // #59: `marv -p` without --approve has no on_limit. One more request, with Marv's note and tool_choice none;
+        // the tools are still sent (same list: the cached prefix holds). The reply is the turn's last word.
+        let dirs = Dirs::new();
+        let mut steps = reads(4);
+        steps.push(say("Read 4 files. Left: the fifth. Next: read it."));
+        let provider = Scripted::new(steps);
+        let events = collect(go(&scripted(&dirs, &provider, |i| i.max_steps = Some(4)), "loop")).await;
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 5);
+        let (history, options) = &requests[4];
+        assert_eq!(options.tool_choice, marv_core::ToolChoice::None);
+        assert_eq!(options.tools, requests[3].1.tools);
+        assert_eq!(options.system, requests[3].1.system);
+        assert!(requests[..4].iter().all(|(_, o)| o.tool_choice == marv_core::ToolChoice::Auto));
+        assert_eq!(text_of(history.last().unwrap()), marv_agent::agent::STEP_LIMIT_NOTE);
+        assert!(history.starts_with(&requests[3].0), "append-only");
+        assert_eq!(last_reply(&events).as_deref(), Some("Read 4 files. Left: the fifth. Next: read it."));
+        assert!(has_done(&events, StopReason::MaxSteps));
+        assert_eq!(end_reason(&events), TurnEndReason::Done(StopReason::MaxSteps));
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_answer_at_the_step_limit_gets_the_wrap_up_too_and_a_stray_call_is_not_run() {
+        // `marv -p --approve …` answers the step-limit question "unavailable": no one could say keep going.
+        let dirs = Dirs::new();
+        let mut steps = reads(3);
+        steps.push(use_tools(vec![call("w1", "write_file", serde_json::json!({ "path": "late.txt", "content": "x" }))]));
+        let provider = Scripted::new(steps);
+        let approver = answer(Decision::Unavailable);
+        let session = scripted(&dirs, &provider, |i| {
+            i.max_steps = Some(3);
+            i.approve = Some(approver.clone());
+        });
+        let events = collect(go(&session, "loop")).await;
+        assert_eq!(provider.requests().len(), 4);
+        assert_eq!(provider.requests()[3].1.tool_choice, marv_core::ToolChoice::None);
+        // The call the wrap-up made anyway (Ollama has no tool_choice) never ran, and has its result.
+        assert!(!dirs.project.join("late.txt").exists());
+        let history = session.conversation();
+        assert!(unanswered(&history).is_empty());
+        assert!(
+            history.iter().any(|t| matches!(t, ChatTurn::Tool { text, .. } if text == marv_agent::agent::not_run::STEP_LIMIT))
+        );
+        assert_eq!(end_reason(&events), TurnEndReason::Done(StopReason::MaxSteps));
+    }
+
+    #[tokio::test]
+    async fn a_no_at_the_step_limit_stops_without_a_wrap_up() {
+        // The TUI's "Keep going?" flow is unchanged: the user chose to stop.
+        let dirs = Dirs::new();
+        let provider = Scripted::new(reads(10));
+        let approver = answer(Decision::No);
+        let session = scripted(&dirs, &provider, |i| {
+            i.max_steps = Some(4);
+            i.approve = Some(approver.clone());
+        });
+        let events = collect(go(&session, "loop")).await;
+        assert_eq!(provider.requests().len(), 4);
+        assert!(provider.requests().iter().all(|(_, o)| o.tool_choice == marv_core::ToolChoice::Auto));
+        assert_eq!(end_reason(&events), TurnEndReason::Done(StopReason::MaxSteps));
     }
 
     #[tokio::test]
@@ -3306,6 +3404,23 @@ mod turn_tests {
         assert!(text_of(provider.requests()[1].0.last().unwrap()).contains("Focus especially on: the plan"));
         collect(go(&session, "next")).await;
         assert!(text_of(&provider.requests()[2].0[0]).contains("THE SUMMARY"));
+    }
+
+    #[tokio::test]
+    async fn a_compaction_forgets_which_nested_instruction_files_were_given() {
+        // The summary replaces the tool results that carried them (#62): the next touch gives them again.
+        let dirs = Dirs::new();
+        std::fs::create_dir_all(dirs.project.join("pkg")).unwrap();
+        std::fs::write(dirs.project.join("pkg/AGENTS.md"), "pkg rules").unwrap();
+        let provider = Scripted::new(vec![say("Answer."), say("THE SUMMARY")]);
+        let session = scripted(&dirs, &provider, |_| {});
+        let root = session.inner.init.root.clone();
+        let touch = || session.inner.nested.note_for(&root, &root.join("pkg/a.rs"), "read_file");
+        assert!(touch().is_some());
+        assert!(touch().is_none());
+        collect(go(&session, "first")).await;
+        assert!(matches!(session.compact(None).await.unwrap(), CompactResult::Compacted { .. }));
+        assert!(touch().is_some_and(|n| n.contains("pkg rules")));
     }
 
     #[tokio::test]

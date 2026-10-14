@@ -29,6 +29,7 @@ base64 = "0.22.1"
 [dev-dependencies]
 # The oracle's tracker (Marv's evals/mcp/tracker.ts): the 25-tool MCP server the tests serve over HTTP.
 marv-oracle = { path = "../marv-oracle" }
+tempfile.workspace = true
 
 [[bin]]
 # Test fixture only: Marv's tests/fixtures/mcp-server.ts (and the paging server), for the stdio tests in tests/.
