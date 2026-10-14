@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 
-use crate::models::{ModelInfo, ReasoningSupport};
+use crate::models::ModelInfo;
 use crate::{Provider, ProviderConfig, ProviderKind};
 
 pub trait ProviderFactory: Send + Sync {
@@ -34,8 +34,8 @@ pub trait ProviderFactory: Send + Sync {
         false
     }
     /// The session's provider; `model` for a subagent type that names another one; `info` once
-    /// the model list was read (its reasoning support).
-    fn make(&self, model: Option<&str>, info: Option<ReasoningSupport>) -> Arc<dyn Provider>;
+    /// the model list was read (its reasoning support and, #96, its output limit).
+    fn make(&self, model: Option<&str>, info: Option<&ModelInfo>) -> Arc<dyn Provider>;
     /// What the provider's model list says about the model (context window, prices, reasoning),
     /// when it has a list. OpenRouter's list has all of that; Ollama's knows none of it (`None`).
     fn lookup(&self) -> Option<BoxFuture<'static, Option<ModelInfo>>> {
@@ -54,7 +54,7 @@ pub enum ProviderOption {
 }
 
 /// Makes a provider from a config and what the model list says about it.
-pub type MakeProvider = Arc<dyn Fn(&ProviderConfig, Option<ReasoningSupport>) -> Arc<dyn Provider> + Send + Sync>;
+pub type MakeProvider = Arc<dyn Fn(&ProviderConfig, Option<&ModelInfo>) -> Arc<dyn Provider> + Send + Sync>;
 /// Reads a provider's model list.
 pub type LoadModels = Arc<dyn Fn(ProviderKind, String) -> BoxFuture<'static, Result<Vec<ModelInfo>, String>> + Send + Sync>;
 
@@ -78,7 +78,7 @@ impl ProviderFactory for ConfigFactory {
         self.config.provider == ProviderKind::Ollama
     }
 
-    fn make(&self, model: Option<&str>, info: Option<ReasoningSupport>) -> Arc<dyn Provider> {
+    fn make(&self, model: Option<&str>, info: Option<&ModelInfo>) -> Arc<dyn Provider> {
         match model {
             Some(model) => (self.make)(&ProviderConfig { model: model.to_string(), ..self.config.clone() }, info),
             None => (self.make)(&self.config, info),
@@ -120,7 +120,7 @@ impl ProviderFactory for CustomFactory {
         &self.model
     }
 
-    fn make(&self, _model: Option<&str>, _info: Option<ReasoningSupport>) -> Arc<dyn Provider> {
+    fn make(&self, _model: Option<&str>, _info: Option<&ModelInfo>) -> Arc<dyn Provider> {
         self.provider.clone()
     }
 }

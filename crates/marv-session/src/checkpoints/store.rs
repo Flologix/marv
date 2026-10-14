@@ -877,7 +877,8 @@ mod tests {
         write(r.join("new.txt"), "new\n");
         write(r.join("ignored.txt"), "secret\n");
         let before = state(r);
-        let s = store_in(r, "s1", &temp("cp-own"));
+        let cp_own = temp("cp-own");
+        let s = store_in(r, "s1", &cp_own);
         let result = snap(&s, 1, CheckpointKind::Before, "do it").await;
         let sha = sha_of(&result);
         assert_eq!(tree_files(r, &sha), [".gitignore", "a.txt", "forced.txt", "new.txt"]);
@@ -943,9 +944,10 @@ mod tests {
         for i in 0..6 {
             write(big.0.join(format!("f{i}.txt")), "x");
         }
+        let cp_own = temp("cp-own");
         let small = CheckpointStore::new(StoreOptions {
             limits: Some(Limits { files: 5, bytes: 1_000_000_000 }),
-            ..StoreOptions::new(&big.0, Some(temp("cp-own").0.clone()), "s1")
+            ..StoreOptions::new(&big.0, Some(cp_own.0.clone()), "s1")
         });
         let too_large = snap(&small, 1, CheckpointKind::Before, "").await;
         assert!(matches!(too_large, SnapshotResult::Failed { reason: SnapshotFailure::TooLarge, .. }), "{too_large:?}");
@@ -986,7 +988,8 @@ mod tests {
     #[tokio::test]
     async fn in_a_repository_this_sessions_ref_lock_is_cleared_once_its_old() {
         let repo = make_repo(true);
-        let s = store_in(&repo.0, "s1", &temp("cp-own"));
+        let cp_own = temp("cp-own");
+        let s = store_in(&repo.0, "s1", &cp_own);
         assert!(snap(&s, 1, CheckpointKind::Before, "").await.ok());
         let lock = repo.0.join(".git/refs/marv/checkpoints/s1.lock");
         write(&lock, "");
@@ -999,7 +1002,8 @@ mod tests {
     #[tokio::test]
     async fn drop_to_moves_the_ref_back_chain_parses_turn_and_kind_newest_first() {
         let repo = make_repo(true);
-        let s = store_in(&repo.0, "s1", &temp("cp-own"));
+        let cp_own = temp("cp-own");
+        let s = store_in(&repo.0, "s1", &cp_own);
         let one = sha_of(&snap(&s, 1, CheckpointKind::Before, "add the parser").await);
         let two = sha_of(&snap(&s, 1, CheckpointKind::After, "add the parser").await);
         let chain = s.chain().await.unwrap();
@@ -1033,9 +1037,10 @@ mod tests {
         let now = crate::time::now_ms();
         // Five sessions: two old, three recent. Keep 2 + anything newer than 14 days.
         for (i, age) in [40u64, 30, 3, 2, 1].into_iter().enumerate() {
+            let cp_own = temp("cp-own");
             let s = CheckpointStore::new(StoreOptions {
                 now: Some(Arc::new(move || now - age * DAY_MS)),
-                ..StoreOptions::new(&repo.0, Some(temp("cp-own").0.clone()), format!("s{i}"))
+                ..StoreOptions::new(&repo.0, Some(cp_own.0.clone()), format!("s{i}"))
             });
             assert!(snap(&s, 1, CheckpointKind::Before, "").await.ok());
         }

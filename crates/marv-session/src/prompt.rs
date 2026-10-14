@@ -9,12 +9,15 @@
 //! `offset` reads the rest. Names up front, content on demand, as skills do (issue #40: Marv's own file was 76k and
 //! workers saw a quarter of it with no way to the rest).
 //!
-//! Plan #62 (not in Marv yet, stub only): also read a global `~/.marv/AGENTS.md` and the `AGENTS.md` of parent folders
-//! up to the repository root, and fall back to `CLAUDE.md` where there's no `AGENTS.md` ([`instruction_files`]).
+//! marv-rs #62 (not in Marv): several instruction files, found by `crate::instructions`: the project's `AGENTS.md`
+//! (or `CLAUDE.md` where there's none), the `AGENTS.md` of each parent folder up to the git root, and the user's own
+//! `~/.marv/AGENTS.md`. [`render_instructions`] gives each its own heading, in that order (nearest first, as opencode
+//! does), and the 20k cap applies to them all together: the project's file takes what it needs first, each next one
+//! gets what's left, and one that would get less than [`MIN_SOURCE_CHARS`] is left out. A project with only an
+//! `AGENTS.md` gets the same bytes as before (the oracle compares them with Marv's).
 //!
 //! Port notes: lengths count `char`s (Marv: UTF-16 units). The date is passed in as `YYYY-MM-DD`.
 
-use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -23,7 +26,12 @@ use crate::memory::{Memories, memory_section};
 use crate::types::NoticeItem;
 
 pub const INSTRUCTIONS_FILE: &str = "AGENTS.md";
+/// The project's instructions where it has no [`INSTRUCTIONS_FILE`] (#62).
+pub const CLAUDE_FILE: &str = "CLAUDE.md";
+/// For all the instruction files together (#62).
 pub const MAX_INSTRUCTION_CHARS: usize = 20_000;
+/// A file that would get less than this of the shared cap is left out rather than cut to a stub (#62).
+pub const MIN_SOURCE_CHARS: usize = 500;
 /// At most this many headings are listed; a file with more is mostly headings anyway.
 const MAX_LISTED_SECTIONS: usize = 60;
 
@@ -143,20 +151,31 @@ fn listed(items: &[Listed]) -> String {
     items.iter().map(|i| format!("- {}: {}", i.name, i.description)).collect::<Vec<_>>().join("\n")
 }
 
+/// When a skill is worth loading (#84). "When a request matches one of these, load it before you start" let a skill whose
+/// description claims every task ("use when starting any conversation", "you MUST use this before any creative work")
+/// win every time: on GLM, a one-line fix ran a whole test-driven loop, 2.3× slower, in 23 of 62 eval runs.
+pub const SKILLS_INTRO: &str = "Skills are detailed instructions for particular kinds of tasks. Load one with the skill tool when the task is clearly the kind it describes, before you start, then follow it. Judge by the task, not by how broadly a skill's description claims to apply: a small, direct request (a quick fix, a rename, a question about the code) doesn't need one, so just do it.";
+
 fn skills_section(skills: &[Listed]) -> String {
     if skills.is_empty() {
         return String::new();
     }
-    format!(
-        "\n\n# Skills\n\nSkills are detailed instructions for particular kinds of tasks. When a request matches one of these, load it with the skill tool before you start, then follow it:\n\n{}",
-        listed(skills)
-    )
+    format!("\n\n# Skills\n\n{SKILLS_INTRO}\n\n{}", listed(skills))
 }
+
+/// The instructions' headings (#62). Text that starts with one came from [`render_instructions`] and goes in as it is;
+/// any other text (an SDK caller's own) goes under the project heading, as before.
+const PROJECT_HEADING: &str = "# Project instructions (from ";
+const PARENT_HEADING: &str = "# Instructions from a parent folder (";
+const PERSONAL_HEADING: &str = "# The user's own instructions, for every project (from ";
 
 fn project_section(instructions: Option<&str>) -> String {
     match instructions {
+        Some(text) if [PROJECT_HEADING, PARENT_HEADING, PERSONAL_HEADING].iter().any(|h| text.starts_with(h)) => {
+            format!("\n\n{text}")
+        }
         Some(text) if !text.is_empty() => {
-            format!("\n\n# Project instructions (from {INSTRUCTIONS_FILE})\n\n{text}")
+            format!("\n\n{PROJECT_HEADING}{INSTRUCTIONS_FILE})\n\n{text}")
         }
         _ => String::new(),
     }
@@ -248,6 +267,8 @@ pub fn subagent_prompt(input: &SubagentPromptInput) -> String {
 /// Where a too-long AGENTS.md was cut, for the startup notice (the model gets the same facts in the text).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstructionsCut {
+    /// The file's name: `AGENTS.md`, or `CLAUDE.md` (#62).
+    pub file: String,
     /// The whole (trimmed) file's length.
     pub chars: usize,
     /// The file's line count, and the first line not in the prompt (read_file's numbering).
@@ -260,7 +281,52 @@ pub struct InstructionsCut {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Instructions {
     pub text: String,
+    /// The project file's cut, for the startup notice.
     pub cut: Option<InstructionsCut>,
+    /// What [`render_instructions`] put in, in prompt order (#62); empty from [`cut_instructions`].
+    pub sources: Vec<InstructionSource>,
+}
+
+/// Where an instruction file comes from (#62).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstructionKind {
+    /// The project's `AGENTS.md`, or its `CLAUDE.md` where there's no `AGENTS.md`.
+    Project,
+    /// A parent folder's `AGENTS.md`, up to the git root.
+    Parent,
+    /// The user's own `~/.marv/AGENTS.md`.
+    Personal,
+}
+
+/// One instruction file, read (the reader is `crate::instructions`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstructionFile {
+    pub kind: InstructionKind,
+    /// As its heading and the startup notice show it: `AGENTS.md`, `CLAUDE.md`, `~/work/AGENTS.md`,
+    /// `~/.marv/AGENTS.md`.
+    pub shown: String,
+    pub raw: String,
+}
+
+/// What became of one file in the prompt, for the startup notice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstructionSource {
+    pub kind: InstructionKind,
+    pub shown: String,
+    /// Characters of it in the prompt (0: left out).
+    pub chars: usize,
+    /// Its whole (trimmed) length.
+    pub total: usize,
+}
+
+impl InstructionSource {
+    pub fn cut(&self) -> bool {
+        self.chars > 0 && self.chars < self.total
+    }
+
+    pub fn left_out(&self) -> bool {
+        self.chars == 0
+    }
 }
 
 static FENCE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^ {0,3}(`{3,}|~{3,})").unwrap());
@@ -291,7 +357,8 @@ fn headings_after(lines: &[&str], from: usize) -> Vec<(String, usize)> {
     found
 }
 
-fn cut_note(cut: &InstructionsCut) -> String {
+/// The note in place of the rest of a cut project file (`file`: its name, which `read_file` reads).
+fn cut_note(cut: &InstructionsCut, file: &str) -> String {
     let mut listed: Vec<String> =
         cut.sections.iter().take(MAX_LISTED_SECTIONS).map(|(h, l)| format!("- {h} (line {l})")).collect();
     if cut.sections.len() > listed.len() {
@@ -299,51 +366,102 @@ fn cut_note(cut: &InstructionsCut) -> String {
     }
     let list = if listed.is_empty() { String::new() } else { format!(" Sections not shown:\n{}", listed.join("\n")) };
     format!(
-        "({INSTRUCTIONS_FILE} was cut off here: it's longer than {MAX_INSTRUCTION_CHARS} characters. Lines {}-{} aren't in this prompt. When your task touches what they cover, read them with read_file with path {INSTRUCTIONS_FILE} and offset {} (or a section's line) rather than working it out from the code.{list})",
+        "({file} was cut off here: it's longer than {MAX_INSTRUCTION_CHARS} characters. Lines {}-{} aren't in this prompt. When your task touches what they cover, read them with read_file with path {file} and offset {} (or a section's line) rather than working it out from the code.{list})",
         cut.next_line, cut.total_lines, cut.next_line
     )
 }
 
 /// The file's text as it goes into the prompt: trimmed, `None` when empty, cut at [`MAX_INSTRUCTION_CHARS`] with the
-/// note. Pure (the reader is [`read_instructions`]).
+/// note. Pure (the reader is `crate::instructions`).
 pub fn cut_instructions(raw: &str) -> Option<Instructions> {
+    let (shown, cut) = cut_at(raw, MAX_INSTRUCTION_CHARS)?;
+    let text = match &cut {
+        Some(cut) => format!("{shown}\n\n{}", cut_note(cut, INSTRUCTIONS_FILE)),
+        None => shown,
+    };
+    Some(Instructions { text, cut, sources: Vec::new() })
+}
+
+/// The trimmed text up to `limit` characters, cut at a whole line, and where it was cut. `None` when empty.
+fn cut_at(raw: &str, limit: usize) -> Option<(String, Option<InstructionsCut>)> {
     let text = raw.trim();
     if text.is_empty() {
         return None;
     }
-    if text.chars().count() <= MAX_INSTRUCTION_CHARS {
-        return Some(Instructions { text: text.to_string(), cut: None });
+    if text.chars().count() <= limit {
+        return Some((text.to_string(), None));
     }
     // Line numbers are the file's, as read_file shows them: count the blank lines trim() took off the start.
     let before = raw[..raw.len() - raw.trim_start().len()].matches('\n').count();
     let lines: Vec<&str> = text.split('\n').collect();
     // Whole lines up to the cap; a first line longer than the cap is shown cut (read_file clips it too).
     let (mut shown_lines, mut length) = (0, 0);
-    while shown_lines < lines.len() && length + lines[shown_lines].chars().count() < MAX_INSTRUCTION_CHARS {
+    while shown_lines < lines.len() && length + lines[shown_lines].chars().count() < limit {
         length += lines[shown_lines].chars().count() + 1;
         shown_lines += 1;
     }
-    let shown =
-        if shown_lines > 0 { lines[..shown_lines].join("\n") } else { text.chars().take(MAX_INSTRUCTION_CHARS).collect() };
+    let shown = if shown_lines > 0 { lines[..shown_lines].join("\n") } else { text.chars().take(limit).collect() };
     let cut = InstructionsCut {
+        file: INSTRUCTIONS_FILE.into(),
         chars: text.chars().count(),
         total_lines: before + lines.len(),
         next_line: before + shown_lines + 1,
         sections: headings_after(&lines, shown_lines).into_iter().map(|(h, i)| (h, before + i + 1)).collect(),
     };
-    Some(Instructions { text: format!("{shown}\n\n{}", cut_note(&cut)), cut: Some(cut) })
+    Some((shown, Some(cut)))
 }
 
-/// The project's AGENTS.md, read once at startup (see [`cut_instructions`]).
-pub fn read_instructions(root: &Path) -> Option<Instructions> {
-    std::fs::read_to_string(root.join(INSTRUCTIONS_FILE)).ok().and_then(|raw| cut_instructions(&raw))
+/// The instruction files as one block for the prompt (#62), each under its own heading, in the order given (the
+/// reader's: the project's, the parents' nearest first, the user's own). The cap is shared: the project's file is cut
+/// as before (its note says `read_file` reads the rest), a later file gets what the earlier ones left (the tools
+/// can't reach a parent's or the user's file, so its note says only that it was cut), and one that would get less
+/// than [`MIN_SOURCE_CHARS`] is left out. Empty files are skipped. Pure, so the same files give the same bytes.
+pub fn render_instructions(files: &[InstructionFile]) -> Option<Instructions> {
+    let mut left = MAX_INSTRUCTION_CHARS;
+    let (mut sections, mut sources, mut project_cut) = (Vec::new(), Vec::new(), None);
+    for file in files {
+        let total = file.raw.trim().chars().count();
+        if total == 0 {
+            continue;
+        }
+        let limit = if file.kind == InstructionKind::Project { left } else { left.min(total) };
+        if limit < MIN_SOURCE_CHARS.min(total) {
+            sources.push(InstructionSource { kind: file.kind, shown: file.shown.clone(), chars: 0, total });
+            continue;
+        }
+        let Some((shown, cut)) = cut_at(&file.raw, limit) else { continue };
+        let chars = shown.chars().count();
+        left = left.saturating_sub(chars);
+        let body = match (&cut, file.kind) {
+            (Some(cut), InstructionKind::Project) => format!("{shown}\n\n{}", cut_note(cut, &file.shown)),
+            (Some(cut), _) => format!(
+                "{shown}\n\n({} was cut off here: the instruction files share a limit of {MAX_INSTRUCTION_CHARS} characters, and the ones above used the rest. Lines {}-{} of it aren't in this prompt.)",
+                file.shown, cut.next_line, cut.total_lines
+            ),
+            (None, _) => shown,
+        };
+        let heading = match file.kind {
+            InstructionKind::Project => PROJECT_HEADING,
+            InstructionKind::Parent => PARENT_HEADING,
+            InstructionKind::Personal => PERSONAL_HEADING,
+        };
+        sections.push(format!("{heading}{})\n\n{body}", file.shown));
+        if file.kind == InstructionKind::Project {
+            project_cut = cut.map(|cut| InstructionsCut { file: file.shown.clone(), ..cut });
+        }
+        sources.push(InstructionSource { kind: file.kind, shown: file.shown.clone(), chars, total });
+    }
+    (!sections.is_empty()).then(|| Instructions { text: sections.join("\n\n"), cut: project_cut, sources })
 }
 
-/// Plan #62 (stub): the instruction files to read, in prompt order: `~/.marv/AGENTS.md`, then parents' `AGENTS.md`
-/// up to the repository root, then the project's; `CLAUDE.md` wherever a folder has no `AGENTS.md`. Each would be
-/// read only after a realpath check, and AGENTS.md/CLAUDE.md are protected paths (writes ask, even in yolo).
-pub fn instruction_files(_root: &Path, _config_dir: &Path) -> Vec<PathBuf> {
-    todo!("port: plan #62 (global + parent AGENTS.md, CLAUDE.md fallback); Marv reads only <root>/AGENTS.md")
+/// A nested instruction file's text for a tool result's note (#62): cut at [`MAX_INSTRUCTION_CHARS`], with a note
+/// naming `rel` (its project path) for `read_file`. `None` when empty.
+pub fn nested_instructions_text(raw: &str, rel: &str) -> Option<String> {
+    let (shown, cut) = cut_at(raw, MAX_INSTRUCTION_CHARS)?;
+    Some(match cut {
+        Some(cut) => format!("{shown}\n\n{}", cut_note(&cut, rel)),
+        None => shown,
+    })
 }
 
 fn thousands(n: usize) -> String {
@@ -369,7 +487,8 @@ pub fn instructions_cut_notice(cut: &InstructionsCut) -> String {
         String::new()
     };
     format!(
-        "{INSTRUCTIONS_FILE} is longer than {} characters ({}): the model gets lines 1-{} up front, plus the {count} after that{which} by name, which it reads with read_file when it needs them. Put what matters most first.",
+        "{} is longer than {} characters ({}): the model gets lines 1-{} up front, plus the {count} after that{which} by name, which it reads with read_file when it needs them. Put what matters most first.",
+        cut.file,
         thousands(MAX_INSTRUCTION_CHARS),
         thousands(cut.chars),
         cut.next_line - 1
@@ -385,7 +504,8 @@ pub fn instructions_cut_item(cut: &InstructionsCut) -> NoticeItem {
     }
     NoticeItem {
         text: format!(
-            "{INSTRUCTIONS_FILE} is long: the model sees the first {} of {} characters",
+            "{} is long: the model sees the first {} of {} characters",
+            cut.file,
             thousands(MAX_INSTRUCTION_CHARS),
             thousands(cut.chars)
         ),
@@ -399,6 +519,43 @@ pub fn instructions_cut_item(cut: &InstructionsCut) -> NoticeItem {
             "Put what matters most first.".into(),
         ]),
     }
+}
+
+/// The startup notice's item listing the instruction files (#62), or `None` when there's nothing to say beyond the
+/// welcome banner's "AGENTS.md loaded" (only the project's `AGENTS.md`, whole, and no problems). `problems`: files
+/// that were found but not read, and why.
+pub fn instruction_sources_item(sources: &[InstructionSource], problems: &[String]) -> Option<NoticeItem> {
+    let plain = sources.len() == 1
+        && sources[0].kind == InstructionKind::Project
+        && sources[0].shown == INSTRUCTIONS_FILE
+        && !sources[0].cut();
+    if (sources.is_empty() || plain) && problems.is_empty() {
+        return None;
+    }
+    let loaded = sources.iter().filter(|s| !s.left_out()).count();
+    let mut detail: Vec<String> = sources
+        .iter()
+        .map(|s| {
+            let what = match s.kind {
+                InstructionKind::Project => "the project's",
+                InstructionKind::Parent => "a parent folder's",
+                InstructionKind::Personal => "yours, for every project",
+            };
+            let state = if s.left_out() {
+                format!(", left out: the {} characters were used up", thousands(MAX_INSTRUCTION_CHARS))
+            } else if s.cut() {
+                format!(", cut to {} of {} characters", thousands(s.chars), thousands(s.total))
+            } else {
+                String::new()
+            };
+            format!("{} ({what}{state})", s.shown)
+        })
+        .collect();
+    detail.extend(problems.iter().cloned());
+    Some(NoticeItem {
+        text: format!("Instructions from {loaded} file{}", if loaded == 1 { "" } else { "s" }),
+        detail: Some(detail),
+    })
 }
 
 #[cfg(test)]
@@ -530,7 +687,7 @@ mod tests {
     #[test]
     fn a_long_file_is_cut_at_a_line_and_lists_the_sections_after_the_cut() {
         let long = long();
-        let Instructions { text, cut } = cut_instructions(&long).unwrap();
+        let Instructions { text, cut, .. } = cut_instructions(&long).unwrap();
         let cut = cut.unwrap();
         assert!(text.chars().count() < 21_000);
         let lines: Vec<&str> = long.split('\n').collect();
@@ -577,6 +734,17 @@ mod tests {
     }
 
     #[test]
+    fn skills_are_for_tasks_that_clearly_need_them() {
+        // #84: "load it before you start" made a skill that claims every task run on a one-line fix.
+        assert!(!system_prompt(&input()).contains("# Skills"));
+        let tdd = Listed { name: "tdd".into(), description: "You MUST use this before writing any code.".into() };
+        let p = system_prompt(&PromptInput { skills: vec![tdd], ..input() });
+        assert!(p.contains(&format!("# Skills\n\n{SKILLS_INTRO}\n\n- tdd: You MUST use this before writing any code.")));
+        assert!(SKILLS_INTRO.contains("Judge by the task, not by how broadly a skill's description claims to apply"));
+        assert!(!SKILLS_INTRO.contains("When a request matches one of these"));
+    }
+
+    #[test]
     fn subagent_prompts() {
         let p = subagent_prompt(&SubagentPromptInput {
             cwd: "~/p".into(),
@@ -599,5 +767,100 @@ mod tests {
             " github runs gh with the user's login to read GitHub (pull requests, CI runs, issues; changes are the main agent's)"
         ));
         assert!(!w.contains("github runs"));
+    }
+
+    fn file(kind: InstructionKind, shown: &str, raw: &str) -> InstructionFile {
+        InstructionFile { kind, shown: shown.into(), raw: raw.into() }
+    }
+
+    #[test]
+    fn a_lone_project_agents_md_gives_the_same_bytes_as_before() {
+        // The oracle compares this prompt with Marv's, which knows only <root>/AGENTS.md (#62).
+        let rendered = render_instructions(&[file(InstructionKind::Project, "AGENTS.md", "\nUse tabs.\n")]).unwrap();
+        let plain = system_prompt(&PromptInput { instructions: Some("Use tabs.".into()), ..input() });
+        let loaded = system_prompt(&PromptInput { instructions: Some(rendered.text.clone()), ..input() });
+        assert_eq!(plain, loaded);
+        assert!(loaded.ends_with("\n\n# Project instructions (from AGENTS.md)\n\nUse tabs."));
+        assert_eq!(rendered.sources.len(), 1);
+        assert_eq!(instruction_sources_item(&rendered.sources, &[]), None);
+    }
+
+    #[test]
+    fn each_source_gets_its_own_heading_nearest_first() {
+        let rendered = render_instructions(&[
+            file(InstructionKind::Project, "CLAUDE.md", "Project rule."),
+            file(InstructionKind::Parent, "~/mono/packages/AGENTS.md", "Packages rule."),
+            file(InstructionKind::Parent, "~/mono/AGENTS.md", "  \n"),
+            file(InstructionKind::Personal, "~/.marv/AGENTS.md", "My rule."),
+        ])
+        .unwrap();
+        assert_eq!(
+            rendered.text,
+            "# Project instructions (from CLAUDE.md)\n\nProject rule.\n\n# Instructions from a parent folder (~/mono/packages/AGENTS.md)\n\nPackages rule.\n\n# The user's own instructions, for every project (from ~/.marv/AGENTS.md)\n\nMy rule."
+        );
+        // The empty one is skipped; the prompt takes the block as it is (one heading each, none added).
+        assert_eq!(rendered.sources.len(), 3);
+        let p = system_prompt(&PromptInput { instructions: Some(rendered.text.clone()), ..input() });
+        assert!(p.ends_with(&format!("\n\n{}", rendered.text)));
+        assert!(!p.contains("(from AGENTS.md)"));
+        // Without a project file, a parent's or the user's file still comes in under its own heading.
+        let personal = render_instructions(&[file(InstructionKind::Personal, "~/.marv/AGENTS.md", "Mine.")]).unwrap();
+        let sub = subagent_prompt(&SubagentPromptInput { instructions: Some(personal.text.clone()), ..Default::default() });
+        assert!(sub.ends_with("\n\n# The user's own instructions, for every project (from ~/.marv/AGENTS.md)\n\nMine."));
+        let item = instruction_sources_item(&rendered.sources, &[]).unwrap();
+        assert_eq!(item.text, "Instructions from 3 files");
+        assert_eq!(
+            item.detail.unwrap(),
+            vec![
+                "CLAUDE.md (the project's)",
+                "~/mono/packages/AGENTS.md (a parent folder's)",
+                "~/.marv/AGENTS.md (yours, for every project)"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_cap_is_shared_with_the_project_file_first() {
+        let line = "- a rule that matters here\n";
+        let project = line.repeat(15_000 / line.len());
+        let parent = line.repeat(10_000 / line.len());
+        // What's left after the cut parent is a few characters: a file that needs more is left out, not cut to a stub.
+        let mine = format!("My rule.\n{}", line.repeat(30));
+        let rendered = render_instructions(&[
+            file(InstructionKind::Project, "AGENTS.md", &project),
+            file(InstructionKind::Parent, "~/mono/AGENTS.md", &parent),
+            file(InstructionKind::Personal, "~/.marv/AGENTS.md", &mine),
+        ])
+        .unwrap();
+        let [p, parent_src, personal] = &rendered.sources[..] else { panic!("{:?}", rendered.sources) };
+        assert!(!p.cut() && p.chars == project.trim().chars().count());
+        assert!(parent_src.cut());
+        assert!(p.chars + parent_src.chars <= MAX_INSTRUCTION_CHARS);
+        assert!(personal.left_out());
+        assert!(rendered.text.contains("(~/mono/AGENTS.md was cut off here: the instruction files share a limit"));
+        assert!(!rendered.text.contains("My rule."));
+        assert_eq!(rendered.cut, None);
+        let item = instruction_sources_item(&rendered.sources, &[]).unwrap();
+        assert_eq!(item.text, "Instructions from 2 files");
+        assert!(item.detail.as_ref().unwrap()[2].contains("left out"));
+        // A project file over the cap is cut as before, its note naming the file read_file reads.
+        let long = long();
+        let rendered = render_instructions(&[
+            file(InstructionKind::Project, "CLAUDE.md", &long),
+            file(InstructionKind::Personal, "~/.marv/AGENTS.md", "My rule."),
+        ])
+        .unwrap();
+        assert!(rendered.text.contains("read_file with path CLAUDE.md and offset"));
+        assert!(rendered.sources[1].left_out());
+        let cut = rendered.cut.unwrap();
+        assert_eq!(cut.file, "CLAUDE.md");
+        assert!(instructions_cut_item(&cut).text.starts_with("CLAUDE.md is long"));
+    }
+
+    #[test]
+    fn nested_text_is_cut_with_its_own_path() {
+        assert_eq!(nested_instructions_text("\n Use pnpm.\n", "pkg/AGENTS.md").unwrap(), "Use pnpm.");
+        assert_eq!(nested_instructions_text(" \n", "pkg/AGENTS.md"), None);
+        assert!(nested_instructions_text(&long(), "pkg/AGENTS.md").unwrap().contains("read_file with path pkg/AGENTS.md"));
     }
 }

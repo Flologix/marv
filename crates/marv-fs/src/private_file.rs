@@ -88,10 +88,9 @@ mod tests {
 
     // Ported from tests/private-file.test.ts.
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("marv-private-{tag}-{}-{}", std::process::id(), random_hex()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// Removed when the guard drops, so a failing test doesn't leave its folder behind (#89).
+    fn temp_dir(tag: &str) -> tempfile::TempDir {
+        tempfile::Builder::new().prefix(&format!("marv-private-{tag}-")).tempdir().unwrap()
     }
 
     fn names(dir: &Path) -> Vec<String> {
@@ -108,7 +107,8 @@ mod tests {
 
     #[tokio::test]
     async fn writes_are_private_and_overlapping_writes_never_corrupt_it_the_last_one_wins() {
-        let dir = temp_dir("overlap");
+        let tmp = temp_dir("overlap");
+        let dir = tmp.path();
         let file = dir.join("sub/session.json");
         // Big enough that the writes overlap. `join_all` polls them in order, so they queue in order.
         let contents: Vec<String> =
@@ -123,7 +123,6 @@ mod tests {
         assert_eq!(std::fs::metadata(dir.join("sub")).unwrap().permissions().mode() & 0o777, 0o700);
         assert_eq!(names(&dir.join("sub")), ["session.json"]); // no temp files left
         assert!(QUEUES.lock().unwrap().get(&file).is_none()); // the queue is forgotten
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// The other Marv process of the next test: the test binary run again, for this test only.
@@ -142,7 +141,8 @@ mod tests {
 
     #[test]
     fn two_marv_processes_writing_the_same_file_never_corrupt_it() {
-        let dir = temp_dir("procs");
+        let tmp = temp_dir("procs");
+        let dir = tmp.path();
         let file = dir.join("s.json");
         let writer = |id: u32| {
             std::process::Command::new(std::env::current_exe().unwrap())
@@ -158,7 +158,6 @@ mod tests {
         }
         let text = std::fs::read_to_string(&file).unwrap();
         assert_eq!(serde_json::from_str::<serde_json::Value>(&text).unwrap()["i"], 39);
-        assert_eq!(names(&dir), ["s.json"]);
-        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(names(dir), ["s.json"]);
     }
 }
