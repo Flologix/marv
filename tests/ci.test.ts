@@ -67,6 +67,20 @@ describe("the CI workflow", () => {
     for (const action of uses) expect(action).toMatch(/@[0-9a-f]{40}$/);
   });
 
+  test("the guard tests (#53) must all run: the test step writes a JUnit report, a strict count after it fails on any skip, and the summary says how many ran", () => {
+    const text = yml();
+    const steps = text.split("\n");
+    const tests = steps.findIndex((line) => line.includes("run: bun test"));
+    expect(steps[tests]).toContain("--reporter=junit --reporter-outfile=test-results.xml");
+    const strict = steps.findIndex((line) => line.includes("run: bun scripts/guard-summary.ts test-results.xml --strict"));
+    expect(strict).toBeGreaterThan(tests);
+    // The sandbox check runs before both, so a runner without bwrap fails before any guard is skipped.
+    expect(steps.findIndex((line) => line.includes("name: Require a working sandbox"))).toBeLessThan(tests);
+    // And the always() summary step counts them too.
+    const summary = text.slice(text.indexOf("if: always()"));
+    expect(summary).toContain('bun scripts/guard-summary.ts test-results.xml >> "$GITHUB_STEP_SUMMARY"');
+  });
+
   test("caches installs keyed on bun.lock", () => {
     const text = yml();
     expect(text).toContain("actions/cache");

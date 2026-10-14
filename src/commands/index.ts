@@ -8,6 +8,8 @@ import { CHECKS_DIR, type ProjectCheck } from "../checks/load.ts";
 import { printable } from "../printable.ts";
 import { formatViolation, type ProjectCheckResult } from "../checks/kind.ts";
 import { usageReport, type Totals } from "../usage.ts";
+import type { ProcessInfo } from "../processes.ts";
+import { processLine } from "../tools/process.ts";
 import type { Usage } from "../provider/types.ts";
 
 // Slash commands are handled locally and never reach the LLM.
@@ -26,6 +28,9 @@ export type CommandAction =
   | { type: "trajectories"; on: boolean }
   | { type: "diagnostics"; on: boolean }
   | { type: "checks"; on: boolean }
+  | { type: "checkpoints"; on: boolean }
+  /** Show the last turn's changes and, on a yes, put its files back (#16). */
+  | { type: "undo" }
   /**
    * The step limit: show it (no `every`), set it to a whole number of steps (0 = never ask), or turn it
    * off. The App saves it in the config and passes it to the session.
@@ -51,6 +56,8 @@ export type CommandAction =
   | { type: "memory" }
   /** Summarize the conversation so far and continue from the summary. */
   | { type: "compact"; focus?: string }
+  /** Stop one of the session's background processes (#51). */
+  | { type: "processes"; stop: string }
   /** The user ran a skill: /<name> <args>. */
   | { type: "skill"; skill: Skill; args: string }
   | { type: "exit" };
@@ -73,8 +80,12 @@ export interface CommandContext {
   usage?: { totals: Totals; last: Usage | null; contextLength?: number };
   /** The project's checks (.marv/checks/) as they are on disk now, and the session's last check pass, for /checks. */
   checks?: { list: ProjectCheck[]; problems: string[]; last?: ProjectCheckResult };
+  /** Why the last checkpoint failed, or why checkpoints are off for this project, for /checkpoints. */
+  checkpoints?: { failure?: string; off?: string };
   /** PATH folders under the home folder the sandbox can't see, shortened (~) for display; empty when there are none. */
   hiddenPathFolders?: string[];
+  /** The session's background processes, for /processes; undefined when the session doesn't offer the process tool. */
+  processes?: ProcessInfo[];
 }
 
 interface Command {
@@ -233,6 +244,34 @@ export const commands: Command[] = [
     },
   },
   {
+    name: "processes",
+    description: "Background processes the model started (/processes stop <name>)",
+    run: (args, { processes }) => {
+      const [sub = "", name, ...extra] = args.trim().split(/\s+/);
+      if (sub === "stop" && name && !extra.length) return { type: "processes", stop: name };
+      if (sub) return { type: "print", text: "Usage: /processes, or /processes stop <name>", isError: true };
+      if (!processes) return { type: "print", text: "Background processes aren't available here: they need the bubblewrap sandbox." };
+      if (!processes.length) return { type: "print", text: "No background processes. The model starts one with the process tool (a dev server, a watcher), and you're asked first." };
+      return { type: "print", text: processes.map((p) => printable(processLine(p))).join("\n") };
+    },
+  },
+  {
+    name: "undo",
+    description: "Put back the files the last turn changed (shows them first)",
+    run: (args) => (args.trim() ? { type: "print", text: "Usage: /undo (it takes back the last turn not yet undone; again for the one before)", isError: true } : { type: "undo" }),
+  },
+  {
+    name: "checkpoints",
+    description: "Snapshots before each turn's changes, for /undo (/checkpoints on, /checkpoints off)",
+    run: (args, { config, checkpoints }) => {
+      const arg = args.toLowerCase();
+      if (arg === "on" || arg === "off") return { type: "checkpoints", on: arg === "on" };
+      if (arg) return { type: "print", text: "Usage: /checkpoints, /checkpoints on, or /checkpoints off", isError: true };
+      const problem = checkpoints?.off ? `\nOff for this project: ${checkpoints.off}.` : checkpoints?.failure ? `\nThe last checkpoint failed: ${checkpoints.failure}` : "";
+      return { type: "print", text: `Checkpoints: ${checkpointsStatus(config)}${config.checkpoints ? problem : ""}` };
+    },
+  },
+  {
     name: "diagnostics",
     description: "Typecheck after the model's edits (/diagnostics on, /diagnostics off)",
     run: (args, { config }) => {
@@ -310,6 +349,7 @@ function configText({ config, configPath }: CommandContext): string {
     `Trajectories: ${config.trajectories ? "on" : "off"} (/trajectories)`,
     `Diagnostics: ${config.diagnostics ? "on" : "off"} (/diagnostics)`,
     `Checks:    ${config.checks ? "on" : "off"} (/checks)`,
+    `Checkpoints: ${config.checkpoints ? "on" : "off"} (/checkpoints, /undo)`,
     `Steps: ${stepsStatus(config)}`,
     `Endpoint:  ${config.baseUrl}`,
     ...(config.provider === "ollama" ? [`Context:   ${config.contextLength.toLocaleString("en-US")} tokens (contextLength in the config file)`] : []),
@@ -321,6 +361,12 @@ function configText({ config, configPath }: CommandContext): string {
 export function diagnosticsStatus(config: Config): string {
   return config.diagnostics
     ? "on: after the model changes files in a TypeScript project, Marv runs the project's typecheck (in the sandbox, read-only) and tells the model about new errors"
+    : "off";
+}
+
+export function checkpointsStatus(config: Config): string {
+  return config.checkpoints
+    ? "on: before a turn's first change Marv snapshots the project's files (git, under a hidden ref; never your branch, index or stash), so /undo can put them back"
     : "off";
 }
 

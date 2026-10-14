@@ -7,9 +7,12 @@ import { agent } from "./agent.ts";
 import { bash } from "./bash.ts";
 import { editFile } from "./edit-file.ts";
 import { projectPath } from "./files.ts";
+import { github } from "./github/github.ts";
 import { glob } from "./glob.ts";
 import { grep } from "./grep.ts";
 import { memory } from "./memory.ts";
+import { plan } from "./plan.ts";
+import { processTool } from "./process.ts";
 import { readFile } from "./read-file.ts";
 import { repairJsonArgs, withNote } from "./repair.ts";
 import { skill } from "./skill.ts";
@@ -17,7 +20,7 @@ import { webFetch } from "./web-fetch.ts";
 import { writeFile } from "./write-file.ts";
 import { ToolError, type Tool, type ToolContext, type ToolResult } from "./types.ts";
 
-export const tools: Tool[] = [readFile, glob, grep, webFetch, skill, editFile, writeFile, bash, memory, agent] as Tool[];
+export const tools: Tool[] = [readFile, glob, grep, webFetch, github, skill, editFile, writeFile, bash, processTool, memory, plan, agent] as Tool[];
 
 /** Whether a call may run at the same time as its neighbours (subagents). */
 export const isParallelCall = (call: ToolCall) => tools.some((t) => t.name === call.name && t.parallel);
@@ -34,9 +37,15 @@ export function specOf(tool: Tool): ToolSpec {
   return { name: tool.name, description: tool.description, parameters };
 }
 
-/** The specs for a session: the skill tool only when there are skills to load. Same objects every time (cache). */
-export function toolSpecsFor({ hasSkills }: { hasSkills: boolean }): ToolSpec[] {
-  return hasSkills ? toolSpecs : toolSpecs.filter((spec) => spec.name !== "skill");
+/**
+ * The specs for a session: the skill tool only when there are skills to load, the plan tool unless the session
+ * turned it off (#15), the process tool only where the session has that door (#51), the github tool only where gh is
+ * there and logged in (#47). Same objects every time (cache).
+ */
+export function toolSpecsFor({ hasSkills, plan = true, process = false, github = false }: { hasSkills: boolean; plan?: boolean; process?: boolean; github?: boolean }): ToolSpec[] {
+  return toolSpecs.filter(
+    (spec) => (hasSkills || spec.name !== "skill") && (plan || spec.name !== "plan") && (process || spec.name !== "process") && (github || spec.name !== "github"),
+  );
 }
 
 /**
@@ -91,37 +100,52 @@ export async function runTool(call: ToolCall, ctx: ToolContext, available: Tool[
   if (!parsed.success) return noted(fail(`Invalid input for ${call.name}:\n${z.prettifyError(parsed.error)}`));
 
   const label = shortLabel(tool.label(parsed.data), ctx.root);
+  const interrupted = () => noted({ output: NOT_RUN.aborted, summary: "interrupted", declined: true, label, approval: "interrupted" as const });
+  // The turn's checkpoint, before anything that can change files runs (approved, yolo, or a tool that asks no one):
+  // whatever the call does, bash included, /undo can put back. It never fails the call; a stop meanwhile does.
+  const takesCheckpoint = tool.checkpoint ?? Boolean(tool.kind && tool.kind !== "read");
+  const checkpointed = async (): Promise<boolean> => {
+    if (!takesCheckpoint || !ctx.checkpoint) return true;
+    await ctx.checkpoint().catch(() => {});
+    return !ctx.signal?.aborted;
+  };
   try {
     // Tools that change something need the user's go-ahead. The preview runs
     // first, so a call that can't succeed fails here instead of being approved.
     const gated = tool.needsApproval ? tool.needsApproval(parsed.data) : Boolean(tool.kind && tool.kind !== "read");
     if (gated) {
       const preview = await tool.preview!(parsed.data, ctx);
-      const scope = tool.scope?.(parsed.data) ?? { key: call.name, description: call.name };
-      const network = tool.usesNetwork?.(parsed.data) ? { network: true } : {};
+      const scope = tool.scope?.(parsed.data, ctx) ?? { key: call.name, description: call.name };
+      const network = tool.usesNetwork?.(parsed.data, ctx) ? { network: true } : {};
+      // A door out of the sandbox (#47, #51, #52): the prompt shows its warning, the result and trajectory name it,
+      // and a `once` call is never remembered (the session's approver holds that, whatever the client answers).
+      const door = tool.door?.(parsed.data, ctx);
+      const doorFields = { ...(door ? { door } : {}), ...(tool.once?.(parsed.data, ctx) ? { once: true } : {}) };
+      const doorResult = door ? { door } : {};
       // Stopped while the preview was being made (a parallel subagent when the
       // user pressed Esc): don't raise a prompt for a run that's over. Summed up
       // as the interrupt it was; `declined` stops the loop like any other stop
       // (runAgent checks the abort first, so the model reads "Interrupted").
       if (ctx.signal?.aborted) {
-        return noted({ output: NOT_RUN.aborted, summary: "interrupted", declined: true, label, approval: "interrupted" });
+        return noted({ output: NOT_RUN.aborted, summary: "interrupted", declined: true, label, approval: "interrupted", ...doorResult });
       }
       // Yolo: a call the tool vouches for runs without asking, confined (bash
       // then can't touch .git). It still went through the preview above, so
       // a call that can't succeed fails the same way.
       if (ctx.yolo && tool.autoSafe?.(parsed.data, ctx)) {
-        return noted({ ...(await tool.run(parsed.data, { ...ctx, callId: call.id, confined: true })), label, approval: "auto" });
+        if (!(await checkpointed())) return { ...interrupted(), ...doorResult };
+        return noted({ ...(await tool.run(parsed.data, { ...ctx, callId: call.id, confined: true })), label, approval: "auto", ...doorResult });
       }
       // No one to ask (a program using the SDK without an approver): refused, as an error the model can read and
       // work around, rather than a "no" that would stop the run.
       const noOneToAsk = () => noted(fail(`${call.name} needs the user's approval, and there's no one to ask.`, label));
       if (!ctx.approve) return noOneToAsk();
-      const decision = await ctx.approve({ tool: call.name, label, preview, scope, ...network });
+      const decision = await ctx.approve({ tool: call.name, label, preview, scope, ...network, ...doorFields });
       if (decision === "unavailable") return noOneToAsk();
       // Esc at the prompt answers "no" and then aborts the run: that's an interrupt, and the model should read it
       // as one (like the calls queued behind it), not as "the user declined this, don't retry".
       if (decision === "no" && ctx.signal?.aborted) {
-        return noted({ output: NOT_RUN.aborted, summary: "interrupted", declined: true, label, approval: "interrupted" });
+        return noted({ output: NOT_RUN.aborted, summary: "interrupted", declined: true, label, approval: "interrupted", ...doorResult });
       }
       if (decision === "no") {
         return noted({
@@ -130,10 +154,13 @@ export async function runTool(call: ToolCall, ctx: ToolContext, available: Tool[
           declined: true,
           label,
           approval: "no",
+          ...doorResult,
         });
       }
-      return noted({ ...(await tool.run(parsed.data, { ...ctx, callId: call.id })), label, approval: decision });
+      if (!(await checkpointed())) return { ...interrupted(), approval: decision, ...doorResult };
+      return noted({ ...(await tool.run(parsed.data, { ...ctx, callId: call.id })), label, approval: decision, ...doorResult });
     }
+    if (!(await checkpointed())) return interrupted();
     return noted({ ...(await tool.run(parsed.data, { ...ctx, callId: call.id })), label });
   } catch (err) {
     if (err instanceof ToolError) return noted(fail(err.message, label));

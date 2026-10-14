@@ -21,7 +21,7 @@ import type { LoopEvent } from "./agent.ts";
 import type { ModeChoice } from "./mcp/deferred.ts";
 import { projectKey } from "./paths.ts";
 import type { ToolCall, Usage } from "./provider/types.ts";
-import type { Decision } from "./tools/types.ts";
+import type { Decision, Door } from "./tools/types.ts";
 
 export const FORMAT_VERSION = 1;
 
@@ -49,6 +49,8 @@ export type TrajectoryRecord =
       isError: boolean;
       declined: boolean;
       approval: "none" | "auto" | "interrupted" | Decision;
+      /** The door out of the sandbox the call went through (#47, #51, #52); absent for an ordinary call. */
+      door?: Door;
       ms: number;
     })
   | (Who & { type: "error"; message: string })
@@ -71,6 +73,10 @@ export type TrajectoryRecord =
   | (Who & { type: "subagent_start"; subagent: string; call: string; agentType: string; description: string; prompt: string; isolation?: string })
   /** How an agent's run ended (for "main", the turn). */
   | (Who & { type: "agent_end"; reason: string; steps: number; tools: number; ms: number })
+  /** A checkpoint snapshot (src/checkpoints, #16): which, its commit and file count, or why it failed. */
+  | { type: "checkpoint"; turn: string; kind: "before" | "after" | "pre-undo"; ok: boolean; sha?: string; files?: number; ms: number; message?: string }
+  /** /undo (#16): the turn it took back (its number in the checkpoints), the paths written, and those left alone. */
+  | { type: "undo"; turn: number; paths: string[]; skipped: string[] }
   /** The conversation was replaced by a summary (what the model sees from here on). */
   | { type: "compact"; turn?: string; summary: string }
   /** About a turn: 1 good, -1 bad, 0 just labeled. */
@@ -187,6 +193,7 @@ export class AgentRecorder {
           isError: Boolean(result.isError),
           declined: Boolean(result.declined),
           approval: result.approval ?? "none",
+          ...(result.door ? { door: result.door } : {}),
           ms: this.now() - started,
         });
         // The next request goes out once the last tool is done.

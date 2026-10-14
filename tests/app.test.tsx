@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { existsSync, readdirSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { createServer } from "node:net";
 import { join } from "node:path";
 import { cleanup, render } from "ink-testing-library";
 import * as agentModule from "../src/agent.ts";
@@ -29,6 +30,7 @@ import type { Proposal } from "../src/mcp/install/proposal.ts";
 import type { RegistryHit } from "../src/mcp/install/registry.ts";
 import type { AddOptions } from "../src/mcp/install/source.ts";
 import { dns } from "../src/tools/web/address.ts";
+import { sandboxAvailable } from "../src/sandbox.ts";
 import { FakeProvider, RoutedProvider, ScriptedProvider } from "./fake-provider.ts";
 
 const ENTER = "\r";
@@ -321,7 +323,75 @@ describe("App", () => {
     expect(frame).toContain("It says to remember the milk.");
     // The real tool ran on the project and its output went back to the model.
     expect(model.requests[1]!.history.at(-1)).toEqual({ role: "tool", callId: "c1", name: "read_file", text: "    1→remember the milk" });
-    expect(model.requests[0]!.options.tools!.map((t) => t.name)).toEqual(["read_file", "glob", "grep", "web_fetch", "edit_file", "write_file", "bash", "memory", "agent"]);
+    expect(model.requests[0]!.options.tools!.map((t) => t.name)).toEqual(["read_file", "glob", "grep", "web_fetch", "edit_file", "write_file", "bash", ...(sandboxAvailable() ? ["process"] : []), "memory", "plan", "agent"]);
+  });
+
+  describe("the plan (#15)", () => {
+    const planCall = (id: string, items: { text: string; status: string }[]): AgentEvent[] => [
+      { type: "tool_call", call: { id, name: "plan", arguments: JSON.stringify({ items }) } },
+      { type: "done", reason: "tool_calls" },
+    ];
+    const reply = (text: string): AgentEvent[] => [{ type: "text_delta", text }, { type: "done" }];
+    const three = [
+      { text: "Read the report command", status: "done" },
+      { text: "Add the --json flag", status: "in_progress" },
+      { text: "Update README", status: "pending" },
+    ];
+    const allDone = three.map((i) => ({ ...i, status: "done" }));
+    /** The rows between the transcript and the prompt: the panel sits right above the prompt's line. */
+    const abovePrompt = (frame: string) => frame.slice(0, frame.lastIndexOf("╭")).trimEnd().split("\n").slice(-4).join("\n");
+
+    test("a plan call pins the panel above the prompt with the current item; an all-done one hides it", async () => {
+      const model = new ScriptedProvider([planCall("p1", three), reply("Working on it."), planCall("p2", allDone), reply("All done.")]);
+      const { lastFrame, stdin } = renderApp(LOCAL, 0, undefined, () => model);
+      await type(stdin, "do three things");
+      await until(() => lastFrame()!.includes("Working on it."));
+      const frame = lastFrame()!;
+      expect(frame).toContain("● plan Plan");
+      expect(frame).toContain("⎿ 1/3 done");
+      expect(abovePrompt(frame)).toContain(" Plan 1/3 ─");
+      expect(abovePrompt(frame)).toContain("▸ Add the --json flag");
+      await type(stdin, "finish");
+      await until(() => lastFrame()!.includes("All done."));
+      expect(lastFrame()).toContain("⎿ 3/3 done");
+      expect(lastFrame()).not.toContain(" Plan 3/3 ─");
+      expect(lastFrame()).not.toContain("▸ Add the --json flag");
+    });
+
+    test("/clear hides it", async () => {
+      const model = new ScriptedProvider([planCall("p1", three), reply("Working on it.")]);
+      const { lastFrame, stdin } = renderApp(LOCAL, 0, undefined, () => model);
+      await type(stdin, "do three things");
+      await until(() => lastFrame()!.includes("Working on it."));
+      expect(lastFrame()).toContain(" Plan 1/3 ─");
+      await type(stdin, "/clear");
+      await tick(100);
+      expect(lastFrame()).not.toContain(" Plan 1/3 ─");
+    });
+
+    test("not on a window under 20 rows", async () => {
+      const model = new ScriptedProvider([planCall("p1", three), reply("Working on it.")]);
+      const app = renderApp(LOCAL, 0, undefined, () => model);
+      Object.defineProperty(app.stdout, "rows", { value: 15, configurable: true });
+      app.stdout.emit("resize");
+      await type(app.stdin, "do three things");
+      await until(() => app.lastFrame()!.includes("⎿ 1/3 done"));
+      expect(app.lastFrame()).not.toContain(" Plan 1/3 ─");
+    });
+
+    test("a resumed session shows its saved plan", async () => {
+      const sessions = new SessionStore(join(dir, "sessions"));
+      const props = { store, initialFile: LOCAL, env: {}, version: "9.9.9", cwd: "~/x", root: project, splashMs: 0, loadModels: async () => [], sessions };
+      const first = render(<App {...props} makeProvider={() => new ScriptedProvider([planCall("p1", three), reply("Working on it.")])} />);
+      await type(first.stdin, "do three things");
+      await until(() => first.lastFrame()!.includes("Working on it."));
+      await tick(400); // saved 200 ms after the turn
+      first.unmount();
+      const second = render(<App {...props} makeProvider={() => new ScriptedProvider([])} resume="latest" />);
+      await until(() => second.lastFrame()!.includes("Resumed a session"));
+      expect(second.lastFrame()).toContain(" Plan 1/3 ─");
+      expect(second.lastFrame()).toContain("▸ Add the --json flag");
+    });
   });
 
   test("a failing tool shows its error, and the model gets it to recover from", async () => {
@@ -494,6 +564,51 @@ describe("App", () => {
       stdin.write("\x0f"); // ctrl+o
       await until(() => lastFrame()!.includes("30 + LINE 30"));
       expect(lastFrame()).not.toContain("(ctrl+o)");
+    });
+
+    test.if(sandboxAvailable())("bash with sandbox: false asks in yolo, with the host door's warning and no 'don't ask again', and runs on yes (#52)", async () => {
+      const hostCall = (id: string) =>
+        [{ type: "tool_call", call: { id, name: "bash", arguments: JSON.stringify({ command: "touch host-ran", sandbox: false }) } }, { type: "done" }] as AgentEvent[];
+      const model = new ScriptedProvider([hostCall("h1"), reply("Ran it.")]);
+      const { lastFrame, stdin } = renderApp(LOCAL, 0, undefined, () => model);
+      await type(stdin, "check the service");
+      await until(() => lastFrame()!.includes("Do you want to proceed?"));
+      expect(lastFrame()).toContain("Run a command on your machine");
+      expect(lastFrame()).toContain("Runs OUTSIDE the sandbox, as you, with your files, network and credentials.");
+      expect(lastFrame()).not.toContain("don't ask again");
+      expect(existsSync(join(project, "host-ran"))).toBe(false);
+      stdin.write(ENTER);
+      await until(() => lastFrame()!.includes("Ran it."));
+      expect(existsSync(join(project, "host-ran"))).toBe(true);
+    });
+
+    test.if(sandboxAvailable())("process start asks with the process door's warning; the status bar counts it; /processes lists and stops it (#51)", async () => {
+      const server = createServer();
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      const port = (server.address() as { port: number }).port;
+      await new Promise((resolve) => server.close(resolve));
+      const command = `/run/marv-bun -e 'Bun.serve({ port: ${port}, hostname: "127.0.0.1", fetch: () => new Response("app page") })'`;
+      const model = new ScriptedProvider([
+        [{ type: "tool_call", call: { id: "p1", name: "process", arguments: JSON.stringify({ action: "start", command, name: "web" }) } }, { type: "done" }],
+        reply("It's up."),
+      ]);
+      const { lastFrame, stdin } = renderApp(LOCAL, 0, undefined, () => model);
+      await type(stdin, "start the server");
+      await until(() => lastFrame()!.includes("Do you want to proceed?"));
+      expect(lastFrame()).toContain("Start a background process (web)");
+      expect(lastFrame()).toContain("Keeps running after this turn");
+      stdin.write(ENTER);
+      await until(() => lastFrame()!.includes("It's up."));
+      expect(lastFrame()).toContain("1 running");
+      expect(await (await fetch(`http://127.0.0.1:${port}/`)).text()).toBe("app page");
+      await type(stdin, "/processes");
+      await until(() => lastFrame()!.includes(`web: running · http://localhost:${port}`));
+      await type(stdin, "/processes stop web");
+      await until(() => lastFrame()!.includes("Stopped web."));
+      await until(() => !lastFrame()!.includes("1 running"));
+      await expect(fetch(`http://127.0.0.1:${port}/`)).rejects.toThrow();
+      await type(stdin, "/processes stop web");
+      await until(() => lastFrame()!.includes('No background process named "web"'));
     });
 
     test("/yolo off turns it off and saves it; then changes ask", async () => {
@@ -2047,5 +2162,94 @@ describe("/mcp add, search and remove", () => {
     const { lastFrame, stdin } = renderAdd(async () => fixtureProposal());
     await type(stdin, "/mcp remove nope");
     await until(() => lastFrame()!.includes("no server named"));
+  });
+});
+
+describe("/undo", () => {
+  const git = (...args: string[]) => Bun.spawnSync(["git", ...args], { cwd: project }).stdout.toString().trim();
+  beforeEach(() => {
+    git("init", "-q", "-b", "main");
+    git("add", "-A");
+    git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "first");
+  });
+  const writeTurn = () =>
+    new ScriptedProvider([
+      [{ type: "tool_call", call: { id: "w", name: "write_file", arguments: JSON.stringify({ path: "notes.txt", content: "buy bread\n" }) } }, { type: "done", reason: "tool_calls" }],
+      [{ type: "text_delta", text: "Changed the note." }, { type: "done", reason: "stop" }],
+    ]);
+  const read = (path: string) => Bun.file(join(project, path)).text();
+
+  test("shows the turn's files and diffs; Yes puts them back", async () => {
+    const provider = writeTurn();
+    const { lastFrame, stdin } = renderApp(LOCAL, 0, undefined, () => provider);
+    await tick();
+    await type(stdin, "change the note");
+    await until(() => lastFrame()!.includes("Changed the note."));
+    expect(await read("notes.txt")).toBe("buy bread\n");
+    await type(stdin, "/undo");
+    await until(() => lastFrame()!.includes("Do you want to proceed?"));
+    const frame = lastFrame()!;
+    expect(frame).toContain('Undo turn 1 ("change the note")? 1 file');
+    expect(frame).toContain("Restore notes.txt");
+    expect(frame).toContain("- buy bread");
+    expect(frame).toContain("+ remember the milk");
+    expect(frame).not.toContain("don't ask again");
+    stdin.write(ENTER);
+    await until(() => lastFrame()!.includes("↶ Undid turn 1"));
+    expect(lastFrame()).toContain("↶ Undid turn 1: 1 file restored");
+    expect(await read("notes.txt")).toBe("remember the milk\n");
+    // Nothing more to undo.
+    await type(stdin, "/undo");
+    await until(() => lastFrame()!.includes("Nothing to undo"));
+  });
+
+  test("No changes nothing", async () => {
+    const provider = writeTurn();
+    const { lastFrame, stdin } = renderApp(LOCAL, 0, undefined, () => provider);
+    await tick();
+    await type(stdin, "change the note");
+    await until(() => lastFrame()!.includes("Changed the note."));
+    await type(stdin, "/undo");
+    await until(() => lastFrame()!.includes("Do you want to proceed?"));
+    stdin.write(DOWN);
+    await tick();
+    stdin.write(ENTER);
+    await until(() => lastFrame()!.includes("Nothing was undone."));
+    expect(await read("notes.txt")).toBe("buy bread\n");
+  });
+
+  test("with nothing to undo it says why", async () => {
+    const { lastFrame, stdin } = renderApp(LOCAL);
+    await tick();
+    await type(stdin, "/undo");
+    await until(() => lastFrame()!.includes("Nothing to undo"));
+    expect(lastFrame()).toContain("no turn in this session has changed files yet");
+  });
+
+  test("refused during a turn", async () => {
+    class WriteThenHang implements Provider {
+      readonly name = "hang";
+      n = 0;
+      async *stream(_h: ChatTurn[], { signal }: StreamOptions = {}): AsyncIterable<AgentEvent> {
+        if (this.n++ === 0) {
+          yield { type: "tool_call", call: { id: "w", name: "write_file", arguments: JSON.stringify({ path: "notes.txt", content: "x\n" }) } };
+          yield { type: "done", reason: "tool_calls" };
+          return;
+        }
+        yield { type: "text_delta", text: "Still working" };
+        await new Promise<void>((resolve) => signal?.addEventListener("abort", () => resolve(), { once: true }));
+        yield { type: "done" };
+      }
+    }
+    const { lastFrame, stdin } = renderApp(LOCAL, 0, undefined, () => new WriteThenHang());
+    await tick();
+    await type(stdin, "go");
+    await until(() => lastFrame()!.includes("Still working"));
+    await type(stdin, "/undo");
+    await tick(200);
+    expect(lastFrame()).not.toContain("Do you want to proceed?");
+    expect(await read("notes.txt")).toBe("x\n");
+    stdin.write("\x1b");
+    await tick(200);
   });
 });

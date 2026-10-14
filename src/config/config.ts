@@ -62,6 +62,8 @@ const FileConfigSchema = z.object({
   diagnostics: z.boolean().optional(),
   /** Run the project's own checks (.marv/checks/) after the model changes files (default on; nothing without the folder). */
   checks: z.boolean().optional(),
+  /** Snapshot the project before each turn's changes, so /undo can put them back (default on). #16. */
+  checkpoints: z.boolean().optional(),
   /**
    * MCP tools' specs in every request ("eager"), or only their names with tool_search and mcp_call to load and run
    * them ("deferred"); "auto" (the default) defers past min(4000 tokens, 10% of the context window). #14.
@@ -99,6 +101,7 @@ export interface Config {
   trajectories: boolean;
   diagnostics: boolean;
   checks: boolean;
+  checkpoints: boolean;
   /** How MCP tools are offered (src/mcp/deferred.ts); a conversation decides once, at its first turn with MCP tools. */
   mcpTools: "auto" | "deferred" | "eager";
   /**
@@ -198,6 +201,7 @@ export function resolveConfig(file: FileConfig | null, env: Env): Config {
     trajectories: file?.trajectories ?? true,
     diagnostics: file?.diagnostics ?? true,
     checks: file?.checks ?? true,
+    checkpoints: file?.checkpoints ?? true,
     mcpTools: file?.mcpTools ?? "auto",
     maxSteps: maxStepsFromEnv(env.MARV_MAX_STEPS, file?.maxSteps === "off" ? 0 : (file?.maxSteps ?? DEFAULT_MAX_STEPS)),
   };

@@ -9,7 +9,10 @@
 //   2 — stopped: max steps, output limit, or loop (no final answer)
 //   3 — approval needed but couldn't get it (refused or declined/interrupted)
 import { ConfigError, ConfigStore, defaultConfigDir, migrateLegacyConfig, resolveConfig } from "./config/config.ts";
+import { TUI_HINTS } from "./provider/errors.ts";
 import { createSession, type SessionEvent, type ApprovalRequest, type Decision, type ProviderOption } from "./sdk.ts";
+import { NO_HOST_DOOR } from "./tools/bash.ts";
+import { githubWanted } from "./tools/github/github.ts";
 import { TrajectoryStore } from "./trajectory.ts";
 
 export type OutputFormat = "text" | "json" | "stream-json";
@@ -23,6 +26,9 @@ const APPROVE_PREFIXES: Record<string, string[]> = {
   files: ["files"],
   memory: ["memory"],
   agent_worktree: ["agent:worktree"],
+  process: ["process:"],
+  // The github tool's writes and sensitive reads (#47); its reads need nothing.
+  github: ["github:"],
 };
 
 const ALL_APPROVE_NAMES = Object.keys(APPROVE_PREFIXES);
@@ -66,25 +72,28 @@ export function buildApprover(
 ): [{ (request: ApprovalRequest): Promise<Decision> } | undefined, string[]] {
   if (!names.length) return [undefined, []];
   const problems: string[] = [];
-  // Collect the scope-key prefixes each name maps to.
-  const matchPrefixes: string[] = [];
-  for (const name of names) {
-    if (APPROVE_PREFIXES[name]) {
-      matchPrefixes.push(...APPROVE_PREFIXES[name]);
-    } else {
-      // Also accept an exact scope key directly.
-      matchPrefixes.push(name);
-    }
-    if (!APPROVE_PREFIXES[name] && !ALL_APPROVE_NAMES.includes(name)) {
-      problems.push(`Unknown --approve scope "${name}". Known: ${ALL_APPROVE_NAMES.join(", ")}`);
-    }
-  }
+  const known = new Set(names.filter((n) => APPROVE_PREFIXES[n]));
+  // Anything else is an exact scope key: it approves that key and nothing more (never a prefix of others).
+  const exact = new Set(names.filter((n) => !APPROVE_PREFIXES[n]));
+  for (const name of exact) problems.push(`Unknown --approve scope "${name}". Known: ${ALL_APPROVE_NAMES.join(", ")}`);
+  // Prefixes for the names that aren't about bash's flags (web:, mcp:, files, memory, agent:worktree).
+  const prefixes = [...known].filter((n) => n !== "git_write" && n !== "network").flatMap((n) => APPROVE_PREFIXES[n]!);
   // Answer "yes" (not "always") so each call is asked individually, even for the same tool. Anything outside the
   // list is "unavailable", not "no": refused as an error the model can work around, as with no --approve at all,
   // rather than a decline that ends the turn.
   const approve = async (request: ApprovalRequest): Promise<Decision> => {
     const key = request.scope.key;
-    if (matchPrefixes.some((prefix) => key === prefix || key.startsWith(prefix))) return "yes" as const;
+    if (exact.has(key)) return "yes" as const;
+    // A bash call needs every door its flags open (bash:[net:][git:]<command>): git_write alone doesn't approve a
+    // command that also has network (curl … | sh with git_write: true), nor network alone a git write.
+    const flags = /^bash:(net:)?(git:)?/.exec(key);
+    if (flags) {
+      const needs = [...(flags[1] ? ["network"] : []), ...(flags[2] ? ["git_write"] : [])];
+      return needs.length > 0 && needs.every((n) => known.has(n)) ? ("yes" as const) : ("unavailable" as const);
+    }
+    // A background process that shares the user's network needs network too, as a bash command with it does.
+    if (key.startsWith("process:net:")) return known.has("process") && known.has("network") ? ("yes" as const) : ("unavailable" as const);
+    if (prefixes.some((prefix) => key === prefix || key.startsWith(prefix))) return "yes" as const;
     return "unavailable" as const;
   };
   return [approve, problems];
@@ -161,9 +170,15 @@ export async function runHeadless(options: HeadlessOptions): Promise<number> {
       trajectories,
       diagnostics: config.diagnostics,
       checks: config.checks,
+      checkpoints: config.checkpoints,
       configDir,
       mcpTools: config.mcpTools,
+      // gh with the user's login, when it's there (MARV_GITHUB=off hides it): reads run, writes need --approve github.
+      github: githubWanted(process.env),
       resume: options.resume,
+      // A CLI user runs marv, not createSession(): a bad key should point at /setup or OPENROUTER_API_KEY, as the
+      // TUI does (issue #54).
+      errorHints: TUI_HINTS,
       // To stderr, so stdout stays the reply (or JSON): an MCP server that needs a login (/mcp login in the TUI), a
       // trajectory that can't be written.
       onWarning: (text) => console.error(`marv: ${text}`),
@@ -195,7 +210,8 @@ async function collectAndOutput(
   let lastAssistantText: string | undefined;
   const allEvents: SessionEvent[] = [];
   const errors: string[] = [];
-  // Calls that were refused (no approver, output matches "there's no one to ask").
+  // Calls that were refused (no approver, output matches "there's no one to ask"; or a command for the host, which
+  // headless never runs, whatever --approve says: #52).
   const refused: { tool: string; label: string }[] = [];
   const seenRefused = new Set<string>();
 
@@ -204,7 +220,8 @@ async function collectAndOutput(
   /** Detect a refused call (no approver, or the user said no) and list it once. */
   const noteRefused = (event: Extract<SessionEvent, { type: "tool_end" }>) => {
     const { result } = event;
-    if (!(result.output.includes(NO_APPROVER) || result.approval === "no" || result.declined)) return;
+    const refusedHere = result.output.includes(NO_APPROVER) || (result.isError && result.output.includes(NO_HOST_DOOR));
+    if (!(refusedHere || result.approval === "no" || result.declined)) return;
     const tool = event.call.name;
     const label = result.label ?? tool;
     const key = refusedCallKey({ tool, label });

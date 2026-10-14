@@ -14,11 +14,13 @@ import { McpManager } from "./mcp/manager.ts";
 import { McpTokenStore } from "./mcp/oauth-store.ts";
 import { McpTrust } from "./mcp/trust.ts";
 import { homeOrAbove, projectKey } from "./paths.ts";
+import type { ErrorHints } from "./provider/errors.ts";
 import type { ProviderOption } from "./provider/factory.ts";
 import { MarvSession, type Session } from "./session.ts";
 import { SessionStore } from "./sessions.ts";
 import { loadSources, type Source } from "./sources.ts";
 import { TrajectoryStore } from "./trajectory.ts";
+import { githubAvailable } from "./tools/github/github.ts";
 import type { ApprovalRequest, Decision, Tool } from "./tools/types.ts";
 import type { Message } from "./types.ts";
 
@@ -87,6 +89,17 @@ export interface SessionOptions {
    */
   checks?: boolean;
   /**
+   * Offer the plan tool: a checklist the model keeps for a long task (`session.plan` reads it, each change also
+   * arrives as a tool_end's `result.plan`). Default true. Fixed for the session, since it changes the tool list.
+   */
+  plan?: boolean;
+  /**
+   * Before a turn's first change, snapshot the project (git commits under a hidden ref, refs/marv/checkpoints/<session>,
+   * or a git dir of Marv's own in configDir outside a repository), and again when it ends, so `session.undoPlan()`
+   * and `session.undo(plan)` can put that turn's files back. Default true.
+   */
+  checkpoints?: boolean;
+  /**
    * MCP tools' specs in every request ("eager"), or only their names, in a note, with tool_search and mcp_call to
    * load and run them ("deferred"). Default "auto": deferred when the specs would cost more than min(4000 tokens,
    * 10% of the context window). Decided once per conversation, at its first turn with MCP tools.
@@ -95,6 +108,25 @@ export interface SessionOptions {
   /** Run bash in the bubblewrap sandbox (default true). */
   sandbox?: boolean;
   /** Run what the sandbox confines without asking (default true). Must be false when `cwd` is your home folder or above it. */
+  /**
+   * Let bash run a command on the host, outside the sandbox (`sandbox: false`), when your approver says yes. Asked
+   * every time (the request has `door: "host"` and `once: true`; an "always" counts as one yes). Default false:
+   * such calls are refused before your approver is asked.
+   */
+  hostCommands?: boolean;
+  /**
+   * Offer the process tool (#51): a dev server or watcher that keeps running in its own sandbox, its ports forwarded
+   * to 127.0.0.1, each start through your approver (`door: "process"`; scope `process:<command>`). Default true,
+   * where bubblewrap works. `session.close()` stops them all.
+   */
+  processes?: boolean;
+  /**
+   * Offer the github tool (gh with the user's login, outside the sandbox) when gh is on PATH and logged in, checked
+   * once here. Reads run without asking; writes and sensitive API reads go to your approver (`door: "github"`,
+   * scope `github:<command>`); what can never run (auth, config, extensions, --web, another host…) is refused.
+   * Default false.
+   */
+  github?: boolean;
   yolo?: boolean;
   /** Let thinking models reason before they answer (default false). */
   thinking?: boolean;
@@ -118,6 +150,12 @@ export interface SessionOptions {
   configDir?: string;
   /** Something you should hear about that isn't a turn's event (a trajectory that can't be written). */
   onWarning?: (text: string) => void;
+  /**
+   * Not public SDK surface: what a bad key or an unknown model tells the user to change. Default: this SDK's
+   * options. Marv's own headless mode (`marv -p`, src/headless.ts) passes the TUI's advice instead, since its
+   * user runs `marv`, not `createSession()` (issue #54).
+   */
+  errorHints?: ErrorHints;
 }
 
 /** true → the default store; a store → that one; false or absent → none. */
@@ -160,10 +198,13 @@ export async function createSession(options: SessionOptions): Promise<Session> {
     ? new McpManager(servers, { root, version: pkg.version, trust: new McpTrust(join(configDir, "mcp-trust.json")), logins: new McpTokenStore(tokensFile) })
     : undefined;
 
+  // Before the session: its tool list is fixed from the start (the prompt cache).
+  const github = options.github ? await githubAvailable() : false;
   const session = new MarvSession({
     root,
     provider: options.provider,
     thinking: options.thinking,
+    errorHints: options.errorHints,
     version: pkg.version,
     instructions: loaded.instructions,
     skills: loaded.skills,
@@ -177,8 +218,14 @@ export async function createSession(options: SessionOptions): Promise<Session> {
     maxSteps: options.maxSteps,
     diagnostics: options.diagnostics,
     checks: options.checks,
+    plan: options.plan,
+    checkpoints: options.checkpoints,
+    checkpointsDir: join(configDir, "checkpoints", projectKey(root)),
     mcpTools: options.mcpTools,
     sandbox: options.sandbox,
+    hostCommands: options.hostCommands,
+    processes: options.processes,
+    github,
     yolo: options.yolo,
     noYolo,
     sessions: storeFor(options.persist, () => new SessionStore(join(configDir, "sessions"))),
@@ -224,7 +271,7 @@ export type { Session, SessionEvent, TurnEndReason, CompactResult, Resumed } fro
 export type { ProviderOption } from "./provider/factory.ts";
 export type { Source } from "./sources.ts";
 export { ToolError } from "./tools/types.ts";
-export type { AgentHost, AgentProgress, Tool, ToolContext, ToolResult, ApprovalRequest, Decision, Preview, Scope, DiffLine, DiffShown } from "./tools/types.ts";
+export type { AgentHost, AgentProgress, Tool, ToolContext, ToolResult, ApprovalRequest, Decision, Door, Preview, Scope, DiffLine, DiffShown, PlanItem } from "./tools/types.ts";
 export type { Provider, AgentEvent, ChatTurn, StreamOptions, ToolCall, ToolSpec, Usage } from "./provider/types.ts";
 export { OllamaProvider } from "./provider/ollama.ts";
 export { OpenAICompatProvider } from "./provider/openai-compat.ts";
@@ -232,6 +279,8 @@ export type { LoopEvent } from "./agent.ts";
 export type { CheckResult } from "./diagnostics/turn.ts";
 export type { TsError } from "./diagnostics/tsc.ts";
 export type { ProjectCheckResult } from "./checks/kind.ts";
+export type { ProcessInfo } from "./processes.ts";
+export type { UndoFile, UndoPlan, UndoResult } from "./checkpoints/undo.ts";
 export type { Violation } from "./checks/load.ts";
 export type { Totals } from "./usage.ts";
 export type { Message } from "./types.ts";

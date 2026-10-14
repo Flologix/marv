@@ -42,6 +42,7 @@ test("per model: turns, how they ended, tokens (subagents included), and feedbac
     rated: 2,
     good: 1,
     bad: 1,
+    doors: {},
   });
   expect(stats.get("b")).toMatchObject({ turns: 1, rated: 0, good: 0, bad: 0 });
   const table = formatStats(stats);
@@ -52,4 +53,12 @@ test("per model: turns, how they ended, tokens (subagents included), and feedbac
 test("can group by Marv version instead", () => {
   const records = [{ ...base, type: "session", marv: "0.2.0", model: "a" }, turn("t1", "a"), end("t1", "end")];
   expect([...summarize(records, "marv").keys()]).toEqual(["0.2.0"]);
+});
+
+test("counts calls through each door out of the sandbox, subagents' included (#52)", () => {
+  const tool = (id: string, agent: string, door?: string) => ({ ...base, type: "tool", turn: id, agent, ...(door ? { door } : {}) });
+  const records = [turn("t1", "a"), tool("t1", "main", "host"), tool("t1", "main"), tool("t1", "t1.1", "github"), end("t1", "end"), turn("t2", "a"), tool("t2", "main", "host"), end("t2", "end")];
+  const stats = summarize(records);
+  expect(stats.get("a")?.doors).toEqual({ host: 2, github: 1 });
+  expect(formatStats(stats)).toContain("host 2, github 1");
 });

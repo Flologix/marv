@@ -2,7 +2,7 @@
 // model, and on OpenRouter the provider is remade once the model list says whether the model's reasoning can be
 // turned off (/think). A factory makes them, and says what to record in saved sessions and trajectories.
 import { resolveConfig, type Config } from "../config/config.ts";
-import { SDK_HINTS } from "./errors.ts";
+import { SDK_HINTS, type ErrorHints } from "./errors.ts";
 import { createProvider } from "./index.ts";
 import { listModels, type ModelInfo } from "./models.ts";
 import type { Provider } from "./types.ts";
@@ -53,8 +53,12 @@ export function configFactory(
   };
 }
 
-/** The SDK's way. Environment variables (OPENROUTER_API_KEY, MARV_MODEL…) are ignored: a library uses what it's given. */
-export function providerFactory(option: ProviderOption, thinking = false): ProviderFactory {
+/**
+ * The SDK's way. Environment variables (OPENROUTER_API_KEY, MARV_MODEL…) are ignored: a library uses what it's given.
+ * `hints` is what a bad key or an unknown model tells the user to change (the SDK's options by default; the CLI's
+ * headless mode passes the TUI's advice, issue #54 — `marv -p` is not an SDK user).
+ */
+export function providerFactory(option: ProviderOption, thinking = false, hints: ErrorHints = SDK_HINTS): ProviderFactory {
   // A Provider has `stream` (a built-in option never does).
   if ("stream" in option) return { id: "custom", model: option.name, make: () => option };
   // Check both kinds by name: a typo (or "OpenRouter" from plain JS) must not quietly become Ollama on localhost.
@@ -67,5 +71,5 @@ export function providerFactory(option: ProviderOption, thinking = false): Provi
       : { provider: "ollama" as const, model: option.model, contextLength: option.contextLength };
   const env = option.kind === "ollama" && option.host ? { OLLAMA_HOST: option.host } : {};
   // Errors name the option to change: an SDK user has no /setup or /model.
-  return configFactory({ ...resolveConfig(file, env), thinking }, (config, info) => createProvider(config, info, SDK_HINTS));
+  return configFactory({ ...resolveConfig(file, env), thinking }, (config, info) => createProvider(config, info, hints));
 }

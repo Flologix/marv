@@ -40,3 +40,51 @@ export function runGit(
   const ok = result.exitCode === 0;
   return { ok, out: (ok ? result.stdout : result.stderr).toString(), timedOut: false };
 }
+
+export interface GitAsyncResult extends GitResult {
+  /** stdout as bytes (a blob from `cat-file`), whatever the exit code. */
+  bytes: Uint8Array;
+}
+
+/**
+ * runGit without blocking the event loop: a snapshot of a big tree (checkpoints) takes seconds, and the UI must keep
+ * drawing meanwhile. The same rules (no hooks or fsmonitor, no inherited GIT_*, no stdin but Marv's own `input`, a
+ * timeout), and an abort kills it too. A git that's killed isn't waited for: a child it started (an alias, a filter) may hold its pipes open.
+ */
+export async function runGitAsync(
+  cwd: string,
+  args: string[],
+  { env, timeoutMs = GIT_TIMEOUT_MS, signal, input }: { env?: Record<string, string>; timeoutMs?: number; signal?: AbortSignal; input?: string } = {},
+): Promise<GitAsyncResult> {
+  const killed: GitAsyncResult = { ok: false, out: "", bytes: new Uint8Array(), timedOut: false };
+  if (signal?.aborted) return killed;
+  let proc: ReturnType<typeof Bun.spawn<"ignore" | Uint8Array, "pipe", "pipe">>;
+  try {
+    const stdin: "ignore" | Uint8Array = input === undefined ? "ignore" : new TextEncoder().encode(input);
+    proc = Bun.spawn(["git", ...NO_PROGRAMS, ...args], { cwd, env: gitEnvironment(env), stdin, stdout: "pipe", stderr: "pipe" });
+  } catch (error) {
+    return { ...killed, out: (error as Error).message };
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
+  const stopped = new Promise<"timeout" | "abort">((resolve) => {
+    timer = setTimeout(() => resolve("timeout"), timeoutMs);
+    onAbort = () => resolve("abort");
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+  const finished = Promise.all([new Response(proc.stdout).bytes(), new Response(proc.stderr).text(), proc.exited]);
+  try {
+    const outcome = await Promise.race([finished, stopped]);
+    if (outcome === "timeout" || outcome === "abort") {
+      proc.kill("SIGKILL");
+      finished.catch(() => {}); // its pipes close whenever the last child lets go
+      return { ...killed, timedOut: outcome === "timeout" };
+    }
+    const [stdout, stderr, code] = outcome;
+    const ok = code === 0;
+    return { ok, out: ok ? new TextDecoder().decode(stdout) : stderr, bytes: stdout, timedOut: false };
+  } finally {
+    clearTimeout(timer);
+    if (onAbort) signal?.removeEventListener("abort", onAbort);
+  }
+}

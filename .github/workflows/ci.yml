@@ -5,8 +5,9 @@
 # The sandbox is Marv's main safety boundary and its tests are gated on bwrap, so they are made to run rather than
 # skip: bubblewrap is installed, and Ubuntu 24.04's runners refuse unprivileged user namespaces (AppArmor), which
 # bwrap needs, so the restriction is lifted for the runner machine. The job summary says whether the sandbox really
-# ran, also when an earlier step failed. The runners already have git, python3 (the syntax check) and node (the
-# system-wide interpreter of tsc's launcher, which sandboxed checks run), so only bwrap is installed here.
+# ran, also when an earlier step failed, and how many guard tests (tests/guards) ran and were skipped. The runners
+# already have git, python3 (the syntax check) and node (the system-wide interpreter of tsc's launcher, which
+# sandboxed checks run), so only bwrap is installed here.
 name: CI
 
 "on":
@@ -70,8 +71,15 @@ jobs:
       - name: Typecheck
         run: bun run typecheck
 
+      # A JUnit report beside the usual output, so the guard tests (tests/guards, issue #53: what must stay impossible
+      # or must always ask, against the real bwrap) can be counted below.
       - name: Test
-        run: bun test
+        run: bun test --reporter=junit --reporter-outfile=test-results.xml
+
+      # The guards skip where bwrap can't run. "Require a working sandbox" checks bwrap itself; this checks that every
+      # guard test really ran in this job (none skipped, at least one found), and fails it otherwise.
+      - name: Guard tests ran, none skipped
+        run: bun scripts/guard-summary.ts test-results.xml --strict
 
       - name: Eval tasks verify
         run: bun run eval --verify
@@ -84,3 +92,4 @@ jobs:
           else
             echo "sandbox: bwrap is unavailable — the sandbox tests were **skipped**." >> "$GITHUB_STEP_SUMMARY"
           fi
+          bun scripts/guard-summary.ts test-results.xml >> "$GITHUB_STEP_SUMMARY" || echo "guards: couldn't count them (bun missing?)." >> "$GITHUB_STEP_SUMMARY"

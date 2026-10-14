@@ -366,3 +366,38 @@ describe("MCP logins (#18)", () => {
     }
   });
 });
+
+test("plan: false leaves the plan tool out; by default it's offered and session.plan reads it (#15)", async () => {
+  const items = [{ text: "Step one", status: "in_progress" }];
+  const on = new ScriptedProvider([[{ type: "tool_call", call: { id: "p1", name: "plan", arguments: JSON.stringify({ items }) } }, { type: "done", reason: "tool_calls" }], say("Ok.")]);
+  const a = await createSession({ cwd: root, provider: on, configDir });
+  await collect(a.send("go"));
+  expect(on.requests[0]!.options.tools!.map((t) => t.name)).toContain("plan");
+  expect(a.plan).toEqual(items as sdk.PlanItem[]);
+  await a.close();
+  const off = new ScriptedProvider([say("Ok.")]);
+  const b = await createSession({ cwd: root, provider: off, configDir, plan: false });
+  await collect(b.send("go"));
+  expect(off.requests[0]!.options.tools!.map((t) => t.name)).not.toContain("plan");
+  await b.close();
+});
+
+test("checkpoints: a turn's files can be put back with undoPlan() and undo(), outside a repository too (#16)", async () => {
+  const write = { id: "w", name: "write_file", arguments: JSON.stringify({ path: "made.txt", content: "made\n" }) };
+  const steps: AgentEvent[][] = [[{ type: "tool_call", call: write }, { type: "done", reason: "tool_calls" }], say("Made it.")];
+  const session = await createSession({ cwd: root, provider: new ScriptedProvider(steps), configDir });
+  await collect(session.send("make a file"));
+  expect(existsSync(join(root, "made.txt"))).toBe(true);
+  const plan = await session.undoPlan();
+  if ("reason" in plan) throw new Error(plan.reason);
+  expect(plan.files.map((f) => [f.path, f.action])).toEqual([["made.txt", "delete"]]);
+  expect((await session.undo(plan)).deleted).toEqual(["made.txt"]);
+  expect(existsSync(join(root, "made.txt"))).toBe(false);
+  expect(existsSync(join(configDir, "checkpoints"))).toBe(true);
+  await session.close();
+
+  const off = await createSession({ cwd: root, provider: new ScriptedProvider(structuredClone(steps)), configDir, checkpoints: false });
+  await collect(off.send("make a file"));
+  expect(await off.undoPlan()).toMatchObject({ reason: expect.stringContaining("off") });
+  await off.close();
+});

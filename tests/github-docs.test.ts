@@ -56,6 +56,14 @@ describe("README's Connect GitHub section", () => {
     expect(problems[0]).toContain("MARV_GITHUB_TOKEN");
   });
 
+  test("leads with gh (the github tool, #47), then the MCP server for everyone else", async () => {
+    const text = await readme();
+    const section = text.slice(text.indexOf("## Connect GitHub"));
+    expect(section.indexOf("If you use `gh`, there's nothing to do")).toBeLessThan(section.indexOf("github-mcp-server"));
+    expect(section).toContain("MARV_GITHUB=off");
+    expect(section).toContain("--approve github");
+  });
+
   test("links the example skill", async () => {
     expect(await readme()).toContain("examples/skills/github/SKILL.md");
   });

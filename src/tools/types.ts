@@ -2,6 +2,7 @@ import type { z } from "zod";
 import type { LoopEvent } from "../agent.ts";
 import type { AgentType } from "../agents.ts";
 import type { MemoryPaths } from "../memory.ts";
+import type { ProcessForward, ProcessManager } from "../processes.ts";
 import type { Provider, Usage } from "../provider/types.ts";
 import type { Skill } from "../skills.ts";
 
@@ -35,6 +36,8 @@ export interface Preview {
   note?: string;
   /** Shown in the warning color, e.g. "runs WITHOUT a sandbox". */
   warning?: string;
+  /** Several files, each with its own diff (/undo: what goes back where). */
+  files?: { title: string; diff?: DiffShown; note?: string }[];
 }
 
 /** "Don't ask again this session" applies to everything with the same key. */
@@ -53,8 +56,33 @@ export interface ApprovalRequest {
   agent?: string;
   /** The action can reach the network (bash with network: true). */
   network?: boolean;
-  /** Yes or no only, no "don't ask again": each one is its own decision (/mcp add). */
+  /**
+   * Yes or no only, no "don't ask again": each one is its own decision (/mcp add, a door to the host). The session
+   * never answers one from its "don't ask again" scopes, nor adds one to them, whatever the client answers.
+   */
   once?: boolean;
+  /** The call leaves the sandbox through one of its doors: the prompt shows that door's warning line. */
+  door?: Door;
+}
+
+/**
+ * The narrow, named ways out of the sandbox, each with its own rule for what it can never do: `host` is bash with
+ * `sandbox: false` (one command on the user's machine, #52); `github` runs gh with the user's login (#47);
+ * `process` keeps a server running in its own sandbox (#51).
+ */
+export type Door = "github" | "process" | "host";
+
+/**
+ * The doors this agent may use where a door is gated by who's running, not by the approver (an approver can be
+ * told to say yes to an exact scope key: `marv -p --approve`). Set by the session for the main agent only; a
+ * subagent's context is built without it.
+ */
+export interface Doors {
+  /** bash with sandbox: false: only where the user approves each command at a terminal (the TUI, or the SDK's hostCommands). */
+  host?: boolean;
+  process?: boolean;
+  /** The github tool's writes and sensitive reads (#47): the main agent's, where the session offers the tool; a subagent only reads. */
+  github?: boolean;
 }
 
 /** yes: run it. always: run it, and everything in its scope this session. no: don't. */
@@ -95,6 +123,38 @@ export interface ToolContext {
    * baseline sees the project as it was. Never rejects.
    */
   beforeChange?: () => Promise<void>;
+  /** Where the plan tool keeps its list (#15). Only the main agent has one, so subagents have no plan. */
+  plan?: PlanHost;
+  /** The doors out of the sandbox this agent has (see Doors). Absent: none. */
+  doors?: Doors;
+  /** The session's background processes (#51), for the process tool. Only the main agent has them. */
+  processes?: ProcessHost;
+  /**
+   * The running processes' forwarded ports: a sandboxed bash command (without network) gets a relay to each, so its
+   * `curl localhost:<port>` reaches the session's own servers. Subagents get this too (but not `processes`).
+   */
+  forwards?: () => ProcessForward[];
+  /**
+   * The turn's checkpoint (src/checkpoints): a snapshot of the project before the turn's first change, so /undo can
+   * put it back. runTool awaits it after the approval and before running any call that can change files; one
+   * snapshot per turn, shared by every call and by shared-folder subagents. Never rejects (runTool ignores it if it does).
+   */
+  checkpoint?: () => Promise<void>;
+}
+
+/** What the process tool runs through: the session's ProcessManager. */
+export type ProcessHost = Pick<ProcessManager, "start" | "logs" | "stop" | "list">;
+
+/** One item of the plan tool's checklist; at most one is in_progress at a time (the current item). */
+export interface PlanItem {
+  text: string;
+  status: "pending" | "in_progress" | "done";
+}
+
+/** What the plan tool writes through: the session's state. */
+export interface PlanHost {
+  /** The whole list, replacing the previous one; empty clears the plan. */
+  set(items: PlanItem[]): void;
 }
 
 export interface ToolResult {
@@ -109,6 +169,8 @@ export interface ToolResult {
   diff?: DiffShown;
   /** The file a change wrote (with `diff`), relative to the project root: which project checks run after the step. */
   changed?: string;
+  /** The plan tool's list after the call, for the screen only (like `diff`: never sent to the model or a trajectory; the call already holds it). */
+  plan?: PlanItem[];
   isError?: boolean;
   /** The user said no: the agent stops so they can say what to do instead. */
   declined?: boolean;
@@ -119,6 +181,8 @@ export interface ToolResult {
    * it needed none.
    */
   approval?: "auto" | "interrupted" | Decision;
+  /** The door the call went through (for trajectories); absent for an ordinary call. */
+  door?: Door;
 }
 
 /**
@@ -136,14 +200,24 @@ export interface Tool<S extends z.ZodType = z.ZodType> {
   kind?: "read" | "write" | "execute";
   /** Calls of this tool that come together in one reply run at the same time (subagents). */
   parallel?: boolean;
+  /**
+   * Whether runTool takes the turn's checkpoint before a call runs. Default: any `kind` but "read". False for tools
+   * that change nothing in the project (MCP servers act outside it, memory writes ~/.marv, a subagent's own calls
+   * take it themselves).
+   */
+  checkpoint?: boolean;
   /** Overrides `kind` for one call: whether it needs the user's approval. */
   needsApproval?(input: z.infer<S>): boolean;
   /** Whether this call can reach the network (approvals inside a worktree still ask then). */
-  usesNetwork?(input: z.infer<S>): boolean;
+  usesNetwork?(input: z.infer<S>, ctx: ToolContext): boolean;
   /** What the approval prompt shows. Throw a ToolError here for a call that can't succeed, so the user isn't asked to approve it. */
   preview?(input: z.infer<S>, ctx: ToolContext): Promise<Preview>;
   /** What "don't ask again" covers. */
-  scope?(input: z.infer<S>): Scope;
+  scope?(input: z.infer<S>, ctx: ToolContext): Scope;
+  /** The door this call leaves the sandbox through, if any: copied onto its ApprovalRequest and its result. */
+  door?(input: z.infer<S>, ctx: ToolContext): Door | undefined;
+  /** Whether this call must be asked every time (ApprovalRequest.once): no "don't ask again", ever. */
+  once?(input: z.infer<S>, ctx: ToolContext): boolean;
   /**
    * Whether yolo mode may run this call without asking: what it can change is
    * confined to the project (never its .git, whose hooks and config git runs

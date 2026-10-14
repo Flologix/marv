@@ -82,6 +82,12 @@ export function subagentContext(ctx: ToolContext, who: string, worktree?: Worktr
     readOnly: worktree ? [...(worktree.prefix ? [worktree.dir] : []), worktree.gitDir] : undefined,
     gitEnv: worktree && worktreeEnv(worktree),
     approve: subagentApprove(ctx.approve, who, Boolean(worktree) && sandboxed),
+    // Its sandboxed bash reaches the session's background processes like the main agent's (curl localhost:<port>);
+    // starting one is the main agent's alone (no processes, no doors).
+    forwards: ctx.forwards,
+    // A shared-folder subagent edits the same files in the same turn: the turn's one checkpoint covers it. A
+    // worktree's changes land on its branch, which is already the way back.
+    checkpoint: worktree ? undefined : ctx.checkpoint,
   };
 }
 
@@ -121,11 +127,15 @@ export async function runSubagent(input: SubagentInput, ctx: ToolContext): Promi
   // worktree is finished (its changes committed, its folder removed) however
   // the subagent ends: a reply, an error, ctrl+c, a "no", or a throw.
   try {
-    // Only subagent tools (never agent or memory, whatever the type lists),
-    // and skill only when there are skills to load.
+    // Only subagent tools (never agent or memory, whatever the type lists), skill only when there are skills to
+    // load, and github only where the session offers it (its main agent has the door; the subagent only reads).
     const hasSkills = (ctx.skills?.length ?? 0) > 0;
     const available = tools.filter(
-      (t) => SUBAGENT_TOOLS.includes(t.name) && type.tools.includes(t.name) && (t.name !== "skill" || hasSkills),
+      (t) =>
+        SUBAGENT_TOOLS.includes(t.name) &&
+        type.tools.includes(t.name) &&
+        (t.name !== "skill" || hasSkills) &&
+        (t.name !== "github" || Boolean(ctx.doors?.github)),
     );
     const names = available.map((t) => t.name);
     const subCtx = subagentContext(ctx, who, worktree);

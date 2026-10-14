@@ -52,6 +52,45 @@ export interface RunResult {
   mcpTools?: string;
   /** MCP tools run (mcp_call, or an mcp__ tool offered directly). */
   mcpCalls?: number;
+  /** Whether the plan tool was offered (--plan; #15). */
+  plan?: boolean;
+  /** Calls to the plan tool. */
+  planCalls?: number;
+  /** The run ended with an answer while its last plan still had unfinished items: the model let it go stale. */
+  planOpen?: boolean;
+  /** The hidden check's tests that passed, and how many it ran (from bun test's summary): partial credit. */
+  testsPassed?: number;
+  testsTotal?: number;
+}
+
+/**
+ * The plan tool's measures from a run's plan calls (their arguments and whether the tool refused them, in order) and
+ * how it ended: how often the model planned, and whether it answered with its last accepted plan still unfinished.
+ * Every call counts as an attempt; only one the tool accepted replaced the plan (a 21-item call is readable but
+ * refused). Only an answer ("end") counts as letting it go stale: a run cut off by the step limit or a timeout didn't
+ * choose to stop.
+ */
+export function planOutcome(calls: { arguments: string; isError?: boolean }[], reason: string): { planCalls: number; planOpen: boolean } {
+  let last: { status?: unknown }[] | null = null;
+  for (const call of calls) {
+    if (call.isError) continue;
+    try {
+      const items = (JSON.parse(call.arguments) as { items?: unknown }).items;
+      if (Array.isArray(items)) last = items as { status?: unknown }[];
+    } catch {
+      // Not readable here: the plan is still the previous one.
+    }
+  }
+  return { planCalls: calls.length, planOpen: reason === "end" && Boolean(last?.some((i) => i?.status !== "done")) };
+}
+
+/** Passed and total tests from a `bun test` summary (" 5 pass", " 1 fail"), or nothing when there's none to read. */
+export function testCounts(output: string): { testsPassed?: number; testsTotal?: number } {
+  const pass = /^\s*(\d+) pass\b/m.exec(output);
+  const fail = /^\s*(\d+) fail\b/m.exec(output);
+  if (!pass || !fail) return {};
+  const testsPassed = Number(pass[1]);
+  return { testsPassed, testsTotal: testsPassed + Number(fail[1]) };
 }
 
 export interface SummaryRow {
@@ -66,6 +105,13 @@ export interface SummaryRow {
   /** Prompt tokens over all requests: per request, what deferring MCP tools (#14) should move. */
   promptTokens: number;
   mcpCalls: number;
+  /** Tests passed and run, over the runs that reported them (#15). */
+  testsPassed: number;
+  testsTotal: number;
+  /** Plan calls, and runs that answered with the plan unfinished; `planRuns` counts the runs that recorded them. */
+  planCalls: number;
+  planOpen: number;
+  planRuns: number;
   cost: number;
   medianMs: number;
   /** Which runs the row is (label and model), for the per-task grid. */
@@ -99,6 +145,11 @@ export function summarizeRuns(results: RunResult[]): SummaryRow[] {
       requests: runs.reduce((n, r) => n + r.requests, 0),
       promptTokens: runs.reduce((n, r) => n + r.promptTokens, 0),
       mcpCalls: runs.reduce((n, r) => n + (r.mcpCalls ?? 0), 0),
+      testsPassed: runs.reduce((n, r) => n + (r.testsPassed ?? 0), 0),
+      testsTotal: runs.reduce((n, r) => n + (r.testsTotal ?? 0), 0),
+      planCalls: runs.reduce((n, r) => n + (r.planCalls ?? 0), 0),
+      planOpen: runs.filter((r) => r.planOpen).length,
+      planRuns: runs.filter((r) => r.planCalls !== undefined).length,
       cost: runs.reduce((n, r) => n + r.cost, 0),
       medianMs: median(runs.map((r) => r.ms)),
       group: groupKey(runs[0]!),
@@ -119,7 +170,13 @@ export function formatSummary(results: RunResult[]): string {
   const rows = summarizeRuns(results);
   // Likewise MCP calls: only runs with a server make any.
   const showMcp = rows.some((r) => r.mcpCalls);
-  const head = ["label", "model", "runs", "pass", "edits", "edit fail", "steps/run", "tools/run", ...(showMcp ? ["mcp/run"] : []), "prompt/req", "$/run", "$ total", "median"];
+  // Partial credit and the plan tool's measures (#15): only runs that recorded them.
+  const showTests = rows.some((r) => r.testsTotal);
+  const showPlan = rows.some((r) => r.planRuns);
+  const head = [
+    "label", "model", "runs", "pass", ...(showTests ? ["tests"] : []), "edits", "edit fail", "steps/run", "tools/run",
+    ...(showMcp ? ["mcp/run"] : []), ...(showPlan ? ["plan/run", "plan open"] : []), "prompt/req", "$/run", "$ total", "median",
+  ];
   const overview = table([
     head,
     ...rows.map((r) => [
@@ -127,11 +184,13 @@ export function formatSummary(results: RunResult[]): string {
       r.model,
       String(r.runs),
       pct(r.passed, r.runs),
+      ...(showTests ? [pct(r.testsPassed, r.testsTotal)] : []),
       String(r.editCalls),
       pct(r.editErrors, r.editCalls),
       (r.requests / r.runs).toFixed(1),
       (r.toolCalls / r.runs).toFixed(1),
       ...(showMcp ? [(r.mcpCalls / r.runs).toFixed(1)] : []),
+      ...(showPlan ? [r.planRuns ? (r.planCalls / r.planRuns).toFixed(1) : "-", r.planRuns ? String(r.planOpen) : "-"] : []),
       r.requests ? String(Math.round(r.promptTokens / r.requests)) : "-",
       (r.cost / r.runs).toFixed(4),
       r.cost.toFixed(3),

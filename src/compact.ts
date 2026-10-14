@@ -7,6 +7,8 @@
 // summary: the cache starts over once, deliberately. The transcript the user
 // sees is not touched.
 import type { ChatTurn, Provider, ToolSpec, Usage } from "./provider/types.ts";
+import { planOpen } from "./tools/plan.ts";
+import type { PlanItem } from "./tools/types.ts";
 
 /** Compact before the next message once this much of the context window is used. */
 export const COMPACT_AT = 0.85;
@@ -62,10 +64,22 @@ export async function summarize({ provider, history, system, tools, signal, focu
   return text.trim() ? { summary: text.trim() } : { error: "The model returned an empty summary." };
 }
 
-/** The model's history after compacting: the summary, acknowledged. */
-export function compactedHistory(summary: string): ChatTurn[] {
+const STATUS: Record<PlanItem["status"], string> = { done: "done", in_progress: "in progress", pending: "pending" };
+
+/**
+ * The plan as it stood, for the summary's message (#15): the summary replaces the plan calls the model made, so the
+ * session's own copy goes in instead, as structured text rather than the model's paraphrase.
+ */
+export function planText(items: PlanItem[]): string {
+  const lines = items.map((i) => `- [${STATUS[i.status]}] ${i.text}`);
+  return `Your plan (from the plan tool), as it stood:\n${lines.join("\n")}\nKeep updating it with the plan tool.`;
+}
+
+/** The model's history after compacting: the summary, acknowledged, with the plan when one has something left to do. */
+export function compactedHistory(summary: string, plan?: PlanItem[] | null): ChatTurn[] {
+  const kept = planOpen(plan) ? `\n\n${planText(plan)}` : "";
   return [
-    { role: "user", text: `This conversation was compacted to save space. Here is a summary of everything before this point:\n\n${summary}` },
+    { role: "user", text: `This conversation was compacted to save space. Here is a summary of everything before this point:\n\n${summary}${kept}` },
     { role: "assistant", text: "Got it. I have the context from the summary and will continue from here." },
   ];
 }

@@ -6,7 +6,7 @@ import { applyEvent, createAgentLog, type AgentLog } from "./agent-log.ts";
 import { GENERAL_PURPOSE, type AgentType } from "./agents.ts";
 import { copyToClipboard } from "./clipboard.ts";
 import type { HerdrReporter } from "./herdr.ts";
-import { checksStatus, commands, diagnosticsStatus, isCommand, runCommand, stepsStatus, trajectoriesStatus, yoloStatus } from "./commands/index.ts";
+import { checkpointsStatus, checksStatus, commands, diagnosticsStatus, isCommand, runCommand, stepsStatus, trajectoriesStatus, yoloStatus } from "./commands/index.ts";
 import {
   needsSetup,
   PRESETS,
@@ -26,7 +26,7 @@ import type { Provider, Usage } from "./provider/types.ts";
 import { selection } from "./selection.ts";
 import { costText, emptyTotals, tokens, type Totals } from "./usage.ts";
 import { addMemory, findMemory, loadMemory, removeMemory, type Memories, type MemoryPaths } from "./memory.ts";
-import { MarvSession, type CompactResult, type Resumed } from "./session.ts";
+import { MarvSession, type CompactResult, type Resumed, type SessionEvent } from "./session.ts";
 import { timeAgo, type SessionStore, type SessionSummary } from "./sessions.ts";
 import { skillMessage, type Skill } from "./skills.ts";
 import type { TrajectoryStore } from "./trajectory.ts";
@@ -39,8 +39,9 @@ import { searchRegistry, searchText, type RegistryHit } from "./mcp/install/regi
 import { parseAddArgs, type AddOptions } from "./mcp/install/source.ts";
 import { addPersonalServer, personalServerNames, removePersonalServer } from "./mcp/personal-file.ts";
 import { printable } from "./printable.ts";
-import type { AgentProgress, ApprovalRequest, Decision } from "./tools/types.ts";
+import type { AgentProgress, ApprovalRequest, Decision, PlanItem } from "./tools/types.ts";
 import { checkNotice } from "./diagnostics/turn.ts";
+import { undoRequest, undoSummary, type UndoPlan, type UndoRefusal } from "./checkpoints/undo.ts";
 import { projectCheckNotice, type ProjectCheckResult } from "./checks/kind.ts";
 import { loadChecks, type ProjectCheck } from "./checks/load.ts";
 import { hiddenPathFoldersItem } from "./commands/sandbox-notice.ts";
@@ -48,6 +49,7 @@ import { instructionsCutItem, type InstructionsCut } from "./prompt.ts";
 import type { CommandAction } from "./commands/index.ts";
 import type { Message, Notice, NoticeItem, NoticeTone } from "./types.ts";
 import { AgentView, AgentViewHeader } from "./ui/AgentView.tsx";
+import { PLAN_MIN_WINDOW, PlanView } from "./ui/PlanView.tsx";
 import { Approval } from "./ui/Approval.tsx";
 import { SessionPicker } from "./ui/SessionPicker.tsx";
 import { MessageView } from "./ui/MessageView.tsx";
@@ -114,6 +116,13 @@ function loginResult(s: McpServerStatus): { text: string; isError: boolean } {
 const DEFAULT_AGENTS: AgentType[] = [GENERAL_PURPOSE];
 const NO_PROBLEMS: string[] = [];
 
+/** What the waiting line says while a turn is between replies; nothing for the rest. */
+const WAITING_LABEL: Partial<Record<Extract<SessionEvent, { type: "status" }>["status"], string>> = {
+  waiting_for_mcp: "Waiting for MCP servers to start…",
+  checking: "Checking…",
+  checkpointing: "Saving a checkpoint…",
+};
+
 /** The project's checks for /checks, read when it runs (a check can be added at any time); other commands skip the disk. */
 function checksOnDisk(root: string, text: string): { list: ProjectCheck[]; problems: string[] } {
   if (!/^\/checks\b/.test(text.trim())) return { list: [], problems: [] };
@@ -162,6 +171,8 @@ interface Props {
   openUrl?: (url: URL) => void;
   /** Hands cli.tsx a function to run before the process exits: saves the session and flushes the trajectory. */
   onFlush?: (flush: () => Promise<void>) => void;
+  /** Hands cli.tsx a function that stops the background processes (#51) on the way out: nothing outlives Marv. */
+  onStopProcesses?: (stop: () => Promise<void>) => void;
   /** Start by resuming: the latest session here (marv -c), or a picker (marv -r). */
   resume?: "latest" | "pick";
   /** Where memory lives, and what it held at startup. */
@@ -175,8 +186,12 @@ interface Props {
   instructionsCut?: InstructionsCut;
   /** Where subagents' worktrees go (~/.marv/worktrees/<project>); without it, no worktrees. */
   worktreesDir?: string;
+  /** Marv's own git dir for checkpoints outside a repository (~/.marv/checkpoints/<project>); without it, none there. */
+  checkpointsDir?: string;
   /** Running in a Herdr pane: Marv reports its state there (src/herdr.ts). */
   herdr?: HerdrReporter;
+  /** gh is there and logged in (checked once at startup): the session offers the github tool (#47). */
+  github?: boolean;
 }
 
 // "model" is the /model picker: the setup screen, starting at the model step.
@@ -204,6 +219,7 @@ export function App({
   searchMcp,
   openUrl = defaultOpenUrl,
   onFlush,
+  onStopProcesses,
   resume,
   memory,
   agents = DEFAULT_AGENTS,
@@ -211,7 +227,9 @@ export function App({
   hiddenPathFolders = NO_PROBLEMS,
   instructionsCut,
   worktreesDir,
+  checkpointsDir,
   herdr,
+  github = false,
 }: Props) {
   const { exit } = useApp();
   const { columns, rows } = useWindowSize();
@@ -276,6 +294,8 @@ export function App({
   const agentLogs = useRef(new Map<string, AgentLog>());
   // The subagent whose view is open, if any; `logVersion` moves when its log changed.
   const [viewing, setViewing] = useState<string | null>(null);
+  /** The plan tool's list (#15), pinned above the prompt while it has something left to do. */
+  const [plan, setPlan] = useState<readonly PlanItem[] | null>(null);
   const viewingRef = useRef(viewing);
   viewingRef.current = viewing;
   const [logVersion, setLogVersion] = useState(0);
@@ -316,11 +336,13 @@ export function App({
       const [head, ...rest] = approvals.current;
       if (!head) return;
       let remaining = rest;
-      if (decision === "always") {
-        // The session remembers the scope from now on; requests already waiting in it are covered too.
+      if (decision === "always" && !head.request.once) {
+        // The session remembers the scope from now on; requests already waiting in it are covered too, except the
+        // ones asked every time (`once`: a door to the host).
         const key = head.request.scope.key;
-        for (const pending of rest) if (pending.request.scope.key === key) pending.resolve("yes");
-        remaining = rest.filter((pending) => pending.request.scope.key !== key);
+        const covered = (pending: (typeof rest)[number]) => pending.request.scope.key === key && !pending.request.once;
+        for (const pending of rest) if (covered(pending)) pending.resolve("yes");
+        remaining = rest.filter((pending) => !covered(pending));
       }
       approvals.current = remaining;
       showApprovals();
@@ -384,9 +406,14 @@ export function App({
         mcp,
         approve,
         sandbox: config.sandbox,
+        // The user approves each command at this terminal: bash may ask to run one on the host (#52).
+        hostCommands: true,
+        github,
         yolo: config.yolo,
         diagnostics: config.diagnostics,
         checks: config.checks,
+        checkpoints: config.checkpoints,
+        checkpointsDir,
         mcpTools: config.mcpTools,
         maxSteps: config.maxSteps,
         sessions,
@@ -398,6 +425,8 @@ export function App({
         onWarning: (text) => addMessage({ role: "system", text, isError: true }),
       }),
   );
+  // Background processes running (#51), for the status bar; the session's onChange re-renders when one starts or ends.
+  const processesRunning = session.processes.filter((p) => p.state === "running").length;
   // The project checks' last pass, for /checks.
   const lastChecks = useRef<ProjectCheckResult | undefined>(undefined);
   // Settings changed (setup, /model, /think, /sandbox, /yolo, /trajectories, /diagnostics, /checks): the session uses them from its next turn.
@@ -412,6 +441,7 @@ export function App({
       trajectories: config.trajectories,
       diagnostics: config.diagnostics,
       checks: config.checks,
+      checkpoints: config.checkpoints,
       mcpTools: config.mcpTools,
       maxSteps: config.maxSteps,
     });
@@ -453,6 +483,7 @@ export function App({
     agentLogs.current.clear();
     setViewing(null);
     setUsage(null);
+    setPlan(null);
     setItems([{ kind: "welcome", id: "welcome-0" }]);
   }, [session, addMessage]);
 
@@ -576,9 +607,12 @@ export function App({
           }
           switch (event.type) {
             case "status":
-              setWaitingFor(event.status === "waiting_for_mcp" ? "Waiting for MCP servers to start…" : event.status === "checking" ? "Checking…" : null);
+              setWaitingFor(WAITING_LABEL[event.status] ?? null);
               setCompacting(event.status === "compacting");
               if (event.status === "running") stepStarted = Date.now(); // the wait for the next reply starts after a check
+              break;
+            case "checkpoint":
+              addMessage({ role: "system", isError: true, text: `This turn can't be undone: its checkpoint failed (${event.message}).` });
               break;
             case "check": {
               const notice = checkNotice(event.result);
@@ -684,6 +718,8 @@ export function App({
               const summary = result.isError && result.summary === "error" ? result.output.split("\n")[0] : result.summary;
               const status = result.declined ? "declined" : result.isError ? "error" : "done";
               if (entry) updateMessage(entry.line, { tool: { label: result.label, status, summary, steps: callSteps, diff: result.diff } });
+              // The main agent's plan call: a new list (an empty one clears it). Subagents have no plan tool.
+              if (event.call.name === "plan" && result.plan) setPlan(result.plan.length ? result.plan : null);
               const log = logs.get(event.call.id);
               if (log) {
                 // It may have ended before its loop started (a failed check): either way it's over now.
@@ -840,6 +876,8 @@ export function App({
       trajectoriesPath: trajectories && shortenHome(join(trajectories.dir, projectKey(root))),
       mcp: { servers: mcp?.status() ?? [], problems: mcpProblems },
       checks: { ...checksOnDisk(root, text), last: lastChecks.current },
+      processes: session.processesOffered ? session.processes : undefined,
+      checkpoints: session.checkpointProblem(),
     });
     switch (action.type) {
       case "print":
@@ -871,6 +909,17 @@ export function App({
       case "compact":
         void compact(action.focus);
         break;
+      case "processes": {
+        const name = action.stop;
+        void session.stopProcess(name).then((stopped) =>
+          addMessage(
+            stopped
+              ? { role: "system", text: `Stopped ${name}.` }
+              : { role: "system", text: `No background process named "${name}". /processes lists them.`, isError: true },
+          ),
+        );
+        break;
+      }
       case "resume":
         void openPicker();
         break;
@@ -890,6 +939,12 @@ export function App({
         break;
       case "checks":
         void saveConfig({ ...(file ?? { provider: config.provider }), checks: action.on }, `Checks ${checksStatus({ ...config, checks: action.on })}`);
+        break;
+      case "checkpoints":
+        void saveConfig({ ...(file ?? { provider: config.provider }), checkpoints: action.on }, `Checkpoints ${checkpointsStatus({ ...config, checkpoints: action.on })}`);
+        break;
+      case "undo":
+        void undoTurn();
         break;
       case "diagnostics":
         void saveConfig({ ...(file ?? { provider: config.provider }), diagnostics: action.on }, `Diagnostics ${diagnosticsStatus({ ...config, diagnostics: action.on })}`);
@@ -1125,6 +1180,43 @@ export function App({
     }
   };
 
+  /**
+   * /undo: the last turn's changes, shown like an approval (each file's diff), and on a yes put back. Outside a turn
+   * only (a turn could be writing the same files); nothing is written before the yes.
+   */
+  const undoTurn = async () => {
+    if (abortRef.current) {
+      addMessage({ role: "system", isError: true, text: "Marv is working: stop the current turn (Esc) before /undo." });
+      return;
+    }
+    let plan: UndoPlan | UndoRefusal;
+    try {
+      plan = await busyWith("Reading the checkpoints…", () => session.undoPlan());
+    } catch (err) {
+      addMessage({ role: "system", isError: true, text: `Couldn't read the checkpoints: ${(err as Error).message}` });
+      return;
+    }
+    if ("reason" in plan) {
+      if (plan.failed) addMessage({ role: "system", isError: true, text: `Couldn't undo: ${plan.reason}.` });
+      else addMessage({ role: "system", text: `Nothing to undo: ${plan.reason.replace(/^nothing to undo: /, "")}.` });
+      return;
+    }
+    if (plan.files.length === 0) {
+      addMessage({ role: "system", text: `Turn ${plan.turn} changed nothing in this project's folder, so there's nothing to undo.` });
+      return;
+    }
+    if ((await approve(undoRequest(plan))) !== "yes") {
+      addMessage({ role: "system", text: "Nothing was undone." });
+      return;
+    }
+    try {
+      const result = await busyWith("Undoing…", () => session.undo(plan));
+      addMessage({ role: "system", text: undoSummary(plan, result) });
+    } catch (err) {
+      addMessage({ role: "system", isError: true, text: `Couldn't undo: ${(err as Error).message}` });
+    }
+  };
+
   /** /mcp search: the MCP Registry's latest, active entries. */
   const findMcp = async (words: string) => {
     try {
@@ -1306,6 +1398,9 @@ export function App({
   useEffect(() => {
     onFlush?.(() => session.flush());
   }, [onFlush, session]);
+  useEffect(() => {
+    onStopProcesses?.(() => session.stopProcesses());
+  }, [onStopProcesses, session]);
 
   const WORKING = "Marv is working: stop the current turn (Esc) before resuming another session.";
 
@@ -1315,6 +1410,7 @@ export function App({
       selection.reset();
       agentLogs.current.clear();
       setViewing(null);
+      setPlan(resumed.plan);
       // Never lower it: an update still on its way for a message of this process must not hit a restored one.
       nextId.current = Math.max(nextId.current, Math.max(0, ...resumed.transcript.map((m) => m.id)) + 1);
       syncUsage();
@@ -1481,9 +1577,11 @@ export function App({
 
   const view = viewing ? agentLogs.current.get(viewing) : undefined;
 
+  // An approval listing files (/undo) scrolls that list with PgUp/PgDn and the wheel: the transcript stays put.
+  const filesShown = Boolean(approval && !setupMode && approval.head.request.preview.files?.length);
   return (
     <Box flexDirection="column" height={rows} width={columns}>
-      <ScrollView followKey={followKey} isActive={setupMode === null} onViewport={selection.setViewport} hidden={view !== undefined}>
+      <ScrollView followKey={followKey} isActive={setupMode === null && !filesShown} onViewport={selection.setViewport} hidden={view !== undefined}>
         <Transcript
           items={items}
           version={version}
@@ -1507,10 +1605,12 @@ export function App({
 
       {view && <AgentViewHeader log={view} />}
       {view && (
-        <ScrollView key={viewing} isActive={setupMode === null} onViewport={selection.setViewport}>
+        <ScrollView key={viewing} isActive={setupMode === null && !filesShown} onViewport={selection.setViewport}>
           <AgentView log={view} version={logVersion} showSteps={showSteps} />
         </ScrollView>
       )}
+
+      {rows >= PLAN_MIN_WINDOW && <PlanView items={plan} width={columns} />}
 
       <Box flexDirection="column" flexShrink={0}>
         {picker && !setupMode && !approval ? (
@@ -1525,7 +1625,7 @@ export function App({
               onCancel={cancelAll}
               escapeCancels={!view}
             />
-            <StatusBar model={session.providerName} cwd={cwd} confirmExit={false} notice={notice} busy agents={agentsRunning} yolo={config.yolo} viewing={Boolean(view)} />
+            <StatusBar model={session.providerName} cwd={cwd} confirmExit={false} notice={notice} busy agents={agentsRunning} processes={processesRunning} yolo={config.yolo} viewing={Boolean(view)} />
           </>
         ) : setupMode ? (
           <Setup
@@ -1554,6 +1654,7 @@ export function App({
               notice={notice}
               busy={busy}
               agents={agentsRunning}
+              processes={processesRunning}
               yolo={config.yolo}
               viewing={Boolean(view)}
             />

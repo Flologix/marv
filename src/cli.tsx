@@ -19,6 +19,7 @@ import { SessionStore } from "./sessions.ts";
 import { TrajectoryStore } from "./trajectory.ts";
 import { loadMcpConfig } from "./mcp/config.ts";
 import { McpManager } from "./mcp/manager.ts";
+import { githubAvailable, githubWanted } from "./tools/github/github.ts";
 import { McpTokenStore } from "./mcp/oauth-store.ts";
 import { McpTrust } from "./mcp/trust.ts";
 import { loadMemory, memoryPaths } from "./memory.ts";
@@ -149,6 +150,9 @@ if (promptIndex !== -1) {
 
 // The project is wherever Marv was started; the tools can't reach outside it.
 const root = process.cwd();
+// Whether to offer the github tool (#47): asked of gh once, alongside the rest of startup, since the tool list is
+// fixed for the session. At most 2 s (gh auth status asks GitHub; offline it falls back to gh's hosts.yml).
+const githubCheck = githubWanted(process.env) ? githubAvailable() : Promise.resolve(false);
 const agentsMd = await readInstructions(root);
 const { skills, problems: skillProblems } = await loadSkills({ root, home: homedir() });
 const { agents, problems: agentProblems } = await loadAgents({ root, home: homedir() });
@@ -196,8 +200,10 @@ if (process.stdin.isTTY && process.stdout.isTTY) {
 // In a Herdr pane, Herdr shows what Marv is doing (src/herdr.ts).
 const herdrPane = herdrTarget(process.env);
 const herdr = herdrPane && new HerdrReporter(herdrPane);
+const github = await githubCheck;
 
 let flush: () => Promise<void> = async () => {};
+let stopProcesses: () => Promise<void> = async () => {};
 const instance = render(
   <App
     store={store}
@@ -210,16 +216,19 @@ const instance = render(
     instructionsCut={agentsMd?.cut}
     skills={skills}
     skillProblems={skillProblems}
+    github={github}
     hiddenPathFolders={hiddenPathFolders(process.env.PATH ?? "", homedir(), root).map((dir) => shortenHome(dir))}
     agents={agents}
     agentProblems={agentProblems}
     worktreesDir={join(defaultConfigDir(process.env), "worktrees", projectKey(root))}
+    checkpointsDir={join(defaultConfigDir(process.env), "checkpoints", projectKey(root))}
     sessions={new SessionStore(join(defaultConfigDir(process.env), "sessions"))}
     trajectories={new TrajectoryStore(join(defaultConfigDir(process.env), "trajectories"))}
     mcp={mcp}
     mcpProblems={mcpProblems}
     herdr={herdr}
     onFlush={(f) => (flush = f)}
+    onStopProcesses={(stop) => (stopProcesses = stop)}
     memory={memory}
     resume={args.includes("-c") || args.includes("--continue") ? "latest" : args.includes("-r") || args.includes("--resume") ? "pick" : undefined}
   />,
@@ -231,6 +240,9 @@ selection.repaint = instance.repaint;
 await instance.waitUntilExit();
 // The last turn and pending trajectory records reach the disk (quitting cancels the delayed save).
 await Promise.race([flush(), Bun.sleep(2000)]);
+// Background processes stop with Marv (#51): SIGTERM, then SIGKILL after 2 s; their sandboxes also die with Marv if
+// it's killed harder (bwrap's --die-with-parent).
+await Promise.race([stopProcesses(), Bun.sleep(2500)]);
 // Let servers shut down cleanly, but don't hang on one that won't.
 await Promise.race([mcp.close(), Bun.sleep(2000)]);
 // Herdr stops showing an agent in this pane; no waiting on a Herdr that doesn't answer.

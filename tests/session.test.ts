@@ -1018,6 +1018,12 @@ describe("final review fixes", () => {
     expect(() => makeSession(new ScriptedProvider([]), { tools: [custom("skill")] })).toThrow(/"skill" is already built in/);
   });
 
+  test("plan and process are free names where the session doesn't offer them (plan: false, processes: false)", () => {
+    expect(() => makeSession(new ScriptedProvider([]), { tools: [custom("plan")] })).toThrow(/"plan" is already built in/);
+    expect(() => makeSession(new ScriptedProvider([]), { tools: [custom("plan")], plan: false })).not.toThrow();
+    expect(() => makeSession(new ScriptedProvider([]), { tools: [custom("process")], processes: false })).not.toThrow();
+  });
+
   test("two tools of your own can't share a name", () => {
     expect(() => makeSession(new ScriptedProvider([]), { tools: [custom("x"), custom("x")] })).toThrow('Two tools are named "x".');
   });
@@ -1197,7 +1203,7 @@ describe("deferred MCP tools (#14)", () => {
   const used = (promptTokens: number): AgentEvent => ({ type: "usage", usage: { promptTokens, completionTokens: 0 } });
   const tools = [fakeTool("mcp__x__a", { kind: "read" }), fakeTool("mcp__x__b", { kind: "read" })];
   const specsOf = (ts: Tool[]): ToolSpec[] => ts.map((t) => ({ name: t.name, description: t.description, parameters: { type: "object", properties: {} } }));
-  const builtinNames = toolSpecsFor({ hasSkills: false }).map((s) => s.name);
+  const builtinNames = toolSpecsFor({ hasSkills: false, process: sandboxAvailable() }).map((s) => s.name);
   const NOTE = "Marv: MCP tools you can use (not loaded: call tool_search with their names to see their parameters, then run one with mcp_call):";
   const lastUser = (p: ScriptedProvider, i: number) => p.requests[i]!.history.findLast((t) => t.role === "user")!.text;
   const ready = (ts: Tool[] = tools) => fakeMcp(Promise.resolve(), specsOf(ts), [...ts]);
@@ -1394,5 +1400,140 @@ describe("a long AGENTS.md (#40)", () => {
     for (const r of provider.requests) expect(r.options.system).toBe(system);
     const result = provider.requests[1]!.history.find((t) => t.role === "tool");
     expect(result).toMatchObject({ role: "tool", text: expect.stringContaining(`${conventions.line}→## Conventions`) });
+  });
+});
+
+describe("the plan (#15)", () => {
+  const items = [
+    { text: "Read the report command", status: "done" },
+    { text: "Add the --json flag", status: "in_progress" },
+    { text: "Update README and CHANGELOG", status: "pending" },
+  ] as const;
+  const planCall = (id: string, list: readonly unknown[] = items) => call(id, "plan", { items: list });
+
+  test("a plan call sets session.plan; the system prompt and specs stay byte-identical", async () => {
+    const provider = new ScriptedProvider([useTools(planCall("p1")), say("Working."), say("More.")]);
+    const session = makeSession(provider);
+    expect(session.plan).toBeNull();
+    const events = await collect(session.send("do three things"));
+    expect(session.plan).toEqual([...items]);
+    const end = events.find((e) => e.type === "tool_end");
+    expect(end).toMatchObject({ result: { output: "Plan saved: 1 of 3 done; now: Add the --json flag.", plan: [...items] } });
+    // The model got only the line; the list is in its own call.
+    expect(provider.requests[1]!.history.at(-1)).toEqual({ role: "tool", callId: "p1", name: "plan", text: "Plan saved: 1 of 3 done; now: Add the --json flag." });
+    await collect(session.send("and then?"));
+    const [a, b, c] = provider.requests;
+    expect(a!.options.tools!.map((t) => t.name)).toContain("plan");
+    for (const r of [b!, c!]) {
+      expect(r.options.system).toBe(a!.options.system);
+      expect(r.options.tools).toBe(a!.options.tools);
+    }
+    expect(a!.options.system).toContain("keep a plan with the plan tool");
+  });
+
+  test("an empty list clears it; clear() drops it", async () => {
+    const session = makeSession(new ScriptedProvider([useTools(planCall("p1")), say("Ok."), useTools(planCall("p2", [])), say("Cleared."), useTools(planCall("p3")), say("Again.")]));
+    await collect(session.send("plan"));
+    expect(session.plan).not.toBeNull();
+    await collect(session.send("drop it"));
+    expect(session.plan).toBeNull();
+    await collect(session.send("plan again"));
+    expect(session.plan).not.toBeNull();
+    await session.clear();
+    expect(session.plan).toBeNull();
+  });
+
+  test("saved with the session, and restored by resume()", async () => {
+    const sessions = new SessionStore(dir);
+    const a = makeSession(new ScriptedProvider([useTools(planCall("p1")), say("Planned.")]), { sessions });
+    await collect(a.send("plan it"));
+    await a.flush();
+    expect((await sessions.load(project, a.id))?.plan).toEqual([...items]);
+    const b = makeSession(new ScriptedProvider([]), { sessions });
+    const resumed = await b.resume(a.id);
+    expect(resumed?.plan).toEqual([...items]);
+    expect(b.plan).toEqual([...items]);
+  });
+
+  test("resumed into a session with plan: false, an unfinished saved plan isn't restored, nor handed to compaction (Greptile on #71)", async () => {
+    const sessions = new SessionStore(dir);
+    const a = makeSession(new ScriptedProvider([useTools(planCall("p1")), say("Planned.")]), { sessions });
+    await collect(a.send("plan it"));
+    await a.flush();
+    const provider = new ScriptedProvider([say("The summary."), say("Ok.")]);
+    const b = makeSession(provider, { sessions, plan: false });
+    const resumed = await b.resume(a.id);
+    expect(resumed?.plan).toBeNull();
+    expect(b.plan).toBeNull();
+    await b.compact();
+    await collect(b.send("go on"));
+    const history = JSON.stringify(provider.requests.at(-1)!.history);
+    expect(history).toContain("The summary.");
+    expect(history).not.toContain("plan tool");
+  });
+
+  test("a malformed saved plan is dropped; the session still loads", async () => {
+    const sessions = new SessionStore(dir);
+    const a = makeSession(new ScriptedProvider([say("Hi.")]), { sessions });
+    await collect(a.send("hi"));
+    await a.flush();
+    const file = sessions.file(project, a.id);
+    const saved = JSON.parse(await readFile(file, "utf8"));
+    await writeFile(file, JSON.stringify({ ...saved, plan: [{ text: "x", status: "started" }] }));
+    const b = makeSession(new ScriptedProvider([]), { sessions });
+    const resumed = await b.resume(a.id);
+    expect(resumed?.id).toBe(a.id);
+    expect(resumed?.plan).toBeNull();
+    expect(b.plan).toBeNull();
+  });
+
+  test("plan: false leaves it out of every request and the system prompt; a call to it is unknown", async () => {
+    const provider = new ScriptedProvider([useTools(planCall("p1")), say("Ok.")]);
+    const session = makeSession(provider, { plan: false });
+    const events = await collect(session.send("plan"));
+    for (const r of provider.requests) {
+      expect(r.options.tools!.map((t) => t.name)).not.toContain("plan");
+      expect(r.options.system).not.toContain("plan tool");
+    }
+    const end = events.find((e) => e.type === "tool_end");
+    expect(end?.type === "tool_end" && end.result.isError).toBe(true);
+    expect(end?.type === "tool_end" ? end.result.output : "").toStartWith('Unknown tool "plan"');
+    expect(session.plan).toBeNull();
+  });
+
+  test("a subagent is offered no plan, and its call to one fails", async () => {
+    const sub = new ScriptedProvider([useTools(planCall("s1")), say("Found them.")]);
+    const provider = new RoutedProvider({
+      "parent-task": new ScriptedProvider([useTools(call("a1", "agent", { description: "look around", prompt: "sub-task: find the notes" })), say("Parent done.")]),
+      "sub-task": sub,
+    });
+    const session = makeSession(provider);
+    await collect(session.send("parent-task: go"));
+    expect(sub.requests[0]!.options.tools!.map((t) => t.name)).not.toContain("plan");
+    expect(sub.requests[1]!.history.at(-1)!.text).toStartWith('Unknown tool "plan"');
+    expect(session.plan).toBeNull();
+  });
+
+  describe("compaction keeps it", () => {
+    const used = (promptTokens: number): AgentEvent => ({ type: "usage", usage: { promptTokens, completionTokens: 0 } });
+
+    test("mid-turn: the request after the summary has the plan, then MID_TURN_NOTE", async () => {
+      const provider = new ScriptedProvider([useTools(planCall("p1")), [used(900), ...useTools(read("c1"))], say("SUMMARY"), say("Finished.")], 1000);
+      const session = makeSession(provider);
+      await collect(session.send("long task"));
+      const after = provider.requests[3]!.history;
+      expect(after[0]!.text).toContain("SUMMARY\n\nYour plan (from the plan tool), as it stood:\n- [done] Read the report command\n- [in progress] Add the --json flag\n- [pending] Update README and CHANGELOG\nKeep updating it with the plan tool.");
+      expect(after.at(-1)!.text).toBe(MID_TURN_NOTE);
+    });
+
+    test("before a user message: the plan is in the first message, and the message follows", async () => {
+      const provider = new ScriptedProvider([useTools(planCall("p1")), [used(900), ...say("Paused.")], say("SUMMARY"), say("Going on.")], 1000);
+      const session = makeSession(provider);
+      await collect(session.send("long task"));
+      await collect(session.send("go on"));
+      const after = provider.requests[3]!.history;
+      expect(after[0]!.text).toContain("- [in progress] Add the --json flag");
+      expect(after.at(-1)).toEqual({ role: "user", text: "go on" });
+    });
   });
 });
