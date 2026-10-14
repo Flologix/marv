@@ -1220,7 +1220,16 @@ impl App {
     /// Marv's `handleSubmit`.
     fn submit(&mut self, raw: &str, now: Instant) {
         let text = raw.trim();
-        if text.is_empty() || self.busy() {
+        if text.is_empty() {
+            return;
+        }
+        // A login's callback address holds the authorization code: it goes to the login, never to the model, the
+        // prompt history or the saved transcript. Even during a turn.
+        if self.port.login_callback(text) {
+            self.prompt.set("");
+            return;
+        }
+        if self.busy() {
             return;
         }
         let text = text.to_string();
@@ -1605,6 +1614,7 @@ mod tests {
         LoadModels(ProviderId),
         CompleteSetup(SetupAnswer),
         Resume(Option<String>),
+        LoginCallback(String),
     }
 
     #[derive(Default)]
@@ -1639,6 +1649,13 @@ mod tests {
         }
         fn flush(&self) -> BoxFuture<'static, ()> {
             Box::pin(async {})
+        }
+        fn login_callback(&self, text: &str) -> bool {
+            let taken = text.starts_with("http://127.0.0.1:5555/callback?");
+            if taken {
+                self.calls.lock().unwrap().push(Call::LoginCallback(text.into()));
+            }
+            taken
         }
     }
 
@@ -2503,6 +2520,22 @@ mod tests {
         h.key(ESC);
         assert!(!h.app.exiting());
         assert!(h.frame().contains("Type a message"));
+    }
+
+    // Marv tests/app.test.tsx "MCP logins (#18)": the code in a pasted callback never reaches the model, the
+    // transcript or the prompt history, even during a turn.
+    #[test]
+    fn a_pasted_login_callback_goes_to_the_engine_even_while_busy_and_is_never_kept() {
+        let mut h = harness();
+        h.typed("hello");
+        assert_eq!(h.calls(), [Call::Send("hello".into())]);
+        let pasted = "http://127.0.0.1:5555/callback?code=code-secret&state=abc";
+        h.typed(pasted);
+        assert_eq!(h.calls()[1], Call::LoginCallback(pasted.into()));
+        assert_eq!(h.calls().len(), 2);
+        assert!(!h.frame().contains("code-secret"));
+        h.key(KeyCode::Up);
+        assert!(!h.frame().contains("code-secret"), "not in the prompt history");
     }
 
     #[test]

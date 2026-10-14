@@ -598,6 +598,14 @@ pub trait SessionPort: Send + Sync {
     /// Before the process exits: save the session and flush the trajectory. The returned future is
     /// awaited (bounded) after the terminal is restored.
     fn flush(&self) -> futures::future::BoxFuture<'static, ()>;
+
+    /// A submitted line that is a login's callback address alone (Marv #18: pasted from a browser that couldn't reach
+    /// Marv's listener). It holds the authorization code, so the engine takes it for the waiting `/mcp login`, and it
+    /// never reaches the model, the prompt history or the transcript, even during a turn. True: the engine took it
+    /// (what happened comes back as events).
+    fn login_callback(&self, _text: &str) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
