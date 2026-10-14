@@ -938,7 +938,10 @@ impl Bridge {
     }
 
     async fn undo_now(&self) {
-        let plan = match self.session.undo_plan().await {
+        self.emit(UiEvent::Busy(Some("Reading the checkpoints…".into())));
+        let plan = self.session.undo_plan().await;
+        self.emit(UiEvent::Busy(None));
+        let plan = match plan {
             Err(e) => return self.emit(system(format!("Couldn't read the checkpoints: {e}"), true)),
             Ok(Err(refusal)) if refusal.failed => return self.emit(system(format!("Couldn't undo: {}.", refusal.reason), true)),
             Ok(Err(refusal)) => {
@@ -956,7 +959,10 @@ impl Bridge {
         if asked != marv_tools::Decision::Yes {
             return self.emit(system("Nothing was undone.", false));
         }
-        match self.session.undo(&plan).await {
+        self.emit(UiEvent::Busy(Some("Undoing…".into())));
+        let undone = self.session.undo(&plan).await;
+        self.emit(UiEvent::Busy(None));
+        match undone {
             Ok(result) => self.emit(system(marv_session::undo_summary(&plan, &result), false)),
             Err(e) => self.emit(system(format!("Couldn't undo: {e}"), true)),
         }

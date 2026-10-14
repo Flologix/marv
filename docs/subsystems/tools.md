@@ -8,8 +8,8 @@ Spec: the **Tools**, **Web**, **Skills**, **Memory**, **Subagents** and **Yolo m
 
 | Marv (TS) | Rust module | Status |
 |---|---|---|
-| `src/tools/types.ts` | `types.rs` | Done: `Tool` (typed `Input`), the type-erased `DynTool`, `ToolContext`, `ToolOutput`, `Preview`, `Scope`, `ApprovalRequest`, `Decision`, `Approval`, `Approver`, `BeforeChange`, `AgentHost`, `Skill`, `MemoryPaths`, `DiffLine`/`DiffShown` |
-| `src/tools/index.ts` | `registry.rs` | **Ported and tested:** `run_tool` (the whole approval flow, plus taint and protected paths), `builtin_tools` (Marv's order), `tool_specs`/`tool_specs_for`, `is_parallel_call` |
+| `src/tools/types.ts` | `types.rs` | Done: `Tool` (typed `Input`), the type-erased `DynTool`, `ToolContext`, `ToolOutput`, `Preview`, `Scope`, `ApprovalRequest`, `Decision`, `Approval`, `Approver`, `BeforeChange`, `AgentHost`, `Skill`, `MemoryPaths`, `DiffLine`/`DiffShown`. #22: `Checkpoint` (`ToolContext::checkpoint`, separate from `before_change`), `Tool::checkpoint` (default: Write or Execute; false for `memory`, `agent`, MCP and mesh tools), `Preview::files`/`PreviewFile` |
+| `src/tools/index.ts` | `registry.rs` | **Ported and tested:** `run_tool` (the whole approval flow, plus taint and protected paths), `builtin_tools` (Marv's order), `tool_specs`/`tool_specs_for`, `is_parallel_call`. #22: the turn's checkpoint, after the approval (or yolo, or an ungated call) and before running; a stop meanwhile is "interrupted" (tested as in `tools.test.ts`'s "the turn's checkpoint") |
 | `src/tools/repair.ts` | `repair.rs` | **Ported and tested:** JSON control-character escaping, timeout from ms to s, the leading-slash path. Todo: schema-guided repair (#65) |
 | `src/tools/edit-match.ts` | `edit_match.rs` | **Ported and tested:** exact, then the Unicode tier (#60: typographic quotes, dashes, `…` and Unicode spaces folded to ASCII, unique only, the file's original span replaced), then trailing whitespace, then indentation; CRLF handling, `closest_lines` |
 | `src/tools/diff.ts` | `diff.rs` | **Ported and tested.** Uses `similar` in place of jsdiff |

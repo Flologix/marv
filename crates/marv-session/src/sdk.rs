@@ -340,4 +340,67 @@ mod tests {
         let err = SessionBuilder::new("/nonexistent/marv/x", provider()).build().await.err().unwrap();
         assert!(err.to_string().ends_with("isn't a folder"));
     }
+
+    /// Writes made.txt, then says it did.
+    struct MakesAFile(std::sync::Mutex<u32>);
+    impl marv_provider::Provider for MakesAFile {
+        fn name(&self) -> &str {
+            "scripted"
+        }
+        fn context_length(&self) -> Option<u64> {
+            None
+        }
+        fn stream(&self, _history: &[marv_core::ChatTurn], _options: marv_provider::StreamOptions) -> marv_provider::EventStream {
+            use marv_core::ProviderEvent;
+            let first = {
+                let mut n = self.0.lock().unwrap();
+                *n += 1;
+                *n == 1
+            };
+            let events = if first {
+                let arguments = serde_json::json!({"path": "made.txt", "content": "made\n"}).to_string();
+                vec![
+                    ProviderEvent::ToolCall(marv_core::ToolCall { id: "w".into(), name: "write_file".into(), arguments }),
+                    ProviderEvent::Done { reason: Some("tool_calls".into()) },
+                ]
+            } else {
+                vec![ProviderEvent::TextDelta("Made it.".into()), ProviderEvent::Done { reason: Some("stop".into()) }]
+            };
+            Box::pin(futures::stream::iter(events))
+        }
+    }
+
+    // Ports tests/sdk.test.ts "checkpoints: a turn's files can be put back with undoPlan() and undo(), outside a
+    // repository too (#16)".
+    #[tokio::test]
+    async fn checkpoints_a_turns_files_can_be_put_back_outside_a_repository_too() {
+        use futures::StreamExt;
+        let base = std::env::temp_dir().join(format!("marv-sdk-cp-{}-{}", std::process::id(), marv_fs::random_hex()));
+        let (root, config_dir) = (base.join("project"), base.join("config"));
+        std::fs::create_dir_all(&root).unwrap();
+        let session_with = |checkpoints: bool| {
+            let mut builder = SessionBuilder::new(&root, ProviderOption::Custom(Arc::new(MakesAFile(std::sync::Mutex::new(0)))));
+            builder.options.config_dir = Some(config_dir.clone());
+            builder.options.sandbox = false;
+            builder.options.checkpoints = checkpoints;
+            builder.build()
+        };
+        let session = session_with(true).await.unwrap();
+        session.send("make a file", crate::session::SendOptions::default()).unwrap().collect::<Vec<_>>().await;
+        assert!(root.join("made.txt").exists());
+        let plan = session.undo_plan().await.unwrap().unwrap_or_else(|r| panic!("{}", r.reason));
+        let files: Vec<(&str, crate::checkpoints::undo::UndoAction)> =
+            plan.files.iter().map(|f| (f.path.as_str(), f.action)).collect();
+        assert_eq!(files, [("made.txt", crate::checkpoints::undo::UndoAction::Delete)]);
+        assert_eq!(session.undo(&plan).await.unwrap().deleted, ["made.txt"]);
+        assert!(!root.join("made.txt").exists());
+        assert!(config_dir.join("checkpoints").exists());
+        session.close().await;
+
+        let off = session_with(false).await.unwrap();
+        off.send("make a file", crate::session::SendOptions::default()).unwrap().collect::<Vec<_>>().await;
+        assert!(off.undo_plan().await.unwrap().unwrap_err().reason.contains("off"));
+        off.close().await;
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
