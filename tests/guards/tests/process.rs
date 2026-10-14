@@ -186,7 +186,8 @@ async fn a_forwarded_port_is_on_the_hosts_127_0_0_1_only() {
 
 /// **A background process dies on stop**, with everything it started (its own PID namespace).
 ///
-/// Proven: removed both signals in `ProcessManager::stop` (and the watcher's wait) → failed (the marker still ran).
+/// Proven: skipped the kill in `ProcessManager::stop` (the entry forgotten, its sandbox left running) → failed (the
+/// marker still ran).
 #[tokio::test]
 async fn a_process_dies_on_stop() {
     require_bwrap!();

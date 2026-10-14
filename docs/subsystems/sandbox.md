@@ -16,14 +16,14 @@ Spec: the **Sandbox** and **Yolo mode** bullets in Marv's `CLAUDE.md`, `src/sand
 
 | Marv (TS) | Rust module | Status |
 |---|---|---|
-| `src/sandbox.ts` (`sandboxArgs`, `runMounts`, `resolveExtra`, `sandboxAvailable`) | `bwrap.rs` | **Ported and tested.** Adds protected-path read-only binds and the mesh plug at `/run/marv/mesh.sock`. The file system is injectable (`FsProbe`) |
+| `src/sandbox.ts` (`sandboxArgs`, `runMounts`, `resolveExtra`, `sandboxAvailable`) | `bwrap.rs` | **Ported and tested.** Adds protected-path read-only binds and the mesh plug at `/run/marv/mesh.sock`. The file system is injectable (`FsProbe`). #24: `binds` (Marv's Sprint 4 `binds`: a mount at a path of its own after the empty `/run`, read-only unless `writable`), for the process door's relay |
 | `src/sandbox.ts` (`TOOLCHAINS`, `CREDENTIALS`, `credentialMasks`, `hiddenPathFolders`) | `home.rs` | **Ported and tested** |
 | `src/tools/files.ts` (`resolveInProject`, `insideGitDir`, `touchesGit`, `refuseGit`, `projectPath`) | `paths.rs` | **Ported and tested.** New: `resolve_within`, the realpath containment check for skill files, with a symlink test |
 | `src/tools/bash.ts` (`gitGuard`, `worktreeGit`, `worktreeGitDirs`) | `git_guard.rs` | **Ported and tested** |
 | `src/tools/bash.ts` (`GIT_HINT`, `HOME_NOTE`, `NETWORK_NOTE`, `GH_NOTE`, `touchesHiddenHome`, `looksLikeNetworkFailure`) | `notes.rs` | **Ported and tested** (regex has no lookahead, so the word ends are checked by hand) |
 | new (`docs/SECURITY.md`) | `protected.rs` | **Done and tested:** `PROTECTED_PATHS`, `rule_for_relative`, `protected_rule`/`is_protected` (realpath, a dangling final symlink followed, fails closed), `hooks_path`, `lifecycle_scripts_changed`, `protected_mounts` (top level only), and the post-command scan: `protected_snapshot`, `scan_created`, `revert_created`, `created_note` (#8) |
 | new (`docs/SECURITY.md`) | `taint.rs` | **Done and tested:** `TaintState` (`mark`, `is_tainted`, `must_ask`, approved prefixes, `for_subagent`) |
-| — | `lib.rs` | `Sandbox` (the session's handle: `from_env`, `active`, `command`), `CommandMounts`, `SandboxError` |
+| — | `lib.rs` | `Sandbox` (the session's handle: `from_env`, `active`, `command`, `command_argv` for an inner command other than `bash -c`), `CommandMounts` (with `binds`, #24), `SandboxError` |
 
 No `todo!` is left in this crate. The gaps are listed below.
 
