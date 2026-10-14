@@ -109,6 +109,9 @@ pub struct SessionOptions {
     /// once at the start of its first message. Pass only commands the user wrote into their own config
     /// (`crate::hooks::session_start_hooks`), never a repository's. Default none.
     pub hooks: Vec<crate::hooks::HookCommand>,
+    /// A one-shot run, like `marv -p`: the process tool tells the model its processes end when the run does (#86).
+    /// Default false.
+    pub one_shot: bool,
 }
 
 /// Builds a [`MarvSession`] (Marv's `createSession`).
@@ -149,6 +152,7 @@ impl SessionBuilder {
                 wire_approver: None,
                 processes: true,
                 hooks: Vec::new(),
+                one_shot: false,
             },
         }
     }
@@ -179,6 +183,10 @@ impl SessionBuilder {
     }
     pub fn processes(mut self, on: bool) -> Self {
         self.options.processes = on;
+        self
+    }
+    pub fn one_shot(mut self, on: bool) -> Self {
+        self.options.one_shot = on;
         self
     }
     pub fn max_steps(mut self, steps: u32) -> Self {
@@ -321,6 +329,7 @@ pub async fn create_session(options: SessionOptions) -> Result<MarvSession, Sess
     init.problems = problems;
     init.processes = options.processes;
     init.hooks = options.hooks;
+    init.one_shot = options.one_shot;
     let session = MarvSession::new(init)?;
     if let Some(mcp) = &session.mcp() {
         // A server that needs a login is told once (again only after it connected meanwhile).
