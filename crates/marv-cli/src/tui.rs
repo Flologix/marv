@@ -855,6 +855,8 @@ pub struct Bridge {
     gate: Mutex<Gate>,
     /// A project's `.marv/config.json` named `hooks` (#108): the startup note saying they were not run.
     hooks_refused: Option<String>,
+    /// The next-step suggestion being asked for after a turn: a new turn, a command or Esc stops it.
+    suggesting: Mutex<Option<CancellationToken>>,
 }
 
 /// [`Bridge::gate`]'s state.
@@ -968,6 +970,7 @@ impl Bridge {
             mesh_watch: CancellationToken::new(),
             gate: Mutex::default(),
             hooks_refused,
+            suggesting: Mutex::default(),
         });
         *changed.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(&bridge));
         Ok(bridge)
@@ -1177,13 +1180,14 @@ impl Bridge {
 
     /// Sends a message on a gate already taken for it.
     fn start_claimed(self: &Arc<Self>, text: String, for_model: Option<String>) {
+        self.stop_suggesting();
         let turn = match self.session.send(&text, SendOptions { for_model, cancel: None }) {
             Ok(turn) => turn,
             Err(e) => {
                 // The App started its turn on submit: end it (this one, the rejected turn: no other turn's end).
                 self.emit(system(e.to_string(), true));
                 self.emit(UiEvent::TurnEnd { turn: String::new(), reason: view::TurnEndReason::Loop(StopReason::Error) });
-                self.finished();
+                self.finished(false);
                 return;
             }
         };
@@ -1191,8 +1195,8 @@ impl Bridge {
     }
 
     /// The gate's turn is over: the next queued input starts on the same gate (nothing can slip in between), or the
-    /// bridge is free.
-    fn finished(self: &Arc<Self>) {
+    /// bridge is free. `done`: the turn's reply finished normally, so once idle the next message may be suggested.
+    fn finished(self: &Arc<Self>, done: bool) {
         let next = {
             let mut gate = self.gate.lock().unwrap_or_else(|e| e.into_inner());
             gate.woken = false;
@@ -1211,6 +1215,10 @@ impl Bridge {
             // reply runs no `after_step`), would otherwise wait for some later message. `wake` checks everything
             // again (on, closing, approvals, the rate limit, which also bounds a wake that keeps failing).
             None => {
+                // Only after a reply that finished: not after an error, a stop or the step limit.
+                if done {
+                    self.suggest_next();
+                }
                 let me = self.clone();
                 tokio::spawn(async move { me.wake() });
             }
@@ -1227,8 +1235,10 @@ impl Bridge {
             let totals_fn = move || totals(&usage_of.usage().totals);
             let last_of = me.session.clone();
             let last_fn = move || last_of.usage().last;
+            let mut finished = false;
             while let Some(event) = turn.next().await {
                 let end = matches!(event, SessionEvent::TurnEnd { .. });
+                finished |= matches!(event, SessionEvent::TurnEnd { reason: TurnEndReason::Done(StopReason::End), .. });
                 for ui in map_event(event, &mut map, &totals_fn, &last_fn) {
                     me.emit(ui);
                 }
@@ -1240,8 +1250,41 @@ impl Bridge {
                 *me.last_checks.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
             }
             // After the end went out: input the App sends on seeing it is queued and starts here, in order.
-            me.finished();
+            me.finished(finished);
         });
+    }
+
+    /// Asks for the user's next message in the background and offers it to the prompt (`Session::suggest`), unless
+    /// `suggestions` is off in the config. A new turn, a command or Esc stops it ([`Self::stop_suggesting`]).
+    fn suggest_next(self: &Arc<Self>) {
+        if !self.config().suggestions {
+            return;
+        }
+        let cancel = CancellationToken::new();
+        if let Some(old) = self.suggesting.lock().unwrap_or_else(|e| e.into_inner()).replace(cancel.clone()) {
+            old.cancel();
+        }
+        let me = self.clone();
+        tokio::spawn(async move {
+            let suggestion = me.session.suggest(cancel.clone()).await;
+            if cancel.is_cancelled() {
+                return;
+            }
+            // Its tokens and cost count like any request's.
+            let usage = me.session.usage();
+            if let Some(last) = usage.last {
+                me.emit(UiEvent::Usage { last, totals: totals(&usage.totals) });
+            }
+            if let Some(text) = suggestion {
+                me.emit(UiEvent::Suggestion(text));
+            }
+        });
+    }
+
+    fn stop_suggesting(&self) {
+        if let Some(cancel) = self.suggesting.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            cancel.cancel();
+        }
     }
 
     /// `/compact [focus]`: shown as a turn (its waiting line, Esc stops it), reported like an automatic one.
@@ -1620,12 +1663,13 @@ impl Bridge {
         (gate.turn, gate.woken) = (true, true);
         self.activity.set_busy(true);
         drop(gate);
+        self.stop_suggesting();
         match self.session.wake(&by) {
             Ok(Some(turn)) => {
                 self.emit(system(by.line(), false));
                 self.forward(turn);
             }
-            Ok(None) | Err(_) => self.finished(),
+            Ok(None) | Err(_) => self.finished(false),
         }
     }
 
@@ -2032,6 +2076,7 @@ impl SessionPort for Port {
     }
 
     fn run_command(&self, line: String) {
+        self.0.stop_suggesting();
         let bridge = self.0.clone();
         let action = bridge.command_action(&line);
         tokio::spawn(async move { bridge.apply(&line, action).await });
@@ -2041,7 +2086,12 @@ impl SessionPort for Port {
         self.0.activity.answer(id.0, decision(d));
     }
 
+    fn stop_suggesting(&self) {
+        self.0.stop_suggesting();
+    }
+
     fn abort(&self) {
+        self.0.stop_suggesting();
         self.0.session.interrupt();
         if let Some(work) = self.0.busy_work.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
             work.cancel();
@@ -2403,6 +2453,8 @@ mod tests {
             yolo: Some(false),
             diagnostics: Some(false),
             checks: Some(false),
+            // A suggestion is one more request after each turn: off, so each test's scripted replies stay its turns'.
+            suggestions: Some(false),
             ..FileConfig::default()
         }
     }
@@ -3036,6 +3088,29 @@ mod tests {
         port.send("hello".into());
         let seen = until(&mut rx, |e| matches!(e, UiEvent::TurnEnd { .. })).await;
         assert!(seen.iter().any(|e| matches!(e, UiEvent::Assistant { text } if text == "again")));
+    }
+
+    #[tokio::test]
+    async fn after_a_finished_turn_the_next_message_is_suggested_unless_thats_off() {
+        let dirs = Dirs::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let on = FileConfig { suggestions: Some(true), ..asks() };
+        let port = Port(Bridge::start(startup(&dirs, Some(on), vec![say("Fixed it."), say("run the tests")], None), tx).unwrap());
+        port.send("fix it".into());
+        let events = until(&mut rx, |e| matches!(e, UiEvent::Suggestion(_))).await;
+        assert!(matches!(events.last(), Some(UiEvent::Suggestion(t)) if t == "run the tests"), "{events:?}");
+        assert!(events.iter().any(|e| matches!(e, UiEvent::TurnEnd { .. })), "after the turn");
+
+        let dirs = Dirs::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let port =
+            Port(Bridge::start(startup(&dirs, Some(asks()), vec![say("Fixed it."), say("run the tests")], None), tx).unwrap());
+        port.send("fix it".into());
+        until(&mut rx, |e| matches!(e, UiEvent::TurnEnd { .. })).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        while let Ok(event) = rx.try_recv() {
+            assert!(!matches!(event, UiEvent::Suggestion(_)), "suggestions are off");
+        }
     }
 
     #[tokio::test]
