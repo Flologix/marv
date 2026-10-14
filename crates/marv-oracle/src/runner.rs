@@ -294,9 +294,8 @@ pub fn canonical_request(body: &str) -> String {
 
 /// System-prompt sections marv-rs adds and Marv doesn't (deliberate differences, one place for all scenarios): the
 /// oracle drops them from both sides before comparing, so the rest of the prompt is still checked byte for byte. The
-/// raw requests (the prefix rule) keep them. `# Sandbox limits` is Marv's own from 0.4.0 (#50); listed until the
-/// recordings come from 0.4.0.
-pub const MARV_RS_SECTIONS: &[&str] = &["# Sandbox limits", "# Your situation"];
+/// raw requests (the prefix rule) keep them.
+pub const MARV_RS_SECTIONS: &[&str] = &["# Your situation"];
 
 /// Removes each of [`MARV_RS_SECTIONS`] (from its `\n\n<heading>\n\n` to the next `\n\n# ` heading, or the end) from a
 /// system message's text, plain or in parts.
@@ -432,7 +431,7 @@ mod tests {
         ]})
         .to_string();
         let canonical: Value = serde_json::from_str(&canonical_request(&body)).unwrap();
-        assert_eq!(canonical["messages"][0]["content"], "You are Marv.\n\n# MCP servers\n\nSetup.");
+        assert_eq!(canonical["messages"][0]["content"], "You are Marv.\n\n# Sandbox limits\n\nEnds.\n\n# MCP servers\n\nSetup.");
         assert_eq!(canonical["messages"][1]["content"], "# Your situation");
     }
 
