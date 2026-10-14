@@ -235,6 +235,9 @@ impl HerdrReporter {
 
 /// The `herdr` CLI gets this long per command; Herdr not answering is an error the agent reads, never a hang.
 pub const HERDR_TIMEOUT: Duration = Duration::from_secs(5);
+/// `mesh_list` waits this long for `herdr agent list`, then lists no panes: a slow or missing Herdr never holds the
+/// list up.
+pub const LIST_TIMEOUT: Duration = Duration::from_millis(1500);
 /// `herdr.pane.<pane>.status` reads at most this many lines of the pane's output.
 pub const MAX_READ_LINES: u64 = 200;
 /// Between the text and its Enter: an agent's TUI may still be taking the text in (Herdr's own `agent prompt` waits
@@ -422,6 +425,15 @@ impl HerdrAdapter {
         })
     }
 
+    /// The panes `mesh_list` shows as wireable: the agents' panes, Marv's own left out, within [`LIST_TIMEOUT`]. A
+    /// slow, failing or missing Herdr is no panes (the `herdr` it started is killed with the dropped command).
+    pub async fn wireable_panes(&self) -> Vec<HerdrPane> {
+        match tokio::time::timeout(LIST_TIMEOUT, self.agents()).await {
+            Ok(Ok(panes)) => panes.into_iter().filter(|p| self.offerable(p)).collect(),
+            _ => Vec::new(),
+        }
+    }
+
     /// Every receptacle the adapter offers right now: two per agent pane, Marv's own left out.
     pub async fn receptacles(&self) -> crate::Result<Vec<Receptacle>> {
         let panes = self.agents().await?;
@@ -603,7 +615,7 @@ mod tests {
             };
             // printf, not echo: dash (Ubuntu's sh) turns the \n in the JSON into a newline.
             let script = format!(
-                "#!/bin/sh\necho \"$@\" >> '{log}'\ncase \"$1 $2\" in\n\
+                "#!/bin/sh\n[ \"$1\" = --ready ] && exit 0\necho \"$@\" >> '{log}'\ncase \"$1 $2\" in\n\
                  'agent list') printf '%s\\n' '{agents}';;\n\
                  'pane get') case \"$3\" in\n{gets}\n*) printf '%s\\n' '{{\"error\":{{\"code\":\"pane_not_found\",\"message\":\"pane $3 not found\"}}}}'; exit 1;;\nesac;;\n\
                  'pane read') printf '%s\\n' '{{\"result\":{{\"text\":\"line1\\nline2\"}}}}';;\n\
@@ -614,6 +626,7 @@ mod tests {
             let program = dir.0.join("herdr");
             std::fs::write(&program, script).unwrap();
             std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+            wait_until_runnable(&program);
             Self { dir }
         }
         fn adapter(&self) -> Arc<HerdrAdapter> {
@@ -621,6 +634,24 @@ mod tests {
         }
         fn log(&self) -> String {
             std::fs::read_to_string(self.dir.0.join("log")).unwrap_or_default()
+        }
+    }
+
+    /// Waits until a script just written can be run (#92). While `std::fs::write` had it open, another test's thread
+    /// may have forked to spawn its own child; that child holds a copy of the write handle until it execs, and Linux
+    /// refuses to run a file open for writing ("Text file busy", ETXTBSY). Under load that gap is long enough for the
+    /// adapter's first `herdr` to fail. No new holder can appear once the write is closed, so the first run that
+    /// starts means every later one will too.
+    fn wait_until_runnable(program: &std::path::Path) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            match std::process::Command::new(program).arg("--ready").status() {
+                Ok(status) => return assert!(status.success(), "fake herdr --ready: {status}"),
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Err(e) => panic!("fake herdr didn't run: {e}"),
+            }
         }
     }
 
@@ -655,6 +686,52 @@ mod tests {
             assert!(panes.resolve(&name(absent)).await.is_none(), "{absent}");
         }
         assert!(!fake.log().contains("send-text"), "finding panes types nothing");
+        let listed: Vec<String> = fake.adapter().wireable_panes().await.into_iter().map(|p| p.pane_id).collect();
+        assert_eq!(listed, ["w1:p2", "w1:p3"]);
+    }
+
+    /// Runs a fake `herdr` just written (`herdr probe`) until Linux lets it run: another test's forked child can hold
+    /// its write handle for a moment, and running it then fails with "Text file busy" (#92).
+    fn wait_to_run(program: &std::path::Path) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            match std::process::Command::new(program).arg("probe").output() {
+                Ok(_) => return,
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Err(e) => panic!("fake herdr didn't run: {e}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_slow_or_missing_herdr_lists_no_panes_in_bounded_time() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::switchboard::tests::Runtime::new();
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let program = dir.0.join("herdr");
+        std::fs::write(&program, "#!/bin/sh\n[ \"$1\" = probe ] && exit 0\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        wait_to_run(&program);
+        let started = std::time::Instant::now();
+        assert!(HerdrAdapter::new(&program, None).wireable_panes().await.is_empty());
+        let took = started.elapsed();
+        assert!(took >= LIST_TIMEOUT && took < LIST_TIMEOUT + Duration::from_secs(2), "{took:?}");
+        assert!(HerdrAdapter::new("/nonexistent/herdr", None).wireable_panes().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_switchboard_given_herdr_finds_panes_and_lists_them() {
+        use crate::switchboard::{NoTrajectory, Switchboard};
+        let fake = FakeHerdr::new();
+        wait_to_run(&fake.dir.0.join("herdr"));
+        let runtime = crate::switchboard::tests::Runtime::new();
+        let sb = Switchboard::new("s", runtime.0.clone(), Arc::new(NoTrajectory));
+        assert!(sb.herdr().is_none());
+        sb.set_herdr(fake.adapter());
+        assert!(sb.lookup(&ReceptacleName::new("herdr.pane.w1-p2.status").unwrap()).await.is_some());
+        assert_eq!(sb.herdr().unwrap().wireable_panes().await.len(), 2);
     }
 
     #[tokio::test]

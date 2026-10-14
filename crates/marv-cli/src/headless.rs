@@ -13,7 +13,9 @@
 //!
 //! `--approve` answers "yes" (not "always", so each call is still checked) for its scopes and "unavailable" for
 //! everything else: refused as an error the model can work around, not a decline that ends the turn. With
-//! `--approve`, the step limit still stops: nobody can say "keep going". marv-rs: `--approve mesh:<receptacle>`
+//! `--approve`, the step limit still stops: nobody can say "keep going". marv-rs (#59): before it stops, the model gets
+//! one tools-off request to say what it finished, what's left and the next step; that is the reply, and the exit code
+//! is still 2. marv-rs: `--approve mesh:<receptacle>`
 //! pre-approves wires to that receptacle (docs/MESH.md); it never covers anything else, and yolo never wires.
 //!
 //! **Bug fix (Marv 0.3.0):** Marv's text output wrote the model's reply to the terminal raw, so a reply could carry

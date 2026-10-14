@@ -47,4 +47,22 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo check --workspace --all-targets
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # The tests must remove their temp folders (#89: a dev machine had ~6,000 left in /tmp, 6.7 GB, and the /tmp quota
+      # filled). Count them before and after; any growth fails the job and lists what was left. `marv-<uid>` is the
+      # shared runtime folder used without XDG_RUNTIME_DIR, kept on purpose.
+      - name: Count temp folders before the tests
+        run: |
+          echo "TEMP_BEFORE=$(find /tmp -maxdepth 1 \( -name 'marv-*' -o -name 'mx-*' \) ! -name "marv-$(id -u)" | wc -l)" >> "$GITHUB_ENV"
       - run: cargo test --workspace --no-fail-fast
+      - name: Fail if the tests left temp folders
+        # Also after failed tests: a failing test is the likeliest to leave its folder behind.
+        if: ${{ !cancelled() && env.TEMP_BEFORE != '' }}
+        run: |
+          left=$(find /tmp -maxdepth 1 \( -name 'marv-*' -o -name 'mx-*' \) ! -name "marv-$(id -u)" | sort)
+          after=$(printf '%s' "$left" | grep -c . || true)
+          echo "temp folders before: $TEMP_BEFORE, after: $after"
+          if [ "$after" -gt "$TEMP_BEFORE" ]; then
+            echo "the tests left temp folders in /tmp:"
+            printf '%s\n' "$left"
+            exit 1
+          fi

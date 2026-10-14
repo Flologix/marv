@@ -3,7 +3,8 @@
 //!
 //! A round accent border, 2 columns of padding, the martian, a 3-column gap, then (vertically
 //! centred) "Welcome to Marv v1.2.3", "/help for commands", "cwd: …" and, when anything was loaded,
-//! one line like "AGENTS.md loaded · 3 skills (/skills) · 1 memory (/memory) · 2 MCP servers (/mcp)".
+//! one line like "AGENTS.md loaded · 3 skills (/skills) · 1 memory (/memory) · 2 MCP servers (/mcp)" (several
+//! instruction files: "3 instruction files loaded", #62).
 //! The cwd goes through `printable()`. The martian's pose comes from the app's
 //! [`MartianAnimation`](super::martian::MartianAnimation); the app only wakes for it while this
 //! banner is inside the viewport.
@@ -29,8 +30,10 @@ fn plural(n: usize, one: &str, many: &str) -> String {
 /// "AGENTS.md loaded · 3 skills (/skills) · …", or None when nothing was loaded.
 pub fn loaded_line(info: &WelcomeInfo) -> Option<String> {
     let mut parts = Vec::new();
-    if info.instructions {
-        parts.push("AGENTS.md loaded".to_string());
+    match info.instructions.as_slice() {
+        [] => {}
+        [one] => parts.push(format!("{} loaded", printable(one))),
+        many => parts.push(format!("{} instruction files loaded", many.len())),
     }
     if info.skills > 0 {
         parts.push(format!("{} (/skills)", plural(info.skills, "skill", "skills")));
@@ -121,7 +124,7 @@ mod tests {
     fn loaded_line_pluralises() {
         let mut info = WelcomeInfo::default();
         assert_eq!(loaded_line(&info), None);
-        info.instructions = true;
+        info.instructions = vec!["AGENTS.md".into()];
         info.skills = 1;
         info.memories = 2;
         info.mcp_servers = 1;
@@ -129,5 +132,10 @@ mod tests {
             loaded_line(&info).unwrap(),
             "AGENTS.md loaded · 1 skill (/skills) · 2 memories (/memory) · 1 MCP server (/mcp)"
         );
+        // #62: CLAUDE.md by name, several files by count.
+        info.instructions = vec!["CLAUDE.md".into()];
+        assert!(loaded_line(&info).unwrap().starts_with("CLAUDE.md loaded · "));
+        info.instructions = vec!["AGENTS.md".into(), "~/.marv/AGENTS.md".into()];
+        assert!(loaded_line(&info).unwrap().starts_with("2 instruction files loaded · "));
     }
 }

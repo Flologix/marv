@@ -5,7 +5,8 @@
 //!   text from outside puts the cursor at the end (Marv remounted ink-text-input for that).
 //! - Typing `/` opens a menu of [`match_commands`]: ↑/↓ select, Enter runs the highlighted one
 //!   ("/se" → "/setup"), Tab or → completes it plus a space so arguments can follow, Esc hides the
-//!   menu until the text changes. Hidden while busy.
+//!   menu until the text changes. Hidden while busy. ctrl+k opens the App's command palette over it
+//!   (`command_palette`, #44), built from the same commands; the text here stays as it was.
 //! - Placeholder "Type a message, or / for commands"; the border dims while busy.
 //! - New in marv-rs: after a turn, a suggested next message ([`PromptInput::suggest`]) shows in the empty prompt
 //!   instead of the placeholder. Tab or → takes it into the line; typing anything drops it. Enter on the empty line
@@ -344,7 +345,7 @@ mod tests {
             ("think", "Toggle thinking"),
         ]
         .into_iter()
-        .map(|(n, d)| CommandInfo { name: n.into(), description: d.into() })
+        .map(|(n, d)| CommandInfo::new(n, d))
         .collect()
     }
 
@@ -494,7 +495,7 @@ mod tests {
     fn an_argument_completion_is_offered_once_its_command_and_subcommand_are_typed() {
         let mut c = commands();
         for n in ["mcp", "mcp login github", "mcp login linear", "mcp logout github"] {
-            c.push(CommandInfo { name: n.into(), description: String::new() });
+            c.push(CommandInfo::new(n, ""));
         }
         let names = |v: &str| match_commands(v, &c).iter().map(|c| c.name.clone()).collect::<Vec<_>>();
         assert_eq!(names("/mcp login "), ["mcp login github", "mcp login linear"]);
