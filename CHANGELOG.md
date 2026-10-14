@@ -14,6 +14,7 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ### Changed
 
+- **An approval ignores Enter and ↑/↓ for its first 400 ms (#113).** A key typed for the prompt or the command palette just as an approval appeared could answer it, and Enter answers Yes. Esc and ctrl+c still decline at once; the prompt looks the same.
 - **`mesh_list` names the other Marvs on this machine**, with the inbox a `mesh_send` would use and a note that the user has to wire it first. Before, the model only saw "nothing is wired", and answered "who's on the mesh?" with nobody while `marv mesh ls` listed several. Names only: their folders and panes stay in `marv mesh ls`.
 
 ### Added

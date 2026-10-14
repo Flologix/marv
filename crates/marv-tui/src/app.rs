@@ -47,10 +47,15 @@
 //!   "N more waiting". Esc at an approval declines everything queued and stops the run (unless a
 //!   subagent's view is open: Esc then only closes the view). ctrl+c at an approval declines all.
 //!   "Always" also answers the queued requests with the same scope key.
+//! - **Approvals arm after [`APPROVAL_ARM_MS`] (#113, a deliberate difference from Marv):** each newly shown head
+//!   ignores the keys that would answer it (Enter, ↑/↓) for 400 ms; Esc, ctrl+c and PgUp/PgDn work at once. An
+//!   approval can appear under keys typed for the prompt or the ctrl+k palette, and an Enter meant for them would
+//!   otherwise answer Yes. Nothing on screen changes while it arms.
 //! - **ctrl+c:** interrupt a reply → clear the prompt → "Press ctrl+c again to exit"
 //!   ([`EXIT_CONFIRM_MS`]) → exit. ctrl+o toggles details (subagents' steps, whole diffs).
 //! - **ctrl+k** (#44): the command palette over the prompt (`ui::command_palette`); the prompt keeps its text.
-//!   Never over an approval, the picker or setup; an approval arriving closes it.
+//!   Never over an approval, the picker or setup; an approval, the session picker or setup arriving closes it, and
+//!   they get keys before it (#113).
 //! - **Live tool drafts:** a streaming tool call is kept as the latest draft (dropped at a step's
 //!   end, [`STEP_ENDS`]) and shown by `DraftView` as `Writing src/app.js… (8s · ~400 tokens)`.
 //! - **Subagent view:** subagents' events fold into per-call `AgentLog`s; a click on an agent entry
@@ -117,6 +122,9 @@ use marv_core::{StopReason, Usage};
 
 /// How long "Press ctrl+c again to exit" waits for the second ctrl+c.
 pub const EXIT_CONFIRM_MS: Duration = Duration::from_millis(1500);
+/// A newly shown approval ignores the keys that would answer it for this long (#113): a key typed for the prompt or
+/// the palette just as the approval appears (an Enter, most of all, which answers Yes) must not decide it.
+pub const APPROVAL_ARM_MS: Duration = Duration::from_millis(400);
 /// How long a status bar flash ("Copied 3 lines") stays.
 pub const NOTICE_MS: Duration = Duration::from_millis(2000);
 /// A burst of streamed text is revealed over about this long (see the module docs): long enough to
@@ -326,6 +334,8 @@ pub struct App {
     palette: Option<CommandPalette>,
     approvals: VecDeque<Pending>,
     approval: Option<(ApprovalId, ApprovalView)>,
+    /// Until when the approval on screen ignores keys that would answer it ([`APPROVAL_ARM_MS`]).
+    approval_armed_at: Option<Instant>,
     picker: Option<SessionPicker>,
     setup: Option<Setup>,
 
@@ -396,6 +406,7 @@ impl App {
             palette: None,
             approvals: VecDeque::new(),
             approval: None,
+            approval_armed_at: None,
             picker: None,
             setup: None,
             copy,
@@ -651,7 +662,7 @@ impl App {
                 // answer it. The prompt's text is still there underneath.
                 self.palette = None;
                 self.approvals.push_back(Pending { id, request });
-                self.show_approvals();
+                self.show_approvals(now);
             }
             UiEvent::Message(message) => {
                 self.add_message(message);
@@ -666,6 +677,8 @@ impl App {
             }
             UiEvent::Clear => self.clear_transcript(),
             UiEvent::OpenSetup(context) => {
+                // Setup takes the keyboard: a palette left open underneath would be closed by nothing.
+                self.palette = None;
                 let setup = Setup::new(context);
                 if let Some(provider) = setup.needs_models() {
                     self.port.load_models(provider);
@@ -686,6 +699,8 @@ impl App {
                 } else if list.is_empty() {
                     self.system("No saved sessions for this project yet.");
                 } else {
+                    // The picker takes the keyboard (#113): a palette opened while the list loaded goes.
+                    self.palette = None;
                     self.picker = Some(SessionPicker::new(&list, unix_ms()));
                     self.dirty = true;
                 }
@@ -1081,8 +1096,9 @@ impl App {
     // Approvals
     // ------------------------------------------------------------------------------------------
 
-    /// The head of the queue is shown; a new head gets a fresh view (cursor back on Yes).
-    fn show_approvals(&mut self) {
+    /// The head of the queue is shown; a new head gets a fresh view (cursor back on Yes), armed only after
+    /// [`APPROVAL_ARM_MS`] so a key already on its way can't answer it.
+    fn show_approvals(&mut self, now: Instant) {
         let escape_cancels = self.viewing.is_none();
         match self.approvals.front() {
             None => self.approval = None,
@@ -1090,14 +1106,17 @@ impl App {
                 let waiting = self.approvals.len() - 1;
                 match &mut self.approval {
                     Some((id, view)) if *id == head.id => view.waiting = waiting,
-                    _ => self.approval = Some((head.id, ApprovalView::new(head.request.clone(), waiting, escape_cancels))),
+                    _ => {
+                        self.approval = Some((head.id, ApprovalView::new(head.request.clone(), waiting, escape_cancels)));
+                        self.approval_armed_at = Some(now + APPROVAL_ARM_MS);
+                    }
                 }
             }
         }
         self.dirty = true;
     }
 
-    fn decide(&mut self, decision: Decision) {
+    fn decide(&mut self, decision: Decision, now: Instant) {
         let Some(head) = self.approvals.pop_front() else { return };
         if decision == Decision::Always {
             // The session remembers the scope from now on; requests already waiting in it are covered too.
@@ -1108,14 +1127,15 @@ impl App {
                 self.port.answer(pending.id, Decision::Yes);
             }
         }
-        self.show_approvals();
+        self.show_approvals(now);
         self.port.answer(head.id, decision);
     }
 
     /// No to everything waiting (ctrl+c at an approval, and part of Esc).
     fn decline_all(&mut self) {
         let pending: Vec<_> = self.approvals.drain(..).collect();
-        self.show_approvals();
+        self.approval = None;
+        self.dirty = true;
         for p in pending {
             self.port.answer(p.id, Decision::No);
         }
@@ -1174,7 +1194,7 @@ impl App {
             }
             return;
         }
-        if self.palette.is_some() && self.approval.is_none() {
+        if self.palette.is_some() && self.approval.is_none() && self.picker.is_none() {
             self.on_palette_key(key);
             return;
         }
@@ -1230,8 +1250,13 @@ impl App {
             }
         } else if let Some((_, view)) = &mut self.approval {
             view.escape_cancels = !viewing_before;
+            // Not yet armed: only Esc (and ctrl+c, above) and scrolling a file list get through.
+            let armed = self.approval_armed_at.is_none_or(|at| now >= at);
+            if !armed && !matches!(key.code, KeyCode::Esc | KeyCode::PageUp | KeyCode::PageDown) {
+                return;
+            }
             match view.on_key(key) {
-                Some(ApprovalOutcome::Decide(decision)) => self.decide(decision),
+                Some(ApprovalOutcome::Decide(decision)) => self.decide(decision, now),
                 Some(ApprovalOutcome::CancelAll) => self.cancel_all(),
                 None => {}
             }
@@ -1832,6 +1857,11 @@ mod tests {
             panic!("the reveal never finished");
         }
 
+        /// Past the time a newly shown approval ignores answering keys ([`APPROVAL_ARM_MS`]).
+        fn arm(&mut self) {
+            self.advance(APPROVAL_ARM_MS.as_millis() as u64);
+        }
+
         fn key(&mut self, code: KeyCode) {
             self.app.on_key(KeyEvent::new(code, KeyModifiers::NONE), self.now);
         }
@@ -2187,6 +2217,7 @@ mod tests {
         assert!(frame.contains("Create made.txt"));
         assert!(frame.contains("Do you want to proceed?"));
         assert!(!frame.contains("Type a message"));
+        h.arm();
         h.key(ENTER); // Yes
         assert_eq!(h.calls().last(), Some(&Call::Answer(1, Decision::Yes)));
         assert!(!h.frame().contains("Do you want to proceed?"));
@@ -2197,6 +2228,7 @@ mod tests {
         let mut h = harness();
         h.typed("make a file");
         h.events([UiEvent::Approval { id: ApprovalId(1), request: write_request("made.txt", None) }]);
+        h.arm();
         h.key(DOWN);
         h.key(DOWN);
         h.key(ENTER);
@@ -2243,6 +2275,7 @@ mod tests {
         assert!(frame.contains("1 more waiting"));
         assert!(frame.contains("2 agents running"));
         assert!(frame.contains("[general-purpose · one]"));
+        h.arm();
         h.key(DOWN);
         h.key(DOWN);
         assert!(h.frame().contains("❯ No, and tell Marv"));
@@ -2252,6 +2285,10 @@ mod tests {
         assert!(frame.contains("❯ Yes"));
         assert!(!frame.contains("❯ No"));
         assert!(!frame.contains("more waiting"));
+        // The next head is armed afresh: an Enter pressed twice doesn't answer it too.
+        h.key(ENTER);
+        assert_eq!(&h.calls()[1..], [Call::Answer(1, Decision::No)]);
+        h.arm();
         h.key(ENTER);
         assert_eq!(&h.calls()[1..], [Call::Answer(1, Decision::No), Call::Answer(2, Decision::Yes)]);
     }
@@ -2267,6 +2304,7 @@ mod tests {
             UiEvent::Approval { id: ApprovalId(2), request: other },
             UiEvent::Approval { id: ApprovalId(3), request: write_request("two.txt", None) },
         ]);
+        h.arm();
         h.key(DOWN);
         h.key(ENTER); // Yes, and don't ask again for file changes
         assert_eq!(&h.calls()[1..], [Call::Answer(3, Decision::Yes), Call::Answer(1, Decision::Always)]);
@@ -2499,6 +2537,7 @@ mod tests {
         assert!(!h.frame().contains("esc to go back"));
         assert!(h.frame().contains("Do you want to proceed?")); // still asking
         assert_eq!(h.calls(), [Call::Send("make a file".into())]);
+        h.arm();
         h.key(ENTER);
         assert_eq!(h.calls().last(), Some(&Call::Answer(1, Decision::Yes)));
     }
@@ -2933,10 +2972,12 @@ mod tests {
         assert!(!frame.contains("Search commands"), "{frame}");
         assert!(frame.contains("Create made.txt"), "{frame}");
         assert!(!h.calls().iter().any(|c| matches!(c, Call::Answer(..))));
+        h.arm();
         h.key(ENTER);
         assert!(h.calls().contains(&Call::Answer(1, Decision::Yes)));
 
-        // Open, then an approval arrives: it takes over, and an Enter answers it, not the palette.
+        // Open, then an approval arrives: it takes over. An Enter meant for the palette, pressed just as it appears,
+        // answers nothing (#113) and runs nothing; one after the arm delay answers it.
         let mut h = harness();
         h.typed("make a file");
         h.ctrl('k');
@@ -2946,8 +2987,83 @@ mod tests {
         assert!(!frame.contains("Search commands"), "{frame}");
         assert!(frame.contains("Create other.txt"), "{frame}");
         h.key(ENTER);
+        assert!(!h.calls().iter().any(|c| matches!(c, Call::Answer(..))), "{:?}", h.calls());
+        assert!(!h.calls().contains(&Call::Command("/yolo off".into())));
+        assert!(h.frame().contains("Create other.txt"));
+        h.arm();
+        h.key(ENTER);
         assert!(h.calls().contains(&Call::Answer(2, Decision::Yes)));
         assert!(!h.calls().contains(&Call::Command("/yolo off".into())));
+    }
+
+    #[test]
+    fn an_approval_ignores_answering_keys_typed_for_the_prompt_as_it_appears() {
+        let mut h = harness();
+        h.typed("make a file");
+        type_only(&mut h, "next messag");
+        h.events([UiEvent::Approval { id: ApprovalId(1), request: write_request("made.txt", None) }]);
+        // Still typing: the rest of the word, then Enter. None of it answers, moves the choice or reaches the prompt.
+        type_only(&mut h, "e");
+        h.key(DOWN);
+        h.key(ENTER);
+        assert!(!h.calls().iter().any(|c| matches!(c, Call::Answer(..))), "{:?}", h.calls());
+        let frame = h.frame();
+        assert!(frame.contains("❯ Yes"), "{frame}");
+        assert_eq!(h.app.prompt.value, "next messag");
+        // Just before the window ends, still nothing; at its end the Enter answers as before.
+        h.advance(APPROVAL_ARM_MS.as_millis() as u64 - FRAME_INTERVAL.as_millis() as u64 - 2);
+        h.key(ENTER);
+        assert!(!h.calls().iter().any(|c| matches!(c, Call::Answer(..))));
+        h.arm();
+        h.key(ENTER);
+        assert_eq!(h.calls().last(), Some(&Call::Answer(1, Decision::Yes)));
+    }
+
+    #[test]
+    fn esc_still_declines_an_approval_before_it_is_armed() {
+        let mut h = harness();
+        h.typed("make a file");
+        h.events([UiEvent::Approval { id: ApprovalId(1), request: write_request("made.txt", None) }]);
+        h.key(ESC);
+        assert_eq!(&h.calls()[1..], [Call::Answer(1, Decision::No), Call::Abort]);
+    }
+
+    #[test]
+    fn the_session_picker_takes_over_from_a_palette_opened_while_its_list_loaded() {
+        let mut h = harness();
+        h.typed("/resume");
+        h.ctrl('k');
+        assert!(h.frame().contains("Search commands"));
+        let summary = |id: &str, title: &str| SessionSummary {
+            id: id.into(),
+            title: title.into(),
+            updated_at: 0,
+            messages: 2,
+            model: "m".into(),
+        };
+        h.event(UiEvent::Sessions(vec![summary("s1", "First"), summary("s2", "Second")]));
+        let frame = h.frame();
+        assert!(frame.contains("Resume a session"), "{frame}");
+        assert!(!frame.contains("Search commands"), "{frame}");
+        h.key(DOWN);
+        h.key(ENTER);
+        assert_eq!(h.calls().last(), Some(&Call::Resume(Some("s2".into()))));
+        assert!(h.app.palette.is_none());
+    }
+
+    #[test]
+    fn setup_takes_over_from_an_open_palette() {
+        let mut h = harness();
+        h.ctrl('k');
+        h.event(UiEvent::OpenSetup(crate::view::SetupContext {
+            start: SetupStart::Model,
+            presets: vec![],
+            current: None,
+            saved_key: None,
+            env_keys: vec![],
+        }));
+        assert!(h.app.palette.is_none());
+        assert!(!h.frame().contains("Search commands"));
     }
 
     #[test]
