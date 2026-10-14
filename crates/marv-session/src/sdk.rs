@@ -69,6 +69,18 @@ pub struct SessionOptions {
     pub checks: bool,
     pub mcp_tools: McpToolsSetting,
     pub sandbox: bool,
+    /// Let bash run a command on the host, outside the sandbox (`sandbox: false`), when your approver says yes. Asked
+    /// every time (the request has `door: Host` and `once`; an "always" counts as one yes). Default false: such calls
+    /// are refused before your approver is asked (Marv #52).
+    pub host_commands: bool,
+    /// Offer the github tool (gh with the user's login, outside the sandbox) when gh is on PATH and logged in,
+    /// checked once here. Reads run without asking; writes and sensitive API reads go to your approver (`door:
+    /// Github`, scope `github:<command>`); what can never run (auth, config, extensions, --web, another host…) is
+    /// refused. Default false (Marv #47).
+    pub github: bool,
+    /// Whether gh is there and logged in, when the caller already asked (`marv -p` asks before it joins the mesh);
+    /// None: asked here, when `github` is set.
+    pub github_known: Option<bool>,
     pub yolo: bool,
     pub thinking: bool,
     pub persist: Store<SessionStore>,
@@ -105,6 +117,9 @@ impl SessionBuilder {
                 checks: true,
                 mcp_tools: McpToolsSetting::Auto,
                 sandbox: true,
+                host_commands: false,
+                github: false,
+                github_known: None,
                 yolo: true,
                 thinking: false,
                 persist: Store::Off,
@@ -234,6 +249,15 @@ pub async fn create_session(options: SessionOptions) -> Result<MarvSession, Sess
         )
     });
 
+    // Before the session: its tool list is fixed from the start (the prompt cache).
+    let github = options.github
+        && match options.github_known {
+            Some(known) => known,
+            None => {
+                let pairs: Vec<(String, String)> = env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                marv_tools::github::github_available(&pairs, marv_tools::github::AUTH_CHECK).await
+            }
+        };
     let mut init = SessionInit::new(root.clone(), ProviderChoice::Option(options.provider));
     init.thinking = options.thinking;
     init.instructions = loaded.instructions.map(|i| i.text);
@@ -252,6 +276,8 @@ pub async fn create_session(options: SessionOptions) -> Result<MarvSession, Sess
     init.checks = options.checks;
     init.mcp_tools = options.mcp_tools;
     init.sandbox = options.sandbox;
+    init.host_commands = options.host_commands;
+    init.github = github;
     init.yolo = options.yolo;
     init.no_yolo = no_yolo;
     init.sessions = store_for(&options.persist, || SessionStore::new(config_dir.join("sessions")));

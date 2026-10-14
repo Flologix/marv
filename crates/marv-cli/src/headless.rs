@@ -43,7 +43,7 @@ pub enum ExitCode {
 }
 
 /// Known `--approve` names and the scope-key prefixes they match.
-pub const APPROVE_PREFIXES: [(&str, &[&str]); 7] = [
+pub const APPROVE_PREFIXES: [(&str, &[&str]); 8] = [
     ("git_write", &["bash:git:", "bash:net:git:"]),
     ("network", &["bash:net:"]),
     ("web", &["web:"]),
@@ -51,6 +51,8 @@ pub const APPROVE_PREFIXES: [(&str, &[&str]); 7] = [
     ("files", &["files"]),
     ("memory", &["memory"]),
     ("agent_worktree", &["agent:worktree"]),
+    // The github tool's writes and sensitive reads (#47); its reads need nothing.
+    ("github", &["github:"]),
 ];
 
 /// `marv -p --approve`'s approver: yes for the listed scopes, unavailable for the rest.
@@ -157,7 +159,10 @@ impl Collector {
         else {
             return;
         };
-        if !(run.result.output.contains(NO_APPROVER) || run.approval == ApprovalRecord::No || run.declined) {
+        // Or a command for the host, which headless never runs, whatever --approve says (#52).
+        let refused_here = run.result.output.contains(NO_APPROVER)
+            || (run.result.is_error && run.result.output.contains(marv_tools::bash::NO_HOST_DOOR));
+        if !(refused_here || run.approval == ApprovalRecord::No || run.declined) {
             return;
         }
         let refused =
@@ -378,6 +383,14 @@ pub async fn run_headless(options: HeadlessOptions) -> ExitCode {
     if let Some(approve) = approve {
         builder = builder.approve(approve);
     }
+    // gh with the user's login, when it's there (MARV_GITHUB=off hides it): reads run, writes need --approve github.
+    // Asked here, before the mesh starts: another Marv lists this one once its main agent's plug is bound, and gh
+    // auth status can take up to 2 s. No host_commands: nobody approves each command here (#52).
+    let github = marv_tools::github::github_wanted(env.get("MARV_GITHUB").map(String::as_str)) && {
+        let pairs: Vec<(String, String)> = env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        marv_tools::github::github_available(&pairs, marv_tools::github::AUTH_CHECK).await
+    };
+    (builder.options.github, builder.options.github_known) = (github, Some(github));
     // The mesh, when asked for (`--approve mesh:<r>` or `MARV_MESH_NAME`): otherwise a one-off `marv -p` isn't on it
     // and its model isn't offered the mesh tools. Wires are granted only for the listed receptacles, from this run's
     // own agents or from another Marv (its door).
@@ -448,6 +461,34 @@ mod tests {
             protected: None,
             door: None,
         }
+    }
+
+    // Marv's tests/github-tool.test.ts, "marv -p".
+    #[tokio::test]
+    async fn approve_github_approves_writes_and_sensitive_reads_nothing_else() {
+        let (a, _) = build_approver(&["github".into()]).unwrap();
+        let a = a.unwrap();
+        assert_eq!(a.approve(request("github:pr merge")).await, Decision::Yes);
+        assert_eq!(a.approve(request("github:api sensitive")).await, Decision::Yes);
+        assert_eq!(a.approve(request("bash:echo")).await, Decision::Unavailable);
+        assert_eq!(a.approve(request("bash:host:echo")).await, Decision::Unavailable);
+        let (none, _) = build_approver(&["network".into()]).unwrap();
+        assert_eq!(none.unwrap().approve(request("github:pr merge")).await, Decision::Unavailable);
+    }
+
+    // #52: a command for the host is refused in -p whatever --approve says, and listed as refused (exit 3).
+    #[test]
+    fn a_host_command_is_listed_as_refused() {
+        let mut c = Collector::default();
+        let call = marv_core::ToolCall { id: "1".into(), name: "bash".into(), arguments: "{}".into() };
+        let result = marv_core::ToolResult {
+            output: marv_tools::bash::NO_HOST_DOOR.into(),
+            summary: Some("error".into()),
+            is_error: true,
+        };
+        let run = marv_agent::ToolRun::new(result, "systemctl --user restart x");
+        c.event(&SessionEvent::Loop(LoopEvent::ToolEnd { call, run }));
+        assert_eq!(c.refused, vec![Refused { tool: "bash".into(), label: "systemctl --user restart x".into() }]);
     }
 
     #[tokio::test]
