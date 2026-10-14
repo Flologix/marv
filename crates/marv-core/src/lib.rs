@@ -222,9 +222,36 @@ pub enum MarvError {
 
 pub type Result<T, E = MarvError> = std::result::Result<T, E>;
 
+/// `text` with every closing tag for `tag` (`</tag`, in any case, spaces allowed after `</`) turned into `<\/…`, so
+/// text quoted inside a `<tag>` fence can't close it. `tag` is ASCII.
+pub fn defuse_closing_tag(text: &str, tag: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find("</") {
+        let after = &rest[i + 2..];
+        let name = after.trim_start_matches(|c: char| c.is_ascii_whitespace());
+        let closes = name.get(..tag.len()).is_some_and(|n| n.eq_ignore_ascii_case(tag));
+        out.push_str(&rest[..i]);
+        out.push_str(if closes { "<\\/" } else { "</" });
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closing_tags_are_defused_in_any_case() {
+        let tag = "untrusted-data";
+        assert_eq!(defuse_closing_tag("a</untrusted-data>b", tag), "a<\\/untrusted-data>b");
+        assert_eq!(defuse_closing_tag("</UNTRUSTED-DATA></Untrusted-Data >", tag), "<\\/UNTRUSTED-DATA><\\/Untrusted-Data >");
+        assert_eq!(defuse_closing_tag("</ untrusted-data>", tag), "<\\/ untrusted-data>");
+        assert_eq!(defuse_closing_tag("</b> </untrusted <é </", tag), "</b> </untrusted <é </");
+        assert_eq!(defuse_closing_tag("</untrusted-datä", tag), "</untrusted-datä");
+    }
 
     #[test]
     fn chat_turn_round_trips_with_marv_ts_field_names() {

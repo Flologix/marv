@@ -2090,8 +2090,9 @@ impl MarvSession {
         if let Some(stop) = hook_stop {
             stop.cancel();
         }
+        // A backstop: the commands are bounded already (killed, then a short grace for their pipes).
         if let Some(task) = hook_task {
-            let _ = task.await;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
         }
         // A turn's end saves its conversation (and arms a save timer): waiting for it means that save is part of
         // this flush, rather than one that lands after close() returned.
@@ -4552,5 +4553,17 @@ mod turn_tests {
         session.close().await;
         tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
         assert!(!dirs.dir.join("late").exists());
+    }
+
+    #[tokio::test]
+    async fn close_returns_when_a_hooks_child_left_the_group_with_the_pipe() {
+        let dirs = Dirs::new();
+        let hook = HookCommand { timeout: std::time::Duration::from_secs(60), ..hook("setsid sh -c 'sleep 30' & sleep 30") };
+        let session = scripted(&dirs, &Scripted::new(vec![]), |i| i.hooks = vec![hook]);
+        session.run_start_hooks();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let started = std::time::Instant::now();
+        session.close().await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(4), "{:?}", started.elapsed());
     }
 }
