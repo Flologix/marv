@@ -1,6 +1,7 @@
 //! The `Marv:` notes bash appends to a sandboxed command's output, and the guesses that decide when.
 //!
-//! Ports `GIT_HINT`, `HOME_NOTE`, `NETWORK_NOTE`, `GH_NOTE`, `touchesHiddenHome` and `looksLikeNetworkFailure` from
+//! Ports `GIT_HINT`, `HOME_NOTE`, `NETWORK_NOTE`, `GH_NOTE`, `BACKGROUND_NOTE` (and its process-door variant),
+//! `touchesHiddenHome`, `backgroundsProcess` and `looksLikeNetworkFailure` from
 //! Marv's `src/tools/bash.ts`. They live here because each one explains the sandbox to the model.
 //!
 //! - The home note: the prompt said "hidden", but `ls ~/.marv` showed `skills/` (mounted back in), so a model decided
@@ -30,6 +31,50 @@ pub const NETWORK_NOTE: &str = "Marv: this command ran in the sandbox without ne
 
 /// Added to the network note when the failed command is `gh`.
 pub const GH_NOTE: &str = "For GitHub, don't suggest gh auth login, and never mount gh's config into the sandbox (a token there must not reach command output): suggest the GitHub MCP server instead, which the user connects in ~/.marv/mcp.json — see Marv's README, \"Connect GitHub\".";
+
+/// Appended when a sandboxed command leaves processes running in the background: each command runs in its own PID
+/// namespace, so everything it started is killed when it ends, and (without network) its localhost isn't the user's
+/// anyway. A model started a dev server detached, curled it successfully inside the sandbox, and told the user "the
+/// server's up" with a dead link (Marv issue #50).
+pub const BACKGROUND_NOTE: &str = "Marv: anything this command started in the background was stopped when the command ended, and a server in the sandbox can't be reached from the user's browser (the sandbox has its own network namespace; with network: true its localhost is the host's). Don't say a server is running for the user: to check one yourself, run it in the foreground within one command, query it there, and let the command end; to let the user try it, give them the command to run in their own terminal.";
+
+/// The same, where the session has the process door (Marv #51): the way to keep one running is the process tool.
+pub const BACKGROUND_NOTE_PROCESS: &str = "Marv: anything this command started in the background was stopped when the command ended, and a server in the sandbox can't be reached from the user's browser (the sandbox has its own network namespace; with network: true its localhost is the host's). Don't say a server is running for the user: to check one yourself, run it in the foreground within one command, query it there, and let the command end; to keep a server or watcher running for the user, use the process tool instead.";
+
+/// Whether a command leaves processes running in the background, as far as its text can say: a background `&` (an
+/// unquoted one, outside `&&`), `nohup`/`setsid`/`disown`, or a command whose very job is to keep serving (`dev`,
+/// `start`, `serve` — as the command or a `run`/package-runner script, not as an argument like `echo start`). A guess,
+/// for [`BACKGROUND_NOTE`] only. Marv's `backgroundsProcess`; its `(?=$|[\s#])` lookahead is a consuming group here.
+pub fn backgrounds_process(command: &str) -> bool {
+    static RES: OnceLock<[Regex; 4]> = OnceLock::new();
+    let [quoted, comment, redirect, amp] = RES.get_or_init(|| {
+        [
+            Regex::new(r#""(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'"#).unwrap(),
+            Regex::new(r"(^|\s)#[^\n]*").unwrap(),
+            Regex::new(r"(\d)>&(\d)").unwrap(),
+            Regex::new(r"(?:^|[\s;|])&(?:$|[\s#])").unwrap(),
+        ]
+    });
+    let clean = quoted.replace_all(command, " "); // quoted text, including any & in it
+    let clean = comment.replace_all(&clean, "$1"); // comments
+    let clean = clean.replace("&&", " ");
+    let clean = redirect.replace_all(&clean, "$1=$2"); // 2>&1 isn't backgrounding
+    if amp.is_match(&clean) {
+        return true;
+    }
+    let serving = |word: Option<&&str>| word.is_some_and(|w| matches!(*w, "dev" | "start" | "serve"));
+    clean.split([';', '|', '\n', '&']).any(|segment| {
+        let words: Vec<&str> = segment.split_whitespace().collect();
+        let Some(head) = words.first() else { return false };
+        if matches!(*head, "nohup" | "setsid" | "disown") || serving(Some(head)) {
+            return true;
+        }
+        if matches!(*head, "npm" | "pnpm" | "yarn" | "bun" | "npx" | "bunx") {
+            return if words.get(1) == Some(&"run") { serving(words.get(2)) } else { serving(words.get(1)) };
+        }
+        false
+    })
+}
 
 fn network_errors() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -89,6 +134,32 @@ pub fn touches_hidden_home(command: &str, root: &Path, home: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backgrounds_process_sees_a_trailing_amp_nohup_setsid_disown_and_serve_dev_start_commands() {
+        for command in [
+            "node server.cjs &",
+            "nohup node server.cjs > log 2>&1",
+            "setsid nohup node server.cjs &",
+            "bun run dev & disown",
+            "bunx serve -l 4789",
+            "npm run dev",
+        ] {
+            assert!(backgrounds_process(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn backgrounds_process_not_for_ordinary_foreground_commands() {
+        for command in ["bun test", "git push origin main", "echo 'run it with &'", "cat a && b", "echo start; ls"] {
+            assert!(!backgrounds_process(command), "{command}");
+        }
+        // `wait` alone, or a comment after &, doesn't background anything; `wait` after a real & does.
+        assert!(!backgrounds_process("echo done # not &"));
+        assert!(backgrounds_process("bun run dev & wait"));
+        // 2>&1 isn't backgrounding.
+        assert!(!backgrounds_process("cargo build 2>&1"));
+    }
 
     #[test]
     fn touches_the_home_folder_or_anything_hidden_in_it() {

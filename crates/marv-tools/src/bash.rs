@@ -38,7 +38,10 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use marv_sandbox::git_guard::{GitGuard, git_guard, worktree_git};
-use marv_sandbox::notes::{GH_NOTE, GIT_HINT, HOME_NOTE, NETWORK_NOTE, looks_like_network_failure, runs_gh, touches_hidden_home};
+use marv_sandbox::notes::{
+    BACKGROUND_NOTE, BACKGROUND_NOTE_PROCESS, GH_NOTE, GIT_HINT, HOME_NOTE, NETWORK_NOTE, backgrounds_process,
+    looks_like_network_failure, runs_gh, touches_hidden_home,
+};
 use marv_sandbox::paths::is_inside;
 use marv_sandbox::protected::{ProtectedRule, created_note, nested_git_dirs, protected_snapshot, revert_created, scan_created};
 
@@ -415,6 +418,11 @@ impl Tool for Bash {
         if sandboxed && touches_hidden_home(&input.command, &ctx.root, &ctx.sandbox.home) {
             result.output.push_str(&format!("\n{HOME_NOTE}\n"));
         }
+        // Everything a command backgrounds dies with it (Marv #50); with the process door, that's the way instead (#51).
+        if sandboxed && backgrounds_process(&input.command) {
+            let note = if ctx.doors.process { BACKGROUND_NOTE_PROCESS } else { BACKGROUND_NOTE };
+            result.output.push_str(&format!("\n{note}\n"));
+        }
         // Not for a command that isn't there (127) or can't run (126): the network has nothing to do with those.
         let failed = result.timed_out || (!result.aborted && !matches!(result.exit_code, Some(0 | 126 | 127)));
         if sandboxed && !network && failed && looks_like_network_failure(&input.command, &result.output) {
@@ -727,6 +735,32 @@ mod tests {
         assert!(result.output.contains("Marv: ") && result.output.contains("stand-in"));
         assert!(result.output.find("/.marv").unwrap() < result.output.find("Marv: ").unwrap());
         assert_eq!(result.summary, "exit 0 · 1 line of output");
+    }
+
+    #[tokio::test]
+    async fn the_background_note_is_added_when_a_sandboxed_command_leaves_processes_in_the_background() {
+        // Marv issue #50.
+        require_bwrap!();
+        let root = TempDir::new("bash-note-bg");
+        let result = Bash.run(&bash("echo started; sleep 30 &"), &tool_ctx(&root, true)).await.unwrap();
+        assert!(result.output.contains(&format!("\n{BACKGROUND_NOTE}\n")), "{}", result.output);
+        assert!(result.output.find("started").unwrap() < result.output.find("Marv: ").unwrap());
+        assert_eq!(result.summary, "exit 0 · 1 line of output");
+        // With the process door, it points at the process tool instead (#51).
+        let mut door = tool_ctx(&root, true);
+        door.doors.process = true;
+        let result = Bash.run(&bash("echo started; sleep 30 &"), &door).await.unwrap();
+        assert!(result.output.contains(&format!("\n{BACKGROUND_NOTE_PROCESS}\n")), "{}", result.output);
+        assert!(!result.output.contains(BACKGROUND_NOTE));
+    }
+
+    #[tokio::test]
+    async fn the_background_note_isnt_added_without_the_sandbox_or_for_a_foreground_command() {
+        let root = TempDir::new("bash-note-bg-none");
+        assert!(!Bash.run(&bash("echo started; true &"), &tool_ctx(&root, false)).await.unwrap().output.contains("Marv: "));
+        if sandbox_available() {
+            assert!(!Bash.run(&bash("echo started"), &tool_ctx(&root, true)).await.unwrap().output.contains("Marv: "));
+        }
     }
 
     #[tokio::test]
