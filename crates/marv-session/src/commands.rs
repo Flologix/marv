@@ -15,6 +15,7 @@ use marv_mcp::manager::{McpServerStatus, McpState};
 use crate::agents::{AgentType, SUBAGENT_TOOLS};
 use crate::checks::{CHECKS_DIR, ProjectCheck, ProjectCheckResult};
 use crate::config::{Config, KeySource, mask_key, preset};
+use crate::session::CheckpointProblem;
 use crate::skills::{LoadedSkill, SkillSource};
 use crate::usage::{Totals, usage_report};
 
@@ -55,6 +56,11 @@ pub enum CommandAction {
     Checks {
         on: bool,
     },
+    Checkpoints {
+        on: bool,
+    },
+    /// Show the last turn's changes and, on a yes, put its files back (#16).
+    Undo,
     /// The step limit: set it (0 never asks). Showing it is a `Print`.
     Steps {
         every: u32,
@@ -131,6 +137,8 @@ pub struct CommandContext<'a> {
     pub usage: Option<(&'a Totals, Option<&'a marv_core::Usage>, Option<u64>)>,
     /// The project's checks on disk, problems, the session's last pass.
     pub checks: Option<(&'a [ProjectCheck], &'a [String], Option<&'a ProjectCheckResult>)>,
+    /// Why the last checkpoint failed, or why checkpoints are off for this project, for /checkpoints.
+    pub checkpoints: Option<&'a CheckpointProblem>,
     /// PATH folders under the home folder the sandbox can't see, shortened for display.
     pub hidden_path_folders: &'a [String],
     pub sandbox_available: bool,
@@ -326,6 +334,36 @@ pub fn commands() -> &'static [Command] {
             },
         },
         Command {
+            name: "undo",
+            description: "Put back the files the last turn changed (shows them first)",
+            run: |args, _| {
+                if args.trim().is_empty() {
+                    CommandAction::Undo
+                } else {
+                    error("Usage: /undo (it takes back the last turn not yet undone; again for the one before)")
+                }
+            },
+        },
+        Command {
+            name: "checkpoints",
+            description: "Snapshots before each turn's changes, for /undo (/checkpoints on, /checkpoints off)",
+            run: |args, ctx| match on_off(args, "Usage: /checkpoints, /checkpoints on, or /checkpoints off") {
+                Ok(Some(on)) => CommandAction::Checkpoints { on },
+                Ok(None) => {
+                    let problem = match ctx.checkpoints {
+                        Some(CheckpointProblem { off: Some(off), .. }) => format!("\nOff for this project: {}.", printable(off)),
+                        Some(CheckpointProblem { failure: Some(failure), .. }) => {
+                            format!("\nThe last checkpoint failed: {}", printable(failure))
+                        }
+                        _ => String::new(),
+                    };
+                    let problem = if ctx.config.checkpoints { problem } else { String::new() };
+                    print(format!("Checkpoints: {}{problem}", checkpoints_status(ctx.config)))
+                }
+                Err(e) => e,
+            },
+        },
+        Command {
             name: "diagnostics",
             description: "Typecheck after the model's edits (/diagnostics on, /diagnostics off)",
             run: |args, ctx| match on_off(args, "Usage: /diagnostics, /diagnostics on, or /diagnostics off") {
@@ -417,6 +455,7 @@ fn config_text(ctx: &CommandContext) -> String {
         format!("Trajectories: {} (/trajectories)", if c.trajectories { "on" } else { "off" }),
         format!("Diagnostics: {} (/diagnostics)", if c.diagnostics { "on" } else { "off" }),
         format!("Checks:    {} (/checks)", if c.checks { "on" } else { "off" }),
+        format!("Checkpoints: {} (/checkpoints, /undo)", if c.checkpoints { "on" } else { "off" }),
         format!("Steps: {}", steps_status(c)),
         format!("Endpoint:  {}", c.base_url),
     ];
@@ -431,6 +470,14 @@ fn config_text(ctx: &CommandContext) -> String {
 pub fn diagnostics_status(config: &Config) -> String {
     if config.diagnostics {
         "on: after the model changes files in a TypeScript project, Marv runs the project's typecheck (in the sandbox, read-only) and tells the model about new errors".into()
+    } else {
+        "off".into()
+    }
+}
+
+pub fn checkpoints_status(config: &Config) -> String {
+    if config.checkpoints {
+        "on: before a turn's first change Marv snapshots the project's files (git, under a hidden ref; never your branch, index or stash), so /undo can put them back".into()
     } else {
         "off".into()
     }
@@ -767,6 +814,7 @@ mod tests {
             trajectories_path: None,
             usage: None,
             checks: None,
+            checkpoints: None,
             hidden_path_folders: &[],
             sandbox_available: true,
             processes: None,
@@ -863,6 +911,33 @@ mod tests {
             assert!(commands().iter().all(|c| text.contains(&format!("/{}", c.name))));
             let CommandAction::Print { text, .. } = run_command("/config", ctx) else { panic!() };
             assert!(text.contains("sk-or-v1-a…wxyz (from OPENROUTER_API_KEY)"));
+        });
+    }
+
+    #[test]
+    fn undo_and_checkpoints_says_what_it_does_and_the_last_failure_or_turns_it_on_and_off() {
+        with(|ctx| {
+            assert_eq!(run_command("/undo", ctx), CommandAction::Undo);
+            assert!(matches!(run_command("/undo 3", ctx), CommandAction::Print { is_error: true, .. }));
+            assert_eq!(run_command("/checkpoints off", ctx), CommandAction::Checkpoints { on: false });
+            assert_eq!(run_command("/checkpoints on", ctx), CommandAction::Checkpoints { on: true });
+            let CommandAction::Print { text, is_error: false, .. } = run_command("/checkpoints", ctx) else { panic!() };
+            assert!(text.contains("/undo"), "{text}");
+            assert!(matches!(run_command("/checkpoints maybe", ctx), CommandAction::Print { is_error: true, .. }));
+            let failed = CheckpointProblem { failure: Some("disk full".into()), off: None };
+            let CommandAction::Print { text, .. } =
+                run_command("/checkpoints", &CommandContext { checkpoints: Some(&failed), ..ctx.clone() })
+            else {
+                panic!()
+            };
+            assert!(text.contains("disk full"), "{text}");
+            let off = Config { checkpoints: false, ..ctx.config.clone() };
+            assert_eq!(
+                run_command("/checkpoints", &CommandContext { config: &off, ..ctx.clone() }),
+                CommandAction::Print { text: "Checkpoints: off".into(), is_error: false, markdown: false }
+            );
+            let CommandAction::Print { text, .. } = run_command("/config", ctx) else { panic!() };
+            assert!(text.contains("Checkpoints: on (/checkpoints, /undo)"));
         });
     }
 

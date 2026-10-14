@@ -49,6 +49,10 @@ impl Tool for McpToolAdapter {
     fn kind(&self) -> ToolKind {
         self.tool.kind(self.taint.is_tainted())
     }
+    /// An MCP server acts outside the project: nothing for /undo to put back (#16).
+    fn checkpoint(&self) -> bool {
+        false
+    }
     fn provenance(&self) -> Provenance {
         Provenance::Mcp
     }
@@ -142,6 +146,9 @@ impl Tool for McpCallTool {
     }
     fn kind(&self) -> ToolKind {
         if self.taint.is_tainted() { ToolKind::Egress } else { ToolKind::Execute }
+    }
+    fn checkpoint(&self) -> bool {
+        false
     }
     fn provenance(&self) -> Provenance {
         Provenance::Mcp

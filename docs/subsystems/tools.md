@@ -1,6 +1,6 @@
 # marv-tools
 
-The `Tool` trait, the registry and `run_tool` (preview, approval, yolo, repair), and Marv's built-in tools: `read_file`, `glob`, `grep`, `web_fetch`, `skill`, `edit_file`, `write_file`, `bash`, `memory` and `agent`. It also holds edit matching, syntax checks, diffs and the web readers. The sandbox and the path rules live in `marv-sandbox`. Tools reach them through `files.rs`.
+The `Tool` trait, the registry and `run_tool` (preview, approval, yolo, repair), and Marv's built-in tools: `read_file`, `glob`, `grep`, `web_fetch`, `skill`, `edit_file`, `write_file`, `bash`, `memory`, `plan` and `agent`. It also holds edit matching, syntax checks, diffs and the web readers. The sandbox and the path rules live in `marv-sandbox`. Tools reach them through `files.rs`.
 
 Spec: the **Tools**, **Web**, **Skills**, **Memory**, **Subagents** and **Yolo mode** bullets in Marv's `CLAUDE.md`, `src/tools/**`, and `tests/{tools,edit-match,tool-call-repair,diff,bash,web-*,write-tools,agent-tool,skills}.test.ts`.
 
@@ -8,8 +8,8 @@ Spec: the **Tools**, **Web**, **Skills**, **Memory**, **Subagents** and **Yolo m
 
 | Marv (TS) | Rust module | Status |
 |---|---|---|
-| `src/tools/types.ts` | `types.rs` | Done: `Tool` (typed `Input`), the type-erased `DynTool`, `ToolContext`, `ToolOutput`, `Preview`, `Scope`, `ApprovalRequest`, `Decision`, `Approval`, `Approver`, `BeforeChange`, `AgentHost`, `Skill`, `MemoryPaths`, `DiffLine`/`DiffShown`; #24: `ProcessHost`, `ProcessForwards`, `ProcessForward`, `ProcessInfo`, `ProcessState`, `StartResult`, `ToolContext::{processes, forwards}` |
-| `src/tools/index.ts` | `registry.rs` | **Ported and tested:** `run_tool` (the whole approval flow, plus taint and protected paths), `builtin_tools` (Marv's order), `tool_specs`/`tool_specs_for`, `is_parallel_call` |
+| `src/tools/types.ts` | `types.rs` | Done: `Tool` (typed `Input`), the type-erased `DynTool`, `ToolContext`, `ToolOutput`, `Preview`, `Scope`, `ApprovalRequest`, `Decision`, `Approval`, `Approver`, `BeforeChange`, `AgentHost`, `Skill`, `MemoryPaths`, `DiffLine`/`DiffShown`. #22: `Checkpoint` (`ToolContext::checkpoint`, separate from `before_change`), `Tool::checkpoint` (default: Write or Execute; false for `memory`, `agent`, MCP and mesh tools), `Preview::files`/`PreviewFile`; #24: `ProcessHost`, `ProcessForwards`, `ProcessForward`, `ProcessInfo`, `ProcessState`, `StartResult`, `ToolContext::{processes, forwards}` |
+| `src/tools/index.ts` | `registry.rs` | **Ported and tested:** `run_tool` (the whole approval flow, plus taint and protected paths), `builtin_tools` (Marv's order), `tool_specs`/`tool_specs_for`, `is_parallel_call`. #22: the turn's checkpoint, after the approval (or yolo, or an ungated call) and before running; a stop meanwhile is "interrupted" (tested as in `tools.test.ts`'s "the turn's checkpoint") |
 | `src/tools/repair.ts` | `repair.rs` | **Ported and tested:** JSON control-character escaping, timeout from ms to s, the leading-slash path. Todo: schema-guided repair (#65) |
 | `src/tools/edit-match.ts` | `edit_match.rs` | **Ported and tested:** exact, then the Unicode tier (#60: typographic quotes, dashes, `…` and Unicode spaces folded to ASCII, unique only, the file's original span replaced), then trailing whitespace, then indentation; CRLF handling, `closest_lines` |
 | `src/tools/diff.ts` | `diff.rs` | **Ported and tested.** Uses `similar` in place of jsdiff |
@@ -25,6 +25,7 @@ Spec: the **Tools**, **Web**, **Skills**, **Memory**, **Subagents** and **Yolo m
 | `src/tools/process.ts` | `process.rs` | **Ported and tested (#24, Marv #51):** the spec byte for byte, scope `process:[net:]<command>`, door `process` on a start (asks even in yolo: no `auto_safe`), `NO_PROCESS_DOOR` refused in `preview` and `run`, `process_line`; tested with a fake `ProcessHost` (the real one is marv-session's `ProcessManager`) |
 | `src/processes/relay.ts` | `relay.rs` | **Ported and tested (#24):** forward and reverse modes, the port-line rule (1024–65535, 16 bytes), bytes before the connection kept. Redesigned as `marv __relay <spec>` (see session.md); `relay_exe`/`set_relay_exe`, `exe_bind`, `sandbox_argv`, `through_socket` (the host side's pipe too) |
 | `src/tools/memory.ts` (+ bullet edits from `src/memory.ts`) | `memory.rs` | **Ported and tested:** the tool, and `add_memory`/`find_memory`/`remove_memory` (line-by-line edits, 0600 through `marv_fs::write_private`) |
+| `src/tools/plan.ts` | `plan.rs` | **Ported and tested (#21, Marv #15):** the tool (whole-list replace, `check` for 20 items, 1–200 characters, one `in_progress`), `plan_progress`, `plan_open`, `plan_text` (compaction's plan text: marv-agent can't depend on marv-tools, so it lives here). `PlanItem`/`PlanStatus`/`PlanHost`, `ToolContext::plan` and `ToolOutput::plan` in `types.rs`. All `plan-tool.test.ts` cases |
 | `src/tools/agent.ts` | `agent.rs` | Ported (it delegates to `AgentHost`, which marv-session implements) |
 | `src/tools/syntax.ts` | `syntax.rs` | **Ported and tested:** `syntax_error` (oxc parser + semantic checks for JS/TS, serde_json, serde_yaml_ng over every document, `python3 -I`), `broken_by`, `syntax_note` |
 | `src/tools/web-fetch.ts` | `web_fetch.rs` | **Ported and tested** (#5; `web-fetch-tool.test.ts` through `run_tool`, a local server only): `preview` (the address check fails before anyone is asked), `run` (cache, same-site redirects, GitHub, the "pass an http:// URL" hint), `pasted_scopes` (#11; a fence scanner, Rust's regex has no backreferences), the `offset` `maximum` (2^53 − 1). marv-rs: `Provenance::Web`; invisible characters stripped; `egress_url`/`url_prefix` for tainted sessions. Not ported: the env-var half of Marv's token test (setting env vars needs `unsafe` in Rust 2024) |
@@ -79,12 +80,12 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
 pub struct ToolOutcome { pub result: ToolOutput, pub label: String }
 impl ToolOutput { pub fn into_core(self) -> marv_core::ToolResult }
 pub fn builtin_tools() -> &'static [ToolRef];
-pub fn tool_specs_for(has_skills: bool) -> Vec<ToolSpec>;
+pub fn tool_specs_for(has_skills: bool, plan: bool) -> Vec<ToolSpec>;
 pub fn is_parallel_call(call: &ToolCall, available: &[ToolRef]) -> bool;
 pub const INTERRUPTED: &str;  // must equal marv-agent's NOT_RUN.aborted
 ```
 
-`ToolContext` fields: `root`, `home`, `cancel: CancellationToken`, `approver: Option<Arc<dyn Approver>>`, `sandbox: Arc<marv_sandbox::Sandbox>`, `yolo`, `confined`, `skills: Arc<Vec<Skill>>`, `memory: Option<MemoryPaths>`, `call_id`, `read_only`, `agent_host`, `git_env`, `before_change`, `taint: Arc<TaintState>`. `ToolContext::new(root)` gives Marv's defaults.
+`ToolContext` fields: `root`, `home`, `cancel: CancellationToken`, `approver: Option<Arc<dyn Approver>>`, `sandbox: Arc<marv_sandbox::Sandbox>`, `yolo`, `confined`, `skills: Arc<Vec<Skill>>`, `memory: Option<MemoryPaths>`, `call_id`, `read_only`, `agent_host`, `plan: Option<Arc<dyn PlanHost>>` (the main agent's only), `git_env`, `before_change`, `taint: Arc<TaintState>`. `ToolContext::new(root)` gives Marv's defaults.
 
 ## Port notes
 

@@ -9,10 +9,12 @@
 //! - `preview` runs before the approval: a [`ToolError`] there means the call can't succeed, so the user is never
 //!   asked to approve it.
 //! - `repair` (issue #10) fixes a malformed call whose meaning is beyond doubt, before validation; never fails.
-//! - `ToolOutput::diff` is for the screen only: never sent to the model (the loop appends `output`) nor written to
+//! - `ToolOutput::diff` and `ToolOutput::plan` are for the screen only: never sent to the model (the loop appends `output`) nor written to
 //!   trajectories (they record named fields).
 //! - `ToolContext::before_change` is started (not awaited) by the edit tools' preview and awaited in `run` before
 //!   writing: the session takes the typecheck's baseline there, so it sees the project as it was.
+//! - `ToolContext::checkpoint` (#16) is awaited by `run_tool` after the approval (or yolo) and before running any
+//!   call whose tool takes one (`Tool::checkpoint`); `Preview::files` is /undo's list of files, each with its diff.
 //!
 //! marv-rs changes (docs/SECURITY.md):
 //! - `ToolKind::Egress` and `uses_network`: once the session is tainted ([`marv_sandbox::TaintState`]) such calls ask
@@ -102,6 +104,18 @@ pub struct Preview {
     pub note: Option<String>,
     /// Shown in the warning color, e.g. "runs WITHOUT a sandbox".
     pub warning: Option<String>,
+    /// Several files, each with its own diff (/undo: what goes back where).
+    pub files: Option<Vec<PreviewFile>>,
+}
+
+/// One file of a [`Preview::files`] list.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PreviewFile {
+    /// "Restore src/app.ts".
+    pub title: String,
+    pub diff: Option<DiffShown>,
+    /// "binary", "too large to show", "changed since".
+    pub note: Option<String>,
 }
 
 /// "Don't ask again this session" applies to everything with the same key.
@@ -242,6 +256,14 @@ pub trait BeforeChange: Send + Sync {
     async fn before_change(&self);
 }
 
+/// The turn's checkpoint (marv-session's `checkpoints`): a snapshot of the project before the turn's first change, so
+/// /undo can put it back. `run_tool` awaits it after the approval and before running any call whose tool takes one
+/// ([`Tool::checkpoint`]); one snapshot per turn, shared by every call and by shared-folder subagents. Never fails.
+#[async_trait]
+pub trait Checkpoint: Send + Sync {
+    async fn checkpoint(&self);
+}
+
 /// A loaded skill, as the `skill` tool needs it. Loading (`src/skills.ts`) lives in marv-session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Skill {
@@ -286,6 +308,28 @@ pub trait AgentHost: Send + Sync {
     async fn run(&self, input: &crate::agent::AgentInput, ctx: &ToolContext) -> Result<ToolOutput, ToolError>;
 }
 
+/// The status of one plan item; at most one is `InProgress` at a time (the current item).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanStatus {
+    Pending,
+    InProgress,
+    Done,
+}
+
+/// One item of the plan tool's checklist (#15).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanItem {
+    pub text: String,
+    pub status: PlanStatus,
+}
+
+/// What the plan tool writes through: the session's state.
+pub trait PlanHost: Send + Sync {
+    /// The whole list, replacing the previous one; empty clears the plan.
+    fn set(&self, items: Vec<PlanItem>);
+}
+
 /// Everything a tool call may use. Cheap to clone (paths and `Arc`s); `run_tool` clones it per call to set
 /// `call_id` and `confined`.
 #[derive(Clone)]
@@ -312,9 +356,13 @@ pub struct ToolContext {
     /// Extra folders bash may read but not change: a worktree's shared `.git`.
     pub read_only: Vec<PathBuf>,
     pub agent_host: Option<Arc<dyn AgentHost>>,
+    /// Where the plan tool keeps its list (#15). Only the main agent has one, so subagents have no plan.
+    pub plan: Option<Arc<dyn PlanHost>>,
     /// Pins where git looks for this agent's file listing (a worktree subagent).
     pub git_env: Vec<(String, String)>,
     pub before_change: Option<Arc<dyn BeforeChange>>,
+    /// The turn's checkpoint (see [`Checkpoint`]); separate from `before_change`, the checks' baseline.
+    pub checkpoint: Option<Arc<dyn Checkpoint>>,
     /// The session's taint (marv-rs).
     pub taint: Arc<TaintState>,
     /// The doors out of the sandbox this agent has (see [`Doors`]). Default: none.
@@ -343,8 +391,10 @@ impl ToolContext {
             call_id: None,
             read_only: Vec::new(),
             agent_host: None,
+            plan: None,
             git_env: Vec::new(),
             before_change: None,
+            checkpoint: None,
             taint: Arc::new(TaintState::new()),
             doors: Doors::default(),
             processes: None,
@@ -366,6 +416,9 @@ pub struct ToolOutput {
     pub summary: String,
     /// What a file change did, for the transcript only.
     pub diff: Option<DiffShown>,
+    /// The plan tool's list after the call, for the screen only (like `diff`: never sent to the model or a
+    /// trajectory; the call already holds it).
+    pub plan: Option<Vec<PlanItem>>,
     /// The file a change wrote (with `diff`), project-relative: which project checks run after the step.
     pub changed: Option<String>,
     pub is_error: bool,
@@ -384,6 +437,7 @@ impl ToolOutput {
             output: output.into(),
             summary: summary.into(),
             diff: None,
+            plan: None,
             changed: None,
             is_error: false,
             declined: false,
@@ -431,6 +485,12 @@ pub trait Tool: Send + Sync + 'static {
     /// Calls of this tool that come together in one reply run at the same time (subagents).
     fn parallel(&self) -> bool {
         false
+    }
+    /// Whether `run_tool` takes the turn's checkpoint before a call runs. Default: a kind that changes files (Write,
+    /// Execute; marv-rs's Egress is Marv's "read" web_fetch or an MCP or mesh tool). False for tools that change
+    /// nothing in the project (MCP servers act outside it, memory writes ~/.marv, a subagent's own calls take it).
+    fn checkpoint(&self) -> bool {
+        matches!(self.kind(), ToolKind::Write | ToolKind::Execute)
     }
     /// Checks serde can't express (zod's `.min()`, `.max()`, `.int()` ranges). The message follows "Invalid input for <tool>:".
     fn check(&self, _input: &Self::Input) -> Result<(), String> {
@@ -497,6 +557,7 @@ pub trait DynTool: Send + Sync {
     fn kind(&self) -> ToolKind;
     fn provenance(&self) -> Provenance;
     fn parallel(&self) -> bool;
+    fn checkpoint(&self) -> bool;
     /// Deserialize and check; the error is the text after "Invalid input for <tool>:".
     fn parse(&self, raw: Value) -> Result<ParsedInput, String>;
     fn label(&self, input: In<'_>) -> String;
@@ -537,6 +598,9 @@ impl<T: Tool> DynTool for T {
     }
     fn parallel(&self) -> bool {
         Tool::parallel(self)
+    }
+    fn checkpoint(&self) -> bool {
+        Tool::checkpoint(self)
     }
     fn parse(&self, raw: Value) -> Result<ParsedInput, String> {
         let input: T::Input = serde_json::from_value(raw).map_err(|e| e.to_string())?;

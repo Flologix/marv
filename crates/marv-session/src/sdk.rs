@@ -65,8 +65,15 @@ pub struct SessionOptions {
     pub mcp_servers: Vec<(String, Value)>,
     pub approve: Option<Arc<dyn Approver>>,
     pub max_steps: Option<u32>,
+    /// Offer the plan tool: a checklist the model keeps for a long task (`session.plan()` reads it, each change also
+    /// arrives as a tool end's `result.plan`). Default true. Fixed for the session, since it changes the tool list.
+    pub plan: bool,
     pub diagnostics: bool,
     pub checks: bool,
+    /// Before a turn's first change, snapshot the project (git commits under a hidden ref,
+    /// `refs/marv/checkpoints/<session>`, or a git dir of Marv's own in `config_dir` outside a repository), and again
+    /// when it ends, so `session.undo_plan()` and `session.undo(plan)` can put that turn's files back. Default true.
+    pub checkpoints: bool,
     pub mcp_tools: McpToolsSetting,
     pub sandbox: bool,
     pub yolo: bool,
@@ -105,8 +112,10 @@ impl SessionBuilder {
                 mcp_servers: Vec::new(),
                 approve: None,
                 max_steps: None,
+                plan: true,
                 diagnostics: true,
                 checks: true,
+                checkpoints: true,
                 mcp_tools: McpToolsSetting::Auto,
                 sandbox: true,
                 yolo: true,
@@ -154,6 +163,11 @@ impl SessionBuilder {
     }
     pub fn max_steps(mut self, steps: u32) -> Self {
         self.options.max_steps = Some(steps);
+        self
+    }
+    /// `false` leaves the plan tool out (#15; the eval's "off" arm).
+    pub fn plan(mut self, on: bool) -> Self {
+        self.options.plan = on;
         self
     }
 
@@ -257,8 +271,11 @@ pub async fn create_session(options: SessionOptions) -> Result<MarvSession, Sess
     init.mesh = options.mesh;
     init.wire_approver = options.wire_approver;
     init.max_steps = options.max_steps;
+    init.plan = options.plan;
     init.diagnostics = options.diagnostics;
     init.checks = options.checks;
+    init.checkpoints = options.checkpoints;
+    init.checkpoints_dir = Some(config_dir.join("checkpoints").join(project_key(&root)));
     init.mcp_tools = options.mcp_tools;
     init.sandbox = options.sandbox;
     init.yolo = options.yolo;
@@ -342,5 +359,85 @@ mod tests {
         assert_eq!(err.to_string(), "resume needs persist (there's nowhere to resume from)");
         let err = SessionBuilder::new("/nonexistent/marv/x", provider()).build().await.err().unwrap();
         assert!(err.to_string().ends_with("isn't a folder"));
+    }
+
+    #[tokio::test]
+    async fn plan_false_leaves_the_plan_tool_out_by_default_its_offered() {
+        let provider = || ProviderOption::Ollama { model: "m".into(), host: None, context_length: None };
+        let dir = std::env::temp_dir().join(format!("marv-sdk-plan-{}-{}", std::process::id(), marv_fs::random_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut on = SessionBuilder::new(&dir, provider());
+        on.options.config_dir = Some(dir.join("config"));
+        let off = SessionBuilder { options: SessionOptions { plan: false, ..on.options.clone() } };
+        assert!(on.options.plan);
+        on = on.plan(true);
+        let (on, off) = (on.build().await.unwrap(), off.build().await.unwrap());
+        assert!(on.system_prompt().contains("keep a plan with the plan tool"));
+        assert!(!off.system_prompt().contains("plan tool"));
+        assert_eq!(on.plan(), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Writes made.txt, then says it did.
+    struct MakesAFile(std::sync::Mutex<u32>);
+    impl marv_provider::Provider for MakesAFile {
+        fn name(&self) -> &str {
+            "scripted"
+        }
+        fn context_length(&self) -> Option<u64> {
+            None
+        }
+        fn stream(&self, _history: &[marv_core::ChatTurn], _options: marv_provider::StreamOptions) -> marv_provider::EventStream {
+            use marv_core::ProviderEvent;
+            let first = {
+                let mut n = self.0.lock().unwrap();
+                *n += 1;
+                *n == 1
+            };
+            let events = if first {
+                let arguments = serde_json::json!({"path": "made.txt", "content": "made\n"}).to_string();
+                vec![
+                    ProviderEvent::ToolCall(marv_core::ToolCall { id: "w".into(), name: "write_file".into(), arguments }),
+                    ProviderEvent::Done { reason: Some("tool_calls".into()) },
+                ]
+            } else {
+                vec![ProviderEvent::TextDelta("Made it.".into()), ProviderEvent::Done { reason: Some("stop".into()) }]
+            };
+            Box::pin(futures::stream::iter(events))
+        }
+    }
+
+    // Ports tests/sdk.test.ts "checkpoints: a turn's files can be put back with undoPlan() and undo(), outside a
+    // repository too (#16)".
+    #[tokio::test]
+    async fn checkpoints_a_turns_files_can_be_put_back_outside_a_repository_too() {
+        use futures::StreamExt;
+        let base = std::env::temp_dir().join(format!("marv-sdk-cp-{}-{}", std::process::id(), marv_fs::random_hex()));
+        let (root, config_dir) = (base.join("project"), base.join("config"));
+        std::fs::create_dir_all(&root).unwrap();
+        let session_with = |checkpoints: bool| {
+            let mut builder = SessionBuilder::new(&root, ProviderOption::Custom(Arc::new(MakesAFile(std::sync::Mutex::new(0)))));
+            builder.options.config_dir = Some(config_dir.clone());
+            builder.options.sandbox = false;
+            builder.options.checkpoints = checkpoints;
+            builder.build()
+        };
+        let session = session_with(true).await.unwrap();
+        session.send("make a file", crate::session::SendOptions::default()).unwrap().collect::<Vec<_>>().await;
+        assert!(root.join("made.txt").exists());
+        let plan = session.undo_plan().await.unwrap().unwrap_or_else(|r| panic!("{}", r.reason));
+        let files: Vec<(&str, crate::checkpoints::undo::UndoAction)> =
+            plan.files.iter().map(|f| (f.path.as_str(), f.action)).collect();
+        assert_eq!(files, [("made.txt", crate::checkpoints::undo::UndoAction::Delete)]);
+        assert_eq!(session.undo(&plan).await.unwrap().deleted, ["made.txt"]);
+        assert!(!root.join("made.txt").exists());
+        assert!(config_dir.join("checkpoints").exists());
+        session.close().await;
+
+        let off = session_with(false).await.unwrap();
+        off.send("make a file", crate::session::SendOptions::default()).unwrap().collect::<Vec<_>>().await;
+        assert!(off.undo_plan().await.unwrap().unwrap_err().reason.contains("off"));
+        off.close().await;
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

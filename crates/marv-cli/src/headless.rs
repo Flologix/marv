@@ -235,6 +235,7 @@ impl Collector {
                     marv_session::TurnStatus::WaitingForMcp => "waiting_for_mcp",
                     marv_session::TurnStatus::Compacting => "compacting",
                     marv_session::TurnStatus::Checking => "checking",
+                    marv_session::TurnStatus::Checkpointing => "checkpointing",
                     marv_session::TurnStatus::Running => "running",
                 };
                 Some(json!({"type": "status", "status": status}))
@@ -410,6 +411,7 @@ pub async fn run_headless(options: HeadlessOptions) -> ExitCode {
     let o = &mut builder.options;
     (o.sandbox, o.thinking, o.diagnostics, o.checks, o.mcp_tools, o.config_dir) =
         (config.sandbox, config.thinking, config.diagnostics, config.checks, config.mcp_tools, Some(config_dir));
+    o.checkpoints = config.checkpoints;
     // To stderr, so stdout stays the reply: an MCP server that needs a login, a trajectory that can't be written.
     o.on_warning = Some(Arc::new(|text: String| eprintln!("marv: {}", printable(&text))));
     let session = match builder.build().await {

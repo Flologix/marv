@@ -5,13 +5,15 @@
 //! - Tool specs are built once, so every request sends byte-identical definitions in a stable order (anything else
 //!   breaks the prompt cache). Note: `serde_json` without `preserve_order` sorts object keys, so a schema's key order
 //!   differs from Marv's (zod's insertion order); it's still byte-stable, which is what the cache needs.
-//! - `skill` is offered only when skills exist (`tool_specs_for`).
+//! - `skill` is offered only when skills exist, `plan` unless the session turned it off (#15) (`tool_specs_for`).
 //! - `run_tool` never fails: bad JSON, invalid input and `ToolError`s become error results the model can recover from.
 //!   `available` is what this agent was offered (a subagent gets fewer tools); anything else is unknown, even if the
 //!   model names it.
 //! - Flow: parse JSON (else `repair_json_args`) → the tool's `repair` → validate → label → if gated: preview (a
 //!   `ToolError` fails the call before anyone is asked) → aborted? interrupted → yolo + `auto_safe`: run confined →
 //!   no approver: "no one to ask" → approve: unavailable / no (aborted → interrupted) / yes / always → run.
+//! - Right before any run (ungated, yolo or approved), the turn's checkpoint (#16) when the tool takes one
+//!   (`Tool::checkpoint`); a stop while it's taken returns "interrupted" instead of running.
 //! - Every repaired call's result carries the repair notes, however the call ended.
 //!
 //! marv-rs additions (docs/SECURITY.md): a tainted session's egress (`ToolKind::Egress` or `uses_network`) and any
@@ -37,8 +39,9 @@ pub const INTERRUPTED: &str = "Interrupted by the user before this tool ran.";
 pub const DECLINED: &str = "The user declined this. Don't retry it: stop and wait for them to say how to proceed.";
 
 /// Marv's built-in tools, in Marv's order (the order of the specs the model sees):
-/// read_file, glob, grep, web_fetch, skill, edit_file, write_file, bash, memory, agent.
-/// `apply_patch` (#66) isn't registered until it's built.
+/// read_file, glob, grep, web_fetch, skill, edit_file, write_file, bash, memory, plan, agent.
+/// `apply_patch` (#66) isn't registered until it's built; Marv's github (after web_fetch) and process (after bash)
+/// come with their own ports.
 pub fn builtin_tools() -> &'static [ToolRef] {
     static TOOLS: OnceLock<Vec<ToolRef>> = OnceLock::new();
     TOOLS.get_or_init(|| {
@@ -53,6 +56,7 @@ pub fn builtin_tools() -> &'static [ToolRef] {
             Arc::new(crate::bash::Bash),
             Arc::new(crate::process::ProcessTool),
             Arc::new(crate::memory::Memory),
+            Arc::new(crate::plan::Plan),
             Arc::new(crate::agent::Agent),
         ]
     })
@@ -69,10 +73,11 @@ pub fn tool_specs() -> &'static [ToolSpec] {
     SPECS.get_or_init(|| builtin_tools().iter().map(|t| t.spec()).collect())
 }
 
-/// The specs for a session: the skill tool only when there are skills to load. The process tool is in it: a session
+/// The specs for a session: the skill tool only when there are skills to load, the plan tool unless the session
+/// turned it off (#15; decided at construction, since it changes the tool list). The process tool is in it: a session
 /// without the process door (Marv #51) drops it.
-pub fn tool_specs_for(has_skills: bool) -> Vec<ToolSpec> {
-    tool_specs().iter().filter(|s| has_skills || s.name != "skill").cloned().collect()
+pub fn tool_specs_for(has_skills: bool, plan: bool) -> Vec<ToolSpec> {
+    tool_specs().iter().filter(|s| (has_skills || s.name != "skill") && (plan || s.name != "plan")).cloned().collect()
 }
 
 /// A finished call: the result and the transcript label.
@@ -153,7 +158,25 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
     let prefix_approved = egress_url.as_deref().is_some_and(|url| ctx.taint.prefix_approved(url));
     let must_ask = protected.is_some() || (ctx.taint.must_ask(tool.kind(), network) && !prefix_approved);
     let gated = must_ask || (!prefix_approved && tool.needs_approval(input).unwrap_or(tool.kind() != ToolKind::Read));
+    let interrupted = |approval: Approval| {
+        let mut result = ToolOutput::ok(INTERRUPTED, "interrupted");
+        result.declined = true;
+        result.approval = Some(approval);
+        result.door = door;
+        noted(ToolOutcome { result, label: label.clone() })
+    };
+    // The turn's checkpoint, before anything that can change files runs (approved, yolo, or a tool that asks no one):
+    // whatever the call does, bash included, /undo can put back. It never fails the call; a stop meanwhile does.
+    let checkpointed = || async {
+        if let Some(checkpoint) = ctx.checkpoint.as_ref().filter(|_| tool.checkpoint()) {
+            checkpoint.checkpoint().await;
+        }
+        !ctx.aborted()
+    };
     if !gated {
+        if !checkpointed().await {
+            return interrupted(Approval::Interrupted);
+        }
         return finish(tool.run(input, &per_call).await, None);
     }
 
@@ -162,19 +185,15 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
         Ok(preview) => preview,
         Err(err) => return noted(fail(err.0, &label)),
     };
-    let interrupted = || {
-        let mut result = ToolOutput::ok(INTERRUPTED, "interrupted");
-        result.declined = true;
-        result.approval = Some(Approval::Interrupted);
-        result.door = door;
-        noted(ToolOutcome { result, label: label.clone() })
-    };
     // Stopped while the preview was being made: don't raise a prompt for a run that's over.
     if ctx.aborted() {
-        return interrupted();
+        return interrupted(Approval::Interrupted);
     }
     // Yolo: a call the tool vouches for runs without asking, confined (bash then can't touch .git).
     if ctx.yolo && !must_ask && tool.auto_safe(input, ctx) {
+        if !checkpointed().await {
+            return interrupted(Approval::Interrupted);
+        }
         let confined = ToolContext { confined: true, ..per_call };
         return finish(tool.run(input, &confined).await, Some(Approval::Auto));
     }
@@ -197,7 +216,7 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
     match approver.approve(request).await {
         Decision::Unavailable => no_one_to_ask(),
         // Esc at the prompt answers "no" and then aborts the run: an interrupt, not "don't retry".
-        Decision::No if ctx.aborted() => interrupted(),
+        Decision::No if ctx.aborted() => interrupted(Approval::Interrupted),
         Decision::No => {
             let mut result = ToolOutput::ok(DECLINED, "declined");
             result.declined = true;
@@ -212,6 +231,9 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
                 && let Some(prefix) = egress_url.as_deref().and_then(crate::web_fetch::url_prefix)
             {
                 ctx.taint.approve_prefix(&prefix);
+            }
+            if !checkpointed().await {
+                return interrupted(Approval::Decided(decision));
             }
             finish(tool.run(input, &per_call).await, Some(Approval::Decided(decision)))
         }
@@ -394,15 +416,181 @@ mod tests {
     }
 
     #[test]
-    fn builtin_specs_are_in_marvs_order_and_skill_is_optional() {
+    fn builtin_specs_are_in_marvs_order_and_skill_and_plan_are_optional() {
         let names: Vec<&str> = tool_specs().iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
             names,
-            ["read_file", "glob", "grep", "web_fetch", "skill", "edit_file", "write_file", "bash", "process", "memory", "agent"]
+            [
+                "read_file",
+                "glob",
+                "grep",
+                "web_fetch",
+                "skill",
+                "edit_file",
+                "write_file",
+                "bash",
+                "process",
+                "memory",
+                "plan",
+                "agent"
+            ]
         );
-        assert!(!tool_specs_for(false).iter().any(|s| s.name == "skill"));
-        assert_eq!(tool_specs_for(true).len(), 11);
+        assert!(!tool_specs_for(false, true).iter().any(|s| s.name == "skill"));
+        assert_eq!(tool_specs_for(true, true).len(), 12);
+        assert!(!tool_specs_for(true, false).iter().any(|s| s.name == "plan"));
+        assert_eq!(tool_specs_for(true, false).len(), 11);
         let agent = ToolCall { id: "1".into(), name: "agent".into(), arguments: "{}".into() };
         assert!(is_parallel_call(&agent, builtin_tools()));
+    }
+
+    // Ports tests/tools.test.ts "the turn's checkpoint" (#16).
+    mod checkpoint {
+        use super::*;
+        use crate::test_support::project;
+        use crate::types::Checkpoint;
+
+        type Order = Arc<Mutex<Vec<&'static str>>>;
+
+        struct Counting(Order);
+        #[async_trait]
+        impl Checkpoint for Counting {
+            async fn checkpoint(&self) {
+                self.0.lock().unwrap().push("checkpoint");
+            }
+        }
+        struct Saying(Order, Decision);
+        #[async_trait]
+        impl Approver for Saying {
+            async fn approve(&self, _request: ApprovalRequest) -> Decision {
+                self.0.lock().unwrap().push("approve");
+                self.1
+            }
+        }
+
+        fn named(name: &str, args: Value) -> ToolCall {
+            ToolCall { id: "c1".into(), name: name.into(), arguments: args.to_string() }
+        }
+        fn counted(root: &std::path::Path, order: &Order, answer: Option<Decision>) -> ToolContext {
+            let mut ctx = ToolContext::new(root);
+            ctx.sandbox = Arc::new(marv_sandbox::Sandbox::from_env(false));
+            ctx.checkpoint = Some(Arc::new(Counting(order.clone())));
+            ctx.approver = answer.map(|a| Arc::new(Saying(order.clone(), a)) as Arc<dyn Approver>);
+            ctx
+        }
+        fn without_approvals(order: &Order) -> Vec<&'static str> {
+            order.lock().unwrap().iter().copied().filter(|e| *e != "approve").collect()
+        }
+
+        #[tokio::test]
+        async fn taken_before_a_change_runs_approved_and_in_yolo() {
+            let root = project("checkpoint-yes");
+            let order: Order = Arc::default();
+            let ctx = counted(root.path(), &order, Some(Decision::Yes));
+            run_tool(&named("write_file", serde_json::json!({"path": "new.txt", "content": "x\n"})), &ctx, builtin_tools()).await;
+            assert_eq!(*order.lock().unwrap(), ["approve", "checkpoint"]);
+            order.lock().unwrap().clear();
+            let yolo = ToolContext { yolo: true, approver: None, ..ctx.clone() };
+            let edit = named("edit_file", serde_json::json!({"path": "src/app.ts", "old_string": "main", "new_string": "start"}));
+            let edited = run_tool(&edit, &yolo, builtin_tools()).await;
+            assert_eq!(edited.result.approval, Some(Approval::Auto), "{}", edited.result.output);
+            assert_eq!(*order.lock().unwrap(), ["checkpoint"]);
+            run_tool(&named("bash", serde_json::json!({"command": "true"})), &ctx, builtin_tools()).await;
+            assert_eq!(without_approvals(&order), ["checkpoint", "checkpoint"]);
+        }
+
+        #[tokio::test]
+        async fn not_for_reads_and_not_when_declined_invalid_or_aborted() {
+            let root = project("checkpoint-no");
+            let order: Order = Arc::default();
+            let ctx = counted(root.path(), &order, None);
+            for (name, args) in [
+                ("read_file", serde_json::json!({"path": "src/app.ts"})),
+                ("glob", serde_json::json!({"pattern": "**/*.ts"})),
+                ("grep", serde_json::json!({"pattern": "greet"})),
+            ] {
+                run_tool(&named(name, args), &ctx, builtin_tools()).await;
+            }
+            let write = named("write_file", serde_json::json!({"path": "a.txt", "content": "x"}));
+            run_tool(&write, &counted(root.path(), &order, Some(Decision::No)), builtin_tools()).await;
+            let yes = counted(root.path(), &order, Some(Decision::Yes));
+            run_tool(&named("write_file", serde_json::json!({"nope": true})), &yes, builtin_tools()).await;
+            yes.cancel.cancel();
+            run_tool(&write, &yes, builtin_tools()).await;
+            assert!(without_approvals(&order).is_empty());
+        }
+
+        /// A tool that changes nothing in the project (an MCP server's, memory, a subagent).
+        struct Outsider;
+        #[async_trait]
+        impl Tool for Outsider {
+            type Input = Value;
+            fn name(&self) -> &str {
+                "outsider"
+            }
+            fn description(&self) -> &str {
+                ""
+            }
+            fn schema(&self) -> Value {
+                serde_json::json!({"type": "object"})
+            }
+            fn kind(&self) -> ToolKind {
+                ToolKind::Execute
+            }
+            fn checkpoint(&self) -> bool {
+                false
+            }
+            fn label(&self, _input: &Value) -> String {
+                "x".into()
+            }
+            async fn run(&self, _input: &Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+                Ok(ToolOutput::ok("ok", "ok"))
+            }
+        }
+
+        #[tokio::test]
+        async fn not_for_a_tool_that_changes_nothing_in_the_project() {
+            let root = project("checkpoint-outsider");
+            let order: Order = Arc::default();
+            let ctx = counted(root.path(), &order, Some(Decision::Yes));
+            let out = run_tool(&named("outsider", serde_json::json!({})), &ctx, &[Arc::new(Outsider) as ToolRef]).await;
+            assert_eq!(out.result.output, "ok");
+            assert!(without_approvals(&order).is_empty());
+        }
+
+        #[test]
+        fn the_default_is_any_kind_that_changes_files_and_memory_and_agent_opt_out() {
+            let takes = |name: &str| builtin_tools().iter().find(|t| t.name() == name).unwrap().checkpoint();
+            for name in ["edit_file", "write_file", "bash"] {
+                assert!(takes(name), "{name}");
+            }
+            for name in ["read_file", "glob", "grep", "web_fetch", "skill", "memory", "plan", "agent"] {
+                assert!(!takes(name), "{name}");
+            }
+        }
+
+        /// Marv's "a failing checkpoint doesn't fail the call": here `Checkpoint::checkpoint` can't fail (it returns
+        /// nothing), so what's left to check is that a stop while it runs doesn't run the call.
+        struct StopsMeanwhile(tokio_util::sync::CancellationToken);
+        #[async_trait]
+        impl Checkpoint for StopsMeanwhile {
+            async fn checkpoint(&self) {
+                self.0.cancel();
+            }
+        }
+
+        #[tokio::test]
+        async fn a_stop_while_checkpointing_is_an_interrupt_and_writes_nothing() {
+            let root = project("checkpoint-stop");
+            let order: Order = Arc::default();
+            let mut ctx = counted(root.path(), &order, Some(Decision::Yes));
+            ctx.checkpoint = Some(Arc::new(StopsMeanwhile(ctx.cancel.clone())));
+            let out =
+                run_tool(&named("write_file", serde_json::json!({"path": "b.txt", "content": "x\n"})), &ctx, builtin_tools())
+                    .await;
+            assert_eq!(out.result.output, INTERRUPTED);
+            // Marv keeps the answer the call got: it was approved, then stopped.
+            assert_eq!(out.result.approval, Some(Approval::Decided(Decision::Yes)));
+            assert!(!root.path().join("b.txt").exists());
+        }
     }
 }

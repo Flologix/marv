@@ -201,6 +201,22 @@ pub enum TrajectoryRecord {
         tools: u32,
         ms: u64,
     },
+    /// A checkpoint snapshot (Marv #16): which, its commit and file count, or why it failed.
+    Checkpoint {
+        turn: String,
+        /// "before", "after" or "pre-undo".
+        kind: &'static str,
+        ok: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sha: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        files: Option<usize>,
+        ms: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+    /// /undo (Marv #16): the turn it took back (its number in the checkpoints), the paths written, those left alone.
+    Undo { turn: u32, paths: Vec<String>, skipped: Vec<String> },
     /// The conversation was replaced by a summary.
     Compact {
         #[serde(skip_serializing_if = "Option::is_none")]
