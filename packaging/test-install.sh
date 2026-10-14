@@ -91,7 +91,7 @@ out=$("$install" --prefix "$prefix" 2>&1)
 check "marv is marv-rs" same_as_rs "$bin/marv"
 check "marv-ts is the old launcher" bash -c "[[ \$(sha256sum '$bin/marv-ts' | cut -d' ' -f1) == $ts_sum ]]"
 check "marv-ts still runs TS Marv" runs_ts "$bin/marv-ts"
-check "says it moved it" grep -q "moved the existing $bin/marv (not marv-rs) to $bin/marv-ts" <<<"$out"
+check "says it moved it" grep -q "moved the existing $bin/marv (an older, TypeScript Marv) to $bin/marv-ts" <<<"$out"
 
 # Idempotent: a second run replaces marv-rs and leaves marv-ts alone.
 out=$("$install" --prefix "$prefix" 2>&1)
@@ -173,7 +173,7 @@ check "marv-ts is gone" test ! -e "$bin/marv-ts"
 check "says it moved it back" grep -q "moved $bin/marv-ts back to $bin/marv" <<<"$out"
 out=$("$install" --prefix "$prefix" --uninstall 2>&1)
 check "second uninstall leaves TS Marv" runs_ts "$bin/marv"
-check "second uninstall says so" grep -q "isn't marv-rs; leaving it" <<<"$out"
+check "second uninstall says so" grep -q "isn't this Marv (Rust); leaving it" <<<"$out"
 end
 
 begin uninstall-alone

@@ -1,7 +1,7 @@
 #!/bin/sh
 # Installs marv-rs as `marv` (issue #19).
 #
-#   curl -fsSL https://github.com/FlologixAI/marv-rs/releases/latest/download/install.sh | sh
+#   curl -fsSL https://github.com/FlologixAI/marv/releases/latest/download/install.sh | sh
 #   sh install.sh [--prefix DIR] [--version vX.Y.Z] [--from FILE] [--uninstall]
 #
 # The binary goes to $PREFIX/bin/marv (default prefix: ~/.local). It's a static musl build, so nothing else is needed.
@@ -14,11 +14,11 @@
 # or replaced until the new binary has been downloaded and its SHA-256 checked, so a failed download changes nothing.
 #
 # Environment (mostly for tests and mirrors):
-#   MARV_RELEASE_URL  the releases base URL (default https://github.com/FlologixAI/marv-rs/releases); file:// works
+#   MARV_RELEASE_URL  the releases base URL (default https://github.com/FlologixAI/marv/releases); file:// works
 #   MARV_TARGET       the target triple to download, instead of the one detected from uname
 set -eu
 
-RELEASE_URL=${MARV_RELEASE_URL:-https://github.com/FlologixAI/marv-rs/releases}
+RELEASE_URL=${MARV_RELEASE_URL:-https://github.com/FlologixAI/marv/releases}
 PREFIX="${HOME}/.local"
 VERSION=latest
 FROM=
@@ -32,17 +32,17 @@ die() {
 
 usage() {
 	cat <<'EOF'
-Install marv-rs as `marv`.
+Install Marv as `marv`.
 
 Usage: install.sh [options]
 
   --prefix DIR      install into DIR/bin (default: ~/.local)
   --version vX.Y.Z  install that release (default: the latest)
   --from FILE       install a marv binary you built (target/release/marv) instead of downloading one
-  --uninstall       remove marv-rs and move marv-ts back to marv
+  --uninstall       remove Marv and move marv-ts back to marv
   -h, --help        show this help
 
-A `marv` already in DIR/bin that isn't marv-rs (TS Marv's launcher) is moved to `marv-ts` first.
+A `marv` already in DIR/bin that isn't this Marv (an older, TypeScript Marv) is moved to `marv-ts` first.
 EOF
 }
 
@@ -153,7 +153,7 @@ uninstall() {
 			rm -f "$MARV"
 			say "removed $MARV"
 		else
-			say "$MARV isn't marv-rs; leaving it as it is"
+			say "$MARV isn't this Marv (Rust); leaving it as it is"
 			return 0
 		fi
 	fi
@@ -199,7 +199,7 @@ else
 	tar -xzf "$TMP/$ASSET" -C "$TMP" marv || die "$ASSET has no marv in it"
 	SOURCE="$ASSET ($VERSION)"
 fi
-is_marv_rs "$TMP/marv" || die "$SOURCE isn't a marv-rs binary; nothing was installed"
+is_marv_rs "$TMP/marv" || die "$SOURCE isn't a Marv binary; nothing was installed"
 chmod 755 "$TMP/marv"
 
 # 2. Stage it beside the target, so a full disk or a read-only BIN_DIR fails before the switch below.
@@ -210,10 +210,10 @@ cp "$TMP/marv" "$STAGED"
 # 3. The command switch: keep TS Marv as marv-ts.
 if exists "$MARV" && ! is_marv_rs "$MARV"; then
 	if exists "$MARV_TS"; then
-		die "$MARV isn't marv-rs and $MARV_TS already exists; move one of them aside and run this again"
+		die "$MARV isn't this Marv (Rust) and $MARV_TS already exists; move one of them aside and run this again"
 	fi
 	mv "$MARV" "$MARV_TS"
-	say "moved the existing $MARV (not marv-rs) to $MARV_TS; TS Marv still runs as marv-ts"
+	say "moved the existing $MARV (an older, TypeScript Marv) to $MARV_TS; it still runs as marv-ts"
 fi
 
 # 4. Rename over the target: the rename is atomic, and works while an old marv is running.

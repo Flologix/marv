@@ -1551,7 +1551,7 @@ dependencies = [
 
 [[package]]
 name = "marv-agent"
-version = "0.0.1"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -1567,7 +1567,7 @@ dependencies = [
 
 [[package]]
 name = "marv-cli"
-version = "0.0.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1591,7 +1591,7 @@ dependencies = [
 
 [[package]]
 name = "marv-core"
-version = "0.0.1"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1600,7 +1600,7 @@ dependencies = [
 
 [[package]]
 name = "marv-fs"
-version = "0.0.1"
+version = "0.4.0"
 dependencies = [
  "futures",
  "serde_json",
@@ -1610,7 +1610,7 @@ dependencies = [
 
 [[package]]
 name = "marv-guards"
-version = "0.0.1"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -1630,7 +1630,7 @@ dependencies = [
 
 [[package]]
 name = "marv-mcp"
-version = "0.0.1"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1652,7 +1652,7 @@ dependencies = [
 
 [[package]]
 name = "marv-mesh"
-version = "0.0.1"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -1669,7 +1669,7 @@ dependencies = [
 
 [[package]]
 name = "marv-oracle"
-version = "0.0.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "marv-core",
@@ -1680,7 +1680,7 @@ dependencies = [
 
 [[package]]
 name = "marv-provider"
-version = "0.0.1"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -1697,7 +1697,7 @@ dependencies = [
 
 [[package]]
 name = "marv-sandbox"
-version = "0.0.1"
+version = "0.4.0"
 dependencies = [
  "marv-core",
  "regex",
@@ -1708,7 +1708,7 @@ dependencies = [
 
 [[package]]
 name = "marv-session"
-version = "0.0.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1738,7 +1738,7 @@ dependencies = [
 
 [[package]]
 name = "marv-tools"
-version = "0.0.1"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "brotli",
@@ -1775,7 +1775,7 @@ dependencies = [
 
 [[package]]
 name = "marv-tui"
-version = "0.0.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

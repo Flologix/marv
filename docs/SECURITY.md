@@ -5,7 +5,7 @@
 - untrusted content in its context;
 - a way out (network, the mesh, or code that runs outside the sandbox).
 
-These rules are requirements for marv-rs from day one. They come from the 2026-10-12 audit of Marv 0.3.0; the details are in the private `marv-security-plan.md`.
+These rules are requirements for the Rust build from day one. They come from a security review of Marv 0.3.0 (2026-10-12); see the repository's security advisories.
 
 ## Process and launch
 - **One static binary.** No interpreter reads the project's `bunfig.toml`, `.env`, `node_modules` or similar. Config comes only from:
