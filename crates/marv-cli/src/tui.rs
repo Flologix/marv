@@ -1118,6 +1118,17 @@ impl Bridge {
             CommandAction::Remember { scope, text } => self.remember(scope, &text).await,
             CommandAction::Forget { text } => self.forget(&text).await,
             CommandAction::Compact { focus } => self.compact(focus),
+            CommandAction::Processes { stop } => {
+                let me = self.clone();
+                tokio::spawn(async move {
+                    let stopped = me.session.stop_process(&stop).await;
+                    me.emit(if stopped {
+                        system(format!("Stopped {}.", printable(&stop)), false)
+                    } else {
+                        system(format!("No background process named \"{}\". /processes lists them.", printable(&stop)), true)
+                    });
+                });
+            }
             CommandAction::Skill { name, args } => {
                 let Some(skill) = self.skills.iter().find(|s| s.skill.name == name) else { return };
                 let for_model = marv_session::skills::skill_message(&skill.skill, &args);
@@ -1147,6 +1158,7 @@ impl Bridge {
             if wants_checks { marv_session::checks::load_checks(&self.root) } else { (Vec::new(), Vec::new()) };
         let last_checks = self.last_checks.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let trajectories_path = self.trajectories_dir.as_ref().map(|d| shorten_home(d, &self.home));
+        let processes = self.session.processes();
         let ctx = CommandContext {
             config: &config,
             config_path: shorten_home(&self.store.path, &self.home),
@@ -1160,6 +1172,7 @@ impl Bridge {
             checks: Some((&checks, &check_problems, last_checks.as_ref())),
             hidden_path_folders: &self.hidden_path_folders,
             sandbox_available: self.sandbox_available,
+            processes: self.session.processes_offered().then_some(&processes[..]),
         };
         commands::run_command(line, &ctx)
     }

@@ -34,7 +34,7 @@ Spec: the **Config**, **Session**, **SDK**, **Skills**, **Memory**, **Subagents*
 | `src/sources.ts` | `sources.rs` | **Ported** (`load_sources`) |
 | `src/event-queue.ts` | `event_queue.rs` | **Ported and tested** (an unbounded channel with one reader) |
 | `src/frontmatter.ts` | `frontmatter.rs` | **Ported and tested** (`serde_norway`) |
-| `src/commands/index.ts`, `sandbox-notice.ts` | `commands.rs` | **Ported and tested:** every command, `run_command`, `help_text`, the `/config`, `/checks`, `/mcp`, `/skills` and `/agents` texts, and the status lines |
+| `src/commands/index.ts`, `sandbox-notice.ts` | `commands.rs` | **Ported and tested:** every command, `run_command`, `help_text`, the `/config`, `/checks`, `/mcp`, `/skills` and `/agents` texts, and the status lines. #24: `/processes` (list, `stop <name>`; `CommandContext::processes`) |
 | `src/tool-draft.ts` | `tool_draft.rs` | **Ported and tested** |
 | `src/types.ts` | `types.rs` | **Done** (`Message`, `Role`, `ToolStatus`, `Notice`): the transcript is saved with sessions |
 | (new) | `runner.rs` | **Done and tested:** `SessionToolRunner`, `tool_run_from`, `ToolDisplay`, `approval_record` (`ApprovalRecord` lives in marv-agent, re-exported), `SessionApprover`, `AlwaysScopes`, `step_limit_request`, `SessionAgentHost` (`preview` and `run` delegate to `subagent.rs`) |

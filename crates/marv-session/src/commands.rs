@@ -93,6 +93,10 @@ pub enum CommandAction {
     Compact {
         focus: Option<String>,
     },
+    /// Stop one of the session's background processes (Marv #51).
+    Processes {
+        stop: String,
+    },
     /// The user ran a skill: `/<name> <args>`.
     Skill {
         name: String,
@@ -130,6 +134,8 @@ pub struct CommandContext<'a> {
     /// PATH folders under the home folder the sandbox can't see, shortened for display.
     pub hidden_path_folders: &'a [String],
     pub sandbox_available: bool,
+    /// The session's background processes, for /processes; None when the session doesn't offer the process tool.
+    pub processes: Option<&'a [marv_tools::ProcessInfo]>,
 }
 
 pub struct Command {
@@ -290,6 +296,33 @@ pub fn commands() -> &'static [Command] {
                 Ok(Some(on)) => CommandAction::Checks { on },
                 Ok(None) => markdown(checks_text(ctx)),
                 Err(e) => e,
+            },
+        },
+        Command {
+            name: "processes",
+            description: "Background processes the model started (/processes stop <name>)",
+            run: |args, ctx| {
+                let words: Vec<&str> = args.split_whitespace().collect();
+                match words[..] {
+                    ["stop", name] => return CommandAction::Processes { stop: name.to_string() },
+                    [] => {}
+                    _ => return error("Usage: /processes, or /processes stop <name>"),
+                }
+                match ctx.processes {
+                    None => print("Background processes aren't available here: they need the bubblewrap sandbox."),
+                    Some([]) => print(
+                        "No background processes. The model starts one with the process tool (a dev server, a watcher), and you're asked first.",
+                    ),
+                    Some(list) => {
+                        let now = marv_tools::process::now_ms();
+                        print(
+                            list.iter()
+                                .map(|p| printable(&marv_tools::process::process_line(p, now)))
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        )
+                    }
+                }
             },
         },
         Command {
@@ -736,8 +769,55 @@ mod tests {
             checks: None,
             hidden_path_folders: &[],
             sandbox_available: true,
+            processes: None,
         };
         f(&ctx)
+    }
+
+    #[test]
+    fn processes_lists_the_sessions_background_processes_and_stop_is_an_action() {
+        let now = marv_tools::process::now_ms();
+        let web = marv_tools::ProcessInfo {
+            name: "web".into(),
+            command: "bun run dev".into(),
+            network: false,
+            state: marv_tools::ProcessState::Running,
+            exit_code: None,
+            ports: vec![5173],
+            notes: vec![],
+            started_at: now - 125_000,
+        };
+        let old = marv_tools::ProcessInfo {
+            name: "old".into(),
+            state: marv_tools::ProcessState::Exited,
+            exit_code: Some(1),
+            ports: vec![],
+            ..web.clone()
+        };
+        with(|ctx| {
+            let list = [web, old];
+            let listed = CommandContext { processes: Some(&list), ..ctx.clone() };
+            assert_eq!(
+                run_command("/processes", &listed),
+                print(
+                    "web: running · http://localhost:5173 · up 2m · $ bun run dev\nold: exited (code 1) · up 2m · $ bun run dev"
+                )
+            );
+            let none = CommandContext { processes: Some(&[]), ..ctx.clone() };
+            assert!(
+                matches!(run_command("/processes", &none), CommandAction::Print { text, .. } if text.contains("No background processes"))
+            );
+            assert!(
+                matches!(run_command("/processes", ctx), CommandAction::Print { text, .. } if text.contains("need the bubblewrap sandbox"))
+            );
+            assert_eq!(run_command("/processes stop web", ctx), CommandAction::Processes { stop: "web".into() });
+            for bad in ["/processes stop", "/processes kill web", "/processes stop a b"] {
+                assert!(
+                    matches!(run_command(bad, ctx), CommandAction::Print { is_error: true, ref text, .. } if text.contains("Usage")),
+                    "{bad}"
+                );
+            }
+        });
     }
 
     #[test]
