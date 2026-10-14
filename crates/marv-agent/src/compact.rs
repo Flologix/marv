@@ -237,7 +237,13 @@ mod tests {
     async fn a_dropped_connection_mid_summary_keeps_only_the_retried_text() {
         let model = ScriptedProvider::new(vec![vec![
             ProviderEvent::TextDelta("Summary: half of a fir".into()),
-            ProviderEvent::Retry { attempt: 1, max: 2, message: "connection lost, retrying (1/2)…".into(), continued: false },
+            ProviderEvent::Retry {
+                attempt: 1,
+                max: 2,
+                message: "connection lost, retrying (1/2)…".into(),
+                continued: false,
+                cause: Default::default(),
+            },
             ProviderEvent::TextDelta("Summary: scroll glide added.".into()),
             ProviderEvent::Done { reason: None },
         ]]);

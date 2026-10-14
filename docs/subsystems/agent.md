@@ -79,6 +79,7 @@ pub type RewriteCall = Arc<dyn Fn(&ToolCall) -> Option<ToolCall> + Send + Sync>;
 - **#64 continue after a dropped stream:**
   - `LoopEvent::Retry { continued }` is in place. When the provider signals a continuable drop, keep the partial text as the assistant turn and append `DROPPED_STREAM_NOTE` instead of discarding it.
   - **This needs `marv_core::ProviderEvent::Retry` to gain `continued: bool`** (a marv-core change, still to request).
+  - `Retry` also carries `cause: marv_core::RetryCause` (#88 stall, #96 degenerate reply); the loop passes it on in `LoopEvent::Retry` for the trajectory and otherwise treats every cause the same.
 - **#63 compaction v2 (spec first; nothing is settled):**
   - `V2_SECTIONS` (structured template), `V2_TAIL_TOKENS` = 15k (verbatim tail), `V2_OVERFLOW_TARGETS` = 70/50/35%;
   - `tail_start` (never splits a call from its result) and `rolling_update_request` are todo;

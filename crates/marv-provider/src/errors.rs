@@ -23,6 +23,9 @@ pub const MAX_RAW: usize = 400;
 /// An error object as providers send it: OpenAI-style, with OpenRouter's wrapper for upstream failures.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct ErrorObject {
+    /// OpenRouter's numeric error code (an HTTP status), when it sends one. A number or a string.
+    #[serde(default)]
+    pub code: Option<serde_json::Value>,
     #[serde(default)]
     pub message: Option<String>,
     #[serde(default)]
@@ -57,6 +60,27 @@ pub fn describe_error(error: &ErrorObject) -> String {
     };
     let who = meta.provider_name.as_deref().map(|p| format!("{p}: ")).unwrap_or_default();
     format!("{message}: {who}{}", clip(&detail, MAX_RAW))
+}
+
+/// Whether an error sent inside a stream (after the 200) is one a fresh attempt may get past: the provider behind
+/// the router timed out, was overloaded or unavailable, or aborted the reply. OpenRouter sends these mid-stream as
+/// `{"error":{"code":502,"message":"The operation was aborted"}}`; Gemini 3.8 Flash through OpenRouter did it again and
+/// again in a benchmark run, where the same model straight from Google didn't. These are retried like a
+/// dropped connection (#64: the partial reply is kept or continued). Anything else (a bad request, a refused tool
+/// call, an auth error) still ends the turn with its message.
+pub fn transient(error: &ErrorObject) -> bool {
+    let code = match &error.code {
+        Some(serde_json::Value::Number(n)) => n.as_u64(),
+        Some(serde_json::Value::String(s)) => s.parse().ok(),
+        _ => None,
+    };
+    if let Some(code) = code {
+        return matches!(code, 408 | 429 | 500 | 502 | 503 | 504 | 520..=529);
+    }
+    let message = error.message.as_deref().unwrap_or_default().to_lowercase();
+    ["aborted", "timed out", "timeout", "overloaded", "temporarily unavailable", "service unavailable", "try again"]
+        .iter()
+        .any(|m| message.contains(m))
 }
 
 /// Pulls the message out of an error body (`{"error":{"message":…}}` or Ollama's `{"error":"…"}`).
@@ -131,6 +155,19 @@ pub fn is_context_overflow(_message: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn transient_stream_errors_are_upstream_timeouts_aborts_and_overloads() {
+        let e =
+            |code: Option<serde_json::Value>, message: &str| ErrorObject { code, message: Some(message.into()), metadata: None };
+        assert!(transient(&e(Some(502.into()), "The operation was aborted")));
+        assert!(transient(&e(None, "The operation was aborted")));
+        assert!(transient(&e(Some(429.into()), "Rate limited")));
+        assert!(transient(&e(Some("529".into()), "Overloaded")));
+        assert!(!transient(&e(Some(400.into()), "Request timed out?")), "the code decides when there is one");
+        assert!(!transient(&e(None, "tool_use ids must be unique")));
+        assert!(!transient(&e(Some(401.into()), "No auth credentials found")));
+    }
+
     // From tests/openai-compat.test.ts and tests/provider-factory.test.ts (there through a server).
 
     #[test]
@@ -175,6 +212,7 @@ mod tests {
     #[test]
     fn openrouter_wrapped_errors_keep_the_upstream_detail() {
         let err = ErrorObject {
+            code: None,
             message: Some("Provider returned error".into()),
             metadata: Some(ErrorMetadata {
                 provider_name: Some("Anthropic".into()),

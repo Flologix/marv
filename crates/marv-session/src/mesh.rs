@@ -628,7 +628,7 @@ mod tests {
         use crate::trajectory::TrajectoryStore;
         use futures::StreamExt;
         use marv_core::{ChatTurn, ProviderEvent, ToolCall};
-        use marv_provider::{EventStream, Provider, ProviderFactory, ReasoningSupport, StreamOptions};
+        use marv_provider::{EventStream, Provider, ProviderFactory, StreamOptions};
 
         type Hook =
             dyn Fn(usize, &[ChatTurn], &StreamOptions) -> futures::future::BoxFuture<'static, Vec<ProviderEvent>> + Send + Sync;
@@ -669,7 +669,7 @@ mod tests {
             fn model(&self) -> &str {
                 "test-model"
             }
-            fn make(&self, _model: Option<&str>, _info: Option<ReasoningSupport>) -> Arc<dyn Provider> {
+            fn make(&self, _model: Option<&str>, _info: Option<&marv_provider::ModelInfo>) -> Arc<dyn Provider> {
                 Arc::new(Model { hook: self.0.hook.clone(), seen: self.0.seen.clone() })
             }
         }

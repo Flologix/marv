@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use marv_agent::{ApprovalRecord, LoopEvent, ToolRun};
 use marv_core::{ChatTurn, Door, ProviderEvent, ToolCall};
-use marv_provider::{EventStream, Provider, ProviderFactory, ProviderOption, ReasoningSupport, StreamOptions};
+use marv_provider::{EventStream, Provider, ProviderFactory, ProviderOption, StreamOptions};
 use marv_session::processes::ProcessManager;
 use marv_session::{MarvSession, ProviderChoice, SendOptions, SessionBuilder, SessionEvent, SessionInit};
 use marv_tools::{ApprovalRequest, Approver, Decision, ProcessState};
@@ -58,7 +58,7 @@ impl ProviderFactory for Fixed {
     fn model(&self) -> &str {
         "test-model"
     }
-    fn make(&self, _: Option<&str>, _: Option<ReasoningSupport>) -> Arc<dyn Provider> {
+    fn make(&self, _: Option<&str>, _: Option<&marv_provider::ModelInfo>) -> Arc<dyn Provider> {
         self.0.clone()
     }
 }

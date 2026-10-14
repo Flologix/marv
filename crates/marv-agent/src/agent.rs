@@ -408,12 +408,13 @@ pub enum LoopEvent {
     Compacted,
     Done(StopReason),
     /// The connection was lost and the provider is retrying. `continued` (#64): the partial reply
-    /// was kept and the model asked to continue, instead of starting over.
+    /// was kept and the model asked to continue, instead of starting over. `cause`: why (#88, #96).
     Retry {
         attempt: u32,
         max: u32,
         message: String,
         continued: bool,
+        cause: marv_core::RetryCause,
     },
 }
 
@@ -561,7 +562,7 @@ impl StepReply {
                 self.error = Some(message);
                 None
             }
-            ProviderEvent::Retry { attempt, max, message, continued } => {
+            ProviderEvent::Retry { attempt, max, message, continued, cause } => {
                 // Retrying from scratch: discard this attempt's partial text, calls and reasoning so
                 // the retry doesn't duplicate them. A continued retry (#64) keeps the partial text:
                 // the next attempt appends to it.
@@ -572,7 +573,7 @@ impl StepReply {
                     self.reasoning = None;
                     self.calls.clear();
                 }
-                Some(LoopEvent::Retry { attempt, max, message, continued })
+                Some(LoopEvent::Retry { attempt, max, message, continued, cause })
             }
         }
     }
@@ -1387,7 +1388,7 @@ mod tests {
         let (reply, events) = fold(vec![
             ProviderEvent::TextDelta("Half".into()),
             ProviderEvent::ToolCall(call("c1", "a")),
-            ProviderEvent::Retry { attempt: 1, max: 2, message: "retrying".into(), continued: false },
+            ProviderEvent::Retry { attempt: 1, max: 2, message: "retrying".into(), continued: false, cause: Default::default() },
             ProviderEvent::TextDelta("Whole".into()),
             ProviderEvent::Done { reason: Some("stop".into()) },
         ]);
@@ -1916,7 +1917,7 @@ mod tests {
         let provider = Arc::new(ScriptedProvider::new(vec![vec![
             ProviderEvent::TextDelta("Hel".into()),
             ProviderEvent::ToolCall(c.clone()),
-            ProviderEvent::Retry { attempt: 1, max: 2, message: "lost".into(), continued: false },
+            ProviderEvent::Retry { attempt: 1, max: 2, message: "lost".into(), continued: false, cause: Default::default() },
             ProviderEvent::TextDelta("Hello".into()),
             ProviderEvent::ToolCall(c),
             ProviderEvent::Done { reason: Some("tool_calls".into()) },
@@ -1926,9 +1927,9 @@ mod tests {
         assert!(events.iter().any(|e| matches!(e, LoopEvent::Assistant { text } if text == "Hello")));
         assert_eq!(starts(&events).len(), 1);
         assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, LoopEvent::Retry { attempt: 1, max: 2, message, continued: false } if message == "lost"))
+            events.iter().any(
+                |e| matches!(e, LoopEvent::Retry { attempt: 1, max: 2, message, continued: false, .. } if message == "lost")
+            )
         );
     }
 

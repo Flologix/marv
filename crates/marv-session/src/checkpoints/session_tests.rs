@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use futures::StreamExt;
 use marv_agent::LoopEvent;
 use marv_core::{ChatTurn, ProviderEvent, StopReason, ToolCall};
-use marv_provider::{EventStream, Provider, ProviderFactory, ReasoningSupport, StreamOptions};
+use marv_provider::{EventStream, Provider, ProviderFactory, StreamOptions};
 use marv_tools::{ApprovalRequest, Approver, Decision};
 
 use super::store::{CheckpointStore, SnapshotFailure, SnapshotResult, StoreOptions};
@@ -83,7 +83,7 @@ impl ProviderFactory for Fixed {
     fn model(&self) -> &str {
         "test-model"
     }
-    fn make(&self, _model: Option<&str>, _info: Option<ReasoningSupport>) -> Arc<dyn Provider> {
+    fn make(&self, _model: Option<&str>, _info: Option<&marv_provider::ModelInfo>) -> Arc<dyn Provider> {
         self.0.clone()
     }
 }

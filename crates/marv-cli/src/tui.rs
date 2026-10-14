@@ -285,7 +285,7 @@ pub fn map_loop(event: &LoopEvent, totals: &dyn Fn() -> view::Totals) -> Option<
         L::ToolLoop { continued } => UiEvent::ToolLoop { continued: *continued },
         L::Compacted => UiEvent::Compacted,
         L::Done(reason) => UiEvent::Done(*reason),
-        L::Retry { attempt, max, message, continued } => {
+        L::Retry { attempt, max, message, continued, .. } => {
             UiEvent::Retry { attempt: *attempt, max: *max, message: message.clone(), continued: *continued }
         }
     })

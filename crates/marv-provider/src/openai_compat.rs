@@ -44,18 +44,21 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use futures::{FutureExt, StreamExt};
-use marv_core::{ChatTurn, ProviderEvent, ToolCall, ToolChoice, ToolSpec, Usage};
+use marv_core::{ChatTurn, ProviderEvent, RetryCause, ToolCall, ToolChoice, ToolSpec, Usage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+use crate::degenerate::{DEGENERATE_NOTE, DegenerateGuard};
 use crate::errors::{ErrorHints, ErrorObject, describe_error, error_message, http_error, unreachable};
 use crate::retry::{
-    BACKOFFS, DropRecovery, MAX_ATTEMPTS, RetryTiming, drop_recovery, is_network_error, parse_retry_after, retriable_http_status,
-    sleep_abortable,
+    BACKOFFS, BodyError, DropRecovery, FailureKind, MAX_ATTEMPTS, RetryTiming, drop_recovery, idle_guard, parse_retry_after,
+    retriable_failure, retriable_http_status, sleep_abortable,
 };
 use crate::sse::parse_sse;
 use crate::{EventStream, Provider, StreamOptions};
@@ -66,6 +69,30 @@ pub const DROPPED_STREAM_NOTE: &str = "(Automatic note from Marv, the program ru
 
 /// Marv #64: the most a backoff wait is lengthened at random (a share of it).
 pub const JITTER: f64 = 0.25;
+
+/// Marv #88: how long a stream may send nothing at all (not even a keep-alive) before it counts as stalled and is
+/// retried like a dropped connection. OpenRouter sends keep-alive comments while the model works, so a provider that
+/// is slow but alive isn't cut off; a stalled one used to hold the turn for the whole 300 s read timeout.
+pub const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(75);
+
+/// Marv #96: the `max_tokens` sent when the model list doesn't say what the model can do (and the most sent when it
+/// does). Without one, a runaway reply only ends when the provider gives up; GLM streamed newlines for six minutes.
+/// opencode sends the same cap.
+pub const DEFAULT_MAX_TOKENS: u64 = 32_000;
+
+/// #96: the `max_tokens` for a model whose list entry says it can write at most `max_output` tokens per reply.
+pub fn max_tokens_for(max_output: Option<u64>) -> u64 {
+    max_output.map_or(DEFAULT_MAX_TOKENS, |n| n.min(DEFAULT_MAX_TOKENS))
+}
+
+/// #96: how a provider says it won't take the `max_tokens` Marv sent: it names the field, or (OpenRouter) the prompt
+/// plus the requested output don't fit the window ("…, 32000 in the output").
+static MAX_TOKENS_REFUSED: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?i)max_tokens|max_completion_tokens|max output tokens|in the output").unwrap());
+
+/// Names the field itself: the provider doesn't take it at all, so later requests leave it out too.
+static NAMES_MAX_TOKENS: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?i)max_tokens|max_completion_tokens").unwrap());
 
 #[derive(Debug, Clone, Default)]
 pub struct OpenAiCompatOptions {
@@ -85,6 +112,12 @@ pub struct OpenAiCompatOptions {
     /// What a bad key or an unknown model tells the user to change (default: the TUI's commands).
     pub hints: ErrorHints,
     pub timing: RetryTiming,
+    /// #88: a stream silent for this long is retried ([`STREAM_IDLE_TIMEOUT`] for OpenRouter). `None`: only the
+    /// 300 s read timeout applies.
+    pub idle_timeout: Option<Duration>,
+    /// #96: sent as `max_tokens`, so the provider ends a runaway reply ([`max_tokens_for`] for OpenRouter). `None`
+    /// sends nothing. A provider that refuses it gets the request again without it.
+    pub max_tokens: Option<u64>,
 }
 
 /// Marv #56: models that cache only (or more reliably) with explicit breakpoints. One small table.
@@ -181,6 +214,9 @@ pub struct ChatRequest<'a> {
     /// Only ever "none" (#59); `Auto` sends nothing, so today's requests keep their bytes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<&'static str>,
+    /// #96: the most the reply may be. Not part of the prompt, so it doesn't touch the cache.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
     #[serde(flatten)]
     pub extra: &'a serde_json::Map<String, Value>,
 }
@@ -253,6 +289,7 @@ pub fn request_body<'a>(
         messages: to_messages(history, system, needs_cache_breakpoints(&options.model)),
         tools: tools.iter().map(|t| WireTool { kind: "function", function: t }).collect(),
         tool_choice: (tool_choice == ToolChoice::None).then_some("none"),
+        max_tokens: options.max_tokens,
         extra: &options.body,
     }
 }
@@ -358,6 +395,9 @@ pub struct ReplyAssembler {
     reasoning: Vec<Value>,
     /// #64: what a dropped stream had already delivered.
     pub text_received: bool,
+    /// An error the provider sent mid-stream that a fresh attempt may get past (`errors::transient`): retried like a
+    /// drop, and reported in full if every attempt ends this way.
+    pub upstream: Option<String>,
 }
 
 impl ReplyAssembler {
@@ -369,6 +409,7 @@ impl ReplyAssembler {
             complete: false,
             reasoning: Vec::new(),
             text_received: false,
+            upstream: None,
         }
     }
 
@@ -384,9 +425,15 @@ impl ReplyAssembler {
             return Flow::Done;
         }
         let Ok(chunk) = serde_json::from_str::<Chunk>(data) else { return Flow::Broken };
-        // Errors can also arrive mid-stream, after the 200 status was already sent.
+        // Errors can also arrive mid-stream, after the 200 status was already sent. One the provider behind the router
+        // may get past on a fresh attempt (an upstream abort, timeout or overload) is retried like a dropped connection.
         if let Some(error) = &chunk.error {
-            out.push(ProviderEvent::Error(format!("{}: {}", self.label, describe_error(error))));
+            let message = format!("{}: {}", self.label, describe_error(error));
+            if crate::errors::transient(error) {
+                self.upstream = Some(message);
+                return Flow::Broken;
+            }
+            out.push(ProviderEvent::Error(message));
             return Flow::Stop;
         }
         if let Some(u) = chunk.usage {
@@ -463,6 +510,8 @@ pub struct OpenAiCompatProvider {
     pub options: OpenAiCompatOptions,
     /// Shared connection pool; built with rustls and the timeouts in the module notes.
     pub client: reqwest::Client,
+    /// #96: the provider said it doesn't take `max_tokens`: later streams leave it out.
+    max_tokens_refused: Arc<AtomicBool>,
 }
 
 impl OpenAiCompatProvider {
@@ -473,7 +522,7 @@ impl OpenAiCompatProvider {
             .read_timeout(Duration::from_secs(300))
             .build()
             .unwrap_or_default();
-        Self { options, client }
+        Self { options, client, max_tokens_refused: Arc::default() }
     }
 }
 
@@ -495,9 +544,14 @@ impl Provider for OpenAiCompatProvider {
             system: options.system,
             tools: options.tools,
             tool_choice: options.tool_choice,
+            note: None,
         };
-        let (client, adapter, cancel) = (self.client.clone(), self.options.clone(), options.cancel);
-        channel_stream(move |emit| run(client, adapter, outgoing, cancel, emit))
+        let (client, mut adapter, cancel) = (self.client.clone(), self.options.clone(), options.cancel);
+        if self.max_tokens_refused.load(Ordering::Relaxed) {
+            adapter.max_tokens = None;
+        }
+        let refused = self.max_tokens_refused.clone();
+        channel_stream(move |emit| run(client, adapter, outgoing, refused, cancel, emit))
     }
 }
 
@@ -507,13 +561,15 @@ struct Outgoing {
     system: Option<String>,
     tools: Vec<ToolSpec>,
     tool_choice: ToolChoice,
+    /// #96: sent after the history once a reply degenerated.
+    note: Option<&'static str>,
 }
 
 impl Outgoing {
     /// The body of the next attempt (#64: with the kept partial reply and the note, if any).
     fn body(&mut self, options: &OpenAiCompatOptions, kept: &str) -> Vec<u8> {
-        let Self { history, system, tools, tool_choice } = self;
-        with_continuation(history, kept, |history| {
+        let Self { history, system, tools, tool_choice, note } = self;
+        with_continuation(history, *note, kept, |history| {
             let body = request_body(options, history, system.as_deref(), tools, *tool_choice);
             serde_json::to_vec(&body).expect("a request body is plain JSON")
         })
@@ -522,30 +578,87 @@ impl Outgoing {
 
 /// Marv #64: runs `f` on the history with, when `kept` isn't empty, the partial reply as an
 /// assistant turn and [`DROPPED_STREAM_NOTE`] after it. The history is left as it was.
-pub(crate) fn with_continuation<R>(history: &mut Vec<ChatTurn>, kept: &str, f: impl FnOnce(&[ChatTurn]) -> R) -> R {
-    if kept.is_empty() {
-        return f(history);
+/// #96: `note` (after a degenerate reply) goes right after the history, as a user turn.
+pub(crate) fn with_continuation<R>(
+    history: &mut Vec<ChatTurn>,
+    note: Option<&str>,
+    kept: &str,
+    f: impl FnOnce(&[ChatTurn]) -> R,
+) -> R {
+    let len = history.len();
+    if let Some(note) = note {
+        history.push(ChatTurn::User { text: note.to_string() });
     }
-    history.push(ChatTurn::Assistant { text: kept.to_string(), tool_calls: Vec::new(), reasoning: None });
-    history.push(ChatTurn::User { text: DROPPED_STREAM_NOTE.to_string() });
+    if !kept.is_empty() {
+        history.push(ChatTurn::Assistant { text: kept.to_string(), tool_calls: Vec::new(), reasoning: None });
+        history.push(ChatTurn::User { text: DROPPED_STREAM_NOTE.to_string() });
+    }
     let result = f(history);
-    history.truncate(history.len() - 2);
+    history.truncate(len);
     result
 }
 
-/// The retry loop: up to [`MAX_ATTEMPTS`] for network errors, drops and 429/502/503/504.
-async fn run(client: reqwest::Client, o: OpenAiCompatOptions, mut outgoing: Outgoing, cancel: CancellationToken, emit: Emit) {
-    let label = o.label.as_str();
+/// #96: after a reply degenerated, retry once (`true`: the caller sends the next attempt at once) or end the stream.
+/// Either way what the attempt streamed is thrown away: the retry starts over, with [`DEGENERATE_NOTE`].
+pub(crate) fn after_degenerate(
+    label: &str,
+    discarded: u64,
+    degenerate_retries: &mut u32,
+    kept: &mut String,
+    note: &mut Option<&'static str>,
+    emit: &Emit,
+) -> bool {
+    if *degenerate_retries >= 1 {
+        emit.send(ProviderEvent::Error(format!(
+            "{label}: the model's reply degenerated again (whitespace, or the same short piece over and over), so Marv \
+             stopped it. Try again, or switch to another model."
+        )));
+        return false;
+    }
+    *degenerate_retries += 1;
+    kept.clear();
+    *note = Some(DEGENERATE_NOTE);
+    let kb = discarded.div_ceil(1024);
+    emit.send(ProviderEvent::Retry {
+        attempt: 1,
+        max: 1,
+        message: format!("{label}: the reply degenerated into repeated output ({kb} KB thrown away), asking again…"),
+        continued: false,
+        cause: RetryCause::Degenerate { discarded },
+    });
+    true
+}
+
+/// The retry loop: up to [`MAX_ATTEMPTS`] for network errors, drops, stalls and 429/502/503/504; once more after a
+/// degenerate reply (#96), and once without `max_tokens` when the provider refuses it.
+async fn run(
+    client: reqwest::Client,
+    mut o: OpenAiCompatOptions,
+    mut outgoing: Outgoing,
+    refused: Arc<AtomicBool>,
+    cancel: CancellationToken,
+    emit: Emit,
+) {
+    let label = o.label.clone();
+    let label = label.as_str();
     let url = format!("{}/chat/completions", o.base_url);
     // #64: the partial reply kept from dropped attempts; the next request continues it.
     let mut kept = String::new();
-    for attempt in 1.. {
+    // Why the next attempt is a retry (#88: a stall is recorded as one).
+    let mut cause = RetryCause::Dropped;
+    // The attempt number for connection retries; a degenerate retry or one without max_tokens doesn't count.
+    let mut attempt = 0;
+    let mut announce = false;
+    let mut degenerate_retries = 0;
+    loop {
         if cancel.is_cancelled() {
             return;
         }
-        if attempt > 1 {
-            emit.retry(label, attempt - 1, !kept.is_empty());
+        attempt += 1;
+        if announce {
+            emit.retry(label, attempt - 1, !kept.is_empty(), std::mem::take(&mut cause));
         }
+        announce = true;
 
         let mut request = client.post(&url).header(reqwest::header::CONTENT_TYPE, "application/json");
         if let Some(key) = &o.api_key {
@@ -572,17 +685,27 @@ async fn run(client: reqwest::Client, o: OpenAiCompatOptions, mut outgoing: Outg
         let status = response.status().as_u16();
         if response.status().is_success() {
             // Stream the SSE body. If the connection drops mid-stream, retry (#64: or continue).
-            match read_reply(response, label, &cancel, &emit).await {
+            match read_reply(response, label, o.idle_timeout, &cancel, &emit).await {
                 Read::Finished => return,
-                Read::Dropped { text, tool_call_in_progress } => {
+                Read::Degenerate { discarded } => {
+                    if !after_degenerate(label, discarded, &mut degenerate_retries, &mut kept, &mut outgoing.note, &emit) {
+                        return;
+                    }
+                    (attempt, announce) = (attempt - 1, false);
+                    continue;
+                }
+                Read::Dropped { text, tool_call_in_progress, cause: dropped } => {
                     keep_or_restart(&mut kept, &text, tool_call_in_progress);
+                    if matches!(dropped, DropCause::Stalled(_)) {
+                        cause = RetryCause::Stalled;
+                    }
                     if attempt < MAX_ATTEMPTS {
                         if sleep_abortable(backoff(o.timing, attempt), &cancel).await {
                             return;
                         }
                         continue;
                     }
-                    emit.send(ProviderEvent::Error(ended_early(label)));
+                    emit.send(ProviderEvent::Error(dropped.final_message(label)));
                     return;
                 }
             }
@@ -596,6 +719,15 @@ async fn run(client: reqwest::Client, o: OpenAiCompatOptions, mut outgoing: Outg
             continue;
         }
         let Some(detail) = read_error(response, &cancel).await else { return };
+        // #96: a provider that won't take max_tokens (or can't fit it beside this prompt) gets the request without it.
+        if (400..500).contains(&status) && o.max_tokens.is_some() && MAX_TOKENS_REFUSED.is_match(&detail) {
+            if NAMES_MAX_TOKENS.is_match(&detail) {
+                refused.store(true, Ordering::Relaxed);
+            }
+            o.max_tokens = None;
+            (attempt, announce) = (attempt - 1, false);
+            continue;
+        }
         emit.send(ProviderEvent::Error(http_error(status, &detail, label, &o.model, o.hints)));
         return;
     }
@@ -606,29 +738,78 @@ pub(crate) enum Read {
     /// Complete, or an error event was sent, or cancelled: the stream is over.
     Finished,
     /// It broke off before the reply was complete: retry. `text` is what this attempt streamed.
-    Dropped { text: String, tool_call_in_progress: bool },
+    Dropped { text: String, tool_call_in_progress: bool, cause: DropCause },
+    /// #96: the reply degenerated and the request was aborted; `discarded` bytes of text and reasoning are thrown away.
+    Degenerate { discarded: u64 },
 }
 
-/// Parses the SSE body, sending events as they come.
-async fn read_reply(response: reqwest::Response, label: &str, cancel: &CancellationToken, emit: &Emit) -> Read {
+/// Why a stream broke off: what the error says when no attempt gets past it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DropCause {
+    /// The connection dropped, or the stream ended (or broke) before the reply was complete.
+    Dropped,
+    /// The provider sent an error mid-stream that a fresh attempt may get past (the full message).
+    Upstream(String),
+    /// #88: nothing at all arrived for this long.
+    Stalled(Duration),
+}
+
+impl DropCause {
+    /// The error after the last attempt broke off too.
+    pub(crate) fn final_message(&self, label: &str) -> String {
+        match self {
+            Self::Dropped => ended_early(label),
+            Self::Upstream(message) => message.clone(),
+            Self::Stalled(idle) => {
+                let idle = if idle.as_secs() > 0 { format!("{} s", idle.as_secs()) } else { format!("{} ms", idle.as_millis()) };
+                format!("{label}: the stream stalled (nothing arrived for {idle}), on every attempt. Try again.")
+            }
+        }
+    }
+}
+
+/// Parses the SSE body, sending events as they come. `idle` (#88): the longest silence allowed between chunks.
+async fn read_reply(
+    response: reqwest::Response,
+    label: &str,
+    idle: Option<Duration>,
+    cancel: &CancellationToken,
+    emit: &Emit,
+) -> Read {
     let mut assembler = ReplyAssembler::new(label);
+    let mut guard = DegenerateGuard::default();
     let mut text = String::new();
     let mut out = Vec::new();
-    let mut data = Box::pin(parse_sse(Box::pin(response.bytes_stream())));
+    let mut data = Box::pin(parse_sse(idle_guard(response.bytes_stream(), idle)));
     loop {
         let Some(next) = until_cancelled(cancel, data.next()).await else { return Read::Finished };
         let flow = match next {
             None => break,
+            // #88: silent for too long. Retried like a drop: the partial reply is kept or continued (#64).
+            Some(Err(BodyError::Stalled(idle))) => {
+                return Read::Dropped {
+                    text,
+                    tool_call_in_progress: assembler.tool_call_in_progress(),
+                    cause: DropCause::Stalled(idle),
+                };
+            }
             // A connection drop mid-stream is retriable: typically a socket closed or reset.
-            Some(Err(_)) => Flow::Broken,
+            Some(Err(BodyError::Transport(_))) => Flow::Broken,
             Some(Ok(data)) => assembler.on_data(&data, &mut out),
         };
+        // #96: a reply that turned into whitespace or one repeated piece is aborted (dropping the response closes it).
+        if out.iter().any(|event| guard.check(event)) {
+            return Read::Degenerate { discarded: guard.streamed() };
+        }
         emit.forward(&mut out, &mut text);
         match flow {
             Flow::Continue => {}
             Flow::Done => break,
             Flow::Stop => return Read::Finished,
-            Flow::Broken => return Read::Dropped { text, tool_call_in_progress: assembler.tool_call_in_progress() },
+            Flow::Broken => {
+                let cause = assembler.upstream.take().map_or(DropCause::Dropped, DropCause::Upstream);
+                return Read::Dropped { text, tool_call_in_progress: assembler.tool_call_in_progress(), cause };
+            }
         }
     }
     let tool_call_in_progress = assembler.tool_call_in_progress();
@@ -638,7 +819,7 @@ async fn read_reply(response: reqwest::Response, label: &str, cancel: &Cancellat
     emit.forward(&mut out, &mut text);
     match finished {
         Ok(()) => Read::Finished,
-        Err(Incomplete) => Read::Dropped { text, tool_call_in_progress },
+        Err(Incomplete) => Read::Dropped { text, tool_call_in_progress, cause: DropCause::Dropped },
     }
 }
 
@@ -691,10 +872,13 @@ pub(crate) async fn read_error(response: reqwest::Response, cancel: &Cancellatio
     Some(error_message(content_type.as_deref(), status_text, &body))
 }
 
-/// Whether a failed request is worth retrying: a connection or timeout error, or one whose
-/// wording says so (hyper's differs from Bun's, so the whole chain is checked).
+/// Whether a failed request is worth retrying ([`retriable_failure`], #107): reqwest says it failed connecting,
+/// sending, timing out or reading the body, or the wording says so (hyper's and rustls' differ from Bun's, so the
+/// whole chain is checked). A certificate error never is.
 pub(crate) fn is_network_failure(err: &reqwest::Error) -> bool {
-    err.is_connect() || err.is_timeout() || is_network_error(&error_chain(err))
+    let kind =
+        FailureKind { connect: err.is_connect(), timeout: err.is_timeout(), body: err.is_body(), request: err.is_request() };
+    retriable_failure(kind, &error_chain(err))
 }
 
 /// Every message in an error's chain, joined with ": ".
@@ -745,14 +929,19 @@ impl Emit {
         }
     }
 
-    /// The `Retry` event before a new attempt (`retry`/`MAX_ATTEMPTS - 1`).
-    pub(crate) fn retry(&self, label: &str, retry: u32, continued: bool) {
+    /// The `Retry` event before a new attempt (`retry`/`MAX_ATTEMPTS - 1`), saying why.
+    pub(crate) fn retry(&self, label: &str, retry: u32, continued: bool, cause: RetryCause) {
         let max = MAX_ATTEMPTS - 1;
+        let what = match cause {
+            RetryCause::Stalled => "the stream stalled",
+            _ => "connection lost",
+        };
         self.send(ProviderEvent::Retry {
             attempt: retry,
             max,
-            message: format!("{label}: connection lost, retrying ({retry}/{max})…"),
+            message: format!("{label}: {what}, retrying ({retry}/{max})…"),
             continued,
+            cause,
         });
     }
 }
@@ -812,6 +1001,18 @@ mod tests {
         assert!(none.contains(r#""tool_choice":"none""#));
         let no_tools = serde_json::to_string(&request_body(&options, &[], None, &[], ToolChoice::Auto)).unwrap();
         assert!(!no_tools.contains("tools"));
+    }
+
+    #[test]
+    fn max_tokens_goes_after_the_tools_before_extra_fields_and_is_capped() {
+        // #96
+        let mut options = OpenAiCompatOptions { model: "acme/m".into(), max_tokens: Some(8192), ..Default::default() };
+        options.body.insert("reasoning".into(), serde_json::json!({"enabled": true}));
+        let body = serde_json::to_string(&request_body(&options, &[], None, &[], ToolChoice::None)).unwrap();
+        assert!(body.ends_with(r#""tool_choice":"none","max_tokens":8192,"reasoning":{"enabled":true}}"#), "{body}");
+        assert_eq!(max_tokens_for(None), DEFAULT_MAX_TOKENS);
+        assert_eq!(max_tokens_for(Some(4096)), 4096);
+        assert_eq!(max_tokens_for(Some(1_000_000)), DEFAULT_MAX_TOKENS);
     }
 
     #[test]
@@ -931,6 +1132,23 @@ mod tests {
             events.last(),
             Some(&ProviderEvent::Error("TestRouter: Provider returned error: Anthropic: tool_use ids must be unique".into()))
         );
+    }
+
+    #[test]
+    fn an_upstream_abort_in_the_stream_is_retried_like_a_dropped_connection() {
+        // What OpenRouter sent when Gemini's upstream gave up mid-reply.
+        for error in [
+            r#"{"error":{"code":502,"message":"The operation was aborted"}}"#,
+            r#"{"error":{"message":"The operation was aborted"}}"#,
+            r#"{"error":{"code":"503","message":"Provider is overloaded"}}"#,
+        ] {
+            let (events, result) = run(&[r#"{"choices":[{"delta":{"content":"partial"}}]}"#, error]);
+            assert_eq!(result, Err(Incomplete), "{error}");
+            assert!(!events.iter().any(|e| matches!(e, ProviderEvent::Error(_))), "{error}: {events:?}");
+        }
+        // A request the provider refuses isn't retried: same code family, different meaning.
+        let (_, result) = run(&[r#"{"error":{"code":400,"message":"Provider returned error"}}"#]);
+        assert_eq!(result, Ok(()));
     }
 
     #[test]

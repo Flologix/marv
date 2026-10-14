@@ -7,7 +7,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use futures::StreamExt;
-use marv_core::{ChatTurn, ProviderEvent, ToolCall, ToolSpec, Usage};
+use marv_core::{ChatTurn, ProviderEvent, RetryCause, ToolCall, ToolSpec, Usage};
+use marv_provider::degenerate::DEGENERATE_NOTE;
 use marv_provider::ollama::{OllamaOptions, OllamaProvider};
 use marv_provider::openai_compat::DROPPED_STREAM_NOTE;
 use marv_provider::retry::RetryTiming;
@@ -325,7 +326,11 @@ async fn resends_the_request_after_an_http_503_succeeding_on_retry() {
     assert_eq!(
         events[0],
         ProviderEvent::Retry {
-            attempt: 1, max: 2, message: "Ollama: connection lost, retrying (1/2)…".into(), continued: false
+            attempt: 1,
+            max: 2,
+            message: "Ollama: connection lost, retrying (1/2)…".into(),
+            continued: false,
+            cause: Default::default(),
         }
     );
 }
@@ -492,4 +497,36 @@ async fn a_drop_after_a_tool_call_arrived_starts_over() {
     let events = say_hi(&provider(&server.url(), false)).await;
     assert_eq!(retries(&events), [false]);
     assert_eq!(last_chat(&server)["messages"], json!([{"role": "user", "content": "hi"}]));
+}
+
+#[tokio::test]
+async fn a_degenerate_reply_is_aborted_and_asked_again_once_then_ends_the_turn() {
+    // #96: a local model can loop too; Ollama's num_predict caps it, but only after thousands of tokens.
+    let flood = || {
+        let mut lines: Vec<Value> = (0..128).map(|_| msg(json!({"thinking": "\n".repeat(512)}))).collect();
+        lines.push(end());
+        Reply::ndjson(&lines)
+    };
+    let server =
+        FakeServer::start(chat(
+            move |n| if n == 1 { flood() } else { Reply::ndjson(&[msg(json!({"content": "Done."})), end()]) },
+        ))
+        .await;
+    let events = say_hi(&provider(&server.url(), true)).await;
+    assert!(
+        events.iter().any(|e| matches!(e, ProviderEvent::Retry { continued: false, cause: RetryCause::Degenerate { .. }, .. })),
+        "{events:?}"
+    );
+    assert!(events.contains(&ProviderEvent::TextDelta("Done.".into())));
+    let messages = last_chat(&server)["messages"].as_array().unwrap().clone();
+    assert_eq!(messages.last().unwrap(), &json!({"role": "user", "content": DEGENERATE_NOTE}));
+
+    let server = FakeServer::start(chat(move |_| flood())).await;
+    let events = say_hi(&provider(&server.url(), true)).await;
+    assert_eq!(server.count("/api/chat"), 2);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, ProviderEvent::Error(m) if m.starts_with("Ollama: the model's reply degenerated again")))
+    );
 }

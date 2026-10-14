@@ -8,7 +8,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
-use marv_core::{ChatTurn, ProviderEvent, ToolCall, ToolSpec, Usage};
+use marv_core::{ChatTurn, ProviderEvent, RetryCause, ToolCall, ToolSpec, Usage};
+use marv_provider::degenerate::DEGENERATE_NOTE;
 use marv_provider::openai_compat::{DROPPED_STREAM_NOTE, JITTER, OpenAiCompatOptions, OpenAiCompatProvider, jittered};
 use marv_provider::retry::RetryTiming;
 use marv_provider::{EventStream, Provider, StreamOptions};
@@ -307,6 +308,218 @@ async fn a_stream_that_ends_inside_a_tool_call_retries_from_the_top_then_reports
 }
 
 #[tokio::test]
+async fn a_connection_reset_mid_stream_is_retried_and_continued() {
+    // #107: a broken TLS session ends the connection with a reset, not a clean close.
+    let server = FakeServer::start(counting(|n| {
+        if n == 1 { Reply::sse(&[delta("Half ")]).ending(End::Reset) } else { Reply::sse(&[delta("done."), stop(), done()]) }
+    }))
+    .await;
+    let events = collect(provider(&v1(&server), None).stream(&hi(), StreamOptions::default())).await;
+    assert_eq!(retries(&events), [true], "{events:?}");
+    assert!(events.contains(&text("done.")));
+    assert!(!events.iter().any(|e| matches!(e, ProviderEvent::Error(_))), "{events:?}");
+}
+
+#[tokio::test]
+async fn a_request_whose_connection_is_reset_before_any_reply_is_retried() {
+    // #107: the send itself fails (a pooled connection whose TLS session broke fails the same way).
+    let server = FakeServer::start(counting(|n| {
+        if n == 1 { Reply::text(200, "").ending(End::ResetBeforeReply) } else { Reply::sse(&[delta("ok"), stop(), done()]) }
+    }))
+    .await;
+    let events = collect(provider(&v1(&server), None).stream(&hi(), StreamOptions::default())).await;
+    assert_eq!(retries(&events), [false], "{events:?}");
+    assert!(events.contains(&text("ok")));
+}
+
+#[tokio::test]
+async fn an_upstream_abort_inside_the_stream_is_retried_and_reported_in_full_if_it_persists() {
+    // OpenRouter sends the upstream's failure as an error object after the 200.
+    let abort = json!({"error": {"code": 502, "message": "The operation was aborted"}});
+    let server = FakeServer::start(counting(move |n| {
+        if n == 1 { Reply::sse(&[delta("Hal"), abort.clone()]) } else { Reply::sse(&[delta("f."), stop(), done()]) }
+    }))
+    .await;
+    let events = collect(provider(&v1(&server), None).stream(&hi(), StreamOptions::default())).await;
+    assert_eq!(retries(&events), [true]);
+    assert!(events.contains(&text("f.")));
+    assert!(!events.iter().any(|e| matches!(e, ProviderEvent::Error(_))));
+
+    let abort = json!({"error": {"code": 502, "message": "The operation was aborted"}});
+    let server = FakeServer::start(move |_| Reply::sse(std::slice::from_ref(&abort))).await;
+    let events = collect(provider(&v1(&server), None).stream(&hi(), StreamOptions::default())).await;
+    assert_eq!(server.requests().len(), 3);
+    assert_eq!(error_of(&events), "TestRouter: The operation was aborted");
+}
+
+fn idle(base_url: &str, idle: Duration) -> OpenAiCompatProvider {
+    OpenAiCompatProvider::new(OpenAiCompatOptions {
+        label: "TestRouter".into(),
+        base_url: base_url.into(),
+        model: "acme/model-1".into(),
+        timing: FAST,
+        idle_timeout: Some(idle),
+        ..Default::default()
+    })
+}
+
+fn causes(events: &[ProviderEvent]) -> Vec<RetryCause> {
+    events.iter().filter_map(|e| if let ProviderEvent::Retry { cause, .. } = e { Some(*cause) } else { None }).collect()
+}
+
+#[tokio::test]
+async fn a_stream_that_goes_silent_is_retried_after_the_idle_timeout_and_continued() {
+    // #88: the server sends part of the reply, then nothing for 3 s (it would end the body after that).
+    let server = FakeServer::start(counting(|n| {
+        if n == 1 {
+            Reply::sse(&[delta("Half ")]).ending(End::StallThenComplete(Duration::from_secs(3)))
+        } else {
+            Reply::sse(&[delta("done."), stop(), done()])
+        }
+    }))
+    .await;
+    let start = Instant::now();
+    let events = collect(idle(&v1(&server), Duration::from_millis(150)).stream(&hi(), StreamOptions::default())).await;
+    assert!(start.elapsed() < Duration::from_secs(2), "waited out the stall: {:?}", start.elapsed());
+    assert_eq!(retries(&events), [true], "the partial reply is continued (#64)");
+    assert_eq!(causes(&events), [RetryCause::Stalled]);
+    let message =
+        events.iter().find_map(|e| if let ProviderEvent::Retry { message, .. } = e { Some(message.clone()) } else { None });
+    assert_eq!(message.as_deref(), Some("TestRouter: the stream stalled, retrying (1/2)…"));
+    assert!(events.contains(&text("done.")));
+    assert!(server.last().text().contains(DROPPED_STREAM_NOTE));
+}
+
+#[tokio::test]
+async fn keep_alives_are_not_a_stall_and_a_stream_that_always_stalls_ends_with_a_clear_error() {
+    // Keep-alive comments every 50 ms for 400 ms, with a 150 ms idle timeout: alive, so not cut off.
+    let mut alive = Reply::sse(&[]).paced(Duration::from_millis(50));
+    alive.chunks = (0..8).map(|_| b": OPENROUTER PROCESSING\n\n".to_vec()).collect();
+    alive.chunks.extend(Reply::sse(&[delta("ok"), stop(), done()]).chunks);
+    let server = FakeServer::start(move |_| alive.clone()).await;
+    let paced = OpenAiCompatProvider::new(OpenAiCompatOptions {
+        label: "TestRouter".into(),
+        base_url: v1(&server),
+        timing: FAST,
+        idle_timeout: Some(Duration::from_millis(150)),
+        ..Default::default()
+    });
+    let events = collect(paced.stream(&hi(), StreamOptions::default())).await;
+    assert!(retries(&events).is_empty(), "{events:?}");
+    assert!(events.contains(&text("ok")));
+
+    let server = FakeServer::start(|_| Reply::sse(&[]).ending(End::StallThenComplete(Duration::from_secs(3)))).await;
+    let events = collect(idle(&v1(&server), Duration::from_millis(100)).stream(&hi(), StreamOptions::default())).await;
+    assert_eq!(server.requests().len(), 3);
+    assert_eq!(causes(&events), [RetryCause::Stalled, RetryCause::Stalled]);
+    assert_eq!(error_of(&events), "TestRouter: the stream stalled (nothing arrived for 100 ms), on every attempt. Try again.");
+}
+
+/// #96: what GLM streamed for six minutes: reasoning made of nothing but newlines (here 64 KB of it).
+fn newline_flood() -> Reply {
+    let mut events: Vec<Value> = (0..128).map(|_| json!({"choices": [{"delta": {"reasoning": "\n".repeat(512)}}]})).collect();
+    events.extend([stop(), done()]);
+    Reply::sse(&events)
+}
+
+#[tokio::test]
+async fn a_degenerate_reply_is_aborted_and_asked_again_once_with_a_note() {
+    let server = FakeServer::start(counting(|n| {
+        if n == 1 {
+            let mut flood = newline_flood();
+            flood.chunks.insert(0, Reply::sse(&[delta("Let me check")]).chunks.remove(0));
+            flood
+        } else {
+            Reply::sse(&[delta("All done."), stop(), done()])
+        }
+    }))
+    .await;
+    let events = collect(provider(&v1(&server), None).stream(&hi(), StreamOptions::default())).await;
+    assert_eq!(retries(&events), [false], "the attempt is thrown away, not continued");
+    let Some(RetryCause::Degenerate { discarded }) = causes(&events).first().copied() else { panic!("{events:?}") };
+    // Aborted within the guard's tail (16 KB, checked every KB), long before the 64 KB the server would have sent.
+    let thinking: usize = events.iter().map(|e| if let ProviderEvent::ThinkingDelta(t) = e { t.len() } else { 0 }).sum();
+    assert!(thinking < 20 * 1024 && discarded >= thinking as u64, "{thinking} {discarded}");
+    assert!(events.contains(&text("All done.")));
+    assert!(!events.iter().any(|e| matches!(e, ProviderEvent::Error(_))));
+    // The retry starts over (no partial reply kept), with the note after the history.
+    let retried = server.last().json();
+    let messages = retried["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[1], json!({"role": "user", "content": DEGENERATE_NOTE}));
+}
+
+#[tokio::test]
+async fn a_reply_that_degenerates_again_ends_the_turn_with_a_clear_error() {
+    let server = FakeServer::start(|_| newline_flood()).await;
+    let events = collect(provider(&v1(&server), None).stream(&hi(), StreamOptions::default())).await;
+    assert_eq!(server.requests().len(), 2, "one retry only");
+    assert_eq!(causes(&events).len(), 1);
+    assert!(error_of(&events).starts_with("TestRouter: the model's reply degenerated again"), "{}", error_of(&events));
+    assert!(!events.iter().any(|e| matches!(e, ProviderEvent::Done { .. })));
+}
+
+fn capped(base_url: &str, max_tokens: Option<u64>) -> OpenAiCompatProvider {
+    OpenAiCompatProvider::new(OpenAiCompatOptions {
+        label: "TestRouter".into(),
+        base_url: base_url.into(),
+        model: "acme/model-1".into(),
+        timing: FAST,
+        max_tokens,
+        ..Default::default()
+    })
+}
+
+#[tokio::test]
+async fn max_tokens_is_sent_and_left_out_for_good_when_the_provider_refuses_the_field() {
+    let server = FakeServer::start(|r| {
+        if r.json().get("max_tokens").is_some() {
+            Reply::json(400, json!({"error": {"message": "Unsupported parameter: 'max_tokens'"}}))
+        } else {
+            Reply::sse(&[delta("ok"), stop(), done()])
+        }
+    })
+    .await;
+    let provider = capped(&v1(&server), Some(32_000));
+    let events = collect(provider.stream(&hi(), StreamOptions::default())).await;
+    assert!(events.contains(&text("ok")), "{events:?}");
+    assert!(retries(&events).is_empty(), "not a connection retry");
+    let sent: Vec<_> = server.requests().iter().map(|r| r.json().get("max_tokens").cloned()).collect();
+    assert_eq!(sent, [Some(json!(32_000)), None]);
+    // The next stream doesn't try again.
+    collect(provider.stream(&hi(), StreamOptions::default())).await;
+    assert_eq!(server.requests().len(), 3);
+    assert_eq!(server.last().json().get("max_tokens"), None);
+}
+
+#[tokio::test]
+async fn a_prompt_too_big_to_fit_beside_max_tokens_is_sent_without_it_this_time_only() {
+    // OpenRouter's wording when the prompt plus the requested output don't fit the window.
+    let refusal = "This endpoint's maximum context length is 131072 tokens. However, you requested about 140000 tokens (108000 of text input, 32000 in the output).";
+    let first = Arc::new(AtomicUsize::new(0));
+    let seen = first.clone();
+    let server = FakeServer::start(move |r| {
+        if r.json().get("max_tokens").is_some() && seen.fetch_add(1, Ordering::SeqCst) == 0 {
+            Reply::json(400, json!({"error": {"message": refusal}}))
+        } else {
+            Reply::sse(&[delta("ok"), stop(), done()])
+        }
+    })
+    .await;
+    let provider = capped(&v1(&server), Some(32_000));
+    let events = collect(provider.stream(&hi(), StreamOptions::default())).await;
+    assert!(events.contains(&text("ok")));
+    collect(provider.stream(&hi(), StreamOptions::default())).await;
+    let sent: Vec<_> = server.requests().iter().map(|r| r.json().get("max_tokens").cloned()).collect();
+    assert_eq!(sent, [Some(json!(32_000)), None, Some(json!(32_000))]);
+    // Any other refusal is reported as before.
+    let server = FakeServer::start(|_| Reply::json(400, json!({"error": {"message": "tools are not supported"}}))).await;
+    let events = collect(capped(&v1(&server), Some(32_000)).stream(&hi(), StreamOptions::default())).await;
+    assert_eq!(server.requests().len(), 1);
+    assert!(error_of(&events).contains("tools are not supported"));
+}
+
+#[tokio::test]
 async fn explains_when_the_server_cant_be_reached_after_retries() {
     let events = collect(provider("http://localhost:1/v1", None).stream(&hi(), StreamOptions::default())).await;
     // Unable to connect is a network error, retried 3 times, then reported.
@@ -331,7 +544,8 @@ async fn resends_the_request_after_an_http_503_succeeding_on_retry() {
             attempt: 1,
             max: 2,
             message: "TestRouter: connection lost, retrying (1/2)…".into(),
-            continued: false
+            continued: false,
+            cause: Default::default(),
         }
     );
 }
@@ -483,7 +697,8 @@ async fn a_drop_after_text_continues_from_the_partial_reply() {
                 attempt: 1,
                 max: 2,
                 message: "TestRouter: connection lost, retrying (1/2)…".into(),
-                continued: true
+                continued: true,
+                cause: RetryCause::Dropped,
             },
             text("ld!"),
             ProviderEvent::Done { reason: Some("stop".into()) },

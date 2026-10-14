@@ -1770,7 +1770,7 @@ impl MarvSession {
             // Same model (a /think or /yolo): what the list said still holds, so the provider keeps its switch.
             let same = factory.id() == s.factory.id() && factory.model() == s.factory.model();
             let info = if same { s.info.clone() } else { None };
-            let provider = factory.make(None, info.as_ref().and_then(|i| i.reasoning));
+            let provider = factory.make(None, info.as_ref());
             Some((option, thinking, factory, provider, info))
         } else {
             None
@@ -2178,8 +2178,9 @@ impl MarvSession {
                 if s.lookups != ticket {
                     return; // the provider changed meanwhile
                 }
-                if info.reasoning.is_some() {
-                    s.provider = factory.make(None, info.reasoning);
+                // What the list says changes the request: the reasoning switch, and the output limit (#96).
+                if info.reasoning.is_some() || info.max_output.is_some() {
+                    s.provider = factory.make(None, Some(&info));
                 }
                 s.info = Some(info);
             }
@@ -2467,7 +2468,7 @@ mod turn_tests {
         }
     }
 
-    type Make = Arc<dyn Fn(Option<&str>, Option<ReasoningSupport>) -> Arc<dyn Provider> + Send + Sync>;
+    type Make = Arc<dyn Fn(Option<&str>, Option<&ModelInfo>) -> Arc<dyn Provider> + Send + Sync>;
     type Lookup = Arc<dyn Fn() -> BoxFuture<'static, Option<ModelInfo>> + Send + Sync>;
 
     struct TestFactory {
@@ -2488,7 +2489,7 @@ mod turn_tests {
         fn local(&self) -> bool {
             self.local
         }
-        fn make(&self, model: Option<&str>, info: Option<ReasoningSupport>) -> Arc<dyn Provider> {
+        fn make(&self, model: Option<&str>, info: Option<&ModelInfo>) -> Arc<dyn Provider> {
             (self.make)(model, info)
         }
         fn lookup(&self) -> Option<BoxFuture<'static, Option<ModelInfo>>> {
@@ -3467,7 +3468,7 @@ mod turn_tests {
             make: {
                 let made = made.clone();
                 Arc::new(move |_, info| {
-                    lock(&made).push(info);
+                    lock(&made).push(info.and_then(|i| i.reasoning));
                     Arc::new(Scripted::new(vec![])) as Arc<dyn Provider>
                 })
             },
@@ -3595,7 +3596,7 @@ mod turn_tests {
             make: {
                 let made = made.clone();
                 Arc::new(move |_, info| {
-                    lock(&made).push(info);
+                    lock(&made).push(info.and_then(|i| i.reasoning));
                     Arc::new(Scripted::new(vec![])) as Arc<dyn Provider>
                 })
             },
