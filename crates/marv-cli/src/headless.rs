@@ -43,7 +43,7 @@ pub enum ExitCode {
 }
 
 /// Known `--approve` names and the scope-key prefixes they match.
-pub const APPROVE_PREFIXES: [(&str, &[&str]); 7] = [
+pub const APPROVE_PREFIXES: [(&str, &[&str]); 8] = [
     ("git_write", &["bash:git:", "bash:net:git:"]),
     ("network", &["bash:net:"]),
     ("web", &["web:"]),
@@ -51,6 +51,7 @@ pub const APPROVE_PREFIXES: [(&str, &[&str]); 7] = [
     ("files", &["files"]),
     ("memory", &["memory"]),
     ("agent_worktree", &["agent:worktree"]),
+    ("process", &["process:"]),
 ];
 
 /// `marv -p --approve`'s approver: yes for the listed scopes, unavailable for the rest.
@@ -63,6 +64,11 @@ pub struct ScopeApprover {
 impl Approver for ScopeApprover {
     async fn approve(&self, request: ApprovalRequest) -> Decision {
         let key = &request.scope.key;
+        // A background process that shares the user's network needs network too, as a bash command with it does.
+        if key.starts_with("process:net:") {
+            let has = |prefix: &str| self.prefixes.iter().any(|p| p == prefix);
+            return if has("process:") && has("bash:net:") { Decision::Yes } else { Decision::Unavailable };
+        }
         if self.prefixes.iter().any(|p| key == p || key.starts_with(p.as_str())) { Decision::Yes } else { Decision::Unavailable }
     }
 }
@@ -464,6 +470,20 @@ mod tests {
         assert_eq!(a.approve(request("files")).await, Decision::Yes);
         assert_eq!(a.approve(request("web:docs.rs")).await, Decision::Yes);
         assert_eq!(a.approve(request("memory")).await, Decision::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn approve_process_approves_starting_a_process_not_one_on_the_users_network_without_network_too() {
+        let approver =
+            |names: &[&str]| build_approver(&names.iter().map(|n| n.to_string()).collect::<Vec<_>>()).unwrap().0.unwrap();
+        let only = approver(&["process"]);
+        assert_eq!(only.approve(request("process:bun run dev")).await, Decision::Yes);
+        assert_eq!(only.approve(request("process:net:bun run dev")).await, Decision::Unavailable);
+        let both = approver(&["process", "network"]);
+        assert_eq!(both.approve(request("process:net:bun run dev")).await, Decision::Yes);
+        let none = approver(&["network"]);
+        assert_eq!(none.approve(request("process:bun run dev")).await, Decision::Unavailable);
+        assert_eq!(none.approve(request("process:net:bun run dev")).await, Decision::Unavailable);
     }
 
     #[tokio::test]

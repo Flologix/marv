@@ -77,6 +77,8 @@ use tokio::sync::oneshot;
 
 /// How long the MCP servers get to shut down on the way out.
 const MCP_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Background processes get SIGTERM, then SIGKILL after 2 s (Marv #51).
+const PROCESSES_STOP_TIMEOUT: Duration = Duration::from_millis(2500);
 /// How long Herdr gets to hear that Marv left the pane.
 const HERDR_RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
 const WORKING: &str = "Marv is working: stop the current turn (Esc) before resuming another session.";
@@ -1401,6 +1403,9 @@ pub async fn run(resume: Option<bool>) -> anyhow::Result<i32> {
     }
     // Stop a turn still running: its tools mustn't outlive the UI.
     bridge.session().interrupt();
+    // Background processes stop with Marv (#51): SIGTERM, then SIGKILL after 2 s; their sandboxes also die with Marv
+    // if it's killed harder (bwrap's --die-with-parent).
+    let _ = tokio::time::timeout(PROCESSES_STOP_TIMEOUT, bridge.session().stop_processes()).await;
     // Let servers shut down cleanly, but don't hang on one that won't.
     if let Some(mcp) = mcp {
         let _ = tokio::time::timeout(MCP_CLOSE_TIMEOUT, tokio::spawn(async move { mcp.close().await })).await;
