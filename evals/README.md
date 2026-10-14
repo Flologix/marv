@@ -29,11 +29,14 @@ Options: `--tasks a,b`, `--marv-model` (default `anthropic/claude-haiku-5.5`), `
 1. The task's `repo/` is copied to a temp folder and committed. A TypeScript task gets the compiler in `node_modules`.
 2. The agent gets `task.md` as its prompt:
    - Marv: `marv -p --output stream-json --approve files --approve process --approve mcp`, with a throwaway
-     `MARV_CONFIG_DIR`, so your own MCP servers, skills and settings stay out.
+     `MARV_CONFIG_DIR`, so your own MCP servers, memory and settings stay out. Your personal skills
+     (`~/.marv/skills`) still load: Marv's sandbox hides the folder `HOME` names, so a throwaway `HOME` would leave
+     the real one readable. bench.py says so when you have some; move them aside for a run without them.
    - Claude Code: `claude -p --output-format stream-json` with project settings only, no MCP servers but the
      task's, and the tools Read, Edit, Write, Glob, Grep, Bash, TodoWrite.
    - opencode: `opencode run --pure --auto --format json -m openrouter/<--marv-model>`, with throwaway XDG config,
-     data, state and cache folders (so your own config, plugins and sessions stay out) and the task's MCP servers in
+     data, state and cache folders and a throwaway `HOME` (so your own config, plugins, skills and sessions stay out;
+     `--user-skills` keeps your `HOME`) and the task's MCP servers in
      `OPENCODE_CONFIG_CONTENT`. `--auto` approves everything: it has no sandbox. bench.py calls the binary itself, not
      mise's `opencode` wrapper, which would reinstall opencode in each run's empty config folder.
    - The MCP tasks get the tracker server (`marv-oracle tracker`) on `tests/oracle/mcp/tracker.json`, and what it

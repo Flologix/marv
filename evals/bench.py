@@ -22,7 +22,7 @@ Results go to evals/results/<time>-<label>/: results.jsonl (one line per run) an
 stream, Marv's trajectory, stderr, the diff). Costs are what OpenRouter reports for Marv and Claude Code's own
 estimate for Claude Code (on a subscription that is not a bill).
 """
-import argparse, json, os, re, shutil, subprocess, sys, tempfile, threading, time
+import argparse, json, os, re, shutil, signal, subprocess, sys, tempfile, threading, time
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -82,25 +82,35 @@ def parse_lines(text):
 
 
 def agent_run(cmd, ws, logdir, timeout, env=None):
-    """Runs the agent and saves its stream and stderr, also when it times out: then it's killed and `timedOut` is set,
-    and what it printed until then is still parsed (a stuck run is the one worth reading)."""
-    proc = subprocess.Popen(cmd, cwd=ws, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    """Runs the agent and saves its stream and stderr, also when it times out: then its process group is killed and
+    `timedOut` is set, and what it printed until then is still parsed (a stuck run is the one worth reading). The wait
+    for output after the kill is bounded too: a child that left the group (a setsid'd command) may hold the pipes."""
+    proc = subprocess.Popen(cmd, cwd=ws, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            start_new_session=True)
     try:
         out, err = proc.communicate(timeout=timeout)
         timed_out = False
     except subprocess.TimeoutExpired:
-        proc.kill()
-        out, err = proc.communicate()
         timed_out = True
+        try: os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError: pass
+        try:
+            out, err = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired as e:
+            decode = lambda b: b.decode(errors="replace") if isinstance(b, bytes) else (b or "")
+            out, err = decode(e.stdout), decode(e.stderr)
+            proc.stdout.close(); proc.stderr.close()
+            proc.wait()
     (logdir / "stream.jsonl").write_text(out or "")
     (logdir / "stderr.txt").write_text(err or "")
     return subprocess.CompletedProcess(cmd, None if timed_out else proc.returncode, out or "", err or ""), timed_out
 
 
 def isolated_home(a, env, tmp):
-    """Without --user-skills, a throwaway HOME: personal skills and agents come from the home whatever the config dir
-    (Marv's ~/.marv/skills, opencode's ~/.claude/skills and ~/.agents/skills), and one harness would carry a set the
-    other doesn't (#84)."""
+    """Without --user-skills, a throwaway HOME for opencode: it reads personal skills from the home whatever its config
+    folders (~/.claude/skills, ~/.agents/skills), a set Marv wouldn't have (#84). Not for Marv: its sandbox hides the
+    folder HOME names, so with a throwaway one the real home (~/.marv with the API key, ~/.ssh) would be readable
+    through the sandbox's read-only /. Marv's own personal skills (~/.marv/skills) do load: see main()."""
     if a.user_skills: return
     home = tmp / "home"
     home.mkdir(parents=True, exist_ok=True)
@@ -144,7 +154,6 @@ def run_marv(ws, prompt, servers, logdir, a):
     if servers: (cfg / "mcp.json").write_text(json.dumps({"mcpServers": servers}))
     env = {k: v for k, v in os.environ.items() if k not in ("OPENROUTER_API_KEY", "MARV_MODEL", "MARV_MAX_STEPS")}
     env["MARV_CONFIG_DIR"] = str(cfg)
-    isolated_home(a, env, cfg)
     cmd = [a.marv_bin, "-p", prompt, "-m", a.marv_model, "--output", "stream-json", "--max-steps", "50",
            "--approve", "files", "--approve", "process", "--approve", "mcp"]
     try:
@@ -371,7 +380,7 @@ def main():
     ap.add_argument("--claude-model", default="claude-haiku-5-5")
     ap.add_argument("--marv-bin", default=str(ROOT / "target/release/marv") if (ROOT / "target/release/marv").exists() else "marv")
     ap.add_argument("--opencode-bin", default=opencode_bin())
-    ap.add_argument("--user-skills", action="store_true", help="keep your HOME, and with it your personal skills (Marv, opencode)")
+    ap.add_argument("--user-skills", action="store_true", help="keep your HOME for opencode, and with it your personal skills (Marv always has its own)")
     ap.add_argument("--tracker", default=str(ROOT / "target/debug/marv-oracle"))
     a = ap.parse_args()
     if a.report: return report(a.report)
@@ -405,6 +414,10 @@ def main():
     if "marv" in harnesses or "opencode" in harnesses:
         a.key = os.environ.get("OPENROUTER_API_KEY") or json.loads((Path.home() / ".marv/config.json").read_text()).get("apiKey")
         if not a.key: sys.exit("No OpenRouter key: set OPENROUTER_API_KEY or run marv's /setup.")
+    skills = Path.home() / ".marv/skills"
+    if "marv" in harnesses and not a.user_skills and skills.is_dir() and any(skills.iterdir()):
+        print(f"Note: Marv loads your personal skills from {skills} (its sandbox needs the real HOME); move them aside "
+              "for a run without them.", flush=True)
     if any((TASKS / t / "mcp.json").exists() for t in tasks) and not Path(a.tracker).exists():
         sys.exit(f"No tracker at {a.tracker}: run `cargo build -p marv-oracle` (or pass --tracker).")
     jobs = [(h, t, rep) for rep in range(a.repeat) for t in tasks for h in harnesses if t not in SKIP.get(h, ())]
