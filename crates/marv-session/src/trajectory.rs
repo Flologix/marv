@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex, mpsc};
 
 use marv_agent::LoopEvent;
 use marv_agent::agent::EmptyNext;
-use marv_core::{Provenance, ToolCall, Usage};
+use marv_core::{Provenance, RetryCause, ToolCall, Usage};
 use marv_mcp::deferred::ModeChoice;
 use marv_mesh::switchboard::{MeshRecord, TrajectorySink};
 use serde::Serialize;
@@ -57,6 +57,57 @@ impl From<&Usage> for UsageRecord {
             completion_tokens: u.completion_tokens,
             cached_tokens: u.cached_tokens,
             cost: u.cost,
+        }
+    }
+}
+
+/// What it took to get a request's reply (Marv #88, #96), so evals can tell provider noise from Marv. Every field is
+/// left out when the reply came at the first try.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetryRecord {
+    /// How many times the provider retried the request (dropped connections, stalls, degenerate replies).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub retries: u32,
+    /// #88: the stream went silent past the idle timeout at least once.
+    #[serde(skip_serializing_if = "is_false")]
+    pub stalled: bool,
+    /// #96: the reply degenerated (whitespace, or one short piece over and over) and was thrown away.
+    #[serde(skip_serializing_if = "is_false")]
+    pub degenerate: bool,
+    /// #96: how many bytes of text and reasoning the degenerate attempts had streamed.
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub discarded_bytes: u64,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+fn is_zero_u64(n: &u64) -> bool {
+    *n == 0
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+impl RetryRecord {
+    /// Counts one `Retry` from the provider.
+    pub fn add(&mut self, cause: RetryCause) {
+        self.retries += 1;
+        self.discard(cause);
+    }
+
+    /// What a thrown-away attempt says, retried or not (#96: the second degenerate reply isn't).
+    pub fn discard(&mut self, cause: RetryCause) {
+        match cause {
+            RetryCause::Dropped => {}
+            RetryCause::Stalled => self.stalled = true,
+            RetryCause::Degenerate { discarded } => {
+                self.degenerate = true;
+                self.discarded_bytes += discarded;
+            }
         }
     }
 }
@@ -103,13 +154,16 @@ pub enum TrajectoryRecord {
     /// marv-rs (#108): a session-start hook whose output starts the turn's message (`exit_code` null: killed or
     /// couldn't start; `bytes`: its whole output, before the cut).
     Hook { turn: String, command: String, exit_code: Option<i32>, timed_out: bool, bytes: usize, ms: u64 },
-    /// One model request: its tokens and how long since the previous step ended.
+    /// One model request: its tokens and how long since the previous step ended; `retries`, `stalled`, `degenerate`
+    /// and `discardedBytes` when it took more than one try (#88, #96).
     Request {
         #[serde(flatten)]
         who: Who,
         step: u32,
         usage: UsageRecord,
         ms: u64,
+        #[serde(flatten)]
+        retry: RetryRecord,
     },
     /// A finished reply, with the reasoning before it.
     Assistant {
@@ -134,10 +188,14 @@ pub enum TrajectoryRecord {
         door: Option<marv_core::Door>,
         ms: u64,
     },
+    /// The run's error; with what the failed request's retries were (#88, #96: a reply that degenerated twice ends
+    /// here, with no `request` record).
     Error {
         #[serde(flatten)]
         who: Who,
         message: String,
+        #[serde(flatten)]
+        retry: RetryRecord,
     },
     StepLimit {
         #[serde(flatten)]
@@ -394,6 +452,8 @@ pub struct AgentRecorder {
     tools: u32,
     tool_starts: std::collections::HashMap<String, u64>,
     ended: bool,
+    /// The provider's retries since the last request record (#88, #96): they go on the next one.
+    retry: RetryRecord,
 }
 
 impl AgentRecorder {
@@ -414,6 +474,7 @@ impl AgentRecorder {
             tools: 0,
             tool_starts: Default::default(),
             ended: false,
+            retry: RetryRecord::default(),
         }
     }
 
@@ -432,11 +493,32 @@ impl AgentRecorder {
         }
         let who = self.who.clone();
         let now = (self.now)();
+        // Everything but the stream's own events comes after the reply ended: its retries are closed then, usage or
+        // not, so they can't land on a later request's record (a provider that sends no usage).
+        let reply_ended = !matches!(
+            event,
+            LoopEvent::TextDelta(_)
+                | LoopEvent::ThinkingDelta(_)
+                | LoopEvent::ToolCallDelta { .. }
+                | LoopEvent::Usage(_)
+                | LoopEvent::Retry { .. }
+                | LoopEvent::Discarded { .. }
+        );
+        if reply_ended && !matches!(event, LoopEvent::Error(_)) {
+            self.retry = RetryRecord::default();
+        }
         match event {
             LoopEvent::ThinkingDelta(text) => self.thinking.push_str(text),
             LoopEvent::Usage(usage) => {
                 self.steps += 1;
-                (self.sink)(TrajectoryRecord::Request { who, step: self.steps, usage: usage.into(), ms: now - self.step_start });
+                let retry = std::mem::take(&mut self.retry);
+                (self.sink)(TrajectoryRecord::Request {
+                    who,
+                    step: self.steps,
+                    usage: usage.into(),
+                    ms: now - self.step_start,
+                    retry,
+                });
             }
             LoopEvent::Assistant { text } => {
                 let thinking = self.take_thinking();
@@ -479,7 +561,22 @@ impl AgentRecorder {
                 door: None,
                 ms: 0,
             }),
-            LoopEvent::Error(message) => (self.sink)(TrajectoryRecord::Error { who, message: message.clone() }),
+            LoopEvent::Error(message) => {
+                let retry = std::mem::take(&mut self.retry);
+                (self.sink)(TrajectoryRecord::Error { who, message: message.clone(), retry })
+            }
+            LoopEvent::Discarded { cause } => {
+                self.retry.discard(*cause);
+                self.thinking.clear();
+            }
+            LoopEvent::Retry { continued, cause, .. } => {
+                self.retry.add(*cause);
+                // Starting over: the loop throws the attempt away, its reasoning included (a degenerate one can be
+                // megabytes of newlines, #96).
+                if !continued {
+                    self.thinking.clear();
+                }
+            }
             LoopEvent::StepLimit { steps, continued } => {
                 (self.sink)(TrajectoryRecord::StepLimit { who, steps: *steps, continued: *continued })
             }
@@ -499,7 +596,7 @@ impl AgentRecorder {
                 self.finish(&reason);
             }
             // The whole reply comes with Assistant; deltas, retries and compactions aren't records.
-            LoopEvent::TextDelta(_) | LoopEvent::ToolCallDelta { .. } | LoopEvent::Compacted | LoopEvent::Retry { .. } => {}
+            LoopEvent::TextDelta(_) | LoopEvent::ToolCallDelta { .. } | LoopEvent::Compacted => {}
         }
     }
 
@@ -560,6 +657,69 @@ mod tests {
         assert_eq!(tool["isError"], false);
         assert_eq!(tool["agent"], "main");
         assert_eq!(serde_json::to_value(&records[3]).unwrap()["reason"], "end");
+    }
+
+    #[test]
+    fn retries_stalls_and_degenerate_replies_go_on_the_next_request_or_the_error() {
+        // #88, #96
+        let (mut rec, out) = recorder();
+        let retry = |continued, cause| LoopEvent::Retry { attempt: 1, max: 2, message: "m".into(), continued, cause };
+        let usage = || LoopEvent::Usage(Usage { prompt_tokens: 1, completion_tokens: 1, cached_tokens: None, cost: None });
+        rec.event(&LoopEvent::ThinkingDelta("\n\n\n".into()));
+        rec.event(&retry(false, RetryCause::Degenerate { discarded: 3 }));
+        rec.event(&retry(true, RetryCause::Stalled));
+        rec.event(&usage());
+        rec.event(&usage());
+        rec.event(&retry(false, RetryCause::Degenerate { discarded: 70_000 }));
+        rec.event(&LoopEvent::Error("degenerated again".into()));
+        let records: Vec<serde_json::Value> = out.lock().unwrap().iter().map(|r| serde_json::to_value(r).unwrap()).collect();
+        assert_eq!(records[0]["type"], "request");
+        assert_eq!(
+            (&records[0]["retries"], &records[0]["stalled"], &records[0]["degenerate"], &records[0]["discardedBytes"]),
+            (&serde_json::json!(2), &serde_json::json!(true), &serde_json::json!(true), &serde_json::json!(3))
+        );
+        // A request that came at the first try says nothing about retries.
+        assert_eq!(records[1]["type"], "request");
+        assert!(records[1].get("retries").is_none() && records[1].get("stalled").is_none(), "{}", records[1]);
+        assert_eq!(records[2]["type"], "error");
+        assert_eq!(
+            (&records[2]["degenerate"], &records[2]["discardedBytes"]),
+            (&serde_json::json!(true), &serde_json::json!(70_000))
+        );
+        // The discarded attempt's reasoning isn't recorded as the reply's.
+        assert!(!records.iter().any(|r| r["type"] == "assistant"), "{records:?}");
+    }
+
+    #[test]
+    fn a_reply_without_usage_closes_its_retries_and_a_second_degenerate_reply_leaves_nothing() {
+        let (mut rec, out) = recorder();
+        let usage = || LoopEvent::Usage(Usage { prompt_tokens: 1, completion_tokens: 1, cached_tokens: None, cost: None });
+        // A retried reply from a provider that sends no usage, then a clean request.
+        rec.event(&LoopEvent::Retry { attempt: 1, max: 2, message: "m".into(), continued: true, cause: RetryCause::Stalled });
+        rec.event(&LoopEvent::Assistant { text: "ok".into() });
+        rec.event(&usage());
+        // #96: degenerate, retried, degenerate again: both attempts' bytes counted, none of their reasoning kept.
+        rec.event(&LoopEvent::ThinkingDelta("\n\n".into()));
+        rec.event(&LoopEvent::Retry {
+            attempt: 1,
+            max: 1,
+            message: "m".into(),
+            continued: false,
+            cause: RetryCause::Degenerate { discarded: 2 },
+        });
+        rec.event(&LoopEvent::ThinkingDelta("\n\n\n".into()));
+        rec.event(&LoopEvent::Discarded { cause: RetryCause::Degenerate { discarded: 3 } });
+        rec.event(&LoopEvent::Error("degenerated again".into()));
+        rec.finish("error");
+        let records: Vec<serde_json::Value> = out.lock().unwrap().iter().map(|r| serde_json::to_value(r).unwrap()).collect();
+        let request = records.iter().find(|r| r["type"] == "request").unwrap();
+        assert!(request.get("retries").is_none() && request.get("stalled").is_none(), "{request}");
+        let error = records.iter().find(|r| r["type"] == "error").unwrap();
+        assert_eq!((&error["retries"], &error["discardedBytes"]), (&serde_json::json!(1), &serde_json::json!(5)), "{error}");
+        assert!(
+            !records.iter().any(|r| r["thinking"].as_str().is_some_and(|t| t.contains('\n'))),
+            "the runaway reasoning isn't recorded: {records:?}"
+        );
     }
 
     #[tokio::test]

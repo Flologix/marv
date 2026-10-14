@@ -27,6 +27,7 @@ pub mod feedback;
 pub mod frontmatter;
 pub mod git;
 pub mod hooks;
+pub mod instructions;
 pub mod mcp_install;
 pub mod mcp_tools;
 pub mod memory;
