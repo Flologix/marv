@@ -236,6 +236,9 @@ impl Drop for SubagentPlug {
 }
 
 /// One of the three mesh tools for an agent's plug.
+/// How long `mesh_list` waits for the other Marvs to say who they are; past it, the list goes without them.
+const PEERS_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+
 pub struct MeshTool {
     /// `mesh_list`, `mesh_call` or `mesh_send`.
     pub name: &'static str,
@@ -354,7 +357,7 @@ impl Tool for MeshTool {
     fn auto_safe(&self, input: &Self::Input, _ctx: &ToolContext) -> bool {
         self.wired(input)
     }
-    async fn run(&self, input: &Self::Input, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+    async fn run(&self, input: &Self::Input, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let target = self.target(input);
         if let Some((receptacle, mode)) = &target
             && let Err(err) = self.ask_for_wire(receptacle, *mode).await
@@ -371,9 +374,15 @@ impl Tool for MeshTool {
         };
         // The list also names the other Marvs on the machine: a model asked "who's on the mesh?" otherwise only
         // learns that nothing is wired, while `marv mesh ls` shows several.
-        if self.name == MESH_LIST
-            && let Some(dir) = self.mesh.peer_dir()
-            && let Ok(peers) = marv_mesh::discovery::list(&dir).await
+        // Bounded, and over when the turn is stopped: a hung Marv delays the list by PEERS_TIMEOUT at most.
+        let peers = match self.mesh.peer_dir().filter(|_| self.name == MESH_LIST) {
+            Some(dir) => tokio::select! {
+                found = tokio::time::timeout(PEERS_TIMEOUT, marv_mesh::discovery::list(&dir)) => found.ok().and_then(Result::ok),
+                _ = ctx.cancel.cancelled() => None,
+            },
+            None => None,
+        };
+        if let Some(peers) = peers
             && let Some(text) = marv_mesh::tools::peers_text(&self.mesh.session, &peers)
         {
             answer.text = format!("{}\n\n{text}", answer.text);
@@ -529,6 +538,15 @@ mod tests {
             .unwrap();
         assert!(out.output.starts_with("You're wired to:"), "{}", out.output);
         assert_eq!(out.provenance, Provenance::Mesh);
+
+        // A Marv that never answers its door doesn't hold the list up past a stopped turn.
+        let _hung = std::os::unix::net::UnixListener::bind(folder.0.join("hung.sock")).unwrap();
+        let stopped = ToolContext::new(std::env::temp_dir());
+        stopped.cancel.cancel();
+        let started = std::time::Instant::now();
+        let out = list.run(&serde_json::Map::new(), &stopped).await.unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_millis(500), "{:?}", started.elapsed());
+        assert!(out.output.starts_with("Nothing is wired to you"), "{}", out.output);
         cancel.cancel();
         web_cancel.cancel();
     }

@@ -24,7 +24,7 @@
 //! receiving switchboard checks, limits and logs them like any other plug's, and its model sees them fenced, from
 //! `peer-<session>`. Both switchboards log every message.
 
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -184,19 +184,23 @@ pub async fn list(dir: &Path) -> Result<Vec<PeerSwitchboard>> {
     if !meta.is_dir() || meta.uid() != own_uid()? || meta.permissions().mode() & 0o077 != 0 {
         return Err(MeshError::Io(format!("{} isn't a private folder of this user's: not listing it", dir.display())));
     }
-    let mut found = Vec::new();
-    for entry in entries.flatten() {
+    // Every door at once: an unresponsive Marv costs DOOR_TIMEOUT once, not once per socket after it.
+    let probes = entries.flatten().filter_map(|entry| {
         let file = entry.file_name().to_string_lossy().into_owned();
-        let Some(session) = file.strip_suffix(".sock").filter(|s| valid_segment(s)) else { continue };
+        let session = file.strip_suffix(".sock").filter(|s| valid_segment(s))?.to_string();
         let socket = entry.path();
-        let info = async {
-            let mut door = DoorClient::connect(&socket).await?;
-            door.info().await
-        };
-        if let Ok(Ok(info)) = tokio::time::timeout(DOOR_TIMEOUT, info).await {
-            found.push(PeerSwitchboard { session: session.to_string(), socket, info });
-        }
-    }
+        Some(async move {
+            let info = async {
+                let mut door = DoorClient::connect(&socket).await?;
+                door.info().await
+            };
+            match tokio::time::timeout(DOOR_TIMEOUT, info).await {
+                Ok(Ok(info)) => Some(PeerSwitchboard { session, socket, info }),
+                _ => None,
+            }
+        })
+    });
+    let mut found: Vec<PeerSwitchboard> = futures::future::join_all(probes).await.into_iter().flatten().collect();
     found.sort_by(|a, b| a.session.cmp(&b.session));
     Ok(found)
 }
@@ -287,10 +291,25 @@ struct Door {
     approver: Arc<dyn PeerApprover>,
 }
 
+/// How long a door's socket has to take a connection before the Marv behind it counts as busy (alive) rather than gone.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// Whether nothing listens on `socket` any more (the connection is refused). A connect to a live Marv whose backlog is
+/// full blocks, so it runs on a thread of its own, and a Marv that doesn't take it within [`PROBE_TIMEOUT`] is busy,
+/// not gone (the thread finishes when the backlog drains).
+fn nobody_listens(socket: &Path) -> bool {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let path = socket.to_path_buf();
+    std::thread::spawn(move || {
+        let _ = tx.send(std::os::unix::net::UnixStream::connect(&path).err().map(|e| e.kind()));
+    });
+    matches!(rx.recv_timeout(PROBE_TIMEOUT), Ok(Some(std::io::ErrorKind::ConnectionRefused)))
+}
+
 /// Removes the sockets of Marvs that are gone: a door's socket outlives a Marv that was killed or crashed (the guard's
-/// drop never ran), and the folder filled up with them. Only a refused connection counts as gone (nothing listens on
-/// that socket any more); a slow or busy Marv keeps its socket. The folder is this user's and private
-/// ([`private_folder`]), so these are all this user's Marvs.
+/// drop never ran), and the folder filled up with them. Only a refused connection counts as gone ([`nobody_listens`]);
+/// a slow or busy Marv keeps its socket. The folder is this user's and private ([`private_folder`]), so these are all
+/// this user's Marvs. Called with the folder's lock held ([`open_door`]), so no other Marv is replacing a socket.
 fn sweep_dead(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
@@ -299,9 +318,7 @@ fn sweep_dead(dir: &Path) {
         if !is_socket || path.extension().is_none_or(|e| e != "sock") {
             continue;
         }
-        if let Err(e) = std::os::unix::net::UnixStream::connect(&path)
-            && e.kind() == std::io::ErrorKind::ConnectionRefused
-        {
+        if nobody_listens(&path) {
             let _ = std::fs::remove_file(&path);
         }
     }
@@ -316,9 +333,19 @@ pub fn open_door(sb: Arc<Switchboard>, dir: &Path, info: DoorInfo, approver: Arc
         .filter(|_| name.len() <= MAX_SESSION_NAME)
         .ok_or_else(|| MeshError::BadName(format!("\"{name}\" isn't a mesh name")))?;
     private_folder(dir)?;
+    // Sweeping and replacing sockets happen under one lock: otherwise a sweep that found a dead socket could remove it
+    // after another Marv replaced it with its live one. Released when this function returns, the door bound.
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(dir.join(".lock"))
+        .map_err(|e| io("the mesh folder's lock", e))?;
+    lock.lock().map_err(|e| io("the mesh folder's lock", e))?;
     sweep_dead(dir);
     if std::fs::symlink_metadata(&socket).is_ok() {
-        if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+        if !nobody_listens(&socket) {
             return Err(MeshError::Io(format!("a Marv named \"{name}\" is already on the mesh (set MARV_MESH_NAME)")));
         }
         let _ = std::fs::remove_file(&socket);
@@ -671,6 +698,11 @@ mod tests {
         assert!(!mesh.0.join("dead.sock").exists(), "nothing listens there: swept");
         assert!(mesh.0.join("alpha.sock").exists() && mesh.0.join("notes.sock").exists());
         assert_eq!(beta.sb.peer_dir(), Some(mesh.0.clone()));
+        // A Marv that takes no connections (a listener nobody accepts on) is busy, not gone.
+        let busy = std::os::unix::net::UnixListener::bind(mesh.0.join("busy.sock")).unwrap();
+        assert!(!nobody_listens(&mesh.0.join("busy.sock")));
+        drop(busy);
+        assert!(nobody_listens(&mesh.0.join("busy.sock")));
     }
 
     #[tokio::test]
