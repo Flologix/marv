@@ -21,6 +21,7 @@ pub mod edit_file;
 pub mod edit_match;
 pub mod file_lock;
 pub mod files;
+pub mod github;
 pub mod glob;
 pub mod grep;
 pub mod memory;
