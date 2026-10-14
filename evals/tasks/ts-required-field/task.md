@@ -1,0 +1,1 @@
+Add a required `email: string` field to the User interface in src/types.ts, and show it in greet: "Hi Ada Lovelace <ada@example.com>". makeUser (src/factory.ts) takes the email as a third argument. Wherever a user is created without a known address, use `<id>@example.com`.

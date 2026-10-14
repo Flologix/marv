@@ -4,6 +4,16 @@ All notable changes to Marv are listed here. The format follows [Keep a Changelo
 
 What counts as Marv's public API: the `marv` command's flags, subcommands and slash commands (and, up to 0.3.0, the SDK, `@flologixai/marv/sdk`), and the files it reads (`~/.marv/config.json`, `.marv/skills/`, `.marv/agents/`, `.mcp.json`, `AGENTS.md`, saved sessions).
 
+## [Unreleased]
+
+### Fixed
+
+- **`marv -p --approve mcp` approves MCP calls after an MCP read again.** Once a session had read anything from an MCP server, a call made through `mcp_call` (the deferred tools) was refused as "needs the user's approval", because the wrapper asked under its own name instead of the real tool's scope (`mcp:<server>:<tool>`); in the TUI it asked twice. The real tool still asks once the session is tainted, even in yolo, and without `--approve mcp` the call is still refused.
+
+### Added
+
+- **Real-model evals (#73).** `evals/bench.py` runs Marv's 20 eval tasks through `marv -p`, and through `claude -p` for comparison, grades them with each task's hidden tests, and reports pass rate, time, requests, tool calls, tokens and cost. See `evals/README.md`.
+
 ## [0.4.0] - 2026-10-14
 
 Marv, rebuilt in Rust. The version goes from 0.3.0 straight to 0.4.0: this release is the Rust build, plus the Sprint 4 work that was unreleased in the TypeScript code, plus what's new in the Rust build. It replaces the TypeScript code in this repository. The behaviour is Marv's: an oracle of 30 scenarios recorded from the TypeScript Marv (the eval tasks and the agent loop's edge cases) checks that the Rust build does the same things, and that its requests keep the prompt cache.

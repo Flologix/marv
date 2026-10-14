@@ -1,3 +1,5 @@
 /target
 *.swp
 .env
+/evals/node_modules
+/evals/results

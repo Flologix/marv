@@ -1,0 +1,1 @@
+`bun test` fails: the nightly report is missing entries. One bug in src/ is behind every failure. Fix the code, not the tests.
