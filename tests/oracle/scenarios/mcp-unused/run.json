@@ -4,5 +4,8 @@
   "mcp": {
     "server": "tracker",
     "data": "tracker.json"
+  },
+  "config": {
+    "mcpTools": "deferred"
   }
 }
