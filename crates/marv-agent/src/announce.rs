@@ -8,7 +8,8 @@
 //! The detector is deliberately conservative — it must never fire on a normal summary or a
 //! question to the user, since a false continue costs a request and a confusing nudge:
 //! - a dangling `:` at the very end of the reply (the observed form),
-//! - a last sentence starting "let me …" (but not "let me know…", an offer to the user),
+//! - a last sentence starting "let me …", optionally after "now"/"next"/"first"/"then" (but
+//!   not "let me know/summarize/recap…", which address the user),
 //! - a last sentence starting "now " with a known progressive verb ("now checking …").
 //!
 //! Questions (`?`), code blocks, long sentences (a summary, not an announcement) and
@@ -58,12 +59,10 @@ const NOW_VERBS: &[&str] = &[
     "running",
     "saving",
     "searching",
-    "stopping",
     "testing",
     "tracing",
     "updating",
     "verifying",
-    "waiting",
     "writing",
 ];
 
@@ -93,8 +92,15 @@ pub fn announces_next_step(text: &str) -> bool {
     if sentence.trim_end_matches(['*', '_', '`', ' ', '\t']).ends_with('?') {
         return false;
     }
-    if lower.starts_with("let me ") && !lower.starts_with("let me know") {
-        return true;
+    // "Now let me …" / "Next, let me …" is the same announcement with a lead-in (the GLM form
+    // without its colon). "let me know/summarize/recap" addresses the user, not a next step.
+    let let_me = ["now", "next", "first", "then"]
+        .iter()
+        .find_map(|lead| lower.strip_prefix(lead).map(|rest| rest.trim_start_matches(',').trim_start()))
+        .filter(|rest| rest.starts_with("let me "))
+        .unwrap_or(&lower);
+    if let Some(rest) = let_me.strip_prefix("let me ") {
+        return !["know", "summarize", "summarise", "recap"].iter().any(|w| rest.starts_with(w));
     }
     match lower.strip_prefix("now ").and_then(|rest| rest.split(|c: char| !c.is_ascii_alphabetic()).next()) {
         Some(word) => NOW_VERBS.contains(&word),
@@ -155,6 +161,20 @@ mod tests {
         assert!(!announces_next_step("Should I also update the docs?"));
         assert!(!announces_next_step("Let me know if you want me to continue."));
         assert!(!announces_next_step("Both modes verified. Shall I comment on #7 now?"));
+        // Waiting on the user, or stopping, is the end of the turn, not a step to take.
+        assert!(!announces_next_step("All done. Now waiting for your feedback."));
+        assert!(!announces_next_step("Now stopping here."));
+        assert!(!announces_next_step("Now let me know if anything else is needed."));
+    }
+
+    #[test]
+    fn fires_on_let_me_after_a_lead_in_and_not_on_a_summary() {
+        // The observed GLM form without its dangling colon.
+        assert!(announces_next_step("Both modes work. Now let me look at issue #7 and comment."));
+        assert!(announces_next_step("Next, let me fix b."));
+        assert!(announces_next_step("Now, let me check the tests."));
+        assert!(!announces_next_step("Let me summarize: everything passes."));
+        assert!(!announces_next_step("Let me recap what changed."));
     }
 
     #[test]
