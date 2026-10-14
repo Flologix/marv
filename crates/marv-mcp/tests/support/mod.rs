@@ -12,7 +12,6 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -29,16 +28,19 @@ use marv_mcp::trust::McpTrust;
 
 pub const FIXTURE: &str = env!("CARGO_BIN_EXE_marv-mcp-fixture");
 
+thread_local! {
+    // The folders this test made, removed when its thread ends: libtest runs each test on its own thread, so that is
+    // the end of the test, passed or panicked. Callers get a plain PathBuf (`Opts::new` and the token store take it by
+    // value), so the guard can't live with them. #89: these were never removed, and test runs filled the /tmp quota.
+    static KEPT: std::cell::RefCell<Vec<tempfile::TempDir>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A fresh, empty folder (canonical path), removed when the test ends.
 pub fn temp_dir(tag: &str) -> PathBuf {
-    static N: AtomicUsize = AtomicUsize::new(0);
-    let dir = std::env::temp_dir().join(format!(
-        "marv-mcp-it-{tag}-{}-{}-{}",
-        std::process::id(),
-        N.fetch_add(1, Ordering::SeqCst),
-        marv_fs::random_hex()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::canonicalize(dir).unwrap()
+    let dir = tempfile::Builder::new().prefix(&format!("marv-mcp-it-{tag}-")).tempdir().unwrap();
+    let path = std::fs::canonicalize(dir.path()).unwrap();
+    KEPT.with(|kept| kept.borrow_mut().push(dir));
+    path
 }
 
 // ---- configs and managers ----

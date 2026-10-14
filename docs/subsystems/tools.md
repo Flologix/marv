@@ -10,13 +10,14 @@ Spec: the **Tools**, **Web**, **Skills**, **Memory**, **Subagents** and **Yolo m
 |---|---|---|
 | `src/tools/types.ts` | `types.rs` | Done: `Tool` (typed `Input`), the type-erased `DynTool`, `ToolContext`, `ToolOutput`, `Preview`, `Scope`, `ApprovalRequest`, `Decision`, `Approval`, `Approver`, `BeforeChange`, `AgentHost`, `Skill`, `MemoryPaths`, `DiffLine`/`DiffShown`. #22: `Checkpoint` (`ToolContext::checkpoint`, separate from `before_change`), `Tool::checkpoint` (default: Write or Execute; false for `memory`, `agent`, MCP and mesh tools), `Preview::files`/`PreviewFile`; #24: `ProcessHost`, `ProcessForwards`, `ProcessForward`, `ProcessInfo`, `ProcessState`, `StartResult`, `ToolContext::{processes, forwards}` |
 | `src/tools/index.ts` | `registry.rs` | **Ported and tested:** `run_tool` (the whole approval flow, plus taint and protected paths), `builtin_tools` (Marv's order), `tool_specs`/`tool_specs_for`, `is_parallel_call`. #22: the turn's checkpoint, after the approval (or yolo, or an ungated call) and before running; a stop meanwhile is "interrupted" (tested as in `tools.test.ts`'s "the turn's checkpoint"). #23: doors and `once` on the request and result, `github` after `web_fetch`, `tool_specs_for(has_skills, plan, github)`; `scope`/`uses_network` see the context (`Tool::scope_in`/`uses_network_in`, Marv Sprint 4) |
-| `src/tools/repair.ts` | `repair.rs` | **Ported and tested:** JSON control-character escaping, timeout from ms to s, the leading-slash path. Todo: schema-guided repair (#65) |
+| `src/tools/repair.ts` | `repair.rs` | **Ported and tested:** JSON control-character escaping, timeout from ms to s, the leading-slash path |
+| (none: new, #65) | `schema_repair.rs` | **Done and tested:** schema-guided argument repair, `repair_args(schema, args, mode)` (a pure function; `run_tool` calls it through `registry::schema_repaired` after the JSON parse and before the tool's own `repair`). Coerces a string to a number, integer or boolean when it is exactly one, a JSON string to the object or array the schema wants, a lone value to a one-item array; for built-in tools (`RepairMode::Builtin`) also leaves out `null` optional fields and drops unknown fields. Each repair is listed in one `Marv:` note on the result. Ambiguous values (`"20abc"`, `anyOf`/`oneOf`, two readings) are left for the ordinary error; a built-in tool's input that its parse already accepts isn't touched. MCP tools use `RepairMode::Mcp` (`Tool::repair_mode`) and `check_required` (see mcp.md). Repairs aren't counted in trajectories (no repair is) |
 | `src/tools/edit-match.ts` | `edit_match.rs` | **Ported and tested:** exact, then the Unicode tier (#60: typographic quotes, dashes, `…` and Unicode spaces folded to ASCII, unique only, the file's original span replaced), then trailing whitespace, then indentation; CRLF handling, `closest_lines` |
 | `src/tools/diff.ts` | `diff.rs` | **Ported and tested.** Uses `similar` in place of jsdiff |
 | `src/tools/file-lock.ts` | `file_lock.rs` | **Ported and tested** (a per-path tokio mutex; an entry is dropped once nothing waits on it) |
 | `src/tools/files.ts` | `files.rs` (+ `marv_sandbox::paths`) | **Ported and tested.** The path rules live in marv-sandbox. Here: regular-file checks, `looks_binary`, `list_project_files` (git ls-files through a local `run_git` with `NO_PROGRAMS`, no inherited `GIT_*`, `git_env` pinned, a timeout that errors; the `ignore` walker outside git) |
 | `src/tools/read-file.ts` | `read_file.rs` | **Ported and tested** (end to end through `run_tool`) |
-| `src/tools/skill.ts` | `skill.rs` | **Ported and tested**, including the realpath fix (symlink test) |
+| `src/tools/skill.ts` | `skill.rs` | **Ported and tested**, including the realpath fix (symlink test). #84: the description adds "small, direct requests don't need one" |
 | `src/tools/edit-file.ts` | `edit_file.rs` | **Ported and tested** (end to end through `run_tool`): `run` awaits `before_change` (or Esc), plans again and writes under the file lock, syntax note, fuzzy notes. marv-rs: the `package.json` lifecycle-scripts content rule. Todo: formatter (#67) |
 | `src/tools/write-file.ts` | `write_file.rs` | **Ported and tested** (end to end, `write-tools.test.ts`): create/overwrite/append, CRLF, folders, parallel appends, syntax note, `before_change`. marv-rs: the `package.json` lifecycle-scripts content rule. Todo: formatter (#67) |
 | `src/tools/glob.ts` | `glob.rs` | **Ported and tested.** `globset` with `literal_separator`, checked against Bun.Glob's answers |
@@ -64,6 +65,7 @@ pub trait Tool: Send + Sync + 'static {
     fn auto_safe(&self, input: &Self::Input, ctx: &ToolContext) -> bool { false }
     fn protected_target(&self, input: &Self::Input, ctx: &ToolContext) -> Option<ProtectedRule> { None }
     fn repair(&self, raw: &Value, ctx: &ToolContext) -> Option<Repaired> { None }
+    fn repair_mode(&self) -> RepairMode { RepairMode::Builtin }             // #65: MCP tools say Mcp
     async fn run(&self, input: &Self::Input, ctx: &ToolContext) -> Result<ToolOutput, ToolError>;
 }
 // Every T: Tool is also a DynTool (object-safe). The registry holds ToolRef = Arc<dyn DynTool>.
@@ -112,7 +114,6 @@ pub const INTERRUPTED: &str;  // must equal marv-agent's NOT_RUN.aborted
 - **The `agent` tool** reaches subagents only through `AgentHost`, because marv-tools can't depend on marv-agent.
 - **Planned:**
   - spill cut output to a file (#61, `output::spill_cut`);
-  - schema-guided arg repair (#65, `repair`);
   - a formatter after edits (#67, `edit_file`/`write_file`);
   - `apply_patch` (#66).
 - **Web port notes:**

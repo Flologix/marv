@@ -82,11 +82,29 @@ pub struct SessionToolRunner {
     pub tools: Arc<Vec<ToolRef>>,
     /// Call id → the repair's note, for calls `rewrite_call` turned into `mcp_call`.
     rewritten: Mutex<HashMap<String, String>>,
+    /// Nested instruction files this agent's conversation has had (#62): a read_file, edit_file or write_file result
+    /// in a folder with its own `AGENTS.md` gets it as a note, once. None: never.
+    pub nested: Option<Arc<crate::instructions::NestedInstructions>>,
 }
 
 impl SessionToolRunner {
     pub fn new(ctx: ToolContext, tools: Arc<Vec<ToolRef>>) -> Self {
-        Self { ctx, tools, rewritten: Mutex::default() }
+        Self { ctx, tools, rewritten: Mutex::default(), nested: None }
+    }
+
+    /// The nested instruction files' note for a read_file, edit_file or write_file that worked (#62). The path is
+    /// resolved as the tool resolved it (inside the root, after realpath), so a call the tool refused gets none.
+    fn nested_note(&self, call: &ToolCall, outcome: &ToolOutcome) -> Option<String> {
+        let nested = self.nested.as_ref()?;
+        if !crate::instructions::NESTED_TOOLS.contains(&call.name.as_str()) || outcome.result.is_error || outcome.result.declined
+        {
+            return None;
+        }
+        let args: serde_json::Value = serde_json::from_str(&call.arguments).ok()?;
+        let path = args.get("path")?.as_str()?;
+        let (path, _) = marv_tools::repair::repair_project_path(&self.ctx.root, path);
+        let touched = marv_sandbox::resolve_in_project(&self.ctx.root, &path, &self.ctx.home).ok()?;
+        nested.note_for(&self.ctx.root, &touched, &call.name)
     }
 
     /// Remembers that `call_id` was rewritten (its result gets `note`).
@@ -108,7 +126,9 @@ impl ToolRunner for SessionToolRunner {
         let tool = self.tools.iter().find(|t| t.name() == call.name);
         let asks = tool.is_some_and(|t| {
             let raw = serde_json::from_str(if call.arguments.is_empty() { "{}" } else { &call.arguments });
-            raw.ok().and_then(|raw| t.parse(raw).ok()).is_some_and(|input| t.needs_approval(input.as_ref()) == Some(true))
+            // Judged on the arguments `run_tool` will parse: repaired against the schema (#65).
+            let raw = raw.ok().map(|raw| marv_tools::schema_repaired(t.as_ref(), raw).0);
+            raw.and_then(|raw| t.parse(raw).ok()).is_some_and(|input| t.needs_approval(input.as_ref()) == Some(true))
         });
         (self.kind(call) == ToolKind::Read && !asks) || marv_tools::is_parallel_call(call, &self.tools)
     }
@@ -117,7 +137,13 @@ impl ToolRunner for SessionToolRunner {
         let mut ctx = self.ctx.clone();
         ctx.cancel = cancel;
         let outcome = marv_tools::run_tool(&call, &ctx, &self.tools).await;
-        let note = self.rewritten.lock().unwrap_or_else(|e| e.into_inner()).remove(&call.id);
+        let mut note = self.rewritten.lock().unwrap_or_else(|e| e.into_inner()).remove(&call.id);
+        if let Some(nested) = self.nested_note(&call, &outcome) {
+            note = Some(match note {
+                Some(note) => format!("{note}\n\n{nested}"),
+                None => nested,
+            });
+        }
         Ok(tool_run_from(outcome, note.as_deref()))
     }
 }
@@ -212,7 +238,10 @@ pub struct SessionAgentHost {
     pub agents: Arc<Vec<AgentType>>,
     /// Shown to the subagent ("~/Projects/app").
     pub cwd: String,
+    /// The main agent's instruction files, all of them (#62: the user's own too, see `subagent`).
     pub instructions: Option<String>,
+    /// Each subagent gets nested instruction files on its own (a fresh `NestedInstructions`: its context starts empty).
+    pub nested_instructions: bool,
     /// `~/.marv/worktrees/<project>`; without it, no worktrees.
     pub worktrees_dir: Option<PathBuf>,
     /// The turn's factory and provider: a type naming another model gets it from the same factory.
@@ -364,5 +393,32 @@ mod tests {
         let plain = tool_run_from(ToolOutcome { result: ToolOutput::ok("x", "1 line"), label: "a".into() }, Some("Marv: fixed"));
         assert!(plain.result.output.starts_with('x'));
         assert!(plain.result.output.contains("Marv: fixed"));
+    }
+
+    #[tokio::test]
+    async fn a_nested_agents_md_comes_with_the_first_read_in_its_folder_once() {
+        let dir = crate::checkpoints::test_support::temp("runner-nested");
+        std::fs::create_dir_all(dir.0.join("pkg")).unwrap();
+        let root = std::fs::canonicalize(&dir.0).unwrap();
+        std::fs::write(root.join("pkg/AGENTS.md"), "Use pnpm here.").unwrap();
+        std::fs::write(root.join("pkg/a.ts"), "a").unwrap();
+        std::fs::write(root.join("pkg/b.ts"), "b").unwrap();
+        let mut runner = SessionToolRunner::new(ToolContext::new(&root), Arc::new(marv_tools::builtin_tools().to_vec()));
+        runner.nested = Some(Arc::default());
+        let call = |id: &str, args: &str| ToolCall { id: id.into(), name: "read_file".into(), arguments: args.into() };
+        let run = |c: ToolCall| runner.run(c, CancellationToken::new());
+        let first = run(call("1", r#"{"path": "pkg/a.ts"}"#)).await.unwrap().result.output;
+        assert!(first.contains("\n\nMarv: pkg/AGENTS.md has instructions for the files in pkg/"), "{first}");
+        assert!(first.ends_with("Use pnpm here."));
+        // Once per conversation.
+        let second = run(call("2", r#"{"path": "pkg/b.ts"}"#)).await.unwrap().result.output;
+        assert!(!second.contains("Use pnpm"), "{second}");
+        // A call that failed gets none; nor does a runner without the record.
+        runner.nested = Some(Arc::default());
+        let failed = runner.run(call("3", r#"{"path": "pkg/missing.ts"}"#), CancellationToken::new()).await.unwrap();
+        assert!(failed.result.is_error && !failed.result.output.contains("Use pnpm"));
+        runner.nested = None;
+        let plain = runner.run(call("4", r#"{"path": "pkg/a.ts"}"#), CancellationToken::new()).await.unwrap();
+        assert!(!plain.result.output.contains("Use pnpm"));
     }
 }
