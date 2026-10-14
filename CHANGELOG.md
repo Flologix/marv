@@ -56,7 +56,6 @@ Hardening from a review of 0.3.0, kept as rules with a test each (`tests/guards/
 
 ### Known limitations
 
-- `/mcp add`, `/mcp search`, `/mcp remove`, `/mcp trust`, `/mcp login` and `/mcp logout` aren't wired into the TUI yet: they say they aren't available. Servers in your own `~/.marv/mcp.json` start as before; a project's `.mcp.json` servers wait for trust.
 - On `/resume` and `marv -c`, the transcript shows your messages and the replies, not the tool entries and notices.
 
 ## [0.3.0] - 2026-10-12

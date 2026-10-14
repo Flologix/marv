@@ -16,7 +16,7 @@ Marv is written in Rust and ships as one static binary. Nothing else runs it: no
 - **Guarded against prompt injection.** Once a web page, an MCP result or a message from another agent is in the conversation, anything that could send data out asks you, even in yolo and even after "don't ask again". Text from outside is shown to the model as data, never in Marv's voice. See [Safety model](#safety-model).
 - **Dev servers you can open.** A command's processes end with it, and its `localhost` isn't yours, so Marv starts servers and watchers with its `process` tool instead: each keeps running in its own sandbox (same rules: only the project writable, no network unless asked) across turns until it's stopped or Marv exits, and the ports it listens on are forwarded to your `127.0.0.1`, so `http://localhost:5173` just works. You're asked before each start; `/processes` lists them, `/processes stop <name>` stops one, and the status bar shows how many run.
 - **Any model.** OpenRouter or a local Ollama model, with a searchable model picker showing prices. Switch with `/model`.
-- **MCP servers.** Connect any [Model Context Protocol](https://modelcontextprotocol.io) server, local or remote, in `~/.marv/mcp.json` or `.mcp.json` (Claude Code's format). Its tools join Marv's; calls ask first unless the server marks a tool read-only, since servers run outside the sandbox. With many tools connected, the model sees only their names and loads a tool's parameters when it needs one, so they don't cost thousands of tokens on every request. See [MCP servers](#mcp-servers) for what 0.4.0 can't do yet.
+- **MCP servers.** Connect any [Model Context Protocol](https://modelcontextprotocol.io) server, local or remote, in `~/.marv/mcp.json` or `.mcp.json` (Claude Code's format). Its tools join Marv's; calls ask first unless the server marks a tool read-only, since servers run outside the sandbox. With many tools connected, the model sees only their names and loads a tool's parameters when it needs one, so they don't cost thousands of tokens on every request. A project's servers only start once you trust them (`/mcp trust`). `/mcp add <npm package | URL | GitHub repo>` sets one up for you: it pins the version, shows you exactly what it will write, and starts it without a restart (see [Add an MCP server](#add-an-mcp-server)).
 - **Skills.** Drop a `SKILL.md` into `.marv/skills/` (or `~/.marv/skills/`) and Marv loads it when a task matches, or run it yourself with `/<skill-name>`.
 - **GitHub with your `gh` login.** If you use the GitHub CLI, Marv runs it for you, outside the sandbox: reading PRs, CI runs and issues just works, anything that changes GitHub asks first, and `gh auth` and friends never run. See [Connect GitHub](#connect-github).
 - **Subagents.** Marv can hand a task to a fresh agent with its own context, which reports back when it's done, so the files it read don't fill up the conversation. Several can run in parallel, each in its own git worktree if they change files. Click one to watch its own transcript live. Agent types are Markdown files, compatible with Claude Code's.
@@ -119,7 +119,7 @@ Type what you want in plain language, for example:
 | `/processes` | List the background processes Marv started (dev servers, watchers); `/processes stop <name>` stops one |
 | `/good`, `/bad` | Rate the last turn, with an optional note (`/bad edited the wrong file`) |
 | `/label` | Tag the last turn (`/label refactor, tests`) |
-| `/mcp` | Show MCP servers and their tools (the subcommands aren't in 0.4.0 yet: see [MCP servers](#mcp-servers)) |
+| `/mcp` | Show MCP servers and their tools; `/mcp add <package \| URL \| repo>` adds one, `/mcp search <words>` finds one, `/mcp remove <name>` takes yours out, `/mcp trust` starts the project's, `/mcp login <name>` logs in to a remote server (OAuth), `/mcp logout <name>` forgets the login |
 | `/undo` | Show what the last turn changed and, on a yes, put those files back; again for the turn before ([Undo](#undo)) |
 | `/checkpoints` | Show or set the snapshots `/undo` needs (`/checkpoints on`, `/checkpoints off`) |
 | `/diagnostics` | Show or set the typecheck after edits (`/diagnostics on`, `/diagnostics off`) |
@@ -205,14 +205,57 @@ Servers go in `~/.marv/mcp.json` (yours, every project) or the project's `.mcp.j
 
 - `${VAR}` and `${VAR:-default}` read your environment, so tokens stay out of the file. `/mcp` shows each server as written, with the variables it reads, never their values.
 - Local servers (stdio) and remote ones (Streamable HTTP) both work. An optional `timeout` sets the seconds per call (default 120). The old `sse` transport isn't supported.
-- Servers start in the background when Marv does, and the first request waits for them. Restart Marv after editing a config.
-- A project server can't take the name of one of yours, and starts only once it's trusted (see [Safety model](#safety-model)).
+- Servers start in the background when Marv does, and the first request waits for them. Restart Marv after editing a config by hand (`/mcp add` starts its server at once).
+- A project server can't take the name of one of yours, and starts only once you trust it with `/mcp trust` (see [Safety model](#safety-model)). Once the servers have started, an "MCP" notice lists those that failed, those waiting for trust (what each runs and reads from your environment) and those that need a login. Trust given by Marv 0.3.0 doesn't carry over (the trust key changed).
 - With many tools connected (specs that would cost more than 4,000 tokens per request, or 10% of the context window if that is less), the model gets their names and two tools to look one up and call it. `"mcpTools": "eager"` in `~/.marv/config.json` sends every spec with every request instead, `"deferred"` always sends names only.
 
-**Not in 0.4.0 yet.** `/mcp add`, `/mcp search`, `/mcp remove`, `/mcp trust`, `/mcp login` and `/mcp logout` answer that they aren't available. Until they are:
-- put servers in `~/.marv/mcp.json` by hand: yours start without a trust step;
-- a project's `.mcp.json` servers stay "not trusted yet", and trust given by Marv 0.3.0 doesn't carry over (the trust key changed);
-- a remote server that wants an OAuth login, rather than a token in `headers`, shows as `needs login`; give it a token header instead.
+### Add an MCP server
+
+`/mcp add` works out a server's entry, shows it to you once, writes it to `~/.marv/mcp.json` (yours, every project) and starts it in the running session:
+
+```sh
+/mcp add @modelcontextprotocol/server-filesystem -- ${MARV_PROJECT_DIR}     # an npm package (npm: prefix optional)
+/mcp add pypi:mcp-server-fetch                                              # a PyPI package (run with uvx)
+/mcp add https://mcp.example.com/mcp --header "Authorization: Bearer ${EXAMPLE_TOKEN}"   # a remote server
+/mcp add io.github.acme/weather                                             # a name from the official MCP Registry
+/mcp add https://github.com/acme/weather-mcp                                # a repo whose README names a package or URL
+/mcp search weather                                                         # look in the MCP Registry
+/mcp remove weather                                                         # take one of yours out again
+```
+
+- **Pinned.** A package is written as `npx -y <pkg>@<exact version>` or `uvx <pkg>@<exact version>`, resolved before you're asked (`name@1.2.3` asks for a version; it must exist). npm and PyPI never let a published version's files change.
+- **One approval, of exactly what's written.** The prompt shows the command line, the version and when it was published and by whom, the repository the package names (npm and PyPI don't check that field), the registry publisher's verified namespace, every environment variable the server reads (and whether it's set), and the JSON it writes. Warnings stand out: a deprecated or yanked version, a package first published in the last week, a GitHub README naming a package whose own repository is a different one. Yes writes that JSON as shown; nothing fetched afterwards changes it. There's no "don't ask again": each server is its own decision.
+- **Secrets stay in your environment.** `--env NAME` writes `"NAME": "${NAME}"`, and `--header` takes `"Name: Bearer ${VAR}"`; a value typed in (`--env KEY=sk-…`, a literal header) is refused, since the file sits on disk. A variable that isn't set means the entry is written but not started: set it in your shell and restart Marv.
+- **Options:** `--name <name>` (by default it comes from the package, `@modelcontextprotocol/server-filesystem` → `filesystem`, or the URL's host), and arguments for the server after `--`. A registry entry's fixed arguments and required variables are filled in; a required argument with no value goes after `--`.
+- **GitHub repos:** Marv reads the README (with `GITHUB_TOKEN` or `GH_TOKEN` if set) and takes only a package name or an https URL from its config examples, nothing else from the block (no extra arguments, no `env` values; the variable names it uses are suggested as `--env`). Several candidates: you get the `/mcp add` commands to choose from.
+- **Its tools** reach the model from your next message. `/mcp remove <name>` takes one of your servers out and stops it; its tools stay listed (failing) until `/clear` or a restart. A project's servers stay in `.mcp.json`, edited by hand.
+
+Known limits: npx resolves a package's own dependencies by their version ranges when it first runs (there's no lockfile to pin them); a remote server is whatever its owner deploys at that URL; no Docker images and no building from source yet (a README that only shows those is reported, not followed); a PyPI package whose command has another name than the package needs a hand edit.
+
+### Servers that need a login
+
+A remote server that wants an OAuth login, rather than a token in `headers`, shows as `needs login` at startup and in `/mcp`. Log in with:
+
+```sh
+/mcp login linear      # opens your browser; when it comes back, Marv stores the tokens and connects
+/mcp logout linear     # forgets the login, and revokes it where the server allows
+```
+
+- **Only you start a login.** Startup, a tool call and the model never open a browser or register Marv with a server; a server whose login runs out (its refresh token refused) says `needs login` again, and its tools fail with a message telling the model to ask you.
+- **The browser comes back to Marv** on `127.0.0.1` (a random port, PKCE, a random `state`). Over SSH or without a display Marv doesn't open a browser: it shows the link. Open it anywhere; if the browser then shows an error page (it couldn't reach `127.0.0.1` on that machine), paste the address it ended up on into Marv's prompt. That address goes to the login, never to the model, and the transcript shows `(login callback)`. A login gives up after 5 minutes; `/mcp login` again starts over.
+- **Tokens** are kept in `~/.marv/mcp-tokens.json` (0600), per server URL: your servers share one login across projects (renaming a server keeps it), and a project's server (from `.mcp.json`, trusted first) gets its own. Marv renews the access token with the refresh token when it runs out, also in `marv -p` using the same config folder; `marv -p` never starts a login, and says which server needs one. Tokens never reach the model, the transcript, session files, trajectories or sandboxed commands.
+- **Servers without dynamic registration** need a client you register yourself (an OAuth app at the provider, with the redirect URI `http://127.0.0.1:<port>/callback`), in the server's entry:
+
+```json
+{ "mcpServers": { "example": {
+  "type": "http", "url": "https://mcp.example.com/mcp",
+  "oauth": { "clientId": "abc123", "clientSecret": "${EXAMPLE_CLIENT_SECRET}", "callbackPort": 33418, "scope": "read write" }
+} } }
+```
+
+  All of `oauth` is optional: `clientId` and `clientSecret` (a `${VAR}`, like headers; leave it out for a public client), `callbackPort` (the port of the redirect URI you registered), and `scope` (space-separated: the scope Marv asks for, instead of the one the server suggests). `/mcp` shows the client id and scope, never the secret. A server with its own `Authorization` header logs in with that, not with `/mcp login`.
+
+Known limits of logins: no login from `marv -p` (log in once in the TUI); a client registered by hand needs its exact `callbackPort` free when you log in.
 
 ## Connect GitHub
 
