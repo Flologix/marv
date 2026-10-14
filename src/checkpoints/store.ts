@@ -230,7 +230,7 @@ export class CheckpointStore {
       const path = entry.slice(tab + 1);
       // Symlinks and submodules go through no filter; a path with a newline, or starting with a quote (which
       // --stdin-paths unquotes C-style), can't go through --stdin-paths: it keeps add's blob.
-      if (tab < 0 || type !== "blob" || mode === "120000" || !path.startsWith(where.prefix) || path.includes("\n") || path.slice(where.prefix.length).startsWith('"') || path.startsWith('"')) continue;
+      if (tab < 0 || type !== "blob" || mode === "120000" || !path.startsWith(where.prefix) || path.includes("\n") || path.startsWith('"')) continue;
       blobs.push({ mode, sha, size: Number(size), path });
     }
     if (!blobs.length) return { ok: true, out: tree };
