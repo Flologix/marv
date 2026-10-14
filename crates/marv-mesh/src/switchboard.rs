@@ -136,6 +136,9 @@ pub struct Switchboard {
     /// The folder of the machine's switchboards, once this one's door is open (`discovery::open_door`): where
     /// `mesh_list` finds the other Marvs.
     peer_dir: Mutex<Option<PathBuf>>,
+    /// The Herdr adapter, when Marv runs in a Herdr pane ([`Self::set_herdr`]): where `mesh_list` finds the agent
+    /// panes it could be wired to.
+    herdr: Mutex<Option<Arc<crate::herdr::HerdrAdapter>>>,
 }
 
 /// What changes: one short lock, never held across an await.
@@ -177,6 +180,7 @@ impl Switchboard {
             mail: tokio::sync::Notify::new(),
             resolvers: Mutex::default(),
             peer_dir: Mutex::default(),
+            herdr: Mutex::default(),
         }
     }
 
@@ -186,6 +190,15 @@ impl Switchboard {
     }
     pub fn peer_dir(&self) -> Option<PathBuf> {
         self.peer_dir.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Offers Herdr's agent panes: found on demand by name ([`crate::herdr::HerdrPanes`]) and listed by `mesh_list`.
+    pub fn set_herdr(&self, adapter: Arc<crate::herdr::HerdrAdapter>) {
+        self.add_resolver(Arc::new(crate::herdr::HerdrPanes(adapter.clone())));
+        *self.herdr.lock().unwrap_or_else(|e| e.into_inner()) = Some(adapter);
+    }
+    pub fn herdr(&self) -> Option<Arc<crate::herdr::HerdrAdapter>> {
+        self.herdr.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     fn board(&self) -> MutexGuard<'_, Board> {

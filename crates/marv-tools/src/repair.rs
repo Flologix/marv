@@ -10,8 +10,8 @@
 //! - a tool's `repair(raw, ctx)`: bash's `timeout` given in milliseconds ([`repair_timeout_seconds`]) and a project
 //!   path written with a leading slash ([`repair_path_field`]).
 //!
-//! Planned (#65): schema-guided argument repair (a number sent as a string, a single value where the schema wants an
-//! array, a known field misspelled), still only where the schema leaves one reading.
+//! Schema-guided repair (#65: a number sent as a string, a single value where the schema wants an array, an unknown
+//! field) is generic, not a tool's own: [`crate::schema_repair`], run by `run_tool` before the tool's `repair`.
 
 use std::path::Path;
 
