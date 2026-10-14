@@ -14,6 +14,7 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ### Changed
 
+- **Skills load when the task is clearly their kind, not on every request (#84).** The system prompt said to load a matching skill before starting, and a skill whose description claims every task ("use when starting any conversation") then took over even a one-line fix: on GLM, runs that loaded one were 2.3× slower, with a whole test-driven loop for a small edit. Now the model judges by the task, and small, direct requests skip skills.
 - **`mesh_list` names the other Marvs on this machine**, with the inbox a `mesh_send` would use and a note that the user has to wire it first. Before, the model only saw "nothing is wired", and answered "who's on the mesh?" with nobody while `marv mesh ls` listed several. Names only: their folders and panes stay in `marv mesh ls`.
 
 ### Added
