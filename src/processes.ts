@@ -8,7 +8,7 @@
 // (src/processes/relay.ts) listens on a socket in a folder bind-mounted at /run/marv; Marv reads the sandbox's
 // listening ports from /proc/<pid>/net/tcp{,6} and, for each, listens on the same port of the host's 127.0.0.1 and
 // pipes every connection into the socket.
-import { mkdirSync, readdirSync, readFileSync, readlinkSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync } from "node:fs";
 import { rmdir } from "node:fs/promises";
 import { connect, createServer, type Server, type Socket } from "node:net";
 import { constants, homedir, tmpdir } from "node:os";
@@ -79,7 +79,10 @@ export interface ProcessManagerOptions {
   root: string;
   /** The home folder the sandbox hides (default: the user's); tests pass a fake one. */
   home?: string;
-  /** Where the socket folders go (default: $XDG_RUNTIME_DIR/marv/<pid>). */
+  /**
+   * The folder this manager makes its own folder in, for its processes' sockets (default: $XDG_RUNTIME_DIR/marv).
+   * Its own is `<pid>-<random>`: two sessions in one program never share one, and each removes only its own.
+   */
   runtimeDir?: string;
   /** Something changed (started, exited, a port forwarded): for the status bar. */
   onChange?: () => void;
@@ -171,11 +174,22 @@ export class ProcessManager {
   private readonly entries = new Map<string, Entry>();
   private count = 0;
   private closed = false;
-  private readonly runtimeDir: string;
+  private readonly parentDir: string;
+  /** This manager's own socket folder, made at its first start. */
+  private ownDir: string | null = null;
 
   constructor(private readonly options: ProcessManagerOptions) {
     // A short path: a Unix socket's path is limited to 107 bytes.
-    this.runtimeDir = options.runtimeDir ?? join(process.env.XDG_RUNTIME_DIR || join(tmpdir(), `marv-${process.getuid?.() ?? "user"}`), "marv", String(process.pid));
+    this.parentDir = options.runtimeDir ?? join(process.env.XDG_RUNTIME_DIR || join(tmpdir(), `marv-${process.getuid?.() ?? "user"}`), "marv");
+  }
+
+  /** Its own folder (0700), unique even among managers in one process: their process ids both start at p1. */
+  private get runtimeDir(): string {
+    if (!this.ownDir) {
+      mkdirSync(this.parentDir, { recursive: true, mode: 0o700 });
+      this.ownDir = mkdtempSync(join(this.parentDir, `${process.pid}-`));
+    }
+    return this.ownDir;
   }
 
   list(): ProcessInfo[] {
@@ -286,7 +300,8 @@ export class ProcessManager {
   async closeAll(): Promise<void> {
     this.closed = true;
     await Promise.all([...this.entries.keys()].map((name) => this.stop(name)));
-    rmSync(this.runtimeDir, { recursive: true, force: true });
+    // Only its own folder: another session's processes may be using the parent.
+    if (this.ownDir) rmSync(this.ownDir, { recursive: true, force: true });
   }
 
   private unknown(name: string): string {

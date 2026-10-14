@@ -88,14 +88,22 @@ describe("formatSummary", () => {
 describe("the plan tool's measures (#15)", () => {
   const items = (...statuses: string[]) => JSON.stringify({ items: statuses.map((status, i) => ({ text: `s${i}`, status })) });
 
+  const ok = (args: string) => ({ arguments: args, isError: false });
+
   test("planCalls counts the calls; planOpen: the run ended with an answer while the last plan had unfinished items", () => {
-    expect(planOutcome([items("in_progress", "pending"), items("done", "in_progress")], "end")).toEqual({ planCalls: 2, planOpen: true });
-    expect(planOutcome([items("in_progress"), items("done", "done")], "end")).toEqual({ planCalls: 2, planOpen: false });
+    expect(planOutcome([ok(items("in_progress", "pending")), ok(items("done", "in_progress"))], "end")).toEqual({ planCalls: 2, planOpen: true });
+    expect(planOutcome([ok(items("in_progress")), ok(items("done", "done"))], "end")).toEqual({ planCalls: 2, planOpen: false });
     // Not an answer (out of steps, a timeout): unfinished, but not "let go stale".
-    expect(planOutcome([items("in_progress")], "max_steps")).toEqual({ planCalls: 1, planOpen: false });
+    expect(planOutcome([ok(items("in_progress"))], "max_steps")).toEqual({ planCalls: 1, planOpen: false });
     expect(planOutcome([], "end")).toEqual({ planCalls: 0, planOpen: false });
     // A malformed call (refused by the tool) isn't the plan.
-    expect(planOutcome([items("in_progress"), "{not json"], "end")).toEqual({ planCalls: 2, planOpen: true });
+    expect(planOutcome([ok(items("in_progress")), { arguments: "{not json", isError: true }], "end")).toEqual({ planCalls: 2, planOpen: true });
+  });
+
+  test("a call the tool rejected counts as a call but isn't the plan (Greptile on #71)", () => {
+    // A valid unfinished plan, then a readable 21-item all-done call the tool refused (at most 20 items).
+    const rejected = { arguments: items(...Array<string>(21).fill("done")), isError: true };
+    expect(planOutcome([ok(items("in_progress", "pending")), rejected], "end")).toEqual({ planCalls: 2, planOpen: true });
   });
 
   test("testsPassed and testsTotal from a bun test summary, absent when unreadable", () => {

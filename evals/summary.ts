@@ -64,18 +64,21 @@ export interface RunResult {
 }
 
 /**
- * The plan tool's measures from a run's plan calls (their arguments, in order) and how it ended: how often the model
- * planned, and whether it answered with its last readable plan still unfinished. Only an answer ("end") counts as
- * letting it go stale: a run cut off by the step limit or a timeout didn't choose to stop.
+ * The plan tool's measures from a run's plan calls (their arguments and whether the tool refused them, in order) and
+ * how it ended: how often the model planned, and whether it answered with its last accepted plan still unfinished.
+ * Every call counts as an attempt; only one the tool accepted replaced the plan (a 21-item call is readable but
+ * refused). Only an answer ("end") counts as letting it go stale: a run cut off by the step limit or a timeout didn't
+ * choose to stop.
  */
-export function planOutcome(calls: string[], reason: string): { planCalls: number; planOpen: boolean } {
+export function planOutcome(calls: { arguments: string; isError?: boolean }[], reason: string): { planCalls: number; planOpen: boolean } {
   let last: { status?: unknown }[] | null = null;
-  for (const args of calls) {
+  for (const call of calls) {
+    if (call.isError) continue;
     try {
-      const items = (JSON.parse(args) as { items?: unknown }).items;
+      const items = (JSON.parse(call.arguments) as { items?: unknown }).items;
       if (Array.isArray(items)) last = items as { status?: unknown }[];
     } catch {
-      // A malformed call was refused by the tool: the plan is still the previous one.
+      // Not readable here: the plan is still the previous one.
     }
   }
   return { planCalls: calls.length, planOpen: reason === "end" && Boolean(last?.some((i) => i?.status !== "done")) };

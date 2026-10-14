@@ -300,6 +300,30 @@ describe("CLI: spawning bun src/cli.tsx -p", () => {
     expect(Bun.spawnSync(["git", "log", "--oneline"], { cwd: root }).stdout.toString()).toContain("one");
   });
 
+  test("checkpoints: false in the config takes no snapshots, as the TUI does (Greptile on #71)", async () => {
+    const git = (...args: string[]) => Bun.spawnSync(["git", ...args], { cwd: root }).stdout.toString().trim();
+    git("init", "-q");
+    await writeFile(join(root, "a.txt"), "a\n");
+    git("add", "a.txt");
+    git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "one");
+    const turn = async (content: string, overrides: Record<string, unknown>) => {
+      server?.stop(true);
+      const url = scripted([callChunk("c1", "write_file", { path: "a.txt", content }), finish("tool_calls")], [delta("Done."), finish("stop")]);
+      await writeConfig(url, overrides);
+      const { stderr, exitCode } = await runCli(["-p", "change a.txt", "--output", "json"]);
+      expect({ exitCode, stderr }).toMatchObject({ exitCode: 0 });
+    };
+    // Control: on by default, the turn leaves a checkpoint ref.
+    await turn("b\n", {});
+    const refs = git("for-each-ref", "--format=%(refname)", "refs/marv/");
+    expect(refs).not.toBe("");
+    for (const ref of refs.split("\n")) git("update-ref", "-d", ref);
+    // Off in the config: the file changes and no ref is made.
+    await turn("c\n", { checkpoints: false });
+    expect(await Bun.file(join(root, "a.txt")).text()).toBe("c\n");
+    expect(git("for-each-ref", "refs/marv/")).toBe("");
+  });
+
   test("stdin: marv -p - reads from stdin", async () => {
     const url = serve(() => sse(delta("You said: "), delta("hello"), { choices: [{ delta: {}, finish_reason: "stop" }] }, "[DONE]"));
     await writeConfig(url);

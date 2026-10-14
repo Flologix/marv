@@ -3,8 +3,8 @@
 // object store under a hidden ref, refs/marv/checkpoints/<session>, which no branch list, push, fetch or status
 // shows; outside one, into a bare git dir of Marv's own (~/.marv/checkpoints/<project>/git). Each checkpoint's
 // parent is the one before it, so the ref keeps the whole chain reachable and one `update-ref -d` lets it go.
-import { copyFile, mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { copyFile, lstat, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { runGitAsync, type GitAsyncResult } from "../git.ts";
 import { IGNORED_DIRS } from "../tools/files.ts";
@@ -37,6 +37,8 @@ const IDENTITY = { GIT_AUTHOR_NAME: "Marv", GIT_AUTHOR_EMAIL: "marv@localhost", 
 const REF_PREFIX = "refs/marv/checkpoints/";
 const SUBJECT = /^marv checkpoint: turn (\d+) (before|after|pre-undo|undo)$/;
 const DAY_MS = 86_400_000;
+/** Files keepOwnBytes stats at once. */
+const STAT_BATCH = 256;
 export const NOT_A_REPOSITORY = "the project isn't in a git repository";
 
 /** A checkpoint's commit message: "marv checkpoint: turn 3 before", then the turn's request on its own line. */
@@ -94,6 +96,11 @@ export class CheckpointStore {
    * it just wrote before the commit points at it, and two snapshots would race for the ref.
    */
   private queue: Promise<unknown> = Promise.resolve();
+  /**
+   * The working bytes' blob of each file whose stored blob git's filters changed (keepOwnBytes), with the file's
+   * stat when it was hashed: a big LFS asset is read once a session while it doesn't change, not every turn.
+   */
+  private readonly ownBytes = new Map<string, { stamp: string; sha: string }>();
 
   constructor(private readonly options: StoreOptions) {
     this.session = options.session;
@@ -122,13 +129,13 @@ export class CheckpointStore {
   }
 
   /** git with the checkpoint's git dir and work tree pinned, run in the work tree's top. */
-  async git(args: string[], { index, signal, timeoutMs }: { index?: string; signal?: AbortSignal; timeoutMs?: number } = {}): Promise<GitAsyncResult> {
+  async git(args: string[], { index, signal, timeoutMs, input }: { index?: string; signal?: AbortSignal; timeoutMs?: number; input?: string } = {}): Promise<GitAsyncResult> {
     const where = await this.locate();
     if ("error" in where) return { ok: false, out: where.error, bytes: new Uint8Array(), timedOut: false };
     const time = this.options.now ? `${Math.floor(this.options.now() / 1000)} +0000` : undefined;
     const env: Record<string, string> = { ...IDENTITY, GIT_DIR: where.gitDir, GIT_WORK_TREE: where.top, ...(time ? { GIT_AUTHOR_DATE: time, GIT_COMMITTER_DATE: time } : {}) };
     if (index) env.GIT_INDEX_FILE = index;
-    return runGitAsync(where.top, args, { env, signal, timeoutMs });
+    return runGitAsync(where.top, args, { env, signal, timeoutMs, input });
   }
 
   /** The project's files, as a pathspec in the work tree ("." or ":(literal)pkg/"). */
@@ -180,8 +187,10 @@ export class CheckpointStore {
       const spec = await this.pathspec();
       const added = await this.git(["add", "-A", "--", spec], { index, signal });
       if (!added.ok) return fail(added.timedOut ? "git add timed out" : added.out || "git add failed");
-      const tree = await this.git(["write-tree"], { index, signal });
-      if (!tree.ok) return fail(tree.out || "git write-tree failed");
+      const written = await this.git(["write-tree"], { index, signal });
+      if (!written.ok) return fail(written.out || "git write-tree failed");
+      const tree = await this.keepOwnBytes(where, index, written.out.trim(), signal);
+      if (!tree.ok) return fail(tree.out);
       const listed = await this.git(["ls-files", "-z", "--", spec], { index, signal });
       const files = listed.ok ? listed.out.split("\0").filter(Boolean).length : 0;
       const previous = await this.head();
@@ -200,6 +209,116 @@ export class CheckpointStore {
     } finally {
       if (temp) await rm(temp, { recursive: true, force: true }).catch(() => {});
     }
+  }
+
+  /**
+   * `add -A` stores what git's clean side makes of a file: an LFS pointer, LF for a CRLF file (eol, autocrlf), a
+   * collapsed `$Id$`, UTF-8 for a re-encoded file. Undo writes blobs back without running checkout's smudge side (a
+   * program, maybe a download), so the snapshot must hold the file's own bytes: each blob whose size differs from
+   * the file's (an eol conversion only ever drops CRs) or whose path has a `filter`, `ident` or
+   * `working-tree-encoding` attribute (a filter may keep the size) is hashed again from the file with
+   * `--no-filters` and put in the temporary index. Returns the tree to commit.
+   */
+  private async keepOwnBytes(where: Location, index: string, tree: string, signal?: AbortSignal): Promise<{ ok: true; out: string } | { ok: false; out: string }> {
+    if (!(await this.mayConvert(where, index, signal))) return { ok: true, out: tree };
+    const listed = await this.git(["ls-tree", "-r", "-l", "-z", tree], { signal });
+    if (!listed.ok) return { ok: false, out: listed.out || "git ls-tree failed" };
+    const blobs: { mode: string; sha: string; size: number; path: string }[] = [];
+    for (const entry of listed.out.split("\0")) {
+      const tab = entry.indexOf("\t");
+      const [mode = "", type = "", sha = "", size = ""] = entry.slice(0, Math.max(tab, 0)).split(/ +/);
+      const path = entry.slice(tab + 1);
+      // Symlinks and submodules go through no filter; a path with a newline, or starting with a quote (which
+      // --stdin-paths unquotes C-style), can't go through --stdin-paths: it keeps add's blob.
+      if (tab < 0 || type !== "blob" || mode === "120000" || !path.startsWith(where.prefix) || path.includes("\n") || path.slice(where.prefix.length).startsWith('"') || path.startsWith('"')) continue;
+      blobs.push({ mode, sha, size: Number(size), path });
+    }
+    if (!blobs.length) return { ok: true, out: tree };
+    const attrs = await this.git(["check-attr", "-z", "--stdin", "filter", "ident", "working-tree-encoding"], {
+      index,
+      signal,
+      input: blobs.map((b) => `${b.path}\0`).join(""),
+    });
+    if (!attrs.ok) return { ok: false, out: attrs.out || "git check-attr failed" };
+    const filtered = new Set<string>();
+    const fields = attrs.out.split("\0");
+    for (let i = 0; i + 2 < fields.length; i += 3) if (fields[i + 2] !== "unspecified" && fields[i + 2] !== "unset") filtered.add(fields[i]!);
+
+    // The files' sizes as `add -A` just saw them: the index's stat data, which it refreshed (stat'ing every file
+    // from here took most of the snapshot's time). A path it doesn't give is stat'ed below.
+    const debug = await this.git(["ls-files", "--debug", "-s", "-z", "--", await this.pathspec()], { index, signal });
+    const sizes = new Map<string, number>();
+    if (debug.ok) for (const m of debug.out.matchAll(/\d{6} [0-9a-f]+ \d\t([^\0]*)\0[^\0]*?size: (\d+)\t/g)) sizes.set(m[1]!, Number(m[2]));
+    const candidates = blobs.filter((b) => filtered.has(b.path) || sizes.get(b.path) !== b.size);
+    const changed: { mode: string; path: string; stamp: string }[] = [];
+    for (let start = 0; start < candidates.length; start += STAT_BATCH) {
+      const batch = candidates.slice(start, start + STAT_BATCH);
+      const infos = await Promise.all(batch.map((b) => lstat(join(where.top, b.path), { bigint: true }).catch(() => null)));
+      batch.forEach((blob, i) => {
+        const info = infos[i];
+        // Not a file here (skip-worktree, deleted meanwhile), or the same size after all: git's blob is the file.
+        if (!info?.isFile() || (Number(info.size) === blob.size && !filtered.has(blob.path))) return;
+        changed.push({ mode: blob.mode, path: blob.path, stamp: `${info.size}:${info.mtimeNs}:${info.ctimeNs}:${info.ino}` });
+      });
+    }
+    if (!changed.length) return { ok: true, out: tree };
+    // Hashed before and unchanged since: reused, if the object is still there (a dropped pair's may be collected).
+    const known = changed.filter((c) => this.ownBytes.get(c.path)?.stamp === c.stamp);
+    const present = new Set<string>();
+    if (known.length) {
+      const checked = await this.git(["cat-file", "--batch-check=%(objectname)"], { signal, input: known.map((c) => `${this.ownBytes.get(c.path)!.sha}\n`).join("") });
+      if (checked.ok) for (const line of checked.out.split("\n")) if (/^[0-9a-f]+$/.test(line)) present.add(line);
+    }
+    const shas = new Map<string, string>();
+    for (const c of known) {
+      const sha = this.ownBytes.get(c.path)!.sha;
+      if (present.has(sha)) shas.set(c.path, sha);
+    }
+    const fresh = changed.filter((c) => !shas.has(c.path));
+    if (fresh.length) {
+      const hashed = await this.git(["hash-object", "-w", "--no-filters", "--stdin-paths"], { signal, input: fresh.map((c) => `${c.path}\n`).join("") });
+      if (!hashed.ok) return { ok: false, out: hashed.out || "git hash-object failed" };
+      const lines = hashed.out.split("\n").filter(Boolean);
+      if (lines.length !== fresh.length) return { ok: false, out: "git hash-object answered for fewer files than asked" };
+      fresh.forEach((c, i) => {
+        shas.set(c.path, lines[i]!);
+        this.ownBytes.set(c.path, { stamp: c.stamp, sha: lines[i]! });
+      });
+    }
+    const updated = await this.git(["update-index", "-z", "--index-info"], {
+      index,
+      signal,
+      input: changed.map((c) => `${c.mode} ${shas.get(c.path)}\t${c.path}\0`).join(""),
+    });
+    if (!updated.ok) return { ok: false, out: updated.out || "git update-index failed" };
+    const rewritten = await this.git(["write-tree"], { index, signal });
+    return rewritten.ok ? { ok: true, out: rewritten.out.trim() } : { ok: false, out: rewritten.out || "git write-tree failed" };
+  }
+
+  /**
+   * Whether git could store anything but a file's own bytes here: core.autocrlf is on, or some attributes file
+   * (the tree's .gitattributes, info/attributes, the user's and the system's) names an attribute that converts.
+   * Read as text, so a comment or a macro using one counts too: a needless check costs time, never bytes. Most
+   * projects have none, and the check (check-attr over every path) is most of a snapshot's time on a big tree.
+   */
+  private async mayConvert(where: Location, index: string, signal?: AbortSignal): Promise<boolean> {
+    // Every .gitattributes in the work tree (a parent folder's applies to a subfolder project too).
+    const [config, listed, info] = await Promise.all([
+      this.git(["config", "-z", "--type=path", "--get-regexp", "^core\\.(autocrlf|attributesfile)$"], { signal }),
+      this.git(["ls-files", "-z", "--full-name", "--", ":(top,glob)**/.gitattributes"], { index, signal }),
+      this.git(["rev-parse", "--git-path", "info/attributes"], { signal }),
+    ]);
+    const attributeFiles = listed.ok ? listed.out.split("\0").filter(Boolean) : [];
+    let userFile = join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "git", "attributes");
+    for (const pair of config.ok ? config.out.split("\0") : []) {
+      const [key = "", value = ""] = pair.split("\n");
+      if (key === "core.autocrlf" && ["true", "input"].includes(value.trim().toLowerCase())) return true;
+      if (key === "core.attributesfile") userFile = resolve(where.top, value);
+    }
+    const files = [...attributeFiles.map((path) => join(where.top, path)), userFile, "/etc/gitattributes"];
+    if (info.ok) files.push(resolve(where.top, info.out.trim()));
+    const texts = await Promise.all(files.map((file) => readFile(file, "utf8").catch(() => "")));
+    return texts.some((text) => /\b(filter|ident|working-tree-encoding|text|eol|crlf)\b/.test(text));
   }
 
   private serial<T>(work: () => Promise<T>): Promise<T> {

@@ -183,7 +183,7 @@ async function runOne({ model, task, rep }: { model: string; task: string; rep: 
     ...(withMcp ? { mcpTools: mcpTools ?? "auto", mcpCalls: 0 } : {}),
     plan,
   };
-  const planCalls: string[] = [];
+  const planCalls: { arguments: string; isError?: boolean }[] = [];
   // What happened, for reading a run afterwards: replies, and every tool call with (the start of) what it returned.
   const log: unknown[] = [];
   // The model's final reply, written into the workspace for the check (a reply-reading task's check reads it there;
@@ -232,7 +232,7 @@ async function runOne({ model, task, rep }: { model: string; task: string; rep: 
           if (/^Marv: .* doesn't parse/m.test(event.result.output)) result.syntaxNotes = (result.syntaxNotes ?? 0) + 1;
           if (name === "bash" && ranTypecheck(event.call.arguments)) result.ranTypecheck = true;
           if (name === "mcp_call" || name.startsWith("mcp__")) result.mcpCalls = (result.mcpCalls ?? 0) + 1;
-          if (name === "plan") planCalls.push(event.call.arguments);
+          if (name === "plan") planCalls.push({ arguments: event.call.arguments, isError: event.result.isError });
           log.push({ tool: name, args: event.call.arguments, isError: event.result.isError ?? false, output: short(event.result.output, 3000) });
         }
       }

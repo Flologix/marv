@@ -1455,6 +1455,23 @@ describe("the plan (#15)", () => {
     expect(b.plan).toEqual([...items]);
   });
 
+  test("resumed into a session with plan: false, an unfinished saved plan isn't restored, nor handed to compaction (Greptile on #71)", async () => {
+    const sessions = new SessionStore(dir);
+    const a = makeSession(new ScriptedProvider([useTools(planCall("p1")), say("Planned.")]), { sessions });
+    await collect(a.send("plan it"));
+    await a.flush();
+    const provider = new ScriptedProvider([say("The summary."), say("Ok.")]);
+    const b = makeSession(provider, { sessions, plan: false });
+    const resumed = await b.resume(a.id);
+    expect(resumed?.plan).toBeNull();
+    expect(b.plan).toBeNull();
+    await b.compact();
+    await collect(b.send("go on"));
+    const history = JSON.stringify(provider.requests.at(-1)!.history);
+    expect(history).toContain("The summary.");
+    expect(history).not.toContain("plan tool");
+  });
+
   test("a malformed saved plan is dropped; the session still loads", async () => {
     const sessions = new SessionStore(dir);
     const a = makeSession(new ScriptedProvider([say("Hi.")]), { sessions });
