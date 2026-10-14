@@ -1864,6 +1864,10 @@ impl SessionPort for Port {
         self.0.activity.answer(id.0, decision(d));
     }
 
+    fn stop_suggesting(&self) {
+        self.0.stop_suggesting();
+    }
+
     fn abort(&self) {
         self.0.stop_suggesting();
         self.0.session.interrupt();

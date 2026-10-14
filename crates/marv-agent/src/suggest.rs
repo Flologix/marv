@@ -37,16 +37,19 @@ pub fn suggestion_request(history: &[ChatTurn]) -> Vec<ChatTurn> {
     request
 }
 
-/// A reply as a suggestion: its one line, without quotes or a leading `>`, or `None` (NONE, empty, several lines,
-/// longer than [`MAX_CHARS`]).
+/// A reply as a suggestion: its one line, printable only, without quotes or a leading `>`, or `None` (NONE, empty,
+/// several lines, longer than [`MAX_CHARS`], or a slash command: Enter would run that instead of sending a message,
+/// and a suggestion is only ever a message to the model).
 pub fn clean(reply: &str) -> Option<String> {
+    let reply = marv_core::printable(reply);
     let reply = reply.trim();
     if reply.lines().count() != 1 {
         return None;
     }
     let text = reply.trim_start_matches('>').trim().trim_matches(|c| matches!(c, '"' | '\'' | '`' | '“' | '”')).trim();
     let none = text.trim_end_matches('.').eq_ignore_ascii_case("none");
-    (!text.is_empty() && !none && text.chars().count() <= MAX_CHARS).then(|| text.to_string())
+    let command = text.starts_with('/');
+    (!text.is_empty() && !none && !command && text.chars().count() <= MAX_CHARS).then(|| text.to_string())
 }
 
 /// Asks the model for the user's next message. `None` when there's nothing to suggest, the model tried a tool, the
@@ -150,7 +153,10 @@ mod tests {
         assert_eq!(clean("  \"commit this\"  ").as_deref(), Some("commit this"));
         assert_eq!(clean("> run the tests").as_deref(), Some("run the tests"));
         assert_eq!(clean("`cargo test`").as_deref(), Some("cargo test"));
-        for no in ["NONE", "none.", "", "  ", "do this\nthen that", &"word ".repeat(30)] {
+        // The model's text is printable only: escapes and bidi controls never reach the prompt line.
+        assert_eq!(clean("run the tests\x1b[2J\u{202e}").as_deref(), Some("run the tests"));
+        for no in ["NONE", "none.", "", "  ", "do this\nthen that", &"word ".repeat(30), "/yolo", "\"/sandbox off\"", "\x1b[31m"]
+        {
             assert_eq!(clean(no), None, "{no:?}");
         }
     }

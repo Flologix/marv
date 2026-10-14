@@ -1501,6 +1501,10 @@ impl MarvSession {
             return None;
         }
         let history = lock(&conversation).clone();
+        // Again with the history in hand: outside text that came in meanwhile (an inbox message) tainted it first.
+        if !self.tainted().is_empty() {
+            return None;
+        }
         let tools = self.offered().0;
         let on_usage = |usage: Usage| self.count(&usage, factory.as_ref(), info.as_ref());
         marv_agent::suggest::suggest(marv_agent::suggest::SuggestOptions {

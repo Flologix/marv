@@ -637,6 +637,10 @@ pub trait SessionPort: Send + Sync {
     /// itself (with [`answer`](Self::answer)) before calling this.
     fn abort(&self);
 
+    /// Esc while idle: stop asking for the next-step suggestion, if that's still going (the prompt drops a late one
+    /// itself). Nothing else is running to stop.
+    fn stop_suggesting(&self) {}
+
     /// The setup screen's model step needs the provider's list ([`UiEvent::Models`]).
     fn load_models(&self, provider: ProviderId);
 

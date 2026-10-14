@@ -73,8 +73,11 @@ pub struct PromptInput {
     pub menu_index: usize,
     /// Esc hides the menu until the text changes again.
     pub dismissed_at: Option<String>,
-    /// The suggested next message, shown while the line is empty.
+    /// The suggested next message, shown while the line is empty (already `printable()`: Tab takes what was shown).
     pub suggestion: Option<String>,
+    /// The user typed, pasted or pressed Esc since the last turn ended ([`Self::expect_suggestion`]): a suggestion
+    /// that arrives now is dropped, even if the line is empty again.
+    pub suggestion_closed: bool,
 }
 
 impl PromptInput {
@@ -85,11 +88,27 @@ impl PromptInput {
         self.menu_index = 0;
     }
 
-    /// Offers `text` as the next message, while the line is empty (one typed meanwhile wins).
+    /// Offers `text` as the next message, while the line is empty and the user hasn't typed, pasted or pressed Esc
+    /// since the turn ended (what they did meanwhile wins). Only its printable text is kept: what Tab puts in the line
+    /// is what was shown.
     pub fn suggest(&mut self, text: &str) {
-        if self.value.is_empty() {
-            self.suggestion = Some(text.to_string());
+        let text = printable(text);
+        // Never a slash command: Enter would run it, and a suggestion is only ever a message to the model.
+        let command = text.trim_start().starts_with('/');
+        if self.value.is_empty() && !self.suggestion_closed && !text.trim().is_empty() && !command {
+            self.suggestion = Some(text);
         }
+    }
+
+    /// A turn ended: the suggestion asked for now may be shown when it comes.
+    pub fn expect_suggestion(&mut self) {
+        self.suggestion_closed = false;
+    }
+
+    /// Typing, pasting or Esc: no suggestion now, and none that's still on its way.
+    fn close_suggestion(&mut self) {
+        self.suggestion = None;
+        self.suggestion_closed = true;
     }
 
     /// Adds a submission to the history (not twice in a row), as the App does on submit.
@@ -125,11 +144,13 @@ impl PromptInput {
             && let Some(suggestion) = self.suggestion.take()
         {
             self.set(suggestion);
+            self.close_suggestion();
             return None;
         }
+        let before = self.value.clone();
         let outcome = self.edit(key, busy, commands);
-        if !self.value.is_empty() {
-            self.suggestion = None;
+        if self.value != before || !self.value.is_empty() || key.code == KeyCode::Esc {
+            self.close_suggestion();
         }
         outcome
     }
@@ -211,8 +232,8 @@ impl PromptInput {
     pub fn paste(&mut self, text: &str) {
         let text: String = text.chars().map(|c| if c == '\n' || c == '\r' { ' ' } else { c }).collect();
         self.type_text(&text);
-        if !self.value.is_empty() {
-            self.suggestion = None;
+        if !text.is_empty() {
+            self.close_suggestion();
         }
     }
 
@@ -556,9 +577,10 @@ mod tests {
         h.press(&[KeyCode::Enter]);
         assert_eq!(h.submitted, [""], "Enter sends the empty line (which the App ignores), not the suggestion");
         h.press(&[KeyCode::Tab]);
-        assert_eq!(h.prompt.value, "run the tests\x1b[2J");
+        assert_eq!(h.prompt.value, "run the tests", "Tab takes what was shown, never the escape");
         assert_eq!(h.prompt.suggestion, None);
         h.prompt.set("");
+        h.prompt.expect_suggestion();
         // Typing drops it, and it doesn't come back when the line is emptied again.
         h.prompt.suggest("commit this");
         h.typed("n");
@@ -566,11 +588,46 @@ mod tests {
         h.press(&[KeyCode::Backspace]);
         assert!(h.frame().contains("> Type a message"), "{}", h.frame());
         // → takes it too; one that arrives after typing started is dropped.
+        h.prompt.expect_suggestion();
         h.prompt.suggest("commit this");
         h.press(&[KeyCode::Right]);
         assert_eq!(h.prompt.value, "commit this");
         h.prompt.suggest("something else");
         assert_eq!(h.prompt.suggestion, None);
+    }
+
+    // Greptile #83: typing and erasing before the suggestion arrives, a paste, or Esc all mean "not now": the late
+    // reply isn't shown on the emptied line. Esc also hides one already shown. The next turn's end opens it again.
+    #[test]
+    fn a_suggestion_arriving_after_typing_erasing_paste_or_esc_is_dropped() {
+        let mut h = Harness::new(&[]);
+        h.prompt.expect_suggestion();
+        h.typed("r");
+        h.press(&[KeyCode::Backspace]);
+        assert_eq!(h.prompt.value, "");
+        h.prompt.suggest("run the tests");
+        assert_eq!(h.prompt.suggestion, None, "typed and erased");
+
+        h.prompt.expect_suggestion();
+        h.prompt.paste("x");
+        h.press(&[KeyCode::Backspace]);
+        h.prompt.suggest("run the tests");
+        assert_eq!(h.prompt.suggestion, None, "pasted and erased");
+
+        h.prompt.expect_suggestion();
+        h.prompt.suggest("run the tests");
+        h.press(&[KeyCode::Esc]);
+        assert_eq!(h.prompt.suggestion, None, "Esc hides it");
+        assert!(h.frame().contains("> Type a message"), "{}", h.frame());
+        h.prompt.suggest("run the tests");
+        assert_eq!(h.prompt.suggestion, None, "and one still on its way");
+
+        h.prompt.expect_suggestion();
+        h.prompt.suggest("run the tests");
+        assert_eq!(h.prompt.suggestion.as_deref(), Some("run the tests"), "the next turn's suggestion shows");
+        h.prompt.suggestion = None;
+        h.prompt.suggest(" /yolo");
+        assert_eq!(h.prompt.suggestion, None, "never a command");
     }
 
     #[test]
