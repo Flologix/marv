@@ -5,7 +5,7 @@
 //! - Tool specs are built once, so every request sends byte-identical definitions in a stable order (anything else
 //!   breaks the prompt cache). Note: `serde_json` without `preserve_order` sorts object keys, so a schema's key order
 //!   differs from Marv's (zod's insertion order); it's still byte-stable, which is what the cache needs.
-//! - `skill` is offered only when skills exist (`tool_specs_for`).
+//! - `skill` is offered only when skills exist, `plan` unless the session turned it off (#15) (`tool_specs_for`).
 //! - `run_tool` never fails: bad JSON, invalid input and `ToolError`s become error results the model can recover from.
 //!   `available` is what this agent was offered (a subagent gets fewer tools); anything else is unknown, even if the
 //!   model names it.
@@ -37,8 +37,9 @@ pub const INTERRUPTED: &str = "Interrupted by the user before this tool ran.";
 pub const DECLINED: &str = "The user declined this. Don't retry it: stop and wait for them to say how to proceed.";
 
 /// Marv's built-in tools, in Marv's order (the order of the specs the model sees):
-/// read_file, glob, grep, web_fetch, skill, edit_file, write_file, bash, memory, agent.
-/// `apply_patch` (#66) isn't registered until it's built.
+/// read_file, glob, grep, web_fetch, skill, edit_file, write_file, bash, memory, plan, agent.
+/// `apply_patch` (#66) isn't registered until it's built; Marv's github (after web_fetch) and process (after bash)
+/// come with their own ports.
 pub fn builtin_tools() -> &'static [ToolRef] {
     static TOOLS: OnceLock<Vec<ToolRef>> = OnceLock::new();
     TOOLS.get_or_init(|| {
@@ -52,6 +53,7 @@ pub fn builtin_tools() -> &'static [ToolRef] {
             Arc::new(crate::write_file::WriteFile),
             Arc::new(crate::bash::Bash),
             Arc::new(crate::memory::Memory),
+            Arc::new(crate::plan::Plan),
             Arc::new(crate::agent::Agent),
         ]
     })
@@ -68,9 +70,10 @@ pub fn tool_specs() -> &'static [ToolSpec] {
     SPECS.get_or_init(|| builtin_tools().iter().map(|t| t.spec()).collect())
 }
 
-/// The specs for a session: the skill tool only when there are skills to load.
-pub fn tool_specs_for(has_skills: bool) -> Vec<ToolSpec> {
-    tool_specs().iter().filter(|s| has_skills || s.name != "skill").cloned().collect()
+/// The specs for a session: the skill tool only when there are skills to load, the plan tool unless the session
+/// turned it off (#15; decided at construction, since it changes the tool list).
+pub fn tool_specs_for(has_skills: bool, plan: bool) -> Vec<ToolSpec> {
+    tool_specs().iter().filter(|s| (has_skills || s.name != "skill") && (plan || s.name != "plan")).cloned().collect()
 }
 
 /// A finished call: the result and the transcript label.
@@ -360,14 +363,16 @@ mod tests {
     }
 
     #[test]
-    fn builtin_specs_are_in_marvs_order_and_skill_is_optional() {
+    fn builtin_specs_are_in_marvs_order_and_skill_and_plan_are_optional() {
         let names: Vec<&str> = tool_specs().iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
             names,
-            ["read_file", "glob", "grep", "web_fetch", "skill", "edit_file", "write_file", "bash", "memory", "agent"]
+            ["read_file", "glob", "grep", "web_fetch", "skill", "edit_file", "write_file", "bash", "memory", "plan", "agent"]
         );
-        assert!(!tool_specs_for(false).iter().any(|s| s.name == "skill"));
-        assert_eq!(tool_specs_for(true).len(), 10);
+        assert!(!tool_specs_for(false, true).iter().any(|s| s.name == "skill"));
+        assert_eq!(tool_specs_for(true, true).len(), 11);
+        assert!(!tool_specs_for(true, false).iter().any(|s| s.name == "plan"));
+        assert_eq!(tool_specs_for(true, false).len(), 10);
         let agent = ToolCall { id: "1".into(), name: "agent".into(), arguments: "{}".into() };
         assert!(is_parallel_call(&agent, builtin_tools()));
     }
