@@ -1,62 +1,448 @@
-# marv-rs
+<p align="center"><img src="docs/images/marv.svg" alt="Marv, a pixel-art martian" width="144"></p>
 
-```
- ●       ●
-  ▀▄   ▄▀
- ▄███████▄
-▄██ ███ ██▄
- ███▀▀▀███
- ▀███████▀
-  ▀▀   ▀▀
-```
+# Marv
 
-Marv, rebuilt in Rust. Marv is a terminal coding agent that runs every command in a sandbox. marv-rs adds a **mesh**: wired, approved lines of communication between sandboxed agents, including agents running in Herdr or tmux panes.
+A terminal coding agent. Marv reads your code, edits files and runs commands (sandboxed, and asking for your approval wherever the sandbox can't contain what it does), inside a full-screen terminal UI with a little martian for company.
 
-**Status: skeleton.** The crates have the shape of the TypeScript Marv (`FlologixAI/marv`): types, constants, signatures and module docs. Bodies are `todo!("port: …")`. To see what's left:
+Marv is written in Rust and ships as one static binary. Nothing else runs it: no Bun, no Node, no interpreter that could read a project's `.env` or `bunfig.toml` when it starts (npm is only one way to install it). It talks to models through [OpenRouter](https://openrouter.ai) (hundreds of cloud models with one API key) or [Ollama](https://ollama.com) (models running on your own machine).
 
-```sh
-grep -rn 'todo!("port' crates | wc -l
-```
+![Marv's welcome screen in the terminal](docs/images/screenshot.png)
 
-## Read first
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): crates, runtime shape, conventions.
-- [docs/SECURITY.md](docs/SECURITY.md): the sandbox, protected paths, provenance and taint. These are requirements from day one.
-- [docs/MESH.md](docs/MESH.md): plugs, receptacles and the switchboard.
-- [docs/PORTING.md](docs/PORTING.md): every Marv TypeScript file and its Rust home, plus the build order.
-- [AGENTS.md](AGENTS.md): how to work in this repo, for people and agents.
+## Features
 
-## Build
+- **An agent loop with tools.** It can read, search (`glob`, `grep`), edit, write, and run shell commands. The model decides which tools to use; Marv runs them and reports back. Read-only calls in a row run in parallel.
+- **Safe yolo mode (on by default).** Sandboxed commands and edits inside the project run without asking; anything the sandbox can't contain (network access, git commits and other repository changes, `.git` itself, protected files like `.envrc` or `AGENTS.md`, memory) still shows you a colored diff or the exact command first: yes, yes for the rest of the session, or no (which stops Marv so you can redirect it). `/yolo off` asks for every change.
+- **Sandboxed commands.** Commands run in [bubblewrap](https://github.com/containers/bubblewrap): only the project folder is writable, your home folder (keys, SSH, Marv's own config) is hidden, there's no network unless a command asks for it, and API keys never reach the command.
+- **Guarded against prompt injection.** Once a web page, an MCP result or a message from another agent is in the conversation, anything that could send data out asks you, even in yolo and even after "don't ask again". Text from outside is shown to the model as data, never in Marv's voice. See [Safety model](#safety-model).
+- **Dev servers you can open.** A command's processes end with it, and its `localhost` isn't yours, so Marv starts servers and watchers with its `process` tool instead: each keeps running in its own sandbox (same rules: only the project writable, no network unless asked) across turns until it's stopped or Marv exits, and the ports it listens on are forwarded to your `127.0.0.1`, so `http://localhost:5173` just works. You're asked before each start; `/processes` lists them, `/processes stop <name>` stops one, and the status bar shows how many run.
+- **Any model.** OpenRouter or a local Ollama model, with a searchable model picker showing prices. Switch with `/model`.
+- **MCP servers.** Connect any [Model Context Protocol](https://modelcontextprotocol.io) server, local or remote, in `~/.marv/mcp.json` or `.mcp.json` (Claude Code's format). Its tools join Marv's; calls ask first unless the server marks a tool read-only, since servers run outside the sandbox. With many tools connected, the model sees only their names and loads a tool's parameters when it needs one, so they don't cost thousands of tokens on every request. See [MCP servers](#mcp-servers) for what 0.4.0 can't do yet.
+- **Skills.** Drop a `SKILL.md` into `.marv/skills/` (or `~/.marv/skills/`) and Marv loads it when a task matches, or run it yourself with `/<skill-name>`.
+- **GitHub with your `gh` login.** If you use the GitHub CLI, Marv runs it for you, outside the sandbox: reading PRs, CI runs and issues just works, anything that changes GitHub asks first, and `gh auth` and friends never run. See [Connect GitHub](#connect-github).
+- **Subagents.** Marv can hand a task to a fresh agent with its own context, which reports back when it's done, so the files it read don't fill up the conversation. Several can run in parallel, each in its own git worktree if they change files. Click one to watch its own transcript live. Agent types are Markdown files, compatible with Claude Code's.
+- **The mesh.** Sandboxed agents can talk to each other, to other Marvs on your machine, to agents in [Herdr](https://herdr.dev) panes, and to Claude Code or opencode, over wires you approve. Nothing is wired by default. See [The mesh](#the-mesh-talking-to-other-agents).
+- **Memory.** Marv remembers your preferences and project facts across sessions. Every change it makes to its memory needs your approval.
+- **Sessions.** Every conversation is saved; `marv -c` continues the last one, `/resume` picks an earlier one.
+- **Long conversations.** When the context window fills up, Marv summarizes the conversation and carries on (`/compact` does it on demand). Requests reuse the provider's prompt cache wherever possible.
+- **Trajectories and feedback.** Every turn is logged step by step (requests, replies, tool calls, subagents, timings, tokens) to `~/.marv/trajectories/`, with your ratings: `/good`, `/bad`, `/label`, and what your next message implies ("thanks, perfect" or "that's wrong").
+- **Type errors caught early.** After Marv changes files in a TypeScript project, it runs the project's own typecheck in the sandbox and tells the model about errors the change added, even in files it didn't touch (a project here means a `tsconfig.json` in the folder Marv starts in plus the project's own `typescript` or tsgo in that folder's `node_modules`; a global tsc isn't used), so it fixes broken callers before saying it's done. `/diagnostics off` turns it off.
+- **Your project's rules, as checks.** Rules from your instructions ("imports use `.ts` extensions", "never call X outside Y") can live in `.marv/checks/` as code: after a step that changed files, Marv runs the checks those files concern, in the sandbox, and tells the model only the violations its change added, with the reason. See [Checks](#checks).
+- **A plan for long tasks.** For a task with several steps (or a request with several asks in one paragraph), the model writes a checklist with its `plan` tool and ticks it off as it works. Marv pins it above the prompt (`Plan 2/5`, the current item highlighted) until every item is done, saves it with the session, and hands it back to the model after the conversation is compacted.
+- **Undo a turn.** Before a turn's first change Marv snapshots the project's files, and `/undo` shows what that turn changed (each file's diff) and, on a yes, puts those files back: edits, new files and deleted ones, whether a tool or a `bash` command made them. Your branch, index and stash are never touched. See [Undo](#undo).
+- **No dead stops.** After 25 steps without finishing, Marv asks whether to keep going instead of giving up. Raise the interval with `/steps 40` (or `maxSteps` in the config), or turn the asking off with `/steps off` (subagents still stop at their own 50).
+- **Cost tracking.** OpenRouter's actual charge per request, plus context and cache use, in the status bar; `/cost` for the breakdown.
+- **Herdr aware.** Run Marv in a [Herdr](https://herdr.dev) pane and Herdr's sidebar shows whether it's working, waiting for your approval, or done, with nothing to set up.
+- **A comfortable, light TUI.** Streaming Markdown replies revealed at an even pace, a live preview of the model's reasoning, mouse-wheel scrolling, drag-to-copy with auto-scroll, a `/` command menu, and Esc to interrupt. It uses next to no CPU while idle.
 
-```sh
-cargo check
-cargo test
-cargo run -p marv-cli   # the `marv` binary (once ported)
-```
+## Requirements
 
-The toolchain is stable Rust (1.99+), installed with `mise use rust@stable`.
+- Linux on x86_64 or aarch64. **On Windows, use [WSL](https://learn.microsoft.com/windows/wsl/install)**: install Marv inside your WSL distribution (e.g. Ubuntu) and run `marv` there.
+- **No macOS build in 0.4.0.** The release has Linux binaries only, and the installer stops on macOS with a note.
+- `bubblewrap` (`bwrap`) for the command sandbox (e.g. `sudo apt install bubblewrap`). Without it Marv still works, but every command asks first and warns that it runs unsandboxed, and what needs the sandbox is off: the typecheck after edits, the project's checks and the `process` tool.
+- `git`, for `/undo` and for subagents' worktrees.
+- One of:
+  - an [OpenRouter API key](https://openrouter.ai/settings/keys), or
+  - [Ollama](https://ollama.com) running locally, with a model that supports tool calling (e.g. `ollama pull qwen3.5:9b`).
 
 ## Install
 
-A tagged release has static binaries for Linux x86_64 and aarch64 (no macOS build yet). The installer downloads the one for your machine, checks its SHA-256, and puts it at `~/.local/bin/marv`:
-
 ```sh
-curl -fsSL https://github.com/FlologixAI/marv-rs/releases/latest/download/install.sh | sh
-sh install.sh --prefix /opt/marv       # into /opt/marv/bin instead
-sh install.sh --version v0.1.0         # a given release
-sh install.sh --uninstall              # remove it, and move marv-ts back to marv
+npm install -g @flologixai/marv
 ```
 
-**TS Marv becomes `marv-ts`.** TS Marv's launcher is also called `marv`. If the installer finds a `marv` that isn't marv-rs in the same folder, it moves it to `marv-ts` and says so, so `marv-ts` still runs the TypeScript Marv. `--uninstall` moves it back. Running the installer again is safe: it replaces marv-rs and leaves `marv-ts` alone.
+npm installs the prebuilt binary for your machine (`@flologixai/marv-linux-x64` or `-arm64`, an optional dependency, so npm picks the one that fits; there's no postinstall script and no download at run time). The `marv` command it puts on your PATH is a small Node launcher that starts the binary. Installed 0.3.0 with `bun add -g`? Run `bun remove -g @flologixai/marv` first, so the old launcher doesn't shadow the new one.
 
-### From source
+Or, without npm, the installer from the GitHub release. It downloads the binary for your machine, checks its SHA-256 against the release's `SHA256SUMS`, and puts it at `~/.local/bin/marv`:
 
 ```sh
-cargo install --path crates/marv-cli --root ~/.local   # builds ~/.local/bin/marv
+curl -fsSL https://github.com/FlologixAI/marv/releases/latest/download/install.sh | sh
 ```
 
-**Caution:** `cargo install` overwrites `~/.local/bin/marv` without asking, which is TS Marv's launcher if you have one. Move it first (`mv ~/.local/bin/marv ~/.local/bin/marv-ts`), or build and let the installer do the switch:
+Download `install.sh` to pass it options:
 
 ```sh
+sh install.sh --prefix /opt/marv       # into /opt/marv/bin instead of ~/.local/bin
+sh install.sh --version v0.4.0         # a given release instead of the latest
+sh install.sh --from target/release/marv   # a binary you built yourself
+sh install.sh --uninstall              # remove it again
+```
+
+Nothing is replaced until the new binary has been downloaded and checked, so a failed download changes nothing, and running it again is safe. It tells you if the folder isn't on your PATH.
+
+Or from source (stable Rust 1.99 or newer):
+
+```sh
+git clone https://github.com/FlologixAI/marv.git
+cd marv
 cargo build --release -p marv-cli
-sh install.sh --from target/release/marv
+sh install.sh --from target/release/marv     # or: cargo install --path crates/marv-cli --root ~/.local
 ```
+
+Then start it in any project folder:
+
+```sh
+cd ~/some/project
+marv
+```
+
+The first run opens a short setup: pick OpenRouter or Ollama, pick a model, and (for OpenRouter) paste your key. Settings are saved to `~/.marv/config.json`, readable only by you. Run `/setup` to change them later.
+
+## Using Marv
+
+Type what you want in plain language, for example:
+
+```
+> how does the config loading work?
+> add a --verbose flag to the CLI and update the help text
+> run the tests and fix whatever fails
+```
+
+### Commands
+
+| Command | What it does |
+|---|---|
+| `/help` | Show available commands and shortcuts |
+| `/model` | Pick a model (`/model <id>` to set one directly) |
+| `/setup` | Change provider, model, or API key |
+| `/config` | Show the current configuration |
+| `/think` | Let thinking models reason before answering (`/think on`, `/think off`) |
+| `/skills` | List available skills; run one with `/<skill-name> <request>` |
+| `/agents` | List the subagent types Marv can start |
+| `/memory` | Show what Marv remembers |
+| `/remember` | Save a note to memory (`/remember <note>`, or `/remember project: <note>`) |
+| `/forget` | Remove a memory (`/forget <text from it>`) |
+| `/resume` | Pick up an earlier session in this project |
+| `/compact` | Summarize the conversation to free up context (`/compact <what to keep>`) |
+| `/cost` | Tokens used and cost so far |
+| `/sandbox` | Show or set the command sandbox (`/sandbox on`, `/sandbox off`) |
+| `/yolo` | Run what the sandbox contains without asking (`/yolo on`, `/yolo off`) |
+| `/processes` | List the background processes Marv started (dev servers, watchers); `/processes stop <name>` stops one |
+| `/good`, `/bad` | Rate the last turn, with an optional note (`/bad edited the wrong file`) |
+| `/label` | Tag the last turn (`/label refactor, tests`) |
+| `/mcp` | Show MCP servers and their tools (the subcommands aren't in 0.4.0 yet: see [MCP servers](#mcp-servers)) |
+| `/undo` | Show what the last turn changed and, on a yes, put those files back; again for the turn before ([Undo](#undo)) |
+| `/checkpoints` | Show or set the snapshots `/undo` needs (`/checkpoints on`, `/checkpoints off`) |
+| `/diagnostics` | Show or set the typecheck after edits (`/diagnostics on`, `/diagnostics off`) |
+| `/checks` | List the project's checks and their last result (`/checks on`, `/checks off`) |
+| `/steps` | Show or set the step limit (`/steps 40`, `/steps off` never asks) |
+| `/trajectories` | Show or set run logging (`/trajectories on`, `/trajectories off`) |
+| `/clear` | Start a fresh conversation (the old one stays saved) |
+| `/exit` | Quit |
+
+Type `/` to open the command menu: ↑/↓ to choose, Enter to run, Tab or → to complete.
+
+### Keys
+
+| Key | Action |
+|---|---|
+| Esc | Stop a reply or a running tool (in a subagent's view: go back) |
+| ctrl+c | Stop / clear the input / press twice to quit |
+| ctrl+o | Show or hide details: what subagents did, and whole diffs |
+| Click a subagent | Open its own transcript, live |
+| PgUp / PgDn, mouse wheel | Scroll the conversation |
+| Drag with the mouse | Select text; it's copied when you let go (drag past the edge to scroll) |
+| ↑ / ↓ | Previous inputs |
+
+### Command-line options
+
+```
+marv                 start an interactive session
+marv -c              continue the latest session in this folder (--continue)
+marv -r              pick an earlier session to resume (--resume)
+marv -m <model>      use a different model (--model)
+marv -p <prompt>     run one turn without the UI (see "Using Marv from scripts")
+marv mesh ls         list the Marvs on this machine you can wire to (see "The mesh")
+marv mesh wire …     ask for a wire between agents
+marv mesh plug …     plug another agent into a Marv over stdin/stdout
+marv --version       print the version (-v)
+marv --help          show the help
+```
+
+## Safety model
+
+Marv is built so that you stay in control of what changes on your machine:
+
+1. **Reading is free; what can't be contained needs approval.** Reading and searching files never asks. With yolo mode on (the default), commands that run in a working sandbox without network, and edits inside the project (but not in `.git` or a protected file), run without asking; everything else shows you exactly what will happen first: a command that wants the network or changes the git repository (it must say so with `git_write`), an edit to a protected file, any command when the sandbox is off or unavailable, and every memory change. With `/yolo off`, every edit and command asks. "Don't ask again" covers the rest of the session only: all file edits, or one exact command.
+2. **Protected files always ask.** Some files run code or instructions outside the sandbox later: `.git/` (any level) and the `core.hooksPath` folder (git runs hooks and config from them on your next commit), `.env*` and `.envrc` (your shell's loaders read them), `bunfig.toml`, `.mcp.json`, `AGENTS.md` and `CLAUDE.md` at any level, `.marv/`, `.vscode/` and `.idea/`, and the lifecycle `scripts` in `package.json`. A change to one asks every time, in yolo too, and "don't ask again" never covers it. Inside the sandbox they're read-only, and one a command creates is found and taken back. Paths are checked after following symlinks, so a link named `innocent.sh` pointing at `.envrc` counts as `.envrc`. What this can't protect: other files you later run yourself, like a script or a `Makefile`; review with `git diff` before running them.
+3. **Paths are confined to the project.** Tools refuse anything outside the folder Marv was started in, including through symlinks (dangling ones too). Skills' files are checked the same way.
+4. **Commands run in a sandbox.** The system is read-only, `/run` (where your desktop's sockets live) is empty, and the home folder is a stand-in: toolchains like `~/.bun`, `~/.cargo`, `~/.local/share/mise` and your git config are mounted read-only, with credential files inside them masked. The project folder is the only writable place, and there's no network unless the command asks for it, which the approval prompt shows. The environment starts empty, so API keys can't leak into commands.
+5. **Outside text is data, and it taints the session.** What a web page, an MCP server or another agent sends is fenced as data for the model, never in Marv's voice; so are project checks' and the typecheck's messages. Once any of it is in the conversation, every call that could send something out asks, in yolo too and whatever "don't ask again" you gave: a command with network, every MCP call (read-only ones too), a web page under a new address prefix, a message on a wire not yet approved. Subagents start tainted when their parent is, and never inherit its network, web or mesh approvals.
+6. **Nothing in the project configures Marv.** Marv's settings come from `~/.marv/` (or `MARV_CONFIG_DIR` from your real environment), never from a file in the project. No runtime starts with Marv, so nothing reads the project's `.env`, `bunfig.toml` or `node_modules` along the way. Text from the model never reaches your terminal raw: escape codes, control characters and bidi overrides are stripped first, in `marv -p`'s output too.
+7. **Memory changes are approved too.** Memory comes back in every future session, so an instruction planted by a malicious file and saved there would be a persistent prompt injection. You see every memory before it's saved.
+8. **MCP servers are trusted explicitly, and their calls ask.** A server is a program running with your permissions, outside the sandbox, so a project's `.mcp.json` servers start only once trusted, for that exact config and the project files its command runs (if either changes, it needs trusting again). Every call asks unless the server marks the tool read-only. Yolo mode never skips these. Local servers get no API keys from Marv's environment, only what their config gives them. Your own servers start in your home folder, not the project (so a package planted in the project can't stand in for one); use `${MARV_PROJECT_DIR}` in their arguments if they need the project path. A server's `instructions` are ignored.
+9. **Background processes ask first, and stay as contained as commands.** A server or watcher the `process` tool starts asks every time a new command starts (yolo too; "don't ask again" covers that exact command for the session). It runs in its own sandbox like a command: the project is the only writable place, `.git` is read-only, the home folder is hidden, and there's no network unless the start asked for it. Only the ports it listens on (1024 and up, at most 4) are forwarded, to your `127.0.0.1` only, never another interface; nothing on your machine is reachable from it. It stops on `/processes stop`, when Marv exits, and with Marv even if Marv is killed. Subagents can't start one.
+10. **One command outside the sandbox, only if you say so each time.** For what can't work in the sandbox (a system service, a tool under your hidden home folder), the model can ask to run one `bash` command on your machine, as you, with `sandbox: false`. The prompt says so in a warning line, it asks every time (yolo too, never "don't ask again"), and the command gets your environment minus Marv's keys and anything that looks like a secret. Only the TUI offers this: `marv -p` and subagents are refused before anything is asked.
+11. **Subagents ask like Marv does, or work in a worktree.** A subagent in the project folder asks before each change, and the prompt says which one is asking. One in its own git worktree is approved once when it starts; inside its sandboxed worktree its edits and commands then run without asking, except commands that want the network (and with the sandbox off, everything asks). It can't touch the repository's `.git` (it's read-only in the sandbox, so no commits, branch moves, hooks or config), and when it's done, Marv commits its changes to its branch, without running any of the repository's hooks. Its work comes back as a branch you (or Marv, with your approval) review and merge. Esc at an approval prompt declines everything waiting and stops the run.
+
+[`docs/SECURITY.md`](docs/SECURITY.md) has the full list of rules; each one has a test in `tests/guards/` that fails when its guard is removed.
+
+## Skills
+
+A skill is a folder with a `SKILL.md`:
+
+```markdown
+---
+name: release-notes
+description: How to write release notes for this project. Use when asked for release notes or a changelog.
+---
+
+1. Run `git log` since the last tag…
+2. Group the changes into Added / Changed / Fixed…
+```
+
+Put it in `.marv/skills/<name>/` (this project) or `~/.marv/skills/<name>/` (all projects). Only each skill's name and description go into the system prompt; Marv loads the full instructions when a request matches. A skill folder can also hold scripts and reference files. Write descriptions that name the task and when to use it: that's how the model decides.
+
+## MCP servers
+
+Servers go in `~/.marv/mcp.json` (yours, every project) or the project's `.mcp.json`, in Claude Code's format:
+
+```json
+{ "mcpServers": {
+  "filesystem": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "${MARV_PROJECT_DIR}"] },
+  "example": { "type": "http", "url": "https://mcp.example.com/mcp", "headers": { "Authorization": "Bearer ${EXAMPLE_TOKEN}" } }
+} }
+```
+
+- `${VAR}` and `${VAR:-default}` read your environment, so tokens stay out of the file. `/mcp` shows each server as written, with the variables it reads, never their values.
+- Local servers (stdio) and remote ones (Streamable HTTP) both work. An optional `timeout` sets the seconds per call (default 120). The old `sse` transport isn't supported.
+- Servers start in the background when Marv does, and the first request waits for them. Restart Marv after editing a config.
+- A project server can't take the name of one of yours, and starts only once it's trusted (see [Safety model](#safety-model)).
+- With many tools connected (specs that would cost more than 4,000 tokens per request, or 10% of the context window if that is less), the model gets their names and two tools to look one up and call it. `"mcpTools": "eager"` in `~/.marv/config.json` sends every spec with every request instead, `"deferred"` always sends names only.
+
+**Not in 0.4.0 yet.** `/mcp add`, `/mcp search`, `/mcp remove`, `/mcp trust`, `/mcp login` and `/mcp logout` answer that they aren't available. Until they are:
+- put servers in `~/.marv/mcp.json` by hand: yours start without a trust step;
+- a project's `.mcp.json` servers stay "not trusted yet", and trust given by Marv 0.3.0 doesn't carry over (the trust key changed);
+- a remote server that wants an OAuth login, rather than a token in `headers`, shows as `needs login`; give it a token header instead.
+
+## Connect GitHub
+
+**If you use `gh`, there's nothing to do.** When the [GitHub CLI](https://cli.github.com/) is installed and logged in (`gh auth status`), Marv offers the model a `github` tool that runs `gh` for it, outside the sandbox, with your own login. Ask "check the current project" and it reads the open PRs, the failing CI run and the issues without a prompt. The rules:
+
+- **Reads run at once:** `pr list|view|checks|diff|status`, `issue list|view|status`, `run list|view` (`--log-failed` too), `workflow list|view`, `repo view`, `release list|view`, `label list`, `search …`, `status`, and `gh api` GET requests.
+- **Changes ask first**, since other people see them: commenting, creating, editing, closing, reopening, merging or reviewing PRs and issues, releases, re-running or cancelling runs, `workflow run`, `label create`, and `gh api` with fields, another method or `graphql`. A merge or close names the repository. "Don't ask again" works per command (`gh pr comment`). `gh api` reads of secrets, variables, keys, webhooks, installations, invitations and your emails ask every time.
+- **Never run:** `gh auth`, `config`, `extension`, aliases (any unknown command), `secret`, `variable`, `ssh-key`, `gpg-key`, `codespace`, `gist`, `--web`, downloads, `gh api --input` and `--verbose`, and `pr checkout`/`repo clone` (they'd run git outside the sandbox, with hooks a command may have written; the model checks out a PR with an approved `git fetch` instead). Nothing reaches a GitHub host the project doesn't name: `-R`, `--hostname` and URLs must point at the host of the project's `origin` (`github.com` outside a repository), which is all GitHub Enterprise needs.
+- `gh` gets your environment minus Marv's own keys and anything secret-looking (its own `GH_TOKEN`/`GITHUB_TOKEN` kept), never prompts, and is spawned without a shell. Tokens in its output (`ghp_…`, `github_pat_…`) are replaced with `[redacted token]` before the model, the transcript or a log sees them.
+- Subagents can read with it, not write. In `marv -p`, reads run and changes need `--approve github`.
+- `MARV_GITHUB=off` hides the tool (to use the MCP server below instead). Marv checks for `gh` once at startup, so log in before you start it.
+
+`gh` typed into a bash command still fails, on purpose: the sandbox has no network, hides `~/.config/gh` and starts with an empty environment, so a token can't be printed into output that goes to the model provider. Don't "fix" that by mounting gh's config into the sandbox; the `github` tool is the way.
+
+**Without `gh`**, or for a fine-grained token limited to a few repositories, connect GitHub's official MCP server ([github/github-mcp-server](https://github.com/github/github-mcp-server)). It runs outside the sandbox with its own token, so the model never sees the token, read-only tools run without asking, and anything that changes something (a comment, a merge, a push) shows you an approval prompt first. (A `web_fetch` of a public GitHub page works without any setup; it just can't authenticate or act.)
+
+1. Create a **fine-grained** personal access token ([github.com/settings/personal-access-tokens/new](https://github.com/settings/personal-access-tokens/new)): "Public repositories" or selected repositories only, with repository permissions `contents: read`, `issues: read`, `pull requests: read`, and `metadata: read` (selected automatically). Add the write permissions you want Marv to be able to use, e.g. `issues: write` and `pull requests: write`; every write still asks you first. Don't reuse the token the `gh` CLI uses: a fine-grained token on a few repos limits the blast radius if something goes wrong.
+2. Export it as `MARV_GITHUB_TOKEN` in your shell (e.g. in `~/.profile`), so it never lands in a file.
+3. Write the server to `~/.marv/mcp.json`:
+
+```json
+{ "mcpServers": { "github": {
+  "command": "docker",
+  "args": ["run", "-i", "--rm", "-e", "GITHUB_PERSONAL_ACCESS_TOKEN", "-e", "GITHUB_TOOLSETS", "ghcr.io/github/github-mcp-server"],
+  "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "${MARV_GITHUB_TOKEN}", "GITHUB_TOOLSETS": "default" }
+} } }
+```
+
+   Needs [Docker](https://docs.docker.com/get-started/get-docker/); without it, [build the server from source](https://github.com/github/github-mcp-server?tab=readme-ov-file#build-from-source) and point `command`/`args` at the binary (`["<path>", "stdio"]`). `GITHUB_TOOLSETS` picks the tool groups (`default` is `context`, `repos`, `issues`, `pull_requests`, `users`; add `,actions` for CI). To run it strictly read-only, add `"GITHUB_READ_ONLY": "1"` to `env` (and `-e GITHUB_READ_ONLY` to `args`): then merging or commenting is impossible rather than merely approved.
+
+4. Restart Marv and check `/mcp`: the server should be listed with its tools. Try "list the open PRs in owner/repo" (no prompt: read-only), then "comment on PR 7" (asks first).
+
+## Agents
+
+An agent type is a Markdown file, in the same format as Claude Code's agent files:
+
+```markdown
+---
+name: code-reviewer
+description: Reviews a change for bugs and missing tests. Use after implementing a task, before merging it.
+tools: read_file, grep, glob, bash   # optional; Claude Code names (Read, Grep, Edit…) work too
+model: inherit                       # optional; or a model id on the same provider
+---
+
+You are a careful code reviewer. Read the diff, then the code around it…
+```
+
+Put it in `.marv/agents/<name>.md` (this project) or `~/.marv/agents/<name>.md` (all projects); there's also a built-in `general-purpose` agent with every tool. A subagent starts with a fresh conversation that holds only the task it was given, and never gets the `agent`, `memory` or `plan` tools. Only names and descriptions go into the system prompt, so write descriptions that say when to use the agent. A reference like `superpowers:code-reviewer` finds `code-reviewer`, so skills written for Claude Code work unchanged. `/agents` lists what loaded, and why any file didn't.
+
+## Checks
+
+A check is one rule of your project, in `.marv/checks/`, one file per rule. A simple rule is declarative (YAML or JSON):
+
+```yaml
+# .marv/checks/imports.yaml
+glob: ["src/**/*.{ts,tsx}"]      # the files it reads; it runs after a step that changed one of them
+exclude: src/generated/**        # optional
+forbid: 'from\s+["''](\.{1,2}/[^"'']*?)(?<!\.tsx?)["'']'   # or require: a pattern each file must contain
+flags: m                         # optional: i, m, s, u
+message: relative import without its .ts extension
+why: Bun runs the sources as they are, so an import without its extension fails at run time.
+```
+
+A rule that needs code is a script, `.marv/checks/<name>.ts`, run with the project's `bun` (it must be on the PATH the sandbox sees) from the project's root. Its first comments say which changes concern it (`// glob: src/**/*.ts`; without one it runs after any change), and it prints one JSON line per violation, `{"file": "src/a.ts", "line": 3, "message": "…", "why": "…"}`, then exits 0 (any other exit is reported as the check failing).
+
+After a step that changed files, Marv runs the checks whose glob matches one of them and tells the model only what's new since the turn began (matched by check, file and message, not line), with each check's `why`. Checks are code from the repository, so like the typecheck they run only in the sandbox, with the project read-only and no network, never ask for approval, and don't run at all without the sandbox. `/checks` lists them, what couldn't be loaded, and the last result; `/checks off` (config `checks`) turns them off.
+
+## Undo
+
+Every turn that changes files gets two snapshots: one just before its first change (any `edit_file`, `write_file` or `bash` command, a subagent's in the shared folder too) and one when the turn ends, however it ends. They're git commits written through a temporary index, so your index, `HEAD`, branches and stash stay exactly as they were. In a repository they're kept under a hidden ref, `refs/marv/checkpoints/<session>`, which `git branch`, `git status`, `git push` and `git fetch` don't show (`git log --all` and `git push --mirror` do); outside a repository, in a git folder of Marv's own under `~/.marv/checkpoints/` (up to 20,000 files and 200 MB of new content; past that, checkpoints are off for that project for the session).
+
+`/undo` takes the newest turn not yet undone and shows each file it changed with its diff: restored, deleted (the turn created it) or recreated (the turn deleted it). Files you edited since the turn ended are marked; they're restored too. Nothing is written before you say yes. Before writing, Marv takes one more snapshot, so an undo can itself be undone by hand (`git checkout <sha> -- file`, the sha from `git log refs/marv/checkpoints/<session>`). `/undo` again goes one more turn back. The conversation isn't rewound: the model is told what was undone at the start of your next message.
+
+What `/undo` can't put back: files git ignores (`.env`, `node_modules/`, build output; they're listed as "not restored"), anything outside the project folder, and anything a command did outside files (a database, a server, a push). Changes you make yourself while a turn runs count as that turn's. A repository's clean filters (git-lfs) run when Marv snapshots, as they do on your `git status`. At a session's first turn, refs older than 14 days beyond the 20 newest sessions are deleted; git's own gc collects their objects later. `/checkpoints off` (config `checkpoints`) turns it all off.
+
+## The mesh: talking to other agents
+
+Marv's agents are sandboxed: no network, and every process ends with its command. So two agents can't talk to each other, or to your other tools, unless you wire them. The mesh is how: each Marv runs a **switchboard** outside every sandbox, agents reach it through a **plug** (a Unix socket mounted into their sandbox, so it works with no network), and services they can reach are **receptacles**, such as another agent's inbox. Nothing is live until it's wired.
+
+- **Nothing is wired by default.** A wire is a grant from one plug to one receptacle, in one mode (`send` into an inbox, or `call` for an answer). The first time an agent uses a receptacle, Marv asks you to approve the wire. Yolo never wires anything, and an agent can't wire itself.
+- **Mesh text is data.** A message reaches the model fenced as a message from another agent, not as instructions, and it taints the session (see [Safety model](#safety-model)). Every message is logged to the trajectory (sender, receptacle, size; never the body), and each wire has size and rate limits.
+- **Subagents** get a plug with no wires. The model has three tools: `mesh_list` (what this agent can reach), `mesh_send` and `mesh_call`.
+
+**Several Marvs on one machine.** Every interactive Marv is on the mesh (when `XDG_RUNTIME_DIR` is set), and says its name at startup: `MARV_MESH_NAME` if you set it, else the project folder's name plus four hex digits. Its door is a socket in `$XDG_RUNTIME_DIR/marv/mesh/`, private to you.
+
+```sh
+MARV_MESH_NAME=api marv          # in one pane
+MARV_MESH_NAME=web marv          # in another
+marv mesh ls                     # in a third: the live Marvs, and in Herdr the agent panes they can reach
+marv mesh wire 'api -> web:inbox'
+```
+
+`marv mesh wire` asks; it doesn't approve. A wire to another Marv is approved on **both** ends: `api` asks you first, then `web` does. After that, tell `api` "tell peer.web.agent.parent.inbox that the API is ready", and `web` reads it at its next turn, as a message from `peer-api`. (Or skip `marv mesh wire` and just ask: the same two approvals come up when the agent first sends.)
+
+**Herdr panes.** In a [Herdr](https://herdr.dev) pane, a Marv also offers each Herdr agent pane as two receptacles: `herdr.pane.<pane>.status` (call: the pane's agent and its state) and `herdr.pane.<pane>.send` (types a prompt into that pane, only while its agent is idle or done, so it can never answer an approval there). `marv mesh ls` prints their names. Each pane is its own wire, so approving one approves typing into that pane only.
+
+**Claude Code, opencode and other MCP clients.** `marv mesh plug <marv> [--as <name>]` is a stdio MCP server: add it to the other agent's MCP config (command `marv`, args `["mesh", "plug", "web", "--as", "claude"]`), then wire it like any agent: `marv mesh wire 'web/claude -> web:inbox'`, approved in `web`. Its receptacles show up as MCP tools (`agent_parent_inbox`); restart the MCP server after wiring so the client lists the new tool.
+
+**In `marv -p`** the mesh is off unless you ask for it: `--approve mesh:<receptacle>` pre-approves wires to that receptacle (and nothing else), and `MARV_MESH_NAME` puts the run on the mesh under that name.
+
+Not yet: `watch` (subscribing to events), unwiring across processes (a wire to another Marv lasts until that Marv ends), a tmux adapter, and wires across machines. [`docs/MESH.md`](docs/MESH.md) has the design.
+
+## Files and settings
+
+| Path | Contents |
+|---|---|
+| `~/.marv/config.json` | Provider, model, API key and settings (mode 0600) |
+| `~/.marv/sessions/<project>/` | Saved conversations (private) |
+| `~/.marv/trajectories/<project>/` | Every turn, step by step, with your ratings (private) |
+| `~/.marv/memory/personal.md` | Personal memory, used in every project |
+| `~/.marv/memory/projects/<project>.md` | Memory for one project (never stored in the repo) |
+| `~/.marv/skills/` | Your personal skills |
+| `.marv/skills/` | The project's skills |
+| `~/.marv/agents/` | Your personal agent types |
+| `.marv/agents/` | The project's agent types |
+| `.marv/checks/` | The project's checks, run after the model's edits ([Checks](#checks)) |
+| `~/.marv/mcp.json`, `.mcp.json` | MCP servers: yours, and the project's (`{"mcpServers": {"name": {"command": …} or {"type": "http", "url": …}}}`) |
+| `~/.marv/mcp-trust.json` | Which project MCP servers you've trusted |
+| `~/.marv/mcp-tokens.json` | MCP logins: OAuth clients and tokens, private (0600) |
+| `~/.marv/checkpoints/<project>/` | `/undo`'s snapshots for a project that isn't a git repository (in a repository they're under `refs/marv/checkpoints/`) |
+| `~/.marv/worktrees/<project>/` | Subagents' worktrees while they run (removed when each finishes; its branch stays) |
+| `$XDG_RUNTIME_DIR/marv/` | The mesh's sockets and background processes' relays, while Marv runs |
+| `AGENTS.md` | Project instructions, read into the system prompt at startup |
+
+`~/.marv/config.json` also takes `sandbox`, `yolo`, `thinking`, `trajectories`, `diagnostics`, `checks`, `checkpoints` (each `true` or `false`), `maxSteps`, `mcpTools` (`auto`, `deferred` or `eager`), `contextLength` (Ollama) and `baseUrl` (e.g. Ollama on another machine). The slash commands write most of them for you.
+
+| Environment variable | Effect |
+|---|---|
+| `OPENROUTER_API_KEY` | Overrides the saved OpenRouter key |
+| `MARV_MODEL` | Overrides the saved model |
+| `MARV_MAX_STEPS` | Overrides the saved step limit (`0` or `off` never asks; `/steps`) |
+| `OLLAMA_HOST` | Where Ollama runs (default `localhost:11434`) |
+| `MARV_CONFIG_DIR` | Use a different folder instead of `~/.marv` (read from the environment only, never from a project file) |
+| `MARV_GITHUB` | `off` hides the `github` tool |
+| `MARV_MESH_NAME` | This Marv's name on the mesh |
+| `GITHUB_TOKEN`, `GH_TOKEN` | Used by `web_fetch` for GitHub links (sent to GitHub's API only) |
+
+Ollama's context window defaults to 32k tokens (`contextLength` in the config file). That is large enough for an agent to read code, and fits in 12 GB of VRAM for 9-12B models. Marv never sets it past what the model was trained for (`/api/show`'s context length), so a model trained on 8k isn't run at 32k; the config value is only ever the upper bound.
+
+## Using Marv from scripts and other agents
+
+`marv -p "<prompt>"` (or `marv run <prompt>`) runs one non-interactive turn in the current folder and prints the reply to stdout. It loads the same project files and config the TUI does, so a worker started this way behaves like an interactive session.
+
+```sh
+# Print the model's reply as text (default)
+marv -p "add a test for the parser"
+
+# Same with the "run" alias
+marv run "add a test for the parser"
+
+# Get a JSON result with reply, reason, steps and usage
+marv -p "what is the git log?" --output json
+
+# Follow events as they happen (stream-json)
+marv -p "update the README" --output stream-json
+
+# Read the prompt from stdin
+echo "refactor this file" | marv -p -
+
+# Allow git writes and network commands without asking
+marv -p "install the npm package" --approve git_write --approve network
+
+# Continue the latest saved session
+marv -p "now fix the other one" -c
+
+# Use a different model
+marv -p "audit the dependencies" --model "anthropic/claude-sonnet-5.5"
+```
+
+**Exit codes:**
+- `0`: the model finished normally.
+- `1`: an error (bad config, the provider failed, a bad argument or an unknown `--approve` name).
+- `2`: the turn stopped before finishing: the step limit (`--max-steps`), the output limit, or a loop was detected.
+- `3`: an approval it couldn't get: a call was refused because no one could approve it (even if the turn then finished), a decline, or an interrupt.
+
+**Approvals.** With nobody to ask, what yolo mode allows (sandboxed commands without network, edits outside `.git` and protected files, read-only tools) runs; everything else is refused as an error the model can read and work around, and the JSON result lists what was refused. Pass `--approve <name>` to allow more: `git_write`, `network`, `web`, `mcp`, `files`, `memory`, `agent_worktree`, `process`, `github`, or `mesh:<receptacle>`. A command that needs both git and network (a `git push`) needs both named: `--approve git_write` alone never approves a command that also uses the network. `--approve process` lets the model start background processes (a server for its own tests; `--approve network` too for one that shares the network); they all stop when the run ends. A command outside the sandbox (`sandbox: false`) is always refused here, whatever you approve.
+
+**Options for `-p`:**
+
+| Flag | Effect |
+|---|---|
+| `-p <prompt>` or `-p -` (stdin) | The prompt (required; `marv run <prompt>` is an alias, and `marv run` alone reads stdin) |
+| `--output text` | Print the final reply as text (default) |
+| `--output json` | Print a JSON object with `reply`, `reason`, `steps`, `usage` (and `refused`, when calls were) |
+| `--output stream-json` | Print a JSON line per event as it happens |
+| `--approve <name>` | Auto-approve calls in this scope (repeatable) |
+| `--max-steps <N>` | Steps before the turn stops (`0` never stops) |
+| `-m`, `--model <name>` | Use a different model |
+| `-c` / `--continue` | Continue the latest saved session |
+| `-v`, `--version`, `-h`, `--help` | Print version or help |
+
+### No more TypeScript SDK
+
+Marv 0.3.0 shipped its engine as a TypeScript library, `@flologixai/marv/sdk`. That's gone in 0.4.0: the npm package now holds only the `marv` command. Scripts and other agents drive Marv through `marv -p` (with `--output json` or `stream-json` for something to parse, above), or talk to a running Marv over [the mesh](#the-mesh-talking-to-other-agents).
+
+## Development
+
+```sh
+eval "$(mise env -s bash)"        # if cargo isn't on your PATH (mise)
+cargo run -p marv-cli             # run the TUI from source
+cargo run -p marv-cli -- -p "hi"  # or one headless turn
+cargo check --workspace --all-targets
+cargo test --workspace            # the test suite, guards included
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all --check
+```
+
+CI runs those last four on every pull request, with bubblewrap installed so the sandbox tests run rather than skip.
+
+- **The oracle** (`tests/oracle/`, the `marv-oracle` crate) proves Marv behaves as it did: 30 scenarios recorded from the TypeScript Marv, each replayed against a fake model server and compared with what Marv did then (files, tool calls, requests, exit code), plus a check that every request extends the one before it, so the prompt cache holds. No run reaches a real model. Build the binary, then check it: `cargo build -p marv-cli && cargo run -p marv-oracle -- check` (or name a few scenarios). [`tests/oracle/README.md`](tests/oracle/README.md) has the rest.
+- **The guard suite** (`tests/guards/`, `cargo test -p marv-guards`) has one test per rule in [`docs/SECURITY.md`](docs/SECURITY.md), with the real bubblewrap where it matters. Each was proven by removing its guard and watching it fail.
+- Try the UI without a model: `cargo run -p marv-tui --example martian` (the martian, q to quit) and `cargo run -p marv-tui --example fake_session` (the whole TUI on a scripted engine).
+
+Read first: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) (the crates and how they fit), [`docs/SECURITY.md`](docs/SECURITY.md) (the security rules), [`docs/MESH.md`](docs/MESH.md) (the mesh's design), and [`AGENTS.md`](AGENTS.md) (how to work in this repository, for people and agents). Each crate has its notes in `docs/subsystems/`.
+
+### Releasing
+
+1. Move `CHANGELOG.md`'s entries under the new version (patch for fixes, minor for features or anything breaking while below 1.0), and bump `version` under `[workspace.package]` in `Cargo.toml` to match (a version can only be published once).
+2. Tag and push: `git tag v0.4.0 && git push origin v0.4.0`. The release workflow (`.github/workflows/release.yml`) builds static musl binaries for x86_64 and aarch64, tests the installer and the npm packages against them, and creates the GitHub release with `marv-<target>.tar.gz`, `SHA256SUMS`, `install.sh` and the npm packages as `.tgz` files. Run it by hand (workflow_dispatch) for a dry run without the release.
+3. Publish the npm packages by hand (npm wants your 2FA), platform packages first, since the launcher names them:
+
+```sh
+gh release download v0.4.0 -p 'flologixai-marv-*.tgz' -D npm
+npm publish npm/flologixai-marv-linux-x64-0.4.0.tgz --access public
+npm publish npm/flologixai-marv-linux-arm64-0.4.0.tgz --access public
+npm publish npm/flologixai-marv-0.4.0.tgz --access public
+```
+
+`packaging/npm/build.sh` builds those packages from the release's tarballs, if you need them again.
+
+## License
+
+[MIT](LICENSE) © FlologixAI. "Marv" and the martian are FlologixAI's; forks are welcome under another name.

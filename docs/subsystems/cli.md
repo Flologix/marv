@@ -37,7 +37,7 @@ Spec: the startup bullet of Marv's `CLAUDE.md` ("`bin/marv` is the `bin` entryâ€
 - **`__relay <spec>`** (#24) calls `marv_tools::relay::main` before the runtime starts: the process door's relay, run inside a sandbox with this binary mounted at `/run/marv-bin`. Tested by `tests/relay.rs`. End to end (the real binary as its own relay, a scripted model starting a dev server, sandboxed bash curling it, the host reaching it, nothing left after exit): `tests/process_door.rs`.
 - **Background processes never outlive Marv (#24, Marv #51).** The TUI stops them on the way out (`stop_processes`: SIGTERM, then SIGKILL after 2 s; at most 2.5 s), `marv -p`'s `session.close()` does too, and `main` SIGKILLs whatever is left when it ends, a panic included (`StopProcesses`, a drop guard around the runtime, calling `marv_session::processes::kill_running`). If Marv is killed harder, bwrap's `--die-with-parent` takes them.
 - **`--approve process`** (#24) approves starting a background process (scope `process:`); one with `network: true` (`process:net:`) needs `network` too, as Marv's `buildApprover`.
-- **`__html-convert`** calls `marv_tools::web::html_convert_cli::main()`, which is still todo in marv-tools.
+- **`__html-convert`** calls `marv_tools::web::html_convert_cli::main()` (the web reader's converter, run as its own process).
 
 ## Release and install (#19)
 
