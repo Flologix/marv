@@ -83,8 +83,8 @@ use marv_session::{
 };
 use marv_tui::app::{App, AppOptions};
 use marv_tui::view::{
-    self, ApprovalId, CommandInfo, Notice, NoticeItem, NoticeTone, ProviderId, Role, SessionPort, SetupAnswer, SetupContext,
-    SetupStart, StatusInfo, UiEvent, WelcomeInfo,
+    self, ApprovalId, CommandInfo, CommandKind, Notice, NoticeItem, NoticeTone, ProviderId, Role, SessionPort, SettingAction,
+    SettingInfo, SetupAnswer, SetupContext, SetupStart, StatusInfo, UiEvent, WelcomeInfo,
 };
 use serde_json::Value;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
@@ -1762,26 +1762,48 @@ impl Bridge {
     }
 }
 
+/// The palette's settings (#44) from the settings table, with their values in `config`.
+pub fn setting_infos(config: &Config) -> Vec<SettingInfo> {
+    commands::settings()
+        .iter()
+        .map(|s| SettingInfo {
+            name: s.name.into(),
+            value: s.value(config),
+            description: s.description().into(),
+            action: match s.choice(config) {
+                commands::SettingChoice::Run(line) => SettingAction::Run(line),
+                commands::SettingChoice::Prefill(text) => SettingAction::Prefill(text),
+            },
+            while_busy: s.while_busy(),
+        })
+        .collect()
+}
+
 /// The handle the App holds: every method returns at once; results come back as events.
 pub struct Port(pub Arc<Bridge>);
 
 impl SessionPort for Port {
     fn commands(&self) -> Vec<CommandInfo> {
         let b = &self.0;
+        // The `/` menu and the ctrl+k palette are both built from this list (#44).
         let mut menu: Vec<CommandInfo> = commands::commands()
             .iter()
-            .map(|c| CommandInfo { name: c.name.into(), description: c.description.into() })
-            .chain(b.skills.iter().map(|s| CommandInfo { name: s.skill.name.clone(), description: s.skill.description.clone() }))
+            .map(|c| CommandInfo { while_busy: c.while_busy, ..CommandInfo::new(c.name, c.description) })
+            .chain(b.skills.iter().map(|s| CommandInfo {
+                kind: CommandKind::Skill,
+                ..CommandInfo::new(s.skill.name.clone(), s.skill.description.clone())
+            }))
             .collect();
         // Server names after "/mcp login " and "/mcp logout ".
         for name in b.mcp.as_ref().map(|m| m.loginable()).unwrap_or_default() {
-            menu.push(CommandInfo {
-                name: format!("mcp login {name}"),
-                description: format!("Log in to {name} (OAuth, in your browser)"),
-            });
-            menu.push(CommandInfo { name: format!("mcp logout {name}"), description: format!("Forget {name}'s login") });
+            menu.push(CommandInfo::new(format!("mcp login {name}"), format!("Log in to {name} (OAuth, in your browser)")));
+            menu.push(CommandInfo::new(format!("mcp logout {name}"), format!("Forget {name}'s login")));
         }
         menu
+    }
+
+    fn settings(&self) -> Vec<SettingInfo> {
+        setting_infos(&self.0.config())
     }
 
     fn send(&self, text: String) {
@@ -1803,6 +1825,10 @@ impl SessionPort for Port {
         if let Some(work) = self.0.busy_work.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
             work.cancel();
         }
+    }
+
+    fn is_login_callback(&self, text: &str) -> bool {
+        marv_mcp::oauth::is_callback(text)
     }
 
     fn login_callback(&self, text: &str) -> bool {
@@ -2528,6 +2554,37 @@ mod tests {
         assert!(matches!(next(&mut rx).await, UiEvent::Message(m) if m.is_error));
         port.run_command("/exit".into());
         assert_eq!(next(&mut rx).await, UiEvent::Exit);
+    }
+
+    // #44: the palette lists the settings with their values, and a toggle goes the way its slash command goes.
+    #[tokio::test]
+    async fn the_palettes_settings_show_their_values_and_a_toggle_is_saved_and_announced_like_its_command() {
+        let dirs = Dirs::new();
+        let (tx, mut rx) = unbounded_channel();
+        let bridge = Bridge::start(startup(&dirs, Some(asks()), vec![], None), tx).unwrap();
+        let port = Port(bridge.clone());
+        let setting = |name: &str| port.settings().into_iter().find(|s| s.name == name).unwrap();
+        let yolo = setting("Yolo");
+        assert_eq!((yolo.value.as_str(), &yolo.action, yolo.while_busy), ("off", &SettingAction::Run("/yolo on".into()), true));
+        assert_eq!(setting("Model").value, "qwen3.5:9b");
+        assert_eq!(setting("Model").action, SettingAction::Run("/model".into()));
+        assert_eq!(setting("Step limit").action, SettingAction::Prefill("/steps ".into()));
+
+        let SettingAction::Run(line) = yolo.action else { unreachable!() };
+        port.run_command(line);
+        let seen = until(&mut rx, |e| matches!(e, UiEvent::Message(_))).await;
+        assert!(seen.iter().any(|e| matches!(e, UiEvent::StatusInfo(s) if s.yolo)));
+        assert!(texts(&seen)[0].starts_with("Yolo on: file edits run without asking"));
+        assert_eq!(ConfigStore::new(&dirs.config).load().unwrap().unwrap().yolo, Some(true));
+        // Asked again when the palette next opens: the new value, and the flip back.
+        assert_eq!(setting("Yolo").value, "on");
+        assert_eq!(setting("Yolo").action, SettingAction::Run("/yolo off".into()));
+
+        // The menu's entries carry what the palette needs: built-ins with their busy rule.
+        let menu = port.commands();
+        let entry = |name: &str| menu.iter().find(|c| c.name == name).unwrap().clone();
+        assert!(entry("cost").while_busy && !entry("undo").while_busy);
+        assert_eq!(entry("cost").kind, CommandKind::Command);
     }
 
     #[tokio::test]

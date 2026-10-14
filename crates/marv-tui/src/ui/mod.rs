@@ -6,6 +6,7 @@
 
 pub mod agent_view;
 pub mod approval;
+pub mod command_palette;
 pub mod diff_view;
 pub mod markdown;
 pub mod martian;
