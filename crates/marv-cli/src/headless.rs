@@ -17,6 +17,8 @@
 //! one tools-off request to say what it finished, what's left and the next step; that is the reply, and the exit code
 //! is still 2. marv-rs: `--approve mesh:<receptacle>`
 //! pre-approves wires to that receptacle (docs/MESH.md); it never covers anything else, and yolo never wires.
+//! A mesh message never starts a turn here (`mesh.wake`, #78, is the TUI's): the one turn reads what's in the inbox
+//! when it starts and between steps, and anything later waits for whoever runs the next one.
 //!
 //! **Bug fix (Marv 0.3.0):** Marv's text output wrote the model's reply to the terminal raw, so a reply could carry
 //! escape sequences (OSC 52 clipboard writes, title changes, cursor moves) or bidi overrides. Text output and stderr
@@ -347,13 +349,18 @@ pub async fn run_headless(options: HeadlessOptions) -> ExitCode {
     // subagent doesn't inherit them, as the guards require), and its writable folders (#98) are bound read-write
     // into every sandbox. Both go on stderr with the rest of the startup notice (stdout stays the reply).
     let mut seed_problems = Vec::new();
-    let seeds = config.approve.iter().filter(|name| match marv_session::approvals::parse_approvals(std::slice::from_ref(name)) {
-        Ok(_) => true,
-        Err(problem) => {
-            seed_problems.push(problem);
-            false
-        }
-    }).cloned().collect::<Vec<_>>();
+    let seeds = config
+        .approve
+        .iter()
+        .filter(|name| match marv_session::approvals::parse_approvals(std::slice::from_ref(name)) {
+            Ok(_) => true,
+            Err(problem) => {
+                seed_problems.push(problem);
+                false
+            }
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     for problem in &seed_problems {
         eprintln!("{problem}");
     }
@@ -387,6 +394,7 @@ pub async fn run_headless(options: HeadlessOptions) -> ExitCode {
         &home,
         &root,
         std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from).as_deref(),
+        Some(&config_dir),
     );
     for problem in &writable_problems {
         eprintln!("{problem}");
@@ -399,6 +407,8 @@ pub async fn run_headless(options: HeadlessOptions) -> ExitCode {
         .sources(&[marv_session::sources::Source::User, marv_session::sources::Source::Project])
         .max_steps(options.max_steps.unwrap_or(config.max_steps))
         .yolo(config.yolo)
+        // Marv exits after the reply and stops its background processes (main.rs): the process tool says so (#86).
+        .one_shot(true)
         .persist(marv_session::sdk::Store::Default)
         .trajectories(if config.trajectories { marv_session::sdk::Store::Default } else { marv_session::sdk::Store::Off })
         .pre_approve(&seeds)
@@ -439,10 +449,17 @@ pub async fn run_headless(options: HeadlessOptions) -> ExitCode {
     if options.resume_latest {
         builder = builder.resume(marv_session::ResumeTarget::Latest);
     }
+    let user_config = ConfigStore::new(&config_dir).path;
     let o = &mut builder.options;
     (o.sandbox, o.thinking, o.diagnostics, o.checks, o.mcp_tools, o.config_dir) =
         (config.sandbox, config.thinking, config.diagnostics, config.checks, config.mcp_tools, Some(config_dir));
     o.checkpoints = config.checkpoints;
+    // Session-start hooks (#108): from the user's own config file only; a project's naming some is told, never run.
+    let refused;
+    (o.hooks, refused) = marv_session::hooks::session_start_hooks(&root, &user_config, file.as_ref());
+    if let Some(refused) = refused {
+        eprintln!("marv: {refused}");
+    }
     // To stderr, so stdout stays the reply: an MCP server that needs a login, a trajectory that can't be written.
     o.on_warning = Some(Arc::new(|text: String| eprintln!("marv: {}", printable(&text))));
     let session = match builder.build().await {
@@ -452,6 +469,11 @@ pub async fn run_headless(options: HeadlessOptions) -> ExitCode {
             return ExitCode::Error;
         }
     };
+    // The hooks (started by a resume already, else now) go with this prompt; one that failed is a line on stderr.
+    session.run_start_hooks();
+    for run in session.start_hooks_done().await.unwrap_or_default().iter().filter(|r| !r.ok()) {
+        eprintln!("marv: session-start hook {}", printable(&run.line()));
+    }
     // With -c the totals include the resumed conversation's: the turn's usage is what this turn added.
     let before = session.usage().totals;
     let code = match session.send(&options.prompt, marv_session::SendOptions::default()) {

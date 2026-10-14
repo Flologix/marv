@@ -30,7 +30,10 @@
 //!   run `Loop`. A step that answered resets the count.
 //! - **Tool loops**: a period-1/2 cycle of identical calls *with identical results*: the first
 //!   time every call is answered with [`tool_loop_note`] instead of running; the second time the
-//!   calls are answered and the run ends `Loop`.
+//!   calls are answered and the run ends `Loop`. marv-rs (#81): a bash command that already failed the same way
+//!   twice since the last change, whatever its tail, isn't run again ([`crate::repetition::FailureLoopState`]),
+//!   checked as each call is about to run, so an edit earlier in the same reply counts: the note the first time,
+//!   the run ends `Loop` (the step's remaining calls not run) the next.
 //! - **Empty replies** (no text, whitespace doesn't count, no calls; not failed, cut off or
 //!   cancelled): the first is asked for again unchanged (nothing enters the history, so the cache
 //!   holds; OpenRouter's upstream hosts sometimes bill for a reply and send nothing, a third of
@@ -86,7 +89,9 @@ use marv_core::{
 use marv_provider::{EventStream, Provider, StreamOptions};
 use tokio_util::sync::CancellationToken;
 
-use crate::repetition::{ToolCallKey, ToolLoopState, detect_text_repetition, make_tool_key, tool_loop_detected};
+use crate::repetition::{
+    FailureLoopState, ToolCallKey, ToolLoopState, detect_text_repetition, failing_command_note, make_tool_key, tool_loop_detected,
+};
 
 pub const DEFAULT_MAX_STEPS: u32 = 25;
 /// Subagents' own hard limit (Marv `SUBAGENT_MAX_STEPS`, in `src/subagent.ts`).
@@ -783,6 +788,11 @@ pub struct LoopState {
     /// (tool, normalized args) → hash of what it returned last time. A call repeated with the same
     /// result is a loop; one whose result changes each time (the next item from a queue) is new work.
     last_result: std::collections::HashMap<(String, String), u64>,
+    /// Bash commands failing the same way since the last edit (#81): another try is a loop, whatever its tail.
+    /// Checked as each call is about to run, after the calls before it in the reply were recorded.
+    failures: FailureLoopState,
+    /// A failing command was tried again after the warning: the step's remaining calls don't run, the run ends `Loop`.
+    failure_stop: bool,
     in_flight: InFlight,
 }
 
@@ -801,6 +811,8 @@ impl LoopState {
             text_loops: 0,
             tool_loop: ToolLoopState::default(),
             last_result: Default::default(),
+            failures: FailureLoopState::default(),
+            failure_stop: false,
             in_flight: InFlight::default(),
         }
     }
@@ -845,6 +857,7 @@ impl LoopState {
     fn answer(&mut self, call: &ToolCall, text: &str) {
         self.push_result(call, text);
         self.last_result.insert(Self::call_key(call), result_hash(text));
+        self.failures.record(&call.name, &call.arguments, text);
         self.in_flight.answered += 1;
     }
 
@@ -1137,6 +1150,8 @@ impl LoopState {
             Some(not_run::ABORTED)
         } else if tools.declined {
             Some(not_run::DECLINED)
+        } else if self.failure_stop {
+            Some(not_run::CUT_OFF)
         } else {
             None
         };
@@ -1165,9 +1180,20 @@ impl LoopState {
         // user quit) never sees a tool run that it can't show or stop.
         if let Some(k) = group.announced.take() {
             let call = self.in_flight.calls[group.range.start + k].clone();
-            let runner = self.options.runner.clone();
-            let cancel = self.options.cancel.clone();
-            group.running.push(Box::pin(async move { (k, runner.run(call, cancel).await) }));
+            // #81: a command that keeps failing the same way isn't run again: the note the first time, the end of
+            // the run the next (the tool-loop guard's `warned`).
+            if let Some((count, shown)) = self.failures.repeated(&call.name, &call.arguments) {
+                let continued = !self.tool_loop.warned;
+                self.tool_loop.warned = true;
+                self.failure_stop |= !continued;
+                self.emit(LoopEvent::ToolLoop { continued });
+                let run = not_run_record(&call, &failing_command_note(count, &shown));
+                group.running.push(Box::pin(async move { (k, Ok(run)) }));
+            } else {
+                let runner = self.options.runner.clone();
+                let cancel = self.options.cancel.clone();
+                group.running.push(Box::pin(async move { (k, runner.run(call, cancel).await) }));
+            }
             // Polled once right away, so whatever the tool does first (asking for approval, say)
             // happens before the next call is considered.
             if let Some(Some((k, result))) = group.running.next().now_or_never() {
@@ -1261,6 +1287,8 @@ impl LoopState {
         } else if tools.declined {
             // The user said no: stop here and let them say what to do instead.
             self.finish(StopReason::Declined);
+        } else if self.failure_stop {
+            self.finish(StopReason::Loop);
         } else {
             self.phase = Phase::Full(std::mem::take(&mut tools.runs));
         }
@@ -3123,6 +3151,97 @@ mod tests {
         // The write_file reset, so 4 and 5 are fresh: history stays too short to trigger.
         assert!(tool_loops(&events).is_empty());
         assert_eq!(end(&events), Some(StopReason::End));
+    }
+
+    // Issue #81: a clone that can't work without network, re-sent with another tail each time.
+    fn bash_call(id: &str, command: &str) -> ToolCall {
+        ToolCall { id: id.into(), name: "bash".into(), arguments: serde_json::json!({ "command": command }).to_string() }
+    }
+    /// Every bash command fails like a clone without network, counting how many ran.
+    fn offline(ran: Arc<AtomicUsize>) -> FakeRunner {
+        let run: RunFn = Arc::new(move |c, _| {
+            ran.fetch_add(1, Ordering::SeqCst);
+            let out = "fatal: unable to access 'https://github.com/x/y/': Could not resolve host: github.com\n\n[exit code 128]";
+            Box::pin(async move { Ok(ok(out, c.id.clone())) })
+        });
+        FakeRunner { run, parallel: |_| false }
+    }
+    const CLONE: &str = "git clone https://github.com/x/y";
+
+    #[tokio::test]
+    async fn a_command_failing_the_same_way_with_another_tail_each_time_warns_then_stops() {
+        let tails = ["2>&1 | tail -2", "&& du -sh y", "|| true", "&& command -v tokei", "; ls"];
+        let mut script: Vec<_> =
+            tails.iter().enumerate().map(|(i, t)| use_tools(&[bash_call(&format!("c{i}"), &format!("{CLONE} {t}"))])).collect();
+        // A probe in between doesn't hide it.
+        script.insert(1, use_tools(&[bash_call("p", "echo test")]));
+        let ran = Arc::new(AtomicUsize::new(0));
+        let history = history(vec![user("go")]);
+        let events = collect(options(Arc::new(ScriptedProvider::new(script)), &history, offline(ran.clone()))).await;
+        assert_eq!(tool_loops(&events), [true, false]);
+        assert_eq!(end(&events), Some(StopReason::Loop));
+        // The two clones and the probe ran; the third clone got the note, the fourth stopped the run.
+        assert_eq!(ran.load(Ordering::SeqCst), 3);
+        let turns = history.lock().unwrap();
+        let noted = turns.iter().any(|t| {
+            matches!(t, ChatTurn::Tool { text, .. } if text.starts_with("Marv: not run. This command already failed 2 times"))
+        });
+        assert!(noted, "{turns:?}");
+    }
+
+    // Greptile on #111: each call is checked when it's about to run, after the calls before it in the reply.
+    #[tokio::test]
+    async fn an_edit_earlier_in_the_same_reply_resets_the_failures_before_the_retry_runs() {
+        let edit = ToolCall {
+            id: "e".into(),
+            name: "edit_file".into(),
+            arguments: serde_json::json!({"path": "a.rs", "old": "x", "new": "y"}).to_string(),
+        };
+        let script = vec![
+            use_tools(&[bash_call("c1", "cargo test")]),
+            use_tools(&[bash_call("c2", "cargo test")]),
+            use_tools(&[edit, bash_call("c3", "cargo test")]),
+            say("Done."),
+        ];
+        let (bash_runs, edits) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (b, e) = (bash_runs.clone(), edits.clone());
+        let run: RunFn = Arc::new(move |c, _| {
+            let out = if c.name == "bash" {
+                b.fetch_add(1, Ordering::SeqCst);
+                "error[E0308]: mismatched types\n\n[exit code 101]"
+            } else {
+                e.fetch_add(1, Ordering::SeqCst);
+                "Edited a.rs"
+            };
+            Box::pin(async move { Ok(ok(out, c.id.clone())) })
+        });
+        let runner = FakeRunner { run, parallel: |_| false };
+        let events = collect(options(Arc::new(ScriptedProvider::new(script)), &history(vec![user("go")]), runner)).await;
+        assert!(tool_loops(&events).is_empty());
+        assert_eq!((edits.load(Ordering::SeqCst), bash_runs.load(Ordering::SeqCst)), (1, 3));
+        assert_eq!(end(&events), Some(StopReason::End));
+    }
+
+    #[tokio::test]
+    async fn re_running_a_failing_command_after_an_edit_isnt_a_loop() {
+        let write = ToolCall {
+            id: "w".into(),
+            name: "write_file".into(),
+            arguments: serde_json::json!({"path": "a.rs", "content": "fixed"}).to_string(),
+        };
+        let script = vec![
+            use_tools(&[bash_call("c1", CLONE)]),
+            use_tools(&[bash_call("c2", CLONE)]),
+            use_tools(&[write]),
+            use_tools(&[bash_call("c3", CLONE)]),
+            say("Done."),
+        ];
+        let ran = Arc::new(AtomicUsize::new(0));
+        let events =
+            collect(options(Arc::new(ScriptedProvider::new(script)), &history(vec![user("go")]), offline(ran.clone()))).await;
+        assert!(tool_loops(&events).is_empty());
+        assert_eq!(end(&events), Some(StopReason::End));
+        assert_eq!(ran.load(Ordering::SeqCst), 4);
     }
 
     #[tokio::test]

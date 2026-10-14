@@ -77,8 +77,12 @@ pub struct PromptDoors {
 const BASE_TOOLS_TEXT: &str = "Look at the actual code before answering questions about it, and don't guess what a file contains. Start narrow: grep for a name or glob for a file pattern, then read the relevant part of a file rather than whole large files. Paths are relative to the project root.";
 
 // One constant sentence, in the tools paragraph only when the plan tool is offered (#15): fixed per session, like the
-// web section.
-const PLAN_SENTENCE: &str = " For a task with several steps, keep a plan with the plan tool and update it as you go.";
+// web section. Deliberate difference (marv-rs #85): Marv says "For a task with several steps, keep a plan with the
+// plan tool and update it as you go." On the GLM bench that made 33 of 47 plan calls requests of their own (7% of
+// request time), so only long tasks, and each update rides along with a real call. Kept in `marv -p` too: the plan
+// steers the model and survives compaction, not just the screen, and batched it costs no request. The oracle maps
+// it back to Marv's (`marv_oracle::runner::MARV_RS_TEXT`: keep them in step).
+const PLAN_SENTENCE: &str = " For a task of four or more steps, keep a plan with the plan tool; send each update in the same reply as your next tool call; only the final one, marking the plan done, may go alone.";
 
 const BASE_REST_TEXT: &str = "\n\nYou can change files with edit_file (replace exact text; copy it from read_file, whitespace included) and write_file (new files or full rewrites), never through bash (no heredocs or echo >), and run shell commands with bash, e.g. the tests after a change. For a long file, write the first part with write_file, then add the rest with append: true. The user may be asked to approve a change or command; if they decline, stop and ask how to proceed instead of trying another way. Commands run in a sandbox: only the project folder is writable, the home folder is an empty stand-in (toolchains like ~/.bun, git config and ~/.marv/skills show through, read-only; Marv's own config, sessions and trajectories in ~/.marv, and everything else there, aren't visible, so a file missing under ~ may well exist), and there's no network unless you set network: true. A command that changes the git repository (commit, checkout, merge, stash…) needs git_write: true. Make focused changes and check your work.
 
@@ -645,7 +649,10 @@ mod tests {
         assert!(!none.contains("writable in your sandbox"), "{none}");
         let some = situation_section(false, &["web".into(), "network".into()], &["~/Projects/marv/.beads".into()]);
         assert!(some.contains("Pre-approved for this session (they run without asking): web, network."), "{some}");
-        assert!(some.contains("Folders writable in your sandbox besides the project (set in config): `~/Projects/marv/.beads`."), "{some}");
+        assert!(
+            some.contains("Folders writable in your sandbox besides the project (set in config): `~/Projects/marv/.beads`."),
+            "{some}"
+        );
         assert_eq!(some, situation_section(false, &["web".into(), "network".into()], &["~/Projects/marv/.beads".into()]));
         // In the full prompt the sections stay fixed per session (the input's).
         let mut listed = input();
@@ -686,7 +693,7 @@ mod tests {
 
     #[test]
     fn says_to_keep_a_plan_only_when_the_plan_tool_is_offered() {
-        let sentence = "For a task with several steps, keep a plan with the plan tool and update it as you go.";
+        let sentence = "For a task of four or more steps, keep a plan with the plan tool; send each update in the same reply as your next tool call; only the final one, marking the plan done, may go alone.";
         let with = system_prompt(&PromptInput { tools: vec!["read_file".into(), "plan".into()], ..input() });
         assert!(with.contains(&format!("Paths are relative to the project root. {sentence}\n\nYou can change files")));
         let without = system_prompt(&PromptInput { tools: vec!["read_file".into()], ..input() });

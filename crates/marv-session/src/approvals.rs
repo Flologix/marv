@@ -56,7 +56,7 @@ pub fn seed_prefixes(names: &[String]) -> Result<Vec<String>, String> {
 }
 
 /// The names split: `mesh:<receptacle>` grants (for headless's `HeadlessWires`), and the other names' scope-key
-/// prefixes. `marv-session::mesh::headless_grants` builds on this.
+/// prefixes. `marv -p` (headless) and the config's seeds both build on this.
 pub fn parse_approvals(names: &[String]) -> Result<(Vec<ReceptacleName>, Vec<String>), String> {
     let mut receptacles = Vec::new();
     let mut prefixes = Vec::new();
@@ -68,10 +68,7 @@ pub fn parse_approvals(names: &[String]) -> Result<(Vec<ReceptacleName>, Vec<Str
                 Some((_, scope_prefixes)) => prefixes.extend(scope_prefixes.iter().map(|s| s.to_string())),
                 None => {
                     let known: Vec<&str> = APPROVE_PREFIXES.iter().map(|(n, _)| *n).collect();
-                    return Err(format!(
-                        "Unknown --approve scope \"{name}\". Known: {}, mesh:<receptacle>",
-                        known.join(", ")
-                    ));
+                    return Err(format!("Unknown --approve scope \"{name}\". Known: {}, mesh:<receptacle>", known.join(", ")));
                 }
             },
         }

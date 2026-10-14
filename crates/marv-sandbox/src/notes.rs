@@ -30,6 +30,10 @@ pub const HOME_NOTE: &str = "Marv: in the sandbox the home folder is an empty st
 /// Appended when a sandboxed command without network fails in a way that looks like the network's missing.
 pub const NETWORK_NOTE: &str = "Marv: this command ran in the sandbox without network, and its failure looks like it may come from that: there, every connection and DNS lookup fails, so logins look invalid and servers look down. Before drawing conclusions, run it again with network: true.";
 
+/// Added to the result of a retry that was run with network because the same command (its tail aside) already failed
+/// without it the way the network note describes (#81): a model ignored that note and re-sent the command 11 times.
+pub const ESCALATED_NOTE: &str = "Marv: this command already failed without network in a way that looked like the missing network, so this time Marv ran it with network: true, which the user has to approve. If network isn't granted, don't run it again: do without it (look for what's already on this machine) or tell the user it needs the network.";
+
 /// Added to the network note when the failed command is `gh`.
 pub const GH_NOTE: &str = "For GitHub, don't suggest gh auth login, and never mount gh's config into the sandbox (a token there must not reach command output): suggest the GitHub MCP server instead, which the user connects in ~/.marv/mcp.json — see Marv's README, \"Connect GitHub\".";
 
@@ -103,6 +107,13 @@ fn gh_command() -> &'static Regex {
 /// command is one that needs the network. A guess, for the note only.
 pub fn looks_like_network_failure(command: &str, output: &str) -> bool {
     network_errors().is_match(output) || network_commands().is_match(command)
+}
+
+/// Whether a command that exited 0 hid a failure like the missing network's behind `||` (`git clone … || true`, #81):
+/// it has a `||`, it's a command that needs the network, and its output has a network error. Stricter than
+/// [`looks_like_network_failure`], since nothing failed as far as the exit code says.
+pub fn hidden_network_failure(command: &str, output: &str) -> bool {
+    command.contains("||") && network_commands().is_match(command) && network_errors().is_match(output)
 }
 
 /// Whether the command runs `gh` (the gh note follows the network note).

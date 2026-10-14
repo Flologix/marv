@@ -274,9 +274,7 @@ mod tests {
             Cli::command()
                 .get_arguments()
                 .find(|a| a.get_long() == Some("approve"))
-                .map(|a| {
-                    a.get_long_help().or_else(|| a.get_help()).map(|h| h.to_string()).unwrap_or_default()
-                })
+                .map(|a| a.get_long_help().or_else(|| a.get_help()).map(|h| h.to_string()).unwrap_or_default())
                 .unwrap_or_default()
         };
         for (name, _) in marv_session::approvals::APPROVE_PREFIXES {

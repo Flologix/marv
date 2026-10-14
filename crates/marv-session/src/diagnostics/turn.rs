@@ -104,6 +104,8 @@ pub fn sandboxed_options(run: &CheckRun) -> RunOptions {
         project_read_only: true,
         env: None,
         forwards: Vec::new(),
+        // A check's exit code is bash's own: `grep -r TODO src | wc -l` mustn't turn into a failure (#81).
+        pipe_check: false,
     }
 }
 
@@ -652,6 +654,20 @@ mod tests {
 
     fn unreadable(r: &CheckResult) -> bool {
         matches!(r, CheckOutcome::Failed { reason: FailReason::Unreadable, notify: true, tool: None, .. })
+    }
+
+    // #81's pipe check is the bash tool's: a user's check like `grep -r TODO src | wc -l` keeps its exit code.
+    #[tokio::test]
+    async fn a_check_command_runs_without_the_pipe_check() {
+        let dir = Scratch::new();
+        let run =
+            CheckRun { command: "false | true".into(), root: dir.0.clone(), read_only: vec![], timeout: Duration::from_secs(10) };
+        assert!(!sandboxed_options(&run).pipe_check);
+        if marv_sandbox::sandbox_available() {
+            let result = sandboxed()(run, CancellationToken::new()).await;
+            assert_eq!(result.exit_code, Some(0), "{}", result.output);
+            assert!(!result.output.contains("Marv:"), "{}", result.output);
+        }
     }
 
     #[tokio::test]

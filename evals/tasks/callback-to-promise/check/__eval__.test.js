@@ -89,14 +89,31 @@ test("main", async () => {
   await expect(main(d, ["nope"])).rejects.toThrow("unknown command");
 });
 
+// `code` without each `name(…)` call, arguments and all (to its matching parenthesis, across lines). Strings and
+// comments are already gone, so parentheses in them can't throw the count off.
+function withoutCalls(code, name) {
+  const re = new RegExp(`\\b${name}\\s*\\(`, "g");
+  let out = "", from = 0, m;
+  while ((m = re.exec(code))) {
+    let i = m.index + m[0].length, depth = 1;
+    for (; i < code.length && depth; i++) depth += code[i] === "(" ? 1 : code[i] === ")" ? -1 : 0;
+    out += code.slice(from, m.index) + "null";
+    from = re.lastIndex = i;
+  }
+  return out + code.slice(from);
+}
+
 test("no callbacks are left in the code or the tests (loadCallback aside)", () => {
   const src = readdirSync("src").map((f) => [`src/${f}`, readFileSync(join("src", f), "utf8")]);
   const tests = readdirSync("test").filter((f) => f.endsWith(".test.js")).map((f) => [`test/${f}`, readFileSync(join("test", f), "utf8")]);
   expect(tests.length).toBeGreaterThanOrEqual(3);
   for (const [name, text] of [...src, ...tests]) {
     // Comments may describe the old API; the wrapper is the one callback allowed (up to the next blank line).
-    const bare = text.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
-    const code = name === "src/store.js" ? bare.replace(/export\s+(async\s+)?(function|const|let)\s+loadCallback[\s\S]*?(\n\s*\n|$)/, "") : bare;
+    // Strings don't count either (a test's "cb.json" isn't a callback), and a test may call the wrapper with one.
+    const bare = text.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "").replace(/(["'`])(?:\\.|(?!\1)[^\\\n])*\1/g, '""');
+    const code = name === "src/store.js"
+      ? bare.replace(/export\s+(async\s+)?(function|const|let)\s+loadCallback[\s\S]*?(\n\s*\n|$)/, "")
+      : withoutCalls(bare, "loadCallback");
     expect({ name, callbacks: /\((err\w*|e), /.test(code) || /\bdone\)/.test(code) || /\bcb\b/.test(code) }).toEqual({ name, callbacks: false });
   }
 });

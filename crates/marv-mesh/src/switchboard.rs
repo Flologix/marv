@@ -27,7 +27,8 @@
 //! Inboxes (v1): a queue per agent, at most `DEFAULT_INBOX_DEPTH` unread (the
 //! oldest are kept, new ones refused, so a looping sender can't push out what
 //! the reader hasn't seen). The agent's next step reads them with
-//! [`Switchboard::drain_inbox`]; nothing is pushed into a running reply.
+//! [`Switchboard::drain_inbox`]; nothing is pushed into a running reply. A delivery rings [`Switchboard::mail`], so an
+//! idle TUI with `mesh.wake` on can start a turn to read it (#78; the turn still drains it the same way).
 //!
 //! Shared, not locked by its users: the switchboard lives in an `Arc` and every method takes `&self`; `serve` and
 //! `route` take `Arc<Self>` because they outlive the call (the socket loop, a `call` waiting for its answer). Its
@@ -127,6 +128,9 @@ pub struct Switchboard {
     runtime_dir: PathBuf,
     /// A plug was added while `serve` runs: it has a new socket to listen on.
     wake: tokio::sync::Notify,
+    /// A message went into an inbox (#78): what an idle TUI waits on to start a turn (`mesh.wake`). One permit is
+    /// kept when nobody waits, so a message that lands between two waits isn't missed.
+    mail: tokio::sync::Notify,
     /// Asked, in order, for a receptacle nobody offered yet ([`Self::lookup`]).
     resolvers: Mutex<Vec<Arc<dyn Resolve>>>,
     /// The folder of the machine's switchboards, once this one's door is open (`discovery::open_door`): where
@@ -173,6 +177,7 @@ impl Switchboard {
             trajectory: Mutex::new(trajectory),
             runtime_dir,
             wake: tokio::sync::Notify::new(),
+            mail: tokio::sync::Notify::new(),
             resolvers: Mutex::default(),
             peer_dir: Mutex::default(),
             herdr: Mutex::default(),
@@ -435,6 +440,7 @@ impl Switchboard {
                     Next::Done(match board.inboxes.get_mut(&owner) {
                         Some(queue) if queue.len() < DEFAULT_INBOX_DEPTH => {
                             queue.push_back(envelope.clone());
+                            self.mail.notify_one();
                             Ok(None)
                         }
                         Some(_) => Err(MeshError::InboxFull(envelope.receptacle.to_string())),
@@ -601,6 +607,22 @@ impl Switchboard {
                 return;
             }
         }
+    }
+
+    /// Resolves once a message has gone into an inbox since the last call (#78). Any agent's inbox: the caller reads
+    /// [`Self::unread`] for the one it cares about.
+    pub async fn mail(&self) {
+        self.mail.notified().await;
+    }
+
+    /// The wires of an agent's unread messages (sender, receptacle), oldest first, without taking them: they're
+    /// still drained, fenced, by its next turn (#78).
+    pub fn unread(&self, agent: &PlugId) -> Vec<(PlugId, ReceptacleName)> {
+        self.board()
+            .inboxes
+            .get(agent)
+            .map(|q| q.iter().map(|e| (e.sender.clone(), e.receptacle.clone())).collect())
+            .unwrap_or_default()
     }
 
     /// The inbox's unread messages for an agent's next turn (oldest first).
@@ -804,6 +826,25 @@ pub(crate) mod tests {
         assert!(sb.drain_inbox(&id("parent")).is_empty());
         assert!(sb.drain_inbox(&id("worker-1")).is_empty());
         assert_eq!(log.0.lock().unwrap().len(), 2);
+    }
+
+    /// #78: a delivery into an inbox rings the mail bell (once, even if nobody was listening yet), and the unread
+    /// messages' wires can be read without taking them: the next turn still drains them.
+    #[tokio::test]
+    async fn an_inbox_delivery_rings_the_mail_bell_and_can_be_peeked() {
+        let (sb, _log, _rt) = board();
+        let sb = Arc::new(sb);
+        let inbox = ReceptacleName::inbox(&id("parent"));
+        sb.wire(tui("worker-1", &inbox)).unwrap();
+        let quiet = tokio::time::timeout(std::time::Duration::from_millis(50), sb.mail()).await;
+        assert!(quiet.is_err(), "no mail yet");
+        sb.deliver(&id("worker-1"), inbox.as_str(), WireMode::Send, json!({"text": "hi"})).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), sb.mail()).await.expect("rung");
+        assert_eq!(sb.unread(&id("parent")), [(id("worker-1"), inbox.clone())]);
+        assert_eq!(sb.unread(&id("parent")).len(), 1, "peeking takes nothing");
+        assert_eq!(sb.drain_inbox(&id("parent")).len(), 1);
+        assert!(sb.unread(&id("parent")).is_empty());
+        assert!(sb.unread(&id("nobody")).is_empty());
     }
 
     #[tokio::test]

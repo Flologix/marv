@@ -101,6 +101,48 @@ async fn config_approve_never_covers_tainted_egress() {
     }
 }
 
+/// **…nor #81's network escalation in a tainted session.** A sandboxed command that failed like the missing network
+/// is retried with network (`repair`): with `"approve": ["network"]` the retry runs on the seed in a clean session
+/// (what the scope is for), but once tainted it's asked with `must_ask` like any network command, and declined, it
+/// doesn't run.
+///
+/// Proven: dropped the `!request.must_ask` half in `SessionApprover` → this failed (the tainted retry wasn't asked).
+#[tokio::test]
+async fn config_approve_never_covers_a_tainted_network_escalation() {
+    marv_guards::require_bwrap!();
+    let project = TempDir::new("approvals-escalate");
+    let approver = Recorder::new(Decision::No);
+    // Fails like a command without network (the escalation's trigger), and leaves a mark when it runs.
+    let offline = "touch ran; echo 'fatal: unable to access: Could not resolve host: github.com'; exit 128";
+    let bash = call("bash", json!({ "command": offline }));
+    let wrapper = marv_session::SessionApprover {
+        inner: approver.clone(),
+        always: {
+            let always = AlwaysScopes::default();
+            always.seed(&["bash:net:".to_string()]);
+            always
+        },
+        cancel: tokio_util::sync::CancellationToken::new(),
+    };
+    let mut ctx = ToolContext { approver: Some(Arc::new(wrapper)), ..ToolContext::new(project.path()) };
+    ctx.sandbox = Arc::new(marv_sandbox::Sandbox::from_env(true));
+    ctx.yolo = true;
+    run_tool(&bash, &ctx, builtin_tools()).await; // the first failure, no network: auto_safe in yolo
+    // Clean: the escalated retry is a network command the seed answers.
+    let out = run_tool(&bash, &ctx, builtin_tools()).await;
+    assert!(out.result.output.contains(marv_sandbox::notes::ESCALATED_NOTE), "{}", out.result.output);
+    assert!(approver.requests().is_empty(), "the seed answered: {:?}", approver.requests());
+    // Tainted: the retry is asked, with must_ask, and declined it doesn't run.
+    std::fs::remove_file(project.path().join("ran")).unwrap();
+    ctx.taint.mark(marv_core::Provenance::Mesh);
+    let out = run_tool(&bash, &ctx, builtin_tools()).await;
+    let asked = approver.requests();
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert!(asked[0].must_ask && asked[0].network, "{:?}", asked[0]);
+    assert!(out.result.declined, "{}", out.result.output);
+    assert!(!project.path().join("ran").exists(), "the declined retry didn't run");
+}
+
 /// **…nor a protected path.** `"approve": ["files"]` covers ordinary writes without asking; a write to `AGENTS.md`
 /// (a protected path) still asks with `must_ask`, and is not written.
 ///
@@ -177,11 +219,8 @@ async fn config_approve_never_grants_a_mesh_wire() {
     assert!(!always.contains(&request.scope.key), "the seed doesn't cover a wire request's key");
     // The wrapper the session wraps its client with (what "always" answers flow through) still asks the person.
     let person = Recorder::new(Decision::Yes);
-    let wrapper = marv_session::SessionApprover {
-        inner: person.clone(),
-        always,
-        cancel: tokio_util::sync::CancellationToken::new(),
-    };
+    let wrapper =
+        marv_session::SessionApprover { inner: person.clone(), always, cancel: tokio_util::sync::CancellationToken::new() };
     use marv_tools::Approver as _;
     assert_eq!(wrapper.approve(request).await, Decision::Yes, "the person answered");
     assert_eq!(person.requests().len(), 1, "the person was asked, the seed did not answer");
@@ -194,10 +233,19 @@ async fn config_approve_never_grants_a_mesh_wire() {
 #[test]
 fn subagents_dont_inherit_config_scopes() {
     let always = AlwaysScopes::default();
-    always.seed(
-        &["web:".to_string(), "bash:net:".to_string(), "mcp:".to_string(), "mesh:agent.x.inbox:".to_string(), "files".to_string()],
-    );
+    always.seed(&[
+        "web:".to_string(),
+        "bash:net:".to_string(),
+        "mcp:".to_string(),
+        "mesh:agent.x.inbox:".to_string(),
+        "files".to_string(),
+    ]);
     let sub = always.for_subagent();
     assert!(sub.contains("files"));
-    assert!(!sub.contains("web:docs.rs") && !sub.contains("bash:net:curl") && !sub.contains("mcp:gh:search") && !sub.contains("mesh:agent.x.inbox:send"));
+    assert!(
+        !sub.contains("web:docs.rs")
+            && !sub.contains("bash:net:curl")
+            && !sub.contains("mcp:gh:search")
+            && !sub.contains("mesh:agent.x.inbox:send")
+    );
 }

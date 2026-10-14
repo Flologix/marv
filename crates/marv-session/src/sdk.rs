@@ -111,6 +111,13 @@ pub struct SessionOptions {
     /// Extra writable sandbox folders (#98), e.g. bd's database folder: canonical paths, already checked
     /// (`marv_sandbox::resolve_writable`), bound read-write into every command's sandbox. Default: none.
     pub writable: Vec<PathBuf>,
+    /// Session-start hooks (#108): commands run as each conversation begins, outside the sandbox, their output sent
+    /// once at the start of its first message. Pass only commands the user wrote into their own config
+    /// (`crate::hooks::session_start_hooks`), never a repository's. Default none.
+    pub hooks: Vec<crate::hooks::HookCommand>,
+    /// A one-shot run, like `marv -p`: the process tool tells the model its processes end when the run does (#86).
+    /// Default false.
+    pub one_shot: bool,
 }
 
 /// Builds a [`MarvSession`] (Marv's `createSession`).
@@ -152,6 +159,8 @@ impl SessionBuilder {
                 processes: true,
                 pre_approved: Vec::new(),
                 writable: Vec::new(),
+                hooks: Vec::new(),
+                one_shot: false,
             },
         }
     }
@@ -192,6 +201,10 @@ impl SessionBuilder {
     /// Extra writable sandbox folders (#98), already checked (`marv_sandbox::resolve_writable`).
     pub fn writable(mut self, folders: Vec<PathBuf>) -> Self {
         self.options.writable = folders;
+        self
+    }
+    pub fn one_shot(mut self, on: bool) -> Self {
+        self.options.one_shot = on;
         self
     }
     pub fn max_steps(mut self, steps: u32) -> Self {
@@ -329,12 +342,15 @@ pub async fn create_session(options: SessionOptions) -> Result<MarvSession, Sess
     init.sessions = store_for(&options.persist, || SessionStore::new(config_dir.join("sessions")));
     init.trajectories = store_for(&options.trajectories, || TrajectoryStore::new(config_dir.join("trajectories")));
     init.worktrees_dir = Some(config_dir.join("worktrees").join(project_key(&root)));
+    init.tool_output_dir = Some(config_dir.join(marv_tools::output::TOOL_OUTPUT_DIR));
     init.transcript = options.transcript;
     init.on_warning = options.on_warning.clone();
     init.problems = problems;
     init.processes = options.processes;
     init.pre_approved = options.pre_approved;
     init.writable = options.writable;
+    init.hooks = options.hooks;
+    init.one_shot = options.one_shot;
     let session = MarvSession::new(init)?;
     if let Some(mcp) = &session.mcp() {
         // A server that needs a login is told once (again only after it connected meanwhile).
