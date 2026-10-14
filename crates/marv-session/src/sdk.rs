@@ -105,6 +105,10 @@ pub struct SessionOptions {
     /// forwarded to 127.0.0.1, each start through your approver (`door: process`; scope `process:<command>`). Default
     /// true, where bubblewrap works. `close()` stops them all.
     pub processes: bool,
+    /// Session-start hooks (#108): commands run as each conversation begins, outside the sandbox, their output sent
+    /// once at the start of its first message. Pass only commands the user wrote into their own config
+    /// (`crate::hooks::session_start_hooks`), never a repository's. Default none.
+    pub hooks: Vec<crate::hooks::HookCommand>,
 }
 
 /// Builds a [`MarvSession`] (Marv's `createSession`).
@@ -144,6 +148,7 @@ impl SessionBuilder {
                 mesh: None,
                 wire_approver: None,
                 processes: true,
+                hooks: Vec::new(),
             },
         }
     }
@@ -315,6 +320,7 @@ pub async fn create_session(options: SessionOptions) -> Result<MarvSession, Sess
     init.on_warning = options.on_warning.clone();
     init.problems = problems;
     init.processes = options.processes;
+    init.hooks = options.hooks;
     let session = MarvSession::new(init)?;
     if let Some(mcp) = &session.mcp() {
         // A server that needs a login is told once (again only after it connected meanwhile).

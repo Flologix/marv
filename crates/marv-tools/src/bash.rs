@@ -226,26 +226,23 @@ pub async fn run_command(
             }
         }
     };
-    // Both at once, so neither pipe fills up and blocks the other.
-    let io = async { tokio::join!(capture(stdout), capture(stderr)) };
-    tokio::pin!(io);
     let deadline = tokio::time::sleep(timeout);
     tokio::pin!(deadline);
-    let (mut timed_out, mut aborted) = (false, false);
-    let (output, errors) = loop {
-        tokio::select! {
-            out = &mut io => break out,
-            () = &mut deadline, if !timed_out && !aborted => {
-                timed_out = true;
-                kill(&mut child);
-            }
-            () = cancel.cancelled(), if !timed_out && !aborted => {
-                aborted = true;
-                kill(&mut child);
-            }
+    let Captured { output, errors, mut timed_out, mut aborted } =
+        capture_until(stdout, stderr, deadline.as_mut(), cancel, || kill(&mut child)).await;
+    // The pipes can close long before the command ends (`exec >/dev/null 2>&1; sleep 60`): the timeout and the stop
+    // stay armed until it has exited, or such a command would hold the turn (or a hook) past its timeout.
+    let status = loop {
+        if timed_out || aborted {
+            break child.wait().await.ok();
         }
+        tokio::select! {
+            status = child.wait() => break status.ok(),
+            () = &mut deadline => timed_out = true,
+            () = cancel.cancelled() => aborted = true,
+        }
+        kill(&mut child);
     };
-    let status = child.wait().await.ok();
     let exit_code = if timed_out || aborted { None } else { status.and_then(|s| s.code()) };
     let mut output = output;
     // Without this, a sandbox that never started looks like a command that silently failed.
@@ -255,9 +252,52 @@ pub async fn run_command(
     CommandResult { output, exit_code, timed_out, aborted, timeout: Some(timeout) }
 }
 
-/// A stream's text, up to about [`MAX_CAPTURE`] (whole chunks are kept while under it; the rest is read and dropped).
-pub(crate) async fn capture(mut stream: impl AsyncRead + Unpin) -> String {
-    let mut kept = Vec::new();
+/// How long the output pipes are still read after a timeout or a stop killed the command: a process that left its
+/// group (`setsid`) can hold them open, and isn't waited for.
+pub const KILL_GRACE: Duration = Duration::from_secs(2);
+
+/// Both pipes' text, and whether `deadline` or `cancel` ended the command.
+pub(crate) struct Captured {
+    pub output: String,
+    pub errors: String,
+    pub timed_out: bool,
+    pub aborted: bool,
+}
+
+/// Reads both pipes at once (so neither fills up and blocks the other) until they close. At `deadline` or `cancel`,
+/// calls `kill` once, then reads for at most [`KILL_GRACE`] more and returns what it has.
+pub(crate) async fn capture_until(
+    stdout: impl AsyncRead + Unpin,
+    stderr: impl AsyncRead + Unpin,
+    mut deadline: std::pin::Pin<&mut tokio::time::Sleep>,
+    cancel: &tokio_util::sync::CancellationToken,
+    mut kill: impl FnMut(),
+) -> Captured {
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let (mut timed_out, mut aborted) = (false, false);
+    {
+        let io = async { tokio::join!(capture_into(stdout, &mut out), capture_into(stderr, &mut err)) };
+        tokio::pin!(io);
+        let grace = tokio::time::sleep(Duration::MAX);
+        tokio::pin!(grace);
+        loop {
+            tokio::select! {
+                _ = &mut io => break,
+                () = &mut deadline, if !timed_out && !aborted => timed_out = true,
+                () = cancel.cancelled(), if !timed_out && !aborted => aborted = true,
+                () = &mut grace => break,
+            }
+            kill();
+            grace.as_mut().reset(tokio::time::Instant::now() + KILL_GRACE);
+        }
+    }
+    let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+    Captured { output: text(&out), errors: text(&err), timed_out, aborted }
+}
+
+/// Reads `stream` into `kept`, up to about [`MAX_CAPTURE`] (whole chunks are kept while under it; the rest is read
+/// and dropped). What's read stays in `kept` if the read is dropped.
+async fn capture_into(mut stream: impl AsyncRead + Unpin, kept: &mut Vec<u8>) {
     let mut chunk = vec![0u8; 64 * 1024];
     loop {
         match stream.read(&mut chunk).await {
@@ -266,7 +306,6 @@ pub(crate) async fn capture(mut stream: impl AsyncRead + Unpin) -> String {
             Ok(_) => {}
         }
     }
-    String::from_utf8_lossy(&kept).into_owned()
 }
 
 /// The real path, or the path itself when it doesn't resolve.
@@ -744,6 +783,81 @@ mod tests {
         let started = std::time::Instant::now();
         assert!(run_command(second, &Sandbox::from_env(true), &CancellationToken::new()).await.timed_out);
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    /// A command that closes its output pipes and keeps running: the timeout still holds, and kills its whole group
+    /// (Greptile on #115: `run_command` waited for the child outside its timeout once the pipes had closed).
+    const CLOSES_ITS_PIPES: &str = "(sleep 3; touch late) >/dev/null 2>&1 & exec >/dev/null 2>&1; sleep 60";
+
+    async fn times_out_after_closing_its_pipes(sandbox: bool) {
+        let root = TempDir::new("bash-closed");
+        let options = RunOptions { sandbox, timeout: Duration::from_secs(1), ..options(CLOSES_ITS_PIPES, root.path()) };
+        let started = std::time::Instant::now();
+        let result = run_command(options, &Sandbox::from_env(true), &CancellationToken::new()).await;
+        assert!(result.timed_out && result.exit_code.is_none(), "{result:?}");
+        let took = started.elapsed();
+        assert!(took >= Duration::from_millis(900) && took < Duration::from_millis(2500), "{took:?}");
+        // Its background job was in the group (the sandbox) that died: it never gets to write.
+        tokio::time::sleep(Duration::from_millis(3000)).await;
+        assert!(!root.path().join("late").exists(), "the command's group outlived its timeout");
+    }
+
+    #[tokio::test]
+    async fn the_timeout_holds_after_the_command_closes_its_pipes() {
+        times_out_after_closing_its_pipes(false).await;
+    }
+
+    #[tokio::test]
+    async fn the_timeout_holds_after_a_sandboxed_command_closes_its_pipes() {
+        require_bwrap!();
+        times_out_after_closing_its_pipes(true).await;
+    }
+
+    /// A process that left the group (`setsid`) keeps the output pipe: once the timeout or the stop has killed the
+    /// command, the pipes get [`KILL_GRACE`], then what was read is returned.
+    const LEAVES_THE_GROUP: &str = "echo before; setsid sh -c 'sleep 30' & sleep 30";
+
+    #[tokio::test]
+    async fn the_timeout_holds_when_a_child_left_the_group_with_the_pipe() {
+        let root = TempDir::new("bash-setsid");
+        let options = RunOptions { timeout: Duration::from_secs(1), ..options(LEAVES_THE_GROUP, root.path()) };
+        let started = std::time::Instant::now();
+        let result = run_command(options, &Sandbox::from_env(true), &CancellationToken::new()).await;
+        assert!(result.timed_out && result.exit_code.is_none(), "{result:?}");
+        assert_eq!(result.output, "before\n");
+        assert!(started.elapsed() < Duration::from_secs(4), "{:?}", started.elapsed());
+    }
+
+    #[tokio::test]
+    async fn a_stop_holds_when_a_child_left_the_group_with_the_pipe() {
+        let root = TempDir::new("bash-setsid-stop");
+        let cancel = CancellationToken::new();
+        let stop = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            stop.cancel();
+        });
+        let started = std::time::Instant::now();
+        let options = RunOptions { timeout: Duration::from_secs(60), ..options(LEAVES_THE_GROUP, root.path()) };
+        let result = run_command(options, &Sandbox::from_env(true), &cancel).await;
+        assert!(result.aborted, "{result:?}");
+        assert!(started.elapsed() < Duration::from_secs(4), "{:?}", started.elapsed());
+    }
+
+    #[tokio::test]
+    async fn a_stop_holds_after_the_command_closes_its_pipes() {
+        let root = TempDir::new("bash-closed-stop");
+        let cancel = CancellationToken::new();
+        let stop = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            stop.cancel();
+        });
+        let started = std::time::Instant::now();
+        let options = RunOptions { timeout: Duration::from_secs(60), ..options(CLOSES_ITS_PIPES, root.path()) };
+        let result = run_command(options, &Sandbox::from_env(true), &cancel).await;
+        assert!(result.aborted && result.exit_code.is_none(), "{result:?}");
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
     }
 
     #[tokio::test]
