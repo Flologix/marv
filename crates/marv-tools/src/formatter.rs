@@ -28,8 +28,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures::future::BoxFuture;
 use futures::FutureExt;
+use futures::future::BoxFuture;
 use tokio_util::sync::CancellationToken;
 
 use crate::bash::RunOptions;
@@ -45,8 +45,8 @@ const BIOME_EXTENSIONS: &[&str] =
 /// What prettier formats, as Marv detects it (prettier itself knows more; an unsupported file type means no formatter
 /// here, so a `.txt` edit in a prettier project isn't told "no parser could be inferred" every time).
 const PRETTIER_EXTENSIONS: &[&str] = &[
-    "js", "jsx", "ts", "tsx", "mjs", "cjs", "cts", "mts", "json", "jsonc", "json5", "css", "scss", "sass", "less",
-    "html", "htm", "vue", "svelte", "astro", "md", "mdx", "yaml", "yml", "graphql", "gql",
+    "js", "jsx", "ts", "tsx", "mjs", "cjs", "cts", "mts", "json", "jsonc", "json5", "css", "scss", "sass", "less", "html", "htm",
+    "vue", "svelte", "astro", "md", "mdx", "yaml", "yml", "graphql", "gql",
 ];
 
 /// Prettier's config files, by exact name (`.prettierrc.bak` and friends aren't configs), plus `package.json`'s
@@ -111,6 +111,8 @@ pub fn sandboxed_options(run: &FormatRun) -> RunOptions {
         project_read_only: true,
         env: None,
         forwards: Vec::new(),
+        // Like the checks: the formatter's own exit code, no pipe check (#81).
+        pipe_check: false,
     }
 }
 
@@ -184,12 +186,7 @@ impl Formatter for ProjectFormatter {
             return FormatOutcome::Skipped;
         }
         let Some(command) = self.command_for(root, path) else { return FormatOutcome::Skipped };
-        let run = FormatRun {
-            command,
-            root: root.to_path_buf(),
-            writable: root.join(path),
-            timeout: self.timeout,
-        };
+        let run = FormatRun { command, root: root.to_path_buf(), writable: root.join(path), timeout: self.timeout };
         let runner = self.run.clone().unwrap_or_else(sandboxed);
         let result = runner(run, cancel.clone()).await;
         if result.aborted || cancel.is_cancelled() {
@@ -291,12 +288,16 @@ pub async fn after_write(ctx: &ToolContext, shown: &str, absolute: &Path, wrote:
 pub fn detect_command(root: &Path, path: &str) -> Option<String> {
     let ext = extension(path)?;
     let file = shell_quote(path);
-    if BIOME_EXTENSIONS.contains(&ext.as_str()) && root.join("node_modules/.bin/biome").is_file()
+    if BIOME_EXTENSIONS.contains(&ext.as_str())
+        && root.join("node_modules/.bin/biome").is_file()
         && (root.join("biome.json").is_file() || root.join("biome.jsonc").is_file())
     {
         return Some(format!("node_modules/.bin/biome format --write {file}"));
     }
-    if PRETTIER_EXTENSIONS.contains(&ext.as_str()) && root.join("node_modules/.bin/prettier").is_file() && prettier_configured(root) {
+    if PRETTIER_EXTENSIONS.contains(&ext.as_str())
+        && root.join("node_modules/.bin/prettier").is_file()
+        && prettier_configured(root)
+    {
         return Some(format!("node_modules/.bin/prettier --write {file}"));
     }
     if ext == "py" && has_ruff_config(root) {
@@ -336,8 +337,8 @@ fn prettier_configured(root: &Path) -> bool {
 
 /// `pyproject.toml` has a `[tool.ruff]` (or `[tool.ruff.…]`) section: ruff is the project's own Python tooling.
 fn has_ruff_config(root: &Path) -> bool {
-    use std::sync::LazyLock;
     use regex::Regex;
+    use std::sync::LazyLock;
     static RUFF_SECTION: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^\s*\[tool\.ruff\b").unwrap());
     std::fs::read_to_string(root.join("pyproject.toml")).is_ok_and(|text| RUFF_SECTION.is_match(&text))
 }
@@ -345,8 +346,8 @@ fn has_ruff_config(root: &Path) -> bool {
 /// Rust's edition from `Cargo.toml` (`[package]` or `[workspace.package]`), so `rustfmt` parses modern code; `None`
 /// when the manifest doesn't say (rustfmt then applies its own default, as it would by hand).
 fn rust_edition(root: &Path) -> Option<String> {
-    use std::sync::LazyLock;
     use regex::Regex;
+    use std::sync::LazyLock;
     static EDITION: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"^\s*edition\s*=\s*"(\d+)""#).unwrap());
     let text = std::fs::read_to_string(root.join("Cargo.toml")).ok()?;
     let mut section = String::new();
@@ -382,18 +383,12 @@ mod tests {
         let root = TempDir::new("fmt-prettier");
         root.write(".prettierrc", "{ \"singleQuote\": true }");
         testing::bin(&root, "prettier", "#!/bin/sh\ntrue\n");
-        assert_eq!(
-            detect_command(root.path(), "src/a.ts").as_deref(),
-            Some("node_modules/.bin/prettier --write 'src/a.ts'")
-        );
+        assert_eq!(detect_command(root.path(), "src/a.ts").as_deref(), Some("node_modules/.bin/prettier --write 'src/a.ts'"));
         // package.json's prettier key counts too
         let root = TempDir::new("fmt-package");
         root.write("package.json", "{ \"name\": \"a\", \"prettier\": { \"singleQuote\": true } }");
         testing::bin(&root, "prettier", "#!/bin/sh\ntrue\n");
-        assert_eq!(
-            detect_command(root.path(), "src/a.ts").as_deref(),
-            Some("node_modules/.bin/prettier --write 'src/a.ts'")
-        );
+        assert_eq!(detect_command(root.path(), "src/a.ts").as_deref(), Some("node_modules/.bin/prettier --write 'src/a.ts'"));
 
         // ruff from [tool.ruff] in pyproject.toml
         let root = TempDir::new("fmt-ruff");
@@ -427,10 +422,7 @@ mod tests {
         assert_eq!(detect_command(root.path(), "a.ts"), None);
         // …but with one it runs
         root.write("prettier.config.js", "module.exports = {};\n");
-        assert_eq!(
-            detect_command(root.path(), "a.ts").as_deref(),
-            Some("node_modules/.bin/prettier --write 'a.ts'")
-        );
+        assert_eq!(detect_command(root.path(), "a.ts").as_deref(), Some("node_modules/.bin/prettier --write 'a.ts'"));
     }
 
     #[test]
@@ -439,10 +431,7 @@ mod tests {
         root.write(".prettierrc", "{}");
         root.write("Cargo.toml", "[package]\nname = \"a\"\nedition = \"2021\"\n");
         testing::bin(&root, "prettier", "#!/bin/sh\ntrue\n");
-        assert_eq!(
-            detect_command(root.path(), "src/ui.ts").as_deref(),
-            Some("node_modules/.bin/prettier --write 'src/ui.ts'")
-        );
+        assert_eq!(detect_command(root.path(), "src/ui.ts").as_deref(), Some("node_modules/.bin/prettier --write 'src/ui.ts'"));
         assert_eq!(detect_command(root.path(), "src/lib.rs").as_deref(), Some("rustfmt --edition 2021 'src/lib.rs'"));
         // biome wins where both are configured
         root.write("biome.json", "{}");
@@ -567,17 +556,17 @@ mod tests {
         let formatter = hook(&FormatterSetting::Auto, true, &missing);
         assert_eq!(formatter.format(root.path(), "a.ts", &CancellationToken::new()).await, FormatOutcome::Skipped);
         // A parse error is a note with the last lines of the formatter's output.
-        let broken = Fake::new(|_, _| {
-            CommandResult {
-                output: "a.ts: SyntaxError: unexpected token\n    at prettier (lib.js:1:1)\n".into(),
-                exit_code: Some(2),
-                ..Default::default()
-            }
+        let broken = Fake::new(|_, _| CommandResult {
+            output: "a.ts: SyntaxError: unexpected token\n    at prettier (lib.js:1:1)\n".into(),
+            exit_code: Some(2),
+            ..Default::default()
         });
         let formatter = hook(&FormatterSetting::Auto, true, &broken);
         assert_eq!(
             formatter.format(root.path(), "a.ts", &CancellationToken::new()).await,
-            FormatOutcome::Failed("it failed with exit code 2:\na.ts: SyntaxError: unexpected token\n    at prettier (lib.js:1:1)".into())
+            FormatOutcome::Failed(
+                "it failed with exit code 2:\na.ts: SyntaxError: unexpected token\n    at prettier (lib.js:1:1)".into()
+            )
         );
         // Silent failure.
         let silent = Fake::new(|_, _| CommandResult { exit_code: Some(1), ..Default::default() });
@@ -612,13 +601,7 @@ mod tests {
         formatter.format(root.path(), "src/a.rs", &CancellationToken::new()).await;
         formatter.format(root.path(), "src/main.zig", &CancellationToken::new()).await;
         let commands = fake.ran().into_iter().map(|r| r.command).collect::<Vec<_>>();
-        assert_eq!(
-            commands,
-            [
-                "rustfmt --config skip_children=true 'src/a.rs'",
-                "zig fmt 'src/main.zig'",
-            ]
-        );
+        assert_eq!(commands, ["rustfmt --config skip_children=true 'src/a.rs'", "zig fmt 'src/main.zig'",]);
     }
 
     #[tokio::test]
@@ -653,9 +636,8 @@ mod tests {
         let mut ctx = ToolContext::new(root.path());
         root.write(".prettierrc", "{}");
         testing::bin(&root, "prettier", "#!/bin/sh\ntrue\n");
-        let fake = Fake::new(|_, _| {
-            CommandResult { output: "a.ts: SyntaxError\n".into(), exit_code: Some(2), ..Default::default() }
-        });
+        let fake =
+            Fake::new(|_, _| CommandResult { output: "a.ts: SyntaxError\n".into(), exit_code: Some(2), ..Default::default() });
         ctx.formatter = Some(hook(&FormatterSetting::Auto, true, &fake));
         let absolute = root.path().join("a.ts");
         std::fs::write(&absolute, "written").unwrap();
@@ -664,7 +646,9 @@ mod tests {
         assert!(!formatted.beyond);
         assert_eq!(
             formatted.failure.as_deref(),
-            Some("the project's formatter failed: it failed with exit code 2:\na.ts: SyntaxError (the file keeps what this edit wrote).")
+            Some(
+                "the project's formatter failed: it failed with exit code 2:\na.ts: SyntaxError (the file keeps what this edit wrote)."
+            )
         );
     }
 
@@ -737,7 +721,8 @@ pub(crate) mod testing {
     pub(crate) fn bin(root: &TempDir, name: &str, script: &str) {
         root.write(&format!("node_modules/.bin/{name}"), script);
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(root.path().join(format!("node_modules/.bin/{name}")), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(root.path().join(format!("node_modules/.bin/{name}")), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
     }
 
     /// The real run path ([`crate::bash::run_command`]), unsandboxed (the crate's tests run without bwrap).
@@ -757,6 +742,7 @@ pub(crate) mod testing {
                         project_read_only: false,
                         env: None,
                         forwards: vec![],
+                        pipe_check: false,
                     },
                     &marv_sandbox::Sandbox::from_env(false),
                     &cancel,

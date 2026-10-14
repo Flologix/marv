@@ -195,10 +195,8 @@ impl Tool for WriteFile {
             let nl = if planned.new_line_missing { "; added a newline to its last line first" } else { "" };
             let crlf_note = if planned.crlf { "; kept its CRLF line endings" } else { "" };
             let summary = change_summary(&diff);
-            let mut result = ToolOutput::ok(
-                format!("{what} {} ({summary} lines{nl}{crlf_note}).{notes}{broken}", planned.shown),
-                summary,
-            );
+            let mut result =
+                ToolOutput::ok(format!("{what} {} ({summary} lines{nl}{crlf_note}).{notes}{broken}", planned.shown), summary);
             result.diff = Some(shown_diff(&diff.lines));
             result
         };
@@ -617,10 +615,13 @@ mod tests {
     async fn an_edit_with_double_quotes_lands_formatted_and_the_result_shows_it() {
         let (f, ctx) = formatting_fixture("w-fmt-edit", true);
         f.root.write("a.js", "const a = \"hi\";\n");
-        let out =
-            run_with(&ctx, "edit_file", json!({"path": "a.js", "old_string": "const a = \"hi\";", "new_string": "const b = \"there\";"}))
-                .await
-                .result;
+        let out = run_with(
+            &ctx,
+            "edit_file",
+            json!({"path": "a.js", "old_string": "const a = \"hi\";", "new_string": "const b = \"there\";"}),
+        )
+        .await
+        .result;
         assert!(!out.is_error, "{}", out.output);
         // What landed is the formatted file.
         assert_eq!(f.read("a.js"), "const b = 'there';\n");
@@ -644,10 +645,13 @@ mod tests {
     async fn no_formatter_config_means_no_change() {
         let (f, ctx) = formatting_fixture("w-fmt-none", false);
         f.root.write("a.js", "const a = \"hi\";\n");
-        let out =
-            run_with(&ctx, "edit_file", json!({"path": "a.js", "old_string": "const a = \"hi\";", "new_string": "const b = \"there\";"}))
-                .await
-                .result;
+        let out = run_with(
+            &ctx,
+            "edit_file",
+            json!({"path": "a.js", "old_string": "const a = \"hi\";", "new_string": "const b = \"there\";"}),
+        )
+        .await
+        .result;
         assert!(!out.is_error, "{}", out.output);
         assert_eq!(f.read("a.js"), "const b = \"there\";\n");
         assert!(out.diff.unwrap().lines.iter().any(|l| l.text == "const b = \"there\";"));
@@ -677,10 +681,13 @@ mod tests {
             Some(crate::formatter::testing::run_unsandboxed()),
         )));
         f.root.write("a.js", "const a = \"hi\";\n");
-        let out =
-            run_with(&ctx, "edit_file", json!({"path": "a.js", "old_string": "const a = \"hi\";", "new_string": "const b = \"there\";"}))
-                .await
-                .result;
+        let out = run_with(
+            &ctx,
+            "edit_file",
+            json!({"path": "a.js", "old_string": "const a = \"hi\";", "new_string": "const b = \"there\";"}),
+        )
+        .await
+        .result;
         // The edit landed; the formatter's failure is a note.
         assert!(!out.is_error, "{}", out.output);
         assert_eq!(f.read("a.js"), "const b = \"there\";\n");

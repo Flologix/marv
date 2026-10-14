@@ -11,7 +11,7 @@
 //! - `tests/worktree.rs`: worktree subagents (`.git` read-only, Marv commits for them);
 //! - `tests/mcp.rs`: trust, package runners, ignored `instructions`;
 //! - `tests/mesh.rs`: the mesh from inside a sandbox (unwired calls refused and logged, a subagent reaches the parent
-//!   only over its wire);
+//!   only over its wire; a message that wakes an idle Marv is fenced and taints, #78);
 //! - `tests/web.rs`: what a reader doesn't see never reaches the model (hidden text in web pages);
 //! - `tests/images.rs`: images (not built yet: ignored);
 //! - `tests/github.rs`, `tests/host.rs`: the doors out of the sandbox (Marv #47, #52): what gh can never do, what

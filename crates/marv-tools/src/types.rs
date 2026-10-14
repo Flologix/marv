@@ -32,9 +32,9 @@ use std::any::Any;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::formatter::Formatter;
 use async_trait::async_trait;
 pub use marv_core::Door;
-use crate::formatter::Formatter;
 use marv_core::{Provenance, ToolKind, ToolSpec};
 use marv_sandbox::{ProtectedRule, Sandbox, TaintState};
 use serde::de::DeserializeOwned;
@@ -221,6 +221,10 @@ pub trait ProcessHost: Send + Sync {
     /// Stops it and forgets it; false when there's none of that name.
     async fn stop(&self, name: &str) -> bool;
     fn list(&self) -> Vec<ProcessInfo>;
+    /// A one-shot session (`marv -p`): Marv stops every process when it exits after the reply (#86).
+    fn one_shot(&self) -> bool {
+        false
+    }
 }
 
 /// The running processes' forwarded ports, as bash's relay needs them (Marv's `ToolContext.forwards`).
@@ -382,6 +386,28 @@ pub struct ToolContext {
     /// The project's formatter (#67), built by the session: it runs on every file the edit tools write, inside the
     /// sandbox, before the tools' notes; without it (off, or no sandbox) the tools change nothing but their edit.
     pub formatter: Option<Arc<dyn Formatter>>,
+    /// Commands that failed in the sandbox without network in a way that looked like it (#81): a retry without
+    /// network is asked for with network instead (bash's `repair`). Fresh for each context (the session's turn, a
+    /// subagent).
+    pub network_failures: Arc<NetworkFailures>,
+    /// This session's folder of saved outputs (#61, `~/.marv/tool-output/<session>`): a cut result is saved there
+    /// whole, and `read_file` and `grep` may read it (only it, read-only). None: cuts aren't saved.
+    pub tool_output: Option<PathBuf>,
+}
+
+/// Sandboxed commands, by [`marv_core::command::command_key`], whose failure without network looked like the missing
+/// network (the ones that got [`marv_sandbox::notes::NETWORK_NOTE`]), so a retry that only changes the tail
+/// (`&& du -sh`, `| tail -2`) is recognized (#81).
+#[derive(Debug, Default)]
+pub struct NetworkFailures(std::sync::Mutex<std::collections::HashSet<String>>);
+
+impl NetworkFailures {
+    pub fn record(&self, command: &str) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).insert(marv_core::command::command_key(command));
+    }
+    pub fn contains(&self, command: &str) -> bool {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).contains(&marv_core::command::command_key(command))
+    }
 }
 
 impl ToolContext {
@@ -410,6 +436,8 @@ impl ToolContext {
             processes: None,
             forwards: None,
             formatter: None,
+            network_failures: Arc::default(),
+            tool_output: None,
         }
     }
 

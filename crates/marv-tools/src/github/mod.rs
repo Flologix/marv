@@ -32,7 +32,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::bash::{CommandResult, capture, format_output};
+use crate::bash::{Captured, CommandResult, capture_until, format_output_with};
+use crate::output::cut_for_call;
 use crate::types::{Door, Preview, Scope, Tool, ToolContext, ToolError, ToolOutput};
 use allow::{Classified, ClassifyContext, classify, origin_host};
 use redact::{redact, redacted_note};
@@ -227,24 +228,13 @@ async fn run_gh(
     let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
         return Err(ToolError::new("couldn't start gh: no output pipes"));
     };
-    let io = async { tokio::join!(capture(stdout), capture(stderr)) };
-    tokio::pin!(io);
     let deadline = tokio::time::sleep(timeout);
     tokio::pin!(deadline);
-    let (mut timed_out, mut aborted) = (false, false);
-    let (out, err) = loop {
-        tokio::select! {
-            out = &mut io => break out,
-            () = &mut deadline, if !timed_out && !aborted => {
-                timed_out = true;
-                let _ = child.start_kill();
-            }
-            () = cancel.cancelled(), if !timed_out && !aborted => {
-                aborted = true;
-                let _ = child.start_kill();
-            }
-        }
-    };
+    let Captured { output: out, errors: err, timed_out, aborted } =
+        capture_until(stdout, stderr, deadline.as_mut(), cancel, || {
+            let _ = child.start_kill();
+        })
+        .await;
     let status = child.wait().await.ok();
     let output = if !out.is_empty() && !err.is_empty() {
         format!("{}\n{err}", out.trim_end())
@@ -466,8 +456,10 @@ impl Tool for Github {
     async fn run(&self, input: &GithubInput, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let env = self.env();
         self.judge(&input.args, ctx, &env).await?; // Again here: a read that names a host never went through the preview.
-        let result = run_gh(&input.args, &ctx.root, &env, &ctx.cancel, TIMEOUT).await?;
-        let shown = redact(&format_output(&result));
+        let mut result = run_gh(&input.args, &ctx.root, &env, &ctx.cancel, TIMEOUT).await?;
+        // Redacted before the cut, so a cut output saved whole (#61) is redacted too.
+        let shown = redact(&result.output);
+        result.output = shown.text;
         let trimmed = result.output.trim_end();
         let lines = if trimmed.is_empty() { 0 } else { trimmed.split('\n').count() };
         let status = if result.timed_out {
@@ -485,7 +477,10 @@ impl Tool for Github {
             n => format!(" · {n} tokens redacted"),
         };
         let note = if shown.count > 0 { format!("\n\n{}", redacted_note(shown.count)) } else { String::new() };
-        Ok(ToolOutput::ok(shown.text + &note, status + &redacted))
+        Ok(ToolOutput::ok(
+            format_output_with(&result, |t| cut_for_call(t, ctx, marv_core::Provenance::Project)) + &note,
+            status + &redacted,
+        ))
     }
 }
 

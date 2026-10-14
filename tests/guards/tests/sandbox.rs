@@ -381,6 +381,57 @@ async fn no_tool_follows_a_symlink_out_of_the_project() {
     assert!(!outside.path().join("new.txt").exists());
 }
 
+/// **…the one way out for reading: the session's saved tool outputs (#61).** `read_file` and `grep` read the files of
+/// exactly that folder (after realpath); another session's folder, the rest of `~/.marv` and a symlink out of it are
+/// refused, the writing tools treat it as outside the project, and sandboxed bash can't see it at all.
+///
+/// Proven: made `resolve_readable` accept the whole store (the folder's parent) → failed (another session's output
+/// read); made it take a lexical path instead of `resolve_within`'s realpath → failed (the symlink's target read).
+#[tokio::test]
+async fn only_reading_tools_reach_the_sessions_saved_outputs_and_nothing_else_outside() {
+    let (project, home) = (TempDir::new("spill"), TempDir::outside_tmp("spill-home"));
+    let saved = home.write(".marv/tool-output/s1/b1.txt", "test parser FAILED\n");
+    let other = home.write(".marv/tool-output/s2/b1.txt", "another session's\n");
+    home.write(".marv/config.json", "{\"key\": \"sk-secret\"}");
+    let secret = home.write("secret.txt", "top secret\n");
+    let dir = saved.parent().unwrap().to_path_buf();
+    std::os::unix::fs::symlink(&secret, dir.join("link.txt")).unwrap();
+    let ctx = ToolContext {
+        home: home.path().into(),
+        tool_output: Some(dir.clone()),
+        approver: Some(Recorder::new(Decision::Yes)),
+        ..ToolContext::new(project.path())
+    };
+    let run = |name: &str, args: serde_json::Value| {
+        let (call, ctx) = (call(name, args), ctx.clone());
+        async move { run_tool(&call, &ctx, builtin_tools()).await.result }
+    };
+
+    assert!(run("read_file", json!({"path": saved})).await.output.contains("test parser FAILED"));
+    assert!(run("grep", json!({"pattern": "FAILED", "path": saved})).await.output.contains("test parser FAILED"));
+    for path in [other.display().to_string(), "~/.marv/config.json".into(), dir.join("link.txt").display().to_string()] {
+        for (tool, args) in [("read_file", json!({"path": path})), ("grep", json!({"pattern": ".", "path": path}))] {
+            let out = run(tool, args).await;
+            assert!(out.is_error, "{tool} {path}: {}", out.output);
+            assert!(!["another", "sk-secret", "top secret"].iter().any(|s| out.output.contains(s)), "{}", out.output);
+        }
+    }
+    let write = run("write_file", json!({"path": saved, "content": "x"})).await;
+    let edit = run("edit_file", json!({"path": saved, "old_string": "FAILED", "new_string": "ok"})).await;
+    assert!(write.is_error && edit.is_error, "{} / {}", write.output, edit.output);
+    assert_eq!(std::fs::read_to_string(&saved).unwrap(), "test parser FAILED\n");
+
+    require_bwrap!();
+    let ran = run_sandboxed(
+        &sandbox_with_home(home.path()),
+        project.path(),
+        &CommandMounts::default(),
+        &format!("cat {} ~/.marv/tool-output/s1/b1.txt", saved.display()),
+        &[],
+    );
+    assert!(!ran.output.contains("FAILED"), "{}", ran.output);
+}
+
 /// **…including a dangling symlink**: a write through `out.sh -> /elsewhere/planted.sh` creates the target. Found by
 /// this suite: `resolve_in_project` checked the nearest *existing* ancestor, and `write_file` wrote outside the
 /// project. A dangling link into `.git` is refused too.

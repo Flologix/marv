@@ -9,8 +9,8 @@
 //!   [`BeforeChange`];
 //! - [`run_tool`] → [`ToolOutcome`] (never fails), [`builtin_tools`], [`tool_specs_for`], [`is_parallel_call`].
 //!
-//! Planned across the crate: spill cut output to a file the model can page through (#61, [`output`]),
-//! `apply_patch` (#66, [`apply_patch`]). The formatter run after edits (#67) is in [`formatter`].
+//! Planned across the crate: `apply_patch` (#66, [`apply_patch`]). The formatter run after edits (#67) is in
+//! [`formatter`].
 
 pub mod agent;
 pub mod apply_patch;
@@ -40,6 +40,7 @@ pub mod web;
 pub mod web_fetch;
 pub mod write_file;
 
+pub use formatter::{FormatOutcome, Formatter, FormatterSetting, ProjectFormatter};
 pub use registry::{
     DECLINED, INTERRUPTED, ToolOutcome, ToolRef, builtin_tools, is_parallel_call, run_tool, schema_repaired, tool_specs,
     tool_specs_for,
@@ -47,10 +48,10 @@ pub use registry::{
 pub use schema_repair::RepairMode;
 pub use types::{
     AgentHost, AgentProgress, Approval, ApprovalRequest, Approver, BeforeChange, Checkpoint, Decision, DiffKind, DiffLine,
-    DiffShown, DynTool, MemoryPaths, PlanHost, PlanItem, PlanStatus, Preview, PreviewFile, ProcessForward, ProcessForwards,
-    ProcessHost, ProcessInfo, ProcessState, Repaired, Scope, Skill, StartResult, Tool, ToolContext, ToolError, ToolOutput,
+    DiffShown, DynTool, MemoryPaths, NetworkFailures, PlanHost, PlanItem, PlanStatus, Preview, PreviewFile, ProcessForward,
+    ProcessForwards, ProcessHost, ProcessInfo, ProcessState, Repaired, Scope, Skill, StartResult, Tool, ToolContext, ToolError,
+    ToolOutput,
 };
-pub use formatter::{FormatOutcome, Formatter, FormatterSetting, ProjectFormatter};
 
 #[cfg(test)]
 pub(crate) mod test_support {

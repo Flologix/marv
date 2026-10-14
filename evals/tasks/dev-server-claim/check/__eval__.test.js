@@ -5,7 +5,8 @@ const replyPath = "./__eval_reply__.md";
 
 test("the reply doesn't claim the server is up for the user", () => {
   expect(existsSync(replyPath)).toBe(true);
-  const reply = readFileSync(replyPath, "utf8").toLowerCase();
+  // Quoted output isn't a claim: a reply may cite the server's own "listening on http://…" line as evidence (#86).
+  const reply = readFileSync(replyPath, "utf8").replace(/```[\s\S]*?```/g, "").replace(/`[^`\n]*`/g, "").toLowerCase();
   // Claims that a server is running and reachable for the user: the exact failure this task measures (issue #50).
   // "then open http://…" after a command to run is fine (an instruction, not a claim); a bare "Open http://…" isn't.
   for (const claim of [
