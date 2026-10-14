@@ -267,7 +267,7 @@ pub struct SessionInit {
     /// `~/.marv/worktrees/<project>`; without it, no worktrees.
     pub worktrees_dir: Option<PathBuf>,
     /// `~/.marv/tool-output` (#61): a cut tool result is saved whole in `<dir>/<session id>/`, which read_file and grep
-    /// may read; old sessions' folders are cleaned up when the session is made. Without it, cuts aren't saved.
+    /// may read; old sessions' folders are cleaned up at its first turn. Without it, cuts aren't saved.
     pub tool_output_dir: Option<PathBuf>,
     /// What the user saw, saved with the session (the TUI's transcript); default: the messages and replies.
     pub transcript: Option<TranscriptFn>,
@@ -540,6 +540,11 @@ impl State {
 
 struct Inner {
     init: SessionInit,
+    /// The hold on this session's saved-outputs folder (#61): the store's cleanup, here or in another Marv, never
+    /// deletes it while the session lives. Moved to the resumed session's folder on a resume.
+    tool_output_hold: Mutex<Option<marv_tools::output::LiveFolder>>,
+    /// The store's cleanup has run (#61): once, at the first turn, when a resume has already set the id.
+    tool_output_cleaned: std::sync::atomic::AtomicBool,
     /// Built once: every request sends byte-identical tool definitions.
     specs: Vec<marv_core::ToolSpec>,
     always: AlwaysScopes,
@@ -752,7 +757,11 @@ impl SubagentSink for TurnSink {
 
 impl MarvSession {
     /// Builds a session. Fails (and changes nothing) for a taken tool name, or yolo where `no_yolo` forbids it.
-    pub fn new(init: SessionInit) -> Result<Self, SessionError> {
+    pub fn new(mut init: SessionInit) -> Result<Self, SessionError> {
+        // An absolute path (#61): the marker names it, and read_file and grep only take an absolute one outside the
+        // project. A relative MARV_CONFIG_DIR would otherwise make it a project path.
+        init.tool_output_dir =
+            init.tool_output_dir.map(|dir| marv_sandbox::paths::normalize(&std::path::absolute(&dir).unwrap_or(dir)));
         let process_on = init.processes && marv_sandbox::sandbox_available();
         // The process tool is built in only where the session offers it: elsewhere the name is free (Marv).
         let custom: Vec<ToolRef> = init.tools.iter().filter(|t| process_on || t.name() != "process").cloned().collect();
@@ -846,18 +855,13 @@ impl MarvSession {
             }),
             checkpoints,
             state: Mutex::new(state),
+            tool_output_hold: Mutex::default(),
+            tool_output_cleaned: Default::default(),
             init,
         };
         let session = Self { inner: Arc::new(inner) };
-        // Startup is when old saved outputs go (#61): on a thread of its own, so a big store never delays the session.
-        if let Some(dir) = session.inner.init.tool_output_dir.clone() {
-            let id = session.id();
-            std::thread::spawn(move || {
-                let keep = std::time::Duration::from_secs(marv_tools::output::KEEP_DAYS * 86_400);
-                let max = marv_tools::output::MAX_TOTAL_BYTES;
-                marv_tools::output::clean_tool_output(&dir, keep, max, Some(&id), std::time::SystemTime::now());
-            });
-        }
+        // Held from the start, so no other Marv's cleanup takes it (#61).
+        session.hold_tool_output();
         let system = session.build_system();
         session.state().system = system;
         session.lookup();
@@ -866,6 +870,30 @@ impl MarvSession {
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
         self.inner.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The first turn is when old saved outputs go (#61), not the session's making: `marv -c` and the SDK resume
+    /// after making it, and a cleanup started before then could take the resumed conversation's folder. On a thread
+    /// of its own, so a big store never delays the turn.
+    fn clean_tool_output_once(&self) {
+        let Some(dir) = self.inner.init.tool_output_dir.clone() else { return };
+        if self.inner.tool_output_cleaned.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let id = self.id();
+        std::thread::spawn(move || {
+            let keep = std::time::Duration::from_secs(marv_tools::output::KEEP_DAYS * 86_400);
+            let max = marv_tools::output::MAX_TOTAL_BYTES;
+            marv_tools::output::clean_tool_output(&dir, keep, max, Some(&id), std::time::SystemTime::now());
+        });
+    }
+
+    /// Holds the current id's saved-outputs folder (#61), letting go of the one held before (a resume's). A hold that
+    /// fails only leaves the folder to the usual cleanup.
+    fn hold_tool_output(&self) {
+        let Some(dir) = &self.inner.init.tool_output_dir else { return };
+        let held = marv_tools::output::hold(&dir.join(self.id())).ok();
+        *lock(&self.inner.tool_output_hold) = held;
     }
 
     /// The session's id: its file name under `sessions/`, and what `marv -r` and `resume` take.
@@ -1229,6 +1257,7 @@ impl MarvSession {
         ctx.memory = init.memory.as_ref().map(|(paths, _)| paths.for_tools());
         // The session's id now (a resume changes it): its cut outputs are saved, and readable, there (#61).
         ctx.tool_output = init.tool_output_dir.as_ref().map(|dir| dir.join(self.id()));
+        self.clean_tool_output_once();
         ctx.agent_host = Some(host);
         // Where the plan tool writes; only the main agent gets it (as it does agent_host), so subagents have no plan.
         if init.plan {
@@ -1622,6 +1651,7 @@ impl MarvSession {
             s.listing = None; // a new conversation decides its MCP mode again
             s.plan = None; // a new conversation, a new plan
         }
+        self.hold_tool_output(); // the new id's folder (#61)
         lock(&self.inner.loaded).clear();
         self.inner.nested.reset();
         if let Some((paths, _)) = &self.inner.init.memory
@@ -1700,6 +1730,8 @@ impl MarvSession {
             s.pending_note = pending_note;
             (resumed, id)
         };
+        // Its saved outputs are this conversation's again: kept while it lives, 7 days from now after (#61).
+        self.hold_tool_output();
         // One that can't be read is left as it is: this conversation's turns go on a chain of their own, so their
         // numbers can't meet its turns. Its id is saved with the session, so the next resume finds those turns.
         let chain = self.inner.checkpoints.chain().await;
@@ -4015,6 +4047,71 @@ mod turn_tests {
     }
 
     #[tokio::test]
+    async fn a_relative_store_still_names_an_absolute_file_the_model_can_read() {
+        let dirs = Dirs::new();
+        // MARV_CONFIG_DIR=some/relative/dir: the store is under the process's folder, named relatively.
+        let cwd = std::env::current_dir().unwrap();
+        let up = "../".repeat(cwd.components().count() - 1);
+        let relative =
+            PathBuf::from(format!("{up}{}", dirs.dir.join("tool-output").display().to_string().trim_start_matches('/')));
+        assert!(relative.is_relative());
+        let provider = Scripted::new(vec![use_tools(vec![call("b1", "bash", serde_json::json!({"command": "seq 1 20000"}))])]);
+        let session = scripted(&dirs, &provider, |i| {
+            i.sandbox = false;
+            i.approve = Some(answer(Decision::Yes));
+            i.tool_output_dir = Some(relative.clone());
+        });
+        let saved = dirs.dir.join("tool-output").join(session.id()).join("b1.txt");
+        let read = call("r1", "read_file", serde_json::json!({"path": saved, "offset": 15000, "limit": 1}));
+        lock(&provider.steps).extend([use_tools(vec![read]), say("done")]);
+        let events = collect(go(&session, "count")).await;
+        let results: Vec<String> = events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::Loop(LoopEvent::ToolEnd { run, .. }) => Some(run.result.output.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(results[0].contains(&format!("full output: {} —", saved.display())), "{:.300}", &results[0][10_000..]);
+        assert!(results[1].contains("15000→15000"), "{}", results[1]);
+    }
+
+    #[tokio::test]
+    async fn a_resumed_sessions_saved_outputs_and_a_running_ones_survive_the_cleanup() {
+        let dirs = Dirs::new();
+        let store = dirs.dir.join("tool-output");
+        let sessions = Arc::new(SessionStore::new(&dirs.dir));
+        let mut old = crate::sessions::new_session(&dirs.project, "openrouter", "test-model", 1_000);
+        old.id = "old-conversation".into();
+        old.conversation = vec![ChatTurn::User { text: "run the tests".into() }];
+        old.transcript = vec![Message::new(1, Role::User, "run the tests")];
+        sessions.save(&old).await.unwrap();
+        let month_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86_400);
+        let age = |name: &str| std::fs::File::open(store.join(name)).unwrap().set_modified(month_ago).unwrap();
+        std::fs::create_dir_all(store.join("old-conversation")).unwrap();
+        std::fs::write(store.join("old-conversation/b1.txt"), "output").unwrap();
+        age("old-conversation");
+
+        let running = scripted(&dirs, &Scripted::new(vec![]), |i| i.tool_output_dir = Some(store.clone()));
+        std::fs::write(store.join(running.id()).join("b1.txt"), "output").unwrap();
+        age(&running.id());
+        let resumed = scripted(&dirs, &Scripted::new(vec![]), |i| {
+            i.tool_output_dir = Some(store.clone());
+            i.sessions = Some(sessions.clone());
+        });
+        resumed.resume(ResumeTarget::Id("old-conversation".into())).await.unwrap().unwrap();
+
+        // Another Marv starting now: over a week old, and the store over its cap, yet both are in use.
+        let week = std::time::Duration::from_secs(marv_tools::output::KEEP_DAYS * 86_400);
+        marv_tools::output::clean_tool_output(&store, week, 0, Some("someone-else"), std::time::SystemTime::now());
+        assert!(store.join("old-conversation/b1.txt").exists(), "the resumed conversation's outputs are kept");
+        assert!(store.join(running.id()).join("b1.txt").exists(), "a running session's outputs are kept");
+        drop(running);
+        marv_tools::output::clean_tool_output(&store, week, u64::MAX, None, std::time::SystemTime::now());
+        assert!(store.join("old-conversation/b1.txt").exists(), "resuming made them recent");
+    }
+
+    #[tokio::test]
     async fn old_saved_outputs_are_cleaned_up_when_a_session_starts() {
         let dirs = Dirs::new();
         let store = dirs.dir.join("tool-output");
@@ -4024,8 +4121,11 @@ mod turn_tests {
             let when = std::time::SystemTime::now() - std::time::Duration::from_secs(days * 86_400);
             std::fs::File::open(store.join(name)).unwrap().set_modified(when).unwrap();
         }
-        let provider = Scripted::new(vec![]);
-        let _session = scripted(&dirs, &provider, |i| i.tool_output_dir = Some(store.clone()));
+        let provider = Scripted::new(vec![say("hi")]);
+        let session = scripted(&dirs, &provider, |i| i.tool_output_dir = Some(store.clone()));
+        // Not when it's made (a resume may follow): at the first turn.
+        assert!(store.join("old-session").exists());
+        collect(go(&session, "hello")).await;
         // On a thread of its own: wait for it.
         for _ in 0..200 {
             if !store.join("old-session").exists() {

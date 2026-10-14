@@ -88,7 +88,7 @@ impl Tool for McpToolAdapter {
     async fn run(&self, input: &Self::Input, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let result = self.tool.run_whole(input.clone(), ctx.cancel.clone()).await.map_err(ToolError::new)?;
         // Cut here, not in marv-mcp: a cut result is saved whole for read_file and grep (#61).
-        let mut out = ToolOutput::ok(cut_for_call(&result.output, ctx), result.summary.unwrap_or_default());
+        let mut out = ToolOutput::ok(cut_for_call(&result.output, ctx, Provenance::Mcp), result.summary.unwrap_or_default());
         out.is_error = result.is_error;
         out.provenance = Provenance::Mcp;
         Ok(out)
@@ -301,14 +301,40 @@ mod tests {
             taint: Arc::new(TaintState::new()),
         };
         let store = std::env::temp_dir().join(format!("marv-mcp-spill-{}", std::process::id()));
+        // Removed even when an assertion fails (#89).
+        struct Gone(std::path::PathBuf);
+        impl Drop for Gone {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _gone = Gone(store.clone());
         let ctx =
             ToolContext { tool_output: Some(store.join("s")), call_id: Some("m1".into()), ..ToolContext::new("/nonexistent/p") };
         let out = adapter.run(&Map::new(), &ctx).await.unwrap();
-        let saved = store.join("s/m1.txt");
+        let saved = store.join("s/m1.mcp.txt");
         assert!(out.output.starts_with("first\n") && out.output.ends_with("\nlast"));
         assert!(out.output.contains(&format!("characters omitted; full output: {}", saved.display())));
         assert_eq!(std::fs::read_to_string(&saved).unwrap(), format!("first\n{}\nlast", "y".repeat(40_000)));
-        std::fs::remove_dir_all(store).unwrap();
+
+        // Read back, it's still the server's text: fenced as MCP's and tainting, by read_file and by grep.
+        let taint = Arc::new(TaintState::new());
+        let ctx = ToolContext { taint: taint.clone(), call_id: None, ..ctx };
+        for (name, args) in
+            [("read_file", json!({"path": saved, "limit": 1})), ("grep", json!({"pattern": "first", "path": saved}))]
+        {
+            let call = ToolCall { id: "r".into(), name: name.into(), arguments: args.to_string() };
+            let outcome = marv_tools::run_tool(&call, &ctx, marv_tools::builtin_tools()).await;
+            assert_eq!(outcome.result.provenance, Provenance::Mcp, "{name}");
+            let run = crate::runner::tool_run_from(outcome, None);
+            let fenced = format!("<{} source=\"mcp\"", crate::provenance::FENCE_TAG);
+            assert!(
+                run.result.output.starts_with(&fenced) && run.result.output.contains("first"),
+                "{name}: {}",
+                run.result.output
+            );
+        }
+        assert!(taint.is_tainted());
     }
 
     struct Recording(std::sync::Mutex<Vec<String>>);

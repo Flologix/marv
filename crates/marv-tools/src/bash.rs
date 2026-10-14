@@ -449,7 +449,10 @@ impl Tool for Bash {
             let note = if shown.count > 0 { format!("\n{}", redacted_note(shown.count)) } else { String::new() };
             let redacted = if shown.count > 0 { format!(" · {} redacted", shown.count) } else { String::new() };
             let summary = format!("{} · on your machine{redacted}", command_summary(&result, timeout));
-            return Ok(ToolOutput::ok(format_output_with(&result, |t| cut_for_call(t, ctx)) + &note, summary));
+            return Ok(ToolOutput::ok(
+                format_output_with(&result, |t| cut_for_call(t, ctx, marv_core::Provenance::Project)) + &note,
+                summary,
+            ));
         }
         // A command that runs without asking sees .git read-only: git runs hooks and config from it outside any
         // sandbox (the user's next commit, their editor), so a planted hook would escape. Without a .git, it can't
@@ -530,7 +533,7 @@ impl Tool for Bash {
                 result.output.push_str(&format!("\n{gh}\n"));
             }
         }
-        Ok(ToolOutput::ok(format_output_with(&result, |t| cut_for_call(t, ctx)), summary))
+        Ok(ToolOutput::ok(format_output_with(&result, |t| cut_for_call(t, ctx, marv_core::Provenance::Project)), summary))
     }
 }
 

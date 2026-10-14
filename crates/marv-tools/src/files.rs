@@ -20,7 +20,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::types::{ToolContext, ToolError};
+use crate::types::{ToolContext, ToolError, ToolOutput};
 
 pub use marv_sandbox::paths::{project_path, refuse_git};
 
@@ -60,6 +60,15 @@ pub fn resolve_readable(ctx: &ToolContext, path: &str) -> Result<PathBuf, ToolEr
 pub fn is_tool_output(ctx: &ToolContext, path: &Path) -> bool {
     let real = |p: &Path| std::fs::canonicalize(p).ok();
     ctx.tool_output.as_deref().and_then(real).is_some_and(|dir| real(path).is_some_and(|p| p.starts_with(dir)))
+}
+
+/// A reading tool's result from `path`: when that's a saved tool output, it keeps the source the output came from
+/// (`output::saved_provenance`), so an MCP server's text read back is fenced and taints as it did the first time.
+pub fn with_saved_source(ctx: &ToolContext, path: &Path, mut out: ToolOutput) -> ToolOutput {
+    if is_tool_output(ctx, path) {
+        out.provenance = crate::output::saved_provenance(path);
+    }
+    out
 }
 
 /// For `auto_safe`: whether a path leads into `.git` (outside the project counts too).

@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::files::{is_directory, looks_binary, project_path, require_regular_file, resolve_readable};
+use crate::files::{is_directory, looks_binary, project_path, require_regular_file, resolve_readable, with_saved_source};
 use crate::repair::repair_path_field;
 use crate::types::{Repaired, Tool, ToolContext, ToolError, ToolOutput};
 
@@ -138,7 +138,10 @@ impl Tool for ReadFile {
         if looks_binary(&bytes) {
             return Ok(ToolOutput::ok(format!("Binary file ({} bytes), not shown.", bytes.len()), "binary file"));
         }
-        render(&String::from_utf8_lossy(&bytes), input.offset.unwrap_or(1), input.limit.unwrap_or(DEFAULT_LIMIT), &shown)
+        let out =
+            render(&String::from_utf8_lossy(&bytes), input.offset.unwrap_or(1), input.limit.unwrap_or(DEFAULT_LIMIT), &shown)?;
+        // A saved MCP output is still the server's text (#61).
+        Ok(with_saved_source(ctx, &absolute, out))
     }
 }
 

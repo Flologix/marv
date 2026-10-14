@@ -315,7 +315,7 @@ pub async fn run_subagent(host: &SessionAgentHost, input: &AgentInput, ctx: &Too
     let mut report = subagent_report(&run);
     // marv-rs (#61): a report is cut like a long bash output (Marv's wasn't), and a cut one saved whole. Marv's own
     // lines are at its end, which the cut keeps.
-    report.output = cut_for_call(&report.output, ctx);
+    report.output = cut_for_call(&report.output, ctx, marv_core::Provenance::Subagent);
     Ok(report)
 }
 
@@ -788,6 +788,14 @@ mod run_tests {
         let mut ctx = ctx_with(host, &Asker::yes(), &f.root.0);
         sandbox_off(&mut ctx);
         let store = std::env::temp_dir().join(format!("marv-subagent-spill-{}", std::process::id()));
+        // Removed even when an assertion fails (#89).
+        struct Gone(std::path::PathBuf);
+        impl Drop for Gone {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _gone = Gone(store.clone());
         ctx.tool_output = Some(store.join("s"));
         let out = run(agent_call(serde_json::json!({"description": "x", "prompt": "p"}), "a1"), &ctx).await;
 
@@ -795,11 +803,10 @@ mod run_tests {
         assert!(provider.results(1)[0].contains(&format!("full output: {}", store.join("s/b1.txt").display())));
         assert!(std::fs::read_to_string(store.join("s/b1.txt")).unwrap().ends_with("\n20000"));
         // Its report: cut for the parent, saved under the agent call's id.
-        let saved = store.join("s/a1.txt");
+        let saved = store.join("s/a1.subagent.txt");
         assert!(out.result.output.starts_with("Report start.") && out.result.output.ends_with("Report end."));
         assert!(out.result.output.contains(&format!("full output: {}", saved.display())));
         assert_eq!(std::fs::read_to_string(&saved).unwrap(), report);
-        std::fs::remove_dir_all(store).unwrap();
     }
 
     #[tokio::test]

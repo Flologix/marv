@@ -488,7 +488,10 @@ impl Tool for Github {
             n => format!(" · {n} tokens redacted"),
         };
         let note = if shown.count > 0 { format!("\n\n{}", redacted_note(shown.count)) } else { String::new() };
-        Ok(ToolOutput::ok(format_output_with(&result, |t| cut_for_call(t, ctx)) + &note, status + &redacted))
+        Ok(ToolOutput::ok(
+            format_output_with(&result, |t| cut_for_call(t, ctx, marv_core::Provenance::Project)) + &note,
+            status + &redacted,
+        ))
     }
 }
 

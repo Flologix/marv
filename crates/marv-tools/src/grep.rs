@@ -4,6 +4,8 @@
 //!
 //! - Output `path:line:text`, at most [`MAX_MATCHES`] = 100 lines (then "N more matches not shown"), each cut at
 //!   [`MAX_LINE_CHARS`] = 300; files over 1 MB and binary files are skipped; the summary counts matches and files.
+//!   marv-rs (#61): a long line whose match lies past those 300 shows the 300 around the match instead (`…` and
+//!   where it starts), so a one-line JSON or a long report saved whole can be searched for what's deep in it.
 //! - A glob without a slash matches the file name anywhere (`*.ts`); with one, the project path.
 //! - Never follows a symlink out of the project (each listed file goes through `resolve_in_project`); a FIFO in a
 //!   folder is skipped, one named explicitly is refused; a missing path says it doesn't exist. Esc stops the scan.
@@ -26,7 +28,7 @@ use grep_searcher::{Searcher, SearcherBuilder, sinks};
 
 use crate::files::{
     files_under, is_directory, is_regular_file, is_tool_output, looks_binary, project_path, require_regular_file,
-    resolve_in_project, resolve_readable,
+    resolve_in_project, resolve_readable, with_saved_source,
 };
 use crate::glob::glob_matcher;
 use crate::repair::repair_path_field;
@@ -140,10 +142,12 @@ impl Tool for Grep {
         } else {
             String::new()
         };
-        Ok(ToolOutput::ok(
+        let out = ToolOutput::ok(
             format!("{}{more}", found.lines.join("\n")),
             format!("{} in {}", plural(found.count, "match"), plural(found.files, "file")),
-        ))
+        );
+        // Lines of a saved MCP output are still the server's text (#61).
+        Ok(with_saved_source(ctx, &target, out))
     }
 }
 
@@ -183,8 +187,7 @@ fn search(
             found.count += 1;
             if found.lines.len() < MAX_MATCHES {
                 let line = line.strip_suffix('\n').unwrap_or(line);
-                let cut: String = line.chars().take(MAX_LINE_CHARS).collect();
-                found.lines.push(format!("{file}:{line_number}:{cut}"));
+                found.lines.push(format!("{file}:{line_number}:{}", shown_line(line, matcher)));
             }
             Ok(true)
         });
@@ -194,6 +197,24 @@ fn search(
         }
     }
     found
+}
+
+/// A matching line as shown: whole up to [`MAX_LINE_CHARS`]; past that its start, or, when the match lies beyond the
+/// start, the [`MAX_LINE_CHARS`] around it (a third before), marked with `…` and where it starts.
+fn shown_line(line: &str, matcher: &grep_regex::RegexMatcher) -> String {
+    use grep_matcher::Matcher;
+    let start: String = line.chars().take(MAX_LINE_CHARS).collect();
+    if start.len() == line.len() {
+        return start;
+    }
+    let Ok(Some(found)) = matcher.find(line.as_bytes()) else { return start };
+    let (match_start, match_end) = (line[..found.start()].chars().count(), line[..found.end()].chars().count());
+    if match_end <= MAX_LINE_CHARS {
+        return start;
+    }
+    let from = match_start.saturating_sub(MAX_LINE_CHARS / 3);
+    let window: String = line.chars().skip(from).take(MAX_LINE_CHARS).collect();
+    format!("[from character {}] …{window}…", from + 1)
 }
 
 /// The error for a pattern that doesn't compile; a hint when it looks like JavaScript-only syntax.
@@ -260,6 +281,17 @@ mod tests {
         assert_eq!(out.output.lines().filter(|l| l.contains(":hit")).count(), 100);
         let long = run(&root, json!({"pattern": "hit", "path": "long.txt"})).await.result;
         assert_eq!(long.output.chars().count(), "long.txt:1:".len() + MAX_LINE_CHARS);
+    }
+
+    #[tokio::test]
+    async fn a_match_deep_in_a_long_line_shows_the_text_around_it() {
+        // A one-line JSON, as an MCP result or a curl saves it: the match at character 50,001.
+        let root = TempDir::new("grep-deep");
+        root.write("one.json", format!("{}\"error\": \"parser::quotes FAILED\"{}\n", "a".repeat(50_000), "z".repeat(50_000)));
+        let out = run(&root, json!({"pattern": "FAILED", "path": "one.json"})).await.result;
+        let before = 50_000 + "\"error\": \"parser::quotes ".len() - MAX_LINE_CHARS / 3;
+        assert!(out.output.starts_with(&format!("one.json:1:[from character {}] …", before + 1)), "{}", out.output);
+        assert!(out.output.contains("\"error\": \"parser::quotes FAILED\"") && out.output.ends_with("z…"), "{}", out.output);
     }
 
     #[tokio::test]

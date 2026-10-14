@@ -14,13 +14,20 @@
 //! - Call ids aren't unique (Ollama reuses `call_0`, and a subagent's ids are its own): a taken name gets `-1`, `-2`….
 //! - A save that fails only loses the path: the cut is the same, so the call never fails over it.
 //! - Trajectories record the model's text, so the path, never the saved content.
-//! - [`clean_tool_output`] runs when a session starts: sessions' folders older than [`KEEP_DAYS`] go, then the oldest
+//! - [`clean_tool_output`] runs at a session's first turn (after any resume): sessions' folders older than [`KEEP_DAYS`] go, then the oldest
 //!   until the whole store is under [`MAX_TOTAL_BYTES`]. web_fetch isn't cut but paged (`offset`), so it saves nothing.
+//! - A live session holds its folder ([`hold`]: a shared lock on its `.live` file), and the cleanup never deletes a
+//!   held one: not the session that just started, not the one it then resumed, not another Marv's that's running.
+//! - The source is kept: an output from a source other than the project (an MCP server, a subagent) is saved as
+//!   `<call id>.<source>.txt`, and reading it back with `read_file` or `grep` gives it that source again
+//!   ([`saved_provenance`]), so an MCP server's text is fenced and taints when read back as when it first came.
 
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
+
+use marv_core::Provenance;
 
 use crate::types::ToolContext;
 
@@ -34,6 +41,8 @@ pub const TOOL_OUTPUT_DIR: &str = "tool-output";
 pub const KEEP_DAYS: u64 = 7;
 /// The whole store's cap: past it, the oldest sessions' folders go first.
 pub const MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+/// The file a live session holds a shared lock on, in its folder ([`hold`]).
+pub const LIVE_FILE: &str = ".live";
 
 /// `text` with its middle cut when longer than `max` characters: `head` characters, a marker, then the last
 /// `max - head`.
@@ -66,25 +75,48 @@ pub fn cut_for_model(text: &str) -> String {
 
 /// [`cut_for_model`], and when it cuts, `text` saved whole in `dir` (a session's folder) under the call's id and
 /// named in the marker.
-pub fn spill_cut(text: &str, dir: &Path, call_id: &str) -> std::io::Result<String> {
+pub fn spill_cut(text: &str, dir: &Path, call_id: &str, source: Provenance) -> std::io::Result<String> {
     if text.chars().count() <= MAX_MODEL_CHARS {
         return Ok(text.to_string());
     }
-    let path = save(text, dir, call_id)?;
+    let path = save(text, dir, call_id, source)?;
     Ok(cut_middle_saved(text, MAX_MODEL_CHARS, HEAD_CHARS, Some(&path)))
 }
 
 /// What a call's long result goes through: [`spill_cut`] into the session's folder (`ToolContext::tool_output`),
-/// or the plain cut where there's none or the save fails.
-pub fn cut_for_call(text: &str, ctx: &ToolContext) -> String {
+/// or the plain cut where there's none or the save fails. `source`: where the text came from (the tool's provenance),
+/// kept in the file's name so a read gives it back ([`saved_provenance`]).
+pub fn cut_for_call(text: &str, ctx: &ToolContext, source: Provenance) -> String {
     match &ctx.tool_output {
-        Some(dir) => spill_cut(text, dir, ctx.call_id.as_deref().unwrap_or("call")).unwrap_or_else(|_| cut_for_model(text)),
+        Some(dir) => {
+            spill_cut(text, dir, ctx.call_id.as_deref().unwrap_or("call"), source).unwrap_or_else(|_| cut_for_model(text))
+        }
         None => cut_for_model(text),
     }
 }
 
-/// Writes `text` to a new `<call id>.txt` in `dir` (0600; `-1`, `-2`… when the name is taken). Returns its path.
-fn save(text: &str, dir: &Path, call_id: &str) -> std::io::Result<PathBuf> {
+/// The source's tag in a saved output's name: none for the project, its serde name (`mcp`, `subagent`…) otherwise.
+fn source_tag(source: Provenance) -> Option<String> {
+    (source != Provenance::Project)
+        .then(|| serde_json::to_value(source).ok().and_then(|v| v.as_str().map(str::to_string)))
+        .flatten()
+}
+
+/// The source of a saved output, from its name (`<call id>[-n][.<source>].txt`; a call id has no dots). A name with
+/// a tag Marv doesn't know is MCP's: the strictest reading (fenced, taints).
+pub fn saved_provenance(path: &Path) -> Provenance {
+    let Some(stem) = path.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_suffix(".txt")) else {
+        return Provenance::Mcp;
+    };
+    match stem.split_once('.') {
+        None => Provenance::Project,
+        Some((_, tag)) => serde_json::from_value(serde_json::Value::String(tag.into())).unwrap_or(Provenance::Mcp),
+    }
+}
+
+/// Writes `text` to a new `<call id>[.<source>].txt` in `dir` (0600; `-1`, `-2`… when the name is taken). Returns its
+/// path.
+fn save(text: &str, dir: &Path, call_id: &str, source: Provenance) -> std::io::Result<PathBuf> {
     std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
     // A provider's id is the model's text as far as a file name goes: only what's safe in one.
     let mut name: String =
@@ -92,8 +124,9 @@ fn save(text: &str, dir: &Path, call_id: &str) -> std::io::Result<PathBuf> {
     if name.is_empty() {
         name = "call".into();
     }
+    let tag = source_tag(source).map_or(String::new(), |t| format!(".{t}"));
     for n in 0.. {
-        let path = if n == 0 { dir.join(format!("{name}.txt")) } else { dir.join(format!("{name}-{n}.txt")) };
+        let path = if n == 0 { dir.join(format!("{name}{tag}.txt")) } else { dir.join(format!("{name}-{n}{tag}.txt")) };
         match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path) {
             Ok(mut file) => {
                 file.write_all(text.as_bytes())?;
@@ -106,32 +139,86 @@ fn save(text: &str, dir: &Path, call_id: &str) -> std::io::Result<PathBuf> {
     unreachable!("some name is free")
 }
 
+/// A live session's hold on its folder (a shared lock on its [`LIVE_FILE`]): while it's kept, [`clean_tool_output`]
+/// leaves the folder alone, in this process or another. Dropping it lets the folder age out as usual.
+#[derive(Debug)]
+pub struct LiveFolder {
+    _lock: std::fs::File,
+}
+
+/// Holds `dir` (a session's folder, made if missing) for a live session, and marks it as just used, so a resumed
+/// session's outputs are kept 7 days from now. Waits while a cleanup is deleting it, then makes it again.
+pub fn hold(dir: &Path) -> std::io::Result<LiveFolder> {
+    use std::os::unix::fs::MetadataExt;
+    loop {
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+        let path = dir.join(LIVE_FILE);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(nix::libc::O_NOFOLLOW)
+            .open(&path)?;
+        file.lock_shared()?;
+        // A cleanup that held it exclusively has deleted the folder meanwhile: the lock is then on a file that's gone.
+        let (held, now) = (file.metadata()?, std::fs::symlink_metadata(&path));
+        if now.is_ok_and(|m| m.dev() == held.dev() && m.ino() == held.ino()) {
+            let _ = std::fs::File::open(dir).and_then(|d| d.set_modified(SystemTime::now()));
+            return Ok(LiveFolder { _lock: file });
+        }
+    }
+}
+
+/// Deletes a session's folder unless a live session holds it ([`hold`]); the exclusive lock is kept while deleting,
+/// so a session starting to hold it waits and makes it again. Whether it was deleted.
+fn remove_unless_held(dir: &Path) -> bool {
+    let live = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(dir.join(LIVE_FILE));
+    match live {
+        Ok(file) => file.try_lock().is_ok() && std::fs::remove_dir_all(dir).is_ok(),
+        Err(_) => false,
+    }
+}
+
 /// Startup cleanup of the store (`~/.marv/tool-output`): sessions' folders not changed for `keep` go, then the
-/// oldest ones until the rest is under `max_bytes`. `current` (the session starting) is never deleted. Cheap: one
-/// stat per file; errors are skipped (a missing store is nothing to clean).
+/// oldest ones until the rest is under `max_bytes`. A folder a live session holds ([`hold`]) is never deleted, nor
+/// `current` (the session starting). Cheap: one stat per file; errors are skipped (a missing store is nothing to
+/// clean).
 pub fn clean_tool_output(base: &Path, keep: Duration, max_bytes: u64, current: Option<&str>, now: SystemTime) {
     let Ok(entries) = std::fs::read_dir(base) else { return };
     let mut sessions: Vec<(SystemTime, u64, PathBuf)> = Vec::new();
+    let mut total: u64 = 0;
     for entry in entries.filter_map(Result::ok) {
         let Ok(meta) = std::fs::symlink_metadata(entry.path()) else { continue };
-        if !meta.is_dir() || current.is_some_and(|c| entry.file_name() == c) {
+        if !meta.is_dir() {
+            continue;
+        }
+        if current.is_some_and(|c| entry.file_name() == c) {
+            total += folder_bytes(&entry.path());
             continue;
         }
         let changed = meta.modified().unwrap_or(now);
-        if now.duration_since(changed).is_ok_and(|age| age > keep) {
-            let _ = std::fs::remove_dir_all(entry.path());
+        if now.duration_since(changed).is_ok_and(|age| age > keep) && remove_unless_held(&entry.path()) {
             continue;
         }
-        sessions.push((changed, folder_bytes(&entry.path()), entry.path()));
+        let bytes = folder_bytes(&entry.path());
+        total += bytes;
+        sessions.push((changed, bytes, entry.path()));
     }
-    let current_bytes = current.map_or(0, |c| folder_bytes(&base.join(c)));
-    let mut total: u64 = current_bytes + sessions.iter().map(|(_, bytes, _)| bytes).sum::<u64>();
     sessions.sort();
     for (_, bytes, path) in sessions {
         if total <= max_bytes {
             break;
         }
-        if std::fs::remove_dir_all(&path).is_ok() {
+        if remove_unless_held(&path) {
             total -= bytes;
         }
     }
@@ -171,7 +258,7 @@ mod tests {
         let store = TempDir::new("spill");
         let dir = store.path().join("session-1");
         let output = format!("start\n{}\nend", "é".repeat(50_000));
-        let text = spill_cut(&output, &dir, "call_0").unwrap();
+        let text = spill_cut(&output, &dir, "call_0", Provenance::Project).unwrap();
         let path = dir.join("call_0.txt");
         assert!(text.starts_with("start\n") && text.ends_with("\nend"));
         let omitted = output.chars().count() - MAX_MODEL_CHARS;
@@ -184,13 +271,13 @@ mod tests {
         assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
 
         // Ollama reuses call_0; an id that isn't a file name is made one.
-        let again = spill_cut(&output, &dir, "call_0").unwrap();
+        let again = spill_cut(&output, &dir, "call_0", Provenance::Project).unwrap();
         assert!(again.contains(&dir.join("call_0-1.txt").display().to_string()));
-        let odd = spill_cut(&output, &dir, "../x/y").unwrap();
+        let odd = spill_cut(&output, &dir, "../x/y", Provenance::Project).unwrap();
         assert!(odd.contains(&dir.join("___x_y.txt").display().to_string()));
 
         // Short output: untouched, nothing saved.
-        assert_eq!(spill_cut("short", &dir, "call_9").unwrap(), "short");
+        assert_eq!(spill_cut("short", &dir, "call_9", Provenance::Mcp).unwrap(), "short");
         assert!(!dir.join("call_9.txt").exists());
     }
 
@@ -198,11 +285,67 @@ mod tests {
     fn without_a_store_or_when_the_save_fails_the_cut_is_the_plain_one() {
         let output = "x".repeat(40_000);
         let plain = cut_for_model(&output);
-        assert_eq!(cut_for_call(&output, &ToolContext::new("/tmp")), plain);
+        assert_eq!(cut_for_call(&output, &ToolContext::new("/tmp"), Provenance::Project), plain);
         let store = TempDir::new("spill-fails");
         store.write("file", "not a folder");
         let ctx = ToolContext { tool_output: Some(store.path().join("file/s")), ..ToolContext::new("/tmp") };
-        assert_eq!(cut_for_call(&output, &ctx), plain);
+        assert_eq!(cut_for_call(&output, &ctx, Provenance::Project), plain);
+    }
+
+    #[test]
+    fn a_saved_outputs_name_keeps_its_source_and_a_read_gives_it_back() {
+        let store = TempDir::new("spill-source");
+        let dir = store.path().join("s");
+        let output = "m".repeat(40_000);
+        for (id, source, name) in [
+            ("m1", Provenance::Mcp, "m1.mcp.txt"),
+            ("m1", Provenance::Mcp, "m1-1.mcp.txt"),
+            ("a1", Provenance::Subagent, "a1.subagent.txt"),
+            ("b1", Provenance::Project, "b1.txt"),
+            // A provider's id can't pass for a source: its dots are made underscores.
+            ("x.project", Provenance::Mcp, "x_project.mcp.txt"),
+        ] {
+            let text = spill_cut(&output, &dir, id, source).unwrap();
+            let path = dir.join(name);
+            assert!(text.contains(&path.display().to_string()), "{name}: {text:.200}");
+            assert_eq!(saved_provenance(&path), source, "{name}");
+        }
+        // A tag Marv doesn't know reads as the strictest source.
+        assert_eq!(saved_provenance(Path::new("/s/y.what.txt")), Provenance::Mcp);
+        assert_eq!(saved_provenance(Path::new("/s/.live")), Provenance::Mcp);
+    }
+
+    #[test]
+    fn a_folder_a_live_session_holds_is_never_cleaned_up() {
+        let store = TempDir::new("clean-held");
+        for name in ["resumed", "running", "ended"] {
+            store.write(&format!("{name}/call_0.txt"), "x".repeat(400));
+        }
+        let held: Vec<LiveFolder> = ["resumed", "running"].iter().map(|n| hold(&store.path().join(n)).unwrap()).collect();
+        for name in ["resumed", "running", "ended"] {
+            age(&store.path().join(name), 30);
+        }
+        let week = Duration::from_secs(KEEP_DAYS * 86_400);
+        clean_tool_output(store.path(), week, 0, Some("new"), SystemTime::now());
+        let left = |name: &str| store.path().join(name).join("call_0.txt").exists();
+        assert!(left("resumed") && left("running"), "held folders survive both age and size");
+        assert!(!left("ended"));
+
+        // Once let go, they age out as any other; holding one marks it as just used.
+        drop(held);
+        let resumed = store.path().join("resumed");
+        age(&resumed, 30);
+        let _again = hold(&resumed).unwrap();
+        let fresh = std::fs::metadata(&resumed).unwrap().modified().unwrap();
+        assert!(SystemTime::now().duration_since(fresh).unwrap() < Duration::from_secs(60));
+        clean_tool_output(store.path(), week, u64::MAX, None, SystemTime::now());
+        assert!(left("resumed"));
+        assert!(!store.path().join("running").exists(), "no longer held, 30 days old");
+
+        // A folder held by this process too: the cleanup's lock is refused.
+        let gone = store.path().join("gone");
+        let _held = hold(&gone).unwrap();
+        assert!(gone.join(LIVE_FILE).exists() && !remove_unless_held(&gone));
     }
 
     fn age(dir: &Path, days: u64) {
