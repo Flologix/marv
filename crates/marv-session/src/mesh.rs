@@ -965,6 +965,36 @@ mod tests {
         cancel.cancel();
     }
 
+    /// #77 with #78: a wire made in the one prompt wakes the session only when the user said yes to it (granted by
+    /// the TUI's person, like a wire asked for apart). A no leaves no wire and nothing to wake on.
+    #[tokio::test]
+    async fn only_a_wire_the_user_granted_in_the_one_prompt_wakes_the_session() {
+        let (mesh, _log, _rt, cancel) = switchboard();
+        mesh.plug(parent_id()).unwrap();
+        let inbox = ReceptacleName::new("agent.parent.inbox").unwrap();
+        let call = marv_core::ToolCall {
+            id: "c1".into(),
+            name: MESH_SEND.into(),
+            arguments: r#"{"receptacle": "agent.parent.inbox", "text": "done"}"#.into(),
+        };
+        for (answer, wakes) in [(Decision::No, false), (Decision::Yes, true)] {
+            let worker = mesh.plug_next(WORKER).unwrap();
+            let person = Arc::new(Person(answer, Mutex::default()));
+            let mut ctx = ToolContext::new(std::env::temp_dir());
+            ctx.approver = Some(person.clone());
+            let wires = wire_approver(None, Some(&(person.clone() as Arc<dyn Approver>)));
+            let tools: Vec<ToolRef> = MeshTool::all(&worker, &mesh, wires).into_iter().map(|t| Arc::new(t) as ToolRef).collect();
+            marv_tools::run_tool(&call, &ctx, &tools).await;
+            assert_eq!(person.1.lock().unwrap().iter().map(|r| r.tool.as_str()).collect::<Vec<_>>(), [MESH_WIRE_CALL]);
+            let by = mesh.table().all().iter().find(|w| w.from == worker.id).map(|w| w.grant.local);
+            assert_eq!(by, wakes.then_some(WireBy::Tui), "{answer:?}");
+            let check = wake_check(&mesh, &mut WakeLimit::default(), 0);
+            assert_eq!(check.wake, wakes.then(|| WakeBy { sender: worker.id.clone(), receptacle: inbox.clone() }));
+            mesh.drain_inbox(&parent_id());
+        }
+        cancel.cancel();
+    }
+
     #[test]
     fn the_one_prompt_shows_the_payload_the_wire_its_limits_and_the_taint_warning() {
         let request = WireRequest {
