@@ -914,6 +914,7 @@ impl Bridge {
         init.trajectories = s.trajectories.clone();
         init.log_trajectories = config.trajectories;
         init.worktrees_dir = Some(s.config_dir.join("worktrees").join(project_key(&s.root)));
+        init.tool_output_dir = Some(s.config_dir.join(marv_tools::output::TOOL_OUTPUT_DIR));
         init.checkpoints = config.checkpoints;
         init.checkpoints_dir = Some(s.config_dir.join("checkpoints").join(project_key(&s.root)));
         // Session-start hooks (#108): from the user's own config file only. A project's naming some is only told.

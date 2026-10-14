@@ -384,6 +384,9 @@ pub struct ToolContext {
     /// network is asked for with network instead (bash's `repair`). Fresh for each context (the session's turn, a
     /// subagent).
     pub network_failures: Arc<NetworkFailures>,
+    /// This session's folder of saved outputs (#61, `~/.marv/tool-output/<session>`): a cut result is saved there
+    /// whole, and `read_file` and `grep` may read it (only it, read-only). None: cuts aren't saved.
+    pub tool_output: Option<PathBuf>,
 }
 
 /// Sandboxed commands, by [`marv_core::command::command_key`], whose failure without network looked like the missing
@@ -427,6 +430,7 @@ impl ToolContext {
             processes: None,
             forwards: None,
             network_failures: Arc::default(),
+            tool_output: None,
         }
     }
 

@@ -34,6 +34,7 @@ Each guard's doc comment says how it was proven: the guard was reverted, and the
 | … skill files and folders | `sandbox.rs::skill_files_and_folders_stay_inside_after_realpath` | Proven |
 | … instruction files: project, parent and nested `AGENTS.md`/`CLAUDE.md` | `sandbox.rs::instruction_files_stay_inside_after_realpath` | Proven (#62) |
 | … and inside the project, never a secret or a `node_modules`/`target`/`.git` target | `sandbox.rs::instruction_files_never_read_secrets_or_skipped_folders` | Proven (#62, two reverts) |
+| Saved tool outputs: read_file/grep read only the session's folder; no writes, bash can't see it | `sandbox.rs::only_reading_tools_reach_the_sessions_saved_outputs_and_nothing_else_outside` | Proven (#61; two reverts; bash part real bwrap) |
 | Results tagged; outside text fenced, never Marv's voice | `provenance.rs::outside_text_is_tagged_and_fenced_as_data` | Proven |
 | Web/MCP/mesh/image content taints | `provenance.rs::outside_content_taints_the_session` | Proven |
 | Tainted: network bash asks | `provenance.rs::tainted_network_bash_must_ask` | Proven |

@@ -4,7 +4,8 @@
 //!
 //! - stdout and stderr combined in order (`exec 2>&1` before the command); both pipes read at once so neither fills
 //!   and blocks; at most [`MAX_CAPTURE`] = 2M chars kept in memory; the model sees 30k (10k head + 20k tail,
-//!   [`crate::output`]) and how it ended (`[exit code N]`, `[timed out after Ns]`, `[stopped by the user]`).
+//!   [`crate::output`]) and how it ended (`[exit code N]`, `[timed out after Ns]`, `[stopped by the user]`). A cut
+//!   output is saved whole to the session's tool-output folder and the marker names it (#61).
 //! - If bwrap itself fails to start the sandbox, its stderr is shown as `[sandbox failed to start: …]` instead of
 //!   empty output.
 //! - Timeout default 120 s, max 600 s ([`MAX_TIMEOUT_S`]); a timeout given in milliseconds is repaired (issue #10).
@@ -48,7 +49,7 @@ use marv_sandbox::paths::is_inside;
 use marv_sandbox::protected::{ProtectedRule, created_note, nested_git_dirs, protected_snapshot, revert_created, scan_created};
 
 use crate::github::redact::{redact, redacted_note};
-use crate::output::cut_for_model;
+use crate::output::{cut_for_call, cut_for_model};
 use crate::repair::repair_timeout_field;
 use crate::types::{Door, Preview, Repaired, Scope, Tool, ToolContext, ToolError, ToolOutput};
 
@@ -318,8 +319,13 @@ static GIT_READ_ONLY: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::ne
 
 /// The command's result as the model sees it: output (start and end if long), then how it ended.
 pub fn format_output(result: &CommandResult) -> String {
+    format_output_with(result, cut_for_model)
+}
+
+/// [`format_output`] with the cut given: a call's is [`cut_for_call`], which saves a cut output whole (#61).
+pub fn format_output_with(result: &CommandResult, cut: impl FnOnce(&str) -> String) -> String {
     let trimmed = result.output.trim_end();
-    let text = if result.output.trim().is_empty() { "(no output)".to_string() } else { cut_for_model(trimmed) };
+    let text = if result.output.trim().is_empty() { "(no output)".to_string() } else { cut(trimmed) };
     let ending = if result.timed_out {
         // Math.round(ms / 1000), as Marv.
         format!("[timed out after {}s]", result.timeout.map_or(0, |t| (t.as_millis() + 500) / 1000))
@@ -528,14 +534,19 @@ impl Tool for Bash {
                 pipe_check: true,
                 ..Default::default()
             };
-            let result = run_command(options, &ctx.sandbox, &ctx.cancel).await;
+            let mut result = run_command(options, &ctx.sandbox, &ctx.cancel).await;
             // A second line behind host_env's filter, for GitHub's token shapes only (redact()): other secrets a
-            // command prints itself aren't caught, which is why each host command is shown and asked first.
-            let shown = redact(&format_output(&result));
+            // command prints itself aren't caught, which is why each host command is shown and asked first. Before
+            // the cut, so the saved output (#61) is redacted too.
+            let shown = redact(&result.output);
+            result.output = shown.text;
             let note = if shown.count > 0 { format!("\n{}", redacted_note(shown.count)) } else { String::new() };
             let redacted = if shown.count > 0 { format!(" · {} redacted", shown.count) } else { String::new() };
             let summary = format!("{} · on your machine{redacted}", command_summary(&result, timeout));
-            return Ok(ToolOutput::ok(shown.text + &note, summary));
+            return Ok(ToolOutput::ok(
+                format_output_with(&result, |t| cut_for_call(t, ctx, marv_core::Provenance::Project)) + &note,
+                summary,
+            ));
         }
         // A command that runs without asking sees .git read-only: git runs hooks and config from it outside any
         // sandbox (the user's next commit, their editor), so a planted hook would escape. Without a .git, it can't
@@ -621,7 +632,7 @@ impl Tool for Bash {
                 result.output.push_str(&format!("\n{gh}\n"));
             }
         }
-        Ok(ToolOutput::ok(format_output(&result), summary))
+        Ok(ToolOutput::ok(format_output_with(&result, |t| cut_for_call(t, ctx, marv_core::Provenance::Project)), summary))
     }
 }
 
@@ -1256,6 +1267,30 @@ mod tests {
         assert!(out.result.output.contains("deploy key [redacted token]"));
         assert!(out.result.output.contains("Marv: 1 token was redacted from this output."));
         assert!(out.result.summary.contains("1 redacted"), "{}", out.result.summary);
+    }
+
+    #[tokio::test]
+    async fn a_cut_output_is_saved_whole_and_a_host_commands_is_saved_redacted() {
+        let root = TempDir::new("bash-spill");
+        let store = TempDir::new("bash-spill-store");
+        let mut ctx = tool_ctx(&root, false);
+        ctx.tool_output = Some(store.path().join("s1"));
+        ctx.call_id = Some("b1".into());
+        let out = Bash.run(&bash("seq 1 20000"), &ctx).await.unwrap();
+        let saved = store.path().join("s1/b1.txt");
+        assert!(out.output.contains(&format!("full output: {} — read_file it, or grep it", saved.display())));
+        assert_eq!(std::fs::read_to_string(&saved).unwrap(), (1..=20000).map(|n| n.to_string()).collect::<Vec<_>>().join("\n"));
+        assert!(out.output.ends_with("20000\n\n[exit code 0]"));
+
+        require_bwrap!();
+        let token = format!("ghp_{}", "A".repeat(36));
+        let (mut ctx, _) = asking(&root, Decision::Yes, true);
+        ctx.tool_output = Some(store.path().join("s1"));
+        let command = format!("echo {token}; seq 1 20000");
+        let out = crate::run_tool(&host_call(&command, json!({})), &ctx, &tools()).await;
+        let saved = std::fs::read_to_string(store.path().join("s1/h1.txt")).unwrap();
+        assert!(saved.starts_with("[redacted token]\n1\n") && !saved.contains(&token));
+        assert!(out.result.output.contains("Marv: 1 token was redacted from this output."));
     }
 
     #[tokio::test]

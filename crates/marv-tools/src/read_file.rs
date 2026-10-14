@@ -11,12 +11,14 @@
 //!   ([`LINE_BUDGET_CHARS`]), so `limit: 1` shows a long line whole (an AGENTS.md bullet, issue #40); the cut says so.
 //! - Binary files (a NUL in the first 8 KB) aren't dumped; special files (FIFOs) are refused.
 //! - Port note: lengths are `char` counts (Marv: UTF-16 units).
+//! - marv-rs (#61): it also reads the session's saved tool outputs, the one place outside the project
+//!   (`files::resolve_readable`); the omitted marker of a cut output names the file.
 
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::files::{is_directory, looks_binary, project_path, require_regular_file, resolve_in_project};
+use crate::files::{is_directory, looks_binary, project_path, require_regular_file, resolve_readable, with_saved_source};
 use crate::repair::repair_path_field;
 use crate::types::{Repaired, Tool, ToolContext, ToolError, ToolOutput};
 
@@ -122,7 +124,8 @@ impl Tool for ReadFile {
     }
 
     async fn run(&self, input: &ReadFileInput, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
-        let absolute = resolve_in_project(ctx, &input.path)?;
+        // The project, or a cut tool output saved whole (#61).
+        let absolute = resolve_readable(ctx, &input.path)?;
         let shown = project_path(&ctx.root, &absolute);
         if is_directory(&absolute) {
             return Err(ToolError(format!("\"{shown}\" is a directory. Use glob to list its files.")));
@@ -135,7 +138,10 @@ impl Tool for ReadFile {
         if looks_binary(&bytes) {
             return Ok(ToolOutput::ok(format!("Binary file ({} bytes), not shown.", bytes.len()), "binary file"));
         }
-        render(&String::from_utf8_lossy(&bytes), input.offset.unwrap_or(1), input.limit.unwrap_or(DEFAULT_LIMIT), &shown)
+        let out =
+            render(&String::from_utf8_lossy(&bytes), input.offset.unwrap_or(1), input.limit.unwrap_or(DEFAULT_LIMIT), &shown)?;
+        // A saved MCP output is still the server's text (#61).
+        Ok(with_saved_source(ctx, &absolute, out))
     }
 }
 
@@ -184,6 +190,51 @@ mod tests {
         assert!(many.contains(&format!("(line truncated: {} characters; offset=2 and limit=1 reads it whole)", long.len())));
         let one = run(&root, json!({"path": "notes.md", "offset": 2, "limit": 1})).await.result.output;
         assert!(one.contains(&format!("    2→{long}\n")));
+    }
+
+    #[tokio::test]
+    async fn reads_the_sessions_saved_tool_outputs_and_nothing_else_outside_the_project() {
+        let root = TempDir::new("read-spilled");
+        let home = TempDir::new("read-spilled-home");
+        let store = home.path().join(".marv/tool-output");
+        home.write(".marv/tool-output/s1/b1.txt", "saved line 1\nsaved line 2\n");
+        home.write(".marv/tool-output/s2/b1.txt", "another session's\n");
+        home.write(".marv/config.json", "{}");
+        home.write("secret.txt", "top secret\n");
+        std::os::unix::fs::symlink(home.path().join("secret.txt"), store.join("s1/link.txt")).unwrap();
+        let tools: Vec<ToolRef> = vec![Arc::new(ReadFile)];
+        let ctx = ToolContext { home: home.path().into(), tool_output: Some(store.join("s1")), ..ToolContext::new(root.path()) };
+        let read = |path: String| {
+            let call = ToolCall { id: "c".into(), name: "read_file".into(), arguments: json!({ "path": path }).to_string() };
+            let (ctx, tools) = (ctx.clone(), tools.clone());
+            async move { run_tool(&call, &ctx, &tools).await.result }
+        };
+
+        let saved = read(store.join("s1/b1.txt").display().to_string()).await;
+        assert_eq!(saved.output, "    1→saved line 1\n    2→saved line 2");
+        assert_eq!(read("~/.marv/tool-output/s1/b1.txt".into()).await.output, saved.output);
+
+        for path in [
+            store.join("s2/b1.txt").display().to_string(), // another session's
+            store.join("s1/../s2/b1.txt").display().to_string(),
+            "~/.marv/config.json".into(),
+            store.join("s1/link.txt").display().to_string(), // a symlink out of the folder
+            store.join("s1").display().to_string(),          // the folder itself
+        ] {
+            let out = read(path.clone()).await;
+            assert!(out.is_error && !out.output.contains("secret") && !out.output.contains("another"), "{path}: {}", out.output);
+        }
+        let missing = read(store.join("s1/gone.txt").display().to_string()).await;
+        assert_eq!(missing.output, format!("\"{}\" doesn't exist.", store.join("s1/gone.txt").display()));
+
+        // Without a session folder (a context that saves nothing), it's outside the project like anything else.
+        let call = ToolCall {
+            id: "c".into(),
+            name: "read_file".into(),
+            arguments: json!({ "path": store.join("s1/b1.txt") }).to_string(),
+        };
+        let out = run_tool(&call, &ToolContext { tool_output: None, ..ctx.clone() }, &tools).await.result;
+        assert!(out.is_error && out.output.contains("outside the project"), "{}", out.output);
     }
 
     #[tokio::test]

@@ -4,6 +4,8 @@
 //!
 //! - Output `path:line:text`, at most [`MAX_MATCHES`] = 100 lines (then "N more matches not shown"), each cut at
 //!   [`MAX_LINE_CHARS`] = 300; files over 1 MB and binary files are skipped; the summary counts matches and files.
+//!   marv-rs (#61): a long line whose match lies past those 300 shows the 300 around the match instead (`…` and
+//!   where it starts), so a one-line JSON or a long report saved whole can be searched for what's deep in it.
 //! - A glob without a slash matches the file name anywhere (`*.ts`); with one, the project path.
 //! - Never follows a symlink out of the project (each listed file goes through `resolve_in_project`); a FIFO in a
 //!   folder is skipped, one named explicitly is refused; a missing path says it doesn't exist. Esc stops the scan.
@@ -14,6 +16,8 @@
 //!   usually needs, but no lookaround and no backreferences. The schema keeps Marv's words ("JavaScript syntax"),
 //!   so the requests match Marv's (the oracle, #11); the error for a pattern that uses them says so instead, and the
 //!   model rewrites it.
+//! - marv-rs (#61): a `path` may also name one of the session's saved tool outputs, the one place outside the project
+//!   (`files::resolve_readable`), searched whatever its size; matches show its absolute path.
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -23,7 +27,8 @@ use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{Searcher, SearcherBuilder, sinks};
 
 use crate::files::{
-    files_under, is_directory, is_regular_file, looks_binary, project_path, require_regular_file, resolve_in_project,
+    files_under, is_directory, is_regular_file, is_tool_output, looks_binary, project_path, require_regular_file,
+    resolve_in_project, resolve_readable, with_saved_source,
 };
 use crate::glob::glob_matcher;
 use crate::repair::repair_path_field;
@@ -96,7 +101,8 @@ impl Tool for Grep {
             .build(&input.pattern)
             .map_err(|e| ToolError(invalid_regex(&e.to_string())))?;
         let path = input.path.as_deref().unwrap_or(".");
-        let target = resolve_in_project(ctx, path)?;
+        // The project, or a cut tool output saved whole (#61).
+        let target = resolve_readable(ctx, path)?;
         let base = project_path(&ctx.root, &target);
         // A glob without a slash matches the file name anywhere ("*.ts"); with one, the project path.
         let filter = input.glob.as_deref().map(|g| Ok::<_, ToolError>((glob_matcher(g)?, g.contains('/')))).transpose()?;
@@ -119,9 +125,12 @@ impl Tool for Grep {
         };
         let files: Vec<String> = files.into_iter().filter(|f| wanted(f)).collect();
 
+        // A saved output is searched whatever its size: it's there to be searched, and Marv wrote it (bash keeps 2M
+        // characters at most).
+        let max_bytes = if is_tool_output(ctx, &target) { u64::MAX } else { MAX_FILE_BYTES };
         let root = ctx.root.clone();
         let cancel = ctx.cancel.clone();
-        let found = tokio::task::spawn_blocking(move || search(&root, &files, &matcher, &cancel))
+        let found = tokio::task::spawn_blocking(move || search(&root, &files, &matcher, max_bytes, &cancel))
             .await
             .map_err(|e| ToolError(format!("The search failed: {e}")))?;
 
@@ -133,10 +142,12 @@ impl Tool for Grep {
         } else {
             String::new()
         };
-        Ok(ToolOutput::ok(
+        let out = ToolOutput::ok(
             format!("{}{more}", found.lines.join("\n")),
             format!("{} in {}", plural(found.count, "match"), plural(found.files, "file")),
-        ))
+        );
+        // Lines of a saved MCP output are still the server's text (#61).
+        Ok(with_saved_source(ctx, &target, out))
     }
 }
 
@@ -148,11 +159,13 @@ struct Found {
     files: usize,
 }
 
-/// Searches the files (project-relative) one by one; Esc stops between files.
+/// Searches the files (project-relative, or absolute: a saved output) one by one, skipping those over `max_bytes`;
+/// Esc stops between files.
 fn search(
     root: &std::path::Path,
     files: &[String],
     matcher: &grep_regex::RegexMatcher,
+    max_bytes: u64,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Found {
     let mut searcher: Searcher = SearcherBuilder::new().line_number(true).build();
@@ -162,7 +175,7 @@ fn search(
             break;
         }
         let path = root.join(file);
-        if std::fs::metadata(&path).map_or(true, |m| m.len() > MAX_FILE_BYTES) {
+        if std::fs::metadata(&path).map_or(true, |m| m.len() > max_bytes) {
             continue;
         }
         let Ok(bytes) = std::fs::read(&path) else { continue };
@@ -174,8 +187,7 @@ fn search(
             found.count += 1;
             if found.lines.len() < MAX_MATCHES {
                 let line = line.strip_suffix('\n').unwrap_or(line);
-                let cut: String = line.chars().take(MAX_LINE_CHARS).collect();
-                found.lines.push(format!("{file}:{line_number}:{cut}"));
+                found.lines.push(format!("{file}:{line_number}:{}", shown_line(line, matcher)));
             }
             Ok(true)
         });
@@ -185,6 +197,24 @@ fn search(
         }
     }
     found
+}
+
+/// A matching line as shown: whole up to [`MAX_LINE_CHARS`]; past that its start, or, when the match lies beyond the
+/// start, the [`MAX_LINE_CHARS`] around it (a third before), marked with `…` and where it starts.
+fn shown_line(line: &str, matcher: &grep_regex::RegexMatcher) -> String {
+    use grep_matcher::Matcher;
+    let start: String = line.chars().take(MAX_LINE_CHARS).collect();
+    if start.len() == line.len() {
+        return start;
+    }
+    let Ok(Some(found)) = matcher.find(line.as_bytes()) else { return start };
+    let (match_start, match_end) = (line[..found.start()].chars().count(), line[..found.end()].chars().count());
+    if match_end <= MAX_LINE_CHARS {
+        return start;
+    }
+    let from = match_start.saturating_sub(MAX_LINE_CHARS / 3);
+    let window: String = line.chars().skip(from).take(MAX_LINE_CHARS).collect();
+    format!("[from character {}] …{window}…", from + 1)
 }
 
 /// The error for a pattern that doesn't compile; a hint when it looks like JavaScript-only syntax.
@@ -251,6 +281,40 @@ mod tests {
         assert_eq!(out.output.lines().filter(|l| l.contains(":hit")).count(), 100);
         let long = run(&root, json!({"pattern": "hit", "path": "long.txt"})).await.result;
         assert_eq!(long.output.chars().count(), "long.txt:1:".len() + MAX_LINE_CHARS);
+    }
+
+    #[tokio::test]
+    async fn a_match_deep_in_a_long_line_shows_the_text_around_it() {
+        // A one-line JSON, as an MCP result or a curl saves it: the match at character 50,001.
+        let root = TempDir::new("grep-deep");
+        root.write("one.json", format!("{}\"error\": \"parser::quotes FAILED\"{}\n", "a".repeat(50_000), "z".repeat(50_000)));
+        let out = run(&root, json!({"pattern": "FAILED", "path": "one.json"})).await.result;
+        let before = 50_000 + "\"error\": \"parser::quotes ".len() - MAX_LINE_CHARS / 3;
+        assert!(out.output.starts_with(&format!("one.json:1:[from character {}] …", before + 1)), "{}", out.output);
+        assert!(out.output.contains("\"error\": \"parser::quotes FAILED\"") && out.output.ends_with("z…"), "{}", out.output);
+    }
+
+    #[tokio::test]
+    async fn searches_a_saved_tool_output_whatever_its_size_and_no_other_outside_file() {
+        let root = project("grep-spilled");
+        let store = TempDir::new("grep-spilled-store");
+        // Over the 1 MB a project file may be: a saved output is searched anyway.
+        let big = format!("{}test parser::nested FAILED\n{}", "ok\n".repeat(400_000), "ok\n".repeat(100_000));
+        store.write("s1/b1.txt", &big);
+        store.write("s2/b1.txt", "test other FAILED\n");
+        let ctx = ToolContext { tool_output: Some(store.path().join("s1")), ..ToolContext::new(root.path()) };
+        let grep = |args: Value| {
+            let call = ToolCall { id: "g".into(), name: "grep".into(), arguments: args.to_string() };
+            let ctx = ctx.clone();
+            async move { run_tool(&call, &ctx, builtin_tools()).await.result }
+        };
+        let saved = store.path().join("s1/b1.txt").display().to_string();
+        let out = grep(json!({"pattern": "FAILED", "path": saved})).await;
+        assert_eq!(out.output, format!("{saved}:400001:test parser::nested FAILED"));
+        let other = grep(json!({"pattern": "FAILED", "path": store.path().join("s2/b1.txt")})).await;
+        assert!(other.is_error && other.output.contains("outside the project"), "{}", other.output);
+        // A search of the project still doesn't reach it.
+        assert_eq!(grep(json!({"pattern": "FAILED"})).await.output, "No matches.");
     }
 
     #[tokio::test]
