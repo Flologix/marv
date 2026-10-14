@@ -1,5 +1,0 @@
-#!/usr/bin/env bash
-# Launcher for `marv`. Running src/cli.tsx through its shebang would make the process's argv[0] "bun", which is
-# the name VS Code's terminal tab (and ps) shows; `exec -a` starts Bun under the name "marv" instead.
-here=$(dirname "$(realpath "$0")")
-exec -a marv bun "$here/../src/cli.tsx" "$@"

@@ -1,0 +1,4 @@
+// needs the network
+{"tool_calls": [{"name": "bash", "arguments": {"command": "npm install", "network": true}}]}
+// gives up
+{"text": "I couldn't install them: running npm with network access needs your approval. Run with `--approve network`."}

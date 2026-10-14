@@ -1,3 +1,0 @@
-[
-  { "issue": 7, "body": "Done: `main([\"--json\", file])` in src/report.js now returns the summary as JSON; the text table stays the default." }
-]

@@ -1,5 +1,0 @@
-[test]
-# Only Marv's own tests: the eval tasks under evals/tasks contain test files of their own.
-root = "tests"
-# Keeps the github tool's check of the real gh (it asks GitHub) out of every test, child processes included.
-preload = ["./tests/setup.ts"]

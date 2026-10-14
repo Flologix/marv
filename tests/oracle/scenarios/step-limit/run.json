@@ -1,0 +1,5 @@
+{
+  "description": "--max-steps 3 with no one to ask: the turn stops after three steps without an answer, exit 2.",
+  "prompt": "Look through every file.",
+  "max_steps": 3
+}

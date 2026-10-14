@@ -1,2 +1,0 @@
-# The eval fixtures need their exact bytes: tabs, CRLF line endings, trailing whitespace.
-evals/tasks/** -text

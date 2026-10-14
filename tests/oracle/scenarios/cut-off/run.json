@@ -1,0 +1,4 @@
+{
+  "description": "A reply cut off at the output limit (finish_reason length): its write_file isn't run, the model is told, and the redo in a smaller piece runs.",
+  "prompt": "Write src/numbers.js with 200 numbered constants."
+}

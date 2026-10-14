@@ -1,0 +1,11 @@
+{
+  "description": "The typecheck after an edit: renaming an export breaks its caller in a file the model didn't touch, the typecheck's note names it, and the next step fixes it. The compiler is a stand-in shell script (the oracle has no TypeScript), made executable by the first step because the copy doesn't keep file modes.",
+  "prompt": "Rename formatPrice (in src/format.ts) to formatMoney.",
+  "config": {
+    "diagnostics": true
+  },
+  "deliberate": {
+    "security": "Provenance and taint",
+    "why": "marv-rs fences the typecheck's note (a Marv 0.3.0 bug): the note is Marv's own sentence, then tsc's output inside <untrusted-data source=\"project\">, where Marv began it 'Marv:'. Everything else (events, files, exit code) is Marv's."
+  }
+}

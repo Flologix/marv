@@ -1,0 +1,4 @@
+{
+  "description": "old_string copied without the file's trailing spaces: the trailing-whitespace match finds it, and the file keeps them.",
+  "prompt": "In src/config.js, raise the default timeout to 60 and add a default `retries: 3`."
+}

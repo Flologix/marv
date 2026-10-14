@@ -1,0 +1,41 @@
+[package]
+name = "marv-mcp"
+description = "MCP client: config, trust, connections, OAuth, deferred tools, installers."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio-util.workspace = true
+marv-core.workspace = true
+marv-fs.workspace = true
+marv-sandbox.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+# Trust keys and shortened tool names hash with SHA-256 (as Marv's node:crypto did).
+sha2 = "0.10.9"
+# Source URLs, OAuth callback and authorization URLs.
+url = "2.5.4"
+# Streamable HTTP and the OAuth requests (the same reqwest marv-provider uses).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+# A login's `state` and PKCE verifier: secrets, so from the OS RNG.
+getrandom = "0.3"
+base64 = "0.22.1"
+
+[dev-dependencies]
+# The oracle's tracker (Marv's evals/mcp/tracker.ts): the 25-tool MCP server the tests serve over HTTP.
+marv-oracle = { path = "../marv-oracle" }
+
+[[bin]]
+# Test fixture only: Marv's tests/fixtures/mcp-server.ts (and the paging server), for the stdio tests in tests/.
+name = "marv-mcp-fixture"
+path = "src/bin/marv-mcp-fixture.rs"
+test = false
+doc = false
+
+[lints]
+workspace = true

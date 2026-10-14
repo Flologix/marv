@@ -1,0 +1,8 @@
+// find every use
+{"tool_calls": [{"name": "grep", "arguments": {"pattern": "fetchUserData"}}]}
+// rename everywhere
+{"text": "Renaming in all five files.", "tool_calls": [{"name": "edit_file", "arguments": {"path": "README.md", "old_string": "fetchUserData", "new_string": "loadUser", "replace_all": true}}, {"name": "edit_file", "arguments": {"path": "src/admin.js", "old_string": "fetchUserData", "new_string": "loadUser", "replace_all": true}}, {"name": "edit_file", "arguments": {"path": "src/api.js", "old_string": "fetchUserData", "new_string": "loadUser", "replace_all": true}}, {"name": "edit_file", "arguments": {"path": "src/index.js", "old_string": "fetchUserData", "new_string": "loadUser", "replace_all": true}}, {"name": "edit_file", "arguments": {"path": "src/profile.js", "old_string": "fetchUserData", "new_string": "loadUser", "replace_all": true}}]}
+// check none are left
+{"tool_calls": [{"name": "grep", "arguments": {"pattern": "fetchUserData"}}]}
+// done
+{"text": "Renamed `fetchUserData` to `loadUser` in the code, the error message and the README."}

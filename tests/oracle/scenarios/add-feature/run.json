@@ -1,0 +1,4 @@
+{
+  "description": "A new function from its doc comment: two parallel reads, the body edited in under the comment (non-ASCII in new_string), the export added.",
+  "prompt": "Implement slugify in src/slug.js as its comment describes (accents are removed: \"Cr\u00e8me br\u00fbl\u00e9e\" gives \"creme-brulee\"), and export it from src/index.js."
+}

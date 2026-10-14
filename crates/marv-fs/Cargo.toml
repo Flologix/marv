@@ -1,0 +1,18 @@
+[package]
+name = "marv-fs"
+description = "Shared file helpers below marv-mcp and marv-session: private (0600) writes and a cross-process file lock."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio = { workspace = true, features = ["fs", "rt", "sync", "time"] }
+thiserror.workspace = true
+
+[dev-dependencies]
+futures.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,8 @@
+// find it
+{"tool_calls": [{"name": "grep", "arguments": {"pattern": "formatPrice", "path": "src"}}]}
+// rename everywhere
+{"tool_calls": [{"name": "edit_file", "arguments": {"path": "src/cart.ts", "old_string": "formatPrice", "new_string": "formatMoney", "replace_all": true}}, {"name": "edit_file", "arguments": {"path": "src/format.ts", "old_string": "formatPrice", "new_string": "formatMoney", "replace_all": true}}, {"name": "edit_file", "arguments": {"path": "src/index.ts", "old_string": "formatPrice", "new_string": "formatMoney", "replace_all": true}}, {"name": "edit_file", "arguments": {"path": "src/report.ts", "old_string": "formatPrice", "new_string": "formatMoney", "replace_all": true}}, {"name": "edit_file", "arguments": {"path": "src/types.ts", "old_string": "formatPrice", "new_string": "formatMoney", "replace_all": true}}]}
+// what changed
+{"tool_calls": [{"name": "bash", "arguments": {"command": "git status --short"}}]}
+// done
+{"text": "Renamed `formatPrice` to `formatMoney` in all five files, including the export in `src/index.ts`."}

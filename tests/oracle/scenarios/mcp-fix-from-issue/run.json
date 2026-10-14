@@ -1,0 +1,12 @@
+{
+  "description": "Deferred MCP tools: the model loads get_issue's spec with tool_search, runs it with mcp_call, then fixes the bug the issue describes.",
+  "prompt": "Fix the bug reported in issue #12 of this project's issue tracker (the tracker MCP server).",
+  "mcp": {
+    "server": "tracker",
+    "data": "tracker.json"
+  },
+  "deliberate": {
+    "security": "Provenance and taint",
+    "why": "marv-rs fences every MCP result as data for the model (docs/SECURITY.md, \"Provenance and taint\": text that isn't from the user or Marv is fenced), so the tool results the model reads, and the events that show them, are wrapped in <untrusted-data source=\"mcp\" …>. Files, tool calls and the exit code are Marv's."
+  }
+}
