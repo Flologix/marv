@@ -33,7 +33,7 @@ Spec: Marv `CLAUDE.md` bullets **Rendering**, **Mouse**, **Selection**, **Replie
 | `src/ui/ModelPicker.tsx` | `ui/model_picker.rs` | **Ported**, with `format_price`. `setup.test.tsx` picker cases ported. |
 | `src/ui/Setup.tsx` | `ui/setup.rs` | **Ported.** Answers with `SetupAnswer` (`api_key: None` keeps the saved key; the engine owns the file, the env and the endpoint). All `setup.test.tsx` cases ported. |
 | `src/ui/PromptInput.tsx` | `ui/prompt_input.rs` | **Ported.** Owns its value (the App clears it on an accepted submit). All `prompt.test.tsx` cases ported. |
-| `src/ui/StatusBar.tsx` | `ui/status_bar.rs` | **Ported**, with `tokens`, `format_usage` (cache-hit rate), `cost_text` (integer rounding to match JS's halves-up). Tests. |
+| `src/ui/StatusBar.tsx` | `ui/status_bar.rs` | **Ported**, with `tokens`, `format_usage` (cache-hit rate), `cost_text` (integer rounding to match JS's halves-up). Tests. #24: `N running` (background processes, `StatusInfo::processes`) after yolo, idle or busy, as Marv's #51; the TUI bridge sends a fresh `StatusInfo` when the process manager reports a change |
 
 `grep -rn 'todo!("port' crates/marv-tui` lists what's left. `cargo run -p marv-tui --example martian` shows the animated martian (q to quit); `cargo run -p marv-tui --example fake_session` runs the whole shell on a scripted fake engine (see its header for what to try; `--stream` streams a long reply at once, `--no-splash`).
 

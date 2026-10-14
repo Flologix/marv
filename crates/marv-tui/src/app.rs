@@ -1654,7 +1654,13 @@ mod tests {
     fn options(splash_ms: u64) -> AppOptions {
         AppOptions {
             welcome: WelcomeInfo { version: "9.9.9".into(), cwd: "~/x".into(), ..Default::default() },
-            status: StatusInfo { model: "ollama/qwen3.5:9b".into(), cwd: "~/x".into(), yolo: false, context_length: None },
+            status: StatusInfo {
+                model: "ollama/qwen3.5:9b".into(),
+                cwd: "~/x".into(),
+                yolo: false,
+                context_length: None,
+                processes: 0,
+            },
             splash_ms,
             render: Default::default(),
         }

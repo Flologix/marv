@@ -768,6 +768,8 @@ impl Bridge {
             cwd: self.cwd(),
             yolo: config.yolo && self.session_yolo_allowed(),
             context_length: self.session.context_length(),
+            // The process manager calls the session's on_change when one starts or ends: the bar is asked again.
+            processes: self.session.processes().iter().filter(|p| p.state == marv_tools::ProcessState::Running).count(),
         }
     }
 
@@ -1888,6 +1890,44 @@ mod tests {
             until(&mut rx, |e| matches!(e, UiEvent::TurnEnd { .. })).await;
         }
         assert!(!outside.exists());
+    }
+
+    #[tokio::test]
+    async fn the_status_bar_counts_running_processes_and_processes_stop_takes_one_off() {
+        // Marv's app.test.tsx (#51): the status bar counts it; /processes stops it.
+        if !marv_sandbox::sandbox_available() || std::process::Command::new("python3").arg("--version").output().is_err() {
+            eprintln!("skipped: needs bubblewrap and python3");
+            return;
+        }
+        let dirs = Dirs::new();
+        // network: true runs bash directly in the sandbox (no relay binary needed in a unit test); a server that listens
+        // ends the start's wait for a port at once.
+        let command = "python3 -m http.server 0 --bind 127.0.0.1";
+        let start = serde_json::json!({"action": "start", "command": command, "name": "web", "network": true});
+        let replies = vec![
+            vec![
+                ProviderEvent::ToolCall(ToolCall { id: "p1".into(), name: "process".into(), arguments: start.to_string() }),
+                ProviderEvent::Done { reason: Some("tool_calls".into()) },
+            ],
+            say("It's up."),
+        ];
+        let (tx, mut rx) = unbounded_channel();
+        let bridge = Bridge::start(startup(&dirs, Some(asks()), replies, None), tx).unwrap();
+        assert_eq!(bridge.status_info().processes, 0);
+        let port = Port(bridge.clone());
+        port.send("start the server".into());
+        let seen = until(&mut rx, |e| matches!(e, UiEvent::Approval { .. })).await;
+        let Some(UiEvent::Approval { id, request }) = seen.last() else { unreachable!() };
+        assert_eq!(request.preview.title, "Start a background process (web)");
+        port.answer(*id, view::Decision::Yes);
+        until(&mut rx, |e| matches!(e, UiEvent::StatusInfo(info) if info.processes == 1)).await;
+        until(&mut rx, |e| matches!(e, UiEvent::TurnEnd { .. })).await;
+        port.run_command("/processes stop web".into());
+        let seen = until(&mut rx, |e| matches!(e, UiEvent::StatusInfo(info) if info.processes == 0)).await;
+        let seen =
+            [seen, until(&mut rx, |e| texts(std::slice::from_ref(e)).iter().any(|t| t.contains("Stopped web."))).await].concat();
+        assert!(texts(&seen).iter().any(|t| t == "Stopped web."), "{:?}", texts(&seen));
+        bridge.session().stop_processes().await;
     }
 
     #[tokio::test]

@@ -242,6 +242,8 @@ pub struct StatusInfo {
     pub yolo: bool,
     /// The model's context window, when known (status bar `12.3k/32.8k ctx`).
     pub context_length: Option<u64>,
+    /// Background processes running (Marv #51): shown whenever there are any, since they keep running between turns.
+    pub processes: usize,
 }
 
 /// What the welcome banner says was loaded at startup.
