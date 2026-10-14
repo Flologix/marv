@@ -38,6 +38,23 @@ pub fn plan_open(items: Option<&[PlanItem]>) -> bool {
     items.is_some_and(|items| items.iter().any(|i| i.status != PlanStatus::Done))
 }
 
+/// The plan as it stood, for the compacted summary's message (#15): the summary replaces the plan calls the model
+/// made, so the session's own copy goes in instead, as structured text rather than the model's paraphrase.
+pub fn plan_text(items: &[PlanItem]) -> String {
+    let lines: Vec<String> = items
+        .iter()
+        .map(|i| {
+            let status = match i.status {
+                PlanStatus::Done => "done",
+                PlanStatus::InProgress => "in progress",
+                PlanStatus::Pending => "pending",
+            };
+            format!("- [{status}] {}", i.text)
+        })
+        .collect();
+    format!("Your plan (from the plan tool), as it stood:\n{}\nKeep updating it with the plan tool.", lines.join("\n"))
+}
+
 pub struct Plan;
 
 #[async_trait]
@@ -242,6 +259,16 @@ mod tests {
         assert!(!r.result.is_error);
         assert_eq!(r.result.approval, None);
         assert_eq!(host.0.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn plan_text_lists_each_item_with_its_status() {
+        let items =
+            [item("Read", PlanStatus::Done), item("Write", PlanStatus::InProgress), item("Docs", PlanStatus::Pending)];
+        assert_eq!(
+            plan_text(&items),
+            "Your plan (from the plan tool), as it stood:\n- [done] Read\n- [in progress] Write\n- [pending] Docs\nKeep updating it with the plan tool."
+        );
     }
 
     #[test]
