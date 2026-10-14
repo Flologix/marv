@@ -89,6 +89,8 @@ pub struct FileConfig {
     pub checkpoints: Option<bool>,
     /// Session-start hooks (#108). Read only from this file, the user's own: no project file ever fills it.
     pub hooks: Option<crate::hooks::Hooks>,
+    /// After a turn, suggest the next message in the empty prompt (default on; Tab takes it).
+    pub suggestions: Option<bool>,
     pub mcp_tools: Option<McpToolsSetting>,
     pub max_steps: Option<MaxStepsSetting>,
     /// `mesh.wake` (marv-rs #78): a message on a wired inbox starts a turn while the TUI is idle (default off).
@@ -203,6 +205,7 @@ impl FileConfig {
             checks: boolean("checks", &mut problems),
             checkpoints: boolean("checkpoints", &mut problems),
             hooks,
+            suggestions: boolean("suggestions", &mut problems),
             mcp_tools,
             max_steps,
             mesh_wake,
@@ -231,6 +234,7 @@ impl FileConfig {
         put("checks", self.checks.map(Value::from));
         put("checkpoints", self.checkpoints.map(Value::from));
         put("hooks", self.hooks.as_ref().map(crate::hooks::Hooks::to_value));
+        put("suggestions", self.suggestions.map(Value::from));
         put("mcpTools", self.mcp_tools.and_then(|m| serde_json::to_value(m).ok()));
         put(
             "maxSteps",
@@ -266,6 +270,7 @@ pub struct Config {
     pub diagnostics: bool,
     pub checks: bool,
     pub checkpoints: bool,
+    pub suggestions: bool,
     pub mcp_tools: McpToolsSetting,
     /// 0 never asks; 1 can't happen. Subagents' own hard limit (50) is not touched by 0.
     pub max_steps: u32,
@@ -356,6 +361,7 @@ pub fn resolve_config(file: Option<&FileConfig>, env: &Env) -> Config {
         diagnostics: file.and_then(|f| f.diagnostics).unwrap_or(true),
         checks: file.and_then(|f| f.checks).unwrap_or(true),
         checkpoints: file.and_then(|f| f.checkpoints).unwrap_or(true),
+        suggestions: file.and_then(|f| f.suggestions).unwrap_or(true),
         mcp_tools: file.and_then(|f| f.mcp_tools).unwrap_or_default(),
         max_steps: max_steps_from_env(env.get("MARV_MAX_STEPS").map(String::as_str), file_steps),
         mesh_wake: file.and_then(|f| f.mesh_wake).unwrap_or(false),
@@ -486,7 +492,7 @@ mod tests {
             (c.thinking, c.context_length, c.sandbox, c.yolo, c.trajectories, c.diagnostics, c.checks),
             (false, 32768, true, true, true, true, true)
         );
-        assert!(c.checkpoints);
+        assert!(c.checkpoints && c.suggestions);
         assert_eq!((c.max_steps, c.mcp_tools), (25, McpToolsSetting::Auto));
     }
 

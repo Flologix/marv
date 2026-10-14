@@ -143,6 +143,7 @@ Type `/` to open the command menu: ↑/↓ to choose, Enter to run, Tab or → t
 | PgUp / PgDn, mouse wheel | Scroll the conversation |
 | Drag with the mouse | Select text; it's copied when you let go (drag past the edge to scroll) |
 | ↑ / ↓ | Previous inputs |
+| Tab or → (empty input) | Take the suggested next message shown in the prompt; Enter then sends it |
 
 ### Command-line options
 
@@ -381,7 +382,7 @@ Not yet: `watch` (subscribing to events), unwiring across processes (a wire to a
 | `$XDG_RUNTIME_DIR/marv/` | The mesh's sockets and background processes' relays, while Marv runs |
 | `AGENTS.md` | Project instructions, read into the system prompt at startup |
 
-`~/.marv/config.json` also takes `sandbox`, `yolo`, `thinking`, `trajectories`, `diagnostics`, `checks`, `checkpoints` (each `true` or `false`), `maxSteps`, `mcpTools` (`auto`, `deferred` or `eager`), `contextLength` (Ollama) and `baseUrl` (e.g. Ollama on another machine). The slash commands write most of them for you.
+`~/.marv/config.json` also takes `sandbox`, `yolo`, `thinking`, `trajectories`, `diagnostics`, `checks`, `checkpoints`, `suggestions` (each `true` or `false`), `maxSteps`, `mcpTools` (`auto`, `deferred` or `eager`), `contextLength` (Ollama) and `baseUrl` (e.g. Ollama on another machine). The slash commands write most of them for you.
 
 **Session-start hooks.** `"hooks": {"sessionStart": ["bd ready", {"command": "git status -s", "timeout": 5}]}` runs those commands, in order, whenever a conversation starts: when Marv starts (the TUI and `marv -p`), after `/clear` and on a resume (never in subagents). They run like your own shell command: bash, in the project folder, outside the sandbox, with your environment minus Marv's keys and secret-looking variables. Each has a timeout in seconds (default 15) and its output is cut to 8 KB. Their output goes to the model once, at the start of your first message, labelled with each command and quoted as data; the TUI shows one line per hook. Like a web page or an MCP result, hook output **taints the conversation**: from then on anything that can send data out asks first, even in yolo, because what a command prints (issue titles in `bd ready`, say) can come from anyone. Add `"trusted": true` to a hook (`{"command": "date", "trusted": true}`) when you vouch for its output; a hook that prints nothing taints nothing. A hook that fails or times out is a one-line note and never stops Marv from starting. Hooks are read **only from your own `~/.marv/config.json`**: a project's `.marv/config.json` naming `hooks` is refused with a startup note and never run, so cloning a repository can't make Marv run its commands.
 
