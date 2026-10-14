@@ -50,9 +50,13 @@ pub struct PromptInput {
     pub date: String,
 }
 
-const BASE_TOOLS_TEXT: &str = "Look at the actual code before answering questions about it, and don't guess what a file contains. Start narrow: grep for a name or glob for a file pattern, then read the relevant part of a file rather than whole large files. Paths are relative to the project root.
+const BASE_TOOLS_TEXT: &str = "Look at the actual code before answering questions about it, and don't guess what a file contains. Start narrow: grep for a name or glob for a file pattern, then read the relevant part of a file rather than whole large files. Paths are relative to the project root.";
 
-You can change files with edit_file (replace exact text; copy it from read_file, whitespace included) and write_file (new files or full rewrites), never through bash (no heredocs or echo >), and run shell commands with bash, e.g. the tests after a change. For a long file, write the first part with write_file, then add the rest with append: true. The user may be asked to approve a change or command; if they decline, stop and ask how to proceed instead of trying another way. Commands run in a sandbox: only the project folder is writable, the home folder is an empty stand-in (toolchains like ~/.bun, git config and ~/.marv/skills show through, read-only; Marv's own config, sessions and trajectories in ~/.marv, and everything else there, aren't visible, so a file missing under ~ may well exist), and there's no network unless you set network: true. A command that changes the git repository (commit, checkout, merge, stash…) needs git_write: true. Make focused changes and check your work.
+// One constant sentence, in the tools paragraph only when the plan tool is offered (#15): fixed per session, like the
+// web section.
+const PLAN_SENTENCE: &str = " For a task with several steps, keep a plan with the plan tool and update it as you go.";
+
+const BASE_REST_TEXT: &str = "\n\nYou can change files with edit_file (replace exact text; copy it from read_file, whitespace included) and write_file (new files or full rewrites), never through bash (no heredocs or echo >), and run shell commands with bash, e.g. the tests after a change. For a long file, write the first part with write_file, then add the rest with append: true. The user may be asked to approve a change or command; if they decline, stop and ask how to proceed instead of trying another way. Commands run in a sandbox: only the project folder is writable, the home folder is an empty stand-in (toolchains like ~/.bun, git config and ~/.marv/skills show through, read-only; Marv's own config, sessions and trajectories in ~/.marv, and everything else there, aren't visible, so a file missing under ~ may well exist), and there's no network unless you set network: true. A command that changes the git repository (commit, checkout, merge, stash…) needs git_write: true. Make focused changes and check your work.
 
 Your replies are rendered as Markdown in a terminal. Keep them concise and structured: short paragraphs, bullet or numbered lists for several items, `backticks` for file paths, identifiers and commands, and fenced code blocks with a language for code. Use a small table only when comparing things side by side. Point to code as path:line.";
 
@@ -121,10 +125,11 @@ fn project_section(instructions: Option<&str>) -> String {
 /// The main agent's system prompt.
 pub fn system_prompt(input: &PromptInput) -> String {
     let base = format!(
-        "You are Marv, a coding agent running in the user's terminal.\n\nWorking directory: {}\nToday's date: {}\n\nYou can explore the project with these tools: {}. {BASE_TOOLS_TEXT}",
+        "You are Marv, a coding agent running in the user's terminal.\n\nWorking directory: {}\nToday's date: {}\n\nYou can explore the project with these tools: {}. {BASE_TOOLS_TEXT}{}{BASE_REST_TEXT}",
         input.cwd,
         input.date,
-        input.tools.join(", ")
+        input.tools.join(", "),
+        if input.tools.iter().any(|t| t == "plan") { PLAN_SENTENCE } else { "" },
     );
     let agents = if input.agents.is_empty() {
         String::new()
@@ -388,6 +393,16 @@ mod tests {
         assert!(p.contains("never through bash (no heredocs"));
         assert!(p.contains("# MCP servers"));
         assert!(!p.contains("# Web"));
+    }
+
+    #[test]
+    fn says_to_keep_a_plan_only_when_the_plan_tool_is_offered() {
+        let sentence = "For a task with several steps, keep a plan with the plan tool and update it as you go.";
+        let with = system_prompt(&PromptInput { tools: vec!["read_file".into(), "plan".into()], ..input() });
+        assert!(with.contains(&format!("Paths are relative to the project root. {sentence}\n\nYou can change files")));
+        let without = system_prompt(&PromptInput { tools: vec!["read_file".into()], ..input() });
+        assert!(!without.contains("plan tool"));
+        assert!(without.contains("Paths are relative to the project root.\n\nYou can change files"));
     }
 
     #[test]

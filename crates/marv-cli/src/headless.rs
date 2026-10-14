@@ -448,6 +448,7 @@ mod tests {
             once: false,
             must_ask: false,
             protected: None,
+            door: None,
         }
     }
 

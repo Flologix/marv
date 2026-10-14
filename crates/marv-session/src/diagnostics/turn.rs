@@ -523,7 +523,7 @@ pub(crate) mod testing {
             "a.ts",
         );
         run.changed = path.map(String::from);
-        run.display = Some(Arc::new(crate::runner::ToolDisplay { diff: Some(Default::default()) }));
+        run.display = Some(Arc::new(crate::runner::ToolDisplay { diff: Some(Default::default()), plan: None }));
         run
     }
 

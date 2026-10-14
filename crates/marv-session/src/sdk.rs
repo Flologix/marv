@@ -65,6 +65,9 @@ pub struct SessionOptions {
     pub mcp_servers: Vec<(String, Value)>,
     pub approve: Option<Arc<dyn Approver>>,
     pub max_steps: Option<u32>,
+    /// Offer the plan tool: a checklist the model keeps for a long task (`session.plan()` reads it, each change also
+    /// arrives as a tool end's `result.plan`). Default true. Fixed for the session, since it changes the tool list.
+    pub plan: bool,
     pub diagnostics: bool,
     pub checks: bool,
     /// Before a turn's first change, snapshot the project (git commits under a hidden ref,
@@ -105,6 +108,7 @@ impl SessionBuilder {
                 mcp_servers: Vec::new(),
                 approve: None,
                 max_steps: None,
+                plan: true,
                 diagnostics: true,
                 checks: true,
                 checkpoints: true,
@@ -150,6 +154,11 @@ impl SessionBuilder {
     }
     pub fn max_steps(mut self, steps: u32) -> Self {
         self.options.max_steps = Some(steps);
+        self
+    }
+    /// `false` leaves the plan tool out (#15; the eval's "off" arm).
+    pub fn plan(mut self, on: bool) -> Self {
+        self.options.plan = on;
         self
     }
 
@@ -253,6 +262,7 @@ pub async fn create_session(options: SessionOptions) -> Result<MarvSession, Sess
     init.mesh = options.mesh;
     init.wire_approver = options.wire_approver;
     init.max_steps = options.max_steps;
+    init.plan = options.plan;
     init.diagnostics = options.diagnostics;
     init.checks = options.checks;
     init.checkpoints = options.checkpoints;
@@ -339,6 +349,23 @@ mod tests {
         assert_eq!(err.to_string(), "resume needs persist (there's nowhere to resume from)");
         let err = SessionBuilder::new("/nonexistent/marv/x", provider()).build().await.err().unwrap();
         assert!(err.to_string().ends_with("isn't a folder"));
+    }
+
+    #[tokio::test]
+    async fn plan_false_leaves_the_plan_tool_out_by_default_its_offered() {
+        let provider = || ProviderOption::Ollama { model: "m".into(), host: None, context_length: None };
+        let dir = std::env::temp_dir().join(format!("marv-sdk-plan-{}-{}", std::process::id(), marv_fs::random_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut on = SessionBuilder::new(&dir, provider());
+        on.options.config_dir = Some(dir.join("config"));
+        let off = SessionBuilder { options: SessionOptions { plan: false, ..on.options.clone() } };
+        assert!(on.options.plan);
+        on = on.plan(true);
+        let (on, off) = (on.build().await.unwrap(), off.build().await.unwrap());
+        assert!(on.system_prompt().contains("keep a plan with the plan tool"));
+        assert!(!off.system_prompt().contains("plan tool"));
+        assert_eq!(on.plan(), None);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// Writes made.txt, then says it did.

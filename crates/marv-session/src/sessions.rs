@@ -45,6 +45,10 @@ pub struct SavedSession {
     /// Absent before a turn had MCP tools. A malformed value is dropped on load (`mcp_listing_of`), not fatal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp: Option<serde_json::Value>,
+    /// The plan tool's list (#15), when one is set. Kept as JSON and checked on resume (`plan_items`): a bad one is
+    /// dropped, not the session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<serde_json::Value>,
     /// The conversation's checkpoint chain (#16): its id (the session's own, or the one a resume started when the old
     /// chain couldn't be read) and, per turn number, the paths its tools reported changing (an undo preview lists
     /// those it can't restore). Absent in older files; checked on resume (`saved_checkpoints`).
@@ -64,6 +68,12 @@ pub struct SavedCheckpoints {
 }
 
 impl SavedSession {
+    /// The saved plan, or `None` for none, an old file or a hand edit (the plan is dropped, the session still loads).
+    pub fn plan_items(&self) -> Option<Vec<marv_tools::PlanItem>> {
+        let items: Vec<marv_tools::PlanItem> = serde_json::from_value(self.plan.clone()?).ok()?;
+        (!items.is_empty()).then_some(items)
+    }
+
     /// The conversation's MCP listing, or `None` for an old file or a hand edit (then nothing counts as announced).
     pub fn mcp_listing(&self) -> Option<McpListing> {
         self.mcp.as_ref().and_then(|v| serde_json::from_value(v.clone()).ok())
@@ -108,6 +118,7 @@ pub fn new_session(root: &Path, provider: &str, model: &str, now_ms: u64) -> Sav
         transcript: Vec::new(),
         totals: Totals::default(),
         mcp: None,
+        plan: None,
         checkpoints: None,
         pending_note: None,
     }
@@ -269,6 +280,22 @@ mod tests {
         assert_eq!(time_ago(0, 3 * 3_600_000), "3 hours ago");
         assert_eq!(time_ago(0, 30 * 3_600_000), "yesterday");
         assert_eq!(time_ago(0, 72 * 3_600_000), "3 days ago");
+    }
+
+    #[test]
+    fn a_saved_plan_is_read_back_and_a_bad_or_empty_one_is_dropped() {
+        let mut s = new_session(Path::new("/p"), "x", "y", 1);
+        assert_eq!(s.plan_items(), None);
+        s.plan = Some(serde_json::json!([{ "text": "a", "status": "in_progress" }]));
+        let items = s.plan_items().unwrap();
+        assert_eq!(items[0].status, marv_tools::PlanStatus::InProgress);
+        s.plan = Some(serde_json::json!([{ "text": "x", "status": "started" }]));
+        assert_eq!(s.plan_items(), None);
+        s.plan = Some(serde_json::json!([]));
+        assert_eq!(s.plan_items(), None);
+        // Written only when there is one: older readers never see the key.
+        s.plan = None;
+        assert!(!serde_json::to_string(&s).unwrap().contains("\"plan\""));
     }
 
     #[test]

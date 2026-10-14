@@ -145,6 +145,7 @@ fn write_request(path: &str, agent: Option<String>) -> ApprovalRequest {
         agent,
         network: false,
         once: false,
+        door: None,
     }
 }
 
@@ -393,6 +394,7 @@ impl SessionPort for Fake {
             model: "ollama/qwen3.5:9b".into(),
             transcript,
             totals: Totals::default(),
+            plan: None,
         }));
     }
 

@@ -190,8 +190,10 @@ pub struct ApprovalRequest {
     pub agent: Option<String>,
     /// The action can reach the network (bash with network: true).
     pub network: bool,
-    /// Yes or no only, no "don't ask again": each one is its own decision (/mcp add).
+    /// Yes or no only, no "don't ask again": each one is its own decision (/mcp add, a door to the host).
     pub once: bool,
+    /// The call leaves the sandbox through this door: the prompt shows its warning line (Marv Sprint 4).
+    pub door: Option<marv_core::Door>,
 }
 
 /// Identifies one pending approval so the answer reaches the right waiter (parallel subagents can
@@ -299,6 +301,23 @@ pub struct Resumed {
     /// What the user saw.
     pub transcript: Vec<Message>,
     pub totals: Totals,
+    /// The plan tool's list as it was saved (#15), pinned again.
+    pub plan: Option<Vec<PlanItem>>,
+}
+
+/// One item of the plan tool's checklist (Marv `src/tools/types.ts` `PlanItem`, #15).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanItem {
+    pub text: String,
+    pub status: PlanStatus,
+}
+
+/// At most one item is `InProgress` at a time (the current item).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanStatus {
+    Pending,
+    InProgress,
+    Done,
 }
 
 /// The providers setup offers.
@@ -486,6 +505,9 @@ pub enum UiEvent {
         call_id: String,
         progress: AgentProgress,
     },
+    /// The main agent's plan call ended (#15): its new list, empty when cleared. (Marv's App read `result.plan` off
+    /// the plan call's `tool_end`; subagents have no plan tool.)
+    Plan(Vec<PlanItem>),
     /// An automatic (or `/compact`) compaction, and how it went.
     Compaction {
         automatic: bool,

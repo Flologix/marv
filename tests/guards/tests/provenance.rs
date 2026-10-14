@@ -61,6 +61,7 @@ fn request(key: &str, must_ask: bool, network: bool) -> ApprovalRequest {
         once: false,
         must_ask,
         protected: None,
+        door: None,
     }
 }
 

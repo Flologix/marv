@@ -45,7 +45,7 @@ use marv_mcp::deferred::{
 };
 use marv_provider::{ModelInfo, Provider, ProviderFactory, ProviderOption};
 use marv_sandbox::TaintState;
-use marv_tools::{AgentProgress, Approver, Decision, ToolContext, ToolRef};
+use marv_tools::{AgentProgress, Approver, Decision, PlanHost, PlanItem, ToolContext, ToolRef};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_util::sync::CancellationToken;
 
@@ -174,6 +174,8 @@ pub struct Resumed {
     /// What the user saw (the client's transcript when it gave one, otherwise the messages and replies).
     pub transcript: Vec<Message>,
     pub totals: Totals,
+    /// The plan tool's list as it was saved (#15), or `None`.
+    pub plan: Option<Vec<PlanItem>>,
 }
 
 /// A built-in provider by option, or a factory (the TUI makes one from its config: `ConfigFactory`).
@@ -226,6 +228,9 @@ pub struct SessionInit {
     pub approve: Option<Arc<dyn Approver>>,
     /// The main agent's step limit (default 25; 0 never asks and never stops it). Subagents keep their own 50.
     pub max_steps: Option<u32>,
+    /// Offer the plan tool (#15): a checklist the main agent keeps for a long task. Default true. Fixed for the
+    /// session's life, since it changes the tool list (prompt cache).
+    pub plan: bool,
     pub diagnostics: bool,
     pub checks: bool,
     /// Snapshot the project before each turn's first change and after the turn (git commits under a hidden ref, #16),
@@ -276,6 +281,7 @@ impl SessionInit {
             system_prompt: None,
             approve: None,
             max_steps: None,
+            plan: true,
             diagnostics: true,
             checks: true,
             checkpoints: true,
@@ -459,6 +465,8 @@ struct State {
     working: Option<CancellationToken>,
     /// The running turn's MCP specs: what a mid-turn compaction announces again.
     turn_mcp_specs: Arc<Vec<ToolSpec>>,
+    /// The plan tool's list (#15): set only by its calls, saved with the conversation, re-injected after compaction.
+    plan: Option<Vec<PlanItem>>,
     /// A turn has waited for the MCP servers (see `turn_body`): only the first turn always does.
     mcp_waited: bool,
     checkpoints: bool,
@@ -525,12 +533,13 @@ pub struct MarvSession {
 
 /// Tools of the caller's own must have names of their own: `run_tool` runs the first tool with the call's name, so a
 /// custom "bash" would be offered next to the built-in one while every call ran the built-in; `mcp__` names are MCP
-/// servers'; `tool_search`/`mcp_call` are a deferred conversation's.
-pub fn check_tool_names(custom: &[ToolRef]) -> Result<(), String> {
+/// servers'; `tool_search`/`mcp_call` are a deferred conversation's. `plan` is built in only where the session offers
+/// it (`plan`): elsewhere the name is free.
+pub fn check_tool_names(custom: &[ToolRef], plan: bool) -> Result<(), String> {
     let mut seen = std::collections::HashSet::new();
     for tool in custom {
         let name = tool.name();
-        if marv_tools::builtin_tools().iter().any(|t| t.name() == name)
+        if marv_tools::builtin_tools().iter().any(|t| t.name() == name && (plan || name != "plan"))
             || DEFERRED_NAMES.contains(&name)
             || [marv_mesh::tools::MESH_LIST, marv_mesh::tools::MESH_CALL, marv_mesh::tools::MESH_SEND].contains(&name)
         {
@@ -663,6 +672,15 @@ impl Drop for Free<'_> {
     }
 }
 
+/// The main agent's plan tool writes into the session's state (#15).
+struct SessionPlan(MarvSession);
+
+impl PlanHost for SessionPlan {
+    fn set(&self, items: Vec<PlanItem>) {
+        self.0.state().plan = (!items.is_empty()).then_some(items);
+    }
+}
+
 /// Where a turn's subagents report: their events and progress become `SessionEvent`s, their usage the totals.
 struct TurnSink {
     session: MarvSession,
@@ -694,7 +712,7 @@ impl SubagentSink for TurnSink {
 impl MarvSession {
     /// Builds a session. Fails (and changes nothing) for a taken tool name, or yolo where `no_yolo` forbids it.
     pub fn new(init: SessionInit) -> Result<Self, SessionError> {
-        check_tool_names(&init.tools).map_err(SessionError::Invalid)?;
+        check_tool_names(&init.tools, init.plan).map_err(SessionError::Invalid)?;
         // The main agent's plug (`agent.parent.inbox`), bound now so it's there before the first turn.
         if let Some(mesh) = &init.mesh {
             mesh.plug(crate::mesh::parent_id()).map_err(|e| SessionError::Invalid(format!("The mesh: {e}")))?;
@@ -707,7 +725,9 @@ impl MarvSession {
         let factory = factory_of(&init.provider, init.thinking);
         let provider = factory.make(None, None);
         let has_skills = !init.skills.is_empty();
-        let mut specs = marv_tools::tool_specs_for(has_skills);
+        // Built once, so every request sends byte-identical tool definitions (the skill tool only when there are
+        // skills, the plan tool unless it's off).
+        let mut specs = marv_tools::tool_specs_for(has_skills, init.plan);
         specs.extend(init.tools.iter().map(|t| t.spec()));
         if init.mesh.is_some() {
             specs.extend(marv_mesh::tools::mesh_specs());
@@ -753,6 +773,7 @@ impl MarvSession {
             working: None,
             turn_mcp_specs: Arc::default(),
             mcp_waited: false,
+            plan: None,
             checkpoints: init.checkpoints,
             turn_number: 0,
             reported: Default::default(),
@@ -811,6 +832,11 @@ impl MarvSession {
     /// Files and servers that couldn't be read, and why.
     pub fn problems(&self) -> &[String] {
         &self.inner.init.problems
+    }
+    /// The plan tool's list (#15), or `None` when there's none; each change also arrives as a tool end's
+    /// `result.plan`.
+    pub fn plan(&self) -> Option<Vec<PlanItem>> {
+        self.state().plan.clone()
     }
     /// What tainted this session, in order (empty: clean).
     pub fn tainted(&self) -> Vec<Provenance> {
@@ -1138,6 +1164,10 @@ impl MarvSession {
         ctx.skills = self.inner.skills.clone();
         ctx.memory = init.memory.as_ref().map(|(paths, _)| paths.for_tools());
         ctx.agent_host = Some(host);
+        // Where the plan tool writes; only the main agent gets it (as it does agent_host), so subagents have no plan.
+        if init.plan {
+            ctx.plan = Some(Arc::new(SessionPlan(self.clone())));
+        }
         ctx.before_change = checks.as_ref().map(|c| c.before_change.clone());
         ctx.checkpoint = checkpoint.map(|c| c as Arc<dyn marv_tools::Checkpoint>);
         ctx.taint = self.inner.taint.clone();
@@ -1467,7 +1497,8 @@ impl MarvSession {
         };
         // In place: the loop holds this very history for the whole turn, so a compaction between its steps must
         // rewrite it where it stands; replacing the Arc would leave the loop on the full history.
-        *lock(&conversation) = compacted_history(&summary);
+        let plan = self.state().plan.clone().filter(|p| marv_tools::plan::plan_open(Some(p)));
+        *lock(&conversation) = compacted_history(&summary, plan.as_deref().map(marv_tools::plan::plan_text).as_deref());
         {
             // A summary may drop the list of MCP tools: the next message announces them all again (the cache starts
             // over here anyway), and schemas seen before it may be gone too.
@@ -1502,6 +1533,7 @@ impl MarvSession {
             s.messages.clear();
             s.last = None;
             s.listing = None; // a new conversation decides its MCP mode again
+            s.plan = None; // a new conversation, a new plan
         }
         lock(&self.inner.loaded).clear();
         if let Some((paths, _)) = &self.inner.init.memory
@@ -1548,12 +1580,17 @@ impl MarvSession {
             s.totals = saved.totals.clone();
             s.last = None;
             s.listing = saved.mcp_listing();
+            // The model needs nothing extra: its last plan call (or the summary holding the plan) is still in the
+            // conversation. A session without the plan tool restores none: compaction would tell the model to keep
+            // updating it.
+            s.plan = if self.inner.init.plan { saved.plan_items() } else { None };
             let resumed = Resumed {
                 id: saved.id.clone(),
                 updated_at: saved.updated_at,
                 model: saved.model.clone(),
                 transcript: saved.transcript.clone(),
                 totals: saved.totals.clone(),
+                plan: s.plan.clone(),
             };
             let (saved_checkpoints, pending_note, id) = (saved.saved_checkpoints(), saved.pending_note(), saved.id.clone());
             s.saved = saved;
@@ -1773,6 +1810,7 @@ impl MarvSession {
         saved.transcript = transcript.unwrap_or_else(|| s.messages.clone());
         saved.totals = s.totals.clone();
         saved.mcp = s.listing.as_ref().and_then(|l| serde_json::to_value(l).ok());
+        saved.plan = s.plan.as_ref().and_then(|p| serde_json::to_value(p).ok());
         let checkpoints = SavedCheckpoints {
             chain: s.chain_id.clone(),
             reported: s.reported.iter().map(|(turn, paths)| (*turn, paths.clone())).collect(),
@@ -1909,7 +1947,8 @@ impl MarvSession {
     fn offered(&self) -> (Vec<ToolSpec>, Vec<ToolRef>) {
         let init = &self.inner.init;
         let mut specs = self.inner.specs.clone();
-        let mut tools: Vec<ToolRef> = marv_tools::builtin_tools().to_vec();
+        let mut tools: Vec<ToolRef> =
+            marv_tools::builtin_tools().iter().filter(|t| init.plan || t.name() != "plan").cloned().collect();
         tools.extend(init.tools.iter().cloned());
         if let Some(mesh) = &init.mesh
             && let Ok(plug) = mesh.plug(crate::mesh::parent_id())
@@ -2206,11 +2245,14 @@ mod tests {
     #[test]
     fn custom_tool_names_must_be_their_own() {
         let tools = |names: &[&'static str]| names.iter().map(|n| Arc::new(Named(n)) as ToolRef).collect::<Vec<_>>();
-        assert!(check_tool_names(&tools(&["deploy"])).is_ok());
-        assert!(check_tool_names(&tools(&["bash"])).unwrap_err().contains("already built in"));
-        assert!(check_tool_names(&tools(&["mcp_call"])).unwrap_err().contains("already built in"));
-        assert!(check_tool_names(&tools(&["mcp__x__y"])).unwrap_err().contains("mcp__"));
-        assert!(check_tool_names(&tools(&["a", "a"])).unwrap_err().contains("Two tools"));
+        assert!(check_tool_names(&tools(&["deploy"]), true).is_ok());
+        assert!(check_tool_names(&tools(&["bash"]), true).unwrap_err().contains("already built in"));
+        assert!(check_tool_names(&tools(&["mcp_call"]), true).unwrap_err().contains("already built in"));
+        assert!(check_tool_names(&tools(&["mcp__x__y"]), true).unwrap_err().contains("mcp__"));
+        assert!(check_tool_names(&tools(&["a", "a"]), true).unwrap_err().contains("Two tools"));
+        // plan is a free name where the session doesn't offer it (#15).
+        assert!(check_tool_names(&tools(&["plan"]), true).unwrap_err().contains("\"plan\" is already built in"));
+        assert!(check_tool_names(&tools(&["plan"]), false).is_ok());
         let s = session(|i| i.tools = tools(&["deploy"])).unwrap();
         let _: &[ToolSpec] = &s.inner.specs;
         assert_eq!(s.inner.specs.last().unwrap().name, "deploy");
@@ -3579,5 +3621,235 @@ mod turn_tests {
         let events = collect(go(&session, "write it")).await;
         assert!(events.iter().any(|e| matches!(e, SessionEvent::Loop(LoopEvent::Assistant { text }) if text == "Refused.")));
         assert!(!dirs.project.join("out.txt").exists());
+    }
+
+    // ---- the plan (#15) ----
+
+    fn plan_items() -> serde_json::Value {
+        serde_json::json!([
+            { "text": "Read the report command", "status": "done" },
+            { "text": "Add the --json flag", "status": "in_progress" },
+            { "text": "Update README and CHANGELOG", "status": "pending" },
+        ])
+    }
+    fn plan_call(id: &str, items: serde_json::Value) -> ToolCall {
+        call(id, "plan", serde_json::json!({ "items": items }))
+    }
+    fn expected_plan() -> Vec<PlanItem> {
+        serde_json::from_value(plan_items()).unwrap()
+    }
+    fn tool_names(options: &StreamOptions) -> Vec<String> {
+        options.tools.iter().map(|t| t.name.clone()).collect()
+    }
+    fn plan_shown(events: &[SessionEvent]) -> Option<Vec<PlanItem>> {
+        events.iter().find_map(|e| match e {
+            SessionEvent::Loop(LoopEvent::ToolEnd { run, .. }) => {
+                run.display.as_ref().and_then(|d| d.downcast_ref::<crate::runner::ToolDisplay>()).and_then(|d| d.plan.clone())
+            }
+            _ => None,
+        })
+    }
+    const PLAN_TEXT: &str = "Your plan (from the plan tool), as it stood:\n- [done] Read the report command\n- [in progress] Add the --json flag\n- [pending] Update README and CHANGELOG\nKeep updating it with the plan tool.";
+
+    #[tokio::test]
+    async fn a_plan_call_sets_the_plan_and_the_system_prompt_and_specs_stay_byte_identical() {
+        let dirs = Dirs::new();
+        let provider = Scripted::new(vec![use_tools(vec![plan_call("p1", plan_items())]), say("Working."), say("More.")]);
+        let session = scripted(&dirs, &provider, |_| {});
+        assert_eq!(session.plan(), None);
+        let events = collect(go(&session, "do three things")).await;
+        assert_eq!(session.plan(), Some(expected_plan()));
+        assert_eq!(plan_shown(&events), Some(expected_plan()));
+        // The model got only the line; the list is in its own call.
+        let line = "Plan saved: 1 of 3 done; now: Add the --json flag.";
+        assert_eq!(
+            provider.requests()[1].0.last(),
+            Some(&ChatTurn::Tool { call_id: "p1".into(), name: "plan".into(), text: line.into() })
+        );
+        collect(go(&session, "and then?")).await;
+        let requests = provider.requests();
+        assert!(tool_names(&requests[0].1).contains(&"plan".to_string()));
+        for (_, options) in &requests[1..] {
+            assert_eq!(options.system, requests[0].1.system);
+            assert_eq!(options.tools, requests[0].1.tools);
+        }
+        assert!(requests[0].1.system.as_deref().unwrap().contains("keep a plan with the plan tool"));
+    }
+
+    #[tokio::test]
+    async fn an_empty_plan_clears_it_and_clear_drops_it() {
+        let dirs = Dirs::new();
+        let provider = Scripted::new(vec![
+            use_tools(vec![plan_call("p1", plan_items())]),
+            say("Ok."),
+            use_tools(vec![plan_call("p2", serde_json::json!([]))]),
+            say("Cleared."),
+            use_tools(vec![plan_call("p3", plan_items())]),
+            say("Again."),
+        ]);
+        let session = scripted(&dirs, &provider, |_| {});
+        collect(go(&session, "plan")).await;
+        assert!(session.plan().is_some());
+        let events = collect(go(&session, "drop it")).await;
+        assert_eq!(session.plan(), None);
+        assert_eq!(plan_shown(&events), Some(vec![]));
+        collect(go(&session, "plan again")).await;
+        assert!(session.plan().is_some());
+        session.clear().await.unwrap();
+        assert_eq!(session.plan(), None);
+    }
+
+    #[tokio::test]
+    async fn the_plan_is_saved_with_the_session_and_restored_by_resume() {
+        let dirs = Dirs::new();
+        let sessions = Arc::new(SessionStore::new(&dirs.dir));
+        let provider = Scripted::new(vec![use_tools(vec![plan_call("p1", plan_items())]), say("Planned.")]);
+        let a = scripted(&dirs, &provider, |i| i.sessions = Some(sessions.clone()));
+        collect(go(&a, "plan it")).await;
+        a.flush().await;
+        assert_eq!(sessions.load(&dirs.project, &a.id()).await.unwrap().plan_items(), Some(expected_plan()));
+        let b = scripted(&dirs, &Scripted::new(vec![]), |i| i.sessions = Some(sessions.clone()));
+        let resumed = b.resume(ResumeTarget::Id(a.id())).await.unwrap().unwrap();
+        assert_eq!(resumed.plan, Some(expected_plan()));
+        assert_eq!(b.plan(), Some(expected_plan()));
+    }
+
+    #[tokio::test]
+    async fn resumed_with_plan_off_an_unfinished_saved_plan_isnt_restored_nor_handed_to_compaction() {
+        let dirs = Dirs::new();
+        let sessions = Arc::new(SessionStore::new(&dirs.dir));
+        let a = scripted(&dirs, &Scripted::new(vec![use_tools(vec![plan_call("p1", plan_items())]), say("Planned.")]), |i| {
+            i.sessions = Some(sessions.clone())
+        });
+        collect(go(&a, "plan it")).await;
+        a.flush().await;
+        let provider = Scripted::new(vec![say("The summary."), say("Ok.")]);
+        let b = scripted(&dirs, &provider, |i| {
+            i.sessions = Some(sessions.clone());
+            i.plan = false;
+        });
+        let resumed = b.resume(ResumeTarget::Id(a.id())).await.unwrap().unwrap();
+        assert_eq!(resumed.plan, None);
+        assert_eq!(b.plan(), None);
+        assert!(matches!(b.compact(None).await.unwrap(), CompactResult::Compacted { .. }));
+        collect(go(&b, "go on")).await;
+        let history = format!("{:?}", provider.requests().last().unwrap().0);
+        assert!(history.contains("The summary."));
+        assert!(!history.contains("plan tool"));
+    }
+
+    #[tokio::test]
+    async fn a_malformed_saved_plan_is_dropped_and_the_session_still_loads() {
+        let dirs = Dirs::new();
+        let sessions = Arc::new(SessionStore::new(&dirs.dir));
+        let a = scripted(&dirs, &Scripted::new(vec![say("Hi.")]), |i| i.sessions = Some(sessions.clone()));
+        collect(go(&a, "hi")).await;
+        a.flush().await;
+        let file = sessions.file(&dirs.project, &a.id());
+        let mut saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        saved["plan"] = serde_json::json!([{ "text": "x", "status": "started" }]);
+        std::fs::write(&file, saved.to_string()).unwrap();
+        let b = scripted(&dirs, &Scripted::new(vec![]), |i| i.sessions = Some(sessions.clone()));
+        let resumed = b.resume(ResumeTarget::Id(a.id())).await.unwrap().unwrap();
+        assert_eq!(resumed.id, a.id());
+        assert_eq!(resumed.plan, None);
+        assert_eq!(b.plan(), None);
+    }
+
+    #[tokio::test]
+    async fn plan_off_leaves_it_out_of_every_request_and_the_system_prompt_and_a_call_to_it_is_unknown() {
+        let dirs = Dirs::new();
+        let provider = Scripted::new(vec![use_tools(vec![plan_call("p1", plan_items())]), say("Ok.")]);
+        let session = scripted(&dirs, &provider, |i| i.plan = false);
+        let events = collect(go(&session, "plan")).await;
+        for (_, options) in provider.requests() {
+            assert!(!tool_names(&options).contains(&"plan".to_string()));
+            assert!(!options.system.as_deref().unwrap().contains("plan tool"));
+        }
+        let end = events.iter().find_map(|e| match e {
+            SessionEvent::Loop(LoopEvent::ToolEnd { run, .. }) => Some(run.result.clone()),
+            _ => None,
+        });
+        let end = end.unwrap();
+        assert!(end.is_error);
+        assert!(end.output.starts_with("Unknown tool \"plan\""), "{}", end.output);
+        assert_eq!(session.plan(), None);
+    }
+
+    #[tokio::test]
+    async fn a_subagent_is_offered_no_plan_and_its_call_to_one_fails() {
+        let dirs = Dirs::new();
+        let parent = Scripted::new(vec![
+            use_tools(vec![call(
+                "a1",
+                "agent",
+                serde_json::json!({ "description": "look around", "prompt": "sub-task: find the notes" }),
+            )]),
+            say("Parent done."),
+        ]);
+        let sub = Scripted::new(vec![use_tools(vec![plan_call("s1", plan_items())]), say("Found them.")]);
+        let (p, s) = (parent.clone(), sub.clone());
+        let routed = Hook(move |history: &[ChatTurn], options: &StreamOptions| {
+            let is_sub = history.iter().any(|t| matches!(t, ChatTurn::User { text } if text.contains("sub-task")));
+            if is_sub { s.stream(history, options.clone()) } else { p.stream(history, options.clone()) }
+        });
+        let session = make(&dirs, fixed(Arc::new(routed)), |_| {});
+        collect(go(&session, "go")).await;
+        let sub_requests = sub.requests();
+        assert!(!tool_names(&sub_requests[0].1).contains(&"plan".to_string()));
+        assert!(text_of(sub_requests[1].0.last().unwrap()).starts_with("Unknown tool \"plan\""));
+        assert_eq!(session.plan(), None);
+    }
+
+    #[tokio::test]
+    async fn mid_turn_compaction_keeps_the_plan_then_the_mid_turn_note() {
+        let dirs = Dirs::new();
+        let provider = Scripted::new(vec![
+            use_tools(vec![plan_call("p1", plan_items())]),
+            with(used(900), use_tools(vec![read("c1")])),
+            say("SUMMARY"),
+            say("Finished."),
+        ])
+        .with_context(1000);
+        let session = scripted(&dirs, &provider, |_| {});
+        collect(go(&session, "long task")).await;
+        let after = &provider.requests()[3].0;
+        assert!(text_of(&after[0]).ends_with(&format!("SUMMARY\n\n{PLAN_TEXT}")), "{}", text_of(&after[0]));
+        assert_eq!(text_of(after.last().unwrap()), MID_TURN_NOTE);
+    }
+
+    #[tokio::test]
+    async fn compaction_before_a_message_keeps_the_plan_and_the_message_follows() {
+        let dirs = Dirs::new();
+        let provider = Scripted::new(vec![
+            use_tools(vec![plan_call("p1", plan_items())]),
+            with(used(900), say("Paused.")),
+            say("SUMMARY"),
+            say("Going on."),
+        ])
+        .with_context(1000);
+        let session = scripted(&dirs, &provider, |_| {});
+        collect(go(&session, "long task")).await;
+        collect(go(&session, "go on")).await;
+        let after = &provider.requests()[3].0;
+        assert!(text_of(&after[0]).contains("- [in progress] Add the --json flag"));
+        assert_eq!(after.last(), Some(&ChatTurn::User { text: "go on".into() }));
+    }
+
+    #[tokio::test]
+    async fn a_finished_plan_isnt_handed_to_compaction() {
+        let dirs = Dirs::new();
+        let done = serde_json::json!([{ "text": "All of it", "status": "done" }]);
+        let provider = Scripted::new(vec![
+            use_tools(vec![plan_call("p1", done)]),
+            with(used(900), say("Done.")),
+            say("SUMMARY"),
+            say("Ok."),
+        ])
+        .with_context(1000);
+        let session = scripted(&dirs, &provider, |_| {});
+        collect(go(&session, "task")).await;
+        collect(go(&session, "next")).await;
+        assert!(!text_of(&provider.requests()[3].0[0]).contains("plan tool"));
     }
 }

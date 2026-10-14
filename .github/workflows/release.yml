@@ -6,6 +6,7 @@
 #   marv-aarch64-unknown-linux-musl.tar.gz  (+ .sha256)
 #   SHA256SUMS                              all of the above, which install.sh checks against
 #   install.sh
+#   flologixai-marv-*.tgz                   the npm packages (packaging/npm), published by hand
 #
 # Run it by hand (workflow_dispatch) for a dry run: everything but the release.
 name: Release
@@ -60,6 +61,7 @@ jobs:
         run: |
           target/${{ matrix.target }}/release/marv --version
           MARV_TEST_BINARY=target/${{ matrix.target }}/release/marv packaging/test-install.sh
+          packaging/npm/test.sh target/${{ matrix.target }}/release/marv
       - name: Package
         run: packaging/package.sh ${{ matrix.target }} target/${{ matrix.target }}/release/marv dist
       - uses: actions/upload-artifact@v4
@@ -107,9 +109,15 @@ jobs:
           cat marv-*.tar.gz.sha256 > SHA256SUMS
           sha256sum -c SHA256SUMS
           cat SHA256SUMS
+      # The npm packages go up as release assets too; publishing them needs the maintainer's 2FA, so it's done by hand
+      # (packaging/npm/build.sh says the order).
+      - name: npm packages
+        run: |
+          packaging/npm/build.sh "${GITHUB_REF_NAME#v}" dist npm
+          mv npm/*.tgz dist/
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" dist/* \
-            --verify-tag --title "marv-rs $GITHUB_REF_NAME" --generate-notes
+            --verify-tag --title "Marv $GITHUB_REF_NAME" --generate-notes

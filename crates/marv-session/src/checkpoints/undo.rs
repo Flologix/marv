@@ -451,6 +451,7 @@ pub fn undo_request(plan: &UndoPlan) -> ApprovalRequest {
         once: true,
         must_ask: false,
         protected: None,
+        door: None,
     }
 }
 

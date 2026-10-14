@@ -9,7 +9,7 @@
 //! - `preview` runs before the approval: a [`ToolError`] there means the call can't succeed, so the user is never
 //!   asked to approve it.
 //! - `repair` (issue #10) fixes a malformed call whose meaning is beyond doubt, before validation; never fails.
-//! - `ToolOutput::diff` is for the screen only: never sent to the model (the loop appends `output`) nor written to
+//! - `ToolOutput::diff` and `ToolOutput::plan` are for the screen only: never sent to the model (the loop appends `output`) nor written to
 //!   trajectories (they record named fields).
 //! - `ToolContext::before_change` is started (not awaited) by the edit tools' preview and awaited in `run` before
 //!   writing: the session takes the typecheck's baseline there, so it sees the project as it was.
@@ -29,6 +29,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+pub use marv_core::Door;
 use marv_core::{Provenance, ToolKind, ToolSpec};
 use marv_sandbox::{ProtectedRule, Sandbox, TaintState};
 use serde::de::DeserializeOwned;
@@ -142,6 +143,22 @@ pub struct ApprovalRequest {
     pub must_ask: bool,
     /// marv-rs: the protected path rule this call touches, for the approval's warning.
     pub protected: Option<ProtectedRule>,
+    /// The call leaves the sandbox through one of its doors: the prompt shows that door's warning line.
+    pub door: Option<Door>,
+}
+
+/// The doors this agent may use where a door is gated by who's running, not by the approver (an approver can be told
+/// to say yes to an exact scope key: `marv -p --approve`). Set by the session for the main agent only; a subagent's
+/// context is built without it. Marv's `Doors`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Doors {
+    /// bash with sandbox: false: only where the user approves each command at a terminal (the TUI, or the SDK's
+    /// hostCommands).
+    pub host: bool,
+    pub process: bool,
+    /// The github tool's writes and sensitive reads (#47): the main agent's, where the session offers the tool; a
+    /// subagent only reads.
+    pub github: bool,
 }
 
 /// An approver's answer. `Unavailable`: no one can approve this call (a headless run's `--approve` list doesn't
@@ -231,6 +248,28 @@ pub trait AgentHost: Send + Sync {
     async fn run(&self, input: &crate::agent::AgentInput, ctx: &ToolContext) -> Result<ToolOutput, ToolError>;
 }
 
+/// The status of one plan item; at most one is `InProgress` at a time (the current item).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanStatus {
+    Pending,
+    InProgress,
+    Done,
+}
+
+/// One item of the plan tool's checklist (#15).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanItem {
+    pub text: String,
+    pub status: PlanStatus,
+}
+
+/// What the plan tool writes through: the session's state.
+pub trait PlanHost: Send + Sync {
+    /// The whole list, replacing the previous one; empty clears the plan.
+    fn set(&self, items: Vec<PlanItem>);
+}
+
 /// Everything a tool call may use. Cheap to clone (paths and `Arc`s); `run_tool` clones it per call to set
 /// `call_id` and `confined`.
 #[derive(Clone)]
@@ -257,6 +296,8 @@ pub struct ToolContext {
     /// Extra folders bash may read but not change: a worktree's shared `.git`.
     pub read_only: Vec<PathBuf>,
     pub agent_host: Option<Arc<dyn AgentHost>>,
+    /// Where the plan tool keeps its list (#15). Only the main agent has one, so subagents have no plan.
+    pub plan: Option<Arc<dyn PlanHost>>,
     /// Pins where git looks for this agent's file listing (a worktree subagent).
     pub git_env: Vec<(String, String)>,
     pub before_change: Option<Arc<dyn BeforeChange>>,
@@ -264,6 +305,8 @@ pub struct ToolContext {
     pub checkpoint: Option<Arc<dyn Checkpoint>>,
     /// The session's taint (marv-rs).
     pub taint: Arc<TaintState>,
+    /// The doors out of the sandbox this agent has (see [`Doors`]). Default: none.
+    pub doors: Doors,
 }
 
 impl ToolContext {
@@ -283,10 +326,12 @@ impl ToolContext {
             call_id: None,
             read_only: Vec::new(),
             agent_host: None,
+            plan: None,
             git_env: Vec::new(),
             before_change: None,
             checkpoint: None,
             taint: Arc::new(TaintState::new()),
+            doors: Doors::default(),
         }
     }
 
@@ -304,6 +349,9 @@ pub struct ToolOutput {
     pub summary: String,
     /// What a file change did, for the transcript only.
     pub diff: Option<DiffShown>,
+    /// The plan tool's list after the call, for the screen only (like `diff`: never sent to the model or a
+    /// trajectory; the call already holds it).
+    pub plan: Option<Vec<PlanItem>>,
     /// The file a change wrote (with `diff`), project-relative: which project checks run after the step.
     pub changed: Option<String>,
     pub is_error: bool,
@@ -312,6 +360,8 @@ pub struct ToolOutput {
     pub approval: Option<Approval>,
     /// Where `output` came from (marv-rs): text from anything but the user or Marv is fenced as data.
     pub provenance: Provenance,
+    /// The door the call went through (for trajectories); None for an ordinary call. Set by `run_tool`.
+    pub door: Option<Door>,
 }
 
 impl ToolOutput {
@@ -320,11 +370,13 @@ impl ToolOutput {
             output: output.into(),
             summary: summary.into(),
             diff: None,
+            plan: None,
             changed: None,
             is_error: false,
             declined: false,
             approval: None,
             provenance: Provenance::Project,
+            door: None,
         }
     }
 
@@ -413,6 +465,15 @@ pub trait Tool: Send + Sync + 'static {
     fn egress_url(&self, _input: &Self::Input) -> Option<String> {
         None
     }
+    /// The door this call leaves the sandbox through, if any: `run_tool` copies it onto the call's
+    /// [`ApprovalRequest`] and its result (Marv Sprint 4).
+    fn door(&self, _input: &Self::Input, _ctx: &ToolContext) -> Option<Door> {
+        None
+    }
+    /// Whether this call must be asked every time ([`ApprovalRequest::once`]): no "don't ask again", ever.
+    fn once(&self, _input: &Self::Input, _ctx: &ToolContext) -> bool {
+        false
+    }
     async fn run(&self, input: &Self::Input, ctx: &ToolContext) -> Result<ToolOutput, ToolError>;
 }
 
@@ -441,6 +502,8 @@ pub trait DynTool: Send + Sync {
     fn protected_target(&self, input: In<'_>, ctx: &ToolContext) -> Option<ProtectedRule>;
     fn repair(&self, raw: &Value, ctx: &ToolContext) -> Option<Repaired>;
     fn egress_url(&self, input: In<'_>) -> Option<String>;
+    fn door(&self, input: In<'_>, ctx: &ToolContext) -> Option<Door>;
+    fn once(&self, input: In<'_>, ctx: &ToolContext) -> bool;
     async fn run(&self, input: In<'_>, ctx: &ToolContext) -> Result<ToolOutput, ToolError>;
 }
 
@@ -503,6 +566,12 @@ impl<T: Tool> DynTool for T {
     }
     fn egress_url(&self, input: In<'_>) -> Option<String> {
         Tool::egress_url(self, typed::<T>(input))
+    }
+    fn door(&self, input: In<'_>, ctx: &ToolContext) -> Option<Door> {
+        Tool::door(self, typed::<T>(input), ctx)
+    }
+    fn once(&self, input: In<'_>, ctx: &ToolContext) -> bool {
+        Tool::once(self, typed::<T>(input), ctx)
     }
     async fn run(&self, input: In<'_>, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         Tool::run(self, typed::<T>(input), ctx).await

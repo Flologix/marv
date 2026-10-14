@@ -53,12 +53,14 @@ pub fn approval_record(approval: Option<Approval>) -> ApprovalRecord {
 pub struct ToolDisplay {
     /// What a file change did (edit_file, write_file).
     pub diff: Option<DiffShown>,
+    /// The plan tool's list after the call (#15; empty: cleared). The model has it in its own call.
+    pub plan: Option<Vec<marv_tools::PlanItem>>,
 }
 
 /// The loop's view of a finished call. `note`: a repair's note for a rewritten call (deferred MCP, #14).
 pub fn tool_run_from(outcome: ToolOutcome, note: Option<&str>) -> ToolRun {
     let ToolOutcome { result, label } = outcome;
-    let display = ToolDisplay { diff: result.diff.clone() };
+    let display = ToolDisplay { diff: result.diff.clone(), plan: result.plan.clone() };
     let (declined, provenance, changed) = (result.declined, result.provenance, result.changed.clone());
     let approval = approval_record(result.approval);
     let mut core = result.into_core();
@@ -148,19 +150,23 @@ pub struct SessionApprover {
 #[async_trait]
 impl Approver for SessionApprover {
     async fn approve(&self, request: ApprovalRequest) -> Decision {
-        // marv-rs: a must_ask request (tainted egress, a protected path) is never answered from remembered scopes.
-        if !request.must_ask && self.always.contains(&request.scope.key) {
+        // marv-rs: a must_ask request (tainted egress, a protected path) is never answered from remembered scopes. Nor
+        // is a `once` one (a door to the host, /mcp add), which is never added to them either, whatever the client
+        // answers (Marv Sprint 4).
+        let remembered = !request.must_ask && !request.once;
+        if remembered && self.always.contains(&request.scope.key) {
             return Decision::Yes;
         }
         if self.cancel.is_cancelled() {
             return Decision::No;
         }
         let key = request.scope.key.clone();
+        let once = request.once;
         let decision = tokio::select! {
             d = self.inner.approve(request) => d,
             _ = self.cancel.cancelled() => Decision::No,
         };
-        if decision == Decision::Always {
+        if decision == Decision::Always && !once {
             self.always.add(key);
         }
         decision
@@ -183,6 +189,7 @@ pub fn step_limit_request(steps: u32, every: u32) -> ApprovalRequest {
         once: false,
         must_ask: false,
         protected: None,
+        door: None,
     }
 }
 
@@ -278,6 +285,21 @@ mod tests {
         assert_eq!(a.approve(request("web:docs.rs", true)).await, Decision::Yes);
         assert_eq!(a.approve(request("web:docs.rs", true)).await, Decision::Yes);
         assert_eq!(inner.0.lock().unwrap().len(), 2, "the person was asked both times");
+    }
+
+    // Marv Sprint 4: a `once` request (a door to the host, /mcp add) is never answered from "always", nor added to it.
+    #[tokio::test]
+    async fn once_requests_are_never_remembered() {
+        let inner = Arc::new(Counting(Mutex::default(), Decision::Always));
+        let always = AlwaysScopes::default();
+        always.add("host");
+        let a = SessionApprover { inner: inner.clone(), always: always.clone(), cancel: CancellationToken::new() };
+        let once = |key: &str| ApprovalRequest { once: true, ..request(key, false) };
+        assert_eq!(a.approve(once("host")).await, Decision::Always);
+        assert_eq!(a.approve(once("bash:rm -rf build")).await, Decision::Always);
+        assert_eq!(a.approve(once("bash:rm -rf build")).await, Decision::Always);
+        assert_eq!(inner.0.lock().unwrap().len(), 3, "asked every time");
+        assert!(!always.contains("bash:rm -rf build"));
     }
 
     #[tokio::test]
