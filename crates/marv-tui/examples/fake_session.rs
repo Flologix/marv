@@ -429,7 +429,7 @@ fn setup_context(start: SetupStart) -> SetupContext {
 }
 
 fn status(model: &str) -> StatusInfo {
-    StatusInfo { model: model.into(), cwd: "~/Projects/demo".into(), yolo: true, context_length: Some(32_768) }
+    StatusInfo { model: model.into(), cwd: "~/Projects/demo".into(), yolo: true, context_length: Some(32_768), processes: 0 }
 }
 
 #[tokio::main]

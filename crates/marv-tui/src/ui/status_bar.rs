@@ -158,6 +158,11 @@ impl StatusBar<'_> {
             spans.push(Span::styled("yolo", Style::new().fg(theme::ACCENT)));
             spans.push(Span::styled(" · ", Style::new().fg(color)));
         }
+        let running = self.info.map_or(0, |i| i.processes);
+        if running > 0 && !self.confirm_exit && self.flash.is_none() {
+            spans.push(Span::styled(format!("{running} running"), Style::new().fg(theme::ACCENT)));
+            spans.push(Span::styled(" · ", Style::new().fg(color)));
+        }
         spans.push(Span::styled(hint, Style::new().fg(color)));
         Line::from(spans)
     }
@@ -248,7 +253,7 @@ mod tests {
 
     #[test]
     fn the_hint_follows_the_state() {
-        let info = StatusInfo { model: "ollama/qwen".into(), cwd: "~/x".into(), yolo: true, context_length: None };
+        let info = StatusInfo { model: "ollama/qwen".into(), cwd: "~/x".into(), yolo: true, context_length: None, processes: 0 };
         let idle = StatusBar { info: Some(&info), ..Default::default() };
         assert_eq!(idle.left().to_string(), "yolo · /help · PgUp/PgDn · ctrl+c exit");
         let busy = StatusBar { busy: true, agents: 2, ..idle.clone() };
@@ -259,6 +264,23 @@ mod tests {
         assert_eq!(confirm.left().to_string(), "Press ctrl+c again to exit");
         let flash = StatusBar { flash: Some("Copied 7 chars"), ..idle.clone() };
         assert_eq!(flash.left().to_string(), "Copied 7 chars");
+    }
+
+    #[test]
+    fn running_background_processes_are_counted_whenever_there_are_any() {
+        // Marv's StatusBar (#51): they keep running between turns, so idle or busy, after yolo and before the hint.
+        let info = StatusInfo { yolo: true, processes: 1, ..Default::default() };
+        let idle = StatusBar { info: Some(&info), ..Default::default() };
+        assert_eq!(idle.left().to_string(), "yolo · 1 running · /help · PgUp/PgDn · ctrl+c exit");
+        assert_eq!(idle.left().spans[2].style.fg, Some(theme::ACCENT));
+        let two = StatusInfo { processes: 2, ..Default::default() };
+        let busy = StatusBar { info: Some(&two), busy: true, ..Default::default() };
+        assert_eq!(busy.left().to_string(), "2 running · esc to interrupt");
+        // Not over the exit confirmation or a flash, and not at all with none.
+        assert_eq!(StatusBar { confirm_exit: true, ..busy.clone() }.left().to_string(), "Press ctrl+c again to exit");
+        assert_eq!(StatusBar { flash: Some("Copied"), ..busy.clone() }.left().to_string(), "Copied");
+        let none = StatusInfo::default();
+        assert_eq!(StatusBar { info: Some(&none), ..Default::default() }.left().to_string(), "/help · PgUp/PgDn · ctrl+c exit");
     }
 
     #[test]
