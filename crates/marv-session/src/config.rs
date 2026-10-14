@@ -87,6 +87,8 @@ pub struct FileConfig {
     pub checks: Option<bool>,
     /// Snapshot the project before each turn's changes, so /undo can put them back (default on). #16.
     pub checkpoints: Option<bool>,
+    /// Session-start hooks (#108). Read only from this file, the user's own: no project file ever fills it.
+    pub hooks: Option<crate::hooks::Hooks>,
     pub mcp_tools: Option<McpToolsSetting>,
     pub max_steps: Option<MaxStepsSetting>,
     /// `mesh.wake` (marv-rs #78): a message on a wired inbox starts a turn while the TUI is idle (default off).
@@ -183,6 +185,10 @@ impl FileConfig {
                 None
             }
         };
+        let hooks = match map.get("hooks") {
+            None | Some(Value::Null) => None,
+            Some(v) => crate::hooks::Hooks::from_value(v).map_err(|e| problems.push(e)).ok(),
+        };
         let config = Self {
             provider,
             model: string("model", &mut problems),
@@ -196,6 +202,7 @@ impl FileConfig {
             diagnostics: boolean("diagnostics", &mut problems),
             checks: boolean("checks", &mut problems),
             checkpoints: boolean("checkpoints", &mut problems),
+            hooks,
             mcp_tools,
             max_steps,
             mesh_wake,
@@ -223,6 +230,7 @@ impl FileConfig {
         put("diagnostics", self.diagnostics.map(Value::from));
         put("checks", self.checks.map(Value::from));
         put("checkpoints", self.checkpoints.map(Value::from));
+        put("hooks", self.hooks.as_ref().map(crate::hooks::Hooks::to_value));
         put("mcpTools", self.mcp_tools.and_then(|m| serde_json::to_value(m).ok()));
         put(
             "maxSteps",
@@ -597,5 +605,16 @@ mod tests {
         std::fs::write(&store.path, "{not json").unwrap();
         assert!(store.load().is_err());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // #108: saving the config (/yolo, /setup…) keeps the user's hooks; a bad one names itself.
+    #[test]
+    fn hooks_survive_a_save_and_a_bad_one_is_rejected() {
+        let raw = json!({"provider": "ollama", "hooks": {"sessionStart": ["bd ready", {"command": "x", "timeout": 3}]}});
+        let f = FileConfig::from_value(&raw).unwrap();
+        assert_eq!(f.hooks.as_ref().unwrap().session_start.len(), 2);
+        assert_eq!(f.to_value()["hooks"], raw["hooks"]);
+        let bad = FileConfig::from_value(&json!({"hooks": {"sessionStart": [""]}})).unwrap_err();
+        assert!(bad.contains("hooks.sessionStart[0]"), "{bad}");
     }
 }

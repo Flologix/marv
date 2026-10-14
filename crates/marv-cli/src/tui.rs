@@ -310,6 +310,7 @@ pub fn tainted_text(source: marv_core::Provenance) -> String {
         marv_core::Provenance::Mcp => "an MCP server's output",
         marv_core::Provenance::Mesh => "a mesh message",
         marv_core::Provenance::Image => "an image",
+        marv_core::Provenance::Hook => "a session-start hook's output",
         _ => "untrusted content",
     };
     format!(
@@ -477,6 +478,20 @@ pub fn startup_notice(notes: Vec<(NoticeTone, NoticeItem)>) -> Option<Notice> {
         title: format!("Startup · {n} note{}", if n == 1 { "" } else { "s" }),
         tone: notes.iter().map(|(t, _)| *t).max().unwrap_or(NoticeTone::Info),
         items: notes.into_iter().map(|(_, item)| item).collect(),
+    })
+}
+
+/// What the session-start hooks did (#108), one line each: shown when a conversation starts, collapsed to that (the
+/// output itself goes to the model, not the screen).
+pub fn hooks_notice(runs: &[marv_session::hooks::HookRun]) -> Option<Notice> {
+    if runs.is_empty() {
+        return None;
+    }
+    let failed = runs.iter().any(|r| !r.ok());
+    Some(Notice {
+        title: format!("Session-start hooks · {} ran", runs.len()),
+        tone: if failed { NoticeTone::Warning } else { NoticeTone::Info },
+        items: runs.iter().map(|r| NoticeItem { text: printable(&r.line()), detail: None }).collect(),
     })
 }
 
@@ -838,6 +853,8 @@ pub struct Bridge {
     /// Who may start a turn (#78): user submissions and wake-ups go through this one lock, so a wake can't start
     /// once a submission is on its way, and a submission that meets a running turn waits for it instead of failing.
     gate: Mutex<Gate>,
+    /// A project's `.marv/config.json` named `hooks` (#108): the startup note saying they were not run.
+    hooks_refused: Option<String>,
 }
 
 /// [`Bridge::gate`]'s state.
@@ -897,6 +914,9 @@ impl Bridge {
         init.worktrees_dir = Some(s.config_dir.join("worktrees").join(project_key(&s.root)));
         init.checkpoints = config.checkpoints;
         init.checkpoints_dir = Some(s.config_dir.join("checkpoints").join(project_key(&s.root)));
+        // Session-start hooks (#108): from the user's own config file only. A project's naming some is only told.
+        let hooks_refused;
+        (init.hooks, hooks_refused) = marv_session::hooks::session_start_hooks(&s.root, &s.store.path, s.file.as_ref());
         let (on_change, on_warning) = (tx.clone(), tx.clone());
         // The model's info arrived (its context window): the status bar is asked again via `status_info`, below.
         let changed = Arc::new(Mutex::new(None::<std::sync::Weak<Bridge>>));
@@ -947,6 +967,7 @@ impl Bridge {
             wake_limit: Mutex::default(),
             mesh_watch: CancellationToken::new(),
             gate: Mutex::default(),
+            hooks_refused,
         });
         *changed.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(&bridge));
         Ok(bridge)
@@ -1051,6 +1072,9 @@ impl Bridge {
                 },
             ));
         }
+        if let Some(refused) = &self.hooks_refused {
+            notes.push((NoticeTone::Warning, NoticeItem { text: refused.clone(), detail: None }));
+        }
         if let Some(notice) = startup_notice(notes) {
             self.emit(notice_message(notice));
         }
@@ -1068,6 +1092,18 @@ impl Bridge {
             let path = self.sessions.as_ref().map(|s| s.file(&self.root, &id).to_string_lossy().into_owned());
             herdr.session(&id, path.as_deref()).await;
         }
+    }
+
+    /// Starts this conversation's session-start hooks if they haven't started (#108), and shows them once they've
+    /// run. Called at startup and after `/clear` or a resume (which start a round of their own).
+    pub fn show_hooks(self: &Arc<Self>) {
+        self.session.run_start_hooks();
+        let bridge = self.clone();
+        tokio::spawn(async move {
+            if let Some(notice) = bridge.session.start_hooks_done().await.as_deref().and_then(hooks_notice) {
+                bridge.emit(notice_message(notice));
+            }
+        });
     }
 
     /// Herdr's first state: idle.
@@ -1397,6 +1433,7 @@ impl Bridge {
         }
         self.emit(UiEvent::Clear);
         self.emit(UiEvent::Welcome(self.welcome()));
+        self.show_hooks();
         self.report_session().await;
     }
 
@@ -2056,6 +2093,7 @@ impl SessionPort for Port {
             match bridge.session.resume(target).await {
                 Ok(Some(resumed)) => {
                     bridge.show_resumed(resumed);
+                    bridge.show_hooks();
                     bridge.report_session().await;
                 }
                 Ok(None) => bridge.emit(system("That session couldn't be loaded.", true)),
@@ -2214,6 +2252,8 @@ pub async fn run(resume: Option<bool>) -> anyhow::Result<i32> {
         Some(false) => bridge.open_picker().await,
         None => {}
     }
+    // After `-c`'s resume, which starts its own round: the hooks run once here, not twice.
+    bridge.show_hooks();
     bridge.report_state();
     bridge.report_session().await;
 
@@ -3109,6 +3149,43 @@ mod tests {
         let seen = until(&mut rx, |e| matches!(e, UiEvent::Welcome(_))).await;
         assert!(seen.contains(&UiEvent::Clear));
         assert_ne!(bridge.session.id(), before);
+    }
+
+    fn notices(events: &[UiEvent]) -> Vec<Notice> {
+        events.iter().filter_map(|e| if let UiEvent::Message(m) = e { m.notice.clone() } else { None }).collect()
+    }
+    fn is_hooks_notice(e: &UiEvent) -> bool {
+        matches!(e, UiEvent::Message(m) if m.notice.as_ref().is_some_and(|n| n.title.starts_with("Session-start hooks")))
+    }
+
+    // #108: the user's hooks run at start and again after /clear, each time shown as one line; a project's hooks are
+    // told about and never run.
+    #[tokio::test]
+    async fn session_start_hooks_show_at_start_and_after_clear_and_a_projects_are_refused() {
+        let dirs = Dirs::new();
+        let count = dirs.base.join("runs.txt");
+        let pwned = dirs.project.join("PWNED");
+        std::fs::create_dir_all(dirs.project.join(".marv")).unwrap();
+        let planted = serde_json::json!({"hooks": {"sessionStart": [format!("touch '{}'", pwned.display())]}});
+        std::fs::write(dirs.project.join(".marv/config.json"), planted.to_string()).unwrap();
+        let command = format!("echo x >> '{0}'; echo \"queue run $(wc -l < '{0}')\"", count.display());
+        let file = FileConfig {
+            hooks: Some(marv_session::hooks::Hooks { session_start: vec![marv_session::hooks::HookCommand::new(command)] }),
+            ..asks()
+        };
+        let (tx, mut rx) = unbounded_channel();
+        let bridge = Bridge::start(startup(&dirs, Some(file), vec![], None), tx).unwrap();
+        bridge.announce(None);
+        let startup = notices(&until(&mut rx, |e| matches!(e, UiEvent::Message(m) if m.notice.is_some())).await);
+        assert!(startup[0].items.iter().any(|i| i.text.contains(".marv/config.json has \"hooks\": not run")), "{startup:?}");
+        bridge.show_hooks();
+        let shown = notices(&until(&mut rx, is_hooks_notice).await).pop().unwrap();
+        assert_eq!(shown.items.len(), 1);
+        assert!(shown.items[0].text.ends_with("ms") && shown.items[0].text.contains(": 1 line, "), "{shown:?}");
+        Port(bridge.clone()).run_command("/clear".into());
+        until(&mut rx, is_hooks_notice).await;
+        assert_eq!(std::fs::read_to_string(&count).unwrap().lines().count(), 2);
+        assert!(!pwned.exists(), "the project's hook ran");
     }
 
     #[tokio::test]

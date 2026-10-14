@@ -32,7 +32,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::bash::{CommandResult, capture, format_output};
+use crate::bash::{Captured, CommandResult, capture_until, format_output};
 use crate::types::{Door, Preview, Scope, Tool, ToolContext, ToolError, ToolOutput};
 use allow::{Classified, ClassifyContext, classify, origin_host};
 use redact::{redact, redacted_note};
@@ -227,24 +227,13 @@ async fn run_gh(
     let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
         return Err(ToolError::new("couldn't start gh: no output pipes"));
     };
-    let io = async { tokio::join!(capture(stdout), capture(stderr)) };
-    tokio::pin!(io);
     let deadline = tokio::time::sleep(timeout);
     tokio::pin!(deadline);
-    let (mut timed_out, mut aborted) = (false, false);
-    let (out, err) = loop {
-        tokio::select! {
-            out = &mut io => break out,
-            () = &mut deadline, if !timed_out && !aborted => {
-                timed_out = true;
-                let _ = child.start_kill();
-            }
-            () = cancel.cancelled(), if !timed_out && !aborted => {
-                aborted = true;
-                let _ = child.start_kill();
-            }
-        }
-    };
+    let Captured { output: out, errors: err, timed_out, aborted } =
+        capture_until(stdout, stderr, deadline.as_mut(), cancel, || {
+            let _ = child.start_kill();
+        })
+        .await;
     let status = child.wait().await.ok();
     let output = if !out.is_empty() && !err.is_empty() {
         format!("{}\n{err}", out.trim_end())
