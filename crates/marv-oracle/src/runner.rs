@@ -149,6 +149,10 @@ pub fn run(scenario: &Scenario, bin: &Path) -> anyhow::Result<Outcome> {
         .env("TERM", "dumb")
         .env("LANG", "C.UTF-8")
         .env("NO_COLOR", "1")
+        // No GitHub probe (`gh auth status`). With a fake home gh is never logged in, so the tool specs are the same
+        // either way; but where `gh` is a wrapper that installs gh on first use (mise), the probe's timeout kills the
+        // wrapper and not the installer, which keeps writing ~40 MB into the fake home after it was removed (#89).
+        .env("MARV_GITHUB", "off")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .stdin(Stdio::null())

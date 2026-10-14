@@ -85,7 +85,7 @@ mod tests {
 
     #[test]
     fn a_hand_edited_file_trusts_nothing_and_yours_always_run() {
-        let path = std::env::temp_dir().join(format!("marv-trust-{}.json", std::process::id()));
+        let path = crate::testutil::temp_dir("trust").join("mcp-trust.json");
         let trust = McpTrust::new(&path);
         for text in ["null", "[1]", "{\"p\": \"k\"}", "broken"] {
             std::fs::write(&path, text).unwrap();
@@ -96,7 +96,6 @@ mod tests {
         assert!(!trust.is_trusted("other", &server(ServerSource::Project, "k")));
         assert!(!trust.is_trusted("p", &server(ServerSource::Project, "changed")));
         assert!(trust.is_trusted("x", &server(ServerSource::Personal, "any")));
-        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]

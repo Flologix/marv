@@ -49,7 +49,7 @@ impl Tool for SkillTool {
         "skill"
     }
     fn description(&self) -> &str {
-        "Load a skill: detailed instructions for a specific kind of task (the available skills are listed in the system prompt). Load the matching skill before starting such a task, then follow it. Use `file` to read one of the skill's extra files."
+        "Load a skill: detailed instructions for a specific kind of task (the available skills are listed in the system prompt). Load the matching skill before starting such a task, then follow it; small, direct requests don't need one. Use `file` to read one of the skill's extra files."
     }
     fn schema(&self) -> Value {
         json!({

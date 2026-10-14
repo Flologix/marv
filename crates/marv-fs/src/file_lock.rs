@@ -256,14 +256,13 @@ pub async fn release_lock(lock: &Path, token: &str, stale: Duration) -> std::io:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::private_file::random_hex;
 
     // Ported from tests/file-lock.test.ts (and tests/fixtures/file-lock-contender.ts).
 
-    fn dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("marv-lock-{}-{}", std::process::id(), random_hex()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A fresh folder, removed when the returned guard drops: the caller keeps it for the whole test (#89: these
+    /// were never removed, and a test run left hundreds of them in /tmp).
+    fn dir() -> tempfile::TempDir {
+        tempfile::Builder::new().prefix("marv-lock-").tempdir().unwrap()
     }
 
     fn age(path: &Path, ago: Duration) {
@@ -278,7 +277,8 @@ mod tests {
 
     #[tokio::test]
     async fn held_during_the_work_gone_after_it_also_when_the_work_fails() {
-        let path = dir().join("f.json");
+        let tmp = dir();
+        let path = tmp.path().join("f.json");
         let lock = with_suffix(&path, ".lock");
         with_file_lock(&path, LockOptions::default(), || async {
             let token = read(&lock);
@@ -296,7 +296,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_dropped_hold_still_releases_its_lock() {
-        let path = dir().join("f.json");
+        let tmp = dir();
+        let path = tmp.path().join("f.json");
         let lock = with_suffix(&path, ".lock");
         let hold = with_file_lock(&path, LockOptions::default(), std::future::pending::<()>);
         assert!(tokio::time::timeout(Duration::from_millis(50), hold).await.is_err());
@@ -311,7 +312,8 @@ mod tests {
 
     #[tokio::test]
     async fn release_never_removes_another_holders_lock() {
-        let path = dir().join("f.json");
+        let tmp = dir();
+        let path = tmp.path().join("f.json");
         let lock = with_suffix(&path, ".lock");
         with_file_lock(&path, LockOptions::default(), || async {
             // This hold looked dead: it was taken over, and another process holds the lock now.
@@ -329,7 +331,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_slow_holder_keeps_its_lock_fresh_so_it_isnt_taken_over_as_stale() {
-        let path = dir().join("f.json");
+        let tmp = dir();
+        let path = tmp.path().join("f.json");
         let options = LockOptions::stale(Duration::from_millis(120));
         let order = Arc::new(Mutex::new(Vec::new()));
         let slow = {
@@ -355,7 +358,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_stale_lock_is_removed_a_fresh_one_is_left_alone() {
-        let lock = dir().join("f.json.lock");
+        let tmp = dir();
+        let lock = tmp.path().join("f.json.lock");
         std::fs::write(&lock, "111 dead").unwrap();
         age(&lock, Duration::from_secs(60));
         assert!(take_over_stale(&lock, Duration::from_secs(1)).await.unwrap());
@@ -367,7 +371,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_lock_created_by_a_third_contender_during_a_takeover_is_left_alone() {
-        let lock = dir().join("f.json.lock");
+        let tmp = dir();
+        let lock = tmp.path().join("f.json.lock");
         let guard = with_suffix(&lock, ".takeover");
         std::fs::write(&lock, "111 dead").unwrap();
         age(&lock, Duration::from_secs(60));
@@ -390,7 +395,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_guard_left_by_a_process_that_died_is_taken_over_after_its_own_longer_timeout() {
-        let lock = dir().join("f.json.lock");
+        let tmp = dir();
+        let lock = tmp.path().join("f.json.lock");
         let guard = with_suffix(&lock, ".takeover");
         std::fs::write(&lock, "111 dead").unwrap();
         age(&lock, Duration::from_secs(60));
@@ -435,7 +441,8 @@ mod tests {
 
     #[test]
     fn several_processes_with_crashed_holders_never_hold_at_once() {
-        let path = dir().join("f.json");
+        let tmp = dir();
+        let path = tmp.path().join("f.json");
         let children: Vec<_> = (0..4)
             .map(|_| {
                 std::process::Command::new(std::env::current_exe().unwrap())
