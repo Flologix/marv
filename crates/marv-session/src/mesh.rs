@@ -97,6 +97,7 @@ pub fn wire_approval(request: &WireRequest) -> ApprovalRequest {
         once: true,
         must_ask: true,
         protected: None,
+        door: None,
     }
 }
 

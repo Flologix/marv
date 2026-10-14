@@ -1763,6 +1763,7 @@ mod tests {
             agent: agent.map(Into::into),
             network: false,
             once: false,
+            door: None,
         }
     }
 

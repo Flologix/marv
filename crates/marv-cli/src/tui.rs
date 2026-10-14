@@ -127,6 +127,7 @@ pub fn approval_request(request: &marv_tools::ApprovalRequest) -> view::Approval
         agent: request.agent.clone(),
         network: request.network,
         once: request.once,
+        door: request.door,
     }
 }
 
@@ -1789,6 +1790,7 @@ mod tests {
             once: true,
             must_ask: true,
             protected: marv_sandbox::protected::rule_for_relative(Path::new(".envrc")),
+            door: None,
         };
         let shown = approval_request(&request);
         assert!(shown.preview.warning.unwrap().starts_with("changes .envrc"));

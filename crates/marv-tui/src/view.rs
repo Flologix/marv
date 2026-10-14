@@ -178,8 +178,10 @@ pub struct ApprovalRequest {
     pub agent: Option<String>,
     /// The action can reach the network (bash with network: true).
     pub network: bool,
-    /// Yes or no only, no "don't ask again": each one is its own decision (/mcp add).
+    /// Yes or no only, no "don't ask again": each one is its own decision (/mcp add, a door to the host).
     pub once: bool,
+    /// The call leaves the sandbox through this door: the prompt shows its warning line (Marv Sprint 4).
+    pub door: Option<marv_core::Door>,
 }
 
 /// Identifies one pending approval so the answer reaches the right waiter (parallel subagents can

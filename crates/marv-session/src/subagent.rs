@@ -1297,6 +1297,7 @@ mod run_tests {
             once: false,
             must_ask: false,
             protected: None,
+            door: None,
         };
         assert_eq!(sub.approver.unwrap().approve(request).await, Decision::No);
         let asked = asker.asked();

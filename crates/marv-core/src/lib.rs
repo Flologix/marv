@@ -168,6 +168,18 @@ pub enum ToolKind {
     Egress,
 }
 
+/// The narrow, named ways out of the sandbox (Marv Sprint 4), each with its own rule for what it can never do:
+/// `Host` is bash with `sandbox: false` (one command on the user's machine, Marv #52); `Github` runs gh with the
+/// user's login (#47); `Process` keeps a server running in its own sandbox (#51). A call through one carries it on
+/// its approval (the prompt shows the door's warning line) and on its result (trajectories name it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Door {
+    Github,
+    Process,
+    Host,
+}
+
 /// Where a piece of text came from. Text from anything but the user or Marv
 /// itself is data, never instructions (see `docs/SECURITY.md`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

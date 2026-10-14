@@ -126,11 +126,15 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
     let input = input.as_ref();
     let label = short_label(tool.label(input), ctx);
     let per_call = ToolContext { call_id: Some(call.id.clone()), ..ctx.clone() };
+    // A door out of the sandbox (Marv #47, #51, #52): the prompt shows its warning, the result and trajectory name
+    // it, and a `once` call is never remembered (the session's approver holds that, whatever the client answers).
+    let door = tool.door(input, ctx);
     let finish = |result: Result<ToolOutput, crate::types::ToolError>, approval: Option<Approval>| {
         let mut result = match result {
             Ok(result) => result,
             Err(err) => return noted(fail(err.0, &label)),
         };
+        result.door = door;
         if result.provenance.taints() {
             ctx.taint.mark(result.provenance);
         }
@@ -160,6 +164,7 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
         let mut result = ToolOutput::ok(INTERRUPTED, "interrupted");
         result.declined = true;
         result.approval = Some(Approval::Interrupted);
+        result.door = door;
         noted(ToolOutcome { result, label: label.clone() })
     };
     // Stopped while the preview was being made: don't raise a prompt for a run that's over.
@@ -182,9 +187,10 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
         scope,
         agent: None,
         network,
-        once: false,
+        once: tool.once(input, ctx),
         must_ask,
         protected,
+        door,
     };
     match approver.approve(request).await {
         Decision::Unavailable => no_one_to_ask(),
@@ -194,6 +200,7 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
             let mut result = ToolOutput::ok(DECLINED, "declined");
             result.declined = true;
             result.approval = Some(Approval::Decided(Decision::No));
+            result.door = door;
             noted(ToolOutcome { result, label: label.clone() })
         }
         decision => {
@@ -255,6 +262,13 @@ mod tests {
         fn auto_safe(&self, _input: &EchoInput, _ctx: &ToolContext) -> bool {
             self.safe
         }
+        // "host …" goes through the host door, asked every time.
+        fn door(&self, input: &EchoInput, _ctx: &ToolContext) -> Option<crate::types::Door> {
+            input.text.starts_with("host").then_some(crate::types::Door::Host)
+        }
+        fn once(&self, input: &EchoInput, _ctx: &ToolContext) -> bool {
+            input.text.starts_with("host")
+        }
         async fn preview(&self, input: &EchoInput, _ctx: &ToolContext) -> Result<Preview, ToolError> {
             if input.text == "impossible" {
                 return Err(ToolError::new("can't"));
@@ -303,6 +317,24 @@ mod tests {
         assert!(!out.result.is_error);
         assert!(out.result.output.starts_with("a\tb\n\nMarv: the arguments contained 1 raw control character"));
         assert_eq!(out.label, "a\tb");
+    }
+
+    #[tokio::test]
+    async fn a_door_call_names_its_door_on_the_approval_and_the_result() {
+        let t = tools(ToolKind::Execute, false);
+        let approver = Arc::new(Answer(Decision::Yes, Mutex::new(vec![])));
+        let asking = ToolContext { approver: Some(approver.clone()), ..ctx() };
+        let host = run_tool(&call(r#"{"text": "host ls"}"#), &asking, &t).await;
+        assert_eq!(host.result.door, Some(crate::types::Door::Host));
+        let plain = run_tool(&call(r#"{"text": "ls"}"#), &asking, &t).await;
+        assert_eq!(plain.result.door, None);
+        let asked: Vec<_> = approver.1.lock().unwrap().iter().map(|r| (r.door, r.once)).collect();
+        assert_eq!(asked, [(Some(crate::types::Door::Host), true), (None, false)]);
+        // Declined, it still says which door it would have gone through.
+        let no = ToolContext { approver: Some(Arc::new(Answer(Decision::No, Mutex::new(vec![])))), ..ctx() };
+        let declined = run_tool(&call(r#"{"text": "host rm"}"#), &no, &t).await;
+        assert!(declined.result.declined);
+        assert_eq!(declined.result.door, Some(crate::types::Door::Host));
     }
 
     #[tokio::test]

@@ -27,6 +27,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+pub use marv_core::Door;
 use marv_core::{Provenance, ToolKind, ToolSpec};
 use marv_sandbox::{ProtectedRule, Sandbox, TaintState};
 use serde::de::DeserializeOwned;
@@ -128,6 +129,22 @@ pub struct ApprovalRequest {
     pub must_ask: bool,
     /// marv-rs: the protected path rule this call touches, for the approval's warning.
     pub protected: Option<ProtectedRule>,
+    /// The call leaves the sandbox through one of its doors: the prompt shows that door's warning line.
+    pub door: Option<Door>,
+}
+
+/// The doors this agent may use where a door is gated by who's running, not by the approver (an approver can be told
+/// to say yes to an exact scope key: `marv -p --approve`). Set by the session for the main agent only; a subagent's
+/// context is built without it. Marv's `Doors`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Doors {
+    /// bash with sandbox: false: only where the user approves each command at a terminal (the TUI, or the SDK's
+    /// hostCommands).
+    pub host: bool,
+    pub process: bool,
+    /// The github tool's writes and sensitive reads (#47): the main agent's, where the session offers the tool; a
+    /// subagent only reads.
+    pub github: bool,
 }
 
 /// An approver's answer. `Unavailable`: no one can approve this call (a headless run's `--approve` list doesn't
@@ -240,6 +257,8 @@ pub struct ToolContext {
     pub before_change: Option<Arc<dyn BeforeChange>>,
     /// The session's taint (marv-rs).
     pub taint: Arc<TaintState>,
+    /// The doors out of the sandbox this agent has (see [`Doors`]). Default: none.
+    pub doors: Doors,
 }
 
 impl ToolContext {
@@ -262,6 +281,7 @@ impl ToolContext {
             git_env: Vec::new(),
             before_change: None,
             taint: Arc::new(TaintState::new()),
+            doors: Doors::default(),
         }
     }
 
@@ -287,6 +307,8 @@ pub struct ToolOutput {
     pub approval: Option<Approval>,
     /// Where `output` came from (marv-rs): text from anything but the user or Marv is fenced as data.
     pub provenance: Provenance,
+    /// The door the call went through (for trajectories); None for an ordinary call. Set by `run_tool`.
+    pub door: Option<Door>,
 }
 
 impl ToolOutput {
@@ -300,6 +322,7 @@ impl ToolOutput {
             declined: false,
             approval: None,
             provenance: Provenance::Project,
+            door: None,
         }
     }
 
@@ -382,6 +405,15 @@ pub trait Tool: Send + Sync + 'static {
     fn egress_url(&self, _input: &Self::Input) -> Option<String> {
         None
     }
+    /// The door this call leaves the sandbox through, if any: `run_tool` copies it onto the call's
+    /// [`ApprovalRequest`] and its result (Marv Sprint 4).
+    fn door(&self, _input: &Self::Input, _ctx: &ToolContext) -> Option<Door> {
+        None
+    }
+    /// Whether this call must be asked every time ([`ApprovalRequest::once`]): no "don't ask again", ever.
+    fn once(&self, _input: &Self::Input, _ctx: &ToolContext) -> bool {
+        false
+    }
     async fn run(&self, input: &Self::Input, ctx: &ToolContext) -> Result<ToolOutput, ToolError>;
 }
 
@@ -409,6 +441,8 @@ pub trait DynTool: Send + Sync {
     fn protected_target(&self, input: In<'_>, ctx: &ToolContext) -> Option<ProtectedRule>;
     fn repair(&self, raw: &Value, ctx: &ToolContext) -> Option<Repaired>;
     fn egress_url(&self, input: In<'_>) -> Option<String>;
+    fn door(&self, input: In<'_>, ctx: &ToolContext) -> Option<Door>;
+    fn once(&self, input: In<'_>, ctx: &ToolContext) -> bool;
     async fn run(&self, input: In<'_>, ctx: &ToolContext) -> Result<ToolOutput, ToolError>;
 }
 
@@ -468,6 +502,12 @@ impl<T: Tool> DynTool for T {
     }
     fn egress_url(&self, input: In<'_>) -> Option<String> {
         Tool::egress_url(self, typed::<T>(input))
+    }
+    fn door(&self, input: In<'_>, ctx: &ToolContext) -> Option<Door> {
+        Tool::door(self, typed::<T>(input), ctx)
+    }
+    fn once(&self, input: In<'_>, ctx: &ToolContext) -> bool {
+        Tool::once(self, typed::<T>(input), ctx)
     }
     async fn run(&self, input: In<'_>, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         Tool::run(self, typed::<T>(input), ctx).await

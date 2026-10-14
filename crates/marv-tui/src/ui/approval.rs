@@ -3,7 +3,7 @@
 //! Shown in place of the prompt while the agent waits: a round border (warning colour when the
 //! preview has a warning), `[agent]` when a subagent asks, the bold title, then the payload in
 //! full (docs/SECURITY.md: approvals show the full payload): `$ command`, text, and the diff (at
-//! most [`MAX_DIFF_LINES`]), a note, `⚠ warning`, "N more waiting" (parallel subagents queue
+//! most [`MAX_DIFF_LINES`]), a note, the door's `⚠` line ([`door_warning`]), `⚠ warning`, "N more waiting" (parallel subagents queue
 //! behind the head), and the choice: Yes / Yes, and don't ask again for <scope> this session /
 //! No, and tell Marv what to do instead (esc). `once` requests offer only Yes / No.
 //!
@@ -33,6 +33,17 @@ use super::theme;
 use crate::view::{ApprovalRequest, Decision};
 
 pub const MAX_DIFF_LINES: usize = 24;
+
+/// One warning line per door out of the sandbox, in the warning colour: what saying yes lets out (Marv's
+/// `DOOR_WARNINGS`). A door's own detail (the repository a github write is visible on) comes in its preview's warning,
+/// below this line.
+pub fn door_warning(door: marv_core::Door) -> &'static str {
+    match door {
+        marv_core::Door::Host => "Runs OUTSIDE the sandbox, as you, with your files, network and credentials.",
+        marv_core::Door::Github => "Visible to other people on GitHub.",
+        marv_core::Door::Process => "Keeps running after this turn, until stopped or Marv exits.",
+    }
+}
 
 /// What a key did at the approval.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +115,9 @@ impl ApprovalView {
         if let Some(note) = &preview.note {
             lines.push(Line::styled(printable(note), dim));
         }
+        if let Some(door) = self.request.door {
+            lines.push(Line::styled(format!("⚠ {}", door_warning(door)), Style::new().fg(theme::WARNING)));
+        }
         if let Some(warning) = &preview.warning {
             lines.push(Line::styled(format!("⚠ {}", printable(warning)), Style::new().fg(theme::WARNING)));
         }
@@ -122,7 +136,8 @@ impl ApprovalView {
     }
 
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
-        let border = if self.request.preview.warning.is_some() { theme::WARNING } else { theme::ACCENT };
+        let warned = self.request.preview.warning.is_some() || self.request.door.is_some();
+        let border = if warned { theme::WARNING } else { theme::ACCENT };
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(Style::new().fg(border))
@@ -165,6 +180,7 @@ mod tests {
             agent: None,
             network: false,
             once: false,
+            door: None,
         }
     }
 
@@ -182,6 +198,7 @@ mod tests {
             agent: None,
             network: false,
             once: false,
+            door: None,
         }
     }
 
@@ -246,6 +263,7 @@ mod tests {
             agent: Some("worker-1".into()),
             network: false,
             once: true,
+            door: None,
         };
         let mut view = ApprovalView::new(wire, 0, true);
         let f = frame(&view);
@@ -299,6 +317,16 @@ mod tests {
         let f = frame(&ApprovalView::new(request, 0, true));
         assert!(f.contains("Prefers short answers."));
         assert!(!f.contains("$ Prefers"));
+    }
+
+    #[test]
+    fn a_door_shows_its_warning_line_above_the_previews_own() {
+        let mut request = command();
+        request.door = Some(marv_core::Door::Github);
+        request.preview.warning = Some("on FlologixAI/marv".into());
+        let f = frame(&ApprovalView::new(request, 0, true));
+        let door = f.find("⚠ Visible to other people on GitHub.").expect("door line");
+        assert!(door < f.find("⚠ on FlologixAI/marv").expect("preview warning"), "{f}");
     }
 
     #[test]

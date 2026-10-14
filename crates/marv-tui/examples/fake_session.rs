@@ -145,6 +145,7 @@ fn write_request(path: &str, agent: Option<String>) -> ApprovalRequest {
         agent,
         network: false,
         once: false,
+        door: None,
     }
 }
 
