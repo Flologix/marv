@@ -24,6 +24,7 @@ use futures::{FutureExt, StreamExt};
 use marv_agent::{AgentOptions, History, LoopEvent, run_agent};
 use marv_core::{ChatTurn, StopReason};
 use marv_tools::agent::{AgentInput, Isolation};
+use marv_tools::output::cut_for_call;
 use marv_tools::{AgentProgress, ApprovalRequest, Approver, Decision, Preview, ToolContext, ToolError, ToolOutput, ToolRef};
 
 use crate::agents::{AgentType, SUBAGENT_TOOLS, find_agent};
@@ -105,6 +106,8 @@ pub fn subagent_context(
     // Its sandboxed bash reaches the session's background processes like the main agent's (curl localhost:<port>);
     // starting one is the main agent's alone (no processes, no doors).
     ctx.forwards = parent.forwards.clone();
+    // Its cut outputs are saved with the session's (#61), so it can read them back as the main agent can.
+    ctx.tool_output = parent.tool_output.clone();
     // A shared-folder subagent edits the same files in the same turn: the turn's one checkpoint covers it (#16). A
     // worktree's changes land on its branch, which is already the way back.
     ctx.checkpoint = if worktree.is_some() { None } else { parent.checkpoint.clone() };
@@ -309,7 +312,11 @@ pub async fn run_subagent(host: &SessionAgentHost, input: &AgentInput, ctx: &Too
     }
     run.tool_count = tally.tool_count;
     run.tokens_used = tally.used;
-    Ok(subagent_report(&run))
+    let mut report = subagent_report(&run);
+    // marv-rs (#61): a report is cut like a long bash output (Marv's wasn't), and a cut one saved whole. Marv's own
+    // lines are at its end, which the cut keeps.
+    report.output = cut_for_call(&report.output, ctx, marv_core::Provenance::Subagent);
+    Ok(report)
 }
 
 /// The subagent's loop, folded into `tally` and `run`.
@@ -772,6 +779,36 @@ mod run_tests {
         let progress = lock(&seen.progress).clone();
         assert!(progress.iter().any(|p| p.line == "shared folder · 1 tool · read_file notes.txt"), "{progress:?}");
         assert_eq!(progress.last().unwrap().steps, ["read_file notes.txt · 1 line"]);
+    }
+
+    #[tokio::test]
+    async fn its_cut_outputs_and_a_cut_report_are_saved_in_the_sessions_folder() {
+        let f = Fixture::new();
+        let report = format!("Report start.\n{}\nReport end.", "r".repeat(40_000));
+        let provider = Scripted::new(vec![use_tool("b1", "bash", serde_json::json!({"command": "seq 1 20000"})), say(&report)]);
+        let (host, _) = f.host(provider.clone(), vec![general_purpose()], true);
+        let mut ctx = ctx_with(host, &Asker::yes(), &f.root.0);
+        sandbox_off(&mut ctx);
+        let store = std::env::temp_dir().join(format!("marv-subagent-spill-{}", std::process::id()));
+        // Removed even when an assertion fails (#89).
+        struct Gone(std::path::PathBuf);
+        impl Drop for Gone {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _gone = Gone(store.clone());
+        ctx.tool_output = Some(store.join("s"));
+        let out = run(agent_call(serde_json::json!({"description": "x", "prompt": "p"}), "a1"), &ctx).await;
+
+        // Its own bash output: cut for it, saved where the main agent's are.
+        assert!(provider.results(1)[0].contains(&format!("full output: {}", store.join("s/b1.txt").display())));
+        assert!(std::fs::read_to_string(store.join("s/b1.txt")).unwrap().ends_with("\n20000"));
+        // Its report: cut for the parent, saved under the agent call's id.
+        let saved = store.join("s/a1.subagent.txt");
+        assert!(out.result.output.starts_with("Report start.") && out.result.output.ends_with("Report end."));
+        assert!(out.result.output.contains(&format!("full output: {}", saved.display())));
+        assert_eq!(std::fs::read_to_string(&saved).unwrap(), report);
     }
 
     #[tokio::test]

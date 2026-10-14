@@ -280,6 +280,7 @@ pub fn canonical_request(body: &str) -> String {
             let Some(content) = message.get_mut("content") else { continue };
             if system {
                 strip_sections(content);
+                unword(content);
             }
             // A marked message carries its text as one part; unmarked it's the plain string.
             if let Some([part]) = content.as_array().map(Vec::as_slice)
@@ -292,6 +293,9 @@ pub fn canonical_request(body: &str) -> String {
             }
         }
     }
+    if let Some(tools) = value.get_mut("tools").and_then(Value::as_array_mut) {
+        tools.iter_mut().filter_map(|t| t.pointer_mut("/function/description")).for_each(unword);
+    }
     strip_cache_control(&mut value);
     value.to_string()
 }
@@ -300,6 +304,36 @@ pub fn canonical_request(body: &str) -> String {
 /// oracle drops them from both sides before comparing, so the rest of the prompt is still checked byte for byte. The
 /// raw requests (the prefix rule) keep them.
 pub const MARV_RS_SECTIONS: &[&str] = &["# Your situation"];
+
+/// Text marv-rs rewords on purpose, as (marv-rs, Marv) pairs: the oracle puts Marv's text back in the system prompt
+/// and the tool descriptions before comparing, so everything around it is still checked. The raw requests (the prefix
+/// rule) keep marv-rs's. Keep these in step with the sources: #85's plan sentence (`marv_session::prompt`'s
+/// `PLAN_SENTENCE`) and plan tool description (`marv_tools::plan::PLAN_DESCRIPTION`).
+pub const MARV_RS_TEXT: &[(&str, &str)] = &[
+    (
+        " For a task of four or more steps, keep a plan with the plan tool; send each update in the same reply as your next tool call; only the final one, marking the plan done, may go alone.",
+        " For a task with several steps, keep a plan with the plan tool and update it as you go.",
+    ),
+    (
+        "Keep a checklist for a task of four or more steps, or when the user asks for several things. Write the plan before starting; mark an item in_progress before working on it and done as soon as it is; add items you discover and remove ones that turn out unnecessary. Send the whole list every time (it replaces the previous one), in the same reply as your next tool call; only the final update, marking the last items done, may go alone. Skip it for a short task or a question.",
+        "Keep a checklist for a task of three or more steps, or when the user asks for several things. Write the plan before starting; mark an item in_progress before working on it and done as soon as it is; add items you discover and remove ones that turn out unnecessary. Send the whole list every time (it replaces the previous one). Skip it for a one-step task or a question.",
+    ),
+];
+
+/// Puts Marv's wording back for each of [`MARV_RS_TEXT`] in a string, plain or in parts.
+fn unword(content: &mut Value) {
+    match content {
+        Value::String(text) => {
+            for (ours, marvs) in MARV_RS_TEXT {
+                if text.contains(ours) {
+                    *text = text.replace(ours, marvs);
+                }
+            }
+        }
+        Value::Array(parts) => parts.iter_mut().filter_map(|p| p.get_mut("text")).for_each(unword),
+        _ => {}
+    }
+}
 
 /// Removes each of [`MARV_RS_SECTIONS`] (from its `\n\n<heading>\n\n` to the next `\n\n# ` heading, or the end) from a
 /// system message's text, plain or in parts.
@@ -437,6 +471,30 @@ mod tests {
         let canonical: Value = serde_json::from_str(&canonical_request(&body)).unwrap();
         assert_eq!(canonical["messages"][0]["content"], "You are Marv.\n\n# Sandbox limits\n\nEnds.\n\n# MCP servers\n\nSetup.");
         assert_eq!(canonical["messages"][1]["content"], "# Your situation");
+    }
+
+    #[test]
+    fn marv_rs_reworded_text_compares_as_marvs() {
+        let (rs_sentence, marv_sentence) = MARV_RS_TEXT[0];
+        let (rs_tool, marv_tool) = MARV_RS_TEXT[1];
+        let body = |sentence: &str, tool: &str| {
+            json!({
+                "messages": [
+                    {"role": "system", "content": format!("Paths are relative.{sentence}\n\nYou can change files")},
+                    {"role": "user", "content": sentence},
+                ],
+                "tools": [{"type": "function", "function": {"name": "plan", "description": tool}}],
+            })
+            .to_string()
+        };
+        let canonical: Value = serde_json::from_str(&canonical_request(&body(rs_sentence, rs_tool))).unwrap();
+        let marvs: Value = serde_json::from_str(&canonical_request(&body(marv_sentence, marv_tool))).unwrap();
+        assert_eq!(canonical["messages"][0], marvs["messages"][0]);
+        assert_eq!(canonical["tools"], marvs["tools"]);
+        assert_eq!(canonical["messages"][0]["content"], format!("Paths are relative.{marv_sentence}\n\nYou can change files"));
+        assert_eq!(canonical["tools"][0]["function"]["description"], marv_tool);
+        // Only the system prompt and tool descriptions: a user message keeps its text.
+        assert_eq!(canonical["messages"][1]["content"], rs_sentence);
     }
 
     #[test]

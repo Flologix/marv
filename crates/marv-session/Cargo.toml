@@ -36,8 +36,9 @@ regress = "0.12"
 globset = "0.4"
 # The home folder (`shorten_home`, `home_or_above`, personal skills and agents).
 dirs = "6.0"
-# Background processes (#51): signals to their sandboxes, and the uid for their socket folder.
-nix = { version = "0.31.3", features = ["signal", "user"] }
+# Background processes (#51): signals to their sandboxes, and the uid for their socket folder. `fs`: opening a
+# project file without blocking (#108).
+nix = { version = "0.31.3", features = ["signal", "user", "fs"] }
 
 [lints]
 workspace = true

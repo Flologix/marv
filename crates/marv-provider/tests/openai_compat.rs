@@ -205,12 +205,7 @@ async fn reassembles_tool_calls_streamed_in_fragments() {
             call("c2", "glob", r#"{"pattern":"*"}"#),
             // The usage (with #90's ReplyEnd) is sent at the end of the reply, after the calls.
             ProviderEvent::Usage(
-                Usage {
-                    prompt_tokens: 1200,
-                    completion_tokens: 30,
-                    cached_tokens: Some(1000),
-                    cost: Some(0.00042)
-                },
+                Usage { prompt_tokens: 1200, completion_tokens: 30, cached_tokens: Some(1000), cost: Some(0.00042) },
                 marv_core::ReplyEnd { finish_reason: Some("tool_calls".into()), raw_response: None }
             ),
             ProviderEvent::Done { reason: Some("tool_calls".into()) },

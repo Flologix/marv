@@ -479,6 +479,8 @@ pub enum UiEvent {
     TurnStart {
         turn: String,
     },
+    /// After a turn: the user's likely next message, for the empty prompt (Tab takes it).
+    Suggestion(String),
     Status(TurnStatus),
     /// Streamed reply text. The UI batches these (see `app`: revealed at a pace, `REVEAL_MS`).
     TextDelta(String),
@@ -638,6 +640,10 @@ pub trait SessionPort: Send + Sync {
     /// Esc / ctrl+c: stop the running turn or command. The UI declines its queued approvals
     /// itself (with [`answer`](Self::answer)) before calling this.
     fn abort(&self);
+
+    /// Esc while idle: stop asking for the next-step suggestion, if that's still going (the prompt drops a late one
+    /// itself). Nothing else is running to stop.
+    fn stop_suggesting(&self) {}
 
     /// The setup screen's model step needs the provider's list ([`UiEvent::Models`]).
     fn load_models(&self, provider: ProviderId);

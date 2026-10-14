@@ -218,6 +218,10 @@ pub trait ProcessHost: Send + Sync {
     /// Stops it and forgets it; false when there's none of that name.
     async fn stop(&self, name: &str) -> bool;
     fn list(&self) -> Vec<ProcessInfo>;
+    /// A one-shot session (`marv -p`): Marv stops every process when it exits after the reply (#86).
+    fn one_shot(&self) -> bool {
+        false
+    }
 }
 
 /// The running processes' forwarded ports, as bash's relay needs them (Marv's `ToolContext.forwards`).
@@ -376,6 +380,28 @@ pub struct ToolContext {
     /// The running processes' forwarded ports: a sandboxed bash command (without network) gets a relay to each, so
     /// its `curl localhost:<port>` reaches the session's own servers. Subagents get this too (but not `processes`).
     pub forwards: Option<Arc<dyn ProcessForwards>>,
+    /// Commands that failed in the sandbox without network in a way that looked like it (#81): a retry without
+    /// network is asked for with network instead (bash's `repair`). Fresh for each context (the session's turn, a
+    /// subagent).
+    pub network_failures: Arc<NetworkFailures>,
+    /// This session's folder of saved outputs (#61, `~/.marv/tool-output/<session>`): a cut result is saved there
+    /// whole, and `read_file` and `grep` may read it (only it, read-only). None: cuts aren't saved.
+    pub tool_output: Option<PathBuf>,
+}
+
+/// Sandboxed commands, by [`marv_core::command::command_key`], whose failure without network looked like the missing
+/// network (the ones that got [`marv_sandbox::notes::NETWORK_NOTE`]), so a retry that only changes the tail
+/// (`&& du -sh`, `| tail -2`) is recognized (#81).
+#[derive(Debug, Default)]
+pub struct NetworkFailures(std::sync::Mutex<std::collections::HashSet<String>>);
+
+impl NetworkFailures {
+    pub fn record(&self, command: &str) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).insert(marv_core::command::command_key(command));
+    }
+    pub fn contains(&self, command: &str) -> bool {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).contains(&marv_core::command::command_key(command))
+    }
 }
 
 impl ToolContext {
@@ -403,6 +429,8 @@ impl ToolContext {
             doors: Doors::default(),
             processes: None,
             forwards: None,
+            network_failures: Arc::default(),
+            tool_output: None,
         }
     }
 

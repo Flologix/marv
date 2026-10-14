@@ -554,10 +554,7 @@ impl ReplyAssembler {
         if let Some(usage) = self.usage {
             out.push(ProviderEvent::Usage(
                 usage,
-                ReplyEnd {
-                    finish_reason: self.reason.clone(),
-                    raw_response: self.raw.as_ref().map(|raw| raw.join("\n")),
-                },
+                ReplyEnd { finish_reason: self.reason.clone(), raw_response: self.raw.as_ref().map(|raw| raw.join("\n")) },
             ));
         }
         out.push(ProviderEvent::Done { reason: self.reason });
@@ -1189,7 +1186,10 @@ mod tests {
         ]);
         assert_eq!(
             events[0],
-            ProviderEvent::Usage(Usage { prompt_tokens: 100, completion_tokens: 5, cached_tokens: Some(80), cost: Some(0.002) }, ReplyEnd::default())
+            ProviderEvent::Usage(
+                Usage { prompt_tokens: 100, completion_tokens: 5, cached_tokens: Some(80), cost: Some(0.002) },
+                ReplyEnd::default()
+            )
         );
     }
 

@@ -25,7 +25,46 @@ const MAX_ANNOUNCEMENT: usize = 200;
 /// "now <verb>ing" — a closed list, so the detector can't run off into prose. Extend when the
 /// bench shows a form it misses; a miss only means no nudge, never a wrong one.
 const NOW_VERBS: &[&str] = &[
-    "adding", "analyzing", "browsing", "building", "checking", "compiling", "comparing", "counting", "creating", "debugging", "editing", "examining", "fetching", "fixing", "implementing", "inspecting", "installing", "loading", "looking", "measuring", "merging", "opening", "parsing", "posting", "profiling", "reading", "refactoring", "removing", "renaming", "reviewing", "running", "saving", "searching", "stopping", "testing", "tracing", "updating", "verifying", "waiting", "writing",
+    "adding",
+    "analyzing",
+    "browsing",
+    "building",
+    "checking",
+    "compiling",
+    "comparing",
+    "counting",
+    "creating",
+    "debugging",
+    "editing",
+    "examining",
+    "fetching",
+    "fixing",
+    "implementing",
+    "inspecting",
+    "installing",
+    "loading",
+    "looking",
+    "measuring",
+    "merging",
+    "opening",
+    "parsing",
+    "posting",
+    "profiling",
+    "reading",
+    "refactoring",
+    "removing",
+    "renaming",
+    "reviewing",
+    "running",
+    "saving",
+    "searching",
+    "stopping",
+    "testing",
+    "tracing",
+    "updating",
+    "verifying",
+    "waiting",
+    "writing",
 ];
 
 /// Whether a finished reply (no tool calls) ends by announcing its next action.
@@ -69,7 +108,8 @@ pub fn announces_next_step(text: &str) -> bool {
 /// sentence rather than starting an empty one, so "Let me check the test." stays one sentence.
 fn last_sentence(line: &str) -> &str {
     let line = line.trim_end_matches(['.', '!', '?', '"', '\'', '’', '…', ')', '*', '_', '`', ' ', '\t']);
-    let start = line.char_indices()
+    let start = line
+        .char_indices()
         .rev()
         .find_map(|(i, c)| {
             let followed_by_space = line.as_bytes().get(i + 1).is_none_or(|b| *b == b' ' || *b == b'\t');

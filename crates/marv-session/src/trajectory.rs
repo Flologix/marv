@@ -151,6 +151,9 @@ pub enum TrajectoryRecord {
     },
     /// Deferred MCP tools (#14): the note at the start of the turn's message.
     McpNote { turn: String, text: String },
+    /// marv-rs (#108): a session-start hook whose output starts the turn's message (`exit_code` null: killed or
+    /// couldn't start; `bytes`: its whole output, before the cut).
+    Hook { turn: String, command: String, exit_code: Option<i32>, timed_out: bool, bytes: usize, ms: u64 },
     /// One model request: its tokens and how long since the previous step ended; `retries`, `stalled`, `degenerate`
     /// and `discardedBytes` when it took more than one try (#88, #96).
     /// #90: `finish_reason` is the provider's stop reason ("stop", "tool_calls", "length"…) —
@@ -672,7 +675,10 @@ mod tests {
         assert_eq!(types, vec!["request", "assistant", "tool", "agent_end"]);
         // #90: the request record carries the provider's finish reason.
         let request = serde_json::to_value(&records[0]).unwrap();
-        assert_eq!((request["type"].as_str(), request["finishReason"].as_str(), request["step"].as_u64()), (Some("request"), Some("stop"), Some(1)));
+        assert_eq!(
+            (request["type"].as_str(), request["finishReason"].as_str(), request["step"].as_u64()),
+            (Some("request"), Some("stop"), Some(1))
+        );
         assert!(request.get("rawResponse").is_none());
         let tool = serde_json::to_value(&records[2]).unwrap();
         assert_eq!(tool["approval"], "none");
@@ -686,7 +692,12 @@ mod tests {
         // #88, #96
         let (mut rec, out) = recorder();
         let retry = |continued, cause| LoopEvent::Retry { attempt: 1, max: 2, message: "m".into(), continued, cause };
-        let usage = || LoopEvent::Usage(Usage { prompt_tokens: 1, completion_tokens: 1, cached_tokens: None, cost: None }, marv_core::ReplyEnd::default());
+        let usage = || {
+            LoopEvent::Usage(
+                Usage { prompt_tokens: 1, completion_tokens: 1, cached_tokens: None, cost: None },
+                marv_core::ReplyEnd::default(),
+            )
+        };
         rec.event(&LoopEvent::ThinkingDelta("\n\n\n".into()));
         rec.event(&retry(false, RetryCause::Degenerate { discarded: 3 }));
         rec.event(&retry(true, RetryCause::Stalled));
@@ -715,7 +726,12 @@ mod tests {
     #[test]
     fn a_reply_without_usage_closes_its_retries_and_a_second_degenerate_reply_leaves_nothing() {
         let (mut rec, out) = recorder();
-        let usage = || LoopEvent::Usage(Usage { prompt_tokens: 1, completion_tokens: 1, cached_tokens: None, cost: None }, marv_core::ReplyEnd::default());
+        let usage = || {
+            LoopEvent::Usage(
+                Usage { prompt_tokens: 1, completion_tokens: 1, cached_tokens: None, cost: None },
+                marv_core::ReplyEnd::default(),
+            )
+        };
         // A retried reply from a provider that sends no usage, then a clean request.
         rec.event(&LoopEvent::Retry { attempt: 1, max: 2, message: "m".into(), continued: true, cause: RetryCause::Stalled });
         rec.event(&LoopEvent::Assistant { text: "ok".into() });

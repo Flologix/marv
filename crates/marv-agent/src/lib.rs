@@ -11,6 +11,7 @@ pub mod agent;
 pub mod announce;
 pub mod compact;
 pub mod repetition;
+pub mod suggest;
 
 #[cfg(test)]
 pub(crate) mod testing;

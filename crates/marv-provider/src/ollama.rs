@@ -359,10 +359,7 @@ impl LineAssembler {
                     cost: None,
                 },
                 // The done line carries usage and done_reason together (#90); the raw lines join them.
-                ReplyEnd {
-                    finish_reason: self.reason.clone(),
-                    raw_response: self.raw.take().as_ref().map(|raw| raw.join("\n")),
-                },
+                ReplyEnd { finish_reason: self.reason.clone(), raw_response: self.raw.take().as_ref().map(|raw| raw.join("\n")) },
             ));
         }
         Ok(true)
@@ -805,7 +802,8 @@ mod tests {
     // #90: with debug recording on, the raw NDJSON lines ride the Usage event; without, raw_response stays None.
     #[test]
     fn the_raw_lines_are_collected_only_behind_the_debug_flag() {
-        let lines = [r#"{"message":{"content":"hi"}}"#, r#"{"done":true,"done_reason":"stop","prompt_eval_count":10,"eval_count":2}"#];
+        let lines =
+            [r#"{"message":{"content":"hi"}}"#, r#"{"done":true,"done_reason":"stop","prompt_eval_count":10,"eval_count":2}"#];
         let mut off = LineAssembler::new();
         let mut out = Vec::new();
         for line in &lines {
@@ -820,14 +818,13 @@ mod tests {
             assert!(on.on_line(line, &mut out).unwrap());
         }
         on.finish(&mut out).unwrap();
-        let end =
-            out.iter().find_map(|e| if let ProviderEvent::Usage(_, end) = e { Some(end) } else { None }).expect("the Usage event");
+        let end = out
+            .iter()
+            .find_map(|e| if let ProviderEvent::Usage(_, end) = e { Some(end) } else { None })
+            .expect("the Usage event");
         assert_eq!(
             end,
-            &ReplyEnd {
-                finish_reason: Some("stop".into()),
-                raw_response: Some(format!("{}\n{}", lines[0], lines[1]))
-            }
+            &ReplyEnd { finish_reason: Some("stop".into()), raw_response: Some(format!("{}\n{}", lines[0], lines[1])) }
         );
     }
 

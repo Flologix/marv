@@ -14,11 +14,13 @@
 //! - `read_file`, `edit_file`, `write_file` and `grep` refuse special files (FIFOs, devices): reading one would block
 //!   forever, and Esc can't cancel it. A missing path is called missing, not special.
 //! - Binary: a NUL byte in the first 8 KB (crude but standard).
+//! - #61: `read_file` and `grep` also read the session's saved tool outputs ([`resolve_readable`]), and only them
+//!   outside the project. bash can't (its sandbox has its own home), and the writing tools keep `resolve_in_project`.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::types::{ToolContext, ToolError};
+use crate::types::{ToolContext, ToolError, ToolOutput};
 
 pub use marv_sandbox::paths::{project_path, refuse_git};
 
@@ -32,6 +34,41 @@ pub const LIST_TIMEOUT: Duration = Duration::from_secs(20);
 /// A path the model gave, resolved inside the project (see `marv_sandbox::resolve_in_project`).
 pub fn resolve_in_project(ctx: &ToolContext, path: &str) -> Result<PathBuf, ToolError> {
     Ok(marv_sandbox::resolve_in_project(&ctx.root, path, &ctx.home)?)
+}
+
+/// For the reading tools (`read_file`, `grep`): a path inside the project, or a file in this session's saved tool
+/// outputs (#61, `ToolContext::tool_output`). Exactly that folder's files, checked after realpath like the project's
+/// (`resolve_within`); nothing else outside the project, and the writing tools never get here.
+pub fn resolve_readable(ctx: &ToolContext, path: &str) -> Result<PathBuf, ToolError> {
+    if let Some(dir) = &ctx.tool_output {
+        let dir = marv_sandbox::paths::normalize(dir);
+        let absolute = marv_sandbox::paths::normalize(&marv_sandbox::paths::expand_home(path, &ctx.home));
+        if absolute.is_absolute()
+            && let Ok(file) = absolute.strip_prefix(&dir)
+            && !file.as_os_str().is_empty()
+        {
+            return marv_sandbox::resolve_within(&dir, &file.to_string_lossy()).map_err(|e| match e {
+                marv_sandbox::SandboxError::Missing(_) => ToolError(format!("\"{path}\" doesn't exist.")),
+                e => e.into(),
+            });
+        }
+    }
+    resolve_in_project(ctx, path)
+}
+
+/// Whether `path` (as [`resolve_readable`] returned it) is one of the session's saved tool outputs.
+pub fn is_tool_output(ctx: &ToolContext, path: &Path) -> bool {
+    let real = |p: &Path| std::fs::canonicalize(p).ok();
+    ctx.tool_output.as_deref().and_then(real).is_some_and(|dir| real(path).is_some_and(|p| p.starts_with(dir)))
+}
+
+/// A reading tool's result from `path`: when that's a saved tool output, it keeps the source the output came from
+/// (`output::saved_provenance`), so an MCP server's text read back is fenced and taints as it did the first time.
+pub fn with_saved_source(ctx: &ToolContext, path: &Path, mut out: ToolOutput) -> ToolOutput {
+    if is_tool_output(ctx, path) {
+        out.provenance = crate::output::saved_provenance(path);
+    }
+    out
 }
 
 /// For `auto_safe`: whether a path leads into `.git` (outside the project counts too).

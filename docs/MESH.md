@@ -37,6 +37,8 @@ The mesh gives sandboxed agents **deliberate, wired, auditable lines out**, with
    - Headless runs need `--approve mesh:<receptacle>`.
    - Yolo never wires anything by itself.
 2. **Mesh text is data.** Every message that arrives through the mesh is `Provenance::Mesh`. It taints the session (`docs/SECURITY.md`), and the model sees it fenced as a message from another agent, not as instructions.
+   - An agent reads its inbox when a turn starts and between steps. By default a message that arrives while it's idle waits for the next turn.
+   - **Wake (opt-in, `/mesh wake on` or `"mesh": {"wake": true}`):** in the TUI, a message on a wired inbox starts a turn while the session is idle. That turn has no user message: it reads the inbox exactly as above (fenced, tainting), then a note that the user didn't write it; the transcript says who woke it. Never during a turn or while an approval waits (the running turn reads the message between steps, and one that lands after its last read wakes a turn once that turn ends; under an approval with no turn running, it waits for the next message or turn), at most `WAKES_PER_MINUTE` (3) wake-ups a minute per wire (over that, the user is told once and the messages wait), and never in `marv -p`, which runs one turn.
 3. **The switchboard logs every message** to the trajectory, with sender, receptacle and size.
 4. **Size and rate limits per wire**, so a looping agent can't flood another.
 5. **No ambient authority.** A plug can do nothing beyond its wires. In particular, an agent can't wire itself.
