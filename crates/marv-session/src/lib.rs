@@ -29,6 +29,7 @@ pub mod mcp_tools;
 pub mod memory;
 pub mod mesh;
 pub mod paths;
+pub mod processes;
 pub mod prompt;
 pub mod provenance;
 pub mod runner;
