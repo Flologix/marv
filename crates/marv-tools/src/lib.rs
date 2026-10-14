@@ -41,7 +41,8 @@ pub use registry::{
 };
 pub use types::{
     AgentHost, AgentProgress, Approval, ApprovalRequest, Approver, BeforeChange, Decision, DiffKind, DiffLine, DiffShown,
-    DynTool, MemoryPaths, PlanHost, PlanItem, PlanStatus, Preview, Repaired, Scope, Skill, Tool, ToolContext, ToolError, ToolOutput,
+    DynTool, MemoryPaths, PlanHost, PlanItem, PlanStatus, Preview, Repaired, Scope, Skill, Tool, ToolContext, ToolError,
+    ToolOutput,
 };
 
 #[cfg(test)]

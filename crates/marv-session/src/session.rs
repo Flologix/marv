@@ -3388,7 +3388,10 @@ mod turn_tests {
         assert_eq!(plan_shown(&events), Some(expected_plan()));
         // The model got only the line; the list is in its own call.
         let line = "Plan saved: 1 of 3 done; now: Add the --json flag.";
-        assert_eq!(provider.requests()[1].0.last(), Some(&ChatTurn::Tool { call_id: "p1".into(), name: "plan".into(), text: line.into() }));
+        assert_eq!(
+            provider.requests()[1].0.last(),
+            Some(&ChatTurn::Tool { call_id: "p1".into(), name: "plan".into(), text: line.into() })
+        );
         collect(go(&session, "and then?")).await;
         let requests = provider.requests();
         assert!(tool_names(&requests[0].1).contains(&"plan".to_string()));
@@ -3503,7 +3506,11 @@ mod turn_tests {
     async fn a_subagent_is_offered_no_plan_and_its_call_to_one_fails() {
         let dirs = Dirs::new();
         let parent = Scripted::new(vec![
-            use_tools(vec![call("a1", "agent", serde_json::json!({ "description": "look around", "prompt": "sub-task: find the notes" }))]),
+            use_tools(vec![call(
+                "a1",
+                "agent",
+                serde_json::json!({ "description": "look around", "prompt": "sub-task: find the notes" }),
+            )]),
             say("Parent done."),
         ]);
         let sub = Scripted::new(vec![use_tools(vec![plan_call("s1", plan_items())]), say("Found them.")]);
@@ -3559,9 +3566,13 @@ mod turn_tests {
     async fn a_finished_plan_isnt_handed_to_compaction() {
         let dirs = Dirs::new();
         let done = serde_json::json!([{ "text": "All of it", "status": "done" }]);
-        let provider =
-            Scripted::new(vec![use_tools(vec![plan_call("p1", done)]), with(used(900), say("Done.")), say("SUMMARY"), say("Ok.")])
-                .with_context(1000);
+        let provider = Scripted::new(vec![
+            use_tools(vec![plan_call("p1", done)]),
+            with(used(900), say("Done.")),
+            say("SUMMARY"),
+            say("Ok."),
+        ])
+        .with_context(1000);
         let session = scripted(&dirs, &provider, |_| {});
         collect(go(&session, "task")).await;
         collect(go(&session, "next")).await;

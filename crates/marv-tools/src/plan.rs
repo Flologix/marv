@@ -193,8 +193,8 @@ mod tests {
     #[tokio::test]
     async fn the_current_items_final_period_is_dropped() {
         let host = Arc::new(Host::default());
-        let r = run_tool(&call(json!([{ "text": "Write the tests.", "status": "in_progress" }])), &ctx(&host), builtin_tools())
-            .await;
+        let r =
+            run_tool(&call(json!([{ "text": "Write the tests.", "status": "in_progress" }])), &ctx(&host), builtin_tools()).await;
         assert_eq!(r.result.output, "Plan saved: 0 of 1 done; now: Write the tests.");
     }
 
@@ -263,8 +263,7 @@ mod tests {
 
     #[test]
     fn plan_text_lists_each_item_with_its_status() {
-        let items =
-            [item("Read", PlanStatus::Done), item("Write", PlanStatus::InProgress), item("Docs", PlanStatus::Pending)];
+        let items = [item("Read", PlanStatus::Done), item("Write", PlanStatus::InProgress), item("Docs", PlanStatus::Pending)];
         assert_eq!(
             plan_text(&items),
             "Your plan (from the plan tool), as it stood:\n- [done] Read\n- [in progress] Write\n- [pending] Docs\nKeep updating it with the plan tool."
