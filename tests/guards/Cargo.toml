@@ -14,6 +14,9 @@ marv-session.workspace = true
 marv-mcp.workspace = true
 marv-mesh.workspace = true
 marv-oracle = { path = "../../crates/marv-oracle" }
+marv-provider.workspace = true
+marv-agent.workspace = true
+futures.workspace = true
 async-trait.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

@@ -1613,10 +1613,13 @@ name = "marv-guards"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "futures",
+ "marv-agent",
  "marv-core",
  "marv-mcp",
  "marv-mesh",
  "marv-oracle",
+ "marv-provider",
  "marv-sandbox",
  "marv-session",
  "marv-tools",

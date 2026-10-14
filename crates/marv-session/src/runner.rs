@@ -100,8 +100,15 @@ impl ToolRunner for SessionToolRunner {
         self.tools.iter().find(|t| t.name() == call.name).map_or(ToolKind::Execute, |t| t.kind())
     }
 
+    /// A read runs with its neighbours (#58), unless this call asks (the github tool's writes, Marv #47): approvals
+    /// come one at a time, and a "no" stops the calls behind it, as in Marv.
     fn concurrent(&self, call: &ToolCall) -> bool {
-        self.kind(call) == ToolKind::Read || marv_tools::is_parallel_call(call, &self.tools)
+        let tool = self.tools.iter().find(|t| t.name() == call.name);
+        let asks = tool.is_some_and(|t| {
+            let raw = serde_json::from_str(if call.arguments.is_empty() { "{}" } else { &call.arguments });
+            raw.ok().and_then(|raw| t.parse(raw).ok()).is_some_and(|input| t.needs_approval(input.as_ref()) == Some(true))
+        });
+        (self.kind(call) == ToolKind::Read && !asks) || marv_tools::is_parallel_call(call, &self.tools)
     }
 
     async fn run(&self, call: ToolCall, cancel: CancellationToken) -> Result<ToolRun, MarvError> {
@@ -262,6 +269,16 @@ mod tests {
 
     fn request(key: &str, must_ask: bool) -> ApprovalRequest {
         ApprovalRequest { scope: Scope { key: key.into(), description: key.into() }, must_ask, ..step_limit_request(1, 25) }
+    }
+
+    // Marv #47: the github tool is a read, but its writes ask; those run alone.
+    #[test]
+    fn a_read_that_asks_for_this_call_isnt_concurrent() {
+        let runner = SessionToolRunner::new(ToolContext::new("/tmp"), Arc::new(marv_tools::builtin_tools().to_vec()));
+        let gh = |args: &str| ToolCall { id: "g".into(), name: "github".into(), arguments: format!("{{\"args\": {args}}}") };
+        assert!(runner.concurrent(&gh(r#"["pr", "list"]"#)));
+        assert!(!runner.concurrent(&gh(r#"["pr", "comment", "1", "--body", "x"]"#)));
+        assert!(runner.concurrent(&ToolCall { id: "r".into(), name: "read_file".into(), arguments: r#"{"path": "a"}"#.into() }));
     }
 
     #[tokio::test]
