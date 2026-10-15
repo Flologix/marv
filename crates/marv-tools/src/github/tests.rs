@@ -211,7 +211,7 @@ async fn gh_missing_while_the_repository_is_looked_up_isnt_remembered() {
     // git still there (the project's host comes from it), gh not: looking up the repository fails to spawn.
     let git_only = f.root().join(".git-only-bin");
     std::fs::create_dir(&git_only).unwrap();
-    let real_git = which("git", std::env::var("PATH").ok().as_deref()).unwrap();
+    let real_git = which("git", std::env::var("PATH").ok().as_deref(), &[]).unwrap();
     std::os::unix::fs::symlink(real_git, git_only.join("git")).unwrap();
     let with_gh = f.env().into_iter().find(|(k, _)| k == "PATH").unwrap().1;
     f.set("PATH", &git_only.display().to_string());
@@ -333,10 +333,10 @@ async fn an_argument_with_a_nul_or_more_than_40_is_invalid() {
 #[tokio::test]
 async fn offered_when_gh_is_on_path_and_logged_in_not_when_logged_out_or_missing() {
     let f = Fixture::new();
-    assert!(github_available(&f.env(), AUTH_CHECK).await);
+    assert!(github_available(&f.env(), &[], AUTH_CHECK).await);
     f.set("FAKE_GH_LOGGED_IN", "0");
-    assert!(!github_available(&f.env(), AUTH_CHECK).await);
-    assert!(!github_available(&[("PATH".into(), "/nonexistent".into())], AUTH_CHECK).await);
+    assert!(!github_available(&f.env(), &[], AUTH_CHECK).await);
+    assert!(!github_available(&[("PATH".into(), "/nonexistent".into())], &[], AUTH_CHECK).await);
 }
 
 #[tokio::test]
@@ -347,9 +347,9 @@ async fn when_gh_auth_status_doesnt_answer_in_time_ghs_hosts_yml_decides() {
     std::fs::create_dir(&config).unwrap();
     f.set("GH_CONFIG_DIR", &config.display().to_string());
     let quick = Duration::from_millis(200);
-    assert!(!github_available(&f.env(), quick).await);
+    assert!(!github_available(&f.env(), &[], quick).await);
     std::fs::write(config.join("hosts.yml"), "github.com:\n  user: me\n").unwrap();
-    assert!(github_available(&f.env(), quick).await);
+    assert!(github_available(&f.env(), &[], quick).await);
 }
 
 #[test]

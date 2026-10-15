@@ -3,7 +3,8 @@
 # in `log` next to this script ("$*"). State lives in the same folder: `next` (the next new pane's number) and
 # `agent-<pane>` (what runs in a pane the door opened: `pane run` of a command naming marv starts a Marv there,
 # `agent start --kind K` a K). Pane w1:p1 is the caller's own Marv; w1:p2 a Claude Code whose name and output carry
-# terminal escapes and a fence's closing tag.
+# terminal escapes and a fence's closing tag. `state-<pane>` overrides an opened pane's agent state (idle by default);
+# a pane whose `opened-<pane>` file is gone is gone (pane_not_found), as when the user closed it.
 dir=$(dirname "$0")
 [ "$1" = --ready ] && exit 0
 printf '%s\n' "$*" >> "$dir/log"
@@ -18,7 +19,7 @@ pane_json() {
     w1:p2) printf '{"pane_id":"w1:p2","agent":"claude","name":"rev\\u001b[31mIEWER","agent_status":"idle","cwd":"/w"}' ;;
     *)
       if [ -f "$dir/agent-$1" ]; then
-        printf '{"pane_id":"%s","agent":"%s","agent_status":"idle","cwd":"/w"}' "$1" "$(cat "$dir/agent-$1")"
+        printf '{"pane_id":"%s","agent":"%s","agent_status":"%s","cwd":"/w"}' "$1" "$(cat "$dir/agent-$1")" "$(cat "$dir/state-$1" 2>/dev/null || echo idle)"
       elif [ -f "$dir/opened-$1" ]; then
         printf '{"pane_id":"%s","agent_status":"unknown","cwd":"/w"}' "$1"
       else
@@ -43,6 +44,8 @@ case "$1 $2" in
     case "$4" in *marv*) echo marv > "$dir/agent-$3" ;; esac
     printf '{"result":{}}\n' ;;
   'agent start') echo "$5" > "$dir/agent-$7"; printf '{"result":{}}\n' ;;
-  'pane close') rm -f "$dir/agent-$3" "$dir/opened-$3"; printf '{"result":{}}\n' ;;
+  'pane close')
+    if [ -f "$dir/opened-$3" ]; then rm -f "$dir/agent-$3" "$dir/opened-$3"; printf '{"result":{}}\n'; else
+      printf '{"error":{"code":"pane_not_found","message":"pane %s not found"}}\n' "$3"; exit 1; fi ;;
   *) printf '{"result":{}}\n' ;;
 esac

@@ -119,6 +119,12 @@ pub fn yolo_held_off(value: Option<&str>) -> bool {
     matches!(value.map(|v| v.trim().to_lowercase()).as_deref(), Some("0" | "off" | "false" | "no"))
 }
 
+/// `MARV_TAINTED=1` (or true, yes, on): this Marv starts tainted (#74: the Herdr door spawns a worker so when the
+/// spawning conversation is). It can only add taint, never take it away.
+pub fn tainted_at_start(env: &Env) -> bool {
+    matches!(env.get("MARV_TAINTED").map(|v| v.trim().to_lowercase()).as_deref(), Some("1" | "true" | "yes" | "on"))
+}
+
 /// The Herdr door's default limit on panes it opens per session (#74).
 pub const DEFAULT_HERDR_PEERS: u32 = 4;
 /// The most `herdr.peers` may allow.

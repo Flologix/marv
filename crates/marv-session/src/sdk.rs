@@ -125,6 +125,9 @@ pub struct SessionOptions {
     /// rename and prompts go to your approver (`door: Herdr`); commands and spawns only with `host_commands`, asked
     /// every time (`once`). Default none.
     pub herdr: Option<crate::herdr_door::HerdrSetup>,
+    /// Start tainted (#74, `MARV_TAINTED=1`): this session's first message came from a conversation that held
+    /// untrusted text. Default false.
+    pub tainted_at_start: bool,
 }
 
 /// Builds a [`MarvSession`] (Marv's `createSession`).
@@ -170,6 +173,7 @@ impl SessionBuilder {
                 hooks: Vec::new(),
                 one_shot: false,
                 herdr: None,
+                tainted_at_start: false,
             },
         }
     }
@@ -321,7 +325,8 @@ pub async fn create_session(options: SessionOptions) -> Result<MarvSession, Sess
             Some(known) => known,
             None => {
                 let pairs: Vec<(String, String)> = env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-                marv_tools::github::github_available(&pairs, marv_tools::github::AUTH_CHECK).await
+                let outside: Vec<PathBuf> = std::iter::once(root.clone()).chain(options.writable.iter().cloned()).collect();
+                marv_tools::github::github_available(&pairs, &outside, marv_tools::github::AUTH_CHECK).await
             }
         };
     let mut init = SessionInit::new(root.clone(), ProviderChoice::Option(options.provider));
@@ -365,6 +370,7 @@ pub async fn create_session(options: SessionOptions) -> Result<MarvSession, Sess
     init.hooks = options.hooks;
     init.one_shot = options.one_shot;
     init.herdr = options.herdr;
+    init.tainted_at_start = options.tainted_at_start;
     let session = MarvSession::new(init)?;
     if let Some(mcp) = &session.mcp() {
         // A server that needs a login is told once (again only after it connected meanwhile).

@@ -22,6 +22,17 @@ pub fn fake_herdr_log(dir: &Path) -> Vec<String> {
     std::fs::read_to_string(dir.join("log")).unwrap_or_default().lines().map(str::to_string).collect()
 }
 
+/// Sets the state Herdr reports for the agent in a pane the door opened (`working`, `blocked`…).
+pub fn set_pane_state(dir: &Path, pane: &str, state: &str) {
+    std::fs::write(dir.join(format!("state-{pane}")), format!("{state}\n")).unwrap();
+}
+
+/// Closes a pane behind Marv's back (the user closed it, its program exited): Herdr no longer has it.
+pub fn close_pane_outside(dir: &Path, pane: &str) {
+    let _ = std::fs::remove_file(dir.join(format!("opened-{pane}")));
+    let _ = std::fs::remove_file(dir.join(format!("agent-{pane}")));
+}
+
 /// The door's setup with the fake in `dir`: Marv in pane w1:p1, Marv's binary a stand-in path.
 pub fn fake_setup(dir: &Path, max_peers: u32) -> super::HerdrSetup {
     super::HerdrSetup {
@@ -29,6 +40,7 @@ pub fn fake_setup(dir: &Path, max_peers: u32) -> super::HerdrSetup {
         own_pane: Some("w1:p1".into()),
         marv: PathBuf::from("/opt/marv/bin/marv"),
         max_peers,
+        runs: true,
     }
 }
 

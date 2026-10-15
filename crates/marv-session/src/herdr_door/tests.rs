@@ -215,11 +215,14 @@ async fn another_agent_kind_starts_without_arguments_and_a_branch_gets_a_worktre
     assert!(!out.result.is_error, "{}", out.result.output);
     let root = r.project.path().to_string_lossy().to_string();
     let log = r.log();
+    // The default name carries this session's own prefix, so a worker's own workers don't collide with its parent's.
+    let name = r.peers.list()[0].name.clone();
+    assert!(name.starts_with("peer-") && name.ends_with("-1") && name.len() == "peer-abcd-1".len(), "{name}");
     assert!(
-        log.contains(&format!("worktree create --cwd {root} --branch feat/x --base main --no-focus --label peer-1")),
+        log.contains(&format!("worktree create --cwd {root} --branch feat/x --base main --no-focus --label {name}")),
         "{log:?}"
     );
-    assert!(log.contains(&"agent start peer-1 --kind claude --pane w1:p5".to_string()), "{log:?}");
+    assert!(log.contains(&format!("agent start {name} --kind claude --pane w1:p5")), "{log:?}");
     assert!(log.contains(&"pane send-text w1:p5 review it".to_string()), "{log:?}");
     let warning = r.approver.asked()[0].preview.warning.clone().unwrap();
     assert!(warning.contains("claude runs with its own permission settings"), "{warning}");
@@ -239,7 +242,7 @@ async fn the_peer_limit_holds_before_anyone_is_asked() {
 #[test]
 fn inputs_are_checked_before_anything_runs() {
     let door = HerdrDoor::new(
-        HerdrSetup { program: "/nonexistent/herdr".into(), own_pane: None, marv: "/m".into(), max_peers: 1 },
+        HerdrSetup { program: "/nonexistent/herdr".into(), own_pane: None, marv: "/m".into(), max_peers: 1, runs: true },
         Arc::default(),
     );
     let bad = [
@@ -277,4 +280,69 @@ fn the_peers_list_goes_through_printable() {
     let text = peers_text(&[peer], &[Some("idle".into())]);
     assert!(!text.contains('\u{1b}') && !text.contains('\u{7}'), "{text:?}");
     assert!(text.contains("w1:p5") && text.contains("idle"), "{text}");
+}
+
+#[tokio::test]
+async fn nothing_starting_with_a_dash_reaches_herdr() {
+    let r = rig("dash", 4, Decision::Yes);
+    for args in [
+        json!({"action": "read", "pane": "--help"}),
+        json!({"action": "status", "pane": "-h"}),
+        json!({"action": "list", "what": "tabs", "workspace": "--version"}),
+        json!({"action": "focus", "target": "-x:p1"}),
+        json!({"action": "rename", "target": "w1:p2", "name": "--help"}),
+        json!({"action": "prompt", "pane": "w1:p2", "text": "--help"}),
+        json!({"action": "run", "command": "--help"}),
+        json!({"action": "spawn", "kind": "marv", "task": "-v"}),
+    ] {
+        let out = r.run(args.clone()).await;
+        assert!(out.result.is_error, "{args}: {}", out.result.output);
+    }
+    assert!(r.approver.asked().is_empty());
+    // The prompt's preview reads the pane first; nothing else reached Herdr.
+    assert!(r.log().iter().all(|l| l == "pane get w1:p2"), "{:?}", r.log());
+}
+
+#[test]
+fn a_run_command_shows_what_runs_and_points_an_agent_to_spawn() {
+    let door = HerdrDoor::new(
+        HerdrSetup { program: "/nonexistent/herdr".into(), own_pane: None, marv: "/m".into(), max_peers: 1, runs: true },
+        Arc::default(),
+    );
+    for bad in ["echo hi!", "echo a\u{200B}b", "echo \u{202E}x", "ls \u{E0041}"] {
+        assert!(marv_tools::DynTool::parse(&door, json!({"action": "run", "command": bad})).is_err(), "{bad:?}");
+    }
+    assert_eq!(agent_in_command("claude --dangerously-skip-permissions"), Some("claude"));
+    assert_eq!(agent_in_command("FOO=1 /usr/local/bin/marv"), Some("marv"));
+    assert_eq!(agent_in_command("cargo watch"), None);
+}
+
+#[tokio::test]
+async fn in_a_tainted_session_a_prompt_or_spawn_says_whose_words_and_a_marv_starts_tainted() {
+    let r = rig("tainted", 4, Decision::Yes);
+    r.ctx.taint.mark(Provenance::Web);
+    let prompt = r.run(json!({"action": "prompt", "pane": "w1:p2", "text": "review"})).await;
+    assert!(!prompt.result.is_error, "{}", prompt.result.output);
+    r.run(json!({"action": "spawn", "kind": "marv", "task": "fix"})).await;
+    let asked = r.approver.asked();
+    assert!(asked.iter().all(|a| a.must_ask), "tainted: asked as egress");
+    assert_eq!(asked[0].preview.warning.as_deref(), Some(OWN_WORDS));
+    assert!(asked[1].preview.warning.as_deref().unwrap().contains(OWN_WORDS));
+    assert_eq!(asked[1].preview.command.as_deref(), Some("MARV_TAINTED=1 MARV_YOLO=off /opt/marv/bin/marv"));
+}
+
+#[tokio::test]
+async fn panes_gone_from_herdr_dont_count_against_the_limit() {
+    let r = rig("prune", 1, Decision::Yes);
+    assert!(!r.run(json!({"action": "run", "command": "echo one"})).await.result.is_error);
+    super::fake::close_pane_outside(r.herdr.path(), "w1:p5");
+    let again = r.run(json!({"action": "run", "command": "echo two"})).await;
+    assert!(!again.result.is_error, "{}", again.result.output);
+    assert_eq!(r.peers.list().iter().map(|p| p.pane.as_str()).collect::<Vec<_>>(), ["w1:p6"]);
+}
+
+#[test]
+fn each_session_names_its_peers_with_its_own_prefix() {
+    let (a, b) = (Peers::default(), Peers::default());
+    assert_ne!(a.free_name("peer"), b.free_name("peer"));
 }

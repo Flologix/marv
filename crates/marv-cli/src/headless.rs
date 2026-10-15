@@ -456,6 +456,8 @@ pub async fn run_headless(options: HeadlessOptions) -> ExitCode {
         let shown: Vec<String> = writable.iter().map(|d| marv_session::paths::shorten_home(d, &home)).collect();
         eprintln!("Writable in the sandbox besides the project (config): {}", shown.join(", "));
     }
+    // Where a door's program (gh, herdr) is never taken from: the project and the sandbox's writable folders.
+    let door_outside: Vec<std::path::PathBuf> = std::iter::once(root.clone()).chain(writable.iter().cloned()).collect();
     let mut builder = marv_session::SessionBuilder::new(root.clone(), provider)
         .sources(&[marv_session::sources::Source::User, marv_session::sources::Source::Project])
         .max_steps(options.max_steps.unwrap_or(config.max_steps))
@@ -474,12 +476,14 @@ pub async fn run_headless(options: HeadlessOptions) -> ExitCode {
     // auth status can take up to 2 s. No host_commands: nobody approves each command here (#52).
     let github = marv_tools::github::github_wanted(env.get("MARV_GITHUB").map(String::as_str)) && {
         let pairs: Vec<(String, String)> = env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-        marv_tools::github::github_available(&pairs, marv_tools::github::AUTH_CHECK).await
+        marv_tools::github::github_available(&pairs, &door_outside, marv_tools::github::AUTH_CHECK).await
     };
     (builder.options.github, builder.options.github_known) = (github, Some(github));
     // In a Herdr pane, the herdr tool reads panes (#74); without host_commands its commands and spawns are refused
     // before anything is asked, whatever --approve says.
-    builder.options.herdr = marv_session::herdr_door::setup_from_env(&env, config.herdr_peers);
+    builder.options.herdr = marv_session::herdr_door::setup_from_env(&env, config.herdr_peers, &door_outside);
+    // A worker the Herdr door spawned from a tainted conversation starts tainted (MARV_TAINTED=1: only adds taint).
+    builder.options.tainted_at_start = marv_session::config::tainted_at_start(&env);
     // The mesh, when asked for (`--approve mesh:<r>` or `MARV_MESH_NAME`): otherwise a one-off `marv -p` isn't on it
     // and its model isn't offered the mesh tools. Wires are granted only for the listed receptacles, from this run's
     // own agents or from another Marv (its door).

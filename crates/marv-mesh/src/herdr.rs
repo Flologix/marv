@@ -487,7 +487,8 @@ impl HerdrAdapter {
         if !self.offerable(&target) {
             return Err(MeshError::NoReceptacle(format!("an agent in Herdr pane {pane}")));
         }
-        let state = target.status.as_deref().unwrap_or("unknown");
+        // Herdr's word for it, shown only if it's a plain one (the error reaches the model).
+        let state = target.status.as_deref().filter(|s| plain_id(s)).unwrap_or("unknown");
         if !matches!(state, "idle" | "done") {
             return Err(MeshError::Io(format!(
                 "the agent in Herdr pane {pane} is {state}: it takes a prompt only when idle or done, try again later"
@@ -553,7 +554,10 @@ const READY_POLL: Duration = Duration::from_millis(500);
 /// An id Herdr handed back (`w1`, `w1:t2`, `w1:p3`): opaque, but only ever these characters, so it's Marv's to show
 /// and pass on, never text another program chose.
 pub fn plain_id(id: &str) -> bool {
-    !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '_' | '-'))
+    // It starts with a letter or digit: one starting with `-` would reach the `herdr` CLI as an option.
+    id.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && id.len() <= 64
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '_' | '-'))
 }
 
 /// The Herdr door's commands (#74), on the same `herdr` CLI as the pane receptacles, run in Marv's own process (the
@@ -683,20 +687,50 @@ impl HerdrAdapter {
     /// The user's `/peers stop` (#74), never the model's: asks the worker to leave as its user would (`/exit` for a
     /// Marv; ctrl+c twice for another agent, which is how Claude Code quits), then closes the pane. Typed past the
     /// prompts-only rule ([`pane_prompt`]) because a person asked for it, not a model.
-    pub async fn stop(&self, pane: &str, marv: bool) -> crate::Result<()> {
-        if marv {
-            let _ = self.run(&["pane", "send-text", pane, "/exit"]).await;
-            tokio::time::sleep(ENTER_DELAY).await;
-            let _ = self.run(&["pane", "send-keys", pane, "enter"]).await;
-        } else {
-            for _ in 0..2 {
-                let _ = self.run(&["pane", "send-keys", pane, "ctrl+c"]).await;
+    ///
+    /// Only into an agent that's idle or done: one at an approval or a question would take the Enter (or the ctrl+c)
+    /// as its answer, and Marv's approval picks its highlighted item, Yes, on Enter. Anything else (working, blocked,
+    /// unknown, no agent) gets nothing typed: its pane is closed at once. A pane Herdr no longer has is
+    /// [`Stopped::Gone`].
+    pub async fn stop(&self, pane: &str, marv: bool) -> crate::Result<Stopped> {
+        let target = match self.pane(pane).await {
+            Ok(target) => target,
+            Err(e) if pane_not_found(&e) => return Ok(Stopped::Gone),
+            Err(e) => return Err(e),
+        };
+        if target.agent.is_some() && matches!(target.status.as_deref(), Some("idle" | "done")) {
+            if marv {
+                let _ = self.run(&["pane", "send-text", pane, "/exit"]).await;
                 tokio::time::sleep(ENTER_DELAY).await;
+                let _ = self.run(&["pane", "send-keys", pane, "enter"]).await;
+            } else {
+                for _ in 0..2 {
+                    let _ = self.run(&["pane", "send-keys", pane, "ctrl+c"]).await;
+                    tokio::time::sleep(ENTER_DELAY).await;
+                }
             }
+            tokio::time::sleep(STOP_GRACE).await;
         }
-        tokio::time::sleep(STOP_GRACE).await;
-        self.run(&["pane", "close", pane]).await.map(drop)
+        match self.run(&["pane", "close", pane]).await {
+            Ok(_) => Ok(Stopped::Closed),
+            Err(e) if pane_not_found(&e) => Ok(Stopped::Gone),
+            Err(e) => Err(e),
+        }
     }
+}
+
+/// How a `stop` ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stopped {
+    /// Its pane was closed.
+    Closed,
+    /// Herdr no longer had the pane (closed by the user, or its program exited).
+    Gone,
+}
+
+/// Herdr answered `pane_not_found` (the pane is gone).
+pub fn pane_not_found(err: &MeshError) -> bool {
+    matches!(err, MeshError::Io(m) if m.ends_with(": pane_not_found"))
 }
 
 /// How long a stopped worker gets to leave before its pane is closed.
@@ -750,6 +784,12 @@ pub fn pane_prompt(text: &str) -> crate::Result<String> {
     let Some(first) = text.chars().find(|c| !invisible(c)) else {
         return Err(MeshError::BadName("herdr.pane.send needs some text".into()));
     };
+    // `herdr pane send-text <pane> <text>`: text starting with `-` would be read as an option, not typed.
+    if text.starts_with('-') {
+        return Err(MeshError::BadName(
+            "a prompt can't start with - (Herdr would read it as an option); nothing was typed".into(),
+        ));
+    }
     if COMMAND_PREFIXES.contains(&first) {
         return Err(MeshError::BadName(
             "herdr.pane.send types a prompt, not a command: text starting with / ! or # is refused; nothing was typed".into(),
