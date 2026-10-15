@@ -1390,7 +1390,7 @@ mod run_tests {
     #[test]
     fn a_subagents_context_has_no_doors_whatever_the_parent_has() {
         let mut p = parent();
-        p.doors = marv_tools::types::Doors { host: true, process: true, github: true };
+        p.doors = marv_tools::types::Doors { host: true, process: true, github: true, herdr: true };
         let sub = subagent_context(&p, "general-purpose · x", None, None);
         assert_eq!(sub.doors, marv_tools::types::Doors::default());
     }

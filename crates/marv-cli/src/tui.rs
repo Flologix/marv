@@ -306,6 +306,12 @@ pub struct TurnMap {
     pub last_checks: Option<ProjectCheckResult>,
 }
 
+/// `/yolo on` in a Marv started with `MARV_YOLO=off` (#74).
+pub const YOLO_HELD_OFF: &str = "Yolo stays off in this Marv: it was started with MARV_YOLO=off (a worker started by a Marv out of yolo). Start it without that variable to use yolo.";
+
+/// The startup note of a Marv started with `MARV_TAINTED=1` (#74).
+pub const TAINTED_AT_START: &str = "Started by another Marv whose conversation held untrusted content (MARV_TAINTED): its task counts as untrusted here too, so anything that can send data out asks first, even in yolo.";
+
 /// The tainted-session line (marv-rs, docs/SECURITY.md): from now on egress asks, even in yolo.
 pub fn tainted_text(source: marv_core::Provenance) -> String {
     let what = match source {
@@ -314,6 +320,7 @@ pub fn tainted_text(source: marv_core::Provenance) -> String {
         marv_core::Provenance::Mesh => "a mesh message",
         marv_core::Provenance::Image => "an image",
         marv_core::Provenance::Hook => "a session-start hook's output",
+        marv_core::Provenance::Herdr => "what another Herdr pane shows",
         _ => "untrusted content",
     };
     format!(
@@ -965,6 +972,11 @@ impl Bridge {
         // The person at this terminal approves each command on the host (#52); gh where it's logged in (#47).
         init.host_commands = true;
         init.github = s.github;
+        // In a Herdr pane, the herdr tool (#74): reads, light actions, and commands and workers asked every time.
+        let outside: Vec<PathBuf> = std::iter::once(s.root.clone()).chain(s.writable.iter().cloned()).collect();
+        init.herdr = marv_session::herdr_door::setup_from_env(&s.env, config.herdr_peers, &outside);
+        // Spawned by a Marv whose conversation held untrusted text (MARV_TAINTED=1, #74): start tainted.
+        init.tainted_at_start = marv_session::config::tainted_at_start(&s.env);
         init.no_yolo = marv_session::sdk::no_yolo_reason(&s.root, &s.home);
         if init.no_yolo.is_some() {
             init.yolo = false;
@@ -1073,6 +1085,38 @@ impl Bridge {
         }
     }
 
+    /// `/peers` (#74): the Herdr panes this session opened, one read, or one stopped. Names, tasks and pane text come
+    /// from the model or another program: all of it goes through `printable()`.
+    async fn peers(&self, read: Option<String>, stop: Option<String>) {
+        if let Some(name) = stop {
+            return self.emit(match self.session.stop_peer(&name).await {
+                Ok((peer, stopped)) => system(
+                    printable(&format!(
+                        "{} {}.{}",
+                        peer.name,
+                        match stopped {
+                            marv_mesh::herdr::Stopped::Closed => format!("stopped, and pane {} closed", peer.pane),
+                            marv_mesh::herdr::Stopped::Gone => format!("forgotten: pane {} was already gone", peer.pane),
+                        },
+                        peer.branch
+                            .map(|b| format!(" Its worktree (branch {b}) stays: remove it once it's merged."))
+                            .unwrap_or_default()
+                    )),
+                    false,
+                ),
+                Err(e) => system(printable(&e), true),
+            });
+        }
+        if let Some(name) = read {
+            return self.emit(match self.session.read_peer(&name, 40).await {
+                Ok(text) => system(printable(&format!("{name}'s last lines:\n{text}")), false),
+                Err(e) => system(printable(&e), true),
+            });
+        }
+        let (peers, states): (Vec<_>, Vec<_>) = self.session.peer_states().await.into_iter().unzip();
+        self.emit(system(marv_session::herdr_door::peers_text(&peers, &states), false));
+    }
+
     fn session_yolo_allowed(&self) -> bool {
         marv_session::sdk::no_yolo_reason(&self.root, &self.home).is_none()
     }
@@ -1178,6 +1222,9 @@ impl Bridge {
         }
         if let Some(refused) = &self.hooks_refused {
             notes.push((NoticeTone::Warning, NoticeItem { text: refused.clone(), detail: None }));
+        }
+        if marv_session::config::tainted_at_start(&self.env) {
+            notes.push((NoticeTone::Warning, NoticeItem { text: TAINTED_AT_START.into(), detail: None }));
         }
         if let Some(notice) = startup_notice(notes) {
             self.emit(notice_message(notice));
@@ -1631,6 +1678,13 @@ impl Bridge {
                 };
                 self.save_config(self.with_file(|f| f.sandbox = Some(on)), notice.into());
             }
+            // MARV_YOLO=off (#74: a worker the Herdr door spawned from a session out of yolo) holds yolo off for this
+            // process: /yolo on would claim otherwise, and write yolo into the user's config for every Marv.
+            CommandAction::Yolo { on: true }
+                if marv_session::config::yolo_held_off(self.env.get("MARV_YOLO").map(String::as_str)) =>
+            {
+                self.emit(system(YOLO_HELD_OFF, true));
+            }
             CommandAction::Yolo { on } => {
                 let notice = commands::yolo_status(&Config { yolo: on, ..config.clone() }, self.sandbox_available);
                 self.save_config(self.with_file(|f| f.yolo = Some(on)), notice);
@@ -1706,6 +1760,13 @@ impl Bridge {
                         system(format!("No background process named \"{}\". /processes lists them.", printable(&stop)), true)
                     });
                 });
+            }
+            CommandAction::Peers { read, stop } => {
+                if !self.session.herdr_offered() {
+                    return self.emit(system("No Herdr peers here: Marv isn't running in a Herdr pane.", true));
+                }
+                let me = self.clone();
+                tokio::spawn(async move { me.peers(read, stop).await });
             }
             CommandAction::Skill { name, args } => {
                 let Some(skill) = self.skills.iter().find(|s| s.skill.name == name) else { return };
@@ -2509,13 +2570,6 @@ pub async fn run(resume: Option<bool>, approve: Vec<String>) -> anyhow::Result<i
     // The project is wherever Marv was started; the tools can't reach outside it.
     let cwd = std::env::current_dir()?;
     let root = std::fs::canonicalize(&cwd).unwrap_or(cwd);
-    // Whether to offer the github tool (#47): asked of gh once, alongside the rest of startup, since the tool list is
-    // fixed for the session. At most 2 s (gh auth status asks GitHub; offline it falls back to gh's hosts.yml).
-    let github_check = {
-        let wanted = marv_tools::github::github_wanted(env.get("MARV_GITHUB").map(String::as_str));
-        let pairs: Vec<(String, String)> = env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-        tokio::spawn(async move { wanted && marv_tools::github::github_available(&pairs, marv_tools::github::AUTH_CHECK).await })
-    };
     let config_dir = default_config_dir(&env, &home);
     let loaded_instructions = load_instructions(&root, &home, true, true);
     let instructions = loaded_instructions.instructions;
@@ -2543,6 +2597,19 @@ pub async fn run(resume: Option<bool>, approve: Vec<String>) -> anyhow::Result<i
     let (pre_approved, mut approval_problems) = merge_pre_approved(config.approve.clone(), &approve);
     let (writable, writable_problems) = resolve_writable(&config.writable, &home, &root, &config_dir);
     approval_problems.extend(writable_problems);
+    // Where a door's program (gh, herdr) is never taken from: the project and the sandbox's writable folders.
+    let door_outside: Vec<PathBuf> = std::iter::once(root.clone()).chain(writable.iter().cloned()).collect();
+    // Whether to offer the github tool (#47): asked of gh once, alongside the rest of startup, since the tool list is
+    // fixed for the session. At most 2 s (gh auth status asks GitHub; offline it falls back to gh's hosts.yml). gh is
+    // never taken from the project or a sandbox-writable folder (only an absolute PATH entry outside them).
+    let github_check = {
+        let wanted = marv_tools::github::github_wanted(env.get("MARV_GITHUB").map(String::as_str));
+        let pairs: Vec<(String, String)> = env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let outside = door_outside.clone();
+        tokio::spawn(async move {
+            wanted && marv_tools::github::github_available(&pairs, &outside, marv_tools::github::AUTH_CHECK).await
+        })
+    };
     let hidden = marv_sandbox::home::hidden_path_folders(
         env.get("PATH").map(String::as_str).unwrap_or_default(),
         &home,
@@ -2555,7 +2622,7 @@ pub async fn run(resume: Option<bool>, approve: Vec<String>) -> anyhow::Result<i
     // In a Herdr pane, Herdr shows what Marv is doing.
     let herdr = herdr_target(&env).map(|target| HerdrReporter::new(target, None));
     // The mesh (v2): this Marv's switchboard, put on the mesh once the TUI can ask for wires (below).
-    let (mut mesh, mut mesh_note) = match crate::mesh_cmd::start(&env, &root) {
+    let (mut mesh, mut mesh_note) = match crate::mesh_cmd::start(&env, &root, &door_outside) {
         Ok(mesh) => (mesh, None),
         Err(e) => (None, Some((format!("Not on the mesh: {e}"), true))),
     };
@@ -3578,6 +3645,21 @@ mod tests {
         Port(bridge.clone()).run_command("/resume".into());
         let UiEvent::Sessions(list) = next(&mut rx).await else { panic!("not the list") };
         assert!(list.iter().all(|s| s.id != bridge.session.id()));
+    }
+
+    /// #74: in a Marv started with MARV_YOLO=off, /yolo on says it stays off, names the variable, and writes nothing.
+    #[tokio::test]
+    async fn yolo_on_is_refused_under_marv_yolo_off() {
+        let dirs = Dirs::new();
+        let (tx, mut rx) = unbounded_channel();
+        let mut start = startup(&dirs, Some(FileConfig { yolo: Some(false), ..asks() }), vec![], None);
+        start.env.insert("MARV_YOLO".into(), "off".into());
+        let bridge = Bridge::start(start, tx).unwrap();
+        Port(bridge.clone()).run_command("/yolo on".into());
+        let seen = until(&mut rx, |e| matches!(e, UiEvent::Message(_))).await;
+        assert!(texts(&seen).iter().any(|t| t.contains("MARV_YOLO=off")), "{:?}", texts(&seen));
+        assert!(ConfigStore::new(&dirs.config).load().unwrap().is_none_or(|f| f.yolo != Some(true)), "nothing written");
+        assert!(!bridge.status_info().yolo);
     }
 
     #[tokio::test]

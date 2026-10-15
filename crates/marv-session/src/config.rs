@@ -109,7 +109,26 @@ pub struct FileConfig {
     /// `mesh.radio` (marv-rs #124): this Marv is on the mesh radio (default off). Read only from this file, the user's
     /// own: never a project's, an environment variable or a flag.
     pub mesh_radio: Option<RadioSetting>,
+    /// `herdr.peers` (#74): how many panes the Herdr door may open (commands and spawned workers) per session
+    /// (default [`DEFAULT_HERDR_PEERS`], at most [`MAX_HERDR_PEERS`]; 0: none). The user's own file only.
+    pub herdr_peers: Option<u32>,
 }
+
+/// `MARV_YOLO=off` (or 0, false, no): yolo stays off for this process (#74).
+pub fn yolo_held_off(value: Option<&str>) -> bool {
+    matches!(value.map(|v| v.trim().to_lowercase()).as_deref(), Some("0" | "off" | "false" | "no"))
+}
+
+/// `MARV_TAINTED=1` (or true, yes, on): this Marv starts tainted (#74: the Herdr door spawns a worker so when the
+/// spawning conversation is). It can only add taint, never take it away.
+pub fn tainted_at_start(env: &Env) -> bool {
+    matches!(env.get("MARV_TAINTED").map(|v| v.trim().to_lowercase()).as_deref(), Some("1" | "true" | "yes" | "on"))
+}
+
+/// The Herdr door's default limit on panes it opens per session (#74).
+pub const DEFAULT_HERDR_PEERS: u32 = 4;
+/// The most `herdr.peers` may allow.
+pub const MAX_HERDR_PEERS: u32 = 16;
 
 /// `"mesh": {"radio": true}`, or the object form `{"radio": {"titles": false}}` (on, without sharing the
 /// conversation's title in presence). `false` is off. `/radio off` with titles off saves `{"on": false, "titles":
@@ -291,6 +310,29 @@ impl FileConfig {
                 (None, None)
             }
         };
+        // `"herdr": {"peers": 4}`: the Herdr door's settings (#74).
+        let herdr_peers = match map.get("herdr") {
+            None | Some(Value::Null) => None,
+            Some(Value::Object(herdr)) => {
+                if let Some(key) = herdr.keys().find(|k| k.as_str() != "peers") {
+                    problems.push(format!("herdr: unknown key \"{key}\" (only \"peers\")"));
+                }
+                match herdr.get("peers") {
+                    None | Some(Value::Null) => None,
+                    Some(v) => match v.as_u64().filter(|n| *n <= u64::from(MAX_HERDR_PEERS)) {
+                        Some(n) => Some(n as u32),
+                        None => {
+                            problems.push(format!("herdr.peers: expected a whole number from 0 to {MAX_HERDR_PEERS}"));
+                            None
+                        }
+                    },
+                }
+            }
+            Some(_) => {
+                problems.push("herdr: expected an object, like {\"peers\": 4}".into());
+                None
+            }
+        };
         let hooks = match map.get("hooks") {
             None | Some(Value::Null) => None,
             Some(v) => crate::hooks::Hooks::from_value(v).map_err(|e| problems.push(e)).ok(),
@@ -317,6 +359,7 @@ impl FileConfig {
             writable: string_list("writable", &mut problems),
             mesh_wake,
             mesh_radio,
+            herdr_peers,
         };
         if problems.is_empty() { Ok(config) } else { Err(problems.join("\n")) }
     }
@@ -369,6 +412,7 @@ impl FileConfig {
             mesh.insert("radio".into(), radio.to_value());
         }
         put("mesh", (!mesh.is_empty()).then_some(Value::Object(mesh)));
+        put("herdr", self.herdr_peers.map(|n| serde_json::json!({"peers": n})));
         Value::Object(map)
     }
 }
@@ -410,6 +454,8 @@ pub struct Config {
     pub mesh_wake: bool,
     /// `mesh.radio` (#124): off unless the user's own file turns it on. No environment variable or flag reaches it.
     pub mesh_radio: bool,
+    /// `herdr.peers` (#74): the panes the Herdr door may open per session.
+    pub herdr_peers: u32,
     /// Whether the radio's presence carries the conversation's title (`{"radio": {"titles": false}}` turns it off).
     pub radio_titles: bool,
 }
@@ -508,7 +554,9 @@ pub fn resolve_config(file: Option<&FileConfig>, env: &Env) -> Config {
         thinking: file.and_then(|f| f.thinking).unwrap_or(false),
         context_length: file.and_then(|f| f.context_length).unwrap_or(DEFAULT_CONTEXT_LENGTH),
         sandbox: file.and_then(|f| f.sandbox).unwrap_or(true),
-        yolo: file.and_then(|f| f.yolo).unwrap_or(true),
+        // `MARV_YOLO=off` holds yolo off for this process whatever the file says (#74: how the Herdr door starts a Marv
+        // that may have no more than the session that spawned it). It can only turn yolo off, never on.
+        yolo: file.and_then(|f| f.yolo).unwrap_or(true) && !yolo_held_off(env.get("MARV_YOLO").map(String::as_str)),
         trajectories: file.and_then(|f| f.trajectories).unwrap_or(true),
         diagnostics: file.and_then(|f| f.diagnostics).unwrap_or(true),
         checks: file.and_then(|f| f.checks).unwrap_or(true),
@@ -522,6 +570,7 @@ pub fn resolve_config(file: Option<&FileConfig>, env: &Env) -> Config {
         mesh_wake: file.and_then(|f| f.mesh_wake).unwrap_or(false),
         mesh_radio: file.and_then(|f| f.mesh_radio).is_some_and(|r| r.on),
         radio_titles: file.and_then(|f| f.mesh_radio).is_none_or(|r| r.titles),
+        herdr_peers: file.and_then(|f| f.herdr_peers).unwrap_or(DEFAULT_HERDR_PEERS),
     }
 }
 
@@ -760,6 +809,25 @@ mod tests {
                 assert!(FileConfig::from_value(&raw).is_err(), "{bad}");
             }
         }
+    }
+
+    /// #74: the Herdr door's pane limit is the user's file's (default 4, at most 16), and `MARV_YOLO=off` only ever
+    /// turns yolo off.
+    #[test]
+    fn herdr_peers_comes_from_the_file_and_marv_yolo_only_turns_yolo_off() {
+        assert_eq!(resolve_config(None, &Env::new()).herdr_peers, DEFAULT_HERDR_PEERS);
+        let two = FileConfig::from_value(&json!({"herdr": {"peers": 2}})).unwrap();
+        assert_eq!(resolve_config(Some(&two), &Env::new()).herdr_peers, 2);
+        assert_eq!(two.to_value()["herdr"], json!({"peers": 2}));
+        for bad in [json!({"peers": 17}), json!({"peers": -1}), json!({"peers": "4"}), json!({"max": 1}), json!(4)] {
+            assert!(FileConfig::from_value(&json!({ "herdr": bad })).is_err(), "{bad}");
+        }
+        let off: Env = [("MARV_YOLO".to_string(), "off".to_string())].into();
+        let on: Env = [("MARV_YOLO".to_string(), "on".to_string())].into();
+        let no_yolo = FileConfig { yolo: Some(false), ..FileConfig::default() };
+        assert!(!resolve_config(None, &off).yolo);
+        assert!(resolve_config(None, &on).yolo);
+        assert!(!resolve_config(Some(&no_yolo), &on).yolo, "never turns it on");
     }
 
     #[test]

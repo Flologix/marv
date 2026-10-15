@@ -102,22 +102,27 @@ pub fn github_wanted(marv_github: Option<&str>) -> bool {
     !matches!(marv_github.map(|v| v.trim().to_lowercase()).as_deref(), Some("0" | "off" | "false" | "no"))
 }
 
-/// `name` on `path` (Bun.which): the first executable file.
-fn which(name: &str, path: Option<&str>) -> Option<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
-    path?
-        .split(':')
-        .filter(|d| !d.is_empty())
-        .map(|d| Path::new(d).join(name))
-        .find(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
+/// `name` on `path` (Bun.which), the doors' way: only absolute entries, and never a program inside `outside` (the
+/// project and the sandbox's other writable folders), where a sandboxed command could have put it
+/// (`marv_sandbox::host_env::host_program`).
+fn which(name: &str, path: Option<&str>, outside: &[PathBuf]) -> Option<PathBuf> {
+    let outside: Vec<&Path> = outside.iter().map(PathBuf::as_path).collect();
+    marv_sandbox::host_env::host_program(name, path, &outside)
+}
+
+/// The folders a door's program may never come from: the project and the sandbox's extra writable folders.
+pub fn sandbox_writable(ctx: &ToolContext) -> Vec<PathBuf> {
+    std::iter::once(ctx.root.clone()).chain(ctx.sandbox.writable.iter().cloned()).collect()
 }
 
 /// Whether to offer the tool: gh is on PATH and logged in. Checked once per session, before the tool specs are built
 /// (they're fixed for the session: the prompt cache). `gh auth status --active` prints no token without
 /// --show-token; if it doesn't answer in time (offline), gh's hosts.yml listing a host is enough, and calls fail as gh
 /// fails.
-pub async fn github_available(env: &[(String, String)], timeout: Duration) -> bool {
-    let Some(gh) = which("gh", var(env, "PATH")) else { return false };
+///
+/// `outside`: the project and the sandbox's writable folders, where gh is never taken from.
+pub async fn github_available(env: &[(String, String)], outside: &[PathBuf], timeout: Duration) -> bool {
+    let Some(gh) = which("gh", var(env, "PATH"), outside) else { return false };
     let child = tokio::process::Command::new(gh)
         .args(["auth", "status", "--active"])
         .env_clear()
@@ -182,14 +187,14 @@ pub async fn project_host(root: &Path, env: &[(String, String)]) -> Option<Strin
 static REPO_NAMES: LazyLock<Mutex<HashMap<PathBuf, String>>> = LazyLock::new(Mutex::default);
 static REPO_NAME: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$").unwrap());
 
-async fn repo_name(root: &Path, env: &[(String, String)], cancel: &CancellationToken) -> Option<String> {
+async fn repo_name(root: &Path, env: &[(String, String)], cancel: &CancellationToken, outside: &[PathBuf]) -> Option<String> {
     if let Some(name) = REPO_NAMES.lock().unwrap().get(root) {
         return Some(name.clone());
     }
     let args: Vec<String> =
         ["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"].iter().map(|a| a.to_string()).collect();
     // gh gone, or failed to spawn: unknown, like a failure.
-    let result = run_gh(&args, root, env, cancel, Duration::from_secs(10)).await.ok()?;
+    let result = run_gh(&args, root, env, cancel, Duration::from_secs(10), outside).await.ok()?;
     let name = result.output.trim();
     if result.exit_code != Some(0) || !REPO_NAME.is_match(name) {
         return None;
@@ -205,14 +210,17 @@ async fn run_gh(
     env: &[(String, String)],
     cancel: &CancellationToken,
     timeout: Duration,
+    outside: &[PathBuf],
 ) -> Result<CommandResult, ToolError> {
     // gh resolves a bare OWNER/REPO (and a folder without a GitHub remote) against GH_HOST: pinned to the project's
     // host, the one allow checks every named host against, so the user's own GH_HOST can't point it elsewhere.
     let mut vars = gh_env(env);
     // A project whose origin names no host gets github.com, never the user's own default.
     vars.insert("GH_HOST".into(), project_host(root, env).await.unwrap_or_else(|| "github.com".into()));
-    let Some(gh) = which("gh", vars.get("PATH").map(String::as_str)) else {
-        return Err(ToolError::new("gh isn't on PATH anymore: install it again, or use the GitHub MCP server."));
+    let Some(gh) = which("gh", vars.get("PATH").map(String::as_str), outside) else {
+        return Err(ToolError::new(
+            "gh isn't on PATH anymore (an absolute PATH entry outside the project): install it again, or use the GitHub MCP server.",
+        ));
     };
     let mut child = tokio::process::Command::new(gh)
         .args(args)
@@ -429,7 +437,7 @@ impl Tool for Github {
         if NAMES_REPO.contains(&changed.as_str()) {
             let repo = match repo_flag(&input.args) {
                 Some(repo) => Some(repo),
-                None => repo_name(&ctx.root, &env, &ctx.cancel).await,
+                None => repo_name(&ctx.root, &env, &ctx.cancel, &sandbox_writable(ctx)).await,
             };
             warnings.push(match repo {
                 Some(repo) if repo.split('/').count() == 2 => {
@@ -456,7 +464,7 @@ impl Tool for Github {
     async fn run(&self, input: &GithubInput, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let env = self.env();
         self.judge(&input.args, ctx, &env).await?; // Again here: a read that names a host never went through the preview.
-        let mut result = run_gh(&input.args, &ctx.root, &env, &ctx.cancel, TIMEOUT).await?;
+        let mut result = run_gh(&input.args, &ctx.root, &env, &ctx.cancel, TIMEOUT, &sandbox_writable(ctx)).await?;
         // Redacted before the cut, so a cut output saved whole (#61) is redacted too.
         let shown = redact(&result.output);
         result.output = shown.text;

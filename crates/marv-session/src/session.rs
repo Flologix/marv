@@ -302,6 +302,15 @@ pub struct SessionInit {
     /// A one-shot run (`marv -p`): the session ends with the reply, and its background processes with it (#86).
     /// Default false.
     pub one_shot: bool,
+    /// Offer the herdr tool (#74): Marv runs in a Herdr pane (`HERDR_ENV` at startup, checked once by the caller,
+    /// since the tool list and the prompt are fixed for the session). Its reads run anywhere; its commands and spawns
+    /// only with `host_commands` (someone approves each one at a terminal), and only for the main agent. Default
+    /// none.
+    pub herdr: Option<crate::herdr_door::HerdrSetup>,
+    /// Start tainted (`MARV_TAINTED=1`, #74): this Marv was spawned by one whose conversation held untrusted text,
+    /// and its task came from there. Marked (and shown, and logged) at the first turn, as `Provenance::Herdr`. It can
+    /// only add taint. Default false.
+    pub tainted_at_start: bool,
     /// The mesh radio (marv-rs #124): `None` (the default) for a session that is never on it (`marv -p`, the SDK);
     /// `Some(on)` for the TUI's, `on` being whether the user's own config has it on as the session starts. A
     /// conversation that starts with the radio on offers `radio_tx` and the prompt's radio sentence for its whole life
@@ -359,6 +368,8 @@ impl SessionInit {
             writable: Vec::new(),
             hooks: Vec::new(),
             one_shot: false,
+            herdr: None,
+            tainted_at_start: false,
             radio: None,
         }
     }
@@ -626,6 +637,10 @@ struct Inner {
     processes: Option<ProcessManager>,
     /// The project's checkpoints (#16); its ref follows the conversation (`State::chain_id`).
     checkpoints: Arc<CheckpointStore>,
+    /// The panes the Herdr door opened (#74). Like the processes, they outlive turns, `clear()` and `resume()`.
+    peers: Arc<crate::herdr_door::Peers>,
+    /// `tainted_at_start` was marked (at the first turn).
+    start_taint_marked: AtomicBool,
     /// Nested instruction files the main agent's conversation has had (#62); emptied with it (`clear`, `resume`) and
     /// by a compaction (the summary replaces the results that carried them).
     nested: Arc<crate::instructions::NestedInstructions>,
@@ -831,6 +846,16 @@ impl MarvSession {
         // The process tool is built in only where the session offers it: elsewhere the name is free (Marv).
         let custom: Vec<ToolRef> = init.tools.iter().filter(|t| process_on || t.name() != "process").cloned().collect();
         check_tool_names(&custom, init.plan, init.github).map_err(SessionError::Invalid)?;
+        // The door's run and spawn work only with host_commands: its description says which, fixed for the session.
+        if let Some(setup) = &mut init.herdr {
+            setup.runs = init.host_commands;
+        }
+        if init.herdr.is_some() && custom.iter().any(|t| t.name() == crate::herdr_door::HERDR) {
+            return Err(SessionError::Invalid(format!(
+                "A tool named \"{}\" is already built in: give yours another name.",
+                crate::herdr_door::HERDR
+            )));
+        }
         // The main agent's plug (`agent.parent.inbox`), bound now so it's there before the first turn.
         if let Some(mesh) = &init.mesh {
             mesh.plug(crate::mesh::parent_id()).map_err(|e| SessionError::Invalid(format!("The mesh: {e}")))?;
@@ -848,6 +873,10 @@ impl MarvSession {
         let mut specs = marv_tools::tool_specs_for(has_skills, init.plan, init.github);
         specs.retain(|s| process_on || s.name != "process");
         specs.extend(init.tools.iter().map(|t| t.spec()));
+        // The Herdr door (#74), after the caller's tools: fixed for the session (the cache).
+        if let Some(setup) = &init.herdr {
+            specs.push(marv_tools::DynTool::spec(&crate::herdr_door::HerdrDoor::new(setup.clone(), Arc::default())));
+        }
         if init.mesh.is_some() {
             specs.extend(marv_mesh::tools::mesh_specs());
         }
@@ -937,6 +966,8 @@ impl MarvSession {
                 })
             }),
             checkpoints,
+            peers: Arc::default(),
+            start_taint_marked: AtomicBool::new(false),
             radio_hop: Arc::default(),
             state: Mutex::new(state),
             tool_output_hold: Mutex::default(),
@@ -1382,18 +1413,22 @@ impl MarvSession {
                 ms: run.ms,
             });
         }
+        // Spawned tainted (MARV_TAINTED=1, #74): the task this first turn carries came from a tainted conversation.
+        if init.tainted_at_start && !self.inner.start_taint_marked.swap(true, Ordering::SeqCst) {
+            self.inner.taint.mark(Provenance::Herdr);
+        }
         // Their output taints the session as it's sent (unless every hook that printed something is `trusted`): the user
-        // chose the commands, not what they print (`bd ready` lists issue titles anyone can file). Shown and logged now,
-        // before the request, like any taint.
+        // chose the commands, not what they print (`bd ready` lists issue titles anyone can file).
         if hook_runs.as_deref().is_some_and(crate::hooks::taints) {
             self.inner.taint.mark(Provenance::Hook);
-            let sources = self.inner.taint.sources();
-            for source in sources.iter().skip(tainted) {
-                record(TrajectoryRecord::Taint { turn: Some(turn.into()), source: *source });
-                emit(SessionEvent::Tainted { source: *source });
-            }
-            tainted = sources.len();
         }
+        // Either is shown and logged now, before the request, like any taint.
+        let sources = self.inner.taint.sources();
+        for source in sources.iter().skip(tainted) {
+            record(TrajectoryRecord::Taint { turn: Some(turn.into()), source: *source });
+            emit(SessionEvent::Tainted { source: *source });
+        }
+        tainted = sources.len();
         lock(&history).push(ChatTurn::User { text: message });
         // A woken turn (#78): who woke it is Marv's line in the transcript; the user said nothing.
         self.note(if woken.is_woken() { Role::System } else { Role::User }, text);
@@ -1419,12 +1454,15 @@ impl MarvSession {
         // #124: a turn the radio started runs with automatic approval off (§8.4): its approvals are asked once each,
         // say why, and are never answered from the session's remembered "always" (nor are its subagents'); yolo and an
         // approved URL prefix don't apply (`no_auto_approval` below). Its hop was set before its first read, above.
+        // #74: so does any turn the person didn't start, a mesh wake (#78) too: another agent's message is never a
+        // reason to approve anything automatically.
         let radio_turn = matches!(woken, Woken::Radio(_));
+        let unattended = woken.is_woken();
         let client: Option<Arc<dyn Approver>> = init
             .approve
             .clone()
             .map(|inner| if radio_turn { Arc::new(crate::radio::RadioTurnApprover(inner)) as Arc<dyn Approver> } else { inner });
-        let always = if radio_turn { AlwaysScopes::default() } else { self.inner.always.clone() };
+        let always = if unattended { AlwaysScopes::default() } else { self.inner.always.clone() };
         let approve: Option<Arc<dyn Approver>> = client
             .clone()
             .map(|inner| Arc::new(SessionApprover { inner, always: always.clone(), cancel: stop.clone() }) as Arc<dyn Approver>);
@@ -1461,8 +1499,8 @@ impl MarvSession {
         ctx.home = ctx.sandbox.home.clone();
         ctx.cancel = stop.clone();
         ctx.approver = approve.clone();
-        ctx.yolo = yolo && !radio_turn;
-        ctx.no_auto_approval = radio_turn;
+        ctx.yolo = yolo && !unattended;
+        ctx.no_auto_approval = unattended;
         ctx.skills = self.inner.skills.clone();
         ctx.memory = init.memory.as_ref().map(|(paths, _)| paths.for_tools());
         // The session's id now (a resume changes it): its cut outputs are saved, and readable, there (#61).
@@ -1482,6 +1520,9 @@ impl MarvSession {
         // The main agent's doors out of the sandbox, fixed for the session (the prompt names them: the cache).
         ctx.doors.host = init.host_commands;
         ctx.doors.github = init.github;
+        // The Herdr door's commands and spawns (#74): where the session has the door and someone approves each command
+        // at a terminal, as the host door. Reads need neither.
+        ctx.doors.herdr = init.herdr.is_some() && init.host_commands;
         // The process door (Marv #51): the main agent's alone. Subagents get the forwards (their bash reaches the
         // servers), never the processes.
         ctx.doors.process = self.inner.process_on;
@@ -2389,6 +2430,60 @@ impl MarvSession {
     }
 
     /// Whether this session offers the process tool (bubblewrap works, and it wasn't turned off).
+    /// The panes the Herdr door opened this session (#74), for `/peers`.
+    pub fn peers(&self) -> Vec<crate::herdr_door::Peer> {
+        self.inner.peers.list()
+    }
+
+    /// Whether this session has the Herdr door (#74).
+    pub fn herdr_offered(&self) -> bool {
+        self.inner.init.herdr.is_some()
+    }
+
+    /// The door's adapter, for `/peers` (the user's own commands, outside any turn). None without the door.
+    fn herdr_adapter(&self) -> Option<marv_mesh::herdr::HerdrAdapter> {
+        let setup = self.inner.init.herdr.as_ref()?;
+        Some(marv_mesh::herdr::HerdrAdapter::new(&setup.program, setup.own_pane.clone()))
+    }
+
+    /// Each peer with its state as Herdr reports it now (None: Herdr didn't say plainly). A peer whose pane Herdr no
+    /// longer has is forgotten here: it no longer counts against `herdr.peers`.
+    pub async fn peer_states(&self) -> Vec<(crate::herdr_door::Peer, Option<String>)> {
+        let Some(adapter) = self.herdr_adapter() else { return Vec::new() };
+        let mut listed = Vec::new();
+        for peer in self.peers() {
+            let state = match adapter.pane(&peer.pane).await {
+                Ok(p) => Some(p.status.unwrap_or_else(|| "running".into())),
+                Err(e) if marv_mesh::herdr::pane_not_found(&e) => {
+                    self.inner.peers.remove(&peer.name);
+                    continue;
+                }
+                Err(_) => None,
+            };
+            listed.push((peer, state.filter(|s| marv_mesh::herdr::plain_id(s))));
+        }
+        listed
+    }
+
+    /// `/peers read <name>`: a peer's last lines, for the user's screen only (the caller shows it through
+    /// `printable()`; it never reaches the model).
+    pub async fn read_peer(&self, name: &str, lines: u64) -> Result<String, String> {
+        let adapter = self.herdr_adapter().ok_or("This session has no Herdr door.")?;
+        let peer = self.peers().into_iter().find(|p| p.name == name).ok_or_else(|| format!("No peer named {name}."))?;
+        adapter.read(&peer.pane, lines).await.map_err(|e| e.to_string())
+    }
+
+    /// `/peers stop <name>` (the user's, never the model's): the worker is asked to leave if it's at an empty prompt,
+    /// then its pane closes (`HerdrAdapter::stop`). A pane that's already gone just forgets the peer. A worktree it
+    /// worked in stays (the user removes it once its branch is merged).
+    pub async fn stop_peer(&self, name: &str) -> Result<(crate::herdr_door::Peer, marv_mesh::herdr::Stopped), String> {
+        let adapter = self.herdr_adapter().ok_or("This session has no Herdr door.")?;
+        let peer = self.peers().into_iter().find(|p| p.name == name).ok_or_else(|| format!("No peer named {name}."))?;
+        let stopped = adapter.stop(&peer.pane, peer.kind == "marv").await.map_err(|e| e.to_string())?;
+        self.inner.peers.remove(name);
+        Ok((peer, stopped))
+    }
+
     pub fn processes_offered(&self) -> bool {
         self.inner.process_on
     }
@@ -2428,7 +2523,13 @@ impl MarvSession {
             // Whenever there's a manager, even an empty one: a server added mid-conversation is then covered without
             // changing the system prompt (the prompt cache).
             mcp: init.mcp.is_some(),
-            doors: crate::prompt::PromptDoors { github: init.github, process: self.inner.process_on, host: init.host_commands },
+            doors: crate::prompt::PromptDoors {
+                github: init.github,
+                process: self.inner.process_on,
+                host: init.host_commands,
+                herdr: init.herdr.is_some(),
+                herdr_runs: init.host_commands,
+            },
             // #98: what's pre-approved, and which folders outside the project are writable — fixed per session.
             pre_approved: init.pre_approved.clone(),
             writable: init.writable.iter().map(|d| crate::paths::shorten_home(d, &crate::paths::home_dir())).collect(),
@@ -2471,6 +2572,9 @@ impl MarvSession {
             .cloned()
             .collect();
         tools.extend(init.tools.iter().cloned());
+        if let Some(setup) = &init.herdr {
+            tools.push(Arc::new(crate::herdr_door::HerdrDoor::new(setup.clone(), self.inner.peers.clone())));
+        }
         if let Some(mesh) = &init.mesh
             && let Ok(plug) = mesh.plug(crate::mesh::parent_id())
         {
@@ -2565,8 +2669,8 @@ impl MarvSession {
                     for_model: (for_model != text).then(|| for_model.to_string()),
                     provider: s.factory.id().into(),
                     model: s.factory.model().into(),
-                    // A turn the radio started runs without yolo (#124).
-                    yolo: s.yolo && !matches!(woken, Woken::Radio(_)),
+                    // A turn the person didn't start (the radio, #124; a mesh wake, #74) runs without yolo.
+                    yolo: s.yolo && !woken.is_woken(),
                     sandbox: s.sandbox,
                     diagnostics: s.diagnostics,
                     checks: s.checks,
@@ -2745,6 +2849,46 @@ mod tests {
         .unwrap();
         assert!(s.configure(Configure { yolo: Some(true), ..Configure::default() }).is_err());
         assert!(!s.state().yolo);
+    }
+
+    /// #74: in a Herdr pane the session offers the herdr tool, after the caller's tools, and its situation says so;
+    /// elsewhere neither. Both fixed for the session (the cache).
+    #[test]
+    fn in_herdr_the_herdr_tool_is_offered_and_the_situation_says_so() {
+        let dir = std::env::temp_dir().join(format!("marv-session-herdr-{}", std::process::id()));
+        let setup = crate::herdr_door::fake::fake_setup(&dir, 4);
+        let s = session(|i| {
+            i.herdr = Some(setup.clone());
+            i.host_commands = true;
+            i.tools = vec![Arc::new(Named("mine"))];
+        })
+        .unwrap();
+        let names: Vec<&str> = s.inner.specs.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(&names[names.len() - 2..], ["mine", "herdr"]);
+        assert!(s.system_prompt().contains(crate::prompt::HERDR_SITUATION));
+        assert_eq!(s.system_prompt(), s.build_system());
+        assert!(s.inner.specs.last().unwrap().description.contains("spawn"));
+        // Without host_commands, run and spawn can't work: neither the prompt nor the tool offers them.
+        let reads = session(|i| i.herdr = Some(setup.clone())).unwrap();
+        assert!(reads.system_prompt().contains(crate::prompt::HERDR_SITUATION_READS));
+        assert!(!reads.system_prompt().contains(crate::prompt::HERDR_SITUATION));
+        let spec = reads.inner.specs.iter().find(|t| t.name == "herdr").unwrap();
+        assert!(
+            !spec.description.contains("spawn (") && spec.description.contains("isn't available here"),
+            "{}",
+            spec.description
+        );
+        let plain = session(|_| {}).unwrap();
+        assert!(!plain.inner.specs.iter().any(|t| t.name == "herdr"));
+        assert!(!plain.system_prompt().contains("Herdr pane"));
+        assert!(
+            session(|i| {
+                i.herdr = Some(setup.clone());
+                i.tools = vec![Arc::new(Named("herdr"))];
+            })
+            .is_err()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -5171,6 +5315,69 @@ mod turn_tests {
     /// #98 with #78: the config's pre-approved scopes (here web, network and the worker's mesh calls) never answer
     /// egress in a turn a mesh message woke: the inbox taints the session first, so web_fetch and mesh_send ask with
     /// `must_ask`, and the planted request sends nothing.
+    /// #74's lifecycle: a worker the door spawned outlives the turn, is listed with Herdr's state, read, and stopped
+    /// by the user (`/exit` typed for a Marv, then its pane closed); then it's gone from the list.
+    #[tokio::test]
+    async fn a_spawned_peer_outlives_the_turn_and_the_user_stops_it() {
+        let dirs = Dirs::new();
+        let herdr = dirs.dir.join("herdr");
+        let provider = Scripted::new(vec![
+            use_tools(vec![call(
+                "s1",
+                "herdr",
+                serde_json::json!({"action": "spawn", "kind": "marv", "task": "fix it", "name": "fixer"}),
+            )]),
+            say("Started."),
+        ]);
+        let session = scripted(&dirs, &provider, |init| {
+            init.herdr = Some(crate::herdr_door::fake::fake_setup(&herdr, 4));
+            init.host_commands = true;
+            init.approve = Some(answer(Decision::Yes));
+        });
+        collect(go(&session, "start a worker")).await;
+        let peers = session.peers();
+        assert_eq!(peers.iter().map(|p| (p.name.as_str(), p.pane.as_str())).collect::<Vec<_>>(), [("fixer", "w1:p5")]);
+        let states: Vec<Option<String>> = session.peer_states().await.into_iter().map(|(_, s)| s).collect();
+        assert_eq!(states, [Some("idle".to_string())]);
+        assert!(session.read_peer("fixer", 10).await.unwrap().contains("all tests pass"));
+        assert!(session.stop_peer("nobody").await.is_err());
+        let (_, stopped) = session.stop_peer("fixer").await.unwrap();
+        assert_eq!(stopped, marv_mesh::herdr::Stopped::Closed);
+        assert!(session.peers().is_empty());
+        let log = crate::herdr_door::fake::fake_herdr_log(&herdr);
+        let at = |line: &str| log.iter().position(|l| l == line).unwrap_or_else(|| panic!("{line}: {log:?}"));
+        assert!(at("pane send-text w1:p5 /exit") < at("pane close w1:p5"));
+    }
+
+    /// #74: a peer whose pane Herdr no longer has (the user closed it, its program exited) can always be let go:
+    /// `/peers stop` forgets it (Herdr's pane_not_found counts as stopped), and listing forgets it too, so dead
+    /// panes never use up `herdr.peers`.
+    #[tokio::test]
+    async fn a_peer_whose_pane_is_gone_is_forgotten_and_frees_its_slot() {
+        let dirs = Dirs::new();
+        let herdr = dirs.dir.join("herdr");
+        let run = |id: &str| use_tools(vec![call(id, "herdr", serde_json::json!({"action": "run", "command": "sleep 9"}))]);
+        let provider = Scripted::new(vec![run("r1"), run("r2"), say("Two."), run("r3"), say("Three.")]);
+        let session = scripted(&dirs, &provider, |init| {
+            init.herdr = Some(crate::herdr_door::fake::fake_setup(&herdr, 2));
+            init.host_commands = true;
+            init.approve = Some(answer(Decision::Yes));
+        });
+        collect(go(&session, "two commands")).await;
+        let panes: Vec<String> = session.peers().into_iter().map(|p| p.pane).collect();
+        assert_eq!(panes, ["w1:p5", "w1:p6"]);
+        crate::herdr_door::fake::close_pane_outside(&herdr, "w1:p5");
+        crate::herdr_door::fake::close_pane_outside(&herdr, "w1:p6");
+        let first = session.peers()[0].name.clone();
+        let (_, stopped) = session.stop_peer(&first).await.unwrap();
+        assert_eq!(stopped, marv_mesh::herdr::Stopped::Gone);
+        assert!(session.peer_states().await.is_empty(), "the other gone pane is forgotten when listed");
+        assert!(session.peers().is_empty());
+        // Both slots are free again: a third command runs.
+        collect(go(&session, "a third")).await;
+        assert_eq!(session.peers().len(), 1);
+    }
+
     #[tokio::test]
     async fn pre_approved_scopes_dont_cover_egress_in_a_woken_turn() {
         use crate::mesh::{WakeBy, parent_id};

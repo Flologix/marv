@@ -252,7 +252,10 @@ fn a_tx_reaches_the_other_marvs_model_fenced_and_wakes_it() {
     wait_for("alpha in beta's strip", || beta.screen().contains("alphaidle"));
 
     alpha.type_line("/tx @beta tests pass on main");
-    wait_for("alpha's line", || alpha.screen().contains("✻Radio→@beta:testspassonmain"));
+    // The screen log holds the terminal's incremental redraws: a cell already showing the right letter isn't written
+    // again, so the line's full text may never appear in one piece (with /peers in the palette, "tests pass" came out
+    // as "testspss"). Its start is enough here: what reached beta is checked in full below.
+    wait_for("alpha's line", || alpha.screen().contains("✻Radio→@beta:"));
     wait_for("beta's model asked", || beta_model.requests().iter().any(|r| r.path.ends_with("/chat/completions")));
     let request = beta_model.requests().into_iter().find(|r| r.path.ends_with("/chat/completions")).unwrap();
     let body: Value = serde_json::from_str(&request.body).unwrap();

@@ -27,6 +27,7 @@ pub mod event_queue;
 pub mod feedback;
 pub mod frontmatter;
 pub mod git;
+pub mod herdr_door;
 pub mod hooks;
 pub mod instructions;
 pub mod mcp_install;

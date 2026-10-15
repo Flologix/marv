@@ -57,7 +57,9 @@ impl Drop for Mesh {
 
 /// This process's switchboard (`None` without `XDG_RUNTIME_DIR`). An error names what's wrong (a bad
 /// `MARV_MESH_NAME`, a name a live Marv has); the caller carries on without the mesh. Needs a Tokio runtime.
-pub fn start(env: &marv_mcp::Env, root: &Path) -> Result<Option<Mesh>, String> {
+/// `outside`: the project and the sandbox's writable folders, where the `herdr` the pane receptacles run is never taken
+/// from (`herdr_program`).
+pub fn start(env: &marv_mcp::Env, root: &Path, outside: &[std::path::PathBuf]) -> Result<Option<Mesh>, String> {
     let Some(dir) = mesh_dir(env) else { return Ok(None) };
     let chosen = env.contains_key("MARV_MESH_NAME");
     let mut name = mesh_name(env, root).map_err(|e| e.to_string())?;
@@ -76,8 +78,9 @@ pub fn start(env: &marv_mcp::Env, root: &Path) -> Result<Option<Mesh>, String> {
     let cancel = CancellationToken::new();
     let handle = marv_session::mesh::start(&name, env, cancel.clone()).ok_or("no XDG_RUNTIME_DIR")?;
     let pane = herdr_target(env).map(|t| t.pane_id);
-    if let Some(own) = &pane {
-        handle.set_herdr(Arc::new(HerdrAdapter::new("herdr", Some(own.clone()))));
+    // No herdr found the safe way: no Herdr receptacles, rather than a PATH lookup that could run a planted one.
+    if let (Some(own), Some(program)) = (&pane, herdr_program(env, outside)) {
+        handle.set_herdr(Arc::new(HerdrAdapter::new(program, Some(own.clone()))));
     }
     Ok(Some(Mesh { handle, name, root: root.to_path_buf(), pane, dir, door: None, radio: None, cancel }))
 }
@@ -145,6 +148,13 @@ fn ls_lines(peers: &[PeerSwitchboard]) -> Vec<String> {
         .collect()
 }
 
+/// The `herdr` the mesh runs (pane receptacles, `marv mesh ls`), the doors' way: from an absolute PATH entry only, and
+/// never from inside `outside` (`marv_sandbox::host_env::host_program`). None: Marv offers no Herdr panes.
+pub fn herdr_program(env: &marv_mcp::Env, outside: &[std::path::PathBuf]) -> Option<std::path::PathBuf> {
+    let outside: Vec<&Path> = outside.iter().map(std::path::PathBuf::as_path).collect();
+    marv_sandbox::host_env::host_program("herdr", env.get("PATH").map(String::as_str), &outside)
+}
+
 /// `marv mesh ls`. Returns the exit code.
 pub async fn ls() -> i32 {
     let env = env();
@@ -163,8 +173,11 @@ pub async fn ls() -> i32 {
         println!("{line}");
     }
     // In Herdr: the agent panes a Marv here can be wired to (reading Herdr's list changes nothing).
+    // Never a herdr from the folder `marv mesh ls` runs in (a project's node_modules/.bin, `.` on PATH).
+    let here: Vec<std::path::PathBuf> = std::env::current_dir().ok().into_iter().collect();
     if let Some(target) = herdr_target(&env)
-        && let Ok(panes) = HerdrAdapter::new("herdr", None).agents().await
+        && let Some(program) = herdr_program(&env, &here)
+        && let Ok(panes) = HerdrAdapter::new(program, None).agents().await
         && !panes.is_empty()
     {
         println!("\nHerdr agent panes:");

@@ -16,6 +16,8 @@
 //! - `tests/images.rs`: images (not built yet: ignored);
 //! - `tests/github.rs`, `tests/host.rs`: the doors out of the sandbox (Marv #47, #52): what gh can never do, what
 //!   asks, tokens kept out of everything; host commands asked every time and only where someone approves each one.
+//! - `tests/herdr.rs`: the Herdr door (#74): the sandbox can't reach Herdr, reads fenced and tainting, commands and
+//!   spawns asked every time and only at a terminal, a worker no stronger than its parent, the peer limit.
 //!
 //! Every guard's doc comment says how it was proven: "reverted X → this test failed". A guard whose code isn't
 //! written yet is `#[ignore = "needs …"]` with the body it will run.

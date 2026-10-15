@@ -166,6 +166,9 @@ pub struct Doors {
     /// The github tool's writes and sensitive reads (#47): the main agent's, where the session offers the tool; a
     /// subagent only reads.
     pub github: bool,
+    /// The Herdr door's commands and spawns (#74): only where the user approves each one at a terminal (the TUI), as
+    /// `host`. A subagent, `marv -p` and an SDK session without `host_commands` read panes at most.
+    pub herdr: bool,
 }
 
 /// For a sandboxed bash command: a running process's forwarded port, and where its socket folder is (Marv #51).
@@ -356,9 +359,10 @@ pub struct ToolContext {
     pub sandbox: Arc<Sandbox>,
     /// Yolo mode: calls whose tool says they're safe (`auto_safe`) run without asking.
     pub yolo: bool,
-    /// Automatic approval is off (marv-rs #124: a turn the mesh radio started): yolo doesn't apply, a URL prefix
-    /// approved earlier doesn't either, and every call that asks is asked `once`, so neither a remembered "always"
-    /// nor a worktree subagent's automatic yes answers it. Only a person at this Marv does. Subagents inherit it.
+    /// Automatic approval is off: a turn the person at this Marv didn't start (a mesh wake, #78; the radio, #124).
+    /// Yolo doesn't apply, a URL prefix approved earlier doesn't either, and every call that asks is asked `once`, so
+    /// neither a remembered "always" nor a worktree subagent's automatic yes answers it (the Herdr door's light actions
+    /// included, #74). Only a person at this Marv does. Subagents inherit it.
     pub no_auto_approval: bool,
     /// Set by `run_tool` for a call that runs without asking: bash then sees the project's `.git` read-only, and the
     /// edit tools re-check `.git` at apply time.
