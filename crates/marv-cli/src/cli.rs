@@ -71,6 +71,16 @@ pub struct Cli {
     #[arg(long = "approve", value_name = "SCOPE")]
     pub approve: Vec<String>,
 
+    /// With --approve, in -p: also approve egress (web, network, MCP, mesh, GitHub) after the session read
+    /// untrusted content. Without it, those calls are refused.
+    #[arg(long = "approve-tainted")]
+    pub approve_tainted: bool,
+
+    /// With --approve files, in -p: also approve writes to protected paths (.git, .env*, AGENTS.md, .marv/…).
+    /// Without it, those writes are refused.
+    #[arg(long = "approve-protected")]
+    pub approve_protected: bool,
+
     /// Steps before the turn stops (0 never stops; default: your config's maxSteps).
     #[arg(long = "max-steps", value_name = "N")]
     pub max_steps: Option<u32>,
@@ -248,6 +258,9 @@ mod tests {
         ]);
         assert_eq!(cli.output, OutputFormat::StreamJson);
         assert_eq!(cli.approve, vec!["git_write", "mesh:agent.parent.inbox"]);
+        assert!(!cli.approve_tainted && !cli.approve_protected);
+        let opted = parse(&["-p", "x", "--approve", "web", "--approve-tainted", "--approve-protected"]);
+        assert!(opted.approve_tainted && opted.approve_protected);
         assert_eq!((cli.max_steps, cli.model.as_deref(), cli.continue_), (Some(0), Some("m"), true));
     }
 

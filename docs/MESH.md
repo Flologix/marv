@@ -34,7 +34,7 @@ The mesh gives sandboxed agents **deliberate, wired, auditable lines out**, with
 ## Rules
 1. **Nothing is wired by default.**
    - A new wire needs the user's approval in the TUI, or an explicit `marv mesh wire a -> b:inbox`. When an agent's `mesh_send` or `mesh_call` needs the wire, that's one prompt for the message and the wire together ("Yes (wire it)" or "No").
-   - Headless runs need `--approve mesh:<receptacle>`.
+   - Headless runs need `--approve mesh:<receptacle>`. Once a message has arrived (the session is tainted), sending also needs `--approve-tainted`.
    - Yolo never wires anything by itself.
 2. **Mesh text is data.** Every message that arrives through the mesh is `Provenance::Mesh`. It taints the session (`docs/SECURITY.md`), and the model sees it fenced as a message from another agent, not as instructions.
    - An agent reads its inbox when a turn starts and between steps. By default a message that arrives while it's idle waits for the next turn.
