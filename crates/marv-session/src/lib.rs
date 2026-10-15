@@ -37,6 +37,7 @@ pub mod paths;
 pub mod processes;
 pub mod prompt;
 pub mod provenance;
+pub mod radio;
 pub mod runner;
 pub mod sdk;
 pub mod session;

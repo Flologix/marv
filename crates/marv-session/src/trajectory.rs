@@ -149,6 +149,9 @@ pub enum TrajectoryRecord {
         checks: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         mcp_tools: Option<ModeChoice>,
+        /// marv-rs #124: the radio message that started this turn (no user message), and the turn's hop.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        radio_wake: Option<RadioWake>,
     },
     /// Deferred MCP tools (#14): the note at the start of the turn's message.
     McpNote { turn: String, text: String },
@@ -320,6 +323,10 @@ pub enum TrajectoryRecord {
     /// marv-rs #124: a radio event (a join, a leave, `lost`, `silent`, a drop, a refused frame; never a heartbeat or a
     /// title).
     Radio(marv_mesh::radio::RadioRecord),
+    /// marv-rs #124: a radio message sent or received, delivered or refused: a `mesh` record with `radio: true`, its
+    /// kind, addressees, hop, `by` and size, never its text.
+    #[serde(rename = "mesh")]
+    RadioFrame(marv_mesh::radio::RadioFrameRecord),
     /// marv-rs: the session became tainted (web, MCP, mesh or image content entered its context).
     Taint {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -460,6 +467,17 @@ impl TrajectorySink for MeshSink {
     fn radio(&self, record: marv_mesh::radio::RadioRecord) {
         self.0.write(&TrajectoryRecord::Radio(record));
     }
+    fn radio_frame(&self, record: marv_mesh::radio::RadioFrameRecord) {
+        self.0.write(&TrajectoryRecord::RadioFrame(record));
+    }
+}
+
+/// The radio message that started a turn (#124): its id and sender (checked names), and the turn's hop.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RadioWake {
+    pub id: String,
+    pub from: String,
+    pub hop: u32,
 }
 
 /// Turns one agent's loop events into records, plus timings. One per agent per turn.

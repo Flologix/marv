@@ -6,6 +6,10 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+### Added
+
+- **The mesh radio, phase 2: short messages (#124). Still opt-in, off by default.** `/tx @name text` sends one of your Marvs on the radio a message (`@a @b` for several), `/tx text` sends it to all of them; the model gets `radio_tx` for the same, in a conversation that started with the radio on. What arrives flashes on the strip for 10 s, is listed in `/radio`, and reaches the other Marv's model at its next step fenced as another agent's data (`<radio-message …>`), tainting that conversation: its egress asks from then on, in yolo too. With mesh wake on, a message addressed to an idle Marv starts a turn in which nothing is approved automatically (yolo, "always" and pre-approved scopes don't apply; everything that would ask, asks); a message to all never wakes. Limits: 2 KB a message (refused, never cut), 20 a minute per sender in bursts of 5, 3 wakes a minute per sender and 10 in 10 minutes overall; a Marv that stops reading is told "isn't keeping up" instead of holding anyone up. Every message is logged to the trajectory without its text. A turn a wired inbox woke leaves radio messages unread (it may auto-approve); a peer whose queue stays full for 30 s is dropped. Subagents and `marv -p` still aren't on the radio. Requests with automatic replies come in phase 3.
+
 ### Changed
 
 - **Marv looks on your disk first for "where is" and "how big is" questions.** The system prompt now says to find or measure something on this machine (`find`, `du`, `wc -l`) before going to the network: asked how many lines of code Marv has, a model found the GitHub URL in the installed binary and spent 20 steps on a clone the sandbox couldn't make, then estimated from the GitHub API, while the source was already on disk (#81).

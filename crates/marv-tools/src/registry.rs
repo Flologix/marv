@@ -188,7 +188,8 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
     let protected = tool.protected_target(input, ctx);
     // A web request under a URL prefix the user approved after the taint (docs/SECURITY.md) runs as approved.
     let egress_url = tool.egress_url(input).filter(|_| ctx.taint.is_tainted());
-    let prefix_approved = egress_url.as_deref().is_some_and(|url| ctx.taint.prefix_approved(url));
+    // Not in a turn without automatic approval (#124): that prefix is a remembered answer too.
+    let prefix_approved = !ctx.no_auto_approval && egress_url.as_deref().is_some_and(|url| ctx.taint.prefix_approved(url));
     let must_ask = protected.is_some() || (ctx.taint.must_ask(tool.kind(), network) && !prefix_approved);
     let gated = must_ask || (!prefix_approved && tool.needs_approval(input).unwrap_or(tool.kind() != ToolKind::Read));
     let interrupted = |approval: Approval| {
@@ -241,9 +242,11 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
             // the host later. So no "always" is offered, no remembered or config-seeded "files" covers it, and yolo
             // (which the session refuses there anyway) doesn't run it.
             let home_write = home_file_write(tool.kind(), &scope.key, ctx);
-            let once = tool.once(input, ctx) || home_write;
+            // A turn without automatic approval (#124, a turn the radio started) asks every call `once`: no
+            // remembered "always" and no worktree subagent's automatic yes answers it.
+            let once = tool.once(input, ctx) || home_write || ctx.no_auto_approval;
             // Yolo: a call the tool vouches for runs without asking, confined (bash then can't touch .git).
-            if ctx.yolo && !must_ask && !home_write && tool.auto_safe(input, ctx) {
+            if ctx.yolo && !ctx.no_auto_approval && !must_ask && !home_write && tool.auto_safe(input, ctx) {
                 if !checkpointed().await {
                     return interrupted(Approval::Interrupted);
                 }
@@ -537,6 +540,23 @@ mod tests {
         let egress = run_tool(&call(r#"{"text": "x"}"#), &asking, &tools(ToolKind::Egress, true)).await;
         assert_eq!(egress.result.output, "x");
         assert!(approver.1.lock().unwrap()[0].must_ask);
+    }
+
+    /// #124: with automatic approval off (a turn the radio started), yolo doesn't run what it vouches for: it's asked,
+    /// once (no "always"), and a read still runs without asking.
+    #[tokio::test]
+    async fn without_automatic_approval_yolo_asks_once() {
+        let approver = Arc::new(Answer(Decision::Yes, Mutex::new(vec![])));
+        let off = ToolContext { yolo: true, no_auto_approval: true, approver: Some(approver.clone()), ..ctx() };
+        let asked = run_tool(&call(r#"{"text": "x"}"#), &off, &tools(ToolKind::Write, true)).await;
+        assert_eq!(asked.result.output, "x", "approved by the person, not confined by yolo");
+        assert_eq!(asked.result.approval, Some(Approval::Decided(Decision::Yes)));
+        let requests = approver.1.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].once, "never answered from or added to a remembered always");
+        let read = run_tool(&call(r#"{"text": "y"}"#), &off, &tools(ToolKind::Read, false)).await;
+        assert_eq!(read.result.output, "y");
+        assert_eq!(approver.1.lock().unwrap().len(), 1, "a read doesn't ask");
     }
 
     #[tokio::test]

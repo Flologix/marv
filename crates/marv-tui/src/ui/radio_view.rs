@@ -1,13 +1,16 @@
-//! The mesh radio (marv-rs #124, phase 1: presence; new in marv-rs). Two pieces:
+//! The mesh radio (marv-rs #124, phases 1 and 2: presence and messages; new in marv-rs). Two pieces:
 //!
 //! - [`strip`]: one line above the prompt while the radio is on, never more:
 //!   ` ◉ radio · 58a7 working "fix the login test" · docs-11c2 idle · api-3f9a waiting · +1`. A name is shown short
 //!   (`58a7` for `flologix-58a7`) when it shares this Marv's project prefix and the rest is unique; `silent` is
-//!   greyed; a Marv that left shows `left` (or `left (lost)`) for a moment. Names that don't fit become `+N`.
+//!   greyed; a Marv that left shows `left` (or `left (lost)`) for a moment. Names that don't fit become `+N`. A
+//!   message just received flashes there for [`FLASH_MS`] instead ([`flash`]): ` ◉ radio · ← 58a7: tests pass  (/radio)`.
 //! - [`RadioPanel`]: `/radio`'s view, the roster with full names, panes, states, titles and how long each state has
-//!   lasted. Esc closes it.
+//!   lasted, then the traffic: the last messages sent and received (as many as fit, newest last), who wrote them
+//!   (`(user)` is shown, never believed) and whether one was refused. Esc closes it.
 //!
-//! Titles and projects are other Marvs' users' words: drawn through `printable()`, shown here only.
+//! Titles, projects and messages are other Marvs' (or their users' or models') words: drawn through `printable()`,
+//! shown here only.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use marv_core::printable;
@@ -20,10 +23,51 @@ use unicode_width::UnicodeWidthStr;
 
 use super::select::truncate_end;
 use super::theme;
-use crate::view::{RadioPeer, RadioState, RadioView};
+use crate::view::{RadioPeer, RadioState, RadioTraffic, RadioView};
 
 /// The strip's marker.
 pub const MARK: &str = "◉";
+
+/// A message received flashes on the strip this long (§3.1).
+pub const FLASH_MS: u64 = 10_000;
+
+/// The newest received message the strip may flash (not one this Marv refused).
+pub fn newest_received(view: &RadioView) -> Option<&RadioTraffic> {
+    view.traffic.iter().rev().find(|t| !t.outgoing && t.refused.is_none())
+}
+
+/// The strip while `message` flashes: ` ◉ radio · ← 58a7 (user): tests pass on main now   (/radio)`, one line.
+pub fn flash(view: &RadioView, message: &RadioTraffic, width_cols: u16) -> Line<'static> {
+    let from = message.peers.first().map(|p| short_name(view, p)).unwrap_or_default();
+    let by = if message.by == "user" { " (user)" } else { "" };
+    let hint = "  (/radio)";
+    let head = vec![
+        Span::styled(format!(" {MARK} radio"), Style::new().fg(theme::ACCENT)),
+        Span::styled(" · ", Style::new().fg(theme::DIM)),
+        Span::styled(format!("← {}{by}: ", printable(&from)), Style::new().add_modifier(Modifier::BOLD)),
+    ];
+    let text = printable(&message.text).split_whitespace().collect::<Vec<_>>().join(" ");
+    let room = (width_cols as usize).saturating_sub(width(&head) + hint.width());
+    let mut spans = head;
+    spans.push(Span::raw(truncate_text(&text, room)));
+    spans.push(Span::styled(hint, Style::new().fg(theme::DIM)));
+    truncate_end(Line::from(spans), width_cols)
+}
+
+/// `text` in at most `cols` columns, cut with `…`.
+fn truncate_text(text: &str, cols: usize) -> String {
+    if text.width() <= cols {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    for c in text.chars() {
+        if out.width() + unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) + 1 > cols {
+            break;
+        }
+        out.push(c);
+    }
+    format!("{out}…")
+}
 
 /// `name` as the strip shows it: without this Marv's own `<project>-` prefix when what's left is unique.
 pub fn short_name(view: &RadioView, name: &str) -> String {
@@ -108,7 +152,34 @@ impl RadioPanel {
         key.code == KeyCode::Esc
     }
 
+    /// One traffic line: `12s → @58a7  tests pass`, `3m ← docs-11c2 (user)  anyone on README?`, and why it was
+    /// refused, if it was.
+    fn traffic_line(view: &RadioView, t: &RadioTraffic, now_ms: u64) -> Line<'static> {
+        let who = if t.outgoing {
+            let to = t.peers.iter().map(|p| if p == "*" { "all".to_string() } else { format!("@{}", short_name(view, p)) });
+            format!("→ {}", to.collect::<Vec<_>>().join(" "))
+        } else {
+            let from = t.peers.first().map(|p| short_name(view, p)).unwrap_or_default();
+            format!("← {from}{}", if t.by == "user" { " (user)" } else { "" })
+        };
+        let text = printable(&t.text).split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut spans = vec![
+            Span::styled(format!("  {:>4} ", age(t.at_ms, now_ms)), Style::new().fg(theme::DIM)),
+            Span::styled(format!("{}  ", printable(&who)), Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(text),
+        ];
+        if let Some(why) = &t.refused {
+            spans.push(Span::styled(format!("  (refused: {})", printable(why)), Style::new().fg(theme::WARNING)));
+        }
+        Line::from(spans)
+    }
+
+    /// The view's lines; with `rows`, the oldest traffic goes first so the rest fits.
     fn lines(view: &RadioView, now_ms: u64) -> Vec<Line<'static>> {
+        Self::lines_in(view, now_ms, usize::MAX)
+    }
+
+    fn lines_in(view: &RadioView, now_ms: u64, rows: usize) -> Vec<Line<'static>> {
         let count = view.peers.iter().filter(|p| !matches!(p.state, RadioState::Left | RadioState::Lost)).count() + 1;
         let mut lines = vec![
             Line::from(vec![
@@ -138,7 +209,20 @@ impl RadioPanel {
             lines.push(Line::styled("  No other Marv is on the radio yet.", Style::new().fg(theme::DIM)));
         }
         lines.push(Line::default());
-        lines.push(Line::styled("/radio off to leave · Esc to close", Style::new().fg(theme::DIM)));
+        lines.push(Line::styled("TRAFFIC", Style::new().fg(theme::DIM)));
+        // What's left after the help line and its gap goes to the newest messages.
+        let room = rows.saturating_sub(lines.len() + 2).max(1);
+        if view.traffic.is_empty() {
+            lines.push(Line::styled("  Nothing said yet.", Style::new().fg(theme::DIM)));
+        } else {
+            let skip = view.traffic.len().saturating_sub(room);
+            lines.extend(view.traffic.iter().skip(skip).map(|t| Self::traffic_line(view, t, now_ms)));
+        }
+        lines.push(Line::default());
+        lines.push(Line::styled(
+            "/tx @name text · /tx text (all) · /radio off to leave · Esc to close",
+            Style::new().fg(theme::DIM),
+        ));
         lines
     }
 
@@ -149,7 +233,8 @@ impl RadioPanel {
 
     pub fn render(view: &RadioView, now_ms: u64, area: Rect, buf: &mut Buffer) {
         let inner = area.width.saturating_sub(4);
-        let lines: Vec<Line> = Self::lines(view, now_ms).into_iter().map(|l| truncate_end(l, inner)).collect();
+        let rows = area.height.saturating_sub(2) as usize;
+        let lines: Vec<Line> = Self::lines_in(view, now_ms, rows).into_iter().map(|l| truncate_end(l, inner)).collect();
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(Style::new().fg(theme::ACCENT))
@@ -167,7 +252,7 @@ mod tests {
     }
 
     fn view(peers: Vec<RadioPeer>) -> RadioView {
-        RadioView { on: true, me: "flologix-c792".into(), my_title: "mine".into(), peers }
+        RadioView { on: true, me: "flologix-c792".into(), my_title: "mine".into(), peers, traffic: Vec::new() }
     }
 
     #[test]
@@ -212,5 +297,50 @@ mod tests {
         assert!(screen.contains("flologix-c792  you"), "{screen}");
         assert!(screen.contains("flologix-58a7  w3_y-p1  working    \"fix the login test\"  12m"), "{screen}");
         assert!(screen.contains("/radio off to leave · Esc to close"), "{screen}");
+        assert!(screen.contains("Nothing said yet."), "{screen}");
+    }
+
+    fn said(id: &str, outgoing: bool, peers: &[&str], by: &str, text: &str, at_ms: u64) -> RadioTraffic {
+        RadioTraffic {
+            at_ms,
+            id: id.into(),
+            outgoing,
+            peers: peers.iter().map(|p| p.to_string()).collect(),
+            by: by.into(),
+            text: text.into(),
+            refused: None,
+        }
+    }
+
+    #[test]
+    fn traffic_shows_newest_last_with_who_and_refusals_and_fits() {
+        let mut v = view(vec![peer("flologix-58a7", RadioState::Idle, ""), peer("docs-11c2", RadioState::Idle, "")]);
+        v.traffic =
+            (0..30).map(|i| said(&format!("docs-11c2:{i}"), false, &["docs-11c2"], "user", &format!("old {i}"), 0)).collect();
+        v.traffic.push(said("flologix-c792:1", true, &["flologix-58a7"], "user", "tests pass\x1b[2J on main", 60_000));
+        let mut refused = said("flologix-c792:2", true, &["*"], "model", "anyone?", 60_000);
+        refused.refused = Some("docs-11c2: too many messages".into());
+        v.traffic.push(refused);
+        let area = Rect::new(0, 0, 100, 16);
+        let mut buf = Buffer::empty(area);
+        RadioPanel::render(&v, 120_000, area, &mut buf);
+        let screen: String =
+            (0..area.height).map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect::<String>() + "\n").collect();
+        assert!(screen.contains("TRAFFIC"), "{screen}");
+        assert!(screen.contains("1m → @58a7  tests pass on main"), "{screen}");
+        assert!(screen.contains("→ all  anyone?  (refused: docs-11c2: too many messages)"), "{screen}");
+        assert!(screen.contains("← docs-11c2 (user)  old 29") && !screen.contains("old 0 "), "{screen}");
+        assert!(screen.contains("Esc to close"), "the help line still fits: {screen}");
+        assert!(!screen.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn a_received_message_flashes_in_one_line() {
+        let v = view(vec![peer("flologix-58a7", RadioState::Idle, "")]);
+        let m = said("flologix-58a7:3", false, &["flologix-58a7"], "model", "tests pass on main now\n\x1b]0;x\x07", 0);
+        assert_eq!(flash(&v, &m, 80).to_string(), " ◉ radio · ← 58a7: tests pass on main now  (/radio)");
+        let narrow = flash(&v, &said("flologix-58a7:4", false, &["flologix-58a7"], "user", &"word ".repeat(40), 0), 50);
+        assert!(narrow.to_string().contains("← 58a7 (user): word") && narrow.to_string().ends_with("…  (/radio)"), "{narrow}");
+        assert!(narrow.to_string().width() <= 50);
     }
 }
