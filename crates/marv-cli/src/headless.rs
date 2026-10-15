@@ -17,6 +17,11 @@
 //! one tools-off request to say what it finished, what's left and the next step; that is the reply, and the exit code
 //! is still 2. marv-rs: `--approve mesh:<receptacle>`
 //! pre-approves wires to that receptacle (docs/MESH.md); it never covers anything else, and yolo never wires.
+//! marv-rs: a `must_ask` request (docs/SECURITY.md: egress once the session read untrusted content, a write to a
+//! protected path) is one Marv asks a person about every time, even in yolo. `--approve` alone no longer answers it:
+//! tainted egress also needs `--approve-tainted`, a protected-path write `--approve-protected`. Without them the call
+//! is refused like any other (listed in `refused`, exit 3) with a stderr line naming the flag. Subagents reach the
+//! same [`ScopeApprover`], so the same rule holds for them.
 //! A mesh message never starts a turn here (`mesh.wake`, #78, is the TUI's): the one turn reads what's in the inbox
 //! when it starts and between steps, and anything later waits for whoever runs the next one.
 //!
@@ -48,37 +53,82 @@ pub enum ExitCode {
 
 /// The scope names and their matching live in `marv_session::approvals` (`APPROVE_PREFIXES` there) — the same
 /// list the config's `"approve"` and the TUI's `--approve` use (#98).
-/// `marv -p --approve`'s approver: yes for the listed scopes, unavailable for the rest.
-#[derive(Debug, Clone)]
+/// `marv -p --approve`'s approver: yes for the listed scopes, unavailable for the rest. A request Marv always asks a
+/// person about (`must_ask`) needs its opt-in flag as well: `tainted` (`--approve-tainted`) for egress once the
+/// session read untrusted content, `protected` (`--approve-protected`) for a write to a protected path.
+#[derive(Debug, Clone, Default)]
 pub struct ScopeApprover {
     pub prefixes: Vec<String>,
+    pub tainted: bool,
+    pub protected: bool,
+}
+
+/// How much of a refused call's label its stderr line shows.
+const LABEL_CHARS: usize = 120;
+
+impl ScopeApprover {
+    fn covers(&self, key: &str) -> bool {
+        // The same matching the seeded "always" scopes use (#98): the listed prefixes cover their keys, and a
+        // background process or a git command with the network needs network as well.
+        marv_session::approvals::prefix_covers(&self.prefixes, key)
+    }
+
+    /// Why a request its scopes cover is still refused (a `must_ask` one without its opt-in flag), for stderr.
+    pub fn must_ask_refusal(&self, request: &ApprovalRequest) -> Option<String> {
+        // One line on stderr whatever the label holds (a multi-line command): its first line, cut short.
+        let line = request.label.lines().next().unwrap_or_default();
+        let first: String = line.chars().take(LABEL_CHARS).collect();
+        let cut = first.len() < request.label.trim_end().len();
+        let what = format!("{} ({first}{})", request.tool, if cut { " …" } else { "" });
+        if request.protected.is_some() {
+            return (!self.protected).then(|| {
+                format!("refused {what}: it writes a protected path; add --approve-protected to approve that in marv -p")
+            });
+        }
+        (request.must_ask && !self.tainted).then(|| {
+            format!(
+                "refused {what}: the session read untrusted content, so egress needs --approve-tainted as well as \
+                 --approve"
+            )
+        })
+    }
 }
 
 #[async_trait]
 impl Approver for ScopeApprover {
     async fn approve(&self, request: ApprovalRequest) -> Decision {
-        // The same matching the seeded "always" scopes use (#98): the listed prefixes cover their keys, and a
-        // background process with the network needs process and network both.
-        if marv_session::approvals::prefix_covers(&self.prefixes, &request.scope.key) {
-            Decision::Yes
-        } else {
-            Decision::Unavailable
+        if !self.covers(&request.scope.key) {
+            return Decision::Unavailable;
         }
+        if let Some(why) = self.must_ask_refusal(&request) {
+            eprintln!("marv: {}", printable(&why));
+            return Decision::Unavailable;
+        }
+        Decision::Yes
     }
 }
 
 /// The approver (`None`: nobody approves) and the receptacles `--approve mesh:<r>` pre-approves.
 pub type HeadlessApprovals = (Option<Arc<dyn Approver>>, Vec<marv_mesh::ReceptacleName>);
 
+/// The opt-ins for what `--approve` alone never answers (`--approve-tainted`, `--approve-protected`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MustAsk {
+    pub tainted: bool,
+    pub protected: bool,
+}
+
 /// The `--approve` list as an approver (`None` for an empty list) plus the pre-approved mesh receptacles. An
 /// unknown name is an error (exit 1), as Marv's `runHeadless` checked before anything ran. The scope names and
 /// their matching live in `marv_session::approvals` — the same list the config's `"approve"` and the TUI's
 /// `--approve` use (#98).
-pub fn build_approver(names: &[String]) -> Result<HeadlessApprovals, String> {
+pub fn build_approver(names: &[String], must_ask: MustAsk) -> Result<HeadlessApprovals, String> {
     let (mesh, mut prefixes) = marv_session::approvals::parse_approvals(names)?;
     // A pre-approved receptacle's mesh tool calls are approved too (scope `mesh:<receptacle>:<mode>`).
     prefixes.extend(mesh.iter().map(|r| format!("mesh:{r}:")));
-    let approver = (!prefixes.is_empty()).then(|| Arc::new(ScopeApprover { prefixes }) as Arc<dyn Approver>);
+    let approver = (!prefixes.is_empty()).then(|| {
+        Arc::new(ScopeApprover { prefixes, tainted: must_ask.tainted, protected: must_ask.protected }) as Arc<dyn Approver>
+    });
     Ok((approver, mesh))
 }
 
@@ -316,12 +366,14 @@ pub struct HeadlessOptions {
     pub model: Option<String>,
     pub max_steps: Option<u32>,
     pub approve: Vec<String>,
+    /// `--approve-tainted` and `--approve-protected`.
+    pub must_ask: MustAsk,
 }
 
 /// Runs one headless turn and writes the result to stdout. Returns the exit code.
 pub async fn run_headless(options: HeadlessOptions) -> ExitCode {
     use marv_session::config::{ConfigStore, Env, default_config_dir, migrate_legacy_config, resolve_config};
-    let (approve, mesh_grants) = match build_approver(&options.approve) {
+    let (approve, mesh_grants) = match build_approver(&options.approve, options.must_ask) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("{e}");
@@ -516,13 +568,13 @@ mod tests {
     // Marv's tests/github-tool.test.ts, "marv -p".
     #[tokio::test]
     async fn approve_github_approves_writes_and_sensitive_reads_nothing_else() {
-        let (a, _) = build_approver(&["github".into()]).unwrap();
+        let (a, _) = build_approver(&["github".into()], MustAsk::default()).unwrap();
         let a = a.unwrap();
         assert_eq!(a.approve(request("github:pr merge")).await, Decision::Yes);
         assert_eq!(a.approve(request("github:api sensitive")).await, Decision::Yes);
         assert_eq!(a.approve(request("bash:echo")).await, Decision::Unavailable);
         assert_eq!(a.approve(request("bash:host:echo")).await, Decision::Unavailable);
-        let (none, _) = build_approver(&["network".into()]).unwrap();
+        let (none, _) = build_approver(&["network".into()], MustAsk::default()).unwrap();
         assert_eq!(none.unwrap().approve(request("github:pr merge")).await, Decision::Unavailable);
     }
 
@@ -543,18 +595,18 @@ mod tests {
 
     #[tokio::test]
     async fn approve_scopes_match_prefixes() {
-        let (none, _) = build_approver(&[]).unwrap();
+        let (none, _) = build_approver(&[], MustAsk::default()).unwrap();
         assert!(none.is_none());
-        let (a, _) = build_approver(&["git_write".into()]).unwrap();
+        let (a, _) = build_approver(&["git_write".into()], MustAsk::default()).unwrap();
         let a = a.unwrap();
         assert_eq!(a.approve(request("bash:git:commit")).await, Decision::Yes);
         // git_write alone never covers a command with the network: a push needs network too.
         assert_eq!(a.approve(request("bash:net+git:git push")).await, Decision::Unavailable);
         assert_eq!(a.approve(request("bash:net:git:;curl x")).await, Decision::Unavailable);
         assert_eq!(a.approve(request("bash:net:curl")).await, Decision::Unavailable);
-        let (both, _) = build_approver(&["git_write".into(), "network".into()]).unwrap();
+        let (both, _) = build_approver(&["git_write".into(), "network".into()], MustAsk::default()).unwrap();
         assert_eq!(both.unwrap().approve(request("bash:net+git:git push")).await, Decision::Yes);
-        let (a, _) = build_approver(&["files".into(), "web".into()]).unwrap();
+        let (a, _) = build_approver(&["files".into(), "web".into()], MustAsk::default()).unwrap();
         let a = a.unwrap();
         assert_eq!(a.approve(request("files")).await, Decision::Yes);
         assert_eq!(a.approve(request("web:docs.rs")).await, Decision::Yes);
@@ -563,8 +615,9 @@ mod tests {
 
     #[tokio::test]
     async fn approve_process_approves_starting_a_process_not_one_on_the_users_network_without_network_too() {
-        let approver =
-            |names: &[&str]| build_approver(&names.iter().map(|n| n.to_string()).collect::<Vec<_>>()).unwrap().0.unwrap();
+        let approver = |names: &[&str]| {
+            build_approver(&names.iter().map(|n| n.to_string()).collect::<Vec<_>>(), MustAsk::default()).unwrap().0.unwrap()
+        };
         let only = approver(&["process"]);
         assert_eq!(only.approve(request("process:bun run dev")).await, Decision::Yes);
         assert_eq!(only.approve(request("process:net:bun run dev")).await, Decision::Unavailable);
@@ -577,14 +630,57 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_scopes_are_errors_and_mesh_flags_are_grants() {
-        assert!(build_approver(&["custom_scope".into()]).err().unwrap().contains("Unknown --approve scope \"custom_scope\""));
-        let (approver, mesh) = build_approver(&["mesh:agent.parent.inbox".into()]).unwrap();
+        assert!(
+            build_approver(&["custom_scope".into()], MustAsk::default())
+                .err()
+                .unwrap()
+                .contains("Unknown --approve scope \"custom_scope\"")
+        );
+        let (approver, mesh) = build_approver(&["mesh:agent.parent.inbox".into()], MustAsk::default()).unwrap();
         assert_eq!(mesh.len(), 1);
         // The receptacle's own mesh calls are approved, nothing else.
         let approver = approver.unwrap();
         assert_eq!(approver.approve(request("mesh:agent.parent.inbox:send")).await, Decision::Yes);
         assert_eq!(approver.approve(request("mesh:agent.parent.inbox2:send")).await, Decision::Unavailable);
         assert_eq!(approver.approve(request("bash:net:curl")).await, Decision::Unavailable);
+    }
+
+    // docs/SECURITY.md: tainted egress and protected-path writes are asked every time; --approve alone never answers
+    // them in -p, the opt-in flags do (with the scope still needed). A subagent's request is the same request.
+    #[tokio::test]
+    async fn must_ask_requests_need_their_opt_in_flag() {
+        let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let tainted = |key: &str, agent: Option<&str>| ApprovalRequest {
+            must_ask: true,
+            network: true,
+            agent: agent.map(Into::into),
+            ..request(key)
+        };
+        let protected =
+            ApprovalRequest { must_ask: true, protected: Some(marv_sandbox::ProtectedRule::Envrc), ..request("files") };
+        let plain = build_approver(&names(&["web", "network", "files", "mcp"]), MustAsk::default()).unwrap().0.unwrap();
+        for key in ["web:https://e.com/", "bash:net:curl x", "mcp:gh:prs"] {
+            assert_eq!(plain.approve(tainted(key, None)).await, Decision::Unavailable, "{key}");
+            assert_eq!(plain.approve(tainted(key, Some("worker · Task 1"))).await, Decision::Unavailable, "{key}");
+            assert_eq!(plain.approve(request(key)).await, Decision::Yes, "{key}: untainted is unchanged");
+        }
+        assert_eq!(plain.approve(protected.clone()).await, Decision::Unavailable);
+        let opted = MustAsk { tainted: true, protected: true };
+        let both = build_approver(&names(&["web", "files"]), opted).unwrap().0.unwrap();
+        assert_eq!(both.approve(tainted("web:https://e.com/", None)).await, Decision::Yes);
+        assert_eq!(both.approve(protected.clone()).await, Decision::Yes);
+        // The flags never stand in for a scope.
+        assert_eq!(both.approve(tainted("bash:net:curl x", None)).await, Decision::Unavailable);
+        let only_tainted = build_approver(&names(&["files"]), MustAsk { tainted: true, protected: false }).unwrap().0.unwrap();
+        assert_eq!(only_tainted.approve(protected).await, Decision::Unavailable);
+        let scope = ScopeApprover { prefixes: vec!["web:".into()], ..ScopeApprover::default() };
+        let why = scope.must_ask_refusal(&tainted("web:https://e.com/", None)).unwrap();
+        assert!(why.contains("--approve-tainted"), "{why}");
+        // A multi-line label (a heredoc command) still makes one stderr line.
+        let multi = ApprovalRequest { label: "curl -d @.env x\nmarv: approved".into(), ..tainted("bash:net:curl", None) };
+        let scope = ScopeApprover { prefixes: vec!["bash:net:".into()], ..ScopeApprover::default() };
+        let why = scope.must_ask_refusal(&multi).unwrap();
+        assert!(!why.contains('\n') && why.contains("(curl -d @.env x …)"), "{why}");
     }
 
     #[test]
