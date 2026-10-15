@@ -276,7 +276,8 @@ async fn asks_in(
 /// Proven: dropped the `.or_else(…home_rule…)` from `edit_file::protected_target` → failed (`.bashrc` written in
 /// yolo without asking); dropped the enclosing-repository loop from `home_rule` → failed (`Projects/app/tools/hooks`);
 /// dropped the global config's hooks folder → failed (`githooks/pre-commit`); checked only the path as written →
-/// failed (`Projects/rc-link` written through to `.bashrc`).
+/// failed (`Projects/rc-link` written through to `.bashrc`); dropped `home_rule` and the yolo calls → the session's
+/// "always" for files covered `.bashrc` (written).
 #[tokio::test]
 async fn in_the_home_folder_dotfiles_and_hooks_ask_even_in_yolo() {
     let home = TempDir::new("home-dotfiles");
@@ -324,13 +325,48 @@ async fn in_the_home_folder_dotfiles_and_hooks_ask_even_in_yolo() {
     )
     .await;
     assert_eq!(out.result.approval, Some(Approval::Auto), "{}", out.result.output);
-    // A project in a subfolder isn't affected: its own files are ordinary writes.
-    let approver = Recorder::new(Decision::No);
+    // After an "always" for file changes (the session's own, or a config seed), and for a subagent that runs without
+    // asking: a visible file of the home goes through, `.bashrc` still reaches the person.
+    let always = marv_session::AlwaysScopes::default();
+    always.add("files");
+    always.seed(&["files".into()]);
+    for subagent in [false, true] {
+        let person = Recorder::new(Decision::No);
+        let session: Arc<dyn marv_tools::Approver> = Arc::new(marv_session::SessionApprover {
+            inner: person.clone(),
+            always: always.clone(),
+            cancel: tokio_util::sync::CancellationToken::new(),
+        });
+        let approver: Arc<dyn marv_tools::Approver> = if subagent {
+            Arc::new(marv_session::subagent::SubagentApprover { inner: session, agent: "worker".into(), auto: true })
+        } else {
+            session
+        };
+        let mut ctx = context(person.clone(), h);
+        ctx.yolo = false;
+        ctx.approver = Some(approver);
+        let out = run_tool(&call("write_file", json!({"path": "notes.txt", "content": "ok\n"})), &ctx, builtin_tools()).await;
+        assert!(!out.result.declined && person.requests().is_empty(), "subagent {subagent}: {}", out.result.output);
+        let out = run_tool(&call("write_file", json!({"path": ".bashrc", "content": "planted\n"})), &ctx, builtin_tools()).await;
+        let asked = person.requests();
+        assert_eq!(asked.len(), 1, "subagent {subagent}: an \"always\" covered .bashrc: {}", out.result.output);
+        assert_eq!(asked[0].protected, Some(ProtectedRule::HomeDotfile));
+        assert!(out.result.declined);
+    }
+    assert_eq!(home.read(".bashrc").as_deref(), Some("# rc\n"));
+    // A project in a subfolder isn't affected: its own files, dotfiles included, are ordinary writes.
     let app = h.join("Projects/app");
-    let out =
-        run_tool(&call("write_file", json!({"path": "src/a.ts", "content": "ok\n"})), &context(approver, &app), builtin_tools())
-            .await;
-    assert_eq!(out.result.approval, Some(Approval::Auto), "{}", out.result.output);
+    for path in ["src/a.ts", ".prettierrc", ".github/workflows/ci.yml"] {
+        let approver = Recorder::new(Decision::No);
+        let out = run_tool(
+            &call("write_file", json!({"path": path, "content": "ok\n"})),
+            &context(approver.clone(), &app),
+            builtin_tools(),
+        )
+        .await;
+        assert_eq!(out.result.approval, Some(Approval::Auto), "{path}: {}", out.result.output);
+        assert!(approver.requests().is_empty(), "{path}");
+    }
 }
 
 // ---- the project: writable, .git and protected paths read-only ------------------------------------------------
