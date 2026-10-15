@@ -12,6 +12,12 @@
 //!   `once` and `must_ask`; [`HeadlessWires`]: `--approve mesh:<receptacle>`). Yolo never wires: the approver
 //!   wrapped is the client's own, never the session's yolo or "always" layer, and nothing here lets an agent wire
 //!   itself (a wire to its own inbox is never even asked for).
+//! - One prompt per new wire (#77): a `mesh_send`/`mesh_call` that needs a wire asks [`WireApprover::approve_call`]
+//!   instead of the registry (`Tool::approve_itself`): the payload, the wire, its limits and the taint warning, "Yes
+//!   (wire it)" or "No" ([`call_wire_approval`], `once`, `must_ask`). Yes approves both, no neither (a declined call).
+//!   The far end still asks its own user. `--approve mesh:<receptacle>` and an SDK client's own wire approver can't
+//!   show both, so their calls are approved and their wires asked for apart, as before; so is a call on a wire
+//!   already there (the taint rules unchanged).
 //! - Inbox messages are drained before the turn's request and between steps ([`inbox_note`], [`with_inbox`]) and
 //!   go in fenced (`Envelope::fenced`), marking the session tainted with `Provenance::Mesh`.
 //! - Wake (#78, opt-in `mesh.wake`): the TUI, idle with no approval waiting, may start a turn when a message lands in
@@ -78,23 +84,46 @@ pub fn log_to(mesh: &MeshHandle, log: Option<&Arc<Trajectory>>) {
 #[async_trait]
 pub trait WireApprover: Send + Sync {
     async fn approve_wire(&self, request: WireRequest) -> Option<WireBy>;
+
+    /// #77: one prompt for a `mesh_send`/`mesh_call` that needs a new wire, holding the call (`call`, its preview)
+    /// and the wire together ([`call_wire_approval`]). `None` (the default): this approver can't show both
+    /// (`--approve mesh:<receptacle>`, an SDK client's own), so the call is approved as any other and the wire is
+    /// asked for apart, as before.
+    async fn approve_call(&self, _request: &WireRequest, _call: Preview) -> Option<CallWire> {
+        None
+    }
 }
+
+/// The answer to [`WireApprover::approve_call`]'s one prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallWire {
+    /// Yes to both: the wire (granted by this) and the call.
+    Granted(WireBy),
+    /// Neither: `No` (a person declined) or `Unavailable` (no one could answer).
+    Refused(Decision),
+}
+
+/// The combined prompt's tool name (#77): the TUI's Yes reads "Yes (wire it)" for it.
+pub const MESH_WIRE_CALL: &str = "mesh_wire_call";
+
+fn limits_line() -> String {
+    let limits = WireLimits::default();
+    format!("Limits: {} bytes a message, {} a minute (bursts of {}).", limits.max_message_bytes, limits.per_minute, limits.burst)
+}
+
+const WIRE_LASTS: &str = "The wire lasts until either agent ends.";
 
 /// What a wire approval shows: the full request (who, to what, which mode, the limits). Yes or no only, and a
 /// person must answer it (no "always" layer, no yolo).
 pub fn wire_approval(request: &WireRequest) -> ApprovalRequest {
-    let limits = WireLimits::default();
     let (from, to, mode) = (&request.from, &request.to, request.mode);
     ApprovalRequest {
         tool: "mesh_wire".into(),
         label: request.title(),
         preview: Preview {
             title: request.title(),
-            text: Some(format!(
-                "{from} asks to {mode} to {to}.\nLimits: {} bytes a message, {} a minute (bursts of {}).",
-                limits.max_message_bytes, limits.per_minute, limits.burst
-            )),
-            note: Some("The wire lasts until either agent ends.".into()),
+            text: Some(format!("{from} asks to {mode} to {to}.\n{}", limits_line())),
+            note: Some(WIRE_LASTS.into()),
             warning: Some("What arrives through it is data from another agent: the receiving session counts as tainted.".into()),
             ..Preview::default()
         },
@@ -105,6 +134,24 @@ pub fn wire_approval(request: &WireRequest) -> ApprovalRequest {
         must_ask: true,
         protected: None,
         door: None,
+    }
+}
+
+/// #77: the one prompt for a call that needs a new wire: the call's payload (`call`, its preview: the message or the
+/// arguments), then the wire, its limits and the taint warning. Like [`wire_approval`], yes or no only (`once`: the
+/// TUI offers "Yes (wire it)" and "No") and a person must answer it (`must_ask`). The far end still asks its own.
+pub fn call_wire_approval(request: &WireRequest, call: Preview) -> ApprovalRequest {
+    let wire = wire_approval(request);
+    ApprovalRequest {
+        tool: MESH_WIRE_CALL.into(),
+        preview: Preview {
+            title: format!("{} over a new wire", call.title),
+            text: call.text,
+            note: Some(format!("{}. {} {WIRE_LASTS}", request.title(), limits_line())),
+            warning: wire.preview.warning.clone(),
+            ..Preview::default()
+        },
+        ..wire
     }
 }
 
@@ -122,6 +169,13 @@ impl WireApprover for PersonWires {
             Decision::Yes | Decision::Always => Some(self.by),
             Decision::No | Decision::Unavailable => None,
         }
+    }
+
+    async fn approve_call(&self, request: &WireRequest, call: Preview) -> Option<CallWire> {
+        Some(match self.inner.approve(call_wire_approval(request, call)).await {
+            Decision::Yes | Decision::Always => CallWire::Granted(self.by),
+            refused => CallWire::Refused(refused),
+        })
     }
 }
 
@@ -362,14 +416,24 @@ impl MeshTool {
     /// Marv is granted only once that Marv's user approves too (`Switchboard::grant`). If they don't, the message
     /// goes on and is refused; the far end's answer is what the agent reads (`Err` from here).
     async fn ask_for_wire(&self, receptacle: &ReceptacleName, mode: WireMode) -> Result<(), String> {
-        if self.mesh.table().allows(&self.plug, receptacle, mode) {
-            return Ok(());
-        }
-        let Some(r) = self.mesh.lookup(receptacle).await else { return Ok(()) };
-        let own = r.owner.as_ref() == Some(&self.plug) || receptacle.inbox_owner() == Some(self.plug.as_str());
-        let Some(approver) = self.approver.as_ref().filter(|_| r.supports(mode) && !own) else { return Ok(()) };
-        let request = WireRequest { from: self.plug.clone(), to: receptacle.clone(), mode, asked_by: self.plug.clone() };
+        let Some((request, approver)) = self.wire_request(receptacle, mode).await else { return Ok(()) };
         let Some(by) = approver.approve_wire(request.clone()).await else { return Ok(()) };
+        self.grant(request, by).await
+    }
+
+    /// The wire this call would need asked for, and who to ask: `None` when it's wired already, or can't be wired
+    /// (no such receptacle, not that mode, this agent's own, nobody to ask).
+    async fn wire_request(&self, receptacle: &ReceptacleName, mode: WireMode) -> Option<(WireRequest, &Arc<dyn WireApprover>)> {
+        if self.mesh.table().allows(&self.plug, receptacle, mode) {
+            return None;
+        }
+        let r = self.mesh.lookup(receptacle).await?;
+        let own = r.owner.as_ref() == Some(&self.plug) || receptacle.inbox_owner() == Some(self.plug.as_str());
+        let approver = self.approver.as_ref().filter(|_| r.supports(mode) && !own)?;
+        Some((WireRequest { from: self.plug.clone(), to: receptacle.clone(), mode, asked_by: self.plug.clone() }, approver))
+    }
+
+    async fn grant(&self, request: WireRequest, by: WireBy) -> Result<(), String> {
         match self.mesh.grant(request, by).await {
             Ok(()) => Ok(()),
             // A self-wire leaves it unwired, and the switchboard says so; the far end saying no is said here.
@@ -473,6 +537,28 @@ impl Tool for MeshTool {
     /// Yolo may use a wire the user already granted (tainted sessions still ask: `must_ask`); it never wires.
     fn auto_safe(&self, input: &Self::Input, _ctx: &ToolContext) -> bool {
         self.wired(input)
+    }
+    /// #77: a call that needs a new wire is one prompt, the call and the wire together, asked of the wire approver
+    /// (a person, through the client's own approver: never yolo or a remembered "always", `once` and `must_ask`).
+    /// Yes grants the wire (and the far end asks its own user); the call then runs over it. An approver that can't
+    /// show both, or a call on a wire already there, is approved by the registry as before.
+    async fn approve_itself(
+        &self,
+        input: &Self::Input,
+        ctx: &ToolContext,
+        preview: &Preview,
+    ) -> Option<Result<Decision, ToolError>> {
+        let (receptacle, mode) = self.target(input)?;
+        let (request, approver) = self.wire_request(&receptacle, mode).await?;
+        let answer = tokio::select! {
+            answer = approver.approve_call(&request, preview.clone()) => answer?,
+            // A stopped turn doesn't leave the prompt waiting: no, and the registry reads the stop.
+            _ = ctx.cancel.cancelled() => return Some(Ok(Decision::No)),
+        };
+        Some(match answer {
+            CallWire::Granted(by) => self.grant(request, by).await.map(|()| Decision::Yes).map_err(ToolError::new),
+            CallWire::Refused(decision) => Ok(decision),
+        })
     }
     async fn run(&self, input: &Self::Input, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let target = self.target(input);
@@ -767,6 +853,229 @@ mod tests {
         web_cancel.cancel();
     }
 
+    /// One Marv on the mesh for the round-trip tests: its switchboard (session `name`), its main agent's plug, its door
+    /// in `folder` (the far end's wires asked of `person`), and its `mesh_send` as `run_tool` runs it.
+    struct Marv {
+        mesh: MeshHandle,
+        ctx: ToolContext,
+        tools: Vec<ToolRef>,
+        cancel: CancellationToken,
+        _door: marv_mesh::discovery::DoorGuard,
+        _rt: Runtime,
+    }
+    impl Drop for Marv {
+        fn drop(&mut self) {
+            self.cancel.cancel();
+        }
+    }
+
+    fn marv_on(name: &str, folder: &std::path::Path, person: &Arc<Person>) -> Marv {
+        use marv_mesh::discovery::{DoorInfo, open_door};
+        let rt = Runtime(std::env::temp_dir().join(format!("ms-{name}-{}-{}", std::process::id(), marv_fs::random_hex())));
+        let mesh = Arc::new(Switchboard::new(name, rt.0.clone(), Arc::new(Log::default())));
+        let cancel = CancellationToken::new();
+        tokio::spawn(Arc::clone(&mesh).serve(cancel.clone()));
+        let parent = mesh.plug(parent_id()).unwrap();
+        let wires = wire_approver(None, Some(&(person.clone() as Arc<dyn Approver>))).unwrap();
+        let info = DoorInfo { cwd: format!("/{name}").into(), pane: None };
+        let door = open_door(mesh.clone(), folder, info, Arc::new(DoorWires(wires.clone()))).unwrap();
+        let mut ctx = ToolContext::new(std::env::temp_dir());
+        ctx.approver = Some(person.clone());
+        let tools = MeshTool::all(&parent, &mesh, Some(wires)).into_iter().map(|t| Arc::new(t) as ToolRef).collect();
+        Marv { mesh, ctx, tools, cancel, _door: door, _rt: rt }
+    }
+
+    async fn send_as(marv: &Marv, to: &str, text: &str) -> marv_tools::ToolOutcome {
+        let call = marv_core::ToolCall {
+            id: "c1".into(),
+            name: MESH_SEND.into(),
+            arguments: serde_json::json!({"receptacle": to, "text": text}).to_string(),
+        };
+        marv_tools::run_tool(&call, &marv.ctx, &marv.tools).await
+    }
+
+    /// #77: a round trip, alpha → beta → alpha, between two Marvs' users. Each new wire is one prompt on the caller's
+    /// side (the message, the wire, its limits, the taint warning; yes or no) plus the far end's own: four in all
+    /// (it was six: the call, then the wire, then the far end, on each side). A second message over the wires asks only
+    /// as any call does.
+    #[tokio::test]
+    async fn a_round_trip_between_two_marvs_asks_once_per_new_wire_on_each_end() {
+        let folder = Runtime(std::env::temp_dir().join(format!("ms-rt77-{}-{}", std::process::id(), marv_fs::random_hex())));
+        let (pa, pb) = (Arc::new(Person(Decision::Yes, Mutex::default())), Arc::new(Person(Decision::Yes, Mutex::default())));
+        let (alpha, beta) = (marv_on("alpha", &folder.0, &pa), marv_on("beta", &folder.0, &pb));
+
+        let out = send_as(&alpha, "peer.beta.agent.parent.inbox", "the API is ready").await;
+        assert!(!out.result.is_error && !out.result.declined, "{}", out.result.output);
+        assert!(inbox_note(&beta.mesh, &parent_id(), &beta.ctx.taint).unwrap().contains("the API is ready"));
+        assert!(beta.ctx.taint.is_tainted(), "beta read alpha's message: tainted");
+        let out = send_as(&beta, "peer.alpha.agent.parent.inbox", "thanks, starting").await;
+        assert!(!out.result.is_error && !out.result.declined, "{}", out.result.output);
+        assert!(inbox_note(&alpha.mesh, &parent_id(), &alpha.ctx.taint).unwrap().contains("thanks, starting"));
+
+        let titles = |p: &Person| p.1.lock().unwrap().iter().map(|r| r.preview.title.clone()).collect::<Vec<_>>();
+        assert_eq!(
+            titles(&pa),
+            ["Send a message to peer.beta.agent.parent.inbox over a new wire", "Wire peer-beta -> agent.parent.inbox (send)"]
+        );
+        assert_eq!(
+            titles(&pb),
+            ["Wire peer-alpha -> agent.parent.inbox (send)", "Send a message to peer.alpha.agent.parent.inbox over a new wire"]
+        );
+        // The caller's prompt held the message and the wire, and a person had to answer it, yes or no.
+        let asked = pb.1.lock().unwrap()[1].clone();
+        assert_eq!(asked.preview.text.as_deref(), Some("thanks, starting"));
+        assert!(asked.preview.note.as_ref().unwrap().contains("Wire parent -> peer.alpha.agent.parent.inbox (send)"));
+        assert!(asked.once && asked.must_ask);
+
+        // Over the wire now there: the call's own approval as before (beta is tainted, so it asks; alpha isn't).
+        send_as(&beta, "peer.alpha.agent.parent.inbox", "done").await;
+        assert_eq!(titles(&pb)[2], "Send a message to peer.alpha.agent.parent.inbox");
+        assert!(pb.1.lock().unwrap()[2].must_ask && !pb.1.lock().unwrap()[2].once);
+        send_as(&alpha, "peer.beta.agent.parent.inbox", "ok").await;
+        assert_eq!(titles(&pa)[2], "Send a message to peer.beta.agent.parent.inbox");
+        assert_eq!((pa.1.lock().unwrap().len(), pb.1.lock().unwrap().len()), (3, 3));
+    }
+
+    /// #77: saying no to the one prompt approves neither the call nor the wire: nothing is wired or sent, and the model
+    /// reads a declined call (the run stops for the user), not a refusal to work around.
+    #[tokio::test]
+    async fn no_to_the_one_prompt_is_no_to_the_call_and_the_wire() {
+        let (mesh, log, _rt, cancel) = switchboard();
+        mesh.plug(parent_id()).unwrap();
+        let worker = mesh.plug_next(WORKER).unwrap();
+        let no = Arc::new(Person(Decision::No, Mutex::default()));
+        let mut ctx = ToolContext::new(std::env::temp_dir());
+        ctx.approver = Some(no.clone());
+        let tools: Vec<ToolRef> = MeshTool::all(&worker, &mesh, wire_approver(None, Some(&(no.clone() as Arc<dyn Approver>))))
+            .into_iter()
+            .map(|t| Arc::new(t) as ToolRef)
+            .collect();
+        let call = marv_core::ToolCall {
+            id: "c1".into(),
+            name: MESH_SEND.into(),
+            arguments: r#"{"receptacle": "agent.parent.inbox", "text": "hi"}"#.into(),
+        };
+        let out = marv_tools::run_tool(&call, &ctx, &tools).await;
+        assert!(out.result.declined, "{}", out.result.output);
+        assert_eq!(out.result.output, marv_tools::DECLINED);
+        assert_eq!(no.1.lock().unwrap().len(), 1, "asked once");
+        assert!(mesh.table().all().is_empty());
+        assert!(log.0.lock().unwrap().is_empty(), "nothing went to the switchboard");
+        assert!(mesh.drain_inbox(&parent_id()).is_empty());
+        cancel.cancel();
+    }
+
+    /// #77: a turn stopped (Esc) while the one prompt waits doesn't leave it waiting: the call is interrupted, the
+    /// prompt is dropped, and nothing is wired or sent.
+    #[tokio::test]
+    async fn a_stop_while_the_one_prompt_waits_is_an_interrupt_with_no_wire() {
+        struct Waiting(tokio::sync::Notify, Mutex<usize>);
+        #[async_trait]
+        impl Approver for Waiting {
+            async fn approve(&self, _request: ApprovalRequest) -> Decision {
+                *self.1.lock().unwrap() += 1;
+                self.0.notify_one();
+                std::future::pending().await
+            }
+        }
+        let (mesh, log, _rt, cancel) = switchboard();
+        mesh.plug(parent_id()).unwrap();
+        let worker = mesh.plug_next(WORKER).unwrap();
+        let person = Arc::new(Waiting(tokio::sync::Notify::new(), Mutex::default()));
+        let mut ctx = ToolContext::new(std::env::temp_dir());
+        ctx.approver = Some(person.clone());
+        let tools: Vec<ToolRef> =
+            MeshTool::all(&worker, &mesh, wire_approver(None, Some(&(person.clone() as Arc<dyn Approver>))))
+                .into_iter()
+                .map(|t| Arc::new(t) as ToolRef)
+                .collect();
+        let call = marv_core::ToolCall {
+            id: "c1".into(),
+            name: MESH_SEND.into(),
+            arguments: r#"{"receptacle": "agent.parent.inbox", "text": "hi"}"#.into(),
+        };
+        let stop = ctx.cancel.clone();
+        let asked = person.0.notified();
+        let run = marv_tools::run_tool(&call, &ctx, &tools);
+        let out = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(run, async {
+                asked.await;
+                stop.cancel();
+            })
+            .0
+        })
+        .await
+        .expect("a stop answers the waiting prompt");
+        assert_eq!(*person.1.lock().unwrap(), 1, "asked once");
+        assert!(out.result.declined, "{}", out.result.output);
+        assert_eq!(out.result.output, marv_tools::INTERRUPTED);
+        assert!(mesh.table().all().is_empty());
+        assert!(log.0.lock().unwrap().is_empty(), "nothing went to the switchboard");
+        assert!(mesh.drain_inbox(&parent_id()).is_empty());
+        cancel.cancel();
+    }
+
+    /// #77 with #78: a wire made in the one prompt wakes the session only when the user said yes to it (granted by
+    /// the TUI's person, like a wire asked for apart). A no leaves no wire and nothing to wake on.
+    #[tokio::test]
+    async fn only_a_wire_the_user_granted_in_the_one_prompt_wakes_the_session() {
+        let (mesh, _log, _rt, cancel) = switchboard();
+        mesh.plug(parent_id()).unwrap();
+        let inbox = ReceptacleName::new("agent.parent.inbox").unwrap();
+        let call = marv_core::ToolCall {
+            id: "c1".into(),
+            name: MESH_SEND.into(),
+            arguments: r#"{"receptacle": "agent.parent.inbox", "text": "done"}"#.into(),
+        };
+        for (answer, wakes) in [(Decision::No, false), (Decision::Yes, true)] {
+            let worker = mesh.plug_next(WORKER).unwrap();
+            let person = Arc::new(Person(answer, Mutex::default()));
+            let mut ctx = ToolContext::new(std::env::temp_dir());
+            ctx.approver = Some(person.clone());
+            let wires = wire_approver(None, Some(&(person.clone() as Arc<dyn Approver>)));
+            let tools: Vec<ToolRef> = MeshTool::all(&worker, &mesh, wires).into_iter().map(|t| Arc::new(t) as ToolRef).collect();
+            marv_tools::run_tool(&call, &ctx, &tools).await;
+            assert_eq!(person.1.lock().unwrap().iter().map(|r| r.tool.as_str()).collect::<Vec<_>>(), [MESH_WIRE_CALL]);
+            let by = mesh.table().all().iter().find(|w| w.from == worker.id).map(|w| w.grant.local);
+            assert_eq!(by, wakes.then_some(WireBy::Tui), "{answer:?}");
+            let check = wake_check(&mesh, &mut WakeLimit::default(), 0);
+            assert_eq!(check.wake, wakes.then(|| WakeBy { sender: worker.id.clone(), receptacle: inbox.clone() }));
+            mesh.drain_inbox(&parent_id());
+        }
+        cancel.cancel();
+    }
+
+    #[test]
+    fn the_one_prompt_shows_the_payload_the_wire_its_limits_and_the_taint_warning() {
+        let request = WireRequest {
+            from: PlugId::new("worker-1").unwrap(),
+            to: ReceptacleName::new("agent.parent.inbox").unwrap(),
+            mode: WireMode::Send,
+            asked_by: PlugId::new("worker-1").unwrap(),
+        };
+        let call =
+            Preview { title: "Send a message to agent.parent.inbox".into(), text: Some("found it".into()), ..Preview::default() };
+        let shown = call_wire_approval(&request, call);
+        assert_eq!(shown.tool, MESH_WIRE_CALL);
+        assert_eq!(shown.preview.title, "Send a message to agent.parent.inbox over a new wire");
+        assert_eq!(shown.preview.text.as_deref(), Some("found it"));
+        assert_eq!(
+            shown.preview.note.as_deref(),
+            Some(
+                "Wire worker-1 -> agent.parent.inbox (send). Limits: 32768 bytes a message, 30 a minute (bursts of 10). \
+                 The wire lasts until either agent ends."
+            )
+        );
+        assert_eq!(shown.preview.warning, wire_approval(&request).preview.warning);
+        assert!(shown.once && shown.must_ask, "yes or no, and a person answers");
+        assert_eq!(shown.agent.as_deref(), Some("worker-1"));
+        assert_eq!(shown.scope.key, "mesh-wire:worker-1:agent.parent.inbox:send");
+        // A call shows its arguments the same way.
+        let call = Preview { title: "Call herdr.pane.w1-p3.status".into(), text: Some("{}".into()), ..Preview::default() };
+        let shown = call_wire_approval(&WireRequest { mode: WireMode::Call, ..request }, call);
+        assert_eq!(shown.preview.title, "Call herdr.pane.w1-p3.status over a new wire");
+    }
+
     #[tokio::test]
     async fn declined_or_unasked_wires_are_refused_and_logged() {
         let (mesh, log, _rt, cancel) = switchboard();
@@ -1048,22 +1357,22 @@ mod tests {
                 "the parent's session is tainted by the worker's message"
             );
             assert_eq!(model.seen.lock().unwrap().len(), 4, "both models ran their whole script");
-            // Both wires were asked for by the agent that needed it, and a person granted each.
-            let wires: Vec<(String, Option<String>)> = person
-                .1
-                .lock()
-                .unwrap()
+            // Both wires were asked for by the agent that needed it, and a person granted each. The subagent's
+            // mesh_send, run by its loop, was one prompt for the message and the wire (#77): never a second.
+            let asked = person.1.lock().unwrap().clone();
+            let wires: Vec<(String, Option<String>)> = asked
                 .iter()
-                .filter(|r| r.tool == "mesh_wire")
+                .filter(|r| r.tool == "mesh_wire" || r.tool == MESH_WIRE_CALL)
                 .map(|r| (r.preview.title.clone(), r.agent.clone()))
                 .collect();
             assert_eq!(
                 wires,
                 [
                     ("Wire parent -> agent.worker-1.inbox (send)".to_string(), None),
-                    ("Wire worker-1 -> agent.parent.inbox (send)".to_string(), Some("worker-1".to_string())),
+                    ("Send a message to agent.parent.inbox over a new wire".to_string(), Some("worker-1".to_string())),
                 ]
             );
+            assert!(!asked.iter().any(|r| r.tool == MESH_SEND), "no separate prompt for the call");
             // The subagent ended: its plug, inbox and both wires are gone.
             assert!(mesh.table().all().is_empty());
             assert!(mesh.receptacle(&ReceptacleName::new("agent.worker-1.inbox").unwrap()).is_none());
