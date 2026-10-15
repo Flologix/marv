@@ -147,7 +147,7 @@ tools::{mesh_specs, kind_of, target, run, MESH_LIST, MESH_CALL, MESH_SEND}; plug
 // marv-session::mesh (for marv-cli and the TUI)
 start, log_to, PARENT, parent_id, WireApprover { approve_wire, approve_call }, CallWire, PersonWires { inner, by },
 HeadlessWires(Vec<ReceptacleName>), wire_approval, call_wire_approval, MESH_WIRE_CALL,
-wire_approver, headless_grants, inbox_note, with_inbox, MeshAccess::plug_subagent -> SubagentPlug { tools, sandbox, after_step }
+wire_approver, inbox_note, with_inbox, MeshAccess::plug_subagent -> SubagentPlug { tools, sandbox, after_step }  // headless_grants is approvals::parse_approval
 
 // Herdr (marv-cli makes one, the App reports)
 herdr::{herdr_target(&env), HerdrReporter::new(target, None), .state(s, msg), async .session(id, path), async .release()}

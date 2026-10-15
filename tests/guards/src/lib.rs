@@ -98,6 +98,7 @@ pub fn sandbox_with_home(home: &Path) -> Sandbox {
         lang: "C.UTF-8".into(),
         mesh_socket: None,
         hidden: Vec::new(),
+        writable: Vec::new(),
     }
 }
 

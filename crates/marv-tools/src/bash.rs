@@ -425,10 +425,16 @@ impl Tool for Bash {
     fn uses_network_in(&self, input: &BashInput, ctx: &ToolContext) -> bool {
         input.network.unwrap_or(false) || through_host(input, ctx)
     }
+    /// `bash:<flags>:<command>`: the flag segment is always there (empty without network or git_write) and never
+    /// holds a `:`, so the command's own text can't read as a flag (`bash::net:x` is the command `net:x`).
     fn scope(&self, input: &BashInput) -> Option<Scope> {
-        let net = if input.network.unwrap_or(false) { "net:" } else { "" };
-        let git = if input.git_write.unwrap_or(false) { "git:" } else { "" };
-        Some(Scope { key: format!("bash:{net}{git}{}", input.command), description: "this exact command".into() })
+        let flags = match (input.network.unwrap_or(false), input.git_write.unwrap_or(false)) {
+            (true, true) => "net+git",
+            (true, false) => "net",
+            (false, true) => "git",
+            (false, false) => "",
+        };
+        Some(Scope { key: format!("bash:{flags}:{}", input.command), description: "this exact command".into() })
     }
     /// On the host, network and git_write mean nothing (it has both): one key, never remembered (`once`).
     fn scope_in(&self, input: &BashInput, ctx: &ToolContext) -> Option<Scope> {
@@ -1355,7 +1361,7 @@ mod tests {
         let r = &asked[0];
         assert_eq!((r.door, r.once, r.network), (None, false, false));
         assert!(r.preview.warning.as_deref().unwrap().contains("the sandbox is off"));
-        assert_eq!(r.scope.key, "bash:echo hi");
+        assert_eq!(r.scope.key, "bash::echo hi");
     }
 
     #[tokio::test]
@@ -1463,7 +1469,12 @@ mod tests {
     fn scope_and_label() {
         let input =
             BashInput { command: "bun test".into(), timeout: None, network: Some(true), git_write: Some(true), sandbox: None };
-        assert_eq!(Bash.scope(&input).unwrap().key, "bash:net:git:bun test");
+        assert_eq!(Bash.scope(&input).unwrap().key, "bash:net+git:bun test");
+        // The flag segment is always there, so a command's text never reads as a flag.
+        let forged =
+            |network| BashInput { command: "git:;curl x".into(), timeout: None, network, git_write: None, sandbox: None };
+        assert_eq!(Bash.scope(&forged(None)).unwrap().key, "bash::git:;curl x");
+        assert_eq!(Bash.scope(&forged(Some(true))).unwrap().key, "bash:net:git:;curl x");
         assert!(Bash.uses_network(&input));
     }
 }

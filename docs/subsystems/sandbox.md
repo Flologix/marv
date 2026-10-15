@@ -24,14 +24,16 @@ Spec: the **Sandbox** and **Yolo mode** bullets in Marv's `CLAUDE.md`, `src/sand
 | new (`docs/SECURITY.md`) | `protected.rs` | **Done and tested:** `PROTECTED_PATHS`, `rule_for_relative`, `protected_rule`/`is_protected` (realpath, a dangling final symlink followed, fails closed), `hooks_path`, `lifecycle_scripts_changed`, `protected_mounts` (top level only), and the post-command scan: `protected_snapshot`, `scan_created`, `revert_created`, `created_note` (#8); `is_secret_name` (docs/SECURITY.md's secret names: `.env*` but `.envrc`, `*.pem`, `id_*`; used by instruction files, #62; the read_file gate is still to come) |
 | `src/tools/bash.ts` (`secretVariable`, `hostEnv`) | `host_env.rs` | **Ported and tested** (marv-rs #23, Marv #52; `host-env.test.ts`): the environment of what runs on the host, Marv's keys and secret-looking variables stripped |
 | new (`docs/SECURITY.md`) | `taint.rs` | **Done and tested:** `TaintState` (`mark`, `is_tainted`, `must_ask`, approved prefixes, `for_subagent`) |
-| — | `lib.rs` | `Sandbox` (the session's handle: `from_env`, `active`, `command`, `command_argv` for an inner command other than `bash -c`), `CommandMounts` (with `binds`, #24), `SandboxError` |
+| (new, #98) | `writable.rs` | **Done and tested:** the config's `"writable"` resolved once at startup (`resolve` → canonical paths + startup problems; `~` expanded, symlinks followed, the rules judged on the canonical path), and the refuse list (`/`, the home and its parents, the project's parents, any hidden top-level home entry (`~/.<anything>` — the message names the known ones, the rule doesn't need the list), a git repository (the entry is one, under a `.git` component, or directly holding a `.git` entry, worktree file included; a repo planted deeper inside an accepted folder later is *not* scanned — stated in the doc), the mesh's runtime sockets (`marv/` in the runtime dir, inside it or holding it), Marv's config folder (`config_dir`, wherever `MARV_CONFIG_DIR` puts it), missing/non-folders); an entry in the project or inside another accepted entry is left out quietly (#119 review: a swapped parent would let bwrap bind a symlink's target) |
+| — | `lib.rs` | `Sandbox` (the session's handle: `from_env`, `active`, `command`, `command_argv` for an inner command other than `bash -c`; #98: `writable`, the session's extra writable folders, merged under each command's own), `CommandMounts` (with `binds`, #24), `SandboxError` |
 
 No `todo!` is left in this crate. The gaps are listed below.
 
 ## Interfaces other crates use
 
 ```rust
-pub struct Sandbox { pub enabled: bool, pub home: PathBuf, pub path: String, pub lang: String, pub mesh_socket: Option<PathBuf> }
+pub struct Sandbox { pub enabled: bool, pub home: PathBuf, pub path: String, pub lang: String, pub mesh_socket: Option<PathBuf>, pub hidden: Vec<PathBuf>, pub writable: Vec<PathBuf> }  // writable: the #98 extras
+pub fn writable::resolve(entries: &[String], home: &Path, root: &Path, runtime: Option<&Path>, config_dir: Option<&Path>) -> (Vec<PathBuf>, Vec<String>);  // accepted + problems
 impl Sandbox {
     pub fn from_env(enabled: bool) -> Self;
     pub fn active(&self) -> bool;                                    // enabled && bwrap works here
@@ -74,7 +76,7 @@ pub fn notes::{looks_like_network_failure, runs_gh, touches_hidden_home}; pub co
   4. extras around the project;
   5. the project;
   6. other extras;
-  7. writable folders;
+  7. writable folders (the command's own, then the session's #98 extras — a folder the caller made read-only stays that way);
   8. protected paths (skipped when the project is read-only);
   9. placeholders;
   10. credential masks, last.
