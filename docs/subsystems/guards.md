@@ -85,6 +85,16 @@ Each guard's doc comment says how it was proven: the guard was reverted, and the
 | host: refused before any ask without `host_commands` | `host.rs::a_session_without_host_commands_refuses_it_before_its_approver_is_asked` | Proven (real bwrap) |
 | host: a subagent can't | `host.rs::a_subagent_cant_even_where_the_session_has_the_door` | Proven (real bwrap) |
 | host: `marv -p` refuses it with every `--approve` name | `host.rs::headless_refuses_it_with_every_approve_name` | Proven (two layers, both reverted) |
+| herdr: the sandbox sees neither Herdr's variables nor its socket | `herdr.rs::a_sandboxed_command_sees_neither_herdrs_variables_nor_its_socket` | Proven (real bwrap) |
+| herdr: what the door reads is fenced and taints | `herdr.rs::what_the_door_reads_back_is_fenced_and_taints_the_conversation` | Proven (fake herdr) |
+| herdr: run and spawn ask every time (yolo, "always", every pre-approved scope) | `herdr.rs::run_and_spawn_ask_every_time_even_in_yolo_after_always_and_with_pre_approved_scopes` | Proven |
+| herdr: refused before any ask without `host_commands` | `herdr.rs::a_session_without_host_commands_refuses_run_and_spawn_before_asking` | Proven |
+| herdr: `marv -p` refuses run and spawn with every `--approve` name | `herdr.rs::headless_refuses_run_and_spawn_with_every_approve_name` | Proven (two layers, both reverted; the marv binary) |
+| herdr: a subagent's context refuses run and spawn | `herdr.rs::a_subagents_context_refuses_run_and_spawn` | Proven |
+| herdr: a spawned worker gets no more than its parent | `herdr.rs::a_spawned_worker_never_gets_more_than_its_parent` | Proven (two reverts) |
+| herdr: the peer limit holds before any ask | `herdr.rs::the_peer_limit_holds_before_anyone_is_asked` | Proven |
+| herdr: a light action in a woken turn gets no "always" | `herdr.rs::a_light_action_in_a_woken_turn_gets_no_always` | Proven |
+| herdr: names and output reach the terminal through `printable()` | `herdr.rs::herdr_names_and_output_reach_the_terminal_only_through_printable` | Proven |
 | `marv -p`: tainted egress refused with `--approve web` alone | `headless_taint.rs::headless_refuses_tainted_egress_with_approve_alone` | Proven (the marv binary) |
 | `marv -p`: `--approve-tainted` opts in; untainted `--approve web` unchanged | `headless_taint.rs::headless_approve_tainted_allows_tainted_egress`, `headless_approve_web_still_allows_untainted_egress` | Controls |
 | `marv -p`: a protected-path write needs `--approve-protected` | `headless_taint.rs::headless_refuses_protected_writes_without_approve_protected` | Proven (the marv binary) |
@@ -103,6 +113,7 @@ Each guard's doc comment says how it was proven: the guard was reverted, and the
 - **Found by the suite:** dangling symlinks. `innocent.sh -> .envrc`, where `.envrc` didn't exist yet, wasn't seen as protected, and `write_file` through `out.sh -> /elsewhere/x` wrote outside the project. Both are fixed in `paths::real_with_missing` (sandbox.md). Nested `.git` folders read-only for confined commands are proven by marv-tools' `an_approved_git_write_keeps_its_new_repository_and_confined_commands_see_nested_git_read_only`.
 - **Fake homes live in `/var/tmp`** (`TempDir::outside_tmp`): the sandbox replaces `/tmp` with its own, so a fake home there would look hidden even without the home tmpfs.
 - **The web guards use a local server** (`marv_guards::serve`) and a `WebFetch` that lets private addresses through: the guards never fetch the internet.
+- **The Herdr door's guards** (`herdr.rs`) run a fake `herdr` (`marv_session::herdr_door::fake`, a shell script that logs every call and keeps its state in its own folder): never the user's Herdr, never `~/.config/herdr`. The `marv -p` one gives the binary a cleared environment with `HERDR_ENV` and a socket path that doesn't exist. Run the suite with Herdr's variables unset when you're inside Herdr.
 - **The process door's guards** run `marv-guards-fixture` (`src/bin/`) as the relay, in place of `marv __relay`: a library's tests can't run the `marv` binary. The same fixture serves the forwarded test page from inside the sandbox and plays the parent that gets SIGKILLed. Each guard was proven by a scripted revert (one at a time, file restored after).
 - **The doors' guards** (`github.rs`, `host.rs`): gh is a fake on PATH (`marv_tools::github::fake`, a shell script that logs every argv); never the real gh. The SDK guards that need it in the environment re-run themselves in a child process with it set (`marv_guards::in_child_with_env`: Rust can't change its own environment without `unsafe`). The `marv -p` guards run the binary `cargo test --workspace` builds (`marv_oracle::binary()`), against `marv_oracle`'s fake OpenRouter on port 0.
 - **The lock-file guard** reads `Cargo.lock` at run time. To prove it, the test binary was built first, because cargo prunes an unused lock entry before it runs a test.

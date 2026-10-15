@@ -45,7 +45,7 @@ Narrow, named ways out, each asked for and each with its own rule for what it ca
 
 ## Provenance and taint (`marv-core::Provenance`)
 - **Every tool result is tagged with its source.** Text that isn't from the user or Marv is fenced as data for the model; a closing tag inside it, in any case, is defused (`marv_core::defuse_closing_tag`). Project checks and diagnostics are quoted, never spoken in Marv's voice.
-- **A session becomes tainted** once web, MCP, mesh or image content, or a session-start hook's output (unless the user marked that hook `trusted`), enters its context. From then on, every `ToolKind::Egress` call asks, even in yolo:
+- **A session becomes tainted** once web, MCP, mesh or image content, a session-start hook's output (unless the user marked that hook `trusted`), or what the Herdr door read from a pane (#74), enters its context. From then on, every `ToolKind::Egress` call asks, even in yolo:
   - network bash;
   - every MCP call, including tools marked `readOnlyHint`;
   - web requests to a new URL prefix;
@@ -74,6 +74,12 @@ Narrow, named ways out, each with what it can never do. A call through one carri
   - asked every time (`once`: "always" never covers another), in yolo too;
   - only where someone approves each command at a terminal (the TUI; the SDK's `host_commands`): refused before any ask in `marv -p`, in an SDK session without `host_commands`, and for a subagent;
   - its environment is the user's minus Marv's keys and anything secret-looking (`marv_sandbox::host_env`); token shapes are redacted from its output.
+- **herdr** (#74) drives Herdr, the terminal multiplexer Marv runs in, from Marv's own process (the `herdr` CLI, through mesh v2's adapter). Offered only when Marv starts in a Herdr pane (`HERDR_ENV`), fixed for the session; the sandbox still can't reach Herdr (its variables cleared, its socket hidden: #130), only the door can:
+  - **reads run without asking** (list workspaces, tabs, panes, agents; a pane's status; a pane's last lines). What comes back is other programs' text (screens, names and titles anyone can set): it's `Provenance::Herdr`, fenced as data (`<untrusted-data source="herdr">`) and it **taints** the session, like a mesh message;
+  - **light actions ask** (focus, rename, a prompt typed into an idle agent's pane), "always" allowed (`herdr:focus`, `herdr:rename`, `herdr:prompt:<pane>`). A prompt is never a command (the pane send's rule, #128: text starting with `/`, `!` or `#` is refused before anyone is asked). In a turn another agent started (a mesh wake; the radio's turns once #124's phase 2 lands, same `ToolContext::no_auto_approval`), they're asked `once`: no remembered "always" answers them;
+  - **running anything is asked every time** (`once`: never remembered, not by "always", the config's pre-approved scopes or yolo): `run` (a command in a new pane) and `spawn` (a Marv or another Herdr agent kind, optionally in a new git worktree). The approval shows the exact command, the folder or branch, the worker's kind and its task. Only where someone approves each one at a terminal (`Doors::herdr`, the TUI's main agent, as `host`): refused before any ask in `marv -p` (with every `--approve` name: none covers `herdr:`), in an SDK session without `host_commands`, and for a subagent (which isn't offered the tool at all);
+  - **a spawned worker gets no more than its parent:** a Marv starts with the user's config only (never the session's `--approve` scopes or remembered answers), and with `MARV_YOLO=off` (which can only turn yolo off) unless the spawning turn is in yolo; another agent kind starts with no arguments a model chose (the tool has no field for them). At most `herdr.peers` panes per session (the user's own config; default 4, 0 to 16), checked before anyone is asked;
+  - the panes it opened outlive the turn and are the user's: `/peers` lists them, `/peers read <name>` shows one's last lines, `/peers stop <name>` asks the worker to leave and closes its pane (never the model's to do); a worktree stays until the user removes it. Pane names, titles and output reach the terminal only through `printable()`.
 
 ## MCP
 - Project servers need trust. The hash covers the entry and the files its command runs.
