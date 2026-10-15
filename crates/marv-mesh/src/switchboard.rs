@@ -91,6 +91,8 @@ pub trait TrajectorySink: Send + Sync {
     fn mesh(&self, record: MeshRecord);
     /// A radio event (#124): joins, leaves, `lost`, `silent`, drops and refused frames.
     fn radio(&self, _record: crate::radio::RadioRecord) {}
+    /// A radio message sent or received, delivered or refused (#124, phase 2): never its text.
+    fn radio_frame(&self, _record: crate::radio::RadioFrameRecord) {}
 }
 
 /// A sink that keeps nothing (tests, and runs without trajectories).
@@ -157,6 +159,8 @@ struct Board {
     seq: u64,
     /// Unread messages per agent, oldest first.
     inboxes: HashMap<PlugId, VecDeque<Envelope>>,
+    /// Unread radio messages (#124), oldest first: the main agent's alone, drained at the inbox's points.
+    radio_inbox: VecDeque<crate::radio::RadioMessage>,
     /// Sockets bound by `plug` that `serve` hasn't picked up yet.
     unserved: Vec<(PlugId, StdUnixListener)>,
     /// Stops a plug's listener and its connections when it's unplugged.
@@ -203,6 +207,36 @@ impl Switchboard {
     pub fn log_radio(&self, record: crate::radio::RadioRecord) {
         let sink = self.trajectory.lock().unwrap_or_else(|e| e.into_inner()).clone();
         sink.radio(record);
+    }
+
+    /// Logs a radio message (never its text) to the current trajectory.
+    pub fn log_radio_frame(&self, record: crate::radio::RadioFrameRecord) {
+        let sink = self.trajectory.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        sink.radio_frame(record);
+    }
+
+    /// A radio message for the main agent (#124): queued, unless `depth` wait unread already (the oldest are kept,
+    /// the new one refused, as an inbox does). Rings [`Self::mail`].
+    pub fn deliver_radio(&self, message: crate::radio::RadioMessage, depth: usize) -> bool {
+        {
+            let mut board = self.board();
+            if board.radio_inbox.len() >= depth {
+                return false;
+            }
+            board.radio_inbox.push_back(message);
+        }
+        self.mail.notify_one();
+        true
+    }
+
+    /// The unread radio messages, oldest first, without taking them: what decides a radio wake (#124).
+    pub fn unread_radio(&self) -> Vec<crate::radio::RadioMessage> {
+        self.board().radio_inbox.iter().cloned().collect()
+    }
+
+    /// The unread radio messages for the main agent's next read (oldest first).
+    pub fn drain_radio(&self) -> Vec<crate::radio::RadioMessage> {
+        self.board().radio_inbox.drain(..).collect()
     }
 
     /// Where the other Marvs' doors are (set when this one's door opens).
