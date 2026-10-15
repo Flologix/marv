@@ -6,6 +6,10 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+### Added
+
+- **The mesh radio, phase 1: presence (#124). Opt-in, off by default.** With `/radio on` (or `"mesh": {"radio": true}` in your own `~/.marv/config.json`), your Marvs on one machine show each other in one line above the prompt: name, idle, working or waiting for its user, and the conversation's title. `/radio` lists them with their panes and how long each state has lasted; `/radio off` leaves. `"mesh": {"radio": {"titles": false}}` keeps the title out. Presence is drawn in the TUI only: no other Marv's words reach a model, and `mesh_list`'s new "On the radio" section gives the model names and states only, without tainting the conversation. A Marv that stops answering shows `silent` after 45 s and drops after 120 s; one that was killed shows `left (lost)` and its socket is removed. `marv mesh ls` has a `radio` column. Links are private Unix sockets, each end checked by its process id; sandboxed commands can't see them. A project's `.marv/config.json` that sets `mesh` (the radio or wake) is ignored with a startup note; there's no flag or environment variable for it, and `marv -p` and subagents are never on the radio. Sending messages and requests on the radio come in later phases.
+
 ### Fixed
 
 - **A mesh message that isn't text is refused, never typed or passed on as JSON (#123).** A `herdr.pane.<pane>.send` whose arguments weren't `{"text": "..."}` (a model sent `{"prompt": "..."}`) typed the JSON into the pane. Now the switchboard refuses it, and any `send` to an inbox or to another Marv's inbox whose body isn't a JSON string or `{"text": "..."}`, with `expected {"text": "..."}` and nothing typed or queued. An object with keys besides `text` is refused too, so no words are dropped quietly. `mesh_call` checks a pane send's arguments first, so a bad one doesn't ask the user to wire anything.
