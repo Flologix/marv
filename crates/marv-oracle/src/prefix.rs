@@ -9,7 +9,8 @@
 //! - every message of the previous request is in this one, at the same index, with the same bytes;
 //! - every other field (`model`, `tools`, `stream_options`, …) has the same bytes, except
 //!   `tool_choice`: the wrap-up reply at the step limit sends `"none"` with the tools still there
-//!   (#59), which leaves the prefix alone;
+//!   (#59), which leaves the prefix alone, and `max_tokens`: it follows the room left in the window
+//!   (#116), and an output cap isn't part of the cached prompt;
 //! - `cache_control` breakpoints (#56) don't count. They mark the last message, so they move each
 //!   request by design: a marked message (`[{"type":"text","text":…,"cache_control":…}]`) counts as
 //!   its plain text, and a marker elsewhere is cut out.
@@ -30,7 +31,7 @@ pub struct Break {
 }
 
 /// Fields that may change between requests without touching the cached prefix.
-const FREE_FIELDS: [&str; 2] = ["messages", "tool_choice"];
+const FREE_FIELDS: [&str; 3] = ["messages", "tool_choice", "max_tokens"];
 
 /// Checks each body against the one before it. `resets` are 1-based request numbers allowed to
 /// start over (after a compaction).
@@ -212,6 +213,16 @@ mod tests {
         let wrap_up =
             r#"{"model":"m","stream":true,"messages":[{"role":"system","content":"S"}],"tools":[],"tool_choice":"none"}"#;
         assert_eq!(prefix_breaks(&[body(&[SYS], "[]"), wrap_up.to_string()], &[]), []);
+    }
+
+    #[test]
+    fn max_tokens_may_change_or_go() {
+        // #116: the cap follows the room left in the window, and goes when there's none.
+        let capped = |cap: &str| {
+            format!(r#"{{"model":"m","stream":true,"messages":[{{"role":"system","content":"S"}}],"tools":[]{cap}}}"#)
+        };
+        let bodies = [capped(r#","max_tokens":32000"#), capped(r#","max_tokens":17672"#), capped("")];
+        assert_eq!(prefix_breaks(&bodies, &[]), []);
     }
 
     #[test]
