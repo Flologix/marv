@@ -217,6 +217,28 @@ impl Presence {
     }
 }
 
+/// `presence` cut to fit [`MAX_PRESENCE_BYTES`]: the title first, then the project, a character at a time (each stays
+/// one clean line ending in `…`). 56 characters of four bytes each, with a project like it, are over: unfitted, every
+/// peer would refuse this Marv's joins and frames.
+fn fitted(mut presence: Presence) -> Presence {
+    fn size(p: &Presence) -> usize {
+        serde_json::to_string(p).map_or(usize::MAX, |s| s.len())
+    }
+    fn shorter(text: &str) -> String {
+        match text.chars().count() {
+            0 | 1 => String::new(),
+            n => one_line(text, n - 1),
+        }
+    }
+    while size(&presence) > MAX_PRESENCE_BYTES && !presence.title.is_empty() {
+        presence.title = shorter(&presence.title);
+    }
+    while size(&presence) > MAX_PRESENCE_BYTES && !presence.project.is_empty() {
+        presence.project = shorter(&presence.project);
+    }
+    presence
+}
+
 /// A presence frame's fields besides the presence: `{v, id, seq, kind, to, by, hop, at_ms, presence}`. There is no
 /// `from`: the receiver knows the sender by the link.
 fn presence_frame(own: &str, seq: u64, presence: &Presence) -> Value {
@@ -527,13 +549,14 @@ impl Radio {
         }
     }
 
-    /// This Marv's presence as sent: its title left out when titles are off.
+    /// This Marv's presence as sent: its title left out when titles are off, and cut to fit
+    /// [`MAX_PRESENCE_BYTES`] ([`fitted`]), which every peer checks.
     pub fn presence(&self) -> Presence {
         let mut me = self.me().clone();
         if !self.titles.load(Ordering::SeqCst) {
             me.title.clear();
         }
-        me
+        fitted(me)
     }
 
     fn next_seq(&self) -> u64 {
@@ -1122,6 +1145,28 @@ mod tests {
         assert!(a.radio.roster().is_empty());
         until("the re-list's join", || a.radio.roster().len() == 1 && b.radio.roster().len() == 1).await;
         assert_eq!(a.radio.links(), [("beta".to_string(), "alpha".to_string())]);
+    }
+
+    /// A title and project of four-byte characters at their limits are over 512 bytes: the presence sent is cut to
+    /// fit, so peers don't refuse this Marv.
+    #[tokio::test]
+    async fn a_presence_is_cut_to_fit_its_size() {
+        let mesh = Runtime::new();
+        let (a, b) = (marv("alpha", &mesh.0, fast()), marv("beta", &mesh.0, fast()));
+        let wide = "\u{1F600}".repeat(80);
+        b.radio.update(|p| {
+            p.project = clean_project(Path::new(&format!("/x/{wide}")));
+            p.pane = Some("p".repeat(MAX_PANE_CHARS));
+        });
+        b.radio.set_title(&wide);
+        assert_eq!(b.radio.me().title.chars().count(), MAX_TITLE_CHARS);
+        let sent = b.radio.presence();
+        assert_eq!(sent.check(), Ok(()));
+        assert!(sent.title.ends_with('…') && sent.title.chars().count() > 20, "{}", sent.title);
+        a.radio.turn_on().await;
+        b.radio.turn_on().await;
+        until("a link", || a.radio.roster().len() == 1).await;
+        assert_eq!(a.radio.roster()[0].title, sent.title);
     }
 
     #[tokio::test]
