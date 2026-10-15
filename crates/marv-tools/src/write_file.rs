@@ -596,7 +596,7 @@ mod tests {
         assert!(out.output.contains("hi"));
         let asked = f.asked();
         assert_eq!(asked[0].preview.command.as_deref(), Some("echo hi"));
-        assert_eq!(asked[0].scope, Scope { key: "bash:echo hi".into(), description: "this exact command".into() });
+        assert_eq!(asked[0].scope, Scope { key: "bash::echo hi".into(), description: "this exact command".into() });
     }
 
     #[tokio::test]

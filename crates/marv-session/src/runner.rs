@@ -163,7 +163,7 @@ pub struct AlwaysScopes {
 }
 
 /// Scope prefixes a subagent never inherits: what reaches the network or leaves the sandbox.
-pub const NOT_INHERITED: [&str; 4] = ["bash:net:", "web:", "mcp:", "mesh:"];
+pub const NOT_INHERITED: [&str; 5] = ["bash:net:", "bash:net+git:", "web:", "mcp:", "mesh:"];
 
 impl AlwaysScopes {
     pub fn contains(&self, key: &str) -> bool {
@@ -396,13 +396,15 @@ mod tests {
     #[test]
     fn subagents_dont_inherit_egress_scopes() {
         let always = AlwaysScopes::default();
-        for k in ["files", "bash:net:curl", "web:docs.rs", "mcp:gh:search", "mesh:agent.x.inbox", "bash"] {
+        for k in ["files", "bash:net:curl", "bash:net+git:git push", "web:docs.rs", "mcp:gh:search", "mesh:agent.x.inbox", "bash"]
+        {
             always.add(k);
         }
         let sub = always.for_subagent();
         assert!(sub.contains("files") && sub.contains("bash"));
         assert!(
             !sub.contains("bash:net:curl")
+                && !sub.contains("bash:net+git:git push")
                 && !sub.contains("web:docs.rs")
                 && !sub.contains("mcp:gh:search")
                 && !sub.contains("mesh:agent.x.inbox")

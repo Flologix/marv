@@ -249,3 +249,79 @@ fn subagents_dont_inherit_config_scopes() {
             && !sub.contains("mesh:agent.x.inbox:send")
     );
 }
+
+/// The two ways a network command could have been dressed as a `git_write` one: both flags set, or the network
+/// flag with a command whose text starts like the git flag segment (`git:;…`). Each leaves `name` when it runs.
+fn network_commands_under_git_write(first: &str, second: &str) -> [serde_json::Value; 2] {
+    [
+        json!({"command": format!("touch {first}"), "network": true, "git_write": true}),
+        json!({"command": format!("git:;touch {second}"), "network": true}),
+    ]
+}
+
+/// **`git_write` alone never covers a network command (config `"approve"`).** With `"approve": ["git_write"]`, a
+/// command with both network and git_write, and a network command whose text starts with `git:`, are both asked
+/// (and, declined, don't run). With `git_write` and `network` both, the first runs without asking.
+///
+/// Proven: restored `"bash:net:git:"` in `git_write`'s prefixes and the `bash:{net}{git}{command}` key → this
+/// failed (neither was asked).
+#[tokio::test]
+async fn config_approve_git_write_never_covers_a_network_command() {
+    let s = Setup::new();
+    // One turn each: a declined call ends the turn.
+    for (args, ran) in network_commands_under_git_write("ran-1", "ran-2").into_iter().zip(["ran-1", "ran-2"]) {
+        let approver = Recorder::new(Decision::No);
+        let calls = vec![tool_call("1", "bash", args)];
+        let run = sdk_turn(s.project.path(), &s.config_dir, Scripted::new(vec![use_tools(calls), say("Done.")]), |o| {
+            o.yolo = false;
+            o.approve = Some(approver.clone());
+            o.pre_approved = ["git_write".to_string()].into();
+        })
+        .await;
+        let asked = approver.requests();
+        assert_eq!(asked.len(), 1, "asked: {:?}", asked.iter().map(|r| r.scope.key.clone()).collect::<Vec<_>>());
+        assert!(asked[0].network, "{:?}", asked[0].scope.key);
+        assert!(declined(&run.results[0]), "{}", run.results[0].output);
+        assert!(s.project.read(ran).is_none(), "{ran}: didn't run");
+    }
+
+    // The control: git_write and network both cover a command with both flags.
+    marv_guards::require_bwrap!();
+    let approver = Recorder::new(Decision::No);
+    let calls = vec![tool_call("1", "bash", network_commands_under_git_write("ran-3", "unused")[0].clone())];
+    let run = sdk_turn(s.project.path(), &s.config_dir, Scripted::new(vec![use_tools(calls), say("Done.")]), |o| {
+        o.yolo = false;
+        o.approve = Some(approver.clone());
+        o.pre_approved = ["git_write".to_string(), "network".to_string()].into();
+    })
+    .await;
+    assert!(approver.requests().is_empty(), "{:?}", approver.requests().iter().map(|r| r.scope.key.clone()).collect::<Vec<_>>());
+    assert!(!declined(&run.results[0]), "{}", run.results[0].output);
+    assert!(s.project.read("ran-3").is_some(), "it ran");
+}
+
+/// **…nor in `marv -p --approve git_write`.** Both network commands are refused (exit 3) and don't run; with
+/// `--approve git_write --approve network` the first one runs.
+///
+/// Proven: same revert as above → this failed (both ran, exit 0).
+#[test]
+fn headless_approve_git_write_never_covers_a_network_command() {
+    marv_guards::require_bwrap!();
+    let (root, config) = (TempDir::new("approvals-p"), TempDir::new("approvals-p-config"));
+    let path = std::env::var("PATH").unwrap_or_default();
+    let env = [("PATH", path.as_str()), ("MARV_GITHUB", "off")];
+    let calls = |first: &str, second: &str| {
+        network_commands_under_git_write(first, second)
+            .into_iter()
+            .enumerate()
+            .map(|(i, arguments)| marv_oracle::script::ScriptCall { id: Some(format!("g{i}")), name: "bash".into(), arguments })
+            .collect::<Vec<_>>()
+    };
+    let out = marv_guards::headless(root.path(), config.path(), calls("ran-1", "ran-2"), &["git_write"], &env);
+    assert_eq!(out.code, Some(3), "{}", out.result);
+    assert_eq!(out.result["refused"].as_array().map(Vec::len), Some(2), "{}", out.result);
+    assert!(root.read("ran-1").is_none() && root.read("ran-2").is_none(), "neither ran");
+
+    let out = marv_guards::headless(root.path(), config.path(), calls("ran-3", "ran-4"), &["git_write", "network"], &env);
+    assert!(root.read("ran-3").is_some(), "with network too, the first ran: {}", out.result);
+}

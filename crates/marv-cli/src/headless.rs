@@ -546,8 +546,12 @@ mod tests {
         let (a, _) = build_approver(&["git_write".into()]).unwrap();
         let a = a.unwrap();
         assert_eq!(a.approve(request("bash:git:commit")).await, Decision::Yes);
-        assert_eq!(a.approve(request("bash:net:git:push")).await, Decision::Yes);
+        // git_write alone never covers a command with the network: a push needs network too.
+        assert_eq!(a.approve(request("bash:net+git:git push")).await, Decision::Unavailable);
+        assert_eq!(a.approve(request("bash:net:git:;curl x")).await, Decision::Unavailable);
         assert_eq!(a.approve(request("bash:net:curl")).await, Decision::Unavailable);
+        let (both, _) = build_approver(&["git_write".into(), "network".into()]).unwrap();
+        assert_eq!(both.unwrap().approve(request("bash:net+git:git push")).await, Decision::Yes);
         let (a, _) = build_approver(&["files".into(), "web".into()]).unwrap();
         let a = a.unwrap();
         assert_eq!(a.approve(request("files")).await, Decision::Yes);

@@ -10,7 +10,8 @@
 //! (`AlwaysScopes`), so `must_ask` (tainted egress, protected paths) and `once` (host commands, wires) still win.
 //! It never grants a mesh wire: wires are a person's grant (`docs/MESH.md`), whatever the config says. And it never
 //! covers `process:net:` without `network`: a process with the network shares the host's, as headless has always
-//! required both scopes ([`prefix_covers`]).
+//! required both scopes; likewise a command with both network and git_write (`bash:net+git:`) needs both
+//! `git_write` and `network` ([`prefix_covers`]).
 //!
 //! Subagents get the seeds through `AlwaysScopes::for_subagent`, which strips the egress prefixes (`NOT_INHERITED`),
 //! so a worker doesn't inherit the config's network, web, MCP or mesh scopes.
@@ -20,7 +21,8 @@ use marv_mesh::approval::parse_approve_flag;
 
 /// Known `--approve` names and the scope-key prefixes they match.
 pub const APPROVE_PREFIXES: [(&str, &[&str]); 9] = [
-    ("git_write", &["bash:git:", "bash:net:git:"]),
+    // A command with network and git_write (`bash:net+git:`, a `git push`) needs `network` too: `prefix_covers`.
+    ("git_write", &["bash:git:"]),
     ("network", &["bash:net:"]),
     ("web", &["web:"]),
     ("mcp", &["mcp:"]),
@@ -35,11 +37,18 @@ pub const APPROVE_PREFIXES: [(&str, &[&str]); 9] = [
 /// Whether `prefixes` (from `--approve`, or the config's seeded "always" scopes) answer a request with scope key
 /// `key`. One shared rule, so `-p` and the seeded TUI can't drift:
 /// - the listed prefixes cover their keys;
-/// - `process:net:` (a background process with the host's network) needs both `process` and `network`.
+/// - `process:net:` (a background process with the host's network) needs both `process` and `network`;
+/// - `bash:net+git:` (a command with network and git_write) needs both `git_write` and `network`.
+///
+/// Bash keys are `bash:<flags>:<command>` with the flag segment always present, so a command's text never reads
+/// as a flag segment (`marv_tools::bash`).
 pub fn prefix_covers(prefixes: &[String], key: &str) -> bool {
+    let has = |prefix: &str| prefixes.iter().any(|p| p == prefix);
     if key.starts_with("process:net:") {
-        let has = |prefix: &str| prefixes.iter().any(|p| p == prefix);
         return has("process:") && has("bash:net:");
+    }
+    if key.starts_with("bash:net+git:") {
+        return has("bash:git:") && has("bash:net:");
     }
     prefixes.iter().any(|p| key == p || key.starts_with(p.as_str()))
 }
@@ -88,7 +97,7 @@ mod tests {
     fn known_names_expand_to_their_prefixes() {
         let (mesh, prefixes) = parse_approvals(&names(&["git_write", "web"])).unwrap();
         assert!(mesh.is_empty());
-        assert_eq!(prefixes, ["bash:git:", "bash:net:git:", "web:"]);
+        assert_eq!(prefixes, ["bash:git:", "web:"]);
     }
 
     #[test]
@@ -117,5 +126,21 @@ mod tests {
         assert!(prefix_covers(&seeds, "mesh:agent.parent.inbox:send"));
         assert!(!prefix_covers(&seeds, "mesh:agent.other.inbox:send"));
         assert!(!prefix_covers(&seeds, "github:pr merge"));
+    }
+
+    #[test]
+    fn git_write_alone_never_covers_a_network_command() {
+        let git = seed_prefixes(&names(&["git_write"])).unwrap();
+        assert!(prefix_covers(&git, "bash:git:git commit -m x"));
+        assert!(!prefix_covers(&git, "bash:net+git:git push"));
+        assert!(!prefix_covers(&git, "bash:net:git:;curl x"));
+        assert!(!prefix_covers(&git, "bash:net:curl x"));
+        let net = seed_prefixes(&names(&["network"])).unwrap();
+        assert!(prefix_covers(&net, "bash:net:curl x"));
+        assert!(!prefix_covers(&net, "bash:net+git:git push"));
+        let both = seed_prefixes(&names(&["git_write", "network"])).unwrap();
+        assert!(prefix_covers(&both, "bash:net+git:git push"));
+        // A command whose text starts like a flag is still a command without flags.
+        assert!(!prefix_covers(&both, "bash::git:x") && !prefix_covers(&both, "bash::net:x"));
     }
 }
