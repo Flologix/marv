@@ -356,6 +356,10 @@ pub struct ToolContext {
     pub sandbox: Arc<Sandbox>,
     /// Yolo mode: calls whose tool says they're safe (`auto_safe`) run without asking.
     pub yolo: bool,
+    /// Automatic approval is off (marv-rs #124: a turn the mesh radio started): yolo doesn't apply, a URL prefix
+    /// approved earlier doesn't either, and every call that asks is asked `once`, so neither a remembered "always"
+    /// nor a worktree subagent's automatic yes answers it. Only a person at this Marv does. Subagents inherit it.
+    pub no_auto_approval: bool,
     /// Set by `run_tool` for a call that runs without asking: bash then sees the project's `.git` read-only, and the
     /// edit tools re-check `.git` at apply time.
     pub confined: bool,
@@ -421,6 +425,7 @@ impl ToolContext {
             approver: None,
             sandbox: Arc::new(sandbox),
             yolo: false,
+            no_auto_approval: false,
             confined: false,
             skills: Arc::new(Vec::new()),
             memory: None,

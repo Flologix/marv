@@ -208,14 +208,20 @@ pub fn wire_approver(own: Option<Arc<dyn WireApprover>>, approve: Option<&Arc<dy
     own.or_else(|| approve.map(|inner| Arc::new(PersonWires { inner: inner.clone(), by: WireBy::Tui }) as Arc<dyn WireApprover>))
 }
 
-/// The unread messages in `agent`'s inbox, fenced, as one note for the model; marks the session tainted (Mesh).
+/// The unread messages in `agent`'s inbox, fenced, as one note for the model; marks the session tainted (Mesh). For
+/// the main agent, the radio's unread messages too (#124), in their own fence after the inbox's: subagents aren't on
+/// the radio, so a worker's read never takes them.
 pub fn inbox_note(mesh: &Switchboard, agent: &PlugId, taint: &TaintState) -> Option<String> {
     let messages = mesh.drain_inbox(agent);
-    if messages.is_empty() {
+    let radio = if agent.as_str() == PARENT { mesh.drain_radio() } else { Vec::new() };
+    if messages.is_empty() && radio.is_empty() {
         return None;
     }
+    // Before the text goes anywhere: the request that carries it is sent tainted.
     taint.mark(Provenance::Mesh);
-    Some(messages.iter().map(|m| m.fenced()).collect::<Vec<_>>().join("\n\n"))
+    let mut notes: Vec<String> = messages.iter().map(|m| m.fenced()).collect();
+    notes.extend(marv_mesh::radio::radio_note(&radio));
+    Some(notes.join("\n\n"))
 }
 
 /// `after_step` that also reads the agent's inbox: its messages follow the step's own note (the checks').
