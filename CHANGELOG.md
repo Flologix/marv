@@ -9,7 +9,13 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 ### Added
 
 - **The Herdr door (#74): Marv can drive the Herdr it runs in.** When Marv starts in a Herdr pane, the model gets a `herdr` tool that runs in Marv's own process (the sandbox still can't reach Herdr). It lists workspaces, tabs, panes and agents and reads a pane without asking; what it reads is treated as other programs' text: fenced, and the conversation counts as untrusted from then on. Focusing, renaming and typing a prompt into an idle agent's pane ask first ("always" allowed; a prompt is never a command). Running a command in a new pane and **spawning a persistent worker** (a Marv, or an agent kind Herdr supports such as Claude Code or Codex, optionally in a new git worktree) ask every time, showing the exact command, folder or branch, kind and task; "always", yolo and pre-approved scopes never cover them, and they're refused in `marv -p` and for subagents. A spawned Marv starts with your config only, held out of yolo unless the spawning session is in yolo; another agent starts with its own defaults. At most 4 panes per session (`"herdr": {"peers": N}` in your own `~/.marv/config.json`, up to 16). `/peers` lists them, `/peers read <name>` shows one's last lines, `/peers stop <name>` closes one (a worktree stays). In a turn a mesh message started, its focus, rename and prompt ask every time.
-- **`MARV_YOLO=off` keeps yolo off for that Marv**, whatever the config says (it can't turn yolo on). The Herdr door starts a worker this way when the session that spawns it isn't in yolo.
+- **`MARV_YOLO=off` keeps yolo off for that Marv**, whatever the config says (it can't turn yolo on, and `/yolo on` says so). The Herdr door starts a worker this way when the session that spawns it isn't in yolo.
+- **`MARV_TAINTED=1` starts a Marv with its conversation counted as untrusted**, so anything that can send data out asks first (it can only add that, never remove it). The Herdr door starts a worker this way when the conversation that spawns it is untrusted.
+
+### Changed
+
+- **The doors only use absolute PATH entries outside the project.** The github tool's `gh` (and the new Herdr door's `herdr`) is taken from an absolute PATH entry, never a relative one, and never from inside the project or a folder the sandbox can write.
+- **A Herdr pane send can't start with `-`.** It's refused with nothing typed, as text starting with `/`, `!` or `#` already is.
 
 ## [0.7.0] - 2026-10-15
 

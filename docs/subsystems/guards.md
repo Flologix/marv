@@ -95,6 +95,11 @@ Each guard's doc comment says how it was proven: the guard was reverted, and the
 | herdr: the peer limit holds before any ask | `herdr.rs::the_peer_limit_holds_before_anyone_is_asked` | Proven |
 | herdr: a light action in a woken turn gets no "always" | `herdr.rs::a_light_action_in_a_woken_turn_gets_no_always` | Proven |
 | herdr: names and output reach the terminal through `printable()` | `herdr.rs::herdr_names_and_output_reach_the_terminal_only_through_printable` | Proven |
+| herdr: `/peers stop` types nothing into a busy or asking agent | `herdr.rs::stopping_a_peer_types_nothing_into_an_agent_thats_busy_or_asking` | Proven |
+| doors: a `gh`/`herdr` planted in the project or a relative PATH entry is never run | `herdr.rs::a_door_program_planted_in_the_project_is_never_run` | Proven |
+| herdr: nothing starting with `-` reaches the CLI | `herdr.rs::nothing_starting_with_a_dash_reaches_the_herdr_cli` | Proven (four reverts) |
+| herdr: a worker spawned from a tainted conversation starts tainted | `herdr.rs::a_worker_spawned_from_a_tainted_conversation_starts_tainted` | Proven (two reverts; the marv binary) |
+| herdr: a tainted prompt asks every time and says whose words | `herdr.rs::a_prompt_in_a_tainted_conversation_asks_every_time_and_says_whose_words` | Proven (two reverts) |
 | `marv -p`: tainted egress refused with `--approve web` alone | `headless_taint.rs::headless_refuses_tainted_egress_with_approve_alone` | Proven (the marv binary) |
 | `marv -p`: `--approve-tainted` opts in; untainted `--approve web` unchanged | `headless_taint.rs::headless_approve_tainted_allows_tainted_egress`, `headless_approve_web_still_allows_untainted_egress` | Controls |
 | `marv -p`: a protected-path write needs `--approve-protected` | `headless_taint.rs::headless_refuses_protected_writes_without_approve_protected` | Proven (the marv binary) |

