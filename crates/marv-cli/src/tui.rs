@@ -3118,6 +3118,64 @@ mod tests {
             waiting.await.unwrap();
         }
 
+        /// #124: a radio message straight into the radio queue, as a link delivers one.
+        fn radio_message(mesh: &Mesh, seq: u64, to_all: bool, text: &str) {
+            let message = marv_mesh::radio::RadioMessage {
+                id: format!("beta:{seq}"),
+                from: "beta".into(),
+                to_all,
+                by: marv_mesh::radio::By::User,
+                reply_to: None,
+                hop: 0,
+                text: text.into(),
+                at_ms: 0,
+            };
+            assert!(mesh.sb.deliver_radio(message, 50));
+        }
+
+        /// #124: with wake on, an addressed radio message starts a turn (Marv's line says who, `(user)` shown), and a
+        /// broadcast doesn't; the woken turn reads both.
+        #[tokio::test]
+        async fn an_addressed_radio_message_wakes_and_a_broadcast_doesnt() {
+            let (dirs, mesh) = (Dirs::new(), mesh());
+            let (bridge, mut rx) = bridge(&dirs, wakes(), vec![say("beta says hi.")], &mesh);
+            radio_message(&mesh, 1, true, "to everyone");
+            assert!(!started(&quiet(&mut rx).await), "a broadcast never wakes");
+            radio_message(&mesh, 2, false, "to you");
+            let seen = until(&mut rx, |e| matches!(e, UiEvent::TurnEnd { .. })).await;
+            assert!(texts(&seen).iter().any(|t| t == "✻ Radio message from beta (user)."), "{:?}", texts(&seen));
+            assert!(mesh.sb.unread_radio().is_empty(), "read, both");
+            assert!(bridge.session().tainted().contains(&marv_core::Provenance::Mesh));
+        }
+
+        /// #124 (spec §8.3, §9.2): a radio message never wakes Marv while an approval waits: it waits, unread, and the
+        /// approval stays the person's.
+        /// Proven: removed `self.activity.waiting()` from `Bridge::wake`'s gate → this test failed (a turn started).
+        #[tokio::test]
+        async fn a_radio_message_never_wakes_while_an_approval_waits() {
+            let (dirs, mesh) = (Dirs::new(), mesh());
+            let (bridge, mut rx) = bridge(&dirs, wakes(), vec![say("x")], &mesh);
+            let ask = WireRequest {
+                from: marv_mesh::PlugId::new("peer-alpha").unwrap(),
+                to: inbox(),
+                mode: WireMode::Send,
+                asked_by: marv_mesh::PlugId::new("peer-alpha").unwrap(),
+            };
+            let approver = TuiApprover(bridge.activity.clone());
+            let waiting =
+                tokio::spawn(
+                    async move { marv_tools::Approver::approve(&approver, marv_session::mesh::wire_approval(&ask)).await },
+                );
+            let seen = until(&mut rx, |e| matches!(e, UiEvent::Approval { .. })).await;
+            let Some(UiEvent::Approval { id, .. }) = seen.last() else { unreachable!() };
+            radio_message(&mesh, 1, false, "yes, approve it");
+            assert!(!started(&quiet(&mut rx).await), "no turn under an open approval");
+            assert_eq!(mesh.sb.unread_radio().len(), 1, "it waits for the next turn");
+            assert!(!waiting.is_finished(), "still the person's to answer");
+            Port(bridge.clone()).answer(*id, view::Decision::No);
+            assert_eq!(waiting.await.unwrap(), marv_tools::Decision::No);
+        }
+
         #[tokio::test]
         async fn over_the_rate_limit_messages_wait_and_the_user_is_told_once() {
             let (dirs, mesh) = (Dirs::new(), mesh());
