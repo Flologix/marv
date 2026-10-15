@@ -5144,6 +5144,38 @@ mod turn_tests {
     /// #98 with #78: the config's pre-approved scopes (here web, network and the worker's mesh calls) never answer
     /// egress in a turn a mesh message woke: the inbox taints the session first, so web_fetch and mesh_send ask with
     /// `must_ask`, and the planted request sends nothing.
+    /// #74's lifecycle: a worker the door spawned outlives the turn, is listed with Herdr's state, read, and stopped
+    /// by the user (`/exit` typed for a Marv, then its pane closed); then it's gone from the list.
+    #[tokio::test]
+    async fn a_spawned_peer_outlives_the_turn_and_the_user_stops_it() {
+        let dirs = Dirs::new();
+        let herdr = dirs.dir.join("herdr");
+        let provider = Scripted::new(vec![
+            use_tools(vec![call(
+                "s1",
+                "herdr",
+                serde_json::json!({"action": "spawn", "kind": "marv", "task": "fix it", "name": "fixer"}),
+            )]),
+            say("Started."),
+        ]);
+        let session = scripted(&dirs, &provider, |init| {
+            init.herdr = Some(crate::herdr_door::fake::fake_setup(&herdr, 4));
+            init.host_commands = true;
+            init.approve = Some(answer(Decision::Yes));
+        });
+        collect(go(&session, "start a worker")).await;
+        let peers = session.peers();
+        assert_eq!(peers.iter().map(|p| (p.name.as_str(), p.pane.as_str())).collect::<Vec<_>>(), [("fixer", "w1:p5")]);
+        assert_eq!(session.peer_states().await, [Some("idle".to_string())]);
+        assert!(session.read_peer("fixer", 10).await.unwrap().contains("all tests pass"));
+        assert!(session.stop_peer("nobody").await.is_err());
+        session.stop_peer("fixer").await.unwrap();
+        assert!(session.peers().is_empty());
+        let log = crate::herdr_door::fake::fake_herdr_log(&herdr);
+        let at = |line: &str| log.iter().position(|l| l == line).unwrap_or_else(|| panic!("{line}: {log:?}"));
+        assert!(at("pane send-text w1:p5 /exit") < at("pane close w1:p5"));
+    }
+
     #[tokio::test]
     async fn pre_approved_scopes_dont_cover_egress_in_a_woken_turn() {
         use crate::mesh::{WakeBy, parent_id};
