@@ -6,6 +6,12 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+### Fixed
+
+- **A mesh message that isn't text is refused, never typed or passed on as JSON (#123).** A `herdr.pane.<pane>.send` whose arguments weren't `{"text": "..."}` (a model sent `{"prompt": "..."}`) typed the JSON into the pane. Now the switchboard refuses it, and any `send` to an inbox or to another Marv's inbox whose body isn't a JSON string or `{"text": "..."}`, with `expected {"text": "..."}` and nothing typed or queued. An object with keys besides `text` is refused too, so no words are dropped quietly. `mesh_call` checks a pane send's arguments first, so a bad one doesn't ask the user to wire anything.
+- **`mesh_list` and the pane receptacles say how to read a pane (#123).** `herdr.pane.<pane>.status` with `lines: N` returns the pane's last N lines (what its agent shows); its description and `mesh_list`'s hint now say so.
+- **A Herdr pane running a Marv that `mesh_list` lists is steered to that Marv's inbox (#123).** Its line offers `.status` and says "This is Marv X: mesh_send to its inbox peer.X.agent.parent.inbox to get a reply", instead of offering `.send`, which types as if the user typed and can't get an answer back. `.send` still works when named, and is still listed for a Marv that isn't on the mesh.
+
 ## [0.5.0] - 2026-10-14
 
 ### Fixed

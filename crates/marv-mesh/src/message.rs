@@ -12,6 +12,7 @@ use marv_core::Provenance;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::MeshError;
 use crate::plug::PlugId;
 use crate::receptacle::ReceptacleName;
 use crate::wire::WireMode;
@@ -43,15 +44,18 @@ impl Envelope {
         Self { id, sender, receptacle, mode, provenance: Provenance::Mesh, body, size, at_ms }
     }
 
-    /// The body as text: a string body as is, anything else as JSON.
+    /// The body as text: a string body as is, `{"text": "…"}` as its text, anything else as JSON. Only for showing
+    /// a message (inside the fence); what is typed or forwarded as text takes [`Self::send_text`], which refuses the
+    /// rest (#123).
     pub fn text(&self) -> String {
-        match &self.body {
-            Value::String(s) => s.clone(),
-            Value::Object(o) if o.len() == 1 && o.get("text").is_some_and(Value::is_string) => {
-                o["text"].as_str().unwrap_or_default().to_string()
-            }
-            other => other.to_string(),
-        }
+        text_body(&self.body).map_or_else(|| self.body.to_string(), str::to_string)
+    }
+
+    /// The body as the text a send carries, or a refusal naming the expected shape: a JSON string, or an object
+    /// whose only field is a string `text` (#123). Other keys aren't dropped quietly (the model put words there it
+    /// meant to send), and the request's own fields aren't echoed back.
+    pub fn send_text(&self) -> crate::Result<&str> {
+        text_body(&self.body).ok_or_else(|| bad_text_body(self.receptacle.as_str()))
     }
 
     /// How the receiving model sees it: fenced as data from another agent.
@@ -63,6 +67,22 @@ impl Envelope {
             self.sender, self.receptacle, self.size, self.sender, self.receptacle
         )
     }
+}
+
+/// A message's text: a string body, or `{"text": "…"}` with no other field.
+pub fn text_body(body: &Value) -> Option<&str> {
+    match body {
+        Value::String(s) => Some(s),
+        Value::Object(o) if o.len() == 1 => o.get("text").and_then(Value::as_str),
+        _ => None,
+    }
+}
+
+/// The refusal for a body that isn't text, in the words the model needs to fix it.
+pub fn bad_text_body(receptacle: &str) -> MeshError {
+    MeshError::BadName(format!(
+        "{receptacle}: expected {{\"text\": \"...\"}} (one string field, text, and nothing else); nothing was sent"
+    ))
 }
 
 #[cfg(test)]
@@ -87,6 +107,23 @@ mod tests {
         assert!(e.provenance.taints());
         assert_eq!(e.size, r#"{"text":"done"}"#.len());
         assert_eq!(e.text(), "done");
+    }
+
+    #[test]
+    fn send_text_takes_a_string_or_a_lone_text_field_and_refuses_the_rest() {
+        assert_eq!(env(Value::from("hi")).send_text().unwrap(), "hi");
+        assert_eq!(env(serde_json::json!({"text": "hi"})).send_text().unwrap(), "hi");
+        for bad in [
+            serde_json::json!({"prompt": "hi"}),
+            serde_json::json!({"text": "hi", "to": "x"}),
+            serde_json::json!({"text": 1}),
+            serde_json::json!(null),
+        ] {
+            let err = env(bad.clone()).send_text().unwrap_err().to_string();
+            assert!(err.starts_with(r#"agent.parent.inbox: expected {"text": "..."}"#), "{bad}: {err}");
+        }
+        // Shown (fenced), anything else is still its JSON: never lost, never unfenced.
+        assert_eq!(env(serde_json::json!({"prompt": "hi"})).text(), r#"{"prompt":"hi"}"#);
     }
 
     #[test]

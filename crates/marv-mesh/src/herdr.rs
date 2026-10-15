@@ -249,7 +249,8 @@ const ENTER_DELAY: Duration = Duration::from_millis(150);
 pub enum PaneAction {
     /// `herdr.pane.<pane>.send`: types a prompt into the pane and presses Enter.
     Send,
-    /// `herdr.pane.<pane>.status`: the pane's agent and state, optionally its last lines.
+    /// `herdr.pane.<pane>.status`: the pane's agent and state and, with `lines: N`, its last N lines: how a pane is
+    /// read (#123: the model missed that; kept as one receptacle, so one wire reads both).
     Status,
 }
 
@@ -405,14 +406,32 @@ impl HerdrAdapter {
         let (description, schema) = match action {
             PaneAction::Send => (
                 format!(
-                    "Types a prompt into the {who} in Herdr pane {} and presses Enter, as if the user typed it",
-                    pane.pane_id
+                    "Types a prompt into the {who} in Herdr pane {} and presses Enter, as if the user typed it. Arguments: \
+                     {{\"text\": \"...\"}}, nothing else. It can't answer you: read the pane with .status and lines: N{}",
+                    pane.pane_id,
+                    if who == AGENT {
+                        ", or, when mesh_list names this Marv, mesh_send to its inbox (peer.<marv>.agent.parent.inbox) for a reply"
+                    } else {
+                        ""
+                    }
                 ),
-                json!({"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}),
+                json!({
+                    "type": "object",
+                    "properties": {"text": {"type": "string", "description": "The prompt to type."}},
+                    "required": ["text"],
+                    "additionalProperties": false
+                }),
             ),
             PaneAction::Status => (
-                format!("The state of the {who} in Herdr pane {} (and its last lines, with lines: N)", pane.pane_id),
-                json!({"type": "object", "properties": {"lines": {"type": "integer", "minimum": 0, "maximum": MAX_READ_LINES}}}),
+                format!(
+                    "Reads Herdr pane {}: the {who}'s state and, with lines: N (up to {MAX_READ_LINES}), the pane's last N \
+                     lines, which is what the agent shows (its chat)",
+                    pane.pane_id
+                ),
+                json!({"type": "object", "properties": {"lines": {
+                    "type": "integer", "minimum": 0, "maximum": MAX_READ_LINES,
+                    "description": "Also return the pane's last N lines (its chat)."
+                }}}),
             ),
         };
         Some(Receptacle {
@@ -512,7 +531,7 @@ pub struct PaneService {
 impl Service for PaneService {
     async fn deliver(&self, envelope: &Envelope) -> crate::Result<Option<Value>> {
         let answer = match self.action {
-            PaneAction::Send => self.adapter.send_text(&self.pane, &envelope.text()).await?,
+            PaneAction::Send => self.adapter.send_text(&self.pane, envelope.send_text()?).await?,
             PaneAction::Status => self.adapter.status(&self.pane, envelope.body.get("lines").and_then(Value::as_u64)).await?,
         };
         Ok(Some(Value::String(answer)))
@@ -771,6 +790,52 @@ mod tests {
         assert_eq!((answer["agent"].as_str(), answer["state"].as_str()), (Some("marv"), Some("blocked")));
         assert_eq!(answer["output"], "line1\nline2");
         assert!(fake.log().contains("pane read w1:p3 --source recent --lines 5 --format text"));
+    }
+
+    /// #123: a model sent `{"prompt": …}` and the pane got the JSON typed in. A body that isn't text is refused, with
+    /// the shape it needs, and nothing reaches the pane.
+    #[tokio::test]
+    async fn a_send_that_isnt_text_is_refused_and_nothing_is_typed() {
+        use crate::switchboard::{NoTrajectory, Switchboard};
+        use crate::wire::{Approver, Grant, Wire};
+        let fake = FakeHerdr::new();
+        let runtime = crate::switchboard::tests::Runtime::new();
+        let sb = Arc::new(Switchboard::new("s", runtime.0.clone(), Arc::new(NoTrajectory)));
+        sb.add_resolver(Arc::new(HerdrPanes(fake.adapter())));
+        let worker = crate::PlugId::new("worker-1").unwrap();
+        sb.plug(worker.clone()).unwrap();
+        let send = ReceptacleName::new("herdr.pane.w1-p2.send").unwrap();
+        sb.lookup(&send).await.unwrap();
+        sb.wire(Wire::new(worker.clone(), send.clone(), WireMode::Call, Grant::local(Approver::Tui))).unwrap();
+        for body in [
+            json!({"prompt": "Please start hack.py"}),
+            json!({"text": "hi", "prompt": "and this"}),
+            json!({"text": 5}),
+            json!({}),
+            json!(["hi"]),
+            json!(7),
+        ] {
+            let err = sb.deliver(&worker, send.as_str(), WireMode::Call, body.clone()).await.unwrap_err().to_string();
+            assert!(err.contains(r#"expected {"text": "..."}"#), "{body}: {err}");
+            assert!(!err.contains("hack.py") && !err.contains("and this"), "the body isn't echoed: {err}");
+        }
+        assert!(!fake.log().contains("send-text"), "nothing typed: {}", fake.log());
+        // A plain string or {"text": "…"} is typed.
+        sb.deliver(&worker, send.as_str(), WireMode::Call, json!("hello")).await.unwrap();
+        assert!(fake.log().contains("pane send-text w1:p2 hello\n"), "{}", fake.log());
+    }
+
+    #[test]
+    fn pane_descriptions_say_status_reads_the_pane_and_a_marv_has_an_inbox() {
+        let pane = |agent: &str| HerdrPane { pane_id: "w1:p2".into(), agent: Some(agent.into()), ..HerdrPane::default() };
+        let status = HerdrAdapter::receptacle(&pane("claude"), PaneAction::Status).unwrap();
+        assert!(status.description.contains("with lines: N"), "{}", status.description);
+        assert!(status.description.contains("last N lines"), "{}", status.description);
+        let send = HerdrAdapter::receptacle(&pane("claude"), PaneAction::Send).unwrap();
+        assert!(send.description.contains(r#"{"text": "..."}"#) && !send.description.contains("inbox"), "{}", send.description);
+        assert_eq!(send.input_schema["additionalProperties"], json!(false));
+        let marv = HerdrAdapter::receptacle(&pane("marv"), PaneAction::Send).unwrap();
+        assert!(marv.description.contains("peer.<marv>.agent.parent.inbox"), "{}", marv.description);
     }
 
     #[tokio::test]

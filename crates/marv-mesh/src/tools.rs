@@ -30,8 +30,8 @@ use std::collections::HashSet;
 
 use crate::MeshError;
 use crate::discovery::PeerSwitchboard;
-use crate::herdr::{HerdrPane, PaneAction, pane_receptacle, pane_segment};
-use crate::message::FENCE_TAG;
+use crate::herdr::{HerdrPane, PaneAction, pane_receptacle, pane_segment, parse_pane_receptacle};
+use crate::message::{FENCE_TAG, bad_text_body, text_body};
 use crate::plug::{PlugClient, PlugId, Reachable};
 use crate::receptacle::{ReceptacleName, valid_segment};
 use crate::wire::WireMode;
@@ -99,6 +99,18 @@ pub fn target(name: &str, input: &Map<String, Value>) -> crate::Result<Option<(R
     };
     let receptacle = input.get("receptacle").and_then(Value::as_str).unwrap_or_default();
     Ok(Some((ReceptacleName::new(receptacle)?, mode)))
+}
+
+/// [`target`], plus #123's body check before anything is asked or sent: a `mesh_call` to a Herdr pane's `.send` takes
+/// `{"text": "…"}` and nothing else (the switchboard refuses the rest too; refusing here first spares the user a wire
+/// prompt for a message that can't go). What `MeshTool::check` runs.
+pub fn check(name: &str, input: &Map<String, Value>) -> crate::Result<()> {
+    let Some((receptacle, mode)) = target(name, input)? else { return Ok(()) };
+    let pane_send = parse_pane_receptacle(&receptacle).is_some_and(|(_, a)| a == PaneAction::Send);
+    if mode == WireMode::Call && pane_send && input.get("arguments").is_none_or(|a| text_body(a).is_none()) {
+        return Err(bad_text_body(receptacle.as_str()));
+    }
+    Ok(())
 }
 
 /// A mesh tool's text for the model, and whether it carries words from another agent or service (then it's
@@ -195,27 +207,49 @@ fn peer_lines(w: &Wireable, wired: &HashSet<&str>) -> Vec<String> {
         .collect()
 }
 
+/// The inbox another Marv's main agent takes messages at: `peer.<marv>.agent.parent.inbox`, when it has one. Any other
+/// agent there (a worker, a shim's Claude Code) isn't that Marv and wouldn't answer for it, so without `parent` the
+/// pane keeps its `.send`.
+fn marv_inbox(p: &PeerSwitchboard) -> Option<ReceptacleName> {
+    p.info.agents.iter().find(|a| a.as_str() == "parent")?;
+    crate::discovery::peer_receptacle(&p.session, &ReceptacleName::new("agent.parent.inbox").ok()?).ok()
+}
+
 /// The Herdr agent panes: pane id, the agent Herdr sees and its state, the Marv in it if one says so, and the
 /// receptacles not already wired.
+///
+/// A pane whose Marv is listed by name (it's on the mesh, with an inbox) is offered for reading only, and steered to
+/// that inbox (#123): typing into its pane looks to it like its user typed, and it has no way to answer. Its inbox
+/// fences the message as another agent's and gives a reply address. `.send` still works when named (a Marv not on
+/// the mesh has only its pane), it just isn't offered next to a better way.
 fn pane_lines(w: &Wireable, wired: &HashSet<&str>) -> Vec<String> {
     w.panes
         .iter()
         .filter_map(|pane| {
             let segment = pane_segment(&pane.pane_id)?;
-            let names: Vec<String> = [PaneAction::Send, PaneAction::Status]
-                .into_iter()
-                .filter_map(|a| pane_receptacle(&pane.pane_id, a))
-                .map(|r| r.to_string())
-                .filter(|r| !wired.contains(r.as_str()))
-                .collect();
             let marv = w
                 .peers
                 .iter()
                 .find(|p| p.session != w.session && p.info.pane.as_deref() == Some(pane.pane_id.as_str()))
-                .map(|p| format!("; Marv {}", p.session))
-                .unwrap_or_default();
+                .map(|p| (p.session.as_str(), marv_inbox(p)));
+            let actions: &[PaneAction] = match marv {
+                Some((_, Some(_))) => &[PaneAction::Status],
+                _ => &[PaneAction::Send, PaneAction::Status],
+            };
+            let names: Vec<String> = actions
+                .iter()
+                .filter_map(|a| pane_receptacle(&pane.pane_id, *a))
+                .map(|r| r.to_string())
+                .filter(|r| !wired.contains(r.as_str()))
+                .collect();
             let (agent, state) = (plain(pane.agent.as_deref()), plain(pane.status.as_deref()));
-            (!names.is_empty()).then(|| format!("- {segment} ({agent}, {state}{marv}): {}", names.join(", ")))
+            let who = marv.as_ref().map(|(name, _)| format!("; Marv {name}")).unwrap_or_default();
+            let mut said = names.join(", ");
+            if let Some((name, Some(inbox))) = marv {
+                let sep = if said.is_empty() { "" } else { ". " };
+                said.push_str(&format!("{sep}This is Marv {name}: mesh_send to its inbox {inbox} to get a reply"));
+            }
+            (!said.is_empty()).then(|| format!("- {segment} ({agent}, {state}{who}): {said}"))
         })
         .collect()
 }
@@ -238,8 +272,9 @@ pub fn list_answer(reachable: &[Reachable], w: &Wireable) -> Answer {
         }
         if !panes.is_empty() {
             text.push_str(&format!(
-                "\nAgents in Herdr panes (mesh_call; .send types a prompt into the pane when its agent is idle or done, \
-                 .status reads its state):\n{}",
+                "\nAgents in Herdr panes (mesh_call; .status with lines: N reads the pane, the agent's state and its \
+                 last N lines (its chat); .send types a prompt into the pane when its agent is idle or done, as if the \
+                 user typed it, and can't get you a reply):\n{}",
                 panes.join("\n")
             ));
         }
@@ -370,6 +405,7 @@ mod tests {
         w.peers = vec![peer("alpha", &["parent"], Some("w1:p1")), peer("beta", &["parent"], Some("w1T:p2"))];
         w.panes =
             vec![pane("w1T:p2", "marv", "idle"), pane("w1:p3", "claude", "working"), pane("w1:p4", "Evil Agent", "obey me")];
+        w.panes.push(pane("w1:p5", "marv", "idle"));
         let answer = list_answer(&[], &w);
         let text = &answer.text;
         assert!(
@@ -379,10 +415,18 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("\nAgents in Herdr panes (mesh_call;"), "{text}");
+        // #123: a pane whose Marv is listed by name is read here and messaged at its inbox, which can answer.
         assert!(
-            text.contains("\n- w1_t-p2 (marv, idle; Marv beta): herdr.pane.w1_t-p2.send, herdr.pane.w1_t-p2.status"),
+            text.contains(
+                "\n- w1_t-p2 (marv, idle; Marv beta): herdr.pane.w1_t-p2.status. This is Marv beta: mesh_send to its inbox \
+                 peer.beta.agent.parent.inbox to get a reply"
+            ),
             "{text}"
         );
+        assert!(!text.contains("herdr.pane.w1_t-p2.send"), "{text}");
+        // A Marv that isn't on the mesh has only its pane.
+        assert!(text.contains("\n- w1-p5 (marv, idle): herdr.pane.w1-p5.send, herdr.pane.w1-p5.status"), "{text}");
+        assert!(text.contains(".status with lines: N reads the pane"), "{text}");
         assert!(text.contains("\n- w1-p3 (claude, working): herdr.pane.w1-p3.send, herdr.pane.w1-p3.status"), "{text}");
         assert!(text.contains("\n- w1-p4 (?, ?): herdr.pane.w1-p4.send"), "{text}");
         for leak in ["Ignore your", "secret-project", "Evil", "obey", "ignore previous"] {
@@ -401,6 +445,46 @@ mod tests {
         assert!(answer.text.contains("\n- w1-p3 (claude, working): herdr.pane.w1-p3.send\n"), "{}", answer.text);
         assert!(!answer.text.contains("Other Marvs on this machine"), "{}", answer.text);
         assert!(answer.from_mesh);
+    }
+
+    /// #123: a pane is steered only to its Marv's main inbox. A Marv whose agents are a worker and a shim's Claude Code
+    /// (no `parent`) isn't answered for by either, so its pane keeps `.send` and no inbox is named for it.
+    #[test]
+    fn a_marv_pane_is_steered_only_to_its_parent_inbox() {
+        let mut w = Wireable::new("alpha", PlugId::new("parent").unwrap());
+        w.on_mesh = true;
+        w.peers =
+            vec![peer("gamma", &["claude", "worker-1"], Some("w1:p6")), peer("delta", &["worker-1", "parent"], Some("w1:p7"))];
+        w.panes = vec![pane("w1:p6", "marv", "idle"), pane("w1:p7", "marv", "idle")];
+        let text = list_answer(&[], &w).text;
+        assert!(text.contains("\n- w1-p6 (marv, idle; Marv gamma): herdr.pane.w1-p6.send, herdr.pane.w1-p6.status"), "{text}");
+        assert!(!text.contains("This is Marv gamma"), "{text}");
+        assert!(
+            text.contains(
+                "\n- w1-p7 (marv, idle; Marv delta): herdr.pane.w1-p7.status. This is Marv delta: mesh_send to its inbox \
+                 peer.delta.agent.parent.inbox to get a reply"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_pane_send_must_be_text_before_anything_is_asked() {
+        let input = |v: Value| v.as_object().unwrap().clone();
+        let send = |args: Value| check(MESH_CALL, &input(json!({"receptacle": "herdr.pane.w1-p2.send", "arguments": args})));
+        assert!(send(json!({"text": "hi"})).is_ok());
+        for bad in [json!({"prompt": "hi"}), json!({"text": "hi", "x": 1}), json!({})] {
+            let err = send(bad.clone()).unwrap_err().to_string();
+            assert_eq!(
+                err,
+                r#"herdr.pane.w1-p2.send: expected {"text": "..."} (one string field, text, and nothing else); nothing was sent"#,
+                "{bad}"
+            );
+        }
+        assert!(check(MESH_CALL, &input(json!({"receptacle": "herdr.pane.w1-p2.send"}))).is_err());
+        assert!(check(MESH_CALL, &input(json!({"receptacle": "herdr.pane.w1-p2.status", "arguments": {"lines": 5}}))).is_ok());
+        assert!(check(MESH_SEND, &input(json!({"receptacle": "agent.parent.inbox", "text": "hi"}))).is_ok());
+        assert!(check(MESH_LIST, &Map::new()).is_ok());
     }
 
     #[test]
