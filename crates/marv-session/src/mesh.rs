@@ -987,6 +987,32 @@ mod tests {
         cancel.cancel();
     }
 
+    /// A pane send is a prompt, not a command: text starting with `/`, `!` or `#` is refused as invalid input before
+    /// anyone is asked to wire it, and the switchboard (or Herdr) never hears of it.
+    #[tokio::test]
+    async fn a_pane_send_of_a_command_is_invalid_input_and_asks_nothing() {
+        let (mesh, log, _rt, cancel) = switchboard();
+        let parent = mesh.plug(parent_id()).unwrap();
+        let person = Arc::new(Person(Decision::Yes, Mutex::default()));
+        let mut ctx = ToolContext::new(std::env::temp_dir());
+        ctx.approver = Some(person.clone());
+        let tools: Vec<ToolRef> =
+            MeshTool::all(&parent, &mesh, wire_approver(None, Some(&(person.clone() as Arc<dyn Approver>))))
+                .into_iter()
+                .map(|t| Arc::new(t) as ToolRef)
+                .collect();
+        for (i, text) in ["/help", "!ls", "# note", "  /help"].into_iter().enumerate() {
+            let arguments = serde_json::json!({"receptacle": "herdr.pane.w1-p2.send", "arguments": {"text": text}});
+            let call = marv_core::ToolCall { id: format!("c{i}"), name: MESH_CALL.into(), arguments: arguments.to_string() };
+            let out = marv_tools::run_tool(&call, &ctx, &tools).await;
+            assert!(out.result.is_error, "{text}: {}", out.result.output);
+            assert!(out.result.output.contains("types a prompt, not a command"), "{text}: {}", out.result.output);
+        }
+        assert!(person.1.lock().unwrap().is_empty(), "nobody was asked");
+        assert!(log.0.lock().unwrap().is_empty(), "nothing went to the switchboard");
+        cancel.cancel();
+    }
+
     /// #77: a turn stopped (Esc) while the one prompt waits doesn't leave it waiting: the call is interrupted, the
     /// prompt is dropped, and nothing is wired or sent.
     #[tokio::test]
