@@ -670,6 +670,9 @@ pub struct Activity {
     asks: Mutex<Vec<Ask>>,
     /// A turn or `/compact` is running.
     busy: AtomicBool,
+    /// Something other than an empty prompt has the keyboard (`SessionPort::keyboard_held`): Herdr is told
+    /// working, not idle, so a pane send (a prompt, not a command) can't type into it.
+    held: AtomicBool,
     herdr: Option<HerdrReporter>,
     /// The mesh radio (#124): its presence's state follows Herdr's (blocked is `waiting`).
     radio: Mutex<Option<Arc<Radio>>>,
@@ -682,6 +685,7 @@ impl Activity {
             next: AtomicU64::new(1),
             asks: Mutex::default(),
             busy: AtomicBool::new(false),
+            held: AtomicBool::new(false),
             herdr,
             radio: Mutex::default(),
         })
@@ -691,8 +695,17 @@ impl Activity {
         let _ = self.tx.send(event);
     }
 
-    /// Herdr's state: blocked at an approval, working while busy, idle otherwise.
+    /// Herdr's state: blocked at an approval, working while busy or while the keyboard is held (the palette, setup,
+    /// a half-typed slash command…), idle otherwise.
     pub fn herdr_state(&self) -> (HerdrState, Option<String>) {
+        match self.session_state() {
+            (HerdrState::Idle, _) if self.held.load(Ordering::SeqCst) => (HerdrState::Working, None),
+            state => state,
+        }
+    }
+
+    /// The session's own state, whatever has the keyboard: what the radio shows.
+    fn session_state(&self) -> (HerdrState, Option<String>) {
         let asks = self.asks.lock().unwrap_or_else(|e| e.into_inner());
         match asks.first() {
             Some(head) => (HerdrState::Blocked, Some(head.message.clone())),
@@ -707,11 +720,17 @@ impl Activity {
             herdr.state(state, message.as_deref());
         }
         if let Some(radio) = self.radio.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-            radio.set_state(match self.herdr_state().0 {
+            radio.set_state(match self.session_state().0 {
                 HerdrState::Idle => PresenceState::Idle,
                 HerdrState::Working => PresenceState::Working,
                 HerdrState::Blocked => PresenceState::Waiting,
             });
+        }
+    }
+
+    fn set_held(&self, held: bool) {
+        if self.held.swap(held, Ordering::SeqCst) != held {
+            self.report();
         }
     }
 
@@ -2290,6 +2309,10 @@ impl SessionPort for Port {
         marv_mcp::oauth::is_callback(text)
     }
 
+    fn keyboard_held(&self, held: bool) {
+        self.0.activity.set_held(held);
+    }
+
     fn login_callback(&self, text: &str) -> bool {
         if !marv_mcp::oauth::is_callback(text) {
             return false;
@@ -3208,6 +3231,30 @@ mod tests {
         let at = |s: &str| states.iter().position(|x| x == s).unwrap();
         assert!(at("working") < at("blocked"));
         assert_eq!(states.last().unwrap(), "idle");
+    }
+
+    /// A pane send is a prompt, not a command: while the palette, setup or a half-typed slash command has the
+    /// keyboard, Herdr hears working, not idle, so nothing is typed into it; idle again once the prompt is free.
+    #[tokio::test]
+    async fn a_held_keyboard_is_working_to_herdr_and_free_again_is_idle() {
+        let dirs = Dirs::new();
+        let recorder = Arc::new(Recorder::default());
+        let target = HerdrTarget { socket_path: "/unused".into(), pane_id: "w1:p7".into() };
+        let herdr = HerdrReporter::new(target, Some(recorder.clone() as Arc<dyn HerdrSend>));
+        let (tx, _rx) = unbounded_channel();
+        let bridge = Bridge::start(startup(&dirs, Some(asks()), vec![], Some(herdr.clone())), tx).unwrap();
+        bridge.report_state();
+        herdr.settled().await;
+        let port = Port(bridge.clone());
+        port.keyboard_held(true);
+        assert_eq!(bridge.activity.herdr_state(), (HerdrState::Working, None));
+        assert_eq!(bridge.activity.session_state(), (HerdrState::Idle, None), "the radio still shows idle");
+        herdr.settled().await;
+        assert_eq!(recorder.states().last().unwrap(), "working");
+        port.keyboard_held(false);
+        assert_eq!(bridge.activity.herdr_state(), (HerdrState::Idle, None));
+        herdr.settled().await;
+        assert_eq!(recorder.states().last().unwrap(), "idle");
     }
 
     fn calls(id: &str, name: &str, args: serde_json::Value) -> Vec<ProviderEvent> {

@@ -243,6 +243,9 @@ pub const MAX_READ_LINES: u64 = 200;
 /// Between the text and its Enter: an agent's TUI may still be taking the text in (Herdr's own `agent prompt` waits
 /// too), and an Enter that lands first submits half a prompt.
 const ENTER_DELAY: Duration = Duration::from_millis(150);
+/// After a send, the same pane takes no other for this long: Herdr may still call its agent idle while the prompt
+/// just typed is being taken in, and a second send's text and Enter would land in whatever that agent shows next.
+pub const SEND_GAP: Duration = Duration::from_secs(5);
 
 /// What a pane receptacle does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -349,11 +352,13 @@ pub struct HerdrAdapter {
     pub program: PathBuf,
     /// The pane Marv runs in (`HERDR_PANE_ID`): never offered.
     pub own_pane: Option<String>,
+    /// When each pane was last typed into ([`SEND_GAP`]). Held for a whole send, so sends one at a time.
+    sent: tokio::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
 }
 
 impl HerdrAdapter {
     pub fn new(program: impl Into<PathBuf>, own_pane: Option<String>) -> Self {
-        Self { program: program.into(), own_pane }
+        Self { program: program.into(), own_pane, sent: Default::default() }
     }
 
     /// Runs `herdr <args>` and returns its JSON `result`. Herdr's own words never reach the agent: an error is named
@@ -470,6 +475,14 @@ impl HerdrAdapter {
     /// a command ([`pane_prompt`]).
     pub async fn send_text(&self, pane: &str, text: &str) -> crate::Result<String> {
         let text = pane_prompt(text)?;
+        // One send at a time, and not again into a pane typed into within SEND_GAP: its state may not show it yet.
+        let mut sent = self.sent.lock().await;
+        sent.retain(|_, at| at.elapsed() < SEND_GAP);
+        if sent.get(pane).is_some_and(|at| at.elapsed() < SEND_GAP) {
+            return Err(MeshError::Io(format!(
+                "Herdr pane {pane} was just sent a prompt: it takes another once its agent is idle or done again, try again later"
+            )));
+        }
         let target = self.pane(pane).await?;
         if !self.offerable(&target) {
             return Err(MeshError::NoReceptacle(format!("an agent in Herdr pane {pane}")));
@@ -480,6 +493,7 @@ impl HerdrAdapter {
                 "the agent in Herdr pane {pane} is {state}: it takes a prompt only when idle or done, try again later"
             )));
         }
+        sent.insert(pane.to_string(), std::time::Instant::now());
         self.run(&["pane", "send-text", pane, &text]).await?;
         tokio::time::sleep(ENTER_DELAY).await;
         self.run(&["pane", "send-keys", pane, "enter"]).await?;
@@ -880,6 +894,23 @@ mod tests {
         assert!(!fake.log().contains("send-keys"), "no Enter pressed: {}", fake.log());
         sb.deliver(&worker, send.as_str(), WireMode::Call, json!({"text": "  rerun the tests # then report"})).await.unwrap();
         assert!(fake.log().contains("pane send-text w1:p2 rerun the tests # then report\n"), "{}", fake.log());
+    }
+
+    /// Two sends at once, or one right after another, into the same pane: one is typed, the other is refused before
+    /// anything is typed (Herdr may still call the agent idle while it takes the first in).
+    #[tokio::test]
+    async fn a_pane_just_sent_a_prompt_takes_no_other_for_a_while() {
+        let fake = FakeHerdr::new();
+        let adapter = fake.adapter();
+        let (a, b) = tokio::join!(adapter.send_text("w1:p2", "first"), adapter.send_text("w1:p2", "second"));
+        assert_eq!(a.is_ok() as u8 + b.is_ok() as u8, 1, "{a:?} {b:?}");
+        let err = a.err().or(b.err()).unwrap().to_string();
+        assert!(err.contains("was just sent a prompt") && !err.contains("first") && !err.contains("second"), "{err}");
+        assert!(adapter.send_text("w1:p2", "third").await.is_err());
+        let log = fake.log();
+        assert_eq!(log.matches("send-text").count(), 1, "{log}");
+        assert_eq!(log.matches("send-keys").count(), 1, "{log}");
+        assert!(!log.contains("third"), "{log}");
     }
 
     #[test]

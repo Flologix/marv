@@ -724,6 +724,11 @@ pub trait SessionPort: Send + Sync {
     fn is_login_callback(&self, _text: &str) -> bool {
         false
     }
+
+    /// Whether something other than an empty prompt has the keyboard: the splash, setup, the session picker, the
+    /// ctrl+k palette, the radio's roster, or a half-typed slash command. Called when it changes. While it's held,
+    /// what's typed isn't a new prompt, so Herdr isn't told the agent is idle (a pane send types a prompt only).
+    fn keyboard_held(&self, _held: bool) {}
 }
 
 #[cfg(test)]
