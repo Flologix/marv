@@ -26,6 +26,26 @@ pub const MAX_LOG_LINES: usize = 400;
 /// What `logs` returns without `lines`.
 pub const DEFAULT_LOG_LINES: usize = 50;
 
+/// Deliberate difference (marv-rs #81): Marv's ends at "network: true". GLM reached for `start` to run a one-off
+/// clone-and-count (it sent no command, see [`missing_command`]): the last sentence says what start is not for. The
+/// oracle maps it back to Marv's (`marv_oracle::runner::MARV_RS_TEXT`).
+pub const PROCESS_DESCRIPTION: &str = "Run something that should keep running (a dev server, a watcher) in its own sandbox, across turns, until stopped or Marv exits. start runs a shell command and waits up to 10 s for it to listen on a port: the ports it listens on (1024 and up) are forwarded to the user's localhost, and your bash commands can reach them too (curl localhost:<port>). logs reads its output, stop ends it and everything it started, list shows them all. The user is asked before each start. Like bash's sandbox: only the project folder is writable, no network unless network: true. start always needs command; a command that finishes on its own belongs in bash.";
+
+/// #81: a start without `command` says what to send and what did arrive. On GLM via OpenRouter the call came as
+/// `{"action": "start"}` although the model's reasoning had written a command too; "start needs a command" alone
+/// left it guessing whether its fields reach Marv at all.
+fn missing_command(input: &ProcessInput) -> String {
+    let arrived: Vec<&str> =
+        [Some("action"), input.name.as_ref().map(|_| "name"), input.network.map(|_| "network"), input.lines.map(|_| "lines")]
+            .into_iter()
+            .flatten()
+            .collect();
+    format!(
+        "command: start needs a command, the shell command to keep running, in the same call: {{\"action\": \"start\", \"command\": \"bun run dev\"}}. This call had only: {}. For a command that finishes on its own (a build, a clone, a count), use bash instead.",
+        arrived.join(", ")
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProcessAction {
@@ -99,7 +119,7 @@ impl Tool for ProcessTool {
         "process"
     }
     fn description(&self) -> &str {
-        "Run something that should keep running (a dev server, a watcher) in its own sandbox, across turns, until stopped or Marv exits. start runs a shell command and waits up to 10 s for it to listen on a port: the ports it listens on (1024 and up) are forwarded to the user's localhost, and your bash commands can reach them too (curl localhost:<port>). logs reads its output, stop ends it and everything it started, list shows them all. The user is asked before each start. Like bash's sandbox: only the project folder is writable, no network unless network: true."
+        PROCESS_DESCRIPTION
     }
     fn schema(&self) -> Value {
         json!({
@@ -129,7 +149,7 @@ impl Tool for ProcessTool {
             return Err(format!("lines: must be between 1 and {MAX_LOG_LINES}"));
         }
         match input.action {
-            ProcessAction::Start if input.command.is_none() => Err("command: start needs a command".into()),
+            ProcessAction::Start if input.command.is_none() => Err(missing_command(input)),
             ProcessAction::Logs | ProcessAction::Stop if input.name.is_none() => {
                 let action = if input.action == ProcessAction::Logs { "logs" } else { "stop" };
                 Err(format!("name: {action} needs the process's name (list shows them)"))
@@ -432,6 +452,10 @@ mod tests {
         let ctx = ctx(&host, true, &asked);
         for (args, error) in [
             (json!({"action": "start"}), "start needs a command"),
+            // #81: it says what to send, and which fields did arrive.
+            (json!({"action": "start"}), r#"{"action": "start", "command": "bun run dev"}. This call had only: action. "#),
+            (json!({"action": "start", "network": true, "name": "n"}), "This call had only: action, name, network."),
+            (json!({"action": "start"}), "use bash instead"),
             (json!({"action": "logs"}), "logs needs the process's name (list shows them)"),
             (json!({"action": "stop"}), "stop needs the process's name"),
             (json!({"action": "logs", "name": "a", "lines": 401}), "between 1 and 400"),
