@@ -3952,9 +3952,7 @@ done
 "#,
                 log.display()
             );
-            std::fs::write(path, script).unwrap();
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            marv_tools::github::fake::write_executable(path, &script);
         }
 
         struct Mcp {

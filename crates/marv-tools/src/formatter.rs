@@ -747,10 +747,7 @@ pub(crate) mod testing {
 
     /// Writes an executable script into `node_modules/.bin`.
     pub(crate) fn bin(root: &TempDir, name: &str, script: &str) {
-        root.write(&format!("node_modules/.bin/{name}"), script);
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(root.path().join(format!("node_modules/.bin/{name}")), std::fs::Permissions::from_mode(0o755))
-            .unwrap();
+        crate::github::fake::write_executable(&root.path().join(format!("node_modules/.bin/{name}")), script);
     }
 
     /// The real run path ([`crate::bash::run_command`]), unsandboxed (the crate's tests run without bwrap).

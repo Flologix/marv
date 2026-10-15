@@ -798,7 +798,6 @@ mod tests {
     // Ports tests/checkpoints.test.ts: locate, snapshot, stale locks, the chain.
     use super::*;
     use crate::checkpoints::test_support::{Temp, git, make_repo, read, temp, tree_files, write};
-    use std::os::unix::fs::PermissionsExt;
 
     pub(crate) fn store_in(root: &Path, session: &str, own: &Temp) -> CheckpointStore {
         CheckpointStore::new(StoreOptions::new(root, Some(own.0.clone()), session))
@@ -916,12 +915,9 @@ mod tests {
         let marker = outside.0.join("ran");
         let script = repo.0.join(".git/touch.sh");
         let body = format!("#!/bin/sh\ntouch {}\n", marker.display());
-        write(&script, &body);
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        marv_tools::github::fake::write_executable(&script, &body);
         for hook in ["pre-commit", "post-commit", "reference-transaction"] {
-            let path = repo.0.join(".git/hooks").join(hook);
-            write(&path, &body);
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            marv_tools::github::fake::write_executable(&repo.0.join(".git/hooks").join(hook), &body);
         }
         git(&repo.0, &["config", "core.fsmonitor", &script.to_string_lossy()]);
         write(repo.0.join("a.txt"), "x\n");

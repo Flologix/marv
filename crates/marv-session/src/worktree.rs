@@ -421,8 +421,7 @@ pub(crate) mod tests {
         // is the second layer.)
         std::fs::create_dir_all(wt.git_dir.join("hooks")).unwrap();
         let hook = wt.git_dir.join("hooks/pre-commit");
-        write(&hook, &format!("#!/bin/sh\ntouch {}\n", pwned.display()));
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        marv_tools::github::fake::write_executable(&hook, &format!("#!/bin/sh\ntouch {}\n", pwned.display()));
         // The worktree's .git file pointed at a fake repository whose config runs a program.
         let fake = trees.0.join("fake.git");
         sh_git(&trees.0, &["init", "-q", "--bare", &fake.to_string_lossy()]);
@@ -617,8 +616,7 @@ pub(crate) mod tests {
     async fn a_repository_that_signs_commits_gets_an_unsigned_commit_so_nothing_prompts_or_hangs() {
         let (repo, trees) = setup();
         let gpg = trees.0.join("gpg.sh");
-        write(&gpg, "#!/bin/sh\nexit 1\n");
-        std::fs::set_permissions(&gpg, std::fs::Permissions::from_mode(0o755)).unwrap();
+        marv_tools::github::fake::write_executable(&gpg, "#!/bin/sh\nexit 1\n");
         sh_git(&repo.0, &["config", "commit.gpgSign", "true"]);
         sh_git(&repo.0, &["config", "gpg.program", &gpg.to_string_lossy()]);
         let wt = create_worktree(&repo.0, &trees.0, "Signed").await.unwrap();

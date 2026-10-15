@@ -89,10 +89,10 @@ async fn marvs_commit_trusts_nothing_the_worktree_says() {
     let (repo, trees) = (repo(), TempDir::outside_tmp("wt-trees2"));
     let wt = create_worktree(repo.path(), trees.path(), "planted").await.expect("a worktree");
     let pwned = trees.path().join("PWNED");
-    let hook = trees.write("hook.sh", &format!("#!/bin/sh\ntouch {}\n", pwned.display()));
-    std::fs::create_dir_all(wt.git_dir.join("hooks")).unwrap();
-    std::fs::copy(&hook, wt.git_dir.join("hooks").join("pre-commit")).unwrap();
-    Command::new("chmod").arg("+x").arg(wt.git_dir.join("hooks").join("pre-commit")).status().unwrap();
+    marv_tools::github::fake::write_executable(
+        &wt.git_dir.join("hooks").join("pre-commit"),
+        &format!("#!/bin/sh\ntouch {}\n", pwned.display()),
+    );
     let fake = trees.path().join("fake.git");
     git(trees.path(), &["init", "-q", "--bare", &fake.to_string_lossy()]);
     git(&fake, &["config", "core.fsmonitor", &format!("touch {}", pwned.display())]);
