@@ -120,7 +120,7 @@ In the sender's transcript, a `/tx` is one line in Marv's voice and nothing reac
 
 ● process start  hack-matrix  python3 ~/hack.py
   ╭ Start a process? ─────────────────────────────────────────╮
-  │ hack-matrix: python3 /home/flologix/hack.py               │
+  │ hack-matrix: python3 ~/hack.py                            │
   │ Asked during a turn started by a radio request.           │
   │ > Yes   No                                                │
   ╰───────────────────────────────────────────────────────────╯
