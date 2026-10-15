@@ -1069,8 +1069,7 @@ mod tests {
         let asdf_shims = home.join(".asdf/shims");
         for dir in [&mise_bin, &asdf_shims] {
             std::fs::create_dir_all(dir).unwrap();
-            std::fs::write(dir.join("node"), "#!/bin/sh\necho mise-asdf-node ok").unwrap();
-            std::fs::set_permissions(dir.join("node"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+            crate::github::fake::write_executable(&dir.join("node"), "#!/bin/sh\necho mise-asdf-node ok");
         }
         std::fs::create_dir(root.path().join("project")).unwrap();
         let base = Sandbox::from_env(true);

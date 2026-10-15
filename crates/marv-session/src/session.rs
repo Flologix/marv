@@ -4490,10 +4490,7 @@ mod turn_tests {
         // read-only project folder (the command substitution reads before the redirect truncates).
         let script = "#!/bin/sh\nfor f in \"$@\"; do case \"$f\" in --*) ;; *) printf '%s\\n' \"$(tr '\"' \"'\" < \"$f\")\" > \"$f\" ;; esac; done\n";
         std::fs::create_dir_all(dirs.project.join("node_modules/.bin")).unwrap();
-        std::fs::write(dirs.project.join("node_modules/.bin/prettier"), script).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dirs.project.join("node_modules/.bin/prettier"), std::fs::Permissions::from_mode(0o755))
-            .unwrap();
+        marv_tools::github::fake::write_executable(&dirs.project.join("node_modules/.bin/prettier"), script);
         std::fs::write(dirs.project.join(".prettierrc"), "{ \"singleQuote\": true }").unwrap();
         std::fs::write(dirs.project.join("a.js"), "const a = \"hi\";\n").unwrap();
         let provider = Scripted::new(vec![
