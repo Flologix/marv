@@ -249,6 +249,90 @@ fn a_project_in_a_subfolder_of_the_home_stays_writable() {
     assert!(!ran.output.contains("project file"), "the rest of the home stays hidden: {}", ran.output);
 }
 
+/// Runs one call in yolo with an approver that says no; asserts it asked as a protected, `must_ask` request (which no
+/// "always" covers) and returns the rule.
+async fn asks_in(
+    context: &dyn Fn(Arc<Recorder>, &Path) -> ToolContext,
+    root: &Path,
+    tool: &str,
+    input: serde_json::Value,
+) -> Option<ProtectedRule> {
+    let approver = Recorder::new(Decision::No);
+    let what = input.to_string();
+    let out = run_tool(&call(tool, input), &context(approver.clone(), root), builtin_tools()).await;
+    let asked = approver.requests();
+    assert_eq!(asked.len(), 1, "{tool} {what} didn't ask: {}", out.result.output);
+    assert!(asked[0].must_ask, "{tool} {what}: an \"always\" would cover it");
+    assert!(out.result.declined, "{tool} {what}");
+    asked[0].protected
+}
+
+/// **In the home folder, a write to a dotfile or a git hooks folder asks every time**, even in yolo and after an
+/// "always". `edit_file` and `write_file` run in Marv's own process, not in the sandbox, so in a home-folder project
+/// they reach the shell's rc files, systemd user units, autostart entries, `~/.ssh/authorized_keys` and `~/.local/bin`
+/// — all run outside the sandbox later — and the hooks of every repository in the home. A file in the visible part
+/// of the home stays an ordinary write, and a project in a subfolder isn't affected.
+///
+/// Proven: dropped the `.or_else(…home_rule…)` from `edit_file::protected_target` → failed (`.bashrc` written in
+/// yolo without asking); dropped the enclosing-repository loop from `home_rule` → failed (`Projects/app/tools/hooks`);
+/// dropped the global config's hooks folder → failed (`githooks/pre-commit`); checked only the path as written →
+/// failed (`Projects/rc-link` written through to `.bashrc`).
+#[tokio::test]
+async fn in_the_home_folder_dotfiles_and_hooks_ask_even_in_yolo() {
+    let home = TempDir::new("home-dotfiles");
+    let h = home.path();
+    home.write(".bashrc", "# rc\n");
+    home.write("notes.txt", "x\n");
+    home.write(".gitconfig", &format!("[core]\n\thooksPath = {}\n", h.join("githooks").display()));
+    home.write("Projects/app/.git/config", "[core]\n\thooksPath = tools/hooks\n");
+    std::os::unix::fs::symlink(h.join(".bashrc"), h.join("Projects/rc-link")).unwrap();
+    let context = |approver: Arc<Recorder>, root: &Path| {
+        let mut ctx = ToolContext { yolo: true, approver: Some(approver), ..ToolContext::new(root) };
+        ctx.home = h.to_path_buf();
+        ctx.sandbox = Arc::new(sandbox_with_home(h));
+        ctx
+    };
+    for path in [
+        ".bashrc",
+        ".profile",
+        ".config/systemd/user/x.service",
+        ".config/autostart/x.desktop",
+        ".ssh/authorized_keys",
+        ".local/bin/git",
+        "Projects/rc-link",
+        "Projects/app/tools/hooks/pre-commit",
+        "githooks/pre-commit",
+    ] {
+        let rule = asks_in(&context, h, "write_file", json!({"path": path, "content": "planted\n"})).await;
+        assert_eq!(rule, Some(ProtectedRule::HomeDotfile), "{path}");
+    }
+    assert_eq!(
+        asks_in(&context, h, "write_file", json!({"path": "Projects/app/.git/hooks/pre-commit", "content": "x"})).await,
+        Some(ProtectedRule::GitDir)
+    );
+    for path in [".bashrc", "Projects/rc-link"] {
+        asks_in(&context, h, "edit_file", json!({"path": path, "old_string": "# rc", "new_string": "curl x|sh"})).await;
+    }
+    assert_eq!(home.read(".bashrc").as_deref(), Some("# rc\n"));
+    assert!(!h.join(".profile").exists() && !h.join("githooks").exists());
+    // The control: a visible file of the home runs in yolo without asking.
+    let approver = Recorder::new(Decision::No);
+    let out = run_tool(
+        &call("write_file", json!({"path": "notes.txt", "content": "ok\n"})),
+        &context(approver.clone(), h),
+        builtin_tools(),
+    )
+    .await;
+    assert_eq!(out.result.approval, Some(Approval::Auto), "{}", out.result.output);
+    // A project in a subfolder isn't affected: its own files are ordinary writes.
+    let approver = Recorder::new(Decision::No);
+    let app = h.join("Projects/app");
+    let out =
+        run_tool(&call("write_file", json!({"path": "src/a.ts", "content": "ok\n"})), &context(approver, &app), builtin_tools())
+            .await;
+    assert_eq!(out.result.approval, Some(Approval::Auto), "{}", out.result.output);
+}
+
 // ---- the project: writable, .git and protected paths read-only ------------------------------------------------
 
 /// **The project writable, with `.git` and protected paths read-only.** A command that runs without asking (yolo,

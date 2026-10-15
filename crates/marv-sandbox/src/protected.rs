@@ -38,6 +38,8 @@ pub enum ProtectedRule {
     EditorConfig,
     /// Content rule only: see [`lifecycle_scripts_changed`].
     PackageScripts,
+    /// Only when the project is the home folder (or holds it): see [`home_rule`].
+    HomeDotfile,
 }
 
 /// One rule as the approval prompt and the docs show it.
@@ -81,6 +83,11 @@ pub const PROTECTED_PATHS: &[ProtectedPath] = &[
         rule: ProtectedRule::PackageScripts,
         pattern: "package.json scripts",
         why: "install and lifecycle scripts run on your next install",
+    },
+    ProtectedPath {
+        rule: ProtectedRule::HomeDotfile,
+        pattern: "~/.* (project is the home folder)",
+        why: "your shell, desktop, services and tools run or read it outside the sandbox",
     },
 ];
 
@@ -154,7 +161,13 @@ pub fn is_protected(root: &Path, path: &Path) -> bool {
 /// relative to the work tree, as git reads it). Only the repository's own config: a global hooksPath lives outside
 /// the project, where the sandbox can't write anyway.
 pub fn hooks_path(root: &Path) -> Option<PathBuf> {
-    let config = std::fs::read_to_string(root.join(".git/config")).ok()?;
+    core_hooks_path(&root.join(".git/config"), Some(root))
+}
+
+/// `core.hooksPath` from a git config file; a relative value is resolved against `base` (a repository's work tree),
+/// and ignored without one (a global config's relative value depends on where git runs).
+fn core_hooks_path(file: &Path, base: Option<&Path>) -> Option<PathBuf> {
+    let config = std::fs::read_to_string(file).ok()?;
     let mut in_core = false;
     let mut found = None;
     for line in config.lines() {
@@ -172,10 +185,50 @@ pub fn hooks_path(root: &Path) -> Option<PathBuf> {
             let value = value.trim().trim_matches('"');
             let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
             let path = expand_home(value, &home);
-            found = Some(if path.is_absolute() { path } else { root.join(path) }); // the last one wins, as in git
+            // The last one wins, as in git.
+            found = if path.is_absolute() { Some(path) } else { base.map(|b| b.join(path)) };
         }
     }
     found
+}
+
+/// marv-rs: when the project is the home folder or holds it (Marv started in `~`), `edit_file` and `write_file` reach
+/// the whole home, and they run in Marv's own process, not in the sandbox. A change to any hidden top-level entry
+/// (`~/.bashrc`, `~/.profile`, `~/.config/systemd/user/*`, `~/.config/autostart`, `~/.ssh/authorized_keys`,
+/// `~/.local/bin/*`…) runs outside the sandbox later, so it is protected: it asks every time, never covered by an
+/// "always", never in yolo. So is a git hooks folder any repository in the home uses (`core.hooksPath` of the
+/// repository around the file, or of the global git config); `.git/` itself is protected anywhere already.
+///
+/// Checked on the path as written and on where it really leads; a path that can't be resolved is protected.
+/// `None` for any other project: its files can't reach the home.
+pub fn home_rule(root: &Path, home: &Path, path: &Path) -> Option<ProtectedRule> {
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let (real_root, real_home) = (real(root), real(home));
+    if !real_home.starts_with(&real_root) || home.as_os_str().is_empty() || real_home == Path::new("/") {
+        return None;
+    }
+    let absolute = normalize(&root.join(path));
+    let Ok(resolved) = real_with_missing(&absolute) else { return Some(ProtectedRule::HomeDotfile) };
+    let hidden = |p: &Path, base: &Path| {
+        p.strip_prefix(base)
+            .ok()
+            .and_then(|rel| rel.components().next())
+            .is_some_and(|first| first.as_os_str().to_string_lossy().starts_with('.'))
+    };
+    if hidden(&absolute, home) || hidden(&absolute, &real_home) || hidden(&resolved, &real_home) {
+        return Some(ProtectedRule::HomeDotfile);
+    }
+    // Hooks folders: the global config's, and each enclosing repository's (the project's own is `HooksPath`).
+    let mut hooks: Vec<PathBuf> = [real_home.join(".gitconfig"), real_home.join(".config/git/config")]
+        .iter()
+        .filter_map(|file| core_hooks_path(file, None))
+        .collect();
+    for dir in resolved.ancestors().skip(1).take_while(|d| d.starts_with(&real_root)) {
+        if let Some(found) = core_hooks_path(&dir.join(".git/config"), Some(dir)) {
+            hooks.push(found);
+        }
+    }
+    hooks.into_iter().any(|h| is_inside(&normalize(&real(&h)), &resolved)).then_some(ProtectedRule::HomeDotfile)
 }
 
 /// npm's lifecycle scripts: run by `npm|bun|pnpm install` and friends, outside the sandbox when the user runs them.
