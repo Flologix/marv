@@ -315,7 +315,8 @@ pub const MARV_RS_SECTIONS: &[&str] = &["# Your situation"];
 /// Text marv-rs rewords on purpose, as (marv-rs, Marv) pairs: the oracle puts Marv's text back in the system prompt
 /// and the tool descriptions before comparing, so everything around it is still checked. The raw requests (the prefix
 /// rule) keep marv-rs's. Keep these in step with the sources: #85's plan sentence (`marv_session::prompt`'s
-/// `PLAN_SENTENCE`) and plan tool description (`marv_tools::plan::PLAN_DESCRIPTION`).
+/// `PLAN_SENTENCE`) and plan tool description (`marv_tools::plan::PLAN_DESCRIPTION`), and #81's sentence at the end of
+/// the process tool's description (`marv_tools::process::PROCESS_DESCRIPTION`), which Marv doesn't have.
 pub const MARV_RS_TEXT: &[(&str, &str)] = &[
     (
         " For a task of four or more steps, keep a plan with the plan tool; send each update in the same reply as your next tool call; only the final one, marking the plan done, may go alone.",
@@ -325,6 +326,7 @@ pub const MARV_RS_TEXT: &[(&str, &str)] = &[
         "Keep a checklist for a task of four or more steps, or when the user asks for several things. Write the plan before starting; mark an item in_progress before working on it and done as soon as it is; add items you discover and remove ones that turn out unnecessary. Send the whole list every time (it replaces the previous one), in the same reply as your next tool call; only the final update, marking the last items done, may go alone. Skip it for a short task or a question.",
         "Keep a checklist for a task of three or more steps, or when the user asks for several things. Write the plan before starting; mark an item in_progress before working on it and done as soon as it is; add items you discover and remove ones that turn out unnecessary. Send the whole list every time (it replaces the previous one). Skip it for a one-step task or a question.",
     ),
+    (" start always needs command; a command that finishes on its own belongs in bash.", ""),
 ];
 
 /// Puts Marv's wording back for each of [`MARV_RS_TEXT`] in a string, plain or in parts.

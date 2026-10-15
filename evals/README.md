@@ -41,7 +41,8 @@ Options: `--tasks a,b`, `--marv-model` (default `anthropic/claude-haiku-5.5`), `
      mise's `opencode` wrapper, which would reinstall opencode in each run's empty config folder.
    - The MCP tasks get the tracker server (`marv-oracle tracker`) on `tests/oracle/mcp/tracker.json`, and what it
      recorded is copied in as `__tracker_comments__.json`. A check that reads the final reply finds it in
-     `__eval_reply__.md`.
+     `__eval_reply__.md`, and one that grades the run's length finds `{"requests": n}` in `__eval_run__.json`
+     (`count-lines-local` passes only in 8 requests or fewer, #81).
 3. The task's `check/` is copied in and `bun test ./__eval__.test.js` grades it.
 
 `dev-server-claim` doesn't run for Claude Code or opencode: it checks that the reply doesn't say a server is up for the

@@ -134,6 +134,10 @@ pub const SITUATION_HEADING: &str = "# Your situation";
 ///
 /// #98: also what's pre-approved this session and which folders outside the project are writable (the model plans
 /// around them instead of asking), each only when set.
+///
+/// #81: local first for where/how-big questions. Asked how many lines Marv has, GLM found the GitHub URL in the
+/// installed binary and spent 20 steps on a clone the sandbox couldn't make and an estimate from the GitHub API, while
+/// the checkout was on disk (opencode ran `find` first: 6 steps, the exact count). Fixed text, so the cache holds.
 pub fn situation_section(home: bool, pre_approved: &[String], writable: &[String]) -> String {
     let home = if home {
         " The working directory is the user's home folder itself, so here the home folder is the project: its files are visible and writable, and a path like ~/notes.txt is notes.txt."
@@ -154,7 +158,7 @@ pub fn situation_section(home: bool, pre_approved: &[String], writable: &[String
         )
     };
     format!(
-        "\n\n{SITUATION_HEADING}\n\nYou work only through your tools. You have no screen: you can't open a window, a terminal, a tab or a pane, or show the user anything live. The user sees your messages and a one-line summary of each tool call, not its output, so quote what matters. A program that draws (a TUI, an animation, a game) shows nothing here: to check that it runs, run it briefly with timeout; for the user to see it, give them the command to run in their own terminal. Commands don't run inside the user's terminal or its multiplexer (Herdr, tmux): those variables and sockets aren't in the sandbox, so a script that needs them fails here.{home}\n\nKnow your limits before you start. When none of your tools can do what's asked, say so in a sentence and give the user the exact command to run, instead of trying tools that weren't made for it: a tool does only what its description says, and is never a way around a limit. Keep replies short: answer first, don't narrate what you're about to do, and don't end with a menu of options or offers. Ask a question only when you need the answer to go on.{approved}{folders}"
+        "\n\n{SITUATION_HEADING}\n\nYou work only through your tools. You have no screen: you can't open a window, a terminal, a tab or a pane, or show the user anything live. The user sees your messages and a one-line summary of each tool call, not its output, so quote what matters. A program that draws (a TUI, an animation, a game) shows nothing here: to check that it runs, run it briefly with timeout; for the user to see it, give them the command to run in their own terminal. Commands don't run inside the user's terminal or its multiplexer (Herdr, tmux): those variables and sockets aren't in the sandbox, so a script that needs them fails here.{home}\n\nKnow your limits before you start. When none of your tools can do what's asked, say so in a sentence and give the user the exact command to run, instead of trying tools that weren't made for it: a tool does only what its description says, and is never a way around a limit. Keep replies short: answer first, don't narrate what you're about to do, and don't end with a menu of options or offers. Ask a question only when you need the answer to go on. To find or measure something (where is X, how big is X, how many lines), look on this machine first (find, du, wc -l): a copy is often already on disk, and an exact local count beats an estimate from the network.{approved}{folders}"
     )
 }
 
@@ -669,6 +673,8 @@ mod tests {
         assert!(p.contains("# Sandbox limits\n\nEvery process a bash command starts ends"));
         assert!(p.contains("# Your situation\n\nYou work only through your tools. You have no screen"));
         assert!(!p.contains("home folder itself"));
+        // #81: local first, before the network.
+        assert!(p.contains("look on this machine first (find, du, wc -l)"));
         // Before memory, skills and the rest, and only with bash for the limits.
         assert!(p.find("# Your situation").unwrap() < p.find("# MCP servers").unwrap());
         let no_bash = system_prompt(&PromptInput { tools: vec!["read_file".into()], ..input() });

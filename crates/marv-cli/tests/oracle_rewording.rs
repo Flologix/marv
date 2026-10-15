@@ -12,4 +12,7 @@ fn the_oracles_reworded_text_matches_what_marv_rs_sends() {
     assert!(prompt.contains(plan_sentence), "MARV_RS_TEXT[0] isn't the prompt's plan sentence:\n{prompt}");
     let (plan_description, _) = MARV_RS_TEXT[1];
     assert_eq!(plan_description, marv_tools::plan::PLAN_DESCRIPTION);
+    // #81: Marv's process description is marv-rs's without its last sentence.
+    let (process_sentence, nothing) = MARV_RS_TEXT[2];
+    assert!(marv_tools::process::PROCESS_DESCRIPTION.ends_with(process_sentence) && nothing.is_empty());
 }
