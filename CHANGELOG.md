@@ -6,6 +6,10 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+### Fixed
+
+- **Near a full context window, OpenRouter requests fit their output cap beside the prompt instead of being refused and resent (#116).** Since 0.5.0 Marv sends `max_tokens` (the model's output limit, at most 32,000). When the prompt plus that didn't fit the window, OpenRouter refused the request ("…, 32000 in the output") and Marv resent it without any cap, on every step until compaction. Now `max_tokens` is clamped to the window minus the prompt's estimated size (measured from the last reply's prompt count, or 4 characters a token before any reply, plus 5% headroom), never below 1,024. A refusal that still happens says the window and the prompt's size: Marv remembers both for the rest of the session and resends once with what's left; only if that's refused too does the request go without a cap.
+
 ## [0.7.0] - 2026-10-15
 
 ### Changed
