@@ -359,9 +359,10 @@ pub struct ToolContext {
     pub sandbox: Arc<Sandbox>,
     /// Yolo mode: calls whose tool says they're safe (`auto_safe`) run without asking.
     pub yolo: bool,
-    /// Automatic approval is off: a turn another agent started (a mesh wake, #78; the radio, #124). The Herdr door's
-    /// light actions are then asked `once` (#74), so no remembered "always" answers them. The radio's phase 2
-    /// (`feat/124-radio-txrx`) gives this same flag its full meaning in `run_tool` (no yolo, every ask `once`).
+    /// Automatic approval is off: a turn the person at this Marv didn't start (a mesh wake, #78; the radio, #124).
+    /// Yolo doesn't apply, a URL prefix approved earlier doesn't either, and every call that asks is asked `once`, so
+    /// neither a remembered "always" nor a worktree subagent's automatic yes answers it (the Herdr door's light actions
+    /// included, #74). Only a person at this Marv does. Subagents inherit it.
     pub no_auto_approval: bool,
     /// Set by `run_tool` for a call that runs without asking: bash then sees the project's `.git` read-only, and the
     /// edit tools re-check `.git` at apply time.

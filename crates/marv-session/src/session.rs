@@ -311,6 +311,12 @@ pub struct SessionInit {
     /// and its task came from there. Marked (and shown, and logged) at the first turn, as `Provenance::Herdr`. It can
     /// only add taint. Default false.
     pub tainted_at_start: bool,
+    /// The mesh radio (marv-rs #124): `None` (the default) for a session that is never on it (`marv -p`, the SDK);
+    /// `Some(on)` for the TUI's, `on` being whether the user's own config has it on as the session starts. A
+    /// conversation that starts with the radio on offers `radio_tx` and the prompt's radio sentence for its whole life
+    /// (the prompt cache), even after `/radio off`; one that starts with it off offers them after `clear()` once it's
+    /// on. Needs `mesh`, whose radio it reads after the first conversation.
+    pub radio: Option<bool>,
 }
 
 impl SessionInit {
@@ -364,6 +370,7 @@ impl SessionInit {
             one_shot: false,
             herdr: None,
             tainted_at_start: false,
+            radio: None,
         }
     }
 }
@@ -384,6 +391,21 @@ pub struct Configure {
     pub max_steps: Option<u32>,
     /// Applies from the next conversation that decides (after `clear()`).
     pub mcp_tools: Option<McpToolsSetting>,
+}
+
+/// What started a turn that the person didn't: nothing (they did), a message on a wired inbox (#78), or a radio
+/// message (#124).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Woken {
+    No,
+    Inbox,
+    Radio(crate::radio::RadioWakeBy),
+}
+
+impl Woken {
+    fn is_woken(&self) -> bool {
+        *self != Woken::No
+    }
 }
 
 #[derive(Clone, Default)]
@@ -562,6 +584,8 @@ struct State {
     hook_stop: Option<CancellationToken>,
     /// The current round's task: `close()` waits for it.
     hook_task: Option<tokio::task::JoinHandle<()>>,
+    /// This conversation offers `radio_tx` (#124): it started with the radio on. Fixed until `clear()`.
+    radio_offered: bool,
 }
 
 impl State {
@@ -620,6 +644,8 @@ struct Inner {
     /// Nested instruction files the main agent's conversation has had (#62); emptied with it (`clear`, `resume`) and
     /// by a compaction (the summary replaces the results that carried them).
     nested: Arc<crate::instructions::NestedInstructions>,
+    /// The running turn's radio hop (#124): what `radio_tx` sends carries it.
+    radio_hop: Arc<crate::radio::TurnHop>,
     state: Mutex<State>,
 }
 
@@ -911,6 +937,7 @@ impl MarvSession {
             hooks_unsent: false,
             hook_stop: None,
             hook_task: None,
+            radio_offered: init.radio == Some(true) && init.mesh.is_some(),
         };
         // The config's pre-approved scopes (#98) seed the "always" layer: they mean "always, for this session",
         // through the same path a person's "always" takes, so must_ask and taint still win. An unknown name is a
@@ -941,6 +968,7 @@ impl MarvSession {
             checkpoints,
             peers: Arc::default(),
             start_taint_marked: AtomicBool::new(false),
+            radio_hop: Arc::default(),
             state: Mutex::new(state),
             tool_output_hold: Mutex::default(),
             tool_output_cleaned: Default::default(),
@@ -1065,7 +1093,7 @@ impl MarvSession {
     /// own task (it must be inside a Tokio runtime); read the [`Turn`] for its events. Fails during a turn, or after
     /// `close()`.
     pub fn send(&self, text: &str, options: SendOptions) -> Result<Turn, SessionError> {
-        self.start(text, options, false)
+        self.start(text, options, Woken::No)
     }
 
     /// marv-rs #78 (`mesh.wake`, the TUI's opt-in): a turn started by a message on a wired inbox, not by the user.
@@ -1082,11 +1110,30 @@ impl MarvSession {
             return Ok(None);
         }
         let options = SendOptions { for_model: Some(crate::mesh::WAKE_NOTE.to_string()), cancel: None };
-        self.start(&by.line(), options, true).map(Some)
+        self.start(&by.line(), options, Woken::Inbox).map(Some)
+    }
+
+    /// marv-rs #124 (`mesh.wake` with the radio on, the TUI's): a turn started by an addressed radio message, not by
+    /// the user. `None` when nothing waits on the radio (no turn). Refused like `send` during a turn.
+    ///
+    /// Like [`Self::wake`]: no user message, the radio's messages read fenced and tainting before the first request,
+    /// then [`crate::radio::RADIO_WAKE_NOTE`], and `by`'s line in the transcript as Marv's. And **nothing is approved
+    /// automatically in it** (§8.4): yolo, remembered "always" answers, approved URL prefixes and a worktree
+    /// subagent's automatic yes don't apply; every call that would ask asks the person, once. The turn runs one hop
+    /// past the message that woke it, and its `radio_tx` messages carry that hop. Whether to wake at all (on, idle, no
+    /// approval waiting, the limits: [`crate::radio::radio_wake_check`]) is the caller's; `marv -p` never calls this.
+    pub fn wake_radio(&self, by: &crate::radio::RadioWakeBy) -> Result<Option<Turn>, SessionError> {
+        self.idle(&self.state())?;
+        let Some(mesh) = &self.inner.init.mesh else { return Ok(None) };
+        if mesh.unread_radio().is_empty() {
+            return Ok(None);
+        }
+        let options = SendOptions { for_model: Some(crate::radio::RADIO_WAKE_NOTE.to_string()), cancel: None };
+        self.start(&by.line(), options, Woken::Radio(by.clone())).map(Some)
     }
 
     /// `send`, or a wake-up (`woken`: `text` is Marv's line for the transcript, not the user's).
-    fn start(&self, text: &str, options: SendOptions, woken: bool) -> Result<Turn, SessionError> {
+    fn start(&self, text: &str, options: SendOptions, woken: Woken) -> Result<Turn, SessionError> {
         let stop = CancellationToken::new();
         let done = CancellationToken::new();
         {
@@ -1095,7 +1142,7 @@ impl MarvSession {
             // Sites the user pasted are theirs to fetch: only what they typed counts (not a /skill's instructions,
             // a file or a page: links found there are where a planted instruction would send the model). A woken
             // turn's line isn't the user's.
-            if !woken {
+            if !woken.is_woken() {
                 for key in marv_tools::web_fetch::pasted_scopes(text) {
                     self.inner.always.add(key);
                 }
@@ -1146,7 +1193,7 @@ impl MarvSession {
         &self,
         text: String,
         for_model: String,
-        woken: bool,
+        woken: Woken,
         stop: CancellationToken,
         push: impl Fn(SessionEvent) + Send + Sync + 'static,
     ) {
@@ -1166,7 +1213,7 @@ impl MarvSession {
         // Subagents' recorders, by call id; ids are unique within the turn.
         let subs: Recorders = Arc::default();
         let pair: Pair = Arc::default();
-        let work = AssertUnwindSafe(self.turn_body(&turn, &text, &for_model, woken, &stop, &emit, &main, &subs, &pair));
+        let work = AssertUnwindSafe(self.turn_body(&turn, &text, &for_model, &woken, &stop, &emit, &main, &subs, &pair));
         let reason = match work.catch_unwind().await {
             Ok(reason) => reason,
             Err(panic) => {
@@ -1210,7 +1257,7 @@ impl MarvSession {
         turn: &str,
         text: &str,
         for_model: &str,
-        woken: bool,
+        woken: &Woken,
         stop: &CancellationToken,
         emit: &Emit,
         main: &Recorder,
@@ -1292,7 +1339,7 @@ impl MarvSession {
                 }
             })
         };
-        self.start_turn_log(log.as_ref(), turn, text, for_model, &specs, mcp_choice).await;
+        self.start_turn_log(log.as_ref(), turn, text, for_model, &specs, mcp_choice, woken).await;
         *lock(main) = Some(recorder(&record, turn, "main"));
 
         // Nearly out of context: summarize first, so this message (and what follows) fits.
@@ -1319,8 +1366,23 @@ impl MarvSession {
             Some(note) => format!("{note}\n\n{for_model}"),
             None => for_model.to_string(),
         };
+        // #124: the radio's messages are read only in the person's own turn (hop 0: a person typing resets the chain)
+        // and in a turn the radio started (automatic approval off; its hop rises past the deepest message it reads).
+        // A turn a wired inbox woke leaves them unread: it may auto-approve (review P2-1).
+        self.inner.radio_hop.set(match woken {
+            Woken::Radio(by) => by.turn_hop(),
+            _ => 0,
+        });
+        let radio_read = match woken {
+            Woken::No => crate::mesh::RadioRead::Read,
+            Woken::Radio(_) => crate::mesh::RadioRead::RaiseHop(self.inner.radio_hop.clone()),
+            Woken::Inbox => crate::mesh::RadioRead::Skip,
+        };
         // Mesh messages that came in since the last step: before the user's message, fenced as data.
-        let inbox = init.mesh.as_ref().and_then(|m| crate::mesh::inbox_note(m, &crate::mesh::parent_id(), &self.inner.taint));
+        let inbox = init
+            .mesh
+            .as_ref()
+            .and_then(|m| crate::mesh::inbox_note_with(m, &crate::mesh::parent_id(), &self.inner.taint, &radio_read));
         let message = match inbox {
             Some(inbox) => format!("{inbox}\n\n{message}"),
             None => message,
@@ -1369,7 +1431,7 @@ impl MarvSession {
         tainted = sources.len();
         lock(&history).push(ChatTurn::User { text: message });
         // A woken turn (#78): who woke it is Marv's line in the transcript; the user said nothing.
-        self.note(if woken { Role::System } else { Role::User }, text);
+        self.note(if woken.is_woken() { Role::System } else { Role::User }, text);
         emit(SessionEvent::Status(TurnStatus::Running));
 
         // The turn's checkpoint pair (#16): the before is taken by the first call that can change files.
@@ -1389,9 +1451,21 @@ impl MarvSession {
         let checkpoint = checkpoints_on.then(|| Arc::new(self.checkpoint_turn(number, text, turn, emit, &record)));
         *lock(pair) = checkpoint.clone();
 
-        let approve: Option<Arc<dyn Approver>> = init.approve.clone().map(|inner| {
-            Arc::new(SessionApprover { inner, always: self.inner.always.clone(), cancel: stop.clone() }) as Arc<dyn Approver>
-        });
+        // #124: a turn the radio started runs with automatic approval off (§8.4): its approvals are asked once each,
+        // say why, and are never answered from the session's remembered "always" (nor are its subagents'); yolo and an
+        // approved URL prefix don't apply (`no_auto_approval` below). Its hop was set before its first read, above.
+        // #74: so does any turn the person didn't start, a mesh wake (#78) too: another agent's message is never a
+        // reason to approve anything automatically.
+        let radio_turn = matches!(woken, Woken::Radio(_));
+        let unattended = woken.is_woken();
+        let client: Option<Arc<dyn Approver>> = init
+            .approve
+            .clone()
+            .map(|inner| if radio_turn { Arc::new(crate::radio::RadioTurnApprover(inner)) as Arc<dyn Approver> } else { inner });
+        let always = if unattended { AlwaysScopes::default() } else { self.inner.always.clone() };
+        let approve: Option<Arc<dyn Approver>> = client
+            .clone()
+            .map(|inner| Arc::new(SessionApprover { inner, always: always.clone(), cancel: stop.clone() }) as Arc<dyn Approver>);
         let checks = self.turn_checks(turn, sandbox, diagnostics, checks_on, stop, emit, main, &record);
         let sink = Arc::new(TurnSink {
             session: self.clone(),
@@ -1411,8 +1485,8 @@ impl MarvSession {
             worktrees_dir: init.worktrees_dir.clone(),
             factory: factory.clone(),
             provider: provider.clone(),
-            approver: init.approve.clone(),
-            always: self.inner.always.clone(),
+            approver: client.clone(),
+            always: always.clone(),
             sink,
             mesh: init.mesh.clone().map(|mesh| MeshAccess { mesh, approver: self.wire_approver() }),
         });
@@ -1425,7 +1499,8 @@ impl MarvSession {
         ctx.home = ctx.sandbox.home.clone();
         ctx.cancel = stop.clone();
         ctx.approver = approve.clone();
-        ctx.yolo = yolo;
+        ctx.yolo = yolo && !unattended;
+        ctx.no_auto_approval = unattended;
         ctx.skills = self.inner.skills.clone();
         ctx.memory = init.memory.as_ref().map(|(paths, _)| paths.for_tools());
         // The session's id now (a resume changes it): its cut outputs are saved, and readable, there (#61).
@@ -1448,9 +1523,6 @@ impl MarvSession {
         // The Herdr door's commands and spawns (#74): where the session has the door and someone approves each command
         // at a terminal, as the host door. Reads need neither.
         ctx.doors.herdr = init.herdr.is_some() && init.host_commands;
-        // A turn another agent started (a mesh wake, #78) gets no automatic answers for the Herdr door's light actions
-        // (#74). The radio's phase 2 (#124) sets this same flag for its turns, with its full meaning in `run_tool`.
-        ctx.no_auto_approval = woken;
         // The process door (Marv #51): the main agent's alone. Subagents get the forwards (their bash reaches the
         // servers), never the processes.
         ctx.doors.process = self.inner.process_on;
@@ -1475,8 +1547,13 @@ impl MarvSession {
         );
         if let Some(mesh) = &init.mesh {
             let taint = self.inner.taint.clone();
-            options.after_step =
-                Some(crate::mesh::with_inbox(options.after_step.take(), mesh.clone(), crate::mesh::parent_id(), taint));
+            options.after_step = Some(crate::mesh::with_inbox(
+                options.after_step.take(),
+                mesh.clone(),
+                crate::mesh::parent_id(),
+                taint,
+                radio_read,
+            ));
         }
         // A direct call to a deferred MCP tool runs as the mcp_call it meant (#14), and its result says so.
         let deferred = self.state().listing.as_ref().is_some_and(|l| l.mode == McpMode::Deferred);
@@ -1931,6 +2008,8 @@ impl MarvSession {
             s.last = None;
             s.listing = None; // a new conversation decides its MCP mode again
             s.plan = None; // a new conversation, a new plan
+            // #124: the new conversation offers radio_tx if it starts with the radio on (fixed until the next clear).
+            s.radio_offered = self.radio_on_now();
         }
         self.hold_tool_output(); // the new id's folder (#61)
         lock(&self.inner.loaded).clear();
@@ -2422,10 +2501,17 @@ impl MarvSession {
         if let Some(SystemPrompt::Replace(text)) = &init.system_prompt {
             return text.clone();
         }
-        let memory = self.state().memories.clone();
+        let (memory, radio) = {
+            let s = self.state();
+            (s.memories.clone(), s.radio_offered)
+        };
+        let mut tools: Vec<String> = self.inner.specs.iter().map(|s| s.name.clone()).collect();
+        if radio {
+            tools.push(crate::radio::RADIO_TX.into());
+        }
         let base = system_prompt(&PromptInput {
             cwd: self.cwd(),
-            tools: self.inner.specs.iter().map(|s| s.name.clone()).collect(),
+            tools,
             instructions: init.instructions.clone(),
             skills: init
                 .skills
@@ -2449,10 +2535,24 @@ impl MarvSession {
             writable: init.writable.iter().map(|d| crate::paths::shorten_home(d, &crate::paths::home_dir())).collect(),
             date: crate::time::iso_date(crate::time::now_ms()),
         });
+        // #124: one fixed section while this conversation offers radio_tx (never a roster, a name or a state).
+        let base = if radio { format!("{base}{}", crate::radio::RADIO_PROMPT) } else { base };
         match &init.system_prompt {
             Some(SystemPrompt::Append(more)) => format!("{base}\n\n{more}"),
             _ => base,
         }
+    }
+
+    /// Whether a conversation starting now starts with the radio on (#124): only a session that can be on it (the
+    /// TUI's), whose switchboard's radio is on.
+    fn radio_on_now(&self) -> bool {
+        let init = &self.inner.init;
+        init.radio.is_some() && init.mesh.as_ref().and_then(|m| m.radio()).is_some_and(|r| r.is_on())
+    }
+
+    /// Whether this conversation offers `radio_tx` (#124).
+    pub fn radio_offered(&self) -> bool {
+        self.state().radio_offered
     }
 
     /// What the model is offered: the built-in tools and the caller's (and the mesh's), then the MCP servers' (fixed
@@ -2479,6 +2579,12 @@ impl MarvSession {
             && let Ok(plug) = mesh.plug(crate::mesh::parent_id())
         {
             tools.extend(MeshTool::all(&plug, mesh, self.wire_approver()).into_iter().map(|t| Arc::new(t) as ToolRef));
+        }
+        // #124: radio_tx right after the mesh's tools, in a conversation that started with the radio on; constant
+        // bytes, and still there after /radio off (it then says the radio is off).
+        if let Some(mesh) = init.mesh.as_ref().filter(|_| self.state().radio_offered) {
+            specs.push(crate::radio::radio_tx_spec());
+            tools.push(Arc::new(crate::radio::RadioTx { mesh: mesh.clone(), hop: self.inner.radio_hop.clone() }));
         }
         let Some(mcp) = &init.mcp else { return (specs, tools) };
         let taint = self.inner.taint.clone();
@@ -2525,6 +2631,7 @@ impl MarvSession {
     }
 
     /// The session's setup (once per file), what this message says about the last turn, and the new turn.
+    #[allow(clippy::too_many_arguments)]
     async fn start_turn_log(
         &self,
         log: Option<&Arc<Trajectory>>,
@@ -2533,6 +2640,7 @@ impl MarvSession {
         for_model: &str,
         specs: &[ToolSpec],
         mcp_choice: Option<ModeChoice>,
+        woken: &Woken,
     ) {
         if let Some(log) = log {
             let init = &self.inner.init;
@@ -2561,11 +2669,18 @@ impl MarvSession {
                     for_model: (for_model != text).then(|| for_model.to_string()),
                     provider: s.factory.id().into(),
                     model: s.factory.model().into(),
-                    yolo: s.yolo,
+                    // A turn the person didn't start (the radio, #124; a mesh wake, #74) runs without yolo.
+                    yolo: s.yolo && !woken.is_woken(),
                     sandbox: s.sandbox,
                     diagnostics: s.diagnostics,
                     checks: s.checks,
                     mcp_tools: mcp_choice,
+                    radio_wake: match woken {
+                        Woken::Radio(by) => {
+                            Some(crate::trajectory::RadioWake { id: by.id.clone(), from: by.from.clone(), hop: by.turn_hop() })
+                        }
+                        _ => None,
+                    },
                 };
                 (s.last_turn.clone(), record)
             };
@@ -2611,8 +2726,9 @@ impl MarvSession {
                 if s.lookups != ticket {
                     return; // the provider changed meanwhile
                 }
-                // What the list says changes the request: the reasoning switch, and the output limit (#96).
-                if info.reasoning.is_some() || info.max_output.is_some() {
+                // What the list says changes the request: the reasoning switch, the output limit (#96), and the
+                // window that clamps it (#116).
+                if info.reasoning.is_some() || info.max_output.is_some() || info.context.is_some() {
                     s.provider = factory.make(None, Some(&info));
                 }
                 s.info = Some(info);
@@ -4242,6 +4358,29 @@ mod turn_tests {
     }
 
     #[tokio::test]
+    async fn a_list_that_gives_only_the_window_remakes_the_provider() {
+        // #116: the window clamps max_tokens, so the provider is made again with it.
+        let dirs = Dirs::new();
+        let made: Arc<Mutex<Vec<Option<u64>>>> = Arc::default();
+        let factory = TestFactory {
+            id: "openrouter".into(),
+            model: "x/y".into(),
+            local: false,
+            make: {
+                let made = made.clone();
+                Arc::new(move |_, info| {
+                    lock(&made).push(info.and_then(|i| i.context));
+                    Arc::new(Scripted::new(vec![])) as Arc<dyn Provider>
+                })
+            },
+            lookup: Some(Arc::new(|| Box::pin(async { Some(info(Some(200_000), None)) }))),
+        };
+        let session = make(&dirs, factory, |_| {});
+        assert!(until(|| session.context_length() == Some(200_000)).await);
+        assert_eq!(*lock(&made), [None, Some(200_000)]);
+    }
+
+    #[tokio::test]
     async fn every_request_extends_the_previous_one_exactly() {
         let dirs = Dirs::new();
         let provider = Scripted::new(vec![
@@ -4610,10 +4749,7 @@ mod turn_tests {
         // read-only project folder (the command substitution reads before the redirect truncates).
         let script = "#!/bin/sh\nfor f in \"$@\"; do case \"$f\" in --*) ;; *) printf '%s\\n' \"$(tr '\"' \"'\" < \"$f\")\" > \"$f\" ;; esac; done\n";
         std::fs::create_dir_all(dirs.project.join("node_modules/.bin")).unwrap();
-        std::fs::write(dirs.project.join("node_modules/.bin/prettier"), script).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dirs.project.join("node_modules/.bin/prettier"), std::fs::Permissions::from_mode(0o755))
-            .unwrap();
+        marv_tools::github::fake::write_executable(&dirs.project.join("node_modules/.bin/prettier"), script);
         std::fs::write(dirs.project.join(".prettierrc"), "{ \"singleQuote\": true }").unwrap();
         std::fs::write(dirs.project.join("a.js"), "const a = \"hi\";\n").unwrap();
         let provider = Scripted::new(vec![

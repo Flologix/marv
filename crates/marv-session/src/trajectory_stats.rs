@@ -119,6 +119,39 @@ pub fn summarize(records: &[Value], by: GroupBy) -> Vec<(String, GroupStats)> {
         .collect()
 }
 
+/// The mesh radio's traffic in a trajectory (marv-rs #124): messages per kind each way, refusals, and the turns the
+/// radio started.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RadioStats {
+    pub sent: BTreeMap<String, usize>,
+    pub received: BTreeMap<String, usize>,
+    /// Sent or received, refused (by this Marv or, sent, by its own limits).
+    pub refused: usize,
+    pub wakes: usize,
+}
+
+/// Counts the radio's records: `mesh` records with `radio: true`, and `turn_start`s with a `radioWake`.
+pub fn radio_stats(records: &[Value]) -> RadioStats {
+    let mut stats = RadioStats::default();
+    for r in records {
+        match r.get("type").and_then(Value::as_str) {
+            Some("mesh") if r.get("radio").and_then(Value::as_bool) == Some(true) => {
+                let kind = r.get("kind").and_then(Value::as_str).unwrap_or("unknown").to_string();
+                match r.get("direction").and_then(Value::as_str) {
+                    Some("sent") => *stats.sent.entry(kind).or_insert(0) += 1,
+                    _ => *stats.received.entry(kind).or_insert(0) += 1,
+                }
+                if r.get("outcome").and_then(Value::as_str) == Some("refused") {
+                    stats.refused += 1;
+                }
+            }
+            Some("turn_start") if r.get("radioWake").is_some_and(|w| !w.is_null()) => stats.wakes += 1,
+            _ => {}
+        }
+    }
+    stats
+}
+
 fn median(mut values: Vec<f64>) -> f64 {
     if values.is_empty() {
         return 0.0;
@@ -188,5 +221,19 @@ mod tests {
         assert_eq!(s.median_seconds, 4.0);
         assert_eq!(summarize(&records, GroupBy::Marv)[0].0, "0.3.0");
         assert!(format_stats(&stats).contains("end 1, max_steps 1"));
+    }
+
+    #[test]
+    fn radio_traffic_is_counted_per_kind_with_refusals_and_wakes() {
+        let records = vec![
+            json!({"type": "mesh", "radio": true, "direction": "sent", "kind": "msg", "outcome": "delivered"}),
+            json!({"type": "mesh", "radio": true, "direction": "sent", "kind": "msg", "outcome": "refused", "reason": "rate"}),
+            json!({"type": "mesh", "radio": true, "direction": "received", "kind": "msg", "outcome": "delivered"}),
+            json!({"type": "mesh", "sender": "worker-1", "outcome": "delivered"}),
+            json!({"type": "turn_start", "turn": "a", "radioWake": {"id": "b:1", "from": "b", "hop": 1}}),
+            json!({"type": "turn_start", "turn": "b"}),
+        ];
+        let stats = radio_stats(&records);
+        assert_eq!((stats.sent["msg"], stats.received["msg"], stats.refused, stats.wakes), (2, 1, 1, 1));
     }
 }

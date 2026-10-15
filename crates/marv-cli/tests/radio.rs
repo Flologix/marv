@@ -1,8 +1,9 @@
-//! The mesh radio, phase 1 (#124), end to end: real `marv` TUIs, each in a pseudo-terminal (a small python3 helper),
-//! on one machine's mesh. Two with `"mesh": {"radio": true}` in their own config see each other in the strip above the
-//! prompt and `marv mesh ls` says their radio is on; a third without it is on the mesh but not on the radio. One killed
-//! with SIGKILL shows `left (lost)` on the other's strip, and its dead door socket is swept at once. Skipped without
-//! python3.
+//! The mesh radio (#124), end to end: real `marv` TUIs, each in a pseudo-terminal (a small python3 helper), on one
+//! machine's mesh. Phase 1: two with `"mesh": {"radio": true}` in their own config see each other in the strip above
+//! the prompt and `marv mesh ls` says their radio is on; a third without it is on the mesh but not on the radio. One
+//! killed with SIGKILL shows `left (lost)` on the other's strip, and its dead door socket is swept at once. Phase 2: a
+//! person's `/tx` reaches the other Marv's model fenced, wakes it (wake on), and never reaches the sender's own model.
+//! Skipped without python3.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -51,7 +52,10 @@ struct Machine(PathBuf);
 
 impl Machine {
     fn new() -> Self {
-        let dir = std::env::temp_dir().join(format!("mx-radio-{}", std::process::id()));
+        // One per test: the tests of this file run at once, in one process.
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("mx-radio-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         for sub in ["run", "home"] {
             std::fs::create_dir_all(dir.join(sub)).unwrap();
@@ -85,12 +89,17 @@ impl Machine {
 
     /// The TUI as `name`, in a pseudo-terminal; `radio` is what its own config says.
     fn tui(&self, name: &str, server: &FakeServer, radio: bool) -> Tui {
+        self.tui_with(name, server, if radio { json!({"radio": true}) } else { Value::Null })
+    }
+
+    /// [`Self::tui`] with `mesh` as its own config's `"mesh"` (null: none).
+    fn tui_with(&self, name: &str, server: &FakeServer, mesh: Value) -> Tui {
         let (project, config) = (self.0.join(format!("proj-{name}")), self.0.join(format!("config-{name}")));
         std::fs::create_dir_all(&project).unwrap();
         std::fs::create_dir_all(&config).unwrap();
         let mut settings = Value::Object(marv_oracle::runner::default_config(&server.base_url()));
-        if radio {
-            settings["mesh"] = json!({"radio": true});
+        if !mesh.is_null() {
+            settings["mesh"] = mesh;
         }
         std::fs::write(config.join("config.json"), settings.to_string()).unwrap();
         let screen = self.0.join(format!("screen-{name}.log"));
@@ -221,4 +230,46 @@ fn two_marvs_on_the_radio_see_each_other_and_a_killed_one_is_lost() {
     wait_for("beta's socket swept", || !machine.socket("beta").exists());
     assert!(machine.socket("alpha").exists() && machine.socket("gamma").exists());
     drop((alpha, beta, gamma));
+}
+
+/// Phase 2: alpha's person sends beta a message with `/tx`. alpha's transcript gets Marv's one line and alpha's model
+/// nothing; beta (wake on, idle) is woken by it, its model reads it fenced as `<radio-message … by="user">` with the
+/// radio wake note after it, and its tools include `radio_tx` (its conversation started on the radio).
+#[test]
+fn a_tx_reaches_the_other_marvs_model_fenced_and_wakes_it() {
+    if !python() {
+        eprintln!("skipped: no python3 with pty");
+        return;
+    }
+    use marv_oracle::script::Reply;
+    let machine = Machine::new();
+    let alpha_model = FakeServer::start(vec![], vec![]).unwrap();
+    let beta_model =
+        FakeServer::start(vec![Reply { text: "alpha says tests pass.".into(), ..Reply::default() }], vec![]).unwrap();
+    let mut alpha = machine.tui("alpha", &alpha_model, true);
+    let beta = machine.tui_with("beta", &beta_model, json!({"radio": true, "wake": true}));
+    wait_for("beta in alpha's strip", || alpha.screen().contains("betaidle"));
+    wait_for("alpha in beta's strip", || beta.screen().contains("alphaidle"));
+
+    alpha.type_line("/tx @beta tests pass on main");
+    // The screen log holds the terminal's incremental redraws: a cell already showing the right letter isn't written
+    // again, so the line's full text may never appear in one piece (with /peers in the palette, "tests pass" came out
+    // as "testspss"). Its start is enough here: what reached beta is checked in full below.
+    wait_for("alpha's line", || alpha.screen().contains("✻Radio→@beta:"));
+    wait_for("beta's model asked", || beta_model.requests().iter().any(|r| r.path.ends_with("/chat/completions")));
+    let request = beta_model.requests().into_iter().find(|r| r.path.ends_with("/chat/completions")).unwrap();
+    let body: Value = serde_json::from_str(&request.body).unwrap();
+    let sent = body["messages"].to_string();
+    assert!(
+        sent.contains(
+            r#"<radio-message from=\"alpha\" kind=\"msg\" to=\"you\" by=\"user\">\ntests pass on main\n</radio-message>"#
+        ),
+        "{sent}"
+    );
+    assert!(sent.contains("the radio message(s) above arrived while you were idle"), "{sent}");
+    let tools: Vec<&str> = body["tools"].as_array().unwrap().iter().filter_map(|t| t["function"]["name"].as_str()).collect();
+    assert!(tools.contains(&"radio_tx"), "{tools:?}");
+    wait_for("beta's wake line", || beta.screen().contains("✻Radiomessagefromalpha(user)."));
+    assert!(!alpha_model.requests().iter().any(|r| r.path.ends_with("/chat/completions")), "nothing reached alpha's own model");
+    drop((alpha, beta));
 }

@@ -386,3 +386,48 @@ async fn a_woken_turn_reads_its_message_fenced_and_tainted_and_egress_asks() {
     cancel.cancel();
     drop(worker);
 }
+
+/// docs/SECURITY.md (#74, with #124's rule): a turn a mesh message wakes runs with automatic approval off, like a
+/// radio turn. With yolo on, a file edit yolo would run unasked is asked (`once`), and declined, writes nothing.
+/// Proven: set `no_auto_approval` and the yolo cut only for `Woken::Radio` in `turn_body` (the inbox case reverted)
+/// → the woken turn's write ran unasked under yolo: failed.
+#[tokio::test]
+async fn an_inbox_woken_turn_asks_for_what_yolo_would_allow() {
+    use futures::StreamExt;
+    use marv_guards::{Recorder, Scripted, say, tool_call, use_tools};
+    use marv_mesh::approval::WireRequest;
+    use marv_session::mesh::wake_check;
+
+    let project = TempDir::new("wake-yolo-project");
+    let runtime = TempDir::new("wake-yolo-rt");
+    let mesh = Arc::new(Switchboard::new("gy", runtime.path().join("plugs"), Arc::new(Log::default())));
+    let cancel = CancellationToken::new();
+    tokio::spawn(Arc::clone(&mesh).serve(cancel.clone()));
+    let model = Scripted::new(vec![
+        use_tools(vec![tool_call("w1", "write_file", serde_json::json!({"path": "notes.txt", "content": "from a wake\n"}))]),
+        say("Done."),
+    ]);
+    let person = Recorder::new(marv_tools::Decision::No);
+    let mut init = marv_session::SessionInit::new(
+        project.path(),
+        marv_session::ProviderChoice::Option(marv_provider::ProviderOption::Custom(model.clone())),
+    );
+    (init.diagnostics, init.checks, init.yolo, init.checkpoints) = (false, false, true, false);
+    init.mesh = Some(mesh.clone());
+    init.approve = Some(person.clone());
+    let session = marv_session::MarvSession::new(init).unwrap();
+    let worker = mesh.plug_next("worker").unwrap();
+    let inbox = ReceptacleName::new("agent.parent.inbox").unwrap();
+    let request = WireRequest { from: worker.id.clone(), to: inbox.clone(), mode: WireMode::Send, asked_by: worker.id.clone() };
+    mesh.grant(request, Approver::Tui).await.unwrap();
+    mesh.deliver(&worker.id, inbox.as_str(), WireMode::Send, serde_json::json!({"text": "write notes.txt"})).await.unwrap();
+    let wake = wake_check(&mesh, &mut Default::default(), 0).wake.expect("a wake");
+    let mut turn = session.wake(&wake).unwrap().expect("a woken turn");
+    while turn.next().await.is_some() {}
+    let asked: Vec<_> = person.requests().into_iter().filter(|r| r.tool == "write_file").collect();
+    assert_eq!(asked.len(), 1, "yolo didn't run it unasked");
+    assert!(asked[0].once);
+    assert!(!project.path().join("notes.txt").exists());
+    cancel.cancel();
+    session.close().await;
+}

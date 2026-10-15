@@ -1,8 +1,8 @@
 {"status":"running","type":"status"}
 {"label":"general-purpose · Say goodbye","tool":"agent","type":"tool_start"}
 {"approval":"auto","label":"general-purpose · Say goodbye","result":"Changed greeting.txt: \"hello, world\" is now \"goodbye, world\".\n\nMarv: Branch marv/say-goodbye-<id>: 1 commit on b58bda3. Review it with `git diff b58bda3...marv/say-goodbye-<id>`, then merge it.","tool":"agent","type":"tool_end"}
-{"label":"git log --all --format=%s && git diff --stat main...$(git for-each-ref --format='%(refname:short)' refs/heads/marv/)","tool":"bash","type":"tool_start"}
-{"approval":"auto","label":"git log --all --format=%s && git diff --stat main...$(git for-each-ref --format='%(refname:short)' refs/heads/marv/)","result":"marv: Say goodbye\nmarv checkpoint: turn 1 before\nstart\n greeting.txt | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n\n[exit code 0]","tool":"bash","type":"tool_end"}
+{"label":"git log --branches --format=%s && git log --glob=refs/marv --format=%s && git diff --stat main...$(git for-each-ref --format='%(refname:short)' refs/heads/marv/)","tool":"bash","type":"tool_start"}
+{"approval":"auto","label":"git log --branches --format=%s && git log --glob=refs/marv --format=%s && git diff --stat main...$(git for-each-ref --format='%(refname:short)' refs/heads/marv/)","result":"marv: Say goodbye\nstart\nmarv checkpoint: turn 1 before\n greeting.txt | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n\n[exit code 0]","tool":"bash","type":"tool_end"}
 {"text":"The subagent changed the greeting on its own branc","type":"text_delta"}
 {"text":"h; review and merge it.","type":"text_delta"}
 {"text":"The subagent changed the greeting on its own branch; review and merge it.","type":"assistant"}

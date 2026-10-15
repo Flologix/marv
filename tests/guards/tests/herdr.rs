@@ -272,7 +272,7 @@ async fn the_peer_limit_holds_before_anyone_is_asked() {
 /// A light action in a turn another agent started (a mesh wake, #78) gets no "always": the person who answered
 /// "always" for focus in their own turn is asked again in the woken one.
 ///
-/// Proven: set `ctx.no_auto_approval` to false for woken turns in `turn_body` → the woken turn's focus was answered
+/// Proven: left `Woken::Inbox` out of `turn_body`'s automatic-approval cut (`unattended`) → the woken turn's focus was answered
 /// from "always" (one ask): failed.
 #[tokio::test]
 async fn a_light_action_in_a_woken_turn_gets_no_always() {

@@ -272,6 +272,10 @@ pub fn write_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
 /// a `Value`), with `cache_control` breakpoints (#56) taken out. The prompt cache needs each run's
 /// own requests to be byte-stable ([`crate::prefix`]), not marv-rs's bytes to equal Marv's, so
 /// key order and breakpoints are left to each implementation; everything else must be the same.
+///
+/// `max_tokens` is taken out too (#112): marv-rs caps each OpenRouter reply so a runaway one ends (Marv #96), and
+/// Marv's recordings have no such field. Its value is marv-rs's own choice (from the model list, and later from the
+/// context left), so the field is dropped rather than pinned.
 pub fn canonical_request(body: &str) -> String {
     let Ok(mut value) = serde_json::from_str::<Value>(body) else { return body.to_string() };
     if let Some(messages) = value.get_mut("messages").and_then(Value::as_array_mut) {
@@ -297,6 +301,9 @@ pub fn canonical_request(body: &str) -> String {
         tools.iter_mut().filter_map(|t| t.pointer_mut("/function/description")).for_each(unword);
     }
     strip_cache_control(&mut value);
+    if let Some(body) = value.as_object_mut() {
+        body.remove("max_tokens");
+    }
     value.to_string()
 }
 
@@ -308,7 +315,8 @@ pub const MARV_RS_SECTIONS: &[&str] = &["# Your situation"];
 /// Text marv-rs rewords on purpose, as (marv-rs, Marv) pairs: the oracle puts Marv's text back in the system prompt
 /// and the tool descriptions before comparing, so everything around it is still checked. The raw requests (the prefix
 /// rule) keep marv-rs's. Keep these in step with the sources: #85's plan sentence (`marv_session::prompt`'s
-/// `PLAN_SENTENCE`) and plan tool description (`marv_tools::plan::PLAN_DESCRIPTION`).
+/// `PLAN_SENTENCE`) and plan tool description (`marv_tools::plan::PLAN_DESCRIPTION`), and #81's sentence at the end of
+/// the process tool's description (`marv_tools::process::PROCESS_DESCRIPTION`), which Marv doesn't have.
 pub const MARV_RS_TEXT: &[(&str, &str)] = &[
     (
         " For a task of four or more steps, keep a plan with the plan tool; send each update in the same reply as your next tool call; only the final one, marking the plan done, may go alone.",
@@ -318,6 +326,7 @@ pub const MARV_RS_TEXT: &[(&str, &str)] = &[
         "Keep a checklist for a task of four or more steps, or when the user asks for several things. Write the plan before starting; mark an item in_progress before working on it and done as soon as it is; add items you discover and remove ones that turn out unnecessary. Send the whole list every time (it replaces the previous one), in the same reply as your next tool call; only the final update, marking the last items done, may go alone. Skip it for a short task or a question.",
         "Keep a checklist for a task of three or more steps, or when the user asks for several things. Write the plan before starting; mark an item in_progress before working on it and done as soon as it is; add items you discover and remove ones that turn out unnecessary. Send the whole list every time (it replaces the previous one). Skip it for a one-step task or a question.",
     ),
+    (" start always needs command; a command that finishes on its own belongs in bash.", ""),
 ];
 
 /// Puts Marv's wording back for each of [`MARV_RS_TEXT`] in a string, plain or in parts.
@@ -506,6 +515,17 @@ mod tests {
             canonical_request(plain),
             r#"{"messages":[{"content":"S","role":"system"},{"content":"hi","role":"user"}],"model":"m","stream":true}"#
         );
+    }
+
+    #[test]
+    fn canonical_requests_drop_max_tokens_and_nothing_else() {
+        let plain = r#"{"messages":[{"content":"hi","role":"user"}],"model":"m","stream":true}"#;
+        let capped = r#"{"max_tokens":32000,"messages":[{"content":"hi","role":"user"}],"model":"m","stream":true}"#;
+        assert_eq!(canonical_request(capped), canonical_request(plain));
+        assert_eq!(canonical_request(capped), plain);
+        // Only the top-level field: a message or tool that says max_tokens keeps it.
+        let inside = r#"{"messages":[{"content":"hi","max_tokens":5,"role":"user"}],"model":"m"}"#;
+        assert_eq!(canonical_request(inside), inside);
     }
 
     #[test]

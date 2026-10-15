@@ -104,6 +104,8 @@ pub fn subagent_context(
     // The subagent's edits format like the main agent's (#67); the hook takes each root per call (a worktree's own).
     ctx.formatter = parent.formatter.clone();
     ctx.yolo = parent.yolo;
+    // A turn the radio started (#124) has no automatic approval, and neither have its subagents.
+    ctx.no_auto_approval = parent.no_auto_approval;
     ctx.skills = parent.skills.clone();
     ctx.taint = Arc::new(parent.taint.for_subagent());
     // Its sandboxed bash reaches the session's background processes like the main agent's (curl localhost:<port>);

@@ -621,6 +621,26 @@ pub struct RadioView {
     /// This Marv's own title, as it goes out (empty with titles off).
     pub my_title: String,
     pub peers: Vec<RadioPeer>,
+    /// The last messages sent and received (phase 2), oldest first: the strip's flash and `/radio`'s traffic list.
+    pub traffic: Vec<RadioTraffic>,
+}
+
+/// One message on the radio, for the person's eyes only. The text is another Marv's (or this one's model's or
+/// person's) words: drawn through `printable()`, sent nowhere.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RadioTraffic {
+    pub at_ms: u64,
+    /// `<sender>:<seq>`.
+    pub id: String,
+    /// Sent by this Marv.
+    pub outgoing: bool,
+    /// Received: its sender. Sent: its addressees (`*` for all).
+    pub peers: Vec<String>,
+    /// `user`, `model` or `marv`: shown, never believed.
+    pub by: String,
+    pub text: String,
+    /// Refused, and why (Marv's words).
+    pub refused: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

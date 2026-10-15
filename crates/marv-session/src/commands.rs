@@ -110,6 +110,12 @@ pub enum CommandAction {
     },
     /// `/radio` with the radio on: the view of who's on it.
     RadioView,
+    /// marv-rs #124: `/tx [@name…] text`, the person's message on the radio (`by: user`); no `@name` is everyone.
+    /// Nothing of it reaches this Marv's own model.
+    Tx {
+        to: Vec<String>,
+        text: String,
+    },
     /// Stop one of the session's background processes (Marv #51).
     Processes {
         stop: String,
@@ -432,12 +438,27 @@ pub fn commands() -> &'static [Command] {
             name: "radio",
             // Joining or leaving doesn't touch a running turn: the palette may run it.
             while_busy: true,
-            description: "The mesh radio: who of your Marvs here is up (/radio on, /radio off)",
+            description: "The mesh radio: who of your Marvs here is up, and what they said (/radio on, /radio off)",
             run: |args, ctx| match on_off(args.trim(), "Usage: /radio, /radio on, or /radio off") {
                 Err(usage) => usage,
                 Ok(Some(on)) => CommandAction::Radio { on },
                 Ok(None) if ctx.config.mesh_radio => CommandAction::RadioView,
                 Ok(None) => print(RADIO_OFF),
+            },
+        },
+        Command {
+            name: "tx",
+            // Sending doesn't touch a running turn: the palette may run it.
+            while_busy: true,
+            description: "Say something on the mesh radio: /tx @name text, or /tx text for every Marv on it",
+            run: |args, ctx| {
+                if !ctx.config.mesh_radio {
+                    return print(RADIO_OFF);
+                }
+                match parse_tx(args) {
+                    Some((to, text)) => CommandAction::Tx { to, text },
+                    None => error("Usage: /tx @name text (one Marv; several: @a @b), or /tx text (every Marv on the radio)"),
+                }
             },
         },
         Command {
@@ -677,7 +698,26 @@ pub fn diagnostics_status(config: &Config) -> String {
 }
 
 /// `/radio` with the radio off (#124).
-pub const RADIO_OFF: &str = "The radio is off. /radio on puts this Marv on it (saved as \"mesh\": {\"radio\": true} in your own ~/.marv/config.json): your Marvs on this machine with the radio on see each other's state (idle, working, waiting) and conversation title, in the strip above the prompt. Nothing any of them says reaches another's model.";
+pub const RADIO_OFF: &str = "The radio is off. /radio on puts this Marv on it (saved as \"mesh\": {\"radio\": true} in your own ~/.marv/config.json): your Marvs on this machine with the radio on see each other's state (idle, working, waiting) and conversation title, in the strip above the prompt, and can send each other short messages (/tx). A message reaches the other Marvs' models as data from another agent, never as their user's words.";
+
+/// `/tx`'s words: leading `@name`s (none: everyone), then the text. `None` without text.
+pub fn parse_tx(args: &str) -> Option<(Vec<String>, String)> {
+    let mut rest = args.trim_start();
+    let mut to = Vec::new();
+    while let Some(after) = rest.strip_prefix('@') {
+        let end = after.find(char::is_whitespace).unwrap_or(after.len());
+        let name = &after[..end];
+        if name.is_empty() {
+            return None;
+        }
+        if name != "all" {
+            to.push(name.to_string());
+        }
+        rest = after[end..].trim_start();
+    }
+    let text = rest.trim_end();
+    (!text.is_empty()).then(|| (to, text.to_string()))
+}
 
 /// `/mesh wake` (#78).
 pub fn mesh_wake_status(config: &Config) -> String {
@@ -1089,6 +1129,24 @@ mod tests {
             assert!(text.contains("on the mesh as `beta`") && text.contains("- `peer-alpha -> agent.parent.inbox`"), "{text}");
             assert!(!text.contains('\u{1b}'), "printable: {text}");
             assert!(text.contains("**Wake**: on") && text.contains("at most 3 a minute per wire"), "{text}");
+        });
+    }
+
+    #[test]
+    fn tx_takes_names_then_the_text() {
+        assert_eq!(parse_tx("@58a7 tests pass"), Some((vec!["58a7".into()], "tests pass".into())));
+        assert_eq!(parse_tx(" @a  @b  hi there "), Some((vec!["a".into(), "b".into()], "hi there".into())));
+        assert_eq!(parse_tx("tests pass on @main"), Some((vec![], "tests pass on @main".into())));
+        assert_eq!(parse_tx("@all hi"), Some((vec![], "hi".into())));
+        assert_eq!(parse_tx("@58a7"), None);
+        assert_eq!(parse_tx("  "), None);
+        assert_eq!(parse_tx("@ hi"), None);
+        with(|ctx| {
+            assert!(matches!(run_command("/tx hi", ctx), CommandAction::Print { .. }), "the radio is off");
+            let on = Config { mesh_radio: true, ..ctx.config.clone() };
+            let ctx = CommandContext { config: &on, ..ctx.clone() };
+            assert_eq!(run_command("/tx @b2 hi", &ctx), CommandAction::Tx { to: vec!["b2".into()], text: "hi".into() });
+            assert!(matches!(run_command("/tx", &ctx), CommandAction::Print { is_error: true, .. }));
         });
     }
 

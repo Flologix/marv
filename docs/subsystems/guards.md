@@ -56,6 +56,23 @@ Each guard's doc comment says how it was proven: the guard was reverted, and the
 | Radio: sandboxed commands can't see it | `radio.rs::sandboxed_commands_cant_see_the_radio` | Proven (real bwrap) |
 | Radio: a killed peer shows lost and its socket is swept | `radio.rs::a_killed_peer_shows_lost_and_its_socket_is_swept` | Proven (two reverts; the peer is this test binary run again) |
 | Radio: a silent peer greys, then drops | `radio.rs::a_silent_peer_greys_then_drops` | Proven (two reverts) |
+| Radio (phase 2): radio text is fenced and taints before the request that carries it | `radio.rs::radio_text_is_fenced_and_taints_before_the_request_that_carries_it` | Proven |
+| Radio: a body can't close the radio fence | `radio.rs::a_body_cant_close_the_radio_fence` | Proven |
+| Radio: egress after radio text asks, even in yolo | `radio.rs::egress_after_radio_text_asks_even_in_yolo` | Proven (real bwrap) |
+| Radio: nothing on the radio can answer an approval | `radio.rs::nothing_on_the_radio_can_answer_an_approval` (+ `marv-cli`'s `mesh_wake::a_radio_message_never_wakes_while_an_approval_waits`) | Proven (two reverts) |
+| Radio: `by: user` is shown but changes nothing | `radio.rs::by_user_is_shown_but_changes_nothing` | Proven |
+| Radio: the model can't turn the radio on | `radio.rs::the_model_cant_turn_the_radio_on` | Proven |
+| Radio: a turn started by the radio asks for what yolo would have allowed | `radio.rs::a_turn_started_by_the_radio_asks_for_what_yolo_would_have_allowed` | Proven (two reverts) |
+| Radio: subagents have no radio | `radio.rs::subagents_have_no_radio` | Proven |
+| Radio: `marv -p` is never on the radio | `radio.rs::marv_p_is_never_on_the_radio` | Proven (the real binary) |
+| Radio: `radio_tx`'s spec is constant and stays after the radio goes off | `radio.rs::radio_tx_spec_is_constant_and_stays_after_radio_off` | Proven |
+| Radio: history stays append-only when radio notes arrive | `radio.rs::history_stays_append_only_when_radio_notes_arrive` | Proven |
+| Radio: oversize messages are refused, not cut | `radio.rs::oversize_messages_are_refused_not_cut` | Proven (two reverts) |
+| Radio: per-sender rates apply at the receiver | `radio.rs::per_sender_rates_apply_at_the_receiver` | Proven |
+| Radio: broadcasts never wake | `radio.rs::broadcasts_never_wake` | Proven |
+| Radio: radio wakes are limited per sender and overall | `radio.rs::radio_wakes_are_limited_per_sender_and_overall` | Proven (two reverts) |
+| Radio: a slow peer never stalls the sender | `radio.rs::a_slow_peer_never_stalls_the_sender` | Proven |
+| Radio: every frame is logged without its text | `radio.rs::every_frame_is_logged_without_its_text` | Proven |
 | Subagents don't inherit network/web/mesh approvals | `provenance.rs::subagents_inherit_taint_but_no_egress_approvals` | Proven |
 | … the config's pre-approved scopes too (#98) | `approvals.rs::subagents_dont_inherit_config_scopes` | Proven |
 | Pre-approved scopes answer their own scopes (#98) | `approvals.rs::config_approve_answers_its_scopes_without_asking` | Proven (session level) |
@@ -95,6 +112,7 @@ Each guard's doc comment says how it was proven: the guard was reverted, and the
 | herdr: the peer limit holds before any ask | `herdr.rs::the_peer_limit_holds_before_anyone_is_asked` | Proven |
 | herdr: a light action in a woken turn gets no "always" | `herdr.rs::a_light_action_in_a_woken_turn_gets_no_always` | Proven |
 | herdr: names and output reach the terminal through `printable()` | `herdr.rs::herdr_names_and_output_reach_the_terminal_only_through_printable` | Proven |
+| A turn a mesh message wakes runs with automatic approval off: yolo asks there (#74) | `mesh.rs::an_inbox_woken_turn_asks_for_what_yolo_would_allow` | Proven |
 | herdr: `/peers stop` types nothing into a busy or asking agent | `herdr.rs::stopping_a_peer_types_nothing_into_an_agent_thats_busy_or_asking` | Proven |
 | doors: a `gh`/`herdr` planted in the project or a relative PATH entry is never run | `herdr.rs::a_door_program_planted_in_the_project_is_never_run` | Proven |
 | herdr: nothing starting with `-` reaches the CLI | `herdr.rs::nothing_starting_with_a_dash_reaches_the_herdr_cli` | Proven (four reverts) |

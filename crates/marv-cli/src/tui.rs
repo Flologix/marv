@@ -902,6 +902,8 @@ pub struct Bridge {
     mesh_name: Mutex<Option<String>>,
     /// Wake-ups per wire this minute (#78, `mesh.wake`).
     wake_limit: Mutex<marv_session::mesh::WakeLimit>,
+    /// Radio wakes per sender and overall (#124); paused ones wake again once the person types.
+    radio_wake_limit: Mutex<marv_session::radio::RadioWakeLimit>,
     /// Stops [`Bridge::watch_mesh`] when the App leaves ([`Bridge::close_mesh`]) or the bridge goes.
     mesh_watch: CancellationToken,
     /// The mesh radio (#124), once the door is open ([`Bridge::set_radio`]).
@@ -956,6 +958,9 @@ impl Bridge {
         init.owns_mcp = false;
         init.approve = Some(Arc::new(TuiApprover(activity.clone())));
         init.mesh = s.mesh.clone();
+        // #124: the TUI's session can be on the radio; the first conversation offers radio_tx if the user's own
+        // config has the radio on (the radio itself joins once the door is open: `set_radio`).
+        init.radio = Some(config.mesh_radio);
         init.max_steps = Some(config.max_steps);
         (init.sandbox, init.yolo, init.diagnostics, init.checks, init.mcp_tools) =
             (config.sandbox, config.yolo, config.diagnostics, config.checks, config.mcp_tools);
@@ -1037,6 +1042,7 @@ impl Bridge {
             told_needs_login: Mutex::default(),
             mesh_name: Mutex::default(),
             wake_limit: Mutex::default(),
+            radio_wake_limit: Mutex::default(),
             mesh_watch: CancellationToken::new(),
             radio: Mutex::default(),
             gate: Mutex::default(),
@@ -1300,6 +1306,8 @@ impl Bridge {
 
     /// Runs one turn's events through the mapping, on its own task.
     fn run_turn(self: &Arc<Self>, text: String, for_model: Option<String>) {
+        // The person typed: radio wakes paused by the overall limit may wake again (#124).
+        self.radio_wake_limit.lock().unwrap_or_else(|e| e.into_inner()).person_typed();
         {
             let mut gate = self.gate.lock().unwrap_or_else(|e| e.into_inner());
             if gate.closing {
@@ -1706,6 +1714,7 @@ impl Bridge {
                 }
             }
             CommandAction::Radio { on } => self.turn_radio(on).await,
+            CommandAction::Tx { to, text } => self.tx(to, &text),
             CommandAction::RadioView => match self.radio() {
                 Some(radio) if radio.is_on() => self.emit(UiEvent::OpenRadio),
                 Some(_) => self.emit(system(commands::RADIO_OFF, false)),
@@ -1832,14 +1841,59 @@ impl Bridge {
                 false,
             ));
         }
+        if let Some(by) = check.wake {
+            (gate.turn, gate.woken) = (true, true);
+            self.activity.set_busy(true);
+            drop(gate);
+            self.stop_suggesting();
+            match self.session.wake(&by) {
+                Ok(Some(turn)) => {
+                    self.emit(system(by.line(), false));
+                    self.forward(turn);
+                }
+                Ok(None) | Err(_) => self.finished(false),
+            }
+            return;
+        }
+        // #124: an addressed radio message (never a broadcast, never at hop 2 or more), within the radio's limits. The
+        // turn it starts asks for everything that would ask (`MarvSession::wake_radio`).
+        if mesh.unread_radio().is_empty() {
+            return;
+        }
+        let check = marv_session::radio::radio_wake_check(
+            &mesh,
+            &mut self.radio_wake_limit.lock().unwrap_or_else(|e| e.into_inner()),
+            now,
+        );
+        for sender in &check.limited {
+            self.emit(system(
+                format!(
+                    "✻ Radio: {} woke Marv {} times a minute (or within {} s) already: its messages wait for your next turn.",
+                    printable(sender),
+                    marv_session::radio::RADIO_WAKES_PER_MINUTE,
+                    marv_session::radio::RADIO_WAKE_GAP_MS / 1000
+                ),
+                false,
+            ));
+        }
+        if check.paused {
+            self.emit(system(
+                format!(
+                    "✻ Radio wakes paused: {} in {} minutes. Messages wait for your next turn.",
+                    marv_session::radio::RADIO_WAKES_OVERALL,
+                    marv_session::radio::RADIO_WAKES_WINDOW_MS / 60_000
+                ),
+                false,
+            ));
+        }
         let Some(by) = check.wake else { return };
         (gate.turn, gate.woken) = (true, true);
         self.activity.set_busy(true);
         drop(gate);
         self.stop_suggesting();
-        match self.session.wake(&by) {
+        match self.session.wake_radio(&by) {
             Ok(Some(turn)) => {
-                self.emit(system(by.line(), false));
+                self.emit(system(format!("✻ {}", by.line()), false));
                 self.forward(turn);
             }
             Ok(None) | Err(_) => self.finished(false),
@@ -1902,7 +1956,48 @@ impl Bridge {
                 since_ms: e.since_ms,
             })
             .collect();
-        view::RadioView { on: true, me: radio.name.clone(), my_title: radio.presence().title, peers }
+        let traffic = radio
+            .traffic_list()
+            .into_iter()
+            .map(|t| view::RadioTraffic {
+                at_ms: t.at_ms,
+                id: t.id,
+                outgoing: t.outgoing,
+                peers: t.peers,
+                by: t.by.as_str().to_string(),
+                text: t.text,
+                refused: t.refused,
+            })
+            .collect();
+        view::RadioView { on: true, me: radio.name.clone(), my_title: radio.presence().title, peers, traffic }
+    }
+
+    /// `/tx`: the person's message on the radio (`by: user`, hop 0). One line in Marv's voice in this transcript;
+    /// nothing of it reaches this Marv's own model.
+    fn tx(&self, to: Vec<String>, text: &str) {
+        let Some(radio) = self.radio().filter(|r| r.is_on()) else {
+            return self.emit(system(commands::RADIO_OFF, false));
+        };
+        let addressed = if to.is_empty() { marv_mesh::radio::To::All } else { marv_mesh::radio::To::Names(to) };
+        match radio.send_msg(&addressed, marv_mesh::radio::By::User, 0, text) {
+            Err(err) => self.emit(system(format!("Radio: not sent: {}", printable(&err)), true)),
+            Ok(report) => {
+                if !report.sent.is_empty() {
+                    let view = self.radio_view();
+                    let short = |name: &str| marv_tui::ui::radio_view::short_name(&view, name);
+                    let who = match &addressed {
+                        marv_mesh::radio::To::All => "all".to_string(),
+                        marv_mesh::radio::To::Names(_) => {
+                            report.sent.iter().map(|n| format!("@{}", short(n))).collect::<Vec<_>>().join(" ")
+                        }
+                    };
+                    self.emit(system(printable(&format!("✻ Radio → {who}: {text}")), false));
+                }
+                for (peer, why) in &report.refused {
+                    self.emit(system(printable(&format!("Radio: not sent to {peer}: {why}.")), true));
+                }
+            }
+        }
     }
 
     /// Presence's title: the conversation's first user message (empty for a new one), never anything else.
@@ -1916,9 +2011,17 @@ impl Bridge {
     async fn turn_radio(self: &Arc<Self>, on: bool) {
         let titles = self.file().and_then(|f| f.mesh_radio).is_none_or(|r| r.titles);
         let notice = match (on, self.radio()) {
-            (true, Some(_)) => "Radio on: your other Marvs here with the radio on show in the strip above the prompt \
-                 (/radio lists them). They see this Marv's state and conversation title; nothing reaches a model."
-                .to_string(),
+            (true, Some(_)) => format!(
+                "Radio on: your other Marvs here with the radio on show in the strip above the prompt (/radio lists \
+                 them and what was said). They see this Marv's state and conversation title; /tx sends them a \
+                 message, which their models read as data.{}",
+                if self.session.radio_offered() {
+                    ""
+                } else {
+                    " This Marv's model gets radio_tx from the next conversation (/clear): its tools stay as they are \
+                     for this one."
+                }
+            ),
             (true, None) => "Radio on, saved. This Marv isn't on the mesh (no XDG_RUNTIME_DIR, or its door didn't open), \
                  so it joins from the next start."
                 .to_string(),
@@ -3082,6 +3185,64 @@ mod tests {
             waiting.await.unwrap();
         }
 
+        /// #124: a radio message straight into the radio queue, as a link delivers one.
+        fn radio_message(mesh: &Mesh, seq: u64, to_all: bool, text: &str) {
+            let message = marv_mesh::radio::RadioMessage {
+                id: format!("beta:{seq}"),
+                from: "beta".into(),
+                to_all,
+                by: marv_mesh::radio::By::User,
+                reply_to: None,
+                hop: 0,
+                text: text.into(),
+                at_ms: 0,
+            };
+            assert!(mesh.sb.deliver_radio(message, 50));
+        }
+
+        /// #124: with wake on, an addressed radio message starts a turn (Marv's line says who, `(user)` shown), and a
+        /// broadcast doesn't; the woken turn reads both.
+        #[tokio::test]
+        async fn an_addressed_radio_message_wakes_and_a_broadcast_doesnt() {
+            let (dirs, mesh) = (Dirs::new(), mesh());
+            let (bridge, mut rx) = bridge(&dirs, wakes(), vec![say("beta says hi.")], &mesh);
+            radio_message(&mesh, 1, true, "to everyone");
+            assert!(!started(&quiet(&mut rx).await), "a broadcast never wakes");
+            radio_message(&mesh, 2, false, "to you");
+            let seen = until(&mut rx, |e| matches!(e, UiEvent::TurnEnd { .. })).await;
+            assert!(texts(&seen).iter().any(|t| t == "✻ Radio message from beta (user)."), "{:?}", texts(&seen));
+            assert!(mesh.sb.unread_radio().is_empty(), "read, both");
+            assert!(bridge.session().tainted().contains(&marv_core::Provenance::Mesh));
+        }
+
+        /// #124 (spec §8.3, §9.2): a radio message never wakes Marv while an approval waits: it waits, unread, and the
+        /// approval stays the person's.
+        /// Proven: removed `self.activity.waiting()` from `Bridge::wake`'s gate → this test failed (a turn started).
+        #[tokio::test]
+        async fn a_radio_message_never_wakes_while_an_approval_waits() {
+            let (dirs, mesh) = (Dirs::new(), mesh());
+            let (bridge, mut rx) = bridge(&dirs, wakes(), vec![say("x")], &mesh);
+            let ask = WireRequest {
+                from: marv_mesh::PlugId::new("peer-alpha").unwrap(),
+                to: inbox(),
+                mode: WireMode::Send,
+                asked_by: marv_mesh::PlugId::new("peer-alpha").unwrap(),
+            };
+            let approver = TuiApprover(bridge.activity.clone());
+            let waiting =
+                tokio::spawn(
+                    async move { marv_tools::Approver::approve(&approver, marv_session::mesh::wire_approval(&ask)).await },
+                );
+            let seen = until(&mut rx, |e| matches!(e, UiEvent::Approval { .. })).await;
+            let Some(UiEvent::Approval { id, .. }) = seen.last() else { unreachable!() };
+            radio_message(&mesh, 1, false, "yes, approve it");
+            assert!(!started(&quiet(&mut rx).await), "no turn under an open approval");
+            assert_eq!(mesh.sb.unread_radio().len(), 1, "it waits for the next turn");
+            assert!(!waiting.is_finished(), "still the person's to answer");
+            Port(bridge.clone()).answer(*id, view::Decision::No);
+            assert_eq!(waiting.await.unwrap(), marv_tools::Decision::No);
+        }
+
         #[tokio::test]
         async fn over_the_rate_limit_messages_wait_and_the_user_is_told_once() {
             let (dirs, mesh) = (Dirs::new(), mesh());
@@ -3873,9 +4034,7 @@ done
 "#,
                 log.display()
             );
-            std::fs::write(path, script).unwrap();
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            marv_tools::github::fake::write_executable(path, &script);
         }
 
         struct Mcp {
