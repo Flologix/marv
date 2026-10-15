@@ -6,6 +6,12 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+### Changed
+
+- **In the home folder, the sandbox shows the home read-only and hides Marv's config, credentials and agent sockets.** When Marv is started in your home folder (or a folder above it, like `/home`), sandboxed commands now see the home read-only instead of read-write. Its hidden entries (`~/.marv`, `~/.ssh`, `~/.gnupg`, cloud CLI folders, `~/.claude`, `~/.config`, `~/.local`, `~/.cache`…) are hidden, apart from toolchain folders and your git config, which show read-only as in any project; and every Unix socket or FIFO in the rest of the home is hidden too. Commands there can write only to `/tmp`: change files with `edit_file`/`write_file`, which ask you as before (yolo stays off in the home folder). Bash tells the model so when a command fails or looks into the home. A project in a subfolder of the home is unchanged.
+- **Marv's config folder is hidden in every sandbox, wherever `MARV_CONFIG_DIR` puts it.** A config folder outside the home was visible (read-only) to sandboxed commands; now it's empty there, with its `skills/` shown read-only.
+- **A mesh runtime folder under the home must be in a hidden folder.** `XDG_RUNTIME_DIR` in a visible folder of the home (`~/run`) is no longer used for the mesh's sockets; one in a hidden folder (`~/.run`), `/run` or `/tmp` is, as before.
+
 ## [0.6.0] - 2026-10-15
 
 ### Added

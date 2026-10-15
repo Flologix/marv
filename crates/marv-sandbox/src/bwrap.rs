@@ -12,6 +12,14 @@
 //!   network, the DNS config `/etc/resolv.conf` leads to are shown again, read-only;
 //! - the home folder is a stand-in (see [`crate::home`]);
 //! - the project is the only writable place (plus a private, RAM-backed `/tmp`), with protected paths read-only;
+//! - when the project is the home folder or a parent of it (Marv started in `~`), the stand-in can't hide the home
+//!   without hiding the project, so the project is shown **read-only** instead, and on top of it every hidden
+//!   top-level entry of the home (`~/.<anything>`: Marv's config, credentials, agent and tool state, the sockets they
+//!   keep) is an empty tmpfs or `/dev/null`, the toolchain folders are shown again read-only, [`HOME_MASKS`] are
+//!   masked once more, and every Unix socket or FIFO a bounded scan finds in the visible part of the home is
+//!   `/dev/null` (a read-only mount doesn't stop a `connect()` or a write into a FIFO). See `home_masks`;
+//! - Marv's config folder (`MARV_CONFIG_DIR`) is an empty tmpfs wherever it is, except inside the stand-in home,
+//!   which hides it already;
 //! - bun's download cache is a throwaway one in that `/tmp` (`BUN_INSTALL_CACHE_DIR=/tmp/bun-cache`): a shared or
 //!   host cache would let one sandboxed command (an install's lifecycle scripts) plant packages for another context;
 //! - no network unless the call asked (`--unshare-net`); known limit: with network the sandbox shares the host's
@@ -27,7 +35,8 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use crate::SandboxError;
-use crate::home::{CREDENTIALS, TOOLCHAINS, contains, credential_masks};
+use crate::home::{CREDENTIALS, HOME_MASKS, TOOLCHAINS, contains, credential_masks};
+use crate::protected::SKIPPED_DIRS;
 
 /// Where the mesh plug's socket appears inside the sandbox: the one thing in the otherwise empty `/run`.
 pub const MESH_SOCKET: &str = "/run/marv/mesh.sock";
@@ -39,8 +48,30 @@ pub enum FileKind {
     Symlink,
 }
 
+/// What a folder entry is, not following a symlink: what [`FsProbe::entries`] reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum EntryKind {
+    Dir,
+    File,
+    Symlink,
+    /// A Unix socket or a FIFO: a way to talk to a process outside the sandbox, which a read-only mount doesn't close.
+    Channel,
+    /// A device or anything else.
+    Other,
+}
+
+/// How deep below the home folder the socket scan of a home-folder project looks, and how many entries it reads at
+/// most (breadth first, so the shallow ones are seen first). The home's hidden entries, where services keep their
+/// sockets, are masked whole without a scan; this is for the visible folders.
+pub const SOCKET_SCAN_DEPTH: usize = 6;
+pub const SOCKET_SCAN_LIMIT: usize = 20_000;
+
 /// The file system, injectable for tests.
 pub trait FsProbe {
+    /// A folder's entries with what each is (not following symlinks).
+    fn entries(&self, dir: &Path) -> io::Result<Vec<(std::ffi::OsString, EntryKind)>>;
+    /// What a path itself is (not following a final symlink); None if it doesn't exist.
+    fn entry_kind(&self, path: &Path) -> Option<EntryKind>;
     /// Whether a path exists (following symlinks).
     fn exists(&self, path: &Path) -> bool;
     /// What the path itself is.
@@ -52,7 +83,34 @@ pub trait FsProbe {
 /// The real file system.
 pub struct RealFs;
 
+fn entry_kind_of(file_type: std::fs::FileType) -> EntryKind {
+    use std::os::unix::fs::FileTypeExt;
+    if file_type.is_symlink() {
+        EntryKind::Symlink
+    } else if file_type.is_dir() {
+        EntryKind::Dir
+    } else if file_type.is_file() {
+        EntryKind::File
+    } else if file_type.is_socket() || file_type.is_fifo() {
+        EntryKind::Channel
+    } else {
+        EntryKind::Other
+    }
+}
+
 impl FsProbe for RealFs {
+    fn entries(&self, dir: &Path) -> io::Result<Vec<(OsString, EntryKind)>> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            out.push((entry.file_name(), entry.file_type().map(entry_kind_of)?));
+        }
+        out.sort();
+        Ok(out)
+    }
+    fn entry_kind(&self, path: &Path) -> Option<EntryKind> {
+        std::fs::symlink_metadata(path).ok().map(|m| entry_kind_of(m.file_type()))
+    }
     fn exists(&self, path: &Path) -> bool {
         path.exists()
     }
@@ -106,6 +164,9 @@ pub struct SandboxOptions {
     /// Marv's own runtime folders (`$XDG_RUNTIME_DIR/marv`: the mesh's plug and discovery sockets, the process
     /// door's relays), each an empty tmpfs in the sandbox wherever it is (marv-rs).
     pub hidden: Vec<PathBuf>,
+    /// Marv's config folder (`~/.marv` or `MARV_CONFIG_DIR`): an empty tmpfs in the sandbox wherever it is, its
+    /// `skills/` shown again read-only (marv-rs). Inside the stand-in home it's hidden already.
+    pub config_dir: Option<PathBuf>,
 }
 
 /// One of [`SandboxOptions::binds`]: `source` on the host, at `dest` in the sandbox.
@@ -178,6 +239,16 @@ fn run_mounts(path: &str, network: bool, fs: &dyn FsProbe) -> Vec<OsString> {
 pub fn sandbox_args(opts: &SandboxOptions, fs: &dyn FsProbe) -> Result<Vec<OsString>, SandboxError> {
     let root = opts.root.as_os_str();
     let home = opts.home.as_os_str();
+    let real_home = fs.realpath(&opts.home).unwrap_or_else(|_| opts.home.clone());
+    let real_root = fs.realpath(&opts.root).unwrap_or_else(|_| opts.root.clone());
+    // The project is the home folder or a parent of it (marv-rs): mounting it writable would put the whole real home
+    // back over the stand-in, so it's read-only, with what's private in the home masked on top (`home_masks`). At /
+    // the first mount already shows it read-only, and binding / again would cover /tmp, /run and the stand-in home:
+    // the home stays a stand-in then.
+    let home_project = contains(&real_root, &real_home);
+    let bind_root = real_root != Path::new("/");
+    let home_shown = home_project && bind_root;
+    let read_only = opts.project_read_only || home_project;
     let mut args: Vec<OsString> = Vec::new();
     let mut push = |items: &[&std::ffi::OsStr]| args.extend(items.iter().map(|s| s.to_os_string()));
     push(&[
@@ -214,7 +285,9 @@ pub fn sandbox_args(opts: &SandboxOptions, fs: &dyn FsProbe) -> Result<Vec<OsStr
     for (dir, real, _) in extras.iter().filter(|e| e.2) {
         args.extend(["--ro-bind".into(), real.clone().into_os_string(), dir.as_os_str().to_os_string()]);
     }
-    args.extend([if opts.project_read_only { "--ro-bind" } else { "--bind" }.into(), root.to_os_string(), root.to_os_string()]);
+    if bind_root {
+        args.extend([if read_only { "--ro-bind" } else { "--bind" }.into(), root.to_os_string(), root.to_os_string()]);
+    }
     for (dir, real, _) in extras.iter().filter(|e| !e.2) {
         args.extend(["--ro-bind".into(), real.clone().into_os_string(), dir.as_os_str().to_os_string()]);
     }
@@ -222,7 +295,7 @@ pub fn sandbox_args(opts: &SandboxOptions, fs: &dyn FsProbe) -> Result<Vec<OsStr
         let (real, _) = resolve_extra(dir, &opts.home, &opts.root, fs)?;
         args.extend(["--bind".into(), real.into_os_string(), dir.as_os_str().to_os_string()]);
     }
-    if !opts.project_read_only {
+    if !read_only {
         // Protected paths (marv-rs): read-only on top of the writable project.
         for path in &opts.protected {
             args.extend(["--ro-bind".into(), path.clone().into_os_string(), path.clone().into_os_string()]);
@@ -251,6 +324,27 @@ pub fn sandbox_args(opts: &SandboxOptions, fs: &dyn FsProbe) -> Result<Vec<OsStr
         {
             args.extend(["--tmpfs".into(), real.into_os_string()]);
         }
+    }
+    // Marv's config folder (marv-rs): its config.json holds the API key and the session-start hooks, which run outside
+    // the sandbox. Inside the stand-in home it's gone already (a tmpfs there would only hide ~/.marv/skills, mounted
+    // above); elsewhere `/` shows it, and in a home-folder project the project does. Never one that holds the
+    // project: that would hide the project.
+    let mut config_hidden = None;
+    if let Some(dir) = &opts.config_dir
+        && let Ok(real) = fs.realpath(dir)
+        && fs.entry_kind(&real) == Some(EntryKind::Dir)
+        && !contains(&real, &real_root)
+        && (home_shown || !real.starts_with(&real_home))
+    {
+        args.extend(["--tmpfs".into(), real.clone().into_os_string()]);
+        let skills = real.join("skills");
+        if !home_shown && fs.entry_kind(&skills) == Some(EntryKind::Dir) {
+            args.extend(["--ro-bind".into(), skills.clone().into_os_string(), skills.into_os_string()]);
+        }
+        config_hidden = Some(real);
+    }
+    if home_shown {
+        args.extend(home_masks(opts, &real_home, config_hidden.as_deref(), fs)?);
     }
     // Last, on top of every other mount, so the empty file hides the real one and no later mount shows it again.
     let mut masks: Vec<PathBuf> = Vec::new();
@@ -286,6 +380,131 @@ pub fn sandbox_args(opts: &SandboxOptions, fs: &dyn FsProbe) -> Result<Vec<OsStr
     Ok(args)
 }
 
+/// What hides `path` (by what it is, not following a symlink): a folder becomes an empty tmpfs, anything else
+/// (a file, a socket, a FIFO) `/dev/null`. A symlink hides what it leads to, if that's inside the home and not the
+/// home itself or a parent of it (outside the home, it's what any sandbox shows; a link to the home only leads back
+/// to what's masked anyway). Nothing for a path that doesn't exist.
+fn mask(path: &Path, real_home: &Path, fs: &dyn FsProbe) -> Option<(Vec<OsString>, PathBuf)> {
+    let (path, kind) = match fs.entry_kind(path)? {
+        EntryKind::Symlink => {
+            let target = fs.realpath(path).ok()?;
+            if !target.starts_with(real_home) || contains(&target, real_home) {
+                return None;
+            }
+            let kind = fs.entry_kind(&target)?;
+            (target, kind)
+        }
+        kind => (path.to_path_buf(), kind),
+    };
+    let args = match kind {
+        EntryKind::Dir => vec!["--tmpfs".into(), path.clone().into_os_string()],
+        EntryKind::Symlink => return None, // realpath leads to no symlink
+        _ => vec!["--ro-bind".into(), "/dev/null".into(), path.clone().into_os_string()],
+    };
+    Some((args, path))
+}
+
+/// The masks over a home folder the project shows (read-only), in this order:
+/// 1. every hidden top-level entry (`~/.<anything>`) but the toolchains named whole in [`TOOLCHAINS`] (`.bun`,
+///    `.cargo`, `.gitconfig`…): Marv's config, credentials (`.ssh`, `.gnupg`, cloud CLI folders), agent state
+///    (`.claude`), and `.config`, `.local`, `.cache` where tools keep their sockets (Herdr's `.config/herdr`). This is
+///    what the stand-in home hides in any other project. If the home can't be listed, the command doesn't run;
+/// 2. the toolchain folders inside those (`.local/bin`, `.config/git`, `.marv/skills`…), shown again read-only;
+/// 3. [`HOME_MASKS`], wherever step 2 (or a future toolchain) would show one again;
+/// 4. every Unix socket and FIFO in the visible part of the home, found by a breadth-first scan of at most
+///    [`SOCKET_SCAN_LIMIT`] entries, [`SOCKET_SCAN_DEPTH`] levels deep, not following symlinks and skipping
+///    `node_modules`, `target` and `.git/objects`: `/dev/null` on top of each. A read-only mount doesn't stop a
+///    `connect()` on a socket or a write into a FIFO, and a service listening there may do anything its client asks.
+///
+/// The credential masks ([`CREDENTIALS`]) still come after all of these.
+fn home_masks(
+    opts: &SandboxOptions,
+    real_home: &Path,
+    config_hidden: Option<&Path>,
+    fs: &dyn FsProbe,
+) -> Result<Vec<OsString>, SandboxError> {
+    let entries = fs.entries(real_home).map_err(|e| {
+        SandboxError::Mount(format!(
+            "Can't list the home folder {} to hide what's private in it ({e}), so no command runs there in the sandbox. Start Marv in a project folder.",
+            real_home.display()
+        ))
+    })?;
+    let mut args: Vec<OsString> = Vec::new();
+    let mut masked: Vec<PathBuf> = config_hidden.map(Path::to_path_buf).into_iter().collect();
+    // 1. Hidden top-level entries.
+    for (name, _) in &entries {
+        let text = name.to_string_lossy();
+        if !text.starts_with('.') || TOOLCHAINS.contains(&&*text) {
+            continue;
+        }
+        if let Some((more, path)) = mask(&real_home.join(name), real_home, fs)
+            && !masked.contains(&path)
+        {
+            args.extend(more);
+            masked.push(path);
+        }
+    }
+    // 2. Toolchains under them, shown again (bwrap makes their mount points in the tmpfs).
+    let shown_again: Vec<PathBuf> = TOOLCHAINS
+        .iter()
+        .map(|dir| real_home.join(dir))
+        .filter(|full| fs.exists(full) && masked.iter().any(|m| full.starts_with(m) && full != m))
+        .collect();
+    for full in &shown_again {
+        args.extend(["--ro-bind".into(), full.clone().into_os_string(), full.clone().into_os_string()]);
+    }
+    let visible = |path: &Path, masked: &[PathBuf]| {
+        !masked.iter().any(|m| path.starts_with(m)) || shown_again.iter().any(|t| path.starts_with(t))
+    };
+    // 3. The named ones, wherever a toolchain shows them again.
+    for name in HOME_MASKS {
+        let path = real_home.join(name);
+        if visible(&path, &masked)
+            && let Some((more, path)) = mask(&path, real_home, fs)
+        {
+            args.extend(more);
+            masked.push(path);
+        }
+    }
+    // 4. Sockets and FIFOs in what's still visible.
+    let mut queue: std::collections::VecDeque<(PathBuf, usize)> = std::collections::VecDeque::new();
+    let mut seen = 0usize;
+    let mut channels: Vec<PathBuf> = Vec::new();
+    let mut visit =
+        |dir: &Path, depth: usize, list: &[(OsString, EntryKind)], queue: &mut std::collections::VecDeque<(PathBuf, usize)>| {
+            for (name, kind) in list {
+                let path = dir.join(name);
+                // The toolchains left whole at the top (`.cargo`, `.rustup`) are shown as in any project's sandbox, unscanned.
+                let skipped = SKIPPED_DIRS.iter().any(|s| *s != ".git" && name == *s)
+                    || (name == "objects" && dir.file_name().is_some_and(|n| n == ".git"))
+                    || (depth == 1 && name.to_string_lossy().starts_with('.'));
+                match kind {
+                    EntryKind::Channel if visible(&path, &masked) => channels.push(path),
+                    EntryKind::Dir if depth < SOCKET_SCAN_DEPTH && !skipped && visible(&path, &masked) => {
+                        queue.push_back((path, depth + 1))
+                    }
+                    _ => {}
+                }
+            }
+        };
+    visit(real_home, 1, &entries, &mut queue);
+    while let Some((dir, depth)) = queue.pop_front() {
+        if opts.hidden.iter().any(|h| dir.starts_with(h)) {
+            continue;
+        }
+        let Ok(list) = fs.entries(&dir) else { continue };
+        seen += list.len();
+        visit(&dir, depth, &list, &mut queue);
+        if seen >= SOCKET_SCAN_LIMIT {
+            break;
+        }
+    }
+    for path in channels {
+        args.extend(["--ro-bind".into(), "/dev/null".into(), path.into_os_string()]);
+    }
+    Ok(args)
+}
+
 /// Whether bwrap is installed and allowed to create namespaces here (checked once per process).
 pub fn sandbox_available() -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
@@ -310,13 +529,73 @@ mod tests {
         kinds: HashMap<String, FileKind>,
         links: HashMap<String, String>,
         dangling: bool,
+        /// Folder listings (a folder not listed is empty), and what's in them.
+        dirs: HashMap<String, Vec<(String, EntryKind)>>,
+        unlistable: bool,
     }
     impl Fake {
         fn new(exists: impl Fn(&str) -> bool + 'static) -> Self {
-            Self { exists: Box::new(exists), kinds: HashMap::new(), links: HashMap::new(), dangling: false }
+            Self {
+                exists: Box::new(exists),
+                kinds: HashMap::new(),
+                links: HashMap::new(),
+                dangling: false,
+                dirs: HashMap::new(),
+                unlistable: false,
+            }
+        }
+        /// A file system from listings alone: every listed entry exists, as what it's listed as.
+        fn listed(dirs: &[(&str, &[(&str, EntryKind)])]) -> Self {
+            let mut all: HashMap<String, EntryKind> = HashMap::new();
+            for (dir, list) in dirs {
+                all.insert((*dir).into(), EntryKind::Dir);
+                for (name, kind) in *list {
+                    all.insert(format!("{dir}/{name}"), *kind);
+                }
+            }
+            let names: Vec<String> = all.keys().cloned().collect();
+            let mut fs = Fake::new(move |p| names.iter().any(|n| n == p));
+            for (path, kind) in &all {
+                match kind {
+                    EntryKind::File => drop(fs.kinds.insert(path.clone(), FileKind::File)),
+                    EntryKind::Symlink => drop(fs.kinds.insert(path.clone(), FileKind::Symlink)),
+                    _ => {}
+                }
+            }
+            fs.dirs = dirs.iter().map(|(d, l)| ((*d).into(), l.iter().map(|(n, k)| ((*n).into(), *k)).collect())).collect();
+            fs
+        }
+        fn listed_kind(&self, path: &str) -> Option<EntryKind> {
+            let (dir, name) = path.rsplit_once('/')?;
+            let dir = if dir.is_empty() { "/" } else { dir };
+            self.dirs.get(dir)?.iter().find(|(n, _)| n == name).map(|(_, k)| *k)
         }
     }
     impl FsProbe for Fake {
+        fn entries(&self, dir: &Path) -> io::Result<Vec<(OsString, EntryKind)>> {
+            if self.unlistable {
+                return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+            }
+            Ok(self
+                .dirs
+                .get(&*dir.to_string_lossy())
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(n, k)| (n.into(), k))
+                .collect())
+        }
+        fn entry_kind(&self, path: &Path) -> Option<EntryKind> {
+            let p = path.to_string_lossy();
+            if let Some(kind) = self.listed_kind(&p) {
+                return Some(kind);
+            }
+            match self.kinds.get(&*p) {
+                Some(FileKind::File) => Some(EntryKind::File),
+                Some(FileKind::Symlink) => Some(EntryKind::Symlink),
+                None => self.exists(path).then_some(EntryKind::Dir),
+            }
+        }
         fn exists(&self, path: &Path) -> bool {
             (self.exists)(&path.to_string_lossy())
         }
@@ -528,5 +807,139 @@ mod tests {
             args.find("--tmpfs /run").unwrap()
                 < args.find(&format!("--bind /run/user/1000/marv/mesh-1.sock {MESH_SOCKET}")).unwrap()
         );
+    }
+
+    use EntryKind::{Channel, Dir, File as F, Symlink as L};
+
+    /// A home folder with Marv's config, credentials, agent state, sockets in hidden and visible folders, toolchains.
+    fn a_home() -> Fake {
+        let mut fs = Fake::listed(&[
+            (
+                "/home/me",
+                &[
+                    (".bashrc", F),
+                    (".cargo", Dir),
+                    (".claude", Dir),
+                    (".config", Dir),
+                    (".gitconfig", F),
+                    (".local", Dir),
+                    (".marv", Dir),
+                    (".ssh", Dir),
+                    (".agent.sock", Channel),
+                    (".dots", L),
+                    ("Projects", Dir),
+                    ("notes.txt", F),
+                ],
+            ),
+            ("/home/me/.config", &[("herdr", Dir), ("git", Dir)]),
+            ("/home/me/.config/herdr", &[("herdr.sock", Channel)]),
+            ("/home/me/.local", &[("share", Dir), ("bin", Dir)]),
+            ("/home/me/.local/share", &[("mise", Dir), ("keyrings", Dir)]),
+            ("/home/me/.marv", &[("config.json", F), ("skills", Dir)]),
+            ("/home/me/Projects", &[("run.sock", Channel), ("app", Dir), ("dotfiles", Dir)]),
+            ("/home/me/Projects/app", &[("node_modules", Dir), ("pipe", Channel)]),
+            ("/home/me/Projects/app/node_modules", &[("x.sock", Channel)]),
+            ("/home/me/Projects/dotfiles", &[("secret", Dir)]),
+        ]);
+        fs.links.insert("/home/me/.dots".into(), "/home/me/Projects/dotfiles/secret".into());
+        fs
+    }
+    fn at_home() -> SandboxOptions {
+        SandboxOptions {
+            root: "/home/me".into(),
+            home: "/home/me".into(),
+            path: "/usr/bin".into(),
+            config_dir: Some("/home/me/.marv".into()),
+            ..Default::default()
+        }
+    }
+    /// Where `needle` last appears in the joined args.
+    fn last(args: &str, needle: &str) -> usize {
+        args.rfind(needle).unwrap_or_else(|| panic!("{needle} missing from {args}"))
+    }
+
+    #[test]
+    fn a_home_folder_project_is_read_only_and_its_private_parts_are_masked_after_it() {
+        let fs = a_home();
+        let opts =
+            SandboxOptions { protected: vec!["/home/me/.envrc".into()], placeholders: vec!["/home/me/.git".into()], ..at_home() };
+        let args = joined(&opts, &fs);
+        let project = last(&args, "--ro-bind /home/me /home/me");
+        assert_eq!(args.matches("--tmpfs /home/me/.marv ").count(), 1, "the config folder once: {args}");
+        assert!(!args.contains("--bind /home/me /home/me"), "never writable: {args}");
+        // Every hidden top-level entry, after the read-only home.
+        for mask in [
+            "--tmpfs /home/me/.marv",
+            "--tmpfs /home/me/.ssh",
+            "--tmpfs /home/me/.claude",
+            "--tmpfs /home/me/.config",
+            "--tmpfs /home/me/.local",
+            "--ro-bind /dev/null /home/me/.bashrc",
+            "--ro-bind /dev/null /home/me/.agent.sock",
+            // A hidden symlink hides what it leads to.
+            "--tmpfs /home/me/Projects/dotfiles/secret",
+            // Sockets and FIFOs in the visible part.
+            "--ro-bind /dev/null /home/me/Projects/run.sock",
+            "--ro-bind /dev/null /home/me/Projects/app/pipe",
+        ] {
+            assert!(last(&args, mask) > project, "{mask} must come after the home: {args}");
+        }
+        // Toolchains: left whole, or shown again after their hidden parent.
+        assert!(!args.contains("--tmpfs /home/me/.cargo") && !args.contains("/dev/null /home/me/.gitconfig"), "{args}");
+        for (parent, toolchain) in
+            [(".local", ".local/share/mise"), (".local", ".local/bin"), (".config", ".config/git"), (".marv", ".marv/skills")]
+        {
+            let shown = last(&args, &format!("--ro-bind /home/me/{toolchain} /home/me/{toolchain}"));
+            assert!(shown > last(&args, &format!("--tmpfs /home/me/{parent} ")), "{toolchain}: {args}");
+        }
+        // Not node_modules (skipped), and nothing protected on top of a read-only project.
+        assert!(!args.contains("x.sock") && !args.contains(".envrc") && !args.contains(".git "), "{args}");
+    }
+
+    #[test]
+    fn a_parent_of_the_home_is_read_only_too_and_the_root_keeps_the_stand_in() {
+        let fs = a_home();
+        let args = joined(&SandboxOptions { root: "/home".into(), ..at_home() }, &fs);
+        let project = last(&args, "--ro-bind /home /home");
+        assert!(!args.contains("--bind /home /home"));
+        assert!(last(&args, "--tmpfs /home/me/.config") > project, "{args}");
+        assert!(last(&args, "--ro-bind /dev/null /home/me/Projects/run.sock") > project, "{args}");
+        // At / the first mount shows the project read-only already; binding / again would cover /tmp, /run and
+        // the stand-in home.
+        let args = strings(&SandboxOptions { root: "/".into(), ..at_home() }, &fs);
+        assert_eq!(args.windows(3).filter(|w| w[1] == "/" && w[2] == "/").count(), 1, "{args:?}");
+        assert!(!args.iter().any(|a| a == "--bind"), "{args:?}");
+        assert!(args.join(" ").contains("--tmpfs /home/me"));
+    }
+
+    #[test]
+    fn a_home_that_cant_be_listed_runs_nothing() {
+        let mut fs = a_home();
+        fs.unlistable = true;
+        assert!(sandbox_args(&at_home(), &fs).is_err());
+        // Elsewhere the home isn't listed at all.
+        assert!(sandbox_args(&SandboxOptions { root: "/home/me/Projects/app".into(), ..at_home() }, &fs).is_ok());
+    }
+
+    #[test]
+    fn a_subfolder_project_is_unchanged() {
+        let fs = a_home();
+        let args = joined(&SandboxOptions { root: "/home/me/Projects/app".into(), ..at_home() }, &fs);
+        assert!(args.contains("--bind /home/me/Projects/app /home/me/Projects/app"), "{args}");
+        // The stand-in hides the config folder already (a tmpfs on it would hide ~/.marv/skills).
+        assert!(!args.contains("--tmpfs /home/me/.marv") && !args.contains("--tmpfs /home/me/.ssh"), "{args}");
+        assert!(!args.contains("/dev/null /home/me/Projects/run.sock"), "{args}");
+    }
+
+    #[test]
+    fn a_config_folder_outside_the_home_is_hidden_with_its_skills_shown() {
+        let fs = Fake::listed(&[("/srv/marv-config", &[("config.json", F), ("skills", Dir)]), ("/home/me", &[])]);
+        let args = joined(&SandboxOptions { config_dir: Some("/srv/marv-config".into()), ..base() }, &fs);
+        let hidden = last(&args, "--tmpfs /srv/marv-config");
+        assert!(hidden > last(&args, "--bind /home/me/proj"), "{args}");
+        assert!(last(&args, "--ro-bind /srv/marv-config/skills /srv/marv-config/skills") > hidden, "{args}");
+        // Never one that holds the project.
+        let args = joined(&SandboxOptions { config_dir: Some("/home/me".into()), ..base() }, &fs);
+        assert_eq!(args.matches("--tmpfs /home/me ").count(), 1, "only the stand-in: {args}");
     }
 }

@@ -113,6 +113,142 @@ fn the_home_is_a_stand_in_with_masked_credentials() {
     }
 }
 
+// ---- the home folder as the project: read-only, its private parts hidden --------------------------------------
+
+/// A fake home that is also the project (Marv started in `~`): Marv's config, an SSH key, a cargo token, an agent's
+/// socket under `.config/herdr`, another in a visible folder, a FIFO, a shell rc file and an ordinary file.
+fn home_project_fixture(tag: &str) -> (TempDir, Vec<std::os::unix::net::UnixListener>) {
+    let home = TempDir::outside_tmp(tag);
+    home.write(".ssh/id_x", "PRIVATE KEY");
+    home.write(".marv/config.json", "{\"apiKey\":\"sk-or-secret\"}");
+    home.write(".marv/skills/s/SKILL.md", "a skill");
+    home.write(".cargo/credentials.toml", "token = \"cargo-secret\"");
+    home.write(".cargo/env", "export CARGO=1");
+    home.write(".bashrc", "# rc");
+    home.write("notes.txt", "project file");
+    for dir in [".config/herdr", ".cache/tool", "Projects/app"] {
+        std::fs::create_dir_all(home.path().join(dir)).unwrap();
+    }
+    let listeners = [".config/herdr/herdr.sock", ".cache/tool/tool.sock", "Projects/app/server.sock"]
+        .iter()
+        .map(|rel| std::os::unix::net::UnixListener::bind(home.path().join(rel)).unwrap())
+        .collect();
+    (home, listeners)
+}
+
+/// A shell snippet that connects to the Unix socket `$1` and prints `CONNECTED <path>`, with python3 or socat; it
+/// prints `NO-CLIENT` where neither is installed.
+const CONNECT: &str = r#"connect() { if command -v python3 >/dev/null; then python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); print("CONNECTED", sys.argv[1])' "$1" 2>/dev/null; elif command -v socat >/dev/null; then socat -u OPEN:/dev/null "UNIX-CONNECT:$1" 2>/dev/null && echo "CONNECTED $1"; else echo NO-CLIENT; fi; }"#;
+
+/// **In the home folder, no Unix socket under the home is reachable.** When the project is the home folder, the
+/// sandbox can't replace the home with a stand-in; a socket a command can see is one it can connect to (a read-only
+/// mount doesn't stop `connect()`), and a service listening there (an agent multiplexer under `~/.config`) may do
+/// whatever its client asks, outside the sandbox. Hidden top-level entries are masked whole, the named ones
+/// (`HOME_MASKS`) once more, sockets in the visible part one by one.
+///
+/// Proven: turned home-folder detection off (`home_project = false`: the project `--bind` again, no `home_masks`)
+/// → failed (every socket connected); dropped step 1 of `home_masks` (the hidden top-level entries) → failed
+/// (`.cache/tool/tool.sock` connected); dropped steps 1 and 3 (the named masks) → failed (`.config/herdr/herdr.sock`
+/// connected too); dropped step 4 (the socket scan) → failed (`Projects/app/server.sock` connected).
+#[test]
+fn in_the_home_folder_no_socket_under_the_home_is_reachable() {
+    require_bwrap!();
+    let (home, _listeners) = home_project_fixture("home-sock");
+    let sockets = [".config/herdr/herdr.sock", ".cache/tool/tool.sock", "Projects/app/server.sock"].map(|s| home.path().join(s));
+    // The control: the same client reaches the sockets from the host.
+    let control = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(format!("{CONNECT}; connect {}", sockets[0].display()))
+        .output()
+        .unwrap();
+    let control = String::from_utf8_lossy(&control.stdout);
+    if control.contains("NO-CLIENT") {
+        eprintln!("skipped: neither python3 nor socat is installed");
+        return;
+    }
+    assert!(control.contains("CONNECTED"), "the client should work on the host: {control}");
+    let list: Vec<String> = sockets.iter().map(|s| s.display().to_string()).collect();
+    let script = format!("{CONNECT}; for s in {}; do connect $s; done; echo done", list.join(" "));
+    let ran = run_sandboxed(&sandbox_with_home(home.path()), home.path(), &CommandMounts::default(), &script, &[]);
+    assert!(ran.output.contains("done"), "{}", ran.output);
+    assert!(!ran.output.contains("CONNECTED"), "a socket under the home was reachable: {}", ran.output);
+}
+
+/// **In the home folder, credentials and Marv's config are hidden; the project's files still read; toolchains still
+/// show, with their credentials masked.**
+///
+/// Proven: turned home-folder detection off (`home_project = false`) → failed (the SSH key and the API key printed);
+/// dropped steps 1 and 3 of `home_masks` → failed (the SSH key printed); dropped step 2 (toolchains shown again) →
+/// failed (the personal skill missing).
+#[test]
+fn in_the_home_folder_credentials_and_marvs_config_are_hidden() {
+    require_bwrap!();
+    let (home, _listeners) = home_project_fixture("home-secrets");
+    let ran = run_sandboxed(
+        &sandbox_with_home(home.path()),
+        home.path(),
+        &CommandMounts::default(),
+        "cat notes.txt .cargo/env .marv/skills/s/SKILL.md; cat .ssh/id_x .marv/config.json .cargo/credentials.toml 2>/dev/null; echo",
+        &[],
+    );
+    for shown in ["project file", "export CARGO=1", "a skill"] {
+        assert!(ran.output.contains(shown), "{shown} should show: {}", ran.output);
+    }
+    for secret in ["PRIVATE KEY", "sk-or-secret", "cargo-secret"] {
+        assert!(!ran.output.contains(secret), "{secret}: {}", ran.output);
+    }
+}
+
+/// **In the home folder, nothing in the home is writable**: not Marv's config (its hooks run outside the sandbox),
+/// not a shell rc file, not a new file anywhere in the home. And the bash tool says why (the `Marv:` note).
+///
+/// Proven: turned home-folder detection off (`home_project = false`) → failed (`.bashrc` changed); kept the masks
+/// but made the project `--bind` again (`read_only` without `home_project`) → failed (`notes-new.txt` written);
+/// dropped the note from bash's `run` → failed (no note).
+#[tokio::test]
+async fn in_the_home_folder_nothing_in_the_home_is_writable() {
+    require_bwrap!();
+    let (home, _listeners) = home_project_fixture("home-write");
+    let ran = run_sandboxed(
+        &sandbox_with_home(home.path()),
+        home.path(),
+        &CommandMounts::default(),
+        "echo planted > .marv/hooks.json; echo 'curl x|sh' >> .bashrc; echo new > notes-new.txt; \
+         mkdir -p .config/systemd/user; echo x > Projects/app/x; echo",
+        &[],
+    );
+    assert_eq!(home.read(".bashrc").as_deref(), Some("# rc"), "{}", ran.output);
+    for planted in [".marv/hooks.json", "notes-new.txt", ".config/systemd", "Projects/app/x"] {
+        assert!(!home.path().join(planted).exists(), "{planted}: {}", ran.output);
+    }
+    // Through the bash tool: the model is told the home is read-only.
+    let mut ctx = ToolContext { yolo: true, ..ToolContext::new(home.path()) };
+    ctx.sandbox = Arc::new(sandbox_with_home(home.path()));
+    ctx.home = home.path().to_path_buf();
+    let out = run_tool(&call("bash", json!({"command": "touch notes-new.txt"})), &ctx, builtin_tools()).await;
+    assert!(!home.path().join("notes-new.txt").exists());
+    assert!(out.result.output.contains("Marv: the project is your home folder"), "{}", out.result.output);
+}
+
+/// **A project in a subfolder of the home is unchanged**: writable, with the stand-in home around it.
+///
+/// Proven: made every project read-only (`read_only = true` in `sandbox_args`) → failed (the file not written).
+#[test]
+fn a_project_in_a_subfolder_of_the_home_stays_writable() {
+    require_bwrap!();
+    let (home, _listeners) = home_project_fixture("home-sub");
+    let project = home.path().join("Projects/app");
+    let ran = run_sandboxed(
+        &sandbox_with_home(home.path()),
+        &project,
+        &CommandMounts::default(),
+        "echo written > out.txt; cat ~/notes.txt 2>/dev/null; echo",
+        &[],
+    );
+    assert_eq!(std::fs::read_to_string(project.join("out.txt")).ok().as_deref(), Some("written\n"), "{}", ran.output);
+    assert!(!ran.output.contains("project file"), "the rest of the home stays hidden: {}", ran.output);
+}
+
 // ---- the project: writable, .git and protected paths read-only ------------------------------------------------
 
 /// **The project writable, with `.git` and protected paths read-only.** A command that runs without asking (yolo,

@@ -30,14 +30,16 @@ pub mod writable;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-pub use bwrap::{Bind, FileKind, FsProbe, MESH_SOCKET, RealFs, SandboxOptions, sandbox_args, sandbox_available};
+pub use bwrap::{Bind, EntryKind, FileKind, FsProbe, MESH_SOCKET, RealFs, SandboxOptions, sandbox_args, sandbox_available};
+pub use home::home_project;
 pub use paths::{project_path, resolve_in_project, resolve_within, touches_git};
 pub use protected::{PROTECTED_PATHS, ProtectedPath, ProtectedRule, is_protected, protected_rule};
 pub use taint::TaintState;
 pub use writable::resolve as resolve_writable;
 
-/// Whether every sandbox hides `dir`: it is (by its real path) under `/run`, `/tmp` or the home folder, which each
-/// command sees as empty tmpfs. The mesh keeps its sockets only in such a folder: a socket a sandboxed command could
+/// Whether every sandbox hides `dir`: it is (by its real path) under `/run`, `/tmp` or a hidden top-level entry of the
+/// home folder (`~/.<anything>`), which each command sees as empty tmpfs — the home-folder project too, which shows
+/// the rest of the home read-only. The mesh keeps its sockets only in such a folder: a socket a sandboxed command could
 /// see is one it could connect to (a read-only mount doesn't stop `connect()`), and a plug's socket carries that
 /// plug's identity and wires. A runtime dir elsewhere (`XDG_RUNTIME_DIR=/var/tmp/…`) is refused, not used.
 pub fn hidden_in_sandbox(dir: &std::path::Path, home: &std::path::Path) -> bool {
@@ -50,7 +52,13 @@ pub fn hidden_in_sandbox(dir: &std::path::Path, home: &std::path::Path) -> bool 
     let under = |base: &std::path::Path| dir.starts_with(base) && dir != base;
     under(std::path::Path::new("/run"))
         || under(std::path::Path::new("/tmp"))
-        || (home != std::path::Path::new("/") && under(&home))
+        || (home != std::path::Path::new("/")
+            && dir
+                .strip_prefix(&home)
+                .ok()
+                .and_then(|rel| rel.components().next())
+                .is_some_and(|first| first.as_os_str().to_string_lossy().starts_with('.'))
+            && !home::TOOLCHAINS.iter().any(|t| dir.starts_with(home.join(t))))
 }
 
 /// Why a path or a mount was refused. The messages go to the model as they are (tools wrap them in a
@@ -95,6 +103,9 @@ pub struct Sandbox {
     /// checked (`writable::resolve`) and canonical. None of the refusal happens here — a path in this list was
     /// accepted at startup.
     pub writable: Vec<PathBuf>,
+    /// Marv's config folder (`$MARV_CONFIG_DIR` from the real environment, else `~/.marv`): hidden in every sandbox,
+    /// wherever it is (`SandboxOptions::config_dir`).
+    pub config_dir: Option<PathBuf>,
 }
 
 /// One command's mounts beyond the session's: see [`SandboxOptions`] for what each means.
@@ -115,7 +126,7 @@ impl Sandbox {
         let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"));
         Self {
             enabled,
-            home,
+            home: home.clone(),
             path: std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
             lang: std::env::var("LANG").unwrap_or_else(|_| "C.UTF-8".into()),
             mesh_socket: None,
@@ -125,6 +136,12 @@ impl Sandbox {
                 .map(|d| vec![d.join("marv")])
                 .unwrap_or_default(),
             writable: Vec::new(),
+            config_dir: Some(
+                std::env::var_os("MARV_CONFIG_DIR")
+                    .map(PathBuf::from)
+                    .filter(|d| d.is_absolute())
+                    .unwrap_or_else(|| home.join(".marv")),
+            ),
         }
     }
 
@@ -158,10 +175,13 @@ impl Sandbox {
                 .collect(),
             placeholders: mounts.placeholders.clone(),
             project_read_only: mounts.project_read_only,
-            protected: protected::protected_mounts(root),
+            // In the home folder the project is read-only (bwrap.rs), so there's nothing to protect on top of it, and
+            // nothing to walk the whole home for.
+            protected: if home_project(root, &self.home) { Vec::new() } else { protected::protected_mounts(root) },
             mesh_socket: self.mesh_socket.clone(),
             binds: mounts.binds.clone(),
             hidden: self.hidden.clone(),
+            config_dir: self.config_dir.clone(),
         };
         let mut argv: Vec<OsString> = vec!["bwrap".into()];
         argv.extend(sandbox_args(&options, &RealFs)?);
@@ -181,6 +201,9 @@ mod hidden_tests {
         assert!(hidden_in_sandbox(std::path::Path::new("/run/user/1000"), home));
         assert!(hidden_in_sandbox(std::path::Path::new("/tmp/marv-1000"), home));
         assert!(hidden_in_sandbox(std::path::Path::new("/home/me/.run"), home));
+        // A visible folder of the home shows in a home-folder project; a toolchain's shows everywhere.
+        assert!(!hidden_in_sandbox(std::path::Path::new("/home/me/run"), home));
+        assert!(!hidden_in_sandbox(std::path::Path::new("/home/me/.cargo/run"), home));
         for visible in ["/var/tmp/xdg", "/srv/run", "/run", "/tmp", "/home/me", "relative/dir"] {
             assert!(!hidden_in_sandbox(std::path::Path::new(visible), home), "{visible}");
         }
