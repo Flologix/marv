@@ -343,6 +343,8 @@ pub struct App {
     radio: RadioView,
     /// `/radio`'s roster view is open (Esc closes it).
     radio_panel: bool,
+    /// What [`SessionPort::keyboard_held`] was last told (`None`: nothing yet).
+    held_told: Option<bool>,
 
     // --- the loop ---
     copy: CopyFn,
@@ -416,6 +418,7 @@ impl App {
             setup: None,
             radio: RadioView::default(),
             radio_panel: false,
+            held_told: None,
             copy,
             copies: FuturesUnordered::new(),
             welcome_visible: true,
@@ -492,6 +495,17 @@ impl App {
         Ok(())
     }
 
+    /// Whether something other than an empty prompt has the keyboard ([`SessionPort::keyboard_held`]): what's typed
+    /// now would answer a screen, pick from a list, or finish a slash command, not start a turn.
+    fn keyboard_held(&self) -> bool {
+        self.phase != Phase::Main
+            || self.setup.is_some()
+            || self.picker.is_some()
+            || self.palette.is_some()
+            || self.radio_panel
+            || self.prompt.value.trim_start().starts_with('/')
+    }
+
     /// Whether the App wants to exit (`/exit`, ctrl+c twice, first-run setup cancelled).
     pub fn exiting(&self) -> bool {
         self.exit
@@ -534,6 +548,17 @@ impl App {
     /// Advances everything that moves on its own and is due by `now`: the splash, the stream flush,
     /// the martian, the wheel glide, selection auto-scroll, the spinner and the expiries.
     pub fn tick(&mut self, now: Instant) {
+        self.move_on(now);
+        // The loop ticks after every event, so the port hears of a change at once.
+        let held = self.keyboard_held();
+        if self.held_told != Some(held) {
+            self.held_told = Some(held);
+            self.port.keyboard_held(held);
+        }
+    }
+
+    /// What moves on its own (the rest of [`Self::tick`]).
+    fn move_on(&mut self, now: Instant) {
         if self.phase == Phase::Splash && self.splash.as_ref().is_some_and(|s| s.done(now)) {
             self.finish_splash(now);
         }
@@ -1798,6 +1823,8 @@ mod tests {
     #[derive(Default)]
     struct FakePort {
         calls: Mutex<Vec<Call>>,
+        /// What `keyboard_held` was told, in order.
+        held: Mutex<Vec<bool>>,
     }
 
     impl SessionPort for FakePort {
@@ -1854,6 +1881,9 @@ mod tests {
         }
         fn is_login_callback(&self, text: &str) -> bool {
             text.starts_with("http://127.0.0.1:5555/callback?")
+        }
+        fn keyboard_held(&self, held: bool) {
+            self.held.lock().unwrap().push(held);
         }
         fn login_callback(&self, text: &str) -> bool {
             let taken = text.starts_with("http://127.0.0.1:5555/callback?");
@@ -3224,6 +3254,49 @@ mod tests {
         }));
         assert!(h.app.palette.is_none());
         assert!(!h.frame().contains("Search commands"));
+    }
+
+    /// A pane send is a prompt, not a command: while the palette, setup, the session picker, the radio's roster or a
+    /// half-typed slash command has the keyboard, the port hears it's held (Herdr isn't told idle), and again when
+    /// the prompt is free.
+    #[test]
+    fn the_port_hears_when_something_but_an_empty_prompt_has_the_keyboard() {
+        let mut h = harness_with(1000);
+        let held = |h: &Harness| h.port.held.lock().unwrap().clone();
+        h.advance(1);
+        assert_eq!(held(&h), [true], "the splash takes the first key");
+        h.advance(2000);
+        assert_eq!(held(&h), [true, false]);
+        h.ctrl('k');
+        h.advance(1);
+        assert_eq!(held(&h).last(), Some(&true), "the palette");
+        h.key(ESC);
+        h.advance(1);
+        assert_eq!(held(&h).last(), Some(&false));
+        h.key(KeyCode::Char(' '));
+        h.key(KeyCode::Char('/'));
+        h.advance(1);
+        assert_eq!(held(&h).last(), Some(&true), "a slash command being typed");
+        h.key(KeyCode::Backspace);
+        h.advance(1);
+        assert_eq!(held(&h).last(), Some(&false));
+        h.key(KeyCode::Char('x'));
+        h.advance(1);
+        assert_eq!(held(&h).last(), Some(&false), "a message being typed");
+        let presets = vec![crate::view::ProviderPreset {
+            id: ProviderId::Ollama,
+            label: "Ollama".into(),
+            key_env: None,
+            key_url: None,
+            default_model: String::new(),
+        }];
+        let context =
+            crate::view::SetupContext { start: SetupStart::FirstRun, presets, current: None, saved_key: None, env_keys: vec![] };
+        h.events([UiEvent::OpenSetup(context)]);
+        assert_eq!(held(&h).last(), Some(&true), "setup");
+        let told = held(&h).len();
+        h.advance(1);
+        assert_eq!(held(&h).len(), told, "told only when it changes");
     }
 
     #[test]

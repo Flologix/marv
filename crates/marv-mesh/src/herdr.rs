@@ -243,6 +243,9 @@ pub const MAX_READ_LINES: u64 = 200;
 /// Between the text and its Enter: an agent's TUI may still be taking the text in (Herdr's own `agent prompt` waits
 /// too), and an Enter that lands first submits half a prompt.
 const ENTER_DELAY: Duration = Duration::from_millis(150);
+/// After a send, the same pane takes no other for this long: Herdr may still call its agent idle while the prompt
+/// just typed is being taken in, and a second send's text and Enter would land in whatever that agent shows next.
+pub const SEND_GAP: Duration = Duration::from_secs(5);
 
 /// What a pane receptacle does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -339,6 +342,8 @@ pub struct HerdrPane {
 ///   answer (Herdr's `agent prompt` refuses a blocked agent for the same reason). Control characters are dropped and
 ///   newlines become spaces, so the text can't drive the TUI or submit early. What arrives is typed as if by the user:
 ///   the wire approval says so.
+/// - A send is a prompt, never a command ([`pane_prompt`]): text starting with `/`, `!` or `#` is refused, so a wire
+///   to a pane asks its agent for work and never reaches that agent's own commands or settings.
 /// - Commands run from the switchboard, on the host, through the `herdr` CLI (`pane get`, `pane send-text` then
 ///   `pane send-keys enter`, since Herdr 0.8.2 refuses `agent prompt` for Marv; `pane read`), never from a sandbox.
 ///   A pane's state and output are the other side's text: answers are `Provenance::Mesh`, fenced like any mesh text.
@@ -347,11 +352,13 @@ pub struct HerdrAdapter {
     pub program: PathBuf,
     /// The pane Marv runs in (`HERDR_PANE_ID`): never offered.
     pub own_pane: Option<String>,
+    /// When each pane was last typed into ([`SEND_GAP`]). Held for a whole send, so sends one at a time.
+    sent: tokio::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
 }
 
 impl HerdrAdapter {
     pub fn new(program: impl Into<PathBuf>, own_pane: Option<String>) -> Self {
-        Self { program: program.into(), own_pane }
+        Self { program: program.into(), own_pane, sent: Default::default() }
     }
 
     /// Runs `herdr <args>` and returns its JSON `result`. Herdr's own words never reach the agent: an error is named
@@ -406,8 +413,9 @@ impl HerdrAdapter {
         let (description, schema) = match action {
             PaneAction::Send => (
                 format!(
-                    "Types a prompt into the {who} in Herdr pane {} and presses Enter, as if the user typed it. Arguments: \
-                     {{\"text\": \"...\"}}, nothing else. It can't answer you: read the pane with .status and lines: N{}",
+                    "Types a prompt into the {who} in Herdr pane {} and presses Enter, as if the user typed it; a prompt, never \
+                     a command: text starting with / ! or # is refused. Arguments: {{\"text\": \"...\"}}, nothing \
+                     else. It can't answer you: read the pane with .status and lines: N{}",
                     pane.pane_id,
                     if who == AGENT {
                         ", or, when mesh_list names this Marv, mesh_send to its inbox (peer.<marv>.agent.parent.inbox) for a reply"
@@ -417,7 +425,7 @@ impl HerdrAdapter {
                 ),
                 json!({
                     "type": "object",
-                    "properties": {"text": {"type": "string", "description": "The prompt to type."}},
+                    "properties": {"text": {"type": "string", "description": "The prompt to type: a prompt, not a command (no leading / ! or #)."}},
                     "required": ["text"],
                     "additionalProperties": false
                 }),
@@ -463,8 +471,18 @@ impl HerdrAdapter {
             .collect())
     }
 
-    /// `herdr.pane.<pane>.send`: the text, then Enter, into an agent that's idle or done.
+    /// `herdr.pane.<pane>.send`: the text, then Enter, into an agent that's idle or done. The text is a prompt, never
+    /// a command ([`pane_prompt`]).
     pub async fn send_text(&self, pane: &str, text: &str) -> crate::Result<String> {
+        let text = pane_prompt(text)?;
+        // One send at a time, and not again into a pane typed into within SEND_GAP: its state may not show it yet.
+        let mut sent = self.sent.lock().await;
+        sent.retain(|_, at| at.elapsed() < SEND_GAP);
+        if sent.get(pane).is_some_and(|at| at.elapsed() < SEND_GAP) {
+            return Err(MeshError::Io(format!(
+                "Herdr pane {pane} was just sent a prompt: it takes another once its agent is idle or done again, try again later"
+            )));
+        }
         let target = self.pane(pane).await?;
         if !self.offerable(&target) {
             return Err(MeshError::NoReceptacle(format!("an agent in Herdr pane {pane}")));
@@ -475,13 +493,8 @@ impl HerdrAdapter {
                 "the agent in Herdr pane {pane} is {state}: it takes a prompt only when idle or done, try again later"
             )));
         }
-        let text: String =
-            text.chars().map(|c| if c == '\n' || c == '\t' || c == '\r' { ' ' } else { c }).filter(|c| !c.is_control()).collect();
-        let text = text.trim();
-        if text.is_empty() {
-            return Err(MeshError::BadName("herdr.pane.send needs some text".into()));
-        }
-        self.run(&["pane", "send-text", pane, text]).await?;
+        sent.insert(pane.to_string(), std::time::Instant::now());
+        self.run(&["pane", "send-text", pane, &text]).await?;
         tokio::time::sleep(ENTER_DELAY).await;
         self.run(&["pane", "send-keys", pane, "enter"]).await?;
         Ok(format!("Typed into Herdr pane {pane} and pressed Enter."))
@@ -502,6 +515,33 @@ impl HerdrAdapter {
         }
         Ok(status.to_string())
     }
+}
+
+/// The characters that make an agent's input box read a line as a command rather than a prompt: `/` (a slash
+/// command, in Marv and Claude Code alike), `!` (Claude Code's shell mode), `#` (Claude Code's memory).
+const COMMAND_PREFIXES: [char; 3] = ['/', '!', '#'];
+
+/// The text a pane send types, or a refusal. Newlines, tabs and returns become spaces, other control characters go
+/// (no escape sequences, no early Enter), and the ends are trimmed. A pane send is a prompt, not a command: text
+/// whose first visible character is `/`, `!` or `#` is refused whole, not stripped, so nothing is typed. Checked
+/// by [`HerdrAdapter::send_text`] and, before any wire is asked for, by `tools::check`.
+pub fn pane_prompt(text: &str) -> crate::Result<String> {
+    let text: String =
+        text.chars().map(|c| if c == '\n' || c == '\t' || c == '\r' { ' ' } else { c }).filter(|c| !c.is_control()).collect();
+    let text = text.trim();
+    // Zero-width and other invisible characters don't hide a command: the first visible one decides.
+    let invisible = |c: &char| {
+        c.is_whitespace() || matches!(c, '\u{00AD}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{2060}'..='\u{2064}' | '\u{FEFF}')
+    };
+    let Some(first) = text.chars().find(|c| !invisible(c)) else {
+        return Err(MeshError::BadName("herdr.pane.send needs some text".into()));
+    };
+    if COMMAND_PREFIXES.contains(&first) {
+        return Err(MeshError::BadName(
+            "herdr.pane.send types a prompt, not a command: text starting with / ! or # is refused; nothing was typed".into(),
+        ));
+    }
+    Ok(text.to_string())
 }
 
 /// Finds `herdr.pane.<pane>.<action>` receptacles on demand (a pane opened after Marv started).
@@ -825,6 +865,66 @@ mod tests {
         assert!(fake.log().contains("pane send-text w1:p2 hello\n"), "{}", fake.log());
     }
 
+    /// A pane send is a prompt, not a command: text whose first visible character is `/`, `!` or `#` is refused
+    /// whole (not stripped), and nothing reaches the pane; a prompt with those characters later on is typed.
+    #[tokio::test]
+    async fn a_send_that_starts_like_a_command_is_refused_and_nothing_is_typed() {
+        use crate::switchboard::{NoTrajectory, Switchboard};
+        use crate::wire::{Approver, Grant, Wire};
+        let fake = FakeHerdr::new();
+        let runtime = crate::switchboard::tests::Runtime::new();
+        let sb = Arc::new(Switchboard::new("s", runtime.0.clone(), Arc::new(NoTrajectory)));
+        sb.add_resolver(Arc::new(HerdrPanes(fake.adapter())));
+        let worker = crate::PlugId::new("worker-1").unwrap();
+        sb.plug(worker.clone()).unwrap();
+        let send = ReceptacleName::new("herdr.pane.w1-p2.send").unwrap();
+        sb.lookup(&send).await.unwrap();
+        sb.wire(Wire::new(worker.clone(), send.clone(), WireMode::Call, Grant::local(Approver::Tui))).unwrap();
+        for text in ["/help", "!ls", "#remember this", "   /help", "\n\t !ls", "\r# x", "\u{1b}/help", "\u{FEFF}/help"] {
+            let err = sb.deliver(&worker, send.as_str(), WireMode::Call, json!({"text": text})).await.unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "herdr.pane.send types a prompt, not a command: text starting with / ! or # is refused; nothing was typed",
+                "{text:?}"
+            );
+        }
+        // The adapter refuses it too, whoever calls it.
+        assert!(fake.adapter().send_text("w1:p2", "/help").await.is_err());
+        assert!(!fake.log().contains("send-text"), "nothing typed: {}", fake.log());
+        assert!(!fake.log().contains("send-keys"), "no Enter pressed: {}", fake.log());
+        sb.deliver(&worker, send.as_str(), WireMode::Call, json!({"text": "  rerun the tests # then report"})).await.unwrap();
+        assert!(fake.log().contains("pane send-text w1:p2 rerun the tests # then report\n"), "{}", fake.log());
+    }
+
+    /// Two sends at once, or one right after another, into the same pane: one is typed, the other is refused before
+    /// anything is typed (Herdr may still call the agent idle while it takes the first in).
+    #[tokio::test]
+    async fn a_pane_just_sent_a_prompt_takes_no_other_for_a_while() {
+        let fake = FakeHerdr::new();
+        let adapter = fake.adapter();
+        let (a, b) = tokio::join!(adapter.send_text("w1:p2", "first"), adapter.send_text("w1:p2", "second"));
+        assert_eq!(a.is_ok() as u8 + b.is_ok() as u8, 1, "{a:?} {b:?}");
+        let err = a.err().or(b.err()).unwrap().to_string();
+        assert!(err.contains("was just sent a prompt") && !err.contains("first") && !err.contains("second"), "{err}");
+        assert!(adapter.send_text("w1:p2", "third").await.is_err());
+        let log = fake.log();
+        assert_eq!(log.matches("send-text").count(), 1, "{log}");
+        assert_eq!(log.matches("send-keys").count(), 1, "{log}");
+        assert!(!log.contains("third"), "{log}");
+    }
+
+    #[test]
+    fn a_pane_prompt_is_cleaned_and_a_command_or_nothing_is_refused() {
+        assert_eq!(pane_prompt(" fix it\nnow\u{1b}[2J ").unwrap(), "fix it now[2J");
+        assert_eq!(pane_prompt("a/b !c #d").unwrap(), "a/b !c #d");
+        for command in ["/x", "!x", "#x", " \t/x", "\u{200B}#x"] {
+            assert!(pane_prompt(command).unwrap_err().to_string().contains("not a command"), "{command:?}");
+        }
+        for empty in ["", "  \n", "\u{200B}"] {
+            assert_eq!(pane_prompt(empty).unwrap_err().to_string(), "herdr.pane.send needs some text", "{empty:?}");
+        }
+    }
+
     #[test]
     fn pane_descriptions_say_status_reads_the_pane_and_a_marv_has_an_inbox() {
         let pane = |agent: &str| HerdrPane { pane_id: "w1:p2".into(), agent: Some(agent.into()), ..HerdrPane::default() };
@@ -833,6 +933,7 @@ mod tests {
         assert!(status.description.contains("last N lines"), "{}", status.description);
         let send = HerdrAdapter::receptacle(&pane("claude"), PaneAction::Send).unwrap();
         assert!(send.description.contains(r#"{"text": "..."}"#) && !send.description.contains("inbox"), "{}", send.description);
+        assert!(send.description.contains("never a command: text starting with / ! or # is refused"), "{}", send.description);
         assert_eq!(send.input_schema["additionalProperties"], json!(false));
         let marv = HerdrAdapter::receptacle(&pane("marv"), PaneAction::Send).unwrap();
         assert!(marv.description.contains("peer.<marv>.agent.parent.inbox"), "{}", marv.description);

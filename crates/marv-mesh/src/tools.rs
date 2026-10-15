@@ -30,7 +30,7 @@ use std::collections::HashSet;
 
 use crate::MeshError;
 use crate::discovery::PeerSwitchboard;
-use crate::herdr::{HerdrPane, PaneAction, pane_receptacle, pane_segment, parse_pane_receptacle};
+use crate::herdr::{HerdrPane, PaneAction, pane_prompt, pane_receptacle, pane_segment, parse_pane_receptacle};
 use crate::message::{FENCE_TAG, bad_text_body, text_body};
 use crate::plug::{PlugClient, PlugId, Reachable};
 use crate::receptacle::{ReceptacleName, valid_segment};
@@ -103,12 +103,17 @@ pub fn target(name: &str, input: &Map<String, Value>) -> crate::Result<Option<(R
 
 /// [`target`], plus #123's body check before anything is asked or sent: a `mesh_call` to a Herdr pane's `.send` takes
 /// `{"text": "…"}` and nothing else (the switchboard refuses the rest too; refusing here first spares the user a wire
-/// prompt for a message that can't go). What `MeshTool::check` runs.
+/// prompt for a message that can't go), and the same goes for text [`pane_prompt`] refuses (a command, or nothing).
+/// What `MeshTool::check` runs.
 pub fn check(name: &str, input: &Map<String, Value>) -> crate::Result<()> {
     let Some((receptacle, mode)) = target(name, input)? else { return Ok(()) };
     let pane_send = parse_pane_receptacle(&receptacle).is_some_and(|(_, a)| a == PaneAction::Send);
-    if mode == WireMode::Call && pane_send && input.get("arguments").is_none_or(|a| text_body(a).is_none()) {
-        return Err(bad_text_body(receptacle.as_str()));
+    if mode == WireMode::Call && pane_send {
+        let Some(text) = input.get("arguments").and_then(text_body) else {
+            return Err(bad_text_body(receptacle.as_str()));
+        };
+        // A pane send is a prompt, not a command: refused here too, so no wire is asked for one that can't go.
+        pane_prompt(text)?;
     }
     Ok(())
 }
@@ -529,6 +534,26 @@ mod tests {
         assert!(check(MESH_CALL, &input(json!({"receptacle": "herdr.pane.w1-p2.status", "arguments": {"lines": 5}}))).is_ok());
         assert!(check(MESH_SEND, &input(json!({"receptacle": "agent.parent.inbox", "text": "hi"}))).is_ok());
         assert!(check(MESH_LIST, &Map::new()).is_ok());
+    }
+
+    #[test]
+    fn a_pane_send_of_a_command_is_refused_before_anything_is_asked() {
+        let input = |v: Value| v.as_object().unwrap().clone();
+        let send =
+            |text: &str| check(MESH_CALL, &input(json!({"receptacle": "herdr.pane.w1-p2.send", "arguments": {"text": text}})));
+        for text in ["/help", "!ls", "# a note", "  /help", "\n\t!ls", "\u{200B}/help"] {
+            let err = send(text).unwrap_err().to_string();
+            assert_eq!(
+                err, "herdr.pane.send types a prompt, not a command: text starting with / ! or # is refused; nothing was typed",
+                "{text:?}"
+            );
+        }
+        assert!(check(MESH_CALL, &input(json!({"receptacle": "herdr.pane.w1-p2.send", "arguments": "/help"}))).is_err());
+        for text in ["fix the test in a/b.rs", "use #[test] and ! in rust", "what does /etc/hosts say?"] {
+            assert!(send(text).is_ok(), "{text}");
+        }
+        // Only a pane's .send: an inbox takes any text (the receiving Marv shows it as a message, never as a command).
+        assert!(check(MESH_SEND, &input(json!({"receptacle": "agent.parent.inbox", "text": "/help"}))).is_ok());
     }
 
     #[test]
