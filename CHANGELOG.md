@@ -6,6 +6,8 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-15
+
 ### Changed
 
 - **In the home folder, the sandbox shows the home read-only and hides Marv's config, credentials and agent sockets.** When Marv is started in your home folder (or a folder above it, like `/home`), sandboxed commands now see the home read-only instead of read-write. Its hidden entries (`~/.marv`, `~/.ssh`, `~/.gnupg`, cloud CLI folders, `~/.claude`, `~/.config`, `~/.local`, `~/.cache`…) are hidden, apart from toolchain folders and your git config, which show read-only as in any project; and every Unix socket or FIFO in the rest of the home is hidden too. Commands there can write only to `/tmp`: change files with `edit_file`/`write_file`, which ask you as before (yolo stays off in the home folder). Bash tells the model so when a command fails or looks into the home. A project in a subfolder of the home is unchanged.
@@ -224,7 +226,8 @@ The first public release, on npm as `@flologixai/marv`.
 - The SDK: `createSession()` from `@flologixai/marv/sdk` runs Marv from code, without the UI.
 - Evals: `bun run eval` runs real models on small tasks with hidden checks.
 
-[Unreleased]: https://github.com/FlologixAI/marv/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/FlologixAI/marv/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/FlologixAI/marv/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/FlologixAI/marv/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/FlologixAI/marv/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/FlologixAI/marv/releases/tag/v0.4.0
