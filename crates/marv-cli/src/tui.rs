@@ -260,7 +260,7 @@ pub fn map_loop(event: &LoopEvent, totals: &dyn Fn() -> view::Totals) -> Option<
         L::Discarded { .. } => return None,
         L::TextDelta(text) => UiEvent::TextDelta(text.clone()),
         L::ThinkingDelta(text) => UiEvent::ThinkingDelta(text.clone()),
-        L::Usage(usage) => UiEvent::Usage { last: *usage, totals: totals() },
+        L::Usage(usage, _) => UiEvent::Usage { last: *usage, totals: totals() },
         L::Assistant { text } => UiEvent::Assistant { text: text.clone() },
         L::ToolCallDelta { index, name, text } => {
             UiEvent::ToolCallDelta { index: *index, name: name.clone(), text: text.clone() }
@@ -285,6 +285,7 @@ pub fn map_loop(event: &LoopEvent, totals: &dyn Fn() -> view::Totals) -> Option<
         },
         L::CutOff { continued } => UiEvent::CutOff { continued: *continued },
         L::TextLoop { continued } => UiEvent::TextLoop { continued: *continued },
+        L::AnnouncedStep { continued } => UiEvent::AnnouncedStep { continued: *continued },
         L::ToolLoop { continued } => UiEvent::ToolLoop { continued: *continued },
         L::Compacted => UiEvent::Compacted,
         L::Done(reason) => UiEvent::Done(*reason),
@@ -355,7 +356,7 @@ pub fn map_event(
             let title = map.titles.get(&call_id).cloned().unwrap_or_default();
             let mut out = Vec::new();
             // Subagents' requests count toward the session's tokens and cost; the context bar stays the main agent's.
-            if matches!(event, LoopEvent::Usage(_))
+            if matches!(event, LoopEvent::Usage(..))
                 && let Some(last) = last()
             {
                 out.push(UiEvent::Usage { last, totals: totals() });
@@ -3340,7 +3341,7 @@ mod tests {
         let last = || Some(marv_core::Usage { prompt_tokens: 10, completion_tokens: 1, cached_tokens: None, cost: None });
         map_event(SessionEvent::Loop(LoopEvent::ToolStart { call, label: "general-purpose · fix".into() }), &mut map, &t, &last);
         let out = map_event(
-            SessionEvent::Subagent { call_id: "a1".into(), event: LoopEvent::Usage(Default::default()) },
+            SessionEvent::Subagent { call_id: "a1".into(), event: LoopEvent::Usage(Default::default(), Default::default()) },
             &mut map,
             &t,
             &last,

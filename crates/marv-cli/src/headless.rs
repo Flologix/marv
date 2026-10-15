@@ -193,7 +193,7 @@ impl Collector {
                 // Steps: a reply ends in its text, its tool calls, or both: counted once at the first of those after
                 // something new streamed in (not every provider reports usage per request).
                 match e {
-                    L::TextDelta(_) | L::ThinkingDelta(_) | L::ToolCallDelta { .. } | L::Usage(_) => self.counted = false,
+                    L::TextDelta(_) | L::ThinkingDelta(_) | L::ToolCallDelta { .. } | L::Usage(..) => self.counted = false,
                     L::Assistant { .. } | L::ToolStart { .. } | L::ToolSkipped { .. } if !self.counted => {
                         self.steps += 1;
                         self.counted = true;
@@ -235,6 +235,7 @@ impl Collector {
                     }
                     L::CutOff { continued } => Some(json!({"type": "cut_off", "continued": continued})),
                     L::TextLoop { continued } => Some(json!({"type": "text_loop", "continued": continued})),
+                    L::AnnouncedStep { continued } => Some(json!({"type": "announced_step", "continued": continued})),
                     L::ToolLoop { continued } => Some(json!({"type": "tool_loop", "continued": continued})),
                     _ => None,
                 }

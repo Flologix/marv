@@ -5,8 +5,10 @@
 //!   `marv-session` implements. UI-free and vendor-free.
 //! - [`repetition`]: text and tool-call loop detection.
 //! - [`compact`]: the summary request and the compacted history (and, planned, compaction v2, #63).
+//! - [`announce`]: #90, marv-rs only — the announced-next-step detector and its continue note.
 
 pub mod agent;
+pub mod announce;
 pub mod compact;
 pub mod repetition;
 pub mod suggest;

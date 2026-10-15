@@ -387,6 +387,8 @@ async fn drive(
     // No one can say "keep going" to a subagent: at its limit it gets one tools-off request to report what it finished
     // and what's left, so the parent reads a summary rather than only the limit (#59).
     options.wrap_up_at_limit = true;
+    // #90: subagents' request records get the raw responses under debug recording too.
+    options.debug_raw = crate::config::debug_raw();
     options.after_step = plug.as_ref().map(|p| p.after_step(None, taint));
 
     tally.report();
@@ -397,7 +399,7 @@ async fn drive(
             host.sink.event(id, &event);
         }
         match event {
-            LoopEvent::Usage(usage) => {
+            LoopEvent::Usage(usage, _) => {
                 tally.used += usage.prompt_tokens + usage.completion_tokens;
                 host.sink.usage(&usage);
             }
@@ -489,7 +491,7 @@ mod run_tests {
     use std::collections::{HashMap, VecDeque};
     use std::path::{Path, PathBuf};
 
-    use marv_core::{ProviderEvent, ToolCall, Usage};
+    use marv_core::{ProviderEvent, ReplyEnd, ToolCall, Usage};
     use marv_provider::{EventStream, Provider, ProviderFactory, StreamOptions};
     use marv_sandbox::sandbox_available;
     use marv_tools::ToolOutcome;
@@ -559,7 +561,7 @@ mod run_tests {
     fn say_with_usage(text: &str, prompt_tokens: u64, completion_tokens: u64) -> Vec<ProviderEvent> {
         vec![
             ProviderEvent::TextDelta(text.into()),
-            ProviderEvent::Usage(Usage { prompt_tokens, completion_tokens, ..Usage::default() }),
+            ProviderEvent::Usage(Usage { prompt_tokens, completion_tokens, ..Usage::default() }, ReplyEnd::default()),
             ProviderEvent::Done { reason: Some("stop".into()) },
         ]
     }
@@ -613,7 +615,7 @@ mod run_tests {
                 LoopEvent::Assistant { .. } => "assistant",
                 LoopEvent::ToolStart { .. } => "tool_start",
                 LoopEvent::ToolEnd { .. } => "tool_end",
-                LoopEvent::Usage(_) => "usage",
+                LoopEvent::Usage(..) => "usage",
                 LoopEvent::Done(_) => "done",
                 LoopEvent::Error(_) => "error",
                 _ => "other",

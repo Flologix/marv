@@ -113,7 +113,7 @@ pub async fn summarize(options: SummarizeOptions<'_>) -> Result<String, String> 
             }
             ProviderEvent::ToolCall(_) => tool_call = true,
             ProviderEvent::Done { reason: r } => reason = r,
-            ProviderEvent::Usage(usage) => {
+            ProviderEvent::Usage(usage, _) => {
                 if let Some(on_usage) = options.on_usage {
                     on_usage(usage);
                 }

@@ -71,7 +71,7 @@ async fn main() {
             }
             ProviderEvent::ThinkingDelta(text) => eprint!("\x1b[2m{}\x1b[0m", printable(&text)),
             ProviderEvent::Retry { message, .. } => eprintln!("\n[{}]", printable(&message)),
-            ProviderEvent::Usage(usage) => eprintln!(
+            ProviderEvent::Usage(usage, _) => eprintln!(
                 "\n[{} in ({} cached), {} out{}]",
                 usage.prompt_tokens,
                 usage.cached_tokens.unwrap_or(0),

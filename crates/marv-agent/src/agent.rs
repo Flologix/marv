@@ -58,6 +58,16 @@
 //!   discarded so the retry doesn't duplicate them.
 //!
 //! marv-rs changes and planned work:
+//! - **#90 announced next step, no tool call**: a plain answer that ends by announcing what it
+//!   will do next ("Now checking issue #7 before commenting:") is how a turn dies halfway (2 of
+//!   6 GLM runs of `mcp-comment`; opencode: 0 of 6). When such an answer is about to end the
+//!   run, the loop says "continue" once per turn (an [`LoopEvent::AnnouncedStep`], a note, one
+//!   more step) — what a user would do. A second announcement ends the run as before, still
+//!   logged. The detector is [`crate::announce::announces_next_step`]; the tests pin the
+//!   conservative side (questions, summaries and code blocks never fire).
+//!   The continue is an ordinary step: it counts toward `max_steps`, so at the limit the #59
+//!   wrap-up (or `on_limit`) comes next, and the wrap-up reply is never continued. The #81
+//!   failure-loop guard only sees tool calls, so the two never feed each other.
 //! - **#58 parallel read-only tools**: Marv runs only consecutive `agent` calls together
 //!   (`isParallel`). Here [`ToolRunner::concurrent`] decides, defaulting to `ToolKind::Read`; the
 //!   session also returns true for `agent`. Anything else is a barrier.
@@ -89,6 +99,7 @@ use marv_core::{
 use marv_provider::{EventStream, Provider, StreamOptions};
 use tokio_util::sync::CancellationToken;
 
+pub use crate::announce::{ANNOUNCED_STEP_NOTE, announces_next_step};
 use crate::repetition::{
     FailureLoopState, ToolCallKey, ToolLoopState, detect_text_repetition, failing_command_note, make_tool_key, tool_loop_detected,
 };
@@ -364,7 +375,9 @@ impl EmptyNext {
 pub enum LoopEvent {
     TextDelta(String),
     ThinkingDelta(String),
-    Usage(Usage),
+    /// One request's usage, with how it ended (#90): the vendor's finish reason always, the
+    /// raw response when debug recording was on (`StreamOptions::debug_raw`).
+    Usage(Usage, marv_core::ReplyEnd),
     /// One step's reply text is complete.
     Assistant {
         text: String,
@@ -403,6 +416,12 @@ pub enum LoopEvent {
     },
     /// The reply was stuck repeating one sentence and was dropped. `continued`: the model was told.
     TextLoop {
+        continued: bool,
+    },
+    /// #90 (marv-rs): the reply announced its next step but made no tool call, so the run had
+    /// stopped halfway. `continued`: Marv said "continue" (once per turn); a second one ends
+    /// the run as before, still logged so the bench can count the turns that announced.
+    AnnouncedStep {
         continued: bool,
     },
     /// The same tool calls repeated without progress: the model was told (once), or the run stopped.
@@ -487,6 +506,9 @@ pub struct AgentOptions {
     /// #59: one tools-off wrap-up reply before a hard stop at the step limit (no `on_limit`, or it answered
     /// `Unavailable`). The session sets it for the main agent and subagents.
     pub wrap_up_at_limit: bool,
+    /// #90: providers collect the raw response payloads (the trajectory's `request` record
+    /// carries them). The session sets this from `MARV_DEBUG_RAW`.
+    pub debug_raw: bool,
 }
 
 impl AgentOptions {
@@ -513,6 +535,7 @@ impl AgentOptions {
             on_full: None,
             after_step: None,
             wrap_up_at_limit: false,
+            debug_raw: false,
         }
     }
 }
@@ -554,7 +577,7 @@ impl StepReply {
                 self.reasoned = true;
                 Some(LoopEvent::ThinkingDelta(text))
             }
-            ProviderEvent::Usage(usage) => Some(LoopEvent::Usage(usage)),
+            ProviderEvent::Usage(usage, end) => Some(LoopEvent::Usage(usage, end)),
             ProviderEvent::ToolCallDelta { index, name, text } => Some(LoopEvent::ToolCallDelta { index, name, text }),
             ProviderEvent::ToolCall(call) => {
                 self.calls.push(call);
@@ -784,6 +807,9 @@ pub struct LoopState {
     empties: u32,
     /// Text loops in a row.
     text_loops: u32,
+    /// #90: whether this run already continued an announced next step (once per turn: the
+    /// first is rescued, a second announcement ends the run, still logged as an event).
+    announced: bool,
     tool_loop: ToolLoopState,
     /// (tool, normalized args) → hash of what it returned last time. A call repeated with the same
     /// result is a loop; one whose result changes each time (the next item from a queue) is new work.
@@ -809,6 +835,7 @@ impl LoopState {
             cut_offs: 0,
             empties: 0,
             text_loops: 0,
+            announced: false,
             tool_loop: ToolLoopState::default(),
             last_result: Default::default(),
             failures: FailureLoopState::default(),
@@ -886,6 +913,7 @@ impl LoopState {
                     tools: self.options.tools.clone(),
                     tool_choice,
                     cancel: self.options.cancel.clone(),
+                    debug_raw: self.options.debug_raw,
                 };
                 let stream = self.options.provider.stream(&snapshot, options);
                 self.phase = Phase::Streaming { stream, reply: StepReply::default(), wrap_up };
@@ -1036,7 +1064,7 @@ impl LoopState {
                     StepOutcome::CutOff => self.cut_off(reply),
                     _ => {
                         self.cut_offs = 0;
-                        self.run_calls(reply.calls, aborted);
+                        self.run_calls(reply, aborted);
                     }
                 }
             }
@@ -1067,7 +1095,8 @@ impl LoopState {
     }
 
     /// Tool-loop detection, then the calls (or the end of the run, for a plain answer).
-    fn run_calls(&mut self, calls: Vec<ToolCall>, aborted: bool) {
+    fn run_calls(&mut self, reply: StepReply, aborted: bool) {
+        let calls = reply.calls;
         let warned = self.tool_loop.warned;
         let hit = !aborted && !calls.is_empty() && {
             let keys = calls
@@ -1106,6 +1135,18 @@ impl LoopState {
             return self.finish(StopReason::Loop);
         }
         if calls.is_empty() {
+            // #90: a plain answer that announces its next step ("Now checking issue #7 before
+            // commenting:") is how a turn dies halfway. Once per turn, say "continue" like a
+            // user would; a second announcement just ends the run, still logged.
+            if !aborted && announces_next_step(&reply.text) {
+                let continued = !self.announced;
+                self.announced = true;
+                self.emit(LoopEvent::AnnouncedStep { continued });
+                if continued {
+                    self.push_note(ANNOUNCED_STEP_NOTE);
+                    return self.next_step();
+                }
+            }
             return self.finish(if aborted { StopReason::Aborted } else { StopReason::End });
         }
         let runner = &self.options.runner;
@@ -2067,6 +2108,133 @@ mod tests {
         let events = collect(options(failing.clone(), &history(vec![user("go")]), plain())).await;
         assert!(empties(&events).is_empty());
         assert_eq!(failing.requests().len(), 1);
+    }
+
+    // A reply that announces its next step ("Now checking issue #7 before commenting:") but
+    // makes no tool call ends the run halfway (#90). The loop says "continue" once per turn,
+    // like a user would.
+
+    fn announced(text: &str) -> Vec<ProviderEvent> {
+        vec![ProviderEvent::TextDelta(text.into()), ProviderEvent::Done { reason: Some("stop".into()) }]
+    }
+    fn announced_steps(events: &[LoopEvent]) -> Vec<bool> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                LoopEvent::AnnouncedStep { continued } => Some(*continued),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_announced_step_with_no_tool_call_gets_one_continue() {
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            announced("Both modes work. Now let me look at issue #7 and comment:"),
+            use_tools(&[call("c1", "a.ts")]),
+            say("Done."),
+        ]));
+        let h = history(vec![user("go")]);
+        let events = collect(options(provider.clone(), &h, plain())).await;
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 3, "the run did not stop at the announcement");
+        assert_eq!(requests[1].0.last(), Some(&user(ANNOUNCED_STEP_NOTE)));
+        // The announced reply stays in the history before the note (a valid, ordinary turn).
+        assert_eq!(
+            snapshot(&h)[1..3],
+            [said("Both modes work. Now let me look at issue #7 and comment:"), user(ANNOUNCED_STEP_NOTE)]
+        );
+        assert_eq!(announced_steps(&events), [true]);
+        assert_eq!(end(&events), Some(StopReason::End));
+    }
+
+    #[tokio::test]
+    async fn a_second_announced_step_after_the_rescue_only_ends_the_run() {
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            announced("Now checking issue #7 before commenting:"),
+            announced("Now also summarizing the diff:"),
+            say("never asked"),
+        ]));
+        let h = history(vec![user("go")]);
+        let events = collect(options(provider.clone(), &h, plain())).await;
+        assert_eq!(provider.requests().len(), 2, "one continue per turn: the second announcement stops the run");
+        assert_eq!(announced_steps(&events), [true, false]);
+        assert_eq!(end(&events), Some(StopReason::End));
+        let notes = snapshot(&h).iter().filter(|t| matches!(t, ChatTurn::User { text } if text == ANNOUNCED_STEP_NOTE)).count();
+        assert_eq!(notes, 1);
+    }
+
+    #[tokio::test]
+    async fn a_question_or_a_summary_ending_is_never_rescued() {
+        // A plain answer (a question to the user, a summary) ends the run as before: no note,
+        // no continue, no second request.
+        let provider = Arc::new(ScriptedProvider::new(vec![announced("Should I also update the docs?"), say("never asked")]));
+        let h = history(vec![user("go")]);
+        let events = collect(options(provider.clone(), &h, plain())).await;
+        assert_eq!(provider.requests().len(), 1, "the question ended the run as before");
+        assert_eq!(announced_steps(&events), Vec::<bool>::new());
+        assert!(snapshot(&h).iter().all(|t| !matches!(t, ChatTurn::User { text } if text == ANNOUNCED_STEP_NOTE)));
+        assert_eq!(end(&events), Some(StopReason::End));
+
+        let provider = Arc::new(ScriptedProvider::new(vec![announced("Done. Both modes work as expected."), say("never asked")]));
+        let events = collect(options(provider, &history(vec![user("go")]), plain())).await;
+        assert_eq!(announced_steps(&events), Vec::<bool>::new());
+        assert_eq!(end(&events), Some(StopReason::End));
+    }
+
+    #[tokio::test]
+    async fn an_announced_step_counts_toward_the_step_limit_and_the_wrap_up_is_never_continued() {
+        // #90 + #59: the continue is an ordinary step, so it can reach the limit; the wrap-up reply
+        // that follows is tools-off and final even when it announces a next step itself.
+        let mut script = steps(1);
+        script.push(announced("Read a. Now let me fix b:"));
+        script.push(announced("Read a; b is left. Next, let me fix b:"));
+        script.push(say("never asked"));
+        let provider = Arc::new(ScriptedProvider::new(script));
+        let h = history(vec![user("go")]);
+        let (_state, runner) = tracked(None);
+        let events =
+            collect(AgentOptions { max_steps: 2, wrap_up_at_limit: true, ..options(provider.clone(), &h, runner) }).await;
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 3, "the continue used the last step; then only the wrap-up");
+        assert_eq!(requests[2].0.last(), Some(&user(STEP_LIMIT_NOTE)));
+        assert_eq!(requests[2].1.tool_choice, ToolChoice::None);
+        assert_eq!(announced_steps(&events), [true]);
+        assert_eq!(end(&events), Some(StopReason::MaxSteps));
+    }
+
+    #[tokio::test]
+    async fn an_announced_step_with_tool_calls_is_an_ordinary_step() {
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            // The same reply announced its step and called the tool: the calls run, nothing to rescue.
+            vec![
+                ProviderEvent::TextDelta("Now checking issue #7:".into()),
+                ProviderEvent::ToolCall(call("c1", "a.ts")),
+                ProviderEvent::Done { reason: Some("tool_calls".into()) },
+            ],
+            say("Done."),
+        ]));
+        let h = history(vec![user("go")]);
+        let events = collect(options(provider.clone(), &h, plain())).await;
+        assert_eq!(provider.requests().len(), 2);
+        assert_eq!(announced_steps(&events), Vec::<bool>::new());
+        assert_eq!(end(&events), Some(StopReason::End));
+    }
+
+    // #90: debug recording is a plain option on its way to the provider (which collects the
+    // raw payloads for the trajectory's request records when it's on).
+    #[tokio::test]
+    async fn debug_recording_reaches_the_provider() {
+        let provider = Arc::new(ScriptedProvider::new(vec![say("Done.")]));
+        let h = history(vec![user("go")]);
+        let mut flagged = options(provider.clone(), &h, plain());
+        flagged.debug_raw = true;
+        collect(flagged).await;
+        assert!(provider.requests()[0].1.debug_raw);
+
+        let provider = Arc::new(ScriptedProvider::new(vec![say("Done.")]));
+        collect(options(provider.clone(), &history(vec![user("go")]), plain())).await;
+        assert!(!provider.requests()[0].1.debug_raw, "off by default");
     }
 
     // A reply cut off at the output limit.

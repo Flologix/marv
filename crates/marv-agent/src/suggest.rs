@@ -73,7 +73,7 @@ pub async fn suggest(options: SuggestOptions<'_>) -> Option<String> {
             ProviderEvent::Retry { .. } => text.clear(),
             ProviderEvent::ToolCall(_) | ProviderEvent::Error(_) => return None,
             ProviderEvent::Done { reason } if reason.as_deref() == Some("length") => return None,
-            ProviderEvent::Usage(usage) => {
+            ProviderEvent::Usage(usage, _) => {
                 if let Some(on_usage) = options.on_usage {
                     on_usage(usage);
                 }

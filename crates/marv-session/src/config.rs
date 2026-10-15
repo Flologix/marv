@@ -313,6 +313,22 @@ pub fn max_steps_from_env(value: Option<&str>, fallback: u32) -> u32 {
     }
 }
 
+/// `MARV_DEBUG_RAW` (#90): debug recording for a turn. On, the providers collect the raw
+/// response payloads (the trajectory's `request` records carry them as `rawResponse`) — for
+/// diagnosing a turn that ended on something the loop may have misparsed. Off by default;
+/// "off" (any case) and "0" turn it back off.
+pub fn debug_raw() -> bool {
+    debug_raw_from(std::env::var("MARV_DEBUG_RAW").ok().as_deref())
+}
+
+/// The `MARV_DEBUG_RAW` value's meaning (testable).
+pub fn debug_raw_from(value: Option<&str>) -> bool {
+    let Some(text) = value.map(str::trim).filter(|t| !t.is_empty()) else {
+        return false;
+    };
+    !text.eq_ignore_ascii_case("off") && text != "0"
+}
+
 /// `OLLAMA_HOST` is Ollama's own setting ("127.0.0.1:11434" or a full URL); honor it.
 pub fn ollama_url(host: Option<&str>) -> String {
     let Some(host) = host.filter(|h| !h.trim().is_empty()) else {
@@ -504,6 +520,18 @@ mod tests {
             (c.api_key.as_deref(), c.api_key_source, c.model.as_str()),
             (Some("sk-from-env"), Some(KeySource::Env), "openai/gpt-5.6-luna")
         );
+    }
+
+    #[test]
+    fn debug_raw_only_from_its_env_var() {
+        // #90: the flag is off unless MARV_DEBUG_RAW names it on; "off" and "0" turn it off.
+        assert!(!debug_raw_from(None));
+        assert!(!debug_raw_from(Some("")));
+        assert!(!debug_raw_from(Some("0")));
+        assert!(!debug_raw_from(Some("off")));
+        assert!(debug_raw_from(Some("1")));
+        assert!(debug_raw_from(Some("on")));
+        assert!(debug_raw_from(Some(" any ")));
     }
 
     #[test]
