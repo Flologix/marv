@@ -13,8 +13,9 @@ pub fn install_fake_gh(dir: &Path) -> PathBuf {
     dir.to_path_buf()
 }
 
-/// Writes `contents` to `path` (making its folder) as an executable (0755) script, for a test's fake program. Every test in the workspace
-/// that writes a script it (or Marv) then runs goes through this.
+/// Writes `contents` to `path` (making its folder) as an executable (0755) script, for a test's fake program. Tests
+/// that write a script they (or Marv) then run go through this, except the Herdr fakes in marv-mesh and
+/// marv-session's mesh tests, which keep #92's wait-until-runnable probe.
 ///
 /// The file is written by a child `sh`, never by this process (#92): while a test thread here has a file open for
 /// writing, another thread may fork to spawn its own child, and that child holds a copy of the write handle until it
