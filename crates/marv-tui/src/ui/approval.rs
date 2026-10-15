@@ -266,6 +266,7 @@ mod tests {
             agent: None,
             network: false,
             once: false,
+            must_ask: false,
             door: None,
         }
     }
@@ -284,6 +285,7 @@ mod tests {
             agent: None,
             network: false,
             once: false,
+            must_ask: false,
             door: None,
         }
     }
@@ -349,6 +351,7 @@ mod tests {
             agent: Some("worker-1".into()),
             network: false,
             once: true,
+            must_ask: false,
             door: None,
         };
         let mut view = ApprovalView::new(wire, 0, true);
@@ -386,6 +389,7 @@ mod tests {
             agent: Some("worker-1".into()),
             network: false,
             once: true,
+            must_ask: false,
             door: None,
         };
         let mut view = ApprovalView::new(call.clone(), 0, true);
@@ -554,6 +558,7 @@ mod tests {
             tool: "undo".into(),
             label: "turn 3".into(),
             once: true,
+            must_ask: false,
             scope: Scope { key: "undo".into(), description: "undo".into() },
             preview: Preview {
                 title: "Undo turn 3".into(),

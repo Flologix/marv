@@ -159,6 +159,7 @@ pub fn approval_request(request: &marv_tools::ApprovalRequest) -> view::Approval
         agent: request.agent.clone(),
         network: request.network,
         once: request.once,
+        must_ask: request.must_ask,
         door: request.door,
     }
 }
@@ -3647,6 +3648,8 @@ mod tests {
         let shown = approval_request(&request);
         assert!(shown.preview.warning.unwrap().starts_with("changes .envrc"));
         assert_eq!((shown.agent.as_deref(), shown.once), (Some("implementer · Task 2"), true));
+        // The TUI's queue needs `must_ask` too: an "always" on another request never answers this one.
+        assert!(shown.must_ask);
     }
 
     /// #77: the session's one prompt for a call and its new wire reaches the TUI as "Yes (wire it)" or "No".
