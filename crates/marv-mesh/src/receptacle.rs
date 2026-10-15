@@ -134,7 +134,14 @@ impl Receptacle {
             owner: Some(agent),
             kind: ReceptacleKind::Inbox,
             modes: vec![WireMode::Send, WireMode::Watch],
-            input_schema: serde_json::json!({"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}),
+            // Only {"text": "…"}: the switchboard refuses any other key (#123), so the schema an MCP client (the
+            // `marv mesh plug` shim) shows its model says so up front.
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"text": {"type": "string"}},
+                "required": ["text"],
+                "additionalProperties": false
+            }),
         }
     }
 
@@ -157,6 +164,12 @@ mod tests {
         let id = PlugId::new("worker-1").unwrap();
         let inbox = ReceptacleName::inbox(&id);
         assert_eq!(inbox.as_str(), "agent.worker-1.inbox");
+        // #123: an inbox takes {"text": "…"} and nothing else; its schema says so to a shim's MCP client.
+        let schema = Receptacle::inbox(id.clone()).input_schema;
+        assert_eq!(
+            (schema["required"].clone(), schema["additionalProperties"].clone()),
+            (serde_json::json!(["text"]), serde_json::json!(false))
+        );
         assert_eq!(inbox.inbox_owner(), Some("worker-1"));
         assert_eq!(ReceptacleName::new("herdr.pane.send").unwrap().inbox_owner(), None);
         assert!(ReceptacleName::remote("weather").unwrap().is_remote());

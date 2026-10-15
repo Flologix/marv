@@ -207,12 +207,12 @@ fn peer_lines(w: &Wireable, wired: &HashSet<&str>) -> Vec<String> {
         .collect()
 }
 
-/// The inbox another Marv's main agent takes messages at (`peer.<marv>.agent.parent.inbox`, else its first agent's).
+/// The inbox another Marv's main agent takes messages at: `peer.<marv>.agent.parent.inbox`, when it has one. Any other
+/// agent there (a worker, a shim's Claude Code) isn't that Marv and wouldn't answer for it, so without `parent` the
+/// pane keeps its `.send`.
 fn marv_inbox(p: &PeerSwitchboard) -> Option<ReceptacleName> {
-    let agents = || p.info.agents.iter().filter(|a| !a.starts_with("peer-"));
-    let agent = agents().find(|a| a.as_str() == "parent").or_else(|| agents().next())?;
-    let inbox = ReceptacleName::new(format!("agent.{agent}.inbox")).ok()?;
-    crate::discovery::peer_receptacle(&p.session, &inbox).ok()
+    p.info.agents.iter().find(|a| a.as_str() == "parent")?;
+    crate::discovery::peer_receptacle(&p.session, &ReceptacleName::new("agent.parent.inbox").ok()?).ok()
 }
 
 /// The Herdr agent panes: pane id, the agent Herdr sees and its state, the Marv in it if one says so, and the
@@ -445,6 +445,27 @@ mod tests {
         assert!(answer.text.contains("\n- w1-p3 (claude, working): herdr.pane.w1-p3.send\n"), "{}", answer.text);
         assert!(!answer.text.contains("Other Marvs on this machine"), "{}", answer.text);
         assert!(answer.from_mesh);
+    }
+
+    /// #123: a pane is steered only to its Marv's main inbox. A Marv whose agents are a worker and a shim's Claude Code
+    /// (no `parent`) isn't answered for by either, so its pane keeps `.send` and no inbox is named for it.
+    #[test]
+    fn a_marv_pane_is_steered_only_to_its_parent_inbox() {
+        let mut w = Wireable::new("alpha", PlugId::new("parent").unwrap());
+        w.on_mesh = true;
+        w.peers =
+            vec![peer("gamma", &["claude", "worker-1"], Some("w1:p6")), peer("delta", &["worker-1", "parent"], Some("w1:p7"))];
+        w.panes = vec![pane("w1:p6", "marv", "idle"), pane("w1:p7", "marv", "idle")];
+        let text = list_answer(&[], &w).text;
+        assert!(text.contains("\n- w1-p6 (marv, idle; Marv gamma): herdr.pane.w1-p6.send, herdr.pane.w1-p6.status"), "{text}");
+        assert!(!text.contains("This is Marv gamma"), "{text}");
+        assert!(
+            text.contains(
+                "\n- w1-p7 (marv, idle; Marv delta): herdr.pane.w1-p7.status. This is Marv delta: mesh_send to its inbox \
+                 peer.delta.agent.parent.inbox to get a reply"
+            ),
+            "{text}"
+        );
     }
 
     #[test]
