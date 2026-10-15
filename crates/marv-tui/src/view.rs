@@ -192,6 +192,9 @@ pub struct ApprovalRequest {
     pub network: bool,
     /// Yes or no only, no "don't ask again": each one is its own decision (/mcp add, a door to the host).
     pub once: bool,
+    /// Asked every time whatever was answered before (a protected path, egress after untrusted content): an "always"
+    /// on another request never covers it, queued or not.
+    pub must_ask: bool,
     /// The call leaves the sandbox through this door: the prompt shows its warning line (Marv Sprint 4).
     pub door: Option<marv_core::Door>,
 }

@@ -1185,9 +1185,11 @@ impl App {
     fn decide(&mut self, decision: Decision, now: Instant) {
         let Some(head) = self.approvals.pop_front() else { return };
         if decision == Decision::Always {
-            // The session remembers the scope from now on; requests already waiting in it are covered too.
+            // The session remembers the scope from now on; requests already waiting in it are covered too (not a
+            // `once` or `must_ask` one, which is asked each time: the session never answers those from "always").
             let key = head.request.scope.key.clone();
-            let (covered, rest): (Vec<_>, Vec<_>) = self.approvals.drain(..).partition(|p| p.request.scope.key == key);
+            let (covered, rest): (Vec<_>, Vec<_>) =
+                self.approvals.drain(..).partition(|p| p.request.scope.key == key && !p.request.once && !p.request.must_ask);
             self.approvals = rest.into();
             for pending in covered {
                 self.port.answer(pending.id, Decision::Yes);
@@ -2062,6 +2064,7 @@ mod tests {
             agent: agent.map(Into::into),
             network: false,
             once: false,
+            must_ask: false,
             door: None,
         }
     }
@@ -2457,6 +2460,41 @@ mod tests {
         assert_eq!(&h.calls()[1..], [Call::Answer(3, Decision::Yes), Call::Answer(1, Decision::Always)]);
         assert!(h.frame().contains("Do you want to proceed?")); // the other scope still asks
         assert!(!h.frame().contains("more waiting"));
+    }
+
+    #[test]
+    fn always_leaves_a_queued_once_request_in_the_same_scope_to_ask() {
+        let mut h = harness();
+        h.typed("make files");
+        let once = ApprovalRequest { once: true, ..write_request("two.txt", None) };
+        h.events([
+            UiEvent::Approval { id: ApprovalId(1), request: write_request("one.txt", None) },
+            UiEvent::Approval { id: ApprovalId(2), request: once },
+        ]);
+        h.arm();
+        h.key(DOWN);
+        h.key(ENTER); // Yes, and don't ask again for file changes
+        assert_eq!(&h.calls()[1..], [Call::Answer(1, Decision::Always)]);
+        assert!(h.frame().contains("Do you want to proceed?")); // the once request still asks
+    }
+
+    /// A protected path (or egress after untrusted content) queued behind an ordinary file change: "Always" on the
+    /// head doesn't answer it, so its warning still reaches the person. Proven: dropped `!p.request.must_ask` from
+    /// `decide` → failed (request 2 answered Yes unseen).
+    #[test]
+    fn always_leaves_a_queued_must_ask_request_in_the_same_scope_to_ask() {
+        let mut h = harness();
+        h.typed("make files");
+        let protected = ApprovalRequest { must_ask: true, ..write_request(".envrc", Some("general-purpose · two")) };
+        h.events([
+            UiEvent::Approval { id: ApprovalId(1), request: write_request("one.txt", Some("general-purpose · one")) },
+            UiEvent::Approval { id: ApprovalId(2), request: protected },
+        ]);
+        h.arm();
+        h.key(DOWN);
+        h.key(ENTER); // Yes, and don't ask again for file changes
+        assert_eq!(&h.calls()[1..], [Call::Answer(1, Decision::Always)]);
+        assert!(h.frame().contains("Do you want to proceed?")); // the protected request still asks
     }
 
     #[test]

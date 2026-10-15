@@ -271,13 +271,15 @@ async fn asks_in(
 /// "always". `edit_file` and `write_file` run in Marv's own process, not in the sandbox, so in a home-folder project
 /// they reach the shell's rc files, systemd user units, autostart entries, `~/.ssh/authorized_keys` and `~/.local/bin`
 /// — all run outside the sandbox later — and the hooks of every repository in the home. A file in the visible part
-/// of the home stays an ordinary write, and a project in a subfolder isn't affected.
+/// of the home isn't a protected path (it's asked `once`, in yolo too: approvals.rs), and a project in a subfolder
+/// isn't affected.
 ///
 /// Proven: dropped the `.or_else(…home_rule…)` from `edit_file::protected_target` → failed (`.bashrc` written in
 /// yolo without asking); dropped the enclosing-repository loop from `home_rule` → failed (`Projects/app/tools/hooks`);
 /// dropped the global config's hooks folder → failed (`githooks/pre-commit`); checked only the path as written →
 /// failed (`Projects/rc-link` written through to `.bashrc`); dropped `home_rule` and the yolo calls → the session's
-/// "always" for files covered `.bashrc` (written).
+/// "always" for files covered `.bashrc` (written); dropped `!home_write` from the registry's yolo rule → failed
+/// (`notes.txt` ran in yolo without asking).
 #[tokio::test]
 async fn in_the_home_folder_dotfiles_and_hooks_ask_even_in_yolo() {
     let home = TempDir::new("home-dotfiles");
@@ -316,7 +318,8 @@ async fn in_the_home_folder_dotfiles_and_hooks_ask_even_in_yolo() {
     }
     assert_eq!(home.read(".bashrc").as_deref(), Some("# rc\n"));
     assert!(!h.join(".profile").exists() && !h.join("githooks").exists());
-    // The control: a visible file of the home runs in yolo without asking.
+    // A visible file of the home isn't a protected path, but in the home folder every file change asks (`once`),
+    // in yolo too (which the session refuses there anyway): see approvals.rs.
     let approver = Recorder::new(Decision::No);
     let out = run_tool(
         &call("write_file", json!({"path": "notes.txt", "content": "ok\n"})),
@@ -324,9 +327,11 @@ async fn in_the_home_folder_dotfiles_and_hooks_ask_even_in_yolo() {
         builtin_tools(),
     )
     .await;
-    assert_eq!(out.result.approval, Some(Approval::Auto), "{}", out.result.output);
+    assert!(out.result.declined, "{}", out.result.output);
+    let asked = approver.requests();
+    assert!(asked.len() == 1 && asked[0].once && asked[0].protected.is_none(), "{asked:?}");
     // After an "always" for file changes (the session's own, or a config seed), and for a subagent that runs without
-    // asking: a visible file of the home goes through, `.bashrc` still reaches the person.
+    // asking: a visible file of the home is still asked (`once`), and `.bashrc` reaches the person as protected.
     let always = marv_session::AlwaysScopes::default();
     always.add("files");
     always.seed(&["files".into()]);
@@ -346,11 +351,12 @@ async fn in_the_home_folder_dotfiles_and_hooks_ask_even_in_yolo() {
         ctx.yolo = false;
         ctx.approver = Some(approver);
         let out = run_tool(&call("write_file", json!({"path": "notes.txt", "content": "ok\n"})), &ctx, builtin_tools()).await;
-        assert!(!out.result.declined && person.requests().is_empty(), "subagent {subagent}: {}", out.result.output);
+        assert!(out.result.declined, "subagent {subagent}: an \"always\" covered notes.txt: {}", out.result.output);
+        assert!(person.requests().len() == 1 && person.requests()[0].once, "subagent {subagent}");
         let out = run_tool(&call("write_file", json!({"path": ".bashrc", "content": "planted\n"})), &ctx, builtin_tools()).await;
         let asked = person.requests();
-        assert_eq!(asked.len(), 1, "subagent {subagent}: an \"always\" covered .bashrc: {}", out.result.output);
-        assert_eq!(asked[0].protected, Some(ProtectedRule::HomeDotfile));
+        assert_eq!(asked.len(), 2, "subagent {subagent}: an \"always\" covered .bashrc: {}", out.result.output);
+        assert_eq!(asked[1].protected, Some(ProtectedRule::HomeDotfile));
         assert!(out.result.declined);
     }
     assert_eq!(home.read(".bashrc").as_deref(), Some("# rc\n"));

@@ -63,6 +63,12 @@ Each guard's doc comment says how it was proven: the guard was reverted, and the
 | Pre-approved never cover protected paths (#98) | `approvals.rs::config_approve_never_covers_protected_paths` | Proven (same revert) |
 | Pre-approved never cover lifecycle scripts (#98) | `approvals.rs::config_approve_never_covers_lifecycle_scripts` | Proven (same revert) |
 | Pre-approved never grant a mesh wire (#98) | `approvals.rs::config_approve_never_grants_a_mesh_wire` | Proven (construction: `wire_approval` is `must_ask`+`once`) |
+| In the home folder, "always" on a file change still asks the next time | `approvals.rs::in_the_home_folder_always_on_a_file_change_still_asks_the_next_time` | Proven (`home_file_write` dropped from the registry's `once` → failed) |
+| … the request is `once` (no "always" offered) | `approvals.rs::in_the_home_folder_a_file_change_request_is_once` | Proven (same revert) |
+| … config `"approve": ["files"]` doesn't cover it | `approvals.rs::in_the_home_folder_config_approve_files_doesnt_cover_a_file_change`, `headless_config_approve_files_in_the_home_folder_is_refused` | Proven (same revert; the second through `marv -p`) |
+| … a worktree subagent's automatic yes doesn't cover a `once` request | `approvals.rs::a_subagents_automatic_yes_doesnt_cover_a_once_request` | Proven (`!request.once` dropped from `SubagentApprover` → failed) |
+| A project under the home keeps "always" for file changes | `approvals.rs::a_project_under_the_home_keeps_always_for_file_changes` | Proven (`home_file_write` true for every project → failed) |
+| `marv -p --approve files` still writes in the home folder | `approvals.rs::headless_approve_files_in_the_home_folder_still_writes` | Behaviour lock (the chosen rule) |
 | Writable entries refused at startup (#98) | `sandbox.rs::refused_writable_entries_are_refused_at_startup` | Proven (any hidden top-level home entry: the rule dropped → failed) |
 | A writable folder that is or holds a git repo refused (#98 review) | `sandbox.rs::git_repositories_are_refused_as_writable_entries` | Proven (the `.git` checks dropped → failed) |
 | A writable folder writable, nothing else new (#98) | `sandbox.rs::the_writable_folder_is_writable_and_nothing_else_new_is` | Proven (real bwrap; the session merge dropped → failed) |

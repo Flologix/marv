@@ -68,7 +68,8 @@ pub fn resolve_type<'a>(agents: &'a [AgentType], name: Option<&str>) -> Result<&
 
 /// How a subagent's changes get approved. In a sandboxed worktree they run without asking (the worktree is the
 /// boundary, merging its branch is the review), except anything that reaches the network, and anything a person
-/// must answer (`must_ask`: tainted egress, protected paths). Otherwise the user is asked, labeled with which
+/// must answer (`must_ask`: tainted egress, protected paths), and anything asked each time (`once`: a file change in
+/// the home folder, see `marv_tools::registry::home_file_write`). Otherwise the user is asked, labeled with which
 /// subagent asks. Without an approver there's no auto-yes either.
 pub struct SubagentApprover {
     pub inner: Arc<dyn Approver>,
@@ -80,7 +81,7 @@ pub struct SubagentApprover {
 #[async_trait]
 impl Approver for SubagentApprover {
     async fn approve(&self, request: ApprovalRequest) -> Decision {
-        if self.auto && !request.network && !request.must_ask {
+        if self.auto && !request.network && !request.must_ask && !request.once {
             return Decision::Yes;
         }
         self.inner.approve(ApprovalRequest { agent: Some(self.agent.clone()), ..request }).await
