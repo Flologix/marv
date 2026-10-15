@@ -11,7 +11,8 @@
 //! ([`Trajectory::on_error`]) and the rest are dropped quietly. A crash can leave a half-written last line, so the file
 //! is started on a fresh line before the first record of a process.
 //!
-//! marv-rs additions: `mesh` records (every mesh message, delivered or refused: `marv_mesh::switchboard::MeshRecord`)
+//! marv-rs additions: `mesh` records (every mesh message, delivered or refused: `marv_mesh::switchboard::MeshRecord`),
+//! `radio` records (#124: joins, leaves, `lost`, `silent`, drops and refused frames: `marv_mesh::radio::RadioRecord`)
 //! and `taint` records (what tainted the session, `docs/SECURITY.md`).
 
 use std::io::Write;
@@ -316,6 +317,9 @@ pub enum TrajectoryRecord {
     },
     /// marv-rs: a mesh message, delivered or refused (never its body).
     Mesh(MeshRecord),
+    /// marv-rs #124: a radio event (a join, a leave, `lost`, `silent`, a drop, a refused frame; never a heartbeat or a
+    /// title).
+    Radio(marv_mesh::radio::RadioRecord),
     /// marv-rs: the session became tainted (web, MCP, mesh or image content entered its context).
     Taint {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -452,6 +456,9 @@ pub struct MeshSink(pub Arc<Trajectory>);
 impl TrajectorySink for MeshSink {
     fn mesh(&self, record: MeshRecord) {
         self.0.write(&TrajectoryRecord::Mesh(record));
+    }
+    fn radio(&self, record: marv_mesh::radio::RadioRecord) {
+        self.0.write(&TrajectoryRecord::Radio(record));
     }
 }
 

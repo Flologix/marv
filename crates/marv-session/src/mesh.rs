@@ -20,6 +20,9 @@
 //!   already there (the taint rules unchanged).
 //! - Inbox messages are drained before the turn's request and between steps ([`inbox_note`], [`with_inbox`]) and
 //!   go in fenced (`Envelope::fenced`), marking the session tainted with `Provenance::Mesh`.
+//! - The radio (#124, phase 1: presence): `mesh_list` gives the main agent an "On the radio" section, names and fixed
+//!   state words only (`Radio::listed`), so it stays untainted; presence itself never reaches a model or the history.
+//!   No new tool and no tool-spec change.
 //! - Wake (#78, opt-in `mesh.wake`): the TUI, idle with no approval waiting, may start a turn when a message lands in
 //!   the main agent's inbox ([`wake_check`]: only on a granted wire, at most [`WAKES_PER_MINUTE`] a minute per wire).
 //!   The woken turn has no user message: it drains the inbox the same way (fenced, tainting), then [`WAKE_NOTE`].
@@ -439,6 +442,13 @@ impl MeshTool {
         let mut found = Wireable::new(&self.mesh.session, self.plug.clone());
         let dir = self.mesh.peer_dir();
         found.on_mesh = dir.is_some();
+        // #124: who's on the radio, for the main agent only (subagents aren't on it): names and fixed state words,
+        // never a title, so the list stays Marv's own words.
+        if self.plug.as_str() == PARENT
+            && let Some(radio) = self.mesh.radio().filter(|r| r.is_on())
+        {
+            found.radio = radio.listed();
+        }
         let herdr = self.mesh.herdr();
         let peers = async {
             match dir {

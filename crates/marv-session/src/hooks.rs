@@ -286,7 +286,7 @@ pub fn hooks_note(runs: &[HookRun]) -> Option<String> {
 pub const PROJECT_CONFIG_CAP: u64 = 1024 * 1024;
 
 /// A project's `.marv/config.json` with a `hooks` key: the startup note saying it was not run (and, #98, with an
-/// `approve` or `writable` key: that it was ignored). `None` when there's no
+/// `approve` or `writable` key, or #124 a `mesh` key: that it was ignored). `None` when there's no
 /// such file, it has no `hooks`, or it *is* the user's own config (`user_config`, e.g. Marv started in the home folder
 /// with the default config dir). The file is only looked at, never used: no project setting reaches Marv's config.
 ///
@@ -332,6 +332,14 @@ pub fn project_hooks_refusal(root: &Path, user_config: &Path) -> Option<String> 
              approve its own calls or widen the sandbox).",
             widening.join(" and ")
         ));
+    }
+    // #124: the radio, and wake with it. Never read from here either; a project turning the radio on would put this
+    // user's Marv on a channel with their other Marvs without them choosing it.
+    if raw.get("mesh").is_some() {
+        notes.push(
+            "This project's .marv/config.json sets \"mesh\". Only your own config can turn the radio or wake on: ignored."
+                .to_string(),
+        );
     }
     (!notes.is_empty()).then(|| notes.join(" "))
 }
@@ -585,6 +593,13 @@ mod tests {
         let refusal = project_hooks_refusal(&root, &user).unwrap();
         assert!(refusal.contains("has \"approve\" and \"writable\": ignored"), "{refusal}");
         assert!(!refusal.contains("hooks"), "{refusal}");
+        // #124: the radio and wake (one `mesh` object) are told about too, never read.
+        std::fs::write(root.join(".marv/config.json"), r#"{"mesh": {"radio": true, "wake": true}}"#).unwrap();
+        let refusal = project_hooks_refusal(&root, &user).unwrap();
+        assert_eq!(
+            refusal,
+            "This project's .marv/config.json sets \"mesh\". Only your own config can turn the radio or wake on: ignored."
+        );
         // Marv started in the home folder: the project's .marv/config.json is the user's own.
         assert_eq!(project_hooks_refusal(&root, &root.join(".marv/config.json")), None);
         let _ = std::fs::remove_dir_all(&root);

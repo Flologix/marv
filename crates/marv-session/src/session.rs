@@ -994,6 +994,13 @@ impl MarvSession {
         self.inner.init.mcp.clone()
     }
     /// The mesh switchboard (for `marv mesh wire` and the TUI's wire approvals), if any.
+    /// The conversation's first user message, as the user typed it (empty for a new conversation): the radio's
+    /// presence title (#124) is made from it. Never a file's text, a tool's output, the model's words or another
+    /// Marv's.
+    pub fn first_message(&self) -> String {
+        self.state().saved.transcript.iter().find(|m| m.role == Role::User).map(|m| m.text.clone()).unwrap_or_default()
+    }
+
     pub fn mesh(&self) -> Option<MeshHandle> {
         self.inner.init.mesh.clone()
     }

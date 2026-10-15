@@ -106,6 +106,47 @@ pub struct FileConfig {
     pub writable: Option<Vec<String>>,
     /// `mesh.wake` (marv-rs #78): a message on a wired inbox starts a turn while the TUI is idle (default off).
     pub mesh_wake: Option<bool>,
+    /// `mesh.radio` (marv-rs #124): this Marv is on the mesh radio (default off). Read only from this file, the user's
+    /// own: never a project's, an environment variable or a flag.
+    pub mesh_radio: Option<RadioSetting>,
+}
+
+/// `"mesh": {"radio": true}`, or the object form `{"radio": {"titles": false}}` (on, without sharing the
+/// conversation's title in presence). `false` is off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RadioSetting {
+    pub on: bool,
+    /// Whether presence carries the conversation's title (default on).
+    pub titles: bool,
+}
+
+impl RadioSetting {
+    fn from_value(value: &Value) -> Result<Option<Self>, String> {
+        match value {
+            Value::Null => Ok(None),
+            Value::Bool(on) => Ok(Some(Self { on: *on, titles: true })),
+            Value::Object(options) => {
+                if let Some(key) = options.keys().find(|k| k.as_str() != "titles") {
+                    return Err(format!("mesh.radio: unknown key \"{key}\" (only \"titles\")"));
+                }
+                match options.get("titles") {
+                    None | Some(Value::Null) => Ok(Some(Self { on: true, titles: true })),
+                    Some(Value::Bool(titles)) => Ok(Some(Self { on: true, titles: *titles })),
+                    Some(_) => Err("mesh.radio.titles: expected a boolean".into()),
+                }
+            }
+            _ => Err("mesh.radio: expected true, false or {\"titles\": false}".into()),
+        }
+    }
+
+    /// As saved: `true`/`false`, or `{"titles": false}` when on without titles. Off is `false`.
+    fn to_value(self) -> Value {
+        match (self.on, self.titles) {
+            (on, true) => Value::from(on),
+            (true, false) => serde_json::json!({ "titles": false }),
+            (false, false) => Value::from(false),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -224,20 +265,27 @@ impl FileConfig {
                 None
             }
         };
-        // `"mesh": {"wake": true}`: the mesh's settings, one object (only `wake` so far).
-        let mesh_wake = match map.get("mesh") {
-            None | Some(Value::Null) => None,
-            Some(Value::Object(mesh)) => match mesh.get("wake") {
-                None | Some(Value::Null) => None,
-                Some(Value::Bool(b)) => Some(*b),
-                Some(_) => {
-                    problems.push("mesh.wake: expected a boolean".into());
-                    None
-                }
-            },
+        // `"mesh": {"wake": true, "radio": true}`: the mesh's settings, one object.
+        let (mesh_wake, mesh_radio) = match map.get("mesh") {
+            None | Some(Value::Null) => (None, None),
+            Some(Value::Object(mesh)) => {
+                let wake = match mesh.get("wake") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::Bool(b)) => Some(*b),
+                    Some(_) => {
+                        problems.push("mesh.wake: expected a boolean".into());
+                        None
+                    }
+                };
+                let radio = RadioSetting::from_value(mesh.get("radio").unwrap_or(&Value::Null))
+                    .map_err(|e| problems.push(e))
+                    .ok()
+                    .flatten();
+                (wake, radio)
+            }
             Some(_) => {
                 problems.push("mesh: expected an object, like {\"wake\": true}".into());
-                None
+                (None, None)
             }
         };
         let hooks = match map.get("hooks") {
@@ -265,6 +313,7 @@ impl FileConfig {
             approve: string_list("approve", &mut problems),
             writable: string_list("writable", &mut problems),
             mesh_wake,
+            mesh_radio,
         };
         if problems.is_empty() { Ok(config) } else { Err(problems.join("\n")) }
     }
@@ -309,7 +358,14 @@ impl FileConfig {
                 FormatterSetting::Custom(commands) => serde_json::to_value(commands).unwrap_or(Value::Null),
             }),
         );
-        put("mesh", self.mesh_wake.map(|wake| serde_json::json!({ "wake": wake })));
+        let mut mesh = Map::new();
+        if let Some(wake) = self.mesh_wake {
+            mesh.insert("wake".into(), Value::from(wake));
+        }
+        if let Some(radio) = self.mesh_radio {
+            mesh.insert("radio".into(), radio.to_value());
+        }
+        put("mesh", (!mesh.is_empty()).then_some(Value::Object(mesh)));
         Value::Object(map)
     }
 }
@@ -349,6 +405,10 @@ pub struct Config {
     pub writable: Vec<String>,
     /// `mesh.wake` (#78): off unless the file turns it on.
     pub mesh_wake: bool,
+    /// `mesh.radio` (#124): off unless the user's own file turns it on. No environment variable or flag reaches it.
+    pub mesh_radio: bool,
+    /// Whether the radio's presence carries the conversation's title (`{"radio": {"titles": false}}` turns it off).
+    pub radio_titles: bool,
 }
 
 impl Config {
@@ -457,6 +517,8 @@ pub fn resolve_config(file: Option<&FileConfig>, env: &Env) -> Config {
         approve: file.and_then(|f| f.approve.clone()).unwrap_or_default(),
         writable: file.and_then(|f| f.writable.clone()).unwrap_or_default(),
         mesh_wake: file.and_then(|f| f.mesh_wake).unwrap_or(false),
+        mesh_radio: file.and_then(|f| f.mesh_radio).is_some_and(|r| r.on),
+        radio_titles: file.and_then(|f| f.mesh_radio).is_none_or(|r| r.titles),
     }
 }
 
@@ -695,6 +757,27 @@ mod tests {
                 assert!(FileConfig::from_value(&raw).is_err(), "{bad}");
             }
         }
+    }
+
+    #[test]
+    fn the_radio_is_off_unless_the_file_turns_it_on_and_keeps_its_titles_choice() {
+        let env: Env = [("MARV_RADIO", "1"), ("MARV_MESH_RADIO", "true")].map(|(k, v)| (k.to_string(), v.to_string())).into();
+        assert!(!resolve_config(None, &env).mesh_radio, "no environment variable turns it on");
+        assert!(!resolve_config(Some(&file()), &env).mesh_radio);
+        let on = FileConfig::from_value(&json!({"provider": "openrouter", "mesh": {"wake": true, "radio": true}})).unwrap();
+        let config = resolve_config(Some(&on), &Env::new());
+        assert!(config.mesh_radio && config.radio_titles && config.mesh_wake);
+        assert_eq!(on.to_value()["mesh"], json!({"wake": true, "radio": true}));
+        let quiet = FileConfig::from_value(&json!({"mesh": {"radio": {"titles": false}}})).unwrap();
+        let config = resolve_config(Some(&quiet), &Env::new());
+        assert!(config.mesh_radio && !config.radio_titles);
+        assert_eq!(quiet.to_value()["mesh"], json!({"radio": {"titles": false}}));
+        let off = FileConfig { mesh_radio: Some(RadioSetting { on: false, titles: false }), ..quiet.clone() };
+        assert!(!resolve_config(Some(&off), &Env::new()).mesh_radio);
+        assert_eq!(off.to_value()["mesh"], json!({"radio": false}));
+        assert!(FileConfig::from_value(&json!({"mesh": {"radio": "yes"}})).is_err());
+        assert!(FileConfig::from_value(&json!({"mesh": {"radio": {"titles": "no"}}})).is_err());
+        assert!(FileConfig::from_value(&json!({"mesh": {"radio": {"everyone": true}}})).is_err());
     }
 
     #[test]
