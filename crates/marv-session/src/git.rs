@@ -231,16 +231,14 @@ mod tests {
 
     #[tokio::test]
     async fn run_git_async_never_runs_hooks_or_fsmonitor() {
-        use std::os::unix::fs::PermissionsExt;
+        use marv_tools::github::fake::write_executable;
         let dir = repo();
         let marker = dir.0.join("ran");
         let script = dir.0.join("touch.sh");
         let body = format!("#!/bin/sh\ntouch {}\n", marker.display());
-        std::fs::write(&script, &body).unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable(&script, &body);
         let hook = dir.0.join(".git/hooks/pre-commit");
-        std::fs::write(&hook, &body).unwrap();
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable(&hook, &body);
         sh_git(&dir.0, &["config", "core.fsmonitor", &script.to_string_lossy()]);
         std::fs::write(dir.0.join("a.txt"), "changed\n").unwrap();
         run_git_async(&dir.0, &["status", "--porcelain"], GitOptions::default()).await;
