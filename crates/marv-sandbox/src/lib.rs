@@ -61,6 +61,17 @@ pub fn hidden_in_sandbox(dir: &std::path::Path, home: &std::path::Path) -> bool 
             && !home::TOOLCHAINS.iter().any(|t| dir.starts_with(home.join(t))))
 }
 
+/// Marv's config folder as the session finds it (`default_config_dir`): `MARV_CONFIG_DIR`, a relative one taken from
+/// the folder Marv started in (where the session reads it), else `~/.marv`. Never `~/.marv` in place of a relative
+/// value: the sandbox would then hide the wrong folder and show the real one.
+fn config_dir(value: Option<OsString>, cwd: Option<&Path>, home: &Path) -> PathBuf {
+    match value.map(PathBuf::from) {
+        Some(dir) if dir.is_absolute() => dir,
+        Some(dir) => cwd.map(|c| c.join(&dir)).unwrap_or(dir),
+        None => home.join(".marv"),
+    }
+}
+
 /// Why a path or a mount was refused. The messages go to the model as they are (tools wrap them in a
 /// `ToolError`), so they say what to do instead.
 #[derive(Debug, thiserror::Error)]
@@ -136,12 +147,7 @@ impl Sandbox {
                 .map(|d| vec![d.join("marv")])
                 .unwrap_or_default(),
             writable: Vec::new(),
-            config_dir: Some(
-                std::env::var_os("MARV_CONFIG_DIR")
-                    .map(PathBuf::from)
-                    .filter(|d| d.is_absolute())
-                    .unwrap_or_else(|| home.join(".marv")),
-            ),
+            config_dir: Some(config_dir(std::env::var_os("MARV_CONFIG_DIR"), std::env::current_dir().ok().as_deref(), &home)),
         }
     }
 
@@ -194,6 +200,16 @@ impl Sandbox {
 #[cfg(test)]
 mod hidden_tests {
     use super::*;
+
+    /// A relative `MARV_CONFIG_DIR` is where the session reads it (from the folder Marv started in), so that's what
+    /// the sandbox hides, not `~/.marv`.
+    #[test]
+    fn the_config_folder_is_the_sessions() {
+        let (cwd, home) = (Some(Path::new("/work")), Path::new("/home/me"));
+        assert_eq!(config_dir(Some("cfg".into()), cwd, home), Path::new("/work/cfg"));
+        assert_eq!(config_dir(Some("/srv/cfg".into()), cwd, home), Path::new("/srv/cfg"));
+        assert_eq!(config_dir(None, cwd, home), Path::new("/home/me/.marv"));
+    }
 
     #[test]
     fn only_folders_the_sandbox_hides_hold_the_mesh() {
