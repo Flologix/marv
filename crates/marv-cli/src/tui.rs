@@ -60,13 +60,14 @@ use marv_mcp::manager::{McpServerStatus, McpState};
 use marv_mcp::oauth::{Authorize, CallbackCheck, Revoked};
 use marv_mcp::personal_file::{add_personal_server, personal_server_names, remove_personal_server};
 use marv_mesh::herdr::{HerdrReporter, HerdrState, herdr_target};
+use marv_mesh::radio::{PresenceState, Radio, RosterState};
 use marv_provider::ProviderKind;
 use marv_provider::factory::{ConfigFactory, LoadModels, MakeProvider};
 use marv_session::checks::{ProjectCheckResult, project_check_notice};
 use marv_session::commands::{self, CommandAction, CommandContext, MemoryTarget};
 use marv_session::config::{
-    Config, ConfigStore, Env, FileConfig, MaxStepsSetting, default_config_dir, mask_key, migrate_legacy_config, needs_setup,
-    preset, resolve_config,
+    Config, ConfigStore, Env, FileConfig, MaxStepsSetting, RadioSetting, default_config_dir, mask_key, migrate_legacy_config,
+    needs_setup, preset, resolve_config,
 };
 use marv_session::diagnostics::check_notice;
 use marv_session::instructions::load_instructions;
@@ -670,11 +671,20 @@ pub struct Activity {
     /// A turn or `/compact` is running.
     busy: AtomicBool,
     herdr: Option<HerdrReporter>,
+    /// The mesh radio (#124): its presence's state follows Herdr's (blocked is `waiting`).
+    radio: Mutex<Option<Arc<Radio>>>,
 }
 
 impl Activity {
     fn new(tx: UnboundedSender<UiEvent>, herdr: Option<HerdrReporter>) -> Arc<Self> {
-        Arc::new(Self { tx, next: AtomicU64::new(1), asks: Mutex::default(), busy: AtomicBool::new(false), herdr })
+        Arc::new(Self {
+            tx,
+            next: AtomicU64::new(1),
+            asks: Mutex::default(),
+            busy: AtomicBool::new(false),
+            herdr,
+            radio: Mutex::default(),
+        })
     }
 
     fn emit(&self, event: UiEvent) {
@@ -695,6 +705,13 @@ impl Activity {
         if let Some(herdr) = &self.herdr {
             let (state, message) = self.herdr_state();
             herdr.state(state, message.as_deref());
+        }
+        if let Some(radio) = self.radio.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            radio.set_state(match self.herdr_state().0 {
+                HerdrState::Idle => PresenceState::Idle,
+                HerdrState::Working => PresenceState::Working,
+                HerdrState::Blocked => PresenceState::Waiting,
+            });
         }
     }
 
@@ -860,6 +877,8 @@ pub struct Bridge {
     wake_limit: Mutex<marv_session::mesh::WakeLimit>,
     /// Stops [`Bridge::watch_mesh`] when the App leaves ([`Bridge::close_mesh`]) or the bridge goes.
     mesh_watch: CancellationToken,
+    /// The mesh radio (#124), once the door is open ([`Bridge::set_radio`]).
+    radio: Mutex<Option<Arc<Radio>>>,
     /// Who may start a turn (#78): user submissions and wake-ups go through this one lock, so a wake can't start
     /// once a submission is on its way, and a submission that meets a running turn waits for it instead of failing.
     gate: Mutex<Gate>,
@@ -987,6 +1006,7 @@ impl Bridge {
             mesh_name: Mutex::default(),
             wake_limit: Mutex::default(),
             mesh_watch: CancellationToken::new(),
+            radio: Mutex::default(),
             gate: Mutex::default(),
             hooks_refused,
             suggesting: Mutex::default(),
@@ -1179,6 +1199,7 @@ impl Bridge {
     }
 
     fn show_resumed(&self, resumed: marv_session::Resumed) {
+        self.radio_title();
         self.emit(UiEvent::Resumed(view::Resumed {
             id: resumed.id,
             updated_at: resumed.updated_at,
@@ -1237,7 +1258,10 @@ impl Bridge {
     fn start_claimed(self: &Arc<Self>, text: String, for_model: Option<String>) {
         self.stop_suggesting();
         let turn = match self.session.send(&text, SendOptions { for_model, cancel: None }) {
-            Ok(turn) => turn,
+            Ok(turn) => {
+                self.radio_title();
+                turn
+            }
             Err(e) => {
                 // The App started its turn on submit: end it (this one, the rejected turn: no other turn's end).
                 self.emit(system(e.to_string(), true));
@@ -1531,6 +1555,7 @@ impl Bridge {
         }
         self.emit(UiEvent::Clear);
         self.emit(UiEvent::Welcome(self.welcome()));
+        self.radio_title();
         self.show_hooks();
         self.report_session().await;
     }
@@ -1602,7 +1627,19 @@ impl Bridge {
             CommandAction::MeshWake { on } => {
                 let status = commands::mesh_wake_status(&Config { mesh_wake: on, ..config.clone() });
                 self.save_config(self.with_file(|f| f.mesh_wake = Some(on)), format!("Mesh wake {status}."));
+                if let Some(radio) = self.radio() {
+                    radio.set_wake(on);
+                }
             }
+            CommandAction::Radio { on } => self.turn_radio(on).await,
+            CommandAction::RadioView => match self.radio() {
+                Some(radio) if radio.is_on() => self.emit(UiEvent::OpenRadio),
+                Some(_) => self.emit(system(commands::RADIO_OFF, false)),
+                None => self.emit(system(
+                    "This Marv isn't on the mesh (no XDG_RUNTIME_DIR, or its door didn't open), so it isn't on the radio.",
+                    false,
+                )),
+            },
             CommandAction::Undo => self.undo(),
             CommandAction::Steps { every } => {
                 let saved = self.with_file(|f| f.max_steps = Some(MaxStepsSetting::Every(every)));
@@ -1725,6 +1762,102 @@ impl Bridge {
                 self.forward(turn);
             }
             Ok(None) | Err(_) => self.finished(false),
+        }
+    }
+
+    // ---- The mesh radio (marv-rs #124, phase 1: presence) ----
+
+    fn radio(&self) -> Option<Arc<Radio>> {
+        self.radio.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// This Marv's radio, its door open: presence follows the session (state, title, wake), the strip follows the
+    /// roster, and it joins now if the user's own config has it on. Only the TUI has one: `marv -p` is never on it.
+    pub fn set_radio(self: &Arc<Self>, radio: Arc<Radio>) {
+        let config = self.config();
+        radio.set_titles(config.radio_titles);
+        radio.set_wake(config.mesh_wake);
+        *self.radio.lock().unwrap_or_else(|e| e.into_inner()) = Some(radio.clone());
+        *self.activity.radio.lock().unwrap_or_else(|e| e.into_inner()) = Some(radio.clone());
+        self.radio_title();
+        self.activity.report();
+        let (me, stop) = (Arc::downgrade(self), self.mesh_watch.clone());
+        let mut changes = radio.subscribe();
+        tokio::spawn(async move {
+            loop {
+                if let Some(bridge) = me.upgrade() {
+                    bridge.emit(UiEvent::Radio(bridge.radio_view()));
+                }
+                tokio::select! {
+                    _ = stop.cancelled() => return,
+                    changed = changes.changed() => if changed.is_err() { return },
+                }
+            }
+        });
+        if config.mesh_radio {
+            tokio::spawn(async move { radio.turn_on().await });
+        }
+    }
+
+    /// The radio as the strip and `/radio` show it.
+    fn radio_view(&self) -> view::RadioView {
+        let Some(radio) = self.radio().filter(|r| r.is_on()) else { return view::RadioView::default() };
+        let peers = radio
+            .roster()
+            .into_iter()
+            .map(|e| view::RadioPeer {
+                name: e.name,
+                state: match e.state {
+                    RosterState::Idle => view::RadioState::Idle,
+                    RosterState::Working => view::RadioState::Working,
+                    RosterState::Waiting => view::RadioState::Waiting,
+                    RosterState::Silent => view::RadioState::Silent,
+                    RosterState::Left => view::RadioState::Left,
+                    RosterState::Lost => view::RadioState::Lost,
+                },
+                title: e.title,
+                project: e.project,
+                pane: e.pane,
+                since_ms: e.since_ms,
+            })
+            .collect();
+        view::RadioView { on: true, me: radio.name.clone(), my_title: radio.presence().title, peers }
+    }
+
+    /// Presence's title: the conversation's first user message (empty for a new one), never anything else.
+    fn radio_title(&self) {
+        if let Some(radio) = self.radio() {
+            radio.set_title(&self.session.first_message());
+        }
+    }
+
+    /// `/radio on|off`: saved in the user's own config, and joined or left at once.
+    async fn turn_radio(self: &Arc<Self>, on: bool) {
+        let titles = self.file().and_then(|f| f.mesh_radio).is_none_or(|r| r.titles);
+        let notice = match (on, self.radio()) {
+            (true, Some(_)) => "Radio on: your other Marvs here with the radio on show in the strip above the prompt \
+                 (/radio lists them). They see this Marv's state and conversation title; nothing reaches a model."
+                .to_string(),
+            (true, None) => "Radio on, saved. This Marv isn't on the mesh (no XDG_RUNTIME_DIR, or its door didn't open), \
+                 so it joins from the next start."
+                .to_string(),
+            (false, _) => "Radio off: this Marv left it.".to_string(),
+        };
+        self.save_config(self.with_file(|f| f.mesh_radio = Some(RadioSetting { on, titles })), notice);
+        let Some(radio) = self.radio() else { return };
+        if on {
+            radio.set_titles(titles);
+            radio.turn_on().await;
+        } else {
+            radio.turn_off().await;
+        }
+        self.emit(UiEvent::Radio(self.radio_view()));
+    }
+
+    /// Leaves the radio on the way out: a `left` to every link (bounded), so the others don't wait for a timeout.
+    pub async fn leave_radio(&self) {
+        if let Some(radio) = self.radio().filter(|r| r.is_on()) {
+            radio.turn_off().await;
         }
     }
 
@@ -2364,6 +2497,8 @@ pub async fn run(resume: Option<bool>, approve: Vec<String>) -> anyhow::Result<i
         mesh_note = Some(match mesh.open_door(Arc::new(person)) {
             Ok(()) => {
                 bridge.set_mesh_name(&mesh.name);
+                // The radio (#124): there whenever the door is, on only if the user's own config (or /radio on) says.
+                bridge.set_radio(mesh.start_radio(bridge.config().mesh_wake));
                 (
                     format!(
                         "On the mesh as {} (marv mesh ls; others reach you at peer.{}.agent.parent.inbox).",
@@ -2417,7 +2552,9 @@ pub async fn run(resume: Option<bool>, approve: Vec<String>) -> anyhow::Result<i
     if let Some(herdr) = herdr {
         let _ = tokio::time::timeout(HERDR_RELEASE_TIMEOUT, herdr.release()).await;
     }
-    // Off the mesh: the door's socket goes, and the plugs' with the switchboard.
+    // Off the radio with a goodbye (bounded), then off the mesh: the door's socket goes, and the plugs' with the
+    // switchboard.
+    bridge.leave_radio().await;
     drop(mesh);
     result?;
     Ok(0)
