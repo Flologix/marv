@@ -37,7 +37,7 @@ Marv is written in Rust and ships as one static binary. Nothing else runs it: no
 ## Requirements
 
 - Linux on x86_64 or aarch64. **On Windows, use [WSL](https://learn.microsoft.com/windows/wsl/install)**: install Marv inside your WSL distribution (e.g. Ubuntu) and run `marv` there.
-- **No macOS build in 0.5.0.** The release has Linux binaries only, and the installer stops on macOS with a note.
+- **No macOS build in 0.6.0.** The release has Linux binaries only, and the installer stops on macOS with a note.
 - `bubblewrap` (`bwrap`) for the command sandbox (e.g. `sudo apt install bubblewrap`). Without it Marv still works, but every command asks first and warns that it runs unsandboxed, and what needs the sandbox is off: the typecheck after edits, the project's checks and the `process` tool.
 - `git`, for `/undo` and for subagents' worktrees.
 - One of:
@@ -62,7 +62,7 @@ Download `install.sh` to pass it options:
 
 ```sh
 sh install.sh --prefix /opt/marv       # into /opt/marv/bin instead of ~/.local/bin
-sh install.sh --version v0.5.0         # a given release instead of the latest
+sh install.sh --version v0.6.0         # a given release instead of the latest
 sh install.sh --from target/release/marv   # a binary you built yourself
 sh install.sh --uninstall              # remove it again
 ```
@@ -496,14 +496,14 @@ Read first: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) (the crates and how t
 ### Releasing
 
 1. Move `CHANGELOG.md`'s entries under the new version (patch for fixes, minor for features or anything breaking while below 1.0), and bump `version` under `[workspace.package]` in `Cargo.toml` to match (a version can only be published once).
-2. Tag and push: `git tag v0.5.0 && git push origin v0.5.0`. The release workflow (`.github/workflows/release.yml`) builds static musl binaries for x86_64 and aarch64, tests the installer and the npm packages against them, and creates the GitHub release with `marv-<target>.tar.gz`, `SHA256SUMS`, `install.sh` and the npm packages as `.tgz` files. Run it by hand (workflow_dispatch) for a dry run without the release.
+2. Tag and push: `git tag v0.6.0 && git push origin v0.6.0`. The release workflow (`.github/workflows/release.yml`) builds static musl binaries for x86_64 and aarch64, tests the installer and the npm packages against them, and creates the GitHub release with `marv-<target>.tar.gz`, `SHA256SUMS`, `install.sh` and the npm packages as `.tgz` files. Run it by hand (workflow_dispatch) for a dry run without the release.
 3. Publish the npm packages by hand (npm wants your 2FA), platform packages first, since the launcher names them:
 
 ```sh
-gh release download v0.5.0 -p 'flologixai-marv-*.tgz' -D npm
-npm publish npm/flologixai-marv-linux-x64-0.5.0.tgz --access public
-npm publish npm/flologixai-marv-linux-arm64-0.5.0.tgz --access public
-npm publish npm/flologixai-marv-0.5.0.tgz --access public
+gh release download v0.6.0 -p 'flologixai-marv-*.tgz' -D npm
+npm publish ./npm/flologixai-marv-linux-x64-0.6.0.tgz --access public
+npm publish ./npm/flologixai-marv-linux-arm64-0.6.0.tgz --access public
+npm publish ./npm/flologixai-marv-0.6.0.tgz --access public
 ```
 
 `packaging/npm/build.sh` builds those packages from the release's tarballs, if you need them again.
