@@ -16,8 +16,8 @@ The mesh gives sandboxed agents **deliberate, wired, auditable lines out**, with
   | Receptacle | What it is |
   |---|---|
   | `agent.<name>.inbox` | an agent's message inbox |
-  | `herdr.pane.<pane>.send` | sends a prompt to one Herdr agent pane (only when that agent is idle or done, so it can't answer an approval) |
-  | `herdr.pane.<pane>.status` | reads one Herdr pane's status |
+  | `herdr.pane.<pane>.send` | types a prompt (`{"text": "..."}`, nothing else) into one Herdr agent pane (only when that agent is idle or done, so it can't answer an approval). For a pane running a Marv that's on the mesh, `mesh_list` points to that Marv's inbox instead: it can answer. |
+  | `herdr.pane.<pane>.status` | reads one Herdr pane: its agent's state and, with `lines: N`, the pane's last N lines |
   | `github.read` | the Marv #47 door |
   | `process.<name>` | a background dev server (Marv #51) |
   | `mesh.remote.<service>` | anything published on an AgentMesh network |

@@ -560,7 +560,7 @@ impl Service for PeerLink {
         let socket = socket.ok_or_else(|| MeshError::Io(format!("the Marv \"{}\" hasn't approved this wire", self.session)))?;
         let mut client = PlugClient::connect(&socket).await?;
         match envelope.mode {
-            WireMode::Send => client.send(&self.remote, &envelope.text()).await.map(|()| None),
+            WireMode::Send => client.send(&self.remote, envelope.send_text()?).await.map(|()| None),
             WireMode::Call => client.call(&self.remote, envelope.body.clone()).await.map(|answer| Some(Value::String(answer))),
             WireMode::Watch => Err(MeshError::NotServed { receptacle: envelope.receptacle.to_string(), mode: envelope.mode }),
         }

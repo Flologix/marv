@@ -8,8 +8,9 @@
 //!
 //! 1. the receptacle exists and supports the mode;
 //! 2. a wire allows it ([`WireTable::allows`]: default deny, by name only);
-//! 3. the message fits the wire's size limit (refused, never cut);
-//! 4. the wire's rate limit has a token.
+//! 3. a message that must be text (a `send`, a Herdr pane's `.send`) is a JSON string or `{"text": "…"}` (#123);
+//! 4. the message fits the wire's size limit (refused, never cut);
+//! 5. the wire's rate limit has a token.
 //!
 //! The sender is the plug whose socket the message arrived on: identity comes
 //! from the connection, never from the message.
@@ -52,7 +53,7 @@ use tokio_util::sync::CancellationToken;
 use crate::MeshError;
 use crate::approval::WireRequest;
 use crate::limits::{DEFAULT_INBOX_DEPTH, RateLimiter};
-use crate::message::Envelope;
+use crate::message::{Envelope, bad_text_body, text_body};
 use crate::plug::{MODE_META, MODES_META, Plug, PlugId, Reachable};
 use crate::receptacle::{Receptacle, ReceptacleKind, ReceptacleName};
 use crate::wire::{Approver, Wire, WireMode, WireTable};
@@ -639,6 +640,15 @@ impl Drop for Switchboard {
     }
 }
 
+/// Whether a message must be text (#123): every `send` (an inbox, another Marv's inbox) and a Herdr pane's `.send`,
+/// whose text is typed into the pane. Their text is a JSON string or `{"text": "…"}`; anything else is refused here,
+/// before it's queued, forwarded or typed, never passed on as JSON.
+fn takes_text(r: &Receptacle, e: &Envelope) -> bool {
+    e.mode == WireMode::Send
+        || (r.kind == ReceptacleKind::HerdrPane
+            && crate::herdr::parse_pane_receptacle(&e.receptacle).is_some_and(|(_, a)| a == crate::herdr::PaneAction::Send))
+}
+
 impl Board {
     fn check(&mut self, e: &Envelope) -> crate::Result<()> {
         let r = self.receptacles.get(&e.receptacle).ok_or_else(|| MeshError::NoReceptacle(e.receptacle.to_string()))?;
@@ -650,6 +660,9 @@ impl Board {
             && r.owner.as_ref().and_then(|o| self.inboxes.get(o)).is_some_and(|q| q.len() >= DEFAULT_INBOX_DEPTH);
         let wire = self.table.check(&e.sender, &e.receptacle, e.mode)?;
         let limits = wire.limits;
+        if takes_text(r, e) && text_body(&e.body).is_none() {
+            return Err(bad_text_body(e.receptacle.as_str()));
+        }
         limits.check_size(e.receptacle.as_str(), e.size)?;
         if full {
             return Err(MeshError::InboxFull(e.receptacle.to_string()));
@@ -847,6 +860,21 @@ pub(crate) mod tests {
         assert!(sb.unread(&id("nobody")).is_empty());
     }
 
+    /// #123: an inbox send is text. Anything else is refused at admission (logged), never queued as JSON.
+    #[tokio::test]
+    async fn an_inbox_send_that_isnt_text_is_refused_not_queued() {
+        let (sb, log, _rt) = board();
+        let sb = Arc::new(sb);
+        let inbox = ReceptacleName::inbox(&id("parent"));
+        sb.wire(tui("worker-1", &inbox)).unwrap();
+        let err = sb.deliver(&id("worker-1"), inbox.as_str(), WireMode::Send, json!({"prompt": "go"})).await.unwrap_err();
+        assert!(err.to_string().contains(r#"expected {"text": "..."}"#), "{err}");
+        assert!(matches!(log.0.lock().unwrap().last().unwrap().outcome, Outcome::Refused { .. }));
+        assert!(sb.drain_inbox(&id("parent")).is_empty());
+        sb.deliver(&id("worker-1"), inbox.as_str(), WireMode::Send, json!({"text": "go"})).await.unwrap();
+        assert_eq!(sb.drain_inbox(&id("parent"))[0].text(), "go");
+    }
+
     #[tokio::test]
     async fn a_full_inbox_keeps_the_oldest_and_refuses_new_ones() {
         let (sb, log, _rt) = board();
@@ -856,7 +884,7 @@ pub(crate) mod tests {
         w.limits.burst = 1000;
         sb.wire(w).unwrap();
         for i in 0..DEFAULT_INBOX_DEPTH {
-            sb.deliver(&id("worker-1"), inbox.as_str(), WireMode::Send, Value::from(i)).await.unwrap();
+            sb.deliver(&id("worker-1"), inbox.as_str(), WireMode::Send, Value::from(i.to_string())).await.unwrap();
         }
         let err = sb.deliver(&id("worker-1"), inbox.as_str(), WireMode::Send, Value::from("late")).await.unwrap_err();
         assert!(matches!(err, MeshError::InboxFull(_)));

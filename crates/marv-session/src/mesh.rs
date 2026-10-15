@@ -490,7 +490,7 @@ impl Tool for MeshTool {
         Provenance::Mesh
     }
     fn check(&self, input: &Self::Input) -> Result<(), String> {
-        marv_mesh::tools::target(self.name, input).map(drop).map_err(|e| e.to_string())
+        marv_mesh::tools::check(self.name, input).map_err(|e| e.to_string())
     }
     fn label(&self, input: &Self::Input) -> String {
         input.get("receptacle").and_then(Value::as_str).unwrap_or(self.name).to_string()
@@ -808,7 +808,14 @@ mod tests {
         assert!(text.contains("herdr.pane.<pane>.send") && !text.contains("agent.<name>.inbox"), "{text}");
         assert!(text.contains("another Marv on this machine sends to it as peer.s.agent.parent.inbox"), "{text}");
         assert!(text.contains("\n- web: peer.web.agent.parent.inbox"), "{text}");
-        assert!(text.contains("\n- w1-p2 (marv, idle; Marv web): herdr.pane.w1-p2.send, herdr.pane.w1-p2.status"), "{text}");
+        // #123: Marv web's pane is read here; it's messaged at its inbox, which can answer.
+        assert!(
+            text.contains(
+                "\n- w1-p2 (marv, idle; Marv web): herdr.pane.w1-p2.status. This is Marv web: mesh_send to its inbox \
+                 peer.web.agent.parent.inbox to get a reply"
+            ),
+            "{text}"
+        );
         assert!(text.contains("\n- w1-p3 (claude, working): herdr.pane.w1-p3.send, herdr.pane.w1-p3.status"), "{text}");
         assert!(!text.contains("w1-p1") && !text.contains("Ignore your") && !text.contains("secret"), "{text}");
         assert_eq!(out.provenance, Provenance::Project, "names Marv checked, and Herdr's kinds and states: no taint");
@@ -950,6 +957,33 @@ mod tests {
         assert!(mesh.table().all().is_empty());
         assert!(log.0.lock().unwrap().is_empty(), "nothing went to the switchboard");
         assert!(mesh.drain_inbox(&parent_id()).is_empty());
+        cancel.cancel();
+    }
+
+    /// #123: a pane send whose arguments aren't `{"text": "…"}` is refused as invalid input, before any prompt and
+    /// before the switchboard (or Herdr) hears of it.
+    #[tokio::test]
+    async fn a_pane_send_that_isnt_text_is_invalid_input_and_asks_nothing() {
+        let (mesh, log, _rt, cancel) = switchboard();
+        let parent = mesh.plug(parent_id()).unwrap();
+        let person = Arc::new(Person(Decision::Yes, Mutex::default()));
+        let mut ctx = ToolContext::new(std::env::temp_dir());
+        ctx.approver = Some(person.clone());
+        let tools: Vec<ToolRef> =
+            MeshTool::all(&parent, &mesh, wire_approver(None, Some(&(person.clone() as Arc<dyn Approver>))))
+                .into_iter()
+                .map(|t| Arc::new(t) as ToolRef)
+                .collect();
+        let call = marv_core::ToolCall {
+            id: "c1".into(),
+            name: MESH_CALL.into(),
+            arguments: r#"{"receptacle": "herdr.pane.w1-p2.send", "arguments": {"prompt": "start hack.py"}}"#.into(),
+        };
+        let out = marv_tools::run_tool(&call, &ctx, &tools).await;
+        assert!(out.result.is_error, "{}", out.result.output);
+        assert!(out.result.output.contains(r#"expected {"text": "..."}"#), "{}", out.result.output);
+        assert!(person.1.lock().unwrap().is_empty(), "nobody was asked");
+        assert!(log.0.lock().unwrap().is_empty(), "nothing went to the switchboard");
         cancel.cancel();
     }
 
