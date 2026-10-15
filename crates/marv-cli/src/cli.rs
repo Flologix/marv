@@ -239,6 +239,15 @@ mod tests {
         assert_eq!(parse(&["__relay", "{}"]).mode(), Mode::Relay { spec: "{}".into() });
     }
 
+    /// #124: the radio is the user's own config (or `/radio on`) only: no flag turns it on, so nothing that starts Marv
+    /// for them (a script, a project's tooling) can.
+    #[test]
+    fn no_flag_turns_the_radio_on() {
+        for args in [&["--radio"][..], &["--radio", "on"], &["--mesh-radio"], &["-p", "x", "--radio"]] {
+            assert!(Cli::try_parse_from(std::iter::once("marv").chain(args.iter().copied())).is_err(), "{args:?}");
+        }
+    }
+
     #[test]
     fn headless_flags() {
         let cli = parse(&[

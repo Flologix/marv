@@ -204,7 +204,7 @@ fn two_marvs_exchange_messages_over_wires_both_ends_approved() {
     let mut reap = Reap(vec![beta]);
     wait_for("beta on the mesh", || socket(&machine, "beta").exists());
     let listed = ls(&machine);
-    assert!(listed.starts_with("beta  pane -  agents parent  "), "{listed}");
+    assert!(listed.starts_with("beta  radio off  pane -  agents parent  "), "{listed}");
     assert!(listed.contains("(peer.beta.agent.parent.inbox)"), "{listed}");
 
     let alpha = machine.marv(

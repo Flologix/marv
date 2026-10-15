@@ -6,6 +6,10 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+### Added
+
+- **The mesh radio, phase 1: presence (#124). Opt-in, off by default.** With `/radio on` (or `"mesh": {"radio": true}` in your own `~/.marv/config.json`), your Marvs on one machine show each other in one line above the prompt: name, idle, working or waiting for its user, and the conversation's title. `/radio` lists them with their panes and how long each state has lasted; `/radio off` leaves. `"mesh": {"radio": {"titles": false}}` keeps the title out. Presence is drawn in the TUI only: no other Marv's words reach a model, and `mesh_list`'s new "On the radio" section gives the model names and states only, without tainting the conversation. A Marv that stops answering shows `silent` after 45 s and drops after 120 s; one that was killed shows `left (lost)` and its socket is removed. `marv mesh ls` has a `radio` column. Links are private Unix sockets, each end checked by its process id; sandboxed commands can't see them. A project's `.marv/config.json` that sets `mesh` (the radio or wake) is ignored with a startup note; there's no flag or environment variable for it, and `marv -p` and subagents are never on the radio. Sending messages and requests on the radio come in later phases.
+
 ### Fixed
 
 - **`herdr.pane.*.send` types prompts only: text starting with `/`, `!` or `#` is refused.** A pane send is a prompt, not a command: what's typed into another agent's pane goes to that agent as a request, never to its own commands (a slash command, a shell line, a memory note). After control characters and the ends are cleaned up, a send whose first visible character is `/`, `!` or `#` is refused whole, with "herdr.pane.send types a prompt, not a command: text starting with / ! or # is refused; nothing was typed". `mesh_call` checks it first, so it doesn't ask the user to wire anything; the `.send` description says so. Those characters later in a prompt are typed as before.

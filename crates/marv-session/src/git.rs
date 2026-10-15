@@ -73,9 +73,25 @@ pub struct GitAsyncResult {
     pub timed_out: bool,
 }
 
+/// Kills a git's whole process group when it's dropped before git finished: a timeout, a stop, or Marv exiting with
+/// the task still running (the runtime drops it). Killing git alone left what it started running: `git gc`'s
+/// `git repack` went on writing into the checkpoint git dir after Marv had gone, and recreated a removed folder.
+struct GitGroup {
+    pgid: Option<nix::unistd::Pid>,
+}
+
+impl Drop for GitGroup {
+    fn drop(&mut self) {
+        if let Some(pgid) = self.pgid {
+            let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
+        }
+    }
+}
+
 /// Marv's `runGitAsync` (checkpoints): `run_git`'s rules (no hooks or fsmonitor, no inherited `GIT_*`, no stdin but
 /// Marv's own `input`, a timeout), and a stop kills it too. A git that's killed isn't waited for: a child it started
-/// (an alias, a filter) may hold its pipes open.
+/// (an alias, a filter) may hold its pipes open. git runs in a process group of its own, killed whole when git is
+/// ([`GitGroup`]), so nothing it started outlives it.
 pub async fn run_git_async(cwd: &Path, args: &[&str], options: GitOptions<'_>) -> GitAsyncResult {
     let killed = GitAsyncResult { ok: false, out: String::new(), bytes: Vec::new(), timed_out: false };
     if options.cancel.is_some_and(|c| c.is_cancelled()) {
@@ -93,11 +109,13 @@ pub async fn run_git_async(cwd: &Path, args: &[&str], options: GitOptions<'_>) -
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true) // a timeout or a stop drops the child: SIGKILL, and its pipes aren't waited for
+        .process_group(0)
         .spawn();
     let mut child = match spawned {
         Ok(child) => child,
         Err(err) => return GitAsyncResult { out: err.to_string(), ..killed },
     };
+    let mut group = GitGroup { pgid: child.id().map(|pid| nix::unistd::Pid::from_raw(pid as i32)) };
     // Written beside the reads: a large input and a large output would otherwise wait for each other.
     if let (Some(input), Some(mut stdin)) = (options.input, child.stdin.take()) {
         let input = input.to_vec();
@@ -112,6 +130,8 @@ pub async fn run_git_async(cwd: &Path, args: &[&str], options: GitOptions<'_>) -
         output = child.wait_with_output() => match output {
             Err(err) => GitAsyncResult { out: err.to_string(), ..killed },
             Ok(output) => {
+                // git exited (and was reaped): its group is gone or no longer its own to kill.
+                group.pgid = None;
                 let ok = output.status.success();
                 let out = String::from_utf8_lossy(if ok { &output.stdout } else { &output.stderr }).into_owned();
                 GitAsyncResult { ok, out, bytes: output.stdout, timed_out: false }
@@ -147,6 +167,26 @@ mod tests {
         let r = run_git(&dir, &["--version"], &[], GIT_TIMEOUT).await;
         // git may be missing on a build machine: then it's an error result, never a panic.
         assert!(!r.timed_out);
+    }
+
+    /// What git started dies with it: a `git` dropped mid-run (Marv exiting with a checkpoint's `git gc` still going)
+    /// left `gc`'s `git repack` writing into a folder after it was removed.
+    #[tokio::test]
+    async fn a_git_stopped_midway_takes_what_it_started_with_it() {
+        let dir = Temp::new("git-group");
+        let marker = dir.0.join("written-after-git-stopped");
+        let alias = format!("alias.later=!sleep 0.4; touch '{}'", marker.display());
+        let args = ["-c", alias.as_str(), "later"];
+        // Dropped from outside (the runtime going away), and stopped by its own timeout.
+        let dropped = tokio::time::timeout(Duration::from_millis(100), run_git_async(&dir.0, &args, GitOptions::default()));
+        assert!(dropped.await.is_err());
+        let timed = run_git_async(&dir.0, &args, GitOptions { timeout: Duration::from_millis(100), ..Default::default() }).await;
+        assert!(timed.timed_out);
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert!(!marker.exists(), "a child of a stopped git ran on");
+        // Left to finish, it does.
+        assert!(run_git_async(&dir.0, &args, GitOptions::default()).await.ok);
+        assert!(marker.exists());
     }
 
     // Ports tests/git.test.ts (runGitAsync).

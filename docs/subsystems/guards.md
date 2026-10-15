@@ -46,6 +46,16 @@ Each guard's doc comment says how it was proven: the guard was reverted, and the
 | Approvals show the full payload | `provenance.rs::approvals_show_the_full_payload` | Proven |
 | A network approval lists scripts written this session | `provenance.rs::a_network_approval_lists_the_scripts_it_runs` | Ignored: not built yet |
 | A mesh message that wakes an idle Marv is fenced and taints; its turn's egress asks (#78) | `mesh.rs::a_woken_turn_reads_its_message_fenced_and_tainted_and_egress_asks` | Proven |
+| Radio (#124): a project's config can't turn it (or wake) on; the startup note | `radio.rs::a_projects_config_cant_turn_the_radio_on` | Proven |
+| Radio: off unless the user's own config turns it on (no env variable, no flag) | `radio.rs::the_radio_is_off_unless_the_users_config_turns_it_on` (+ `marv-cli`'s `cli::tests::no_flag_turns_the_radio_on`) | Proven |
+| Radio: a Marv with it off refuses joins and sends no presence | `radio.rs::a_marv_with_the_radio_off_refuses_joins_and_sends_no_presence` | Proven |
+| Radio: a join from a process that isn't the named Marv is refused (pid) | `radio.rs::a_join_from_a_process_that_isnt_the_named_marv_is_refused` | Proven (python3 for the other process) |
+| Radio: a frame that names its own sender is refused (the sender is the link) | `radio.rs::a_frame_that_names_its_own_sender_is_refused` | Proven (two reverts) |
+| Radio: presence has exactly the listed fields | `radio.rs::presence_has_exactly_the_listed_fields` | Proven (two reverts) |
+| Radio: presence never reaches a model and doesn't taint | `radio.rs::presence_never_reaches_a_model_and_doesnt_taint` | Proven (two reverts) |
+| Radio: sandboxed commands can't see it | `radio.rs::sandboxed_commands_cant_see_the_radio` | Proven (real bwrap) |
+| Radio: a killed peer shows lost and its socket is swept | `radio.rs::a_killed_peer_shows_lost_and_its_socket_is_swept` | Proven (two reverts; the peer is this test binary run again) |
+| Radio: a silent peer greys, then drops | `radio.rs::a_silent_peer_greys_then_drops` | Proven (two reverts) |
 | Subagents don't inherit network/web/mesh approvals | `provenance.rs::subagents_inherit_taint_but_no_egress_approvals` | Proven |
 | … the config's pre-approved scopes too (#98) | `approvals.rs::subagents_dont_inherit_config_scopes` | Proven |
 | Pre-approved scopes answer their own scopes (#98) | `approvals.rs::config_approve_answers_its_scopes_without_asking` | Proven (session level) |

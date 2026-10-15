@@ -600,8 +600,61 @@ pub enum UiEvent {
     Flash(String),
     /// Work outside a turn started or stopped (`/mcp add`'s lookup...): shows the waiting line.
     Busy(Option<String>),
+    /// marv-rs #124: the mesh radio changed (on or off, who's on it): the strip above the prompt.
+    Radio(RadioView),
+    /// `/radio` with the radio on: the roster view, until Esc.
+    OpenRadio,
     /// `/exit`, or the engine is going away.
     Exit,
+}
+
+/// The mesh radio as the TUI shows it (marv-rs #124). Names are checked mesh names; titles and projects are another
+/// Marv's user's words, drawn through `printable()` and never sent anywhere.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RadioView {
+    pub on: bool,
+    /// This Marv's mesh name.
+    pub me: String,
+    /// This Marv's own title, as it goes out (empty with titles off).
+    pub my_title: String,
+    pub peers: Vec<RadioPeer>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RadioPeer {
+    pub name: String,
+    pub state: RadioState,
+    pub title: String,
+    pub project: String,
+    pub pane: Option<String>,
+    /// When its state began.
+    pub since_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RadioState {
+    Idle,
+    Working,
+    Waiting,
+    /// No heartbeat for 45 s: greyed.
+    Silent,
+    /// Left a moment ago (shown for 10 s).
+    Left,
+    /// Its link ended without a leave: crashed or killed.
+    Lost,
+}
+
+impl RadioState {
+    pub fn word(self) -> &'static str {
+        match self {
+            RadioState::Idle => "idle",
+            RadioState::Working => "working",
+            RadioState::Waiting => "waiting",
+            RadioState::Silent => "silent",
+            RadioState::Left => "left",
+            RadioState::Lost => "left (lost)",
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
