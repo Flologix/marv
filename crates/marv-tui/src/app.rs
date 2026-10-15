@@ -2832,6 +2832,43 @@ mod tests {
         assert!(!h.frame().contains("◉ radio"));
     }
 
+    /// #124: a message received flashes on the strip for 10 s, once; the roster changing doesn't flash it again.
+    #[test]
+    fn a_radio_message_flashes_on_the_strip_for_a_while() {
+        use crate::view::{RadioPeer, RadioState, RadioTraffic};
+        let mut h = harness();
+        let peer = RadioPeer {
+            name: "proj-58a7".into(),
+            state: RadioState::Idle,
+            title: String::new(),
+            project: "proj".into(),
+            pane: None,
+            since_ms: 0,
+        };
+        let said = RadioTraffic {
+            at_ms: 0,
+            id: "proj-58a7:3".into(),
+            outgoing: false,
+            peers: vec!["proj-58a7".into()],
+            by: "model".into(),
+            text: "tests pass on main now".into(),
+            refused: None,
+        };
+        let view = |traffic: Vec<RadioTraffic>| RadioView {
+            on: true,
+            me: "proj-c792".into(),
+            my_title: String::new(),
+            peers: vec![peer.clone()],
+            traffic,
+        };
+        h.event(UiEvent::Radio(view(vec![said.clone()])));
+        assert!(h.frame().contains("◉ radio · ← 58a7: tests pass on main now"), "{}", h.frame());
+        h.advance(radio_view::FLASH_MS + 10);
+        assert!(h.frame().contains("◉ radio · 58a7 idle"), "{}", h.frame());
+        h.event(UiEvent::Radio(view(vec![said])));
+        assert!(!h.frame().contains("← 58a7"), "seen already: {}", h.frame());
+    }
+
     #[test]
     fn resume_picks_an_earlier_session() {
         let mut h = harness();
