@@ -81,8 +81,7 @@ fn a_wrong_binary_fails_with_a_diff() {
     std::fs::create_dir_all(&dir).unwrap();
     let bin = dir.join("marv");
     // Answers without asking the model, and leaves a file behind.
-    std::fs::write(&bin, "#!/bin/sh\necho '{\"type\":\"done\",\"reason\":\"end\"}'\necho stray > stray.txt\nexit 0\n").unwrap();
-    std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    write_executable(&bin, "#!/bin/sh\necho '{\"type\":\"done\",\"reason\":\"end\"}'\necho stray > stray.txt\nexit 0\n");
     let scenario = scenarios().into_iter().find(|s| s.name == "step-limit").unwrap();
     let verdict = marv_oracle::check(&scenario, &bin, false, Target::MarvRs);
     std::fs::remove_dir_all(&dir).unwrap();
@@ -98,4 +97,17 @@ fn a_wrong_binary_fails_with_a_diff() {
             && text.contains("+{\"reason\":\"end\",\"type\":\"done\"}"),
         "{text}"
     );
+}
+
+/// Writes an executable script from a child `sh`, never from this process: a test thread here holding the write
+/// handle while another forks would make the first run fail with "Text file busy" (ETXTBSY, #92). The same helper
+/// as `marv_tools::github::fake::write_executable` (this crate doesn't depend on marv-tools).
+fn write_executable(path: &std::path::Path, contents: &str) {
+    let status = std::process::Command::new("sh")
+        .args(["-c", "printf '%s' \"$2\" > \"$1\" && chmod 755 \"$1\"", "sh"])
+        .arg(path)
+        .arg(contents)
+        .status()
+        .unwrap();
+    assert!(status.success(), "couldn't write {}: {status}", path.display());
 }

@@ -43,10 +43,11 @@ A recording is refused when the run timed out, left scripted replies unused or b
 
 ## How requests are compared
 Two checks, because the prompt cache needs each run's requests to be byte-stable, not marv-rs's bytes to equal Marv's:
-- **Against the recording, as canonical JSON.** `requests.jsonl` holds each body with its keys sorted and `cache_control` breakpoints (#56) taken out. A marked message (`[{"type":"text","text":…,"cache_control":…}]`) counts as its plain text. Key order and breakpoints are each implementation's business; every value must match.
-- **Against the run's own previous request, as bytes (the prefix rule, AGENTS.md "Prompt cache").** Every message of the previous request must be in the next one, at the same index, with the same bytes, and every other field (`model`, `tools`, …) must be byte-identical. Two things are exempt:
+- **Against the recording, as canonical JSON.** `requests.jsonl` holds each body with its keys sorted, `cache_control` breakpoints (#56) taken out, and the top-level `max_tokens` taken out (#112: marv-rs caps each reply; Marv's recordings have none). A marked message (`[{"type":"text","text":…,"cache_control":…}]`) counts as its plain text. Key order and breakpoints are each implementation's business; every value must match.
+- **Against the run's own previous request, as bytes (the prefix rule, AGENTS.md "Prompt cache").** Every message of the previous request must be in the next one, at the same index, with the same bytes, and every other field (`model`, `tools`, …) must be byte-identical. Three things are exempt:
   - `cache_control` markers, which move to the last message on purpose;
-  - `tool_choice`: the wrap-up reply at the step limit sends `"none"` (#59).
+  - `tool_choice`: the wrap-up reply at the step limit sends `"none"` (#59);
+  - `max_tokens`: it follows the room left in the window and goes when there's none (#116); an output cap isn't part of the cached prompt.
 
   A compaction starts the cache over on purpose: `run.json` `prefix_resets` names the request after it.
 
@@ -105,7 +106,7 @@ The loop's edge cases:
 | `dropped-stream` | a stream that closes early is retried from scratch, after the 1 s backoff |
 | `rate-limited` | an HTTP 429 with `Retry-After: 1` is retried after that wait |
 | `mid-turn-compaction` | a step past 85% of the context window triggers a summary request (same prefix), then the turn goes on from the summary |
-| `worktree-subagent` | an `agent` call with `isolation: "worktree"` (#12): the subagent edits its worktree's copy, Marv commits for it (`marv: <description>`), the main checkout is untouched, and `git log --all` shows the commit. Requests 2–3 are the subagent's own conversation (`prefix_resets` 2 and 4) |
+| `worktree-subagent` | an `agent` call with `isolation: "worktree"` (#12): the subagent edits its worktree's copy, Marv commits for it (`marv: <description>`), the main checkout is untouched, and `git log --branches` plus `git log --glob=refs/marv` show the commits (two single-line histories, so same-second commits can't swap order). Requests 2–3 are the subagent's own conversation (`prefix_resets` 2 and 4) |
 
 ## Still to write
 - Every guard in `docs/SECURITY.md` (#8).

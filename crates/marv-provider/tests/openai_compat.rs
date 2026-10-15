@@ -517,15 +517,19 @@ async fn max_tokens_is_sent_and_left_out_for_good_when_the_provider_refuses_the_
     assert_eq!(server.last().json().get("max_tokens"), None);
 }
 
+/// OpenRouter's wording when the prompt plus the requested output don't fit the window.
+const WINDOW_REFUSAL: &str = "This endpoint's maximum context length is 131072 tokens. However, you requested about 140000 tokens (108000 of text input, 32000 in the output).";
+
+/// #116: what's left of OpenRouter's 131072-token window beside a 108000-token prompt, less the 5% headroom.
+const LEFT: u64 = 131_072 - 113_400;
+
 #[tokio::test]
-async fn a_prompt_too_big_to_fit_beside_max_tokens_is_sent_without_it_this_time_only() {
-    // OpenRouter's wording when the prompt plus the requested output don't fit the window.
-    let refusal = "This endpoint's maximum context length is 131072 tokens. However, you requested about 140000 tokens (108000 of text input, 32000 in the output).";
+async fn a_prompt_too_big_to_fit_beside_max_tokens_is_resent_with_what_is_left_and_later_requests_keep_that_cap() {
     let first = Arc::new(AtomicUsize::new(0));
     let seen = first.clone();
     let server = FakeServer::start(move |r| {
         if r.json().get("max_tokens").is_some() && seen.fetch_add(1, Ordering::SeqCst) == 0 {
-            Reply::json(400, json!({"error": {"message": refusal}}))
+            Reply::json(400, json!({"error": {"message": WINDOW_REFUSAL}}))
         } else {
             Reply::sse(&[delta("ok"), stop(), done()])
         }
@@ -534,9 +538,155 @@ async fn a_prompt_too_big_to_fit_beside_max_tokens_is_sent_without_it_this_time_
     let provider = capped(&v1(&server), Some(32_000));
     let events = collect(provider.stream(&hi(), StreamOptions::default())).await;
     assert!(events.contains(&text("ok")));
+    assert!(retries(&events).is_empty(), "not a connection retry");
+    assert_eq!(provider.room().window, Some(131_072), "the window the refusal named is kept");
+    // The next step fits its cap beside the prompt at once: no refusal, and never uncapped.
     collect(provider.stream(&hi(), StreamOptions::default())).await;
     let sent: Vec<_> = server.requests().iter().map(|r| r.json().get("max_tokens").cloned()).collect();
-    assert_eq!(sent, [Some(json!(32_000)), None, Some(json!(32_000))]);
+    assert_eq!(sent, [Some(json!(32_000)), Some(json!(LEFT)), Some(json!(LEFT))]);
+}
+
+#[tokio::test]
+async fn when_the_fitted_cap_is_refused_too_the_request_goes_without_one() {
+    let server = FakeServer::start(|r| {
+        if r.json().get("max_tokens").is_some() {
+            Reply::json(400, json!({"error": {"message": WINDOW_REFUSAL}}))
+        } else {
+            Reply::sse(&[delta("ok"), stop(), done()])
+        }
+    })
+    .await;
+    let events = collect(capped(&v1(&server), Some(32_000)).stream(&hi(), StreamOptions::default())).await;
+    assert!(events.contains(&text("ok")));
+    let sent: Vec<_> = server.requests().iter().map(|r| r.json().get("max_tokens").cloned()).collect();
+    assert_eq!(sent, [Some(json!(32_000)), Some(json!(LEFT)), None]);
+}
+
+/// #116: a provider that knows the window (from the model list).
+fn windowed(base_url: &str, window: u64) -> OpenAiCompatProvider {
+    OpenAiCompatProvider::new(OpenAiCompatOptions { context_length: Some(window), ..capped(base_url, Some(32_000)).options })
+}
+
+#[tokio::test]
+async fn near_a_full_window_a_step_sends_one_request_with_a_smaller_cap() {
+    // Like OpenRouter: the prompt is 30000 tokens and the window 50000, so more than 20000 in the output is refused.
+    const PROMPT: u64 = 30_000;
+    const WINDOW: u64 = 50_000;
+    let server = FakeServer::start(|r| {
+        let max = r.json().get("max_tokens").and_then(Value::as_u64);
+        if max.is_some_and(|max| PROMPT + max > WINDOW) {
+            let message = format!(
+                "This endpoint's maximum context length is {WINDOW} tokens. However, you requested about {} tokens ({PROMPT} of text input, {} in the output).",
+                PROMPT + max.unwrap(),
+                max.unwrap()
+            );
+            return Reply::json(400, json!({"error": {"message": message}}));
+        }
+        Reply::sse(&[
+            delta("ok"),
+            stop(),
+            json!({"choices": [], "usage": {"prompt_tokens": PROMPT, "completion_tokens": 2}}),
+            done(),
+        ])
+    })
+    .await;
+    let provider = windowed(&v1(&server), WINDOW);
+    // The first step's prompt is estimated (4 characters a token): a short body leaves room for the whole 32000…
+    // but the server counts 30000 prompt tokens, so this one is refused and fitted once.
+    collect(provider.stream(&hi(), StreamOptions::default())).await;
+    let before = server.requests().len();
+    // From then on the measured prompt size clamps the cap: one request per step, capped.
+    for _ in 0..2 {
+        let events = collect(provider.stream(&hi(), StreamOptions::default())).await;
+        assert!(events.contains(&text("ok")), "{events:?}");
+    }
+    let later: Vec<_> = server.requests()[before..].iter().map(|r| r.json().get("max_tokens").and_then(Value::as_u64)).collect();
+    assert_eq!(later.len(), 2, "one request per step: {later:?}");
+    for max in later {
+        let max = max.expect("still capped");
+        assert!(max < WINDOW - PROMPT && max > 18_000, "{max}");
+    }
+}
+
+#[tokio::test]
+async fn a_reply_measures_the_prompt_so_the_next_cap_fits_before_any_refusal() {
+    // The reply says the prompt was 30000 tokens, in a 50000-token window: the next request asks for at most what's left.
+    let server = FakeServer::start(|_| {
+        Reply::sse(&[delta("ok"), stop(), json!({"choices": [], "usage": {"prompt_tokens": 30_000}}), done()])
+    })
+    .await;
+    let provider = windowed(&v1(&server), 50_000);
+    collect(provider.stream(&hi(), StreamOptions::default())).await;
+    collect(provider.stream(&hi(), StreamOptions::default())).await;
+    let sent: Vec<_> = server.requests().iter().map(|r| r.json().get("max_tokens").and_then(Value::as_u64)).collect();
+    assert_eq!(sent, [Some(32_000), Some(50_000 - 31_500)]);
+}
+
+/// #116: a fake OpenRouter that counts the prompt as `prompt` tokens in a `window`, refusing (with its wording) a
+/// `max_tokens` that doesn't fit beside it, and counting the refusals.
+fn strict(prompt: u64, window: u64, refusals: Arc<AtomicUsize>) -> impl Fn(&support::Request) -> Reply {
+    move |r| {
+        if let Some(max) = r.json().get("max_tokens").and_then(Value::as_u64).filter(|max| prompt + max > window) {
+            refusals.fetch_add(1, Ordering::SeqCst);
+            let message = format!(
+                "This endpoint's maximum context length is {window} tokens. However, you requested about {} tokens ({prompt} of text input, {max} in the output).",
+                prompt + max
+            );
+            return Reply::json(400, json!({"error": {"message": message}}));
+        }
+        Reply::sse(&[delta("ok"), stop(), json!({"choices": [], "usage": {"prompt_tokens": prompt}}), done()])
+    }
+}
+
+#[tokio::test]
+async fn a_window_too_full_for_the_floor_costs_at_most_one_refusal_then_none() {
+    // 500 tokens left: less than MIN_MAX_TOKENS, so no cap fits; the request goes without one.
+    let refusals = Arc::new(AtomicUsize::new(0));
+    let server = FakeServer::start(strict(49_500, 50_000, refusals.clone())).await;
+    let provider = windowed(&v1(&server), 50_000);
+    let events = collect(provider.stream(&hi(), StreamOptions::default())).await;
+    assert!(events.contains(&text("ok")), "{events:?}");
+    assert_eq!(refusals.load(Ordering::SeqCst), 1, "the first step's estimate was off once");
+    for _ in 0..2 {
+        let events = collect(provider.stream(&hi(), StreamOptions::default())).await;
+        assert!(events.contains(&text("ok")), "{events:?}");
+    }
+    assert_eq!(refusals.load(Ordering::SeqCst), 1, "later steps fit at once");
+    let sent: Vec<_> = server.requests().iter().map(|r| r.json().get("max_tokens").cloned()).collect();
+    assert_eq!(sent, [Some(json!(32_000)), None, None, None]);
+}
+
+#[tokio::test]
+async fn a_refit_with_no_room_left_beside_the_headroom_goes_without_a_cap() {
+    // The window is 50000 and the prompt 48000: 2000 left, but not with the 5% headroom, so no cap rather than a
+    // second refusal.
+    let refusals = Arc::new(AtomicUsize::new(0));
+    let server = FakeServer::start(strict(48_000, 50_000, refusals.clone())).await;
+    collect(windowed(&v1(&server), 50_000).stream(&hi(), StreamOptions::default())).await;
+    let sent: Vec<_> = server.requests().iter().map(|r| r.json().get("max_tokens").cloned()).collect();
+    assert_eq!(sent, [Some(json!(32_000)), None]);
+    assert_eq!(refusals.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_refit_never_resends_the_cap_that_was_refused() {
+    // A refusal whose numbers say the cap fits (some other limit): refitting would send the same 32000 again.
+    let message = "maximum context length is 200000 tokens. However, you requested about 140000 tokens (108000 of text input, 32000 in the output).";
+    let server = FakeServer::start(move |r| {
+        if r.json().get("max_tokens").is_some() {
+            Reply::json(400, json!({"error": {"message": message}}))
+        } else {
+            Reply::sse(&[delta("ok"), stop(), done()])
+        }
+    })
+    .await;
+    collect(capped(&v1(&server), Some(32_000)).stream(&hi(), StreamOptions::default())).await;
+    let sent: Vec<_> = server.requests().iter().map(|r| r.json().get("max_tokens").cloned()).collect();
+    assert_eq!(sent, [Some(json!(32_000)), None]);
+}
+
+#[tokio::test]
+async fn a_refusal_that_names_max_tokens_drops_it_for_that_request_only() {
     // A refusal that names the field but doesn't say it's unsupported drops it for that request only.
     let first = Arc::new(AtomicUsize::new(0));
     let seen = first.clone();

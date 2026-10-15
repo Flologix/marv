@@ -49,7 +49,7 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use futures::{FutureExt, StreamExt};
@@ -103,6 +103,59 @@ static UNSUPPORTED: LazyLock<regex::Regex> = LazyLock::new(|| {
         .unwrap()
 });
 
+/// #116: the least `max_tokens` a clamped request is sent with: below this a model can't finish even a short answer.
+/// When the room left is smaller, the request goes without `max_tokens` (a cap that small would only be refused).
+pub const MIN_MAX_TOKENS: u64 = 1024;
+/// #116: tokens per byte of request body assumed until a reply reports its prompt count: 4 characters a token, the
+/// estimate compaction uses. JSON escaping makes the body longer than the text, so it errs toward a smaller cap.
+pub const ASSUMED_TOKENS_PER_BYTE: f64 = 0.25;
+
+/// #116: OpenRouter's refusal when the prompt plus `max_tokens` don't fit: "maximum context length is 131072 tokens.
+/// However, you requested about 140000 tokens (108000 of text input, 32000 in the output)".
+static WINDOW_REFUSAL: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?is)context length is (\d+) tokens.*?requested about (\d+) tokens.*?(\d+) in the output").unwrap()
+});
+
+/// #116: what a refusal like [`WINDOW_REFUSAL`] says: the window, and how many tokens the prompt was.
+pub fn window_refusal(detail: &str) -> Option<(u64, u64)> {
+    let caps = WINDOW_REFUSAL.captures(detail)?;
+    let number = |i: usize| caps.get(i)?.as_str().parse::<u64>().ok();
+    let (window, total, output) = (number(1)?, number(2)?, number(3)?);
+    Some((window, total.checked_sub(output).filter(|&input| input > 0)?))
+}
+
+/// #116: what the adapter has learned about the room in the window, shared by every stream of this provider (the
+/// session and its subagents use the same one), so one refusal lowers the cap for the rest of the session.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Room {
+    /// The context window: from the model list, or from a refusal that said it.
+    pub window: Option<u64>,
+    /// The most prompt tokens per byte of request body measured so far (a reply's `prompt_tokens`, or a refusal's
+    /// "N of text input", over the body's size). The highest: a cached prefix never lowers it.
+    pub tokens_per_byte: Option<f64>,
+}
+
+impl Room {
+    /// Records a prompt count for a body of `bytes` bytes.
+    pub fn record(&mut self, prompt_tokens: u64, bytes: usize) {
+        if prompt_tokens > 0 && bytes > 0 {
+            let ratio = prompt_tokens as f64 / bytes as f64;
+            self.tokens_per_byte = Some(self.tokens_per_byte.map_or(ratio, |r| r.max(ratio)));
+        }
+    }
+
+    /// The `max_tokens` for a body of `bytes` bytes, given the model's limit `max`: at most the window minus the
+    /// prompt's estimate (+5% headroom). `None` (send none) when that room is under [`MIN_MAX_TOKENS`] (or `max`, if
+    /// smaller): such a cap wouldn't fit either, and a refusal costs a round trip. `max` when the window isn't known.
+    pub fn cap(&self, max: u64, bytes: usize) -> Option<u64> {
+        let Some(window) = self.window.filter(|&w| w > 0) else { return Some(max) };
+        let ratio = self.tokens_per_byte.unwrap_or(ASSUMED_TOKENS_PER_BYTE);
+        let prompt = (bytes as f64 * ratio * crate::ollama::PROMPT_MARGIN).ceil() as u64;
+        let room = window.saturating_sub(prompt);
+        (room >= MIN_MAX_TOKENS.min(max)).then(|| max.min(room))
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct OpenAiCompatOptions {
     /// Shown in the status bar.
@@ -125,8 +178,12 @@ pub struct OpenAiCompatOptions {
     /// 300 s read timeout applies.
     pub idle_timeout: Option<Duration>,
     /// #96: sent as `max_tokens`, so the provider ends a runaway reply ([`max_tokens_for`] for OpenRouter). `None`
-    /// sends nothing. A provider that refuses it gets the request again without it.
+    /// sends nothing. #116: clamped per request to the room the prompt leaves ([`Room::cap`]). A provider that refuses
+    /// it gets the request again with what its refusal says is left ([`window_refusal`]), or without it.
     pub max_tokens: Option<u64>,
+    /// #116: the model's context window (the model list's `context_length`), so `max_tokens` is clamped to the room
+    /// the prompt leaves. `None`: learned from the first refusal that says it.
+    pub context_length: Option<u64>,
 }
 
 /// Marv #56: models that cache only (or more reliably) with explicit breakpoints. One small table.
@@ -569,6 +626,8 @@ pub struct OpenAiCompatProvider {
     pub client: reqwest::Client,
     /// #96: the provider said it doesn't take `max_tokens`: later streams leave it out.
     max_tokens_refused: Arc<AtomicBool>,
+    /// #116: the room in the window, learned from replies and refusals.
+    room: Arc<Mutex<Room>>,
 }
 
 impl OpenAiCompatProvider {
@@ -579,7 +638,13 @@ impl OpenAiCompatProvider {
             .read_timeout(Duration::from_secs(300))
             .build()
             .unwrap_or_default();
-        Self { options, client, max_tokens_refused: Arc::default() }
+        let room = Room { window: options.context_length, tokens_per_byte: None };
+        Self { options, client, max_tokens_refused: Arc::default(), room: Arc::new(Mutex::new(room)) }
+    }
+
+    /// #116: what the provider has learned about the room in the window.
+    pub fn room(&self) -> Room {
+        *self.room.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -608,8 +673,8 @@ impl Provider for OpenAiCompatProvider {
         if self.max_tokens_refused.load(Ordering::Relaxed) {
             adapter.max_tokens = None;
         }
-        let refused = self.max_tokens_refused.clone();
-        channel_stream(move |emit| run(client, adapter, outgoing, refused, cancel, debug_raw, emit))
+        let shared = Shared { refused: self.max_tokens_refused.clone(), room: self.room.clone() };
+        channel_stream(move |emit| run(client, adapter, outgoing, shared, cancel, debug_raw, emit))
     }
 }
 
@@ -624,13 +689,40 @@ struct Outgoing {
 }
 
 impl Outgoing {
-    /// The body of the next attempt (#64: with the kept partial reply and the note, if any).
-    fn body(&mut self, options: &OpenAiCompatOptions, kept: &str) -> Vec<u8> {
+    /// The body of the next attempt (#64: with the kept partial reply and the note, if any). #116: `max_tokens` is
+    /// clamped to the room `room` says the prompt leaves (the body is built again only when that changes it). Also
+    /// returns the `max_tokens` sent.
+    fn body(&mut self, options: &OpenAiCompatOptions, room: Room, kept: &str) -> (Vec<u8>, Option<u64>) {
         let Self { history, system, tools, tool_choice, note } = self;
         with_continuation(history, *note, kept, |history| {
-            let body = request_body(options, history, system.as_deref(), tools, *tool_choice);
-            serde_json::to_vec(&body).expect("a request body is plain JSON")
+            let mut request = request_body(options, history, system.as_deref(), tools, *tool_choice);
+            let body = serde_json::to_vec(&request).expect("a request body is plain JSON");
+            let Some(max) = options.max_tokens else { return (body, None) };
+            let cap = room.cap(max, body.len());
+            if cap == Some(max) {
+                return (body, cap);
+            }
+            request.max_tokens = cap;
+            (serde_json::to_vec(&request).expect("a request body is plain JSON"), cap)
         })
+    }
+}
+
+/// What every stream of one provider shares.
+struct Shared {
+    /// #96: the provider doesn't take `max_tokens` at all.
+    refused: Arc<AtomicBool>,
+    /// #116: the room in the window.
+    room: Arc<Mutex<Room>>,
+}
+
+impl Shared {
+    fn room(&self) -> Room {
+        *self.room.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn update(&self, f: impl FnOnce(&mut Room)) {
+        f(&mut self.room.lock().unwrap_or_else(|e| e.into_inner()));
     }
 }
 
@@ -692,12 +784,13 @@ pub(crate) fn after_degenerate(
 }
 
 /// The retry loop: up to [`MAX_ATTEMPTS`] for network errors, drops, stalls and 429/502/503/504; once more after a
-/// degenerate reply (#96), and once without `max_tokens` when the provider refuses it.
+/// degenerate reply (#96); once with a fitted `max_tokens` when the provider says the cap doesn't fit (#116), and once
+/// without it when the provider refuses it.
 async fn run(
     client: reqwest::Client,
     mut o: OpenAiCompatOptions,
     mut outgoing: Outgoing,
-    refused: Arc<AtomicBool>,
+    shared: Shared,
     cancel: CancellationToken,
     debug_raw: bool,
     emit: Emit,
@@ -713,6 +806,8 @@ async fn run(
     let mut attempt = 0;
     let mut announce = false;
     let mut degenerate_retries = 0;
+    // #116: a refusal that said how big the prompt was is resent once with a cap that fits; after that, without one.
+    let mut refit = false;
     loop {
         if cancel.is_cancelled() {
             return;
@@ -730,7 +825,9 @@ async fn run(
         for (name, value) in &o.headers {
             request = request.header(name, value);
         }
-        let Some(sent) = until_cancelled(&cancel, request.body(outgoing.body(&o, &kept)).send()).await else { return };
+        let (body, sent_cap) = outgoing.body(&o, shared.room(), &kept);
+        let bytes = body.len();
+        let Some(sent) = until_cancelled(&cancel, request.body(body).send()).await else { return };
         let response = match sent {
             Ok(response) => response,
             Err(err) => {
@@ -748,7 +845,13 @@ async fn run(
         let status = response.status().as_u16();
         if response.status().is_success() {
             // Stream the SSE body. If the connection drops mid-stream, retry (#64: or continue).
-            match read_reply(response, label, o.idle_timeout, &cancel, debug_raw, &emit).await {
+            let mut prompt_tokens = None;
+            let read = read_reply(response, label, o.idle_timeout, &cancel, debug_raw, &emit, &mut prompt_tokens).await;
+            // #116: the measured prompt size, so the next request's cap fits beside it.
+            if let Some(tokens) = prompt_tokens {
+                shared.update(|room| room.record(tokens, bytes));
+            }
+            match read {
                 Read::Finished => return,
                 Read::Degenerate { discarded } => {
                     if !after_degenerate(label, discarded, &mut degenerate_retries, &mut kept, &mut outgoing.note, &emit) {
@@ -783,11 +886,25 @@ async fn run(
         }
         let Some(detail) = read_error(response, &cancel).await else { return };
         // #96: a provider that won't take max_tokens (or can't fit it beside this prompt) gets the request without it.
-        if (400..500).contains(&status) && o.max_tokens.is_some() && MAX_TOKENS_REFUSED.is_match(&detail) {
+        if (400..500).contains(&status) && sent_cap.is_some() && MAX_TOKENS_REFUSED.is_match(&detail) {
             if NAMES_MAX_TOKENS.is_match(&detail) && UNSUPPORTED.is_match(&detail) {
-                refused.store(true, Ordering::Relaxed);
+                shared.refused.store(true, Ordering::Relaxed);
             }
-            o.max_tokens = None;
+            // #116: the refusal said the window and the prompt's size: remember both (for every later request too)
+            // and resend once with what's left, rather than without a cap.
+            if let Some((window, input)) = window_refusal(&detail).filter(|_| !refit) {
+                shared.update(|room| {
+                    room.window = Some(window);
+                    room.record(input, bytes);
+                });
+                refit = true;
+                // Never the cap that was just refused again (a cap of None leaves it out at once).
+                if o.max_tokens.and_then(|max| shared.room().cap(max, bytes)) == sent_cap {
+                    o.max_tokens = None;
+                }
+            } else {
+                o.max_tokens = None;
+            }
             (attempt, announce) = (attempt - 1, false);
             continue;
         }
@@ -839,6 +956,7 @@ async fn read_reply(
     cancel: &CancellationToken,
     debug_raw: bool,
     emit: &Emit,
+    prompt_tokens: &mut Option<u64>,
 ) -> Read {
     let mut assembler = ReplyAssembler::with_debug(label, debug_raw);
     let mut guard = DegenerateGuard::default();
@@ -866,6 +984,7 @@ async fn read_reply(
         if out.iter().any(|event| guard.check(event)) || (!details.is_empty() && guard.check_reasoning(&details)) {
             return Read::Degenerate { discarded: guard.streamed() };
         }
+        note_prompt_tokens(&out, prompt_tokens);
         emit.forward(&mut out, &mut text);
         match flow {
             Flow::Continue => {}
@@ -881,10 +1000,20 @@ async fn read_reply(
     // The stream ended cleanly but early (no [DONE] or finish_reason): a proxy closed it, or the
     // server lost the connection. A retry gets a fresh response.
     let finished = assembler.finish(&mut out);
+    note_prompt_tokens(&out, prompt_tokens);
     emit.forward(&mut out, &mut text);
     match finished {
         Ok(()) => Read::Finished,
         Err(Incomplete) => Read::Dropped { text, tool_call_in_progress, cause: DropCause::Dropped },
+    }
+}
+
+/// #116: the prompt count of a `Usage` event among `out`, if any.
+fn note_prompt_tokens(out: &[ProviderEvent], prompt_tokens: &mut Option<u64>) {
+    for event in out {
+        if let ProviderEvent::Usage(usage, _) = event {
+            *prompt_tokens = Some(usage.prompt_tokens);
+        }
     }
 }
 
@@ -1078,6 +1207,36 @@ mod tests {
         assert_eq!(max_tokens_for(None), DEFAULT_MAX_TOKENS);
         assert_eq!(max_tokens_for(Some(4096)), 4096);
         assert_eq!(max_tokens_for(Some(1_000_000)), DEFAULT_MAX_TOKENS);
+    }
+
+    #[test]
+    fn a_window_refusal_says_the_window_and_the_prompt_size() {
+        let openrouter = "This endpoint's maximum context length is 131072 tokens. However, you requested about 140000 tokens (108000 of text input, 32000 in the output). Please reduce the length.";
+        assert_eq!(window_refusal(openrouter), Some((131_072, 108_000)));
+        let with_tools = "maximum context length is 1000 tokens. However, you requested about 1200 tokens (700 of text input, 100 of tool input, 400 in the output).";
+        assert_eq!(window_refusal(with_tools), Some((1000, 800)));
+        assert_eq!(window_refusal("max_tokens exceeds the remaining context"), None);
+    }
+
+    #[test]
+    fn the_cap_is_the_room_left_in_the_window_with_a_floor() {
+        // No window known: the model's limit.
+        assert_eq!(Room::default().cap(32_000, 1_000_000), Some(32_000));
+        // Before any measurement, 4 bytes a token (+5%): 400 KB is 105000 tokens.
+        let room = Room { window: Some(131_072), tokens_per_byte: None };
+        assert_eq!(room.cap(32_000, 400_000), Some(26_072));
+        assert_eq!(room.cap(32_000, 1_000), Some(32_000));
+        // Measured: the highest ratio wins, so a cached prefix doesn't lower it.
+        let mut room = Room { window: Some(50_000), tokens_per_byte: None };
+        room.record(30_000, 100_000);
+        room.record(10_000, 100_000);
+        assert_eq!(room.cap(32_000, 100_000), Some(18_500));
+        // Under the floor the request goes without a cap: a cap that small would be refused too.
+        assert_eq!(room.cap(32_000, 150_000), Some(2_750));
+        assert_eq!(room.cap(32_000, 200_000), None);
+        assert_eq!(room.cap(32_000, 157_000), None, "545 tokens left: under the floor");
+        // A model whose own limit is under the floor keeps it while that fits.
+        assert_eq!(room.cap(512, 157_000), Some(512));
     }
 
     #[test]
