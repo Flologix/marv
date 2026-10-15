@@ -477,6 +477,9 @@ pub async fn run_headless(options: HeadlessOptions) -> ExitCode {
         marv_tools::github::github_available(&pairs, marv_tools::github::AUTH_CHECK).await
     };
     (builder.options.github, builder.options.github_known) = (github, Some(github));
+    // In a Herdr pane, the herdr tool reads panes (#74); without host_commands its commands and spawns are refused
+    // before anything is asked, whatever --approve says.
+    builder.options.herdr = marv_session::herdr_door::setup_from_env(&env, config.herdr_peers);
     // The mesh, when asked for (`--approve mesh:<r>` or `MARV_MESH_NAME`): otherwise a one-off `marv -p` isn't on it
     // and its model isn't offered the mesh tools. Wires are granted only for the listed receptacles, from this run's
     // own agents or from another Marv (its door).

@@ -314,6 +314,7 @@ pub fn tainted_text(source: marv_core::Provenance) -> String {
         marv_core::Provenance::Mesh => "a mesh message",
         marv_core::Provenance::Image => "an image",
         marv_core::Provenance::Hook => "a session-start hook's output",
+        marv_core::Provenance::Herdr => "what another Herdr pane shows",
         _ => "untrusted content",
     };
     format!(
@@ -960,6 +961,8 @@ impl Bridge {
         // The person at this terminal approves each command on the host (#52); gh where it's logged in (#47).
         init.host_commands = true;
         init.github = s.github;
+        // In a Herdr pane, the herdr tool (#74): reads, light actions, and commands and workers asked every time.
+        init.herdr = marv_session::herdr_door::setup_from_env(&s.env, config.herdr_peers);
         init.no_yolo = marv_session::sdk::no_yolo_reason(&s.root, &s.home);
         if init.no_yolo.is_some() {
             init.yolo = false;
@@ -1065,6 +1068,35 @@ impl Bridge {
             // The process manager calls the session's on_change when one starts or ends: the bar is asked again.
             processes: self.session.processes().iter().filter(|p| p.state == marv_tools::ProcessState::Running).count(),
         }
+    }
+
+    /// `/peers` (#74): the Herdr panes this session opened, one read, or one stopped. Names, tasks and pane text come
+    /// from the model or another program: all of it goes through `printable()`.
+    async fn peers(&self, read: Option<String>, stop: Option<String>) {
+        if let Some(name) = stop {
+            return self.emit(match self.session.stop_peer(&name).await {
+                Ok(peer) => system(
+                    printable(&format!(
+                        "Stopped {} and closed pane {}.{}",
+                        peer.name,
+                        peer.pane,
+                        peer.branch
+                            .map(|b| format!(" Its worktree (branch {b}) stays: remove it once it's merged."))
+                            .unwrap_or_default()
+                    )),
+                    false,
+                ),
+                Err(e) => system(printable(&e), true),
+            });
+        }
+        if let Some(name) = read {
+            return self.emit(match self.session.read_peer(&name, 40).await {
+                Ok(text) => system(printable(&format!("{name}'s last lines:\n{text}")), false),
+                Err(e) => system(printable(&e), true),
+            });
+        }
+        let states = self.session.peer_states().await;
+        self.emit(system(marv_session::herdr_door::peers_text(&self.session.peers(), &states), false));
     }
 
     fn session_yolo_allowed(&self) -> bool {
@@ -1697,6 +1729,13 @@ impl Bridge {
                         system(format!("No background process named \"{}\". /processes lists them.", printable(&stop)), true)
                     });
                 });
+            }
+            CommandAction::Peers { read, stop } => {
+                if !self.session.herdr_offered() {
+                    return self.emit(system("No Herdr peers here: Marv isn't running in a Herdr pane.", true));
+                }
+                let me = self.clone();
+                tokio::spawn(async move { me.peers(read, stop).await });
             }
             CommandAction::Skill { name, args } => {
                 let Some(skill) = self.skills.iter().find(|s| s.skill.name == name) else { return };

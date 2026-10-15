@@ -114,6 +114,12 @@ pub enum CommandAction {
     Processes {
         stop: String,
     },
+    /// marv-rs #74: the panes the Herdr door opened. Neither set: list them; `read`: a peer's last lines; `stop`: ask
+    /// it to leave and close its pane (its worktree stays).
+    Peers {
+        read: Option<String>,
+        stop: Option<String>,
+    },
     /// The user ran a skill: `/<name> <args>`.
     Skill {
         name: String,
@@ -388,6 +394,20 @@ pub fn commands() -> &'static [Command] {
                                 .join("\n"),
                         )
                     }
+                }
+            },
+        },
+        Command {
+            name: "peers",
+            while_busy: true,
+            description: "Herdr panes and workers the model opened (/peers read <name>, /peers stop <name>)",
+            run: |args, _ctx| {
+                let words: Vec<&str> = args.split_whitespace().collect();
+                match words[..] {
+                    [] => CommandAction::Peers { read: None, stop: None },
+                    ["read", name] => CommandAction::Peers { read: Some(name.to_string()), stop: None },
+                    ["stop", name] => CommandAction::Peers { read: None, stop: Some(name.to_string()) },
+                    _ => error("Usage: /peers, /peers read <name>, or /peers stop <name>"),
                 }
             },
         },
@@ -1183,6 +1203,18 @@ mod tests {
         assert!(text.contains("- `/omarchy`: D. *(personal: omarchy → /usr/share/omarchy/skills/omarchy)*"), "{text}");
         assert!(text.contains("- `/todo`: D. *(personal)*"), "{text}");
         assert!(!text.contains('\x1b'));
+    }
+
+    #[test]
+    fn peers_lists_reads_and_stops_as_actions() {
+        with(|ctx| {
+            assert_eq!(run_command("/peers", ctx), CommandAction::Peers { read: None, stop: None });
+            assert_eq!(run_command("/peers read w1", ctx), CommandAction::Peers { read: Some("w1".into()), stop: None });
+            assert_eq!(run_command("/peers stop w1", ctx), CommandAction::Peers { read: None, stop: Some("w1".into()) });
+            for bad in ["/peers stop", "/peers kill w1", "/peers read a b"] {
+                assert!(matches!(run_command(bad, ctx), CommandAction::Print { is_error: true, .. }), "{bad}");
+            }
+        });
     }
 
     #[test]

@@ -10,7 +10,7 @@
 //!
 //! [`fence`] is used for:
 //! - `after_step` notes (diagnostics, project checks): [`Provenance::Project`];
-//! - tool results whose provenance taints (web, MCP, image), by the session's tool runner;
+//! - tool results whose provenance taints (web, MCP, image, the Herdr door's reads), by the session's tool runner;
 //!   mesh messages come fenced already (`marv_mesh::Envelope::fenced`).
 
 use marv_core::Provenance;
@@ -30,6 +30,7 @@ pub fn source_name(provenance: Provenance) -> &'static str {
         Provenance::Subagent => "subagent",
         Provenance::Image => "image",
         Provenance::Hook => "hook",
+        Provenance::Herdr => "herdr",
     }
 }
 

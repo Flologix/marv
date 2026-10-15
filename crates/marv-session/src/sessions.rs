@@ -73,8 +73,8 @@ pub struct SavedCheckpoints {
 
 impl SavedSession {
     /// The taint to restore on resume. Saved files say it; an older file (or one from TypeScript Marv) is judged by
-    /// its conversation, erring on the tainted side: a web or github call counts as web content, an MCP or mesh call
-    /// as theirs, and a subagent's report (which could carry either) as web content.
+    /// its conversation, erring on the tainted side: a web or github call counts as web content, an MCP, mesh or herdr
+    /// call as theirs, and a subagent's report (which could carry either) as web content.
     pub fn taint_sources(&self) -> Vec<marv_core::Provenance> {
         use marv_core::Provenance;
         if let Some(saved) = &self.taint {
@@ -87,6 +87,7 @@ impl SavedSession {
                 "web_fetch" | "github" | "agent" => Provenance::Web,
                 n if n.starts_with("mcp") => Provenance::Mcp,
                 n if n.starts_with("mesh") => Provenance::Mesh,
+                "herdr" => Provenance::Herdr,
                 _ => continue,
             };
             if !sources.contains(&source) {

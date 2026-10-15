@@ -517,6 +517,220 @@ impl HerdrAdapter {
     }
 }
 
+/// What the Herdr door lists (#74): `herdr workspace list`, `tab list`, `pane list`, `agent list`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HerdrList {
+    Workspaces,
+    Tabs,
+    Panes,
+    Agents,
+}
+
+/// Where the Herdr door opens a pane (#74): split from Marv's own pane, or a new tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Place {
+    Right,
+    Down,
+    Tab,
+}
+
+impl Place {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Place::Right => "right",
+            Place::Down => "down",
+            Place::Tab => "tab",
+        }
+    }
+}
+
+/// How long a spawned Marv gets to show its prompt (its splash, setup, a resume) before the door gives up on typing
+/// its task (#74).
+pub const READY_TIMEOUT: Duration = Duration::from_secs(60);
+/// How often the door looks at a starting pane.
+const READY_POLL: Duration = Duration::from_millis(500);
+
+/// An id Herdr handed back (`w1`, `w1:t2`, `w1:p3`): opaque, but only ever these characters, so it's Marv's to show
+/// and pass on, never text another program chose.
+pub fn plain_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '_' | '-'))
+}
+
+/// The Herdr door's commands (#74), on the same `herdr` CLI as the pane receptacles, run in Marv's own process (the
+/// sandbox can't reach Herdr's socket: #130). What comes back from a read is the other panes' text: the door fences it
+/// and taints the session with it. Errors name the command, never Herdr's words (`run`).
+impl HerdrAdapter {
+    /// `herdr <args>`'s JSON `result` (the door's commands).
+    pub async fn call(&self, args: &[&str]) -> crate::Result<Value> {
+        self.run(args).await
+    }
+
+    /// A listing, as Herdr's JSON (`workspace list`, `tab list [--workspace w]`, `pane list [--workspace w]`, `agent
+    /// list`).
+    pub async fn list(&self, what: HerdrList, workspace: Option<&str>) -> crate::Result<Value> {
+        let mut args = match what {
+            HerdrList::Workspaces => vec!["workspace", "list"],
+            HerdrList::Tabs => vec!["tab", "list"],
+            HerdrList::Panes => vec!["pane", "list"],
+            HerdrList::Agents => vec!["agent", "list"],
+        };
+        if let Some(w) = workspace.filter(|_| matches!(what, HerdrList::Tabs | HerdrList::Panes)) {
+            args.extend(["--workspace", w]);
+        }
+        self.run(&args).await
+    }
+
+    /// A pane's last `lines` lines (at most [`MAX_READ_LINES`]), soft wraps joined, as plain text.
+    pub async fn read(&self, pane: &str, lines: u64) -> crate::Result<String> {
+        let n = lines.clamp(1, MAX_READ_LINES).to_string();
+        let read = self.run(&["pane", "read", pane, "--source", "recent-unwrapped", "--lines", &n, "--format", "text"]).await?;
+        Ok(match read.get("text").or_else(|| read.get("output")).cloned().unwrap_or(read) {
+            Value::String(s) => s,
+            other => other.to_string(),
+        })
+    }
+
+    /// Opens a pane in `cwd`: split from `from` (Marv's own pane) to the right or below, or a new tab. Focus stays
+    /// where the user has it. Returns the new pane's id.
+    pub async fn open_pane(&self, place: Place, from: Option<&str>, cwd: &str, label: Option<&str>) -> crate::Result<String> {
+        let result = match place {
+            Place::Tab => {
+                let mut args = vec!["tab", "create", "--cwd", cwd, "--no-focus"];
+                if let Some(label) = label {
+                    args.extend(["--label", label]);
+                }
+                self.run(&args).await?
+            }
+            Place::Right | Place::Down => {
+                let Some(from) = from else {
+                    return Err(MeshError::Io("herdr pane split: Marv doesn't know its own pane (HERDR_PANE_ID)".into()));
+                };
+                self.run(&["pane", "split", from, "--direction", place.as_str(), "--cwd", cwd, "--no-focus"]).await?
+            }
+        };
+        new_pane_id(&result).ok_or_else(|| MeshError::Io("herdr: an answer without the new pane's id".into()))
+    }
+
+    /// A new git worktree on `branch` (from `base`), opened by Herdr in a workspace of its own. Returns its first pane.
+    pub async fn worktree(&self, repo: &str, branch: &str, base: &str, label: Option<&str>) -> crate::Result<String> {
+        let mut args = vec!["worktree", "create", "--cwd", repo, "--branch", branch, "--base", base, "--no-focus"];
+        if let Some(label) = label {
+            args.extend(["--label", label]);
+        }
+        let result = self.run(&args).await?;
+        new_pane_id(&result).ok_or_else(|| MeshError::Io("herdr worktree create: an answer without the new pane's id".into()))
+    }
+
+    /// Types `command` into a pane's shell and presses Enter (`herdr pane run`).
+    pub async fn pane_run(&self, pane: &str, command: &str) -> crate::Result<()> {
+        self.run(&["pane", "run", pane, command]).await.map(drop)
+    }
+
+    /// Starts a Herdr-supported agent `kind` named `name` in a pane at its shell prompt (`herdr agent start`), with no
+    /// arguments of its own: it runs with its own defaults, never with flags a model chose.
+    pub async fn agent_start(&self, name: &str, kind: &str, pane: &str) -> crate::Result<()> {
+        self.run(&["agent", "start", name, "--kind", kind, "--pane", pane]).await.map(drop)
+    }
+
+    /// Waits until the pane holds a `agent` that's idle or done (a Marv past its splash, at an empty prompt), at most
+    /// `timeout`; false when it never got there (or `cancel` fired).
+    pub async fn wait_ready(
+        &self,
+        pane: &str,
+        agent: &str,
+        timeout: Duration,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Ok(p) = self.pane(pane).await
+                && p.agent.as_deref() == Some(agent)
+                && matches!(p.status.as_deref(), Some("idle" | "done"))
+            {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(READY_POLL) => {}
+                _ = cancel.cancelled() => return false,
+            }
+        }
+    }
+
+    /// Focuses a tab (`w1:t2`), a workspace (`w1`) or the agent in a pane (`w1:p3`).
+    pub async fn focus(&self, target: &str) -> crate::Result<()> {
+        let args: [&str; 3] = match target_kind(target) {
+            Some(TargetKind::Pane) => ["agent", "focus", target],
+            Some(TargetKind::Tab) => ["tab", "focus", target],
+            Some(TargetKind::Workspace) => ["workspace", "focus", target],
+            None => return Err(MeshError::BadName(format!("not a Herdr pane, tab or workspace id: {target}"))),
+        };
+        self.run(&args).await.map(drop)
+    }
+
+    /// Renames a pane or a tab.
+    pub async fn rename(&self, target: &str, name: &str) -> crate::Result<()> {
+        let args: [&str; 4] = match target_kind(target) {
+            Some(TargetKind::Pane) => ["pane", "rename", target, name],
+            Some(TargetKind::Tab) => ["tab", "rename", target, name],
+            _ => return Err(MeshError::BadName(format!("not a Herdr pane or tab id: {target}"))),
+        };
+        self.run(&args).await.map(drop)
+    }
+
+    /// The user's `/peers stop` (#74), never the model's: asks the worker to leave as its user would (`/exit` for a
+    /// Marv; ctrl+c twice for another agent, which is how Claude Code quits), then closes the pane. Typed past the
+    /// prompts-only rule ([`pane_prompt`]) because a person asked for it, not a model.
+    pub async fn stop(&self, pane: &str, marv: bool) -> crate::Result<()> {
+        if marv {
+            let _ = self.run(&["pane", "send-text", pane, "/exit"]).await;
+            tokio::time::sleep(ENTER_DELAY).await;
+            let _ = self.run(&["pane", "send-keys", pane, "enter"]).await;
+        } else {
+            for _ in 0..2 {
+                let _ = self.run(&["pane", "send-keys", pane, "ctrl+c"]).await;
+                tokio::time::sleep(ENTER_DELAY).await;
+            }
+        }
+        tokio::time::sleep(STOP_GRACE).await;
+        self.run(&["pane", "close", pane]).await.map(drop)
+    }
+}
+
+/// How long a stopped worker gets to leave before its pane is closed.
+const STOP_GRACE: Duration = Duration::from_millis(1500);
+
+/// What an id names, by its shape: `w1` a workspace, `w1:t2` a tab, `w1:p3` a pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetKind {
+    Workspace,
+    Tab,
+    Pane,
+}
+
+pub fn target_kind(id: &str) -> Option<TargetKind> {
+    if !plain_id(id) {
+        return None;
+    }
+    match id.split_once(':') {
+        None => Some(TargetKind::Workspace),
+        Some((_, rest)) if rest.starts_with('t') => Some(TargetKind::Tab),
+        Some((_, rest)) if rest.starts_with('p') => Some(TargetKind::Pane),
+        _ => None,
+    }
+}
+
+/// The new pane's id in a creation answer (`pane split`: `.pane`; `tab create`, `worktree create`: `.root_pane`).
+fn new_pane_id(result: &Value) -> Option<String> {
+    ["/pane/pane_id", "/root_pane/pane_id", "/workspace/root_pane/pane_id"]
+        .iter()
+        .find_map(|p| result.pointer(p).and_then(Value::as_str))
+        .filter(|id| plain_id(id))
+        .map(str::to_string)
+}
+
 /// The characters that make an agent's input box read a line as a command rather than a prompt: `/` (a slash
 /// command, in Marv and Claude Code alike), `!` (Claude Code's shell mode), `#` (Claude Code's memory).
 const COMMAND_PREFIXES: [char; 3] = ['/', '!', '#'];

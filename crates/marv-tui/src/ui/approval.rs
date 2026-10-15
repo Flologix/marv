@@ -56,6 +56,7 @@ pub fn door_warning(door: marv_core::Door) -> &'static str {
         marv_core::Door::Host => "Runs OUTSIDE the sandbox, as you, with your files, network and credentials.",
         marv_core::Door::Github => "Visible to other people on GitHub.",
         marv_core::Door::Process => "Keeps running after this turn, until stopped or Marv exits.",
+        marv_core::Door::Herdr => "Acts in Herdr, OUTSIDE the sandbox: what starts in a pane runs as you, and keeps running.",
     }
 }
 

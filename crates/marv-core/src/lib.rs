@@ -211,14 +211,16 @@ pub enum ToolKind {
 
 /// The narrow, named ways out of the sandbox (Marv Sprint 4), each with its own rule for what it can never do:
 /// `Host` is bash with `sandbox: false` (one command on the user's machine, Marv #52); `Github` runs gh with the
-/// user's login (#47); `Process` keeps a server running in its own sandbox (#51). A call through one carries it on
-/// its approval (the prompt shows the door's warning line) and on its result (trajectories name it).
+/// user's login (#47); `Process` keeps a server running in its own sandbox (#51); `Herdr` drives the Herdr terminal
+/// multiplexer Marv runs in from Marv's own process (#74). A call through one carries it on its approval (the prompt
+/// shows the door's warning line) and on its result (trajectories name it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Door {
     Github,
     Process,
     Host,
+    Herdr,
 }
 
 /// Where a piece of text came from. Text from anything but the user or Marv
@@ -237,13 +239,16 @@ pub enum Provenance {
     /// A session-start hook's output (#108): the user chose the command, not what it prints (`bd ready` lists issue
     /// titles anyone can file). A hook marked `trusted` in the user's config doesn't taint.
     Hook,
+    /// What the Herdr door read back (#74): other panes' screens, names and titles, which another agent or program
+    /// wrote. Fenced as data and tainting, like a mesh message.
+    Herdr,
 }
 
 impl Provenance {
     /// Whether text from this source taints the session (exfiltration-capable
     /// calls ask from then on, even in yolo).
     pub fn taints(self) -> bool {
-        matches!(self, Self::Web | Self::Mcp | Self::Mesh | Self::Image | Self::Hook)
+        matches!(self, Self::Web | Self::Mcp | Self::Mesh | Self::Image | Self::Hook | Self::Herdr)
     }
 }
 
