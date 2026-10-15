@@ -17,7 +17,10 @@
 //! - `marv/wire {from, to, mode, by}`: another switchboard asks for the far end of a cross-process wire. The caller
 //!   must be the process listening on `<from>.sock` (its pid, from the socket's peer credentials, never from the
 //!   message), and `to` must be one of this Marv's inboxes. If this Marv's user approves, the caller gets a plug of its
-//!   own here, `peer-<from>`, wired with both approvals (`Grant::remote`), and its socket's path.
+//!   own here, `peer-<from>`, wired with both approvals (`Grant::remote`), and its socket's path;
+//! - `marv/radio.join {from, presence}` (#124): another Marv on the radio asks for a link. Refused unless this Marv's
+//!   radio is on; the caller is checked by pid exactly as for `marv/wire`. Accepted, the connection becomes the link
+//!   ([`crate::radio`]).
 //!
 //! On the asking side another Marv's inbox is the receptacle `peer.<session>.agent.<agent>.inbox`, found on demand
 //! ([`PeerResolver`]) and served by a [`PeerLink`]: its messages go out through that `peer-<session>` plug, so the
@@ -162,6 +165,9 @@ pub struct PeerInfo {
     /// Its agents' plugs (`parent`, `worker-1`, `peer-<session>`, a shim's).
     pub agents: Vec<String>,
     pub version: String,
+    /// Whether its radio is on (#124). Missing from older Marvs: off.
+    #[serde(default)]
+    pub radio: bool,
 }
 
 /// A switchboard found by `marv mesh ls`.
@@ -320,6 +326,27 @@ fn sweep_dead(dir: &Path) {
     }
 }
 
+/// [`sweep_dead`] with the folder's lock held, as [`open_door`] does it: the radio's re-list, and a link that was
+/// lost (#124). Blocks while another Marv holds the lock. The lock file is never made here: a door opened in the folder
+/// made it, and a folder on its way out isn't filled again.
+pub fn sweep_locked(dir: &Path) {
+    let Ok(lock) = std::fs::OpenOptions::new().write(true).open(dir.join(".lock")) else { return };
+    if lock.lock().is_ok() {
+        sweep_dead(dir);
+    }
+}
+
+/// The caller of a door is who listens on `<from>.sock`: checked by pid (the socket's peer credentials), never taken
+/// from the message. `marv/wire` and `marv/radio.join` both ask this.
+async fn confirm_caller(dir: &Path, from: &str, caller: Option<i32>) -> Result<()> {
+    let socket = session_socket(dir, from).ok_or_else(|| MeshError::BadName(from.to_string()))?;
+    let listening = DoorClient::connect(&socket).await.ok().and_then(|d| d.pid);
+    if caller.is_none() || listening != caller {
+        return Err(MeshError::Io(format!("can't confirm the caller is the Marv \"{from}\"")));
+    }
+    Ok(())
+}
+
 /// Opens `sb`'s door at `<dir>/<sb.session>.sock` (0600, in the 0700 folder), serves it until the guard drops, and
 /// lets `sb` find the other Marvs' inboxes in `dir` ([`PeerResolver`]). Refuses when a live Marv already has the
 /// name; a dead one's socket is replaced. Needs a Tokio runtime.
@@ -395,6 +422,29 @@ impl Door {
             }
             let Ok(text) = std::str::from_utf8(&line) else { break };
             let Ok(Message::Request(request)) = decode_line(text) else { continue };
+            if request.method == crate::radio::JOIN {
+                let id = request.id.clone();
+                match self.radio_join(request.params.unwrap_or(Value::Null), caller).await {
+                    Ok((radio, accepted)) => {
+                        let answer = Response::ok(id, json!({"presence": accepted.presence}));
+                        if write.write_all(encode_line(&Message::Response(answer)).as_bytes()).await.is_ok() {
+                            for plug in made.drain(..) {
+                                self.sb.unplug(&plug);
+                            }
+                            // From here the connection is the radio link.
+                            return radio.adopt(accepted, read, write);
+                        }
+                        break;
+                    }
+                    Err(err) => {
+                        let answer = Response::err(id, code::INVALID_PARAMS, err);
+                        if write.write_all(encode_line(&Message::Response(answer)).as_bytes()).await.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                }
+            }
             let response = self.handle(request, caller, &mut made).await;
             if write.write_all(encode_line(&Message::Response(response)).as_bytes()).await.is_err() {
                 break;
@@ -436,6 +486,7 @@ impl Door {
             pane: self.info.pane.clone(),
             agents: self.sb.agents().into_iter().map(String::from).collect(),
             version: env!("CARGO_PKG_VERSION").into(),
+            radio: self.sb.radio().is_some_and(|r| r.is_on()),
         }
     }
 
@@ -482,11 +533,7 @@ impl Door {
             return Err(MeshError::BadName(format!("\"{from}\" isn't another Marv's name")));
         }
         // The caller is who listens on <from>.sock: checked by pid, never taken from the message.
-        let socket = session_socket(&self.dir, from).ok_or_else(|| MeshError::BadName(from.to_string()))?;
-        let listening = DoorClient::connect(&socket).await.ok().and_then(|d| d.pid);
-        if caller.is_none() || listening != caller {
-            return Err(MeshError::Io(format!("can't confirm the caller is the Marv \"{from}\"")));
-        }
+        confirm_caller(&self.dir, from, caller).await?;
         let to = ReceptacleName::new(to)?;
         let mode: WireMode = mode.parse()?;
         let receptacle = self.sb.receptacle(&to).ok_or_else(|| MeshError::NoReceptacle(to.to_string()))?;
@@ -504,6 +551,26 @@ impl Door {
         wire.grant.remote = Some(remote_by);
         self.sb.wire(wire)?;
         Ok(json!({"granted": true, "by": by_here, "socket": plug.host_socket}))
+    }
+}
+
+impl Door {
+    /// `marv/radio.join` (#124): only while this Marv's radio is on, only from the process listening on `<from>.sock`
+    /// (by pid, as `marv/wire`), then the radio's own checks ([`crate::radio::Radio::accept_join`]).
+    async fn radio_join(
+        &self,
+        params: Value,
+        caller: Option<i32>,
+    ) -> std::result::Result<(Arc<crate::radio::Radio>, crate::radio::Accepted), String> {
+        // No radio at all (`marv -p`) is off; one that's off says so itself (`accept_join`).
+        let radio = self.sb.radio().ok_or_else(|| format!("{}'s radio is off", self.sb.session))?;
+        let from = params.get("from").and_then(Value::as_str).unwrap_or_default();
+        if from == self.sb.session || !valid_segment(from) || from.len() > MAX_SESSION_NAME {
+            return Err(format!("\"{from}\" isn't another Marv's name"));
+        }
+        confirm_caller(&self.dir, from, caller).await.map_err(|e| e.to_string())?;
+        let accepted = radio.accept_join(from, params.get("presence").unwrap_or(&Value::Null))?;
+        Ok((radio, accepted))
     }
 }
 

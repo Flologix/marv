@@ -26,6 +26,7 @@ use marv_mesh::discovery::{
 };
 use marv_mesh::herdr::{HerdrAdapter, PaneAction, herdr_target, pane_receptacle};
 use marv_mesh::plug::{MODE_META, MODES_META};
+use marv_mesh::radio::{Presence, Radio, RadioTimings};
 use marv_mesh::{PlugId, ReceptacleName, WireMode};
 use marv_session::mesh::{DoorWires, MeshHandle, PARENT, WireApprover};
 use serde_json::{Map, Value, json};
@@ -39,11 +40,16 @@ pub struct Mesh {
     pane: Option<String>,
     dir: std::path::PathBuf,
     door: Option<DoorGuard>,
+    /// The radio (#124), the TUI's only ([`Mesh::start_radio`]).
+    radio: Option<Arc<Radio>>,
     cancel: CancellationToken,
 }
 
 impl Drop for Mesh {
     fn drop(&mut self) {
+        if let Some(radio) = self.radio.take() {
+            radio.stop();
+        }
         self.door.take();
         self.cancel.cancel();
     }
@@ -73,7 +79,7 @@ pub fn start(env: &marv_mcp::Env, root: &Path) -> Result<Option<Mesh>, String> {
     if let Some(own) = &pane {
         handle.set_herdr(Arc::new(HerdrAdapter::new("herdr", Some(own.clone()))));
     }
-    Ok(Some(Mesh { handle, name, root: root.to_path_buf(), pane, dir, door: None, cancel }))
+    Ok(Some(Mesh { handle, name, root: root.to_path_buf(), pane, dir, door: None, radio: None, cancel }))
 }
 
 impl Mesh {
@@ -84,6 +90,16 @@ impl Mesh {
         let door = open_door(self.handle.clone(), &self.dir, info, Arc::new(DoorWires(wires))).map_err(|e| e.to_string())?;
         self.door = Some(door);
         Ok(())
+    }
+
+    /// The radio (#124) for this Marv's open door, off until the caller turns it on. The TUI's alone: `marv -p` never
+    /// makes one, so its door refuses every join.
+    pub fn start_radio(&mut self, wake: bool) -> Arc<Radio> {
+        let me = Presence::new(&self.name, &self.root, self.pane.clone(), wake);
+        let radio = Radio::new(&self.handle, &self.dir, me, RadioTimings::default());
+        radio.start();
+        self.radio = Some(radio.clone());
+        radio
     }
 }
 
@@ -107,7 +123,8 @@ fn short(path: &str) -> String {
     }
 }
 
-/// One line per live switchboard: name, pane, agents, folder, and the receptacle another Marv reaches its parent by.
+/// One line per live switchboard: name, whether its radio is on (#124), pane, agents, folder, and the receptacle
+/// another Marv reaches its parent by.
 fn ls_lines(peers: &[PeerSwitchboard]) -> Vec<String> {
     let width = peers.iter().map(|p| p.session.len()).max().unwrap_or(0);
     peers
@@ -116,8 +133,9 @@ fn ls_lines(peers: &[PeerSwitchboard]) -> Vec<String> {
             let inbox = ReceptacleName::inbox(&PlugId::new(PARENT).expect("a plug id"));
             let reach = peer_receptacle(&p.session, &inbox).map(|r| r.to_string()).unwrap_or_default();
             printable(&format!(
-                "{:width$}  pane {}  agents {}  {}  ({})",
+                "{:width$}  radio {:<3}  pane {}  agents {}  {}  ({})",
                 p.session,
+                if p.info.radio { "on" } else { "off" },
                 p.info.pane.as_deref().unwrap_or("-"),
                 p.info.agents.join(","),
                 short(&p.info.cwd),
@@ -442,14 +460,15 @@ mod tests {
                 pane: pane.map(String::from),
                 agents: vec!["parent".into(), "worker-1".into()],
                 version: "0".into(),
+                radio: pane.is_some(),
             },
         };
         let lines = ls_lines(&[peer("alpha", Some("w1:p2")), peer("b", None)]);
         assert_eq!(lines.len(), 2);
-        assert!(lines[0].starts_with("alpha  pane w1:p2  agents parent,worker-1  /srv/api"), "{}", lines[0]);
+        assert!(lines[0].starts_with("alpha  radio on   pane w1:p2  agents parent,worker-1  /srv/api"), "{}", lines[0]);
         assert!(lines[0].ends_with("(peer.alpha.agent.parent.inbox)"));
         assert!(!lines[0].contains('\x1b'), "printable");
-        assert!(lines[1].starts_with("b      pane -"), "{}", lines[1]);
+        assert!(lines[1].starts_with("b      radio off  pane -"), "{}", lines[1]);
     }
 
     #[test]

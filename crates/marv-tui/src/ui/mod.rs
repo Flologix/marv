@@ -15,6 +15,7 @@ pub mod model_picker;
 pub mod notice_view;
 pub mod plan_view;
 pub mod prompt_input;
+pub mod radio_view;
 pub mod scroll_view;
 pub mod select;
 pub mod session_picker;

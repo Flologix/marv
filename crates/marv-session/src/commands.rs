@@ -103,6 +103,13 @@ pub enum CommandAction {
     MeshWake {
         on: bool,
     },
+    /// marv-rs #124: put this Marv on the mesh radio, or take it off (`mesh.radio` in the user's own config, and join
+    /// or leave at once).
+    Radio {
+        on: bool,
+    },
+    /// `/radio` with the radio on: the view of who's on it.
+    RadioView,
     /// Stop one of the session's background processes (Marv #51).
     Processes {
         stop: String,
@@ -402,6 +409,18 @@ pub fn commands() -> &'static [Command] {
             },
         },
         Command {
+            name: "radio",
+            // Joining or leaving doesn't touch a running turn: the palette may run it.
+            while_busy: true,
+            description: "The mesh radio: who of your Marvs here is up (/radio on, /radio off)",
+            run: |args, ctx| match on_off(args.trim(), "Usage: /radio, /radio on, or /radio off") {
+                Err(usage) => usage,
+                Ok(Some(on)) => CommandAction::Radio { on },
+                Ok(None) if ctx.config.mesh_radio => CommandAction::RadioView,
+                Ok(None) => print(RADIO_OFF),
+            },
+        },
+        Command {
             name: "undo",
             while_busy: false,
             description: "Put back the files the last turn changed (shows them first)",
@@ -618,6 +637,7 @@ fn config_text(ctx: &CommandContext) -> String {
         format!("Checkpoints: {} (/checkpoints, /undo)", if c.checkpoints { "on" } else { "off" }),
         format!("Steps: {}", steps_status(c)),
         format!("Mesh wake: {} (/mesh)", if c.mesh_wake { "on" } else { "off" }),
+        format!("Radio:     {} (/radio)", if c.mesh_radio { "on" } else { "off" }),
         format!("Endpoint:  {}", c.base_url),
     ];
     if c.provider == marv_provider::ProviderKind::Ollama {
@@ -635,6 +655,9 @@ pub fn diagnostics_status(config: &Config) -> String {
         "off".into()
     }
 }
+
+/// `/radio` with the radio off (#124).
+pub const RADIO_OFF: &str = "The radio is off. /radio on puts this Marv on it (saved as \"mesh\": {\"radio\": true} in your own ~/.marv/config.json): your Marvs on this machine with the radio on see each other's state (idle, working, waiting) and conversation title, in the strip above the prompt. Nothing any of them says reaches another's model.";
 
 /// `/mesh wake` (#78).
 pub fn mesh_wake_status(config: &Config) -> String {
@@ -1046,6 +1069,21 @@ mod tests {
             assert!(text.contains("on the mesh as `beta`") && text.contains("- `peer-alpha -> agent.parent.inbox`"), "{text}");
             assert!(!text.contains('\u{1b}'), "printable: {text}");
             assert!(text.contains("**Wake**: on") && text.contains("at most 3 a minute per wire"), "{text}");
+        });
+    }
+
+    #[test]
+    fn radio_turns_on_and_off_and_shows_the_view_only_when_on() {
+        with(|ctx| {
+            assert_eq!(run_command("/radio on", ctx), CommandAction::Radio { on: true });
+            assert_eq!(run_command("/radio OFF", ctx), CommandAction::Radio { on: false });
+            assert!(matches!(run_command("/radio loud", ctx), CommandAction::Print { is_error: true, .. }));
+            let CommandAction::Print { text, is_error: false, .. } = run_command("/radio", ctx) else { panic!() };
+            assert!(text.starts_with("The radio is off. /radio on"), "{text}");
+            let on = Config { mesh_radio: true, ..ctx.config.clone() };
+            assert_eq!(run_command("/radio", &CommandContext { config: &on, ..ctx.clone() }), CommandAction::RadioView);
+            let CommandAction::Print { text, .. } = run_command("/config", ctx) else { panic!() };
+            assert!(text.contains("Radio:     off (/radio)"), "{text}");
         });
     }
 

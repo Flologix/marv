@@ -89,6 +89,8 @@ pub struct MeshRecord {
 /// Where the switchboard logs every message (`marv-session`'s trajectory writer).
 pub trait TrajectorySink: Send + Sync {
     fn mesh(&self, record: MeshRecord);
+    /// A radio event (#124): joins, leaves, `lost`, `silent`, drops and refused frames.
+    fn radio(&self, _record: crate::radio::RadioRecord) {}
 }
 
 /// A sink that keeps nothing (tests, and runs without trajectories).
@@ -140,6 +142,9 @@ pub struct Switchboard {
     /// The Herdr adapter, when Marv runs in a Herdr pane ([`Self::set_herdr`]): where `mesh_list` finds the agent
     /// panes it could be wired to.
     herdr: Mutex<Option<Arc<crate::herdr::HerdrAdapter>>>,
+    /// The radio (#124), when this Marv has one ([`crate::radio::Radio::new`]): the door answers joins with it while
+    /// it's on, and `mesh_list` lists who's on it.
+    radio: Mutex<Option<Arc<crate::radio::Radio>>>,
 }
 
 /// What changes: one short lock, never held across an await.
@@ -182,7 +187,22 @@ impl Switchboard {
             resolvers: Mutex::default(),
             peer_dir: Mutex::default(),
             herdr: Mutex::default(),
+            radio: Mutex::default(),
         }
+    }
+
+    /// This Marv's radio (#124; set by [`crate::radio::Radio::new`]).
+    pub fn set_radio(&self, radio: Arc<crate::radio::Radio>) {
+        *self.radio.lock().unwrap_or_else(|e| e.into_inner()) = Some(radio);
+    }
+    pub fn radio(&self) -> Option<Arc<crate::radio::Radio>> {
+        self.radio.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Logs a radio event to the current trajectory.
+    pub fn log_radio(&self, record: crate::radio::RadioRecord) {
+        let sink = self.trajectory.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        sink.radio(record);
     }
 
     /// Where the other Marvs' doors are (set when this one's door opens).

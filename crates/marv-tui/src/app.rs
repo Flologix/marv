@@ -107,6 +107,7 @@ use crate::ui::martian::MartianAnimation;
 use crate::ui::message_view;
 use crate::ui::plan_view::{self, PLAN_MIN_WINDOW};
 use crate::ui::prompt_input::{PromptInput, PromptOutcome};
+use crate::ui::radio_view::{self, RadioPanel};
 use crate::ui::scroll_view::ScrollView;
 use crate::ui::session_picker::{PickerOutcome, SessionPicker};
 use crate::ui::setup::{Setup, SetupOutcome};
@@ -115,8 +116,8 @@ use crate::ui::status_bar::{self, StatusBar};
 use crate::ui::thinking_view::{self, DraftView, ThinkingView};
 use crate::ui::transcript::{self, Transcript, TranscriptItem};
 use crate::view::{
-    AgentProgress, ApprovalId, ApprovalRequest, CommandInfo, CompactOutcome, Decision, EmptyNext, Message, PlanItem, Role,
-    SessionPort, SetupStart, StatusInfo, ToolState, ToolStatus, Totals, TurnEndReason, TurnStatus, UiEvent, WelcomeInfo,
+    AgentProgress, ApprovalId, ApprovalRequest, CommandInfo, CompactOutcome, Decision, EmptyNext, Message, PlanItem, RadioView,
+    Role, SessionPort, SetupStart, StatusInfo, ToolState, ToolStatus, Totals, TurnEndReason, TurnStatus, UiEvent, WelcomeInfo,
 };
 use marv_core::{StopReason, Usage};
 
@@ -338,6 +339,10 @@ pub struct App {
     approval_armed_at: Option<Instant>,
     picker: Option<SessionPicker>,
     setup: Option<Setup>,
+    /// The mesh radio (#124): the strip above the prompt while it's on.
+    radio: RadioView,
+    /// `/radio`'s roster view is open (Esc closes it).
+    radio_panel: bool,
 
     // --- the loop ---
     copy: CopyFn,
@@ -409,6 +414,8 @@ impl App {
             approval_armed_at: None,
             picker: None,
             setup: None,
+            radio: RadioView::default(),
+            radio_panel: false,
             copy,
             copies: FuturesUnordered::new(),
             welcome_visible: true,
@@ -728,6 +735,19 @@ impl App {
             UiEvent::Flash(text) => {
                 self.flash = Some((text, now + NOTICE_MS));
                 self.dirty = true;
+            }
+            UiEvent::Radio(view) => {
+                self.radio_panel &= view.on;
+                self.radio = view;
+                self.dirty = true;
+            }
+            UiEvent::OpenRadio => {
+                if self.radio.on {
+                    // It takes the keyboard, like the picker: a palette open goes.
+                    self.palette = None;
+                    self.radio_panel = true;
+                    self.dirty = true;
+                }
             }
             UiEvent::Busy(label) => {
                 self.busy_label = label;
@@ -1220,6 +1240,17 @@ impl App {
             return;
         }
 
+        // `/radio`'s view: Esc closes it (it never stops a run); ctrl+c and paging still work, the rest waits.
+        if self.radio_panel && self.approval.is_none() && self.picker.is_none() && self.setup.is_none() {
+            if RadioPanel.on_key(key) {
+                self.radio_panel = false;
+                return;
+            }
+            if !(ctrl && key.code == KeyCode::Char('c')) && !matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
+                return;
+            }
+        }
+
         // What the panels see is this key's state, before the App's own handlers change it (as in
         // Marv, where every useInput saw the same render).
         let viewing_before = self.viewing.is_some();
@@ -1497,9 +1528,12 @@ impl App {
             view.set_window_rows(area.height);
         }
         let header = if self.viewing.is_some() { agent_view::HEADER_HEIGHT } else { 0 };
+        let radio_panel = self.radio_panel && self.radio.on && self.picker.is_none();
         let panel_height = if let Some(picker) = self.picker.as_ref().filter(|_| self.setup.is_none() && self.approval.is_none())
         {
             picker.height()
+        } else if radio_panel && self.setup.is_none() && self.approval.is_none() {
+            RadioPanel::height(&self.radio)
         } else if let Some((_, view)) = self.approval.as_ref().filter(|_| self.setup.is_none()) {
             view.height(width) + status_height
         } else if let Some(setup) = &self.setup {
@@ -1510,6 +1544,15 @@ impl App {
             self.prompt.height(width, busy, &self.commands) + status_height
         };
         let panel_height = panel_height.min(area.height.saturating_sub(header + 1));
+        // The radio's strip (#124): one line above the prompt while the radio is on (not over setup or a picker).
+        let strip_height = u16::from(
+            self.radio.on
+                && !radio_panel
+                && self.setup.is_none()
+                && self.picker.is_none()
+                && area.height > header + panel_height + 2,
+        );
+        let panel_height = panel_height + strip_height;
         // The plan sits between the transcript and the panel (in a subagent's view too: it's the main agent's plan).
         let plan = if area.height >= PLAN_MIN_WINDOW { plan_view::render(self.plan.as_deref(), width) } else { Vec::new() };
         let plan_height = (plan.len() as u16).min(area.height.saturating_sub(header + panel_height + 1));
@@ -1544,10 +1587,16 @@ impl App {
             agents: self.agents_running,
             viewing: self.viewing.is_some(),
         };
+        if strip_height == 1 {
+            buf.set_line(panel.x, panel.y, &radio_view::strip(&self.radio, panel.width), panel.width);
+        }
+        let panel = Rect { y: panel.y + strip_height, height: panel.height - strip_height, ..panel };
         let status_area = Rect { y: panel.bottom().saturating_sub(1), height: 1.min(panel.height), ..panel };
         let above_status = Rect { height: panel.height.saturating_sub(1), ..panel };
         if let Some(picker) = self.picker.as_ref().filter(|_| self.setup.is_none() && self.approval.is_none()) {
             picker.render(panel, buf);
+        } else if radio_panel && self.setup.is_none() && self.approval.is_none() {
+            RadioPanel::render(&self.radio, unix_ms(), panel, buf);
         } else if let Some((_, view)) = self.approval.as_ref().filter(|_| self.setup.is_none()) {
             view.render(above_status, buf);
             // At an approval the bar is always busy and never asks to confirm an exit.
@@ -2653,6 +2702,35 @@ mod tests {
     }
 
     // --- pickers, setup, events from outside a turn ---
+
+    /// #124: the radio's strip sits above the prompt while it's on; `/radio`'s view opens over the prompt and Esc
+    /// closes it without stopping anything.
+    #[test]
+    fn the_radio_strip_shows_while_on_and_its_view_closes_with_esc() {
+        use crate::view::{RadioPeer, RadioState};
+        let mut h = harness();
+        h.event(UiEvent::OpenRadio);
+        assert!(!h.frame().contains("◉ radio"), "off: no strip, no view");
+        let peer = RadioPeer {
+            name: "proj-58a7".into(),
+            state: RadioState::Working,
+            title: "fix the login test".into(),
+            project: "proj".into(),
+            pane: None,
+            since_ms: 0,
+        };
+        h.event(UiEvent::Radio(RadioView { on: true, me: "proj-c792".into(), my_title: String::new(), peers: vec![peer] }));
+        assert!(h.frame().contains("◉ radio · 58a7 working \"fix the login test\""), "{}", h.frame());
+        h.event(UiEvent::OpenRadio);
+        assert!(h.frame().contains("ON THE RADIO") && h.frame().contains("proj-58a7"), "{}", h.frame());
+        h.key(KeyCode::Char('x'));
+        assert!(h.frame().contains("ON THE RADIO"), "the view keeps the keyboard");
+        h.key(KeyCode::Esc);
+        assert!(!h.frame().contains("ON THE RADIO"), "{}", h.frame());
+        assert!(h.calls().is_empty(), "Esc closed the view and nothing else: {:?}", h.calls());
+        h.event(UiEvent::Radio(RadioView::default()));
+        assert!(!h.frame().contains("◉ radio"));
+    }
 
     #[test]
     fn resume_picks_an_earlier_session() {

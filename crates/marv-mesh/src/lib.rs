@@ -40,6 +40,7 @@ pub mod herdr;
 pub mod limits;
 pub mod message;
 pub mod plug;
+pub mod radio;
 pub mod receptacle;
 pub mod switchboard;
 pub mod tools;

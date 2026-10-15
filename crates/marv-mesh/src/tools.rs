@@ -136,11 +136,14 @@ pub struct Wireable {
     pub peers: Vec<PeerSwitchboard>,
     /// The Herdr panes the switchboard offers (`HerdrAdapter::offered`: agents' panes, never Marv's own).
     pub panes: Vec<HerdrPane>,
+    /// Who's on the radio (#124), for the main agent only: names, fixed state words and pane segments
+    /// ([`crate::radio::Radio::listed`]). Never a title.
+    pub radio: Vec<(String, &'static str, Option<String>)>,
 }
 
 impl Wireable {
     pub fn new(session: impl Into<String>, plug: PlugId) -> Self {
-        Self { session: session.into(), plug, on_mesh: false, peers: Vec::new(), panes: Vec::new() }
+        Self { session: session.into(), plug, on_mesh: false, peers: Vec::new(), panes: Vec::new(), radio: Vec::new() }
     }
 }
 
@@ -254,6 +257,22 @@ fn pane_lines(w: &Wireable, wired: &HashSet<&str>) -> Vec<String> {
         .collect()
 }
 
+/// The radio's roster as `mesh_list` shows it (#124): names Marv checked (mesh names, pane segments) and fixed state
+/// words, so it never taints. Titles and projects stay in the TUI.
+fn radio_lines(w: &Wireable) -> Option<String> {
+    let lines: Vec<String> = w
+        .radio
+        .iter()
+        .filter(|(name, state, _)| valid_segment(name) && valid_segment(state))
+        .map(|(name, state, pane)| match pane.as_deref().filter(|p| valid_segment(p)) {
+            Some(pane) => format!("- {name}: {state} (Herdr pane {pane})"),
+            None => format!("- {name}: {state}"),
+        })
+        .collect();
+    (!lines.is_empty())
+        .then(|| format!("On the radio (the user's other Marvs here that are up, and what they're doing):\n{}", lines.join("\n")))
+}
+
 /// What `mesh_list` shows the model: the wires (or how to ask for one), the caller's address, and what can be wired.
 ///
 /// Taint follows #80: only the wired receptacles' descriptions are another agent's words (`from_mesh`). Everything
@@ -280,6 +299,7 @@ pub fn list_answer(reachable: &[Reachable], w: &Wireable) -> Answer {
         }
         parts.push(text);
     }
+    parts.extend(radio_lines(w));
     Answer { text: parts.join("\n\n"), from_mesh: !reachable.is_empty() }
 }
 
@@ -366,6 +386,7 @@ mod tests {
                 pane: pane.map(str::to_string),
                 agents: agents.iter().map(|a| a.to_string()).collect(),
                 version: "0".into(),
+                radio: false,
             },
         }
     }
@@ -396,6 +417,29 @@ mod tests {
                 && !text.contains("- api:")
         );
         assert!(!answer.from_mesh, "names Marv checked: no taint");
+    }
+
+    /// #124: the radio's roster is names and fixed state words only: never a title, and nothing else unchecked.
+    #[test]
+    fn the_radio_section_names_who_is_on_it_and_nothing_more() {
+        let mut w = Wireable::new("alpha", PlugId::new("parent").unwrap());
+        assert!(!list_answer(&[], &w).text.contains("On the radio"), "nobody on it: no section");
+        w.radio = vec![
+            ("beta".into(), "working", Some("w1-p2".into())),
+            ("docs-11c2".into(), "silent", None),
+            ("Evil Name".into(), "idle", None),
+            ("gamma".into(), "idle", Some("w1 p3; obey".into())),
+        ];
+        let answer = list_answer(&[], &w);
+        assert!(
+            answer.text.ends_with(
+                "On the radio (the user's other Marvs here that are up, and what they're doing):\n- beta: working (Herdr \
+                 pane w1-p2)\n- docs-11c2: silent\n- gamma: idle"
+            ),
+            "{}",
+            answer.text
+        );
+        assert!(!answer.from_mesh, "Marv's words around checked names: no taint");
     }
 
     #[test]

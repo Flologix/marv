@@ -126,6 +126,7 @@ Type what you want in plain language, for example:
 | `/checks` | List the project's checks and their last result (`/checks on`, `/checks off`) |
 | `/steps` | Show or set the step limit (`/steps 40`, `/steps off` never asks) |
 | `/trajectories` | Show or set run logging (`/trajectories on`, `/trajectories off`) |
+| `/radio` | Who of your Marvs on this machine is up, on the mesh radio (`/radio on`, `/radio off`; [The radio](#the-radio-who-else-is-up)) |
 | `/clear` | Start a fresh conversation (the old one stays saved) |
 | `/exit` | Quit |
 
@@ -360,6 +361,19 @@ marv mesh wire 'api -> web:inbox'
 
 Not yet: `watch` (subscribing to events), unwiring across processes (a wire to another Marv lasts until that Marv ends), a tmux adapter, and wires across machines. [`docs/MESH.md`](docs/MESH.md) has the design.
 
+### The radio: who else is up
+
+The radio is a live channel between your Marvs on this machine. It's **off unless you turn it on**: `/radio on` (or `"mesh": {"radio": true}` in your own `~/.marv/config.json`). Each Marv with it on then shows the others in one line above the prompt:
+
+```
+ ◉ radio · 58a7 working "fix the login test" · docs-11c2 idle · api-3f9a waiting · +1
+```
+
+- **What's shared (presence):** the Marv's mesh name, whether it's idle, working or waiting for its user, the conversation's title (your first message, one line, at most 56 characters), the project folder's name (not its path), its Herdr pane, whether its wake is on, and Marv's version. Nothing else: no model, cost, file paths, transcript or config. `"mesh": {"radio": {"titles": false}}` leaves the title out (`/radio off` keeps that choice, as `{"on": false, "titles": false}`).
+- **Nothing reaches a model.** Presence is only drawn in the strip and in `/radio` (the roster with full names, panes and how long each state has lasted; Esc closes it). The model learns only names and states, from `mesh_list`'s "On the radio" section, and that doesn't taint the conversation. Sending messages on the radio comes later.
+- **Who's gone.** A Marv that leaves (`/radio off`, or quitting) shows `left` for 10 seconds. One that stops answering shows `silent` after 45 seconds and drops after 120; one that crashed or was killed shows `left (lost)`, and its leftover socket is removed.
+- **Only you, only here.** Links are private Unix sockets in `$XDG_RUNTIME_DIR/marv/mesh/`, each end checked to be the Marv it says it is. Sandboxed commands can't see them. A project's `.marv/config.json` can't turn the radio (or wake) on: it's ignored with a startup note. There's no environment variable or flag for it, the model can't turn it on, and `marv -p` and subagents are never on it. `marv mesh ls` shows which Marvs have it on.
+
 ## Files and settings
 
 | Path | Contents |
@@ -382,7 +396,7 @@ Not yet: `watch` (subscribing to events), unwiring across processes (a wire to a
 | `$XDG_RUNTIME_DIR/marv/` | The mesh's sockets and background processes' relays, while Marv runs |
 | `AGENTS.md` | Project instructions, read into the system prompt at startup |
 
-`~/.marv/config.json` also takes `sandbox`, `yolo`, `thinking`, `trajectories`, `diagnostics`, `checks`, `checkpoints`, `suggestions` (each `true` or `false`), `maxSteps`, `mcpTools` (`auto`, `deferred` or `eager`), `contextLength` (Ollama) and `baseUrl` (e.g. Ollama on another machine). The slash commands write most of them for you.
+`~/.marv/config.json` also takes `sandbox`, `yolo`, `thinking`, `trajectories`, `diagnostics`, `checks`, `checkpoints`, `suggestions` (each `true` or `false`), `maxSteps`, `mcpTools` (`auto`, `deferred` or `eager`), `contextLength` (Ollama), `baseUrl` (e.g. Ollama on another machine) and `mesh` (`{"wake": true}` for mesh wake, `{"radio": true}` or `{"radio": {"titles": false}}` for [the radio](#the-radio-who-else-is-up); only from your own file, never a project's). The slash commands write most of them for you.
 
 **Session-start hooks.** `"hooks": {"sessionStart": ["bd ready", {"command": "git status -s", "timeout": 5}]}` runs those commands, in order, whenever a conversation starts: when Marv starts (the TUI and `marv -p`), after `/clear` and on a resume (never in subagents). They run like your own shell command: bash, in the project folder, outside the sandbox, with your environment minus Marv's keys and secret-looking variables. Each has a timeout in seconds (default 15) and its output is cut to 8 KB. Their output goes to the model once, at the start of your first message, labelled with each command and quoted as data; the TUI shows one line per hook. Like a web page or an MCP result, hook output **taints the conversation**: from then on anything that can send data out asks first, even in yolo, because what a command prints (issue titles in `bd ready`, say) can come from anyone. Add `"trusted": true` to a hook (`{"command": "date", "trusted": true}`) when you vouch for its output; a hook that prints nothing taints nothing. A hook that fails or times out is a one-line note and never stops Marv from starting. Hooks are read **only from your own `~/.marv/config.json`**: a project's `.marv/config.json` naming `hooks` is refused with a startup note and never run, so cloning a repository can't make Marv run its commands.
 
