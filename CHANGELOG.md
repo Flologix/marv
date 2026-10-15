@@ -6,6 +6,8 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-14
+
 ### Fixed
 
 - **`git_write` no longer covers network commands; bash scope keys separate their flags from the command.** `--approve git_write` (and `"approve": ["git_write"]` in the config, or the TUI's `--approve git_write`) approved a command that also asked for the network, as the README already said it shouldn't: a command with both `network` and `git_write` (a `git push`) now needs `git_write` and `network` both, like a background process with the network needs `process` and `network`. A bash approval scope is now `bash:<flags>:<command>`, with the flag segment always there (`bash::ls`, `bash:net:curl …`, `bash:git:…`, `bash:net+git:…`), so a command's own text can't read as a flag. "Don't ask again" for one exact command works as before.
@@ -198,7 +200,8 @@ The first public release, on npm as `@flologixai/marv`.
 - The SDK: `createSession()` from `@flologixai/marv/sdk` runs Marv from code, without the UI.
 - Evals: `bun run eval` runs real models on small tasks with hidden checks.
 
-[Unreleased]: https://github.com/FlologixAI/marv/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/FlologixAI/marv/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/FlologixAI/marv/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/FlologixAI/marv/releases/tag/v0.4.0
 [0.3.0]: https://github.com/FlologixAI/marv/compare/v0.1.2...v0.3.0
 [0.1.2]: https://github.com/FlologixAI/marv/compare/v0.1.1...v0.1.2
