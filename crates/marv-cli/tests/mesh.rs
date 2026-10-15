@@ -86,8 +86,13 @@ impl Machine {
         let settings = Value::Object(marv_oracle::runner::default_config(&server.base_url()));
         std::fs::write(config.join("config.json"), settings.to_string()).unwrap();
         let mut args = vec!["-p", prompt];
+        // A name is an --approve scope; a flag ("--approve-tainted") goes as it is.
         for a in approve {
-            args.extend(["--approve", a]);
+            if a.starts_with("--") {
+                args.push(a);
+            } else {
+                args.extend(["--approve", a]);
+            }
         }
         self.command(name, &args).spawn().unwrap()
     }
@@ -188,9 +193,14 @@ fn two_marvs_exchange_messages_over_wires_both_ends_approved() {
     )
     .unwrap();
 
-    // Each pre-approves its wire to the other and the other's wire to it.
-    let beta =
-        machine.marv("beta", &beta_model, "Wait for alpha.", &["mesh:agent.parent.inbox", "mesh:peer.alpha.agent.parent.inbox"]);
+    // Each pre-approves its wire to the other and the other's wire to it. beta replies after alpha's message tainted
+    // its session, and `marv -p` approves tainted egress only with --approve-tainted.
+    let beta = machine.marv(
+        "beta",
+        &beta_model,
+        "Wait for alpha.",
+        &["mesh:agent.parent.inbox", "mesh:peer.alpha.agent.parent.inbox", "--approve-tainted"],
+    );
     let mut reap = Reap(vec![beta]);
     wait_for("beta on the mesh", || socket(&machine, "beta").exists());
     let listed = ls(&machine);

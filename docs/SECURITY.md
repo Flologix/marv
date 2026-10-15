@@ -52,6 +52,7 @@ Narrow, named ways out, each asked for and each with its own rule for what it ca
 - **Marv's runtime folder is empty in every sandbox.** `$XDG_RUNTIME_DIR/marv` (the mesh's plug and discovery sockets, the process door's relays) is an empty tmpfs in every command's sandbox, mounted after the project and toolchains, wherever it is: a sandboxed command that could see a plug's socket could connect to it and use that plug's wires. And the mesh refuses a runtime dir outside `/run`, `/tmp` and the home folder.
 - **Approvals show the full payload.** A network approval lists the scripts written this session that the command will run.
 - **Subagents don't inherit** network, web or mesh approvals.
+- **`marv -p --approve` never answers a call that asks every time.** Tainted egress needs `--approve-tainted` as well as the call's `--approve` scope, and a protected-path write needs `--approve-protected` as well as `--approve files`; otherwise the call is refused (in `refused`, exit 3, a stderr line naming the flag). Subagents reach the same approver. The SDK hands the request to the client's approver with `must_ask` set, and an approver that answers from a policy should refuse it the same way. Guards: `tests/guards/tests/headless_taint.rs`.
 
 ## The doors out of the sandbox (Marv Sprint 4)
 Narrow, named ways out, each with what it can never do. A call through one carries its door on the approval (the prompt shows the door's warning line), on its result and in the trajectory. The doors are the main agent's: a subagent's context has none.

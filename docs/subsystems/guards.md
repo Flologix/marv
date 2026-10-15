@@ -60,6 +60,9 @@ Each guard's doc comment says how it was proven: the guard was reverted, and the
 | host: refused before any ask without `host_commands` | `host.rs::a_session_without_host_commands_refuses_it_before_its_approver_is_asked` | Proven (real bwrap) |
 | host: a subagent can't | `host.rs::a_subagent_cant_even_where_the_session_has_the_door` | Proven (real bwrap) |
 | host: `marv -p` refuses it with every `--approve` name | `host.rs::headless_refuses_it_with_every_approve_name` | Proven (two layers, both reverted) |
+| `marv -p`: tainted egress refused with `--approve web` alone | `headless_taint.rs::headless_refuses_tainted_egress_with_approve_alone` | Proven (the marv binary) |
+| `marv -p`: `--approve-tainted` opts in; untainted `--approve web` unchanged | `headless_taint.rs::headless_approve_tainted_allows_tainted_egress`, `headless_approve_web_still_allows_untainted_egress` | Controls |
+| `marv -p`: a protected-path write needs `--approve-protected` | `headless_taint.rs::headless_refuses_protected_writes_without_approve_protected` | Proven (the marv binary) |
 | Project MCP servers need trust; hash covers entry and files | `mcp.rs::project_servers_need_trust_covering_entry_and_files` | Proven |
 | `npx`/`uvx` outside the project | `mcp.rs::package_runners_start_outside_the_project` | Proven |
 | Server `instructions` ignored | `mcp.rs::server_instructions_never_leave_the_parser` | Proven (a source check until the manager connects, M7) |

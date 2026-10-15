@@ -277,10 +277,11 @@ pub async fn sdk_turn(
     TurnRun { events, results }
 }
 
-/// What `marv -p` printed as JSON, and its exit code.
+/// What `marv -p` printed as JSON, its exit code, and its stderr.
 pub struct Headless {
     pub code: Option<i32>,
     pub result: serde_json::Value,
+    pub stderr: String,
 }
 
 /// Runs the real `marv -p "do it" --output json` in `root` (the binary `cargo test --workspace` builds, or
@@ -293,10 +294,24 @@ pub fn headless(
     approve: &[&str],
     env: &[(&str, &str)],
 ) -> Headless {
+    let args: Vec<&str> = approve.iter().flat_map(|name| ["--approve", name]).collect();
+    headless_steps(root, config_dir, vec![calls], &args, env)
+}
+
+/// [`headless`] with one model reply per entry of `steps` (each makes its calls; then "Done."), and `args` added to
+/// the command line as they are (`["--approve", "web", "--approve-tainted"]`).
+pub fn headless_steps(
+    root: &Path,
+    config_dir: &Path,
+    steps: Vec<Vec<marv_oracle::script::ScriptCall>>,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> Headless {
     use marv_oracle::script::Reply;
     let bin = marv_oracle::binary();
     assert!(bin.exists(), "no marv binary at {} (cargo build -p marv-cli, or set MARV_ORACLE_BIN)", bin.display());
-    let replies = vec![Reply { tool_calls: calls, ..Reply::default() }, Reply { text: "Done.".into(), ..Reply::default() }];
+    let mut replies: Vec<Reply> = steps.into_iter().map(|calls| Reply { tool_calls: calls, ..Reply::default() }).collect();
+    replies.push(Reply { text: "Done.".into(), ..Reply::default() });
     let server =
         marv_oracle::server::FakeServer::start(replies, vec![serde_json::json!({"id": marv_oracle::runner::MODEL})]).unwrap();
     let config = serde_json::Value::Object(marv_oracle::runner::default_config(&server.base_url()));
@@ -305,10 +320,7 @@ pub fn headless(
     let home = config_dir.join("home");
     std::fs::create_dir_all(&home).unwrap();
     let mut cmd = std::process::Command::new(bin);
-    cmd.args(["-p", "do it", "--output", "json"]);
-    for name in approve {
-        cmd.args(["--approve", name]);
-    }
+    cmd.args(["-p", "do it", "--output", "json"]).args(args);
     let out = cmd
         .current_dir(root)
         .env_clear()
@@ -319,8 +331,8 @@ pub fn headless(
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let result = serde_json::from_str(&stdout).unwrap_or_else(|_| {
-        panic!("marv -p printed no JSON (exit {:?}):\n{stdout}\n{}", out.status.code(), String::from_utf8_lossy(&out.stderr))
-    });
-    Headless { code: out.status.code(), result }
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let result = serde_json::from_str(&stdout)
+        .unwrap_or_else(|_| panic!("marv -p printed no JSON (exit {:?}):\n{stdout}\n{stderr}", out.status.code()));
+    Headless { code: out.status.code(), result, stderr }
 }

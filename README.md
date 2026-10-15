@@ -356,7 +356,7 @@ marv mesh wire 'api -> web:inbox'
 
 **Claude Code, opencode and other MCP clients.** `marv mesh plug <marv> [--as <name>]` is a stdio MCP server: add it to the other agent's MCP config (command `marv`, args `["mesh", "plug", "web", "--as", "claude"]`), then wire it like any agent: `marv mesh wire 'web/claude -> web:inbox'`, approved in `web`. Its receptacles show up as MCP tools (`agent_parent_inbox`); restart the MCP server after wiring so the client lists the new tool.
 
-**In `marv -p`** the mesh is off unless you ask for it: `--approve mesh:<receptacle>` pre-approves wires to that receptacle (and nothing else), and `MARV_MESH_NAME` puts the run on the mesh under that name.
+**In `marv -p`** the mesh is off unless you ask for it: `--approve mesh:<receptacle>` pre-approves wires to that receptacle (and nothing else), and `MARV_MESH_NAME` puts the run on the mesh under that name. A message from another agent taints the session, so a send after one also needs `--approve-tainted`.
 
 Not yet: `watch` (subscribing to events), unwiring across processes (a wire to another Marv lasts until that Marv ends), a tmux adapter, and wires across machines. [`docs/MESH.md`](docs/MESH.md) has the design.
 
@@ -437,6 +437,8 @@ marv -p "audit the dependencies" --model "anthropic/claude-sonnet-5.5"
 
 **Approvals.** With nobody to ask, what yolo mode allows (sandboxed commands without network, edits outside `.git` and protected files, read-only tools) runs; everything else is refused as an error the model can read and work around, and the JSON result lists what was refused. Pass `--approve <name>` to allow more: `git_write`, `network`, `web`, `mcp`, `files`, `memory`, `agent_worktree`, `process`, `github`, or `mesh:<receptacle>`. A command that needs both git and network (a `git push`) needs both named: `--approve git_write` alone never approves a command that also uses the network. `--approve process` lets the model start background processes (a server for its own tests; `--approve network` too for one that shares the network); they all stop when the run ends. A command outside the sandbox (`sandbox: false`) is always refused here, whatever you approve.
 
+Two kinds of call ask a person every time, even in yolo, so `--approve` alone doesn't answer them in `marv -p`: once the session has read untrusted content (a web page, an MCP result, a mesh message, an image, a session-start hook's output), any call that could send something out (web, network commands, MCP, mesh); and writes to protected paths (`.git`, `.env*`, `AGENTS.md`/`CLAUDE.md`, `.marv/`…). They're refused (listed in `refused`, exit 3, with a line on stderr naming the flag) unless you also pass `--approve-tainted` or `--approve-protected`. These only widen a scope you named: `--approve web --approve-tainted` lets a run that read a page fetch another one; `--approve-tainted` alone approves nothing.
+
 **Options for `-p`:**
 
 | Flag | Effect |
@@ -446,6 +448,8 @@ marv -p "audit the dependencies" --model "anthropic/claude-sonnet-5.5"
 | `--output json` | Print a JSON object with `reply`, `reason`, `steps`, `usage` (and `refused`, when calls were) |
 | `--output stream-json` | Print a JSON line per event as it happens |
 | `--approve <name>` | Auto-approve calls in this scope (repeatable) |
+| `--approve-tainted` | Also approve egress in those scopes after the session read untrusted content |
+| `--approve-protected` | Also approve writes to protected paths (with `--approve files`) |
 | `--max-steps <N>` | Steps before the turn stops (`0` never stops) |
 | `-m`, `--model <name>` | Use a different model |
 | `-c` / `--continue` | Continue the latest saved session |

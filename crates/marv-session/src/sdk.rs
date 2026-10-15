@@ -161,6 +161,9 @@ impl SessionBuilder {
         self.options.sources = sources.to_vec();
         self
     }
+    /// The client's approver. A request with `must_ask` (tainted egress, a protected-path write) is one a person
+    /// must answer every time: an approver that answers from a policy instead (as `marv -p --approve` does) should
+    /// refuse it unless its user opted in (`--approve-tainted`, `--approve-protected`).
     pub fn approve(mut self, approver: Arc<dyn Approver>) -> Self {
         self.options.approve = Some(approver);
         self
