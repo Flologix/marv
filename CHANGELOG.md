@@ -6,12 +6,15 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-15
+
 ### Added
 
 - **The mesh radio, phase 1: presence (#124). Opt-in, off by default.** With `/radio on` (or `"mesh": {"radio": true}` in your own `~/.marv/config.json`), your Marvs on one machine show each other in one line above the prompt: name, idle, working or waiting for its user, and the conversation's title. `/radio` lists them with their panes and how long each state has lasted; `/radio off` leaves. `"mesh": {"radio": {"titles": false}}` keeps the title out. Presence is drawn in the TUI only: no other Marv's words reach a model, and `mesh_list`'s new "On the radio" section gives the model names and states only, without tainting the conversation. A Marv that stops answering shows `silent` after 45 s and drops after 120 s; one that was killed shows `left (lost)` and its socket is removed. `marv mesh ls` has a `radio` column. Links are private Unix sockets, each end checked by its process id; sandboxed commands can't see them. A project's `.marv/config.json` that sets `mesh` (the radio or wake) is ignored with a startup note; there's no flag or environment variable for it, and `marv -p` and subagents are never on the radio. Sending messages and requests on the radio come in later phases.
 
 ### Fixed
 
+- **A git command Marv stops no longer leaves its children running.** When `marv -p` exited while the checkpoint store's `git gc` was still running, Marv killed `git` but not the `git repack` it had started, which went on writing into the checkpoint folder afterwards. Marv's own git commands now run in their own process group, and the whole group is killed when one is stopped, as bash commands already are.
 - **`herdr.pane.*.send` types prompts only: text starting with `/`, `!` or `#` is refused.** A pane send is a prompt, not a command: what's typed into another agent's pane goes to that agent as a request, never to its own commands (a slash command, a shell line, a memory note). After control characters and the ends are cleaned up, a send whose first visible character is `/`, `!` or `#` is refused whole, with "herdr.pane.send types a prompt, not a command: text starting with / ! or # is refused; nothing was typed". `mesh_call` checks it first, so it doesn't ask the user to wire anything; the `.send` description says so. Those characters later in a prompt are typed as before. A Marv in a Herdr pane tells Herdr it's working, not idle, while something other than an empty prompt has its keyboard (the ctrl+k palette, setup, the session picker, `/radio`'s roster, the splash, a half-typed slash command), so a send isn't typed into it then. And a pane that was just sent a prompt takes no other for 5 s, one send at a time, so a second send can't land while the first is being taken in.
 - **A mesh message that isn't text is refused, never typed or passed on as JSON (#123).** A `herdr.pane.<pane>.send` whose arguments weren't `{"text": "..."}` (a model sent `{"prompt": "..."}`) typed the JSON into the pane. Now the switchboard refuses it, and any `send` to an inbox or to another Marv's inbox whose body isn't a JSON string or `{"text": "..."}`, with `expected {"text": "..."}` and nothing typed or queued. An object with keys besides `text` is refused too, so no words are dropped quietly. `mesh_call` checks a pane send's arguments first, so a bad one doesn't ask the user to wire anything.
 - **`mesh_list` and the pane receptacles say how to read a pane (#123).** `herdr.pane.<pane>.status` with `lines: N` returns the pane's last N lines (what its agent shows); its description and `mesh_list`'s hint now say so.
@@ -211,7 +214,8 @@ The first public release, on npm as `@flologixai/marv`.
 - The SDK: `createSession()` from `@flologixai/marv/sdk` runs Marv from code, without the UI.
 - Evals: `bun run eval` runs real models on small tasks with hidden checks.
 
-[Unreleased]: https://github.com/FlologixAI/marv/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/FlologixAI/marv/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/FlologixAI/marv/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/FlologixAI/marv/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/FlologixAI/marv/releases/tag/v0.4.0
 [0.3.0]: https://github.com/FlologixAI/marv/compare/v0.1.2...v0.3.0
