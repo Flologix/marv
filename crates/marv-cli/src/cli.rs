@@ -70,8 +70,8 @@ pub struct Cli {
     #[arg(long = "approve", value_name = "SCOPE")]
     pub approve: Vec<String>,
 
-    /// With --approve, in -p: also approve egress (web, network, MCP, mesh) after the session read untrusted
-    /// content. Without it, those calls are refused.
+    /// With --approve, in -p: also approve egress (web, network, MCP, mesh, GitHub) after the session read
+    /// untrusted content. Without it, those calls are refused.
     #[arg(long = "approve-tainted")]
     pub approve_tainted: bool,
 
