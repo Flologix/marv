@@ -2507,8 +2507,9 @@ impl MarvSession {
                 if s.lookups != ticket {
                     return; // the provider changed meanwhile
                 }
-                // What the list says changes the request: the reasoning switch, and the output limit (#96).
-                if info.reasoning.is_some() || info.max_output.is_some() {
+                // What the list says changes the request: the reasoning switch, the output limit (#96), and the
+                // window that clamps it (#116).
+                if info.reasoning.is_some() || info.max_output.is_some() || info.context.is_some() {
                     s.provider = factory.make(None, Some(&info));
                 }
                 s.info = Some(info);
@@ -4095,6 +4096,29 @@ mod turn_tests {
         assert_eq!(session.model_info().unwrap().reasoning, Some(ReasoningSupport::Optional));
         assert_eq!(*lock(&made), [None, Some(ReasoningSupport::Optional)]);
         assert_eq!(changed.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_list_that_gives_only_the_window_remakes_the_provider() {
+        // #116: the window clamps max_tokens, so the provider is made again with it.
+        let dirs = Dirs::new();
+        let made: Arc<Mutex<Vec<Option<u64>>>> = Arc::default();
+        let factory = TestFactory {
+            id: "openrouter".into(),
+            model: "x/y".into(),
+            local: false,
+            make: {
+                let made = made.clone();
+                Arc::new(move |_, info| {
+                    lock(&made).push(info.and_then(|i| i.context));
+                    Arc::new(Scripted::new(vec![])) as Arc<dyn Provider>
+                })
+            },
+            lookup: Some(Arc::new(|| Box::pin(async { Some(info(Some(200_000), None)) }))),
+        };
+        let session = make(&dirs, factory, |_| {});
+        assert!(until(|| session.context_length() == Some(200_000)).await);
+        assert_eq!(*lock(&made), [None, Some(200_000)]);
     }
 
     #[tokio::test]

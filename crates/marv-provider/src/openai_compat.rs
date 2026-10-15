@@ -103,8 +103,8 @@ static UNSUPPORTED: LazyLock<regex::Regex> = LazyLock::new(|| {
         .unwrap()
 });
 
-/// #116: the least `max_tokens` a request gets when it's clamped to the room left in the window: below this a model
-/// can't finish even a short answer. Never more than the model's own limit.
+/// #116: the least `max_tokens` a clamped request is sent with: below this a model can't finish even a short answer.
+/// When the room left is smaller, the request goes without `max_tokens` (a cap that small would only be refused).
 pub const MIN_MAX_TOKENS: u64 = 1024;
 /// #116: tokens per byte of request body assumed until a reply reports its prompt count: 4 characters a token, the
 /// estimate compaction uses. JSON escaping makes the body longer than the text, so it errs toward a smaller cap.
@@ -145,13 +145,14 @@ impl Room {
     }
 
     /// The `max_tokens` for a body of `bytes` bytes, given the model's limit `max`: at most the window minus the
-    /// prompt's estimate (+5% headroom), never below [`MIN_MAX_TOKENS`] (nor above `max`). `max` when the window
-    /// isn't known.
-    pub fn cap(&self, max: u64, bytes: usize) -> u64 {
-        let Some(window) = self.window.filter(|&w| w > 0) else { return max };
+    /// prompt's estimate (+5% headroom). `None` (send none) when that room is under [`MIN_MAX_TOKENS`] (or `max`, if
+    /// smaller): such a cap wouldn't fit either, and a refusal costs a round trip. `max` when the window isn't known.
+    pub fn cap(&self, max: u64, bytes: usize) -> Option<u64> {
+        let Some(window) = self.window.filter(|&w| w > 0) else { return Some(max) };
         let ratio = self.tokens_per_byte.unwrap_or(ASSUMED_TOKENS_PER_BYTE);
         let prompt = (bytes as f64 * ratio * crate::ollama::PROMPT_MARGIN).ceil() as u64;
-        max.min(window.saturating_sub(prompt).max(MIN_MAX_TOKENS))
+        let room = window.saturating_sub(prompt);
+        (room >= MIN_MAX_TOKENS.min(max)).then(|| max.min(room))
     }
 }
 
@@ -689,19 +690,20 @@ struct Outgoing {
 
 impl Outgoing {
     /// The body of the next attempt (#64: with the kept partial reply and the note, if any). #116: `max_tokens` is
-    /// clamped to the room `room` says the prompt leaves (the body is built again only when that changes it).
-    fn body(&mut self, options: &OpenAiCompatOptions, room: Room, kept: &str) -> Vec<u8> {
+    /// clamped to the room `room` says the prompt leaves (the body is built again only when that changes it). Also
+    /// returns the `max_tokens` sent.
+    fn body(&mut self, options: &OpenAiCompatOptions, room: Room, kept: &str) -> (Vec<u8>, Option<u64>) {
         let Self { history, system, tools, tool_choice, note } = self;
         with_continuation(history, *note, kept, |history| {
             let mut request = request_body(options, history, system.as_deref(), tools, *tool_choice);
             let body = serde_json::to_vec(&request).expect("a request body is plain JSON");
-            let Some(max) = options.max_tokens else { return body };
+            let Some(max) = options.max_tokens else { return (body, None) };
             let cap = room.cap(max, body.len());
-            if cap == max {
-                return body;
+            if cap == Some(max) {
+                return (body, cap);
             }
-            request.max_tokens = Some(cap);
-            serde_json::to_vec(&request).expect("a request body is plain JSON")
+            request.max_tokens = cap;
+            (serde_json::to_vec(&request).expect("a request body is plain JSON"), cap)
         })
     }
 }
@@ -823,7 +825,7 @@ async fn run(
         for (name, value) in &o.headers {
             request = request.header(name, value);
         }
-        let body = outgoing.body(&o, shared.room(), &kept);
+        let (body, sent_cap) = outgoing.body(&o, shared.room(), &kept);
         let bytes = body.len();
         let Some(sent) = until_cancelled(&cancel, request.body(body).send()).await else { return };
         let response = match sent {
@@ -884,7 +886,7 @@ async fn run(
         }
         let Some(detail) = read_error(response, &cancel).await else { return };
         // #96: a provider that won't take max_tokens (or can't fit it beside this prompt) gets the request without it.
-        if (400..500).contains(&status) && o.max_tokens.is_some() && MAX_TOKENS_REFUSED.is_match(&detail) {
+        if (400..500).contains(&status) && sent_cap.is_some() && MAX_TOKENS_REFUSED.is_match(&detail) {
             if NAMES_MAX_TOKENS.is_match(&detail) && UNSUPPORTED.is_match(&detail) {
                 shared.refused.store(true, Ordering::Relaxed);
             }
@@ -896,6 +898,10 @@ async fn run(
                     room.record(input, bytes);
                 });
                 refit = true;
+                // Never the cap that was just refused again (a cap of None leaves it out at once).
+                if o.max_tokens.and_then(|max| shared.room().cap(max, bytes)) == sent_cap {
+                    o.max_tokens = None;
+                }
             } else {
                 o.max_tokens = None;
             }
@@ -1215,19 +1221,22 @@ mod tests {
     #[test]
     fn the_cap_is_the_room_left_in_the_window_with_a_floor() {
         // No window known: the model's limit.
-        assert_eq!(Room::default().cap(32_000, 1_000_000), 32_000);
+        assert_eq!(Room::default().cap(32_000, 1_000_000), Some(32_000));
         // Before any measurement, 4 bytes a token (+5%): 400 KB is 105000 tokens.
         let room = Room { window: Some(131_072), tokens_per_byte: None };
-        assert_eq!(room.cap(32_000, 400_000), 26_072);
-        assert_eq!(room.cap(32_000, 1_000), 32_000);
+        assert_eq!(room.cap(32_000, 400_000), Some(26_072));
+        assert_eq!(room.cap(32_000, 1_000), Some(32_000));
         // Measured: the highest ratio wins, so a cached prefix doesn't lower it.
         let mut room = Room { window: Some(50_000), tokens_per_byte: None };
         room.record(30_000, 100_000);
         room.record(10_000, 100_000);
-        assert_eq!(room.cap(32_000, 100_000), 18_500);
-        // A full window still gets the floor, but never more than the model's limit.
-        assert_eq!(room.cap(32_000, 200_000), MIN_MAX_TOKENS);
-        assert_eq!(room.cap(512, 200_000), 512);
+        assert_eq!(room.cap(32_000, 100_000), Some(18_500));
+        // Under the floor the request goes without a cap: a cap that small would be refused too.
+        assert_eq!(room.cap(32_000, 150_000), Some(2_750));
+        assert_eq!(room.cap(32_000, 200_000), None);
+        assert_eq!(room.cap(32_000, 157_000), None, "545 tokens left: under the floor");
+        // A model whose own limit is under the floor keeps it while that fits.
+        assert_eq!(room.cap(512, 157_000), Some(512));
     }
 
     #[test]
