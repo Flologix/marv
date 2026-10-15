@@ -47,6 +47,15 @@ Each guard's doc comment says how it was proven: the guard was reverted, and the
 | A network approval lists scripts written this session | `provenance.rs::a_network_approval_lists_the_scripts_it_runs` | Ignored: not built yet |
 | A mesh message that wakes an idle Marv is fenced and taints; its turn's egress asks (#78) | `mesh.rs::a_woken_turn_reads_its_message_fenced_and_tainted_and_egress_asks` | Proven |
 | Subagents don't inherit network/web/mesh approvals | `provenance.rs::subagents_inherit_taint_but_no_egress_approvals` | Proven |
+| … the config's pre-approved scopes too (#98) | `approvals.rs::subagents_dont_inherit_config_scopes` | Proven |
+| Pre-approved scopes answer their own scopes (#98) | `approvals.rs::config_approve_answers_its_scopes_without_asking` | Proven (session level) |
+| Pre-approved never cover tainted egress (#98) | `approvals.rs::config_approve_never_covers_tainted_egress` | Proven (the `must_ask` half reverted) |
+| Pre-approved never cover protected paths (#98) | `approvals.rs::config_approve_never_covers_protected_paths` | Proven (same revert) |
+| Pre-approved never cover lifecycle scripts (#98) | `approvals.rs::config_approve_never_covers_lifecycle_scripts` | Proven (same revert) |
+| Pre-approved never grant a mesh wire (#98) | `approvals.rs::config_approve_never_grants_a_mesh_wire` | Proven (construction: `wire_approval` is `must_ask`+`once`) |
+| Writable entries refused at startup (#98) | `sandbox.rs::refused_writable_entries_are_refused_at_startup` | Proven (any hidden top-level home entry: the rule dropped → failed) |
+| A writable folder that is or holds a git repo refused (#98 review) | `sandbox.rs::git_repositories_are_refused_as_writable_entries` | Proven (the `.git` checks dropped → failed) |
+| A writable folder writable, nothing else new (#98) | `sandbox.rs::the_writable_folder_is_writable_and_nothing_else_new_is` | Proven (real bwrap; the session merge dropped → failed) |
 | A worktree subagent's `.git` is read-only; Marv commits for it | `worktree.rs::a_worktree_subagents_git_is_read_only_and_marv_commits_for_it` | Proven (real bwrap, #12) |
 | … Marv's commit trusts nothing the worktree says | `worktree.rs::marvs_commit_trusts_nothing_the_worktree_says` | Proven (#12) |
 | github: what gh can never do never reaches it, whatever the approver says | `github.rs::what_can_never_run_never_reaches_gh_and_isnt_asked` | Proven (fake gh) |

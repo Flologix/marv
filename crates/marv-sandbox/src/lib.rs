@@ -25,6 +25,7 @@ pub mod notes;
 pub mod paths;
 pub mod protected;
 pub mod taint;
+pub mod writable;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -33,6 +34,7 @@ pub use bwrap::{Bind, FileKind, FsProbe, MESH_SOCKET, RealFs, SandboxOptions, sa
 pub use paths::{project_path, resolve_in_project, resolve_within, touches_git};
 pub use protected::{PROTECTED_PATHS, ProtectedPath, ProtectedRule, is_protected, protected_rule};
 pub use taint::TaintState;
+pub use writable::resolve as resolve_writable;
 
 /// Whether every sandbox hides `dir`: it is (by its real path) under `/run`, `/tmp` or the home folder, which each
 /// command sees as empty tmpfs. The mesh keeps its sockets only in such a folder: a socket a sandboxed command could
@@ -89,6 +91,10 @@ pub struct Sandbox {
     pub mesh_socket: Option<PathBuf>,
     /// Folders every command sees empty: Marv's runtime folder (`$XDG_RUNTIME_DIR/marv`, see `SandboxOptions::hidden`).
     pub hidden: Vec<PathBuf>,
+    /// Extra folders outside the project every command may change (#98): the config's `"writable"`, already
+    /// checked (`writable::resolve`) and canonical. None of the refusal happens here — a path in this list was
+    /// accepted at startup.
+    pub writable: Vec<PathBuf>,
 }
 
 /// One command's mounts beyond the session's: see [`SandboxOptions`] for what each means.
@@ -118,6 +124,7 @@ impl Sandbox {
                 .filter(|d| d.is_absolute())
                 .map(|d| vec![d.join("marv")])
                 .unwrap_or_default(),
+            writable: Vec::new(),
         }
     }
 
@@ -141,7 +148,14 @@ impl Sandbox {
             path: self.path.clone(),
             lang: self.lang.clone(),
             read_only: mounts.read_only.clone(),
-            writable: mounts.writable.clone(),
+            // The session's extra writable folders (#98) with this command's own on top.
+            writable: self
+                .writable
+                .iter()
+                .chain(mounts.writable.iter())
+                .filter(|d| !mounts.read_only.contains(d))
+                .cloned()
+                .collect(),
             placeholders: mounts.placeholders.clone(),
             project_read_only: mounts.project_read_only,
             protected: protected::protected_mounts(root),

@@ -285,7 +285,8 @@ pub fn hooks_note(runs: &[HookRun]) -> Option<String> {
 /// The most of a project's `.marv/config.json` that's read to look for `hooks`.
 pub const PROJECT_CONFIG_CAP: u64 = 1024 * 1024;
 
-/// A project's `.marv/config.json` with a `hooks` key: the startup note saying it was not run. `None` when there's no
+/// A project's `.marv/config.json` with a `hooks` key: the startup note saying it was not run (and, #98, with an
+/// `approve` or `writable` key: that it was ignored). `None` when there's no
 /// such file, it has no `hooks`, or it *is* the user's own config (`user_config`, e.g. Marv started in the home folder
 /// with the default config dir). The file is only looked at, never used: no project setting reaches Marv's config.
 ///
@@ -312,12 +313,27 @@ pub fn project_hooks_refusal(root: &Path, user_config: &Path) -> Option<String> 
         return None;
     }
     let raw: Value = serde_json::from_str(&text).ok()?;
-    raw.get("hooks")?;
-    Some(
-        "This project's .marv/config.json has \"hooks\": not run. Hooks run only from your own ~/.marv/config.json, \
-         never from a project's (a cloned repository could otherwise run commands when Marv starts)."
-            .into(),
-    )
+    let mut notes = Vec::new();
+    if raw.get("hooks").is_some() {
+        notes.push(
+            "This project's .marv/config.json has \"hooks\": not run. Hooks run only from your own ~/.marv/config.json, \
+             never from a project's (a cloned repository could otherwise run commands when Marv starts)."
+                .to_string(),
+        );
+    }
+    // #98: the same for the keys that widen what runs without asking. They're never read from here either (no project
+    // setting reaches Marv's config); the note only says so.
+    let widening: Vec<String> =
+        ["approve", "writable"].into_iter().filter(|k| raw.get(*k).is_some()).map(|k| format!("\"{k}\"")).collect();
+    if !widening.is_empty() {
+        notes.push(format!(
+            "This project's .marv/config.json has {}: ignored. Pre-approved scopes and writable sandbox folders come \
+             only from your own ~/.marv/config.json, never from a project's (a cloned repository could otherwise \
+             approve its own calls or widen the sandbox).",
+            widening.join(" and ")
+        ));
+    }
+    (!notes.is_empty()).then(|| notes.join(" "))
 }
 
 #[cfg(test)]
@@ -564,6 +580,11 @@ mod tests {
         std::fs::write(root.join(".marv/config.json"), r#"{"hooks": {"sessionStart": ["touch pwned"]}}"#).unwrap();
         let refusal = project_hooks_refusal(&root, &user).unwrap();
         assert!(refusal.contains(".marv/config.json has \"hooks\": not run"), "{refusal}");
+        // #98: a project's pre-approvals and writable folders are told about too (never read).
+        std::fs::write(root.join(".marv/config.json"), r#"{"approve": ["network"], "writable": ["/"]}"#).unwrap();
+        let refusal = project_hooks_refusal(&root, &user).unwrap();
+        assert!(refusal.contains("has \"approve\" and \"writable\": ignored"), "{refusal}");
+        assert!(!refusal.contains("hooks"), "{refusal}");
         // Marv started in the home folder: the project's .marv/config.json is the user's own.
         assert_eq!(project_hooks_refusal(&root, &root.join(".marv/config.json")), None);
         let _ = std::fs::remove_dir_all(&root);

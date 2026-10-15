@@ -46,20 +46,8 @@ pub enum ExitCode {
     NeedsApproval = 3,
 }
 
-/// Known `--approve` names and the scope-key prefixes they match.
-pub const APPROVE_PREFIXES: [(&str, &[&str]); 9] = [
-    ("git_write", &["bash:git:", "bash:net:git:"]),
-    ("network", &["bash:net:"]),
-    ("web", &["web:"]),
-    ("mcp", &["mcp:"]),
-    ("files", &["files"]),
-    ("memory", &["memory"]),
-    ("agent_worktree", &["agent:worktree"]),
-    ("process", &["process:"]),
-    // The github tool's writes and sensitive reads (#47); its reads need nothing.
-    ("github", &["github:"]),
-];
-
+/// The scope names and their matching live in `marv_session::approvals` (`APPROVE_PREFIXES` there) — the same
+/// list the config's `"approve"` and the TUI's `--approve` use (#98).
 /// `marv -p --approve`'s approver: yes for the listed scopes, unavailable for the rest.
 #[derive(Debug, Clone)]
 pub struct ScopeApprover {
@@ -69,13 +57,13 @@ pub struct ScopeApprover {
 #[async_trait]
 impl Approver for ScopeApprover {
     async fn approve(&self, request: ApprovalRequest) -> Decision {
-        let key = &request.scope.key;
-        // A background process that shares the user's network needs network too, as a bash command with it does.
-        if key.starts_with("process:net:") {
-            let has = |prefix: &str| self.prefixes.iter().any(|p| p == prefix);
-            return if has("process:") && has("bash:net:") { Decision::Yes } else { Decision::Unavailable };
+        // The same matching the seeded "always" scopes use (#98): the listed prefixes cover their keys, and a
+        // background process with the network needs process and network both.
+        if marv_session::approvals::prefix_covers(&self.prefixes, &request.scope.key) {
+            Decision::Yes
+        } else {
+            Decision::Unavailable
         }
-        if self.prefixes.iter().any(|p| key == p || key.starts_with(p.as_str())) { Decision::Yes } else { Decision::Unavailable }
     }
 }
 
@@ -83,19 +71,11 @@ impl Approver for ScopeApprover {
 pub type HeadlessApprovals = (Option<Arc<dyn Approver>>, Vec<marv_mesh::ReceptacleName>);
 
 /// The `--approve` list as an approver (`None` for an empty list) plus the pre-approved mesh receptacles. An
-/// unknown name is an error (exit 1), as Marv's `runHeadless` checked before anything ran.
+/// unknown name is an error (exit 1), as Marv's `runHeadless` checked before anything ran. The scope names and
+/// their matching live in `marv_session::approvals` — the same list the config's `"approve"` and the TUI's
+/// `--approve` use (#98).
 pub fn build_approver(names: &[String]) -> Result<HeadlessApprovals, String> {
-    let (mesh, names) = marv_session::mesh::headless_grants(names)?;
-    let mut prefixes = Vec::new();
-    for name in &names {
-        match APPROVE_PREFIXES.iter().find(|(n, _)| n == name) {
-            Some((_, p)) => prefixes.extend(p.iter().map(|s| s.to_string())),
-            None => {
-                let known: Vec<&str> = APPROVE_PREFIXES.iter().map(|(n, _)| *n).collect();
-                return Err(format!("Unknown --approve scope \"{name}\". Known: {}, mesh:<receptacle>", known.join(", ")));
-            }
-        }
-    }
+    let (mesh, mut prefixes) = marv_session::approvals::parse_approvals(names)?;
     // A pre-approved receptacle's mesh tool calls are approved too (scope `mesh:<receptacle>:<mode>`).
     prefixes.extend(mesh.iter().map(|r| format!("mesh:{r}:")));
     let approver = (!prefixes.is_empty()).then(|| Arc::new(ScopeApprover { prefixes }) as Arc<dyn Approver>);
@@ -366,6 +346,28 @@ pub async fn run_headless(options: HeadlessOptions) -> ExitCode {
         env.insert("MARV_MODEL".into(), model.clone());
     }
     let config = resolve_config(file.as_ref(), &env);
+    // The config's pre-approved scopes (#98) seed the session's "always" layer (never the headless approver, so a
+    // subagent doesn't inherit them, as the guards require), and its writable folders (#98) are bound read-write
+    // into every sandbox. Both go on stderr with the rest of the startup notice (stdout stays the reply).
+    let mut seed_problems = Vec::new();
+    let seeds = config
+        .approve
+        .iter()
+        .filter(|name| match marv_session::approvals::parse_approvals(std::slice::from_ref(name)) {
+            Ok(_) => true,
+            Err(problem) => {
+                seed_problems.push(problem);
+                false
+            }
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for problem in &seed_problems {
+        eprintln!("{problem}");
+    }
+    if !seeds.is_empty() {
+        eprintln!("Pre-approved for this session (config): {}", seeds.join(", "));
+    }
     // The SDK takes each provider's own options: Ollama's endpoint is `host` and it has a context length.
     let provider = match config.provider {
         marv_provider::ProviderKind::Ollama => marv_provider::ProviderOption::Ollama {
@@ -386,6 +388,22 @@ pub async fn run_headless(options: HeadlessOptions) -> ExitCode {
             return ExitCode::Error;
         }
     };
+    // The config's extra writable folders (#98), resolved once here (refused ones are problems on stderr, not
+    // mounts), and bound read-write into every sandbox.
+    let (writable, writable_problems) = marv_sandbox::resolve_writable(
+        &config.writable,
+        &home,
+        &root,
+        std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from).as_deref(),
+        Some(&config_dir),
+    );
+    for problem in &writable_problems {
+        eprintln!("{problem}");
+    }
+    if !writable.is_empty() {
+        let shown: Vec<String> = writable.iter().map(|d| marv_session::paths::shorten_home(d, &home)).collect();
+        eprintln!("Writable in the sandbox besides the project (config): {}", shown.join(", "));
+    }
     let mut builder = marv_session::SessionBuilder::new(root.clone(), provider)
         .sources(&[marv_session::sources::Source::User, marv_session::sources::Source::Project])
         .max_steps(options.max_steps.unwrap_or(config.max_steps))
@@ -393,7 +411,9 @@ pub async fn run_headless(options: HeadlessOptions) -> ExitCode {
         // Marv exits after the reply and stops its background processes (main.rs): the process tool says so (#86).
         .one_shot(true)
         .persist(marv_session::sdk::Store::Default)
-        .trajectories(if config.trajectories { marv_session::sdk::Store::Default } else { marv_session::sdk::Store::Off });
+        .trajectories(if config.trajectories { marv_session::sdk::Store::Default } else { marv_session::sdk::Store::Off })
+        .pre_approve(&seeds)
+        .writable(writable);
     if let Some(approve) = approve {
         builder = builder.approve(approve);
     }
@@ -528,8 +548,12 @@ mod tests {
         let (a, _) = build_approver(&["git_write".into()]).unwrap();
         let a = a.unwrap();
         assert_eq!(a.approve(request("bash:git:commit")).await, Decision::Yes);
-        assert_eq!(a.approve(request("bash:net:git:push")).await, Decision::Yes);
+        // git_write alone never covers a command with the network: a push needs network too.
+        assert_eq!(a.approve(request("bash:net+git:git push")).await, Decision::Unavailable);
+        assert_eq!(a.approve(request("bash:net:git:;curl x")).await, Decision::Unavailable);
         assert_eq!(a.approve(request("bash:net:curl")).await, Decision::Unavailable);
+        let (both, _) = build_approver(&["git_write".into(), "network".into()]).unwrap();
+        assert_eq!(both.unwrap().approve(request("bash:net+git:git push")).await, Decision::Yes);
         let (a, _) = build_approver(&["files".into(), "web".into()]).unwrap();
         let a = a.unwrap();
         assert_eq!(a.approve(request("files")).await, Decision::Yes);

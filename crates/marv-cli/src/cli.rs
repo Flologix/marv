@@ -65,8 +65,9 @@ pub struct Cli {
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     pub output: OutputFormat,
 
-    /// Auto-approve a scope in -p (git_write, network, web, mcp, files, memory, agent_worktree, process, github,
-    /// mesh:<receptacle>).
+    /// Auto-approve a scope for this session (git_write, network, web, mcp, files, memory, agent_worktree, process,
+    /// github, mesh:<receptacle>) — like answering "always" at the start. Works in -p and the TUI; the config's
+    /// "approve" list is the same thing.
     #[arg(long = "approve", value_name = "SCOPE")]
     pub approve: Vec<String>,
 
@@ -134,9 +135,11 @@ pub enum MeshCommand {
 /// What the process should do, resolved from the arguments.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Mode {
-    /// The TUI. `resume`: `Some(true)` for -c (latest), `Some(false)` for -r (pick).
+    /// The TUI. `resume`: `Some(true)` for -c (latest), `Some(false)` for -r (pick). `approve`: the `--approve`
+    /// scopes (#98), which seed "always" like the config's list.
     Interactive {
         resume: Option<bool>,
+        approve: Vec<String>,
     },
     /// `-p`/`run`. `prompt` is `-` for stdin.
     Headless {
@@ -184,6 +187,7 @@ impl Cli {
                     } else {
                         None
                     },
+                    approve: self.approve.clone(),
                 },
             },
         }
@@ -200,9 +204,14 @@ mod tests {
 
     #[test]
     fn modes() {
-        assert_eq!(parse(&[]).mode(), Mode::Interactive { resume: None });
-        assert_eq!(parse(&["-c"]).mode(), Mode::Interactive { resume: Some(true) });
-        assert_eq!(parse(&["-r"]).mode(), Mode::Interactive { resume: Some(false) });
+        assert_eq!(parse(&[]).mode(), Mode::Interactive { resume: None, approve: vec![] });
+        assert_eq!(parse(&["-c"]).mode(), Mode::Interactive { resume: Some(true), approve: vec![] });
+        assert_eq!(parse(&["-r"]).mode(), Mode::Interactive { resume: Some(false), approve: vec![] });
+        // #98: --approve is accepted in the TUI too, not only -p.
+        assert_eq!(
+            parse(&["--approve", "web", "-c"]).mode(),
+            Mode::Interactive { resume: Some(true), approve: vec!["web".into()] }
+        );
         assert_eq!(parse(&["-p", "fix it"]).mode(), Mode::Headless { prompt: "fix it".into() });
         assert_eq!(parse(&["-p", "-"]).mode(), Mode::Headless { prompt: "-".into() });
         assert_eq!(parse(&["run", "fix", "it"]).mode(), Mode::Headless { prompt: "fix it".into() });
@@ -255,5 +264,22 @@ mod tests {
     fn the_command_line_is_well_formed() {
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    // The flag's help names the scope names by hand; it must not drift from the real list (#98).
+    #[test]
+    fn the_help_names_every_approve_scope() {
+        let help: String = {
+            use clap::CommandFactory as _;
+            Cli::command()
+                .get_arguments()
+                .find(|a| a.get_long() == Some("approve"))
+                .map(|a| a.get_long_help().or_else(|| a.get_help()).map(|h| h.to_string()).unwrap_or_default())
+                .unwrap_or_default()
+        };
+        for (name, _) in marv_session::approvals::APPROVE_PREFIXES {
+            assert!(help.contains(name), "the --approve help doesn't name \"{name}\": {help}");
+        }
+        assert!(help.contains("TUI"), "the help should say --approve works in the TUI too: {help}");
     }
 }

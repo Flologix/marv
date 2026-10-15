@@ -6,7 +6,7 @@ use std::sync::Arc;
 use marv_guards::{Recorder, TempDir, call, require_bwrap, run_sandboxed, sandbox_with_home};
 use marv_sandbox::git_guard::git_guard;
 use marv_sandbox::protected::{created_note, protected_snapshot, revert_created, scan_created};
-use marv_sandbox::{CommandMounts, ProtectedRule, resolve_in_project, resolve_within};
+use marv_sandbox::{CommandMounts, ProtectedRule, Sandbox, resolve_in_project, resolve_within};
 use marv_tools::{Approval, Decision, ToolContext, builtin_tools, run_tool};
 use serde_json::json;
 
@@ -354,6 +354,180 @@ fn secrets_are_masked_in_the_sandbox() {
     for secret in ["sk-secret", "PEM-SECRET", "RSA-SECRET"] {
         assert!(!ran.output.contains(secret), "{secret}: {}", ran.output);
     }
+}
+
+// ---- extra writable folders (#98) ------------------------------------------------------------------------------
+
+/// **The config's `"writable"` entries: refused ones are refused at startup, not mounted.** `~`, `/`, `~/.ssh`,
+/// `~/.marv`, a folder holding a protected path, and a parent of the project resolve to nothing (problems, not
+/// paths); the good folder beside them resolves to its canonical path.
+///
+/// Proven: dropped the `refuse` checks in `marv_sandbox::writable` → this failed (the home and `.ssh` resolved).
+#[test]
+fn refused_writable_entries_are_refused_at_startup() {
+    let (project, home) = (TempDir::new("wrt"), TempDir::outside_tmp("wrt-home"));
+    std::fs::create_dir_all(home.path().join(".ssh")).unwrap();
+    std::fs::create_dir_all(home.path().join(".beads")).unwrap();
+    std::os::unix::fs::symlink(home.path().join(".ssh"), home.path().join("link")).unwrap();
+    let runtime = home.path().join("xdg");
+    std::fs::create_dir_all(runtime.join("marv")).unwrap();
+    let home_str = home.path().to_str().unwrap();
+    let bad = [
+        home_str.to_string(),
+        "/".to_string(),
+        format!("{home_str}/.ssh"),
+        format!("{home_str}/link"),
+        "~/.marv".to_string(),
+        format!("{home_str}/xdg/marv"),
+        format!("{home_str}/.nope"),
+        home_str.to_string(),
+        // #98 review: the ways out of the sandbox the name blocklist missed — any hidden top-level home entry:
+        // .local/bin (a planted binary on PATH runs on the host), .config/autostart (runs at the next login),
+        // .claude (its hooks run on the host).
+        format!("{home_str}/.local/bin"),
+        "~/.local/bin".to_string(),
+        "~/.config/autostart".to_string(),
+        "~/.claude".to_string(),
+    ];
+    // The good one — the task's own example: a visible tree beside the repos, not a top-level dot entry.
+    let good = format!("{home_str}/Projects/marv/.beads");
+    std::fs::create_dir_all(home.path().join("Projects/marv/.beads")).unwrap();
+    let (accepted, problems) = marv_sandbox::resolve_writable(
+        &[bad.as_slice(), std::slice::from_ref(&good)].concat(),
+        home.path(),
+        project.path(),
+        Some(&runtime),
+        None,
+    );
+    for entry in &bad {
+        assert!(problems.iter().any(|p| p.contains(entry)), "{entry} not refused: {problems:?}");
+    }
+    assert!(accepted.contains(&std::path::PathBuf::from(&good)), "the good folder resolves: {accepted:?} / {problems:?}");
+    assert_eq!(accepted.len(), 1, "only the good one is mounted: {accepted:?}");
+}
+
+/// **Nothing Marv keeps for itself is a writable folder** (#98 review): Marv's config folder wherever
+/// `MARV_CONFIG_DIR` puts it — a visible one escapes the hidden-entry rule, and its `config.json` hooks run outside the
+/// sandbox at the next start — its `tool-output` folder, a folder holding it, and the mesh's socket folder *inside*
+/// `$XDG_RUNTIME_DIR/marv` (`marv/mesh`), not only `marv/` itself.
+///
+/// Proven: dropped the config-folder check, and the `real.starts_with(sockets)` half of the runtime check, in
+/// `marv_sandbox::writable::refuse` → this failed (each resolved).
+#[test]
+fn marvs_own_folders_are_refused_as_writable_entries() {
+    let (project, home) = (TempDir::new("wrt-own"), TempDir::outside_tmp("wrt-own-home"));
+    let config = home.path().join("marv-config");
+    std::fs::create_dir_all(config.join("tool-output")).unwrap();
+    let runtime = home.path().join("xdg");
+    std::fs::create_dir_all(runtime.join("marv/mesh")).unwrap();
+    let entries = ["~/marv-config", "~/marv-config/tool-output", "~/xdg/marv/mesh"];
+    let (accepted, problems) = marv_sandbox::resolve_writable(
+        &entries.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        home.path(),
+        project.path(),
+        Some(&runtime),
+        Some(&config),
+    );
+    for entry in entries {
+        assert!(problems.iter().any(|p| p.contains(entry) && p.contains("Refusing")), "{entry} not refused: {problems:?}");
+    }
+    assert!(accepted.is_empty(), "{accepted:?}");
+}
+
+/// **A writable folder that is a git repository — or sits inside one's `.git`, or directly holds a `.git` entry
+/// (a worktree's `.git` file included) — is refused at startup**: a planted `.git/hooks` script runs on the
+/// host's next git command there. `~/Projects/marv/.beads`, a *visible* folder beside a repo's own `.git`,
+/// stays accepted.
+///
+/// Proven: dropped the `.git` component/direct-entry checks in `marv_sandbox::writable::refuse` → this failed
+/// (the repositories resolved).
+#[test]
+fn git_repositories_are_refused_as_writable_entries() {
+    let (project, home) = (TempDir::new("wrt-git"), TempDir::outside_tmp("wrt-git-home"));
+    std::fs::create_dir_all(home.path().join("repo/.git/hooks")).unwrap();
+    std::fs::create_dir_all(home.path().join("wt")).unwrap();
+    std::fs::write(home.path().join("wt/.git"), "gitdir: /nowhere\n").unwrap();
+    let entries = ["~/repo", "~/repo/.git/hooks", "~/wt"];
+    let (accepted, problems) = marv_sandbox::resolve_writable(
+        &entries.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        home.path(),
+        project.path(),
+        None,
+        None,
+    );
+    for entry in entries {
+        assert!(problems.iter().any(|p| p.contains("git repository")), "{entry} not refused: {problems:?}");
+    }
+    assert!(accepted.is_empty(), "{accepted:?}");
+    // The visible tree beside a repository stays allowed (the config's own example's shape).
+    std::fs::create_dir_all(home.path().join("Projects/marv/.beads")).unwrap();
+    let (accepted, problems) =
+        marv_sandbox::resolve_writable(&["~/Projects/marv/.beads".to_string()], home.path(), project.path(), None, None);
+    assert_eq!(accepted, vec![home.path().join("Projects/marv/.beads")], "{problems:?}");
+}
+
+/// **A `writable` folder is writable inside the sandbox, and nothing else new is.** With
+/// `"writable": ["<dir>"]` a yolo bash command `touch <dir>/x` needs no approval and succeeds; another host folder
+/// beside it stays read-only, and so does `~/.ssh` (masked home).
+///
+/// Proven: dropped the session's `writable` merge in `Sandbox::command_argv` → this failed (the touch failed).
+#[tokio::test]
+async fn the_writable_folder_is_writable_and_nothing_else_new_is() {
+    require_bwrap!();
+    let (project, home) = (TempDir::new("wrt-run"), TempDir::outside_tmp("wrt-run-home"));
+    let beads = TempDir::outside_tmp("wrt-run-beads");
+    let other = TempDir::outside_tmp("wrt-run-other");
+    let (accepted, problems) = marv_sandbox::resolve_writable(
+        &[beads.path().display().to_string()],
+        home.path(),
+        project.path(),
+        std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from).as_deref(),
+        None,
+    );
+    assert_eq!(accepted, vec![beads.path()], "{problems:?}");
+    let sandbox = Sandbox { writable: accepted, ..sandbox_with_home(home.path()) };
+    let ran = run_sandboxed(
+        &sandbox,
+        project.path(),
+        &CommandMounts::default(),
+        &format!(
+            "touch {}/x && echo beads-ok; touch {}/y 2>/dev/null && echo other-ok; echo",
+            beads.path().display(),
+            other.path().display()
+        ),
+        &[],
+    );
+    assert!(ran.output.contains("beads-ok"), "{}", ran.output);
+    assert!(!ran.output.contains("other-ok"), "{}", ran.output);
+    assert!(beads.path().join("x").exists(), "{}", ran.output);
+    assert!(!other.path().join("y").exists());
+}
+
+/// **A `writable` entry is never one whose parent a sandboxed command can change** (#119 review): one in the project
+/// (writable already) or inside another entry is left out. Otherwise a command swaps the entry's parent for a
+/// symlink, and the next command's bwrap resolves it and binds the real folder it leads to (another repository's
+/// `.git/hooks` here) read-write.
+///
+/// Proven: dropped the in-project skip in `marv_sandbox::writable::resolve` → this failed (the other repository's
+/// hook was written).
+#[tokio::test]
+async fn a_writable_entry_in_the_project_cant_be_swapped_for_a_symlink() {
+    require_bwrap!();
+    let (project, home) = (TempDir::new("wrt-swap"), TempDir::outside_tmp("wrt-swap-home"));
+    let other = TempDir::outside_tmp("wrt-swap-other");
+    std::fs::create_dir_all(other.path().join(".git/hooks")).unwrap();
+    std::fs::create_dir_all(project.path().join("tools/hooks")).unwrap();
+    let entry = project.path().join("tools/hooks");
+    let (accepted, problems) =
+        marv_sandbox::resolve_writable(&[entry.display().to_string()], home.path(), project.path(), None, None);
+    assert!(problems.is_empty(), "{problems:?}");
+    let sandbox = Sandbox { writable: accepted, ..sandbox_with_home(home.path()) };
+    let swap = format!("mv tools tools.old && ln -s {} tools && echo swapped", other.path().join(".git").display());
+    let ran = run_sandboxed(&sandbox, project.path(), &CommandMounts::default(), &swap, &[]);
+    assert!(ran.output.contains("swapped"), "{}", ran.output);
+    let plant = format!("echo pwned > {}/pre-commit 2>/dev/null; echo", entry.display());
+    run_sandboxed(&sandbox, project.path(), &CommandMounts::default(), &plant, &[]);
+    assert!(!other.path().join(".git/hooks/pre-commit").exists(), "another repository's hook was planted");
 }
 
 // ---- realpath --------------------------------------------------------------------------------------------------

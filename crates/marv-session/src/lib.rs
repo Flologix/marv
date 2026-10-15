@@ -17,6 +17,7 @@
 //! `marv_core::printable()`.
 
 pub mod agents;
+pub mod approvals;
 pub mod checkpoints;
 pub mod checks;
 pub mod commands;
@@ -52,7 +53,7 @@ pub mod usage;
 pub mod worktree;
 
 pub use checkpoints::undo::{UndoFile, UndoPlan, UndoRefusal, UndoResult, undo_request, undo_summary};
-pub use runner::{ApprovalRecord, SessionAgentHost, SessionApprover, SessionToolRunner, ToolDisplay};
+pub use runner::{AlwaysScopes, ApprovalRecord, SessionAgentHost, SessionApprover, SessionToolRunner, ToolDisplay};
 pub use sdk::{SessionBuilder, SessionOptions, create_session};
 pub use session::{
     CheckpointProblem, CompactFailure, CompactResult, Configure, Feedback, MarvSession, ProviderChoice, RateOutcome,
