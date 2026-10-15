@@ -348,7 +348,8 @@ pub struct RadioTimings {
     pub presence_gap: Duration,
     /// How often liveness is checked.
     pub tick: Duration,
-    /// A link whose frame can't be written for this long is dropped (a peer that stopped reading).
+    /// A link whose frame can't be written for this long, or whose send queue stays full this long (a peer that
+    /// stopped reading, or reads too slowly to keep up), is dropped.
     pub write_timeout: Duration,
 }
 
@@ -475,7 +476,8 @@ impl Presence {
     /// A presence another Marv sent: exactly the listed fields (any other is refused), each keeping its rule.
     pub fn parse(value: &Value) -> Result<Self, String> {
         let presence: Self = serde_json::from_value(value.clone())
-            .map_err(|e| format!("not a presence (only name, state, title, project, pane, since_ms, wake, version): {e}"))?;
+            // Never serde's words: they quote the frame (a field's name), and refusals go to the trajectory.
+            .map_err(|_| "not a presence (only name, state, title, project, pane, since_ms, wake, version)".to_string())?;
         presence.check()?;
         Ok(presence)
     }
@@ -579,7 +581,8 @@ pub fn parse_frame(params: &Value, own: &str, link_peer: &str, max_text: usize) 
         }
         Some("msg") => {
             let fields: MsgFields = serde_json::from_value(params.clone())
-                .map_err(|e| format!("not a message (only v, id, seq, kind, to, by, reply_to, hop, text, at_ms): {e}"))?;
+                // Never serde's words: they quote the frame (a field's name), and refusals go to the trajectory.
+                .map_err(|_| "not a message (only v, id, seq, kind, to, by, reply_to, hop, text, at_ms)".to_string())?;
             if fields.id != format!("{link_peer}:{}", fields.seq) {
                 return Err("the message's id names another Marv than the link's: the sender is the link".into());
             }
@@ -719,6 +722,9 @@ struct Link {
     dirty: Arc<Notify>,
     queue: Arc<Mutex<VecDeque<String>>>,
     queued: Arc<Notify>,
+    /// Since when the queue has been full without emptying since (§5.3: a peer whose queue stays full for
+    /// `write_timeout`, 30 s, is dropped, even one that reads a line now and then).
+    full_since: Arc<Mutex<Option<Instant>>>,
 }
 
 impl Link {
@@ -726,17 +732,36 @@ impl Link {
         self.queue.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Queues one line for the writer, unless `cap` lines wait already: never blocks.
+    fn full_since(&self) -> MutexGuard<'_, Option<Instant>> {
+        self.full_since.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Queues one line for the writer, unless `cap` lines wait already: never blocks. Marks when the queue filled.
     fn push(&self, line: String, cap: usize) -> bool {
         {
             let mut queue = self.queue();
             if queue.len() >= cap {
+                self.full_since().get_or_insert_with(Instant::now);
                 return false;
             }
             queue.push_back(line);
+            if queue.len() >= cap {
+                self.full_since().get_or_insert_with(Instant::now);
+            }
         }
         self.queued.notify_one();
         true
+    }
+
+    /// The writer's next line. Only a queue that empties counts as caught up: one that a trickling reader keeps
+    /// one slot short of full stays "full" (§5.3, review P3-1).
+    fn pop(&self) -> Option<String> {
+        let mut queue = self.queue();
+        let line = queue.pop_front();
+        if queue.is_empty() {
+            *self.full_since() = None;
+        }
+        line
     }
 }
 
@@ -745,23 +770,11 @@ struct Peer {
     status: Status,
     last_frame: Instant,
     link: Option<Link>,
-    /// Its messages to this Marv (§6.3: per sender, at the receiver).
-    rate_in: RateLimiter,
-    /// This Marv's messages to it: the same limit, mirrored, so a refusal is told at once to whoever sends.
-    rate_out: RateLimiter,
 }
 
 impl Peer {
-    fn new(presence: Option<Presence>, link: Link, limits: &RadioLimits) -> Self {
-        let now = now_ms();
-        Self {
-            presence,
-            status: Status::Live,
-            last_frame: Instant::now(),
-            link: Some(link),
-            rate_in: RateLimiter::new(limits.rate(), now),
-            rate_out: RateLimiter::new(limits.rate(), now),
-        }
+    fn new(presence: Option<Presence>, link: Link) -> Self {
+        Self { presence, status: Status::Live, last_frame: Instant::now(), link: Some(link) }
     }
 }
 
@@ -789,6 +802,10 @@ pub struct Radio {
     limits: RadioLimits,
     /// The last [`TRAFFIC_KEPT`] messages, for the TUI.
     traffic: Mutex<VecDeque<Traffic>>,
+    /// Per Marv, by name, across its links (a peer that leaves and rejoins keeps its count): its messages to this
+    /// one (§6.3: per sender, at the receiver), and this one's to it (the same limit, mirrored, so a refusal is told at
+    /// once to whoever sends). Only ever locked after `peers`, never before it.
+    rates: Mutex<BTreeMap<String, (RateLimiter, RateLimiter)>>,
     on: AtomicBool,
     titles: AtomicBool,
     /// This Marv's presence as it is (its title kept even with titles off: [`Self::presence`] leaves it out).
@@ -826,6 +843,7 @@ impl Radio {
             timings,
             limits,
             traffic: Mutex::default(),
+            rates: Mutex::default(),
             on: AtomicBool::new(false),
             titles: AtomicBool::new(true),
             me: Mutex::new(Presence { name: sb.session.clone(), ..me }),
@@ -1050,6 +1068,19 @@ impl Radio {
                 if let Status::Gone { at, .. } = p.status {
                     return at.elapsed() < self.timings.left_shown;
                 }
+                // A queue full this long: the peer reads too slowly to keep up (a trickle never trips the write's own
+                // timeout), so it's dropped and must rejoin (§5.3).
+                if let Some(full) = *link.full_since()
+                    && full.elapsed() >= self.timings.write_timeout
+                {
+                    link.stop.cancel();
+                    events.push((
+                        name.clone(),
+                        RadioEvent::Dropped,
+                        Some(format!("its send queue stayed full for {} s", full.elapsed().as_secs())),
+                    ));
+                    return false;
+                }
                 let quiet = p.last_frame.elapsed();
                 if quiet >= self.timings.drop_after {
                     link.stop.cancel();
@@ -1104,7 +1135,7 @@ impl Radio {
                 return Ok(());
             }
             let link = self.new_link(true, false);
-            peers.insert(peer.clone(), Peer::new(None, link.clone(), &self.limits));
+            peers.insert(peer.clone(), Peer::new(None, link.clone()));
             link
         };
         let opened = tokio::time::timeout(DOOR_TIMEOUT, self.open(&peer)).await.unwrap_or_else(|_| Err("no answer".into()));
@@ -1145,6 +1176,7 @@ impl Radio {
             dirty: Arc::new(Notify::new()),
             queue: Arc::default(),
             queued: Arc::new(Notify::new()),
+            full_since: Arc::default(),
         }
     }
 
@@ -1200,7 +1232,7 @@ impl Radio {
                 }
             }
             let link = self.new_link(false, true);
-            peers.insert(from.to_string(), Peer::new(Some(presence), link.clone(), &self.limits));
+            peers.insert(from.to_string(), Peer::new(Some(presence), link.clone()));
             link
         };
         self.record(from, RadioEvent::Joined, None);
@@ -1218,13 +1250,19 @@ impl Radio {
         tokio::spawn(Arc::clone(self).read_loop(peer, link, read));
     }
 
-    async fn write_line(&self, write: &mut OwnedWriteHalf, line: &str) -> bool {
-        matches!(tokio::time::timeout(self.timings.write_timeout, write.write_all(line.as_bytes())).await, Ok(Ok(())))
+    /// One line, within `write_timeout`; a link stopped meanwhile (dropped) ends the write.
+    async fn write_line(&self, write: &mut OwnedWriteHalf, line: &str, link: &Link) -> bool {
+        tokio::select! {
+            written = tokio::time::timeout(self.timings.write_timeout, write.write_all(line.as_bytes())) => {
+                matches!(written, Ok(Ok(())))
+            }
+            _ = link.stop.cancelled() => false,
+        }
     }
 
-    async fn send(&self, write: &mut OwnedWriteHalf, presence: &Presence) -> bool {
+    async fn send(&self, write: &mut OwnedWriteHalf, presence: &Presence, link: &Link) -> bool {
         let frame = presence_frame(&self.name, self.next_seq(), presence);
-        self.write_line(write, &encode_line(&Message::Notification(Notification::new(FRAME, Some(frame))))).await
+        self.write_line(write, &encode_line(&Message::Notification(Notification::new(FRAME, Some(frame)))), link).await
     }
 
     /// One link's writer, so a peer that doesn't read never stalls anything else: the queued frames (messages, and
@@ -1239,9 +1277,8 @@ impl Radio {
             if !self.is_on() || link.stop.is_cancelled() {
                 break;
             }
-            loop {
-                let Some(line) = link.queue().pop_front() else { break };
-                if !self.write_line(&mut write, &line).await {
+            while let Some(line) = link.pop() {
+                if !self.write_line(&mut write, &line, &link).await {
                     self.record(&peer, RadioEvent::Dropped, Some("its link stopped taking frames".into()));
                     break 'link;
                 }
@@ -1251,7 +1288,7 @@ impl Radio {
             }
             // At most one presence per gap: changes meanwhile are taken by the one sent at its end.
             if presence_due && Instant::now() >= last + self.timings.presence_gap {
-                if !self.send(&mut write, &self.presence()).await {
+                if !self.send(&mut write, &self.presence(), &link).await {
                     self.record(&peer, RadioEvent::Dropped, Some("its link stopped taking frames".into()));
                     break;
                 }
@@ -1269,7 +1306,7 @@ impl Radio {
         // A leave goes at once.
         if !self.is_on() && !link.stop.is_cancelled() {
             let left = Presence { state: PresenceState::Left, since_ms: now_ms(), ..self.presence() };
-            self.send(&mut write, &left).await;
+            self.send(&mut write, &left, &link).await;
         }
         let _ = write.shutdown().await;
         link.stop.cancel();
@@ -1343,7 +1380,7 @@ impl Radio {
             }
             entry.last_frame = Instant::now();
             entry.status = Status::Live;
-            entry.rate_in.take(peer, now_ms())
+            self.take_rate(peer, true, now_ms())
         };
         let record = |outcome: Outcome| RadioFrameRecord {
             at_ms: now_ms(),
@@ -1446,6 +1483,15 @@ impl Radio {
             link.stop.cancel();
         }
         self.notify_ui();
+    }
+
+    /// Takes a message's token from `peer`'s limiter (`inbound`: its messages to this Marv; else this Marv's to it).
+    fn take_rate(&self, peer: &str, inbound: bool, now: u64) -> crate::Result<()> {
+        let mut rates = self.rates.lock().unwrap_or_else(|e| e.into_inner());
+        let limits = self.limits.rate();
+        let (rate_in, rate_out) =
+            rates.entry(peer.to_string()).or_insert_with(|| (RateLimiter::new(limits, now), RateLimiter::new(limits, now)));
+        if inbound { rate_in.take(peer, now) } else { rate_out.take(peer, now) }
     }
 
     fn traffic(&self) -> MutexGuard<'_, VecDeque<Traffic>> {
@@ -1565,7 +1611,7 @@ impl Radio {
                 match peers.get_mut(peer) {
                     Some(entry) if entry.linked().is_some_and(|l| l.established) => {
                         let link = entry.link.clone().expect("linked");
-                        match entry.rate_out.take(peer, at_ms) {
+                        match self.take_rate(peer, false, at_ms) {
                             Err(crate::MeshError::RateLimited { retry_ms, .. }) => Some(format!(
                                 "too many messages to {peer} (at most {} a minute): try again in {} s",
                                 self.limits.per_minute,
@@ -1876,6 +1922,26 @@ mod tests {
         );
         a.radio.turn_off().await;
         assert_eq!(a.radio.send_msg(&To::All, By::Model, 0, "x").unwrap_err(), "the radio is off");
+    }
+
+    /// Review P3-4: the rates are per Marv, not per link: one that leaves and rejoins keeps its count.
+    #[tokio::test]
+    async fn a_rejoin_keeps_the_rate() {
+        let mesh = Runtime::new();
+        let a = marv_limited("alpha", &mesh.0, limits(2));
+        let b = marv("beta", &mesh.0, fast());
+        a.radio.turn_on().await;
+        b.radio.turn_on().await;
+        until("a link", || a.radio.links().len() == 1).await;
+        for text in ["one", "two"] {
+            assert!(a.radio.send_msg(&To::All, By::Model, 0, text).unwrap().refused.is_empty());
+        }
+        b.radio.turn_off().await;
+        until("gone", || a.radio.links().is_empty()).await;
+        b.radio.turn_on().await;
+        until("linked again", || a.radio.links().len() == 1).await;
+        let third = a.radio.send_msg(&To::All, By::Model, 0, "three").unwrap();
+        assert!(third.refused[0].1.starts_with("too many messages to beta"), "{third:?}");
     }
 
     /// A full radio queue at the receiver refuses the new message and tells the sender with a fixed code.
