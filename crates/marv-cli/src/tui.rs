@@ -904,6 +904,7 @@ impl Bridge {
         init.max_steps = Some(config.max_steps);
         (init.sandbox, init.yolo, init.diagnostics, init.checks, init.mcp_tools) =
             (config.sandbox, config.yolo, config.diagnostics, config.checks, config.mcp_tools);
+        init.formatter = config.formatter;
         // The person at this terminal approves each command on the host (#52); gh where it's logged in (#47).
         init.host_commands = true;
         init.github = s.github;

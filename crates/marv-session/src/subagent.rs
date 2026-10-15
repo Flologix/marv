@@ -100,6 +100,8 @@ pub fn subagent_context(
     ctx.home = parent.home.clone();
     ctx.cancel = parent.cancel.clone();
     ctx.sandbox = parent.sandbox.clone();
+    // The subagent's edits format like the main agent's (#67); the hook takes each root per call (a worktree's own).
+    ctx.formatter = parent.formatter.clone();
     ctx.yolo = parent.yolo;
     ctx.skills = parent.skills.clone();
     ctx.taint = Arc::new(parent.taint.for_subagent());

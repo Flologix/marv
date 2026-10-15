@@ -15,6 +15,8 @@
 //!   trajectories (they record named fields).
 //! - `ToolContext::before_change` is started (not awaited) by the edit tools' preview and awaited in `run` before
 //!   writing: the session takes the typecheck's baseline there, so it sees the project as it was.
+//! - `ToolContext::formatter` (#67) is what the edit tools run after their write: the session builds it (detection
+//!   plus the sandboxed run), the tools re-read the file and diff what's on disk.
 //! - `ToolContext::checkpoint` (#16) is awaited by `run_tool` after the approval (or yolo) and before running any
 //!   call whose tool takes one (`Tool::checkpoint`); `Preview::files` is /undo's list of files, each with its diff.
 //!
@@ -30,6 +32,7 @@ use std::any::Any;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::formatter::Formatter;
 use async_trait::async_trait;
 pub use marv_core::Door;
 use marv_core::{Provenance, ToolKind, ToolSpec};
@@ -380,6 +383,9 @@ pub struct ToolContext {
     /// The running processes' forwarded ports: a sandboxed bash command (without network) gets a relay to each, so
     /// its `curl localhost:<port>` reaches the session's own servers. Subagents get this too (but not `processes`).
     pub forwards: Option<Arc<dyn ProcessForwards>>,
+    /// The project's formatter (#67), built by the session: it runs on every file the edit tools write, inside the
+    /// sandbox, before the tools' notes; without it (off, or no sandbox) the tools change nothing but their edit.
+    pub formatter: Option<Arc<dyn Formatter>>,
     /// Commands that failed in the sandbox without network in a way that looked like it (#81): a retry without
     /// network is asked for with network instead (bash's `repair`). Fresh for each context (the session's turn, a
     /// subagent).
@@ -429,6 +435,7 @@ impl ToolContext {
             doors: Doors::default(),
             processes: None,
             forwards: None,
+            formatter: None,
             network_failures: Arc::default(),
             tool_output: None,
         }
