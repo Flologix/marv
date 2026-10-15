@@ -3326,6 +3326,24 @@ mod tests {
         assert_eq!((shown.agent.as_deref(), shown.once), (Some("implementer · Task 2"), true));
     }
 
+    /// #77: the session's one prompt for a call and its new wire reaches the TUI as "Yes (wire it)" or "No".
+    #[test]
+    fn a_call_needing_a_new_wire_shows_yes_wire_it_or_no() {
+        use marv_mesh::{PlugId, ReceptacleName, WireMode, approval::WireRequest};
+        let request = WireRequest {
+            from: PlugId::new("parent").unwrap(),
+            to: ReceptacleName::new("peer.web.agent.parent.inbox").unwrap(),
+            mode: WireMode::Send,
+            asked_by: PlugId::new("parent").unwrap(),
+        };
+        let call = marv_tools::Preview { title: "Send a message".into(), text: Some("hi".into()), ..Default::default() };
+        let shown = approval_request(&marv_session::mesh::call_wire_approval(&request, call));
+        assert_eq!(marv_session::mesh::MESH_WIRE_CALL, marv_tui::ui::approval::MESH_WIRE_CALL);
+        let view = marv_tui::ui::approval::ApprovalView::new(shown, 0, true);
+        let labels: Vec<&str> = view.select.items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, ["Yes (wire it)", "No"]);
+    }
+
     #[test]
     fn tool_entries_show_a_failures_message_and_subagents_keep_their_title() {
         let call = ToolCall { id: "a1".into(), name: "agent".into(), arguments: "{}".into() };
