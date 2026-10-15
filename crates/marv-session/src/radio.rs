@@ -104,6 +104,10 @@ impl TurnHop {
     pub fn set(&self, hop: u32) {
         self.0.store(hop, Ordering::SeqCst);
     }
+    /// At least `hop` from now on (a turn the radio started read a message from deeper in a chain).
+    pub fn raise(&self, hop: u32) {
+        self.0.fetch_max(hop, Ordering::SeqCst);
+    }
 }
 
 /// `radio_tx`: the main agent's message to other Marvs on the radio. Never asks (§8.2), never waits for a peer.
@@ -232,8 +236,11 @@ pub struct RadioWakeLimit {
 impl RadioWakeLimit {
     /// The person typed: paused radio wakes may wake again (§8.6, 4: "until the user types").
     pub fn person_typed(&mut self) {
-        self.paused = false;
-        self.overall.clear();
+        // Only a pause ends here (its window with it, or it would pause again at once); typing doesn't reset a count
+        // that hasn't tripped (review P3-5).
+        if std::mem::take(&mut self.paused) {
+            self.overall.clear();
+        }
     }
 
     fn sender_has_room(&mut self, from: &str, now_ms: u64) -> bool {
@@ -309,6 +316,21 @@ mod tests {
         assert_eq!(to(json!("@58a7")), To::Names(vec!["@58a7".into()]));
         assert_eq!(to(json!(["a", " b "])), To::Names(vec!["a".into(), "b".into()]));
         assert!(serde_json::from_value::<RadioTxInput>(json!({"to": "a", "text": "x", "kind": "request"})).is_err());
+    }
+
+    /// Review P3-5: typing ends a pause, but doesn't reset a count that hasn't tripped.
+    #[test]
+    fn typing_ends_a_pause_but_not_the_count() {
+        let mut limit = RadioWakeLimit::default();
+        for i in 0..RADIO_WAKES_OVERALL - 1 {
+            limit.take(&format!("s{i}"), 0);
+        }
+        limit.person_typed();
+        assert_eq!(limit.overall.len(), RADIO_WAKES_OVERALL - 1, "not paused: the count stands");
+        limit.take("last", 0);
+        limit.paused = true;
+        limit.person_typed();
+        assert!(!limit.paused && limit.overall.is_empty());
     }
 
     #[test]

@@ -208,32 +208,64 @@ pub fn wire_approver(own: Option<Arc<dyn WireApprover>>, approve: Option<&Arc<dy
     own.or_else(|| approve.map(|inner| Arc::new(PersonWires { inner: inner.clone(), by: WireBy::Tui }) as Arc<dyn WireApprover>))
 }
 
-/// The unread messages in `agent`'s inbox, fenced, as one note for the model; marks the session tainted (Mesh). For
-/// the main agent, the radio's unread messages too (#124), in their own fence after the inbox's: subagents aren't on
-/// the radio, so a worker's read never takes them.
+/// Whether a turn reads the radio's queue (#124), and what that does to its hop. Only two kinds of turn read it: the
+/// person's own (their approvals apply, and a person typing resets the chain: hop 0), and one the radio woke, which
+/// runs with automatic approval off and whose hop rises past every message it reads. A turn a wired inbox woke
+/// (#78) doesn't: it may auto-approve, so radio text waits for one of the other two (review of #124, P2-1).
+#[derive(Clone, Default)]
+pub enum RadioRead {
+    /// Leave the radio's messages unread (subagents, inbox-woken turns, callers that don't say).
+    #[default]
+    Skip,
+    /// The person's turn: read them; the hop stays the person's (0).
+    Read,
+    /// A turn the radio started: read them, and raise the turn's hop to one past the highest read.
+    RaiseHop(Arc<crate::radio::TurnHop>),
+}
+
+/// The unread messages in `agent`'s inbox, fenced, as one note for the model; marks the session tainted (Mesh). The
+/// radio's unread messages too when `radio` says so and `agent` is the main agent (subagents aren't on the radio), in
+/// their own fence after the inbox's.
 pub fn inbox_note(mesh: &Switchboard, agent: &PlugId, taint: &TaintState) -> Option<String> {
+    inbox_note_with(mesh, agent, taint, &RadioRead::Skip)
+}
+
+/// [`inbox_note`], reading the radio as `radio` says.
+pub fn inbox_note_with(mesh: &Switchboard, agent: &PlugId, taint: &TaintState, radio: &RadioRead) -> Option<String> {
     let messages = mesh.drain_inbox(agent);
-    let radio = if agent.as_str() == PARENT { mesh.drain_radio() } else { Vec::new() };
-    if messages.is_empty() && radio.is_empty() {
+    let read = agent.as_str() == PARENT && !matches!(radio, RadioRead::Skip);
+    let radio_messages = if read { mesh.drain_radio() } else { Vec::new() };
+    if messages.is_empty() && radio_messages.is_empty() {
         return None;
     }
-    // Before the text goes anywhere: the request that carries it is sent tainted.
+    // Before the text goes anywhere: the request that carries it is sent tainted, and what the model sends after it
+    // carries the hop of the deepest chain it read.
     taint.mark(Provenance::Mesh);
+    if let (RadioRead::RaiseHop(hop), Some(deepest)) = (radio, radio_messages.iter().map(|m| m.hop).max()) {
+        hop.raise(deepest.saturating_add(1));
+    }
     let mut notes: Vec<String> = messages.iter().map(|m| m.fenced()).collect();
-    notes.extend(marv_mesh::radio::radio_note(&radio));
+    notes.extend(marv_mesh::radio::radio_note(&radio_messages));
     Some(notes.join("\n\n"))
 }
 
-/// `after_step` that also reads the agent's inbox: its messages follow the step's own note (the checks').
-pub fn with_inbox(inner: Option<AfterStep>, mesh: MeshHandle, agent: PlugId, taint: Arc<TaintState>) -> AfterStep {
+/// `after_step` that also reads the agent's inbox (and the radio as `radio` says): its messages follow the step's own
+/// note (the checks').
+pub fn with_inbox(
+    inner: Option<AfterStep>,
+    mesh: MeshHandle,
+    agent: PlugId,
+    taint: Arc<TaintState>,
+    radio: RadioRead,
+) -> AfterStep {
     Arc::new(move |runs| {
-        let (inner, mesh, agent, taint) = (inner.clone(), mesh.clone(), agent.clone(), taint.clone());
+        let (inner, mesh, agent, taint, radio) = (inner.clone(), mesh.clone(), agent.clone(), taint.clone(), radio.clone());
         Box::pin(async move {
             let note = match inner {
                 Some(after) => after(runs).await,
                 None => None,
             };
-            match (note, inbox_note(&mesh, &agent, &taint)) {
+            match (note, inbox_note_with(&mesh, &agent, &taint, &radio)) {
                 (Some(note), Some(inbox)) => Some(format!("{note}\n\n{inbox}")),
                 (note, inbox) => note.or(inbox),
             }
@@ -360,7 +392,7 @@ impl SubagentPlug {
 
     /// Its `after_step`: reads its inbox between steps.
     pub fn after_step(&self, inner: Option<AfterStep>, taint: Arc<TaintState>) -> AfterStep {
-        with_inbox(inner, self.access.mesh.clone(), self.plug.id.clone(), taint)
+        with_inbox(inner, self.access.mesh.clone(), self.plug.id.clone(), taint, RadioRead::Skip)
     }
 }
 

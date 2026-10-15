@@ -1335,8 +1335,23 @@ impl MarvSession {
             Some(note) => format!("{note}\n\n{for_model}"),
             None => for_model.to_string(),
         };
+        // #124: the radio's messages are read only in the person's own turn (hop 0: a person typing resets the chain)
+        // and in a turn the radio started (automatic approval off; its hop rises past the deepest message it reads).
+        // A turn a wired inbox woke leaves them unread: it may auto-approve (review P2-1).
+        self.inner.radio_hop.set(match woken {
+            Woken::Radio(by) => by.turn_hop(),
+            _ => 0,
+        });
+        let radio_read = match woken {
+            Woken::No => crate::mesh::RadioRead::Read,
+            Woken::Radio(_) => crate::mesh::RadioRead::RaiseHop(self.inner.radio_hop.clone()),
+            Woken::Inbox => crate::mesh::RadioRead::Skip,
+        };
         // Mesh messages that came in since the last step: before the user's message, fenced as data.
-        let inbox = init.mesh.as_ref().and_then(|m| crate::mesh::inbox_note(m, &crate::mesh::parent_id(), &self.inner.taint));
+        let inbox = init
+            .mesh
+            .as_ref()
+            .and_then(|m| crate::mesh::inbox_note_with(m, &crate::mesh::parent_id(), &self.inner.taint, &radio_read));
         let message = match inbox {
             Some(inbox) => format!("{inbox}\n\n{message}"),
             None => message,
@@ -1403,12 +1418,8 @@ impl MarvSession {
 
         // #124: a turn the radio started runs with automatic approval off (§8.4): its approvals are asked once each,
         // say why, and are never answered from the session's remembered "always" (nor are its subagents'); yolo and an
-        // approved URL prefix don't apply (`no_auto_approval` below). Its hop is one past the waking message's.
+        // approved URL prefix don't apply (`no_auto_approval` below). Its hop was set before its first read, above.
         let radio_turn = matches!(woken, Woken::Radio(_));
-        self.inner.radio_hop.set(match woken {
-            Woken::Radio(by) => by.turn_hop(),
-            _ => 0,
-        });
         let client: Option<Arc<dyn Approver>> = init
             .approve
             .clone()
@@ -1495,8 +1506,13 @@ impl MarvSession {
         );
         if let Some(mesh) = &init.mesh {
             let taint = self.inner.taint.clone();
-            options.after_step =
-                Some(crate::mesh::with_inbox(options.after_step.take(), mesh.clone(), crate::mesh::parent_id(), taint));
+            options.after_step = Some(crate::mesh::with_inbox(
+                options.after_step.take(),
+                mesh.clone(),
+                crate::mesh::parent_id(),
+                taint,
+                radio_read,
+            ));
         }
         // A direct call to a deferred MCP tool runs as the mcp_call it meant (#14), and its result says so.
         let deferred = self.state().listing.as_ref().is_some_and(|l| l.mode == McpMode::Deferred);
