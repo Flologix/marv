@@ -6,6 +6,12 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+### Changed
+
+- **Marv looks on your disk first for "where is" and "how big is" questions.** The system prompt now says to find or measure something on this machine (`find`, `du`, `wc -l`) before going to the network: asked how many lines of code Marv has, a model found the GitHub URL in the installed binary and spent 20 steps on a clone the sandbox couldn't make, then estimated from the GitHub API, while the source was already on disk (#81).
+- **The `process` tool says what to send when `start` has no command.** The error now shows a complete call (`{"action": "start", "command": "bun run dev"}`), lists the fields that did arrive, and points one-off commands (a build, a clone, a count) to `bash`; the tool's description says `start` always needs a command (#81).
+- **Evals: `count-lines-local` must reach the exact count in 8 requests or fewer.** `bench.py` writes the run's request count into `__eval_run__.json` for a check that reads it (#81).
+
 ## [0.7.0] - 2026-10-15
 
 ### Changed

@@ -8,7 +8,8 @@
   python3 -I evals/bench.py --report evals/results/<run>  [<run> …]
 
 A task is a folder in evals/tasks: task.md (the request), repo/ (the starting files), check/ (hidden tests, copied in
-only after the agent finishes), solution/ (files that make the check pass, for --verify). Each run gets a fresh git
+only after the agent finishes), solution/ (files that make the check pass, for --verify). A check may read the final
+reply (__eval_reply__.md) and the run's request count (__eval_run__.json), which bench.py writes in after the run. Each run gets a fresh git
 repository in a temp folder. The check is `bun test ./__eval__.test.js`, only ever in bubblewrap (no network, a cleared
 environment, an empty home, only the workspace writable): it runs code the model wrote.
 
@@ -32,6 +33,9 @@ EVALS = ROOT / "evals"
 TASKS = EVALS / "tasks"
 MCP_DATA = ROOT / "tests/oracle/mcp"
 REPLY_FILE, COMMENTS = "__eval_reply__.md", "__tracker_comments__.json"
+# For a check that grades how the run went, not only what it left (count-lines-local: at most 8 requests, #81):
+# {"requests": <model requests>}, Marv's `steps`. Written by bench.py after the run, replacing anything the agent left.
+RUN_FILE = "__eval_run__.json"
 CLAUDE_TOOLS = "Read,Edit,Write,Glob,Grep,Bash,TodoWrite,mcp__tracker"
 # Tasks that don't measure the same thing for Claude Code. dev-server-claim checks that the reply doesn't tell the
 # user a server is up: true of Marv, whose sandbox the server can't leave, false of Claude Code's unsandboxed one.
@@ -356,8 +360,11 @@ class Run:
             write_fresh(ws / COMMENTS, recorded.read_text() if recorded.exists() else "[]")
         # Only for a check that reads the reply: anywhere else it's one more file in the repo (it would still name
         # what a rename task removed, say).
-        if res.get("reply") and any(REPLY_FILE in f.read_text() for f in (TASKS / task / "check").rglob("*.js")):
+        checks = [f.read_text() for f in (TASKS / task / "check").rglob("*.js")]
+        if res.get("reply") and any(REPLY_FILE in c for c in checks):
             write_fresh(ws / REPLY_FILE, res["reply"])
+        if any(RUN_FILE in c for c in checks):
+            write_fresh(ws / RUN_FILE, json.dumps({"requests": res.get("requests")}))
         res["pass_"], output = check(ws, task)
         if not res["pass_"]: res["checkOutput"] = output
         shutil.rmtree(ws, ignore_errors=True)
