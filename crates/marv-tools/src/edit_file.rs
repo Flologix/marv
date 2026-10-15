@@ -12,10 +12,10 @@
 //! - Yolo: `auto_safe` outside `.git` (`touches_git`, through symlinks), re-checked at apply time (`refuse_git`).
 //! - marv-rs: a protected path (`marv_sandbox::protected_rule`) asks even in yolo, and so does a `package.json` edit
 //!   that changes a lifecycle script (the content rule, `marv_sandbox::protected::lifecycle_scripts_changed`).
-//! - `run` awaits `before_change` (or Esc), then plans again and writes under [`with_file_lock`], so a parallel
-//!   edit or append on the same file can't be lost.
-//! - Planned (#67): run the project's formatter on the changed file after the edit (sandboxed, project read-only
-//!   except that file), and report what it changed so the model's next `old_string` matches.
+//! - `run` awaits `before_change` (or Esc), then plans again, writes and formats under [`with_file_lock`], so a
+//!   parallel edit or append on the same file can't be lost, and the formatter can't be formatted over (#67).
+//! - #67: the project's formatter runs on the changed file after the write, inside the sandbox; the diff and the
+//!   summary describe the formatted file, and the note says so when formatting changed lines beyond the edit.
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -203,30 +203,36 @@ impl Tool for EditFile {
         if await_before_change(ctx).await {
             return Ok(ToolOutput::ok(INTERRUPTED_BEFORE_WRITE, "interrupted"));
         }
-        // Planned again: the file may have changed while the user was deciding. Read and written as one step per
-        // file, so a parallel edit (or append) can't be lost.
-        let Plan { shown, before, after, count, fuzzy, .. } = with_file_lock(&ctx.root, &input.path, || async {
+        // Planned again: the file may have changed while the user was deciding. Read, written and formatted as one
+        // step per file, so a parallel edit (or append) can't be lost, and the formatter can't be formatted over.
+        let (planned, formatted) = with_file_lock(&ctx.root, &input.path, || async {
             let planned = plan(input, ctx).await?;
             tokio::fs::write(&planned.absolute, &planned.after)
                 .await
                 .map_err(|e| ToolError(format!("Couldn't write {}: {e}", planned.shown)))?;
-            Ok::<_, ToolError>(planned)
+            // #67: the project's formatter runs before anything is said; its failure is a note, not an error.
+            let formatted = crate::formatter::after_write(ctx, &planned.shown, &planned.absolute, &planned.after).await;
+            Ok::<_, ToolError>((planned, formatted))
         })
         .await?;
-        let diff = diff_text(&before, &after, 3);
-        let note = fuzzy.map(|f| format!(" {}", fuzzy_note(f))).unwrap_or_default();
-        let broken = match broken_by(&shown, Some(&before), &after).await {
-            Some(problem) => format!("\n\n{}", syntax_note(&shown, &problem, &after, true)),
+        let diff = diff_text(&planned.before, &formatted.content, 3);
+        let fuzzy = planned.fuzzy.map(|f| format!(" {}", fuzzy_note(f))).unwrap_or_default();
+        let notes = crate::formatter::notes(&formatted, &planned.after);
+        let broken = match broken_by(&planned.shown, Some(&planned.before), &formatted.content).await {
+            Some(problem) => format!("\n\n{}", syntax_note(&planned.shown, &problem, &formatted.content, true)),
             None => String::new(),
         };
-        let plural = if count == 1 { "" } else { "s" };
+        let plural = if planned.count == 1 { "" } else { "s" };
         let summary = change_summary(&diff);
         let mut result = ToolOutput::ok(
-            format!("Edited {shown}: replaced {count} occurrence{plural} ({summary} lines).{note}{broken}"),
+            format!(
+                "Edited {}: replaced {} occurrence{} ({summary} lines).{fuzzy}{notes}{broken}",
+                planned.shown, planned.count, plural
+            ),
             summary,
         );
         result.diff = Some(shown_diff(&diff.lines));
-        result.changed = Some(shown);
+        result.changed = Some(planned.shown.clone());
         Ok(result)
     }
 }

@@ -23,6 +23,7 @@ use std::sync::Arc;
 use marv_mcp::deferred::McpToolsSetting;
 use marv_provider::factory::{ConfigFactory, CustomFactory};
 use marv_provider::{ProviderConfig, ProviderFactory, ProviderKind, ProviderOption};
+use marv_tools::formatter::FormatterSetting;
 use serde_json::{Map, Value};
 
 /// Marv's own environment, as a map (the CLI passes the real one).
@@ -93,6 +94,8 @@ pub struct FileConfig {
     pub suggestions: Option<bool>,
     pub mcp_tools: Option<McpToolsSetting>,
     pub max_steps: Option<MaxStepsSetting>,
+    /// The formatter the edit tools run after a change (#67): `false` (off), `true` (detect), or extension → command.
+    pub formatter: Option<FormatterSetting>,
     /// `mesh.wake` (marv-rs #78): a message on a wired inbox starts a turn while the TUI is idle (default off).
     pub mesh_wake: Option<bool>,
 }
@@ -171,6 +174,27 @@ impl FileConfig {
                 }
             },
         };
+        let formatter = match map.get("formatter") {
+            None | Some(Value::Null) => None,
+            Some(Value::Bool(false)) => Some(FormatterSetting::Off),
+            Some(Value::Bool(true)) => Some(FormatterSetting::Auto),
+            Some(Value::Object(entries)) => {
+                let mut commands = BTreeMap::new();
+                for (ext, command) in entries {
+                    match command.as_str().filter(|c| !c.is_empty()) {
+                        Some(command) => {
+                            commands.insert(ext.to_lowercase(), command.to_string());
+                        }
+                        None => problems.push(format!("formatter.{ext}: expected a non-empty command string")),
+                    }
+                }
+                Some(FormatterSetting::Custom(commands))
+            }
+            Some(_) => {
+                problems.push("formatter: expected false, true, or an object of extension to command".into());
+                None
+            }
+        };
         // `"mesh": {"wake": true}`: the mesh's settings, one object (only `wake` so far).
         let mesh_wake = match map.get("mesh") {
             None | Some(Value::Null) => None,
@@ -208,6 +232,7 @@ impl FileConfig {
             suggestions: boolean("suggestions", &mut problems),
             mcp_tools,
             max_steps,
+            formatter,
             mesh_wake,
         };
         if problems.is_empty() { Ok(config) } else { Err(problems.join("\n")) }
@@ -243,6 +268,14 @@ impl FileConfig {
                 MaxStepsSetting::Every(n) => Value::from(n),
             }),
         );
+        put(
+            "formatter",
+            self.formatter.as_ref().map(|f| match f {
+                FormatterSetting::Off => Value::from(false),
+                FormatterSetting::Auto => Value::from(true),
+                FormatterSetting::Custom(commands) => serde_json::to_value(commands).unwrap_or(Value::Null),
+            }),
+        );
         put("mesh", self.mesh_wake.map(|wake| serde_json::json!({ "wake": wake })));
         Value::Object(map)
     }
@@ -274,6 +307,9 @@ pub struct Config {
     pub mcp_tools: McpToolsSetting,
     /// 0 never asks; 1 can't happen. Subagents' own hard limit (50) is not touched by 0.
     pub max_steps: u32,
+    /// The formatter the edit tools run after a change (#67). On (detect) unless the file turned it off or
+    /// configured it.
+    pub formatter: FormatterSetting,
     /// `mesh.wake` (#78): off unless the file turns it on.
     pub mesh_wake: bool,
 }
@@ -380,6 +416,7 @@ pub fn resolve_config(file: Option<&FileConfig>, env: &Env) -> Config {
         suggestions: file.and_then(|f| f.suggestions).unwrap_or(true),
         mcp_tools: file.and_then(|f| f.mcp_tools).unwrap_or_default(),
         max_steps: max_steps_from_env(env.get("MARV_MAX_STEPS").map(String::as_str), file_steps),
+        formatter: file.and_then(|f| f.formatter.clone()).unwrap_or(FormatterSetting::Auto),
         mesh_wake: file.and_then(|f| f.mesh_wake).unwrap_or(false),
     }
 }
@@ -532,6 +569,35 @@ mod tests {
         assert!(debug_raw_from(Some("1")));
         assert!(debug_raw_from(Some("on")));
         assert!(debug_raw_from(Some(" any ")));
+    }
+
+    #[test]
+    fn the_formatter_setting_is_off_auto_or_a_command_per_extension() {
+        let parsed = |value: Value| FileConfig::from_value(&json!({"formatter": value}));
+        assert_eq!(parsed(json!(false)).unwrap().formatter, Some(FormatterSetting::Off));
+        assert_eq!(parsed(json!(true)).unwrap().formatter, Some(FormatterSetting::Auto));
+        let custom = parsed(json!({"rs": "rustfmt --edition 2024", "py": "ruff format"})).unwrap().formatter;
+        match custom {
+            Some(FormatterSetting::Custom(commands)) => {
+                assert_eq!(commands.get("rs").map(String::as_str), Some("rustfmt --edition 2024"));
+                assert_eq!(commands.get("py").map(String::as_str), Some("ruff format"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(parsed(json!("off")).unwrap_err(), "formatter: expected false, true, or an object of extension to command");
+        assert_eq!(parsed(json!({"py": ""})).unwrap_err(), "formatter.py: expected a non-empty command string");
+        // Absent: on (detect). Saved: round-trips, `Off` as false and `Auto` as true.
+        let c = resolve_config(Some(&file()), &Env::new());
+        assert_eq!(c.formatter, FormatterSetting::Auto);
+        let mut off = file();
+        off.formatter = Some(FormatterSetting::Off);
+        let mut custom = file();
+        custom.formatter = Some(FormatterSetting::Custom([("rs".to_string(), "rustfmt".to_string())].into_iter().collect()));
+        let custom_setting = custom.formatter.clone();
+        let round = |f: FileConfig| FileConfig::from_value(&f.to_value()).unwrap().formatter;
+        assert_eq!(round(off), Some(FormatterSetting::Off));
+        assert_eq!(round(custom), custom_setting);
+        assert_eq!(round(file()), None);
     }
 
     #[test]
