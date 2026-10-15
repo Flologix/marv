@@ -325,3 +325,168 @@ fn headless_approve_git_write_never_covers_a_network_command() {
     let out = marv_guards::headless(root.path(), config.path(), calls("ran-3", "ran-4"), &["git_write", "network"], &env);
     assert!(root.read("ran-3").is_some(), "with network too, the first ran: {}", out.result);
 }
+
+// ---- the home folder as the project: a file change asks each time ---------------------------------------------
+
+/// A context whose project is the home folder `home` (Marv started in `~`), or `root` under it, asking through the
+/// session's own "always" layer (`always`) in front of `person`. Yolo off.
+fn home_ctx(root: &std::path::Path, home: &std::path::Path, person: Arc<Recorder>, always: AlwaysScopes) -> ToolContext {
+    let wrapper = marv_session::SessionApprover { inner: person, always, cancel: tokio_util::sync::CancellationToken::new() };
+    ToolContext { home: home.to_path_buf(), approver: Some(Arc::new(wrapper)), ..ToolContext::new(root) }
+}
+
+/// A write of an ordinary (not hidden) file: in the home folder, a script on PATH or another repository's Makefile
+/// looks just like this.
+fn plain_write(name: &str) -> marv_core::ToolCall {
+    call("write_file", json!({"path": format!("bin/{name}"), "content": "#!/bin/sh\necho hi\n"}))
+}
+
+/// **In the home folder, "always" on a file change still asks on the next one, and isn't offered.** The edit tools
+/// write outside the sandbox, so a plain file there can run on the host later: each change is asked `once` (the
+/// TUI then offers only Yes / No), and an "always" answer is never remembered.
+///
+/// Proven: dropped `home_file_write` from the registry's `once` → failed (the second write wasn't asked).
+#[tokio::test]
+async fn in_the_home_folder_always_on_a_file_change_still_asks_the_next_time() {
+    let home = TempDir::new("home-always");
+    let person = Recorder::new(Decision::Always);
+    let always = AlwaysScopes::default();
+    let ctx = home_ctx(home.path(), home.path(), person.clone(), always.clone());
+    for (i, name) in ["a", "b"].into_iter().enumerate() {
+        let out = run_tool(&plain_write(name), &ctx, builtin_tools()).await;
+        assert!(!out.result.declined && !out.result.is_error, "{}", out.result.output);
+        assert_eq!(person.requests().len(), i + 1, "asked every time");
+    }
+    assert!(!always.contains("files"), "the \"always\" answer wasn't remembered");
+    assert_eq!(home.read("bin/b"), Some("#!/bin/sh\necho hi\n".into()), "the approved write ran");
+}
+
+/// **…and the request is `once`**: no "Always" is offered for it (the TUI's `once` prompt is Yes / No).
+///
+/// Proven: same revert → failed (`once` was false).
+#[tokio::test]
+async fn in_the_home_folder_a_file_change_request_is_once() {
+    let home = TempDir::new("home-once");
+    for tool in ["write_file", "edit_file"] {
+        home.write("notes.txt", "old\n");
+        let person = Recorder::new(Decision::No);
+        let ctx = home_ctx(home.path(), home.path(), person.clone(), AlwaysScopes::default());
+        let args = match tool {
+            "write_file" => json!({"path": "notes.txt", "content": "new\n"}),
+            _ => json!({"path": "notes.txt", "old_string": "old", "new_string": "new"}),
+        };
+        let out = run_tool(&call(tool, args), &ctx, builtin_tools()).await;
+        let asked = person.requests();
+        assert_eq!(asked.len(), 1, "{tool}");
+        assert!(asked[0].once && asked[0].scope.key == "files", "{tool}: {:?}", asked[0]);
+        assert!(out.result.declined, "{tool}: {}", out.result.output);
+        assert_eq!(home.read("notes.txt"), Some("old\n".into()), "{tool}: declined, not written");
+    }
+}
+
+/// **…nor does the config's `"approve": ["files"]` cover it** (#98's seeds mean "always", which the home folder
+/// doesn't offer). The person is asked and, declining, the file isn't written.
+///
+/// Proven: same revert → failed (the seed answered, the file was written).
+#[tokio::test]
+async fn in_the_home_folder_config_approve_files_doesnt_cover_a_file_change() {
+    let home = TempDir::new("home-seed");
+    let person = Recorder::new(Decision::No);
+    let always = AlwaysScopes::default();
+    always.seed(&marv_session::approvals::seed_prefixes(&["files".to_string()]).unwrap());
+    let ctx = home_ctx(home.path(), home.path(), person.clone(), always);
+    let out = run_tool(&plain_write("tool"), &ctx, builtin_tools()).await;
+    assert_eq!(person.requests().len(), 1, "the person was asked, the seed didn't answer");
+    assert!(out.result.declined, "{}", out.result.output);
+    assert_eq!(home.read("bin/tool"), None, "not written");
+}
+
+/// **A worktree subagent's automatic yes doesn't cover a `once` request either** (`SubagentApprover`): only a
+/// person answers a file change in the home folder.
+///
+/// Proven: dropped `!request.once` from `SubagentApprover`'s auto rule → failed (answered without asking).
+#[tokio::test]
+async fn a_subagents_automatic_yes_doesnt_cover_a_once_request() {
+    use marv_tools::Approver as _;
+    let home = TempDir::new("home-sub");
+    let person = Recorder::new(Decision::No);
+    let sub = marv_session::subagent::SubagentApprover { inner: person.clone(), agent: "worker".into(), auto: true };
+    let ctx = home_ctx(home.path(), home.path(), Recorder::new(Decision::No), AlwaysScopes::default());
+    let ctx = ToolContext { approver: Some(Arc::new(sub)), ..ctx };
+    let out = run_tool(&plain_write("w"), &ctx, builtin_tools()).await;
+    assert_eq!(person.requests().len(), 1, "the person was asked");
+    assert!(person.requests()[0].once);
+    assert!(out.result.declined && home.read("bin/w").is_none(), "{}", out.result.output);
+    // The control: an ordinary request is still answered automatically.
+    let plain = marv_session::subagent::SubagentApprover { inner: person.clone(), agent: "worker".into(), auto: true };
+    let mut request = person.requests()[0].clone();
+    request.once = false;
+    assert_eq!(plain.approve(request).await, Decision::Yes);
+}
+
+/// **A project in a subfolder of the home keeps "always" as before**: one "always" answer covers the next file
+/// change, and the request offers it (not `once`).
+///
+/// Proven: made `home_file_write` true for every project → failed (the second write was asked).
+#[tokio::test]
+async fn a_project_under_the_home_keeps_always_for_file_changes() {
+    let home = TempDir::new("home-sub-project");
+    let root = home.path().join("Projects/app");
+    std::fs::create_dir_all(&root).unwrap();
+    let person = Recorder::new(Decision::Always);
+    let always = AlwaysScopes::default();
+    let ctx = home_ctx(&root, home.path(), person.clone(), always.clone());
+    for name in ["a", "b"] {
+        let out = run_tool(&plain_write(name), &ctx, builtin_tools()).await;
+        assert!(!out.result.declined && !out.result.is_error, "{}", out.result.output);
+    }
+    let asked = person.requests();
+    assert_eq!(asked.len(), 1, "\"always\" covered the second write");
+    assert!(!asked[0].once);
+    assert!(always.contains("files"));
+    assert!(root.join("bin/b").exists());
+}
+
+/// `marv -p` in the home folder `home` (yolo off: headless refuses yolo there), making one `write_file` of
+/// `bin/<name>`, with `args` on the command line and `extra` in the config.
+fn headless_home_write(config: &TempDir, name: &str, args: &[&str], extra: serde_json::Value) -> marv_guards::Headless {
+    let home = config.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let path = std::env::var("PATH").unwrap_or_default();
+    let env = [("PATH", path.as_str()), ("MARV_GITHUB", "off")];
+    let call = marv_oracle::script::ScriptCall {
+        id: Some("w".into()),
+        name: "write_file".into(),
+        arguments: json!({"path": format!("bin/{name}"), "content": "x\n"}),
+    };
+    let mut extra = extra;
+    extra["yolo"] = json!(false);
+    marv_guards::headless_configured(&home, config.path(), vec![vec![call]], args, &env, extra)
+}
+
+/// **`marv -p --approve files` in the home folder still writes**: the flag names the scope for that one run, and
+/// headless answers "yes" per call (never "always"). Without the flag the write is refused (exit 3).
+#[test]
+fn headless_approve_files_in_the_home_folder_still_writes() {
+    let config = TempDir::new("home-p-config");
+    let home = config.path().join("home");
+    let out = headless_home_write(&config, "refused", &[], json!({}));
+    assert_eq!(out.code, Some(3), "{} {}", out.result, out.stderr);
+    assert!(!home.join("bin/refused").exists());
+    let out = headless_home_write(&config, "ok", &["--approve", "files"], json!({}));
+    assert_eq!(out.code, Some(0), "{} {}", out.result, out.stderr);
+    assert!(home.join("bin/ok").exists());
+}
+
+/// **…but the config's `"approve": ["files"]` doesn't cover it in `marv -p` either**: a config seed is an "always",
+/// which the home folder doesn't offer. The write is refused (exit 3) and not made.
+///
+/// Proven: dropped `home_file_write` from the registry's `once` → failed (the seed answered, exit 0).
+#[test]
+fn headless_config_approve_files_in_the_home_folder_is_refused() {
+    let config = TempDir::new("home-p-seed");
+    // `--approve web` so the run has an approver for the seeds to sit in front of (without one, nothing is asked).
+    let out = headless_home_write(&config, "seeded", &["--approve", "web"], json!({"approve": ["files"]}));
+    assert_eq!(out.code, Some(3), "{} {}", out.result, out.stderr);
+    assert!(!config.path().join("home/bin/seeded").exists());
+}

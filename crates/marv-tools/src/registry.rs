@@ -118,6 +118,15 @@ pub fn schema_repaired(tool: &dyn DynTool, raw: Value) -> (Value, Option<String>
     (value, repair_note(&fixes))
 }
 
+/// Whether a call is a file change (a `Write` tool with the "files" scope: edit_file, write_file) in a project that is
+/// the home folder or holds it ([`marv_sandbox::home_project`]). Such a call is asked `once`, every time.
+pub fn home_file_write(kind: ToolKind, scope_key: &str, ctx: &ToolContext) -> bool {
+    kind == ToolKind::Write
+        && scope_key == "files"
+        && !ctx.home.as_os_str().is_empty()
+        && marv_sandbox::home_project(&ctx.root, &ctx.home)
+}
+
 /// Runs a call. Never fails: every failure becomes a result the model can read and recover from.
 pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef]) -> ToolOutcome {
     let fail = |output: String, label: &str| ToolOutcome { result: ToolOutput::error(output), label: label.to_string() };
@@ -224,8 +233,17 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
         Some(Err(err)) => return noted(fail(err.0, &label)),
         Some(Ok(decision)) => decision,
         None => {
+            let scope = tool
+                .scope(input, ctx)
+                .unwrap_or_else(|| crate::types::Scope { key: call.name.clone(), description: call.name.clone() });
+            // In the home folder (the project is `~` or holds it), a file change asks each time: the edit tools write
+            // outside the sandbox, and a plain file there (a script on PATH, another repository's Makefile) can run on
+            // the host later. So no "always" is offered, no remembered or config-seeded "files" covers it, and yolo
+            // (which the session refuses there anyway) doesn't run it.
+            let home_write = home_file_write(tool.kind(), &scope.key, ctx);
+            let once = tool.once(input, ctx) || home_write;
             // Yolo: a call the tool vouches for runs without asking, confined (bash then can't touch .git).
-            if ctx.yolo && !must_ask && tool.auto_safe(input, ctx) {
+            if ctx.yolo && !must_ask && !home_write && tool.auto_safe(input, ctx) {
                 if !checkpointed().await {
                     return interrupted(Approval::Interrupted);
                 }
@@ -233,9 +251,6 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
                 return finish(tool.run(input, &confined).await, Some(Approval::Auto));
             }
             let Some(approver) = &ctx.approver else { return no_one_to_ask() };
-            let scope = tool
-                .scope(input, ctx)
-                .unwrap_or_else(|| crate::types::Scope { key: call.name.clone(), description: call.name.clone() });
             let request = ApprovalRequest {
                 tool: call.name.clone(),
                 label: label.clone(),
@@ -243,7 +258,7 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
                 scope,
                 agent: None,
                 network,
-                once: tool.once(input, ctx),
+                once,
                 must_ask,
                 protected,
                 door,

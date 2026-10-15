@@ -309,6 +309,18 @@ pub fn headless_steps(
     args: &[&str],
     env: &[(&str, &str)],
 ) -> Headless {
+    headless_configured(root, config_dir, steps, args, env, serde_json::json!({}))
+}
+
+/// [`headless_steps`] with `extra` (a JSON object) merged into the config file (`{"yolo": false, "approve": [...]}`).
+pub fn headless_configured(
+    root: &Path,
+    config_dir: &Path,
+    steps: Vec<Vec<marv_oracle::script::ScriptCall>>,
+    args: &[&str],
+    env: &[(&str, &str)],
+    extra: serde_json::Value,
+) -> Headless {
     use marv_oracle::script::Reply;
     let bin = marv_oracle::binary();
     assert!(bin.exists(), "no marv binary at {} (cargo build -p marv-cli, or set MARV_ORACLE_BIN)", bin.display());
@@ -316,7 +328,11 @@ pub fn headless_steps(
     replies.push(Reply { text: "Done.".into(), ..Reply::default() });
     let server =
         marv_oracle::server::FakeServer::start(replies, vec![serde_json::json!({"id": marv_oracle::runner::MODEL})]).unwrap();
-    let config = serde_json::Value::Object(marv_oracle::runner::default_config(&server.base_url()));
+    let mut config = marv_oracle::runner::default_config(&server.base_url());
+    if let serde_json::Value::Object(extra) = extra {
+        config.extend(extra);
+    }
+    let config = serde_json::Value::Object(config);
     std::fs::create_dir_all(config_dir).unwrap();
     std::fs::write(config_dir.join("config.json"), config.to_string()).unwrap();
     let home = config_dir.join("home");
