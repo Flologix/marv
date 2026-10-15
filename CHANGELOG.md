@@ -14,7 +14,7 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ### Changed
 
-- **The doors only use absolute PATH entries outside the project.** The github tool's `gh` (and the new Herdr door's `herdr`) is taken from an absolute PATH entry, never a relative one, and never from inside the project or a folder the sandbox can write.
+- **The doors only use absolute PATH entries outside the project.** The github tool's `gh`, the mesh's Herdr panes and the new Herdr door's `herdr` are taken from an absolute PATH entry, never a relative one, and never from inside the project or a folder the sandbox can write. In a home-folder project, a `gh` or `herdr` under your home (like `~/.local/bin`) is therefore not used there, and that tool isn't offered.
 - **A Herdr pane send can't start with `-`.** It's refused with nothing typed, as text starting with `/`, `!` or `#` already is.
 
 ## [0.7.0] - 2026-10-15

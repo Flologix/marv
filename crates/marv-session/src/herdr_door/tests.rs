@@ -309,7 +309,19 @@ fn a_run_command_shows_what_runs_and_points_an_agent_to_spawn() {
         HerdrSetup { program: "/nonexistent/herdr".into(), own_pane: None, marv: "/m".into(), max_peers: 1, runs: true },
         Arc::default(),
     );
-    for bad in ["echo hi!", "echo a\u{200B}b", "echo \u{202E}x", "ls \u{E0041}"] {
+    for bad in [
+        "echo hi!",
+        "echo a\u{200B}b",
+        "echo \u{202E}x",
+        "ls \u{E0041}",
+        "^ls^rm -rf ~^",
+        " ^a^b",
+        "echo a\u{2028}b",
+        "echo a\u{2029}b",
+        "echo \u{115F}\u{1160}",
+        "echo \u{3164}",
+        "echo \u{FFA0}",
+    ] {
         assert!(marv_tools::DynTool::parse(&door, json!({"action": "run", "command": bad})).is_err(), "{bad:?}");
     }
     assert_eq!(agent_in_command("claude --dangerously-skip-permissions"), Some("claude"));

@@ -372,7 +372,9 @@ async fn stopping_a_peer_types_nothing_into_an_agent_thats_busy_or_asking() {
 /// a `herdr` or `gh` a sandboxed command could have put there is never run (nor picked for later).
 ///
 /// Proven: made `marv_sandbox::host_env::host_program` take any PATH entry, with no `outside` check → the planted gh
-/// ran (its marker appeared) and the planted herdr became the door's program: failed.
+/// ran (its marker appeared) and the planted herdr became the door's program: failed; made `mesh_cmd::start` give the
+/// switchboard a bare `"herdr"` again (a PATH lookup) → `mesh_list` ran the planted one: failed. The `marv -p` part runs
+/// the binary at `MARV_ORACLE_BIN`, which `cargo test` doesn't rebuild: build `marv-cli` first.
 #[tokio::test]
 async fn a_door_program_planted_in_the_project_is_never_run() {
     use std::os::unix::fs::PermissionsExt;
@@ -396,6 +398,25 @@ async fn a_door_program_planted_in_the_project_is_never_run() {
     .into();
     assert!(marv_session::herdr_door::setup_from_env(&herdr_env, 4, &outside).is_none());
     assert!(!marker.exists(), "a planted program ran");
+
+    // The mesh's Herdr panes (mesh_list in `marv -p` on the mesh) take herdr the same way: the planted one never runs.
+    let (config, runtime) = (TempDir::new("doors-planted-cfg"), TempDir::new("doors-planted-rt"));
+    let system = std::env::var("PATH").unwrap_or_default();
+    let path = format!("{planted}:{system}");
+    let runtime_dir = runtime.path().to_string_lossy().to_string();
+    let env = [
+        ("PATH", path.as_str()),
+        ("MARV_GITHUB", "off"),
+        ("MARV_MESH_NAME", "planted"),
+        ("XDG_RUNTIME_DIR", runtime_dir.as_str()),
+        ("HERDR_ENV", "1"),
+        ("HERDR_SOCKET_PATH", "/nonexistent.sock"),
+        ("HERDR_PANE_ID", "w1:p1"),
+    ];
+    let list = marv_oracle::script::ScriptCall { id: Some("m1".into()), name: "mesh_list".into(), arguments: json!({}) };
+    let out = marv_guards::headless_steps(project.path(), config.path(), vec![vec![list]], &[], &env);
+    assert!(out.stderr.is_empty() || !out.stderr.contains("panicked"), "{}", out.stderr);
+    assert!(!marker.exists(), "mesh_list ran the planted herdr");
 }
 
 /// Nothing a model passes reaches the `herdr` CLI as an option: ids, names, commands and prompts starting with `-`

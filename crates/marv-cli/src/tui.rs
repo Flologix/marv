@@ -2494,13 +2494,15 @@ pub async fn run(resume: Option<bool>, approve: Vec<String>) -> anyhow::Result<i
     let (pre_approved, mut approval_problems) = merge_pre_approved(config.approve.clone(), &approve);
     let (writable, writable_problems) = resolve_writable(&config.writable, &home, &root, &config_dir);
     approval_problems.extend(writable_problems);
+    // Where a door's program (gh, herdr) is never taken from: the project and the sandbox's writable folders.
+    let door_outside: Vec<PathBuf> = std::iter::once(root.clone()).chain(writable.iter().cloned()).collect();
     // Whether to offer the github tool (#47): asked of gh once, alongside the rest of startup, since the tool list is
     // fixed for the session. At most 2 s (gh auth status asks GitHub; offline it falls back to gh's hosts.yml). gh is
     // never taken from the project or a sandbox-writable folder (only an absolute PATH entry outside them).
     let github_check = {
         let wanted = marv_tools::github::github_wanted(env.get("MARV_GITHUB").map(String::as_str));
         let pairs: Vec<(String, String)> = env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-        let outside: Vec<PathBuf> = std::iter::once(root.clone()).chain(writable.iter().cloned()).collect();
+        let outside = door_outside.clone();
         tokio::spawn(async move {
             wanted && marv_tools::github::github_available(&pairs, &outside, marv_tools::github::AUTH_CHECK).await
         })
@@ -2517,7 +2519,7 @@ pub async fn run(resume: Option<bool>, approve: Vec<String>) -> anyhow::Result<i
     // In a Herdr pane, Herdr shows what Marv is doing.
     let herdr = herdr_target(&env).map(|target| HerdrReporter::new(target, None));
     // The mesh (v2): this Marv's switchboard, put on the mesh once the TUI can ask for wires (below).
-    let (mut mesh, mut mesh_note) = match crate::mesh_cmd::start(&env, &root) {
+    let (mut mesh, mut mesh_note) = match crate::mesh_cmd::start(&env, &root, &door_outside) {
         Ok(mesh) => (mesh, None),
         Err(e) => (None, Some((format!("Not on the mesh: {e}"), true))),
     };

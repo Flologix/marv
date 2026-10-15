@@ -490,7 +490,7 @@ pub async fn run_headless(options: HeadlessOptions) -> ExitCode {
     let wants_mesh = !mesh_grants.is_empty() || env.get("MARV_MESH_NAME").is_some_and(|n| !n.is_empty());
     let mut mesh = None;
     if wants_mesh {
-        match crate::mesh_cmd::start(&env, &root) {
+        match crate::mesh_cmd::start(&env, &root, &door_outside) {
             Ok(Some(mut started)) => {
                 let wires: Arc<dyn marv_session::mesh::WireApprover> = Arc::new(marv_session::mesh::HeadlessWires(mesh_grants));
                 if let Err(e) = started.open_door(wires.clone()) {

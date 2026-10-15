@@ -281,7 +281,7 @@ fn valid_ref(name: &str) -> bool {
 
 /// One line, no control characters: what the approval shows is exactly what's typed.
 fn one_line(text: &str) -> bool {
-    !text.chars().any(char::is_control)
+    !text.chars().any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
 }
 
 /// Quotes an argument where a shell would split it (display and `pane run`'s command line).
@@ -318,10 +318,12 @@ pub fn marv_command(marv: &std::path::Path, ctx: &ToolContext) -> String {
 /// The approval's line for a prompt or a spawn in a tainted session: the text crosses into another agent as its user's.
 pub const OWN_WORDS: &str = "The receiving agent will treat this text as your own words, with its own approvals.";
 
-/// Characters a run command can't hold: `!` (the shell's history expansion: what runs isn't what was shown) and
-/// invisible format characters (zero-width, bidi controls, tags), which would hide part of the command.
+/// Characters a run command can't hold: `!` (the shell's history expansion: what runs isn't what was shown),
+/// invisible format characters (zero-width, bidi controls, tags), line and paragraph separators, and the Hangul
+/// fillers, which would hide part of the command.
 fn hidden_in_command(c: char) -> bool {
     c == '!'
+        || matches!(c, '\u{2028}' | '\u{2029}' | '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}')
         || matches!(c,
             '\u{00AD}' | '\u{034F}' | '\u{061C}' | '\u{0600}'..='\u{0605}' | '\u{06DD}' | '\u{070F}' | '\u{180E}'
             | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{FE00}'..='\u{FE0F}'
@@ -645,6 +647,9 @@ impl Tool for HerdrDoor {
                 }
                 if command.trim_start().starts_with('-') {
                     return Err("command: can't start with - (Herdr would read it as an option)".into());
+                }
+                if command.trim_start().starts_with('^') {
+                    return Err("command: can't start with ^ (the shell's quick substitution reruns the last command)".into());
                 }
                 if command.chars().any(hidden_in_command) {
                     return Err("command: no ! (the shell's history expansion) and no invisible characters: what the user approves is exactly what runs".into());
