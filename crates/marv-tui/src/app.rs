@@ -343,6 +343,10 @@ pub struct App {
     radio: RadioView,
     /// `/radio`'s roster view is open (Esc closes it).
     radio_panel: bool,
+    /// A message just received flashes on the strip until then (#124): its id, and when the flash ends.
+    radio_flash: Option<(String, Instant)>,
+    /// The newest received message already seen (flashed or not), so a roster change doesn't flash it again.
+    radio_seen: Option<String>,
     /// What [`SessionPort::keyboard_held`] was last told (`None`: nothing yet).
     held_told: Option<bool>,
 
@@ -418,6 +422,8 @@ impl App {
             setup: None,
             radio: RadioView::default(),
             radio_panel: false,
+            radio_flash: None,
+            radio_seen: None,
             held_told: None,
             copy,
             copies: FuturesUnordered::new(),
@@ -589,6 +595,10 @@ impl App {
             self.flash = None;
             self.dirty = true;
         }
+        if self.radio_flash.as_ref().is_some_and(|(_, until)| now >= *until) {
+            self.radio_flash = None;
+            self.dirty = true;
+        }
     }
 
     /// The earliest moment something on screen changes on its own.
@@ -608,6 +618,7 @@ impl App {
         d.add(self.spinner_since().map(|since| thinking_view::next_frame(since, Instant::now())));
         d.add(self.confirm_exit);
         d.add(self.flash.as_ref().map(|(_, until)| *until));
+        d.add(self.radio_flash.as_ref().map(|(_, until)| *until));
         d.next()
     }
 
@@ -763,6 +774,15 @@ impl App {
             }
             UiEvent::Radio(view) => {
                 self.radio_panel &= view.on;
+                // A message that wasn't there before flashes on the strip (#124); the radio off ends a flash.
+                let newest = radio_view::newest_received(&view).map(|t| t.id.clone());
+                if newest.is_some() && newest != self.radio_seen {
+                    self.radio_flash = newest.clone().map(|id| (id, now + Duration::from_millis(radio_view::FLASH_MS)));
+                }
+                self.radio_seen = newest;
+                if !view.on {
+                    self.radio_flash = None;
+                }
                 self.radio = view;
                 self.dirty = true;
             }
@@ -1615,7 +1635,13 @@ impl App {
             viewing: self.viewing.is_some(),
         };
         if strip_height == 1 {
-            buf.set_line(panel.x, panel.y, &radio_view::strip(&self.radio, panel.width), panel.width);
+            let flashing =
+                self.radio_flash.as_ref().and_then(|(id, _)| self.radio.traffic.iter().find(|t| &t.id == id && !t.outgoing));
+            let line = match flashing {
+                Some(message) => radio_view::flash(&self.radio, message, panel.width),
+                None => radio_view::strip(&self.radio, panel.width),
+            };
+            buf.set_line(panel.x, panel.y, &line, panel.width);
         }
         let panel = Rect { y: panel.y + strip_height, height: panel.height - strip_height, ..panel };
         let status_area = Rect { y: panel.bottom().saturating_sub(1), height: 1.min(panel.height), ..panel };
@@ -2787,7 +2813,13 @@ mod tests {
             pane: None,
             since_ms: 0,
         };
-        h.event(UiEvent::Radio(RadioView { on: true, me: "proj-c792".into(), my_title: String::new(), peers: vec![peer] }));
+        h.event(UiEvent::Radio(RadioView {
+            on: true,
+            me: "proj-c792".into(),
+            my_title: String::new(),
+            peers: vec![peer],
+            traffic: Vec::new(),
+        }));
         assert!(h.frame().contains("◉ radio · 58a7 working \"fix the login test\""), "{}", h.frame());
         h.event(UiEvent::OpenRadio);
         assert!(h.frame().contains("ON THE RADIO") && h.frame().contains("proj-58a7"), "{}", h.frame());
