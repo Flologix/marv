@@ -25,7 +25,7 @@
 //! - anything missing or not a folder: bwrap can't mount it.
 //!
 //! Left out quietly (not refused: one config serves every project): an entry in the project, which is writable
-//! already, and one inside another accepted entry. A sandboxed command can change their parents, and bwrap resolves a
+//! already (or, when the project is the home folder, read-only like the rest of it: see `bwrap`), and one inside another accepted entry. A sandboxed command can change their parents, and bwrap resolves a
 //! mount point's parents when the next command starts: a parent swapped for a symlink would bind the real folder it
 //! leads to read-write.
 //!

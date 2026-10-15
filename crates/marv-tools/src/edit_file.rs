@@ -255,9 +255,13 @@ pub(crate) fn package_json(path: &str, ctx: &ToolContext) -> Option<std::path::P
 }
 
 /// The protected rule a project path falls under (marv-rs); a path outside the project is left to `resolve_in_project`.
+/// When the project is the home folder (or holds it), the home's dotfiles and git hooks folders are protected too
+/// (`marv_sandbox::protected::home_rule`): this tool writes outside the sandbox.
 pub(crate) fn protected_target(path: &str, ctx: &ToolContext) -> Option<marv_sandbox::ProtectedRule> {
     let absolute = resolve_in_project(ctx, path).ok()?;
-    marv_sandbox::protected_rule(&ctx.root, &absolute).unwrap_or(Some(marv_sandbox::ProtectedRule::GitDir))
+    marv_sandbox::protected_rule(&ctx.root, &absolute)
+        .unwrap_or(Some(marv_sandbox::ProtectedRule::GitDir))
+        .or_else(|| marv_sandbox::protected::home_rule(&ctx.root, &ctx.home, &absolute))
 }
 
 #[cfg(test)]

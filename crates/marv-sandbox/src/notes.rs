@@ -27,6 +27,11 @@ pub const GIT_HINT: &str = "Marv: .git is read-only for commands that run withou
 /// Appended when a sandboxed command looks into the hidden home folder.
 pub const HOME_NOTE: &str = "Marv: in the sandbox the home folder is an empty stand-in: only toolchain folders (like ~/.bun, ~/.local/share/mise, ~/.asdf), git config and ~/.marv/skills show through, read-only. Anything else there (Marv's own config, sessions and trajectories in ~/.marv included) is invisible, so a missing file or an empty folder under ~ says nothing about the real home folder.";
 
+/// Appended to a sandboxed command in a project that is the home folder (or holds it) when it failed or looked at a
+/// hidden part of the home (marv-rs): there the home is shown read-only with its private parts hidden, so a write
+/// fails with "Read-only file system" and `~/.ssh` reads as empty, and a model that doesn't know why retries.
+pub const HOME_PROJECT_NOTE: &str = "Marv: the project is your home folder, so in the sandbox it is read-only, and its hidden entries (~/.marv, ~/.ssh, ~/.config, ~/.local and the like, apart from toolchain folders and git config) and any socket in it are hidden: an empty or missing one there says nothing about the real home folder. Commands can write only to /tmp. To change a file, use edit_file or write_file (the user is asked); for more, ask the user to start Marv in a project folder.";
+
 /// Appended when a sandboxed command without network fails in a way that looks like the network's missing.
 pub const NETWORK_NOTE: &str = "Marv: this command ran in the sandbox without network, and its failure looks like it may come from that: there, every connection and DNS lookup fails, so logins look invalid and servers look down. Before drawing conclusions, run it again with network: true.";
 
@@ -146,6 +151,20 @@ pub fn touches_hidden_home(command: &str, root: &Path, home: &Path) -> bool {
     false
 }
 
+/// Whether [`HOME_PROJECT_NOTE`] goes after a command in a home-folder project: it failed, or its text names the home
+/// (`~`, `$HOME`, its path) or a hidden entry (a word starting with `.` and a letter: `.ssh`, `./.config`). A guess.
+pub fn needs_home_project_note(command: &str, home: &Path, failed: bool) -> bool {
+    if failed {
+        return true;
+    }
+    let refs = Regex::new(&format!(
+        r#"(?:^|[\s=:'"(<>;|&])(?:~|\$HOME|\$\{{HOME\}}|{})|(?:^|[\s=:'"(<>;|&/])\.[A-Za-z_]"#,
+        regex::escape(&home.to_string_lossy())
+    ))
+    .unwrap();
+    refs.is_match(command)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,6 +217,18 @@ mod tests {
         assert!(!touches("git log HEAD~1 && git diff main~2"));
         assert!(!touches("ls /home/meow ~other"));
         assert!(!touches("bun test"));
+    }
+
+    #[test]
+    fn the_home_project_note_after_a_failure_or_a_look_at_the_home() {
+        let home = Path::new("/home/me");
+        assert!(needs_home_project_note("touch notes.txt", home, true));
+        for command in ["ls ~/.ssh", "cat .marv/config.json", "ls -a ./.config", "ls $HOME", "cat /home/me/x"] {
+            assert!(needs_home_project_note(command, home, false), "{command}");
+        }
+        for command in ["ls Projects", "cat notes.txt", "git log HEAD~1", "ls ./src"] {
+            assert!(!needs_home_project_note(command, home, false), "{command}");
+        }
     }
 
     #[test]

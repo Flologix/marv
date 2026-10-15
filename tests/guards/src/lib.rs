@@ -99,6 +99,7 @@ pub fn sandbox_with_home(home: &Path) -> Sandbox {
         mesh_socket: None,
         hidden: Vec::new(),
         writable: Vec::new(),
+        config_dir: Some(home.join(".marv")),
     }
 }
 

@@ -40,6 +40,37 @@ pub const TOOLCHAINS: &[&str] = &[
 /// could otherwise print them into the conversation, which goes to the model provider.
 pub const CREDENTIALS: &[&str] = &[".cargo/credentials", ".cargo/credentials.toml", ".config/git/credentials"];
 
+/// Home entries that never show in the sandbox, even when the project is the home folder (or holds it) and the
+/// home is shown read-only: Marv's config, credentials, and agent and tool state with sockets in it. Every hidden
+/// top-level entry of the home is already hidden in that case ([`crate::bwrap`]); this list keeps these hidden even
+/// if a toolchain mount (or a later change to [`TOOLCHAINS`]) would show them again.
+pub const HOME_MASKS: &[&str] = &[
+    ".ssh",
+    ".gnupg",
+    ".netrc",
+    ".git-credentials",
+    ".npmrc",
+    ".pypirc",
+    ".aws",
+    ".azure",
+    ".config/gcloud",
+    ".config/gh",
+    ".config/herdr",
+    ".claude",
+    ".claude.json",
+    ".docker",
+    ".kube",
+    ".local/share/keyrings",
+];
+
+/// Whether the project is the home folder or a parent of it (`/`, `/home`), judged on real paths. Then the sandbox
+/// can't hide the home behind a stand-in without hiding the project too: it shows it read-only, with Marv's config,
+/// credentials and every hidden top-level entry masked ([`crate::bwrap::sandbox_args`]).
+pub fn home_project(root: &Path, home: &Path) -> bool {
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    contains(&real(root), &real(home))
+}
+
 /// Whether `outer` is `inner` or a parent of it.
 pub(crate) fn contains(outer: &Path, inner: &Path) -> bool {
     inner.starts_with(outer)

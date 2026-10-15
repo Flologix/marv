@@ -237,7 +237,7 @@ pub fn no_yolo_reason(root: &Path, home: &Path) -> Option<String> {
     }
     let where_ = if root == Path::new("/") { "the root of the file system" } else { "your home folder (or above it)" };
     Some(format!(
-        "cwd {} is {where_}: with yolo on, Marv would change files there without asking, dotfiles included. Use a project folder, or pass yolo: false (then every change goes to your approver, or is refused without one).",
+        "cwd {} is {where_}: with yolo on, Marv would change files there without asking, dotfiles included. Use a project folder, or pass yolo: false (then every change goes to your approver, or is refused without one). There, sandboxed commands see the home read-only, with Marv's config, credentials and agent sockets hidden.",
         root.display()
     ))
 }

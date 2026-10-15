@@ -42,8 +42,9 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 
 use marv_sandbox::git_guard::{GitGuard, git_guard, worktree_git};
 use marv_sandbox::notes::{
-    BACKGROUND_NOTE, BACKGROUND_NOTE_PROCESS, ESCALATED_NOTE, GH_NOTE, GH_TOOL_NOTE, GIT_HINT, HOME_NOTE, NETWORK_NOTE,
-    backgrounds_process, hidden_network_failure, looks_like_network_failure, runs_gh, touches_hidden_home,
+    BACKGROUND_NOTE, BACKGROUND_NOTE_PROCESS, ESCALATED_NOTE, GH_NOTE, GH_TOOL_NOTE, GIT_HINT, HOME_NOTE, HOME_PROJECT_NOTE,
+    NETWORK_NOTE, backgrounds_process, hidden_network_failure, looks_like_network_failure, needs_home_project_note, runs_gh,
+    touches_hidden_home,
 };
 use marv_sandbox::paths::is_inside;
 use marv_sandbox::protected::{ProtectedRule, created_note, nested_git_dirs, protected_snapshot, revert_created, scan_created};
@@ -570,14 +571,17 @@ impl Tool for Bash {
             worktree_git(&ctx.root).into_iter().filter(|dir| !kept.iter().any(|ro| is_inside(ro, &real_or_self(dir)))).collect()
         };
         let sandboxed = ctx.sandbox.active();
+        // The project is the home folder (or holds it): the sandbox shows it read-only (marv_sandbox::bwrap), so a
+        // command can't change .git or create a protected file there, and nothing needs walking the whole home for.
+        let home_project = sandboxed && marv_sandbox::home_project(&ctx.root, &ctx.sandbox.home);
         let mut read_only = ctx.read_only.clone();
         read_only.extend(guard.read_only);
         // A vendored repository's .git runs its config and hooks when the user works there, like the project's own.
-        if ctx.confined && sandboxed {
+        if ctx.confined && sandboxed && !home_project {
             read_only.extend(nested_git_dirs(&ctx.root));
         }
         // What's protected now, to find what the command adds (bwrap can only mount what exists).
-        let before = sandboxed.then(|| protected_snapshot(&ctx.root));
+        let before = (sandboxed && !home_project).then(|| protected_snapshot(&ctx.root));
         let options = RunOptions {
             command: input.command.clone(),
             root: ctx.root.clone(),
@@ -626,6 +630,9 @@ impl Tool for Bash {
         let failed = result.timed_out || (!result.aborted && !matches!(result.exit_code, Some(0 | 126 | 127)));
         // `|| true` hides a failure like a pipe does (#81): a network command that printed a network error counts.
         let hidden = !failed && !result.aborted && hidden_network_failure(&input.command, &result.output);
+        if home_project && needs_home_project_note(&input.command, &ctx.sandbox.home, failed) {
+            result.output.push_str(&format!("\n{HOME_PROJECT_NOTE}{last_resort}\n"));
+        }
         if sandboxed && !network && (failed && looks_like_network_failure(&input.command, &result.output) || hidden) {
             result.output.push_str(&format!("\n{NETWORK_NOTE}{last_resort}\n"));
             // A retry without network asks for it instead (#81, `repair`).
