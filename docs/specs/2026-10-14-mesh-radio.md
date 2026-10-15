@@ -1,7 +1,7 @@
 # Mesh radio: a live channel every Marv on the mesh is on
 
 - Issue: FlologixAI/marv #124
-- Status: **draft, for approval.** Nothing is implemented until this is approved.
+- Status: **approved 2026-10-15**, with every recommendation in §12 taken as the decision. Implement in the phases of §10.
 - Date: 2026-10-14
 - Scope: `crates/marv-mesh` (radio frames, door methods, links), `crates/marv-session` (config, model tool, rx notes, reports, wake), `crates/marv-tui` (strip and `/radio` view), `crates/marv-cli` (bridge, `/tx`, `/ask`, `marv mesh ls`), `tests/guards`.
 
@@ -538,15 +538,17 @@ Phase 4: non-Marv agents through the shim (§9.5). Moving links onto the shared 
 
 `docs/MESH.md` (rule 1's "one decision", the radio as topology 2's channel), `docs/SECURITY.md` (§8 in short), `docs/subsystems/mesh.md` (modules, rules table, port notes), the user docs for `/radio`, `/tx`, `/ask`.
 
-## 12. Open questions for the user
+## 12. Decisions (approved 2026-10-15)
 
-1. **Should `radio_tx` ask once the session is tainted?** *Recommendation: no* (§8.2). Every Marv on the radio taints on receipt and asks before anything leaves it, so the text stays within the user's Marvs. Asking would make the radio ask on nearly every message after the first.
-2. **May a radio request lead to work in the receiving Marv?** *Recommendation: yes, with automatic approval off in that turn* (§8.4): read-only work runs, everything else asks that Marv's person. The stricter choice is #78's rule (a woken turn only tells its user what arrived); the looser one lets yolo apply.
-3. **Should broadcasts (`to: all`) reach every model, or only the strip?** *Recommendation: reach the model, never wake.* A channel nobody's model hears isn't much use; the cost is that every Marv on the radio is tainted by chatter.
-4. **Should presence share the conversation's title?** *Recommendation: yes by default, with `"mesh": {"radio": {"titles": false}}` to turn it off.* It's the most useful thing in the strip, but it's the user's own words and may hold something private. (That makes the key either `true` or an object.)
-5. **Non-Marv agents (Claude Code, opencode) on the radio through the shim?** *Recommendation: later, phase 4*, with tainted sends to them asking (§9.5).
-6. **`marv -p` on the radio?** *Recommendation: not now.* Maybe later as send-only (`--radio`), so a script's Marv can post its result.
-7. **Does the user's own `/tx` go out as the Marv or as "user"?** *Recommendation: as the Marv, marked `by: user`*, shown as `docs-11c2 (user)` and treated exactly like any other text.
-8. **Retire `herdr.pane.*.send` to Marv panes?** *Recommendation: refuse it only for Marvs on the radio* (§9.3), and keep it, with #123's fixes, for everything else.
-9. **UI:** *Recommendation: the one-line strip above the prompt plus the `/radio` view*, no side panel (it would take width from the transcript in narrow Herdr panes). `/ask` for requests, or `/tx?`, or `/tx --ask`?
-10. **The limits** (2 KB messages, 20 a minute, 2 open requests per sender, 2 hops, 10 radio wakes in 10 minutes): good starting numbers, or should any be config keys from the start? *Recommendation: constants first*, keys only if they get in the way.
+The user approved the spec with every recommendation below. They were the open questions of the draft.
+
+1. **`radio_tx` doesn't ask once the session is tainted** (§8.2). Every Marv on the radio taints on receipt and asks before anything leaves it.
+2. **A radio request may lead to work in the receiving Marv, with automatic approval off in that turn** (§8.4): read-only work runs, everything else asks that Marv's person. This deliberately goes further than #78's woken turn, for radio requests only.
+3. **Broadcasts (`to: all`) reach every model, and never wake one.**
+4. **Presence shares the conversation's title by default**, with `"mesh": {"radio": {"titles": false}}` to turn it off (the key is `true` or an object).
+5. **Non-Marv agents join later, in phase 4**, with tainted sends to them asking (§9.5).
+6. **`marv -p` is not on the radio for now** (maybe later as send-only, `--radio`).
+7. **The user's own `/tx` goes out as the Marv, marked `by: user`**, shown as `docs-11c2 (user)` and treated like any other text.
+8. **`herdr.pane.*.send` is refused only for Marvs on the radio** (§9.3), and kept, with #123's fixes, for everything else.
+9. **UI: the one-line strip above the prompt plus the `/radio` view**, no side panel. Requests use **`/ask`**.
+10. **The limits are constants first** (2 KB messages, 20 a minute, 2 open requests per sender, 2 hops, 10 radio wakes in 10 minutes); config keys only if they get in the way.
