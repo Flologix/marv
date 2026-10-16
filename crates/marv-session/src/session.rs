@@ -124,6 +124,17 @@ pub enum CompactFailure {
     Failed,
 }
 
+/// How long a turn waits for the model list when it hasn't answered yet (#143).
+pub const LOOKUP_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Sends `true` when dropped: the lookup's end, however it ends.
+struct DropSend(tokio::sync::watch::Sender<bool>);
+impl Drop for DropSend {
+    fn drop(&mut self) {
+        let _ = self.0.send(true);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum CompactResult {
     Compacted { summary: String, tokens_before: Option<u64> },
@@ -525,6 +536,8 @@ struct State {
     info: Option<ModelInfo>,
     /// Bumped by each lookup: an answer for a provider replaced meanwhile is ignored.
     lookups: u64,
+    /// The running model-list lookup: `true` once it has answered (or given up). A turn waits for it briefly (#143).
+    lookup_done: Option<tokio::sync::watch::Receiver<bool>>,
     /// What the model sees. Shared with the running loop (`marv_agent::History`).
     conversation: marv_agent::History,
     saved: SavedSession,
@@ -909,6 +922,7 @@ impl MarvSession {
             thinking: init.thinking,
             info: None,
             lookups: 0,
+            lookup_done: None,
             conversation: Arc::default(),
             saved,
             totals: Totals::default(),
@@ -1308,6 +1322,17 @@ impl MarvSession {
         if let Some(done) = hooks_done {
             tokio::select! {
                 _ = done.cancelled() => {}
+                _ = stop.cancelled() => return TurnEndReason::Interrupted,
+            }
+        }
+        // The model list (#143): what it says changes the request (the reasoning effort, the output limit #96 and the
+        // window #116), and the provider this turn takes is fixed for the whole turn. A `marv -p` run is one turn, so
+        // a list that answered a moment after it started (OpenRouter's is ~0.8 MB) left the whole run without them.
+        // Waited for briefly, only while it hasn't answered.
+        let lookup = self.state().lookup_done.clone();
+        if let Some(mut lookup) = lookup.filter(|l| !*l.borrow()) {
+            tokio::select! {
+                _ = tokio::time::timeout(LOOKUP_WAIT, lookup.wait_for(|done| *done)) => {}
                 _ = stop.cancelled() => return TurnEndReason::Interrupted,
             }
         }
@@ -2740,8 +2765,12 @@ impl MarvSession {
         let Some(lookup) = factory.lookup() else {
             return;
         };
+        let (done, waiting) = tokio::sync::watch::channel(false);
+        self.state().lookup_done = Some(waiting);
         let session = self.clone();
         handle.spawn(async move {
+            // Told on every way out (an empty answer, a provider changed meanwhile), so no turn waits past it.
+            let _done = DropSend(done);
             let Some(info) = lookup.await else { return };
             {
                 let mut s = session.state();
@@ -4428,6 +4457,35 @@ mod turn_tests {
         assert_eq!(session.model_info().unwrap().reasoning, Some(ReasoningSupport::Optional));
         assert_eq!(*lock(&made), [None, Some(ReasoningSupport::Optional)]);
         assert_eq!(changed.load(Ordering::SeqCst), 1);
+    }
+
+    /// #143: the first turn waits briefly for a model list that hasn't answered, so a `marv -p` run (one turn) gets the
+    /// provider made with it: before, a list answering a moment late left the whole run without the reasoning effort.
+    #[tokio::test]
+    async fn the_first_turn_waits_briefly_for_the_model_list() {
+        let dirs = Dirs::new();
+        let without = Scripted::new(vec![say("Without the list.")]);
+        let with_list = Scripted::new(vec![say("With the list.")]);
+        let factory = TestFactory {
+            id: "openrouter".into(),
+            model: "x/y".into(),
+            local: false,
+            make: {
+                let (without, with_list) = (without.clone(), with_list.clone());
+                Arc::new(move |_, info| {
+                    if info.is_some() { Arc::new(with_list.clone()) as Arc<dyn Provider> } else { Arc::new(without.clone()) as Arc<dyn Provider> }
+                })
+            },
+            lookup: Some(Arc::new(|| {
+                Box::pin(async {
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    Some(info(Some(200_000), Some(ReasoningSupport::Mandatory)))
+                })
+            })),
+        };
+        let session = make(&dirs, factory, |_| {});
+        collect(go(&session, "hi")).await;
+        assert_eq!((without.requests().len(), with_list.requests().len()), (0, 1));
     }
 
     #[tokio::test]
