@@ -64,7 +64,7 @@ marv-rs must match these, or note the difference with an issue number:
   - a text loop's dropped reply (`text-loop`);
   - the compaction's summary request: `steps` is 2 in `mid-turn-compaction` with 3 requests. The usage includes the summary's tokens.
 - **A dropped stream's `text_delta`s** are already printed before the retry (`dropped-stream`; marv-rs continues instead, #64 above). A 429's retry prints nothing (`rate-limited`).
-- **Compaction events.** The summary request streams no `text_delta`. The turn shows `status: compacting` then `compaction {compacted: true}`, and no second `status: running` (`mid-turn-compaction`).
+- **Compaction events.** The summary request streams no `text_delta`. The turn shows `status: compacting` then `compaction {compacted: true}` (a failed one: `{compacted: false, reason, error}`, #144), and no second `status: running` (`mid-turn-compaction`).
 - **The MCP scenarios pin `mcpTools: deferred`** (marv-rs #87). Marv deferred the tracker's 25 tools (4,654 tokens) past its 4000-token limit; marv-rs offers them directly up to 8000. The recordings are Marv's deferred runs, so `run.json` asks for deferral and they keep checking that path. The direct path is tested in `marv-session` (`turn_tests`).
 - **Deferred MCP labels.** For `tool_search` and `mcp_call`, `tool_start`'s label is the raw arguments JSON (`{"names":[…]}`, `{"tool":…,"arguments":…}`), while `tool_end`'s is the tool name(s) (`mcp-fix-from-issue`, `mcp-comment`).
 - **An MCP tool called by its own name** (`mcp__tracker__add_comment`) runs as `mcp_call`. The stream shows `tool: "mcp_call"`, and the result ends with Marv's note that it isn't offered as a tool of its own (`mcp-comment`).
