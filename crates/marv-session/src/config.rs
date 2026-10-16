@@ -33,6 +33,10 @@ pub type Env = BTreeMap<String, String>;
 pub const DEFAULT_MAX_STEPS: u32 = marv_agent::agent::DEFAULT_MAX_STEPS;
 /// 32k fits fully on a 12 GB GPU for 9-12B models and holds a fair amount of code.
 pub const DEFAULT_CONTEXT_LENGTH: u64 = 32_768;
+/// `reasoningEffort` (#143) when the file doesn't say: medium. On SWE-bench (10 Verified instances, GLM-5.3-flash)
+/// it resolved the same 7 as the model's own effort with 37% fewer output tokens and 30% less cost; low was no
+/// cheaper and slower.
+pub const DEFAULT_REASONING_EFFORT: Option<marv_provider::ReasoningEffort> = Some(marv_provider::ReasoningEffort::Medium);
 /// `compactTokens` (#140): compact once the context passes this many tokens, even when the window is far larger.
 pub const DEFAULT_COMPACT_TOKENS: u64 = 100_000;
 /// The smallest `compactTokens`. After a compaction the context is the system prompt, tools and MCP list (7k–13k
@@ -84,6 +88,9 @@ pub struct FileConfig {
     /// Overrides the preset endpoint, e.g. Ollama on another machine.
     pub base_url: Option<String>,
     pub thinking: Option<bool>,
+    /// `reasoningEffort` (#143): `minimal`, `low`, `medium` or `high`, sent to OpenRouter models that reason;
+    /// `Some(None)` is `"default"` (the model picks). Unset: [`DEFAULT_REASONING_EFFORT`].
+    pub reasoning_effort: Option<Option<marv_provider::ReasoningEffort>>,
     /// Ollama's context window (num_ctx), at least 2048.
     pub context_length: Option<u64>,
     /// `compactTokens` (#140): compact at this many tokens of context, or at 85% of the window if that comes first.
@@ -248,6 +255,20 @@ impl FileConfig {
                 }
             },
         };
+        let reasoning_effort = match map.get("reasoningEffort") {
+            None | Some(Value::Null) => None,
+            Some(v) if v.as_str() == Some("default") => Some(None),
+            Some(v) => match v.as_str().and_then(marv_provider::ReasoningEffort::parse) {
+                Some(effort) => Some(Some(effort)),
+                None => {
+                    problems.push(format!(
+                        "reasoningEffort: expected one of {}, or default",
+                        marv_provider::ReasoningEffort::NAMES.join(", ")
+                    ));
+                    None
+                }
+            },
+        };
         let compact_tokens = match map.get("compactTokens") {
             None | Some(Value::Null) => None,
             Some(Value::Bool(false)) => Some(0),
@@ -364,6 +385,7 @@ impl FileConfig {
             api_key: string("apiKey", &mut problems),
             base_url,
             thinking: boolean("thinking", &mut problems),
+            reasoning_effort,
             context_length,
             compact_tokens,
             sandbox: boolean("sandbox", &mut problems),
@@ -399,6 +421,7 @@ impl FileConfig {
         put("apiKey", self.api_key.clone().map(Value::from));
         put("baseUrl", self.base_url.clone().map(Value::from));
         put("thinking", self.thinking.map(Value::from));
+        put("reasoningEffort", self.reasoning_effort.map(|e| Value::from(e.map_or("default", |e| e.as_str()))));
         put("contextLength", self.context_length.map(Value::from));
         put("compactTokens", self.compact_tokens.map(Value::from));
         put("sandbox", self.sandbox.map(Value::from));
@@ -455,6 +478,8 @@ pub struct Config {
     pub api_key: Option<String>,
     pub api_key_source: Option<KeySource>,
     pub thinking: bool,
+    /// `reasoningEffort` (#143); `None`: the model's own default.
+    pub reasoning_effort: Option<marv_provider::ReasoningEffort>,
     pub context_length: u64,
     /// `compactTokens` (#140): compact at this many tokens of context (or at 85% of the window if sooner); `None`: off.
     pub compact_tokens: Option<u64>,
@@ -495,6 +520,7 @@ impl Config {
             api_key: self.api_key.clone(),
             context_length: self.context_length,
             thinking: self.thinking,
+            reasoning_effort: self.reasoning_effort,
         }
     }
 }
@@ -577,6 +603,7 @@ pub fn resolve_config(file: Option<&FileConfig>, env: &Env) -> Config {
         },
         api_key,
         thinking: file.and_then(|f| f.thinking).unwrap_or(false),
+        reasoning_effort: file.and_then(|f| f.reasoning_effort).unwrap_or(DEFAULT_REASONING_EFFORT),
         context_length: file.and_then(|f| f.context_length).unwrap_or(DEFAULT_CONTEXT_LENGTH),
         compact_tokens: match file.and_then(|f| f.compact_tokens) {
             Some(0) => None,
@@ -674,7 +701,11 @@ pub fn migrate_legacy_config(home: &Path) -> std::io::Result<bool> {
 
 /// The SDK's way to a provider factory (Marv's `providerFactory`). Environment variables are ignored on this path: a
 /// library uses what it's given, and errors name the option to change (`SDK_HINTS`).
-pub fn provider_factory(option: ProviderOption, thinking: bool) -> Arc<dyn ProviderFactory> {
+pub fn provider_factory(
+    option: ProviderOption,
+    thinking: bool,
+    reasoning_effort: Option<marv_provider::ReasoningEffort>,
+) -> Arc<dyn ProviderFactory> {
     let (file, env) = match option {
         ProviderOption::Custom(provider) => return Arc::new(CustomFactory::new(provider)),
         ProviderOption::OpenRouter { api_key, model, base_url } => (
@@ -692,7 +723,7 @@ pub fn provider_factory(option: ProviderOption, thinking: bool) -> Arc<dyn Provi
             host.map(|h| Env::from([("OLLAMA_HOST".to_string(), h)])).unwrap_or_default(),
         ),
     };
-    let config = Config { thinking, ..resolve_config(Some(&file), &env) };
+    let config = Config { thinking, reasoning_effort, ..resolve_config(Some(&file), &env) };
     Arc::new(ConfigFactory {
         config: config.provider_config(),
         make: Arc::new(|config, info| marv_provider::create_provider(config, info, Some(marv_provider::errors::SDK_HINTS))),
@@ -837,6 +868,22 @@ mod tests {
                 raw[key] = bad.clone();
                 assert!(FileConfig::from_value(&raw).is_err(), "{bad}");
             }
+        }
+    }
+
+    #[test]
+    fn reasoning_effort_comes_from_the_file_and_reaches_the_provider_config() {
+        assert_eq!(resolve_config(None, &Env::new()).reasoning_effort, Some(marv_provider::ReasoningEffort::Medium));
+        let file = FileConfig::from_value(&json!({"reasoningEffort": "high"})).unwrap();
+        assert_eq!(file.to_value()["reasoningEffort"], json!("high"));
+        let config = resolve_config(Some(&file), &Env::new());
+        assert_eq!(config.provider_config().reasoning_effort, Some(marv_provider::ReasoningEffort::High));
+        // "default": the model picks, as before #143.
+        let own = FileConfig::from_value(&json!({"reasoningEffort": "default"})).unwrap();
+        assert_eq!(own.to_value()["reasoningEffort"], json!("default"));
+        assert_eq!(resolve_config(Some(&own), &Env::new()).reasoning_effort, None);
+        for bad in [json!("max"), json!(2), json!(true)] {
+            assert!(FileConfig::from_value(&json!({ "reasoningEffort": bad })).unwrap_err().contains("reasoningEffort"), "{bad}");
         }
     }
 

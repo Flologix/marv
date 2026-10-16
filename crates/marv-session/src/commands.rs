@@ -670,6 +670,10 @@ fn config_text(ctx: &CommandContext) -> String {
         format!("Provider:  {}", p.label),
         format!("Model:     {}", c.model),
         format!("Thinking:  {}", if c.thinking { "on" } else { "off" }),
+        format!(
+            "Reasoning: {} (reasoningEffort in the config file)",
+            c.reasoning_effort.map_or("the model's default", |e| e.as_str())
+        ),
         format!("Sandbox:   {}", sandbox_status(c, ctx.sandbox_available, &[])),
         format!("Yolo:      {} (/yolo)", if c.yolo { "on" } else { "off" }),
         format!("Trajectories: {} (/trajectories)", if c.trajectories { "on" } else { "off" }),
@@ -1175,6 +1179,7 @@ mod tests {
             let CommandAction::Print { text, .. } = run_command("/config", ctx) else { panic!() };
             assert!(text.contains("Radio:     off (/radio)"), "{text}");
             assert!(text.contains("Compact:   at 100,000 tokens or 85% of the window"), "{text}");
+            assert!(text.contains("Reasoning: medium (reasoningEffort in the config file)"), "{text}");
         });
     }
 

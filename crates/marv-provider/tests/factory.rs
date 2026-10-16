@@ -23,6 +23,7 @@ fn openrouter(base_url: &str, thinking: bool) -> ProviderConfig {
         api_key: Some("k".into()),
         context_length: 32768,
         thinking,
+        reasoning_effort: None,
     }
 }
 
@@ -52,6 +53,20 @@ async fn think_on_turns_reasoning_on_for_models_that_can_reason() {
 async fn think_off_turns_it_off_only_where_its_optional() {
     assert_eq!(body_sent(false, Some(ReasoningSupport::Optional)).await["reasoning"], json!({"enabled": false}));
     assert_eq!(body_sent(false, Some(ReasoningSupport::Mandatory)).await.get("reasoning"), None);
+}
+
+/// #143: `reasoningEffort` reaches the body of a model that always reasons, as OpenRouter's `effort`.
+#[tokio::test]
+async fn an_effort_reaches_a_model_that_always_reasons() {
+    let server =
+        FakeServer::start(|_| Reply::sse(&[json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}), json!("[DONE]")])).await;
+    let info = ModelInfo { id: "acme/m".into(), reasoning: Some(ReasoningSupport::Mandatory), ..Default::default() };
+    let config = ProviderConfig {
+        reasoning_effort: Some(marv_provider::ReasoningEffort::Medium),
+        ..openrouter(&format!("{}/v1", server.url()), false)
+    };
+    create_provider(&config, Some(&info), None).stream(&hi(), StreamOptions::default()).collect::<Vec<_>>().await;
+    assert_eq!(server.last().json()["reasoning"], json!({"effort": "medium"}));
 }
 
 #[tokio::test]
@@ -99,6 +114,7 @@ fn ollama_has_its_context_window() {
         api_key: None,
         context_length: 65536,
         thinking: false,
+        reasoning_effort: None,
     };
     let provider = create_provider(&config, None, None);
     assert_eq!(provider.name(), "ollama · qwen3.5:9b");

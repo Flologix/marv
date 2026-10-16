@@ -95,6 +95,8 @@ pub struct SessionOptions {
     pub github_known: Option<bool>,
     pub yolo: bool,
     pub thinking: bool,
+    /// `reasoningEffort` (#143): how hard an OpenRouter reasoning model reasons; `None`: the model's default.
+    pub reasoning_effort: Option<marv_provider::ReasoningEffort>,
     pub persist: Store<SessionStore>,
     pub trajectories: Store<TrajectoryStore>,
     pub transcript: Option<TranscriptFn>,
@@ -162,6 +164,7 @@ impl SessionBuilder {
                 github_known: None,
                 yolo: true,
                 thinking: false,
+                reasoning_effort: None,
                 persist: Store::Off,
                 trajectories: Store::Off,
                 transcript: None,
@@ -334,6 +337,7 @@ pub async fn create_session(options: SessionOptions) -> Result<MarvSession, Sess
         };
     let mut init = SessionInit::new(root.clone(), ProviderChoice::Option(options.provider));
     init.thinking = options.thinking;
+    init.reasoning_effort = options.reasoning_effort;
     init.instructions = loaded.instructions.map(|i| i.text);
     // Nested AGENTS.md files are the project's too (#62).
     init.nested_instructions = options.sources.contains(&Source::Project);
