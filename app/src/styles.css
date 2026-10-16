@@ -538,10 +538,33 @@ h3 {
 }
 
 .reply {
+  position: relative;
   display: grid;
   gap: 10px;
   min-width: 0;
   font-size: 14.5px;
+}
+
+.reply .copy {
+  justify-self: start;
+  margin-top: -4px;
+  padding: 0 6px;
+  border-radius: var(--r);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--tx-3);
+  opacity: 0;
+  transition: opacity 120ms var(--ease);
+}
+
+.reply:hover .copy,
+.reply .copy:focus-visible {
+  opacity: 1;
+}
+
+.reply .copy:hover {
+  background: var(--bg-2);
+  color: var(--tx);
 }
 
 .reply h1,

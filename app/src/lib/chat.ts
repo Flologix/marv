@@ -79,9 +79,17 @@ function apply(items: Item[], e: ServerEvent): Item[] {
       else next.push({ kind, text: String(e.text) });
       return next;
     }
-    case "assistant":
-      if (last?.kind !== "text" && e.text) next.push({ kind: "text", text: String(e.text) });
+    case "assistant": {
+      // The reply's whole text: already shown if it streamed in, even with tool calls after it in this step.
+      const text = String(e.text ?? "").trim();
+      for (let i = next.length - 1; i >= 0; i--) {
+        const it = next[i];
+        if (it.kind === "user" || it.kind === "turn") break;
+        if (it.kind === "text" && it.text.trim() === text) return items;
+      }
+      if (text) next.push({ kind: "text", text });
       return next;
+    }
     case "tool_start":
       if (tool(e.id) < 0) next.push({ kind: "tool", id: String(e.id), tool: String(e.tool), label: String(e.label ?? ""), agent: e.agent as string | undefined, done: false });
       return next;
@@ -194,6 +202,8 @@ export function useChat(id: string | null, settings: ChatSettings) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [commands, setCommands] = useState<Command[]>([]);
+  /** This chat's name on the machine's mesh, when it's on it. */
+  const [meshName, setMeshName] = useState<string | null>(null);
   const connection = useRef<Connection | null>(null);
   const pending = useRef<object[]>([]);
   const first = useRef<{ id: string; text: string } | null>(null);
@@ -234,6 +244,7 @@ export function useChat(id: string | null, settings: ChatSettings) {
           ready.current = true;
           first.current = null;
           setStatus("ready");
+          setMeshName((e.mesh as string | null) ?? null);
           const list = (e.commands as Command[]) ?? [];
           setCommands(list);
           try {
@@ -303,5 +314,5 @@ export function useChat(id: string | null, settings: ChatSettings) {
   const interrupt = useCallback(() => connection.current?.send({ type: "interrupt" }), []);
   const answer = useCallback((rid: number, decision: "yes" | "always" | "no") => connection.current?.send({ type: "approval", id: rid, decision }), []);
 
-  return { items, status, busy, error, commands, send, startWith, interrupt, answer };
+  return { items, status, busy, error, commands, meshName, send, startWith, interrupt, answer };
 }

@@ -39,6 +39,10 @@ pub struct ChatSpec {
     /// What Marv loads from disk, as the CLI does: `User` (~/.marv's skills, memory, MCP servers, instructions) and
     /// `Project` (the folder's). Only for the person's own machine; marv-web loads none.
     pub sources: Vec<Source>,
+    /// Put the chat on this machine's mesh, as the TUI is: it gets a name other Marvs see (`marv mesh ls`, the
+    /// `mesh_list` tool), wires need its person's approval, and a message on a wire wakes it. Only on the person's own
+    /// machine.
+    pub mesh: bool,
 }
 
 /// The commands the page offers in its `/` menu (besides the skills), and what they do here.
@@ -74,13 +78,36 @@ fn openrouter(api_key: &str, model: &str) -> ProviderOption {
 /// resume) or `fatal` first.
 pub async fn run_chat(spec: ChatSpec, mut incoming: UnboundedReceiver<ClientMessage>, out: UnboundedSender<Value>) {
     let approver = Arc::new(WebApprover::new(out.clone()));
-    let session = match open(&spec, approver.clone(), out.clone()).await {
+    // The mesh first: the session's tools include it from the start (the prompt cache).
+    let env: std::collections::BTreeMap<String, String> = std::env::vars().collect();
+    let mut mesh = None;
+    if spec.mesh {
+        match marv_session::mesh_process::start(&env, &spec.root, std::slice::from_ref(&spec.root)) {
+            Ok(started) => mesh = started,
+            Err(e) => {
+                let _ = out.send(json!({"type": "notice", "text": format!("Not on the mesh: {}", marv_core::printable(&e))}));
+            }
+        }
+    }
+    let session = match open(&spec, approver.clone(), out.clone(), mesh.as_ref().map(|m| m.handle.clone())).await {
         Ok(session) => session,
         Err(message) => {
             let _ = out.send(json!({"type": "fatal", "message": message}));
             return;
         }
     };
+    // Its door: other Marvs find it and ask for wires, which its person answers here.
+    let as_approver: Arc<dyn marv_tools::types::Approver> = approver.clone();
+    if let Some(mesh) = mesh.as_mut()
+        && let Some(wires) = marv_session::mesh::wire_approver(None, Some(&as_approver))
+        && let Err(e) = mesh.open_door(wires)
+    {
+        let _ = out.send(json!({"type": "notice", "text": format!("Not on the mesh: {}", marv_core::printable(&e))}));
+    }
+    let watching = CancellationToken::new();
+    if let Some(handle) = session.mesh() {
+        tokio::spawn(watch_mesh(handle, session.clone(), approver.clone(), out.clone(), watching.clone()));
+    }
     let home = marv_session::paths::home_dir();
     let skills: Vec<LoadedSkill> = if spec.sources.is_empty() {
         Vec::new()
@@ -93,7 +120,10 @@ pub async fn run_chat(spec: ChatSpec, mut incoming: UnboundedReceiver<ClientMess
         .map(|(name, description)| json!({"name": name, "description": description}))
         .chain(skills.iter().map(|s| json!({"name": s.skill.name, "description": s.skill.description, "skill": true})))
         .collect();
-    let _ = out.send(json!({"type": "ready", "sessionId": session.id(), "model": spec.model, "commands": menu}));
+    let mesh_name = mesh.as_ref().map(|m| m.name.clone());
+    let _ = out.send(json!({
+        "type": "ready", "sessionId": session.id(), "model": spec.model, "commands": menu, "mesh": mesh_name,
+    }));
 
     let mut turn: Option<(CancellationToken, JoinHandle<()>)> = None;
     while let Some(message) = incoming.recv().await {
@@ -115,7 +145,8 @@ pub async fn run_chat(spec: ChatSpec, mut incoming: UnboundedReceiver<ClientMess
                 }
             }
             ClientMessage::Command { line } => {
-                let (name, args) = line.trim().trim_start_matches('/').split_once(' ').unwrap_or((line.trim().trim_start_matches('/'), ""));
+                let (name, args) =
+                    line.trim().trim_start_matches('/').split_once(' ').unwrap_or((line.trim().trim_start_matches('/'), ""));
                 let (name, args) = (name.to_lowercase(), args.trim());
                 if let Some(skill) = skills.iter().find(|s| s.skill.name == name) {
                     // As typed in the transcript; the skill's instructions for the model.
@@ -162,7 +193,9 @@ pub async fn run_chat(spec: ChatSpec, mut incoming: UnboundedReceiver<ClientMess
                             Err(e) => print(e.to_string()),
                         }
                     }
-                    "model" => print("Use /model <OpenRouter id>, e.g. /model z-ai/glm-5.3-flash, or the model menu up top.".into()),
+                    "model" => {
+                        print("Use /model <OpenRouter id>, e.g. /model z-ai/glm-5.3-flash, or the model menu up top.".into())
+                    }
                     "compact" => {
                         let (session, out) = (session.clone(), out.clone());
                         let focus = (!args.is_empty()).then(|| args.to_string());
@@ -184,6 +217,8 @@ pub async fn run_chat(spec: ChatSpec, mut incoming: UnboundedReceiver<ClientMess
                 if let Some((cancel, _)) = &turn {
                     cancel.cancel();
                 }
+                // A turn a mesh message woke, too.
+                session.interrupt();
                 approver.cancel_all();
             }
             ClientMessage::Approval { id, decision } => approver.answer(id, decision),
@@ -210,7 +245,49 @@ pub async fn run_chat(spec: ChatSpec, mut incoming: UnboundedReceiver<ClientMess
         approver.cancel_all();
         let _ = tokio::time::timeout(Duration::from_secs(5), work).await;
     }
+    watching.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(3), session.close()).await;
+    drop(mesh);
+}
+
+/// A message on a wired inbox wakes the chat, as `mesh.wake` does in the TUI: only while nothing runs and no approval
+/// waits (otherwise it waits in the inbox for the next turn, and a later check picks it up), and within
+/// `WAKES_PER_MINUTE` per wire. The woken turn reads it fenced as data from another agent, tainting the session.
+async fn watch_mesh(
+    mesh: marv_session::mesh::MeshHandle,
+    session: MarvSession,
+    approver: Arc<WebApprover>,
+    out: UnboundedSender<Value>,
+    stop: CancellationToken,
+) {
+    let mut limit = marv_session::mesh::WakeLimit::default();
+    loop {
+        tokio::select! {
+            _ = mesh.mail() => {}
+            // Mail that came during a turn is still unread after it: look again now and then.
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+            _ = stop.cancelled() => return,
+        }
+        if session.busy() || approver.waiting() {
+            continue;
+        }
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+        let check = marv_session::mesh::wake_check(&mesh, &mut limit, now);
+        for wire in &check.limited {
+            let _ = out.send(json!({"type": "notice", "text": format!(
+                "{} woke Marv {} times a minute already: its messages on {} wait for your next message.",
+                marv_core::printable(wire.sender.as_str()),
+                marv_session::mesh::WAKES_PER_MINUTE,
+                marv_core::printable(wire.receptacle.as_str()),
+            )}));
+        }
+        let Some(by) = check.wake else { continue };
+        let before = session.usage().totals;
+        if let Ok(Some(turn)) = session.wake(&by) {
+            let _ = out.send(json!({"type": "notice", "text": by.line()}));
+            forward(turn, before, session.clone(), out.clone()).await;
+        }
+    }
 }
 
 fn help(skills: &[LoadedSkill]) -> String {
@@ -228,7 +305,12 @@ fn skills_text(skills: &[LoadedSkill]) -> String {
     skills.iter().map(|s| format!("- `/{}`: {}\n", s.skill.name, s.skill.description)).collect()
 }
 
-async fn open(spec: &ChatSpec, approver: Arc<WebApprover>, out: UnboundedSender<Value>) -> Result<MarvSession, String> {
+async fn open(
+    spec: &ChatSpec,
+    approver: Arc<WebApprover>,
+    out: UnboundedSender<Value>,
+    mesh: Option<marv_session::mesh::MeshHandle>,
+) -> Result<MarvSession, String> {
     let build = |resume: Option<ResumeTarget>| {
         let mut builder = SessionBuilder::new(&spec.root, openrouter(&spec.api_key, &spec.model))
             .approve(approver.clone())
@@ -242,6 +324,7 @@ async fn open(spec: &ChatSpec, approver: Arc<WebApprover>, out: UnboundedSender<
         }
         // No `sources`: none of the user's skills, memory, MCP servers or instructions from ~/.marv.
         builder.options.config_dir = Some(spec.config_dir.clone());
+        builder.options.mesh = mesh.clone();
         let out = out.clone();
         builder.options.on_warning = Some(Arc::new(move |text: String| {
             let _ = out.send(json!({"type": "notice", "text": marv_core::printable(&text)}));

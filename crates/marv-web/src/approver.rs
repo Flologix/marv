@@ -38,6 +38,11 @@ impl WebApprover {
         }
     }
 
+    /// A request is waiting for the person.
+    pub fn waiting(&self) -> bool {
+        !self.pending().is_empty()
+    }
+
     /// Every open request answered no (an interrupt, or the page went away).
     pub fn cancel_all(&self) {
         for (_, p) in self.pending().drain() {

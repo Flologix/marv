@@ -62,10 +62,7 @@ async fn main() -> anyhow::Result<()> {
         live: Mutex::new(HashSet::new()),
     });
     let addr = env("MARV_WEB_ADDR", "127.0.0.1:8787");
-    let router = Router::new()
-        .route("/ws", get(websocket))
-        .route("/health", get(|| async { "ok" }))
-        .with_state(app.clone());
+    let router = Router::new().route("/ws", get(websocket)).route("/health", get(|| async { "ok" })).with_state(app.clone());
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     eprintln!("marv-web on ws://{addr}/ws (data in {}, origins: {})", app.data.display(), app.origins.join(", "));
     axum::serve(listener, router).await?;
@@ -145,6 +142,7 @@ async fn chat(app: Arc<App>, socket: WebSocket) {
             processes: false,
             // Nothing from the server user's ~/.marv: no skills, memory, MCP servers or instructions.
             sources: Vec::new(),
+            mesh: false,
         };
         let (to_chat, from_page) = mpsc::unbounded_channel();
         let reader = async move {

@@ -64,6 +64,11 @@ export function ChatView({
       <header className="topbar">
         {left}
         <div className="crumbs">{crumbs}</div>
+        {chat.meshName && (
+          <span className="faint" title={`On the mesh as ${chat.meshName}: other Marvs see it (marv mesh ls) and can ask you for a wire`}>
+            mesh · {chat.meshName}
+          </span>
+        )}
         {chat.status !== "idle" && <span className={`status-dot ${chat.status}`} title={chat.status} />}
         {cost > 0 && <span className="faint">${cost.toFixed(4)}</span>}
         <button className="chip" aria-expanded={open} onClick={() => setOpen((o) => !o)}>
@@ -176,6 +181,7 @@ function ItemView({ item, onAnswer }: { item: Item; onAnswer: (id: number, d: "y
       return (
         <div className="reply">
           <Markdown remarkPlugins={[remarkGfm]}>{item.text}</Markdown>
+          <CopyButton text={item.text} />
         </div>
       );
     case "thinking":
@@ -261,6 +267,30 @@ function Approval({
         </button>
       </div>
     </section>
+  );
+}
+
+/** Copies a reply as Markdown, the way it was written. */
+function CopyButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      // Older webviews: through a hidden text box.
+      const area = Object.assign(document.createElement("textarea"), { value: text });
+      document.body.append(area);
+      area.select();
+      document.execCommand("copy");
+      area.remove();
+    }
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1200);
+  }
+  return (
+    <button className="copy" title="Copy this reply" onClick={() => void copy()}>
+      {copied ? "copied" : "copy"}
+    </button>
   );
 }
 

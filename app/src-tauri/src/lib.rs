@@ -205,8 +205,7 @@ fn trash_entry(desktop: State<'_, Desktop>, rel: String) -> Result<(), String> {
 #[tauri::command]
 fn list_chats(desktop: State<'_, Desktop>, folder: Option<String>) -> Vec<Chat> {
     let folder = folder.and_then(|f| desktop.full(&f).ok());
-    let mut chats: Vec<Chat> =
-        desktop.chats().into_iter().filter(|c| folder.as_ref().is_none_or(|f| &c.folder == f)).collect();
+    let mut chats: Vec<Chat> = desktop.chats().into_iter().filter(|c| folder.as_ref().is_none_or(|f| &c.folder == f)).collect();
     chats.sort_by_key(|c| std::cmp::Reverse(c.created));
     chats
 }
@@ -271,10 +270,7 @@ fn open_chat(
     let spec = ChatSpec {
         root: dir,
         // The CLI's own folder (~/.marv): the same memory, MCP servers and saved sessions as `marv`.
-        config_dir: marv_session::config::default_config_dir(
-            &std::env::vars().collect(),
-            &marv_session::paths::home_dir(),
-        ),
+        config_dir: marv_session::config::default_config_dir(&std::env::vars().collect(), &marv_session::paths::home_dir()),
         api_key,
         model,
         max_steps: max_steps.min(500),
@@ -284,6 +280,8 @@ fn open_chat(
         processes: true,
         // As the CLI: your skills, memory, MCP servers and instructions, and the folder's own.
         sources: vec![marv_session::sources::Source::User, marv_session::sources::Source::Project],
+        // On the mesh like a terminal Marv: other Marvs (desktop chats, Herdr panes) see it and can be wired to it.
+        mesh: true,
     };
     let (to_chat, from_page) = mpsc::unbounded_channel();
     let (out, mut events) = mpsc::unbounded_channel::<Value>();
@@ -330,11 +328,7 @@ pub fn run() {
             let data = app.path().app_data_dir()?;
             // The first argument that isn't a flag: `marv-desktop .`, `marv-desktop ~/Projects/site`.
             let launch = std::env::args().skip(1).find(|a| !a.starts_with('-'));
-            app.manage(Desktop {
-                store: Store::new(config, data),
-                live: Mutex::new(HashMap::new()),
-                launch: Mutex::new(launch),
-            });
+            app.manage(Desktop { store: Store::new(config, data), live: Mutex::new(HashMap::new()), launch: Mutex::new(launch) });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
