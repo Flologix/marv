@@ -67,6 +67,7 @@ pub type RewriteCall = Arc<dyn Fn(&ToolCall) -> Option<ToolCall> + Send + Sync>;
 - **Kept from Marv as is** (worth a look, not changed here): a reply with calls that ends in a provider `Error` puts its calls in the history unanswered (the session's `answer_all_calls` covers saving), and the second tool loop answers its calls with `not_run::CUT_OFF`'s text.
 - **Tests:** `ScriptedProvider` replies with an empty `Done` after its script (Marv: "(script ended)"), so a test that runs past its script sees empty-reply retries first; the tests that count requests script their last reply.
 - **Two compaction failure rules live in the session** (`midTurnCompactFailed`): a summary that failed mid-turn isn't asked for again that turn, and Esc during the summary stops the turn (the loop checks for abort right after `on_full`).
+- **When to compact also lives in the session** (`nearly_full`, marv-rs #140): at `COMPACT_AT` (85%) of the window as in Marv, or sooner once the context passes the user's `compactTokens` (default 100k; `0`/`false` off). Marv compacts only at 85%; on OpenRouter models with large windows that was never reached, and long sessions resent 200k–400k tokens every step (replayed on real trajectories: about 60% of the cost of long turns saved at 100k). Subagent loops have no `on_full` hook and still never compact (as before #140). The threshold counts prompt plus completion tokens, so a thinking model's reasoning counts too.
 
 ## Planned improvements (Marv issues)
 

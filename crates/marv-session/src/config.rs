@@ -33,6 +33,11 @@ pub type Env = BTreeMap<String, String>;
 pub const DEFAULT_MAX_STEPS: u32 = marv_agent::agent::DEFAULT_MAX_STEPS;
 /// 32k fits fully on a 12 GB GPU for 9-12B models and holds a fair amount of code.
 pub const DEFAULT_CONTEXT_LENGTH: u64 = 32_768;
+/// `compactTokens` (#140): compact once the context passes this many tokens, even when the window is far larger.
+pub const DEFAULT_COMPACT_TOKENS: u64 = 100_000;
+/// The smallest `compactTokens`. After a compaction the context is the system prompt, tools and MCP list (7k–13k
+/// seen), the summary and the next tool outputs: a threshold close to that would compact again every step or two.
+pub const MIN_COMPACT_TOKENS: u64 = 40_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Preset {
@@ -81,6 +86,9 @@ pub struct FileConfig {
     pub thinking: Option<bool>,
     /// Ollama's context window (num_ctx), at least 2048.
     pub context_length: Option<u64>,
+    /// `compactTokens` (#140): compact at this many tokens of context, or at 85% of the window if that comes first.
+    /// `Some(0)` (written `0` or `false`) turns it off: only the window rule is left.
+    pub compact_tokens: Option<u64>,
     pub sandbox: Option<bool>,
     pub yolo: Option<bool>,
     pub trajectories: Option<bool>,
@@ -240,6 +248,19 @@ impl FileConfig {
                 }
             },
         };
+        let compact_tokens = match map.get("compactTokens") {
+            None | Some(Value::Null) => None,
+            Some(Value::Bool(false)) => Some(0),
+            Some(v) => match v.as_u64() {
+                Some(n) if n == 0 || n >= MIN_COMPACT_TOKENS => Some(n),
+                _ => {
+                    problems.push(format!(
+                        "compactTokens: expected a whole number of at least {MIN_COMPACT_TOKENS}, or 0 or false (off)"
+                    ));
+                    None
+                }
+            },
+        };
         let mcp_tools = match map.get("mcpTools") {
             None | Some(Value::Null) => None,
             Some(v) => match serde_json::from_value::<McpToolsSetting>(v.clone()) {
@@ -344,6 +365,7 @@ impl FileConfig {
             base_url,
             thinking: boolean("thinking", &mut problems),
             context_length,
+            compact_tokens,
             sandbox: boolean("sandbox", &mut problems),
             yolo: boolean("yolo", &mut problems),
             trajectories: boolean("trajectories", &mut problems),
@@ -378,6 +400,7 @@ impl FileConfig {
         put("baseUrl", self.base_url.clone().map(Value::from));
         put("thinking", self.thinking.map(Value::from));
         put("contextLength", self.context_length.map(Value::from));
+        put("compactTokens", self.compact_tokens.map(Value::from));
         put("sandbox", self.sandbox.map(Value::from));
         put("yolo", self.yolo.map(Value::from));
         put("trajectories", self.trajectories.map(Value::from));
@@ -433,6 +456,8 @@ pub struct Config {
     pub api_key_source: Option<KeySource>,
     pub thinking: bool,
     pub context_length: u64,
+    /// `compactTokens` (#140): compact at this many tokens of context (or at 85% of the window if sooner); `None`: off.
+    pub compact_tokens: Option<u64>,
     pub sandbox: bool,
     pub yolo: bool,
     pub trajectories: bool,
@@ -553,6 +578,10 @@ pub fn resolve_config(file: Option<&FileConfig>, env: &Env) -> Config {
         api_key,
         thinking: file.and_then(|f| f.thinking).unwrap_or(false),
         context_length: file.and_then(|f| f.context_length).unwrap_or(DEFAULT_CONTEXT_LENGTH),
+        compact_tokens: match file.and_then(|f| f.compact_tokens) {
+            Some(0) => None,
+            n => Some(n.unwrap_or(DEFAULT_COMPACT_TOKENS)),
+        },
         sandbox: file.and_then(|f| f.sandbox).unwrap_or(true),
         // `MARV_YOLO=off` holds yolo off for this process whatever the file says (#74: how the Herdr door starts a Marv
         // that may have no more than the session that spawned it). It can only turn yolo off, never on.
@@ -808,6 +837,25 @@ mod tests {
                 raw[key] = bad.clone();
                 assert!(FileConfig::from_value(&raw).is_err(), "{bad}");
             }
+        }
+    }
+
+    #[test]
+    fn compact_tokens_defaults_to_100k_and_0_or_false_turns_it_off() {
+        assert_eq!(resolve_config(None, &Env::new()).compact_tokens, Some(DEFAULT_COMPACT_TOKENS));
+        let file = |v: Value| FileConfig::from_value(&json!({ "compactTokens": v }));
+        let set = file(json!(150_000)).unwrap();
+        assert_eq!(set.compact_tokens, Some(150_000));
+        assert_eq!(set.to_value()["compactTokens"], json!(150_000));
+        assert_eq!(resolve_config(Some(&set), &Env::new()).compact_tokens, Some(150_000));
+        for off in [json!(0), json!(false)] {
+            let off = file(off).unwrap();
+            assert_eq!(resolve_config(Some(&off), &Env::new()).compact_tokens, None);
+            assert_eq!(off.to_value()["compactTokens"], json!(0));
+        }
+        assert_eq!(file(json!(MIN_COMPACT_TOKENS)).unwrap().compact_tokens, Some(MIN_COMPACT_TOKENS));
+        for bad in [json!(MIN_COMPACT_TOKENS - 1), json!(-5), json!("100k"), json!(true), json!(1.5)] {
+            assert!(file(bad.clone()).unwrap_err().contains("compactTokens"), "{bad}");
         }
     }
 
