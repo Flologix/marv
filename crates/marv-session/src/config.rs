@@ -35,8 +35,9 @@ pub const DEFAULT_MAX_STEPS: u32 = marv_agent::agent::DEFAULT_MAX_STEPS;
 pub const DEFAULT_CONTEXT_LENGTH: u64 = 32_768;
 /// `compactTokens` (#140): compact once the context passes this many tokens, even when the window is far larger.
 pub const DEFAULT_COMPACT_TOKENS: u64 = 100_000;
-/// The smallest `compactTokens`: below it the system prompt and tools alone would trigger compaction every few steps.
-pub const MIN_COMPACT_TOKENS: u64 = 20_000;
+/// The smallest `compactTokens`. After a compaction the context is the system prompt, tools and MCP list (7k–13k
+/// seen), the summary and the next tool outputs: a threshold close to that would compact again every step or two.
+pub const MIN_COMPACT_TOKENS: u64 = 40_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Preset {
@@ -839,8 +840,6 @@ mod tests {
         }
     }
 
-    /// #74: the Herdr door's pane limit is the user's file's (default 4, at most 16), and `MARV_YOLO=off` only ever
-    /// turns yolo off.
     #[test]
     fn compact_tokens_defaults_to_100k_and_0_or_false_turns_it_off() {
         assert_eq!(resolve_config(None, &Env::new()).compact_tokens, Some(DEFAULT_COMPACT_TOKENS));
@@ -860,6 +859,8 @@ mod tests {
         }
     }
 
+    /// #74: the Herdr door's pane limit is the user's file's (default 4, at most 16), and `MARV_YOLO=off` only ever
+    /// turns yolo off.
     #[test]
     fn herdr_peers_comes_from_the_file_and_marv_yolo_only_turns_yolo_off() {
         assert_eq!(resolve_config(None, &Env::new()).herdr_peers, DEFAULT_HERDR_PEERS);

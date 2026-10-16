@@ -2983,6 +2983,35 @@ mod tests {
         // Off: only the window.
         let off = session(|i| i.compact_tokens = None).unwrap();
         assert!(!used(&off, 800) && used(&off, 850));
+        // A large window (400k, so 340k) and the default: 100k comes first.
+        let large = session(|i| i.provider = ProviderChoice::Option(ProviderOption::Custom(Arc::new(Window(Some(400_000))))));
+        assert!(!used(&large.unwrap(), 99_999));
+        let large = session(|i| i.provider = ProviderChoice::Option(ProviderOption::Custom(Arc::new(Window(Some(400_000))))));
+        assert!(used(&large.unwrap(), 100_000));
+        // No known window: compactTokens alone; off, never.
+        let unknown = |b| {
+            session(|i| {
+                i.provider = ProviderChoice::Option(ProviderOption::Custom(Arc::new(Window(None))));
+                i.compact_tokens = b;
+            })
+            .unwrap()
+        };
+        assert!(!used(&unknown(Some(100_000)), 99_999) && used(&unknown(Some(100_000)), 100_000));
+        assert!(!used(&unknown(None), 1_000_000));
+    }
+
+    /// A provider with a given window (or none known).
+    struct Window(Option<u64>);
+    impl Provider for Window {
+        fn name(&self) -> &str {
+            "window"
+        }
+        fn context_length(&self) -> Option<u64> {
+            self.0
+        }
+        fn stream(&self, _history: &[ChatTurn], _options: marv_provider::StreamOptions) -> EventStream {
+            Box::pin(futures::stream::empty())
+        }
     }
 
     #[test]
