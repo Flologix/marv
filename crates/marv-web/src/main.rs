@@ -1,41 +1,32 @@
-//! marv-web: Marv sessions for a browser. One WebSocket is one chat: the server builds a [`marv_session`] session in
-//! that chat's own workspace, streams its events as JSON, and sends each approval to the browser, waiting for the
-//! person's answer (yes, always, no) instead of refusing as `marv -p` does.
+//! marv-web: Marv chats for a browser, over a WebSocket. One socket is one chat, in its own workspace
+//! (`<data>/workspaces/<chat id>`, a fresh git repo, continued on reconnect); [`marv_web::host`] drives it.
 //!
 //! Local only for now: there's no login, so it binds to 127.0.0.1 and only takes WebSockets from the origins in
 //! `MARV_WEB_ORIGINS`. Everything runs as the server's user, with the server's OpenRouter key.
 
-mod approver;
-mod chat;
-mod events;
-
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use axum::Router;
+use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{State, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use futures::{SinkExt, StreamExt};
+use marv_web::host::{ChatSpec, run_chat};
+use marv_web::protocol::{ClientMessage, is_chat_id, is_model_id};
+use serde_json::{Value, json};
+use tokio::sync::mpsc;
 
-pub struct App {
-    /// Workspaces (`workspaces/<chat id>`) and Marv's own files (`marv/`: sessions, checkpoints, trajectories).
-    pub data: PathBuf,
-    pub api_key: String,
-    pub default_model: String,
+struct App {
+    data: PathBuf,
+    api_key: String,
+    default_model: String,
     origins: Vec<String>,
     /// Chats with a connection now: one at a time each, as a session has one turn at a time.
-    pub live: Mutex<HashSet<String>>,
-}
-
-impl App {
-    pub fn workspaces(&self) -> PathBuf {
-        self.data.join("workspaces")
-    }
-    pub fn config_dir(&self) -> PathBuf {
-        self.data.join("marv")
-    }
+    live: Mutex<HashSet<String>>,
 }
 
 /// The OpenRouter key: `OPENROUTER_API_KEY`, else (for local use) the one saved by `marv`'s setup.
@@ -87,5 +78,91 @@ async fn websocket(State(app): State<Arc<App>>, headers: HeaderMap, upgrade: Web
     if !app.origins.iter().any(|allowed| allowed == origin) {
         return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
     }
-    upgrade.on_upgrade(move |socket| chat::run(app, socket))
+    upgrade.on_upgrade(move |socket| chat(app, socket))
+}
+
+fn parse(message: Message) -> Option<ClientMessage> {
+    let Message::Text(text) = message else { return None };
+    serde_json::from_str(&text).ok()
+}
+
+async fn chat(app: Arc<App>, socket: WebSocket) {
+    let (mut sink, mut incoming) = socket.split();
+    let (out, mut outgoing) = mpsc::unbounded_channel::<Value>();
+    let writer = tokio::spawn(async move {
+        while let Some(value) = outgoing.recv().await {
+            if sink.send(Message::Text(value.to_string().into())).await.is_err() {
+                break;
+            }
+        }
+    });
+    let finish = |out: mpsc::UnboundedSender<Value>| async move {
+        drop(out);
+        let _ = writer.await;
+    };
+
+    let hello = loop {
+        match incoming.next().await {
+            Some(Ok(message)) => {
+                if let Some(message) = parse(message) {
+                    break message;
+                }
+            }
+            _ => return finish(out).await,
+        }
+    };
+    let ClientMessage::Hello { chat_id, model, max_steps, yolo } = hello else {
+        let _ = out.send(json!({"type": "fatal", "message": "Expected hello with a chat id and a model."}));
+        return finish(out).await;
+    };
+    let model = model.unwrap_or_else(|| app.default_model.clone());
+    if !is_chat_id(&chat_id) || !is_model_id(&model) {
+        let _ = out.send(json!({"type": "fatal", "message": "Expected hello with a chat id and a model."}));
+        return finish(out).await;
+    }
+    if !app.live.lock().unwrap_or_else(|e| e.into_inner()).insert(chat_id.clone()) {
+        // Often this tab's own last connection, still closing: the page tries again.
+        let _ = out.send(json!({"type": "fatal", "message": "This chat is open in another tab.", "retry": true}));
+        return finish(out).await;
+    }
+
+    let root = app.data.join("workspaces").join(&chat_id);
+    let resume = root.exists().then_some(marv_session::ResumeTarget::Latest);
+    if resume.is_none()
+        && let Err(e) = new_workspace(&root)
+    {
+        let _ = out.send(json!({"type": "fatal", "message": format!("Couldn't make the workspace: {e}")}));
+    } else {
+        let spec = ChatSpec {
+            root,
+            config_dir: app.data.join("marv"),
+            api_key: app.api_key.clone(),
+            model,
+            max_steps: max_steps.unwrap_or(50).min(500),
+            yolo: yolo.unwrap_or(true),
+            resume,
+            // Its ports would be forwarded to the server's 127.0.0.1, not the person's.
+            processes: false,
+        };
+        let (to_chat, from_page) = mpsc::unbounded_channel();
+        let reader = async move {
+            while let Some(Ok(message)) = incoming.next().await {
+                if let Some(message) = parse(message) {
+                    let _ = to_chat.send(message);
+                }
+            }
+        };
+        tokio::join!(run_chat(spec, from_page, out.clone()), reader);
+    }
+    app.live.lock().unwrap_or_else(|e| e.into_inner()).remove(&chat_id);
+    finish(out).await;
+}
+
+fn new_workspace(root: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(root)?;
+    let status = std::process::Command::new("git").args(["init", "-q"]).current_dir(root).status()?;
+    if !status.success() {
+        return Err(std::io::Error::other("git init failed"));
+    }
+    Ok(())
 }

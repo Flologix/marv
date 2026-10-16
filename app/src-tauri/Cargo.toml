@@ -1,0 +1,25 @@
+[package]
+name = "marv-desktop"
+description = "Marv desktop: a folder tree and Marv chats on the folders you pick, in a Tauri window."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "marv_desktop"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.7.3", features = [] }
+
+[dependencies]
+marv-web = { path = "../../crates/marv-web" }
+marv-session.workspace = true
+tauri = { version = "2.12.4", features = [] }
+tauri-plugin-dialog = "2"
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid = { version = "1", features = ["v4"] }
+# Deleting from the tree moves to the desktop's trash, never rm -rf.
+trash = "5"

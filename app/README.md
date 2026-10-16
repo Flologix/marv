@@ -1,0 +1,68 @@
+# Marv desktop
+
+Marv in a window. You pick a **Marv folder** once (for example `~/Projects` or a new `~/Marv`). The left pane shows its tree, where you can make, rename and trash folders. A chat runs Marv on whichever folder is selected: Marv reads and changes everything below that folder, runs sandboxed commands and edits on its own, and asks you, in the window, before anything leaves the sandbox. Every chat belongs to a folder and picks up where it left off when you reopen it.
+
+The look is Flexoki light (paper, thin lines) with the FloLogix AI typefaces: Jost, IBM Plex Sans and IBM Plex Mono.
+
+## How it fits together
+
+```
+app/ (Vite + React)  ── Tauri commands + a channel ──▶  app/src-tauri (marv-desktop)
+                                                          │  folder tree, chats, settings
+                                                          ▼
+                                                   marv_web::host::run_chat  ──▶  marv-session (Marv's engine)
+                                                          ▲
+browser (same app/)  ── WebSocket ──▶  crates/marv-web ───┘
+```
+
+- **One frontend, two backends.** The page in `app/` works in both:
+  - Inside Tauri it calls the desktop's commands.
+  - In a plain browser it talks to `marv-web` over a WebSocket.
+- **One protocol.** A chat gets the same messages either way, and returns the same events: `send`, `interrupt`, `approval`, `configure` in; text, tool calls, approvals and usage out (see `crates/marv-web/src/protocol.rs`). That's the contract a hosted Marv, or a desktop linked to one, builds on.
+- **One engine.** `marv_web::host::run_chat` drives the session for both. The desktop runs it in-process, with no server and no port.
+
+### What the desktop keeps
+
+| Where | What |
+|---|---|
+| `~/.config/ai.flologix.marv/settings.json` (0600) | The Marv folder, and the OpenRouter key if you pasted one |
+| `~/.local/share/ai.flologix.marv/chats.json` | Each chat's folder, title and Marv session id |
+| `~/.local/share/ai.flologix.marv/marv/` | Marv's saved sessions and undo checkpoints (not the CLI's `~/.marv`) |
+| The window's local storage | Transcripts as shown, and the model, step limit and yolo setting |
+
+### Safety
+
+- **The Marv folder can't be your home folder or anything above it.** Marv changes files below its folder without asking, so that would include your dotfiles.
+- **Tree paths are checked against the root.** Every path the page sends must be relative to the root: no absolute paths, no `..`, and no symlinks that lead out.
+- **Deleting goes to the trash.** Nothing is removed outright.
+- **Marv loads none of the CLI's skills, memory, MCP servers or instructions.** The desktop's sessions start clean.
+- **The key is found in this order:**
+  1. the one you pasted;
+  2. `OPENROUTER_API_KEY`;
+  3. the one `marv` setup saved.
+
+## Run it
+
+You need Rust, Node and bubblewrap. On Linux you also need WebKitGTK 4.1 (`webkit2gtk-4.1`).
+
+```sh
+cd app
+npm install
+npx tauri dev        # the app, with hot reload
+npx tauri build      # .deb and .AppImage in target/release/bundle
+```
+
+**Linux note:** WebKitGTK's DMA-BUF renderer crashes on some Wayland + NVIDIA setups ("Error 71 (Protocol error)"). Marv desktop sets `WEBKIT_DISABLE_DMABUF_RENDERER=1` for itself. To keep the renderer, set the variable to `0`.
+
+**In a browser:**
+1. Run `cargo run -p marv-web`.
+2. In `app/`, run `npm run dev` and open http://127.0.0.1:1420.
+3. Add that origin to `MARV_WEB_ORIGINS` (see `crates/marv-web`).
+
+This mode is one chat in a fresh workspace on the server, with no folder tree.
+
+## Next
+
+- Accounts, and a hosted `marv-web` with a workspace per user in a container.
+- Code moves between desktop and hosted through git, not file sync.
+- Link a signed-in desktop so the hosted page can reach it.
