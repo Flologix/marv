@@ -110,24 +110,73 @@ pub struct ProviderConfig {
     pub context_length: u64,
     /// `/think`: off by default (local thinking models can otherwise reason for minutes).
     pub thinking: bool,
+    /// `reasoningEffort` (marv-rs #143): how hard an OpenRouter model reasons, where it reasons at all.
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
-/// OpenRouter's unified reasoning switch, as sent in the request body (`{"enabled": bool}`).
+/// OpenRouter's unified reasoning setting, as sent in the request body: `{"enabled": bool}` or `{"effort": "low"}`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct ReasoningSwitch {
-    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<ReasoningEffort>,
+}
+
+impl ReasoningSwitch {
+    pub const ON: Self = Self { enabled: Some(true), effort: None };
+    pub const OFF: Self = Self { enabled: Some(false), effort: None };
+    pub fn effort(effort: ReasoningEffort) -> Self {
+        Self { enabled: None, effort: Some(effort) }
+    }
+}
+
+/// OpenRouter's reasoning effort levels (marv-rs #143).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    Minimal,
+    Low,
+    Medium,
+    High,
+}
+
+impl ReasoningEffort {
+    pub const NAMES: [&str; 4] = ["minimal", "low", "medium", "high"];
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "minimal" => Some(Self::Minimal),
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            _ => None,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        Self::NAMES[self as usize]
+    }
 }
 
 /// `/think` on OpenRouter. "Off" goes only to models whose reasoning is optional: for one that
 /// always reasons, OpenRouter rejects the request (and thinking is off by default, so that would
 /// be every request). For a model Marv knows nothing about yet (the model list hasn't loaded),
 /// nothing is sent.
-pub fn reasoning_for(thinking: bool, reasoning: Option<ReasoningSupport>) -> Option<ReasoningSwitch> {
+///
+/// `effort` (`reasoningEffort`, marv-rs #143) goes wherever the model reasons: with `/think` on, and to a model that
+/// always reasons. Without it, a model that always reasons picks its own effort, and GLM-5.3-flash's own is far
+/// more than coding needs (on SWE-bench, 4x the output tokens Codex got from the same model at medium).
+pub fn reasoning_for(
+    thinking: bool,
+    effort: Option<ReasoningEffort>,
+    reasoning: Option<ReasoningSupport>,
+) -> Option<ReasoningSwitch> {
     let reasoning = reasoning?;
-    if thinking {
-        return Some(ReasoningSwitch { enabled: true });
+    let reasons = thinking || reasoning == ReasoningSupport::Mandatory;
+    match effort {
+        Some(effort) if reasons => Some(ReasoningSwitch::effort(effort)),
+        _ if thinking => Some(ReasoningSwitch::ON),
+        _ => (reasoning == ReasoningSupport::Optional).then_some(ReasoningSwitch::OFF),
     }
-    (reasoning == ReasoningSupport::Optional).then_some(ReasoningSwitch { enabled: false })
 }
 
 /// The one place that maps a config to a concrete [`Provider`]. `model`: what the model list says
@@ -143,7 +192,7 @@ pub fn create_provider(config: &ProviderConfig, model: Option<&ModelInfo>, hints
     match config.provider {
         ProviderKind::OpenRouter => {
             let mut body = serde_json::Map::new();
-            if let Some(reasoning) = reasoning_for(config.thinking, model.and_then(|m| m.reasoning)) {
+            if let Some(reasoning) = reasoning_for(config.thinking, config.reasoning_effort, model.and_then(|m| m.reasoning)) {
                 body.insert("reasoning".into(), serde_json::json!(reasoning));
             }
             Arc::new(openai_compat::OpenAiCompatProvider::new(openai_compat::OpenAiCompatOptions {
@@ -185,25 +234,45 @@ mod tests {
 
     #[test]
     fn think_on_turns_reasoning_on_for_models_that_can_reason() {
-        let on = Some(ReasoningSwitch { enabled: true });
-        assert_eq!(reasoning_for(true, Some(ReasoningSupport::Optional)), on);
-        assert_eq!(reasoning_for(true, Some(ReasoningSupport::Mandatory)), on);
+        let on = Some(ReasoningSwitch::ON);
+        assert_eq!(reasoning_for(true, None, Some(ReasoningSupport::Optional)), on);
+        assert_eq!(reasoning_for(true, None, Some(ReasoningSupport::Mandatory)), on);
     }
 
     #[test]
     fn think_off_turns_it_off_only_where_it_is_optional() {
-        assert_eq!(reasoning_for(false, Some(ReasoningSupport::Optional)), Some(ReasoningSwitch { enabled: false }));
-        assert_eq!(reasoning_for(false, Some(ReasoningSupport::Mandatory)), None);
+        assert_eq!(reasoning_for(false, None, Some(ReasoningSupport::Optional)), Some(ReasoningSwitch::OFF));
+        assert_eq!(reasoning_for(false, None, Some(ReasoningSupport::Mandatory)), None);
     }
 
     #[test]
     fn for_an_unknown_model_nothing_is_sent_either_way() {
-        assert_eq!(reasoning_for(true, None), None);
-        assert_eq!(reasoning_for(false, None), None);
+        assert_eq!(reasoning_for(true, None, None), None);
+        assert_eq!(reasoning_for(false, None, None), None);
+        assert_eq!(reasoning_for(true, Some(ReasoningEffort::Low), None), None);
+    }
+
+    /// #143: the effort goes wherever the model reasons; thinking off on an optional model stays off.
+    #[test]
+    fn an_effort_goes_where_the_model_reasons() {
+        let low = Some(ReasoningEffort::Low);
+        assert_eq!(
+            reasoning_for(false, low, Some(ReasoningSupport::Mandatory)),
+            Some(ReasoningSwitch::effort(ReasoningEffort::Low))
+        );
+        assert_eq!(
+            reasoning_for(true, low, Some(ReasoningSupport::Optional)),
+            Some(ReasoningSwitch::effort(ReasoningEffort::Low))
+        );
+        assert_eq!(reasoning_for(false, low, Some(ReasoningSupport::Optional)), Some(ReasoningSwitch::OFF));
     }
 
     #[test]
     fn reasoning_switch_serializes_like_openrouter_expects() {
-        assert_eq!(serde_json::to_string(&ReasoningSwitch { enabled: false }).unwrap(), r#"{"enabled":false}"#);
+        assert_eq!(serde_json::to_string(&ReasoningSwitch::OFF).unwrap(), r#"{"enabled":false}"#);
+        assert_eq!(serde_json::to_string(&ReasoningSwitch::effort(ReasoningEffort::Medium)).unwrap(), r#"{"effort":"medium"}"#);
+        for name in ReasoningEffort::NAMES {
+            assert_eq!(ReasoningEffort::parse(name).unwrap().as_str(), name);
+        }
     }
 }

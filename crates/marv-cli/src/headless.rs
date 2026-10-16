@@ -514,6 +514,7 @@ pub async fn run_headless(options: HeadlessOptions) -> ExitCode {
     let o = &mut builder.options;
     (o.sandbox, o.thinking, o.diagnostics, o.checks, o.mcp_tools, o.config_dir) =
         (config.sandbox, config.thinking, config.diagnostics, config.checks, config.mcp_tools, Some(config_dir));
+    o.reasoning_effort = config.reasoning_effort;
     o.formatter = config.formatter;
     o.checkpoints = config.checkpoints;
     // Session-start hooks (#108): from the user's own config file only; a project's naming some is told, never run.

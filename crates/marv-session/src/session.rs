@@ -210,6 +210,8 @@ pub struct SessionInit {
     pub provider: ProviderChoice,
     /// For a `ProviderOption`: let thinking models reason first (a factory has it built in).
     pub thinking: bool,
+    /// For a `ProviderOption`: `reasoningEffort` (#143), how hard a reasoning model reasons (a factory has it built in).
+    pub reasoning_effort: Option<marv_provider::ReasoningEffort>,
     /// Marv's version, for trajectories.
     pub version: String,
     /// The instruction files, as they go into the prompt (`instructions::load_instructions`, which gives each its
@@ -329,6 +331,7 @@ impl SessionInit {
             cwd: None,
             provider,
             thinking: false,
+            reasoning_effort: None,
             version: env!("CARGO_PKG_VERSION").into(),
             instructions: None,
             nested_instructions: false,
@@ -689,10 +692,14 @@ pub fn check_tool_names(custom: &[ToolRef], plan: bool, github: bool) -> Result<
     Ok(())
 }
 
-fn factory_of(choice: &ProviderChoice, thinking: bool) -> Arc<dyn ProviderFactory> {
+fn factory_of(
+    choice: &ProviderChoice,
+    thinking: bool,
+    reasoning_effort: Option<marv_provider::ReasoningEffort>,
+) -> Arc<dyn ProviderFactory> {
     match choice {
         ProviderChoice::Factory(f) => f.clone(),
-        ProviderChoice::Option(o) => crate::config::provider_factory(o.clone(), thinking),
+        ProviderChoice::Option(o) => crate::config::provider_factory(o.clone(), thinking, reasoning_effort),
     }
 }
 
@@ -873,7 +880,7 @@ impl MarvSession {
         {
             return Err(SessionError::Invalid(why.clone()));
         }
-        let factory = factory_of(&init.provider, init.thinking);
+        let factory = factory_of(&init.provider, init.thinking, init.reasoning_effort);
         let provider = factory.make(None, None);
         let has_skills = !init.skills.is_empty();
         // Built once, so every request sends byte-identical tool definitions (the skill tool only when there are
@@ -2213,7 +2220,7 @@ impl MarvSession {
         let remade = if changes.provider.is_some() || changes.thinking.is_some() {
             let option = changes.provider.clone().unwrap_or_else(|| s.option.clone());
             let thinking = changes.thinking.unwrap_or(s.thinking);
-            let factory = factory_of(&option, thinking);
+            let factory = factory_of(&option, thinking, self.inner.init.reasoning_effort);
             // Same model (a /think or /yolo): what the list said still holds, so the provider keeps its switch.
             let same = factory.id() == s.factory.id() && factory.model() == s.factory.model();
             let info = if same { s.info.clone() } else { None };
