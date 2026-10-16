@@ -14,7 +14,8 @@
 //! - **Not a summary** (the history is kept, an error is returned): a reply that calls a tool
 //!   ("Let me re-read src/app.tsx first."), one cut off at the output limit, an empty one, a
 //!   provider error, or a cancel. Replacing the history with any of those would lose the
-//!   conversation for good.
+//!   conversation for good. marv-rs #144: a reply that calls a tool is asked again once with
+//!   `tool_choice: "none"` (same prefix, tools still sent) before giving up.
 //! - A `Retry` event means the provider is asking again from the start: what the failed attempt
 //!   sent isn't part of the summary that will replace the conversation (Marv #36 review).
 //! - Mid-turn, [`MID_TURN_NOTE`] follows the compacted history: it ends with the model's own
@@ -37,7 +38,7 @@
 //!   drops the oldest exchanges.
 
 use futures::StreamExt;
-use marv_core::{ChatTurn, ProviderEvent, ToolSpec, Usage};
+use marv_core::{ChatTurn, ProviderEvent, ToolChoice, ToolSpec, Usage};
 use marv_provider::{Provider, StreamOptions};
 use tokio_util::sync::CancellationToken;
 
@@ -90,19 +91,45 @@ pub fn summary_request(history: &[ChatTurn], focus: Option<&str>) -> Vec<ChatTur
     request
 }
 
+/// The error when the model called a tool instead of summarizing (after the retry with `tool_choice: "none"`).
+pub const TOOL_CALL_ERROR: &str = "The model tried to use a tool instead of summarizing.";
+
 /// Asks the model for a summary. `Ok(summary)` (trimmed), or `Err(message)` with the history to be kept.
+///
+/// marv-rs #144 (Marv asks once): a reply that calls a tool is asked again once with `tool_choice: "none"`. The tools
+/// are still sent, so the retry keeps the same prefix and hits the prompt cache (`tool_choice` is outside the prefix
+/// rule). Only a tool call is retried: a cut-off, empty or failed summary would most likely fail the same way.
 pub async fn summarize(options: SummarizeOptions<'_>) -> Result<String, String> {
     let request = summary_request(options.history, options.focus);
+    match ask(&options, &request, ToolChoice::Auto).await {
+        Err(Failure::ToolCall) => ask(&options, &request, ToolChoice::None).await,
+        other => other,
+    }
+    .map_err(|failure| match failure {
+        Failure::ToolCall => TOOL_CALL_ERROR.into(),
+        Failure::Other(message) => message,
+    })
+}
+
+/// Why one summary request gave no summary.
+enum Failure {
+    ToolCall,
+    Other(String),
+}
+
+/// One summary request.
+async fn ask(options: &SummarizeOptions<'_>, request: &[ChatTurn], tool_choice: ToolChoice) -> Result<String, Failure> {
     let stream_options = StreamOptions {
         system: Some(options.system.to_string()),
         tools: options.tools.to_vec(),
+        tool_choice,
         cancel: options.cancel.clone(),
         ..Default::default()
     };
     let mut text = String::new();
     let mut tool_call = false;
     let mut reason: Option<String> = None;
-    let mut events = options.provider.stream(&request, stream_options);
+    let mut events = options.provider.stream(request, stream_options);
     while let Some(event) = events.next().await {
         match event {
             ProviderEvent::TextDelta(t) => text.push_str(&t),
@@ -119,21 +146,21 @@ pub async fn summarize(options: SummarizeOptions<'_>) -> Result<String, String> 
                     on_usage(usage);
                 }
             }
-            ProviderEvent::Error(message) => return Err(message),
+            ProviderEvent::Error(message) => return Err(Failure::Other(message)),
             ProviderEvent::ThinkingDelta(_) | ProviderEvent::ToolCallDelta { .. } | ProviderEvent::Reasoning(_) => {}
         }
     }
     if options.cancel.is_cancelled() {
-        return Err("Stopped.".into());
+        return Err(Failure::Other("Stopped.".into()));
     }
     if tool_call {
-        return Err("The model tried to use a tool instead of summarizing.".into());
+        return Err(Failure::ToolCall);
     }
     if reason.as_deref() == Some("length") {
-        return Err("The summary was cut off by the model's output limit.".into());
+        return Err(Failure::Other("The summary was cut off by the model's output limit.".into()));
     }
     let summary = text.trim();
-    if summary.is_empty() { Err("The model returned an empty summary.".into()) } else { Ok(summary.to_string()) }
+    if summary.is_empty() { Err(Failure::Other("The model returned an empty summary.".into())) } else { Ok(summary.to_string()) }
 }
 
 /// The model's history after compacting: the summary, acknowledged, with the plan's text when one has something left
@@ -268,13 +295,18 @@ mod tests {
         assert!(run(&empty, &history(), &[], None).await.is_err());
     }
 
-    #[tokio::test]
-    async fn a_reply_that_calls_a_tool_or_is_cut_off_is_not_a_summary() {
-        let wants_tool = ScriptedProvider::new(vec![vec![
+    fn calls_a_tool() -> Vec<ProviderEvent> {
+        vec![
             ProviderEvent::TextDelta("Let me re-read src/app.tsx first.".into()),
             ProviderEvent::ToolCall(marv_core::ToolCall { id: "c1".into(), name: "read_file".into(), arguments: "{}".into() }),
             ProviderEvent::Done { reason: Some("tool_calls".into()) },
-        ]]);
+        ]
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_calls_a_tool_or_is_cut_off_is_not_a_summary() {
+        // #144: a tool call is asked again once; a second one is still not a summary.
+        let wants_tool = ScriptedProvider::new(vec![calls_a_tool(), calls_a_tool()]);
         let cut_off = ScriptedProvider::new(vec![vec![
             ProviderEvent::TextDelta("## Goal\nThe user wants to refac".into()),
             ProviderEvent::Done { reason: Some("length".into()) },
@@ -283,6 +315,55 @@ mod tests {
             let error = run(&provider, &[ChatTurn::User { text: "hi".into() }], &[], None).await.unwrap_err();
             assert!(error.contains("tool") || error.contains("cut off"), "{error}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_instead_of_a_summary_is_asked_again_once_with_tool_choice_none() {
+        // marv-rs #144: the retry keeps the same prefix (system, tools, history) and only sets tool_choice.
+        let model = ScriptedProvider::new(vec![calls_a_tool(), say("Summary: scroll glide added.")]);
+        let tools = vec![ToolSpec { name: "read_file".into(), description: "d".into(), parameters: serde_json::json!({}) }];
+        let h = history();
+        assert_eq!(run(&model, &h, &tools, None).await, Ok("Summary: scroll glide added.".into()));
+        let requests = model.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].1.tool_choice, ToolChoice::Auto);
+        assert_eq!(requests[1].1.tool_choice, ToolChoice::None);
+        assert_eq!(requests[1].1.tools, tools);
+        assert_eq!(requests[1].1.system, requests[0].1.system);
+        assert_eq!(requests[1].0, requests[0].0);
+
+        let stubborn = ScriptedProvider::new(vec![calls_a_tool(), calls_a_tool(), say("never asked")]);
+        assert_eq!(run(&stubborn, &h, &tools, None).await, Err(TOOL_CALL_ERROR.into()));
+        assert_eq!(stubborn.requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn only_a_tool_call_is_asked_again() {
+        for reply in [
+            vec![ProviderEvent::Error("Rate limited".into())],
+            vec![ProviderEvent::TextDelta("half".into()), ProviderEvent::Done { reason: Some("length".into()) }],
+            say("  "),
+        ] {
+            let model = ScriptedProvider::new(vec![reply, say("a summary")]);
+            assert!(run(&model, &history(), &[], None).await.is_err());
+            assert_eq!(model.requests().len(), 1);
+        }
+        // Stopped during the first request: no retry either.
+        let model = ScriptedProvider::new(vec![calls_a_tool(), say("a summary")]);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let result = summarize(SummarizeOptions {
+            provider: &model,
+            history: &history(),
+            system: "SYSTEM",
+            tools: &[],
+            cancel,
+            focus: None,
+            on_usage: None,
+        })
+        .await;
+        assert_eq!(result, Err("Stopped.".into()));
+        assert_eq!(model.requests().len(), 1);
     }
 
     #[test]

@@ -12,8 +12,9 @@
 //! is started on a fresh line before the first record of a process.
 //!
 //! marv-rs additions: `mesh` records (every mesh message, delivered or refused: `marv_mesh::switchboard::MeshRecord`),
-//! `radio` records (#124: joins, leaves, `lost`, `silent`, drops and refused frames: `marv_mesh::radio::RadioRecord`)
-//! and `taint` records (what tainted the session, `docs/SECURITY.md`).
+//! `radio` records (#124: joins, leaves, `lost`, `silent`, drops and refused frames: `marv_mesh::radio::RadioRecord`),
+//! `taint` records (what tainted the session, `docs/SECURITY.md`) and `compact_failed` records (#144: a summary that
+//! failed, and why).
 
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
@@ -305,6 +306,16 @@ pub enum TrajectoryRecord {
         #[serde(skip_serializing_if = "Option::is_none")]
         turn: Option<String>,
         summary: String,
+    },
+    /// marv-rs #144: a summary that failed, and why: `reason` "failed", "stopped" or "empty", `error` the message (a
+    /// tool call, a cut-off or empty summary, the provider's error), `tokens` the context's size when it was asked for.
+    CompactFailed {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        turn: Option<String>,
+        reason: &'static str,
+        error: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tokens: Option<u64>,
     },
     /// 1 good, -1 bad, 0 just labeled.
     Feedback {

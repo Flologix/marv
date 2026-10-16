@@ -280,9 +280,13 @@ impl Collector {
                 };
                 Some(json!({"type": "status", "status": status}))
             }
-            E::Compaction(result) => {
-                Some(json!({"type": "compaction", "compacted": matches!(result, marv_session::CompactResult::Compacted { .. })}))
-            }
+            E::Compaction(result) => Some(match result {
+                marv_session::CompactResult::Compacted { .. } => json!({"type": "compaction", "compacted": true}),
+                // #144: why it failed ("failed", "stopped", "empty") and the error, so a run's log says what happened.
+                marv_session::CompactResult::NotCompacted { reason, error } => {
+                    json!({"type": "compaction", "compacted": false, "reason": reason.as_str(), "error": error})
+                }
+            }),
             E::TurnEnd { reason, .. } => {
                 self.reason = reason.as_str().into();
                 None
@@ -585,6 +589,24 @@ mod tests {
         assert_eq!(a.approve(request("bash:host:echo")).await, Decision::Unavailable);
         let (none, _) = build_approver(&["network".into()], MustAsk::default()).unwrap();
         assert_eq!(none.unwrap().approve(request("github:pr merge")).await, Decision::Unavailable);
+    }
+
+    // #144: a failed compaction says why in stream-json.
+    #[test]
+    fn a_failed_compaction_carries_its_reason_and_error() {
+        let mut c = Collector::default();
+        let failed = marv_session::CompactResult::NotCompacted {
+            reason: marv_session::CompactFailure::Failed,
+            error: marv_agent::compact::TOOL_CALL_ERROR.into(),
+        };
+        assert_eq!(
+            c.event(&SessionEvent::Compaction(failed)),
+            Some(
+                serde_json::json!({"type": "compaction", "compacted": false, "reason": "failed", "error": marv_agent::compact::TOOL_CALL_ERROR})
+            )
+        );
+        let done = marv_session::CompactResult::Compacted { summary: "S".into(), tokens_before: Some(9) };
+        assert_eq!(c.event(&SessionEvent::Compaction(done)), Some(serde_json::json!({"type": "compaction", "compacted": true})));
     }
 
     // #52: a command for the host is refused in -p whatever --approve says, and listed as refused (exit 3).
