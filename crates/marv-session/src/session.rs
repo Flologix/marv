@@ -145,8 +145,9 @@ pub const MAX_COMPACT_FAILURES: u32 = 3;
 /// at `failed_at` tokens, with the context now at `now`. Marv gave up for the rest of the turn after one failure, but a
 /// `marv -p` run is a single turn: one failed summary (SWE-bench django-12663 at 112k) let it grow to 201k and time out.
 /// Growth first, so the next step doesn't pay for the same summary that just failed; a cap, so a model that can't
-/// summarize doesn't pay for one every few steps.
-pub(crate) fn may_compact_again(failures: u32, failed_at: Option<u64>, now: Option<u64>) -> bool {
+/// summarize doesn't pay for one every few steps. With a known `window`, the retry point is never past halfway from
+/// the failure to the window: when the trigger was 85% of it, 25% more would be past the window and never come.
+pub(crate) fn may_compact_again(failures: u32, failed_at: Option<u64>, now: Option<u64>, window: Option<u64>) -> bool {
     if failures == 0 {
         return true;
     }
@@ -154,7 +155,11 @@ pub(crate) fn may_compact_again(failures: u32, failed_at: Option<u64>, now: Opti
         return false;
     }
     match (failed_at, now) {
-        (Some(at), Some(now)) => now as f64 >= at as f64 * COMPACT_RETRY_GROWTH,
+        (Some(at), Some(now)) => {
+            let grown = at as f64 * COMPACT_RETRY_GROWTH;
+            let halfway = window.filter(|w| *w > at).map(|w| at as f64 + (w - at) as f64 / 2.0);
+            now as f64 >= halfway.map_or(grown, |h| h.min(grown))
+        }
         // The size at the failure isn't known: don't guess, wait for the next turn.
         _ => false,
     }
@@ -1881,8 +1886,11 @@ impl MarvSession {
     /// grown enough since one did (#144, [`may_compact_again`]).
     fn try_compact(&self) -> bool {
         self.nearly_full() && {
+            // context_length() takes the state's lock itself: read it first.
+            let window = self.context_length();
             let s = self.state();
-            may_compact_again(s.compact_failures, s.compact_failed_at, s.last.map(|l| l.prompt_tokens + l.completion_tokens))
+            let now = s.last.map(|l| l.prompt_tokens + l.completion_tokens);
+            may_compact_again(s.compact_failures, s.compact_failed_at, now, window)
         }
     }
 
@@ -4205,12 +4213,18 @@ mod turn_tests {
     /// #144: after a failure, again once the context is 25% past where it failed, at most 3 failures a turn.
     #[test]
     fn a_failed_summary_is_tried_again_after_growth_and_at_most_three_times_a_turn() {
-        assert!(may_compact_again(0, None, None));
-        assert!(!may_compact_again(1, Some(1000), Some(1249)));
-        assert!(may_compact_again(1, Some(1000), Some(1250)));
-        assert!(may_compact_again(2, Some(1250), Some(1563)));
-        assert!(!may_compact_again(MAX_COMPACT_FAILURES, Some(1000), Some(10_000)));
-        assert!(!may_compact_again(1, None, Some(10_000)), "no size at the failure: wait for the next turn");
+        assert!(may_compact_again(0, None, None, None));
+        assert!(!may_compact_again(1, Some(1000), Some(1249), None));
+        assert!(may_compact_again(1, Some(1000), Some(1250), None));
+        assert!(may_compact_again(2, Some(1250), Some(1563), None));
+        assert!(!may_compact_again(MAX_COMPACT_FAILURES, Some(1000), Some(10_000), None));
+        assert!(!may_compact_again(1, None, Some(10_000), None), "no size at the failure: wait for the next turn");
+        // A failure at 85% of a 1000 window: the retry comes halfway to the window (925), not at 1062 (never).
+        assert!(!may_compact_again(1, Some(850), Some(924), Some(1000)));
+        assert!(may_compact_again(1, Some(850), Some(925), Some(1000)));
+        // A large window: 25% growth comes first.
+        assert!(may_compact_again(1, Some(100_000), Some(125_000), Some(1_048_576)));
+        assert!(!may_compact_again(1, Some(100_000), Some(124_999), Some(1_048_576)));
     }
 
     #[tokio::test]
@@ -4224,8 +4238,8 @@ mod turn_tests {
             say("SUMMARY at last"),
             say("Finished."),
         ])
-        .with_context(1000);
-        let events = collect(go(&scripted(&dirs, &provider, |_| {}), "first")).await;
+        .with_context(10_000);
+        let events = collect(go(&scripted(&dirs, &provider, |i| i.compact_tokens = Some(900)), "first")).await;
         assert_eq!(
             compactions(&events),
             [
@@ -4253,8 +4267,8 @@ mod turn_tests {
             with(used(5000), use_tools(vec![read("c4")])), // grown, but three failed already
             say("Finished."),
         ])
-        .with_context(1000);
-        let session = scripted(&dirs, &provider, |_| {});
+        .with_context(10_000);
+        let session = scripted(&dirs, &provider, |i| i.compact_tokens = Some(900));
         let events = collect(go(&session, "first")).await;
         assert_eq!(compactions(&events).len(), 3);
         assert_eq!(summaries(&provider.requests()), 3);
