@@ -22,7 +22,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost https://openrouter.ai; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data:",
+      "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost https://openrouter.ai http://127.0.0.1:11434 http://localhost:11434; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data:",
       "devCsp": null
     }
   },

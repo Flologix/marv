@@ -228,7 +228,12 @@ fn open_chat(
     on_event: Channel<Value>,
 ) -> Result<Chat, String> {
     let root = desktop.root()?;
-    let api_key = desktop.api_key().ok_or("Add an OpenRouter key first.")?;
+    // A local (Ollama) model needs no key.
+    let api_key = match desktop.api_key() {
+        Some(key) => key,
+        None if marv_web::host::is_local(&model) => String::new(),
+        None => return Err("Add an OpenRouter key first, or pick a local model (ollama/…).".into()),
+    };
     if !is_model_id(&model) {
         return Err(format!("\"{model}\" isn't an OpenRouter model id."));
     }

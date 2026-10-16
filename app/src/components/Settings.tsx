@@ -31,13 +31,15 @@ export function Settings({
         />
         <datalist id="models">
           {models.map((m) => (
-            <option key={m.id} value={m.id}>{`${m.name} · $${m.input.toFixed(2)} / $${m.output.toFixed(2)}`}</option>
+            <option key={m.id} value={m.id}>{m.local ? m.name : `${m.name} · $${m.input.toFixed(2)} / $${m.output.toFixed(2)}`}</option>
           ))}
         </datalist>
         <span className="help">
-          {info
+          {info?.local
+            ? "Runs on this machine with Ollama: free, and nothing leaves your computer. The first message loads it into memory."
+            : info
             ? `${tokens(info.context)} context · $${info.input.toFixed(2)} in, $${info.output.toFixed(2)} out per million tokens`
-            : "Any OpenRouter model that can call tools."}
+            : "Any OpenRouter model that can call tools, or ollama/<name> for a local one."}
         </span>
       </label>
       <label className="field">

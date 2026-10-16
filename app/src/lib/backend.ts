@@ -93,12 +93,37 @@ export interface Model {
   /** Dollars per million tokens. */
   input: number;
   output: number;
+  /** Runs on this machine (Ollama). */
+  local?: boolean;
+}
+
+/** The models pulled into the local Ollama, as `ollama/<name>`; none when it isn't running. */
+async function localModels(): Promise<Model[]> {
+  try {
+    const response = await fetch("http://127.0.0.1:11434/api/tags", { signal: AbortSignal.timeout(1500) });
+    const { models } = await response.json();
+    return (models ?? []).map((m: { name: string; size: number }) => ({
+      id: `ollama/${m.name}`,
+      name: `${m.name} · local, ${(m.size / 1e9).toFixed(1)} GB`,
+      context: 0,
+      input: 0,
+      output: 0,
+      local: true,
+    }));
+  } catch {
+    return [];
+  }
 }
 
 const MODELS_KEY = "marv-models";
 
-/** OpenRouter's models that can call tools, cheapest first (cached for an hour). */
+/** Local Ollama models first, then OpenRouter's that can call tools, cheapest first (cached for an hour). */
 export async function loadModels(): Promise<Model[]> {
+  const [local, remote] = await Promise.all([localModels(), remoteModels().catch(() => [] as Model[])]);
+  return [...local, ...remote];
+}
+
+async function remoteModels(): Promise<Model[]> {
   try {
     const cached = JSON.parse(localStorage.getItem(MODELS_KEY) ?? "null");
     if (cached && Date.now() - cached.at < 3_600_000) return cached.models;

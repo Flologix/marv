@@ -51,8 +51,23 @@ const COMMANDS: &[(&str, &str)] = &[
     ("model", "Switch the model (/model <id>)"),
 ];
 
+/// A model id that starts with this runs on the local Ollama (`ollama/gemma4:12b`); any other is OpenRouter's.
+pub const OLLAMA_PREFIX: &str = "ollama/";
+
+pub fn is_local(model: &str) -> bool {
+    model.starts_with(OLLAMA_PREFIX)
+}
+
 fn openrouter(api_key: &str, model: &str) -> ProviderOption {
-    ProviderOption::OpenRouter { api_key: api_key.to_string(), model: Some(model.to_string()), base_url: None }
+    match model.strip_prefix(OLLAMA_PREFIX) {
+        // Ollama on its default port, with the CLI's default context window (Ollama's own is far smaller).
+        Some(local) => ProviderOption::Ollama {
+            model: local.to_string(),
+            host: None,
+            context_length: Some(marv_session::config::DEFAULT_CONTEXT_LENGTH),
+        },
+        None => ProviderOption::OpenRouter { api_key: api_key.to_string(), model: Some(model.to_string()), base_url: None },
+    }
 }
 
 /// Runs the chat until `incoming` closes (the page went away). Sends `ready` (with the session's id, for a later
