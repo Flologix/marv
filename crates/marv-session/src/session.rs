@@ -584,6 +584,9 @@ struct State {
     hook_stop: Option<CancellationToken>,
     /// The current round's task: `close()` waits for it.
     hook_task: Option<tokio::task::JoinHandle<()>>,
+    /// The first turn's checkpoint prune (a `git gc` in Marv's own git dir, at most once a day): close() waits for it,
+    /// so nothing still writes in the config folder once the session is closed.
+    prune_task: Option<tokio::task::JoinHandle<()>>,
     /// This conversation offers `radio_tx` (#124): it started with the radio on. Fixed until `clear()`.
     radio_offered: bool,
 }
@@ -937,6 +940,7 @@ impl MarvSession {
             hooks_unsent: false,
             hook_stop: None,
             hook_task: None,
+            prune_task: None,
             radio_offered: init.radio == Some(true) && init.mesh.is_some(),
         };
         // The config's pre-approved scopes (#98) seed the "always" layer: they mean "always, for this session",
@@ -1446,7 +1450,7 @@ impl MarvSession {
         };
         if prune {
             let store = self.inner.checkpoints.clone();
-            tokio::spawn(async move { store.prune(20, 14).await });
+            self.state().prune_task = Some(tokio::spawn(async move { store.prune(20, 14).await }));
         }
         let checkpoint = checkpoints_on.then(|| Arc::new(self.checkpoint_turn(number, text, turn, emit, &record)));
         *lock(pair) = checkpoint.clone();
@@ -2382,9 +2386,9 @@ impl MarvSession {
             if let Some(stop) = &s.current {
                 stop.cancel();
             }
-            (s.working.take(), s.hook_stop.take(), s.hook_task.take())
+            (s.working.take(), s.hook_stop.take(), s.hook_task.take(), s.prune_task.take())
         };
-        let (working, hook_stop, hook_task) = working;
+        let (working, hook_stop, hook_task, prune_task) = working;
         // Session-start hooks still running are killed (with what they started) and waited for (Greptile on #115).
         if let Some(stop) = hook_stop {
             stop.cancel();
@@ -2397,6 +2401,11 @@ impl MarvSession {
         // this flush, rather than one that lands after close() returned.
         if let Some(done) = working {
             done.cancelled().await;
+        }
+        // The checkpoint prune may be in a `git gc` (bounded at 120 s): one that outlived close() kept writing in the
+        // config folder after the caller had removed it (CI's leftover-folder check on the herdr guards, #142).
+        if let Some(task) = prune_task {
+            let _ = task.await;
         }
         self.flush().await;
         if self.inner.init.owns_mcp
