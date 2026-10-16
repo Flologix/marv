@@ -2,6 +2,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { useCallback, useEffect, useState } from "react";
 import { ChatView } from "./components/ChatView";
 import { Onboarding } from "./components/Onboarding";
+import { Martian } from "./components/Martian";
 import { Sidebar } from "./components/Sidebar";
 import { type AppInfo, type ChatRecord, type ChatSettings, type Model, desktop, isDesktop, loadModels } from "./lib/backend";
 import { useChat } from "./lib/chat";
@@ -144,6 +145,7 @@ function Desktop() {
         }
         empty={
           <section className="empty">
+            <Martian size={56} className="toon" />
             <span className="where">
               {rootName}
               {folder && ` / ${folder}`}
@@ -183,6 +185,7 @@ function Browser() {
       onSend={chat.send}
       empty={
         <section className="empty">
+          <Martian size={56} className="toon" />
           <h1>What should Marv build?</h1>
           <p>This chat runs in a fresh workspace on the marv-web server.</p>
         </section>

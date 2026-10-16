@@ -981,7 +981,34 @@ details > summary::-webkit-details-marker {
   color: var(--tx-2);
 }
 
-.brand img {
-  width: 18px;
-  height: 18px;
+.brand img.flai {
+  height: 16px;
+  width: auto;
+}
+
+/* Marv the martian, in Flexoki cyan. */
+.toon {
+  color: var(--cyan);
+  flex: none;
+}
+
+.empty .toon {
+  margin-bottom: 6px;
+}
+
+.bob {
+  animation: bob 1.2s ease-in-out infinite;
+}
+
+@keyframes bob {
+  50% {
+    transform: translateY(-2px);
+  }
+}
+
+/* The FloLogix AI mark: small, once per view. */
+img.flai {
+  height: 12px;
+  width: auto;
+  display: block;
 }

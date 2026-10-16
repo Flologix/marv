@@ -4,6 +4,7 @@ import remarkGfm from "remark-gfm";
 import type { ChatSettings, Model } from "../lib/backend";
 import type { ApprovalRequest, DiffLine, Item, useChat } from "../lib/chat";
 import { tokens } from "../lib/format";
+import { Martian } from "./Martian";
 import { Settings } from "./Settings";
 
 type Chat = ReturnType<typeof useChat>;
@@ -65,7 +66,7 @@ export function ChatView({
           {chat.items.length === 0 ? empty : chat.items.map((item, i) => <ItemView key={i} item={item} onAnswer={chat.answer} />)}
           {chat.busy && !asking && (
             <div className="working">
-              <span className="spinner" /> working
+              <Martian size={12} className="toon bob" /> working
             </div>
           )}
           {chat.error && <p className="notice error">{chat.error}</p>}

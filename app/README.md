@@ -2,7 +2,7 @@
 
 Marv in a window. You pick a **Marv folder** once (for example `~/Projects` or a new `~/Marv`). The left pane shows its tree, where you can make, rename and trash folders. A chat runs Marv on whichever folder is selected: Marv reads and changes everything below that folder, runs sandboxed commands and edits on its own, and asks you, in the window, before anything leaves the sandbox. Every chat belongs to a folder and picks up where it left off when you reopen it.
 
-The look is Flexoki light (paper, thin lines) with the FloLogix AI typefaces: Jost, IBM Plex Sans and IBM Plex Mono.
+The look is Flexoki light (paper, thin lines) with the FloLogix AI typefaces: Jost, IBM Plex Sans and IBM Plex Mono. Marv the martian appears on an empty chat and bobs while it works. The FLAI mark, from `FlologixAI/flologixai-site/public/Logo.png` and cropped, sits in the sidebar and on the first-run screen.
 
 ## How it fits together
 
@@ -41,7 +41,16 @@ browser (same app/)  ── WebSocket ──▶  crates/marv-web ───┘
   2. `OPENROUTER_API_KEY`;
   3. the one `marv` setup saved.
 
-## Run it
+## Install it (Omarchy and other Linux desktops)
+
+```sh
+app/install-desktop.sh            # build, then install for you
+app/install-desktop.sh --uninstall
+```
+
+It builds the release binary into `~/.local/bin/marv-desktop`, and adds an icon and a launcher entry. Open **Marv** from the app launcher (Omarchy: Super+Space), or run `marv-desktop`. Run it again after pulling changes to update.
+
+## Develop
 
 You need Rust, Node and bubblewrap. On Linux you also need WebKitGTK 4.1 (`webkit2gtk-4.1`).
 

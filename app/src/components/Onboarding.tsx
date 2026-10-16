@@ -1,6 +1,7 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { useState } from "react";
 import { type AppInfo, desktop } from "../lib/backend";
+import { Martian } from "./Martian";
 
 /** First run: the Marv folder (everything Marv works on lives under it) and, if there's none yet, a key. */
 export function Onboarding({ info, onDone }: { info: AppInfo; onDone: (info: AppInfo) => void }) {
@@ -30,8 +31,9 @@ export function Onboarding({ info, onDone }: { info: AppInfo; onDone: (info: App
   return (
     <div className="onboarding">
       <div className="card">
+        <Martian size={64} className="toon" />
         <div className="brand">
-          <img src="/marv.svg" alt="" /> marv desktop
+          <img className="flai" src="/flai.png" alt="FloLogix AI" /> marv desktop
         </div>
         {!info.root ? (
           <>

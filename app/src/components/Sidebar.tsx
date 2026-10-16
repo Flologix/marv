@@ -211,7 +211,8 @@ export function Sidebar({
         ))}
       </div>
       <div className="side-foot">
-        <span className="grow">marv · {rootName}</span>
+        <img className="flai" src="/flai.png" alt="FloLogix AI" />
+        <span className="grow">marv</span>
         <button className="icon-btn" title="Choose another Marv folder" onClick={onChangeRoot}>
           ⇄
         </button>
