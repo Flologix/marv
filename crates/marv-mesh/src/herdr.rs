@@ -364,6 +364,33 @@ impl HerdrAdapter {
     /// Runs `herdr <args>` and returns its JSON `result`. Herdr's own words never reach the agent: an error is named
     /// by the command, plus Herdr's error code when it's a plain identifier (`pane_not_found`).
     async fn run(&self, args: &[&str]) -> crate::Result<Value> {
+        let (what, output) = self.exec(args).await?;
+        let answer: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
+        failed(&what, &answer)?;
+        if !output.status.success() {
+            return Err(MeshError::Io(format!("{what} failed ({})", output.status)));
+        }
+        Ok(answer.get("result").cloned().unwrap_or(Value::Null))
+    }
+
+    /// Runs `herdr <args>` for a command that answers in plain text (`pane read`, #138): its stdout, trailing blank
+    /// space trimmed and control characters but newlines and tabs dropped. An answer that is Herdr's JSON error is
+    /// named as in [`Self::run`].
+    async fn run_text(&self, args: &[&str]) -> crate::Result<String> {
+        let (what, output) = self.exec(args).await?;
+        // The whole answer being Herdr's error document is an error whatever the exit status; pane text that merely
+        // contains JSON isn't (from_slice reads all of stdout or nothing).
+        failed(&what, &serde_json::from_slice(&output.stdout).unwrap_or(Value::Null))?;
+        if !output.status.success() {
+            return Err(MeshError::Io(format!("{what} failed ({})", output.status)));
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        Ok(text.trim_end().chars().filter(|c| !c.is_control() || matches!(c, '\n' | '\t')).collect())
+    }
+
+    /// Runs `herdr <args>` with nothing in and stderr dropped, within [`HERDR_TIMEOUT`]; returns the command's name
+    /// (`herdr pane read`) and its output.
+    async fn exec(&self, args: &[&str]) -> crate::Result<(String, std::process::Output)> {
         let what = format!("herdr {}", args.iter().take(2).copied().collect::<Vec<_>>().join(" "));
         let mut command = tokio::process::Command::new(&self.program);
         command
@@ -372,20 +399,11 @@ impl HerdrAdapter {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true);
-        let output = match tokio::time::timeout(HERDR_TIMEOUT, command.output()).await {
-            Ok(Ok(output)) => output,
-            Ok(Err(e)) => return Err(MeshError::Io(format!("{what}: {e}"))),
-            Err(_) => return Err(MeshError::Io(format!("{what}: Herdr didn't answer in {} s", HERDR_TIMEOUT.as_secs()))),
-        };
-        let answer: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
-        if let Some(code) = answer.pointer("/error/code").and_then(Value::as_str) {
-            let plain = code.chars().all(|c| c.is_ascii_lowercase() || c == '_') && code.len() <= 40;
-            return Err(MeshError::Io(if plain { format!("{what}: {code}") } else { format!("{what} failed") }));
+        match tokio::time::timeout(HERDR_TIMEOUT, command.output()).await {
+            Ok(Ok(output)) => Ok((what, output)),
+            Ok(Err(e)) => Err(MeshError::Io(format!("{what}: {e}"))),
+            Err(_) => Err(MeshError::Io(format!("{what}: Herdr didn't answer in {} s", HERDR_TIMEOUT.as_secs()))),
         }
-        if !output.status.success() {
-            return Err(MeshError::Io(format!("{what} failed ({})", output.status)));
-        }
-        Ok(answer.get("result").cloned().unwrap_or(Value::Null))
     }
 
     /// The panes Herdr sees an agent in (`herdr agent list`).
@@ -507,14 +525,22 @@ impl HerdrAdapter {
         let mut status = json!({"pane": target.pane_id, "agent": target.agent, "name": target.name, "state": target.status});
         if let Some(n) = lines.filter(|n| *n > 0) {
             let n = n.min(MAX_READ_LINES).to_string();
-            let read = self.run(&["pane", "read", pane, "--source", "recent", "--lines", &n, "--format", "text"]).await?;
-            let text = read.get("text").or_else(|| read.get("output")).cloned().unwrap_or(read);
-            status["output"] = match text {
-                Value::String(s) => Value::String(s),
-                other => Value::String(other.to_string()),
-            };
+            let text = self.run_text(&["pane", "read", pane, "--source", "recent", "--lines", &n, "--format", "text"]).await?;
+            status["output"] = Value::String(text);
         }
         Ok(status.to_string())
+    }
+}
+
+/// Herdr's JSON error as Marv's: named by the command, plus Herdr's code when it's a plain identifier
+/// (`pane_not_found`); Herdr's own message never reaches the agent.
+fn failed(what: &str, answer: &Value) -> crate::Result<()> {
+    match answer.pointer("/error/code").and_then(Value::as_str) {
+        Some(code) => {
+            let plain = code.chars().all(|c| c.is_ascii_lowercase() || c == '_') && code.len() <= 40;
+            Err(MeshError::Io(if plain { format!("{what}: {code}") } else { format!("{what} failed") }))
+        }
+        None => Ok(()),
     }
 }
 
@@ -587,11 +613,7 @@ impl HerdrAdapter {
     /// A pane's last `lines` lines (at most [`MAX_READ_LINES`]), soft wraps joined, as plain text.
     pub async fn read(&self, pane: &str, lines: u64) -> crate::Result<String> {
         let n = lines.clamp(1, MAX_READ_LINES).to_string();
-        let read = self.run(&["pane", "read", pane, "--source", "recent-unwrapped", "--lines", &n, "--format", "text"]).await?;
-        Ok(match read.get("text").or_else(|| read.get("output")).cloned().unwrap_or(read) {
-            Value::String(s) => s,
-            other => other.to_string(),
-        })
+        self.run_text(&["pane", "read", pane, "--source", "recent-unwrapped", "--lines", &n, "--format", "text"]).await
     }
 
     /// Opens a pane in `cwd`: split from `from` (Marv's own pane) to the right or below, or a new tab. Focus stays
@@ -931,7 +953,7 @@ mod tests {
                 "#!/bin/sh\n[ \"$1\" = --ready ] && exit 0\necho \"$@\" >> '{log}'\ncase \"$1 $2\" in\n\
                  'agent list') printf '%s\\n' '{agents}';;\n\
                  'pane get') case \"$3\" in\n{gets}\n*) printf '%s\\n' '{{\"error\":{{\"code\":\"pane_not_found\",\"message\":\"pane $3 not found\"}}}}'; exit 1;;\nesac;;\n\
-                 'pane read') printf '%s\\n' '{{\"result\":{{\"text\":\"line1\\nline2\"}}}}';;\n\
+                 'pane read') case \"$3\" in w1:p9) printf '%s\\n' '{{\"error\":{{\"code\":\"pane_not_found\",\"message\":\"pane w1:p9 not found\"}}}}'; exit 1;; w1:p8) printf '%s\\n' '{{\"error\":{{\"code\":\"pane_not_found\",\"message\":\"pane w1:p8 not found\"}}}}';; w1:p7) printf 'see {{\"error\":{{\"code\":\"x\"}}}}\\n';; *) printf 'line1\\n\\033[2Jline2\\n\\n';; esac;;\n\
                  *) printf '%s\\n' '{{\"result\":{{}}}}';;\nesac\n",
                 log = log.display(),
                 gets = panes.iter().map(get).collect::<Vec<_>>().join("\n"),
@@ -1082,8 +1104,23 @@ mod tests {
         let answer = sb.deliver(&worker, status.as_str(), WireMode::Call, json!({"lines": 5})).await.unwrap().unwrap();
         let answer: Value = serde_json::from_str(answer.as_str().unwrap()).unwrap();
         assert_eq!((answer["agent"].as_str(), answer["state"].as_str()), (Some("marv"), Some("blocked")));
-        assert_eq!(answer["output"], "line1\nline2");
+        assert_eq!(answer["output"], "line1\n[2Jline2");
         assert!(fake.log().contains("pane read w1:p3 --source recent --lines 5 --format text"));
+    }
+
+    /// #138: real Herdr answers `pane read` in plain text, not JSON; Marv used to hand the agent `null`. An unknown
+    /// pane is Herdr's JSON error, named by its code.
+    #[tokio::test]
+    async fn a_pane_read_is_plain_text_and_its_error_is_named() {
+        let fake = FakeHerdr::new();
+        let adapter = fake.adapter();
+        assert_eq!(adapter.read("w1:p3", 5).await.unwrap(), "line1\n[2Jline2");
+        assert!(fake.log().contains("pane read w1:p3 --source recent-unwrapped --lines 5 --format text"));
+        let err = adapter.read("w1:p9", 5).await.unwrap_err();
+        assert_eq!(err.to_string(), "herdr pane read: pane_not_found");
+        // Herdr's error document is an error even with exit 0; pane text that only contains one is text.
+        assert_eq!(adapter.read("w1:p8", 5).await.unwrap_err().to_string(), "herdr pane read: pane_not_found");
+        assert_eq!(adapter.read("w1:p7", 5).await.unwrap(), r#"see {"error":{"code":"x"}}"#);
     }
 
     /// #123: a model sent `{"prompt": …}` and the pane got the JSON typed in. A body that isn't text is refused, with

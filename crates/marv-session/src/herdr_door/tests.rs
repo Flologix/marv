@@ -102,9 +102,22 @@ async fn reads_run_without_asking_and_come_back_fenced_and_tainting() {
     assert!(r.log().contains(&"pane read w1:p2 --source recent-unwrapped --lines 5 --format text".to_string()), "{:?}", r.log());
     // As the session's runner hands it to the model: fenced as Herdr's, the closing tag inside defused.
     let read = r.run(json!({"action": "read", "pane": "w1:p2"})).await;
+    // Herdr's plain text, not `null` (#138), with its control characters dropped.
+    assert!(read.result.output.starts_with("[2Jall tests pass\n"), "{:?}", read.result.output);
+    assert!(!read.result.output.contains('\u{1b}'));
     let run = crate::runner::tool_run_from(read, None);
     assert!(run.result.output.starts_with("<untrusted-data source=\"herdr\""), "{}", run.result.output);
     assert_eq!(run.result.output.to_ascii_lowercase().matches("</untrusted-data").count(), 1, "{}", run.result.output);
+}
+
+#[tokio::test]
+async fn a_read_of_a_pane_herdr_doesnt_have_fails_with_its_code_and_asks_no_one() {
+    let r = rig("read-gone", 4, Decision::No);
+    let out = r.run(json!({"action": "read", "pane": "w1:p9"})).await;
+    assert!(out.result.is_error, "{}", out.result.output);
+    assert!(out.result.output.contains("herdr pane read: pane_not_found"), "{}", out.result.output);
+    assert!(!out.result.output.contains("not found"), "Herdr's own message stays out: {}", out.result.output);
+    assert!(r.approver.asked().is_empty());
 }
 
 #[tokio::test]
