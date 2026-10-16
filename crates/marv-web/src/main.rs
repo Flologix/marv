@@ -143,6 +143,8 @@ async fn chat(app: Arc<App>, socket: WebSocket) {
             resume,
             // Its ports would be forwarded to the server's 127.0.0.1, not the person's.
             processes: false,
+            // Nothing from the server user's ~/.marv: no skills, memory, MCP servers or instructions.
+            sources: Vec::new(),
         };
         let (to_chat, from_page) = mpsc::unbounded_channel();
         let reader = async move {

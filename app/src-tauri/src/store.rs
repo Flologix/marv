@@ -58,11 +58,6 @@ impl Store {
         Self { config, data }
     }
 
-    /// Marv's own files (saved sessions, checkpoints): the app's, not the CLI's `~/.marv`.
-    pub fn marv_dir(&self) -> PathBuf {
-        self.data.join("marv")
-    }
-
     pub fn settings(&self) -> Settings {
         read(&self.config.join("settings.json"))
     }

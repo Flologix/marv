@@ -10,6 +10,8 @@ pub enum ClientMessage {
     /// marv-web's first message: which chat, with what settings. (Marv desktop opens a chat with a command instead.)
     Hello { chat_id: String, model: Option<String>, max_steps: Option<u32>, yolo: Option<bool> },
     Send { text: String },
+    /// A `/command` line, run by Marv (not sent to the model as text): `/help`, `/skills`, `/<skill> request`…
+    Command { line: String },
     Interrupt,
     Approval { id: u64, decision: Decision },
     Configure { model: Option<String>, max_steps: Option<u32>, yolo: Option<bool> },

@@ -4,6 +4,14 @@ Marv in a window. You pick a **Marv folder** once (for example `~/Projects` or a
 
 The look is Flexoki light (paper, thin lines) with the FloLogix AI typefaces: Jost, IBM Plex Sans and IBM Plex Mono. Marv the martian appears on an empty chat and bobs while it works. The FLAI mark, from `FlologixAI/flologixai-site/public/Logo.png` and cropped, sits in the sidebar and on the first-run screen.
 
+## Commands and skills
+
+Type `/` in the prompt for the menu (↑/↓, then Tab or Enter):
+- **Commands Marv runs itself:** `/help`, `/skills`, `/compact`, `/cost`, `/memory` and `/model <id>`.
+- **Your skills:** `/<skill> <request>` runs one. Skills come from `~/.marv/skills` and the folder's `.marv/skills`.
+
+The terminal UI's other commands (`/undo`, `/mcp`, `/resume`…) aren't in the desktop yet.
+
 ## How it fits together
 
 ```
@@ -27,7 +35,7 @@ browser (same app/)  ── WebSocket ──▶  crates/marv-web ───┘
 |---|---|
 | `~/.config/ai.flologix.marv/settings.json` (0600) | The Marv folder, and the OpenRouter key if you pasted one |
 | `~/.local/share/ai.flologix.marv/chats.json` | Each chat's folder, title and Marv session id |
-| `~/.local/share/ai.flologix.marv/marv/` | Marv's saved sessions and undo checkpoints (not the CLI's `~/.marv`) |
+| `~/.marv/` (the CLI's own) | Saved sessions and undo checkpoints, next to your memory, skills and MCP servers |
 | The window's local storage | Transcripts as shown, and the model, step limit and yolo setting |
 
 ### Safety
@@ -35,7 +43,7 @@ browser (same app/)  ── WebSocket ──▶  crates/marv-web ───┘
 - **The Marv folder can't be your home folder or anything above it.** Marv changes files below its folder without asking, so that would include your dotfiles.
 - **Tree paths are checked against the root.** Every path the page sends must be relative to the root: no absolute paths, no `..`, and no symlinks that lead out.
 - **Deleting goes to the trash.** Nothing is removed outright.
-- **Marv loads none of the CLI's skills, memory, MCP servers or instructions.** The desktop's sessions start clean.
+- **Marv loads what the CLI loads.** On your own machine it gets your `~/.marv` skills, memory, MCP servers and instructions, and the folder's own. `marv-web` loads none of these, since it isn't your machine.
 - **The key is found in this order:**
   1. the one you pasted;
   2. `OPENROUTER_API_KEY`;

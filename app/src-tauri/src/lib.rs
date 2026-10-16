@@ -196,7 +196,11 @@ fn open_chat(
     }
     let spec = ChatSpec {
         root: dir,
-        config_dir: desktop.store.marv_dir(),
+        // The CLI's own folder (~/.marv): the same memory, MCP servers and saved sessions as `marv`.
+        config_dir: marv_session::config::default_config_dir(
+            &std::env::vars().collect(),
+            &marv_session::paths::home_dir(),
+        ),
         api_key,
         model,
         max_steps: max_steps.min(500),
@@ -204,6 +208,8 @@ fn open_chat(
         resume: chat.session_id.clone().map(marv_session::ResumeTarget::Id),
         // The person is at this machine: a dev server's port opens on their own 127.0.0.1.
         processes: true,
+        // As the CLI: your skills, memory, MCP servers and instructions, and the folder's own.
+        sources: vec![marv_session::sources::Source::User, marv_session::sources::Source::Project],
     };
     let (to_chat, from_page) = mpsc::unbounded_channel();
     let (out, mut events) = mpsc::unbounded_channel::<Value>();

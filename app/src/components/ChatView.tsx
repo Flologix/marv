@@ -2,7 +2,7 @@ import { type ReactNode, useEffect, useRef, useState } from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { ChatSettings, Model } from "../lib/backend";
-import type { ApprovalRequest, DiffLine, Item, useChat } from "../lib/chat";
+import { type ApprovalRequest, type Command, type DiffLine, type Item, knownCommands, type useChat } from "../lib/chat";
 import { tokens } from "../lib/format";
 import { Martian } from "./Martian";
 import { Settings } from "./Settings";
@@ -30,6 +30,17 @@ export function ChatView({
 }) {
   const [input, setInput] = useState("");
   const [open, setOpen] = useState(false);
+  const [active, setActive] = useState(0);
+  const [dismissed, setDismissed] = useState(false);
+  const all: Command[] = chat.commands.length ? chat.commands : knownCommands();
+  // The / menu: while the first word is still being typed.
+  const typing = input.startsWith("/") && !input.includes(" ") && !dismissed;
+  const matches = typing ? all.filter((c) => c.name.startsWith(input.slice(1).toLowerCase())).slice(0, 50) : [];
+
+  function pick(c: Command) {
+    setInput(`/${c.name} `);
+    setActive(0);
+  }
   const bottom = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -75,6 +86,27 @@ export function ChatView({
       </main>
 
       <footer className="dock">
+        <div className="composer-wrap">
+        {matches.length > 0 && (
+          <div className="slash" role="listbox">
+            {matches.map((c, i) => (
+              <button
+                key={c.name}
+                type="button"
+                role="option"
+                aria-selected={i === active}
+                className={i === Math.min(active, matches.length - 1) ? "active" : ""}
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  pick(c);
+                }}
+              >
+                <span className={`cmd${c.skill ? " skill" : ""}`}>/{c.name}</span>
+                <span className="desc">{c.description}</span>
+              </button>
+            ))}
+          </div>
+        )}
         <form
           className="composer"
           onSubmit={(e) => {
@@ -86,9 +118,30 @@ export function ChatView({
             value={input}
             rows={1}
             autoFocus
-            placeholder="Ask Marv to build, fix or explain something"
-            onChange={(e) => setInput(e.target.value)}
+            placeholder="Ask Marv to build, fix or explain something, or type / for commands"
+            onChange={(e) => {
+              setInput(e.target.value);
+              setActive(0);
+              setDismissed(false);
+            }}
             onKeyDown={(e) => {
+              if (matches.length > 0) {
+                const current = Math.min(active, matches.length - 1);
+                if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+                  e.preventDefault();
+                  setActive((current + (e.key === "ArrowDown" ? 1 : matches.length - 1)) % matches.length);
+                  return;
+                }
+                if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey && `/${matches[current].name}` !== input)) {
+                  e.preventDefault();
+                  pick(matches[current]);
+                  return;
+                }
+                if (e.key === "Escape") {
+                  setDismissed(true);
+                  return;
+                }
+              }
               if (e.key === "Enter" && !e.shiftKey) {
                 e.preventDefault();
                 submit();
@@ -105,8 +158,9 @@ export function ChatView({
             </button>
           )}
         </form>
+        </div>
         <div className="hint">
-          <span>enter to send · shift+enter for a new line</span>
+          <span>enter to send · shift+enter for a new line · / for commands and skills</span>
           {usage?.context && usage.contextLength ? <span>context {tokens(usage.context)} / {tokens(usage.contextLength)}</span> : null}
         </div>
       </footer>
@@ -151,6 +205,12 @@ function ItemView({ item, onAnswer }: { item: Item; onAnswer: (id: number, d: "y
       return <Approval request={item.request} decision={item.decision} onAnswer={onAnswer} />;
     case "notice":
       return <p className={`notice ${item.tone}`}>{item.text}</p>;
+    case "output":
+      return (
+        <div className="output">
+          <Markdown remarkPlugins={[remarkGfm]}>{item.text}</Markdown>
+        </div>
+      );
     case "turn":
       return (
         <p className="turn">

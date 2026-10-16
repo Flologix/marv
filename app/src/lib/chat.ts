@@ -48,7 +48,16 @@ export type Item =
     }
   | { kind: "approval"; request: ApprovalRequest; decision?: string }
   | { kind: "notice"; text: string; tone: "info" | "warn" | "error" }
-  | { kind: "turn"; reason: string; usage?: Usage };
+  | { kind: "turn"; reason: string; usage?: Usage }
+  /** What a /command printed. */
+  | { kind: "output"; text: string };
+
+/** An entry of the / menu: a command, or one of the user's skills. */
+export interface Command {
+  name: string;
+  description: string;
+  skill?: boolean;
+}
 
 const STOPS: Record<string, string> = {
   step_limit: "Stopped at the step limit.",
@@ -123,6 +132,9 @@ function apply(items: Item[], e: ServerEvent): Item[] {
     case "error":
       next.push({ kind: "notice", text: String(e.message), tone: "error" });
       return next;
+    case "command_output":
+      next.push({ kind: "output", text: String(e.text) });
+      return next;
     case "turn_end":
       next.push({ kind: "turn", reason: String(e.reason) });
       return next;
@@ -142,9 +154,23 @@ function apply(items: Item[], e: ServerEvent): Item[] {
 
 const storageKey = (id: string) => `marv-transcript-${id}`;
 
+/** What the page sends for a line: a /command runs in Marv, anything else is a message to the model. */
+const message = (text: string) => (text.startsWith("/") ? { type: "command", line: text } : { type: "send", text });
+
 function load(id: string): Item[] {
   try {
     return JSON.parse(localStorage.getItem(storageKey(id)) ?? "[]");
+  } catch {
+    return [];
+  }
+}
+
+const COMMANDS_KEY = "marv-commands";
+
+/** The / menu as the last chat's session gave it: for a new chat, before its session starts. */
+export function knownCommands(): Command[] {
+  try {
+    return JSON.parse(localStorage.getItem(COMMANDS_KEY) ?? "[]");
   } catch {
     return [];
   }
@@ -167,8 +193,9 @@ export function useChat(id: string | null, settings: ChatSettings) {
   const [status, setStatus] = useState<Status>("idle");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [commands, setCommands] = useState<Command[]>([]);
   const connection = useRef<Connection | null>(null);
-  const pending = useRef<string[]>([]);
+  const pending = useRef<object[]>([]);
   const first = useRef<{ id: string; text: string } | null>(null);
   const ready = useRef(false);
   const settingsRef = useRef(settings);
@@ -193,10 +220,10 @@ export function useChat(id: string | null, settings: ChatSettings) {
     pending.current = [];
     // Kept until the session is ready: React's dev double-mount runs this twice.
     const opening = first.current?.id === id ? first.current.text : null;
-    if (opening) pending.current.push(opening);
+    if (opening) pending.current.push(message(opening));
     setItems(opening ? [...load(id), { kind: "user", text: opening }] : load(id));
     setStatus("connecting");
-    setBusy(opening !== null);
+    setBusy(opening !== null && !opening.startsWith("/"));
     setError(null);
     sent.current = settingsRef.current;
     // Opened a beat late, so React's dev double-mount doesn't open the chat twice.
@@ -207,10 +234,12 @@ export function useChat(id: string | null, settings: ChatSettings) {
           ready.current = true;
           first.current = null;
           setStatus("ready");
-          for (const text of pending.current.splice(0)) {
-            setBusy(true);
-            conn?.send({ type: "send", text });
-          }
+          const list = (e.commands as Command[]) ?? [];
+          setCommands(list);
+          try {
+            localStorage.setItem(COMMANDS_KEY, JSON.stringify(list));
+          } catch {}
+          for (const m of pending.current.splice(0)) conn?.send(m);
         } else if (e.type === "fatal") {
           setStatus("failed");
           setError(String(e.message));
@@ -251,7 +280,8 @@ export function useChat(id: string | null, settings: ChatSettings) {
   }, [settings, status]);
 
   useEffect(() => {
-    if (!id) return;
+    // Never an empty list: on open that's the state before the saved transcript loads (and would erase it).
+    if (!id || items.length === 0) return;
     try {
       localStorage.setItem(storageKey(id), JSON.stringify(items.slice(-500)));
     } catch {}
@@ -259,9 +289,10 @@ export function useChat(id: string | null, settings: ChatSettings) {
 
   const send = useCallback((text: string) => {
     setItems((items) => [...items, { kind: "user", text }]);
-    setBusy(true);
-    if (ready.current && connection.current) connection.current.send({ type: "send", text });
-    else pending.current.push(text);
+    // A /command only turns busy if it starts a turn (a skill): turn_start says so.
+    if (!text.startsWith("/")) setBusy(true);
+    if (ready.current && connection.current) connection.current.send(message(text));
+    else pending.current.push(message(text));
   }, []);
 
   /** A new chat's first message: call just before switching to `chatId`; it's sent once the session is ready. */
@@ -272,5 +303,5 @@ export function useChat(id: string | null, settings: ChatSettings) {
   const interrupt = useCallback(() => connection.current?.send({ type: "interrupt" }), []);
   const answer = useCallback((rid: number, decision: "yes" | "always" | "no") => connection.current?.send({ type: "approval", id: rid, decision }), []);
 
-  return { items, status, busy, error, send, startWith, interrupt, answer };
+  return { items, status, busy, error, commands, send, startWith, interrupt, answer };
 }
