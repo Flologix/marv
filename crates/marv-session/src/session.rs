@@ -124,6 +124,47 @@ pub enum CompactFailure {
     Failed,
 }
 
+impl CompactFailure {
+    /// The name clients and the trajectory use: "empty", "stopped" or "failed".
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::Stopped => "stopped",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// marv-rs #144: after a failed automatic summary, the next one waits until the context (last prompt + completion) has
+/// grown this much past the size at which it failed.
+pub const COMPACT_RETRY_GROWTH: f64 = 1.25;
+/// marv-rs #144: at most this many automatic summaries may fail in one turn; then the turn goes on without compacting.
+pub const MAX_COMPACT_FAILURES: u32 = 3;
+
+/// marv-rs #144: whether an automatic summary may be asked for again after `failures` failed ones this turn, the last
+/// at `failed_at` tokens, with the context now at `now`. Marv gave up for the rest of the turn after one failure, but a
+/// `marv -p` run is a single turn: one failed summary (SWE-bench django-12663 at 112k) let it grow to 201k and time out.
+/// Growth first, so the next step doesn't pay for the same summary that just failed; a cap, so a model that can't
+/// summarize doesn't pay for one every few steps. With a known `window`, the retry point is never past halfway from
+/// the failure to the window: when the trigger was 85% of it, 25% more would be past the window and never come.
+pub(crate) fn may_compact_again(failures: u32, failed_at: Option<u64>, now: Option<u64>, window: Option<u64>) -> bool {
+    if failures == 0 {
+        return true;
+    }
+    if failures >= MAX_COMPACT_FAILURES {
+        return false;
+    }
+    match (failed_at, now) {
+        (Some(at), Some(now)) => {
+            let grown = at as f64 * COMPACT_RETRY_GROWTH;
+            let halfway = window.filter(|w| *w > at).map(|w| at as f64 + (w - at) as f64 / 2.0);
+            now as f64 >= halfway.map_or(grown, |h| h.min(grown))
+        }
+        // The size at the failure isn't known: don't guess, wait for the next turn.
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum CompactResult {
     Compacted { summary: String, tokens_before: Option<u64> },
@@ -527,8 +568,10 @@ struct State {
     saved: SavedSession,
     totals: Totals,
     last: Option<Usage>,
-    /// A mid-turn summary already failed this turn: don't ask for another (each would be another paid request).
-    mid_turn_compact_failed: bool,
+    /// Automatic summaries that failed this turn, and the context's size (prompt + completion) before the last one
+    /// (#144, [`may_compact_again`]): each is another paid request.
+    compact_failures: u32,
+    compact_failed_at: Option<u64>,
     current: Option<CancellationToken>,
     running: bool,
     closed: bool,
@@ -906,7 +949,8 @@ impl MarvSession {
             saved,
             totals: Totals::default(),
             last: None,
-            mid_turn_compact_failed: false,
+            compact_failures: 0,
+            compact_failed_at: None,
             current: None,
             running: false,
             closed: false,
@@ -1196,7 +1240,7 @@ impl MarvSession {
     /// `rewrite_call` (deferred MCP), `on_full` (mid-turn compaction), `on_limit` (the step-limit approval),
     /// `after_step` (checks), `wrap_up_at_limit` → forward `Loop` events (usage → totals; assistant → transcript;
     /// agent `ToolStart` → `subagent_start` record) → drain mesh inbox between steps → finally: reset
-    /// `mid_turn_compact_failed`, finish recorders, cancel the stop, free the session, schedule the save, `TurnEnd`.
+    /// the compaction failures, finish recorders, cancel the stop, free the session, schedule the save, `TurnEnd`.
     /// marv-rs: the parent's mesh inbox is read before the user message (its messages go in first, fenced) and
     /// after each step (`crate::mesh::with_inbox`).
     async fn run_turn(
@@ -1233,7 +1277,12 @@ impl MarvSession {
                 TurnEndReason::Done(StopReason::Error)
             }
         };
-        self.state().mid_turn_compact_failed = false; // the next turn tries compaction again
+        {
+            // The next turn tries compaction again.
+            let mut s = self.state();
+            s.compact_failures = 0;
+            s.compact_failed_at = None;
+        }
         for (_, mut sub) in lock(&subs).drain() {
             sub.finish("interrupted");
         }
@@ -1833,9 +1882,16 @@ impl MarvSession {
         .await
     }
 
-    /// Whether compaction should be tried at all now: nearly full, and no mid-turn summary has failed this turn.
+    /// Whether compaction should be tried at all now: nearly full, and no summary failed this turn, or the context has
+    /// grown enough since one did (#144, [`may_compact_again`]).
     fn try_compact(&self) -> bool {
-        self.nearly_full() && !self.state().mid_turn_compact_failed
+        self.nearly_full() && {
+            // context_length() takes the state's lock itself: read it first.
+            let window = self.context_length();
+            let s = self.state();
+            let now = s.last.map(|l| l.prompt_tokens + l.completion_tokens);
+            may_compact_again(s.compact_failures, s.compact_failed_at, now, window)
+        }
     }
 
     /// When the context is nearly full, summarizes the conversation and continues from the summary, right where the
@@ -1853,6 +1909,7 @@ impl MarvSession {
         if !self.try_compact() {
             return CompactResult::NotCompacted { reason: CompactFailure::Empty, error: "The context isn't nearly full.".into() };
         }
+        let size = self.state().last.map(|l| l.prompt_tokens + l.completion_tokens);
         let result = self.summarize_into(None, stop, provider, factory, info).await;
         match &result {
             CompactResult::Compacted { .. } if mid_turn => {
@@ -1868,9 +1925,14 @@ impl MarvSession {
                 lock(&history).push(ChatTurn::User { text });
             }
             CompactResult::Compacted { .. } => {}
-            // A summary that failed isn't tried again within the turn: the next step would ask for the same expensive
-            // summary that just failed. The next turn (a new user message) tries again.
-            CompactResult::NotCompacted { .. } => self.state().mid_turn_compact_failed = true,
+            // A summary that failed isn't tried again right away: the next step would ask for the same expensive
+            // summary that just failed. Marv waited for the next turn (a new user message); marv-rs #144 also tries
+            // again within the turn once the context has grown (`may_compact_again`), since `marv -p` has only one.
+            CompactResult::NotCompacted { .. } => {
+                let mut s = self.state();
+                s.compact_failures += 1;
+                s.compact_failed_at = size;
+            }
         }
         result
     }
@@ -1910,6 +1972,15 @@ impl MarvSession {
             Ok(summary) => summary,
             Err(error) => {
                 let reason = if stop.is_cancelled() { CompactFailure::Stopped } else { CompactFailure::Failed };
+                // #144: why it failed (a tool call, a cut-off or empty summary, the provider's error) goes on record.
+                if let Some(log) = self.trajectory() {
+                    log.write(&TrajectoryRecord::CompactFailed {
+                        turn: self.trajectory_turn(&log),
+                        reason: reason.as_str(),
+                        error: error.clone(),
+                        tokens: before.map(|b| b.prompt_tokens + b.completion_tokens),
+                    });
+                }
                 return CompactResult::NotCompacted { reason, error };
             }
         };
@@ -1932,10 +2003,15 @@ impl MarvSession {
         // From here the model sees the summary, not the turns before it: the trajectory needs it to say what the model
         // saw. The turn it follows only if that turn is in this file (after resume(), the last turn was in another one).
         if let Some(log) = self.trajectory() {
-            let after = self.state().last_turn.clone().filter(|(_, session)| *session == log.session).map(|(turn, _)| turn);
-            log.write(&TrajectoryRecord::Compact { turn: after, summary: summary.clone() });
+            log.write(&TrajectoryRecord::Compact { turn: self.trajectory_turn(&log), summary: summary.clone() });
         }
         CompactResult::Compacted { summary, tokens_before: before.map(|b| b.prompt_tokens + b.completion_tokens) }
+    }
+
+    /// The turn a compaction record follows: the last turn, only if that turn is in this file (after resume(), the last
+    /// turn was in another one).
+    fn trajectory_turn(&self, log: &Trajectory) -> Option<String> {
+        self.state().last_turn.clone().filter(|(_, session)| *session == log.session).map(|(turn, _)| turn)
     }
 
     /// Starts this conversation's session-start hooks (#108) in the background, unless they've started already (a
@@ -4123,11 +4199,106 @@ mod turn_tests {
         let requests = provider.requests();
         assert_eq!(role_of(requests[2].0.last().unwrap()), "tool"); // not replaced by the summary
         assert!(unanswered(&requests[2].0).is_empty());
-        // Still nearly full after the next step, but the failed summary isn't tried again within the turn.
+        // Still nearly full after the next step, but not 25% past where it failed: not tried again yet (#144).
         assert_eq!(statuses(&events, TurnStatus::Compacting), 1);
         let summaries =
             requests.iter().filter(|(h, _)| text_of(h.last().unwrap()).starts_with("Summarize our conversation")).count();
         assert_eq!(summaries, 1);
+    }
+
+    fn summaries(requests: &[(Vec<ChatTurn>, StreamOptions)]) -> usize {
+        requests.iter().filter(|(h, _)| text_of(h.last().unwrap()).starts_with("Summarize our conversation")).count()
+    }
+
+    /// #144: after a failure, again once the context is 25% past where it failed, at most 3 failures a turn.
+    #[test]
+    fn a_failed_summary_is_tried_again_after_growth_and_at_most_three_times_a_turn() {
+        assert!(may_compact_again(0, None, None, None));
+        assert!(!may_compact_again(1, Some(1000), Some(1249), None));
+        assert!(may_compact_again(1, Some(1000), Some(1250), None));
+        assert!(may_compact_again(2, Some(1250), Some(1563), None));
+        assert!(!may_compact_again(MAX_COMPACT_FAILURES, Some(1000), Some(10_000), None));
+        assert!(!may_compact_again(1, None, Some(10_000), None), "no size at the failure: wait for the next turn");
+        // A failure at 85% of a 1000 window: the retry comes halfway to the window (925), not at 1062 (never).
+        assert!(!may_compact_again(1, Some(850), Some(924), Some(1000)));
+        assert!(may_compact_again(1, Some(850), Some(925), Some(1000)));
+        // A large window: 25% growth comes first.
+        assert!(may_compact_again(1, Some(100_000), Some(125_000), Some(1_048_576)));
+        assert!(!may_compact_again(1, Some(100_000), Some(124_999), Some(1_048_576)));
+    }
+
+    #[tokio::test]
+    async fn a_failed_mid_turn_compaction_is_tried_again_once_the_context_has_grown() {
+        let dirs = Dirs::new();
+        let provider = Scripted::new(vec![
+            with(used(900), use_tools(vec![read("c1")])),
+            vec![ProviderEvent::Error("summary failed".into())],
+            with(used(1124), use_tools(vec![read("c2")])), // under 900 × 1.25: not yet
+            with(used(1125), use_tools(vec![read("c3")])),
+            say("SUMMARY at last"),
+            say("Finished."),
+        ])
+        .with_context(10_000);
+        let events = collect(go(&scripted(&dirs, &provider, |i| i.compact_tokens = Some(900)), "first")).await;
+        assert_eq!(
+            compactions(&events),
+            [
+                CompactResult::NotCompacted { reason: CompactFailure::Failed, error: "summary failed".into() },
+                compacted("SUMMARY at last", 1125),
+            ]
+        );
+        assert_eq!(statuses(&events, TurnStatus::Compacting), 2);
+        assert_eq!(summaries(&provider.requests()), 2);
+        assert!(text_of(&provider.requests()[5].0[0]).contains("SUMMARY at last"));
+        assert_eq!(end_reason(&events), TurnEndReason::Done(StopReason::End));
+    }
+
+    #[tokio::test]
+    async fn at_most_three_mid_turn_summaries_fail_in_a_turn() {
+        let dirs = Dirs::new();
+        let failed = || vec![ProviderEvent::Error("summary failed".into())];
+        let provider = Scripted::new(vec![
+            with(used(900), use_tools(vec![read("c1")])),
+            failed(),
+            with(used(1125), use_tools(vec![read("c2")])),
+            failed(),
+            with(used(1407), use_tools(vec![read("c3")])),
+            failed(),
+            with(used(5000), use_tools(vec![read("c4")])), // grown, but three failed already
+            say("Finished."),
+        ])
+        .with_context(10_000);
+        let session = scripted(&dirs, &provider, |i| i.compact_tokens = Some(900));
+        let events = collect(go(&session, "first")).await;
+        assert_eq!(compactions(&events).len(), 3);
+        assert_eq!(summaries(&provider.requests()), 3);
+        assert_eq!(end_reason(&events), TurnEndReason::Done(StopReason::End));
+        // The next turn starts over: it tries again at once.
+        let provider_requests = provider.requests().len();
+        let events = collect(go(&session, "second")).await;
+        assert_eq!(statuses(&events, TurnStatus::Compacting), 1);
+        assert!(provider.requests().len() > provider_requests);
+    }
+
+    #[tokio::test]
+    async fn a_failed_compaction_is_recorded_with_its_reason_and_error() {
+        let dirs = Dirs::new();
+        let store = Arc::new(TrajectoryStore::new(dirs.dir.join("t")));
+        let provider = Scripted::new(vec![
+            with(used(900), use_tools(vec![read("c1")])),
+            vec![ProviderEvent::Error("Rate limited".into())],
+            say("Finished."),
+        ])
+        .with_context(1000);
+        let session = scripted(&dirs, &provider, |i| i.trajectories = Some(store.clone()));
+        collect(go(&session, "first")).await;
+        let log = records(&store, &dirs.project, &session).await;
+        let failed = log.iter().find(|r| r["type"] == "compact_failed").expect("a compact_failed record");
+        assert_eq!(failed["reason"], "failed");
+        assert_eq!(failed["error"], "Rate limited");
+        assert_eq!(failed["tokens"], 900);
+        assert!(failed["turn"].is_string());
+        assert!(log.iter().all(|r| r["type"] != "compact"));
     }
 
     #[tokio::test]
