@@ -1,30 +1,100 @@
+/* FloLogix AI design system v1.0 tokens (flologixai-design-system.html). */
 :root {
-  --bg: #f7f7f5;
-  --panel: #ffffff;
-  --border: #e2e2de;
-  --text: #1c1c1e;
-  --muted: #6b6b70;
-  --accent: #0f9d8a;
-  --accent-soft: #d8f3ef;
-  --user: #ecebe6;
-  --code-bg: #f1f1ee;
-  --warn: #a15c00;
-  --error: #c0362c;
+  --fl-cyan: #10bee1;
+  --fl-cyan-deep: #0a97b4;
+  --fl-cyan-ink: #065a6e;
+  --fl-yellow: #ffde59;
+  --fl-yellow-deep: #e6c43a;
+  --fl-current: #0b2e3d;
+  --fl-ink: #0f1a20;
+  --fl-mist: #eaf8fc;
+  --fl-mist-2: #d3f1f8;
+  --fl-white: #ffffff;
+  --fl-slate-050: #f5f8fa;
+  --fl-slate-100: #e9eff3;
+  --fl-slate-200: #d6dfe6;
+  --fl-slate-400: #8fa1ae;
+  --fl-slate-600: #5a6d7a;
+  --fl-slate-800: #2c3d48;
+  --fl-success: #1db47a;
+  --fl-danger: #e5484d;
+
+  --font-display: var(--font-jost), system-ui, sans-serif;
+  --font-body: var(--font-plex-sans), system-ui, sans-serif;
+  --font-mono: var(--font-plex-mono), ui-monospace, monospace;
+  --fs-h2: clamp(1.5rem, 3vw, 2rem);
+  --fs-small: 0.875rem;
+  --fs-caption: 0.75rem;
+
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 24px;
+  --sp-6: 32px;
+  --sp-7: 48px;
+  --sp-8: 64px;
+
+  --r-sm: 4px;
+  --r-md: 8px;
+  --r-lg: 14px;
+  --r-pill: 999px;
+  --tilt: -7deg;
+
+  --sh-1: 0 1px 2px rgba(11, 46, 61, 0.06), 0 1px 3px rgba(11, 46, 61, 0.08);
+  --sh-2: 0 4px 12px rgba(11, 46, 61, 0.1);
+  --sh-3: 0 12px 32px rgba(11, 46, 61, 0.14);
+  --sh-glow: 0 0 0 4px rgba(16, 190, 225, 0.25);
+
+  --ease-flow: cubic-bezier(0.4, 0, 0.2, 1);
+  --dur-fast: 120ms;
+  --dur-base: 200ms;
+  --dur-slow: 360ms;
+
+  /* Roles: what the components use. Light is the system's own; dark builds on Deep Current. */
+  --bg: var(--fl-white);
+  --surface: var(--fl-white);
+  --surface-alt: var(--fl-slate-050);
+  --tint: var(--fl-mist);
+  --tint-border: var(--fl-mist-2);
+  --line: var(--fl-slate-100);
+  --line-strong: var(--fl-slate-200);
+  --text: var(--fl-ink);
+  --heading: var(--fl-current);
+  --muted: var(--fl-slate-600);
+  --faint: var(--fl-slate-400);
+  --link: var(--fl-cyan-ink);
+  --code-bg: var(--fl-current);
+  --code-text: #cfeff7;
+  --ok-bg: #ddf6ec;
+  --ok-text: #0e7a50;
+  --err-bg: #fde3e4;
+  --err-text: #a11e23;
+  --warn-bg: #fff8db;
+  --warn-text: #6b5300;
 }
 
 @media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #141416;
-    --panel: #1c1c1e;
-    --border: #2e2e32;
-    --text: #e8e8ea;
-    --muted: #9a9aa2;
-    --accent: #2dd4bf;
-    --accent-soft: #123a35;
-    --user: #26262a;
-    --code-bg: #111113;
-    --warn: #f0b24a;
-    --error: #ff7b6e;
+  :root:not([data-theme="light"]) {
+    --bg: #071e28;
+    --surface: var(--fl-current);
+    --surface-alt: #0d3546;
+    --tint: #0e3a4c;
+    --tint-border: #155268;
+    --line: #134456;
+    --line-strong: #1d5a70;
+    --text: #e4f2f6;
+    --heading: #ffffff;
+    --muted: #a9c7d2;
+    --faint: #6f93a1;
+    --link: var(--fl-cyan);
+    --code-bg: #04161e;
+    --ok-bg: #0d3b2e;
+    --ok-text: #6ee0b0;
+    --err-bg: #3d1a1f;
+    --err-text: #ff9a9d;
+    --warn-bg: #3a3214;
+    --warn-text: #ffe58a;
   }
 }
 
@@ -37,11 +107,23 @@
 html,
 body {
   height: 100%;
-  background: var(--bg);
+}
+
+body {
+  font-family: var(--font-body);
   color: var(--text);
-  font-family: var(--font-geist-sans), system-ui, sans-serif;
-  font-size: 15px;
+  background: var(--bg);
+  line-height: 1.6;
   -webkit-font-smoothing: antialiased;
+}
+
+h1,
+h2,
+h3 {
+  font-family: var(--font-display);
+  color: var(--heading);
+  line-height: 1.05;
+  letter-spacing: -0.01em;
 }
 
 button,
@@ -49,4 +131,21 @@ input,
 textarea {
   font: inherit;
   color: inherit;
+}
+
+a {
+  color: var(--link);
+}
+
+:focus-visible {
+  outline: none;
+  box-shadow: var(--sh-glow);
+  border-radius: var(--r-sm);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation: none !important;
+    transition: none !important;
+  }
 }

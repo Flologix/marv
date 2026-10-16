@@ -1,47 +1,81 @@
 # Marv on the web
 
-A minimal browser UI for Marv: a text box, the model's reply as it streams, each tool call (expand it for its output), and settings for the model, the step limit and what Marv may do without asking. It's a first step toward a hosted Marv; for now it's for showing people how the harness works.
+A browser UI for Marv:
+- a prompt box;
+- the reply as it streams;
+- every tool call, which expands to its output or diff;
+- **live approvals**: when Marv wants to do something the sandbox can't contain (a git commit, network access, a protected file), the page shows the exact command or diff and waits for **Allow**, **Allow … this session** or **Decline**.
+
+The page is styled with the FloLogix AI design system v1.0: Jost, IBM Plex Sans and Mono, Flow Cyan and the Signal Yellow tilt, in light and dark.
 
 ## How it works
 
-There is no second agent here. Each message is one `marv -p - --output stream-json` run, and the server streams Marv's JSON events to the page:
+```
+browser ──WebSocket──▶ marv-web (Rust, crates/marv-web) ──▶ marv-session (the same engine as the marv CLI)
+   ▲                                                          │
+   └────────── events, approval requests ◀───────────────────┘
+Next.js (this folder) serves the page and /api/models
+```
 
-- **One workspace per chat.** A chat runs in its own folder (`.data/workspaces/<chat id>`, a fresh git repo). Later messages pass `-c`, so Marv continues that chat's saved session.
-- **Its own HOME.** Marv runs with `HOME=.data/home`, so it never sees the server user's `~/.marv` (their skills, memory, MCP servers, sessions) or `gh` login. The child gets only `PATH`, `HOME`, `LANG`, `TERM`, `NODE_ENV` and the OpenRouter key, never the rest of the server's environment.
-- **Approvals.** There's no one to click "yes", so Marv's headless rules apply: sandboxed commands and edits in the workspace run, anything else is refused unless a scope is ticked in settings (`--approve web`, `network`, `git_write`, `process`, `files`, `memory`). `github`, mesh receptacles and the tainted/protected opt-ins aren't offered.
-- **Stop** aborts the request, and the server interrupts Marv (SIGINT, then SIGKILL after 3 s).
+- **One WebSocket is one chat.** The page sends `hello` (the chat id, model, step limit, yolo). `marv-web` then builds a session with `SessionBuilder` in that chat's own workspace (`<data>/workspaces/<chat id>`, a fresh git repo) and keeps it open between messages. A reconnect resumes the chat's saved session.
+- **Approvals.** `marv-web` gives the session an approver that sends each request to the page and waits for the answer:
+  - "Always" is remembered for the session.
+  - Requests Marv says a person must answer every time (tainted egress, protected paths) get Allow and Decline only.
+  - Stop, or closing the tab, answers whatever is still open with no.
+- **Isolation.**
+  - The session loads no sources: none of the server user's skills, memory, MCP servers or instructions.
+  - Marv's own files (sessions, checkpoints) live in `<data>/marv`.
+  - The `process` tool is off, since its ports would open on the server, not the viewer's machine.
+- **Origin check.** WebSockets are accepted only from the origins in `MARV_WEB_ORIGINS`. Without it, any page the user visits could drive their agent.
 
-| File | What it does |
+### The protocol
+
+| Page → server | |
 |---|---|
-| `lib/marv.ts` | Spawns Marv for a turn and turns its stdout into the response stream |
-| `app/api/chat/route.ts` | `POST {chatId, prompt, model, approve, maxSteps, resume}` → NDJSON events |
-| `app/api/models/route.ts` | OpenRouter's tool-capable models with prices (cached for an hour) |
-| `app/chat.tsx` | The page |
+| `{type:"hello", chatId, model, maxSteps, yolo}` | first message |
+| `{type:"send", text}` | a user message (one turn at a time) |
+| `{type:"interrupt"}` | stop the turn |
+| `{type:"approval", id, decision:"yes"\|"always"\|"no"}` | answer a request |
+| `{type:"configure", model?, maxSteps?, yolo?}` | from the next turn |
+
+**Server → page:**
+- `ready` and `fatal`;
+- `turn_start`, `text_delta`, `thinking_delta` and `assistant`;
+- `tool_start` and `tool_end` (with `id`, `result`, `summary`, `diff` and `approval`), `tool_skipped`;
+- `approval` (with `title`, `command`, `diff`, `note`, `warning`, `scope` and `once`), `approval_done`;
+- `status`, `compaction`, `tainted`, `notice`, `error` and `turn_end`;
+- `usage` (this turn's tokens and cost, plus the context used).
 
 ## Run it
 
-Needs `marv` on PATH (or `MARV_BIN`), bubblewrap, git and Node.
+You need Rust (see the repo README), Node, bubblewrap and git.
 
 ```sh
-cd web
-npm install
-OPENROUTER_API_KEY=sk-or-… npm run dev -- -H 127.0.0.1
+# 1. The server (the key: OPENROUTER_API_KEY, else the one marv's setup saved)
+cargo run -p marv-web
+
+# 2. The page
+cd web && npm install && npm run dev -- -H 127.0.0.1
 ```
 
-Without `OPENROUTER_API_KEY`, the server uses the key saved in your own `~/.marv/config.json` (handy locally).
+Open http://127.0.0.1:3000. Using another port? Add its origin to `MARV_WEB_ORIGINS`.
 
-| Env var | Default |
+| Server env var | Default |
 |---|---|
+| `MARV_WEB_ADDR` | `127.0.0.1:8787` |
+| `MARV_WEB_DATA` | `.marv-web` |
+| `MARV_WEB_ORIGINS` | `http://localhost:3000,http://127.0.0.1:3000` |
+| `MARV_WEB_MODEL` | `z-ai/glm-5.3-flash` (also read by the page's `/api/models`) |
 | `OPENROUTER_API_KEY` | the key in `~/.marv/config.json` |
-| `MARV_BIN` | `marv` |
-| `MARV_WEB_MODEL` | `z-ai/glm-5.3-flash` (the picker's default) |
-| `MARV_WEB_DATA` | `./.data` |
+
+The page connects to `ws://<its host>:8787/ws`; set `NEXT_PUBLIC_MARV_WS` to point it elsewhere.
 
 ## Not hosted yet
 
-**Keep it on 127.0.0.1.** There's no login, so anyone who can reach the page runs an agent on your key and your machine. Before it goes on the internet it needs:
-- accounts and a per-user key or budget;
-- workspaces in a container or VM per user rather than folders on the host (Marv's bwrap sandbox protects the host from a command, not from a stranger who controls the prompt);
-- a cap on concurrent runs;
+**Keep it on 127.0.0.1.** There's no login, so anyone who reaches the page runs an agent on your key and your machine. To host it, it still needs:
+- accounts, with the WebSocket authenticated (a session cookie checked on upgrade);
+- a key or budget per user;
+- workspaces in a container or VM per user, not folders on the host (bubblewrap protects the host from a command, not from a stranger who writes the prompts);
+- a cap on sessions;
 - workspace cleanup;
-- a way to see and download a chat's files.
+- a file browser and download.

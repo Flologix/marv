@@ -1,4 +1,4 @@
-import { DEFAULT_MODEL } from "@/lib/marv";
+const DEFAULT_MODEL = process.env.MARV_WEB_MODEL ?? "z-ai/glm-5.3-flash";
 
 export interface ModelInfo {
   id: string;
