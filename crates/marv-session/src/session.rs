@@ -243,6 +243,9 @@ pub struct SessionInit {
     pub plan: bool,
     pub diagnostics: bool,
     pub checks: bool,
+    /// `compactTokens` (#140): compact once the context passes this many tokens, or at 85% of the window if that comes
+    /// first. Default [`crate::config::DEFAULT_COMPACT_TOKENS`]; `None`: only the window rule.
+    pub compact_tokens: Option<u64>,
     /// The formatter the edit tools run after a change (#67). Default on (detect from the project's config).
     pub formatter: FormatterSetting,
     /// Snapshot the project before each turn's first change and after the turn (git commits under a hidden ref, #16),
@@ -343,6 +346,7 @@ impl SessionInit {
             plan: true,
             diagnostics: true,
             checks: true,
+            compact_tokens: Some(crate::config::DEFAULT_COMPACT_TOKENS),
             formatter: FormatterSetting::Auto,
             checkpoints: true,
             checkpoints_dir: None,
@@ -534,6 +538,7 @@ struct State {
     yolo: bool,
     diagnostics: bool,
     checks: bool,
+    compact_tokens: Option<u64>,
     formatter: FormatterSetting,
     max_steps: Option<u32>,
     logging: bool,
@@ -908,6 +913,7 @@ impl MarvSession {
             yolo: init.yolo,
             diagnostics: init.diagnostics,
             checks: init.checks,
+            compact_tokens: init.compact_tokens,
             formatter: init.formatter.clone(),
             max_steps: init.max_steps,
             logging: init.log_trajectories,
@@ -2756,14 +2762,18 @@ impl MarvSession {
         s.totals = totals;
     }
 
-    /// Whether the last request used ≥85% of the context window.
+    /// Whether the last request used ≥85% of the context window, or passed `compactTokens` (#140): on a model with a
+    /// large window (GLM's, on OpenRouter) 85% was never reached, and long sessions resent 200k–400k tokens a step.
     pub(crate) fn nearly_full(&self) -> bool {
         let context = self.context_length();
         let s = self.state();
-        match (context, s.last) {
-            (Some(c), Some(last)) => {
-                (last.prompt_tokens + last.completion_tokens) as f64 >= c as f64 * marv_agent::compact::COMPACT_AT
-            }
+        let window = context.filter(|c| *c > 0).map(|c| c as f64 * marv_agent::compact::COMPACT_AT);
+        let threshold = match (window, s.compact_tokens) {
+            (Some(w), Some(b)) => Some(w.min(b as f64)),
+            (w, b) => w.or(b.map(|b| b as f64)),
+        };
+        match (threshold, s.last) {
+            (Some(t), Some(last)) => (last.prompt_tokens + last.completion_tokens) as f64 >= t,
             _ => false,
         }
     }
@@ -2955,6 +2965,24 @@ mod tests {
         assert_eq!(s.usage().totals.requests, 1);
         s.state().last = Some(Usage { prompt_tokens: 900, completion_tokens: 10, cached_tokens: None, cost: None });
         assert!(s.nearly_full());
+    }
+
+    /// #140: compaction starts at `compactTokens` or 85% of the window, whichever comes first; off leaves the window.
+    #[test]
+    fn compact_tokens_compacts_before_the_window_would() {
+        let used = |s: &MarvSession, prompt_tokens| {
+            s.state().last = Some(Usage { prompt_tokens, completion_tokens: 0, cached_tokens: None, cost: None });
+            s.nearly_full()
+        };
+        // The window (1000, so 850) comes first with the default 100k.
+        let default = session(|_| {}).unwrap();
+        assert!(!used(&default, 849) && used(&default, 850));
+        // A budget under the window comes first.
+        let budget = session(|i| i.compact_tokens = Some(500)).unwrap();
+        assert!(!used(&budget, 499) && used(&budget, 500));
+        // Off: only the window.
+        let off = session(|i| i.compact_tokens = None).unwrap();
+        assert!(!used(&off, 800) && used(&off, 850));
     }
 
     #[test]

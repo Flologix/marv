@@ -484,6 +484,7 @@ pub async fn run_headless(options: HeadlessOptions) -> ExitCode {
     builder.options.herdr = marv_session::herdr_door::setup_from_env(&env, config.herdr_peers, &door_outside);
     // A worker the Herdr door spawned from a tainted conversation starts tainted (MARV_TAINTED=1: only adds taint).
     builder.options.tainted_at_start = marv_session::config::tainted_at_start(&env);
+    builder.options.compact_tokens = config.compact_tokens;
     // The mesh, when asked for (`--approve mesh:<r>` or `MARV_MESH_NAME`): otherwise a one-off `marv -p` isn't on it
     // and its model isn't offered the mesh tools. Wires are granted only for the listed receptacles, from this run's
     // own agents or from another Marv (its door).

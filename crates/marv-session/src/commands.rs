@@ -677,6 +677,7 @@ fn config_text(ctx: &CommandContext) -> String {
         format!("Checks:    {} (/checks)", if c.checks { "on" } else { "off" }),
         format!("Checkpoints: {} (/checkpoints, /undo)", if c.checkpoints { "on" } else { "off" }),
         format!("Steps: {}", steps_status(c)),
+        format!("Compact:   {}", compact_status(c)),
         format!("Mesh wake: {} (/mesh)", if c.mesh_wake { "on" } else { "off" }),
         format!("Radio:     {} (/radio)", if c.mesh_radio { "on" } else { "off" }),
         format!("Endpoint:  {}", c.base_url),
@@ -687,6 +688,17 @@ fn config_text(ctx: &CommandContext) -> String {
     lines.push(format!("API key:   {key}"));
     lines.push(format!("File:      {}", ctx.config_path));
     lines.join("\n")
+}
+
+/// When Marv summarizes the conversation (#140): `compactTokens`, or only the window rule when it's off.
+pub fn compact_status(config: &Config) -> String {
+    match config.compact_tokens {
+        Some(n) => format!(
+            "at {} tokens or 85% of the window, whichever comes first (compactTokens in the config file)",
+            crate::prompt::thousands(n as usize)
+        ),
+        None => "at 85% of the window (compactTokens is off in the config file)".into(),
+    }
 }
 
 pub fn diagnostics_status(config: &Config) -> String {
@@ -1162,7 +1174,16 @@ mod tests {
             assert_eq!(run_command("/radio", &CommandContext { config: &on, ..ctx.clone() }), CommandAction::RadioView);
             let CommandAction::Print { text, .. } = run_command("/config", ctx) else { panic!() };
             assert!(text.contains("Radio:     off (/radio)"), "{text}");
+            assert!(text.contains("Compact:   at 100,000 tokens or 85% of the window"), "{text}");
         });
+    }
+
+    #[test]
+    fn compact_status_says_the_size_or_that_its_off() {
+        let config = crate::config::resolve_config(None, &crate::config::Env::new());
+        assert!(compact_status(&config).starts_with("at 100,000 tokens or 85% of the window"));
+        let off = Config { compact_tokens: None, ..config };
+        assert_eq!(compact_status(&off), "at 85% of the window (compactTokens is off in the config file)");
     }
 
     #[test]

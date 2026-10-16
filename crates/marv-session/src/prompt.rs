@@ -512,7 +512,7 @@ pub fn nested_instructions_text(raw: &str, rel: &str) -> Option<String> {
     })
 }
 
-fn thousands(n: usize) -> String {
+pub(crate) fn thousands(n: usize) -> String {
     let s = n.to_string();
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {

@@ -2,8 +2,9 @@
 //! summarize it, then continue from the summary. Ports `src/compact.ts`.
 //!
 //! - Triggered at [`COMPACT_AT`] (85%) of the window, by the last request's prompt size (known for
-//!   Ollama, and for OpenRouter via the model list). The session runs it before a turn
-//!   (`runTurn` → `summarizeInto`) and mid-turn through the loop's `on_full` hook.
+//!   Ollama, and for OpenRouter via the model list), or sooner at the user's `compactTokens` (marv-rs #140,
+//!   default 100k: on a large window 85% was never reached). The session decides (`nearly_full`) and runs it
+//!   before a turn (`runTurn` → `summarizeInto`) and mid-turn through the loop's `on_full` hook.
 //! - **The summary request reuses the exact prefix** of a normal request (same system prompt,
 //!   tools and history) and only appends one user message, so it hits the prompt cache and is
 //!   cheap. The tools are offered for that reason, not to be used.

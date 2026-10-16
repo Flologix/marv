@@ -965,6 +965,7 @@ impl Bridge {
         (init.sandbox, init.yolo, init.diagnostics, init.checks, init.mcp_tools) =
             (config.sandbox, config.yolo, config.diagnostics, config.checks, config.mcp_tools);
         init.formatter = config.formatter;
+        init.compact_tokens = config.compact_tokens;
         // #98: the config's "approve" and this run's --approve seed the session's "always" scopes; the writable
         // folders are resolved and checked already (refused ones are in approval_problems, not here).
         init.pre_approved = s.pre_approved.clone();
