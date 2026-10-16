@@ -26,6 +26,14 @@ struct Desktop {
     live: Mutex<HashMap<String, mpsc::UnboundedSender<ClientMessage>>>,
     /// The folder named on the command line (`marv-desktop <dir>`), until the page takes it.
     launch: Mutex<Option<String>>,
+    /// MCP servers looked up for adding, by name: what the person saw is exactly what gets written.
+    proposals: Mutex<HashMap<String, Value>>,
+}
+
+/// The CLI's own folder (~/.marv): memory, MCP servers, logins and saved sessions shared with `marv`.
+fn marv_dir() -> PathBuf {
+    let env: marv_session::config::Env = std::env::vars().collect();
+    marv_session::config::default_config_dir(&env, &marv_session::paths::home_dir())
 }
 
 impl Desktop {
@@ -246,6 +254,7 @@ fn create_chat(desktop: State<'_, Desktop>, folder: String, title: String) -> Re
 
 /// Opens a chat and starts its session (continuing the saved one); its events go to `on_event`.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // A Tauri command's arguments are the page's named fields.
 fn open_chat(
     app: AppHandle,
     desktop: State<'_, Desktop>,
@@ -253,6 +262,7 @@ fn open_chat(
     model: String,
     max_steps: u32,
     yolo: bool,
+    mcp_off: Vec<String>,
     on_event: Channel<Value>,
 ) -> Result<Chat, String> {
     // A local (Ollama) model needs no key.
@@ -270,7 +280,7 @@ fn open_chat(
     let spec = ChatSpec {
         root: dir,
         // The CLI's own folder (~/.marv): the same memory, MCP servers and saved sessions as `marv`.
-        config_dir: marv_session::config::default_config_dir(&std::env::vars().collect(), &marv_session::paths::home_dir()),
+        config_dir: marv_dir(),
         api_key,
         model,
         max_steps: max_steps.min(500),
@@ -282,6 +292,8 @@ fn open_chat(
         sources: vec![marv_session::sources::Source::User, marv_session::sources::Source::Project],
         // On the mesh like a terminal Marv: other Marvs (desktop chats, Herdr panes) see it and can be wired to it.
         mesh: true,
+        mcp_off,
+        manage_mcp: true,
     };
     let (to_chat, from_page) = mpsc::unbounded_channel();
     let (out, mut events) = mpsc::unbounded_channel::<Value>();
@@ -306,6 +318,87 @@ fn open_chat(
     Ok(chat)
 }
 
+#[derive(Serialize)]
+struct ServerEntry {
+    name: String,
+    /// "global" (~/.marv/mcp.json, every folder) or "folder" (the folder's .mcp.json, once trusted).
+    scope: &'static str,
+    /// The config as written (`${VAR}`s unexpanded, so no secrets).
+    target: String,
+}
+
+/// The MCP servers a chat in `folder` gets, from the config files (whether or not a chat runs them).
+#[tauri::command]
+fn mcp_servers(desktop: State<'_, Desktop>, folder: String) -> Result<Vec<ServerEntry>, String> {
+    let dir = tree::resolve(&desktop.root()?, &folder)?;
+    let env: marv_mcp::Env = std::env::vars().collect();
+    let include = marv_mcp::config::Include { personal: true, project: true };
+    let loaded = marv_mcp::config::load_mcp_config(&dir, &marv_dir(), &env, include);
+    Ok(loaded
+        .servers
+        .into_iter()
+        .map(|s| ServerEntry {
+            scope: if s.source == marv_mcp::config::ServerSource::Project { "folder" } else { "global" },
+            name: s.name,
+            target: marv_core::printable(&s.display),
+        })
+        .collect())
+}
+
+/// `/mcp add`'s lookup: an npm package, a URL or a GitHub repo becomes the exact entry to write, shown to the person
+/// first (with what was found about it). Several servers in one README: the choices.
+#[tauri::command]
+async fn mcp_lookup(desktop: State<'_, Desktop>, source: String, name: Option<String>) -> Result<Value, String> {
+    use marv_mcp::install::{AddOptions, Resolved, resolve_add};
+    let env: marv_session::config::Env = std::env::vars().collect();
+    let options =
+        AddOptions { source: source.trim().to_string(), name: name.filter(|n| !n.trim().is_empty()), ..AddOptions::default() };
+    let deps = marv_session::mcp_install::LiveDeps::new(env.clone(), tokio_util::sync::CancellationToken::new());
+    let proposal = match resolve_add(&options, &deps).await.map_err(|e| e.to_string())? {
+        Resolved::Choices(c) => return Ok(serde_json::json!({ "choices": c.choices })),
+        Resolved::Proposal(p) => p,
+    };
+    if marv_mcp::personal_file::personal_server_names(&marv_dir()).contains(&proposal.name) {
+        return Err(format!("You already have a server named \"{}\": give this one another name.", proposal.name));
+    }
+    let (approval, json) = marv_mcp::install::proposal::approval_for(&proposal, &|v| env.contains_key(v))?;
+    let entry: Value = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+    desktop.proposals.lock().unwrap_or_else(|e| e.into_inner()).insert(proposal.name.clone(), entry);
+    Ok(serde_json::json!({
+        "name": proposal.name,
+        "title": approval.title,
+        "command": approval.command,
+        "text": approval.text,
+        "warning": approval.warning,
+    }))
+}
+
+/// Writes a looked-up server to ~/.marv/mcp.json (every folder's): exactly the entry `mcp_lookup` showed.
+#[tauri::command]
+async fn mcp_install(desktop: State<'_, Desktop>, name: String) -> Result<(), String> {
+    let entry = desktop.proposals.lock().unwrap_or_else(|e| e.into_inner()).remove(&name).ok_or("Look the server up first.")?;
+    marv_mcp::personal_file::add_personal_server(&marv_dir(), &name, entry).await.map_err(|e| e.to_string())
+}
+
+/// Takes one of your servers out of ~/.marv/mcp.json (a folder's are in its .mcp.json).
+#[tauri::command]
+async fn mcp_remove(name: String) -> Result<(), String> {
+    if !marv_mcp::personal_file::personal_server_names(&marv_dir()).contains(&name) {
+        return Err(format!("\"{name}\" isn't in ~/.marv/mcp.json: a folder's server is removed from its .mcp.json."));
+    }
+    marv_mcp::personal_file::remove_personal_server(&marv_dir(), &name).await.map_err(|e| e.to_string())
+}
+
+/// Starts or stops dictation with Voxtype (Omarchy's; Super+Ctrl+X does the same): it types into the focused field.
+#[tauri::command]
+fn dictate() -> Result<(), String> {
+    std::process::Command::new("voxtype")
+        .args(["record", "toggle"])
+        .spawn()
+        .map(|_| ())
+        .map_err(|_| "Dictation needs Voxtype (on Omarchy: Super+Ctrl+X).".to_string())
+}
+
 #[tauri::command]
 fn chat_message(desktop: State<'_, Desktop>, id: String, message: Value) -> Result<(), String> {
     let message: ClientMessage = serde_json::from_value(message).map_err(|e| e.to_string())?;
@@ -328,7 +421,12 @@ pub fn run() {
             let data = app.path().app_data_dir()?;
             // The first argument that isn't a flag: `marv-desktop .`, `marv-desktop ~/Projects/site`.
             let launch = std::env::args().skip(1).find(|a| !a.starts_with('-'));
-            app.manage(Desktop { store: Store::new(config, data), live: Mutex::new(HashMap::new()), launch: Mutex::new(launch) });
+            app.manage(Desktop {
+                store: Store::new(config, data),
+                live: Mutex::new(HashMap::new()),
+                launch: Mutex::new(launch),
+                proposals: Mutex::new(HashMap::new()),
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -336,6 +434,11 @@ pub fn run() {
             set_root,
             root_up,
             enter_folder,
+            mcp_servers,
+            mcp_lookup,
+            mcp_install,
+            mcp_remove,
+            dictate,
             take_launch,
             set_api_key,
             list_dir,

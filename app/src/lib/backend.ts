@@ -29,7 +29,21 @@ export interface ChatSettings {
   maxSteps: number;
   /** Sandboxed commands and edits in the folder run without asking. */
   yolo: boolean;
+  /** MCP servers switched off for chats (by name). */
+  mcpOff: string[];
 }
+
+/** An MCP server as the config files have it. */
+export interface ServerEntry {
+  name: string;
+  scope: "global" | "folder";
+  target: string;
+}
+
+/** A looked-up server to add, shown before it's written; or several to choose from. */
+export type Lookup =
+  | { name: string; title: string; command?: string | null; text: string; warning?: string | null }
+  | { choices: string[] };
 
 export type ServerEvent = Record<string, unknown> & { type: string };
 
@@ -55,6 +69,12 @@ export const desktop = {
   createChat: (folder: string, title: string) => invoke<ChatRecord>("create_chat", { folder, title }),
   renameChat: (id: string, title: string) => invoke<void>("rename_chat", { id, title }),
   deleteChat: (id: string) => invoke<void>("delete_chat", { id }),
+  mcpServers: (folder: string) => invoke<ServerEntry[]>("mcp_servers", { folder }),
+  mcpLookup: (source: string, name?: string) => invoke<Lookup>("mcp_lookup", { source, name }),
+  mcpInstall: (name: string) => invoke<void>("mcp_install", { name }),
+  mcpRemove: (name: string) => invoke<void>("mcp_remove", { name }),
+  /** Voxtype dictation on or off: it types into the focused field. */
+  dictate: () => invoke<void>("dictate"),
 };
 
 /** Opens a chat's session; `onEvent` gets its events until `close()`. */

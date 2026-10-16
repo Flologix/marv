@@ -1110,3 +1110,195 @@ img.flai {
   width: auto;
   display: block;
 }
+
+/* ---------- sidebar tabs, servers ---------- */
+.side-tabs {
+  display: flex;
+  gap: 2px;
+  height: 34px;
+  padding: 0 8px;
+  align-items: flex-end;
+  border-bottom: 1px solid var(--ui);
+}
+
+.side-tabs button {
+  padding: 4px 10px 6px;
+  font-family: var(--font-display);
+  font-weight: 500;
+  font-size: 13px;
+  color: var(--tx-2);
+  border-bottom: 2px solid transparent;
+}
+
+.side-tabs button.active {
+  color: var(--tx);
+  border-bottom-color: var(--tx);
+}
+
+.servers {
+  padding-bottom: 12px;
+}
+
+.servers .pad {
+  padding: 2px 12px;
+}
+
+.server {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 28px;
+  padding: 0 10px 0 12px;
+}
+
+.server:hover {
+  background: var(--bg-2);
+}
+
+.server-dot {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 50%;
+  border: 1px solid var(--tx-3);
+}
+
+.server-dot.connected {
+  background: var(--green);
+  border-color: var(--green);
+}
+
+.server-dot.connecting {
+  background: var(--yellow);
+  border-color: var(--yellow);
+}
+
+.server-dot.needs_login,
+.server-dot.untrusted {
+  border-color: var(--orange);
+}
+
+.server-dot.failed {
+  background: var(--red);
+  border-color: var(--red);
+}
+
+.server-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.server-meta {
+  color: var(--tx-3);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.server-actions {
+  display: none;
+}
+
+.server:hover .server-actions {
+  display: flex;
+}
+
+.toggle.small {
+  width: 26px;
+  height: 14px;
+}
+
+.toggle.small::after {
+  width: 10px;
+  height: 10px;
+}
+
+.toggle.small.on::after {
+  transform: translateX(12px);
+}
+
+.link {
+  color: var(--blue);
+  font-size: 11px;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.link.mono {
+  display: block;
+  text-align: left;
+  padding: 2px 0;
+  font-family: var(--font-mono);
+}
+
+.add-link {
+  margin: 10px 12px 0;
+  color: var(--blue);
+}
+
+.add-server {
+  display: grid;
+  gap: 6px;
+  margin: 10px 12px 0;
+}
+
+.add-server input {
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--ui-2);
+  border-radius: var(--r);
+  background: var(--paper);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  outline: none;
+}
+
+.add-server input:focus {
+  border-color: var(--blue);
+}
+
+.add-buttons {
+  display: flex;
+  gap: 6px;
+}
+
+.add-server .btn {
+  height: 26px;
+  font-size: 12.5px;
+}
+
+.lookup {
+  display: grid;
+  gap: 6px;
+  font-family: var(--font-body);
+  font-size: 12.5px;
+}
+
+.lookup .code {
+  font-size: 11px;
+  max-height: 180px;
+}
+
+.lookup .warning {
+  color: var(--orange);
+}
+
+/* ---------- mic ---------- */
+.mic {
+  height: 30px;
+  padding: 0 8px;
+  border-radius: var(--r);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--tx-2);
+}
+
+.mic:hover {
+  background: var(--bg-2);
+  color: var(--tx);
+}
+
+.mic.on {
+  color: var(--red);
+}

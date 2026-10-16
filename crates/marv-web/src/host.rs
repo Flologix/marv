@@ -43,6 +43,10 @@ pub struct ChatSpec {
     /// `mesh_list` tool), wires need its person's approval, and a message on a wire wakes it. Only on the person's own
     /// machine.
     pub mesh: bool,
+    /// MCP servers switched off for this chat, by name.
+    pub mcp_off: Vec<String>,
+    /// Allow `mcp` login/logout/trust (OAuth opens the browser on this machine): only on the person's own machine.
+    pub manage_mcp: bool,
 }
 
 /// The commands the page offers in its `/` menu (besides the skills), and what they do here.
@@ -236,6 +240,56 @@ pub async fn run_chat(spec: ChatSpec, mut incoming: UnboundedReceiver<ClientMess
                 };
                 let _ = out.send(reply);
             }
+            ClientMessage::Mcp { action, name } => {
+                let Some(mcp) = session.mcp() else {
+                    let _ = out.send(json!({"type": "mcp", "servers": []}));
+                    continue;
+                };
+                if action != "status" && !spec.manage_mcp {
+                    continue;
+                }
+                let (out, name) = (out.clone(), name.unwrap_or_default());
+                tokio::spawn(async move {
+                    let say = |text: String| {
+                        let _ = out.send(json!({"type": "command_output", "text": text}));
+                    };
+                    match action.as_str() {
+                        "login" => {
+                            let tell = out.clone();
+                            let server = name.clone();
+                            let authorize: marv_mcp::oauth::Authorize = Arc::new(move |url| {
+                                let _ = tell.send(json!({"type": "command_output", "text": format!(
+                                    "Log in to **{server}**: your browser is opening. If it doesn't, open [this link]({url})."
+                                )}));
+                                // The person's own browser, on their machine.
+                                let _ = std::process::Command::new("xdg-open").arg(url.as_str()).spawn();
+                            });
+                            match mcp.login(&name, authorize) {
+                                Ok(login) => match login.done.await {
+                                    Ok(Ok(status)) => say(format!("{name}: logged in · {} tools", status.tools.len())),
+                                    Ok(Err(e)) => say(format!("{name}: not logged in: {e}")),
+                                    Err(_) => say(format!("{name}: not logged in: the login stopped")),
+                                },
+                                Err(e) => say(e.to_string()),
+                            }
+                        }
+                        "logout" => match mcp.logout(&name).await {
+                            Ok(_) => say(format!("{name}: logged out.")),
+                            Err(e) => say(e.to_string()),
+                        },
+                        "trust" => match mcp.trust_all().await {
+                            Ok(started) => say(started
+                                .iter()
+                                .map(|s| format!("{}: {}", s.name, state_name(s.state)))
+                                .collect::<Vec<_>>()
+                                .join("\n")),
+                            Err(e) => say(format!("Couldn't trust the servers: {e}")),
+                        },
+                        _ => {}
+                    }
+                    let _ = out.send(mcp_status(&mcp));
+                });
+            }
             ClientMessage::Hello { .. } => {}
         }
     }
@@ -290,6 +344,38 @@ async fn watch_mesh(
     }
 }
 
+fn state_name(state: marv_mcp::manager::McpState) -> &'static str {
+    use marv_mcp::manager::McpState as S;
+    match state {
+        S::Untrusted => "untrusted",
+        S::Connecting => "connecting",
+        S::Connected => "connected",
+        S::Failed => "failed",
+        S::Removed => "removed",
+        S::NeedsLogin => "needs_login",
+    }
+}
+
+/// The chat's servers as the page shows them (never a token).
+fn mcp_status(mcp: &marv_session::mcp_tools::McpHandle) -> Value {
+    let servers: Vec<Value> = mcp
+        .status()
+        .iter()
+        .map(|s| {
+            json!({
+                "name": s.name,
+                "scope": if s.source == marv_mcp::config::ServerSource::Project { "folder" } else { "global" },
+                "state": state_name(s.state),
+                "tools": s.tools.len(),
+                "error": s.error.as_deref().map(marv_core::printable),
+                "canLogin": s.login.is_some(),
+                "loggedIn": s.login.as_ref().is_some_and(|l| l.logged_in),
+            })
+        })
+        .collect();
+    json!({"type": "mcp", "servers": servers})
+}
+
 fn help(skills: &[LoadedSkill]) -> String {
     let mut text: String = COMMANDS.iter().map(|(name, d)| format!("- `/{name}`: {d}\n")).collect();
     if !skills.is_empty() {
@@ -325,6 +411,7 @@ async fn open(
         // No `sources`: none of the user's skills, memory, MCP servers or instructions from ~/.marv.
         builder.options.config_dir = Some(spec.config_dir.clone());
         builder.options.mesh = mesh.clone();
+        builder.options.mcp_skip = spec.mcp_off.clone();
         let out = out.clone();
         builder.options.on_warning = Some(Arc::new(move |text: String| {
             let _ = out.send(json!({"type": "notice", "text": marv_core::printable(&text)}));

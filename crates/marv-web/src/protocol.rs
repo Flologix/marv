@@ -31,6 +31,11 @@ pub enum ClientMessage {
         max_steps: Option<u32>,
         yolo: Option<bool>,
     },
+    /// The chat's MCP servers: `status` (sends `mcp`), `login` / `logout` a remote one (OAuth), `trust` the folder's.
+    Mcp {
+        action: String,
+        name: Option<String>,
+    },
 }
 
 /// A chat id is a UUID: it names a folder, so nothing else gets through.

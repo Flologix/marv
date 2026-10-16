@@ -8,7 +8,7 @@ import { type AppInfo, type ChatRecord, type ChatSettings, type Model, desktop, 
 import { useChat } from "./lib/chat";
 
 const SETTINGS_KEY = "marv-settings";
-const DEFAULT_SETTINGS: ChatSettings = { model: "z-ai/glm-5.3-flash", maxSteps: 50, yolo: true };
+const DEFAULT_SETTINGS: ChatSettings = { model: "z-ai/glm-5.3-flash", maxSteps: 50, yolo: true, mcpOff: [] };
 
 function stored<T>(key: string, fallback: T): T {
   try {
@@ -25,7 +25,7 @@ function keep(key: string, value: unknown) {
 }
 
 function useSettings() {
-  const [settings, setSettings] = useState<ChatSettings>(() => stored(SETTINGS_KEY, DEFAULT_SETTINGS));
+  const [settings, setSettings] = useState<ChatSettings>(() => ({ ...DEFAULT_SETTINGS, ...stored(SETTINGS_KEY, DEFAULT_SETTINGS) }));
   const [models, setModels] = useState<Model[]>([]);
   useEffect(() => keep(SETTINGS_KEY, settings), [settings]);
   useEffect(() => {
@@ -46,7 +46,8 @@ function Desktop() {
   const [chats, setChats] = useState<ChatRecord[]>([]);
   const [collapsed, setCollapsed] = useState(false);
   const { settings, setSettings, models } = useSettings();
-  const chat = useChat(chatId, settings);
+  const [reload, setReload] = useState(0);
+  const chat = useChat(chatId, settings, reload);
 
   // Opened as `marv-desktop <dir>`: that folder; else where the last session left off.
   useEffect(() => {
@@ -159,6 +160,14 @@ function Desktop() {
         rootName={rootName}
         onRootUp={() => void rootUp()}
         onEnter={(rel) => void enter(rel)}
+        servers={chat.servers}
+        chatOpen={chatId !== null && chat.status === "ready"}
+        mcpOff={settings.mcpOff}
+        onToggleServer={(name, on) =>
+          setSettings({ ...settings, mcpOff: on ? settings.mcpOff.filter((n) => n !== name) : [...settings.mcpOff, name] })
+        }
+        onServerAction={chat.mcp}
+        onServersChanged={() => setReload((r) => r + 1)}
         folder={folder}
         onFolder={selectFolder}
         chats={chats}

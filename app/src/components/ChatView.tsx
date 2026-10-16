@@ -1,7 +1,7 @@
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import type { ChatSettings, Model } from "../lib/backend";
+import { type ChatSettings, type Model, desktop, isDesktop } from "../lib/backend";
 import { type ApprovalRequest, type Command, type DiffLine, type Item, knownCommands, type useChat } from "../lib/chat";
 import { tokens } from "../lib/format";
 import { Martian } from "./Martian";
@@ -32,6 +32,17 @@ export function ChatView({
   const [open, setOpen] = useState(false);
   const [active, setActive] = useState(0);
   const [dismissed, setDismissed] = useState(false);
+  const [listening, setListening] = useState(false);
+  const promptRef = useRef<HTMLTextAreaElement>(null);
+
+  // Voxtype types into the focused field: the prompt, then.
+  function dictate() {
+    promptRef.current?.focus();
+    desktop.dictate().then(
+      () => setListening((l) => !l),
+      () => setListening(false),
+    );
+  }
   const all: Command[] = chat.commands.length ? chat.commands : knownCommands();
   // The / menu: while the first word is still being typed.
   const typing = input.startsWith("/") && !input.includes(" ") && !dismissed;
@@ -120,6 +131,7 @@ export function ChatView({
           }}
         >
           <textarea
+            ref={promptRef}
             value={input}
             rows={1}
             autoFocus
@@ -153,6 +165,16 @@ export function ChatView({
               }
             }}
           />
+          {isDesktop && (
+            <button
+              type="button"
+              className={`mic${listening ? " on" : ""}`}
+              title={listening ? "Stop dictation (Super+Ctrl+X)" : "Dictate (Super+Ctrl+X)"}
+              onClick={dictate}
+            >
+              {listening ? "● rec" : "mic"}
+            </button>
+          )}
           {chat.busy ? (
             <button type="button" className="btn" onClick={chat.interrupt}>
               Stop

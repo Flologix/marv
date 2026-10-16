@@ -143,6 +143,8 @@ async fn chat(app: Arc<App>, socket: WebSocket) {
             // Nothing from the server user's ~/.marv: no skills, memory, MCP servers or instructions.
             sources: Vec::new(),
             mesh: false,
+            mcp_off: Vec::new(),
+            manage_mcp: false,
         };
         let (to_chat, from_page) = mpsc::unbounded_channel();
         let reader = async move {

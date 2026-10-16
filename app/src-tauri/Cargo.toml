@@ -15,6 +15,9 @@ tauri-build = { version = "2.7.3", features = [] }
 [dependencies]
 marv-web = { path = "../../crates/marv-web" }
 marv-session.workspace = true
+marv-core.workspace = true
+marv-mcp.workspace = true
+tokio-util.workspace = true
 tauri = { version = "2.12.4", features = [] }
 tauri-plugin-dialog = "2"
 tokio.workspace = true

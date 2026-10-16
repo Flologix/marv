@@ -192,11 +192,22 @@ export function forget(id: string) {
 
 export type Status = "idle" | "connecting" | "ready" | "failed";
 
+/** A server as the open chat runs it. */
+export interface ServerStatus {
+  name: string;
+  scope: "global" | "folder";
+  state: "untrusted" | "connecting" | "connected" | "failed" | "removed" | "needs_login";
+  tools: number;
+  error?: string | null;
+  canLogin: boolean;
+  loggedIn: boolean;
+}
+
 /**
  * One open chat: its transcript (kept in this window's storage), its connection, and what the page can do.
  * `send` before the session is ready waits for it.
  */
-export function useChat(id: string | null, settings: ChatSettings) {
+export function useChat(id: string | null, settings: ChatSettings, reload = 0) {
   const [items, setItems] = useState<Item[]>([]);
   const [status, setStatus] = useState<Status>("idle");
   const [busy, setBusy] = useState(false);
@@ -204,6 +215,9 @@ export function useChat(id: string | null, settings: ChatSettings) {
   const [commands, setCommands] = useState<Command[]>([]);
   /** This chat's name on the machine's mesh, when it's on it. */
   const [meshName, setMeshName] = useState<string | null>(null);
+  const [servers, setServers] = useState<ServerStatus[]>([]);
+  // The session's tool list is fixed when it starts: switching a server on or off reopens the chat (it continues).
+  const sessionKey = `${id}|${[...settings.mcpOff].sort().join(",")}|${reload}`;
   const connection = useRef<Connection | null>(null);
   const pending = useRef<object[]>([]);
   const first = useRef<{ id: string; text: string } | null>(null);
@@ -245,12 +259,15 @@ export function useChat(id: string | null, settings: ChatSettings) {
           first.current = null;
           setStatus("ready");
           setMeshName((e.mesh as string | null) ?? null);
+          conn?.send({ type: "mcp", action: "status" });
           const list = (e.commands as Command[]) ?? [];
           setCommands(list);
           try {
             localStorage.setItem(COMMANDS_KEY, JSON.stringify(list));
           } catch {}
           for (const m of pending.current.splice(0)) conn?.send(m);
+        } else if (e.type === "mcp") {
+          setServers((e.servers as ServerStatus[]) ?? []);
         } else if (e.type === "fatal") {
           setStatus("failed");
           setError(String(e.message));
@@ -280,7 +297,7 @@ export function useChat(id: string | null, settings: ChatSettings) {
       conn?.close();
       connection.current = null;
     };
-  }, [id]);
+  }, [sessionKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Settings changed with the chat open: from its next turn.
   useEffect(() => {
@@ -311,8 +328,10 @@ export function useChat(id: string | null, settings: ChatSettings) {
     first.current = { id: chatId, text };
   }, []);
 
+  const mcp = useCallback((action: string, name?: string) => connection.current?.send({ type: "mcp", action, name }), []);
+
   const interrupt = useCallback(() => connection.current?.send({ type: "interrupt" }), []);
   const answer = useCallback((rid: number, decision: "yes" | "always" | "no") => connection.current?.send({ type: "approval", id: rid, decision }), []);
 
-  return { items, status, busy, error, commands, meshName, send, startWith, interrupt, answer };
+  return { items, status, busy, error, commands, meshName, servers, mcp, send, startWith, interrupt, answer };
 }

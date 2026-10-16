@@ -1,7 +1,8 @@
 import { ask } from "@tauri-apps/plugin-dialog";
 import { useCallback, useEffect, useState } from "react";
 import { type ChatRecord, type Entry, desktop } from "../lib/backend";
-import { forget } from "../lib/chat";
+import { type ServerStatus, forget } from "../lib/chat";
+import { Servers } from "./Servers";
 import { ago } from "../lib/format";
 
 type Editing = { mode: "new"; parent: string } | { mode: "rename"; rel: string; name: string } | null;
@@ -22,6 +23,12 @@ export function Sidebar({
   onChangeRoot,
   onRootUp,
   onEnter,
+  servers,
+  chatOpen,
+  mcpOff,
+  onToggleServer,
+  onServerAction,
+  onServersChanged,
 }: {
   rootName: string;
   folder: string;
@@ -34,11 +41,18 @@ export function Sidebar({
   onChangeRoot: () => void;
   onRootUp: () => void;
   onEnter: (rel: string) => void;
+  servers: ServerStatus[];
+  chatOpen: boolean;
+  mcpOff: string[];
+  onToggleServer: (name: string, on: boolean) => void;
+  onServerAction: (action: string, name?: string) => void;
+  onServersChanged: () => void;
 }) {
   const [children, setChildren] = useState<Record<string, Entry[]>>({});
   const [open, setOpen] = useState<Set<string>>(new Set([""]));
   const [editing, setEditing] = useState<Editing>(null);
   const [error, setError] = useState<string | null>(null);
+  const [view, setView] = useState<"folders" | "servers">("folders");
 
   const load = useCallback(async (rel: string) => {
     try {
@@ -178,6 +192,28 @@ export function Sidebar({
 
   return (
     <aside className="side">
+      <div className="side-tabs" role="tablist">
+        <button role="tab" aria-selected={view === "folders"} className={view === "folders" ? "active" : ""} onClick={() => setView("folders")}>
+          Folders
+        </button>
+        <button role="tab" aria-selected={view === "servers"} className={view === "servers" ? "active" : ""} onClick={() => setView("servers")}>
+          Servers
+        </button>
+      </div>
+      {view === "servers" ? (
+        <div className="tree">
+          <Servers
+            folder={folder}
+            servers={servers}
+            chatOpen={chatOpen}
+            mcpOff={mcpOff}
+            onToggle={onToggleServer}
+            onAction={onServerAction}
+            onChanged={onServersChanged}
+          />
+        </div>
+      ) : (
+      <>
       <div className="side-head">
         <span className="label" title="Your Marv folder">
           {rootName}
@@ -197,6 +233,8 @@ export function Sidebar({
         {rows("", 0)}
         {error && <p className="notice error" style={{ padding: "6px 12px" }}>{error}</p>}
       </div>
+      </>
+      )}
       <div className="chats">
         <div className="section-title">
           <span>chats · {folder || rootName}</span>
