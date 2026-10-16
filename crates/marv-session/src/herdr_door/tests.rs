@@ -111,6 +111,16 @@ async fn reads_run_without_asking_and_come_back_fenced_and_tainting() {
 }
 
 #[tokio::test]
+async fn a_read_of_a_pane_herdr_doesnt_have_fails_with_its_code_and_asks_no_one() {
+    let r = rig("read-gone", 4, Decision::No);
+    let out = r.run(json!({"action": "read", "pane": "w1:p9"})).await;
+    assert!(out.result.is_error, "{}", out.result.output);
+    assert!(out.result.output.contains("herdr pane read: pane_not_found"), "{}", out.result.output);
+    assert!(!out.result.output.contains("not found"), "Herdr's own message stays out: {}", out.result.output);
+    assert!(r.approver.asked().is_empty());
+}
+
+#[tokio::test]
 async fn light_actions_ask_with_the_door_and_may_be_remembered_except_in_a_turn_another_agent_started() {
     let r = rig("light", 4, Decision::Yes);
     r.run(json!({"action": "focus", "target": "w1:t1"})).await;

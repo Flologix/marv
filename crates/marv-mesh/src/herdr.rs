@@ -374,11 +374,14 @@ impl HerdrAdapter {
     }
 
     /// Runs `herdr <args>` for a command that answers in plain text (`pane read`, #138): its stdout, trailing blank
-    /// space trimmed and control characters but newlines and tabs dropped. A failure is still Herdr's JSON error, named as in [`Self::run`].
+    /// space trimmed and control characters but newlines and tabs dropped. An answer that is Herdr's JSON error is
+    /// named as in [`Self::run`].
     async fn run_text(&self, args: &[&str]) -> crate::Result<String> {
         let (what, output) = self.exec(args).await?;
+        // The whole answer being Herdr's error document is an error whatever the exit status; pane text that merely
+        // contains JSON isn't (from_slice reads all of stdout or nothing).
+        failed(&what, &serde_json::from_slice(&output.stdout).unwrap_or(Value::Null))?;
         if !output.status.success() {
-            failed(&what, &serde_json::from_slice(&output.stdout).unwrap_or(Value::Null))?;
             return Err(MeshError::Io(format!("{what} failed ({})", output.status)));
         }
         let text = String::from_utf8_lossy(&output.stdout);
@@ -950,7 +953,7 @@ mod tests {
                 "#!/bin/sh\n[ \"$1\" = --ready ] && exit 0\necho \"$@\" >> '{log}'\ncase \"$1 $2\" in\n\
                  'agent list') printf '%s\\n' '{agents}';;\n\
                  'pane get') case \"$3\" in\n{gets}\n*) printf '%s\\n' '{{\"error\":{{\"code\":\"pane_not_found\",\"message\":\"pane $3 not found\"}}}}'; exit 1;;\nesac;;\n\
-                 'pane read') case \"$3\" in w1:p9) printf '%s\\n' '{{\"error\":{{\"code\":\"pane_not_found\",\"message\":\"pane w1:p9 not found\"}}}}'; exit 1;; *) printf 'line1\\n\\033[2Jline2\\n\\n';; esac;;\n\
+                 'pane read') case \"$3\" in w1:p9) printf '%s\\n' '{{\"error\":{{\"code\":\"pane_not_found\",\"message\":\"pane w1:p9 not found\"}}}}'; exit 1;; w1:p8) printf '%s\\n' '{{\"error\":{{\"code\":\"pane_not_found\",\"message\":\"pane w1:p8 not found\"}}}}';; w1:p7) printf 'see {{\"error\":{{\"code\":\"x\"}}}}\\n';; *) printf 'line1\\n\\033[2Jline2\\n\\n';; esac;;\n\
                  *) printf '%s\\n' '{{\"result\":{{}}}}';;\nesac\n",
                 log = log.display(),
                 gets = panes.iter().map(get).collect::<Vec<_>>().join("\n"),
@@ -1115,6 +1118,9 @@ mod tests {
         assert!(fake.log().contains("pane read w1:p3 --source recent-unwrapped --lines 5 --format text"));
         let err = adapter.read("w1:p9", 5).await.unwrap_err();
         assert_eq!(err.to_string(), "herdr pane read: pane_not_found");
+        // Herdr's error document is an error even with exit 0; pane text that only contains one is text.
+        assert_eq!(adapter.read("w1:p8", 5).await.unwrap_err().to_string(), "herdr pane read: pane_not_found");
+        assert_eq!(adapter.read("w1:p7", 5).await.unwrap(), r#"see {"error":{"code":"x"}}"#);
     }
 
     /// #123: a model sent `{"prompt": …}` and the pane got the JSON typed in. A body that isn't text is refused, with
