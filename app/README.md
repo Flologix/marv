@@ -64,7 +64,7 @@ It builds the release binary into `~/.local/bin/marv-desktop`, and adds an icon 
 
 `setsid -f marv-desktop .` gives your terminal back. In the app:
 - click a folder to work there;
-- **↑** (next to **+**) makes the Marv folder's parent the Marv folder;
+- double-click a folder to go into it, and **↑** (next to **+**) to come back out (like a file explorer);
 - **⇄** picks any folder.
 
 Your home folder and anything above it are refused.

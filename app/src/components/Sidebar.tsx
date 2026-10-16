@@ -21,6 +21,7 @@ export function Sidebar({
   onChatsChanged,
   onChangeRoot,
   onRootUp,
+  onEnter,
 }: {
   rootName: string;
   folder: string;
@@ -32,6 +33,7 @@ export function Sidebar({
   onChatsChanged: () => void;
   onChangeRoot: () => void;
   onRootUp: () => void;
+  onEnter: (rel: string) => void;
 }) {
   const [children, setChildren] = useState<Record<string, Entry[]>>({});
   const [open, setOpen] = useState<Set<string>>(new Set([""]));
@@ -142,8 +144,9 @@ export function Sidebar({
           key={rel}
           className={`row${folder === rel ? " selected" : ""}`}
           style={pad}
+          title="Click to work here · double-click to open"
           onClick={() => onFolder(rel)}
-          onDoubleClick={() => toggle(rel)}
+          onDoubleClick={() => onEnter(rel)}
         >
           <span
             className="twisty"
@@ -179,7 +182,7 @@ export function Sidebar({
         <span className="label" title="Your Marv folder">
           {rootName}
         </span>
-        <button className="icon-btn" title="Up a level: make the parent folder your Marv folder" onClick={onRootUp}>
+        <button className="icon-btn" title="Up a level" onClick={onRootUp}>
           ↑
         </button>
         <button className="icon-btn" title="New folder" onClick={() => setEditing({ mode: "new", parent: "" })}>

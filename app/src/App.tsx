@@ -116,6 +116,17 @@ function Desktop() {
     }
   }
 
+  // Double-click: into that folder.
+  async function enter(rel: string) {
+    try {
+      setInfo(await desktop.enterFolder(rel));
+      setFolder("");
+      setChatId(null);
+    } catch (e) {
+      void message(String(e), { title: "Marv", kind: "info" });
+    }
+  }
+
   // ↑: the Marv folder's parent becomes the Marv folder; the selected folder stays selected.
   async function rootUp() {
     try {
@@ -147,6 +158,7 @@ function Desktop() {
         key={info.root}
         rootName={rootName}
         onRootUp={() => void rootUp()}
+        onEnter={(rel) => void enter(rel)}
         folder={folder}
         onFolder={selectFolder}
         chats={chats}

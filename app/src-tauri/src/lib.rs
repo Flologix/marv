@@ -33,6 +33,25 @@ impl Desktop {
         self.store.settings().root.ok_or_else(|| "Pick your Marv folder first.".to_string())
     }
 
+    /// The chats, with any saved relative to the root (before folders were full paths) converted and saved back.
+    fn chats(&self) -> Vec<Chat> {
+        let mut chats = self.store.chats();
+        if let Ok(root) = self.root()
+            && chats.iter().any(|c| !c.folder.starts_with('/'))
+        {
+            for chat in chats.iter_mut().filter(|c| !c.folder.starts_with('/')) {
+                chat.folder = root.join(&chat.folder).to_string_lossy().trim_end_matches('/').to_string();
+            }
+            let _ = self.store.save_chats(&chats);
+        }
+        chats
+    }
+
+    /// `rel` (from the page, relative to the top folder) as a full path.
+    fn full(&self, rel: &str) -> Result<String, String> {
+        Ok(tree::resolve(&self.root()?, rel)?.to_string_lossy().trim_end_matches('/').to_string())
+    }
+
     fn live(&self) -> std::sync::MutexGuard<'_, HashMap<String, mpsc::UnboundedSender<ClientMessage>>> {
         self.live.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -103,6 +122,13 @@ fn set_root(desktop: State<'_, Desktop>, path: String) -> Result<AppInfo, String
     save_root(&desktop, check_root(&path)?)
 }
 
+/// Going into a folder (double-click in the tree): it becomes the top folder.
+#[tauri::command]
+fn enter_folder(desktop: State<'_, Desktop>, rel: String) -> Result<AppInfo, String> {
+    let dir = tree::resolve(&desktop.root()?, &rel)?;
+    save_root(&desktop, check_root(&dir.to_string_lossy())?)
+}
+
 /// The Marv folder's parent becomes the Marv folder (the tree's ↑), where that's allowed.
 #[tauri::command]
 fn root_up(desktop: State<'_, Desktop>) -> Result<AppInfo, String> {
@@ -155,15 +181,15 @@ fn create_folder(desktop: State<'_, Desktop>, parent: String, name: String) -> R
 
 #[tauri::command]
 fn rename_entry(desktop: State<'_, Desktop>, rel: String, name: String) -> Result<String, String> {
-    let root = desktop.root()?;
-    let renamed = tree::rename(&root, &rel, &name)?;
+    let (from, mut chats) = (desktop.full(&rel)?, desktop.chats());
+    let renamed = tree::rename(&desktop.root()?, &rel, &name)?;
+    let to = desktop.full(&renamed)?;
     // Chats in the folder (or below it) follow it.
-    let mut chats = desktop.store.chats();
     for chat in &mut chats {
-        if chat.folder == rel {
-            chat.folder = renamed.clone();
-        } else if let Some(below) = chat.folder.strip_prefix(&format!("{rel}/")) {
-            chat.folder = format!("{renamed}/{below}");
+        if chat.folder == from {
+            chat.folder = to.clone();
+        } else if let Some(below) = chat.folder.strip_prefix(&format!("{from}/")) {
+            chat.folder = format!("{to}/{below}");
         }
     }
     desktop.store.save_chats(&chats)?;
@@ -178,8 +204,9 @@ fn trash_entry(desktop: State<'_, Desktop>, rel: String) -> Result<(), String> {
 /// The chats, newest first: all of them, or one folder's.
 #[tauri::command]
 fn list_chats(desktop: State<'_, Desktop>, folder: Option<String>) -> Vec<Chat> {
+    let folder = folder.and_then(|f| desktop.full(&f).ok());
     let mut chats: Vec<Chat> =
-        desktop.store.chats().into_iter().filter(|c| folder.as_ref().is_none_or(|f| &c.folder == f)).collect();
+        desktop.chats().into_iter().filter(|c| folder.as_ref().is_none_or(|f| &c.folder == f)).collect();
     chats.sort_by_key(|c| std::cmp::Reverse(c.created));
     chats
 }
@@ -193,16 +220,18 @@ fn rename_chat(desktop: State<'_, Desktop>, id: String, title: String) -> Result
 #[tauri::command]
 fn delete_chat(desktop: State<'_, Desktop>, id: String) -> Result<(), String> {
     desktop.live().remove(&id);
-    let chats: Vec<Chat> = desktop.store.chats().into_iter().filter(|c| c.id != id).collect();
+    let chats: Vec<Chat> = desktop.chats().into_iter().filter(|c| c.id != id).collect();
     desktop.store.save_chats(&chats)
 }
 
-/// A new chat in `folder` (relative to the root), titled from its first message.
+/// A new chat in `folder` (relative to the top folder), titled from its first message.
 #[tauri::command]
 fn create_chat(desktop: State<'_, Desktop>, folder: String, title: String) -> Result<Chat, String> {
-    if !tree::resolve(&desktop.root()?, &folder)?.is_dir() {
+    let full = desktop.full(&folder)?;
+    if !std::path::Path::new(&full).is_dir() {
         return Err(format!("{folder} isn't a folder."));
     }
+    let folder = full;
     let chat = Chat {
         id: uuid::Uuid::new_v4().to_string(),
         folder,
@@ -210,7 +239,7 @@ fn create_chat(desktop: State<'_, Desktop>, folder: String, title: String) -> Re
         session_id: None,
         created: SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
     };
-    let mut chats = desktop.store.chats();
+    let mut chats = desktop.chats();
     chats.push(chat.clone());
     desktop.store.save_chats(&chats)?;
     Ok(chat)
@@ -227,7 +256,6 @@ fn open_chat(
     yolo: bool,
     on_event: Channel<Value>,
 ) -> Result<Chat, String> {
-    let root = desktop.root()?;
     // A local (Ollama) model needs no key.
     let api_key = match desktop.api_key() {
         Some(key) => key,
@@ -237,11 +265,9 @@ fn open_chat(
     if !is_model_id(&model) {
         return Err(format!("\"{model}\" isn't an OpenRouter model id."));
     }
-    let chat = desktop.store.chats().into_iter().find(|c| c.id == id).ok_or("That chat is gone.")?;
-    let dir = tree::resolve(&root, &chat.folder)?;
-    if !dir.is_dir() {
-        return Err(format!("The folder {} is gone.", if chat.folder.is_empty() { "of this chat" } else { &chat.folder }));
-    }
+    let chat = desktop.chats().into_iter().find(|c| c.id == id).ok_or("That chat is gone.")?;
+    // Wherever the top folder is now: the chat runs in its own folder (still never home or above).
+    let dir = check_root(&chat.folder).map_err(|e| format!("This chat's folder: {e}"))?;
     let spec = ChatSpec {
         root: dir,
         // The CLI's own folder (~/.marv): the same memory, MCP servers and saved sessions as `marv`.
@@ -315,6 +341,7 @@ pub fn run() {
             app_info,
             set_root,
             root_up,
+            enter_folder,
             take_launch,
             set_api_key,
             list_dir,

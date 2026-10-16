@@ -17,7 +17,7 @@ export interface Entry {
 
 export interface ChatRecord {
   id: string;
-  /** Relative to the root; "" is the root. */
+  /** The full path of the folder the chat runs in. */
   folder: string;
   title: string;
   sessionId?: string | null;
@@ -42,6 +42,8 @@ export const desktop = {
   info: () => invoke<AppInfo>("app_info"),
   setRoot: (path: string) => invoke<AppInfo>("set_root", { path }),
   rootUp: () => invoke<AppInfo>("root_up"),
+  /** Go into a folder: it becomes the tree's top folder. */
+  enterFolder: (rel: string) => invoke<AppInfo>("enter_folder", { rel }),
   /** `marv-desktop <dir>`: where to open, once. */
   takeLaunch: () => invoke<{ info: AppInfo; folder: string } | null>("take_launch"),
   setApiKey: (key: string) => invoke<AppInfo>("set_api_key", { key }),

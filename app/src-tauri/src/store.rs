@@ -19,7 +19,8 @@ pub struct Settings {
 #[serde(rename_all = "camelCase")]
 pub struct Chat {
     pub id: String,
-    /// Relative to the root; "" is the root itself.
+    /// The folder Marv works in, as a full path: the tree's top folder can move (↑, going into a folder) without
+    /// losing a chat's place. (Chats saved before were relative to the root: [`crate::Desktop::chats`] converts them.)
     pub folder: String,
     pub title: String,
     /// Marv's saved session, once the chat has one (`ready`'s `sessionId`).
