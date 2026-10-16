@@ -41,6 +41,9 @@ export interface Connection {
 export const desktop = {
   info: () => invoke<AppInfo>("app_info"),
   setRoot: (path: string) => invoke<AppInfo>("set_root", { path }),
+  rootUp: () => invoke<AppInfo>("root_up"),
+  /** `marv-desktop <dir>`: where to open, once. */
+  takeLaunch: () => invoke<{ info: AppInfo; folder: string } | null>("take_launch"),
   setApiKey: (key: string) => invoke<AppInfo>("set_api_key", { key }),
   listDir: (rel: string) => invoke<Entry[]>("list_dir", { rel }),
   createFolder: (parent: string, name: string) => invoke<string>("create_folder", { parent, name }),

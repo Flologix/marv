@@ -1,4 +1,4 @@
-import { open } from "@tauri-apps/plugin-dialog";
+import { message, open } from "@tauri-apps/plugin-dialog";
 import { useCallback, useEffect, useState } from "react";
 import { ChatView } from "./components/ChatView";
 import { Onboarding } from "./components/Onboarding";
@@ -48,8 +48,20 @@ function Desktop() {
   const { settings, setSettings, models } = useSettings();
   const chat = useChat(chatId, settings);
 
+  // Opened as `marv-desktop <dir>`: that folder; else where the last session left off.
   useEffect(() => {
-    desktop.info().then(setInfo);
+    desktop.takeLaunch().then(
+      (launch) => {
+        if (!launch) return desktop.info().then(setInfo);
+        setInfo(launch.info);
+        setFolder(launch.folder);
+        setChatId(null);
+      },
+      (e) => {
+        void message(String(e), { title: "Marv", kind: "error" });
+        desktop.info().then(setInfo);
+      },
+    );
   }, []);
 
   useEffect(() => keep("marv-folder", folder), [folder]);
@@ -100,7 +112,19 @@ function Desktop() {
       setFolder("");
       setChatId(null);
     } catch (e) {
-      alert(String(e));
+      void message(String(e), { title: "Marv", kind: "error" });
+    }
+  }
+
+  // ↑: the Marv folder's parent becomes the Marv folder; the selected folder stays selected.
+  async function rootUp() {
+    try {
+      const was = rootName;
+      setInfo(await desktop.rootUp());
+      setFolder(folder ? `${was}/${folder}` : was);
+      setChatId(null);
+    } catch (e) {
+      void message(String(e), { title: "Marv", kind: "info" });
     }
   }
 
@@ -120,7 +144,9 @@ function Desktop() {
   return (
     <div className={`shell${collapsed ? " collapsed" : ""}`}>
       <Sidebar
+        key={info.root}
         rootName={rootName}
+        onRootUp={() => void rootUp()}
         folder={folder}
         onFolder={selectFolder}
         chats={chats}

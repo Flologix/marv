@@ -24,6 +24,8 @@ struct Desktop {
     store: Store,
     /// Open chats: where their page messages go. Dropping one ends the chat (its session closes).
     live: Mutex<HashMap<String, mpsc::UnboundedSender<ClientMessage>>>,
+    /// The folder named on the command line (`marv-desktop <dir>`), until the page takes it.
+    launch: Mutex<Option<String>>,
 }
 
 impl Desktop {
@@ -73,23 +75,64 @@ fn app_info(desktop: State<'_, Desktop>) -> AppInfo {
     info(&desktop)
 }
 
-/// The root folder: any folder inside the home folder. Not the home folder or above it, since Marv changes files
+/// A root folder: any folder inside the home folder. Not the home folder or above it, since Marv changes files
 /// below its folder without asking (dotfiles included, there).
-#[tauri::command]
-fn set_root(desktop: State<'_, Desktop>, path: String) -> Result<AppInfo, String> {
-    let root = std::fs::canonicalize(&path).map_err(|e| format!("Couldn't open {path}: {e}"))?;
+fn check_root(path: &str) -> Result<PathBuf, String> {
+    let root = std::fs::canonicalize(path).map_err(|e| format!("Couldn't open {path}: {e}"))?;
     if !root.is_dir() {
         return Err(format!("{path} isn't a folder."));
     }
     if marv_session::paths::home_or_above(&root, &marv_session::paths::home_dir()) {
-        return Err(
-            "Pick a folder inside your home folder (like ~/Marv or ~/Projects), not your home folder or above it: Marv changes files in its folder without asking.".into(),
-        );
+        return Err(format!(
+            "{} is your home folder or above it: Marv changes files in its folder without asking, so pick a folder inside your home folder (like ~/Projects).",
+            root.display()
+        ));
     }
+    Ok(root)
+}
+
+fn save_root(desktop: &Desktop, root: PathBuf) -> Result<AppInfo, String> {
     let mut settings = desktop.store.settings();
     settings.root = Some(root);
     desktop.store.save_settings(&settings)?;
-    Ok(info(&desktop))
+    Ok(info(desktop))
+}
+
+#[tauri::command]
+fn set_root(desktop: State<'_, Desktop>, path: String) -> Result<AppInfo, String> {
+    save_root(&desktop, check_root(&path)?)
+}
+
+/// The Marv folder's parent becomes the Marv folder (the tree's ↑), where that's allowed.
+#[tauri::command]
+fn root_up(desktop: State<'_, Desktop>) -> Result<AppInfo, String> {
+    let root = desktop.root()?;
+    let parent = root.parent().ok_or("There's nothing above this folder.")?;
+    save_root(&desktop, check_root(&parent.to_string_lossy())?)
+}
+
+#[derive(Serialize)]
+struct Launch {
+    info: AppInfo,
+    /// The folder to select, relative to the root.
+    folder: String,
+}
+
+/// `marv-desktop <dir>`, once: a folder inside the Marv folder is selected; any other becomes the Marv folder.
+#[tauri::command]
+fn take_launch(desktop: State<'_, Desktop>) -> Result<Option<Launch>, String> {
+    let Some(path) = desktop.launch.lock().unwrap_or_else(|e| e.into_inner()).take() else { return Ok(None) };
+    let dir = std::fs::canonicalize(&path).map_err(|e| format!("Couldn't open {path}: {e}"))?;
+    if !dir.is_dir() {
+        return Err(format!("{path} isn't a folder."));
+    }
+    if let Some(root) = desktop.store.settings().root
+        && let Ok(rel) = dir.strip_prefix(&root)
+    {
+        return Ok(Some(Launch { info: info(&desktop), folder: rel.to_string_lossy().into_owned() }));
+    }
+    let info = save_root(&desktop, check_root(&path)?)?;
+    Ok(Some(Launch { info, folder: String::new() }))
 }
 
 #[tauri::command]
@@ -254,12 +297,20 @@ pub fn run() {
         .setup(|app| {
             let config = app.path().app_config_dir()?;
             let data = app.path().app_data_dir()?;
-            app.manage(Desktop { store: Store::new(config, data), live: Mutex::new(HashMap::new()) });
+            // The first argument that isn't a flag: `marv-desktop .`, `marv-desktop ~/Projects/site`.
+            let launch = std::env::args().skip(1).find(|a| !a.starts_with('-'));
+            app.manage(Desktop {
+                store: Store::new(config, data),
+                live: Mutex::new(HashMap::new()),
+                launch: Mutex::new(launch),
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             app_info,
             set_root,
+            root_up,
+            take_launch,
             set_api_key,
             list_dir,
             create_folder,

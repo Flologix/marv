@@ -58,6 +58,17 @@ app/install-desktop.sh --uninstall
 
 It builds the release binary into `~/.local/bin/marv-desktop`, and adds an icon and a launcher entry. Open **Marv** from the app launcher (Omarchy: Super+Space), or run `marv-desktop`. Run it again after pulling changes to update.
 
+**Opening a specific folder:** `marv-desktop <dir>`, for example `marv-desktop .` or `marv-desktop ~/Projects/site`.
+- A folder inside your Marv folder is selected in the tree.
+- Any other folder becomes the Marv folder.
+
+`setsid -f marv-desktop .` gives your terminal back. In the app:
+- click a folder to work there;
+- **↑** (next to **+**) makes the Marv folder's parent the Marv folder;
+- **⇄** picks any folder.
+
+Your home folder and anything above it are refused.
+
 ## Develop
 
 You need Rust, Node and bubblewrap. On Linux you also need WebKitGTK 4.1 (`webkit2gtk-4.1`).

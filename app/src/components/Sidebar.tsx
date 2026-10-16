@@ -20,6 +20,7 @@ export function Sidebar({
   onNewChat,
   onChatsChanged,
   onChangeRoot,
+  onRootUp,
 }: {
   rootName: string;
   folder: string;
@@ -30,6 +31,7 @@ export function Sidebar({
   onNewChat: () => void;
   onChatsChanged: () => void;
   onChangeRoot: () => void;
+  onRootUp: () => void;
 }) {
   const [children, setChildren] = useState<Record<string, Entry[]>>({});
   const [open, setOpen] = useState<Set<string>>(new Set([""]));
@@ -177,6 +179,9 @@ export function Sidebar({
         <span className="label" title="Your Marv folder">
           {rootName}
         </span>
+        <button className="icon-btn" title="Up a level: make the parent folder your Marv folder" onClick={onRootUp}>
+          ↑
+        </button>
         <button className="icon-btn" title="New folder" onClick={() => setEditing({ mode: "new", parent: "" })}>
           +
         </button>
