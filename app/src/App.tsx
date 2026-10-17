@@ -1,8 +1,10 @@
 import { message, open } from "@tauri-apps/plugin-dialog";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { ChatView } from "./components/ChatView";
 import { Onboarding } from "./components/Onboarding";
+import { Gallery } from "./components/Gallery";
 import { Martian } from "./components/Martian";
+import { SpacesBar } from "./components/SpacesBar";
 import { Sidebar } from "./components/Sidebar";
 import { type AppInfo, type ChatRecord, type ChatSettings, type Model, desktop, isDesktop, loadModels } from "./lib/backend";
 import { useChat } from "./lib/chat";
@@ -47,7 +49,19 @@ function Desktop() {
   const [collapsed, setCollapsed] = useState(false);
   const { settings, setSettings, models } = useSettings();
   const [reload, setReload] = useState(0);
-  const chat = useChat(chatId, settings, reload);
+  const [setup, setSetup] = useState(false);
+  const [gallery, setGallery] = useState(false);
+  const [installed, setInstalled] = useState<string[]>([]);
+  // The active space's switched-off apps go with every chat in it.
+  const appsOff = info?.spaces.find((s) => s.id === info.active)?.appsOff ?? [];
+  const appsOffKey = appsOff.join(",");
+  const chatSettings = useMemo(() => ({ ...settings, mcpOff: appsOffKey ? appsOffKey.split(",") : [] }), [settings, appsOffKey]);
+  const chat = useChat(chatId, chatSettings, reload);
+
+  // First run (or a step still missing): the onboarding, through to connecting apps.
+  useEffect(() => {
+    if (info && (!info.root || !(info.hasKey || info.provider === "ollama"))) setSetup(true);
+  }, [info]);
 
   // Opened as `marv-desktop <dir>`: that folder; else where the last session left off.
   useEffect(() => {
@@ -87,8 +101,23 @@ function Desktop() {
   }, []);
 
   if (!info) return null;
-  if (!info.root || !info.hasKey) return <Onboarding info={info} onDone={setInfo} />;
+  if (setup)
+    return (
+      <Onboarding info={info} onInfo={setInfo} onModel={(model) => setSettings({ ...settings, model })} onFinish={() => setSetup(false)} />
+    );
   const rootName = info.rootName ?? "marv";
+
+  // Another space: its own folder, chats and apps.
+  function toSpace(next: AppInfo) {
+    setInfo(next);
+    setFolder("");
+    setChatId(null);
+  }
+
+  function openGallery() {
+    desktop.mcpServers(folder).then((s) => setInstalled(s.map((e) => e.name)), () => {});
+    setGallery(true);
+  }
 
   function selectFolder(rel: string) {
     if (rel !== folder) setChatId(null);
@@ -154,6 +183,8 @@ function Desktop() {
   );
 
   return (
+    <div className="frame">
+    <SpacesBar info={info} onInfo={toSpace} />
     <div className={`shell${collapsed ? " collapsed" : ""}`}>
       <Sidebar
         key={info.root}
@@ -162,10 +193,11 @@ function Desktop() {
         onEnter={(rel) => void enter(rel)}
         servers={chat.servers}
         chatOpen={chatId !== null && chat.status === "ready"}
-        mcpOff={settings.mcpOff}
+        mcpOff={chatSettings.mcpOff}
         onToggleServer={(name, on) =>
-          setSettings({ ...settings, mcpOff: on ? settings.mcpOff.filter((n) => n !== name) : [...settings.mcpOff, name] })
+          void desktop.setAppsOff(on ? appsOff.filter((n) => n !== name) : [...appsOff, name]).then(setInfo)
         }
+        onBrowseApps={openGallery}
         onServerAction={chat.mcp}
         onServersChanged={() => setReload((r) => r + 1)}
         folder={folder}
@@ -181,9 +213,10 @@ function Desktop() {
         key={chatId ?? `draft:${folder}`}
         chat={chat}
         crumbs={crumbs}
-        settings={settings}
+        settings={chatSettings}
         onSettings={setSettings}
         models={models}
+        hasKey={info.hasKey}
         onSend={(text) => void send(text)}
         left={
           <button className="icon-btn" title={collapsed ? "Show folders (ctrl+b)" : "Hide folders (ctrl+b)"} onClick={() => setCollapsed((c) => !c)}>
@@ -205,6 +238,27 @@ function Desktop() {
           </section>
         }
       />
+    </div>
+    {gallery && (
+      <div className="modal" onClick={() => setGallery(false)}>
+        <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+          <div className="modal-head">
+            <h2>Apps</h2>
+            <button className="icon-btn" title="Close" onClick={() => setGallery(false)}>
+              ×
+            </button>
+          </div>
+          <p className="help">Connected apps are on in every space; switch one off in a space from Servers.</p>
+          <Gallery
+            installed={installed}
+            onInstalled={() => {
+              openGallery();
+              setReload((r) => r + 1);
+            }}
+          />
+        </div>
+      </div>
+    )}
     </div>
   );
 }

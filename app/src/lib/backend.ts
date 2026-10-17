@@ -4,10 +4,27 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 
 export const isDesktop = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
+export interface Space {
+  id: string;
+  name: string;
+  root: string;
+  /** Apps (MCP servers) switched off in this space. */
+  appsOff: string[];
+}
+
 export interface AppInfo {
   root: string | null;
   rootName: string | null;
   hasKey: boolean;
+  /** "openrouter" or "ollama", once chosen at onboarding. */
+  provider: string | null;
+  spaces: Space[];
+  active: string | null;
+}
+
+export interface LocalModel {
+  id: string;
+  tools: boolean;
 }
 
 export interface Entry {
@@ -70,11 +87,27 @@ export const desktop = {
   renameChat: (id: string, title: string) => invoke<void>("rename_chat", { id, title }),
   deleteChat: (id: string) => invoke<void>("delete_chat", { id }),
   mcpServers: (folder: string) => invoke<ServerEntry[]>("mcp_servers", { folder }),
-  mcpLookup: (source: string, name?: string) => invoke<Lookup>("mcp_lookup", { source, name }),
-  mcpInstall: (name: string) => invoke<void>("mcp_install", { name }),
+  mcpLookup: (source: string, name?: string, vars?: string[], headers?: Record<string, string>) =>
+    invoke<Lookup>("mcp_lookup", { source, name, vars, headers }),
+  /** Writes the looked-up server, its `${VAR}`s filled from `values`. */
+  mcpInstall: (name: string, values?: Record<string, string>) => invoke<void>("mcp_install", { name, values }),
+  createSpace: (name: string, path: string) => invoke<AppInfo>("create_space", { name, path }),
+  switchSpace: (id: string) => invoke<AppInfo>("switch_space", { id }),
+  renameSpace: (id: string, name: string) => invoke<AppInfo>("rename_space", { id, name }),
+  removeSpace: (id: string) => invoke<AppInfo>("remove_space", { id }),
+  setAppsOff: (off: string[]) => invoke<AppInfo>("set_apps_off", { off }),
+  setProvider: (provider: "openrouter" | "ollama") => invoke<AppInfo>("set_provider", { provider }),
+  localModels: () => invoke<LocalModel[]>("local_models"),
+  pullModel: (name: string, onProgress: (line: string) => void) => {
+    const channel = new Channel<string>();
+    channel.onmessage = onProgress;
+    return invoke<void>("pull_model", { name, onProgress: channel });
+  },
   mcpRemove: (name: string) => invoke<void>("mcp_remove", { name }),
   /** Voxtype dictation on or off: it types into the focused field. */
   dictate: () => invoke<void>("dictate"),
+  /** An https link, in the person's browser. */
+  openUrl: (url: string) => invoke<void>("open_url", { url }),
 };
 
 /** Opens a chat's session; `onEvent` gets its events until `close()`. */
@@ -120,13 +153,13 @@ export interface Model {
 }
 
 /** The models pulled into the local Ollama, as `ollama/<name>`; none when it isn't running. */
-async function localModels(): Promise<Model[]> {
+/** The models in the local Ollama (asked by the app, not the page: no browser rules in the way). */
+export async function localModels(): Promise<Model[]> {
+  if (!isDesktop) return [];
   try {
-    const response = await fetch("http://127.0.0.1:11434/api/tags", { signal: AbortSignal.timeout(1500) });
-    const { models } = await response.json();
-    return (models ?? []).map((m: { name: string; size: number }) => ({
-      id: `ollama/${m.name}`,
-      name: `${m.name} · local, ${(m.size / 1e9).toFixed(1)} GB`,
+    return (await desktop.localModels()).map((m) => ({
+      id: m.id,
+      name: m.tools ? m.id.slice(7) : `${m.id.slice(7)} · no tool calls`,
       context: 0,
       input: 0,
       output: 0,
@@ -145,7 +178,7 @@ export async function loadModels(): Promise<Model[]> {
   return [...local, ...remote];
 }
 
-async function remoteModels(): Promise<Model[]> {
+export async function remoteModels(): Promise<Model[]> {
   try {
     const cached = JSON.parse(localStorage.getItem(MODELS_KEY) ?? "null");
     if (cached && Date.now() - cached.at < 3_600_000) return cached.models;

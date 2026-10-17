@@ -1,47 +1,30 @@
-import { useState } from "react";
 import type { ChatSettings, Model } from "../lib/backend";
-import { tokens } from "../lib/format";
+import { ModelPicker } from "./ModelPicker";
 
 export function Settings({
   settings,
   models,
+  hasKey = true,
   onChange,
   onClose,
 }: {
   settings: ChatSettings;
   models: Model[];
+  hasKey?: boolean;
   onChange: (s: ChatSettings) => void;
   onClose: () => void;
 }) {
-  const [model, setModel] = useState(settings.model);
-  const info = models.find((m) => m.id === model);
-  const commit = () => model && model !== settings.model && onChange({ ...settings, model });
   return (
     <div className="popover" role="dialog" aria-label="Settings">
-      <label className="field">
+      <div className="field">
         <span>Model</span>
-        <input
-          className="mono"
-          list="models"
-          value={model}
-          spellCheck={false}
-          onChange={(e) => setModel(e.target.value.trim())}
-          onBlur={commit}
-          onKeyDown={(e) => e.key === "Enter" && commit()}
+        <ModelPicker
+          model={settings.model}
+          remote={models.filter((m) => !m.local)}
+          hasKey={hasKey}
+          onPick={(model) => model !== settings.model && onChange({ ...settings, model })}
         />
-        <datalist id="models">
-          {models.map((m) => (
-            <option key={m.id} value={m.id}>{m.local ? m.name : `${m.name} · $${m.input.toFixed(2)} / $${m.output.toFixed(2)}`}</option>
-          ))}
-        </datalist>
-        <span className="help">
-          {info?.local
-            ? "Runs on this machine with Ollama: free, and nothing leaves your computer. The first message loads it into memory."
-            : info
-            ? `${tokens(info.context)} context · $${info.input.toFixed(2)} in, $${info.output.toFixed(2)} out per million tokens`
-            : "Any OpenRouter model that can call tools, or ollama/<name> for a local one."}
-        </span>
-      </label>
+      </div>
       <label className="field">
         <span>Steps before asking to continue</span>
         <input

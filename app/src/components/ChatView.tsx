@@ -16,6 +16,7 @@ export function ChatView({
   settings,
   onSettings,
   models,
+  hasKey,
   onSend,
   left,
 }: {
@@ -25,6 +26,7 @@ export function ChatView({
   settings: ChatSettings;
   onSettings: (s: ChatSettings) => void;
   models: Model[];
+  hasKey?: boolean;
   onSend: (text: string) => void;
   left?: ReactNode;
 }) {
@@ -85,7 +87,7 @@ export function ChatView({
         <button className="chip" aria-expanded={open} onClick={() => setOpen((o) => !o)}>
           {settings.model}
         </button>
-        {open && <Settings settings={settings} models={models} onChange={onSettings} onClose={() => setOpen(false)} />}
+        {open && <Settings settings={settings} models={models} hasKey={hasKey} onChange={onSettings} onClose={() => setOpen(false)} />}
       </header>
 
       <main className="scroll">

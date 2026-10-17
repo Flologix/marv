@@ -9,10 +9,65 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
+    /// The active space's top folder (kept equal to it: what the tree and chats use).
     pub root: Option<PathBuf>,
+    /// Spaces: each a top folder, its own chats (by folder) and the apps (MCP servers) switched off in it.
+    #[serde(default)]
+    pub spaces: Vec<Space>,
+    #[serde(default)]
+    pub active: Option<String>,
+    /// "openrouter" or "ollama", as chosen at onboarding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     /// The OpenRouter key, when the user pasted one here (else `OPENROUTER_API_KEY` or `marv`'s own config).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Space {
+    pub id: String,
+    pub name: String,
+    pub root: PathBuf,
+    /// MCP servers switched off in this space, by name (a new server is on everywhere).
+    #[serde(default)]
+    pub apps_off: Vec<String>,
+}
+
+impl Settings {
+    /// Settings from before spaces: the root becomes the first space.
+    fn migrate(&mut self) {
+        if self.spaces.is_empty()
+            && let Some(root) = &self.root
+        {
+            let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "Projects".into());
+            self.spaces.push(Space { id: "main".into(), name, root: root.clone(), apps_off: Vec::new() });
+            self.active = Some("main".into());
+        }
+    }
+
+    pub fn active_space(&self) -> Option<&Space> {
+        self.spaces.iter().find(|s| Some(&s.id) == self.active.as_ref()).or(self.spaces.first())
+    }
+
+    pub fn active_space_mut(&mut self) -> Option<&mut Space> {
+        let id = self.active_space()?.id.clone();
+        self.spaces.iter_mut().find(|s| s.id == id)
+    }
+
+    /// The active space's top folder, now `root`, in both places.
+    pub fn set_root(&mut self, root: PathBuf) {
+        match self.active_space_mut() {
+            Some(space) => space.root = root.clone(),
+            None => {
+                let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "Projects".into());
+                self.spaces.push(Space { id: "main".into(), name, root: root.clone(), apps_off: Vec::new() });
+                self.active = Some("main".into());
+            }
+        }
+        self.root = Some(root);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,7 +115,13 @@ impl Store {
     }
 
     pub fn settings(&self) -> Settings {
-        read(&self.config.join("settings.json"))
+        let mut settings: Settings = read(&self.config.join("settings.json"));
+        settings.migrate();
+        // The active space wins: `root` is only its mirror.
+        if let Some(root) = settings.active_space().map(|s| s.root.clone()) {
+            settings.root = Some(root);
+        }
+        settings
     }
 
     pub fn save_settings(&self, settings: &Settings) -> Result<(), String> {
@@ -82,5 +143,22 @@ impl Store {
         let chat = chat.clone();
         self.save_chats(&chats)?;
         Ok(Some(chat))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_root_from_before_spaces_becomes_the_first_space() {
+        let mut settings = Settings { root: Some("/home/u/Projects".into()), ..Settings::default() };
+        settings.migrate();
+        assert_eq!(settings.spaces.len(), 1);
+        assert_eq!((settings.spaces[0].name.as_str(), settings.active.as_deref()), ("Projects", Some("main")));
+        // Moving the top folder moves the active space's.
+        settings.set_root("/home/u/Work".into());
+        assert_eq!(settings.active_space().unwrap().root, PathBuf::from("/home/u/Work"));
+        assert_eq!(settings.root, Some(PathBuf::from("/home/u/Work")));
     }
 }

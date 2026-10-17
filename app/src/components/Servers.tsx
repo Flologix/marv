@@ -25,6 +25,7 @@ export function Servers({
   onToggle,
   onAction,
   onChanged,
+  onBrowse,
 }: {
   folder: string;
   servers: ServerStatus[];
@@ -33,6 +34,7 @@ export function Servers({
   onToggle: (name: string, on: boolean) => void;
   onAction: (action: string, name?: string) => void;
   onChanged: () => void;
+  onBrowse: () => void;
 }) {
   const [entries, setEntries] = useState<ServerEntry[]>([]);
   const [adding, setAdding] = useState(false);
@@ -195,9 +197,14 @@ export function Servers({
           )}
         </div>
       ) : (
-        <button className="add-link" onClick={() => setAdding(true)}>
-          + add server
-        </button>
+        <div className="add-row">
+          <button className="btn" onClick={onBrowse}>
+            Browse apps
+          </button>
+          <button className="add-link" onClick={() => setAdding(true)}>
+            + other server
+          </button>
+        </div>
       )}
       {error && <p className="notice error pad">{error}</p>}
     </div>

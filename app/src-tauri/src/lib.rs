@@ -86,14 +86,22 @@ struct AppInfo {
     root: Option<String>,
     root_name: Option<String>,
     has_key: bool,
+    /// "openrouter" or "ollama", once chosen.
+    provider: Option<String>,
+    spaces: Vec<store::Space>,
+    active: Option<String>,
 }
 
 fn info(desktop: &Desktop) -> AppInfo {
-    let root = desktop.store.settings().root;
+    let settings = desktop.store.settings();
+    let root = settings.root.clone();
     AppInfo {
         root_name: root.as_ref().and_then(|r| r.file_name()).map(|n| n.to_string_lossy().into_owned()),
         root: root.map(|r| r.to_string_lossy().into_owned()),
         has_key: desktop.api_key().is_some(),
+        provider: settings.provider.clone(),
+        active: settings.active_space().map(|s| s.id.clone()),
+        spaces: settings.spaces,
     }
 }
 
@@ -120,9 +128,137 @@ fn check_root(path: &str) -> Result<PathBuf, String> {
 
 fn save_root(desktop: &Desktop, root: PathBuf) -> Result<AppInfo, String> {
     let mut settings = desktop.store.settings();
-    settings.root = Some(root);
+    settings.set_root(root);
     desktop.store.save_settings(&settings)?;
     Ok(info(desktop))
+}
+
+/// A new space on `path` (named `name`), and switch to it.
+#[tauri::command]
+fn create_space(desktop: State<'_, Desktop>, name: String, path: String) -> Result<AppInfo, String> {
+    let root = check_root(&path)?;
+    let name: String = name.trim().chars().take(40).collect();
+    let name =
+        if name.is_empty() { root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default() } else { name };
+    let mut settings = desktop.store.settings();
+    let id = uuid::Uuid::new_v4().to_string();
+    settings.spaces.push(store::Space { id: id.clone(), name, root: root.clone(), apps_off: Vec::new() });
+    settings.active = Some(id);
+    settings.root = Some(root);
+    desktop.store.save_settings(&settings)?;
+    Ok(info(&desktop))
+}
+
+#[tauri::command]
+fn switch_space(desktop: State<'_, Desktop>, id: String) -> Result<AppInfo, String> {
+    let mut settings = desktop.store.settings();
+    let root = settings.spaces.iter().find(|s| s.id == id).ok_or("That space is gone.")?.root.clone();
+    settings.active = Some(id);
+    settings.root = Some(root);
+    desktop.store.save_settings(&settings)?;
+    Ok(info(&desktop))
+}
+
+#[tauri::command]
+fn rename_space(desktop: State<'_, Desktop>, id: String, name: String) -> Result<AppInfo, String> {
+    let mut settings = desktop.store.settings();
+    let space = settings.spaces.iter_mut().find(|s| s.id == id).ok_or("That space is gone.")?;
+    let name: String = name.trim().chars().take(40).collect();
+    if !name.is_empty() {
+        space.name = name;
+    }
+    desktop.store.save_settings(&settings)?;
+    Ok(info(&desktop))
+}
+
+/// Removes a space (its folder, files and chats stay); not the last one.
+#[tauri::command]
+fn remove_space(desktop: State<'_, Desktop>, id: String) -> Result<AppInfo, String> {
+    let mut settings = desktop.store.settings();
+    if settings.spaces.len() <= 1 {
+        return Err("That's your only space.".into());
+    }
+    settings.spaces.retain(|s| s.id != id);
+    if settings.active.as_ref() == Some(&id) {
+        settings.active = settings.spaces.first().map(|s| s.id.clone());
+    }
+    desktop.store.save_settings(&settings)?;
+    Ok(info(&desktop))
+}
+
+/// The apps (MCP servers) switched off in the active space.
+#[tauri::command]
+fn set_apps_off(desktop: State<'_, Desktop>, off: Vec<String>) -> Result<AppInfo, String> {
+    let mut settings = desktop.store.settings();
+    settings.active_space_mut().ok_or("Pick a folder first.")?.apps_off = off;
+    desktop.store.save_settings(&settings)?;
+    Ok(info(&desktop))
+}
+
+/// "openrouter" or "ollama": how Marv thinks, chosen at onboarding.
+#[tauri::command]
+fn set_provider(desktop: State<'_, Desktop>, provider: String) -> Result<AppInfo, String> {
+    if provider != "openrouter" && provider != "ollama" {
+        return Err(format!("Unknown provider {provider}."));
+    }
+    let mut settings = desktop.store.settings();
+    settings.provider = Some(provider);
+    desktop.store.save_settings(&settings)?;
+    Ok(info(&desktop))
+}
+
+#[derive(Serialize)]
+struct LocalModel {
+    /// `ollama/<name>`, as a chat's model.
+    id: String,
+    /// Ollama says it can call tools (Marv needs them).
+    tools: bool,
+}
+
+/// The models pulled into the local Ollama; an error when it isn't running.
+#[tauri::command]
+async fn local_models() -> Result<Vec<LocalModel>, String> {
+    let models = marv_provider::models::list_models(marv_provider::ProviderKind::Ollama, "http://localhost:11434", None)
+        .await
+        .map_err(|_| "Ollama isn't running (sudo systemctl enable --now ollama).".to_string())?;
+    Ok(models.into_iter().map(|m| LocalModel { id: format!("ollama/{}", m.id), tools: m.tools.unwrap_or(false) }).collect())
+}
+
+/// `ollama pull <name>`, its progress lines to `on_progress`.
+#[tauri::command]
+async fn pull_model(name: String, on_progress: Channel<String>) -> Result<(), String> {
+    use tokio::io::AsyncReadExt;
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.:/".contains(c)) {
+        return Err(format!("\"{name}\" isn't a model name."));
+    }
+    let mut child = tokio::process::Command::new("ollama")
+        .args(["pull", &name])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|_| "Ollama isn't installed.".to_string())?;
+    // Progress comes on stderr, redrawn with \r.
+    let mut err = child.stderr.take().ok_or("no output")?;
+    let mut buf = [0u8; 4096];
+    let mut line = String::new();
+    while let Ok(n) = err.read(&mut buf).await {
+        if n == 0 {
+            break;
+        }
+        for c in String::from_utf8_lossy(&buf[..n]).chars() {
+            if c == '\r' || c == '\n' {
+                let text = marv_core::printable(line.trim());
+                if !text.is_empty() {
+                    let _ = on_progress.send(text);
+                }
+                line.clear();
+            } else {
+                line.push(c);
+            }
+        }
+    }
+    let status = child.wait().await.map_err(|e| e.to_string())?;
+    if status.success() { Ok(()) } else { Err(format!("ollama pull {name} failed.")) }
 }
 
 #[tauri::command]
@@ -348,11 +484,23 @@ fn mcp_servers(desktop: State<'_, Desktop>, folder: String) -> Result<Vec<Server
 /// `/mcp add`'s lookup: an npm package, a URL or a GitHub repo becomes the exact entry to write, shown to the person
 /// first (with what was found about it). Several servers in one README: the choices.
 #[tauri::command]
-async fn mcp_lookup(desktop: State<'_, Desktop>, source: String, name: Option<String>) -> Result<Value, String> {
+async fn mcp_lookup(
+    desktop: State<'_, Desktop>,
+    source: String,
+    name: Option<String>,
+    // Credentials the server reads: written as `${VAR}`, filled in by `mcp_install`.
+    vars: Option<Vec<String>>,
+    headers: Option<std::collections::BTreeMap<String, String>>,
+) -> Result<Value, String> {
     use marv_mcp::install::{AddOptions, Resolved, resolve_add};
     let env: marv_session::config::Env = std::env::vars().collect();
-    let options =
-        AddOptions { source: source.trim().to_string(), name: name.filter(|n| !n.trim().is_empty()), ..AddOptions::default() };
+    let options = AddOptions {
+        source: source.trim().to_string(),
+        name: name.filter(|n| !n.trim().is_empty()),
+        env: vars.unwrap_or_default(),
+        headers: headers.unwrap_or_default(),
+        ..AddOptions::default()
+    };
     let deps = marv_session::mcp_install::LiveDeps::new(env.clone(), tokio_util::sync::CancellationToken::new());
     let proposal = match resolve_add(&options, &deps).await.map_err(|e| e.to_string())? {
         Resolved::Choices(c) => return Ok(serde_json::json!({ "choices": c.choices })),
@@ -373,11 +521,33 @@ async fn mcp_lookup(desktop: State<'_, Desktop>, source: String, name: Option<St
     }))
 }
 
-/// Writes a looked-up server to ~/.marv/mcp.json (every folder's): exactly the entry `mcp_lookup` showed.
+/// Writes a looked-up server to ~/.marv/mcp.json (every folder's): exactly the entry `mcp_lookup` showed, with its
+/// `${VAR}`s filled from `values` (the credentials typed at setup). The file is the user's alone (0600) and hidden
+/// from Marv's sandbox.
 #[tauri::command]
-async fn mcp_install(desktop: State<'_, Desktop>, name: String) -> Result<(), String> {
-    let entry = desktop.proposals.lock().unwrap_or_else(|e| e.into_inner()).remove(&name).ok_or("Look the server up first.")?;
+async fn mcp_install(
+    desktop: State<'_, Desktop>,
+    name: String,
+    values: Option<std::collections::HashMap<String, String>>,
+) -> Result<(), String> {
+    let mut entry =
+        desktop.proposals.lock().unwrap_or_else(|e| e.into_inner()).remove(&name).ok_or("Look the server up first.")?;
+    fill(&mut entry, &values.unwrap_or_default());
     marv_mcp::personal_file::add_personal_server(&marv_dir(), &name, entry).await.map_err(|e| e.to_string())
+}
+
+/// `${VAR}` → its value, in every string of an entry (only the names given; anything else stays a reference).
+fn fill(value: &mut Value, values: &std::collections::HashMap<String, String>) {
+    match value {
+        Value::String(text) => {
+            for (name, v) in values {
+                *text = text.replace(&format!("${{{name}}}"), v);
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(|i| fill(i, values)),
+        Value::Object(map) => map.values_mut().for_each(|i| fill(i, values)),
+        _ => {}
+    }
 }
 
 /// Takes one of your servers out of ~/.marv/mcp.json (a folder's are in its .mcp.json).
@@ -387,6 +557,15 @@ async fn mcp_remove(name: String) -> Result<(), String> {
         return Err(format!("\"{name}\" isn't in ~/.marv/mcp.json: a folder's server is removed from its .mcp.json."));
     }
     marv_mcp::personal_file::remove_personal_server(&marv_dir(), &name).await.map_err(|e| e.to_string())
+}
+
+/// An http(s) link in the person's own browser (a setup page for an app's keys).
+#[tauri::command]
+fn open_url(url: String) -> Result<(), String> {
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err("Only web links open here.".into());
+    }
+    std::process::Command::new("xdg-open").arg(&url).spawn().map(|_| ()).map_err(|e| e.to_string())
 }
 
 /// Starts or stops dictation with Voxtype (Omarchy's; Super+Ctrl+X does the same): it types into the focused field.
@@ -434,11 +613,20 @@ pub fn run() {
             set_root,
             root_up,
             enter_folder,
+            create_space,
+            switch_space,
+            rename_space,
+            remove_space,
+            set_apps_off,
+            set_provider,
+            local_models,
+            pull_model,
             mcp_servers,
             mcp_lookup,
             mcp_install,
             mcp_remove,
             dictate,
+            open_url,
             take_launch,
             set_api_key,
             list_dir,
@@ -455,4 +643,54 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running Marv desktop");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fill_puts_in_only_the_given_credentials() {
+        let mut entry = serde_json::json!({
+            "command": "uvx", "args": ["mcparmory-google-gmail==1.0.4"],
+            "env": { "OAUTH2_CLIENT_ID": "${OAUTH2_CLIENT_ID}", "OTHER": "${OTHER}" },
+            "headers": { "Authorization": "Bearer ${GITHUB_TOKEN}" }
+        });
+        let values = [("OAUTH2_CLIENT_ID", "id.apps"), ("GITHUB_TOKEN", "pat")].map(|(k, v)| (k.to_string(), v.to_string()));
+        fill(&mut entry, &values.into_iter().collect());
+        assert_eq!(entry["env"]["OAUTH2_CLIENT_ID"], "id.apps");
+        assert_eq!(entry["env"]["OTHER"], "${OTHER}");
+        assert_eq!(entry["headers"]["Authorization"], "Bearer pat");
+    }
+}
+
+#[cfg(test)]
+mod live {
+    /// The gallery's sources resolve (network: `cargo test -p marv-desktop -- --ignored`).
+    #[tokio::test]
+    #[ignore]
+    async fn gallery_sources_resolve() {
+        use marv_mcp::install::{AddOptions, Resolved, resolve_add};
+        let env: marv_session::config::Env = std::env::vars().collect();
+        let deps = marv_session::mcp_install::LiveDeps::new(env, tokio_util::sync::CancellationToken::new());
+        let cases = [
+            ("pypi:mcparmory-google-gmail", vec!["OAUTH2_CLIENT_ID".to_string()], vec![]),
+            ("slack-workspace-mcp-server", vec!["SLACK_BOT_TOKEN".to_string()], vec![]),
+            ("pypi:mcp-server-kicad", vec![], vec![]),
+            (
+                "https://api.githubcopilot.com/mcp/",
+                vec![],
+                vec![("Authorization".to_string(), "Bearer ${GITHUB_TOKEN}".to_string())],
+            ),
+        ];
+        for (source, env, headers) in cases {
+            let options =
+                AddOptions { source: source.into(), env, headers: headers.into_iter().collect(), ..AddOptions::default() };
+            match resolve_add(&options, &deps).await {
+                Ok(Resolved::Proposal(p)) => println!("OK {source} -> {} {}", p.name, serde_json::to_string(&p.entry).unwrap()),
+                Ok(Resolved::Choices(c)) => println!("CHOICES {source}: {:?}", c.choices),
+                Err(e) => println!("ERR {source}: {e}"),
+            }
+        }
+    }
 }

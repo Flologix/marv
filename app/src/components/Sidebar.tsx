@@ -29,6 +29,7 @@ export function Sidebar({
   onToggleServer,
   onServerAction,
   onServersChanged,
+  onBrowseApps,
 }: {
   rootName: string;
   folder: string;
@@ -47,6 +48,7 @@ export function Sidebar({
   onToggleServer: (name: string, on: boolean) => void;
   onServerAction: (action: string, name?: string) => void;
   onServersChanged: () => void;
+  onBrowseApps: () => void;
 }) {
   const [children, setChildren] = useState<Record<string, Entry[]>>({});
   const [open, setOpen] = useState<Set<string>>(new Set([""]));
@@ -210,6 +212,7 @@ export function Sidebar({
             onToggle={onToggleServer}
             onAction={onServerAction}
             onChanged={onServersChanged}
+            onBrowse={onBrowseApps}
           />
         </div>
       ) : (
