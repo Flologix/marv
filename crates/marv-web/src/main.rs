@@ -145,6 +145,7 @@ async fn chat(app: Arc<App>, socket: WebSocket) {
             mesh: false,
             mcp_off: Vec::new(),
             manage_mcp: false,
+            host_commands: false,
         };
         let (to_chat, from_page) = mpsc::unbounded_channel();
         let reader = async move {

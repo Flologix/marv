@@ -170,7 +170,7 @@ export async function localModels(): Promise<Model[]> {
   }
 }
 
-const MODELS_KEY = "marv-models";
+const MODELS_KEY = "marv-models-2";
 
 /** Local Ollama models first, then OpenRouter's that can call tools, cheapest first (cached for an hour). */
 export async function loadModels(): Promise<Model[]> {
@@ -196,6 +196,8 @@ export async function remoteModels(): Promise<Model[]> {
     }))
     // Routers price per request (-1): no fixed price to show.
     .filter((m: Model) => m.input >= 0 && m.output >= 0)
+    // Batch variants only take the batch API, not chat.
+    .filter((m: Model) => !m.id.endsWith(":batch"))
     .sort((a: Model, b: Model) => a.input - b.input);
   try {
     localStorage.setItem(MODELS_KEY, JSON.stringify({ at: Date.now(), models }));

@@ -47,6 +47,9 @@ pub struct ChatSpec {
     pub mcp_off: Vec<String>,
     /// Allow `mcp` login/logout/trust (OAuth opens the browser on this machine): only on the person's own machine.
     pub manage_mcp: bool,
+    /// Let bash run a command on this machine outside the sandbox, asked every time (never yolo, never "always"):
+    /// only where the person approving is at this machine.
+    pub host_commands: bool,
 }
 
 /// The commands the page offers in its `/` menu (besides the skills), and what they do here.
@@ -412,6 +415,7 @@ async fn open(
         builder.options.config_dir = Some(spec.config_dir.clone());
         builder.options.mesh = mesh.clone();
         builder.options.mcp_skip = spec.mcp_off.clone();
+        builder.options.host_commands = spec.host_commands;
         let out = out.clone();
         builder.options.on_warning = Some(Arc::new(move |text: String| {
             let _ = out.send(json!({"type": "notice", "text": marv_core::printable(&text)}));

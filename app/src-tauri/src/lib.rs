@@ -430,6 +430,7 @@ fn open_chat(
         mesh: true,
         mcp_off,
         manage_mcp: true,
+        host_commands: true,
     };
     let (to_chat, from_page) = mpsc::unbounded_channel();
     let (out, mut events) = mpsc::unbounded_channel::<Value>();
