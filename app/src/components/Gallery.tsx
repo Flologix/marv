@@ -20,7 +20,7 @@ export function Gallery({ installed, onInstalled }: { installed: string[]; onIns
           />
         ) : (
           <div key={app.id} className="tile">
-            <span className="mark">{app.mark}</span>
+            <span className="app-mark">{app.mark}</span>
             <div className="tile-text">
               <b>{app.name}</b>
               <span>{app.blurb}</span>
@@ -78,7 +78,7 @@ function Connect({ app, onDone, onCancel }: { app: App; onDone: () => void; onCa
   return (
     <div className="tile open">
       <div className="tile-head">
-        <span className="mark">{app.mark}</span>
+        <span className="app-mark">{app.mark}</span>
         <b>Connect {app.name}</b>
       </div>
       {app.setup && (

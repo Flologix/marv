@@ -144,6 +144,11 @@ function apply(items: Item[], e: ServerEvent): Item[] {
       next.push({ kind: "output", text: String(e.text) });
       return next;
     case "turn_end":
+      // A tool that never reported back (an interrupt, a dropped call) stops spinning with its turn.
+      for (let i = 0; i < next.length; i++) {
+        const it = next[i];
+        if (it.kind === "tool" && !it.done) next[i] = { ...it, done: true };
+      }
       next.push({ kind: "turn", reason: String(e.reason) });
       return next;
     case "usage":

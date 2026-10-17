@@ -1414,7 +1414,7 @@ img.flai {
   gap: 10px;
 }
 
-.mark {
+.app-mark {
   display: grid;
   place-items: center;
   width: 32px;
