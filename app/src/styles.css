@@ -306,6 +306,61 @@ h3 {
   border-color: var(--blue);
 }
 
+/* Running chats (#155): on the mesh (green), working (pulsing), waiting for an answer (orange). */
+.chat-row.live .dot {
+  background: var(--green);
+  border-color: var(--green);
+}
+
+.chat-row.busy .dot {
+  background: var(--blue);
+  border-color: var(--blue);
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+.chat-row.waiting .dot,
+.waiting-elsewhere .dot {
+  background: var(--orange);
+  border-color: var(--orange);
+}
+
+@keyframes pulse {
+  50% {
+    opacity: 0.3;
+  }
+}
+
+.waiting-elsewhere {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: calc(100% - 16px);
+  margin: 2px 8px 6px;
+  padding: 6px 8px;
+  border: 1px solid var(--orange);
+  border-radius: var(--r-md, 6px);
+  background: var(--bg);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.waiting-elsewhere .dot {
+  width: 6px;
+  height: 6px;
+  flex: none;
+  border-radius: 50%;
+}
+
+.waiting-elsewhere .title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
 .chat-row .title {
   flex: 1;
   overflow: hidden;

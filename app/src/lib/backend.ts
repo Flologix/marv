@@ -32,6 +32,13 @@ export interface Entry {
   dir: boolean;
 }
 
+/** A chat running in the background, or on screen: whether a turn runs, and how many approvals wait. */
+export interface LiveChat {
+  id: string;
+  busy: boolean;
+  waiting: number;
+}
+
 export interface ChatRecord {
   id: string;
   /** The full path of the folder the chat runs in. */
@@ -86,6 +93,10 @@ export const desktop = {
   createChat: (folder: string, title: string) => invoke<ChatRecord>("create_chat", { folder, title }),
   renameChat: (id: string, title: string) => invoke<void>("rename_chat", { id, title }),
   deleteChat: (id: string) => invoke<void>("delete_chat", { id }),
+  /** Ends a chat running in the background: it leaves the mesh. Opening it again continues it. */
+  stopChat: (id: string) => invoke<void>("stop_chat", { id }),
+  /** The running chats (#155), shown or not. */
+  liveChats: () => invoke<LiveChat[]>("live_chats"),
   mcpServers: (folder: string) => invoke<ServerEntry[]>("mcp_servers", { folder }),
   mcpLookup: (source: string, name?: string, vars?: string[], headers?: Record<string, string>) =>
     invoke<Lookup>("mcp_lookup", { source, name, vars, headers }),
@@ -111,13 +122,20 @@ export const desktop = {
 };
 
 /** Opens a chat's session; `onEvent` gets its events until `close()`. */
-export async function connect(id: string, settings: ChatSettings, onEvent: (e: ServerEvent) => void): Promise<Connection> {
+export async function connect(
+  id: string,
+  settings: ChatSettings,
+  resume: { generation: number; after: number },
+  onEvent: (e: ServerEvent) => void,
+): Promise<Connection> {
   if (isDesktop) {
     const channel = new Channel<ServerEvent>();
     channel.onmessage = onEvent;
-    await invoke("open_chat", { id, ...settings, onEvent: channel });
+    // A chat still running in the background is shown again from event `after` on; it isn't started twice.
+    await invoke("open_chat", { id, ...settings, ...resume, onEvent: channel });
     return {
       send: (message) => void invoke("chat_message", { id, message }).catch((e) => onEvent({ type: "error", message: String(e) })),
+      // The chat keeps running (on the mesh, its turn going on); stop_chat ends it.
       close: () => void invoke("close_chat", { id }),
     };
   }

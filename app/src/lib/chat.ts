@@ -166,6 +166,16 @@ function apply(items: Item[], e: ServerEvent): Item[] {
 }
 
 const storageKey = (id: string) => `marv-transcript-${id}`;
+/** The number of the last event the saved transcript has: a chat reopened gets what came after (#155). */
+const seqKey = (id: string) => `marv-seq-${id}`;
+
+function loadSeq(id: string): number {
+  try {
+    return Number(localStorage.getItem(seqKey(id)) ?? 0) || 0;
+  } catch {
+    return 0;
+  }
+}
 
 /** What the page sends for a line: a /command runs in Marv, anything else is a message to the model. */
 const message = (text: string) => (text.startsWith("/") ? { type: "command", line: text } : { type: "send", text });
@@ -192,6 +202,7 @@ export function knownCommands(): Command[] {
 export function forget(id: string) {
   try {
     localStorage.removeItem(storageKey(id));
+    localStorage.removeItem(seqKey(id));
   } catch {}
 }
 
@@ -226,6 +237,9 @@ export function useChat(id: string | null, settings: ChatSettings, reload = 0) {
   const connection = useRef<Connection | null>(null);
   const pending = useRef<object[]>([]);
   const first = useRef<{ id: string; text: string } | null>(null);
+  /** The last event number this page got, and the last one in `items` (saved with them). */
+  const received = useRef(0);
+  const applied = useRef(0);
   const ready = useRef(false);
   const settingsRef = useRef(settings);
   const sent = useRef(settings);
@@ -251,15 +265,23 @@ export function useChat(id: string | null, settings: ChatSettings, reload = 0) {
     const opening = first.current?.id === id ? first.current.text : null;
     if (opening) pending.current.push(message(opening));
     setItems(opening ? [...load(id), { kind: "user", text: opening }] : load(id));
+    received.current = applied.current = loadSeq(id);
     setStatus("connecting");
     setBusy(opening !== null && !opening.startsWith("/"));
     setError(null);
     sent.current = settingsRef.current;
     // Opened a beat late, so React's dev double-mount doesn't open the chat twice.
     const timer = setTimeout(() => {
-      connect(id, settingsRef.current, (e) => {
+      connect(id, settingsRef.current, { generation: reload, after: received.current }, (e) => {
         if (!live) return;
+        // Numbered events: one this page already has (a reattach racing the last one) is skipped.
+        if (typeof e.seq === "number") {
+          if (e.seq <= received.current) return;
+          received.current = e.seq;
+        }
         if (e.type === "ready") {
+          // Reopened while a turn runs in the background.
+          if (e.busy === true) setBusy(true);
           ready.current = true;
           first.current = null;
           setStatus("ready");
@@ -282,7 +304,10 @@ export function useChat(id: string | null, settings: ChatSettings, reload = 0) {
         } else {
           if (e.type === "turn_start") setBusy(true);
           if (e.type === "usage") setBusy(false);
-          setItems((items) => apply(items, e));
+          setItems((items) => {
+            if (typeof e.seq === "number") applied.current = e.seq;
+            return apply(items, e);
+          });
         }
       })
         .then((c) => {
@@ -323,6 +348,7 @@ export function useChat(id: string | null, settings: ChatSettings, reload = 0) {
     if (!id || items.length === 0) return;
     try {
       localStorage.setItem(storageKey(id), JSON.stringify(items.slice(-500)));
+      localStorage.setItem(seqKey(id), String(applied.current));
     } catch {}
   }, [id, items]);
 

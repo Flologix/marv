@@ -3,6 +3,7 @@
 //! `marv_web::host`, the same code marv-web runs for a browser: the page sends the same messages and gets the same
 //! events, through Tauri commands and a channel instead of a WebSocket.
 
+mod background;
 mod store;
 mod tree;
 
@@ -11,6 +12,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use background::LiveChat;
 use marv_web::host::{ChatSpec, run_chat};
 use marv_web::protocol::{ClientMessage, is_model_id};
 use serde::Serialize;
@@ -22,8 +24,8 @@ use tokio::sync::mpsc;
 
 struct Desktop {
     store: Store,
-    /// Open chats: where their page messages go. Dropping one ends the chat (its session closes).
-    live: Mutex<HashMap<String, mpsc::UnboundedSender<ClientMessage>>>,
+    /// Running chats, shown or not (#155). Removing one ends it (its session closes).
+    live: Mutex<HashMap<String, LiveChat>>,
     /// The folder named on the command line (`marv-desktop <dir>`), until the page takes it.
     launch: Mutex<Option<String>>,
     /// MCP servers looked up for adding, by name: what the person saw is exactly what gets written.
@@ -60,7 +62,7 @@ impl Desktop {
         Ok(tree::resolve(&self.root()?, rel)?.to_string_lossy().trim_end_matches('/').to_string())
     }
 
-    fn live(&self) -> std::sync::MutexGuard<'_, HashMap<String, mpsc::UnboundedSender<ClientMessage>>> {
+    fn live(&self) -> std::sync::MutexGuard<'_, HashMap<String, LiveChat>> {
         self.live.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -399,6 +401,8 @@ fn open_chat(
     max_steps: u32,
     yolo: bool,
     mcp_off: Vec<String>,
+    generation: Option<u32>,
+    after: Option<u64>,
     on_event: Channel<Value>,
 ) -> Result<Chat, String> {
     // A local (Ollama) model needs no key.
@@ -411,6 +415,29 @@ fn open_chat(
         return Err(format!("\"{model}\" isn't an OpenRouter model id."));
     }
     let chat = desktop.chats().into_iter().find(|c| c.id == id).ok_or("That chat is gone.")?;
+    let sink: background::Sink = Box::new(move |event| on_event.send(event).is_ok());
+    let mut off = mcp_off.clone();
+    off.sort();
+    let key = format!("{}|{}", off.join(","), generation.unwrap_or(0));
+    // Still running (in the background, or another view of it): show it again, with the settings picked now.
+    {
+        let mut live = desktop.live();
+        if let Some(running) = live.get_mut(&chat.id) {
+            if running.key == key && running.running() {
+                running.seen = std::time::Instant::now();
+                let configure =
+                    ClientMessage::Configure { model: Some(model), max_steps: Some(max_steps.min(500)), yolo: Some(yolo) };
+                let _ = running.to_chat.send(configure);
+                running.shared().attach(sink, after.unwrap_or(0));
+                return Ok(chat);
+            }
+            // Its servers changed (or it ended): started again below, continuing the conversation.
+            live.remove(&chat.id);
+        }
+        if let Some(oldest) = background::to_evict(&live, &chat.id) {
+            live.remove(&oldest);
+        }
+    }
     // Wherever the top folder is now: the chat runs in its own folder (still never home or above).
     let dir = check_root(&chat.folder).map_err(|e| format!("This chat's folder: {e}"))?;
     let spec = ChatSpec {
@@ -434,10 +461,13 @@ fn open_chat(
     };
     let (to_chat, from_page) = mpsc::unbounded_channel();
     let (out, mut events) = mpsc::unbounded_channel::<Value>();
-    // Replaces (and so ends) an earlier connection to the same chat.
-    desktop.live().insert(chat.id.clone(), to_chat);
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(background::Shared::default()));
+    background::lock(&shared).attach(sink, 0);
+    let running = LiveChat { to_chat, key, shared: shared.clone(), seen: std::time::Instant::now() };
+    desktop.live().insert(chat.id.clone(), running);
     tauri::async_runtime::spawn(run_chat(spec, from_page, out));
     let chat_id = chat.id.clone();
+    // Every event, shown or kept for later, until the session ends (delete, stop, a newer start, the app quitting).
     tauri::async_runtime::spawn(async move {
         while let Some(event) = events.recv().await {
             // Remember the session, so reopening the chat continues it.
@@ -447,10 +477,9 @@ fn open_chat(
                 let session = session.to_string();
                 let _ = app.state::<Desktop>().store.update_chat(&chat_id, |c| c.session_id = Some(session));
             }
-            if on_event.send(event).is_err() {
-                break;
-            }
+            background::lock(&shared).deliver(event);
         }
+        background::lock(&shared).end();
     });
     Ok(chat)
 }
@@ -584,12 +613,28 @@ fn chat_message(desktop: State<'_, Desktop>, id: String, message: Value) -> Resu
     let message: ClientMessage = serde_json::from_value(message).map_err(|e| e.to_string())?;
     let live = desktop.live();
     let chat = live.get(&id).ok_or("This chat isn't open.")?;
-    chat.send(message).map_err(|_| "This chat has closed.".to_string())
+    chat.to_chat.send(message).map_err(|_| "This chat has closed.".to_string())
 }
 
+/// The page stopped showing the chat: it keeps running (on the mesh, its turn going on) and keeps what happens.
 #[tauri::command]
 fn close_chat(desktop: State<'_, Desktop>, id: String) {
+    if let Some(chat) = desktop.live().get_mut(&id) {
+        chat.shared().detach();
+        chat.seen = std::time::Instant::now();
+    }
+}
+
+/// Ends a running chat: it leaves the mesh. Opening it again continues the conversation.
+#[tauri::command]
+fn stop_chat(desktop: State<'_, Desktop>, id: String) {
     desktop.live().remove(&id);
+}
+
+/// The running chats, for the sidebar: busy, and how many approvals wait.
+#[tauri::command]
+fn live_chats(desktop: State<'_, Desktop>) -> Vec<background::LiveState> {
+    background::states(&desktop.live())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -641,6 +686,8 @@ pub fn run() {
             open_chat,
             chat_message,
             close_chat,
+            stop_chat,
+            live_chats,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Marv desktop");

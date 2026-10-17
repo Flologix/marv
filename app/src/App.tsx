@@ -6,7 +6,7 @@ import { Gallery } from "./components/Gallery";
 import { Martian } from "./components/Martian";
 import { SpacesBar } from "./components/SpacesBar";
 import { Sidebar } from "./components/Sidebar";
-import { type AppInfo, type ChatRecord, type ChatSettings, type Model, desktop, isDesktop, loadModels } from "./lib/backend";
+import { type AppInfo, type ChatRecord, type ChatSettings, type LiveChat, type Model, desktop, isDesktop, loadModels } from "./lib/backend";
 import { useChat } from "./lib/chat";
 
 const SETTINGS_KEY = "marv-settings";
@@ -81,6 +81,20 @@ function Desktop() {
 
   useEffect(() => keep("marv-folder", folder), [folder]);
 
+  // The running chats (#155): the sidebar marks them, and one waiting for an answer anywhere is shown.
+  const [live, setLive] = useState<LiveChat[]>([]);
+  const [allChats, setAllChats] = useState<ChatRecord[]>([]);
+  useEffect(() => {
+    const poll = () => desktop.liveChats().then(setLive, () => {});
+    void poll();
+    const timer = setInterval(poll, 2000);
+    return () => clearInterval(timer);
+  }, []);
+  const waitingIds = live.filter((c) => c.waiting > 0).map((c) => c.id).join(",");
+  useEffect(() => {
+    if (waitingIds) desktop.chats().then(setAllChats, () => {});
+  }, [waitingIds]);
+
   const refreshChats = useCallback(() => {
     desktop.chats(folder).then(setChats, () => setChats([]));
   }, [folder]);
@@ -107,14 +121,20 @@ function Desktop() {
     );
   const rootName = info.rootName ?? "marv";
 
-  // Another space: its own folder, chats and apps, back where you left it (renaming one keeps the view).
-  function toSpace(next: AppInfo) {
+  // Another space: its own folder, chats and apps, back where you left it (renaming one keeps the view), or at
+  // `target`.
+  function toSpace(next: AppInfo, target?: { folder: string; chatId: string }) {
     const was = info?.active;
     setInfo(next);
     if (next.active === was) return;
     const views = stored<Record<string, { folder: string; chatId: string | null }>>("marv-space-views", {});
     if (was) views[was] = { folder, chatId };
     keep("marv-space-views", views);
+    if (target) {
+      setFolder(target.folder);
+      setChatId(target.chatId);
+      return;
+    }
     const view = next.active ? views[next.active] : undefined;
     setFolder(view?.folder ?? "");
     setChatId(null);
@@ -126,6 +146,22 @@ function Desktop() {
         () => {},
       );
   }
+
+  // A chat anywhere: its space (the one whose folder holds it most closely), its folder, the chat.
+  function jumpTo(target: ChatRecord) {
+    const space = info!.spaces
+      .filter((s) => target.folder === s.root || target.folder.startsWith(`${s.root}/`))
+      .sort((a, b) => b.root.length - a.root.length)[0];
+    if (!space) return;
+    const rel = target.folder.slice(space.root.length + 1);
+    if (space.id === info!.active && info!.root === space.root) {
+      setFolder(rel);
+      setChatId(target.id);
+    } else {
+      desktop.switchSpace(space.id).then((next) => toSpace(next, { folder: rel, chatId: target.id }), (e) => void message(String(e), { title: "Marv" }));
+    }
+  }
+  const waiting = allChats.filter((c) => c.id !== chatId && live.some((l) => l.id === c.id && l.waiting > 0));
 
   function openGallery() {
     desktop.mcpServers(folder).then((s) => setInstalled(s.map((e) => e.name)), () => {});
@@ -220,6 +256,10 @@ function Desktop() {
         onChat={setChatId}
         onNewChat={() => setChatId(null)}
         onChatsChanged={refreshChats}
+        live={live}
+        onStop={(id) => void desktop.stopChat(id).then(() => desktop.liveChats().then(setLive))}
+        waiting={waiting}
+        onJump={jumpTo}
         onChangeRoot={() => void changeRoot()}
       />
       <ChatView
