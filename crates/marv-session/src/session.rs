@@ -3326,6 +3326,9 @@ mod turn_tests {
     impl Dirs {
         fn new() -> Self {
             let base = std::env::temp_dir().join(format!("marv-turn-{}-{}", std::process::id(), marv_fs::random_hex()));
+            std::fs::create_dir_all(&base).unwrap();
+            // The real path (macOS: /var is a link to /private/var), as the tools report it.
+            let base = base.canonicalize().unwrap();
             let (project, dir) = (base.join("project"), base.join("store"));
             std::fs::create_dir_all(&project).unwrap();
             std::fs::create_dir_all(&dir).unwrap();
@@ -5746,7 +5749,7 @@ mod turn_tests {
     /// Hooks that count their runs in `runs.txt` (outside the project) and print which run this is.
     fn counting(dirs: &Dirs) -> Vec<HookCommand> {
         let count = dirs.dir.join("runs.txt");
-        vec![hook(&format!("echo x >> '{0}'; echo \"queue run $(wc -l < '{0}')\"", count.display()))]
+        vec![hook(&format!("echo x >> '{0}'; echo \"queue run $(wc -l < '{0}' | tr -d ' ')\"", count.display()))]
     }
     fn runs(dirs: &Dirs) -> usize {
         std::fs::read_to_string(dirs.dir.join("runs.txt")).map_or(0, |t| t.lines().count())

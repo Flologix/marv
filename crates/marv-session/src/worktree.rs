@@ -306,7 +306,9 @@ pub(crate) mod tests {
         pub(crate) fn new(tag: &str) -> Self {
             let dir = std::env::temp_dir().join(format!("marv-{tag}-{}-{}", std::process::id(), marv_fs::random_hex()));
             std::fs::create_dir_all(&dir).unwrap();
-            Self(dir)
+            // The real path: on macOS the temp folder is under /var, a link to /private/var, and git and the code
+            // under test report the resolved one.
+            Self(dir.canonicalize().unwrap())
         }
     }
     impl Drop for Temp {
