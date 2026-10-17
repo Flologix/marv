@@ -64,6 +64,9 @@ pub struct SessionOptions {
     pub tools: Vec<ToolRef>,
     /// `.mcp.json`'s format, `{ name: entry }`, in order.
     pub mcp_servers: Vec<(String, Value)>,
+    /// Servers from the config files (or `mcp_servers`) this session leaves out, by name: switched off for one
+    /// conversation (Marv desktop's per-chat switches) without touching the files.
+    pub mcp_skip: Vec<String>,
     pub approve: Option<Arc<dyn Approver>>,
     pub max_steps: Option<u32>,
     /// Offer the plan tool: a checklist the model keeps for a long task (`session.plan()` reads it, each change also
@@ -149,6 +152,7 @@ impl SessionBuilder {
                 system_prompt: None,
                 tools: Vec::new(),
                 mcp_servers: Vec::new(),
+                mcp_skip: Vec::new(),
                 approve: None,
                 max_steps: None,
                 plan: true,
@@ -306,6 +310,7 @@ pub async fn create_session(options: SessionOptions) -> Result<MarvSession, Sess
             servers.push(server);
         }
     }
+    servers.retain(|s| !options.mcp_skip.contains(&s.name));
     // Logins made with /mcp login in the TUI (same config dir) are used and refreshed; a library never starts one.
     let tokens_file = config_dir.join("mcp-tokens.json");
     let mcp: Option<crate::mcp_tools::McpHandle> = (!servers.is_empty()).then(|| {

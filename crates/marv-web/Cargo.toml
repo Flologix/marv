@@ -1,0 +1,30 @@
+[package]
+name = "marv-web"
+description = "marv-web: Marv sessions over a WebSocket, with approvals answered in the browser."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "marv-web"
+path = "src/main.rs"
+
+[dependencies]
+marv-core.workspace = true
+marv-session.workspace = true
+marv-agent.workspace = true
+marv-tools.workspace = true
+marv-provider.workspace = true
+marv-mcp.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+axum = { version = "0.8", features = ["ws"] }
+uuid = { version = "1", features = ["v4"] }
+
+[lints]
+workspace = true

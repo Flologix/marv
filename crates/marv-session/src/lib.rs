@@ -34,6 +34,7 @@ pub mod mcp_install;
 pub mod mcp_tools;
 pub mod memory;
 pub mod mesh;
+pub mod mesh_process;
 pub mod paths;
 pub mod processes;
 pub mod prompt;
