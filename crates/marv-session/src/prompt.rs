@@ -92,6 +92,13 @@ const BASE_REST_TEXT: &str = "\n\nYou can change files with edit_file (replace e
 
 Your replies are rendered as Markdown in a terminal. Keep them concise and structured: short paragraphs, bullet or numbered lists for several items, `backticks` for file paths, identifiers and commands, and fenced code blocks with a language for code. Use a small table only when comparing things side by side. Point to code as path:line.";
 
+/// How to fix a bug (marv-rs #147, not in Marv), only where the agent can change files. Marv's prompt said how to use
+/// the tools but not how to fix a bug; Codex's says to fix the root cause. On SWE-bench Verified (30 instances,
+/// GLM-5.3-flash) this text as a project AGENTS.md took Marv from 24 to 26 resolved, against Codex's 27; the fixes
+/// it missed were a symptom patched in three database backends instead of the shared helper, and one of two files
+/// that needed the same change.
+pub const FIXING_BUGS: &str = "\n\n# Fixing bugs\n\n- Find the root cause before you change anything. A fix belongs where the wrong value or behaviour starts, not where it shows up: if several places show the same symptom, look for the shared helper or base class they all go through and fix it there.\n- Before editing a function, find its callers and the other code paths that do the same thing (grep for the name and for sibling classes). A bug reported for one case often has a twin that needs the same fix.\n- Reproduce the problem first with a short script (`python -c`, or a file you delete afterwards) or the most specific existing test, so you can see it fail. After the fix, run that again, then the tests for the module you changed.\n- Keep the change minimal and in the style of the surrounding code. Don't rename things or fix unrelated issues.\n- `git log -p -- <file>` and `git blame` show why code looks the way it does; use them when the intent isn't clear.\n- Don't stop at the first plausible patch: check it against the issue's exact example and the edge cases it mentions.";
+
 // Fixed text, only with bash: the sandbox kills every process a command starts and hides its localhost, so a model
 // claimed a server was "up" and handed the user a dead link (Marv issue #50). With the process door (#51), the door's
 // own paragraph in "# Outside the sandbox" says this and where to go instead.
@@ -245,6 +252,7 @@ pub fn system_prompt(input: &PromptInput) -> String {
     let web = if input.tools.iter().any(|t| t == "web_fetch") { WEB_SECTION } else { "" };
     // With the process door, its paragraph says what this one did (and where to go instead).
     let limits = if input.tools.iter().any(|t| t == "bash") && !input.doors.process { SANDBOX_LIMITS } else { "" };
+    let fixing = if input.tools.iter().any(|t| t == "edit_file") { FIXING_BUGS } else { "" };
     let outside = outside_section(&input.doors);
     let situation = situation_section(
         input.cwd == "~",
@@ -253,7 +261,7 @@ pub fn system_prompt(input: &PromptInput) -> String {
         input.doors.herdr.then_some(input.doors.herdr_runs),
     );
     format!(
-        "{base}{limits}{outside}{situation}{remembered}{}{agents}{web}{MCP_SETUP}{}{}",
+        "{base}{fixing}{limits}{outside}{situation}{remembered}{}{agents}{web}{MCP_SETUP}{}{}",
         skills_section(&input.skills),
         if input.mcp { MCP_TOOLS } else { "" },
         project_section(input.instructions.as_deref())
@@ -703,6 +711,16 @@ mod tests {
         assert!(home.contains("here the home folder is the project"));
         // The oracle strips this section by its heading.
         assert_eq!(SITUATION_HEADING, "# Your situation");
+    }
+
+    /// #147: how to fix a bug, only for an agent that can change files, before the sandbox limits.
+    #[test]
+    fn fixing_bugs_comes_with_the_edit_tools() {
+        let edits = system_prompt(&PromptInput { tools: vec!["read_file".into(), "edit_file".into(), "bash".into()], ..input() });
+        assert!(edits.contains("# Fixing bugs\n\n- Find the root cause before you change anything."));
+        assert!(edits.find("# Fixing bugs").unwrap() < edits.find("# Sandbox limits").unwrap());
+        let reads = system_prompt(&PromptInput { tools: vec!["read_file".into(), "bash".into()], ..input() });
+        assert!(!reads.contains("# Fixing bugs"));
     }
 
     #[test]

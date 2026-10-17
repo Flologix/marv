@@ -310,7 +310,7 @@ pub fn canonical_request(body: &str) -> String {
 /// System-prompt sections marv-rs adds and Marv doesn't (deliberate differences, one place for all scenarios): the
 /// oracle drops them from both sides before comparing, so the rest of the prompt is still checked byte for byte. The
 /// raw requests (the prefix rule) keep them.
-pub const MARV_RS_SECTIONS: &[&str] = &["# Your situation"];
+pub const MARV_RS_SECTIONS: &[&str] = &["# Your situation", "# Fixing bugs"];
 
 /// Text marv-rs rewords on purpose, as (marv-rs, Marv) pairs: the oracle puts Marv's text back in the system prompt
 /// and the tool descriptions before comparing, so everything around it is still checked. The raw requests (the prefix
