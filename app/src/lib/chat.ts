@@ -312,7 +312,13 @@ export function useChat(id: string | null, settings: ChatSettings, reload = 0) {
     connection.current?.send({ type: "configure", ...settings });
   }, [settings, status]);
 
+  // The id the items belong to: on the render that switches chats they're still the last chat's.
+  const owner = useRef<string | null>(null);
   useEffect(() => {
+    if (owner.current !== id) {
+      owner.current = id;
+      return;
+    }
     // Never an empty list: on open that's the state before the saved transcript loads (and would erase it).
     if (!id || items.length === 0) return;
     try {

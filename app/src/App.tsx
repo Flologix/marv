@@ -107,11 +107,24 @@ function Desktop() {
     );
   const rootName = info.rootName ?? "marv";
 
-  // Another space: its own folder, chats and apps.
+  // Another space: its own folder, chats and apps, back where you left it (renaming one keeps the view).
   function toSpace(next: AppInfo) {
+    const was = info?.active;
     setInfo(next);
-    setFolder("");
+    if (next.active === was) return;
+    const views = stored<Record<string, { folder: string; chatId: string | null }>>("marv-space-views", {});
+    if (was) views[was] = { folder, chatId };
+    keep("marv-space-views", views);
+    const view = next.active ? views[next.active] : undefined;
+    setFolder(view?.folder ?? "");
     setChatId(null);
+    // Its chat again, unless it was deleted since.
+    const id = view?.chatId;
+    if (id)
+      desktop.chats(view.folder).then(
+        (list) => list.some((c) => c.id === id) && setChatId(id),
+        () => {},
+      );
   }
 
   function openGallery() {
