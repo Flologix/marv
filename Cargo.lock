@@ -2654,6 +2654,9 @@ dependencies = [
 name = "marv-desktop"
 version = "0.7.0"
 dependencies = [
+ "marv-core",
+ "marv-mcp",
+ "marv-provider",
  "marv-session",
  "marv-web",
  "serde",
@@ -2662,6 +2665,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-dialog",
  "tokio",
+ "tokio-util",
  "trash",
  "uuid",
 ]
@@ -2872,6 +2876,7 @@ dependencies = [
  "futures",
  "marv-agent",
  "marv-core",
+ "marv-mcp",
  "marv-provider",
  "marv-session",
  "marv-tools",
