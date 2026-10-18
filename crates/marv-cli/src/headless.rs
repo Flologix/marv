@@ -436,6 +436,11 @@ pub async fn run_headless(options: HeadlessOptions) -> ExitCode {
             model: Some(config.model.clone()),
             base_url: Some(config.base_url.clone()),
         },
+        marv_provider::ProviderKind::Zai => marv_provider::ProviderOption::Zai {
+            api_key: config.api_key.clone().unwrap_or_default(),
+            model: Some(config.model.clone()),
+            base_url: Some(config.base_url.clone()),
+        },
     };
     let root = match std::env::current_dir() {
         Ok(r) => r,

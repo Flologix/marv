@@ -367,6 +367,7 @@ impl SessionPort for Fake {
                     m("meta/llama-free", Some((0.0, 0.0)), false, false),
                 ],
                 ProviderId::Ollama => vec![m("qwen3.5:9b", None, true, true), m("tiny:1b", None, true, false)],
+                ProviderId::Zai => vec![m("glm-4.6", None, false, true)],
             };
             let _ = tx.send(UiEvent::Models(Ok(models)));
         });
@@ -376,6 +377,7 @@ impl SessionPort for Fake {
         let label = match answer.provider {
             ProviderId::OpenRouter => "OpenRouter",
             ProviderId::Ollama => "Ollama",
+            ProviderId::Zai => "Z.ai",
         };
         self.system(&format!("Saved to ~/.marv/config.json · {label} · {}", answer.model));
         self.emit(UiEvent::StatusInfo(status(&format!("{}/{}", label.to_lowercase(), answer.model))));

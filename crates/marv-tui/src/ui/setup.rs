@@ -59,6 +59,7 @@ fn provider_hint(id: ProviderId) -> &'static str {
     match id {
         ProviderId::OpenRouter => "hundreds of cloud models, one API key",
         ProviderId::Ollama => "models running on this machine, free",
+        ProviderId::Zai => "GLM models on the Z.ai GLM Coding Plan you pay for",
     }
 }
 
@@ -292,6 +293,7 @@ mod tests {
                 m("z-ai/glm-5.3", true, Some((0.22, 3.39)), false),
             ],
             ProviderId::Ollama => vec![m("qwen3.5:9b", true, None, true), m("tiny:1b", false, None, true)],
+            ProviderId::Zai => vec![m("glm-5.3", true, None, false), m("glm-5.3-flash", true, None, false)],
         }
     }
 

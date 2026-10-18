@@ -1,8 +1,8 @@
 //! Configuration: presets, the file on disk, env overrides, and the provider factory. Ports Marv's
 //! `src/config/config.ts` (and `providerFactory` from `src/provider/factory.ts`, which needs `resolve_config`).
 //!
-//! Two layers, later wins: `~/.marv/config.json` (validated, written 0600 because it can hold the API key), then env
-//! vars (`OPENROUTER_API_KEY`, `MARV_MODEL`, `OLLAMA_HOST`, `MARV_MAX_STEPS`). [`FileConfig`] is what's on disk;
+//! Two layers, later wins: `~/.marv/config.json` (validated, written 0600 because it can hold the API keys), then env
+//! vars (`OPENROUTER_API_KEY`, `ZAI_API_KEY`, `MARV_MODEL`, `OLLAMA_HOST`, `MARV_MAX_STEPS`). [`FileConfig`] is what's on disk;
 //! [`resolve_config`] produces the [`Config`] the app runs on.
 //!
 //! **Security (docs/SECURITY.md):** the config folder comes only from `~/.marv` or `MARV_CONFIG_DIR` *in the real
@@ -55,7 +55,9 @@ pub struct Preset {
     pub default_model: &'static str,
 }
 
-/// `PRESETS`: OpenRouter through the OpenAI-compatible adapter, Ollama through its native API.
+/// `PRESETS`: OpenRouter through the OpenAI-compatible adapter, Ollama through its native API, and (#159) Z.ai's GLM
+/// Coding Plan through the OpenAI-compatible adapter on the plan's own endpoint: a Coding Plan key gets 401 on Z.ai's
+/// general `/api/paas/v4`.
 pub fn preset(kind: ProviderKind) -> Preset {
     match kind {
         ProviderKind::OpenRouter => Preset {
@@ -68,6 +70,13 @@ pub fn preset(kind: ProviderKind) -> Preset {
         ProviderKind::Ollama => {
             Preset { label: "Ollama", base_url: "http://localhost:11434", key_env: None, key_url: None, default_model: "" }
         }
+        ProviderKind::Zai => Preset {
+            label: "Z.ai Coding Plan",
+            base_url: marv_provider::models::ZAI_CODING_BASE_URL,
+            key_env: Some("ZAI_API_KEY"),
+            key_url: Some("z.ai/manage-apikey/apikey-list"),
+            default_model: marv_provider::models::ZAI_DEFAULT_MODEL,
+        },
     }
 }
 
@@ -85,6 +94,9 @@ pub struct FileConfig {
     pub model: Option<String>,
     /// The OpenRouter key.
     pub api_key: Option<String>,
+    /// `zaiApiKey` (#159): the Z.ai Coding Plan key. Its own field, so switching providers never sends one vendor's key
+    /// to another.
+    pub zai_api_key: Option<String>,
     /// Overrides the preset endpoint, e.g. Ollama on another machine.
     pub base_url: Option<String>,
     pub thinking: Option<bool>,
@@ -191,6 +203,24 @@ impl RadioSetting {
 pub struct ConfigError(pub String);
 
 impl FileConfig {
+    /// The saved key of `kind` (#159: each provider has its own field). `None` for a provider that needs none.
+    pub fn key_for(&self, kind: ProviderKind) -> Option<&str> {
+        match kind {
+            ProviderKind::OpenRouter => self.api_key.as_deref(),
+            ProviderKind::Zai => self.zai_api_key.as_deref(),
+            ProviderKind::Ollama => None,
+        }
+    }
+
+    /// Saves `key` as `kind`'s key (nothing for a provider that needs none).
+    pub fn set_key(&mut self, kind: ProviderKind, key: String) {
+        match kind {
+            ProviderKind::OpenRouter => self.api_key = Some(key),
+            ProviderKind::Zai => self.zai_api_key = Some(key),
+            ProviderKind::Ollama => {}
+        }
+    }
+
     /// Validates a parsed config file (zod's `FileConfigSchema`). Unknown keys are ignored, like zod's object.
     pub fn from_value(raw: &Value) -> Result<Self, String> {
         let Value::Object(map) = raw else {
@@ -237,6 +267,7 @@ impl FileConfig {
         let provider = match map.get("provider").and_then(Value::as_str) {
             Some("openrouter") => Some(ProviderKind::OpenRouter),
             Some("ollama") => Some(ProviderKind::Ollama),
+            Some("zai") => Some(ProviderKind::Zai),
             _ => None, // a provider Marv no longer has is dropped, so setup opens
         };
         let base_url = string("baseUrl", &mut problems);
@@ -383,6 +414,7 @@ impl FileConfig {
             provider,
             model: string("model", &mut problems),
             api_key: string("apiKey", &mut problems),
+            zai_api_key: string("zaiApiKey", &mut problems),
             base_url,
             thinking: boolean("thinking", &mut problems),
             reasoning_effort,
@@ -419,6 +451,7 @@ impl FileConfig {
         put("provider", self.provider.map(|p| Value::from(p.id())));
         put("model", self.model.clone().map(Value::from));
         put("apiKey", self.api_key.clone().map(Value::from));
+        put("zaiApiKey", self.zai_api_key.clone().map(Value::from));
         put("baseUrl", self.base_url.clone().map(Value::from));
         put("thinking", self.thinking.map(Value::from));
         put("reasoningEffort", self.reasoning_effort.map(|e| Value::from(e.map_or("default", |e| e.as_str()))));
@@ -576,7 +609,12 @@ pub fn resolve_config(file: Option<&FileConfig>, env: &Env) -> Config {
     let provider = file.and_then(|f| f.provider).unwrap_or(ProviderKind::OpenRouter);
     let preset = preset(provider);
     let env_key = preset.key_env.and_then(|k| env.get(k)).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
-    let api_key = if preset.key_env.is_some() { env_key.clone().or_else(|| file.and_then(|f| f.api_key.clone())) } else { None };
+    // #159: only this provider's own key, from its own variable or field: never another vendor's.
+    let api_key = if preset.key_env.is_some() {
+        env_key.clone().or_else(|| file.and_then(|f| f.key_for(provider)).map(str::to_string))
+    } else {
+        None
+    };
     let file_steps = match file.and_then(|f| f.max_steps) {
         Some(MaxStepsSetting::Off) => 0,
         Some(MaxStepsSetting::Every(n)) => n,
@@ -592,7 +630,7 @@ pub fn resolve_config(file: Option<&FileConfig>, env: &Env) -> Config {
             .unwrap_or_else(|| preset.default_model.into()),
         base_url: file.and_then(|f| f.base_url.clone()).unwrap_or_else(|| match provider {
             ProviderKind::Ollama => ollama_url(env.get("OLLAMA_HOST").map(String::as_str)),
-            ProviderKind::OpenRouter => preset.base_url.into(),
+            ProviderKind::OpenRouter | ProviderKind::Zai => preset.base_url.into(),
         }),
         api_key_source: if env_key.is_some() {
             Some(KeySource::Env)
@@ -722,12 +760,22 @@ pub fn provider_factory(
             FileConfig { provider: Some(ProviderKind::Ollama), model: Some(model), context_length, ..FileConfig::default() },
             host.map(|h| Env::from([("OLLAMA_HOST".to_string(), h)])).unwrap_or_default(),
         ),
+        ProviderOption::Zai { api_key, model, base_url } => (
+            FileConfig {
+                provider: Some(ProviderKind::Zai),
+                zai_api_key: Some(api_key),
+                model,
+                base_url,
+                ..FileConfig::default()
+            },
+            Env::new(),
+        ),
     };
     let config = Config { thinking, reasoning_effort, ..resolve_config(Some(&file), &env) };
     Arc::new(ConfigFactory {
         config: config.provider_config(),
         make: Arc::new(|config, info| marv_provider::create_provider(config, info, Some(marv_provider::errors::SDK_HINTS))),
-        // Marv's model lists need no key (OpenRouter's is public, Ollama's local).
+        // Marv's model lists need no key (OpenRouter's is public, Ollama's local, Z.ai's plan models Marv's own table).
         load: Arc::new(|kind, base_url| Box::pin(async move { marv_provider::models::list_models(kind, &base_url, None).await })),
     })
 }
@@ -991,6 +1039,25 @@ mod tests {
         assert_eq!(resolve_config(Some(&m), &env(&[("OLLAMA_HOST", "https://box.lan/")])).base_url, "https://box.lan");
         let gpu = FileConfig { base_url: Some("http://gpu:11434".into()), ..m };
         assert_eq!(resolve_config(Some(&gpu), &Env::new()).base_url, "http://gpu:11434");
+    }
+
+    /// #159: the Coding Plan's key has its own field and variable, and is saved under `zaiApiKey`.
+    #[test]
+    fn the_zai_plan_has_its_own_key_endpoint_and_default_model() {
+        let f = FileConfig::from_value(&json!({"provider": "zai", "zaiApiKey": "zai-file", "apiKey": "sk-or"})).unwrap();
+        assert_eq!((f.provider, f.key_for(ProviderKind::Zai)), (Some(ProviderKind::Zai), Some("zai-file")));
+        assert_eq!(f.to_value()["zaiApiKey"], json!("zai-file"));
+        let c = resolve_config(Some(&f), &env(&[]));
+        assert_eq!(
+            (c.api_key.as_deref(), c.base_url.as_str(), c.model.as_str()),
+            (Some("zai-file"), "https://api.z.ai/api/coding/paas/v4", "glm-5.3")
+        );
+        let c = resolve_config(Some(&f), &env(&[("ZAI_API_KEY", "zai-env")]));
+        assert_eq!((c.api_key.as_deref(), c.api_key_source), (Some("zai-env"), Some(KeySource::Env)));
+        let mut g = FileConfig::default();
+        g.set_key(ProviderKind::Zai, "z".into());
+        g.set_key(ProviderKind::Ollama, "nothing".into());
+        assert_eq!((g.api_key, g.zai_api_key.as_deref()), (None, Some("z")));
     }
 
     #[test]

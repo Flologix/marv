@@ -7,6 +7,8 @@
 //!   per token as strings and are shown per million tokens.
 //! - Ollama: the native `GET /api/tags`, then per model `POST /api/show` for its `capabilities`
 //!   (a failed `/api/show` leaves `tools` unknown rather than failing the list).
+//! - Z.ai's GLM Coding Plan (#159): Marv's own table ([`ZAI_CODING_MODELS`]), no request. The coding endpoint
+//!   documents no model list, and the plan offers a handful of models: the table is the one place to update.
 //! - `reasoning`: "optional" can be turned off, "mandatory" can't (OpenRouter rejects trying):
 //!   `crate::reasoning_for` depends on this.
 
@@ -38,6 +40,37 @@ pub struct ModelInfo {
     pub reasoning: Option<ReasoningSupport>,
     /// Marv #96: the most tokens one reply may have (OpenRouter's `top_provider.max_completion_tokens`), when known.
     pub max_output: Option<u64>,
+}
+
+/// #159: Z.ai's OpenAI-compatible endpoint for GLM Coding Plan keys. A plan key gets 401 on the general
+/// `https://api.z.ai/api/paas/v4`, and calls there don't draw on the plan.
+pub const ZAI_CODING_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
+
+/// One model the GLM Coding Plan offers: (id, context window, most output tokens), `None` where Z.ai doesn't say.
+pub type ZaiModel = (&'static str, Option<u64>, Option<u64>);
+
+/// #159: the models every GLM Coding Plan includes (docs.z.ai/devpack/overview, 2026-10: "All plans support GLM-5.3,
+/// GLM-5.3-Flash"; older ids are routed to these two). GLM-5.3: 1M-token window, 128K output (docs.z.ai/guides/llm/glm-5.3).
+/// The flash model's window isn't documented. Both always reason ("Disabling reasoning is no longer supported").
+/// Update this table when the plan changes; the first entry is the default.
+pub const ZAI_CODING_MODELS: &[ZaiModel] = &[("glm-5.3", Some(1_000_000), Some(131_072)), ("glm-5.3-flash", None, Some(131_072))];
+
+/// The model setup suggests for the Coding Plan.
+pub const ZAI_DEFAULT_MODEL: &str = ZAI_CODING_MODELS[0].0;
+
+/// [`ZAI_CODING_MODELS`] as model infos: tools, always reasoning, no per-token price (the plan is a subscription).
+pub fn zai_models() -> Vec<ModelInfo> {
+    ZAI_CODING_MODELS
+        .iter()
+        .map(|&(id, context, max_output)| ModelInfo {
+            id: id.into(),
+            tools: Some(true),
+            context,
+            max_output,
+            reasoning: Some(ReasoningSupport::Mandatory),
+            ..Default::default()
+        })
+        .collect()
 }
 
 /// One entry of OpenRouter's `/models` list (only the fields Marv reads).
@@ -129,6 +162,8 @@ pub async fn list_models_with(
             let list: OpenRouterList = get_json(client, &format!("{base_url}/models"), api_key, None).await?;
             Ok(from_openrouter(list.data))
         }
+        // #159: Marv's own table; the coding endpoint documents no model list.
+        ProviderKind::Zai => Ok(zai_models()),
         ProviderKind::Ollama => {
             // Ollama's native API (not the /v1 compatibility layer) lists local models and, per
             // model, its capabilities.
@@ -250,5 +285,15 @@ mod tests {
         assert_eq!(models[1].price_in, None);
         // #96: the output limit, when the list knows it.
         assert_eq!((models[0].max_output, models[1].max_output), (Some(800), None));
+    }
+
+    #[tokio::test]
+    async fn the_zai_plan_lists_its_own_table_without_a_request() {
+        // An unreachable address: Z.ai's list must not touch the network.
+        let models = list_models(ProviderKind::Zai, "http://127.0.0.1:9", None).await.unwrap();
+        assert_eq!(models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["glm-5.3", "glm-5.3-flash"]);
+        assert_eq!(models[0].id, ZAI_DEFAULT_MODEL);
+        assert!(models.iter().all(|m| m.tools == Some(true) && m.reasoning == Some(ReasoningSupport::Mandatory)));
+        assert_eq!(format_price(&models[0]), "", "a subscription: no per-token price");
     }
 }

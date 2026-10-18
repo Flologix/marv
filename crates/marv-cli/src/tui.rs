@@ -404,6 +404,7 @@ fn provider_id(kind: ProviderKind) -> ProviderId {
     match kind {
         ProviderKind::OpenRouter => ProviderId::OpenRouter,
         ProviderKind::Ollama => ProviderId::Ollama,
+        ProviderKind::Zai => ProviderId::Zai,
     }
 }
 
@@ -411,6 +412,7 @@ fn provider_kind(id: ProviderId) -> ProviderKind {
     match id {
         ProviderId::OpenRouter => ProviderKind::OpenRouter,
         ProviderId::Ollama => ProviderKind::Ollama,
+        ProviderId::Zai => ProviderKind::Zai,
     }
 }
 
@@ -473,7 +475,8 @@ pub fn setup_file(file: Option<&FileConfig>, answer: &SetupAnswer) -> FileConfig
     next.provider = Some(kind);
     next.model = Some(answer.model.clone());
     if let Some(key) = &answer.api_key {
-        next.api_key = Some(key.clone());
+        // #159: into the chosen provider's own field, never another's.
+        next.set_key(kind, key.clone());
     }
     next
 }

@@ -9,6 +9,8 @@
 //!   through its native API ([`ollama`]), because only the native API can set `num_ctx`.
 //! - Errors never surface as `Err`: an adapter yields [`ProviderEvent::Error`] with a message the
 //!   user can act on ([`errors`]), and SDK sessions name the option to change ([`errors::SDK_HINTS`]).
+//! - Z.ai's GLM Coding Plan (#159) goes through [`openai_compat`] too, on the plan's coding endpoint
+//!   ([`models::ZAI_CODING_BASE_URL`]) with the plan's own key.
 //! - `/think` on OpenRouter is its unified `reasoning: { enabled }` switch, decided by
 //!   [`reasoning_for`] from what the model list says ([`models::ReasoningSupport`]).
 //! - Marv's `Config`/`PRESETS`/`resolveConfig` live in `marv-session`; this crate only takes the
@@ -76,14 +78,17 @@ pub trait Provider: Send + Sync {
 pub enum ProviderKind {
     OpenRouter,
     Ollama,
+    /// #159: Z.ai's GLM Coding Plan, a subscription, through its OpenAI-compatible coding endpoint.
+    Zai,
 }
 
 impl ProviderKind {
-    /// The id recorded with sessions and trajectories ("openrouter", "ollama").
+    /// The id recorded with sessions and trajectories ("openrouter", "ollama", "zai").
     pub fn id(self) -> &'static str {
         match self {
             Self::OpenRouter => "openrouter",
             Self::Ollama => "ollama",
+            Self::Zai => "zai",
         }
     }
 
@@ -92,6 +97,7 @@ impl ProviderKind {
         match self {
             Self::OpenRouter => "OpenRouter",
             Self::Ollama => "Ollama",
+            Self::Zai => "Z.ai",
         }
     }
 }
@@ -212,6 +218,30 @@ pub fn create_provider(config: &ProviderConfig, model: Option<&ModelInfo>, hints
                 max_tokens: Some(openai_compat::max_tokens_for(model.and_then(|m| m.max_output))),
                 // #116: so max_tokens is clamped to the room the prompt leaves in the window.
                 context_length: model.and_then(|m| m.context),
+            }))
+        }
+        // #159: the GLM Coding Plan on Z.ai's coding endpoint, with the plan's own key. Its models always reason
+        // (`thinking: disabled` is refused), so neither `/think` nor a reasoning switch is sent; `tool_stream` asks for
+        // tool calls in fragments, as OpenRouter streams them (without it they come whole at the end).
+        ProviderKind::Zai => {
+            let mut body = serde_json::Map::new();
+            body.insert("tool_stream".into(), serde_json::Value::Bool(true));
+            let known = models::zai_models().into_iter().find(|m| m.id == config.model);
+            let info = model.or(known.as_ref());
+            Arc::new(openai_compat::OpenAiCompatProvider::new(openai_compat::OpenAiCompatOptions {
+                name: format!("zai · {}", config.model),
+                label: ProviderKind::Zai.label().into(),
+                base_url: config.base_url.clone(),
+                model: config.model.clone(),
+                api_key: config.api_key.clone(),
+                headers: Vec::new(),
+                body,
+                offline_hint: None,
+                hints,
+                timing: Default::default(),
+                idle_timeout: Some(openai_compat::STREAM_IDLE_TIMEOUT),
+                max_tokens: Some(openai_compat::max_tokens_for(info.and_then(|m| m.max_output))),
+                context_length: info.and_then(|m| m.context),
             }))
         }
         // Ollama's native API, so the context window can be set (its default is 4096 tokens).

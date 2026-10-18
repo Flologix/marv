@@ -330,6 +330,8 @@ pub enum PlanStatus {
 pub enum ProviderId {
     OpenRouter,
     Ollama,
+    /// #159: Z.ai's GLM Coding Plan.
+    Zai,
 }
 
 /// What setup needs to know about a provider (Marv `PRESETS[provider]`).

@@ -48,8 +48,22 @@ pub trait ProviderFactory: Send + Sync {
 /// gets the same provider), and what's recorded as the model is its `name()`.
 #[derive(Clone)]
 pub enum ProviderOption {
-    OpenRouter { api_key: String, model: Option<String>, base_url: Option<String> },
-    Ollama { model: String, host: Option<String>, context_length: Option<u64> },
+    OpenRouter {
+        api_key: String,
+        model: Option<String>,
+        base_url: Option<String>,
+    },
+    Ollama {
+        model: String,
+        host: Option<String>,
+        context_length: Option<u64>,
+    },
+    /// #159: Z.ai's GLM Coding Plan, with the plan's own key (never another provider's).
+    Zai {
+        api_key: String,
+        model: Option<String>,
+        base_url: Option<String>,
+    },
     Custom(Arc<dyn Provider>),
 }
 
@@ -86,8 +100,13 @@ impl ProviderFactory for ConfigFactory {
     }
 
     /// OpenRouter's list has every model's context window, prices and reasoning; Ollama's knows
-    /// none of that. A list that fails to load says nothing about the model (`None`).
+    /// none of that. A list that fails to load says nothing about the model (`None`). Z.ai's plan
+    /// models come from Marv's own table ([`crate::models::zai_models`]), so no request is made.
     fn lookup(&self) -> Option<BoxFuture<'static, Option<ModelInfo>>> {
+        if self.config.provider == ProviderKind::Zai {
+            let found = crate::models::zai_models().into_iter().find(|m| m.id == self.config.model);
+            return Some(Box::pin(async move { found }));
+        }
         if self.config.provider != ProviderKind::OpenRouter {
             return None;
         }
