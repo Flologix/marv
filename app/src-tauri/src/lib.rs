@@ -83,6 +83,17 @@ impl Desktop {
         marv_provider::chatgpt::AuthStore::new(&marv_dir())
     }
 
+    /// #159: whether a plan may be used here: its switch is on (`marv_provider::offered`), or it's already the chosen
+    /// provider (as the CLI keeps a config that names it).
+    fn plan_allowed(&self, plan: &str) -> bool {
+        let offered = match plan {
+            "zai" => marv_provider::offered::ZAI_CODING_PLAN,
+            "chatgpt" => marv_provider::offered::CHATGPT_SIGN_IN,
+            _ => false,
+        };
+        offered || self.store.settings().provider.as_deref() == Some(plan)
+    }
+
     /// Whether the chosen provider has what it needs (a key, a sign-in; Ollama nothing).
     fn ready(&self) -> bool {
         match self.store.settings().provider.as_deref() {
@@ -427,27 +438,31 @@ struct PlanModel {
     /// "Z.ai Coding Plan" or "ChatGPT".
     plan: &'static str,
     context: Option<u64>,
+    /// What to show (ChatGPT's `display_name`), when the list has one.
+    name: Option<String>,
 }
 
 /// #159: the models of the plans set up here: the Z.ai Coding Plan's (with a key) and the ChatGPT account's (signed in).
 #[tauri::command]
 async fn plan_models(desktop: State<'_, Desktop>) -> Result<Vec<PlanModel>, String> {
     let mut models = Vec::new();
-    if desktop.zai_key().is_some() {
+    if desktop.plan_allowed("zai") && desktop.zai_key().is_some() {
         models.extend(marv_provider::models::zai_models().into_iter().map(|m| PlanModel {
             id: format!("{}{}", marv_web::host::ZAI_PREFIX, m.id),
             plan: "Z.ai Coding Plan",
             context: m.context,
+            name: m.name,
         }));
     }
     let store = desktop.chatgpt();
-    if store.signed_in() {
+    if desktop.plan_allowed("chatgpt") && store.signed_in() {
         let credentials = marv_provider::chatgpt::ChatGptCredentials { store, endpoints: Default::default() };
         let listed = marv_provider::chatgpt::list_models(&credentials).await.unwrap_or_default();
         models.extend(listed.into_iter().map(|m| PlanModel {
             id: format!("{}{}", marv_web::host::CHATGPT_PREFIX, m.id),
             plan: "ChatGPT",
             context: m.context,
+            name: m.name,
         }));
     }
     Ok(models)
@@ -546,6 +561,11 @@ fn open_chat(
 ) -> Result<Chat, String> {
     // A local (Ollama) model needs no key; a plan (#159) needs its own key or sign-in, never another provider's.
     let (zai, chatgpt) = (marv_web::host::ZAI_PREFIX, marv_web::host::CHATGPT_PREFIX);
+    if (model.starts_with(zai) && !desktop.plan_allowed("zai"))
+        || (model.starts_with(chatgpt) && !desktop.plan_allowed("chatgpt"))
+    {
+        return Err("That plan isn't available in this build.".into());
+    }
     if model.starts_with(zai) && desktop.zai_key().is_none() {
         return Err("Add your Z.ai Coding Plan key first.".into());
     }

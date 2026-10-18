@@ -62,6 +62,20 @@ mod sign_in_listener {
         assert!(get(port, "/auth/callback?code=late&state=the-state").await.is_err());
     }
 
+    /// An idle local connection (any process can open one) doesn't hold the callback up: connections are answered side
+    /// by side, each with a short timeout for its request.
+    #[tokio::test]
+    async fn an_idle_connection_doesnt_stall_the_sign_in() {
+        let listener = listen().await.unwrap();
+        let port = listener.port;
+        let waiting = tokio::spawn(async move { listener.wait("s", Duration::from_secs(10), &CancellationToken::new()).await });
+        let _idle = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let start = std::time::Instant::now();
+        assert!(get(port, "/auth/callback?code=c&state=s").await.unwrap().contains("200"));
+        assert!(matches!(waiting.await.unwrap(), Ok(Callback::Code { .. })));
+        assert!(start.elapsed() < Duration::from_secs(1), "{:?}", start.elapsed());
+    }
+
     /// A sign-in nobody finishes stops listening after its timeout (and on cancel).
     #[tokio::test]
     async fn the_sign_in_listener_times_out() {
@@ -144,4 +158,21 @@ mod plan_limit {
         assert!(message.starts_with("Z.ai: your plan's usage limit is reached"), "{message}");
         assert!(message.contains("won't switch to another key or provider"));
     }
+}
+
+/// The ChatGPT sign-in's token goes only to OpenAI's public API, whatever `baseUrl` a config names.
+#[test]
+fn the_chatgpt_token_is_never_sent_to_another_host() {
+    let config = marv_provider::ProviderConfig {
+        provider: ProviderKind::ChatGpt,
+        model: "gpt-6.1-sol".into(),
+        base_url: "https://attacker.example/v1".into(),
+        api_key: None,
+        context_length: 0,
+        thinking: false,
+        reasoning_effort: None,
+        auth_file: Some("/home/u/.marv/chatgpt.json".into()),
+    };
+    let options = marv_provider::chatgpt_options(&config, Default::default()).unwrap();
+    assert_eq!(options.base_url, "https://api.openai.com/v1");
 }

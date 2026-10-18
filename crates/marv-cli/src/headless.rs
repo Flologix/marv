@@ -437,9 +437,12 @@ pub async fn run_headless(options: HeadlessOptions) -> ExitCode {
             base_url: Some(config.base_url.clone()),
         },
         // #159: the saved sign-in; without one, the first request says to sign in with /setup.
-        marv_provider::ProviderKind::ChatGpt => marv_provider::ProviderOption::ChatGpt {
-            model: config.model.clone(),
-            auth_file: config.auth_file.clone().unwrap_or_default(),
+        marv_provider::ProviderKind::ChatGpt => match config.auth_file.clone() {
+            Some(auth_file) => marv_provider::ProviderOption::ChatGpt { model: config.model.clone(), auth_file },
+            None => {
+                eprintln!("ChatGPT: Marv doesn't know where the sign-in is kept: set HOME or MARV_CONFIG_DIR.");
+                return ExitCode::Error;
+            }
         },
         marv_provider::ProviderKind::Zai => marv_provider::ProviderOption::Zai {
             api_key: config.api_key.clone().unwrap_or_default(),

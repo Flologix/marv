@@ -49,6 +49,8 @@ Each guard's doc comment says how it was proven: the guard was reverted, and the
 | Subscriptions (#159): a provider never gets another provider's key | `subscriptions.rs::a_providers_key_never_goes_to_another_provider` | Proven |
 | Subscriptions: a plan's usage limit is a hard stop (one request, never retried, no other key) | `subscriptions.rs::plan_limit::a_plans_limit_is_a_hard_stop` | Proven |
 | Sign in with ChatGPT: the loopback listener is 127.0.0.1 only, needs the state, takes one callback | `subscriptions.rs::sign_in_listener::the_sign_in_listener_is_loopback_only_needs_the_state_and_takes_one_callback` | Proven |
+| Sign in with ChatGPT: an idle local connection doesn't stall the callback | `subscriptions.rs::sign_in_listener::an_idle_connection_doesnt_stall_the_sign_in` | |
+| Sign in with ChatGPT: the token goes only to api.openai.com, whatever baseUrl says | `subscriptions.rs::the_chatgpt_token_is_never_sent_to_another_host` | |
 | Sign in with ChatGPT: the listener times out and stops on cancel | `subscriptions.rs::sign_in_listener::the_sign_in_listener_times_out` | |
 | Sign in with ChatGPT: tokens never in `Debug` output | `subscriptions.rs::sign_in_listener::the_sign_in_tokens_never_show_in_debug_output` | |
 | Radio (#124): a project's config can't turn it (or wake) on; the startup note | `radio.rs::a_projects_config_cant_turn_the_radio_on` | Proven |

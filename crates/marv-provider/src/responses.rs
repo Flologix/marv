@@ -966,7 +966,7 @@ mod tests {
         ]);
         assert_eq!(result, Ok(()));
         assert!(
-            matches!(events.last(), Some(ProviderEvent::Error(m)) if m.starts_with("TestAI: your ChatGPT plan's usage limit is reached"))
+            matches!(events.last(), Some(ProviderEvent::Error(m)) if m.starts_with("TestAI: the usage limit for Marv on your ChatGPT plan is reached"))
         );
         let (events, result) = run(&[
             r#"{"type":"response.failed","response":{"error":{"code":"server_error","message":"The server is overloaded"}}}"#,

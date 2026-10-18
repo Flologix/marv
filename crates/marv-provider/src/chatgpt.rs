@@ -61,6 +61,8 @@ pub const PREFERRED_PORT: u16 = 1455;
 pub const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
 /// Refresh when the access token has less than this left.
 pub const REFRESH_MARGIN: Duration = Duration::from_secs(300);
+/// How long one connection to the sign-in listener may take to send its request.
+pub const HEADER_TIMEOUT: Duration = Duration::from_secs(2);
 /// The tokens' file in Marv's config folder.
 pub const AUTH_FILE: &str = "chatgpt.json";
 /// A refresh refused with one of these means the sign-in is over.
@@ -434,21 +436,30 @@ impl Listener {
     }
 
     /// Answers requests until one carries `state` (then the listener closes: it takes one callback), `timeout`
-    /// passes, or `cancel` fires. Each request gets 10 s and 16 KB.
+    /// passes, or `cancel` fires. Connections are answered side by side, each given [`HEADER_TIMEOUT`] for its request
+    /// line and at most 16 KB, so an idle local connection (any process can open one) can't hold the callback up.
     pub async fn wait(self, state: &str, timeout: Duration, cancel: &CancellationToken) -> Result<Callback, String> {
         let deadline = tokio::time::Instant::now() + timeout;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut answering = tokio::task::JoinSet::new();
         loop {
-            let accepted = tokio::select! {
+            tokio::select! {
                 _ = cancel.cancelled() => return Err("the sign-in was cancelled".into()),
                 _ = tokio::time::sleep_until(deadline) => {
                     return Err(format!("the sign-in timed out (nothing came back within {} minutes)", timeout.as_secs() / 60));
                 }
-                a = self.listener.accept() => a,
-            };
-            let Ok((stream, _)) = accepted else { continue };
-            match tokio::time::timeout(Duration::from_secs(10), answer(stream, state)).await {
-                Ok(Ok(Callback::Ignored(_))) | Ok(Err(_)) | Err(_) => continue,
-                Ok(Ok(callback)) => return Ok(callback),
+                Some(callback) = rx.recv() => return Ok(callback),
+                accepted = self.listener.accept() => {
+                    let Ok((stream, _)) = accepted else { continue };
+                    let (tx, state) = (tx.clone(), state.to_string());
+                    answering.spawn(async move {
+                        if let Ok(Ok(callback)) = tokio::time::timeout(HEADER_TIMEOUT, answer(stream, &state)).await
+                            && !matches!(callback, Callback::Ignored(_))
+                        {
+                            let _ = tx.send(callback);
+                        }
+                    });
+                }
             }
         }
     }
@@ -767,6 +778,10 @@ struct Jwk {
     kid: Option<String>,
     #[serde(default)]
     kty: String,
+    #[serde(default, rename = "use")]
+    usage: Option<String>,
+    #[serde(default)]
+    alg: Option<String>,
     #[serde(default)]
     n: String,
     #[serde(default)]
@@ -779,8 +794,15 @@ pub async fn verify_id_token(token: &str, endpoints: &Endpoints, client_id: &str
     let jwks: Jwks = async { http().get(endpoints.jwks()).send().await?.error_for_status()?.json().await }
         .await
         .map_err(|e: reqwest::Error| format!("couldn't read OpenAI's signing keys ({e})"))?;
-    let keys: Vec<(Option<String>, Vec<u8>, Vec<u8>)> =
-        jwks.keys.into_iter().filter(|k| k.kty == "RSA").filter_map(|k| Some((k.kid, decode(&k.n)?, decode(&k.e)?))).collect();
+    // Signing keys for RS256 only (a key for encryption, or another algorithm, never verifies a token).
+    let keys: Vec<(Option<String>, Vec<u8>, Vec<u8>)> = jwks
+        .keys
+        .into_iter()
+        .filter(|k| {
+            k.kty == "RSA" && k.usage.as_deref().is_none_or(|u| u == "sig") && k.alg.as_deref().is_none_or(|a| a == "RS256")
+        })
+        .filter_map(|k| Some((k.kid, decode(&k.n)?, decode(&k.e)?)))
+        .collect();
     check_id_token(token, &keys, &endpoints.issuer, client_id, nonce, now_ms() / 1000)
 }
 
@@ -808,12 +830,20 @@ pub fn check_id_token(
     }
     let Some(signature) = decode(signature) else { return bad("signature") };
     let signed = format!("{}.{}", parts[0], parts[1]);
-    let verified =
-        keys.iter().filter(|(kid, ..)| header.kid.is_none() || kid.is_none() || *kid == header.kid).any(|(_, n, e)| {
-            ring::signature::RsaPublicKeyComponents { n, e }
-                .verify(&ring::signature::RSA_PKCS1_2048_8192_SHA256, signed.as_bytes(), &signature)
-                .is_ok()
-        });
+    // With several keys the token must name its own (`kid`), and only that one is tried.
+    if keys.len() > 1 && header.kid.is_none() {
+        return bad("kid");
+    }
+    let candidate = |kid: &Option<String>| match (&header.kid, kid) {
+        (Some(want), Some(have)) => want == have,
+        (Some(_), None) => keys.len() == 1,
+        (None, _) => true,
+    };
+    let verified = keys.iter().filter(|(kid, ..)| candidate(kid)).any(|(_, n, e)| {
+        ring::signature::RsaPublicKeyComponents { n, e }
+            .verify(&ring::signature::RSA_PKCS1_2048_8192_SHA256, signed.as_bytes(), &signature)
+            .is_ok()
+    });
     if !verified {
         return bad("signature");
     }

@@ -81,26 +81,52 @@ pub fn transient(error: &ErrorObject) -> bool {
     if let Some(code) = code {
         return matches!(code, 408 | 429 | 500 | 502 | 503 | 504 | 520..=529);
     }
+    // #159: the ChatGPT plan's temporary ones: retried with backoff.
+    if let Some(serde_json::Value::String(code)) = &error.code
+        && matches!(code.as_str(), "subscription_sharing_usage_unavailable" | "subscription_sharing_user_unavailable")
+    {
+        return true;
+    }
     let message = error.message.as_deref().unwrap_or_default().to_lowercase();
     ["aborted", "timed out", "timeout", "overloaded", "temporarily unavailable", "service unavailable", "try again"]
         .iter()
         .any(|m| message.contains(m))
 }
 
-/// #159: what a plan's error code means. Z.ai's codes (docs.z.ai/api-reference/api-code, all HTTP 429) and the
-/// ChatGPT plan's (developers.openai.com/siwc, errors and recovery).
-fn plan_reason(code: &str) -> Option<&'static str> {
+/// #159: what a plan's error code means, and what to do about it. Z.ai's codes (docs.z.ai/api-reference/api-code,
+/// all HTTP 429) and the ChatGPT plan's (developers.openai.com/siwc, errors and recovery). A temporary one
+/// (`subscription_sharing_usage_unavailable`, `…_user_unavailable`, 503) isn't here: it's retried with backoff
+/// ([`transient`] and the HTTP retry).
+fn plan_reason(code: &str) -> Option<(&'static str, &'static str)> {
+    let limit = "Try again once the limit resets, or choose another provider with /setup.";
     Some(match code {
         // Z.ai: the 5-hour, weekly or monthly limit (1316–1321: with no extra usage left or allowed).
-        "1308" | "1310" | "1316" | "1317" | "1318" | "1319" | "1320" | "1321" => "your plan's usage limit is reached",
-        "1113" => "the account has no balance or resource package left",
-        "1309" => "your plan has expired",
-        "1311" => "your plan doesn't include this model",
-        "1313" => "the plan's fair-use rules stopped this request",
+        "1308" | "1310" | "1316" | "1317" | "1318" | "1319" | "1320" | "1321" => ("your plan's usage limit is reached", limit),
+        "1113" => {
+            ("the account has no balance or resource package left", "Top it up on z.ai, or choose another provider with /setup.")
+        }
+        "1309" => ("your GLM Coding Plan has expired", "Renew it on z.ai, or choose another provider with /setup."),
+        "1311" => ("your plan doesn't include this model", "Pick a model the plan includes with /model."),
+        "1313" => (
+            "Z.ai says this account's usage doesn't comply with its Fair Usage Policy",
+            "Ask Z.ai to restore access, or choose another provider with /setup.",
+        ),
+        "1314" => {
+            ("your enterprise package has expired", "Ask your enterprise administrator, or choose another provider with /setup.")
+        }
+        "1315" => (
+            "this key is for the enterprise coding package only",
+            "Use the key for your plan from z.ai, or choose another provider with /setup.",
+        ),
         // ChatGPT.
-        "subscription_sharing_usage_limit_exceeded" => "your ChatGPT plan's usage limit is reached",
-        "subscription_sharing_usage_unavailable" => "your ChatGPT plan's usage isn't available right now",
-        "subscription_sharing_user_not_eligible" => "this ChatGPT account isn't eligible to use its plan in Marv",
+        "subscription_sharing_usage_limit_exceeded" => (
+            "the usage limit for Marv on your ChatGPT plan is reached",
+            "See chatgpt.com/settings/usage for your plan's and Marv's limits, or choose another provider with /setup.",
+        ),
+        "subscription_sharing_user_not_eligible" => (
+            "ChatGPT plan usage isn't available for this account, workspace or policy",
+            "Signing in again won't change that; choose another provider with /setup.",
+        ),
         _ => return None,
     })
 }
@@ -113,12 +139,9 @@ pub fn plan_limit_of(label: &str, code: Option<&serde_json::Value>, message: Opt
         serde_json::Value::Number(n) => n.to_string(),
         _ => return None,
     };
-    let reason = plan_reason(&code)?;
+    let (reason, advice) = plan_reason(&code)?;
     let detail = message.filter(|m| !m.trim().is_empty()).map(|m| format!(" ({})", clip(m.trim(), MAX_RAW))).unwrap_or_default();
-    Some(format!(
-        "{label}: {reason}{detail}. Marv stopped here and won't switch to another key or provider on its own. Try again once \
-         the limit resets, or choose another provider with /setup."
-    ))
+    Some(format!("{label}: {reason}{detail}. Marv stopped here and won't switch to another key or provider on its own. {advice}"))
 }
 
 /// #159: [`plan_limit_of`] for an error response's body (`{"error":{"code":…,"message":…}}`; OpenAI may put the code
@@ -142,6 +165,10 @@ pub fn error_message(content_type: Option<&str>, status_text: &str, body: &str) 
             Some(serde_json::Value::String(s)) => s.clone(),
             Some(err) if !err.is_null() && err != &serde_json::Value::Bool(false) => {
                 describe_error(&serde_json::from_value(err.clone()).unwrap_or_default())
+            }
+            // #159: OpenAI's admission errors, before a stream opens: `{"detail": "…"}` (diagnostic text).
+            _ if value.get("detail").and_then(serde_json::Value::as_str).is_some() => {
+                clip(value["detail"].as_str().unwrap_or_default(), MAX_RAW)
             }
             _ => body.to_string(),
         },
@@ -279,7 +306,24 @@ mod tests {
         assert!(message.contains("won't switch to another key or provider"));
         assert!(plan_limit("Z.ai", r#"{"error":{"code":1310,"message":"Weekly Limit Exhausted"}}"#).is_some());
         let chatgpt = r#"{"error":{"type":"subscription_sharing_usage_limit_exceeded","message":"Plan usage limit reached"}}"#;
-        assert!(plan_limit("ChatGPT", chatgpt).unwrap().starts_with("ChatGPT: your ChatGPT plan's usage limit is reached"));
+        let message = plan_limit("ChatGPT", chatgpt).unwrap();
+        assert!(message.starts_with("ChatGPT: the usage limit for Marv on your ChatGPT plan is reached"), "{message}");
+        assert!(message.contains("chatgpt.com/settings/usage"));
+        // Each says what fits it: not eligible doesn't say "wait", a model outside the plan says /model.
+        let not_eligible = plan_limit("ChatGPT", r#"{"error":{"code":"subscription_sharing_user_not_eligible"}}"#).unwrap();
+        assert!(not_eligible.contains("won't change") && !not_eligible.contains("resets"), "{not_eligible}");
+        assert!(plan_limit("Z.ai", r#"{"error":{"code":"1311"}}"#).unwrap().contains("/model"));
+        assert!(plan_limit("Z.ai", r#"{"error":{"code":"1309"}}"#).unwrap().contains("Renew"));
+        for code in ["1314", "1315"] {
+            assert!(plan_limit("Z.ai", &format!(r#"{{"error":{{"code":"{code}"}}}}"#)).is_some(), "{code}");
+        }
+        // Temporary: retried, not a hard stop.
+        let unavailable = r#"{"error":{"code":"subscription_sharing_usage_unavailable","message":"Usage couldn't be checked"}}"#;
+        assert_eq!(plan_limit("ChatGPT", unavailable), None);
+        let e = ErrorObject { code: Some("subscription_sharing_usage_unavailable".into()), message: None, metadata: None };
+        assert!(transient(&e));
+        // OpenAI's admission errors carry `detail`.
+        assert_eq!(error_message(None, "Forbidden", r#"{"detail":"Region not supported"}"#), "Region not supported");
         // A passing rate limit (1302) or overload (1305) is retried like any 429, not a hard stop.
         assert_eq!(plan_limit("Z.ai", r#"{"error":{"code":"1302","message":"Rate limit reached"}}"#), None);
         assert_eq!(plan_limit("OpenRouter", r#"{"error":{"code":429,"message":"Rate limited"}}"#), None);

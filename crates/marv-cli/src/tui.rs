@@ -431,6 +431,7 @@ fn model_info(m: marv_provider::ModelInfo) -> view::ModelInfo {
             marv_provider::ReasoningSupport::Optional => view::ReasoningMode::Optional,
             marv_provider::ReasoningSupport::Mandatory => view::ReasoningMode::Mandatory,
         }),
+        name: m.name,
     }
 }
 

@@ -163,6 +163,23 @@ async fn an_unknown_model_is_a_readable_error() {
     );
 }
 
+/// #159 review: "usage couldn't be checked" (503) is temporary: retried with backoff, not a hard stop.
+#[tokio::test]
+async fn usage_unavailable_is_retried() {
+    let server = FakeServer::start(|_| {
+        Reply::json(
+            503,
+            json!({"error": {"code": "subscription_sharing_usage_unavailable", "message": "Usage couldn't be checked"}}),
+        )
+    })
+    .await;
+    let provider = ResponsesProvider::new(options(&server.url(), Arc::new(ApiKey("k".into()))));
+    let events = events(&provider).await;
+    assert_eq!(server.count("/responses"), 3);
+    assert!(events.iter().any(|e| matches!(e, ProviderEvent::Retry { .. })));
+    assert!(matches!(events.last(), Some(ProviderEvent::Error(m)) if m.contains("Usage couldn't be checked")), "{events:?}");
+}
+
 /// #159: the ChatGPT plan's limit is a hard stop: one request, the plan's message, no retry.
 #[tokio::test]
 async fn the_plans_limit_is_not_retried() {
@@ -177,7 +194,7 @@ async fn the_plans_limit_is_not_retried() {
     let events = events(&provider).await;
     assert_eq!(server.count("/responses"), 1);
     assert!(
-        matches!(events.last(), Some(ProviderEvent::Error(m)) if m.starts_with("TestAI: your ChatGPT plan's usage limit is reached")),
+        matches!(events.last(), Some(ProviderEvent::Error(m)) if m.starts_with("TestAI: the usage limit for Marv on your ChatGPT plan is reached")),
         "{events:?}"
     );
 }

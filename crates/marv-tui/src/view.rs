@@ -284,6 +284,8 @@ pub struct ModelInfo {
     /// Runs on this machine (Ollama).
     pub local: bool,
     pub reasoning: Option<ReasoningMode>,
+    /// #159: the name to show beside the id, when the list has one (ChatGPT's `display_name`).
+    pub name: Option<String>,
 }
 
 /// One saved session for `/resume` (Marv `SessionSummary`).

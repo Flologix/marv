@@ -108,7 +108,7 @@ async fn openai(stage: Arc<Mutex<Stage>>) -> FakeServer {
             "/api/accounts/oauth/revoke" => Reply::new(stage.revoke_status.unwrap_or(200), "text/plain", ""),
             "/v1/models" => Reply::json(
                 200,
-                json!({"models": [{"slug": "gpt-6.1-sol", "visibility": "list"}, {"slug": "internal", "visibility": "hide"}]}),
+                json!({"models": [{"slug": "gpt-6.1-sol", "display_name": "GPT-6.1 Sol", "visibility": "list"}, {"slug": "internal", "visibility": "hide"}]}),
             ),
             _ => Reply::text(404, "no"),
         }
@@ -272,6 +272,18 @@ fn the_id_token_is_checked_signature_issuer_audience_expiry_and_nonce() {
     ] {
         assert!(check(&sign(&claims(over.clone()))).unwrap_err().contains(why), "{over}");
     }
+    // With several keys the token must name its key, and only that key is tried.
+    let other = (Some("k2".to_string()), vec![0xc5; 256], vec![1, 0, 1]);
+    let two = vec![keys[0].clone(), other];
+    let check_two = |token: &str| check_id_token(token, &two, "https://auth.openai.com", "oaiapp_1", "N", 1000);
+    assert!(check_two(&sign(&claims(json!({})))).is_ok(), "kid k1 picks the right key");
+    let no_kid = {
+        let header = b64(json!({"alg": "RS256"}).to_string().as_bytes());
+        let token = sign(&claims(json!({})));
+        let parts: Vec<&str> = token.split('.').collect();
+        format!("{header}.{}.{}", parts[1], parts[2])
+    };
+    assert!(check_two(&no_kid).unwrap_err().contains("kid"));
     // A changed payload breaks the signature; so does an unsigned token.
     let token = sign(&claims(json!({})));
     let parts: Vec<&str> = token.split('.').collect();
@@ -359,6 +371,8 @@ async fn the_accounts_listed_models_by_slug() {
     store.save(&signed_in(3600)).await.unwrap();
     let models = list_models(&ChatGptCredentials { store, endpoints: endpoints(&server) }).await.unwrap();
     assert_eq!(models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["gpt-6.1-sol"]);
+    assert_eq!(models[0].name.as_deref(), Some("GPT-6.1 Sol"), "display_name is shown, the slug is sent");
+    assert_eq!(models[0].context, Some(marv_provider::chatgpt::DEFAULT_CONTEXT_WINDOW));
     assert_eq!(server.last().header("authorization"), Some("Bearer at-1"));
 }
 

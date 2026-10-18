@@ -95,7 +95,14 @@ pub fn provider_option(spec: &ChatSpec, model: &str) -> ProviderOption {
         return ProviderOption::Zai { api_key, model: Some(plan.to_string()), base_url: None };
     }
     if let Some(slug) = model.strip_prefix(CHATGPT_PREFIX) {
-        return ProviderOption::ChatGpt { model: slug.to_string(), auth_file: spec.chatgpt_auth.clone().unwrap_or_default() };
+        return match spec.chatgpt_auth.clone() {
+            Some(auth_file) => ProviderOption::ChatGpt { model: slug.to_string(), auth_file },
+            // Never an empty path (it would read a file in the working folder).
+            None => ProviderOption::Custom(std::sync::Arc::new(marv_provider::FailingProvider {
+                name: format!("chatgpt · {slug}"),
+                message: "Sign in with ChatGPT isn't available here.".into(),
+            })),
+        };
     }
     ProviderOption::OpenRouter { api_key: spec.api_key.clone(), model: Some(model.to_string()), base_url: None }
 }

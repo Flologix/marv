@@ -40,6 +40,8 @@ pub struct ModelInfo {
     pub reasoning: Option<ReasoningSupport>,
     /// Marv #96: the most tokens one reply may have (OpenRouter's `top_provider.max_completion_tokens`), when known.
     pub max_output: Option<u64>,
+    /// #159: the name to show (ChatGPT's `display_name`); the id is what's sent.
+    pub name: Option<String>,
 }
 
 /// #159: Z.ai's OpenAI-compatible endpoint for GLM Coding Plan keys. A plan key gets 401 on the general
@@ -127,6 +129,7 @@ pub fn from_openrouter(data: Vec<OpenRouterModel>) -> Vec<ModelInfo> {
                     .reasoning
                     .map(|r| if r.mandatory == Some(true) { ReasoningSupport::Mandatory } else { ReasoningSupport::Optional }),
                 max_output: m.top_provider.and_then(|t| t.max_completion_tokens).filter(|&n| n > 0),
+                name: None,
                 id: m.id,
             }
         })
@@ -177,6 +180,7 @@ pub async fn list_models_with(
                 .filter(|m| m.visibility.as_deref() == Some("list"))
                 .map(|m| ModelInfo {
                     context: Some(crate::chatgpt::context_window(&m.slug)),
+                    name: m.display_name,
                     id: m.slug,
                     tools: Some(true),
                     ..Default::default()
@@ -217,6 +221,8 @@ struct ChatGptList {
 #[derive(Deserialize)]
 struct ChatGptModel {
     slug: String,
+    #[serde(default)]
+    display_name: Option<String>,
     #[serde(default)]
     visibility: Option<String>,
 }

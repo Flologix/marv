@@ -88,8 +88,8 @@ export function ModelPicker({
           <p className="help">Paid by your plan, within its usage limits. When a limit is reached Marv stops and says so.</p>
           <div className="model-list">
             {plans.map((m) => (
-              <button key={m.id} className={`model${m.id === model ? " active" : ""}`} onClick={() => onPick(m.id)}>
-                <span className="model-id">{m.id}</span>
+              <button key={m.id} className={`model${m.id === model ? " active" : ""}`} onClick={() => onPick(m.id)} title={m.id}>
+                <span className="model-id">{m.name}</span>
                 <span className="model-meta">
                   {m.context ? `${tokens(m.context)} · ` : ""}
                   {m.plan}

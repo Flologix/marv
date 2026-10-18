@@ -35,6 +35,8 @@ export interface PlanModel {
   id: string;
   plan: string;
   context: number | null;
+  /** What to show (ChatGPT's display name), when the list has one. */
+  name: string | null;
 }
 
 export interface LocalModel {
@@ -198,7 +200,14 @@ export interface Model {
 export async function planModels(): Promise<Model[]> {
   if (!isDesktop) return [];
   try {
-    return (await desktop.planModels()).map((m) => ({ id: m.id, name: m.id, context: m.context ?? 0, input: 0, output: 0, plan: m.plan }));
+    return (await desktop.planModels()).map((m) => ({
+      id: m.id,
+      name: m.name ?? m.id,
+      context: m.context ?? 0,
+      input: 0,
+      output: 0,
+      plan: m.plan,
+    }));
   } catch {
     return [];
   }
