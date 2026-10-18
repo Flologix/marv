@@ -1,6 +1,6 @@
 import { ask } from "@tauri-apps/plugin-dialog";
 import { useCallback, useEffect, useState } from "react";
-import { type ChatRecord, type Entry, desktop } from "../lib/backend";
+import { type ChatRecord, type Entry, type LiveChat, desktop } from "../lib/backend";
 import { type ServerStatus, forget } from "../lib/chat";
 import { Servers } from "./Servers";
 import { ago } from "../lib/format";
@@ -30,6 +30,10 @@ export function Sidebar({
   onServerAction,
   onServersChanged,
   onBrowseApps,
+  live,
+  onStop,
+  waiting,
+  onJump,
 }: {
   rootName: string;
   folder: string;
@@ -49,6 +53,12 @@ export function Sidebar({
   onServerAction: (action: string, name?: string) => void;
   onServersChanged: () => void;
   onBrowseApps: () => void;
+  /** Chats running now, here or elsewhere (#155). */
+  live: LiveChat[];
+  onStop: (id: string) => void;
+  /** Chats elsewhere waiting for an approval. */
+  waiting: ChatRecord[];
+  onJump: (chat: ChatRecord) => void;
 }) {
   const [children, setChildren] = useState<Record<string, Entry[]>>({});
   const [open, setOpen] = useState<Set<string>>(new Set([""]));
@@ -245,19 +255,42 @@ export function Sidebar({
             +
           </button>
         </div>
-        {chats.length === 0 && <p className="faint" style={{ padding: "2px 12px" }}>none yet</p>}
-        {chats.map((chat) => (
-          <div key={chat.id} className={`chat-row${chat.id === chatId ? " selected" : ""}`} onClick={() => onChat(chat.id)}>
+        {waiting.map((chat) => (
+          <button key={chat.id} className="waiting-elsewhere" onClick={() => onJump(chat)} title={chat.folder}>
             <span className="dot" />
             <span className="title">{chat.title}</span>
-            <span className="when">{ago(chat.created)}</span>
-            <span className="actions" onClick={(e) => e.stopPropagation()}>
-              <button className="icon-btn danger" title="Delete chat" onClick={() => void removeChat(chat)}>
-                ×
-              </button>
-            </span>
-          </div>
+            <span className="faint">needs an answer</span>
+          </button>
         ))}
+        {chats.length === 0 && <p className="faint" style={{ padding: "2px 12px" }}>none yet</p>}
+        {chats.map((chat) => {
+          const state = live.find((l) => l.id === chat.id);
+          const mark = !state ? "" : state.waiting > 0 ? " waiting" : state.busy ? " busy" : " live";
+          const tip = !state
+            ? "Not running: opening it continues the conversation"
+            : state.waiting > 0
+              ? "Running · waiting for your answer"
+              : state.busy
+                ? "Running · working"
+                : "Running · on the mesh, idle";
+          return (
+            <div key={chat.id} className={`chat-row${chat.id === chatId ? " selected" : ""}${mark}`} onClick={() => onChat(chat.id)}>
+              <span className="dot" title={tip} />
+              <span className="title">{chat.title}</span>
+              <span className="when">{ago(chat.created)}</span>
+              <span className="actions" onClick={(e) => e.stopPropagation()}>
+                {state && chat.id !== chatId && (
+                  <button className="icon-btn" title="Stop: it leaves the mesh (opening it again continues it)" onClick={() => onStop(chat.id)}>
+                    ■
+                  </button>
+                )}
+                <button className="icon-btn danger" title="Delete chat" onClick={() => void removeChat(chat)}>
+                  ×
+                </button>
+              </span>
+            </div>
+          );
+        })}
       </div>
       <div className="side-foot">
         <img className="flai" src="/flai.png" alt="FloLogix AI" />
