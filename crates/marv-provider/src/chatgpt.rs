@@ -73,6 +73,23 @@ const SIGNED_OUT_ERRORS: &[&str] = &[
     "refresh_token_reused",
 ];
 
+/// The context windows of ChatGPT models Marv knows, by slug prefix (the longest match wins). The account's model
+/// list doesn't give one, and without it compaction would wait for `compactTokens` alone. GPT-5's family takes 272K
+/// input tokens on the API. Update as models come.
+pub const CONTEXT_WINDOWS: &[(&str, u64)] = &[("gpt-5", 272_000)];
+
+/// The window assumed for a ChatGPT model not in [`CONTEXT_WINDOWS`]: small enough to be safe for any current one.
+pub const DEFAULT_CONTEXT_WINDOW: u64 = 128_000;
+
+/// The context window to assume for `slug`.
+pub fn context_window(slug: &str) -> u64 {
+    CONTEXT_WINDOWS
+        .iter()
+        .filter(|(prefix, _)| slug.starts_with(prefix))
+        .max_by_key(|(prefix, _)| prefix.len())
+        .map_or(DEFAULT_CONTEXT_WINDOW, |&(_, window)| window)
+}
+
 /// What to say when there's no usable sign-in.
 pub const SIGN_IN_AGAIN: &str = "Sign in with ChatGPT again: run /setup.";
 

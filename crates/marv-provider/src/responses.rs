@@ -96,6 +96,8 @@ pub struct ResponsesOptions {
     pub max_output_tokens: Option<u64>,
     /// The namespace the tools go in (`None`: flat). The ChatGPT route's preview takes them only grouped.
     pub tool_namespace: Option<ToolNamespace>,
+    /// The model's context window, when known (the session compacts before it fills).
+    pub context_length: Option<u64>,
     pub hints: ErrorHints,
     pub timing: RetryTiming,
     /// A stream silent for this long is retried (#88).
@@ -565,7 +567,7 @@ impl Provider for ResponsesProvider {
     }
 
     fn context_length(&self) -> Option<u64> {
-        None
+        self.options.context_length
     }
 
     fn stream(&self, history: &[ChatTurn], options: StreamOptions) -> EventStream {
@@ -778,6 +780,7 @@ mod tests {
             encrypted_reasoning: false,
             max_output_tokens: None,
             tool_namespace: None,
+            context_length: None,
             hints: ErrorHints::default(),
             timing: RetryTiming::default(),
             idle_timeout: None,

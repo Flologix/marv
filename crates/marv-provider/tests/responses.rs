@@ -28,6 +28,7 @@ fn options(base_url: &str, credentials: Arc<dyn Credentials>) -> ResponsesOption
         encrypted_reasoning: true,
         max_output_tokens: None,
         tool_namespace: None,
+        context_length: None,
         hints: ErrorHints::default(),
         timing: RetryTiming { scale: 0.001 },
         idle_timeout: None,

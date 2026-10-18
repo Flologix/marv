@@ -272,6 +272,8 @@ pub fn create_provider(config: &ProviderConfig, model: Option<&ModelInfo>, hints
                 max_output_tokens: None,
                 // The route's preview takes function tools only grouped in a namespace.
                 tool_namespace: Some(responses::MARV_TOOLS),
+                // The account's model list gives no window: Marv's table, or a safe default.
+                context_length: Some(chatgpt::context_window(&config.model)),
                 hints,
                 timing: Default::default(),
                 idle_timeout: Some(openai_compat::STREAM_IDLE_TIMEOUT),

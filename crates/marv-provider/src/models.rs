@@ -51,9 +51,11 @@ pub type ZaiModel = (&'static str, Option<u64>, Option<u64>);
 
 /// #159: the models every GLM Coding Plan includes (docs.z.ai/devpack/overview, 2026-10: "All plans support GLM-5.3,
 /// GLM-5.3-Flash"; older ids are routed to these two). GLM-5.3: 1M-token window, 128K output (docs.z.ai/guides/llm/glm-5.3).
-/// The flash model's window isn't documented. Both always reason ("Disabling reasoning is no longer supported").
+/// The flash model's window isn't documented: 200K, what Z.ai's tools page gives for models other than GLM-5.2, so
+/// compaction still runs before the window is reached (a guess on the safe side). Both always reason ("Disabling reasoning is no longer supported").
 /// Update this table when the plan changes; the first entry is the default.
-pub const ZAI_CODING_MODELS: &[ZaiModel] = &[("glm-5.3", Some(1_000_000), Some(131_072)), ("glm-5.3-flash", None, Some(131_072))];
+pub const ZAI_CODING_MODELS: &[ZaiModel] =
+    &[("glm-5.3", Some(1_000_000), Some(131_072)), ("glm-5.3-flash", Some(200_000), Some(131_072))];
 
 /// The model setup suggests for the Coding Plan.
 pub const ZAI_DEFAULT_MODEL: &str = ZAI_CODING_MODELS[0].0;
@@ -173,7 +175,12 @@ pub async fn list_models_with(
                 .models
                 .into_iter()
                 .filter(|m| m.visibility.as_deref() == Some("list"))
-                .map(|m| ModelInfo { id: m.slug, tools: Some(true), ..Default::default() })
+                .map(|m| ModelInfo {
+                    context: Some(crate::chatgpt::context_window(&m.slug)),
+                    id: m.slug,
+                    tools: Some(true),
+                    ..Default::default()
+                })
                 .collect())
         }
         ProviderKind::Ollama => {
