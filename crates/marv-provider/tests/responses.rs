@@ -160,3 +160,22 @@ async fn an_unknown_model_is_a_readable_error() {
         vec![ProviderEvent::Error("Model \"gpt-x\" wasn't found on TestAI. Pick another with /model.\nno such model".into())]
     );
 }
+
+/// #159: the ChatGPT plan's limit is a hard stop: one request, the plan's message, no retry.
+#[tokio::test]
+async fn the_plans_limit_is_not_retried() {
+    let server = FakeServer::start(|_| {
+        Reply::json(
+            429,
+            json!({"error": {"code": "subscription_sharing_usage_limit_exceeded", "message": "Usage limit reached"}}),
+        )
+    })
+    .await;
+    let provider = ResponsesProvider::new(options(&server.url(), Arc::new(ApiKey("k".into()))));
+    let events = events(&provider).await;
+    assert_eq!(server.count("/responses"), 1);
+    assert!(
+        matches!(events.last(), Some(ProviderEvent::Error(m)) if m.starts_with("TestAI: your ChatGPT plan's usage limit is reached")),
+        "{events:?}"
+    );
+}

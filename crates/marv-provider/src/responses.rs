@@ -41,9 +41,9 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::degenerate::DegenerateGuard;
-use crate::errors::{ErrorHints, ErrorObject, describe_error, http_error, unreachable};
+use crate::errors::{ErrorHints, ErrorObject, describe_error, http_error, plan_limit, plan_limit_of, unreachable};
 use crate::openai_compat::{
-    DropCause, Emit, Read, after_degenerate, backoff, channel_stream, is_network_failure, keep_or_restart, read_error,
+    DropCause, Emit, Read, after_degenerate, backoff, channel_stream, is_network_failure, keep_or_restart, read_error_body,
     root_cause, status_wait, until_cancelled, with_continuation,
 };
 use crate::retry::{BodyError, MAX_ATTEMPTS, RetryTiming, idle_guard, retriable_http_status, sleep_abortable};
@@ -344,6 +344,12 @@ impl ReplyAssembler {
 
     /// An error from the stream: retried when a fresh attempt may get past it, else the turn's error.
     fn error(&mut self, error: &ErrorObject, out: &mut Vec<ProviderEvent>) -> Flow {
+        // #159: a plan's limit (`response.failed` after the stream opened): a hard stop, before the retry check (its
+        // message may well say "try again later").
+        if let Some(message) = plan_limit_of(&self.label, error.code.as_ref(), error.message.as_deref()) {
+            out.push(ProviderEvent::Error(message));
+            return Flow::Stop;
+        }
         let message = format!("{}: {}", self.label, describe_error(error));
         if crate::errors::transient(error) {
             self.upstream = Some(message);
@@ -638,13 +644,18 @@ async fn run(
                 Some(Err(_)) => {}
             }
         }
+        // #159: the body first: a plan's limit (a 429) is a hard stop, never retried, never another key or provider.
+        let wait = status_wait(&response, o.timing, attempt);
+        let Some((detail, body)) = read_error_body(response, &cancel).await else { return };
+        if let Some(message) = plan_limit(label, &body) {
+            return emit.send(ProviderEvent::Error(message));
+        }
         if retriable_http_status(status) && attempt < MAX_ATTEMPTS {
-            if sleep_abortable(status_wait(&response, o.timing, attempt), &cancel).await {
+            if sleep_abortable(wait, &cancel).await {
                 return;
             }
             continue;
         }
-        let Some(detail) = read_error(response, &cancel).await else { return };
         emit.send(ProviderEvent::Error(http_error(status, &detail, label, &o.model, o.hints)));
         return;
     }
@@ -875,6 +886,14 @@ mod tests {
         assert_eq!(events.last(), Some(&ProviderEvent::Error("TestAI: Bad input".into())));
         let (events, _) = run(&[r#"{"type":"error","code":"bad","message":"Nope"}"#]);
         assert_eq!(events.last(), Some(&ProviderEvent::Error("TestAI: Nope".into())));
+        // #159: the plan's limit is a hard stop even though its message says to try again.
+        let (events, result) = run(&[
+            r#"{"type":"response.failed","response":{"error":{"code":"subscription_sharing_usage_limit_exceeded","message":"Usage limit reached, try again later"}}}"#,
+        ]);
+        assert_eq!(result, Ok(()));
+        assert!(
+            matches!(events.last(), Some(ProviderEvent::Error(m)) if m.starts_with("TestAI: your ChatGPT plan's usage limit is reached"))
+        );
         let (events, result) = run(&[
             r#"{"type":"response.failed","response":{"error":{"code":"server_error","message":"The server is overloaded"}}}"#,
         ]);

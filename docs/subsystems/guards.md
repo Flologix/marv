@@ -46,6 +46,11 @@ Each guard's doc comment says how it was proven: the guard was reverted, and the
 | Approvals show the full payload | `provenance.rs::approvals_show_the_full_payload` | Proven |
 | A network approval lists scripts written this session | `provenance.rs::a_network_approval_lists_the_scripts_it_runs` | Ignored: not built yet |
 | A mesh message that wakes an idle Marv is fenced and taints; its turn's egress asks (#78) | `mesh.rs::a_woken_turn_reads_its_message_fenced_and_tainted_and_egress_asks` | Proven |
+| Subscriptions (#159): a provider never gets another provider's key | `subscriptions.rs::a_providers_key_never_goes_to_another_provider` | Proven |
+| Subscriptions: a plan's usage limit is a hard stop (one request, never retried, no other key) | `subscriptions.rs::plan_limit::a_plans_limit_is_a_hard_stop` | Proven |
+| Sign in with ChatGPT: the loopback listener is 127.0.0.1 only, needs the state, takes one callback | `subscriptions.rs::sign_in_listener::the_sign_in_listener_is_loopback_only_needs_the_state_and_takes_one_callback` | Proven |
+| Sign in with ChatGPT: the listener times out and stops on cancel | `subscriptions.rs::sign_in_listener::the_sign_in_listener_times_out` | |
+| Sign in with ChatGPT: tokens never in `Debug` output | `subscriptions.rs::sign_in_listener::the_sign_in_tokens_never_show_in_debug_output` | |
 | Radio (#124): a project's config can't turn it (or wake) on; the startup note | `radio.rs::a_projects_config_cant_turn_the_radio_on` | Proven |
 | Radio: off unless the user's own config turns it on (no env variable, no flag) | `radio.rs::the_radio_is_off_unless_the_users_config_turns_it_on` (+ `marv-cli`'s `cli::tests::no_flag_turns_the_radio_on`) | Proven |
 | Radio: a Marv with it off refuses joins and sends no presence | `radio.rs::a_marv_with_the_radio_off_refuses_joins_and_sends_no_presence` | Proven |

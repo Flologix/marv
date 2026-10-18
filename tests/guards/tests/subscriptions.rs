@@ -87,3 +87,61 @@ mod sign_in_listener {
         assert!(!format!("{auth:?}").contains("secret"));
     }
 }
+
+mod plan_limit {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use futures::StreamExt;
+    use marv_core::{ChatTurn, ProviderEvent};
+    use marv_provider::{ProviderConfig, ProviderKind, StreamOptions, create_provider};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A server answering every request with `status` and `body`; counts the requests.
+    async fn answering(status: u16, body: &'static str) -> (String, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let count = Arc::new(AtomicUsize::new(0));
+        let seen = count.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                seen.fetch_add(1, Ordering::SeqCst);
+                let mut buf = vec![0u8; 65536];
+                let _ = socket.read(&mut buf).await;
+                let reply = format!(
+                    "HTTP/1.1 {status} Error\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(reply.as_bytes()).await;
+            }
+        });
+        (url, count)
+    }
+
+    /// A plan's usage limit (Z.ai's 1308, a 429) ends the turn at once with the plan's message: not retried like a
+    /// passing rate limit, and no other key or provider is tried.
+    #[tokio::test]
+    async fn a_plans_limit_is_a_hard_stop() {
+        let body = r#"{"error":{"code":"1308","message":"Usage limit reached for 5 hour."}}"#;
+        let (url, count) = answering(429, body).await;
+        let config = ProviderConfig {
+            provider: ProviderKind::Zai,
+            model: "glm-5.3".into(),
+            base_url: url,
+            api_key: Some("zai-key".into()),
+            context_length: 32768,
+            thinking: false,
+            reasoning_effort: None,
+            auth_file: None,
+        };
+        let events: Vec<_> = create_provider(&config, None, None)
+            .stream(&[ChatTurn::User { text: "hi".into() }], StreamOptions::default())
+            .collect()
+            .await;
+        assert_eq!(count.load(Ordering::SeqCst), 1, "never retried");
+        assert!(!events.iter().any(|e| matches!(e, ProviderEvent::Retry { .. })));
+        let Some(ProviderEvent::Error(message)) = events.last() else { panic!("{events:?}") };
+        assert!(message.starts_with("Z.ai: your plan's usage limit is reached"), "{message}");
+        assert!(message.contains("won't switch to another key or provider"));
+    }
+}
