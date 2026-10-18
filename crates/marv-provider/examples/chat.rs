@@ -34,6 +34,7 @@ async fn main() {
             context_length: 32768,
             thinking,
             reasoning_effort: None,
+            auth_file: None,
         }
     } else {
         let Some(api_key) = env("OPENROUTER_API_KEY") else {
@@ -48,6 +49,7 @@ async fn main() {
             context_length: 32768,
             thinking,
             reasoning_effort: None,
+            auth_file: None,
         }
     };
 

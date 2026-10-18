@@ -8,6 +8,8 @@ license.workspace = true
 [dependencies]
 tokio-util.workspace = true
 marv-core.workspace = true
+# #159: the ChatGPT sign-in's token file: private writes and a lock across Marv processes.
+marv-fs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
@@ -18,6 +20,15 @@ tracing.workspace = true
 # HTTP: rustls only (a single static binary, no system OpenSSL).
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
 regex = "1"
+# #159: the sign-in's PKCE, state, nonce and host id (OS RNG), and the ID token's RS256 check (the ring reqwest's
+# rustls already builds).
+ring = "0.17"
+base64 = "0.22.1"
+
+[dev-dependencies]
+# The sign-in tests: temp config folders and reading the stand-in's form posts.
+tempfile.workspace = true
+url = "2.5.4"
 
 [lints]
 workspace = true

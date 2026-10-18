@@ -164,6 +164,18 @@ pub async fn list_models_with(
         }
         // #159: Marv's own table; the coding endpoint documents no model list.
         ProviderKind::Zai => Ok(zai_models()),
+        // #159: the signed-in account's models (`api_key` is the sign-in's access token): the entries listed for
+        // display, by slug.
+        ProviderKind::ChatGpt => {
+            let token = api_key.ok_or_else(|| "Sign in with ChatGPT first.".to_string())?;
+            let list: ChatGptList = get_json(client, &format!("{base_url}/models"), Some(token), None).await?;
+            Ok(list
+                .models
+                .into_iter()
+                .filter(|m| m.visibility.as_deref() == Some("list"))
+                .map(|m| ModelInfo { id: m.slug, tools: Some(true), ..Default::default() })
+                .collect())
+        }
         ProviderKind::Ollama => {
             // Ollama's native API (not the /v1 compatibility layer) lists local models and, per
             // model, its capabilities.
@@ -187,6 +199,19 @@ pub async fn list_models_with(
 #[derive(Deserialize)]
 struct OpenRouterList {
     data: Vec<OpenRouterModel>,
+}
+
+#[derive(Deserialize)]
+struct ChatGptList {
+    #[serde(default)]
+    models: Vec<ChatGptModel>,
+}
+
+#[derive(Deserialize)]
+struct ChatGptModel {
+    slug: String,
+    #[serde(default)]
+    visibility: Option<String>,
 }
 
 #[derive(Deserialize)]

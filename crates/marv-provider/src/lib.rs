@@ -24,10 +24,12 @@ use futures::Stream;
 use marv_core::{ChatTurn, ProviderEvent, ToolChoice, ToolSpec};
 use tokio_util::sync::CancellationToken;
 
+pub mod chatgpt;
 pub mod degenerate;
 pub mod errors;
 pub mod factory;
 pub mod models;
+pub mod offered;
 pub mod ollama;
 pub mod openai_compat;
 pub mod responses;
@@ -81,6 +83,9 @@ pub enum ProviderKind {
     Ollama,
     /// #159: Z.ai's GLM Coding Plan, a subscription, through its OpenAI-compatible coding endpoint.
     Zai,
+    /// #159: Sign in with ChatGPT: the person's ChatGPT plan, through the Responses API ([`chatgpt`]).
+    #[serde(rename = "chatgpt")]
+    ChatGpt,
 }
 
 impl ProviderKind {
@@ -90,6 +95,7 @@ impl ProviderKind {
             Self::OpenRouter => "openrouter",
             Self::Ollama => "ollama",
             Self::Zai => "zai",
+            Self::ChatGpt => "chatgpt",
         }
     }
 
@@ -99,6 +105,7 @@ impl ProviderKind {
             Self::OpenRouter => "OpenRouter",
             Self::Ollama => "Ollama",
             Self::Zai => "Z.ai",
+            Self::ChatGpt => "ChatGPT",
         }
     }
 }
@@ -119,6 +126,8 @@ pub struct ProviderConfig {
     pub thinking: bool,
     /// `reasoningEffort` (marv-rs #143): how hard an OpenRouter model reasons, where it reasons at all.
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// #159: the ChatGPT sign-in's token file (`<config dir>/chatgpt.json`); `None` for the other providers.
+    pub auth_file: Option<std::path::PathBuf>,
 }
 
 /// OpenRouter's unified reasoning setting, as sent in the request body: `{"enabled": bool}` or `{"effort": "low"}`.
@@ -243,6 +252,27 @@ pub fn create_provider(config: &ProviderConfig, model: Option<&ModelInfo>, hints
                 idle_timeout: Some(openai_compat::STREAM_IDLE_TIMEOUT),
                 max_tokens: Some(openai_compat::max_tokens_for(info.and_then(|m| m.max_output))),
                 context_length: info.and_then(|m| m.context),
+            }))
+        }
+        // #159: the person's ChatGPT plan, through the Responses API with the sign-in's token. The route refuses
+        // `max_output_tokens` and sampling fields, so none are sent; the reasoning effort is, with a summary.
+        ProviderKind::ChatGpt => {
+            let store = chatgpt::AuthStore {
+                path: config.auth_file.clone().unwrap_or_else(|| std::path::PathBuf::from(chatgpt::AUTH_FILE)),
+            };
+            Arc::new(responses::ResponsesProvider::new(responses::ResponsesOptions {
+                name: format!("chatgpt · {}", config.model),
+                label: ProviderKind::ChatGpt.label().into(),
+                base_url: config.base_url.clone(),
+                model: config.model.clone(),
+                credentials: chatgpt::ChatGptCredentials::new(store),
+                headers: Vec::new(),
+                reasoning_effort: config.reasoning_effort,
+                encrypted_reasoning: true,
+                max_output_tokens: None,
+                hints,
+                timing: Default::default(),
+                idle_timeout: Some(openai_compat::STREAM_IDLE_TIMEOUT),
             }))
         }
         // Ollama's native API, so the context window can be set (its default is 4096 tokens).

@@ -60,6 +60,7 @@ fn provider_hint(id: ProviderId) -> &'static str {
         ProviderId::OpenRouter => "hundreds of cloud models, one API key",
         ProviderId::Ollama => "models running on this machine, free",
         ProviderId::Zai => "GLM models on the Z.ai GLM Coding Plan you pay for",
+        ProviderId::ChatGpt => "sign in and use your ChatGPT Plus or Pro plan",
     }
 }
 
@@ -294,6 +295,7 @@ mod tests {
             ],
             ProviderId::Ollama => vec![m("qwen3.5:9b", true, None, true), m("tiny:1b", false, None, true)],
             ProviderId::Zai => vec![m("glm-5.3", true, None, false), m("glm-5.3-flash", true, None, false)],
+            ProviderId::ChatGpt => vec![m("gpt-6.1-sol", true, None, false)],
         }
     }
 

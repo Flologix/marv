@@ -2758,16 +2758,21 @@ name = "marv-provider"
 version = "0.7.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "futures",
  "marv-core",
+ "marv-fs",
  "regex",
  "reqwest 0.12.28",
+ "ring",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
  "tracing",
+ "url",
 ]
 
 [[package]]

@@ -332,6 +332,8 @@ pub enum ProviderId {
     Ollama,
     /// #159: Z.ai's GLM Coding Plan.
     Zai,
+    /// #159: Sign in with ChatGPT.
+    ChatGpt,
 }
 
 /// What setup needs to know about a provider (Marv `PRESETS[provider]`).

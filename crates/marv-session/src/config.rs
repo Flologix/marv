@@ -77,6 +77,14 @@ pub fn preset(kind: ProviderKind) -> Preset {
             key_url: Some("z.ai/manage-apikey/apikey-list"),
             default_model: marv_provider::models::ZAI_DEFAULT_MODEL,
         },
+        // #159: no key; the person signs in (`marv_provider::chatgpt`). The models are the account's, picked in setup.
+        ProviderKind::ChatGpt => Preset {
+            label: "ChatGPT",
+            base_url: marv_provider::chatgpt::API_BASE_URL,
+            key_env: None,
+            key_url: None,
+            default_model: "",
+        },
     }
 }
 
@@ -208,7 +216,7 @@ impl FileConfig {
         match kind {
             ProviderKind::OpenRouter => self.api_key.as_deref(),
             ProviderKind::Zai => self.zai_api_key.as_deref(),
-            ProviderKind::Ollama => None,
+            ProviderKind::Ollama | ProviderKind::ChatGpt => None,
         }
     }
 
@@ -217,7 +225,7 @@ impl FileConfig {
         match kind {
             ProviderKind::OpenRouter => self.api_key = Some(key),
             ProviderKind::Zai => self.zai_api_key = Some(key),
-            ProviderKind::Ollama => {}
+            ProviderKind::Ollama | ProviderKind::ChatGpt => {}
         }
     }
 
@@ -268,6 +276,7 @@ impl FileConfig {
             Some("openrouter") => Some(ProviderKind::OpenRouter),
             Some("ollama") => Some(ProviderKind::Ollama),
             Some("zai") => Some(ProviderKind::Zai),
+            Some("chatgpt") => Some(ProviderKind::ChatGpt),
             _ => None, // a provider Marv no longer has is dropped, so setup opens
         };
         let base_url = string("baseUrl", &mut problems);
@@ -539,6 +548,9 @@ pub struct Config {
     pub mesh_radio: bool,
     /// `herdr.peers` (#74): the panes the Herdr door may open per session.
     pub herdr_peers: u32,
+    /// #159: the ChatGPT sign-in's token file, `chatgpt.json` in the config folder (`MARV_CONFIG_DIR`, else
+    /// `$HOME/.marv`); `None` when the environment names neither.
+    pub auth_file: Option<PathBuf>,
     /// Whether the radio's presence carries the conversation's title (`{"radio": {"titles": false}}` turns it off).
     pub radio_titles: bool,
 }
@@ -554,6 +566,7 @@ impl Config {
             context_length: self.context_length,
             thinking: self.thinking,
             reasoning_effort: self.reasoning_effort,
+            auth_file: (self.provider == ProviderKind::ChatGpt).then(|| self.auth_file.clone()).flatten(),
         }
     }
 }
@@ -630,7 +643,7 @@ pub fn resolve_config(file: Option<&FileConfig>, env: &Env) -> Config {
             .unwrap_or_else(|| preset.default_model.into()),
         base_url: file.and_then(|f| f.base_url.clone()).unwrap_or_else(|| match provider {
             ProviderKind::Ollama => ollama_url(env.get("OLLAMA_HOST").map(String::as_str)),
-            ProviderKind::OpenRouter | ProviderKind::Zai => preset.base_url.into(),
+            ProviderKind::OpenRouter | ProviderKind::Zai | ProviderKind::ChatGpt => preset.base_url.into(),
         }),
         api_key_source: if env_key.is_some() {
             Some(KeySource::Env)
@@ -665,6 +678,11 @@ pub fn resolve_config(file: Option<&FileConfig>, env: &Env) -> Config {
         mesh_radio: file.and_then(|f| f.mesh_radio).is_some_and(|r| r.on),
         radio_titles: file.and_then(|f| f.mesh_radio).is_none_or(|r| r.titles),
         herdr_peers: file.and_then(|f| f.herdr_peers).unwrap_or(DEFAULT_HERDR_PEERS),
+        auth_file: env
+            .get("MARV_CONFIG_DIR")
+            .map(PathBuf::from)
+            .or_else(|| env.get("HOME").map(|home| Path::new(home).join(".marv")))
+            .map(|dir| dir.join(marv_provider::chatgpt::AUTH_FILE)),
     }
 }
 
@@ -672,6 +690,13 @@ pub fn resolve_config(file: Option<&FileConfig>, env: &Env) -> Config {
 pub fn needs_setup(file: Option<&FileConfig>, config: &Config) -> bool {
     if file.and_then(|f| f.provider).is_none() || config.model.is_empty() {
         return true;
+    }
+    // #159: ChatGPT needs a saved sign-in that allows plan usage.
+    if config.provider == ProviderKind::ChatGpt {
+        return !config
+            .auth_file
+            .as_ref()
+            .is_some_and(|path| marv_provider::chatgpt::AuthStore { path: path.clone() }.signed_in());
     }
     preset(config.provider).key_env.is_some() && config.api_key.is_none()
 }
@@ -760,6 +785,12 @@ pub fn provider_factory(
             FileConfig { provider: Some(ProviderKind::Ollama), model: Some(model), context_length, ..FileConfig::default() },
             host.map(|h| Env::from([("OLLAMA_HOST".to_string(), h)])).unwrap_or_default(),
         ),
+        ProviderOption::ChatGpt { model, auth_file } => {
+            let file = FileConfig { provider: Some(ProviderKind::ChatGpt), model: Some(model), ..FileConfig::default() };
+            let config =
+                Config { thinking, reasoning_effort, auth_file: Some(auth_file), ..resolve_config(Some(&file), &Env::new()) };
+            return config_factory(config);
+        }
         ProviderOption::Zai { api_key, model, base_url } => (
             FileConfig {
                 provider: Some(ProviderKind::Zai),
@@ -771,7 +802,11 @@ pub fn provider_factory(
             Env::new(),
         ),
     };
-    let config = Config { thinking, reasoning_effort, ..resolve_config(Some(&file), &env) };
+    config_factory(Config { thinking, reasoning_effort, ..resolve_config(Some(&file), &env) })
+}
+
+/// The SDK's factory for a resolved config.
+fn config_factory(config: Config) -> Arc<dyn ProviderFactory> {
     Arc::new(ConfigFactory {
         config: config.provider_config(),
         make: Arc::new(|config, info| marv_provider::create_provider(config, info, Some(marv_provider::errors::SDK_HINTS))),
@@ -1058,6 +1093,40 @@ mod tests {
         g.set_key(ProviderKind::Zai, "z".into());
         g.set_key(ProviderKind::Ollama, "nothing".into());
         assert_eq!((g.api_key, g.zai_api_key.as_deref()), (None, Some("z")));
+    }
+
+    /// #159: ChatGPT needs no key but a saved sign-in with plan usage; its token file is in the config folder.
+    #[tokio::test]
+    async fn chatgpt_needs_a_sign_in_in_the_config_folder() {
+        let dir = std::env::temp_dir().join(format!("marv-chatgpt-{}-{}", std::process::id(), marv_fs::random_hex()));
+        struct Gone(PathBuf);
+        impl Drop for Gone {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _gone = Gone(dir.clone());
+        let env = env(&[("MARV_CONFIG_DIR", dir.to_str().unwrap()), ("OPENROUTER_API_KEY", "sk-or")]);
+        let f = FileConfig::from_value(&json!({"provider": "chatgpt", "model": "gpt-6.1-sol", "apiKey": "sk-or"})).unwrap();
+        let c = resolve_config(Some(&f), &env);
+        assert_eq!(
+            (c.provider, c.api_key.as_deref(), c.base_url.as_str()),
+            (ProviderKind::ChatGpt, None, "https://api.openai.com/v1")
+        );
+        assert_eq!(c.provider_config().auth_file, Some(dir.join("chatgpt.json")));
+        assert!(needs_setup(Some(&f), &c), "not signed in yet");
+        let store = marv_provider::chatgpt::AuthStore::new(&dir);
+        let signed_in = marv_provider::chatgpt::StoredAuth {
+            access_token: Some("at".into()),
+            refresh_token: Some("rt".into()),
+            scopes: vec![marv_provider::chatgpt::PLAN_SCOPE.into()],
+            ..Default::default()
+        };
+        store.save(&signed_in).await.unwrap();
+        assert!(!needs_setup(Some(&f), &c));
+        // Another provider's config never carries the token file.
+        let o = resolve_config(Some(&FileConfig { provider: Some(ProviderKind::OpenRouter), ..f }), &env);
+        assert_eq!(o.provider_config().auth_file, None);
     }
 
     #[test]

@@ -64,6 +64,11 @@ pub enum ProviderOption {
         model: Option<String>,
         base_url: Option<String>,
     },
+    /// #159: Sign in with ChatGPT, with the sign-in's token file (`<config dir>/chatgpt.json`).
+    ChatGpt {
+        model: String,
+        auth_file: std::path::PathBuf,
+    },
     Custom(Arc<dyn Provider>),
 }
 

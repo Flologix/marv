@@ -405,6 +405,7 @@ fn provider_id(kind: ProviderKind) -> ProviderId {
         ProviderKind::OpenRouter => ProviderId::OpenRouter,
         ProviderKind::Ollama => ProviderId::Ollama,
         ProviderKind::Zai => ProviderId::Zai,
+        ProviderKind::ChatGpt => ProviderId::ChatGpt,
     }
 }
 
@@ -413,6 +414,7 @@ fn provider_kind(id: ProviderId) -> ProviderKind {
         ProviderId::OpenRouter => ProviderKind::OpenRouter,
         ProviderId::Ollama => ProviderKind::Ollama,
         ProviderId::Zai => ProviderKind::Zai,
+        ProviderId::ChatGpt => ProviderKind::ChatGpt,
     }
 }
 

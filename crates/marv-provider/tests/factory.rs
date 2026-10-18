@@ -24,6 +24,7 @@ fn openrouter(base_url: &str, thinking: bool) -> ProviderConfig {
         context_length: 32768,
         thinking,
         reasoning_effort: None,
+        auth_file: None,
     }
 }
 
@@ -115,6 +116,7 @@ fn ollama_has_its_context_window() {
         context_length: 65536,
         thinking: false,
         reasoning_effort: None,
+        auth_file: None,
     };
     let provider = create_provider(&config, None, None);
     assert_eq!(provider.name(), "ollama · qwen3.5:9b");
@@ -174,6 +176,7 @@ async fn error_of(status: u16, config: ProviderConfig, hints: Option<ErrorHints>
     let base_url = match config.provider {
         ProviderKind::OpenRouter | ProviderKind::Zai => format!("{}/v1", server.url()),
         ProviderKind::Ollama => server.url(),
+        ProviderKind::ChatGpt => unreachable!("signs in"),
     };
     let provider = create_provider(&ProviderConfig { base_url, ..config }, None, hints);
     let events: Vec<_> = provider.stream(&hi(), StreamOptions::default()).collect().await;
@@ -225,6 +228,7 @@ async fn the_zai_plan_sends_its_key_and_no_reasoning_switch() {
         context_length: 32768,
         thinking: true,
         reasoning_effort: Some(marv_provider::ReasoningEffort::Medium),
+        auth_file: None,
     };
     let provider = create_provider(&config, None, None);
     assert_eq!(provider.name(), "zai · glm-5.3");
