@@ -270,6 +270,8 @@ pub fn create_provider(config: &ProviderConfig, model: Option<&ModelInfo>, hints
                 reasoning_effort: config.reasoning_effort,
                 encrypted_reasoning: true,
                 max_output_tokens: None,
+                // The route's preview takes function tools only grouped in a namespace.
+                tool_namespace: Some(responses::MARV_TOOLS),
                 hints,
                 timing: Default::default(),
                 idle_timeout: Some(openai_compat::STREAM_IDLE_TIMEOUT),

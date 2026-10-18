@@ -9,7 +9,10 @@
 //!   share a cacheable prefix; `ToolCall::arguments` is sent as the model's raw text, never re-serialized.
 //! - The system prompt goes in `instructions`: a `system` message item is refused on the ChatGPT route.
 //! - Tool calls are `function_call` items, results `function_call_output` items, matched by `call_id`. Tools are
-//!   sent flat (`{"type":"function","name",…}`), not nested under `function` as in chat completions.
+//!   sent flat (`{"type":"function","name",…}`), not nested under `function` as in chat completions; with a
+//!   [`ToolNamespace`] (the ChatGPT route, whose preview takes function tools only grouped in a namespace) they go
+//!   inside one `{"type":"namespace","name","description","tools":[…]}`, and the history's `function_call` items
+//!   carry that `namespace`.
 //! - **Reasoning round-trip:** with `include: ["reasoning.encrypted_content"]` the stream's `reasoning` output items
 //!   carry their encrypted state. They're kept on the assistant turn ([`ProviderEvent::Reasoning`], an array of the
 //!   items) and sent back before that turn's message and calls, without their `id` (with `store: false` the server
@@ -91,6 +94,8 @@ pub struct ResponsesOptions {
     pub encrypted_reasoning: bool,
     /// Sent as `max_output_tokens` when set. `None` on the ChatGPT route, which refuses it.
     pub max_output_tokens: Option<u64>,
+    /// The namespace the tools go in (`None`: flat). The ChatGPT route's preview takes them only grouped.
+    pub tool_namespace: Option<ToolNamespace>,
     pub hints: ErrorHints,
     pub timing: RetryTiming,
     /// A stream silent for this long is retried (#88).
@@ -123,6 +128,9 @@ pub enum InputItem {
         name: String,
         /// The model's raw JSON text (prompt cache: never re-serialized).
         arguments: String,
+        /// The tools' namespace, when they're sent in one.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        namespace: Option<&'static str>,
     },
     FunctionCallOutput {
         #[serde(rename = "type")]
@@ -143,6 +151,32 @@ pub struct WireTool<'a> {
     pub parameters: &'a Value,
 }
 
+/// One entry of `tools`: a function, or a namespace holding them.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum ToolEntry<'a> {
+    Function(WireTool<'a>),
+    Namespace {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        name: &'static str,
+        description: &'static str,
+        tools: Vec<WireTool<'a>>,
+    },
+}
+
+/// A namespace the tools are grouped in (the Responses API's `namespace` tool).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolNamespace {
+    /// Used in tool calls (`function_call.namespace`).
+    pub name: &'static str,
+    /// Shown to the model.
+    pub description: &'static str,
+}
+
+/// The namespace Marv's tools go in where a route wants one (ChatGPT).
+pub const MARV_TOOLS: ToolNamespace = ToolNamespace { name: "marv", description: "Marv's tools for working on this project." };
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct ReasoningParam {
     pub effort: ReasoningEffort,
@@ -157,7 +191,7 @@ pub struct ResponsesRequest<'a> {
     pub instructions: Option<&'a str>,
     pub input: Vec<InputItem>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub tools: Vec<WireTool<'a>>,
+    pub tools: Vec<ToolEntry<'a>>,
     /// Only ever "none" (#59, the wrap-up reply); `Auto` sends nothing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<&'static str>,
@@ -185,7 +219,8 @@ fn reasoning_items(reasoning: Option<&marv_core::Reasoning>) -> impl Iterator<It
 }
 
 /// Marv's conversation as Responses `input` items. Deterministic, so repeated requests share a cacheable prefix.
-pub fn to_input(history: &[ChatTurn]) -> Vec<InputItem> {
+/// `namespace`: the one the tools are sent in, named on every `function_call`.
+pub fn to_input(history: &[ChatTurn], namespace: Option<&'static str>) -> Vec<InputItem> {
     let mut input = Vec::new();
     for turn in history {
         match turn {
@@ -201,6 +236,7 @@ pub fn to_input(history: &[ChatTurn]) -> Vec<InputItem> {
                     call_id: c.id.clone(),
                     name: c.name.clone(),
                     arguments: c.arguments.clone(),
+                    namespace,
                 }));
             }
             ChatTurn::Tool { call_id, text, .. } => input.push(InputItem::FunctionCallOutput {
@@ -211,6 +247,23 @@ pub fn to_input(history: &[ChatTurn]) -> Vec<InputItem> {
         }
     }
     input
+}
+
+/// The tools as sent: flat, or (`namespace`) all inside one namespace. None, nothing (not an empty namespace).
+fn wire_tools(tools: &[ToolSpec], namespace: Option<ToolNamespace>) -> Vec<ToolEntry<'_>> {
+    let flat = tools.iter().map(|t| WireTool {
+        kind: "function",
+        name: &t.name,
+        description: &t.description,
+        parameters: &t.parameters,
+    });
+    match namespace {
+        Some(_) if tools.is_empty() => Vec::new(),
+        Some(ns) => {
+            vec![ToolEntry::Namespace { kind: "namespace", name: ns.name, description: ns.description, tools: flat.collect() }]
+        }
+        None => flat.map(ToolEntry::Function).collect(),
+    }
 }
 
 /// Builds the request body for one stream.
@@ -224,11 +277,8 @@ pub fn request_body<'a>(
     ResponsesRequest {
         model: &options.model,
         instructions: system,
-        input: to_input(history),
-        tools: tools
-            .iter()
-            .map(|t| WireTool { kind: "function", name: &t.name, description: &t.description, parameters: &t.parameters })
-            .collect(),
+        input: to_input(history, options.tool_namespace.map(|n| n.name)),
+        tools: wire_tools(tools, options.tool_namespace),
         tool_choice: (tool_choice == ToolChoice::None).then_some("none"),
         reasoning: options.reasoning_effort.map(|effort| ReasoningParam { effort, summary: "auto" }),
         store: false,
@@ -727,6 +777,7 @@ mod tests {
             reasoning_effort: None,
             encrypted_reasoning: false,
             max_output_tokens: None,
+            tool_namespace: None,
             hints: ErrorHints::default(),
             timing: RetryTiming::default(),
             idle_timeout: None,
@@ -756,7 +807,7 @@ mod tests {
     #[test]
     fn history_becomes_input_items_with_raw_arguments_and_reasoning_without_ids() {
         assert_eq!(
-            serde_json::to_string(&to_input(&history())).unwrap(),
+            serde_json::to_string(&to_input(&history(), None)).unwrap(),
             concat!(
                 r#"[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},"#,
                 r#"{"encrypted_content":"enc","summary":[],"type":"reasoning"},"#,
@@ -765,6 +816,26 @@ mod tests {
                 r#"{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}]"#
             )
         );
+    }
+
+    /// #159 review: the ChatGPT route takes function tools only in a namespace; the history's calls name it.
+    #[test]
+    fn tools_can_go_in_a_namespace_and_calls_carry_it() {
+        let tools = vec![ToolSpec { name: "t".into(), description: "d".into(), parameters: serde_json::json!({}) }];
+        let o = ResponsesOptions { tool_namespace: Some(MARV_TOOLS), ..options() };
+        let body = serde_json::to_value(request_body(&o, &history(), None, &tools, ToolChoice::Auto)).unwrap();
+        assert_eq!(
+            body["tools"],
+            serde_json::json!([{"type": "namespace", "name": "marv", "description": MARV_TOOLS.description,
+                "tools": [{"type": "function", "name": "t", "description": "d", "parameters": {}}]}])
+        );
+        let call = body["input"].as_array().unwrap().iter().find(|i| i["type"] == "function_call").unwrap();
+        assert_eq!(call["namespace"], "marv");
+        // No tools, no empty namespace; flat calls carry no namespace.
+        let body = serde_json::to_value(request_body(&o, &[], None, &[], ToolChoice::Auto)).unwrap();
+        assert_eq!(body.get("tools"), None);
+        let flat = serde_json::to_string(&to_input(&history(), None)).unwrap();
+        assert!(!flat.contains("namespace"));
     }
 
     #[test]
