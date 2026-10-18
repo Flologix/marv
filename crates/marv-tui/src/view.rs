@@ -367,10 +367,34 @@ pub struct SetupContext {
     pub current: Option<(ProviderId, String)>,
     /// The saved API key of each provider that has one, masked (#159: each provider has its own).
     pub saved_keys: Vec<(ProviderId, String)>,
-    /// #159: the providers with a saved sign-in, and who is signed in (an email, or "signed in").
-    pub signed_in: Vec<(ProviderId, String)>,
+    /// #159: the saved sign-ins (registrations) of providers that sign in, the one in use first.
+    pub accounts: Vec<(ProviderId, AccountInfo)>,
     /// A key found in the environment for each provider, masked.
     pub env_keys: Vec<(ProviderId, String)>,
+}
+
+/// #159: one saved sign-in (a ChatGPT registration).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountInfo {
+    /// What the engine knows it by (the issued client id).
+    pub id: String,
+    /// What's shown (an email).
+    pub label: String,
+    /// Signed in, with plan usage.
+    pub signed_in: bool,
+    /// The one in use.
+    pub active: bool,
+}
+
+/// #159: which registration a sign-in is for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignInTarget {
+    /// The one in use (a new registration when there's none).
+    Current,
+    /// A saved one, by id.
+    Account(String),
+    /// A new registration: another account.
+    New,
 }
 
 /// #159: how a sign-in is going.
@@ -747,7 +771,10 @@ pub trait SessionPort: Send + Sync {
     fn complete_setup(&self, answer: SetupAnswer);
 
     /// #159: setup's sign-in step: open the browser and wait for the sign-in ([`UiEvent::SignIn`]).
-    fn sign_in(&self, _provider: ProviderId) {}
+    fn sign_in(&self, _provider: ProviderId, _target: SignInTarget) {}
+
+    /// #159: setup switched to another saved sign-in: make it the one in use ([`UiEvent::SignIn`] when done).
+    fn use_account(&self, _provider: ProviderId, _id: String) {}
 
     /// #159: setup closed while a sign-in waited: stop listening for it.
     fn cancel_sign_in(&self) {}

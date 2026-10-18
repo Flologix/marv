@@ -482,16 +482,19 @@ pub fn setup_context(start: SetupStart, file: Option<&FileConfig>, config: &Conf
         presets,
         current: file.and_then(|f| f.provider).map(|kind| (provider_id(kind), config.model.clone())),
         saved_keys: kinds.iter().filter_map(|&kind| Some((provider_id(kind), mask_key(file?.key_for(kind)?)))).collect(),
-        signed_in: config
+        accounts: config
             .auth_file
             .clone()
-            .map(|path| marv_provider::chatgpt::AuthStore { path })
-            .filter(|store| kinds.contains(&ProviderKind::ChatGpt) && store.signed_in())
-            .map(|store| {
-                let who = store.load().and_then(|a| a.email).unwrap_or_else(|| "your ChatGPT account".into());
-                (ProviderId::ChatGpt, who)
-            })
+            .filter(|_| kinds.contains(&ProviderKind::ChatGpt))
+            .map(|path| marv_provider::chatgpt::AuthStore { path }.accounts())
+            .unwrap_or_default()
             .into_iter()
+            .enumerate()
+            .filter_map(|(i, a)| {
+                let info =
+                    view::AccountInfo { id: a.client_id.clone()?, label: a.label(), signed_in: a.usable(), active: i == 0 };
+                Some((ProviderId::ChatGpt, info))
+            })
             .collect(),
         env_keys,
     }
@@ -2560,7 +2563,7 @@ impl SessionPort for Port {
         b.save_config(next, format!("Saved to {} · {label} · {}", shorten_home(&b.store.path, &b.home), answer.model));
     }
 
-    fn sign_in(&self, _provider: ProviderId) {
+    fn sign_in(&self, _provider: ProviderId, target: view::SignInTarget) {
         let b = self.0.clone();
         let cancel = CancellationToken::new();
         if let Some(old) = b.sign_in.lock().unwrap_or_else(|e| e.into_inner()).replace(cancel.clone()) {
@@ -2568,9 +2571,15 @@ impl SessionPort for Port {
         }
         let store = auth_store(&b.config(), &b.config_dir);
         tokio::spawn(async move {
-            let done = match marv_provider::chatgpt::start_sign_in(store, Default::default()).await {
+            let target = match target {
+                view::SignInTarget::Current => marv_provider::chatgpt::SignInTarget::Current,
+                view::SignInTarget::Account(id) => marv_provider::chatgpt::SignInTarget::Account(id),
+                view::SignInTarget::New => marv_provider::chatgpt::SignInTarget::New,
+            };
+            let done = match marv_provider::chatgpt::start_sign_in(store, Default::default(), target).await {
                 Ok(sign_in) => {
-                    b.emit(UiEvent::SignIn(view::SignInProgress::Started { url: sign_in.url().to_string() }));
+                    // Shown without the id_token_hint (a token); the browser gets the whole address.
+                    b.emit(UiEvent::SignIn(view::SignInProgress::Started { url: sign_in.shown_url().to_string() }));
                     if let Ok(url) = sign_in.url().parse() {
                         (b.open_url)(url);
                     }
@@ -2578,6 +2587,15 @@ impl SessionPort for Port {
                 }
                 Err(why) => Err(why),
             };
+            b.emit(UiEvent::SignIn(view::SignInProgress::Done(done)));
+        });
+    }
+
+    fn use_account(&self, _provider: ProviderId, id: String) {
+        let b = self.0.clone();
+        let store = auth_store(&b.config(), &b.config_dir);
+        tokio::spawn(async move {
+            let done = store.activate(&id).await.map(|a| a.label());
             b.emit(UiEvent::SignIn(view::SignInProgress::Done(done)));
         });
     }

@@ -1117,6 +1117,7 @@ mod tests {
         assert!(needs_setup(Some(&f), &c), "not signed in yet");
         let store = marv_provider::chatgpt::AuthStore::new(&dir);
         let signed_in = marv_provider::chatgpt::StoredAuth {
+            client_id: Some("oaiapp_1".into()),
             access_token: Some("at".into()),
             refresh_token: Some("rt".into()),
             scopes: vec![marv_provider::chatgpt::PLAN_SCOPE.into()],

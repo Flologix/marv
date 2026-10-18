@@ -81,13 +81,18 @@ pub const SIGN_IN_AGAIN: &str = "Sign in with ChatGPT again: run /setup.";
 pub struct Endpoints {
     pub issuer: String,
     pub api: String,
+    /// The first wait before a revocation is tried again (doubled each time).
+    pub backoff: Duration,
 }
 
 impl Default for Endpoints {
     fn default() -> Self {
-        Self { issuer: ISSUER.into(), api: API_BASE_URL.into() }
+        Self { issuer: ISSUER.into(), api: API_BASE_URL.into(), backoff: Duration::from_millis(500) }
     }
 }
+
+/// How many times a revocation is tried (network failures and 5xx).
+pub const REVOKE_ATTEMPTS: u32 = 3;
 
 impl Endpoints {
     fn authorize(&self) -> String {
@@ -145,13 +150,15 @@ fn same(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// What `chatgpt.json` holds.
+/// One registration in `chatgpt.json`: an issued client id, the account it was issued for, and that account's
+/// tokens (none while signed out).
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StoredAuth {
-    /// This machine's `ext_agent_host_id`, made once and kept across sign-outs.
+    /// This machine's `ext_agent_host_id` (the file's; filled in on load).
+    #[serde(default, skip_serializing)]
     pub host_id: String,
-    /// The client id OpenAI issued at the first sign-in (kept across sign-outs).
+    /// The client id OpenAI issued at this registration (kept across sign-outs).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -167,10 +174,17 @@ pub struct StoredAuth {
     /// When the access token expires, ms since the epoch.
     #[serde(default)]
     pub expires_at: u64,
+    /// The token response's `earliest_refresh_at`, ms since the epoch: no routine refresh before it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub refresh_after: u64,
     #[serde(default)]
     pub scopes: Vec<String>,
     #[serde(default)]
     pub saved_at: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// Never the tokens: a `{:?}` in a log or an error mustn't carry them.
@@ -190,11 +204,54 @@ impl StoredAuth {
         self.access_token.is_some() && self.refresh_token.is_some()
     }
 
-    /// Drops the tokens, keeping the client id, the host id and who it was.
+    /// Signed in, with plan usage granted.
+    pub fn usable(&self) -> bool {
+        self.signed_in() && self.scopes.iter().any(|s| s == PLAN_SCOPE)
+    }
+
+    /// What setup shows for it: the email, else a short form of the subject.
+    pub fn label(&self) -> String {
+        self.email.clone().unwrap_or_else(|| "your ChatGPT account".into())
+    }
+
+    /// Drops the tokens (the ID token too: no `id_token_hint` after a sign-out), keeping the client id and who it was.
     fn clear_tokens(&mut self) {
         (self.id_token, self.access_token, self.refresh_token) = (None, None, None);
-        self.expires_at = 0;
+        (self.expires_at, self.refresh_after) = (0, 0);
         self.scopes.clear();
+    }
+}
+
+/// `chatgpt.json`: this machine's host id, every registration (one per issued client id, each bound to one account,
+/// as OpenAI's docs ask: never two registrations' tokens mixed), and which one is in use.
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthFile {
+    #[serde(default)]
+    pub host_id: String,
+    /// The client id of the registration in use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<String>,
+    #[serde(default)]
+    pub accounts: Vec<StoredAuth>,
+}
+
+impl AuthFile {
+    fn account(&self, client_id: &str) -> Option<&StoredAuth> {
+        self.accounts.iter().find(|a| a.client_id.as_deref() == Some(client_id))
+    }
+
+    fn active(&self) -> Option<StoredAuth> {
+        let account = self.account(self.active.as_deref()?)?;
+        Some(StoredAuth { host_id: self.host_id.clone(), ..account.clone() })
+    }
+
+    /// Adds or replaces `auth`'s registration (by client id) and makes it the one in use.
+    fn put(&mut self, auth: StoredAuth) {
+        let client_id = auth.client_id.clone();
+        self.accounts.retain(|a| a.client_id != client_id);
+        self.accounts.push(StoredAuth { host_id: String::new(), saved_at: now_ms(), ..auth });
+        self.active = client_id;
     }
 }
 
@@ -209,18 +266,72 @@ impl AuthStore {
         Self { path: config_dir.join(AUTH_FILE) }
     }
 
-    /// What's saved; `None` when nothing is (or the file isn't readable as Marv wrote it).
-    pub fn load(&self) -> Option<StoredAuth> {
-        serde_json::from_str(&std::fs::read_to_string(&self.path).ok()?).ok()
+    /// The whole file; empty when there's none (or it isn't readable as Marv wrote it).
+    pub fn file(&self) -> AuthFile {
+        std::fs::read_to_string(&self.path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
     }
 
-    /// Saves privately (0600) and atomically.
-    pub async fn save(&self, auth: &StoredAuth) -> Result<(), String> {
-        let text =
-            serde_json::to_string_pretty(&StoredAuth { saved_at: now_ms(), ..auth.clone() }).map_err(|e| e.to_string())? + "\n";
+    /// The registration in use, if any.
+    pub fn load(&self) -> Option<StoredAuth> {
+        self.file().active()
+    }
+
+    /// Every registration, the one in use first.
+    pub fn accounts(&self) -> Vec<StoredAuth> {
+        let file = self.file();
+        let mut accounts = file.accounts.clone();
+        accounts.sort_by_key(|a| a.client_id != file.active);
+        accounts.into_iter().map(|a| StoredAuth { host_id: file.host_id.clone(), ..a }).collect()
+    }
+
+    async fn write(&self, file: &AuthFile) -> Result<(), String> {
+        let text = serde_json::to_string_pretty(file).map_err(|e| e.to_string())? + "\n";
         marv_fs::private_file::write_private(&self.path, &text)
             .await
             .map_err(|e| format!("couldn't save the sign-in to {} ({e})", self.path.display()))
+    }
+
+    /// Saves `auth` as its registration (by client id), in use from now on; privately (0600) and atomically. The
+    /// host id is the file's (made now if there is none yet).
+    pub async fn save(&self, auth: &StoredAuth) -> Result<(), String> {
+        let mut file = self.file();
+        if file.host_id.is_empty() {
+            file.host_id = if auth.host_id.is_empty() { new_host_id() } else { auth.host_id.clone() };
+        }
+        file.put(auth.clone());
+        self.write(&file).await
+    }
+
+    /// This machine's host id: the saved one, or a new one saved now (kept across sign-outs and registrations).
+    pub async fn host_id(&self) -> Result<String, String> {
+        let mut file = self.file();
+        if file.host_id.is_empty() {
+            file.host_id = new_host_id();
+            self.write(&file).await?;
+        }
+        Ok(file.host_id)
+    }
+
+    /// Makes the registration `client_id` the one in use (another saved account).
+    pub async fn activate(&self, client_id: &str) -> Result<StoredAuth, String> {
+        let work = async {
+            let mut file = self.file();
+            let account = file.account(client_id).cloned().ok_or("That ChatGPT account isn't saved any more.")?;
+            file.active = Some(client_id.to_string());
+            self.write(&file).await?;
+            Ok(account)
+        };
+        self.locked(work).await?
+    }
+
+    /// Forgets the registration `client_id` (OpenAI no longer knows it): the next sign-in registers again.
+    async fn forget(&self, client_id: &str) -> Result<(), String> {
+        let mut file = self.file();
+        file.accounts.retain(|a| a.client_id.as_deref() != Some(client_id));
+        if file.active.as_deref() == Some(client_id) {
+            file.active = None;
+        }
+        self.write(&file).await
     }
 
     /// Runs `work` holding the file's lock (refresh and sign-in must not race another Marv's).
@@ -228,9 +339,9 @@ impl AuthStore {
         marv_fs::with_file_lock(&self.path, marv_fs::LockOptions::default(), || work).await.map_err(|e| e.to_string())
     }
 
-    /// Whether a sign-in with plan usage is saved (the status line, `/setup`).
+    /// Whether the registration in use is signed in with plan usage (the status line, `/setup`).
     pub fn signed_in(&self) -> bool {
-        self.load().is_some_and(|a| a.signed_in() && a.scopes.iter().any(|s| s == PLAN_SCOPE))
+        self.load().is_some_and(|a| a.usable())
     }
 }
 
@@ -366,33 +477,63 @@ async fn answer(mut stream: tokio::net::TcpStream, state: &str) -> std::io::Resu
 /// A sign-in under way: open [`SignIn::url`] in the browser, then [`SignIn::finish`].
 pub struct SignIn {
     url: String,
+    /// The same address without the `id_token_hint` (what's shown: the hint is a token).
+    shown_url: String,
     listener: Listener,
     store: AuthStore,
     endpoints: Endpoints,
-    previous: StoredAuth,
+    /// The registration being signed in again; `None` for a new registration.
+    previous: Option<StoredAuth>,
+    host_id: String,
     state: String,
     nonce: String,
     verifier: String,
 }
 
-/// Starts a sign-in: listens on the loopback and builds the authorize address (a first sign-in registers; a later
-/// one reuses the issued client id and names the account it was).
-pub async fn start_sign_in(store: AuthStore, endpoints: Endpoints) -> Result<SignIn, String> {
+/// Which registration a sign-in is for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignInTarget {
+    /// The registration in use, or a new one when there's none.
+    Current,
+    /// A saved registration, by its client id.
+    Account(String),
+    /// A new registration: another ChatGPT account (or the same one, registered again).
+    New,
+}
+
+/// What to say when OpenAI no longer knows a registration (Marv has forgotten it).
+pub const REGISTER_AGAIN: &str =
+    "OpenAI no longer knows this Marv's registration, so Marv forgot it. Sign in again: it registers anew.";
+
+/// Starts a sign-in: listens on the loopback and builds the authorize address. A new registration names
+/// `dynamic_agent_client` and Marv; signing in again reuses the registration's issued client id and names the
+/// account. Either way the host id is this machine's, kept across registrations.
+pub async fn start_sign_in(store: AuthStore, endpoints: Endpoints, target: SignInTarget) -> Result<SignIn, String> {
     let listener = listen().await.map_err(|e| format!("couldn't listen on 127.0.0.1 for the sign-in ({e})"))?;
-    let previous = store.load().unwrap_or_default();
-    let previous = if previous.host_id.is_empty() { StoredAuth { host_id: new_host_id(), ..previous } } else { previous };
+    let host_id = store.host_id().await?;
+    let previous = match &target {
+        SignInTarget::Current => store.load(),
+        SignInTarget::Account(id) => Some(
+            store
+                .accounts()
+                .into_iter()
+                .find(|a| a.client_id.as_deref() == Some(id.as_str()))
+                .ok_or("That ChatGPT account isn't saved any more.")?,
+        ),
+        SignInTarget::New => None,
+    }
+    .filter(|a| a.client_id.is_some());
     let (state, nonce) = (random_token(), random_token());
     let (verifier, challenge) = pkce();
     let mut url = Url::parse(&endpoints.authorize()).map_err(|e| e.to_string())?;
+    let mut hint = None;
     {
         let mut q = url.query_pairs_mut();
-        match &previous.client_id {
-            Some(client_id) => {
-                q.append_pair("client_id", client_id);
-                if let Some(hint) = &previous.id_token {
-                    q.append_pair("id_token_hint", hint);
-                }
-                if let Some(email) = &previous.email {
+        match &previous {
+            Some(account) => {
+                q.append_pair("client_id", account.client_id.as_deref().unwrap_or_default());
+                hint = account.id_token.clone();
+                if let Some(email) = &account.email {
                     q.append_pair("login_hint", email);
                 }
             }
@@ -401,7 +542,7 @@ pub async fn start_sign_in(store: AuthStore, endpoints: Endpoints) -> Result<Sig
                 q.append_pair("agent_name_hint", AGENT_NAME);
             }
         }
-        q.append_pair("ext_agent_host_id", &previous.host_id)
+        q.append_pair("ext_agent_host_id", &host_id)
             .append_pair("response_type", "code")
             .append_pair("redirect_uri", &listener.redirect_uri())
             .append_pair("scope", SCOPES)
@@ -411,7 +552,11 @@ pub async fn start_sign_in(store: AuthStore, endpoints: Endpoints) -> Result<Sig
             .append_pair("code_challenge", &challenge)
             .append_pair("code_challenge_method", "S256");
     }
-    Ok(SignIn { url: url.into(), listener, store, endpoints, previous, state, nonce, verifier })
+    let shown_url = url.to_string();
+    if let Some(hint) = hint {
+        url.query_pairs_mut().append_pair("id_token_hint", &hint);
+    }
+    Ok(SignIn { url: url.into(), shown_url, listener, store, endpoints, previous, host_id, state, nonce, verifier })
 }
 
 /// Who signed in.
@@ -433,11 +578,24 @@ struct TokenResponse {
     scope: Option<String>,
     #[serde(default)]
     scopes: Option<Vec<String>>,
+    /// No routine refresh before this (Unix seconds, or ms).
+    #[serde(default)]
+    earliest_refresh_at: Option<Value>,
 }
 
 impl TokenResponse {
+    /// The granted scopes (the token response's, which decide plan usage).
     fn scopes(&self) -> Option<Vec<String>> {
         self.scopes.clone().or_else(|| self.scope.as_ref().map(|s| s.split_whitespace().map(str::to_string).collect()))
+    }
+
+    /// `earliest_refresh_at` in ms since the epoch (a number of seconds or ms; anything else is ignored).
+    fn refresh_after(&self) -> u64 {
+        match self.earliest_refresh_at.as_ref().and_then(Value::as_u64) {
+            Some(n) if n > 100_000_000_000 => n,
+            Some(n) => n * 1000,
+            None => 0,
+        }
     }
 }
 
@@ -468,9 +626,15 @@ async fn token_request(endpoints: &Endpoints, form: &[(&str, &str)]) -> Result<T
 }
 
 impl SignIn {
-    /// The authorize address to open in the browser.
+    /// The authorize address to open in the browser (it may carry the account's `id_token_hint`: never show or log
+    /// it; [`SignIn::shown_url`] is for that).
     pub fn url(&self) -> &str {
         &self.url
+    }
+
+    /// The authorize address without the `id_token_hint`, to show in case the browser didn't open.
+    pub fn shown_url(&self) -> &str {
+        &self.shown_url
     }
 
     pub fn port(&self) -> u16 {
@@ -484,46 +648,56 @@ impl SignIn {
     }
 
     pub async fn finish_within(self, timeout: Duration, cancel: CancellationToken) -> Result<Account, String> {
-        let Self { listener, store, endpoints, previous, state, nonce, verifier, .. } = self;
+        let Self { listener, store, endpoints, previous, host_id, state, nonce, verifier, .. } = self;
         let redirect_uri = listener.redirect_uri();
-        let (code, issued, scope) = match listener.wait(&state, timeout, &cancel).await? {
-            Callback::Code { code, client_id, scope } => (code, client_id, scope),
+        let kept = previous.as_ref().and_then(|p| p.client_id.clone());
+        let (code, issued) = match listener.wait(&state, timeout, &cancel).await? {
+            Callback::Code { code, client_id, .. } => (code, client_id),
+            // A registration OpenAI no longer knows (revoked, deleted): forget it, so the next sign-in registers.
+            Callback::Refused(why) if kept.is_some() && matches!(why.as_str(), "invalid_client" | "unauthorized_client") => {
+                store.forget(kept.as_deref().unwrap_or_default()).await?;
+                return Err(REGISTER_AGAIN.into());
+            }
             Callback::Refused(why) => return Err(format!("OpenAI refused the sign-in ({why})")),
             Callback::Ignored(_) => unreachable!("wait never returns an ignored request"),
         };
-        let client_id = match (&previous.client_id, issued) {
-            (None, Some(issued)) => issued,
-            (None, None) => return Err("OpenAI didn't issue Marv a client id: the sign-in is incomplete. Try again.".into()),
+        let client_id = match (&kept, issued) {
+            (None, Some(issued)) if issued != DYNAMIC_CLIENT => issued,
+            (None, _) => return Err("OpenAI didn't issue Marv a client id: the sign-in is incomplete. Try again.".into()),
             (Some(kept), Some(issued)) if *kept != issued => {
                 return Err("OpenAI answered for another client than this sign-in's: nothing was saved.".into());
             }
             (Some(kept), _) => kept.clone(),
         };
-        let tokens = token_request(
-            &endpoints,
-            &[
-                ("grant_type", "authorization_code"),
-                ("client_id", &client_id),
-                ("code", &code),
-                ("code_verifier", &verifier),
-                ("redirect_uri", &redirect_uri),
-                ("resource", RESOURCE),
-            ],
-        )
-        .await
-        .map_err(|why| format!("OpenAI didn't accept the sign-in ({why})"))?;
+        let form = [
+            ("grant_type", "authorization_code"),
+            ("client_id", client_id.as_str()),
+            ("code", code.as_str()),
+            ("code_verifier", verifier.as_str()),
+            ("redirect_uri", redirect_uri.as_str()),
+            ("resource", RESOURCE),
+        ];
+        let tokens = match token_request(&endpoints, &form).await {
+            Ok(tokens) => tokens,
+            Err(code) if code == "invalid_client" && kept.is_some() => {
+                store.forget(&client_id).await?;
+                return Err(REGISTER_AGAIN.into());
+            }
+            Err(why) => return Err(format!("OpenAI didn't accept the sign-in ({why})")),
+        };
         let id_token = tokens.id_token.clone().ok_or("OpenAI sent no ID token")?;
         let claims = verify_id_token(&id_token, &endpoints, &client_id, &nonce).await?;
-        if previous.subject.as_ref().is_some_and(|s| *s != claims.sub) && previous.client_id.is_some() {
+        if previous.as_ref().and_then(|p| p.subject.as_ref()).is_some_and(|s| *s != claims.sub) {
             return Err("That's another ChatGPT account than this client was issued for: nothing was saved.".into());
         }
-        let scopes = tokens.scopes().or_else(|| scope.map(|s| s.split_whitespace().map(str::to_string).collect()));
-        let scopes = scopes.unwrap_or_default();
+        // The token response's granted scopes decide plan usage (not the callback's).
+        let scopes = tokens.scopes().unwrap_or_default();
         if !scopes.iter().any(|s| s == PLAN_SCOPE) {
             return Err("Your ChatGPT account didn't allow plan usage for Marv, so it can't be used. Nothing was saved.".into());
         }
+        let refresh_after = tokens.refresh_after();
         let auth = StoredAuth {
-            host_id: previous.host_id,
+            host_id,
             client_id: Some(client_id),
             subject: Some(claims.sub),
             email: claims.email.clone(),
@@ -531,6 +705,7 @@ impl SignIn {
             access_token: Some(tokens.access_token),
             refresh_token: tokens.refresh_token,
             expires_at: now_ms() + tokens.expires_in.unwrap_or(3600) * 1000,
+            refresh_after,
             scopes,
             saved_at: 0,
         };
@@ -668,7 +843,10 @@ impl ChatGptCredentials {
     /// server just refused), else a refreshed one, under the file's lock.
     async fn token(&self, stale: Option<&str>) -> Result<String, String> {
         let usable = |auth: &StoredAuth| {
-            let fresh = auth.expires_at > now_ms() + REFRESH_MARGIN.as_millis() as u64;
+            let now = now_ms();
+            // Fresh enough, or not yet allowed a routine refresh (`earliest_refresh_at`) and still valid a while.
+            let fresh = auth.expires_at > now + REFRESH_MARGIN.as_millis() as u64
+                || (now < auth.refresh_after && auth.expires_at > now + 30_000);
             auth.access_token.clone().filter(|t| fresh && Some(t.as_str()) != stale)
         };
         let auth = self.store.load().filter(StoredAuth::signed_in).ok_or_else(|| format!("not signed in. {SIGN_IN_AGAIN}"))?;
@@ -697,6 +875,7 @@ impl ChatGptCredentials {
             match token_request(&self.endpoints, &form).await {
                 Ok(tokens) => {
                     // Everything together: the access token, its expiry, the scopes and the rotated refresh token.
+                    auth.refresh_after = tokens.refresh_after();
                     auth.scopes = tokens.scopes().unwrap_or(auth.scopes);
                     auth.expires_at = now_ms() + tokens.expires_in.unwrap_or(3600) * 1000;
                     auth.refresh_token = tokens.refresh_token.or(auth.refresh_token);
@@ -704,6 +883,11 @@ impl ChatGptCredentials {
                     auth.access_token = Some(tokens.access_token.clone());
                     self.store.save(&auth).await?;
                     Ok(tokens.access_token)
+                }
+                // A registration OpenAI no longer knows: forgotten, so the next sign-in registers anew.
+                Err(code) if code == "invalid_client" => {
+                    self.store.forget(&client_id).await?;
+                    Err(REGISTER_AGAIN.into())
                 }
                 Err(code) if SIGNED_OUT_ERRORS.contains(&code.as_str()) => {
                     auth.clear_tokens();
@@ -737,7 +921,21 @@ pub async fn sign_out(store: &AuthStore, endpoints: &Endpoints) -> Result<bool, 
         let mut confirmed = true;
         if let (Some(refresh), Some(client_id)) = (&auth.refresh_token, &auth.client_id) {
             let form = [("token", refresh.as_str()), ("token_type_hint", "refresh_token"), ("client_id", client_id.as_str())];
-            confirmed = http().post(endpoints.revoke()).form(&form).send().await.is_ok_and(|r| r.status().is_success());
+            confirmed = false;
+            // A network failure or a 5xx is tried again with backoff while the refresh token is still here.
+            for attempt in 0..REVOKE_ATTEMPTS {
+                if attempt > 0 {
+                    tokio::time::sleep(endpoints.backoff * (1 << (attempt - 1))).await;
+                }
+                match http().post(endpoints.revoke()).form(&form).send().await {
+                    Ok(r) if r.status().is_success() => {
+                        confirmed = true;
+                        break;
+                    }
+                    Ok(r) if !r.status().is_server_error() => break,
+                    _ => {}
+                }
+            }
         }
         auth.clear_tokens();
         store.save(&auth).await?;

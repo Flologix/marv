@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use base64::Engine;
 use marv_provider::chatgpt::{
-    AuthStore, ChatGptCredentials, Endpoints, PLAN_SCOPE, StoredAuth, check_id_token, list_models, sign_out, start_sign_in,
+    AuthStore, ChatGptCredentials, Endpoints, PLAN_SCOPE, REGISTER_AGAIN, SignInTarget, StoredAuth, check_id_token, list_models,
+    sign_out, start_sign_in,
 };
 use marv_provider::responses::Credentials;
 use reqwest::Url;
@@ -64,6 +65,13 @@ struct Stage {
     audience: String,
     scope: String,
     refresh_error: Option<&'static str>,
+    /// The code exchange's error, if any.
+    exchange_error: Option<&'static str>,
+    /// Who the next ID token is for (default "user-1").
+    subject: Option<&'static str>,
+    /// The revocation endpoint's status (default 200).
+    revoke_status: Option<u16>,
+    earliest_refresh_at: Option<u64>,
 }
 
 async fn openai(stage: Arc<Mutex<Stage>>) -> FakeServer {
@@ -78,13 +86,17 @@ async fn openai(stage: Arc<Mutex<Stage>>) -> FakeServer {
                     Some(code) => Reply::json(400, json!({"error": code})),
                     None => Reply::json(
                         200,
-                        json!({"access_token": "at-2", "refresh_token": "rt-2", "expires_in": 3600, "scope": stage.scope}),
+                        json!({"access_token": "at-2", "refresh_token": "rt-2", "expires_in": 3600, "scope": stage.scope,
+                               "earliest_refresh_at": stage.earliest_refresh_at}),
                     ),
                 }
             }
+            "/api/accounts/oauth/token" if stage.exchange_error.is_some() => {
+                Reply::json(400, json!({"error": stage.exchange_error}))
+            }
             "/api/accounts/oauth/token" => {
                 let id_token = sign(&json!({
-                    "iss": seen.lock().unwrap().clone(), "sub": "user-1", "aud": stage.audience, "exp": now() + 600,
+                    "iss": seen.lock().unwrap().clone(), "sub": stage.subject.unwrap_or("user-1"), "aud": stage.audience, "exp": now() + 600,
                     "nonce": stage.nonce, "email": "ada@example.com"
                 }));
                 Reply::json(
@@ -93,7 +105,7 @@ async fn openai(stage: Arc<Mutex<Stage>>) -> FakeServer {
                            "expires_in": 3600, "scope": stage.scope}),
                 )
             }
-            "/api/accounts/oauth/revoke" => Reply::new(200, "text/plain", ""),
+            "/api/accounts/oauth/revoke" => Reply::new(stage.revoke_status.unwrap_or(200), "text/plain", ""),
             "/v1/models" => Reply::json(
                 200,
                 json!({"models": [{"slug": "gpt-6.1-sol", "visibility": "list"}, {"slug": "internal", "visibility": "hide"}]}),
@@ -107,7 +119,7 @@ async fn openai(stage: Arc<Mutex<Stage>>) -> FakeServer {
 }
 
 fn endpoints(server: &FakeServer) -> Endpoints {
-    Endpoints { issuer: server.url(), api: format!("{}/v1", server.url()) }
+    Endpoints { issuer: server.url(), api: format!("{}/v1", server.url()), backoff: Duration::from_millis(5) }
 }
 
 fn param(url: &Url, name: &str) -> Option<String> {
@@ -129,7 +141,18 @@ async fn sign_in(
     stage: &Arc<Mutex<Stage>>,
     callback_extra: &str,
 ) -> (Url, Result<marv_provider::chatgpt::Account, String>) {
-    let sign_in = start_sign_in(store.clone(), endpoints(server)).await.unwrap();
+    sign_in_to(store, server, stage, callback_extra, SignInTarget::Current).await
+}
+
+async fn sign_in_to(
+    store: &AuthStore,
+    server: &FakeServer,
+    stage: &Arc<Mutex<Stage>>,
+    callback_extra: &str,
+    target: SignInTarget,
+) -> (Url, Result<marv_provider::chatgpt::Account, String>) {
+    let sign_in = start_sign_in(store.clone(), endpoints(server), target).await.unwrap();
+    assert!(!sign_in.shown_url().contains("id_token_hint"), "the hint is a token: never shown");
     let url = Url::parse(sign_in.url()).unwrap();
     {
         let mut stage = stage.lock().unwrap();
@@ -220,7 +243,7 @@ async fn a_refused_sign_in_says_so_and_saves_nothing() {
     let server = openai(stage.clone()).await;
     let dir = tempfile::tempdir().unwrap();
     let store = AuthStore::new(dir.path());
-    let sign_in = start_sign_in(store.clone(), endpoints(&server)).await.unwrap();
+    let sign_in = start_sign_in(store.clone(), endpoints(&server), SignInTarget::Current).await.unwrap();
     let url = Url::parse(sign_in.url()).unwrap();
     browser(format!("{}?error=access_denied&state={}", param(&url, "redirect_uri").unwrap(), param(&url, "state").unwrap()));
     let outcome = sign_in.finish_within(Duration::from_secs(5), CancellationToken::new()).await;
@@ -337,4 +360,118 @@ async fn the_accounts_listed_models_by_slug() {
     let models = list_models(&ChatGptCredentials { store, endpoints: endpoints(&server) }).await.unwrap();
     assert_eq!(models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["gpt-6.1-sol"]);
     assert_eq!(server.last().header("authorization"), Some("Bearer at-1"));
+}
+
+/// #159 review: several registrations, one per issued client id: another account registers anew (same host id)
+/// without touching the first; a saved one can be switched to; signing out keeps the registration, and signing in
+/// again reuses it without the (cleared) ID token as a hint.
+#[tokio::test]
+async fn several_accounts_each_with_its_own_registration() {
+    let stage = plan_stage();
+    let server = openai(stage.clone()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let store = AuthStore::new(dir.path());
+    let (first, outcome) = sign_in(&store, &server, &stage, "&client_id=oaiapp_1").await;
+    outcome.unwrap();
+
+    {
+        let mut stage = stage.lock().unwrap();
+        (stage.audience, stage.subject) = ("oaiapp_2".into(), Some("user-2"));
+    }
+    let (second, outcome) = sign_in_to(&store, &server, &stage, "&client_id=oaiapp_2", SignInTarget::New).await;
+    outcome.unwrap();
+    assert_eq!(param(&second, "client_id").as_deref(), Some("dynamic_agent_client"));
+    assert_eq!(param(&second, "agent_name_hint").as_deref(), Some("Marv"));
+    assert_eq!(param(&second, "ext_agent_host_id"), param(&first, "ext_agent_host_id"), "one host id per machine");
+    let accounts = store.accounts();
+    assert_eq!(accounts.iter().map(|a| a.client_id.as_deref().unwrap()).collect::<Vec<_>>(), ["oaiapp_2", "oaiapp_1"]);
+    assert!(accounts.iter().all(StoredAuth::usable));
+    assert_eq!(store.load().unwrap().subject.as_deref(), Some("user-2"));
+
+    store.activate("oaiapp_1").await.unwrap();
+    assert_eq!(store.load().unwrap().subject.as_deref(), Some("user-1"));
+
+    assert!(sign_out(&store, &endpoints(&server)).await.unwrap());
+    assert!(!store.signed_in());
+    assert_eq!(store.accounts().len(), 2, "signing out keeps the registration");
+    {
+        let mut stage = stage.lock().unwrap();
+        (stage.audience, stage.subject) = ("oaiapp_1".into(), None);
+    }
+    let (again, outcome) = sign_in(&store, &server, &stage, "").await;
+    outcome.unwrap();
+    assert_eq!(param(&again, "client_id").as_deref(), Some("oaiapp_1"));
+    assert_eq!(param(&again, "id_token_hint"), None, "no hint after a sign-out");
+    assert!(store.signed_in());
+}
+
+/// #159 review: a registration OpenAI no longer knows (`invalid_client`) is forgotten, and the next sign-in
+/// registers anew instead of failing the same way forever.
+#[tokio::test]
+async fn a_stale_registration_leads_to_registering_again() {
+    let stage = plan_stage();
+    let server = openai(stage.clone()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let store = AuthStore::new(dir.path());
+    sign_in(&store, &server, &stage, "&client_id=oaiapp_1").await.1.unwrap();
+    let host = store.file().host_id;
+
+    stage.lock().unwrap().exchange_error = Some("invalid_client");
+    let (_, outcome) = sign_in(&store, &server, &stage, "").await;
+    assert_eq!(outcome.unwrap_err(), REGISTER_AGAIN);
+    assert!(store.accounts().is_empty());
+
+    stage.lock().unwrap().exchange_error = None;
+    let (url, outcome) = sign_in(&store, &server, &stage, "&client_id=oaiapp_1").await;
+    outcome.unwrap();
+    assert_eq!(param(&url, "client_id").as_deref(), Some("dynamic_agent_client"));
+    assert_eq!(store.file().host_id, host, "the host id stays");
+
+    // The same from a refresh.
+    let mut auth = store.load().unwrap();
+    auth.expires_at = 0;
+    store.save(&auth).await.unwrap();
+    stage.lock().unwrap().refresh_error = Some("invalid_client");
+    let credentials = ChatGptCredentials { store: store.clone(), endpoints: endpoints(&server) };
+    assert_eq!(credentials.bearer().await.unwrap_err(), REGISTER_AGAIN);
+    assert!(store.accounts().is_empty());
+}
+
+/// #159 review: plan usage is decided by the token response's scopes, not the callback's.
+#[tokio::test]
+async fn the_token_responses_scopes_decide() {
+    let stage =
+        Arc::new(Mutex::new(Stage { audience: "oaiapp_1".into(), scope: "openid offline_access".into(), ..Stage::default() }));
+    let server = openai(stage.clone()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let store = AuthStore::new(dir.path());
+    let (_, outcome) = sign_in(&store, &server, &stage, &format!("&client_id=oaiapp_1&scope={PLAN_SCOPE}")).await;
+    assert!(outcome.unwrap_err().contains("didn't allow plan usage"));
+}
+
+/// #159 review: a revocation that meets a 5xx is tried again (with backoff), and an unconfirmed one says so.
+#[tokio::test]
+async fn a_failing_revocation_is_retried_then_reported_unconfirmed() {
+    let stage = plan_stage();
+    stage.lock().unwrap().revoke_status = Some(503);
+    let server = openai(stage.clone()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let store = AuthStore::new(dir.path());
+    store.save(&signed_in(3600)).await.unwrap();
+    assert!(!sign_out(&store, &endpoints(&server)).await.unwrap());
+    assert_eq!(server.count("/api/accounts/oauth/revoke"), marv_provider::chatgpt::REVOKE_ATTEMPTS as usize);
+    assert!(!store.signed_in(), "cleared here anyway");
+}
+
+/// #159 review: no routine refresh before the token response's `earliest_refresh_at`.
+#[tokio::test]
+async fn no_refresh_before_earliest_refresh_at() {
+    let stage = plan_stage();
+    let server = openai(stage.clone()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let store = AuthStore::new(dir.path());
+    store.save(&StoredAuth { refresh_after: (now() + 600) * 1000, ..signed_in(120) }).await.unwrap();
+    let credentials = ChatGptCredentials { store, endpoints: endpoints(&server) };
+    assert_eq!(credentials.bearer().await.unwrap(), "at-1");
+    assert_eq!(server.count("/api/accounts/oauth/token"), 0);
 }

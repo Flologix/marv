@@ -431,7 +431,7 @@ fn setup_context(start: SetupStart) -> SetupContext {
         ],
         current: Some((ProviderId::Ollama, "qwen3.5:9b".into())),
         saved_keys: vec![],
-        signed_in: vec![],
+        accounts: vec![],
         env_keys: vec![],
     }
 }

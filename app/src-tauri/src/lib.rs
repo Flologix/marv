@@ -30,6 +30,8 @@ struct Desktop {
     launch: Mutex<Option<String>>,
     /// MCP servers looked up for adding, by name: what the person saw is exactly what gets written.
     proposals: Mutex<HashMap<String, Value>>,
+    /// #159: the ChatGPT sign-in waiting for the browser, if one is (one at a time; the page can cancel it).
+    sign_in: Mutex<Option<tokio_util::sync::CancellationToken>>,
 }
 
 /// The CLI's own folder (~/.marv): memory, MCP servers, logins and saved sessions shared with `marv`.
@@ -373,14 +375,42 @@ fn set_zai_key(desktop: State<'_, Desktop>, key: String) -> Result<AppInfo, Stri
 /// #159: Sign in with ChatGPT: the browser opens OpenAI's page, a 127.0.0.1 listener takes the one callback. Shared
 /// with `marv` (~/.marv/chatgpt.json).
 #[tauri::command]
-async fn chatgpt_sign_in(desktop: State<'_, Desktop>) -> Result<AppInfo, String> {
+async fn chatgpt_sign_in(desktop: State<'_, Desktop>, another: Option<bool>) -> Result<AppInfo, String> {
     if !marv_provider::offered::CHATGPT_SIGN_IN {
         return Err("Sign in with ChatGPT isn't available in this build.".into());
     }
-    let sign_in = marv_provider::chatgpt::start_sign_in(desktop.chatgpt(), Default::default()).await?;
-    std::process::Command::new("xdg-open").arg(sign_in.url()).spawn().map_err(|e| e.to_string())?;
-    sign_in.finish(tokio_util::sync::CancellationToken::new()).await?;
+    let cancel = tokio_util::sync::CancellationToken::new();
+    {
+        let mut pending = desktop.sign_in.lock().unwrap_or_else(|e| e.into_inner());
+        if pending.as_ref().is_some_and(|c| !c.is_cancelled()) {
+            return Err("A sign-in is already waiting for the browser.".into());
+        }
+        *pending = Some(cancel.clone());
+    }
+    // `another`: register another ChatGPT account; else the one in use (or a first registration).
+    let target = if another == Some(true) {
+        marv_provider::chatgpt::SignInTarget::New
+    } else {
+        marv_provider::chatgpt::SignInTarget::Current
+    };
+    let outcome = async {
+        let sign_in = marv_provider::chatgpt::start_sign_in(desktop.chatgpt(), Default::default(), target).await?;
+        let url = sign_in.url().parse().map_err(|e| format!("{e}"))?;
+        marv_mcp::oauth::open_browser(&url, std::env::consts::OS);
+        sign_in.finish(cancel.clone()).await
+    }
+    .await;
+    desktop.sign_in.lock().unwrap_or_else(|e| e.into_inner()).take();
+    outcome?;
     Ok(info(&desktop))
+}
+
+/// #159: stops the ChatGPT sign-in waiting for the browser.
+#[tauri::command]
+fn chatgpt_cancel_sign_in(desktop: State<'_, Desktop>) {
+    if let Some(cancel) = desktop.sign_in.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        cancel.cancel();
+    }
 }
 
 /// #159: signs out of ChatGPT (revoked at OpenAI when it answers).
@@ -770,6 +800,7 @@ pub fn run() {
                 live: Mutex::new(HashMap::new()),
                 launch: Mutex::new(launch),
                 proposals: Mutex::new(HashMap::new()),
+                sign_in: Mutex::new(None),
             });
             Ok(())
         })
@@ -796,6 +827,7 @@ pub fn run() {
             set_api_key,
             set_zai_key,
             chatgpt_sign_in,
+            chatgpt_cancel_sign_in,
             chatgpt_sign_out,
             plan_models,
             list_dir,

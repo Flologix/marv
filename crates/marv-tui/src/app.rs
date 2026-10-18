@@ -1264,7 +1264,8 @@ impl App {
             // While setup is open, Setup handles Esc and ctrl+c itself.
             match setup.on_key(key) {
                 Some(SetupOutcome::LoadModels(provider)) => self.port.load_models(provider),
-                Some(SetupOutcome::SignIn(provider)) => self.port.sign_in(provider),
+                Some(SetupOutcome::SignIn(provider, target)) => self.port.sign_in(provider, target),
+                Some(SetupOutcome::UseAccount(provider, id)) => self.port.use_account(provider, id),
                 Some(SetupOutcome::SignOut(provider)) => {
                     self.setup = None;
                     self.port.sign_out(provider);
@@ -2921,7 +2922,7 @@ mod tests {
             presets,
             current: None,
             saved_keys: vec![],
-            signed_in: vec![],
+            accounts: vec![],
             env_keys: vec![],
         };
         h.event(UiEvent::OpenSetup(context.clone()));
@@ -2959,7 +2960,7 @@ mod tests {
             presets,
             current,
             saved_keys: vec![],
-            signed_in: vec![],
+            accounts: vec![],
             env_keys: vec![],
         }));
         assert_eq!(h.calls(), [Call::LoadModels(ProviderId::Ollama)]);
@@ -3382,7 +3383,7 @@ mod tests {
             presets: vec![],
             current: None,
             saved_keys: vec![],
-            signed_in: vec![],
+            accounts: vec![],
             env_keys: vec![],
         }));
         assert!(h.app.palette.is_none());
@@ -3429,7 +3430,7 @@ mod tests {
             presets,
             current: None,
             saved_keys: vec![],
-            signed_in: vec![],
+            accounts: vec![],
             env_keys: vec![],
         };
         h.events([UiEvent::OpenSetup(context)]);

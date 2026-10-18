@@ -31,7 +31,9 @@ use ratatui::widgets::{Block, BorderType, Padding, Widget};
 use super::model_picker::ModelPicker;
 use super::select::{Select, SelectItem, wrap_all};
 use super::theme;
-use crate::view::{ModelInfo, ProviderId, ProviderPreset, SetupAnswer, SetupContext, SetupStart, SignInProgress};
+use crate::view::{
+    AccountInfo, ModelInfo, ProviderId, ProviderPreset, SetupAnswer, SetupContext, SetupStart, SignInProgress, SignInTarget,
+};
 
 #[cfg(doc)]
 use crate::view::SessionPort;
@@ -45,11 +47,18 @@ pub enum SetupStep {
     ApiKey,
 }
 
-/// #159: what to do with a saved sign-in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// #159: what to do with the saved sign-ins.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SignInChoice {
+    /// Keep the one in use.
     Keep,
-    Again,
+    /// Use another saved one that's signed in.
+    Switch(String),
+    /// Sign in (again) to a saved one.
+    Again(String),
+    /// Register another account.
+    New,
+    /// Sign out of the one in use.
     Out,
 }
 
@@ -69,7 +78,9 @@ pub enum SetupOutcome {
     /// Needs the provider's models: call `SessionPort::load_models`.
     LoadModels(ProviderId),
     /// #159: start the sign-in: call `SessionPort::sign_in`.
-    SignIn(ProviderId),
+    SignIn(ProviderId, SignInTarget),
+    /// #159: use another saved sign-in: call `SessionPort::use_account`.
+    UseAccount(ProviderId, String),
     /// #159: sign out (setup closes): call `SessionPort::sign_out`.
     SignOut(ProviderId),
     Complete(SetupAnswer),
@@ -145,9 +156,39 @@ impl Setup {
         self.context.saved_keys.iter().find(|(p, _)| *p == self.provider).map(|(_, k)| k.as_str())
     }
 
-    /// Who is signed in to this provider, if anyone.
-    fn signed_in(&self) -> Option<&str> {
-        self.context.signed_in.iter().find(|(p, _)| *p == self.provider).map(|(_, who)| who.as_str())
+    /// This provider's saved sign-ins, the one in use first.
+    fn accounts(&self) -> Vec<&AccountInfo> {
+        self.context.accounts.iter().filter(|(p, _)| *p == self.provider).map(|(_, a)| a).collect()
+    }
+
+    /// The one in use, when it's signed in.
+    fn signed_in(&self) -> Option<&AccountInfo> {
+        self.accounts().into_iter().find(|a| a.active && a.signed_in)
+    }
+
+    /// The choices for the saved sign-ins.
+    fn account_choices(&self) -> Select<SignInChoice> {
+        let mut items = Vec::new();
+        let active = self.signed_in();
+        if let Some(a) = active {
+            items.push(SelectItem::new(SignInChoice::Keep, format!("Keep using {}", a.label)));
+        }
+        for a in self.accounts().into_iter().filter(|a| Some(*a) != active) {
+            items.push(if a.signed_in {
+                SelectItem::new(SignInChoice::Switch(a.id.clone()), format!("Switch to {}", a.label))
+            } else {
+                SelectItem::new(SignInChoice::Again(a.id.clone()), format!("Sign in as {}", a.label))
+            });
+        }
+        if let Some(a) = active {
+            items.push(SelectItem::new(SignInChoice::Again(a.id.clone()), format!("Sign in again as {}", a.label)));
+        }
+        items.push(SelectItem::new(SignInChoice::New, "Use another ChatGPT account"));
+        if let Some(a) = active {
+            items.push(SelectItem::new(SignInChoice::Out, format!("Sign out of {}", a.label)));
+        }
+        let first = items.first().map(|i| i.value.clone());
+        Select::new(items, first.as_ref())
     }
 
     fn signs_in(&self) -> bool {
@@ -171,14 +212,13 @@ impl Setup {
                 self.sign_in = SignInState::Waiting { url: Some(url) };
                 None
             }
-            SignInProgress::Done(Ok(who)) => {
-                self.context.signed_in.retain(|(p, _)| *p != self.provider);
-                self.context.signed_in.push((self.provider, who));
+            SignInProgress::Done(Ok(_)) => {
                 self.error = None;
                 Some(self.open_models())
             }
             SignInProgress::Done(Err(why)) => {
-                self.sign_in = SignInState::Ready;
+                // Back to the choices (or Enter to try again): never a dead end.
+                self.sign_in = if self.accounts().is_empty() { SignInState::Ready } else { SignInState::Choose };
                 self.error = Some(why);
                 None
             }
@@ -217,31 +257,31 @@ impl Setup {
                     return Some(self.open_models());
                 }
                 self.step = SetupStep::SignIn;
-                self.sign_in = if self.signed_in().is_some() { SignInState::Choose } else { SignInState::Ready };
-                let who = self.signed_in().unwrap_or_default().to_string();
-                self.sign_in_choices = Select::new(
-                    vec![
-                        SelectItem::new(SignInChoice::Keep, format!("Keep using {who}")),
-                        SelectItem::new(SignInChoice::Again, "Sign in again"),
-                        SelectItem::new(SignInChoice::Out, "Sign out"),
-                    ],
-                    Some(&SignInChoice::Keep),
-                );
+                self.sign_in = if self.accounts().is_empty() { SignInState::Ready } else { SignInState::Choose };
+                self.sign_in_choices = self.account_choices();
                 None
             }
             SetupStep::SignIn => match self.sign_in {
-                SignInState::Choose => match self.sign_in_choices.on_key(key)? {
-                    SignInChoice::Keep => Some(self.open_models()),
-                    SignInChoice::Again => {
-                        self.sign_in = SignInState::Waiting { url: None };
-                        Some(SetupOutcome::SignIn(self.provider))
+                SignInState::Choose => {
+                    let choice = self.sign_in_choices.on_key(key)?;
+                    self.error = None;
+                    let provider = self.provider;
+                    match choice {
+                        SignInChoice::Keep => return Some(self.open_models()),
+                        SignInChoice::Out => return Some(SetupOutcome::SignOut(provider)),
+                        _ => {}
                     }
-                    SignInChoice::Out => Some(SetupOutcome::SignOut(self.provider)),
-                },
+                    self.sign_in = SignInState::Waiting { url: None };
+                    Some(match choice {
+                        SignInChoice::Switch(id) => SetupOutcome::UseAccount(provider, id),
+                        SignInChoice::Again(id) => SetupOutcome::SignIn(provider, SignInTarget::Account(id)),
+                        _ => SetupOutcome::SignIn(provider, SignInTarget::New),
+                    })
+                }
                 SignInState::Ready if key.code == KeyCode::Enter => {
                     self.error = None;
                     self.sign_in = SignInState::Waiting { url: None };
-                    Some(SetupOutcome::SignIn(self.provider))
+                    Some(SetupOutcome::SignIn(self.provider, SignInTarget::Current))
                 }
                 _ => None,
             },
@@ -326,7 +366,9 @@ impl Setup {
                 ));
                 match &self.sign_in {
                     SignInState::Choose => {
-                        lines.push(Line::styled(format!("Signed in as {}.", self.signed_in().unwrap_or_default()), dim));
+                        if let Some(a) = self.signed_in() {
+                            lines.push(Line::styled(format!("Signed in as {}.", a.label), dim));
+                        }
                         lines.extend(self.sign_in_choices.render());
                     }
                     SignInState::Ready => lines.push(Line::raw("Press Enter to open your browser and sign in.")),
@@ -443,7 +485,7 @@ mod tests {
     }
 
     fn context(start: SetupStart) -> SetupContext {
-        SetupContext { start, presets: presets(), current: None, saved_keys: vec![], signed_in: vec![], env_keys: vec![] }
+        SetupContext { start, presets: presets(), current: None, saved_keys: vec![], accounts: vec![], env_keys: vec![] }
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -641,14 +683,14 @@ mod tests {
         assert_eq!(press(&mut setup, &[KeyCode::Down, KeyCode::Down, KeyCode::Enter]), None);
         assert!(frame(&setup).contains("Press Enter to open your browser and sign in."));
         assert!(frame(&setup).contains("step 2 of 3"));
-        assert_eq!(setup.on_key(key(KeyCode::Enter)), Some(SetupOutcome::SignIn(ProviderId::ChatGpt)));
+        assert_eq!(setup.on_key(key(KeyCode::Enter)), Some(SetupOutcome::SignIn(ProviderId::ChatGpt, SignInTarget::Current)));
         assert_eq!(setup.on_key(key(KeyCode::Enter)), None, "waiting: Enter does nothing");
         setup.sign_in_progress(SignInProgress::Started { url: "https://auth.openai.com/api/accounts/authorize?x".into() });
         assert!(frame(&setup).contains("https://auth.openai.com/api/accounts/authorize?x"));
         // A failed sign-in says why and can be tried again.
         assert_eq!(setup.sign_in_progress(SignInProgress::Done(Err("the sign-in timed out".into()))), None);
         assert!(frame(&setup).contains("the sign-in timed out"));
-        assert_eq!(setup.on_key(key(KeyCode::Enter)), Some(SetupOutcome::SignIn(ProviderId::ChatGpt)));
+        assert_eq!(setup.on_key(key(KeyCode::Enter)), Some(SetupOutcome::SignIn(ProviderId::ChatGpt, SignInTarget::Current)));
         assert_eq!(
             setup.sign_in_progress(SignInProgress::Done(Ok("ada@example.com".into()))),
             Some(SetupOutcome::LoadModels(ProviderId::ChatGpt))
@@ -657,23 +699,71 @@ mod tests {
         assert_eq!(press(&mut setup, &[KeyCode::Enter]), answer(ProviderId::ChatGpt, "gpt-6.1-sol", None));
     }
 
-    /// #159: already signed in: keep it, sign in again, or sign out.
+    /// #159: saved sign-ins: keep the one in use, switch to another, sign in again, add another account, sign out.
     #[test]
-    fn a_saved_sign_in_can_be_kept_renewed_or_signed_out() {
+    fn saved_sign_ins_can_be_kept_switched_renewed_added_or_signed_out() {
+        let account = |id: &str, label: &str, signed_in, active| {
+            (ProviderId::ChatGpt, AccountInfo { id: id.into(), label: label.into(), signed_in, active })
+        };
         let context = || SetupContext {
-            signed_in: vec![(ProviderId::ChatGpt, "ada@example.com".into())],
+            accounts: vec![
+                account("c1", "ada@example.com", true, true),
+                account("c2", "bob@example.com", true, false),
+                account("c3", "eve@example.com", false, false),
+            ],
             ..with_plans(SetupStart::Reconfigure)
         };
+        let pick = |downs: usize| {
+            let mut setup = Setup::new(context());
+            press(&mut setup, &[KeyCode::Down, KeyCode::Down, KeyCode::Enter]);
+            for _ in 0..downs {
+                setup.on_key(key(KeyCode::Down));
+            }
+            let outcome = setup.on_key(key(KeyCode::Enter));
+            (frame(&setup), outcome)
+        };
+        assert_eq!(pick(0).1, Some(SetupOutcome::LoadModels(ProviderId::ChatGpt)));
         let mut setup = Setup::new(context());
         press(&mut setup, &[KeyCode::Down, KeyCode::Down, KeyCode::Enter]);
-        assert!(frame(&setup).contains("Keep using ada@example.com"));
-        assert_eq!(setup.on_key(key(KeyCode::Enter)), Some(SetupOutcome::LoadModels(ProviderId::ChatGpt)));
-        let mut setup = Setup::new(context());
-        press(&mut setup, &[KeyCode::Down, KeyCode::Down, KeyCode::Enter, KeyCode::Down]);
-        assert_eq!(setup.on_key(key(KeyCode::Enter)), Some(SetupOutcome::SignIn(ProviderId::ChatGpt)));
-        let mut setup = Setup::new(context());
-        press(&mut setup, &[KeyCode::Down, KeyCode::Down, KeyCode::Enter, KeyCode::Down, KeyCode::Down]);
-        assert_eq!(setup.on_key(key(KeyCode::Enter)), Some(SetupOutcome::SignOut(ProviderId::ChatGpt)));
+        let shown = frame(&setup);
+        for line in [
+            "Keep using ada@example.com",
+            "Switch to bob@example.com",
+            "Sign in as eve@example.com",
+            "Sign in again as ada@example.com",
+            "Use another ChatGPT account",
+            "Sign out of ada@example.com",
+        ] {
+            assert!(shown.contains(line), "{line}: {shown}");
+        }
+        assert_eq!(pick(1).1, Some(SetupOutcome::UseAccount(ProviderId::ChatGpt, "c2".into())));
+        assert_eq!(pick(2).1, Some(SetupOutcome::SignIn(ProviderId::ChatGpt, SignInTarget::Account("c3".into()))));
+        assert_eq!(pick(3).1, Some(SetupOutcome::SignIn(ProviderId::ChatGpt, SignInTarget::Account("c1".into()))));
+        assert_eq!(pick(4).1, Some(SetupOutcome::SignIn(ProviderId::ChatGpt, SignInTarget::New)));
+        assert_eq!(pick(5).1, Some(SetupOutcome::SignOut(ProviderId::ChatGpt)));
+    }
+
+    /// #159 review: signed out of every saved account, the choices still offer signing in and another account; a
+    /// failed sign-in goes back to them.
+    #[test]
+    fn signed_out_is_never_a_dead_end() {
+        let mut setup = Setup::new(SetupContext {
+            accounts: vec![(
+                ProviderId::ChatGpt,
+                AccountInfo { id: "c1".into(), label: "ada@example.com".into(), signed_in: false, active: true },
+            )],
+            ..with_plans(SetupStart::Reconfigure)
+        });
+        press(&mut setup, &[KeyCode::Down, KeyCode::Down, KeyCode::Enter]);
+        let shown = frame(&setup);
+        assert!(shown.contains("Sign in as ada@example.com") && shown.contains("Use another ChatGPT account"), "{shown}");
+        assert_eq!(
+            setup.on_key(key(KeyCode::Enter)),
+            Some(SetupOutcome::SignIn(ProviderId::ChatGpt, SignInTarget::Account("c1".into())))
+        );
+        setup.sign_in_progress(SignInProgress::Done(Err("OpenAI no longer knows this Marv's registration".into())));
+        assert!(frame(&setup).contains("Use another ChatGPT account"));
+        assert_eq!(setup.sign_in, SignInState::Choose);
     }
 
     #[test]

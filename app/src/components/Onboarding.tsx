@@ -190,11 +190,11 @@ function Plans({
     }
   }
 
-  async function chooseChatgpt() {
+  async function chooseChatgpt(another = false) {
     onError(null);
     setSigningIn(true);
     try {
-      if (!info.chatgptAccount) await desktop.chatgptSignIn();
+      if (another || !info.chatgptAccount) await desktop.chatgptSignIn(another);
       const first = (await desktop.planModels()).find((m) => m.id.startsWith("chatgpt/"));
       if (first) onModel(first.id);
       onInfo(await desktop.setProvider("chatgpt"));
@@ -234,6 +234,16 @@ function Plans({
             <button className="btn primary" disabled={signingIn} onClick={() => void chooseChatgpt()}>
               {signingIn ? "Waiting for the browser…" : info.chatgptAccount ? "Use ChatGPT" : "Sign in with ChatGPT"}
             </button>
+            {signingIn && (
+              <button className="btn" onClick={() => void desktop.chatgptCancelSignIn()}>
+                Cancel
+              </button>
+            )}
+            {info.chatgptAccount && !signingIn && (
+              <button className="link" onClick={() => void chooseChatgpt(true)}>
+                Use another ChatGPT account
+              </button>
+            )}
           </section>
         )}
       </div>

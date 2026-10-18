@@ -102,7 +102,9 @@ export const desktop = {
   setApiKey: (key: string) => invoke<AppInfo>("set_api_key", { key }),
   setZaiKey: (key: string) => invoke<AppInfo>("set_zai_key", { key }),
   /** Opens OpenAI's sign-in page in the browser and waits for it (a 127.0.0.1 listener takes the one callback). */
-  chatgptSignIn: () => invoke<AppInfo>("chatgpt_sign_in"),
+  chatgptSignIn: (another?: boolean) => invoke<AppInfo>("chatgpt_sign_in", { another }),
+  /** Stops a sign-in still waiting for the browser. */
+  chatgptCancelSignIn: () => invoke<void>("chatgpt_cancel_sign_in"),
   chatgptSignOut: () => invoke<AppInfo>("chatgpt_sign_out"),
   planModels: () => invoke<PlanModel[]>("plan_models"),
   listDir: (rel: string) => invoke<Entry[]>("list_dir", { rel }),
