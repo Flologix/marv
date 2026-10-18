@@ -30,6 +30,7 @@ pub mod factory;
 pub mod models;
 pub mod ollama;
 pub mod openai_compat;
+pub mod responses;
 pub mod retry;
 pub mod sse;
 

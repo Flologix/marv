@@ -17,6 +17,7 @@ Spec: Marv `CLAUDE.md` bullets **Provider seam** and **createProvider**, `src/pr
 | `src/provider/openai-compat.ts` | `openai_compat.rs` | ported: wire types, `to_messages`, `request_body`, `ReplyAssembler`, and the HTTP/retry loop with #64; `openai-compat.test.ts` ported in `tests/openai_compat.rs` |
 | `src/provider/ollama.ts` | `ollama.rs` | ported, including `ask_trained` and the HTTP/retry loop with #64; `ollama.test.ts` ported in `tests/ollama.rs` |
 | — (marv-rs only, #96) | `degenerate.rs` | `DegenerateGuard`, `is_degenerate`, `DEGENERATE_NOTE`; table tests |
+| — (marv-rs only, #159) | `responses.rs` | OpenAI's Responses API (`POST {base}/responses`, `store: false`, `stream: true`, `instructions`, flat function tools, `function_call`/`function_call_output` items; `reasoning` items kept with `include: ["reasoning.encrypted_content"]` and sent back without their `id`). Credentials through the `Credentials` trait (an API key, or a sign-in that refreshes; a 401 asks it once for a fresh token). Shares `openai_compat`'s retry helpers. Unit tests on the assembler, `tests/responses.rs` against the fake server |
 | `src/provider/factory.ts` | `factory.rs` | ported (`ConfigFactory`, `CustomFactory`); `providerFactory` moves to `marv-session`; `provider-factory.test.ts` ported in `tests/factory.rs` (the SDK hint cases through `create_provider`) |
 
 `grep -rn 'todo!("port' crates/marv-provider` lists what's left (only `is_context_overflow`, #63).
