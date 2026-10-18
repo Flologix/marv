@@ -8,7 +8,8 @@ const SUGGESTED = [
   { id: "qwen3:14b", note: "9 GB · tools, thinking" },
 ];
 
-/** Where Marv's model comes from: OpenRouter (cloud, a key) or Ollama (this machine, free). */
+/** Where Marv's model comes from: OpenRouter (cloud, a key), a plan set up here (Z.ai Coding Plan, ChatGPT), or Ollama
+ * (this machine, free). */
 export function ModelPicker({
   model,
   remote,
@@ -20,7 +21,10 @@ export function ModelPicker({
   hasKey: boolean;
   onPick: (id: string) => void;
 }) {
-  const [tab, setTab] = useState<"openrouter" | "ollama">(model.startsWith("ollama/") ? "ollama" : "openrouter");
+  const plans = remote.filter((m) => m.plan);
+  const [tab, setTab] = useState<"openrouter" | "plan" | "ollama">(
+    model.startsWith("ollama/") ? "ollama" : plans.some((m) => m.id === model) ? "plan" : "openrouter",
+  );
   const [query, setQuery] = useState("");
   const [local, setLocal] = useState<Model[] | null>(null);
   const [pulling, setPulling] = useState<string | null>(null);
@@ -56,7 +60,10 @@ export function ModelPicker({
   }
 
   const q = query.trim().toLowerCase();
-  const shown = remote.filter((m) => !q || m.id.toLowerCase().includes(q) || m.name.toLowerCase().includes(q)).slice(0, 80);
+  const shown = remote
+    .filter((m) => !m.plan)
+    .filter((m) => !q || m.id.toLowerCase().includes(q) || m.name.toLowerCase().includes(q))
+    .slice(0, 80);
 
   return (
     <div className="picker">
@@ -64,6 +71,11 @@ export function ModelPicker({
         <button role="tab" aria-selected={tab === "openrouter"} className={tab === "openrouter" ? "active" : ""} onClick={() => setTab("openrouter")}>
           OpenRouter
         </button>
+        {plans.length > 0 && (
+          <button role="tab" aria-selected={tab === "plan"} className={tab === "plan" ? "active" : ""} onClick={() => setTab("plan")}>
+            Your plan
+          </button>
+        )}
         {isDesktop && (
           <button role="tab" aria-selected={tab === "ollama"} className={tab === "ollama" ? "active" : ""} onClick={() => setTab("ollama")}>
             Ollama · local
@@ -71,7 +83,22 @@ export function ModelPicker({
         )}
       </div>
 
-      {tab === "openrouter" ? (
+      {tab === "plan" ? (
+        <>
+          <p className="help">Paid by your plan, within its usage limits. When a limit is reached Marv stops and says so.</p>
+          <div className="model-list">
+            {plans.map((m) => (
+              <button key={m.id} className={`model${m.id === model ? " active" : ""}`} onClick={() => onPick(m.id)}>
+                <span className="model-id">{m.id}</span>
+                <span className="model-meta">
+                  {m.context ? `${tokens(m.context)} · ` : ""}
+                  {m.plan}
+                </span>
+              </button>
+            ))}
+          </div>
+        </>
+      ) : tab === "openrouter" ? (
         <>
           {!hasKey && <p className="help warn">Add an OpenRouter key (first-run setup) to use these.</p>}
           <input className="search mono" placeholder="search models" value={query} spellCheck={false} onChange={(e) => setQuery(e.target.value)} />

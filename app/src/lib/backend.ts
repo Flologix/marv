@@ -16,10 +16,25 @@ export interface AppInfo {
   root: string | null;
   rootName: string | null;
   hasKey: boolean;
-  /** "openrouter" or "ollama", once chosen at onboarding. */
+  /** "openrouter", "ollama", "zai" or "chatgpt", once chosen at onboarding. */
   provider: string | null;
+  /** The chosen provider has what it needs (a key, a sign-in). */
+  ready: boolean;
+  /** Onboarding offers the Z.ai Coding Plan / Sign in with ChatGPT (off until each vendor clears Marv). */
+  offerZai: boolean;
+  offerChatgpt: boolean;
+  hasZaiKey: boolean;
+  /** Who is signed in with ChatGPT, if anyone. */
+  chatgptAccount: string | null;
   spaces: Space[];
   active: string | null;
+}
+
+/** A model of a plan set up here: `zai/<model>` or `chatgpt/<slug>`. */
+export interface PlanModel {
+  id: string;
+  plan: string;
+  context: number | null;
 }
 
 export interface LocalModel {
@@ -85,6 +100,11 @@ export const desktop = {
   /** `marv-desktop <dir>`: where to open, once. */
   takeLaunch: () => invoke<{ info: AppInfo; folder: string } | null>("take_launch"),
   setApiKey: (key: string) => invoke<AppInfo>("set_api_key", { key }),
+  setZaiKey: (key: string) => invoke<AppInfo>("set_zai_key", { key }),
+  /** Opens OpenAI's sign-in page in the browser and waits for it (a 127.0.0.1 listener takes the one callback). */
+  chatgptSignIn: () => invoke<AppInfo>("chatgpt_sign_in"),
+  chatgptSignOut: () => invoke<AppInfo>("chatgpt_sign_out"),
+  planModels: () => invoke<PlanModel[]>("plan_models"),
   listDir: (rel: string) => invoke<Entry[]>("list_dir", { rel }),
   createFolder: (parent: string, name: string) => invoke<string>("create_folder", { parent, name }),
   rename: (rel: string, name: string) => invoke<string>("rename_entry", { rel, name }),
@@ -107,7 +127,7 @@ export const desktop = {
   renameSpace: (id: string, name: string) => invoke<AppInfo>("rename_space", { id, name }),
   removeSpace: (id: string) => invoke<AppInfo>("remove_space", { id }),
   setAppsOff: (off: string[]) => invoke<AppInfo>("set_apps_off", { off }),
-  setProvider: (provider: "openrouter" | "ollama") => invoke<AppInfo>("set_provider", { provider }),
+  setProvider: (provider: "openrouter" | "ollama" | "zai" | "chatgpt") => invoke<AppInfo>("set_provider", { provider }),
   localModels: () => invoke<LocalModel[]>("local_models"),
   pullModel: (name: string, onProgress: (line: string) => void) => {
     const channel = new Channel<string>();
@@ -168,6 +188,18 @@ export interface Model {
   output: number;
   /** Runs on this machine (Ollama). */
   local?: boolean;
+  /** Paid by a plan set up here ("Z.ai Coding Plan", "ChatGPT"): no per-token price. */
+  plan?: string;
+}
+
+/** The models of the plans set up here (Z.ai Coding Plan, ChatGPT). */
+export async function planModels(): Promise<Model[]> {
+  if (!isDesktop) return [];
+  try {
+    return (await desktop.planModels()).map((m) => ({ id: m.id, name: m.id, context: m.context ?? 0, input: 0, output: 0, plan: m.plan }));
+  } catch {
+    return [];
+  }
 }
 
 /** The models pulled into the local Ollama, as `ollama/<name>`; none when it isn't running. */
@@ -192,8 +224,8 @@ const MODELS_KEY = "marv-models-2";
 
 /** Local Ollama models first, then OpenRouter's that can call tools, cheapest first (cached for an hour). */
 export async function loadModels(): Promise<Model[]> {
-  const [local, remote] = await Promise.all([localModels(), remoteModels().catch(() => [] as Model[])]);
-  return [...local, ...remote];
+  const [local, plans, remote] = await Promise.all([localModels(), planModels(), remoteModels().catch(() => [] as Model[])]);
+  return [...local, ...plans, ...remote];
 }
 
 export async function remoteModels(): Promise<Model[]> {

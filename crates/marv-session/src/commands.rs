@@ -659,7 +659,12 @@ pub fn help_text() -> String {
 fn config_text(ctx: &CommandContext) -> String {
     let c = ctx.config;
     let p = preset(c.provider);
+    let signed_in = || c.auth_file.clone().is_some_and(|path| marv_provider::chatgpt::AuthStore { path }.signed_in());
     let key = match (p.key_env, &c.api_key) {
+        // #159: ChatGPT signs in instead.
+        (None, _) if c.provider == marv_provider::ProviderKind::ChatGpt => {
+            if signed_in() { "signed in with ChatGPT (/setup to change)" } else { "not signed in (/setup)" }.to_string()
+        }
         (None, _) => "not needed".to_string(),
         (Some(env), Some(k)) => {
             format!("{} (from {})", mask_key(k), if c.api_key_source == Some(KeySource::Env) { env } else { "config file" })

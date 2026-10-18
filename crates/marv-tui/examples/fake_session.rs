@@ -418,6 +418,7 @@ fn setup_context(start: SetupStart) -> SetupContext {
                 key_env: Some("OPENROUTER_API_KEY".into()),
                 key_url: Some("openrouter.ai/settings/keys".into()),
                 default_model: "anthropic/claude-sonnet-5.5".into(),
+                sign_in: false,
             },
             ProviderPreset {
                 id: ProviderId::Ollama,
@@ -425,10 +426,12 @@ fn setup_context(start: SetupStart) -> SetupContext {
                 key_env: None,
                 key_url: None,
                 default_model: String::new(),
+                sign_in: false,
             },
         ],
         current: Some((ProviderId::Ollama, "qwen3.5:9b".into())),
-        saved_key: None,
+        saved_keys: vec![],
+        signed_in: vec![],
         env_keys: vec![],
     }
 }

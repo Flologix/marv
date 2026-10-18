@@ -60,7 +60,7 @@ function Desktop() {
 
   // First run (or a step still missing): the onboarding, through to connecting apps.
   useEffect(() => {
-    if (info && (!info.root || !(info.hasKey || info.provider === "ollama"))) setSetup(true);
+    if (info && (!info.root || !info.ready)) setSetup(true);
   }, [info]);
 
   // Opened as `marv-desktop <dir>`: that folder; else where the last session left off.

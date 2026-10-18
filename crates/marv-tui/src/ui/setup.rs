@@ -10,6 +10,11 @@
 //! - A custom endpoint belongs to the provider it was set for (the engine drops it on a switch).
 //! - Esc or ctrl+c cancels.
 //!
+//! - #159: a provider that signs in (ChatGPT) has a sign-in step instead of the key step, before the model (its
+//!   models are the account's): Enter opens the browser (the engine runs the sign-in, [`SessionPort::sign_in`]),
+//!   the step shows the address meanwhile and the outcome after. Already signed in, it offers to keep the sign-in,
+//!   sign in again or sign out. Each provider keeps its own saved key (`saved_keys`).
+//!
 //! What changes in Rust: the config file and the environment stay in the engine. Setup gets a
 //! [`SetupContext`] (presets, the saved provider and model, *masked* keys) and answers with a
 //! [`SetupAnswer`] whose `api_key: None` means "keep the saved key" (Marv's `finish({})` kept
@@ -26,19 +31,47 @@ use ratatui::widgets::{Block, BorderType, Padding, Widget};
 use super::model_picker::ModelPicker;
 use super::select::{Select, SelectItem, wrap_all};
 use super::theme;
-use crate::view::{ModelInfo, ProviderId, ProviderPreset, SetupAnswer, SetupContext, SetupStart};
+use crate::view::{ModelInfo, ProviderId, ProviderPreset, SetupAnswer, SetupContext, SetupStart, SignInProgress};
+
+#[cfg(doc)]
+use crate::view::SessionPort;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetupStep {
     Provider,
+    /// #159: signing in (ChatGPT), before the model.
+    SignIn,
     Model,
     ApiKey,
+}
+
+/// #159: what to do with a saved sign-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignInChoice {
+    Keep,
+    Again,
+    Out,
+}
+
+/// #159: where the sign-in step is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignInState {
+    /// Signed in already: keep it, sign in again, or sign out.
+    Choose,
+    /// Enter opens the browser.
+    Ready,
+    /// The browser was sent off (`url` once known): waiting for the person.
+    Waiting { url: Option<String> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SetupOutcome {
     /// Needs the provider's models: call `SessionPort::load_models`.
     LoadModels(ProviderId),
+    /// #159: start the sign-in: call `SessionPort::sign_in`.
+    SignIn(ProviderId),
+    /// #159: sign out (setup closes): call `SessionPort::sign_out`.
+    SignOut(ProviderId),
     Complete(SetupAnswer),
     Cancel,
 }
@@ -52,6 +85,8 @@ pub struct Setup {
     pub model: String,
     pub key_input: String,
     pub error: Option<String>,
+    pub sign_in: SignInState,
+    pub sign_in_choices: Select<SignInChoice>,
 }
 
 /// The hint beside each provider (Marv's `PROVIDER_ITEMS`).
@@ -81,6 +116,8 @@ impl Setup {
             model: String::new(),
             key_input: String::new(),
             error: None,
+            sign_in: SignInState::Ready,
+            sign_in_choices: Select::new(Vec::new(), None),
         };
         setup.picker = ModelPicker::new(setup.initial_model());
         setup
@@ -101,6 +138,51 @@ impl Setup {
 
     fn label(&self) -> String {
         self.preset().map_or_else(String::new, |p| p.label.clone())
+    }
+
+    /// This provider's saved key, masked.
+    fn saved_key(&self) -> Option<&str> {
+        self.context.saved_keys.iter().find(|(p, _)| *p == self.provider).map(|(_, k)| k.as_str())
+    }
+
+    /// Who is signed in to this provider, if anyone.
+    fn signed_in(&self) -> Option<&str> {
+        self.context.signed_in.iter().find(|(p, _)| *p == self.provider).map(|(_, who)| who.as_str())
+    }
+
+    fn signs_in(&self) -> bool {
+        self.preset().is_some_and(|p| p.sign_in)
+    }
+
+    /// The model step, with the provider's list asked for.
+    fn open_models(&mut self) -> SetupOutcome {
+        self.step = SetupStep::Model;
+        self.picker = ModelPicker::new(self.initial_model());
+        SetupOutcome::LoadModels(self.provider)
+    }
+
+    /// #159: how the sign-in the engine started is going. `Some(LoadModels)` once signed in.
+    pub fn sign_in_progress(&mut self, progress: SignInProgress) -> Option<SetupOutcome> {
+        if self.step != SetupStep::SignIn {
+            return None;
+        }
+        match progress {
+            SignInProgress::Started { url } => {
+                self.sign_in = SignInState::Waiting { url: Some(url) };
+                None
+            }
+            SignInProgress::Done(Ok(who)) => {
+                self.context.signed_in.retain(|(p, _)| *p != self.provider);
+                self.context.signed_in.push((self.provider, who));
+                self.error = None;
+                Some(self.open_models())
+            }
+            SignInProgress::Done(Err(why)) => {
+                self.sign_in = SignInState::Ready;
+                self.error = Some(why);
+                None
+            }
+        }
     }
 
     /// The key found in the environment for this provider, masked.
@@ -129,16 +211,44 @@ impl Setup {
         }
         match self.step {
             SetupStep::Provider => {
-                let provider = self.providers.on_key(key)?;
-                self.provider = provider;
-                self.step = SetupStep::Model;
-                self.picker = ModelPicker::new(self.initial_model());
-                Some(SetupOutcome::LoadModels(provider))
+                self.provider = self.providers.on_key(key)?;
+                self.error = None;
+                if !self.signs_in() {
+                    return Some(self.open_models());
+                }
+                self.step = SetupStep::SignIn;
+                self.sign_in = if self.signed_in().is_some() { SignInState::Choose } else { SignInState::Ready };
+                let who = self.signed_in().unwrap_or_default().to_string();
+                self.sign_in_choices = Select::new(
+                    vec![
+                        SelectItem::new(SignInChoice::Keep, format!("Keep using {who}")),
+                        SelectItem::new(SignInChoice::Again, "Sign in again"),
+                        SelectItem::new(SignInChoice::Out, "Sign out"),
+                    ],
+                    Some(&SignInChoice::Keep),
+                );
+                None
             }
+            SetupStep::SignIn => match self.sign_in {
+                SignInState::Choose => match self.sign_in_choices.on_key(key)? {
+                    SignInChoice::Keep => Some(self.open_models()),
+                    SignInChoice::Again => {
+                        self.sign_in = SignInState::Waiting { url: None };
+                        Some(SetupOutcome::SignIn(self.provider))
+                    }
+                    SignInChoice::Out => Some(SetupOutcome::SignOut(self.provider)),
+                },
+                SignInState::Ready if key.code == KeyCode::Enter => {
+                    self.error = None;
+                    self.sign_in = SignInState::Waiting { url: None };
+                    Some(SetupOutcome::SignIn(self.provider))
+                }
+                _ => None,
+            },
             SetupStep::Model => {
                 let model = self.picker.on_key(key)?;
                 self.model = model;
-                let keep_saved = self.context.start == SetupStart::Model && self.context.saved_key.is_some();
+                let keep_saved = self.context.start == SetupStart::Model && self.saved_key().is_some();
                 if self.needs_key_step() && !keep_saved {
                     self.step = SetupStep::ApiKey;
                     None
@@ -149,7 +259,7 @@ impl Setup {
             SetupStep::ApiKey => match key.code {
                 KeyCode::Enter => {
                     let value = self.key_input.trim().to_string();
-                    if value.is_empty() && self.context.saved_key.is_some() {
+                    if value.is_empty() && self.saved_key().is_some() {
                         return Some(self.finish(None)); // Enter on empty keeps the saved key
                     }
                     if value.is_empty() {
@@ -177,7 +287,11 @@ impl Setup {
     }
 
     fn steps(&self) -> Vec<SetupStep> {
-        let mut steps = vec![SetupStep::Provider, SetupStep::Model];
+        let mut steps = vec![SetupStep::Provider];
+        if self.signs_in() {
+            steps.push(SetupStep::SignIn);
+        }
+        steps.push(SetupStep::Model);
         if self.needs_key_step() {
             steps.push(SetupStep::ApiKey);
         }
@@ -204,6 +318,28 @@ impl Setup {
                 lines.push(Line::raw("Which AI provider should Marv use?"));
                 lines.extend(self.providers.render());
             }
+            SetupStep::SignIn => {
+                lines.push(Line::raw(format!("Sign in with {}", self.label())));
+                lines.push(Line::styled(
+                    "Your plan pays for Marv's requests, within its usage limits. The sign-in is saved to ~/.marv/chatgpt.json, readable only by you.",
+                    dim,
+                ));
+                match &self.sign_in {
+                    SignInState::Choose => {
+                        lines.push(Line::styled(format!("Signed in as {}.", self.signed_in().unwrap_or_default()), dim));
+                        lines.extend(self.sign_in_choices.render());
+                    }
+                    SignInState::Ready => lines.push(Line::raw("Press Enter to open your browser and sign in.")),
+                    SignInState::Waiting { url: None } => lines.push(Line::styled("Opening your browser…", dim)),
+                    SignInState::Waiting { url: Some(url) } => {
+                        lines.push(Line::raw("Finish signing in in your browser. If it didn't open, go to:"));
+                        lines.push(Line::styled(url.clone(), accent));
+                    }
+                }
+                if let Some(error) = &self.error {
+                    lines.push(Line::styled(error.clone(), Style::new().fg(theme::ERROR)));
+                }
+            }
             SetupStep::Model => {
                 lines.push(Line::raw("Which model?"));
                 lines.extend(self.picker.lines());
@@ -218,7 +354,7 @@ impl Setup {
                     format!("Get one at {url}. It's saved to ~/.marv/config.json, readable only by you."),
                     dim,
                 ));
-                if let Some(saved) = &self.context.saved_key {
+                if let Some(saved) = self.saved_key() {
                     lines.push(Line::styled(format!("Press Enter to keep the current key ({saved})."), dim));
                 }
                 lines.push(Line::from(vec![
@@ -232,7 +368,12 @@ impl Setup {
             }
         }
         lines.push(Line::default());
-        let keys = if self.step == SetupStep::ApiKey { "Enter to save" } else { "↑/↓ to move · Enter to choose" };
+        let keys = match (self.step, &self.sign_in) {
+            (SetupStep::ApiKey, _) => "Enter to save",
+            (SetupStep::SignIn, SignInState::Ready) => "Enter to sign in",
+            (SetupStep::SignIn, SignInState::Waiting { .. }) => "Waiting for the browser",
+            _ => "↑/↓ to move · Enter to choose",
+        };
         lines.push(Line::styled(format!("{keys} · Esc to cancel"), dim));
         lines
     }
@@ -267,6 +408,7 @@ mod tests {
                 key_env: Some("OPENROUTER_API_KEY".into()),
                 key_url: Some("openrouter.ai/settings/keys".into()),
                 default_model: "anthropic/claude-sonnet-5.5".into(),
+                sign_in: false,
             },
             ProviderPreset {
                 id: ProviderId::Ollama,
@@ -274,6 +416,7 @@ mod tests {
                 key_env: None,
                 key_url: None,
                 default_model: String::new(),
+                sign_in: false,
             },
         ]
     }
@@ -300,7 +443,7 @@ mod tests {
     }
 
     fn context(start: SetupStart) -> SetupContext {
-        SetupContext { start, presets: presets(), current: None, saved_key: None, env_keys: vec![] }
+        SetupContext { start, presets: presets(), current: None, saved_keys: vec![], signed_in: vec![], env_keys: vec![] }
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -411,7 +554,7 @@ mod tests {
     fn enter_on_an_empty_key_keeps_the_saved_one() {
         let mut setup = Setup::new(SetupContext {
             current: Some((ProviderId::OpenRouter, "z-ai/glm-5.3".into())),
-            saved_key: Some("sk-or-save…0000".into()),
+            saved_keys: vec![(ProviderId::OpenRouter, "sk-or-save…0000".into())],
             ..context(SetupStart::Reconfigure)
         });
         press(&mut setup, &[KeyCode::Enter, KeyCode::Enter]); // provider, model (current one highlighted)
@@ -443,6 +586,94 @@ mod tests {
         assert!(frame(&setup).contains("❯ tiny:1b"));
         typed(&mut setup, "qwen");
         assert_eq!(press(&mut setup, &[KeyCode::Enter]), answer(ProviderId::Ollama, "qwen3.5:9b", None));
+    }
+
+    /// #159: the plans, when the engine offers them.
+    fn with_plans(start: SetupStart) -> SetupContext {
+        let mut presets = presets();
+        presets.insert(
+            1,
+            ProviderPreset {
+                id: ProviderId::Zai,
+                label: "Z.ai Coding Plan".into(),
+                key_env: Some("ZAI_API_KEY".into()),
+                key_url: Some("z.ai/manage-apikey/apikey-list".into()),
+                default_model: "glm-5.3".into(),
+                sign_in: false,
+            },
+        );
+        presets.insert(
+            2,
+            ProviderPreset {
+                id: ProviderId::ChatGpt,
+                label: "ChatGPT".into(),
+                key_env: None,
+                key_url: None,
+                default_model: String::new(),
+                sign_in: true,
+            },
+        );
+        SetupContext { presets, ..context(start) }
+    }
+
+    /// #159: the Coding Plan asks for its own key: OpenRouter's saved key isn't offered for it.
+    #[test]
+    fn the_zai_plan_asks_for_its_own_key() {
+        let mut setup = Setup::new(SetupContext {
+            saved_keys: vec![(ProviderId::OpenRouter, "sk-or-save…0000".into())],
+            ..with_plans(SetupStart::Reconfigure)
+        });
+        assert!(frame(&setup).contains("Z.ai Coding Plan · GLM models on the Z.ai GLM Coding Plan you pay for"));
+        assert_eq!(press(&mut setup, &[KeyCode::Down, KeyCode::Enter]), Some(SetupOutcome::LoadModels(ProviderId::Zai)));
+        assert_eq!(press(&mut setup, &[KeyCode::Enter]), None);
+        let shown = frame(&setup);
+        assert!(shown.contains("Paste your Z.ai Coding Plan API key") && shown.contains("z.ai/manage-apikey/apikey-list"));
+        assert!(!shown.contains("sk-or-save"), "another provider's key isn't offered");
+        assert_eq!(press(&mut setup, &[KeyCode::Enter]), None, "an empty key isn't kept from another provider");
+        typed(&mut setup, "zai-key");
+        assert_eq!(press(&mut setup, &[KeyCode::Enter]), answer(ProviderId::Zai, "glm-5.3", Some("zai-key")));
+    }
+
+    /// #159: ChatGPT signs in (the engine runs it), then shows the account's models; no key step.
+    #[test]
+    fn chatgpt_signs_in_before_the_model() {
+        let mut setup = Setup::new(with_plans(SetupStart::FirstRun));
+        assert_eq!(press(&mut setup, &[KeyCode::Down, KeyCode::Down, KeyCode::Enter]), None);
+        assert!(frame(&setup).contains("Press Enter to open your browser and sign in."));
+        assert!(frame(&setup).contains("step 2 of 3"));
+        assert_eq!(setup.on_key(key(KeyCode::Enter)), Some(SetupOutcome::SignIn(ProviderId::ChatGpt)));
+        assert_eq!(setup.on_key(key(KeyCode::Enter)), None, "waiting: Enter does nothing");
+        setup.sign_in_progress(SignInProgress::Started { url: "https://auth.openai.com/api/accounts/authorize?x".into() });
+        assert!(frame(&setup).contains("https://auth.openai.com/api/accounts/authorize?x"));
+        // A failed sign-in says why and can be tried again.
+        assert_eq!(setup.sign_in_progress(SignInProgress::Done(Err("the sign-in timed out".into()))), None);
+        assert!(frame(&setup).contains("the sign-in timed out"));
+        assert_eq!(setup.on_key(key(KeyCode::Enter)), Some(SetupOutcome::SignIn(ProviderId::ChatGpt)));
+        assert_eq!(
+            setup.sign_in_progress(SignInProgress::Done(Ok("ada@example.com".into()))),
+            Some(SetupOutcome::LoadModels(ProviderId::ChatGpt))
+        );
+        setup.models_loaded(Ok(models(ProviderId::ChatGpt)));
+        assert_eq!(press(&mut setup, &[KeyCode::Enter]), answer(ProviderId::ChatGpt, "gpt-6.1-sol", None));
+    }
+
+    /// #159: already signed in: keep it, sign in again, or sign out.
+    #[test]
+    fn a_saved_sign_in_can_be_kept_renewed_or_signed_out() {
+        let context = || SetupContext {
+            signed_in: vec![(ProviderId::ChatGpt, "ada@example.com".into())],
+            ..with_plans(SetupStart::Reconfigure)
+        };
+        let mut setup = Setup::new(context());
+        press(&mut setup, &[KeyCode::Down, KeyCode::Down, KeyCode::Enter]);
+        assert!(frame(&setup).contains("Keep using ada@example.com"));
+        assert_eq!(setup.on_key(key(KeyCode::Enter)), Some(SetupOutcome::LoadModels(ProviderId::ChatGpt)));
+        let mut setup = Setup::new(context());
+        press(&mut setup, &[KeyCode::Down, KeyCode::Down, KeyCode::Enter, KeyCode::Down]);
+        assert_eq!(setup.on_key(key(KeyCode::Enter)), Some(SetupOutcome::SignIn(ProviderId::ChatGpt)));
+        let mut setup = Setup::new(context());
+        press(&mut setup, &[KeyCode::Down, KeyCode::Down, KeyCode::Enter, KeyCode::Down, KeyCode::Down]);
+        assert_eq!(setup.on_key(key(KeyCode::Enter)), Some(SetupOutcome::SignOut(ProviderId::ChatGpt)));
     }
 
     #[test]

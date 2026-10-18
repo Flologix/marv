@@ -345,6 +345,8 @@ pub struct ProviderPreset {
     pub key_env: Option<String>,
     pub key_url: Option<String>,
     pub default_model: String,
+    /// #159: the person signs in (ChatGPT) instead of pasting a key.
+    pub sign_in: bool,
 }
 
 /// Where setup starts: the whole wizard (first run, `/setup`) or just the model (`/model`).
@@ -363,10 +365,21 @@ pub struct SetupContext {
     pub presets: Vec<ProviderPreset>,
     /// The saved provider and model; None on first run.
     pub current: Option<(ProviderId, String)>,
-    /// The saved API key, masked, if there is one.
-    pub saved_key: Option<String>,
+    /// The saved API key of each provider that has one, masked (#159: each provider has its own).
+    pub saved_keys: Vec<(ProviderId, String)>,
+    /// #159: the providers with a saved sign-in, and who is signed in (an email, or "signed in").
+    pub signed_in: Vec<(ProviderId, String)>,
     /// A key found in the environment for each provider, masked.
     pub env_keys: Vec<(ProviderId, String)>,
+}
+
+/// #159: how a sign-in is going.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignInProgress {
+    /// The browser was sent to this address (shown, in case it didn't open).
+    Started { url: String },
+    /// Signed in (who: an email, or "signed in"), or why not.
+    Done(Result<String, String>),
 }
 
 /// What the user chose in setup. `api_key: None` keeps the saved key.
@@ -601,6 +614,8 @@ pub enum UiEvent {
     Sessions(Vec<SessionSummary>),
     /// The answer to [`SessionPort::load_models`].
     Models(Result<Vec<ModelInfo>, String>),
+    /// #159: how a sign-in started with [`SessionPort::sign_in`] is going.
+    SignIn(SignInProgress),
     /// A session was brought back: replace the transcript.
     Resumed(Resumed),
     /// A short-lived status bar message ("Copied 3 lines").
@@ -730,6 +745,15 @@ pub trait SessionPort: Send + Sync {
 
     /// Setup finished: save the config and reconfigure the provider.
     fn complete_setup(&self, answer: SetupAnswer);
+
+    /// #159: setup's sign-in step: open the browser and wait for the sign-in ([`UiEvent::SignIn`]).
+    fn sign_in(&self, _provider: ProviderId) {}
+
+    /// #159: setup closed while a sign-in waited: stop listening for it.
+    fn cancel_sign_in(&self) {}
+
+    /// #159: setup's "sign out": revoke and forget the provider's sign-in.
+    fn sign_out(&self, _provider: ProviderId) {}
 
     /// `/resume` picked a session, or `marv -c` (`None` = the latest here).
     fn resume(&self, id: Option<String>);
