@@ -37,13 +37,25 @@ pub struct Shared {
     /// Approvals asked and not answered yet, by id.
     waiting: BTreeSet<u64>,
     ended: bool,
+    /// Which numbering the events have: a new one each time the app starts this chat's events afresh. A page whose
+    /// saved number is from another (an earlier run of the app) gets every event kept, not those after its number.
+    epoch: String,
 }
 
 impl Shared {
+    /// This numbering's id, made on first use.
+    fn epoch(&mut self) -> String {
+        if self.epoch.is_empty() {
+            self.epoch = uuid::Uuid::new_v4().to_string();
+        }
+        self.epoch.clone()
+    }
+
     /// One event from the session: noted, numbered and kept, and sent to the page if one is attached.
     pub fn deliver(&mut self, mut event: Value) {
         match event["type"].as_str() {
             Some("ready") => {
+                event["epoch"] = json!(self.epoch());
                 self.ready = Some(event.clone());
                 self.send(event);
                 return;
@@ -82,9 +94,11 @@ impl Shared {
         }
     }
 
-    /// A page shows the chat, having saved everything up to `after`: its `ready` (with whether a turn is running),
-    /// then what came after, then live events.
-    pub fn attach(&mut self, sink: Sink, after: u64) {
+    /// A page shows the chat, having saved everything up to `after` of numbering `epoch`: its `ready` (with whether a
+    /// turn is running, and this numbering's epoch), then what came after, then live events. A page with another
+    /// epoch (saved before the app restarted) gets every event kept: its number means nothing here.
+    pub fn attach(&mut self, sink: Sink, after: u64, epoch: Option<&str>) {
+        let after = if epoch == Some(self.epoch().as_str()) { after } else { 0 };
         self.sink = Some(sink);
         if let Some(mut ready) = self.ready.clone() {
             ready["busy"] = json!(self.busy);
@@ -213,7 +227,7 @@ mod tests {
     fn a_page_that_comes_back_gets_what_came_after_its_last_event_and_a_waiting_approval_is_counted() {
         let mut chat = Shared::default();
         let (sink, got, open) = page();
-        chat.attach(sink, 0);
+        chat.attach(sink, 0, None);
         chat.deliver(json!({"type": "ready", "sessionId": "s"}));
         chat.deliver(json!({"type": "turn_start"}));
         chat.deliver(json!({"type": "text_delta", "text": "a"}));
@@ -227,7 +241,8 @@ mod tests {
         assert_eq!(types(&got), ["ready", "turn_start", "text_delta", "text_delta"]);
 
         let (sink, again, _) = page();
-        chat.attach(sink, 2);
+        let epoch = chat.epoch();
+        chat.attach(sink, 2, Some(&epoch));
         assert_eq!(types(&again), ["ready", "text_delta", "text_delta", "approval"]);
         let again = again.lock().unwrap();
         assert_eq!(again[0]["busy"], true);
@@ -245,10 +260,11 @@ mod tests {
         chat.deliver(json!({"type": "ready"}));
         chat.deliver(json!({"type": "notice", "text": "woken"}));
         let (sink, got, _) = page();
-        chat.attach(sink, 0);
+        chat.attach(sink, 0, None);
         assert_eq!(types(&got), ["ready", "notice"]);
         let (sink, up_to_date, _) = page();
-        chat.attach(sink, 1);
+        let epoch = chat.epoch();
+        chat.attach(sink, 1, Some(&epoch));
         assert_eq!(types(&up_to_date), ["ready"]);
     }
 
@@ -259,11 +275,27 @@ mod tests {
             chat.deliver(json!({"type": "text_delta", "text": i.to_string()}));
         }
         let (sink, got, _) = page();
-        chat.attach(sink, 1);
+        let epoch = chat.epoch();
+        chat.attach(sink, 1, Some(&epoch));
         let got = got.lock().unwrap();
         assert_eq!(got.len(), BACKLOG + 1);
         assert!(got[0]["text"].as_str().unwrap().starts_with("2 earlier updates"), "{}", got[0]);
         assert_eq!(got[1]["text"], "3");
+    }
+
+    /// After the app restarts, a chat's numbering starts again at 1, while the page saved a number from the last run:
+    /// a page with another epoch (or none) gets every event kept, and the `ready` it gets says the new epoch.
+    #[test]
+    fn a_page_from_an_earlier_run_gets_every_event() {
+        let mut chat = Shared::default();
+        chat.deliver(json!({"type": "ready"}));
+        chat.deliver(json!({"type": "text_delta", "text": "new run"}));
+        for epoch in [Some("an-earlier-run"), None] {
+            let (sink, got, _) = page();
+            chat.attach(sink, 41, epoch);
+            assert_eq!(types(&got), ["ready", "text_delta"], "{epoch:?}");
+            assert_eq!(got.lock().unwrap()[0]["epoch"], chat.epoch());
+        }
     }
 
     #[test]
@@ -271,7 +303,7 @@ mod tests {
         let mut chat = Shared::default();
         chat.end();
         let (sink, got, _) = page();
-        chat.attach(sink, 0);
+        chat.attach(sink, 0, None);
         assert_eq!(types(&got), ["closed"]);
     }
 
@@ -294,7 +326,7 @@ mod tests {
         // c0 is running a turn, c1 waits for an approval, c2 is on screen: c3 is the oldest that can go.
         live["c0"].shared().busy = true;
         live["c1"].shared().waiting.insert(1);
-        live["c2"].shared().attach(Box::new(|_| true), 0);
+        live["c2"].shared().attach(Box::new(|_| true), 0, None);
         assert_eq!(to_evict(&live, "new").as_deref(), Some("c3"));
         assert_eq!(to_evict(&live, "c3").as_deref(), Some("c4"));
         live.remove("c7");

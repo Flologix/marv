@@ -125,7 +125,7 @@ export const desktop = {
 export async function connect(
   id: string,
   settings: ChatSettings,
-  resume: { generation: number; after: number },
+  resume: { generation: number; after: number; epoch: string | null },
   onEvent: (e: ServerEvent) => void,
 ): Promise<Connection> {
   if (isDesktop) {

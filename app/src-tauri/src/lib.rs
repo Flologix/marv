@@ -403,6 +403,7 @@ fn open_chat(
     mcp_off: Vec<String>,
     generation: Option<u32>,
     after: Option<u64>,
+    epoch: Option<String>,
     on_event: Channel<Value>,
 ) -> Result<Chat, String> {
     // A local (Ollama) model needs no key.
@@ -428,7 +429,7 @@ fn open_chat(
                 let configure =
                     ClientMessage::Configure { model: Some(model), max_steps: Some(max_steps.min(500)), yolo: Some(yolo) };
                 let _ = running.to_chat.send(configure);
-                running.shared().attach(sink, after.unwrap_or(0));
+                running.shared().attach(sink, after.unwrap_or(0), epoch.as_deref());
                 return Ok(chat);
             }
             // Its servers changed (or it ended): started again below, continuing the conversation.
@@ -462,7 +463,7 @@ fn open_chat(
     let (to_chat, from_page) = mpsc::unbounded_channel();
     let (out, mut events) = mpsc::unbounded_channel::<Value>();
     let shared = std::sync::Arc::new(std::sync::Mutex::new(background::Shared::default()));
-    background::lock(&shared).attach(sink, 0);
+    background::lock(&shared).attach(sink, 0, None);
     let running = LiveChat { to_chat, key, shared: shared.clone(), seen: std::time::Instant::now() };
     desktop.live().insert(chat.id.clone(), running);
     tauri::async_runtime::spawn(run_chat(spec, from_page, out));

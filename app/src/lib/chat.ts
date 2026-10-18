@@ -168,6 +168,16 @@ function apply(items: Item[], e: ServerEvent): Item[] {
 const storageKey = (id: string) => `marv-transcript-${id}`;
 /** The number of the last event the saved transcript has: a chat reopened gets what came after (#155). */
 const seqKey = (id: string) => `marv-seq-${id}`;
+/** Which numbering that number is in: the app numbers a chat's events afresh each time it starts. */
+const epochKey = (id: string) => `marv-epoch-${id}`;
+
+function loadEpoch(id: string): string | null {
+  try {
+    return localStorage.getItem(epochKey(id));
+  } catch {
+    return null;
+  }
+}
 
 function loadSeq(id: string): number {
   try {
@@ -203,6 +213,7 @@ export function forget(id: string) {
   try {
     localStorage.removeItem(storageKey(id));
     localStorage.removeItem(seqKey(id));
+    localStorage.removeItem(epochKey(id));
   } catch {}
 }
 
@@ -272,8 +283,16 @@ export function useChat(id: string | null, settings: ChatSettings, reload = 0) {
     sent.current = settingsRef.current;
     // Opened a beat late, so React's dev double-mount doesn't open the chat twice.
     const timer = setTimeout(() => {
-      connect(id, settingsRef.current, { generation: reload, after: received.current }, (e) => {
+      connect(id, settingsRef.current, { generation: reload, after: received.current, epoch: loadEpoch(id) }, (e) => {
         if (!live) return;
+        // Another numbering than the saved one (the app restarted): this page's numbers start over with it, and the
+        // app sends every event it kept.
+        if (e.type === "ready" && typeof e.epoch === "string" && e.epoch !== loadEpoch(id)) {
+          received.current = applied.current = 0;
+          try {
+            localStorage.setItem(epochKey(id), e.epoch);
+          } catch {}
+        }
         // Numbered events: one this page already has (a reattach racing the last one) is skipped.
         if (typeof e.seq === "number") {
           if (e.seq <= received.current) return;
