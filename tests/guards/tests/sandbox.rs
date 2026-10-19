@@ -687,7 +687,7 @@ fn marvs_own_folders_are_refused_as_writable_entries() {
         &entries.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
         home.path(),
         project.path(),
-        Some(&runtime),
+        Some(&runtime.join("marv")),
         Some(&config),
     );
     for entry in entries {
@@ -743,7 +743,7 @@ async fn the_writable_folder_is_writable_and_nothing_else_new_is() {
         &[beads.path().display().to_string()],
         home.path(),
         project.path(),
-        std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from).as_deref(),
+        marv_sandbox::runtime_path(&marv_sandbox::runtime_env()).as_deref(),
         None,
     );
     assert_eq!(accepted, vec![beads.path()], "{problems:?}");

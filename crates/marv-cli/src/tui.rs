@@ -1720,7 +1720,7 @@ impl Bridge {
                 Some(radio) if radio.is_on() => self.emit(UiEvent::OpenRadio),
                 Some(_) => self.emit(system(commands::RADIO_OFF, false)),
                 None => self.emit(system(
-                    "This Marv isn't on the mesh (no XDG_RUNTIME_DIR, or its door didn't open), so it isn't on the radio.",
+                    "This Marv isn't on the mesh (no runtime folder, or its door didn't open), so it isn't on the radio.",
                     false,
                 )),
             },
@@ -2023,7 +2023,7 @@ impl Bridge {
                      for this one."
                 }
             ),
-            (true, None) => "Radio on, saved. This Marv isn't on the mesh (no XDG_RUNTIME_DIR, or its door didn't open), \
+            (true, None) => "Radio on, saved. This Marv isn't on the mesh (no runtime folder, or its door didn't open), \
                  so it joins from the next start."
                 .to_string(),
             (false, _) => "Radio off: this Marv left it.".to_string(),
@@ -2560,7 +2560,7 @@ pub fn merge_pre_approved(mut from_config: Vec<String>, from_cli: &[String]) -> 
 
 /// Extra writable sandbox folders (#98): resolved once here (refused entries are problems, never mounts).
 pub fn resolve_writable(config: &[String], home: &Path, root: &Path, config_dir: &Path) -> (Vec<PathBuf>, Vec<String>) {
-    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from);
+    let runtime = marv_sandbox::runtime_path(&marv_sandbox::runtime_env());
     marv_sandbox::resolve_writable(config, home, root, runtime.as_deref(), Some(config_dir))
 }
 

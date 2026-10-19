@@ -15,6 +15,7 @@
 //! - [`bwrap`]: the bubblewrap argument builder (and the mesh plug at `/run/marv/mesh.sock`).
 //! - [`git_guard`]: `.git` read-only or a placeholder for commands that run without asking; worktree records.
 //! - [`notes`]: the `Marv:` notes bash appends (stand-in home, missing network, gh, read-only .git).
+//! - [`runtime`]: Marv's runtime folder (mesh and process sockets): one rule per platform, `MARV_RUNTIME_DIR`.
 //! - [`taint`]: once web/MCP/mesh/image text is in the context, egress always asks.
 
 pub mod bwrap;
@@ -24,6 +25,7 @@ pub mod host_env;
 pub mod notes;
 pub mod paths;
 pub mod protected;
+pub mod runtime;
 pub mod taint;
 pub mod writable;
 
@@ -34,10 +36,12 @@ pub use bwrap::{Bind, EntryKind, FileKind, FsProbe, MESH_SOCKET, RealFs, Sandbox
 pub use home::home_project;
 pub use paths::{project_path, resolve_in_project, resolve_within, touches_git};
 pub use protected::{PROTECTED_PATHS, ProtectedPath, ProtectedRule, is_protected, protected_rule};
+pub use runtime::{RUNTIME_DIR_RULE, runtime_dir, runtime_env, runtime_path};
 pub use taint::TaintState;
 pub use writable::resolve as resolve_writable;
 
-/// Whether every sandbox hides `dir`: it is (by its real path) under `/run`, `/tmp` or a hidden top-level entry of the
+/// Whether every sandbox hides `dir`: it is (by its real path) under `/run`, `/tmp` (by their real paths too: macOS's
+/// `/tmp` is `/private/tmp`) or a hidden top-level entry of the
 /// home folder (`~/.<anything>`), which each command sees as empty tmpfs — the home-folder project too, which shows
 /// the rest of the home read-only. The mesh keeps its sockets only in such a folder: a socket a sandboxed command could
 /// see is one it could connect to (a read-only mount doesn't stop `connect()`), and a plug's socket carries that
@@ -50,8 +54,8 @@ pub fn hidden_in_sandbox(dir: &std::path::Path, home: &std::path::Path) -> bool 
     }
     let home = real(home);
     let under = |base: &std::path::Path| dir.starts_with(base) && dir != base;
-    under(std::path::Path::new("/run"))
-        || under(std::path::Path::new("/tmp"))
+    under(&real(std::path::Path::new("/run")))
+        || under(&real(std::path::Path::new("/tmp")))
         || (home != std::path::Path::new("/")
             && dir
                 .strip_prefix(&home)
@@ -108,7 +112,7 @@ pub struct Sandbox {
     pub lang: String,
     /// The mesh plug's host-side socket, bound at [`MESH_SOCKET`] (`docs/MESH.md`). None: no mesh.
     pub mesh_socket: Option<PathBuf>,
-    /// Folders every command sees empty: Marv's runtime folder (`$XDG_RUNTIME_DIR/marv`, see `SandboxOptions::hidden`).
+    /// Folders every command sees empty: Marv's runtime folder (`runtime::runtime_path`, see `SandboxOptions::hidden`).
     pub hidden: Vec<PathBuf>,
     /// Extra folders outside the project every command may change (#98): the config's `"writable"`, already
     /// checked (`writable::resolve`) and canonical. None of the refusal happens here — a path in this list was
@@ -141,11 +145,7 @@ impl Sandbox {
             path: std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
             lang: std::env::var("LANG").unwrap_or_else(|_| "C.UTF-8".into()),
             mesh_socket: None,
-            hidden: std::env::var_os("XDG_RUNTIME_DIR")
-                .map(PathBuf::from)
-                .filter(|d| d.is_absolute())
-                .map(|d| vec![d.join("marv")])
-                .unwrap_or_default(),
+            hidden: runtime_path(&runtime_env()).into_iter().collect(),
             writable: Vec::new(),
             config_dir: Some(config_dir(std::env::var_os("MARV_CONFIG_DIR"), std::env::current_dir().ok().as_deref(), &home)),
         }

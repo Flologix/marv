@@ -19,7 +19,7 @@
 //!   accepted folder later (`~/Projects/x/cache/repo/.git` created by a command) is not scanned — the refusal
 //!   happens once, at startup, on what the entry held then;
 //! - the project's parents (a writable `~/Projects` would make every other project writable);
-//! - a Marv runtime folder (the mesh's plug sockets, the `runtime` argument's `marv/` under it), inside it or holding it;
+//! - a Marv runtime folder (the mesh's sockets: the `runtime` argument, `runtime::runtime_path`), inside it or holding it;
 //! - Marv's config folder (`config_dir`: `~/.marv`, or a visible `MARV_CONFIG_DIR`), inside it or holding it — the
 //!   config's hooks, the API key, the tool-output files;
 //! - anything missing or not a folder: bwrap can't mount it.
@@ -105,13 +105,12 @@ fn refuse(real: &Path, home: &Path, root: &Path, runtime: Option<&Path>, config_
     if real.is_dir() && real.join(".git").try_exists().unwrap_or(true) {
         return Some("it is, or holds, a git repository: git runs its hooks and config outside the sandbox".into());
     }
-    // The mesh's sockets live in the runtime dir's `marv` folder: a writable mount over them (or over their
-    // parent) would let a command reach a plug's socket. (`hidden_in_sandbox` is broader — anything under /run,
-    // /tmp or the home — but a writable folder under the home is exactly the point of #98, so only the runtime
-    // dir itself is out. `runtime` is the caller's XDG_RUNTIME_DIR, from the real environment.)
-    // Inside it counts too (`$XDG_RUNTIME_DIR/marv/mesh`, where the sockets themselves are). Judged on the real path,
-    // like the entry.
-    if let Some(sockets) = runtime.map(|base| real_or_given(&base.join("marv")))
+    // The mesh's sockets live in Marv's runtime folder: a writable mount over them (or over their parent) would let
+    // a command reach a plug's socket. (`hidden_in_sandbox` is broader — anything under /run, /tmp or the home — but
+    // a writable folder under the home is exactly the point of #98, so only the runtime folder itself is out.
+    // `runtime` is the caller's `runtime::runtime_path`, from the real environment.) Inside it counts too
+    // (`<runtime>/mesh`, where the sockets themselves are). Judged on the real path, like the entry.
+    if let Some(sockets) = runtime.map(real_or_given)
         && (real.starts_with(&sockets) || sockets.starts_with(real))
     {
         return Some("the mesh's runtime sockets live there".into());
@@ -160,8 +159,8 @@ fn resolve_entry(
 }
 
 /// The config's `"writable"` entries resolved once at startup: the canonical paths to bind read-write into every
-/// sandbox, and the problems (refused entries) for the startup notice. Duplicates collapse. `runtime` is the
-/// process's `XDG_RUNTIME_DIR` (the mesh sockets live under `marv/` in it), from the real environment; `config_dir` is
+/// sandbox, and the problems (refused entries) for the startup notice. Duplicates collapse. `runtime` is Marv's
+/// runtime folder (`runtime::runtime_path`: the mesh's sockets), from the real environment; `config_dir` is
 /// Marv's config folder (`default_config_dir`: `~/.marv` or `MARV_CONFIG_DIR`).
 pub fn resolve(
     entries: &[String],
@@ -357,13 +356,13 @@ mod tests {
         let root = TempDir::new("writable-root6");
         let runtime = home.path().join("xdg");
         std::fs::create_dir_all(runtime.join("marv")).unwrap();
-        let why = with_runtime(home.path(), root.path(), "~/xdg/marv", &runtime).unwrap_err();
+        let why = with_runtime(home.path(), root.path(), "~/xdg/marv", &runtime.join("marv")).unwrap_err();
         assert!(why.contains("runtime sockets"), "{why}");
-        let why = with_runtime(home.path(), root.path(), "~/xdg", &runtime).unwrap_err();
+        let why = with_runtime(home.path(), root.path(), "~/xdg", &runtime.join("marv")).unwrap_err();
         assert!(why.contains("runtime sockets"), "{why}");
         // An unrelated folder next to it is fine.
         std::fs::create_dir_all(home.path().join("other")).unwrap();
-        assert!(with_runtime(home.path(), root.path(), "~/other", &runtime).is_ok());
+        assert!(with_runtime(home.path(), root.path(), "~/other", &runtime.join("marv")).is_ok());
     }
 
     // #98 review: the sockets are in `marv/mesh` under the runtime dir, so a folder *inside* `marv/` is refused too.
@@ -373,7 +372,7 @@ mod tests {
         let root = TempDir::new("writable-root7");
         let runtime = home.path().join("xdg");
         std::fs::create_dir_all(runtime.join("marv/mesh")).unwrap();
-        let why = with_runtime(home.path(), root.path(), "~/xdg/marv/mesh", &runtime).unwrap_err();
+        let why = with_runtime(home.path(), root.path(), "~/xdg/marv/mesh", &runtime.join("marv")).unwrap_err();
         assert!(why.contains("runtime sockets"), "{why}");
     }
 
