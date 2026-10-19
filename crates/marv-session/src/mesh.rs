@@ -61,14 +61,13 @@ pub fn parent_id() -> PlugId {
     PlugId::new(PARENT).expect("a valid plug id")
 }
 
-/// A switchboard for session `session`, its plug sockets in `$XDG_RUNTIME_DIR/marv/plugs/<session>` (0700), served
-/// until `cancel`. `None` without a runtime dir: plugs never fall back to a world-readable `/tmp`. Nor with a runtime
-/// dir every sandbox doesn't hide: a worker that could see `parent.sock` could connect to it and use the parent's
-/// wires (`marv_sandbox::hidden_in_sandbox`).
+/// A switchboard for session `session`, its plug sockets in `<runtime>/p/<pid>` (0700), served until `cancel`. `None`
+/// without a runtime folder (`marv_sandbox::runtime_dir`): plugs never fall back to a world-readable `/tmp`, nor to a
+/// folder every sandbox doesn't hide: a worker that could see `parent.sock` could connect to it and use the parent's
+/// wires. The folder is named after the process, not the session (one switchboard per process): a session name of up
+/// to 43 bytes and a plug id of up to 48 overflowed `sun_path` (#150).
 pub fn start(session: &str, env: &marv_mcp::Env, cancel: CancellationToken) -> Option<MeshHandle> {
-    let home = env.get("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"));
-    let base = env.get("XDG_RUNTIME_DIR").filter(|d| marv_sandbox::hidden_in_sandbox(std::path::Path::new(d), &home))?;
-    let dir = PathBuf::from(base).join("marv").join("plugs").join(session);
+    let dir = marv_sandbox::runtime_dir(env)?.join("p").join(std::process::id().to_string());
     let mesh = Arc::new(Switchboard::new(session, dir, Arc::new(marv_mesh::switchboard::NoTrajectory)));
     tokio::spawn(Arc::clone(&mesh).serve(cancel));
     Some(mesh)

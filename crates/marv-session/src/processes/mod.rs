@@ -70,8 +70,8 @@ pub struct ProcessManagerOptions {
     pub root: PathBuf,
     /// The home folder the sandbox hides (default: the user's); tests pass a fake one.
     pub home: Option<PathBuf>,
-    /// The folder this manager makes its own folder in, for its processes' sockets (default:
-    /// `$XDG_RUNTIME_DIR/marv`). Its own is `<pid>-<random>`: two sessions in one program never share one, and each
+    /// The folder this manager makes its own folder in, for its processes' sockets (default: Marv's runtime folder,
+    /// `marv_sandbox::runtime_dir`). Its own is `<pid>-<random>`: two sessions in one program never share one, and each
     /// removes only its own.
     pub runtime_dir: Option<PathBuf>,
     pub on_change: Option<OnChange>,
@@ -267,12 +267,11 @@ impl ProcessManager {
         if let Some(dir) = &self.shared.options.runtime_dir {
             return dir.clone();
         }
-        // A short path: a Unix socket's path is limited to 107 bytes.
-        let base = std::env::var_os("XDG_RUNTIME_DIR")
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| std::env::temp_dir().join(format!("marv-{}", nix::unistd::getuid())));
-        base.join("marv")
+        // A short path: a Unix socket's path is limited to 107 bytes (103 on macOS). Marv's runtime folder
+        // (`marv_sandbox::runtime_dir`, hidden in every sandbox), else as before a folder of the user's in the temp
+        // folder.
+        marv_sandbox::runtime_dir(&marv_sandbox::runtime_env())
+            .unwrap_or_else(|| std::env::temp_dir().join(format!("marv-{}", nix::unistd::getuid())).join("marv"))
     }
 
     /// Its own folder (0700), unique even among managers in one process: their process ids both start at p1.

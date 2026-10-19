@@ -18,7 +18,7 @@
 //! Serving: an MCP server (`marv_mcp::jsonrpc`) on each plug's socket. Each
 //! wired receptacle is a tool in `tools/list`; `tools/call` routes; `watch`
 //! wires get notifications (routing them comes last). v2 also listens on
-//! `$XDG_RUNTIME_DIR/marv/mesh/<session>.sock` ([`crate::discovery`]).
+//! `<runtime>/mesh/<session>.sock` ([`crate::discovery`]).
 //!
 //! Receptacles other than inboxes (v2: another Marv's inbox, a Herdr pane) are served by a [`Service`] offered with
 //! them ([`Switchboard::offer_service`]). Ones that appear while Marv runs (a Marv started later, a new Herdr pane)
@@ -343,6 +343,7 @@ impl Switchboard {
         let host_socket = self.runtime_dir.join(format!("{}.sock", id.as_str()));
         // A socket left by an earlier plug of this name (the folder is this session's own): bind would fail on it.
         let _ = std::fs::remove_file(&host_socket);
+        marv_sandbox::runtime::check_socket_path(&host_socket).map_err(MeshError::Io)?;
         let listener =
             StdUnixListener::bind(&host_socket).map_err(|e| io(&format!("can't listen on {}", host_socket.display()), e))?;
         std::fs::set_permissions(&host_socket, std::fs::Permissions::from_mode(0o600))
