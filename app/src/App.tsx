@@ -29,11 +29,12 @@ function keep(key: string, value: unknown) {
 function useSettings() {
   const [settings, setSettings] = useState<ChatSettings>(() => ({ ...DEFAULT_SETTINGS, ...stored(SETTINGS_KEY, DEFAULT_SETTINGS) }));
   const [models, setModels] = useState<Model[]>([]);
+  const reloadModels = () => loadModels().then(setModels, () => setModels([]));
   useEffect(() => keep(SETTINGS_KEY, settings), [settings]);
   useEffect(() => {
-    loadModels().then(setModels, () => setModels([]));
+    void reloadModels();
   }, []);
-  return { settings, setSettings, models };
+  return { settings, setSettings, models, reloadModels };
 }
 
 export default function App() {
@@ -47,9 +48,10 @@ function Desktop() {
   const [chatId, setChatId] = useState<string | null>(null);
   const [chats, setChats] = useState<ChatRecord[]>([]);
   const [collapsed, setCollapsed] = useState(false);
-  const { settings, setSettings, models } = useSettings();
+  const { settings, setSettings, models, reloadModels } = useSettings();
   const [reload, setReload] = useState(0);
-  const [setup, setSetup] = useState(false);
+  // "first": the first-run onboarding; "plan" (#159): its first step again, from the model menu, to set up a plan.
+  const [setup, setSetup] = useState<false | "first" | "plan">(false);
   const [gallery, setGallery] = useState(false);
   const [installed, setInstalled] = useState<string[]>([]);
   // The active space's switched-off apps go with every chat in it.
@@ -60,7 +62,7 @@ function Desktop() {
 
   // First run (or a step still missing): the onboarding, through to connecting apps.
   useEffect(() => {
-    if (info && (!info.root || !info.ready)) setSetup(true);
+    if (info && (!info.root || !info.ready)) setSetup("first");
   }, [info]);
 
   // Opened as `marv-desktop <dir>`: that folder; else where the last session left off.
@@ -115,6 +117,20 @@ function Desktop() {
   }, []);
 
   if (!info) return null;
+  if (setup === "plan")
+    return (
+      <Onboarding
+        info={info}
+        again
+        onInfo={(next) => {
+          setInfo(next);
+          void reloadModels();
+          setSetup(false);
+        }}
+        onModel={(model) => setSettings({ ...settings, model })}
+        onFinish={() => setSetup(false)}
+      />
+    );
   if (setup)
     return (
       <Onboarding info={info} onInfo={setInfo} onModel={(model) => setSettings({ ...settings, model })} onFinish={() => setSetup(false)} />
@@ -270,6 +286,7 @@ function Desktop() {
         onSettings={setSettings}
         models={models}
         hasKey={info.hasKey}
+        onSetupPlan={info.offerZai || info.offerChatgpt ? () => setSetup("plan") : undefined}
         onSend={(text) => void send(text)}
         left={
           <button className="icon-btn" title={collapsed ? "Show folders (ctrl+b)" : "Hide folders (ctrl+b)"} onClick={() => setCollapsed((c) => !c)}>

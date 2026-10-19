@@ -16,13 +16,16 @@ export function Onboarding({
   onInfo,
   onModel,
   onFinish,
+  again = false,
 }: {
   info: AppInfo;
   onInfo: (info: AppInfo) => void;
   onModel: (model: string) => void;
   onFinish: () => void;
+  /** #159: only the first step again (from the model menu, to set up a plan), with a way back. */
+  again?: boolean;
 }) {
-  const step = !info.ready ? "brain" : !info.root ? "folder" : "apps";
+  const step = again || !info.ready ? "brain" : !info.root ? "folder" : "apps";
   const [installed, setInstalled] = useState<string[]>([]);
   const refresh = () => desktop.mcpServers("").then((s) => setInstalled(s.map((e) => e.name)), () => {});
 
@@ -36,13 +39,22 @@ export function Onboarding({
         <Martian size={56} className="toon" />
         <div className="brand">
           <img className="flai" src="/flai.png" alt="FloLogix AI" /> marv desktop
-          <span className="steps">
-            {["brain", "folder", "apps"].map((s) => (
-              <i key={s} className={s === step ? "on" : ""} />
-            ))}
-          </span>
+          {!again && (
+            <span className="steps">
+              {["brain", "folder", "apps"].map((s) => (
+                <i key={s} className={s === step ? "on" : ""} />
+              ))}
+            </span>
+          )}
         </div>
         {step === "brain" && <Brain info={info} onInfo={onInfo} onModel={onModel} />}
+        {again && (
+          <div>
+            <button className="btn" onClick={onFinish}>
+              Back
+            </button>
+          </div>
+        )}
         {step === "folder" && <Folder onInfo={onInfo} />}
         {step === "apps" && (
           <>

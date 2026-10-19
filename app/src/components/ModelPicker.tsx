@@ -14,11 +14,14 @@ export function ModelPicker({
   model,
   remote,
   hasKey,
+  onSetupPlan,
   onPick,
 }: {
   model: string;
   remote: Model[];
   hasKey: boolean;
+  /** #159: set up a plan (the Z.ai Coding Plan, Sign in with ChatGPT) when this build offers one. */
+  onSetupPlan?: () => void;
   onPick: (id: string) => void;
 }) {
   const plans = remote.filter((m) => m.plan);
@@ -71,7 +74,7 @@ export function ModelPicker({
         <button role="tab" aria-selected={tab === "openrouter"} className={tab === "openrouter" ? "active" : ""} onClick={() => setTab("openrouter")}>
           OpenRouter
         </button>
-        {plans.length > 0 && (
+        {(plans.length > 0 || onSetupPlan) && (
           <button role="tab" aria-selected={tab === "plan"} className={tab === "plan" ? "active" : ""} onClick={() => setTab("plan")}>
             Your plan
           </button>
@@ -85,7 +88,11 @@ export function ModelPicker({
 
       {tab === "plan" ? (
         <>
-          <p className="help">Paid by your plan, within its usage limits. When a limit is reached Marv stops and says so.</p>
+          <p className="help">
+            {plans.length > 0
+              ? "Paid by your plan, within its usage limits. When a limit is reached Marv stops and says so."
+              : "Use a plan you already pay for: the Z.ai GLM Coding Plan, or your ChatGPT plan."}
+          </p>
           <div className="model-list">
             {plans.map((m) => (
               <button key={m.id} className={`model${m.id === model ? " active" : ""}`} onClick={() => onPick(m.id)} title={m.id}>
@@ -97,6 +104,11 @@ export function ModelPicker({
               </button>
             ))}
           </div>
+          {onSetupPlan && (
+            <button className="btn" onClick={onSetupPlan}>
+              {plans.length > 0 ? "Set up another plan…" : "Set up a plan…"}
+            </button>
+          )}
         </>
       ) : tab === "openrouter" ? (
         <>
