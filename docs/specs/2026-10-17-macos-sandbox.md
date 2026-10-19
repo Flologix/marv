@@ -1,7 +1,7 @@
 # macOS sandbox: a Seatbelt backend next to bubblewrap
 
 - Issues: FlologixAI/marv #150 (macOS port), #151 (Seatbelt backend), #152 (processes and the port relay)
-- Status: **draft, for approval.** Nothing is implemented until this is approved.
+- Status: **approved 2026-10-19**, with every recommendation taken (§11 records the decisions).
 - Date: 2026-10-17
 - Scope: `crates/marv-sandbox` (a backend trait, the Seatbelt profile builder, the runtime folder), `crates/marv-tools` (bash, the relay), `crates/marv-session` (processes, mesh start), `crates/marv-mesh` (discovery, switchboard, plug), `crates/marv-cli` (messages, a `__guard` subcommand), `tests/guards`, `.github/workflows/ci.yml`, `docs/SECURITY.md`.
 
@@ -403,14 +403,18 @@ Each step is one PR, green on Linux, and adds what it fixes to the macOS job.
 8. **Processes on macOS** (#152): option A of §8 with its guards (`tests/guards/tests/process.rs` on both).
 9. **Docs** with each step: `docs/SECURITY.md` (the §6.12 table, the runtime folder rule on line 59 per platform), `docs/subsystems/sandbox.md`, `docs/MESH.md` (the runtime folder), `PORTING.md`, the bash tool's description per platform.
 
-## 11. Open questions
+## 11. Decisions (2026-10-19)
 
-1. **Loopback without network.** Deny it all, as recommended (in-sandbox client/server tests then need `network: true`, which asks), or allow `localhost:*` and accept that a command can reach the user's local services?
-2. **`/tmp`.** Deny `/private/tmp` entirely, with a private `TMPDIR` per command (recommended), or allow writes to a per-command folder under `/private/tmp` that tools hard-coding `/tmp` won't use anyway?
-3. **Runtime folder.** `/tmp/marv-<uid>` (recommended) or a home path; and should `MARV_RUNTIME_DIR` exist as an override?
-4. **The process door on macOS** before #152: off (recommended), or ship option A with the first backend?
-5. **Escapees from the process group.** Accept as a documented limit (recommended for now), or add a process-tree sweep in the guard (needs a crate such as `libproc` or `sysinfo`)?
-6. **Secrets in the project** (`.env*`, `*.pem`, `id_*`): Seatbelt can deny their reads with one regex, which `secrets_are_masked_in_the_sandbox` (sandbox.rs:603, ignored) wants and bwrap doesn't do yet. Do it on both together later (recommended), or on macOS first?
-7. **No `sandbox-exec`.** Same as Linux without bwrap (commands run unsandboxed, with the warning) as recommended, or refuse to run bash on macOS without it?
-8. **Supported macOS versions.** CI has `macos-14` (Sonoma, arm64). Add `macos-15` and the newest runner, and an Intel runner (`macos-13`) for the x86_64 build?
-9. **The desktop app.** Confirm it will never be App Sandboxed while it runs the agent in-process (sandbox-exec can't run inside the App Sandbox).
+The open questions were settled on 2026-10-19 by taking every recommendation:
+
+1. **Loopback without network:** denied. In-sandbox client/server tests need `network: true`, which asks.
+2. **`/tmp`:** `/private/tmp` is denied; each command gets a private `TMPDIR`.
+3. **Runtime folder:** `/tmp/marv-<uid>`, with a `MARV_RUNTIME_DIR` override checked like the default.
+4. **The process door on macOS:** off until #152, which ships option A of §8.
+5. **Escapees from the process group:** a documented limit for now (no process-tree sweep).
+6. **Secrets in the project:** masked later, on both backends together.
+7. **No `sandbox-exec`:** same as Linux without bwrap. Commands run unsandboxed, with the warning.
+8. **macOS versions:** CI runs `macos-14` and `macos-15` (arm64), plus `macos-13` (Intel) for the x86_64 build.
+9. **The desktop app:** never App Sandboxed while it runs the agent in-process.
+
+The first macOS launch is the terminal app (arm64 and x86_64, npm and `install.sh`). The desktop bundle follows in #154.
