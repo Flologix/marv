@@ -271,7 +271,7 @@ impl ProcessManager {
         // (`marv_sandbox::runtime_dir`, hidden in every sandbox), else as before a folder of the user's in the temp
         // folder.
         marv_sandbox::runtime_dir(&marv_sandbox::runtime_env())
-            .unwrap_or_else(|| std::env::temp_dir().join(format!("marv-{}", nix::unistd::getuid())).join("marv"))
+            .unwrap_or_else(|| std::env::temp_dir().join(format!("marv-{}", nix::unistd::geteuid())).join("marv"))
     }
 
     /// Its own folder (0700), unique even among managers in one process: their process ids both start at p1.
