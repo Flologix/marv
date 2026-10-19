@@ -35,6 +35,25 @@ These rules are requirements for the Rust build from day one. They come from a s
   - The one exception: a **personal** skill folder (`~/.marv/skills/<name>`) may be a symlink to a folder only root can change, such as Omarchy's `/usr/share/omarchy/…` (#75). That folder and every folder above it must be owned by root and not group- or world-writable. The skill is read from the link's real target, and its `SKILL.md` and files can't lead out of that folder. A project's skill folder never may.
 - **The one read outside the project is the session's saved tool outputs (#61).** `read_file` and `grep` may read the files in `~/.marv/tool-output/<session>/`, and nothing else outside the project. Writing tools can't, and bash can't see the folder at all. A saved output keeps its source in its name (`<call id>.mcp.txt`), so an MCP server's text read back is fenced and taints as it did when it came.
 
+- **On macOS (Seatbelt).** The macOS sandbox is built from the same plan as bubblewrap's (`marv_sandbox::seatbelt`, #164): a deny-default SBPL profile for `/usr/bin/sandbox-exec`, with reads allowed for the whole disk and then narrowed, writes only to the project, the writable extras and a private `TMPDIR`, and every path canonical and passed as a parameter, never written into the profile (a project path that can't be written into the protected-name regexes stops the command). It isn't the active backend yet (#166): until then, macOS commands run unsandboxed with the warning, as on Linux without bwrap. Seatbelt can refuse a path but can't show something else there, so these guarantees differ from bubblewrap's:
+
+  | bubblewrap | Seatbelt | Mitigation | What's left |
+  |---|---|---|---|
+  | A stand-in home: empty, writable, thrown away | The home is unreadable and unwritable | Caches in the private `TMPDIR`; the home note says reads and writes there are refused | Tools that insist on writing `~/.something` fail instead of working on a throwaway copy |
+  | Credential files read as empty | Reading them is refused | Denied by the path as written and where it leads | A tool that expects the file to exist and be empty errors out |
+  | A private `/tmp` | `/tmp` is the host's | A private `TMPDIR` per command (0700, made by Marv, removed after); `/private/tmp` and the user's `/var/folders/…` denied | Tools that hard-code `/tmp` fail |
+  | Its own PID namespace | None | Signals and process info only within the sandbox; no `kern.proc.all` | Other processes' pids can be guessed but not used |
+  | Dies with Marv (`--die-with-parent`) | None | `marv __guard`: its own process group, watches its parent, kills the group when Marv dies; everything is killed on exit | A process that leaves the group and double-forks outlives the command, still sandboxed |
+  | `--new-session` | No flag | `setsid()` in the guard, stdin `/dev/null`, terminals and pseudo-terminals denied | None known |
+  | Its own loopback without network | None: loopback is the host's | Without network every IP connection is refused, loopback included, but for the forwarded ports of your background processes | In-sandbox client/server tests need network (which asks) |
+  | Protected paths mounted read-only | Write denies by path | The path and where it leads, `literal` and `subpath`; the protected names as case-insensitive regexes at any depth (outside `node_modules`, `target` and `.git`), so a command can't create them either; folders above a protected path can't be removed or renamed; the after-scan still runs | Hard links to an existing protected file: to be checked on macOS |
+  | The home-folder project's socket scan, bounded | Every Unix socket refused unless named | None needed | Stronger: no depth or count limit |
+  | With network, abstract sockets reachable | No abstract sockets; Unix sockets stay closed with network | None needed | Stronger |
+  | — | Mach and XPC services (`open`, `osascript`, `launchctl`, the pasteboard, the keychain) | Deny-default; a short reviewed `mach-lookup` list; XPC services denied last | Every service added is a review item |
+  | — | `sandbox-exec` is deprecated | Probed on every start; guards on every CI run | If a macOS release removes it, commands run unsandboxed with the warning, as without bwrap |
+
+  The process door's relay isn't offered on macOS yet (#152): a command that needs it doesn't start there. Guards for each row run on the macOS job once the backend is wired in (#166).
+
 ## Doors out of the sandbox
 Narrow, named ways out, each asked for and each with its own rule for what it can never do (Marv Sprint 4).
 - **Process (#24, Marv #51):** a dev server or watcher that keeps running across turns.

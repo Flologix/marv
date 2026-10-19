@@ -1,7 +1,7 @@
 # marv-sandbox
 
 What commands can touch and which paths an agent may reach. It covers:
-- the sandbox's plan and backends (bubblewrap today; Seatbelt on macOS next, `docs/specs/2026-10-17-macos-sandbox.md`);
+- the sandbox's plan and backends (bubblewrap today; Seatbelt's profile builder is in, wired in on macOS next, `docs/specs/2026-10-17-macos-sandbox.md`);
 - the bubblewrap argument builder;
 - the stand-in home and its credential masks;
 - the `.git` guard;
@@ -20,6 +20,7 @@ Spec: the **Sandbox** and **Yolo mode** bullets in Marv's `CLAUDE.md`, `src/sand
 | (new, #163) | `plan.rs` | **Done and tested.** `Plan` (was `SandboxOptions`, which stays as bwrap's alias): what one command's sandbox allows, built by `Sandbox::plan`. The policy every backend shares is methods over a `FsProbe`: `read_only_extras`/`writable_extras` (`resolve_extra`, moved here: refused when the home, a parent of it, `/` or (read-only) the project; `Extra { given, real, around_project }`), `home_project`, `project_read_only`, `toolchains`, `hidden_dirs`, `config_dir_hidden`, `credentials`, `mesh_bind`, and `env` (G19's list, plus `MARV_MESH_SOCKET` when plugged) |
 | (new, #163) | `backend.rs` | **Done.** `SandboxBackend` (`name`, `available`, `command` → `SandboxCommand { argv, env, leftovers }`, `guest_path`, `hides`, `kill`, `terminate`, `after`) and `backend()`, which picks the platform's: bubblewrap everywhere for now (it isn't available on macOS, so commands there run unsandboxed with the warning, as before) |
 | (new, #163) | `fs.rs` | `FsProbe`, `RealFs`, `EntryKind`, `FileKind`, moved out of `bwrap.rs` (re-exported there) so every backend checks paths the same way; tests share one `Fake` (`test_fs.rs`) |
+| (new, #164) | `seatbelt.rs` | **Done and tested; not wired in** (#166). `profile(plan, invocation, fs) -> Profile { text, params }`: the plan as a deny-default SBPL profile for `/usr/bin/sandbox-exec` (spec §6.2's nine sections, in order: later rules win), `Profile::args` (`-p …`, `-D KEY=VALUE`…). `Invocation` carries what the macOS backend makes per command: the private `TMPDIR`, the user's `/var/folders/<xx>/<id>`, Marv's binary, the forwarded ports. `canonical` resolves each prefix through `FsProbe` (`/tmp` → `/private/tmp`, the missing rest as written). Pure, so its tests run on Linux |
 | `src/sandbox.ts` (`sandboxArgs`, `runMounts`, `resolveExtra`, `sandboxAvailable`) | `bwrap.rs` | **Ported and tested.** #163: `Bwrap`, the `SandboxBackend` over `sandbox_args`, which reads the policy from the `Plan` and keeps only how bwrap spells it (mount order, tmpfs or `/dev/null`, `run_mounts`, the home's socket scan). Adds protected-path read-only binds and the mesh plug at `/run/marv/mesh.sock`. The file system is injectable (`FsProbe`). #24: `binds` (Marv's Sprint 4 `binds`: a mount at a path of its own after the empty `/run`, read-only unless `writable`), for the process door's relay |
 | `src/sandbox.ts` (`TOOLCHAINS`, `CREDENTIALS`, `credentialMasks`, `hiddenPathFolders`) | `home.rs` | **Ported and tested.** marv-rs: `HOME_MASKS` and `home_project` for a project that is the home folder (see "The home folder as the project") |
 | `src/tools/files.ts` (`resolveInProject`, `insideGitDir`, `touchesGit`, `refuseGit`, `projectPath`) | `paths.rs` | **Ported and tested.** New: `resolve_within`, the realpath containment check for skill files, with a symlink test |
@@ -97,6 +98,15 @@ pub fn notes::{looks_like_network_failure, runs_gh, touches_hidden_home}; pub co
   - a plugged command gets `MARV_MESH_SOCKET` with its plug's path inside (bwrap: `/run/marv/mesh.sock`); `marv_mesh::plug::sandbox_socket` reads it, falling back to `SANDBOX_SOCKET`. Seatbelt can't mount, so there it will be the host path;
   - the mesh's runtime folder check still calls `hidden_in_sandbox` directly; `SandboxBackend::hides` is the same rule for bwrap, for the runtime-folder work to switch to.
   The spec's sketch stores the resolved values as `Plan` fields; they are methods here, so a hand-built `Plan` (the bwrap tests, unchanged) can't disagree with its resolved view, and `Sandbox::plan` can't fail (every refusal happens in the backend, before anything starts).
+- **The Seatbelt profile (#164).** Every path is a `-D` parameter, canonical (`seatbelt::canonical` walks the path through `FsProbe::realpath` a prefix at a time, so the `Fake`'s `/tmp → /private/tmp` link is enough to test it on Linux); only the protected-name regexes and the home-project regex put a path in the text, escaped (`\`, `"`, the regex metacharacters, one backslash each: `#"…"` hands backslashes to the regex) and refused with a control character or when not UTF-8. Choices the spec left to the code:
+  - a runtime folder is denied whether it exists yet or not (bwrap can only hide one that exists);
+  - the `.git` name rule applies when the plan holds the project's `.git` read-only or as a placeholder (bash's git guard, i.e. a command that runs without asking), so the plan needs no new field;
+  - protected-name rules skip `node_modules`, `target` and `.git`, as the after-scan does, so installs still write `node_modules/pkg/AGENTS.md`; names are case-insensitive, `.git`, `.marv`, `.vscode`, `.idea` included;
+  - a read-only extra inside a write-allowed folder gets a write deny after it; one around the project gets none (it would cover the project);
+  - Unix sockets may be bound and connected only inside the private `TMPDIR`, which is the command's own; `system-socket` is allowed, since creating a socket reaches nothing;
+  - `binds` (the process door's relay) are refused: the door is off on macOS until #152;
+  - the environment (`path`, `lang`) isn't in the profile: the macOS backend sets it on the spawn (#166). So is the profile-file fallback over 256 KB (`-f`).
+  Marked "to verify" in the spec and pinned by the macOS probes of #166: the last rule wins, `#"…"` regexes take backslashes raw, `localhost` filters, `(subpath …)` inside `unix-socket`, connecting to the plug inside a denied folder, `system-fcntl` with deny-default.
 - **`SandboxOptions.lang`** replaces Marv's read of `process.env.LANG` inside `sandboxArgs`, so the function stays pure.
 - **Args are `OsString`s**, so a path that isn't UTF-8 still mounts.
 - **Order of mounts:**
