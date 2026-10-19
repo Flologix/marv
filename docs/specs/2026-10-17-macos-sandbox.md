@@ -273,7 +273,7 @@ There's no PID namespace and no `PR_SET_PDEATHSIG`. The design:
 4. **Marv kills the group.** `backend.kill(pid)` is `killpg(pid, SIGKILL)` for a timeout, a stop or `kill_running` (`processes/mod.rs:199-203`). The guard's exit code is the command's.
 5. **Seeing and signalling other processes** (G20): `signal` and `process-info*` are allowed only `(target same-sandbox)`, and `kern.proc.all` isn't in the sysctl list, so `kill`, `ps` and `lsof` can't reach the user's processes. A pid may still be guessed; nothing can be done with it.
 
-**Known limit:** a process that calls `setsid()` or `setpgid()` itself leaves the group, and if it also double-forks it's re-parented to launchd and the guard can't find it. It's still in the sandbox (Seatbelt is inherited and can't be dropped), so it can only do what the command could, but it outlives the command. bwrap's PID namespace closes this; Seatbelt can't. Mitigation in §6.12; open question 5 asks about a process-tree sweep.
+**Known limit:** a process that calls `setsid()` or `setpgid()` itself leaves the group, and if it also double-forks it's re-parented to launchd and the guard can't find it. It's still in the sandbox (Seatbelt is inherited and can't be dropped), so it can only do what the command could, but it outlives the command. bwrap's PID namespace closes this; Seatbelt can't. Mitigation in §6.12; open question 5 asks about a process-tree sweep. The command can also SIGKILL or SIGSTOP the guard itself (same sandbox, same group, `signal (target same-sandbox)`); the group then outlives a Marv that crashes or is SIGKILLed, while a Marv that exits normally or times the command out still `killpg`s it.
 
 ### 6.11 Availability and errors (G24)
 
@@ -291,7 +291,7 @@ This table goes into `docs/SECURITY.md` under "Sandbox", as "On macOS (Seatbelt)
 | G17 credentials read as empty files | Reads refused | Deny by literal path and real path | A tool that expects the file to exist and be empty errors out |
 | G2 private `/tmp` | `/tmp` is shared with the host | A private TMPDIR per command (0700, made by Marv, removed after); `/private/tmp` and the user's `/var/folders/…` denied for reads and writes | Tools that hard-code `/tmp` fail with EPERM; open question 2 |
 | G20 own PID namespace | None | `signal`/`process-info*` same-sandbox only, no `kern.proc.all` | Pids of other processes are guessable but unusable |
-| G21 `--die-with-parent` | None | `marv __guard`: own process group, polls its parent, `killpg` on Marv's death; `kill_running` on exit | A process that leaves the group and double-forks survives the command, still sandboxed |
+| G21 `--die-with-parent` | None | `marv __guard`: own process group, polls its parent, `killpg` on Marv's death; `kill_running` on exit | A process that leaves the group and double-forks survives the command, still sandboxed; a command that SIGKILLs or SIGSTOPs its guard outlives a crashed or SIGKILLed Marv |
 | G22 `--new-session` | No flag | `setsid()` in the guard, stdin `/dev/null`, no `/dev/tty*` and no `pseudo-tty` rule | None known |
 | G18 own loopback without network | None: loopback is the host's | Deny all IP without network; allow only forwarded process ports by number | In-sandbox client/server tests need `network: true` (asks) |
 | G11, G12 read-only mounts | Path-based write denies | Literal + subpath + name regexes, case-insensitive; after-scan kept | Hard links to an existing protected file: to verify (§6.6) |
