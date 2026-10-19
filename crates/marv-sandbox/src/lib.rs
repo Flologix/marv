@@ -15,6 +15,7 @@
 //! - [`plan`]: what one command's sandbox allows ([`Plan`]), decided once for every backend.
 //! - [`backend`]: [`SandboxBackend`], how a plan becomes a sandboxed command, its clean-up and its kill.
 //! - [`bwrap`]: the bubblewrap backend and argument builder (and the mesh plug at `/run/marv/mesh.sock`).
+//! - [`seatbelt`]: the Seatbelt (macOS `sandbox-exec`) profile builder, pure; not the active backend yet (#166).
 //! - [`fs`]: the file system as the sandbox checks it ([`FsProbe`]), injectable for tests.
 //! - [`git_guard`]: `.git` read-only or a placeholder for commands that run without asking; worktree records.
 //! - [`notes`]: the `Marv:` notes bash appends (stand-in home, missing network, gh, read-only .git).
@@ -30,6 +31,7 @@ pub mod notes;
 pub mod paths;
 pub mod plan;
 pub mod protected;
+pub mod seatbelt;
 pub mod taint;
 pub mod writable;
 
