@@ -63,7 +63,14 @@ pub struct PromptInput {
     pub writable: Vec<String>,
     /// `YYYY-MM-DD`.
     pub date: String,
+    /// The project has no `.git` of its own, so commands see the sandbox's empty read-only stand-in (`git_guard`).
+    pub git_placeholder: bool,
 }
+
+/// Said when the project has no `.git` (and bash is offered). A session in ~/Projects (no repository) ran `ls -la`,
+/// saw the sandbox's empty `.git` and told the user their repository was empty and broken. Git skips an empty `.git`
+/// and still finds a repository in a parent folder. Fixed per conversation, so the prompt cache holds.
+pub const GIT_PLACEHOLDER: &str = "\n\nThis folder has no .git of its own. In your commands an empty, read-only .git folder stands in its place, so none can be created here: it's the sandbox's placeholder, not a broken or empty repository, and git still finds a repository in a parent folder if there is one. Don't report it as a problem.";
 
 /// Which doors a session offers the model (decided once per session, before its first request: the cache). Marv's
 /// `PromptDoors`.
@@ -253,6 +260,7 @@ pub fn system_prompt(input: &PromptInput) -> String {
     // With the process door, its paragraph says what this one did (and where to go instead).
     let limits = if input.tools.iter().any(|t| t == "bash") && !input.doors.process { SANDBOX_LIMITS } else { "" };
     let fixing = if input.tools.iter().any(|t| t == "edit_file") { FIXING_BUGS } else { "" };
+    let git = if input.git_placeholder && input.tools.iter().any(|t| t == "bash") { GIT_PLACEHOLDER } else { "" };
     let outside = outside_section(&input.doors);
     let situation = situation_section(
         input.cwd == "~",
@@ -261,7 +269,7 @@ pub fn system_prompt(input: &PromptInput) -> String {
         input.doors.herdr.then_some(input.doors.herdr_runs),
     );
     format!(
-        "{base}{fixing}{limits}{outside}{situation}{remembered}{}{agents}{web}{MCP_SETUP}{}{}",
+        "{base}{fixing}{limits}{git}{outside}{situation}{remembered}{}{agents}{web}{MCP_SETUP}{}{}",
         skills_section(&input.skills),
         if input.mcp { MCP_TOOLS } else { "" },
         project_section(input.instructions.as_deref())
@@ -708,6 +716,14 @@ mod tests {
         assert!(!no_bash.contains("# Sandbox limits") && no_bash.contains("# Your situation"));
         // In the home folder itself, ~ is the project.
         let home = system_prompt(&PromptInput { cwd: "~".into(), ..input() });
+        // No .git here: the sandbox's empty stand-in is named, so it isn't reported as a broken repository. Only with
+        // bash (the only way to see it), and never for a project with its own .git.
+        assert!(system_prompt(&PromptInput { git_placeholder: true, ..input() }).contains(GIT_PLACEHOLDER));
+        assert!(!system_prompt(&input()).contains(GIT_PLACEHOLDER));
+        assert!(
+            !system_prompt(&PromptInput { tools: vec!["read_file".into()], git_placeholder: true, ..input() })
+                .contains(GIT_PLACEHOLDER)
+        );
         assert!(home.contains("here the home folder is the project"));
         // The oracle strips this section by its heading.
         assert_eq!(SITUATION_HEADING, "# Your situation");

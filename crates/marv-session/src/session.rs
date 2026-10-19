@@ -2657,6 +2657,8 @@ impl MarvSession {
             pre_approved: init.pre_approved.clone(),
             writable: init.writable.iter().map(|d| crate::paths::shorten_home(d, &crate::paths::home_dir())).collect(),
             date: crate::time::iso_date(crate::time::now_ms()),
+            // As `git_guard` decides it (nothing at .git, not even a link): checked per conversation, so the cache holds.
+            git_placeholder: std::fs::symlink_metadata(init.root.join(".git")).is_err(),
         });
         // #124: one fixed section while this conversation offers radio_tx (never a roster, a name or a state).
         let base = if radio { format!("{base}{}", crate::radio::RADIO_PROMPT) } else { base };
@@ -2967,6 +2969,19 @@ mod tests {
         assert_eq!(s.context_length(), Some(1000));
         assert!(!s.busy());
         assert!(s.system_prompt().contains("Working directory: ~/p"));
+    }
+
+    /// A project without `.git` is told about the sandbox's empty stand-in; one with its own `.git` isn't.
+    #[test]
+    fn a_project_without_git_hears_about_the_placeholder() {
+        let base = std::env::temp_dir().join(format!("marv-git-{}-{}", std::process::id(), marv_fs::random_hex()));
+        let (bare, repo) = (base.join("bare"), base.join("repo"));
+        std::fs::create_dir_all(&bare).unwrap();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let prompt = |root: &std::path::Path| session(|i| i.root = root.to_path_buf()).unwrap().system_prompt();
+        assert!(prompt(&bare).contains(crate::prompt::GIT_PLACEHOLDER));
+        assert!(!prompt(&repo).contains(crate::prompt::GIT_PLACEHOLDER));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
