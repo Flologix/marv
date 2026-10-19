@@ -557,9 +557,11 @@ impl ReplyAssembler {
         if let Some(thinking) = thinking {
             out.push(ProviderEvent::ThinkingDelta(thinking));
         }
-        // Port note (#57): OpenRouter may split one block over several chunks (same `index`);
-        // check whether the blocks must be merged before they're sent back.
-        self.reasoning.extend(delta.reasoning_details.unwrap_or_default());
+        // OpenRouter streams one block over many chunks (same `index` and `type`, often a token each):
+        // merged here, so the session keeps and sends back one block, not one per chunk.
+        for block in delta.reasoning_details.unwrap_or_default() {
+            merge_reasoning_block(&mut self.reasoning, block);
+        }
         if let Some(text) = delta.content.filter(|t| !t.is_empty()) {
             self.text_received = true;
             out.push(ProviderEvent::TextDelta(text));
@@ -1152,6 +1154,33 @@ where
     Box::pin(futures::stream::select(rx, producer))
 }
 
+/// Adds a streamed `reasoning_details` block to `blocks`. A piece of the block before it (the same `index` and `type`)
+/// is appended to it: its strings (`text`, `summary`, `data`) are concatenated, and any other field it carries
+/// (`signature`, `id`, `format`) fills in one the block didn't have yet. A block without an `index` is kept as is.
+fn merge_reasoning_block(blocks: &mut Vec<Value>, block: Value) {
+    let same = |a: &Value, b: &Value| {
+        a.get("index").is_some_and(|i| !i.is_null()) && a.get("index") == b.get("index") && a.get("type") == b.get("type")
+    };
+    let (Some(last), Value::Object(piece)) = (blocks.last_mut(), &block) else {
+        blocks.push(block);
+        return;
+    };
+    if !same(last, &block) {
+        blocks.push(block);
+        return;
+    }
+    let Value::Object(into) = last else { unreachable!("same() saw an index on it") };
+    for (key, value) in piece {
+        match (key.as_str(), into.get_mut(key), value) {
+            ("text" | "summary" | "data", Some(Value::String(have)), Value::String(more)) => have.push_str(more),
+            (_, Some(have), _) if !have.is_null() && have != &Value::String(String::new()) => {}
+            _ => {
+                into.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1450,6 +1479,42 @@ mod tests {
     fn a_stream_that_ends_before_the_reply_is_complete_needs_a_retry() {
         let (_, result) = run(&[r#"{"choices":[{"delta":{"content":"Writing the fi"}}]}"#]);
         assert_eq!(result, Err(Incomplete));
+    }
+
+    /// One block streamed a token per chunk (as OpenRouter sends DeepSeek's) is kept as one block, its signature
+    /// included; a block with another index or type stays separate.
+    #[test]
+    fn a_reasoning_block_streamed_in_pieces_is_kept_as_one() {
+        let piece = |json: &str| format!(r#"{{"choices":[{{"delta":{{"reasoning_details":[{json}]}}}}]}}"#);
+        let (events, _) = run(&[
+            &piece(r#"{"type":"reasoning.text","index":0,"format":"unknown","text":"The"}"#),
+            &piece(r#"{"type":"reasoning.text","index":0,"format":"unknown","text":" user"}"#),
+            &piece(r#"{"type":"reasoning.text","index":0,"text":" asks","signature":"sig"}"#),
+            &piece(r#"{"type":"reasoning.encrypted","index":0,"data":"ab"}"#),
+            &piece(r#"{"type":"reasoning.encrypted","index":0,"data":"cd"}"#),
+            &piece(r#"{"type":"reasoning.text","index":1,"text":"next"}"#),
+            "[DONE]",
+        ]);
+        let Some(ProviderEvent::Reasoning(r)) = events.iter().find(|e| matches!(e, ProviderEvent::Reasoning(_))) else {
+            panic!("no reasoning: {events:?}")
+        };
+        assert_eq!(
+            r.0,
+            serde_json::json!([
+                {"type": "reasoning.text", "index": 0, "format": "unknown", "text": "The user asks", "signature": "sig"},
+                {"type": "reasoning.encrypted", "index": 0, "data": "abcd"},
+                {"type": "reasoning.text", "index": 1, "text": "next"},
+            ])
+        );
+    }
+
+    /// Blocks without an index are never merged: nothing says they are one.
+    #[test]
+    fn reasoning_blocks_without_an_index_stay_apart() {
+        let mut blocks = Vec::new();
+        merge_reasoning_block(&mut blocks, serde_json::json!({"type": "reasoning.text", "text": "a"}));
+        merge_reasoning_block(&mut blocks, serde_json::json!({"type": "reasoning.text", "text": "b"}));
+        assert_eq!(blocks.len(), 2);
     }
 
     #[test]
