@@ -131,6 +131,8 @@ pub struct Switchboard {
     trajectory: Mutex<Arc<dyn TrajectorySink>>,
     /// The private 0700 folder holding plug sockets.
     runtime_dir: PathBuf,
+    /// Whether this switchboard made `runtime_dir` for itself ([`Self::owning_folder`]): removed (when empty) on drop.
+    owns_folder: bool,
     /// A plug was added while `serve` runs: it has a new socket to listen on.
     wake: tokio::sync::Notify,
     /// A message went into an inbox (#78): what an idle TUI waits on to start a turn (`mesh.wake`). One permit is
@@ -186,6 +188,7 @@ impl Switchboard {
             board: Mutex::default(),
             trajectory: Mutex::new(trajectory),
             runtime_dir,
+            owns_folder: false,
             wake: tokio::sync::Notify::new(),
             mail: tokio::sync::Notify::new(),
             resolvers: Mutex::default(),
@@ -193,6 +196,14 @@ impl Switchboard {
             herdr: Mutex::default(),
             radio: Mutex::default(),
         }
+    }
+
+    /// Marks `runtime_dir` as made for this switchboard alone (`marv_session::mesh::start`'s `p/<pid>-<hex>`): dropped,
+    /// the switchboard removes it once its sockets are gone, so empty plug folders don't pile up. Never a folder
+    /// someone else gave it.
+    pub fn owning_folder(mut self) -> Self {
+        self.owns_folder = true;
+        self
     }
 
     /// This Marv's radio (#124; set by [`crate::radio::Radio::new`]).
@@ -691,6 +702,10 @@ impl Drop for Switchboard {
     fn drop(&mut self) {
         for plug in self.board().plugs.values() {
             let _ = std::fs::remove_file(&plug.host_socket);
+        }
+        if self.owns_folder {
+            // Only when empty: anything else in it is left as it is.
+            let _ = std::fs::remove_dir(&self.runtime_dir);
         }
     }
 }

@@ -68,7 +68,7 @@ pub fn parent_id() -> PlugId {
 /// up to 48 overflowed `sun_path` (#150).
 pub fn start(session: &str, env: &marv_mcp::Env, cancel: CancellationToken) -> Option<MeshHandle> {
     let dir = plug_folder(&marv_sandbox::runtime_dir(env)?).ok()?;
-    let mesh = Arc::new(Switchboard::new(session, dir, Arc::new(marv_mesh::switchboard::NoTrajectory)));
+    let mesh = Arc::new(Switchboard::new(session, dir, Arc::new(marv_mesh::switchboard::NoTrajectory)).owning_folder());
     tokio::spawn(Arc::clone(&mesh).serve(cancel));
     Some(mesh)
 }
@@ -732,7 +732,16 @@ mod tests {
         for socket in [&pa.host_socket, &pb.host_socket] {
             assert!(std::os::unix::net::UnixStream::connect(socket).is_ok(), "{} isn't listening", socket.display());
         }
+        // Dropped (once `serve` lets go), each removes its own plug folder: empty folders don't pile up.
+        let folders = [pa.host_socket.parent().unwrap().to_path_buf(), pb.host_socket.parent().unwrap().to_path_buf()];
         cancel.cancel();
+        drop((a, b));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while folders.iter().any(|f| f.exists()) {
+            assert!(std::time::Instant::now() < deadline, "plug folders left: {folders:?}");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(base.join("marv/p").exists(), "only its own folder goes");
     }
 
     #[tokio::test]
