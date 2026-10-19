@@ -318,17 +318,24 @@ pub fn profile(plan: &Plan, run: &Invocation, fs: &dyn FsProbe) -> Result<Profil
     let toolchains: Vec<PathBuf> = plan.toolchains(fs);
     let ro_extras = plan.read_only_extras(fs)?;
     let rw_extras = plan.writable_extras(fs)?;
+    let config = plan.config_dir_hidden(fs).map(|c| canon(&c));
+    // Every runtime folder, there yet or not: one Marv makes later is hidden from the start.
+    let runtime: Vec<PathBuf> = plan.hidden.iter().filter(|d| d.is_absolute()).map(|d| canon(d)).collect();
     let tmp = canon(&run.tmp);
     let user_temp = user_temp(run, &tmp, fs)?;
-    // The private TMPDIR is writable and may hold sockets: never a folder that holds anything else.
-    if !run.tmp.is_absolute()
-        || contains(&tmp, &home)
-        || contains(&tmp, &root)
-        || contains(&tmp, Path::new(SHARED_TMP))
-        || contains(&tmp, &user_temp)
-    {
+    // The private TMPDIR is readable, writable and may hold sockets: a fresh folder of its own (the backend makes it,
+    // #166) at least two levels inside the user's temporary folder (in `T/`, never `T` or `C` themselves), and
+    // neither inside nor around anything the profile hides or limits.
+    let others: Vec<PathBuf> = [home.clone(), root.clone(), PathBuf::from(SHARED_TMP)]
+        .into_iter()
+        .chain(runtime.iter().cloned())
+        .chain(config.clone())
+        .chain(ro_extras.iter().chain(&rw_extras).map(|e| canon(&e.real)))
+        .collect();
+    let deep_enough = tmp.strip_prefix(&user_temp).is_ok_and(|rest| rest.components().count() >= 2);
+    if !run.tmp.is_absolute() || !deep_enough || others.iter().any(|o| contains(o, &tmp) || contains(&tmp, o)) {
         return Err(SandboxError::Mount(format!(
-            "The sandbox's temporary folder {} must be a folder of its own inside the user's temporary folder.",
+            "The sandbox's temporary folder {} must be a new folder of its own inside the user's temporary folder.",
             run.tmp.display()
         )));
     }
@@ -366,13 +373,11 @@ pub fn profile(plan: &Plan, run: &Invocation, fs: &dyn FsProbe) -> Result<Profil
         b.line(&format!("(deny file-read* (regex #\"^{prefix}/\\.[^/]+(/.*)?$\"))"));
         b.line(&format!("(deny {HARD_LINK_OP} (regex #\"^{prefix}/\\.[^/]+(/.*)?$\"))"));
         // macOS keeps what Linux keeps in dotfolders in ~/Library: keychains, cookies, mail, messages, browser
-        // profiles, app containers and their data. No toolchain lives there, so nothing is shown again.
+        // profiles, app containers and their data. No TOOLCHAINS entry is there; a read-only or writable extra
+        // under it is shown again in section 4, as the plan asks.
         b.paths("deny file-read*", &["subpath"], "HOME_LIBRARY", &home.join("Library"), None);
     } else {
         let p = b.param("HOME".into(), &home);
-        // Hard links out of the home are refused too, also within a project under it: tools that link (cargo, git,
-        // pnpm) fall back to copying.
-        b.no_links.push("HOME".into());
         b.line(&format!("(deny file-read* (subpath {p}))"));
         b.line(&format!("(allow file-read-metadata (literal {p}))"));
     }
@@ -408,7 +413,6 @@ pub fn profile(plan: &Plan, run: &Invocation, fs: &dyn FsProbe) -> Result<Profil
     for (i, (given, real)) in masks.iter().enumerate() {
         b.paths("deny file-read*", &["literal", "subpath"], &format!("HOME_MASK_{i}"), given, real.as_deref());
     }
-    let config = plan.config_dir_hidden(fs).map(|c| canon(&c));
     if let Some(config) = &config {
         b.paths("deny file-read*", &["subpath"], "CONFIG", config, None);
         let skills = config.join("skills");
@@ -416,8 +420,6 @@ pub fn profile(plan: &Plan, run: &Invocation, fs: &dyn FsProbe) -> Result<Profil
             b.paths(read, &["subpath"], "SKILLS", &skills, None);
         }
     }
-    // Every runtime folder, there yet or not: one Marv makes later is hidden from the start.
-    let runtime: Vec<PathBuf> = plan.hidden.iter().filter(|d| d.is_absolute()).map(|d| canon(d)).collect();
     for (i, dir) in runtime.iter().enumerate() {
         b.paths("deny file-read*", &["subpath"], &format!("RUNTIME_{i}"), dir, None);
     }
@@ -444,6 +446,21 @@ pub fn profile(plan: &Plan, run: &Invocation, fs: &dyn FsProbe) -> Result<Profil
         b.paths(write, &["subpath"], &format!("WRITABLE_{i}"), &canon(&extra.real), None);
     }
     b.paths(write, &["subpath"], "TMP", &tmp, None);
+    // Hard links (see HARD_LINK_OP): none out of the home or the shared temporary folders, then allowed in the
+    // project and the private TMPDIR (rustc's incremental cache, `ln`), which may sit inside those; what in them
+    // may not be linked is denied again in section 7.
+    let home_key = if home_project { None } else { Some("(param \"HOME\")".to_string()) };
+    let broad: Vec<String> = home_key
+        .into_iter()
+        .chain([quoted(SHARED_TMP), "(param \"USER_TEMP\")".to_string()])
+        .map(|p| format!("(subpath {p})"))
+        .collect();
+    b.line(&format!("(deny {HARD_LINK_OP} {})", broad.join(" ")));
+    let mut linkable = vec![format!("(subpath {})", b.param("TMP".into(), &tmp))];
+    if !read_only {
+        linkable.insert(0, format!("(subpath {})", b.param("PROJECT".into(), &root)));
+    }
+    b.line(&format!("(allow {HARD_LINK_OP} {})", linkable.join(" ")));
     b.line("(allow file-write-data (literal \"/dev/null\") (literal \"/dev/dtracehelper\") (regex #\"^/dev/fd/[0-9]+$\"))");
 
     // 7. Writes, closed again.
@@ -491,11 +508,13 @@ pub fn profile(plan: &Plan, run: &Invocation, fs: &dyn FsProbe) -> Result<Profil
         // Protected names at any depth, existing or new, outside node_modules, target and .git (G13).
         let prefix = regex_prefix(&root, "project")?;
         let names: Vec<String> = PROTECTED_NAMES.iter().map(|n| any_case(n)).collect();
-        b.line(&name_rule(&prefix, &names.join("|"), true));
+        b.line(&name_rule("file-write*", &prefix, &names.join("|"), true));
+        b.line(&name_rule(HARD_LINK_OP, &prefix, &names.join("|"), true));
         // `.git` at any depth for a command that runs without asking (its project `.git` is read-only or a
         // placeholder in the plan, as bash's git guard makes it); an approved command may change a repository.
         if git_confined(plan, &root, fs) {
-            b.line(&name_rule(&prefix, &any_case(".git"), false));
+            b.line(&name_rule("file-write*", &prefix, &any_case(".git"), false));
+            b.line(&name_rule(HARD_LINK_OP, &prefix, &any_case(".git"), false));
         }
         // A protected entry can't be carried away by renaming or removing a folder above it.
         for (i, dir) in ancestors.iter().enumerate() {
@@ -503,8 +522,8 @@ pub fn profile(plan: &Plan, run: &Invocation, fs: &dyn FsProbe) -> Result<Profil
             b.line(&format!("(deny file-write-unlink (literal {p}))"));
         }
     }
-    // No hard link to anything denied above: the home, Library, masks, Marv's folders, credentials, protected paths,
-    // read-only extras (see HARD_LINK_OP).
+    // No hard link to anything denied above, even inside the project or the private TMPDIR: Library, the masks,
+    // Marv's folders, credentials, protected paths, read-only extras (see HARD_LINK_OP).
     for key in std::mem::take(&mut b.no_links) {
         b.line(&format!("(deny {HARD_LINK_OP} (literal (param {k})) (subpath (param {k})))", k = quoted(&key)));
     }
@@ -578,12 +597,12 @@ fn credentials(plan: &Plan, fs: &dyn FsProbe) -> Vec<(PathBuf, Option<PathBuf>)>
         .collect()
 }
 
-/// A write deny for protected names under the project: `names` as a whole path component at any depth, and what's
-/// in it, but not inside node_modules or target (nor `.git`, with `skip_git`).
-fn name_rule(prefix: &str, names: &str, skip_git: bool) -> String {
+/// A deny of `op` (writes, or hard links) for protected names under the project: `names` as a whole path component
+/// at any depth, and what's in it, but not inside node_modules or target (nor `.git`, with `skip_git`).
+fn name_rule(op: &str, prefix: &str, names: &str, skip_git: bool) -> String {
     let skipped = if skip_git { SKIPPED.to_string() } else { "(node_modules|target)".to_string() };
     format!(
-        "(deny file-write* (require-all (regex #\"^{prefix}/(.*/)?({names})(/.*)?$\") (require-not (regex #\"^{prefix}/(.*/)?{skipped}/\"))))"
+        "(deny {op} (require-all (regex #\"^{prefix}/(.*/)?({names})(/.*)?$\") (require-not (regex #\"^{prefix}/(.*/)?{skipped}/\"))))"
     )
 }
 
@@ -659,7 +678,10 @@ mod tests {
     }
     /// Whether a write to `path` is denied by the name rules (both regexes of a require-all/require-not pair).
     fn name_denied(text: &str, path: &str) -> bool {
-        text.lines().filter(|l| l.contains("require-all")).any(|line| {
+        name_denied_for(text, "file-write*", path)
+    }
+    fn name_denied_for(text: &str, op: &str, path: &str) -> bool {
+        text.lines().filter(|l| l.starts_with(&format!("(deny {op} (require-all"))).any(|line| {
             let r = regexes(line);
             r[0].is_match(path) && !r[1].is_match(path)
         })
@@ -1117,14 +1139,31 @@ mod tests {
             ..base()
         };
         let t = build(&plan, &fs).text;
-        for key in ["HOME", "CREDENTIAL_0", "PROTECTED_0", "READ_ONLY_0", "RUNTIME_0", "CONFIG"] {
+        for key in ["CREDENTIAL_0", "PROTECTED_0", "READ_ONLY_0", "RUNTIME_0", "CONFIG"] {
             let line = format!("(deny {HARD_LINK_OP} (literal (param \"{key}\")) (subpath (param \"{key}\")))");
             assert!(at(&t, &line) > at(&t, "; 7."), "{key}");
         }
-        // Not the private TMPDIR or the project: those are the command's to link in.
-        for key in ["TMP", "PROJECT", "USER_TEMP"] {
+        // Not out of the home or the shared temporary folders; then allowed in the project and the private TMPDIR,
+        // which sit inside those, before the denies above.
+        let broad = at(
+            &t,
+            &format!(
+                "(deny {HARD_LINK_OP} (subpath (param \"HOME\")) (subpath \"/private/tmp\") (subpath (param \"USER_TEMP\")))"
+            ),
+        );
+        let allow = at(&t, &format!("(allow {HARD_LINK_OP} (subpath (param \"PROJECT\")) (subpath (param \"TMP\")))"));
+        assert!(at(&t, "; 6.") < broad && broad < allow && allow < at(&t, "; 7."));
+        for key in ["TMP", "PROJECT", "USER_TEMP", "HOME"] {
             assert!(!t.contains(&format!("(deny {HARD_LINK_OP} (literal (param \"{key}\"))")), "{key}");
         }
+        // Protected names at any depth can't be linked (and written through) either; nor a nested .git when confined.
+        for path in ["sub/.env", "a/b/AGENTS.md", "sub/.git/config"] {
+            assert!(name_denied_for(&t, HARD_LINK_OP, &format!("/Users/me/proj/{path}")), "{path}");
+        }
+        assert!(!name_denied_for(&t, HARD_LINK_OP, "/Users/me/proj/src/main.rs"));
+        // A read-only project: links only in the private TMPDIR.
+        let ro = build(&Plan { project_read_only: true, ..plan.clone() }, &fs).text;
+        assert!(ro.contains(&format!("(allow {HARD_LINK_OP} (subpath (param \"TMP\")))")));
         // A home-folder project: the hidden entries by the same regex as their reads.
         let home = build(&Plan { root: "/Users/me".into(), ..base() }, &fs).text;
         assert!(home.contains(&format!("(deny {HARD_LINK_OP} (regex #\"^/Users/me/\\.[^/]+(/.*)?$\"))")));
@@ -1138,18 +1177,56 @@ mod tests {
         assert_eq!(derived.param("USER_TEMP"), Some(Path::new("/private/var/folders/ab/xyz")));
         let elsewhere = Invocation { tmp: "/Volumes/scratch/marv-1".into(), user_temp: None, ..run() };
         assert!(profile(&base(), &elsewhere, &fs).unwrap_err().to_string().contains("temporary folder"));
-        // Given, it may be anywhere.
-        let given = Invocation { tmp: "/Volumes/scratch/marv-1".into(), user_temp: Some("/Volumes/scratch".into()), ..run() };
+        // Given, the private TMPDIR must still be two levels inside it.
+        let given = Invocation { tmp: "/Volumes/scratch/T/marv-1".into(), user_temp: Some("/Volumes/scratch".into()), ..run() };
         assert_eq!(profile(&base(), &given, &fs).unwrap().param("USER_TEMP"), Some(Path::new("/Volumes/scratch")));
     }
 
     #[test]
     fn the_private_tmpdir_must_be_a_folder_of_its_own() {
         let fs = mac_fs(|_| false);
-        for tmp in ["", "relative", "/", "/Users", "/Users/me", "/Users/me/proj", "/tmp", "/var/folders/ab/xyz", "/var/folders"] {
+        for tmp in [
+            "",
+            "relative",
+            "/",
+            "/Users",
+            "/Users/me",
+            "/Users/me/proj",
+            "/Users/me/Documents",
+            "/Users/me/.ssh",
+            "/opt/homebrew",
+            "/tmp",
+            "/tmp/marv-501",
+            "/tmp/com.apple.launchd.x/Listeners",
+            "/var/folders",
+            "/var/folders/ab/xyz",
+            "/var/folders/ab/xyz/T",
+            "/var/folders/ab/xyz/C",
+            "/var/folders/ab/xyz/T/../../xyz/T",
+        ] {
             let run = Invocation { tmp: tmp.into(), ..run() };
             assert!(profile(&base(), &run, &fs).is_err(), "{tmp:?}");
         }
+        // Inside a read-only project, still refused.
+        let ro = Plan { project_read_only: true, ..base() };
+        assert!(profile(&ro, &Invocation { tmp: "/Users/me/proj/sub".into(), ..run() }, &fs).is_err());
+        // Inside or around a runtime folder, the config folder or an extra, even in the user's temporary folder.
+        let t = "/var/folders/ab/xyz/T";
+        let marv_fs = mac_fs(|p| p.contains("/T/"));
+        for plan in [
+            Plan { hidden: vec![format!("{t}/marv-run").into()], ..base() },
+            Plan { config_dir: Some(format!("{t}/marv-run").into()), ..base() },
+            Plan { writable: vec![format!("{t}/marv-run").into()], ..base() },
+            Plan { read_only: vec![format!("{t}/marv-run").into()], ..base() },
+        ] {
+            for tmp in [format!("{t}/marv-run/x"), format!("{t}/marv-run")] {
+                assert!(profile(&plan, &Invocation { tmp: tmp.clone().into(), ..run() }, &marv_fs).is_err(), "{tmp} {plan:?}");
+            }
+            let around = Plan { hidden: vec![format!("{t}/a/marv-run").into()], ..base() };
+            assert!(profile(&around, &Invocation { tmp: format!("{t}/a").into(), ..run() }, &marv_fs).is_err());
+        }
+        // The usual one is fine.
+        assert!(profile(&base(), &run(), &fs).is_ok());
     }
 
     #[test]
@@ -1171,6 +1248,8 @@ mod tests {
             Plan {
                 hidden: vec!["/Users/me/proj/run/marv".into(), "/tmp/marv-501".into()],
                 config_dir: Some("/Users/me/.marv".into()),
+                protected: vec!["/Users/me/proj/.envrc".into()],
+                placeholders: vec!["/Users/me/proj/.git".into()],
                 read_only: vec!["/srv/ro".into()],
                 writable: vec!["/srv/rw".into()],
                 mesh_socket: Some("/tmp/marv-501/p/1/a.sock".into()),
@@ -1196,9 +1275,32 @@ mod tests {
             let keys_in = |line: &str| -> Vec<String> {
                 line.split("(param \"").skip(1).filter_map(|rest| rest.split('"').next()).map(str::to_string).collect()
             };
-            let hidden = |k: &str| ["CREDENTIAL_", "HOME_MASK_", "RUNTIME_", "CONFIG"].iter().any(|h| k.starts_with(h));
+            let hidden = |k: &str| {
+                [
+                    "CREDENTIAL_",
+                    "HOME_MASK_",
+                    "HOME_LIBRARY",
+                    "RUNTIME_",
+                    "CONFIG",
+                    "PROTECTED_",
+                    "PLACEHOLDER_",
+                    "READ_ONLY_",
+                    "USER_TEMP",
+                ]
+                .iter()
+                .any(|h| k.starts_with(h))
+            };
+            // No socket rule for a folder around or inside Marv's runtime or config folders (the plug is a literal).
+            for line in lines.iter().filter(|l| l.starts_with("(allow network")) {
+                for key in line.split("(subpath (param \"").skip(1).filter_map(|r| r.split('"').next()) {
+                    let allowed = p.param(key).unwrap();
+                    for (k, v) in p.params.iter().filter(|(k, _)| k.starts_with("RUNTIME_") || k == "CONFIG") {
+                        assert!(!v.starts_with(allowed) && !allowed.starts_with(v), "{k} reachable by sockets in: {line}");
+                    }
+                }
+            }
             for (i, line) in lines.iter().enumerate() {
-                for op in ["file-read", "file-write"] {
+                for op in ["file-read", "file-write", HARD_LINK_OP] {
                     if !line.starts_with(&format!("(deny {op}")) && !line.starts_with(&format!("(deny file-read* {op}")) {
                         continue;
                     }
@@ -1209,7 +1311,10 @@ mod tests {
                                 continue;
                             }
                             for other in keys_in(later) {
-                                if key == "CONFIG" && other == "SKILLS" && op == "file-read" {
+                                // Intended: skills shown again inside the config; the private TMPDIR inside the user's.
+                                if (key == "CONFIG" && other == "SKILLS" && op == "file-read")
+                                    || (key == "USER_TEMP" && other == "TMP")
+                                {
                                     continue;
                                 }
                                 let allowed = p.param(&other).unwrap();
