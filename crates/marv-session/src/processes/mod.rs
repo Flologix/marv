@@ -44,7 +44,7 @@ use marv_sandbox::git_guard::git_guard;
 use marv_sandbox::protected::{
     ProtectedSnapshot, created_note, nested_git_dirs, protected_snapshot, revert_created, scan_created,
 };
-use marv_sandbox::{Bind, CommandMounts, Sandbox, SandboxCommand};
+use marv_sandbox::{Bind, CommandMounts, Prepared, Sandbox};
 use marv_tools::relay::{RelaySpec, SOCKET_DIR, SOCKET_NAME};
 use marv_tools::{ProcessForward, ProcessForwards, ProcessHost, ProcessInfo, ProcessState, StartResult, ToolError};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -218,7 +218,7 @@ struct Entry {
     seen: HashSet<u16>,
     exited: tokio::sync::watch::Receiver<bool>,
     /// What started it, for the backend's clean-up once it has ended (bwrap's placeholder mount points).
-    sandboxed: SandboxCommand,
+    sandboxed: Prepared,
     /// The project's protected files at the start, to find the ones the process adds.
     protected: Option<ProtectedSnapshot>,
     released: bool,
@@ -431,11 +431,8 @@ impl ProcessManager {
         };
         let sandboxed = self.shared.sandbox.prepare(root, &mounts, &inner).map_err(ToolError::from)?;
         let protected = Some(protected_snapshot(root));
-        let mut child = tokio::process::Command::new(&sandboxed.argv[0])
-            .args(&sandboxed.argv[1..])
-            .env_clear()
-            .envs(sandboxed.env.iter().map(|(k, v)| (k, v)))
-            .current_dir(root)
+        // Only the backend's environment, never Marv's. A spawn that fails drops `sandboxed`, which cleans up.
+        let mut child = tokio::process::Command::from(sandboxed.to_command(root))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -707,7 +704,7 @@ fn release_entry(entry: &mut Entry, root: &Path) {
     entry.released = true;
     let _ = std::fs::remove_dir_all(&entry.dir);
     // What the sandbox left behind (bwrap: a placeholder's empty mount point, removed only while it's empty).
-    marv_sandbox::backend().after(&entry.sandboxed);
+    entry.sandboxed.finish();
     if let Some(before) = entry.protected.take() {
         let mut created = scan_created(root, &before);
         revert_created(root, &mut created);

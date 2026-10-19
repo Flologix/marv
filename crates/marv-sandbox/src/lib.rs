@@ -39,7 +39,7 @@ mod test_fs;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-pub use backend::{SandboxBackend, SandboxCommand, backend};
+pub use backend::{Prepared, SandboxBackend, SandboxCommand, backend};
 pub use bwrap::{Bwrap, MESH_SOCKET, SandboxOptions, sandbox_args, sandbox_available};
 pub use fs::{EntryKind, FileKind, FsProbe, RealFs};
 pub use home::home_project;
@@ -173,22 +173,12 @@ impl Sandbox {
         self.enabled && self.backend().available()
     }
 
-    /// The full argv for `script` in the project: `bwrap <args> -- bash -c script`. Protected paths that exist
-    /// are mounted read-only (`protected::protected_mounts`).
-    pub fn command(&self, root: &Path, mounts: &CommandMounts, script: &str) -> Result<Vec<OsString>, SandboxError> {
-        self.command_argv(root, mounts, &["bash".into(), "-c".into(), script.into()])
-    }
-
-    /// The full argv for `inner` in the project: `bwrap <args> -- inner…` (the process door runs its relay there).
-    /// Spawning needs [`SandboxCommand::env`] too: use [`Sandbox::prepare`].
-    pub fn command_argv(&self, root: &Path, mounts: &CommandMounts, inner: &[OsString]) -> Result<Vec<OsString>, SandboxError> {
-        Ok(self.prepare(root, mounts, inner)?.argv)
-    }
-
-    /// `inner` in the project, sandboxed by the backend: spawn [`SandboxCommand::argv`] after `env_clear()` with
-    /// [`SandboxCommand::env`], in `root`, and give it to [`SandboxBackend::after`] once it has ended.
-    pub fn prepare(&self, root: &Path, mounts: &CommandMounts, inner: &[OsString]) -> Result<SandboxCommand, SandboxError> {
-        self.backend().command(&self.plan(root, mounts), inner, &RealFs)
+    /// `inner` in the project, sandboxed by the backend: spawn [`SandboxCommand::to_command`] (only the backend's
+    /// environment, in `root`), and [`Prepared::finish`] it once it has ended (dropping it does too). Protected paths
+    /// that exist are read-only (`protected::protected_mounts`).
+    pub fn prepare(&self, root: &Path, mounts: &CommandMounts, inner: &[OsString]) -> Result<Prepared, SandboxError> {
+        let backend = self.backend();
+        Ok(Prepared::new(backend.command(&self.plan(root, mounts), inner, &RealFs)?, backend))
     }
 
     /// The [`Plan`] for one command in the project: the session's sandbox merged with the command's own mounts, plus

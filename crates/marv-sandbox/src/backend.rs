@@ -27,6 +27,57 @@ pub struct SandboxCommand {
     pub leftovers: Vec<PathBuf>,
 }
 
+impl SandboxCommand {
+    /// The command to spawn, in `root`: [`SandboxCommand::argv`] with **only** [`SandboxCommand::env`], nothing
+    /// inherited from Marv (no API keys, no `DYLD_*`). Always spawn through this: `sandbox-exec` passes its environment
+    /// on to the command, so a spawn that kept Marv's would hand it all to the sandbox. (`tokio::process::Command`
+    /// converts from it.) Stdio and the rest are the caller's.
+    pub fn to_command(&self, root: &Path) -> std::process::Command {
+        let mut cmd = std::process::Command::new(&self.argv[0]);
+        cmd.args(&self.argv[1..]).env_clear().envs(self.env.iter().map(|(k, v)| (k, v))).current_dir(root);
+        cmd
+    }
+}
+
+/// A [`SandboxCommand`] that cleans up after itself: [`Prepared::finish`] runs the backend's
+/// [`SandboxBackend::after`] once the command has ended, and dropping it does so if nothing did, so a spawn that fails
+/// or a caller that returns early leaves nothing behind (bwrap's placeholder mount points, Seatbelt's private
+/// `TMPDIR`). Finish it explicitly where the order matters: bash removes the placeholders before it scans for
+/// protected files a command created.
+#[derive(Debug)]
+pub struct Prepared {
+    command: SandboxCommand,
+    backend: &'static dyn SandboxBackend,
+    finished: bool,
+}
+
+impl Prepared {
+    pub fn new(command: SandboxCommand, backend: &'static dyn SandboxBackend) -> Self {
+        Self { command, backend, finished: false }
+    }
+
+    /// The command's clean-up, now (only the first call does anything). Call it once the command has ended.
+    pub fn finish(&mut self) {
+        if !self.finished {
+            self.finished = true;
+            self.backend.after(&self.command);
+        }
+    }
+}
+
+impl std::ops::Deref for Prepared {
+    type Target = SandboxCommand;
+    fn deref(&self) -> &SandboxCommand {
+        &self.command
+    }
+}
+
+impl Drop for Prepared {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
 /// One way to sandbox a command. Selected by [`backend`]; held by [`crate::Sandbox`].
 pub trait SandboxBackend: Send + Sync + std::fmt::Debug {
     /// "bubblewrap" (or "Seatbelt"), for notes and `/sandbox`.
@@ -62,5 +113,66 @@ pub(crate) fn send(pid: u32, signal: nix::sys::signal::Signal) {
         && pid > 0
     {
         let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), signal);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A backend that only counts its clean-ups.
+    #[derive(Debug)]
+    struct Counting(AtomicUsize);
+    impl SandboxBackend for Counting {
+        fn name(&self) -> &'static str {
+            "counting"
+        }
+        fn available(&self) -> bool {
+            false
+        }
+        fn command(&self, _: &Plan, _: &[OsString], _: &dyn FsProbe) -> Result<SandboxCommand, SandboxError> {
+            Ok(SandboxCommand::default())
+        }
+        fn guest_path(&self, bind: &Bind) -> PathBuf {
+            bind.source.clone()
+        }
+        fn hides(&self, _: &Path, _: &Path) -> bool {
+            false
+        }
+        fn kill(&self, _: u32) {}
+        fn terminate(&self, _: u32) {}
+        fn after(&self, _: &SandboxCommand) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn the_spawned_command_gets_only_the_backends_environment() {
+        let command = SandboxCommand {
+            argv: vec!["bwrap".into(), "--".into(), "true".into()],
+            env: vec![("PATH".into(), "/usr/bin".into())],
+            leftovers: vec![],
+        };
+        let cmd = command.to_command(Path::new("/work"));
+        assert_eq!(cmd.get_program(), "bwrap");
+        assert_eq!(cmd.get_args().collect::<Vec<_>>(), ["--", "true"]);
+        assert_eq!(cmd.get_current_dir(), Some(Path::new("/work")));
+        // The backend's environment and nothing else set (env_clear() itself is checked by the guards, which spawn this).
+        let envs: Vec<_> = cmd.get_envs().collect();
+        assert_eq!(envs, [(std::ffi::OsStr::new("PATH"), Some(std::ffi::OsStr::new("/usr/bin")))]);
+    }
+
+    #[test]
+    fn a_prepared_command_cleans_up_once_finished_or_dropped() {
+        static FINISHED: Counting = Counting(AtomicUsize::new(0));
+        let mut prepared = Prepared::new(SandboxCommand::default(), &FINISHED);
+        prepared.finish();
+        prepared.finish();
+        drop(prepared);
+        assert_eq!(FINISHED.0.load(Ordering::SeqCst), 1, "finished once, not again on drop");
+        static DROPPED: Counting = Counting(AtomicUsize::new(0));
+        drop(Prepared::new(SandboxCommand::default(), &DROPPED));
+        assert_eq!(DROPPED.0.load(Ordering::SeqCst), 1, "a spawn that failed or an early return still cleans up");
     }
 }

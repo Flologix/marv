@@ -183,7 +183,8 @@ pub async fn run_command(
     let check = if pipe_check && !command.contains("||") { PIPE_CHECK } else { "" };
     let script = format!("exec 2>&1\n{check}\n{command}");
     let backend = sandbox.backend();
-    let mut prepared = None;
+    // Declared before the child, so on an early return the child is dropped (killed) first, then this cleans up.
+    let mut prepared: Option<marv_sandbox::Prepared> = None;
     let mut cmd = if sandboxed {
         let relay = if network { None } else { relay_for(&forwards, &script, backend) };
         let mut mounts =
@@ -200,8 +201,8 @@ pub async fn run_command(
             // A mount that can't be made safely: the command never starts, and the model is told why.
             Err(e) => return started(format!("[sandbox failed to start: {e}]\n")),
         };
-        let mut cmd = tokio::process::Command::new(&command.argv[0]);
-        cmd.args(&command.argv[1..]).env_clear().envs(command.env.iter().map(|(k, v)| (k, v)));
+        // Only the backend's environment, never Marv's.
+        let cmd = tokio::process::Command::from(command.to_command(&root));
         prepared = Some(command);
         cmd
     } else {
@@ -263,8 +264,9 @@ pub async fn run_command(
         }
         kill(&mut child);
     };
-    if let Some(command) = &prepared {
-        backend.after(command);
+    // Before the caller's scan for created protected files: a placeholder's mount point left behind would read as one.
+    if let Some(command) = &mut prepared {
+        command.finish();
     }
     let exit_code = if timed_out || aborted { None } else { status.and_then(|s| s.code()) };
     let mut output = output;
