@@ -2661,7 +2661,7 @@ pub async fn run(resume: Option<bool>, approve: Vec<String>) -> anyhow::Result<i
         mcp: Some(mcp.clone()),
         mcp_problems,
         hidden_path_folders: hidden,
-        sandbox_available: marv_sandbox::bwrap::sandbox_available(),
+        sandbox_available: marv_sandbox::backend().available(),
         pre_approved,
         writable,
         approval_problems,
