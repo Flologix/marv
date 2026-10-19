@@ -113,7 +113,7 @@ v1's integration test is `marv_session::mesh::tests::end_to_end`: a `MarvSession
 
 ## Port notes
 
-- **Plug sockets** live in `<runtime>/p/<pid>/<plug>.sock` (`marv_session::mesh::start`; #162, was `plugs/<session>/`, which a long session name pushed past `sun_path`). Without a runtime folder there's no mesh: no `/tmp` fallback, as for discovery. Both bind sites refuse a path over `sun_path` with a message (`marv_sandbox::runtime::check_socket_path`).
+- **Plug sockets** live in `<runtime>/p/<pid>-<hex>/<plug>.sock` (`marv_session::mesh::start`, a folder per switchboard made exclusively: Marv desktop runs one per chat in one process, and a dead process's folder is never reused; #162, was `plugs/<session>/`, which a long session name pushed past `sun_path`). Without a runtime folder there's no mesh: no `/tmp` fallback, as for discovery. Both bind sites refuse a path over `sun_path` with a message (`marv_sandbox::runtime::check_socket_path`).
 - **The mode rides in `_meta`.** `tools/call` carries `"_meta": {"marv/mode": "send"}` (default `call`), and `tools/list` gives each receptacle's wired modes as `"_meta": {"marv/modes": [...]}`. A refusal is a tool result with `isError`, so the agent reads it.
 - **The model's tools use the socket too.** `MeshTool` runs in Marv, but it connects to its agent's own plug socket like anything in the sandbox would, so every message from a model goes through the same checks, identity and log.
 - **Asking for a wire.** A `mesh_send`/`mesh_call` on a receptacle that exists, takes the mode and isn't the agent's own asks the session's `WireApprover` first. A wire to an agent's own inbox is never asked for. Yolo may *use* a granted wire (`auto_safe` when wired; tainted sessions still ask), never grant one.
@@ -138,7 +138,7 @@ v1's integration test is `marv_session::mesh::tests::end_to_end`: a `MarvSession
 ## Interfaces other crates use
 
 ```rust
-// switchboard (marv-session owns one per process: marv_session::mesh::start(session, &env, cancel) -> Option<MeshHandle>)
+// switchboard (marv-session owns one per session, its own plug folder: marv_session::mesh::start(session, &env, cancel) -> Option<MeshHandle>)
 // Shared as Arc<Switchboard>: every method takes &self; serve/route/deliver/handle take the Arc.
 Switchboard::new(session, runtime_dir, Arc<dyn TrajectorySink>)
   .table() -> WireTable (snapshot); .receptacle(&name) -> Option<Receptacle> (clone)
