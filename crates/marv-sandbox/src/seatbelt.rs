@@ -125,9 +125,16 @@ const DNS_SOCKET: &str = "/private/var/run/mDNSResponder";
 /// The operation that makes a hard link. A hard link is a second name for a file that no path rule names: a protected
 /// file linked into the project or the private `TMPDIR` could be written through it, a credential read through it.
 /// bwrap stops this with `EXDEV` (a link can't cross a mount); here each denied path is also denied as a link source.
-/// TODO(#166): the operation's name and whether it filters on the link's source are "to verify" (spec §6.6); the
-/// macOS probe of #166 pins it. If it's wrong, `sandbox-exec` rejects the whole profile, so it can't ship silently.
+/// TODO(#166): the operation's name is "to verify" (spec §6.6); if it's wrong, `sandbox-exec` rejects the whole
+/// profile, so it can't ship silently.
 const HARD_LINK_OP: &str = "file-link";
+
+/// Whether hard links are allowed in the project and the private `TMPDIR` (rustc's incremental cache, `ln`). Off:
+/// under `(deny default)` no link can be made anywhere, and tools that link (cargo, git, pnpm) fall back to copying.
+/// Whether `file-link` filters on the link's source or on its new name isn't known: if on the new name, an allow for
+/// the project would let `ln ~/.ssh/id_ed25519 ./x; cat x` through. Turn this on only once the BLOCKING probe of #166
+/// (spec §9.2) proves the source is checked.
+const ALLOW_LINKS_IN_PROJECT: bool = false;
 
 // TODO(#166): a setuid or setgid program (`sudo`, `su`) runs with raised privileges, still inside the sandbox; there
 // is no `no_new_privs`. A rule like `(deny process-exec (file-mode #o4000))` waits for the macOS probe to confirm the
@@ -299,6 +306,11 @@ impl Builder {
 /// The profile for `plan`: see the module doc for its sections. An error means a rule can't be written safely, and
 /// the command must not start (G24).
 pub fn profile(plan: &Plan, run: &Invocation, fs: &dyn FsProbe) -> Result<Profile, SandboxError> {
+    build_profile(plan, run, fs, ALLOW_LINKS_IN_PROJECT)
+}
+
+/// [`profile`], with hard links in the project and the private TMPDIR allowed or not ([`ALLOW_LINKS_IN_PROJECT`]).
+fn build_profile(plan: &Plan, run: &Invocation, fs: &dyn FsProbe, allow_links: bool) -> Result<Profile, SandboxError> {
     for (path, what) in [(&plan.root, "project"), (&plan.home, "home folder")] {
         if !path.is_absolute() {
             return Err(SandboxError::Mount(format!("The {what} path {} isn't absolute.", path.display())));
@@ -446,8 +458,8 @@ pub fn profile(plan: &Plan, run: &Invocation, fs: &dyn FsProbe) -> Result<Profil
         b.paths(write, &["subpath"], &format!("WRITABLE_{i}"), &canon(&extra.real), None);
     }
     b.paths(write, &["subpath"], "TMP", &tmp, None);
-    // Hard links (see HARD_LINK_OP): none out of the home or the shared temporary folders, then allowed in the
-    // project and the private TMPDIR (rustc's incremental cache, `ln`), which may sit inside those; what in them
+    // Hard links (see HARD_LINK_OP): none out of the home or the shared temporary folders; then, only with
+    // ALLOW_LINKS_IN_PROJECT, allowed in the project and the private TMPDIR, which may sit inside those; what in them
     // may not be linked is denied again in section 7.
     let home_key = if home_project { None } else { Some("(param \"HOME\")".to_string()) };
     let broad: Vec<String> = home_key
@@ -456,11 +468,13 @@ pub fn profile(plan: &Plan, run: &Invocation, fs: &dyn FsProbe) -> Result<Profil
         .map(|p| format!("(subpath {p})"))
         .collect();
     b.line(&format!("(deny {HARD_LINK_OP} {})", broad.join(" ")));
-    let mut linkable = vec![format!("(subpath {})", b.param("TMP".into(), &tmp))];
-    if !read_only {
-        linkable.insert(0, format!("(subpath {})", b.param("PROJECT".into(), &root)));
+    if allow_links {
+        let mut linkable = vec![format!("(subpath {})", b.param("TMP".into(), &tmp))];
+        if !read_only {
+            linkable.insert(0, format!("(subpath {})", b.param("PROJECT".into(), &root)));
+        }
+        b.line(&format!("(allow {HARD_LINK_OP} {})", linkable.join(" ")));
     }
-    b.line(&format!("(allow {HARD_LINK_OP} {})", linkable.join(" ")));
     b.line("(allow file-write-data (literal \"/dev/null\") (literal \"/dev/dtracehelper\") (regex #\"^/dev/fd/[0-9]+$\"))");
 
     // 7. Writes, closed again.
@@ -560,19 +574,24 @@ pub fn profile(plan: &Plan, run: &Invocation, fs: &dyn FsProbe) -> Result<Profil
     Ok(Profile { text: b.text, params: b.params })
 }
 
-/// The user's temporary folder: as given, or the `/private/var/folders/<xx>/<id>` the private TMPDIR is in.
+/// The user's temporary folder, `/private/var/folders/<xx>/<id>` exactly: as given or the one the private TMPDIR is
+/// in. Either way the TMPDIR must be in its `T/` (never `C/` or `0/`, nor elsewhere under a given folder).
 fn user_temp(run: &Invocation, tmp: &Path, fs: &dyn FsProbe) -> Result<PathBuf, SandboxError> {
-    if let Some(given) = &run.user_temp {
-        return Ok(canonical(given, fs));
+    let shape = |p: &Path| p.starts_with("/private/var/folders") && p.components().count() == 6;
+    let found = match &run.user_temp {
+        Some(given) => Some(canonical(given, fs)).filter(|g| shape(g)),
+        None => {
+            let parts: Vec<Component> = tmp.components().collect();
+            (parts.len() > 6).then(|| parts[..6].iter().collect::<PathBuf>()).filter(|g| shape(g))
+        }
+    };
+    match found {
+        Some(user_temp) if tmp.strip_prefix(&user_temp).is_ok_and(|rest| rest.starts_with("T")) => Ok(user_temp),
+        _ => Err(SandboxError::Mount(format!(
+            "Can't tell the user's temporary folder from {}, so the macOS sandbox can't close it.",
+            tmp.display()
+        ))),
     }
-    let parts: Vec<Component> = tmp.components().collect();
-    if tmp.starts_with("/private/var/folders") && parts.len() > 6 {
-        return Ok(parts[..6].iter().collect());
-    }
-    Err(SandboxError::Mount(format!(
-        "Can't tell the user's temporary folder from {}, so the macOS sandbox can't close it.",
-        tmp.display()
-    )))
 }
 
 /// A path as written (its folder canonical, its own name kept: a symlinked credential or protected file is denied
@@ -639,6 +658,10 @@ mod tests {
     }
     fn build(plan: &Plan, fs: &Fake) -> Profile {
         profile(plan, &run(), fs).unwrap()
+    }
+    /// With hard links allowed in the project and the TMPDIR, as once the #166 probe allows it.
+    fn build_linking(plan: &Plan, fs: &Fake) -> Profile {
+        build_profile(plan, &run(), fs, true).unwrap()
     }
     /// Where `needle` first is in the text (it must be there).
     fn at(text: &str, needle: &str) -> usize {
@@ -1138,7 +1161,13 @@ mod tests {
             config_dir: Some("/Users/me/.marv".into()),
             ..base()
         };
-        let t = build(&plan, &fs).text;
+        // As shipped: no link allowed anywhere (deny default), until the #166 probe shows `file-link` checks the
+        // source; the denies below are there all the same.
+        let off = build(&plan, &fs).text;
+        assert!(!off.lines().any(|l| l.starts_with(&format!("(allow {HARD_LINK_OP}"))));
+        assert!(off.contains(&format!("(deny {HARD_LINK_OP} (literal (param \"CREDENTIAL_0\"))")));
+        // With links allowed in the project and the TMPDIR:
+        let t = build_linking(&plan, &fs).text;
         for key in ["CREDENTIAL_0", "PROTECTED_0", "READ_ONLY_0", "RUNTIME_0", "CONFIG"] {
             let line = format!("(deny {HARD_LINK_OP} (literal (param \"{key}\")) (subpath (param \"{key}\")))");
             assert!(at(&t, &line) > at(&t, "; 7."), "{key}");
@@ -1162,7 +1191,7 @@ mod tests {
         }
         assert!(!name_denied_for(&t, HARD_LINK_OP, "/Users/me/proj/src/main.rs"));
         // A read-only project: links only in the private TMPDIR.
-        let ro = build(&Plan { project_read_only: true, ..plan.clone() }, &fs).text;
+        let ro = build_linking(&Plan { project_read_only: true, ..plan.clone() }, &fs).text;
         assert!(ro.contains(&format!("(allow {HARD_LINK_OP} (subpath (param \"TMP\")))")));
         // A home-folder project: the hidden entries by the same regex as their reads.
         let home = build(&Plan { root: "/Users/me".into(), ..base() }, &fs).text;
@@ -1177,9 +1206,23 @@ mod tests {
         assert_eq!(derived.param("USER_TEMP"), Some(Path::new("/private/var/folders/ab/xyz")));
         let elsewhere = Invocation { tmp: "/Volumes/scratch/marv-1".into(), user_temp: None, ..run() };
         assert!(profile(&base(), &elsewhere, &fs).unwrap_err().to_string().contains("temporary folder"));
-        // Given, the private TMPDIR must still be two levels inside it.
-        let given = Invocation { tmp: "/Volumes/scratch/T/marv-1".into(), user_temp: Some("/Volumes/scratch".into()), ..run() };
-        assert_eq!(profile(&base(), &given, &fs).unwrap().param("USER_TEMP"), Some(Path::new("/Volumes/scratch")));
+        // Given, it must have the shape /private/var/folders/<xx>/<id>, and the TMPDIR must be in its T/.
+        let given =
+            Invocation { tmp: "/var/folders/cd/uvw/T/marv-1".into(), user_temp: Some("/var/folders/cd/uvw".into()), ..run() };
+        assert_eq!(profile(&base(), &given, &fs).unwrap().param("USER_TEMP"), Some(Path::new("/private/var/folders/cd/uvw")));
+        for (tmp, user_temp) in [
+            ("/opt/homebrew/x/y", Some("/")),
+            ("/Volumes/scratch/T/marv-1", Some("/Volumes/scratch")),
+            ("/var/folders/cd/uvw/T/marv-1", Some("/var/folders/cd")),
+            ("/var/folders/cd/uvw/T/marv-1", Some("/var/folders/cd/uvw/T")),
+            ("/var/folders/cd/uvw/C/marv-1", Some("/var/folders/cd/uvw")),
+            ("/var/folders/cd/uvw/0/marv-1", None),
+            ("/var/folders/cd/uvw/C/marv-1", None),
+            ("/var/folders/ab/xyz/T/marv-1", Some("/var/folders/cd/uvw")),
+        ] {
+            let run = Invocation { tmp: tmp.into(), user_temp: user_temp.map(PathBuf::from), ..run() };
+            assert!(profile(&base(), &run, &fs).is_err(), "{tmp} in {user_temp:?}");
+        }
     }
 
     #[test]
@@ -1269,8 +1312,8 @@ mod tests {
                 ..base()
             },
         ];
-        for plan in scenarios {
-            let p = build(&plan, &fs);
+        for (plan, allow_links) in scenarios.iter().flat_map(|p| [(p, false), (p, true)]) {
+            let p = build_profile(plan, &run(), &fs, allow_links).unwrap();
             let lines: Vec<&str> = p.text.lines().collect();
             let keys_in = |line: &str| -> Vec<String> {
                 line.split("(param \"").skip(1).filter_map(|rest| rest.split('"').next()).map(str::to_string).collect()
@@ -1290,12 +1333,15 @@ mod tests {
                 .iter()
                 .any(|h| k.starts_with(h))
             };
-            // No socket rule for a folder around or inside Marv's runtime or config folders (the plug is a literal).
+            // No socket rule for a path around or inside Marv's runtime or config folders, by parameter or constant,
+            // `subpath` or `path-literal`; the plug's own literal, inside a runtime folder, is the one exception.
             for line in lines.iter().filter(|l| l.starts_with("(allow network")) {
-                for key in line.split("(subpath (param \"").skip(1).filter_map(|r| r.split('"').next()) {
-                    let allowed = p.param(key).unwrap();
+                for (filter, allowed) in socket_paths(line, &p) {
+                    if filter == "path-literal" && Some(allowed.as_path()) == p.param("PLUG") {
+                        continue;
+                    }
                     for (k, v) in p.params.iter().filter(|(k, _)| k.starts_with("RUNTIME_") || k == "CONFIG") {
-                        assert!(!v.starts_with(allowed) && !allowed.starts_with(v), "{k} reachable by sockets in: {line}");
+                        assert!(!v.starts_with(&allowed) && !allowed.starts_with(v), "{k} reachable by sockets in: {line}");
                     }
                 }
             }
@@ -1329,6 +1375,31 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The paths a socket rule names: `(subpath …)`, `(path-literal …)` or `(literal …)` of a parameter or a constant.
+    fn socket_paths(line: &str, p: &Profile) -> Vec<(&'static str, PathBuf)> {
+        let mut out = Vec::new();
+        for filter in ["subpath", "path-literal", "literal"] {
+            for rest in line.split(&format!("({filter} ")).skip(1) {
+                let path = if let Some(key) = rest.strip_prefix("(param \"") {
+                    p.param(key.split('"').next().unwrap()).unwrap().to_path_buf()
+                } else if let Some(text) = rest.strip_prefix('"') {
+                    PathBuf::from(text.split('"').next().unwrap())
+                } else {
+                    panic!("an unparsed socket filter in: {line}");
+                };
+                out.push((filter, path));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_socket_check_sees_constants_and_literals() {
+        let p = Profile { text: String::new(), params: vec![("TMP".into(), "/x/t".into())] };
+        let line = "(allow network-outbound (remote unix-socket (subpath \"/private/tmp\")) (path-literal (param \"TMP\")))";
+        assert_eq!(socket_paths(line, &p), [("subpath", PathBuf::from("/private/tmp")), ("path-literal", PathBuf::from("/x/t"))]);
     }
 
     /// Parity: every field of the plan is rendered by both backends. Destructured without `..`, so a new field fails
