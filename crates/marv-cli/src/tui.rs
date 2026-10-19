@@ -2624,6 +2624,8 @@ pub async fn run(resume: Option<bool>, approve: Vec<String>) -> anyhow::Result<i
     let herdr = herdr_target(&env).map(|target| HerdrReporter::new(target, None));
     // The mesh (v2): this Marv's switchboard, put on the mesh once the TUI can ask for wires (below).
     let (mut mesh, mut mesh_note) = match crate::mesh_cmd::start(&env, &root, &door_outside) {
+        // A MARV_RUNTIME_DIR that was refused says why (a symlink on the way, say), rather than the mesh just being off.
+        Ok(None) => (None, marv_sandbox::override_refusal(&env).map(|why| (format!("Not on the mesh: {why}"), true))),
         Ok(mesh) => (mesh, None),
         Err(e) => (None, Some((format!("Not on the mesh: {e}"), true))),
     };

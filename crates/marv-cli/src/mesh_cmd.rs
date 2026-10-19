@@ -39,6 +39,9 @@ fn no_runtime_dir(command: &str) -> i32 {
         "marv mesh {command} needs {}: Marv puts the mesh only where sandboxed commands can't see it.",
         marv_sandbox::RUNTIME_DIR_RULE
     );
+    if let Some(why) = marv_sandbox::override_refusal(&marv_sandbox::runtime_env()) {
+        eprintln!("marv: {}", printable(&why));
+    }
     1
 }
 

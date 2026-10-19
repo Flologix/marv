@@ -36,7 +36,7 @@ pub use bwrap::{Bind, EntryKind, FileKind, FsProbe, MESH_SOCKET, RealFs, Sandbox
 pub use home::home_project;
 pub use paths::{project_path, resolve_in_project, resolve_within, touches_git};
 pub use protected::{PROTECTED_PATHS, ProtectedPath, ProtectedRule, is_protected, protected_rule};
-pub use runtime::{RUNTIME_DIR_RULE, runtime_dir, runtime_env, runtime_paths};
+pub use runtime::{RUNTIME_DIR_RULE, override_refusal, runtime_dir, runtime_env, runtime_paths};
 pub use taint::TaintState;
 pub use writable::resolve as resolve_writable;
 

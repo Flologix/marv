@@ -89,16 +89,7 @@ fn default_path(env: &BTreeMap<String, String>) -> Option<PathBuf> {
 pub fn runtime_dir(env: &BTreeMap<String, String>) -> Option<PathBuf> {
     let home = env.get("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"));
     if let Some(dir) = env.get(RUNTIME_DIR_VAR).filter(|d| !d.is_empty()) {
-        let dir = PathBuf::from(dir);
-        if dir.as_os_str().len() > MAX_RUNTIME_DIR {
-            return None;
-        }
-        // Judged where it really is: its parent must exist, and is taken by its real path (macOS's `/tmp` is
-        // `/private/tmp`). Sockets are bound at the path as given, which `private_folder` checks leads nowhere else.
-        let (parent, name) = (dir.parent()?, dir.file_name()?);
-        let real = std::fs::canonicalize(parent).ok()?.join(name);
-        let ok = crate::hidden_in_sandbox(&real, &home) && private_folder(&dir).is_ok();
-        return ok.then_some(dir);
+        return check_override(Path::new(dir), &home).ok();
     }
     if cfg!(target_os = "macos") {
         let dir = default_path(env)?;
@@ -106,6 +97,34 @@ pub fn runtime_dir(env: &BTreeMap<String, String>) -> Option<PathBuf> {
     }
     let base = env.get("XDG_RUNTIME_DIR").filter(|d| crate::hidden_in_sandbox(Path::new(d), &home))?;
     Some(Path::new(base).join("marv"))
+}
+
+/// Why `MARV_RUNTIME_DIR` was refused, for the message that says the mesh is off; `None` when it's unset or accepted.
+pub fn override_refusal(env: &BTreeMap<String, String>) -> Option<String> {
+    let dir = env.get(RUNTIME_DIR_VAR).filter(|d| !d.is_empty())?;
+    let home = env.get("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"));
+    check_override(Path::new(dir), &home).err().map(|why| format!("{RUNTIME_DIR_VAR} {dir} isn't used: {why}"))
+}
+
+/// `MARV_RUNTIME_DIR`, checked like the default: absolute, short enough, its parent existing and judged by its real
+/// path (macOS's `/tmp` is `/private/tmp`), hidden in every sandbox, then [`private_folder`]. Sockets are bound at the
+/// path as given, which `private_folder` checks leads nowhere else.
+fn check_override(dir: &Path, home: &Path) -> Result<PathBuf, String> {
+    if !dir.is_absolute() {
+        return Err("it isn't an absolute path".into());
+    }
+    if dir.as_os_str().len() > MAX_RUNTIME_DIR {
+        return Err(format!("it's longer than {MAX_RUNTIME_DIR} bytes, too long for the mesh's sockets"));
+    }
+    let (Some(parent), Some(name)) = (dir.parent(), dir.file_name()) else {
+        return Err("it names no folder".into());
+    };
+    let real = std::fs::canonicalize(parent).map_err(|e| format!("its parent {}: {e}", parent.display()))?.join(name);
+    if !crate::hidden_in_sandbox(&real, home) {
+        return Err("sandboxed commands could see it: use a folder under /tmp, /run or a hidden folder of your home".into());
+    }
+    private_folder(dir).map_err(|e| e.to_string())?;
+    Ok(dir.to_path_buf())
 }
 
 /// Makes `dir` this user's private folder, or refuses it. `dir` is absolute and plain (no `.` or `..`); its parent
@@ -117,7 +136,7 @@ pub fn runtime_dir(env: &BTreeMap<String, String>) -> Option<PathBuf> {
 fn private_folder(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     use std::path::Component;
-    let refuse = |why: &str| Err(std::io::Error::other(format!("{}: {why}", dir.display())));
+    let refuse = |why: &str| Err(std::io::Error::other(why.to_string()));
     let uid = nix::unistd::geteuid().as_raw();
     let mut parts = dir.components();
     if parts.next() != Some(Component::RootDir) || !parts.all(|c| matches!(c, Component::Normal(_))) {
@@ -127,7 +146,12 @@ fn private_folder(dir: &Path) -> std::io::Result<()> {
         let mut meta = std::fs::symlink_metadata(ancestor)?;
         if meta.file_type().is_symlink() {
             if ancestor != Path::new("/tmp") {
-                return refuse(&format!("{} is a symlink", ancestor.display()));
+                // Not followed, not even a system's own (Fedora Silverblue's /home -> var/home): through it, a folder
+                // that looks hidden could be one sandboxes see. The real path works.
+                let real = std::fs::canonicalize(dir.parent().unwrap_or(dir))
+                    .map(|p| format!(" (here {})", p.join(dir.file_name().unwrap_or_default()).display()))
+                    .unwrap_or_default();
+                return refuse(&format!("a symlink on the way: {}; use a path without symlinks{real}", ancestor.display()));
             }
             meta = std::fs::metadata(ancestor)?;
         }
@@ -143,7 +167,7 @@ fn private_folder(dir: &Path) -> std::io::Result<()> {
     }
     let meta = std::fs::symlink_metadata(dir)?;
     if !meta.is_dir() || meta.uid() != uid {
-        return refuse("isn't a folder of this user's");
+        return refuse(&format!("{} isn't a folder of this user's", dir.display()));
     }
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
 }
@@ -219,6 +243,7 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         let got = runtime_dir(&env(&[(RUNTIME_DIR_VAR, value.to_str().unwrap()), ("XDG_RUNTIME_DIR", "/run/user/1")]));
         assert_eq!(got, Some(value.clone()));
+        assert_eq!(override_refusal(&env(&[(RUNTIME_DIR_VAR, value.to_str().unwrap())])), None);
         assert_eq!(std::fs::metadata(&value).unwrap().permissions().mode() & 0o777, 0o700);
         // Relative, too long for the longest socket, or a symlink: refused, never another folder in its place.
         assert_eq!(runtime_dir(&env(&[(RUNTIME_DIR_VAR, "rel/marv")])), None);
@@ -237,6 +262,15 @@ mod tests {
             assert!(!out.join("marv").exists());
             let _ = std::fs::remove_dir_all(&out);
         }
+        // A symlinked parent that leads somewhere hidden too (Fedora Silverblue's /home -> var/home): still refused,
+        // and the refusal says why and what to use instead.
+        std::fs::create_dir(dir.join("real")).unwrap();
+        std::os::unix::fs::symlink(dir.join("real"), dir.join("alias")).unwrap();
+        let via_link = env(&[(RUNTIME_DIR_VAR, dir.join("alias/marv").to_str().unwrap())]);
+        assert_eq!(runtime_dir(&via_link), None);
+        let why = override_refusal(&via_link).unwrap();
+        assert!(why.contains(&format!("a symlink on the way: {}", dir.join("alias").display())), "{why}");
+        assert!(why.contains("without symlinks") && why.contains("real/marv"), "{why}");
         // Not plain.
         let dotted = format!("{}/../marv", dir.display());
         assert_eq!(runtime_dir(&env(&[(RUNTIME_DIR_VAR, &dotted)])), None);
