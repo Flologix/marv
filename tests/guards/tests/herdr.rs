@@ -282,7 +282,8 @@ async fn a_light_action_in_a_woken_turn_gets_no_always() {
     use marv_mesh::{ReceptacleName, WireMode};
     use marv_session::mesh::{parent_id, wake_check};
 
-    let (project, runtime, herdr) = (TempDir::new("herdr-wake"), TempDir::new("herdr-wake-rt"), TempDir::new("herdr-wake-fake"));
+    let (project, runtime, herdr) =
+        (TempDir::new("herdr-wake"), TempDir::short("herdr-wake-rt"), TempDir::new("herdr-wake-fake"));
     let mesh = Arc::new(Switchboard::new("hw", runtime.path().join("plugs"), Arc::new(NoTrajectory)));
     let cancel = tokio_util::sync::CancellationToken::new();
     tokio::spawn(Arc::clone(&mesh).serve(cancel.clone()));
@@ -400,15 +401,16 @@ async fn a_door_program_planted_in_the_project_is_never_run() {
     assert!(!marker.exists(), "a planted program ran");
 
     // The mesh's Herdr panes (mesh_list in `marv -p` on the mesh) take herdr the same way: the planted one never runs.
-    let (config, runtime) = (TempDir::new("doors-planted-cfg"), TempDir::new("doors-planted-rt"));
+    let (config, runtime) = (TempDir::new("doors-planted-cfg"), TempDir::short("doors-planted-rt"));
     let system = std::env::var("PATH").unwrap_or_default();
     let path = format!("{planted}:{system}");
-    let runtime_dir = runtime.path().to_string_lossy().to_string();
+    let (runtime_var, runtime_dir) = marv_guards::runtime_var(runtime.path());
+    let runtime_dir = runtime_dir.to_string_lossy().to_string();
     let env = [
         ("PATH", path.as_str()),
         ("MARV_GITHUB", "off"),
         ("MARV_MESH_NAME", "planted"),
-        ("XDG_RUNTIME_DIR", runtime_dir.as_str()),
+        (runtime_var, runtime_dir.as_str()),
         ("HERDR_ENV", "1"),
         ("HERDR_SOCKET_PATH", "/nonexistent.sock"),
         ("HERDR_PANE_ID", "w1:p1"),
