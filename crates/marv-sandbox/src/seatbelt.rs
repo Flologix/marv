@@ -13,11 +13,11 @@
 //! fixed order (§6.2), each overriding the ones before it:
 //!
 //! 1. **base**: `(deny default)`, fork and exec, signals and process info for this sandbox only, a short `sysctl-read`
-//!    list without `kern.proc.all` (G20), two Mach services, POSIX semaphores, sockets may be created (connecting and
-//!    binding are separate rules), the harmless devices. No `pseudo-tty` (G22);
+//!    list without `kern.proc.all` (G20), two Mach services, POSIX semaphores, Unix and IP sockets may be created
+//!    (connecting and binding are separate rules), the harmless devices. No `pseudo-tty` (G22);
 //! 2. **reads, broad**: `file-read*` and `file-map-executable` everywhere (G1);
 //! 3. **closed**: the home (only its own entry's metadata stays readable, so `cd ~` works), or in a home-folder
-//!    project every hidden top-level entry of it by one regex (G6, G16); `/private/tmp` and the user's
+//!    project every hidden top-level entry of it by one regex, and `~/Library` (G6, G16); `/private/tmp` and the user's
 //!    `/private/var/folders/<xx>/<id>` (G2);
 //! 4. **shown again**: the project, the toolchains (G7), the read-only and writable extras (G8, G10), the private
 //!    `TMPDIR`, Marv's binary;
@@ -28,7 +28,7 @@
 //! 7. **writes closed again**: the runtime and config folders, credentials, each protected path and placeholder as
 //!    written and where it leads (G11, G12), the protected names at any depth as regexes, which also stop a command
 //!    *creating* `.envrc` or `pkg/AGENTS.md` (G13), and unlinking an ancestor of a protected path (a rename of the
-//!    parent can't carry the protected entry away);
+//!    parent can't carry the protected entry away); and no hard link to anything denied (bwrap's `EXDEV`);
 //! 8. **network** (G18): nothing without it but the forwarded process ports on `localhost` and the mesh plug; with
 //!    it, IP, DNS and the TLS-trust services. Unix sockets stay closed either way, except the plug and sockets in the
 //!    private `TMPDIR`;
@@ -60,7 +60,8 @@ pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 pub const SHARED_TMP: &str = "/private/tmp";
 
 /// Folders the protected-name rules don't reach into, as the after-scan doesn't (`protected::SKIPPED_DIRS`): an
-/// install writes `node_modules/pkg/AGENTS.md` and that must work.
+/// install writes `node_modules/pkg/AGENTS.md` and that must work. Matched case-sensitively, as the walker matches
+/// them: `Node_Modules/AGENTS.md` is still denied, which is stricter than the scan and intended.
 const SKIPPED: &str = "(node_modules|target|\\.git)";
 
 /// The sysctls any process reads (Codex's list, from Chromium's). Not `kern.proc.all` or `kern.proc.pid.`: listing or
@@ -103,7 +104,9 @@ const SYSCTLS: &[&str] = &[
 const SYSCTL_PREFIXES: &[&str] = &["hw.optional.arm.", "hw.optional.armv8_", "hw.perflevel"];
 
 /// The Mach services every command may look up: user and group lookups (git, ssh) and the system log. Each one added
-/// later is a review item, with a failing tool and a test.
+/// later is a review item, with a failing tool and a test. `opendirectoryd.libinfo` answers `getpwuid`/`getgrgid`
+/// and friends: a command can learn the machine's user and group names and home folders (as `/etc/passwd` shows on
+/// Linux), nothing more.
 pub const MACH_SERVICES: &[&str] = &["com.apple.system.opendirectoryd.libinfo", "com.apple.system.logger"];
 
 /// The services a command with network needs on top: DNS configuration and TLS trust (Codex's network policy).
@@ -119,6 +122,17 @@ pub const NETWORK_MACH_SERVICES: &[&str] = &[
 /// The DNS resolver's socket, reachable with network only.
 const DNS_SOCKET: &str = "/private/var/run/mDNSResponder";
 
+/// The operation that makes a hard link. A hard link is a second name for a file that no path rule names: a protected
+/// file linked into the project or the private `TMPDIR` could be written through it, a credential read through it.
+/// bwrap stops this with `EXDEV` (a link can't cross a mount); here each denied path is also denied as a link source.
+/// TODO(#166): the operation's name and whether it filters on the link's source are "to verify" (spec §6.6); the
+/// macOS probe of #166 pins it. If it's wrong, `sandbox-exec` rejects the whole profile, so it can't ship silently.
+const HARD_LINK_OP: &str = "file-link";
+
+// TODO(#166): a setuid or setgid program (`sudo`, `su`) runs with raised privileges, still inside the sandbox; there
+// is no `no_new_privs`. A rule like `(deny process-exec (file-mode #o4000))` waits for the macOS probe to confirm the
+// filter's syntax and meaning. Listed in docs/SECURITY.md.
+
 /// What one command's profile needs beyond the [`Plan`]: things the macOS backend makes or finds per command (#166).
 #[derive(Debug, Clone, Default)]
 pub struct Invocation {
@@ -126,7 +140,8 @@ pub struct Invocation {
     /// the one place a command may bind and connect Unix sockets.
     pub tmp: PathBuf,
     /// The user's own temporary folder, `/private/var/folders/<xx>/<id>` (`getconf DARWIN_USER_DIR`'s parent), denied
-    /// like `/private/tmp`. None where there is none.
+    /// like `/private/tmp`. None: taken from [`Invocation::tmp`] when that is inside it; otherwise the profile is
+    /// refused rather than leaving it readable.
     pub user_temp: Option<PathBuf>,
     /// Marv's own binary, which `sandbox-exec` runs as `marv __guard` around the command: readable and executable
     /// even under the closed home.
@@ -192,20 +207,22 @@ fn quoted(text: &str) -> String {
     format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-/// A canonical path as the prefix of a regex inside `#"…"`: every regex metacharacter, `\` and `"` escaped with one
-/// backslash (SBPL's `#"…"` hands its backslashes to the regex unchanged). Refused when it can't be written there:
-/// not UTF-8, or a control character (a newline would end more than the string). A trailing `/` is dropped, so `/`
+/// A canonical path as the prefix of a regex inside `#"…"`, every regex metacharacter escaped with one backslash.
+/// Refused when it can't be written there safely: not UTF-8, a control character (a newline would end more than the
+/// string), or `"` or `\`. Whether SBPL's `#"…"` reader treats a backslash as an escape isn't known yet: if it doesn't,
+/// a `"` in the path would end the regex and the rest of the path would become profile text (`x"))) (allow default)`).
+/// Relax this only after a macOS probe (#166) proves how `\"` and `\\` are read. A trailing `/` is dropped, so `/`
 /// gives the empty prefix.
 fn regex_prefix(path: &Path, what: &str) -> Result<String, SandboxError> {
     let refuse =
         || SandboxError::Mount(format!("The {what} path has a character the macOS sandbox can't express: {}", path.display()));
     let text = path.to_str().ok_or_else(refuse)?;
-    if text.chars().any(char::is_control) {
+    if text.chars().any(|c| c.is_control() || c == '"' || c == '\\') {
         return Err(refuse());
     }
     let mut out = String::with_capacity(text.len() + 8);
     for c in text.trim_end_matches('/').chars() {
-        if matches!(c, '\\' | '"' | '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|') {
+        if matches!(c, '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|') {
             out.push('\\');
         }
         out.push(c);
@@ -241,6 +258,8 @@ const PROTECTED_NAMES: &[&str] = &[".env*", "bunfig.toml", ".mcp.json", "AGENTS.
 struct Builder {
     text: String,
     params: Vec<(String, PathBuf)>,
+    /// Parameters of paths that may not be the source of a hard link (see [`HARD_LINK_OP`]).
+    no_links: Vec<String>,
 }
 
 impl Builder {
@@ -267,6 +286,9 @@ impl Builder {
             forms.push((format!("{key}_REAL"), real.to_path_buf()));
         }
         for (key, path) in forms {
+            if rule.starts_with("deny") && !self.no_links.contains(&key) {
+                self.no_links.push(key.clone());
+            }
             let p = self.param(key, &path);
             let filters: Vec<String> = filters.iter().map(|f| format!("({f} {p})")).collect();
             self.line(&format!("({rule} {})", filters.join(" ")));
@@ -297,7 +319,20 @@ pub fn profile(plan: &Plan, run: &Invocation, fs: &dyn FsProbe) -> Result<Profil
     let ro_extras = plan.read_only_extras(fs)?;
     let rw_extras = plan.writable_extras(fs)?;
     let tmp = canon(&run.tmp);
-    let mut b = Builder { text: String::new(), params: Vec::new() };
+    let user_temp = user_temp(run, &tmp, fs)?;
+    // The private TMPDIR is writable and may hold sockets: never a folder that holds anything else.
+    if !run.tmp.is_absolute()
+        || contains(&tmp, &home)
+        || contains(&tmp, &root)
+        || contains(&tmp, Path::new(SHARED_TMP))
+        || contains(&tmp, &user_temp)
+    {
+        return Err(SandboxError::Mount(format!(
+            "The sandbox's temporary folder {} must be a folder of its own inside the user's temporary folder.",
+            run.tmp.display()
+        )));
+    }
+    let mut b = Builder { text: String::new(), params: Vec::new(), no_links: Vec::new() };
 
     // 1. Base.
     b.section("1. base");
@@ -313,8 +348,9 @@ pub fn profile(plan: &Plan, run: &Invocation, fs: &dyn FsProbe) -> Result<Profil
     let services: Vec<String> = MACH_SERVICES.iter().map(|s| format!("(global-name {})", quoted(s))).collect();
     b.line(&format!("(allow mach-lookup {})", services.join(" ")));
     b.line("(allow ipc-posix-sem)");
-    // Creating a socket reaches nothing; connecting and binding are the network section's.
-    b.line("(allow system-socket)");
+    // Creating a Unix or IP socket reaches nothing; connecting and binding are the network section's. TODO(#166):
+    // the symbolic domain names are to verify on the macOS probe.
+    b.line("(allow system-socket (socket-domain AF_UNIX) (socket-domain AF_INET) (socket-domain AF_INET6))");
     b.line("(allow file-ioctl (literal \"/dev/dtracehelper\"))");
 
     // 2. Reads, broad.
@@ -328,16 +364,21 @@ pub fn profile(plan: &Plan, run: &Invocation, fs: &dyn FsProbe) -> Result<Profil
         // the home, so nothing there can be connected to at any depth).
         let prefix = regex_prefix(&home, "home folder")?;
         b.line(&format!("(deny file-read* (regex #\"^{prefix}/\\.[^/]+(/.*)?$\"))"));
+        b.line(&format!("(deny {HARD_LINK_OP} (regex #\"^{prefix}/\\.[^/]+(/.*)?$\"))"));
+        // macOS keeps what Linux keeps in dotfolders in ~/Library: keychains, cookies, mail, messages, browser
+        // profiles, app containers and their data. No toolchain lives there, so nothing is shown again.
+        b.paths("deny file-read*", &["subpath"], "HOME_LIBRARY", &home.join("Library"), None);
     } else {
         let p = b.param("HOME".into(), &home);
+        // Hard links out of the home are refused too, also within a project under it: tools that link (cargo, git,
+        // pnpm) fall back to copying.
+        b.no_links.push("HOME".into());
         b.line(&format!("(deny file-read* (subpath {p}))"));
         b.line(&format!("(allow file-read-metadata (literal {p}))"));
     }
     b.line(&format!("(deny file-read* (subpath {}))", quoted(SHARED_TMP)));
-    if let Some(user_temp) = &run.user_temp {
-        let p = b.param("USER_TEMP".into(), &canon(user_temp));
-        b.line(&format!("(deny file-read* (subpath {p}))"));
-    }
+    let p = b.param("USER_TEMP".into(), &user_temp);
+    b.line(&format!("(deny file-read* (subpath {p}))"));
 
     // 4. Reads, shown again.
     b.section("4. reads, shown again");
@@ -394,7 +435,8 @@ pub fn profile(plan: &Plan, run: &Invocation, fs: &dyn FsProbe) -> Result<Profil
         b.paths(write, &["subpath"], "PROJECT", &root, None);
     }
     // A read-only folder inside the project or a writable one (a worktree's `.git`): read-only on top of it, as
-    // bwrap mounts it. One around the project has no write rule to undo.
+    // bwrap mounts it. One around the project has no write rule to undo. A writable extra inside a read-only one is
+    // allowed again after this, as bwrap's later writable bind sits on top of the read-only one.
     for (i, extra) in ro_extras.iter().enumerate().filter(|(_, e)| !e.around_project) {
         b.paths("deny file-write*", &["literal", "subpath"], &format!("READ_ONLY_{i}"), &canon(&extra.real), None);
     }
@@ -418,7 +460,18 @@ pub fn profile(plan: &Plan, run: &Invocation, fs: &dyn FsProbe) -> Result<Profil
     for (i, (given, real)) in credentials.iter().enumerate() {
         b.paths("deny file-write*", &["literal"], &format!("CREDENTIAL_{i}"), given, real.as_deref());
     }
-    if !read_only {
+    if read_only {
+        // Nothing to write to in the project, but a protected file linked into the private TMPDIR could be written.
+        for (i, path) in plan.protected.iter().enumerate() {
+            let (given, real) = written_and_real(path, fs);
+            for (key, value) in [(format!("PROTECTED_{i}"), Some(given)), (format!("PROTECTED_{i}_REAL"), real)] {
+                if let Some(value) = value {
+                    b.param(key.clone(), &value);
+                    b.no_links.push(key);
+                }
+            }
+        }
+    } else {
         // Protected paths that exist (and the hooks folder), as written and where they lead.
         let mut ancestors: Vec<PathBuf> = vec![root.clone()];
         for (i, path) in plan.protected.iter().enumerate() {
@@ -449,6 +502,11 @@ pub fn profile(plan: &Plan, run: &Invocation, fs: &dyn FsProbe) -> Result<Profil
             let p = b.param(format!("ANCESTOR_{i}"), dir);
             b.line(&format!("(deny file-write-unlink (literal {p}))"));
         }
+    }
+    // No hard link to anything denied above: the home, Library, masks, Marv's folders, credentials, protected paths,
+    // read-only extras (see HARD_LINK_OP).
+    for key in std::mem::take(&mut b.no_links) {
+        b.line(&format!("(deny {HARD_LINK_OP} (literal (param {k})) (subpath (param {k})))", k = quoted(&key)));
     }
 
     // 8. Network.
@@ -481,6 +539,21 @@ pub fn profile(plan: &Plan, run: &Invocation, fs: &dyn FsProbe) -> Result<Profil
     b.line("(deny mach-lookup (xpc-service-name-prefix \"\"))");
     b.line("(deny system-fcntl (fcntl-command 80) (fcntl-command 110))");
     Ok(Profile { text: b.text, params: b.params })
+}
+
+/// The user's temporary folder: as given, or the `/private/var/folders/<xx>/<id>` the private TMPDIR is in.
+fn user_temp(run: &Invocation, tmp: &Path, fs: &dyn FsProbe) -> Result<PathBuf, SandboxError> {
+    if let Some(given) = &run.user_temp {
+        return Ok(canonical(given, fs));
+    }
+    let parts: Vec<Component> = tmp.components().collect();
+    if tmp.starts_with("/private/var/folders") && parts.len() > 6 {
+        return Ok(parts[..6].iter().collect());
+    }
+    Err(SandboxError::Mount(format!(
+        "Can't tell the user's temporary folder from {}, so the macOS sandbox can't close it.",
+        tmp.display()
+    )))
 }
 
 /// A path as written (its folder canonical, its own name kept: a symlinked credential or protected file is denied
@@ -555,10 +628,10 @@ mod tests {
     fn last_at(text: &str, needle: &str) -> usize {
         text.rfind(needle).unwrap_or_else(|| panic!("{needle:?} not in:\n{text}"))
     }
-    /// The rule lines that read parameter `key`.
+    /// The rule lines that read parameter `key`, but its hard-link deny (`nothing_denied_can_be_hard_linked`).
     fn rules<'a>(text: &'a str, key: &str) -> Vec<&'a str> {
         let p = format!("(param \"{key}\")");
-        text.lines().filter(|l| l.contains(&p)).collect()
+        text.lines().filter(|l| l.contains(&p) && !l.starts_with(&format!("(deny {HARD_LINK_OP}"))).collect()
     }
     /// Every `#"…"` regex in the profile, as the regex sees it.
     fn regexes(text: &str) -> Vec<regex::Regex> {
@@ -566,7 +639,7 @@ mod tests {
         let mut rest = text;
         while let Some(start) = rest.find("#\"") {
             let body = &rest[start + 2..];
-            let mut end = 0;
+            let mut end = None;
             let mut escaped = false;
             for (i, c) in body.char_indices() {
                 if escaped {
@@ -574,10 +647,11 @@ mod tests {
                 } else if c == '\\' {
                     escaped = true;
                 } else if c == '"' {
-                    end = i;
+                    end = Some(i);
                     break;
                 }
             }
+            let end = end.unwrap_or_else(|| panic!("an unclosed regex in: {rest}"));
             out.push(regex::Regex::new(&body[..end]).unwrap_or_else(|e| panic!("{}: {e}", &body[..end])));
             rest = &body[end + 1..];
         }
@@ -839,7 +913,13 @@ mod tests {
         };
         let p = build(&plan, &mac_fs(|_| false));
         assert!(rules(&p.text, "PROJECT").iter().all(|l| !l.contains("file-write")));
-        assert!(p.param("PROTECTED_0").is_none() && p.param("PLACEHOLDER_0").is_none() && !p.text.contains("require-all"));
+        assert!(p.param("PLACEHOLDER_0").is_none() && !p.text.contains("require-all"));
+        // The protected file still can't be hard-linked into the private TMPDIR and written there.
+        let protected: Vec<&str> = p.text.lines().filter(|l| l.contains("(param \"PROTECTED_0\")")).collect();
+        assert_eq!(
+            protected,
+            [format!("(deny {HARD_LINK_OP} (literal (param \"PROTECTED_0\")) (subpath (param \"PROTECTED_0\")))")]
+        );
         // Only the private TMPDIR (and /dev) is writable.
         let writes: Vec<&str> = p.text.lines().filter(|l| l.starts_with("(allow file-write")).collect();
         assert_eq!(
@@ -859,7 +939,8 @@ mod tests {
         let p = build(&plan, &fs);
         let t = &p.text;
         assert!(p.param("HOME").is_none() && p.param("PROJECT").is_none());
-        let hidden: Vec<&str> = t.lines().filter(|l| l.contains("^/Users/me/\\.[^/]+")).collect();
+        let hidden: Vec<&str> =
+            t.lines().filter(|l| l.starts_with("(deny file-read*") && l.contains("^/Users/me/\\.[^/]+")).collect();
         assert_eq!(hidden, ["(deny file-read* (regex #\"^/Users/me/\\.[^/]+(/.*)?$\"))"]);
         let r = &regexes(hidden[0])[0];
         assert!(r.is_match("/Users/me/.ssh/id_ed25519") && r.is_match("/Users/me/.zshrc"));
@@ -976,15 +1057,15 @@ mod tests {
 
     #[test]
     fn a_path_with_regex_and_sbpl_characters_matches_only_itself() {
-        let root = "/Users/me/we\"ird\\ (dir).*+?[x]{1}^$| ü";
+        let root = "/Users/me/weird (dir).*+?[x]{1}^$| ü";
         let p = build(&Plan { root: root.into(), ..base() }, &mac_fs(|_| false));
         assert!(name_denied(&p.text, &format!("{root}/.envrc")));
         // The same path with any metacharacter read as a pattern doesn't match.
         for other in [
-            "/Users/me/weXird\\ (dir).*+?[x]{1}^$| ü",
-            "/Users/me/we\"ird\\ dir.*+?[x]{1}^$| ü",
-            "/Users/me/we\"ird\\ (dir)x*+?[x]{1}^$| ü",
-            "/Users/me/we\"ird\\ (dir).*+?x{1}^$| ü",
+            "/Users/me/weird dir.*+?[x]{1}^$| ü",
+            "/Users/me/weird (dir)x*+?[x]{1}^$| ü",
+            "/Users/me/weird (dir).*+?x{1}^$| ü",
+            "/Users/me/weird (dir).*+?[x]{1}| ü",
         ] {
             assert!(!name_denied(&p.text, &format!("{other}/.envrc")), "{other}");
         }
@@ -996,7 +1077,11 @@ mod tests {
     #[test]
     fn a_path_the_profile_cant_express_stops_the_command() {
         let fs = mac_fs(|_| false);
-        for root in ["/Users/me/a\nb", "/Users/me/a\tb", "/Users/me/a\u{7f}b"] {
+        // `"` and `\` too, until a macOS probe shows how SBPL's `#"…"` reads a backslash: a project folder named
+        // `x"))) (allow default) ;` must not become profile text.
+        for root in
+            ["/Users/me/a\nb", "/Users/me/a\tb", "/Users/me/a\u{7f}b", "/Users/me/x\"))) (allow default) ;", "/Users/me/a\\b"]
+        {
             let err = profile(&Plan { root: root.into(), ..base() }, &run(), &fs).unwrap_err().to_string();
             assert!(err.contains("can't express"), "{err}");
         }
@@ -1004,6 +1089,141 @@ mod tests {
         let err = profile(&Plan { root: "/Users/m\ne".into(), home: "/Users/m\ne".into(), ..base() }, &run(), &fs).unwrap_err();
         assert!(err.to_string().contains("home folder"));
         assert!(profile(&Plan { root: "relative".into(), ..base() }, &run(), &fs).is_err());
+    }
+
+    #[test]
+    fn a_home_folder_project_closes_library_too() {
+        let plan = Plan { root: "/Users/me".into(), ..base() };
+        let p = build(&plan, &mac_fs(|_| false));
+        assert_eq!(p.param("HOME_LIBRARY"), Some(Path::new("/Users/me/Library")));
+        let rules = rules(&p.text, "HOME_LIBRARY");
+        assert!(rules.contains(&"(deny file-read* (subpath (param \"HOME_LIBRARY\")))"));
+        // Nothing reads it again later (no toolchain lives there).
+        let deny = at(&p.text, "(deny file-read* (subpath (param \"HOME_LIBRARY\")))");
+        assert!(!p.text[deny..].lines().any(|l| l.starts_with("(allow file-read") && l.contains("HOME_LIBRARY")));
+        // In any other project the whole home is closed already.
+        assert!(build(&base(), &mac_fs(|_| false)).param("HOME_LIBRARY").is_none());
+    }
+
+    #[test]
+    fn nothing_denied_can_be_hard_linked() {
+        let mut fs = mac_fs(|p| p.contains("marv"));
+        fs.kinds.insert("/Users/me/.cargo/credentials.toml".into(), FileKind::File);
+        let plan = Plan {
+            protected: vec!["/Users/me/proj/.envrc".into()],
+            read_only: vec!["/Users/me/proj/.git".into()],
+            hidden: vec!["/tmp/marv-501".into()],
+            config_dir: Some("/Users/me/.marv".into()),
+            ..base()
+        };
+        let t = build(&plan, &fs).text;
+        for key in ["HOME", "CREDENTIAL_0", "PROTECTED_0", "READ_ONLY_0", "RUNTIME_0", "CONFIG"] {
+            let line = format!("(deny {HARD_LINK_OP} (literal (param \"{key}\")) (subpath (param \"{key}\")))");
+            assert!(at(&t, &line) > at(&t, "; 7."), "{key}");
+        }
+        // Not the private TMPDIR or the project: those are the command's to link in.
+        for key in ["TMP", "PROJECT", "USER_TEMP"] {
+            assert!(!t.contains(&format!("(deny {HARD_LINK_OP} (literal (param \"{key}\"))")), "{key}");
+        }
+        // A home-folder project: the hidden entries by the same regex as their reads.
+        let home = build(&Plan { root: "/Users/me".into(), ..base() }, &fs).text;
+        assert!(home.contains(&format!("(deny {HARD_LINK_OP} (regex #\"^/Users/me/\\.[^/]+(/.*)?$\"))")));
+        assert!(home.contains(&format!("(deny {HARD_LINK_OP} (literal (param \"HOME_LIBRARY\"))")));
+    }
+
+    #[test]
+    fn the_users_temporary_folder_is_found_from_the_tmpdir_or_the_profile_is_refused() {
+        let fs = mac_fs(|_| false);
+        let derived = profile(&base(), &Invocation { user_temp: None, ..run() }, &fs).unwrap();
+        assert_eq!(derived.param("USER_TEMP"), Some(Path::new("/private/var/folders/ab/xyz")));
+        let elsewhere = Invocation { tmp: "/Volumes/scratch/marv-1".into(), user_temp: None, ..run() };
+        assert!(profile(&base(), &elsewhere, &fs).unwrap_err().to_string().contains("temporary folder"));
+        // Given, it may be anywhere.
+        let given = Invocation { tmp: "/Volumes/scratch/marv-1".into(), user_temp: Some("/Volumes/scratch".into()), ..run() };
+        assert_eq!(profile(&base(), &given, &fs).unwrap().param("USER_TEMP"), Some(Path::new("/Volumes/scratch")));
+    }
+
+    #[test]
+    fn the_private_tmpdir_must_be_a_folder_of_its_own() {
+        let fs = mac_fs(|_| false);
+        for tmp in ["", "relative", "/", "/Users", "/Users/me", "/Users/me/proj", "/tmp", "/var/folders/ab/xyz", "/var/folders"] {
+            let run = Invocation { tmp: tmp.into(), ..run() };
+            assert!(profile(&base(), &run, &fs).is_err(), "{tmp:?}");
+        }
+    }
+
+    #[test]
+    fn only_unix_and_ip_sockets_can_be_made() {
+        let t = build(&base(), &mac_fs(|_| false)).text;
+        let line = t.lines().find(|l| l.contains("system-socket")).unwrap();
+        assert_eq!(line, "(allow system-socket (socket-domain AF_UNIX) (socket-domain AF_INET) (socket-domain AF_INET6))");
+    }
+
+    /// For every credential, home mask, runtime and config deny, no later allow of the same operation names a path
+    /// equal to it, inside it or around it (`SKILLS` after the config's read deny is the one intended exception).
+    #[test]
+    fn no_allow_reopens_a_hidden_path() {
+        let mut fs = mac_fs(|p| p.contains("marv") || p.starts_with("/srv"));
+        fs.kinds.insert("/Users/me/.cargo/credentials.toml".into(), FileKind::File);
+        fs.kinds.insert("/Users/me/.cargo/credentials".into(), FileKind::Symlink);
+        fs.links.insert("/Users/me/.cargo/credentials".into(), "/Users/me/proj/creds".into());
+        let scenarios = [
+            Plan {
+                hidden: vec!["/Users/me/proj/run/marv".into(), "/tmp/marv-501".into()],
+                config_dir: Some("/Users/me/.marv".into()),
+                read_only: vec!["/srv/ro".into()],
+                writable: vec!["/srv/rw".into()],
+                mesh_socket: Some("/tmp/marv-501/p/1/a.sock".into()),
+                network: true,
+                ..base()
+            },
+            Plan {
+                root: "/Users/me".into(),
+                config_dir: Some("/Users/me/.marv".into()),
+                hidden: vec!["/tmp/marv-501".into()],
+                ..base()
+            },
+            Plan {
+                root: "/srv/proj".into(),
+                config_dir: Some("/srv/proj/marv-config".into()),
+                hidden: vec!["/srv/proj/marv-run".into()],
+                ..base()
+            },
+        ];
+        for plan in scenarios {
+            let p = build(&plan, &fs);
+            let lines: Vec<&str> = p.text.lines().collect();
+            let keys_in = |line: &str| -> Vec<String> {
+                line.split("(param \"").skip(1).filter_map(|rest| rest.split('"').next()).map(str::to_string).collect()
+            };
+            let hidden = |k: &str| ["CREDENTIAL_", "HOME_MASK_", "RUNTIME_", "CONFIG"].iter().any(|h| k.starts_with(h));
+            for (i, line) in lines.iter().enumerate() {
+                for op in ["file-read", "file-write"] {
+                    if !line.starts_with(&format!("(deny {op}")) && !line.starts_with(&format!("(deny file-read* {op}")) {
+                        continue;
+                    }
+                    for key in keys_in(line).into_iter().filter(|k| hidden(k)) {
+                        let denied = p.param(&key).unwrap();
+                        for later in &lines[i + 1..] {
+                            if !later.starts_with(&format!("(allow {op}")) {
+                                continue;
+                            }
+                            for other in keys_in(later) {
+                                if key == "CONFIG" && other == "SKILLS" && op == "file-read" {
+                                    continue;
+                                }
+                                let allowed = p.param(&other).unwrap();
+                                assert!(
+                                    !denied.starts_with(allowed) && !allowed.starts_with(denied),
+                                    "{key} ({}) reopened by {other} in: {later}",
+                                    denied.display()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Parity: every field of the plan is rendered by both backends. Destructured without `..`, so a new field fails
