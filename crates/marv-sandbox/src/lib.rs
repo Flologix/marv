@@ -36,7 +36,7 @@ pub use bwrap::{Bind, EntryKind, FileKind, FsProbe, MESH_SOCKET, RealFs, Sandbox
 pub use home::home_project;
 pub use paths::{project_path, resolve_in_project, resolve_within, touches_git};
 pub use protected::{PROTECTED_PATHS, ProtectedPath, ProtectedRule, is_protected, protected_rule};
-pub use runtime::{RUNTIME_DIR_RULE, runtime_dir, runtime_env, runtime_path};
+pub use runtime::{RUNTIME_DIR_RULE, runtime_dir, runtime_env, runtime_paths};
 pub use taint::TaintState;
 pub use writable::resolve as resolve_writable;
 
@@ -112,7 +112,7 @@ pub struct Sandbox {
     pub lang: String,
     /// The mesh plug's host-side socket, bound at [`MESH_SOCKET`] (`docs/MESH.md`). None: no mesh.
     pub mesh_socket: Option<PathBuf>,
-    /// Folders every command sees empty: Marv's runtime folder (`runtime::runtime_path`, see `SandboxOptions::hidden`).
+    /// Folders every command sees empty: Marv's runtime folder (`runtime::runtime_paths`: the default and any override, see `SandboxOptions::hidden`).
     pub hidden: Vec<PathBuf>,
     /// Extra folders outside the project every command may change (#98): the config's `"writable"`, already
     /// checked (`writable::resolve`) and canonical. None of the refusal happens here — a path in this list was
@@ -145,7 +145,7 @@ impl Sandbox {
             path: std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
             lang: std::env::var("LANG").unwrap_or_else(|_| "C.UTF-8".into()),
             mesh_socket: None,
-            hidden: runtime_path(&runtime_env()).into_iter().collect(),
+            hidden: runtime_paths(&runtime_env()),
             writable: Vec::new(),
             config_dir: Some(config_dir(std::env::var_os("MARV_CONFIG_DIR"), std::env::current_dir().ok().as_deref(), &home)),
         }

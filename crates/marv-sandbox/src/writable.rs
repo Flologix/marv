@@ -19,7 +19,7 @@
 //!   accepted folder later (`~/Projects/x/cache/repo/.git` created by a command) is not scanned — the refusal
 //!   happens once, at startup, on what the entry held then;
 //! - the project's parents (a writable `~/Projects` would make every other project writable);
-//! - a Marv runtime folder (the mesh's sockets: the `runtime` argument, `runtime::runtime_path`), inside it or holding it;
+//! - a Marv runtime folder (the mesh's sockets: the `runtime` argument, `runtime::runtime_paths`: the default and any override), inside it or holding it;
 //! - Marv's config folder (`config_dir`: `~/.marv`, or a visible `MARV_CONFIG_DIR`), inside it or holding it — the
 //!   config's hooks, the API key, the tool-output files;
 //! - anything missing or not a folder: bwrap can't mount it.
@@ -62,7 +62,7 @@ pub const PROTECTED_HOME_PATHS: &[&str] = &[
 /// Whether `real` (the canonical entry) can't be mounted writable, and why. Fail closed: the rules say no more
 /// than what's plainly safe outside the project, and anything under the home is refused unless it's a *visible*
 /// top-level folder's tree (`~/Projects/…`), a git repository or the mesh's runtime dir excluded.
-fn refuse(real: &Path, home: &Path, root: &Path, runtime: Option<&Path>, config_dir: Option<&Path>) -> Option<String> {
+fn refuse(real: &Path, home: &Path, root: &Path, runtime: &[PathBuf], config_dir: Option<&Path>) -> Option<String> {
     if real == Path::new("/") {
         return Some("it is the root of the file system".into());
     }
@@ -105,14 +105,12 @@ fn refuse(real: &Path, home: &Path, root: &Path, runtime: Option<&Path>, config_
     if real.is_dir() && real.join(".git").try_exists().unwrap_or(true) {
         return Some("it is, or holds, a git repository: git runs its hooks and config outside the sandbox".into());
     }
-    // The mesh's sockets live in Marv's runtime folder: a writable mount over them (or over their parent) would let
+    // The mesh's sockets live in Marv's runtime folders: a writable mount over them (or over their parent) would let
     // a command reach a plug's socket. (`hidden_in_sandbox` is broader — anything under /run, /tmp or the home — but
     // a writable folder under the home is exactly the point of #98, so only the runtime folder itself is out.
-    // `runtime` is the caller's `runtime::runtime_path`, from the real environment.) Inside it counts too
+    // `runtime` is the caller's `runtime::runtime_paths`, from the real environment.) Inside it counts too
     // (`<runtime>/mesh`, where the sockets themselves are). Judged on the real path, like the entry.
-    if let Some(sockets) = runtime.map(real_or_given)
-        && (real.starts_with(&sockets) || sockets.starts_with(real))
-    {
+    if runtime.iter().map(|dir| real_or_given(dir)).any(|sockets| real.starts_with(&sockets) || sockets.starts_with(real)) {
         return Some("the mesh's runtime sockets live there".into());
     }
     // Marv's own config folder (`~/.marv`, or wherever `MARV_CONFIG_DIR` puts it — a visible folder escapes the
@@ -136,7 +134,7 @@ fn resolve_entry(
     entry: &str,
     home: &Path,
     root: &Path,
-    runtime: Option<&Path>,
+    runtime: &[PathBuf],
     config_dir: Option<&Path>,
 ) -> Result<PathBuf, String> {
     let raw = expand_home(entry, home);
@@ -160,13 +158,13 @@ fn resolve_entry(
 
 /// The config's `"writable"` entries resolved once at startup: the canonical paths to bind read-write into every
 /// sandbox, and the problems (refused entries) for the startup notice. Duplicates collapse. `runtime` is Marv's
-/// runtime folder (`runtime::runtime_path`: the mesh's sockets), from the real environment; `config_dir` is
+/// runtime folder (`runtime::runtime_paths`: the mesh's sockets), from the real environment; `config_dir` is
 /// Marv's config folder (`default_config_dir`: `~/.marv` or `MARV_CONFIG_DIR`).
 pub fn resolve(
     entries: &[String],
     home: &Path,
     root: &Path,
-    runtime: Option<&Path>,
+    runtime: &[PathBuf],
     config_dir: Option<&Path>,
 ) -> (Vec<PathBuf>, Vec<String>) {
     let (mut accepted, mut problems) = (Vec::<PathBuf>::new(), Vec::new());
@@ -196,11 +194,11 @@ mod tests {
     use crate::paths::test_dir::TempDir;
 
     fn in_home(home: &Path, root: &Path, entry: &str) -> Result<PathBuf, String> {
-        resolve_entry(entry, home, root, None, None)
+        resolve_entry(entry, home, root, &[], None)
     }
 
     fn with_runtime(home: &Path, root: &Path, entry: &str, runtime: &Path) -> Result<PathBuf, String> {
-        resolve_entry(entry, home, root, Some(runtime), None)
+        resolve_entry(entry, home, root, &[runtime.to_path_buf()], None)
     }
 
     #[test]
@@ -209,7 +207,7 @@ mod tests {
         let dir = TempDir::new("writable-ok");
         let path = dir.path().to_str().unwrap().to_string();
         let root = TempDir::new("writable-root");
-        let (ok, problems) = resolve(&[path.clone(), format!("{path}/.")], home.path(), root.path(), None, None);
+        let (ok, problems) = resolve(&[path.clone(), format!("{path}/.")], home.path(), root.path(), &[], None);
         assert_eq!(ok, [dir.path()], "duplicates and `.` paths collapse to the canonical path");
         assert!(problems.is_empty(), "{problems:?}");
     }
@@ -310,7 +308,7 @@ mod tests {
             assert!(why.contains("git repository"), "{entry}: {why}");
         }
         let why =
-            resolve_entry(&outside.path().join("repo").to_string_lossy(), Path::new("/nowhere-home"), project.path(), None, None)
+            resolve_entry(&outside.path().join("repo").to_string_lossy(), Path::new("/nowhere-home"), project.path(), &[], None)
                 .unwrap_err();
         assert!(why.contains("git repository"), "{why}");
         // A folder inside a repo — but not a `.git` interior and not directly holding one — is the documented
@@ -387,7 +385,7 @@ mod tests {
         std::fs::create_dir_all(home.path().join("shared/cache")).unwrap();
         let entries: Vec<String> =
             ["~/Projects/p", "~/Projects/p/tools/hooks", "~/shared/cache", "~/shared"].iter().map(|s| s.to_string()).collect();
-        let (ok, problems) = resolve(&entries, home.path(), &project, None, None);
+        let (ok, problems) = resolve(&entries, home.path(), &project, &[], None);
         assert_eq!(ok, [home.path().join("shared")], "only the outer folder outside the project");
         assert!(problems.is_empty(), "{problems:?}");
     }
@@ -404,11 +402,11 @@ mod tests {
         let nested = home.path().join("holder/inner/cfg");
         std::fs::create_dir_all(&nested).unwrap();
         for (entry, config) in [("~/marv-config", &config), ("~/marv-config/tool-output", &config), ("~/holder", &nested)] {
-            let why = resolve_entry(entry, home.path(), root.path(), None, Some(config)).unwrap_err();
+            let why = resolve_entry(entry, home.path(), root.path(), &[], Some(config)).unwrap_err();
             assert!(why.contains("Marv's config folder"), "{entry}: {why}");
         }
         // Next to it is fine.
         std::fs::create_dir_all(home.path().join("beads")).unwrap();
-        assert!(resolve_entry("~/beads", home.path(), root.path(), None, Some(&config)).is_ok());
+        assert!(resolve_entry("~/beads", home.path(), root.path(), &[], Some(&config)).is_ok());
     }
 }

@@ -2560,8 +2560,8 @@ pub fn merge_pre_approved(mut from_config: Vec<String>, from_cli: &[String]) -> 
 
 /// Extra writable sandbox folders (#98): resolved once here (refused entries are problems, never mounts).
 pub fn resolve_writable(config: &[String], home: &Path, root: &Path, config_dir: &Path) -> (Vec<PathBuf>, Vec<String>) {
-    let runtime = marv_sandbox::runtime_path(&marv_sandbox::runtime_env());
-    marv_sandbox::resolve_writable(config, home, root, runtime.as_deref(), Some(config_dir))
+    let runtime = marv_sandbox::runtime_paths(&marv_sandbox::runtime_env());
+    marv_sandbox::resolve_writable(config, home, root, &runtime, Some(config_dir))
 }
 
 pub async fn run(resume: Option<bool>, approve: Vec<String>) -> anyhow::Result<i32> {

@@ -450,7 +450,7 @@ pub async fn run_headless(options: HeadlessOptions) -> ExitCode {
         &config.writable,
         &home,
         &root,
-        marv_sandbox::runtime_path(&marv_sandbox::runtime_env()).as_deref(),
+        &marv_sandbox::runtime_paths(&marv_sandbox::runtime_env()),
         Some(&config_dir),
     );
     for problem in &writable_problems {

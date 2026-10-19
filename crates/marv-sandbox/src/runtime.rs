@@ -11,9 +11,13 @@
 //!   (not a symlink) this user owns. Another user who made ours first turns the mesh off, nothing more: `/tmp`'s
 //!   sticky bit stops them replacing it.
 //!
-//! Inside it: `mesh/<name>.sock` (doors), `p/<pid>/<plug>.sock` (one process's plugs) and `<pid>-<hex>/p<n>/` (the
-//! process door's sockets). The plug folder is named after the process, not the session: the session name is up to
-//! 43 bytes and the plug id up to 48, which together overflowed `sun_path` on both platforms.
+//! The override's parent must exist; it's judged by its real path, and nothing on the way may be a symlink (but the
+//! root's `/tmp`) or changeable by another user ([`private_folder`]).
+//!
+//! Inside it: `mesh/<name>.sock` (doors), `p/<pid>-<hex>/<plug>.sock` (one switchboard's plugs; a process can have
+//! several, Marv desktop's chats) and `<pid>-<hex>/p<n>/` (the process door's sockets). The plug folder isn't named
+//! after the session: the session name is up to 43 bytes and the plug id up to 48, which together overflowed
+//! `sun_path` on both platforms.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -27,8 +31,9 @@ pub const SUN_PATH: usize = 104;
 #[cfg(not(target_os = "macos"))]
 pub const SUN_PATH: usize = 108;
 
-/// What the longest socket adds to the runtime folder: `/p/` + a pid (7 digits) + `/` + a plug id (48) + `.sock`.
-const LONGEST_SOCKET_TAIL: usize = 3 + 7 + 1 + 48 + 5;
+/// What the longest socket adds to the runtime folder: `/p/` + a pid (7 digits) + `-` + 4 hex digits (one folder per
+/// switchboard) + `/` + a plug id (48) + `.sock`.
+const LONGEST_SOCKET_TAIL: usize = 3 + 7 + 1 + 4 + 1 + 48 + 5;
 
 /// The longest runtime folder whose every socket fits `sun_path`.
 pub const MAX_RUNTIME_DIR: usize = SUN_PATH - 1 - LONGEST_SOCKET_TAIL;
@@ -47,13 +52,25 @@ pub fn runtime_env() -> BTreeMap<String, String> {
         .collect()
 }
 
-/// Where the rule puts the runtime folder, unchecked: what the sandbox hides and the writable check refuses (more
-/// hidden is harmless). `None` only on Linux without an absolute `XDG_RUNTIME_DIR`.
-pub fn runtime_path(env: &BTreeMap<String, String>) -> Option<PathBuf> {
-    if let Some(dir) = env.get(RUNTIME_DIR_VAR).filter(|d| !d.is_empty()) {
-        return Some(PathBuf::from(dir)).filter(|d| d.is_absolute());
+/// Every folder the rule could put the runtime folder in, unchecked: what the sandbox hides and the writable check
+/// refuses (more hidden is harmless). The platform's default and, when set, `MARV_RUNTIME_DIR` (a relative one taken
+/// from the current folder, though [`runtime_dir`] never uses it).
+pub fn runtime_paths(env: &BTreeMap<String, String>) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = default_path(env).into_iter().collect();
+    if let Some(dir) = env.get(RUNTIME_DIR_VAR).filter(|d| !d.is_empty()).map(PathBuf::from) {
+        let dir = if dir.is_absolute() {
+            dir
+        } else {
+            match std::env::current_dir() {
+                Ok(cwd) => cwd.join(dir),
+                Err(_) => return paths,
+            }
+        };
+        if !paths.contains(&dir) {
+            paths.push(dir);
+        }
     }
-    default_path(env)
+    paths
 }
 
 #[cfg(target_os = "macos")]
@@ -67,16 +84,20 @@ fn default_path(env: &BTreeMap<String, String>) -> Option<PathBuf> {
 }
 
 /// The runtime folder, checked (see the module doc); `None` when there's none Marv may use, and the mesh and the
-/// processes' sockets are off. The macOS default and the override are made here (0700) and must then be this user's
-/// own folder; the Linux default is checked as before (hidden in every sandbox) and made where it's used.
+/// processes' sockets are off. The macOS default and the override are made here ([`private_folder`]); the Linux
+/// default is checked as before (hidden in every sandbox) and made where it's used.
 pub fn runtime_dir(env: &BTreeMap<String, String>) -> Option<PathBuf> {
     let home = env.get("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"));
     if let Some(dir) = env.get(RUNTIME_DIR_VAR).filter(|d| !d.is_empty()) {
         let dir = PathBuf::from(dir);
-        let ok = dir.is_absolute()
-            && dir.as_os_str().len() <= MAX_RUNTIME_DIR
-            && crate::hidden_in_sandbox(&dir, &home)
-            && private_folder(&dir).is_ok();
+        if dir.as_os_str().len() > MAX_RUNTIME_DIR {
+            return None;
+        }
+        // Judged where it really is: its parent must exist, and is taken by its real path (macOS's `/tmp` is
+        // `/private/tmp`). Sockets are bound at the path as given, which `private_folder` checks leads nowhere else.
+        let (parent, name) = (dir.parent()?, dir.file_name()?);
+        let real = std::fs::canonicalize(parent).ok()?.join(name);
+        let ok = crate::hidden_in_sandbox(&real, &home) && private_folder(&dir).is_ok();
         return ok.then_some(dir);
     }
     if cfg!(target_os = "macos") {
@@ -87,17 +108,42 @@ pub fn runtime_dir(env: &BTreeMap<String, String>) -> Option<PathBuf> {
     Some(Path::new(base).join("marv"))
 }
 
-/// Makes `dir` (0700) and checks it's a folder, not a symlink, of this user's; then 0700 again (an existing one).
+/// Makes `dir` this user's private folder, or refuses it. `dir` is absolute and plain (no `.` or `..`); its parent
+/// exists, and nothing on the way is a symlink but the root's `/tmp` (macOS's link to `/private/tmp`): through a
+/// linked parent a folder that looks hidden could be one sandboxes see. Every folder on the way belongs to this user or
+/// root and isn't writable by others unless sticky (`/tmp`): nobody else can swap a parent before a socket is bound.
+/// Only the last part is made, 0700 and not recursively; then it must be a folder, not a symlink, of this user's (an
+/// existing one is made 0700 again).
 fn private_folder(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-    match std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir) {
+    use std::path::Component;
+    let refuse = |why: &str| Err(std::io::Error::other(format!("{}: {why}", dir.display())));
+    let uid = nix::unistd::geteuid().as_raw();
+    let mut parts = dir.components();
+    if parts.next() != Some(Component::RootDir) || !parts.all(|c| matches!(c, Component::Normal(_))) {
+        return refuse("not an absolute, plain path");
+    }
+    for ancestor in dir.ancestors().skip(1) {
+        let mut meta = std::fs::symlink_metadata(ancestor)?;
+        if meta.file_type().is_symlink() {
+            if ancestor != Path::new("/tmp") {
+                return refuse(&format!("{} is a symlink", ancestor.display()));
+            }
+            meta = std::fs::metadata(ancestor)?;
+        }
+        let mode = meta.mode();
+        if !meta.is_dir() || (meta.uid() != uid && meta.uid() != 0) || (mode & 0o022 != 0 && mode & 0o1000 == 0) {
+            return refuse(&format!("{} could be changed by another user", ancestor.display()));
+        }
+    }
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(e),
     }
     let meta = std::fs::symlink_metadata(dir)?;
-    if !meta.is_dir() || meta.uid() != nix::unistd::geteuid().as_raw() {
-        return Err(std::io::Error::other(format!("{} isn't a folder of this user's", dir.display())));
+    if !meta.is_dir() || meta.uid() != uid {
+        return refuse("isn't a folder of this user's");
     }
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
 }
@@ -132,10 +178,10 @@ mod tests {
     #[test]
     fn the_longest_plug_socket_fits_in_the_longest_runtime_folder() {
         let dir = "/".to_string() + &"r".repeat(MAX_RUNTIME_DIR - 1);
-        let plug = format!("{dir}/p/4194304/{}.sock", "x".repeat(48));
+        let plug = format!("{dir}/p/4194304-ffff/{}.sock", "x".repeat(48));
         assert_eq!(plug.len(), SUN_PATH - 1);
         assert!(check_socket_path(Path::new(&plug)).is_ok());
-        let over = format!("{dir}x/p/4194304/{}.sock", "x".repeat(48));
+        let over = format!("{dir}x/p/4194304-ffff/{}.sock", "x".repeat(48));
         let err = check_socket_path(Path::new(&over)).unwrap_err();
         assert!(err.contains("too long") && err.contains(RUNTIME_DIR_VAR), "{err}");
     }
@@ -147,7 +193,10 @@ mod tests {
         assert_eq!(runtime_dir(&env(&[("XDG_RUNTIME_DIR", "relative")])), None);
         assert_eq!(runtime_dir(&env(&[("XDG_RUNTIME_DIR", "/var/tmp/x")])), None);
         assert_eq!(runtime_dir(&env(&[])), None);
-        assert_eq!(runtime_path(&env(&[("XDG_RUNTIME_DIR", "/var/tmp/x")])), Some("/var/tmp/x/marv".into()));
+        assert_eq!(runtime_paths(&env(&[("XDG_RUNTIME_DIR", "/var/tmp/x")])), [PathBuf::from("/var/tmp/x/marv")]);
+        // The default and the override are both hidden.
+        let both = runtime_paths(&env(&[("XDG_RUNTIME_DIR", "/run/user/1"), (RUNTIME_DIR_VAR, "/tmp/o")]));
+        assert_eq!(both, [PathBuf::from("/run/user/1/marv"), PathBuf::from("/tmp/o")]);
     }
 
     #[cfg(target_os = "macos")]
@@ -155,7 +204,8 @@ mod tests {
     fn macos_uses_a_private_tmp_folder_named_for_the_user() {
         let uid = nix::unistd::geteuid().as_raw();
         let want = PathBuf::from(format!("/tmp/marv-{uid}"));
-        assert_eq!(runtime_path(&env(&[("XDG_RUNTIME_DIR", "/run/user/1")])), Some(want.clone()));
+        assert_eq!(runtime_paths(&env(&[("XDG_RUNTIME_DIR", "/run/user/1")])), std::slice::from_ref(&want));
+        assert_eq!(runtime_paths(&env(&[(RUNTIME_DIR_VAR, "/tmp/o")])), [want.clone(), PathBuf::from("/tmp/o")]);
         assert_eq!(runtime_dir(&env(&[])), Some(want));
     }
 
@@ -163,7 +213,10 @@ mod tests {
     fn the_override_is_made_private_and_checked_like_the_default() {
         use std::os::unix::fs::PermissionsExt;
         let dir = short_temp("ov");
+        // Its parent must exist.
         let value = dir.join("marv");
+        assert_eq!(runtime_dir(&env(&[(RUNTIME_DIR_VAR, value.to_str().unwrap())])), None);
+        std::fs::create_dir(&dir).unwrap();
         let got = runtime_dir(&env(&[(RUNTIME_DIR_VAR, value.to_str().unwrap()), ("XDG_RUNTIME_DIR", "/run/user/1")]));
         assert_eq!(got, Some(value.clone()));
         assert_eq!(std::fs::metadata(&value).unwrap().permissions().mode() & 0o777, 0o700);
@@ -175,6 +228,18 @@ mod tests {
         let link = dir.join("link");
         std::os::unix::fs::symlink(&value, &link).unwrap();
         assert_eq!(runtime_dir(&env(&[(RUNTIME_DIR_VAR, link.to_str().unwrap())])), None);
+        // A parent that's a symlink: the folder could be made wherever it leads (here outside /tmp).
+        let out = PathBuf::from(format!("/var/tmp/mx-rt-out-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out);
+        if std::fs::create_dir(&out).is_ok() {
+            std::os::unix::fs::symlink(&out, dir.join("up")).unwrap();
+            assert_eq!(runtime_dir(&env(&[(RUNTIME_DIR_VAR, dir.join("up/marv").to_str().unwrap())])), None);
+            assert!(!out.join("marv").exists());
+            let _ = std::fs::remove_dir_all(&out);
+        }
+        // Not plain.
+        let dotted = format!("{}/../marv", dir.display());
+        assert_eq!(runtime_dir(&env(&[(RUNTIME_DIR_VAR, &dotted)])), None);
         // One a sandboxed command could see (not under /tmp, /run or a hidden home entry): refused, and not made.
         assert_eq!(runtime_dir(&env(&[(RUNTIME_DIR_VAR, "/var/marv-mx-nope")])), None);
         assert!(!Path::new("/var/marv-mx-nope").exists());
