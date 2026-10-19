@@ -237,12 +237,14 @@ fn marvs_runtime_folder_is_empty_in_the_sandbox_even_inside_the_project() {
 }
 
 /// **`MARV_RUNTIME_DIR` is checked like the default runtime folder** (#162): the mesh uses it only when it's absolute,
-/// short enough for the longest socket, hidden in every sandbox, and a real folder of this user's, made 0700. A symlink
-/// (which could lead into a folder a command sees), a visible folder, or a relative path turns the mesh off: never a
-/// fallback, never the folder it named.
+/// short enough for the longest socket, its parent exists and is judged by its real path, it's hidden in every sandbox,
+/// nothing on the way is a symlink or another user's, and it's a real folder of this user's, made 0700. A symlink, a
+/// symlinked parent (either could lead into a folder a command sees), a visible folder, a missing parent or a relative
+/// path turns the mesh off: never a fallback, never the folder it named.
 ///
 /// Proven: reduced the override's checks in `marv_sandbox::runtime_dir` to `is_absolute` (the folder still made) →
-/// this test failed (the symlink was used).
+/// this test failed (the symlink was used); judged the override as given instead of by its parent's real path, and
+/// dropped the ancestor walk in `private_folder` (each alone catches it) → failed (made through the symlinked parent).
 #[test]
 fn the_runtime_folder_override_is_checked_like_the_default() {
     use std::os::unix::fs::PermissionsExt;
@@ -270,6 +272,13 @@ fn the_runtime_folder_override_is_checked_like_the_default() {
     assert_eq!(marv_mesh::discovery::mesh_dir(&env(&link)), None, "a symlink");
     assert_eq!(marv_mesh::discovery::mesh_dir(&env(&visible.path().join("marv"))), None, "a folder sandboxes see");
     assert!(!visible.path().join("marv").exists(), "and not made");
+    // Through a symlinked parent: it looks under /tmp, but it would be made where the link leads, which sandboxes see
+    // (their fresh /tmp hides the link, not its target).
+    std::os::unix::fs::symlink(visible.path(), base.0.join("up")).unwrap();
+    assert_eq!(marv_mesh::discovery::mesh_dir(&env(&base.0.join("up/marv"))), None, "a symlinked parent");
+    assert!(!visible.path().join("marv").exists(), "and not made there");
+    // A parent that doesn't exist yet.
+    assert_eq!(marv_mesh::discovery::mesh_dir(&env(&base.0.join("missing/marv"))), None, "a missing parent");
     assert_eq!(marv_mesh::discovery::mesh_dir(&env(std::path::Path::new("rel/marv"))), None, "relative");
 }
 

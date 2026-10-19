@@ -53,15 +53,15 @@ impl TempDir {
         Self::new_in(&std::env::temp_dir(), tag)
     }
     /// A folder for sockets (a runtime folder, a plug folder, a mesh folder): on macOS a short `/tmp/mx-<pid>-<n>`,
-    /// as macOS's temp folder (`/var/folders/…/T`) leaves too little of `sun_path`'s 104 bytes (#150). Elsewhere the
-    /// same as [`TempDir::new`].
+    /// as macOS's temp folder (`/var/folders/…/T`) leaves too little of `sun_path`'s 104 bytes (#150), kept as
+    /// `/tmp/…` rather than its real `/private/tmp/…` (8 bytes more). Elsewhere the same as [`TempDir::new`].
     pub fn short(tag: &str) -> Self {
         if cfg!(target_os = "macos") {
             static NEXT: AtomicUsize = AtomicUsize::new(0);
             let dir = PathBuf::from(format!("/tmp/mx-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
-            return Self(std::fs::canonicalize(dir).unwrap());
+            return Self(dir);
         }
         Self::new(tag)
     }

@@ -41,9 +41,15 @@ fn temp_base() -> PathBuf {
 }
 
 /// The variable that puts a Marv's runtime folder at `<run>/marv`: `XDG_RUNTIME_DIR=<run>` on Linux,
-/// `MARV_RUNTIME_DIR=<run>/marv` on macOS, which has no `XDG_RUNTIME_DIR`.
+/// `MARV_RUNTIME_DIR=<run>/marv` on macOS, which has no `XDG_RUNTIME_DIR` (as `/tmp/…`, not the real `/private/tmp/…`:
+/// 8 bytes fewer for the sockets).
 fn runtime_var(run: &Path) -> (&'static str, PathBuf) {
-    if cfg!(target_os = "macos") { ("MARV_RUNTIME_DIR", run.join("marv")) } else { ("XDG_RUNTIME_DIR", run.to_path_buf()) }
+    if cfg!(target_os = "macos") {
+        let run = run.strip_prefix("/private").map_or_else(|_| run.to_path_buf(), |r| Path::new("/").join(r));
+        ("MARV_RUNTIME_DIR", run.join("marv"))
+    } else {
+        ("XDG_RUNTIME_DIR", run.to_path_buf())
+    }
 }
 
 /// A throwaway machine: a private runtime dir, a home, and a project and config per Marv.
