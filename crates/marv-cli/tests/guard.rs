@@ -114,16 +114,58 @@ fn nothing_in_the_group_outlives_a_parent_killed_with_sigkill() {
 
 #[test]
 fn a_stop_is_passed_on_once_not_again_for_the_guards_own_copy() {
-    // The command survives SIGTERM and counts how many it got while it runs for 2 s.
-    let script =
-        "n=0; trap 'n=$((n+1))' TERM; echo 0; end=$((SECONDS+2)); while [ $SECONDS -lt $end ]; do sleep 0.1; done; echo $n";
-    let mut child = guard(&["bash", "-c", script]).stdout(Stdio::piped()).stdin(Stdio::null()).spawn().unwrap();
+    // The command survives SIGTERM and counts how many it got until the test creates the marker, 1 s after the stop.
+    let marker = std::env::temp_dir().join(format!("marv-guard-once-{}", std::process::id()));
+    let _ = std::fs::remove_file(&marker);
+    let script = r#"n=0; trap 'n=$((n+1))' TERM; echo 0; while [ ! -e "$1" ]; do sleep 0.1; done; echo $n"#;
+    let marker_arg = marker.to_str().unwrap();
+    let mut child =
+        guard(&["bash", "-c", script, "count", marker_arg]).stdout(Stdio::piped()).stdin(Stdio::null()).spawn().unwrap();
     let mut out = BufReader::new(child.stdout.take().unwrap());
     let mut line = String::new();
     out.read_line(&mut line).unwrap();
     kill(Pid::from_raw(child.id() as i32), Signal::SIGTERM).unwrap();
+    std::thread::sleep(Duration::from_secs(1));
+    std::fs::write(&marker, "").unwrap();
     line.clear();
     out.read_line(&mut line).unwrap();
     assert_eq!(child.wait().unwrap().code(), Some(0));
     assert_eq!(line.trim(), "1", "the command got the stop {} times", line.trim());
+}
+
+#[test]
+fn a_guard_that_cant_have_a_session_of_its_own_runs_nothing() {
+    use std::os::unix::process::CommandExt;
+    // A group leader can't `setsid`: in a group of its own it would still be in the test's session.
+    let out = guard(&["echo", "ran"]).process_group(0).output().unwrap();
+    assert_eq!(out.status.code(), Some(127));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("session"));
+}
+
+#[test]
+fn other_signals_that_would_end_the_guard_are_passed_on_too() {
+    // Not SIGQUIT here: bash starts a background job with SIGINT and SIGQUIT ignored.
+    for signal in [Signal::SIGUSR1, Signal::SIGUSR2, Signal::SIGALRM] {
+        let code = 128 + signal as i32;
+        let mut child =
+            guard(&["bash", "-c", "sleep 600 & echo $!; wait"]).stdout(Stdio::piped()).stdin(Stdio::null()).spawn().unwrap();
+        let sleeper = first_line(&mut child)[0];
+        kill(Pid::from_raw(child.id() as i32), signal).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() > deadline {
+                let _ = nix::sys::signal::killpg(Pid::from_raw(child.id() as i32), Signal::SIGKILL);
+                panic!("the guard didn't exit after {signal}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        // First, so a failure leaves nothing running: `ends` kills a sleeper that outlives its 5 s.
+        assert!(ends(sleeper), "the background sleeper outlived {signal}");
+        // The guard's own code is the command's: it was passed on, not the guard's death.
+        assert_eq!(status.code(), Some(code), "{signal}");
+    }
 }

@@ -6,14 +6,18 @@
 //! - **makes a session** (`setsid`): a new session and process group whose id is the guard's pid. `sandbox-exec`
 //!   execs the guard, so that's also the pid Marv spawned, and Marv's `killpg(pid, SIGKILL)` (a timeout, a stop,
 //!   `kill_running`) takes down the guard, the command and everything still in the group at once. No controlling
-//!   terminal comes with it.
+//!   terminal comes with it. Without a session of its own the command doesn't run (exit 127): a guard spawned as a
+//!   group leader (`process_group(0)`) can't `setsid`, and would otherwise leave the command in Marv's session, with
+//!   Marv's controlling terminal.
 //! - **watches its parent**: every [`POLL`] it checks `getppid()` against the pid it was given. When that changes
 //!   (Marv exited, panicked or was SIGKILLed, and the guard was re-parented to init/launchd), it SIGKILLs its whole
 //!   group, itself included. Polling is portable and needs nothing unsafe; `PR_SET_PDEATHSIG` isn't used because it
 //!   fires when the *thread* that spawned the guard exits, and Marv spawns from Tokio's worker threads, which come
 //!   and go. If the parent is already gone when the guard starts, the command never runs.
-//! - **passes SIGTERM, SIGINT and SIGHUP on to the group** (a process's stop asks before it kills). The guard is in
-//!   the group, so it gets its own copy back: that echo is skipped, once per signal passed on.
+//! - **passes SIGTERM, SIGINT and SIGHUP on to the group** (a process's stop asks before it kills), and every other
+//!   signal whose default would end the guard and leave the command unwatched ([`PASSED_ON`]). They're caught, not
+//!   ignored (an ignored signal stays ignored across exec). The guard is in the group, so it gets its own copy back:
+//!   that echo is skipped, once per signal passed on.
 //! - **exits with the command's code**, 128 + n when signal n ended it (`marv_tools::relay::exit_code`, as bash's
 //!   results report it), 127 when it couldn't start.
 //!
@@ -21,17 +25,37 @@
 //! does that; here the caller does it, `killpg(pid, SIGKILL)` after the guard has been waited for (a process group's
 //! id isn't reused while the group has members). **Known limit** (spec §11, decision 5): a process that leaves the
 //! group itself (`setsid`, `setpgid`) and double-forks is out of the guard's reach and can outlive the command. It
-//! is still inside the sandbox (Seatbelt is inherited and can't be dropped). There's no process-tree sweep.
+//! is still inside the sandbox (Seatbelt is inherited and can't be dropped). There's no process-tree sweep. The same
+//! goes for the guard itself: it shares the command's sandbox and group, so the command can SIGKILL or SIGSTOP it,
+//! and the group then outlives a Marv that crashes or is SIGKILLed (a Marv that exits normally or times the command
+//! out still `killpg`s it).
 
 use std::ffi::OsString;
 use std::process::ExitCode;
 use std::time::Duration;
 
 use nix::sys::signal::{Signal, killpg};
-use nix::unistd::{Pid, getpgrp, getpid, getppid, setsid};
+use nix::unistd::{Pid, getpgrp, getpid, getppid, getsid, setsid};
 
 /// How often the guard checks that its parent is still the one it was given.
 pub const POLL: Duration = Duration::from_millis(200);
+
+/// The signals passed on to the group: the stops, then every other one whose default action ends the process and that
+/// can be caught (SIGKILL and SIGSTOP can't; SIGPIPE is ignored by Rust, and SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP,
+/// SIGABRT and SIGSYS are the guard's own faults).
+pub const PASSED_ON: [Signal; 11] = [
+    Signal::SIGTERM,
+    Signal::SIGINT,
+    Signal::SIGHUP,
+    Signal::SIGQUIT,
+    Signal::SIGUSR1,
+    Signal::SIGUSR2,
+    Signal::SIGALRM,
+    Signal::SIGVTALRM,
+    Signal::SIGPROF,
+    Signal::SIGXCPU,
+    Signal::SIGXFSZ,
+];
 
 /// `marv __guard <parent> -- <command…>`: runs the command in a session of its own, and exits with its code.
 pub fn main(parent: u32, command: &[OsString]) -> ExitCode {
@@ -48,8 +72,9 @@ fn run(parent: u32, command: &[OsString]) -> i32 {
         eprintln!("marv __guard: {parent} isn't a parent to watch");
         return 127;
     };
-    // Already a group leader (`setsid` refuses then): the group is already ours alone, as long as it's our own pid.
-    if setsid().is_err() && getpgrp() != getpid() {
+    // `setsid` refuses a group leader: then only a session the guard already leads will do. A group of its own in
+    // Marv's session would keep Marv's controlling terminal, so the command doesn't run.
+    if setsid().is_err() && getsid(None).ok() != Some(getpid()) {
         eprintln!("marv __guard: couldn't start a session of its own");
         return 127;
     }
@@ -72,9 +97,12 @@ async fn supervise(parent: Pid, program: &OsString, args: &[OsString]) -> i32 {
     use tokio::signal::unix::{SignalKind, signal};
     // Before the spawn, so a stop that comes right after it isn't lost. The child gets the default dispositions back
     // (exec resets caught signals) and an empty signal mask (std resets it).
-    let mut terminate = signal(SignalKind::terminate()).ok();
-    let mut interrupt = signal(SignalKind::interrupt()).ok();
-    let mut hangup = signal(SignalKind::hangup()).ok();
+    let (arrived, mut signals) = tokio::sync::mpsc::unbounded_channel();
+    for passed in PASSED_ON {
+        let Ok(mut stream) = signal(SignalKind::from_raw(passed as i32)) else { continue };
+        let arrived = arrived.clone();
+        tokio::spawn(async move { while stream.recv().await.is_some() && arrived.send(passed).is_ok() {} });
+    }
     let mut child = match tokio::process::Command::new(program).args(args).spawn() {
         Ok(child) => child,
         Err(e) => {
@@ -100,18 +128,8 @@ async fn supervise(parent: Pid, program: &OsString, args: &[OsString]) -> i32 {
                     return 137;
                 }
             }
-            Some(()) = recv(&mut terminate) => echoes.pass_on(group, Signal::SIGTERM),
-            Some(()) = recv(&mut interrupt) => echoes.pass_on(group, Signal::SIGINT),
-            Some(()) = recv(&mut hangup) => echoes.pass_on(group, Signal::SIGHUP),
+            Some(signal) = signals.recv() => echoes.pass_on(group, signal),
         }
-    }
-}
-
-/// The next delivery of a signal the guard listens for (never, when it couldn't listen).
-async fn recv(stream: &mut Option<tokio::signal::unix::Signal>) -> Option<()> {
-    match stream {
-        Some(stream) => stream.recv().await,
-        None => std::future::pending().await,
     }
 }
 
