@@ -139,7 +139,9 @@ const DNS_SOCKET: &str = "/private/var/run/mDNSResponder";
 /// bwrap stops this with `EXDEV` (a link can't cross a mount); here each denied path is also denied as a link source.
 /// The name is right, and `link()` is checked against **both** paths, the source and the new name: a rule naming
 /// either refuses it (#166 probe on macOS 14: with `(deny file-link (subpath A))`, A→B, B→A and A→A are refused, B→B
-/// isn't; with `(deny file-link)` then `(allow file-link (subpath A))` only A→A works).
+/// isn't; with `(deny file-link)` then `(allow file-link (subpath A))` only A→A works). And it's refused whenever the
+/// source is denied for reading or writing its data, whatever the `file-link` rules say (#166 review probe), so the link
+/// denies below are a second layer for everything denied for reads or writes.
 const HARD_LINK_OP: &str = "file-link";
 
 /// Whether hard links are allowed in the project and the private `TMPDIR` (rustc's incremental cache, `ln`). On since
