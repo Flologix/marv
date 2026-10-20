@@ -166,8 +166,13 @@ impl RadioPanel {
         let mut spans = vec![
             Span::styled(format!("  {:>4} ", age(t.at_ms, now_ms)), Style::new().fg(theme::DIM)),
             Span::styled(format!("{}  ", printable(&who)), Style::new().add_modifier(Modifier::BOLD)),
-            Span::raw(text),
         ];
+        // #124, phase 3: a request and its replies say which (`request r17`, `ack r17`, `done r17`).
+        if t.kind != "msg" && !t.kind.is_empty() {
+            let request = t.request.as_deref().map(|r| format!(" {r}")).unwrap_or_default();
+            spans.push(Span::styled(printable(&format!("{}{request}  ", t.kind)), Style::new().fg(theme::ACCENT)));
+        }
+        spans.push(Span::raw(text));
         if let Some(why) = &t.refused {
             spans.push(Span::styled(format!("  (refused: {})", printable(why)), Style::new().fg(theme::WARNING)));
         }
@@ -220,7 +225,7 @@ impl RadioPanel {
         }
         lines.push(Line::default());
         lines.push(Line::styled(
-            "/tx @name text · /tx text (all) · /radio off to leave · Esc to close",
+            "/tx @name text · /tx text (all) · /ask @name text · /radio off · Esc to close",
             Style::new().fg(theme::DIM),
         ));
         lines
@@ -296,7 +301,7 @@ mod tests {
         assert!(screen.contains("on · 2 Marvs"), "{screen}");
         assert!(screen.contains("flologix-c792  you"), "{screen}");
         assert!(screen.contains("flologix-58a7  w3_y-p1  working    \"fix the login test\"  12m"), "{screen}");
-        assert!(screen.contains("/radio off to leave · Esc to close"), "{screen}");
+        assert!(screen.contains("/ask @name text · /radio off · Esc to close"), "{screen}");
         assert!(screen.contains("Nothing said yet."), "{screen}");
     }
 
@@ -307,6 +312,8 @@ mod tests {
             outgoing,
             peers: peers.iter().map(|p| p.to_string()).collect(),
             by: by.into(),
+            kind: "msg".into(),
+            request: None,
             text: text.into(),
             refused: None,
         }
@@ -332,6 +339,24 @@ mod tests {
         assert!(screen.contains("← docs-11c2 (user)  old 29") && !screen.contains("old 0 "), "{screen}");
         assert!(screen.contains("Esc to close"), "the help line still fits: {screen}");
         assert!(!screen.contains('\u{1b}'));
+    }
+
+    /// #124, phase 3: a request and its replies show which, with the request's short id.
+    #[test]
+    fn requests_and_replies_show_their_kind_and_short_id() {
+        let mut v = view(vec![peer("flologix-58a7", RadioState::Idle, "")]);
+        let mut request = said("flologix-c792:17", true, &["flologix-58a7"], "model", "start hack.py", 0);
+        (request.kind, request.request) = ("request".into(), Some("r17".into()));
+        let mut ack = said("flologix-58a7:3", false, &["flologix-58a7"], "marv", "on it", 0);
+        (ack.kind, ack.request) = ("ack".into(), Some("r17".into()));
+        v.traffic = vec![request, ack];
+        let area = Rect::new(0, 0, 100, 12);
+        let mut buf = Buffer::empty(area);
+        RadioPanel::render(&v, 1_000, area, &mut buf);
+        let screen: String =
+            (0..area.height).map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect::<String>() + "\n").collect();
+        assert!(screen.contains("→ @58a7  request r17  start hack.py"), "{screen}");
+        assert!(screen.contains("← 58a7  ack r17  on it"), "{screen}");
     }
 
     #[test]

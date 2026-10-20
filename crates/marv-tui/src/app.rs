@@ -2851,6 +2851,8 @@ mod tests {
             outgoing: false,
             peers: vec!["proj-58a7".into()],
             by: "model".into(),
+            kind: "msg".into(),
+            request: None,
             text: "tests pass on main now".into(),
             refused: None,
         };

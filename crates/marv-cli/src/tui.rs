@@ -387,6 +387,8 @@ pub fn map_event(
             notice.map(|text| system(text, false)).into_iter().collect()
         }
         SessionEvent::Tainted { source } => vec![system(tainted_text(source), false)],
+        // #124: Marv's line about a radio report it sent (checked names and fixed words; printable anyway).
+        SessionEvent::RadioNote { text } => vec![system(printable(&format!("✻ {text}")), false)],
         SessionEvent::CheckpointFailed { message } => {
             vec![system(format!("This turn can't be undone: its checkpoint failed ({message})."), true)]
         }
@@ -1716,6 +1718,7 @@ impl Bridge {
             }
             CommandAction::Radio { on } => self.turn_radio(on).await,
             CommandAction::Tx { to, text } => self.tx(to, &text),
+            CommandAction::Ask { to, text } => self.ask(&to, &text),
             CommandAction::RadioView => match self.radio() {
                 Some(radio) if radio.is_on() => self.emit(UiEvent::OpenRadio),
                 Some(_) => self.emit(system(commands::RADIO_OFF, false)),
@@ -1919,10 +1922,17 @@ impl Bridge {
         self.activity.report();
         let (me, stop) = (Arc::downgrade(self), self.mesh_watch.clone());
         let mut changes = radio.subscribe();
+        let watched = radio.clone();
         tokio::spawn(async move {
+            // Reports already in the traffic list when the TUI started aren't new.
+            let mut shown = std::collections::HashSet::new();
+            for t in watched.traffic_list() {
+                shown.insert(format!("{}>{}", t.id, t.reply_to.unwrap_or_default()));
+            }
             loop {
                 if let Some(bridge) = me.upgrade() {
                     bridge.emit(UiEvent::Radio(bridge.radio_view()));
+                    bridge.show_reports(&watched, &mut shown);
                 }
                 tokio::select! {
                     _ = stop.cancelled() => return,
@@ -1960,14 +1970,21 @@ impl Bridge {
         let traffic = radio
             .traffic_list()
             .into_iter()
-            .map(|t| view::RadioTraffic {
-                at_ms: t.at_ms,
-                id: t.id,
-                outgoing: t.outgoing,
-                peers: t.peers,
-                by: t.by.as_str().to_string(),
-                text: t.text,
-                refused: t.refused,
+            .map(|t| {
+                let request = if t.kind == marv_mesh::radio::Kind::Request { Some(t.id.as_str()) } else { t.reply_to.as_deref() }
+                    .and_then(|id| id.rsplit_once(':'))
+                    .map(|(_, seq)| format!("r{seq}"));
+                view::RadioTraffic {
+                    at_ms: t.at_ms,
+                    id: t.id,
+                    outgoing: t.outgoing,
+                    peers: t.peers,
+                    by: t.by.as_str().to_string(),
+                    kind: t.kind.as_str().to_string(),
+                    request,
+                    text: t.text,
+                    refused: t.refused,
+                }
             })
             .collect();
         view::RadioView { on: true, me: radio.name.clone(), my_title: radio.presence().title, peers, traffic }
@@ -1998,6 +2015,44 @@ impl Bridge {
                     self.emit(system(printable(&format!("Radio: not sent to {peer}: {why}.")), true));
                 }
             }
+        }
+    }
+
+    /// `/ask @name text`: the person's request on the radio (#124, phase 3; `by: user`, hop 0): one Marv, which
+    /// acknowledges and reports back. One line in Marv's voice here; nothing of it reaches this Marv's own model (the
+    /// ack and the report do, fenced, at its next turn).
+    fn ask(&self, to: &str, text: &str) {
+        let Some(radio) = self.radio().filter(|r| r.is_on()) else {
+            return self.emit(system(commands::RADIO_OFF, false));
+        };
+        match radio.send_request(to, marv_mesh::radio::By::User, 0, text) {
+            Err(err) => self.emit(system(format!("Radio: not sent: {}", printable(&err)), true)),
+            Ok(id) => {
+                let view = self.radio_view();
+                let peer = radio.resolve(to).unwrap_or_else(|_| to.to_string());
+                let short = marv_tui::ui::radio_view::short_name(&view, &peer);
+                let seq = id.rsplit_once(':').map(|(_, seq)| seq).unwrap_or_default();
+                self.emit(system(printable(&format!("✻ Radio → @{short} request r{seq}: {text}")), false));
+            }
+        }
+    }
+
+    /// A report on one of this Marv's requests came in (#124): a line in the transcript for the person, in Marv's
+    /// voice with the report's text (printable). The model reads it fenced at its next turn, as any radio traffic.
+    fn show_reports(&self, radio: &Radio, shown: &mut std::collections::HashSet<String>) {
+        for t in radio.traffic_list() {
+            let report = matches!(t.kind, marv_mesh::radio::Kind::Done | marv_mesh::radio::Kind::Failed);
+            if t.outgoing
+                || !report
+                || t.refused.is_some()
+                || !shown.insert(format!("{}>{}", t.id, t.reply_to.clone().unwrap_or_default()))
+            {
+                continue;
+            }
+            let from = t.peers.first().cloned().unwrap_or_default();
+            let short =
+                t.reply_to.as_deref().and_then(|r| r.rsplit_once(':')).map(|(_, seq)| format!(" r{seq}")).unwrap_or_default();
+            self.emit(system(printable(&format!("✻ Radio ← {from} {}{short}: {}", t.kind.as_str(), t.text)), false));
         }
     }
 
@@ -3190,16 +3245,8 @@ mod tests {
 
         /// #124: a radio message straight into the radio queue, as a link delivers one.
         fn radio_message(mesh: &Mesh, seq: u64, to_all: bool, text: &str) {
-            let message = marv_mesh::radio::RadioMessage {
-                id: format!("beta:{seq}"),
-                from: "beta".into(),
-                to_all,
-                by: marv_mesh::radio::By::User,
-                reply_to: None,
-                hop: 0,
-                text: text.into(),
-                at_ms: 0,
-            };
+            let message =
+                marv_mesh::radio::RadioMessage::msg(&format!("beta:{seq}"), "beta", to_all, marv_mesh::radio::By::User, 0, text);
             assert!(mesh.sb.deliver_radio(message, 50));
         }
 

@@ -638,6 +638,10 @@ pub struct RadioTraffic {
     pub peers: Vec<String>,
     /// `user`, `model` or `marv`: shown, never believed.
     pub by: String,
+    /// `msg`, `request`, `ack`, `done` or `failed` (#124, phase 3): fixed words.
+    pub kind: String,
+    /// The request it is or answers, short (`r17`); none for a `msg`.
+    pub request: Option<String>,
     pub text: String,
     /// Refused, and why (Marv's words).
     pub refused: Option<String>,

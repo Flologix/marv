@@ -660,16 +660,7 @@ impl marv_provider::Provider for Watched {
 
 /// A message straight into `marv`'s radio queue, as a link delivers one (for the tests that need it mid-request).
 fn land(marv: &Marv, from: &str, seq: u64, to_all: bool, hop: u32, text: &str) {
-    let message = marv_mesh::radio::RadioMessage {
-        id: format!("{from}:{seq}"),
-        from: from.into(),
-        to_all,
-        by: By::Model,
-        reply_to: None,
-        hop,
-        text: text.into(),
-        at_ms: 0,
-    };
+    let message = marv_mesh::radio::RadioMessage::msg(&format!("{from}:{seq}"), from, to_all, By::Model, hop, text);
     assert!(marv.sb.deliver_radio(message, 50));
 }
 
@@ -960,16 +951,7 @@ async fn subagents_have_no_radio() {
     *model.hook.lock().unwrap() = Some((
         1,
         Box::new(move || {
-            let message = marv_mesh::radio::RadioMessage {
-                id: "beta:99".into(),
-                from: "beta".into(),
-                to_all: false,
-                by: By::Model,
-                reply_to: None,
-                hop: 0,
-                text: "for the main agent".into(),
-                at_ms: 0,
-            };
+            let message = marv_mesh::radio::RadioMessage::msg("beta:99", "beta", false, By::Model, 0, "for the main agent");
             assert!(landing.deliver_radio(message, 50));
         }),
     ));
@@ -1113,16 +1095,7 @@ async fn history_stays_append_only_when_radio_notes_arrive() {
     *model.hook.lock().unwrap() = Some((
         1,
         Box::new(move || {
-            let message = marv_mesh::radio::RadioMessage {
-                id: "beta:50".into(),
-                from: "beta".into(),
-                to_all: true,
-                by: By::Model,
-                reply_to: None,
-                hop: 0,
-                text: "mid-turn news".into(),
-                at_ms: 0,
-            };
+            let message = marv_mesh::radio::RadioMessage::msg("beta:50", "beta", true, By::Model, 0, "mid-turn news");
             assert!(landing.deliver_radio(message, 50));
         }),
     ));
