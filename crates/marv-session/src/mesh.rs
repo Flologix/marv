@@ -1,7 +1,7 @@
 //! The session's side of the mesh (new in marv-rs; `docs/MESH.md`, `docs/subsystems/mesh.md` v1).
 //!
-//! - The session (one per process: the TUI's, or `marv -p`'s) owns the [`MeshHandle`]: one `Switchboard`, on the
-//!   host, outside every sandbox ([`start`] makes one and serves it). Its trajectory sink is
+//! - The session (the TUI's, `marv -p`'s, or each of Marv desktop's chats) owns the [`MeshHandle`]: one
+//!   `Switchboard`, on the host, outside every sandbox ([`start`] makes one and serves it). Its trajectory sink is
 //!   [`crate::trajectory::MeshSink`] on the conversation's current log ([`log_to`]; rule 3: every message logged).
 //! - The main agent's plug is [`PARENT`]. Each subagent gets a plug of its own ([`SubagentPlug`], `worker-N`) with
 //!   no wires, mounted in its sandbox at `/run/marv/mesh.sock`, and unplugged when it ends (its wires and unread
@@ -61,17 +61,42 @@ pub fn parent_id() -> PlugId {
     PlugId::new(PARENT).expect("a valid plug id")
 }
 
-/// A switchboard for session `session`, its plug sockets in `$XDG_RUNTIME_DIR/marv/plugs/<session>` (0700), served
-/// until `cancel`. `None` without a runtime dir: plugs never fall back to a world-readable `/tmp`. Nor with a runtime
-/// dir every sandbox doesn't hide: a worker that could see `parent.sock` could connect to it and use the parent's
-/// wires (`marv_sandbox::hidden_in_sandbox`).
+/// A switchboard for session `session`, its plug sockets in its own `<runtime>/p/<pid>-<hex>` (0700), served until
+/// `cancel`. `None` without a runtime folder (`marv_sandbox::runtime_dir`): plugs never fall back to a world-readable
+/// `/tmp`, nor to a folder every sandbox doesn't hide: a worker that could see `parent.sock` could connect to it and
+/// use the parent's wires. The folder isn't named after the session: a session name of up to 43 bytes and a plug id of
+/// up to 48 overflowed `sun_path` (#150).
 pub fn start(session: &str, env: &marv_mcp::Env, cancel: CancellationToken) -> Option<MeshHandle> {
-    let home = env.get("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"));
-    let base = env.get("XDG_RUNTIME_DIR").filter(|d| marv_sandbox::hidden_in_sandbox(std::path::Path::new(d), &home))?;
-    let dir = PathBuf::from(base).join("marv").join("plugs").join(session);
-    let mesh = Arc::new(Switchboard::new(session, dir, Arc::new(marv_mesh::switchboard::NoTrajectory)));
+    let dir = plug_folder(&marv_sandbox::runtime_dir(env)?).ok()?;
+    let mesh = Arc::new(Switchboard::new(session, dir, Arc::new(marv_mesh::switchboard::NoTrajectory)).owning_folder());
     tokio::spawn(Arc::clone(&mesh).serve(cancel));
     Some(mesh)
+}
+
+/// A new plug folder of this switchboard's own: `<runtime>/p/<pid>-<4 hex>`, made exclusively (0700). A process can
+/// run several switchboards (Marv desktop's chats): sharing a folder, a second `parent` plug would replace the first's
+/// socket. And a folder a dead process with the same pid left is never taken over.
+fn plug_folder(runtime: &std::path::Path) -> std::io::Result<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let parent = runtime.join("p");
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&parent)?;
+    let meta = std::fs::symlink_metadata(&parent)?;
+    if !meta.is_dir() || meta.uid() != nix::unistd::geteuid().as_raw() {
+        return Err(std::io::Error::other(format!("{} isn't a folder of this user's", parent.display())));
+    }
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
+    for _ in 0..64 {
+        let n = (NEXT.fetch_add(1, Ordering::Relaxed).wrapping_add(nanos)) & 0xffff;
+        let dir = parent.join(format!("{}-{n:04x}", std::process::id()));
+        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other(format!("no free plug folder in {}", parent.display())))
 }
 
 /// Logs the switchboard's records to this conversation's trajectory from now on.
@@ -687,6 +712,36 @@ mod tests {
 
     fn tool(name: &str, plug: &Plug, mesh: &MeshHandle, approver: Option<Arc<dyn WireApprover>>) -> MeshTool {
         MeshTool::all(plug, mesh, approver).into_iter().find(|t| t.name == name).unwrap()
+    }
+
+    /// Two switchboards in one process (Marv desktop's chats) get plug folders of their own: the second `parent` never
+    /// replaces the first's socket.
+    #[tokio::test]
+    async fn two_switchboards_in_one_process_keep_their_own_plugs() {
+        let base = PathBuf::from(format!("/tmp/mx-ms2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir(&base).unwrap();
+        let _cleanup = Runtime(base.clone());
+        let env: marv_mcp::Env =
+            [("MARV_RUNTIME_DIR".to_string(), base.join("marv").display().to_string())].into_iter().collect();
+        let cancel = CancellationToken::new();
+        let (a, b) = (start("a", &env, cancel.clone()).unwrap(), start("b", &env, cancel.clone()).unwrap());
+        let (pa, pb) = (a.plug(parent_id()).unwrap(), b.plug(parent_id()).unwrap());
+        assert_ne!(pa.host_socket.parent(), pb.host_socket.parent());
+        assert!(pa.host_socket.starts_with(base.join("marv/p")), "{}", pa.host_socket.display());
+        for socket in [&pa.host_socket, &pb.host_socket] {
+            assert!(std::os::unix::net::UnixStream::connect(socket).is_ok(), "{} isn't listening", socket.display());
+        }
+        // Dropped (once `serve` lets go), each removes its own plug folder: empty folders don't pile up.
+        let folders = [pa.host_socket.parent().unwrap().to_path_buf(), pb.host_socket.parent().unwrap().to_path_buf()];
+        cancel.cancel();
+        drop((a, b));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while folders.iter().any(|f| f.exists()) {
+            assert!(std::time::Instant::now() < deadline, "plug folders left: {folders:?}");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(base.join("marv/p").exists(), "only its own folder goes");
     }
 
     #[tokio::test]

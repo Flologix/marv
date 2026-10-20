@@ -463,7 +463,7 @@ pub async fn run_headless(options: HeadlessOptions) -> ExitCode {
         &config.writable,
         &home,
         &root,
-        std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from).as_deref(),
+        &marv_sandbox::runtime_paths(&marv_sandbox::runtime_env()),
         Some(&config_dir),
     );
     for problem in &writable_problems {
@@ -519,7 +519,10 @@ pub async fn run_headless(options: HeadlessOptions) -> ExitCode {
                 mesh = Some(started);
             }
             Ok(None) => {
-                eprintln!("marv: the mesh needs XDG_RUNTIME_DIR under /run, /tmp or your home folder; running without it.")
+                eprintln!("marv: the mesh needs {}; running without it.", marv_sandbox::RUNTIME_DIR_RULE);
+                if let Some(why) = marv_sandbox::override_refusal(&env) {
+                    eprintln!("marv: {}", printable(&why));
+                }
             }
             Err(e) => eprintln!("marv: the mesh: {}", printable(&e)),
         }

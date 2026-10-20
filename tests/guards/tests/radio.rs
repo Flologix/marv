@@ -86,7 +86,7 @@ impl Drop for Marv {
 }
 
 fn marv(name: &str, mesh: &Path, root: &str, timings: RadioTimings) -> Marv {
-    let plugs = TempDir::new("radio-plugs");
+    let plugs = TempDir::short("radio-plugs");
     let mut marv = marv_with_plugs(name, mesh, root, timings, plugs.path());
     marv._plugs = Some(plugs);
     marv
@@ -112,7 +112,7 @@ fn marv_limited(name: &str, mesh: &Path, root: &str, timings: RadioTimings, plug
 
 /// The private mesh folder (0700), as `discovery::open_door` makes it.
 fn mesh_folder() -> TempDir {
-    let mesh = TempDir::new("radio");
+    let mesh = TempDir::short("radio");
     std::fs::set_permissions(mesh.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     mesh
 }
@@ -248,7 +248,7 @@ async fn a_marv_with_the_radio_off_refuses_joins_and_sends_no_presence() {
     assert!(alpha.radio.roster().is_empty() && alpha.radio.links().is_empty());
     assert!(alpha.log.0.lock().unwrap().is_empty(), "alpha linked nothing");
     // A Marv with no radio at all (marv -p) refuses the same way.
-    let headless = Arc::new(Switchboard::new("gamma", TempDir::new("radio-p").path().to_path_buf(), Arc::new(Log::default())));
+    let headless = Arc::new(Switchboard::new("gamma", TempDir::short("radio-p").path().to_path_buf(), Arc::new(Log::default())));
     let _door = open_door(headless, mesh.path(), DoorInfo { cwd: "/".into(), pane: None }, Arc::new(NoOne)).unwrap();
     assert_eq!(beta.radio.clone().join("gamma".into()).await.unwrap_err(), "gamma's radio is off");
 }
@@ -999,7 +999,7 @@ async fn subagents_have_no_radio() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn marv_p_is_never_on_the_radio() {
     use marv_oracle::script::{Reply, ScriptCall};
-    let xdg = TempDir::new("radio-p-xdg");
+    let xdg = TempDir::short("radio-p-xdg");
     let folder = xdg.path().join("marv/mesh");
     std::fs::create_dir_all(&folder).unwrap();
     std::fs::set_permissions(xdg.path().join("marv"), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1018,6 +1018,7 @@ async fn marv_p_is_never_on_the_radio() {
     std::fs::create_dir_all(&home).unwrap();
     let bin = marv_oracle::binary();
     assert!(bin.exists(), "no marv binary at {} (cargo build -p marv-cli, or set MARV_ORACLE_BIN)", bin.display());
+    let (runtime_var, runtime_dir) = marv_guards::runtime_var(xdg.path());
     let out = tokio::task::spawn_blocking(move || {
         std::process::Command::new(bin)
             .args(["-p", "say hi to alpha on the radio", "--output", "json"])
@@ -1026,7 +1027,7 @@ async fn marv_p_is_never_on_the_radio() {
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", &home)
             .env("MARV_CONFIG_DIR", config.path())
-            .env("XDG_RUNTIME_DIR", xdg.path())
+            .env(runtime_var, runtime_dir)
             .env("MARV_MESH_NAME", "headless")
             .env("MARV_GITHUB", "off")
             .env("NO_COLOR", "1")
@@ -1279,7 +1280,7 @@ async fn radio_wakes_are_limited_per_sender_and_overall() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_slow_peer_never_stalls_the_sender() {
     let mesh = mesh_folder();
-    let plugs = TempDir::new("radio-slow-plugs");
+    let plugs = TempDir::short("radio-slow-plugs");
     let limits = RadioLimits { per_minute: 100_000, burst: 100_000, send_queue: 8, ..RadioLimits::default() };
     let alpha = marv_limited("alpha", mesh.path(), "/work/alpha", fast(), plugs.path(), limits);
     let beta = marv("beta", mesh.path(), "/work/beta", fast());
@@ -1525,7 +1526,7 @@ async fn a_radio_chain_carries_its_hop_and_stops_waking_at_two() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_peer_whose_queue_stays_full_is_dropped() {
     let mesh = mesh_folder();
-    let plugs = TempDir::new("radio-full-plugs");
+    let plugs = TempDir::short("radio-full-plugs");
     let limits = RadioLimits { per_minute: 1_000_000, burst: 1_000_000, send_queue: 128, ..RadioLimits::default() };
     let timings = RadioTimings { write_timeout: Duration::from_secs(3), ..fast() };
     let alpha = marv_limited("alpha", mesh.path(), "/work/alpha", timings, plugs.path(), limits);
