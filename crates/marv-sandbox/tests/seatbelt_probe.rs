@@ -119,7 +119,8 @@ impl Fx {
                 .env("XDG_CACHE_HOME", self.tmp.join("cache"))
                 .env("GOCACHE", self.tmp.join("go-cache"))
                 .env("GOPATH", self.tmp.join("go"))
-                .env("npm_config_cache", self.tmp.join("npm-cache")),
+                .env("npm_config_cache", self.tmp.join("npm-cache"))
+                .env("npm_config_store_dir", self.tmp.join("pnpm-store")),
         )
     }
 }

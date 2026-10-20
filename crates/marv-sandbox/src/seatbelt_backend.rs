@@ -117,8 +117,14 @@ pub fn argv(profile: &Profile, file: Option<&Path>, exe: &Path, parent: u32, inn
 /// The caches a command's tools would keep under the home, which Seatbelt can't make writable (bwrap's stand-in home
 /// was): each in the command's own `TMPDIR`, gone with it. Not shared across commands, for the reason bun's isn't
 /// (`Plan::env`): one command must not plant packages for another.
-pub const CACHE_VARS: &[(&str, &str)] =
-    &[("XDG_CACHE_HOME", "cache"), ("GOCACHE", "go-cache"), ("PIP_CACHE_DIR", "pip-cache"), ("npm_config_cache", "npm-cache")];
+pub const CACHE_VARS: &[(&str, &str)] = &[
+    ("XDG_CACHE_HOME", "cache"),
+    ("GOCACHE", "go-cache"),
+    ("PIP_CACHE_DIR", "pip-cache"),
+    ("npm_config_cache", "npm-cache"),
+    // pnpm's store, `~/Library/pnpm/store` by default (#166 probe).
+    ("npm_config_store_dir", "pnpm-store"),
+];
 
 /// The Seatbelt backend: see the module doc.
 #[derive(Debug)]

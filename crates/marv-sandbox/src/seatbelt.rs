@@ -419,8 +419,34 @@ fn build_profile(plan: &Plan, run: &Invocation, fs: &dyn FsProbe, allow_links: b
         b.paths(read, &["subpath"], &format!("WRITABLE_{i}"), &canon(&extra.real), None);
     }
     b.paths(read, &["subpath"], "TMP", &tmp, None);
-    if let Some(exe) = &run.exe {
-        b.paths(read, &["literal"], "EXE", &canon(exe), None);
+    let exe = run.exe.as_ref().map(|e| canon(e));
+    if let Some(exe) = &exe {
+        b.paths(read, &["literal"], "EXE", exe, None);
+    }
+    // The folders above each of those, by their own entry's metadata only (`stat`, not a listing): tools walk up a
+    // path with `lstat` (npm's `mkdir -p` of its cache in the TMPDIR stops at the user's temporary folder with EPERM,
+    // #166 probe), as `cd ~` needs the home's. Section 5 closes again what it must.
+    let mut shown: Vec<PathBuf> = vec![tmp.clone()];
+    if !home_project {
+        shown.push(root.clone());
+    }
+    shown.extend(toolchains.iter().map(|d| canon(d)));
+    shown.extend(ro_extras.iter().chain(&rw_extras).map(|e| canon(&e.real)));
+    shown.extend(exe.iter().cloned());
+    let mut parents: Vec<PathBuf> = Vec::new();
+    for path in &shown {
+        // Only where section 3 closed them: elsewhere reads are open already.
+        let closed = |d: &Path| d.starts_with(&home) || d.starts_with(&user_temp) || d.starts_with(SHARED_TMP);
+        for dir in path.ancestors().skip(1).filter(|d| closed(d)) {
+            if !parents.iter().any(|p| p == dir) {
+                parents.push(dir.to_path_buf());
+            }
+        }
+    }
+    let filters: Vec<String> =
+        parents.iter().enumerate().map(|(i, dir)| format!("(literal {})", b.param(format!("PARENT_{i}"), dir))).collect();
+    if !filters.is_empty() {
+        b.line(&format!("(allow file-read-metadata {})", filters.join(" ")));
     }
 
     // 5. Reads, closed again.
@@ -908,8 +934,11 @@ mod tests {
             let text = value.to_string_lossy();
             assert!(!text.starts_with("/tmp") && !text.starts_with("/var/"), "{key}={text}");
             assert!(!text.starts_with("/Users/me/code"), "{key}={text}");
-            // Only the regexes carry a path, escaped.
-            assert!(!p.text.lines().filter(|l| !l.contains("#\"")).any(|l| l.contains(&*text)), "{key}'s value is in the text");
+            // Only the regexes carry a path, escaped (`/private/tmp`, a parent of an extra in it, is also a constant).
+            assert!(
+                text == SHARED_TMP || !p.text.lines().filter(|l| !l.contains("#\"")).any(|l| l.contains(&*text)),
+                "{key}'s value is in the text"
+            );
         }
         assert_eq!(p.param("PROJECT"), Some(Path::new("/Volumes/work/code/proj")));
         assert_eq!(p.param("PLUG"), Some(Path::new("/private/tmp/marv-501/p/1/a.sock")));
@@ -1116,6 +1145,31 @@ mod tests {
         assert_eq!(t.matches("unix-socket").count(), 3);
         assert!(at(&t, "(allow network-outbound (remote ip))") > at(&t, "; 8."));
         assert!(at(&t, "(allow network-outbound (remote ip))") < at(&t, "(xpc-service-name-prefix"));
+    }
+
+    /// The folders above what's shown again have their own metadata readable, nothing more, and before section 5.
+    #[test]
+    fn the_folders_above_whats_shown_can_be_stat_ed_only() {
+        let fs = mac_fs(|_| false);
+        let p = build(&Plan { root: "/Users/me/code/proj".into(), ..base() }, &fs);
+        let parents: Vec<&Path> = p.params.iter().filter(|(k, _)| k.starts_with("PARENT_")).map(|(_, v)| v.as_path()).collect();
+        // Above the TMPDIR, the project, the toolchains and Marv's binary (in ~/.local/bin), where section 3 closed them.
+        for dir in [
+            "/private/var/folders/ab/xyz/T",
+            "/private/var/folders/ab/xyz",
+            "/Users/me/code",
+            "/Users/me",
+            "/Users/me/.local/bin",
+            "/Users/me/.local",
+        ] {
+            assert!(parents.contains(&Path::new(dir)), "{dir}: {parents:?}");
+        }
+        for open in ["/", "/Users", "/private", "/private/var/folders"] {
+            assert!(!parents.contains(&Path::new(open)), "{open}: readable already");
+        }
+        let line = p.text.lines().find(|l| l.contains("(param \"PARENT_0\")")).unwrap();
+        assert!(line.starts_with("(allow file-read-metadata (literal") && !line.contains("subpath"), "{line}");
+        assert!(at(&p.text, line) > at(&p.text, "; 4.") && at(&p.text, line) < at(&p.text, "; 5."));
     }
 
     /// Every runtime folder's sockets are denied by name, after the TMPDIR's allow and before the plug's.
@@ -1446,8 +1500,10 @@ mod tests {
                             }
                             for other in keys_in(later) {
                                 // Intended: skills shown again inside the config; the private TMPDIR inside the user's.
+                                // And the folders above what's shown, by their own metadata only.
                                 if (key == "CONFIG" && other == "SKILLS" && op == "file-read")
                                     || (key == "USER_TEMP" && other == "TMP")
+                                    || (other.starts_with("PARENT_") && later.starts_with("(allow file-read-metadata (literal"))
                                 {
                                     continue;
                                 }

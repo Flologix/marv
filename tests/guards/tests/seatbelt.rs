@@ -348,6 +348,7 @@ async fn the_command_gets_only_the_plans_environment() {
         "GOCACHE",
         "PIP_CACHE_DIR",
         "npm_config_cache",
+        "npm_config_store_dir",
         "PWD",
         "SHLVL",
         "_",
