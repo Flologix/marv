@@ -2776,6 +2776,7 @@ name = "marv-sandbox"
 version = "0.7.0"
 dependencies = [
  "marv-core",
+ "nix 0.31.3",
  "regex",
  "serde",
  "serde_json",

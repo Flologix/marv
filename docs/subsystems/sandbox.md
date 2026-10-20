@@ -1,6 +1,7 @@
 # marv-sandbox
 
 What commands can touch and which paths an agent may reach. It covers:
+- the sandbox's plan and backends (bubblewrap today; Seatbelt on macOS next, `docs/specs/2026-10-17-macos-sandbox.md`);
 - the bubblewrap argument builder;
 - the stand-in home and its credential masks;
 - the `.git` guard;
@@ -16,7 +17,10 @@ Spec: the **Sandbox** and **Yolo mode** bullets in Marv's `CLAUDE.md`, `src/sand
 
 | Marv (TS) | Rust module | Status |
 |---|---|---|
-| `src/sandbox.ts` (`sandboxArgs`, `runMounts`, `resolveExtra`, `sandboxAvailable`) | `bwrap.rs` | **Ported and tested.** Adds protected-path read-only binds and the mesh plug at `/run/marv/mesh.sock`. The file system is injectable (`FsProbe`). #24: `binds` (Marv's Sprint 4 `binds`: a mount at a path of its own after the empty `/run`, read-only unless `writable`), for the process door's relay |
+| (new, #163) | `plan.rs` | **Done and tested.** `Plan` (was `SandboxOptions`, which stays as bwrap's alias): what one command's sandbox allows, built by `Sandbox::plan`. The policy every backend shares is methods over a `FsProbe`: `read_only_extras`/`writable_extras` (`resolve_extra`, moved here: refused when the home, a parent of it, `/` or (read-only) the project; `Extra { given, real, around_project }`), `home_project`, `project_read_only`, `toolchains`, `hidden_dirs`, `config_dir_hidden`, `credentials`, `mesh_bind`, and `env` (G19's list, plus `MARV_MESH_SOCKET` when plugged) |
+| (new, #163) | `backend.rs` | **Done.** `SandboxBackend` (`name`, `available`, `command` → `SandboxCommand { argv, env, leftovers }`, `guest_path`, `hides`, `kill`, `terminate`, `after`) and `backend()`, which picks the platform's: bubblewrap everywhere for now (it isn't available on macOS, so commands there run unsandboxed with the warning, as before) |
+| (new, #163) | `fs.rs` | `FsProbe`, `RealFs`, `EntryKind`, `FileKind`, moved out of `bwrap.rs` (re-exported there) so every backend checks paths the same way; tests share one `Fake` (`test_fs.rs`) |
+| `src/sandbox.ts` (`sandboxArgs`, `runMounts`, `resolveExtra`, `sandboxAvailable`) | `bwrap.rs` | **Ported and tested.** #163: `Bwrap`, the `SandboxBackend` over `sandbox_args`, which reads the policy from the `Plan` and keeps only how bwrap spells it (mount order, tmpfs or `/dev/null`, `run_mounts`, the home's socket scan). Adds protected-path read-only binds and the mesh plug at `/run/marv/mesh.sock`. The file system is injectable (`FsProbe`). #24: `binds` (Marv's Sprint 4 `binds`: a mount at a path of its own after the empty `/run`, read-only unless `writable`), for the process door's relay |
 | `src/sandbox.ts` (`TOOLCHAINS`, `CREDENTIALS`, `credentialMasks`, `hiddenPathFolders`) | `home.rs` | **Ported and tested.** marv-rs: `HOME_MASKS` and `home_project` for a project that is the home folder (see "The home folder as the project") |
 | `src/tools/files.ts` (`resolveInProject`, `insideGitDir`, `touchesGit`, `refuseGit`, `projectPath`) | `paths.rs` | **Ported and tested.** New: `resolve_within`, the realpath containment check for skill files, with a symlink test |
 | `src/tools/bash.ts` (`gitGuard`, `worktreeGit`, `worktreeGitDirs`) | `git_guard.rs` | **Ported and tested** |
@@ -25,7 +29,7 @@ Spec: the **Sandbox** and **Yolo mode** bullets in Marv's `CLAUDE.md`, `src/sand
 | `src/tools/bash.ts` (`secretVariable`, `hostEnv`) | `host_env.rs` | **Ported and tested** (marv-rs #23, Marv #52; `host-env.test.ts`): the environment of what runs on the host, Marv's keys and secret-looking variables stripped |
 | new (`docs/SECURITY.md`) | `taint.rs` | **Done and tested:** `TaintState` (`mark`, `is_tainted`, `must_ask`, approved prefixes, `for_subagent`) |
 | (new, #98) | `writable.rs` | **Done and tested:** the config's `"writable"` resolved once at startup (`resolve` → canonical paths + startup problems; `~` expanded, symlinks followed, the rules judged on the canonical path), and the refuse list (`/`, the home and its parents, the project's parents, any hidden top-level home entry (`~/.<anything>` — the message names the known ones, the rule doesn't need the list), a git repository (the entry is one, under a `.git` component, or directly holding a `.git` entry, worktree file included; a repo planted deeper inside an accepted folder later is *not* scanned — stated in the doc), the mesh's runtime sockets (`marv/` in the runtime dir, inside it or holding it), Marv's config folder (`config_dir`, wherever `MARV_CONFIG_DIR` puts it), missing/non-folders); an entry in the project or inside another accepted entry is left out quietly (#119 review: a swapped parent would let bwrap bind a symlink's target) |
-| — | `lib.rs` | `Sandbox` (the session's handle: `from_env`, `active`, `command`, `command_argv` for an inner command other than `bash -c`; #98: `writable`, the session's extra writable folders, merged under each command's own), `CommandMounts` (with `binds`, #24), `SandboxError` |
+| — | `lib.rs` | `Sandbox` (the session's handle: `from_env`, `active`, `backend`, `plan`, `prepare` (#163: the `Prepared` command callers spawn; it replaced `command` and `command_argv`); #98: `writable`, the session's extra writable folders, merged under each command's own), `CommandMounts` (with `binds`, #24), `SandboxError` |
 
 No `todo!` is left in this crate. The gaps are listed below.
 
@@ -37,9 +41,26 @@ pub fn home_project(root: &Path, home: &Path) -> bool;  // the project is the ho
 pub fn writable::resolve(entries: &[String], home: &Path, root: &Path, runtime: Option<&Path>, config_dir: Option<&Path>) -> (Vec<PathBuf>, Vec<String>);  // accepted + problems
 impl Sandbox {
     pub fn from_env(enabled: bool) -> Self;
-    pub fn active(&self) -> bool;                                    // enabled && bwrap works here
-    pub fn command(&self, root: &Path, mounts: &CommandMounts, script: &str) -> Result<Vec<OsString>, SandboxError>;
+    pub fn active(&self) -> bool;                                    // enabled && backend().available()
+    pub fn backend(&self) -> &'static dyn SandboxBackend;
+    pub fn plan(&self, root: &Path, mounts: &CommandMounts) -> Plan; // the session's sandbox + the command's mounts
+    pub fn prepare(&self, root: &Path, mounts: &CommandMounts, inner: &[OsString]) -> Result<Prepared, SandboxError>;
 }
+impl SandboxCommand { pub fn to_command(&self, root: &Path) -> std::process::Command; }  // env_clear + env + current_dir
+pub struct Prepared;  // Deref<Target = SandboxCommand>; finish() runs the backend's after() once, and Drop does if nothing did
+pub trait SandboxBackend: Send + Sync + Debug {                      // #163
+    fn name(&self) -> &'static str;                                  // "bubblewrap"
+    fn available(&self) -> bool;
+    fn command(&self, plan: &Plan, inner: &[OsString], fs: &dyn FsProbe) -> Result<SandboxCommand, SandboxError>;
+    fn guest_path(&self, bind: &Bind) -> PathBuf;                    // where a bind (or the plug) appears inside
+    fn hides(&self, dir: &Path, home: &Path) -> bool;                // bwrap: hidden_in_sandbox
+    fn kill(&self, pid: u32);                                        // the whole sandbox, at once
+    fn terminate(&self, pid: u32);                                   // a process's stop, before kill
+    fn after(&self, command: &SandboxCommand);                       // bwrap: rmdir the placeholder mount points
+}
+pub struct SandboxCommand { pub argv: Vec<OsString>, pub env: Vec<(OsString, OsString)>, pub leftovers: Vec<PathBuf> }
+pub fn backend() -> &'static dyn SandboxBackend;
+pub const MESH_SOCKET_ENV: &str = "MARV_MESH_SOCKET";
 pub struct CommandMounts { pub network: bool, pub read_only: Vec<PathBuf>, pub writable: Vec<PathBuf>, pub placeholders: Vec<PathBuf>, pub project_read_only: bool }
 pub fn sandbox_args(opts: &SandboxOptions, fs: &dyn FsProbe) -> Result<Vec<OsString>, SandboxError>;
 pub fn sandbox_available() -> bool;
@@ -68,6 +89,14 @@ pub fn notes::{looks_like_network_failure, runs_gh, touches_hidden_home}; pub co
 
 ## Port notes
 
+- **One plan, a backend per platform (#163).** The bwrap code mixed two jobs: deciding the policy and spelling it as arguments. The policy is the `Plan` and its methods; `Bwrap` renders it. Callers don't assume bwrap any more:
+  - bash, the process manager and the guards spawn `Sandbox::prepare`'s command only through `SandboxCommand::to_command`, which clears the environment and sets the backend's (`PATH` for bwrap, which sets the command's own with `--setenv`; `sandbox-exec` passes its environment on, so there a spawn that kept Marv's would leak API keys and `DYLD_*`). There is no argv-only API left to spawn by hand;
+  - `Prepared::finish` runs the backend's `after` once the command has ended (bwrap: the placeholder mount points, removed while empty; bash no longer does this itself, and finishes before its scan for created protected files). Dropping a `Prepared` finishes it too, so a spawn that fails or an early return leaves nothing behind;
+  - a timeout, a stop or Marv's exit kills through the backend (`kill`, `terminate`; bwrap: SIGKILL/SIGTERM to bwrap, whose PID namespace takes the rest down);
+  - the relay's binary and socket paths are `guest_path` of their binds (`relay::sandbox_argv_at`), not `/run/marv-bin` and `/run/marv` assumed;
+  - a plugged command gets `MARV_MESH_SOCKET` with its plug's path inside (bwrap: `/run/marv/mesh.sock`); `marv_mesh::plug::sandbox_socket` reads it, falling back to `SANDBOX_SOCKET`. Seatbelt can't mount, so there it will be the host path;
+  - the mesh's runtime folder check still calls `hidden_in_sandbox` directly; `SandboxBackend::hides` is the same rule for bwrap, for the runtime-folder work to switch to.
+  The spec's sketch stores the resolved values as `Plan` fields; they are methods here, so a hand-built `Plan` (the bwrap tests, unchanged) can't disagree with its resolved view, and `Sandbox::plan` can't fail (every refusal happens in the backend, before anything starts).
 - **`SandboxOptions.lang`** replaces Marv's read of `process.env.LANG` inside `sandboxArgs`, so the function stays pure.
 - **Args are `OsString`s**, so a path that isn't UTF-8 still mounts.
 - **Order of mounts:**

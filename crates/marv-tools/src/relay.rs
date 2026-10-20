@@ -79,10 +79,16 @@ pub fn exe_bind() -> Option<marv_sandbox::Bind> {
     relay_exe().map(|source| marv_sandbox::Bind { source, dest: RELAY_EXE.into(), writable: false })
 }
 
-/// What a sandbox runs for `spec`: `/run/marv-bin __relay <spec>`.
+/// What a bubblewrap sandbox runs for `spec`: `/run/marv-bin __relay <spec>`.
 pub fn sandbox_argv(spec: &RelaySpec) -> Vec<OsString> {
+    sandbox_argv_at(Path::new(RELAY_EXE), spec)
+}
+
+/// What a sandbox runs for `spec`, with Marv's binary at `exe` inside it: where the backend shows [`exe_bind`]
+/// (`SandboxBackend::guest_path`), [`RELAY_EXE`] for bubblewrap.
+pub fn sandbox_argv_at(exe: &Path, spec: &RelaySpec) -> Vec<OsString> {
     let json = serde_json::to_string(spec).unwrap_or_default();
-    vec![RELAY_EXE.into(), RELAY_SUBCOMMAND.into(), json.into()]
+    vec![exe.as_os_str().to_os_string(), RELAY_SUBCOMMAND.into(), json.into()]
 }
 
 /// `marv __relay <spec>`: listens, runs the command, exits with its code.
