@@ -481,13 +481,19 @@ fn open_chat(
                 let session = session.to_string();
                 let _ = app.state::<Desktop>().store.update_chat(&chat_id, |c| c.session_id = Some(session));
             }
-            if matches!(event["type"].as_str(), Some("approval" | "turn_end")) {
-                let shown = background::lock(&shared).shown();
+            // The page gets it first; the notifier never blocks (each notification is a task of its own).
+            let tell = matches!(event["type"].as_str(), Some("approval" | "approval_done" | "turn_end")).then(|| event.clone());
+            let shown = {
+                let mut chat = background::lock(&shared);
+                let shown = chat.shown();
+                chat.deliver(event);
+                shown
+            };
+            if let Some(event) = tell {
                 let desktop = app.state::<Desktop>();
                 let title = desktop.store.chats().into_iter().find(|c| c.id == chat_id).map(|c| c.title).unwrap_or_default();
                 desktop.notifier.event(&app, &chat_id, &title, &event, shown);
             }
-            background::lock(&shared).deliver(event);
         }
         background::lock(&shared).end();
     });
