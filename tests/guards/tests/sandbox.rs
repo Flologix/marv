@@ -752,7 +752,7 @@ fn git_repositories_are_refused_as_writable_entries() {
 /// `"writable": ["<dir>"]` a yolo bash command `touch <dir>/x` needs no approval and succeeds; another host folder
 /// beside it stays read-only, and so does `~/.ssh` (masked home).
 ///
-/// Proven: dropped the session's `writable` merge in `Sandbox::command_argv` → this failed (the touch failed).
+/// Proven: dropped the session's `writable` merge in `Sandbox::plan` → this failed (the touch failed).
 #[tokio::test]
 async fn the_writable_folder_is_writable_and_nothing_else_new_is() {
     require_bwrap!();

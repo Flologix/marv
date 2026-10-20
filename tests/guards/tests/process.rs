@@ -98,7 +98,7 @@ fn other_address() -> Option<String> {
 /// command does.
 ///
 /// Proven: started the process's command with `bwrap` replaced by plain `bash` (`launch` building `["bash", "-c",
-/// script]` instead of `command_argv`) → failed (`planted` written outside).
+/// script]` instead of `Sandbox::prepare`) → failed (`planted` written outside).
 #[tokio::test]
 async fn a_process_cant_write_outside_the_project() {
     require_bwrap!();
