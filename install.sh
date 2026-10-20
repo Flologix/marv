@@ -24,6 +24,9 @@ VERSION=latest
 FROM=
 UNINSTALL=0
 
+# Where the README says how to run Marv on Windows (in WSL).
+WSL_HELP=https://github.com/FlologixAI/marv#requirements
+
 say() { printf 'marv install: %s\n' "$*"; }
 die() {
 	printf 'marv install: %s\n' "$*" >&2
@@ -138,7 +141,9 @@ detect_target() {
 	case $os in
 	Linux) ;;
 	Darwin) die "there's no macOS build yet; build from source: cargo install --path crates/marv-cli --root ~/.local" ;;
-	*) die "no build for $os" ;;
+	# Git Bash, MSYS2, Cygwin (#153): Windows itself has no build, but Marv runs in WSL, sandbox and all.
+	MINGW* | MSYS* | CYGWIN* | Windows_NT) die "Marv doesn't run on Windows itself: use WSL. In PowerShell run \`wsl --install\` (it sets up Ubuntu), then run this installer inside WSL. See $WSL_HELP" ;;
+	*) die "no build for $os: Marv runs on Linux (on Windows, inside WSL: $WSL_HELP)" ;;
 	esac
 	case $arch in
 	x86_64 | amd64) printf 'x86_64-unknown-linux-musl\n' ;;

@@ -39,4 +39,5 @@ set +e
 message=$(node "$modules/marv/bin/marv.js" --version 2>&1)
 set -e
 echo "$message" | grep -q "isn't installed" || fail "no message without the platform package: $message"
+node --test "$root/packaging/npm/launcher.test.js" >/dev/null || fail "the launcher's unit tests failed"
 echo "npm packages: ok"
