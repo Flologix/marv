@@ -148,7 +148,7 @@ pub fn sandbox_args(opts: &SandboxOptions, fs: &dyn FsProbe) -> Result<Vec<OsStr
             args.extend(["--tmpfs".into(), path.clone().into_os_string(), "--remount-ro".into(), path.clone().into_os_string()]);
         }
     }
-    // Marv's runtime folder, empty wherever $XDG_RUNTIME_DIR points (marv-rs): a socket a command could see is one it
+    // Marv's runtime folder, empty wherever it is (`runtime::runtime_paths`): a socket a command could see is one it
     // could connect to (a read-only mount doesn't stop connect()), and a plug's socket carries that plug's identity
     // and wires. After the project, toolchain and PATH mounts, so none of them shows it again. The relay and mesh
     // binds have their own destinations under /run/marv, which this never covers. Under /run it's already gone unless

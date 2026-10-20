@@ -61,8 +61,8 @@ pub struct Plan {
     /// socket folder at `/run/marv` (writable for the process that serves it, read-only for a command that only
     /// connects). Where each really appears inside is [`SandboxBackend::guest_path`].
     pub binds: Vec<Bind>,
-    /// Marv's own runtime folders (`$XDG_RUNTIME_DIR/marv`: the mesh's plug and discovery sockets, the process
-    /// door's relays), each an empty tmpfs in the sandbox wherever it is (marv-rs).
+    /// Marv's own runtime folders (`runtime::runtime_paths`, the default and any `MARV_RUNTIME_DIR`: the mesh's plug
+    /// and discovery sockets, the process door's relays), each an empty tmpfs in the sandbox wherever it is (marv-rs).
     pub hidden: Vec<PathBuf>,
     /// Marv's config folder (`~/.marv` or `MARV_CONFIG_DIR`): an empty tmpfs in the sandbox wherever it is, its
     /// `skills/` shown again read-only (marv-rs). Inside the stand-in home it's hidden already.

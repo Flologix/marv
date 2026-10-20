@@ -18,7 +18,7 @@
 //! Serving: an MCP server (`marv_mcp::jsonrpc`) on each plug's socket. Each
 //! wired receptacle is a tool in `tools/list`; `tools/call` routes; `watch`
 //! wires get notifications (routing them comes last). v2 also listens on
-//! `$XDG_RUNTIME_DIR/marv/mesh/<session>.sock` ([`crate::discovery`]).
+//! `<runtime>/mesh/<session>.sock` ([`crate::discovery`]).
 //!
 //! Receptacles other than inboxes (v2: another Marv's inbox, a Herdr pane) are served by a [`Service`] offered with
 //! them ([`Switchboard::offer_service`]). Ones that appear while Marv runs (a Marv started later, a new Herdr pane)
@@ -131,6 +131,8 @@ pub struct Switchboard {
     trajectory: Mutex<Arc<dyn TrajectorySink>>,
     /// The private 0700 folder holding plug sockets.
     runtime_dir: PathBuf,
+    /// Whether this switchboard made `runtime_dir` for itself ([`Self::owning_folder`]): removed (when empty) on drop.
+    owns_folder: bool,
     /// A plug was added while `serve` runs: it has a new socket to listen on.
     wake: tokio::sync::Notify,
     /// A message went into an inbox (#78): what an idle TUI waits on to start a turn (`mesh.wake`). One permit is
@@ -186,6 +188,7 @@ impl Switchboard {
             board: Mutex::default(),
             trajectory: Mutex::new(trajectory),
             runtime_dir,
+            owns_folder: false,
             wake: tokio::sync::Notify::new(),
             mail: tokio::sync::Notify::new(),
             resolvers: Mutex::default(),
@@ -193,6 +196,14 @@ impl Switchboard {
             herdr: Mutex::default(),
             radio: Mutex::default(),
         }
+    }
+
+    /// Marks `runtime_dir` as made for this switchboard alone (`marv_session::mesh::start`'s `p/<pid>-<hex>`): dropped,
+    /// the switchboard removes it once its sockets are gone, so empty plug folders don't pile up. Never a folder
+    /// someone else gave it.
+    pub fn owning_folder(mut self) -> Self {
+        self.owns_folder = true;
+        self
     }
 
     /// This Marv's radio (#124; set by [`crate::radio::Radio::new`]).
@@ -343,6 +354,7 @@ impl Switchboard {
         let host_socket = self.runtime_dir.join(format!("{}.sock", id.as_str()));
         // A socket left by an earlier plug of this name (the folder is this session's own): bind would fail on it.
         let _ = std::fs::remove_file(&host_socket);
+        marv_sandbox::runtime::check_socket_path(&host_socket).map_err(MeshError::Io)?;
         let listener =
             StdUnixListener::bind(&host_socket).map_err(|e| io(&format!("can't listen on {}", host_socket.display()), e))?;
         std::fs::set_permissions(&host_socket, std::fs::Permissions::from_mode(0o600))
@@ -690,6 +702,10 @@ impl Drop for Switchboard {
     fn drop(&mut self) {
         for plug in self.board().plugs.values() {
             let _ = std::fs::remove_file(&plug.host_socket);
+        }
+        if self.owns_folder {
+            // Only when empty: anything else in it is left as it is.
+            let _ = std::fs::remove_dir(&self.runtime_dir);
         }
     }
 }

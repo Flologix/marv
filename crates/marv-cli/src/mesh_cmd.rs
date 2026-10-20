@@ -2,9 +2,10 @@
 //!
 //! - [`start`]: the switchboard of a `marv` process (the TUI's, or `marv -p`'s when asked for), named by
 //!   `marv_mesh::discovery::mesh_name`, with Herdr's agent panes as receptacles when Marv runs in a Herdr pane. Its
-//!   door ([`Mesh::open_door`]) puts it on the mesh: `$XDG_RUNTIME_DIR/marv/mesh/<name>.sock`. No `XDG_RUNTIME_DIR`, no
-//!   mesh (never a `/tmp` fallback).
-//! - `ls`: the live switchboards in `$XDG_RUNTIME_DIR/marv/mesh/` (owner and mode checked), one line each, and in a
+//!   door ([`Mesh::open_door`]) puts it on the mesh: `<runtime>/mesh/<name>.sock`, in Marv's runtime folder
+//!   (`marv_sandbox::runtime_dir`: `$XDG_RUNTIME_DIR/marv` on Linux, `/tmp/marv-<uid>` on macOS). No runtime folder,
+//!   no mesh (never a fallback a sandboxed command could see).
+//! - `ls`: the live switchboards in `<runtime>/mesh/` (owner and mode checked), one line each, and in a
 //!   Herdr pane the agent panes it can reach. Everything printed goes through `printable()`.
 //! - `wire 'alpha -> beta:inbox'`: asks `alpha` for a wire from its `parent` to `beta`'s parent inbox. `alpha`'s user
 //!   approves, then `beta`'s (both ends, `Grant::remote`). Ends are `<name>[/<agent>]`; the target can also be one of
@@ -35,8 +36,12 @@ fn env() -> marv_mcp::Env {
 
 fn no_runtime_dir(command: &str) -> i32 {
     eprintln!(
-        "marv mesh {command} needs XDG_RUNTIME_DIR under /run, /tmp or your home folder: Marv puts the mesh only where sandboxed commands can't see it."
+        "marv mesh {command} needs {}: Marv puts the mesh only where sandboxed commands can't see it.",
+        marv_sandbox::RUNTIME_DIR_RULE
     );
+    if let Some(why) = marv_sandbox::override_refusal(&marv_sandbox::runtime_env()) {
+        eprintln!("marv: {}", printable(&why));
+    }
     1
 }
 

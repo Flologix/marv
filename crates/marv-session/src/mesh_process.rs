@@ -1,6 +1,6 @@
 //! A process's place on the mesh (moved from marv-cli's `mesh_cmd` so Marv desktop can use it too): its switchboard,
 //! named by `marv_mesh::discovery::mesh_name`, with Herdr's agent panes as receptacles when Marv runs in a Herdr
-//! pane, and its door ([`Mesh::open_door`]) at `$XDG_RUNTIME_DIR/marv/mesh/<name>.sock`. No `XDG_RUNTIME_DIR`, no
+//! pane, and its door ([`Mesh::open_door`]) at `<runtime>/mesh/<name>.sock`. No runtime folder, no
 //! mesh (never a `/tmp` fallback).
 
 use std::path::Path;
@@ -36,7 +36,7 @@ impl Drop for Mesh {
     }
 }
 
-/// This process's switchboard (`None` without `XDG_RUNTIME_DIR`). An error names what's wrong (a bad
+/// This process's switchboard (`None` without a runtime folder, `marv_sandbox::runtime_dir`). An error names what's wrong (a bad
 /// `MARV_MESH_NAME`, a name a live Marv has); the caller carries on without the mesh. Needs a Tokio runtime.
 /// `outside`: the project and the sandbox's writable folders, where the `herdr` the pane receptacles run is never taken
 /// from (`herdr_program`).
@@ -57,7 +57,7 @@ pub fn start(env: &marv_mcp::Env, root: &Path, outside: &[std::path::PathBuf]) -
         name = mesh_name(env, root).map_err(|e| e.to_string())?;
     }
     let cancel = CancellationToken::new();
-    let handle = crate::mesh::start(&name, env, cancel.clone()).ok_or("no XDG_RUNTIME_DIR")?;
+    let handle = crate::mesh::start(&name, env, cancel.clone()).ok_or("no runtime folder")?;
     let pane = herdr_target(env).map(|t| t.pane_id);
     // No herdr found the safe way: no Herdr receptacles, rather than a PATH lookup that could run a planted one.
     if let (Some(own), Some(program)) = (&pane, herdr_program(env, outside)) {

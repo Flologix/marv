@@ -52,6 +52,19 @@ impl TempDir {
     pub fn new(tag: &str) -> Self {
         Self::new_in(&std::env::temp_dir(), tag)
     }
+    /// A folder for sockets (a runtime folder, a plug folder, a mesh folder): on macOS a short `/tmp/mx-<pid>-<n>`,
+    /// as macOS's temp folder (`/var/folders/…/T`) leaves too little of `sun_path`'s 104 bytes (#150), kept as
+    /// `/tmp/…` rather than its real `/private/tmp/…` (8 bytes more). Elsewhere the same as [`TempDir::new`].
+    pub fn short(tag: &str) -> Self {
+        if cfg!(target_os = "macos") {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let dir = PathBuf::from(format!("/tmp/mx-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            return Self(dir);
+        }
+        Self::new(tag)
+    }
     /// A folder the host's user can write outside `/tmp` (which the sandbox replaces with its own): `/var/tmp`. A fake
     /// home there is what a missing home tmpfs would expose; a file there is what a writable `/` would let a command
     /// change. Falls back to the temp folder where `/var/tmp` isn't writable.
@@ -88,6 +101,16 @@ impl TempDir {
 impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The variable that puts a child Marv's runtime folder at `<dir>/marv`, and its value: `XDG_RUNTIME_DIR=<dir>` on
+/// Linux, `MARV_RUNTIME_DIR=<dir>/marv` on macOS, which has no `XDG_RUNTIME_DIR` (`marv_sandbox::runtime_dir`).
+pub fn runtime_var(dir: &Path) -> (&'static str, PathBuf) {
+    if cfg!(target_os = "macos") {
+        (marv_sandbox::runtime::RUNTIME_DIR_VAR, dir.join("marv"))
+    } else {
+        ("XDG_RUNTIME_DIR", dir.to_path_buf())
     }
 }
 
