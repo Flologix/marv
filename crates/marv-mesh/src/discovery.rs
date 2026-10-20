@@ -70,7 +70,13 @@ const PEER_PLUG: &str = "peer-";
 /// `<runtime>/mesh`, or `None` without a runtime folder Marv may use (`marv_sandbox::runtime_dir`: on Linux
 /// `$XDG_RUNTIME_DIR/marv` when every sandbox hides it, on macOS `/tmp/marv-<uid>`, or `MARV_RUNTIME_DIR`).
 pub fn mesh_dir(env: &marv_mcp::Env) -> Option<PathBuf> {
-    Some(marv_sandbox::runtime_dir(env)?.join("mesh"))
+    mesh_dir_for(env, None)
+}
+
+/// [`mesh_dir`] for a session in `project`: a `MARV_RUNTIME_DIR` inside it is refused (`marv_sandbox::runtime_dir_for`,
+/// #168).
+pub fn mesh_dir_for(env: &marv_mcp::Env, project: Option<&Path>) -> Option<PathBuf> {
+    Some(marv_sandbox::runtime_dir_for(env, project)?.join("mesh"))
 }
 
 /// A session's discovery socket. Session ids are one name segment, so the path can't escape the folder.

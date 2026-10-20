@@ -65,9 +65,15 @@ pub fn parent_id() -> PlugId {
 /// `cancel`. `None` without a runtime folder (`marv_sandbox::runtime_dir`): plugs never fall back to a world-readable
 /// `/tmp`, nor to a folder every sandbox doesn't hide: a worker that could see `parent.sock` could connect to it and
 /// use the parent's wires. The folder isn't named after the session: a session name of up to 43 bytes and a plug id of
-/// up to 48 overflowed `sun_path` (#150).
-pub fn start(session: &str, env: &marv_mcp::Env, cancel: CancellationToken) -> Option<MeshHandle> {
-    let dir = plug_folder(&marv_sandbox::runtime_dir(env)?).ok()?;
+/// up to 48 overflowed `sun_path` (#150). `project`: the session's root, which may not hold a `MARV_RUNTIME_DIR`
+/// (`marv_sandbox::runtime_dir_for`, #168).
+pub fn start(
+    session: &str,
+    env: &marv_mcp::Env,
+    project: Option<&std::path::Path>,
+    cancel: CancellationToken,
+) -> Option<MeshHandle> {
+    let dir = plug_folder(&marv_sandbox::runtime_dir_for(env, project)?).ok()?;
     let mesh = Arc::new(Switchboard::new(session, dir, Arc::new(marv_mesh::switchboard::NoTrajectory)).owning_folder());
     tokio::spawn(Arc::clone(&mesh).serve(cancel));
     Some(mesh)
@@ -725,7 +731,7 @@ mod tests {
         let env: marv_mcp::Env =
             [("MARV_RUNTIME_DIR".to_string(), base.join("marv").display().to_string())].into_iter().collect();
         let cancel = CancellationToken::new();
-        let (a, b) = (start("a", &env, cancel.clone()).unwrap(), start("b", &env, cancel.clone()).unwrap());
+        let (a, b) = (start("a", &env, None, cancel.clone()).unwrap(), start("b", &env, None, cancel.clone()).unwrap());
         let (pa, pb) = (a.plug(parent_id()).unwrap(), b.plug(parent_id()).unwrap());
         assert_ne!(pa.host_socket.parent(), pb.host_socket.parent());
         assert!(pa.host_socket.starts_with(base.join("marv/p")), "{}", pa.host_socket.display());

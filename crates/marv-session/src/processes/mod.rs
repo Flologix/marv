@@ -265,8 +265,8 @@ impl ProcessManager {
         }
         // A short path: a Unix socket's path is limited to 107 bytes (103 on macOS). Marv's runtime folder
         // (`marv_sandbox::runtime_dir`, hidden in every sandbox), else as before a folder of the user's in the temp
-        // folder.
-        marv_sandbox::runtime_dir(&marv_sandbox::runtime_env())
+        // folder. A MARV_RUNTIME_DIR inside the project isn't used (#168): a sandboxed command could have made it.
+        marv_sandbox::runtime_dir_for(&marv_sandbox::runtime_env(), Some(&self.shared.options.root))
             .unwrap_or_else(|| std::env::temp_dir().join(format!("marv-{}", nix::unistd::geteuid())).join("marv"))
     }
 
