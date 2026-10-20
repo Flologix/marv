@@ -12,29 +12,43 @@
 //! - [`protected`]: paths that ask even in yolo and are read-only inside the sandbox.
 //! - [`home`]: the stand-in home: toolchain folders, credential masks, hidden PATH folders.
 //! - [`host_env`]: the environment of what runs outside the sandbox (host commands, gh), secrets stripped.
-//! - [`bwrap`]: the bubblewrap argument builder (and the mesh plug at `/run/marv/mesh.sock`).
+//! - [`plan`]: what one command's sandbox allows ([`Plan`]), decided once for every backend.
+//! - [`backend`]: [`SandboxBackend`], how a plan becomes a sandboxed command, its clean-up and its kill.
+//! - [`bwrap`]: the bubblewrap backend and argument builder (and the mesh plug at `/run/marv/mesh.sock`).
+//! - [`seatbelt`]: the Seatbelt (macOS `sandbox-exec`) profile builder, pure; not the active backend yet (#166).
+//! - [`fs`]: the file system as the sandbox checks it ([`FsProbe`]), injectable for tests.
 //! - [`git_guard`]: `.git` read-only or a placeholder for commands that run without asking; worktree records.
 //! - [`notes`]: the `Marv:` notes bash appends (stand-in home, missing network, gh, read-only .git).
 //! - [`runtime`]: Marv's runtime folder (mesh and process sockets): one rule per platform, `MARV_RUNTIME_DIR`.
 //! - [`taint`]: once web/MCP/mesh/image text is in the context, egress always asks.
 
+pub mod backend;
 pub mod bwrap;
+pub mod fs;
 pub mod git_guard;
 pub mod home;
 pub mod host_env;
 pub mod notes;
 pub mod paths;
+pub mod plan;
 pub mod protected;
 pub mod runtime;
+pub mod seatbelt;
 pub mod taint;
 pub mod writable;
+
+#[cfg(test)]
+mod test_fs;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-pub use bwrap::{Bind, EntryKind, FileKind, FsProbe, MESH_SOCKET, RealFs, SandboxOptions, sandbox_args, sandbox_available};
+pub use backend::{Prepared, SandboxBackend, SandboxCommand, backend};
+pub use bwrap::{Bwrap, MESH_SOCKET, SandboxOptions, sandbox_args, sandbox_available};
+pub use fs::{EntryKind, FileKind, FsProbe, RealFs};
 pub use home::home_project;
 pub use paths::{project_path, resolve_in_project, resolve_within, touches_git};
+pub use plan::{Bind, Extra, MESH_SOCKET_ENV, Plan};
 pub use protected::{PROTECTED_PATHS, ProtectedPath, ProtectedRule, is_protected, protected_rule};
 pub use runtime::{RUNTIME_DIR_RULE, override_refusal, runtime_dir, runtime_env, runtime_paths};
 pub use taint::TaintState;
@@ -171,20 +185,28 @@ impl Sandbox {
         }
     }
 
-    /// Whether commands really run sandboxed: on, and bwrap works here.
+    /// The backend this platform's commands run in ([`backend()`]).
+    pub fn backend(&self) -> &'static dyn SandboxBackend {
+        backend()
+    }
+
+    /// Whether commands really run sandboxed: on, and the backend works here.
     pub fn active(&self) -> bool {
-        self.enabled && sandbox_available()
+        self.enabled && self.backend().available()
     }
 
-    /// The full argv for `script` in the project: `bwrap <args> -- bash -c script`. Protected paths that exist
-    /// are mounted read-only (`protected::protected_mounts`).
-    pub fn command(&self, root: &Path, mounts: &CommandMounts, script: &str) -> Result<Vec<OsString>, SandboxError> {
-        self.command_argv(root, mounts, &["bash".into(), "-c".into(), script.into()])
+    /// `inner` in the project, sandboxed by the backend: spawn [`SandboxCommand::to_command`] (only the backend's
+    /// environment, in `root`), and [`Prepared::finish`] it once it has ended (dropping it does too). Protected paths
+    /// that exist are read-only (`protected::protected_mounts`).
+    pub fn prepare(&self, root: &Path, mounts: &CommandMounts, inner: &[OsString]) -> Result<Prepared, SandboxError> {
+        let backend = self.backend();
+        Ok(Prepared::new(backend.command(&self.plan(root, mounts), inner, &RealFs)?, backend))
     }
 
-    /// The full argv for `inner` in the project: `bwrap <args> -- inner…` (the process door runs its relay there).
-    pub fn command_argv(&self, root: &Path, mounts: &CommandMounts, inner: &[OsString]) -> Result<Vec<OsString>, SandboxError> {
-        let options = SandboxOptions {
+    /// The [`Plan`] for one command in the project: the session's sandbox merged with the command's own mounts, plus
+    /// the protected paths that exist (`protected::protected_mounts`).
+    pub fn plan(&self, root: &Path, mounts: &CommandMounts) -> Plan {
+        Plan {
             root: root.to_path_buf(),
             home: self.home.clone(),
             network: mounts.network,
@@ -208,12 +230,7 @@ impl Sandbox {
             binds: mounts.binds.clone(),
             hidden: self.hidden.clone(),
             config_dir: self.config_dir.clone(),
-        };
-        let mut argv: Vec<OsString> = vec!["bwrap".into()];
-        argv.extend(sandbox_args(&options, &RealFs)?);
-        argv.push("--".into());
-        argv.extend(inner.iter().cloned());
-        Ok(argv)
+        }
     }
 }
 

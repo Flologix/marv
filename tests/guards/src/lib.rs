@@ -134,17 +134,16 @@ pub struct Ran {
     pub code: Option<i32>,
 }
 
-/// Runs `script` with real bwrap in `root`, as `Sandbox::command` builds it. `env` is added to *our* environment
-/// for bwrap, to show the sandbox clears it.
+/// Runs `script` with real bwrap in `root`, spawned as Marv spawns it (`Sandbox::prepare`, `SandboxCommand::to_command`:
+/// only the backend's environment). `env` is added to that environment for bwrap itself, to show the sandbox clears
+/// it from the command's.
 pub fn run_sandboxed(sandbox: &Sandbox, root: &Path, mounts: &CommandMounts, script: &str, env: &[(&str, &str)]) -> Ran {
-    let argv: Vec<OsString> = sandbox.command(root, mounts, &format!("exec 2>&1\n{script}")).expect("sandbox args");
-    let out = std::process::Command::new(&argv[0])
-        .args(&argv[1..])
-        .envs(env.iter().copied())
-        .current_dir(root)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .expect("bwrap runs");
+    let inner: [OsString; 3] = ["bash".into(), "-c".into(), format!("exec 2>&1\n{script}").into()];
+    let mut prepared = sandbox.prepare(root, mounts, &inner).expect("sandbox args");
+    let out =
+        prepared.to_command(root).envs(env.iter().copied()).stdin(std::process::Stdio::null()).output().expect("bwrap runs");
+    // What bwrap left behind (a placeholder's empty mount point), as Marv removes it after a command.
+    prepared.finish();
     let mut output = String::from_utf8_lossy(&out.stdout).into_owned();
     output.push_str(&String::from_utf8_lossy(&out.stderr));
     Ran { output, code: out.status.code() }
