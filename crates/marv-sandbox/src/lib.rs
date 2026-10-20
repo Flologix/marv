@@ -47,15 +47,15 @@ pub use writable::resolve as resolve_writable;
 /// see is one it could connect to (a read-only mount doesn't stop `connect()`), and a plug's socket carries that
 /// plug's identity and wires. A runtime dir elsewhere (`XDG_RUNTIME_DIR=/var/tmp/…`) is refused, not used.
 pub fn hidden_in_sandbox(dir: &std::path::Path, home: &std::path::Path) -> bool {
-    let real = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    let dir = real(dir);
-    if !dir.is_absolute() {
+    let dir = real_or_planned(dir);
+    // A `..` left over (under a missing folder) could climb out of whichever folder the prefix test matches.
+    if !dir.is_absolute() || dir.components().any(|c| c == std::path::Component::ParentDir) {
         return false;
     }
-    let home = real(home);
+    let home = real_or_planned(home);
     let under = |base: &std::path::Path| dir.starts_with(base) && dir != base;
-    under(&real(std::path::Path::new("/run")))
-        || under(&real(std::path::Path::new("/tmp")))
+    under(&real_or_planned(std::path::Path::new("/run")))
+        || under(&real_or_planned(std::path::Path::new("/tmp")))
         || (home != std::path::Path::new("/")
             && dir
                 .strip_prefix(&home)
@@ -63,6 +63,26 @@ pub fn hidden_in_sandbox(dir: &std::path::Path, home: &std::path::Path) -> bool 
                 .and_then(|rel| rel.components().next())
                 .is_some_and(|first| first.as_os_str().to_string_lossy().starts_with('.'))
             && !home::TOOLCHAINS.iter().any(|t| dir.starts_with(home.join(t))))
+}
+
+/// `path` with its deepest existing ancestor resolved and the rest appended: where a folder that doesn't exist yet
+/// will be once made. A plain `canonicalize` fails there and would leave macOS's `/tmp/marv-<uid>` (before its first
+/// use) unresolved, so it wouldn't match `/tmp`'s real path, `/private/tmp`.
+fn real_or_planned(path: &std::path::Path) -> std::path::PathBuf {
+    let mut rest = Vec::new();
+    let mut base = path;
+    loop {
+        if let Ok(real) = std::fs::canonicalize(base) {
+            return rest.iter().rev().fold(real, |p, c| p.join(c));
+        }
+        match (base.parent(), base.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_os_string());
+                base = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
 }
 
 /// Marv's config folder as the session finds it (`default_config_dir`): `MARV_CONFIG_DIR`, a relative one taken from
@@ -224,5 +244,19 @@ mod hidden_tests {
             assert!(!hidden_in_sandbox(std::path::Path::new(visible), home), "{visible}");
         }
         assert!(!hidden_in_sandbox(std::path::Path::new("/anything"), std::path::Path::new("/")), "a home of / hides nothing");
+        assert!(!hidden_in_sandbox(std::path::Path::new("/tmp/no-such-marv/../../etc"), home));
+    }
+
+    /// macOS's `/tmp` is a symlink to `/private/tmp`: a runtime folder not made yet must still resolve through it.
+    #[test]
+    fn a_folder_not_made_yet_resolves_through_a_symlinked_parent() {
+        let base = std::fs::canonicalize(std::env::temp_dir()).unwrap().join(format!("marv-rp-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("private")).unwrap();
+        let link = base.join("tmp");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(base.join("private"), &link).unwrap();
+        assert_eq!(super::real_or_planned(&link.join("marv-501/p")), base.join("private/marv-501/p"));
+        assert_eq!(super::real_or_planned(&link), base.join("private"));
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }
