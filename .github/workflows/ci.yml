@@ -51,7 +51,7 @@ jobs:
         run: npm ci && npm run build
       # install.sh and the npm launcher (#153: the messages on Windows and macOS). Quick: no real build needed.
       - name: Installer and npm launcher
-        run: sh -n install.sh && packaging/test-install.sh && node --test packaging/npm/
+        run: sh -n install.sh && packaging/test-install.sh && node --test packaging/npm/launcher.test.js
       # Fail here, with bwrap's own error, rather than let the sandbox tests skip.
       - name: Require a working sandbox
         run: bwrap --ro-bind / / --unshare-net --unshare-pid -- true
