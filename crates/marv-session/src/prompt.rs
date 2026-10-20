@@ -63,14 +63,17 @@ pub struct PromptInput {
     pub writable: Vec<String>,
     /// `YYYY-MM-DD`.
     pub date: String,
-    /// The project has no `.git` of its own, so commands see the sandbox's empty read-only stand-in (`git_guard`).
+    /// The project has no `.git` of its own (none, or an empty folder), so confined commands see the sandbox's empty
+    /// read-only stand-in (`git_guard`).
     pub git_placeholder: bool,
 }
 
 /// Said when the project has no `.git` (and bash is offered). A session in ~/Projects (no repository) ran `ls -la`,
 /// saw the sandbox's empty `.git` and told the user their repository was empty and broken. Git skips an empty `.git`
-/// and still finds a repository in a parent folder. Fixed per conversation, so the prompt cache holds.
-pub const GIT_PLACEHOLDER: &str = "\n\nThis folder has no .git of its own. In your commands an empty, read-only .git folder stands in its place, so none can be created here: it's the sandbox's placeholder, not a broken or empty repository, and git still finds a repository in a parent folder if there is one. Don't report it as a problem.";
+/// and still finds a repository in a parent folder. Fixed per conversation, so the prompt cache holds; and since yolo
+/// can be toggled mid-conversation, it has to hold in every mode: only confined commands (yolo's auto-run ones, the
+/// process tool) get the placeholder, and an approved `git_write` command may create a `.git` (`git init`).
+pub const GIT_PLACEHOLDER: &str = "\n\nThis folder has no .git of its own. Commands that run without asking, and background processes, may see an empty, read-only .git folder here: it's the sandbox's placeholder, not a broken or empty repository, and git still finds a repository in a parent folder if there is one. Don't report it as a problem. To create a repository here, run git init with git_write: true.";
 
 /// Which doors a session offers the model (decided once per session, before its first request: the cache). Marv's
 /// `PromptDoors`.

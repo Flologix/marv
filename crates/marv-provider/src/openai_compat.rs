@@ -1156,10 +1156,17 @@ where
 
 /// Adds a streamed `reasoning_details` block to `blocks`. A piece of the block before it (the same `index` and `type`)
 /// is appended to it: its strings (`text`, `summary`, `data`) are concatenated, and any other field it carries
-/// (`signature`, `id`, `format`) fills in one the block didn't have yet. A block without an `index` is kept as is.
+/// (`signature`, `id`, `format`) fills in one the block didn't have yet. A block without an `index` is kept as is, and
+/// so is one that can't be a piece of the one before: both carry a different `id`, or both already carry a `signature`
+/// (two whole blocks under one index; merging would drop the second signature, or corrupt both).
 fn merge_reasoning_block(blocks: &mut Vec<Value>, block: Value) {
+    let filled = |v: &Value, key: &str| v.get(key).filter(|x| !x.is_null() && *x != &Value::String(String::new())).cloned();
     let same = |a: &Value, b: &Value| {
-        a.get("index").is_some_and(|i| !i.is_null()) && a.get("index") == b.get("index") && a.get("type") == b.get("type")
+        a.get("index").is_some_and(|i| !i.is_null())
+            && a.get("index") == b.get("index")
+            && a.get("type") == b.get("type")
+            && !matches!((filled(a, "id"), filled(b, "id")), (Some(x), Some(y)) if x != y)
+            && !(filled(a, "signature").is_some() && filled(b, "signature").is_some())
     };
     let (Some(last), Value::Object(piece)) = (blocks.last_mut(), &block) else {
         blocks.push(block);
@@ -1515,6 +1522,36 @@ mod tests {
         merge_reasoning_block(&mut blocks, serde_json::json!({"type": "reasoning.text", "text": "a"}));
         merge_reasoning_block(&mut blocks, serde_json::json!({"type": "reasoning.text", "text": "b"}));
         assert_eq!(blocks.len(), 2);
+    }
+
+    /// Two whole blocks under one index (a different id each, or a signature each) stay apart, signatures intact; a
+    /// piece with the same id, or with none, still joins.
+    #[test]
+    fn reasoning_blocks_with_their_own_id_or_signature_stay_apart() {
+        use serde_json::json;
+        let mut blocks = Vec::new();
+        merge_reasoning_block(&mut blocks, json!({"type": "reasoning.encrypted", "index": 0, "id": "a", "data": "x"}));
+        merge_reasoning_block(&mut blocks, json!({"type": "reasoning.encrypted", "index": 0, "id": "a", "data": "y"}));
+        merge_reasoning_block(&mut blocks, json!({"type": "reasoning.encrypted", "index": 0, "data": "z"}));
+        merge_reasoning_block(&mut blocks, json!({"type": "reasoning.encrypted", "index": 0, "id": "b", "data": "w"}));
+        assert_eq!(
+            blocks,
+            vec![
+                json!({"type": "reasoning.encrypted", "index": 0, "id": "a", "data": "xyz"}),
+                json!({"type": "reasoning.encrypted", "index": 0, "id": "b", "data": "w"}),
+            ]
+        );
+        let mut blocks = Vec::new();
+        merge_reasoning_block(&mut blocks, json!({"type": "reasoning.text", "index": 0, "text": "a", "signature": "s1"}));
+        merge_reasoning_block(&mut blocks, json!({"type": "reasoning.text", "index": 0, "text": "b", "signature": "s2"}));
+        merge_reasoning_block(&mut blocks, json!({"type": "reasoning.text", "index": 0, "id": "", "text": "c"}));
+        assert_eq!(
+            blocks,
+            vec![
+                json!({"type": "reasoning.text", "index": 0, "text": "a", "signature": "s1"}),
+                json!({"type": "reasoning.text", "index": 0, "text": "bc", "signature": "s2", "id": ""}),
+            ]
+        );
     }
 
     #[test]

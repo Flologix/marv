@@ -330,7 +330,7 @@ pub const MARV_RS_TEXT: &[(&str, &str)] = &[
     (" start always needs command; a command that finishes on its own belongs in bash.", ""),
     // The sandbox's empty `.git` named in a project without one (`marv_session::prompt::GIT_PLACEHOLDER`).
     (
-        "\n\nThis folder has no .git of its own. In your commands an empty, read-only .git folder stands in its place, so none can be created here: it's the sandbox's placeholder, not a broken or empty repository, and git still finds a repository in a parent folder if there is one. Don't report it as a problem.",
+        "\n\nThis folder has no .git of its own. Commands that run without asking, and background processes, may see an empty, read-only .git folder here: it's the sandbox's placeholder, not a broken or empty repository, and git still finds a repository in a parent folder if there is one. Don't report it as a problem. To create a repository here, run git init with git_write: true.",
         "",
     ),
 ];
