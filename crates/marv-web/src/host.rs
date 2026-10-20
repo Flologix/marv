@@ -60,6 +60,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("cost", "Tokens used and cost so far"),
     ("memory", "Show what Marv remembers"),
     ("model", "Switch the model (/model <id>)"),
+    ("permissions", "What Marv may do without asking: this chat's approvals, and what's saved"),
 ];
 
 /// A model id that starts with this runs on the local Ollama (`ollama/gemma4:12b`); any other is OpenRouter's.
@@ -179,6 +180,12 @@ pub async fn run_chat(spec: ChatSpec, mut incoming: UnboundedReceiver<ClientMess
                     "cost" => {
                         let usage = session.usage();
                         print(marv_session::usage::usage_report(&usage.totals, usage.last.as_ref(), usage.context_length));
+                    }
+                    // The same view as the TUI's (#82), shown here only: never sent to the model. The desktop has no
+                    // config file of its own to show.
+                    "permissions" => {
+                        let servers = session.mcp().map(|m| m.status());
+                        print(marv_session::permissions::permissions_text(&session.permissions(), None, servers.as_deref()))
                     }
                     "memory" => print(match session.memory() {
                         Some(m) if !m.personal.is_empty() || !m.project.is_empty() => {

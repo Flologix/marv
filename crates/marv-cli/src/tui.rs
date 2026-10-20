@@ -2366,6 +2366,7 @@ impl Bridge {
         let trajectories_path = self.trajectories_dir.as_ref().map(|d| shorten_home(d, &self.home));
         let processes = self.session.processes();
         let checkpoint_problem = self.session.checkpoint_problem();
+        let permissions = self.session.permissions();
         let mesh = self.session.mesh().map(|mesh| {
             let inbox = marv_mesh::ReceptacleName::inbox(&marv_session::mesh::parent_id());
             commands::MeshStatus {
@@ -2395,6 +2396,7 @@ impl Bridge {
             sandbox_available: self.sandbox_available,
             processes: self.session.processes_offered().then_some(&processes[..]),
             mesh: mesh.as_ref(),
+            permissions: Some(&permissions),
         };
         commands::run_command(line, &ctx)
     }
@@ -3814,6 +3816,32 @@ mod tests {
         assert!(texts(&seen)[0].starts_with("Saved to ") && texts(&seen)[0].ends_with("· Ollama · qwen3.5:9b"));
         let saved = ConfigStore::new(&dirs.config).load().unwrap().unwrap();
         assert_eq!((saved.provider, saved.model.as_deref()), (Some(ProviderKind::Ollama), Some("qwen3.5:9b")));
+    }
+
+    // #82: /permissions shows the pre-approved scopes and an "always" answer, and never reaches the model.
+    #[tokio::test]
+    async fn permissions_lists_the_sessions_grants_and_stays_off_the_conversation() {
+        let dirs = Dirs::new();
+        let replies = vec![write("c1", "made.txt", "hello\n"), say("Created it.")];
+        let mut s = startup(&dirs, Some(asks()), replies, None);
+        s.pre_approved = vec!["web".into()];
+        let (tx, mut rx) = unbounded_channel();
+        let bridge = Bridge::start(s, tx).unwrap();
+        let port = Port(bridge.clone());
+        port.send("make a file".into());
+        let seen = until(&mut rx, |e| matches!(e, UiEvent::Approval { .. })).await;
+        let Some(UiEvent::Approval { id, .. }) = seen.last() else { unreachable!() };
+        port.answer(*id, view::Decision::Always);
+        until(&mut rx, |e| matches!(e, UiEvent::TurnEnd { .. })).await;
+        let (conversation, system) = (bridge.session.conversation(), bridge.session.system_prompt());
+        port.run_command("/permissions".into());
+        let shown = texts(&[until(&mut rx, |e| matches!(e, UiEvent::Message(_))).await.pop().unwrap()]);
+        assert!(shown[0].contains("**Permissions**"), "{shown:?}");
+        assert!(shown[0].contains("- `web` (from --approve): web_fetch from any site"), "{shown:?}");
+        assert!(shown[0].contains("- File changes: (all)"), "{shown:?}");
+        assert!(shown[0].contains("**Yolo**: off"), "{shown:?}");
+        assert_eq!(bridge.session.conversation(), conversation, "nothing of it joins the history");
+        assert_eq!(bridge.session.system_prompt(), system, "nor the system prompt");
     }
 
     // #98: the startup notice names what's pre-approved, which extra folders are writable, and any problem.

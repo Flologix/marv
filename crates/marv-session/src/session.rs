@@ -1123,6 +1123,30 @@ impl MarvSession {
     pub fn tainted(&self) -> Vec<Provenance> {
         self.inner.taint.sources()
     }
+    /// What the session may do without asking, now (`/permissions`, #82): a copy, for showing only.
+    pub fn permissions(&self) -> crate::permissions::Permissions {
+        let (yolo, sandbox) = {
+            let s = self.state();
+            (s.yolo, s.sandbox)
+        };
+        let init = &self.inner.init;
+        let doors = [("github", init.github), ("process", self.inner.process_on), ("herdr", init.herdr.is_some())]
+            .into_iter()
+            .filter_map(|(name, on)| on.then_some(name))
+            .collect();
+        crate::permissions::Permissions {
+            yolo,
+            no_yolo: init.no_yolo.clone(),
+            sandbox,
+            host_commands: init.host_commands,
+            doors,
+            remembered: self.inner.always.remembered(),
+            pre_approved: init.pre_approved.clone(),
+            writable: init.writable.clone(),
+            tainted: self.inner.taint.sources(),
+            approved_urls: self.inner.taint.approved_prefixes(),
+        }
+    }
     /// The MCP manager (for `/mcp`), if the session has one.
     pub fn mcp(&self) -> Option<McpHandle> {
         self.inner.init.mcp.clone()

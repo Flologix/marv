@@ -36,6 +36,7 @@ pub mod memory;
 pub mod mesh;
 pub mod mesh_process;
 pub mod paths;
+pub mod permissions;
 pub mod processes;
 pub mod prompt;
 pub mod provenance;

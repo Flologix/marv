@@ -69,6 +69,11 @@ impl TaintState {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).approved_prefixes.insert(prefix.to_string());
     }
 
+    /// The prefixes approved after taint, sorted (for `/permissions`).
+    pub fn approved_prefixes(&self) -> Vec<String> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).approved_prefixes.iter().cloned().collect()
+    }
+
     /// Whether a URL is under a prefix approved after taint.
     pub fn prefix_approved(&self, url: &str) -> bool {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).approved_prefixes.iter().any(|p| url.starts_with(p.as_str()))

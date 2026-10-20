@@ -178,6 +178,8 @@ pub struct CommandContext<'a> {
     pub processes: Option<&'a [marv_tools::ProcessInfo]>,
     /// The session's switchboard as `/mesh` shows it; None when this Marv isn't on the mesh.
     pub mesh: Option<&'a MeshStatus>,
+    /// The session's grants for `/permissions` (#82); None: the client has none to show.
+    pub permissions: Option<&'a crate::permissions::Permissions>,
 }
 
 pub struct Command {
@@ -313,6 +315,28 @@ pub fn commands() -> &'static [Command] {
             run: |args, ctx| match on_off(args, "Usage: /yolo, /yolo on, or /yolo off") {
                 Ok(on) => CommandAction::Yolo { on: on.unwrap_or(!ctx.config.yolo) },
                 Err(e) => e,
+            },
+        },
+        Command {
+            name: "permissions",
+            // Only shows: the palette may run it while a reply streams.
+            while_busy: true,
+            description: "What Marv may do without asking: this session's approvals, and what's saved",
+            run: |args, ctx| {
+                if !args.trim().is_empty() {
+                    return error("Usage: /permissions (it only shows them)");
+                }
+                match ctx.permissions {
+                    None => print("Permissions aren't available here."),
+                    Some(p) => {
+                        let saved = crate::permissions::SavedGrants {
+                            path: &ctx.config_path,
+                            approve: &ctx.config.approve,
+                            writable: &ctx.config.writable,
+                        };
+                        markdown(crate::permissions::permissions_text(p, Some(saved), ctx.mcp.map(|m| m.0)))
+                    }
+                }
             },
         },
         Command {
@@ -1116,8 +1140,31 @@ mod tests {
             sandbox_available: true,
             processes: None,
             mesh: None,
+            permissions: None,
         };
         f(&ctx)
+    }
+
+    // #82: /permissions only shows; without the session's grants it says so, with them it renders them as markdown.
+    #[test]
+    fn permissions_shows_the_grants_and_takes_no_arguments() {
+        with(|ctx| {
+            assert_eq!(run_command("/permissions", ctx), print("Permissions aren't available here."));
+            assert!(matches!(run_command("/permissions revoke", ctx), CommandAction::Print { is_error: true, .. }));
+            let grants = crate::permissions::Permissions {
+                remembered: vec!["bash:git:git commit".into()],
+                pre_approved: vec!["web".into()],
+                ..Default::default()
+            };
+            let shown = CommandContext { permissions: Some(&grants), ..ctx.clone() };
+            let CommandAction::Print { text, is_error: false, markdown: true } = run_command("/permissions", &shown) else {
+                panic!()
+            };
+            assert!(text.contains("- Git commands that write: `git commit`"), "{text}");
+            assert!(text.contains("- `web` (from --approve)"), "{text}");
+            assert!(text.contains("- ~/.marv/config.json: no `approve` or `writable`"), "{text}");
+            assert!(commands().iter().any(|c| c.name == "permissions" && c.while_busy));
+        });
     }
 
     #[test]
