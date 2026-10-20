@@ -39,7 +39,7 @@ impl Home {
             .unwrap();
         dir.write(".zshrc", "# rc\n");
         // A hidden entry no other rule names (not a credential, not in HOME_MASKS): only the home's own rules close it.
-        dir.write(".notes/secret.txt", "SECRET-HIDDEN\n");
+        dir.write(".notes/hidden.txt", "SECRET-HIDDEN\n");
         dir.write("proj/.envrc", "export SAFE=1\n");
         dir.write("proj/pkg/AGENTS.md", "safe\n");
         dir.write("proj/src/main.rs", "fn main() {}\n");
@@ -257,7 +257,7 @@ fn the_home_marvs_config_and_credentials_cant_be_read() {
         ".cargo/credentials.toml",
         ".config/git/credentials",
         ".dotfiles/git-credentials",
-        ".notes/secret.txt",
+        ".notes/hidden.txt",
         ".zshrc",
     ] {
         let ran = home.run(&format!("cat '{h}/{file}'"));
@@ -285,8 +285,8 @@ fn the_home_marvs_config_and_credentials_cant_be_read() {
     for path in [
         format!("{h}/.ssh/known_hosts"),
         format!("{h}/.SSH/KNOWN_HOSTS"),
-        format!("{h}/.notes/secret.txt"),
-        format!("{h}/.NOTES/SECRET.TXT"),
+        format!("{h}/.notes/hidden.txt"),
+        format!("{h}/.NOTES/HIDDEN.TXT"),
         format!("{h}/Library/Keychains/k"),
         format!("{h}/LIBRARY/KEYCHAINS/K"),
     ] {
