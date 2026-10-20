@@ -1972,8 +1972,7 @@ impl Bridge {
             .into_iter()
             .map(|t| {
                 let request = if t.kind == marv_mesh::radio::Kind::Request { Some(t.id.as_str()) } else { t.reply_to.as_deref() }
-                    .and_then(|id| id.rsplit_once(':'))
-                    .map(|(_, seq)| format!("r{seq}"));
+                    .map(marv_mesh::radio::short_id);
                 view::RadioTraffic {
                     at_ms: t.at_ms,
                     id: t.id,
@@ -2031,8 +2030,8 @@ impl Bridge {
                 let view = self.radio_view();
                 let peer = radio.resolve(to).unwrap_or_else(|_| to.to_string());
                 let short = marv_tui::ui::radio_view::short_name(&view, &peer);
-                let seq = id.rsplit_once(':').map(|(_, seq)| seq).unwrap_or_default();
-                self.emit(system(printable(&format!("✻ Radio → @{short} request r{seq}: {text}")), false));
+                let request = marv_mesh::radio::short_id(&id);
+                self.emit(system(printable(&format!("✻ Radio → @{short} request {request}: {text}")), false));
             }
         }
     }
@@ -2050,8 +2049,7 @@ impl Bridge {
                 continue;
             }
             let from = t.peers.first().cloned().unwrap_or_default();
-            let short =
-                t.reply_to.as_deref().and_then(|r| r.rsplit_once(':')).map(|(_, seq)| format!(" r{seq}")).unwrap_or_default();
+            let short = t.reply_to.as_deref().map(|r| format!(" {}", marv_mesh::radio::short_id(r))).unwrap_or_default();
             self.emit(system(printable(&format!("✻ Radio ← {from} {}{short}: {}", t.kind.as_str(), t.text)), false));
         }
     }

@@ -441,7 +441,7 @@ impl RadioWakeBy {
     /// The transcript's line, in Marv's voice. `by` is shown, never believed.
     pub fn line(&self) -> String {
         let from = marv_core::printable(&self.from);
-        let short = |id: &str| id.rsplit_once(':').map(|(_, seq)| format!("r{seq}")).unwrap_or_default();
+        let short = marv_mesh::radio::short_id;
         match self.kind {
             Kind::Request => format!(
                 "Radio request {} from {from} ({}). Working on it; your approvals apply.",

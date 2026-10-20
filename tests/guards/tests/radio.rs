@@ -1708,8 +1708,7 @@ async fn a_report_wakes_the_requester_only_for_a_request_from_a_users_turn() {
     until("its report", 5, || reports_for(&alpha, &persons).len() == 1).await;
     let by = radio_wake_check(&alpha.sb, &mut limit, 60_000).wake.expect("this one wakes alpha");
     assert_eq!((by.kind, by.reply_to.as_deref()), (Kind::Failed, Some(persons.as_str())));
-    let seq = persons.rsplit_once(':').unwrap().1;
-    assert_eq!(by.line(), format!("Radio failed r{seq} from beta."));
+    assert_eq!(by.line(), format!("Radio failed {} from beta.", marv_mesh::radio::short_id(&persons)));
     assert_eq!(by.note(), marv_session::radio::RADIO_REPORT_WAKE_NOTE);
 }
 

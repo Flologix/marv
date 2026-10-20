@@ -306,7 +306,7 @@ impl RadioMessage {
     /// The radio's short id for the UI: `r<seq>` for a request (its own id, or the one a reply names).
     pub fn short_request(&self) -> Option<String> {
         let id = if self.kind == Kind::Request { Some(self.id.as_str()) } else { self.reply_to.as_deref() };
-        id.and_then(|id| id.rsplit_once(':')).map(|(_, seq)| format!("r{seq}"))
+        id.map(short_id)
     }
 
     /// How a model reads it: fenced, the fence's closing tag defused in the text (in any case). The attributes are
@@ -675,6 +675,22 @@ fn presence_frame(own: &str, seq: u64, presence: &Presence) -> Value {
     })
 }
 
+/// Where this process's frame numbers start: now in milliseconds, times 1000. A Marv that restarts under the same
+/// name never reuses an id its peers saw (it would have to send a thousand frames a millisecond), so a reply can't
+/// be matched to an older process's request (review of #181). Ids stay `<name>:<digits>`, as saved ones are.
+fn seq_epoch() -> u64 {
+    now_ms().saturating_mul(1000)
+}
+
+/// A radio id's short form for the person's eyes (`r` and the last four digits of its number): `r7` for
+/// `alpha:7`, `r4012` for `alpha:1792000000004012`. Only shown; matching always uses the whole id.
+pub fn short_id(id: &str) -> String {
+    let seq = id.rsplit_once(':').map_or("", |(_, seq)| seq);
+    let tail = &seq[seq.len().saturating_sub(4)..];
+    let tail = tail.trim_start_matches('0');
+    format!("r{}", if tail.is_empty() { "0" } else { tail })
+}
+
 /// A report's text cut to fit [`MAX_REPORT_BYTES`]: at the last sentence end that fits, else at a character, ending
 /// in `…`. A text that fits stays as it is.
 pub fn fit_report(text: &str) -> String {
@@ -938,7 +954,8 @@ struct Link {
     established: bool,
     stop: CancellationToken,
     dirty: Arc<Notify>,
-    /// Each line, and whether it's chatter (a `msg` or `request`) that a reply may take the place of (§5.3).
+    /// Each line, and whether it's chatter (a `msg`) that a reply may take the place of (§5.3). A request never is:
+    /// dropping it would leave its sender waiting for a report that can't come.
     queue: Arc<Mutex<VecDeque<(String, bool)>>>,
     queued: Arc<Notify>,
     /// Since when the queue has been full without emptying since (§5.3: a peer whose queue stays full for
@@ -960,9 +977,8 @@ impl Link {
         self.push_as(line, cap, true)
     }
 
-    /// [`Self::push`] for a reply (an `ack`, `done` or `failed`) or a refusal told back: over `cap`, it takes the place
-    /// of the oldest queued `msg` or `request` (replies matter more than chatter, §5.3); only a queue of replies
-    /// refuses it.
+    /// [`Self::push`] for a reply (an `ack`, `done` or `failed`): over `cap`, it takes the place of the oldest queued
+    /// `msg` (replies matter more than chatter, §5.3); a queue of replies and requests refuses it.
     fn push_reply(&self, line: String, cap: usize) -> bool {
         {
             let mut queue = self.queue();
@@ -1093,8 +1109,10 @@ pub struct Radio {
     outgoing: Mutex<BTreeMap<String, Outgoing>>,
     /// Requests this Marv received that it hasn't answered yet, by id. Only ever locked alone.
     incoming: Mutex<BTreeMap<String, OpenRequest>>,
-    /// Requests answered (sent or received), the newest last: each gets one `done` or `failed`. Only ever locked alone.
-    replied: Mutex<VecDeque<String>>,
+    /// Requests answered (sent or received), as `(peer, id)`, the newest last: each gets one `done` or `failed`.
+    /// Kept per peer and forgotten when its link ends: a Marv that restarts starts its ids again (review of #181).
+    /// Only ever locked alone.
+    replied: Mutex<VecDeque<(String, String)>>,
     changed: tokio::sync::watch::Sender<u64>,
     sb: Weak<Switchboard>,
     stop: CancellationToken,
@@ -1129,7 +1147,7 @@ impl Radio {
             on: AtomicBool::new(false),
             titles: AtomicBool::new(true),
             me: Mutex::new(Presence { name: sb.session.clone(), ..me }),
-            seq: AtomicU64::new(0),
+            seq: AtomicU64::new(seq_epoch()),
             next_link: AtomicU64::new(0),
             peers: Mutex::default(),
             outgoing: Mutex::default(),
@@ -1189,6 +1207,8 @@ impl Radio {
 
     /// Joins: from now on this Marv answers joins, joins every door on the radio and sends presence.
     pub async fn turn_on(self: &Arc<Self>) {
+        // Every link is new: what was answered on the old ones is forgotten (a peer's ids may start again).
+        self.replied().clear();
         self.on.store(true, Ordering::SeqCst);
         self.notify_ui();
         self.join_all().await;
@@ -1757,7 +1777,7 @@ impl Radio {
                     return self.refuse(link, record(&message, Outcome::Refused { reason }), RefusedCode::Invalid, None, false);
                 };
                 if message.kind != Kind::Ack {
-                    self.answered(&id);
+                    self.answered(peer, &id);
                 }
                 // A report wakes only for a request the person's own turn sent (§8.6, 3); an ack never.
                 message.wakes = message.kind != Kind::Ack && sent_at_hop == 0;
@@ -1780,6 +1800,8 @@ impl Radio {
         self.log_frame(record(&message, Outcome::Delivered));
         if message.kind == Kind::Request {
             let open = OpenRequest { id: message.id.clone(), from: peer.to_string(), hop: message.hop, at_ms: now_ms() };
+            // A new request under an id answered before (a sender whose clock went back) is a new request.
+            self.replied().retain(|(p, i)| !(p == peer && *i == open.id));
             self.incoming().insert(open.id.clone(), open);
             self.ack(link, peer, &message);
         }
@@ -1845,17 +1867,21 @@ impl Radio {
         self.incoming.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn replied(&self) -> MutexGuard<'_, VecDeque<String>> {
+    fn replied(&self) -> MutexGuard<'_, VecDeque<(String, String)>> {
         self.replied.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// `id` got its one report.
-    fn answered(&self, id: &str) {
+    /// `id`, a request between this Marv and `peer`, got its one report.
+    fn answered(&self, peer: &str, id: &str) {
         let mut replied = self.replied();
         if replied.len() >= REPLIED_KEPT {
             replied.pop_front();
         }
-        replied.push_back(id.to_string());
+        replied.push_back((peer.to_string(), id.to_string()));
+    }
+
+    fn was_answered(&self, peer: &str, id: &str) -> bool {
+        self.replied().iter().any(|(p, i)| p == peer && i == id)
     }
 
     /// A refused message: logged (never its text), the sender told with `code` on its own link when `tell` (best
@@ -1902,7 +1928,7 @@ impl Radio {
             if outgoing.get(id).is_some_and(|o| o.peer == peer) { outgoing.remove(id) } else { None }
         };
         if let Some(open) = request {
-            self.answered(id);
+            self.answered(peer, id);
             self.fail_locally(peer, id, open.hop, &format!("{peer} refused the request: {}", code.words()));
         }
         let mut traffic = self.traffic();
@@ -2091,7 +2117,7 @@ impl Radio {
             return Err(why.clone());
         }
         self.incoming().remove(reply_to);
-        self.answered(reply_to);
+        self.answered(&open.from, reply_to);
         Ok(open.from)
     }
 
@@ -2099,14 +2125,16 @@ impl Radio {
     /// with no model call. `text` is cut to fit [`MAX_REPORT_BYTES`] here if the caller didn't. Once: a request the
     /// model already answered gets nothing.
     pub fn report(&self, open: &OpenRequest, kind: Kind, hop: u32, text: &str, elapsed_ms: u64) -> ReportOutcome {
-        if self.replied().iter().any(|id| *id == open.id) {
+        // Closed here whatever comes next: an answered request must not stay open (it would count against its
+        // sender's limit for good).
+        self.incoming().remove(&open.id);
+        if self.was_answered(&open.from, &open.id) {
             return ReportOutcome::AlreadyAnswered;
         }
         if !matches!(kind, Kind::Done | Kind::Failed) || !open.valid() {
             return ReportOutcome::NotSent("not a report".into());
         }
-        self.incoming().remove(&open.id);
-        self.answered(&open.id);
+        self.answered(&open.from, &open.id);
         if !self.is_on() {
             return ReportOutcome::NotSent("the radio is off".into());
         }
@@ -2139,7 +2167,7 @@ impl Radio {
     /// A request a resumed session still owes a report: open again here unless it was answered (a saved one that
     /// breaks the rules is ignored).
     pub fn reopen(&self, open: &OpenRequest) {
-        if open.valid() && !self.replied().iter().any(|id| *id == open.id) {
+        if open.valid() && !self.was_answered(&open.from, &open.id) {
             self.incoming().entry(open.id.clone()).or_insert_with(|| open.clone());
         }
     }
@@ -2248,12 +2276,11 @@ impl Radio {
                     Some(entry) if entry.linked().is_some_and(|l| l.established) => {
                         let link = entry.link.clone().expect("linked");
                         let rate = if chatter { self.take_rate(peer, false, at_ms) } else { Ok(()) };
-                        let queued = |link: &Link| {
-                            if chatter {
-                                link.push(line.clone(), self.limits.send_queue)
-                            } else {
-                                link.push_reply(line.clone(), self.limits.send_queue)
-                            }
+                        // Only a `msg` may give its place to a reply: a request stays queued (review of #181).
+                        let queued = |link: &Link| match kind {
+                            Kind::Msg => link.push(line.clone(), self.limits.send_queue),
+                            Kind::Request => link.push_as(line.clone(), self.limits.send_queue, false),
+                            _ => link.push_reply(line.clone(), self.limits.send_queue),
                         };
                         match rate {
                             Err(crate::MeshError::RateLimited { retry_ms, .. }) => Some(format!(
@@ -2335,8 +2362,12 @@ impl Radio {
             ids.into_iter().filter_map(|id| outgoing.remove(&id).map(|o| (id, o.hop))).collect()
         };
         for (id, hop) in unanswered {
-            self.answered(&id);
             self.fail_locally(peer, &id, hop, &format!("{peer} left the radio before reporting"));
+        }
+        // Its ids may come again from a new process of the same name: what was answered on this link is forgotten.
+        // (Off the radio, it's kept until it's on again, so the reports `turn_off` sent still count as sent.)
+        if self.is_on() {
+            self.replied().retain(|(p, _)| p != peer);
         }
         if lost && self.is_on() {
             self.record(peer, RadioEvent::Lost, None);
@@ -2881,6 +2912,91 @@ mod tests {
         let back = a._sb.unread_radio().into_iter().find(|m| m.reply_to.as_deref() == Some(refused.as_str())).unwrap();
         assert_eq!((back.kind, back.by), (Kind::Failed, By::Marv));
         assert!(back.text.starts_with("gamma refused the request"), "{}", back.text);
+    }
+
+    /// Review of #181: ids are `<name>:<digits>` with a per-process start, short for the eye, and saved ones load.
+    #[test]
+    fn ids_start_per_process_and_saved_ones_still_load() {
+        assert!(seq_epoch() > 1_700_000_000_000_000, "milliseconds times 1000");
+        assert!(valid_id(&format!("alpha:{}", u64::MAX)));
+        assert_eq!(
+            (short_id("alpha:7"), short_id("alpha:1792000000004012"), short_id("a:10000")),
+            ("r7".into(), "r4012".into(), "r0".into())
+        );
+        let old: OpenRequest = serde_json::from_value(json!({"id": "alpha:3", "from": "alpha", "hop": 0, "at_ms": 1})).unwrap();
+        assert!(old.valid());
+    }
+
+    /// Review of #181: a full link queue gives a `msg`'s place to a reply, never a request's.
+    /// Proven: `push_reply` evicting any line → failed.
+    #[tokio::test]
+    async fn a_reply_never_takes_a_requests_place() {
+        let mesh = Runtime::new();
+        let a = marv("alpha", &mesh.0, fast());
+        let link = a.radio.new_link(true, true);
+        assert!(link.push_as("request 1".into(), 2, false) && link.push("msg".into(), 2));
+        assert!(link.push_reply("reply 1".into(), 2), "the msg made room");
+        assert!(!link.push_reply("reply 2".into(), 2), "a request is never dropped");
+        assert_eq!((link.pop(), link.pop(), link.pop()), (Some("request 1".into()), Some("reply 1".into()), None));
+    }
+
+    /// Review of #181: a reply from another Marv than the one asked is refused, and the request stays open.
+    /// Proven: without the peer check on `outgoing` in `receive` → failed (gamma's report closed it).
+    #[tokio::test]
+    async fn a_reply_from_the_wrong_peer_is_refused() {
+        let mesh = Runtime::new();
+        let (a, b, c) = (marv("alpha", &mesh.0, fast()), marv("beta", &mesh.0, fast()), marv("gamma", &mesh.0, fast()));
+        for m in [&a, &b, &c] {
+            m.radio.turn_on().await;
+        }
+        until("links", || a.radio.links().len() == 2).await;
+        let id = a.radio.send_request("beta", By::User, 0, "yours").unwrap();
+        until("the ack", || a._sb.unread_radio().iter().any(|m| m.kind == Kind::Ack)).await;
+        let forged = OpenRequest { id: id.clone(), from: "alpha".into(), hop: 0, at_ms: 0 };
+        assert_eq!(c.radio.report(&forged, Kind::Done, 0, "gamma says it's done", 0), ReportOutcome::Sent);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(a.radio.awaiting(&id), "still open");
+        assert!(a._sb.unread_radio().iter().all(|m| m.kind == Kind::Ack), "gamma's report never landed");
+        assert_eq!(b.radio.report(&open_at(&b), Kind::Done, 0, "done", 0), ReportOutcome::Sent);
+        until("beta's report", || a._sb.unread_radio().iter().any(|m| m.kind == Kind::Done)).await;
+    }
+
+    /// Review of #181: a Marv that restarts under the same name gets its requests acked and reported, and its
+    /// peer keeps no open request for it: its ids start afresh (a later epoch), and even one that repeats an id
+    /// answered before (a clock that went back) is a new request, since what was answered is forgotten with the link.
+    /// Proven: `seq_epoch` returning 0 → failed (the same ids); without both `replied` clean-ups → failed (no report).
+    #[tokio::test]
+    async fn a_restarted_marv_gets_its_requests_answered() {
+        let mesh = Runtime::new();
+        let b = marv("beta", &mesh.0, fast());
+        b.radio.turn_on().await;
+        let mut old_id = String::new();
+        for round in 0..3 {
+            let a = marv("alpha", &mesh.0, fast());
+            if round == 2 {
+                // The clock went back: the next id is the last one again.
+                let seq: u64 = old_id.rsplit_once(':').unwrap().1.parse().unwrap();
+                a.radio.seq.store(seq - 1, Ordering::SeqCst);
+            }
+            a.radio.turn_on().await;
+            until("a link", || a.radio.links().len() == 1 && b.radio.links().len() == 1).await;
+            let id = a.radio.send_request("beta", By::User, 0, "again").unwrap();
+            if round == 1 {
+                assert_ne!(id, old_id, "a new process, new ids");
+            }
+            if round == 2 {
+                assert_eq!(id, old_id);
+            }
+            until("the request at beta", || b.radio.open_requests().iter().any(|r| r.id == id)).await;
+            assert_eq!(b.radio.report(&open_at(&b), Kind::Done, 0, "done", 0), ReportOutcome::Sent, "round {round}");
+            until("the report", || a._sb.unread_radio().iter().any(|m| m.kind == Kind::Done)).await;
+            assert!(b.radio.open_requests().is_empty(), "round {round}");
+            old_id = id;
+            // Killed: no leave, its links just end.
+            a.radio.stop();
+            drop(a);
+            until("alpha gone", || b.radio.links().is_empty()).await;
+        }
     }
 
     #[tokio::test]

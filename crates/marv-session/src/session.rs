@@ -1373,7 +1373,7 @@ impl MarvSession {
         let hop = self.inner.radio_hop.get();
         let now = crate::radio::now_ms();
         for open in open {
-            let short = open.id.rsplit_once(':').map(|(_, seq)| format!("r{seq}")).unwrap_or_default();
+            let short = marv_mesh::radio::short_id(&open.id);
             let line = match radio.report(&open, kind, hop, &text, now.saturating_sub(open.at_ms)) {
                 marv_mesh::radio::ReportOutcome::Sent => format!("Radio → {} {} {short}", open.from, kind.as_str()),
                 marv_mesh::radio::ReportOutcome::AlreadyAnswered => continue,
