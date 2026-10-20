@@ -278,17 +278,17 @@ fn the_home_marvs_config_and_credentials_cant_be_read() {
     let ran = home.run_with(&sandbox, &home.proj(), false, &format!("cat '{}/config.json'", config.path().display()));
     assert!(!ran.output.contains("SECRET"), "{}", ran.output);
     assert!(host(home.home(), &format!("cat '{}/config.json'", config.path().display())).output.contains("SECRET"), "control");
-    // A home-folder project: the hidden entries and ~/Library stay closed, upper-cased too (APFS ignores case).
+    // A home-folder project: the hidden entries and ~/Library stay closed, their names upper-cased too (APFS ignores
+    // case). (An upper-cased `/PRIVATE/VAR/TMP` prefix fails outside the sandbox too, so only the names are.)
     std::fs::create_dir_all(home.home().join("Library/Keychains")).unwrap();
     home.dir.write("Library/Keychains/k", "SECRET-KEYCHAIN");
-    let upper = h.to_uppercase();
     for path in [
         format!("{h}/.ssh/known_hosts"),
-        format!("{upper}/.SSH/KNOWN_HOSTS"),
+        format!("{h}/.SSH/KNOWN_HOSTS"),
         format!("{h}/.notes/secret.txt"),
-        format!("{upper}/.NOTES/SECRET.TXT"),
+        format!("{h}/.NOTES/SECRET.TXT"),
         format!("{h}/Library/Keychains/k"),
-        format!("{upper}/LIBRARY/KEYCHAINS/K"),
+        format!("{h}/LIBRARY/KEYCHAINS/K"),
     ] {
         let ran = home.run_with(&home.sandbox(), home.home(), false, &format!("cat '{path}'"));
         assert!(!ran.output.contains("SECRET"), "home project, {path}: {}", ran.output);
