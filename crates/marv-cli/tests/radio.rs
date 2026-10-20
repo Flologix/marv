@@ -3,7 +3,8 @@
 //! the prompt and `marv mesh ls` says their radio is on; a third without it is on the mesh but not on the radio. One
 //! killed with SIGKILL shows `left (lost)` on the other's strip, and its dead door socket is swept at once. Phase 2: a
 //! person's `/tx` reaches the other Marv's model fenced, wakes it (wake on), and never reaches the sender's own model.
-//! Skipped without python3.
+//! Phase 3: the #123 example: one Marv's model asks the other to start hack.py; the other acks, its woken turn ends,
+//! and its report comes back fenced to the first, waking it. Skipped without python3.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -290,5 +291,71 @@ fn a_tx_reaches_the_other_marvs_model_fenced_and_wakes_it() {
     assert!(tools.contains(&"radio_tx"), "{tools:?}");
     wait_for("beta's wake line", || beta.screen().contains("✻Radiomessagefromalpha(user)."));
     assert!(!alpha_model.requests().iter().any(|r| r.path.ends_with("/chat/completions")), "nothing reached alpha's own model");
+    drop((alpha, beta));
+}
+
+/// Phase 3, the #123 example end to end: alpha's model asks beta, with `radio_tx` (`kind: "request"`), to start
+/// hack.py. beta (wake on, idle) acks at once and is woken by the request (Marv's line says so); its scripted turn
+/// ends, and its report goes back with no extra model call: `done` with its reply's first paragraph. alpha (wake on)
+/// shows the report, and its model reads the ack and the report fenced as another Marv's data (at its next step, or
+/// in the turn the report wakes: the request came from its person's own turn).
+#[test]
+fn a_request_is_acked_handled_and_reported_back() {
+    if !python() {
+        eprintln!("skipped: no python3 with pty");
+        return;
+    }
+    use marv_oracle::script::{Reply, ScriptCall};
+    let machine = Machine::new();
+    let ask = ScriptCall {
+        id: Some("t1".into()),
+        name: "radio_tx".into(),
+        arguments: json!({"to": "beta", "kind": "request", "text": "Please start ~/hack.py and keep it running."}),
+    };
+    let alpha_model = FakeServer::start(
+        vec![
+            Reply { tool_calls: vec![ask], ..Reply::default() },
+            Reply { text: "beta is on it.".into(), ..Reply::default() },
+            Reply { text: "beta started it.".into(), ..Reply::default() },
+        ],
+        vec![],
+    )
+    .unwrap();
+    let beta_model = FakeServer::start(
+        vec![Reply {
+            text: "Started hack-matrix with the process tool.\n\nIts output is in the log.".into(),
+            ..Reply::default()
+        }],
+        vec![],
+    )
+    .unwrap();
+    let mut alpha = machine.tui_with("alpha", &alpha_model, json!({"radio": true, "wake": true}));
+    let beta = machine.tui_with("beta", &beta_model, json!({"radio": true, "wake": true}));
+    wait_for("beta in alpha's strip", || alpha.screen().contains("betaidle"));
+    wait_for("alpha in beta's strip", || beta.screen().contains("alphaidle"));
+
+    alpha.type_line("can you get the marv agent to start hack.py");
+    wait_for("beta's wake line", || beta.screen().contains("✻Radiorequestr"));
+    wait_for("beta's report line", || beta.screen().contains("✻Radio→alphadoner"));
+    let chats = |server: &FakeServer| -> Vec<Value> {
+        server
+            .requests()
+            .into_iter()
+            .filter(|r| r.path.ends_with("/chat/completions"))
+            .map(|r| serde_json::from_str(&r.body).unwrap())
+            .collect()
+    };
+    assert_eq!(chats(&beta_model).len(), 1, "the report took no model call");
+    let to_beta = chats(&beta_model)[0]["messages"].to_string();
+    assert!(to_beta.contains(r#"kind=\"request\""#) && to_beta.contains("Please start ~/hack.py"), "{to_beta}");
+    assert!(to_beta.contains("the radio request above is from another of the user's Marvs"), "{to_beta}");
+
+    wait_for("alpha's report line", || alpha.screen().contains("✻Radio←betadoner"));
+    // The ack is read at alpha's next step; the report, usually, by the turn it wakes (or at a step, if it's quick).
+    let read = || chats(&alpha_model).iter().map(|c| c["messages"].to_string()).collect::<Vec<_>>();
+    wait_for("alpha's model reads the report", || read().iter().any(|m| m.contains(r#"kind=\"done\""#)));
+    let all = read().join("\n");
+    assert!(all.contains(r#"kind=\"ack\""#), "{all}");
+    assert!(all.contains("Started hack-matrix with the process tool.") && !all.contains("Its output is in the log"), "{all}");
     drop((alpha, beta));
 }

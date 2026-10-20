@@ -350,7 +350,7 @@ mod tests {
         let mut ack = said("flologix-58a7:3", false, &["flologix-58a7"], "marv", "on it", 0);
         (ack.kind, ack.request) = ("ack".into(), Some("r17".into()));
         v.traffic = vec![request, ack];
-        let area = Rect::new(0, 0, 100, 12);
+        let area = Rect::new(0, 0, 100, 16);
         let mut buf = Buffer::empty(area);
         RadioPanel::render(&v, 1_000, area, &mut buf);
         let screen: String =
