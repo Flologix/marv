@@ -20,4 +20,5 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: /usr/bin/sandbox-exec -p '(version 1)(allow default)' /usr/bin/true
       - run: cargo test -p marv-sandbox --lib
+      - run: cargo test -p marv-cli --test radio two_marvs -- --nocapture
       - run: cargo test -p marv-guards --test seatbelt --test sandbox --no-fail-fast -- --test-threads=4
