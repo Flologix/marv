@@ -1,5 +1,5 @@
-// Unit tests for the npm launcher's messages (#153): `node --test packaging/npm/launcher.test.js`. The launcher itself runs only as
-// the main module, so requiring it here starts nothing.
+// Unit tests for the npm launcher's messages (#153): `node --test packaging/npm/launcher.test.js`. The launcher
+// itself runs only as the main module, so requiring it here starts nothing.
 "use strict";
 
 const test = require("node:test");
