@@ -18,7 +18,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
       - run: /usr/bin/sandbox-exec -p '(version 1)(allow default)' /usr/bin/true
       - run: cargo test -p marv-sandbox --lib
-      - run: cargo test -p marv-cli --test radio -- --nocapture
+      - run: cargo test -p marv-sandbox --test seatbelt_probe probe_round4 -- --ignored --nocapture
       - run: cargo test -p marv-guards --test seatbelt --test sandbox --no-fail-fast -- --test-threads=4

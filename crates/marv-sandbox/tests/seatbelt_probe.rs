@@ -852,3 +852,50 @@ fn probe_round3() {
     note("log.denied_sysctls", names.join(", "));
     println!("\n===== REPORT =====\n{}\n===== END =====", report.join("\n"));
 }
+
+/// Round 4: with the profile as it ships now, the interface list (node, Go) with and without network, and pnpm's
+/// clone import with network (the store in the TMPDIR or where pnpm puts it by default).
+#[test]
+#[ignore = "a report for #166: run with --ignored --nocapture on macOS"]
+fn probe_round4() {
+    let mut report: Vec<String> = Vec::new();
+    let mut note = |name: &str, what: String| {
+        println!("PROBE {name}: {what}");
+        report.push(format!("{name}: {what}"));
+    };
+    let fx = Fx::new("r4");
+    let off = fx.profile(false);
+    let on = fx.profile(true);
+    let node_ifaces = r#"node -e 'console.log(JSON.stringify(Object.keys(require("os").networkInterfaces())))'"#;
+    std::fs::write(
+        fx.root.join("ifaces.go"),
+        "package main\nimport (\"fmt\"; \"net\")\nfunc main() { i, err := net.Interfaces(); fmt.Println(len(i), err) }\n",
+    )
+    .unwrap();
+    for (name, prof) in [("network_off", &off), ("network_on", &on)] {
+        note(&format!("ifaces.node.{name}"), fx.sh(prof, &fx.root, node_ifaces).to_string());
+        note(&format!("ifaces.go.{name}"), fx.sh(prof, &fx.root, "go version && go run ifaces.go").to_string());
+        note(
+            &format!("cpus.node.{name}"),
+            fx.sh(prof, &fx.root, "node -e 'console.log(require(\"os\").cpus().length)'").to_string(),
+        );
+        note(&format!("sysctl_n.{name}"), fx.sh(prof, &fx.root, "sysctl -n hw.ncpu").to_string());
+    }
+    std::fs::write(fx.root.join("package.json"), "{\"name\":\"p\",\"version\":\"1.0.0\"}\n").unwrap();
+    for (name, script) in [
+        ("pnpm.version", "npx -y pnpm@9 --version"),
+        ("pnpm.add_default_store", "npx -y pnpm@9 add is-number@7 && ls node_modules"),
+        (
+            "pnpm.add_clone_tmp_store",
+            "rm -rf node_modules; npx -y pnpm@9 add is-number@7 --package-import-method clone --store-dir \"$TMPDIR/pnpm-store\" && ls node_modules",
+        ),
+        (
+            "pnpm.add_auto_tmp_store",
+            "rm -rf node_modules; npx -y pnpm@9 add is-number@7 --store-dir \"$TMPDIR/pnpm-store\" && ls node_modules/.pnpm | head -3",
+        ),
+        ("npm.install", "rm -rf node_modules; npm install is-number@7 --no-audit --no-fund && ls node_modules"),
+    ] {
+        note(name, fx.sh(&on, &fx.root, script).to_string());
+    }
+    println!("\n===== REPORT =====\n{}\n===== END =====", report.join("\n"));
+}
