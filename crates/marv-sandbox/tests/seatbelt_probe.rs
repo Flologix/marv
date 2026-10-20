@@ -464,3 +464,141 @@ fn probe_report() {
 
     println!("\n===== REPORT =====\n{}\n===== END =====", report.join("\n"));
 }
+
+/// Round 2: `link()` itself (python's `os.link`, no `stat` of the source first, as `ln` does), the sysctls node's
+/// `os.networkInterfaces()` and `sysctl -n` need, Apple Events that really leave the process, and kqueue on a child
+/// that has exited but isn't reaped yet.
+#[test]
+#[ignore = "a report for #166: run with --ignored --nocapture on macOS"]
+fn probe_round2() {
+    let mut report: Vec<String> = Vec::new();
+    let mut note = |name: &str, what: String| {
+        println!("PROBE {name}: {what}");
+        report.push(format!("{name}: {what}"));
+    };
+    let fx = Fx::new("r2");
+    let full = fx.profile(false);
+    let net = fx.profile(true);
+    let linking = seatbelt::profile_allowing_links(&fx.plan(&fx.root, false), &fx.run(), &RealFs).unwrap();
+    // A file the user owns outside the home and every allowed folder, on the same volume: /Users/Shared.
+    let outside_dir = PathBuf::from(format!("/Users/Shared/mx-probe-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&outside_dir);
+    let made_outside = std::fs::create_dir_all(&outside_dir).is_ok();
+    let outside = outside_dir.join("victim");
+    let _ = std::fs::write(&outside, "untouched\n");
+    note("setup.outside_writable", made_outside.to_string());
+    let cargo_env = fx.home.join(".cargo/env");
+    note("setup.cargo_env_exists", cargo_env.exists().to_string());
+    std::fs::write(fx.tmp.join("t"), "t\n").unwrap();
+    std::fs::write(fx.root.join("plain"), "p\n").unwrap();
+    let pylink = |src: &Path, dst: &str| {
+        format!(
+            "python3 -c 'import os,sys; os.link(sys.argv[1], sys.argv[2]); print(\"linked\")' '{}' \"{dst}\"",
+            src.display()
+        )
+    };
+    for (name, prof) in [("links_allowed", &linking), ("links_off", &full)] {
+        let cases: Vec<(&str, String)> = vec![
+            ("secret_to_project", pylink(&fx.secret, "x1")),
+            ("secret_to_tmpdir", pylink(&fx.secret, "$TMPDIR/x2")),
+            ("outside_to_project", format!("{} && echo pwned >> x3; cat '{}'", pylink(&outside, "x3"), outside.display())),
+            ("outside_to_tmpdir", pylink(&outside, "$TMPDIR/x4")),
+            ("cargo_env_to_project", pylink(&cargo_env, "x5")),
+            ("envrc_to_project", pylink(&fx.root.join(".envrc"), "x6")),
+            ("agents_to_tmpdir", pylink(&fx.root.join("pkg/AGENTS.md"), "$TMPDIR/x7")),
+            ("plain_to_tmpdir", pylink(&fx.root.join("plain"), "$TMPDIR/x8")),
+            ("tmpdir_to_project", pylink(&fx.tmp.join("t"), "x9")),
+            ("project_to_outside", pylink(&fx.root.join("plain"), &outside_dir.join("x10").to_string_lossy())),
+        ];
+        for (case, script) in cases {
+            note(&format!("pylink.{name}.{case}"), fx.sh(prof, &fx.root, &script).to_string());
+        }
+        for f in ["x1", "x3", "x5", "x6", "x9"] {
+            let _ = std::fs::remove_file(fx.root.join(f));
+        }
+        for f in ["x2", "x4", "x7", "x8"] {
+            let _ = std::fs::remove_file(fx.tmp.join(f));
+        }
+    }
+    note("pylink.outside_after", std::fs::read_to_string(&outside).unwrap_or_default().replace('\n', " | "));
+    let _ = std::fs::remove_dir_all(&outside_dir);
+
+    // Sysctls: what node's os.networkInterfaces() and `sysctl -n` need.
+    let with = |extra: &str| Profile { text: format!("{}\n{extra}\n", full.text), params: full.params.clone() };
+    let node_ifaces = r#"node -e 'console.log(JSON.stringify(Object.keys(require("os").networkInterfaces())))'"#;
+    note("ifaces.node.network_on", fx.sh(&net, &fx.root, node_ifaces).to_string());
+    note("ifaces.node.routetable", fx.sh(&with("(allow sysctl-read (sysctl-name-prefix \"net.routetable.\"))"), &fx.root, node_ifaces).to_string());
+    note("ifaces.python_if_nameindex", fx.sh(&full, &fx.root, "python3 -c 'import socket; print(socket.if_nameindex())'").to_string());
+    let sysctl_meta = "(allow sysctl-read (sysctl-name \"sysctl.name2oid\") (sysctl-name-prefix \"sysctl.oidfmt.\"))";
+    note("sysctl_n.with_meta", fx.sh(&with(sysctl_meta), &fx.root, "sysctl -n hw.ncpu hw.memsize").to_string());
+    note("sysctl_n.brand_with_meta", fx.sh(&with(sysctl_meta), &fx.root, "sysctl -n machdep.cpu.brand_string").to_string());
+    note("node.cpus", fx.sh(&full, &fx.root, "node -e 'console.log(require(\"os\").cpus().length, require(\"os\").cpus()[0].model)'").to_string());
+    note("python.platform", fx.sh(&full, &fx.root, "python3 -c 'import platform, os; print(platform.platform(), platform.processor(), os.cpu_count())'").to_string());
+    let go = output(Command::new("/bin/sh").args(["-c", "ls -d /Users/runner/hostedtoolcache/go/*/arm64/bin 2>/dev/null | tail -1"])).out.trim().to_string();
+    if !go.is_empty() {
+        std::fs::write(
+            fx.root.join("ifaces.go"),
+            "package main\nimport (\"fmt\"; \"net\")\nfunc main() { i, err := net.Interfaces(); fmt.Println(len(i), err) }\n",
+        )
+        .unwrap();
+        note("ifaces.go", fx.sh(&full, &fx.root, &format!("PATH={go}:$PATH; go run ifaces.go")).to_string());
+        note("ifaces.go.routetable", fx.sh(&with("(allow sysctl-read (sysctl-name-prefix \"net.routetable.\"))"), &fx.root, &format!("PATH={go}:$PATH; go run ifaces.go")).to_string());
+    } else {
+        note("ifaces.go", "no go on the runner".into());
+    }
+
+    // Apple Events that leave the process (an application's `name` is answered locally).
+    for (name, script) in [
+        ("finder_windows", "osascript -e 'tell application \"Finder\" to count windows'"),
+        ("system_events", "osascript -e 'tell application \"System Events\" to get name of first process'"),
+        ("finder_desktop", "osascript -e 'tell application \"Finder\" to get POSIX path of (desktop as alias)'"),
+    ] {
+        note(&format!("appleevents.{name}.sandboxed"), fx.sh(&full, &fx.root, script).to_string());
+        note(&format!("appleevents.{name}.unsandboxed"), output(Command::new("/bin/bash").args(["-c", script])).to_string());
+    }
+    note("launchctl.after", output(Command::new("/bin/launchctl").args(["list", "mx-probe"])).to_string());
+
+    // kqueue NOTE_EXIT on a child that exited and isn't reaped yet (a zombie).
+    {
+        use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
+        let mut child = Command::new("/usr/bin/true").spawn().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let kq = Kqueue::new().unwrap();
+        let change = KEvent::new(
+            child.id() as usize,
+            EventFilter::EVFILT_PROC,
+            EvFlags::EV_ADD | EvFlags::EV_ONESHOT,
+            FilterFlag::NOTE_EXIT,
+            0,
+            0,
+        );
+        let mut events = [KEvent::new(0, EventFilter::EVFILT_PROC, EvFlags::empty(), FilterFlag::empty(), 0, 0)];
+        let timeout = nix::libc::timespec { tv_sec: 2, tv_nsec: 0 };
+        let got = kq.kevent(&[change], &mut events, Some(timeout));
+        note(
+            "kqueue.zombie",
+            format!(
+                "{got:?} flags={:?} fflags={:?} data={}",
+                events[0].flags(),
+                events[0].fflags(),
+                events[0].data()
+            ),
+        );
+        let _ = child.wait();
+        let mut running = Command::new("/bin/sleep").arg("0.5").spawn().unwrap();
+        let change = KEvent::new(
+            running.id() as usize,
+            EventFilter::EVFILT_PROC,
+            EvFlags::EV_ADD | EvFlags::EV_ONESHOT,
+            FilterFlag::NOTE_EXIT,
+            0,
+            0,
+        );
+        let started = std::time::Instant::now();
+        let got = kq.kevent(&[change], &mut events, Some(timeout));
+        note("kqueue.running", format!("{got:?} after {:?} fflags={:?}", started.elapsed(), events[0].fflags()));
+        note("kqueue.running.unreaped", format!("{:?}", running.try_wait()));
+        let _ = running.wait();
+    }
+    println!("\n===== REPORT =====\n{}\n===== END =====", report.join("\n"));
+}
