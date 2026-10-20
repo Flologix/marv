@@ -2881,6 +2881,7 @@ dependencies = [
  "marv-core",
  "marv-mcp",
  "marv-provider",
+ "marv-sandbox",
  "marv-session",
  "marv-tools",
  "serde",
