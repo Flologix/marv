@@ -38,6 +38,8 @@ impl Home {
         std::os::unix::fs::symlink(dir.path().join(".dotfiles/git-credentials"), dir.path().join(".config/git/credentials"))
             .unwrap();
         dir.write(".zshrc", "# rc\n");
+        // A hidden entry no other rule names (not a credential, not in HOME_MASKS): only the home's own rules close it.
+        dir.write(".notes/secret.txt", "SECRET-HIDDEN\n");
         dir.write("proj/.envrc", "export SAFE=1\n");
         dir.write("proj/pkg/AGENTS.md", "safe\n");
         dir.write("proj/src/main.rs", "fn main() {}\n");
@@ -157,7 +159,7 @@ fn a_keychain_item_cant_be_read_with_or_without_network() {
     let control = host(home.home(), &find);
     if !added.status.success() || !control.output.contains("SECRET-KEYCHAIN-ITEM") {
         // The limit, said: without a keychain to put an item in, only the refusal of the keychain itself is checked.
-        eprintln!(
+        println!(
             "limit: no keychain item could be made and read back here ({}{}); checking only that the sandbox can't list keychains",
             String::from_utf8_lossy(&added.stderr).trim(),
             control.output.trim()
@@ -255,6 +257,7 @@ fn the_home_marvs_config_and_credentials_cant_be_read() {
         ".cargo/credentials.toml",
         ".config/git/credentials",
         ".dotfiles/git-credentials",
+        ".notes/secret.txt",
         ".zshrc",
     ] {
         let ran = home.run(&format!("cat '{h}/{file}'"));
@@ -282,6 +285,8 @@ fn the_home_marvs_config_and_credentials_cant_be_read() {
     for path in [
         format!("{h}/.ssh/known_hosts"),
         format!("{upper}/.SSH/KNOWN_HOSTS"),
+        format!("{h}/.notes/secret.txt"),
+        format!("{upper}/.NOTES/SECRET.TXT"),
         format!("{h}/Library/Keychains/k"),
         format!("{upper}/LIBRARY/KEYCHAINS/K"),
     ] {
