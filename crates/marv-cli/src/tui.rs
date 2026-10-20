@@ -1720,7 +1720,7 @@ impl Bridge {
                 Some(radio) if radio.is_on() => self.emit(UiEvent::OpenRadio),
                 Some(_) => self.emit(system(commands::RADIO_OFF, false)),
                 None => self.emit(system(
-                    "This Marv isn't on the mesh (no XDG_RUNTIME_DIR, or its door didn't open), so it isn't on the radio.",
+                    "This Marv isn't on the mesh (no runtime folder, or its door didn't open), so it isn't on the radio.",
                     false,
                 )),
             },
@@ -2023,7 +2023,7 @@ impl Bridge {
                      for this one."
                 }
             ),
-            (true, None) => "Radio on, saved. This Marv isn't on the mesh (no XDG_RUNTIME_DIR, or its door didn't open), \
+            (true, None) => "Radio on, saved. This Marv isn't on the mesh (no runtime folder, or its door didn't open), \
                  so it joins from the next start."
                 .to_string(),
             (false, _) => "Radio off: this Marv left it.".to_string(),
@@ -2560,8 +2560,8 @@ pub fn merge_pre_approved(mut from_config: Vec<String>, from_cli: &[String]) -> 
 
 /// Extra writable sandbox folders (#98): resolved once here (refused entries are problems, never mounts).
 pub fn resolve_writable(config: &[String], home: &Path, root: &Path, config_dir: &Path) -> (Vec<PathBuf>, Vec<String>) {
-    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from);
-    marv_sandbox::resolve_writable(config, home, root, runtime.as_deref(), Some(config_dir))
+    let runtime = marv_sandbox::runtime_paths(&marv_sandbox::runtime_env());
+    marv_sandbox::resolve_writable(config, home, root, &runtime, Some(config_dir))
 }
 
 pub async fn run(resume: Option<bool>, approve: Vec<String>) -> anyhow::Result<i32> {
@@ -2624,6 +2624,8 @@ pub async fn run(resume: Option<bool>, approve: Vec<String>) -> anyhow::Result<i
     let herdr = herdr_target(&env).map(|target| HerdrReporter::new(target, None));
     // The mesh (v2): this Marv's switchboard, put on the mesh once the TUI can ask for wires (below).
     let (mut mesh, mut mesh_note) = match crate::mesh_cmd::start(&env, &root, &door_outside) {
+        // A MARV_RUNTIME_DIR that was refused says why (a symlink on the way, say), rather than the mesh just being off.
+        Ok(None) => (None, marv_sandbox::override_refusal(&env).map(|why| (format!("Not on the mesh: {why}"), true))),
         Ok(mesh) => (mesh, None),
         Err(e) => (None, Some((format!("Not on the mesh: {e}"), true))),
     };
@@ -2661,7 +2663,7 @@ pub async fn run(resume: Option<bool>, approve: Vec<String>) -> anyhow::Result<i
         mcp: Some(mcp.clone()),
         mcp_problems,
         hidden_path_folders: hidden,
-        sandbox_available: marv_sandbox::bwrap::sandbox_available(),
+        sandbox_available: marv_sandbox::backend().available(),
         pre_approved,
         writable,
         approval_problems,

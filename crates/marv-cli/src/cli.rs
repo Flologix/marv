@@ -16,6 +16,7 @@
 //! - `--version`/`-v` and `--help`/`-h` exit 0, as in Marv.
 //! - `__html-convert` is hidden: the web reader re-executes `marv __html-convert` to convert a page in a process of
 //!   its own (a conversion that crashes is an answer, not a crash).
+//! - `__guard <parent-pid> -- <command…>` is hidden: Seatbelt's process supervisor (#165, `crate::guard`).
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 
@@ -120,6 +121,13 @@ pub enum Command {
     /// The process door's relay, inside a sandbox (Marv #51): `marv_tools::relay`.
     #[command(name = "__relay", hide = true)]
     Relay { spec: String },
+    /// Runs a command in a session of its own and kills its process group when `parent` dies (#165): `guard`.
+    #[command(name = "__guard", hide = true)]
+    Guard {
+        parent: u32,
+        #[arg(last = true, required = true)]
+        command: Vec<std::ffi::OsString>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -170,6 +178,10 @@ pub enum Mode {
     Relay {
         spec: String,
     },
+    Guard {
+        parent: u32,
+        command: Vec<std::ffi::OsString>,
+    },
 }
 
 impl Cli {
@@ -187,6 +199,7 @@ impl Cli {
             Some(Command::HtmlConvert) => Mode::HtmlConvert,
             Some(Command::RunChecks { spec }) => Mode::RunChecks { spec: spec.clone() },
             Some(Command::Relay { spec }) => Mode::Relay { spec: spec.clone() },
+            Some(Command::Guard { parent, command }) => Mode::Guard { parent: *parent, command: command.clone() },
             None => match &self.prompt {
                 Some(prompt) => Mode::Headless { prompt: prompt.clone() },
                 None => Mode::Interactive {
@@ -237,6 +250,10 @@ mod tests {
         assert_eq!(parse(&["__html-convert"]).mode(), Mode::HtmlConvert);
         assert_eq!(parse(&["__run-checks", "{}"]).mode(), Mode::RunChecks { spec: "{}".into() });
         assert_eq!(parse(&["__relay", "{}"]).mode(), Mode::Relay { spec: "{}".into() });
+        assert_eq!(
+            parse(&["__guard", "42", "--", "bash", "-c", "--x"]).mode(),
+            Mode::Guard { parent: 42, command: vec!["bash".into(), "-c".into(), "--x".into()] }
+        );
     }
 
     /// #124: the radio is the user's own config (or `/radio on`) only: no flag turns it on, so nothing that starts Marv
@@ -280,6 +297,11 @@ mod tests {
         assert!(bad(&["-p", "x", "--max-steps", "-1"]));
         assert!(bad(&["-p", "x", "--max-steps", "2.5"]));
         assert!(bad(&["-p"]));
+        // The guard's command comes after `--` only, and there must be one.
+        assert!(bad(&["__guard", "42"]));
+        assert!(bad(&["__guard", "42", "--"]));
+        assert!(bad(&["__guard", "42", "bash"]));
+        assert!(bad(&["__guard", "x", "--", "bash"]));
     }
 
     #[test]

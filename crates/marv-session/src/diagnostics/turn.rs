@@ -206,7 +206,7 @@ pub struct Checker<E> {
     /// `None`: [`sandboxed`].
     pub run: Option<RunCheck>,
     pub timeout: Duration,
-    /// Whether bwrap works here; `None`: `marv_sandbox::sandbox_available`. Tests pass a stand-in.
+    /// Whether the sandbox works here; `None`: the backend's `available()`. Tests pass a stand-in.
     pub sandbox_works: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     timeouts: AtomicU32,
     told_no_sandbox: AtomicBool,
@@ -238,7 +238,7 @@ impl<E: Clone + Send + Sync + 'static> Checker<E> {
         if self.timeouts.load(Ordering::SeqCst) >= MAX_TIMEOUTS || !self.kind.prepare(&options.root) {
             return None;
         }
-        let works = self.sandbox_works.as_ref().map_or_else(marv_sandbox::sandbox_available, |f| f());
+        let works = self.sandbox_works.as_ref().map_or_else(|| marv_sandbox::backend().available(), |f| f());
         if !options.sandbox || !works {
             // Said when it would have mattered (the first change), not on every turn of a project nobody edits.
             return Some(TurnChecks {

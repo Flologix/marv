@@ -1,10 +1,11 @@
 //! Finding other Marvs on this machine, and wiring across them (mesh v2). New in marv-rs (docs/MESH.md, topology 2).
 //!
-//! Each switchboard also listens on `$XDG_RUNTIME_DIR/marv/mesh/<session>.sock` (folder 0700, socket 0600: the user
-//! only), its **door** ([`open_door`]). `<session>` is the process's mesh name ([`mesh_name`]): `MARV_MESH_NAME`, or
-//! the project folder's name and four hex digits. It names the process, not the conversation, so it stays the same
-//! across `/clear` and resume. Without `XDG_RUNTIME_DIR` there's no discovery: Marv won't fall back to a
-//! world-readable `/tmp`. Sandboxes never see the folder (`/run` and `/tmp` are empty tmpfs in bwrap).
+//! Each switchboard also listens on `<runtime>/mesh/<session>.sock` (folder 0700, socket 0600: the user only), its
+//! **door** ([`open_door`]), in Marv's runtime folder (`marv_sandbox::runtime_dir`: `$XDG_RUNTIME_DIR/marv` on Linux,
+//! `/tmp/marv-<uid>` on macOS, or `MARV_RUNTIME_DIR`). `<session>` is the process's mesh name ([`mesh_name`]):
+//! `MARV_MESH_NAME`, or the project folder's name and four hex digits. It names the process, not the conversation, so
+//! it stays the same across `/clear` and resume. Without a runtime folder there's no discovery: Marv won't fall back to
+//! a folder others can read. Sandboxes never see the folder (`/run` and `/tmp` are empty tmpfs in bwrap).
 //!
 //! The door speaks newline-delimited JSON-RPC, like the plugs:
 //! - `marv/info`: the name, pid, folder, Herdr pane and agents (`marv mesh ls`, [`list`]);
@@ -66,12 +67,10 @@ pub const DOOR_TIMEOUT: Duration = Duration::from_secs(2);
 pub const MAX_SESSION_NAME: usize = 43;
 const PEER_PLUG: &str = "peer-";
 
-/// `$XDG_RUNTIME_DIR/marv/mesh`, or `None` without a runtime dir, or with one a sandboxed command could see
-/// (`marv_sandbox::hidden_in_sandbox`).
+/// `<runtime>/mesh`, or `None` without a runtime folder Marv may use (`marv_sandbox::runtime_dir`: on Linux
+/// `$XDG_RUNTIME_DIR/marv` when every sandbox hides it, on macOS `/tmp/marv-<uid>`, or `MARV_RUNTIME_DIR`).
 pub fn mesh_dir(env: &marv_mcp::Env) -> Option<PathBuf> {
-    let home = env.get("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"));
-    let base = env.get("XDG_RUNTIME_DIR").filter(|d| marv_sandbox::hidden_in_sandbox(Path::new(d), &home))?;
-    Some(Path::new(base).join("marv").join("mesh"))
+    Some(marv_sandbox::runtime_dir(env)?.join("mesh"))
 }
 
 /// A session's discovery socket. Session ids are one name segment, so the path can't escape the folder.
@@ -129,9 +128,10 @@ fn io(context: &str, err: std::io::Error) -> MeshError {
     MeshError::Io(format!("{context}: {err}"))
 }
 
-/// This process's uid, without `unsafe`: the owner of `/proc/self` (Linux, as bwrap is).
+/// This process's effective uid, the owner of the files and sockets it makes. Through nix rather than `/proc/self`,
+/// which macOS doesn't have (#150).
 pub fn own_uid() -> Result<u32> {
-    std::fs::metadata("/proc/self").map(|m| m.uid()).map_err(|e| io("can't tell who this user is (/proc/self)", e))
+    Ok(nix::unistd::geteuid().as_raw())
 }
 
 /// Makes `dir` this user's private folder (0700), refusing a symlink or someone else's folder.
@@ -373,6 +373,7 @@ pub fn open_door(sb: Arc<Switchboard>, dir: &Path, info: DoorInfo, approver: Arc
         }
         let _ = std::fs::remove_file(&socket);
     }
+    marv_sandbox::runtime::check_socket_path(&socket).map_err(MeshError::Io)?;
     let listener =
         std::os::unix::net::UnixListener::bind(&socket).map_err(|e| io(&format!("can't listen on {}", socket.display()), e))?;
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
@@ -670,9 +671,15 @@ mod tests {
     #[test]
     fn sockets_live_under_the_runtime_dir_only() {
         let env = |v: &str| [("XDG_RUNTIME_DIR".to_string(), v.to_string())].into_iter().collect::<marv_mcp::Env>();
-        assert_eq!(mesh_dir(&env("/run/user/1000")), Some(PathBuf::from("/run/user/1000/marv/mesh")));
-        assert_eq!(mesh_dir(&env("relative")), None);
-        assert_eq!(mesh_dir(&Default::default()), None);
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(mesh_dir(&env("/run/user/1000")), Some(PathBuf::from("/run/user/1000/marv/mesh")));
+            assert_eq!(mesh_dir(&env("relative")), None);
+            assert_eq!(mesh_dir(&Default::default()), None);
+        }
+        // macOS has no XDG_RUNTIME_DIR: the runtime folder is /tmp/marv-<uid> whatever it says.
+        #[cfg(target_os = "macos")]
+        assert_eq!(mesh_dir(&env("/run/user/1000")), Some(PathBuf::from(format!("/tmp/marv-{}/mesh", own_uid().unwrap()))));
         let dir = PathBuf::from("/run/user/1000/marv/mesh");
         assert_eq!(session_socket(&dir, "abc-1"), Some(dir.join("abc-1.sock")));
         assert_eq!(session_socket(&dir, "../x"), None);

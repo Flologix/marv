@@ -873,13 +873,29 @@ impl Drop for Listener {
 
 /// Listens on 127.0.0.1, `preferred` first (the port a client was registered
 /// with), else any free port, and says it fell back.
+///
+/// A dropped [`Listener`] only cancels its task, which closes the socket when it next runs, so the previous login's
+/// port can still be bound for a moment: `preferred` is tried a few times over ~200 ms before falling back (and
+/// registering a new client).
 pub async fn listen(check: CallbackHandler, preferred: Option<u16>) -> crate::Result<Listener> {
     use tokio::net::TcpListener;
     let (listener, fell_back) = match preferred {
-        Some(port) => match TcpListener::bind(("127.0.0.1", port)).await {
-            Ok(l) => (l, false),
-            Err(_) => (TcpListener::bind(("127.0.0.1", 0)).await?, true),
-        },
+        Some(port) => {
+            let mut bound = None;
+            for attempt in 0..10 {
+                if attempt > 0 {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                if let Ok(l) = TcpListener::bind(("127.0.0.1", port)).await {
+                    bound = Some(l);
+                    break;
+                }
+            }
+            match bound {
+                Some(l) => (l, false),
+                None => (TcpListener::bind(("127.0.0.1", 0)).await?, true),
+            }
+        }
         None => (TcpListener::bind(("127.0.0.1", 0)).await?, false),
     };
     let port = listener.local_addr()?.port();

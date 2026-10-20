@@ -2857,6 +2857,7 @@ dependencies = [
  "marv-session",
  "marv-tools",
  "marv-tui",
+ "nix 0.31.3",
  "serde",
  "serde_json",
  "tokio",
@@ -2956,6 +2957,7 @@ dependencies = [
  "marv-core",
  "marv-mcp",
  "marv-sandbox",
+ "nix 0.31.3",
  "serde",
  "serde_json",
  "socket2",
@@ -2998,6 +3000,7 @@ name = "marv-sandbox"
 version = "0.7.0"
 dependencies = [
  "marv-core",
+ "nix 0.31.3",
  "regex",
  "serde",
  "serde_json",

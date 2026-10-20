@@ -5,7 +5,9 @@
 //! - `mesh ls|wire|plug`: the mesh ([`mesh_cmd`]);
 //! - `__html-convert` (hidden): the web reader's converter process (`marv_tools::web::html_convert_cli::main`);
 //! - `__run-checks <spec>` (hidden): the project checks' runner, inside the sandbox (`marv_session::checks::runner`);
-//! - `__relay <spec>` (hidden): the process door's relay, inside a sandbox (`marv_tools::relay`, Marv #51).
+//! - `__relay <spec>` (hidden): the process door's relay, inside a sandbox (`marv_tools::relay`, Marv #51);
+//! - `__guard <parent-pid> -- <command…>` (hidden): runs a sandboxed command in a session of its own and kills its
+//!   process group when Marv dies, for a backend without a PID namespace ([`guard`], #165).
 //!
 //! The hidden ones run before the Tokio runtime starts: they're processes of their own.
 //!
@@ -14,6 +16,7 @@
 //! (`marv_session::processes::kill_running`); if Marv is killed harder, bwrap's `--die-with-parent` takes them.
 
 mod cli;
+mod guard;
 mod headless;
 mod mesh_cmd;
 mod tui;
@@ -53,6 +56,9 @@ fn main() -> ExitCode {
     }
     if let Mode::Relay { spec } = &mode {
         return marv_tools::relay::main(spec);
+    }
+    if let Mode::Guard { parent, command } = &mode {
+        return guard::main(*parent, command);
     }
     let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(rt) => rt,
@@ -101,7 +107,7 @@ fn main() -> ExitCode {
                     1
                 }
             },
-            Mode::HtmlConvert | Mode::RunChecks { .. } | Mode::Relay { .. } => {
+            Mode::HtmlConvert | Mode::RunChecks { .. } | Mode::Relay { .. } | Mode::Guard { .. } => {
                 unreachable!("handled before the runtime starts")
             }
         }

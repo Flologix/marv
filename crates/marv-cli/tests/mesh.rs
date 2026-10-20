@@ -6,7 +6,7 @@
 //! The models can't wait for mail on their own, so each script parks in a sandboxed `bash` loop until the test
 //! touches a file in its project; the inbox is read right after that step (`with_inbox`).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -34,12 +34,30 @@ fn text(t: &str) -> Reply {
     reply(json!({"text": t}))
 }
 
+/// Where the test machines go: on macOS a short `/tmp`, as macOS's temp folder (`/var/folders/…/T`) leaves too little
+/// of `sun_path`'s 104 bytes for the sockets (#150).
+fn temp_base() -> PathBuf {
+    if cfg!(target_os = "macos") { PathBuf::from("/tmp") } else { std::env::temp_dir() }
+}
+
+/// The variable that puts a Marv's runtime folder at `<run>/marv`: `XDG_RUNTIME_DIR=<run>` on Linux,
+/// `MARV_RUNTIME_DIR=<run>/marv` on macOS, which has no `XDG_RUNTIME_DIR` (as `/tmp/…`, not the real `/private/tmp/…`:
+/// 8 bytes fewer for the sockets).
+fn runtime_var(run: &Path) -> (&'static str, PathBuf) {
+    if cfg!(target_os = "macos") {
+        let run = run.strip_prefix("/private").map_or_else(|_| run.to_path_buf(), |r| Path::new("/").join(r));
+        ("MARV_RUNTIME_DIR", run.join("marv"))
+    } else {
+        ("XDG_RUNTIME_DIR", run.to_path_buf())
+    }
+}
+
 /// A throwaway machine: a private runtime dir, a home, and a project and config per Marv.
 struct Machine(PathBuf);
 
 impl Machine {
     fn new(label: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("mx-{label}-{}", std::process::id()));
+        let dir = temp_base().join(format!("mx-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let dir = dir.canonicalize().unwrap();
@@ -56,6 +74,7 @@ impl Machine {
     }
 
     fn command(&self, name: &str, args: &[&str]) -> Command {
+        let (runtime_var, runtime_dir) = runtime_var(&self.run_dir());
         let mut command = Command::new(env!("CARGO_BIN_EXE_marv"));
         command
             .args(args)
@@ -64,7 +83,7 @@ impl Machine {
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", self.0.join("home"))
             .env("MARV_CONFIG_DIR", self.0.join(format!("config-{name}")))
-            .env("XDG_RUNTIME_DIR", self.run_dir())
+            .env(runtime_var, runtime_dir)
             .env("MARV_MESH_NAME", name)
             // No GitHub probe (`gh auth status`), which this test doesn't need: where `gh` is a wrapper that installs
             // gh on first use (mise), the probe's timeout kills the wrapper and not the installer, which keeps writing

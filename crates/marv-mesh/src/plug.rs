@@ -3,6 +3,9 @@
 //! - Inside a sandbox, a plug is a Unix socket bind-mounted at
 //!   [`SANDBOX_SOCKET`]. A bind-mounted socket is a file, not a network, so it
 //!   works with `--unshare-net`; `marv-sandbox` keeps `/run` empty except for it.
+//!   The sandbox also names it in `MARV_MESH_SOCKET` (a backend that can't
+//!   mount, Seatbelt, shows it at its host path): a client inside finds it with
+//!   [`sandbox_socket`].
 //! - Each plug gets **its own** host socket (the switchboard knows who's
 //!   calling from which socket it accepted on), so a sender can't claim to be
 //!   another agent: identity comes from the socket, never from the message.
@@ -30,8 +33,18 @@ use crate::MeshError;
 use crate::receptacle::{ReceptacleName, valid_segment};
 use crate::wire::WireMode;
 
-/// Where a sandboxed agent finds its plug.
+/// Where a sandboxed agent finds its plug in a bubblewrap sandbox.
 pub const SANDBOX_SOCKET: &str = "/run/marv/mesh.sock";
+
+/// Where a client inside a sandbox finds its plug: `MARV_MESH_SOCKET`, which every sandbox backend sets when the
+/// command is plugged ([`marv_sandbox::MESH_SOCKET_ENV`]), else [`SANDBOX_SOCKET`].
+pub fn sandbox_socket() -> PathBuf {
+    socket_from(std::env::var_os(marv_sandbox::MESH_SOCKET_ENV))
+}
+
+fn socket_from(value: Option<std::ffi::OsString>) -> PathBuf {
+    value.filter(|v| !v.is_empty()).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(SANDBOX_SOCKET))
+}
 
 /// An agent's name on the mesh (`parent`, `worker-1`): one receptacle-name segment.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -216,5 +229,17 @@ mod tests {
         assert!(PlugId::new("").is_err());
         let plug = Plug { id: PlugId::new("w").unwrap(), host_socket: "/run/user/1000/marv/s/w.sock".into() };
         assert_eq!(plug.mount().guest, PathBuf::from("/run/marv/mesh.sock"));
+    }
+
+    /// A client inside the sandbox takes the plug from `MARV_MESH_SOCKET` (Seatbelt shows it at its host path), else
+    /// bubblewrap's fixed path.
+    #[test]
+    fn a_sandboxed_client_finds_its_plug_where_the_sandbox_says() {
+        assert_eq!(socket_from(None), PathBuf::from(SANDBOX_SOCKET));
+        assert_eq!(socket_from(Some("".into())), PathBuf::from(SANDBOX_SOCKET));
+        assert_eq!(
+            socket_from(Some("/private/tmp/marv-501/p/1/a.sock".into())),
+            PathBuf::from("/private/tmp/marv-501/p/1/a.sock")
+        );
     }
 }

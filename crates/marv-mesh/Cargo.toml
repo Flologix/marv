@@ -16,6 +16,8 @@ serde_json.workspace = true
 tokio.workspace = true
 futures.workspace = true
 socket2.workspace = true
+# This process's uid (`own_uid`), without /proc or `unsafe`.
+nix = { version = "0.31.3", features = ["user"] }
 async-trait.workspace = true
 thiserror.workspace = true
 # The AgentMesh bridge endpoint (loopback check).

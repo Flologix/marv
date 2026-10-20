@@ -45,7 +45,7 @@
 //!   ([`RadioFrameRecord`]): its kind, addressees, hop, `by` and size, **never its text**.
 //! - **The TUI's traffic list** keeps the last [`TRAFFIC_KEPT`] messages with their text ([`Radio::traffic`]) for the
 //!   person to read, drawn through `printable()`; it never reaches a model.
-//! - **Sandbox.** The links run in Marv, on the host. `$XDG_RUNTIME_DIR/marv` is an empty tmpfs in every command's
+//! - **Sandbox.** The links run in Marv, on the host. Marv's runtime folder is an empty tmpfs in every command's
 //!   sandbox, so nothing sandboxed reaches a door. Subagents and `marv -p` have no radio.
 
 use std::collections::{BTreeMap, VecDeque};

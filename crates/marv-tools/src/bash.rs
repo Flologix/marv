@@ -9,12 +9,14 @@
 //! - If bwrap itself fails to start the sandbox, its stderr is shown as `[sandbox failed to start: …]` instead of
 //!   empty output.
 //! - Timeout default 120 s, max 600 s ([`MAX_TIMEOUT_S`]); a timeout given in milliseconds is repaired (issue #10).
-//! - Sandboxed: bwrap, killed with SIGKILL (it takes its PID namespace down with it). Not sandboxed: in a process
+//! - Sandboxed: the sandbox's backend (`SandboxBackend`; bwrap on Linux), killed through it (`kill`: SIGKILL to bwrap,
+//!   which takes its PID namespace down with it), spawned with the environment it gives. Not sandboxed: in a process
 //!   group of its own (Marv: `setsid`; here `process_group(0)`, same effect), so a timeout or ctrl+c kills everything
 //!   it started; still a minimal environment (no API keys).
 //! - Confined (yolo): `.git` read-only or an empty placeholder (`git_guard`; the placeholder's mount point is
-//!   `rmdir`ed afterwards). A confined command that fails on the read-only `.git` gets `GIT_HINT`. An approved command
-//!   in a worktree gets the checked worktree folders writable, except folders the caller made read-only.
+//!   `rmdir`ed afterwards, by the backend's `after`). A confined command that fails on the read-only `.git` gets
+//!   `GIT_HINT`. An approved command in a worktree gets the checked worktree folders writable, except folders the
+//!   caller made read-only.
 //! - Notes after the output: the stand-in home (`touches_hidden_home`), the missing network (not for 126/127; a
 //!   timeout counts) and, for `gh`, the GitHub MCP server instead (#23, #27).
 //! - Scope `bash:[net:][git:]<command>` ("this exact command"); `auto_safe` only sandboxed, without network or
@@ -94,26 +96,35 @@ pub struct RunOptions {
 
 /// The relay in front of a sandboxed command without network while processes run (Marv #51): their socket folders
 /// and Marv's binary mounted, and the command run by `marv __relay`. With network the sandbox shares the host's
-/// 127.0.0.1, where the ports are forwarded already. None: the command runs as it is.
+/// 127.0.0.1, where the ports are forwarded already. None: the command runs as it is. The relay's paths are where
+/// `backend` shows each bind (`guest_path`), never assumed.
 fn relay_for(
     forwards: &[crate::types::ProcessForward],
     script: &str,
+    backend: &dyn marv_sandbox::SandboxBackend,
 ) -> Option<(Vec<marv_sandbox::Bind>, Vec<std::ffi::OsString>)> {
     use crate::relay::{RelayForward, RelaySpec, SOCKET_DIR, SOCKET_NAME};
     if forwards.is_empty() {
         return None;
     }
-    let mut binds = vec![crate::relay::exe_bind()?];
+    let exe = crate::relay::exe_bind()?;
+    let exe_inside = backend.guest_path(&exe);
+    let mut binds = vec![exe];
+    let mut connect = Vec::new();
     for forward in forwards {
-        let dest = PathBuf::from(format!("{SOCKET_DIR}/{}", forward.id));
-        if !binds.iter().any(|b| b.dest == dest) {
-            binds.push(marv_sandbox::Bind { source: forward.dir.clone(), dest, writable: false });
+        let bind = marv_sandbox::Bind {
+            source: forward.dir.clone(),
+            dest: format!("{SOCKET_DIR}/{}", forward.id).into(),
+            writable: false,
+        };
+        let socket = backend.guest_path(&bind).join(SOCKET_NAME).to_string_lossy().into_owned();
+        connect.push(RelayForward { port: forward.port, socket });
+        if !binds.iter().any(|b| b.dest == bind.dest) {
+            binds.push(bind);
         }
     }
-    let connect =
-        forwards.iter().map(|f| RelayForward { port: f.port, socket: format!("{SOCKET_DIR}/{}/{SOCKET_NAME}", f.id) }).collect();
     let spec = RelaySpec { listen: None, connect, argv: vec!["bash".into(), "-c".into(), script.into()] };
-    Some((binds, crate::relay::sandbox_argv(&spec)))
+    Some((binds, crate::relay::sandbox_argv_at(&exe_inside, &spec)))
 }
 
 /// Issue #81: a pipe's exit code is its last stage's, so `git clone … | tail -2` failing without network read as
@@ -144,7 +155,8 @@ if [ "$__marv_st" = 0 ] && [ "${__marv_cmd%% *}" != exit ]; then
 fi' EXIT"#;
 
 /// Runs a shell command in the project folder with stdout and stderr combined (also used by diagnostics and checks).
-/// Sandboxed: inside bwrap (`marv_sandbox::Sandbox::command`). Not sandboxed: still with a minimal environment, so
+/// Sandboxed: inside the sandbox's backend (`marv_sandbox::Sandbox::prepare`), which also removes what it left behind
+/// (bwrap's placeholder mount points) once the command has ended. Not sandboxed: still with a minimal environment, so
 /// API keys don't leak into commands. `sandbox` gives the home folder, `PATH` and `LANG` (tests pass a fake home).
 pub async fn run_command(
     options: RunOptions,
@@ -170,24 +182,28 @@ pub async fn run_command(
     // A command with `||` handles failures itself (`… | tail -2 || true`): left as it is.
     let check = if pipe_check && !command.contains("||") { PIPE_CHECK } else { "" };
     let script = format!("exec 2>&1\n{check}\n{command}");
+    let backend = sandbox.backend();
+    // Declared before the child, so on an early return the child is dropped (killed) first, then this cleans up.
+    let mut prepared: Option<marv_sandbox::Prepared> = None;
     let mut cmd = if sandboxed {
-        let relay = if network { None } else { relay_for(&forwards, &script) };
+        let relay = if network { None } else { relay_for(&forwards, &script, backend) };
         let mut mounts =
             marv_sandbox::CommandMounts { network, read_only, writable, placeholders, project_read_only, binds: vec![] };
-        let argv = match relay {
+        let inner = match relay {
             Some((binds, inner)) => {
                 mounts.binds = binds;
-                sandbox.command_argv(&root, &mounts, &inner)
+                inner
             }
-            None => sandbox.command(&root, &mounts, &script),
+            None => vec!["bash".into(), "-c".into(), script.into()],
         };
-        let argv = match argv {
-            Ok(argv) => argv,
+        let command = match sandbox.prepare(&root, &mounts, &inner) {
+            Ok(command) => command,
             // A mount that can't be made safely: the command never starts, and the model is told why.
             Err(e) => return started(format!("[sandbox failed to start: {e}]\n")),
         };
-        let mut cmd = tokio::process::Command::new(&argv[0]);
-        cmd.args(&argv[1..]).env_clear().env("PATH", &sandbox.path);
+        // Only the backend's environment, never Marv's.
+        let cmd = tokio::process::Command::from(command.to_command(&root));
+        prepared = Some(command);
         cmd
     } else {
         let mut cmd = tokio::process::Command::new("bash");
@@ -222,9 +238,12 @@ pub async fn run_command(
                 let group = nix::unistd::Pid::from_raw(pid as i32);
                 let _ = nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL);
             }
-            // bwrap takes its whole sandbox down with it.
+            // The backend takes the whole sandbox down (bwrap: its PID namespace). Only while the child is still
+            // ours: once it has been waited for, its pid may be another process's.
             _ => {
-                let _ = child.start_kill();
+                if let Some(pid) = child.id() {
+                    backend.kill(pid);
+                }
             }
         }
     };
@@ -245,6 +264,10 @@ pub async fn run_command(
         }
         kill(&mut child);
     };
+    // Before the caller's scan for created protected files: a placeholder's mount point left behind would read as one.
+    if let Some(command) = &mut prepared {
+        command.finish();
+    }
     let exit_code = if timed_out || aborted { None } else { status.and_then(|s| s.code()) };
     let mut output = output;
     // Without this, a sandbox that never started looks like a command that silently failed.
@@ -596,12 +619,9 @@ impl Tool for Bash {
             forwards: ctx.forwards.as_ref().map(|f| f.forwards()).unwrap_or_default(),
             pipe_check: true,
         };
+        // run_command has removed the sandbox's leftovers (bwrap's placeholder mount points) by the time it returns:
+        // an empty .git mount point left behind would read as created.
         let mut result = run_command(options, &ctx.sandbox, &ctx.cancel).await;
-        // bwrap leaves a placeholder's empty mount point; remove_dir only removes it while it's empty.
-        for path in &guard.placeholders {
-            let _ = tokio::fs::remove_dir(path).await;
-        }
-        // After the placeholders are gone: an empty .git mount point left behind would read as created.
         if let Some(before) = &before {
             let mut created = scan_created(&ctx.root, before);
             // A repository an approved git_write command made (`git init`, a submodule) is the user's to keep.
@@ -838,8 +858,10 @@ mod tests {
     }
 
     /// A process that left the group (`setsid`) keeps the output pipe: once the timeout or the stop has killed the
-    /// command, the pipes get [`KILL_GRACE`], then what was read is returned.
-    const LEAVES_THE_GROUP: &str = "echo before; setsid sh -c 'sleep 30' & sleep 30";
+    /// command, the pipes get [`KILL_GRACE`], then what was read is returned. Through python3, as macOS has no
+    /// `setsid` command.
+    const LEAVES_THE_GROUP: &str =
+        "echo before; python3 -c 'import os; os.setsid(); os.execvp(\"sleep\", [\"sleep\", \"30\"])' & sleep 30";
 
     #[tokio::test]
     async fn the_timeout_holds_when_a_child_left_the_group_with_the_pipe() {

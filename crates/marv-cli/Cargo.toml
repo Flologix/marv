@@ -31,6 +31,8 @@ async-trait.workspace = true
 clap = { version = "4.6", features = ["derive"] }
 # The mesh's switchboard is served until its token is cancelled (`mesh_cmd::Mesh`).
 tokio-util.workspace = true
+# `marv __guard` (#165): its session, its parent's pid and the signals it sends its process group.
+nix = { version = "0.31.3", features = ["signal", "process"] }
 
 [dev-dependencies]
 # The two-Marv mesh test (tests/mesh.rs): the oracle's fake OpenAI-compatible server.
