@@ -567,6 +567,14 @@ fn build_profile(plan: &Plan, run: &Invocation, fs: &dyn FsProbe, allow_links: b
     let p = b.param("TMP".into(), &tmp);
     b.line(&format!("(allow network-bind (local unix-socket (subpath {p})))"));
     b.line(&format!("(allow network-outbound (remote unix-socket (subpath {p})))"));
+    // Marv's runtime folders (default and override, by their real paths): no socket there is reachable, nor can one be
+    // bound there, whatever an allow above names. Deny-default closes them already; this keeps them closed. Then the
+    // one plug.
+    for i in 0..runtime.len() {
+        let p = format!("(param \"RUNTIME_{i}\")");
+        b.line(&format!("(deny network-outbound (remote unix-socket (subpath {p})))"));
+        b.line(&format!("(deny network-bind (local unix-socket (subpath {p})))"));
+    }
     if let Some(plug) = &plan.mesh_socket {
         let p = b.param("PLUG".into(), &canon(plug));
         b.line(&format!("(allow network-outbound (remote unix-socket (path-literal {p})))"));
@@ -1108,6 +1116,28 @@ mod tests {
         assert_eq!(t.matches("unix-socket").count(), 3);
         assert!(at(&t, "(allow network-outbound (remote ip))") > at(&t, "; 8."));
         assert!(at(&t, "(allow network-outbound (remote ip))") < at(&t, "(xpc-service-name-prefix"));
+    }
+
+    /// Every runtime folder's sockets are denied by name, after the TMPDIR's allow and before the plug's.
+    #[test]
+    fn runtime_sockets_are_denied_but_the_plug() {
+        let fs = mac_fs(|p| p.contains("marv"));
+        let plan = Plan {
+            hidden: vec!["/tmp/marv-501".into(), "/Users/me/.run/marv".into()],
+            mesh_socket: Some("/tmp/marv-501/p/1/a.sock".into()),
+            ..base()
+        };
+        let p = build(&plan, &fs);
+        assert_eq!(p.param("RUNTIME_0"), Some(Path::new("/private/tmp/marv-501")));
+        let tmp_allow = at(&p.text, "(allow network-outbound (remote unix-socket (subpath (param \"TMP\"))))");
+        let plug = at(&p.text, "(allow network-outbound (remote unix-socket (path-literal (param \"PLUG\"))))");
+        for i in 0..2 {
+            for rule in ["network-outbound (remote", "network-bind (local"] {
+                let line = format!("(deny {rule} unix-socket (subpath (param \"RUNTIME_{i}\"))))");
+                let pos = at(&p.text, &line);
+                assert!(tmp_allow < pos && pos < plug, "{line}");
+            }
+        }
     }
 
     /// The interface list names the machine's addresses: with network only, as Linux shows the host's only then.

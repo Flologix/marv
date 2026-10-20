@@ -238,7 +238,7 @@ pub async fn run_command(
     // The sandbox program's exit, seen without reaping it: then the backend ends what the command left running in
     // the background (`sleep 600 &`; bwrap's PID namespace did that, Seatbelt has none) before the pipes are drained,
     // which such leftovers would hold open, and while the group's id can't be reused.
-    let exit = if sandboxed { ExitWatch::spawn(pid) } else { ExitWatch::none() };
+    let mut exit = if sandboxed { ExitWatch::spawn(pid) } else { ExitWatch::none() };
 
     let kill = |child: &mut tokio::process::Child| {
         match pid {
@@ -268,13 +268,17 @@ pub async fn run_command(
             break child.wait().await.ok();
         }
         tokio::select! {
-            exited = exit.exited() => {
-                // Exited, not reaped yet: what it left in its group goes first, then it's reaped.
-                if exited {
+            seen = exit.exited(), if exit.watching() => {
+                if seen {
+                    // Exited, not reaped yet: what it left in its group goes first, then it's reaped.
                     kill(&mut child);
+                    break child.wait().await.ok();
                 }
-                break child.wait().await.ok();
+                // Its exit can't be seen here: wait for it as usual.
+                exit = ExitWatch::none();
+                continue;
             }
+            status = child.wait(), if !exit.watching() => break status.ok(),
             () = &mut deadline => timed_out = true,
             () = cancel.cancelled() => aborted = true,
         }
@@ -346,7 +350,7 @@ pub(crate) async fn capture_until(
 /// Whether a sandboxed command's program has exited, seen without reaping it ([`marv_sandbox::wait_exited`], on a
 /// blocking thread). Where that can't be seen ([`ExitWatch::none`], or a platform without it), [`ExitWatch::exited`]
 /// says false at once, and the caller waits for the child as usual.
-struct ExitWatch(tokio::sync::watch::Receiver<Option<bool>>);
+struct ExitWatch(Option<tokio::sync::watch::Receiver<Option<bool>>>);
 
 impl ExitWatch {
     fn spawn(pid: Option<u32>) -> Self {
@@ -355,16 +359,22 @@ impl ExitWatch {
         tokio::task::spawn_blocking(move || {
             let _ = tx.send(Some(marv_sandbox::wait_exited(pid)));
         });
-        Self(rx)
+        Self(Some(rx))
     }
 
     fn none() -> Self {
-        Self(tokio::sync::watch::channel(Some(false)).1)
+        Self(None)
+    }
+
+    /// Whether the exit is being watched (else [`ExitWatch::exited`] says false at once).
+    fn watching(&self) -> bool {
+        self.0.is_some()
     }
 
     /// True once the program has exited (and isn't reaped yet); false when that can't be seen.
     async fn exited(&self) -> bool {
-        let mut rx = self.0.clone();
+        let Some(rx) = &self.0 else { return false };
+        let mut rx = rx.clone();
         rx.wait_for(Option::is_some).await.ok().and_then(|v| *v).unwrap_or(false)
     }
 }
@@ -467,6 +477,14 @@ fn command_summary(result: &CommandResult, timeout: u64) -> String {
 
 pub struct Bash;
 
+/// The tool's description, fixed per build (the tool spec stays byte-stable): what the platform's sandbox does with
+/// the home folder and the network differs (bubblewrap shows an empty stand-in home and has a loopback of its own;
+/// Seatbelt, on macOS, refuses the home and every IP connection, loopback included, #166).
+#[cfg(not(target_os = "macos"))]
+const DESCRIPTION: &str = "Run a shell command in the project folder, e.g. to run tests, a build, git status, or wc -l. It runs in a sandbox: only the project folder is writable, the home folder is an empty stand-in (toolchains like ~/.bun, ~/.local/share/mise, ~/.asdf, git config and ~/.marv/skills show through, read-only; nothing else in it is visible), and there's no network unless you set network: true. The user may be asked to approve a command; they always are for network: true or git_write: true. Not interactive: commands can't prompt for input. Don't write files with it (no heredocs or echo >): use write_file or edit_file. Output (stdout and stderr together) is cut in the middle if very long.";
+#[cfg(target_os = "macos")]
+const DESCRIPTION: &str = "Run a shell command in the project folder, e.g. to run tests, a build, git status, or wc -l. It runs in a sandbox: only the project folder and $TMPDIR (the command's own, emptied after it; /tmp can't be used) are writable, the home folder can't be read or written (toolchains like ~/.bun, ~/.cargo, ~/.local/share/mise, git config and ~/.marv/skills can be read; nothing else in it), and there's no network, not even localhost, unless you set network: true. The user may be asked to approve a command; they always are for network: true or git_write: true. Not interactive: commands can't prompt for input. Don't write files with it (no heredocs or echo >): use write_file or edit_file. Output (stdout and stderr together) is cut in the middle if very long.";
+
 #[async_trait]
 impl Tool for Bash {
     type Input = BashInput;
@@ -475,7 +493,7 @@ impl Tool for Bash {
         "bash"
     }
     fn description(&self) -> &str {
-        "Run a shell command in the project folder, e.g. to run tests, a build, git status, or wc -l. It runs in a sandbox: only the project folder is writable, the home folder is an empty stand-in (toolchains like ~/.bun, ~/.local/share/mise, ~/.asdf, git config and ~/.marv/skills show through, read-only; nothing else in it is visible), and there's no network unless you set network: true. The user may be asked to approve a command; they always are for network: true or git_write: true. Not interactive: commands can't prompt for input. Don't write files with it (no heredocs or echo >): use write_file or edit_file. Output (stdout and stderr together) is cut in the middle if very long."
+        DESCRIPTION
     }
     fn schema(&self) -> Value {
         json!({

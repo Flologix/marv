@@ -129,7 +129,7 @@ fn no_socket_outside_the_sandbox_is_reachable() {
     let listeners = [UnixListener::bind(&agent).unwrap(), UnixListener::bind(home.home().join("app.sock")).unwrap()];
     let connect = |path: &Path| {
         format!(
-            "python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); print(\"connected\")' '{}'",
+            "python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); print(\"connec\" \"ted\")' '{}'",
             path.display()
         )
     };
@@ -144,7 +144,7 @@ fn no_socket_outside_the_sandbox_is_reachable() {
     }
     // The command's own sockets, in its private TMPDIR, work.
     let ran = home.run(
-        "python3 -c 'import socket,os; p=os.environ[\"TMPDIR\"]+\"/s.sock\"; l=socket.socket(socket.AF_UNIX); l.bind(p); l.listen(1); c=socket.socket(socket.AF_UNIX); c.connect(p); print(\"own\")'",
+        "python3 -c 'import socket,os; p=os.environ[\"TMPDIR\"]+\"/s.sock\"; l=socket.socket(socket.AF_UNIX); l.bind(p); l.listen(1); c=socket.socket(socket.AF_UNIX); c.connect(p); print(\"o\" \"wn\")'",
     );
     assert!(ran.output.contains("own"), "{}", ran.output);
     drop(listeners);
@@ -163,7 +163,8 @@ fn the_runtime_folder_is_closed_but_for_the_plug() {
     let mut sandbox = home.sandbox();
     sandbox.hidden = vec![runtime.path().to_path_buf()];
     sandbox.mesh_socket = Some(plug.clone());
-    let connect = "python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); print(\"connected\")'";
+    let connect =
+        "python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); print(\"connec\" \"ted\")'";
     let ran = home.run_with(&sandbox, &home.proj(), false, &format!("{connect} \"$MARV_MESH_SOCKET\""));
     assert!(ran.output.contains("connected"), "the plug: {}", ran.output);
     let ran = home.run_with(&sandbox, &home.proj(), false, &format!("{connect} '{}'", other.display()));
@@ -192,7 +193,9 @@ fn the_home_marvs_config_and_credentials_cant_be_read() {
         assert!(!ran.output.contains("SECRET") && ran.code != Some(0), "{file}: {}", ran.output);
     }
     assert!(denied(&home.run("ls ~")), "the home can't be listed");
-    assert_eq!(home.run("cd ~ && echo in").output.trim(), "in", "but cd ~ works");
+    // But `cd ~` works (bash may say it can't name the folder it's in: its parents can't be read).
+    let ran = home.run("cd ~ && echo in");
+    assert_eq!(ran.output.lines().last(), Some("in"), "{}", ran.output);
     let ran = home.run(&format!("cat '{h}/.marv/skills/x/SKILL.md' '{h}/.cargo/bin/tool'"));
     assert_eq!(ran.code, Some(0), "{}", ran.output);
     // Marv's config folder elsewhere (MARV_CONFIG_DIR) is closed too.
@@ -301,7 +304,8 @@ fn without_network_no_ip_not_even_loopback() {
     for script in [
         "curl -sS -m 5 -o /dev/null https://example.com && echo reached".to_string(),
         format!("exec 3<>/dev/tcp/127.0.0.1/{port} && echo reached"),
-        "python3 -c 'import socket; s=socket.socket(); s.bind((\"0.0.0.0\", 0)); s.listen(1); print(\"reached\")'".to_string(),
+        "python3 -c 'import socket; s=socket.socket(); s.bind((\"0.0.0.0\", 0)); s.listen(1); print(\"reach\" \"ed\")'"
+            .to_string(),
         "ping -c 1 -t 2 127.0.0.1 && echo reached".to_string(),
     ] {
         let ran = home.run(&script);

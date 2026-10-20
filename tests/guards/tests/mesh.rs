@@ -57,12 +57,13 @@ fn send_wire(from: &str, to: &str) -> Wire {
 
 /// An MCP client in python3: `initialize`, then each `(label, method, params)`, printing `<label> <response>` lines.
 const CLIENT: &str = r#"
-import json, socket, sys
+import json, os, socket, sys
 def connect(path):
     s = socket.socket(socket.AF_UNIX)
     s.connect(path)
     return s.makefile("rw")
-f = connect("/run/marv/mesh.sock")
+# Where the backend shows the plug (MARV_MESH_SOCKET), as `marv_mesh::plug::sandbox_socket()` finds it.
+f = connect(os.environ.get("MARV_MESH_SOCKET", "/run/marv/mesh.sock"))
 n = 0
 def rpc(method, params):
     global n

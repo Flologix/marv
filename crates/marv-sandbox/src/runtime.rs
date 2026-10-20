@@ -4,7 +4,8 @@
 //! manager, the sandbox's hidden folders, the writable-folder check):
 //! - `MARV_RUNTIME_DIR` from the real environment, when set: the folder itself, checked like the default (absolute,
 //!   short enough for the longest socket, hidden in every sandbox, and a private folder of this user's).
-//! - Linux: `$XDG_RUNTIME_DIR/marv`, when every sandbox hides `XDG_RUNTIME_DIR` ([`crate::hidden_in_sandbox`]).
+//! - Linux: `$XDG_RUNTIME_DIR/marv`, when every sandbox hides `XDG_RUNTIME_DIR` (the backend's
+//!   [`crate::SandboxBackend::hides`]: bubblewrap's [`crate::hidden_in_sandbox`], Seatbelt's own on macOS).
 //!   Without one there's no runtime folder: Marv never falls back to a folder a sandboxed command could see.
 //! - macOS: `/tmp/marv-<uid>` (there's no `XDG_RUNTIME_DIR`). The path string `/tmp/…` is what sockets are bound at:
 //!   it's shorter than `/private/tmp/…`, and `sun_path` is only 104 bytes there. Made 0700; then it must be a folder
@@ -95,7 +96,7 @@ pub fn runtime_dir(env: &BTreeMap<String, String>) -> Option<PathBuf> {
         let dir = default_path(env)?;
         return private_folder(&dir).is_ok().then_some(dir);
     }
-    let base = env.get("XDG_RUNTIME_DIR").filter(|d| crate::hidden_in_sandbox(Path::new(d), &home))?;
+    let base = env.get("XDG_RUNTIME_DIR").filter(|d| crate::backend().hides(Path::new(d), &home))?;
     Some(Path::new(base).join("marv"))
 }
 
@@ -120,7 +121,7 @@ fn check_override(dir: &Path, home: &Path) -> Result<PathBuf, String> {
         return Err("it names no folder".into());
     };
     let real = std::fs::canonicalize(parent).map_err(|e| format!("its parent {}: {e}", parent.display()))?.join(name);
-    if !crate::hidden_in_sandbox(&real, home) {
+    if !crate::backend().hides(&real, home) {
         return Err("sandboxed commands could see it: use a folder under /tmp, /run or a hidden folder of your home".into());
     }
     private_folder(dir).map_err(|e| e.to_string())?;
