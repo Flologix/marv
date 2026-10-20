@@ -117,6 +117,14 @@ fn a_stop_is_passed_on_once_not_again_for_the_guards_own_copy() {
     // The command survives SIGTERM and counts how many it got until the test creates the marker, 1 s after the stop.
     let marker = std::env::temp_dir().join(format!("marv-guard-once-{}", std::process::id()));
     let _ = std::fs::remove_file(&marker);
+    // Removed however the test ends: CI fails a run that leaves anything named marv-* in /tmp (#89).
+    struct Gone<'a>(&'a std::path::Path);
+    impl Drop for Gone<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(self.0);
+        }
+    }
+    let _gone = Gone(&marker);
     let script = r#"n=0; trap 'n=$((n+1))' TERM; echo 0; while [ ! -e "$1" ]; do sleep 0.1; done; echo $n"#;
     let marker_arg = marker.to_str().unwrap();
     let mut child =
