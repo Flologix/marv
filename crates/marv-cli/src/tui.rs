@@ -2548,16 +2548,17 @@ impl SessionPort for Port {
 /// Pre-approved scopes (#98): the config's "approve" and this run's --approve, merged and deduped, seeded as
 /// "always" for the session through the session's own path (so must_ask and taint still win; a subagent inherits
 /// neither). An unknown name is a problem for the startup notice, never a silent approval.
-pub fn merge_pre_approved(mut from_config: Vec<String>, from_cli: &[String]) -> (Vec<String>, Vec<String>) {
-    let mut problems = Vec::new();
-    for name in from_cli {
-        match marv_session::approvals::parse_approvals(std::slice::from_ref(name)) {
-            Ok(_) if !from_config.contains(name) => from_config.push(name.clone()),
-            Ok(_) => {}
-            Err(problem) => problems.push(problem),
+/// The config's names are checked like --approve's (#82): an unknown one is dropped with a problem, the rest kept.
+pub fn merge_pre_approved(from_config: Vec<String>, from_cli: &[String]) -> (Vec<String>, Vec<String>) {
+    let (mut names, mut problems) = marv_session::approvals::known_names(&from_config, "\"approve\" in your config");
+    let (cli, cli_problems) = marv_session::approvals::known_names(from_cli, "--approve");
+    problems.extend(cli_problems);
+    for name in cli {
+        if !names.contains(&name) {
+            names.push(name);
         }
     }
-    (from_config, problems)
+    (names, problems)
 }
 
 /// Extra writable sandbox folders (#98): resolved once here (refused entries are problems, never mounts).
@@ -2778,7 +2779,10 @@ mod tests {
         assert!(problems.is_empty());
         let (scopes, problems) = merge_pre_approved(vec!["web".into()], &["netwrk".to_string()]);
         assert_eq!(scopes, ["web"], "the typo doesn't reach the session");
-        assert!(problems[0].contains("Unknown --approve scope"), "{:?}", problems);
+        assert!(problems[0].contains("Unknown --approve scope"), "{:?}", problems); // #82 review: the config's own names are checked the same way.
+        let (scopes, problems) = merge_pre_approved(vec!["web".into(), "netwrk".into()], &[]);
+        assert_eq!(scopes, ["web"]);
+        assert!(problems[0].starts_with("\"approve\" in your config: Unknown --approve scope \"netwrk\""), "{problems:?}");
     }
     use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -3842,6 +3846,35 @@ mod tests {
         assert!(shown[0].contains("**Yolo**: off"), "{shown:?}");
         assert_eq!(bridge.session.conversation(), conversation, "nothing of it joins the history");
         assert_eq!(bridge.session.system_prompt(), system, "nor the system prompt");
+    }
+
+    // #82 review: config ["web", "netwrk"]: web is seeded and listed, netwrk is warned about and listed nowhere.
+    #[tokio::test]
+    async fn an_unknown_config_scope_is_warned_about_and_not_listed() {
+        let dirs = Dirs::new();
+        // No config file: the notice ends with setup opening, as in the test below.
+        let mut s = startup(&dirs, None, vec![], None);
+        (s.pre_approved, s.approval_problems) = merge_pre_approved(vec!["web".into(), "netwrk".into()], &[]);
+        let (tx, mut rx) = unbounded_channel();
+        let bridge = Bridge::start(s, tx).unwrap();
+        bridge.announce(None);
+        let seen = until(&mut rx, |e| matches!(e, UiEvent::OpenSetup(_))).await;
+        let notice: Vec<String> = seen
+            .iter()
+            .filter_map(|e| if let UiEvent::Message(m) = e { m.notice.as_ref() } else { None })
+            .flat_map(|n| {
+                n.items.iter().flat_map(|i| std::iter::once(i.text.clone()).chain(i.detail.clone().unwrap_or_default()))
+            })
+            .collect();
+        let notice = notice.join("\n");
+        assert!(notice.contains("Pre-approved for this session: web\n"), "{notice}");
+        assert!(notice.contains("Unknown --approve scope \"netwrk\""), "warned: {notice}");
+        assert!(bridge.session.permissions().pre_approved == ["web"]);
+        Port(bridge.clone()).run_command("/permissions".into());
+        let shown = texts(&[until(&mut rx, |e| matches!(e, UiEvent::Message(_))).await.pop().unwrap()]);
+        assert!(shown[0].contains("- `web`"), "{shown:?}");
+        assert!(!shown[0].contains("netwrk"), "{shown:?}");
+        assert!(!bridge.session.system_prompt().contains("netwrk"));
     }
 
     // #98: the startup notice names what's pre-approved, which extra folders are writable, and any problem.

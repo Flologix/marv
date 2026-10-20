@@ -64,6 +64,22 @@ pub fn seed_prefixes(names: &[String]) -> Result<Vec<String>, String> {
     Ok(prefixes)
 }
 
+/// The names that mean something, each once, and a problem (printable) for each that doesn't: an unknown name is
+/// dropped, never a reason to approve more, and never a reason to drop the good ones with it. `from` says where the
+/// names came from in the problem ("--approve", "~/.marv/config.json's \"approve\"").
+pub fn known_names(names: &[String], from: &str) -> (Vec<String>, Vec<String>) {
+    let mut known: Vec<String> = Vec::new();
+    let mut problems = Vec::new();
+    for name in names {
+        match parse_approvals(std::slice::from_ref(name)) {
+            Ok(_) if !known.contains(name) => known.push(name.clone()),
+            Ok(_) => {}
+            Err(problem) => problems.push(marv_core::printable(&format!("{from}: {problem}; ignored"))),
+        }
+    }
+    (known, problems)
+}
+
 /// The names split: `mesh:<receptacle>` grants (for headless's `HeadlessWires`), and the other names' scope-key
 /// prefixes. `marv -p` (headless) and the config's seeds both build on this.
 pub fn parse_approvals(names: &[String]) -> Result<(Vec<ReceptacleName>, Vec<String>), String> {
@@ -91,6 +107,18 @@ mod tests {
 
     fn names(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn an_unknown_name_is_dropped_with_a_problem_and_the_others_kept() {
+        let (known, problems) = known_names(&names(&["web", "netwrk", "web", "mesh:Not A Name", "network"]), "config");
+        assert_eq!(known, ["web", "network"]);
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(problems[0].starts_with("config: Unknown --approve scope \"netwrk\"") && problems[0].ends_with("ignored"));
+        // What's left always seeds: nothing unknown can make the seeding fail (and so approve nothing, or more).
+        assert!(seed_prefixes(&known).is_ok());
+        let (_, problems) = known_names(&names(&["x\u{1b}[2J"]), "config");
+        assert!(!problems[0].contains('\u{1b}'), "{problems:?}");
     }
 
     #[test]

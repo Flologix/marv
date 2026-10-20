@@ -16,6 +16,9 @@ use marv_mcp::manager::{McpServerStatus, McpState};
 
 use crate::approvals::APPROVE_PREFIXES;
 
+/// `/permissions` with anything after it, in the TUI and the desktop alike.
+pub const PERMISSIONS_USAGE: &str = "Usage: /permissions (it only shows them)";
+
 /// The session's grants, as they are now.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Permissions {
@@ -94,9 +97,18 @@ fn group_of(key: &str) -> (&'static str, &str) {
     ("Other", key)
 }
 
-/// A key for markdown: printable, in a code span it can't close.
+/// The longest a key is shown (a heredoc can be pages long).
+const MAX_KEY_CHARS: usize = 100;
+
+/// `text` as one printable line of at most `max` characters, cut with `…` (as the radio's `one_line`).
+fn one_line(text: &str, max: usize) -> String {
+    let line = printable(text).split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.chars().count() > max { format!("{}…", line.chars().take(max - 1).collect::<String>().trim_end()) } else { line }
+}
+
+/// A key for markdown: printable, on one line, cut, in a code span it can't close.
 fn code(text: &str) -> String {
-    let text = printable(text).replace('`', "'").replace('\n', " ");
+    let text = one_line(text, MAX_KEY_CHARS).replace('`', "'");
     if text.is_empty() { "(all)".into() } else { format!("`{text}`") }
 }
 
@@ -128,6 +140,15 @@ pub fn permissions_text(p: &Permissions, saved: Option<SavedGrants>, mcp: Option
         (false, 0) => "a command that needs it asks each time".into(),
         (false, n) => format!("asked, except {n} command{} answered \"always\" (below)", if n == 1 { "" } else { "s" }),
     };
+    // Tainted, a command with the network asks whatever was granted (`must_ask`).
+    let network = match (p.tainted.is_empty(), net_seeded || net_remembered > 0) {
+        (false, true) => format!("{network}; but while this conversation is untrusted, every one asks"),
+        (false, false) => "a command that needs it asks each time (and while untrusted, always)".into(),
+        (true, _) => network,
+    };
+    // A project that is the home folder (or holds it): every file change asks, `files` or "always" or not.
+    let home = p.no_yolo.is_some();
+    let files_note = " (but in this folder every file change still asks)";
     let taint = if p.tainted.is_empty() {
         "no".to_string()
     } else {
@@ -161,7 +182,8 @@ pub fn permissions_text(p: &Permissions, saved: Option<SavedGrants>, mcp: Option
                 .find(|(n, _)| n == name)
                 .map(|(_, prefixes)| format!(" · `{}`", prefixes.join("`, `")))
                 .unwrap_or_default();
-            pre.push(format!("- {}{from}: {}{covers}", code(name), approve_meaning(name)));
+            let note = if home && name == "files" { files_note } else { "" };
+            pre.push(format!("- {}{from}: {}{covers}{note}", code(name), approve_meaning(name)));
         }
     }
     if !p.writable.is_empty() {
@@ -184,10 +206,17 @@ pub fn permissions_text(p: &Permissions, saved: Option<SavedGrants>, mcp: Option
         }
         // In the table's order, so the view reads the same every time.
         groups.sort_by_key(|(t, _)| GROUPS.iter().position(|(_, g)| g == t).unwrap_or(GROUPS.len()));
-        always.extend(groups.iter().map(|(title, keys)| format!("- {title}: {}", list(keys))));
+        always.extend(groups.iter().map(|(title, keys)| {
+            let note = if home && *title == "File changes" { files_note } else { "" };
+            format!("- {title}: {}{note}", list(keys))
+        }));
     }
     always.push(
         "- never remembered, always asked: tainted egress, protected paths, commands on the host, gh's sensitive reads, wires"
+            .into(),
+    );
+    always.push(
+        "- a turn you didn't start (a mesh or radio message woke it) uses none of this: no yolo, no \"always\", nothing pre-approved; everything asks"
             .into(),
     );
     parts.push(always.join("\n"));
@@ -204,7 +233,13 @@ pub fn permissions_text(p: &Permissions, saved: Option<SavedGrants>, mcp: Option
         Some(s) => {
             let mut what = Vec::new();
             if !s.approve.is_empty() {
-                what.push(format!("`approve` {}", list(s.approve)));
+                // Only the names that mean something: an unknown one was ignored (the startup notice says which).
+                let (known, unknown) = crate::approvals::known_names(s.approve, "");
+                let ignored = match unknown.len() {
+                    0 => String::new(),
+                    n => format!(" ({n} unknown name{} ignored)", if n == 1 { "" } else { "s" }),
+                };
+                what.push(format!("`approve` {}{ignored}", if known.is_empty() { "none".into() } else { list(&known) }));
             }
             if !s.writable.is_empty() {
                 what.push(format!("`writable` {}", list(s.writable)));
@@ -213,14 +248,21 @@ pub fn permissions_text(p: &Permissions, saved: Option<SavedGrants>, mcp: Option
         }
         None => {}
     }
-    let trusted: Vec<String> = mcp
-        .unwrap_or_default()
-        .iter()
-        .filter(|s| s.source == ServerSource::Project && !matches!(s.state, McpState::Untrusted | McpState::Removed))
-        .map(|s| s.name.clone())
-        .collect();
+    let project = |states: &[McpState]| -> Vec<String> {
+        mcp.unwrap_or_default()
+            .iter()
+            .filter(|s| s.source == ServerSource::Project && states.contains(&s.state))
+            .map(|s| s.name.clone())
+            .collect()
+    };
+    // A server still connecting may not have had its trust checked yet: pending, not trusted.
+    let trusted = project(&[McpState::Connected, McpState::Failed, McpState::NeedsLogin]);
+    let pending = project(&[McpState::Connecting]);
     if !trusted.is_empty() {
         kept.push(format!("- this project's MCP servers you trusted: {} (~/.marv/mcp-trust.json)", list(&trusted)));
+    }
+    if !pending.is_empty() {
+        kept.push(format!("- this project's MCP servers still starting (trust not known yet): {}", list(&pending)));
     }
     kept.push("- a project's own `.marv/config.json` can't pre-approve anything; \"always\" answers end with the session".into());
     parts.push(kept.join("\n"));
@@ -337,6 +379,7 @@ mod tests {
             login: None,
         };
         let servers = [
+            server("starting", ServerSource::Project, McpState::Connecting),
             server("trusted", ServerSource::Project, McpState::Connected),
             server("waiting", ServerSource::Project, McpState::Untrusted),
             server("mine", ServerSource::Personal, McpState::Connected),
@@ -348,6 +391,8 @@ mod tests {
         assert!(text.contains("asked, except 2 commands answered \"always\""), "{text}");
         assert!(text.contains("MCP servers you trusted: `trusted` ("), "{text}");
         assert!(!text.contains("`waiting`") && !text.contains("`mine`"), "{text}");
+        assert!(text.contains("still starting (trust not known yet): `starting`"), "{text}");
+        assert!(text.contains("but while this conversation is untrusted, every one asks"), "{text}");
         assert!(!text.contains("**Saved** (outlasts the session):\n- ~"), "no config file to show: {text}");
     }
 
@@ -357,5 +402,34 @@ mod tests {
         let text = permissions_text(&p, None, None);
         assert!(!text.contains('\u{1b}'), "{text:?}");
         assert!(text.contains("`echo 'x'"), "{text}");
+        let long =
+            Permissions { remembered: vec![format!("bash::cat <<EOF\n{}\nEOF", "x".repeat(5000))], ..Permissions::default() };
+        let text = permissions_text(&long, None, None);
+        let line = text.lines().find(|l| l.starts_with("- Commands in the sandbox")).unwrap();
+        assert!(line.chars().count() < 160 && line.ends_with("…`"), "{line}");
+    }
+
+    #[test]
+    fn home_folder_file_changes_and_turns_you_didnt_start_are_caveated() {
+        let p = Permissions {
+            no_yolo: Some("the project is your home folder".into()),
+            remembered: keys(&["files"]),
+            pre_approved: keys(&["files"]),
+            ..Permissions::default()
+        };
+        let text = permissions_text(&p, None, None);
+        assert!(text.contains("- File changes: (all) (but in this folder every file change still asks)"), "{text}");
+        assert!(text.contains("- `files`: file changes · `files` (but in this folder every file change still asks)"), "{text}");
+        assert!(text.contains("a turn you didn't start (a mesh or radio message woke it) uses none of this"), "{text}");
+        let elsewhere = permissions_text(&Permissions { no_yolo: None, ..p }, None, None);
+        assert!(!elsewhere.contains("still asks)"), "{elsewhere}");
+    }
+
+    #[test]
+    fn the_saved_approve_list_leaves_unknown_names_out() {
+        let approve = keys(&["web", "netwrk"]);
+        let saved = SavedGrants { path: "~/.marv/config.json", approve: &approve, writable: &[] };
+        let text = permissions_text(&Permissions::default(), Some(saved), None);
+        assert!(text.contains("`approve` `web` (1 unknown name ignored)") && !text.contains("netwrk"), "{text}");
     }
 }

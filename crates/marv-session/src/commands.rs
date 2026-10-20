@@ -324,7 +324,7 @@ pub fn commands() -> &'static [Command] {
             description: "What Marv may do without asking: this session's approvals, and what's saved",
             run: |args, ctx| {
                 if !args.trim().is_empty() {
-                    return error("Usage: /permissions (it only shows them)");
+                    return error(crate::permissions::PERMISSIONS_USAGE);
                 }
                 match ctx.permissions {
                     None => print("Permissions aren't available here."),

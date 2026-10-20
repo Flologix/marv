@@ -183,6 +183,7 @@ pub async fn run_chat(spec: ChatSpec, mut incoming: UnboundedReceiver<ClientMess
                     }
                     // The same view as the TUI's (#82), shown here only: never sent to the model. The desktop has no
                     // config file of its own to show.
+                    "permissions" if !args.is_empty() => print(marv_session::permissions::PERMISSIONS_USAGE.into()),
                     "permissions" => {
                         let servers = session.mcp().map(|m| m.status());
                         print(marv_session::permissions::permissions_text(&session.permissions(), None, servers.as_deref()))

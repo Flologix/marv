@@ -909,6 +909,11 @@ impl SubagentSink for TurnSink {
 impl MarvSession {
     /// Builds a session. Fails (and changes nothing) for a taken tool name, or yolo where `no_yolo` forbids it.
     pub fn new(mut init: SessionInit) -> Result<Self, SessionError> {
+        // #98/#82: only names that mean something stay pre-approved; an unknown one is a problem (shown) and dropped,
+        // so the seeds, the prompt's list and /permissions all name exactly what was seeded (fixed for the session).
+        let (known, problems) = crate::approvals::known_names(&init.pre_approved, "Pre-approved scopes");
+        init.pre_approved = known;
+        init.problems.extend(problems);
         // An absolute path (#61): the marker names it, and read_file and grep only take an absolute one outside the
         // project. A relative MARV_CONFIG_DIR would otherwise make it a project path.
         init.tool_output_dir =
@@ -1018,9 +1023,13 @@ impl MarvSession {
         // through the same path a person's "always" takes, so must_ask and taint still win. An unknown name is a
         // problem (shown), not a silent approval.
         let always = AlwaysScopes::default();
+        // The names were checked above, so this can't fail; were it to, nothing is seeded (never more).
         match crate::approvals::seed_prefixes(&init.pre_approved) {
             Ok(prefixes) => always.seed(&prefixes),
-            Err(problem) => init.problems.push(problem),
+            Err(problem) => {
+                init.problems.push(problem);
+                init.pre_approved.clear();
+            }
         }
         let inner = Inner {
             specs,
@@ -2982,6 +2991,20 @@ mod tests {
         init.cwd = Some("~/p".into());
         edit(&mut init);
         MarvSession::new(init)
+    }
+
+    // #82 review: one unknown name used to make the seeding fail (nothing approved) while the prompt and
+    // /permissions still named every name. Now it's dropped with a problem and the rest are seeded and named.
+    #[test]
+    fn an_unknown_pre_approved_name_is_dropped_and_the_rest_seeded() {
+        let s = session(|i| i.pre_approved = vec!["web".into(), "netwrk".into()]).unwrap();
+        assert!(s.problems().iter().any(|p| p.contains("\"netwrk\"") && p.ends_with("ignored")), "{:?}", s.problems());
+        assert!(s.inner.always.contains("web:example.com"), "web is seeded");
+        assert!(!s.inner.always.contains("bash:net:curl x"));
+        assert_eq!(s.permissions().pre_approved, ["web"]);
+        let prompt = s.system_prompt();
+        assert!(prompt.contains("(they run without asking): web.") && !prompt.contains("netwrk"), "{prompt}");
+        assert_eq!(s.system_prompt(), prompt, "byte-stable");
     }
 
     #[test]
