@@ -15,7 +15,8 @@
 //! - [`plan`]: what one command's sandbox allows ([`Plan`]), decided once for every backend.
 //! - [`backend`]: [`SandboxBackend`], how a plan becomes a sandboxed command, its clean-up and its kill.
 //! - [`bwrap`]: the bubblewrap backend and argument builder (and the mesh plug at `/run/marv/mesh.sock`).
-//! - [`seatbelt`]: the Seatbelt (macOS `sandbox-exec`) profile builder, pure; not the active backend yet (#166).
+//! - [`seatbelt`]: the Seatbelt (macOS `sandbox-exec`) profile builder, pure.
+//! - [`seatbelt_backend`]: the Seatbelt backend (macOS): `sandbox-exec`, `marv __guard`, the private `TMPDIR` (#166).
 //! - [`fs`]: the file system as the sandbox checks it ([`FsProbe`]), injectable for tests.
 //! - [`git_guard`]: `.git` read-only or a placeholder for commands that run without asking; worktree records.
 //! - [`notes`]: the `Marv:` notes bash appends (stand-in home, missing network, gh, read-only .git).
@@ -34,6 +35,7 @@ pub mod plan;
 pub mod protected;
 pub mod runtime;
 pub mod seatbelt;
+pub mod seatbelt_backend;
 pub mod taint;
 pub mod writable;
 
@@ -43,7 +45,7 @@ mod test_fs;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-pub use backend::{Prepared, SandboxBackend, SandboxCommand, backend};
+pub use backend::{Prepared, SandboxBackend, SandboxCommand, backend, kill_group, wait_exited};
 pub use bwrap::{Bwrap, MESH_SOCKET, SandboxOptions, sandbox_args, sandbox_available};
 pub use fs::{EntryKind, FileKind, FsProbe, RealFs};
 pub use home::home_project;
@@ -82,7 +84,7 @@ pub fn hidden_in_sandbox(dir: &std::path::Path, home: &std::path::Path) -> bool 
 /// `path` with its deepest existing ancestor resolved and the rest appended: where a folder that doesn't exist yet
 /// will be once made. A plain `canonicalize` fails there and would leave macOS's `/tmp/marv-<uid>` (before its first
 /// use) unresolved, so it wouldn't match `/tmp`'s real path, `/private/tmp`.
-fn real_or_planned(path: &std::path::Path) -> std::path::PathBuf {
+pub(crate) fn real_or_planned(path: &std::path::Path) -> std::path::PathBuf {
     let mut rest = Vec::new();
     let mut base = path;
     loop {

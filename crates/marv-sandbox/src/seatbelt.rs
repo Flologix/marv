@@ -50,7 +50,9 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::SandboxError;
 use crate::fs::{EntryKind, FileKind, FsProbe};
-use crate::home::{CREDENTIALS, HOME_MASKS, contains};
+use crate::home::{CREDENTIALS, contains};
+#[cfg(test)]
+use crate::home::HOME_MASKS;
 use crate::plan::Plan;
 
 /// `sandbox-exec`, always by its full path on the system volume, never from PATH.
@@ -361,23 +363,7 @@ fn build_profile(plan: &Plan, run: &Invocation, fs: &dyn FsProbe, allow_links: b
     let mut b = Builder { text: String::new(), params: Vec::new(), no_links: Vec::new() };
 
     // 1. Base.
-    b.section("1. base");
-    b.line("(version 1)");
-    b.line("(deny default)");
-    b.line("(allow process-fork)");
-    b.line("(allow process-exec)");
-    b.line("(allow signal (target same-sandbox))");
-    b.line("(allow process-info* (target same-sandbox))");
-    let mut sysctls: Vec<String> = SYSCTLS.iter().map(|s| format!("(sysctl-name {})", quoted(s))).collect();
-    sysctls.extend(SYSCTL_PREFIXES.iter().map(|s| format!("(sysctl-name-prefix {})", quoted(s))));
-    b.line(&format!("(allow sysctl-read {})", sysctls.join(" ")));
-    let services: Vec<String> = MACH_SERVICES.iter().map(|s| format!("(global-name {})", quoted(s))).collect();
-    b.line(&format!("(allow mach-lookup {})", services.join(" ")));
-    b.line("(allow ipc-posix-sem)");
-    // Creating a Unix or IP socket reaches nothing; connecting and binding are the network section's. TODO(#166):
-    // the symbolic domain names are to verify on the macOS probe.
-    b.line("(allow system-socket (socket-domain AF_UNIX) (socket-domain AF_INET) (socket-domain AF_INET6))");
-    b.line("(allow file-ioctl (literal \"/dev/dtracehelper\"))");
+    base(&mut b);
 
     // 2. Reads, broad.
     b.section("2. reads, broad");
@@ -427,8 +413,7 @@ fn build_profile(plan: &Plan, run: &Invocation, fs: &dyn FsProbe, allow_links: b
 
     // 5. Reads, closed again.
     b.section("5. reads, closed again");
-    let masks: Vec<(PathBuf, Option<PathBuf>)> =
-        if home_project { HOME_MASKS.iter().map(|m| written_and_real(&plan.home.join(m), fs)).collect() } else { Vec::new() };
+    let masks: Vec<(PathBuf, Option<PathBuf>)> = plan.home_masks(fs).iter().map(|m| written_and_real(m, fs)).collect();
     for (i, (given, real)) in masks.iter().enumerate() {
         b.paths("deny file-read*", &["literal", "subpath"], &format!("HOME_MASK_{i}"), given, real.as_deref());
     }
@@ -575,10 +560,49 @@ fn build_profile(plan: &Plan, run: &Invocation, fs: &dyn FsProbe, allow_links: b
     }
 
     // 9. Last.
+    last(&mut b);
+    Ok(Profile { text: b.text, params: b.params })
+}
+
+/// Section 1: closed by default, then what any process needs (see the module doc).
+fn base(b: &mut Builder) {
+    b.section("1. base");
+    b.line("(version 1)");
+    b.line("(deny default)");
+    b.line("(allow process-fork)");
+    b.line("(allow process-exec)");
+    b.line("(allow signal (target same-sandbox))");
+    b.line("(allow process-info* (target same-sandbox))");
+    let mut sysctls: Vec<String> = SYSCTLS.iter().map(|s| format!("(sysctl-name {})", quoted(s))).collect();
+    sysctls.extend(SYSCTL_PREFIXES.iter().map(|s| format!("(sysctl-name-prefix {})", quoted(s))));
+    b.line(&format!("(allow sysctl-read {})", sysctls.join(" ")));
+    let services: Vec<String> = MACH_SERVICES.iter().map(|s| format!("(global-name {})", quoted(s))).collect();
+    b.line(&format!("(allow mach-lookup {})", services.join(" ")));
+    b.line("(allow ipc-posix-sem)");
+    // Creating a Unix or IP socket reaches nothing; connecting and binding are the network section's. The symbolic
+    // domain names are accepted (#166 probe).
+    b.line("(allow system-socket (socket-domain AF_UNIX) (socket-domain AF_INET) (socket-domain AF_INET6))");
+    b.line("(allow file-ioctl (literal \"/dev/dtracehelper\"))");
+}
+
+/// Section 9: no XPC service by any name, no `fcntl` that changes a file through a read-only descriptor.
+fn last(b: &mut Builder) {
     b.section("9. last");
     b.line("(deny mach-lookup (xpc-service-name-prefix \"\"))");
     b.line("(deny system-fcntl (fcntl-command 80) (fcntl-command 110))");
-    Ok(Profile { text: b.text, params: b.params })
+}
+
+/// The profile [`crate::seatbelt_backend::Seatbelt`]'s availability check runs: the base and last sections of every
+/// command's profile with reads open, and nothing else. If `sandbox-exec` is gone, or the kernel no longer accepts
+/// these rules, or Marv already runs inside a Seatbelt sandbox (a nested one can't start), it fails.
+pub fn probe_profile() -> String {
+    let mut b = Builder { text: String::new(), params: Vec::new(), no_links: Vec::new() };
+    base(&mut b);
+    b.section("2. reads, broad");
+    b.line("(allow file-read* file-map-executable)");
+    b.line("(allow file-write-data (literal \"/dev/null\"))");
+    last(&mut b);
+    b.text
 }
 
 /// The user's temporary folder, `/private/var/folders/<xx>/<id>` exactly: as given or the one the private TMPDIR is

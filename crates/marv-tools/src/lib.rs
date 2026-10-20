@@ -23,6 +23,7 @@ pub mod files;
 pub mod formatter;
 pub mod github;
 pub mod glob;
+pub mod guard;
 pub mod grep;
 pub mod memory;
 pub mod output;

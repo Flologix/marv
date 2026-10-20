@@ -1,11 +1,12 @@
 //! A sandbox backend: how one [`Plan`] becomes a command that can't do more than the plan allows (#163,
 //! `docs/specs/2026-10-17-macos-sandbox.md` §5).
 //!
-//! Today there is one, bubblewrap ([`crate::bwrap::Bwrap`]), on every platform: where `bwrap` doesn't run (macOS),
-//! [`SandboxBackend::available`] is false and commands run unsandboxed with the warning, as before. Seatbelt
-//! (`sandbox-exec`, macOS) is the second, built from the same plan: its profile builder (#164) renders the plan as an
-//! SBPL profile, and `sandbox-exec` runs `marv __guard` (#165) around the command, so the command's environment, its
-//! clean-up and the way it's killed all go through this trait rather than through callers that know bwrap.
+//! Two: bubblewrap ([`crate::bwrap::Bwrap`]) on Linux, and Seatbelt ([`crate::seatbelt_backend::Seatbelt`],
+//! `sandbox-exec`) on macOS (#166), built from the same plan: its profile builder (#164) renders the plan as an SBPL
+//! profile, and `sandbox-exec` runs `marv __guard` (#165) around the command, so the command's environment, its
+//! clean-up and the way it's killed all go through this trait rather than through callers that know bwrap. Where the
+//! backend can't start a sandbox, [`SandboxBackend::available`] is false and commands run unsandboxed with the
+//! warning.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -49,11 +50,20 @@ pub struct Prepared {
     command: SandboxCommand,
     backend: &'static dyn SandboxBackend,
     finished: bool,
+    /// The spawned sandbox program's pid, once [`Prepared::spawned`] said so.
+    pid: Option<u32>,
 }
 
 impl Prepared {
     pub fn new(command: SandboxCommand, backend: &'static dyn SandboxBackend) -> Self {
-        Self { command, backend, finished: false }
+        Self { command, backend, finished: false, pid: None }
+    }
+
+    /// The command is running as `pid`. Dropped before [`Prepared::finish`] (its owner went away while it ran: a
+    /// process manager dropped), the backend kills it, and everything it started, before cleaning up: Seatbelt's
+    /// private `TMPDIR` is never removed from under a running command (it could make the folder again and leave it).
+    pub fn spawned(&mut self, pid: Option<u32>) {
+        self.pid = pid;
     }
 
     /// The command's clean-up, now (only the first call does anything). Call it once the command has ended.
@@ -74,6 +84,11 @@ impl std::ops::Deref for Prepared {
 
 impl Drop for Prepared {
     fn drop(&mut self) {
+        if !self.finished
+            && let Some(pid) = self.pid.take()
+        {
+            self.backend.kill(pid);
+        }
         self.finish();
     }
 }
@@ -99,11 +114,93 @@ pub trait SandboxBackend: Send + Sync + std::fmt::Debug {
     fn terminate(&self, pid: u32);
     /// After the command has ended: removes what the sandbox left behind ([`SandboxCommand::leftovers`]).
     fn after(&self, command: &SandboxCommand);
+    /// Variables this backend sets on top of [`Plan::env`], given the command's `TMPDIR` (none for bubblewrap).
+    fn extra_env(&self, _tmp: &str) -> Vec<(String, String)> {
+        Vec::new()
+    }
+    /// Whether the process door (background processes and their port relay) works in this backend's sandbox. Not
+    /// yet on macOS (#152, spec §8 option C): the door isn't offered there.
+    fn processes(&self) -> bool {
+        true
+    }
 }
 
-/// The backend for this platform: bubblewrap. (Seatbelt takes macOS in #166.)
+/// The backend for this platform: Seatbelt on macOS (#166), bubblewrap everywhere else.
 pub fn backend() -> &'static dyn SandboxBackend {
-    &crate::bwrap::Bwrap
+    #[cfg(target_os = "macos")]
+    {
+        &crate::seatbelt_backend::Seatbelt
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        &crate::bwrap::Bwrap
+    }
+}
+
+/// SIGKILL to the process group `pid` leads (nothing for a pid that doesn't fit or a group that's gone). Never for a
+/// pid of 1 or below: `killpg(0)` is the caller's own group, and `killpg(1)` init's.
+pub fn kill_group(pid: u32) {
+    if let Ok(pid) = i32::try_from(pid)
+        && pid > 1
+    {
+        let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pid), nix::sys::signal::Signal::SIGKILL);
+    }
+}
+
+/// Blocks until `pid`, a child of this process, has exited, **without reaping it**: while it's a zombie its pid (and
+/// the id of the group it led) can't be taken by another process, so a [`SandboxBackend::kill`] right after this
+/// reaches only what it left behind. Linux: `waitid(WNOWAIT)`; macOS: a kqueue `NOTE_EXIT` (macOS has `WNOWAIT` only
+/// on `waitid`, which nix doesn't offer there). False where it can't tell (another platform, or an error), and then
+/// it returns at once: the caller must not take that for an exit.
+pub fn wait_exited(pid: u32) -> bool {
+    let Some(pid) = i32::try_from(pid).ok().filter(|p| *p > 1) else { return false };
+    wait_exited_os(pid)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn wait_exited_os(pid: i32) -> bool {
+    use nix::sys::wait::{Id, WaitPidFlag, waitid};
+    loop {
+        match waitid(Id::Pid(nix::unistd::Pid::from_raw(pid)), WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT) {
+            Err(nix::errno::Errno::EINTR) => continue,
+            Ok(_) => return true,
+            // ECHILD: reaped by someone else already; it has exited either way.
+            Err(nix::errno::Errno::ECHILD) => return true,
+            Err(_) => return false,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn wait_exited_os(pid: i32) -> bool {
+    use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
+    let Ok(kq) = Kqueue::new() else { return false };
+    let change = KEvent::new(
+        pid as usize,
+        EventFilter::EVFILT_PROC,
+        EvFlags::EV_ADD | EvFlags::EV_ONESHOT,
+        FilterFlag::NOTE_EXIT,
+        0,
+        0,
+    );
+    let mut events = [KEvent::new(0, EventFilter::EVFILT_PROC, EvFlags::empty(), FilterFlag::empty(), 0, 0)];
+    let mut changes: &[KEvent] = std::slice::from_ref(&change);
+    loop {
+        match kq.kevent(changes, &mut events, None) {
+            Err(nix::errno::Errno::EINTR) => changes = &[],
+            // ESRCH: it has exited already (a zombie can't be watched), and it's ours, so it isn't reaped.
+            Err(nix::errno::Errno::ESRCH) => return true,
+            Err(_) => return false,
+            Ok(0) => changes = &[],
+            Ok(_) if events[0].flags().contains(EvFlags::EV_ERROR) => return events[0].data() == nix::libc::ESRCH as isize,
+            Ok(_) => return events[0].fflags().contains(FilterFlag::NOTE_EXIT),
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+fn wait_exited_os(_pid: i32) -> bool {
+    false
 }
 
 /// Sends `signal` to `pid` (nothing for a pid that doesn't fit, or a process that's gone).
@@ -121,9 +218,14 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// A backend that only counts its clean-ups.
+    /// A backend that only counts its clean-ups, its kills, and the kills there had been when it last cleaned up.
     #[derive(Debug)]
-    struct Counting(AtomicUsize);
+    struct Counting(AtomicUsize, AtomicUsize, AtomicUsize);
+    impl Counting {
+        const fn new() -> Self {
+            Self(AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0))
+        }
+    }
     impl SandboxBackend for Counting {
         fn name(&self) -> &'static str {
             "counting"
@@ -140,9 +242,12 @@ mod tests {
         fn hides(&self, _: &Path, _: &Path) -> bool {
             false
         }
-        fn kill(&self, _: u32) {}
+        fn kill(&self, _: u32) {
+            self.1.fetch_add(1, Ordering::SeqCst);
+        }
         fn terminate(&self, _: u32) {}
         fn after(&self, _: &SandboxCommand) {
+            self.2.store(self.1.load(Ordering::SeqCst), Ordering::SeqCst);
             self.0.fetch_add(1, Ordering::SeqCst);
         }
     }
@@ -165,14 +270,52 @@ mod tests {
 
     #[test]
     fn a_prepared_command_cleans_up_once_finished_or_dropped() {
-        static FINISHED: Counting = Counting(AtomicUsize::new(0));
+        static FINISHED: Counting = Counting::new();
         let mut prepared = Prepared::new(SandboxCommand::default(), &FINISHED);
+        prepared.spawned(Some(4242));
         prepared.finish();
         prepared.finish();
         drop(prepared);
         assert_eq!(FINISHED.0.load(Ordering::SeqCst), 1, "finished once, not again on drop");
-        static DROPPED: Counting = Counting(AtomicUsize::new(0));
+        assert_eq!(FINISHED.1.load(Ordering::SeqCst), 0, "finished after it ended: nothing to kill");
+        static DROPPED: Counting = Counting::new();
         drop(Prepared::new(SandboxCommand::default(), &DROPPED));
         assert_eq!(DROPPED.0.load(Ordering::SeqCst), 1, "a spawn that failed or an early return still cleans up");
+        assert_eq!(DROPPED.1.load(Ordering::SeqCst), 0, "never spawned: nothing to kill");
+    }
+
+    /// Dropped while its command still runs (a process manager dropped): killed first, then cleaned up.
+    #[test]
+    fn a_running_command_dropped_is_killed_before_its_clean_up() {
+        static RUNNING: Counting = Counting::new();
+        let mut prepared = Prepared::new(SandboxCommand::default(), &RUNNING);
+        prepared.spawned(Some(4242));
+        drop(prepared);
+        assert_eq!((RUNNING.1.load(Ordering::SeqCst), RUNNING.0.load(Ordering::SeqCst)), (1, 1));
+        assert_eq!(RUNNING.2.load(Ordering::SeqCst), 1, "killed before the clean-up, not after");
+    }
+
+    #[test]
+    fn the_group_kill_refuses_pids_that_would_reach_too_far() {
+        // 0 and 1 would be this test's own group and init's: nothing is sent (this test would die otherwise).
+        kill_group(0);
+        kill_group(1);
+        kill_group(u32::MAX);
+        assert!(!wait_exited(0) && !wait_exited(1));
+    }
+
+    /// The exit is seen while the child is still a zombie: it hasn't been reaped, so its pid stays taken.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn an_exit_is_seen_without_reaping_the_child() {
+        let mut child = std::process::Command::new("sleep").arg("0.2").spawn().unwrap();
+        assert!(wait_exited(child.id()));
+        assert!(nix::sys::signal::kill(nix::unistd::Pid::from_raw(child.id() as i32), None).is_ok(), "still a zombie");
+        assert!(child.wait().unwrap().success());
+        // Exited before the watch began: seen all the same.
+        let mut quick = std::process::Command::new("true").spawn().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(wait_exited(quick.id()));
+        assert!(quick.wait().unwrap().success());
     }
 }

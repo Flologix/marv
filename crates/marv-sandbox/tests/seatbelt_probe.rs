@@ -602,3 +602,96 @@ fn probe_round2() {
     }
     println!("\n===== REPORT =====\n{}\n===== END =====", report.join("\n"));
 }
+
+/// Round 3: which path `file-link` matches (source, new name, or both), with minimal profiles; the sysctls node's
+/// `os.cpus()` and the `sysctl` tool need.
+#[test]
+#[ignore = "a report for #166: run with --ignored --nocapture on macOS"]
+fn probe_round3() {
+    let mut report: Vec<String> = Vec::new();
+    let mut note = |name: &str, what: String| {
+        println!("PROBE {name}: {what}");
+        report.push(format!("{name}: {what}"));
+    };
+    let fx = Fx::new("r3");
+    let base = fx.shared.join("links");
+    let (a, b) = (base.join("A"), base.join("B"));
+    let pylink = |src: &Path, dst: &Path| {
+        format!("python3 -c 'import os,sys; os.link(sys.argv[1], sys.argv[2]); print(\"linked\")' '{}' '{}'", src.display(), dst.display())
+    };
+    let reset = || {
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join("f"), "a").unwrap();
+        std::fs::write(b.join("f"), "b").unwrap();
+    };
+    let profiles = [
+        ("deny_A", format!("(version 1)\n(allow default)\n(deny file-link (subpath \"{}\"))\n", a.display())),
+        ("deny_all_allow_A", format!("(version 1)\n(allow default)\n(deny file-link)\n(allow file-link (subpath \"{}\"))\n", a.display())),
+        (
+            "deny_all_allow_A_literal_dir",
+            format!("(version 1)\n(allow default)\n(deny file-link)\n(allow file-link (literal \"{}\"))\n", a.display()),
+        ),
+    ];
+    for (name, text) in profiles {
+        let p = Profile { text, params: vec![] };
+        for (case, src, dst) in [
+            ("A_to_B", a.join("f"), b.join("g")),
+            ("B_to_A", b.join("f"), a.join("g")),
+            ("A_to_A", a.join("f"), a.join("h")),
+            ("B_to_B", b.join("f"), b.join("h")),
+        ] {
+            reset();
+            note(&format!("linkop.{name}.{case}"), fx.sh(&p, &fx.shared, &pylink(&src, &dst)).to_string());
+        }
+    }
+    let _ = std::fs::remove_dir_all(&base);
+    // The full profile with links allowed, all four directions between the project and the private TMPDIR.
+    let linking = seatbelt::profile_allowing_links(&fx.plan(&fx.root, false), &fx.run(), &RealFs).unwrap();
+    std::fs::write(fx.root.join("p"), "p").unwrap();
+    std::fs::write(fx.tmp.join("t"), "t").unwrap();
+    for (case, src, dst) in [
+        ("project_to_project", fx.root.join("p"), fx.root.join("p2")),
+        ("project_to_tmpdir", fx.root.join("p"), fx.tmp.join("p3")),
+        ("tmpdir_to_project", fx.tmp.join("t"), fx.root.join("t2")),
+        ("tmpdir_to_tmpdir", fx.tmp.join("t"), fx.tmp.join("t3")),
+    ] {
+        note(&format!("fullink.{case}"), fx.sh(&linking, &fx.root, &pylink(&src, &dst)).to_string());
+    }
+    note("fullink.rules", linking.text.lines().filter(|l| l.contains("file-link")).collect::<Vec<_>>().join(" ;; "));
+
+    let full = fx.profile(false);
+    let with = |extra: &str| Profile { text: format!("{}\n{extra}\n", full.text), params: full.params.clone() };
+    let cpus = "node -e 'const c=require(\"os\").cpus(); console.log(c.length, c[0] && c[0].model, c[0] && c[0].speed)'";
+    note("cpus.none", fx.sh(&full, &fx.root, cpus).to_string());
+    note("cpus.brand", fx.sh(&with("(allow sysctl-read (sysctl-name \"machdep.cpu.brand_string\"))"), &fx.root, cpus).to_string());
+    note(
+        "cpus.brand_freq",
+        fx.sh(
+            &with("(allow sysctl-read (sysctl-name \"machdep.cpu.brand_string\") (sysctl-name \"hw.cpufrequency\") (sysctl-name \"hw.cpufrequency_max\") (sysctl-name \"kern.clockrate\"))"),
+            &fx.root,
+            cpus,
+        )
+        .to_string(),
+    );
+    note("cpus.all_sysctls", fx.sh(&with("(allow sysctl-read)"), &fx.root, cpus).to_string());
+    note("sysctl_n.prefix_sysctl", fx.sh(&with("(allow sysctl-read (sysctl-name-prefix \"sysctl.\"))"), &fx.root, "sysctl -n hw.ncpu").to_string());
+    note("sysctl_n.all_sysctls", fx.sh(&with("(allow sysctl-read)"), &fx.root, "sysctl -n hw.ncpu machdep.cpu.brand_string").to_string());
+    note("getconf_ncpu", fx.sh(&full, &fx.root, "getconf _NPROCESSORS_ONLN").to_string());
+    let denied = output(&mut Command::new("/usr/bin/log").args([
+        "show",
+        "--style",
+        "compact",
+        "--last",
+        "3m",
+        "--predicate",
+        "sender == \"Sandbox\" AND eventMessage CONTAINS \"sysctl\"",
+    ]));
+    let mut names: Vec<String> =
+        denied.out.lines().filter_map(|l| l.split_once("sysctl-read ").map(|(_, r)| r.trim().to_string())).collect();
+    names.sort();
+    names.dedup();
+    note("log.denied_sysctls", names.join(", "));
+    println!("\n===== REPORT =====\n{}\n===== END =====", report.join("\n"));
+}
