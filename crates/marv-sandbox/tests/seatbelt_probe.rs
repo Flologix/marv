@@ -900,3 +900,46 @@ fn probe_round4() {
     }
     println!("\n===== REPORT =====\n{}\n===== END =====", report.join("\n"));
 }
+
+/// Round 5 (#166 review): with `com.apple.SecurityServer` dropped from the network services, the TLS clients a command
+/// uses, under the network profile as it ships: curl, git, cargo (its own HTTP stack), npm, pip (truststore: macOS's
+/// Security framework) and a Swift `URLSession` client (Security.framework / Network.framework).
+#[test]
+#[ignore = "a report for #166: run with --ignored --nocapture on macOS"]
+fn probe_round5() {
+    let mut report: Vec<String> = Vec::new();
+    let mut note = |name: &str, what: String| {
+        println!("PROBE {name}: {what}");
+        report.push(format!("{name}: {what}"));
+    };
+    let fx = Fx::new("r5");
+    let net = fx.profile(true);
+    note("profile.security_server", net.text.contains("com.apple.SecurityServer").to_string());
+    std::fs::create_dir_all(fx.root.join("crate/src")).unwrap();
+    std::fs::write(
+        fx.root.join("crate/Cargo.toml"),
+        "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nitoa = \"1\"\n",
+    )
+    .unwrap();
+    std::fs::write(fx.root.join("crate/src/main.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(
+        fx.root.join("fetch.swift"),
+        "import Foundation\nlet s = DispatchSemaphore(value: 0)\nURLSession.shared.dataTask(with: URL(string: \"https://example.com\")!) { d, r, e in print((r as? HTTPURLResponse)?.statusCode ?? -1, e.map { \"\\($0)\" } ?? \"ok\"); s.signal() }.resume()\ns.wait()\n",
+    )
+    .unwrap();
+    for (name, script) in [
+        ("curl", "curl -sS -m 20 -o /dev/null -w '%{http_code}' https://example.com"),
+        ("git_clone", "git clone -q --depth 1 https://github.com/octocat/Hello-World.git hw && ls hw"),
+        ("cargo_fetch", "cd crate && CARGO_HOME=\"$TMPDIR/cargo-home\" cargo fetch -q && echo fetched"),
+        ("npm_view", "npm view is-number version"),
+        ("pip_download", "python3 -m pip download --no-deps -q -d \"$TMPDIR/pip\" six && ls \"$TMPDIR/pip\""),
+        (
+            "pip_truststore",
+            "python3 -m pip --version; python3 -c 'import pip._vendor.truststore as t; print(\"truststore\", t.__name__)'",
+        ),
+        ("swift_urlsession", "swift -module-cache-path \"$TMPDIR/mc\" fetch.swift"),
+    ] {
+        note(name, fx.sh(&net, &fx.root, script).to_string());
+    }
+    println!("\n===== REPORT =====\n{}\n===== END =====", report.join("\n"));
+}
