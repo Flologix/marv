@@ -89,7 +89,11 @@ impl TempDir {
     /// change. Falls back to the temp folder where `/var/tmp` isn't writable.
     pub fn outside_tmp(tag: &str) -> Self {
         let var_tmp = Path::new("/var/tmp");
-        let probe = var_tmp.join(format!(".marv-guards-probe-{}", std::process::id()));
+        // Its own name per call: the tests of one binary run at once, and one's remove_file would make another's
+        // check fail (then it fell back to the temp folder, whose path on macOS is too long for a socket).
+        static PROBE: AtomicUsize = AtomicUsize::new(0);
+        let n = PROBE.fetch_add(1, Ordering::Relaxed);
+        let probe = var_tmp.join(format!(".marv-guards-probe-{}-{n}", std::process::id()));
         let writable = std::fs::write(&probe, "").and_then(|()| std::fs::remove_file(&probe)).is_ok();
         let parent = if writable { var_tmp.to_path_buf() } else { std::env::temp_dir() };
         Self::new_in(&parent, tag)
