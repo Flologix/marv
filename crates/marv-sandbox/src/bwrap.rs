@@ -30,180 +30,28 @@
 //! Order matters: later mounts sit on top of earlier ones.
 
 use std::ffi::OsString;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use crate::SandboxError;
-use crate::home::{CREDENTIALS, HOME_MASKS, TOOLCHAINS, contains, credential_masks};
+use crate::backend::{SandboxBackend, SandboxCommand};
+use crate::home::{HOME_MASKS, TOOLCHAINS, contains};
 use crate::protected::SKIPPED_DIRS;
+
+pub use crate::fs::{EntryKind, FileKind, FsProbe, RealFs};
+pub use crate::plan::{Bind, Plan};
+
+/// One bwrap invocation's mounts: the [`Plan`], under the name it had before there was a second backend.
+pub type SandboxOptions = Plan;
 
 /// Where the mesh plug's socket appears inside the sandbox: the one thing in the otherwise empty `/run`.
 pub const MESH_SOCKET: &str = "/run/marv/mesh.sock";
-
-/// What a path itself is, not following a final symlink (`lstatKind`). Folders and special files are `None`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FileKind {
-    File,
-    Symlink,
-}
-
-/// What a folder entry is, not following a symlink: what [`FsProbe::entries`] reports.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum EntryKind {
-    Dir,
-    File,
-    Symlink,
-    /// A Unix socket or a FIFO: a way to talk to a process outside the sandbox, which a read-only mount doesn't close.
-    Channel,
-    /// A device or anything else.
-    Other,
-}
 
 /// How deep below the home folder the socket scan of a home-folder project looks, and how many entries it reads at
 /// most (breadth first, so the shallow ones are seen first). The home's hidden entries, where services keep their
 /// sockets, are masked whole without a scan; this is for the visible folders.
 pub const SOCKET_SCAN_DEPTH: usize = 6;
 pub const SOCKET_SCAN_LIMIT: usize = 20_000;
-
-/// The file system, injectable for tests.
-pub trait FsProbe {
-    /// A folder's entries with what each is (not following symlinks).
-    fn entries(&self, dir: &Path) -> io::Result<Vec<(std::ffi::OsString, EntryKind)>>;
-    /// What a path itself is (not following a final symlink); None if it doesn't exist.
-    fn entry_kind(&self, path: &Path) -> Option<EntryKind>;
-    /// Whether a path exists (following symlinks).
-    fn exists(&self, path: &Path) -> bool;
-    /// What the path itself is.
-    fn kind(&self, path: &Path) -> Option<FileKind>;
-    /// Where it really leads (an error if it leads nowhere).
-    fn realpath(&self, path: &Path) -> io::Result<PathBuf>;
-}
-
-/// The real file system.
-pub struct RealFs;
-
-fn entry_kind_of(file_type: std::fs::FileType) -> EntryKind {
-    use std::os::unix::fs::FileTypeExt;
-    if file_type.is_symlink() {
-        EntryKind::Symlink
-    } else if file_type.is_dir() {
-        EntryKind::Dir
-    } else if file_type.is_file() {
-        EntryKind::File
-    } else if file_type.is_socket() || file_type.is_fifo() {
-        EntryKind::Channel
-    } else {
-        EntryKind::Other
-    }
-}
-
-impl FsProbe for RealFs {
-    fn entries(&self, dir: &Path) -> io::Result<Vec<(OsString, EntryKind)>> {
-        let mut out = Vec::new();
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            out.push((entry.file_name(), entry.file_type().map(entry_kind_of)?));
-        }
-        out.sort();
-        Ok(out)
-    }
-    fn entry_kind(&self, path: &Path) -> Option<EntryKind> {
-        std::fs::symlink_metadata(path).ok().map(|m| entry_kind_of(m.file_type()))
-    }
-    fn exists(&self, path: &Path) -> bool {
-        path.exists()
-    }
-    fn kind(&self, path: &Path) -> Option<FileKind> {
-        let meta = std::fs::symlink_metadata(path).ok()?;
-        if meta.file_type().is_symlink() {
-            Some(FileKind::Symlink)
-        } else if meta.is_file() {
-            Some(FileKind::File)
-        } else {
-            None
-        }
-    }
-    fn realpath(&self, path: &Path) -> io::Result<PathBuf> {
-        std::fs::canonicalize(path)
-    }
-}
-
-/// One bwrap invocation's mounts.
-#[derive(Debug, Clone, Default)]
-pub struct SandboxOptions {
-    pub root: PathBuf,
-    pub home: PathBuf,
-    pub network: bool,
-    /// PATH inside the sandbox.
-    pub path: String,
-    /// LANG inside the sandbox (`C.UTF-8` when empty).
-    pub lang: String,
-    /// Extra folders the command may read but not change: a worktree's shared `.git` (so git status/diff/log work),
-    /// or the worktree around a subagent working in one of its subfolders (mounted *before* the project, which stays
-    /// writable on top).
-    pub read_only: Vec<PathBuf>,
-    /// Extra folders outside the project the command may change, for an approved command: a git worktree's record
-    /// and its repository's `.git` (in the hidden home), so an approved `git commit` works there.
-    pub writable: Vec<PathBuf>,
-    /// Paths inside the project that don't exist yet and must stay that way: each gets an empty read-only folder
-    /// (a project without `.git`, so a command can't create a repository whose config git would run outside). bwrap
-    /// leaves the empty mount point behind; the caller removes it.
-    pub placeholders: Vec<PathBuf>,
-    /// The project read-only too: Marv's own checks, which run the project's code without asking.
-    pub project_read_only: bool,
-    /// Protected paths inside the project, mounted read-only on top of it (marv-rs).
-    pub protected: Vec<PathBuf>,
-    /// The mesh plug's host socket, bound at [`MESH_SOCKET`] (marv-rs).
-    pub mesh_socket: Option<PathBuf>,
-    /// Files or folders mounted at a path of their own, after `/run` is emptied (so a destination under `/run`
-    /// works): the process door's relay (Marv #51) needs Marv's own binary at `/run/marv-bin` (read-only) and its
-    /// socket folder at `/run/marv` (writable for the process that serves it, read-only for a command that only
-    /// connects).
-    pub binds: Vec<Bind>,
-    /// Marv's own runtime folders (`$XDG_RUNTIME_DIR/marv`: the mesh's plug and discovery sockets, the process
-    /// door's relays), each an empty tmpfs in the sandbox wherever it is (marv-rs).
-    pub hidden: Vec<PathBuf>,
-    /// Marv's config folder (`~/.marv` or `MARV_CONFIG_DIR`): an empty tmpfs in the sandbox wherever it is, its
-    /// `skills/` shown again read-only (marv-rs). Inside the stand-in home it's hidden already.
-    pub config_dir: Option<PathBuf>,
-}
-
-/// One of [`SandboxOptions::binds`]: `source` on the host, at `dest` in the sandbox.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Bind {
-    pub source: PathBuf,
-    pub dest: PathBuf,
-    pub writable: bool,
-}
-
-/// The real path of an extra folder after checking that mounting it is safe, and whether it holds the project (then
-/// it's mounted before the project). bwrap follows symlinks, so the check must too.
-fn resolve_extra(dir: &Path, home: &Path, root: &Path, fs: &dyn FsProbe) -> Result<(PathBuf, bool), SandboxError> {
-    if !dir.is_absolute() {
-        return Err(SandboxError::Mount(format!("Extra sandbox folder {} must be an absolute path.", dir.display())));
-    }
-    let real =
-        fs.realpath(dir).map_err(|_| SandboxError::Mount(format!("Extra sandbox folder {} doesn't exist.", dir.display())))?;
-    let real_home = fs.realpath(home).unwrap_or_else(|_| home.to_path_buf());
-    let real_root = fs.realpath(root).unwrap_or_else(|_| root.to_path_buf());
-    // Mounting the home folder or a parent of it (even read-only) would expose the hidden home, with the API key in it.
-    if real == Path::new("/") || contains(&real, &real_home) {
-        return Err(SandboxError::Mount(format!(
-            "Refusing to make {} visible in the sandbox: it is, or leads to, the home folder or one of its parents.",
-            dir.display()
-        )));
-    }
-    // Read-only over the project itself would leave nothing writable.
-    if real == real_root {
-        return Err(SandboxError::Mount(format!(
-            "Refusing to make {} read-only in the sandbox: it is the project folder.",
-            dir.display()
-        )));
-    }
-    let around = contains(&real, &real_root);
-    Ok((real, around))
-}
 
 /// What the sandbox keeps of `/run`: an empty tmpfs, then PATH folders under it (never `/run`, `/run/user` or a
 /// user's whole folder, even if PATH names one: that's the sockets again) and, with network, the DNS config.
@@ -239,16 +87,16 @@ fn run_mounts(path: &str, network: bool, fs: &dyn FsProbe) -> Vec<OsString> {
 pub fn sandbox_args(opts: &SandboxOptions, fs: &dyn FsProbe) -> Result<Vec<OsString>, SandboxError> {
     let root = opts.root.as_os_str();
     let home = opts.home.as_os_str();
-    let real_home = fs.realpath(&opts.home).unwrap_or_else(|_| opts.home.clone());
-    let real_root = fs.realpath(&opts.root).unwrap_or_else(|_| opts.root.clone());
+    let real_home = opts.real_home(fs);
+    let real_root = opts.real_root(fs);
     // The project is the home folder or a parent of it (marv-rs): mounting it writable would put the whole real home
     // back over the stand-in, so it's read-only, with what's private in the home masked on top (`home_masks`). At /
     // the first mount already shows it read-only, and binding / again would cover /tmp, /run and the stand-in home:
     // the home stays a stand-in then.
-    let home_project = contains(&real_root, &real_home);
+    let home_project = opts.home_project(fs);
     let bind_root = real_root != Path::new("/");
     let home_shown = home_project && bind_root;
-    let read_only = opts.project_read_only || home_project;
+    let read_only = opts.project_read_only(fs);
     let mut args: Vec<OsString> = Vec::new();
     let mut push = |items: &[&std::ffi::OsStr]| args.extend(items.iter().map(|s| s.to_os_string()));
     push(&[
@@ -264,36 +112,31 @@ pub fn sandbox_args(opts: &SandboxOptions, fs: &dyn FsProbe) -> Result<Vec<OsStr
     args.extend(run_mounts(&opts.path, opts.network, fs));
     // The mesh plug (marv-rs): after the empty /run, which would hide it otherwise. A read-only bind wouldn't stop
     // connect() anyway, and the plug only speaks the switchboard's protocol (docs/MESH.md).
-    if let Some(socket) = &opts.mesh_socket {
-        args.extend(["--bind".into(), socket.clone().into_os_string(), MESH_SOCKET.into()]);
+    if let Some(plug) = opts.mesh_bind() {
+        args.extend(["--bind".into(), plug.source.into_os_string(), plug.dest.into_os_string()]);
     }
     for bind in &opts.binds {
         let flag = if bind.writable { "--bind" } else { "--ro-bind" };
         args.extend([flag.into(), bind.source.clone().into_os_string(), bind.dest.clone().into_os_string()]);
     }
-    let mounts: Vec<PathBuf> = TOOLCHAINS.iter().map(|dir| opts.home.join(dir)).filter(|full| fs.exists(full)).collect();
+    let mounts: Vec<PathBuf> = opts.toolchains(fs);
     for full in &mounts {
         args.extend(["--ro-bind".into(), full.clone().into_os_string(), full.clone().into_os_string()]);
     }
     // Bind the resolved path (what was checked), at the path the caller gave. A folder around the project goes
     // first: mounted after it, it would cover the project and silently turn it read-only.
-    let extras = opts
-        .read_only
-        .iter()
-        .map(|dir| resolve_extra(dir, &opts.home, &opts.root, fs).map(|(real, around)| (dir, real, around)))
-        .collect::<Result<Vec<_>, _>>()?;
-    for (dir, real, _) in extras.iter().filter(|e| e.2) {
-        args.extend(["--ro-bind".into(), real.clone().into_os_string(), dir.as_os_str().to_os_string()]);
+    let extras = opts.read_only_extras(fs)?;
+    for extra in extras.iter().filter(|e| e.around_project) {
+        args.extend(["--ro-bind".into(), extra.real.clone().into_os_string(), extra.given.clone().into_os_string()]);
     }
     if bind_root {
         args.extend([if read_only { "--ro-bind" } else { "--bind" }.into(), root.to_os_string(), root.to_os_string()]);
     }
-    for (dir, real, _) in extras.iter().filter(|e| !e.2) {
-        args.extend(["--ro-bind".into(), real.clone().into_os_string(), dir.as_os_str().to_os_string()]);
+    for extra in extras.iter().filter(|e| !e.around_project) {
+        args.extend(["--ro-bind".into(), extra.real.clone().into_os_string(), extra.given.clone().into_os_string()]);
     }
-    for dir in &opts.writable {
-        let (real, _) = resolve_extra(dir, &opts.home, &opts.root, fs)?;
-        args.extend(["--bind".into(), real.into_os_string(), dir.as_os_str().to_os_string()]);
+    for extra in opts.writable_extras(fs)? {
+        args.extend(["--bind".into(), extra.real.into_os_string(), extra.given.into_os_string()]);
     }
     if !read_only {
         // Protected paths (marv-rs): read-only on top of the writable project.
@@ -305,7 +148,7 @@ pub fn sandbox_args(opts: &SandboxOptions, fs: &dyn FsProbe) -> Result<Vec<OsStr
             args.extend(["--tmpfs".into(), path.clone().into_os_string(), "--remount-ro".into(), path.clone().into_os_string()]);
         }
     }
-    // Marv's runtime folder, empty wherever $XDG_RUNTIME_DIR points (marv-rs): a socket a command could see is one it
+    // Marv's runtime folder, empty wherever it is (`runtime::runtime_paths`): a socket a command could see is one it
     // could connect to (a read-only mount doesn't stop connect()), and a plug's socket carries that plug's identity
     // and wires. After the project, toolchain and PATH mounts, so none of them shows it again. The relay and mesh
     // binds have their own destinations under /run/marv, which this never covers. Under /run it's already gone unless
@@ -316,12 +159,8 @@ pub fn sandbox_args(opts: &SandboxOptions, fs: &dyn FsProbe) -> Result<Vec<OsStr
             || opts.read_only.iter().chain(&opts.writable).any(|d| real.starts_with(d))
             || opts.path.split(':').any(|d| d.starts_with("/run/") && real.starts_with(d))
     };
-    for dir in &opts.hidden {
-        if let Ok(real) = fs.realpath(dir)
-            && fs.exists(&real)
-            && real.is_absolute()
-            && (!real.starts_with("/run") || shown_again(&real))
-        {
+    for real in opts.hidden_dirs(fs) {
+        if !real.starts_with("/run") || shown_again(&real) {
             args.extend(["--tmpfs".into(), real.into_os_string()]);
         }
     }
@@ -330,10 +169,7 @@ pub fn sandbox_args(opts: &SandboxOptions, fs: &dyn FsProbe) -> Result<Vec<OsStr
     // above); elsewhere `/` shows it, and in a home-folder project the project does. Never one that holds the
     // project: that would hide the project.
     let mut config_hidden = None;
-    if let Some(dir) = &opts.config_dir
-        && let Ok(real) = fs.realpath(dir)
-        && fs.entry_kind(&real) == Some(EntryKind::Dir)
-        && !contains(&real, &real_root)
+    if let Some(real) = opts.config_dir_hidden(fs)
         && (home_shown || !real.starts_with(&real_home))
     {
         args.extend(["--tmpfs".into(), real.clone().into_os_string()]);
@@ -347,33 +183,17 @@ pub fn sandbox_args(opts: &SandboxOptions, fs: &dyn FsProbe) -> Result<Vec<OsStr
         args.extend(home_masks(opts, &real_home, config_hidden.as_deref(), fs)?);
     }
     // Last, on top of every other mount, so the empty file hides the real one and no later mount shows it again.
-    let mut masks: Vec<PathBuf> = Vec::new();
-    for file in CREDENTIALS {
-        for mask in credential_masks(&opts.home.join(file), &mounts, fs) {
-            if !masks.contains(&mask) {
-                masks.push(mask);
-            }
-        }
-    }
-    for mask in masks {
+    for mask in opts.credentials(&mounts, fs) {
         args.extend(["--ro-bind".into(), "/dev/null".into(), mask.into_os_string()]);
     }
     if !opts.network {
         args.push("--unshare-net".into());
     }
-    let lang = if opts.lang.is_empty() { "C.UTF-8" } else { &opts.lang };
     let flags: [&std::ffi::OsStr; 4] =
         ["--unshare-pid".as_ref(), "--die-with-parent".as_ref(), "--new-session".as_ref(), "--clearenv".as_ref()];
     args.extend(flags.iter().map(|s| s.to_os_string()));
-    for (key, value) in [
-        ("PATH", opts.path.as_str()),
-        ("HOME", &opts.home.to_string_lossy()),
-        ("LANG", lang),
-        ("TERM", "dumb"),
-        ("TMPDIR", "/tmp"),
-        // `bun install` needs a writable cache; not the user's, nor any cache that outlives the command (see above).
-        ("BUN_INSTALL_CACHE_DIR", "/tmp/bun-cache"),
-    ] {
+    // The private /tmp is the temporary folder; `bun install`'s cache is a throwaway one in it (see above).
+    for (key, value) in opts.env("/tmp", &Bwrap) {
         args.extend(["--setenv".into(), key.into(), value.into()]);
     }
     args.extend(["--chdir".into(), root.to_os_string()]);
@@ -518,98 +338,66 @@ pub fn sandbox_available() -> bool {
     })
 }
 
+/// The bubblewrap backend: Linux namespaces, the mounts of [`sandbox_args`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Bwrap;
+
+impl SandboxBackend for Bwrap {
+    fn name(&self) -> &'static str {
+        "bubblewrap"
+    }
+
+    fn available(&self) -> bool {
+        sandbox_available()
+    }
+
+    /// `bwrap <args> -- inner…`, spawned with `PATH` only: bwrap clears the command's environment and sets the plan's
+    /// (`--clearenv`, `--setenv`).
+    fn command(&self, plan: &Plan, inner: &[OsString], fs: &dyn FsProbe) -> Result<SandboxCommand, SandboxError> {
+        let mut argv: Vec<OsString> = vec!["bwrap".into()];
+        argv.extend(sandbox_args(plan, fs)?);
+        argv.push("--".into());
+        argv.extend(inner.iter().cloned());
+        Ok(SandboxCommand {
+            argv,
+            env: vec![("PATH".into(), plan.path.clone().into())],
+            // A read-only project gets no placeholder mounts (`sandbox_args`), but removing an empty folder that isn't
+            // there is harmless, and one that is was bwrap's.
+            leftovers: plan.placeholders.clone(),
+        })
+    }
+
+    /// A bind's destination: bwrap mounts it there.
+    fn guest_path(&self, bind: &Bind) -> PathBuf {
+        bind.dest.clone()
+    }
+
+    fn hides(&self, dir: &Path, home: &Path) -> bool {
+        crate::hidden_in_sandbox(dir, home)
+    }
+
+    /// SIGKILL to bwrap: its own PID namespace goes with it, and everything the command started (`--unshare-pid`).
+    fn kill(&self, pid: u32) {
+        crate::backend::send(pid, nix::sys::signal::Signal::SIGKILL);
+    }
+
+    /// SIGTERM to bwrap: when it ends, its PID namespace and everything in it end too.
+    fn terminate(&self, pid: u32) {
+        crate::backend::send(pid, nix::sys::signal::Signal::SIGTERM);
+    }
+
+    /// bwrap leaves a placeholder's empty mount point; `remove_dir` only removes it while it's empty.
+    fn after(&self, command: &SandboxCommand) {
+        for path in &command.leftovers {
+            let _ = std::fs::remove_dir(path);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-
-    /// A fake file system: `exists` by predicate, `kind` by table, `realpath` by table (identity otherwise).
-    struct Fake {
-        exists: Box<dyn Fn(&str) -> bool>,
-        kinds: HashMap<String, FileKind>,
-        links: HashMap<String, String>,
-        dangling: bool,
-        /// Folder listings (a folder not listed is empty), and what's in them.
-        dirs: HashMap<String, Vec<(String, EntryKind)>>,
-        unlistable: bool,
-    }
-    impl Fake {
-        fn new(exists: impl Fn(&str) -> bool + 'static) -> Self {
-            Self {
-                exists: Box::new(exists),
-                kinds: HashMap::new(),
-                links: HashMap::new(),
-                dangling: false,
-                dirs: HashMap::new(),
-                unlistable: false,
-            }
-        }
-        /// A file system from listings alone: every listed entry exists, as what it's listed as.
-        fn listed(dirs: &[(&str, &[(&str, EntryKind)])]) -> Self {
-            let mut all: HashMap<String, EntryKind> = HashMap::new();
-            for (dir, list) in dirs {
-                all.insert((*dir).into(), EntryKind::Dir);
-                for (name, kind) in *list {
-                    all.insert(format!("{dir}/{name}"), *kind);
-                }
-            }
-            let names: Vec<String> = all.keys().cloned().collect();
-            let mut fs = Fake::new(move |p| names.iter().any(|n| n == p));
-            for (path, kind) in &all {
-                match kind {
-                    EntryKind::File => drop(fs.kinds.insert(path.clone(), FileKind::File)),
-                    EntryKind::Symlink => drop(fs.kinds.insert(path.clone(), FileKind::Symlink)),
-                    _ => {}
-                }
-            }
-            fs.dirs = dirs.iter().map(|(d, l)| ((*d).into(), l.iter().map(|(n, k)| ((*n).into(), *k)).collect())).collect();
-            fs
-        }
-        fn listed_kind(&self, path: &str) -> Option<EntryKind> {
-            let (dir, name) = path.rsplit_once('/')?;
-            let dir = if dir.is_empty() { "/" } else { dir };
-            self.dirs.get(dir)?.iter().find(|(n, _)| n == name).map(|(_, k)| *k)
-        }
-    }
-    impl FsProbe for Fake {
-        fn entries(&self, dir: &Path) -> io::Result<Vec<(OsString, EntryKind)>> {
-            if self.unlistable {
-                return Err(io::Error::from(io::ErrorKind::PermissionDenied));
-            }
-            Ok(self
-                .dirs
-                .get(&*dir.to_string_lossy())
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(n, k)| (n.into(), k))
-                .collect())
-        }
-        fn entry_kind(&self, path: &Path) -> Option<EntryKind> {
-            let p = path.to_string_lossy();
-            if let Some(kind) = self.listed_kind(&p) {
-                return Some(kind);
-            }
-            match self.kinds.get(&*p) {
-                Some(FileKind::File) => Some(EntryKind::File),
-                Some(FileKind::Symlink) => Some(EntryKind::Symlink),
-                None => self.exists(path).then_some(EntryKind::Dir),
-            }
-        }
-        fn exists(&self, path: &Path) -> bool {
-            (self.exists)(&path.to_string_lossy())
-        }
-        fn kind(&self, path: &Path) -> Option<FileKind> {
-            self.kinds.get(&*path.to_string_lossy()).copied()
-        }
-        fn realpath(&self, path: &Path) -> io::Result<PathBuf> {
-            let p = path.to_string_lossy();
-            if self.dangling && self.kinds.get(&*p) == Some(&FileKind::Symlink) {
-                return Err(io::Error::from(io::ErrorKind::NotFound));
-            }
-            Ok(PathBuf::from(self.links.get(&*p).cloned().unwrap_or_else(|| p.into_owned())))
-        }
-    }
+    use crate::test_fs::Fake;
 
     fn base() -> SandboxOptions {
         SandboxOptions { root: "/home/me/proj".into(), home: "/home/me".into(), path: "/usr/bin".into(), ..Default::default() }

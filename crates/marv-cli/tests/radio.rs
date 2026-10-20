@@ -6,7 +6,7 @@
 //! Skipped without python3.
 
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -47,6 +47,24 @@ fn python() -> bool {
     Command::new("python3").arg("-c").arg("import pty").status().is_ok_and(|s| s.success())
 }
 
+/// Where the test machines go: on macOS a short `/tmp`, as macOS's temp folder (`/var/folders/…/T`) leaves too little
+/// of `sun_path`'s 104 bytes for the sockets (#150).
+fn temp_base() -> PathBuf {
+    if cfg!(target_os = "macos") { PathBuf::from("/tmp") } else { std::env::temp_dir() }
+}
+
+/// The variable that puts a Marv's runtime folder at `<run>/marv`: `XDG_RUNTIME_DIR=<run>` on Linux,
+/// `MARV_RUNTIME_DIR=<run>/marv` on macOS, which has no `XDG_RUNTIME_DIR` (as `/tmp/…`, not the real `/private/tmp/…`:
+/// 8 bytes fewer for the sockets).
+fn runtime_var(run: &Path) -> (&'static str, PathBuf) {
+    if cfg!(target_os = "macos") {
+        let run = run.strip_prefix("/private").map_or_else(|_| run.to_path_buf(), |r| Path::new("/").join(r));
+        ("MARV_RUNTIME_DIR", run.join("marv"))
+    } else {
+        ("XDG_RUNTIME_DIR", run.to_path_buf())
+    }
+}
+
 /// A throwaway machine: a private runtime dir, a home, and a project and config per Marv.
 struct Machine(PathBuf);
 
@@ -55,7 +73,7 @@ impl Machine {
         // One per test: the tests of this file run at once, in one process.
         static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("mx-radio-{}-{n}", std::process::id()));
+        let dir = temp_base().join(format!("mx-r{n}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         for sub in ["run", "home"] {
             std::fs::create_dir_all(dir.join(sub)).unwrap();
@@ -71,6 +89,7 @@ impl Machine {
     }
 
     fn command(&self, name: &str, program: &str) -> Command {
+        let (runtime_var, runtime_dir) = runtime_var(&self.0.join("run"));
         let mut command = Command::new(program);
         command
             .current_dir(self.0.join(format!("proj-{name}")))
@@ -78,7 +97,7 @@ impl Machine {
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", self.0.join("home"))
             .env("MARV_CONFIG_DIR", self.0.join(format!("config-{name}")))
-            .env("XDG_RUNTIME_DIR", self.0.join("run"))
+            .env(runtime_var, runtime_dir)
             .env("MARV_MESH_NAME", name)
             // No GitHub probe (see tests/mesh.rs, #89).
             .env("MARV_GITHUB", "off")

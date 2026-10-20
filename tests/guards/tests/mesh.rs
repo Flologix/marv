@@ -37,7 +37,7 @@ impl Drop for Mesh {
 }
 
 fn mesh() -> Mesh {
-    let runtime = TempDir::new("mesh-rt");
+    let runtime = TempDir::short("mesh-rt");
     let log = Arc::new(Log::default());
     let mesh = Arc::new(Switchboard::new("g", runtime.path().join("plugs"), log.clone()));
     let cancel = CancellationToken::new();
@@ -209,8 +209,8 @@ fn marvs_runtime_folder_is_empty_in_the_sandbox_even_inside_the_project() {
     marv_guards::require_bwrap!();
     let (project, home) = (marv_guards::TempDir::new("rt-proj"), marv_guards::TempDir::outside_tmp("rt-home"));
     let outside = marv_guards::TempDir::outside_tmp("rt-xdg");
-    project.write("xdg/marv/plugs/s/parent.sock", "the parent's plug");
-    outside.write("marv/plugs/s/parent.sock", "the parent's plug");
+    project.write("xdg/marv/p/4242/parent.sock", "the parent's plug");
+    outside.write("marv/p/4242/parent.sock", "the parent's plug");
     let sandbox = marv_sandbox::Sandbox {
         hidden: vec![project.path().join("xdg/marv"), outside.path().join("marv")],
         ..marv_guards::sandbox_with_home(home.path())
@@ -220,7 +220,7 @@ fn marvs_runtime_folder_is_empty_in_the_sandbox_even_inside_the_project() {
         project.path(),
         &marv_sandbox::CommandMounts::default(),
         &format!(
-            "ls -A {}/xdg/marv | wc -l; ls -A {}/marv | wc -l; cat {}/xdg/marv/plugs/s/parent.sock {}/marv/plugs/s/parent.sock 2>/dev/null; echo end",
+            "ls -A {}/xdg/marv | wc -l; ls -A {}/marv | wc -l; cat {}/xdg/marv/p/4242/parent.sock {}/marv/p/4242/parent.sock 2>/dev/null; echo end",
             project.path().display(),
             outside.path().display(),
             project.path().display(),
@@ -233,7 +233,53 @@ fn marvs_runtime_folder_is_empty_in_the_sandbox_even_inside_the_project() {
     assert!(!ran.output.contains("the parent's plug"), "{}", ran.output);
     assert!(ran.output.contains("end"), "{}", ran.output);
     // On the host the files are still there: only the sandbox's view is empty.
-    assert!(project.path().join("xdg/marv/plugs/s/parent.sock").exists());
+    assert!(project.path().join("xdg/marv/p/4242/parent.sock").exists());
+}
+
+/// **`MARV_RUNTIME_DIR` is checked like the default runtime folder** (#162): the mesh uses it only when it's absolute,
+/// short enough for the longest socket, its parent exists and is judged by its real path, it's hidden in every sandbox,
+/// nothing on the way is a symlink or another user's, and it's a real folder of this user's, made 0700. A symlink, a
+/// symlinked parent (either could lead into a folder a command sees), a visible folder, a missing parent or a relative
+/// path turns the mesh off: never a fallback, never the folder it named.
+///
+/// Proven: reduced the override's checks in `marv_sandbox::runtime_dir` to `is_absolute` (the folder still made) →
+/// this test failed (the symlink was used); judged the override as given instead of by its parent's real path, and
+/// dropped the ancestor walk in `private_folder` (each alone catches it) → failed (made through the symlinked parent).
+#[test]
+fn the_runtime_folder_override_is_checked_like_the_default() {
+    use std::os::unix::fs::PermissionsExt;
+    // A short folder of its own under /tmp on every platform: the override must leave room for the longest socket.
+    struct Short(std::path::PathBuf);
+    impl Drop for Short {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let base = Short(std::path::PathBuf::from(format!("/tmp/mx-ov-{}", std::process::id())));
+    let _ = std::fs::remove_dir_all(&base.0);
+    std::fs::create_dir_all(&base.0).unwrap();
+    let visible = TempDir::outside_tmp("rt-override-visible");
+    let env = |dir: &std::path::Path| {
+        [("MARV_RUNTIME_DIR".to_string(), dir.display().to_string()), ("HOME".to_string(), "/nonexistent".to_string())]
+            .into_iter()
+            .collect::<marv_mcp::Env>()
+    };
+    let good = base.0.join("marv");
+    assert_eq!(marv_mesh::discovery::mesh_dir(&env(&good)), Some(good.join("mesh")));
+    assert_eq!(std::fs::metadata(&good).unwrap().permissions().mode() & 0o777, 0o700, "made private");
+    let link = base.0.join("link");
+    std::os::unix::fs::symlink(&good, &link).unwrap();
+    assert_eq!(marv_mesh::discovery::mesh_dir(&env(&link)), None, "a symlink");
+    assert_eq!(marv_mesh::discovery::mesh_dir(&env(&visible.path().join("marv"))), None, "a folder sandboxes see");
+    assert!(!visible.path().join("marv").exists(), "and not made");
+    // Through a symlinked parent: it looks under /tmp, but it would be made where the link leads, which sandboxes see
+    // (their fresh /tmp hides the link, not its target).
+    std::os::unix::fs::symlink(visible.path(), base.0.join("up")).unwrap();
+    assert_eq!(marv_mesh::discovery::mesh_dir(&env(&base.0.join("up/marv"))), None, "a symlinked parent");
+    assert!(!visible.path().join("marv").exists(), "and not made there");
+    // A parent that doesn't exist yet.
+    assert_eq!(marv_mesh::discovery::mesh_dir(&env(&base.0.join("missing/marv"))), None, "a missing parent");
+    assert_eq!(marv_mesh::discovery::mesh_dir(&env(std::path::Path::new("rel/marv"))), None, "relative");
 }
 
 /// Answers every approval with its decision, keeping what it was asked.
@@ -260,7 +306,7 @@ async fn the_one_prompt_for_a_call_and_its_new_wire_is_a_persons_yes_or_no() {
     use marv_session::mesh::{HeadlessWires, MESH_WIRE_CALL, MeshTool, WireApprover, wire_approver};
     use marv_session::runner::{AlwaysScopes, SessionApprover};
     use marv_tools::{Approval, Decision, ToolRef};
-    let runtime = TempDir::new("mesh-77");
+    let runtime = TempDir::short("mesh-77");
     let mesh = Arc::new(Switchboard::new("g", runtime.path().join("plugs"), Arc::new(Log::default())));
     let cancel = CancellationToken::new();
     tokio::spawn(Arc::clone(&mesh).serve(cancel.clone()));
@@ -328,7 +374,7 @@ async fn a_woken_turn_reads_its_message_fenced_and_tainted_and_egress_asks() {
     use marv_session::session::SessionEvent;
 
     let project = TempDir::new("wake-project");
-    let runtime = TempDir::new("wake-rt");
+    let runtime = TempDir::short("wake-rt");
     let mesh = Arc::new(Switchboard::new("g", runtime.path().join("plugs"), Arc::new(Log::default())));
     let cancel = CancellationToken::new();
     tokio::spawn(Arc::clone(&mesh).serve(cancel.clone()));
@@ -399,7 +445,7 @@ async fn an_inbox_woken_turn_asks_for_what_yolo_would_allow() {
     use marv_session::mesh::wake_check;
 
     let project = TempDir::new("wake-yolo-project");
-    let runtime = TempDir::new("wake-yolo-rt");
+    let runtime = TempDir::short("wake-yolo-rt");
     let mesh = Arc::new(Switchboard::new("gy", runtime.path().join("plugs"), Arc::new(Log::default())));
     let cancel = CancellationToken::new();
     tokio::spawn(Arc::clone(&mesh).serve(cancel.clone()));

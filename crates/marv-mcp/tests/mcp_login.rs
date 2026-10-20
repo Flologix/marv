@@ -189,7 +189,16 @@ async fn a_second_login_reuses_the_port_with_it_taken_it_registers_again() {
     let port = e.store.get(&key).unwrap().client.unwrap().port.unwrap();
     log_in(&m, "remote").await.unwrap();
     assert_eq!(s.count("/register"), 1);
-    let busy = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    // The last login's dropped listener closes its socket only when its task next runs, so binding may take a moment.
+    let mut busy = None;
+    for _ in 0..50 {
+        if let Ok(l) = std::net::TcpListener::bind(("127.0.0.1", port)) {
+            busy = Some(l);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let busy = busy.expect("the last login's port is free again");
     log_in(&m, "remote").await.unwrap();
     drop(busy);
     assert_eq!(s.count("/register"), 2);

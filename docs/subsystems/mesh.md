@@ -14,7 +14,7 @@ The design is in `docs/MESH.md`, and the security rules are in `docs/SECURITY.md
 |---|---|---|
 | new | `wire.rs` | **Done, with tests.** `WireMode`, `Approver`, `Grant`, `Wire`, and `WireTable` (`add`, `remove`, `unplug`, `find`, `allows`, `check`, `from_plug`). |
 | new | `receptacle.rs` | **Done, with tests.** `ReceptacleName` (a checked name, compared exactly), `ReceptacleKind`, and `Receptacle::inbox`. |
-| new | `plug.rs` | **Done, with tests.** `PlugId`, `Plug`, `SocketMount` (bound at `/run/marv/mesh.sock`), `Reachable`, and `PlugClient` (MCP over the socket: `connect` as `marv-plug`, `list`, `call`, `send`; the mode rides in `tools/call`'s `_meta` as `marv/mode`). |
+| new | `plug.rs` | **Done, with tests.** `PlugId`, `Plug`, `SocketMount` (bound at `/run/marv/mesh.sock`), `sandbox_socket` (#163: `MARV_MESH_SOCKET`, which the sandbox sets when plugged, else that path), `Reachable`, and `PlugClient` (MCP over the socket: `connect` as `marv-plug`, `list`, `call`, `send`; the mode rides in `tools/call`'s `_meta` as `marv/mode`). |
 | new | `message.rs` | **Done, with tests.** `Envelope` (sender, receptacle, mode, `Provenance::Mesh`, size), `fenced()`, and `send_text()`/`text_body` (a JSON string or `{"text": "..."}` alone; anything else is `expected {"text": "..."}`, #123). |
 | new | `limits.rs` | **Done, with tests.** `WireLimits` (size) and `RateLimiter` (a token bucket per wire, fed the time in ms). |
 | new | `approval.rs` | **Done, with tests.** `WireRequest`, `parse_approve_flag` (`--approve mesh:<receptacle>`), and `parse_wire_spec` (`a -> b:inbox`). |
@@ -88,7 +88,7 @@ v1's integration test is `marv_session::mesh::tests::end_to_end`: a `MarvSession
 
 **Status (#16):** done in `marv-mesh`, `marv-session` and `marv-cli`. Left: `watch` (Herdr pane status as notifications), `notifications/tools/list_changed` to plugged-in MCP clients when their wires change, unwiring across processes (a peer's plug and wires last until the far Marv ends), a tmux adapter.
 
-- `discovery`: each switchboard also listens on `$XDG_RUNTIME_DIR/marv/mesh/<name>.sock`, its door. `marv mesh ls` lists the live ones, checking the owner uid and mode 0600. There's no `/tmp` fallback.
+- `discovery`: each switchboard also listens on `<runtime>/mesh/<name>.sock`, its door (`marv_sandbox::runtime_dir`: `$XDG_RUNTIME_DIR/marv` on Linux, `/tmp/marv-<uid>` on macOS, or `MARV_RUNTIME_DIR`). `marv mesh ls` lists the live ones, checking the owner uid and mode 0600. There's no `/tmp` fallback.
 - `ReceptacleKind::Peer { session }`: `peer.<session>.agent.<agent>.inbox`, found on demand, routes to the other switchboard through a plug that switchboard gave this one. A cross-process wire needs `Grant.remote`, so it is approved on both ends.
 - `HerdrAdapter`:
   - maps pane ids to Marvs (`marv mesh ls` shows each Marv's pane, and which agent panes are Marvs);
@@ -113,7 +113,7 @@ v1's integration test is `marv_session::mesh::tests::end_to_end`: a `MarvSession
 
 ## Port notes
 
-- **Plug sockets** live in `$XDG_RUNTIME_DIR/marv/plugs/<session>/<plug>.sock` (`marv_session::mesh::start`). Without `XDG_RUNTIME_DIR` there's no mesh: no `/tmp` fallback, as for discovery.
+- **Plug sockets** live in `<runtime>/p/<pid>-<hex>/<plug>.sock` (`marv_session::mesh::start`, a folder per switchboard made exclusively: Marv desktop runs one per chat in one process, and a dead process's folder is never reused; #162, was `plugs/<session>/`, which a long session name pushed past `sun_path`). Without a runtime folder there's no mesh: no `/tmp` fallback, as for discovery. Both bind sites refuse a path over `sun_path` with a message (`marv_sandbox::runtime::check_socket_path`).
 - **The mode rides in `_meta`.** `tools/call` carries `"_meta": {"marv/mode": "send"}` (default `call`), and `tools/list` gives each receptacle's wired modes as `"_meta": {"marv/modes": [...]}`. A refusal is a tool result with `isError`, so the agent reads it.
 - **The model's tools use the socket too.** `MeshTool` runs in Marv, but it connects to its agent's own plug socket like anything in the sandbox would, so every message from a model goes through the same checks, identity and log.
 - **Asking for a wire.** A `mesh_send`/`mesh_call` on a receptacle that exists, takes the mode and isn't the agent's own asks the session's `WireApprover` first. A wire to an agent's own inbox is never asked for. Yolo may *use* a granted wire (`auto_safe` when wired; tainted sessions still ask), never grant one.
@@ -127,7 +127,7 @@ v1's integration test is `marv_session::mesh::tests::end_to_end`: a `MarvSession
 - **A peer is the whole other Marv.** The far end sees every message from Marv `a` as from its plug `peer-a`; which of `a`'s agents may use the wire is `a`'s wire table's business. Only inboxes take cross-process wires.
 - **Herdr receptacles are per pane** (`herdr.pane.<pane>.send`), not MESH.md's single `herdr.pane.send` with the pane in the message: a grant is decided on names only, so approving it approves typing into that one pane. Pane ids become one segment: `w2T:p1` is `w2_t-p1`.
 - **The shim translates names.** MCP clients take tool names of `[A-Za-z0-9_-]` only, so `marv mesh plug` shows `agent.parent.inbox` as `agent_parent_inbox`, and a call to a send-only receptacle goes as a send.
-- **`marv -p` is on the mesh only when asked** (`--approve mesh:<r>` or `MARV_MESH_NAME`); the TUI always is, with `XDG_RUNTIME_DIR`.
+- **`marv -p` is on the mesh only when asked** (`--approve mesh:<r>` or `MARV_MESH_NAME`); the TUI always is, with a runtime folder.
 - `herdr.rs` replaces Marv's single-flight promise with a `watch::Sender<bool>` for "sending" plus one drain task. The effect is the same: only the newest queued state is sent, and `settled()` waits for the drain. `state()` needs a Tokio runtime.
 - `HerdrReporter::release` drops any queued state, waits for the drain, then sends `pane.release_agent`. The CLI bounds it to 1 s, as in Marv.
 - The adapter tests run a fake `herdr` script written into a temp folder. `FakeHerdr::new` runs it once (`--ready`) before handing it out, retrying while Linux says "Text file busy" (#92). That happens when another test's thread forks while the script is still being written: the child holds the write handle until it execs, and the adapter's first command used to fail under load. No production timeout was involved, and the real `herdr` is never a file that was just written.
@@ -138,7 +138,7 @@ v1's integration test is `marv_session::mesh::tests::end_to_end`: a `MarvSession
 ## Interfaces other crates use
 
 ```rust
-// switchboard (marv-session owns one per process: marv_session::mesh::start(session, &env, cancel) -> Option<MeshHandle>)
+// switchboard (marv-session owns one per session, its own plug folder: marv_session::mesh::start(session, &env, cancel) -> Option<MeshHandle>)
 // Shared as Arc<Switchboard>: every method takes &self; serve/route/deliver/handle take the Arc.
 Switchboard::new(session, runtime_dir, Arc<dyn TrajectorySink>)
   .table() -> WireTable (snapshot); .receptacle(&name) -> Option<Receptacle> (clone)

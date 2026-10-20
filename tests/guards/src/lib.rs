@@ -52,6 +52,19 @@ impl TempDir {
     pub fn new(tag: &str) -> Self {
         Self::new_in(&std::env::temp_dir(), tag)
     }
+    /// A folder for sockets (a runtime folder, a plug folder, a mesh folder): on macOS a short `/tmp/mx-<pid>-<n>`,
+    /// as macOS's temp folder (`/var/folders/…/T`) leaves too little of `sun_path`'s 104 bytes (#150), kept as
+    /// `/tmp/…` rather than its real `/private/tmp/…` (8 bytes more). Elsewhere the same as [`TempDir::new`].
+    pub fn short(tag: &str) -> Self {
+        if cfg!(target_os = "macos") {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let dir = PathBuf::from(format!("/tmp/mx-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            return Self(dir);
+        }
+        Self::new(tag)
+    }
     /// A folder the host's user can write outside `/tmp` (which the sandbox replaces with its own): `/var/tmp`. A fake
     /// home there is what a missing home tmpfs would expose; a file there is what a writable `/` would let a command
     /// change. Falls back to the temp folder where `/var/tmp` isn't writable.
@@ -91,6 +104,16 @@ impl Drop for TempDir {
     }
 }
 
+/// The variable that puts a child Marv's runtime folder at `<dir>/marv`, and its value: `XDG_RUNTIME_DIR=<dir>` on
+/// Linux, `MARV_RUNTIME_DIR=<dir>/marv` on macOS, which has no `XDG_RUNTIME_DIR` (`marv_sandbox::runtime_dir`).
+pub fn runtime_var(dir: &Path) -> (&'static str, PathBuf) {
+    if cfg!(target_os = "macos") {
+        (marv_sandbox::runtime::RUNTIME_DIR_VAR, dir.join("marv"))
+    } else {
+        ("XDG_RUNTIME_DIR", dir.to_path_buf())
+    }
+}
+
 /// A sandbox whose home is `home` (a fake one), with the host's PATH.
 pub fn sandbox_with_home(home: &Path) -> Sandbox {
     Sandbox {
@@ -111,17 +134,16 @@ pub struct Ran {
     pub code: Option<i32>,
 }
 
-/// Runs `script` with real bwrap in `root`, as `Sandbox::command` builds it. `env` is added to *our* environment
-/// for bwrap, to show the sandbox clears it.
+/// Runs `script` with real bwrap in `root`, spawned as Marv spawns it (`Sandbox::prepare`, `SandboxCommand::to_command`:
+/// only the backend's environment). `env` is added to that environment for bwrap itself, to show the sandbox clears
+/// it from the command's.
 pub fn run_sandboxed(sandbox: &Sandbox, root: &Path, mounts: &CommandMounts, script: &str, env: &[(&str, &str)]) -> Ran {
-    let argv: Vec<OsString> = sandbox.command(root, mounts, &format!("exec 2>&1\n{script}")).expect("sandbox args");
-    let out = std::process::Command::new(&argv[0])
-        .args(&argv[1..])
-        .envs(env.iter().copied())
-        .current_dir(root)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .expect("bwrap runs");
+    let inner: [OsString; 3] = ["bash".into(), "-c".into(), format!("exec 2>&1\n{script}").into()];
+    let mut prepared = sandbox.prepare(root, mounts, &inner).expect("sandbox args");
+    let out =
+        prepared.to_command(root).envs(env.iter().copied()).stdin(std::process::Stdio::null()).output().expect("bwrap runs");
+    // What bwrap left behind (a placeholder's empty mount point), as Marv removes it after a command.
+    prepared.finish();
     let mut output = String::from_utf8_lossy(&out.stdout).into_owned();
     output.push_str(&String::from_utf8_lossy(&out.stderr));
     Ran { output, code: out.status.code() }

@@ -61,6 +61,26 @@ fn system_is_read_only_and_run_is_empty_but_for_the_mesh_plug() {
     assert!(ran.output.contains("the plug"), "{}", ran.output);
 }
 
+/// **A plugged command is told where its plug is (#163).** `MARV_MESH_SOCKET` names the plug where the sandbox shows
+/// it (bubblewrap: `/run/marv/mesh.sock`; Seatbelt can't mount, so a client can't assume that path), and only when the
+/// command is plugged. It's the guest path, never the host socket in Marv's runtime folder.
+///
+/// Proven: dropped the `MARV_MESH_SOCKET` entry from `Plan::env` → this test failed (nothing printed).
+#[test]
+fn a_plugged_command_finds_its_plug_through_the_environment() {
+    require_bwrap!();
+    let (project, home, plug) = (TempDir::new("env-plug"), TempDir::outside_tmp("env-plug-home"), TempDir::new("env-plug-s"));
+    let socket = plug.write("mesh.sock", "the plug");
+    let script = "echo \"socket=${MARV_MESH_SOCKET-unset}\"; cat \"$MARV_MESH_SOCKET\" 2>/dev/null; echo";
+    let plugged = marv_sandbox::Sandbox { mesh_socket: Some(socket.clone()), ..sandbox_with_home(home.path()) };
+    let ran = run_sandboxed(&plugged, project.path(), &CommandMounts::default(), script, &[]);
+    assert!(ran.output.contains(&format!("socket={}", marv_sandbox::MESH_SOCKET)), "{}", ran.output);
+    assert!(ran.output.contains("the plug"), "{}", ran.output);
+    assert!(!ran.output.contains(&*socket.to_string_lossy()), "the host path stays hidden: {}", ran.output);
+    let unplugged = run_sandboxed(&sandbox_with_home(home.path()), project.path(), &CommandMounts::default(), script, &[]);
+    assert!(unplugged.output.contains("socket=unset"), "{}", unplugged.output);
+}
+
 /// **No network unless approved (`--unshare-net`), a cleared environment, its own PID namespace.** An API key in
 /// Marv's environment must not reach a command; a command must not see or signal the user's processes.
 ///
@@ -658,7 +678,7 @@ fn refused_writable_entries_are_refused_at_startup() {
         &[bad.as_slice(), std::slice::from_ref(&good)].concat(),
         home.path(),
         project.path(),
-        Some(&runtime),
+        &[runtime.join("marv")],
         None,
     );
     for entry in &bad {
@@ -687,7 +707,7 @@ fn marvs_own_folders_are_refused_as_writable_entries() {
         &entries.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
         home.path(),
         project.path(),
-        Some(&runtime),
+        &[runtime.join("marv")],
         Some(&config),
     );
     for entry in entries {
@@ -714,7 +734,7 @@ fn git_repositories_are_refused_as_writable_entries() {
         &entries.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
         home.path(),
         project.path(),
-        None,
+        &[],
         None,
     );
     for entry in entries {
@@ -724,7 +744,7 @@ fn git_repositories_are_refused_as_writable_entries() {
     // The visible tree beside a repository stays allowed (the config's own example's shape).
     std::fs::create_dir_all(home.path().join("Projects/marv/.beads")).unwrap();
     let (accepted, problems) =
-        marv_sandbox::resolve_writable(&["~/Projects/marv/.beads".to_string()], home.path(), project.path(), None, None);
+        marv_sandbox::resolve_writable(&["~/Projects/marv/.beads".to_string()], home.path(), project.path(), &[], None);
     assert_eq!(accepted, vec![home.path().join("Projects/marv/.beads")], "{problems:?}");
 }
 
@@ -732,7 +752,7 @@ fn git_repositories_are_refused_as_writable_entries() {
 /// `"writable": ["<dir>"]` a yolo bash command `touch <dir>/x` needs no approval and succeeds; another host folder
 /// beside it stays read-only, and so does `~/.ssh` (masked home).
 ///
-/// Proven: dropped the session's `writable` merge in `Sandbox::command_argv` → this failed (the touch failed).
+/// Proven: dropped the session's `writable` merge in `Sandbox::plan` → this failed (the touch failed).
 #[tokio::test]
 async fn the_writable_folder_is_writable_and_nothing_else_new_is() {
     require_bwrap!();
@@ -743,7 +763,7 @@ async fn the_writable_folder_is_writable_and_nothing_else_new_is() {
         &[beads.path().display().to_string()],
         home.path(),
         project.path(),
-        std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from).as_deref(),
+        &marv_sandbox::runtime_paths(&marv_sandbox::runtime_env()),
         None,
     );
     assert_eq!(accepted, vec![beads.path()], "{problems:?}");
@@ -781,7 +801,7 @@ async fn a_writable_entry_in_the_project_cant_be_swapped_for_a_symlink() {
     std::fs::create_dir_all(project.path().join("tools/hooks")).unwrap();
     let entry = project.path().join("tools/hooks");
     let (accepted, problems) =
-        marv_sandbox::resolve_writable(&[entry.display().to_string()], home.path(), project.path(), None, None);
+        marv_sandbox::resolve_writable(&[entry.display().to_string()], home.path(), project.path(), &[], None);
     assert!(problems.is_empty(), "{problems:?}");
     let sandbox = Sandbox { writable: accepted, ..sandbox_with_home(home.path()) };
     let swap = format!("mv tools tools.old && ln -s {} tools && echo swapped", other.path().join(".git").display());

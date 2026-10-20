@@ -61,7 +61,7 @@ Using MCP means:
    - `parent → agent.worker-N.inbox` (send);
    - optionally `worker-N → worker-M` for swarms, but only when wired.
 2. **Several Marvs on one machine: Herdr or tmux (v2, done in #16; see `docs/subsystems/mesh.md` for where it refines this design).**
-   - Each switchboard also listens on `$XDG_RUNTIME_DIR/marv/mesh/<session-id>.sock` (mode 0600, the user only).
+   - Each switchboard also listens on `<runtime>/mesh/<session-id>.sock` (mode 0600, the user only), in Marv's runtime folder (`marv_sandbox::runtime_dir`): `$XDG_RUNTIME_DIR/marv` on Linux (when every sandbox hides it), `/tmp/marv-<uid>` on macOS (made 0700, then it must be a folder, not a symlink, of the user's), or `MARV_RUNTIME_DIR` on either, checked the same way, short enough for the longest socket, and in an existing parent judged by its real path, with no symlink on the way (but the root's `/tmp`) and every folder on the way the user's or root's and not writable by others unless sticky. No runtime folder, no mesh. The plugs' sockets are `<runtime>/p/<pid>-<hex>/<plug>.sock`, a folder per switchboard made exclusively (Marv desktop runs several in one process); a socket path longer than `sun_path` allows (103 bytes on macOS, 107 on Linux) is refused with a message.
    - `marv mesh ls` discovers them.
    - Cross-process wires are approved on **both** ends.
    - The Herdr adapter maps pane ids to sessions and offers `herdr.pane.*` receptacles. This replaces hand-typed orchestration with wired inboxes, while each worker stays sandboxed.

@@ -44,7 +44,7 @@ use marv_sandbox::git_guard::git_guard;
 use marv_sandbox::protected::{
     ProtectedSnapshot, created_note, nested_git_dirs, protected_snapshot, revert_created, scan_created,
 };
-use marv_sandbox::{Bind, CommandMounts, Sandbox};
+use marv_sandbox::{Bind, CommandMounts, Prepared, Sandbox};
 use marv_tools::relay::{RelaySpec, SOCKET_DIR, SOCKET_NAME};
 use marv_tools::{ProcessForward, ProcessForwards, ProcessHost, ProcessInfo, ProcessState, StartResult, ToolError};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -70,8 +70,8 @@ pub struct ProcessManagerOptions {
     pub root: PathBuf,
     /// The home folder the sandbox hides (default: the user's); tests pass a fake one.
     pub home: Option<PathBuf>,
-    /// The folder this manager makes its own folder in, for its processes' sockets (default:
-    /// `$XDG_RUNTIME_DIR/marv`). Its own is `<pid>-<random>`: two sessions in one program never share one, and each
+    /// The folder this manager makes its own folder in, for its processes' sockets (default: Marv's runtime folder,
+    /// `marv_sandbox::runtime_dir`). Its own is `<pid>-<random>`: two sessions in one program never share one, and each
     /// removes only its own.
     pub runtime_dir: Option<PathBuf>,
     pub on_change: Option<OnChange>,
@@ -195,16 +195,11 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// SIGKILLs every background process still running, in every manager (Marv's exit, and a panic on the way out).
+/// Kills every background process still running, in every manager (Marv's exit, and a panic on the way out), through
+/// the sandbox's backend (bwrap: SIGKILL).
 pub fn kill_running() {
     for pid in lock(&RUNNING).drain(..) {
-        signal(pid, nix::sys::signal::Signal::SIGKILL);
-    }
-}
-
-fn signal(pid: u32, signal: nix::sys::signal::Signal) {
-    if let Ok(pid) = i32::try_from(pid) {
-        let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), signal);
+        marv_sandbox::backend().kill(pid);
     }
 }
 
@@ -222,7 +217,8 @@ struct Entry {
     /// Ports already handled (forwarded, refused or over the limit), so each is tried once.
     seen: HashSet<u16>,
     exited: tokio::sync::watch::Receiver<bool>,
-    placeholders: Vec<PathBuf>,
+    /// What started it, for the backend's clean-up once it has ended (bwrap's placeholder mount points).
+    sandboxed: Prepared,
     /// The project's protected files at the start, to find the ones the process adds.
     protected: Option<ProtectedSnapshot>,
     released: bool,
@@ -267,12 +263,11 @@ impl ProcessManager {
         if let Some(dir) = &self.shared.options.runtime_dir {
             return dir.clone();
         }
-        // A short path: a Unix socket's path is limited to 107 bytes.
-        let base = std::env::var_os("XDG_RUNTIME_DIR")
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| std::env::temp_dir().join(format!("marv-{}", nix::unistd::getuid())));
-        base.join("marv")
+        // A short path: a Unix socket's path is limited to 107 bytes (103 on macOS). Marv's runtime folder
+        // (`marv_sandbox::runtime_dir`, hidden in every sandbox), else as before a folder of the user's in the temp
+        // folder.
+        marv_sandbox::runtime_dir(&marv_sandbox::runtime_env())
+            .unwrap_or_else(|| std::env::temp_dir().join(format!("marv-{}", nix::unistd::geteuid())).join("marv"))
     }
 
     /// Its own folder (0700), unique even among managers in one process: their process ids both start at p1.
@@ -409,34 +404,34 @@ impl ProcessManager {
         read_only.extend(nested_git_dirs(root));
         let script = format!("exec 2>&1\n{command}");
         // With network it shares the host's: its ports are already the user's, so there's nothing to relay.
+        let backend = self.shared.sandbox.backend();
         let (binds, inner): (Vec<Bind>, Vec<OsString>) = if network {
             (vec![], vec!["bash".into(), "-c".into(), script.into()])
         } else {
             let exe =
                 marv_tools::relay::exe_bind().ok_or_else(|| ToolError::new("Couldn't find Marv's own binary for the relay."))?;
+            let socket_dir = Bind { source: dir.clone(), dest: SOCKET_DIR.into(), writable: true };
+            // Where the backend shows them inside (bwrap: their mount points), never assumed.
             let spec = RelaySpec {
-                listen: Some(format!("{SOCKET_DIR}/{SOCKET_NAME}")),
+                listen: Some(backend.guest_path(&socket_dir).join(SOCKET_NAME).to_string_lossy().into_owned()),
                 connect: vec![],
                 argv: vec!["bash".into(), "-c".into(), script],
             };
-            let socket_dir = Bind { source: dir.clone(), dest: SOCKET_DIR.into(), writable: true };
-            (vec![exe, socket_dir], marv_tools::relay::sandbox_argv(&spec))
+            let argv = marv_tools::relay::sandbox_argv_at(&backend.guest_path(&exe), &spec);
+            (vec![exe, socket_dir], argv)
         };
         let mounts = CommandMounts {
             network,
             read_only,
             writable: vec![],
-            placeholders: guard.placeholders.clone(),
+            placeholders: guard.placeholders,
             project_read_only: false,
             binds,
         };
-        let argv = self.shared.sandbox.command_argv(root, &mounts, &inner).map_err(ToolError::from)?;
+        let sandboxed = self.shared.sandbox.prepare(root, &mounts, &inner).map_err(ToolError::from)?;
         let protected = Some(protected_snapshot(root));
-        let mut child = tokio::process::Command::new(&argv[0])
-            .args(&argv[1..])
-            .env_clear()
-            .env("PATH", &self.shared.sandbox.path)
-            .current_dir(root)
+        // Only the backend's environment, never Marv's. A spawn that fails drops `sandboxed`, which cleans up.
+        let mut child = tokio::process::Command::from(sandboxed.to_command(root))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -475,7 +470,7 @@ impl ProcessManager {
             stop: stop.clone(),
             seen: HashSet::new(),
             exited,
-            placeholders: guard.placeholders,
+            sandboxed,
             protected,
             released: false,
         });
@@ -529,13 +524,14 @@ impl ProcessManager {
             // bwrap's sandbox dies with it (--die-with-parent kills everything inside; its own PID namespace has no way
             // out).
             let mut exited = entry.exited.clone();
+            let backend = self.shared.sandbox.backend();
             if let Some(pid) = entry.pid {
-                signal(pid, nix::sys::signal::Signal::SIGTERM);
+                backend.terminate(pid);
             }
             let grace = self.shared.options.stop_grace;
             if tokio::time::timeout(grace, exited.wait_for(|d| *d)).await.is_err() {
                 if let Some(pid) = entry.pid {
-                    signal(pid, nix::sys::signal::Signal::SIGKILL);
+                    backend.kill(pid);
                 }
                 let _ = exited.wait_for(|d| *d).await;
             }
@@ -706,10 +702,8 @@ fn release_entry(entry: &mut Entry, root: &Path) {
     }
     entry.released = true;
     let _ = std::fs::remove_dir_all(&entry.dir);
-    // bwrap leaves a placeholder's empty mount point; remove_dir only removes it while it's empty.
-    for path in &entry.placeholders {
-        let _ = std::fs::remove_dir(path);
-    }
+    // What the sandbox left behind (bwrap: a placeholder's empty mount point, removed only while it's empty).
+    entry.sandboxed.finish();
     if let Some(before) = entry.protected.take() {
         let mut created = scan_created(root, &before);
         revert_created(root, &mut created);
