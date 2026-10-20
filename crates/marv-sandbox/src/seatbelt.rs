@@ -309,6 +309,13 @@ pub fn profile(plan: &Plan, run: &Invocation, fs: &dyn FsProbe) -> Result<Profil
     build_profile(plan, run, fs, ALLOW_LINKS_IN_PROJECT)
 }
 
+/// [`profile`] with hard links allowed in the project and the private TMPDIR, whatever [`ALLOW_LINKS_IN_PROJECT`] says:
+/// only for the macOS probe that decides it (`tests/seatbelt_probe.rs`, spec §9.2), never for a command.
+#[doc(hidden)]
+pub fn profile_allowing_links(plan: &Plan, run: &Invocation, fs: &dyn FsProbe) -> Result<Profile, SandboxError> {
+    build_profile(plan, run, fs, true)
+}
+
 /// [`profile`], with hard links in the project and the private TMPDIR allowed or not ([`ALLOW_LINKS_IN_PROJECT`]).
 fn build_profile(plan: &Plan, run: &Invocation, fs: &dyn FsProbe, allow_links: bool) -> Result<Profile, SandboxError> {
     for (path, what) in [(&plan.root, "project"), (&plan.home, "home folder")] {
