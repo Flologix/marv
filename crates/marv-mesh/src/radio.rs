@@ -2940,6 +2940,25 @@ mod tests {
         assert_eq!((link.pop(), link.pop(), link.pop()), (Some("request 1".into()), Some("reply 1".into()), None));
     }
 
+    /// Review of #181: a request sent with `send_request` stays queued when replies fill its link: a reply takes a
+    /// `msg`'s place, never the request's. (The link here has no writer, so its queue only fills.)
+    /// Proven: `send_frame` queueing a request with `push` → failed (the reply took the request's place).
+    #[tokio::test]
+    async fn a_queued_request_survives_replies_on_a_full_link() {
+        let mesh = Runtime::new();
+        let a = marv_limited("alpha", &mesh.0, RadioLimits { send_queue: 2, ..RadioLimits::default() });
+        a.radio.on.store(true, Ordering::SeqCst);
+        let link = a.radio.new_link(true, true);
+        a.radio.peers().insert("beta".into(), Peer::new(Some(Presence::new("beta", Path::new("/p"), None, false)), link.clone()));
+        let id = a.radio.send_request("beta", By::User, 0, "keep me").unwrap();
+        assert!(a.radio.send_msg(&To::Names(vec!["beta".into()]), By::User, 0, "chatter").unwrap().refused.is_empty());
+        assert!(link.push_reply("reply 1".into(), 2), "the msg made room");
+        assert!(!link.push_reply("reply 2".into(), 2), "the request is never dropped");
+        let first = link.pop().unwrap();
+        assert!(first.contains(&format!("\"id\":\"{id}\"")) && first.contains("\"request\""), "{first}");
+        assert_eq!((link.pop(), link.pop()), (Some("reply 1".into()), None));
+    }
+
     /// Review of #181: a reply from another Marv than the one asked is refused, and the request stays open.
     /// Proven: without the peer check on `outgoing` in `receive` → failed (gamma's report closed it).
     #[tokio::test]
