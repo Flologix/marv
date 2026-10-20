@@ -17,7 +17,8 @@ use serde_json::json;
 
 /// A command that leaves a marker per run in `outside`.
 fn host_command(outside: &Path) -> String {
-    format!("touch {}/ran-$(date +%s%N)", outside.display())
+    // `$$-$RANDOM`, not `date +%N`: BSD date (macOS) has no %N, and two runs in one second made one marker.
+    format!("touch {}/ran-$$-$RANDOM", outside.display())
 }
 fn runs(outside: &Path) -> usize {
     std::fs::read_dir(outside).unwrap().count()

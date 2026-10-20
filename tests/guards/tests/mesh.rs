@@ -229,7 +229,9 @@ fn marvs_runtime_folder_is_empty_in_the_sandbox_even_inside_the_project() {
         ),
         &[],
     );
-    let counts: Vec<&str> = ran.output.lines().take(2).map(str::trim).collect();
+    // bwrap shows each folder empty; Seatbelt refuses to list it ("Operation not permitted", on stderr): either way
+    // `ls` lists nothing.
+    let counts: Vec<&str> = ran.output.lines().map(str::trim).filter(|l| l.parse::<u32>().is_ok()).collect();
     assert_eq!(counts, ["0", "0"], "{}", ran.output);
     assert!(!ran.output.contains("the parent's plug"), "{}", ran.output);
     assert!(ran.output.contains("end"), "{}", ran.output);
