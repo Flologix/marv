@@ -143,21 +143,36 @@ fn check_override(dir: &Path, home: &Path, project: Option<&Path>) -> Result<Pat
     // A sandboxed command runs as this user and writes in the project: it could make the folder, or its `mesh` and
     // `p` folders, before Marv does (#168). Judged both as given and by real paths; a project whose real path can't
     // be read is judged as given.
+    // The folder's own real path too, when it exists: on a case-insensitive volume (macOS's APFS) `/tmp/Proj` is
+    // the project `/private/tmp/proj`, which the byte comparison above misses, and `private_folder` would make that
+    // project 0700. Checked again once it's made.
+    let own_real = || std::fs::canonicalize(dir).ok();
     if let Some(project) = project {
-        let real_project = std::fs::canonicalize(project).unwrap_or_else(|_| project.to_path_buf());
-        let inside = |p: &Path| real.starts_with(p) || dir.starts_with(p);
-        if inside(&real_project) || inside(project) {
-            return Err(format!(
-                "it's inside the project ({}), where sandboxed commands could make it first: use a folder outside it",
-                project.display()
-            ));
-        }
-        if real_project.starts_with(&real) || project.starts_with(dir) {
-            return Err(format!("it holds the project ({}): use a folder outside it", project.display()));
-        }
+        clear_of_project(&[dir, &real], own_real().as_deref(), project)?;
     }
     private_folder(dir).map_err(|e| e.to_string())?;
+    if let Some(project) = project {
+        clear_of_project(&[dir, &real], own_real().as_deref(), project)?;
+    }
     Ok(dir.to_path_buf())
+}
+
+/// Refuses a runtime folder (`paths`: as given and with its parent's real path; `own_real`: its own real path, when
+/// it exists) inside `project` or holding it, comparing given and real paths of both.
+fn clear_of_project(paths: &[&Path], own_real: Option<&Path>, project: &Path) -> Result<(), String> {
+    let real_project = std::fs::canonicalize(project).unwrap_or_else(|_| project.to_path_buf());
+    let paths: Vec<&Path> = paths.iter().copied().chain(own_real).collect();
+    let projects = [project, real_project.as_path()];
+    if paths.iter().any(|d| projects.iter().any(|p| d.starts_with(p))) {
+        return Err(format!(
+            "it's inside the project ({}), where sandboxed commands could make it first: use a folder outside it",
+            project.display()
+        ));
+    }
+    if paths.iter().any(|d| projects.iter().any(|p| p.starts_with(d))) {
+        return Err(format!("it holds the project ({}): use a folder outside it", project.display()));
+    }
+    Ok(())
 }
 
 /// Makes `dir` this user's private folder, or refuses it. `dir` is absolute and plain (no `.` or `..`); its parent
@@ -201,6 +216,8 @@ trait Probe {
     /// Where it leads (symlinks followed).
     fn stat(&self, path: &Path) -> std::io::Result<Node>;
     fn realpath(&self, path: &Path) -> std::io::Result<PathBuf>;
+    /// A link's own target, as stored (one hop).
+    fn read_link(&self, path: &Path) -> std::io::Result<PathBuf>;
 }
 
 struct RealFs;
@@ -222,6 +239,9 @@ impl Probe for RealFs {
     fn realpath(&self, path: &Path) -> std::io::Result<PathBuf> {
         std::fs::canonicalize(path)
     }
+    fn read_link(&self, path: &Path) -> std::io::Result<PathBuf> {
+        std::fs::read_link(path)
+    }
 }
 
 /// Every folder on the way to `dir` (not `dir` itself) belongs to this user (`uid`) or root and isn't writable by
@@ -231,24 +251,35 @@ impl Probe for RealFs {
 ///
 /// Nothing on the way may be a symlink, with two exceptions: the root's `/tmp` (macOS's link to `/private/tmp`), and
 /// a link root owns in a folder only root can change (not even sticky-writable by others), such as Fedora
-/// Silverblue's `/home -> var/home` (#168). Nobody but root can change where that one leads, and its target's folders
-/// are walked the same way (the target and each of its parents). Any other symlink is refused, not followed: through
-/// it, a folder that looks hidden could be one sandboxes see.
+/// Silverblue's `/home -> var/home` (#168). Nobody but root can change where that one leads. It's followed one hop
+/// at a time (its stored target, never the fully resolved path): the target and each of its parents are walked the
+/// same way, so a further link in a chain, and the folder it sits in, get the same checks. Any other symlink is
+/// refused, not followed: through it, a folder that looks hidden could be one sandboxes see.
 fn check_ancestors(dir: &Path, uid: u32, fs: &dyn Probe) -> std::io::Result<()> {
+    match dir.parent() {
+        Some(parent) => check_chain(parent, dir, uid, fs, 0),
+        None => Ok(()),
+    }
+}
+
+/// How many root-owned links one walk follows (a loop is refused, not followed forever).
+const MAX_LINK_HOPS: usize = 8;
+
+/// `path` and each of its parents, for [`check_ancestors`] (`dir`: the runtime folder, for messages).
+fn check_chain(path: &Path, dir: &Path, uid: u32, fs: &dyn Probe, hops: usize) -> std::io::Result<()> {
     let refuse = |why: String| Err(std::io::Error::other(why));
-    for ancestor in dir.ancestors().skip(1) {
+    for ancestor in path.ancestors() {
         let mut node = fs.lstat(ancestor)?;
         if node.symlink {
             if ancestor == Path::new("/tmp") {
                 node = fs.stat(ancestor)?;
-            } else if let Some(target) = root_link_target(ancestor, node, fs)? {
-                for folder in target.ancestors() {
-                    let node = fs.lstat(folder)?;
-                    if node.symlink {
-                        return refuse(format!("{} leads through another symlink, {}", ancestor.display(), folder.display()));
-                    }
-                    folder_ok(folder, node, uid)?;
+            } else if root_only_link(ancestor, node, fs)? {
+                if hops >= MAX_LINK_HOPS {
+                    return refuse(format!("too many symlinks on the way at {}", ancestor.display()));
                 }
+                let target = link_target(ancestor, fs)?;
+                check_chain(&target, dir, uid, fs, hops + 1)?;
+                // The link's own folders: the rest of this walk.
                 continue;
             } else {
                 // The real path works, when it's one Marv accepts.
@@ -264,16 +295,30 @@ fn check_ancestors(dir: &Path, uid: u32, fs: &dyn Probe) -> std::io::Result<()> 
     Ok(())
 }
 
-/// Where `link` leads, when it's a link only root could have made or change: root owns it, and its folder is a
-/// root-owned folder nobody else may write in (no sticky-bit exception: a sticky folder others write in could hold a
-/// link root made for someone else's purpose). `None`: not such a link.
-fn root_link_target(link: &Path, node: Node, fs: &dyn Probe) -> std::io::Result<Option<PathBuf>> {
-    let Some(parent) = link.parent() else { return Ok(None) };
+/// Whether `link` is a link only root could have made or change: root owns it, and its folder is a root-owned folder
+/// nobody else may write in (no sticky-bit exception: a sticky folder others write in could hold a link root made for
+/// someone else's purpose).
+fn root_only_link(link: &Path, node: Node, fs: &dyn Probe) -> std::io::Result<bool> {
+    let Some(parent) = link.parent() else { return Ok(false) };
     let folder = fs.stat(parent)?;
-    if node.uid != 0 || !folder.dir || folder.uid != 0 || folder.mode & 0o022 != 0 {
-        return Ok(None);
+    Ok(node.uid == 0 && folder.dir && folder.uid == 0 && folder.mode & 0o022 == 0)
+}
+
+/// `link`'s stored target, absolute (a relative one is joined to the link's folder) and plain: one with `.` or `..`
+/// in it is refused rather than resolved, since `..` after a further link climbs out of where that link leads.
+fn link_target(link: &Path, fs: &dyn Probe) -> std::io::Result<PathBuf> {
+    use std::path::Component;
+    let stored = fs.read_link(link)?;
+    let target = if stored.is_absolute() { stored } else { link.parent().unwrap_or(Path::new("/")).join(stored) };
+    let mut parts = target.components();
+    if parts.next() != Some(Component::RootDir) || !parts.all(|c| matches!(c, Component::Normal(_))) {
+        return Err(std::io::Error::other(format!(
+            "{} leads to {}, not a plain path; use a path without symlinks",
+            link.display(),
+            target.display()
+        )));
     }
-    fs.realpath(link).map(Some)
+    Ok(target)
 }
 
 /// One folder on the way: a folder, this user's or root's, not writable by others unless sticky.
@@ -432,6 +477,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn the_folders_own_real_path_is_compared_with_the_project_too() {
+        // macOS's case-insensitive APFS: `/tmp/Proj` is the project `/private/tmp/proj`, though no byte comparison of
+        // the given path (nor its parent's real path joined to the name as given) says so. The folder's own real path
+        // (`canonicalize`, which returns the stored case) does.
+        let project = Path::new("/mx-no-such/private/tmp/proj");
+        let given = [Path::new("/mx-no-such/tmp/Proj"), Path::new("/mx-no-such/private/tmp/Proj")];
+        assert_eq!(clear_of_project(&given, None, project), Ok(()));
+        let why = clear_of_project(&given, Some(project), project).unwrap_err();
+        assert!(why.contains("inside the project"), "{why}");
+        let why = clear_of_project(&given, Some(Path::new("/mx-no-such/private/tmp")), project).unwrap_err();
+        assert!(why.contains("holds the project"), "{why}");
+    }
+
     /// A file system for [`check_ancestors`]: folders and links, every other path missing.
     #[derive(Default)]
     struct Fake {
@@ -473,7 +532,20 @@ mod tests {
                 out.push(part);
                 for _ in 0..8 {
                     match self.links.get(&out) {
-                        Some(target) => out = target.clone(),
+                        Some(target) => {
+                            let joined = out.parent().unwrap_or(Path::new("/")).join(target);
+                            // Lexically, as the kernel does once the folders on the way are real ones.
+                            out = PathBuf::from("/");
+                            for c in joined.components().skip(1) {
+                                match c {
+                                    std::path::Component::ParentDir => {
+                                        out.pop();
+                                    }
+                                    std::path::Component::CurDir => {}
+                                    c => out.push(c),
+                                }
+                            }
+                        }
                         None => break,
                     }
                 }
@@ -481,9 +553,19 @@ mod tests {
             }
             Ok(out)
         }
+        fn read_link(&self, path: &Path) -> std::io::Result<PathBuf> {
+            let at = match (path.parent(), path.file_name()) {
+                (Some(parent), Some(name)) => self.realpath(parent)?.join(name),
+                _ => path.to_path_buf(),
+            };
+            self.read_link_raw(&at)
+        }
     }
 
     impl Fake {
+        fn read_link_raw(&self, path: &Path) -> std::io::Result<PathBuf> {
+            self.links.get(path).cloned().ok_or_else(|| std::io::ErrorKind::InvalidInput.into())
+        }
         fn raw(&self, path: &Path) -> std::io::Result<Node> {
             self.nodes.get(path).copied().ok_or_else(|| std::io::ErrorKind::NotFound.into())
         }
@@ -516,6 +598,31 @@ mod tests {
         let mut fs = fs;
         fs.nodes.insert("/var/f".into(), Node { symlink: false, dir: false, uid: 0, mode: 0o644 });
         assert!(walk(&fs, "/home/u/.c/marv").is_err());
+    }
+
+    #[test]
+    fn a_chain_of_links_is_followed_one_hop_at_a_time() {
+        // The review's case: root's /srv/l -> /opt/a/l2, and /opt/a/l2 (another uid's, in a folder that uid may
+        // write) -> /var/home. Resolving the whole chain at once only walked /var/home: that uid could repoint l2.
+        let chain = || silverblue().dir("/srv", 0, 0o755).dir("/opt", 0, 0o755).link("/srv/l", 0, "/opt/a/l2");
+        let fs = chain().dir("/opt/a", 2000, 0o777).link("/opt/a/l2", 2000, "/var/home");
+        assert!(walk(&fs, "/srv/l/u/.c/marv").unwrap_err().contains("a symlink on the way: /opt/a/l2"));
+        // A root-owned second link, but in a folder others may write in (or a third uid's): refused too.
+        let fs = chain().dir("/opt/a", 0, 0o777).link("/opt/a/l2", 0, "/var/home");
+        assert!(walk(&fs, "/srv/l/u/.c/marv").unwrap_err().contains("a symlink on the way: /opt/a/l2"));
+        let fs = chain().dir("/opt/a", 2000, 0o755).link("/opt/a/l2", 0, "/var/home");
+        assert!(walk(&fs, "/srv/l/u/.c/marv").is_err());
+        // Two links only root can change, each in a root-only folder: followed.
+        let fs = chain().dir("/opt/a", 0, 0o755).link("/opt/a/l2", 0, "/var/home");
+        assert_eq!(walk(&fs, "/srv/l/u/.c/marv"), Ok(()));
+        // A relative target (Silverblue's own is `var/home`) is joined to the link's folder.
+        let fs = silverblue().link("/home", 0, "var/home");
+        assert_eq!(walk(&fs, "/home/u/.c/marv"), Ok(()));
+        // A target with `..` in it is refused, not resolved; a loop is refused, not followed forever.
+        let fs = silverblue().dir("/srv", 0, 0o755).link("/home", 0, "/srv/../var/home");
+        assert!(walk(&fs, "/home/u/.c/marv").unwrap_err().contains("not a plain path"));
+        let fs = Fake::root().link("/a", 0, "/b").link("/b", 0, "/a");
+        assert!(walk(&fs, "/a/marv").is_err());
     }
 
     #[test]
