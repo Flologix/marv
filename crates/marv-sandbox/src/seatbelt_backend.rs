@@ -131,16 +131,15 @@ pub const CACHE_VARS: &[(&str, &str)] = &[
 pub struct Seatbelt;
 
 impl Seatbelt {
-    /// The availability check itself (uncached): see the module doc.
-    fn probe() -> bool {
-        let Some(exe) = guard_exe() else { return false };
+    /// The availability check itself (uncached) for the guard binary `exe`: see the module doc.
+    fn probe(exe: &Path) -> bool {
         if !Path::new(SANDBOX_EXEC).exists() {
             return false;
         }
         const TOKEN: &str = "marv-seatbelt-ok";
         let out = std::process::Command::new(SANDBOX_EXEC)
             .args(["-p", &probe_profile(), "--"])
-            .arg(&exe)
+            .arg(exe)
             .args([GUARD_SUBCOMMAND, &std::process::id().to_string(), "--", "/bin/echo", TOKEN])
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
@@ -157,9 +156,18 @@ impl SandboxBackend for Seatbelt {
         "Seatbelt"
     }
 
+    /// Probed once per guard binary: a test that sets the guards' fixture ([`set_guard_exe`]) after something else
+    /// asked gets its own answer, not the test harness's.
     fn available(&self) -> bool {
-        static AVAILABLE: OnceLock<bool> = OnceLock::new();
-        *AVAILABLE.get_or_init(Self::probe)
+        static AVAILABLE: std::sync::Mutex<Vec<(PathBuf, bool)>> = std::sync::Mutex::new(Vec::new());
+        let Some(exe) = guard_exe() else { return false };
+        let mut known = AVAILABLE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, ok)) = known.iter().find(|(e, _)| *e == exe) {
+            return *ok;
+        }
+        let ok = Self::probe(&exe);
+        known.push((exe, ok));
+        ok
     }
 
     fn command(&self, plan: &Plan, inner: &[OsString], fs: &dyn FsProbe) -> Result<SandboxCommand, SandboxError> {
