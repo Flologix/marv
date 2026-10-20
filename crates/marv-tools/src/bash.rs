@@ -838,8 +838,10 @@ mod tests {
     }
 
     /// A process that left the group (`setsid`) keeps the output pipe: once the timeout or the stop has killed the
-    /// command, the pipes get [`KILL_GRACE`], then what was read is returned.
-    const LEAVES_THE_GROUP: &str = "echo before; setsid sh -c 'sleep 30' & sleep 30";
+    /// command, the pipes get [`KILL_GRACE`], then what was read is returned. Through python3, as macOS has no
+    /// `setsid` command.
+    const LEAVES_THE_GROUP: &str =
+        "echo before; python3 -c 'import os; os.setsid(); os.execvp(\"sleep\", [\"sleep\", \"30\"])' & sleep 30";
 
     #[tokio::test]
     async fn the_timeout_holds_when_a_child_left_the_group_with_the_pipe() {

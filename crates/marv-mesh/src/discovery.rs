@@ -129,9 +129,10 @@ fn io(context: &str, err: std::io::Error) -> MeshError {
     MeshError::Io(format!("{context}: {err}"))
 }
 
-/// This process's uid, without `unsafe`: the owner of `/proc/self` (Linux, as bwrap is).
+/// This process's effective uid, the owner of the files and sockets it makes. Through nix rather than `/proc/self`,
+/// which macOS doesn't have (#150).
 pub fn own_uid() -> Result<u32> {
-    std::fs::metadata("/proc/self").map(|m| m.uid()).map_err(|e| io("can't tell who this user is (/proc/self)", e))
+    Ok(nix::unistd::geteuid().as_raw())
 }
 
 /// Makes `dir` this user's private folder (0700), refusing a symlink or someone else's folder.

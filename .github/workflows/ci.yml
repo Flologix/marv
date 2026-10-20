@@ -80,3 +80,17 @@ jobs:
             printf '%s\n' "$left" | while read -r d; do echo "== $d"; find "$d" -printf '%TT %M %s %p\n' 2>/dev/null | sort | head -40; done
             exit 1
           fi
+
+  # macOS (#150): Marv compiles there but isn't ported yet. Not required: it shows what fails until it's green, then
+  # it becomes a required check. There's no bubblewrap, so the sandbox tests skip (no MARV_REQUIRE_SANDBOX) until the
+  # Seatbelt backend (#151).
+  macos:
+    runs-on: macos-14
+    timeout-minutes: 45
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets
+      - run: cargo test --workspace --no-fail-fast
