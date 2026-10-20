@@ -122,7 +122,7 @@ pub enum Command {
     #[command(name = "__relay", hide = true)]
     Relay { spec: String },
     /// Runs a command in a session of its own and kills its process group when `parent` dies (#165): `guard`.
-    #[command(name = "__guard", hide = true)]
+    #[command(name = marv_sandbox::seatbelt_backend::GUARD_SUBCOMMAND, hide = true)]
     Guard {
         parent: u32,
         #[arg(last = true, required = true)]

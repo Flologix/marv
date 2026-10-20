@@ -50,9 +50,9 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::SandboxError;
 use crate::fs::{EntryKind, FileKind, FsProbe};
-use crate::home::{CREDENTIALS, contains};
 #[cfg(test)]
 use crate::home::HOME_MASKS;
+use crate::home::{CREDENTIALS, contains};
 use crate::plan::Plan;
 
 /// `sandbox-exec`, always by its full path on the system volume, never from PATH.
@@ -84,6 +84,7 @@ const SYSCTLS: &[&str] = &[
     "hw.logicalcpu_max",
     "hw.machine",
     "hw.memsize",
+    "hw.model",
     "hw.ncpu",
     "hw.nperflevels",
     "hw.packages",
@@ -93,6 +94,7 @@ const SYSCTLS: &[&str] = &[
     "hw.vectorunit",
     "kern.hostname",
     "kern.maxfilesperproc",
+    "kern.ngroups",
     "kern.osproductversion",
     "kern.osrelease",
     "kern.ostype",
@@ -101,9 +103,17 @@ const SYSCTLS: &[&str] = &[
     "kern.secure_kernel",
     "kern.usrstack64",
     "kern.version",
-    "sysctl.proc_cputype",
+    // Node's `os.cpus()` is empty without it (#166 probe), and `os.cpus().length` sizes worker pools.
+    "machdep.cpu.brand_string",
 ];
-const SYSCTL_PREFIXES: &[&str] = &["hw.optional.arm.", "hw.optional.armv8_", "hw.perflevel"];
+/// `sysctl.` is the sysctl tree's own metadata (`name2oid`, `oidfmt`, `next`): the `sysctl -n hw.ncpu` that build
+/// scripts run needs it to look a name up; the value is still filtered by the list above.
+const SYSCTL_PREFIXES: &[&str] = &["hw.optional.arm.", "hw.optional.armv8_", "hw.perflevel", "sysctl."];
+
+/// The interface list (`getifaddrs`: node's `os.networkInterfaces()`, Go's `net.Interfaces()`, Python's
+/// `if_nameindex()`), with network only: it names the machine's addresses, as a networked command on Linux sees the
+/// host's interfaces and one without network sees only `lo`. Without it those calls fail on macOS (#166 probe).
+const NETWORK_SYSCTL_PREFIX: &str = "net.routetable.";
 
 /// The Mach services every command may look up: user and group lookups (git, ssh) and the system log. Each one added
 /// later is a review item, with a failing tool and a test. `opendirectoryd.libinfo` answers `getpwuid`/`getgrgid`
@@ -127,20 +137,22 @@ const DNS_SOCKET: &str = "/private/var/run/mDNSResponder";
 /// The operation that makes a hard link. A hard link is a second name for a file that no path rule names: a protected
 /// file linked into the project or the private `TMPDIR` could be written through it, a credential read through it.
 /// bwrap stops this with `EXDEV` (a link can't cross a mount); here each denied path is also denied as a link source.
-/// TODO(#166): the operation's name is "to verify" (spec §6.6); if it's wrong, `sandbox-exec` rejects the whole
-/// profile, so it can't ship silently.
+/// The name is right, and `link()` is checked against **both** paths, the source and the new name: a rule naming
+/// either refuses it (#166 probe on macOS 14: with `(deny file-link (subpath A))`, A→B, B→A and A→A are refused, B→B
+/// isn't; with `(deny file-link)` then `(allow file-link (subpath A))` only A→A works).
 const HARD_LINK_OP: &str = "file-link";
 
-/// Whether hard links are allowed in the project and the private `TMPDIR` (rustc's incremental cache, `ln`). Off:
-/// under `(deny default)` no link can be made anywhere, and tools that link (cargo, git, pnpm) fall back to copying.
-/// Whether `file-link` filters on the link's source or on its new name isn't known: if on the new name, an allow for
-/// the project would let `ln ~/.ssh/id_ed25519 ./x; cat x` through. Turn this on only once the BLOCKING probe of #166
-/// (spec §9.2) proves the source is checked.
-const ALLOW_LINKS_IN_PROJECT: bool = false;
+/// Whether hard links are allowed in the project and the private `TMPDIR` (rustc's incremental cache, `ln`). On since
+/// the BLOCKING probe of #166 (spec §9.2): because `file-link` checks the source too, an allow for the project doesn't
+/// let `ln ~/.ssh/known_hosts ./x` through (the home's deny names the source), nor `ln ~/.ssh/known_hosts $TMPDIR/x`,
+/// nor `ln .envrc y` (the protected path's deny), nor a link from a readable file outside every allowed folder
+/// (`/Users/Shared/x`, no allow names it). Both ends must be in the project or the private TMPDIR. (A link from the
+/// project into the TMPDIR is refused too, for no reason the rules show; the other three directions work.)
+const ALLOW_LINKS_IN_PROJECT: bool = true;
 
-// TODO(#166): a setuid or setgid program (`sudo`, `su`) runs with raised privileges, still inside the sandbox; there
-// is no `no_new_privs`. A rule like `(deny process-exec (file-mode #o4000))` waits for the macOS probe to confirm the
-// filter's syntax and meaning. Listed in docs/SECURITY.md.
+// A setuid or setgid program (`sudo`, `su`, `ps`) doesn't run in the sandbox at all: `sandbox-exec`'s exec of one
+// fails with EPERM (#166 probe on macOS 14: `sudo -n true` and `/bin/ps` both "Operation not permitted"), so no rule
+// is needed for it. The guards check it stays so.
 
 /// What one command's profile needs beyond the [`Plan`]: things the macOS backend makes or finds per command (#166).
 #[derive(Debug, Clone, Default)]
@@ -543,6 +555,7 @@ fn build_profile(plan: &Plan, run: &Invocation, fs: &dyn FsProbe, allow_links: b
         b.line(&format!("(allow network-outbound (remote unix-socket (path-literal {})))", quoted(DNS_SOCKET)));
         let services: Vec<String> = NETWORK_MACH_SERVICES.iter().map(|s| format!("(global-name {})", quoted(s))).collect();
         b.line(&format!("(allow mach-lookup {})", services.join(" ")));
+        b.line(&format!("(allow sysctl-read (sysctl-name-prefix {}))", quoted(NETWORK_SYSCTL_PREFIX)));
     } else {
         // The host's loopback is the user's (databases, dev servers, a local proxy): closed, but for the forwarded
         // ports of the user's own background processes.
@@ -1097,6 +1110,18 @@ mod tests {
         assert!(at(&t, "(allow network-outbound (remote ip))") < at(&t, "(xpc-service-name-prefix"));
     }
 
+    /// The interface list names the machine's addresses: with network only, as Linux shows the host's only then.
+    #[test]
+    fn the_interface_list_only_with_network() {
+        let fs = mac_fs(|_| false);
+        let rule = format!("(sysctl-name-prefix \"{NETWORK_SYSCTL_PREFIX}\")");
+        assert!(!build(&base(), &fs).text.contains(&rule));
+        assert!(build(&Plan { network: true, ..base() }, &fs).text.contains(&rule));
+        // What `sysctl -n` and node's `os.cpus()` need, always.
+        let t = build(&base(), &fs).text;
+        assert!(t.contains("(sysctl-name-prefix \"sysctl.\")") && t.contains("(sysctl-name \"machdep.cpu.brand_string\")"));
+    }
+
     #[test]
     fn the_plug_is_the_one_socket_in_the_runtime_folder() {
         let fs = mac_fs(|_| false);
@@ -1192,9 +1217,11 @@ mod tests {
             config_dir: Some("/Users/me/.marv".into()),
             ..base()
         };
-        // As shipped: no link allowed anywhere (deny default), until the #166 probe shows `file-link` checks the
-        // source; the denies below are there all the same.
-        let off = build(&plan, &fs).text;
+        // As shipped: links allowed in the project and the TMPDIR, since the #166 probe showed `file-link` checks the
+        // source too (ALLOW_LINKS_IN_PROJECT).
+        assert_eq!(build(&plan, &fs), build_linking(&plan, &fs));
+        // Without the allow: no link anywhere (deny default), the denies all the same.
+        let off = build_profile(&plan, &run(), &fs, false).unwrap().text;
         assert!(!off.lines().any(|l| l.starts_with(&format!("(allow {HARD_LINK_OP}"))));
         assert!(off.contains(&format!("(deny {HARD_LINK_OP} (literal (param \"CREDENTIAL_0\"))")));
         // With links allowed in the project and the TMPDIR:

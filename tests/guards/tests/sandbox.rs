@@ -16,11 +16,18 @@ use serde_json::json;
 /// without it, a runner that blocks user namespaces), which would let a green run skip Marv's main boundary. CI sets
 /// `MARV_REQUIRE_SANDBOX=1`, and then this fails unless the sandbox really runs.
 ///
+/// The platform's backend is the one that must run: bubblewrap on Linux, Seatbelt (`sandbox-exec` with the guard) on
+/// macOS.
+///
 /// Proven: ran with `MARV_REQUIRE_SANDBOX=1` and `PATH` without bwrap → this test failed.
 #[test]
 fn where_the_sandbox_is_required_it_really_runs() {
+    marv_guards::use_fixture_as_guard(env!("CARGO_BIN_EXE_marv-guards-fixture"));
     if std::env::var_os("MARV_REQUIRE_SANDBOX").is_some_and(|v| v == "1") {
-        assert!(marv_sandbox::sandbox_available(), "MARV_REQUIRE_SANDBOX=1, but bubblewrap can't start a sandbox here");
+        let backend = marv_sandbox::backend();
+        assert!(backend.available(), "MARV_REQUIRE_SANDBOX=1, but {} can't start a sandbox here", backend.name());
+        let expected = if cfg!(target_os = "macos") { "Seatbelt" } else { "bubblewrap" };
+        assert_eq!(backend.name(), expected);
     }
 }
 

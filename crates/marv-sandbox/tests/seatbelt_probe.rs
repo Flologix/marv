@@ -184,7 +184,10 @@ fn probe_report() {
         ("syntax.unix_socket_path_literal", r#"(deny network-outbound (remote unix-socket (path-literal "/private/tmp/mx")))"#),
         ("syntax.unix_socket_bind_subpath", r#"(allow network-bind (local unix-socket (subpath "/private/tmp/mx")))"#),
         ("syntax.fcntl", "(deny system-fcntl (fcntl-command 80) (fcntl-command 110))"),
-        ("syntax.system_socket_domains", "(allow system-socket (socket-domain AF_UNIX) (socket-domain AF_INET) (socket-domain AF_INET6))"),
+        (
+            "syntax.system_socket_domains",
+            "(allow system-socket (socket-domain AF_UNIX) (socket-domain AF_INET) (socket-domain AF_INET6))",
+        ),
         ("syntax.file_link", r#"(deny file-link (subpath "/private/tmp/mx"))"#),
         ("syntax.file_link_literal", r#"(deny file-link (literal "/private/tmp/mx"))"#),
         ("syntax.file_clone", r#"(deny file-clone (subpath "/private/tmp/mx"))"#),
@@ -226,11 +229,20 @@ fn probe_report() {
     // --- BLOCKING: does file-link check the link's source? With the allow on, from a project under the home.
     for (name, prof) in [("links_allowed", &linking), ("links_off", &full)] {
         note(&format!("link.{name}.secret_into_project"), fx.sh(prof, &fx.root, r#"ln "$SECRET" x && cat x"#).to_string());
-        note(&format!("link.{name}.secret_into_tmpdir"), fx.sh(prof, &fx.root, r#"ln "$SECRET" "$TMPDIR/x" && cat "$TMPDIR/x""#).to_string());
+        note(
+            &format!("link.{name}.secret_into_tmpdir"),
+            fx.sh(prof, &fx.root, r#"ln "$SECRET" "$TMPDIR/x" && cat "$TMPDIR/x""#).to_string(),
+        );
         note(&format!("link.{name}.envrc_in_project"), fx.sh(prof, &fx.root, "ln .envrc y && echo linked").to_string());
         note(&format!("link.{name}.agents_in_project"), fx.sh(prof, &fx.root, "ln pkg/AGENTS.md z && echo linked").to_string());
-        note(&format!("link.{name}.plain_in_project"), fx.sh(prof, &fx.root, "echo a > plain && ln plain plain2 && echo linked").to_string());
-        note(&format!("link.{name}.plain_in_tmpdir"), fx.sh(prof, &fx.root, r#"echo a > "$TMPDIR/p" && ln "$TMPDIR/p" "$TMPDIR/p2" && echo linked"#).to_string());
+        note(
+            &format!("link.{name}.plain_in_project"),
+            fx.sh(prof, &fx.root, "echo a > plain && ln plain plain2 && echo linked").to_string(),
+        );
+        note(
+            &format!("link.{name}.plain_in_tmpdir"),
+            fx.sh(prof, &fx.root, r#"echo a > "$TMPDIR/p" && ln "$TMPDIR/p" "$TMPDIR/p2" && echo linked"#).to_string(),
+        );
         note(&format!("link.{name}.symlink_to_secret"), fx.sh(prof, &fx.root, r#"ln -s "$SECRET" s && cat s"#).to_string());
         for f in ["x", "y", "z", "plain", "plain2", "s"] {
             let _ = std::fs::remove_file(fx.root.join(f));
@@ -248,8 +260,14 @@ fn probe_report() {
     // --- Case: rules against typed case or on-disk case?
     note("case.secret_upper", fx.sh(&full, &fx.root, r#"cat "$(printf %s "$SECRET" | tr a-z A-Z)""#).to_string());
     note("case.secret_lower_ok", fx.sh(&full, &fx.root, r#"cat "$SECRET""#).to_string());
-    note("case.write_project_via_upper_path", fx.sh(&full, &fx.root, r#"echo a > "$(printf %s "$PWD" | tr a-z A-Z)/upper-new" && echo wrote"#).to_string());
-    note("case.write_envrc_via_upper_path", fx.sh(&full, &fx.root, r#"echo pwned >> "$(printf %s "$PWD" | tr a-z A-Z)/.envrc" && echo wrote"#).to_string());
+    note(
+        "case.write_project_via_upper_path",
+        fx.sh(&full, &fx.root, r#"echo a > "$(printf %s "$PWD" | tr a-z A-Z)/upper-new" && echo wrote"#).to_string(),
+    );
+    note(
+        "case.write_envrc_via_upper_path",
+        fx.sh(&full, &fx.root, r#"echo pwned >> "$(printf %s "$PWD" | tr a-z A-Z)/.envrc" && echo wrote"#).to_string(),
+    );
     note("case.write_ENVRC_name", fx.sh(&full, &fx.root, "echo pwned >> .ENVRC && echo wrote").to_string());
     note("case.new_agents_md_lower", fx.sh(&full, &fx.root, "echo x > pkg/agents.MD && echo wrote").to_string());
     note("case.envrc_after", std::fs::read_to_string(fx.root.join(".envrc")).unwrap_or_default().replace('\n', " | "));
@@ -261,22 +279,34 @@ fn probe_report() {
     // --- file-write-unlink on an ancestor and rename().
     note("unlink.mv_folder_with_agents", fx.sh(&full, &fx.root, "mv pkg pkg2 && echo moved").to_string());
     note("unlink.rm_rf_folder_with_agents", fx.sh(&full, &fx.root, "rm -rf pkg; ls pkg").to_string());
-    note("unlink.mv_plain_folder", fx.sh(&full, &fx.root, "mkdir -p other && mv other other2 && echo moved && rmdir other2").to_string());
+    note(
+        "unlink.mv_plain_folder",
+        fx.sh(&full, &fx.root, "mkdir -p other && mv other other2 && echo moved && rmdir other2").to_string(),
+    );
     note("unlink.agents_after", format!("{}", fx.root.join("pkg/AGENTS.md").exists()));
 
     // --- The keychain.
     for (name, prof) in [("network_off", &full), ("network_on", &net)] {
-        note(&format!("keychain.{name}.find"), fx.sh(prof, &fx.root, "security find-generic-password -s mx-probe-none -w").to_string());
+        note(
+            &format!("keychain.{name}.find"),
+            fx.sh(prof, &fx.root, "security find-generic-password -s mx-probe-none -w").to_string(),
+        );
         note(&format!("keychain.{name}.list"), fx.sh(prof, &fx.root, "security list-keychains").to_string());
     }
     let home_plan = fx.plan(&fx.home, true);
     let home_net = seatbelt::profile(&home_plan, &fx.run(), &RealFs).unwrap();
-    note("keychain.home_project_network_on.find", fx.sh(&home_net, &fx.home, "security find-generic-password -s mx-probe-none -w").to_string());
+    note(
+        "keychain.home_project_network_on.find",
+        fx.sh(&home_net, &fx.home, "security find-generic-password -s mx-probe-none -w").to_string(),
+    );
 
     // --- Home-folder project: ~/LIBRARY, an upper-cased hidden entry.
     note("home_project.library", fx.sh(&home_net, &fx.home, "ls ~/Library | head -3").to_string());
     note("home_project.LIBRARY_upper", fx.sh(&home_net, &fx.home, "ls ~/LIBRARY | head -3").to_string());
-    note("home_project.hidden_entry_upper", fx.sh(&home_net, &fx.home, r#"cat "$(printf %s "$SECRET" | tr a-z A-Z)""#).to_string());
+    note(
+        "home_project.hidden_entry_upper",
+        fx.sh(&home_net, &fx.home, r#"cat "$(printf %s "$SECRET" | tr a-z A-Z)""#).to_string(),
+    );
     note("home_project.hidden_entry", fx.sh(&home_net, &fx.home, r#"cat "$SECRET""#).to_string());
     note("home_project.visible_listing", fx.sh(&home_net, &fx.home, "ls | head -3").to_string());
 
@@ -313,11 +343,31 @@ fn probe_report() {
     let uni = seatbelt::profile(&fx.plan(&nfc, false), &fx.run(), &RealFs);
     match uni {
         Ok(uni) => {
-            note("unicode.on_disk_name", format!("{:?}", std::fs::read_dir(&fx.home).unwrap().flatten().map(|e| e.file_name()).filter(|n| n.to_string_lossy().contains("caf")).collect::<Vec<_>>()));
+            note(
+                "unicode.on_disk_name",
+                format!(
+                    "{:?}",
+                    std::fs::read_dir(&fx.home)
+                        .unwrap()
+                        .flatten()
+                        .map(|e| e.file_name())
+                        .filter(|n| n.to_string_lossy().contains("caf"))
+                        .collect::<Vec<_>>()
+                ),
+            );
             note("unicode.write_cwd", fx.sh(&uni, &nfc, "echo a > new && echo wrote").to_string());
-            note("unicode.write_nfd_path", fx.sh(&uni, &nfc, &format!("echo a > '{}/new2' && echo wrote", nfd.display())).to_string());
-            note("unicode.envrc_nfd_path", fx.sh(&uni, &nfc, &format!("echo pwned >> '{}/.envrc' && echo wrote", nfd.display())).to_string());
-            note("unicode.agents_nfd_path", fx.sh(&uni, &nfc, &format!("echo x > '{}/AGENTS.md' && echo wrote", nfd.display())).to_string());
+            note(
+                "unicode.write_nfd_path",
+                fx.sh(&uni, &nfc, &format!("echo a > '{}/new2' && echo wrote", nfd.display())).to_string(),
+            );
+            note(
+                "unicode.envrc_nfd_path",
+                fx.sh(&uni, &nfc, &format!("echo pwned >> '{}/.envrc' && echo wrote", nfd.display())).to_string(),
+            );
+            note(
+                "unicode.agents_nfd_path",
+                fx.sh(&uni, &nfc, &format!("echo x > '{}/AGENTS.md' && echo wrote", nfd.display())).to_string(),
+            );
         }
         Err(e) => note("unicode.profile", format!("refused: {e}")),
     }
@@ -331,7 +381,11 @@ fn probe_report() {
     note("clone.envrc_clone_then_write", fx.sh(&full, &fx.root, "cp -c .envrc e2 && echo x >> e2 && echo ok").to_string());
 
     // --- Network interfaces (Vite, Go) without AF_ROUTE/AF_SYSTEM.
-    note("ifaces.node", fx.sh(&full, &fx.root, r#"node -e 'console.log(JSON.stringify(Object.keys(require("os").networkInterfaces())))'"#).to_string());
+    note(
+        "ifaces.node",
+        fx.sh(&full, &fx.root, r#"node -e 'console.log(JSON.stringify(Object.keys(require("os").networkInterfaces())))'"#)
+            .to_string(),
+    );
     std::fs::write(
         fx.root.join("ifaces.go"),
         "package main\nimport (\"fmt\"; \"net\")\nfunc main() { i, err := net.Interfaces(); fmt.Println(len(i), err) }\n",
@@ -345,9 +399,18 @@ fn probe_report() {
     let t_sock = user_t().join(format!("mx-probe-{}.sock", std::process::id()));
     unix_listener(&t_sock).unwrap();
     for (name, prof) in [("network_off", &full), ("network_on", &net)] {
-        note(&format!("unix.{name}.shared_tmp"), fx.sh(prof, &fx.root, &format!("{PY_UNIX_CONNECT} {}", agent.display())).to_string());
-        note(&format!("unix.{name}.user_t"), fx.sh(prof, &fx.root, &format!("{PY_UNIX_CONNECT} {}", t_sock.display())).to_string());
-        note(&format!("unix.{name}.ssh_auth_sock"), fx.sh(prof, &fx.root, &format!("{PY_UNIX_CONNECT} \"${{SSH_AUTH_SOCK:-/nonexistent}}\"")).to_string());
+        note(
+            &format!("unix.{name}.shared_tmp"),
+            fx.sh(prof, &fx.root, &format!("{PY_UNIX_CONNECT} {}", agent.display())).to_string(),
+        );
+        note(
+            &format!("unix.{name}.user_t"),
+            fx.sh(prof, &fx.root, &format!("{PY_UNIX_CONNECT} {}", t_sock.display())).to_string(),
+        );
+        note(
+            &format!("unix.{name}.ssh_auth_sock"),
+            fx.sh(prof, &fx.root, &format!("{PY_UNIX_CONNECT} \"${{SSH_AUTH_SOCK:-/nonexistent}}\"")).to_string(),
+        );
     }
     note(
         "unix.own_tmpdir",
@@ -368,7 +431,11 @@ fn probe_report() {
     note("plug.connect", fx.sh(&plugged, &fx.root, &format!("{PY_UNIX_CONNECT} {}", plug.display())).to_string());
     note("plug.list_folder", fx.sh(&plugged, &fx.root, &format!("ls {}", run_dir.display())).to_string());
     note("plug.other_socket", fx.sh(&plugged, &fx.root, &format!("{PY_UNIX_CONNECT} {}", other.display())).to_string());
-    note("plug.via_tmp_symlink", fx.sh(&plugged, &fx.root, &format!("{PY_UNIX_CONNECT} {}", plug.display().to_string().replace("/private/tmp", "/tmp"))).to_string());
+    note(
+        "plug.via_tmp_symlink",
+        fx.sh(&plugged, &fx.root, &format!("{PY_UNIX_CONNECT} {}", plug.display().to_string().replace("/private/tmp", "/tmp")))
+            .to_string(),
+    );
     let _ = std::fs::remove_dir_all(&run_dir);
 
     // --- localhost filters.
@@ -379,23 +446,49 @@ fn probe_report() {
     let tcp = |host: &str, port: u16| format!("exec 3<>/dev/tcp/{host}/{port} && echo connected");
     note("localhost.forwarded.127", fx.sh(&forwarded, &fx.root, &tcp("127.0.0.1", p4)).to_string());
     note("localhost.forwarded.localhost_name", fx.sh(&forwarded, &fx.root, &tcp("localhost", p4)).to_string());
-    note(&format!("localhost.forwarded.v6_listener={}", p6.is_some()), fx.sh(&forwarded, &fx.root, &format!("python3 -c 'import socket; s=socket.socket(socket.AF_INET6); s.connect((\"::1\", {p4})); print(\"connected\")'")).to_string());
+    note(
+        &format!("localhost.forwarded.v6_listener={}", p6.is_some()),
+        fx.sh(
+            &forwarded,
+            &fx.root,
+            &format!(
+                "python3 -c 'import socket; s=socket.socket(socket.AF_INET6); s.connect((\"::1\", {p4})); print(\"connected\")'"
+            ),
+        )
+        .to_string(),
+    );
     note("localhost.forwarded.other_port", fx.sh(&forwarded, &fx.root, &tcp("127.0.0.1", q)).to_string());
     note("localhost.network_off.127", fx.sh(&full, &fx.root, &tcp("127.0.0.1", p4)).to_string());
     let selftest = |host: &str| {
-        format!("python3 -c 'import socket; l=socket.socket(); l.bind((\"{host}\", 0)); l.listen(1); c=socket.socket(); c.connect((\"127.0.0.1\", l.getsockname()[1])); a,_=l.accept(); print(\"self-connected\")'")
+        format!(
+            "python3 -c 'import socket; l=socket.socket(); l.bind((\"{host}\", 0)); l.listen(1); c=socket.socket(); c.connect((\"127.0.0.1\", l.getsockname()[1])); a,_=l.accept(); print(\"self-connected\")'"
+        )
     };
     note("localhost.network_off.self_server", fx.sh(&full, &fx.root, &selftest("127.0.0.1")).to_string());
     note("localhost.network_on.self_server", fx.sh(&net, &fx.root, &selftest("127.0.0.1")).to_string());
     note("localhost.network_on.self_server_any", fx.sh(&net, &fx.root, &selftest("0.0.0.0")).to_string());
-    note("localhost.network_off.bind_any", fx.sh(&full, &fx.root, "python3 -c 'import socket; l=socket.socket(); l.bind((\"0.0.0.0\", 0)); l.listen(1); print(\"bound\")'").to_string());
+    note(
+        "localhost.network_off.bind_any",
+        fx.sh(
+            &full,
+            &fx.root,
+            "python3 -c 'import socket; l=socket.socket(); l.bind((\"0.0.0.0\", 0)); l.listen(1); print(\"bound\")'",
+        )
+        .to_string(),
+    );
     let inbound_only = Profile {
         text: format!("{}\n(allow network-bind (local ip))\n(allow network-inbound (local ip \"localhost:*\"))\n", full.text),
         params: full.params.clone(),
     };
     note("localhost.inbound_rule.listen_any", fx.sh(&inbound_only, &fx.root, "python3 -c 'import socket; l=socket.socket(); l.bind((\"0.0.0.0\", 0)); l.listen(1); print(\"listening\", l.getsockname()[1])'").to_string());
-    note("network.curl_off", fx.sh(&full, &fx.root, "curl -sS -m 5 -o /dev/null -w '%{http_code}' https://example.com").to_string());
-    note("network.curl_on", fx.sh(&net, &fx.root, "curl -sS -m 10 -o /dev/null -w '%{http_code}' https://example.com").to_string());
+    note(
+        "network.curl_off",
+        fx.sh(&full, &fx.root, "curl -sS -m 5 -o /dev/null -w '%{http_code}' https://example.com").to_string(),
+    );
+    note(
+        "network.curl_on",
+        fx.sh(&net, &fx.root, "curl -sS -m 10 -o /dev/null -w '%{http_code}' https://example.com").to_string(),
+    );
 
     // --- Common tools under the closed profile.
     let repo = fx.root.join("repo");
@@ -423,7 +516,10 @@ fn probe_report() {
         ("tools.dev_ttys000", ": < /dev/ttys000 && echo opened"),
         ("tools.osascript", "osascript -e 'tell application \"Finder\" to get name'"),
         ("tools.open", "open -a TextEdit"),
-        ("tools.launchctl", "launchctl submit -l mx-probe -- /usr/bin/true && echo submitted; launchctl remove mx-probe 2>/dev/null; true"),
+        (
+            "tools.launchctl",
+            "launchctl submit -l mx-probe -- /usr/bin/true && echo submitted; launchctl remove mx-probe 2>/dev/null; true",
+        ),
         ("tools.pbpaste", "pbpaste && echo pasted"),
     ] {
         note(name, fx.sh(&full, &fx.root, script).to_string());
@@ -436,13 +532,28 @@ fn probe_report() {
     std::fs::write(&file, &full.text).unwrap();
     let mut args: Vec<std::ffi::OsString> = vec!["-f".into(), file.clone().into()];
     args.extend(full.args().into_iter().skip(2));
-    note("profile_file.f", output(Command::new(SANDBOX_EXEC).args(&args).args(["--", "/bin/echo", "ok"]).current_dir(&fx.root).env_clear()).to_string());
+    note(
+        "profile_file.f",
+        output(Command::new(SANDBOX_EXEC).args(&args).args(["--", "/bin/echo", "ok"]).current_dir(&fx.root).env_clear())
+            .to_string(),
+    );
     let big = Profile { text: format!("{}{}", full.text, "; padding\n".repeat(300_000 / 10)), params: full.params.clone() };
     note("profile_file.p_over_256k", fx.sh(&big, &fx.root, "echo ok").to_string());
 
     // --- clean-tmps and what the kernel logged as denied.
-    note("clean_tmps", output(&mut Command::new("/usr/bin/grep").args(["-n", "find\\|-type\\|daily_clean_tmps", "/etc/periodic/daily/110.clean-tmps"])).to_string());
-    note("defaults.clean_tmps", output(&mut Command::new("/usr/bin/grep").args(["-n", "clean_tmps", "/etc/defaults/periodic.conf"])).to_string());
+    note(
+        "clean_tmps",
+        output(&mut Command::new("/usr/bin/grep").args([
+            "-n",
+            "find\\|-type\\|daily_clean_tmps",
+            "/etc/periodic/daily/110.clean-tmps",
+        ]))
+        .to_string(),
+    );
+    note(
+        "defaults.clean_tmps",
+        output(&mut Command::new("/usr/bin/grep").args(["-n", "clean_tmps", "/etc/defaults/periodic.conf"])).to_string(),
+    );
     let denied = output(&mut Command::new("/usr/bin/log").args([
         "show",
         "--style",
@@ -456,7 +567,15 @@ fn probe_report() {
         .out
         .lines()
         .filter_map(|l| l.split_once("deny(1) ").map(|(_, rest)| rest.split_whitespace().take(2).collect::<Vec<_>>().join(" ")))
-        .filter(|l| l.starts_with("sysctl") || l.starts_with("mach") || l.starts_with("iokit") || l.starts_with("file-ioctl") || l.starts_with("ipc") || l.starts_with("system") || l.starts_with("user-pref"))
+        .filter(|l| {
+            l.starts_with("sysctl")
+                || l.starts_with("mach")
+                || l.starts_with("iokit")
+                || l.starts_with("file-ioctl")
+                || l.starts_with("ipc")
+                || l.starts_with("system")
+                || l.starts_with("user-pref")
+        })
         .collect();
     kinds.sort();
     kinds.dedup();
@@ -492,10 +611,7 @@ fn probe_round2() {
     std::fs::write(fx.tmp.join("t"), "t\n").unwrap();
     std::fs::write(fx.root.join("plain"), "p\n").unwrap();
     let pylink = |src: &Path, dst: &str| {
-        format!(
-            "python3 -c 'import os,sys; os.link(sys.argv[1], sys.argv[2]); print(\"linked\")' '{}' \"{dst}\"",
-            src.display()
-        )
+        format!("python3 -c 'import os,sys; os.link(sys.argv[1], sys.argv[2]); print(\"linked\")' '{}' \"{dst}\"", src.display())
     };
     for (name, prof) in [("links_allowed", &linking), ("links_off", &full)] {
         let cases: Vec<(&str, String)> = vec![
@@ -527,14 +643,36 @@ fn probe_round2() {
     let with = |extra: &str| Profile { text: format!("{}\n{extra}\n", full.text), params: full.params.clone() };
     let node_ifaces = r#"node -e 'console.log(JSON.stringify(Object.keys(require("os").networkInterfaces())))'"#;
     note("ifaces.node.network_on", fx.sh(&net, &fx.root, node_ifaces).to_string());
-    note("ifaces.node.routetable", fx.sh(&with("(allow sysctl-read (sysctl-name-prefix \"net.routetable.\"))"), &fx.root, node_ifaces).to_string());
-    note("ifaces.python_if_nameindex", fx.sh(&full, &fx.root, "python3 -c 'import socket; print(socket.if_nameindex())'").to_string());
+    note(
+        "ifaces.node.routetable",
+        fx.sh(&with("(allow sysctl-read (sysctl-name-prefix \"net.routetable.\"))"), &fx.root, node_ifaces).to_string(),
+    );
+    note(
+        "ifaces.python_if_nameindex",
+        fx.sh(&full, &fx.root, "python3 -c 'import socket; print(socket.if_nameindex())'").to_string(),
+    );
     let sysctl_meta = "(allow sysctl-read (sysctl-name \"sysctl.name2oid\") (sysctl-name-prefix \"sysctl.oidfmt.\"))";
     note("sysctl_n.with_meta", fx.sh(&with(sysctl_meta), &fx.root, "sysctl -n hw.ncpu hw.memsize").to_string());
     note("sysctl_n.brand_with_meta", fx.sh(&with(sysctl_meta), &fx.root, "sysctl -n machdep.cpu.brand_string").to_string());
-    note("node.cpus", fx.sh(&full, &fx.root, "node -e 'console.log(require(\"os\").cpus().length, require(\"os\").cpus()[0].model)'").to_string());
-    note("python.platform", fx.sh(&full, &fx.root, "python3 -c 'import platform, os; print(platform.platform(), platform.processor(), os.cpu_count())'").to_string());
-    let go = output(Command::new("/bin/sh").args(["-c", "ls -d /Users/runner/hostedtoolcache/go/*/arm64/bin 2>/dev/null | tail -1"])).out.trim().to_string();
+    note(
+        "node.cpus",
+        fx.sh(&full, &fx.root, "node -e 'console.log(require(\"os\").cpus().length, require(\"os\").cpus()[0].model)'")
+            .to_string(),
+    );
+    note(
+        "python.platform",
+        fx.sh(
+            &full,
+            &fx.root,
+            "python3 -c 'import platform, os; print(platform.platform(), platform.processor(), os.cpu_count())'",
+        )
+        .to_string(),
+    );
+    let go =
+        output(Command::new("/bin/sh").args(["-c", "ls -d /Users/runner/hostedtoolcache/go/*/arm64/bin 2>/dev/null | tail -1"]))
+            .out
+            .trim()
+            .to_string();
     if !go.is_empty() {
         std::fs::write(
             fx.root.join("ifaces.go"),
@@ -542,7 +680,15 @@ fn probe_round2() {
         )
         .unwrap();
         note("ifaces.go", fx.sh(&full, &fx.root, &format!("PATH={go}:$PATH; go run ifaces.go")).to_string());
-        note("ifaces.go.routetable", fx.sh(&with("(allow sysctl-read (sysctl-name-prefix \"net.routetable.\"))"), &fx.root, &format!("PATH={go}:$PATH; go run ifaces.go")).to_string());
+        note(
+            "ifaces.go.routetable",
+            fx.sh(
+                &with("(allow sysctl-read (sysctl-name-prefix \"net.routetable.\"))"),
+                &fx.root,
+                &format!("PATH={go}:$PATH; go run ifaces.go"),
+            )
+            .to_string(),
+        );
     } else {
         note("ifaces.go", "no go on the runner".into());
     }
@@ -577,12 +723,7 @@ fn probe_round2() {
         let got = kq.kevent(&[change], &mut events, Some(timeout));
         note(
             "kqueue.zombie",
-            format!(
-                "{got:?} flags={:?} fflags={:?} data={}",
-                events[0].flags(),
-                events[0].fflags(),
-                events[0].data()
-            ),
+            format!("{got:?} flags={:?} fflags={:?} data={}", events[0].flags(), events[0].fflags(), events[0].data()),
         );
         let _ = child.wait();
         let mut running = Command::new("/bin/sleep").arg("0.5").spawn().unwrap();
@@ -617,7 +758,11 @@ fn probe_round3() {
     let base = fx.shared.join("links");
     let (a, b) = (base.join("A"), base.join("B"));
     let pylink = |src: &Path, dst: &Path| {
-        format!("python3 -c 'import os,sys; os.link(sys.argv[1], sys.argv[2]); print(\"linked\")' '{}' '{}'", src.display(), dst.display())
+        format!(
+            "python3 -c 'import os,sys; os.link(sys.argv[1], sys.argv[2]); print(\"linked\")' '{}' '{}'",
+            src.display(),
+            dst.display()
+        )
     };
     let reset = || {
         let _ = std::fs::remove_dir_all(&base);
@@ -628,7 +773,10 @@ fn probe_round3() {
     };
     let profiles = [
         ("deny_A", format!("(version 1)\n(allow default)\n(deny file-link (subpath \"{}\"))\n", a.display())),
-        ("deny_all_allow_A", format!("(version 1)\n(allow default)\n(deny file-link)\n(allow file-link (subpath \"{}\"))\n", a.display())),
+        (
+            "deny_all_allow_A",
+            format!("(version 1)\n(allow default)\n(deny file-link)\n(allow file-link (subpath \"{}\"))\n", a.display()),
+        ),
         (
             "deny_all_allow_A_literal_dir",
             format!("(version 1)\n(allow default)\n(deny file-link)\n(allow file-link (literal \"{}\"))\n", a.display()),
@@ -665,7 +813,10 @@ fn probe_round3() {
     let with = |extra: &str| Profile { text: format!("{}\n{extra}\n", full.text), params: full.params.clone() };
     let cpus = "node -e 'const c=require(\"os\").cpus(); console.log(c.length, c[0] && c[0].model, c[0] && c[0].speed)'";
     note("cpus.none", fx.sh(&full, &fx.root, cpus).to_string());
-    note("cpus.brand", fx.sh(&with("(allow sysctl-read (sysctl-name \"machdep.cpu.brand_string\"))"), &fx.root, cpus).to_string());
+    note(
+        "cpus.brand",
+        fx.sh(&with("(allow sysctl-read (sysctl-name \"machdep.cpu.brand_string\"))"), &fx.root, cpus).to_string(),
+    );
     note(
         "cpus.brand_freq",
         fx.sh(
@@ -676,8 +827,14 @@ fn probe_round3() {
         .to_string(),
     );
     note("cpus.all_sysctls", fx.sh(&with("(allow sysctl-read)"), &fx.root, cpus).to_string());
-    note("sysctl_n.prefix_sysctl", fx.sh(&with("(allow sysctl-read (sysctl-name-prefix \"sysctl.\"))"), &fx.root, "sysctl -n hw.ncpu").to_string());
-    note("sysctl_n.all_sysctls", fx.sh(&with("(allow sysctl-read)"), &fx.root, "sysctl -n hw.ncpu machdep.cpu.brand_string").to_string());
+    note(
+        "sysctl_n.prefix_sysctl",
+        fx.sh(&with("(allow sysctl-read (sysctl-name-prefix \"sysctl.\"))"), &fx.root, "sysctl -n hw.ncpu").to_string(),
+    );
+    note(
+        "sysctl_n.all_sysctls",
+        fx.sh(&with("(allow sysctl-read)"), &fx.root, "sysctl -n hw.ncpu machdep.cpu.brand_string").to_string(),
+    );
     note("getconf_ncpu", fx.sh(&full, &fx.root, "getconf _NPROCESSORS_ONLN").to_string());
     let denied = output(&mut Command::new("/usr/bin/log").args([
         "show",

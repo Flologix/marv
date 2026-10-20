@@ -175,14 +175,8 @@ fn wait_exited_os(pid: i32) -> bool {
 fn wait_exited_os(pid: i32) -> bool {
     use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
     let Ok(kq) = Kqueue::new() else { return false };
-    let change = KEvent::new(
-        pid as usize,
-        EventFilter::EVFILT_PROC,
-        EvFlags::EV_ADD | EvFlags::EV_ONESHOT,
-        FilterFlag::NOTE_EXIT,
-        0,
-        0,
-    );
+    let change =
+        KEvent::new(pid as usize, EventFilter::EVFILT_PROC, EvFlags::EV_ADD | EvFlags::EV_ONESHOT, FilterFlag::NOTE_EXIT, 0, 0);
     let mut events = [KEvent::new(0, EventFilter::EVFILT_PROC, EvFlags::empty(), FilterFlag::empty(), 0, 0)];
     let mut changes: &[KEvent] = std::slice::from_ref(&change);
     loop {

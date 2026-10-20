@@ -239,7 +239,7 @@ async fn run_gh(
     let deadline = tokio::time::sleep(timeout);
     tokio::pin!(deadline);
     let Captured { output: out, errors: err, timed_out, aborted } =
-        capture_until(stdout, stderr, deadline.as_mut(), cancel, || {
+        capture_until(stdout, stderr, deadline.as_mut(), cancel, std::future::pending(), || {
             let _ = child.start_kill();
         })
         .await;

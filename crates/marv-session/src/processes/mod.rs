@@ -428,7 +428,7 @@ impl ProcessManager {
             project_read_only: false,
             binds,
         };
-        let sandboxed = self.shared.sandbox.prepare(root, &mounts, &inner).map_err(ToolError::from)?;
+        let mut sandboxed = self.shared.sandbox.prepare(root, &mounts, &inner).map_err(ToolError::from)?;
         let protected = Some(protected_snapshot(root));
         // Only the backend's environment, never Marv's. A spawn that fails drops `sandboxed`, which cleans up.
         let mut child = tokio::process::Command::from(sandboxed.to_command(root))
@@ -442,6 +442,8 @@ impl ProcessManager {
         if let Some(pid) = pid {
             lock(&RUNNING).push(pid);
         }
+        // Dropped with its entry while it still runs (the manager dropped): killed before its clean-up.
+        sandboxed.spawned(pid);
         let log: Arc<Mutex<Vec<u8>>> = Arc::default();
         let captures = [
             child.stdout.take().map(|s| tokio::spawn(capture(s, log.clone()))),

@@ -21,6 +21,7 @@ async-trait.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+nix = { version = "0.31.3", features = ["signal"] }
 
 [lints]
 workspace = true

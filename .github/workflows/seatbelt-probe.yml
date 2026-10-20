@@ -1,4 +1,4 @@
-# Temporary (#166): runs the Seatbelt probes on macOS for every push to the branch, quickly, before the full CI.
+# Temporary (#166): the Seatbelt probes and guards on macOS for every push to the branch, before the full CI.
 name: Seatbelt probe
 
 "on":
@@ -12,10 +12,12 @@ jobs:
   probe:
     runs-on: macos-14
     timeout-minutes: 30
+    env:
+      MARV_REQUIRE_SANDBOX: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: /usr/bin/sandbox-exec -p '(version 1)(allow default)' /usr/bin/true
       - run: cargo test -p marv-sandbox --lib
-      - run: cargo test -p marv-sandbox --test seatbelt_probe -- probe_round3 --ignored --nocapture --test-threads=1
+      - run: cargo test -p marv-guards --test seatbelt --test sandbox --no-fail-fast -- --test-threads=4

@@ -241,7 +241,11 @@ fn seatbelt_hides(dir: &Path, home: &Path, user_temp: Option<&Path>) -> bool {
     if home == Path::new("/") {
         return false;
     }
-    let first = dir.strip_prefix(&home).ok().and_then(|rel| rel.components().next()).map(|c| c.as_os_str().to_string_lossy().into_owned());
+    let first = dir
+        .strip_prefix(&home)
+        .ok()
+        .and_then(|rel| rel.components().next())
+        .map(|c| c.as_os_str().to_string_lossy().into_owned());
     match first {
         Some(first) if first == "Library" => true,
         Some(first) if first.starts_with('.') => !TOOLCHAINS.iter().any(|t| dir.starts_with(home.join(t))),
@@ -261,7 +265,21 @@ mod tests {
         let argv: Vec<&str> = argv.iter().map(|a| a.to_str().unwrap()).collect();
         assert_eq!(
             argv,
-            [SANDBOX_EXEC, "-p", "(version 1)", "-D", "TMP=/t", "--", "/opt/marv", "__guard", "4242", "--", "bash", "-c", "echo hi"]
+            [
+                SANDBOX_EXEC,
+                "-p",
+                "(version 1)",
+                "-D",
+                "TMP=/t",
+                "--",
+                "/opt/marv",
+                "__guard",
+                "4242",
+                "--",
+                "bash",
+                "-c",
+                "echo hi"
+            ]
         );
         // A long profile goes in a file, its parameters still on the command line.
         let argv = argv_strings(&profile, Some(Path::new("/t/sandbox.sb")));
@@ -301,7 +319,9 @@ mod tests {
     fn it_hides_what_every_profile_closes() {
         let home = Path::new("/Users/me");
         let ut = Some(Path::new("/private/var/folders/ab/xyz"));
-        for hidden in ["/private/tmp/marv-501", "/private/var/folders/ab/xyz/T/x", "/Users/me/.run", "/Users/me/Library/Caches/marv"] {
+        for hidden in
+            ["/private/tmp/marv-501", "/private/var/folders/ab/xyz/T/x", "/Users/me/.run", "/Users/me/Library/Caches/marv"]
+        {
             assert!(seatbelt_hides(Path::new(hidden), home, ut), "{hidden}");
         }
         // /run isn't macOS's; a toolchain and the visible home show in some sandbox; the folders themselves aren't in.

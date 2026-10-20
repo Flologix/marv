@@ -45,6 +45,25 @@ macro_rules! require_bwrap {
     };
 }
 
+/// Skips a test that needs this platform's sandbox (bubblewrap on Linux, Seatbelt on macOS) where it can't start.
+/// On macOS the guards' fixture answers `__guard` in place of `marv` (a test binary can't), so it's set first.
+#[macro_export]
+macro_rules! require_sandbox {
+    () => {
+        $crate::use_fixture_as_guard(env!("CARGO_BIN_EXE_marv-guards-fixture"));
+        if !marv_sandbox::backend().available() {
+            eprintln!("skipped: the {} sandbox isn't available here", marv_sandbox::backend().name());
+            return;
+        }
+    };
+}
+
+/// The binary Seatbelt runs as `marv __guard` (`marv_sandbox::seatbelt_backend::set_guard_exe`): the guards'
+/// fixture, which answers it. Harmless elsewhere (bwrap needs no guard).
+pub fn use_fixture_as_guard(fixture: &str) {
+    marv_sandbox::seatbelt_backend::set_guard_exe(fixture);
+}
+
 /// A fresh temp folder (real path), removed on drop.
 pub struct TempDir(PathBuf);
 

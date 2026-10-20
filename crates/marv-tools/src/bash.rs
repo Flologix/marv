@@ -231,15 +231,20 @@ pub async fn run_command(
     let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
         return started("[couldn't start the command: no output pipes]\n".into());
     };
+    // If this future is dropped while the command runs (a turn given up), the backend kills the whole sandbox, not
+    // only the sandbox program's pid as `kill_on_drop` does (Seatbelt: the guard's group). Declared after the child, so
+    // it's dropped first, while the child isn't reaped yet and its pid can't be another process's.
+    let mut group = KillGroupOnDrop { backend, pid: if sandboxed { pid } else { None } };
+    // The sandbox program's exit, seen without reaping it: then the backend ends what the command left running in
+    // the background (`sleep 600 &`; bwrap's PID namespace did that, Seatbelt has none) before the pipes are drained,
+    // which such leftovers would hold open, and while the group's id can't be reused.
+    let exit = if sandboxed { ExitWatch::spawn(pid) } else { ExitWatch::none() };
 
     let kill = |child: &mut tokio::process::Child| {
         match pid {
-            Some(pid) if !sandboxed => {
-                let group = nix::unistd::Pid::from_raw(pid as i32);
-                let _ = nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL);
-            }
-            // The backend takes the whole sandbox down (bwrap: its PID namespace). Only while the child is still
-            // ours: once it has been waited for, its pid may be another process's.
+            Some(pid) if !sandboxed => marv_sandbox::kill_group(pid),
+            // The backend takes the whole sandbox down (bwrap: its PID namespace; Seatbelt: the guard's group). Only
+            // while the child is still ours: once it has been waited for, its pid may be another process's.
             _ => {
                 if let Some(pid) = child.id() {
                     backend.kill(pid);
@@ -249,8 +254,13 @@ pub async fn run_command(
     };
     let deadline = tokio::time::sleep(timeout);
     tokio::pin!(deadline);
+    let ended = async {
+        if !exit.exited().await {
+            std::future::pending::<()>().await;
+        }
+    };
     let Captured { output, errors, mut timed_out, mut aborted } =
-        capture_until(stdout, stderr, deadline.as_mut(), cancel, || kill(&mut child)).await;
+        capture_until(stdout, stderr, deadline.as_mut(), cancel, ended, || kill(&mut child)).await;
     // The pipes can close long before the command ends (`exec >/dev/null 2>&1; sleep 60`): the timeout and the stop
     // stay armed until it has exited, or such a command would hold the turn (or a hook) past its timeout.
     let status = loop {
@@ -258,12 +268,19 @@ pub async fn run_command(
             break child.wait().await.ok();
         }
         tokio::select! {
-            status = child.wait() => break status.ok(),
+            exited = exit.exited() => {
+                // Exited, not reaped yet: what it left in its group goes first, then it's reaped.
+                if exited {
+                    kill(&mut child);
+                }
+                break child.wait().await.ok();
+            }
             () = &mut deadline => timed_out = true,
             () = cancel.cancelled() => aborted = true,
         }
         kill(&mut child);
     };
+    group.pid = None;
     // Before the caller's scan for created protected files: a placeholder's mount point left behind would read as one.
     if let Some(command) = &mut prepared {
         command.finish();
@@ -290,26 +307,32 @@ pub(crate) struct Captured {
 }
 
 /// Reads both pipes at once (so neither fills up and blocks the other) until they close. At `deadline` or `cancel`,
-/// calls `kill` once, then reads for at most [`KILL_GRACE`] more and returns what it has.
+/// calls `kill` once, then reads for at most [`KILL_GRACE`] more and returns what it has. When `ended` (the command
+/// exited, but something it started may still hold the pipes) it calls `kill` too, for those leftovers, and reads for
+/// at most [`KILL_GRACE`] more; neither the deadline nor a stop counts after that.
 pub(crate) async fn capture_until(
     stdout: impl AsyncRead + Unpin,
     stderr: impl AsyncRead + Unpin,
     mut deadline: std::pin::Pin<&mut tokio::time::Sleep>,
     cancel: &tokio_util::sync::CancellationToken,
+    ended: impl std::future::Future<Output = ()>,
     mut kill: impl FnMut(),
 ) -> Captured {
     let (mut out, mut err) = (Vec::new(), Vec::new());
-    let (mut timed_out, mut aborted) = (false, false);
+    let (mut timed_out, mut aborted, mut done) = (false, false, false);
     {
         let io = async { tokio::join!(capture_into(stdout, &mut out), capture_into(stderr, &mut err)) };
         tokio::pin!(io);
+        tokio::pin!(ended);
         let grace = tokio::time::sleep(Duration::MAX);
         tokio::pin!(grace);
         loop {
+            let ending = !timed_out && !aborted && !done;
             tokio::select! {
                 _ = &mut io => break,
-                () = &mut deadline, if !timed_out && !aborted => timed_out = true,
-                () = cancel.cancelled(), if !timed_out && !aborted => aborted = true,
+                () = &mut deadline, if ending => timed_out = true,
+                () = cancel.cancelled(), if ending => aborted = true,
+                () = &mut ended, if ending => done = true,
                 () = &mut grace => break,
             }
             kill();
@@ -318,6 +341,46 @@ pub(crate) async fn capture_until(
     }
     let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
     Captured { output: text(&out), errors: text(&err), timed_out, aborted }
+}
+
+/// Whether a sandboxed command's program has exited, seen without reaping it ([`marv_sandbox::wait_exited`], on a
+/// blocking thread). Where that can't be seen ([`ExitWatch::none`], or a platform without it), [`ExitWatch::exited`]
+/// says false at once, and the caller waits for the child as usual.
+struct ExitWatch(tokio::sync::watch::Receiver<Option<bool>>);
+
+impl ExitWatch {
+    fn spawn(pid: Option<u32>) -> Self {
+        let Some(pid) = pid else { return Self::none() };
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        tokio::task::spawn_blocking(move || {
+            let _ = tx.send(Some(marv_sandbox::wait_exited(pid)));
+        });
+        Self(rx)
+    }
+
+    fn none() -> Self {
+        Self(tokio::sync::watch::channel(Some(false)).1)
+    }
+
+    /// True once the program has exited (and isn't reaped yet); false when that can't be seen.
+    async fn exited(&self) -> bool {
+        let mut rx = self.0.clone();
+        rx.wait_for(Option::is_some).await.ok().and_then(|v| *v).unwrap_or(false)
+    }
+}
+
+/// Kills the backend's whole sandbox on drop while `pid` is set (see `run_command`).
+struct KillGroupOnDrop {
+    backend: &'static dyn marv_sandbox::SandboxBackend,
+    pid: Option<u32>,
+}
+
+impl Drop for KillGroupOnDrop {
+    fn drop(&mut self) {
+        if let Some(pid) = self.pid.take() {
+            self.backend.kill(pid);
+        }
+    }
 }
 
 /// Reads `stream` into `kept`, up to about [`MAX_CAPTURE`] (whole chunks are kept while under it; the rest is read
