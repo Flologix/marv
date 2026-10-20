@@ -39,7 +39,7 @@ fn started(dir: &Path) -> Vec<String> {
 /// Proven: dropped `--clearenv` from the sandbox's arguments → the command saw HERDR_SOCKET_PATH and failed this test.
 #[test]
 fn a_sandboxed_command_sees_neither_herdrs_variables_nor_its_socket() {
-    marv_guards::require_bwrap!();
+    marv_guards::require_sandbox!();
     let (home, root) = (TempDir::outside_tmp("herdr-home"), TempDir::new("herdr-sbx"));
     let socket = home.path().join(".config/herdr/herdr.sock");
     std::fs::create_dir_all(socket.parent().unwrap()).unwrap();

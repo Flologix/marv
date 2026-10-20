@@ -7,7 +7,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 
-use marv_guards::{Recorder, TempDir, call, require_bwrap, sandbox_with_home};
+use marv_guards::{Recorder, TempDir, call, sandbox_with_home};
 use marv_session::subagent::subagent_context;
 use marv_session::worktree::{create_worktree, finish_worktree};
 use marv_tools::{Decision, ToolContext, builtin_tools, run_tool};
@@ -45,7 +45,7 @@ fn repo() -> TempDir {
 /// the branch).
 #[tokio::test]
 async fn a_worktree_subagents_git_is_read_only_and_marv_commits_for_it() {
-    require_bwrap!();
+    marv_guards::require_sandbox!();
     let (repo, trees, home) = (repo(), TempDir::outside_tmp("wt-trees"), TempDir::outside_tmp("wt-home"));
     let wt = create_worktree(repo.path(), trees.path(), "guard").await.expect("a worktree");
     let refs = git(repo.path(), &["for-each-ref"]);

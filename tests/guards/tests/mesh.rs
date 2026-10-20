@@ -4,7 +4,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use marv_guards::{TempDir, require_bwrap, run_sandboxed, sandbox_with_home};
+use marv_guards::{TempDir, run_sandboxed, sandbox_with_home};
 use marv_mesh::switchboard::{MeshRecord, Outcome, Switchboard, TrajectorySink};
 use marv_mesh::wire::{Approver, Grant, Wire, WireMode};
 use marv_mesh::{PlugId, ReceptacleName};
@@ -130,7 +130,7 @@ fn python() -> bool {
 /// message was delivered); made `Switchboard::admit` skip its `MeshRecord` → failed (nothing logged).
 #[tokio::test]
 async fn an_unwired_call_from_the_sandbox_is_refused_and_logged() {
-    require_bwrap!();
+    marv_guards::require_sandbox!();
     if !python() {
         eprintln!("skipped: no python3 for the in-sandbox client");
         return;
@@ -164,7 +164,7 @@ async fn an_unwired_call_from_the_sandbox_is_refused_and_logged() {
 /// (marv-sandbox's bwrap builder) → failed (the parent's socket was reachable).
 #[tokio::test]
 async fn a_sandboxed_subagent_reaches_the_parent_only_over_its_wire() {
-    require_bwrap!();
+    marv_guards::require_sandbox!();
     if !python() {
         eprintln!("skipped: no python3 for the in-sandbox client");
         return;
@@ -207,7 +207,7 @@ async fn a_sandboxed_subagent_reaches_the_parent_only_over_its_wire() {
 /// Proven: removed the `--tmpfs` over `SandboxOptions::hidden` in `sandbox_args` → this test failed (the plug listed).
 #[test]
 fn marvs_runtime_folder_is_empty_in_the_sandbox_even_inside_the_project() {
-    marv_guards::require_bwrap!();
+    marv_guards::require_sandbox!();
     let (project, home) = (marv_guards::TempDir::new("rt-proj"), marv_guards::TempDir::outside_tmp("rt-home"));
     let outside = marv_guards::TempDir::outside_tmp("rt-xdg");
     project.write("xdg/marv/p/4242/parent.sock", "the parent's plug");

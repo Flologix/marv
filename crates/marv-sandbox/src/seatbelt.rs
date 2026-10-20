@@ -121,12 +121,12 @@ const NETWORK_SYSCTL_PREFIX: &str = "net.routetable.";
 /// Linux), nothing more.
 pub const MACH_SERVICES: &[&str] = &["com.apple.system.opendirectoryd.libinfo", "com.apple.system.logger"];
 
-/// The services a command with network needs on top: DNS configuration and TLS trust (Codex's network policy).
+/// The services a command with network needs on top: DNS configuration and TLS trust (Codex's network policy, without
+/// `com.apple.SecurityServer`: securityd answers for keychain items and raises authorization prompts; #166 review).
 pub const NETWORK_MACH_SERVICES: &[&str] = &[
     "com.apple.SystemConfiguration.configd",
     "com.apple.SystemConfiguration.DNSConfiguration",
     "com.apple.trustd.agent",
-    "com.apple.SecurityServer",
     "com.apple.networkd",
     "com.apple.ocspd",
 ];
@@ -1201,6 +1201,8 @@ mod tests {
         let rule = format!("(sysctl-name-prefix \"{NETWORK_SYSCTL_PREFIX}\")");
         assert!(!build(&base(), &fs).text.contains(&rule));
         assert!(build(&Plan { network: true, ..base() }, &fs).text.contains(&rule));
+        // securityd (keychain items, authorization prompts) is never reachable, with network or not.
+        assert!(!build(&Plan { network: true, ..base() }, &fs).text.contains("com.apple.SecurityServer"));
         // What `sysctl -n` and node's `os.cpus()` need, always.
         let t = build(&base(), &fs).text;
         assert!(t.contains("(sysctl-name-prefix \"sysctl.\")") && t.contains("(sysctl-name \"machdep.cpu.brand_string\")"));

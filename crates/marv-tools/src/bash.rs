@@ -265,7 +265,15 @@ pub async fn run_command(
     // stay armed until it has exited, or such a command would hold the turn (or a hook) past its timeout.
     let status = loop {
         if timed_out || aborted {
-            break child.wait().await.ok();
+            // Killed already; the kill is sent again every KILL_GRACE until it has exited, so a kill that came too
+            // early to reach everything (a sandbox still starting) can't leave the call waiting on a stopped command.
+            let status = loop {
+                tokio::select! {
+                    status = child.wait() => break status.ok(),
+                    () = tokio::time::sleep(KILL_GRACE) => kill(&mut child),
+                }
+            };
+            break status;
         }
         tokio::select! {
             seen = exit.exited(), if exit.watching() => {
@@ -615,7 +623,7 @@ impl Tool for Bash {
         let warning = if sandboxed {
             None
         } else if ctx.sandbox.enabled {
-            Some("bubblewrap isn't available here, so this runs WITHOUT a sandbox".to_string())
+            Some(format!("{} isn't available here, so this runs WITHOUT a sandbox", ctx.sandbox.backend().name()))
         } else {
             Some("the sandbox is off (/sandbox on to turn it back on), so this runs WITHOUT a sandbox".to_string())
         };

@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use marv_guards::{TempDir, require_bwrap};
+use marv_guards::TempDir;
 use marv_session::checks::Violation;
 use marv_session::checks::kind::{ProjectChecksKind, checks_note};
 use marv_session::diagnostics::tsc::{TsError, diagnostics_note};
@@ -93,7 +93,7 @@ async fn checks_run_only_sandboxed_with_the_project_read_only_and_no_network() {
     assert_eq!(runs.load(Ordering::SeqCst), 0, "a check ran without the sandbox");
 
     // The real runner, in the real sandbox: the project can't be changed.
-    require_bwrap!();
+    marv_guards::require_sandbox!();
     let run = CheckRun {
         command: "echo planted > planted.txt; echo done".into(),
         root: project.path().to_path_buf(),

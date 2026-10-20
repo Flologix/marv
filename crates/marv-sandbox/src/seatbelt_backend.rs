@@ -55,13 +55,19 @@ static GUARD_EXE: OnceLock<PathBuf> = OnceLock::new();
 /// Tests: the binary that answers `__guard` instead of the test binary itself. Call it before anything asks whether
 /// the sandbox is available; the first call wins.
 pub fn set_guard_exe(path: impl Into<PathBuf>) {
-    let _ = GUARD_EXE.set(path.into());
+    let path = path.into();
+    let _ = GUARD_EXE.set(std::fs::canonicalize(&path).unwrap_or(path));
 }
 
-/// The binary `sandbox-exec` runs as the guard, by its real path: [`set_guard_exe`]'s, else Marv's own.
+/// The binary `sandbox-exec` runs as the guard, by its real path: [`set_guard_exe`]'s, else Marv's own, resolved once
+/// per run. So the answer can't change mid-session (Marv's binary replaced or removed by an upgrade), and a command's
+/// preview and its run agree on whether it's sandboxed (#166 review).
 pub fn guard_exe() -> Option<PathBuf> {
-    let exe = GUARD_EXE.get().cloned().or_else(|| std::env::current_exe().ok())?;
-    std::fs::canonicalize(exe).ok()
+    static OWN: OnceLock<Option<PathBuf>> = OnceLock::new();
+    GUARD_EXE
+        .get()
+        .cloned()
+        .or_else(|| OWN.get_or_init(|| std::env::current_exe().ok().and_then(|e| std::fs::canonicalize(e).ok())).clone())
 }
 
 /// The user's own temporary folder, `/private/var/folders/<xx>/<id>/T`, by its real path: `confstr`'s
@@ -213,9 +219,13 @@ impl SandboxBackend for Seatbelt {
         seatbelt_hides(dir, home, user_temp_dir().as_deref().and_then(Path::parent))
     }
 
-    /// `killpg(pid, SIGKILL)`: the guard leads the group, so this ends it, the command and everything they started
-    /// that stayed in the group.
+    /// `kill(pid, SIGKILL)`, then `killpg(pid, SIGKILL)`. The group exists only once the guard has called `setsid`;
+    /// before that (while `sandbox-exec` compiles the profile and execs the guard) a `killpg` alone finds nothing, and
+    /// the guard would go on to start the command. Killing the pid first ends a guard that hasn't forked yet; one that
+    /// has already made its session, so the group kill then reaches the command and everything it left. `pid` is an
+    /// unreaped child of Marv's, so neither signal can reach another process.
     fn kill(&self, pid: u32) {
+        crate::backend::send(pid, nix::sys::signal::Signal::SIGKILL);
         crate::backend::kill_group(pid);
     }
 

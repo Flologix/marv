@@ -4,7 +4,9 @@
 //! `where_the_sandbox_is_required_it_really_runs` fails rather than let them skip.
 //!
 //! The fixtures: a fake home (with `.ssh`, Marv's config and skills, a toolchain, a credential and a symlinked one) and a
-//! project inside it, both in the user's temporary folder, which every profile closes but for the project.
+//! project inside it, in `/private/var/tmp`, which no rule but the home's closes: in the user's temporary folder
+//! (`/var/folders/…/T`, which every profile closes whole) a guard would pass with the home's rules removed (#166
+//! review). Each refusal has a control: the same command run outside the sandbox gets through.
 #![cfg(target_os = "macos")]
 
 use std::os::unix::net::UnixListener;
@@ -24,7 +26,8 @@ struct Home {
 
 impl Home {
     fn new(tag: &str) -> Self {
-        let dir = TempDir::new(tag);
+        let dir = TempDir::outside_tmp(tag);
+        assert!(dir.path().starts_with("/private/var/tmp"), "the fake home must be outside the user's temporary folder");
         dir.write(".ssh/known_hosts", "SECRET-SSH\n");
         dir.write(".marv/config.json", "{\"key\": \"SECRET-CONFIG\"}\n");
         dir.write(".marv/skills/x/SKILL.md", "a skill\n");
@@ -58,6 +61,20 @@ impl Home {
         let mounts =
             CommandMounts { network, read_only: guard.read_only, placeholders: guard.placeholders, ..Default::default() };
         run_sandboxed(sandbox, root, &mounts, script, &[])
+    }
+}
+
+/// `script` outside any sandbox, in `cwd`, for the controls: what the sandbox refuses must work here.
+fn host(cwd: &Path, script: &str) -> Ran {
+    let out = std::process::Command::new("bash").args(["-c", &format!("exec 2>&1\n{script}")]).current_dir(cwd).output().unwrap();
+    Ran { output: String::from_utf8_lossy(&out.stdout).into_owned(), code: out.status.code() }
+}
+
+/// The tools the guards' scripts use: a missing one would make a refusal look like a pass.
+fn require_tools(tools: &[&str]) {
+    for tool in tools {
+        let found = std::process::Command::new("bash").args(["-c", &format!("command -v {tool}")]).output().unwrap();
+        assert!(found.status.success(), "{tool} is needed by this guard");
     }
 }
 
@@ -104,8 +121,6 @@ fn the_macos_doors_are_closed() {
         "osascript -e 'tell application \"System Events\" to get name of first process'",
         "open -a TextEdit",
         "pbpaste && echo pasted",
-        "security find-generic-password -s marv-guard-none -w",
-        "security list-keychains",
     ] {
         let ran = home.run(script);
         assert_ne!(ran.code, Some(0), "{script}: {}", ran.output);
@@ -115,6 +130,51 @@ fn the_macos_doors_are_closed() {
     let listed = std::process::Command::new("/bin/launchctl").args(["list", &label]).output().unwrap();
     let _ = std::process::Command::new("/bin/launchctl").args(["remove", &label]).output();
     assert!(!listed.status.success(), "launchctl submit reached launchd");
+}
+
+/// **A keychain item can't be read, with or without network**: one that exists outside the sandbox (made in the
+/// user's default keychain for this test, removed after), read through `security`. Reading an item needs securityd
+/// (`com.apple.SecurityServer`), which no profile lets a command reach, with network or not (#166 review).
+///
+/// Proven: see the PR's proof comment (`com.apple.SecurityServer` added back to the network services).
+#[test]
+fn a_keychain_item_cant_be_read_with_or_without_network() {
+    require_sandbox!();
+    let home = Home::new("sb-keychain");
+    let service = format!("marv-guard-{}", std::process::id());
+    struct Remove(String);
+    impl Drop for Remove {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("security").args(["delete-generic-password", "-s", &self.0]).output();
+        }
+    }
+    let added = std::process::Command::new("security")
+        .args(["add-generic-password", "-a", "marv-guard", "-s", &service, "-w", "SECRET-KEYCHAIN-ITEM"])
+        .output()
+        .unwrap();
+    let _remove = Remove(service.clone());
+    let find = format!("security find-generic-password -s {service} -w");
+    let control = host(home.home(), &find);
+    if !added.status.success() || !control.output.contains("SECRET-KEYCHAIN-ITEM") {
+        // The limit, said: without a keychain to put an item in, only the refusal of the keychain itself is checked.
+        eprintln!(
+            "limit: no keychain item could be made and read back here ({}{}); checking only that the sandbox can't list keychains",
+            String::from_utf8_lossy(&added.stderr).trim(),
+            control.output.trim()
+        );
+        for network in [false, true] {
+            let ran = home.run_with(&home.sandbox(), &home.proj(), network, "security list-keychains -d user");
+            assert!(!ran.output.contains("login.keychain"), "network {network}: {}", ran.output);
+        }
+        return;
+    }
+    for network in [false, true] {
+        let ran = home.run_with(&home.sandbox(), &home.proj(), network, &find);
+        assert!(!ran.output.contains("SECRET-KEYCHAIN-ITEM"), "network {network}: {}", ran.output);
+        // A home-folder project too.
+        let ran = home.run_with(&home.sandbox(), home.home(), network, &find);
+        assert!(!ran.output.contains("SECRET-KEYCHAIN-ITEM"), "home project, network {network}: {}", ran.output);
+    }
 }
 
 /// **No Unix socket on the machine but the command's own**: the SSH agent's kind (`/private/tmp/…`), one in the
@@ -133,6 +193,11 @@ fn no_socket_outside_the_sandbox_is_reachable() {
             path.display()
         )
     };
+    require_tools(&["python3"]);
+    for sock in [agent.clone(), home.home().join("app.sock")] {
+        let control = host(home.home(), &connect(&sock));
+        assert!(control.output.contains("connected"), "control, {}: {}", sock.display(), control.output);
+    }
     for network in [false, true] {
         for sock in [agent.clone(), home.home().join("app.sock")] {
             let ran = home.run_with(&home.sandbox(), &home.proj(), network, &connect(&sock));
@@ -155,6 +220,7 @@ fn no_socket_outside_the_sandbox_is_reachable() {
 #[test]
 fn the_runtime_folder_is_closed_but_for_the_plug() {
     require_sandbox!();
+    require_tools(&["python3"]);
     let home = Home::new("sb-run");
     let runtime = TempDir::short("sb-rt");
     let plug = runtime.path().join("plug.sock");
@@ -169,6 +235,8 @@ fn the_runtime_folder_is_closed_but_for_the_plug() {
     assert!(ran.output.contains("connected"), "the plug: {}", ran.output);
     let ran = home.run_with(&sandbox, &home.proj(), false, &format!("{connect} '{}'", other.display()));
     assert!(!ran.output.contains("connected"), "another socket: {}", ran.output);
+    let control = host(home.home(), &format!("{connect} '{}'", other.display()));
+    assert!(control.output.contains("connected"), "control: {}", control.output);
     let ran = home.run_with(&sandbox, &home.proj(), false, &format!("ls '{}'", runtime.path().display()));
     assert!(denied(&ran), "listing: {}", ran.output);
     drop(listeners);
@@ -191,6 +259,7 @@ fn the_home_marvs_config_and_credentials_cant_be_read() {
     ] {
         let ran = home.run(&format!("cat '{h}/{file}'"));
         assert!(!ran.output.contains("SECRET") && ran.code != Some(0), "{file}: {}", ran.output);
+        assert_eq!(host(home.home(), &format!("cat '{h}/{file}'")).code, Some(0), "control: {file}");
     }
     assert!(denied(&home.run("ls ~")), "the home can't be listed");
     // But `cd ~` works (bash may say it can't name the folder it's in: its parents can't be read).
@@ -199,12 +268,13 @@ fn the_home_marvs_config_and_credentials_cant_be_read() {
     let ran = home.run(&format!("cat '{h}/.marv/skills/x/SKILL.md' '{h}/.cargo/bin/tool'"));
     assert_eq!(ran.code, Some(0), "{}", ran.output);
     // Marv's config folder elsewhere (MARV_CONFIG_DIR) is closed too.
-    let config = TempDir::new("sb-config");
+    let config = TempDir::outside_tmp("sb-config");
     config.write("config.json", "SECRET-ELSEWHERE");
     let mut sandbox = home.sandbox();
     sandbox.config_dir = Some(config.path().to_path_buf());
     let ran = home.run_with(&sandbox, &home.proj(), false, &format!("cat '{}/config.json'", config.path().display()));
     assert!(!ran.output.contains("SECRET"), "{}", ran.output);
+    assert!(host(home.home(), &format!("cat '{}/config.json'", config.path().display())).output.contains("SECRET"), "control");
     // A home-folder project: the hidden entries and ~/Library stay closed, upper-cased too (APFS ignores case).
     std::fs::create_dir_all(home.home().join("Library/Keychains")).unwrap();
     home.dir.write("Library/Keychains/k", "SECRET-KEYCHAIN");
@@ -217,7 +287,11 @@ fn the_home_marvs_config_and_credentials_cant_be_read() {
     ] {
         let ran = home.run_with(&home.sandbox(), home.home(), false, &format!("cat '{path}'"));
         assert!(!ran.output.contains("SECRET"), "home project, {path}: {}", ran.output);
+        assert!(host(home.home(), &format!("cat '{path}'")).output.contains("SECRET"), "control: {path}");
     }
+    // ...while the rest of the home reads, as the home-folder project it is.
+    let ran = home.run_with(&home.sandbox(), home.home(), false, "cat proj/src/main.rs");
+    assert_eq!(ran.code, Some(0), "{}", ran.output);
 }
 
 /// **Writes only in the project and the private `TMPDIR`** (G2, G9): not the system, not outside the project, not the
@@ -226,7 +300,7 @@ fn the_home_marvs_config_and_credentials_cant_be_read() {
 fn writes_only_in_the_project_and_a_private_tmpdir() {
     require_sandbox!();
     let home = Home::new("sb-write");
-    let outside = TempDir::new("sb-outside");
+    let outside = TempDir::outside_tmp("sb-outside");
     let shared = format!("/tmp/marv-guard-sb-{}", std::process::id());
     for target in ["/usr/local/marv-guard".to_string(), format!("{}/x", outside.path().display()), shared.clone()] {
         let ran = home.run(&format!("echo x > '{target}' && echo wrote"));
@@ -273,6 +347,7 @@ fn protected_names_cant_be_created_and_the_scan_finds_nothing() {
 #[test]
 fn protected_files_cant_be_renamed_away_or_hard_linked() {
     require_sandbox!();
+    require_tools(&["python3"]);
     let home = Home::new("sb-links");
     let h = home.home().display().to_string();
     let ran = home.run("mv pkg pkg2; mv pkg/AGENTS.md x; echo done");
@@ -287,6 +362,11 @@ fn protected_files_cant_be_renamed_away_or_hard_linked() {
         let ran = home.run(&script);
         assert!(ran.code != Some(0) && !ran.output.contains("SECRET"), "{script}: {}", ran.output);
     }
+    // Controls: outside the sandbox each of those links can be made.
+    for (src, dst) in [(format!("{h}/.ssh/known_hosts"), "ctl-x"), (".envrc".to_string(), "ctl-y")] {
+        let control = host(&home.proj(), &format!("ln '{src}' {dst} && echo made && rm {dst}"));
+        assert!(control.output.contains("made"), "control, {src}: {}", control.output);
+    }
     assert_eq!(std::fs::read_to_string(home.proj().join(".envrc")).unwrap(), "export SAFE=1\n");
     assert_eq!(std::fs::read_to_string(home.proj().join("pkg/AGENTS.md")).unwrap(), "safe\n");
     let ran = home.run("ln src/main.rs src/linked.rs && echo a > \"$TMPDIR/t\" && ln \"$TMPDIR/t\" t && echo linked");
@@ -298,9 +378,20 @@ fn protected_files_cant_be_renamed_away_or_hard_linked() {
 #[test]
 fn without_network_no_ip_not_even_loopback() {
     require_sandbox!();
+    require_tools(&["python3", "curl"]);
     let home = Home::new("sb-net");
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
+    // Controls: the host reaches its own listener; with network, the sandbox reaches the internet and may bind.
+    let control = host(home.home(), &format!("exec 3<>/dev/tcp/127.0.0.1/{port} && echo reached"));
+    assert!(control.output.contains("reached"), "control: {}", control.output);
+    for script in [
+        "curl -sS -m 20 -o /dev/null https://example.com && echo reached",
+        "python3 -c 'import socket; s=socket.socket(); s.bind((\"0.0.0.0\", 0)); s.listen(1); print(\"reach\" \"ed\")'",
+    ] {
+        let ran = home.run_with(&home.sandbox(), &home.proj(), true, script);
+        assert!(ran.output.contains("reached"), "control with network, {script}: {}", ran.output);
+    }
     for script in [
         "curl -sS -m 5 -o /dev/null https://example.com && echo reached".to_string(),
         format!("exec 3<>/dev/tcp/127.0.0.1/{port} && echo reached"),
@@ -416,4 +507,48 @@ async fn a_dropped_command_takes_its_group_with_it() {
     let _ = tokio::time::timeout(Duration::from_secs(2), run).await;
     let pid: i32 = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
     assert!(gone(pid), "the background child outlived the dropped command");
+}
+
+/// A sandboxed command that runs `(sleep 2; touch late) & sleep 600`, stopped by `cancel` (already cancelled, or soon
+/// after the spawn): the call must return at once and leave nothing running (`late` never appears).
+async fn stopped_early(tag: &str, cancel: tokio_util::sync::CancellationToken) {
+    let (project, home) = (TempDir::new(tag), TempDir::outside_tmp(&format!("{tag}-home")));
+    let options = marv_tools::bash::RunOptions {
+        command: "(sleep 2; touch late) & sleep 600".into(),
+        root: project.path().to_path_buf(),
+        sandbox: true,
+        timeout: std::time::Duration::from_secs(60),
+        ..Default::default()
+    };
+    let started = std::time::Instant::now();
+    let result = marv_tools::bash::run_command(options, &sandbox_with_home(home.path()), &cancel).await;
+    assert!(result.aborted, "{result:?}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(10), "the stop didn't hold: {:?}", started.elapsed());
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert!(!project.path().join("late").exists(), "{tag}: the stopped command went on running ({result:?})");
+}
+
+/// **A stop that comes before the sandbox is set up still stops the command** (#166 review): Seatbelt's process group
+/// exists only once `marv __guard` has called `setsid`, so a group kill alone, sent earlier, reached nothing and the
+/// command ran on. An already-cancelled token, and a stop right after the spawn.
+///
+/// Proven: `Seatbelt::kill` as `killpg` alone → failed on macOS (see the PR's proof comment).
+///
+/// macOS only: on Linux a SIGKILL that reaches bwrap while it's still setting up (before `--die-with-parent` holds)
+/// leaves the command running in its namespace; that's bwrap's own race, followed up separately.
+#[tokio::test]
+async fn a_stop_before_the_sandbox_is_up_still_stops_the_command() {
+    require_sandbox!();
+    let cancelled = tokio_util::sync::CancellationToken::new();
+    cancelled.cancel();
+    stopped_early("stop-early", cancelled).await;
+    for delay in [1, 5, 20] {
+        let soon = tokio_util::sync::CancellationToken::new();
+        let stopper = soon.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            stopper.cancel();
+        });
+        stopped_early(&format!("stop-soon-{delay}"), soon).await;
+    }
 }
