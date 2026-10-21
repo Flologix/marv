@@ -143,6 +143,63 @@ async fn config_approve_never_covers_a_tainted_network_escalation() {
     assert!(!project.path().join("ran").exists(), "the declined retry didn't run");
 }
 
+/// **…nor #81's network escalation in a turn without automatic approval, nor a worktree subagent's automatic yes.**
+/// In a turn the radio or a wake started (`no_auto_approval`, #124), the escalated retry is asked `once`: the
+/// remembered `bash:net:` scope doesn't answer it. A worktree subagent's approver says yes by itself to sandboxed
+/// work, never to a network command, so its escalated retry goes to the person too. Declined, it doesn't run.
+///
+/// Proven: dropped `|| ctx.no_auto_approval` from `once` in `run_tool` → the first half failed (the seed answered);
+/// dropped `!request.network` from `SubagentApprover` → the second half failed (it ran without anyone asked).
+#[tokio::test]
+async fn an_escalated_retry_is_asked_in_a_turn_without_automatic_approval_and_in_a_subagent() {
+    marv_guards::require_bwrap!();
+    let offline = "touch ran; echo 'fatal: unable to access: Could not resolve host: github.com'; exit 128";
+    let bash = call("bash", json!({ "command": offline }));
+
+    // A woken turn: the session's "always" for network commands is there, and doesn't answer.
+    let project = TempDir::new("approvals-escalate-woken");
+    let approver = Recorder::new(Decision::No);
+    let wrapper = marv_session::SessionApprover {
+        inner: approver.clone(),
+        always: {
+            let always = AlwaysScopes::default();
+            always.seed(&["bash:net:".to_string()]);
+            always
+        },
+        cancel: tokio_util::sync::CancellationToken::new(),
+    };
+    let mut ctx = ToolContext { approver: Some(Arc::new(wrapper)), ..ToolContext::new(project.path()) };
+    ctx.sandbox = Arc::new(marv_sandbox::Sandbox::from_env(true));
+    ctx.yolo = true;
+    run_tool(&bash, &ctx, builtin_tools()).await; // the first failure, no network: auto_safe in yolo
+    std::fs::remove_file(project.path().join("ran")).unwrap();
+    // The retry comes in a woken turn.
+    ctx.no_auto_approval = true;
+    let out = run_tool(&bash, &ctx, builtin_tools()).await;
+    let asked = approver.requests();
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert!(asked[0].network && asked[0].once, "{:?}", asked[0]);
+    assert!(out.result.declined, "{}", out.result.output);
+    assert!(!project.path().join("ran").exists(), "the declined retry didn't run");
+
+    // A worktree subagent: its automatic yes covers the sandboxed first try, never the escalated retry.
+    let project = TempDir::new("approvals-escalate-subagent");
+    let approver = Recorder::new(Decision::No);
+    let subagent = marv_session::subagent::SubagentApprover { inner: approver.clone(), agent: "implementer".into(), auto: true };
+    let mut ctx = ToolContext { approver: Some(Arc::new(subagent)), ..ToolContext::new(project.path()) };
+    ctx.sandbox = Arc::new(marv_sandbox::Sandbox::from_env(true));
+    run_tool(&bash, &ctx, builtin_tools()).await;
+    assert!(approver.requests().is_empty(), "the subagent's own yes ran the first try: {:?}", approver.requests());
+    std::fs::remove_file(project.path().join("ran")).unwrap();
+    let out = run_tool(&bash, &ctx, builtin_tools()).await;
+    let asked = approver.requests();
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert!(asked[0].network && asked[0].agent.as_deref() == Some("implementer"), "{:?}", asked[0]);
+    assert!(out.result.output.contains(marv_sandbox::notes::ESCALATED_NOTE), "{}", out.result.output);
+    assert!(out.result.declined, "{}", out.result.output);
+    assert!(!project.path().join("ran").exists(), "the declined retry didn't run");
+}
+
 /// **…nor a protected path.** `"approve": ["files"]` covers ordinary writes without asking; a write to `AGENTS.md`
 /// (a protected path) still asks with `must_ask`, and is not written.
 ///

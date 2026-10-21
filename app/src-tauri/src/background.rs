@@ -126,6 +126,11 @@ impl Shared {
         }
     }
 
+    /// Whether a page shows the chat now.
+    pub fn shown(&self) -> bool {
+        self.sink.is_some()
+    }
+
     pub fn detach(&mut self) {
         self.sink = None;
     }

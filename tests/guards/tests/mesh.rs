@@ -285,6 +285,47 @@ fn the_runtime_folder_override_is_checked_like_the_default() {
     assert_eq!(marv_mesh::discovery::mesh_dir(&env(std::path::Path::new("rel/marv"))), None, "relative");
 }
 
+/// **`MARV_RUNTIME_DIR` inside the session's project, or holding it, is refused** (#168): a sandboxed command runs as
+/// the user and writes in the project, so it could make the folder (or its `mesh` and `p` folders) before Marv does.
+/// The session's mesh is off and the folder isn't made; the refusal says why. The same folder outside the project is
+/// used.
+///
+/// Proven: dropped the project check in `check_override` → this test failed (the mesh started in the project's folder).
+#[tokio::test]
+async fn the_runtime_folder_override_is_refused_inside_the_project() {
+    struct Short(std::path::PathBuf);
+    impl Drop for Short {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let base = Short(std::path::PathBuf::from(format!("/tmp/mx-op-{}", std::process::id())));
+    let _ = std::fs::remove_dir_all(&base.0);
+    std::fs::create_dir_all(base.0.join("proj/run")).unwrap();
+    let project = base.0.join("proj");
+    let env = |dir: &std::path::Path| {
+        [
+            ("MARV_RUNTIME_DIR".to_string(), dir.display().to_string()),
+            ("HOME".to_string(), "/nonexistent".to_string()),
+            ("MARV_MESH_NAME".to_string(), "op".to_string()),
+        ]
+        .into_iter()
+        .collect::<marv_mcp::Env>()
+    };
+    let inside = env(&project.join("run/marv"));
+    let started = marv_session::mesh_process::start(&inside, &project, std::slice::from_ref(&project)).unwrap();
+    assert!(started.is_none(), "the mesh started in the project's folder");
+    assert!(!project.join("run/marv").exists(), "and it wasn't made");
+    let why = marv_sandbox::override_refusal_for(&inside, Some(&project)).unwrap();
+    assert!(why.contains("inside the project"), "{why}");
+    // Holding the project.
+    assert_eq!(marv_sandbox::runtime_dir_for(&env(&base.0), Some(&project)), None, "holding the project");
+    // Outside it: used.
+    let outside = base.0.join("marv");
+    let started = marv_session::mesh_process::start(&env(&outside), &project, std::slice::from_ref(&project)).unwrap();
+    assert!(started.is_some(), "an override outside the project is used");
+}
+
 /// Answers every approval with its decision, keeping what it was asked.
 struct Person(marv_tools::Decision, Mutex<Vec<marv_tools::ApprovalRequest>>);
 #[async_trait::async_trait]

@@ -66,7 +66,7 @@ Try it: `OPENROUTER_API_KEY=… cargo run -p marv-provider --example chat -- "hi
 - **#57 reasoning round-trip:**
   - `Delta::reasoning_details` is collected and emitted as `ProviderEvent::Reasoning` before `Done`.
   - `to_messages` re-sends it as `reasoning_details` on the assistant message.
-  - Open question: OpenRouter may split one block over several chunks (same `index`). Check whether the blocks must be merged before they're sent back.
+  - OpenRouter streams one block over many chunks (same `index` and `type`, often a token each). `merge_reasoning_block` joins them as they arrive (strings concatenated, `signature`/`id`/`format` filled in once), so a turn keeps and re-sends one block, not one per chunk (a DeepSeek run had 2,387). Sessions saved before keep their pieces: history is sent back unchanged (the prompt cache).
 - **#59 `tool_choice: "none"`** is in `ChatRequest` and is sent only for `ToolChoice::None`. Auto requests keep their bytes. Ollama has no equivalent, so it relies on the note.
 - **#63 overflow recovery:** `errors::is_context_overflow` is a stub. Collect real OpenRouter and Ollama overflow messages first.
 - **#64 continue after a dropped stream (done in both adapters):**
