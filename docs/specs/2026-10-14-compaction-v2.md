@@ -27,7 +27,7 @@ Evidence still to collect (see §7): the eval measures repeated reads after comp
 | `compacted_history(summary, plan_text)`: `[User(COMPACTED_PREFIX + summary [+ plan]), Assistant(COMPACTED_ACK)]` | `compact.rs` |
 | `MID_TURN_NOTE`: pushed after a mid-turn compaction | `compact.rs`, pushed by `MarvSession::compact_if_full` |
 | v2 stubs: `V2_SECTIONS`, `V2_TAIL_TOKENS = 15_000`, `V2_OVERFLOW_TARGETS = [0.70, 0.50, 0.35]`, `tail_start` (todo), `rolling_update_request` (todo) | `compact.rs` |
-| Failure rule (#144): `State::compact_failures` / `compact_failed_at`; `try_compact()` = `nearly_full() && may_compact_again(…)`: after a failure, again only once the context grew 25% (`COMPACT_RETRY_GROWTH`, or halfway to the window if sooner), at most `MAX_COMPACT_FAILURES` = 3 failures a turn; reset when the turn ends. So a turn makes at most 6 summary requests (3 × 2), as CHANGELOG promises | `session.rs` |
+| Failure rule (#144): `State::compact_failures` / `compact_failed_at`; `try_compact()` = `nearly_full() && may_compact_again(…)`: after a failure, again only once the context grew 25% (`COMPACT_RETRY_GROWTH`, or halfway to the window if sooner), at most `MAX_COMPACT_FAILURES` = 3 failures a turn; reset when the turn ends. So a turn makes at most 6 **failed** summary requests (3 × 2), as CHANGELOG promises; successful summaries aren't capped | `session.rs` |
 | `summarize_into(focus, …)`: swaps the shared `History` **in place**, clears the MCP `announced` list and `loaded` schemas, sets `last = None`, **resets the nested instruction files (#62, `inner.nested.reset()`)**, and writes `TrajectoryRecord::Compact { turn, summary }`, or on failure `TrajectoryRecord::CompactFailed { turn, reason, error, tokens }` | `session.rs`, `trajectory.rs` |
 | Events: `SessionEvent::Compaction(CompactResult)`; stream-json `{"type":"compaction","compacted":true}` or `{…,"compacted":false,"reason","error"}` (#144) | `crates/marv-cli/src/headless.rs`, `crates/marv-web/src/events.rs` |
 | Before a turn: `if self.try_compact() { … compact_if_full(…, false) }`. Mid-turn: `options.on_full`. `/compact [focus]`: `MarvSession::compact` | `session.rs` |
@@ -49,7 +49,7 @@ What works and must stay: mid-turn compaction (`on_full`), `/compact [focus]`, a
 User      COMPACTED_PREFIX + <structured summary> [+ "\n\n" + plan_text]
 Assistant COMPACTED_ACK                     ← only when the tail is empty or starts with a User turn
 <tail>    the newest turns, verbatim (ChatTurn values moved, never rebuilt)
-[User     MID_TURN_NOTE (+ MCP announcement)] ← mid-turn only, as today
+[User     MID_TURN_NOTE (+ MCP announcement)] ← mid-turn and after overflow levels 0–2, so the next request ends on a user message
 ```
 
 - **The ACK rule.** Two user messages or two assistant messages in a row are what the current shape avoids. If the tail starts with an `Assistant` turn (a step's calls), the ACK is left out: User(summary) → Assistant(calls) → Tool … is valid. If the tail starts with a `User` turn, or is empty, the ACK stays. The tail never starts with a `Tool` turn (§3.2).
@@ -63,9 +63,10 @@ Assistant COMPACTED_ACK                     ← only when the tail is empty or s
 - **Snap to a safe boundary:** move the start *earlier* to the nearest index whose turn is `User` or `Assistant`. A `Tool` turn is never first, so a result is never split from the assistant turn that called it. Moving earlier can exceed the budget by one step's results; the cap below bounds it.
 - **Return values.** The cases are checked in this order:
   1. **Already fits:** the whole history's estimate is ≤ `tail_tokens` (an empty history included) → `0`. This is the only way to get `0`. It means there is nothing worth compacting: `CompactFailure::Empty`, "Nothing to compact yet.", as for an empty history today.
-  2. **Pulled in by snapping:** the history doesn't fit, but snapping moved the start back to index 0 → `history.len()` (no tail). Everything gets summarized.
-  3. **Over the cap:** the snapped tail is larger than `2 × tail_tokens` → `history.len()` (no tail). A giant tool result then goes into the summary, not the tail.
-  4. **Otherwise:** the snapped index, which is `> 0` and `< history.len()`.
+  2. **Even the newest turn is over budget:** the walk stops before the last turn → `history.len()` (no tail), **without snapping** (snapping would move earlier and pull in more). Everything gets summarized.
+  3. **Pulled in by snapping:** the history doesn't fit, but snapping moved the start back to index 0 → `history.len()` (no tail). Everything gets summarized.
+  4. **Over the cap:** the snapped tail is larger than `2 × tail_tokens` → `history.len()` (no tail). A giant tool result then goes into the summary, not the tail.
+  5. **Otherwise:** the snapped index, which is `> 0` and `< history.len()`.
 - **Overflow recovery (§3.5)** never calls `tail_start` with the full budget on a history that just overflowed. It passes the level's smaller budget, or `0` at level 2, and a budget of `0` returns `history.len()`. Case 1 only applies when the budget is above zero: an empty history with budget `0` is still `0`.
 - **The default budget** is `min(15k, 15% of the effective threshold)`, the threshold being `nearly_full`'s `min(0.85 × window, compactTokens)`. At the 100k default that is 15k; on a 32k Ollama window it is about 4k, so the tail never crowds out the summary.
 - Pure, in `marv-agent/src/compact.rs`. The 4-chars estimate moves into `marv-core` as one `estimate_tokens` (types-only crate, no I/O), and the four copies in §2 use it (`ASSUMED_TOKENS_PER_BYTE` is defined from it).
@@ -159,7 +160,7 @@ In `LoopState::decide`, `StepOutcome::Error(message)` where `is_context_overflow
   - `Failed(text)` → emit `LoopEvent::Error(text)` (the hook's text, not the raw provider message) and `finish(StopReason::Error)`. The session's turn ends `TurnEndReason::Done(StopReason::Error)`, so headless exits as for any provider error.
   - `Stopped` → `finish(StopReason::Aborted)`, no `Error` event, as Esc during `on_full`.
 - No hook set → today's path with the raw message (`LoopEvent::Error(message)`, `StopReason::Error`). Unset, the hook changes nothing.
-- `attempt` counts per step and resets after a step that got a reply. **At most 5 recoveries per step** (levels 0–3 and the whole-window last attempt); the hook call after that returns `Failed`.
+- `attempt` counts per step and resets after a step that got a reply. **At most 4 recoveries per step** (hook calls returning `Recovered`: one per level, 0 to 3, where the whole-window last attempt takes level 3's place, §3.5) and so at most 5 agent requests; one hook call can walk down several levels. The hook call after the fourth recovery returns `Failed`.
 - A cancel during the hook ends `Aborted` whatever the hook returns, as `on_full` does (the loop checks `aborted()` after the hook).
 
 marv-agent depends on marv-provider already, so it can call `is_context_overflow` directly.
@@ -172,6 +173,10 @@ marv-agent depends on marv-provider already, so it can call `is_context_overflow
 | 1 | Same, target `0.50 × window`, tail budget halved. |
 | 2 | Same, target `0.35 × window`, no tail. |
 | 3 | **No summary:** keep the previous summary (if any) + the newest exchanges that fit `0.35 × window`, drop the rest, and add a note: "(Automatic note from Marv) Older messages were dropped to fit the context window; ask the user if you need something from them." No asking (decided, §9). |
+
+**What the retried request ends with.** After levels 0–2 the history ends `[User summary, Assistant COMPACTED_ACK]` (plus a tail in v2), so the session appends `MID_TURN_NOTE` (plus the MCP announcement) as a user message, exactly as `compact_if_full` does after `on_full`: the retried request ends on a user message. After level 3 the drop note is a user message and comes last (with the MCP announcement appended to it), so nothing else is added.
+
+**Level-3 housekeeping** is the same as `summarize_into`'s: clear the MCP `announced` list and the `loaded` schemas, set `last = None`, and reset the nested instruction files, then apply §3.1's rule to the **kept** exchanges (folders whose notes are in a kept result are marked seen again). The previous summary (if any) stays first; the trajectory gets a `Compact` record with `trigger: "overflow"`, `level: 3` and no new summary text.
 
 Under `compaction: "v1"` (and in PR (c), before v2 exists) "normal compaction" is today's v1 summary on the cut-down history, with no tail: overflow recovery is a bug fix and doesn't wait for v2.
 
@@ -187,11 +192,11 @@ Under `compaction: "v1"` (and in PR (c), before v2 exists) "normal compaction" i
 - **When the fixed content doesn't fit.** Let `fixed_step = estimate(system) + estimate(tool specs)`: what every retried step sends whatever the history. If level 3's budget (at 35%) is also below the minimum, there are three cases, checked in order:
   1. **The fixed content exceeds the window** (`fixed_step ≥ window`). No history can help. The hook returns `Failed("The system prompt and tool definitions alone (about N tokens) are larger than this model's context window (M tokens). Pick a model with a larger window (/model), or turn off MCP servers or tools you don't need (/mcp).")`.
   2. **The fixed content fits but leaves no usable room** (`window − fixed_step − reply_reserve < MIN_HISTORY_BUDGET`). It returns `Failed("After the system prompt and tool definitions (about N tokens) and room for the reply, only about K tokens of this model's M-token window are left for the conversation, which is too little to go on. Pick a model with a larger window (/model), or turn off MCP servers or tools you don't need (/mcp).")`.
-  3. **The fixed content fits, but the 35% target leaves no room.** One **last attempt** at level 3 uses the whole window: `budget = window − fixed_step − reply_reserve`. It is the same drop with no request. If even that step overflows again, the next hook call has nothing left to try and returns `Failed` with case 2's message, using the measured numbers.
+  3. **The fixed content fits, but the 35% target leaves no room.** The **last attempt** **replaces** level 3 (it is not a step after it): the same drop with no request, at `budget = window − fixed_step − reply_reserve`. If that step overflows again, the next hook call has nothing left to try and returns `Failed` with case 2's message, using the measured numbers.
 
-  There is no drop loop: every level, including the last attempt, is tried at most once per step, so the number of requests is bounded.
+  There is no drop loop: every level is tried at most once per step (level 3 either at 35% or as the last attempt, never both), so the number of requests is bounded.
 - **Window when unknown** (custom provider, model list not loaded): `window_refusal(message)`'s window. If that fails too, the size of the request that overflowed (`estimate_tokens` of the history) stands in for the window.
-- **An overflow during an ordinary summary** (`summarize` returns `Err(msg)` with `is_context_overflow(msg)`) goes straight to level 0 instead of `NotCompacted`.
+- **An overflow during an ordinary summary** (`summarize` returns `Err(msg)` with `is_context_overflow(msg)`) counts one failure first (`compact_failures += 1`, `compact_failed_at` set, as for any failed summary), then goes to level 0 instead of `NotCompacted`. So a turn already at `MAX_COMPACT_FAILURES` goes straight to level 3, as in §3.5.1.
 
 #### 3.5.1 When a recovery summary itself overflows
 
@@ -200,7 +205,7 @@ Under `compaction: "v1"` (and in PR (c), before v2 exists) "normal compaction" i
 ```text
 level = attempt                        (0..=3)
 loop:
-  if level == 3: drop to fit (no request); return Recovered   ← or the whole-window last attempt / Failed (§3.5)
+  if level == 3: drop to fit (no request; at 35%, or the whole-window last attempt in its place); return Recovered   ← or Failed (§3.5)
   if compact_failures >= MAX_COMPACT_FAILURES: level = 3; continue
   budget too small? → level += 1; continue
   summarize(fit_for_summary(history, budget), …)
@@ -213,7 +218,7 @@ loop:
 - **How recovery counts toward `compact_failures` (#144).** Recovery is not gated by `may_compact_again`: the alternative is a dead turn. But every recovery summary that fails (it overflowed too, or any other error) adds one to `compact_failures` and sets `compact_failed_at`, like a failed automatic summary. Once the turn has `MAX_COMPACT_FAILURES`, recovery goes straight to level 3 (no request). So failed summary requests stay within #144's bound of 3 failures × 2 requests = 6 a turn, whether they came from the trigger or from recovery. A successful recovery counts nothing; the counters still reset when the turn ends.
 - If the retried **agent** request overflows again after a successful recovery, the loop calls the hook with `attempt + 1`. Recovery then starts one level lower than the level that last succeeded (the session remembers it for the step), so a step never repeats a level.
 - **No template nudge during overflow recovery.** A recovery summary that ignores the template is accepted as it is and logged `structured: false`. A nudge would be one more request per level, each of which could overflow too. #144's tool-call re-ask still applies (it is the same size as the request that just fit).
-- Altogether, a step makes at most 3 summary attempts (≤ 6 requests, and fewer once the turn's failures run out) and 6 agent requests (the original, one after each of levels 0–2, one after level 3, and one after the last attempt) before it gives up.
+- Altogether, a step makes at most 3 summary attempts (≤ 6 requests, and fewer once the turn's failures run out) and 5 agent requests (the original, then one after each of at most 4 recoveries: levels 0–2 and level 3 or its last attempt) before it gives up.
 - Every recovery emits `SessionEvent::Compaction(…)`, so the user sees a notice. `CompactResult::Compacted` gains `trigger: Auto | Manual | Overflow { level }`, which the TUI, stream-json and trajectory carry (§3.6).
 - Before the turn's first request the same hook applies: an overflow there is caught by the loop like any other step.
 
@@ -264,6 +269,7 @@ Unit tests (`crates/marv-agent/src/compact.rs`, `ScriptedProvider`):
 - `tail_start`, one test per return case (§3.2):
   - already fits → `0`;
   - empty with budget > 0 → `0`; empty with budget 0 → `0`;
+  - even the newest turn is over budget → `len`, without snapping;
   - doesn't fit, snapped back to index 0 → `len`;
   - over the 2× cap → `len`;
   - budget `0` on a non-empty history → `len`;
@@ -287,12 +293,14 @@ Provider (`crates/marv-provider/src/errors.rs`):
 Loop (`crates/marv-agent/src/agent.rs`):
 - An overflow `Error` with `on_overflow` → `Overflow` event, the same step is retried, and the history has nothing from the failed reply.
 - `Failed` → `Error` + `Done(Error)`. No hook → as today.
-- The attempt counter climbs per step and resets after a good step; at most 5.
+- The attempt counter climbs per step and resets after a good step; at most 4 `Recovered` and 5 agent requests per step, then `Failed`.
 - Esc during the hook → `Aborted`.
 
 Session (`crates/marv-session/src/session.rs` tests, the "Done when" fake-provider test):
 - **The issue's acceptance test:** a fake provider answers the first request with an OpenRouter overflow error, then a summary, then a reply. The turn ends `Done(End)` with one `Compaction { trigger: Overflow { level: 0 } }` and no user action. Under v1 (PR (c)) and v2.
-- Climbing levels: overflow, overflow, overflow → level 3 drop, and the turn still finishes.
+- Climbing levels: overflow, overflow, overflow → level 3 drop, and the turn still finishes. After levels 0–2 the retried request ends with `MID_TURN_NOTE` (a user message); after level 3 it ends with the drop note; the MCP announcement follows either.
+- Level-3 housekeeping: `announced`, `loaded` and `last` are cleared, and a nested note in a kept exchange isn't given again.
+- An overflow during an ordinary summary counts one failure before level 0; with the turn already at `MAX_COMPACT_FAILURES`, it goes straight to level 3.
 - **The summary request overflows, all the way down:**
   - the agent request overflows;
   - the level 0, 1 and 2 summary requests each overflow too;
@@ -303,10 +311,10 @@ Session (`crates/marv-session/src/session.rs` tests, the "Done when" fake-provid
 - **Failures shared with #144:** after 2 failed automatic summaries in the turn, an overflow's recovery sends one summary request, then goes to level 3 when it fails. A turn's failed summary requests never exceed 6.
 - **The fixed content exceeds the window:** a system prompt larger than the window. The hook returns `Failed` without sending a summary request. The loop emits `LoopEvent::Error` with the "larger than this model's context window" text (not the provider's), and the turn ends `Done(Error)` after 1 request.
 - **The fixed content fits but leaves no room:** the result is `Failed` with the "only about K tokens … left" text; no summary request, no drop; `Done(Error)`.
-- **The 35% target is too small, but the whole window has room:** the last attempt drops to the whole-window budget, the retried step succeeds, and the turn ends `Done(End)`.
+- **The 35% target is too small, but the whole window has room:** the last attempt replaces level 3 and drops to the whole-window budget, the retried step succeeds, and the turn ends `Done(End)`. A step that overflows four times after recovering ends `Done(Error)` after 5 agent requests.
 - **No nudge in recovery:** a recovery summary without the template headings is accepted with `structured: false`. In the "all the way down" test, the total is still 3 summary requests.
 - `OverflowOutcome` in the loop: `Recovered` → the same step is requested again; `Failed(text)` → `LoopEvent::Error(text)` + `Done(Error)`; `Stopped` → `Done(Aborted)` with no `Error` event.
-- A non-overflow error during a recovery summary (rate limited) ends the turn with that error; Esc during it → `Interrupted`.
+- A non-overflow error during a recovery summary (rate limited) ends the turn with that error. Esc during recovery (through the loop hook) → `Stopped` → `Done(Aborted)`; `Interrupted` stays only for Esc during the ordinary summary before the turn's loop starts.
 - Rolling: a second compaction's request contains the rolling instruction; `State::summary` is replaced; save, then resume, keeps it.
 - Mid-turn with a tail: the history ends with the tail then `MID_TURN_NOTE`; the next request is valid (every call answered).
 - Nested instruction files: a note in a tail result isn't given again on the next touch of its folder; a note that was summarized away is.
@@ -338,8 +346,8 @@ Oracle: compaction scenarios in `tests/oracle/` run under `compaction: "v1"` unt
 One PR each, in this order. Only the last needs a paid eval.
 
 - **(a) M1 Overflow detection.** `is_context_overflow` on top of `window_refusal`, matching only what escapes the #116 refit; fixtures from real captured errors; `marv-core::estimate_tokens`, with the four copies using it. No behaviour change.
-- **(b) M2 Loop hook.** `AgentOptions::on_overflow`, `LoopEvent::Overflow`, the per-step attempt counter (at most 5), loop tests. Inert when unset.
-- **(c) M5-lite Overflow recovery, on today's v1 summary.** A bug fix, no A/B: the session hook with levels 0–3 and the last attempt, `fit_for_summary` and the budgets, the #144 failure counting, `CompactResult` `trigger`, the `CompactFailed`/event `trigger`, the TUI and headless notice text, the acceptance test, and the guard `taint_survives_compaction`.
+- **(b) M2 Loop hook.** `AgentOptions::on_overflow`, `LoopEvent::Overflow`, the per-step attempt counter (at most 4 recoveries), loop tests. Inert when unset.
+- **(c) M5-lite Overflow recovery, on today's v1 summary.** A bug fix, no A/B: the session hook with levels 0–3 and the last attempt, `fit_for_summary` and the budgets, the #144 failure counting, `CompactResult` `trigger`, the `CompactFailed`/event `trigger`, the TUI and headless notice text, the acceptance test, and the guard `taint_survives_compaction`, with a `docs/SECURITY.md` rule next to it: taint survives compaction and overflow recovery (the level-3 drop included).
 - **(d) M3 Pure v2 helpers.** `tail_start`, the v2 `compacted_history` (ACK rule), `summary_request(…, rolling)`, the template text and check. Unit tests. Not wired.
 - **(e) M4 v2 wiring behind `compaction: "v2"`.** `State::summary`, `SavedSession::summary`, the nudge with the 2-request bound, the nested-instructions tail rule, the `Compact` trajectory fields, `compactTailTokens`. The default stays `"v1"`.
 - **(f) M6 Eval support** (shared with #66): `bench.py --marv-config`, the eval-only `compactTokens` bypass if needed, the `trajectory_stats` repeated-reads counter, the `long-haul` task with `--verify`, the replay run. Then **ask** to run §7.
@@ -354,4 +362,4 @@ One PR each, in this order. Only the last needs a paid eval.
 5. **A second unstructured summary is accepted** and logged `structured: false`; failing would leave a nearly full context.
 6. **The summary stays a user-role message**, not fenced as data. Revisit with an injection eval.
 7. **A temporary `compaction: "v1" | "v2"` key, default `"v1"`**, removed one release after the default flips.
-8. **Recoveries per step: 5** (levels 0–3 and the whole-window last attempt). The draft's §6 said 4; §3.5 was right.
+8. **Recoveries per step: 4** (levels 0–3, the whole-window last attempt taking level 3's place when its 35% budget is too small), so at most 5 agent requests per step. The draft said 5 in §3.5 and 4 in §6; 4 is the real maximum.

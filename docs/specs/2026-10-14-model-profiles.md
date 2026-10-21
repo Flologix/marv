@@ -34,7 +34,7 @@ opencode, per the issue, gives GPT models (other than gpt-4 and `oss`) a patch t
 | Home-folder rules (0.7.0): a project that is `~` or holds it makes every `ToolKind::Write` call with scope `files` ask `once` (`registry::home_file_write`): no "always", no config seed, not in yolo | `registry.rs::run_tool`, guard `tests/guards/tests/sandbox.rs::in_the_home_folder_dotfiles_and_hooks_ask_even_in_yolo` |
 | `write_file`: create/overwrite/append (the long-file-in-parts workaround), same rules | `crates/marv-tools/src/write_file.rs` |
 | The approval flow: protected → `must_ask` (asks even in yolo); taint; the turn's checkpoint (#16) before any write; yolo + `auto_safe` | `registry.rs::run_tool` |
-| One changed path per call: `ToolOutput::changed: Option<String>`, read by the undo report (`session.rs::note_changed`), the typecheck (`diagnostics/turn.rs`) and the project checks | `crates/marv-tools/src/types.rs` |
+| One changed path per call: `ToolOutput::changed: Option<String>`, copied into the loop's `marv_agent::ToolRun::changed` by `runner.rs::tool_run_from`, and read from there by the undo report (`session.rs::note_changed`), the typecheck and the project checks (`diagnostics/turn.rs`) | `crates/marv-tools/src/types.rs`, `crates/marv-agent/src/agent.rs` (`ToolRun`), `crates/marv-session/src/runner.rs` |
 | Multi-file preview already exists: `Preview::files: Option<Vec<PreviewFile>>` (built for `/undo`), rendered by the TUI approval panel | `types.rs`, `crates/marv-tui/src/ui/approval.rs` |
 | The apply_patch plan and types, not registered: `PatchOp`, `Hunk`, `parse_patch` (todo). Its module doc predates this spec and is superseded by §3.3: hunks are found with `edit_match::find_from` (first match after the cursor), not `apply_edit`, and files are locked together with `with_file_locks`, not `with_file_lock` per file. The implementation PR (M3) rewrites the doc | `crates/marv-tools/src/apply_patch.rs` |
 | Model quirks that exist today, scattered: `needs_cache_breakpoints(model)` (`anthropic/`, `google/gemini-`, #56); `reasoning_for(thinking, reasoningEffort, model list's reasoning)` (#143: medium effort for always-reasoning models, from the model list, not the id); Ollama `presence_penalty: 0` and `num_ctx` (all Ollama models); the duplicate tool-call ids (`make_ids_unique`, every provider) | `openai_compat.rs`, `crates/marv-provider/src/lib.rs`, `ollama.rs`, `crates/marv-agent/src/agent.rs` |
@@ -91,7 +91,7 @@ Matching works on the lowercased id with any `vendor/` prefix stripped. Rules, i
 ### 3.2 When the profile is chosen (cache)
 
 - **Once per conversation:** in `MarvSession::new`, and again on `clear()` and on resume, which already start a new system prompt or a new cache. `Inner::specs` moves into `State` (`State::specs`) so `clear()` can rebuild it.
-- **`/model` mid-conversation keeps the conversation's profile.** The history holds calls to the current edit tools. Swapping the tools under it would leave the model staring at calls to tools it no longer has, and would restart the cache. The TUI shows one notice when the new model's profile differs: "`<model>` works best with apply_patch; it applies from the next /clear." From `/clear` on, the new profile applies.
+- **`/model` mid-conversation keeps the conversation's profile.** The history holds calls to the current edit tools. Swapping the tools under it would leave the model staring at calls to tools it no longer has, and would restart the cache. The TUI shows one notice when the new model's **resolved** edit tools differ from the conversation's (after `editTools` and, before M7, the `auto` → Edit rule, so before M7 no notice appears unless `editTools` is `"patch"`): "`<model>` works best with apply_patch; it applies from the next /clear." From `/clear` on, the new profile applies.
 - **Saved sessions** record `edit_tools` (`SavedSession::edit_tools: Option<EditTools>`, serde default `Edit`). On resume the saved value wins over the model's profile, for the same reason. The trajectory's `session` record already lists `tools`; it also gains `profile: "<family>/<edit_tools>"` so `trajectory_stats` can group by it.
 - **Subagents:** profile by **their** model (a subagent type can name another one), at spawn. Each subagent is its own fresh conversation, so there is no cache concern. Under `Patch`, `SUBAGENT_TOOLS`' `edit_file` and `write_file` become `apply_patch`; an agent type listing `Edit`/`Write` gets `apply_patch` too. `subagent_prompt` gets the matching sentence (§3.4).
 
@@ -139,7 +139,7 @@ Paths are relative to the project root. Give about 3 lines of context above and 
 **Applying a hunk.** Per file, a cursor starts at 0:
 1. If the hunk has an `@@ <context>` header, find the first line at or after the cursor that matches it, using `edit_match`'s tiers line by line; the search starts after that line.
 2. `old` = the context and `-` lines, `new` = the context and `+` lines (each joined with `\n`). Find `old` at or after the search start using the same tiers as `edit_file`, through a new `edit_match::find_from(text, old, from) -> Option<(Range, Fuzzy)>`. It reuses the tier code; `apply_edit`'s uniqueness rule is not used here.
-3. **Codex semantics: the first match at or after the cursor wins** (the order of hunks and `@@` headers disambiguate). This differs from `edit_file`'s "must be unique", deliberately: it is how the format is trained and written. See open question 3.
+3. **Codex semantics: the first match at or after the cursor wins** (the order of hunks and `@@` headers disambiguate). This differs from `edit_file`'s "must be unique", deliberately: it is how the format is trained and written; see §9, decision 3.
 4. A pure addition (no `old` lines) inserts at the `@@` position, or at the end of the file with `*** End of File`, or else is an error asking for context.
 5. CRLF is kept (`edit_match::line_ending`). Indentation re-flow from the indentation tier applies, as in `edit_file`, and is reported with `fuzzy_note`.
 6. Not found → an error naming the file and hunk number, with `closest_lines` for that hunk's `old` text, in the same shape as `edit_file::not_found`.
@@ -175,10 +175,9 @@ An I/O error part-way is reported per file ("applied: a, b; failed: c: <err>") w
 - `ApplyPatch` goes into `builtin_tools` right after `WriteFile`.
 - `tool_specs_for(has_skills, plan, github, edit_tools)` keeps `edit_file` + `write_file` and drops `apply_patch` for `Edit`, and the reverse for `Patch`. The order is stable within each set.
 - `offered()` filters the callable tools the same way, so a GPT conversation can't call `edit_file` and a Claude one can't call `apply_patch`.
-- `ToolOutput::changed` becomes `changed: Vec<String>` (empty = none). Its three readers iterate:
+- `ToolOutput::changed` becomes `changed: Vec<String>` (empty = none), and so does `marv_agent::ToolRun::changed` (`crates/marv-agent/src/agent.rs`), which `crates/marv-session/src/runner.rs::tool_run_from` copies it into. Its readers iterate:
   - `session.rs::note_changed` (undo report);
-  - `diagnostics/turn.rs` (typecheck files);
-  - the project checks.
+  - `diagnostics/turn.rs` (typecheck files and the project checks).
 
   `edit_file`/`write_file` set one entry. This is a mechanical change in its own PR (M2).
 
@@ -320,10 +319,10 @@ Guards: the ones listed in §5 (protected paths, lifecycle scripts including the
 One PR each, in this order. Only M7 and the addenda need paid runs.
 
 - **(a) M1 Profiles:** `marv-provider/src/profile.rs`, the table and its tests; `needs_cache_breakpoints` delegates to `profile_for(model).cache_breakpoints` (no wire change).
-- **(b) M2 `changed` → `Vec<String>`:** in `ToolOutput`, and its readers. Mechanical, no behaviour change.
+- **(b) M2 `changed` → `Vec<String>`:** in `ToolOutput` (`marv-tools/src/types.rs`), `marv_agent::ToolRun::changed` (`marv-agent/src/agent.rs`), the copy in `marv-session/src/runner.rs::tool_run_from`, and the readers (`session.rs::note_changed`, `diagnostics/turn.rs`). Mechanical, no behaviour change.
 - **(c) M3 apply_patch parser and apply:** `parse_patch`, `edit_match::find_from`, `plan()`, `file_lock::with_file_locks`; the unit tests and the checkpoint-restores-a-deletion test; the module doc rewritten (§2). Not registered.
-- **(d) M4 apply_patch as a tool, with its guards:** the `Tool` impl (preview with `Preview::files`, `protected_target` with `home_rule` on every path, `auto_safe`, run with the formatter); the `run_tool` end-to-end tests and the §5 guards, the home-folder one included. Registered in `builtin_tools`, but offered only with `editTools: "patch"`.
-- **(e) M5 Session wiring, with `auto` → Edit for every model:** `State::specs`, the edit tools chosen on new/clear/resume; `PromptInput::edit_tools`, the prompt variants, the `FIXING_BUGS` gate on "can change files", and the snapshot test over the full offered list; subagents, `SavedSession::edit_tools`, the trajectory `profile`; the `/model` notice, the bash `apply_patch` refusal.
+- **(d) M4 apply_patch as a tool, with its guards:** the `Tool` impl (preview with `Preview::files`, `protected_target` with `home_rule` on every path, `auto_safe`, run with the formatter); the `run_tool` end-to-end tests and the §5 guards, the home-folder one included. Registered in `builtin_tools`, but offered only with `editTools: "patch"`. `docs/SECURITY.md` gains `apply_patch` in the home-folder, protected-path and `package.json` lifecycle bullets: Move sources and destinations are judged as writes.
+- **(e) M5 Session wiring, with `auto` → Edit for every model:** `State::specs`, the edit tools chosen on new/clear/resume; `PromptInput::edit_tools`, the prompt variants, the `FIXING_BUGS` gate on "can change files", and the snapshot test over the full offered list; subagents, `SavedSession::edit_tools`, the trajectory `profile`; the `/model` notice on the resolved edit tools (none before M7 unless `editTools: "patch"`), the bash `apply_patch` refusal.
 - **(f) M6 Bench flag** (shared with #63): `bench.py --marv-config`. Then **ask** to run §7 runs 1–2.
 - **M7 Turn on `auto`** (GPT → patch, paid runs) if run 1 shows a gain and run 2 no regression. Update `docs/subsystems/tools.md`, `session.md` and `provider.md`.
 - **Later, per addendum** (paid runs): a PR with the eval delta in its description.
