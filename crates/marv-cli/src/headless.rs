@@ -520,7 +520,7 @@ pub async fn run_headless(options: HeadlessOptions) -> ExitCode {
             }
             Ok(None) => {
                 eprintln!("marv: the mesh needs {}; running without it.", marv_sandbox::RUNTIME_DIR_RULE);
-                if let Some(why) = marv_sandbox::override_refusal(&env) {
+                if let Some(why) = marv_sandbox::override_refusal_for(&env, Some(&root)) {
                     eprintln!("marv: {}", printable(&why));
                 }
             }

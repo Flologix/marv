@@ -107,6 +107,12 @@ pub fn provider_option(spec: &ChatSpec, model: &str) -> ProviderOption {
     ProviderOption::OpenRouter { api_key: spec.api_key.clone(), model: Some(model.to_string()), base_url: None }
 }
 
+/// Why a chat in `root` has no runtime folder, when it's because `MARV_RUNTIME_DIR` was refused
+/// (`marv_sandbox::override_refusal_for`), printable; `None` otherwise (no override: the mesh is quietly off).
+fn mesh_refused_notice(env: &std::collections::BTreeMap<String, String>, root: &std::path::Path) -> Option<String> {
+    marv_sandbox::override_refusal_for(env, Some(root)).map(|why| format!("Not on the mesh: {}", marv_core::printable(&why)))
+}
+
 /// Runs the chat until `incoming` closes (the page went away). Sends `ready` (with the session's id, for a later
 /// resume) or `fatal` first.
 pub async fn run_chat(spec: ChatSpec, mut incoming: UnboundedReceiver<ClientMessage>, out: UnboundedSender<Value>) {
@@ -116,7 +122,14 @@ pub async fn run_chat(spec: ChatSpec, mut incoming: UnboundedReceiver<ClientMess
     let mut mesh = None;
     if spec.mesh {
         match marv_session::mesh_process::start(&env, &spec.root, std::slice::from_ref(&spec.root)) {
-            Ok(started) => mesh = started,
+            Ok(Some(started)) => mesh = Some(started),
+            // A MARV_RUNTIME_DIR that was refused says why (a symlink on the way, inside the project), as the TUI
+            // does, rather than the chat just being off the mesh (#168).
+            Ok(None) => {
+                if let Some(text) = mesh_refused_notice(&env, &spec.root) {
+                    let _ = out.send(json!({"type": "notice", "text": text}));
+                }
+            }
             Err(e) => {
                 let _ = out.send(json!({"type": "notice", "text": format!("Not on the mesh: {}", marv_core::printable(&e))}));
             }
@@ -523,5 +536,26 @@ mod tests {
             matches!(provider_option(&none, "zai/glm-5.3"), ProviderOption::Zai { ref api_key, .. } if api_key.is_empty()),
             "never the OpenRouter key"
         );
+    }
+
+    #[test]
+    fn a_refused_runtime_dir_override_is_a_notice_that_says_why() {
+        // #168: the desktop said nothing when MARV_RUNTIME_DIR was refused; the CLI, -p and the TUI say why.
+        let base = PathBuf::from(format!("/tmp/mx-web-rt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("proj")).unwrap();
+        let env = |dir: &std::path::Path| {
+            [("MARV_RUNTIME_DIR".to_string(), dir.display().to_string())]
+                .into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let text = mesh_refused_notice(&env(&base.join("proj/marv")), &base.join("proj")).unwrap();
+        assert!(text.starts_with("Not on the mesh: MARV_RUNTIME_DIR") && text.contains("inside the project"), "{text}");
+        let text = mesh_refused_notice(&env(std::path::Path::new("rel/marv")), &base.join("proj")).unwrap();
+        assert!(text.contains("isn't an absolute path"), "{text}");
+        // Accepted, or not set: nothing to say.
+        assert_eq!(mesh_refused_notice(&env(&base.join("marv")), &base.join("proj")), None);
+        assert_eq!(mesh_refused_notice(&Default::default(), &base.join("proj")), None);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

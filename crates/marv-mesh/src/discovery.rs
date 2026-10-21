@@ -70,7 +70,13 @@ const PEER_PLUG: &str = "peer-";
 /// `<runtime>/mesh`, or `None` without a runtime folder Marv may use (`marv_sandbox::runtime_dir`: on Linux
 /// `$XDG_RUNTIME_DIR/marv` when every sandbox hides it, on macOS `/tmp/marv-<uid>`, or `MARV_RUNTIME_DIR`).
 pub fn mesh_dir(env: &marv_mcp::Env) -> Option<PathBuf> {
-    Some(marv_sandbox::runtime_dir(env)?.join("mesh"))
+    mesh_dir_for(env, None)
+}
+
+/// [`mesh_dir`] for a session in `project`: a `MARV_RUNTIME_DIR` inside it is refused (`marv_sandbox::runtime_dir_for`,
+/// #168).
+pub fn mesh_dir_for(env: &marv_mcp::Env, project: Option<&Path>) -> Option<PathBuf> {
+    Some(marv_sandbox::runtime_dir_for(env, project)?.join("mesh"))
 }
 
 /// A session's discovery socket. Session ids are one name segment, so the path can't escape the folder.
@@ -673,7 +679,13 @@ mod tests {
         let env = |v: &str| [("XDG_RUNTIME_DIR".to_string(), v.to_string())].into_iter().collect::<marv_mcp::Env>();
         #[cfg(not(target_os = "macos"))]
         {
-            assert_eq!(mesh_dir(&env("/run/user/1000")), Some(PathBuf::from("/run/user/1000/marv/mesh")));
+            // The runtime folder is made and checked, so it has to be a real private folder of this user's.
+            let xdg = PathBuf::from(format!("/tmp/mx-disc-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&xdg);
+            std::os::unix::fs::DirBuilderExt::mode(&mut std::fs::DirBuilder::new(), 0o700).create(&xdg).unwrap();
+            let got = mesh_dir(&env(xdg.to_str().unwrap()));
+            let _ = std::fs::remove_dir_all(&xdg);
+            assert_eq!(got, Some(xdg.join("marv/mesh")));
             assert_eq!(mesh_dir(&env("relative")), None);
             assert_eq!(mesh_dir(&Default::default()), None);
         }
