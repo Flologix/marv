@@ -16,7 +16,8 @@ use serde_json::{Value, json};
 /// Runs `argv` in a pseudo-terminal of 40×160, appends what it draws to `log`, types each line read from stdin
 /// (with a carriage return), and prints the child's pid first. Once the child has exited (and been reaped), it waits
 /// for everything left in the child's session (`pty.fork` makes it a session leader) to end too, killing it after
-/// 10 s, prints `left <pids>` (what was still running then: nothing, after a clean exit) and exits.
+/// 10 s, prints `left <pids>` (what was still running then: nothing, after a clean exit) and `survived <pids>` (what
+/// was still there 5 s after the SIGKILLs), and exits; `sweep failed: …` if it couldn't list the processes.
 /// A process Marv started in a group of its own (a checkpoint's `git gc`, #191) is still in its session: one that
 /// outlived a killed Marv kept writing into the machine's folder while the test removed it.
 const PTY: &str = r#"
@@ -29,13 +30,22 @@ if pid == 0:
 print(pid, flush=True)
 
 def session():
-    try:
-        found = subprocess.run(["pgrep", "-s", str(pid)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-    except OSError:
-        return []
-    return [int(p) for p in found.stdout.split() if int(p) != pid]
+    # Not `pgrep -s`: macOS's pgrep has no -s. A listing that fails raises: the check never passes for want of one.
+    listed = subprocess.run(["ps", "-A", "-o", "pid="], stdout=subprocess.PIPE, text=True, check=True).stdout.split()
+    if not listed:
+        raise RuntimeError("ps listed no processes")
+    found = []
+    for p in map(int, listed):
+        try:
+            if p != pid and os.getsid(p) == pid:
+                found.append(p)
+        except (ProcessLookupError, PermissionError):
+            pass
+    return found
 
-inputs, exited = [fd, sys.stdin], False
+# Whether getsid sees marv's session (it drew something: it has exec'd, after pty.fork's setsid). If it can't, the
+# sweep would find nothing whatever is running: it fails instead.
+inputs, exited, seen = [fd, sys.stdin], False, None
 with open(log, "ab", buffering=0) as out:
     while not exited:
         exited = os.waitpid(pid, os.WNOHANG)[0] == pid
@@ -47,6 +57,11 @@ with open(log, "ab", buffering=0) as out:
                 data = b""
             if data:
                 out.write(data)
+                if seen is None:
+                    try:
+                        seen = os.getsid(pid) == pid
+                    except OSError:
+                        seen = False
             else:
                 inputs.remove(fd)
         if sys.stdin in ready:
@@ -55,18 +70,26 @@ with open(log, "ab", buffering=0) as out:
                 inputs.remove(sys.stdin)
             elif not exited:
                 os.write(fd, line.rstrip("\n").encode() + b"\r")
-deadline = time.monotonic() + 10
-while session() and time.monotonic() < deadline:
-    time.sleep(0.1)
-left = session()
-for p in left:
-    try:
-        os.kill(p, signal.SIGKILL)
-    except OSError:
-        pass
-while session():
-    time.sleep(0.1)
-print("left", *left, flush=True)
+try:
+    if not seen:
+        raise RuntimeError("couldn't read marv's session id")
+    deadline = time.monotonic() + 10
+    while session() and time.monotonic() < deadline:
+        time.sleep(0.1)
+    left = session()
+    for p in left:
+        try:
+            os.kill(p, signal.SIGKILL)
+        except OSError:
+            pass
+    deadline = time.monotonic() + 5
+    while session() and time.monotonic() < deadline:
+        time.sleep(0.1)
+    print("left", *left, flush=True)
+    print("survived", *session(), flush=True)
+except Exception as e:
+    print("sweep failed:", e, flush=True)
+    sys.exit(1)
 "#;
 
 fn python() -> bool {
@@ -243,16 +266,20 @@ impl Tui {
         let _ = Command::new("kill").args(["-KILL", &self.pid.to_string()]).status();
     }
 
-    /// Ends it and waits until marv and everything in its session has exited. Unless it was killed, it's asked to
-    /// leave (`/exit`, once its prompt is up) and given a minute, as a person would; the pids still running 10 s after
-    /// it exited are returned (then killed).
-    fn exit(&mut self) -> Vec<i32> {
+    /// Ends it and waits until marv and everything in its session has exited. Unless it was killed (or the test is
+    /// already failing: no slow goodbyes then), it's asked to leave (`/exit`, once its prompt is up) and given a minute,
+    /// as a person would. `Ok`: the pids still running 10 s after it exited (then killed); `Err`: the helper's sweep
+    /// failed, or something survived the kill.
+    fn exit(&mut self) -> Result<Vec<i32>, String> {
         if self.done {
-            return Vec::new();
+            return Ok(Vec::new());
+        }
+        if std::thread::panicking() {
+            self.kill();
         }
         if !self.killed {
             let deadline = Instant::now() + Duration::from_secs(60);
-            while !self.ready() && Instant::now() < deadline {
+            while !self.ready() && Instant::now() < deadline && self.child.try_wait().ok().flatten().is_none() {
                 std::thread::sleep(Duration::from_millis(100));
             }
             if let Some(stdin) = self.stdin.as_mut() {
@@ -274,20 +301,27 @@ impl Tui {
         self.done = true;
         let mut report = String::new();
         let _ = self.stdout.read_to_string(&mut report);
-        let left = report.lines().find_map(|l| l.strip_prefix("left")).unwrap_or_default();
-        left.split_whitespace().filter_map(|p| p.parse().ok()).collect()
+        let pids = |prefix: &str| -> Option<Vec<i32>> {
+            let line = report.lines().find_map(|l| l.strip_prefix(prefix))?;
+            Some(line.split_whitespace().filter_map(|p| p.parse().ok()).collect())
+        };
+        match (pids("left"), pids("survived")) {
+            (Some(left), Some(survived)) if survived.is_empty() => Ok(left),
+            (Some(_), Some(survived)) => Err(format!("still running after SIGKILL: {survived:?}")),
+            _ => Err(format!("the helper's sweep didn't finish: {report:?}")),
+        }
     }
 
     /// [`Self::exit`], asserting that a Marv that wasn't killed left nothing running.
     fn quit(mut self) {
-        let left = self.exit();
+        let left = self.exit().unwrap_or_else(|e| panic!("marv {}: {e}", self.pid));
         assert!(left.is_empty(), "still running 10 s after marv {} exited: {left:?}", self.pid);
     }
 }
 
 impl Drop for Tui {
     fn drop(&mut self) {
-        self.exit();
+        let _ = self.exit();
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -344,7 +378,7 @@ fn two_marvs_on_the_radio_see_each_other_and_a_killed_one_is_lost() {
     wait_for("beta lost on alpha's strip", || alpha.screen().contains("left(lost)"));
     wait_for("beta's socket swept", || !machine.socket("beta").exists());
     assert!(machine.socket("alpha").exists() && machine.socket("gamma").exists());
-    beta.exit();
+    beta.exit().unwrap();
     alpha.quit();
     gamma.quit();
 }
