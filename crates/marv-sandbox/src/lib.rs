@@ -51,7 +51,8 @@ pub use paths::{project_path, resolve_in_project, resolve_within, touches_git};
 pub use plan::{Bind, Extra, MESH_SOCKET_ENV, Plan};
 pub use protected::{PROTECTED_PATHS, ProtectedPath, ProtectedRule, is_protected, protected_rule};
 pub use runtime::{
-    RUNTIME_DIR_RULE, override_refusal, override_refusal_for, runtime_dir, runtime_dir_for, runtime_env, runtime_paths,
+    RUNTIME_DIR_RULE, override_refusal, override_refusal_for, private_folder, runtime_dir, runtime_dir_for, runtime_env,
+    runtime_paths,
 };
 pub use taint::TaintState;
 pub use writable::resolve as resolve_writable;

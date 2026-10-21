@@ -177,12 +177,17 @@ fn clear_of_project(paths: &[&Path], own_real: Option<&Path>, project: &Path) ->
 
 /// Makes `dir` this user's private folder, or refuses it. `dir` is absolute and plain (no `.` or `..`); its parent
 /// exists, and the folders on the way pass [`check_ancestors`]. Only the last part is made, 0700 and not recursively;
-/// then it must be a folder, not a symlink, of this user's (an existing one is made 0700 again).
-fn private_folder(dir: &Path) -> std::io::Result<()> {
+/// then it must be a folder, not a symlink, of this user's (an existing one is made 0700 again). Also for the
+/// processes' fallback folder (`marv_session::processes`), one level at a time.
+pub fn private_folder(dir: &Path) -> std::io::Result<()> {
+    private_folder_as(dir, nix::unistd::geteuid().as_raw())
+}
+
+/// [`private_folder`] for `uid` (tests pass another uid: a folder of someone else's can't be made without root).
+fn private_folder_as(dir: &Path, uid: u32) -> std::io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     use std::path::Component;
     let refuse = |why: &str| Err(std::io::Error::other(why.to_string()));
-    let uid = nix::unistd::geteuid().as_raw();
     let mut parts = dir.components();
     if parts.next() != Some(Component::RootDir) || !parts.all(|c| matches!(c, Component::Normal(_))) {
         return refuse("not an absolute, plain path");
@@ -489,6 +494,33 @@ mod tests {
         assert!(why.contains("inside the project"), "{why}");
         let why = clear_of_project(&given, Some(Path::new("/mx-no-such/private/tmp")), project).unwrap_err();
         assert!(why.contains("holds the project"), "{why}");
+    }
+
+    #[test]
+    fn a_private_folder_is_made_0700_and_refused_when_it_isnt_this_users_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = short_temp("pf");
+        // Made 0700; an existing one with a wider mode is made 0700 again.
+        private_folder(&dir).unwrap();
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        private_folder(&dir).unwrap();
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+        // Owned by another uid: refused, its mode left alone.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let uid = nix::unistd::geteuid().as_raw();
+        let why = private_folder_as(&dir, uid + 1).unwrap_err().to_string();
+        assert!(why.contains("isn't a folder of this user's"), "{why}");
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o755);
+        // A symlink to a folder of this user's, or a file: refused.
+        let link = PathBuf::from(format!("{}-l", dir.display()));
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        assert!(private_folder(&link).is_err());
+        std::fs::write(dir.join("f"), "").unwrap();
+        assert!(private_folder(&dir.join("f")).is_err());
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A file system for [`check_ancestors`]: folders and links, every other path missing.
