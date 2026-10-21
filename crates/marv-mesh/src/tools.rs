@@ -239,9 +239,11 @@ fn pane_lines(w: &Wireable, wired: &HashSet<&str>) -> Vec<String> {
                 .peers
                 .iter()
                 .find(|p| p.session != w.session && p.info.pane.as_deref() == Some(pane.pane_id.as_str()))
-                .map(|p| (p.session.as_str(), marv_inbox(p)));
+                .map(|p| (p.session.as_str(), marv_inbox(p), p.info.radio));
+            // #124 (§9.3): a Marv on the radio is never typed into (its pane send is refused): reached by radio_tx.
+            let on_radio = marv.as_ref().is_some_and(|(_, _, radio)| *radio);
             let actions: &[PaneAction] = match marv {
-                Some((_, Some(_))) => &[PaneAction::Status],
+                Some((_, Some(_), _)) | Some((_, _, true)) => &[PaneAction::Status],
                 _ => &[PaneAction::Send, PaneAction::Status],
             };
             let names: Vec<String> = actions
@@ -251,11 +253,19 @@ fn pane_lines(w: &Wireable, wired: &HashSet<&str>) -> Vec<String> {
                 .filter(|r| !wired.contains(r.as_str()))
                 .collect();
             let (agent, state) = (plain(pane.agent.as_deref()), plain(pane.status.as_deref()));
-            let who = marv.as_ref().map(|(name, _)| format!("; Marv {name}")).unwrap_or_default();
+            let who = marv.as_ref().map(|(name, _, _)| format!("; Marv {name}")).unwrap_or_default();
             let mut said = names.join(", ");
-            if let Some((name, Some(inbox))) = marv {
-                let sep = if said.is_empty() { "" } else { ". " };
-                said.push_str(&format!("{sep}This is Marv {name}: mesh_send to its inbox {inbox} to get a reply"));
+            let sep = if said.is_empty() { "" } else { ". " };
+            match marv {
+                Some((name, _, true)) if on_radio => {
+                    said.push_str(&format!(
+                        "{sep}This is Marv {name}, on the radio: radio_tx (kind: request) to it to get a reply"
+                    ));
+                }
+                Some((name, Some(inbox), _)) => {
+                    said.push_str(&format!("{sep}This is Marv {name}: mesh_send to its inbox {inbox} to get a reply"));
+                }
+                _ => {}
             }
             (!said.is_empty()).then(|| format!("- {segment} ({agent}, {state}{who}): {said}"))
         })

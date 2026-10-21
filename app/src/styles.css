@@ -866,6 +866,22 @@ details > summary::-webkit-details-marker {
   gap: 6px;
 }
 
+.approval .why {
+  display: flex;
+  gap: 6px;
+}
+
+.approval .why input {
+  flex: 1;
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid var(--ui-3);
+  border-radius: var(--r);
+  background: var(--bg-2);
+  color: var(--tx);
+  font: inherit;
+}
+
 @keyframes rise {
   from {
     opacity: 0;

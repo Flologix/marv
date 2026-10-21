@@ -207,9 +207,24 @@ check "Linux aarch64" test "$(detected Linux aarch64)" = marv-aarch64-unknown-li
 check "macOS arm64" test "$(detected Darwin arm64)" = marv-aarch64-apple-darwin.tar.gz
 check "macOS Intel" test "$(detected Darwin x86_64 0)" = marv-x86_64-apple-darwin.tar.gz
 check "macOS under Rosetta gets arm64" test "$(detected Darwin x86_64 1)" = marv-aarch64-apple-darwin.tar.gz
-detected FreeBSD amd64 >/dev/null
-out=$(env -u MARV_TARGET PATH="$fakes:$PATH" "$install" --prefix "$prefix" 2>&1) && fail "FreeBSD installed"
-check "another OS has no build" grep -q "no build for FreeBSD" <<<"$out"
+end
+
+# --- an OS without a build (#153): Windows shells point to WSL ---
+begin os
+fake_uname() { # a uname on PATH that says $1 for -s
+	mkdir -p "$prefix/fake"
+	printf '#!/bin/sh\n[ "$1" = -s ] && echo "%s" || echo x86_64\n' "$1" >"$prefix/fake/uname"
+	chmod 755 "$prefix/fake/uname"
+}
+for os in MINGW64_NT-10.0-22631 MSYS_NT-10.0 CYGWIN_NT-10.0; do
+	fake_uname "$os"
+	out=$(env -u MARV_TARGET PATH="$prefix/fake:$PATH" "$install" --prefix "$prefix" 2>&1) && fail "$os installed"
+	check "$os: use WSL" grep -q "use WSL.*wsl --install.*#requirements" <<<"$out"
+done
+fake_uname FreeBSD
+out=$(env -u MARV_TARGET PATH="$prefix/fake:$PATH" "$install" --prefix "$prefix" 2>&1) && fail "FreeBSD installed"
+check "another OS: Linux and macOS, or WSL" grep -q "no build for FreeBSD: Marv runs on Linux and macOS (on Windows, inside WSL" <<<"$out"
+check "nothing installed" test ! -e "$bin/marv"
 end
 
 # --- the real binary runs (only with MARV_TEST_BINARY) ---

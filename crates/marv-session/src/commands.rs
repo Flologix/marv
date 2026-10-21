@@ -116,6 +116,13 @@ pub enum CommandAction {
         to: Vec<String>,
         text: String,
     },
+    /// marv-rs #124 (phase 3): `/ask @name text`, the person's request on the radio (`by: user`, hop 0): one Marv,
+    /// which acknowledges and reports `done` or `failed` when the turn that handled it ends. Nothing of it reaches
+    /// this Marv's own model; the reports do, fenced, at its next turn.
+    Ask {
+        to: String,
+        text: String,
+    },
     /// Stop one of the session's background processes (Marv #51).
     Processes {
         stop: String,
@@ -178,6 +185,8 @@ pub struct CommandContext<'a> {
     pub processes: Option<&'a [marv_tools::ProcessInfo]>,
     /// The session's switchboard as `/mesh` shows it; None when this Marv isn't on the mesh.
     pub mesh: Option<&'a MeshStatus>,
+    /// The session's grants for `/permissions` (#82); None: the client has none to show.
+    pub permissions: Option<&'a crate::permissions::Permissions>,
 }
 
 pub struct Command {
@@ -313,6 +322,28 @@ pub fn commands() -> &'static [Command] {
             run: |args, ctx| match on_off(args, "Usage: /yolo, /yolo on, or /yolo off") {
                 Ok(on) => CommandAction::Yolo { on: on.unwrap_or(!ctx.config.yolo) },
                 Err(e) => e,
+            },
+        },
+        Command {
+            name: "permissions",
+            // Only shows: the palette may run it while a reply streams.
+            while_busy: true,
+            description: "What Marv may do without asking: this session's approvals, and what's saved",
+            run: |args, ctx| {
+                if !args.trim().is_empty() {
+                    return error(crate::permissions::PERMISSIONS_USAGE);
+                }
+                match ctx.permissions {
+                    None => print("Permissions aren't available here."),
+                    Some(p) => {
+                        let saved = crate::permissions::SavedGrants {
+                            path: &ctx.config_path,
+                            approve: &ctx.config.approve,
+                            writable: &ctx.config.writable,
+                        };
+                        markdown(crate::permissions::permissions_text(p, Some(saved), ctx.mcp.map(|m| m.0)))
+                    }
+                }
             },
         },
         Command {
@@ -458,6 +489,21 @@ pub fn commands() -> &'static [Command] {
                 match parse_tx(args) {
                     Some((to, text)) => CommandAction::Tx { to, text },
                     None => error("Usage: /tx @name text (one Marv; several: @a @b), or /tx text (every Marv on the radio)"),
+                }
+            },
+        },
+        Command {
+            name: "ask",
+            // Sending doesn't touch a running turn: the palette may run it.
+            while_busy: true,
+            description: "Ask another Marv on the radio to do something: /ask @name text (it acknowledges, then reports back)",
+            run: |args, ctx| {
+                if !ctx.config.mesh_radio {
+                    return print(RADIO_OFF);
+                }
+                match parse_tx(args) {
+                    Some((to, text)) if to.len() == 1 => CommandAction::Ask { to: to[0].clone(), text },
+                    _ => error("Usage: /ask @name text (a request goes to exactly one Marv on the radio)"),
                 }
             },
         },
@@ -719,7 +765,7 @@ pub fn diagnostics_status(config: &Config) -> String {
 }
 
 /// `/radio` with the radio off (#124).
-pub const RADIO_OFF: &str = "The radio is off. /radio on puts this Marv on it (saved as \"mesh\": {\"radio\": true} in your own ~/.marv/config.json): your Marvs on this machine with the radio on see each other's state (idle, working, waiting) and conversation title, in the strip above the prompt, and can send each other short messages (/tx). A message reaches the other Marvs' models as data from another agent, never as their user's words.";
+pub const RADIO_OFF: &str = "The radio is off. /radio on puts this Marv on it (saved as \"mesh\": {\"radio\": true} in your own ~/.marv/config.json): your Marvs on this machine with the radio on see each other's state (idle, working, waiting) and conversation title, in the strip above the prompt, and can send each other short messages (/tx) and requests (/ask). A message reaches the other Marvs' models as data from another agent, never as their user's words.";
 
 /// `/tx`'s words: leading `@name`s (none: everyone), then the text. `None` without text.
 pub fn parse_tx(args: &str) -> Option<(Vec<String>, String)> {
@@ -1128,8 +1174,31 @@ mod tests {
             sandbox_available: true,
             processes: None,
             mesh: None,
+            permissions: None,
         };
         f(&ctx)
+    }
+
+    // #82: /permissions only shows; without the session's grants it says so, with them it renders them as markdown.
+    #[test]
+    fn permissions_shows_the_grants_and_takes_no_arguments() {
+        with(|ctx| {
+            assert_eq!(run_command("/permissions", ctx), print("Permissions aren't available here."));
+            assert!(matches!(run_command("/permissions revoke", ctx), CommandAction::Print { is_error: true, .. }));
+            let grants = crate::permissions::Permissions {
+                remembered: vec!["bash:git:git commit".into()],
+                pre_approved: vec!["web".into()],
+                ..Default::default()
+            };
+            let shown = CommandContext { permissions: Some(&grants), ..ctx.clone() };
+            let CommandAction::Print { text, is_error: false, markdown: true } = run_command("/permissions", &shown) else {
+                panic!()
+            };
+            assert!(text.contains("- Git commands that write: `git commit`"), "{text}");
+            assert!(text.contains("- `web` (from --approve)"), "{text}");
+            assert!(text.contains("- ~/.marv/config.json: no `approve` or `writable`"), "{text}");
+            assert!(commands().iter().any(|c| c.name == "permissions" && c.while_busy));
+        });
     }
 
     #[test]
@@ -1175,6 +1244,23 @@ mod tests {
             let ctx = CommandContext { config: &on, ..ctx.clone() };
             assert_eq!(run_command("/tx @b2 hi", &ctx), CommandAction::Tx { to: vec!["b2".into()], text: "hi".into() });
             assert!(matches!(run_command("/tx", &ctx), CommandAction::Print { is_error: true, .. }));
+        });
+    }
+
+    /// #124, phase 3: `/ask` takes exactly one name, then the text.
+    #[test]
+    fn ask_takes_one_name_then_the_text() {
+        with(|ctx| {
+            assert!(matches!(run_command("/ask @b2 hi", ctx), CommandAction::Print { is_error: false, .. }), "the radio is off");
+            let on = Config { mesh_radio: true, ..ctx.config.clone() };
+            let ctx = CommandContext { config: &on, ..ctx.clone() };
+            assert_eq!(
+                run_command("/ask @b2 run the e2e suite", &ctx),
+                CommandAction::Ask { to: "b2".into(), text: "run the e2e suite".into() }
+            );
+            for bad in ["/ask", "/ask run it", "/ask @a @b run it", "/ask @all run it", "/ask @b2"] {
+                assert!(matches!(run_command(bad, &ctx), CommandAction::Print { is_error: true, .. }), "{bad}");
+            }
         });
     }
 

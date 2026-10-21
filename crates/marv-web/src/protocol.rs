@@ -22,6 +22,8 @@ pub enum ClientMessage {
         line: String,
     },
     Interrupt,
+    /// `decision`: `"yes"`, `"always"`, `"no"`, or `{"declined": "<reason>"}` (#185: not run, the reason goes to the
+    /// model and the turn goes on).
     Approval {
         id: u64,
         decision: Decision,
@@ -73,6 +75,10 @@ mod tests {
         let answer: ClientMessage = serde_json::from_str(r#"{"type":"approval","id":3,"decision":"always"}"#).unwrap();
         assert!(matches!(answer, ClientMessage::Approval { id: 3, decision: Decision::Always }));
         assert!(serde_json::from_str::<ClientMessage>(r#"{"type":"approval","id":3,"decision":"maybe"}"#).is_err());
+        // #185: declined with a reason.
+        let reason: ClientMessage =
+            serde_json::from_str(r#"{"type":"approval","id":4,"decision":{"declined":"use pnpm"}}"#).unwrap();
+        assert!(matches!(reason, ClientMessage::Approval { id: 4, decision: Decision::Declined(r) } if r == "use pnpm"));
         assert!(matches!(serde_json::from_str(r#"{"type":"interrupt"}"#).unwrap(), ClientMessage::Interrupt));
     }
 }

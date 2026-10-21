@@ -13,6 +13,8 @@ struct Pending {
     answer: oneshot::Sender<Decision>,
     /// Yes or no only: an "always" counts as one yes.
     once: bool,
+    /// A reason may come with a no (#185: a model's call); otherwise a decline with a reason is a plain no.
+    reason: bool,
 }
 
 pub struct WebApprover {
@@ -33,7 +35,17 @@ impl WebApprover {
     /// The person's answer to request `id`; an unknown id (already answered, or cancelled) is ignored.
     pub fn answer(&self, id: u64, decision: Decision) {
         if let Some(p) = self.pending().remove(&id) {
-            let decision = if p.once && decision == Decision::Always { Decision::Yes } else { decision };
+            let decision = match decision {
+                Decision::Always if p.once => Decision::Yes,
+                // #185: a reason is read here as the engine reads it (one line, at most MAX_DECLINE_REASON), so the
+                // page's `approval_done` shows what the model gets; an empty one is a plain no.
+                Decision::Declined(_) if !p.reason => Decision::No,
+                Decision::Declined(reason) => match marv_core::decline_reason(&reason) {
+                    read if read.is_empty() => Decision::No,
+                    read => Decision::Declined(read),
+                },
+                decision => decision,
+            };
             let _ = p.answer.send(decision);
         }
     }
@@ -58,13 +70,18 @@ impl Approver for WebApprover {
         let (answer, answered) = oneshot::channel();
         // A person must answer `must_ask` every time, so there's no "always" for it either.
         let once = request.once || request.must_ask;
-        self.pending().insert(id, Pending { answer, once });
+        self.pending().insert(id, Pending { answer, once, reason: request.reason });
         if self.out.send(request_json(id, &request, once)).is_err() {
             self.pending().remove(&id);
             return Decision::Unavailable;
         }
         let decision = answered.await.unwrap_or(Decision::No);
-        let _ = self.out.send(json!({"type": "approval_done", "id": id, "decision": decision}));
+        // A decline with a reason (#185) is "declined" on the page, the reason with it (the person's own text).
+        let done = match &decision {
+            Decision::Declined(reason) => json!({"type": "approval_done", "id": id, "decision": "declined", "reason": reason}),
+            decision => json!({"type": "approval_done", "id": id, "decision": decision}),
+        };
+        let _ = self.out.send(done);
         decision
     }
 }
@@ -87,6 +104,7 @@ fn request_json(id: u64, r: &ApprovalRequest, once: bool) -> Value {
         "network": r.network,
         "once": once,
         "mustAsk": r.must_ask,
+        "reason": r.reason,
     })
 }
 
@@ -98,6 +116,7 @@ mod tests {
 
     fn request(once: bool) -> ApprovalRequest {
         ApprovalRequest {
+            reason: true,
             tool: "bash".into(),
             label: "git commit".into(),
             preview: Preview { title: "Run a command".into(), command: Some("git commit".into()), ..Preview::default() },
@@ -145,6 +164,42 @@ mod tests {
         });
         assert_eq!(page.recv().await.unwrap()["type"], "approval");
         approver.cancel_all();
+        assert_eq!(asking.await.unwrap(), Decision::No);
+    }
+
+    #[tokio::test]
+    async fn a_reason_reaches_the_call_and_the_page_shows_it_declined() {
+        let (out, mut page) = tokio::sync::mpsc::unbounded_channel();
+        let approver = Arc::new(WebApprover::new(out));
+        let asking = tokio::spawn({
+            let approver = approver.clone();
+            async move { approver.approve(request(true)).await }
+        });
+        let id = page.recv().await.unwrap()["id"].as_u64().unwrap();
+        approver.answer(id, Decision::Declined(format!("not on\nmain{}", "!".repeat(marv_tools::MAX_DECLINE_REASON))));
+        let read = format!("not on main{}", "!".repeat(marv_tools::MAX_DECLINE_REASON - 11));
+        assert_eq!(asking.await.unwrap(), Decision::Declined(read.clone()), "one line, cut at the limit");
+        let done = page.recv().await.unwrap();
+        assert_eq!((done["decision"].as_str(), done["reason"].as_str()), (Some("declined"), Some(read.as_str())));
+
+        // An empty reason is a plain no.
+        let asking = tokio::spawn({
+            let approver = approver.clone();
+            async move { approver.approve(request(false)).await }
+        });
+        let id = page.recv().await.unwrap()["id"].as_u64().unwrap();
+        approver.answer(id, Decision::Declined(" \n ".into()));
+        assert_eq!(asking.await.unwrap(), Decision::No);
+        assert_eq!(page.recv().await.unwrap()["decision"], "no");
+
+        // Not a model's call (/undo, /mcp add): no reason is offered, and one sent anyway is a plain no.
+        let asking = tokio::spawn({
+            let approver = approver.clone();
+            async move { approver.approve(ApprovalRequest { reason: false, ..request(false) }).await }
+        });
+        let shown = page.recv().await.unwrap();
+        assert_eq!(shown["reason"], false);
+        approver.answer(shown["id"].as_u64().unwrap(), Decision::Declined("because".into()));
         assert_eq!(asking.await.unwrap(), Decision::No);
     }
 

@@ -125,7 +125,7 @@ pub trait WireApprover: Send + Sync {
 }
 
 /// The answer to [`WireApprover::approve_call`]'s one prompt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallWire {
     /// Yes to both: the wire (granted by this) and the call.
     Granted(WireBy),
@@ -148,6 +148,7 @@ const WIRE_LASTS: &str = "The wire lasts until either agent ends.";
 pub fn wire_approval(request: &WireRequest) -> ApprovalRequest {
     let (from, to, mode) = (&request.from, &request.to, request.mode);
     ApprovalRequest {
+        reason: false,
         tool: "mesh_wire".into(),
         label: request.title(),
         preview: Preview {
@@ -197,7 +198,7 @@ impl WireApprover for PersonWires {
     async fn approve_wire(&self, request: WireRequest) -> Option<WireBy> {
         match self.inner.approve(wire_approval(&request)).await {
             Decision::Yes | Decision::Always => Some(self.by),
-            Decision::No | Decision::Unavailable => None,
+            Decision::No | Decision::Declined(_) | Decision::Unavailable => None,
         }
     }
 
@@ -257,11 +258,37 @@ pub fn inbox_note(mesh: &Switchboard, agent: &PlugId, taint: &TaintState) -> Opt
     inbox_note_with(mesh, agent, taint, &RadioRead::Skip)
 }
 
-/// [`inbox_note`], reading the radio as `radio` says.
+/// [`inbox_note`], reading the radio as `radio` says, between steps: radio requests wait for the next turn's start
+/// (#124, phase 3), the rest is read.
 pub fn inbox_note_with(mesh: &Switchboard, agent: &PlugId, taint: &TaintState, radio: &RadioRead) -> Option<String> {
+    inbox_read(mesh, agent, taint, radio, false).map(|read| read.note)
+}
+
+/// What a read of the inbox (and the radio) gave the model: the note, and the radio requests in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboxRead {
+    pub note: String,
+    /// The radio requests read (only ever at a turn's start): the turn that read them reports on them at its end.
+    pub requests: Vec<marv_mesh::radio::RadioMessage>,
+}
+
+/// The unread messages in `agent`'s inbox and (as `radio` says, for the main agent) the radio's, fenced, as one note
+/// for the model; marks the session tainted (Mesh) first. Radio requests are read only `at_start` of a turn (§7.2):
+/// between steps they stay queued for the next one.
+pub fn inbox_read(
+    mesh: &Switchboard,
+    agent: &PlugId,
+    taint: &TaintState,
+    radio: &RadioRead,
+    at_start: bool,
+) -> Option<InboxRead> {
     let messages = mesh.drain_inbox(agent);
     let read = agent.as_str() == PARENT && !matches!(radio, RadioRead::Skip);
-    let radio_messages = if read { mesh.drain_radio() } else { Vec::new() };
+    let radio_messages = match (read, at_start) {
+        (false, _) => Vec::new(),
+        (true, true) => mesh.drain_radio(),
+        (true, false) => mesh.drain_radio_but_requests(),
+    };
     if messages.is_empty() && radio_messages.is_empty() {
         return None;
     }
@@ -273,7 +300,8 @@ pub fn inbox_note_with(mesh: &Switchboard, agent: &PlugId, taint: &TaintState, r
     }
     let mut notes: Vec<String> = messages.iter().map(|m| m.fenced()).collect();
     notes.extend(marv_mesh::radio::radio_note(&radio_messages));
-    Some(notes.join("\n\n"))
+    let requests = radio_messages.into_iter().filter(|m| m.kind == marv_mesh::radio::Kind::Request).collect();
+    Some(InboxRead { note: notes.join("\n\n"), requests })
 }
 
 /// `after_step` that also reads the agent's inbox (and the radio as `radio` says): its messages follow the step's own
@@ -687,7 +715,7 @@ mod tests {
     impl Approver for Person {
         async fn approve(&self, request: ApprovalRequest) -> Decision {
             self.1.lock().unwrap().push(request);
-            self.0
+            self.0.clone()
         }
     }
 
@@ -1182,7 +1210,7 @@ mod tests {
         };
         for (answer, wakes) in [(Decision::No, false), (Decision::Yes, true)] {
             let worker = mesh.plug_next(WORKER).unwrap();
-            let person = Arc::new(Person(answer, Mutex::default()));
+            let person = Arc::new(Person(answer.clone(), Mutex::default()));
             let mut ctx = ToolContext::new(std::env::temp_dir());
             ctx.approver = Some(person.clone());
             let wires = wire_approver(None, Some(&(person.clone() as Arc<dyn Approver>)));

@@ -135,6 +135,7 @@ pub fn approval_request(request: &marv_tools::ApprovalRequest) -> view::Approval
         (w, why) => w.or(why),
     };
     view::ApprovalRequest {
+        reason: request.reason,
         tool: request.tool.clone(),
         label: request.label.clone(),
         preview: view::Preview {
@@ -203,7 +204,8 @@ pub fn tool_status(run: &marv_agent::ToolRun) -> view::ToolStatus {
     } else {
         result.summary.clone()
     };
-    let status = if run.declined {
+    // A call declined with a reason (#185) didn't run either, though its turn goes on.
+    let status = if run.declined || run.approval == marv_agent::ApprovalRecord::Declined {
         view::ToolState::Declined
     } else if result.is_error {
         view::ToolState::Error
@@ -387,6 +389,8 @@ pub fn map_event(
             notice.map(|text| system(text, false)).into_iter().collect()
         }
         SessionEvent::Tainted { source } => vec![system(tainted_text(source), false)],
+        // #124: Marv's line about a radio report it sent (checked names and fixed words; printable anyway).
+        SessionEvent::RadioNote { text } => vec![system(printable(&format!("✻ {text}")), false)],
         SessionEvent::CheckpointFailed { message } => {
             vec![system(format!("This turn can't be undone: its checkpoint failed ({message})."), true)]
         }
@@ -846,6 +850,7 @@ fn decision(d: view::Decision) -> marv_tools::Decision {
         view::Decision::Yes => marv_tools::Decision::Yes,
         view::Decision::Always => marv_tools::Decision::Always,
         view::Decision::No => marv_tools::Decision::No,
+        view::Decision::Declined(reason) => marv_tools::Decision::Declined(reason),
     }
 }
 
@@ -1759,6 +1764,7 @@ impl Bridge {
             }
             CommandAction::Radio { on } => self.turn_radio(on).await,
             CommandAction::Tx { to, text } => self.tx(to, &text),
+            CommandAction::Ask { to, text } => self.ask(&to, &text),
             CommandAction::RadioView => match self.radio() {
                 Some(radio) if radio.is_on() => self.emit(UiEvent::OpenRadio),
                 Some(_) => self.emit(system(commands::RADIO_OFF, false)),
@@ -1962,10 +1968,17 @@ impl Bridge {
         self.activity.report();
         let (me, stop) = (Arc::downgrade(self), self.mesh_watch.clone());
         let mut changes = radio.subscribe();
+        let watched = radio.clone();
         tokio::spawn(async move {
+            // Reports already in the traffic list when the TUI started aren't new.
+            let mut shown = std::collections::HashSet::new();
+            for t in watched.traffic_list() {
+                shown.insert(format!("{}>{}", t.id, t.reply_to.unwrap_or_default()));
+            }
             loop {
                 if let Some(bridge) = me.upgrade() {
                     bridge.emit(UiEvent::Radio(bridge.radio_view()));
+                    bridge.show_reports(&watched, &mut shown);
                 }
                 tokio::select! {
                     _ = stop.cancelled() => return,
@@ -2003,14 +2016,20 @@ impl Bridge {
         let traffic = radio
             .traffic_list()
             .into_iter()
-            .map(|t| view::RadioTraffic {
-                at_ms: t.at_ms,
-                id: t.id,
-                outgoing: t.outgoing,
-                peers: t.peers,
-                by: t.by.as_str().to_string(),
-                text: t.text,
-                refused: t.refused,
+            .map(|t| {
+                let request = if t.kind == marv_mesh::radio::Kind::Request { Some(t.id.as_str()) } else { t.reply_to.as_deref() }
+                    .map(marv_mesh::radio::short_id);
+                view::RadioTraffic {
+                    at_ms: t.at_ms,
+                    id: t.id,
+                    outgoing: t.outgoing,
+                    peers: t.peers,
+                    by: t.by.as_str().to_string(),
+                    kind: t.kind.as_str().to_string(),
+                    request,
+                    text: t.text,
+                    refused: t.refused,
+                }
             })
             .collect();
         view::RadioView { on: true, me: radio.name.clone(), my_title: radio.presence().title, peers, traffic }
@@ -2041,6 +2060,43 @@ impl Bridge {
                     self.emit(system(printable(&format!("Radio: not sent to {peer}: {why}.")), true));
                 }
             }
+        }
+    }
+
+    /// `/ask @name text`: the person's request on the radio (#124, phase 3; `by: user`, hop 0): one Marv, which
+    /// acknowledges and reports back. One line in Marv's voice here; nothing of it reaches this Marv's own model (the
+    /// ack and the report do, fenced, at its next turn).
+    fn ask(&self, to: &str, text: &str) {
+        let Some(radio) = self.radio().filter(|r| r.is_on()) else {
+            return self.emit(system(commands::RADIO_OFF, false));
+        };
+        match radio.send_request(to, marv_mesh::radio::By::User, 0, text) {
+            Err(err) => self.emit(system(format!("Radio: not sent: {}", printable(&err)), true)),
+            Ok(id) => {
+                let view = self.radio_view();
+                let peer = radio.resolve(to).unwrap_or_else(|_| to.to_string());
+                let short = marv_tui::ui::radio_view::short_name(&view, &peer);
+                let request = marv_mesh::radio::short_id(&id);
+                self.emit(system(printable(&format!("✻ Radio → @{short} request {request}: {text}")), false));
+            }
+        }
+    }
+
+    /// A report on one of this Marv's requests came in (#124): a line in the transcript for the person, in Marv's
+    /// voice with the report's text (printable). The model reads it fenced at its next turn, as any radio traffic.
+    fn show_reports(&self, radio: &Radio, shown: &mut std::collections::HashSet<String>) {
+        for t in radio.traffic_list() {
+            let report = matches!(t.kind, marv_mesh::radio::Kind::Done | marv_mesh::radio::Kind::Failed);
+            if t.outgoing
+                || !report
+                || t.refused.is_some()
+                || !shown.insert(format!("{}>{}", t.id, t.reply_to.clone().unwrap_or_default()))
+            {
+                continue;
+            }
+            let from = t.peers.first().cloned().unwrap_or_default();
+            let short = t.reply_to.as_deref().map(|r| format!(" {}", marv_mesh::radio::short_id(r))).unwrap_or_default();
+            self.emit(system(printable(&format!("✻ Radio ← {from} {}{short}: {}", t.kind.as_str(), t.text)), false));
         }
     }
 
@@ -2409,6 +2465,7 @@ impl Bridge {
         let trajectories_path = self.trajectories_dir.as_ref().map(|d| shorten_home(d, &self.home));
         let processes = self.session.processes();
         let checkpoint_problem = self.session.checkpoint_problem();
+        let permissions = self.session.permissions();
         let mesh = self.session.mesh().map(|mesh| {
             let inbox = marv_mesh::ReceptacleName::inbox(&marv_session::mesh::parent_id());
             commands::MeshStatus {
@@ -2438,6 +2495,7 @@ impl Bridge {
             sandbox_available: self.sandbox_available,
             processes: self.session.processes_offered().then_some(&processes[..]),
             mesh: mesh.as_ref(),
+            permissions: Some(&permissions),
         };
         commands::run_command(line, &ctx)
     }
@@ -2660,16 +2718,17 @@ impl SessionPort for Port {
 /// Pre-approved scopes (#98): the config's "approve" and this run's --approve, merged and deduped, seeded as
 /// "always" for the session through the session's own path (so must_ask and taint still win; a subagent inherits
 /// neither). An unknown name is a problem for the startup notice, never a silent approval.
-pub fn merge_pre_approved(mut from_config: Vec<String>, from_cli: &[String]) -> (Vec<String>, Vec<String>) {
-    let mut problems = Vec::new();
-    for name in from_cli {
-        match marv_session::approvals::parse_approvals(std::slice::from_ref(name)) {
-            Ok(_) if !from_config.contains(name) => from_config.push(name.clone()),
-            Ok(_) => {}
-            Err(problem) => problems.push(problem),
+/// The config's names are checked like --approve's (#82): an unknown one is dropped with a problem, the rest kept.
+pub fn merge_pre_approved(from_config: Vec<String>, from_cli: &[String]) -> (Vec<String>, Vec<String>) {
+    let (mut names, mut problems) = marv_session::approvals::known_names(&from_config, "\"approve\" in your config");
+    let (cli, cli_problems) = marv_session::approvals::known_names(from_cli, "--approve");
+    problems.extend(cli_problems);
+    for name in cli {
+        if !names.contains(&name) {
+            names.push(name);
         }
     }
-    (from_config, problems)
+    (names, problems)
 }
 
 /// Extra writable sandbox folders (#98): resolved once here (refused entries are problems, never mounts).
@@ -2892,7 +2951,10 @@ mod tests {
         assert!(problems.is_empty());
         let (scopes, problems) = merge_pre_approved(vec!["web".into()], &["netwrk".to_string()]);
         assert_eq!(scopes, ["web"], "the typo doesn't reach the session");
-        assert!(problems[0].contains("Unknown --approve scope"), "{:?}", problems);
+        assert!(problems[0].contains("Unknown --approve scope"), "{:?}", problems); // #82 review: the config's own names are checked the same way.
+        let (scopes, problems) = merge_pre_approved(vec!["web".into(), "netwrk".into()], &[]);
+        assert_eq!(scopes, ["web"]);
+        assert!(problems[0].starts_with("\"approve\" in your config: Unknown --approve scope \"netwrk\""), "{problems:?}");
     }
     use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -3306,16 +3368,8 @@ mod tests {
 
         /// #124: a radio message straight into the radio queue, as a link delivers one.
         fn radio_message(mesh: &Mesh, seq: u64, to_all: bool, text: &str) {
-            let message = marv_mesh::radio::RadioMessage {
-                id: format!("beta:{seq}"),
-                from: "beta".into(),
-                to_all,
-                by: marv_mesh::radio::By::User,
-                reply_to: None,
-                hop: 0,
-                text: text.into(),
-                at_ms: 0,
-            };
+            let message =
+                marv_mesh::radio::RadioMessage::msg(&format!("beta:{seq}"), "beta", to_all, marv_mesh::radio::By::User, 0, text);
             assert!(mesh.sb.deliver_radio(message, 50));
         }
 
@@ -3932,6 +3986,61 @@ mod tests {
         assert_eq!((saved.provider, saved.model.as_deref()), (Some(ProviderKind::Ollama), Some("qwen3.5:9b")));
     }
 
+    // #82: /permissions shows the pre-approved scopes and an "always" answer, and never reaches the model.
+    #[tokio::test]
+    async fn permissions_lists_the_sessions_grants_and_stays_off_the_conversation() {
+        let dirs = Dirs::new();
+        let replies = vec![write("c1", "made.txt", "hello\n"), say("Created it.")];
+        let mut s = startup(&dirs, Some(asks()), replies, None);
+        s.pre_approved = vec!["web".into()];
+        let (tx, mut rx) = unbounded_channel();
+        let bridge = Bridge::start(s, tx).unwrap();
+        let port = Port(bridge.clone());
+        port.send("make a file".into());
+        let seen = until(&mut rx, |e| matches!(e, UiEvent::Approval { .. })).await;
+        let Some(UiEvent::Approval { id, .. }) = seen.last() else { unreachable!() };
+        port.answer(*id, view::Decision::Always);
+        until(&mut rx, |e| matches!(e, UiEvent::TurnEnd { .. })).await;
+        let (conversation, system) = (bridge.session.conversation(), bridge.session.system_prompt());
+        port.run_command("/permissions".into());
+        let shown = texts(&[until(&mut rx, |e| matches!(e, UiEvent::Message(_))).await.pop().unwrap()]);
+        assert!(shown[0].contains("**Permissions**"), "{shown:?}");
+        assert!(shown[0].contains("- `web` (from --approve): web_fetch from any site"), "{shown:?}");
+        assert!(shown[0].contains("- File changes: (all)"), "{shown:?}");
+        assert!(shown[0].contains("**Yolo**: off"), "{shown:?}");
+        assert_eq!(bridge.session.conversation(), conversation, "nothing of it joins the history");
+        assert_eq!(bridge.session.system_prompt(), system, "nor the system prompt");
+    }
+
+    // #82 review: config ["web", "netwrk"]: web is seeded and listed, netwrk is warned about and listed nowhere.
+    #[tokio::test]
+    async fn an_unknown_config_scope_is_warned_about_and_not_listed() {
+        let dirs = Dirs::new();
+        // No config file: the notice ends with setup opening, as in the test below.
+        let mut s = startup(&dirs, None, vec![], None);
+        (s.pre_approved, s.approval_problems) = merge_pre_approved(vec!["web".into(), "netwrk".into()], &[]);
+        let (tx, mut rx) = unbounded_channel();
+        let bridge = Bridge::start(s, tx).unwrap();
+        bridge.announce(None);
+        let seen = until(&mut rx, |e| matches!(e, UiEvent::OpenSetup(_))).await;
+        let notice: Vec<String> = seen
+            .iter()
+            .filter_map(|e| if let UiEvent::Message(m) = e { m.notice.as_ref() } else { None })
+            .flat_map(|n| {
+                n.items.iter().flat_map(|i| std::iter::once(i.text.clone()).chain(i.detail.clone().unwrap_or_default()))
+            })
+            .collect();
+        let notice = notice.join("\n");
+        assert!(notice.contains("Pre-approved for this session: web\n"), "{notice}");
+        assert!(notice.contains("Unknown --approve scope \"netwrk\""), "warned: {notice}");
+        assert!(bridge.session.permissions().pre_approved == ["web"]);
+        Port(bridge.clone()).run_command("/permissions".into());
+        let shown = texts(&[until(&mut rx, |e| matches!(e, UiEvent::Message(_))).await.pop().unwrap()]);
+        assert!(shown[0].contains("- `web`"), "{shown:?}");
+        assert!(!shown[0].contains("netwrk"), "{shown:?}");
+        assert!(!bridge.session.system_prompt().contains("netwrk"));
+    }
+
     // #98: the startup notice names what's pre-approved, which extra folders are writable, and any problem.
     #[tokio::test]
     async fn the_startup_notice_names_pre_approved_scopes_and_writable_folders() {
@@ -4023,6 +4132,7 @@ mod tests {
     #[test]
     fn approvals_carry_the_protected_paths_reason() {
         let request = marv_tools::ApprovalRequest {
+            reason: false,
             tool: "write_file".into(),
             label: ".envrc".into(),
             preview: marv_tools::Preview { title: "Create .envrc".into(), ..Default::default() },
@@ -4057,6 +4167,79 @@ mod tests {
         let view = marv_tui::ui::approval::ApprovalView::new(shown, 0, true);
         let labels: Vec<&str> = view.select.items.iter().map(|i| i.label.as_str()).collect();
         assert_eq!(labels, ["Yes (wire it)", "No"]);
+    }
+
+    /// #185: a model's call (run_tool's request sets `reason`) reaches the TUI still offering "No, and say why";
+    /// the step-limit question, /undo and a call needing a new wire don't.
+    #[test]
+    fn only_a_models_call_offers_a_reason_in_the_tui() {
+        use marv_mesh::{PlugId, ReceptacleName, WireMode, approval::WireRequest};
+        use marv_session::checkpoints::store::{Checkpoint, CheckpointKind};
+        let model_call = marv_tools::ApprovalRequest {
+            reason: true,
+            tool: "bash".into(),
+            label: "bun test".into(),
+            preview: marv_tools::Preview {
+                title: "Run a command".into(),
+                command: Some("bun test".into()),
+                ..Default::default()
+            },
+            scope: marv_tools::Scope { key: "bash::bun test".into(), description: "this exact command".into() },
+            agent: None,
+            network: false,
+            once: false,
+            must_ask: false,
+            protected: None,
+            door: None,
+        };
+        let shown = approval_request(&model_call);
+        assert!(shown.reason);
+        let view = marv_tui::ui::approval::ApprovalView::new(shown, 0, true);
+        assert!(view.select.items.iter().any(|i| i.label.starts_with("No, and say why")));
+
+        let checkpoint = |kind| Checkpoint { sha: "a".into(), tree: "b".into(), turn: 1, kind, label: "x".into() };
+        let undo = marv_session::UndoPlan {
+            turn: 1,
+            label: "add the parser".into(),
+            before: checkpoint(CheckpointKind::Before),
+            after: checkpoint(CheckpointKind::After),
+            files: Vec::new(),
+            not_restored: Vec::new(),
+            head: "a".into(),
+            targets: Default::default(),
+        };
+        let wire = WireRequest {
+            from: PlugId::new("parent").unwrap(),
+            to: ReceptacleName::new("peer.web.agent.parent.inbox").unwrap(),
+            mode: WireMode::Send,
+            asked_by: PlugId::new("parent").unwrap(),
+        };
+        let call = marv_tools::Preview { title: "Send a message".into(), ..Default::default() };
+        for request in [
+            marv_session::runner::step_limit_request(25, 25),
+            marv_session::undo_request(&undo),
+            marv_session::mesh::call_wire_approval(&wire, call),
+        ] {
+            let tool = request.tool.clone();
+            let shown = approval_request(&request);
+            assert!(!shown.reason, "{tool}");
+            let view = marv_tui::ui::approval::ApprovalView::new(shown, 0, true);
+            assert!(!view.select.items.iter().any(|i| i.label.contains("say why")), "{tool}");
+        }
+    }
+
+    /// #185: a call declined with a reason shows declined (it didn't run), not done, though the turn goes on.
+    #[test]
+    fn a_call_declined_with_a_reason_shows_declined() {
+        let result =
+            || ToolResult { output: marv_tools::declined_because("not now"), summary: Some("declined".into()), is_error: false };
+        let mut run = marv_agent::ToolRun::new(result(), "bun test");
+        run.approval = marv_agent::ApprovalRecord::Declined;
+        assert!(!run.declined);
+        assert_eq!(tool_status(&run).status, view::ToolState::Declined);
+        let ran =
+            marv_agent::ToolRun { approval: marv_agent::ApprovalRecord::Yes, ..marv_agent::ToolRun::new(result(), "bun test") };
+        assert_eq!(tool_status(&ran).status, view::ToolState::Done);
     }
 
     #[test]

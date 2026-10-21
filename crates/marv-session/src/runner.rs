@@ -44,6 +44,7 @@ pub fn approval_record(approval: Option<Approval>) -> ApprovalRecord {
         Some(Approval::Decided(Decision::Yes)) => ApprovalRecord::Yes,
         Some(Approval::Decided(Decision::Always)) => ApprovalRecord::Always,
         Some(Approval::Decided(Decision::No)) => ApprovalRecord::No,
+        Some(Approval::Decided(Decision::Declined(_))) => ApprovalRecord::Declined,
         Some(Approval::Decided(Decision::Unavailable)) => ApprovalRecord::Unavailable,
     }
 }
@@ -63,7 +64,7 @@ pub fn tool_run_from(outcome: ToolOutcome, note: Option<&str>) -> ToolRun {
     let ToolOutcome { result, label } = outcome;
     let display = ToolDisplay { diff: result.diff.clone(), plan: result.plan.clone() };
     let (declined, provenance, changed, door) = (result.declined, result.provenance, result.changed.clone(), result.door);
-    let approval = approval_record(result.approval);
+    let approval = approval_record(result.approval.clone());
     let mut core = result.into_core();
     // Tainting sources are data, fenced (docs/SECURITY.md); mesh envelopes are fenced by the switchboard already.
     if provenance.taints() && provenance != Provenance::Mesh && !core.is_error {
@@ -181,6 +182,13 @@ impl AlwaysScopes {
         self.seeds.lock().unwrap_or_else(|e| e.into_inner()).extend(prefixes.iter().cloned());
     }
 
+    /// What a person answered "always" to this session, sorted (for `/permissions`; the seeds are the names).
+    pub fn remembered(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self.exact.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect();
+        keys.sort();
+        keys
+    }
+
     pub fn clear(&self) {
         self.exact.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.seeds.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -236,6 +244,7 @@ impl Approver for SessionApprover {
 /// The step-limit question: asked like any approval, so the client's "stop everything" answers it too.
 pub fn step_limit_request(steps: u32, every: u32) -> ApprovalRequest {
     ApprovalRequest {
+        reason: false,
         tool: "continue".into(),
         label: format!("{steps} steps"),
         preview: Preview {
@@ -321,7 +330,7 @@ mod tests {
     impl Approver for Counting {
         async fn approve(&self, request: ApprovalRequest) -> Decision {
             self.0.lock().unwrap().push(request.scope.key);
-            self.1
+            self.1.clone()
         }
     }
 

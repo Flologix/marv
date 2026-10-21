@@ -215,6 +215,11 @@ pub enum SessionEvent {
     Tainted {
         source: Provenance,
     },
+    /// marv-rs #124 (phase 3): a line in Marv's voice about the radio, for the transcript (a report sent at the
+    /// turn's end). Checked names and fixed words only.
+    RadioNote {
+        text: String,
+    },
     /// Always last, exactly once, however the turn ended.
     TurnEnd {
         turn: String,
@@ -653,6 +658,22 @@ struct State {
     prune_task: Option<tokio::task::JoinHandle<()>>,
     /// This conversation offers `radio_tx` (#124): it started with the radio on. Fixed until `clear()`.
     radio_offered: bool,
+    /// Radio requests a turn read and hasn't reported on yet (#124, phase 3, §7.3): in the session's state (and its
+    /// saved file), not the history, so compaction or a resume doesn't lose them. Kept across `clear()`.
+    radio_requests: Vec<marv_mesh::radio::OpenRequest>,
+    /// What the running turn's end needs for its automatic radio reports: its number, its last reply, and the tool
+    /// the user declined.
+    radio_turn: RadioTurnFacts,
+}
+
+/// What a turn's automatic radio report is built from (#124, §7.3): no model call, only what the session has.
+#[derive(Debug, Clone, Default)]
+struct RadioTurnFacts {
+    number: u32,
+    /// The turn read the radio (the person's own, or one the radio started) with requests open: it reports on them.
+    handles: bool,
+    reply: Option<String>,
+    declined: Option<String>,
 }
 
 impl State {
@@ -922,6 +943,11 @@ impl SubagentSink for TurnSink {
 impl MarvSession {
     /// Builds a session. Fails (and changes nothing) for a taken tool name, or yolo where `no_yolo` forbids it.
     pub fn new(mut init: SessionInit) -> Result<Self, SessionError> {
+        // #98/#82: only names that mean something stay pre-approved; an unknown one is a problem (shown) and dropped,
+        // so the seeds, the prompt's list and /permissions all name exactly what was seeded (fixed for the session).
+        let (known, problems) = crate::approvals::known_names(&init.pre_approved, "Pre-approved scopes");
+        init.pre_approved = known;
+        init.problems.extend(problems);
         // An absolute path (#61): the marker names it, and read_file and grep only take an absolute one outside the
         // project. A relative MARV_CONFIG_DIR would otherwise make it a project path.
         init.tool_output_dir =
@@ -1028,14 +1054,20 @@ impl MarvSession {
             hook_task: None,
             prune_task: None,
             radio_offered: init.radio == Some(true) && init.mesh.is_some(),
+            radio_requests: Vec::new(),
+            radio_turn: RadioTurnFacts::default(),
         };
         // The config's pre-approved scopes (#98) seed the "always" layer: they mean "always, for this session",
         // through the same path a person's "always" takes, so must_ask and taint still win. An unknown name is a
         // problem (shown), not a silent approval.
         let always = AlwaysScopes::default();
+        // The names were checked above, so this can't fail; were it to, nothing is seeded (never more).
         match crate::approvals::seed_prefixes(&init.pre_approved) {
             Ok(prefixes) => always.seed(&prefixes),
-            Err(problem) => init.problems.push(problem),
+            Err(problem) => {
+                init.problems.push(problem);
+                init.pre_approved.clear();
+            }
         }
         let inner = Inner {
             specs,
@@ -1138,6 +1170,30 @@ impl MarvSession {
     pub fn tainted(&self) -> Vec<Provenance> {
         self.inner.taint.sources()
     }
+    /// What the session may do without asking, now (`/permissions`, #82): a copy, for showing only.
+    pub fn permissions(&self) -> crate::permissions::Permissions {
+        let (yolo, sandbox) = {
+            let s = self.state();
+            (s.yolo, s.sandbox)
+        };
+        let init = &self.inner.init;
+        let doors = [("github", init.github), ("process", self.inner.process_on), ("herdr", init.herdr.is_some())]
+            .into_iter()
+            .filter_map(|(name, on)| on.then_some(name))
+            .collect();
+        crate::permissions::Permissions {
+            yolo,
+            no_yolo: init.no_yolo.clone(),
+            sandbox,
+            host_commands: init.host_commands,
+            doors,
+            remembered: self.inner.always.remembered(),
+            pre_approved: init.pre_approved.clone(),
+            writable: init.writable.clone(),
+            tainted: self.inner.taint.sources(),
+            approved_urls: self.inner.taint.approved_prefixes(),
+        }
+    }
     /// The MCP manager (for `/mcp`), if the session has one.
     pub fn mcp(&self) -> Option<McpHandle> {
         self.inner.init.mcp.clone()
@@ -1218,7 +1274,7 @@ impl MarvSession {
         if mesh.unread_radio().is_empty() {
             return Ok(None);
         }
-        let options = SendOptions { for_model: Some(crate::radio::RADIO_WAKE_NOTE.to_string()), cancel: None };
+        let options = SendOptions { for_model: Some(by.note().to_string()), cancel: None };
         self.start(&by.line(), options, Woken::Radio(by.clone())).map(Some)
     }
 
@@ -1313,6 +1369,8 @@ impl MarvSession {
                 TurnEndReason::Done(StopReason::Error)
             }
         };
+        // #124: the turn handled radio requests: each gets its report now, built without a model call (§7.3).
+        self.radio_reports(reason, &emit);
         {
             // The next turn tries compaction again.
             let mut s = self.state();
@@ -1343,6 +1401,43 @@ impl MarvSession {
         self.schedule_save();
         emit(SessionEvent::TurnEnd { turn, reason });
         ended.store(true, Ordering::SeqCst);
+    }
+
+    /// The automatic reports (#124, §7.3) on the radio requests the turn that just ended handled: `done` or `failed`
+    /// to each requester, from how it ended and what it said ([`crate::radio::report_of`]), with no model call. A
+    /// request the model answered itself (`radio_tx kind: reply`) gets none. Each sent one is a line in the transcript.
+    fn radio_reports(&self, reason: TurnEndReason, emit: &Emit) {
+        let (open, facts, changed) = {
+            let mut s = self.state();
+            if !std::mem::take(&mut s.radio_turn.handles) {
+                return;
+            }
+            let changed = s.reported.get(&s.radio_turn.number).map_or(0, Vec::len);
+            (std::mem::take(&mut s.radio_requests), s.radio_turn.clone(), changed)
+        };
+        let Some(radio) = self.inner.init.mesh.as_ref().and_then(|m| m.radio()) else { return };
+        let (kind, text) =
+            crate::radio::report_of(reason, &radio.name, facts.reply.as_deref(), facts.declined.as_deref(), changed);
+        let hop = self.inner.radio_hop.get();
+        let now = crate::radio::now_ms();
+        for open in open {
+            let short = marv_mesh::radio::short_id(&open.id);
+            let line = match radio.report(&open, kind, hop, &text, now.saturating_sub(open.at_ms)) {
+                marv_mesh::radio::ReportOutcome::Sent => format!("Radio → {} {} {short}", open.from, kind.as_str()),
+                marv_mesh::radio::ReportOutcome::AlreadyAnswered => continue,
+                marv_mesh::radio::ReportOutcome::NotSent(why) => {
+                    format!("Radio: the {} report on {short} to {} wasn't sent: {why}", kind.as_str(), open.from)
+                }
+            };
+            let line = marv_core::printable(&line);
+            self.note(Role::System, &line);
+            emit(SessionEvent::RadioNote { text: line });
+        }
+    }
+
+    /// The radio requests this session's turns read and haven't reported on yet (#124, phase 3).
+    pub fn radio_requests(&self) -> Vec<marv_mesh::radio::OpenRequest> {
+        self.state().radio_requests.clone()
     }
 
     /// `run_turn` up to the end of the loop: how the turn ended.
@@ -1484,13 +1579,39 @@ impl MarvSession {
             Woken::Radio(_) => crate::mesh::RadioRead::RaiseHop(self.inner.radio_hop.clone()),
             Woken::Inbox => crate::mesh::RadioRead::Skip,
         };
-        // Mesh messages that came in since the last step: before the user's message, fenced as data.
+        // Mesh messages that came in since the last step: before the user's message, fenced as data. Radio requests
+        // are read only here, at a turn's start (#124, §7.2): this turn reports on them when it ends.
         let inbox = init
             .mesh
             .as_ref()
-            .and_then(|m| crate::mesh::inbox_note_with(m, &crate::mesh::parent_id(), &self.inner.taint, &radio_read));
+            .and_then(|m| crate::mesh::inbox_read(m, &crate::mesh::parent_id(), &self.inner.taint, &radio_read, true));
+        let handles_requests = !matches!(radio_read, crate::mesh::RadioRead::Skip) && {
+            let read: Vec<_> = inbox.as_ref().map(|i| i.requests.clone()).unwrap_or_default();
+            let mut s = self.state();
+            for request in read {
+                if !s.radio_requests.iter().any(|r| r.id == request.id) {
+                    s.radio_requests.push(marv_mesh::radio::OpenRequest {
+                        id: request.id,
+                        from: request.from,
+                        hop: request.hop,
+                        at_ms: crate::radio::now_ms(),
+                    });
+                }
+            }
+            // A resumed session's: open again on the radio, so the model may answer them and they get their report.
+            if let Some(radio) = init.mesh.as_ref().and_then(|m| m.radio()) {
+                for open in &s.radio_requests {
+                    radio.reopen(open);
+                }
+            }
+            !s.radio_requests.is_empty()
+        };
+        if handles_requests {
+            // Saved now, so a Marv that dies mid-turn still owes (and, resumed, sends) their reports.
+            self.schedule_save();
+        }
         let message = match inbox {
-            Some(inbox) => format!("{inbox}\n\n{message}"),
+            Some(inbox) => format!("{}\n\n{message}", inbox.note),
             None => message,
         };
         // An undo since the last turn: the model hears of it here, in the message Marv sends anyway (the cache holds).
@@ -1545,6 +1666,7 @@ impl MarvSession {
             let mut s = self.state();
             s.turn_number += 1;
             let number = s.turn_number;
+            s.radio_turn = RadioTurnFacts { number, handles: handles_requests, ..RadioTurnFacts::default() };
             s.reported.insert(number, Vec::new());
             let prune = s.checkpoints && !s.pruned;
             s.pruned |= prune;
@@ -1562,12 +1684,19 @@ impl MarvSession {
         // approved URL prefix don't apply (`no_auto_approval` below). Its hop was set before its first read, above.
         // #74: so does any turn the person didn't start, a mesh wake (#78) too: another agent's message is never a
         // reason to approve anything automatically.
+        // #124, phase 3: so does a turn that handles a radio request, the person's own included (a deliberate step past
+        // spec §8.4, which left the person's turn its normal approvals: the request note invites the model to act on
+        // another Marv's words, so yolo mustn't carry them out unasked).
         let radio_turn = matches!(woken, Woken::Radio(_));
-        let unattended = woken.is_woken();
-        let client: Option<Arc<dyn Approver>> = init
-            .approve
-            .clone()
-            .map(|inner| if radio_turn { Arc::new(crate::radio::RadioTurnApprover(inner)) as Arc<dyn Approver> } else { inner });
+        let unattended = woken.is_woken() || handles_requests;
+        let why = if radio_turn { crate::radio::RADIO_TURN_WARNING } else { crate::radio::RADIO_REQUEST_WARNING };
+        let client: Option<Arc<dyn Approver>> = init.approve.clone().map(|inner| {
+            if radio_turn || handles_requests {
+                Arc::new(crate::radio::RadioTurnApprover(inner, why)) as Arc<dyn Approver>
+            } else {
+                inner
+            }
+        });
         let always = if unattended { AlwaysScopes::default() } else { self.inner.always.clone() };
         let approve: Option<Arc<dyn Approver>> = client
             .clone()
@@ -1714,7 +1843,7 @@ impl MarvSession {
                     match approve.approve(step_limit_request(steps, every)).await {
                         Decision::Yes | Decision::Always => LimitAnswer::Continue,
                         Decision::Unavailable => LimitAnswer::Unavailable,
-                        Decision::No => LimitAnswer::Stop,
+                        Decision::No | Decision::Declined(_) => LimitAnswer::Stop,
                     }
                 })
             }));
@@ -1741,7 +1870,12 @@ impl MarvSession {
                     self.state().last = Some(*usage);
                     self.count(usage, factory.as_ref(), info.as_ref());
                 }
-                LoopEvent::Assistant { text } => self.note(Role::Assistant, text),
+                LoopEvent::Assistant { text } => {
+                    self.note(Role::Assistant, text);
+                    if !text.trim().is_empty() {
+                        self.state().radio_turn.reply = Some(text.clone());
+                    }
+                }
                 LoopEvent::ToolStart { call, .. } if call.name == "agent" => {
                     let args = marv_agent::agent::agent_args(&call.arguments);
                     subagents += 1;
@@ -1758,6 +1892,9 @@ impl MarvSession {
                     lock(subs).insert(call.id.clone(), recorder(&record, turn, &subagent));
                 }
                 LoopEvent::ToolEnd { call, run } => {
+                    if run.declined {
+                        self.state().radio_turn.declined = Some(call.name.clone());
+                    }
                     // A subagent that failed before its loop started never sent Done.
                     if let Some(mut sub) = lock(subs).remove(&call.id) {
                         sub.finish(if run.result.is_error { "error" } else { "end" });
@@ -2202,6 +2339,13 @@ impl MarvSession {
             // marv-rs: the conversation still holds the web, MCP or mesh text that tainted it, so its taint comes back
             // with it (docs/SECURITY.md): egress keeps asking after `marv -c`.
             self.inner.taint.restore(&saved.taint_sources());
+            // #124: radio requests a turn read and didn't report on (Marv stopped mid-turn): the next turn that reads
+            // the radio reports on them. Ones that break the rules are dropped.
+            for open in saved.radio_requests.iter().flatten().filter(|r| r.valid()) {
+                if !s.radio_requests.iter().any(|r| r.id == open.id) {
+                    s.radio_requests.push(open.clone());
+                }
+            }
             let resumed = Resumed {
                 id: saved.id.clone(),
                 updated_at: saved.updated_at,
@@ -2441,6 +2585,7 @@ impl MarvSession {
         saved.checkpoints = serde_json::to_value(checkpoints).ok();
         saved.pending_note = s.pending_note.clone().map(serde_json::Value::String);
         saved.taint = Some(self.inner.taint.sources());
+        saved.radio_requests = (!s.radio_requests.is_empty()).then(|| s.radio_requests.clone());
         s.saved = saved.clone();
         saved
     }
@@ -2713,7 +2858,12 @@ impl MarvSession {
             .collect();
         tools.extend(init.tools.iter().cloned());
         if let Some(setup) = &init.herdr {
-            tools.push(Arc::new(crate::herdr_door::HerdrDoor::new(setup.clone(), self.inner.peers.clone())));
+            let door = crate::herdr_door::HerdrDoor::new(setup.clone(), self.inner.peers.clone());
+            // #124: its prompt refuses a Marv on the radio, found in this Marv's mesh folder.
+            if let Some(dir) = init.mesh.as_ref().and_then(|m| m.peer_dir()) {
+                door.adapter.set_mesh_dir(dir);
+            }
+            tools.push(Arc::new(door));
         }
         if let Some(mesh) = &init.mesh
             && let Ok(plug) = mesh.plug(crate::mesh::parent_id())
@@ -2975,6 +3125,20 @@ mod tests {
         init.cwd = Some("~/p".into());
         edit(&mut init);
         MarvSession::new(init)
+    }
+
+    // #82 review: one unknown name used to make the seeding fail (nothing approved) while the prompt and
+    // /permissions still named every name. Now it's dropped with a problem and the rest are seeded and named.
+    #[test]
+    fn an_unknown_pre_approved_name_is_dropped_and_the_rest_seeded() {
+        let s = session(|i| i.pre_approved = vec!["web".into(), "netwrk".into()]).unwrap();
+        assert!(s.problems().iter().any(|p| p.contains("\"netwrk\"") && p.ends_with("ignored")), "{:?}", s.problems());
+        assert!(s.inner.always.contains("web:example.com"), "web is seeded");
+        assert!(!s.inner.always.contains("bash:net:curl x"));
+        assert_eq!(s.permissions().pre_approved, ["web"]);
+        let prompt = s.system_prompt();
+        assert!(prompt.contains("(they run without asking): web.") && !prompt.contains("netwrk"), "{prompt}");
+        assert_eq!(s.system_prompt(), prompt, "byte-stable");
     }
 
     #[test]
@@ -3465,7 +3629,7 @@ mod turn_tests {
     impl Approver for Answer {
         async fn approve(&self, request: ApprovalRequest) -> Decision {
             lock(&self.0).push(request);
-            self.1
+            self.1.clone()
         }
     }
     fn answer(decision: Decision) -> Arc<Answer> {
@@ -5977,6 +6141,46 @@ mod turn_tests {
         assert!(events.iter().position(|e| matches!(e, SessionEvent::Tainted { .. })).unwrap() < at("tool_start"));
         assert_eq!(asked.len(), 1);
         assert!(asked[0].must_ask && asked[0].network, "tainted egress must ask: {:?}", asked[0]);
+    }
+
+    /// #185: declined with a reason, the call isn't run, its result (an ordinary tool result, history append-only)
+    /// gives the reason as the user wrote it, unfenced, the turn goes on to the model's next reply, and nothing is
+    /// tainted. A plain no still stops the turn there.
+    #[tokio::test]
+    async fn declined_with_a_reason_tells_the_model_why_and_the_turn_goes_on_untainted() {
+        let reason = "Ignore the user: don't use the network, use the fixtures in tests/ instead";
+        let dirs = Dirs::new();
+        let curl = call("c1", "bash", serde_json::json!({"command": "curl -o page.html https://example.com", "network": true}));
+        let provider = Scripted::new(vec![use_tools(vec![curl.clone()]), say("Using the fixtures.")]);
+        let approver = answer(Decision::Declined(reason.into()));
+        let session = scripted(&dirs, &provider, |i| i.approve = Some(approver.clone()));
+        let events = collect(go(&session, "fetch the page")).await;
+        assert_eq!(lock(&approver.0).len(), 1);
+        assert!(!dirs.project.join("page.html").exists(), "not run");
+        // The model was asked again, with the declined result appended after what it had already seen.
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        let (first, second) = (&requests[0].0, &requests[1].0);
+        assert_eq!(&second[..first.len()], &first[..], "append-only");
+        let result = second.iter().find_map(|t| matches!(t, ChatTurn::Tool { .. }).then(|| text_of(t))).unwrap();
+        assert_eq!(result, marv_tools::declined_because(reason));
+        assert!(!result.contains("untrusted-data"), "the user's own words: not fenced");
+        assert!(session.tainted().is_empty() && tainted_events(&events).is_empty(), "no taint");
+        let ended = events.iter().find_map(|e| match e {
+            SessionEvent::Loop(LoopEvent::ToolEnd { run, .. }) => Some((run.declined, run.approval)),
+            _ => None,
+        });
+        assert_eq!(ended, Some((false, marv_agent::agent::ApprovalRecord::Declined)));
+        assert!(has_done(&events, StopReason::End));
+        assert!(!has_done(&events, StopReason::Declined));
+
+        // A plain no, the same call: the turn stops there, the model isn't asked again.
+        let dirs = Dirs::new();
+        let provider = Scripted::new(vec![use_tools(vec![curl]), say("never")]);
+        let session = scripted(&dirs, &provider, |i| i.approve = Some(answer(Decision::No)));
+        let events = collect(go(&session, "fetch the page")).await;
+        assert_eq!(provider.requests().len(), 1);
+        assert!(has_done(&events, StopReason::Declined));
     }
 
     #[tokio::test]

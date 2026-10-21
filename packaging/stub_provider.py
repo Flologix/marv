@@ -7,6 +7,9 @@ It binds 127.0.0.1 on a free port and writes the port to <port file>. `POST .../
 tool call running <bash command> while the conversation has no tool result yet, and then a closing text that quotes
 the tool result back (so the smoke test can read what the command printed in `marv -p`'s output). `GET .../models`
 lists nothing; anything else is a 404. It serves until it is killed.
+
+scripts/screenshots/stub_provider.py is a different stub: a fixed multi-step demo turn on a fixed port, for the
+README's screenshots. This one takes its command and picks a free port, so it can run on any CI runner.
 """
 
 import json

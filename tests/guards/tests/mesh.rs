@@ -332,7 +332,7 @@ struct Person(marv_tools::Decision, Mutex<Vec<marv_tools::ApprovalRequest>>);
 impl marv_tools::Approver for Person {
     async fn approve(&self, request: marv_tools::ApprovalRequest) -> marv_tools::Decision {
         self.1.lock().unwrap().push(request);
-        self.0
+        self.0.clone()
     }
 }
 
@@ -367,7 +367,7 @@ async fn the_one_prompt_for_a_call_and_its_new_wire_is_a_persons_yes_or_no() {
 
     for (answer, wired) in [(Decision::Always, true), (Decision::No, false)] {
         let worker = mesh.plug_next("worker").unwrap();
-        let person = Arc::new(Person(answer, Mutex::default()));
+        let person = Arc::new(Person(answer.clone(), Mutex::default()));
         let always = AlwaysScopes::default();
         always.add("mesh:agent.parent.inbox:send");
         always.add(format!("mesh-wire:{}:agent.parent.inbox:send", worker.id));

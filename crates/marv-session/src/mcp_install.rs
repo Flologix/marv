@@ -69,6 +69,7 @@ impl ResolveDeps for LiveDeps {
 /// `/mcp add`'s question, as the approval queue asks it.
 pub fn add_request(approval: &AddApproval) -> ApprovalRequest {
     ApprovalRequest {
+        reason: false,
         tool: approval.tool.into(),
         label: approval.label.clone(),
         preview: Preview {

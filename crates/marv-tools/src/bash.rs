@@ -1348,7 +1348,7 @@ mod tests {
     impl crate::types::Approver for Answer {
         async fn approve(&self, request: crate::types::ApprovalRequest) -> Decision {
             self.1.lock().unwrap().push(request);
-            self.0
+            self.0.clone()
         }
     }
     use crate::types::Decision;

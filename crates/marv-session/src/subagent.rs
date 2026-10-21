@@ -1414,6 +1414,7 @@ mod run_tests {
         let asker = Asker::new(|_| Decision::No);
         let sub = subagent_context(&parent(), "general-purpose · x", Some(&wt()), Some(asker.clone()));
         let request = ApprovalRequest {
+            reason: false,
             tool: "write_file".into(),
             label: "a.txt".into(),
             preview: Preview { title: "Write a.txt".into(), ..Preview::default() },
