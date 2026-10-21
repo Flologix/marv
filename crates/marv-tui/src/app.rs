@@ -834,9 +834,10 @@ impl App {
             // (or change) with Enter. Never sent on their own.
             UiEvent::NotSent { texts } => {
                 self.sending = 0;
-                let back = texts.join(" ");
+                // Each message on its own line, as sent (the prompt shows the breaks, and Enter sends them).
+                let back = texts.join("\n");
                 let typed = self.prompt.value.trim().to_string();
-                self.prompt.set(if typed.is_empty() { back } else { format!("{back} {typed}") });
+                self.prompt.set(if typed.is_empty() { back } else { format!("{back}\n{typed}") });
                 self.system("✻ Not sent: the turn ended before its next step. Your message is back in the prompt.");
             }
             // A request outside a turn (the suggestion's) still counts.
@@ -2251,6 +2252,13 @@ mod tests {
         let (build, sent) = (frame.find("cargo build").unwrap(), frame.find("> also the tests").unwrap());
         assert!(sent > build, "after the tool's entry:\n{frame}");
         assert!(!frame.contains("for the next step"));
+        // ctrl+s does the same (where the terminal keeps Alt+Enter).
+        for c in "and lint".chars() {
+            h.key(KeyCode::Char(c));
+        }
+        h.ctrl('s');
+        assert_eq!(h.calls().last(), Some(&Call::SendNow("and lint".into())));
+        h.event(UiEvent::SentNow { text: "and lint".into() });
         // Idle, Alt+Enter is Enter.
         h.events([UiEvent::Done(StopReason::End), turn_end()]);
         alt_enter(&mut h, "thanks");
@@ -2267,7 +2275,9 @@ mod tests {
             h.key(KeyCode::Char(c));
         }
         h.events([UiEvent::NotSent { texts: vec!["wait, use pnpm".into()] }, UiEvent::Done(StopReason::Aborted), turn_end()]);
-        assert_eq!(h.app.prompt.value, "wait, use pnpm and");
+        assert_eq!(h.app.prompt.value, "wait, use pnpm\nand");
+        let frame = h.frame();
+        assert!(frame.contains("> wait, use pnpm") && frame.contains("  and"), "{frame}");
         assert!(h.frame().contains("Not sent: the turn ended before its next step"));
         // A command with Alt+Enter is a command: it waits for the turn like Enter.
         h.app.prompt.set("");

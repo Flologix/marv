@@ -8,7 +8,7 @@
 //!   menu until the text changes. Hidden while busy. ctrl+k opens the App's command palette over it
 //!   (`command_palette`, #44), built from the same commands; the text here stays as it was.
 //! - Placeholder "Type a message, or / for commands"; the border dims while busy.
-//! - New in marv-rs: Alt+Enter is [`PromptOutcome::SendNow`] ("send now": while a turn runs, the App sends the line
+//! - New in marv-rs: Alt+Enter (or ctrl+s) is [`PromptOutcome::SendNow`] ("send now": while a turn runs, the App sends the line
 //!   into it at its next step instead of waiting for it to end). Enter is unchanged.
 //! - New in marv-rs: after a turn, a suggested next message ([`PromptInput::suggest`]) shows in the empty prompt
 //!   instead of the placeholder. Tab or → takes it into the line; typing anything drops it. Enter on the empty line
@@ -199,6 +199,16 @@ impl PromptInput {
                 }
                 return Some(PromptOutcome::Submit(text));
             }
+            // ctrl+s: the same as Alt+Enter, for terminals that keep Alt+Enter (Windows Terminal: full screen). Raw
+            // mode turns off XON/XOFF, so it arrives as a key.
+            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.history_index = None;
+                self.dismissed_at = None;
+                return Some(match highlighted {
+                    Some(c) => PromptOutcome::Submit(format!("/{}", c.name)),
+                    None => PromptOutcome::SendNow(self.value.clone()),
+                });
+            }
             KeyCode::Up if !self.history.is_empty() => {
                 let next = self.history_index.map_or(self.history.len() - 1, |i| i.saturating_sub(1));
                 self.history_index = Some(next);
@@ -266,8 +276,19 @@ impl PromptInput {
         let width = inner_width.saturating_sub(2).max(1) as usize;
         let mut rows: Vec<Vec<Span<'static>>> = vec![Vec::new()];
         let mut used = 0;
-        let clean: Vec<String> = self.value.chars().map(|c| printable(&c.to_string())).collect();
+        let chars: Vec<char> = self.value.chars().collect();
+        let clean: Vec<String> = chars.iter().map(|c| printable(&c.to_string())).collect();
         for i in 0..=clean.len() {
+            // A line break (only text given back by "send now" has one: typing and pasting never make one) starts a
+            // new row; the cursor on it shows as a space at the end of its line.
+            if chars.get(i) == Some(&'\n') {
+                if i == self.cursor {
+                    rows.last_mut().expect("never empty").push(Span::styled(" ", cursor_style));
+                }
+                rows.push(Vec::new());
+                used = 0;
+                continue;
+            }
             let (text, w) = match clean.get(i) {
                 Some(t) => (t.clone(), t.width()),
                 None => (" ".to_string(), 1), // the cursor past the end

@@ -42,7 +42,7 @@ pub const AFTER_REPLY: &str = "after the reply";
 pub const SHORTCUTS: &[(&str, &str)] = &[
     ("ctrl+k", "This palette: commands, skills, settings and keys"),
     ("Esc", "Stop a reply or a running tool (in a subagent's view: go back)"),
-    ("alt+enter", "Send now: while Marv works, your message goes in at its next step"),
+    ("alt+enter or ctrl+s", "Send now: while Marv works, your message goes in at its next step"),
     ("ctrl+c", "Stop / clear the input / press twice to quit"),
     ("ctrl+o", "Show or hide details: what subagents did, and whole diffs"),
     ("PgUp/PgDn", "Scroll the conversation (the mouse wheel too)"),
