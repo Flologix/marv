@@ -61,6 +61,10 @@ pub struct SavedSession {
     /// in it. Absent in older files: `taint_sources` then infers it from the conversation's tool calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub taint: Option<Vec<marv_core::Provenance>>,
+    /// marv-rs #124 (phase 3): radio requests a turn read and hasn't reported on yet; the next turn that reads the
+    /// radio reports on them. Absent when there are none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radio_requests: Option<Vec<marv_mesh::radio::OpenRequest>>,
 }
 
 /// A saved session's checkpoint chain and its turns' reported paths (#16).
@@ -151,6 +155,7 @@ pub fn new_session(root: &Path, provider: &str, model: &str, now_ms: u64) -> Sav
         checkpoints: None,
         pending_note: None,
         taint: None,
+        radio_requests: None,
     }
 }
 

@@ -215,6 +215,11 @@ pub enum SessionEvent {
     Tainted {
         source: Provenance,
     },
+    /// marv-rs #124 (phase 3): a line in Marv's voice about the radio, for the transcript (a report sent at the
+    /// turn's end). Checked names and fixed words only.
+    RadioNote {
+        text: String,
+    },
     /// Always last, exactly once, however the turn ended.
     TurnEnd {
         turn: String,
@@ -653,6 +658,22 @@ struct State {
     prune_task: Option<tokio::task::JoinHandle<()>>,
     /// This conversation offers `radio_tx` (#124): it started with the radio on. Fixed until `clear()`.
     radio_offered: bool,
+    /// Radio requests a turn read and hasn't reported on yet (#124, phase 3, §7.3): in the session's state (and its
+    /// saved file), not the history, so compaction or a resume doesn't lose them. Kept across `clear()`.
+    radio_requests: Vec<marv_mesh::radio::OpenRequest>,
+    /// What the running turn's end needs for its automatic radio reports: its number, its last reply, and the tool
+    /// the user declined.
+    radio_turn: RadioTurnFacts,
+}
+
+/// What a turn's automatic radio report is built from (#124, §7.3): no model call, only what the session has.
+#[derive(Debug, Clone, Default)]
+struct RadioTurnFacts {
+    number: u32,
+    /// The turn read the radio (the person's own, or one the radio started) with requests open: it reports on them.
+    handles: bool,
+    reply: Option<String>,
+    declined: Option<String>,
 }
 
 impl State {
@@ -1033,6 +1054,8 @@ impl MarvSession {
             hook_task: None,
             prune_task: None,
             radio_offered: init.radio == Some(true) && init.mesh.is_some(),
+            radio_requests: Vec::new(),
+            radio_turn: RadioTurnFacts::default(),
         };
         // The config's pre-approved scopes (#98) seed the "always" layer: they mean "always, for this session",
         // through the same path a person's "always" takes, so must_ask and taint still win. An unknown name is a
@@ -1251,7 +1274,7 @@ impl MarvSession {
         if mesh.unread_radio().is_empty() {
             return Ok(None);
         }
-        let options = SendOptions { for_model: Some(crate::radio::RADIO_WAKE_NOTE.to_string()), cancel: None };
+        let options = SendOptions { for_model: Some(by.note().to_string()), cancel: None };
         self.start(&by.line(), options, Woken::Radio(by.clone())).map(Some)
     }
 
@@ -1346,6 +1369,8 @@ impl MarvSession {
                 TurnEndReason::Done(StopReason::Error)
             }
         };
+        // #124: the turn handled radio requests: each gets its report now, built without a model call (§7.3).
+        self.radio_reports(reason, &emit);
         {
             // The next turn tries compaction again.
             let mut s = self.state();
@@ -1376,6 +1401,43 @@ impl MarvSession {
         self.schedule_save();
         emit(SessionEvent::TurnEnd { turn, reason });
         ended.store(true, Ordering::SeqCst);
+    }
+
+    /// The automatic reports (#124, §7.3) on the radio requests the turn that just ended handled: `done` or `failed`
+    /// to each requester, from how it ended and what it said ([`crate::radio::report_of`]), with no model call. A
+    /// request the model answered itself (`radio_tx kind: reply`) gets none. Each sent one is a line in the transcript.
+    fn radio_reports(&self, reason: TurnEndReason, emit: &Emit) {
+        let (open, facts, changed) = {
+            let mut s = self.state();
+            if !std::mem::take(&mut s.radio_turn.handles) {
+                return;
+            }
+            let changed = s.reported.get(&s.radio_turn.number).map_or(0, Vec::len);
+            (std::mem::take(&mut s.radio_requests), s.radio_turn.clone(), changed)
+        };
+        let Some(radio) = self.inner.init.mesh.as_ref().and_then(|m| m.radio()) else { return };
+        let (kind, text) =
+            crate::radio::report_of(reason, &radio.name, facts.reply.as_deref(), facts.declined.as_deref(), changed);
+        let hop = self.inner.radio_hop.get();
+        let now = crate::radio::now_ms();
+        for open in open {
+            let short = marv_mesh::radio::short_id(&open.id);
+            let line = match radio.report(&open, kind, hop, &text, now.saturating_sub(open.at_ms)) {
+                marv_mesh::radio::ReportOutcome::Sent => format!("Radio → {} {} {short}", open.from, kind.as_str()),
+                marv_mesh::radio::ReportOutcome::AlreadyAnswered => continue,
+                marv_mesh::radio::ReportOutcome::NotSent(why) => {
+                    format!("Radio: the {} report on {short} to {} wasn't sent: {why}", kind.as_str(), open.from)
+                }
+            };
+            let line = marv_core::printable(&line);
+            self.note(Role::System, &line);
+            emit(SessionEvent::RadioNote { text: line });
+        }
+    }
+
+    /// The radio requests this session's turns read and haven't reported on yet (#124, phase 3).
+    pub fn radio_requests(&self) -> Vec<marv_mesh::radio::OpenRequest> {
+        self.state().radio_requests.clone()
     }
 
     /// `run_turn` up to the end of the loop: how the turn ended.
@@ -1517,13 +1579,39 @@ impl MarvSession {
             Woken::Radio(_) => crate::mesh::RadioRead::RaiseHop(self.inner.radio_hop.clone()),
             Woken::Inbox => crate::mesh::RadioRead::Skip,
         };
-        // Mesh messages that came in since the last step: before the user's message, fenced as data.
+        // Mesh messages that came in since the last step: before the user's message, fenced as data. Radio requests
+        // are read only here, at a turn's start (#124, §7.2): this turn reports on them when it ends.
         let inbox = init
             .mesh
             .as_ref()
-            .and_then(|m| crate::mesh::inbox_note_with(m, &crate::mesh::parent_id(), &self.inner.taint, &radio_read));
+            .and_then(|m| crate::mesh::inbox_read(m, &crate::mesh::parent_id(), &self.inner.taint, &radio_read, true));
+        let handles_requests = !matches!(radio_read, crate::mesh::RadioRead::Skip) && {
+            let read: Vec<_> = inbox.as_ref().map(|i| i.requests.clone()).unwrap_or_default();
+            let mut s = self.state();
+            for request in read {
+                if !s.radio_requests.iter().any(|r| r.id == request.id) {
+                    s.radio_requests.push(marv_mesh::radio::OpenRequest {
+                        id: request.id,
+                        from: request.from,
+                        hop: request.hop,
+                        at_ms: crate::radio::now_ms(),
+                    });
+                }
+            }
+            // A resumed session's: open again on the radio, so the model may answer them and they get their report.
+            if let Some(radio) = init.mesh.as_ref().and_then(|m| m.radio()) {
+                for open in &s.radio_requests {
+                    radio.reopen(open);
+                }
+            }
+            !s.radio_requests.is_empty()
+        };
+        if handles_requests {
+            // Saved now, so a Marv that dies mid-turn still owes (and, resumed, sends) their reports.
+            self.schedule_save();
+        }
         let message = match inbox {
-            Some(inbox) => format!("{inbox}\n\n{message}"),
+            Some(inbox) => format!("{}\n\n{message}", inbox.note),
             None => message,
         };
         // An undo since the last turn: the model hears of it here, in the message Marv sends anyway (the cache holds).
@@ -1578,6 +1666,7 @@ impl MarvSession {
             let mut s = self.state();
             s.turn_number += 1;
             let number = s.turn_number;
+            s.radio_turn = RadioTurnFacts { number, handles: handles_requests, ..RadioTurnFacts::default() };
             s.reported.insert(number, Vec::new());
             let prune = s.checkpoints && !s.pruned;
             s.pruned |= prune;
@@ -1595,12 +1684,19 @@ impl MarvSession {
         // approved URL prefix don't apply (`no_auto_approval` below). Its hop was set before its first read, above.
         // #74: so does any turn the person didn't start, a mesh wake (#78) too: another agent's message is never a
         // reason to approve anything automatically.
+        // #124, phase 3: so does a turn that handles a radio request, the person's own included (a deliberate step past
+        // spec §8.4, which left the person's turn its normal approvals: the request note invites the model to act on
+        // another Marv's words, so yolo mustn't carry them out unasked).
         let radio_turn = matches!(woken, Woken::Radio(_));
-        let unattended = woken.is_woken();
-        let client: Option<Arc<dyn Approver>> = init
-            .approve
-            .clone()
-            .map(|inner| if radio_turn { Arc::new(crate::radio::RadioTurnApprover(inner)) as Arc<dyn Approver> } else { inner });
+        let unattended = woken.is_woken() || handles_requests;
+        let why = if radio_turn { crate::radio::RADIO_TURN_WARNING } else { crate::radio::RADIO_REQUEST_WARNING };
+        let client: Option<Arc<dyn Approver>> = init.approve.clone().map(|inner| {
+            if radio_turn || handles_requests {
+                Arc::new(crate::radio::RadioTurnApprover(inner, why)) as Arc<dyn Approver>
+            } else {
+                inner
+            }
+        });
         let always = if unattended { AlwaysScopes::default() } else { self.inner.always.clone() };
         let approve: Option<Arc<dyn Approver>> = client
             .clone()
@@ -1774,7 +1870,12 @@ impl MarvSession {
                     self.state().last = Some(*usage);
                     self.count(usage, factory.as_ref(), info.as_ref());
                 }
-                LoopEvent::Assistant { text } => self.note(Role::Assistant, text),
+                LoopEvent::Assistant { text } => {
+                    self.note(Role::Assistant, text);
+                    if !text.trim().is_empty() {
+                        self.state().radio_turn.reply = Some(text.clone());
+                    }
+                }
                 LoopEvent::ToolStart { call, .. } if call.name == "agent" => {
                     let args = marv_agent::agent::agent_args(&call.arguments);
                     subagents += 1;
@@ -1791,6 +1892,9 @@ impl MarvSession {
                     lock(subs).insert(call.id.clone(), recorder(&record, turn, &subagent));
                 }
                 LoopEvent::ToolEnd { call, run } => {
+                    if run.declined {
+                        self.state().radio_turn.declined = Some(call.name.clone());
+                    }
                     // A subagent that failed before its loop started never sent Done.
                     if let Some(mut sub) = lock(subs).remove(&call.id) {
                         sub.finish(if run.result.is_error { "error" } else { "end" });
@@ -2235,6 +2339,13 @@ impl MarvSession {
             // marv-rs: the conversation still holds the web, MCP or mesh text that tainted it, so its taint comes back
             // with it (docs/SECURITY.md): egress keeps asking after `marv -c`.
             self.inner.taint.restore(&saved.taint_sources());
+            // #124: radio requests a turn read and didn't report on (Marv stopped mid-turn): the next turn that reads
+            // the radio reports on them. Ones that break the rules are dropped.
+            for open in saved.radio_requests.iter().flatten().filter(|r| r.valid()) {
+                if !s.radio_requests.iter().any(|r| r.id == open.id) {
+                    s.radio_requests.push(open.clone());
+                }
+            }
             let resumed = Resumed {
                 id: saved.id.clone(),
                 updated_at: saved.updated_at,
@@ -2474,6 +2585,7 @@ impl MarvSession {
         saved.checkpoints = serde_json::to_value(checkpoints).ok();
         saved.pending_note = s.pending_note.clone().map(serde_json::Value::String);
         saved.taint = Some(self.inner.taint.sources());
+        saved.radio_requests = (!s.radio_requests.is_empty()).then(|| s.radio_requests.clone());
         s.saved = saved.clone();
         saved
     }
@@ -2746,7 +2858,12 @@ impl MarvSession {
             .collect();
         tools.extend(init.tools.iter().cloned());
         if let Some(setup) = &init.herdr {
-            tools.push(Arc::new(crate::herdr_door::HerdrDoor::new(setup.clone(), self.inner.peers.clone())));
+            let door = crate::herdr_door::HerdrDoor::new(setup.clone(), self.inner.peers.clone());
+            // #124: its prompt refuses a Marv on the radio, found in this Marv's mesh folder.
+            if let Some(dir) = init.mesh.as_ref().and_then(|m| m.peer_dir()) {
+                door.adapter.set_mesh_dir(dir);
+            }
+            tools.push(Arc::new(door));
         }
         if let Some(mesh) = &init.mesh
             && let Ok(plug) = mesh.plug(crate::mesh::parent_id())

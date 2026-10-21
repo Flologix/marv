@@ -61,7 +61,7 @@ Each milestone ends with something you can run.
 10. **M10 Release.** One static binary (musl), install script, and a `0.1.0` tag. Workflow and `install.sh` done (#19); no tag yet.
 
 Later:
-- the mesh radio (#124, `docs/specs/2026-10-14-mesh-radio.md`): phase 1, presence, ✅ done; phase 2, messages (`/tx`, `radio_tx`, radio wakes), ✅ done; phase 3 (requests);
+- the mesh radio (#124, `docs/specs/2026-10-14-mesh-radio.md`): phase 1, presence, ✅ done; phase 2, messages (`/tx`, `radio_tx`, radio wakes), ✅ done; phase 3, requests (`/ask`, `radio_tx kind: request|reply`, automatic acks and reports, hops, no pane send to a Marv on the radio), ✅ done; phase 4 (non-Marv agents) later;
 - mesh v3 (AgentMesh bridge);
 - the Sprint 5 items not yet in: formatter (#67), schema repair (#65), more instruction files (#62);
 - LSP diagnostics;

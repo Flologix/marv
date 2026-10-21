@@ -354,11 +354,40 @@ pub struct HerdrAdapter {
     pub own_pane: Option<String>,
     /// When each pane was last typed into ([`SEND_GAP`]). Held for a whole send, so sends one at a time.
     sent: tokio::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    /// The machine's mesh folder (#124, phase 3): where [`Self::prompt_text`] looks for a Marv on the radio in the
+    /// pane it would type into.
+    mesh_dir: std::sync::Mutex<Option<PathBuf>>,
 }
 
 impl HerdrAdapter {
     pub fn new(program: impl Into<PathBuf>, own_pane: Option<String>) -> Self {
-        Self { program: program.into(), own_pane, sent: Default::default() }
+        Self { program: program.into(), own_pane, sent: Default::default(), mesh_dir: Default::default() }
+    }
+
+    /// The mesh folder to look in for Marvs on the radio ([`Self::prompt_text`]).
+    pub fn set_mesh_dir(&self, dir: PathBuf) {
+        *self.mesh_dir.lock().unwrap_or_else(|e| e.into_inner()) = Some(dir);
+    }
+
+    /// The Marv on the radio that runs in `pane`, if one does (#124, §9.3): a door in the mesh folder whose
+    /// `marv/info` says its radio is on and names this pane. Bounded like `marv mesh ls` (each door at most
+    /// `DOOR_TIMEOUT`).
+    pub async fn radio_marv_in(&self, pane: &str) -> Option<String> {
+        let dir = self.mesh_dir.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
+        let found = crate::discovery::list(&dir).await.unwrap_or_default();
+        found.into_iter().find(|p| p.info.radio && p.info.pane.as_deref() == Some(pane)).map(|p| p.session)
+    }
+
+    /// A prompt typed into an agent's pane (`herdr.pane.<pane>.send`, the Herdr door's `prompt`): [`Self::send_text`],
+    /// unless the pane runs a Marv that is on the radio (#124, §9.3, §12 item 8). Typing into a Marv's pane makes the
+    /// text look as if its user typed it, which is exactly what the radio avoids; it's refused, nothing typed, with
+    /// the radio as the way to reach it (a request gets a reply). Workers the Herdr door spawns get their first task
+    /// through `send_text` itself: the user approved that spawn, and the spawned Marv has no other way to get it.
+    pub async fn prompt_text(&self, pane: &str, text: &str) -> crate::Result<String> {
+        if let Some(marv) = self.radio_marv_in(pane).await {
+            return Err(MeshError::Io(radio_pane_refusal(&marv)));
+        }
+        self.send_text(pane, text).await
     }
 
     /// Runs `herdr <args>` and returns its JSON `result`. Herdr's own words never reach the agent: an error is named
@@ -820,6 +849,14 @@ pub fn pane_prompt(text: &str) -> crate::Result<String> {
     Ok(text.to_string())
 }
 
+/// Why a prompt to a pane is refused when the pane's Marv is on the radio (#124, §9.3).
+pub fn radio_pane_refusal(marv: &str) -> String {
+    format!(
+        "{marv} is on the radio: use radio_tx (kind: request) to get a reply; nothing was typed into its pane (typing \
+         there would look as if its user typed it)"
+    )
+}
+
 /// Finds `herdr.pane.<pane>.<action>` receptacles on demand (a pane opened after Marv started).
 pub struct HerdrPanes(pub Arc<HerdrAdapter>);
 
@@ -847,7 +884,7 @@ pub struct PaneService {
 impl Service for PaneService {
     async fn deliver(&self, envelope: &Envelope) -> crate::Result<Option<Value>> {
         let answer = match self.action {
-            PaneAction::Send => self.adapter.send_text(&self.pane, envelope.send_text()?).await?,
+            PaneAction::Send => self.adapter.prompt_text(&self.pane, envelope.send_text()?).await?,
             PaneAction::Status => self.adapter.status(&self.pane, envelope.body.get("lines").and_then(Value::as_u64)).await?,
         };
         Ok(Some(Value::String(answer)))

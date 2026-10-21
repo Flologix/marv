@@ -250,8 +250,29 @@ impl Switchboard {
         self.board().radio_inbox.drain(..).collect()
     }
 
+    /// The unread radio messages but requests, for a read between steps (#124, phase 3): a request is read only at a
+    /// turn's start, so "the turn that handles it" is well defined; it waits for the next turn.
+    pub fn drain_radio_but_requests(&self) -> Vec<crate::radio::RadioMessage> {
+        let mut board = self.board();
+        let (requests, rest): (Vec<_>, Vec<_>) = board.radio_inbox.drain(..).partition(|m| m.kind == crate::radio::Kind::Request);
+        board.radio_inbox.extend(requests);
+        rest
+    }
+
+    /// Takes the unread `ack`, `done` and `failed` that answer request `id` (`radio_tx`'s wait, #124).
+    pub fn take_radio_replies(&self, id: &str) -> Vec<crate::radio::RadioMessage> {
+        let mut board = self.board();
+        let (replies, rest): (Vec<_>, Vec<_>) =
+            board.radio_inbox.drain(..).partition(|m| m.kind.is_reply() && m.reply_to.as_deref() == Some(id));
+        board.radio_inbox.extend(rest);
+        replies
+    }
+
     /// Where the other Marvs' doors are (set when this one's door opens).
     pub fn set_peer_dir(&self, dir: PathBuf) {
+        if let Some(herdr) = self.herdr() {
+            herdr.set_mesh_dir(dir.clone());
+        }
         *self.peer_dir.lock().unwrap_or_else(|e| e.into_inner()) = Some(dir);
     }
     pub fn peer_dir(&self) -> Option<PathBuf> {
@@ -260,6 +281,10 @@ impl Switchboard {
 
     /// Offers Herdr's agent panes: found on demand by name ([`crate::herdr::HerdrPanes`]) and listed by `mesh_list`.
     pub fn set_herdr(&self, adapter: Arc<crate::herdr::HerdrAdapter>) {
+        // #124: a pane send looks for a Marv on the radio in the pane, in this switchboard's mesh folder.
+        if let Some(dir) = self.peer_dir() {
+            adapter.set_mesh_dir(dir);
+        }
         self.add_resolver(Arc::new(crate::herdr::HerdrPanes(adapter.clone())));
         *self.herdr.lock().unwrap_or_else(|e| e.into_inner()) = Some(adapter);
     }
