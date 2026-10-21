@@ -3,8 +3,12 @@
 //! read as the person answering in the tool's place. The guard is `marv_agent::send_now::at_step_boundary`, checked
 //! right before the message is appended (`LoopState::deliver_sent_now`).
 //!
-//! Proven: with the `at_step_boundary` check in `deliver_sent_now` removed, the second test fails (the message lands
-//! right after the call still waiting for its result).
+//! And it never makes two user turns in a row (some APIs reject them, others merge them): it joins a user turn no
+//! request has carried yet, and waits behind one a request already carried.
+//!
+//! Proven: with the `at_step_boundary` check in `can_deliver` removed, `a_history_that_ends_mid_call_keeps_the_message_
+//! waiting` fails (the message lands right after the call still waiting for its result); with the merge into the last
+//! user turn replaced by a push, `a_message_sent_now_never_makes_two_user_turns_in_a_row` fails.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -52,6 +56,11 @@ fn user_message_inside_a_call(history: &[ChatTurn]) -> Option<usize> {
     None
 }
 
+/// Where two user turns follow each other in `history`, if anywhere.
+fn two_user_turns_in_a_row(history: &[ChatTurn]) -> Option<usize> {
+    history.windows(2).position(|w| matches!(w, [ChatTurn::User { .. }, ChatTurn::User { .. }]))
+}
+
 fn read(id: &str) -> ToolCall {
     tool_call(id, "read_file", json!({ "path": id }))
 }
@@ -83,7 +92,8 @@ async fn a_message_sent_during_a_turn_never_lands_between_a_tool_call_and_its_re
     let history = history.lock().unwrap().clone();
     assert_eq!(user_message_inside_a_call(&history), None, "{history:?}");
     // Every message was delivered: none was dropped to keep the order.
-    let delivered = history.iter().filter(|t| matches!(t, ChatTurn::User { text } if text.starts_with("while "))).count();
+    let delivered: usize =
+        history.iter().map(|t| if let ChatTurn::User { text } = t { text.matches("while ").count() } else { 0 }).sum();
     assert_eq!(delivered, 5);
     assert!(send_now.close().is_empty());
 }
@@ -104,4 +114,33 @@ async fn a_history_that_ends_mid_call_keeps_the_message_waiting() {
     }
     // It never found a boundary: it comes back to the person, never dropped.
     assert_eq!(send_now.close(), ["and also this"]);
+}
+
+#[tokio::test]
+async fn a_message_sent_now_never_makes_two_user_turns_in_a_row() {
+    // Sent before the first request (after the turn's own message), during each step's calls (after a check's note),
+    // and during a plain answer: every request is free of two user turns in a row.
+    let provider = Scripted::new(vec![use_tools(vec![read("a"), read("b")]), say("Done."), say("Done again.")]);
+    let send_now = SendNow::new();
+    send_now.push("before the first request".into()).unwrap();
+    let (mut options, history) = options(provider.clone(), vec![ChatTurn::User { text: "go".into() }], &send_now);
+    options.after_step = Some(Arc::new(|_| Box::pin(async { Some("(Automatic note from Marv) a check's note".to_string()) })));
+    let typed = send_now.clone();
+    let mut stream = std::pin::pin!(run_agent(options));
+    while let Some(event) = stream.next().await {
+        if matches!(&event, marv_agent::LoopEvent::TextDelta(text) if text == "Done.") {
+            typed.push("during the answer".into()).unwrap();
+        }
+    }
+    let requests = provider.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 3);
+    for (n, (sent, _)) in requests.iter().enumerate() {
+        assert_eq!(two_user_turns_in_a_row(sent), None, "request {n}: {sent:?}");
+        assert_eq!(user_message_inside_a_call(sent), None, "request {n}: {sent:?}");
+    }
+    // Everything arrived.
+    let all = format!("{:?}", history.lock().unwrap());
+    for text in ["before the first request", "while a ran", "while b ran", "during the answer"] {
+        assert!(all.contains(text), "{text}: {all}");
+    }
 }

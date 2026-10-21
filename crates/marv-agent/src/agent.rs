@@ -57,11 +57,14 @@
 //! - A `Retry` from the provider means it starts over: this step's text, calls and reasoning are
 //!   discarded so the retry doesn't duplicate them.
 //! - **"Send now"** (`send_now`, [`crate::send_now`]; new in marv-rs): the person's messages sent while the run
-//!   goes are appended as ordinary user messages at the next step boundary: at the top of each step, before its
-//!   request (after `after_step`'s note, so the person has the last word), or in place of ending the run on a plain
-//!   answer (one more step reads them). Only where every call has its result ([`crate::send_now::at_step_boundary`]);
-//!   each yields a `SentNow` once it's in the history. Nothing is stopped for one, and the step limit counts the
-//!   step it causes. Not during a cancel, and not after the run ended: the session hands those back.
+//!   goes go in as one user message (joined by blank lines) at the next step boundary: at the top of a step that
+//!   goes on to an ordinary request (after `after_step`'s note, so the person has the last word; at the step limit
+//!   only after a "continue"), or in place of ending the run on a plain answer (one more step reads them, unless
+//!   that step would be at the limit). Only where every call has its result ([`crate::send_now::at_step_boundary`]).
+//!   Never two user turns in a row: a user turn no request has carried yet (`sent_len`) takes them after a blank
+//!   line; one a request already carried (an empty reply's retry resends it) is never rewritten, so they wait. Each
+//!   yields a `SentNow` once it's in the history. Nothing is stopped for one. Not during a cancel, and not after the
+//!   run ended: the session hands those back.
 //!
 //! marv-rs changes and planned work:
 //! - **#90 announced next step, no tool call**: a plain answer that ends by announcing what it
@@ -837,6 +840,9 @@ pub struct LoopState {
     /// A failing command was tried again after the warning: the step's remaining calls don't run, the run ends `Loop`.
     failure_stop: bool,
     in_flight: InFlight,
+    /// The history's length when the last request was sent: a turn below it was carried by a request and is never
+    /// rewritten (a "send now" message joins only a user turn above it).
+    sent_len: usize,
 }
 
 impl LoopState {
@@ -858,6 +864,7 @@ impl LoopState {
             failures: FailureLoopState::default(),
             failure_stop: false,
             in_flight: InFlight::default(),
+            sent_len: 0,
         }
     }
 
@@ -925,6 +932,7 @@ impl LoopState {
             Phase::Request { tool_choice, wrap_up } => {
                 // The lock is never held across an await: the adapter serializes the snapshot at once.
                 let snapshot = self.options.history.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                self.sent_len = snapshot.len();
                 let options = StreamOptions {
                     system: Some(self.options.system.clone()),
                     tools: self.options.tools.clone(),
@@ -961,6 +969,8 @@ impl LoopState {
                 if let Some(on_full) = self.options.on_full.clone()
                     && on_full().await
                 {
+                    // A fresh history (the summary and a note): none of it was sent yet.
+                    self.sent_len = 0;
                     self.emit(LoopEvent::Compacted);
                     if self.aborted() {
                         return self.finish(StopReason::Aborted);
@@ -986,9 +996,10 @@ impl LoopState {
     /// The step limit guards against a model that never finishes. With `on_limit`, the user decides
     /// at each multiple whether it goes on. `max_steps` 0 (the guard off) never matches.
     async fn top(&mut self) {
-        // The step boundary: the person's "send now" messages go in before this step's request.
-        self.deliver_sent_now();
         if !at_step_limit(self.step, self.options.max_steps) {
+            // The step boundary: the person's "send now" messages go in before this step's request. Only before an
+            // ordinary request: at the limit they wait for a "continue", or go back to the person with the turn.
+            self.deliver_sent_now();
             self.phase = Phase::Request { tool_choice: ToolChoice::Auto, wrap_up: None };
             return;
         }
@@ -1004,6 +1015,8 @@ impl LoopState {
             return self.finish(StopReason::Aborted);
         }
         if continued {
+            // Including what was typed while the limit was asked.
+            self.deliver_sent_now();
             self.phase = Phase::Request { tool_choice: ToolChoice::Auto, wrap_up: None };
             return;
         }
@@ -1156,7 +1169,8 @@ impl LoopState {
         if calls.is_empty() {
             // "Send now": a message that came while this reply streamed is read by one more step, rather than left
             // for after the turn. It's what the person said last, so it goes ahead of #90's "continue".
-            if !aborted && self.deliver_sent_now() {
+            // Not when the next step is at the step limit: then the turn ends and they go back to the person.
+            if !aborted && self.can_deliver() && !at_step_limit(self.step + 1, self.options.max_steps) {
                 return self.next_step();
             }
             // #90: a plain answer that announces its next step ("Now checking issue #7 before
@@ -1213,22 +1227,42 @@ impl LoopState {
     /// the run is being stopped: they stay waiting, and the session hands them back.
     fn deliver_sent_now(&mut self) -> bool {
         let Some(send_now) = self.options.send_now.clone() else { return false };
-        if send_now.is_empty() || self.aborted() {
+        if !self.can_deliver() {
             return false;
         }
         let texts = {
             let mut history = self.options.history.lock().unwrap_or_else(|e| e.into_inner());
-            if !at_step_boundary(&history) {
-                return false;
-            }
             let texts = send_now.take();
-            history.extend(texts.iter().map(|text| ChatTurn::User { text: text.clone() }));
+            let joined = texts.join("\n\n");
+            // Never two user turns in a row: a user turn that no request has carried yet (the turn's own message, a
+            // check's note, a nudge) takes the person's words after a blank line. One already sent is never rewritten.
+            match history.last_mut() {
+                Some(ChatTurn::User { text }) => {
+                    text.push_str("\n\n");
+                    text.push_str(&joined);
+                }
+                _ => history.push(ChatTurn::User { text: joined }),
+            }
             texts
         };
         for text in texts {
             self.emit(LoopEvent::SentNow { text });
         }
         true
+    }
+
+    /// Whether waiting "send now" messages can go in now: some wait, the run isn't being stopped, every call has its
+    /// result ([`at_step_boundary`]), and the history doesn't end with a user turn a request already carried (the
+    /// same request again after an empty reply: appending would make two user turns in a row, rewriting it would
+    /// break the cache). Then they wait for the next boundary.
+    fn can_deliver(&self) -> bool {
+        let Some(send_now) = &self.options.send_now else { return false };
+        if send_now.is_empty() || self.aborted() {
+            return false;
+        }
+        let history = self.options.history.lock().unwrap_or_else(|e| e.into_inner());
+        let sent_user = matches!(history.last(), Some(ChatTurn::User { .. })) && history.len() <= self.sent_len;
+        at_step_boundary(&history) && !sent_user
     }
 
     /// One transition of running the step's calls. True when they're all answered and the phase moved on.
@@ -3521,11 +3555,11 @@ mod tests {
         let requests = provider.requests();
         let second = &requests[1].0;
         // Both calls ran (nothing was stopped for it), their results first, in call order, then the person's words.
-        // Each call pushed it once: two messages, two user turns, in order.
+        // Each call pushed it once: two messages, one user turn (never two in a row), in order.
         assert!(matches!(
-            &second[second.len() - 4..],
-            [ChatTurn::Tool { call_id: a, .. }, ChatTurn::Tool { call_id: b, .. }, ChatTurn::User { text: x }, ChatTurn::User { text: y }]
-                if a == "c1" && b == "c2" && x == "also b" && y == "also b"
+            &second[second.len() - 3..],
+            [ChatTurn::Tool { call_id: a, .. }, ChatTurn::Tool { call_id: b, .. }, ChatTurn::User { text }]
+                if a == "c1" && b == "c2" && text == "also b\n\nalso b"
         ));
         // Appended, not inserted: the second request starts with the first one (prompt cache).
         assert_eq!(second[..requests[0].0.len()], requests[0].0[..]);
@@ -3551,7 +3585,9 @@ mod tests {
         })
         .await;
         let second = &provider.requests()[1].0;
-        assert_eq!(&second[second.len() - 2..], &[user("Marv: 1 new error"), user("and the tests")]);
+        // The note was never sent: the person's words join it, after a blank line.
+        assert_eq!(second.last(), Some(&user("Marv: 1 new error\n\nand the tests")));
+        assert!(!matches!(&second[second.len() - 2], ChatTurn::User { .. }));
     }
 
     #[tokio::test]
@@ -3583,7 +3619,7 @@ mod tests {
         q.push("in Rust".into()).unwrap();
         collect(AgentOptions { send_now: Some(q.clone()), ..options(provider.clone(), &history(vec![user("go")]), plain()) })
             .await;
-        assert_eq!(provider.requests()[0].0, [user("go"), user("in Rust")]);
+        assert_eq!(provider.requests()[0].0, [user("go\n\nin Rust")]);
     }
 
     #[tokio::test]
@@ -3648,5 +3684,86 @@ mod tests {
         assert!(state.deliver_sent_now());
         assert_eq!(snapshot(&h).last(), Some(&user("now")));
         assert!(matches!(state.queue.pop_front(), Some(LoopEvent::SentNow { text }) if text == "now"));
+    }
+
+    #[tokio::test]
+    async fn sent_now_after_an_empty_reply_waits_rather_than_follow_or_rewrite_the_sent_message() {
+        let empty = vec![ProviderEvent::Done { reason: Some("stop".into()) }];
+        let provider = Arc::new(ScriptedProvider::new(vec![empty, say("Ok."), say("And b.")]));
+        let q = SendNow::new();
+        let h = history(vec![user("go")]);
+        let mut stream =
+            std::pin::pin!(run_agent(AgentOptions { send_now: Some(q.clone()), ..options(provider.clone(), &h, plain()) }));
+        while let Some(event) = stream.next().await {
+            if matches!(event, LoopEvent::EmptyReply { .. }) {
+                q.push("and b".into()).unwrap();
+            }
+        }
+        let requests = provider.requests();
+        // The retry is the same request (cached): "go" was sent, so it isn't rewritten and nothing follows it.
+        assert_eq!(requests[1].0, requests[0].0);
+        assert_eq!(requests[2].0, [user("go"), said("Ok."), user("and b")]);
+    }
+
+    /// A run with `max_steps` 1 whose only step's call runs while the person sends "and b"; `on_limit` answers.
+    async fn at_the_limit(answer: Option<LimitAnswer>) -> (Arc<ScriptedProvider>, SendNow, Vec<LoopEvent>) {
+        let provider = Arc::new(ScriptedProvider::new(vec![use_tools(&[call("c1", "a.ts")]), say("Wrapped up.")]));
+        let q = SendNow::new();
+        let mut runner = sending(&q, "and b");
+        runner.parallel = |_| false;
+        let on_limit: Option<OnLimit> = answer.map(|a| -> OnLimit { Arc::new(move |_| Box::pin(async move { a })) });
+        let events = collect(AgentOptions {
+            send_now: Some(q.clone()),
+            max_steps: 1,
+            on_limit,
+            wrap_up_at_limit: true,
+            ..options(provider.clone(), &history(vec![user("go")]), runner)
+        })
+        .await;
+        (provider, q, events)
+    }
+
+    #[tokio::test]
+    async fn sent_now_waits_at_the_step_limit_goes_in_on_continue_and_comes_back_on_a_stop() {
+        let mentions = |p: &ScriptedProvider| {
+            p.requests().iter().any(|(h, _)| h.iter().any(|t| matches!(t, ChatTurn::User { text } if text.contains("and b"))))
+        };
+        // "Continue": read by the next request.
+        let (provider, q, _) = at_the_limit(Some(LimitAnswer::Continue)).await;
+        assert!(mentions(&provider));
+        assert!(q.close().is_empty());
+        // "Stop": not read, and back to the person.
+        let (provider, q, events) = at_the_limit(Some(LimitAnswer::Stop)).await;
+        assert!(!mentions(&provider));
+        assert_eq!(end(&events), Some(StopReason::MaxSteps));
+        assert_eq!(q.close(), ["and b"]);
+        // A hard stop's wrap-up reply doesn't get it either.
+        let (provider, q, events) = at_the_limit(None).await;
+        assert_eq!(provider.requests().len(), 2);
+        assert!(!mentions(&provider));
+        assert_eq!(end(&events), Some(StopReason::MaxSteps));
+        assert_eq!(q.close(), ["and b"]);
+    }
+
+    #[tokio::test]
+    async fn sent_now_during_a_plain_answer_at_the_limit_ends_the_turn_and_comes_back() {
+        let provider = Arc::new(ScriptedProvider::new(vec![say("Done.")]));
+        let q = SendNow::new();
+        let h = history(vec![user("go")]);
+        let mut events = Vec::new();
+        let mut stream = std::pin::pin!(run_agent(AgentOptions {
+            send_now: Some(q.clone()),
+            max_steps: 1,
+            ..options(provider.clone(), &h, plain())
+        }));
+        while let Some(event) = stream.next().await {
+            if matches!(event, LoopEvent::TextDelta(_)) && events.is_empty() {
+                q.push("and b".into()).unwrap();
+            }
+            events.push(event);
+        }
+        assert_eq!(provider.requests().len(), 1);
+        assert_eq!(end(&events), Some(StopReason::End));
+        assert_eq!(q.close(), ["and b"]);
     }
 }
