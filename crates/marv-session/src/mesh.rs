@@ -125,7 +125,7 @@ pub trait WireApprover: Send + Sync {
 }
 
 /// The answer to [`WireApprover::approve_call`]'s one prompt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallWire {
     /// Yes to both: the wire (granted by this) and the call.
     Granted(WireBy),
@@ -148,6 +148,7 @@ const WIRE_LASTS: &str = "The wire lasts until either agent ends.";
 pub fn wire_approval(request: &WireRequest) -> ApprovalRequest {
     let (from, to, mode) = (&request.from, &request.to, request.mode);
     ApprovalRequest {
+        reason: false,
         tool: "mesh_wire".into(),
         label: request.title(),
         preview: Preview {
@@ -197,7 +198,7 @@ impl WireApprover for PersonWires {
     async fn approve_wire(&self, request: WireRequest) -> Option<WireBy> {
         match self.inner.approve(wire_approval(&request)).await {
             Decision::Yes | Decision::Always => Some(self.by),
-            Decision::No | Decision::Unavailable => None,
+            Decision::No | Decision::Declined(_) | Decision::Unavailable => None,
         }
     }
 
@@ -714,7 +715,7 @@ mod tests {
     impl Approver for Person {
         async fn approve(&self, request: ApprovalRequest) -> Decision {
             self.1.lock().unwrap().push(request);
-            self.0
+            self.0.clone()
         }
     }
 
@@ -1209,7 +1210,7 @@ mod tests {
         };
         for (answer, wakes) in [(Decision::No, false), (Decision::Yes, true)] {
             let worker = mesh.plug_next(WORKER).unwrap();
-            let person = Arc::new(Person(answer, Mutex::default()));
+            let person = Arc::new(Person(answer.clone(), Mutex::default()));
             let mut ctx = ToolContext::new(std::env::temp_dir());
             ctx.approver = Some(person.clone());
             let wires = wire_approver(None, Some(&(person.clone() as Arc<dyn Approver>)));

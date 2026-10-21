@@ -538,7 +538,15 @@ impl App {
                 }
             }
             Event::Paste(text) => {
-                if self.phase == Phase::Main && self.setup.is_none() && self.approval.is_none() && self.picker.is_none() {
+                // A reason being typed at an approval (#185) takes the paste; nothing else under it does.
+                if self.approval.is_some() {
+                    if self.setup.is_none()
+                        && let Some((_, view)) = &mut self.approval
+                        && view.paste(&text)
+                    {
+                        self.dirty = true;
+                    }
+                } else if self.phase == Phase::Main && self.setup.is_none() && self.approval.is_none() && self.picker.is_none() {
                     match &mut self.palette {
                         Some(palette) => palette.paste(&text),
                         None => self.prompt.paste(&text),
@@ -2091,6 +2099,7 @@ mod tests {
 
     fn write_request(path: &str, agent: Option<&str>) -> ApprovalRequest {
         ApprovalRequest {
+            reason: true,
             tool: "write_file".into(),
             label: path.into(),
             preview: Preview {
@@ -2428,6 +2437,28 @@ mod tests {
         assert_eq!(h.calls().last(), Some(&Call::Answer(1, Decision::No)));
         h.events([UiEvent::Done(StopReason::Declined), turn_end()]);
         assert!(h.frame().contains("Stopped. Tell Marv what to do instead."));
+    }
+
+    /// #185: tab, a reason, Enter: the answer carries the reason, nothing is aborted (the turn goes on), and a paste
+    /// lands in the reason, not the prompt.
+    #[test]
+    fn no_and_say_why_answers_with_the_reason_and_doesnt_stop() {
+        let mut h = harness();
+        h.typed("make a file");
+        h.events([UiEvent::Approval { id: ApprovalId(1), request: write_request("made.txt", None) }]);
+        h.arm();
+        h.key(KeyCode::Tab);
+        for c in "call it notes.txt".chars() {
+            h.key(KeyCode::Char(c));
+        }
+        h.app.on_event(Event::Paste(" please".into()), h.now);
+        assert_eq!(h.app.prompt.value, "");
+        assert!(h.frame().contains("Why not?"));
+        h.key(ENTER);
+        let calls = h.calls();
+        assert_eq!(calls.last(), Some(&Call::Answer(1, Decision::Declined("call it notes.txt please".into()))));
+        assert!(!calls.contains(&Call::Abort));
+        assert!(!h.frame().contains("Why not?"));
     }
 
     #[test]

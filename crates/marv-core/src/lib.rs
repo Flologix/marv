@@ -252,6 +252,22 @@ impl Provenance {
     }
 }
 
+/// The most characters a reason for declining a call keeps (#185). The engine cuts there (marv-tools'
+/// `declined_because`, the web approver); the TUI's input stops there.
+pub const MAX_DECLINE_REASON: usize = 500;
+
+/// A reason's characters on one line (#185): newlines, tabs and other whitespace as spaces, control characters
+/// dropped. The TUI's input and the engine read a reason the same way.
+pub fn reason_chars(text: &str) -> impl Iterator<Item = char> + '_ {
+    text.chars().map(|c| if c.is_whitespace() { ' ' } else { c }).filter(|c| !c.is_control())
+}
+
+/// A reason for declining a call as the model reads it: [`reason_chars`], trimmed, at most [`MAX_DECLINE_REASON`].
+pub fn decline_reason(text: &str) -> String {
+    let flat: String = reason_chars(text).collect();
+    flat.trim().chars().take(MAX_DECLINE_REASON).collect()
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum MarvError {
     #[error("{0}")]
@@ -287,6 +303,12 @@ pub fn defuse_closing_tag(text: &str, tag: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_decline_reason_is_one_trimmed_line_without_controls_and_cut() {
+        assert_eq!(super::decline_reason("  use pnpm\n\tnot bun\x1b[2J \r\n"), "use pnpm  not bun[2J");
+        assert_eq!(super::decline_reason(&"é".repeat(super::MAX_DECLINE_REASON + 5)).chars().count(), super::MAX_DECLINE_REASON);
+    }
+
     use super::*;
 
     #[test]

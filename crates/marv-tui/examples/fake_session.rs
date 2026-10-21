@@ -138,6 +138,7 @@ fn write_request(path: &str, agent: Option<String>) -> ApprovalRequest {
         .map(|i| DiffLine { kind: DiffKind::Add, text: format!("line {i} of {path}"), old_line: None, new_line: Some(i) })
         .collect();
     ApprovalRequest {
+        reason: true,
         tool: "write_file".into(),
         label: path.into(),
         preview: Preview { title: format!("Create {path}"), diff: Some(diff), ..Default::default() },

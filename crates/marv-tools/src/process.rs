@@ -346,7 +346,7 @@ mod tests {
     impl Approver for Asked {
         async fn approve(&self, request: ApprovalRequest) -> Decision {
             self.0.lock().unwrap().push(request);
-            self.1
+            self.1.clone()
         }
     }
 

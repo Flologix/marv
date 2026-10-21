@@ -547,3 +547,40 @@ fn headless_config_approve_files_in_the_home_folder_is_refused() {
     assert_eq!(out.code, Some(3), "{} {}", out.result, out.stderr);
     assert!(!config.path().join("home/bin/seeded").exists());
 }
+
+/// **A decline with a reason is still a no, and never remembered (#185).** The person answers each of two writes
+/// in the same scope with a reason: neither runs, both are asked (nothing was remembered from the first), each
+/// result carries the reason as the user's words (unfenced), the turn goes on to the model's reply, and nothing
+/// taints the session.
+///
+/// Proven: let `Decision::Declined` fall into `run_tool`'s running arm → this failed (the file was written).
+#[tokio::test]
+async fn a_decline_with_a_reason_never_runs_the_call_and_isnt_remembered() {
+    let s = Setup::new();
+    let approver = Recorder::new(Decision::Declined("put it in lib.rs".into()));
+    let calls = vec![
+        tool_call("1", "write_file", json!({"path": "src/main.rs", "content": "fn main() {}\n"})),
+        tool_call("2", "write_file", json!({"path": "src/other.rs", "content": "fn other() {}\n"})),
+    ];
+    let run = sdk_turn(s.project.path(), &s.config_dir, Scripted::new(vec![use_tools(calls), say("Done.")]), |o| {
+        o.yolo = false;
+        o.approve = Some(approver.clone());
+    })
+    .await;
+    assert_eq!(approver.requests().len(), 2, "each asked: a reason is never an \"always\"");
+    assert_eq!(s.project.read("src/main.rs"), None, "not run");
+    assert_eq!(s.project.read("src/other.rs"), None, "not run");
+    for result in &run.results {
+        assert_eq!(result.output, marv_tools::declined_because("put it in lib.rs"));
+        assert!(!declined(result) && !result.output.contains("untrusted-data"));
+    }
+    let events = &run.events;
+    assert!(
+        !events.iter().any(|e| matches!(e, marv_session::session::SessionEvent::Tainted { .. })),
+        "the user's own words taint nothing"
+    );
+    assert!(events.iter().any(|e| matches!(
+        e,
+        marv_session::session::SessionEvent::Loop(marv_agent::LoopEvent::Done(marv_core::StopReason::End))
+    )));
+}

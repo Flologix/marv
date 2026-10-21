@@ -52,6 +52,7 @@ fn read_only_mcp_tool(taint: &Arc<TaintState>, answer: &'static str) -> ToolRef 
 
 fn request(key: &str, must_ask: bool, network: bool) -> ApprovalRequest {
     ApprovalRequest {
+        reason: false,
         tool: "bash".into(),
         label: key.into(),
         preview: Preview::default(),
