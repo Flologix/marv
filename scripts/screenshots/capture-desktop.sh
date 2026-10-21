@@ -26,7 +26,7 @@ python3 -m http.server "$port" --bind 127.0.0.1 --directory "$tmp/dist" >/dev/nu
 server_pid=$!
 sleep 0.5
 
-chromium --headless --disable-gpu --hide-scrollbars --force-device-scale-factor=2 --window-size=1280,960 \
+"${CHROMIUM:-chromium}" --headless --disable-gpu --hide-scrollbars --force-device-scale-factor=2 --window-size=1280,960 \
   --virtual-time-budget=4000 --screenshot="$tmp/desktop.raw.png" "http://127.0.0.1:$port/" 2>/dev/null
 magick "$tmp/desktop.raw.png" -resize 75% -dither None -colors 128 -strip -define png:compression-level=9 "$out/desktop.png"
 echo "$out/desktop.png: $(du -k "$out/desktop.png" | cut -f1) KB"

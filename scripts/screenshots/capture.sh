@@ -46,6 +46,8 @@ sh "$here/demo_project.sh" "$home/demo/todo-api" >/dev/null
 python3 "$here/stub_provider.py" "$port" &
 stub_pid=$!
 sleep 0.5
+# A port already in use would send Marv's requests to whatever holds it: stop instead.
+kill -0 "$stub_pid" 2>/dev/null || { echo "the stub provider didn't start (port $port in use?)" >&2; exit 1; }
 
 # Start Marv in a clean environment (no keys, no Herdr, no real HOME) at the given size.
 start() { # cols rows
@@ -72,7 +74,7 @@ shot() { # name cols rows
   sleep 0.5
   tmux -L "$sock" capture-pane -e -p -t shot >"$tmp/$1.ans"
   python3 "$here/ansi2html.py" "$tmp/$1.ans" "$tmp/$1.html" "~/demo/todo-api — marv"
-  chromium --headless --disable-gpu --hide-scrollbars --allow-file-access-from-files \
+  "${CHROMIUM:-chromium}" --headless --disable-gpu --hide-scrollbars --allow-file-access-from-files \
     --force-device-scale-factor=2 --window-size="$width,$height" \
     --screenshot="$tmp/$1.raw.png" "file://$tmp/$1.html" 2>/dev/null
   magick "$tmp/$1.raw.png" -dither None -colors 64 -strip -define png:compression-level=9 "$out/$1.png"

@@ -2,7 +2,7 @@
 
 How `docs/images/screenshot.png`, `approval.png` and `desktop.png` are made, so they can be made again for each release. Everything runs headless (no window opens), against a stub model: no API key, no cost, and no real paths (the demo `HOME` is a temp folder, so the project shows as `~/demo/todo-api`).
 
-Needs `tmux`, `python3`, `git`, `chromium`, ImageMagick 7 (`magick`), bubblewrap, and app/'s `node_modules` (`cd app && npm ci`).
+Needs `tmux`, `python3`, `git`, `chromium` (or set `CHROMIUM` to another Chromium-based browser, e.g. `CHROMIUM=google-chrome`), ImageMagick 7 (`magick`), bubblewrap, and app/'s `node_modules` (`cd app && npm ci`).
 
 ```sh
 cargo build -p marv-cli
