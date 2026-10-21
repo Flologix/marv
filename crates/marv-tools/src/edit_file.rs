@@ -210,7 +210,7 @@ impl Tool for EditFile {
         }
         // Planned again: the file may have changed while the user was deciding. Read, written and formatted as one
         // step per file, so a parallel edit (or append) can't be lost, and the formatter can't be formatted over.
-        let (planned, formatted) = with_file_lock(&ctx.root, &input.path, || async {
+        let (planned, formatted) = with_file_lock(ctx, &input.path, || async {
             let planned = plan(input, ctx).await?;
             tokio::fs::write(&planned.absolute, &planned.after)
                 .await

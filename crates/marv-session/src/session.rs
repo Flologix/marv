@@ -1757,6 +1757,10 @@ impl MarvSession {
         ctx.checkpoint = checkpoint.map(|c| c as Arc<dyn marv_tools::Checkpoint>);
         ctx.taint = self.inner.taint.clone();
         ctx.file_versions = self.inner.file_versions.clone();
+        // The edit tools' check-and-write locks against other Marv processes in this folder (none without a runtime
+        // folder: then within this process only).
+        ctx.file_locks = marv_sandbox::runtime_dir_for(&marv_sandbox::runtime_env(), Some(&init.root))
+            .map(|dir| dir.join(marv_tools::file_lock::LOCK_FOLDER));
         // The main agent's doors out of the sandbox, fixed for the session (the prompt names them: the cache).
         ctx.doors.host = init.host_commands;
         ctx.doors.github = init.github;

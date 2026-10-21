@@ -415,6 +415,9 @@ pub struct ToolContext {
     /// `write_file` refuse to write over an existing file that changed since, or that it never read. The session
     /// keeps one across its turns; a subagent gets its own.
     pub file_versions: Arc<FileVersions>,
+    /// Where the edit tools' cross-process file locks live (the runtime folder's `file-locks/`, see
+    /// [`crate::file_lock`]). None: calls on one file are ordered within this process only.
+    pub file_locks: Option<PathBuf>,
 }
 
 /// Sandboxed commands, by [`marv_core::command::command_key`], whose failure without network looked like the missing
@@ -462,6 +465,7 @@ impl ToolContext {
             network_failures: Arc::default(),
             tool_output: None,
             file_versions: Arc::default(),
+            file_locks: None,
         }
     }
 

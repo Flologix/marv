@@ -164,7 +164,7 @@ impl Tool for WriteFile {
             return Ok(ToolOutput::ok(INTERRUPTED_BEFORE_WRITE, "interrupted"));
         }
         // Read, written and formatted as one step per file, so a parallel append (or edit) can't be lost.
-        let (planned, formatted) = with_file_lock(&ctx.root, &input.path, || async {
+        let (planned, formatted) = with_file_lock(ctx, &input.path, || async {
             let planned = plan(input, ctx).await?;
             let failed = |e: std::io::Error| ToolError(format!("Couldn't write {}: {e}", planned.shown));
             if let Some(dir) = planned.absolute.parent() {
