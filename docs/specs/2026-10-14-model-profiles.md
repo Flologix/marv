@@ -1,8 +1,8 @@
 # Model profiles: apply_patch for GPT models, per-family prompt addenda
 
 - Issue: FlologixAI/marv #66
-- Status: **draft, for approval.** Nothing is implemented until this is approved.
-- Date: 2026-10-14
+- Status: **approved 2026-10-20 with amendments.** The amendments are folded into the text below; the decisions are in §9, the PRs in §8.
+- Date: 2026-10-14 (draft), revised against `main` 2026-10-20 (after #147, #143, #67 and the 0.7.0 home-folder rules)
 - Scope:
   - `crates/marv-provider`: the profile table;
   - `crates/marv-tools`: `apply_patch`, registry;
@@ -25,17 +25,19 @@ opencode, per the issue, gives GPT models (other than gpt-4 and `oss`) a patch t
 | What | Where |
 |---|---|
 | The built-in tool list, in a fixed order (`read_file`, `glob`, `grep`, `web_fetch`, `github`, `skill`, `edit_file`, `write_file`, `bash`, `process`, `memory`, `plan`, `agent`) | `crates/marv-tools/src/registry.rs::builtin_tools` |
-| Session tool specs: `tool_specs_for(has_skills, plan, github)`, built **once** in `MarvSession::new` and held in `Inner::specs` (immutable) | `registry.rs`, `crates/marv-session/src/session.rs` (`let mut specs = marv_tools::tool_specs_for(…)`) |
+| Session tool specs: `tool_specs_for(has_skills, plan, github)` (minus `process` without its door), then the caller's tools, then `herdr` (the Herdr door, #74), then the mesh's `mesh_list`, `mesh_call`, `mesh_send`; built **once** in `MarvSession::new` and held in `Inner::specs` (immutable). `offered()` adds `radio_tx` (#124) after the mesh tools in a conversation that started with the radio on, then the MCP specs | `registry.rs`, `crates/marv-session/src/session.rs` (`MarvSession::new`, `offered`) |
 | Callable tools filtered the same way: the model can't call a tool that isn't offered | `session.rs::offered` |
-| System prompt: `system_prompt(&PromptInput)`. `BASE_REST_TEXT` names `edit_file` and `write_file` in fixed text. Built by `MarvSession::build_system`, rebuilt only by `clear()` | `crates/marv-session/src/prompt.rs`, `session.rs` |
+| System prompt: `system_prompt(&PromptInput)`. `BASE_REST_TEXT` names `edit_file` and `write_file` in fixed text. The `# Fixing bugs` section (`FIXING_BUGS`, #147) is added only when `input.tools` contains `edit_file`; `# Your situation` (`situation_section`, with `HERDR_SITUATION`/`HERDR_SITUATION_READS` in Herdr) follows. Built by `MarvSession::build_system`, rebuilt only by `clear()` | `crates/marv-session/src/prompt.rs` (`system_prompt`, the `fixing` line), `session.rs` |
 | Subagents: `SUBAGENT_TOOLS` includes `edit_file` and `write_file`; Claude Code's `Edit`/`MultiEdit`/`Write` map to them; `subagent_prompt` adds an `edit_file` sentence when it is offered; a subagent type can name its own model | `crates/marv-session/src/agents.rs`, `subagent.rs`, `prompt.rs::subagent_prompt` |
-| `edit_file`: plan in preview and again under the file lock; `edit_match::apply_edit` (exact → Unicode (#60) → trailing whitespace → indentation; CRLF kept); `closest_lines` error; `syntax::broken_by` note; `before_change` (typecheck baseline); `auto_safe` unless `touches_git`; `protected_target` (protected paths and the `package.json` lifecycle-scripts rule); scope `files` | `crates/marv-tools/src/edit_file.rs`, `edit_match.rs` |
+| `edit_file`: plan in preview and again under the file lock; `edit_match::apply_edit` (exact → Unicode (#60) → trailing whitespace → indentation; CRLF kept); `closest_lines` error; `syntax::broken_by` note; `before_change` (typecheck baseline); `auto_safe` unless `touches_git`; `protected_target` (protected paths, the `package.json` lifecycle-scripts rule, and in the home folder `marv_sandbox::protected::home_rule`: dotfiles and git hooks folders); scope `files` | `crates/marv-tools/src/edit_file.rs` (`protected_target(path, ctx)`), `edit_match.rs` |
+| #67 formatter: `formatter::after_write(ctx, shown, absolute, wrote)` runs under the file lock right after the write; it skips protected paths and `package.json` itself, and the result's diff is the formatted file | `crates/marv-tools/src/formatter.rs`, `edit_file.rs::run` |
+| Home-folder rules (0.7.0): a project that is `~` or holds it makes every `ToolKind::Write` call with scope `files` ask `once` (`registry::home_file_write`): no "always", no config seed, not in yolo | `registry.rs::run_tool`, guard `tests/guards/tests/sandbox.rs::in_the_home_folder_dotfiles_and_hooks_ask_even_in_yolo` |
 | `write_file`: create/overwrite/append (the long-file-in-parts workaround), same rules | `crates/marv-tools/src/write_file.rs` |
 | The approval flow: protected → `must_ask` (asks even in yolo); taint; the turn's checkpoint (#16) before any write; yolo + `auto_safe` | `registry.rs::run_tool` |
 | One changed path per call: `ToolOutput::changed: Option<String>`, read by the undo report (`session.rs::note_changed`), the typecheck (`diagnostics/turn.rs`) and the project checks | `crates/marv-tools/src/types.rs` |
 | Multi-file preview already exists: `Preview::files: Option<Vec<PreviewFile>>` (built for `/undo`), rendered by the TUI approval panel | `types.rs`, `crates/marv-tui/src/ui/approval.rs` |
-| The apply_patch plan and types, not registered: `PatchOp`, `Hunk`, `parse_patch` (todo) | `crates/marv-tools/src/apply_patch.rs` |
-| Model quirks that exist today, scattered: `needs_cache_breakpoints(model)` (`anthropic/`, `google/gemini-`, #56); `reasoning_for` (from the model list, not the id); Ollama `presence_penalty: 0` and `num_ctx` (all Ollama models); the duplicate tool-call ids (`make_ids_unique`, every provider) | `openai_compat.rs`, `crates/marv-provider/src/lib.rs`, `ollama.rs`, `crates/marv-agent/src/agent.rs` |
+| The apply_patch plan and types, not registered: `PatchOp`, `Hunk`, `parse_patch` (todo). Its module doc predates this spec and is superseded by §3.3: hunks are found with `edit_match::find_from` (first match after the cursor), not `apply_edit`, and files are locked together with `with_file_locks`, not `with_file_lock` per file. The implementation PR (M3) rewrites the doc | `crates/marv-tools/src/apply_patch.rs` |
+| Model quirks that exist today, scattered: `needs_cache_breakpoints(model)` (`anthropic/`, `google/gemini-`, #56); `reasoning_for(thinking, reasoningEffort, model list's reasoning)` (#143: medium effort for always-reasoning models, from the model list, not the id); Ollama `presence_penalty: 0` and `num_ctx` (all Ollama models); the duplicate tool-call ids (`make_ids_unique`, every provider) | `openai_compat.rs`, `crates/marv-provider/src/lib.rs`, `ollama.rs`, `crates/marv-agent/src/agent.rs` |
 | `/model` mid-session: `configure()` remakes the provider; the system prompt and `Inner::specs` stay as they were | `session.rs::configure` |
 
 ## 3. Proposed design
@@ -82,9 +84,9 @@ Matching works on the lowercased id with any `vendor/` prefix stripped. Rules, i
 
 `cache_breakpoints` keeps today's exact prefix rule, so moving it changes nothing on the wire. `needs_cache_breakpoints` becomes `profile_for(model).cache_breakpoints`.
 
-**Not moved into profiles:** reasoning support comes from the model list (`ModelInfo::reasoning`), not the id, and that stays. The Ollama options apply to every Ollama model, so they stay in the adapter. Tool-id de-duplication applies to every provider, so it stays in the loop. The profile is for things keyed by model family; forcing provider-wide behaviour into it would hide it.
+**Not moved into profiles:** reasoning support comes from the model list (`ModelInfo::reasoning`), not the id, and that stays; #143's `reasoningEffort` is consistent with it (a config level, mapped per model by the list). The Ollama options apply to every Ollama model, so they stay in the adapter. Tool-id de-duplication applies to every provider, so it stays in the loop. The profile is for things keyed by model family; forcing provider-wide behaviour into it would hide it.
 
-**Override:** config `editTools: "auto" | "edit" | "patch"` (default `"auto"` = the profile's), and the same in the SDK options. It lets the eval A/B the same GPT model, and lets a user opt out.
+**Override:** config `editTools: "auto" | "edit" | "patch"` (default `"auto"` = the profile's), and the same in the SDK options. It lets the eval A/B the same GPT model, and lets a user opt out. **Until M7, `auto` resolves to `Edit` for every model**; the table's Patch column takes effect only when M7 flips it.
 
 ### 3.2 When the profile is chosen (cache)
 
@@ -147,7 +149,8 @@ Paths are relative to the project root. Give about 3 lines of context above and 
 **Writing.** The file locks for all touched paths (sources and move targets) are taken in sorted path order, through a new `file_lock::with_file_locks(root, paths, f)`, so two patches can't deadlock. Then:
 - adds and updates are written with `tokio::fs::write`, as `edit_file` does;
 - a move writes the destination (which the plan checked doesn't exist, and checks again under its lock), then removes the source;
-- deletes go last.
+- deletes go last;
+- **#67:** `formatter::after_write` runs for each added, updated or moved-to file, still under the locks, as `edit_file` does; it skips protected paths and `package.json` itself. Each file's diff and syntax note describe the formatted file.
 
 An I/O error part-way is reported per file ("applied: a, b; failed: c: <err>") with `is_error`. The turn's checkpoint (#16) was taken before the run, so `/undo` restores the lot. **To verify in M3:** the checkpoint store restores a file the turn *deleted* (a test).
 
@@ -156,10 +159,11 @@ An I/O error part-way is reported per file ("applied: a, b; failed: c: <err>") w
 ### 3.4 System prompt and addenda (`marv-session/src/prompt.rs`)
 
 - `PromptInput` gains `edit_tools: EditTools` and `addendum: Option<&'static str>`.
+- **The `# Fixing bugs` gate (#147) becomes "can change files":** `input.tools` contains `edit_file` **or** `apply_patch`. Today it checks `edit_file` only, so a Patch conversation would silently lose the section.
 - The first sentence of `BASE_REST_TEXT` is split out:
   - `EditTools::Edit`: **exactly today's text** ("You can change files with edit_file (replace exact text; …) and write_file (new files or full rewrites), never through bash …"), and the long-file `append: true` sentence. The default prompt stays byte-identical to today; a test asserts it.
   - `EditTools::Patch`: "You can change files with apply_patch (add, update, delete or move files; copy context lines exactly from read_file), never through bash (no heredocs, echo >, sed -i or an apply_patch command), and run shell commands with bash, …". The `append` sentence is dropped. The rest of the paragraph is unchanged.
-- `subagent_prompt`: under `Patch`, " apply_patch changes files: copy context lines exactly from read_file." takes the place of the `edit_file` sentence.
+- `subagent_prompt`: under `Patch`, " apply_patch changes files: copy context lines exactly from read_file." takes the place of the `edit_file` sentence (its `has("edit_file")` check gets an `apply_patch` twin).
 - **Addenda start empty for every family.** The edit-tool sentence above is a necessity, not an addendum. An addendum is added only with an eval delta (§7) that shows a gain on its family and no loss elsewhere. When one exists, it is appended as a final `# Notes for <family> models` section, fixed per conversation. Candidates to test, not to ship blind:
   - GPT: "Prefer one apply_patch call that covers all the changes to a file";
   - GLM and Qwen: whatever their tool-error stats point to.
@@ -189,7 +193,7 @@ No per-profile prompt config. Addenda live in code, with their eval evidence in 
 ## 4. What stays byte-stable for prompt caching
 
 - **The system prompt and tool specs are chosen once per conversation** (§3.2) and never change within it. `/model` doesn't change them; `/clear` and resume rebuild them, as `/clear` already does.
-- **For every model whose profile is `Edit` (everything but the GPT row), the system prompt and tool specs are byte-identical to today.** Guard: a snapshot test in `prompt.rs` and `registry.rs` (default profile = today's bytes).
+- **For every model whose profile is `Edit` (everything but the GPT row), the system prompt and tool specs are byte-identical to today.** Guard: a snapshot test in `prompt.rs` and `session.rs`, written against today's prompt (`FIXING_BUGS`, the situation section, the Herdr text) and covering the **full offered list**: the built-ins, the caller's tools, `herdr`, the mesh tools and `radio_tx` where they apply, in their order.
 - The `apply_patch` schema and description are constants (`serde_json` key order is stable). The tool order is fixed.
 - The request wire: `cache_control` placement is unchanged (same prefix rule, now read from the profile). `ToolCall::arguments` for `apply_patch` (often large) is stored and re-sent as received, never re-serialized.
 
@@ -211,6 +215,7 @@ No per-profile prompt config. Addenda live in code, with their eval evidence in 
   - `.vscode/`, `.idea/`.
 
   Any one of them makes the whole call `must_ask`. A Move *into* a protected path, and a Delete of one, count.
+- **The home folder** \*: `protected_target` applies `home_rule` to **every** path, Move destinations included, by calling `edit_file::protected_target` per path (it already chains `protected_rule` and `home_rule`). And since `apply_patch` is `ToolKind::Write` with scope `files`, `registry::home_file_write` makes every call there `once`, as for the edit tools, with no change to the registry. A Move of a harmless file to `~/.bashrc` or into a hooks folder asks even in yolo.
 - **`package.json` lifecycle scripts** \*: the content rule (`marv_sandbox::protected::lifecycle_scripts_changed`) runs on every **resulting** `package.json`, whether added, updated, or the **destination of a Move**.
   - It compares the destination path's current contents (none, since Moves onto existing files are refused) with the new contents written there.
   - Updating `template.json` and moving it to `package.json` with a `postinstall` script triggers the rule. The source's old contents never stand in for "before".
@@ -220,13 +225,14 @@ No per-profile prompt config. Addenda live in code, with their eval evidence in 
 - **Approval:** one approval for the whole patch, scope `files` (same key as the edit tools, so "always" for file changes covers it, as it covers both edit tools today). The preview fills `Preview::files` with one `PreviewFile` per file (its diff, or "delete", or "move a → b"), so the user sees every file before saying yes. A Delete shows the removed content as the diff.
 - **Checkpoint (#16):** `Tool::checkpoint` is true (the default for Write), so the turn's checkpoint is taken before the patch runs.
 - **`before_change`:** awaited once before the first write (the typecheck baseline), as `edit_file` does.
-- **After the write:** the syntax check per file. The typecheck and project checks run on `changed` (all files).
+- **After the write:** the formatter (#67) and the syntax check per file. The typecheck and project checks run on `changed` (all files). The formatter never runs on a protected path or `package.json`, so what was approved there is what lands.
 - **Size:** a patch over 1 MB (input) is refused before parsing (a guard against pathological input; the arguments are already bounded by the model's output limit).
 - New guards (each proven by reverting it):
   - \* `apply_patch_protected_paths_ask_even_in_yolo`: every pattern, as Add, Update, Delete and Move target;
   - \* `apply_patch_package_json_lifecycle_scripts_ask_even_in_yolo`, including **Update `template.json` + Move to `package.json`** with a new `postinstall` (must ask; reverting the destination check makes it pass silently);
   - \* `apply_patch_moves_are_judged_by_destination`: a harmless file moved to each protected pattern (`.envrc`, `AGENTS.md`, `.marv/x`, `.vscode/settings.json`, `.git/hooks/pre-commit`) asks even in yolo, and so does a protected file moved away;
   - \* `apply_patch_no_path_out_of_the_project`: `../`, absolute outside, a symlink out, a dangling symlink, a Move target out;
+  - \* `in_the_home_folder_dotfiles_and_hooks_ask_even_in_yolo` extended to `apply_patch`: Add, Update and Move-to of a dotfile and of a hooks-folder file, and that each call is `once` (no "always");
   - \* a bad hunk in file 2 of 3 writes nothing (all-or-nothing): a test in `apply_patch.rs`, not a SECURITY rule.
 
 ## 6. Test plan
@@ -257,6 +263,8 @@ Apply:
     All three are rejected as duplicates with nothing written.
 
 Through `run_tool`, end to end, like `edit_file`'s:
+- the formatter runs on each written file (not on a protected path or `package.json`), and the result's diffs are the formatted files;
+- in the home folder, the call is asked `once`, even with "always" for files remembered;
 - an approval is asked once, with `Preview::files`, one per file;
 - a decline writes nothing;
 - the yolo `auto_safe` path;
@@ -268,8 +276,8 @@ Through `run_tool`, end to end, like `edit_file`'s:
 Profile (`profile.rs`): a table test of ids → profile (OpenRouter and Ollama spellings, the gpt-4 and oss exclusions, case, the vendor prefix), and `cache_breakpoints` == today's `needs_cache_breakpoints` for a list of ids.
 
 Prompt and registry:
-- the `Edit` profile prompt and specs are byte-identical to today (snapshot);
-- the `Patch` prompt has the apply_patch sentence and no `edit_file`/`write_file` mention;
+- the `Edit` profile prompt and the full offered list are byte-identical to today (snapshot, §4);
+- the `Patch` prompt has the apply_patch sentence and no `edit_file`/`write_file` mention, and still has `# Fixing bugs`; a prompt with neither edit tool has no `# Fixing bugs`;
 - `offered()` refuses `edit_file` under Patch;
 - the subagent tools map `Edit`/`Write` → `apply_patch` under Patch.
 
@@ -293,7 +301,7 @@ Guards: the ones listed in §5 (protected paths, lifecycle scripts including the
 `results.jsonl` already has tool calls by name and tool errors. Grouping by `profile` comes from the trajectory.
 
 **Tasks:**
-- all 20 in `evals/tasks/`;
+- all 21 in `evals/tasks/`;
 - the editing stress set is the core:
   - `crlf-line-endings`, `trailing-whitespace`, `tabs-off-by-one`, `duplicate-blocks`, `long-file`, `json-edit`;
   - `rename-across-files`, `refactor-signature`, `callback-to-promise`;
@@ -301,39 +309,31 @@ Guards: the ones listed in §5 (protected paths, lifecycle scripts including the
 - `duplicate-blocks` specifically tests the first-after-cursor rule (repeated code), so watch it.
 
 **Runs:**
-1. **GPT, edit vs patch.** One current GPT-5-line model on OpenRouter (exact id to pick from the live list), × 20 tasks × 2 × `--repeat 5`. This is the "apply_patch passes all editing tasks on a GPT model" gate.
+1. **GPT, edit vs patch.** One current GPT-5-line model on OpenRouter (exact id to pick from the live list), × 21 tasks × 2 × `--repeat 5`. This is the "apply_patch passes all editing tasks on a GPT model" gate.
 2. **No-regression check.** `anthropic/claude-haiku-5.5` (bench default), a GLM model (`z-ai/glm-5.x`) and a Qwen model, `auto` only, before vs after the change, × `--repeat 5`. Their prompts and tools are byte-identical, so any delta is noise; this run confirms that.
 3. **Addenda (later, each its own run).** Family X with vs without the candidate addendum. It ships only with a gain and no loss.
 
-**Bench change:** `--marv-config key=value` writes into the throwaway `MARV_CONFIG_DIR` config (shared with the #63 spec's M6). Ask for a budget before running (`--budget`).
+**Bench change:** `bench.py` has no `--marv-config` yet. M6 adds `--marv-config key=value`, written into the throwaway `MARV_CONFIG_DIR` config (shared with the #63 spec). Ask for a budget before running (`--budget`).
 
-## 8. Milestones (PR-sized)
+## 8. Implementation plan
 
-1. **M1 Profiles:** `marv-provider/src/profile.rs`, the table and tests; `needs_cache_breakpoints` reads it (no wire change).
-2. **M2 `changed` → `Vec<String>`:** in `ToolOutput`, and its three readers. Mechanical, no behaviour change.
-3. **M3 apply_patch parser and apply:**
-   - `parse_patch`, `edit_match::find_from`, `plan()`, `with_file_locks`;
-   - the unit tests, the checkpoint-restores-a-deletion test.
-   - Not registered.
-4. **M4 apply_patch as a tool:**
-   - `Tool` impl (preview with `Preview::files`, `protected_target`, `auto_safe`, run);
-   - the `run_tool` end-to-end tests and the §5 guards.
-   - Registered in `builtin_tools`, but offered only with `editTools: "patch"` (the default stays "edit" for all).
-5. **M5 Session wiring:**
-   - `State::specs`, the profile chosen on new/clear/resume;
-   - `PromptInput::edit_tools`, the prompt variants with the snapshot test;
-   - subagents, `SavedSession::edit_tools`, the trajectory `profile`;
-   - the `/model` notice, the bash `apply_patch` refusal.
-6. **M6 Bench flag**, then **ask** to run §7 runs 1–2.
-7. **M7 Turn on `auto`** (GPT → patch) if run 1 shows a gain and run 2 no regression. Update `docs/subsystems/tools.md`, `session.md` and `provider.md`.
-8. **Later, per addendum:** a PR with the eval delta in its description.
+One PR each, in this order. Only M7 and the addenda need paid runs.
 
-## 9. Open questions for the user
+- **(a) M1 Profiles:** `marv-provider/src/profile.rs`, the table and its tests; `needs_cache_breakpoints` delegates to `profile_for(model).cache_breakpoints` (no wire change).
+- **(b) M2 `changed` → `Vec<String>`:** in `ToolOutput`, and its readers. Mechanical, no behaviour change.
+- **(c) M3 apply_patch parser and apply:** `parse_patch`, `edit_match::find_from`, `plan()`, `file_lock::with_file_locks`; the unit tests and the checkpoint-restores-a-deletion test; the module doc rewritten (§2). Not registered.
+- **(d) M4 apply_patch as a tool, with its guards:** the `Tool` impl (preview with `Preview::files`, `protected_target` with `home_rule` on every path, `auto_safe`, run with the formatter); the `run_tool` end-to-end tests and the §5 guards, the home-folder one included. Registered in `builtin_tools`, but offered only with `editTools: "patch"`.
+- **(e) M5 Session wiring, with `auto` → Edit for every model:** `State::specs`, the edit tools chosen on new/clear/resume; `PromptInput::edit_tools`, the prompt variants, the `FIXING_BUGS` gate on "can change files", and the snapshot test over the full offered list; subagents, `SavedSession::edit_tools`, the trajectory `profile`; the `/model` notice, the bash `apply_patch` refusal.
+- **(f) M6 Bench flag** (shared with #63): `bench.py --marv-config`. Then **ask** to run §7 runs 1–2.
+- **M7 Turn on `auto`** (GPT → patch, paid runs) if run 1 shows a gain and run 2 no regression. Update `docs/subsystems/tools.md`, `session.md` and `provider.md`.
+- **Later, per addendum** (paid runs): a PR with the eval delta in its description.
 
-1. **Under `Patch`, should apply_patch replace both `edit_file` and `write_file`, or only `edit_file`?** *Recommendation: both (as opencode does).* `write_file`'s description and the prompt point at `edit_file`, and GPT-5/Codex models are trained on a patch-only interface. The cost: long new files lose the `append` workaround. The cut-off guard still protects them, and these models have large output limits.
-2. **Should `/model` switching mid-conversation change the edit tools?** *Recommendation: no; it applies from the next `/clear`, with a one-line notice.* A switch would restart the cache, and the history would hold calls to tools that are gone.
-3. **Hunk matching: Codex's first-match-after-cursor, or `edit_file`'s must-be-unique?** *Recommendation: first-after-cursor, with `@@` headers.* It is what the format means and what the models write. `duplicate-blocks` in the eval will show whether it bites.
-4. **Should GPT-4.x and `gpt-oss` stay on edit tools?** *Recommendation: yes, per opencode's rule.* Revisit with the eval if `gpt-oss` (Ollama) users show edit failures.
-5. **Should any prompt addenda ship with the first version?** *Recommendation: none.* Only the edit-tool sentence, which is required. Each addendum comes later with its own eval delta, as the issue asks.
-6. **Should the profile table live in marv-provider or marv-core?** *Recommendation: marv-provider*, next to the per-model knowledge it already holds (`needs_cache_breakpoints`). marv-core stays types-only.
-7. **Should a bash `apply_patch …` command be refused with a hint, or rerouted to the tool?** *Recommendation: refuse with a hint.* Rerouting would make a bash approval apply a patch the user didn't see as a patch.
+## 9. Decisions (2026-10-20)
+
+1. **Under `Patch`, apply_patch replaces both `edit_file` and `write_file`** (as opencode does). Long new files lose the `append` workaround; the cut-off guard still protects them.
+2. **A `/model` switch mid-conversation doesn't change the edit tools**; they change from the next `/clear`, with a one-line notice.
+3. **Hunks match the first occurrence after the cursor** (Codex's semantics, with `@@` headers), not `edit_file`'s must-be-unique. `duplicate-blocks` in the eval watches it.
+4. **gpt-4 and `gpt-oss` stay on Edit**, per opencode's rule. Revisit if `gpt-oss` users show edit failures.
+5. **No prompt addenda ship without an eval delta.** The first version has only the edit-tool sentence, which is required.
+6. **The profile table lives in marv-provider**, next to `needs_cache_breakpoints`; marv-core stays types-only.
+7. **A bash `apply_patch …` command is refused with a hint**, never rerouted: rerouting would make a bash approval apply a patch the user didn't see as one.
