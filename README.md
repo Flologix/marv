@@ -6,13 +6,16 @@ A terminal coding agent. Marv reads your code, edits files and runs commands (sa
 
 Marv is written in Rust and ships as one static binary. Nothing else runs it: no Bun, no Node, no interpreter that could read a project's `.env` or `bunfig.toml` when it starts (npm is only one way to install it). It talks to models through [OpenRouter](https://openrouter.ai) (hundreds of cloud models with one API key) or [Ollama](https://ollama.com) (models running on your own machine).
 
-![Marv's welcome screen in the terminal](docs/images/screenshot.png)
+There's also [Marv desktop](#marv-desktop), the same agent in a window on Linux, built from source for now.
+
+![Marv's welcome screen in the terminal: the pixel-art martian, the version, the working folder, and the status bar with yolo mode, the provider and the model](docs/images/screenshot.png)
 
 ## Features
 
 - **An agent loop with tools.** It can read, search (`glob`, `grep`), edit, write, and run shell commands. The model decides which tools to use; Marv runs them and reports back. Read-only calls in a row run in parallel.
 - **Safe yolo mode (on by default).** Sandboxed commands and edits inside the project run without asking; anything the sandbox can't contain (network access, git commits and other repository changes, `.git` itself, protected files like `.envrc` or `AGENTS.md`, memory) still shows you a colored diff or the exact command first: yes, yes for the rest of the session, or no (which stops Marv so you can redirect it). `/yolo off` asks for every change.
-- **Sandboxed commands.** Commands run in [bubblewrap](https://github.com/containers/bubblewrap): only the project folder is writable, your home folder (keys, SSH, Marv's own config) is hidden, there's no network unless a command asks for it, and API keys never reach the command.
+- **Sandboxed commands.** Commands run in [bubblewrap](https://github.com/containers/bubblewrap): only the project folder is writable, your home folder (keys, SSH, Marv's own config) is hidden, there's no network unless a command asks for it, and API keys never reach the command. When the model retries a command that failed for lack of network, the retry runs with the network, so it asks you like any network command.
+- **Web pages.** `web_fetch` reads a page (or a GitHub repository) as text, asking you per site. A page longer than one 30,000-character part is also saved whole, on the first read, to the session's tool-output folder, so the model can `grep` it or read just the part it needs instead of paging through it.
 - **Guarded against prompt injection.** Once a web page, an MCP result or a message from another agent is in the conversation, anything that could send data out asks you, even in yolo and even after "don't ask again". Text from outside is shown to the model as data, never in Marv's voice. See [Safety model](#safety-model).
 - **Dev servers you can open.** A command's processes end with it, and its `localhost` isn't yours, so Marv starts servers and watchers with its `process` tool instead: each keeps running in its own sandbox (same rules: only the project writable, no network unless asked) across turns until it's stopped or Marv exits, and the ports it listens on are forwarded to your `127.0.0.1`, so `http://localhost:5173` just works. You're asked before each start; `/processes` lists them, `/processes stop <name>` stops one, and the status bar shows how many run.
 - **Any model.** OpenRouter or a local Ollama model, with a searchable model picker showing prices. Switch with `/model`.
@@ -31,13 +34,14 @@ Marv is written in Rust and ships as one static binary. Nothing else runs it: no
 - **Undo a turn.** Before a turn's first change Marv snapshots the project's files, and `/undo` shows what that turn changed (each file's diff) and, on a yes, puts those files back: edits, new files and deleted ones, whether a tool or a `bash` command made them. Your branch, index and stash are never touched. See [Undo](#undo).
 - **No dead stops.** After 25 steps without finishing, Marv asks whether to keep going instead of giving up. Raise the interval with `/steps 40` (or `maxSteps` in the config), or turn the asking off with `/steps off` (subagents still stop at their own 50).
 - **Cost tracking.** OpenRouter's actual charge per request, plus context and cache use, in the status bar; `/cost` for the breakdown.
-- **Herdr aware.** Run Marv in a [Herdr](https://herdr.dev) pane and Herdr's sidebar shows whether it's working, waiting for your approval, or done, with nothing to set up.
+- **Herdr aware.** Run Marv in a [Herdr](https://herdr.dev) pane and Herdr's sidebar shows whether it's working, waiting for your approval, or done, with nothing to set up. There the model also gets a `herdr` tool: it lists and reads panes without asking (what it reads counts as untrusted text), asks before focusing or renaming a pane or typing a prompt into an idle agent's pane, and asks every time before running a command in a new pane or starting a worker (another Marv, or an agent such as Claude Code or Codex, optionally in a new git worktree). `/peers` lists the panes it opened, `/peers read <name>` shows one's last lines and `/peers stop <name>` closes one.
 - **A comfortable, light TUI.** Streaming Markdown replies revealed at an even pace, a live preview of the model's reasoning, mouse-wheel scrolling, drag-to-copy with auto-scroll, a `/` command menu, and Esc to interrupt. It uses next to no CPU while idle.
+- **Marv desktop.** A window for Marv on Linux: pick a folder, start chats on it, and approve what leaves the sandbox in the window. Chats keep running in the background while you look at another, and a desktop notification tells you when one needs you or is done. See [Marv desktop](#marv-desktop).
 
 ## Requirements
 
 - Linux on x86_64 or aarch64. **On Windows, use [WSL](https://learn.microsoft.com/windows/wsl/install)**: install Marv inside your WSL distribution (e.g. Ubuntu) and run `marv` there.
-- **No macOS build in 0.7.0.** The release has Linux binaries only, and the installer stops on macOS with a note.
+- **No macOS build in 0.7.0.** The release has Linux binaries only, and the installer stops on macOS with a note. On `main`, Marv builds from source on macOS and its tests run there in CI, but the macOS sandbox (Seatbelt) isn't switched on yet: commands run unsandboxed and ask first, as on Linux without bubblewrap (below).
 - `bubblewrap` (`bwrap`) for the command sandbox (e.g. `sudo apt install bubblewrap`). Without it Marv still works, but every command asks first and warns that it runs unsandboxed, and what needs the sandbox is off: the typecheck after edits, the project's checks and the `process` tool.
 - `git`, for `/undo` and for subagents' worktrees.
 - One of:
@@ -78,6 +82,8 @@ cargo build --release -p marv-cli
 sh install.sh --from target/release/marv     # or: cargo install --path crates/marv-cli --root ~/.local
 ```
 
+On macOS (from `main` only, see [Requirements](#requirements)), `cargo install --path crates/marv-cli --root ~/.local` puts it in `~/.local/bin`.
+
 Then start it in any project folder:
 
 ```sh
@@ -86,6 +92,8 @@ marv
 ```
 
 The first run opens a short setup: pick OpenRouter or Ollama, pick a model, and (for OpenRouter) paste your key. Settings are saved to `~/.marv/config.json`, readable only by you. Run `/setup` to change them later.
+
+Marv desktop has no download yet: build it from a clone with `app/install-desktop.sh` (see [Marv desktop](#marv-desktop)).
 
 ## Using Marv
 
@@ -96,6 +104,8 @@ Type what you want in plain language, for example:
 > add a --verbose flag to the CLI and update the help text
 > run the tests and fix whatever fails
 ```
+
+![Marv in the terminal partway through a task: the diff of an edit it made to src/cli.js, its four-step plan pinned above the prompt with three steps ticked, and an approval prompt for an npm install that needs the network](docs/images/tui-task.png)
 
 ### Commands
 
@@ -117,6 +127,7 @@ Type what you want in plain language, for example:
 | `/sandbox` | Show or set the command sandbox (`/sandbox on`, `/sandbox off`) |
 | `/yolo` | Run what the sandbox contains without asking (`/yolo on`, `/yolo off`) |
 | `/processes` | List the background processes Marv started (dev servers, watchers); `/processes stop <name>` stops one |
+| `/peers` | In Herdr: the panes and workers the model opened (`/peers read <name>`, `/peers stop <name>`) |
 | `/good`, `/bad` | Rate the last turn, with an optional note (`/bad edited the wrong file`) |
 | `/label` | Tag the last turn (`/label refactor, tests`) |
 | `/mcp` | Show MCP servers and their tools; `/mcp add <package \| URL \| repo>` adds one, `/mcp search <words>` finds one, `/mcp remove <name>` takes yours out, `/mcp trust` starts the project's, `/mcp login <name>` logs in to a remote server (OAuth), `/mcp logout <name>` forgets the login |
@@ -126,6 +137,7 @@ Type what you want in plain language, for example:
 | `/checks` | List the project's checks and their last result (`/checks on`, `/checks off`) |
 | `/steps` | Show or set the step limit (`/steps 40`, `/steps off` never asks) |
 | `/trajectories` | Show or set run logging (`/trajectories on`, `/trajectories off`) |
+| `/mesh` | What's wired to this Marv's inbox; `/mesh wake on` lets a message start a turn while Marv is idle ([The mesh](#the-mesh-talking-to-other-agents)) |
 | `/radio` | Who of your Marvs on this machine is up, and what was said, on the mesh radio (`/radio on`, `/radio off`; [The radio](#the-radio-who-else-is-up)) |
 | `/tx` | Say something on the radio: `/tx @name text` to one Marv (`@a @b` for several), `/tx text` to all of them |
 | `/clear` | Start a fresh conversation (the old one stays saved) |
@@ -161,6 +173,30 @@ marv mesh plug …     plug another agent into a Marv over stdin/stdout
 marv --version       print the version (-v)
 marv --help          show the help
 ```
+
+## Marv desktop
+
+![Marv desktop: the folder tree and the chats of the folder acme-api on the left, with status dots for chats running in the background and a banner for a chat in another folder that needs an answer; on the right a chat with Marv's tool calls, the diff of an edit, and a card asking to run an npm install with network](docs/images/desktop.png)
+
+Marv desktop (`app/`, a [Tauri](https://tauri.app) app) runs the same engine as the terminal UI, in a window:
+
+- **A Marv folder.** You pick one folder once (for example `~/Projects`); the left pane shows its tree, where you can make, rename and trash folders. A chat runs Marv on the selected folder: it reads and changes everything below it, runs sandboxed commands and edits on its own, and asks you in the window before anything leaves the sandbox. Your home folder, or anything above it, can't be the Marv folder. Spaces (tabs across the top) each keep their own folder and chats.
+- **Chats keep running in the background.** Switching to another chat or space doesn't stop the one you left: its turn goes on and it stays on the mesh. Dots in the sidebar show which chats are running, working or waiting for an answer, and a chat waiting anywhere shows as a banner that jumps to it. Up to 8 run at once; past that the least recently shown idle one is stopped (never a busy or waiting one). ■ stops a chat; opening it again continues it.
+- **Desktop notifications.** A chat you aren't looking at that needs an approval, or whose turn finished, shows a notification; clicking it opens the chat (on Linux). The notification names the chat and the kind of tool asking ("run a command", "change a file"), never the command or the diff; you answer in the chat.
+- **The rest of the chat:** streaming replies, thinking and tool calls with their diffs, a `/` menu with `/help`, `/skills`, `/compact`, `/cost`, `/memory`, `/model` and your skills, a context meter, a Servers pane for MCP servers (with login and trust), an app gallery that sets up a few MCP servers for you, and models from OpenRouter or a local Ollama. The terminal UI's other commands (`/undo`, `/resume`, `/mcp add`…) aren't in the desktop yet.
+
+It loads what the CLI loads: your `~/.marv` skills, memory, MCP servers and instructions, and the folder's own, and keeps its sessions in `~/.marv` too.
+
+**Build and install it** (Linux; you need Rust, Node, bubblewrap and WebKitGTK 4.1, `webkit2gtk-4.1`):
+
+```sh
+git clone https://github.com/FlologixAI/marv.git
+cd marv
+app/install-desktop.sh                # builds it, then installs ~/.local/bin/marv-desktop, an icon and a launcher entry
+app/install-desktop.sh --uninstall    # removes all three
+```
+
+Open **Marv** from your app launcher, or run `marv-desktop` (`marv-desktop <dir>` opens that folder). Run the script again after pulling to update. `cd app && npm install && npx tauri build` builds a `.deb` and an `.AppImage` instead. [`app/README.md`](app/README.md) has the details, including the browser mode with `marv-web`.
 
 ## Safety model
 
@@ -343,7 +379,7 @@ Marv's agents are sandboxed: no network, and every process ends with its command
 - **Mesh text is data.** A message reaches the model fenced as a message from another agent, not as instructions, and it taints the session (see [Safety model](#safety-model)). Every message is logged to the trajectory (sender, receptacle, size; never the body), and each wire has size and rate limits.
 - **Subagents** get a plug with no wires. The model has three tools: `mesh_list` (what this agent can reach), `mesh_send` and `mesh_call`.
 
-**Several Marvs on one machine.** Every interactive Marv is on the mesh (when `XDG_RUNTIME_DIR` is set), and says its name at startup: `MARV_MESH_NAME` if you set it, else the project folder's name plus four hex digits. Its door is a socket in `$XDG_RUNTIME_DIR/marv/mesh/`, private to you.
+**Several Marvs on one machine.** Every interactive Marv is on the mesh (when it has a runtime folder: `$XDG_RUNTIME_DIR/marv` on Linux, `/tmp/marv-<uid>` on macOS, or `MARV_RUNTIME_DIR`), and says its name at startup: `MARV_MESH_NAME` if you set it, else the project folder's name plus four hex digits. Its door is a socket in the runtime folder's `mesh/`, private to you.
 
 ```sh
 MARV_MESH_NAME=api marv          # in one pane
@@ -376,7 +412,7 @@ The radio is a live channel between your Marvs on this machine. It's **off unles
 - **What arrives is data.** A message flashes on the strip for 10 seconds (`◉ radio · ← 58a7: tests pass on main now`) and reaches your model at its next step, fenced as another Marv's words, never as yours: the conversation counts as tainted from then on, so anything that can send data out (network commands, web, MCP, mesh) asks first, even in yolo. A message marked `(user)` was typed by the other Marv's person; it's shown, and changes nothing. Nothing on the radio can answer an approval.
 - **Wake.** With mesh wake on (`/mesh wake on`) and Marv idle with no approval waiting, a message addressed to it starts a turn (`✻ Radio message from 58a7 (model).`); a message to all never does. In that turn **nothing is approved automatically**: yolo, "always" answers and pre-approved scopes don't apply, and everything that would ask asks you, once. At most 3 radio wakes a minute per sender (one every 10 s) and 10 in 10 minutes overall; past that, messages wait for your next turn and you're told once.
 - **Who's gone.** A Marv that leaves (`/radio off`, or quitting) shows `left` for 10 seconds. One that stops answering shows `silent` after 45 seconds and drops after 120; one that crashed or was killed shows `left (lost)`, and its leftover socket is removed.
-- **Only you, only here.** Links are private Unix sockets in `$XDG_RUNTIME_DIR/marv/mesh/`, each end checked to be the Marv it says it is. Sandboxed commands can't see them. A project's `.marv/config.json` can't turn the radio (or wake) on: it's ignored with a startup note. There's no environment variable or flag for it, the model can't turn it on, and `marv -p` and subagents are never on it. `marv mesh ls` shows which Marvs have it on.
+- **Only you, only here.** Links are private Unix sockets in the runtime folder's `mesh/`, each end checked to be the Marv it says it is. Sandboxed commands can't see them. A project's `.marv/config.json` can't turn the radio (or wake) on: it's ignored with a startup note. There's no environment variable or flag for it, the model can't turn it on, and `marv -p` and subagents are never on it. `marv mesh ls` shows which Marvs have it on.
 
 ## Files and settings
 
@@ -397,7 +433,8 @@ The radio is a live channel between your Marvs on this machine. It's **off unles
 | `~/.marv/mcp-tokens.json` | MCP logins: OAuth clients and tokens, private (0600) |
 | `~/.marv/checkpoints/<project>/` | `/undo`'s snapshots for a project that isn't a git repository (in a repository they're under `refs/marv/checkpoints/`) |
 | `~/.marv/worktrees/<project>/` | Subagents' worktrees while they run (removed when each finishes; its branch stays) |
-| `$XDG_RUNTIME_DIR/marv/` | The mesh's sockets and background processes' relays, while Marv runs |
+| `~/.marv/tool-output/<session>/` | Tool output too long for the conversation, and long web pages, saved whole for the model to read back |
+| `$XDG_RUNTIME_DIR/marv/` | The runtime folder: the mesh's sockets and background processes' relays, while Marv runs (private, 0700; `/tmp/marv-<uid>` on macOS, or `MARV_RUNTIME_DIR`) |
 | `AGENTS.md` | Project instructions, read into the system prompt at startup |
 
 `~/.marv/config.json` also takes `sandbox`, `yolo`, `thinking`, `trajectories`, `diagnostics`, `checks`, `checkpoints`, `suggestions` (each `true` or `false`), `maxSteps`, `mcpTools` (`auto`, `deferred` or `eager`), `contextLength` (Ollama), `reasoningEffort` (`minimal`, `low`, `medium` or `high`: how hard an OpenRouter model that reasons does so, default `medium`; `default` lets the model pick its own), `compactTokens` (compact once the conversation passes this many tokens, default `100000`, at least `40000`; `0` or `false` compacts only at 85% of the window), `baseUrl` (e.g. Ollama on another machine) and `mesh` (`{"wake": true}` for mesh wake, `{"radio": true}` or `{"radio": {"titles": false}}` for [the radio](#the-radio-who-else-is-up); only from your own file, never a project's). The slash commands write most of them for you.
@@ -413,6 +450,9 @@ The radio is a live channel between your Marvs on this machine. It's **off unles
 | `MARV_CONFIG_DIR` | Use a different folder instead of `~/.marv` (read from the environment only, never from a project file) |
 | `MARV_GITHUB` | `off` hides the `github` tool |
 | `MARV_MESH_NAME` | This Marv's name on the mesh |
+| `MARV_RUNTIME_DIR` | Where the runtime folder goes instead (an absolute path to a private folder of yours, outside every project; refused, with the reason, otherwise) |
+| `MARV_YOLO` | `off` keeps yolo off for this Marv, whatever the config says (it can't turn yolo on) |
+| `MARV_TAINTED` | `1` starts the conversation as untrusted, so anything that can send data out asks first |
 | `GITHUB_TOKEN`, `GH_TOKEN` | Used by `web_fetch` for GitHub links (sent to GitHub's API only) |
 
 Ollama's context window defaults to 32k tokens (`contextLength` in the config file). That is large enough for an agent to read code, and fits in 12 GB of VRAM for 9-12B models. Marv never sets it past what the model was trained for (`/api/show`'s context length), so a model trained on 8k isn't run at 32k; the config value is only ever the upper bound.
@@ -494,6 +534,7 @@ CI runs those last four on every pull request, with bubblewrap installed so the 
 - **The oracle** (`tests/oracle/`, the `marv-oracle` crate) proves Marv behaves as it did: 30 scenarios recorded from the TypeScript Marv, each replayed against a fake model server and compared with what Marv did then (files, tool calls, requests, exit code), plus a check that every request extends the one before it, so the prompt cache holds. No run reaches a real model. Build the binary, then check it: `cargo build -p marv-cli && cargo run -p marv-oracle -- check` (or name a few scenarios). [`tests/oracle/README.md`](tests/oracle/README.md) has the rest.
 - **The guard suite** (`tests/guards/`, `cargo test -p marv-guards`) has one test per rule in [`docs/SECURITY.md`](docs/SECURITY.md), with the real bubblewrap where it matters. Each was proven by removing its guard and watching it fail.
 - Try the UI without a model: `cargo run -p marv-tui --example martian` (the martian, q to quit) and `cargo run -p marv-tui --example fake_session` (the whole TUI on a scripted engine).
+- Marv desktop: `cd app && npm install && npx tauri dev` runs it with hot reload ([`app/README.md`](app/README.md)).
 
 Read first: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) (the crates and how they fit), [`docs/SECURITY.md`](docs/SECURITY.md) (the security rules), [`docs/MESH.md`](docs/MESH.md) (the mesh's design), and [`AGENTS.md`](AGENTS.md) (how to work in this repository, for people and agents). Each crate has its notes in `docs/subsystems/`.
 
