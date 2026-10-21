@@ -683,6 +683,8 @@ struct RadioTurnFacts {
     handles: bool,
     reply: Option<String>,
     declined: Option<String>,
+    /// The person joined the turn with "send now": its reply answered them too, and the report never quotes it.
+    sent_now: bool,
 }
 
 impl State {
@@ -1456,8 +1458,14 @@ impl MarvSession {
             (std::mem::take(&mut s.radio_requests), s.radio_turn.clone(), changed)
         };
         let Some(radio) = self.inner.init.mesh.as_ref().and_then(|m| m.radio()) else { return };
-        let (kind, text) =
-            crate::radio::report_of(reason, &radio.name, facts.reply.as_deref(), facts.declined.as_deref(), changed);
+        let (kind, text) = crate::radio::report_for(
+            reason,
+            &radio.name,
+            facts.reply.as_deref(),
+            facts.declined.as_deref(),
+            changed,
+            facts.sent_now,
+        );
         let hop = self.inner.radio_hop.get();
         let now = crate::radio::now_ms();
         for open in open {
@@ -1913,7 +1921,10 @@ impl MarvSession {
                     self.count(usage, factory.as_ref(), info.as_ref());
                 }
                 // "Send now": in the transcript where the model read it, as the person's.
-                LoopEvent::SentNow { text } => self.note(Role::User, text),
+                LoopEvent::SentNow { text } => {
+                    self.note(Role::User, text);
+                    self.state().radio_turn.sent_now = true;
+                }
                 LoopEvent::Assistant { text } => {
                     self.note(Role::Assistant, text);
                     if !text.trim().is_empty() {
@@ -3772,6 +3783,8 @@ mod turn_tests {
         let messages = session.state().messages.clone();
         let roles: Vec<(Role, &str)> = messages.iter().map(|m| (m.role, m.text.as_str())).collect();
         assert_eq!(roles, [(Role::User, "read it"), (Role::User, "and b"), (Role::Assistant, "Done, b too.")]);
+        // A radio report on this turn wouldn't quote the reply that answered the person too.
+        assert!(session.state().radio_turn.sent_now);
         // Over: refused again.
         assert!(session.send_now("late").is_err());
     }
