@@ -5,6 +5,11 @@
 //! - Marv fetches it itself, not the sandbox (which has no network), so it can enforce what `curl` can't: plain GETs,
 //!   public addresses only, a size and time limit, text only, redirects checked one by one.
 //! - Output in parts of [`PAGE_CHARS`] = 30k characters (`offset`); the header says what to pass for the next.
+//! - marv-rs (#93): the first read (`offset` 0) of a page longer than one part saves the whole page to the session's
+//!   tool-output folder ([`crate::output::spill_whole`], `<call id>.web.txt`) and the header names it, so the model
+//!   can grep or read_file the part it needs instead of paging through. Read back, it's web content again
+//!   (`saved_provenance`): fenced, and it taints. Reading on with `offset` saves nothing more; a failed save only
+//!   loses the note.
 //! - Reading on (`offset > 0`) uses a cache of [`CACHE_PAGES`] = 8 pages (each at most [`CACHE_MAX_CHARS`] = 1M chars)
 //!   for [`CACHE_MS`] = 10 min, keyed by the requested URL and the final one after same-site redirects. A cached read
 //!   sends nothing, so it doesn't ask; `needs_approval` hands the page it found to `run`, so an expiry in between can't
@@ -21,6 +26,7 @@
 //!   zero-width and tag characters can spell instructions no reviewer sees).
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -28,6 +34,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::output::spill_whole;
 use crate::types::{Preview, Scope, Tool, ToolContext, ToolError, ToolOutput};
 use crate::web::address::{CheckOptions, check_address};
 use crate::web::convert::{ConvertOptions, Converter};
@@ -170,6 +177,11 @@ fn chars(n: usize) -> String {
 
 /// The part of a page the model reads now, under a header saying what it is and how to read on.
 pub fn paged(page: &Page, offset: usize, size: usize) -> Result<ToolOutput, ToolError> {
+    paged_saved(page, offset, size, None)
+}
+
+/// [`paged`], the header also naming the file the whole page was saved to.
+fn paged_saved(page: &Page, offset: usize, size: usize, saved: Option<&Path>) -> Result<ToolOutput, ToolError> {
     let total = page.text.chars().count();
     if offset > 0 && offset >= total {
         return Err(ToolError(format!("offset {offset} is past the end ({total} characters).")));
@@ -186,7 +198,10 @@ pub fn paged(page: &Page, offset: usize, size: usize) -> Result<ToolOutput, Tool
         Some(title) if !title.is_empty() => format!("Fetched {} · {title}{range}", page.url),
         _ => format!("Fetched {}{range}", page.url),
     };
-    let note = page.note.as_ref().map(|n| format!("\n({n})")).unwrap_or_default();
+    let mut note = page.note.as_ref().map(|n| format!("\n({n})")).unwrap_or_default();
+    if let Some(path) = saved {
+        note.push_str(&format!("\n(Whole page saved: {} — grep it, or read_file it.)", path.display()));
+    }
     let body: String = page.text.chars().skip(offset).take(end - offset).collect();
     let body = if body.is_empty() { "(empty page)".to_string() } else { body };
     let summary =
@@ -290,9 +305,17 @@ impl WebFetch {
     }
 }
 
-/// The page as the model reads it, tagged as web content (it taints the session).
-fn web_result(page: &Page, offset: usize) -> Result<ToolOutput, ToolError> {
-    let mut result = paged(page, offset, PAGE_CHARS)?;
+/// The page as the model reads it, tagged as web content (it taints the session). The first read of a long page
+/// saves it whole in the session's folder (#93).
+fn web_result(page: &Page, offset: usize, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+    let saved = match &ctx.tool_output {
+        Some(dir) if offset == 0 && page.text.chars().count() > PAGE_CHARS => {
+            let call_id = ctx.call_id.as_deref().unwrap_or("call");
+            spill_whole(&page.text, dir, call_id, marv_core::Provenance::Web).ok()
+        }
+        _ => None,
+    };
+    let mut result = paged_saved(page, offset, PAGE_CHARS, saved.as_deref())?;
     result.provenance = marv_core::Provenance::Web;
     Ok(result)
 }
@@ -374,7 +397,7 @@ impl Tool for WebFetch {
         let approved = self.approved_reads.lock().unwrap_or_else(|e| e.into_inner()).remove(&input.url);
         let cached = approved.or_else(|| if offset > 0 { self.cache.get(&input.url) } else { None });
         if let Some(page) = cached {
-            return web_result(&page, offset);
+            return web_result(&page, offset, ctx);
         }
         let get = self.get_options(&parsed);
         let mut page = match parse_github(&parsed) {
@@ -408,7 +431,7 @@ impl Tool for WebFetch {
             let fin = url::Url::parse(&page.url).map(|u| u.to_string()).unwrap_or_else(|_| page.url.clone());
             self.cache.remember(&[parsed.to_string(), fin], page.clone());
         }
-        web_result(&page, offset)
+        web_result(&page, offset, ctx)
     }
 }
 
@@ -603,6 +626,86 @@ mod tests {
         assert_eq!(s.requests(), 1);
         fetch(&tool, &url, None, &ctx(&asked)).await; // offset 0: fresh
         assert_eq!(s.requests(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_long_pages_first_read_saves_it_whole_and_a_read_back_is_web_content() {
+        let s = long_server("x").await;
+        let store = crate::test_support::TempDir::new("web-save");
+        let dir = store.path().join("s");
+        let asked = Asked::new(Decision::Yes);
+        let ctx = ToolContext { tool_output: Some(dir.clone()), ..ctx(&asked) };
+        let tool = local_tool();
+        let url = format!("{}/long.txt", s.base());
+        let first = fetch(&tool, &url, None, &ctx).await.result;
+        let saved = dir.join("w1.web.txt");
+        assert_eq!(std::fs::read_to_string(&saved).unwrap(), "x".repeat(70_000), "the whole page, not a cut");
+        assert!(
+            first.output.contains(&format!("(Whole page saved: {} — grep it, or read_file it.)", saved.display())),
+            "{:.300}",
+            first.output
+        );
+        assert!(first.output.contains("characters 0-30000 of 70000 (offset: 30000 for the next part)"));
+
+        // Reading on still works, and saves nothing more.
+        let next = fetch(&tool, &url, Some(30_000), &ctx).await.result;
+        assert!(next.output.contains("characters 30000-60000 of 70000") && !next.output.contains("Whole page saved"));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+
+        // grep and read_file give it back as the web content it is: fenced, and it taints.
+        // Each in a fresh session of its own, so neither passes on the other's taint.
+        for (name, args) in [
+            ("grep", json!({"pattern": "xxx", "path": saved.display().to_string()})),
+            ("read_file", json!({"path": saved.display().to_string()})),
+        ] {
+            let clean = ToolContext { tool_output: Some(dir.clone()), ..ToolContext::new(std::env::temp_dir()) };
+            assert!(!clean.taint.is_tainted());
+            let call = ToolCall { id: "g".into(), name: name.into(), arguments: args.to_string() };
+            let out = run_tool(&call, &clean, crate::builtin_tools()).await.result;
+            assert!(!out.is_error, "{name}: {}", out.output);
+            assert_eq!(out.provenance, Provenance::Web, "{name}");
+            assert!(clean.taint.is_tainted(), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_save_only_loses_the_note() {
+        let s = long_server("x").await;
+        let store = crate::test_support::TempDir::new("web-save-fails");
+        store.write("file", "not a folder");
+        let asked = Asked::new(Decision::Yes);
+        let ctx = ToolContext { tool_output: Some(store.path().join("file")), ..ctx(&asked) };
+        let out = fetch(&local_tool(), &format!("{}/long.txt", s.base()), None, &ctx).await.result;
+        assert!(!out.is_error, "{}", out.output);
+        assert!(out.output.contains("characters 0-30000 of 70000"), "{:.300}", out.output);
+        assert!(!out.output.contains("Whole page saved"));
+        assert_eq!(std::fs::read_to_string(store.path().join("file")).unwrap(), "not a folder");
+    }
+
+    #[tokio::test]
+    async fn a_short_page_saves_nothing() {
+        let s = TestServer::start(|_| Response::text("hi", "text/plain")).await;
+        let store = crate::test_support::TempDir::new("web-save-short");
+        let dir = store.path().join("s");
+        let asked = Asked::new(Decision::Yes);
+        let ctx = ToolContext { tool_output: Some(dir.clone()), ..ctx(&asked) };
+        let out = fetch(&local_tool(), &format!("{}/", s.base()), None, &ctx).await.result;
+        assert!(!out.output.contains("Whole page saved"), "{}", out.output);
+        assert!(!dir.exists());
+    }
+
+    #[tokio::test]
+    async fn an_offset_read_saves_nothing_even_when_it_fetches() {
+        let s = long_server("x").await;
+        let store = crate::test_support::TempDir::new("web-save-offset");
+        let dir = store.path().join("s");
+        let asked = Asked::new(Decision::Yes);
+        let ctx = ToolContext { tool_output: Some(dir.clone()), ..ctx(&asked) };
+        // Not cached: this read downloads the page, but only the first read saves it.
+        let out = fetch(&local_tool(), &format!("{}/long.txt", s.base()), Some(30_000), &ctx).await.result;
+        assert!(out.output.contains("characters 30000-60000 of 70000"), "{}", out.output);
+        assert!(!out.output.contains("Whole page saved"));
+        assert!(!dir.exists());
     }
 
     #[tokio::test]

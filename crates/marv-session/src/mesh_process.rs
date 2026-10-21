@@ -6,7 +6,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use marv_mesh::discovery::{DoorGuard, DoorInfo, mesh_dir, mesh_name, open_door, session_socket};
+use marv_mesh::discovery::{DoorGuard, DoorInfo, mesh_dir_for, mesh_name, open_door, session_socket};
 use marv_mesh::herdr::{HerdrAdapter, herdr_target};
 use marv_mesh::radio::{Presence, Radio, RadioTimings};
 use tokio_util::sync::CancellationToken;
@@ -41,7 +41,8 @@ impl Drop for Mesh {
 /// `outside`: the project and the sandbox's writable folders, where the `herdr` the pane receptacles run is never taken
 /// from (`herdr_program`).
 pub fn start(env: &marv_mcp::Env, root: &Path, outside: &[std::path::PathBuf]) -> Result<Option<Mesh>, String> {
-    let Some(dir) = mesh_dir(env) else { return Ok(None) };
+    // In the project, a MARV_RUNTIME_DIR is refused (#168): the caller says why (`marv_sandbox::override_refusal_for`).
+    let Some(dir) = mesh_dir_for(env, Some(root)) else { return Ok(None) };
     let chosen = env.contains_key("MARV_MESH_NAME");
     let mut name = mesh_name(env, root).map_err(|e| e.to_string())?;
     // A generated name that a live Marv already has: try another (the suffix changes with the clock).
@@ -57,7 +58,7 @@ pub fn start(env: &marv_mcp::Env, root: &Path, outside: &[std::path::PathBuf]) -
         name = mesh_name(env, root).map_err(|e| e.to_string())?;
     }
     let cancel = CancellationToken::new();
-    let handle = crate::mesh::start(&name, env, cancel.clone()).ok_or("no runtime folder")?;
+    let handle = crate::mesh::start(&name, env, Some(root), cancel.clone()).ok_or("no runtime folder")?;
     let pane = herdr_target(env).map(|t| t.pane_id);
     // No herdr found the safe way: no Herdr receptacles, rather than a PATH lookup that could run a planted one.
     if let (Some(own), Some(program)) = (&pane, herdr_program(env, outside)) {

@@ -15,4 +15,7 @@ fn the_oracles_reworded_text_matches_what_marv_rs_sends() {
     // #81: Marv's process description is marv-rs's without its last sentence.
     let (process_sentence, nothing) = MARV_RS_TEXT[2];
     assert!(marv_tools::process::PROCESS_DESCRIPTION.ends_with(process_sentence) && nothing.is_empty());
+    // The `.git` placeholder sentence, which Marv doesn't have.
+    let (placeholder, nothing) = MARV_RS_TEXT[3];
+    assert!(placeholder == marv_session::prompt::GIT_PLACEHOLDER && nothing.is_empty());
 }

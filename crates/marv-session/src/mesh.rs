@@ -65,9 +65,15 @@ pub fn parent_id() -> PlugId {
 /// `cancel`. `None` without a runtime folder (`marv_sandbox::runtime_dir`): plugs never fall back to a world-readable
 /// `/tmp`, nor to a folder every sandbox doesn't hide: a worker that could see `parent.sock` could connect to it and
 /// use the parent's wires. The folder isn't named after the session: a session name of up to 43 bytes and a plug id of
-/// up to 48 overflowed `sun_path` (#150).
-pub fn start(session: &str, env: &marv_mcp::Env, cancel: CancellationToken) -> Option<MeshHandle> {
-    let dir = plug_folder(&marv_sandbox::runtime_dir(env)?).ok()?;
+/// up to 48 overflowed `sun_path` (#150). `project`: the session's root, which may not hold a `MARV_RUNTIME_DIR`
+/// (`marv_sandbox::runtime_dir_for`, #168).
+pub fn start(
+    session: &str,
+    env: &marv_mcp::Env,
+    project: Option<&std::path::Path>,
+    cancel: CancellationToken,
+) -> Option<MeshHandle> {
+    let dir = plug_folder(&marv_sandbox::runtime_dir_for(env, project)?).ok()?;
     let mesh = Arc::new(Switchboard::new(session, dir, Arc::new(marv_mesh::switchboard::NoTrajectory)).owning_folder());
     tokio::spawn(Arc::clone(&mesh).serve(cancel));
     Some(mesh)
@@ -77,15 +83,11 @@ pub fn start(session: &str, env: &marv_mcp::Env, cancel: CancellationToken) -> O
 /// run several switchboards (Marv desktop's chats): sharing a folder, a second `parent` plug would replace the first's
 /// socket. And a folder a dead process with the same pid left is never taken over.
 fn plug_folder(runtime: &std::path::Path) -> std::io::Result<PathBuf> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    use std::os::unix::fs::DirBuilderExt;
     use std::sync::atomic::{AtomicU32, Ordering};
     static NEXT: AtomicU32 = AtomicU32::new(0);
     let parent = runtime.join("p");
-    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&parent)?;
-    let meta = std::fs::symlink_metadata(&parent)?;
-    if !meta.is_dir() || meta.uid() != nix::unistd::geteuid().as_raw() {
-        return Err(std::io::Error::other(format!("{} isn't a folder of this user's", parent.display())));
-    }
+    marv_sandbox::private_folder(&parent)?;
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
     for _ in 0..64 {
         let n = (NEXT.fetch_add(1, Ordering::Relaxed).wrapping_add(nanos)) & 0xffff;
@@ -726,7 +728,7 @@ mod tests {
         let env: marv_mcp::Env =
             [("MARV_RUNTIME_DIR".to_string(), base.join("marv").display().to_string())].into_iter().collect();
         let cancel = CancellationToken::new();
-        let (a, b) = (start("a", &env, cancel.clone()).unwrap(), start("b", &env, cancel.clone()).unwrap());
+        let (a, b) = (start("a", &env, None, cancel.clone()).unwrap(), start("b", &env, None, cancel.clone()).unwrap());
         let (pa, pb) = (a.plug(parent_id()).unwrap(), b.plug(parent_id()).unwrap());
         assert_ne!(pa.host_socket.parent(), pb.host_socket.parent());
         assert!(pa.host_socket.starts_with(base.join("marv/p")), "{}", pa.host_socket.display());
