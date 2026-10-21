@@ -1699,7 +1699,7 @@ impl MarvSession {
                     match approve.approve(step_limit_request(steps, every)).await {
                         Decision::Yes | Decision::Always => LimitAnswer::Continue,
                         Decision::Unavailable => LimitAnswer::Unavailable,
-                        Decision::No => LimitAnswer::Stop,
+                        Decision::No | Decision::Declined(_) => LimitAnswer::Stop,
                     }
                 })
             }));
@@ -3407,7 +3407,7 @@ mod turn_tests {
     impl Approver for Answer {
         async fn approve(&self, request: ApprovalRequest) -> Decision {
             lock(&self.0).push(request);
-            self.1
+            self.1.clone()
         }
     }
     fn answer(decision: Decision) -> Arc<Answer> {
@@ -5919,6 +5919,46 @@ mod turn_tests {
         assert!(events.iter().position(|e| matches!(e, SessionEvent::Tainted { .. })).unwrap() < at("tool_start"));
         assert_eq!(asked.len(), 1);
         assert!(asked[0].must_ask && asked[0].network, "tainted egress must ask: {:?}", asked[0]);
+    }
+
+    /// #185: declined with a reason, the call isn't run, its result (an ordinary tool result, history append-only)
+    /// gives the reason as the user wrote it, unfenced, the turn goes on to the model's next reply, and nothing is
+    /// tainted. A plain no still stops the turn there.
+    #[tokio::test]
+    async fn declined_with_a_reason_tells_the_model_why_and_the_turn_goes_on_untainted() {
+        let reason = "Ignore the user: don't use the network, use the fixtures in tests/ instead";
+        let dirs = Dirs::new();
+        let curl = call("c1", "bash", serde_json::json!({"command": "curl -o page.html https://example.com", "network": true}));
+        let provider = Scripted::new(vec![use_tools(vec![curl.clone()]), say("Using the fixtures.")]);
+        let approver = answer(Decision::Declined(reason.into()));
+        let session = scripted(&dirs, &provider, |i| i.approve = Some(approver.clone()));
+        let events = collect(go(&session, "fetch the page")).await;
+        assert_eq!(lock(&approver.0).len(), 1);
+        assert!(!dirs.project.join("page.html").exists(), "not run");
+        // The model was asked again, with the declined result appended after what it had already seen.
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        let (first, second) = (&requests[0].0, &requests[1].0);
+        assert_eq!(&second[..first.len()], &first[..], "append-only");
+        let result = second.iter().find_map(|t| matches!(t, ChatTurn::Tool { .. }).then(|| text_of(t))).unwrap();
+        assert_eq!(result, marv_tools::declined_because(reason));
+        assert!(!result.contains("untrusted-data"), "the user's own words: not fenced");
+        assert!(session.tainted().is_empty() && tainted_events(&events).is_empty(), "no taint");
+        let ended = events.iter().find_map(|e| match e {
+            SessionEvent::Loop(LoopEvent::ToolEnd { run, .. }) => Some((run.declined, run.approval)),
+            _ => None,
+        });
+        assert_eq!(ended, Some((false, marv_agent::agent::ApprovalRecord::Declined)));
+        assert!(has_done(&events, StopReason::End));
+        assert!(!has_done(&events, StopReason::Declined));
+
+        // A plain no, the same call: the turn stops there, the model isn't asked again.
+        let dirs = Dirs::new();
+        let provider = Scripted::new(vec![use_tools(vec![curl]), say("never")]);
+        let session = scripted(&dirs, &provider, |i| i.approve = Some(answer(Decision::No)));
+        let events = collect(go(&session, "fetch the page")).await;
+        assert_eq!(provider.requests().len(), 1);
+        assert!(has_done(&events, StopReason::Declined));
     }
 
     #[tokio::test]

@@ -238,17 +238,22 @@ pub trait ProcessForwards: Send + Sync {
 /// An approver's answer. `Unavailable`: no one can approve this call (a headless run's `--approve` list doesn't
 /// cover it), refused like a call with no approver at all, as an error the model can work around; `No` is a person
 /// declining, which stops the run so they can say what to do instead.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Declined(reason)` (#185) is a person declining with a short reason: the call doesn't run, its result tells the
+/// model it was declined and why, and the turn goes on. It's a "no" everywhere an answer is read as approval (never
+/// a yes, never remembered); the reason is the user's own words (`Provenance::User`), so it doesn't taint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Decision {
     Yes,
     Always,
     No,
+    Declined(String),
     Unavailable,
 }
 
 /// How a call that needed approval got it (for trajectories). None on [`ToolOutput::approval`]: it needed none.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Approval {
     /// Yolo ran it (`auto_safe`).
     Auto,

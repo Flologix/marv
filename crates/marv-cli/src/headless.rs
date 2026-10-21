@@ -202,7 +202,7 @@ impl Collector {
         // Or a command for the host, which headless never runs, whatever --approve says (#52).
         let refused_here = run.result.output.contains(NO_APPROVER)
             || (run.result.is_error && run.result.output.contains(marv_tools::bash::NO_HOST_DOOR));
-        if !(refused_here || run.approval == ApprovalRecord::No || run.declined) {
+        if !(refused_here || matches!(run.approval, ApprovalRecord::No | ApprovalRecord::Declined) || run.declined) {
             return;
         }
         let refused =

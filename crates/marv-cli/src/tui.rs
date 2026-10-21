@@ -806,6 +806,7 @@ fn decision(d: view::Decision) -> marv_tools::Decision {
         view::Decision::Yes => marv_tools::Decision::Yes,
         view::Decision::Always => marv_tools::Decision::Always,
         view::Decision::No => marv_tools::Decision::No,
+        view::Decision::Declined(reason) => marv_tools::Decision::Declined(reason),
     }
 }
 

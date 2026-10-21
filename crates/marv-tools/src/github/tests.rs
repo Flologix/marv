@@ -96,7 +96,7 @@ impl Recorder {
 impl Approver for Recorder {
     async fn approve(&self, request: ApprovalRequest) -> Decision {
         self.1.lock().unwrap().push(request);
-        self.0
+        self.0.clone()
     }
 }
 

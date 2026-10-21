@@ -7,6 +7,11 @@
 //! behind the head), and the choice: Yes / Yes, and don't ask again for <scope> this session /
 //! No, and tell Marv what to do instead (esc). `once` requests offer only Yes / No.
 //!
+//! marv-rs (#185): every request but the step-limit question and a mesh wire's also offers "No, and say why (Marv carries on)" (tab
+//! from anywhere in the list, or Enter on it): a one-line input in the panel. Enter sends the reason as
+//! `Decision::Declined`: the call isn't run, its result tells the model why, and the turn goes on. An empty input
+//! sends nothing, Backspace on it goes back to the choices, and Esc still stops the run like a plain no.
+//!
 //! marv-rs: a mesh wire request (`tool: "mesh_wire"`, built by marv-session's `mesh::wire_approval`) comes through
 //! the same queue: `once` (yes or no; a wire is never remembered as a scope), labeled with the agent that asked,
 //! showing who, to what, which mode and the limits, with the taint warning. A `mesh_send`/`mesh_call` that needs a
@@ -24,7 +29,7 @@
 //! cut, not wrapped, numbered as in the transcript). Each queued request gets a fresh `ApprovalView`
 //! (Marv keyed it by id), so the cursor starts on Yes for every one.
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use marv_core::printable;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -47,6 +52,11 @@ pub const MAX_FILE_DIFF_LINES: usize = 8;
 /// scrolls, so a big /undo never pushes Yes/No off the screen.
 pub const RESERVED_ROWS: u16 = 16;
 pub const MIN_FILES_ROWS: u16 = 4;
+/// The reason input's length, in characters (marv-tools cuts at its own `MAX_DECLINE_REASON` too).
+pub const MAX_REASON_CHARS: usize = 500;
+/// The step-limit question (marv-session's `step_limit_request`): "no" stops there, so no reason is offered. Nor for
+/// a mesh wire (`mesh_wire`, [`MESH_WIRE_CALL`]): a wire is yes or no.
+const NO_REASON: [&str; 3] = ["continue", "mesh_wire", MESH_WIRE_CALL];
 
 /// One warning line per door out of the sandbox, in the warning colour: what saying yes lets out (Marv's
 /// `DOOR_WARNINGS`). A door's own detail (the repository a github write is visible on) comes in its preview's warning,
@@ -61,7 +71,7 @@ pub fn door_warning(door: marv_core::Door) -> &'static str {
 }
 
 /// What a key did at the approval.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApprovalOutcome {
     Decide(Decision),
     /// Esc: no to this and to everything waiting behind it.
@@ -79,6 +89,8 @@ pub struct ApprovalView {
     /// The file list's first shown row, and its last possible one as last drawn.
     files_top: usize,
     files_max: std::cell::Cell<usize>,
+    /// The reason being typed after "No, and say why" (#185); None while the choices show.
+    pub reason: Option<String>,
 }
 
 impl ApprovalView {
@@ -94,6 +106,9 @@ impl ApprovalView {
         }
         let no = if request.once { "No" } else { "No, and tell Marv what to do instead" };
         items.push(SelectItem::new(Decision::No, no).hint("esc"));
+        if !NO_REASON.contains(&request.tool.as_str()) {
+            items.push(SelectItem::new(Decision::Declined(String::new()), "No, and say why (Marv carries on)").hint("tab"));
+        }
         let window_rows = crossterm::terminal::size().map_or(24, |(_, rows)| rows);
         Self {
             request,
@@ -103,6 +118,49 @@ impl ApprovalView {
             window_rows,
             files_top: 0,
             files_max: std::cell::Cell::new(0),
+            reason: None,
+        }
+    }
+
+    /// Whether it offers declining with a reason (not the step-limit question).
+    fn offers_reason(&self) -> bool {
+        self.select.items.iter().any(|i| matches!(i.value, Decision::Declined(_)))
+    }
+
+    /// A key while the reason is being typed: Enter sends it (never when empty), Backspace on an empty input goes
+    /// back to the choices. Only printable characters are taken, on one line.
+    fn on_reason_key(&mut self, key: KeyEvent) -> Option<ApprovalOutcome> {
+        let reason = self.reason.as_mut()?;
+        match key.code {
+            KeyCode::Enter => {
+                let text = reason.trim();
+                if text.is_empty() {
+                    return None;
+                }
+                return Some(ApprovalOutcome::Decide(Decision::Declined(text.to_string())));
+            }
+            KeyCode::Backspace => {
+                if reason.pop().is_none() {
+                    self.reason = None;
+                }
+            }
+            KeyCode::Char(c) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                push_reason(reason, &c.to_string());
+            }
+            _ => {}
+        }
+        None
+    }
+
+    /// Pasted text while the reason is being typed: added on one line (newlines become spaces). False when the
+    /// input isn't open, so the paste goes nowhere.
+    pub fn paste(&mut self, text: &str) -> bool {
+        match self.reason.as_mut() {
+            Some(reason) => {
+                push_reason(reason, text);
+                true
+            }
+            None => false,
         }
     }
 
@@ -110,13 +168,27 @@ impl ApprovalView {
         if key.code == KeyCode::Esc {
             return self.escape_cancels.then_some(ApprovalOutcome::CancelAll);
         }
+        if self.reason.is_some() {
+            return self.on_reason_key(key);
+        }
+        if key.code == KeyCode::Tab && self.offers_reason() {
+            self.reason = Some(String::new());
+            return None;
+        }
         // A file list (/undo) scrolls with PgUp/PgDn: the transcript stays put meanwhile.
         if self.has_files() && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
             let page = self.files_rows() as i32;
             self.scroll_files(if key.code == KeyCode::PageUp { -page } else { page });
             return None;
         }
-        self.select.on_key(key).map(ApprovalOutcome::Decide)
+        match self.select.on_key(key) {
+            // The item opens the input; only Enter there sends a reason.
+            Some(Decision::Declined(_)) => {
+                self.reason = Some(String::new());
+                None
+            }
+            chosen => chosen.map(ApprovalOutcome::Decide),
+        }
     }
 
     /// Whether the request lists files (/undo): PgUp/PgDn and the wheel scroll them, not the transcript.
@@ -212,8 +284,21 @@ impl ApprovalView {
             lines.push(Line::styled(format!("{} more waiting", self.waiting), dim));
         }
         lines.push(Line::default());
-        lines.push(Line::raw("Do you want to proceed?"));
-        lines.extend(self.select.render());
+        match &self.reason {
+            Some(reason) => {
+                lines.push(Line::raw("Why not? Marv reads this and carries on."));
+                lines.push(Line::from(vec![
+                    Span::styled("❯ ", Style::new().fg(theme::ACCENT)),
+                    Span::raw(printable(reason)),
+                    Span::styled("▏", Style::new().fg(theme::ACCENT)),
+                ]));
+                lines.push(Line::styled("enter sends · backspace on empty goes back · esc stops", dim));
+            }
+            None => {
+                lines.push(Line::raw("Do you want to proceed?"));
+                lines.extend(self.select.render());
+            }
+        }
         wrap_all(&lines, width)
     }
 
@@ -234,7 +319,8 @@ impl ApprovalView {
         let lines = self.lines(inner.width);
         // Taller than the screen: keep the choice in view and cut the payload's end instead.
         let skip = lines.len().saturating_sub(inner.height as usize);
-        let keep_head = lines.len().saturating_sub(self.select.items.len() + 2 + skip);
+        let choice_rows = if self.reason.is_some() { 3 } else { self.select.items.len() };
+        let keep_head = lines.len().saturating_sub(choice_rows + 2 + skip);
         let shown = lines[..keep_head].iter().chain(&lines[keep_head + skip..]);
         for (i, line) in shown.enumerate().take(inner.height as usize) {
             buf.set_line(inner.x, inner.y + i as u16, line, inner.width);
@@ -242,11 +328,18 @@ impl ApprovalView {
     }
 }
 
+/// Adds `text` to the reason on one line: control characters dropped, newlines and tabs as spaces, at most
+/// [`MAX_REASON_CHARS`].
+fn push_reason(reason: &mut String, text: &str) {
+    let room = MAX_REASON_CHARS.saturating_sub(reason.chars().count());
+    let flat = text.chars().map(|c| if c.is_whitespace() { ' ' } else { c }).filter(|c| !c.is_control());
+    reason.extend(flat.take(room));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::view::{DiffKind, DiffLine, Preview, Scope};
-    use crossterm::event::KeyModifiers;
 
     fn edit() -> ApprovalRequest {
         let line = |kind, text: &str| DiffLine { kind, text: text.into(), old_line: None, new_line: None };
@@ -525,6 +618,57 @@ mod tests {
             let outcome = keys.into_iter().map(|k| view.on_key(key(k))).last().flatten();
             assert_eq!(outcome, Some(ApprovalOutcome::Decide(decision)));
         }
+    }
+
+    /// #185: "No, and say why" (tab, or Enter on it) opens a one-line input; Enter sends the reason, never an empty
+    /// one, and Backspace on an empty input goes back to the choices. Esc still stops everything.
+    #[test]
+    fn no_and_say_why_types_a_reason() {
+        let mut view = ApprovalView::new(command(), 0, true);
+        assert!(frame(&view).contains("No, and say why (Marv carries on) · tab"));
+        // Enter on the item opens the input; nothing is decided yet.
+        let mut moved = ApprovalView::new(command(), 0, true);
+        for _ in 0..3 {
+            moved.on_key(key(KeyCode::Down));
+        }
+        assert_eq!(moved.on_key(key(KeyCode::Enter)), None);
+        assert_eq!(moved.reason.as_deref(), Some(""));
+        // Tab from anywhere opens it too.
+        assert_eq!(view.on_key(key(KeyCode::Tab)), None);
+        assert!(frame(&view).contains("Why not?"));
+        assert_eq!(view.on_key(key(KeyCode::Enter)), None, "an empty reason sends nothing");
+        for c in "use pnpm".chars() {
+            view.on_key(key(KeyCode::Char(c)));
+        }
+        assert!(view.paste("\n not bun\x1b"), "a paste goes into the input, on one line");
+        assert!(frame(&view).contains("❯ use pnpm  not bun"), "{}", frame(&view));
+        assert_eq!(
+            view.on_key(key(KeyCode::Enter)),
+            Some(ApprovalOutcome::Decide(Decision::Declined("use pnpm  not bun".into())))
+        );
+        // Backspace on an empty input: back to the choices.
+        let mut back = ApprovalView::new(command(), 0, true);
+        back.on_key(key(KeyCode::Tab));
+        back.on_key(key(KeyCode::Char('x')));
+        back.on_key(key(KeyCode::Backspace));
+        back.on_key(key(KeyCode::Backspace));
+        assert!(back.reason.is_none() && frame(&back).contains("Do you want to proceed?"));
+        assert!(!back.paste("x"), "no input open: the paste goes nowhere");
+        // Esc while typing still stops everything, like a plain no.
+        back.on_key(key(KeyCode::Tab));
+        assert_eq!(back.on_key(key(KeyCode::Esc)), Some(ApprovalOutcome::CancelAll));
+        // The step-limit question and a mesh wire don't offer it.
+        for tool in ["continue", "mesh_wire", MESH_WIRE_CALL] {
+            let mut view = ApprovalView::new(ApprovalRequest { tool: tool.into(), ..command() }, 0, true);
+            assert!(!frame(&view).contains("say why"), "{tool}");
+            assert_eq!(view.on_key(key(KeyCode::Tab)), None);
+            assert!(view.reason.is_none());
+        }
+        // At most MAX_REASON_CHARS.
+        let mut long = ApprovalView::new(command(), 0, true);
+        long.on_key(key(KeyCode::Tab));
+        long.paste(&"a".repeat(MAX_REASON_CHARS + 10));
+        assert_eq!(long.reason.as_ref().map(|r| r.chars().count()), Some(MAX_REASON_CHARS));
     }
 
     #[test]

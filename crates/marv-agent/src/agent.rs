@@ -287,6 +287,8 @@ pub enum ApprovalRecord {
     Yes,
     Always,
     No,
+    /// Declined with a reason (#185): not run, and the turn went on. The reason is in the result, never here.
+    Declined,
     Unavailable,
 }
 

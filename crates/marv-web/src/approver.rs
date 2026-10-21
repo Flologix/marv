@@ -64,7 +64,12 @@ impl Approver for WebApprover {
             return Decision::Unavailable;
         }
         let decision = answered.await.unwrap_or(Decision::No);
-        let _ = self.out.send(json!({"type": "approval_done", "id": id, "decision": decision}));
+        // A decline with a reason (#185) is "declined" on the page, the reason with it (the person's own text).
+        let done = match &decision {
+            Decision::Declined(reason) => json!({"type": "approval_done", "id": id, "decision": "declined", "reason": reason}),
+            decision => json!({"type": "approval_done", "id": id, "decision": decision}),
+        };
+        let _ = self.out.send(done);
         decision
     }
 }
@@ -146,6 +151,21 @@ mod tests {
         assert_eq!(page.recv().await.unwrap()["type"], "approval");
         approver.cancel_all();
         assert_eq!(asking.await.unwrap(), Decision::No);
+    }
+
+    #[tokio::test]
+    async fn a_reason_reaches_the_call_and_the_page_shows_it_declined() {
+        let (out, mut page) = tokio::sync::mpsc::unbounded_channel();
+        let approver = Arc::new(WebApprover::new(out));
+        let asking = tokio::spawn({
+            let approver = approver.clone();
+            async move { approver.approve(request(true)).await }
+        });
+        let id = page.recv().await.unwrap()["id"].as_u64().unwrap();
+        approver.answer(id, Decision::Declined("not on main".into()));
+        assert_eq!(asking.await.unwrap(), Decision::Declined("not on main".into()));
+        let done = page.recv().await.unwrap();
+        assert_eq!((done["decision"].as_str(), done["reason"].as_str()), (Some("declined"), Some("not on main")));
     }
 
     #[tokio::test]

@@ -27,7 +27,7 @@
 use std::path::MAIN_SEPARATOR;
 use std::sync::{Arc, OnceLock};
 
-use marv_core::{ToolCall, ToolKind, ToolSpec};
+use marv_core::{Provenance, ToolCall, ToolKind, ToolSpec};
 use serde_json::Value;
 
 use crate::repair::{repair_json_args, with_note};
@@ -41,6 +41,19 @@ pub type ToolRef = Arc<dyn DynTool>;
 pub const INTERRUPTED: &str = "Interrupted by the user before this tool ran.";
 /// What the model reads when the user said no.
 pub const DECLINED: &str = "The user declined this. Don't retry it: stop and wait for them to say how to proceed.";
+
+/// A declined call's reason is cut to this many characters (a client could send any length; the TUI stops there).
+pub const MAX_DECLINE_REASON: usize = 1000;
+
+/// What the model reads for a call declined with a reason (#185): it wasn't run, and the user's reason, as they
+/// wrote it. The turn goes on, so the model can do what the reason asks instead.
+pub fn declined_because(reason: &str) -> String {
+    let reason: String = reason.trim().chars().take(MAX_DECLINE_REASON).collect();
+    format!(
+        "Not run: the user declined this, and said why:\n{}\nDon't retry it as it was. Take their reason into account and carry on.",
+        reason.trim()
+    )
+}
 
 /// Marv's built-in tools, in Marv's order (the order of the specs the model sees):
 /// read_file, glob, grep, web_fetch, github, skill, edit_file, write_file, bash, process, memory, plan, agent.
@@ -280,7 +293,26 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
             result.door = door;
             noted(ToolOutcome { result, label: label.clone() })
         }
-        decision => {
+        // #185: declined with a reason. The call doesn't run and the turn goes on: the result is an ordinary tool
+        // result (history stays append-only) saying it was declined and why. The reason is the user's own words, so
+        // it's `Provenance::User`: not fenced, and it taints nothing.
+        Decision::Declined(_) if ctx.aborted() => interrupted(Approval::Interrupted),
+        // No reason given: a plain no, which stops the run.
+        Decision::Declined(reason) if reason.trim().is_empty() => {
+            let mut result = ToolOutput::ok(DECLINED, "declined");
+            result.declined = true;
+            result.approval = Some(Approval::Decided(Decision::No));
+            result.door = door;
+            noted(ToolOutcome { result, label: label.clone() })
+        }
+        Decision::Declined(reason) => {
+            let mut result = ToolOutput::ok(declined_because(&reason), "declined");
+            result.provenance = Provenance::User;
+            result.approval = Some(Approval::Decided(Decision::Declined(reason)));
+            result.door = door;
+            noted(ToolOutcome { result, label: label.clone() })
+        }
+        decision @ (Decision::Yes | Decision::Always) => {
             // "Always" on a tainted web request covers its URL prefix, not the whole site (marv-rs S6).
             if decision == Decision::Always
                 && must_ask
@@ -301,7 +333,6 @@ mod tests {
     use super::*;
     use crate::types::{Approver, Preview, Tool, ToolError};
     use async_trait::async_trait;
-    use marv_core::Provenance;
     use serde::Deserialize;
     use std::sync::Mutex;
 
@@ -382,7 +413,7 @@ mod tests {
     impl Approver for Answer {
         async fn approve(&self, request: ApprovalRequest) -> Decision {
             self.1.lock().unwrap().push(request);
-            self.0
+            self.0.clone()
         }
     }
 
@@ -489,6 +520,39 @@ mod tests {
         assert_eq!(yes.result.output, "x");
         assert_eq!(yes.result.approval, Some(Approval::Decided(Decision::Yes)));
         assert_eq!(approver.1.lock().unwrap()[0].scope.key, "echo");
+    }
+
+    /// #185: declined with a reason, the call doesn't run (tainted egress included), its result gives the reason as
+    /// the user's own words, and it isn't a decline that stops the run.
+    #[tokio::test]
+    async fn declined_with_a_reason_isnt_run_and_tells_the_model_why() {
+        let reason = || Decision::Declined("use the staging server instead".into());
+        // (a write that asks, and a tainted egress call yolo would otherwise allow, which asks even in yolo)
+        for (kind, safe) in [(ToolKind::Write, false), (ToolKind::Egress, true)] {
+            let t = tools(kind, safe);
+            let asking = ToolContext { approver: Some(Arc::new(Answer(reason(), Mutex::new(vec![])))), yolo: true, ..ctx() };
+            asking.taint.mark(Provenance::Web);
+            let out = run_tool(&call(r#"{"text": "x"}"#), &asking, &t).await;
+            assert_eq!(out.result.output, declined_because("use the staging server instead"));
+            assert!(out.result.output.contains("declined") && out.result.output.contains("use the staging server instead"));
+            assert!(!out.result.declined, "the turn goes on");
+            assert!(!out.result.is_error);
+            assert_eq!(out.result.provenance, Provenance::User, "the user's own words: not fenced, no taint");
+            assert_eq!(out.result.approval, Some(Approval::Decided(reason())));
+        }
+        // Stopped meanwhile (Esc after typing): an interrupt, like a plain no.
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let stopped = ToolContext { approver: Some(Arc::new(Answer(reason(), Mutex::new(vec![])))), cancel, ..ctx() };
+        let out = run_tool(&call(r#"{"text": "x"}"#), &stopped, &tools(ToolKind::Write, false)).await;
+        assert!(out.result.declined);
+        assert_eq!(out.result.output, INTERRUPTED);
+        // An empty reason is a plain no: it stops the run.
+        let blank =
+            ToolContext { approver: Some(Arc::new(Answer(Decision::Declined("  ".into()), Mutex::new(vec![])))), ..ctx() };
+        let out = run_tool(&call(r#"{"text": "x"}"#), &blank, &tools(ToolKind::Write, false)).await;
+        assert!(out.result.declined);
+        assert_eq!(out.result.output, DECLINED);
     }
 
     /// #77: a call the tool asks about itself isn't asked again by the registry, tainted or in yolo; its answer is the
@@ -619,7 +683,7 @@ mod tests {
         impl Approver for Saying {
             async fn approve(&self, _request: ApprovalRequest) -> Decision {
                 self.0.lock().unwrap().push("approve");
-                self.1
+                self.1.clone()
             }
         }
 

@@ -2,7 +2,7 @@ import { type ReactNode, useEffect, useRef, useState } from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { type ChatSettings, type Model, desktop, isDesktop } from "../lib/backend";
-import { type ApprovalRequest, type Command, type DiffLine, type Item, knownCommands, type useChat } from "../lib/chat";
+import { type Answer, type ApprovalRequest, type Command, type DiffLine, type Item, knownCommands, type useChat } from "../lib/chat";
 import { tokens } from "../lib/format";
 import { Martian } from "./Martian";
 import { Settings } from "./Settings";
@@ -197,7 +197,7 @@ export function ChatView({
   );
 }
 
-function ItemView({ item, onAnswer }: { item: Item; onAnswer: (id: number, d: "yes" | "always" | "no") => void }) {
+function ItemView({ item, onAnswer }: { item: Item; onAnswer: (id: number, d: Answer) => void }) {
   switch (item.kind) {
     case "user":
       return <div className="user">{item.text}</div>;
@@ -232,7 +232,7 @@ function ItemView({ item, onAnswer }: { item: Item; onAnswer: (id: number, d: "y
         </details>
       );
     case "approval":
-      return <Approval request={item.request} decision={item.decision} onAnswer={onAnswer} />;
+      return <Approval request={item.request} decision={item.decision} reason={item.reason} onAnswer={onAnswer} />;
     case "notice":
       return <p className={`notice ${item.tone}`}>{item.text}</p>;
     case "output":
@@ -254,20 +254,32 @@ function ItemView({ item, onAnswer }: { item: Item; onAnswer: (id: number, d: "y
 function Approval({
   request: r,
   decision,
+  reason,
   onAnswer,
 }: {
   request: ApprovalRequest;
   decision?: string;
-  onAnswer: (id: number, d: "yes" | "always" | "no") => void;
+  reason?: string;
+  onAnswer: (id: number, d: Answer) => void;
 }) {
+  // #185: "Decline and say why" opens a one-line reason; the turn goes on with it. Not for the step-limit question or
+  // a mesh wire, which are yes or no.
+  const [why, setWhy] = useState<string | null>(null);
   if (decision) {
-    const word = decision === "no" ? "declined" : decision === "always" ? "allowed for this chat" : "allowed";
+    const no = decision === "no" || decision === "declined";
+    const word = no ? "declined" : decision === "always" ? "allowed for this chat" : "allowed";
     return (
-      <p className={`decided${decision === "no" ? " no" : ""}`}>
+      <p className={`decided${no ? " no" : ""}`}>
         {word} · <span>{r.command ?? r.label}</span>
+        {reason && <span> · “{reason}”</span>}
       </p>
     );
   }
+  const offersWhy = !["continue", "mesh_wire", "mesh_wire_call"].includes(r.tool);
+  const sendWhy = () => {
+    const text = (why ?? "").trim();
+    if (text) onAnswer(r.id, { declined: text });
+  };
   return (
     <section className="approval" aria-live="assertive">
       <span className="who">{r.agent ? `${r.agent} asks` : "Marv asks"}</span>
@@ -289,7 +301,35 @@ function Approval({
         <button className="btn plain" onClick={() => onAnswer(r.id, "no")}>
           Decline
         </button>
+        {offersWhy && why === null && (
+          <button className="btn plain" onClick={() => setWhy("")}>
+            Decline and say why
+          </button>
+        )}
       </div>
+      {why !== null && (
+        <form
+          className="why"
+          onSubmit={(e) => {
+            e.preventDefault();
+            sendWhy();
+          }}
+        >
+          <input
+            autoFocus
+            value={why}
+            maxLength={500}
+            placeholder="Why not? Marv reads this and carries on."
+            onChange={(e) => setWhy(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") setWhy(null);
+            }}
+          />
+          <button type="submit" className="btn" disabled={!why.trim()}>
+            Send
+          </button>
+        </form>
+      )}
     </section>
   );
 }

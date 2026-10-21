@@ -42,8 +42,8 @@ pub mod write_file;
 
 pub use formatter::{FormatOutcome, Formatter, FormatterSetting, ProjectFormatter};
 pub use registry::{
-    DECLINED, INTERRUPTED, ToolOutcome, ToolRef, builtin_tools, is_parallel_call, run_tool, schema_repaired, tool_specs,
-    tool_specs_for,
+    DECLINED, INTERRUPTED, MAX_DECLINE_REASON, ToolOutcome, ToolRef, builtin_tools, declined_because, is_parallel_call, run_tool,
+    schema_repaired, tool_specs, tool_specs_for,
 };
 pub use schema_repair::RepairMode;
 pub use types::{

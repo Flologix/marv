@@ -21,6 +21,9 @@ export interface ApprovalRequest {
   once: boolean;
 }
 
+/** The person's answer to an approval. `declined` (#185): not run, the reason goes to the model and the turn goes on. */
+export type Answer = "yes" | "always" | "no" | { declined: string };
+
 export interface Usage {
   promptTokens: number;
   cachedTokens: number;
@@ -46,7 +49,7 @@ export type Item =
       error?: boolean;
       diff?: { lines: DiffLine[]; more: number };
     }
-  | { kind: "approval"; request: ApprovalRequest; decision?: string }
+  | { kind: "approval"; request: ApprovalRequest; decision?: string; reason?: string }
   | { kind: "notice"; text: string; tone: "info" | "warn" | "error" }
   | { kind: "turn"; reason: string; usage?: Usage }
   /** What a /command printed. */
@@ -118,7 +121,7 @@ function apply(items: Item[], e: ServerEvent): Item[] {
       return next;
     case "approval_done": {
       const i = next.findIndex((it) => it.kind === "approval" && it.request.id === e.id);
-      if (i >= 0) next[i] = { ...(next[i] as Extract<Item, { kind: "approval" }>), decision: String(e.decision) };
+      if (i >= 0) next[i] = { ...(next[i] as Extract<Item, { kind: "approval" }>), decision: String(e.decision), reason: typeof e.reason === "string" ? e.reason : undefined };
       return next;
     }
     case "compaction":
@@ -387,7 +390,7 @@ export function useChat(id: string | null, settings: ChatSettings, reload = 0) {
   const mcp = useCallback((action: string, name?: string) => connection.current?.send({ type: "mcp", action, name }), []);
 
   const interrupt = useCallback(() => connection.current?.send({ type: "interrupt" }), []);
-  const answer = useCallback((rid: number, decision: "yes" | "always" | "no") => connection.current?.send({ type: "approval", id: rid, decision }), []);
+  const answer = useCallback((rid: number, decision: Answer) => connection.current?.send({ type: "approval", id: rid, decision }), []);
 
   return { items, status, busy, error, commands, meshName, servers, mcp, send, startWith, interrupt, answer };
 }
