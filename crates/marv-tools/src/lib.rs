@@ -30,6 +30,7 @@ pub mod output;
 pub mod plan;
 pub mod process;
 pub mod read_file;
+pub mod recall;
 pub mod registry;
 pub mod relay;
 pub mod repair;

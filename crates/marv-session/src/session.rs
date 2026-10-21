@@ -1810,6 +1810,9 @@ impl MarvSession {
         ctx.memory = init.memory.as_ref().map(|(paths, _)| paths.for_tools());
         // The session's id now (a resume changes it): its cut outputs are saved, and readable, there (#61).
         ctx.tool_output = init.tool_output_dir.as_ref().map(|dir| dir.join(self.id()));
+        // Its saved pages, which `recall` reads: this conversation's own, the main agent's only (a subagent's context
+        // is built without them, so it can't read its parent's).
+        ctx.swap = self.swap_dir();
         self.clean_tool_output_once();
         ctx.agent_host = Some(host);
         // Where the plan tool writes; only the main agent gets it (as it does agent_host), so subagents have no plan.
