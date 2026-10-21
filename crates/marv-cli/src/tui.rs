@@ -135,7 +135,7 @@ pub fn approval_request(request: &marv_tools::ApprovalRequest) -> view::Approval
         (w, why) => w.or(why),
     };
     view::ApprovalRequest {
-        reason: false,
+        reason: request.reason,
         tool: request.tool.clone(),
         label: request.label.clone(),
         preview: view::Preview {
@@ -3918,6 +3918,65 @@ mod tests {
         let view = marv_tui::ui::approval::ApprovalView::new(shown, 0, true);
         let labels: Vec<&str> = view.select.items.iter().map(|i| i.label.as_str()).collect();
         assert_eq!(labels, ["Yes (wire it)", "No"]);
+    }
+
+    /// #185: a model's call (run_tool's request sets `reason`) reaches the TUI still offering "No, and say why";
+    /// the step-limit question, /undo and a call needing a new wire don't.
+    #[test]
+    fn only_a_models_call_offers_a_reason_in_the_tui() {
+        use marv_mesh::{PlugId, ReceptacleName, WireMode, approval::WireRequest};
+        use marv_session::checkpoints::store::{Checkpoint, CheckpointKind};
+        let model_call = marv_tools::ApprovalRequest {
+            reason: true,
+            tool: "bash".into(),
+            label: "bun test".into(),
+            preview: marv_tools::Preview {
+                title: "Run a command".into(),
+                command: Some("bun test".into()),
+                ..Default::default()
+            },
+            scope: marv_tools::Scope { key: "bash::bun test".into(), description: "this exact command".into() },
+            agent: None,
+            network: false,
+            once: false,
+            must_ask: false,
+            protected: None,
+            door: None,
+        };
+        let shown = approval_request(&model_call);
+        assert!(shown.reason);
+        let view = marv_tui::ui::approval::ApprovalView::new(shown, 0, true);
+        assert!(view.select.items.iter().any(|i| i.label.starts_with("No, and say why")));
+
+        let checkpoint = |kind| Checkpoint { sha: "a".into(), tree: "b".into(), turn: 1, kind, label: "x".into() };
+        let undo = marv_session::UndoPlan {
+            turn: 1,
+            label: "add the parser".into(),
+            before: checkpoint(CheckpointKind::Before),
+            after: checkpoint(CheckpointKind::After),
+            files: Vec::new(),
+            not_restored: Vec::new(),
+            head: "a".into(),
+            targets: Default::default(),
+        };
+        let wire = WireRequest {
+            from: PlugId::new("parent").unwrap(),
+            to: ReceptacleName::new("peer.web.agent.parent.inbox").unwrap(),
+            mode: WireMode::Send,
+            asked_by: PlugId::new("parent").unwrap(),
+        };
+        let call = marv_tools::Preview { title: "Send a message".into(), ..Default::default() };
+        for request in [
+            marv_session::runner::step_limit_request(25, 25),
+            marv_session::undo_request(&undo),
+            marv_session::mesh::call_wire_approval(&wire, call),
+        ] {
+            let tool = request.tool.clone();
+            let shown = approval_request(&request);
+            assert!(!shown.reason, "{tool}");
+            let view = marv_tui::ui::approval::ApprovalView::new(shown, 0, true);
+            assert!(!view.select.items.iter().any(|i| i.label.contains("say why")), "{tool}");
+        }
     }
 
     /// #185: a call declined with a reason shows declined (it didn't run), not done, though the turn goes on.
