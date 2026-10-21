@@ -83,15 +83,11 @@ pub fn start(
 /// run several switchboards (Marv desktop's chats): sharing a folder, a second `parent` plug would replace the first's
 /// socket. And a folder a dead process with the same pid left is never taken over.
 fn plug_folder(runtime: &std::path::Path) -> std::io::Result<PathBuf> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    use std::os::unix::fs::DirBuilderExt;
     use std::sync::atomic::{AtomicU32, Ordering};
     static NEXT: AtomicU32 = AtomicU32::new(0);
     let parent = runtime.join("p");
-    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&parent)?;
-    let meta = std::fs::symlink_metadata(&parent)?;
-    if !meta.is_dir() || meta.uid() != nix::unistd::geteuid().as_raw() {
-        return Err(std::io::Error::other(format!("{} isn't a folder of this user's", parent.display())));
-    }
+    marv_sandbox::private_folder(&parent)?;
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
     for _ in 0..64 {
         let n = (NEXT.fetch_add(1, Ordering::Relaxed).wrapping_add(nanos)) & 0xffff;

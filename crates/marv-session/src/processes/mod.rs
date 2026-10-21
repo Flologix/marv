@@ -224,6 +224,22 @@ struct Entry {
     released: bool,
 }
 
+/// The processes' folder without a runtime folder: `<temp>/marv-<uid>/marv`. Each level gets the runtime folder's
+/// checks (`marv_sandbox::private_folder`): made 0700, then it must be a folder of this user's, not a symlink, with
+/// every folder on the way this user's or root's and not writable by others unless sticky; an existing one is made
+/// 0700 again. Otherwise no process starts, and the error says which folder and why.
+fn fallback_dir(temp: &Path) -> std::io::Result<PathBuf> {
+    let base = temp.join(format!("marv-{}", nix::unistd::geteuid()));
+    let dir = base.join("marv");
+    for level in [&base, &dir] {
+        marv_sandbox::private_folder(level).map_err(|e| {
+            let named = e.to_string().contains(&*level.to_string_lossy());
+            if named { e } else { std::io::Error::new(e.kind(), format!("{}: {e}", level.display())) }
+        })?;
+    }
+    Ok(dir)
+}
+
 struct State {
     /// In start order (a replaced name goes to the end), as Marv's Map.
     entries: Vec<Entry>,
@@ -259,15 +275,24 @@ impl ProcessManager {
         lock(&self.shared.state)
     }
 
-    fn parent_dir(&self) -> PathBuf {
+    fn parent_dir(&self) -> std::io::Result<PathBuf> {
+        use std::os::unix::fs::DirBuilderExt;
         if let Some(dir) = &self.shared.options.runtime_dir {
-            return dir.clone();
+            std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+            return Ok(dir.clone());
         }
         // A short path: a Unix socket's path is limited to 107 bytes (103 on macOS). Marv's runtime folder
         // (`marv_sandbox::runtime_dir`, hidden in every sandbox), else as before a folder of the user's in the temp
-        // folder. A MARV_RUNTIME_DIR inside the project isn't used (#168): a sandboxed command could have made it.
-        marv_sandbox::runtime_dir_for(&marv_sandbox::runtime_env(), Some(&self.shared.options.root))
-            .unwrap_or_else(|| std::env::temp_dir().join(format!("marv-{}", nix::unistd::geteuid())).join("marv"))
+        // folder ([`fallback_dir`]). A MARV_RUNTIME_DIR inside the project isn't used (#168): a sandboxed command could
+        // have made it.
+        match marv_sandbox::runtime_dir_for(&marv_sandbox::runtime_env(), Some(&self.shared.options.root)) {
+            Some(dir) => {
+                // Checked and made by `runtime_dir_for`; again here, as it's about to be used.
+                marv_sandbox::private_folder(&dir)?;
+                Ok(dir)
+            }
+            None => fallback_dir(&std::env::temp_dir()),
+        }
     }
 
     /// Its own folder (0700), unique even among managers in one process: their process ids both start at p1.
@@ -276,8 +301,7 @@ impl ProcessManager {
         if let Some(dir) = &state.own_dir {
             return Ok(dir.clone());
         }
-        let parent = self.parent_dir();
-        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&parent)?;
+        let parent = self.parent_dir()?;
         loop {
             let dir = parent.join(format!("{}-{}", std::process::id(), random_suffix()));
             match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
@@ -823,6 +847,60 @@ mod tests {
     fn names_are_letters_digits_dot_dash_underscore_up_to_64() {
         assert!(valid_name("web") && valid_name("a.b_c-1") && valid_name(&"a".repeat(64)));
         assert!(!valid_name("-web") && !valid_name("") && !valid_name("a b") && !valid_name(&"a".repeat(65)));
+    }
+
+    /// A fresh folder under /tmp standing in for the temp folder.
+    fn temp_root(tag: &str) -> PathBuf {
+        let dir = PathBuf::from(format!("/tmp/mx-pf-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn the_fallback_folder_is_made_0700_at_every_level() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = temp_root("mk");
+        let base = temp.join(format!("marv-{}", nix::unistd::geteuid()));
+        let dir = fallback_dir(&temp).unwrap();
+        assert_eq!(dir, base.join("marv"));
+        assert_eq!((mode(&base), mode(&dir)), (0o700, 0o700));
+        // Existing levels with wider modes are made 0700 again.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert_eq!(fallback_dir(&temp).unwrap(), dir);
+        assert_eq!((mode(&base), mode(&dir)), (0o700, 0o700));
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn a_symlinked_level_of_the_fallback_folder_is_refused() {
+        let temp = temp_root("ln");
+        let elsewhere = temp.join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let base = temp.join(format!("marv-{}", nix::unistd::geteuid()));
+        // `marv-<uid>` a symlink: refused, nothing made where it leads.
+        std::os::unix::fs::symlink(&elsewhere, &base).unwrap();
+        let why = fallback_dir(&temp).unwrap_err().to_string();
+        assert!(why.contains(&base.display().to_string()), "{why}");
+        assert!(!elsewhere.join("marv").exists());
+        // `marv` inside it a symlink: refused too.
+        std::fs::remove_file(&base).unwrap();
+        std::fs::create_dir(&base).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, base.join("marv")).unwrap();
+        let why = fallback_dir(&temp).unwrap_err().to_string();
+        assert!(why.contains(&base.join("marv").display().to_string()), "{why}");
+        // A temp folder reached through a symlink: refused, not followed.
+        let via = temp.join("via");
+        std::os::unix::fs::symlink(&elsewhere, &via).unwrap();
+        let why = fallback_dir(&via).unwrap_err().to_string();
+        assert!(why.contains("symlink"), "{why}");
+        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[tokio::test]
