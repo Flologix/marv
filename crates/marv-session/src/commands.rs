@@ -116,6 +116,13 @@ pub enum CommandAction {
         to: Vec<String>,
         text: String,
     },
+    /// marv-rs #124 (phase 3): `/ask @name text`, the person's request on the radio (`by: user`, hop 0): one Marv,
+    /// which acknowledges and reports `done` or `failed` when the turn that handled it ends. Nothing of it reaches
+    /// this Marv's own model; the reports do, fenced, at its next turn.
+    Ask {
+        to: String,
+        text: String,
+    },
     /// Stop one of the session's background processes (Marv #51).
     Processes {
         stop: String,
@@ -462,6 +469,21 @@ pub fn commands() -> &'static [Command] {
             },
         },
         Command {
+            name: "ask",
+            // Sending doesn't touch a running turn: the palette may run it.
+            while_busy: true,
+            description: "Ask another Marv on the radio to do something: /ask @name text (it acknowledges, then reports back)",
+            run: |args, ctx| {
+                if !ctx.config.mesh_radio {
+                    return print(RADIO_OFF);
+                }
+                match parse_tx(args) {
+                    Some((to, text)) if to.len() == 1 => CommandAction::Ask { to: to[0].clone(), text },
+                    _ => error("Usage: /ask @name text (a request goes to exactly one Marv on the radio)"),
+                }
+            },
+        },
+        Command {
             name: "undo",
             while_busy: false,
             description: "Put back the files the last turn changed (shows them first)",
@@ -719,7 +741,7 @@ pub fn diagnostics_status(config: &Config) -> String {
 }
 
 /// `/radio` with the radio off (#124).
-pub const RADIO_OFF: &str = "The radio is off. /radio on puts this Marv on it (saved as \"mesh\": {\"radio\": true} in your own ~/.marv/config.json): your Marvs on this machine with the radio on see each other's state (idle, working, waiting) and conversation title, in the strip above the prompt, and can send each other short messages (/tx). A message reaches the other Marvs' models as data from another agent, never as their user's words.";
+pub const RADIO_OFF: &str = "The radio is off. /radio on puts this Marv on it (saved as \"mesh\": {\"radio\": true} in your own ~/.marv/config.json): your Marvs on this machine with the radio on see each other's state (idle, working, waiting) and conversation title, in the strip above the prompt, and can send each other short messages (/tx) and requests (/ask). A message reaches the other Marvs' models as data from another agent, never as their user's words.";
 
 /// `/tx`'s words: leading `@name`s (none: everyone), then the text. `None` without text.
 pub fn parse_tx(args: &str) -> Option<(Vec<String>, String)> {
@@ -1175,6 +1197,23 @@ mod tests {
             let ctx = CommandContext { config: &on, ..ctx.clone() };
             assert_eq!(run_command("/tx @b2 hi", &ctx), CommandAction::Tx { to: vec!["b2".into()], text: "hi".into() });
             assert!(matches!(run_command("/tx", &ctx), CommandAction::Print { is_error: true, .. }));
+        });
+    }
+
+    /// #124, phase 3: `/ask` takes exactly one name, then the text.
+    #[test]
+    fn ask_takes_one_name_then_the_text() {
+        with(|ctx| {
+            assert!(matches!(run_command("/ask @b2 hi", ctx), CommandAction::Print { is_error: false, .. }), "the radio is off");
+            let on = Config { mesh_radio: true, ..ctx.config.clone() };
+            let ctx = CommandContext { config: &on, ..ctx.clone() };
+            assert_eq!(
+                run_command("/ask @b2 run the e2e suite", &ctx),
+                CommandAction::Ask { to: "b2".into(), text: "run the e2e suite".into() }
+            );
+            for bad in ["/ask", "/ask run it", "/ask @a @b run it", "/ask @all run it", "/ask @b2"] {
+                assert!(matches!(run_command(bad, &ctx), CommandAction::Print { is_error: true, .. }), "{bad}");
+            }
         });
     }
 

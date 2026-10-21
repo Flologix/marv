@@ -81,6 +81,18 @@ Each guard's doc comment says how it was proven: the guard was reverted, and the
 | Radio: radio wakes are limited per sender and overall | `radio.rs::radio_wakes_are_limited_per_sender_and_overall` | Proven (two reverts) |
 | Radio: a slow peer never stalls the sender | `radio.rs::a_slow_peer_never_stalls_the_sender` | Proven |
 | Radio: every frame is logged without its text | `radio.rs::every_frame_is_logged_without_its_text` | Proven |
+| Radio (phase 3): `ack`, `done` and `failed` never get a reply or a report | `radio.rs::ack_done_and_failed_never_get_a_reply_or_a_report` | Proven |
+| Radio: a request chain stops at two hops | `radio.rs::a_request_chain_stops_at_two_hops` | Proven |
+| Radio: a report wakes the requester only for a request from a user's turn | `radio.rs::a_report_wakes_the_requester_only_for_a_request_from_a_users_turn` | Proven |
+| Radio: a request gets one ack and one report (also when the model replied itself) | `radio.rs::a_request_gets_one_ack_and_one_report` | Proven |
+| Radio: the report is built without a model call | `radio.rs::the_report_is_built_without_a_model_call` (+ `marv-cli`'s `tests/radio.rs::a_request_is_acked_handled_and_reported_back`) | Proven |
+| Radio: failed reports for stopped, declined and errored turns | `radio.rs::failed_reports_for_stopped_declined_and_errored_turns` | Proven |
+| Radio: a request waits while busy and is read only at a turn's start | `radio.rs::a_request_waits_while_busy_and_is_read_only_at_a_turns_start` | Proven |
+| Radio: open requests survive compaction and resume | `radio.rs::open_requests_survive_compaction_and_resume` | Proven |
+| Radio: a Marv leaving mid-request reports failed | `radio.rs::a_marv_leaving_mid_request_reports_failed` | Proven |
+| Radio: a turn that handles a request asks for what yolo would have allowed (marv-rs's decision, past spec §8.4) | `radio.rs::a_turn_that_handles_a_request_asks_even_in_yolo` | Proven |
+| Radio: `radio_tx`'s wait returns the report fenced, tainting first | `radio.rs::radio_tx_waits_for_the_report_fenced_and_tainting` | Proven |
+| Radio: a pane send to a Marv on the radio is refused, with the radio hint | `radio.rs::pane_send_to_a_marv_on_the_radio_is_refused_with_the_radio_hint` | Proven (a fake `herdr`) |
 | Subagents don't inherit network/web/mesh approvals | `provenance.rs::subagents_inherit_taint_but_no_egress_approvals` | Proven |
 | … the config's pre-approved scopes too (#98) | `approvals.rs::subagents_dont_inherit_config_scopes` | Proven |
 | Pre-approved scopes answer their own scopes (#98) | `approvals.rs::config_approve_answers_its_scopes_without_asking` | Proven (session level) |
