@@ -262,6 +262,8 @@ pub fn map_loop(event: &LoopEvent, totals: &dyn Fn() -> view::Totals) -> Option<
     Some(match event {
         // #96: the error right after it says what happened.
         L::Discarded { .. } => return None,
+        // Marv #63: the session's compaction notice that follows says what was done about it.
+        L::Overflow { .. } => return None,
         L::TextDelta(text) => UiEvent::TextDelta(text.clone()),
         L::ThinkingDelta(text) => UiEvent::ThinkingDelta(text.clone()),
         L::Usage(usage, _) => UiEvent::Usage { last: *usage, totals: totals() },

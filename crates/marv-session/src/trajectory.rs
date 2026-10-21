@@ -650,7 +650,7 @@ impl AgentRecorder {
                 self.finish(&reason);
             }
             // The whole reply comes with Assistant; deltas, retries and compactions aren't records.
-            LoopEvent::TextDelta(_) | LoopEvent::ToolCallDelta { .. } | LoopEvent::Compacted => {}
+            LoopEvent::TextDelta(_) | LoopEvent::ToolCallDelta { .. } | LoopEvent::Compacted | LoopEvent::Overflow { .. } => {}
         }
     }
 
