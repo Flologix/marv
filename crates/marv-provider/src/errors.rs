@@ -15,8 +15,10 @@
 //!   ([`plan_limit`]): never retried (it's a 429, which is otherwise retried) and never answered by switching to
 //!   another key or provider.
 //!
-//! Planned (Marv #63): recognize context-length overflow errors (OpenRouter and Ollama wording),
-//! so the loop can compact and retry the step ([`is_context_overflow`]). Planned (Marv #64):
+//! - Marv #63: context-length overflow errors are recognized ([`is_context_overflow`]), so the loop can compact and
+//!   retry the step instead of ending the turn.
+//!
+//! Planned (Marv #64):
 //! classify OpenRouter's `overloaded` / provider errors as retriable where they are.
 
 use serde::Deserialize;
@@ -218,11 +220,36 @@ pub fn unreachable(label: &str, base_url: &str, err: &str, hint: Option<&str>) -
     format!("Can't reach {label} at {origin}.{hint} ({err})")
 }
 
-/// Marv #63 (planned): whether an error says the request was longer than the context window
-/// (OpenRouter: "maximum context length…"/"prompt is too long"; Ollama's wording), so the loop
-/// can compact and retry the step once, then shrink the target (70%, 50%, 35%).
-pub fn is_context_overflow(_message: &str) -> bool {
-    todo!("port: #63 context-overflow detection (collect real OpenRouter/Ollama messages first)")
+/// Marv #63: whether an error says the prompt alone was longer than the context window, so the loop can compact and
+/// retry the step (the session's overflow recovery: 70%, 50%, 35% of the window, then dropping the oldest exchanges).
+/// A case-insensitive match over the whole message the loop sees (`http_error`'s reason plus the detail).
+///
+/// It builds on #116: the OpenAI-compatible adapter recognizes OpenRouter's "maximum context length is N tokens …
+/// X of text input" refusal ([`crate::openai_compat::window_refusal`]) and refits `max_tokens` first, so only a refusal
+/// that still fails after that (the prompt alone doesn't fit) ever reaches here. A refusal about the output alone
+/// ("max_tokens exceeds the remaining context") is the adapter's, and isn't matched.
+///
+/// The wordings (fixtures in `tests/fixtures/overflow/`): OpenRouter's and OpenAI's "maximum context length",
+/// `context_length_exceeded`, "exceeds the context window" (the Responses API), Anthropic's "prompt is too long",
+/// Gemini's "input token count … exceeds the maximum", "context length/window" with "exceed/too long/too large", and an
+/// HTTP 413. Ollama's native API truncates past `num_ctx` instead of failing, so it is covered by the compaction
+/// trigger, not by this.
+pub fn is_context_overflow(message: &str) -> bool {
+    static PATTERNS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(concat!(
+            r"(?is)",
+            r"maximum context length",
+            r"|context_length_exceeded",
+            r"|exceeds the context window",
+            r"|prompt is too long",
+            r"|input token count.*exceeds the maximum",
+            r"|context (length|window).{0,80}(exceed|too long|too large)",
+            r"|(exceed|too long|too large).{0,80}context (length|window)",
+            r"|returned 413\b",
+        ))
+        .unwrap()
+    });
+    PATTERNS.is_match(message)
 }
 
 #[cfg(test)]
@@ -328,6 +355,28 @@ mod tests {
         assert_eq!(plan_limit("Z.ai", r#"{"error":{"code":"1302","message":"Rate limit reached"}}"#), None);
         assert_eq!(plan_limit("OpenRouter", r#"{"error":{"code":429,"message":"Rate limited"}}"#), None);
         assert_eq!(plan_limit("X", "<html>"), None);
+    }
+
+    /// Marv #63: every overflow wording matches, and the errors that look close don't.
+    #[test]
+    fn context_overflow_matches_each_providers_wording_and_nothing_else() {
+        let dir = |d: &str| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(d);
+        let read = |d: &str| {
+            let mut all: Vec<_> = std::fs::read_dir(dir(d)).unwrap().map(|e| e.unwrap().path()).collect();
+            all.sort();
+            all.into_iter().map(|p| (p.display().to_string(), std::fs::read_to_string(&p).unwrap())).collect::<Vec<_>>()
+        };
+        let overflows = read("overflow");
+        assert!(overflows.len() >= 7);
+        for (file, text) in overflows {
+            assert!(is_context_overflow(&text), "{file}");
+            assert!(is_context_overflow(&text.to_uppercase()), "case-insensitive: {file}");
+        }
+        for (file, text) in read("not-overflow") {
+            assert!(!is_context_overflow(&text), "{file}");
+        }
+        assert!(is_context_overflow(r#"{"error":{"code":"context_length_exceeded"}}"#));
+        assert!(!is_context_overflow("Your OpenRouter account is out of credits."));
     }
 
     #[test]

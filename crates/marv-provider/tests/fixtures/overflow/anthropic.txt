@@ -1,0 +1,2 @@
+OpenRouter returned 400.
+Provider returned error: Anthropic: {"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 208437 tokens > 200000 maximum"}}

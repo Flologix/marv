@@ -73,10 +73,9 @@ pub fn add_usage(totals: &Totals, usage: &Usage, prices: &Prices) -> Totals {
     }
 }
 
-/// Tokens in text that's still streaming, before the provider counts them: about four characters a token.
-pub fn estimate_tokens(text: &str) -> u64 {
-    (text.chars().count() as u64).div_ceil(4)
-}
+/// Tokens in text that's still streaming, before the provider counts them: about four characters a token. One
+/// estimate for every crate (Marv #63): `marv_core::estimate_tokens`.
+pub use marv_core::estimate_tokens;
 
 /// `950`, `12.3k`, `240k`, `1.5M`.
 pub fn tokens(n: u64) -> String {
@@ -186,13 +185,6 @@ mod tests {
         assert!((est - (0.0004 + 0.00016 + 0.001)).abs() < 1e-12);
         assert_eq!(add_usage(&Totals::default(), &usage(1000, 100, Some(800), None), &prices).estimated, Some(true));
         assert_eq!(add_usage(&Totals::default(), &usage(1000, 100, None, None), &Prices::default()).cost, None);
-    }
-
-    #[test]
-    fn estimate_tokens_is_four_chars_a_token_rounded_up() {
-        assert_eq!(estimate_tokens(""), 0);
-        assert_eq!(estimate_tokens("abc"), 1);
-        assert_eq!(estimate_tokens(&"x".repeat(4800)), 1200);
     }
 
     #[test]

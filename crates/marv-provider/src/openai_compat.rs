@@ -108,7 +108,7 @@ static UNSUPPORTED: LazyLock<regex::Regex> = LazyLock::new(|| {
 pub const MIN_MAX_TOKENS: u64 = 1024;
 /// #116: tokens per byte of request body assumed until a reply reports its prompt count: 4 characters a token, the
 /// estimate compaction uses. JSON escaping makes the body longer than the text, so it errs toward a smaller cap.
-pub const ASSUMED_TOKENS_PER_BYTE: f64 = 0.25;
+pub const ASSUMED_TOKENS_PER_BYTE: f64 = 1.0 / marv_core::CHARS_PER_TOKEN as f64;
 
 /// #116: OpenRouter's refusal when the prompt plus `max_tokens` don't fit: "maximum context length is 131072 tokens.
 /// However, you requested about 140000 tokens (108000 of text input, 32000 in the output)".

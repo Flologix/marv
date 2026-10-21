@@ -53,7 +53,9 @@ pub fn elapsed(d: Duration) -> String {
     if s < 60 { format!("{s}s") } else { format!("{}m {:02}s", s / 60, s % 60) }
 }
 
-/// Marv's `estimateTokens`: 4 characters (UTF-16 units, as JS counts) a token, rounded up.
+/// Marv's `estimateTokens`: 4 characters (UTF-16 units, as JS counts) a token, rounded up. The one place that still
+/// counts UTF-16 units, so the thinking counter reads as Marv's did; everything else uses `marv_core::estimate_tokens`
+/// (`char`s; the two differ only past the Basic Multilingual Plane, an emoji counting 2 here and 1 there).
 pub fn estimate_tokens(text: &str) -> u64 {
     (text.encode_utf16().count() as u64).div_ceil(4)
 }

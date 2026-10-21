@@ -1004,3 +1004,26 @@ async fn invalid_json_in_a_chunk_counts_as_a_drop() {
     assert_eq!(retries(&events), [false]);
     assert!(events.contains(&text("ok")));
 }
+
+/// Marv #63: a refusal the adapter refits never reaches the loop as an error; one that still fails without a cap (the
+/// prompt alone doesn't fit) does, and the loop's overflow recovery recognizes it.
+#[tokio::test]
+async fn only_a_refusal_that_escapes_the_refit_is_a_context_overflow() {
+    let refitted = FakeServer::start(|r| {
+        if r.json().get("max_tokens").is_some() {
+            Reply::json(400, json!({"error": {"message": WINDOW_REFUSAL}}))
+        } else {
+            Reply::sse(&[delta("ok"), stop(), done()])
+        }
+    })
+    .await;
+    let events = collect(capped(&v1(&refitted), Some(32_000)).stream(&hi(), StreamOptions::default())).await;
+    assert!(!events.iter().any(|e| matches!(e, ProviderEvent::Error(_))), "{events:?}");
+
+    let too_long = "This endpoint's maximum context length is 131072 tokens. However, you requested about 140000 tokens (140000 of text input, 0 in the output).";
+    let refused = FakeServer::start(move |_| Reply::json(400, json!({"error": {"message": too_long}}))).await;
+    let events = collect(capped(&v1(&refused), Some(32_000)).stream(&hi(), StreamOptions::default())).await;
+    let error = events.iter().find_map(|e| if let ProviderEvent::Error(m) = e { Some(m.clone()) } else { None });
+    let error = error.expect("an error reaches the loop");
+    assert!(marv_provider::errors::is_context_overflow(&error), "{error}");
+}

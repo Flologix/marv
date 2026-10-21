@@ -1181,7 +1181,7 @@ impl App {
                         format!(
                             ": {} → about {} tokens",
                             status_bar::tokens(used),
-                            status_bar::tokens((summary.chars().count() as u64 + 2) / 4)
+                            status_bar::tokens(marv_core::estimate_tokens(&summary))
                         )
                     }
                     _ => String::new(),
