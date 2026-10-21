@@ -237,6 +237,7 @@ impl Approver for SessionApprover {
 /// The step-limit question: asked like any approval, so the client's "stop everything" answers it too.
 pub fn step_limit_request(steps: u32, every: u32) -> ApprovalRequest {
     ApprovalRequest {
+        reason: false,
         tool: "continue".into(),
         label: format!("{steps} steps"),
         preview: Preview {

@@ -135,6 +135,7 @@ pub fn approval_request(request: &marv_tools::ApprovalRequest) -> view::Approval
         (w, why) => w.or(why),
     };
     view::ApprovalRequest {
+        reason: false,
         tool: request.tool.clone(),
         label: request.label.clone(),
         preview: view::Preview {
@@ -203,7 +204,8 @@ pub fn tool_status(run: &marv_agent::ToolRun) -> view::ToolStatus {
     } else {
         result.summary.clone()
     };
-    let status = if run.declined {
+    // A call declined with a reason (#185) didn't run either, though its turn goes on.
+    let status = if run.declined || run.approval == marv_agent::ApprovalRecord::Declined {
         view::ToolState::Declined
     } else if result.is_error {
         view::ToolState::Error
@@ -3881,6 +3883,7 @@ mod tests {
     #[test]
     fn approvals_carry_the_protected_paths_reason() {
         let request = marv_tools::ApprovalRequest {
+            reason: false,
             tool: "write_file".into(),
             label: ".envrc".into(),
             preview: marv_tools::Preview { title: "Create .envrc".into(), ..Default::default() },
@@ -3915,6 +3918,20 @@ mod tests {
         let view = marv_tui::ui::approval::ApprovalView::new(shown, 0, true);
         let labels: Vec<&str> = view.select.items.iter().map(|i| i.label.as_str()).collect();
         assert_eq!(labels, ["Yes (wire it)", "No"]);
+    }
+
+    /// #185: a call declined with a reason shows declined (it didn't run), not done, though the turn goes on.
+    #[test]
+    fn a_call_declined_with_a_reason_shows_declined() {
+        let result =
+            || ToolResult { output: marv_tools::declined_because("not now"), summary: Some("declined".into()), is_error: false };
+        let mut run = marv_agent::ToolRun::new(result(), "bun test");
+        run.approval = marv_agent::ApprovalRecord::Declined;
+        assert!(!run.declined);
+        assert_eq!(tool_status(&run).status, view::ToolState::Declined);
+        let ran =
+            marv_agent::ToolRun { approval: marv_agent::ApprovalRecord::Yes, ..marv_agent::ToolRun::new(result(), "bun test") };
+        assert_eq!(tool_status(&ran).status, view::ToolState::Done);
     }
 
     #[test]

@@ -7,10 +7,11 @@
 //! behind the head), and the choice: Yes / Yes, and don't ask again for <scope> this session /
 //! No, and tell Marv what to do instead (esc). `once` requests offer only Yes / No.
 //!
-//! marv-rs (#185): every request but the step-limit question and a mesh wire's also offers "No, and say why (Marv carries on)" (tab
-//! from anywhere in the list, or Enter on it): a one-line input in the panel. Enter sends the reason as
-//! `Decision::Declined`: the call isn't run, its result tells the model why, and the turn goes on. An empty input
-//! sends nothing, Backspace on it goes back to the choices, and Esc still stops the run like a plain no.
+//! marv-rs (#185): a model's tool call (`request.reason`, set only by marv-tools' `run_tool`; not the step-limit
+//! question, a mesh wire, /undo or /mcp add) also offers "No, and say why (Marv carries on)": Tab from anywhere in
+//! the list, or Enter on it, opens a one-line input in the panel. Enter sends the reason as `Decision::Declined`:
+//! the call isn't run, its result tells the model why, and the turn goes on. An empty input sends nothing,
+//! Backspace on it goes back to the choices, and Esc still stops the run like a plain no.
 //!
 //! marv-rs: a mesh wire request (`tool: "mesh_wire"`, built by marv-session's `mesh::wire_approval`) comes through
 //! the same queue: `once` (yes or no; a wire is never remembered as a scope), labeled with the agent that asked,
@@ -52,11 +53,8 @@ pub const MAX_FILE_DIFF_LINES: usize = 8;
 /// scrolls, so a big /undo never pushes Yes/No off the screen.
 pub const RESERVED_ROWS: u16 = 16;
 pub const MIN_FILES_ROWS: u16 = 4;
-/// The reason input's length, in characters (marv-tools cuts at its own `MAX_DECLINE_REASON` too).
-pub const MAX_REASON_CHARS: usize = 500;
-/// The step-limit question (marv-session's `step_limit_request`): "no" stops there, so no reason is offered. Nor for
-/// a mesh wire (`mesh_wire`, [`MESH_WIRE_CALL`]): a wire is yes or no.
-const NO_REASON: [&str; 3] = ["continue", "mesh_wire", MESH_WIRE_CALL];
+/// The reason input's length, in characters: the engine's own cut (`marv_core::MAX_DECLINE_REASON`).
+pub use marv_core::MAX_DECLINE_REASON as MAX_REASON_CHARS;
 
 /// One warning line per door out of the sandbox, in the warning colour: what saying yes lets out (Marv's
 /// `DOOR_WARNINGS`). A door's own detail (the repository a github write is visible on) comes in its preview's warning,
@@ -106,7 +104,7 @@ impl ApprovalView {
         }
         let no = if request.once { "No" } else { "No, and tell Marv what to do instead" };
         items.push(SelectItem::new(Decision::No, no).hint("esc"));
-        if !NO_REASON.contains(&request.tool.as_str()) {
+        if request.reason {
             items.push(SelectItem::new(Decision::Declined(String::new()), "No, and say why (Marv carries on)").hint("tab"));
         }
         let window_rows = crossterm::terminal::size().map_or(24, |(_, rows)| rows);
@@ -122,7 +120,7 @@ impl ApprovalView {
         }
     }
 
-    /// Whether it offers declining with a reason (not the step-limit question).
+    /// Whether it offers declining with a reason (a model's tool call).
     fn offers_reason(&self) -> bool {
         self.select.items.iter().any(|i| matches!(i.value, Decision::Declined(_)))
     }
@@ -284,21 +282,28 @@ impl ApprovalView {
             lines.push(Line::styled(format!("{} more waiting", self.waiting), dim));
         }
         lines.push(Line::default());
-        match &self.reason {
-            Some(reason) => {
-                lines.push(Line::raw("Why not? Marv reads this and carries on."));
-                lines.push(Line::from(vec![
-                    Span::styled("❯ ", Style::new().fg(theme::ACCENT)),
-                    Span::raw(printable(reason)),
-                    Span::styled("▏", Style::new().fg(theme::ACCENT)),
-                ]));
-                lines.push(Line::styled("enter sends · backspace on empty goes back · esc stops", dim));
-            }
-            None => {
-                lines.push(Line::raw("Do you want to proceed?"));
-                lines.extend(self.select.render());
-            }
+        if self.reason.is_some() {
+            let mut lines = wrap_all(&lines, width);
+            lines.extend(self.reason_lines(width));
+            return lines;
         }
+        lines.push(Line::raw("Do you want to proceed?"));
+        lines.extend(self.select.render());
+        wrap_all(&lines, width)
+    }
+
+    /// The reason input's block at `width`, wrapped: the question, what's typed, the hint. Empty when it isn't open.
+    fn reason_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let Some(reason) = &self.reason else { return Vec::new() };
+        let lines = [
+            Line::raw("Why not? Marv reads this and carries on."),
+            Line::from(vec![
+                Span::styled("❯ ", Style::new().fg(theme::ACCENT)),
+                Span::raw(printable(reason)),
+                Span::styled("▏", Style::new().fg(theme::ACCENT)),
+            ]),
+            Line::styled("enter sends · backspace on empty goes back · esc stops", Style::new().fg(theme::DIM)),
+        ];
         wrap_all(&lines, width)
     }
 
@@ -319,8 +324,13 @@ impl ApprovalView {
         let lines = self.lines(inner.width);
         // Taller than the screen: keep the choice in view and cut the payload's end instead.
         let skip = lines.len().saturating_sub(inner.height as usize);
-        let choice_rows = if self.reason.is_some() { 3 } else { self.select.items.len() };
-        let keep_head = lines.len().saturating_sub(choice_rows + 2 + skip);
+        // What stays pinned at the bottom: the blank line, then the reason block (its question, the input wrapped at
+        // this width, the hint) or "Do you want to proceed?" and the choices.
+        let pinned = match &self.reason {
+            Some(_) => 1 + self.reason_lines(inner.width).len(),
+            None => 2 + self.select.items.len(),
+        };
+        let keep_head = lines.len().saturating_sub(pinned + skip);
         let shown = lines[..keep_head].iter().chain(&lines[keep_head + skip..]);
         for (i, line) in shown.enumerate().take(inner.height as usize) {
             buf.set_line(inner.x, inner.y + i as u16, line, inner.width);
@@ -328,12 +338,11 @@ impl ApprovalView {
     }
 }
 
-/// Adds `text` to the reason on one line: control characters dropped, newlines and tabs as spaces, at most
-/// [`MAX_REASON_CHARS`].
+/// Adds `text` to the reason as the engine reads it (`marv_core::reason_chars`: one line, control characters
+/// dropped), at most [`MAX_REASON_CHARS`].
 fn push_reason(reason: &mut String, text: &str) {
     let room = MAX_REASON_CHARS.saturating_sub(reason.chars().count());
-    let flat = text.chars().map(|c| if c.is_whitespace() { ' ' } else { c }).filter(|c| !c.is_control());
-    reason.extend(flat.take(room));
+    reason.extend(marv_core::reason_chars(text).take(room));
 }
 
 #[cfg(test)]
@@ -344,6 +353,7 @@ mod tests {
     fn edit() -> ApprovalRequest {
         let line = |kind, text: &str| DiffLine { kind, text: text.into(), old_line: None, new_line: None };
         ApprovalRequest {
+            reason: true,
             tool: "edit_file".into(),
             label: "src/greet.ts".into(),
             scope: Scope { key: "files".into(), description: "file changes".into() },
@@ -367,6 +377,7 @@ mod tests {
 
     fn command() -> ApprovalRequest {
         ApprovalRequest {
+            reason: true,
             tool: "bash".into(),
             label: "bun test".into(),
             scope: Scope { key: "bash:bun test".into(), description: "this exact command".into() },
@@ -424,6 +435,7 @@ mod tests {
     fn a_mesh_wire_request_shows_the_whole_wire_and_yes_or_no_only() {
         // What marv-session's `mesh::wire_approval` sends for `worker-1`'s first send to the parent.
         let wire = ApprovalRequest {
+            reason: false,
             tool: "mesh_wire".into(),
             label: "Wire worker-1 -> agent.parent.inbox (send)".into(),
             scope: Scope {
@@ -461,6 +473,7 @@ mod tests {
     fn a_call_needing_a_new_wire_is_one_prompt_answered_yes_wire_it_or_no() {
         // What marv-session's `mesh::call_wire_approval` sends for `worker-1`'s first send to the parent.
         let call = ApprovalRequest {
+            reason: false,
             tool: MESH_WIRE_CALL.into(),
             label: "Wire worker-1 -> agent.parent.inbox (send)".into(),
             scope: Scope {
@@ -658,8 +671,9 @@ mod tests {
         back.on_key(key(KeyCode::Tab));
         assert_eq!(back.on_key(key(KeyCode::Esc)), Some(ApprovalOutcome::CancelAll));
         // The step-limit question and a mesh wire don't offer it.
-        for tool in ["continue", "mesh_wire", MESH_WIRE_CALL] {
-            let mut view = ApprovalView::new(ApprovalRequest { tool: tool.into(), ..command() }, 0, true);
+        // Only a model's call offers it: not the step-limit question, a mesh wire, /undo or /mcp add.
+        for tool in ["continue", "mesh_wire", MESH_WIRE_CALL, "undo", "mcp_add"] {
+            let mut view = ApprovalView::new(ApprovalRequest { tool: tool.into(), reason: false, ..command() }, 0, true);
             assert!(!frame(&view).contains("say why"), "{tool}");
             assert_eq!(view.on_key(key(KeyCode::Tab)), None);
             assert!(view.reason.is_none());
@@ -669,6 +683,26 @@ mod tests {
         long.on_key(key(KeyCode::Tab));
         long.paste(&"a".repeat(MAX_REASON_CHARS + 10));
         assert_eq!(long.reason.as_ref().map(|r| r.chars().count()), Some(MAX_REASON_CHARS));
+    }
+
+    /// A long reason wraps; in a panel too short for everything, the whole reason block stays in view and the
+    /// payload is cut instead.
+    #[test]
+    fn a_wrapped_reason_stays_in_view_when_the_payload_is_cut() {
+        let mut request = command();
+        request.preview.command = Some((1..=30).map(|i| format!("echo {i}")).collect::<Vec<_>>().join("\n"));
+        let mut view = ApprovalView::new(request, 0, true);
+        view.on_key(key(KeyCode::Tab));
+        view.paste(&format!("{} END", "word ".repeat(30)));
+        let (width, height) = (40, 18);
+        let area = Rect::new(0, 0, width, height);
+        let mut buf = Buffer::empty(area);
+        view.render(area, &mut buf);
+        let f = (0..height).map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect::<String>()).collect::<Vec<_>>().join("\n");
+        for part in ["Why not?", "❯ word", "END", "enter sends"] {
+            assert!(f.contains(part), "{part}\n{f}");
+        }
+        assert!(f.contains("echo 1") && !f.contains("echo 30"), "the payload is what's cut\n{f}");
     }
 
     #[test]
@@ -700,6 +734,7 @@ mod tests {
             more: 0,
         };
         ApprovalRequest {
+            reason: false,
             tool: "undo".into(),
             label: "turn 3".into(),
             once: true,

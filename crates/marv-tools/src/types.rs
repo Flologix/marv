@@ -152,6 +152,10 @@ pub struct ApprovalRequest {
     pub protected: Option<ProtectedRule>,
     /// The call leaves the sandbox through one of its doors: the prompt shows that door's warning line.
     pub door: Option<Door>,
+    /// marv-rs #185: a model's tool call, so the person may decline it with a reason the model reads as the call's
+    /// result (`Decision::Declined`). Only `run_tool`'s own request sets it: not the step-limit question, a mesh
+    /// wire, /undo or /mcp add, where no model would read a reason.
+    pub reason: bool,
 }
 
 /// The doors this agent may use where a door is gated by who's running, not by the approver (an approver can be told

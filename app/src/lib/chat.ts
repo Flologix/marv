@@ -19,6 +19,8 @@ export interface ApprovalRequest {
   scope: string;
   agent?: string | null;
   once: boolean;
+  /** #185: a model's call, which may be declined with a reason (not the step-limit question, a wire, /undo, /mcp add). */
+  reason?: boolean;
 }
 
 /** The person's answer to an approval. `declined` (#185): not run, the reason goes to the model and the turn goes on. */

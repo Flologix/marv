@@ -262,8 +262,8 @@ function Approval({
   reason?: string;
   onAnswer: (id: number, d: Answer) => void;
 }) {
-  // #185: "Decline and say why" opens a one-line reason; the turn goes on with it. Not for the step-limit question or
-  // a mesh wire, which are yes or no.
+  // #185: "Decline and say why" opens a one-line reason; the turn goes on with it. Only for a model's call
+  // (`reason`): the engine says which.
   const [why, setWhy] = useState<string | null>(null);
   if (decision) {
     const no = decision === "no" || decision === "declined";
@@ -275,7 +275,6 @@ function Approval({
       </p>
     );
   }
-  const offersWhy = !["continue", "mesh_wire", "mesh_wire_call"].includes(r.tool);
   const sendWhy = () => {
     const text = (why ?? "").trim();
     if (text) onAnswer(r.id, { declined: text });
@@ -301,7 +300,7 @@ function Approval({
         <button className="btn plain" onClick={() => onAnswer(r.id, "no")}>
           Decline
         </button>
-        {offersWhy && why === null && (
+        {r.reason && why === null && (
           <button className="btn plain" onClick={() => setWhy("")}>
             Decline and say why
           </button>
@@ -318,7 +317,7 @@ function Approval({
           <input
             autoFocus
             value={why}
-            maxLength={500}
+            maxLength={500} /* the engine's MAX_DECLINE_REASON; it cuts there too */
             placeholder="Why not? Marv reads this and carries on."
             onChange={(e) => setWhy(e.target.value)}
             onKeyDown={(e) => {

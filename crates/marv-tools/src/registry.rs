@@ -42,13 +42,12 @@ pub const INTERRUPTED: &str = "Interrupted by the user before this tool ran.";
 /// What the model reads when the user said no.
 pub const DECLINED: &str = "The user declined this. Don't retry it: stop and wait for them to say how to proceed.";
 
-/// A declined call's reason is cut to this many characters (a client could send any length; the TUI stops there).
-pub const MAX_DECLINE_REASON: usize = 1000;
-
 /// What the model reads for a call declined with a reason (#185): it wasn't run, and the user's reason, as they
 /// wrote it. The turn goes on, so the model can do what the reason asks instead.
+/// The reason is read with `marv_core::decline_reason` (one line, no control characters, at most
+/// `MAX_DECLINE_REASON`), whichever client sent it.
 pub fn declined_because(reason: &str) -> String {
-    let reason: String = reason.trim().chars().take(MAX_DECLINE_REASON).collect();
+    let reason = marv_core::decline_reason(reason);
     format!(
         "Not run: the user declined this, and said why:\n{}\nDon't retry it as it was. Take their reason into account and carry on.",
         reason.trim()
@@ -278,6 +277,7 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
                 must_ask,
                 protected,
                 door,
+                reason: true,
             };
             approver.approve(request).await
         }
@@ -297,15 +297,17 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
         // result (history stays append-only) saying it was declined and why. The reason is the user's own words, so
         // it's `Provenance::User`: not fenced, and it taints nothing.
         Decision::Declined(_) if ctx.aborted() => interrupted(Approval::Interrupted),
-        // No reason given: a plain no, which stops the run.
-        Decision::Declined(reason) if reason.trim().is_empty() => {
-            let mut result = ToolOutput::ok(DECLINED, "declined");
-            result.declined = true;
-            result.approval = Some(Approval::Decided(Decision::No));
-            result.door = door;
-            noted(ToolOutcome { result, label: label.clone() })
-        }
         Decision::Declined(reason) => {
+            // Read once, here: what's recorded and what the model reads are the same cut, one-line text.
+            let reason = marv_core::decline_reason(&reason);
+            if reason.is_empty() {
+                // No reason given: a plain no, which stops the run.
+                let mut result = ToolOutput::ok(DECLINED, "declined");
+                result.declined = true;
+                result.approval = Some(Approval::Decided(Decision::No));
+                result.door = door;
+                return noted(ToolOutcome { result, label: label.clone() });
+            }
             let mut result = ToolOutput::ok(declined_because(&reason), "declined");
             result.provenance = Provenance::User;
             result.approval = Some(Approval::Decided(Decision::Declined(reason)));
@@ -553,6 +555,16 @@ mod tests {
         let out = run_tool(&call(r#"{"text": "x"}"#), &blank, &tools(ToolKind::Write, false)).await;
         assert!(out.result.declined);
         assert_eq!(out.result.output, DECLINED);
+        // Any client's reason is read once: one line, no controls, at most MAX_DECLINE_REASON, recorded as read.
+        let sent = format!("not\nthere\x1b {}", "x".repeat(crate::MAX_DECLINE_REASON));
+        let long =
+            ToolContext { approver: Some(Arc::new(Answer(Decision::Declined(sent.clone()), Mutex::new(vec![])))), ..ctx() };
+        let out = run_tool(&call(r#"{"text": "x"}"#), &long, &tools(ToolKind::Write, false)).await;
+        let read = marv_core::decline_reason(&sent);
+        assert!(read.starts_with("not there ") && read.chars().count() == crate::MAX_DECLINE_REASON);
+        assert_eq!(out.result.approval, Some(Approval::Decided(Decision::Declined(read.clone()))));
+        assert_eq!(out.result.output, declined_because(&read));
+        assert!(!out.result.output.contains('\x1b'));
     }
 
     /// #77: a call the tool asks about itself isn't asked again by the registry, tainted or in yolo; its answer is the

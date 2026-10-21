@@ -2082,6 +2082,7 @@ mod tests {
 
     fn write_request(path: &str, agent: Option<&str>) -> ApprovalRequest {
         ApprovalRequest {
+            reason: true,
             tool: "write_file".into(),
             label: path.into(),
             preview: Preview {

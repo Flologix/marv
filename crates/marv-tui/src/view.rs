@@ -197,6 +197,8 @@ pub struct ApprovalRequest {
     pub must_ask: bool,
     /// The call leaves the sandbox through this door: the prompt shows its warning line (Marv Sprint 4).
     pub door: Option<marv_core::Door>,
+    /// #185: the prompt offers "No, and say why": a model's tool call, whose result the reason becomes.
+    pub reason: bool,
 }
 
 /// Identifies one pending approval so the answer reaches the right waiter (parallel subagents can

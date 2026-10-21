@@ -568,6 +568,7 @@ mod tests {
 
     fn request(key: &str) -> ApprovalRequest {
         ApprovalRequest {
+            reason: false,
             tool: "bash".into(),
             label: "x".into(),
             preview: Preview::default(),
