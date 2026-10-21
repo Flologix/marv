@@ -75,6 +75,7 @@ Each guard's doc comment says how it was proven: the guard was reverted, and the
 | Radio: `marv -p` is never on the radio | `radio.rs::marv_p_is_never_on_the_radio` | Proven (the real binary) |
 | Radio: `radio_tx`'s spec is constant and stays after the radio goes off | `radio.rs::radio_tx_spec_is_constant_and_stays_after_radio_off` | Proven |
 | Radio: history stays append-only when radio notes arrive | `radio.rs::history_stays_append_only_when_radio_notes_arrive` | Proven |
+| "Send now": the person's message during a turn never lands between a tool call and its result | `messages.rs::a_message_sent_during_a_turn_never_lands_between_a_tool_call_and_its_result`, `messages.rs::a_history_that_ends_mid_call_keeps_the_message_waiting` | Proven (the `at_step_boundary` check in `deliver_sent_now` removed: the second fails) |
 | Radio: oversize messages are refused, not cut | `radio.rs::oversize_messages_are_refused_not_cut` | Proven (two reverts) |
 | Radio: per-sender rates apply at the receiver | `radio.rs::per_sender_rates_apply_at_the_receiver` | Proven |
 | Radio: broadcasts never wake | `radio.rs::broadcasts_never_wake` | Proven |

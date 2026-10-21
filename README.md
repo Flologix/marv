@@ -161,6 +161,7 @@ Type `/` to open the command menu: ↑/↓ to choose, Enter to run, Tab or → t
 | Key | Action |
 |---|---|
 | Esc | Stop a reply or a running tool (in a subagent's view: go back) |
+| alt+enter (while Marv works) | Send now: your message goes in at Marv's next step (after the current reply and tool calls), instead of after the turn. Nothing running is stopped |
 | ctrl+c | Stop / clear the input / press twice to quit |
 | ctrl+k | Command palette: search commands, skills, settings (with their values) and keys; Enter flips a toggle |
 | ctrl+o | Show or hide details: what subagents did, and whole diffs |

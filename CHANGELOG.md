@@ -6,6 +6,10 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+### Added
+
+- **Send now: a message for the turn that's running.** While Marv works, Alt+Enter in the TUI (or **Send now** in the desktop composer) sends your message into the running turn: it goes in at Marv's next step, after the current reply and its tool calls and before the next request, instead of waiting for the turn to end. Nothing running is stopped for it (Esc still does that), and it's an ordinary message of yours, added to the conversation like any other (the prompt cache holds). It shows in the transcript where Marv read it. If the turn ends first (you stopped it, declined a call, or it hit a limit), the message comes back to the prompt for you to send; it's never sent on its own. Enter keeps working as before, and `marv -p` is unchanged.
+
 ## [0.8.0] - 2026-10-21
 
 ### Added
