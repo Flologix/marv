@@ -3141,6 +3141,14 @@ mod tests {
             }
         }
 
+        /// One reply that reads `path`, then writes it: the edit tools change an existing file only once it's read.
+        fn read_and_write(path: &str, content: &str) -> Vec<ProviderEvent> {
+            let mut reply = write("w", path, content);
+            let arguments = serde_json::json!({ "path": path }).to_string();
+            reply.insert(0, ProviderEvent::ToolCall(ToolCall { id: "r".into(), name: "read_file".into(), arguments }));
+            reply
+        }
+
         fn note(dirs: &Dirs) -> String {
             std::fs::read_to_string(dirs.project.join("notes.txt")).unwrap()
         }
@@ -3149,10 +3157,10 @@ mod tests {
             matches!(e, UiEvent::Message(m) if m.text.contains(part))
         }
 
-        /// A bridge whose first turn ("change the note") wrote notes.txt, approved.
+        /// A bridge whose first turn ("change the note") read notes.txt and wrote it, approved.
         async fn after_a_turn(dirs: &Dirs) -> (Port, UnboundedReceiver<UiEvent>) {
             repo(dirs);
-            let replies = vec![write("w", "notes.txt", "buy bread\n"), say("Changed the note.")];
+            let replies = vec![read_and_write("notes.txt", "buy bread\n"), say("Changed the note.")];
             let (tx, mut rx) = unbounded_channel();
             let port = Port(Bridge::start(startup(dirs, Some(asks()), replies, None), tx).unwrap());
             port.send("change the note".into());
@@ -3213,7 +3221,7 @@ mod tests {
         async fn refused_during_a_turn() {
             let dirs = Dirs::new();
             repo(&dirs);
-            let replies = vec![write("w", "notes.txt", "x\n"), say("Done.")];
+            let replies = vec![read_and_write("notes.txt", "x\n"), say("Done.")];
             let (tx, mut rx) = unbounded_channel();
             let port = Port(Bridge::start(startup(&dirs, Some(asks()), replies, None), tx).unwrap());
             port.send("go".into());

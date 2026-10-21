@@ -12,6 +12,8 @@
 //!   at apply time when confined, syntax note after the change, protected paths ask even in yolo (marv-rs), and so
 //!   does a `package.json` write that changes a lifecycle script (the content rule); and like `edit_file` (#67), the
 //!   project's formatter runs on the written file before the notes, and the diff shows the file as it is now.
+//! - marv-rs: writing over (or appending to) an existing file needs this session to have it as it is now: read with
+//!   `read_file` or written by this session, unchanged since ([`crate::file_versions`]). A new file needs nothing.
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -75,7 +77,10 @@ pub async fn plan(input: &WriteFileInput, ctx: &ToolContext) -> Result<Plan, Too
     }
     let before = if absolute.exists() {
         require_regular_file(&absolute, &shown)?;
-        Some(tokio::fs::read_to_string(&absolute).await.map_err(|e| ToolError(format!("Couldn't read {shown}: {e}")))?)
+        let before = tokio::fs::read_to_string(&absolute).await.map_err(|e| ToolError(format!("Couldn't read {shown}: {e}")))?;
+        // marv-rs: an existing file only as this session last read or wrote it (`file_versions`); a new one is fine.
+        ctx.file_versions.check(&absolute, &shown, before.as_bytes())?;
+        Some(before)
     } else {
         None
     };
@@ -168,6 +173,8 @@ impl Tool for WriteFile {
             tokio::fs::write(&planned.absolute, &planned.after).await.map_err(failed)?;
             // #67: the project's formatter runs before anything is said; its failure is a note, not an error.
             let formatted = crate::formatter::after_write(ctx, &planned.shown, &planned.absolute, &planned.after).await;
+            // The file as written and formatted is the version this session has now seen.
+            ctx.file_versions.saw(&planned.absolute, formatted.content.as_bytes());
             Ok::<_, ToolError>((planned, formatted))
         })
         .await?;
@@ -245,13 +252,19 @@ mod tests {
         }
         fn answering(tag: &str, answer: Decision) -> Self {
             let root = TempDir::new(tag);
-            root.write("greet.ts", "export function greet(name: string) {\n  return `Hello, ${name}!`;\n}\n");
-            root.write("twice.ts", "x = 1;\nx = 1;\n");
             let asker = Arc::new(Asker { answer, abort: None, asked: Mutex::new(Vec::new()) });
             let mut ctx = ToolContext::new(root.path());
             ctx.sandbox = Arc::new(marv_sandbox::Sandbox::from_env(false));
             ctx.approver = Some(asker.clone());
-            Self { root, asker, ctx }
+            let f = Self { root, asker, ctx };
+            f.write("greet.ts", "export function greet(name: string) {\n  return `Hello, ${name}!`;\n}\n");
+            f.write("twice.ts", "x = 1;\nx = 1;\n");
+            f
+        }
+        /// A file in the project as the model has read it (`file_versions`): the edit tools may change it.
+        fn write(&self, path: &str, content: &str) {
+            self.root.write(path, content);
+            self.ctx.file_versions.saw(&self.root.path().join(path), content.as_bytes());
         }
         async fn run(&self, name: &str, args: Value) -> ToolOutcome {
             run_with(&self.ctx, name, args).await
@@ -335,7 +348,7 @@ mod tests {
     #[tokio::test]
     async fn an_old_string_with_the_wrong_indentation_still_applies_reindented_and_says_so() {
         let f = Fixture::new("w-edit-indent");
-        f.root.write("tabs.js", "function f() {\n\tif (x) {\n\t\treturn 1;\n\t}\n}\n");
+        f.write("tabs.js", "function f() {\n\tif (x) {\n\t\treturn 1;\n\t}\n}\n");
         let out = f
             .run(
                 "edit_file",
@@ -353,7 +366,7 @@ mod tests {
     async fn an_old_string_with_curly_quotes_applies_and_says_so() {
         // Marv #60.
         let f = Fixture::new("w-edit-unicode");
-        f.root.write("q.js", "const a = \"x\";\n");
+        f.write("q.js", "const a = \"x\";\n");
         let out = f
             .run("edit_file", json!({"path": "q.js", "old_string": "a = \u{201C}x\u{201D}", "new_string": "a = \"y\""}))
             .await
@@ -378,7 +391,7 @@ mod tests {
     #[tokio::test]
     async fn a_crlf_file_keeps_its_line_endings_from_edit_file_and_write_file() {
         let f = Fixture::new("w-crlf");
-        f.root.write("win.js", "a();\r\nb();\r\n");
+        f.write("win.js", "a();\r\nb();\r\n");
         f.run("edit_file", json!({"path": "win.js", "old_string": "a();", "new_string": "a();\nc();"})).await;
         assert_eq!(f.read("win.js"), "a();\r\nc();\r\nb();\r\n");
         let written = f.run("write_file", json!({"path": "win.js", "content": "x();\ny();\n"})).await.result;
@@ -463,7 +476,7 @@ mod tests {
     async fn parallel_appends_to_one_file_all_land() {
         // Review, #42: each read-change-write waits for the last.
         let f = Fixture::new("w-parallel");
-        f.root.write("log.txt", "start\n");
+        f.write("log.txt", "start\n");
         let runs =
             (0..12).map(|i| f.run("write_file", json!({"path": "log.txt", "content": format!("line {i}\n"), "append": true})));
         futures::future::join_all(runs).await;
@@ -477,7 +490,7 @@ mod tests {
     #[tokio::test]
     async fn an_append_and_an_edit_on_one_file_at_the_same_time_both_land() {
         let f = Fixture::new("w-mix");
-        f.root.write("mix.txt", "alpha\n");
+        f.write("mix.txt", "alpha\n");
         tokio::join!(
             f.run("edit_file", json!({"path": "mix.txt", "old_string": "alpha", "new_string": "ALPHA"})),
             f.run("write_file", json!({"path": "mix.txt", "content": "omega\n", "append": true})),
@@ -488,7 +501,7 @@ mod tests {
     #[tokio::test]
     async fn append_adds_at_the_end_instead_of_replacing() {
         let f = Fixture::new("w-append");
-        f.root.write("log.txt", "first\n");
+        f.write("log.txt", "first\n");
         let out = f.run("write_file", json!({"path": "log.txt", "content": "second\n", "append": true})).await.result;
         assert!(!out.is_error);
         assert_eq!(f.read("log.txt"), "first\nsecond\n");
@@ -502,7 +515,7 @@ mod tests {
     #[tokio::test]
     async fn an_append_to_a_last_line_without_a_newline_adds_one_first_and_says_so() {
         let f = Fixture::new("w-no-eol");
-        f.root.write("no-eol.txt", "no newline yet");
+        f.write("no-eol.txt", "no newline yet");
         let out = f.run("write_file", json!({"path": "no-eol.txt", "content": "more\n", "append": true})).await.result;
         assert!(!out.is_error);
         assert_eq!(f.read("no-eol.txt"), "no newline yet\nmore\n");
@@ -522,11 +535,11 @@ mod tests {
     #[tokio::test]
     async fn an_append_to_a_crlf_file_keeps_crlf_including_the_added_newline() {
         let f = Fixture::new("w-append-crlf");
-        f.root.write("win.txt", "a\r\n");
+        f.write("win.txt", "a\r\n");
         let out = f.run("write_file", json!({"path": "win.txt", "content": "b\n", "append": true})).await.result;
         assert_eq!(f.read("win.txt"), "a\r\nb\r\n");
         assert!(out.output.contains("CRLF"));
-        f.root.write("win2.txt", "a\r\nb");
+        f.write("win2.txt", "a\r\nb");
         f.run("write_file", json!({"path": "win2.txt", "content": "c\n", "append": true})).await;
         assert_eq!(f.read("win2.txt"), "a\r\nb\r\nc\r\n");
     }
@@ -559,7 +572,7 @@ mod tests {
     #[tokio::test]
     async fn edit_file_applies_a_breaking_change_and_says_so_with_the_line() {
         let f = Fixture::new("w-syntax-edit");
-        f.root.write("a.js", "export const a = 1;\nexport const b = 2;\n");
+        f.write("a.js", "export const a = 1;\nexport const b = 2;\n");
         let out =
             f.run("edit_file", json!({"path": "a.js", "old_string": "const b = 2;", "new_string": "const b = ;"})).await.result;
         assert!(!out.is_error);
@@ -581,7 +594,7 @@ mod tests {
     #[tokio::test]
     async fn a_file_that_was_already_broken_isnt_blamed_and_a_fine_change_says_nothing() {
         let f = Fixture::new("w-syntax-broken");
-        f.root.write("c.js", "const a = ;\nconst b = 1;\n");
+        f.write("c.js", "const a = ;\nconst b = 1;\n");
         let out = f.run("edit_file", json!({"path": "c.js", "old_string": "const b = 1;", "new_string": "const b = 2;"})).await;
         assert!(!out.result.output.contains("parse"));
         let fine = f.run("edit_file", json!({"path": "greet.ts", "old_string": "Hello", "new_string": "Hi"})).await;
@@ -600,7 +613,7 @@ mod tests {
             "#!/bin/sh\nfor f in \"$@\"; do case \"$f\" in --*) ;; *) tr '\"' \"'\" < \"$f\" > \"$f.fmt\" && mv \"$f.fmt\" \"$f\" ;; esac; done\n",
         );
         if config {
-            f.root.write(".prettierrc", "{ \"singleQuote\": true }");
+            f.write(".prettierrc", "{ \"singleQuote\": true }");
         }
         let mut ctx = f.ctx.clone();
         ctx.formatter = Some(Arc::new(crate::formatter::ProjectFormatter::new(
@@ -614,7 +627,7 @@ mod tests {
     #[tokio::test]
     async fn an_edit_with_double_quotes_lands_formatted_and_the_result_shows_it() {
         let (f, ctx) = formatting_fixture("w-fmt-edit", true);
-        f.root.write("a.js", "const a = \"hi\";\n");
+        f.write("a.js", "const a = \"hi\";\n");
         let out = run_with(
             &ctx,
             "edit_file",
@@ -644,7 +657,7 @@ mod tests {
     #[tokio::test]
     async fn no_formatter_config_means_no_change() {
         let (f, ctx) = formatting_fixture("w-fmt-none", false);
-        f.root.write("a.js", "const a = \"hi\";\n");
+        f.write("a.js", "const a = \"hi\";\n");
         let out = run_with(
             &ctx,
             "edit_file",
@@ -673,14 +686,14 @@ mod tests {
     async fn a_failing_formatter_is_a_note_not_an_error() {
         let f = Fixture::new("w-fmt-fail");
         crate::formatter::testing::bin(&f.root, "prettier", "#!/bin/sh\necho 'a.js: SyntaxError' >&2\nexit 2\n");
-        f.root.write(".prettierrc", "{}");
+        f.write(".prettierrc", "{}");
         let mut ctx = f.ctx.clone();
         ctx.formatter = Some(Arc::new(crate::formatter::ProjectFormatter::new(
             crate::formatter::FormatterSetting::Auto,
             true,
             Some(crate::formatter::testing::run_unsandboxed()),
         )));
-        f.root.write("a.js", "const a = \"hi\";\n");
+        f.write("a.js", "const a = \"hi\";\n");
         let out = run_with(
             &ctx,
             "edit_file",
@@ -757,7 +770,7 @@ mod tests {
     #[tokio::test]
     async fn the_diff_a_change_carries() {
         let f = Fixture::new("w-diff");
-        f.root.write("a.txt", "one\ntwo\nthree\n");
+        f.write("a.txt", "one\ntwo\nthree\n");
         let edit = f.run("edit_file", json!({"path": "a.txt", "old_string": "two", "new_string": "TWO"})).await.result;
         assert_eq!(
             edit.diff,
@@ -772,10 +785,10 @@ mod tests {
         assert_eq!(big.lines[0], add("l1", 1));
         assert_eq!((big.lines.len(), big.more), (400, 50));
         // Overwriting shows what changed; an append carries what was added.
-        f.root.write("b.txt", "old\n");
+        f.write("b.txt", "old\n");
         let over = f.run("write_file", json!({"path": "b.txt", "content": "new\n"})).await.result.diff.unwrap();
         assert_eq!(over.lines, vec![del("old", 1), add("new", 1)]);
-        f.root.write("c.txt", "old\n");
+        f.write("c.txt", "old\n");
         let appended =
             f.run("write_file", json!({"path": "c.txt", "content": "new\n", "append": true})).await.result.diff.unwrap();
         assert_eq!(appended.lines, vec![ctx_line("old", 1, 1), add("new", 2)]);
@@ -914,5 +927,75 @@ mod tests {
         assert_eq!(plan_text(None, "new\n", true), ("new\n".into(), "new\n".into(), false, false));
         assert_eq!(line_count("a\nb\n"), 2);
         assert_eq!(line_count(""), 0);
+    }
+
+    // marv-rs: stale writes (`file_versions`)
+
+    #[tokio::test]
+    async fn a_file_changed_since_it_was_read_is_refused_before_anyone_is_asked() {
+        let f = Fixture::new("w-stale");
+        std::fs::write(f.root.path().join("greet.ts"), "// the user's change\n").unwrap();
+        for (name, args) in [
+            ("edit_file", json!({"path": "greet.ts", "old_string": "Hello", "new_string": "Hi"})),
+            ("write_file", json!({"path": "greet.ts", "content": "x\n"})),
+            ("write_file", json!({"path": "greet.ts", "content": "x\n", "append": true})),
+        ] {
+            let out = f.run(name, args).await.result;
+            assert_eq!(out.output, crate::file_versions::changed_since_read("greet.ts"), "{name}");
+            assert!(out.is_error);
+        }
+        assert!(f.asked().is_empty());
+        assert_eq!(f.read("greet.ts"), "// the user's change\n");
+        // Read again, the same edit applies.
+        assert!(!f.run("read_file", json!({"path": "greet.ts"})).await.result.is_error);
+        let out = f.run("write_file", json!({"path": "greet.ts", "content": "x\n", "append": true})).await.result;
+        assert!(!out.is_error, "{}", out.output);
+        assert_eq!(f.read("greet.ts"), "// the user's change\nx\n");
+    }
+
+    #[tokio::test]
+    async fn an_existing_file_never_read_is_refused_and_a_new_one_isnt() {
+        let f = Fixture::new("w-unread");
+        f.root.write("theirs.txt", "keep\n");
+        let out = f.run("write_file", json!({"path": "theirs.txt", "content": "x\n"})).await.result;
+        assert_eq!(out.output, crate::file_versions::never_read("theirs.txt"));
+        let out = f.run("edit_file", json!({"path": "theirs.txt", "old_string": "keep", "new_string": "x"})).await.result;
+        assert_eq!(out.output, crate::file_versions::never_read("theirs.txt"));
+        assert_eq!(f.read("theirs.txt"), "keep\n");
+        assert!(f.asked().is_empty());
+        // A new file, then the session's own writes over it: each is the version it has seen.
+        assert!(!f.run("write_file", json!({"path": "mine.txt", "content": "one\n"})).await.result.is_error);
+        assert!(!f.run("write_file", json!({"path": "mine.txt", "content": "two\n", "append": true})).await.result.is_error);
+        let out = f.run("edit_file", json!({"path": "mine.txt", "old_string": "two", "new_string": "three"})).await.result;
+        assert!(!out.is_error, "{}", out.output);
+        assert_eq!(f.read("mine.txt"), "one\nthree\n");
+    }
+
+    #[tokio::test]
+    async fn a_change_while_the_user_decides_is_caught_at_apply_time() {
+        // The preview saw the file as read; the user's editor changes it before the yes lands.
+        struct ChangesIt(std::path::PathBuf);
+        #[async_trait]
+        impl Approver for ChangesIt {
+            async fn approve(&self, _request: ApprovalRequest) -> Decision {
+                std::fs::write(&self.0, "export const changed = true;\n").unwrap();
+                Decision::Yes
+            }
+        }
+        let f = Fixture::new("w-stale-apply");
+        let ctx = ToolContext { approver: Some(Arc::new(ChangesIt(f.root.path().join("greet.ts")))), ..f.ctx.clone() };
+        let out = run_with(&ctx, "write_file", json!({"path": "greet.ts", "content": "x\n"})).await.result;
+        assert_eq!(out.output, crate::file_versions::changed_since_read("greet.ts"));
+        assert_eq!(f.read("greet.ts"), "export const changed = true;\n");
+    }
+
+    #[tokio::test]
+    async fn the_formatted_file_is_the_version_the_session_has_seen() {
+        let (f, ctx) = formatting_fixture("w-fmt-seen", true);
+        let out = run_with(&ctx, "write_file", json!({"path": "new.js", "content": "const a = \"x\";\n"})).await.result;
+        assert!(!out.is_error, "{}", out.output);
+        let formatted = f.read("new.js");
+        assert_eq!(formatted, "const a = 'x';\n");
+        assert!(ctx.file_versions.is_current(&f.root.path().join("new.js"), formatted.as_bytes()), "{formatted}");
     }
 }

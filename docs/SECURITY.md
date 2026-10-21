@@ -125,6 +125,9 @@ Narrow, named ways out, each with what it can never do. A door's own program (`g
 - `npx`/`uvx` run outside the project folder.
 - Server `instructions` are ignored.
 
+## File changes
+- **No write over a change the session hasn't seen.** Two Marv sessions in one folder, a subagent, a command or the person in their editor can change a file after the model read it; an edit built on the old text would silently drop that change. Each session keeps a content hash (SHA-256) of every file it read (`read_file`, any page; a `grep` hit doesn't count) or wrote (`marv_tools::file_versions`). `edit_file` and `write_file` (appends included) on an **existing** file refuse when the file's hash now differs from the session's, or when the session never read it, with an error telling the model to read the file again; nothing is written and no one is asked (the check runs in the preview, and again at apply time). A new file needs no read; the session's own write (after the formatter) is its new version. A subagent has its own hashes; /clear and a resume start empty. `bash` writes aren't tracked, so a file a command changed must be read again before an edit.
+
 ## Images (when vision is added)
 - **Sources:** only the user (a paste, or a file they name). Never forwarded automatically from web, MCP or mesh.
 - **A quarantined reader:** a tools-less model call extracts the image's text and description. The main model sees only that, fenced as `Provenance::Image`, and it's shown in the transcript. Any image taints the session.

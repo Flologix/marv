@@ -16,6 +16,9 @@
 //!   parallel edit or append on the same file can't be lost, and the formatter can't be formatted over (#67).
 //! - #67: the project's formatter runs on the changed file after the write, inside the sandbox; the diff and the
 //!   summary describe the formatted file, and the note says so when formatting changed lines beyond the edit.
+//! - marv-rs: a stale edit is refused ([`crate::file_versions`]). The file must be as this session last read or wrote
+//!   it, checked in the plan (so in the preview, before anyone is asked, and again at apply time under the lock); the
+//!   file as written and formatted becomes the session's version.
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -110,6 +113,8 @@ pub async fn plan(input: &EditFileInput, ctx: &ToolContext) -> Result<Plan, Tool
     }
     require_regular_file(&absolute, &shown)?;
     let before = tokio::fs::read_to_string(&absolute).await.map_err(|e| ToolError(format!("Couldn't read {shown}: {e}")))?;
+    // marv-rs: only over the version this session last read or wrote (`file_versions`): old_string came from it.
+    ctx.file_versions.check(&absolute, &shown, before.as_bytes())?;
     match apply_edit(&before, &input.old_string, &input.new_string, input.replace_all.unwrap_or(false)) {
         EditResult::Ambiguous { count } => Err(ToolError(format!(
             "old_string appears {count} times in {shown}. Include more of the surrounding lines so it matches exactly once, or set replace_all to change all {count}."
@@ -212,6 +217,8 @@ impl Tool for EditFile {
                 .map_err(|e| ToolError(format!("Couldn't write {}: {e}", planned.shown)))?;
             // #67: the project's formatter runs before anything is said; its failure is a note, not an error.
             let formatted = crate::formatter::after_write(ctx, &planned.shown, &planned.absolute, &planned.after).await;
+            // The file as written and formatted is the version this session has now seen.
+            ctx.file_versions.saw(&planned.absolute, formatted.content.as_bytes());
             Ok::<_, ToolError>((planned, formatted))
         })
         .await?;
@@ -288,13 +295,12 @@ mod tests {
     #[tokio::test]
     async fn nothing_matches_shows_the_closest_lines() {
         let root = TempDir::new("edit-closest");
-        root.write("greet.js", "function a() {\n  return 1;\n}\n\nfunction greet(name) {\n  return `Hello, ${name}!`;\n}\n");
-        let err = plan(
-            &input("greet.js", "function greet(person) {\n  return `Hi, ${person}!`;\n}", "x"),
-            &ToolContext::new(root.path()),
-        )
-        .await
-        .unwrap_err();
+        let text = "function a() {\n  return 1;\n}\n\nfunction greet(name) {\n  return `Hello, ${name}!`;\n}\n";
+        root.write("greet.js", text);
+        let ctx = ToolContext::new(root.path());
+        ctx.file_versions.saw(&root.path().join("greet.js"), text.as_bytes());
+        let err =
+            plan(&input("greet.js", "function greet(person) {\n  return `Hi, ${person}!`;\n}", "x"), &ctx).await.unwrap_err();
         assert!(err.0.contains("The closest text is lines 5-7, as it is now:\n    5→function greet(name) {"), "{}", err.0);
     }
 
@@ -302,7 +308,9 @@ mod tests {
     async fn ambiguous_matches_say_how_many() {
         let root = TempDir::new("edit-ambiguous");
         root.write("a.txt", "x\nx\n");
-        let err = plan(&input("a.txt", "x", "y"), &ToolContext::new(root.path())).await.unwrap_err();
+        let ctx = ToolContext::new(root.path());
+        ctx.file_versions.saw(&root.path().join("a.txt"), b"x\nx\n");
+        let err = plan(&input("a.txt", "x", "y"), &ctx).await.unwrap_err();
         assert!(err.0.starts_with("old_string appears 2 times in a.txt."));
     }
 

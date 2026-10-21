@@ -711,6 +711,9 @@ struct Inner {
     specs: Vec<marv_core::ToolSpec>,
     always: AlwaysScopes,
     taint: Arc<TaintState>,
+    /// The version of each file this conversation read or wrote (`marv_tools::file_versions`), kept across its turns:
+    /// the edit tools refuse to write over a change it hasn't seen. A new conversation (/clear, a resume) starts empty.
+    file_versions: Arc<marv_tools::FileVersions>,
     /// The skills as the `skill` tool takes them.
     skills: Arc<Vec<marv_tools::Skill>>,
     /// MCP tools whose schema this conversation has seen (tool_search, or a rejected call): their errors don't repeat it.
@@ -1073,6 +1076,7 @@ impl MarvSession {
             specs,
             always,
             taint: Arc::new(TaintState::new()),
+            file_versions: Arc::default(),
             skills: Arc::new(init.skills.iter().map(|s| s.skill.clone()).collect()),
             loaded: Arc::default(),
             nested: Arc::default(),
@@ -1752,6 +1756,7 @@ impl MarvSession {
         ctx.formatter = marv_tools::formatter::ProjectFormatter::hook(&formatter, ctx.sandbox.enabled);
         ctx.checkpoint = checkpoint.map(|c| c as Arc<dyn marv_tools::Checkpoint>);
         ctx.taint = self.inner.taint.clone();
+        ctx.file_versions = self.inner.file_versions.clone();
         // The main agent's doors out of the sandbox, fixed for the session (the prompt names them: the cache).
         ctx.doors.host = init.host_commands;
         ctx.doors.github = init.github;
@@ -2283,6 +2288,7 @@ impl MarvSession {
         }
         self.hold_tool_output(); // the new id's folder (#61)
         lock(&self.inner.loaded).clear();
+        self.inner.file_versions.forget_all(); // the new conversation has read nothing yet
         self.inner.nested.reset();
         if let Some((paths, _)) = &self.inner.init.memory
             && let Ok(memories) = crate::memory::load_memory(paths).await
@@ -2325,6 +2331,8 @@ impl MarvSession {
             // The last turn's save may still be waiting: it belongs to the conversation being left.
             self.save_now(&mut s, transcript);
             lock(&self.inner.loaded).clear();
+            // What the conversation being left read says nothing about what the resumed one has seen.
+            self.inner.file_versions.forget_all();
             // The saved conversation may lack a note this one had: give them again (a repeat is harmless).
             self.inner.nested.reset();
             s.conversation = Arc::new(Mutex::new(saved.conversation.clone()));
@@ -5284,15 +5292,18 @@ mod turn_tests {
         std::fs::write(dirs.project.join(".prettierrc"), "{ \"singleQuote\": true }").unwrap();
         std::fs::write(dirs.project.join("a.js"), "const a = \"hi\";\n").unwrap();
         let provider = Scripted::new(vec![
-            use_tools(vec![call(
-                "c1",
-                "edit_file",
-                serde_json::json!({
-                    "path": "a.js",
-                    "old_string": "const a = \"hi\";",
-                    "new_string": "const b = \"there\";"
-                }),
-            )]),
+            use_tools(vec![
+                call("r1", "read_file", serde_json::json!({"path": "a.js"})),
+                call(
+                    "c1",
+                    "edit_file",
+                    serde_json::json!({
+                        "path": "a.js",
+                        "old_string": "const a = \"hi\";",
+                        "new_string": "const b = \"there\";"
+                    }),
+                ),
+            ]),
             say("Done."),
         ]);
         let session = scripted(&dirs, &provider, |i| i.formatter = FormatterSetting::Auto);
@@ -5300,8 +5311,8 @@ mod turn_tests {
         // The file on disk is formatted.
         let content = std::fs::read_to_string(dirs.project.join("a.js")).unwrap();
         assert_eq!(content, "const b = 'there';\n", "{events:?}");
-        // The model was told, and the result it saw is the formatted one.
-        let tool = events.iter().find_map(|e| match e {
+        // The model was told, and the result it saw is the formatted one (the edit's, after the read's).
+        let tool = events.iter().rev().find_map(|e| match e {
             SessionEvent::Loop(LoopEvent::ToolEnd { run, .. }) => Some(run.result.clone()),
             _ => None,
         });
@@ -5319,11 +5330,10 @@ mod turn_tests {
         std::fs::write(dirs.project.join(".prettierrc"), "{}").unwrap();
         std::fs::write(dirs.project.join("a.js"), "hi\n").unwrap();
         let provider = Scripted::new(vec![
-            use_tools(vec![call(
-                "c1",
-                "edit_file",
-                serde_json::json!({ "path": "a.js", "old_string": "hi", "new_string": "there" }),
-            )]),
+            use_tools(vec![
+                call("r1", "read_file", serde_json::json!({"path": "a.js"})),
+                call("c1", "edit_file", serde_json::json!({ "path": "a.js", "old_string": "hi", "new_string": "there" })),
+            ]),
             say("Done."),
         ]);
         let session = scripted(&dirs, &provider, |i| {

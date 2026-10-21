@@ -19,6 +19,7 @@ pub mod diff;
 pub mod edit_file;
 pub mod edit_match;
 pub mod file_lock;
+pub mod file_versions;
 pub mod files;
 pub mod formatter;
 pub mod github;
@@ -41,6 +42,7 @@ pub mod web;
 pub mod web_fetch;
 pub mod write_file;
 
+pub use file_versions::FileVersions;
 pub use formatter::{FormatOutcome, Formatter, FormatterSetting, ProjectFormatter};
 pub use marv_core::MAX_DECLINE_REASON;
 pub use registry::{

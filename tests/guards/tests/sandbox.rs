@@ -290,7 +290,9 @@ async fn asks_in(
 ) -> Option<ProtectedRule> {
     let approver = Recorder::new(Decision::No);
     let what = input.to_string();
-    let out = run_tool(&call(tool, input), &context(approver.clone(), root), builtin_tools()).await;
+    let ctx = context(approver.clone(), root);
+    marv_guards::have_read(&ctx, &[input["path"].as_str().unwrap_or_default()]);
+    let out = run_tool(&call(tool, input), &ctx, builtin_tools()).await;
     let asked = approver.requests();
     assert_eq!(asked.len(), 1, "{tool} {what} didn't ask: {}", out.result.output);
     assert!(asked[0].must_ask, "{tool} {what}: an \"always\" would cover it");
@@ -352,12 +354,9 @@ async fn in_the_home_folder_dotfiles_and_hooks_ask_even_in_yolo() {
     // A visible file of the home isn't a protected path, but in the home folder every file change asks (`once`),
     // in yolo too (which the session refuses there anyway): see approvals.rs.
     let approver = Recorder::new(Decision::No);
-    let out = run_tool(
-        &call("write_file", json!({"path": "notes.txt", "content": "ok\n"})),
-        &context(approver.clone(), h),
-        builtin_tools(),
-    )
-    .await;
+    let ctx = context(approver.clone(), h);
+    marv_guards::have_read(&ctx, &["notes.txt"]);
+    let out = run_tool(&call("write_file", json!({"path": "notes.txt", "content": "ok\n"})), &ctx, builtin_tools()).await;
     assert!(out.result.declined, "{}", out.result.output);
     let asked = approver.requests();
     assert!(asked.len() == 1 && asked[0].once && asked[0].protected.is_none(), "{asked:?}");
@@ -381,6 +380,7 @@ async fn in_the_home_folder_dotfiles_and_hooks_ask_even_in_yolo() {
         let mut ctx = context(person.clone(), h);
         ctx.yolo = false;
         ctx.approver = Some(approver);
+        marv_guards::have_read(&ctx, &["notes.txt", ".bashrc"]);
         let out = run_tool(&call("write_file", json!({"path": "notes.txt", "content": "ok\n"})), &ctx, builtin_tools()).await;
         assert!(out.result.declined, "subagent {subagent}: an \"always\" covered notes.txt: {}", out.result.output);
         assert!(person.requests().len() == 1 && person.requests()[0].once, "subagent {subagent}");
@@ -555,6 +555,7 @@ async fn protected_paths_ask_even_in_yolo() {
     for (path, rule) in cases {
         let approver = Recorder::new(Decision::No);
         let ctx = ToolContext { yolo: true, approver: Some(approver.clone()), ..ToolContext::new(project.path()) };
+        marv_guards::have_read(&ctx, &[path]);
         let out = run_tool(&call("write_file", json!({"path": path, "content": "planted\n"})), &ctx, builtin_tools()).await;
         let asked = approver.requests();
         assert_eq!(asked.len(), 1, "{path} didn't ask: {}", out.result.output);
@@ -592,6 +593,7 @@ async fn package_json_lifecycle_scripts_ask_even_in_yolo() {
     for c in calls {
         let approver = Recorder::new(Decision::No);
         let ctx = ToolContext { yolo: true, approver: Some(approver.clone()), ..ToolContext::new(project.path()) };
+        marv_guards::have_read(&ctx, &["package.json"]);
         let out = run_tool(&c, &ctx, builtin_tools()).await;
         let asked = approver.requests();
         assert_eq!(asked.len(), 1, "{}: {}", c.name, out.result.output);
@@ -601,6 +603,7 @@ async fn package_json_lifecycle_scripts_ask_even_in_yolo() {
     }
     // A dependency bump is an ordinary edit: yolo runs it.
     let ctx = ToolContext { yolo: true, approver: Some(Recorder::new(Decision::No)), ..ToolContext::new(project.path()) };
+    marv_guards::have_read(&ctx, &["package.json"]);
     let bump = call("edit_file", json!({"path": "package.json", "old_string": "4.0.0", "new_string": "4.1.0"}));
     let out = run_tool(&bump, &ctx, builtin_tools()).await;
     assert_eq!(out.result.approval, Some(Approval::Auto), "{}", out.result.output);
