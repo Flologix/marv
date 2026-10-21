@@ -117,7 +117,7 @@ async fn supervise(parent: Pid, program: &OsString, args: &[OsString]) -> i32 {
         tokio::select! {
             status = child.wait() => {
                 return match status {
-                    Ok(status) => marv_tools::relay::exit_code(status),
+                    Ok(status) => crate::relay::exit_code(status),
                     Err(_) => 1,
                 };
             }

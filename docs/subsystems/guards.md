@@ -10,6 +10,7 @@ Each guard's doc comment says how it was proven: the guard was reverted, and the
 | Config only from `~/.marv` or `$MARV_CONFIG_DIR` in the real env | `launch.rs::the_config_folder_comes_only_from_the_real_environment` | Proven |
 | `printable()`: CSI/OSC/DCS, C0/C1, bidi | `launch.rs::printable_strips_escapes_controls_and_bidi` | Proven |
 | … including headless text mode | `launch.rs::headless_text_output_is_printable` | Ignored: needs #11 |
+| macOS (Seatbelt, #166): Mach/XPC doors, sockets, the runtime folder but the plug, the closed home, writes, protected names and hard links, no IP without network, host processes and setuid, the environment, process lifetime | `seatbelt.rs` (14 guards, `require_sandbox!`, macOS only) | Run on the macOS job with `MARV_REQUIRE_SANDBOX=1`. Proven on macOS CI by removing the rule (branch `proof/166-seatbelt-rules`, PR #178): the home deny, the hidden-entry regex, `~/Library`, the protected write denies, the pid kill before the group's; the link refusals hold with the link rules removed (Seatbelt refuses `link()` from a source it can't read or write) |
 | Read-only system, empty `/run` but the mesh plug | `sandbox.rs::system_is_read_only_and_run_is_empty_but_for_the_mesh_plug` | Proven (real bwrap) |
 | No network unless approved, cleared env, own PID namespace | `sandbox.rs::no_network_cleared_environment_and_own_pid_namespace` | Proven (real bwrap) |
 | Stand-in home, toolchains read-only, credentials masked | `sandbox.rs::the_home_is_a_stand_in_with_masked_credentials` | Proven (real bwrap) |
@@ -46,6 +47,13 @@ Each guard's doc comment says how it was proven: the guard was reverted, and the
 | Approvals show the full payload | `provenance.rs::approvals_show_the_full_payload` | Proven |
 | A network approval lists scripts written this session | `provenance.rs::a_network_approval_lists_the_scripts_it_runs` | Ignored: not built yet |
 | A mesh message that wakes an idle Marv is fenced and taints; its turn's egress asks (#78) | `mesh.rs::a_woken_turn_reads_its_message_fenced_and_tainted_and_egress_asks` | Proven |
+| Subscriptions (#159): a provider never gets another provider's key | `subscriptions.rs::a_providers_key_never_goes_to_another_provider` | Proven |
+| Subscriptions: a plan's usage limit is a hard stop (one request, never retried, no other key) | `subscriptions.rs::plan_limit::a_plans_limit_is_a_hard_stop` | Proven |
+| Sign in with ChatGPT: the loopback listener is 127.0.0.1 only, needs the state, takes one callback | `subscriptions.rs::sign_in_listener::the_sign_in_listener_is_loopback_only_needs_the_state_and_takes_one_callback` | Proven |
+| Sign in with ChatGPT: an idle local connection doesn't stall the callback | `subscriptions.rs::sign_in_listener::an_idle_connection_doesnt_stall_the_sign_in` | |
+| Sign in with ChatGPT: the token goes only to api.openai.com, whatever baseUrl says | `subscriptions.rs::the_chatgpt_token_is_never_sent_to_another_host` | |
+| Sign in with ChatGPT: the listener times out and stops on cancel | `subscriptions.rs::sign_in_listener::the_sign_in_listener_times_out` | |
+| Sign in with ChatGPT: tokens never in `Debug` output | `subscriptions.rs::sign_in_listener::the_sign_in_tokens_never_show_in_debug_output` | |
 | Radio (#124): a project's config can't turn it (or wake) on; the startup note | `radio.rs::a_projects_config_cant_turn_the_radio_on` | Proven |
 | Radio: off unless the user's own config turns it on (no env variable, no flag) | `radio.rs::the_radio_is_off_unless_the_users_config_turns_it_on` (+ `marv-cli`'s `cli::tests::no_flag_turns_the_radio_on`) | Proven |
 | Radio: a Marv with it off refuses joins and sends no presence | `radio.rs::a_marv_with_the_radio_off_refuses_joins_and_sends_no_presence` | Proven |

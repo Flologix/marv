@@ -109,7 +109,7 @@ async fn config_approve_never_covers_tainted_egress() {
 /// Proven: dropped the `!request.must_ask` half in `SessionApprover` → this failed (the tainted retry wasn't asked).
 #[tokio::test]
 async fn config_approve_never_covers_a_tainted_network_escalation() {
-    marv_guards::require_bwrap!();
+    marv_guards::require_sandbox!();
     let project = TempDir::new("approvals-escalate");
     let approver = Recorder::new(Decision::No);
     // Fails like a command without network (the escalation's trigger), and leaves a mark when it runs.
@@ -343,7 +343,7 @@ async fn config_approve_git_write_never_covers_a_network_command() {
     }
 
     // The control: git_write and network both cover a command with both flags.
-    marv_guards::require_bwrap!();
+    marv_guards::require_sandbox!();
     let approver = Recorder::new(Decision::No);
     let calls = vec![tool_call("1", "bash", network_commands_under_git_write("ran-3", "unused")[0].clone())];
     let run = sdk_turn(s.project.path(), &s.config_dir, Scripted::new(vec![use_tools(calls), say("Done.")]), |o| {
@@ -363,7 +363,7 @@ async fn config_approve_git_write_never_covers_a_network_command() {
 /// Proven: same revert as above → this failed (both ran, exit 0).
 #[test]
 fn headless_approve_git_write_never_covers_a_network_command() {
-    marv_guards::require_bwrap!();
+    marv_guards::require_sandbox!();
     let (root, config) = (TempDir::new("approvals-p"), TempDir::new("approvals-p-config"));
     let path = std::env::var("PATH").unwrap_or_default();
     let env = [("PATH", path.as_str()), ("MARV_GITHUB", "off")];

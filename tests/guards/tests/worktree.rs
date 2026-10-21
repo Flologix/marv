@@ -7,7 +7,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 
-use marv_guards::{Recorder, TempDir, call, require_bwrap, sandbox_with_home};
+use marv_guards::{Recorder, TempDir, call, sandbox_with_home};
 use marv_session::subagent::subagent_context;
 use marv_session::worktree::{create_worktree, finish_worktree};
 use marv_tools::{Decision, ToolContext, builtin_tools, run_tool};
@@ -45,7 +45,7 @@ fn repo() -> TempDir {
 /// the branch).
 #[tokio::test]
 async fn a_worktree_subagents_git_is_read_only_and_marv_commits_for_it() {
-    require_bwrap!();
+    marv_guards::require_sandbox!();
     let (repo, trees, home) = (repo(), TempDir::outside_tmp("wt-trees"), TempDir::outside_tmp("wt-home"));
     let wt = create_worktree(repo.path(), trees.path(), "guard").await.expect("a worktree");
     let refs = git(repo.path(), &["for-each-ref"]);
@@ -64,7 +64,9 @@ async fn a_worktree_subagents_git_is_read_only_and_marv_commits_for_it() {
         format!("mkdir -p {0} && echo 'touch /tmp/pwned' > {0}/pre-commit", hook.parent().unwrap().display()),
     ] {
         let ran = run_tool(&call("bash", json!({"command": command})), &ctx, builtin_tools()).await;
-        assert!(ran.result.output.contains("Read-only file system"), "{command}: {}", ran.result.output);
+        // bwrap's read-only mount, or Seatbelt's refusal.
+        let refused = ["Read-only file system", "Operation not permitted"].iter().any(|m| ran.result.output.contains(m));
+        assert!(refused, "{command}: {}", ran.result.output);
     }
     assert!(approver.requests().is_empty(), "a sandboxed worktree's changes run without asking");
     assert!(!hook.exists(), "a hook was planted");

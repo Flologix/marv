@@ -31,6 +31,8 @@ struct Desktop {
     launch: Mutex<Option<String>>,
     /// MCP servers looked up for adding, by name: what the person saw is exactly what gets written.
     proposals: Mutex<HashMap<String, Value>>,
+    /// #159: the ChatGPT sign-in waiting for the browser, if one is (one at a time; the page can cancel it).
+    sign_in: Mutex<Option<tokio_util::sync::CancellationToken>>,
     /// Tells the person when a chat they aren't looking at needs them or is done.
     notifier: notify::Notifier,
 }
@@ -71,18 +73,53 @@ impl Desktop {
 
     /// The pasted key, else `OPENROUTER_API_KEY`, else the one `marv`'s setup saved.
     fn api_key(&self) -> Option<String> {
-        if let Some(key) = self.store.settings().api_key.filter(|k| !k.trim().is_empty()) {
-            return Some(key);
-        }
-        if let Ok(key) = std::env::var("OPENROUTER_API_KEY")
-            && !key.trim().is_empty()
-        {
-            return Some(key.trim().to_string());
-        }
-        let home = marv_session::paths::home_dir();
-        let saved: Value = serde_json::from_str(&std::fs::read_to_string(home.join(".marv/config.json")).ok()?).ok()?;
-        saved.get("apiKey")?.as_str().map(str::to_string)
+        saved_key(self.store.settings().api_key, "OPENROUTER_API_KEY", "apiKey")
     }
+
+    /// #159: the Z.ai Coding Plan key: pasted here, else `ZAI_API_KEY`, else `marv`'s own config.
+    fn zai_key(&self) -> Option<String> {
+        saved_key(self.store.settings().zai_api_key, "ZAI_API_KEY", "zaiApiKey")
+    }
+
+    /// #159: the ChatGPT sign-in, shared with `marv` (~/.marv/chatgpt.json).
+    fn chatgpt(&self) -> marv_provider::chatgpt::AuthStore {
+        marv_provider::chatgpt::AuthStore::new(&marv_dir())
+    }
+
+    /// #159: whether a plan may be used here: its switch is on (`marv_provider::offered`), or it's already the chosen
+    /// provider (as the CLI keeps a config that names it).
+    fn plan_allowed(&self, plan: &str) -> bool {
+        let offered = match plan {
+            "zai" => marv_provider::offered::ZAI_CODING_PLAN,
+            "chatgpt" => marv_provider::offered::CHATGPT_SIGN_IN,
+            _ => false,
+        };
+        offered || self.store.settings().provider.as_deref() == Some(plan)
+    }
+
+    /// Whether the chosen provider has what it needs (a key, a sign-in; Ollama nothing).
+    fn ready(&self) -> bool {
+        match self.store.settings().provider.as_deref() {
+            Some("ollama") => true,
+            Some("zai") => self.zai_key().is_some(),
+            Some("chatgpt") => self.chatgpt().signed_in(),
+            _ => self.api_key().is_some(),
+        }
+    }
+}
+
+/// A key pasted here, else the environment's, else the one `marv`'s setup saved under `field`.
+fn saved_key(pasted: Option<String>, env: &str, field: &str) -> Option<String> {
+    if let Some(key) = pasted.filter(|k| !k.trim().is_empty()) {
+        return Some(key);
+    }
+    if let Ok(key) = std::env::var(env)
+        && !key.trim().is_empty()
+    {
+        return Some(key.trim().to_string());
+    }
+    let saved: Value = serde_json::from_str(&std::fs::read_to_string(marv_dir().join("config.json")).ok()?).ok()?;
+    saved.get(field)?.as_str().map(str::to_string)
 }
 
 #[derive(Serialize)]
@@ -91,8 +128,16 @@ struct AppInfo {
     root: Option<String>,
     root_name: Option<String>,
     has_key: bool,
-    /// "openrouter" or "ollama", once chosen.
+    /// "openrouter", "ollama", "zai" or "chatgpt" (#159), once chosen.
     provider: Option<String>,
+    /// #159: the chosen provider has what it needs.
+    ready: bool,
+    /// #159: onboarding offers the Z.ai Coding Plan / Sign in with ChatGPT (`marv_provider::offered`).
+    offer_zai: bool,
+    offer_chatgpt: bool,
+    has_zai_key: bool,
+    /// #159: who is signed in with ChatGPT, if anyone.
+    chatgpt_account: Option<String>,
     spaces: Vec<store::Space>,
     active: Option<String>,
 }
@@ -105,6 +150,14 @@ fn info(desktop: &Desktop) -> AppInfo {
         root: root.map(|r| r.to_string_lossy().into_owned()),
         has_key: desktop.api_key().is_some(),
         provider: settings.provider.clone(),
+        ready: desktop.ready(),
+        offer_zai: marv_provider::offered::ZAI_CODING_PLAN,
+        offer_chatgpt: marv_provider::offered::CHATGPT_SIGN_IN,
+        has_zai_key: desktop.zai_key().is_some(),
+        chatgpt_account: desktop
+            .chatgpt()
+            .signed_in()
+            .then(|| desktop.chatgpt().load().and_then(|a| a.email).unwrap_or_else(|| "your ChatGPT account".into())),
         active: settings.active_space().map(|s| s.id.clone()),
         spaces: settings.spaces,
     }
@@ -200,10 +253,16 @@ fn set_apps_off(desktop: State<'_, Desktop>, off: Vec<String>) -> Result<AppInfo
     Ok(info(&desktop))
 }
 
-/// "openrouter" or "ollama": how Marv thinks, chosen at onboarding.
+/// "openrouter" or "ollama", or (#159, when offered) "zai" or "chatgpt": how Marv thinks, chosen at onboarding.
 #[tauri::command]
 fn set_provider(desktop: State<'_, Desktop>, provider: String) -> Result<AppInfo, String> {
-    if provider != "openrouter" && provider != "ollama" {
+    let known = match provider.as_str() {
+        "openrouter" | "ollama" => true,
+        "zai" => marv_provider::offered::ZAI_CODING_PLAN,
+        "chatgpt" => marv_provider::offered::CHATGPT_SIGN_IN,
+        _ => false,
+    };
+    if !known {
         return Err(format!("Unknown provider {provider}."));
     }
     let mut settings = desktop.store.settings();
@@ -318,6 +377,100 @@ fn set_api_key(desktop: State<'_, Desktop>, key: String) -> Result<AppInfo, Stri
     Ok(info(&desktop))
 }
 
+/// #159: the Z.ai Coding Plan key, saved here (0600).
+#[tauri::command]
+fn set_zai_key(desktop: State<'_, Desktop>, key: String) -> Result<AppInfo, String> {
+    let mut settings = desktop.store.settings();
+    settings.zai_api_key = Some(key.trim().to_string()).filter(|k| !k.is_empty());
+    desktop.store.save_settings(&settings)?;
+    Ok(info(&desktop))
+}
+
+/// #159: Sign in with ChatGPT: the browser opens OpenAI's page, a 127.0.0.1 listener takes the one callback. Shared
+/// with `marv` (~/.marv/chatgpt.json).
+#[tauri::command]
+async fn chatgpt_sign_in(desktop: State<'_, Desktop>, another: Option<bool>) -> Result<AppInfo, String> {
+    if !marv_provider::offered::CHATGPT_SIGN_IN {
+        return Err("Sign in with ChatGPT isn't available in this build.".into());
+    }
+    let cancel = tokio_util::sync::CancellationToken::new();
+    {
+        let mut pending = desktop.sign_in.lock().unwrap_or_else(|e| e.into_inner());
+        if pending.as_ref().is_some_and(|c| !c.is_cancelled()) {
+            return Err("A sign-in is already waiting for the browser.".into());
+        }
+        *pending = Some(cancel.clone());
+    }
+    // `another`: register another ChatGPT account; else the one in use (or a first registration).
+    let target = if another == Some(true) {
+        marv_provider::chatgpt::SignInTarget::New
+    } else {
+        marv_provider::chatgpt::SignInTarget::Current
+    };
+    let outcome = async {
+        let sign_in = marv_provider::chatgpt::start_sign_in(desktop.chatgpt(), Default::default(), target).await?;
+        let url = sign_in.url().parse().map_err(|e| format!("{e}"))?;
+        marv_mcp::oauth::open_browser(&url, std::env::consts::OS);
+        sign_in.finish(cancel.clone()).await
+    }
+    .await;
+    desktop.sign_in.lock().unwrap_or_else(|e| e.into_inner()).take();
+    outcome?;
+    Ok(info(&desktop))
+}
+
+/// #159: stops the ChatGPT sign-in waiting for the browser.
+#[tauri::command]
+fn chatgpt_cancel_sign_in(desktop: State<'_, Desktop>) {
+    if let Some(cancel) = desktop.sign_in.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        cancel.cancel();
+    }
+}
+
+/// #159: signs out of ChatGPT (revoked at OpenAI when it answers).
+#[tauri::command]
+async fn chatgpt_sign_out(desktop: State<'_, Desktop>) -> Result<AppInfo, String> {
+    marv_provider::chatgpt::sign_out(&desktop.chatgpt(), &Default::default()).await?;
+    Ok(info(&desktop))
+}
+
+#[derive(Serialize)]
+struct PlanModel {
+    /// `zai/<model>` or `chatgpt/<slug>`, as a chat's model.
+    id: String,
+    /// "Z.ai Coding Plan" or "ChatGPT".
+    plan: &'static str,
+    context: Option<u64>,
+    /// What to show (ChatGPT's `display_name`), when the list has one.
+    name: Option<String>,
+}
+
+/// #159: the models of the plans set up here: the Z.ai Coding Plan's (with a key) and the ChatGPT account's (signed in).
+#[tauri::command]
+async fn plan_models(desktop: State<'_, Desktop>) -> Result<Vec<PlanModel>, String> {
+    let mut models = Vec::new();
+    if desktop.plan_allowed("zai") && desktop.zai_key().is_some() {
+        models.extend(marv_provider::models::zai_models().into_iter().map(|m| PlanModel {
+            id: format!("{}{}", marv_web::host::ZAI_PREFIX, m.id),
+            plan: "Z.ai Coding Plan",
+            context: m.context,
+            name: m.name,
+        }));
+    }
+    let store = desktop.chatgpt();
+    if desktop.plan_allowed("chatgpt") && store.signed_in() {
+        let credentials = marv_provider::chatgpt::ChatGptCredentials { store, endpoints: Default::default() };
+        let listed = marv_provider::chatgpt::list_models(&credentials).await.unwrap_or_default();
+        models.extend(listed.into_iter().map(|m| PlanModel {
+            id: format!("{}{}", marv_web::host::CHATGPT_PREFIX, m.id),
+            plan: "ChatGPT",
+            context: m.context,
+            name: m.name,
+        }));
+    }
+    Ok(models)
+}
+
 #[tauri::command]
 fn list_dir(desktop: State<'_, Desktop>, rel: String) -> Result<Vec<tree::Entry>, String> {
     tree::list(&desktop.root()?, &rel)
@@ -409,10 +562,23 @@ fn open_chat(
     epoch: Option<String>,
     on_event: Channel<Value>,
 ) -> Result<Chat, String> {
-    // A local (Ollama) model needs no key.
+    // A local (Ollama) model needs no key; a plan (#159) needs its own key or sign-in, never another provider's.
+    let (zai, chatgpt) = (marv_web::host::ZAI_PREFIX, marv_web::host::CHATGPT_PREFIX);
+    if (model.starts_with(zai) && !desktop.plan_allowed("zai"))
+        || (model.starts_with(chatgpt) && !desktop.plan_allowed("chatgpt"))
+    {
+        return Err("That plan isn't available in this build.".into());
+    }
+    if model.starts_with(zai) && desktop.zai_key().is_none() {
+        return Err("Add your Z.ai Coding Plan key first.".into());
+    }
+    if model.starts_with(chatgpt) && !desktop.chatgpt().signed_in() {
+        return Err("Sign in with ChatGPT first.".into());
+    }
+    let plan = model.starts_with(zai) || model.starts_with(chatgpt);
     let api_key = match desktop.api_key() {
         Some(key) => key,
-        None if marv_web::host::is_local(&model) => String::new(),
+        None if plan || marv_web::host::is_local(&model) => String::new(),
         None => return Err("Add an OpenRouter key first, or pick a local model (ollama/…).".into()),
     };
     if !is_model_id(&model) {
@@ -449,6 +615,8 @@ fn open_chat(
         // The CLI's own folder (~/.marv): the same memory, MCP servers and saved sessions as `marv`.
         config_dir: marv_dir(),
         api_key,
+        zai_api_key: desktop.zai_key(),
+        chatgpt_auth: Some(desktop.chatgpt().path),
         model,
         max_steps: max_steps.min(500),
         yolo,
@@ -667,6 +835,7 @@ pub fn run() {
                 live: Mutex::new(HashMap::new()),
                 launch: Mutex::new(launch),
                 proposals: Mutex::new(HashMap::new()),
+                sign_in: Mutex::new(None),
                 notifier: notify::Notifier::default(),
             });
             Ok(())
@@ -692,6 +861,11 @@ pub fn run() {
             open_url,
             take_launch,
             set_api_key,
+            set_zai_key,
+            chatgpt_sign_in,
+            chatgpt_cancel_sign_in,
+            chatgpt_sign_out,
+            plan_models,
             list_dir,
             create_folder,
             rename_entry,

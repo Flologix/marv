@@ -7,7 +7,8 @@ import { Martian } from "./Martian";
 const SUGGESTED = ["gemma4:12b", "qwen3:14b"];
 
 /**
- * First run, three steps: how Marv thinks (Ollama on this machine, or OpenRouter in the cloud), the first space's
+ * First run, three steps: how Marv thinks (Ollama on this machine, OpenRouter in the cloud, or a plan you already pay
+ * for when this build offers it: the Z.ai GLM Coding Plan, Sign in with ChatGPT), the first space's
  * folder, and the apps to connect (skippable). Each step shows only while it's needed.
  */
 export function Onboarding({
@@ -15,13 +16,16 @@ export function Onboarding({
   onInfo,
   onModel,
   onFinish,
+  again = false,
 }: {
   info: AppInfo;
   onInfo: (info: AppInfo) => void;
   onModel: (model: string) => void;
   onFinish: () => void;
+  /** #159: only the first step again (from the model menu, to set up a plan), with a way back. */
+  again?: boolean;
 }) {
-  const step = !info.hasKey && info.provider !== "ollama" ? "brain" : !info.root ? "folder" : "apps";
+  const step = again || !info.ready ? "brain" : !info.root ? "folder" : "apps";
   const [installed, setInstalled] = useState<string[]>([]);
   const refresh = () => desktop.mcpServers("").then((s) => setInstalled(s.map((e) => e.name)), () => {});
 
@@ -35,13 +39,22 @@ export function Onboarding({
         <Martian size={56} className="toon" />
         <div className="brand">
           <img className="flai" src="/flai.png" alt="FloLogix AI" /> marv desktop
-          <span className="steps">
-            {["brain", "folder", "apps"].map((s) => (
-              <i key={s} className={s === step ? "on" : ""} />
-            ))}
-          </span>
+          {!again && (
+            <span className="steps">
+              {["brain", "folder", "apps"].map((s) => (
+                <i key={s} className={s === step ? "on" : ""} />
+              ))}
+            </span>
+          )}
         </div>
-        {step === "brain" && <Brain onInfo={onInfo} onModel={onModel} />}
+        {step === "brain" && <Brain info={info} onInfo={onInfo} onModel={onModel} />}
+        {again && (
+          <div>
+            <button className="btn" onClick={onFinish}>
+              Back
+            </button>
+          </div>
+        )}
         {step === "folder" && <Folder onInfo={onInfo} />}
         {step === "apps" && (
           <>
@@ -60,7 +73,7 @@ export function Onboarding({
   );
 }
 
-function Brain({ onInfo, onModel }: { onInfo: (info: AppInfo) => void; onModel: (model: string) => void }) {
+function Brain({ info, onInfo, onModel }: { info: AppInfo; onInfo: (info: AppInfo) => void; onModel: (model: string) => void }) {
   const [local, setLocal] = useState<LocalModel[] | null>(null);
   const [ollamaError, setOllamaError] = useState<string | null>(null);
   const [key, setKey] = useState("");
@@ -104,6 +117,7 @@ function Brain({ onInfo, onModel }: { onInfo: (info: AppInfo) => void; onModel: 
   }
 
   const usable = local?.filter((m) => m.tools) ?? [];
+  const plans = info.offerZai || info.offerChatgpt;
   return (
     <>
       <h1>How should Marv think?</h1>
@@ -156,7 +170,95 @@ function Brain({ onInfo, onModel }: { onInfo: (info: AppInfo) => void; onModel: 
           </button>
         </section>
       </div>
+      {plans && <Plans info={info} onInfo={onInfo} onModel={onModel} onError={setError} />}
       {error && <p className="error">{error}</p>}
+    </>
+  );
+}
+
+/** A plan the person already pays for, when this build offers it: the Z.ai GLM Coding Plan (its own key), Sign in
+ * with ChatGPT (the browser). */
+function Plans({
+  info,
+  onInfo,
+  onModel,
+  onError,
+}: {
+  info: AppInfo;
+  onInfo: (info: AppInfo) => void;
+  onModel: (model: string) => void;
+  onError: (error: string | null) => void;
+}) {
+  const [zaiKey, setZaiKey] = useState("");
+  const [signingIn, setSigningIn] = useState(false);
+
+  async function chooseZai() {
+    try {
+      await desktop.setZaiKey(zaiKey);
+      onModel("zai/glm-5.3");
+      onInfo(await desktop.setProvider("zai"));
+    } catch (e) {
+      onError(String(e));
+    }
+  }
+
+  async function chooseChatgpt(another = false) {
+    onError(null);
+    setSigningIn(true);
+    try {
+      if (another || !info.chatgptAccount) await desktop.chatgptSignIn(another);
+      const first = (await desktop.planModels()).find((m) => m.id.startsWith("chatgpt/"));
+      if (first) onModel(first.id);
+      onInfo(await desktop.setProvider("chatgpt"));
+    } catch (e) {
+      onError(String(e));
+    } finally {
+      setSigningIn(false);
+    }
+  }
+
+  return (
+    <>
+      <p>Or use a plan you already pay for:</p>
+      <div className="choices">
+        {info.offerZai && (
+          <section className="choice">
+            <b>Z.ai GLM Coding Plan</b>
+            <span className="help">GLM-5.3 on the plan you subscribe to; its usage limits apply.</span>
+            <input className="mono" type="password" placeholder="Coding Plan API key" value={zaiKey} onChange={(e) => setZaiKey(e.target.value)} />
+            <span className="help">
+              From{" "}
+              <button className="link" onClick={() => void desktop.openUrl("https://z.ai/manage-apikey/apikey-list")}>
+                z.ai/manage-apikey/apikey-list ↗
+              </button>
+              . Stays on this machine.
+            </span>
+            <button className="btn primary" disabled={!zaiKey.trim() && !info.hasZaiKey} onClick={() => void chooseZai()}>
+              Use the Coding Plan
+            </button>
+          </section>
+        )}
+        {info.offerChatgpt && (
+          <section className="choice">
+            <b>Sign in with ChatGPT</b>
+            <span className="help">Your ChatGPT Plus or Pro plan pays for Marv, within its usage limits. Your browser opens to sign in.</span>
+            {info.chatgptAccount && <span className="help">Signed in as {info.chatgptAccount}.</span>}
+            <button className="btn primary" disabled={signingIn} onClick={() => void chooseChatgpt()}>
+              {signingIn ? "Waiting for the browser…" : info.chatgptAccount ? "Use ChatGPT" : "Sign in with ChatGPT"}
+            </button>
+            {signingIn && (
+              <button className="btn" onClick={() => void desktop.chatgptCancelSignIn()}>
+                Cancel
+              </button>
+            )}
+            {info.chatgptAccount && !signingIn && (
+              <button className="link" onClick={() => void chooseChatgpt(true)}>
+                Use another ChatGPT account
+              </button>
+            )}
+          </section>
+        )}
+      </div>
     </>
   );
 }

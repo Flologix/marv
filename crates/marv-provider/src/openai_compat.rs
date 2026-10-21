@@ -59,7 +59,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::degenerate::{DEGENERATE_NOTE, DegenerateGuard};
-use crate::errors::{ErrorHints, ErrorObject, describe_error, error_message, http_error, unreachable};
+use crate::errors::{ErrorHints, ErrorObject, describe_error, error_message, http_error, plan_limit, plan_limit_of, unreachable};
 use crate::retry::{
     BACKOFFS, BodyError, DropRecovery, FailureKind, MAX_ATTEMPTS, RetryTiming, drop_recovery, idle_guard, parse_retry_after,
     retriable_failure, retriable_http_status, sleep_abortable,
@@ -516,6 +516,11 @@ impl ReplyAssembler {
         // Errors can also arrive mid-stream, after the 200 status was already sent. One the provider behind the router
         // may get past on a fresh attempt (an upstream abort, timeout or overload) is retried like a dropped connection.
         if let Some(error) = &chunk.error {
+            // #159: a plan's limit, mid-stream: a hard stop with its own message.
+            if let Some(message) = plan_limit_of(&self.label, error.code.as_ref(), error.message.as_deref()) {
+                out.push(ProviderEvent::Error(message));
+                return Flow::Stop;
+            }
             let message = format!("{}: {}", self.label, describe_error(error));
             if crate::errors::transient(error) {
                 // The reply already finished (a finish_reason came): nothing is lost, so don't resend it.
@@ -879,14 +884,20 @@ async fn run(
             }
         }
 
-        // HTTP-level error.
+        // HTTP-level error. #159: the body is read first: a plan's limit (a 429) is a hard stop, never retried, and
+        // never answered with another key or provider.
+        let wait = status_wait(&response, o.timing, attempt);
+        let Some((detail, body)) = read_error_body(response, &cancel).await else { return };
+        if let Some(message) = plan_limit(label, &body) {
+            emit.send(ProviderEvent::Error(message));
+            return;
+        }
         if retriable_http_status(status) && attempt < MAX_ATTEMPTS {
-            if sleep_abortable(status_wait(&response, o.timing, attempt), &cancel).await {
+            if sleep_abortable(wait, &cancel).await {
                 return;
             }
             continue;
         }
-        let Some(detail) = read_error(response, &cancel).await else { return };
         // #96: a provider that won't take max_tokens (or can't fit it beside this prompt) gets the request without it.
         if (400..500).contains(&status) && sent_cap.is_some() && MAX_TOKENS_REFUSED.is_match(&detail) {
             if NAMES_MAX_TOKENS.is_match(&detail) && UNSUPPORTED.is_match(&detail) {
@@ -1062,10 +1073,15 @@ pub(crate) fn status_wait(response: &reqwest::Response, timing: RetryTiming, ret
 
 /// The message in an error response's body. `None`: cancelled while reading it.
 pub(crate) async fn read_error(response: reqwest::Response, cancel: &CancellationToken) -> Option<String> {
+    read_error_body(response, cancel).await.map(|(message, _)| message)
+}
+
+/// The message in an error response's body, and the body itself (#159: a plan's limit is told by its code).
+pub(crate) async fn read_error_body(response: reqwest::Response, cancel: &CancellationToken) -> Option<(String, String)> {
     let content_type = response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).map(str::to_string);
     let status_text = response.status().canonical_reason().unwrap_or_default();
     let body = until_cancelled(cancel, response.text()).await?.unwrap_or_default();
-    Some(error_message(content_type.as_deref(), status_text, &body))
+    Some((error_message(content_type.as_deref(), status_text, &body), body))
 }
 
 /// Whether a failed request is worth retrying ([`retriable_failure`], #107): reqwest says it failed connecting,
