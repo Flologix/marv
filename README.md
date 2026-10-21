@@ -87,6 +87,15 @@ marv
 
 The first run opens a short setup: pick OpenRouter or Ollama, pick a model, and (for OpenRouter) paste your key. Settings are saved to `~/.marv/config.json`, readable only by you. Run `/setup` to change them later.
 
+### A plan you already pay for (coming)
+
+Marv can also run on a subscription instead of an OpenRouter key. Both are built, but **setup doesn't offer them yet**: each waits for the vendor to clear Marv.
+
+- **Z.ai GLM Coding Plan.** GLM-5.3 and GLM-5.3-Flash on the plan's own endpoint (`https://api.z.ai/api/coding/paas/v4`), with your plan's key from [z.ai/manage-apikey/apikey-list](https://z.ai/manage-apikey/apikey-list) (saved as `zaiApiKey`, or `ZAI_API_KEY`). Pending Z.ai's approval: the Coding Plan may only be used from tools Z.ai lists, and Marv isn't on that list yet.
+- **Sign in with ChatGPT.** Your ChatGPT Plus or Pro plan pays for Marv, through OpenAI's program for open-source agents: setup opens your browser to sign in, and requests go to OpenAI's Responses API. The sign-in is saved to `~/.marv/chatgpt.json`, readable only by you; `/setup` can sign in again or sign out. Pending the maintainer's go-ahead with OpenAI.
+
+A build offers one with `MARV_OFFER_ZAI_CODING_PLAN=1` or `MARV_OFFER_CHATGPT_SIGN_IN=1` set when it's compiled (`marv_provider::offered`). When a plan's usage limit is reached, Marv stops with a message saying so: it never switches to another key or provider by itself.
+
 ## Using Marv
 
 Type what you want in plain language, for example:
@@ -409,6 +418,7 @@ The radio is a live channel between your Marvs on this machine. It's **off unles
 | Environment variable | Effect |
 |---|---|
 | `OPENROUTER_API_KEY` | Overrides the saved OpenRouter key |
+| `ZAI_API_KEY` | Overrides the saved Z.ai Coding Plan key (`zaiApiKey`) |
 | `MARV_MODEL` | Overrides the saved model |
 | `MARV_MAX_STEPS` | Overrides the saved step limit (`0` or `off` never asks; `/steps`) |
 | `OLLAMA_HOST` | Where Ollama runs (default `localhost:11434`) |

@@ -1485,7 +1485,7 @@ mod tests {
                                 .unwrap();
                             assert!(!sent.is_error, "{}", sent.output);
                             calls(&[
-                                ("b1", "bash", serde_json::json!({"command": "test -S /run/marv/mesh.sock && echo plugged"})),
+                                ("b1", "bash", serde_json::json!({"command": "test -S \"$MARV_MESH_SOCKET\" && echo plugged"})),
                                 (
                                     "b2",
                                     MESH_SEND,

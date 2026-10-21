@@ -50,7 +50,9 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::SandboxError;
 use crate::fs::{EntryKind, FileKind, FsProbe};
-use crate::home::{CREDENTIALS, HOME_MASKS, contains};
+#[cfg(test)]
+use crate::home::HOME_MASKS;
+use crate::home::{CREDENTIALS, contains};
 use crate::plan::Plan;
 
 /// `sandbox-exec`, always by its full path on the system volume, never from PATH.
@@ -82,6 +84,7 @@ const SYSCTLS: &[&str] = &[
     "hw.logicalcpu_max",
     "hw.machine",
     "hw.memsize",
+    "hw.model",
     "hw.ncpu",
     "hw.nperflevels",
     "hw.packages",
@@ -91,6 +94,7 @@ const SYSCTLS: &[&str] = &[
     "hw.vectorunit",
     "kern.hostname",
     "kern.maxfilesperproc",
+    "kern.ngroups",
     "kern.osproductversion",
     "kern.osrelease",
     "kern.ostype",
@@ -99,9 +103,17 @@ const SYSCTLS: &[&str] = &[
     "kern.secure_kernel",
     "kern.usrstack64",
     "kern.version",
-    "sysctl.proc_cputype",
+    // Node's `os.cpus()` is empty without it (#166 probe), and `os.cpus().length` sizes worker pools.
+    "machdep.cpu.brand_string",
 ];
-const SYSCTL_PREFIXES: &[&str] = &["hw.optional.arm.", "hw.optional.armv8_", "hw.perflevel"];
+/// `sysctl.` is the sysctl tree's own metadata (`name2oid`, `oidfmt`, `next`): the `sysctl -n hw.ncpu` that build
+/// scripts run needs it to look a name up; the value is still filtered by the list above.
+const SYSCTL_PREFIXES: &[&str] = &["hw.optional.arm.", "hw.optional.armv8_", "hw.perflevel", "sysctl."];
+
+/// The interface list (`getifaddrs`: node's `os.networkInterfaces()`, Go's `net.Interfaces()`, Python's
+/// `if_nameindex()`), with network only: it names the machine's addresses, as a networked command on Linux sees the
+/// host's interfaces and one without network sees only `lo`. Without it those calls fail on macOS (#166 probe).
+const NETWORK_SYSCTL_PREFIX: &str = "net.routetable.";
 
 /// The Mach services every command may look up: user and group lookups (git, ssh) and the system log. Each one added
 /// later is a review item, with a failing tool and a test. `opendirectoryd.libinfo` answers `getpwuid`/`getgrgid`
@@ -109,12 +121,12 @@ const SYSCTL_PREFIXES: &[&str] = &["hw.optional.arm.", "hw.optional.armv8_", "hw
 /// Linux), nothing more.
 pub const MACH_SERVICES: &[&str] = &["com.apple.system.opendirectoryd.libinfo", "com.apple.system.logger"];
 
-/// The services a command with network needs on top: DNS configuration and TLS trust (Codex's network policy).
+/// The services a command with network needs on top: DNS configuration and TLS trust (Codex's network policy, without
+/// `com.apple.SecurityServer`: securityd answers for keychain items and raises authorization prompts; #166 review).
 pub const NETWORK_MACH_SERVICES: &[&str] = &[
     "com.apple.SystemConfiguration.configd",
     "com.apple.SystemConfiguration.DNSConfiguration",
     "com.apple.trustd.agent",
-    "com.apple.SecurityServer",
     "com.apple.networkd",
     "com.apple.ocspd",
 ];
@@ -125,20 +137,24 @@ const DNS_SOCKET: &str = "/private/var/run/mDNSResponder";
 /// The operation that makes a hard link. A hard link is a second name for a file that no path rule names: a protected
 /// file linked into the project or the private `TMPDIR` could be written through it, a credential read through it.
 /// bwrap stops this with `EXDEV` (a link can't cross a mount); here each denied path is also denied as a link source.
-/// TODO(#166): the operation's name is "to verify" (spec §6.6); if it's wrong, `sandbox-exec` rejects the whole
-/// profile, so it can't ship silently.
+/// The name is right, and `link()` is checked against **both** paths, the source and the new name: a rule naming
+/// either refuses it (#166 probe on macOS 14: with `(deny file-link (subpath A))`, A→B, B→A and A→A are refused, B→B
+/// isn't; with `(deny file-link)` then `(allow file-link (subpath A))` only A→A works). And it's refused whenever the
+/// source is denied for reading or writing its data, whatever the `file-link` rules say (#166 review probe), so the link
+/// denies below are a second layer for everything denied for reads or writes.
 const HARD_LINK_OP: &str = "file-link";
 
-/// Whether hard links are allowed in the project and the private `TMPDIR` (rustc's incremental cache, `ln`). Off:
-/// under `(deny default)` no link can be made anywhere, and tools that link (cargo, git, pnpm) fall back to copying.
-/// Whether `file-link` filters on the link's source or on its new name isn't known: if on the new name, an allow for
-/// the project would let `ln ~/.ssh/id_ed25519 ./x; cat x` through. Turn this on only once the BLOCKING probe of #166
-/// (spec §9.2) proves the source is checked.
-const ALLOW_LINKS_IN_PROJECT: bool = false;
+/// Whether hard links are allowed in the project and the private `TMPDIR` (rustc's incremental cache, `ln`). On since
+/// the BLOCKING probe of #166 (spec §9.2): because `file-link` checks the source too, an allow for the project doesn't
+/// let `ln ~/.ssh/known_hosts ./x` through (the home's deny names the source), nor `ln ~/.ssh/known_hosts $TMPDIR/x`,
+/// nor `ln .envrc y` (the protected path's deny), nor a link from a readable file outside every allowed folder
+/// (`/Users/Shared/x`, no allow names it). Both ends must be in the project or the private TMPDIR. (A link from the
+/// project into the TMPDIR is refused too, for no reason the rules show; the other three directions work.)
+const ALLOW_LINKS_IN_PROJECT: bool = true;
 
-// TODO(#166): a setuid or setgid program (`sudo`, `su`) runs with raised privileges, still inside the sandbox; there
-// is no `no_new_privs`. A rule like `(deny process-exec (file-mode #o4000))` waits for the macOS probe to confirm the
-// filter's syntax and meaning. Listed in docs/SECURITY.md.
+// A setuid or setgid program (`sudo`, `su`, `ps`) doesn't run in the sandbox at all: `sandbox-exec`'s exec of one
+// fails with EPERM (#166 probe on macOS 14: `sudo -n true` and `/bin/ps` both "Operation not permitted"), so no rule
+// is needed for it. The guards check it stays so.
 
 /// What one command's profile needs beyond the [`Plan`]: things the macOS backend makes or finds per command (#166).
 #[derive(Debug, Clone, Default)]
@@ -309,6 +325,13 @@ pub fn profile(plan: &Plan, run: &Invocation, fs: &dyn FsProbe) -> Result<Profil
     build_profile(plan, run, fs, ALLOW_LINKS_IN_PROJECT)
 }
 
+/// [`profile`] with hard links allowed in the project and the private TMPDIR, whatever [`ALLOW_LINKS_IN_PROJECT`] says:
+/// only for the macOS probe that decides it (`tests/seatbelt_probe.rs`, spec §9.2), never for a command.
+#[doc(hidden)]
+pub fn profile_allowing_links(plan: &Plan, run: &Invocation, fs: &dyn FsProbe) -> Result<Profile, SandboxError> {
+    build_profile(plan, run, fs, true)
+}
+
 /// [`profile`], with hard links in the project and the private TMPDIR allowed or not ([`ALLOW_LINKS_IN_PROJECT`]).
 fn build_profile(plan: &Plan, run: &Invocation, fs: &dyn FsProbe, allow_links: bool) -> Result<Profile, SandboxError> {
     for (path, what) in [(&plan.root, "project"), (&plan.home, "home folder")] {
@@ -354,23 +377,7 @@ fn build_profile(plan: &Plan, run: &Invocation, fs: &dyn FsProbe, allow_links: b
     let mut b = Builder { text: String::new(), params: Vec::new(), no_links: Vec::new() };
 
     // 1. Base.
-    b.section("1. base");
-    b.line("(version 1)");
-    b.line("(deny default)");
-    b.line("(allow process-fork)");
-    b.line("(allow process-exec)");
-    b.line("(allow signal (target same-sandbox))");
-    b.line("(allow process-info* (target same-sandbox))");
-    let mut sysctls: Vec<String> = SYSCTLS.iter().map(|s| format!("(sysctl-name {})", quoted(s))).collect();
-    sysctls.extend(SYSCTL_PREFIXES.iter().map(|s| format!("(sysctl-name-prefix {})", quoted(s))));
-    b.line(&format!("(allow sysctl-read {})", sysctls.join(" ")));
-    let services: Vec<String> = MACH_SERVICES.iter().map(|s| format!("(global-name {})", quoted(s))).collect();
-    b.line(&format!("(allow mach-lookup {})", services.join(" ")));
-    b.line("(allow ipc-posix-sem)");
-    // Creating a Unix or IP socket reaches nothing; connecting and binding are the network section's. TODO(#166):
-    // the symbolic domain names are to verify on the macOS probe.
-    b.line("(allow system-socket (socket-domain AF_UNIX) (socket-domain AF_INET) (socket-domain AF_INET6))");
-    b.line("(allow file-ioctl (literal \"/dev/dtracehelper\"))");
+    base(&mut b);
 
     // 2. Reads, broad.
     b.section("2. reads, broad");
@@ -414,14 +421,39 @@ fn build_profile(plan: &Plan, run: &Invocation, fs: &dyn FsProbe, allow_links: b
         b.paths(read, &["subpath"], &format!("WRITABLE_{i}"), &canon(&extra.real), None);
     }
     b.paths(read, &["subpath"], "TMP", &tmp, None);
-    if let Some(exe) = &run.exe {
-        b.paths(read, &["literal"], "EXE", &canon(exe), None);
+    let exe = run.exe.as_ref().map(|e| canon(e));
+    if let Some(exe) = &exe {
+        b.paths(read, &["literal"], "EXE", exe, None);
+    }
+    // The folders above each of those, by their own entry's metadata only (`stat`, not a listing): tools walk up a
+    // path with `lstat` (npm's `mkdir -p` of its cache in the TMPDIR stops at the user's temporary folder with EPERM,
+    // #166 probe), as `cd ~` needs the home's. Section 5 closes again what it must.
+    let mut shown: Vec<PathBuf> = vec![tmp.clone()];
+    if !home_project {
+        shown.push(root.clone());
+    }
+    shown.extend(toolchains.iter().map(|d| canon(d)));
+    shown.extend(ro_extras.iter().chain(&rw_extras).map(|e| canon(&e.real)));
+    shown.extend(exe.iter().cloned());
+    let mut parents: Vec<PathBuf> = Vec::new();
+    for path in &shown {
+        // Only where section 3 closed them: elsewhere reads are open already.
+        let closed = |d: &Path| d.starts_with(&home) || d.starts_with(&user_temp) || d.starts_with(SHARED_TMP);
+        for dir in path.ancestors().skip(1).filter(|d| closed(d)) {
+            if !parents.iter().any(|p| p == dir) {
+                parents.push(dir.to_path_buf());
+            }
+        }
+    }
+    let filters: Vec<String> =
+        parents.iter().enumerate().map(|(i, dir)| format!("(literal {})", b.param(format!("PARENT_{i}"), dir))).collect();
+    if !filters.is_empty() {
+        b.line(&format!("(allow file-read-metadata {})", filters.join(" ")));
     }
 
     // 5. Reads, closed again.
     b.section("5. reads, closed again");
-    let masks: Vec<(PathBuf, Option<PathBuf>)> =
-        if home_project { HOME_MASKS.iter().map(|m| written_and_real(&plan.home.join(m), fs)).collect() } else { Vec::new() };
+    let masks: Vec<(PathBuf, Option<PathBuf>)> = plan.home_masks(fs).iter().map(|m| written_and_real(m, fs)).collect();
     for (i, (given, real)) in masks.iter().enumerate() {
         b.paths("deny file-read*", &["literal", "subpath"], &format!("HOME_MASK_{i}"), given, real.as_deref());
     }
@@ -551,6 +583,7 @@ fn build_profile(plan: &Plan, run: &Invocation, fs: &dyn FsProbe, allow_links: b
         b.line(&format!("(allow network-outbound (remote unix-socket (path-literal {})))", quoted(DNS_SOCKET)));
         let services: Vec<String> = NETWORK_MACH_SERVICES.iter().map(|s| format!("(global-name {})", quoted(s))).collect();
         b.line(&format!("(allow mach-lookup {})", services.join(" ")));
+        b.line(&format!("(allow sysctl-read (sysctl-name-prefix {}))", quoted(NETWORK_SYSCTL_PREFIX)));
     } else {
         // The host's loopback is the user's (databases, dev servers, a local proxy): closed, but for the forwarded
         // ports of the user's own background processes.
@@ -562,16 +595,63 @@ fn build_profile(plan: &Plan, run: &Invocation, fs: &dyn FsProbe, allow_links: b
     let p = b.param("TMP".into(), &tmp);
     b.line(&format!("(allow network-bind (local unix-socket (subpath {p})))"));
     b.line(&format!("(allow network-outbound (remote unix-socket (subpath {p})))"));
+    // Marv's runtime folders (default and override, by their real paths): no socket there is reachable, nor can one be
+    // bound there, whatever an allow above names. Deny-default closes them already; this keeps them closed. Then the
+    // one plug.
+    for i in 0..runtime.len() {
+        let p = format!("(param \"RUNTIME_{i}\")");
+        b.line(&format!("(deny network-outbound (remote unix-socket (subpath {p})))"));
+        b.line(&format!("(deny network-bind (local unix-socket (subpath {p})))"));
+    }
     if let Some(plug) = &plan.mesh_socket {
         let p = b.param("PLUG".into(), &canon(plug));
         b.line(&format!("(allow network-outbound (remote unix-socket (path-literal {p})))"));
     }
 
     // 9. Last.
+    last(&mut b);
+    Ok(Profile { text: b.text, params: b.params })
+}
+
+/// Section 1: closed by default, then what any process needs (see the module doc).
+fn base(b: &mut Builder) {
+    b.section("1. base");
+    b.line("(version 1)");
+    b.line("(deny default)");
+    b.line("(allow process-fork)");
+    b.line("(allow process-exec)");
+    b.line("(allow signal (target same-sandbox))");
+    b.line("(allow process-info* (target same-sandbox))");
+    let mut sysctls: Vec<String> = SYSCTLS.iter().map(|s| format!("(sysctl-name {})", quoted(s))).collect();
+    sysctls.extend(SYSCTL_PREFIXES.iter().map(|s| format!("(sysctl-name-prefix {})", quoted(s))));
+    b.line(&format!("(allow sysctl-read {})", sysctls.join(" ")));
+    let services: Vec<String> = MACH_SERVICES.iter().map(|s| format!("(global-name {})", quoted(s))).collect();
+    b.line(&format!("(allow mach-lookup {})", services.join(" ")));
+    b.line("(allow ipc-posix-sem)");
+    // Creating a Unix or IP socket reaches nothing; connecting and binding are the network section's. The symbolic
+    // domain names are accepted (#166 probe).
+    b.line("(allow system-socket (socket-domain AF_UNIX) (socket-domain AF_INET) (socket-domain AF_INET6))");
+    b.line("(allow file-ioctl (literal \"/dev/dtracehelper\"))");
+}
+
+/// Section 9: no XPC service by any name, no `fcntl` that changes a file through a read-only descriptor.
+fn last(b: &mut Builder) {
     b.section("9. last");
     b.line("(deny mach-lookup (xpc-service-name-prefix \"\"))");
     b.line("(deny system-fcntl (fcntl-command 80) (fcntl-command 110))");
-    Ok(Profile { text: b.text, params: b.params })
+}
+
+/// The profile [`crate::seatbelt_backend::Seatbelt`]'s availability check runs: the base and last sections of every
+/// command's profile with reads open, and nothing else. If `sandbox-exec` is gone, or the kernel no longer accepts
+/// these rules, or Marv already runs inside a Seatbelt sandbox (a nested one can't start), it fails.
+pub fn probe_profile() -> String {
+    let mut b = Builder { text: String::new(), params: Vec::new(), no_links: Vec::new() };
+    base(&mut b);
+    b.section("2. reads, broad");
+    b.line("(allow file-read* file-map-executable)");
+    b.line("(allow file-write-data (literal \"/dev/null\"))");
+    last(&mut b);
+    b.text
 }
 
 /// The user's temporary folder, `/private/var/folders/<xx>/<id>` exactly: as given or the one the private TMPDIR is
@@ -856,8 +936,11 @@ mod tests {
             let text = value.to_string_lossy();
             assert!(!text.starts_with("/tmp") && !text.starts_with("/var/"), "{key}={text}");
             assert!(!text.starts_with("/Users/me/code"), "{key}={text}");
-            // Only the regexes carry a path, escaped.
-            assert!(!p.text.lines().filter(|l| !l.contains("#\"")).any(|l| l.contains(&*text)), "{key}'s value is in the text");
+            // Only the regexes carry a path, escaped (`/private/tmp`, a parent of an extra in it, is also a constant).
+            assert!(
+                text == SHARED_TMP || !p.text.lines().filter(|l| !l.contains("#\"")).any(|l| l.contains(&*text)),
+                "{key}'s value is in the text"
+            );
         }
         assert_eq!(p.param("PROJECT"), Some(Path::new("/Volumes/work/code/proj")));
         assert_eq!(p.param("PLUG"), Some(Path::new("/private/tmp/marv-501/p/1/a.sock")));
@@ -1066,6 +1149,67 @@ mod tests {
         assert!(at(&t, "(allow network-outbound (remote ip))") < at(&t, "(xpc-service-name-prefix"));
     }
 
+    /// The folders above what's shown again have their own metadata readable, nothing more, and before section 5.
+    #[test]
+    fn the_folders_above_whats_shown_can_be_stat_ed_only() {
+        let fs = mac_fs(|_| false);
+        let p = build(&Plan { root: "/Users/me/code/proj".into(), ..base() }, &fs);
+        let parents: Vec<&Path> = p.params.iter().filter(|(k, _)| k.starts_with("PARENT_")).map(|(_, v)| v.as_path()).collect();
+        // Above the TMPDIR, the project, the toolchains and Marv's binary (in ~/.local/bin), where section 3 closed them.
+        for dir in [
+            "/private/var/folders/ab/xyz/T",
+            "/private/var/folders/ab/xyz",
+            "/Users/me/code",
+            "/Users/me",
+            "/Users/me/.local/bin",
+            "/Users/me/.local",
+        ] {
+            assert!(parents.contains(&Path::new(dir)), "{dir}: {parents:?}");
+        }
+        for open in ["/", "/Users", "/private", "/private/var/folders"] {
+            assert!(!parents.contains(&Path::new(open)), "{open}: readable already");
+        }
+        let line = p.text.lines().find(|l| l.contains("(param \"PARENT_0\")")).unwrap();
+        assert!(line.starts_with("(allow file-read-metadata (literal") && !line.contains("subpath"), "{line}");
+        assert!(at(&p.text, line) > at(&p.text, "; 4.") && at(&p.text, line) < at(&p.text, "; 5."));
+    }
+
+    /// Every runtime folder's sockets are denied by name, after the TMPDIR's allow and before the plug's.
+    #[test]
+    fn runtime_sockets_are_denied_but_the_plug() {
+        let fs = mac_fs(|p| p.contains("marv"));
+        let plan = Plan {
+            hidden: vec!["/tmp/marv-501".into(), "/Users/me/.run/marv".into()],
+            mesh_socket: Some("/tmp/marv-501/p/1/a.sock".into()),
+            ..base()
+        };
+        let p = build(&plan, &fs);
+        assert_eq!(p.param("RUNTIME_0"), Some(Path::new("/private/tmp/marv-501")));
+        let tmp_allow = at(&p.text, "(allow network-outbound (remote unix-socket (subpath (param \"TMP\"))))");
+        let plug = at(&p.text, "(allow network-outbound (remote unix-socket (path-literal (param \"PLUG\"))))");
+        for i in 0..2 {
+            for rule in ["network-outbound (remote", "network-bind (local"] {
+                let line = format!("(deny {rule} unix-socket (subpath (param \"RUNTIME_{i}\"))))");
+                let pos = at(&p.text, &line);
+                assert!(tmp_allow < pos && pos < plug, "{line}");
+            }
+        }
+    }
+
+    /// The interface list names the machine's addresses: with network only, as Linux shows the host's only then.
+    #[test]
+    fn the_interface_list_only_with_network() {
+        let fs = mac_fs(|_| false);
+        let rule = format!("(sysctl-name-prefix \"{NETWORK_SYSCTL_PREFIX}\")");
+        assert!(!build(&base(), &fs).text.contains(&rule));
+        assert!(build(&Plan { network: true, ..base() }, &fs).text.contains(&rule));
+        // securityd (keychain items, authorization prompts) is never reachable, with network or not.
+        assert!(!build(&Plan { network: true, ..base() }, &fs).text.contains("com.apple.SecurityServer"));
+        // What `sysctl -n` and node's `os.cpus()` need, always.
+        let t = build(&base(), &fs).text;
+        assert!(t.contains("(sysctl-name-prefix \"sysctl.\")") && t.contains("(sysctl-name \"machdep.cpu.brand_string\")"));
+    }
+
     #[test]
     fn the_plug_is_the_one_socket_in_the_runtime_folder() {
         let fs = mac_fs(|_| false);
@@ -1161,9 +1305,11 @@ mod tests {
             config_dir: Some("/Users/me/.marv".into()),
             ..base()
         };
-        // As shipped: no link allowed anywhere (deny default), until the #166 probe shows `file-link` checks the
-        // source; the denies below are there all the same.
-        let off = build(&plan, &fs).text;
+        // As shipped: links allowed in the project and the TMPDIR, since the #166 probe showed `file-link` checks the
+        // source too (ALLOW_LINKS_IN_PROJECT).
+        assert_eq!(build(&plan, &fs), build_linking(&plan, &fs));
+        // Without the allow: no link anywhere (deny default), the denies all the same.
+        let off = build_profile(&plan, &run(), &fs, false).unwrap().text;
         assert!(!off.lines().any(|l| l.starts_with(&format!("(allow {HARD_LINK_OP}"))));
         assert!(off.contains(&format!("(deny {HARD_LINK_OP} (literal (param \"CREDENTIAL_0\"))")));
         // With links allowed in the project and the TMPDIR:
@@ -1358,8 +1504,10 @@ mod tests {
                             }
                             for other in keys_in(later) {
                                 // Intended: skills shown again inside the config; the private TMPDIR inside the user's.
+                                // And the folders above what's shown, by their own metadata only.
                                 if (key == "CONFIG" && other == "SKILLS" && op == "file-read")
                                     || (key == "USER_TEMP" && other == "TMP")
+                                    || (other.starts_with("PARENT_") && later.starts_with("(allow file-read-metadata (literal"))
                                 {
                                     continue;
                                 }

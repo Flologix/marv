@@ -39,19 +39,24 @@ fn started(dir: &Path) -> Vec<String> {
 /// Proven: dropped `--clearenv` from the sandbox's arguments → the command saw HERDR_SOCKET_PATH and failed this test.
 #[test]
 fn a_sandboxed_command_sees_neither_herdrs_variables_nor_its_socket() {
-    marv_guards::require_bwrap!();
+    marv_guards::require_sandbox!();
     let (home, root) = (TempDir::outside_tmp("herdr-home"), TempDir::new("herdr-sbx"));
     let socket = home.path().join(".config/herdr/herdr.sock");
     std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
     let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
     let sandbox = marv_guards::sandbox_with_home(home.path());
     let sock = socket.to_string_lossy().to_string();
+    // Given to the sandbox program itself: bwrap clears them from the command's environment. `sandbox-exec` passes its
+    // environment on, so on macOS what keeps them out is that Marv never gives them to it (the spawn has the plan's
+    // environment only; `seatbelt.rs`'s `the_command_gets_only_the_plans_environment`).
+    let herdr_env = [("HERDR_ENV", "1"), ("HERDR_SOCKET_PATH", sock.as_str()), ("HERDR_PANE_ID", "w1:p1")];
+    let env: &[(&str, &str)] = if cfg!(target_os = "macos") { &[] } else { &herdr_env };
     let ran = marv_guards::run_sandboxed(
         &sandbox,
         root.path(),
         &Default::default(),
         &format!("env | grep -c '^HERDR_' ; if [ -e '{sock}' ]; then echo socket-visible; else echo socket-hidden; fi"),
-        &[("HERDR_ENV", "1"), ("HERDR_SOCKET_PATH", sock.as_str()), ("HERDR_PANE_ID", "w1:p1")],
+        env,
     );
     assert!(ran.output.starts_with("0\n"), "{}", ran.output);
     assert!(ran.output.contains("socket-hidden"), "{}", ran.output);

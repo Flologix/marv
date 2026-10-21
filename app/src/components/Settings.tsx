@@ -5,12 +5,14 @@ export function Settings({
   settings,
   models,
   hasKey = true,
+  onSetupPlan,
   onChange,
   onClose,
 }: {
   settings: ChatSettings;
   models: Model[];
   hasKey?: boolean;
+  onSetupPlan?: () => void;
   onChange: (s: ChatSettings) => void;
   onClose: () => void;
 }) {
@@ -22,6 +24,7 @@ export function Settings({
           model={settings.model}
           remote={models.filter((m) => !m.local)}
           hasKey={hasKey}
+          onSetupPlan={onSetupPlan}
           onPick={(model) => model !== settings.model && onChange({ ...settings, model })}
         />
       </div>

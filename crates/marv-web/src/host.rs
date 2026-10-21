@@ -26,7 +26,12 @@ pub struct ChatSpec {
     pub root: PathBuf,
     /// Marv's own files: saved sessions, checkpoints.
     pub config_dir: PathBuf,
+    /// The OpenRouter key.
     pub api_key: String,
+    /// #159: the Z.ai Coding Plan key, for `zai/…` models (the person's own machine only).
+    pub zai_api_key: Option<String>,
+    /// #159: the ChatGPT sign-in's token file, for `chatgpt/…` models (the person's own machine only).
+    pub chatgpt_auth: Option<PathBuf>,
     pub model: String,
     pub max_steps: u32,
     /// Sandboxed commands and edits below `root` run without asking.
@@ -62,23 +67,44 @@ const COMMANDS: &[(&str, &str)] = &[
     ("model", "Switch the model (/model <id>)"),
 ];
 
-/// A model id that starts with this runs on the local Ollama (`ollama/gemma4:12b`); any other is OpenRouter's.
+/// A model id that starts with this runs on the local Ollama (`ollama/gemma4:12b`); one with [`ZAI_PREFIX`] or
+/// [`CHATGPT_PREFIX`] on that plan (#159); any other is OpenRouter's.
 pub const OLLAMA_PREFIX: &str = "ollama/";
+/// #159: `zai/glm-5.3`: the Z.ai GLM Coding Plan, with its own key. (OpenRouter's Z.ai models are `z-ai/…`.)
+pub const ZAI_PREFIX: &str = "zai/";
+/// #159: `chatgpt/<slug>`: the person's ChatGPT plan, through their sign-in.
+pub const CHATGPT_PREFIX: &str = "chatgpt/";
 
 pub fn is_local(model: &str) -> bool {
     model.starts_with(OLLAMA_PREFIX)
 }
 
-fn openrouter(api_key: &str, model: &str) -> ProviderOption {
-    match model.strip_prefix(OLLAMA_PREFIX) {
+/// The provider a chat's model id names. Each gets only its own credential: a plan without one gets an empty key
+/// (its first request says what's missing), never another provider's.
+pub fn provider_option(spec: &ChatSpec, model: &str) -> ProviderOption {
+    if let Some(local) = model.strip_prefix(OLLAMA_PREFIX) {
         // Ollama on its default port, with the CLI's default context window (Ollama's own is far smaller).
-        Some(local) => ProviderOption::Ollama {
+        return ProviderOption::Ollama {
             model: local.to_string(),
             host: None,
             context_length: Some(marv_session::config::DEFAULT_CONTEXT_LENGTH),
-        },
-        None => ProviderOption::OpenRouter { api_key: api_key.to_string(), model: Some(model.to_string()), base_url: None },
+        };
     }
+    if let Some(plan) = model.strip_prefix(ZAI_PREFIX) {
+        let api_key = spec.zai_api_key.clone().unwrap_or_default();
+        return ProviderOption::Zai { api_key, model: Some(plan.to_string()), base_url: None };
+    }
+    if let Some(slug) = model.strip_prefix(CHATGPT_PREFIX) {
+        return match spec.chatgpt_auth.clone() {
+            Some(auth_file) => ProviderOption::ChatGpt { model: slug.to_string(), auth_file },
+            // Never an empty path (it would read a file in the working folder).
+            None => ProviderOption::Custom(std::sync::Arc::new(marv_provider::FailingProvider {
+                name: format!("chatgpt · {slug}"),
+                message: "Sign in with ChatGPT isn't available here.".into(),
+            })),
+        };
+    }
+    ProviderOption::OpenRouter { api_key: spec.api_key.clone(), model: Some(model.to_string()), base_url: None }
 }
 
 /// Why a chat in `root` has no runtime folder, when it's because `MARV_RUNTIME_DIR` was refused
@@ -202,7 +228,7 @@ pub async fn run_chat(spec: ChatSpec, mut incoming: UnboundedReceiver<ClientMess
                     }),
                     "model" if is_model_id(args) => {
                         let changes = Configure {
-                            provider: Some(ProviderChoice::Option(openrouter(&spec.api_key, args))),
+                            provider: Some(ProviderChoice::Option(provider_option(&spec, args))),
                             ..Configure::default()
                         };
                         match session.configure(changes) {
@@ -245,7 +271,7 @@ pub async fn run_chat(spec: ChatSpec, mut incoming: UnboundedReceiver<ClientMess
             ClientMessage::Configure { model, max_steps, yolo } => {
                 let model = model.filter(|m| is_model_id(m));
                 let changes = Configure {
-                    provider: model.as_deref().map(|m| ProviderChoice::Option(openrouter(&spec.api_key, m))),
+                    provider: model.as_deref().map(|m| ProviderChoice::Option(provider_option(&spec, m))),
                     max_steps: max_steps.map(|s| s.min(500)),
                     yolo,
                     ..Configure::default()
@@ -414,7 +440,7 @@ async fn open(
     mesh: Option<marv_session::mesh::MeshHandle>,
 ) -> Result<MarvSession, String> {
     let build = |resume: Option<ResumeTarget>| {
-        let mut builder = SessionBuilder::new(&spec.root, openrouter(&spec.api_key, &spec.model))
+        let mut builder = SessionBuilder::new(&spec.root, provider_option(spec, &spec.model))
             .approve(approver.clone())
             .max_steps(spec.max_steps)
             .yolo(spec.yolo)
@@ -470,6 +496,47 @@ async fn forward(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn spec() -> ChatSpec {
+        ChatSpec {
+            root: PathBuf::from("/tmp"),
+            config_dir: PathBuf::from("/tmp/.marv"),
+            api_key: "sk-or".into(),
+            zai_api_key: Some("zai-key".into()),
+            chatgpt_auth: Some(PathBuf::from("/tmp/.marv/chatgpt.json")),
+            model: String::new(),
+            max_steps: 0,
+            yolo: false,
+            resume: None,
+            processes: false,
+            sources: Vec::new(),
+            mesh: false,
+            mcp_off: Vec::new(),
+            manage_mcp: false,
+            host_commands: false,
+        }
+    }
+
+    /// #159: the model id's prefix picks the provider, and each gets only its own credential.
+    #[test]
+    fn the_prefix_picks_the_provider_and_its_own_credential() {
+        let s = spec();
+        assert!(matches!(provider_option(&s, "zai/glm-5.3"),
+            ProviderOption::Zai { ref api_key, ref model, .. } if api_key == "zai-key" && model.as_deref() == Some("glm-5.3")));
+        assert!(matches!(provider_option(&s, "chatgpt/gpt-6.1-sol"),
+            ProviderOption::ChatGpt { ref model, ref auth_file } if model == "gpt-6.1-sol" && auth_file.ends_with("chatgpt.json")));
+        assert!(
+            matches!(provider_option(&s, "z-ai/glm-5.3"),
+            ProviderOption::OpenRouter { ref api_key, .. } if api_key == "sk-or"),
+            "OpenRouter's z-ai/ models stay OpenRouter's"
+        );
+        assert!(matches!(provider_option(&s, "ollama/qwen3:14b"), ProviderOption::Ollama { .. }));
+        let none = ChatSpec { zai_api_key: None, ..spec() };
+        assert!(
+            matches!(provider_option(&none, "zai/glm-5.3"), ProviderOption::Zai { ref api_key, .. } if api_key.is_empty()),
+            "never the OpenRouter key"
+        );
+    }
 
     #[test]
     fn a_refused_runtime_dir_override_is_a_notice_that_says_why() {

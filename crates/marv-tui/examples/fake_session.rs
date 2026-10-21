@@ -367,6 +367,8 @@ impl SessionPort for Fake {
                     m("meta/llama-free", Some((0.0, 0.0)), false, false),
                 ],
                 ProviderId::Ollama => vec![m("qwen3.5:9b", None, true, true), m("tiny:1b", None, true, false)],
+                ProviderId::Zai => vec![m("glm-5.3", None, false, true)],
+                ProviderId::ChatGpt => vec![m("gpt-6.1-sol", None, false, true)],
             };
             let _ = tx.send(UiEvent::Models(Ok(models)));
         });
@@ -376,6 +378,8 @@ impl SessionPort for Fake {
         let label = match answer.provider {
             ProviderId::OpenRouter => "OpenRouter",
             ProviderId::Ollama => "Ollama",
+            ProviderId::Zai => "Z.ai",
+            ProviderId::ChatGpt => "ChatGPT",
         };
         self.system(&format!("Saved to ~/.marv/config.json · {label} · {}", answer.model));
         self.emit(UiEvent::StatusInfo(status(&format!("{}/{}", label.to_lowercase(), answer.model))));
@@ -414,6 +418,7 @@ fn setup_context(start: SetupStart) -> SetupContext {
                 key_env: Some("OPENROUTER_API_KEY".into()),
                 key_url: Some("openrouter.ai/settings/keys".into()),
                 default_model: "anthropic/claude-sonnet-5.5".into(),
+                sign_in: false,
             },
             ProviderPreset {
                 id: ProviderId::Ollama,
@@ -421,10 +426,12 @@ fn setup_context(start: SetupStart) -> SetupContext {
                 key_env: None,
                 key_url: None,
                 default_model: String::new(),
+                sign_in: false,
             },
         ],
         current: Some((ProviderId::Ollama, "qwen3.5:9b".into())),
-        saved_key: None,
+        saved_keys: vec![],
+        accounts: vec![],
         env_keys: vec![],
     }
 }

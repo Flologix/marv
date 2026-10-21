@@ -406,6 +406,8 @@ fn provider_id(kind: ProviderKind) -> ProviderId {
     match kind {
         ProviderKind::OpenRouter => ProviderId::OpenRouter,
         ProviderKind::Ollama => ProviderId::Ollama,
+        ProviderKind::Zai => ProviderId::Zai,
+        ProviderKind::ChatGpt => ProviderId::ChatGpt,
     }
 }
 
@@ -413,6 +415,8 @@ fn provider_kind(id: ProviderId) -> ProviderKind {
     match id {
         ProviderId::OpenRouter => ProviderKind::OpenRouter,
         ProviderId::Ollama => ProviderKind::Ollama,
+        ProviderId::Zai => ProviderKind::Zai,
+        ProviderId::ChatGpt => ProviderKind::ChatGpt,
     }
 }
 
@@ -429,12 +433,32 @@ fn model_info(m: marv_provider::ModelInfo) -> view::ModelInfo {
             marv_provider::ReasoningSupport::Optional => view::ReasoningMode::Optional,
             marv_provider::ReasoningSupport::Mandatory => view::ReasoningMode::Mandatory,
         }),
+        name: m.name,
     }
+}
+
+/// The providers setup offers: OpenRouter and Ollama, and (#159) the Z.ai Coding Plan and Sign in with ChatGPT when
+/// their switch is on (`marv_provider::offered`) or the config already uses them.
+fn offered_kinds(current: Option<ProviderKind>) -> Vec<ProviderKind> {
+    let plans = [
+        (ProviderKind::Zai, marv_provider::offered::ZAI_CODING_PLAN),
+        (ProviderKind::ChatGpt, marv_provider::offered::CHATGPT_SIGN_IN),
+    ];
+    let mut kinds = vec![ProviderKind::OpenRouter];
+    kinds.extend(plans.into_iter().filter(|&(kind, on)| on || current == Some(kind)).map(|(kind, _)| kind));
+    kinds.push(ProviderKind::Ollama);
+    kinds
+}
+
+/// #159: the ChatGPT sign-in's file: the config's (the provider reads that one).
+fn auth_store(config: &Config, config_dir: &Path) -> marv_provider::chatgpt::AuthStore {
+    let path = config.auth_file.clone().unwrap_or_else(|| config_dir.join(marv_provider::chatgpt::AUTH_FILE));
+    marv_provider::chatgpt::AuthStore { path }
 }
 
 /// What the setup screen starts from. Keys go to the UI masked.
 pub fn setup_context(start: SetupStart, file: Option<&FileConfig>, config: &Config, env: &Env) -> SetupContext {
-    let kinds = [ProviderKind::OpenRouter, ProviderKind::Ollama];
+    let kinds = offered_kinds(file.and_then(|f| f.provider));
     let presets = kinds
         .iter()
         .map(|&kind| {
@@ -445,6 +469,7 @@ pub fn setup_context(start: SetupStart, file: Option<&FileConfig>, config: &Conf
                 key_env: p.key_env.map(Into::into),
                 key_url: p.key_url.map(Into::into),
                 default_model: p.default_model.into(),
+                sign_in: kind == ProviderKind::ChatGpt,
             }
         })
         .collect();
@@ -459,7 +484,21 @@ pub fn setup_context(start: SetupStart, file: Option<&FileConfig>, config: &Conf
         start,
         presets,
         current: file.and_then(|f| f.provider).map(|kind| (provider_id(kind), config.model.clone())),
-        saved_key: file.and_then(|f| f.api_key.as_deref()).map(mask_key),
+        saved_keys: kinds.iter().filter_map(|&kind| Some((provider_id(kind), mask_key(file?.key_for(kind)?)))).collect(),
+        accounts: config
+            .auth_file
+            .clone()
+            .filter(|_| kinds.contains(&ProviderKind::ChatGpt))
+            .map(|path| marv_provider::chatgpt::AuthStore { path }.accounts())
+            .unwrap_or_default()
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, a)| {
+                let info =
+                    view::AccountInfo { id: a.client_id.clone()?, label: a.label(), signed_in: a.usable(), active: i == 0 };
+                Some((ProviderId::ChatGpt, info))
+            })
+            .collect(),
         env_keys,
     }
 }
@@ -475,7 +514,8 @@ pub fn setup_file(file: Option<&FileConfig>, answer: &SetupAnswer) -> FileConfig
     next.provider = Some(kind);
     next.model = Some(answer.model.clone());
     if let Some(key) = &answer.api_key {
-        next.api_key = Some(key.clone());
+        // #159: into the chosen provider's own field, never another's.
+        next.set_key(kind, key.clone());
     }
     next
 }
@@ -897,6 +937,8 @@ pub struct Bridge {
     /// Busy work outside a turn (/mcp add's lookup, /mcp search): Esc stops it.
     busy_work: Mutex<Option<CancellationToken>>,
     pending_login: Mutex<Option<PendingLogin>>,
+    /// #159: the ChatGPT sign-in setup is waiting for, until it ends or setup closes.
+    sign_in: Mutex<Option<CancellationToken>>,
     next_login: AtomicU64,
     /// Servers already said to need a login (at startup or since), so a mid-session expiry is told once.
     told_needs_login: Mutex<std::collections::HashSet<String>>,
@@ -1041,6 +1083,7 @@ impl Bridge {
             open_url: s.open_url,
             busy_work: Mutex::default(),
             pending_login: Mutex::default(),
+            sign_in: Mutex::default(),
             next_login: AtomicU64::new(0),
             told_needs_login: Mutex::default(),
             mesh_name: Mutex::default(),
@@ -2547,7 +2590,19 @@ impl SessionPort for Port {
         let file = b.file();
         let base_url = file.as_ref().filter(|f| f.provider == Some(kind)).and_then(|f| f.base_url.clone());
         let config = resolve_config(Some(&FileConfig { provider: Some(kind), base_url, ..FileConfig::default() }), &b.env);
-        let models = (b.load_models)(kind, config.base_url);
+        let models = if kind == ProviderKind::ChatGpt {
+            // #159: the signed-in account's models, with its token.
+            let store = auth_store(&config, &b.config_dir);
+            Box::pin(async move {
+                marv_provider::chatgpt::list_models(&marv_provider::chatgpt::ChatGptCredentials {
+                    store,
+                    endpoints: Default::default(),
+                })
+                .await
+            })
+        } else {
+            (b.load_models)(kind, config.base_url)
+        };
         let tx = b.activity.tx.clone();
         tokio::spawn(async move {
             let result = models.await.map(|list| list.into_iter().map(model_info).collect());
@@ -2560,6 +2615,65 @@ impl SessionPort for Port {
         let next = setup_file(b.file().as_ref(), &answer);
         let label = preset(provider_kind(answer.provider)).label;
         b.save_config(next, format!("Saved to {} · {label} · {}", shorten_home(&b.store.path, &b.home), answer.model));
+    }
+
+    fn sign_in(&self, _provider: ProviderId, target: view::SignInTarget) {
+        let b = self.0.clone();
+        let cancel = CancellationToken::new();
+        if let Some(old) = b.sign_in.lock().unwrap_or_else(|e| e.into_inner()).replace(cancel.clone()) {
+            old.cancel();
+        }
+        let store = auth_store(&b.config(), &b.config_dir);
+        tokio::spawn(async move {
+            let target = match target {
+                view::SignInTarget::Current => marv_provider::chatgpt::SignInTarget::Current,
+                view::SignInTarget::Account(id) => marv_provider::chatgpt::SignInTarget::Account(id),
+                view::SignInTarget::New => marv_provider::chatgpt::SignInTarget::New,
+            };
+            let done = match marv_provider::chatgpt::start_sign_in(store, Default::default(), target).await {
+                Ok(sign_in) => {
+                    // Shown without the id_token_hint (a token); the browser gets the whole address.
+                    b.emit(UiEvent::SignIn(view::SignInProgress::Started { url: sign_in.shown_url().to_string() }));
+                    if let Ok(url) = sign_in.url().parse() {
+                        (b.open_url)(url);
+                    }
+                    sign_in.finish(cancel).await.map(|a| a.email.unwrap_or_else(|| "your ChatGPT account".into()))
+                }
+                Err(why) => Err(why),
+            };
+            b.emit(UiEvent::SignIn(view::SignInProgress::Done(done)));
+        });
+    }
+
+    fn use_account(&self, _provider: ProviderId, id: String) {
+        let b = self.0.clone();
+        let store = auth_store(&b.config(), &b.config_dir);
+        tokio::spawn(async move {
+            let done = store.activate(&id).await.map(|a| a.label());
+            b.emit(UiEvent::SignIn(view::SignInProgress::Done(done)));
+        });
+    }
+
+    fn cancel_sign_in(&self) {
+        if let Some(cancel) = self.0.sign_in.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            cancel.cancel();
+        }
+    }
+
+    fn sign_out(&self, _provider: ProviderId) {
+        let b = self.0.clone();
+        let store = auth_store(&b.config(), &b.config_dir);
+        tokio::spawn(async move {
+            let text = match marv_provider::chatgpt::sign_out(&store, &Default::default()).await {
+                Ok(true) => "Signed out of ChatGPT.".to_string(),
+                Ok(false) => {
+                    "Signed out of ChatGPT here; OpenAI didn't confirm it, so you can also disconnect Marv in ChatGPT's settings."
+                        .into()
+                }
+                Err(why) => format!("Couldn't sign out of ChatGPT: {why}"),
+            };
+            b.emit(system(text, false));
+        });
     }
 
     fn resume(&self, id: Option<String>) {
@@ -3919,9 +4033,36 @@ mod tests {
 
         let env = Env::from([("OPENROUTER_API_KEY".to_string(), "sk-or-v1-fromtheenvironment".to_string())]);
         let ctx = setup_context(SetupStart::Reconfigure, Some(&file), &resolve_config(Some(&file), &env), &env);
-        assert_eq!(ctx.saved_key.as_deref(), Some("sk-or-v1-0…cdef"));
+        assert_eq!(ctx.saved_keys, vec![(ProviderId::OpenRouter, "sk-or-v1-0…cdef".to_string())]);
         assert_eq!(ctx.env_keys, [(ProviderId::OpenRouter, "sk-or-v1-f…ment".to_string())]);
         assert!(!format!("{ctx:?}").contains("fromtheenvironment"), "keys reach the UI masked");
+    }
+
+    /// #159: the plans are offered only when their switch is on (both off until the vendors clear Marv), or when the
+    /// config already uses one; a plan's key goes to its own field.
+    #[test]
+    fn setup_offers_the_plans_behind_their_switches_and_keeps_keys_apart() {
+        let ids = |file: Option<&FileConfig>| {
+            let env = Env::new();
+            let ctx = setup_context(SetupStart::Reconfigure, file, &resolve_config(file, &env), &env);
+            ctx.presets.iter().map(|p| p.id).collect::<Vec<_>>()
+        };
+        let mut expected = vec![ProviderId::OpenRouter];
+        if marv_provider::offered::ZAI_CODING_PLAN {
+            expected.push(ProviderId::Zai);
+        }
+        if marv_provider::offered::CHATGPT_SIGN_IN {
+            expected.push(ProviderId::ChatGpt);
+        }
+        expected.push(ProviderId::Ollama);
+        assert_eq!(ids(None), expected);
+        let zai = FileConfig { provider: Some(ProviderKind::Zai), ..FileConfig::default() };
+        assert!(ids(Some(&zai)).contains(&ProviderId::Zai), "a config that uses it keeps it in setup");
+
+        let file = FileConfig { api_key: Some("sk-or-keep".into()), ..FileConfig::default() };
+        let answer = SetupAnswer { provider: ProviderId::Zai, model: "glm-5.3".into(), api_key: Some("zai-new".into()) };
+        let next = setup_file(Some(&file), &answer);
+        assert_eq!((next.api_key.as_deref(), next.zai_api_key.as_deref()), (Some("sk-or-keep"), Some("zai-new")));
     }
 
     #[test]

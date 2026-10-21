@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use crate::SandboxError;
 use crate::backend::SandboxBackend;
 use crate::fs::{EntryKind, FsProbe};
-use crate::home::{CREDENTIALS, TOOLCHAINS, contains, credential_masks};
+use crate::home::{CREDENTIALS, HOME_MASKS, TOOLCHAINS, contains, credential_masks};
 
 /// The environment variable that tells a sandboxed command where its mesh plug is (`docs/MESH.md`): bubblewrap shows
 /// the plug at [`crate::bwrap::MESH_SOCKET`], Seatbelt can't move it from its host path. Set only when plugged.
@@ -137,6 +137,17 @@ impl Plan {
         self.project_read_only || self.home_project(fs)
     }
 
+    /// In a home-folder project, [`HOME_MASKS`] under the home's real path: the entries kept hidden even where a
+    /// toolchain would show them again (bwrap masks each that exists; Seatbelt denies each, there or not). Nothing
+    /// otherwise: the whole home is hidden then.
+    pub fn home_masks(&self, fs: &dyn FsProbe) -> Vec<PathBuf> {
+        if !self.home_project(fs) {
+            return Vec::new();
+        }
+        let home = self.real_home(fs);
+        HOME_MASKS.iter().map(|name| home.join(name)).collect()
+    }
+
     /// The [`TOOLCHAINS`] that exist under the home, as paths under the home (not resolved): shown again, read-only.
     pub fn toolchains(&self, fs: &dyn FsProbe) -> Vec<PathBuf> {
         TOOLCHAINS.iter().map(|dir| self.home.join(dir)).filter(|full| fs.exists(full)).collect()
@@ -204,7 +215,8 @@ impl Plan {
 
     /// The command's whole environment, nothing inherited (no API keys): `PATH`, `HOME`, `LANG`, `TERM=dumb`, `TMPDIR`
     /// (`tmp`, the backend's private temporary folder), a throwaway `BUN_INSTALL_CACHE_DIR` in it, and
-    /// [`MESH_SOCKET_ENV`] where `backend` shows the plug, when there is one. `bun install` needs a writable cache; not
+    /// [`MESH_SOCKET_ENV`] where `backend` shows the plug, when there is one, then the backend's own
+    /// ([`SandboxBackend::extra_env`]). `bun install` needs a writable cache; not
     /// the user's, nor any cache that outlives the command: a shared one would let one sandboxed command (an install's
     /// lifecycle scripts) plant packages for another context.
     pub fn env(&self, tmp: &str, backend: &dyn SandboxBackend) -> Vec<(String, String)> {
@@ -223,6 +235,8 @@ impl Plan {
         if let Some(plug) = self.mesh_bind() {
             env.push((MESH_SOCKET_ENV.into(), backend.guest_path(&plug).to_string_lossy().into_owned()));
         }
+        // What this backend needs on top (Seatbelt: caches in the private TMPDIR, as the home can't be written).
+        env.extend(backend.extra_env(tmp));
         env
     }
 }

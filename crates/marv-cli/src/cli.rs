@@ -16,7 +16,7 @@
 //! - `--version`/`-v` and `--help`/`-h` exit 0, as in Marv.
 //! - `__html-convert` is hidden: the web reader re-executes `marv __html-convert` to convert a page in a process of
 //!   its own (a conversion that crashes is an answer, not a crash).
-//! - `__guard <parent-pid> -- <command…>` is hidden: Seatbelt's process supervisor (#165, `crate::guard`).
+//! - `__guard <parent-pid> -- <command…>` is hidden: Seatbelt's process supervisor (#165, `marv_tools::guard`).
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 
@@ -28,6 +28,7 @@ pub const AFTER_HELP: &str = "Config:
   ~/.marv/mcp.json      your MCP servers (a project's go in .mcp.json; /mcp)
   ~/.marv/worktrees/    subagents' worktrees while they run
   OPENROUTER_API_KEY    overrides the saved OpenRouter key
+  ZAI_API_KEY           overrides the saved Z.ai Coding Plan key
   OLLAMA_HOST           where Ollama runs (default localhost:11434)
   MARV_MODEL            overrides the saved model
   MARV_MAX_STEPS        overrides the saved step limit (0 or off: never ask)
@@ -122,7 +123,7 @@ pub enum Command {
     #[command(name = "__relay", hide = true)]
     Relay { spec: String },
     /// Runs a command in a session of its own and kills its process group when `parent` dies (#165): `guard`.
-    #[command(name = "__guard", hide = true)]
+    #[command(name = marv_sandbox::seatbelt_backend::GUARD_SUBCOMMAND, hide = true)]
     Guard {
         parent: u32,
         #[arg(last = true, required = true)]

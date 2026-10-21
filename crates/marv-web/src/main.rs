@@ -134,6 +134,9 @@ async fn chat(app: Arc<App>, socket: WebSocket) {
             root,
             config_dir: app.data.join("marv"),
             api_key: app.api_key.clone(),
+            // A server for others: no one's plan.
+            zai_api_key: None,
+            chatgpt_auth: None,
             model,
             max_steps: max_steps.unwrap_or(50).min(500),
             yolo: yolo.unwrap_or(true),

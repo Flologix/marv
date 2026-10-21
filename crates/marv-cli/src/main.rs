@@ -7,7 +7,7 @@
 //! - `__run-checks <spec>` (hidden): the project checks' runner, inside the sandbox (`marv_session::checks::runner`);
 //! - `__relay <spec>` (hidden): the process door's relay, inside a sandbox (`marv_tools::relay`, Marv #51);
 //! - `__guard <parent-pid> -- <command…>` (hidden): runs a sandboxed command in a session of its own and kills its
-//!   process group when Marv dies, for a backend without a PID namespace ([`guard`], #165).
+//!   process group when Marv dies, for a backend without a PID namespace (`marv_tools::guard`, #165).
 //!
 //! The hidden ones run before the Tokio runtime starts: they're processes of their own.
 //!
@@ -16,7 +16,6 @@
 //! (`marv_session::processes::kill_running`); if Marv is killed harder, bwrap's `--die-with-parent` takes them.
 
 mod cli;
-mod guard;
 mod headless;
 mod mesh_cmd;
 mod tui;
@@ -58,7 +57,7 @@ fn main() -> ExitCode {
         return marv_tools::relay::main(spec);
     }
     if let Mode::Guard { parent, command } = &mode {
-        return guard::main(*parent, command);
+        return marv_tools::guard::main(*parent, command);
     }
     let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(rt) => rt,
