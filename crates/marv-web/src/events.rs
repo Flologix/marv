@@ -3,7 +3,7 @@
 
 use marv_agent::agent::LoopEvent;
 use marv_core::printable;
-use marv_session::{CompactResult, SessionEvent, TurnStatus};
+use marv_session::{SessionEvent, TurnStatus};
 use marv_tools::types::DiffShown;
 use serde_json::{Value, json};
 
@@ -40,12 +40,7 @@ pub fn to_json(event: &SessionEvent) -> Option<Value> {
             TurnStatus::Checkpointing => "checkpointing",
             TurnStatus::Running => "running",
         }})),
-        SessionEvent::Compaction(result) => Some(match result {
-            CompactResult::Compacted { .. } => json!({"type": "compaction", "compacted": true}),
-            CompactResult::NotCompacted { reason, error } => {
-                json!({"type": "compaction", "compacted": false, "reason": reason.as_str(), "error": error})
-            }
-        }),
+        SessionEvent::Compaction(result) => Some(marv_session::compaction_json(result)),
         SessionEvent::Tainted { source } => Some(json!({"type": "tainted", "source": source})),
         SessionEvent::CheckpointFailed { message } => Some(json!({"type": "notice", "text": message})),
         SessionEvent::TurnEnd { reason, .. } => Some(json!({"type": "turn_end", "reason": reason.as_str()})),

@@ -243,8 +243,10 @@ fn view_plan(items: &[marv_tools::PlanItem]) -> Vec<view::PlanItem> {
 
 fn compact_outcome(result: CompactResult) -> view::CompactOutcome {
     match result {
-        CompactResult::Compacted { summary, tokens_before } => view::CompactOutcome::Compacted { summary, tokens_before },
-        CompactResult::NotCompacted { reason, error } => view::CompactOutcome::NotCompacted {
+        CompactResult::Compacted { summary, tokens_before, trigger } => {
+            view::CompactOutcome::Compacted { summary, tokens_before, overflow: trigger.level() }
+        }
+        CompactResult::NotCompacted { reason, error, .. } => view::CompactOutcome::NotCompacted {
             reason: match reason {
                 CompactFailure::Empty => "empty",
                 CompactFailure::Stopped => "stopped",
@@ -1015,6 +1017,7 @@ impl Bridge {
             (config.sandbox, config.yolo, config.diagnostics, config.checks, config.mcp_tools);
         init.formatter = config.formatter;
         init.compact_tokens = config.compact_tokens;
+        (init.compaction, init.compact_tail_tokens) = (config.compaction, config.compact_tail_tokens);
         // #98: the config's "approve" and this run's --approve seed the session's "always" scopes; the writable
         // folders are resolved and checked already (refused ones are in approval_problems, not here).
         init.pre_approved = s.pre_approved.clone();

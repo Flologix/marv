@@ -39,7 +39,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use futures::{FutureExt, Stream, StreamExt};
-use marv_agent::compact::{MID_TURN_NOTE, SummarizeOptions, compacted_history};
+use marv_agent::compact::{MID_TURN_NOTE, SummarizeOptions};
 use marv_agent::{AgentOptions, LimitAnswer, LoopEvent};
 use marv_core::{ChatTurn, Provenance, StopReason, ToolCall, ToolSpec, Usage};
 use marv_mcp::deferred::{
@@ -176,10 +176,63 @@ pub(crate) fn may_compact_again(failures: u32, failed_at: Option<u64>, now: Opti
     }
 }
 
+/// What started a compaction (#63): the context nearly full, `/compact`, or a request too long for the window
+/// (`level`: how far the recovery went, 0–3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactTrigger {
+    Auto,
+    Manual,
+    Overflow { level: u32 },
+}
+
+impl CompactTrigger {
+    /// The name clients and the trajectory use: "auto", "manual" or "overflow".
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Manual => "manual",
+            Self::Overflow { .. } => "overflow",
+        }
+    }
+
+    /// The recovery level of an overflow, else `None`.
+    pub fn level(self) -> Option<u32> {
+        match self {
+            Self::Overflow { level } => Some(level),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum CompactResult {
-    Compacted { summary: String, tokens_before: Option<u64> },
-    NotCompacted { reason: CompactFailure, error: String },
+    Compacted { summary: String, tokens_before: Option<u64>, trigger: CompactTrigger },
+    NotCompacted { reason: CompactFailure, error: String, trigger: CompactTrigger },
+}
+
+impl CompactResult {
+    pub fn trigger(&self) -> CompactTrigger {
+        match self {
+            Self::Compacted { trigger, .. } | Self::NotCompacted { trigger, .. } => *trigger,
+        }
+    }
+}
+
+/// The `compaction` event as stream-json and the web client send it: `compacted`, #144's `reason` and `error` for a
+/// failed one, and #63's `trigger` (with `level` for an overflow).
+pub fn compaction_json(result: &CompactResult) -> serde_json::Value {
+    let mut event = match result {
+        CompactResult::Compacted { .. } => serde_json::json!({"type": "compaction", "compacted": true}),
+        CompactResult::NotCompacted { reason, error, .. } => {
+            serde_json::json!({"type": "compaction", "compacted": false, "reason": reason.as_str(), "error": error})
+        }
+    };
+    let trigger = result.trigger();
+    event["trigger"] = trigger.as_str().into();
+    if let Some(level) = trigger.level() {
+        event["level"] = level.into();
+    }
+    event
 }
 
 /// What a turn yields: the UI-facing event type the TUI and headless consume.
@@ -305,6 +358,10 @@ pub struct SessionInit {
     /// `compactTokens` (#140): compact once the context passes this many tokens, or at 85% of the window if that comes
     /// first. Default [`crate::config::DEFAULT_COMPACT_TOKENS`]; `None`: only the window rule.
     pub compact_tokens: Option<u64>,
+    /// `compaction` (#63, temporary for the A/B): v1 (default) or v2 (the template, the verbatim tail, rolling updates).
+    pub compaction: marv_agent::compact::Version,
+    /// `compactTailTokens` (#63): the v2 verbatim tail's budget; `None`: `min(15k, 15% of the threshold)`; 0: no tail.
+    pub compact_tail_tokens: Option<u64>,
     /// The formatter the edit tools run after a change (#67). Default on (detect from the project's config).
     pub formatter: FormatterSetting,
     /// Snapshot the project before each turn's first change and after the turn (git commits under a hidden ref, #16),
@@ -407,6 +464,8 @@ impl SessionInit {
             diagnostics: true,
             checks: true,
             compact_tokens: Some(crate::config::DEFAULT_COMPACT_TOKENS),
+            compaction: marv_agent::compact::Version::V1,
+            compact_tail_tokens: None,
             formatter: FormatterSetting::Auto,
             checkpoints: true,
             checkpoints_dir: None,
@@ -593,6 +652,12 @@ struct State {
     /// (#144, [`may_compact_again`]): each is another paid request.
     compact_failures: u32,
     compact_failed_at: Option<u64>,
+    /// #63: the overflow recovery level that last succeeded in this step (the next starts below it), and whether that
+    /// was the whole-window last attempt. Reset by an overflow's first attempt.
+    overflow_level: Option<u32>,
+    overflow_last_attempt: bool,
+    /// Where each of this conversation's tool results came from (by call id), for its saved pages; cleared with it.
+    provenance: HashMap<String, Provenance>,
     current: Option<CancellationToken>,
     running: bool,
     closed: bool,
@@ -603,6 +668,8 @@ struct State {
     diagnostics: bool,
     checks: bool,
     compact_tokens: Option<u64>,
+    compaction: marv_agent::compact::Version,
+    compact_tail_tokens: Option<u64>,
     formatter: FormatterSetting,
     max_steps: Option<u32>,
     logging: bool,
@@ -1013,6 +1080,9 @@ impl MarvSession {
             last: None,
             compact_failures: 0,
             compact_failed_at: None,
+            overflow_level: None,
+            overflow_last_attempt: false,
+            provenance: HashMap::new(),
             current: None,
             running: false,
             closed: false,
@@ -1023,6 +1093,8 @@ impl MarvSession {
             diagnostics: init.diagnostics,
             checks: init.checks,
             compact_tokens: init.compact_tokens,
+            compaction: init.compaction,
+            compact_tail_tokens: init.compact_tail_tokens,
             formatter: init.formatter.clone(),
             max_steps: init.max_steps,
             logging: init.log_trajectories,
@@ -1545,9 +1617,7 @@ impl MarvSession {
 
         // Nearly out of context: summarize first, so this message (and what follows) fits.
         if self.try_compact() {
-            emit(SessionEvent::Status(TurnStatus::Compacting));
-            let result = self.compact_if_full(&provider, factory.as_ref(), info.as_ref(), stop, false).await;
-            emit(SessionEvent::Compaction(result.clone()));
+            let result = self.compact_if_full(&provider, factory.as_ref(), info.as_ref(), stop, false, emit).await;
             if matches!(result, CompactResult::NotCompacted { reason: CompactFailure::Stopped, .. }) {
                 // Stopping meant "stop": the message too (it would run on the nearly full context).
                 if let Some(main) = lock(main).as_mut() {
@@ -1814,9 +1884,7 @@ impl MarvSession {
                     if !session.try_compact() {
                         return false;
                     }
-                    emit(SessionEvent::Status(TurnStatus::Compacting));
-                    let result = session.compact_if_full(&provider, factory.as_ref(), info.as_ref(), &stop, true).await;
-                    emit(SessionEvent::Compaction(result.clone()));
+                    let result = session.compact_if_full(&provider, factory.as_ref(), info.as_ref(), &stop, true, &emit).await;
                     match result {
                         CompactResult::Compacted { .. } => true,
                         // Esc during the summary meant "stop the turn", not "keep going on the old context".
@@ -1826,6 +1894,23 @@ impl MarvSession {
                         }
                         CompactResult::NotCompacted { .. } => false,
                     }
+                })
+            })
+        });
+        // #63: a request too long for the window: make it fit (a summary of a cut-down history, or dropping the oldest
+        // turns) and retry the step, instead of ending the turn with the provider's error.
+        options.on_overflow = Some({
+            let (session, provider, factory, info, stop, emit) =
+                (self.clone(), provider.clone(), factory.clone(), info.clone(), stop.clone(), emit.clone());
+            Arc::new(move |error: String, attempt: u32| {
+                let (session, provider, factory, info, stop, emit) =
+                    (session.clone(), provider.clone(), factory.clone(), info.clone(), stop.clone(), emit.clone());
+                Box::pin(async move {
+                    emit(SessionEvent::Status(TurnStatus::Compacting));
+                    let (outcome, result) =
+                        session.recover_overflow(&error, attempt, true, &provider, factory.as_ref(), info.as_ref(), &stop).await;
+                    emit(SessionEvent::Compaction(result));
+                    outcome
                 })
             })
         });
@@ -1892,6 +1977,8 @@ impl MarvSession {
                     lock(subs).insert(call.id.clone(), recorder(&record, turn, &subagent));
                 }
                 LoopEvent::ToolEnd { call, run } => {
+                    // Where the result came from, for its saved page (#63) if a compaction pages it out.
+                    self.state().provenance.insert(call.id.clone(), run.provenance);
                     if run.declined {
                         self.state().radio_turn.declined = Some(call.name.clone());
                     }
@@ -2030,7 +2117,7 @@ impl MarvSession {
         };
         // Freed however it ends, a caller dropping the future included.
         let _free = Free { session: self, done };
-        Ok(self.summarize_into(focus, &stop, &provider, factory.as_ref(), info.as_ref()).await)
+        Ok(self.summarize_into(focus, &stop, &provider, factory.as_ref(), info.as_ref(), CompactTrigger::Manual).await)
     }
 
     /// The user's likely next message (`marv_agent::suggest`), for the TUI's empty prompt; `None` when there's nothing
@@ -2079,9 +2166,11 @@ impl MarvSession {
     }
 
     /// When the context is nearly full, summarizes the conversation and continues from the summary, right where the
-    /// turn is (also between steps: a long turn can fill the window by itself). Emits nothing: the caller emits the
-    /// status and the compaction event around it, so the client shows one notice per compaction. `mid_turn`: between
-    /// two steps (not before a user message), so the summary needs a "continue" note after it.
+    /// turn is (also between steps: a long turn can fill the window by itself). Emits the status and the compaction
+    /// event around it, so the client shows one notice per compaction. `mid_turn`: between two steps (not before a
+    /// user message), so the summary needs a "continue" note after it. #63: an ordinary summary that overflowed the
+    /// window counts its failure, then goes on to the overflow recovery's level 0.
+    #[allow(clippy::too_many_arguments)]
     async fn compact_if_full(
         &self,
         provider: &Arc<dyn Provider>,
@@ -2089,41 +2178,115 @@ impl MarvSession {
         info: Option<&ModelInfo>,
         stop: &CancellationToken,
         mid_turn: bool,
+        emit: &Emit,
     ) -> CompactResult {
         if !self.try_compact() {
-            return CompactResult::NotCompacted { reason: CompactFailure::Empty, error: "The context isn't nearly full.".into() };
+            return CompactResult::NotCompacted {
+                reason: CompactFailure::Empty,
+                error: "The context isn't nearly full.".into(),
+                trigger: CompactTrigger::Auto,
+            };
         }
+        emit(SessionEvent::Status(TurnStatus::Compacting));
         let size = self.state().last.map(|l| l.prompt_tokens + l.completion_tokens);
-        let result = self.summarize_into(None, stop, provider, factory, info).await;
-        match &result {
-            CompactResult::Compacted { .. } if mid_turn => {
-                // The compacted history ends with the model's own "Got it", so mid-turn the next request needs an
-                // instruction to go on: it follows the summary here, before the loop's next request. Before a user
-                // message, that message is the instruction.
-                let specs = self.state().turn_mcp_specs.clone();
-                let text = match self.announce(&specs) {
-                    Some(note) => format!("{MID_TURN_NOTE}\n\n{note}"),
-                    None => MID_TURN_NOTE.to_string(),
-                };
-                let history = self.state().conversation.clone();
-                lock(&history).push(ChatTurn::User { text });
+        let result = self.summarize_into(None, stop, provider, factory, info, CompactTrigger::Auto).await;
+        let result = match result {
+            CompactResult::Compacted { .. } => {
+                if mid_turn {
+                    self.push_mid_turn_note();
+                }
+                result
             }
-            CompactResult::Compacted { .. } => {}
             // A summary that failed isn't tried again right away: the next step would ask for the same expensive
             // summary that just failed. Marv waited for the next turn (a new user message); marv-rs #144 also tries
             // again within the turn once the context has grown (`may_compact_again`), since `marv -p` has only one.
-            CompactResult::NotCompacted { .. } => {
-                let mut s = self.state();
-                s.compact_failures += 1;
-                s.compact_failed_at = size;
+            CompactResult::NotCompacted { reason, ref error, .. } => {
+                {
+                    let mut s = self.state();
+                    s.compact_failures += 1;
+                    s.compact_failed_at = size;
+                }
+                if reason == CompactFailure::Failed && marv_provider::errors::is_context_overflow(error) {
+                    let error = error.clone();
+                    self.recover_overflow(&error, 0, mid_turn, provider, factory, info, stop).await.1
+                } else {
+                    result
+                }
             }
-        }
+        };
+        emit(SessionEvent::Compaction(result.clone()));
         result
+    }
+
+    /// The compacted history ends with the model's own "Got it" (or the tail), so mid-turn the next request needs an
+    /// instruction to go on: it follows the summary, before the loop's next request. Before a user message, that
+    /// message is the instruction.
+    fn push_mid_turn_note(&self) {
+        let specs = self.state().turn_mcp_specs.clone();
+        let text = match self.announce(&specs) {
+            Some(note) => format!("{MID_TURN_NOTE}\n\n{note}"),
+            None => MID_TURN_NOTE.to_string(),
+        };
+        let history = self.state().conversation.clone();
+        lock(&history).push(ChatTurn::User { text });
+    }
+
+    /// The compaction threshold (tokens): `nearly_full`'s `min(85% × window, compactTokens)`; `None` when neither is
+    /// known.
+    fn threshold(&self) -> Option<u64> {
+        let window = self.context_length().filter(|c| *c > 0).map(|c| (c as f64 * marv_agent::compact::COMPACT_AT) as u64);
+        let budget = self.state().compact_tokens;
+        match (window, budget) {
+            (Some(w), Some(b)) => Some(w.min(b)),
+            (w, b) => w.or(b),
+        }
+    }
+
+    /// #63: the v2 verbatim tail's budget (`compactTailTokens`, or `min(15k, 15% of the threshold)`); 0 under v1.
+    fn tail_tokens(&self) -> u64 {
+        let (version, set) = {
+            let s = self.state();
+            (s.compaction, s.compact_tail_tokens)
+        };
+        match version {
+            marv_agent::compact::Version::V1 => 0,
+            marv_agent::compact::Version::V2 => set.unwrap_or_else(|| marv_agent::compact::default_tail_tokens(self.threshold())),
+        }
+    }
+
+    /// #63: how many turns at the start of `history` are the last summary and its acknowledgement (kept by overflow
+    /// recovery). Only when the session holds a summary (never guessed from a message's text alone).
+    fn summary_head(&self, history: &[ChatTurn]) -> usize {
+        use marv_agent::compact::{COMPACTED_ACK, COMPACTED_PREFIX};
+        if self.state().saved.summary.is_none() {
+            return 0;
+        }
+        match history {
+            [ChatTurn::User { text }, ChatTurn::Assistant { text: ack, tool_calls, .. }, ..]
+                if text.starts_with(COMPACTED_PREFIX) && ack == COMPACTED_ACK && tool_calls.is_empty() =>
+            {
+                2
+            }
+            [ChatTurn::User { text }, ..] if text.starts_with(COMPACTED_PREFIX) => 1,
+            _ => 0,
+        }
+    }
+
+    /// #63: what the next summary asks for: v1's, or v2's template, rolling when the session holds a summary.
+    fn summary_kind(&self) -> marv_agent::compact::SummaryKind {
+        use marv_agent::compact::{SummaryKind, Version};
+        let s = self.state();
+        match (s.compaction, &s.saved.summary) {
+            (Version::V1, _) => SummaryKind::V1,
+            (Version::V2, Some(_)) => SummaryKind::Rolling,
+            (Version::V2, None) => SummaryKind::Full,
+        }
     }
 
     /// Summarizes the conversation and continues from the summary (`marv_agent::compact`). Only what the model sees
     /// changes. The provider, factory and info are the caller's (a turn's `info` can be `None`, and a default would
-    /// swap in the current one).
+    /// swap in the current one). #63 v2: the newest turns stay verbatim after the summary, and the template is nudged
+    /// for once.
     async fn summarize_into(
         &self,
         focus: Option<&str>,
@@ -2131,25 +2294,57 @@ impl MarvSession {
         provider: &Arc<dyn Provider>,
         factory: &dyn ProviderFactory,
         info: Option<&ModelInfo>,
+        trigger: CompactTrigger,
     ) -> CompactResult {
-        let (conversation, system, before) = {
-            let s = self.state();
-            (s.conversation.clone(), s.system.clone(), s.last)
-        };
-        let history = lock(&conversation).clone();
+        let history = lock(&self.state().conversation.clone()).clone();
+        let empty =
+            || CompactResult::NotCompacted { reason: CompactFailure::Empty, error: "Nothing to compact yet.".into(), trigger };
         if history.is_empty() {
-            return CompactResult::NotCompacted { reason: CompactFailure::Empty, error: "Nothing to compact yet.".into() };
+            return empty();
         }
+        let tail = self.tail_tokens();
+        // v2: a history that fits in the tail has nothing worth compacting (`tail_start` case 1).
+        if tail > 0 && marv_agent::compact::tail_start(&history, tail) == 0 {
+            return empty();
+        }
+        let v2 = self.state().compaction == marv_agent::compact::Version::V2;
+        self.summarize_level(&history, &history, tail, v2, focus, trigger, stop, provider, factory, info).await
+    }
+
+    /// One summary: asked over `request` (the history, or overflow recovery's cut-down copy of it), then installed in
+    /// place of `history` with the newest `tail` tokens of it kept verbatim (v2). Failures keep the history and are
+    /// logged (`compact_failed`, #144).
+    #[allow(clippy::too_many_arguments)]
+    async fn summarize_level(
+        &self,
+        history: &[ChatTurn],
+        request: &[ChatTurn],
+        tail: u64,
+        nudge: bool,
+        focus: Option<&str>,
+        trigger: CompactTrigger,
+        stop: &CancellationToken,
+        provider: &Arc<dyn Provider>,
+        factory: &dyn ProviderFactory,
+        info: Option<&ModelInfo>,
+    ) -> CompactResult {
+        let (system, before) = {
+            let s = self.state();
+            (s.system.clone(), s.last)
+        };
+        let kind = self.summary_kind();
         let tools = self.offered().0;
         let on_usage = |usage: Usage| self.count(&usage, factory, info);
         let result = marv_agent::compact::summarize(SummarizeOptions {
             provider: provider.as_ref(),
-            history: &history,
+            history: request,
             system: &system,
             tools: &tools,
             cancel: stop.clone(),
             focus,
             on_usage: Some(&on_usage),
+            kind,
+            nudge,
         })
         .await;
         let summary = match result {
@@ -2163,15 +2358,67 @@ impl MarvSession {
                         reason: reason.as_str(),
                         error: error.clone(),
                         tokens: before.map(|b| b.prompt_tokens + b.completion_tokens),
+                        trigger: trigger.as_str(),
+                        level: trigger.level(),
                     });
                 }
-                return CompactResult::NotCompacted { reason, error };
+                return CompactResult::NotCompacted { reason, error, trigger };
             }
         };
-        // In place: the loop holds this very history for the whole turn, so a compaction between its steps must
-        // rewrite it where it stands; replacing the Arc would leave the loop on the full history.
+        // The tail (v2): never the old summary's own turns, never starting at a tool result.
+        let keep = self.summary_head(history);
+        let start = match tail {
+            0 => history.len(),
+            tail => {
+                let start = marv_agent::compact::tail_start(history, tail).max(keep);
+                (start..history.len()).find(|&i| !matches!(history[i], ChatTurn::Tool { .. })).unwrap_or(history.len())
+            }
+        };
         let plan = self.state().plan.clone().filter(|p| marv_tools::plan::plan_open(Some(p)));
-        *lock(&conversation) = compacted_history(&summary, plan.as_deref().map(marv_tools::plan::plan_text).as_deref());
+        let kept = plan.as_deref().map(marv_tools::plan::plan_text);
+        let new = marv_agent::compact::compacted_history_with_tail(&summary.text, kept.as_deref(), history[start..].to_vec());
+        let tail_turns = history.len() - start;
+        if let Err(result) = self.install(new, history, Some(summary.text.clone()), trigger) {
+            return result;
+        }
+        // From here the model sees the summary, not the turns before it: the trajectory needs it to say what the model
+        // saw. The turn it follows only if that turn is in this file (after resume(), the last turn was in another one).
+        if let Some(log) = self.trajectory() {
+            log.write(&TrajectoryRecord::Compact {
+                turn: self.trajectory_turn(&log),
+                summary: Some(summary.text.clone()),
+                trigger: trigger.as_str(),
+                level: trigger.level(),
+                tail_turns,
+                structured: summary.structured,
+                rolling: kind == marv_agent::compact::SummaryKind::Rolling,
+                page: None,
+            });
+        }
+        CompactResult::Compacted {
+            summary: summary.text,
+            tokens_before: before.map(|b| b.prompt_tokens + b.completion_tokens),
+            trigger,
+        }
+    }
+
+    /// Puts `new` in place of the conversation (`old`, as it stands), in place: the loop holds this very history for
+    /// the whole turn, so a compaction between its steps must rewrite it where it stands; replacing the Arc would
+    /// leave the loop on the full history. `summary`: the new summary, or `None` to keep the last one (level 3).
+    /// Never touches the taint: dropping the turns that carried outside text doesn't untaint the session (#63).
+    fn install(
+        &self,
+        new: Vec<ChatTurn>,
+        _old: &[ChatTurn],
+        summary: Option<String>,
+        _trigger: CompactTrigger,
+    ) -> Result<(), CompactResult> {
+        let kept_calls: HashSet<String> = new
+            .iter()
+            .filter_map(|t| if let ChatTurn::Tool { call_id, .. } = t { Some(call_id.clone()) } else { None })
+            .collect();
+        let conversation = self.state().conversation.clone();
+        *lock(&conversation) = new;
         {
             // A summary may drop the list of MCP tools: the next message announces them all again (the cache starts
             // over here anyway), and schemas seen before it may be gone too.
@@ -2180,16 +2427,188 @@ impl MarvSession {
                 listing.announced.clear();
             }
             s.last = None;
+            if let Some(summary) = summary {
+                s.saved.summary = Some(summary);
+            }
         }
         lock(&self.inner.loaded).clear();
-        // The summary replaces the tool results that carried nested instruction files (#62): give them again.
-        self.inner.nested.reset();
-        // From here the model sees the summary, not the turns before it: the trajectory needs it to say what the model
-        // saw. The turn it follows only if that turn is in this file (after resume(), the last turn was in another one).
-        if let Some(log) = self.trajectory() {
-            log.write(&TrajectoryRecord::Compact { turn: self.trajectory_turn(&log), summary: summary.clone() });
+        // The summary replaces the tool results that carried nested instruction files (#62): give them again, except
+        // those whose notes sit in a result kept verbatim (#63).
+        self.inner.nested.keep_calls(&kept_calls);
+        Ok(())
+    }
+
+    /// #63: makes the history fit after a request overflowed the window, starting at overflow level `attempt` (or
+    /// below the level that last succeeded in this step). Levels 0–2 summarize a cut-down history at 70%, 50% and 35%
+    /// of the window (the tail shrinking, none at 2); level 3 drops the oldest turns to fit 35% with no request, or,
+    /// when 35% leaves no room, the whole window (the last attempt, in its place). A summary that overflows too goes
+    /// one level down within the same call. Every failed summary counts toward #144's `MAX_COMPACT_FAILURES`; past
+    /// it, straight to level 3. Returns what the loop does next and the compaction notice to show.
+    #[allow(clippy::too_many_arguments)]
+    async fn recover_overflow(
+        &self,
+        error: &str,
+        attempt: u32,
+        mid_turn: bool,
+        provider: &Arc<dyn Provider>,
+        factory: &dyn ProviderFactory,
+        info: Option<&ModelInfo>,
+        stop: &CancellationToken,
+    ) -> (marv_agent::agent::OverflowOutcome, CompactResult) {
+        use marv_agent::agent::OverflowOutcome;
+        use marv_agent::compact::{
+            DROPPED_NOTE, MIN_HISTORY_BUDGET, V2_OVERFLOW_TARGETS, drop_to_fit, fit_for_summary, summary_instructions,
+        };
+        use marv_core::{estimate_history_tokens, estimate_tokens};
+        let mut level = {
+            let mut s = self.state();
+            if attempt == 0 {
+                s.overflow_level = None;
+                s.overflow_last_attempt = false;
+            }
+            attempt.max(s.overflow_level.map_or(0, |l| l + 1))
+        };
+        let (system, before) = {
+            let s = self.state();
+            (s.system.clone(), s.last)
+        };
+        let history = lock(&self.state().conversation.clone()).clone();
+        let tools = self.offered().0;
+        // What every retried step sends whatever the history: the system prompt and the tools (kept in recovery: some
+        // upstreams reject a history with tool calls when no tools are defined).
+        let fixed_step = estimate_tokens(&system) + estimate_tokens(&serde_json::to_string(&tools).unwrap_or_default());
+        // A refusal that says the prompt's size calibrates the estimates (as the adapter's `tokens_per_byte` does).
+        let refusal = marv_provider::openai_compat::window_refusal(error);
+        let estimated = estimate_history_tokens(&history) + fixed_step;
+        let ratio = refusal.map_or(1.0, |(_, input)| input as f64 / estimated.max(1) as f64).clamp(0.25, 8.0);
+        let window =
+            self.context_length().filter(|w| *w > 0).or(refusal.map(|r| r.0)).unwrap_or((estimated as f64 * ratio) as u64);
+        let reserve = 8192.min(window / 8);
+        // Budgets in estimated tokens (the history is measured by the estimate).
+        let est = |real: f64| (real / ratio).max(0.0);
+        let (window_est, reserve_est, fixed_est) = (est(window as f64), est(reserve as f64), fixed_step as f64);
+        let kind = self.summary_kind();
+        let instruction = estimate_tokens(&summary_instructions(kind, None)) as f64;
+        let keep = self.summary_head(&history);
+        let tail = self.tail_tokens();
+        let tokens_before = before.map(|b| b.prompt_tokens + b.completion_tokens);
+        let failed = |level: u32, error: String| {
+            (
+                OverflowOutcome::Failed(error.clone()),
+                CompactResult::NotCompacted {
+                    reason: CompactFailure::Failed,
+                    error,
+                    trigger: CompactTrigger::Overflow { level },
+                },
+            )
+        };
+        let fixed_real = (fixed_step as f64 * ratio) as u64;
+        let no_room = || {
+            let left = window.saturating_sub(fixed_real + reserve);
+            format!(
+                "After the system prompt and tool definitions (about {fixed_real} tokens) and room for the reply, only about {left} tokens of this model's {window}-token window are left for the conversation, which is too little to go on. Pick a model with a larger window (/model), or turn off MCP servers or tools you don't need (/mcp)."
+            )
+        };
+        loop {
+            if level > 3 {
+                // Every level was tried in this step: nothing is left.
+                let last = self.state().overflow_last_attempt;
+                return failed(3, if last { no_room() } else { error.to_string() });
+            }
+            if level == 3 {
+                let at_35 = 0.35 * window_est - fixed_est - reserve_est;
+                let (budget, last) = if at_35 >= MIN_HISTORY_BUDGET as f64 {
+                    (at_35, false)
+                } else if fixed_real >= window {
+                    return failed(
+                        3,
+                        format!(
+                            "The system prompt and tool definitions alone (about {fixed_real} tokens) are larger than this model's context window ({window} tokens). Pick a model with a larger window (/model), or turn off MCP servers or tools you don't need (/mcp)."
+                        ),
+                    );
+                } else {
+                    let room = window_est - fixed_est - reserve_est;
+                    if room < MIN_HISTORY_BUDGET as f64 {
+                        return failed(3, no_room());
+                    }
+                    (room, true)
+                };
+                let note = if mid_turn {
+                    let specs = self.state().turn_mcp_specs.clone();
+                    match self.announce(&specs) {
+                        Some(note) => format!("{DROPPED_NOTE}\n\n{note}"),
+                        None => DROPPED_NOTE.to_string(),
+                    }
+                } else {
+                    DROPPED_NOTE.to_string()
+                };
+                let new = drop_to_fit(&history, budget as u64, keep, &note);
+                let trigger = CompactTrigger::Overflow { level: 3 };
+                let kept_turns = new.len() - keep - 1;
+                if let Err(result) = self.install(new, &history, None, trigger) {
+                    return (OverflowOutcome::Failed(error.to_string()), result);
+                }
+                if let Some(log) = self.trajectory() {
+                    log.write(&TrajectoryRecord::Compact {
+                        turn: self.trajectory_turn(&log),
+                        summary: None,
+                        trigger: trigger.as_str(),
+                        level: Some(3),
+                        tail_turns: kept_turns,
+                        structured: false,
+                        rolling: false,
+                        page: None,
+                    });
+                }
+                {
+                    let mut s = self.state();
+                    s.overflow_level = Some(3);
+                    s.overflow_last_attempt = last;
+                }
+                let summary = self.state().saved.summary.clone().unwrap_or_default();
+                return (OverflowOutcome::Recovered, CompactResult::Compacted { summary, tokens_before, trigger });
+            }
+            if self.state().compact_failures >= MAX_COMPACT_FAILURES {
+                level = 3;
+                continue;
+            }
+            let budget = V2_OVERFLOW_TARGETS[level as usize] * window_est - fixed_est - instruction - reserve_est;
+            if budget < MIN_HISTORY_BUDGET as f64 {
+                level += 1;
+                continue;
+            }
+            let request = fit_for_summary(&history, budget as u64, keep);
+            let level_tail = match level {
+                0 => tail,
+                1 => tail / 2,
+                _ => 0,
+            };
+            let trigger = CompactTrigger::Overflow { level };
+            let result =
+                self.summarize_level(&history, &request, level_tail, false, None, trigger, stop, provider, factory, info).await;
+            match result {
+                CompactResult::Compacted { .. } => {
+                    if mid_turn {
+                        self.push_mid_turn_note();
+                    }
+                    self.state().overflow_level = Some(level);
+                    return (OverflowOutcome::Recovered, result);
+                }
+                CompactResult::NotCompacted { .. } if stop.is_cancelled() => return (OverflowOutcome::Stopped, result),
+                CompactResult::NotCompacted { ref error, .. } => {
+                    {
+                        let mut s = self.state();
+                        s.compact_failures += 1;
+                        s.compact_failed_at = tokens_before;
+                    }
+                    if !marv_provider::errors::is_context_overflow(error) {
+                        return (OverflowOutcome::Failed(error.clone()), result);
+                    }
+                    // Our estimate was off: try smaller.
+                    level += 1;
+                }
+            }
         }
-        CompactResult::Compacted { summary, tokens_before: before.map(|b| b.prompt_tokens + b.completion_tokens) }
     }
 
     /// The turn a compaction record follows: the last turn, only if that turn is in this file (after resume(), the last
@@ -2278,6 +2697,7 @@ impl MarvSession {
             s.last = None;
             s.listing = None; // a new conversation decides its MCP mode again
             s.plan = None; // a new conversation, a new plan
+            s.provenance.clear();
             // #124: the new conversation offers radio_tx if it starts with the radio on (fixed until the next clear).
             s.radio_offered = self.radio_on_now();
         }
@@ -2332,6 +2752,7 @@ impl MarvSession {
             s.totals = saved.totals.clone();
             s.last = None;
             s.listing = saved.mcp_listing();
+            s.provenance.clear();
             // The model needs nothing extra: its last plan call (or the summary holding the plan) is still in the
             // conversation. A session without the plan tool restores none: compaction would tell the model to keep
             // updating it.
@@ -4292,7 +4713,7 @@ mod turn_tests {
     // ---- compaction ----
 
     fn compacted(summary: &str, tokens_before: u64) -> CompactResult {
-        CompactResult::Compacted { summary: summary.into(), tokens_before: Some(tokens_before) }
+        CompactResult::Compacted { summary: summary.into(), tokens_before: Some(tokens_before), trigger: CompactTrigger::Auto }
     }
     fn with(first: ProviderEvent, rest: Vec<ProviderEvent>) -> Vec<ProviderEvent> {
         std::iter::once(first).chain(rest).collect()
@@ -4342,7 +4763,7 @@ mod turn_tests {
     }
 
     fn stopped() -> CompactResult {
-        CompactResult::NotCompacted { reason: CompactFailure::Stopped, error: "Stopped.".into() }
+        CompactResult::NotCompacted { reason: CompactFailure::Stopped, error: "Stopped.".into(), trigger: CompactTrigger::Auto }
     }
 
     #[tokio::test]
@@ -4389,7 +4810,11 @@ mod turn_tests {
         let session = scripted(&dirs, &provider, |_| {});
         assert_eq!(
             session.compact(None).await.unwrap(),
-            CompactResult::NotCompacted { reason: CompactFailure::Empty, error: "Nothing to compact yet.".into() }
+            CompactResult::NotCompacted {
+                reason: CompactFailure::Empty,
+                error: "Nothing to compact yet.".into(),
+                trigger: CompactTrigger::Manual
+            }
         );
         collect(go(&session, "first")).await;
         let result = session.compact(Some("the plan")).await.unwrap();
@@ -4453,7 +4878,11 @@ mod turn_tests {
         let events = collect(go(&scripted(&dirs, &provider, |_| {}), "first")).await;
         assert_eq!(
             compactions(&events),
-            [CompactResult::NotCompacted { reason: CompactFailure::Failed, error: "summary failed".into() }]
+            [CompactResult::NotCompacted {
+                reason: CompactFailure::Failed,
+                error: "summary failed".into(),
+                trigger: CompactTrigger::Auto
+            }]
         );
         assert!(events.iter().any(|e| matches!(e, SessionEvent::Loop(LoopEvent::Assistant { text }) if text == "Finished.")));
         assert_eq!(end_reason(&events), TurnEndReason::Done(StopReason::End));
@@ -4504,7 +4933,11 @@ mod turn_tests {
         assert_eq!(
             compactions(&events),
             [
-                CompactResult::NotCompacted { reason: CompactFailure::Failed, error: "summary failed".into() },
+                CompactResult::NotCompacted {
+                    reason: CompactFailure::Failed,
+                    error: "summary failed".into(),
+                    trigger: CompactTrigger::Auto
+                },
                 compacted("SUMMARY at last", 1125),
             ]
         );
@@ -4562,6 +4995,308 @@ mod turn_tests {
         assert!(log.iter().all(|r| r["type"] != "compact"));
     }
 
+    // ---- #63: overflow recovery ----
+
+    /// An overflow as it escapes the adapter's refit (no numbers: the estimates stay uncalibrated).
+    fn overflowed() -> Vec<ProviderEvent> {
+        vec![ProviderEvent::Error("OpenRouter returned 400.\nProvider returned error: Anthropic: prompt is too long".into())]
+    }
+    fn is_summary_request(history: &[ChatTurn]) -> bool {
+        history.last().is_some_and(|t| {
+            let text = text_of(t);
+            text.starts_with(marv_agent::compact::INSTRUCTIONS) || text.contains("## Important Context")
+        })
+    }
+    fn overflow(level: u32) -> CompactTrigger {
+        CompactTrigger::Overflow { level }
+    }
+    /// What every request sends whatever the history, estimated (the recovery's `fixed_step`).
+    fn fixed_step(session: &MarvSession) -> u64 {
+        let system = session.state().system.clone();
+        marv_core::estimate_tokens(&system)
+            + marv_core::estimate_tokens(&serde_json::to_string(&session.offered().0).unwrap_or_default())
+    }
+
+    #[tokio::test]
+    async fn an_overflow_is_compacted_and_the_step_retried_with_no_user_action() {
+        // The issue's acceptance test: overflow, then a summary, then the reply. Under v1 and v2.
+        for version in [marv_agent::compact::Version::V1, marv_agent::compact::Version::V2] {
+            let dirs = Dirs::new();
+            let provider = Scripted::new(vec![overflowed(), say("SUMMARY of it all"), say("Answer.")]).with_context(200_000);
+            let session = scripted(&dirs, &provider, |i| i.compaction = version);
+            let events = collect(go(&session, "first")).await;
+            assert_eq!(end_reason(&events), TurnEndReason::Done(StopReason::End), "{version:?}");
+            assert!(!kinds(&events).contains(&"error"));
+            let results = compactions(&events);
+            assert!(
+                matches!(&results[..], [CompactResult::Compacted { summary, trigger, .. }] if summary == "SUMMARY of it all" && *trigger == overflow(0)),
+                "{results:?}"
+            );
+            let requests = provider.requests();
+            assert_eq!(requests.len(), 3);
+            assert!(is_summary_request(&requests[1].0));
+            // The retried step ends on Marv's note to go on, after the summary.
+            let retried = &requests[2].0;
+            assert!(text_of(&retried[0]).contains("SUMMARY of it all"));
+            assert_eq!(text_of(retried.last().unwrap()), MID_TURN_NOTE);
+            assert!(unanswered(retried).is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_summaries_that_overflow_walk_down_to_the_drop_in_one_hook_call() {
+        let dirs = Dirs::new();
+        let store = Arc::new(TrajectoryStore::new(dirs.dir.join("t")));
+        let provider = Scripted::new(vec![
+            use_tools(vec![read("c1")]),
+            use_tools(vec![read("c2")]),
+            overflowed(),
+            overflowed(),
+            overflowed(),
+            overflowed(),
+            say("Answer."),
+        ])
+        .with_context(200_000);
+        let session = scripted(&dirs, &provider, |i| i.trajectories = Some(store.clone()));
+        let events = collect(go(&session, "first")).await;
+        assert_eq!(end_reason(&events), TurnEndReason::Done(StopReason::End));
+        assert!(
+            matches!(&compactions(&events)[..], [CompactResult::Compacted { trigger, .. }] if *trigger == overflow(3)),
+            "one notice: {:?}",
+            compactions(&events)
+        );
+        let requests = provider.requests();
+        let summaries: Vec<u64> =
+            requests.iter().filter(|(h, _)| is_summary_request(h)).map(|(h, _)| marv_core::estimate_history_tokens(h)).collect();
+        assert_eq!(summaries.len(), 3, "levels 0, 1, 2");
+        assert!(summaries.windows(2).all(|w| w[1] <= w[0]), "each no larger than the last: {summaries:?}");
+        assert_eq!(session.state().compact_failures, 0, "reset when the turn ended");
+        // The retried step ends with the drop note, its calls all answered.
+        let retried = &requests.last().unwrap().0;
+        assert!(text_of(retried.last().unwrap()).starts_with(marv_agent::compact::DROPPED_NOTE));
+        assert!(unanswered(retried).is_empty());
+        let log = records(&store, &dirs.project, &session).await;
+        let failed: Vec<_> = log.iter().filter(|r| r["type"] == "compact_failed").collect();
+        assert_eq!(failed.iter().map(|r| r["level"].as_u64().unwrap()).collect::<Vec<_>>(), [0, 1, 2]);
+        assert!(failed.iter().all(|r| r["trigger"] == "overflow"));
+        let compact = log.iter().find(|r| r["type"] == "compact").unwrap();
+        assert_eq!((compact["trigger"].as_str(), compact["level"].as_u64()), (Some("overflow"), Some(3)));
+        assert!(compact.get("summary").is_none(), "level 3 writes no summary");
+    }
+
+    #[tokio::test]
+    async fn after_two_failed_summaries_an_overflow_sends_one_summary_then_drops() {
+        let dirs = Dirs::new();
+        let failed = || vec![ProviderEvent::Error("summary failed".into())];
+        let provider = Scripted::new(vec![
+            with(used(900), use_tools(vec![read("c1")])),
+            failed(),
+            with(used(1300), use_tools(vec![read("c2")])),
+            failed(),
+            overflowed(),
+            overflowed(), // the one recovery summary
+            say("Answer."),
+        ])
+        .with_context(200_000);
+        let session = scripted(&dirs, &provider, |i| i.compact_tokens = Some(900));
+        let events = collect(go(&session, "first")).await;
+        assert_eq!(end_reason(&events), TurnEndReason::Done(StopReason::End));
+        assert_eq!(compactions(&events).last().unwrap().trigger(), overflow(3));
+        assert_eq!(summaries(&provider.requests()), 3, "2 automatic + 1 recovery: never past #144's bound");
+    }
+
+    #[tokio::test]
+    async fn fixed_content_larger_than_the_window_fails_without_a_summary_request() {
+        let dirs = Dirs::new();
+        let provider = Scripted::new(vec![overflowed(), say("never")]).with_context(1000);
+        let session = scripted(&dirs, &provider, |_| {});
+        let events = collect(go(&session, "first")).await;
+        assert_eq!(end_reason(&events), TurnEndReason::Done(StopReason::Error));
+        let error =
+            events.iter().find_map(|e| if let SessionEvent::Loop(LoopEvent::Error(m)) = e { Some(m.clone()) } else { None });
+        assert!(error.unwrap().contains("larger than this model's context window (1000 tokens)"));
+        assert_eq!(provider.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fixed_content_that_leaves_no_room_fails_with_what_is_left() {
+        let dirs = Dirs::new();
+        let probe = scripted(&dirs, &Scripted::new(vec![]), |_| {});
+        let window = fixed_step(&probe) + 1_000;
+        let provider = Scripted::new(vec![overflowed(), say("never")]).with_context(window);
+        let session = scripted(&dirs, &provider, |_| {});
+        let events = collect(go(&session, "first")).await;
+        assert_eq!(end_reason(&events), TurnEndReason::Done(StopReason::Error));
+        let error =
+            events.iter().find_map(|e| if let SessionEvent::Loop(LoopEvent::Error(m)) = e { Some(m.clone()) } else { None });
+        assert!(error.unwrap().contains("too little to go on"));
+        assert_eq!(provider.requests().len(), 1, "no summary request, no drop");
+    }
+
+    #[tokio::test]
+    async fn when_35_percent_is_too_small_the_last_attempt_drops_to_the_whole_window() {
+        let dirs = Dirs::new();
+        let probe = scripted(&dirs, &Scripted::new(vec![]), |_| {});
+        let fixed = fixed_step(&probe);
+        let window = fixed + 4_000 + 8192.min((fixed + 4_000) / 8);
+        assert!(0.70 * window as f64 - (fixed + 8192.min(window / 8)) as f64 - 300.0 < 1024.0, "levels 0–2 are skipped");
+        let provider = Scripted::new(vec![overflowed(), say("Answer.")]).with_context(window);
+        let session = scripted(&dirs, &provider, |_| {});
+        let events = collect(go(&session, "first")).await;
+        assert_eq!(end_reason(&events), TurnEndReason::Done(StopReason::End));
+        assert_eq!(compactions(&events)[0].trigger(), overflow(3));
+        assert_eq!(provider.requests().len(), 2, "no summary request");
+        // A step that keeps overflowing after that has nothing left: 5 agent requests at most, then the error.
+        let provider = Scripted::new((0..6).map(|_| overflowed()).collect()).with_context(window);
+        let session = scripted(&dirs, &provider, |_| {});
+        let events = collect(go(&session, "first")).await;
+        assert_eq!(end_reason(&events), TurnEndReason::Done(StopReason::Error));
+        assert!(provider.requests().len() <= 5);
+        let error =
+            events.iter().find_map(|e| if let SessionEvent::Loop(LoopEvent::Error(m)) = e { Some(m.clone()) } else { None });
+        assert!(error.unwrap().contains("too little to go on"));
+    }
+
+    #[tokio::test]
+    async fn a_non_overflow_error_during_a_recovery_summary_ends_the_turn_with_it() {
+        let dirs = Dirs::new();
+        let provider = Scripted::new(vec![overflowed(), vec![ProviderEvent::Error("Rate limited".into())], say("never")])
+            .with_context(200_000);
+        let events = collect(go(&scripted(&dirs, &provider, |_| {}), "first")).await;
+        assert_eq!(end_reason(&events), TurnEndReason::Done(StopReason::Error));
+        assert!(events.iter().any(|e| matches!(e, SessionEvent::Loop(LoopEvent::Error(m)) if m == "Rate limited")));
+        assert_eq!(provider.requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_overflowing_ordinary_summary_counts_a_failure_then_recovers_from_level_0() {
+        let dirs = Dirs::new();
+        let provider = Scripted::new(vec![
+            with(used(900), use_tools(vec![read("c1")])),
+            overflowed(),           // the ordinary summary
+            say("SUMMARY at last"), // level 0
+            say("Finished."),
+        ])
+        .with_context(200_000);
+        let session = scripted(&dirs, &provider, |i| i.compact_tokens = Some(900));
+        let events = collect(go(&session, "first")).await;
+        assert_eq!(end_reason(&events), TurnEndReason::Done(StopReason::End));
+        assert!(
+            matches!(&compactions(&events)[..], [CompactResult::Compacted { summary, trigger, .. }] if summary == "SUMMARY at last" && *trigger == overflow(0)),
+            "{:?}",
+            compactions(&events)
+        );
+    }
+
+    // ---- #63: v2 ----
+
+    fn v2(i: &mut SessionInit) {
+        i.compaction = marv_agent::compact::Version::V2;
+    }
+    fn structured(text: &str) -> String {
+        marv_agent::compact::V2_SECTIONS.iter().map(|s| format!("## {s}\n{text}\n")).collect()
+    }
+
+    #[tokio::test]
+    async fn v2_keeps_a_verbatim_tail_after_the_summary_mid_turn() {
+        let dirs = Dirs::new();
+        std::fs::write(dirs.project.join("c1"), "x".repeat(2000)).unwrap();
+        std::fs::write(dirs.project.join("c2"), "small").unwrap();
+        let summary = structured("notes");
+        let provider = Scripted::new(vec![
+            use_tools(vec![read("c1")]),
+            with(used(900), use_tools(vec![read("c2")])),
+            say(&summary),
+            say("Finished."),
+        ])
+        .with_context(200_000);
+        let session = scripted(&dirs, &provider, |i| {
+            v2(i);
+            i.compact_tokens = Some(900);
+            i.compact_tail_tokens = Some(60);
+        });
+        let events = collect(go(&session, "first")).await;
+        assert_eq!(end_reason(&events), TurnEndReason::Done(StopReason::End));
+        let requests = provider.requests();
+        let before = &requests[2].0;
+        assert!(text_of(before.last().unwrap()).contains("## Important Context"), "the v2 template");
+        let after = &requests[3].0;
+        // The summary, then the tail (the last step, verbatim: no ACK before an assistant turn), then the note.
+        assert!(text_of(&after[0]).contains("## Objective"));
+        assert_eq!(&after[1..after.len() - 1], &before[before.len() - 3..before.len() - 1]);
+        assert_eq!(role_of(&after[1]), "assistant");
+        assert_eq!(text_of(after.last().unwrap()), MID_TURN_NOTE);
+        assert!(unanswered(after).is_empty());
+    }
+
+    #[tokio::test]
+    async fn v2_nudges_once_and_the_next_compaction_is_a_rolling_update_that_survives_a_resume() {
+        let dirs = Dirs::new();
+        let sessions = Arc::new(SessionStore::new(dirs.dir.join("sessions")));
+        let provider = Scripted::new(vec![
+            say("Answer."),
+            say("free prose"),
+            say(&structured("first")),
+            say("Answer two."),
+            say(&structured("second")),
+        ]);
+        let session = scripted(&dirs, &provider, |i| {
+            v2(i);
+            i.compact_tail_tokens = Some(0);
+            i.sessions = Some(sessions.clone());
+        });
+        collect(go(&session, "first")).await;
+        assert!(
+            matches!(session.compact(None).await.unwrap(), CompactResult::Compacted { ref summary, .. } if summary.contains("first"))
+        );
+        assert_eq!(provider.requests().len(), 3, "the answer, the summary, one nudge");
+        assert!(text_of(provider.requests()[2].0.last().unwrap()).starts_with("Rewrite that summary"));
+        session.flush().await;
+        // Resumed in a new session: it still knows it holds a summary, so the next one is a rolling update.
+        let resumed = scripted(&dirs, &provider, |i| {
+            v2(i);
+            i.compact_tail_tokens = Some(0);
+            i.sessions = Some(sessions.clone());
+        });
+        resumed.resume(ResumeTarget::Id(session.id())).await.unwrap().unwrap();
+        collect(go(&resumed, "second")).await;
+        resumed.compact(None).await.unwrap();
+        let rolling = &provider.requests()[4].0;
+        assert!(text_of(rolling.last().unwrap()).starts_with(marv_agent::compact::ROLLING_INSTRUCTIONS));
+        assert!(resumed.state().saved.summary.as_deref().is_some_and(|s| s.contains("second")));
+    }
+
+    #[tokio::test]
+    async fn a_nested_note_in_a_kept_result_isnt_given_again_one_summarized_away_is() {
+        let dirs = Dirs::new();
+        for pkg in ["old", "new"] {
+            std::fs::create_dir_all(dirs.project.join(pkg)).unwrap();
+            std::fs::write(dirs.project.join(pkg).join("AGENTS.md"), format!("{pkg} rules")).unwrap();
+            std::fs::write(dirs.project.join(pkg).join("a.txt"), if pkg == "old" { "x".repeat(2000) } else { "x".into() })
+                .unwrap();
+        }
+        let read_in = |id: &str, pkg: &str| call(id, "read_file", serde_json::json!({ "path": format!("{pkg}/a.txt") }));
+        let provider = Scripted::new(vec![
+            use_tools(vec![read_in("c1", "old")]),
+            use_tools(vec![read_in("c2", "new")]),
+            say("Done."),
+            say(&structured("s")),
+        ]);
+        let session = scripted(&dirs, &provider, |i| {
+            v2(i);
+            i.nested_instructions = true;
+            i.compact_tail_tokens = Some(200);
+        });
+        collect(go(&session, "first")).await;
+        assert!(matches!(session.compact(None).await.unwrap(), CompactResult::Compacted { .. }));
+        let kept = lock(&session.state().conversation.clone()).clone();
+        assert!(kept.iter().any(|t| text_of(t).contains("new rules")), "the newer read is in the tail: {kept:?}");
+        let root = session.inner.init.root.clone();
+        let touch = |pkg: &str| session.inner.nested.note_for(&root, &root.join(pkg).join("b.txt"), "read_file");
+        assert!(touch("new").is_none(), "its note is still in the history");
+        assert!(touch("old").is_some_and(|n| n.contains("old rules")), "summarized away: given again");
+    }
+
     #[tokio::test]
     async fn stopping_a_mid_turn_compaction_stops_the_turn() {
         let dirs = Dirs::new();
@@ -4589,7 +5324,11 @@ mod turn_tests {
         let events = collect(go(&session, "second")).await;
         assert_eq!(
             compactions(&events),
-            [CompactResult::NotCompacted { reason: CompactFailure::Failed, error: "summary failed".into() }]
+            [CompactResult::NotCompacted {
+                reason: CompactFailure::Failed,
+                error: "summary failed".into(),
+                trigger: CompactTrigger::Auto
+            }]
         );
         assert_eq!(end_reason(&events), TurnEndReason::Done(StopReason::End));
         assert_eq!(provider.requests()[2].0.iter().map(text_of).collect::<Vec<_>>(), ["first", "First.", "second"]);

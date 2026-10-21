@@ -6,6 +6,11 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+### Added
+
+- **A request too long for the model's window no longer ends the turn (#63).** When the provider refuses a request as longer than the context window (after Marv's own output-limit refit), Marv summarizes a cut-down copy of the conversation at 70%, then 50%, then 35% of the window and sends the step again; as a last resort it drops the oldest messages to fit, with a note to the model and a visible notice, without asking (`marv -p` has no one to ask). A system prompt and tools too big for the window say so instead. The `compaction` event in stream-json now says what started it (`trigger`: `auto`, `manual` or `overflow`, with `level`). Whatever is dropped, an untrusted conversation stays untrusted.
+- **Compaction v2, opt-in (#63): `"compaction": "v2"` in `~/.marv/config.json`.** The summary follows a fixed template (objective, requirements, decisions, work state, next move, relevant files, important context; asked once more if the model ignores it), the newest messages stay word for word after it (`compactTailTokens`, default the smaller of 15k and 15% of the trigger; `0` for none), and the next compaction updates the summary instead of starting over, also after a resume. The default stays `"v1"` until an eval compares the two; the key is temporary.
+
 ## [0.8.0] - 2026-10-21
 
 ### Added

@@ -65,6 +65,11 @@ pub struct SavedSession {
     /// radio reports on them. Absent when there are none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub radio_requests: Option<Vec<marv_mesh::radio::OpenRequest>>,
+    /// #63: the last compaction's summary, which the conversation starts with: the next v2 compaction updates it
+    /// (rolling) rather than starting over. Absent in older files: the next summary is a full one (nothing is guessed
+    /// from the conversation's text).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
 }
 
 /// A saved session's checkpoint chain and its turns' reported paths (#16).
@@ -156,6 +161,7 @@ pub fn new_session(root: &Path, provider: &str, model: &str, now_ms: u64) -> Sav
         pending_note: None,
         taint: None,
         radio_requests: None,
+        summary: None,
     }
 }
 
