@@ -182,6 +182,13 @@ impl AlwaysScopes {
         self.seeds.lock().unwrap_or_else(|e| e.into_inner()).extend(prefixes.iter().cloned());
     }
 
+    /// What a person answered "always" to this session, sorted (for `/permissions`; the seeds are the names).
+    pub fn remembered(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self.exact.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect();
+        keys.sort();
+        keys
+    }
+
     pub fn clear(&self) {
         self.exact.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.seeds.lock().unwrap_or_else(|e| e.into_inner()).clear();

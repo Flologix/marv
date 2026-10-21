@@ -125,6 +125,7 @@ Type what you want in plain language, for example:
 | `/cost` | Tokens used and cost so far |
 | `/sandbox` | Show or set the command sandbox (`/sandbox on`, `/sandbox off`) |
 | `/yolo` | Run what the sandbox contains without asking (`/yolo on`, `/yolo off`) |
+| `/permissions` | What Marv may do without asking: this session's "always" answers, pre-approved scopes, yolo, the sandbox and doors, and what's saved in your config |
 | `/processes` | List the background processes Marv started (dev servers, watchers); `/processes stop <name>` stops one |
 | `/good`, `/bad` | Rate the last turn, with an optional note (`/bad edited the wrong file`) |
 | `/label` | Tag the last turn (`/label refactor, tests`) |

@@ -943,6 +943,11 @@ impl SubagentSink for TurnSink {
 impl MarvSession {
     /// Builds a session. Fails (and changes nothing) for a taken tool name, or yolo where `no_yolo` forbids it.
     pub fn new(mut init: SessionInit) -> Result<Self, SessionError> {
+        // #98/#82: only names that mean something stay pre-approved; an unknown one is a problem (shown) and dropped,
+        // so the seeds, the prompt's list and /permissions all name exactly what was seeded (fixed for the session).
+        let (known, problems) = crate::approvals::known_names(&init.pre_approved, "Pre-approved scopes");
+        init.pre_approved = known;
+        init.problems.extend(problems);
         // An absolute path (#61): the marker names it, and read_file and grep only take an absolute one outside the
         // project. A relative MARV_CONFIG_DIR would otherwise make it a project path.
         init.tool_output_dir =
@@ -1056,9 +1061,13 @@ impl MarvSession {
         // through the same path a person's "always" takes, so must_ask and taint still win. An unknown name is a
         // problem (shown), not a silent approval.
         let always = AlwaysScopes::default();
+        // The names were checked above, so this can't fail; were it to, nothing is seeded (never more).
         match crate::approvals::seed_prefixes(&init.pre_approved) {
             Ok(prefixes) => always.seed(&prefixes),
-            Err(problem) => init.problems.push(problem),
+            Err(problem) => {
+                init.problems.push(problem);
+                init.pre_approved.clear();
+            }
         }
         let inner = Inner {
             specs,
@@ -1160,6 +1169,30 @@ impl MarvSession {
     /// What tainted this session, in order (empty: clean).
     pub fn tainted(&self) -> Vec<Provenance> {
         self.inner.taint.sources()
+    }
+    /// What the session may do without asking, now (`/permissions`, #82): a copy, for showing only.
+    pub fn permissions(&self) -> crate::permissions::Permissions {
+        let (yolo, sandbox) = {
+            let s = self.state();
+            (s.yolo, s.sandbox)
+        };
+        let init = &self.inner.init;
+        let doors = [("github", init.github), ("process", self.inner.process_on), ("herdr", init.herdr.is_some())]
+            .into_iter()
+            .filter_map(|(name, on)| on.then_some(name))
+            .collect();
+        crate::permissions::Permissions {
+            yolo,
+            no_yolo: init.no_yolo.clone(),
+            sandbox,
+            host_commands: init.host_commands,
+            doors,
+            remembered: self.inner.always.remembered(),
+            pre_approved: init.pre_approved.clone(),
+            writable: init.writable.clone(),
+            tainted: self.inner.taint.sources(),
+            approved_urls: self.inner.taint.approved_prefixes(),
+        }
     }
     /// The MCP manager (for `/mcp`), if the session has one.
     pub fn mcp(&self) -> Option<McpHandle> {
@@ -3092,6 +3125,20 @@ mod tests {
         init.cwd = Some("~/p".into());
         edit(&mut init);
         MarvSession::new(init)
+    }
+
+    // #82 review: one unknown name used to make the seeding fail (nothing approved) while the prompt and
+    // /permissions still named every name. Now it's dropped with a problem and the rest are seeded and named.
+    #[test]
+    fn an_unknown_pre_approved_name_is_dropped_and_the_rest_seeded() {
+        let s = session(|i| i.pre_approved = vec!["web".into(), "netwrk".into()]).unwrap();
+        assert!(s.problems().iter().any(|p| p.contains("\"netwrk\"") && p.ends_with("ignored")), "{:?}", s.problems());
+        assert!(s.inner.always.contains("web:example.com"), "web is seeded");
+        assert!(!s.inner.always.contains("bash:net:curl x"));
+        assert_eq!(s.permissions().pre_approved, ["web"]);
+        let prompt = s.system_prompt();
+        assert!(prompt.contains("(they run without asking): web.") && !prompt.contains("netwrk"), "{prompt}");
+        assert_eq!(s.system_prompt(), prompt, "byte-stable");
     }
 
     #[test]
