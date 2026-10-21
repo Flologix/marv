@@ -620,6 +620,12 @@ pub trait Tool: Send + Sync + 'static {
     fn once(&self, _input: &Self::Input, _ctx: &ToolContext) -> bool {
         false
     }
+    /// Whether this call writes something every later conversation loads as the person's own words (a memory). In a
+    /// tainted conversation such a call is asked of a person every time (`must_ask` and `once`): a line planted by
+    /// outside text would outlive the conversation. Default: no.
+    fn persists(&self, _input: &Self::Input, _ctx: &ToolContext) -> bool {
+        false
+    }
     /// marv-rs (#77): this call's approval, asked by the tool itself in one prompt that holds the registry's
     /// `preview` and more (a mesh call's new wire, which only a person grants). `None` (the default): the registry
     /// asks as usual. A tool that answers here must ask a person, yes or no (`once` and `must_ask`, never yolo or a
@@ -664,6 +670,7 @@ pub trait DynTool: Send + Sync {
     fn egress_url(&self, input: In<'_>) -> Option<String>;
     fn door(&self, input: In<'_>, ctx: &ToolContext) -> Option<Door>;
     fn once(&self, input: In<'_>, ctx: &ToolContext) -> bool;
+    fn persists(&self, input: In<'_>, ctx: &ToolContext) -> bool;
     async fn approve_itself(&self, input: In<'_>, ctx: &ToolContext, preview: &Preview) -> Option<Result<Decision, ToolError>>;
     async fn run(&self, input: In<'_>, ctx: &ToolContext) -> Result<ToolOutput, ToolError>;
 }
@@ -739,6 +746,9 @@ impl<T: Tool> DynTool for T {
     }
     fn once(&self, input: In<'_>, ctx: &ToolContext) -> bool {
         Tool::once(self, typed::<T>(input), ctx)
+    }
+    fn persists(&self, input: In<'_>, ctx: &ToolContext) -> bool {
+        Tool::persists(self, typed::<T>(input), ctx)
     }
     async fn approve_itself(&self, input: In<'_>, ctx: &ToolContext, preview: &Preview) -> Option<Result<Decision, ToolError>> {
         Tool::approve_itself(self, typed::<T>(input), ctx, preview).await

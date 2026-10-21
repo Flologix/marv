@@ -19,8 +19,9 @@
 //!   (`Tool::checkpoint`); a stop while it's taken returns "interrupted" instead of running.
 //! - Every repaired call's result carries the repair notes, however the call ended.
 //!
-//! marv-rs additions (docs/SECURITY.md): a tainted session's egress (`ToolKind::Egress` or `uses_network`) and any
-//! write to a protected path are gated, skip yolo, and reach the approver with `must_ask` set; a result whose
+//! marv-rs additions (docs/SECURITY.md): a tainted session's egress (`ToolKind::Egress` or `uses_network`) and its
+//! writes that later conversations load (`Tool::persists`: memory, asked `once` too), and any write to a protected
+//! path are gated, skip yolo, and reach the approver with `must_ask` set; a result whose
 //! provenance taints marks the session; a result's provenance is raised to the tool's declared one
 //! (`Tool::provenance_in`), so a tool can't hand outside text over as the project's by leaving it unset. A web request (`egress_url`) under a URL prefix the user approved after the
 //! taint runs as approved; "always" on a tainted one approves its prefix (`web_fetch::url_prefix`), not the site.
@@ -206,7 +207,10 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
     let egress_url = tool.egress_url(input).filter(|_| ctx.taint.is_tainted());
     // Not in a turn without automatic approval (#124): that prefix is a remembered answer too.
     let prefix_approved = !ctx.no_auto_approval && egress_url.as_deref().is_some_and(|url| ctx.taint.prefix_approved(url));
-    let must_ask = protected.is_some() || (ctx.taint.must_ask(tool.kind(), network) && !prefix_approved);
+    // A write that later conversations load as the person's own (memory), once outside text is in this one: a person
+    // answers it every time.
+    let tainted_sink = ctx.taint.is_tainted() && tool.persists(input, ctx);
+    let must_ask = protected.is_some() || tainted_sink || (ctx.taint.must_ask(tool.kind(), network) && !prefix_approved);
     let gated = must_ask || (!prefix_approved && tool.needs_approval(input).unwrap_or(tool.kind() != ToolKind::Read));
     let interrupted = |approval: Approval| {
         let mut result = ToolOutput::ok(INTERRUPTED, "interrupted");
@@ -260,7 +264,7 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
             let home_write = home_file_write(tool.kind(), &scope.key, ctx);
             // A turn without automatic approval (#124, a turn the radio started) asks every call `once`: no
             // remembered "always" and no worktree subagent's automatic yes answers it.
-            let once = tool.once(input, ctx) || home_write || ctx.no_auto_approval;
+            let once = tool.once(input, ctx) || home_write || ctx.no_auto_approval || tainted_sink;
             // Yolo: a call the tool vouches for runs without asking, confined (bash then can't touch .git).
             if ctx.yolo && !ctx.no_auto_approval && !must_ask && !home_write && tool.auto_safe(input, ctx) {
                 if !checkpointed().await {

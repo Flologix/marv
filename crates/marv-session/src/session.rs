@@ -737,6 +737,21 @@ struct Inner {
     state: Mutex<State>,
 }
 
+/// What a `/clear` keeps of the taint: a background process started with the network, while it runs (it keeps
+/// reaching out, and what it prints is outside text), and the taint of a Marv spawned from a tainted conversation
+/// (`MARV_TAINTED`: its pane can be typed into by the one that spawned it). Everything else ends with the conversation
+/// that held the outside text.
+pub fn taint_kept_by_clear(processes: &[ProcessInfo], tainted_at_start: bool) -> Vec<Provenance> {
+    let mut kept = Vec::new();
+    if processes.iter().any(|p| p.network && p.state == marv_tools::ProcessState::Running) {
+        kept.push(Provenance::Network);
+    }
+    if tainted_at_start {
+        kept.push(Provenance::Herdr);
+    }
+    kept
+}
+
 /// The engine. Cheap to clone (an `Arc`): the TUI keeps one for `interrupt()` while a [`Turn`] streams.
 #[derive(Clone)]
 pub struct MarvSession {
@@ -2171,7 +2186,8 @@ impl MarvSession {
         // In place: the loop holds this very history for the whole turn, so a compaction between its steps must
         // rewrite it where it stands; replacing the Arc would leave the loop on the full history.
         let plan = self.state().plan.clone().filter(|p| marv_tools::plan::plan_open(Some(p)));
-        *lock(&conversation) = compacted_history(&summary, plan.as_deref().map(marv_tools::plan::plan_text).as_deref());
+        let tainted = self.inner.taint.is_tainted();
+        *lock(&conversation) = compacted_history(&summary, plan.as_deref().map(marv_tools::plan::plan_text).as_deref(), tainted);
         {
             // A summary may drop the list of MCP tools: the next message announces them all again (the cache starts
             // over here anyway), and schemas seen before it may be gone too.
@@ -2263,7 +2279,8 @@ impl MarvSession {
     }
 
     /// `/clear`: a new conversation (and session file), with memory reloaded for the new system prompt. Totals stay.
-    /// Saves the previous conversation first.
+    /// Saves the previous conversation first. Its taint ends with it (but for a networked process still running, or a
+    /// Marv started tainted).
     pub async fn clear(&self) -> Result<(), SessionError> {
         {
             let transcript = self.transcript();
@@ -2284,6 +2301,9 @@ impl MarvSession {
         self.hold_tool_output(); // the new id's folder (#61)
         lock(&self.inner.loaded).clear();
         self.inner.nested.reset();
+        // Taint lasts as long as the text does: the cleared conversation's outside text is gone, so its taint (and
+        // the URL prefixes approved under it) goes too, but for what outlives the clear (`taint_kept_by_clear`).
+        self.inner.taint.restore(&taint_kept_by_clear(&self.processes(), self.inner.init.tainted_at_start));
         if let Some((paths, _)) = &self.inner.init.memory
             && let Ok(memories) = crate::memory::load_memory(paths).await
         {
@@ -4404,6 +4424,59 @@ mod turn_tests {
         assert!(text_of(provider.requests()[1].0.last().unwrap()).contains("Focus especially on: the plan"));
         collect(go(&session, "next")).await;
         assert!(text_of(&provider.requests()[2].0[0]).contains("THE SUMMARY"));
+    }
+
+    #[tokio::test]
+    async fn a_tainted_conversations_summary_starts_with_marvs_note_and_a_clean_ones_doesnt() {
+        for tainted in [false, true] {
+            let dirs = Dirs::new();
+            let provider = Scripted::new(vec![say("Answer."), say("THE SUMMARY"), say("Next.")]);
+            let session = scripted(&dirs, &provider, |_| {});
+            collect(go(&session, "first")).await;
+            if tainted {
+                session.inner.taint.mark(Provenance::Github);
+            }
+            session.compact(None).await.unwrap();
+            collect(go(&session, "next")).await;
+            let requests = provider.requests();
+            let summary = text_of(&requests[2].0[0]);
+            assert_eq!(summary.starts_with(marv_agent::compact::TAINTED_SUMMARY_NOTE), tainted, "{summary}");
+            assert!(summary.contains("THE SUMMARY"));
+            assert_eq!(session.tainted().is_empty(), !tainted, "the summary still holds what tainted it");
+        }
+    }
+
+    #[test]
+    fn a_clear_keeps_a_running_networked_processs_taint_and_a_marv_started_tainted() {
+        let process = |network, state| ProcessInfo {
+            name: "p".into(),
+            command: "x".into(),
+            network,
+            state,
+            exit_code: None,
+            ports: vec![],
+            notes: vec![],
+            started_at: 0,
+        };
+        use marv_tools::ProcessState::{Exited, Running};
+        assert!(taint_kept_by_clear(&[process(false, Running), process(true, Exited)], false).is_empty());
+        assert_eq!(taint_kept_by_clear(&[process(true, Running)], false), [Provenance::Network]);
+        assert_eq!(taint_kept_by_clear(&[], true), [Provenance::Herdr]);
+    }
+
+    #[tokio::test]
+    async fn clear_ends_the_cleared_conversations_taint() {
+        let dirs = Dirs::new();
+        let provider = Scripted::new(vec![say("One."), say("Two.")]);
+        let session = scripted(&dirs, &provider, |_| {});
+        collect(go(&session, "one")).await;
+        session.inner.taint.mark(Provenance::Web);
+        session.inner.taint.approve_prefix("https://docs.rs/");
+        session.clear().await.unwrap();
+        assert!(session.tainted().is_empty());
+        assert!(session.inner.taint.approved_prefixes().is_empty());
+        collect(go(&session, "two")).await;
+        assert!(session.tainted().is_empty());
     }
 
     #[tokio::test]
