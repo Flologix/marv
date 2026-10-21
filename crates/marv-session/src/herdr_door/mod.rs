@@ -467,7 +467,8 @@ impl HerdrDoor {
                 Ok(ToolOutput::ok(format!("Renamed {target} in Herdr."), "renamed"))
             }
             _ => {
-                let said = self.adapter.send_text(input.pane(), input.text.as_deref().unwrap_or_default()).await.map_err(io)?;
+                // #124: never into a Marv on the radio (`prompt_text` refuses it, with the radio as the way to reach it).
+                let said = self.adapter.prompt_text(input.pane(), input.text.as_deref().unwrap_or_default()).await.map_err(io)?;
                 Ok(ToolOutput::ok(format!("{said} Read its answer with action read."), "typed"))
             }
         }

@@ -1,5 +1,5 @@
-//! The mesh radio, phases 1 and 2: presence, and messages (marv-rs #124; `docs/specs/2026-10-14-mesh-radio.md` §11,
-//! `docs/SECURITY.md`).
+//! The mesh radio, phases 1 to 3: presence, messages, and requests with their replies (marv-rs #124;
+//! `docs/specs/2026-10-14-mesh-radio.md` §11, `docs/SECURITY.md`).
 //!
 //! Real switchboards, real doors in a private mesh folder, real links over Unix sockets, real sessions with a scripted
 //! model. Another process is a python3 listener (the pid check), this test binary run again as a child (a Marv that
@@ -660,16 +660,7 @@ impl marv_provider::Provider for Watched {
 
 /// A message straight into `marv`'s radio queue, as a link delivers one (for the tests that need it mid-request).
 fn land(marv: &Marv, from: &str, seq: u64, to_all: bool, hop: u32, text: &str) {
-    let message = marv_mesh::radio::RadioMessage {
-        id: format!("{from}:{seq}"),
-        from: from.into(),
-        to_all,
-        by: By::Model,
-        reply_to: None,
-        hop,
-        text: text.into(),
-        at_ms: 0,
-    };
+    let message = marv_mesh::radio::RadioMessage::msg(&format!("{from}:{seq}"), from, to_all, By::Model, hop, text);
     assert!(marv.sb.deliver_radio(message, 50));
 }
 
@@ -960,16 +951,7 @@ async fn subagents_have_no_radio() {
     *model.hook.lock().unwrap() = Some((
         1,
         Box::new(move || {
-            let message = marv_mesh::radio::RadioMessage {
-                id: "beta:99".into(),
-                from: "beta".into(),
-                to_all: false,
-                by: By::Model,
-                reply_to: None,
-                hop: 0,
-                text: "for the main agent".into(),
-                at_ms: 0,
-            };
+            let message = marv_mesh::radio::RadioMessage::msg("beta:99", "beta", false, By::Model, 0, "for the main agent");
             assert!(landing.deliver_radio(message, 50));
         }),
     ));
@@ -1113,16 +1095,7 @@ async fn history_stays_append_only_when_radio_notes_arrive() {
     *model.hook.lock().unwrap() = Some((
         1,
         Box::new(move || {
-            let message = marv_mesh::radio::RadioMessage {
-                id: "beta:50".into(),
-                from: "beta".into(),
-                to_all: true,
-                by: By::Model,
-                reply_to: None,
-                hop: 0,
-                text: "mid-turn news".into(),
-                at_ms: 0,
-            };
+            let message = marv_mesh::radio::RadioMessage::msg("beta:50", "beta", true, By::Model, 0, "mid-turn news");
             assert!(landing.deliver_radio(message, 50));
         }),
     ));
@@ -1593,4 +1566,487 @@ async fn a_malformed_frames_content_never_reaches_the_trajectory() {
     let logged = format!("{:?}{:?}", alpha.log.0.lock().unwrap(), alpha.log.frames());
     assert!(!logged.contains("MARKER"), "{logged}");
     assert!(alpha.sb.unread_radio().is_empty());
+}
+
+// ---- Phase 3: requests and their replies (spec §6.1, §7.2, §7.3, §8.4, §8.6, §9.3, §11) ----
+
+use marv_mesh::radio::Direction;
+use marv_mesh::radio::{AckState, Kind, OpenRequest};
+
+/// What `marv` received on the radio and took (delivered), as `(kind, reply_to)`.
+fn received(marv: &Marv) -> Vec<(&'static str, Option<String>)> {
+    marv.log
+        .frames()
+        .into_iter()
+        .filter(|f| f.direction == Direction::Received && f.outcome == marv_mesh::switchboard::Outcome::Delivered)
+        .map(|f| (f.kind, f.reply_to))
+        .collect()
+}
+
+/// `from` asks `to` (by `by`, from a turn at `hop`), and the request is open at `to`. Its id.
+async fn ask(from: &Marv, to: &Marv, by: By, hop: u32, text: &str) -> String {
+    let id = from.radio.send_request(&to.sb.session, by, hop, text).unwrap();
+    until("the request at the far end", 5, || to.radio.open_requests().iter().any(|r| r.id == id)).await;
+    id
+}
+
+/// The reports `marv` got for request `id`, unread, oldest first.
+fn reports_for(marv: &Marv, id: &str) -> Vec<marv_mesh::radio::RadioMessage> {
+    marv.sb
+        .unread_radio()
+        .into_iter()
+        .filter(|m| matches!(m.kind, Kind::Done | Kind::Failed) && m.reply_to.as_deref() == Some(id))
+        .collect()
+}
+
+fn tx(id: &str, args: Value) -> Vec<marv_core::ProviderEvent> {
+    use_tools(vec![tool_call(id, "radio_tx", args)])
+}
+
+/// **`ack`, `done` and `failed` never get a reply or a report** (§8.6, 1). beta handles alpha's request and reports;
+/// alpha's next turn reads the ack and the report, and nothing goes back for either: no ack, no report, no refusal.
+/// Only a request gets an ack and a report.
+///
+/// Proven: made `mesh::inbox_read` count every radio frame it read as a request → this test failed (alpha "reported"
+/// on beta's ack and done).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ack_done_and_failed_never_get_a_reply_or_a_report() {
+    let mesh = mesh_folder();
+    let (alpha, beta) = pair(mesh.path()).await;
+    let id = ask(&alpha, &beta, By::User, 0, "say hi").await;
+    let (pa, pb) = (TempDir::new("radio-p3-noreply-a"), TempDir::new("radio-p3-noreply-b"));
+    let beta_model = Watched::new(vec![say("Hi from beta.")]);
+    let b = session(&beta, pb.path(), beta_model.clone(), None, false, |_| {});
+    finish(b.send("anything?", Default::default()).unwrap()).await;
+    // A turn points the switchboard's log at its trajectory: back to the test's, to see what reaches beta next.
+    beta.sb.set_trajectory(beta.log.clone());
+    until("the ack and the report at alpha", 5, || alpha.sb.unread_radio().len() == 2).await;
+    let alpha_model = Watched::new(vec![say("beta said hi.")]);
+    let a = session(&alpha, pa.path(), alpha_model.clone(), None, false, |_| {});
+    let events = finish(a.send("news?", Default::default()).unwrap()).await;
+    assert!(!events.iter().any(|e| matches!(e, SessionEvent::RadioNote { .. })), "alpha reported nothing: {events:?}");
+    let read = users(&alpha_model.requests()[0].0).join("\n");
+    assert!(read.contains("kind=\"ack\"") && read.contains("kind=\"done\""), "{read}");
+    assert!(!read.contains(marv_mesh::radio::RADIO_REQUEST_NOTE), "no request was read: {read}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(beta.sb.unread_radio().is_empty(), "nothing came back to beta: {:?}", beta.sb.unread_radio());
+    // beta runs no turn now: its own log has whatever came, taken or refused.
+    let at_beta: Vec<_> = beta.log.frames().into_iter().filter(|f| f.direction == Direction::Received).map(|f| f.kind).collect();
+    assert_eq!(at_beta, ["request"], "only the request ever reached beta");
+    assert!(a.radio_requests().is_empty() && b.radio_requests().is_empty());
+    assert!(!alpha.radio.awaiting(&id));
+}
+
+/// **A request chain stops at two hops** (§8.6, 2). alpha's person has its model ask beta (hop 0); beta, woken by
+/// it, asks alpha back (hop 1); alpha, woken by that, tries to ask beta again from a turn at hop 2: refused at its
+/// own `radio_tx` ("chains of more than 2"), nothing sent. And both stop: what's left on the radio (acks, and a report
+/// on a request sent from a woken turn) wakes nobody.
+///
+/// Proven: removed the hop check from `Radio::send_request` → this test failed (the third request went out; beta
+/// refused it at hop 2, but alpha's model was told it was sent).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_chain_stops_at_two_hops() {
+    use marv_session::radio::{RadioWakeLimit, radio_wake_check};
+    let mesh = mesh_folder();
+    let (alpha, beta) = pair(mesh.path()).await;
+    let request = |id: &str, to: &str, text: &str| tx(id, json!({"to": to, "text": text, "kind": "request"}));
+    let alpha_model = Watched::new(vec![
+        request("a1", "beta", "check the build"),
+        say("Asked beta."),
+        request("a2", "beta", "and the docs too?"),
+        say("Stopped there."),
+    ]);
+    let beta_model = Watched::new(vec![request("b1", "alpha", "which branch?"), say("Asked alpha.")]);
+    let (pa, pb) = (TempDir::new("radio-p3-hop-a"), TempDir::new("radio-p3-hop-b"));
+    let a = session(&alpha, pa.path(), alpha_model.clone(), None, false, |_| {});
+    let b = session(&beta, pb.path(), beta_model.clone(), None, false, |_| {});
+    let (mut la, mut lb) = (RadioWakeLimit::default(), RadioWakeLimit::default());
+
+    finish(a.send("ask beta to check the build", Default::default()).unwrap()).await;
+    until("a1 at beta", 5, || !beta.radio.open_requests().is_empty()).await;
+    let woke_beta = radio_wake_check(&beta.sb, &mut lb, 0).wake.expect("the request wakes beta");
+    assert_eq!((woke_beta.kind, woke_beta.hop), (Kind::Request, 0));
+    finish(b.wake_radio(&woke_beta).unwrap().unwrap()).await;
+    // A turn points the switchboard's log at its trajectory: back to the test's, to see what reaches beta next.
+    beta.sb.set_trajectory(beta.log.clone());
+    until("b1 at alpha", 5, || !alpha.radio.open_requests().is_empty()).await;
+    let woke_alpha = radio_wake_check(&alpha.sb, &mut la, 0).wake.expect("beta's request wakes alpha");
+    assert_eq!((woke_alpha.kind, woke_alpha.hop, woke_alpha.turn_hop()), (Kind::Request, 1, 2));
+    finish(a.wake_radio(&woke_alpha).unwrap().unwrap()).await;
+
+    let refused = tool_results(&alpha_model.requests()[3].0).pop().unwrap();
+    assert!(refused.contains("chains of more than 2"), "{refused}");
+    let at_beta: Vec<_> = beta.log.frames().into_iter().filter(|f| f.direction == Direction::Received).map(|f| f.kind).collect();
+    assert_eq!(at_beta.iter().filter(|k| **k == "request").count(), 1, "the third never went out: {at_beta:?}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(radio_wake_check(&alpha.sb, &mut la, 60_000).wake, None, "alpha stops");
+    assert_eq!(radio_wake_check(&beta.sb, &mut lb, 60_000).wake, None, "beta stops");
+}
+
+/// **A report wakes the requester only for a request from a user's turn** (§8.6, 3). A report on a request alpha
+/// sent from a turn the radio started (hop 1) waits for alpha's next turn; one on a request sent from its person's
+/// own turn (hop 0) may wake it, with the report's note and line.
+///
+/// Proven: made `Radio::receive` let every report wake → this test failed (the hop-1 request's report woke alpha).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_report_wakes_the_requester_only_for_a_request_from_a_users_turn() {
+    use marv_session::radio::{RadioWakeLimit, radio_wake_check};
+    let mesh = mesh_folder();
+    let (alpha, beta) = pair(mesh.path()).await;
+    let mut limit = RadioWakeLimit::default();
+    let woken = ask(&alpha, &beta, By::Model, 1, "from a woken turn").await;
+    let open = beta.radio.open_requests().pop().unwrap();
+    // Handled in beta's person's own turn (hop 0): the report's own hop wakes anyone; the request's doesn't.
+    assert_eq!(beta.radio.report(&open, Kind::Done, 0, "done", 10), marv_mesh::radio::ReportOutcome::Sent);
+    until("its report", 5, || reports_for(&alpha, &woken).len() == 1).await;
+    assert_eq!(radio_wake_check(&alpha.sb, &mut limit, 0).wake, None, "waits for alpha's next turn");
+    alpha.sb.drain_radio();
+
+    let persons = ask(&alpha, &beta, By::User, 0, "from the person's turn").await;
+    let open = beta.radio.open_requests().pop().unwrap();
+    assert_eq!(beta.radio.report(&open, Kind::Failed, 1, "couldn't", 10), marv_mesh::radio::ReportOutcome::Sent);
+    until("its report", 5, || reports_for(&alpha, &persons).len() == 1).await;
+    let by = radio_wake_check(&alpha.sb, &mut limit, 60_000).wake.expect("this one wakes alpha");
+    assert_eq!((by.kind, by.reply_to.as_deref()), (Kind::Failed, Some(persons.as_str())));
+    assert_eq!(by.line(), format!("Radio failed {} from beta.", marv_mesh::radio::short_id(&persons)));
+    assert_eq!(by.note(), marv_session::radio::RADIO_REPORT_WAKE_NOTE);
+}
+
+/// **A request gets one ack and one report** (§7.3), also when the model answered it itself: its `radio_tx kind:
+/// reply` is the report, and the automatic one is skipped.
+///
+/// Proven: removed the "answered already" check from `Radio::report` → this test failed (a second `done` went out for
+/// the request the model answered).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_gets_one_ack_and_one_report() {
+    let mesh = mesh_folder();
+    let (alpha, beta) = pair(mesh.path()).await;
+    let pb = TempDir::new("radio-p3-once");
+    let first = ask(&alpha, &beta, By::User, 0, "run the tests").await;
+    let model = Watched::new(vec![say("Ran them: all green.")]);
+    let b = session(&beta, pb.path(), model.clone(), None, false, |_| {});
+    let events = finish(b.send("go", Default::default()).unwrap()).await;
+    assert!(events.iter().any(|e| matches!(e, SessionEvent::RadioNote { text } if text.starts_with("Radio → alpha done r"))));
+    until("the report", 5, || reports_for(&alpha, &first).len() == 1).await;
+    let for_first: Vec<&str> =
+        received(&alpha).into_iter().filter(|(_, r)| r.as_deref() == Some(&first)).map(|(k, _)| k).collect();
+    assert_eq!(for_first, ["ack", "done"]);
+
+    // The second request: the model answers it itself, then ends with a reply of its own.
+    let second = ask(&alpha, &beta, By::User, 0, "and the lint").await;
+    let model2 = Watched::new(vec![
+        tx("r1", json!({"to": "alpha", "kind": "reply", "reply_to": second, "status": "done", "text": "answered myself"})),
+        say("Told alpha."),
+    ]);
+    let b2 = session(&beta, pb.path(), model2.clone(), None, false, |_| {});
+    let events = finish(b2.send("go", Default::default()).unwrap()).await;
+    assert!(tool_results(&model2.requests()[1].0).pop().unwrap().contains("no automatic report follows"));
+    assert!(!events.iter().any(|e| matches!(e, SessionEvent::RadioNote { .. })), "no automatic report: {events:?}");
+    until("the model's report", 5, || reports_for(&alpha, &second).len() == 1).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // What reached alpha for it, taken or refused (alpha runs no turn here: its own log has it all).
+    let arrived: Vec<_> = alpha
+        .log
+        .frames()
+        .into_iter()
+        .filter(|f| f.direction == Direction::Received && f.reply_to.as_deref() == Some(second.as_str()))
+        .map(|f| (f.kind, f.by))
+        .collect();
+    assert_eq!(arrived, [("ack", Some(By::Marv)), ("done", Some(By::Model))], "one ack, one report: the model's");
+    assert_eq!(reports_for(&alpha, &second)[0].text, "answered myself");
+}
+
+/// **The report is built without a model call** (§7.3): the turn that handled the request asks its model once (its
+/// reply), and the report is that reply's first paragraph, code dropped; the fake provider saw no extra request.
+///
+/// Proven: removed the `radio_reports` call from `MarvSession::run_turn` → this test failed (no report).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_report_is_built_without_a_model_call() {
+    let mesh = mesh_folder();
+    let (alpha, beta) = pair(mesh.path()).await;
+    let id = ask(&alpha, &beta, By::Model, 0, "start hack.py").await;
+    let pb = TempDir::new("radio-p3-nocall");
+    let model = Watched::new(vec![
+        say("Started hack-matrix with the process tool.\n\n```sh\npython3 ~/hack.py\n```\n\nIts output is in the log."),
+        say("never asked for"),
+    ]);
+    let b = session(&beta, pb.path(), model.clone(), None, false, |_| {});
+    finish(b.send("what's waiting?", Default::default()).unwrap()).await;
+    until("the report", 5, || reports_for(&alpha, &id).len() == 1).await;
+    assert_eq!(model.requests().len(), 1, "one request: the turn's own");
+    let done = reports_for(&alpha, &id).pop().unwrap();
+    assert_eq!((done.kind, done.by, done.text.as_str()), (Kind::Done, By::Marv, "Started hack-matrix with the process tool."));
+    assert!(done.elapsed_ms.is_some());
+}
+
+/// **Failed reports for stopped, declined and errored turns** (§7.3): each says why in Marv's words.
+///
+/// Proven: made `radio::report_of` say `done` whatever the turn's end → this test failed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_reports_for_stopped_declined_and_errored_turns() {
+    let mesh = mesh_folder();
+    let (alpha, beta) = pair(mesh.path()).await;
+    let pb = TempDir::new("radio-p3-failed");
+
+    let declined = ask(&alpha, &beta, By::User, 0, "write notes.txt").await;
+    let model = Watched::new(vec![
+        use_tools(vec![tool_call("w1", "write_file", json!({"path": "notes.txt", "content": "x"}))]),
+        say("unused"),
+    ]);
+    let b = session(&beta, pb.path(), model, Some(Recorder::new(Decision::No)), false, |_| {});
+    finish(b.send("go", Default::default()).unwrap()).await;
+    until("the declined report", 5, || reports_for(&alpha, &declined).len() == 1).await;
+    let r = reports_for(&alpha, &declined).pop().unwrap();
+    assert_eq!((r.kind, r.text.as_str()), (Kind::Failed, "beta's user declined: write_file"));
+
+    let stopped = ask(&alpha, &beta, By::User, 0, "run forever").await;
+    let model = Watched::new(vec![say("Working on it…"), say("unused")]);
+    let b = session(&beta, pb.path(), model.clone(), None, false, |_| {});
+    let stopper = b.clone();
+    *model.hook.lock().unwrap() = Some((0, Box::new(move || stopper.interrupt())));
+    finish(b.send("go", Default::default()).unwrap()).await;
+    until("the stopped report", 5, || reports_for(&alpha, &stopped).len() == 1).await;
+    let r = reports_for(&alpha, &stopped).pop().unwrap();
+    assert_eq!((r.kind, r.text.as_str()), (Kind::Failed, "stopped by beta's user"));
+
+    let errored = ask(&alpha, &beta, By::User, 0, "and this").await;
+    let model = Watched::new(vec![vec![marv_core::ProviderEvent::Error("the provider fell over".into())]]);
+    let b = session(&beta, pb.path(), model, None, false, |_| {});
+    finish(b.send("go", Default::default()).unwrap()).await;
+    until("the errored report", 5, || reports_for(&alpha, &errored).len() == 1).await;
+    let r = reports_for(&alpha, &errored).pop().unwrap();
+    assert_eq!(r.kind, Kind::Failed);
+    assert!(r.text.starts_with("the turn ended: "), "{}", r.text);
+    assert!(!r.text.contains("fell over"), "the provider's words aren't the report's: {}", r.text);
+}
+
+/// **A request waits while busy and is read only at a turn's start** (§7.2). A request that lands while beta's turn
+/// runs is acked `queued: busy`, isn't read between that turn's steps (so that turn doesn't report on it), and is
+/// read at the start of beta's next turn, with the request note; that turn reports on it.
+///
+/// Proven: made `mesh::inbox_note_with` (between steps) read requests too → this test failed (the running turn read
+/// it and reported on it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_waits_while_busy_and_is_read_only_at_a_turns_start() {
+    let mesh = mesh_folder();
+    let (alpha, beta) = pair(mesh.path()).await;
+    beta.radio.set_wake(true);
+    beta.radio.set_state(PresenceState::Working);
+    let pb = TempDir::new("radio-p3-busy");
+    std::fs::write(pb.path().join("notes.txt"), "notes").unwrap();
+    let model = Watched::new(vec![
+        use_tools(vec![tool_call("r1", "read_file", json!({"path": "notes.txt"}))]),
+        say("Read the notes."),
+        say("Handled alpha's request."),
+    ]);
+    let (asker, landed) = (alpha.radio.clone(), beta.sb.clone());
+    let id = Arc::new(Mutex::new(String::new()));
+    let keep = id.clone();
+    *model.hook.lock().unwrap() = Some((
+        0,
+        Box::new(move || {
+            *keep.lock().unwrap() = asker.send_request("beta", By::Model, 0, "while you're busy").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while landed.unread_radio().is_empty() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }),
+    ));
+    let b = session(&beta, pb.path(), model.clone(), None, false, |_| {});
+    finish(b.send("read the notes", Default::default()).unwrap()).await;
+    let id = id.lock().unwrap().clone();
+    assert!(!format!("{:?}", model.requests()[1].0).contains("kind=\\\"request\\\""), "not read between steps");
+    assert!(beta.sb.unread_radio().iter().any(|m| m.kind == Kind::Request), "still waiting");
+    until("the ack", 5, || alpha.sb.unread_radio().iter().any(|m| m.kind == Kind::Ack)).await;
+    assert_eq!(alpha.sb.unread_radio()[0].state, Some(AckState::QueuedBusy));
+    assert!(reports_for(&alpha, &id).is_empty(), "the running turn didn't report on it");
+
+    finish(b.send("anything else?", Default::default()).unwrap()).await;
+    let next = users(&model.requests()[2].0).pop().unwrap();
+    assert!(next.contains("kind=\"request\"") && next.contains(marv_mesh::radio::RADIO_REQUEST_NOTE), "{next}");
+    until("its report", 5, || reports_for(&alpha, &id).len() == 1).await;
+    assert_eq!(reports_for(&alpha, &id)[0].text, "Handled alpha's request.");
+}
+
+/// **Open requests survive compaction and resume** (§7.3): they're the session's state and its saved file, never
+/// history. A session saved with a request it hadn't reported on (Marv stopped mid-turn), resumed and compacted,
+/// still reports on it at the end of its next turn.
+///
+/// Proven: removed the restore of `radio_requests` in `MarvSession::resume` → this test failed (no report).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn open_requests_survive_compaction_and_resume() {
+    let mesh = mesh_folder();
+    let (alpha, beta) = pair(mesh.path()).await;
+    let id = ask(&alpha, &beta, By::User, 0, "migrate the db").await;
+    let open: OpenRequest = beta.radio.open_requests().pop().unwrap();
+    let (pb, store_dir) = (TempDir::new("radio-p3-resume"), TempDir::new("radio-p3-sessions"));
+    let store = Arc::new(marv_session::sessions::SessionStore::new(store_dir.path()));
+    let root = pb.path().canonicalize().unwrap();
+    let mut saved = marv_session::sessions::new_session(&root, "watched", "m", 1);
+    saved.conversation = vec![
+        ChatTurn::User {
+            text: format!(
+                "<radio-message from=\"alpha\" kind=\"request\" id=\"{id}\" by=\"user\">\nmigrate the db\n</radio-message>"
+            ),
+        },
+        ChatTurn::Assistant { text: "Migrating…".into(), tool_calls: vec![], reasoning: None },
+    ];
+    saved.transcript = serde_json::from_value(json!([{"id": 1, "role": "user", "text": "what's waiting?"}])).unwrap();
+    saved.radio_requests = Some(vec![open.clone()]);
+    store.save(&saved).await.unwrap();
+
+    let model = Watched::new(vec![say("Summary: migrating the db for alpha."), say("Migrated the db.")]);
+    let b = session(&beta, &root, model, None, false, |init| init.sessions = Some(store.clone()));
+    b.resume(marv_session::session::ResumeTarget::Id(saved.id.clone())).await.unwrap().expect("resumed");
+    assert_eq!(b.radio_requests(), std::slice::from_ref(&open));
+    let _ = b.compact(None).await.unwrap();
+    assert_eq!(b.radio_requests(), [open], "compaction rewrote history, not the open requests");
+    finish(b.send("carry on", Default::default()).unwrap()).await;
+    until("the report", 5, || reports_for(&alpha, &id).len() == 1).await;
+    assert_eq!(reports_for(&alpha, &id)[0].text, "Migrated the db.");
+    assert!(b.radio_requests().is_empty());
+}
+
+/// **A Marv leaving mid-request reports `failed`** (§7.3): beta leaves the radio while its turn works on alpha's
+/// request; alpha gets `failed` "beta left the radio before finishing" before the link closes, and nothing more.
+///
+/// Proven: removed the owed reports from `Radio::turn_off` → this test failed (alpha got only beta's leave).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_marv_leaving_mid_request_reports_failed() {
+    let mesh = mesh_folder();
+    let (alpha, beta) = pair(mesh.path()).await;
+    let id = ask(&alpha, &beta, By::User, 0, "a long job").await;
+    let pb = TempDir::new("radio-p3-leave");
+    let model = Watched::new(vec![say("Half way.")]);
+    let (leaving, runtime, watch) = (beta.radio.clone(), tokio::runtime::Handle::current(), alpha.sb.clone());
+    let wanted = id.clone();
+    *model.hook.lock().unwrap() = Some((
+        0,
+        Box::new(move || {
+            // From a thread of its own: a task spawned from this (blocked) worker would wait in its LIFO slot.
+            std::thread::spawn(move || runtime.block_on(async move { leaving.turn_off().await }));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !watch.unread_radio().iter().any(|m| m.reply_to.as_deref() == Some(&wanted) && m.kind == Kind::Failed)
+                && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }),
+    ));
+    let b = session(&beta, pb.path(), model, None, false, |_| {});
+    let events = finish(b.send("go", Default::default()).unwrap()).await;
+    let failed = reports_for(&alpha, &id);
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!((failed[0].kind, failed[0].text.as_str()), (Kind::Failed, "beta left the radio before finishing"));
+    assert!(!events.iter().any(|e| matches!(e, SessionEvent::RadioNote { .. })), "answered on leaving: {events:?}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(reports_for(&alpha, &id).len(), 1, "nothing after the failed");
+}
+
+/// **A turn that handles a radio request asks for what yolo would have allowed** (phase 3's decision, a step past
+/// §8.4): the person's own turn included, since the request note invites the model to act on another Marv's words.
+/// Its approvals are asked once each and say why.
+///
+/// Proven: removed `|| handles_requests` from the turn's `unattended` → this test failed (yolo wrote it unasked).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_turn_that_handles_a_request_asks_even_in_yolo() {
+    let mesh = mesh_folder();
+    let (alpha, beta) = pair(mesh.path()).await;
+    ask(&alpha, &beta, By::Model, 0, "write theirs.txt").await;
+    let pb = TempDir::new("radio-p3-yolo");
+    let model = Watched::new(vec![
+        use_tools(vec![tool_call("w1", "write_file", json!({"path": "theirs.txt", "content": "y"}))]),
+        say("Written."),
+    ]);
+    let person = Recorder::new(Decision::Yes);
+    let b = session(&beta, pb.path(), model, Some(person.clone()), true, |init| init.pre_approved = vec!["files".into()]);
+    finish(b.send("hi", Default::default()).unwrap()).await;
+    let asked = person.requests();
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert!(asked[0].once);
+    let warning = asked[0].preview.warning.clone().unwrap_or_default();
+    assert!(warning.contains(marv_session::radio::RADIO_REQUEST_WARNING), "{warning}");
+}
+
+/// **`radio_tx`'s wait brings the report back fenced, and taints first** (§7.1, §8.1): the request's ack and report
+/// come back in the tool's result as `<radio-message>`s, the session is tainted before the request that carries them,
+/// and they aren't read a second time.
+///
+/// Proven: removed the taint mark from `RadioTx::send_request` → this test failed (the next request went untainted).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn radio_tx_waits_for_the_report_fenced_and_tainting() {
+    let mesh = mesh_folder();
+    let (alpha, beta) = pair(mesh.path()).await;
+    let (pa, pb) = (TempDir::new("radio-p3-wait-a"), TempDir::new("radio-p3-wait-b"));
+    let alpha_model = Watched::new(vec![
+        tx("t1", json!({"to": "beta", "text": "run the e2e suite", "kind": "request", "wait": 10})),
+        say("beta ran it."),
+    ]);
+    let a = session(&alpha, pa.path(), alpha_model.clone(), None, false, |_| {});
+    alpha_model.session.set(a.clone()).ok();
+    let beta_model = Watched::new(vec![say("e2e: 2 failures in login.")]);
+    let b = session(&beta, pb.path(), beta_model, None, false, |_| {});
+    let beta_radio = beta.radio.clone();
+    let handler = tokio::spawn(async move {
+        until("the request at beta", 5, || !beta_radio.open_requests().is_empty()).await;
+        finish(b.send("go", Default::default()).unwrap()).await;
+    });
+    finish(a.send("ask beta to run the e2e suite", Default::default()).unwrap()).await;
+    handler.await.unwrap();
+    let result = tool_results(&alpha_model.requests()[1].0).pop().unwrap();
+    assert!(result.contains("kind=\"done\"") && result.contains("e2e: 2 failures in login."), "{result}");
+    assert_eq!(*alpha_model.tainted.lock().unwrap(), [false, true], "tainted before the result went on");
+    assert!(alpha.sb.unread_radio().iter().all(|m| m.kind == Kind::Msg), "read once");
+}
+
+/// **A pane send to a Marv on the radio is refused, with the radio hint** (§9.3, §12 item 8). Herdr (a fake) shows a
+/// Marv in pane w1:p2 whose door says its radio is on: a prompt to that pane is refused and nothing is typed; once
+/// it's off the radio, the same prompt is typed, as before.
+///
+/// Proven: removed the radio check from `HerdrAdapter::prompt_text` → this test failed (it typed into the pane).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pane_send_to_a_marv_on_the_radio_is_refused_with_the_radio_hint() {
+    let mesh = mesh_folder();
+    let alpha = marv("alpha", mesh.path(), "/work/alpha", fast());
+    // beta runs in Herdr pane w1:p2.
+    let plugs = TempDir::short("radio-p3-pane-plugs");
+    let sb = Arc::new(Switchboard::new("beta", plugs.path().to_path_buf(), Arc::new(Log::default())));
+    let cancel = tokio_util::sync::CancellationToken::new();
+    tokio::spawn(Arc::clone(&sb).serve(cancel.clone()));
+    let _door =
+        open_door(sb.clone(), mesh.path(), DoorInfo { cwd: "/work/beta".into(), pane: Some("w1:p2".into()) }, Arc::new(NoOne))
+            .unwrap();
+    let radio = Radio::new(&sb, mesh.path(), Presence::new("beta", Path::new("/work/beta"), Some("w1:p2".into()), false), fast());
+    radio.start();
+    radio.turn_on().await;
+    alpha.radio.turn_on().await;
+
+    let herdr = TempDir::new("radio-p3-herdr");
+    let log = herdr.path().join("calls.log");
+    let script = herdr.path().join("herdr");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho \"$@\" >> '{}'\ncase \"$1 $2\" in\n'pane get') printf '%s\\n' '{}';;\n*) printf '%s\\n' '{{\"result\": {{}}}}';;\nesac\n",
+            log.display(),
+            json!({"result": {"pane": {"pane_id": "w1:p2", "agent": "marv", "agent_status": "idle"}}})
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let adapter = Arc::new(marv_mesh::herdr::HerdrAdapter::new(&script, Some("w1:p1".into())));
+    // As the session wires it: the switchboard hands its mesh folder to the adapter.
+    alpha.sb.set_herdr(adapter.clone());
+
+    let refused = adapter.prompt_text("w1:p2", "start hack.py").await.unwrap_err().to_string();
+    assert!(refused.contains("beta is on the radio: use radio_tx (kind: request) to get a reply"), "{refused}");
+    let calls = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(!calls.contains("send-text"), "nothing typed: {calls}");
+
+    radio.turn_off().await;
+    let typed = adapter.prompt_text("w1:p2", "start hack.py").await.unwrap();
+    assert!(typed.contains("Typed into Herdr pane w1:p2"), "{typed}");
+    assert!(std::fs::read_to_string(&log).unwrap().contains("pane send-text w1:p2 start hack.py"));
+    radio.stop();
+    cancel.cancel();
 }
