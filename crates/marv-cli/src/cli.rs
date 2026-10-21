@@ -16,7 +16,7 @@
 //! - `--version`/`-v` and `--help`/`-h` exit 0, as in Marv.
 //! - `__html-convert` is hidden: the web reader re-executes `marv __html-convert` to convert a page in a process of
 //!   its own (a conversion that crashes is an answer, not a crash).
-//! - `__guard <parent-pid> -- <command…>` is hidden: Seatbelt's process supervisor (#165, `crate::guard`).
+//! - `__guard <parent-pid> -- <command…>` is hidden: Seatbelt's process supervisor (#165, `marv_tools::guard`).
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 
@@ -123,7 +123,7 @@ pub enum Command {
     #[command(name = "__relay", hide = true)]
     Relay { spec: String },
     /// Runs a command in a session of its own and kills its process group when `parent` dies (#165): `guard`.
-    #[command(name = "__guard", hide = true)]
+    #[command(name = marv_sandbox::seatbelt_backend::GUARD_SUBCOMMAND, hide = true)]
     Guard {
         parent: u32,
         #[arg(last = true, required = true)]

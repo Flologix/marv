@@ -11,13 +11,14 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use marv_guards::{Recorder, Scripted, TempDir, require_bwrap, say, sdk_turn, tool_call, use_tools};
+use marv_guards::{Recorder, Scripted, TempDir, say, sdk_turn, tool_call, use_tools};
 use marv_tools::{Decision, ToolContext, ToolRef, run_tool};
 use serde_json::json;
 
 /// A command that leaves a marker per run in `outside`.
 fn host_command(outside: &Path) -> String {
-    format!("touch {}/ran-$(date +%s%N)", outside.display())
+    // `$$-$RANDOM`, not `date +%N`: BSD date (macOS) has no %N, and two runs in one second made one marker.
+    format!("touch {}/ran-$$-$RANDOM", outside.display())
 }
 fn runs(outside: &Path) -> usize {
     std::fs::read_dir(outside).unwrap().count()
@@ -31,7 +32,7 @@ fn host_call(id: &str, command: &str) -> marv_core::ToolCall {
 /// Proven: dropped `input.sandbox != Some(false)` from `Bash::auto_safe` → yolo ran it unasked, on the host.
 #[tokio::test]
 async fn asks_in_yolo_with_the_host_door_and_once() {
-    require_bwrap!();
+    marv_guards::require_sandbox!();
     let (root, outside) = (TempDir::new("host"), TempDir::outside_tmp("host-outside"));
     let tools: Vec<ToolRef> = vec![Arc::new(marv_tools::bash::Bash)];
     let call = host_call("h1", &host_command(outside.path()));
@@ -56,7 +57,7 @@ async fn asks_in_yolo_with_the_host_door_and_once() {
 /// Proven: made `Bash::once` return false → the second call was answered from "always" (one ask).
 #[tokio::test]
 async fn never_uses_always_two_calls_two_asks() {
-    require_bwrap!();
+    marv_guards::require_sandbox!();
     let (root, config, outside) =
         (TempDir::new("host-always"), TempDir::new("host-always-config"), TempDir::outside_tmp("host-always-out"));
     let command = host_command(outside.path());
@@ -81,7 +82,7 @@ async fn never_uses_always_two_calls_two_asks() {
 /// command ran.
 #[tokio::test]
 async fn a_session_without_host_commands_refuses_it_before_its_approver_is_asked() {
-    require_bwrap!();
+    marv_guards::require_sandbox!();
     let (root, config, outside) =
         (TempDir::new("host-sdk"), TempDir::new("host-sdk-config"), TempDir::outside_tmp("host-sdk-out"));
     let approver = Recorder::new(Decision::Yes);
@@ -99,7 +100,7 @@ async fn a_session_without_host_commands_refuses_it_before_its_approver_is_asked
 /// and ran.
 #[tokio::test]
 async fn a_subagent_cant_even_where_the_session_has_the_door() {
-    require_bwrap!();
+    marv_guards::require_sandbox!();
     let (root, config, outside) =
         (TempDir::new("host-sub"), TempDir::new("host-sub-config"), TempDir::outside_tmp("host-sub-out"));
     let approver = Recorder::new(Decision::Yes);
@@ -126,7 +127,7 @@ async fn a_subagent_cant_even_where_the_session_has_the_door() {
 /// still refused).
 #[test]
 fn headless_refuses_it_with_every_approve_name() {
-    require_bwrap!();
+    marv_guards::require_sandbox!();
     let (root, config, outside) = (TempDir::new("host-p"), TempDir::new("host-p-config"), TempDir::outside_tmp("host-p-out"));
     let call = marv_oracle::script::ScriptCall {
         id: Some("h1".into()),

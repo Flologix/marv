@@ -2920,6 +2920,7 @@ dependencies = [
  "marv-sandbox",
  "marv-session",
  "marv-tools",
+ "nix 0.31.3",
  "serde_json",
  "tokio",
  "tokio-util",

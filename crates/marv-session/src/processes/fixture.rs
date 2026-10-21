@@ -12,6 +12,14 @@ pub fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some(marv_tools::relay::RELAY_SUBCOMMAND) => marv_tools::relay::main(args.get(1).map_or("", String::as_str)),
+        // As `marv __guard <parent> -- <command…>` (Seatbelt runs it around every command).
+        Some(marv_sandbox::seatbelt_backend::GUARD_SUBCOMMAND) if args.len() >= 4 && args[2] == "--" => {
+            let command: Vec<std::ffi::OsString> = std::env::args_os().skip(4).collect();
+            match args[1].parse() {
+                Ok(parent) => marv_tools::guard::main(parent, &command),
+                Err(_) => ExitCode::from(127),
+            }
+        }
         Some("serve") if args.len() >= 4 => {
             let ports: Vec<u16> = args[3..].iter().filter_map(|p| p.parse().ok()).collect();
             runtime().block_on(serve(&args[1], &args[2], &ports));
@@ -22,7 +30,9 @@ pub fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         _ => {
-            eprintln!("usage: __relay <spec> | serve <host> <text> <port>… | parent <root> <runtime dir> <command>");
+            eprintln!(
+                "usage: __relay <spec> | __guard <parent> -- <command…> | serve <host> <text> <port>… | parent <root> <runtime dir> <command>"
+            );
             ExitCode::from(2)
         }
     }

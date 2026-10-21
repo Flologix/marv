@@ -238,7 +238,16 @@ fn two_marvs_on_the_radio_see_each_other_and_a_killed_one_is_lost() {
 
     // gamma turns it on itself (`/radio on`, typed): it joins at once, and its config says so from now on.
     gamma.type_line("/radio on");
-    wait_for("gamma in alpha's strip", || alpha.screen().contains("gammaidle"));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !alpha.screen().contains("gammaidle") {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for gamma in alpha's strip; gamma's screen:\n{}\nalpha's:\n{}",
+            gamma.screen(),
+            alpha.screen()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
     let saved: Value =
         serde_json::from_str(&std::fs::read_to_string(machine.0.join("config-gamma/config.json")).unwrap()).unwrap();
     assert_eq!(saved["mesh"], json!({"radio": true}));

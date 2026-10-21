@@ -880,7 +880,11 @@ pub fn yolo_status(config: &Config, sandbox_available: bool) -> String {
     } else {
         format!(
             "Yolo on: file edits run without asking. Commands still ask: {}, so nothing confines them.",
-            if config.sandbox { "bubblewrap isn't available here" } else { "the sandbox is off" }
+            if config.sandbox {
+                format!("{} isn't available here", marv_sandbox::backend().name())
+            } else {
+                "the sandbox is off".into()
+            }
         )
     }
 }
@@ -902,10 +906,13 @@ fn sandbox_status(config: &Config, available: bool, hidden: &[String]) -> String
         return "off: bash commands run directly on your system (after approval)".into();
     }
     if !available {
-        return "on, but bubblewrap isn't available here, so bash runs WITHOUT a sandbox".into();
+        return format!("on, but {} isn't available here, so bash runs WITHOUT a sandbox", marv_sandbox::backend().name());
     }
     let hidden = if hidden.is_empty() { String::new() } else { format!(" {}", hidden_path_folders_notice(hidden)) };
-    format!("on: bash runs in bubblewrap (project writable, home hidden, no network unless asked).{hidden}")
+    format!(
+        "on: bash runs in {} (project writable, home hidden, no network unless asked).{hidden}",
+        marv_sandbox::backend().name()
+    )
 }
 
 const MCP_USAGE: &str = "Usage: /mcp (list servers), /mcp add <npm package | pypi:<package> | https URL | GitHub repo | registry name> [--name <name>] [--env VAR] [--header \"Name: Bearer ${VAR}\"] [-- <server args>], /mcp search <words>, /mcp remove <name>, /mcp trust, /mcp login <name>, /mcp logout <name>";

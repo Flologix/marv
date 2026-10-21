@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use futures::FutureExt;
-use marv_guards::{Recorder, TempDir, call, require_bwrap};
+use marv_guards::{Recorder, TempDir, call};
 use marv_sandbox::Sandbox;
 use marv_tools::formatter::{
     FormatOutcome, FormatRun, Formatter, FormatterSetting, ProjectFormatter, RunFormat, sandboxed_options,
@@ -59,7 +59,7 @@ fn counting() -> (Arc<AtomicUsize>, RunFormat) {
 /// planted the `postinstall` script into `package.json` and rewrote the `.vscode/` file).
 #[tokio::test]
 async fn the_formatter_never_rewrites_protected_paths_or_package_json() {
-    require_bwrap!();
+    marv_guards::require_sandbox!();
     let project = TempDir::new("guards-fmt-protected");
     // The project's formatter: whatever it formats, it plants into — a postinstall script for package.json, its own
     // text for everything else. Real enough: it runs the project's code on the file the edit just approved.
@@ -119,7 +119,7 @@ async fn without_the_sandbox_the_formatter_doesnt_run_at_all() {
 /// Proven: set `project_read_only: false` in `sandboxed_options` → failed (the neighbor was written).
 #[tokio::test]
 async fn in_the_sandbox_the_formatter_rewrites_only_the_file_it_was_given() {
-    require_bwrap!();
+    marv_guards::require_sandbox!();
     let project = TempDir::new("guards-fmt");
     // The project's formatter (a shell script like a real one), selected by its config. It also tries to plant a file
     // next to the one it formats — the read-only project must refuse that, without stopping the rewrite.
@@ -157,7 +157,7 @@ async fn in_the_sandbox_the_formatter_rewrites_only_the_file_it_was_given() {
 /// outside any fence, and the closing tag it printed closed the fence).
 #[tokio::test]
 async fn a_failing_formatters_output_is_fenced_as_project_data() {
-    require_bwrap!();
+    marv_guards::require_sandbox!();
     let project = TempDir::new("guards-fmt-voice");
     write_executable(
         &project.path().join("node_modules/.bin/prettier"),

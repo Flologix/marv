@@ -926,7 +926,9 @@ impl MarvSession {
         // project. A relative MARV_CONFIG_DIR would otherwise make it a project path.
         init.tool_output_dir =
             init.tool_output_dir.map(|dir| marv_sandbox::paths::normalize(&std::path::absolute(&dir).unwrap_or(dir)));
-        let process_on = init.processes && marv_sandbox::sandbox_available();
+        // Only where the backend runs a sandbox and its process door: not on macOS yet (#152).
+        let backend = marv_sandbox::backend();
+        let process_on = init.processes && backend.processes() && backend.available();
         // The process tool is built in only where the session offers it: elsewhere the name is free (Marv).
         let custom: Vec<ToolRef> = init.tools.iter().filter(|t| process_on || t.name() != "process").cloned().collect();
         check_tool_names(&custom, init.plan, init.github).map_err(SessionError::Invalid)?;

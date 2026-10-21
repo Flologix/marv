@@ -10,6 +10,7 @@ Each guard's doc comment says how it was proven: the guard was reverted, and the
 | Config only from `~/.marv` or `$MARV_CONFIG_DIR` in the real env | `launch.rs::the_config_folder_comes_only_from_the_real_environment` | Proven |
 | `printable()`: CSI/OSC/DCS, C0/C1, bidi | `launch.rs::printable_strips_escapes_controls_and_bidi` | Proven |
 | … including headless text mode | `launch.rs::headless_text_output_is_printable` | Ignored: needs #11 |
+| macOS (Seatbelt, #166): Mach/XPC doors, sockets, the runtime folder but the plug, the closed home, writes, protected names and hard links, no IP without network, host processes and setuid, the environment, process lifetime | `seatbelt.rs` (14 guards, `require_sandbox!`, macOS only) | Run on the macOS job with `MARV_REQUIRE_SANDBOX=1`. Proven on macOS CI by removing the rule (branch `proof/166-seatbelt-rules`, PR #178): the home deny, the hidden-entry regex, `~/Library`, the protected write denies, the pid kill before the group's; the link refusals hold with the link rules removed (Seatbelt refuses `link()` from a source it can't read or write) |
 | Read-only system, empty `/run` but the mesh plug | `sandbox.rs::system_is_read_only_and_run_is_empty_but_for_the_mesh_plug` | Proven (real bwrap) |
 | No network unless approved, cleared env, own PID namespace | `sandbox.rs::no_network_cleared_environment_and_own_pid_namespace` | Proven (real bwrap) |
 | Stand-in home, toolchains read-only, credentials masked | `sandbox.rs::the_home_is_a_stand_in_with_masked_credentials` | Proven (real bwrap) |
