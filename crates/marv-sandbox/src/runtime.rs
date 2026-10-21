@@ -4,8 +4,10 @@
 //! manager, the sandbox's hidden folders, the writable-folder check):
 //! - `MARV_RUNTIME_DIR` from the real environment, when set: the folder itself, checked like the default (absolute,
 //!   short enough for the longest socket, hidden in every sandbox, and a private folder of this user's).
-//! - Linux: `$XDG_RUNTIME_DIR/marv`, when every sandbox hides `XDG_RUNTIME_DIR` ([`crate::hidden_in_sandbox`]).
-//!   Without one there's no runtime folder: Marv never falls back to a folder a sandboxed command could see.
+//! - Linux: `$XDG_RUNTIME_DIR/marv`, when every sandbox hides `XDG_RUNTIME_DIR` ([`crate::hidden_in_sandbox`]) and
+//!   `marv` in it is a private folder of this user's, checked like the override ([`private_folder`]; `XDG_RUNTIME_DIR`
+//!   itself must exist). logind's `/run/user/<uid>` passes: `/run/user` and `/run` are root's. Without one there's no
+//!   runtime folder: Marv never falls back to a folder a sandboxed command could see.
 //! - macOS: `/tmp/marv-<uid>` (there's no `XDG_RUNTIME_DIR`). The path string `/tmp/…` is what sockets are bound at:
 //!   it's shorter than `/private/tmp/…`, and `sun_path` is only 104 bytes there. Made 0700; then it must be a folder
 //!   (not a symlink) this user owns. Another user who made ours first turns the mesh off, nothing more: `/tmp`'s
@@ -16,8 +18,7 @@
 //! the way may be changeable by another user, nor a symlink but the root's `/tmp` and a root-owned link in a folder
 //! only root can change (Fedora Silverblue's `/home -> var/home`), whose target's folders are walked too
 //! ([`private_folder`]). Every folder on the way must be this user's or root's: in a container whose `/` belongs to a
-//! third uid every override is refused (that uid could swap anything under `/`); there the Linux default
-//! (`XDG_RUNTIME_DIR` under `/run`) still works.
+//! third uid every runtime folder is refused, the Linux default too (that uid could swap anything under `/`).
 //!
 //! Inside it: `mesh/<name>.sock` (doors), `p/<pid>-<hex>/<plug>.sock` (one switchboard's plugs; a process can have
 //! several, Marv desktop's chats) and `<pid>-<hex>/p<n>/` (the process door's sockets). The plug folder isn't named
@@ -89,8 +90,8 @@ fn default_path(env: &BTreeMap<String, String>) -> Option<PathBuf> {
 }
 
 /// The runtime folder, checked (see the module doc); `None` when there's none Marv may use, and the mesh and the
-/// processes' sockets are off. The macOS default and the override are made here ([`private_folder`]); the Linux
-/// default is checked as before (hidden in every sandbox) and made where it's used. For a session, use
+/// processes' sockets are off. Each is made here ([`private_folder`]), the Linux default once it's known to be hidden
+/// in every sandbox. For a session, use
 /// [`runtime_dir_for`] with its project, which refuses an override inside it.
 pub fn runtime_dir(env: &BTreeMap<String, String>) -> Option<PathBuf> {
     runtime_dir_for(env, None)
@@ -108,7 +109,8 @@ pub fn runtime_dir_for(env: &BTreeMap<String, String>, project: Option<&Path>) -
         return private_folder(&dir).is_ok().then_some(dir);
     }
     let base = env.get("XDG_RUNTIME_DIR").filter(|d| crate::hidden_in_sandbox(Path::new(d), &home))?;
-    Some(Path::new(base).join("marv"))
+    let dir = Path::new(base).join("marv");
+    private_folder(&dir).is_ok().then_some(dir)
 }
 
 /// Why `MARV_RUNTIME_DIR` was refused, for the message that says the mesh is off; `None` when it's unset or accepted.
@@ -333,8 +335,9 @@ fn folder_ok(path: &Path, node: Node, uid: u32) -> std::io::Result<()> {
         return refuse(format!("{} isn't a folder", path.display()));
     }
     if node.uid != uid && node.uid != 0 {
-        // Linux's default isn't walked: it's judged by `hidden_in_sandbox` alone.
-        let instead = if cfg!(target_os = "macos") { "" } else { "; use XDG_RUNTIME_DIR under /run instead" };
+        // A `/` of a third uid's leaves nothing to suggest: every runtime folder is under it.
+        let instead =
+            if cfg!(target_os = "macos") || path == Path::new("/") { "" } else { "; use XDG_RUNTIME_DIR under /run instead" };
         return refuse(format!(
             "{} belongs to uid {}, neither you nor root, who could change it{instead}",
             path.display(),
@@ -388,7 +391,15 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn linux_uses_xdg_runtime_dir_marv_when_the_sandbox_hides_it() {
-        assert_eq!(runtime_dir(&env(&[("XDG_RUNTIME_DIR", "/run/user/1000")])), Some("/run/user/1000/marv".into()));
+        // A private folder of this user's under /tmp (a real logind /run/user/<uid> needn't exist here): `marv` is made
+        // in it, 0700.
+        use std::os::unix::fs::PermissionsExt;
+        let run = short_temp("xdg");
+        std::fs::create_dir(&run).unwrap();
+        let got = runtime_dir(&env(&[("XDG_RUNTIME_DIR", run.to_str().unwrap())]));
+        assert_eq!(got, Some(run.join("marv")));
+        assert_eq!(std::fs::metadata(run.join("marv")).unwrap().permissions().mode() & 0o777, 0o700);
+        let _ = std::fs::remove_dir_all(&run);
         assert_eq!(runtime_dir(&env(&[("XDG_RUNTIME_DIR", "relative")])), None);
         assert_eq!(runtime_dir(&env(&[("XDG_RUNTIME_DIR", "/var/tmp/x")])), None);
         assert_eq!(runtime_dir(&env(&[])), None);
@@ -396,6 +407,28 @@ mod tests {
         // The default and the override are both hidden.
         let both = runtime_paths(&env(&[("XDG_RUNTIME_DIR", "/run/user/1"), (RUNTIME_DIR_VAR, "/tmp/o")]));
         assert_eq!(both, [PathBuf::from("/run/user/1/marv"), PathBuf::from("/tmp/o")]);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn linux_refuses_an_xdg_runtime_dir_reached_through_a_symlink_or_whose_marv_isnt_a_private_folder() {
+        let root = short_temp("xdgl");
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        // Reached through a symlink (not root's): refused, nothing made where it leads.
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+        assert_eq!(runtime_dir(&env(&[("XDG_RUNTIME_DIR", root.join("link").to_str().unwrap())])), None);
+        assert!(!root.join("real/marv").exists());
+        // `marv` itself a symlink, or in a folder others may write in: refused.
+        std::fs::create_dir(root.join("a")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("a/marv")).unwrap();
+        assert_eq!(runtime_dir(&env(&[("XDG_RUNTIME_DIR", root.join("a").to_str().unwrap())])), None);
+        std::fs::create_dir(root.join("open")).unwrap();
+        std::fs::set_permissions(root.join("open"), std::os::unix::fs::PermissionsExt::from_mode(0o777)).unwrap();
+        assert_eq!(runtime_dir(&env(&[("XDG_RUNTIME_DIR", root.join("open").to_str().unwrap())])), None);
+        // One that doesn't exist: refused, not made.
+        assert_eq!(runtime_dir(&env(&[("XDG_RUNTIME_DIR", root.join("gone").to_str().unwrap())])), None);
+        assert!(!root.join("gone").exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[cfg(target_os = "macos")]
@@ -677,12 +710,20 @@ mod tests {
     #[test]
     fn a_root_folder_owned_by_a_third_uid_refuses_every_override_and_says_why() {
         // #168: a container whose `/` belongs to neither root nor the user. That uid could rename anything under `/`,
-        // so it's refused, with the reason (and, on Linux, what to use instead).
+        // so it's refused, with the reason (nothing to use instead: every runtime folder is under `/`).
         let fs = Fake::default().dir("/", 5000, 0o755).dir("/tmp", 0, 0o1777);
         let why = walk(&fs, "/tmp/marv").unwrap_err();
         assert!(why.contains("/ belongs to uid 5000, neither you nor root"), "{why}");
+        assert!(!why.contains("XDG_RUNTIME_DIR"), "{why}");
+        // A folder below it a third uid owns: on Linux, what to use instead.
+        let fs = Fake::default().dir("/", 0, 0o755).dir("/tmp", 0, 0o1777).dir("/tmp/x", 5000, 0o755);
+        let why = walk(&fs, "/tmp/x/marv").unwrap_err();
+        assert!(why.contains("/tmp/x belongs to uid 5000"), "{why}");
         #[cfg(not(target_os = "macos"))]
         assert!(why.contains("XDG_RUNTIME_DIR under /run"), "{why}");
+        // logind's /run/user/<uid>: root's /run and /run/user, 0755.
+        let fs = Fake::root().dir("/run", 0, 0o755).dir("/run/user", 0, 0o755).dir("/run/user/1000", 1000, 0o700);
+        assert_eq!(walk(&fs, "/run/user/1000/marv"), Ok(()));
         // Root's or the user's: accepted.
         assert_eq!(walk(&Fake::default().dir("/", 0, 0o755).dir("/tmp", 0, 0o1777), "/tmp/marv"), Ok(()));
         assert_eq!(walk(&Fake::default().dir("/", 1000, 0o755).dir("/tmp", 0, 0o1777), "/tmp/marv"), Ok(()));

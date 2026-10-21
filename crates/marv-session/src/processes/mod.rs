@@ -287,7 +287,8 @@ impl ProcessManager {
         // have made it.
         match marv_sandbox::runtime_dir_for(&marv_sandbox::runtime_env(), Some(&self.shared.options.root)) {
             Some(dir) => {
-                std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
+                // Checked and made by `runtime_dir_for`; again here, as it's about to be used.
+                marv_sandbox::private_folder(&dir)?;
                 Ok(dir)
             }
             None => fallback_dir(&std::env::temp_dir()),
