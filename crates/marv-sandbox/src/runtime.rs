@@ -372,7 +372,8 @@ mod tests {
     }
 
     fn short_temp(tag: &str) -> PathBuf {
-        let dir = PathBuf::from(format!("/tmp/mx-rt-{tag}-{}", std::process::id()));
+        // Short: the longest test path has to fit in MAX_RUNTIME_DIR on macOS, whatever the pid.
+        let dir = PathBuf::from(format!("/tmp/mr-{tag}{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }
