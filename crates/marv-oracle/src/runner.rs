@@ -281,10 +281,16 @@ pub fn canonical_request(body: &str) -> String {
     if let Some(messages) = value.get_mut("messages").and_then(Value::as_array_mut) {
         for message in messages {
             let system = message.get("role") == Some(&json!("system"));
+            let user = message.get("role") == Some(&json!("user"));
             let Some(content) = message.get_mut("content") else { continue };
             if system {
                 strip_sections(content);
                 unword(content);
+            }
+            // marv-rs's saved pages (after Marv #63): the list Marv writes at the end of a summary message. Marv
+            // has none. Same text as `marv_tools::swap::PAGE_TABLE_HEAD`.
+            if user {
+                strip_from(content, &format!("\n\n{PAGE_TABLE_HEAD}"));
             }
             // A marked message carries its text as one part; unmarked it's the plain string.
             if let Some([part]) = content.as_array().map(Vec::as_slice)
@@ -298,6 +304,8 @@ pub fn canonical_request(body: &str) -> String {
         }
     }
     if let Some(tools) = value.get_mut("tools").and_then(Value::as_array_mut) {
+        // Tools marv-rs offers and Marv doesn't (`recall`, after Marv #63): left out of the comparison.
+        tools.retain(|t| !t.pointer("/function/name").and_then(Value::as_str).is_some_and(|n| MARV_RS_TOOLS.contains(&n)));
         tools.iter_mut().filter_map(|t| t.pointer_mut("/function/description")).for_each(unword);
     }
     strip_cache_control(&mut value);
@@ -306,6 +314,9 @@ pub fn canonical_request(body: &str) -> String {
     }
     value.to_string()
 }
+
+/// Built-in tools marv-rs offers and Marv doesn't: left out of both sides' tool lists before comparing.
+pub const MARV_RS_TOOLS: &[&str] = &["recall"];
 
 /// System-prompt sections marv-rs adds and Marv doesn't (deliberate differences, one place for all scenarios): the
 /// oracle drops them from both sides before comparing, so the rest of the prompt is still checked byte for byte. The
@@ -365,6 +376,22 @@ fn strip_sections(content: &mut Value) {
             }
         }
         Value::Array(parts) => parts.iter_mut().filter_map(|p| p.get_mut("text")).for_each(strip_sections),
+        _ => {}
+    }
+}
+
+/// marv-rs's saved pages' list, as it starts (`marv_tools::swap::PAGE_TABLE_HEAD`).
+pub const PAGE_TABLE_HEAD: &str = "Saved pages (written by Marv, not by you)";
+
+/// Cuts a message's text (plain or in parts) from `marker` to its end.
+fn strip_from(content: &mut Value, marker: &str) {
+    match content {
+        Value::String(text) => {
+            if let Some(at) = text.find(marker) {
+                text.truncate(at);
+            }
+        }
+        Value::Array(parts) => parts.iter_mut().filter_map(|p| p.get_mut("text")).for_each(|t| strip_from(t, marker)),
         _ => {}
     }
 }
@@ -486,6 +513,20 @@ mod tests {
         let canonical: Value = serde_json::from_str(&canonical_request(&body)).unwrap();
         assert_eq!(canonical["messages"][0]["content"], "You are Marv.\n\n# Sandbox limits\n\nEnds.\n\n# MCP servers\n\nSetup.");
         assert_eq!(canonical["messages"][1]["content"], "# Your situation");
+    }
+
+    #[test]
+    fn marv_rs_saved_pages_and_recall_are_left_out_of_the_comparison() {
+        let ours = json!({
+            "messages": [{"role": "user", "content": format!("summary\n\n{PAGE_TABLE_HEAD}: …\n- page 1: 3 messages")}],
+            "tools": [{"type": "function", "function": {"name": "read_file", "description": "d"}},
+                      {"type": "function", "function": {"name": "recall", "description": "r"}}]
+        });
+        let marvs = json!({
+            "messages": [{"role": "user", "content": "summary"}],
+            "tools": [{"type": "function", "function": {"name": "read_file", "description": "d"}}]
+        });
+        assert_eq!(canonical_request(&ours.to_string()), canonical_request(&marvs.to_string()));
     }
 
     #[test]

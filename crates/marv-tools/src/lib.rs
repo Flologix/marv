@@ -35,6 +35,7 @@ pub mod relay;
 pub mod repair;
 pub mod schema_repair;
 pub mod skill;
+pub mod swap;
 pub mod syntax;
 pub mod types;
 pub mod web;

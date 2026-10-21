@@ -2374,13 +2374,17 @@ impl MarvSession {
                 (start..history.len()).find(|&i| !matches!(history[i], ChatTurn::Tool { .. })).unwrap_or(history.len())
             }
         };
+        // What's summarized away is saved first (a page and the page table): if that fails, nothing is replaced.
+        let (page, table) = match self.page_out(&history[..start], 0, trigger).await {
+            Ok(saved) => saved.unzip(),
+            Err(error) => return CompactResult::NotCompacted { reason: CompactFailure::Failed, error, trigger },
+        };
         let plan = self.state().plan.clone().filter(|p| marv_tools::plan::plan_open(Some(p)));
-        let kept = plan.as_deref().map(marv_tools::plan::plan_text);
+        let kept: Vec<String> = plan.as_deref().map(marv_tools::plan::plan_text).into_iter().chain(table).collect();
+        let kept = (!kept.is_empty()).then(|| kept.join("\n\n"));
         let new = marv_agent::compact::compacted_history_with_tail(&summary.text, kept.as_deref(), history[start..].to_vec());
         let tail_turns = history.len() - start;
-        if let Err(result) = self.install(new, history, Some(summary.text.clone()), trigger) {
-            return result;
-        }
+        self.install(new, Some(summary.text.clone()));
         // From here the model sees the summary, not the turns before it: the trajectory needs it to say what the model
         // saw. The turn it follows only if that turn is in this file (after resume(), the last turn was in another one).
         if let Some(log) = self.trajectory() {
@@ -2392,7 +2396,7 @@ impl MarvSession {
                 tail_turns,
                 structured: summary.structured,
                 rolling: kind == marv_agent::compact::SummaryKind::Rolling,
-                page: None,
+                page,
             });
         }
         CompactResult::Compacted {
@@ -2402,17 +2406,74 @@ impl MarvSession {
         }
     }
 
-    /// Puts `new` in place of the conversation (`old`, as it stands), in place: the loop holds this very history for
-    /// the whole turn, so a compaction between its steps must rewrite it where it stands; replacing the Arc would
-    /// leave the loop on the full history. `summary`: the new summary, or `None` to keep the last one (level 3).
-    /// Never touches the taint: dropping the turns that carried outside text doesn't untaint the session (#63).
-    fn install(
-        &self,
-        new: Vec<ChatTurn>,
-        _old: &[ChatTurn],
-        summary: Option<String>,
-        _trigger: CompactTrigger,
-    ) -> Result<(), CompactResult> {
+    /// The current conversation's swap folder (its saved pages), next to its saved file; `None` without a session
+    /// store (nothing is saved then, and `recall` has nothing to read).
+    fn swap_dir(&self) -> Option<PathBuf> {
+        let store = self.inner.init.sessions.as_ref()?;
+        Some(marv_tools::swap::swap_dir(&store.file(&self.inner.init.root, &self.id())))
+    }
+
+    /// Where a turn the history holds came from, for its saved page: a result as its run said (when that taints), else
+    /// as its fence or its tool says (after a resume the runs are gone), erring on the tainted side as
+    /// `SavedSession::taint_sources` does.
+    fn paged_provenance(&self, turn: &ChatTurn) -> Provenance {
+        let fenced = |text: &str| -> Option<Provenance> {
+            let marker = format!("<{} source=\"", crate::provenance::FENCE_TAG);
+            let at = text.find(&marker)? + marker.len();
+            let name = text[at..].split('"').next()?;
+            serde_json::from_value(serde_json::Value::String(name.into())).ok()
+        };
+        match turn {
+            ChatTurn::Tool { call_id, name, text } => {
+                if let Some(run) = self.state().provenance.get(call_id).copied().filter(|p| p.taints()) {
+                    return run;
+                }
+                fenced(text).unwrap_or(match name.as_str() {
+                    "web_fetch" | "github" | "agent" => Provenance::Web,
+                    n if n.starts_with("mcp") => Provenance::Mcp,
+                    n if n.starts_with("mesh") || n.starts_with("radio") => Provenance::Mesh,
+                    "herdr" => Provenance::Herdr,
+                    _ => Provenance::Project,
+                })
+            }
+            ChatTurn::User { text } => fenced(text).unwrap_or(Provenance::User),
+            ChatTurn::Assistant { .. } => Provenance::Marv,
+        }
+    }
+
+    /// Saves `turns` (the history from index `first`) as the next page of this conversation's swap, with its page
+    /// table entry, before the history they're in is replaced. `Ok(Some((page, table text)))` when saved; `Ok(None)`
+    /// with nothing to save or no store; `Err` when the write failed: the caller keeps the history.
+    async fn page_out(&self, turns: &[ChatTurn], first: usize, trigger: CompactTrigger) -> Result<Option<(u32, String)>, String> {
+        let Some(dir) = self.swap_dir() else { return Ok(None) };
+        if turns.is_empty() {
+            return Ok(None);
+        }
+        let paged: Vec<marv_tools::swap::PagedTurn> = turns
+            .iter()
+            .enumerate()
+            .map(|(i, turn)| marv_tools::swap::PagedTurn {
+                index: first + i,
+                provenance: self.paged_provenance(turn),
+                turn: turn.clone(),
+            })
+            .collect();
+        let page = marv_tools::swap::next_page(&dir);
+        let saved_outputs = self.inner.init.tool_output_dir.as_ref().map(|d| d.join(self.id()));
+        let entry = marv_tools::swap::page_entry(page, &paged, trigger.as_str(), saved_outputs.as_deref());
+        marv_tools::swap::write_page(&dir, &entry, &paged).await.map_err(|e| {
+            format!("Couldn't save the messages a compaction would replace ({e}), so the conversation was kept as it was.")
+        })?;
+        let table = marv_tools::swap::page_table_text(&marv_tools::swap::read_table(&dir)).unwrap_or_default();
+        Ok(Some((page, table)))
+    }
+
+    /// Puts `new` in place of the conversation, in place: the loop holds this very history for the whole turn, so a
+    /// compaction between its steps must rewrite it where it stands; replacing the Arc would leave the loop on the
+    /// full history. `summary`: the new summary, or `None` to keep the last one (level 3). Called only once what it
+    /// replaces is saved (`page_out`). Never touches the taint: dropping the turns that carried outside text doesn't
+    /// untaint the session (#63).
+    fn install(&self, new: Vec<ChatTurn>, summary: Option<String>) {
         let kept_calls: HashSet<String> = new
             .iter()
             .filter_map(|t| if let ChatTurn::Tool { call_id, .. } = t { Some(call_id.clone()) } else { None })
@@ -2435,7 +2496,6 @@ impl MarvSession {
         // The summary replaces the tool results that carried nested instruction files (#62): give them again, except
         // those whose notes sit in a result kept verbatim (#63).
         self.inner.nested.keep_calls(&kept_calls);
-        Ok(())
     }
 
     /// #63: makes the history fit after a request overflowed the window, starting at overflow level `attempt` (or
@@ -2533,21 +2593,30 @@ impl MarvSession {
                     }
                     (room, true)
                 };
-                let note = if mid_turn {
-                    let specs = self.state().turn_mcp_specs.clone();
-                    match self.announce(&specs) {
-                        Some(note) => format!("{DROPPED_NOTE}\n\n{note}"),
-                        None => DROPPED_NOTE.to_string(),
-                    }
-                } else {
-                    DROPPED_NOTE.to_string()
-                };
-                let new = drop_to_fit(&history, budget as u64, keep, &note);
+                // What's kept, then what's dropped: saved first, and listed after the note (the summary message
+                // isn't rewritten at this level).
                 let trigger = CompactTrigger::Overflow { level: 3 };
-                let kept_turns = new.len() - keep - 1;
-                if let Err(result) = self.install(new, &history, None, trigger) {
-                    return (OverflowOutcome::Failed(error.to_string()), result);
+                let kept = drop_to_fit(&history, budget as u64, keep, DROPPED_NOTE);
+                let start = history.len() - (kept.len() - keep - 1);
+                let (page, table) = match self.page_out(&history[keep..start], keep, trigger).await {
+                    Ok(saved) => saved.unzip(),
+                    Err(error) => return failed(3, error),
+                };
+                let mut note = DROPPED_NOTE.to_string();
+                if let Some(table) = table {
+                    note = format!("{note}\n\n{table}");
                 }
+                if mid_turn {
+                    let specs = self.state().turn_mcp_specs.clone();
+                    if let Some(announced) = self.announce(&specs) {
+                        note = format!("{note}\n\n{announced}");
+                    }
+                }
+                let mut new = kept;
+                new.pop();
+                new.push(ChatTurn::User { text: note });
+                let kept_turns = new.len() - keep - 1;
+                self.install(new, None);
                 if let Some(log) = self.trajectory() {
                     log.write(&TrajectoryRecord::Compact {
                         turn: self.trajectory_turn(&log),
@@ -2557,7 +2626,7 @@ impl MarvSession {
                         tail_turns: kept_turns,
                         structured: false,
                         rolling: false,
-                        page: None,
+                        page,
                     });
                 }
                 {
@@ -5295,6 +5364,57 @@ mod turn_tests {
         let touch = |pkg: &str| session.inner.nested.note_for(&root, &root.join(pkg).join("b.txt"), "read_file");
         assert!(touch("new").is_none(), "its note is still in the history");
         assert!(touch("old").is_some_and(|n| n.contains("old rules")), "summarized away: given again");
+    }
+
+    // ---- saved pages ----
+
+    #[tokio::test]
+    async fn a_compaction_saves_what_it_replaces_with_its_sources_and_lists_the_page() {
+        let dirs = Dirs::new();
+        let sessions = Arc::new(SessionStore::new(dirs.dir.join("sessions")));
+        let web = call("w1", "web_fetch", serde_json::json!({ "url": "https://example.test" }));
+        let provider = Scripted::new(vec![use_tools(vec![read("notes.txt"), web]), say("Read them."), say("THE SUMMARY")]);
+        let session = scripted(&dirs, &provider, |i| i.sessions = Some(sessions.clone()));
+        collect(go(&session, "first")).await;
+        let before = lock(&session.state().conversation.clone()).clone();
+        assert!(matches!(session.compact(None).await.unwrap(), CompactResult::Compacted { .. }));
+        let swap = marv_tools::swap::swap_dir(&sessions.file(&dirs.project, &session.id()));
+        let page = marv_tools::swap::read_page(&swap, 1).expect("page 1");
+        assert_eq!(page.iter().map(|p| p.turn.clone()).collect::<Vec<_>>(), before, "byte for byte");
+        let web_result = page.iter().find(|p| matches!(&p.turn, ChatTurn::Tool { name, .. } if name == "web_fetch")).unwrap();
+        assert_eq!(web_result.provenance, Provenance::Web);
+        let table = marv_tools::swap::read_table(&swap);
+        assert_eq!(table[0].files_read, ["notes.txt"]);
+        assert_eq!(table[0].sources, [Provenance::Web]);
+        // The summary message ends with Marv's list of pages, built from the table.
+        let after = lock(&session.state().conversation.clone()).clone();
+        assert!(text_of(&after[0]).ends_with(&marv_tools::swap::page_table_text(&table).unwrap()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(swap.join("1.jsonl")).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(std::fs::metadata(&swap).unwrap().permissions().mode() & 0o777, 0o700);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_page_that_cant_be_saved_fails_the_compaction_and_keeps_the_history() {
+        let dirs = Dirs::new();
+        let sessions = Arc::new(SessionStore::new(dirs.dir.join("sessions")));
+        let provider = Scripted::new(vec![say("Answer."), say("THE SUMMARY")]);
+        let session = scripted(&dirs, &provider, |i| i.sessions = Some(sessions.clone()));
+        collect(go(&session, "first")).await;
+        let swap = marv_tools::swap::swap_dir(&sessions.file(&dirs.project, &session.id()));
+        std::fs::create_dir_all(swap.parent().unwrap()).unwrap();
+        std::fs::write(&swap, "not a folder").unwrap();
+        let before = lock(&session.state().conversation.clone()).clone();
+        let result = session.compact(None).await.unwrap();
+        assert!(
+            matches!(&result, CompactResult::NotCompacted { reason: CompactFailure::Failed, error, .. } if error.contains("kept as it was")),
+            "{result:?}"
+        );
+        assert_eq!(lock(&session.state().conversation.clone()).clone(), before);
+        assert_eq!(session.state().saved.summary, None);
     }
 
     #[tokio::test]
