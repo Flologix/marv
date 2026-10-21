@@ -1,4 +1,8 @@
 {
   "description": "A change that ripples through callers: two parallel reads, a full rewrite with write_file, edits across files in one step, then a second round for the callers' callers. project/.gitignore is stored as gitignore.oracle.",
-  "prompt": "readSync in src/store.ts is going away: make loadSettings (src/settings.ts) use the async read() instead, so loadSettings becomes async, delete readSync, and update everything that uses it, directly or through other functions, so it still works."
+  "prompt": "readSync in src/store.ts is going away: make loadSettings (src/settings.ts) use the async read() instead, so loadSettings becomes async, delete readSync, and update everything that uses it, directly or through other functions, so it still works.",
+  "deliberate": {
+    "security": "File changes",
+    "why": "marv-rs refuses edit_file and write_file on an existing file the session hasn't read, or that changed since it read it: the scripted model also reads `src/theme.ts`, `src/keys.ts`, `src/log.ts`, `src/banner.ts`, `src/css.ts` before editing (script.marv-rs.jsonl), and nothing else changes. The files and exit code are Marv's."
+  }
 }

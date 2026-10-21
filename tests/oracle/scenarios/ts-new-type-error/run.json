@@ -6,6 +6,6 @@
   },
   "deliberate": {
     "security": "Provenance and taint",
-    "why": "marv-rs fences the typecheck's note (a Marv 0.3.0 bug): the note is Marv's own sentence, then tsc's output inside <untrusted-data source=\"project\">, where Marv began it 'Marv:'. Everything else (events, files, exit code) is Marv's."
+    "why": "marv-rs fences the typecheck's note (a Marv 0.3.0 bug): the note is Marv's own sentence, then tsc's output inside <untrusted-data source=\"project\">, where Marv began it 'Marv:'. Everything else (events, files, exit code) is Marv's. Also: marv-rs refuses edit_file and write_file on an existing file the session hasn't read, or that changed since it read it: the scripted model also reads `src/cart.ts` before editing (script.marv-rs.jsonl), and nothing else changes. The files and exit code are Marv's."
   }
 }

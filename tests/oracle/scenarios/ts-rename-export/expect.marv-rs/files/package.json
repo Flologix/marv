@@ -1,0 +1,8 @@
+{
+  "name": "ts-rename-export",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  }
+}
