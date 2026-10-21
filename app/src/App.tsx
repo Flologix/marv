@@ -1,5 +1,6 @@
+import { listen } from "@tauri-apps/api/event";
 import { message, open } from "@tauri-apps/plugin-dialog";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChatView } from "./components/ChatView";
 import { Onboarding } from "./components/Onboarding";
 import { Gallery } from "./components/Gallery";
@@ -103,6 +104,18 @@ function Desktop() {
     if (info?.root) refreshChats();
   }, [info?.root, refreshChats]);
 
+  // A click on a notification: that chat, wherever it is.
+  const jump = useRef<(target: ChatRecord) => void>(() => {});
+  useEffect(() => {
+    const off = listen<string>("open-chat", ({ payload: id }) => {
+      desktop.chats().then((list) => {
+        const target = list.find((c) => c.id === id);
+        if (target) jump.current(target);
+      }, () => {});
+    });
+    return () => void off.then((stop) => stop());
+  }, []);
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key === "b") {
@@ -161,6 +174,7 @@ function Desktop() {
       desktop.switchSpace(space.id).then((next) => toSpace(next, { folder: rel, chatId: target.id }), (e) => void message(String(e), { title: "Marv" }));
     }
   }
+  jump.current = jumpTo;
   const waiting = allChats.filter((c) => c.id !== chatId && live.some((l) => l.id === c.id && l.waiting > 0));
 
   function openGallery() {

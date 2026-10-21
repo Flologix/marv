@@ -15,7 +15,9 @@
 //! - A save that fails only loses the path: the cut is the same, so the call never fails over it.
 //! - Trajectories record the model's text, so the path, never the saved content.
 //! - [`clean_tool_output`] runs at a session's first turn (after any resume): sessions' folders older than [`KEEP_DAYS`] go, then the oldest
-//!   until the whole store is under [`MAX_TOTAL_BYTES`]. web_fetch isn't cut but paged (`offset`), so it saves nothing.
+//!   until the whole store is under [`MAX_TOTAL_BYTES`].
+//! - #93: web_fetch isn't cut but paged (`offset`); on the first read of a page longer than one part it saves the whole
+//!   page ([`spill_whole`], as `<call id>.web.txt`) and names it, so the model can grep it instead of paging through.
 //! - A live session holds its folder ([`hold`]: a shared lock on its `.live` file), and the cleanup never deletes a
 //!   held one: not the session that just started, not the one it then resumed, not another Marv's that's running.
 //! - The source is kept: an output from a source other than the project (an MCP server, a subagent) is saved as
@@ -81,6 +83,12 @@ pub fn spill_cut(text: &str, dir: &Path, call_id: &str, source: Provenance) -> s
     }
     let path = save(text, dir, call_id, source)?;
     Ok(cut_middle_saved(text, MAX_MODEL_CHARS, HEAD_CHARS, Some(&path)))
+}
+
+/// `text` saved whole in `dir` (a session's folder) under the call's id, uncut: for a result the tool pages itself
+/// (web_fetch, #93). Returns the file's path.
+pub fn spill_whole(text: &str, dir: &Path, call_id: &str, source: Provenance) -> std::io::Result<PathBuf> {
+    save(text, dir, call_id, source)
 }
 
 /// What a call's long result goes through: [`spill_cut`] into the session's folder (`ToolContext::tool_output`),
