@@ -30,6 +30,7 @@ jobs:
       - run: packaging/test-install.sh
 
   build:
+    timeout-minutes: 30
     strategy:
       fail-fast: true
       matrix:
@@ -84,6 +85,7 @@ jobs:
   # its own CPU. Rust's linker signs the arm64 binary ad hoc, which is all macOS needs to run it (it's never
   # quarantined: curl and npm don't set the flag).
   build-macos:
+    timeout-minutes: 30
     strategy:
       fail-fast: true
       matrix:

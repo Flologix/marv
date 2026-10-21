@@ -61,6 +61,7 @@ port_file="$work/port"
 command="echo made > made-here.txt; if (echo x > '$outside/escaped') 2>/dev/null; then echo outside-write-allowed; else echo outside-write-refused; fi"
 echo "smoke: $(command -v python3): $(python3 -c 'import sys; print(sys.version.split()[0])' 2>&1)"
 stub_log="$work/stub.log"
+started=$(date +%s)
 python3 "$root/packaging/stub_provider.py" "$port_file" "$command" >"$stub_log" 2>&1 &
 stub=$!
 stub_failed() {
@@ -77,6 +78,7 @@ while [ ! -s "$port_file" ]; do
 	sleep 0.1
 done
 port=$(cat "$port_file")
+echo "smoke: the stub provider started in $(($(date +%s) - started)) s"
 
 turn() { # turn <name> <marv command>
 	t="$work/turn-$1"
@@ -87,22 +89,31 @@ turn() { # turn <name> <marv command>
  "trajectories": false, "diagnostics": false, "checks": false}
 EOF
 	set +e
-	(cd "$t/project" && env -i PATH="$PATH" HOME="$t/home" MARV_CONFIG_DIR="$t/config" XDG_RUNTIME_DIR="$t/run" \
-		MARV_GITHUB=off TERM=dumb "$2" -p "run the smoke command" </dev/null >"$t/stdout" 2>"$t/stderr")
+	began=$(date +%s)
+	(cd "$t/project" && exec env -i PATH="$PATH" HOME="$t/home" MARV_CONFIG_DIR="$t/config" XDG_RUNTIME_DIR="$t/run" \
+		MARV_GITHUB=off TERM=dumb "$2" -p "run the smoke command" </dev/null >"$t/stdout" 2>"$t/stderr") &
+	marv=$!
+	# macOS has no `timeout`: a turn that hangs is killed after 5 minutes instead of holding the release up.
+	(sleep 300 && kill "$marv" 2>/dev/null) &
+	dog=$!
+	wait "$marv"
 	code=$?
+	kill "$dog" 2>/dev/null
 	set -e
-	echo "smoke: [$1] marv -p exited $code; it printed:"
+	echo "smoke: [$1] marv -p exited $code after $(($(date +%s) - began)) s; it printed:"
 	sed 's/^/  | /' "$t/stdout"
 	[ ! -s "$t/stderr" ] || {
 		echo "smoke: [$1] stderr:"
 		sed 's/^/  | /' "$t/stderr"
 	}
 	[ "$code" -eq 0 ] || fail "[$1] marv -p exited $code"
-	! grep -qi unsandboxed "$t/stderr" "$t/stdout" || fail "[$1] the command ran unsandboxed"
+	# bash.rs's warning when there's no sandbox: "... isn't available here, so this runs WITHOUT a sandbox".
+	! grep -q "WITHOUT a sandbox" "$t/stderr" "$t/stdout" || fail "[$1] the command ran unsandboxed"
+	! grep -q outside-write-allowed "$t/stdout" || fail "[$1] the command could write outside the project"
 	[ -f "$t/project/made-here.txt" ] || fail "[$1] the bash command didn't run in the project"
 	[ ! -e "$outside/escaped" ] || fail "[$1] the sandbox let the command write outside the project"
 	if [ "$(uname -s)" = Darwin ]; then
-		grep -q outside-write-refused "$t/stdout" || fail "[$1] Seatbelt didn't refuse the write outside the project"
+		grep -q 'tool said: outside-write-refused' "$t/stdout" || fail "[$1] Seatbelt didn't refuse the write outside the project"
 	fi
 	echo "smoke: [$1] the turn ran sandboxed"
 }
