@@ -6,7 +6,7 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
-## [0.8.0] - 2026-10-20
+## [0.8.0] - 2026-10-21
 
 ### Added
 
