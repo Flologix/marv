@@ -653,17 +653,33 @@ mod tests {
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
 
         // grep and read_file give it back as the web content it is: fenced, and it taints.
-        let clean = ToolContext { tool_output: Some(dir.clone()), ..ToolContext::new(std::env::temp_dir()) };
+        // Each in a fresh session of its own, so neither passes on the other's taint.
         for (name, args) in [
             ("grep", json!({"pattern": "xxx", "path": saved.display().to_string()})),
             ("read_file", json!({"path": saved.display().to_string()})),
         ] {
+            let clean = ToolContext { tool_output: Some(dir.clone()), ..ToolContext::new(std::env::temp_dir()) };
+            assert!(!clean.taint.is_tainted());
             let call = ToolCall { id: "g".into(), name: name.into(), arguments: args.to_string() };
             let out = run_tool(&call, &clean, crate::builtin_tools()).await.result;
             assert!(!out.is_error, "{name}: {}", out.output);
             assert_eq!(out.provenance, Provenance::Web, "{name}");
+            assert!(clean.taint.is_tainted(), "{name}");
         }
-        assert!(clean.taint.is_tainted());
+    }
+
+    #[tokio::test]
+    async fn a_failed_save_only_loses_the_note() {
+        let s = long_server("x").await;
+        let store = crate::test_support::TempDir::new("web-save-fails");
+        store.write("file", "not a folder");
+        let asked = Asked::new(Decision::Yes);
+        let ctx = ToolContext { tool_output: Some(store.path().join("file")), ..ctx(&asked) };
+        let out = fetch(&local_tool(), &format!("{}/long.txt", s.base()), None, &ctx).await.result;
+        assert!(!out.is_error, "{}", out.output);
+        assert!(out.output.contains("characters 0-30000 of 70000"), "{:.300}", out.output);
+        assert!(!out.output.contains("Whole page saved"));
+        assert_eq!(std::fs::read_to_string(store.path().join("file")).unwrap(), "not a folder");
     }
 
     #[tokio::test]
