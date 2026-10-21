@@ -21,7 +21,8 @@
 //!
 //! marv-rs additions (docs/SECURITY.md): a tainted session's egress (`ToolKind::Egress` or `uses_network`) and any
 //! write to a protected path are gated, skip yolo, and reach the approver with `must_ask` set; a result whose
-//! provenance taints marks the session. A web request (`egress_url`) under a URL prefix the user approved after the
+//! provenance taints marks the session; a result's provenance is raised to the tool's declared one
+//! (`Tool::provenance_in`), so a tool can't hand outside text over as the project's by leaving it unset. A web request (`egress_url`) under a URL prefix the user approved after the
 //! taint runs as approved; "always" on a tainted one approves its prefix (`web_fetch::url_prefix`), not the site.
 
 use std::path::MAIN_SEPARATOR;
@@ -181,12 +182,15 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
     // A door out of the sandbox (Marv #47, #51, #52): the prompt shows its warning, the result and trajectory name
     // it, and a `once` call is never remembered (the session's approver holds that, whatever the client answers).
     let door = tool.door(input, ctx);
+    // What the tool declares its output to be, for this call: no result is trusted more than that.
+    let declared = tool.provenance_in(input, ctx);
     let finish = |result: Result<ToolOutput, crate::types::ToolError>, approval: Option<Approval>| {
         let mut result = match result {
             Ok(result) => result,
             Err(err) => return noted(fail(err.0, &label)),
         };
         result.door = door;
+        result.provenance = result.provenance.least_trusted(declared);
         if result.provenance.taints() {
             ctx.taint.mark(result.provenance);
         }
@@ -643,6 +647,50 @@ mod tests {
         assert!(c.taint.is_tainted());
     }
 
+    /// A tool that declares an outside source but leaves its results at `ToolOutput::ok`'s project default.
+    struct Forgetful;
+    #[async_trait]
+    impl Tool for Forgetful {
+        type Input = Value;
+        fn name(&self) -> &str {
+            "forgetful"
+        }
+        fn description(&self) -> &str {
+            ""
+        }
+        fn schema(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn kind(&self) -> ToolKind {
+            ToolKind::Read
+        }
+        fn provenance(&self) -> Provenance {
+            Provenance::Github
+        }
+        fn label(&self, _input: &Value) -> String {
+            "x".into()
+        }
+        async fn run(&self, _input: &Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::ok("someone else's words", "ok"))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_result_is_raised_to_its_tools_declared_source_never_lowered() {
+        let c = ctx();
+        let call = ToolCall { id: "f".into(), name: "forgetful".into(), arguments: "{}".into() };
+        let out = run_tool(&call, &c, &[Arc::new(Forgetful) as ToolRef]).await;
+        assert_eq!(out.result.provenance, Provenance::Github);
+        assert!(c.taint.is_tainted());
+        // A tool that declares its own words keeps a less trusted source it set on the result (a mesh answer).
+        let t: Vec<ToolRef> = vec![Arc::new(Echo { kind: ToolKind::Read, safe: false, provenance: Provenance::Mcp })];
+        assert_eq!(run_tool(&call_named("echo"), &ctx(), &t).await.result.provenance, Provenance::Mcp);
+    }
+
+    fn call_named(name: &str) -> ToolCall {
+        ToolCall { id: "n".into(), name: name.into(), arguments: r#"{"text": "x"}"#.into() }
+    }
+
     #[test]
     fn builtin_specs_are_in_marvs_order_and_skill_and_plan_are_optional() {
         let names: Vec<&str> = tool_specs().iter().map(|s| s.name.as_str()).collect();
@@ -767,6 +815,9 @@ mod tests {
             }
             fn kind(&self) -> ToolKind {
                 ToolKind::Execute
+            }
+            fn provenance(&self) -> Provenance {
+                Provenance::Project
             }
             fn checkpoint(&self) -> bool {
                 false

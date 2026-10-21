@@ -33,6 +33,8 @@ pub fn source_name(provenance: Provenance) -> &'static str {
         Provenance::Image => "image",
         Provenance::Hook => "hook",
         Provenance::Herdr => "herdr",
+        Provenance::Github => "github",
+        Provenance::Network => "network",
     }
 }
 

@@ -589,8 +589,10 @@ impl Tool for MeshTool {
     fn checkpoint(&self) -> bool {
         false
     }
+    /// Marv's own words (the list, a send's receipt) at the least; an answer or message from another agent is marked
+    /// `Mesh` on the result itself (it comes fenced) and taints.
     fn provenance(&self) -> Provenance {
-        Provenance::Mesh
+        Provenance::Marv
     }
     fn check(&self, input: &Self::Input) -> Result<(), String> {
         marv_mesh::tools::check(self.name, input).map_err(|e| e.to_string())

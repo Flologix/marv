@@ -116,6 +116,13 @@ impl Tool for ReadFile {
         }
         Ok(())
     }
+    fn kind(&self) -> marv_core::ToolKind {
+        marv_core::ToolKind::Read
+    }
+    /// The project's files. A saved tool output read back keeps the source it was saved with (`saved_provenance`).
+    fn provenance(&self) -> marv_core::Provenance {
+        marv_core::Provenance::Project
+    }
     fn label(&self, input: &ReadFileInput) -> String {
         input.path.clone()
     }

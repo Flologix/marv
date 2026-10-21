@@ -323,6 +323,8 @@ pub fn tainted_text(source: marv_core::Provenance) -> String {
         marv_core::Provenance::Image => "an image",
         marv_core::Provenance::Hook => "a session-start hook's output",
         marv_core::Provenance::Herdr => "what another Herdr pane shows",
+        marv_core::Provenance::Github => "text from GitHub",
+        marv_core::Provenance::Network => "a networked command's output",
         _ => "untrusted content",
     };
     format!(

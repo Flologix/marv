@@ -109,6 +109,8 @@ async fn a_read_runs_without_asking_yolo_or_not_as_gh_with_the_project_as_cwd() 
         assert!(approver.asked().is_empty());
         assert_eq!(out.label, "gh pr list");
         assert_eq!(out.result.door, Some(Door::Github));
+        // Other people's text: an outside source, so it's fenced and taints.
+        assert_eq!(out.result.provenance, marv_core::Provenance::Github);
         assert!(out.result.output.contains("fake gh pr list"), "{}", out.result.output);
         assert!(out.result.output.contains("[exit code 0]"));
         let calls = f.calls();

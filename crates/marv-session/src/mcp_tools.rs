@@ -114,6 +114,14 @@ impl Tool for ToolSearchTool {
     fn schema(&self) -> Value {
         marv_mcp::deferred::deferred_specs()[0].parameters.clone()
     }
+    fn kind(&self) -> ToolKind {
+        ToolKind::Read
+    }
+    /// Marv's listing. The servers' descriptions and schemas in it are fenced in the text itself, and don't taint:
+    /// the person installed the servers.
+    fn provenance(&self) -> Provenance {
+        Provenance::Marv
+    }
     fn label(&self, input: &Self::Input) -> String {
         if input.names.is_empty() { input.query.clone().unwrap_or_default() } else { input.names.join(", ") }
     }
@@ -167,8 +175,10 @@ impl Tool for McpCallTool {
     fn checkpoint(&self) -> bool {
         false
     }
+    /// Its own words (a decline, no one to ask) at the least: the real tool's result comes marked `Mcp` from the
+    /// inner `run_tool`, fenced and tainting.
     fn provenance(&self) -> Provenance {
-        Provenance::Mcp
+        Provenance::Marv
     }
     fn label(&self, input: &Self::Input) -> String {
         input.tool.clone()

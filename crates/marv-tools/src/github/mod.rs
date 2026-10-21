@@ -371,6 +371,15 @@ impl Tool for Github {
             "additionalProperties": false
         })
     }
+    /// Whether it asks is `needs_approval`'s (reads run at once, writes ask).
+    fn kind(&self) -> marv_core::ToolKind {
+        marv_core::ToolKind::Read
+    }
+    /// What gh returns was written by other people (issues, pull requests, comments, logs): outside text, fenced, and
+    /// it taints the conversation.
+    fn provenance(&self) -> marv_core::Provenance {
+        marv_core::Provenance::Github
+    }
     fn check(&self, input: &GithubInput) -> Result<(), String> {
         if input.args.is_empty() {
             return Err("args: must have at least 1 item".into());
@@ -486,7 +495,7 @@ impl Tool for Github {
         };
         let note = if shown.count > 0 { format!("\n\n{}", redacted_note(shown.count)) } else { String::new() };
         Ok(ToolOutput::ok(
-            format_output_with(&result, |t| cut_for_call(t, ctx, marv_core::Provenance::Project)) + &note,
+            format_output_with(&result, |t| cut_for_call(t, ctx, marv_core::Provenance::Github)) + &note,
             status + &redacted,
         ))
     }

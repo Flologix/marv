@@ -242,13 +242,49 @@ pub enum Provenance {
     /// What the Herdr door read back (#74): other panes' screens, names and titles, which another agent or program
     /// wrote. Fenced as data and tainting, like a mesh message.
     Herdr,
+    /// What the GitHub door returned: issues, pull requests, comments, logs and API answers, which other people wrote.
+    Github,
+    /// The output of a command that ran with the network (bash with `network: true` or on the host, a background
+    /// process started with the network): it can print whatever a server sent it.
+    Network,
+}
+
+/// The three kinds of source a piece of text in a model's context can have (`docs/SECURITY.md`, "Provenance and
+/// taint"). Ordered from most to least trusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceClass {
+    /// The person (what they type and answer, their own files and config) and Marv's fixed words: not fenced.
+    Authority,
+    /// The project folder the person chose to work in (files, local git history, checks, the formatter) and a
+    /// subagent's report: quoted where Marv speaks about it, never tainting.
+    Workspace,
+    /// Anything someone other than the person could have written over a network or from another agent: fenced as
+    /// data, and it taints the conversation.
+    Outside,
 }
 
 impl Provenance {
+    /// The class of source this is ([`SourceClass`]).
+    pub fn class(self) -> SourceClass {
+        match self {
+            Self::User | Self::Marv => SourceClass::Authority,
+            Self::Project | Self::Subagent => SourceClass::Workspace,
+            Self::Web | Self::Mcp | Self::Mesh | Self::Image | Self::Hook | Self::Herdr | Self::Github | Self::Network => {
+                SourceClass::Outside
+            }
+        }
+    }
+
     /// Whether text from this source taints the session (exfiltration-capable
-    /// calls ask from then on, even in yolo).
+    /// calls ask from then on, even in yolo): an [`SourceClass::Outside`] source.
     pub fn taints(self) -> bool {
-        matches!(self, Self::Web | Self::Mcp | Self::Mesh | Self::Image | Self::Hook | Self::Herdr)
+        self.class() == SourceClass::Outside
+    }
+
+    /// The less trusted of the two (by [`SourceClass`]; `self` when they're the same class).
+    pub fn least_trusted(self, other: Provenance) -> Provenance {
+        if other.class() > self.class() { other } else { self }
     }
 }
 

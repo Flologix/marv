@@ -593,6 +593,11 @@ impl Tool for HerdrDoor {
     fn kind(&self) -> ToolKind {
         ToolKind::Execute
     }
+    /// Marv's own words about what it did, at the least; what it read from a pane is marked `Herdr` on the result
+    /// itself (fenced, tainting).
+    fn provenance(&self) -> Provenance {
+        Provenance::Marv
+    }
     /// Nothing it does changes the project's files (a worktree is a new folder and branch).
     fn checkpoint(&self) -> bool {
         false

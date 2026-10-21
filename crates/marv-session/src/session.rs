@@ -3241,6 +3241,12 @@ mod tests {
         fn schema(&self) -> serde_json::Value {
             serde_json::json!({"type": "object"})
         }
+        fn kind(&self) -> marv_core::ToolKind {
+            marv_core::ToolKind::Read
+        }
+        fn provenance(&self) -> marv_core::Provenance {
+            marv_core::Provenance::Project
+        }
         fn label(&self, _input: &Self::Input) -> String {
             String::new()
         }
@@ -5158,6 +5164,12 @@ mod turn_tests {
         fn schema(&self) -> serde_json::Value {
             serde_json::json!({"type": "object"})
         }
+        fn kind(&self) -> marv_core::ToolKind {
+            marv_core::ToolKind::Read
+        }
+        fn provenance(&self) -> marv_core::Provenance {
+            marv_core::Provenance::Project
+        }
         fn label(&self, _input: &Self::Input) -> String {
             "probe".into()
         }
@@ -5228,6 +5240,9 @@ mod turn_tests {
         }
         fn kind(&self) -> marv_core::ToolKind {
             marv_core::ToolKind::Execute
+        }
+        fn provenance(&self) -> marv_core::Provenance {
+            marv_core::Provenance::Project
         }
         fn label(&self, _input: &Self::Input) -> String {
             "d".into()

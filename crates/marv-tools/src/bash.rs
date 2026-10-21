@@ -532,6 +532,15 @@ impl Tool for Bash {
     fn label(&self, input: &BashInput) -> String {
         input.command.clone()
     }
+    /// A command's output: the project's.
+    fn provenance(&self) -> marv_core::Provenance {
+        marv_core::Provenance::Project
+    }
+    /// A command that ran with the network (`network: true`, or on the host, which has it) can print whatever a server
+    /// sent it: outside text, fenced, and it taints the conversation. Offline in the sandbox, it's the project's.
+    fn provenance_in(&self, input: &BashInput, ctx: &ToolContext) -> marv_core::Provenance {
+        if self.uses_network_in(input, ctx) { marv_core::Provenance::Network } else { marv_core::Provenance::Project }
+    }
     fn uses_network(&self, input: &BashInput) -> bool {
         input.network.unwrap_or(false)
     }
@@ -662,10 +671,12 @@ impl Tool for Bash {
             let note = if shown.count > 0 { format!("\n{}", redacted_note(shown.count)) } else { String::new() };
             let redacted = if shown.count > 0 { format!(" · {} redacted", shown.count) } else { String::new() };
             let summary = format!("{} · on your machine{redacted}", command_summary(&result, timeout));
-            return Ok(ToolOutput::ok(
-                format_output_with(&result, |t| cut_for_call(t, ctx, marv_core::Provenance::Project)) + &note,
+            let mut out = ToolOutput::ok(
+                format_output_with(&result, |t| cut_for_call(t, ctx, marv_core::Provenance::Network)) + &note,
                 summary,
-            ));
+            );
+            out.provenance = marv_core::Provenance::Network;
+            return Ok(out);
         }
         // A command that runs without asking sees .git read-only: git runs hooks and config from it outside any
         // sandbox (the user's next commit, their editor), so a planted hook would escape. Without a .git, it can't
@@ -754,7 +765,10 @@ impl Tool for Bash {
                 result.output.push_str(&format!("\n{gh}\n"));
             }
         }
-        Ok(ToolOutput::ok(format_output_with(&result, |t| cut_for_call(t, ctx, marv_core::Provenance::Project)), summary))
+        let source = if network { marv_core::Provenance::Network } else { marv_core::Provenance::Project };
+        let mut out = ToolOutput::ok(format_output_with(&result, |t| cut_for_call(t, ctx, source)), summary);
+        out.provenance = source;
+        Ok(out)
     }
 }
 
@@ -1201,6 +1215,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_networked_commands_output_is_outside_text_an_offline_ones_the_projects() {
+        let root = TempDir::new("bash-network-source");
+        let ctx = tool_ctx(&root, false);
+        let online = BashInput { network: Some(true), ..bash("echo hi") };
+        assert_eq!(Bash.provenance_in(&online, &ctx), marv_core::Provenance::Network);
+        assert_eq!(Bash.run(&online, &ctx).await.unwrap().provenance, marv_core::Provenance::Network);
+        assert_eq!(Bash.provenance_in(&bash("echo hi"), &ctx), marv_core::Provenance::Project);
+        assert_eq!(Bash.run(&bash("echo hi"), &ctx).await.unwrap().provenance, marv_core::Provenance::Project);
+    }
+
+    #[tokio::test]
     async fn the_hidden_home_note_is_added_in_the_sandbox_after_the_output_without_counting_as_output() {
         require_bwrap!();
         let root = TempDir::new("bash-note-home");
@@ -1411,9 +1436,13 @@ mod tests {
         ctx.tool_output = Some(store.path().join("s1"));
         let command = format!("echo {token}; seq 1 20000");
         let out = crate::run_tool(&host_call(&command, json!({})), &ctx, &tools()).await;
-        let saved = std::fs::read_to_string(store.path().join("s1/h1.txt")).unwrap();
+        // A host command has the network: its output is outside text, saved under that source so a read gives it back.
+        let path = store.path().join("s1/h1.network.txt");
+        let saved = std::fs::read_to_string(&path).unwrap();
         assert!(saved.starts_with("[redacted token]\n1\n") && !saved.contains(&token));
         assert!(out.result.output.contains("Marv: 1 token was redacted from this output."));
+        assert_eq!(out.result.provenance, marv_core::Provenance::Network);
+        assert_eq!(crate::output::saved_provenance(&path), marv_core::Provenance::Network);
     }
 
     #[tokio::test]

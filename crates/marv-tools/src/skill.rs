@@ -62,6 +62,13 @@ impl Tool for SkillTool {
             "additionalProperties": false
         })
     }
+    fn kind(&self) -> marv_core::ToolKind {
+        marv_core::ToolKind::Read
+    }
+    /// A skill's instructions and files: the person's own or the project's.
+    fn provenance(&self) -> marv_core::Provenance {
+        marv_core::Provenance::Project
+    }
     fn label(&self, input: &SkillInput) -> String {
         match &input.file {
             Some(file) => format!("{}/{file}", input.name),

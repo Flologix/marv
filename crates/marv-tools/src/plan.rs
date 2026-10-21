@@ -113,6 +113,13 @@ impl Tool for Plan {
         }
         Ok(())
     }
+    fn kind(&self) -> marv_core::ToolKind {
+        marv_core::ToolKind::Read
+    }
+    /// Marv's own words about the model's own list.
+    fn provenance(&self) -> marv_core::Provenance {
+        marv_core::Provenance::Marv
+    }
     fn label(&self, _input: &PlanInput) -> String {
         "Plan".into()
     }

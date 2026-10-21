@@ -172,6 +172,10 @@ impl Tool for EditFile {
     fn check(&self, input: &EditFileInput) -> Result<(), String> {
         if input.old_string.is_empty() { Err("old_string: must not be empty".into()) } else { Ok(()) }
     }
+    /// The project's files (and its formatter's output, quoted).
+    fn provenance(&self) -> marv_core::Provenance {
+        marv_core::Provenance::Project
+    }
     fn label(&self, input: &EditFileInput) -> String {
         input.path.clone()
     }

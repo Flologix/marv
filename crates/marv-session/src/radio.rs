@@ -181,7 +181,7 @@ impl Tool for RadioTx {
     }
     /// Its result is Marv's own sentence: it doesn't taint.
     fn provenance(&self) -> Provenance {
-        Provenance::Project
+        Provenance::Marv
     }
     /// §8.2, §12 item 1: the opt-in is the one decision; a message doesn't ask, tainted or not.
     fn needs_approval(&self, _input: &Self::Input) -> Option<bool> {

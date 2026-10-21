@@ -24,7 +24,8 @@
 //! - `ToolKind::Egress` and `uses_network`: once the session is tainted ([`marv_sandbox::TaintState`]) such calls ask
 //!   even in yolo and even after an "always" (`ApprovalRequest::must_ask`).
 //! - `protected_target`: a write to a protected path asks even in yolo.
-//! - `provenance`: every result is tagged with its source; web/MCP/mesh results taint the session.
+//! - `provenance`: every result is tagged with its source; outside sources (web, MCP, mesh, GitHub, networked
+//!   commands…) are fenced and taint the session. `kind` and `provenance` have no defaults: each tool declares both.
 //! - The typed `Input` replaces zod. The trait is generic; [`DynTool`] is its object-safe, type-erased form that the
 //!   registry holds (`Arc<dyn DynTool>`), and every `T: Tool` gets it for free.
 
@@ -482,7 +483,8 @@ pub struct ToolOutput {
     /// The user said no (or the run was interrupted): the agent stops so they can say what to do instead.
     pub declined: bool,
     pub approval: Option<Approval>,
-    /// Where `output` came from (marv-rs): text from anything but the user or Marv is fenced as data.
+    /// Where `output` came from (marv-rs): text from an outside source is fenced as data and taints. [`ToolOutput::ok`]
+    /// starts it at the project's; `run_tool` raises it to the tool's declared source ([`Tool::provenance_in`]).
     pub provenance: Provenance,
     /// The door the call went through (for trajectories); None for an ordinary call. Set by `run_tool`.
     pub door: Option<Door>,
@@ -531,13 +533,18 @@ pub trait Tool: Send + Sync + 'static {
     fn description(&self) -> &str;
     /// The input's JSON schema, as sent to the model. Must be the same bytes every time (prompt cache).
     fn schema(&self) -> Value;
-    /// Read (the default) runs freely; the rest need approval unless `needs_approval` decides.
-    fn kind(&self) -> ToolKind {
-        ToolKind::Read
-    }
-    /// Where this tool's output comes from (marv-rs).
-    fn provenance(&self) -> Provenance {
-        Provenance::Project
+    /// Read runs freely; the rest need approval unless `needs_approval` decides. No default: every tool says what it
+    /// is, so a new one can't run without asking by omission.
+    fn kind(&self) -> ToolKind;
+    /// Where this tool's output comes from (marv-rs): no result of it is trusted more than this. No default: every
+    /// tool says, so a new one can't hand the model outside text as the project's by omission. `run_tool` raises every
+    /// result to at least this source ([`Provenance::least_trusted`]), whatever the tool set on it. A tool whose
+    /// results are sometimes less trusted says so per call ([`Tool::provenance_in`]) or on the result itself (a mesh
+    /// answer, a saved MCP output read back): a result is never made more trusted than the tool set it.
+    fn provenance(&self) -> Provenance;
+    /// `provenance` for one call in `ctx` (bash with the network or on the host). Default: `provenance`.
+    fn provenance_in(&self, _input: &Self::Input, _ctx: &ToolContext) -> Provenance {
+        self.provenance()
     }
     /// Calls of this tool that come together in one reply run at the same time (subagents).
     fn parallel(&self) -> bool {
@@ -640,6 +647,7 @@ pub trait DynTool: Send + Sync {
     fn spec(&self) -> ToolSpec;
     fn kind(&self) -> ToolKind;
     fn provenance(&self) -> Provenance;
+    fn provenance_in(&self, input: In<'_>, ctx: &ToolContext) -> Provenance;
     fn parallel(&self) -> bool;
     fn checkpoint(&self) -> bool;
     /// Deserialize and check; the error is the text after "Invalid input for <tool>:".
@@ -681,6 +689,9 @@ impl<T: Tool> DynTool for T {
     }
     fn provenance(&self) -> Provenance {
         Tool::provenance(self)
+    }
+    fn provenance_in(&self, input: In<'_>, ctx: &ToolContext) -> Provenance {
+        Tool::provenance_in(self, typed::<T>(input), ctx)
     }
     fn parallel(&self) -> bool {
         Tool::parallel(self)

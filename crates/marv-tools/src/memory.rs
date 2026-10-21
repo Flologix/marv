@@ -210,6 +210,10 @@ impl Tool for Memory {
     fn checkpoint(&self) -> bool {
         false
     }
+    /// Marv's own sentence about what it saved (the text is the model's own).
+    fn provenance(&self) -> marv_core::Provenance {
+        marv_core::Provenance::Marv
+    }
     fn check(&self, input: &MemoryInput) -> Result<(), String> {
         if input.text.is_empty() { Err("text: must not be empty".into()) } else { Ok(()) }
     }
