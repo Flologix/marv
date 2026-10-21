@@ -36,6 +36,7 @@ pub mod repair;
 pub mod schema_repair;
 pub mod skill;
 pub mod syntax;
+pub mod table;
 pub mod types;
 pub mod web;
 pub mod web_fetch;

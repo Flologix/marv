@@ -164,6 +164,7 @@ Each guard's doc comment says how it was proven: the guard was reverted, and the
 | Hidden web text: HTML comments in raw Markdown | `web.rs::html_comments_in_raw_markdown_are_dropped` | Proven (#5) |
 | Images: any image taints | `images.rs::an_image_taints` | Proven |
 | Images: sources, quarantined reader, sandboxed decoding | `images.rs::*` | Ignored: needs vision |
+| `docs/TOOLS.md` is generated from the tools' code and current | `tools.rs::tools_md_matches_the_code` | Proven (`Glob::kind` changed to `Write`) |
 
 ## Notes
 
