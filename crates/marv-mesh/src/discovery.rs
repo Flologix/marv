@@ -679,7 +679,13 @@ mod tests {
         let env = |v: &str| [("XDG_RUNTIME_DIR".to_string(), v.to_string())].into_iter().collect::<marv_mcp::Env>();
         #[cfg(not(target_os = "macos"))]
         {
-            assert_eq!(mesh_dir(&env("/run/user/1000")), Some(PathBuf::from("/run/user/1000/marv/mesh")));
+            // The runtime folder is made and checked, so it has to be a real private folder of this user's.
+            let xdg = PathBuf::from(format!("/tmp/mx-disc-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&xdg);
+            std::os::unix::fs::DirBuilderExt::mode(&mut std::fs::DirBuilder::new(), 0o700).create(&xdg).unwrap();
+            let got = mesh_dir(&env(xdg.to_str().unwrap()));
+            let _ = std::fs::remove_dir_all(&xdg);
+            assert_eq!(got, Some(xdg.join("marv/mesh")));
             assert_eq!(mesh_dir(&env("relative")), None);
             assert_eq!(mesh_dir(&Default::default()), None);
         }
