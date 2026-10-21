@@ -165,7 +165,7 @@ In `LoopState::decide`, `StepOutcome::Error(message)` where `is_context_overflow
 
 marv-agent depends on marv-provider already, so it can call `is_context_overflow` directly.
 
-**Session hook (marv-session):** `attempt` picks the **starting** level. Within one hook call, the session walks down the levels itself (§3.5.1), so a summary request that overflows doesn't end the recovery:
+**Session hook (marv-session):** The **starting** level is max(`attempt`, the last level that succeeded this step + 1). Within one hook call, the session walks down the levels itself (§3.5.1), so a summary request that overflows doesn't end the recovery:
 
 | attempt | What the session does |
 |---|---|
