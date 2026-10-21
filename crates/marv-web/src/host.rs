@@ -57,6 +57,34 @@ pub struct ChatSpec {
     pub host_commands: bool,
 }
 
+/// `/trust`, offered where the chat loads the project's files (the person's own machine).
+const TRUST_COMMAND: (&str, &str) =
+    ("trust", "Use this folder's instructions, skills and agent types as yours (from the next chat)");
+
+/// `/trust`: the project's files as this chat found them, trusted for exactly those contents, from the next chat (this
+/// one's system prompt and tools stay as they are).
+async fn trust_project(
+    spec: &ChatSpec,
+    files: &marv_session::project_trust::ProjectFiles,
+    status: &marv_session::project_trust::TrustStatus,
+) -> String {
+    use marv_session::project_trust::{ProjectTrust, TrustStatus};
+    if files.is_empty() {
+        return "This folder has no instruction files, skills or agent types to trust.".into();
+    }
+    if *status == TrustStatus::Trusted {
+        return "You trusted this folder's instructions already: they're used as yours.".into();
+    }
+    let key = marv_session::paths::project_key(&spec.root);
+    match ProjectTrust::in_config(&spec.config_dir).trust(&key, files).await {
+        Ok(()) => format!(
+            "Trusted this folder's instructions ({}): they're used as yours from the next chat. A change to any of them asks again.",
+            marv_core::printable(&files.summary())
+        ),
+        Err(e) => format!("Couldn't trust them: {e}"),
+    }
+}
+
 /// The commands the page offers in its `/` menu (besides the skills), and what they do here.
 const COMMANDS: &[(&str, &str)] = &[
     ("help", "Show the commands"),
@@ -156,14 +184,25 @@ pub async fn run_chat(spec: ChatSpec, mut incoming: UnboundedReceiver<ClientMess
         tokio::spawn(watch_mesh(handle, session.clone(), approver.clone(), out.clone(), watching.clone()));
     }
     let home = marv_session::paths::home_dir();
+    // The project's instructions, skills and agent types, as this chat found them, and whether the person trusted
+    // them (the session loaded them to match): an untrusted project's skills aren't offered here either.
+    let project_trust = spec.sources.contains(&Source::Project).then(|| {
+        let files = marv_session::project_trust::project_files(&spec.root, &home);
+        let key = marv_session::paths::project_key(&spec.root);
+        let status = marv_session::project_trust::ProjectTrust::in_config(&spec.config_dir).status(&key, &files);
+        (files, status)
+    });
+    let trusted = project_trust.as_ref().is_some_and(|(_, status)| status.trusted());
     let skills: Vec<LoadedSkill> = if spec.sources.is_empty() {
         Vec::new()
     } else {
-        let (project, user) = (spec.sources.contains(&Source::Project), spec.sources.contains(&Source::User));
+        let (project, user) = (spec.sources.contains(&Source::Project) && trusted, spec.sources.contains(&Source::User));
         marv_session::skills::load_skills(project.then_some(spec.root.as_path()), user.then_some(home.as_path())).0
     };
     let menu: Vec<Value> = COMMANDS
         .iter()
+        .copied()
+        .chain(project_trust.as_ref().map(|_| TRUST_COMMAND))
         .map(|(name, description)| json!({"name": name, "description": description}))
         .chain(skills.iter().map(|s| json!({"name": s.skill.name, "description": s.skill.description, "skill": true})))
         .collect();
@@ -226,6 +265,10 @@ pub async fn run_chat(spec: ChatSpec, mut incoming: UnboundedReceiver<ClientMess
                     "permissions" => {
                         let servers = session.mcp().map(|m| m.status());
                         print(marv_session::permissions::permissions_text(&session.permissions(), None, servers.as_deref()))
+                    }
+                    "trust" if project_trust.is_some() => {
+                        let Some((files, status)) = &project_trust else { continue };
+                        print(trust_project(&spec, files, status).await)
                     }
                     "memory" => print(match session.memory() {
                         Some(m) if !m.personal.is_empty() || !m.project.is_empty() => {

@@ -38,6 +38,7 @@ pub mod mesh_process;
 pub mod paths;
 pub mod permissions;
 pub mod processes;
+pub mod project_trust;
 pub mod prompt;
 pub mod provenance;
 pub mod radio;

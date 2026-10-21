@@ -278,6 +278,10 @@ pub struct SessionInit {
     /// result there, once per conversation (#62; `crate::instructions::NestedInstructions`). Default false: an SDK
     /// session reads the project's files only when it asks for the `Project` source; the CLI sets it.
     pub nested_instructions: bool,
+    /// The person trusted this project's instructions (`crate::project_trust`): nested instruction files come as the
+    /// project's instructions, not quoted as its data. Default false. The caller loads `instructions`, `skills` and
+    /// `agents` to match (`crate::instructions::load_instructions_as`, `crate::sources::load_sources`).
+    pub project_trusted: bool,
     pub skills: Vec<LoadedSkill>,
     /// Agent types the agent tool can start (default: general-purpose).
     pub agents: Vec<AgentType>,
@@ -392,6 +396,7 @@ impl SessionInit {
             version: env!("CARGO_PKG_VERSION").into(),
             instructions: None,
             nested_instructions: false,
+            project_trusted: false,
             skills: Vec::new(),
             agents: vec![general_purpose()],
             memory: None,
@@ -1090,7 +1095,7 @@ impl MarvSession {
             taint: Arc::new(TaintState::new()),
             skills: Arc::new(init.skills.iter().map(|s| s.skill.clone()).collect()),
             loaded: Arc::default(),
-            nested: Arc::default(),
+            nested: Arc::new(crate::instructions::NestedInstructions::new(init.project_trusted)),
             typecheck: Arc::new(Checker::new(Arc::new(crate::diagnostics::turn::Typecheck), None)),
             project_checks: Arc::new(Checker::new(Arc::new(crate::checks::kind::ProjectChecksKind), None)),
             process_on,
@@ -1732,6 +1737,7 @@ impl MarvSession {
             cwd: self.cwd(),
             instructions: init.instructions.clone(),
             nested_instructions: init.nested_instructions,
+            nested_trusted: init.project_trusted,
             worktrees_dir: init.worktrees_dir.clone(),
             factory: factory.clone(),
             provider: provider.clone(),

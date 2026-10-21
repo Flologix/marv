@@ -372,6 +372,8 @@ pub struct HeadlessOptions {
     pub approve: Vec<String>,
     /// `--approve-tainted` and `--approve-protected`.
     pub must_ask: MustAsk,
+    /// `--trust-project`: the project's instructions, skills and agent types are used as the person's for this run.
+    pub trust_project: bool,
 }
 
 /// Runs one headless turn and writes the result to stdout. Returns the exit code.
@@ -501,6 +503,10 @@ pub async fn run_headless(options: HeadlessOptions) -> ExitCode {
     builder.options.herdr = marv_session::herdr_door::setup_from_env(&env, config.herdr_peers, &door_outside);
     // A worker the Herdr door spawned from a tainted conversation starts tainted (MARV_TAINTED=1: only adds taint).
     builder.options.tainted_at_start = marv_session::config::tainted_at_start(&env);
+    // A project's instructions count as the person's only where they trusted exactly these files, or with
+    // --trust-project for this run (nothing is stored): a CI run on a cloned repository doesn't take its AGENTS.md as
+    // its owner's words by default.
+    builder.options.trust_project = options.trust_project.then_some(true);
     builder.options.compact_tokens = config.compact_tokens;
     // The mesh, when asked for (`--approve mesh:<r>` or `MARV_MESH_NAME`): otherwise a one-off `marv -p` isn't on it
     // and its model isn't offered the mesh tools. Wires are granted only for the listed receptacles, from this run's

@@ -4,7 +4,10 @@
 //!   project's: both your own files, never in the repository), and your MCP servers (`mcp.json`).
 //! - `Project`: the repository: `AGENTS.md` (or `CLAUDE.md`) and the parent folders' `AGENTS.md` up to the git root
 //!   (#62), `.marv/skills`, `.marv/agents`, and `.mcp.json` (whose servers still start only once trusted, with
-//!   `/mcp trust` in the CLI). Nested `AGENTS.md` files come with the tool results that touch their folders.
+//!   `/mcp trust` in the CLI). Nested `AGENTS.md` files come with the tool results that touch their folders. The
+//!   instruction files, skills and agent types count as the person's only in a project they trusted
+//!   (`crate::project_trust`); otherwise the instruction files are quoted as the project's data, and the skills and
+//!   agent types aren't loaded.
 //!
 //! The CLI loads both. A program using the SDK loads neither unless it asks: a library mustn't quietly read your
 //! files, or start a repository's servers.
@@ -15,7 +18,7 @@ use marv_mcp::config::{Include, McpServerConfig, load_mcp_config};
 
 use crate::agents::{AgentType, load_agents};
 use crate::config::Env;
-use crate::instructions::load_instructions;
+use crate::instructions::load_instructions_as;
 use crate::memory::{Memories, MemoryPaths, load_memory, memory_paths};
 use crate::prompt::Instructions;
 use crate::skills::{LoadedSkill, load_skills};
@@ -39,11 +42,13 @@ pub struct Loaded {
 }
 
 /// Loads only the `sources` asked for. `config_dir` holds memory and `mcp.json`; personal skills and agents live in
-/// `<home>/.marv` (even with another config dir, as the CLI does).
-pub async fn load_sources(root: &Path, sources: &[Source], config_dir: &Path, home: &Path, env: &Env) -> Loaded {
+/// `<home>/.marv` (even with another config dir, as the CLI does). `trusted`: the person trusted the project's
+/// instructions (`crate::project_trust`); when not, its instruction files are quoted as its data and its skills and
+/// agent types aren't loaded.
+pub async fn load_sources(root: &Path, sources: &[Source], config_dir: &Path, home: &Path, env: &Env, trusted: bool) -> Loaded {
     let user = sources.contains(&Source::User);
     let project = sources.contains(&Source::Project);
-    let (root_base, home_base) = (project.then_some(root), user.then_some(home));
+    let (root_base, home_base) = ((project && trusted).then_some(root), user.then_some(home));
     let (skills, mut problems) = load_skills(root_base, home_base);
     let (agents, agent_problems) = load_agents(root_base, home_base);
     problems.extend(agent_problems);
@@ -61,7 +66,7 @@ pub async fn load_sources(root: &Path, sources: &[Source], config_dir: &Path, ho
     } else {
         None
     };
-    let loaded = load_instructions(root, home, user, project);
+    let loaded = load_instructions_as(root, home, user, project, trusted);
     problems.extend(loaded.problems);
     Loaded { instructions: loaded.instructions, skills, agents, memory, mcp_servers, problems }
 }

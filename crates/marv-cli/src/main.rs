@@ -93,6 +93,7 @@ fn main() -> ExitCode {
                     max_steps: cli.max_steps,
                     approve: cli.approve,
                     must_ask: headless::MustAsk { tainted: cli.approve_tainted, protected: cli.approve_protected },
+                    trust_project: cli.trust_project,
                 };
                 headless::run_headless(options).await as i32
             }

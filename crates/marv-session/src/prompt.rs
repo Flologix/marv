@@ -235,10 +235,12 @@ fn skills_section(skills: &[Listed]) -> String {
 const PROJECT_HEADING: &str = "# Project instructions (from ";
 const PARENT_HEADING: &str = "# Instructions from a parent folder (";
 const PERSONAL_HEADING: &str = "# The user's own instructions, for every project (from ";
+/// A project's instruction file the person hasn't trusted (`crate::project_trust`).
+const QUOTED_HEADING: &str = "# This project's instruction files, quoted as data (from ";
 
 fn project_section(instructions: Option<&str>) -> String {
     match instructions {
-        Some(text) if [PROJECT_HEADING, PARENT_HEADING, PERSONAL_HEADING].iter().any(|h| text.starts_with(h)) => {
+        Some(text) if [PROJECT_HEADING, PARENT_HEADING, PERSONAL_HEADING, QUOTED_HEADING].iter().any(|h| text.starts_with(h)) => {
             format!("\n\n{text}")
         }
         Some(text) if !text.is_empty() => {
@@ -380,6 +382,9 @@ pub struct InstructionFile {
     /// `~/.marv/AGENTS.md`.
     pub shown: String,
     pub raw: String,
+    /// A project or parent file of a project whose instructions the person hasn't trusted (`crate::project_trust`):
+    /// it goes in quoted as the project's data, under Marv's fixed note, not as instructions.
+    pub quoted: bool,
 }
 
 /// What became of one file in the prompt, for the startup notice.
@@ -512,14 +517,29 @@ pub fn render_instructions(files: &[InstructionFile]) -> Option<Instructions> {
                 "{shown}\n\n({} was cut off here: the instruction files share a limit of {MAX_INSTRUCTION_CHARS} characters, and the ones above used the rest. Lines {}-{} of it aren't in this prompt.)",
                 file.shown, cut.next_line, cut.total_lines
             ),
-            (None, _) => shown,
+            (None, _) => shown.clone(),
         };
-        let heading = match file.kind {
-            InstructionKind::Project => PROJECT_HEADING,
-            InstructionKind::Parent => PARENT_HEADING,
-            InstructionKind::Personal => PERSONAL_HEADING,
-        };
-        sections.push(format!("{heading}{})\n\n{body}", file.shown));
+        if file.quoted {
+            // Not the person's words: Marv's note first, then the file fenced as the project's data. A cut's note is
+            // Marv's, so it goes after the fence.
+            let fenced = marv_core::untrusted_block("project", &file.shown, &shown);
+            let after = match &cut {
+                Some(_) => body.strip_prefix(shown.as_str()).unwrap_or_default().to_string(),
+                None => String::new(),
+            };
+            sections.push(format!(
+                "{QUOTED_HEADING}{})\n\n{}\n\n{fenced}{after}",
+                file.shown,
+                crate::project_trust::UNTRUSTED_NOTE
+            ));
+        } else {
+            let heading = match file.kind {
+                InstructionKind::Project => PROJECT_HEADING,
+                InstructionKind::Parent => PARENT_HEADING,
+                InstructionKind::Personal => PERSONAL_HEADING,
+            };
+            sections.push(format!("{heading}{})\n\n{body}", file.shown));
+        }
         if file.kind == InstructionKind::Project {
             project_cut = cut.map(|cut| InstructionsCut { file: file.shown.clone(), ..cut });
         }
@@ -887,7 +907,7 @@ mod tests {
     }
 
     fn file(kind: InstructionKind, shown: &str, raw: &str) -> InstructionFile {
-        InstructionFile { kind, shown: shown.into(), raw: raw.into() }
+        InstructionFile { kind, shown: shown.into(), raw: raw.into(), quoted: false }
     }
 
     #[test]
