@@ -5993,7 +5993,7 @@ mod turn_tests {
         let requests = provider.requests();
         let first = text_of(&requests[0].0[0]);
         assert!(first.starts_with("(Automatic note from Marv"), "{first}");
-        assert!(first.contains("<untrusted-data source=\"hook\" from=\"session-start hook: echo x >>"), "{first}");
+        assert!(first.contains("<untrusted-data source=\"hook\" from=\"session-start hook: echo x &gt;&gt;"), "{first}");
         assert!(first.contains("queue run 1\n[exit code 0]"), "{first}");
         assert!(first.ends_with("</untrusted-data>\n\none"), "{first}");
         // Once: the second message is only what was typed, and the first stays as it was sent (append-only history).

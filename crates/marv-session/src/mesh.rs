@@ -850,7 +850,7 @@ mod tests {
             .run(&serde_json::Map::new(), &ToolContext::new(std::env::temp_dir()))
             .await
             .unwrap();
-        assert!(out.output.starts_with("You're wired to:"), "{}", out.output);
+        assert!(out.output.starts_with("You're wired to ("), "{}", out.output);
         assert_eq!(out.provenance, Provenance::Mesh);
 
         // A Marv that never answers its door doesn't hold the list up past a stopped turn.
@@ -974,7 +974,7 @@ mod tests {
 
         // Now wired, they're listed as wired, not as wireable.
         let out = tool(MESH_LIST, &parent, &mesh, None).run(&serde_json::Map::new(), &ctx).await.unwrap();
-        assert!(out.output.starts_with("You're wired to:"), "{}", out.output);
+        assert!(out.output.starts_with("You're wired to ("), "{}", out.output);
         assert!(out.output.ends_with("\n- w1-p3 (claude, working): herdr.pane.w1-p3.send"), "{}", out.output);
         assert!(!out.output.contains("- web: "), "{}", out.output);
         cancel.cancel();

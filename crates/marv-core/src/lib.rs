@@ -284,6 +284,36 @@ pub enum MarvError {
 
 pub type Result<T, E = MarvError> = std::result::Result<T, E>;
 
+/// The tag that fences text quoted as data for a model (`<untrusted-data source=… from=…>`). `marv_session::provenance`
+/// builds it for tool results; MCP tool descriptions in Marv's notes use it too ([`untrusted_block`]).
+pub const UNTRUSTED_TAG: &str = "untrusted-data";
+
+/// `text` fenced as data: `<untrusted-data source="<source>" from="<from>">`, the text, the closing tag. The text
+/// can't close the fence (its closing tags are defused, [`defuse_closing_tag`]) and `source` and `from` can't end
+/// their attribute or the tag ([`escape_attribute`]).
+pub fn untrusted_block(source: &str, from: &str, text: &str) -> String {
+    let (source, from) = (escape_attribute(source), escape_attribute(from));
+    let body = defuse_closing_tag(text, UNTRUSTED_TAG);
+    format!("<{UNTRUSTED_TAG} source=\"{source}\" from=\"{from}\">\n{body}\n</{UNTRUSTED_TAG}>")
+}
+
+/// `value` as it can sit inside a double-quoted attribute: `&`, `"`, `<` and `>` as entities, and line breaks and
+/// other control characters as spaces, so a fence's opening tag stays one line that `value` can't close.
+pub fn escape_attribute(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            c if c.is_control() => out.push(' '),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// `text` with every closing tag for `tag` (`</tag`, in any case, spaces allowed after `</`) turned into `<\/…`, so
 /// text quoted inside a `<tag>` fence can't close it. `tag` is ASCII.
 pub fn defuse_closing_tag(text: &str, tag: &str) -> String {
