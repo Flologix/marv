@@ -45,6 +45,25 @@ macro_rules! require_bwrap {
     };
 }
 
+/// Skips a test that needs this platform's sandbox (bubblewrap on Linux, Seatbelt on macOS) where it can't start.
+/// On macOS the guards' fixture answers `__guard` in place of `marv` (a test binary can't), so it's set first.
+#[macro_export]
+macro_rules! require_sandbox {
+    () => {
+        $crate::use_fixture_as_guard(env!("CARGO_BIN_EXE_marv-guards-fixture"));
+        if !marv_sandbox::backend().available() {
+            eprintln!("skipped: the {} sandbox isn't available here", marv_sandbox::backend().name());
+            return;
+        }
+    };
+}
+
+/// The binary Seatbelt runs as `marv __guard` (`marv_sandbox::seatbelt_backend::set_guard_exe`): the guards'
+/// fixture, which answers it. Harmless elsewhere (bwrap needs no guard).
+pub fn use_fixture_as_guard(fixture: &str) {
+    marv_sandbox::seatbelt_backend::set_guard_exe(fixture);
+}
+
 /// A fresh temp folder (real path), removed on drop.
 pub struct TempDir(PathBuf);
 
@@ -70,7 +89,11 @@ impl TempDir {
     /// change. Falls back to the temp folder where `/var/tmp` isn't writable.
     pub fn outside_tmp(tag: &str) -> Self {
         let var_tmp = Path::new("/var/tmp");
-        let probe = var_tmp.join(format!(".marv-guards-probe-{}", std::process::id()));
+        // Its own name per call: the tests of one binary run at once, and one's remove_file would make another's
+        // check fail (then it fell back to the temp folder, whose path on macOS is too long for a socket).
+        static PROBE: AtomicUsize = AtomicUsize::new(0);
+        let n = PROBE.fetch_add(1, Ordering::Relaxed);
+        let probe = var_tmp.join(format!(".marv-guards-probe-{}-{n}", std::process::id()));
         let writable = std::fs::write(&probe, "").and_then(|()| std::fs::remove_file(&probe)).is_ok();
         let parent = if writable { var_tmp.to_path_buf() } else { std::env::temp_dir() };
         Self::new_in(&parent, tag)

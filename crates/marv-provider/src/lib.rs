@@ -9,6 +9,8 @@
 //!   through its native API ([`ollama`]), because only the native API can set `num_ctx`.
 //! - Errors never surface as `Err`: an adapter yields [`ProviderEvent::Error`] with a message the
 //!   user can act on ([`errors`]), and SDK sessions name the option to change ([`errors::SDK_HINTS`]).
+//! - Z.ai's GLM Coding Plan (#159) goes through [`openai_compat`] too, on the plan's coding endpoint
+//!   ([`models::ZAI_CODING_BASE_URL`]) with the plan's own key.
 //! - `/think` on OpenRouter is its unified `reasoning: { enabled }` switch, decided by
 //!   [`reasoning_for`] from what the model list says ([`models::ReasoningSupport`]).
 //! - Marv's `Config`/`PRESETS`/`resolveConfig` live in `marv-session`; this crate only takes the
@@ -22,12 +24,15 @@ use futures::Stream;
 use marv_core::{ChatTurn, ProviderEvent, ToolChoice, ToolSpec};
 use tokio_util::sync::CancellationToken;
 
+pub mod chatgpt;
 pub mod degenerate;
 pub mod errors;
 pub mod factory;
 pub mod models;
+pub mod offered;
 pub mod ollama;
 pub mod openai_compat;
+pub mod responses;
 pub mod retry;
 pub mod sse;
 
@@ -76,14 +81,21 @@ pub trait Provider: Send + Sync {
 pub enum ProviderKind {
     OpenRouter,
     Ollama,
+    /// #159: Z.ai's GLM Coding Plan, a subscription, through its OpenAI-compatible coding endpoint.
+    Zai,
+    /// #159: Sign in with ChatGPT: the person's ChatGPT plan, through the Responses API ([`chatgpt`]).
+    #[serde(rename = "chatgpt")]
+    ChatGpt,
 }
 
 impl ProviderKind {
-    /// The id recorded with sessions and trajectories ("openrouter", "ollama").
+    /// The id recorded with sessions and trajectories ("openrouter", "ollama", "zai").
     pub fn id(self) -> &'static str {
         match self {
             Self::OpenRouter => "openrouter",
             Self::Ollama => "ollama",
+            Self::Zai => "zai",
+            Self::ChatGpt => "chatgpt",
         }
     }
 
@@ -92,6 +104,8 @@ impl ProviderKind {
         match self {
             Self::OpenRouter => "OpenRouter",
             Self::Ollama => "Ollama",
+            Self::Zai => "Z.ai",
+            Self::ChatGpt => "ChatGPT",
         }
     }
 }
@@ -112,6 +126,8 @@ pub struct ProviderConfig {
     pub thinking: bool,
     /// `reasoningEffort` (marv-rs #143): how hard an OpenRouter model reasons, where it reasons at all.
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// #159: the ChatGPT sign-in's token file (`<config dir>/chatgpt.json`); `None` for the other providers.
+    pub auth_file: Option<std::path::PathBuf>,
 }
 
 /// OpenRouter's unified reasoning setting, as sent in the request body: `{"enabled": bool}` or `{"effort": "low"}`.
@@ -179,6 +195,54 @@ pub fn reasoning_for(
     }
 }
 
+/// #159: the ChatGPT provider's options. The token goes only to OpenAI's public API ([`chatgpt::API_BASE_URL`]),
+/// whatever `baseUrl` the config names, and the token file must be an absolute path (a relative or empty one would
+/// read whatever file the working folder has).
+pub fn chatgpt_options(config: &ProviderConfig, hints: ErrorHints) -> Result<responses::ResponsesOptions, String> {
+    let path = config.auth_file.clone().filter(|p| p.is_absolute()).ok_or_else(|| {
+        "ChatGPT: Marv doesn't know where the sign-in is kept (set HOME or MARV_CONFIG_DIR), so it can't sign the request."
+            .to_string()
+    })?;
+    Ok(responses::ResponsesOptions {
+        name: format!("chatgpt · {}", config.model),
+        label: ProviderKind::ChatGpt.label().into(),
+        base_url: chatgpt::API_BASE_URL.into(),
+        model: config.model.clone(),
+        credentials: chatgpt::ChatGptCredentials::new(chatgpt::AuthStore { path }),
+        headers: Vec::new(),
+        reasoning_effort: config.reasoning_effort,
+        encrypted_reasoning: true,
+        max_output_tokens: None,
+        // The route's preview takes function tools only grouped in a namespace.
+        tool_namespace: Some(responses::MARV_TOOLS),
+        // The account's model list gives no window: Marv's table, or a safe default.
+        context_length: Some(chatgpt::context_window(&config.model)),
+        hints,
+        timing: Default::default(),
+        idle_timeout: Some(openai_compat::STREAM_IDLE_TIMEOUT),
+    })
+}
+
+/// A provider that can't be made: every request ends with `message` (it never fails up front, as the trait says).
+pub struct FailingProvider {
+    pub name: String,
+    pub message: String,
+}
+
+impl Provider for FailingProvider {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn context_length(&self) -> Option<u64> {
+        None
+    }
+
+    fn stream(&self, _history: &[ChatTurn], _options: StreamOptions) -> EventStream {
+        Box::pin(futures::stream::iter([ProviderEvent::Error(self.message.clone())]))
+    }
+}
+
 /// The one place that maps a config to a concrete [`Provider`]. `model`: what the model list says
 /// about it (its reasoning support, and #96 its output limit). `hints`: what a bad key or an unknown model
 /// tells the user to change (the TUI's commands by default; the SDK passes [`errors::SDK_HINTS`]).
@@ -214,6 +278,36 @@ pub fn create_provider(config: &ProviderConfig, model: Option<&ModelInfo>, hints
                 context_length: model.and_then(|m| m.context),
             }))
         }
+        // #159: the GLM Coding Plan on Z.ai's coding endpoint, with the plan's own key. Its models always reason
+        // (`thinking: disabled` is refused), so neither `/think` nor a reasoning switch is sent; `tool_stream` asks for
+        // tool calls in fragments, as OpenRouter streams them (without it they come whole at the end).
+        ProviderKind::Zai => {
+            let mut body = serde_json::Map::new();
+            body.insert("tool_stream".into(), serde_json::Value::Bool(true));
+            let known = models::zai_models().into_iter().find(|m| m.id == config.model);
+            let info = model.or(known.as_ref());
+            Arc::new(openai_compat::OpenAiCompatProvider::new(openai_compat::OpenAiCompatOptions {
+                name: format!("zai · {}", config.model),
+                label: ProviderKind::Zai.label().into(),
+                base_url: config.base_url.clone(),
+                model: config.model.clone(),
+                api_key: config.api_key.clone(),
+                headers: Vec::new(),
+                body,
+                offline_hint: None,
+                hints,
+                timing: Default::default(),
+                idle_timeout: Some(openai_compat::STREAM_IDLE_TIMEOUT),
+                max_tokens: Some(openai_compat::max_tokens_for(info.and_then(|m| m.max_output))),
+                context_length: info.and_then(|m| m.context),
+            }))
+        }
+        // #159: the person's ChatGPT plan, through the Responses API with the sign-in's token. The route refuses
+        // `max_output_tokens` and sampling fields, so none are sent; the reasoning effort is, with a summary.
+        ProviderKind::ChatGpt => match chatgpt_options(config, hints) {
+            Ok(options) => Arc::new(responses::ResponsesProvider::new(options)),
+            Err(why) => Arc::new(FailingProvider { name: format!("chatgpt · {}", config.model), message: why }),
+        },
         // Ollama's native API, so the context window can be set (its default is 4096 tokens).
         ProviderKind::Ollama => Arc::new(ollama::OllamaProvider::new(ollama::OllamaOptions {
             base_url: config.base_url.clone(),
@@ -265,6 +359,29 @@ mod tests {
             Some(ReasoningSwitch::effort(ReasoningEffort::Low))
         );
         assert_eq!(reasoning_for(false, low, Some(ReasoningSupport::Optional)), Some(ReasoningSwitch::OFF));
+    }
+
+    #[test]
+    fn chatgpt_requests_go_only_to_openais_api_with_an_absolute_token_file() {
+        let config = ProviderConfig {
+            provider: ProviderKind::ChatGpt,
+            model: "gpt-6.1-sol".into(),
+            base_url: "https://evil.example/v1".into(),
+            api_key: Some("sk-or".into()),
+            context_length: 0,
+            thinking: false,
+            reasoning_effort: None,
+            auth_file: Some("/home/u/.marv/chatgpt.json".into()),
+        };
+        let options = chatgpt_options(&config, ErrorHints::default()).unwrap();
+        assert_eq!(options.base_url, chatgpt::API_BASE_URL);
+        assert_eq!(options.tool_namespace, Some(responses::MARV_TOOLS));
+        for bad in [None, Some(std::path::PathBuf::new()), Some("chatgpt.json".into())] {
+            assert!(
+                chatgpt_options(&ProviderConfig { auth_file: bad.clone(), ..config.clone() }, ErrorHints::default()).is_err(),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]

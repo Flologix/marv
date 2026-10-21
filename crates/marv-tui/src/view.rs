@@ -289,6 +289,8 @@ pub struct ModelInfo {
     /// Runs on this machine (Ollama).
     pub local: bool,
     pub reasoning: Option<ReasoningMode>,
+    /// #159: the name to show beside the id, when the list has one (ChatGPT's `display_name`).
+    pub name: Option<String>,
 }
 
 /// One saved session for `/resume` (Marv `SessionSummary`).
@@ -335,6 +337,10 @@ pub enum PlanStatus {
 pub enum ProviderId {
     OpenRouter,
     Ollama,
+    /// #159: Z.ai's GLM Coding Plan.
+    Zai,
+    /// #159: Sign in with ChatGPT.
+    ChatGpt,
 }
 
 /// What setup needs to know about a provider (Marv `PRESETS[provider]`).
@@ -346,6 +352,8 @@ pub struct ProviderPreset {
     pub key_env: Option<String>,
     pub key_url: Option<String>,
     pub default_model: String,
+    /// #159: the person signs in (ChatGPT) instead of pasting a key.
+    pub sign_in: bool,
 }
 
 /// Where setup starts: the whole wizard (first run, `/setup`) or just the model (`/model`).
@@ -364,10 +372,45 @@ pub struct SetupContext {
     pub presets: Vec<ProviderPreset>,
     /// The saved provider and model; None on first run.
     pub current: Option<(ProviderId, String)>,
-    /// The saved API key, masked, if there is one.
-    pub saved_key: Option<String>,
+    /// The saved API key of each provider that has one, masked (#159: each provider has its own).
+    pub saved_keys: Vec<(ProviderId, String)>,
+    /// #159: the saved sign-ins (registrations) of providers that sign in, the one in use first.
+    pub accounts: Vec<(ProviderId, AccountInfo)>,
     /// A key found in the environment for each provider, masked.
     pub env_keys: Vec<(ProviderId, String)>,
+}
+
+/// #159: one saved sign-in (a ChatGPT registration).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountInfo {
+    /// What the engine knows it by (the issued client id).
+    pub id: String,
+    /// What's shown (an email).
+    pub label: String,
+    /// Signed in, with plan usage.
+    pub signed_in: bool,
+    /// The one in use.
+    pub active: bool,
+}
+
+/// #159: which registration a sign-in is for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignInTarget {
+    /// The one in use (a new registration when there's none).
+    Current,
+    /// A saved one, by id.
+    Account(String),
+    /// A new registration: another account.
+    New,
+}
+
+/// #159: how a sign-in is going.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignInProgress {
+    /// The browser was sent to this address (shown, in case it didn't open).
+    Started { url: String },
+    /// Signed in (who: an email, or "signed in"), or why not.
+    Done(Result<String, String>),
 }
 
 /// What the user chose in setup. `api_key: None` keeps the saved key.
@@ -602,6 +645,8 @@ pub enum UiEvent {
     Sessions(Vec<SessionSummary>),
     /// The answer to [`SessionPort::load_models`].
     Models(Result<Vec<ModelInfo>, String>),
+    /// #159: how a sign-in started with [`SessionPort::sign_in`] is going.
+    SignIn(SignInProgress),
     /// A session was brought back: replace the transcript.
     Resumed(Resumed),
     /// A short-lived status bar message ("Copied 3 lines").
@@ -731,6 +776,18 @@ pub trait SessionPort: Send + Sync {
 
     /// Setup finished: save the config and reconfigure the provider.
     fn complete_setup(&self, answer: SetupAnswer);
+
+    /// #159: setup's sign-in step: open the browser and wait for the sign-in ([`UiEvent::SignIn`]).
+    fn sign_in(&self, _provider: ProviderId, _target: SignInTarget) {}
+
+    /// #159: setup switched to another saved sign-in: make it the one in use ([`UiEvent::SignIn`] when done).
+    fn use_account(&self, _provider: ProviderId, _id: String) {}
+
+    /// #159: setup closed while a sign-in waited: stop listening for it.
+    fn cancel_sign_in(&self) {}
+
+    /// #159: setup's "sign out": revoke and forget the provider's sign-in.
+    fn sign_out(&self, _provider: ProviderId) {}
 
     /// `/resume` picked a session, or `marv -c` (`None` = the latest here).
     fn resume(&self, id: Option<String>);

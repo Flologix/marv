@@ -5,42 +5,91 @@
 //! person's `/tx` reaches the other Marv's model fenced, wakes it (wake on), and never reaches the sender's own model.
 //! Skipped without python3.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use marv_oracle::server::FakeServer;
 use serde_json::{Value, json};
 
 /// Runs `argv` in a pseudo-terminal of 40×160, appends what it draws to `log`, types each line read from stdin
-/// (with a carriage return), and prints the child's pid first.
+/// (with a carriage return), and prints the child's pid first. Once the child has exited (and been reaped), it waits
+/// for everything left in the child's session (`pty.fork` makes it a session leader) to end too, killing it after
+/// 10 s, prints `left <pids>` (what was still running then: nothing, after a clean exit) and `survived <pids>` (what
+/// was still there 5 s after the SIGKILLs), and exits; `sweep failed: …` if it couldn't list the processes.
+/// A process Marv started in a group of its own (a checkpoint's `git gc`, #191) is still in its session: one that
+/// outlived a killed Marv kept writing into the machine's folder while the test removed it.
 const PTY: &str = r#"
-import fcntl, os, pty, select, signal, struct, sys, termios
+import fcntl, os, pty, select, signal, struct, subprocess, sys, termios, time
 log, argv = sys.argv[1], sys.argv[2:]
 pid, fd = pty.fork()
 if pid == 0:
     fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 160, 0, 0))
     os.execv(argv[0], argv)
 print(pid, flush=True)
-inputs = [fd, sys.stdin]
+
+def session():
+    # Not `pgrep -s`: macOS's pgrep has no -s. A listing that fails raises: the check never passes for want of one.
+    listed = subprocess.run(["ps", "-A", "-o", "pid="], stdout=subprocess.PIPE, text=True, check=True).stdout.split()
+    if not listed:
+        raise RuntimeError("ps listed no processes")
+    found = []
+    for p in map(int, listed):
+        try:
+            if p != pid and os.getsid(p) == pid:
+                found.append(p)
+        except (ProcessLookupError, PermissionError):
+            pass
+    return found
+
+# Whether getsid sees marv's session (it drew something: it has exec'd, after pty.fork's setsid). If it can't, the
+# sweep would find nothing whatever is running: it fails instead.
+inputs, exited, seen = [fd, sys.stdin], False, None
 with open(log, "ab", buffering=0) as out:
-    while True:
-        ready, _, _ = select.select(inputs, [], [], 1.0)
+    while not exited:
+        exited = os.waitpid(pid, os.WNOHANG)[0] == pid
+        ready, _, _ = select.select(inputs, [], [], 0 if exited else 0.2)
         if fd in ready:
             try:
                 data = os.read(fd, 65536)
             except OSError:
-                break
-            if not data:
-                break
-            out.write(data)
+                data = b""
+            if data:
+                out.write(data)
+                if seen is None:
+                    try:
+                        seen = os.getsid(pid) == pid
+                    except OSError:
+                        seen = False
+            else:
+                inputs.remove(fd)
         if sys.stdin in ready:
             line = sys.stdin.readline()
             if not line:
                 inputs.remove(sys.stdin)
-            else:
+            elif not exited:
                 os.write(fd, line.rstrip("\n").encode() + b"\r")
+try:
+    if not seen:
+        raise RuntimeError("couldn't read marv's session id")
+    deadline = time.monotonic() + 10
+    while session() and time.monotonic() < deadline:
+        time.sleep(0.1)
+    left = session()
+    for p in left:
+        try:
+            os.kill(p, signal.SIGKILL)
+        except OSError:
+            pass
+    deadline = time.monotonic() + 5
+    while session() and time.monotonic() < deadline:
+        time.sleep(0.1)
+    print("left", *left, flush=True)
+    print("survived", *session(), flush=True)
+except Exception as e:
+    print("sweep failed:", e, flush=True)
+    sys.exit(1)
 "#;
 
 fn python() -> bool {
@@ -133,10 +182,11 @@ impl Machine {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
         let mut pid = String::new();
-        BufReader::new(child.stdout.take().unwrap()).read_line(&mut pid).unwrap();
+        stdout.read_line(&mut pid).unwrap();
         let stdin = child.stdin.take();
-        Tui { child, stdin, pid: pid.trim().parse().unwrap(), screen }
+        Tui { child, stdin, stdout, pid: pid.trim().parse().unwrap(), screen, killed: false, done: false }
     }
 
     fn ls(&self) -> String {
@@ -147,8 +197,14 @@ impl Machine {
 }
 
 impl Drop for Machine {
+    /// After every Tui has ended ([`Tui::exit`]), with nothing left running in its sessions: a process still writing
+    /// in the folder makes the removal fail midway (`Directory not empty`), leaving the rest behind (#191).
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        if let Err(e) = std::fs::remove_dir_all(&self.0)
+            && !std::thread::panicking()
+        {
+            panic!("couldn't remove {}: {e}", self.0.display());
+        }
     }
 }
 
@@ -156,9 +212,15 @@ impl Drop for Machine {
 struct Tui {
     child: Child,
     stdin: Option<ChildStdin>,
+    /// The helper's: marv's pid came first; `left …` comes last.
+    stdout: BufReader<ChildStdout>,
     /// marv's own pid (the helper's child).
     pid: i32,
     screen: PathBuf,
+    /// Killed on purpose: no `/exit`.
+    killed: bool,
+    /// The helper has exited.
+    done: bool,
 }
 
 impl Tui {
@@ -182,28 +244,96 @@ impl Tui {
         text
     }
 
+    /// Whether the prompt is up: past the splash, which a key only dismisses (it ate the `/` of a `/radio on` typed too
+    /// early on a slow macOS runner, #191), and in raw mode, where the pty's `\n` for a `\r` typed before it would be
+    /// ctrl+j, not Enter.
+    fn ready(&self) -> bool {
+        self.screen().contains(PROMPT)
+    }
+
+    /// Types `line` and Enter, once the prompt is up.
     fn type_line(&mut self, line: &str) {
+        wait_for("the prompt", || self.ready());
         let stdin = self.stdin.as_mut().unwrap();
         stdin.write_all(format!("{line}\n").as_bytes()).unwrap();
         stdin.flush().unwrap();
     }
 
-    fn kill(&self) {
+    /// SIGKILL: no goodbye, no cleanup. What it started in a process group of its own may outlive it; the helper
+    /// waits for (and then kills) what's left in its session.
+    fn kill(&mut self) {
+        self.killed = true;
         let _ = Command::new("kill").args(["-KILL", &self.pid.to_string()]).status();
+    }
+
+    /// Ends it and waits until marv and everything in its session has exited. Unless it was killed (or the test is
+    /// already failing: no slow goodbyes then), it's asked to leave (`/exit`, once its prompt is up) and given a minute,
+    /// as a person would. `Ok`: the pids still running 10 s after it exited (then killed); `Err`: the helper's sweep
+    /// failed, or something survived the kill.
+    fn exit(&mut self) -> Result<Vec<i32>, String> {
+        if self.done {
+            return Ok(Vec::new());
+        }
+        if std::thread::panicking() {
+            self.kill();
+        }
+        if !self.killed {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while !self.ready() && Instant::now() < deadline && self.child.try_wait().ok().flatten().is_none() {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            if let Some(stdin) = self.stdin.as_mut() {
+                let _ = stdin.write_all(b"/exit\n").and_then(|()| stdin.flush());
+            }
+        }
+        // Its EOF: the helper types nothing more, and exits once marv has.
+        self.stdin = None;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while self.child.try_wait().ok().flatten().is_none() {
+            if Instant::now() >= deadline {
+                // It didn't leave: killed, and the helper still sweeps its session.
+                self.kill();
+                let _ = self.child.wait();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        self.done = true;
+        let mut report = String::new();
+        let _ = self.stdout.read_to_string(&mut report);
+        let pids = |prefix: &str| -> Option<Vec<i32>> {
+            let line = report.lines().find_map(|l| l.strip_prefix(prefix))?;
+            Some(line.split_whitespace().filter_map(|p| p.parse().ok()).collect())
+        };
+        match (pids("left"), pids("survived")) {
+            (Some(left), Some(survived)) if survived.is_empty() => Ok(left),
+            (Some(_), Some(survived)) => Err(format!("still running after SIGKILL: {survived:?}")),
+            _ => Err(format!("the helper's sweep didn't finish: {report:?}")),
+        }
+    }
+
+    /// [`Self::exit`], asserting that a Marv that wasn't killed left nothing running.
+    fn quit(mut self) {
+        let left = self.exit().unwrap_or_else(|e| panic!("marv {}: {e}", self.pid));
+        assert!(left.is_empty(), "still running 10 s after marv {} exited: {left:?}", self.pid);
     }
 }
 
 impl Drop for Tui {
     fn drop(&mut self) {
-        self.kill();
+        let _ = self.exit();
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
 }
 
-/// Polls `ok` for up to a minute.
+/// The empty prompt's placeholder, blanks out (see [`Tui::screen`]).
+const PROMPT: &str = "Typeamessage,or/forcommands";
+
+/// Polls `ok` for up to two minutes: a slow runner's Marvs take a while to start, and a radio that missed a join
+/// re-lists every 30 s.
 fn wait_for(what: &str, mut ok: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_secs(120);
     while !ok() {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         std::thread::sleep(Duration::from_millis(100));
@@ -220,7 +350,7 @@ fn two_marvs_on_the_radio_see_each_other_and_a_killed_one_is_lost() {
     let model = FakeServer::start(vec![], vec![]).unwrap();
     let alpha = machine.tui("alpha", &model, true);
     wait_for("alpha on the mesh", || machine.socket("alpha").exists());
-    let beta = machine.tui("beta", &model, true);
+    let mut beta = machine.tui("beta", &model, true);
     let mut gamma = machine.tui("gamma", &model, false);
     wait_for("three Marvs on the mesh", || machine.ls().lines().count() == 3);
     let listed = machine.ls();
@@ -238,7 +368,16 @@ fn two_marvs_on_the_radio_see_each_other_and_a_killed_one_is_lost() {
 
     // gamma turns it on itself (`/radio on`, typed): it joins at once, and its config says so from now on.
     gamma.type_line("/radio on");
-    wait_for("gamma in alpha's strip", || alpha.screen().contains("gammaidle"));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !alpha.screen().contains("gammaidle") {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for gamma in alpha's strip; gamma's screen:\n{}\nalpha's:\n{}",
+            gamma.screen(),
+            alpha.screen()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
     let saved: Value =
         serde_json::from_str(&std::fs::read_to_string(machine.0.join("config-gamma/config.json")).unwrap()).unwrap();
     assert_eq!(saved["mesh"], json!({"radio": true}));
@@ -248,7 +387,9 @@ fn two_marvs_on_the_radio_see_each_other_and_a_killed_one_is_lost() {
     wait_for("beta lost on alpha's strip", || alpha.screen().contains("left(lost)"));
     wait_for("beta's socket swept", || !machine.socket("beta").exists());
     assert!(machine.socket("alpha").exists() && machine.socket("gamma").exists());
-    drop((alpha, beta, gamma));
+    beta.exit().unwrap();
+    alpha.quit();
+    gamma.quit();
 }
 
 /// Phase 2: alpha's person sends beta a message with `/tx`. alpha's transcript gets Marv's one line and alpha's model
@@ -290,5 +431,8 @@ fn a_tx_reaches_the_other_marvs_model_fenced_and_wakes_it() {
     assert!(tools.contains(&"radio_tx"), "{tools:?}");
     wait_for("beta's wake line", || beta.screen().contains("✻Radiomessagefromalpha(user)."));
     assert!(!alpha_model.requests().iter().any(|r| r.path.ends_with("/chat/completions")), "nothing reached alpha's own model");
-    drop((alpha, beta));
+    // beta's turn started a checkpoint prune, whose `git gc` (in a process group of its own) outlived a SIGKILLed beta
+    // and kept writing in config-beta while the folder was removed (#191): a Marv that's asked to leave takes it along.
+    alpha.quit();
+    beta.quit();
 }

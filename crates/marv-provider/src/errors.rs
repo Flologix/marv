@@ -11,6 +11,10 @@
 //! - A gateway's or proxy's HTML error page (a 502 from Cloudflare) says nothing useful and must
 //!   never reach the transcript: it's dropped.
 //!
+//! - #159: a subscription's limit (Z.ai's Coding Plan, the ChatGPT plan) is a hard stop with its own message
+//!   ([`plan_limit`]): never retried (it's a 429, which is otherwise retried) and never answered by switching to
+//!   another key or provider.
+//!
 //! Planned (Marv #63): recognize context-length overflow errors (OpenRouter and Ollama wording),
 //! so the loop can compact and retry the step ([`is_context_overflow`]). Planned (Marv #64):
 //! classify OpenRouter's `overloaded` / provider errors as retriable where they are.
@@ -77,10 +81,76 @@ pub fn transient(error: &ErrorObject) -> bool {
     if let Some(code) = code {
         return matches!(code, 408 | 429 | 500 | 502 | 503 | 504 | 520..=529);
     }
+    // #159: the ChatGPT plan's temporary ones: retried with backoff.
+    if let Some(serde_json::Value::String(code)) = &error.code
+        && matches!(code.as_str(), "subscription_sharing_usage_unavailable" | "subscription_sharing_user_unavailable")
+    {
+        return true;
+    }
     let message = error.message.as_deref().unwrap_or_default().to_lowercase();
     ["aborted", "timed out", "timeout", "overloaded", "temporarily unavailable", "service unavailable", "try again"]
         .iter()
         .any(|m| message.contains(m))
+}
+
+/// #159: what a plan's error code means, and what to do about it. Z.ai's codes (docs.z.ai/api-reference/api-code,
+/// all HTTP 429) and the ChatGPT plan's (developers.openai.com/siwc, errors and recovery). A temporary one
+/// (`subscription_sharing_usage_unavailable`, `…_user_unavailable`, 503) isn't here: it's retried with backoff
+/// ([`transient`] and the HTTP retry).
+fn plan_reason(code: &str) -> Option<(&'static str, &'static str)> {
+    let limit = "Try again once the limit resets, or choose another provider with /setup.";
+    Some(match code {
+        // Z.ai: the 5-hour, weekly or monthly limit (1316–1321: with no extra usage left or allowed).
+        "1308" | "1310" | "1316" | "1317" | "1318" | "1319" | "1320" | "1321" => ("your plan's usage limit is reached", limit),
+        "1113" => {
+            ("the account has no balance or resource package left", "Top it up on z.ai, or choose another provider with /setup.")
+        }
+        "1309" => ("your GLM Coding Plan has expired", "Renew it on z.ai, or choose another provider with /setup."),
+        "1311" => ("your plan doesn't include this model", "Pick a model the plan includes with /model."),
+        "1313" => (
+            "Z.ai says this account's usage doesn't comply with its Fair Usage Policy",
+            "Ask Z.ai to restore access, or choose another provider with /setup.",
+        ),
+        "1314" => {
+            ("your enterprise package has expired", "Ask your enterprise administrator, or choose another provider with /setup.")
+        }
+        "1315" => (
+            "this key is for the enterprise coding package only",
+            "Use the key for your plan from z.ai, or choose another provider with /setup.",
+        ),
+        // ChatGPT.
+        "subscription_sharing_usage_limit_exceeded" => (
+            "the usage limit for Marv on your ChatGPT plan is reached",
+            "See chatgpt.com/settings/usage for your plan's and Marv's limits, or choose another provider with /setup.",
+        ),
+        "subscription_sharing_user_not_eligible" => (
+            "ChatGPT plan usage isn't available for this account, workspace or policy",
+            "Signing in again won't change that; choose another provider with /setup.",
+        ),
+        _ => return None,
+    })
+}
+
+/// #159: the hard-stop message for a plan's error, or `None` when it isn't one. `code` as the provider sent it (a
+/// number or a string), `message` its text.
+pub fn plan_limit_of(label: &str, code: Option<&serde_json::Value>, message: Option<&str>) -> Option<String> {
+    let code = match code? {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Number(n) => n.to_string(),
+        _ => return None,
+    };
+    let (reason, advice) = plan_reason(&code)?;
+    let detail = message.filter(|m| !m.trim().is_empty()).map(|m| format!(" ({})", clip(m.trim(), MAX_RAW))).unwrap_or_default();
+    Some(format!("{label}: {reason}{detail}. Marv stopped here and won't switch to another key or provider on its own. {advice}"))
+}
+
+/// #159: [`plan_limit_of`] for an error response's body (`{"error":{"code":…,"message":…}}`; OpenAI may put the code
+/// in `type`).
+pub fn plan_limit(label: &str, body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let error = value.get("error")?;
+    let code = error.get("code").filter(|c| !c.is_null()).or_else(|| error.get("type"));
+    plan_limit_of(label, code, error.get("message").and_then(serde_json::Value::as_str))
 }
 
 /// Pulls the message out of an error body (`{"error":{"message":…}}` or Ollama's `{"error":"…"}`).
@@ -95,6 +165,10 @@ pub fn error_message(content_type: Option<&str>, status_text: &str, body: &str) 
             Some(serde_json::Value::String(s)) => s.clone(),
             Some(err) if !err.is_null() && err != &serde_json::Value::Bool(false) => {
                 describe_error(&serde_json::from_value(err.clone()).unwrap_or_default())
+            }
+            // #159: OpenAI's admission errors, before a stream opens: `{"detail": "…"}` (diagnostic text).
+            _ if value.get("detail").and_then(serde_json::Value::as_str).is_some() => {
+                clip(value["detail"].as_str().unwrap_or_default(), MAX_RAW)
             }
             _ => body.to_string(),
         },
@@ -221,6 +295,39 @@ mod tests {
         };
         assert_eq!(describe_error(&err), "Provider returned error: Anthropic: tool_use ids must be unique");
         assert_eq!(describe_error(&ErrorObject::default()), "unknown error");
+    }
+
+    /// #159: a plan's limit is a hard stop with its own message; other errors aren't.
+    #[test]
+    fn plan_limits_are_recognised_by_their_codes() {
+        let zai = r#"{"error":{"code":"1308","message":"Usage limit reached for 5 hour. Your limit will reset at 2026-10-18 15:00:00"}}"#;
+        let message = plan_limit("Z.ai", zai).unwrap();
+        assert!(message.starts_with("Z.ai: your plan's usage limit is reached (Usage limit reached for 5 hour."), "{message}");
+        assert!(message.contains("won't switch to another key or provider"));
+        assert!(plan_limit("Z.ai", r#"{"error":{"code":1310,"message":"Weekly Limit Exhausted"}}"#).is_some());
+        let chatgpt = r#"{"error":{"type":"subscription_sharing_usage_limit_exceeded","message":"Plan usage limit reached"}}"#;
+        let message = plan_limit("ChatGPT", chatgpt).unwrap();
+        assert!(message.starts_with("ChatGPT: the usage limit for Marv on your ChatGPT plan is reached"), "{message}");
+        assert!(message.contains("chatgpt.com/settings/usage"));
+        // Each says what fits it: not eligible doesn't say "wait", a model outside the plan says /model.
+        let not_eligible = plan_limit("ChatGPT", r#"{"error":{"code":"subscription_sharing_user_not_eligible"}}"#).unwrap();
+        assert!(not_eligible.contains("won't change") && !not_eligible.contains("resets"), "{not_eligible}");
+        assert!(plan_limit("Z.ai", r#"{"error":{"code":"1311"}}"#).unwrap().contains("/model"));
+        assert!(plan_limit("Z.ai", r#"{"error":{"code":"1309"}}"#).unwrap().contains("Renew"));
+        for code in ["1314", "1315"] {
+            assert!(plan_limit("Z.ai", &format!(r#"{{"error":{{"code":"{code}"}}}}"#)).is_some(), "{code}");
+        }
+        // Temporary: retried, not a hard stop.
+        let unavailable = r#"{"error":{"code":"subscription_sharing_usage_unavailable","message":"Usage couldn't be checked"}}"#;
+        assert_eq!(plan_limit("ChatGPT", unavailable), None);
+        let e = ErrorObject { code: Some("subscription_sharing_usage_unavailable".into()), message: None, metadata: None };
+        assert!(transient(&e));
+        // OpenAI's admission errors carry `detail`.
+        assert_eq!(error_message(None, "Forbidden", r#"{"detail":"Region not supported"}"#), "Region not supported");
+        // A passing rate limit (1302) or overload (1305) is retried like any 429, not a hard stop.
+        assert_eq!(plan_limit("Z.ai", r#"{"error":{"code":"1302","message":"Rate limit reached"}}"#), None);
+        assert_eq!(plan_limit("OpenRouter", r#"{"error":{"code":429,"message":"Rate limited"}}"#), None);
+        assert_eq!(plan_limit("X", "<html>"), None);
     }
 
     #[test]

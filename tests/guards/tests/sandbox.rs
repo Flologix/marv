@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use marv_guards::{Recorder, TempDir, call, require_bwrap, run_sandboxed, sandbox_with_home};
+use marv_guards::{Recorder, TempDir, call, require_bwrap, require_sandbox, run_sandboxed, sandbox_with_home};
 use marv_sandbox::git_guard::git_guard;
 use marv_sandbox::protected::{created_note, protected_snapshot, revert_created, scan_created};
 use marv_sandbox::{CommandMounts, ProtectedRule, Sandbox, resolve_in_project, resolve_within};
@@ -11,16 +11,27 @@ use marv_tools::{Approval, Decision, ToolContext, builtin_tools, run_tool};
 use serde_json::json;
 
 // ---- bubblewrap ----------------------------------------------------------------------------------------------
+//
+// The guards that check an outcome rather than how bwrap gets it run on both backends (`require_sandbox!`: bubblewrap
+// on Linux, Seatbelt on macOS, #166); the ones about bwrap's mounts (`/run`, the stand-in home, the after-scan's
+// reverts) stay `require_bwrap!`, with their macOS twins in `seatbelt.rs`.
 
 /// **CI never passes on skipped guards.** The sandbox guards skip where bubblewrap can't start a sandbox (a machine
 /// without it, a runner that blocks user namespaces), which would let a green run skip Marv's main boundary. CI sets
 /// `MARV_REQUIRE_SANDBOX=1`, and then this fails unless the sandbox really runs.
 ///
+/// The platform's backend is the one that must run: bubblewrap on Linux, Seatbelt (`sandbox-exec` with the guard) on
+/// macOS.
+///
 /// Proven: ran with `MARV_REQUIRE_SANDBOX=1` and `PATH` without bwrap → this test failed.
 #[test]
 fn where_the_sandbox_is_required_it_really_runs() {
+    marv_guards::use_fixture_as_guard(env!("CARGO_BIN_EXE_marv-guards-fixture"));
     if std::env::var_os("MARV_REQUIRE_SANDBOX").is_some_and(|v| v == "1") {
-        assert!(marv_sandbox::sandbox_available(), "MARV_REQUIRE_SANDBOX=1, but bubblewrap can't start a sandbox here");
+        let backend = marv_sandbox::backend();
+        assert!(backend.available(), "MARV_REQUIRE_SANDBOX=1, but {} can't start a sandbox here", backend.name());
+        let expected = if cfg!(target_os = "macos") { "Seatbelt" } else { "bubblewrap" };
+        assert_eq!(backend.name(), expected);
     }
 }
 
@@ -172,7 +183,7 @@ const CONNECT: &str = r#"connect() { if command -v python3 >/dev/null; then pyth
 /// connected too); dropped step 4 (the socket scan) → failed (`Projects/app/server.sock` connected).
 #[test]
 fn in_the_home_folder_no_socket_under_the_home_is_reachable() {
-    require_bwrap!();
+    require_sandbox!();
     let (home, _listeners) = home_project_fixture("home-sock");
     let sockets = [".config/herdr/herdr.sock", ".cache/tool/tool.sock", "Projects/app/server.sock"].map(|s| home.path().join(s));
     // The control: the same client reaches the sockets from the host.
@@ -202,7 +213,7 @@ fn in_the_home_folder_no_socket_under_the_home_is_reachable() {
 /// failed (the personal skill missing).
 #[test]
 fn in_the_home_folder_credentials_and_marvs_config_are_hidden() {
-    require_bwrap!();
+    require_sandbox!();
     let (home, _listeners) = home_project_fixture("home-secrets");
     let ran = run_sandboxed(
         &sandbox_with_home(home.path()),
@@ -227,7 +238,7 @@ fn in_the_home_folder_credentials_and_marvs_config_are_hidden() {
 /// dropped the note from bash's `run` → failed (no note).
 #[tokio::test]
 async fn in_the_home_folder_nothing_in_the_home_is_writable() {
-    require_bwrap!();
+    require_sandbox!();
     let (home, _listeners) = home_project_fixture("home-write");
     let ran = run_sandboxed(
         &sandbox_with_home(home.path()),
@@ -255,7 +266,7 @@ async fn in_the_home_folder_nothing_in_the_home_is_writable() {
 /// Proven: made every project read-only (`read_only = true` in `sandbox_args`) → failed (the file not written).
 #[test]
 fn a_project_in_a_subfolder_of_the_home_stays_writable() {
-    require_bwrap!();
+    require_sandbox!();
     let (home, _listeners) = home_project_fixture("home-sub");
     let project = home.path().join("Projects/app");
     let ran = run_sandboxed(
@@ -409,7 +420,7 @@ async fn in_the_home_folder_dotfiles_and_hooks_ask_even_in_yolo() {
 /// `AGENTS.md` changed).
 #[test]
 fn the_project_is_writable_but_git_and_protected_paths_are_read_only() {
-    require_bwrap!();
+    require_sandbox!();
     let (project, home) = (TempDir::new("proj"), TempDir::outside_tmp("proj-home"));
     for (rel, text) in [
         (".git/HEAD", "ref: refs/heads/main\n"),

@@ -81,16 +81,20 @@ jobs:
             exit 1
           fi
 
-  # macOS (#150): Marv compiles there but isn't ported yet. Not required: it shows what fails until it's green, then
-  # it becomes a required check. There's no bubblewrap, so the sandbox tests skip (no MARV_REQUIRE_SANDBOX) until the
-  # Seatbelt backend (#151).
+  # macOS (#150): not required yet: it shows what fails until it's green, then it becomes a required check. The sandbox
+  # is Seatbelt (#166: `sandbox-exec` with `marv __guard`), and as on Linux its guards must run, not skip:
+  # MARV_REQUIRE_SANDBOX=1, and a broken `sandbox-exec` fails the job before the tests.
   macos:
     runs-on: macos-14
     timeout-minutes: 45
     continue-on-error: true
+    env:
+      MARV_REQUIRE_SANDBOX: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Require a working sandbox
+        run: /usr/bin/sandbox-exec -p '(version 1)(allow default)' /usr/bin/true
       - run: cargo check --workspace --all-targets
       - run: cargo test --workspace --no-fail-fast

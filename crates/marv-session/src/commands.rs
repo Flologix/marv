@@ -659,7 +659,12 @@ pub fn help_text() -> String {
 fn config_text(ctx: &CommandContext) -> String {
     let c = ctx.config;
     let p = preset(c.provider);
+    let signed_in = || c.auth_file.clone().is_some_and(|path| marv_provider::chatgpt::AuthStore { path }.signed_in());
     let key = match (p.key_env, &c.api_key) {
+        // #159: ChatGPT signs in instead.
+        (None, _) if c.provider == marv_provider::ProviderKind::ChatGpt => {
+            if signed_in() { "signed in with ChatGPT (/setup to change)" } else { "not signed in (/setup)" }.to_string()
+        }
         (None, _) => "not needed".to_string(),
         (Some(env), Some(k)) => {
             format!("{} (from {})", mask_key(k), if c.api_key_source == Some(KeySource::Env) { env } else { "config file" })
@@ -875,7 +880,11 @@ pub fn yolo_status(config: &Config, sandbox_available: bool) -> String {
     } else {
         format!(
             "Yolo on: file edits run without asking. Commands still ask: {}, so nothing confines them.",
-            if config.sandbox { "bubblewrap isn't available here" } else { "the sandbox is off" }
+            if config.sandbox {
+                format!("{} isn't available here", marv_sandbox::backend().name())
+            } else {
+                "the sandbox is off".into()
+            }
         )
     }
 }
@@ -897,10 +906,13 @@ fn sandbox_status(config: &Config, available: bool, hidden: &[String]) -> String
         return "off: bash commands run directly on your system (after approval)".into();
     }
     if !available {
-        return "on, but bubblewrap isn't available here, so bash runs WITHOUT a sandbox".into();
+        return format!("on, but {} isn't available here, so bash runs WITHOUT a sandbox", marv_sandbox::backend().name());
     }
     let hidden = if hidden.is_empty() { String::new() } else { format!(" {}", hidden_path_folders_notice(hidden)) };
-    format!("on: bash runs in bubblewrap (project writable, home hidden, no network unless asked).{hidden}")
+    format!(
+        "on: bash runs in {} (project writable, home hidden, no network unless asked).{hidden}",
+        marv_sandbox::backend().name()
+    )
 }
 
 const MCP_USAGE: &str = "Usage: /mcp (list servers), /mcp add <npm package | pypi:<package> | https URL | GitHub repo | registry name> [--name <name>] [--env VAR] [--header \"Name: Bearer ${VAR}\"] [-- <server args>], /mcp search <words>, /mcp remove <name>, /mcp trust, /mcp login <name>, /mcp logout <name>";

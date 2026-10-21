@@ -16,12 +16,15 @@ pub struct Settings {
     pub spaces: Vec<Space>,
     #[serde(default)]
     pub active: Option<String>,
-    /// "openrouter" or "ollama", as chosen at onboarding.
+    /// "openrouter", "ollama", "zai" or "chatgpt" (#159), as chosen at onboarding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
     /// The OpenRouter key, when the user pasted one here (else `OPENROUTER_API_KEY` or `marv`'s own config).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    /// #159: the Z.ai Coding Plan key, when the user pasted one here (else `ZAI_API_KEY` or `marv`'s own config).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zai_api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

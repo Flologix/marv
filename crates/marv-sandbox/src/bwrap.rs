@@ -35,7 +35,7 @@ use std::sync::OnceLock;
 
 use crate::SandboxError;
 use crate::backend::{SandboxBackend, SandboxCommand};
-use crate::home::{HOME_MASKS, TOOLCHAINS, contains};
+use crate::home::{TOOLCHAINS, contains};
 use crate::protected::SKIPPED_DIRS;
 
 pub use crate::fs::{EntryKind, FileKind, FsProbe, RealFs};
@@ -277,8 +277,7 @@ fn home_masks(
         !masked.iter().any(|m| path.starts_with(m)) || shown_again.iter().any(|t| path.starts_with(t))
     };
     // 3. The named ones, wherever a toolchain shows them again.
-    for name in HOME_MASKS {
-        let path = real_home.join(name);
+    for path in opts.home_masks(fs) {
         if visible(&path, &masked)
             && let Some((more, path)) = mask(&path, real_home, fs)
         {

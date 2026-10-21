@@ -25,7 +25,11 @@ use crate::paths::normalize;
 pub const GIT_HINT: &str = "Marv: .git is read-only for commands that run without asking. To change the repository, run the command again with git_write: true (the user is asked).";
 
 /// Appended when a sandboxed command looks into the hidden home folder.
+#[cfg(not(target_os = "macos"))]
 pub const HOME_NOTE: &str = "Marv: in the sandbox the home folder is an empty stand-in: only toolchain folders (like ~/.bun, ~/.local/share/mise, ~/.asdf), git config and ~/.marv/skills show through, read-only. Anything else there (Marv's own config, sessions and trajectories in ~/.marv included) is invisible, so a missing file or an empty folder under ~ says nothing about the real home folder.";
+/// [`HOME_NOTE`] for macOS's sandbox (Seatbelt, #166), which refuses the home instead of showing an empty one.
+#[cfg(target_os = "macos")]
+pub const HOME_NOTE: &str = "Marv: in the sandbox the home folder can't be read or written: only toolchain folders (like ~/.bun, ~/.cargo, ~/.local/share/mise), git config and ~/.marv/skills can be read. Anything else there (Marv's own config, sessions and trajectories in ~/.marv included) is refused with \"Operation not permitted\", which says nothing about whether it exists. Tools' caches go to $TMPDIR, the command's own.";
 
 /// Appended to a sandboxed command in a project that is the home folder (or holds it) when it failed or looked at a
 /// hidden part of the home (marv-rs): there the home is shown read-only with its private parts hidden, so a write
