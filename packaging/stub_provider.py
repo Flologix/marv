@@ -13,6 +13,7 @@ README's screenshots. This one takes its command and picks a free port, so it ca
 """
 
 import json
+import os
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -81,8 +82,12 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    with open(sys.argv[1], "w") as f:
+    # Written whole, then renamed into place: the smoke test reads the port as soon as the file isn't empty.
+    tmp = sys.argv[1] + ".tmp"
+    with open(tmp, "w") as f:
         f.write(str(server.server_address[1]))
+    os.replace(tmp, sys.argv[1])
+    print(f"stub: listening on 127.0.0.1:{server.server_address[1]}", flush=True)
     server.serve_forever()
 
 

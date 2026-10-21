@@ -59,12 +59,21 @@ outside="$work/outside"
 mkdir -p "$outside"
 port_file="$work/port"
 command="echo made > made-here.txt; if (echo x > '$outside/escaped') 2>/dev/null; then echo outside-write-allowed; else echo outside-write-refused; fi"
-python3 "$root/packaging/stub_provider.py" "$port_file" "$command" &
+echo "smoke: $(command -v python3): $(python3 -c 'import sys; print(sys.version.split()[0])' 2>&1)"
+stub_log="$work/stub.log"
+python3 "$root/packaging/stub_provider.py" "$port_file" "$command" >"$stub_log" 2>&1 &
 stub=$!
+stub_failed() {
+	echo "smoke: the stub provider's output:" >&2
+	sed 's/^/  | /' "$stub_log" >&2
+	fail "$1"
+}
+# Up to 30 s (a cold python3 on a fresh runner can be slow), but not a moment longer than the stub lives.
 i=0
 while [ ! -s "$port_file" ]; do
+	kill -0 "$stub" 2>/dev/null || stub_failed "the stub provider exited before it was listening"
 	i=$((i + 1))
-	[ $i -lt 100 ] || fail "the stub provider didn't start"
+	[ $i -lt 300 ] || stub_failed "the stub provider didn't start in 30 s"
 	sleep 0.1
 done
 port=$(cat "$port_file")
