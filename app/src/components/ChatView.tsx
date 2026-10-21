@@ -79,14 +79,13 @@ export function ChatView({
   const canSendNow = chat.busy && chat.status === "ready" && input.trim() !== "" && !input.trim().startsWith("/");
   function sendNow() {
     if (!canSendNow) return;
-    chat.sendNow(input.trim());
-    setInput("");
+    if (chat.sendNow(input.trim())) setInput("");
   }
 
   // What the turn never read comes back here, ahead of anything typed since.
   const { onReturn } = chat;
   useEffect(() => {
-    onReturn((text) => setInput((typed) => (typed.trim() ? `${text} ${typed}` : text)));
+    onReturn((text) => setInput((typed) => (typed.trim() ? `${text}\n${typed}` : text)));
     return () => onReturn(null);
   }, [onReturn]);
 

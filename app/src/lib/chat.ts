@@ -344,7 +344,7 @@ export function useChat(id: string | null, settings: ChatSettings, reload = 0) {
           if (e.type === "not_sent") {
             setSending(0);
             const texts = Array.isArray(e.texts) ? (e.texts as unknown[]).map(String) : [];
-            if (texts.length) returnTo.current?.(texts.join(" "));
+            if (texts.length) returnTo.current?.(texts.join("\n"));
           }
           setItems((items) => {
             if (typeof e.seq === "number") applied.current = e.seq;
@@ -410,9 +410,12 @@ export function useChat(id: string | null, settings: ChatSettings, reload = 0) {
   const mcp = useCallback((action: string, name?: string) => connection.current?.send({ type: "mcp", action, name }), []);
 
   /** "Send now": into the running turn at its next step (after the current reply and tool calls), not after it. */
-  const sendNow = useCallback((text: string) => {
+  /** False when nothing was sent (the chat isn't connected and ready): the composer keeps the text. */
+  const sendNow = useCallback((text: string): boolean => {
+    if (!ready.current || !connection.current) return false;
+    connection.current.send({ type: "send_now", text });
     setSending((n) => n + 1);
-    connection.current?.send({ type: "send_now", text });
+    return true;
   }, []);
   /** The composer: where "send now" text the turn never read goes back. */
   const onReturn = useCallback((take: ((text: string) => void) | null) => {
