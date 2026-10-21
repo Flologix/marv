@@ -66,6 +66,14 @@ jobs:
           packaging/npm/test.sh target/${{ matrix.target }}/release/marv
       - name: Package
         run: packaging/package.sh ${{ matrix.target }} target/${{ matrix.target }}/release/marv dist
+      # bubblewrap for the sandboxed turn (the runners' AppArmor rule lifted, as in CI).
+      - name: Smoke test the asset
+        if: startsWith(matrix.target, 'x86_64')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          packaging/smoke.sh ${{ matrix.target }} dist
       - uses: actions/upload-artifact@v4
         with:
           name: marv-${{ matrix.target }}
@@ -99,17 +107,13 @@ jobs:
           [ "$(lipo -archs "$bin")" = "${{ matrix.arch }}" ]
       - name: Package
         run: packaging/package.sh ${{ matrix.target }} target/${{ matrix.target }}/release/marv dist
-      # The installer as a user runs it (its Darwin case, shasum, the Mach-O check), from the packed asset served
-      # over file://, then the npm packages.
+      # In place of a release candidate tried by hand on a Mac: install.sh and npm from the packed asset, and a
+      # sandboxed `marv -p` turn (Seatbelt must refuse a write outside the project) with each. If it fails, the
+      # release job doesn't run.
       - name: Smoke test
         run: |
           target/${{ matrix.target }}/release/marv --version
-          rel="$RUNNER_TEMP/release/latest/download"
-          mkdir -p "$rel"
-          cp dist/* install.sh "$rel/"
-          cat "$rel"/*.sha256 >"$rel/SHA256SUMS"
-          MARV_RELEASE_URL="file://$RUNNER_TEMP/release" sh install.sh --prefix "$RUNNER_TEMP/prefix"
-          "$RUNNER_TEMP/prefix/bin/marv" --version
+          packaging/smoke.sh ${{ matrix.target }} dist
           packaging/npm/test.sh target/${{ matrix.target }}/release/marv
       - uses: actions/upload-artifact@v4
         with:
