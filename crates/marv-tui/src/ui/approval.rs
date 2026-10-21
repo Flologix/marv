@@ -7,6 +7,12 @@
 //! behind the head), and the choice: Yes / Yes, and don't ask again for <scope> this session /
 //! No, and tell Marv what to do instead (esc). `once` requests offer only Yes / No.
 //!
+//! marv-rs (#185): a model's tool call (`request.reason`, set only by marv-tools' `run_tool`; not the step-limit
+//! question, a mesh wire, /undo or /mcp add) also offers "No, and say why (Marv carries on)": Tab from anywhere in
+//! the list, or Enter on it, opens a one-line input in the panel. Enter sends the reason as `Decision::Declined`:
+//! the call isn't run, its result tells the model why, and the turn goes on. An empty input sends nothing,
+//! Backspace on it goes back to the choices, and Esc still stops the run like a plain no.
+//!
 //! marv-rs: a mesh wire request (`tool: "mesh_wire"`, built by marv-session's `mesh::wire_approval`) comes through
 //! the same queue: `once` (yes or no; a wire is never remembered as a scope), labeled with the agent that asked,
 //! showing who, to what, which mode and the limits, with the taint warning. A `mesh_send`/`mesh_call` that needs a
@@ -24,7 +30,7 @@
 //! cut, not wrapped, numbered as in the transcript). Each queued request gets a fresh `ApprovalView`
 //! (Marv keyed it by id), so the cursor starts on Yes for every one.
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use marv_core::printable;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -47,6 +53,8 @@ pub const MAX_FILE_DIFF_LINES: usize = 8;
 /// scrolls, so a big /undo never pushes Yes/No off the screen.
 pub const RESERVED_ROWS: u16 = 16;
 pub const MIN_FILES_ROWS: u16 = 4;
+/// The reason input's length, in characters: the engine's own cut (`marv_core::MAX_DECLINE_REASON`).
+pub use marv_core::MAX_DECLINE_REASON as MAX_REASON_CHARS;
 
 /// One warning line per door out of the sandbox, in the warning colour: what saying yes lets out (Marv's
 /// `DOOR_WARNINGS`). A door's own detail (the repository a github write is visible on) comes in its preview's warning,
@@ -61,7 +69,7 @@ pub fn door_warning(door: marv_core::Door) -> &'static str {
 }
 
 /// What a key did at the approval.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApprovalOutcome {
     Decide(Decision),
     /// Esc: no to this and to everything waiting behind it.
@@ -79,6 +87,8 @@ pub struct ApprovalView {
     /// The file list's first shown row, and its last possible one as last drawn.
     files_top: usize,
     files_max: std::cell::Cell<usize>,
+    /// The reason being typed after "No, and say why" (#185); None while the choices show.
+    pub reason: Option<String>,
 }
 
 impl ApprovalView {
@@ -94,6 +104,9 @@ impl ApprovalView {
         }
         let no = if request.once { "No" } else { "No, and tell Marv what to do instead" };
         items.push(SelectItem::new(Decision::No, no).hint("esc"));
+        if request.reason {
+            items.push(SelectItem::new(Decision::Declined(String::new()), "No, and say why (Marv carries on)").hint("tab"));
+        }
         let window_rows = crossterm::terminal::size().map_or(24, |(_, rows)| rows);
         Self {
             request,
@@ -103,6 +116,49 @@ impl ApprovalView {
             window_rows,
             files_top: 0,
             files_max: std::cell::Cell::new(0),
+            reason: None,
+        }
+    }
+
+    /// Whether it offers declining with a reason (a model's tool call).
+    fn offers_reason(&self) -> bool {
+        self.select.items.iter().any(|i| matches!(i.value, Decision::Declined(_)))
+    }
+
+    /// A key while the reason is being typed: Enter sends it (never when empty), Backspace on an empty input goes
+    /// back to the choices. Only printable characters are taken, on one line.
+    fn on_reason_key(&mut self, key: KeyEvent) -> Option<ApprovalOutcome> {
+        let reason = self.reason.as_mut()?;
+        match key.code {
+            KeyCode::Enter => {
+                let text = reason.trim();
+                if text.is_empty() {
+                    return None;
+                }
+                return Some(ApprovalOutcome::Decide(Decision::Declined(text.to_string())));
+            }
+            KeyCode::Backspace => {
+                if reason.pop().is_none() {
+                    self.reason = None;
+                }
+            }
+            KeyCode::Char(c) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                push_reason(reason, &c.to_string());
+            }
+            _ => {}
+        }
+        None
+    }
+
+    /// Pasted text while the reason is being typed: added on one line (newlines become spaces). False when the
+    /// input isn't open, so the paste goes nowhere.
+    pub fn paste(&mut self, text: &str) -> bool {
+        match self.reason.as_mut() {
+            Some(reason) => {
+                push_reason(reason, text);
+                true
+            }
+            None => false,
         }
     }
 
@@ -110,13 +166,27 @@ impl ApprovalView {
         if key.code == KeyCode::Esc {
             return self.escape_cancels.then_some(ApprovalOutcome::CancelAll);
         }
+        if self.reason.is_some() {
+            return self.on_reason_key(key);
+        }
+        if key.code == KeyCode::Tab && self.offers_reason() {
+            self.reason = Some(String::new());
+            return None;
+        }
         // A file list (/undo) scrolls with PgUp/PgDn: the transcript stays put meanwhile.
         if self.has_files() && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
             let page = self.files_rows() as i32;
             self.scroll_files(if key.code == KeyCode::PageUp { -page } else { page });
             return None;
         }
-        self.select.on_key(key).map(ApprovalOutcome::Decide)
+        match self.select.on_key(key) {
+            // The item opens the input; only Enter there sends a reason.
+            Some(Decision::Declined(_)) => {
+                self.reason = Some(String::new());
+                None
+            }
+            chosen => chosen.map(ApprovalOutcome::Decide),
+        }
     }
 
     /// Whether the request lists files (/undo): PgUp/PgDn and the wheel scroll them, not the transcript.
@@ -212,8 +282,28 @@ impl ApprovalView {
             lines.push(Line::styled(format!("{} more waiting", self.waiting), dim));
         }
         lines.push(Line::default());
+        if self.reason.is_some() {
+            let mut lines = wrap_all(&lines, width);
+            lines.extend(self.reason_lines(width));
+            return lines;
+        }
         lines.push(Line::raw("Do you want to proceed?"));
         lines.extend(self.select.render());
+        wrap_all(&lines, width)
+    }
+
+    /// The reason input's block at `width`, wrapped: the question, what's typed, the hint. Empty when it isn't open.
+    fn reason_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let Some(reason) = &self.reason else { return Vec::new() };
+        let lines = [
+            Line::raw("Why not? Marv reads this and carries on."),
+            Line::from(vec![
+                Span::styled("❯ ", Style::new().fg(theme::ACCENT)),
+                Span::raw(printable(reason)),
+                Span::styled("▏", Style::new().fg(theme::ACCENT)),
+            ]),
+            Line::styled("enter sends · backspace on empty goes back · esc stops", Style::new().fg(theme::DIM)),
+        ];
         wrap_all(&lines, width)
     }
 
@@ -234,7 +324,13 @@ impl ApprovalView {
         let lines = self.lines(inner.width);
         // Taller than the screen: keep the choice in view and cut the payload's end instead.
         let skip = lines.len().saturating_sub(inner.height as usize);
-        let keep_head = lines.len().saturating_sub(self.select.items.len() + 2 + skip);
+        // What stays pinned at the bottom: the blank line, then the reason block (its question, the input wrapped at
+        // this width, the hint) or "Do you want to proceed?" and the choices.
+        let pinned = match &self.reason {
+            Some(_) => 1 + self.reason_lines(inner.width).len(),
+            None => 2 + self.select.items.len(),
+        };
+        let keep_head = lines.len().saturating_sub(pinned + skip);
         let shown = lines[..keep_head].iter().chain(&lines[keep_head + skip..]);
         for (i, line) in shown.enumerate().take(inner.height as usize) {
             buf.set_line(inner.x, inner.y + i as u16, line, inner.width);
@@ -242,15 +338,22 @@ impl ApprovalView {
     }
 }
 
+/// Adds `text` to the reason as the engine reads it (`marv_core::reason_chars`: one line, control characters
+/// dropped), at most [`MAX_REASON_CHARS`].
+fn push_reason(reason: &mut String, text: &str) {
+    let room = MAX_REASON_CHARS.saturating_sub(reason.chars().count());
+    reason.extend(marv_core::reason_chars(text).take(room));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::view::{DiffKind, DiffLine, Preview, Scope};
-    use crossterm::event::KeyModifiers;
 
     fn edit() -> ApprovalRequest {
         let line = |kind, text: &str| DiffLine { kind, text: text.into(), old_line: None, new_line: None };
         ApprovalRequest {
+            reason: true,
             tool: "edit_file".into(),
             label: "src/greet.ts".into(),
             scope: Scope { key: "files".into(), description: "file changes".into() },
@@ -274,6 +377,7 @@ mod tests {
 
     fn command() -> ApprovalRequest {
         ApprovalRequest {
+            reason: true,
             tool: "bash".into(),
             label: "bun test".into(),
             scope: Scope { key: "bash:bun test".into(), description: "this exact command".into() },
@@ -331,6 +435,7 @@ mod tests {
     fn a_mesh_wire_request_shows_the_whole_wire_and_yes_or_no_only() {
         // What marv-session's `mesh::wire_approval` sends for `worker-1`'s first send to the parent.
         let wire = ApprovalRequest {
+            reason: false,
             tool: "mesh_wire".into(),
             label: "Wire worker-1 -> agent.parent.inbox (send)".into(),
             scope: Scope {
@@ -368,6 +473,7 @@ mod tests {
     fn a_call_needing_a_new_wire_is_one_prompt_answered_yes_wire_it_or_no() {
         // What marv-session's `mesh::call_wire_approval` sends for `worker-1`'s first send to the parent.
         let call = ApprovalRequest {
+            reason: false,
             tool: MESH_WIRE_CALL.into(),
             label: "Wire worker-1 -> agent.parent.inbox (send)".into(),
             scope: Scope {
@@ -527,6 +633,78 @@ mod tests {
         }
     }
 
+    /// #185: "No, and say why" (tab, or Enter on it) opens a one-line input; Enter sends the reason, never an empty
+    /// one, and Backspace on an empty input goes back to the choices. Esc still stops everything.
+    #[test]
+    fn no_and_say_why_types_a_reason() {
+        let mut view = ApprovalView::new(command(), 0, true);
+        assert!(frame(&view).contains("No, and say why (Marv carries on) · tab"));
+        // Enter on the item opens the input; nothing is decided yet.
+        let mut moved = ApprovalView::new(command(), 0, true);
+        for _ in 0..3 {
+            moved.on_key(key(KeyCode::Down));
+        }
+        assert_eq!(moved.on_key(key(KeyCode::Enter)), None);
+        assert_eq!(moved.reason.as_deref(), Some(""));
+        // Tab from anywhere opens it too.
+        assert_eq!(view.on_key(key(KeyCode::Tab)), None);
+        assert!(frame(&view).contains("Why not?"));
+        assert_eq!(view.on_key(key(KeyCode::Enter)), None, "an empty reason sends nothing");
+        for c in "use pnpm".chars() {
+            view.on_key(key(KeyCode::Char(c)));
+        }
+        assert!(view.paste("\n not bun\x1b"), "a paste goes into the input, on one line");
+        assert!(frame(&view).contains("❯ use pnpm  not bun"), "{}", frame(&view));
+        assert_eq!(
+            view.on_key(key(KeyCode::Enter)),
+            Some(ApprovalOutcome::Decide(Decision::Declined("use pnpm  not bun".into())))
+        );
+        // Backspace on an empty input: back to the choices.
+        let mut back = ApprovalView::new(command(), 0, true);
+        back.on_key(key(KeyCode::Tab));
+        back.on_key(key(KeyCode::Char('x')));
+        back.on_key(key(KeyCode::Backspace));
+        back.on_key(key(KeyCode::Backspace));
+        assert!(back.reason.is_none() && frame(&back).contains("Do you want to proceed?"));
+        assert!(!back.paste("x"), "no input open: the paste goes nowhere");
+        // Esc while typing still stops everything, like a plain no.
+        back.on_key(key(KeyCode::Tab));
+        assert_eq!(back.on_key(key(KeyCode::Esc)), Some(ApprovalOutcome::CancelAll));
+        // The step-limit question and a mesh wire don't offer it.
+        // Only a model's call offers it: not the step-limit question, a mesh wire, /undo or /mcp add.
+        for tool in ["continue", "mesh_wire", MESH_WIRE_CALL, "undo", "mcp_add"] {
+            let mut view = ApprovalView::new(ApprovalRequest { tool: tool.into(), reason: false, ..command() }, 0, true);
+            assert!(!frame(&view).contains("say why"), "{tool}");
+            assert_eq!(view.on_key(key(KeyCode::Tab)), None);
+            assert!(view.reason.is_none());
+        }
+        // At most MAX_REASON_CHARS.
+        let mut long = ApprovalView::new(command(), 0, true);
+        long.on_key(key(KeyCode::Tab));
+        long.paste(&"a".repeat(MAX_REASON_CHARS + 10));
+        assert_eq!(long.reason.as_ref().map(|r| r.chars().count()), Some(MAX_REASON_CHARS));
+    }
+
+    /// A long reason wraps; in a panel too short for everything, the whole reason block stays in view and the
+    /// payload is cut instead.
+    #[test]
+    fn a_wrapped_reason_stays_in_view_when_the_payload_is_cut() {
+        let mut request = command();
+        request.preview.command = Some((1..=30).map(|i| format!("echo {i}")).collect::<Vec<_>>().join("\n"));
+        let mut view = ApprovalView::new(request, 0, true);
+        view.on_key(key(KeyCode::Tab));
+        view.paste(&format!("{} END", "word ".repeat(30)));
+        let (width, height) = (40, 18);
+        let area = Rect::new(0, 0, width, height);
+        let mut buf = Buffer::empty(area);
+        view.render(area, &mut buf);
+        let f = (0..height).map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect::<String>()).collect::<Vec<_>>().join("\n");
+        for part in ["Why not?", "❯ word", "END", "enter sends"] {
+            assert!(f.contains(part), "{part}\n{f}");
+        }
+        assert!(f.contains("echo 1") && !f.contains("echo 30"), "the payload is what's cut\n{f}");
+    }
+
     #[test]
     fn every_request_string_is_printable() {
         let mut request = command();
@@ -556,6 +734,7 @@ mod tests {
             more: 0,
         };
         ApprovalRequest {
+            reason: false,
             tool: "undo".into(),
             label: "turn 3".into(),
             once: true,

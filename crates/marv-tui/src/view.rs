@@ -197,6 +197,8 @@ pub struct ApprovalRequest {
     pub must_ask: bool,
     /// The call leaves the sandbox through this door: the prompt shows its warning line (Marv Sprint 4).
     pub door: Option<marv_core::Door>,
+    /// #185: the prompt offers "No, and say why": a model's tool call, whose result the reason becomes.
+    pub reason: bool,
 }
 
 /// Identifies one pending approval so the answer reaches the right waiter (parallel subagents can
@@ -205,7 +207,7 @@ pub struct ApprovalRequest {
 pub struct ApprovalId(pub u64);
 
 /// The user's answer. (`unavailable` is the headless approver's; the TUI never sends it.)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
     /// Run it.
     Yes,
@@ -213,6 +215,9 @@ pub enum Decision {
     Always,
     /// Don't; this stops the run so the user can say what to do instead.
     No,
+    /// Don't, and tell the model why (#185): the call's result gives the reason, as typed, and the turn goes on.
+    /// Never a yes. (In the approval's choices it's the empty-reason item that opens the reason input.)
+    Declined(String),
 }
 
 // ---------------------------------------------------------------------------------------------

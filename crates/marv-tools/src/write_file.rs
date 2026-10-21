@@ -229,7 +229,7 @@ mod tests {
             if let Some(cancel) = &self.abort {
                 cancel.cancel();
             }
-            self.answer
+            self.answer.clone()
         }
     }
 

@@ -390,7 +390,7 @@ mod tests {
     impl Approver for Recording {
         async fn approve(&self, request: ApprovalRequest) -> Decision {
             self.asked.lock().unwrap().push(request);
-            self.answer
+            self.answer.clone()
         }
     }
 
