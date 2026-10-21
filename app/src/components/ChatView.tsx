@@ -75,6 +75,21 @@ export function ChatView({
     setInput("");
   }
 
+  /** "Send now": while a turn runs, the message goes in at its next step. A /command waits for the turn. */
+  const canSendNow = chat.busy && chat.status === "ready" && input.trim() !== "" && !input.trim().startsWith("/");
+  function sendNow() {
+    if (!canSendNow) return;
+    chat.sendNow(input.trim());
+    setInput("");
+  }
+
+  // What the turn never read comes back here, ahead of anything typed since.
+  const { onReturn } = chat;
+  useEffect(() => {
+    onReturn((text) => setInput((typed) => (typed.trim() ? `${text} ${typed}` : text)));
+    return () => onReturn(null);
+  }, [onReturn]);
+
   return (
     <div className="main">
       <header className="topbar">
@@ -164,6 +179,11 @@ export function ChatView({
                   return;
                 }
               }
+              if (e.key === "Enter" && e.altKey && chat.busy) {
+                e.preventDefault();
+                sendNow();
+                return;
+              }
               if (e.key === "Enter" && !e.shiftKey) {
                 e.preventDefault();
                 submit();
@@ -180,6 +200,17 @@ export function ChatView({
               {listening ? "● rec" : "mic"}
             </button>
           )}
+          {chat.busy && (
+            <button
+              type="button"
+              className="btn primary"
+              disabled={!canSendNow}
+              title="Send now (alt+enter): in at Marv's next step, after the current reply and tool calls"
+              onClick={sendNow}
+            >
+              Send now
+            </button>
+          )}
           {chat.busy ? (
             <button type="button" className="btn" onClick={chat.interrupt}>
               Stop
@@ -192,7 +223,11 @@ export function ChatView({
         </form>
         </div>
         <div className="hint">
-          <span>enter to send · shift+enter for a new line · / for commands and skills</span>
+          <span>
+            {chat.busy
+              ? `alt+enter or Send now: in at Marv's next step${chat.sending ? ` · ${chat.sending} waiting` : ""} · shift+enter for a new line`
+              : "enter to send · shift+enter for a new line · / for commands and skills"}
+          </span>
           {usage?.context && usage.contextLength ? <span>context {tokens(usage.context)} / {tokens(usage.contextLength)}</span> : null}
         </div>
       </footer>

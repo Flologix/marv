@@ -118,6 +118,13 @@ function apply(items: Item[], e: ServerEvent): Item[] {
       else next.push(done);
       return next;
     }
+    case "sent_now":
+      // "Send now": the message went into the running turn here, after the step's tool results.
+      next.push({ kind: "user", text: String(e.text) });
+      return next;
+    case "not_sent":
+      next.push({ kind: "notice", text: "Not sent: the turn ended before its next step. Your message is back in the composer.", tone: "info" });
+      return next;
     case "approval":
       next.push({ kind: "approval", request: e as unknown as ApprovalRequest });
       return next;
@@ -248,6 +255,10 @@ export function useChat(id: string | null, settings: ChatSettings, reload = 0) {
   /** This chat's name on the machine's mesh, when it's on it. */
   const [meshName, setMeshName] = useState<string | null>(null);
   const [servers, setServers] = useState<ServerStatus[]>([]);
+  /** "Send now" messages sent into the running turn and not in it yet. */
+  const [sending, setSending] = useState(0);
+  /** Who takes back "send now" text the turn never read: the composer. */
+  const returnTo = useRef<((text: string) => void) | null>(null);
   // The session's tool list is fixed when it starts: switching a server on or off reopens the chat (it continues).
   const sessionKey = `${id}|${[...settings.mcpOff].sort().join(",")}|${reload}`;
   const connection = useRef<Connection | null>(null);
@@ -328,6 +339,13 @@ export function useChat(id: string | null, settings: ChatSettings, reload = 0) {
         } else {
           if (e.type === "turn_start") setBusy(true);
           if (e.type === "usage") setBusy(false);
+          if (e.type === "sent_now") setSending((n) => Math.max(0, n - 1));
+          if (e.type === "turn_end") setSending(0);
+          if (e.type === "not_sent") {
+            setSending(0);
+            const texts = Array.isArray(e.texts) ? (e.texts as unknown[]).map(String) : [];
+            if (texts.length) returnTo.current?.(texts.join(" "));
+          }
           setItems((items) => {
             if (typeof e.seq === "number") applied.current = e.seq;
             return apply(items, e);
@@ -391,8 +409,18 @@ export function useChat(id: string | null, settings: ChatSettings, reload = 0) {
 
   const mcp = useCallback((action: string, name?: string) => connection.current?.send({ type: "mcp", action, name }), []);
 
+  /** "Send now": into the running turn at its next step (after the current reply and tool calls), not after it. */
+  const sendNow = useCallback((text: string) => {
+    setSending((n) => n + 1);
+    connection.current?.send({ type: "send_now", text });
+  }, []);
+  /** The composer: where "send now" text the turn never read goes back. */
+  const onReturn = useCallback((take: ((text: string) => void) | null) => {
+    returnTo.current = take;
+  }, []);
+
   const interrupt = useCallback(() => connection.current?.send({ type: "interrupt" }), []);
   const answer = useCallback((rid: number, decision: Answer) => connection.current?.send({ type: "approval", id: rid, decision }), []);
 
-  return { items, status, busy, error, commands, meshName, servers, mcp, send, startWith, interrupt, answer };
+  return { items, status, busy, error, commands, meshName, servers, mcp, send, sendNow, sending, onReturn, startWith, interrupt, answer };
 }

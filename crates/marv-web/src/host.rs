@@ -191,6 +191,16 @@ pub async fn run_chat(spec: ChatSpec, mut incoming: UnboundedReceiver<ClientMess
                     }
                 }
             }
+            ClientMessage::SendNow { text } => {
+                let text = text.trim();
+                if text.is_empty() {
+                    continue;
+                }
+                // No turn to take it (it just ended): back to the composer, never started as a turn of its own.
+                if session.send_now(text).is_err() {
+                    let _ = out.send(json!({"type": "not_sent", "texts": [text]}));
+                }
+            }
             ClientMessage::Command { line } => {
                 let (name, args) =
                     line.trim().trim_start_matches('/').split_once(' ').unwrap_or((line.trim().trim_start_matches('/'), ""));
