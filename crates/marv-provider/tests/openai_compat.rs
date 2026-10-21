@@ -254,6 +254,30 @@ async fn turns_http_429_into_a_helpful_error_after_retries_are_exhausted() {
     assert!(error_of(&events).contains("Rate limited"));
 }
 
+/// #159: a plan's limit (Z.ai's 1310) is a hard stop: one request, the plan's message; Z.ai's passing rate limit
+/// (1302) is retried like any 429. The limit mid-stream stops too.
+#[tokio::test]
+async fn a_plans_limit_is_a_hard_stop_and_a_passing_rate_limit_is_retried() {
+    let server =
+        FakeServer::start(|_| Reply::json(429, json!({"error": {"code": "1310", "message": "Weekly Limit Exhausted"}}))).await;
+    let events = collect(provider(&v1(&server), None).stream(&hi(), StreamOptions::default())).await;
+    assert_eq!((server.requests().len(), retries(&events).len()), (1, 0));
+    assert!(error_of(&events).starts_with("TestRouter: your plan's usage limit is reached (Weekly Limit Exhausted)."));
+
+    let server =
+        FakeServer::start(|_| Reply::json(429, json!({"error": {"code": "1302", "message": "Rate limit reached"}}))).await;
+    let events = collect(provider(&v1(&server), None).stream(&hi(), StreamOptions::default())).await;
+    assert_eq!(server.requests().len(), 3);
+    assert_eq!(retries(&events).len(), 2, "1302 is retried");
+
+    let server =
+        FakeServer::start(|_| Reply::sse(&[delta("par"), json!({"error": {"code": "1308", "message": "Usage limit reached"}})]))
+            .await;
+    let events = collect(provider(&v1(&server), None).stream(&hi(), StreamOptions::default())).await;
+    assert_eq!((server.requests().len(), retries(&events).len()), (1, 0));
+    assert!(error_of(&events).contains("usage limit is reached"));
+}
+
 #[tokio::test]
 async fn reports_an_error_sent_in_the_middle_of_the_stream() {
     let server = FakeServer::start(|_| Reply::sse(&[delta("partial"), json!({"error": {"message": "provider crashed"}})])).await;

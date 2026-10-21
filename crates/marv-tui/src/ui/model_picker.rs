@@ -161,6 +161,9 @@ impl ModelPicker {
                 Span::styled(format!("{id}{}", " ".repeat(pad)), style),
                 Span::styled(format!("  {}", format_price(model)), dim),
             ];
+            if let Some(name) = model.name.as_deref().filter(|n| *n != model.id) {
+                spans.push(Span::styled(format!("  {}", printable(name)), dim));
+            }
             if model.tools == Some(false) {
                 spans.push(Span::styled("  no tool support", Style::new().fg(theme::WARNING)));
             }

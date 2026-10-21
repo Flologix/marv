@@ -729,6 +729,13 @@ impl App {
                 self.setup = Some(setup);
                 self.dirty = true;
             }
+            UiEvent::SignIn(progress) => {
+                if let Some(setup) = &mut self.setup
+                    && let Some(SetupOutcome::LoadModels(provider)) = setup.sign_in_progress(progress)
+                {
+                    self.port.load_models(provider);
+                }
+            }
             UiEvent::Models(models) => {
                 if let Some(setup) = &mut self.setup {
                     setup.models_loaded(models);
@@ -1257,11 +1264,21 @@ impl App {
             // While setup is open, Setup handles Esc and ctrl+c itself.
             match setup.on_key(key) {
                 Some(SetupOutcome::LoadModels(provider)) => self.port.load_models(provider),
+                Some(SetupOutcome::SignIn(provider, target)) => self.port.sign_in(provider, target),
+                Some(SetupOutcome::UseAccount(provider, id)) => self.port.use_account(provider, id),
+                Some(SetupOutcome::SignOut(provider)) => {
+                    self.setup = None;
+                    self.port.sign_out(provider);
+                }
                 Some(SetupOutcome::Complete(answer)) => {
                     self.setup = None;
                     self.port.complete_setup(answer);
                 }
                 Some(SetupOutcome::Cancel) => {
+                    // #159: a sign-in still waiting for the browser stops listening.
+                    if matches!(setup.sign_in, crate::ui::setup::SignInState::Waiting { .. }) {
+                        self.port.cancel_sign_in();
+                    }
                     // On first run there is nothing to go back to, so cancelling setup quits.
                     if setup.context.start == SetupStart::FirstRun {
                         self.exit = true;
@@ -2898,9 +2915,16 @@ mod tests {
             key_env: None,
             key_url: None,
             default_model: String::new(),
+            sign_in: false,
         }];
-        let context =
-            crate::view::SetupContext { start: SetupStart::FirstRun, presets, current: None, saved_key: None, env_keys: vec![] };
+        let context = crate::view::SetupContext {
+            start: SetupStart::FirstRun,
+            presets,
+            current: None,
+            saved_keys: vec![],
+            accounts: vec![],
+            env_keys: vec![],
+        };
         h.event(UiEvent::OpenSetup(context.clone()));
         assert!(h.frame().contains("Marv setup"));
         assert!(!h.frame().contains("Type a message"));
@@ -2928,13 +2952,15 @@ mod tests {
             key_env: None,
             key_url: None,
             default_model: String::new(),
+            sign_in: false,
         }];
         let current = Some((ProviderId::Ollama, "tiny".into()));
         h.event(UiEvent::OpenSetup(crate::view::SetupContext {
             start: SetupStart::Model,
             presets,
             current,
-            saved_key: None,
+            saved_keys: vec![],
+            accounts: vec![],
             env_keys: vec![],
         }));
         assert_eq!(h.calls(), [Call::LoadModels(ProviderId::Ollama)]);
@@ -3356,7 +3382,8 @@ mod tests {
             start: SetupStart::Model,
             presets: vec![],
             current: None,
-            saved_key: None,
+            saved_keys: vec![],
+            accounts: vec![],
             env_keys: vec![],
         }));
         assert!(h.app.palette.is_none());
@@ -3396,9 +3423,16 @@ mod tests {
             key_env: None,
             key_url: None,
             default_model: String::new(),
+            sign_in: false,
         }];
-        let context =
-            crate::view::SetupContext { start: SetupStart::FirstRun, presets, current: None, saved_key: None, env_keys: vec![] };
+        let context = crate::view::SetupContext {
+            start: SetupStart::FirstRun,
+            presets,
+            current: None,
+            saved_keys: vec![],
+            accounts: vec![],
+            env_keys: vec![],
+        };
         h.events([UiEvent::OpenSetup(context)]);
         assert_eq!(held(&h).last(), Some(&true), "setup");
         let told = held(&h).len();

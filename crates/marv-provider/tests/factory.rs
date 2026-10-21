@@ -24,6 +24,7 @@ fn openrouter(base_url: &str, thinking: bool) -> ProviderConfig {
         context_length: 32768,
         thinking,
         reasoning_effort: None,
+        auth_file: None,
     }
 }
 
@@ -115,6 +116,7 @@ fn ollama_has_its_context_window() {
         context_length: 65536,
         thinking: false,
         reasoning_effort: None,
+        auth_file: None,
     };
     let provider = create_provider(&config, None, None);
     assert_eq!(provider.name(), "ollama · qwen3.5:9b");
@@ -172,8 +174,9 @@ async fn a_model_list_that_fails_to_load_says_nothing_about_the_model() {
 async fn error_of(status: u16, config: ProviderConfig, hints: Option<ErrorHints>) -> String {
     let server = FakeServer::start(move |_| Reply::json(status, json!({"error": {"message": "nope"}}))).await;
     let base_url = match config.provider {
-        ProviderKind::OpenRouter => format!("{}/v1", server.url()),
+        ProviderKind::OpenRouter | ProviderKind::Zai => format!("{}/v1", server.url()),
         ProviderKind::Ollama => server.url(),
+        ProviderKind::ChatGpt => unreachable!("signs in"),
     };
     let provider = create_provider(&ProviderConfig { base_url, ..config }, None, hints);
     let events: Vec<_> = provider.stream(&hi(), StreamOptions::default()).collect().await;
@@ -209,4 +212,41 @@ async fn an_unknown_model_on_openrouter_and_on_ollama() {
             "Model \"nope:1b\" wasn't found on Ollama. Pass another provider.model to createSession() or configure()."
         )
     );
+}
+
+/// #159: the GLM Coding Plan goes to its endpoint with the plan's key, asks for streamed tool calls, sends no
+/// reasoning switch (its models always reason), and caps the reply from Marv's own table.
+#[tokio::test]
+async fn the_zai_plan_sends_its_key_and_no_reasoning_switch() {
+    let server =
+        FakeServer::start(|_| Reply::sse(&[json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}), json!("[DONE]")])).await;
+    let config = ProviderConfig {
+        provider: ProviderKind::Zai,
+        model: "glm-5.3".into(),
+        base_url: format!("{}/api/coding/paas/v4", server.url()),
+        api_key: Some("zai-key".into()),
+        context_length: 32768,
+        thinking: true,
+        reasoning_effort: Some(marv_provider::ReasoningEffort::Medium),
+        auth_file: None,
+    };
+    let provider = create_provider(&config, None, None);
+    assert_eq!(provider.name(), "zai · glm-5.3");
+    provider.stream(&hi(), StreamOptions::default()).collect::<Vec<_>>().await;
+    let request = server.last();
+    assert_eq!(request.path, "/api/coding/paas/v4/chat/completions");
+    assert_eq!(request.header("authorization"), Some("Bearer zai-key"));
+    assert_eq!(request.header("x-title"), None, "OpenRouter's attribution header stays OpenRouter's");
+    let body = request.json();
+    assert_eq!(body["tool_stream"], json!(true));
+    assert_eq!(body.get("reasoning"), None);
+    assert_eq!(body.get("thinking"), None);
+    assert_eq!(body["max_tokens"], json!(32_000));
+    // The factory's lookup reads the table: no request.
+    let factory = ConfigFactory {
+        config,
+        make: Arc::new(|c: &ProviderConfig, info| create_provider(c, info, None)),
+        load: Arc::new(|_, _| Box::pin(async { Err("never asked".to_string()) })),
+    };
+    assert_eq!(factory.lookup().unwrap().await.map(|m| m.context), Some(Some(1_000_000)));
 }
