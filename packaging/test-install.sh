@@ -192,6 +192,26 @@ out=$(MARV_TARGET=riscv64-unknown-linux-musl "$install" --prefix "$prefix" 2>&1)
 check "a missing asset says what it tried" grep -q "couldn't download .*marv-riscv64-unknown-linux-musl.tar.gz" <<<"$out"
 end
 
+# --- the target from uname (a fake uname and sysctl on PATH; the asset it asks for names the target) ---
+begin targets
+fakes="$work/fakes"
+mkdir -p "$fakes"
+detected() { # detected <uname -s> <uname -m> [<sysctl hw.optional.arm64>]
+	printf '#!/bin/sh\ncase $1 in -s) echo %s ;; -m) echo %s ;; esac\n' "$1" "$2" >"$fakes/uname"
+	printf '#!/bin/sh\necho %s\n' "${3:-}" >"$fakes/sysctl"
+	chmod 755 "$fakes/uname" "$fakes/sysctl"
+	env -u MARV_TARGET PATH="$fakes:$PATH" "$install" --prefix "$prefix" 2>&1 | grep -o 'marv-[a-z0-9_-]*\.tar\.gz' | head -1 || true
+}
+check "Linux x86_64" test "$(detected Linux x86_64)" = marv-x86_64-unknown-linux-musl.tar.gz
+check "Linux aarch64" test "$(detected Linux aarch64)" = marv-aarch64-unknown-linux-musl.tar.gz
+check "macOS arm64" test "$(detected Darwin arm64)" = marv-aarch64-apple-darwin.tar.gz
+check "macOS Intel" test "$(detected Darwin x86_64 0)" = marv-x86_64-apple-darwin.tar.gz
+check "macOS under Rosetta gets arm64" test "$(detected Darwin x86_64 1)" = marv-aarch64-apple-darwin.tar.gz
+detected FreeBSD amd64 >/dev/null
+out=$(env -u MARV_TARGET PATH="$fakes:$PATH" "$install" --prefix "$prefix" 2>&1) && fail "FreeBSD installed"
+check "another OS has no build" grep -q "no build for FreeBSD" <<<"$out"
+end
+
 # --- the real binary runs (only with MARV_TEST_BINARY) ---
 if [[ $real == 1 ]]; then
 	begin real

@@ -46,6 +46,8 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: app/package-lock.json
+      - name: Test the npm launcher
+        run: node --test packaging/npm/launcher.test.js
       - name: Build the desktop app's page
         working-directory: app
         run: npm ci && npm run build
@@ -81,13 +83,17 @@ jobs:
             exit 1
           fi
 
-  # macOS (#150): not required yet: it shows what fails until it's green, then it becomes a required check. The sandbox
-  # is Seatbelt (#166: `sandbox-exec` with `marv __guard`), and as on Linux its guards must run, not skip:
+  # macOS (#150, #167): a required check, on arm64 (macos-14, macos-15) and Intel (macos-15-intel; GitHub retired the
+  # macos-13 image the spec named).
+  # The sandbox is Seatbelt (#166: `sandbox-exec` with `marv __guard`), and as on Linux its guards must run, not skip:
   # MARV_REQUIRE_SANDBOX=1, and a broken `sandbox-exec` fails the job before the tests.
   macos:
-    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-14, macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
-    continue-on-error: true
     env:
       MARV_REQUIRE_SANDBOX: "1"
     steps:

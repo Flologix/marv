@@ -1,9 +1,11 @@
-# Release (issue #19): on a v* tag, static musl binaries for Linux x86_64 and aarch64, their SHA-256 sums and
-# install.sh, attached to a GitHub Release.
+# Release (issues #19, #167): on a v* tag, static musl binaries for Linux x86_64 and aarch64, native binaries for
+# macOS arm64 and x86_64, their SHA-256 sums and install.sh, attached to a GitHub Release.
 #
 # Assets (the names carry no version, so releases/latest/download/<asset> always names the newest):
 #   marv-x86_64-unknown-linux-musl.tar.gz   (+ .sha256)
 #   marv-aarch64-unknown-linux-musl.tar.gz  (+ .sha256)
+#   marv-x86_64-apple-darwin.tar.gz         (+ .sha256)
+#   marv-aarch64-apple-darwin.tar.gz        (+ .sha256)
 #   SHA256SUMS                              all of the above, which install.sh checks against
 #   install.sh
 #   flologixai-marv-*.tgz                   the npm packages (packaging/npm), published by hand
@@ -70,27 +72,53 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  # macOS comes later (issue #19 leaves it out). Sketch: native runners, no zig needed; install.sh's
-  # detect_target then needs a Darwin case for these names.
-  #
-  # build-macos:
-  #   strategy:
-  #     matrix:
-  #       include:
-  #         - { target: aarch64-apple-darwin, runner: macos-14 }
-  #         - { target: x86_64-apple-darwin, runner: macos-13 }
-  #   runs-on: ${{ matrix.runner }}
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - uses: dtolnay/rust-toolchain@stable
-  #     - run: rustup target add ${{ matrix.target }}
-  #     - run: cargo build --release --locked -p marv-cli --target ${{ matrix.target }}
-  #     - run: packaging/package.sh ${{ matrix.target }} target/${{ matrix.target }}/release/marv dist  # needs gtar
-  #     - uses: actions/upload-artifact@v4
-  #       with: { name: "marv-${{ matrix.target }}", path: "dist/*" }
+  # macOS (#167): native runners, no zig; arm64 on Apple silicon, x86_64 on Intel, so each build is smoke-tested on
+  # its own CPU. Rust's linker signs the arm64 binary ad hoc, which is all macOS needs to run it (it's never
+  # quarantined: curl and npm don't set the flag).
+  build-macos:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin, runner: macos-14, arch: arm64 }
+          - { target: x86_64-apple-darwin, runner: macos-15-intel, arch: x86_64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked -p marv-cli --target ${{ matrix.target }}
+      - name: Check its CPU
+        run: |
+          bin=target/${{ matrix.target }}/release/marv
+          file "$bin"
+          [ "$(lipo -archs "$bin")" = "${{ matrix.arch }}" ]
+      - name: Package
+        run: packaging/package.sh ${{ matrix.target }} target/${{ matrix.target }}/release/marv dist
+      # The installer as a user runs it (its Darwin case, shasum, the Mach-O check), from the packed asset served
+      # over file://, then the npm packages.
+      - name: Smoke test
+        run: |
+          target/${{ matrix.target }}/release/marv --version
+          rel="$RUNNER_TEMP/release/latest/download"
+          mkdir -p "$rel"
+          cp dist/* install.sh "$rel/"
+          cat "$rel"/*.sha256 >"$rel/SHA256SUMS"
+          MARV_RELEASE_URL="file://$RUNNER_TEMP/release" sh install.sh --prefix "$RUNNER_TEMP/prefix"
+          "$RUNNER_TEMP/prefix/bin/marv" --version
+          packaging/npm/test.sh target/${{ matrix.target }}/release/marv
+      - uses: actions/upload-artifact@v4
+        with:
+          name: marv-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
 
   release:
-    needs: [install-test, build]
+    needs: [install-test, build, build-macos]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -106,6 +134,9 @@ jobs:
         run: |
           cp install.sh dist/
           cd dist
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl x86_64-apple-darwin aarch64-apple-darwin; do
+            [ -f "marv-$target.tar.gz" ] || { echo "marv-$target.tar.gz is missing"; exit 1; }
+          done
           cat marv-*.tar.gz.sha256 > SHA256SUMS
           sha256sum -c SHA256SUMS
           cat SHA256SUMS

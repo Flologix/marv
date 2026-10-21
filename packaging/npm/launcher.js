@@ -9,12 +9,14 @@ const { spawn } = require("node:child_process");
 const PACKAGES = {
   "linux x64": "@flologixai/marv-linux-x64",
   "linux arm64": "@flologixai/marv-linux-arm64",
+  "darwin x64": "@flologixai/marv-darwin-x64",
+  "darwin arm64": "@flologixai/marv-darwin-arm64",
 };
 
 const key = `${process.platform} ${process.arch}`;
 const pkg = PACKAGES[key];
 if (!pkg) {
-  console.error(`marv: there's no build for ${key}. Marv runs on Linux (x64 and arm64): its sandbox is bubblewrap.`);
+  console.error(`marv: there's no build for ${key}. Marv runs on Linux and macOS (x64 and arm64); on Windows, use WSL.`);
   process.exit(1);
 }
 let bin;

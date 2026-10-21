@@ -36,9 +36,8 @@ Marv is written in Rust and ships as one static binary. Nothing else runs it: no
 
 ## Requirements
 
-- Linux on x86_64 or aarch64. **On Windows, use [WSL](https://learn.microsoft.com/windows/wsl/install)**: install Marv inside your WSL distribution (e.g. Ubuntu) and run `marv` there.
-- **No macOS build in 0.7.0.** The release has Linux binaries only, and the installer stops on macOS with a note.
-- `bubblewrap` (`bwrap`) for the command sandbox (e.g. `sudo apt install bubblewrap`). Without it Marv still works, but every command asks first and warns that it runs unsandboxed, and what needs the sandbox is off: the typecheck after edits, the project's checks and the `process` tool.
+- Linux on x86_64 or aarch64, or macOS 14 (Sonoma) or newer on Apple silicon or Intel. **On Windows, use [WSL](https://learn.microsoft.com/windows/wsl/install)**: install Marv inside your WSL distribution (e.g. Ubuntu) and run `marv` there.
+- On Linux, `bubblewrap` (`bwrap`) for the command sandbox (e.g. `sudo apt install bubblewrap`). Without it Marv still works, but every command asks first and warns that it runs unsandboxed, and what needs the sandbox is off: the typecheck after edits, the project's checks and the `process` tool. On macOS the sandbox is Seatbelt (`/usr/bin/sandbox-exec`, built in), so there's nothing to install; the `process` tool isn't on macOS yet (#152).
 - `git`, for `/undo` and for subagents' worktrees.
 - One of:
   - an [OpenRouter API key](https://openrouter.ai/settings/keys), or
@@ -50,7 +49,7 @@ Marv is written in Rust and ships as one static binary. Nothing else runs it: no
 npm install -g @flologixai/marv
 ```
 
-npm installs the prebuilt binary for your machine (`@flologixai/marv-linux-x64` or `-arm64`, an optional dependency, so npm picks the one that fits; there's no postinstall script and no download at run time). The `marv` command it puts on your PATH is a small Node launcher that starts the binary. Installed 0.3.0 with `bun add -g`? Run `bun remove -g @flologixai/marv` first, so the old launcher doesn't shadow the new one.
+npm installs the prebuilt binary for your machine (`@flologixai/marv-linux-x64`, `-linux-arm64`, `-darwin-arm64` or `-darwin-x64`, an optional dependency, so npm picks the one that fits; there's no postinstall script and no download at run time). The `marv` command it puts on your PATH is a small Node launcher that starts the binary. Installed 0.3.0 with `bun add -g`? Run `bun remove -g @flologixai/marv` first, so the old launcher doesn't shadow the new one.
 
 Or, without npm, the installer from the GitHub release. It downloads the binary for your machine, checks its SHA-256 against the release's `SHA256SUMS`, and puts it at `~/.local/bin/marv`:
 
@@ -510,13 +509,15 @@ Read first: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) (the crates and how t
 ### Releasing
 
 1. Move `CHANGELOG.md`'s entries under the new version (patch for fixes, minor for features or anything breaking while below 1.0), and bump `version` under `[workspace.package]` in `Cargo.toml` to match (a version can only be published once).
-2. Tag and push: `git tag v0.7.0 && git push origin v0.7.0`. The release workflow (`.github/workflows/release.yml`) builds static musl binaries for x86_64 and aarch64, tests the installer and the npm packages against them, and creates the GitHub release with `marv-<target>.tar.gz`, `SHA256SUMS`, `install.sh` and the npm packages as `.tgz` files. Run it by hand (workflow_dispatch) for a dry run without the release.
+2. Tag and push: `git tag v0.7.0 && git push origin v0.7.0`. The release workflow (`.github/workflows/release.yml`) builds static musl binaries for Linux x86_64 and aarch64 and native ones for macOS arm64 and x86_64, tests the installer and the npm packages against them, and creates the GitHub release with `marv-<target>.tar.gz`, `SHA256SUMS`, `install.sh` and the npm packages as `.tgz` files. Run it by hand (workflow_dispatch) for a dry run without the release.
 3. Publish the npm packages by hand (npm wants your 2FA), platform packages first, since the launcher names them:
 
 ```sh
 gh release download v0.7.0 -p 'flologixai-marv-*.tgz' -D npm
 npm publish ./npm/flologixai-marv-linux-x64-0.7.0.tgz --access public
 npm publish ./npm/flologixai-marv-linux-arm64-0.7.0.tgz --access public
+npm publish ./npm/flologixai-marv-darwin-arm64-0.7.0.tgz --access public
+npm publish ./npm/flologixai-marv-darwin-x64-0.7.0.tgz --access public
 npm publish ./npm/flologixai-marv-0.7.0.tgz --access public
 ```
 
