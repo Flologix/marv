@@ -152,6 +152,59 @@ pub fn radio_stats(records: &[Value]) -> RadioStats {
     stats
 }
 
+/// #63's eval metric: what a compaction made the model do again.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepeatedReads {
+    /// `compact` records.
+    pub compactions: usize,
+    /// The main agent's `read_file` calls, within [`REPEAT_WINDOW`] steps after a compaction, of a path (and an
+    /// overlapping range) it had already read before it.
+    pub repeated: usize,
+}
+
+/// #63: the steps after a compaction in which a read counts as repeated.
+pub const REPEAT_WINDOW: usize = 10;
+
+/// The lines a `read_file` call covers: `offset` (1-based, default 1) and `limit` (default: to the end).
+fn read_range(args: &Value) -> (u64, u64) {
+    let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(1).max(1);
+    let end = args.get("limit").and_then(Value::as_u64).map_or(u64::MAX, |l| offset.saturating_add(l.max(1) - 1));
+    (offset, end)
+}
+
+/// #63: counts repeated reads after each compaction in a trajectory (records in file order; the main agent's only).
+pub fn repeated_reads(records: &[Value]) -> RepeatedReads {
+    let mut stats = RepeatedReads::default();
+    let mut reads: Vec<(String, (u64, u64))> = Vec::new();
+    let mut before: Vec<(String, (u64, u64))> = Vec::new();
+    // Steps left in the window after the last compaction (`request` records of the main agent).
+    let mut window: Option<usize> = None;
+    let main = |r: &Value| r.get("agent").and_then(Value::as_str).is_none_or(|a| a == "main");
+    for r in records {
+        match r.get("type").and_then(Value::as_str) {
+            Some("compact") => {
+                stats.compactions += 1;
+                before = reads.clone();
+                window = Some(REPEAT_WINDOW);
+            }
+            Some("request") if main(r) => {
+                window = window.and_then(|w| w.checked_sub(1)).filter(|w| *w > 0);
+            }
+            Some("tool") if main(r) && r["call"]["name"] == "read_file" => {
+                let args: Value = r["call"]["arguments"].as_str().and_then(|a| serde_json::from_str(a).ok()).unwrap_or_default();
+                let Some(path) = args.get("path").and_then(Value::as_str) else { continue };
+                let range = read_range(&args);
+                if window.is_some() && before.iter().any(|(p, (start, end))| p == path && range.0 <= *end && *start <= range.1) {
+                    stats.repeated += 1;
+                }
+                reads.push((path.to_string(), range));
+            }
+            _ => {}
+        }
+    }
+    stats
+}
+
 fn median(mut values: Vec<f64>) -> f64 {
     if values.is_empty() {
         return 0.0;
@@ -221,6 +274,30 @@ mod tests {
         assert_eq!(s.median_seconds, 4.0);
         assert_eq!(summarize(&records, GroupBy::Marv)[0].0, "0.3.0");
         assert!(format_stats(&stats).contains("end 1, max_steps 1"));
+    }
+
+    fn read(path: &str, args: Value) -> Value {
+        let mut args = args;
+        args["path"] = path.into();
+        json!({"type": "tool", "turn": "a", "agent": "main", "call": {"id": "c", "name": "read_file", "arguments": args.to_string()}})
+    }
+
+    #[test]
+    fn repeated_reads_count_reads_of_what_was_read_before_a_compaction_within_ten_steps() {
+        let request = json!({"type": "request", "turn": "a", "agent": "main"});
+        let mut records = vec![
+            read("a.rs", json!({})),
+            read("b.rs", json!({"offset": 1, "limit": 10})),
+            json!({"type": "compact", "turn": "a"}),
+            request.clone(),
+            read("a.rs", json!({})),                          // repeated
+            read("b.rs", json!({"offset": 50, "limit": 10})), // another range
+            read("c.rs", json!({})),                          // new
+            json!({"type": "tool", "turn": "a", "agent": "a.1", "call": {"name": "read_file", "arguments": "{\"path\":\"a.rs\"}"}}),
+        ];
+        records.extend((0..10).map(|_| request.clone()));
+        records.push(read("a.rs", json!({}))); // past the window
+        assert_eq!(repeated_reads(&records), RepeatedReads { compactions: 1, repeated: 1 });
     }
 
     #[test]
