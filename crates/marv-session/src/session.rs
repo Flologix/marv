@@ -791,6 +791,19 @@ type Recorder = Arc<Mutex<Option<AgentRecorder>>>;
 type Recorders = Arc<Mutex<HashMap<String, AgentRecorder>>>;
 
 /// A lock that a panic elsewhere doesn't make unusable.
+/// Whether the project has no `.git` of its own, so confined commands see the sandbox's empty stand-in: nothing at
+/// `.git` (not even a link), or an empty folder. bwrap leaves an empty mount point at `.git` while a confined command
+/// or a background process runs (removed afterwards), so a conversation that starts meanwhile must not take it for a
+/// repository; git doesn't either, and `git_guard` would mount such a folder read-only, empty, just the same.
+fn no_git_of_its_own(root: &std::path::Path) -> bool {
+    let git = root.join(".git");
+    match std::fs::symlink_metadata(&git) {
+        Err(_) => true,
+        Ok(meta) if meta.is_dir() => std::fs::read_dir(&git).is_ok_and(|mut entries| entries.next().is_none()),
+        Ok(_) => false,
+    }
+}
+
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -2769,6 +2782,8 @@ impl MarvSession {
             pre_approved: init.pre_approved.clone(),
             writable: init.writable.iter().map(|d| crate::paths::shorten_home(d, &crate::paths::home_dir())).collect(),
             date: crate::time::iso_date(crate::time::now_ms()),
+            // Checked per conversation, so the cache holds.
+            git_placeholder: no_git_of_its_own(&init.root),
         });
         // #124: one fixed section while this conversation offers radio_tx (never a roster, a name or a state).
         let base = if radio { format!("{base}{}", crate::radio::RADIO_PROMPT) } else { base };
@@ -3084,6 +3099,23 @@ mod tests {
         assert_eq!(s.context_length(), Some(1000));
         assert!(!s.busy());
         assert!(s.system_prompt().contains("Working directory: ~/p"));
+    }
+
+    /// A project without `.git` (or with an empty one) is told about the sandbox's empty stand-in; one with its own isn't.
+    #[test]
+    fn a_project_without_git_hears_about_the_placeholder() {
+        let base = std::env::temp_dir().join(format!("marv-git-{}-{}", std::process::id(), marv_fs::random_hex()));
+        let (bare, repo, mount) = (base.join("bare"), base.join("repo"), base.join("mount"));
+        std::fs::create_dir_all(&bare).unwrap();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        // bwrap's leftover mount point while another command runs: an empty `.git` is still no repository.
+        std::fs::create_dir_all(mount.join(".git")).unwrap();
+        let prompt = |root: &std::path::Path| session(|i| i.root = root.to_path_buf()).unwrap().system_prompt();
+        assert!(prompt(&bare).contains(crate::prompt::GIT_PLACEHOLDER));
+        assert!(prompt(&mount).contains(crate::prompt::GIT_PLACEHOLDER));
+        assert!(!prompt(&repo).contains(crate::prompt::GIT_PLACEHOLDER));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

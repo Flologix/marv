@@ -4,6 +4,7 @@
 //! events, through Tauri commands and a channel instead of a WebSocket.
 
 mod background;
+mod notify;
 mod store;
 mod tree;
 
@@ -30,6 +31,8 @@ struct Desktop {
     launch: Mutex<Option<String>>,
     /// MCP servers looked up for adding, by name: what the person saw is exactly what gets written.
     proposals: Mutex<HashMap<String, Value>>,
+    /// Tells the person when a chat they aren't looking at needs them or is done.
+    notifier: notify::Notifier,
 }
 
 /// The CLI's own folder (~/.marv): memory, MCP servers, logins and saved sessions shared with `marv`.
@@ -478,7 +481,19 @@ fn open_chat(
                 let session = session.to_string();
                 let _ = app.state::<Desktop>().store.update_chat(&chat_id, |c| c.session_id = Some(session));
             }
-            background::lock(&shared).deliver(event);
+            // The page gets it first; the notifier never blocks (each notification is a task of its own).
+            let tell = matches!(event["type"].as_str(), Some("approval" | "approval_done" | "turn_end")).then(|| event.clone());
+            let shown = {
+                let mut chat = background::lock(&shared);
+                let shown = chat.shown();
+                chat.deliver(event);
+                shown
+            };
+            if let Some(event) = tell {
+                let desktop = app.state::<Desktop>();
+                let title = desktop.store.chats().into_iter().find(|c| c.id == chat_id).map(|c| c.title).unwrap_or_default();
+                desktop.notifier.event(&app, &chat_id, &title, &event, shown);
+            }
         }
         background::lock(&shared).end();
     });
@@ -652,6 +667,7 @@ pub fn run() {
                 live: Mutex::new(HashMap::new()),
                 launch: Mutex::new(launch),
                 proposals: Mutex::new(HashMap::new()),
+                notifier: notify::Notifier::default(),
             });
             Ok(())
         })
