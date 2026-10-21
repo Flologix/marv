@@ -5,7 +5,8 @@
 (() => {
   const root = "/home/demo/Projects";
   const space = { id: "s1", name: "Projects", root, appsOff: [] };
-  const info = { root, rootName: "Projects", hasKey: true, provider: "openrouter", spaces: [space], active: "s1" };
+  const info = { root, rootName: "Projects", hasKey: true, provider: "openrouter", ready: true,
+    offerZai: false, offerChatgpt: false, hasZaiKey: false, chatgptAccount: null, spaces: [space], active: "s1" };
   const now = Date.now() / 1000; // chats' times are in seconds
   const chats = [
     { id: "c1", folder: `${root}/todo-api`, title: "Add a /health endpoint", created: now - 4 * 60 },
@@ -57,7 +58,7 @@
       request: {
         id: 1, tool: "bash", label: "git commit", title: "Run a command",
         command: 'git add app.py tests/test_app.py && git commit -m "Add /health endpoint"',
-        note: "sandboxed · no network · changes the git repository", scope: "this command", once: false,
+        note: "sandboxed · no network · changes the git repository", scope: "this command", once: false, reason: true,
       },
     },
   ];
@@ -84,6 +85,7 @@
       { id: "c3", busy: true, waiting: 1 },
     ],
     mcp_servers: () => [],
+    plan_models: () => [],
     open_chat: ({ onEvent }) => {
       setTimeout(() => send(onEvent, 0, { type: "ready", epoch: "demo", busy: true, mesh: "todo-api-3f9a", commands: [] }), 10);
       return null;

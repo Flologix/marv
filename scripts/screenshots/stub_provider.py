@@ -22,42 +22,59 @@ APP_NEW = '''    if method == "GET" and path == "/health":
     if method == "GET" and path == "/todos":
         return 200, list(TODOS.values())
 '''
+NOT_FOUND_OLD = '''    return 404, {"error": "not found"}
+'''
+NOT_FOUND_NEW = '''    return 404, {"error": f"no route for {method} {path}"}
+'''
 TEST_OLD = '''if __name__ == "__main__":'''
 TEST_NEW = '''class HealthTest(unittest.TestCase):
     def test_health_reports_ok(self):
         status, body = route("GET", "/health")
-        self.assertEqual(status, 200)
-        self.assertEqual(body["status"], "ok")
+        self.assertEqual((status, body["status"]), (200, "ok"))
+
+    def test_404_names_the_route(self):
+        self.assertIn("/nope", route("GET", "/nope")[1]["error"])
 
 
 if __name__ == "__main__":'''
 
+PLAN = ["Add the /health route", "Make 404s name the route", "Test both", "Commit"]
+
+
+def plan(done):
+    """The plan with `done` items ticked and the next one in progress."""
+    return ("plan", {"items": [{"text": t, "status": "done" if i < done else "in_progress" if i == done else "pending"}
+                               for i, t in enumerate(PLAN)]})
+
+
 # One entry per step of the turn: (reasoning, text, [(tool name, arguments)]).
 STEPS = [
     (
-        "The user wants a health endpoint. I should look at how routes are written and how the tests call them.",
+        "Three changes and a commit: worth a plan. First see how routes are written and how the tests call them.",
         "I'll look at the routes and the tests first.",
-        [("read_file", {"path": "app.py"}), ("read_file", {"path": "tests/test_app.py"})],
+        [plan(0), ("read_file", {"path": "app.py"}), ("read_file", {"path": "tests/test_app.py"})],
     ),
     (
-        "Routes are plain ifs in route(); tests call route() directly. Add the route and a test.",
+        "Routes are plain ifs in route(); tests call route() directly.",
         "",
         [
-            ("edit_file", {"path": "app.py", "old_string": APP_OLD, "new_string": APP_NEW}),
+            plan(2),
             ("edit_file", {"path": "tests/test_app.py", "old_string": TEST_OLD, "new_string": TEST_NEW}),
+            ("edit_file", {"path": "app.py", "old_string": APP_OLD, "new_string": APP_NEW}),
+            ("edit_file", {"path": "app.py", "old_string": NOT_FOUND_OLD, "new_string": NOT_FOUND_NEW}),
         ],
     ),
     ("", "", [("bash", {"command": "python3 -m unittest -q"})]),
     (
         "",
-        "All 4 tests pass. Committing the change.",
-        [("bash", {"command": 'git add app.py tests/test_app.py && git commit -m "Add /health endpoint"', "git_write": True})],
+        "All 5 tests pass. Committing the change.",
+        [plan(3), ("bash", {"command": 'git add app.py tests/test_app.py && git commit -m "Add /health; 404s name the route"', "git_write": True})],
     ),
     (
         "",
-        "Done. `GET /health` returns `{\"status\": \"ok\", \"todos\": <count>}`, with a test, committed as "
-        "\"Add /health endpoint\".",
-        [],
+        "Done. `GET /health` returns `{\"status\": \"ok\", \"todos\": <count>}`, a 404 names the route it didn't find, "
+        "both are tested, and it's committed.",
+        [plan(4)],
     ),
 ]
 

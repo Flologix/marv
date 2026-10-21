@@ -84,10 +84,10 @@ start 100 24
 wait_for "Type a message"
 shot screenshot 100 24
 
-# 2. One turn: two reads, two edits, the tests, then a commit that asks first.
-start 120 40
+# 2. One turn: a plan, two reads, three edits, the tests, then a commit that asks first.
+start 120 46
 wait_for "Type a message"
-tmux -L "$sock" send-keys -t shot -l "add a /health endpoint with a test, then commit it"
+tmux -L "$sock" send-keys -t shot -l "add a /health endpoint, make 404s name the route, test both, then commit"
 tmux -L "$sock" send-keys -t shot Enter
 wait_for "Do you want to proceed?"
-shot approval 120 40
+shot approval 120 46

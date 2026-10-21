@@ -123,8 +123,7 @@ html, body {{ margin: 0; background: #0f0f11; }}
 .win {{ margin: 0; background: {BG}; border-radius: 0; overflow: hidden; }}
 .bar {{ height: 30px; display: flex; align-items: center; gap: 8px; padding: 0 14px; background: #27272a;
   font: 13px system-ui, sans-serif; color: #a1a1aa; }}
-.dot {{ width: 12px; height: 12px; border-radius: 50%; }}
-.bar span.t {{ flex: 1; text-align: center; margin-right: 60px; }}
+.bar span.t {{ flex: 1; text-align: center; }}
 pre {{ margin: 0; padding: 10px 14px 12px; font: 15px/20px Term, "DejaVu Sans Mono", monospace; font-variant-ligatures: none; font-feature-settings: "calt" 0, "liga" 0; color: {FG}; }}
 .r {{ height: 20px; white-space: pre; }}
 .bx {{ display: inline-block; position: relative; width: 1ch; height: 20px; vertical-align: top; }}
@@ -136,9 +135,7 @@ pre {{ margin: 0; padding: 10px 14px 12px; font: 15px/20px Term, "DejaVu Sans Mo
 .bl::before {{ left: 50%; top: 0; right: 0; bottom: calc(50% - 1.5px); border-left-width: 1.5px; border-bottom-width: 1.5px; border-bottom-left-radius: 6px; }}
 .br::before {{ left: 0; top: 0; right: calc(50% - 1.5px); bottom: calc(50% - 1.5px); border-right-width: 1.5px; border-bottom-width: 1.5px; border-bottom-right-radius: 6px; }}
 .el::before {{ left: 50%; top: 0; right: 0; bottom: calc(50% - 1.5px); border-left-width: 1.5px; border-bottom-width: 1.5px; }}
-</style><div class="win"><div class="bar"><i class="dot" style="background:#f87171"></i>
-<i class="dot" style="background:#facc15"></i><i class="dot" style="background:#4ade80"></i>
-<span class="t">{html.escape(title)}</span></div><pre>{body}</pre></div>"""
+</style><div class="win"><div class="bar"><span class="t">{html.escape(title)}</span></div><pre>{body}</pre></div>"""
     open(dst, "w", encoding="utf-8").write(page)
 
 

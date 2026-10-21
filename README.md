@@ -114,7 +114,7 @@ Type what you want in plain language, for example:
 
 Sandboxed reads, edits and test runs go ahead on their own; a commit, the network or a protected file waits for you:
 
-![Marv in the terminal partway through a task: the diff of a test it added, the test run passing, and an approval prompt for a git commit](docs/images/approval.png)
+![Marv in the terminal partway through a task: an edit's diff replacing a line, the tests passing, its four-step plan pinned above the prompt with three steps ticked, and an approval prompt for a git commit with "No, and say why" among the answers](docs/images/approval.png)
 
 ### Commands
 
