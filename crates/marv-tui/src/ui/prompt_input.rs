@@ -8,6 +8,8 @@
 //!   menu until the text changes. Hidden while busy. ctrl+k opens the App's command palette over it
 //!   (`command_palette`, #44), built from the same commands; the text here stays as it was.
 //! - Placeholder "Type a message, or / for commands"; the border dims while busy.
+//! - New in marv-rs: Alt+Enter is [`PromptOutcome::SendNow`] ("send now": while a turn runs, the App sends the line
+//!   into it at its next step instead of waiting for it to end). Enter is unchanged.
 //! - New in marv-rs: after a turn, a suggested next message ([`PromptInput::suggest`]) shows in the empty prompt
 //!   instead of the placeholder. Tab or → takes it into the line; typing anything drops it. Enter on the empty line
 //!   still sends nothing: a suggestion is only ever sent after the user took it and pressed Enter.
@@ -59,6 +61,8 @@ pub fn match_commands<'a>(value: &str, commands: &'a [CommandInfo]) -> Vec<&'a C
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromptOutcome {
     Submit(String),
+    /// Alt+Enter: "send now" (the App sends it into the running turn, at its next step; idle, it's a plain submit).
+    SendNow(String),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -189,6 +193,10 @@ impl PromptInput {
                 self.dismissed_at = None;
                 // With the menu open, Enter runs the highlighted command ("/se" → "/setup").
                 let text = highlighted.map_or_else(|| self.value.clone(), |c| format!("/{}", c.name));
+                // Alt+Enter on a message: send it now. A command is a command either way.
+                if key.modifiers.contains(KeyModifiers::ALT) && highlighted.is_none() {
+                    return Some(PromptOutcome::SendNow(text));
+                }
                 return Some(PromptOutcome::Submit(text));
             }
             KeyCode::Up if !self.history.is_empty() => {

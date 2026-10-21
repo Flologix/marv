@@ -56,6 +56,12 @@
 //!   final answer; a cancel during it ends `Aborted` and drops the note), then the next step.
 //! - A `Retry` from the provider means it starts over: this step's text, calls and reasoning are
 //!   discarded so the retry doesn't duplicate them.
+//! - **"Send now"** (`send_now`, [`crate::send_now`]; new in marv-rs): the person's messages sent while the run
+//!   goes are appended as ordinary user messages at the next step boundary: at the top of each step, before its
+//!   request (after `after_step`'s note, so the person has the last word), or in place of ending the run on a plain
+//!   answer (one more step reads them). Only where every call has its result ([`crate::send_now::at_step_boundary`]);
+//!   each yields a `SentNow` once it's in the history. Nothing is stopped for one, and the step limit counts the
+//!   step it causes. Not during a cancel, and not after the run ended: the session hands those back.
 //!
 //! marv-rs changes and planned work:
 //! - **#90 announced next step, no tool call**: a plain answer that ends by announcing what it
@@ -103,6 +109,7 @@ pub use crate::announce::{ANNOUNCED_STEP_NOTE, announces_next_step};
 use crate::repetition::{
     FailureLoopState, ToolCallKey, ToolLoopState, detect_text_repetition, failing_command_note, make_tool_key, tool_loop_detected,
 };
+pub use crate::send_now::{SendNow, at_step_boundary};
 
 pub const DEFAULT_MAX_STEPS: u32 = 25;
 /// Subagents' own hard limit (Marv `SUBAGENT_MAX_STEPS`, in `src/subagent.ts`).
@@ -432,6 +439,10 @@ pub enum LoopEvent {
     },
     /// A mid-run compaction swapped the history for the summary (`on_full`).
     Compacted,
+    /// "Send now": the person's message went into the history as a user message, at a step boundary.
+    SentNow {
+        text: String,
+    },
     Done(StopReason),
     /// The provider threw the reply away without retrying (#96: it degenerated again); an `Error` follows.
     Discarded {
@@ -511,6 +522,9 @@ pub struct AgentOptions {
     /// #90: providers collect the raw response payloads (the trajectory's `request` record
     /// carries them). The session sets this from `MARV_DEBUG_RAW`.
     pub debug_raw: bool,
+    /// The person's "send now" messages, appended at the next step boundary ([`crate::send_now`]). The session sets
+    /// it for the main agent only.
+    pub send_now: Option<SendNow>,
 }
 
 impl AgentOptions {
@@ -538,6 +552,7 @@ impl AgentOptions {
             after_step: None,
             wrap_up_at_limit: false,
             debug_raw: false,
+            send_now: None,
         }
     }
 }
@@ -971,6 +986,8 @@ impl LoopState {
     /// The step limit guards against a model that never finishes. With `on_limit`, the user decides
     /// at each multiple whether it goes on. `max_steps` 0 (the guard off) never matches.
     async fn top(&mut self) {
+        // The step boundary: the person's "send now" messages go in before this step's request.
+        self.deliver_sent_now();
         if !at_step_limit(self.step, self.options.max_steps) {
             self.phase = Phase::Request { tool_choice: ToolChoice::Auto, wrap_up: None };
             return;
@@ -1137,6 +1154,11 @@ impl LoopState {
             return self.finish(StopReason::Loop);
         }
         if calls.is_empty() {
+            // "Send now": a message that came while this reply streamed is read by one more step, rather than left
+            // for after the turn. It's what the person said last, so it goes ahead of #90's "continue".
+            if !aborted && self.deliver_sent_now() {
+                return self.next_step();
+            }
             // #90: a plain answer that announces its next step ("Now checking issue #7 before
             // commenting:") is how a turn dies halfway. Once per turn, say "continue" like a
             // user would; a second announcement just ends the run, still logged.
@@ -1184,6 +1206,29 @@ impl LoopState {
         }
         self.emit(LoopEvent::Error(message));
         self.finish(StopReason::MaxSteps);
+    }
+
+    /// "Send now": appends the person's waiting messages as user messages, if the history is at a step boundary
+    /// (every call answered: never between a call and its result), and says so. True when any went in. Not while
+    /// the run is being stopped: they stay waiting, and the session hands them back.
+    fn deliver_sent_now(&mut self) -> bool {
+        let Some(send_now) = self.options.send_now.clone() else { return false };
+        if send_now.is_empty() || self.aborted() {
+            return false;
+        }
+        let texts = {
+            let mut history = self.options.history.lock().unwrap_or_else(|e| e.into_inner());
+            if !at_step_boundary(&history) {
+                return false;
+            }
+            let texts = send_now.take();
+            history.extend(texts.iter().map(|text| ChatTurn::User { text: text.clone() }));
+            texts
+        };
+        for text in texts {
+            self.emit(LoopEvent::SentNow { text });
+        }
+        true
     }
 
     /// One transition of running the step's calls. True when they're all answered and the phase moved on.
@@ -3452,5 +3497,156 @@ mod tests {
                 reasoning: None
             }
         );
+    }
+
+    // "Send now": the person's message at the next step boundary.
+
+    /// A runner whose calls each push `text` into `q` while they run (the person typed it then).
+    fn sending(q: &SendNow, text: &'static str) -> FakeRunner {
+        let q = q.clone();
+        let run: RunFn = Arc::new(move |c, cancel| {
+            let _ = q.push(text.to_string());
+            fake_tool()(c, cancel)
+        });
+        FakeRunner { run, parallel: |_| true }
+    }
+
+    #[tokio::test]
+    async fn sent_now_while_tools_run_goes_in_after_every_result_of_the_step_before_the_next_request() {
+        let provider = Arc::new(ScriptedProvider::new(vec![use_tools(&[call("c1", "a.ts"), call("c2", "b.ts")]), say("Done.")]));
+        let q = SendNow::new();
+        let h = history(vec![user("go")]);
+        let events =
+            collect(AgentOptions { send_now: Some(q.clone()), ..options(provider.clone(), &h, sending(&q, "also b")) }).await;
+        let requests = provider.requests();
+        let second = &requests[1].0;
+        // Both calls ran (nothing was stopped for it), their results first, in call order, then the person's words.
+        // Each call pushed it once: two messages, two user turns, in order.
+        assert!(matches!(
+            &second[second.len() - 4..],
+            [ChatTurn::Tool { call_id: a, .. }, ChatTurn::Tool { call_id: b, .. }, ChatTurn::User { text: x }, ChatTurn::User { text: y }]
+                if a == "c1" && b == "c2" && x == "also b" && y == "also b"
+        ));
+        // Appended, not inserted: the second request starts with the first one (prompt cache).
+        assert_eq!(second[..requests[0].0.len()], requests[0].0[..]);
+        // The event comes once it's in the history, after the step's tool ends.
+        let last_end = events.iter().rposition(|e| matches!(e, LoopEvent::ToolEnd { .. })).unwrap();
+        let first_sent = events.iter().position(|e| matches!(e, LoopEvent::SentNow { .. })).unwrap();
+        assert!(first_sent > last_end);
+        assert_eq!(count(&events, |e| matches!(e, LoopEvent::SentNow { text } if text == "also b")), 2);
+        assert_eq!(end(&events), Some(StopReason::End));
+        assert!(q.close().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sent_now_follows_after_steps_note() {
+        let provider = Arc::new(ScriptedProvider::new(vec![use_tools(&[call("c1", "a.ts")]), say("Fixed.")]));
+        let q = SendNow::new();
+        let mut runner = sending(&q, "and the tests");
+        runner.parallel = |_| false;
+        collect(AgentOptions {
+            send_now: Some(q.clone()),
+            after_step: after_step(|_| Some("Marv: 1 new error".into())),
+            ..options(provider.clone(), &history(vec![user("go")]), runner)
+        })
+        .await;
+        let second = &provider.requests()[1].0;
+        assert_eq!(&second[second.len() - 2..], &[user("Marv: 1 new error"), user("and the tests")]);
+    }
+
+    #[tokio::test]
+    async fn sent_now_during_a_plain_answer_is_read_by_one_more_step() {
+        let provider = Arc::new(ScriptedProvider::new(vec![say("Done."), say("Sure, b too.")]));
+        let q = SendNow::new();
+        let h = history(vec![user("go")]);
+        let mut events = Vec::new();
+        let mut stream =
+            std::pin::pin!(run_agent(AgentOptions { send_now: Some(q.clone()), ..options(provider.clone(), &h, plain()) }));
+        while let Some(event) = stream.next().await {
+            // Typed while the reply streams: the run would end after it.
+            if matches!(event, LoopEvent::TextDelta(_)) && events.is_empty() {
+                q.push("and b".into()).unwrap();
+            }
+            events.push(event);
+        }
+        assert_eq!(provider.requests().len(), 2);
+        assert_eq!(snapshot(&h), [user("go"), said("Done."), user("and b"), said("Sure, b too.")]);
+        assert_eq!(count(&events, |e| matches!(e, LoopEvent::SentNow { .. })), 1);
+        // Ahead of #90's "continue": no announced-step event either way here, and the run ends normally.
+        assert_eq!(end(&events), Some(StopReason::End));
+    }
+
+    #[tokio::test]
+    async fn sent_now_before_the_first_request_goes_right_after_the_turns_message() {
+        let provider = Arc::new(ScriptedProvider::new(vec![say("Ok.")]));
+        let q = SendNow::new();
+        q.push("in Rust".into()).unwrap();
+        collect(AgentOptions { send_now: Some(q.clone()), ..options(provider.clone(), &history(vec![user("go")]), plain()) })
+            .await;
+        assert_eq!(provider.requests()[0].0, [user("go"), user("in Rust")]);
+    }
+
+    #[tokio::test]
+    async fn sent_now_is_never_delivered_after_a_stop_or_a_decline_it_stays_for_the_session() {
+        // A decline ends the run: the message isn't read, and the session gets it back.
+        let provider = Arc::new(ScriptedProvider::new(vec![use_tools(&[call("c1", "a.ts")]), say("never asked")]));
+        let q = SendNow::new();
+        let q2 = q.clone();
+        let run: RunFn = Arc::new(move |c, cancel| {
+            let _ = q2.push("do it this way".into());
+            Box::pin(async move { Ok(ToolRun { declined: true, ..fake_tool()(c, cancel).await? }) })
+        });
+        let h = history(vec![user("go")]);
+        let events = collect(AgentOptions {
+            send_now: Some(q.clone()),
+            ..options(provider.clone(), &h, FakeRunner { run, parallel: |_| false })
+        })
+        .await;
+        assert_eq!(end(&events), Some(StopReason::Declined));
+        assert_eq!(count(&events, |e| matches!(e, LoopEvent::SentNow { .. })), 0);
+        assert!(!snapshot(&h).contains(&user("do it this way")));
+        assert_eq!(q.close(), ["do it this way"]);
+
+        // A stop while a tool runs: the call is answered "interrupted", the message stays waiting.
+        let provider = Arc::new(ScriptedProvider::new(vec![use_tools(&[call("c1", "a.ts")]), say("never asked")]));
+        let q = SendNow::new();
+        let (q2, stop) = (q.clone(), CancellationToken::new());
+        let stopper = stop.clone();
+        let run: RunFn = Arc::new(move |c, cancel| {
+            let _ = q2.push("wait".into());
+            stopper.cancel();
+            fake_tool()(c, cancel)
+        });
+        let h = history(vec![user("go")]);
+        let events = collect(AgentOptions {
+            send_now: Some(q.clone()),
+            cancel: stop,
+            ..options(provider.clone(), &h, FakeRunner { run, parallel: |_| false })
+        })
+        .await;
+        assert_eq!(end(&events), Some(StopReason::Aborted));
+        assert_eq!(provider.requests().len(), 1);
+        assert!(!snapshot(&h).contains(&user("wait")));
+        assert_eq!(q.close(), ["wait"]);
+    }
+
+    #[tokio::test]
+    async fn a_history_that_isnt_at_a_step_boundary_keeps_the_message_waiting() {
+        // Whatever the phase: with a call still unanswered at the end of the history, nothing is appended.
+        let h = history(vec![
+            user("go"),
+            ChatTurn::Assistant { text: String::new(), tool_calls: vec![call("c1", "a")], reasoning: None },
+        ]);
+        let q = SendNow::new();
+        q.push("now".into()).unwrap();
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let mut state = LoopState::new(AgentOptions { send_now: Some(q.clone()), ..options(provider, &h, plain()) });
+        assert!(!state.deliver_sent_now());
+        assert!(state.queue.is_empty());
+        assert_eq!(snapshot(&h).len(), 2);
+        h.lock().unwrap().push(tool("c1", "ok"));
+        assert!(state.deliver_sent_now());
+        assert_eq!(snapshot(&h).last(), Some(&user("now")));
+        assert!(matches!(state.queue.pop_front(), Some(LoopEvent::SentNow { text }) if text == "now"));
     }
 }
