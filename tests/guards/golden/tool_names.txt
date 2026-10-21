@@ -1,0 +1,13 @@
+read_file
+glob
+grep
+web_fetch
+github
+skill
+edit_file
+write_file
+bash
+process
+memory
+plan
+agent

@@ -45,8 +45,8 @@ pub mod write_file;
 pub use formatter::{FormatOutcome, Formatter, FormatterSetting, ProjectFormatter};
 pub use marv_core::MAX_DECLINE_REASON;
 pub use registry::{
-    DECLINED, INTERRUPTED, ToolOutcome, ToolRef, builtin_tools, declined_because, is_parallel_call, run_tool, schema_repaired,
-    tool_specs, tool_specs_for,
+    DECLINED, INTERRUPTED, REMOVED_TOOLS, Tombstone, ToolOutcome, ToolRef, builtin_tools, declined_because, is_parallel_call,
+    run_tool, schema_repaired, tool_specs, tool_specs_for, unknown_tool,
 };
 pub use schema_repair::RepairMode;
 pub use types::{

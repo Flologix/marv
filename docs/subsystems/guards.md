@@ -165,6 +165,9 @@ Each guard's doc comment says how it was proven: the guard was reverted, and the
 | Images: any image taints | `images.rs::an_image_taints` | Proven |
 | Images: sources, quarantined reader, sandboxed decoding | `images.rs::*` | Ignored: needs vision |
 | `docs/TOOLS.md` is generated from the tools' code and current | `tools.rs::tools_md_matches_the_code` | Proven (`Glob::kind` changed to `Write`) |
+| The built-in specs' bytes (names, order, descriptions, schemas) change only on purpose | `tools.rs::builtin_specs_match_the_golden` | Proven (a word added to `glob`'s description) |
+| A session's tool list keeps the specs' order | `tools.rs::every_tool_list_keeps_the_specs_order` | Holds by construction (`tool_specs_for` filters) |
+| A tool name is never reused; a removed tool has a tombstone | `tools.rs::a_removed_tool_keeps_its_name_and_tombstone` | Proven (two reverts: `memory` removed without a tombstone; a `glob` tombstone) |
 
 ## Notes
 
