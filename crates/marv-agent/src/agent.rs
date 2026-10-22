@@ -1140,6 +1140,13 @@ impl LoopState {
             OverflowOutcome::Recovered if attempt < MAX_OVERFLOW_RECOVERIES => {
                 self.overflows += 1;
                 let tool_choice = if wrap_up.is_some() { ToolChoice::None } else { ToolChoice::Auto };
+                // The rewritten history may have lost the step limit's note: the wrap-up asks for it again.
+                if wrap_up.is_some() {
+                    let last = self.options.history.lock().unwrap_or_else(|e| e.into_inner()).last().cloned();
+                    if !matches!(last, Some(ChatTurn::User { text }) if text.ends_with(STEP_LIMIT_NOTE)) {
+                        self.push_note(STEP_LIMIT_NOTE);
+                    }
+                }
                 self.phase = Phase::Request { tool_choice, wrap_up };
             }
             // A hook that would go on past the cap: the provider's error stands.
@@ -2979,6 +2986,7 @@ mod tests {
         let requests = provider.requests();
         assert_eq!(requests.len(), 3);
         assert_eq!(requests[2].1.tool_choice, ToolChoice::None, "still the wrap-up");
+        assert_eq!(requests[2].0.last(), Some(&user(&format!("fitted\n\n{STEP_LIMIT_NOTE}"))), "its note again");
         assert_eq!(end(&events), Some(StopReason::MaxSteps));
     }
 

@@ -2583,6 +2583,23 @@ impl MarvSession {
         *held = marv_tools::output::hold(&dir).ok().map(|h| (dir, h));
     }
 
+    /// Takes the person's message (turn `u` of `history`, as it stood) out of the conversation: it alone is larger than
+    /// the window. A turn that holds Marv's notes too keeps them.
+    fn drop_person_message(&self, history: &[ChatTurn], u: usize) {
+        let message = self.state().person_message.take().unwrap_or_default();
+        let mut edited = history.to_vec();
+        if let ChatTurn::User { text } = &mut edited[u] {
+            let rest = text.replacen(message.as_str(), "", 1);
+            if message.is_empty() || rest.trim().is_empty() {
+                edited.remove(u);
+            } else {
+                *text = rest.trim().to_string();
+            }
+        }
+        let conversation = self.state().conversation.clone();
+        *lock(&conversation) = marv_agent::compact::normalize(marv_agent::agent::answer_all_calls(&edited));
+    }
+
     /// Takes back a page whose compaction didn't happen (its summary failed): the history still holds its turns.
     async fn unpage(&self, page: u32) {
         if let Some(dir) = self.swap_dir() {
@@ -2644,6 +2661,17 @@ impl MarvSession {
             DROPPED_NOTE, MIN_HISTORY_BUDGET, V2_OVERFLOW_TARGETS, apply_drop, fit_for_summary, plan_drop, summary_instructions,
         };
         use marv_core::{estimate_history_tokens, estimate_tokens, estimate_turn_tokens};
+        // One notice per recovery for pages that couldn't be saved, however many levels tried.
+        let once: Option<Emit> = emit.map(|emit| {
+            let (emit, noticed) = (emit.clone(), Arc::new(AtomicBool::new(false)));
+            Arc::new(move |event: SessionEvent| {
+                if matches!(event, SessionEvent::Notice { .. }) && noticed.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                emit(event)
+            }) as Emit
+        });
+        let emit = once.as_ref();
         let mut level = {
             let mut s = self.state();
             if attempt == 0 {
@@ -2731,16 +2759,9 @@ impl MarvSession {
                 // What's kept, then what's dropped: saved first, and listed after the note (the summary message
                 // isn't rewritten at this level).
                 let trigger = CompactTrigger::Overflow { level: 3 };
-                let announced = if mid_turn {
-                    let specs = self.state().turn_mcp_specs.clone();
-                    self.announce(&specs)
-                } else {
-                    None
-                };
-                // The note, the page list (capped) and the announcement are budgeted with the turns kept.
-                let note_tokens = estimate_tokens(DROPPED_NOTE)
-                    + marv_tools::swap::MAX_TABLE_CHARS as u64 / marv_core::CHARS_PER_TOKEN
-                    + announced.as_deref().map_or(0, estimate_tokens);
+                // The note and the page list (capped) are budgeted with the turns kept.
+                let note_tokens =
+                    estimate_tokens(DROPPED_NOTE) + marv_tools::swap::MAX_TABLE_CHARS as u64 / marv_core::CHARS_PER_TOKEN;
                 let plan = plan_drop(&history, budget as u64, keep, note_tokens, person);
                 // The person's own message is never dropped; one larger than the whole window can't be sent at all.
                 if let Some(u) = plan.user
@@ -2748,6 +2769,9 @@ impl MarvSession {
                     && estimate_turn_tokens(&history[u]) as f64 > window_est - fixed_est - reserve_est
                 {
                     let size = (estimate_turn_tokens(&history[u]) as f64 * ratio) as u64;
+                    // It's left out of the history, so the next message doesn't meet the same wall (the person still
+                    // has it in their transcript).
+                    self.drop_person_message(&history, u);
                     return failed(
                         3,
                         format!(
@@ -2767,12 +2791,20 @@ impl MarvSession {
                     }
                 };
                 let mut note = DROPPED_NOTE.to_string();
-                for extra in table.into_iter().chain(announced) {
-                    note = format!("{note}\n\n{extra}");
+                if let Some(table) = table {
+                    note = format!("{note}\n\n{table}");
                 }
                 let new = apply_drop(&history, &plan, &note);
                 let kept_turns = new.len().saturating_sub(keep + 1);
                 self.install(new, None);
+                // Announced after the install, which forgets what was announced: otherwise the next message lists the
+                // MCP tools a second time.
+                if mid_turn {
+                    let specs = self.state().turn_mcp_specs.clone();
+                    if let Some(announced) = self.announce(&specs) {
+                        marv_agent::compact::push_user(&mut lock(&self.state().conversation.clone()), &announced);
+                    }
+                }
                 if let Some(log) = self.trajectory() {
                     log.write(&TrajectoryRecord::Compact {
                         turn: self.trajectory_turn(&log),
@@ -5359,6 +5391,26 @@ mod turn_tests {
             events.iter().filter_map(|e| if let SessionEvent::Notice { text } = e { Some(text) } else { None }).collect();
         assert!(matches!(&notices[..], [n] if n.contains("Couldn't save") && n.contains("dropped without them")), "{notices:?}");
         assert!(std::fs::metadata(&swap).unwrap().is_file());
+        assert_alternating(&provider.requests());
+    }
+
+    #[tokio::test]
+    async fn a_message_larger_than_the_window_fails_clearly_and_is_left_out_after() {
+        let dirs = Dirs::new();
+        let probe = scripted(&dirs, &Scripted::new(vec![]), |_| {});
+        let fixed = fixed_step(&probe);
+        let window = fixed + 4_000 + 8192.min((fixed + 4_000) / 8);
+        let provider = Scripted::new(vec![overflowed(), say("Next.")]).with_context(window);
+        let session = scripted(&dirs, &provider, |_| {});
+        let huge = "z".repeat(40_000);
+        let events = collect(go(&session, &huge)).await;
+        assert_eq!(end_reason(&events), TurnEndReason::Done(StopReason::Error));
+        let error =
+            events.iter().find_map(|e| if let SessionEvent::Loop(LoopEvent::Error(m)) = e { Some(m.clone()) } else { None });
+        assert!(error.unwrap().contains("Your message (about"));
+        assert!(!session.conversation().iter().any(|t| text_of(t).contains(&huge)));
+        let events = collect(go(&session, "a short one")).await;
+        assert_eq!(end_reason(&events), TurnEndReason::Done(StopReason::End));
         assert_alternating(&provider.requests());
     }
 
