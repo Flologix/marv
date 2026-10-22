@@ -11,7 +11,9 @@
 //! - Each hunk is located with `edit_match::apply_edit` (exact, trailing-whitespace, indentation tiers; CRLF kept), so
 //!   it forgives exactly what `edit_file` forgives and reports the same closest-lines error.
 //! - One preview with every file's diff; one approval (scope `files`, like the edit tools); `auto_safe` like
-//!   `edit_file` for each path. Applied under `with_file_lock` per file, in path order (no lock-order deadlocks).
+//!   `edit_file` for each path. Every existing file must pass `file_versions`' check like `edit_file`'s (read, and
+//!   unchanged since), in the preview and again at apply time. Applied under `with_file_lock` per file, taken in the
+//!   order of `file_lock::lock_key` (the real-path key both locks use, so no lock-order deadlocks).
 //! - Results: one line per file plus syntax notes (`syntax::broken_by`), `diff` concatenated, `changed` per file
 //!   (needs `ToolOutput::changed` to become a list, which marv-session's checks then iterate).
 //! - Not registered in `builtin_tools` until it is built and has an eval.

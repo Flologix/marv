@@ -9,18 +9,27 @@
 //! after the previous one on the same path has finished. Entries are forgotten once nothing is queued behind them.
 //!
 //! marv-rs: the same holds across processes (two Marv sessions in one folder, a TUI and the desktop). Inside the queue
-//! a call also takes an advisory lock (`flock`) on a per-file lock file in the runtime folder's `file-locks/`
-//! (`ToolContext::file_locks`), so the edit tools' check that the file is still as the session last saw it
-//! ([`crate::file_versions`]) and their write are one step: two writers can't both pass the check.
+//! a call also takes an advisory lock (`flock`) on a per-file lock file in `ToolContext::file_locks` (the runtime
+//! folder's `file-locks/`, or `~/.marv/file-locks/` where there's no runtime folder), so the edit tools' check that
+//! the file is still as the session last saw it ([`crate::file_versions`]) and their write are one step: two writers
+//! can't both pass the check.
+//! - Both locks are keyed on the file's real path ([`lock_key`]), after the path is resolved like the tools resolve it
+//!   (`~/`, `..`, symlinks): every spelling of one file is one lock. On a case-insensitive filesystem (macOS, Windows)
+//!   the file's name is case-folded, so `A.txt` and `a.txt` are one lock too.
 //! - Held for one call's check, write and format only, never across a model step or a turn, and released when the
 //!   call ends however it ends (the lock goes with the file handle, and the OS drops it when a process dies, so
-//!   there are no stale locks to take over).
-//! - The runtime folder is hidden in every sandbox, so a sandboxed command can't hold a lock to stall the edit tools.
-//! - A lock file is named after the hash of the file's real path. Lock files are never removed: unlinking one while a
-//!   waiter has it open would let two holders lock two different files. They're empty, one per file ever written,
-//!   in a folder that's cleared at logout.
+//!   there are no stale locks to take over). Waiting for it ends at Esc.
+//! - The runtime folder and `~/.marv` are hidden in every sandbox, so a sandboxed command can't hold a lock to stall
+//!   the edit tools.
+//! - A lock file is named after the hash of the lock key. Lock files are never removed: unlinking one while a waiter
+//!   has it open would let two holders lock two different files. Each is an empty file, one per file path ever
+//!   written. The runtime folder is cleared at logout or reboot; `~/.marv/file-locks/` keeps them.
 //! - Waits up to [`LOCK_WAIT`] (longer than the formatter's timeout) and then fails the call, writing nothing.
-//! - Without a runtime folder (`file_locks` None), only the in-process queue applies.
+//! - Without a lock folder (`file_locks` None), only the in-process queue applies.
+//! - Known limits: two hard links to one file are two keys (and two locks); and two Marv processes with different lock
+//!   folders (a different `MARV_RUNTIME_DIR`, or one with a runtime folder and one without) don't see each other's
+//!   locks. The content check ([`crate::file_versions`]) still catches the change, except in the instant between one's
+//!   check and its write.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions, TryLockError};
@@ -58,15 +67,28 @@ pub fn real_path(path: &Path) -> PathBuf {
     }
 }
 
+/// Whether file names are case-insensitive here (the platform's default filesystem: APFS, NTFS).
+const CASE_INSENSITIVE: bool = cfg!(any(target_os = "macos", windows));
+
+/// What both locks are keyed on: the real path, its file name case-folded where names are case-insensitive (a new
+/// file has no real spelling yet, so `A.txt` and `a.txt` would otherwise be two locks on one file).
+pub fn lock_key(path: &Path) -> PathBuf {
+    let real = real_path(path);
+    match (CASE_INSENSITIVE, real.parent(), real.file_name()) {
+        (true, Some(parent), Some(name)) => parent.join(name.to_string_lossy().to_lowercase()),
+        _ => real,
+    }
+}
+
 /// The lock file for `file` (an absolute path) in the lock folder `dir`.
 pub fn lock_path(dir: &Path, file: &Path) -> PathBuf {
-    let hash = crate::file_versions::content_hash(real_path(file).as_os_str().as_encoded_bytes());
+    let hash = crate::file_versions::content_hash(lock_key(file).as_os_str().as_encoded_bytes());
     let name: String = hash[..16].iter().map(|b| format!("{b:02x}")).collect();
     dir.join(format!("{name}.lock"))
 }
 
 /// Opens (or makes) the lock file and waits for this process's lock on it.
-async fn lock_across_processes(dir: &Path, file: &Path, shown: &str) -> Result<File, ToolError> {
+async fn lock_across_processes(ctx: &ToolContext, dir: &Path, file: &Path, shown: &str) -> Result<File, ToolError> {
     let failed = |e: std::io::Error| ToolError(format!("Couldn't lock {shown} against other Marv processes: {e}"));
     let path = lock_path(dir, file);
     #[cfg(unix)]
@@ -84,7 +106,14 @@ async fn lock_across_processes(dir: &Path, file: &Path, shown: &str) -> Result<F
     loop {
         match handle.try_lock() {
             Ok(()) => return Ok(handle),
-            Err(TryLockError::WouldBlock) if Instant::now() < deadline => tokio::time::sleep(LOCK_POLL).await,
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                tokio::select! {
+                    () = tokio::time::sleep(LOCK_POLL) => {}
+                    () = ctx.cancel.cancelled() => {
+                        return Err(ToolError(crate::edit_file::INTERRUPTED_BEFORE_WRITE.into()));
+                    }
+                }
+            }
             Err(TryLockError::WouldBlock) => {
                 return Err(ToolError(format!(
                     "{shown} is being changed by another Marv process, so nothing was written. Try again in a moment."
@@ -95,20 +124,21 @@ async fn lock_across_processes(dir: &Path, file: &Path, shown: &str) -> Result<F
     }
 }
 
-/// Runs `f` after every earlier `with_file_lock` on the same path (relative to `ctx.root`) has finished, holding the
-/// cross-process lock on it when `ctx.file_locks` names a folder. Fails, without running `f`, only when that lock
-/// can't be had.
+/// Runs `f` after every earlier `with_file_lock` on the same file has finished, holding the cross-process lock on it
+/// when `ctx.file_locks` names a folder. `path` is resolved as the tools resolve it (a path outside the project fails
+/// here with their error). Fails, without running `f`, when the path is refused or the lock can't be had (Esc
+/// included).
 pub async fn with_file_lock<T, F, Fut>(ctx: &ToolContext, path: &str, f: F) -> Result<T, ToolError>
 where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<T, ToolError>>,
 {
-    let key = normalize(&ctx.root.join(path));
+    let key = lock_key(&crate::files::resolve_in_project(ctx, path)?);
     let lock = locks().lock().unwrap_or_else(|e| e.into_inner()).entry(key.clone()).or_default().clone();
     let result = {
         let _held = lock.lock().await;
         match &ctx.file_locks {
-            Some(dir) => match lock_across_processes(dir, &key, path).await {
+            Some(dir) => match lock_across_processes(ctx, dir, &key, path).await {
                 // Released when this arm ends: the call's check, write and format, and nothing after.
                 Ok(_across) => f().await,
                 Err(e) => Err(e),
@@ -132,7 +162,8 @@ mod tests {
     #[tokio::test]
     async fn calls_on_one_path_run_one_after_another() {
         let order = Arc::new(Mutex::new(Vec::new()));
-        let ctx = ToolContext::new("/tmp/marv-lock-test");
+        let root = TempDir::new("lock-order");
+        let ctx = ToolContext::new(root.path());
         let a = {
             let order = order.clone();
             with_file_lock(&ctx, "a.txt", move || async move {
@@ -151,7 +182,7 @@ mod tests {
         let (a, b) = tokio::join!(a, b);
         assert!(a.is_ok() && b.is_ok());
         assert_eq!(*order.lock().unwrap(), ["first", "second"]);
-        assert!(!locks().lock().unwrap().contains_key(Path::new("/tmp/marv-lock-test/a.txt")));
+        assert!(!locks().lock().unwrap().contains_key(&root.path().join("a.txt")));
     }
 
     #[tokio::test]
@@ -198,5 +229,43 @@ mod tests {
         assert_eq!(lock_path(dir, &root.path().join("a.txt")), lock_path(dir, &root.path().join("x/../a.txt")));
         assert_eq!(lock_path(dir, &root.path().join("new.txt")), lock_path(dir, &root.path().join("./new.txt")));
         assert_ne!(lock_path(dir, &root.path().join("a.txt")), lock_path(dir, &root.path().join("new.txt")));
+    }
+
+    #[tokio::test]
+    async fn esc_ends_the_wait_for_another_processs_lock() {
+        let root = TempDir::new("lock-esc");
+        let dir = root.path().join("locks");
+        let mut ctx = ToolContext::new(root.path());
+        ctx.file_locks = Some(dir.clone());
+        std::fs::create_dir_all(&dir).unwrap();
+        let other = File::create(lock_path(&dir, &root.path().join("a.txt"))).unwrap();
+        other.lock().unwrap();
+        let cancel = ctx.cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel.cancel();
+        });
+        let started = Instant::now();
+        let out = with_file_lock(&ctx, "a.txt", || async { Ok(()) }).await;
+        assert_eq!(out.unwrap_err().0, crate::edit_file::INTERRUPTED_BEFORE_WRITE);
+        assert!(started.elapsed() < Duration::from_secs(5), "waited past Esc");
+    }
+
+    #[tokio::test]
+    async fn a_home_spelling_of_a_project_file_is_the_same_lock() {
+        let home = TempDir::new("lock-home");
+        home.write("proj/a.txt", "x");
+        let root = home.path().join("proj");
+        let ctx = ToolContext { home: home.path().to_path_buf(), ..ToolContext::new(&root) };
+        let key = lock_key(&crate::files::resolve_in_project(&ctx, "~/proj/a.txt").unwrap());
+        assert_eq!(key, lock_key(&crate::files::resolve_in_project(&ctx, "a.txt").unwrap()));
+        assert!(with_file_lock(&ctx, "../outside.txt", || async { Ok(()) }).await.is_err(), "refused like the tools");
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn a_new_files_name_is_case_folded() {
+        let root = TempDir::new("lock-case");
+        assert_eq!(lock_key(&root.path().join("New.TXT")), lock_key(&root.path().join("new.txt")));
     }
 }

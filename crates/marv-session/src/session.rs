@@ -337,6 +337,9 @@ pub struct SessionInit {
     /// `~/.marv/tool-output` (#61): a cut tool result is saved whole in `<dir>/<session id>/`, which read_file and grep
     /// may read; old sessions' folders are cleaned up at its first turn. Without it, cuts aren't saved.
     pub tool_output_dir: Option<PathBuf>,
+    /// Where the edit tools' cross-process file locks go when there's no runtime folder (`~/.marv/file-locks`;
+    /// `marv_tools::file_lock`). None: then such a session orders calls within its own process only.
+    pub file_locks_dir: Option<PathBuf>,
     /// What the user saw, saved with the session (the TUI's transcript); default: the messages and replies.
     pub transcript: Option<TranscriptFn>,
     /// Something a UI shows changed outside a turn (the model's info arrived, memory reloaded).
@@ -422,6 +425,7 @@ impl SessionInit {
             log_trajectories: true,
             worktrees_dir: None,
             tool_output_dir: None,
+            file_locks_dir: None,
             transcript: None,
             on_change: None,
             on_warning: None,
@@ -1757,10 +1761,11 @@ impl MarvSession {
         ctx.checkpoint = checkpoint.map(|c| c as Arc<dyn marv_tools::Checkpoint>);
         ctx.taint = self.inner.taint.clone();
         ctx.file_versions = self.inner.file_versions.clone();
-        // The edit tools' check-and-write locks against other Marv processes in this folder (none without a runtime
-        // folder: then within this process only).
+        // The edit tools' check-and-write locks against other Marv processes in this folder: in the runtime folder,
+        // else in Marv's own folder (`file_locks_dir`); with neither, within this process only.
         ctx.file_locks = marv_sandbox::runtime_dir_for(&marv_sandbox::runtime_env(), Some(&init.root))
-            .map(|dir| dir.join(marv_tools::file_lock::LOCK_FOLDER));
+            .map(|dir| dir.join(marv_tools::file_lock::LOCK_FOLDER))
+            .or_else(|| init.file_locks_dir.clone());
         // The main agent's doors out of the sandbox, fixed for the session (the prompt names them: the cache).
         ctx.doors.host = init.host_commands;
         ctx.doors.github = init.github;

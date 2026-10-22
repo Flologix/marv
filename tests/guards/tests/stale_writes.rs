@@ -36,8 +36,8 @@ async fn run(ctx: &ToolContext, name: &str, args: Value) -> marv_tools::ToolOutp
 /// another Marv process (`marv -p`) reads it and writes it; this session's edit, built on the old text, is refused
 /// and writes nothing, so the other's change stays. After reading the file again, the same edit goes through.
 ///
-/// Proven: removed the `file_versions.check` from `edit_file::plan` → failed (the edit dropped the other process's
-/// line).
+/// Proven: removed the `file_versions.check` from `edit_file::plan` → failed (the stale edit went through instead
+/// of being refused).
 #[tokio::test]
 async fn an_edit_after_another_sessions_write_is_refused_until_reread() {
     let (root, config) = (TempDir::new("stale-edit"), TempDir::new("stale-edit-config"));
@@ -166,4 +166,32 @@ async fn no_lock_outlives_one_call() {
     let created = run(&ctx, "write_file", json!({"path": "c.txt", "content": "new\n"})).await;
     assert!(!created.is_error, "{}", created.output);
     assert!(free("c.txt"), "held after a created file");
+}
+
+/// **Every spelling of a file is one lock.** While another process holds the lock on `proj/a.txt`, a write to it as
+/// `~/proj/a.txt` (the project inside the home) waits, like one as `a.txt` would: the path is resolved, `~/` included,
+/// before the lock is keyed.
+///
+/// Proven: keyed `with_file_lock` on `root.join(path)` unresolved → failed (the `~/` write went through while the lock
+/// was held).
+#[tokio::test]
+async fn a_home_spelling_of_a_file_waits_for_the_same_lock() {
+    let (home, locks) = (TempDir::new("stale-home"), TempDir::new("stale-home-rt"));
+    home.write("proj/a.txt", "one\n");
+    let root = home.path().join("proj");
+    let ctx = ToolContext { home: home.path().to_path_buf(), file_locks: Some(locks.path().to_path_buf()), ..session(&root) };
+    assert!(!run(&ctx, "read_file", json!({"path": "a.txt"})).await.is_error);
+    let theirs = File::create(lock_path(locks.path(), &root.join("a.txt"))).unwrap();
+    theirs.lock().unwrap();
+    let write = run(&ctx, "write_file", json!({"path": "~/proj/a.txt", "content": "two\n"}));
+    let hold = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let during = std::fs::read_to_string(root.join("a.txt")).unwrap();
+        theirs.unlock().unwrap();
+        during
+    };
+    let (out, during) = tokio::join!(write, hold);
+    assert_eq!(during, "one\n", "written while another process held the lock");
+    assert!(!out.is_error, "{}", out.output);
+    assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "two\n");
 }

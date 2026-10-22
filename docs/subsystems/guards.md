@@ -152,6 +152,7 @@ Each guard's doc comment says how it was proven: the guard was reverted, and the
 | File changes: an existing file the session never read can't be overwritten or edited; a new file can | `stale_writes.rs::an_existing_file_never_read_cant_be_overwritten` | Proven |
 | File changes: the check and the write are one step under a cross-process lock | `stale_writes.rs::the_check_and_write_are_atomic_across_processes` | Proven |
 | File changes: no lock outlives one call | `stale_writes.rs::no_lock_outlives_one_call` | Proven |
+| File changes: every spelling of a file (`~/…` included) is one lock | `stale_writes.rs::a_home_spelling_of_a_file_waits_for_the_same_lock` | Proven |
 | Images: any image taints | `images.rs::an_image_taints` | Proven |
 | Images: sources, quarantined reader, sandboxed decoding | `images.rs::*` | Ignored: needs vision |
 
