@@ -130,7 +130,8 @@ impl Tool for Recall {
         for (page, i, paged) in &turns {
             let mut body = turn_text(&paged.turn);
             // One message too big for a call on its own: its start and end, and how to read the rest.
-            let budget = MAX_RECALL_CHARS - 400;
+            // Room for the header and the fence, and for defusing (one character per closing tag, at most 1 in 16).
+            let budget = (MAX_RECALL_CHARS - 600) * 15 / 16;
             let size = body.chars().count();
             if size > budget {
                 let head: String = body.chars().take(budget / 2).collect();

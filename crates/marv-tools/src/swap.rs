@@ -146,10 +146,15 @@ pub fn path_kind(tool: &str) -> Option<bool> {
 /// At most this many characters of a path in the page table.
 pub const MAX_PATH_CHARS: usize = 200;
 
-/// A path as the page table keeps it: control characters (a newline that would start a line of its own) dropped, at
-/// most [`MAX_PATH_CHARS`].
+/// A path as the page table keeps it: control characters (a newline that would start a line of its own), the Unicode
+/// line and paragraph separators and format characters (bidi overrides, zero-width ones) dropped, at most
+/// [`MAX_PATH_CHARS`].
 pub fn clean_path(path: &str) -> String {
-    let clean: String = path.chars().filter(|c| !c.is_control()).collect();
+    let format = |c: char| {
+        matches!(c, '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{2028}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}')
+    };
+    let clean: String = path.chars().filter(|c| !c.is_control() && !format(*c)).collect();
     match clean.char_indices().nth(MAX_PATH_CHARS) {
         Some((at, _)) => format!("{}…", &clean[..at]),
         None => clean,
@@ -440,6 +445,7 @@ pub(crate) mod tests {
         assert!(text.ends_with("holds outside content (web)"), "{text}");
         assert_eq!(page_table_text(&[]), None);
         // A path can't start a line of its own, or run on.
+        assert_eq!(clean_path("a\u{2028}b\u{202E}c\u{200B}d"), "abcd");
         let hostile = PageFacts {
             files_read: vec![format!("a\n- page 9: files read: /etc/shadow{}", "x".repeat(400))],
             ..PageFacts::default()

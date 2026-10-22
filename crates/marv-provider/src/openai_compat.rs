@@ -124,16 +124,24 @@ static DEEPINFRA_REFUSAL: LazyLock<regex::Regex> = LazyLock::new(|| {
 
 /// #116: what a refusal like [`WINDOW_REFUSAL`] says: the window, and how many tokens the prompt was.
 pub fn window_refusal(detail: &str) -> Option<(u64, u64)> {
-    // Marv #63 review: DeepInfra (through OpenRouter) says the same with its own words.
-    if let Some(caps) = DEEPINFRA_REFUSAL.captures(detail) {
-        let number = |i: usize| caps.get(i)?.as_str().parse::<u64>().ok();
-        return Some((number(1)?, number(2)?)).filter(|(_, input)| *input > 0);
+    // Marv #63 review: DeepInfra (through OpenRouter), and vLLM / older OpenAI ("(N in the messages, M in the
+    // completion)"), say the same with their own words. A window of 0 says nothing.
+    for re in [&*DEEPINFRA_REFUSAL, &*MESSAGES_REFUSAL] {
+        if let Some(caps) = re.captures(detail) {
+            let number = |i: usize| caps.get(i)?.as_str().parse::<u64>().ok();
+            return Some((number(1)?, number(2)?)).filter(|(window, input)| *window > 0 && *input > 0);
+        }
     }
     let caps = WINDOW_REFUSAL.captures(detail)?;
     let number = |i: usize| caps.get(i)?.as_str().parse::<u64>().ok();
     let (window, total, output) = (number(1)?, number(2)?, number(3)?);
-    Some((window, total.checked_sub(output).filter(|&input| input > 0)?))
+    Some((window, total.checked_sub(output).filter(|&input| input > 0)?)).filter(|(window, _)| *window > 0)
 }
+
+/// vLLM's and older OpenAI's: "maximum context length is N tokens. However, you requested T tokens (I in the
+/// messages, O in the completion)."
+static MESSAGES_REFUSAL: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?is)maximum context length is (\d+) tokens.*?\((\d+) in the messages,").unwrap());
 
 /// #116: what the adapter has learned about the room in the window, shared by every stream of this provider (the
 /// session and its subagents use the same one), so one refusal lowers the cap for the rest of the session.

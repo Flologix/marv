@@ -412,6 +412,12 @@ mod tests {
             assert!(!is_context_overflow(&text), "{file}");
         }
         assert!(is_context_overflow(r#"{"error":{"code":"context_length_exceeded"}}"#));
+        // vLLM and older OpenAI: the messages against the completion; a window of 0 says nothing.
+        let vllm = "This model's maximum context length is 4096 tokens. However, you requested 5000 tokens (4000 in the messages, 1000 in the completion).";
+        assert_eq!(crate::openai_compat::window_refusal(vllm), Some((4096, 4000)));
+        assert!(!is_context_overflow(vllm), "the prompt alone fits: the adapter refits max_tokens");
+        assert!(is_context_overflow(&vllm.replace("4000 in the messages", "4500 in the messages")));
+        assert_eq!(crate::openai_compat::window_refusal(&vllm.replace("4096", "0")), None);
         // The numbers each wording carries, for calibration.
         let numbers: Vec<_> = read("overflow")
             .iter()

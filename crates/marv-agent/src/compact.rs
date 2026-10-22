@@ -474,8 +474,24 @@ fn head_and_tail(text: &str, tokens: u64) -> String {
     cut_with(text, tokens, "[… cut for the summary …]")
 }
 
-/// [`head_and_tail`] with its own note in the middle.
+/// [`head_and_tail`] with its own note in the middle. A fenced result (`<untrusted-data …>` … `</untrusted-data>`) is
+/// cut inside its fence: both its lines stay, so the cut can't leave the text unfenced.
 pub fn cut_with(text: &str, tokens: u64, note: &str) -> String {
+    const OPEN: &str = "<untrusted-data";
+    const CLOSE: &str = "\n</untrusted-data>";
+    if text.starts_with(OPEN)
+        && text.ends_with(CLOSE)
+        && let Some(first) = text.find('\n')
+        && first < text.len() - CLOSE.len()
+    {
+        let (open, body) = (&text[..=first], &text[first + 1..text.len() - CLOSE.len()]);
+        let room = tokens.saturating_sub(marv_core::estimate_tokens(open) + marv_core::estimate_tokens(CLOSE));
+        return format!("{open}{}{CLOSE}", cut_plain(body, room, note));
+    }
+    cut_plain(text, tokens, note)
+}
+
+fn cut_plain(text: &str, tokens: u64, note: &str) -> String {
     let keep = (tokens * marv_core::CHARS_PER_TOKEN / 2) as usize;
     let chars: Vec<char> = text.chars().collect();
     if chars.len() <= 2 * keep {
@@ -1052,13 +1068,21 @@ mod tests {
         let plan = plan_drop(&h, 1000, 0, 40, newest_user(&h, 0));
         assert!(plan.dropped().contains(&(h.len() - 1)));
         // Marv's own note after the person's message isn't taken for it.
-        let mut h = h;
         let person = h.len() - 1;
         h.push(calls("c9", 4));
         h.push(result("c9", 40));
         h.push(user(MID_TURN_NOTE));
         let plan = plan_drop(&h, 1000, 0, 40, Some(person));
         assert_eq!(plan.user, Some(person));
+    }
+
+    #[test]
+    fn a_fenced_result_is_cut_inside_its_fence() {
+        let text = format!("<untrusted-data source=\"web\" from=\"page\">\n{}\n</untrusted-data>", "w".repeat(8000));
+        let cut = cut_with(&text, 200, MESSAGE_CUT);
+        assert!(cut.starts_with("<untrusted-data source=\"web\" from=\"page\">\nwww"), "{cut}");
+        assert!(cut.ends_with("www\n</untrusted-data>") && cut.contains(MESSAGE_CUT));
+        assert!(marv_core::estimate_tokens(&cut) <= 240);
     }
 
     #[test]

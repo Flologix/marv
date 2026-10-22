@@ -141,7 +141,17 @@ pub fn saved_outputs(dir: &Path, call_id: &str) -> Vec<PathBuf> {
             let name = e.file_name();
             let Some(name) = name.to_str().and_then(|n| n.strip_suffix(".txt")) else { return false };
             let Some(rest) = name.strip_prefix(&stem) else { return false };
-            let rest = rest.strip_prefix('-').map_or(rest, |r| r.trim_start_matches(|c: char| c.is_ascii_digit()));
+            // Exactly `<stem>`, or `<stem>-<n>` (a taken name), then `.<source>` or nothing.
+            let rest = match rest.strip_prefix('-') {
+                Some(numbered) => {
+                    let digits = numbered.len() - numbered.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+                    if digits == 0 {
+                        return false;
+                    }
+                    &numbered[digits..]
+                }
+                None => rest,
+            };
             rest.is_empty() || (rest.starts_with('.') && !rest[1..].contains('.'))
         })
         .map(|e| e.path())
@@ -268,6 +278,17 @@ mod tests {
     use super::*;
     use crate::test_support::TempDir;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn a_calls_saved_outputs_are_found_by_its_exact_name() {
+        let dir = TempDir::new("saved-outputs");
+        for name in ["c1.txt", "c1-2.mcp.txt", "c1-.txt", "c10.txt", "c1x.txt", "c1.mcp.extra.txt"] {
+            std::fs::write(dir.path().join(name), "x").unwrap();
+        }
+        let found: Vec<String> =
+            saved_outputs(dir.path(), "c1").iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(found, ["c1-2.mcp.txt", "c1.txt"]);
+    }
 
     #[test]
     fn keeps_the_start_and_the_end_of_very_long_output() {
