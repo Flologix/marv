@@ -185,24 +185,22 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
     let door = tool.door(input, ctx);
     // What the tool declares its output to be, for this call: no result is trusted more than that.
     let declared = tool.provenance_in(input, ctx);
-    // A tool's own error (`ToolError`) can carry its source's words too: a redirect's `Location`, a server's
-    // `Content-Type`, gh's stderr. From an outside source it's that source's text: fenced, never Marv's. `reached`: the
-    // call got as far as its source (the run, not the preview, whose checks are Marv's own and reach nothing), so the
-    // text taints too.
-    let tool_failed = |err: crate::types::ToolError, reached: bool| {
+    // A tool's own error (`ToolError`) from its run can carry its source's words too: a redirect's `Location`, a
+    // server's `Content-Type`, gh's stderr. From an outside source it's that source's text: fenced and tainting, never
+    // Marv's. A preview's error stays Marv's: a preview reaches nothing (gh's checks are local, web_fetch's is an
+    // address check), so what it says is Marv's own refusal.
+    let tool_failed = |err: crate::types::ToolError| {
         let mut outcome = fail(err.0, &label);
         if declared.taints() {
             outcome.result.provenance = declared;
-            if reached {
-                ctx.taint.mark(declared);
-            }
+            ctx.taint.mark(declared);
         }
         noted(outcome)
     };
     let finish = |result: Result<ToolOutput, crate::types::ToolError>, approval: Option<Approval>| {
         let mut result = match result {
             Ok(result) => result,
-            Err(err) => return tool_failed(err, true),
+            Err(err) => return tool_failed(err),
         };
         result.door = door;
         result.provenance = result.provenance.least_trusted(declared);
@@ -251,7 +249,7 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
     // The preview runs first, so a call that can't succeed fails here instead of being approved.
     let preview = match tool.preview(input, ctx).await {
         Ok(preview) => preview,
-        Err(err) => return tool_failed(err, false),
+        Err(err) => return noted(fail(err.0, &label)),
     };
     // Stopped while the preview was being made: don't raise a prompt for a run that's over.
     if ctx.aborted() {
@@ -265,7 +263,7 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
         Some(_) => None,
     };
     let decision = match own {
-        Some(Err(err)) => return tool_failed(err, true),
+        Some(Err(err)) => return tool_failed(err),
         Some(Ok(decision)) => decision,
         None => {
             let scope = tool
