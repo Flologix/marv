@@ -142,6 +142,9 @@ function apply(items: Item[], e: ServerEvent): Item[] {
     case "notice":
       next.push({ kind: "notice", text: String(e.text), tone: "info" });
       return next;
+    case "checkpoint_failed":
+      next.push({ kind: "notice", text: String(e.text), tone: "warn" });
+      return next;
     case "error":
       next.push({ kind: "notice", text: String(e.message), tone: "error" });
       return next;
