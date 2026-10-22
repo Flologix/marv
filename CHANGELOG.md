@@ -6,15 +6,19 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
-## [0.9.0] - 2026-10-21
+### Changed
 
-### Added
-
-- **macOS builds (#167).** Releases now carry `marv-aarch64-apple-darwin.tar.gz` and `marv-x86_64-apple-darwin.tar.gz` (with their `.sha256`, in `SHA256SUMS`), and npm gets `@flologixai/marv-darwin-arm64` and `@flologixai/marv-darwin-x64`, which `npm install -g @flologixai/marv` picks on a Mac. `install.sh` installs the macOS build instead of stopping with a note (the arm64 one on Apple silicon, even from a shell under Rosetta). Commands run in the Seatbelt sandbox (`sandbox-exec`, built into macOS); the `process` tool isn't on macOS yet (#152). macOS 14 or newer; CI runs the tests and the sandbox guards on macOS 14 and 15 (arm64) and macOS 15 on Intel, as a required check. A smoke test (`packaging/smoke.sh`) installs each build through `install.sh` and through npm and runs a sandboxed `marv -p` turn against a local stub model, in CI and before every release; a release isn't created if it fails.
+- **The agent answers questions about Marv from its docs, and says when something isn't in its history (#205).** `# Your situation` now says to read Marv's README and docs (a checkout on disk, else the GitHub repository) before saying it can't tell, where Marv keeps its records in `~/.marv` (sessions and trajectories), and that a turn cut off by a quit may be missing from its history: when the user says it did something it can't see, it says so instead of denying it. `mesh_send`'s description says that a send with no wire yet asks the user itself (so a named peer gets the message without asking first; mesh_list only when the exact inbox name isn't known), and that a sent message isn't proof it was read. Measured as #147 was (SWE-bench Verified, the same 30 issues, GLM-5.3-flash, sandbox on): 23/30 resolved before and after (two issues swapped each way), and the median cost per issue unchanged; the total ($0.27 → $0.38) moved with a few long runs on issues where both arms wander.
 
 ### Fixed
 
 - **Marv desktop: after a restart, Allow on a new approval card could do nothing.** Approval ids started at 1 again in every chat and every run, while a chat's transcript keeps its old cards, so ids repeated: the answer was shown on an old card and the new one stayed waiting. Ids now never repeat across chats or restarts, and an answer only marks the card still waiting for it. A card left unanswered when Marv quit or the chat restarted now reads "not answered (Marv restarted)", with no buttons, instead of showing Allow and Decline for a request that no longer exists. The app has its first tests (`npm test` in `app/`).
+
+## [0.9.0] - 2026-10-22
+
+### Added
+
+- **macOS builds (#167).** Releases now carry `marv-aarch64-apple-darwin.tar.gz` and `marv-x86_64-apple-darwin.tar.gz` (with their `.sha256`, in `SHA256SUMS`), and npm gets `@flologixai/marv-darwin-arm64` and `@flologixai/marv-darwin-x64`, which `npm install -g @flologixai/marv` picks on a Mac. `install.sh` installs the macOS build instead of stopping with a note (the arm64 one on Apple silicon, even from a shell under Rosetta). Commands run in the Seatbelt sandbox (`sandbox-exec`, built into macOS); the `process` tool isn't on macOS yet (#152). macOS 14 or newer; CI runs the tests and the sandbox guards on macOS 14 and 15 (arm64) and macOS 15 on Intel, as a required check. A smoke test (`packaging/smoke.sh`) installs each build through `install.sh` and through npm and runs a sandboxed `marv -p` turn against a local stub model, in CI and before every release; a release isn't created if it fails.
 
 ## [0.8.0] - 2026-10-21
 
