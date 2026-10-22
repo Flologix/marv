@@ -2384,7 +2384,10 @@ impl MarvSession {
                 }
                 (None, None)
             }
-            Err(error) => return CompactResult::NotCompacted { reason: CompactFailure::Failed, error, trigger },
+            Err(error) => {
+                let error = format!("{error} The conversation was kept as it was.");
+                return CompactResult::NotCompacted { reason: CompactFailure::Failed, error, trigger };
+            }
         };
         let kind = self.summary_kind();
         let tools = self.offered().0;
@@ -2506,11 +2509,7 @@ impl MarvSession {
         let entry =
             marv_tools::swap::save_page(&dir, &paged, |page| marv_tools::swap::page_entry(page, &paged, trigger.as_str(), facts))
                 .await
-                .map_err(|e| {
-                    format!(
-                        "Couldn't save the messages a compaction would replace ({e}), so the conversation was kept as it was."
-                    )
-                })?;
+                .map_err(|e| format!("Couldn't save the messages a compaction would replace ({e})."))?;
         let table = marv_tools::swap::page_table_text(&marv_tools::swap::read_table(&dir)).unwrap_or_default();
         Ok(Some((entry.page, table)))
     }
@@ -5289,6 +5288,36 @@ mod turn_tests {
         let compact = log.iter().find(|r| r["type"] == "compact").unwrap();
         assert_eq!((compact["trigger"].as_str(), compact["level"].as_u64()), (Some("overflow"), Some(3)));
         assert!(compact.get("summary").is_none(), "level 3 writes no summary");
+        assert_alternating(&provider.requests());
+    }
+
+    #[tokio::test]
+    async fn pages_that_cant_be_saved_during_recovery_dont_kill_the_turn_and_say_so() {
+        // The window leaves levels 0–2 no room: level 3 drops the big read, and can't save it.
+        let dirs = Dirs::new();
+        let sessions = Arc::new(SessionStore::new(dirs.dir.join("sessions")));
+        let probe = scripted(&dirs, &Scripted::new(vec![]), |_| {});
+        let fixed = fixed_step(&probe);
+        let window = fixed + 4_000 + 8192.min((fixed + 4_000) / 8);
+        let lines: String = (0..600).map(|i| format!("line {i:04} of a long file, read in full\n")).collect();
+        std::fs::write(dirs.project.join("big.txt"), lines).unwrap();
+        let provider = Scripted::new(vec![
+            use_tools(vec![call("c1", "read_file", serde_json::json!({ "path": "big.txt" }))]),
+            overflowed(),
+            say("Answer."),
+        ])
+        .with_context(window);
+        let session = scripted(&dirs, &provider, |i| i.sessions = Some(sessions.clone()));
+        let swap = marv_tools::swap::swap_dir(&sessions.file(&dirs.project, &session.id()));
+        std::fs::create_dir_all(swap.parent().unwrap()).unwrap();
+        std::fs::write(&swap, "in the way").unwrap();
+        let events = collect(go(&session, "first")).await;
+        assert_eq!(end_reason(&events), TurnEndReason::Done(StopReason::End));
+        assert_eq!(compactions(&events).last().unwrap().trigger(), overflow(3), "level 3 dropped without a page");
+        let notices: Vec<&String> =
+            events.iter().filter_map(|e| if let SessionEvent::Notice { text } = e { Some(text) } else { None }).collect();
+        assert!(matches!(&notices[..], [n] if n.contains("Couldn't save") && n.contains("dropped without them")), "{notices:?}");
+        assert!(std::fs::metadata(&swap).unwrap().is_file());
         assert_alternating(&provider.requests());
     }
 

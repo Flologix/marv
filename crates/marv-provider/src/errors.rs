@@ -234,6 +234,10 @@ pub fn unreachable(label: &str, base_url: &str, err: &str, hint: Option<&str>) -
 /// Gemini's "input token count … exceeds the maximum", "context length/window" with "exceed/too long/too large", and an
 /// HTTP 413. Ollama's native API truncates past `num_ctx` instead of failing, so it is covered by the compaction
 /// trigger, not by this.
+///
+/// A 413 counts as the prompt's length: marv-rs sends no image parts (an image reaches the model as the quarantined
+/// reader's text, `docs/SECURITY.md`), so a request body is text. When image parts are added, a 413 on a body that's
+/// mostly images must not go to the overflow recovery, which can't make an image smaller.
 pub fn is_context_overflow(message: &str) -> bool {
     static PATTERNS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(concat!(
