@@ -2940,7 +2940,8 @@ impl MarvSession {
             lock(&self.inner.loaded).clear();
             // The saved conversation may lack a note this one had: give them again (a repeat is harmless).
             self.inner.nested.reset();
-            s.conversation = Arc::new(Mutex::new(saved.conversation.clone()));
+            // A file 0.8.0 saved can hold two user turns in a row: repaired as it comes back (a valid one is unchanged).
+            s.conversation = Arc::new(Mutex::new(marv_agent::compact::normalize(saved.conversation.clone())));
             s.messages = saved.transcript.clone();
             s.totals = saved.totals.clone();
             s.last = None;
@@ -3183,7 +3184,11 @@ impl MarvSession {
 
     /// What `save()` writes: every tool call answered (a run winding down may still have unanswered calls).
     fn snapshot(&self, s: &mut State, transcript: Option<Vec<Message>>) -> SavedSession {
-        let conversation = marv_agent::agent::answer_all_calls(&s.conversation.lock().unwrap_or_else(|e| e.into_inner()));
+        // #63 review: alternating roles too (0.8.0 saved two user turns in a row after an errored or stopped turn); a
+        // valid history is unchanged.
+        let conversation = marv_agent::compact::normalize(marv_agent::agent::answer_all_calls(
+            &s.conversation.lock().unwrap_or_else(|e| e.into_inner()),
+        ));
         let mut saved = s.saved.clone();
         saved.provider = s.factory.id().into();
         saved.model = s.factory.model().into();
@@ -5521,6 +5526,33 @@ mod turn_tests {
         assert!(text_of(rolling.last().unwrap()).starts_with(marv_agent::compact::ROLLING_INSTRUCTIONS));
         assert!(resumed.state().saved.summary.as_deref().is_some_and(|s| s.contains("second")));
         assert_alternating(&provider.requests());
+    }
+
+    #[tokio::test]
+    async fn a_saved_history_with_two_user_turns_in_a_row_is_repaired_on_resume_and_on_save() {
+        let dirs = Dirs::new();
+        let sessions = Arc::new(SessionStore::new(dirs.dir.join("sessions")));
+        let root = dirs.project.canonicalize().unwrap();
+        let mut saved = crate::sessions::new_session(&root, "test", "test-model", 1);
+        saved.conversation = vec![
+            ChatTurn::User { text: "first".into() },
+            ChatTurn::User { text: "second".into() },
+            ChatTurn::Assistant { text: "ok".into(), tool_calls: vec![], reasoning: None },
+        ];
+        saved.transcript = serde_json::from_value(serde_json::json!([{"id": 1, "role": "user", "text": "first"}])).unwrap();
+        sessions.save(&saved).await.unwrap();
+        let provider = Scripted::new(vec![say("Next.")]);
+        let session = scripted(&dirs, &provider, |i| i.sessions = Some(sessions.clone()));
+        session.resume(ResumeTarget::Id(saved.id.clone())).await.unwrap().unwrap();
+        assert!(marv_agent::compact::alternates(&session.conversation()));
+        collect(go(&session, "third")).await;
+        assert_alternating(&provider.requests());
+        session.flush().await;
+        let back = sessions.load(&root, &saved.id).await.unwrap();
+        assert_eq!(text_of(&back.conversation[0]), "first\n\nsecond");
+        // A valid history is saved as it is.
+        let valid = back.conversation.clone();
+        assert_eq!(marv_agent::compact::normalize(valid.clone()), valid);
     }
 
     #[tokio::test]
