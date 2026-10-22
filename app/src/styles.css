@@ -903,6 +903,10 @@ details > summary::-webkit-details-marker {
   color: var(--red);
 }
 
+.decided.idle {
+  color: var(--tx-2);
+}
+
 .decided span {
   color: var(--tx-2);
 }

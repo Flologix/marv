@@ -6,13 +6,16 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+### Fixed
+
+- **Marv desktop: after a restart, Allow on a new approval card could do nothing.** Approval ids started at 1 again in every chat and every run, while a chat's transcript keeps its old cards, so ids repeated: the answer was shown on an old card and the new one stayed waiting. Ids now never repeat across chats or restarts, and an answer only marks the card still waiting for it. A card left unanswered when Marv quit or the chat restarted now reads "not answered (Marv restarted)", with no buttons, instead of showing Allow and Decline for a request that no longer exists. The app has its first tests (`npm test` in `app/`).
+- **A turn cut off by quitting Marv is kept, and marked as cut off (#202).** Marv saved a conversation only when a turn ended, so quitting mid-turn (a force-quit during a hung approval, a crash) lost the message and every tool call from that turn, and the model could then deny a call you had approved. Now the session is saved as the turn goes: after your message, after each reply and each tool call's start and end (at most one write per 200 ms), and at once before any approval is asked. A call with no result in the saved file gets "Not run: Marv quit while this call waited for approval." (or "No result: Marv quit before this call finished…"), so the session can always be continued. On resume (`marv -c`, `/resume`, or reopening a chat in Marv desktop) the transcript says "The previous turn was cut off: Marv quit while `mesh_send` waited for approval…", and the model's next message starts with the same note.
+
+## [0.9.0] - 2026-10-22
+
 ### Added
 
 - **macOS builds (#167).** Releases now carry `marv-aarch64-apple-darwin.tar.gz` and `marv-x86_64-apple-darwin.tar.gz` (with their `.sha256`, in `SHA256SUMS`), and npm gets `@flologixai/marv-darwin-arm64` and `@flologixai/marv-darwin-x64`, which `npm install -g @flologixai/marv` picks on a Mac. `install.sh` installs the macOS build instead of stopping with a note (the arm64 one on Apple silicon, even from a shell under Rosetta). Commands run in the Seatbelt sandbox (`sandbox-exec`, built into macOS); the `process` tool isn't on macOS yet (#152). macOS 14 or newer; CI runs the tests and the sandbox guards on macOS 14 and 15 (arm64) and macOS 15 on Intel, as a required check. A smoke test (`packaging/smoke.sh`) installs each build through `install.sh` and through npm and runs a sandboxed `marv -p` turn against a local stub model, in CI and before every release; a release isn't created if it fails.
-
-### Fixed
-
-- **A turn cut off by quitting Marv is kept, and marked as cut off (#202).** Marv saved a conversation only when a turn ended, so quitting mid-turn (a force-quit during a hung approval, a crash) lost the message and every tool call from that turn, and the model could then deny a call you had approved. Now the session is saved as the turn goes: after your message, after each reply and each tool call's start and end (at most one write per 200 ms), and at once before any approval is asked. A call with no result in the saved file gets "Not run: Marv quit while this call waited for approval." (or "No result: Marv quit before this call finished…"), so the session can always be continued. On resume (`marv -c`, `/resume`, or reopening a chat in Marv desktop) the transcript says "The previous turn was cut off: Marv quit while `mesh_send` waited for approval…", and the model's next message starts with the same note.
 
 ## [0.8.0] - 2026-10-21
 
@@ -283,7 +286,8 @@ The first public release, on npm as `@flologixai/marv`.
 - The SDK: `createSession()` from `@flologixai/marv/sdk` runs Marv from code, without the UI.
 - Evals: `bun run eval` runs real models on small tasks with hidden checks.
 
-[Unreleased]: https://github.com/FlologixAI/marv/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/FlologixAI/marv/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/FlologixAI/marv/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/FlologixAI/marv/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/FlologixAI/marv/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/FlologixAI/marv/compare/v0.5.0...v0.6.0
