@@ -4,6 +4,9 @@
 //! - The built-in specs' bytes (names, order, descriptions, schemas) match `golden/tool_specs.jsonl`: the prompt
 //!   cache and saved sessions depend on them.
 //! - A tool name is never reused: every name ever offered is a tool today or has a tombstone.
+//! - Who started a turn changes approvals only as it did (`golden/approvals.txt`), and the floor is what `run_tool`
+//!   decides.
+//! - Only `run_tool` runs a tool (a scan of the non-test code).
 //!
 //! A golden that differs fails with the command that writes it again:
 //! `UPDATE_GOLDEN=1 cargo test -p marv-guards --test tools`. Review the diff before committing it.
@@ -384,4 +387,139 @@ async fn the_floor_matches_todays_answers_per_mode() {
             assert_eq!(decided, expected, "{label} in a {name} turn");
         }
     }
+}
+
+/// `text` without its `#[cfg(test)]` items (an inline `mod tests { … }` or any other item), and the names of the
+/// test-only module files it declares (`#[cfg(test)] mod tests;`). Braces are matched naively: enough for this tree.
+fn without_test_code(text: &str) -> (String, Vec<String>) {
+    let mut out = String::new();
+    let mut test_files = Vec::new();
+    let mut lines = text.lines().peekable();
+    while let Some(line) = lines.next() {
+        if line.trim() != "#[cfg(test)]" {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        // Skip further attributes, then the item.
+        let item = lines.by_ref().find(|next| !next.trim_start().starts_with("#[")).unwrap_or_default().to_string();
+        let trimmed = item.trim();
+        if trimmed.ends_with(';') {
+            if let Some(name) = trimmed.trim_end_matches(';').split_whitespace().last() {
+                test_files.push(name.to_string());
+            }
+            continue;
+        }
+        let mut depth = item.matches('{').count() as i64 - item.matches('}').count() as i64;
+        while depth > 0 {
+            let Some(next) = lines.next() else { break };
+            depth += next.matches('{').count() as i64 - next.matches('}').count() as i64;
+        }
+        out.push('\n');
+    }
+    (out, test_files)
+}
+
+/// `text` with the body of `pub async fn run_tool` blanked out (the one place a tool is run).
+fn without_run_tool(text: &str) -> String {
+    let Some(start) = text.find("pub async fn run_tool(") else { return text.to_string() };
+    let mut depth = 0i64;
+    let mut end = text.len();
+    let mut opened = false;
+    for (i, c) in text[start..].char_indices() {
+        match c {
+            '{' => {
+                depth += 1;
+                opened = true;
+            }
+            '}' => depth -= 1,
+            _ => {}
+        }
+        if opened && depth == 0 {
+            end = start + i + 1;
+            break;
+        }
+    }
+    format!("{}{}", &text[..start], &text[end..])
+}
+
+/// Every non-test Rust file under `crates/`: its path and its code without test items.
+fn non_test_sources() -> Vec<(PathBuf, String)> {
+    fn walk(dir: &Path, files: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if path.is_dir() {
+                // Integration tests, benches and examples aren't the product; `target` isn't source.
+                if !matches!(name.as_str(), "tests" | "benches" | "examples" | "target" | "node_modules") {
+                    walk(&path, files);
+                }
+            } else if name.ends_with(".rs") {
+                files.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(&repo_root().join("crates"), &mut files);
+    files.sort();
+    let mut skipped: Vec<PathBuf> = Vec::new();
+    let mut sources = Vec::new();
+    for file in &files {
+        let text = std::fs::read_to_string(file).expect("a source file");
+        let (code, test_files) = without_test_code(&text);
+        let dir = if file.file_name().is_some_and(|n| n == "mod.rs" || n == "lib.rs" || n == "main.rs") {
+            file.parent().expect("a folder").to_path_buf()
+        } else {
+            file.with_extension("")
+        };
+        for name in test_files {
+            skipped.push(dir.join(format!("{name}.rs")));
+            skipped.push(dir.join(&name).join("mod.rs"));
+        }
+        sources.push((file.clone(), code));
+    }
+    sources.retain(|(file, _)| !skipped.contains(file));
+    sources
+}
+
+/// **Only `run_tool` runs a tool.** It's the one place a call is checked (parsed, its floor, protected paths,
+/// taint, yolo, the approval, the checkpoint) before it runs, and its result is marked (the source, the fence, the
+/// taint). A tool's `run` called anywhere else would skip all of that, so outside `run_tool` and tests no code calls
+/// a tool's `run`: neither `Tool::run`, `DynTool::run` or `<T as Tool>::run` by path (except the blanket `impl DynTool for T`, which only
+/// forwards), nor a `.run(input, ctx)` with a tool context (the agent tool's hand-off to its host is listed by name).
+///
+/// Proven: added `let _ = tool.run(input, ctx).await;` to `marv_tools::table::tools_table` → this failed (it named
+/// the file and line); a `<Glob as Tool>::run(&Glob, …)` there → failed too.
+#[test]
+fn only_run_tool_runs_a_tool() {
+    // `.run(<input>, <a ToolContext>)`: Tool::run's shape (the agent loop's runner and MCP's client take others).
+    let by_shape = |line: &str| {
+        let Some(at) = line.find(".run(") else { return false };
+        let args = &line[at + 5..];
+        let args = args.split(").await").next().unwrap_or(args);
+        let mut parts = args.rsplitn(2, ',');
+        let last = parts.next().unwrap_or("").trim().trim_end_matches(')').trim();
+        parts.next().is_some()
+            && ["ctx", "context", "per_call", "confined"].iter().any(|word| last.trim_start_matches('&').contains(word))
+    };
+    // Calls of the same shape that run no tool: the agent tool's `run` hands its call to the session's `AgentHost`
+    // (which starts the subagent; the subagent's own calls go through `run_tool`).
+    let not_a_tool = [("marv-tools/src/agent.rs", "host.run(input, ctx).await")];
+    let mut found = Vec::new();
+    for (file, code) in non_test_sources() {
+        let shown = file.strip_prefix(repo_root()).unwrap_or(&file).display().to_string();
+        let code = if shown.ends_with("marv-tools/src/registry.rs") { without_run_tool(&code) } else { code };
+        let blanket = shown.ends_with("marv-tools/src/types.rs");
+        for (n, line) in code.lines().enumerate() {
+            let code_part = line.split("//").next().unwrap_or("");
+            let by_path = (code_part.contains("Tool::run(") || code_part.contains("Tool>::run("))
+                && !(blanket && code_part.contains("Tool::run(self, typed::<T>(input), ctx)"));
+            let allowed = not_a_tool.iter().any(|(f, text)| shown.ends_with(f) && line.trim() == *text);
+            if (by_path || by_shape(code_part)) && !allowed {
+                found.push(format!("{shown}:{}: {}", n + 1, line.trim()));
+            }
+        }
+    }
+    assert!(found.is_empty(), "a tool is run outside run_tool (call it through marv_tools::run_tool):\n{}", found.join("\n"));
 }
