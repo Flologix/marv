@@ -273,6 +273,11 @@ pub enum SessionEvent {
     RadioNote {
         text: String,
     },
+    /// A line in Marv's own words for the transcript (#63: saved pages that couldn't be written during an overflow's
+    /// recovery). Fixed text and Marv's own errors only, never the model's.
+    Notice {
+        text: String,
+    },
     /// Always last, exactly once, however the turn ended.
     TurnEnd {
         turn: String,
@@ -1726,7 +1731,8 @@ impl MarvSession {
             emit(SessionEvent::Tainted { source: *source });
         }
         tainted = sources.len();
-        lock(&history).push(ChatTurn::User { text: message });
+        // After an overflow's drop note (its level 3) the history can end with a user turn: never two in a row.
+        marv_agent::compact::push_user(&mut lock(&history), &message);
         // A woken turn (#78): who woke it is Marv's line in the transcript; the user said nothing.
         self.note(if woken.is_woken() { Role::System } else { Role::User }, text);
         emit(SessionEvent::Status(TurnStatus::Running));
@@ -1902,6 +1908,9 @@ impl MarvSession {
         });
         // #63: a request too long for the window: make it fit (a summary of a cut-down history, or dropping the oldest
         // turns) and retry the step, instead of ending the turn with the provider's error.
+        // NOTE for send-now (feat/send-now, not on main yet): this rewrites the history under the loop like `on_full`,
+        // so whatever tracks how much of it was already sent (its `sent_len`) must be reset here too, as it is after a
+        // mid-turn compaction.
         options.on_overflow = Some({
             let (session, provider, factory, info, stop, emit) =
                 (self.clone(), provider.clone(), factory.clone(), info.clone(), stop.clone(), emit.clone());
@@ -1910,8 +1919,9 @@ impl MarvSession {
                     (session.clone(), provider.clone(), factory.clone(), info.clone(), stop.clone(), emit.clone());
                 Box::pin(async move {
                     emit(SessionEvent::Status(TurnStatus::Compacting));
-                    let (outcome, result) =
-                        session.recover_overflow(&error, attempt, true, &provider, factory.as_ref(), info.as_ref(), &stop).await;
+                    let (outcome, result) = session
+                        .recover_overflow(&error, attempt, true, &provider, factory.as_ref(), info.as_ref(), &stop, Some(&emit))
+                        .await;
                     emit(SessionEvent::Compaction(result));
                     outcome
                 })
@@ -2211,7 +2221,7 @@ impl MarvSession {
                 }
                 if reason == CompactFailure::Failed && marv_provider::errors::is_context_overflow(error) {
                     let error = error.clone();
-                    self.recover_overflow(&error, 0, mid_turn, provider, factory, info, stop).await.1
+                    self.recover_overflow(&error, 0, mid_turn, provider, factory, info, stop, Some(emit)).await.1
                 } else {
                     result
                 }
@@ -2231,7 +2241,8 @@ impl MarvSession {
             None => MID_TURN_NOTE.to_string(),
         };
         let history = self.state().conversation.clone();
-        lock(&history).push(ChatTurn::User { text });
+        // A v2 tail can end with a user turn: the note joins it.
+        marv_agent::compact::push_user(&mut lock(&history), &text);
     }
 
     /// The compaction threshold (tokens): `nearly_full`'s `min(85% × window, compactTokens)`; `None` when neither is
@@ -2311,7 +2322,7 @@ impl MarvSession {
             return empty();
         }
         let v2 = self.state().compaction == marv_agent::compact::Version::V2;
-        self.summarize_level(&history, &history, tail, v2, focus, trigger, stop, provider, factory, info).await
+        self.summarize_level(&history, &history, tail, v2, focus, trigger, stop, provider, factory, info, None).await
     }
 
     /// One summary: asked over `request` (the history, or overflow recovery's cut-down copy of it), then installed in
@@ -2330,10 +2341,37 @@ impl MarvSession {
         provider: &Arc<dyn Provider>,
         factory: &dyn ProviderFactory,
         info: Option<&ModelInfo>,
+        emit: Option<&Emit>,
     ) -> CompactResult {
         let (system, before) = {
             let s = self.state();
             (s.system.clone(), s.last)
+        };
+        // The tail (v2): never the old summary's own turns, never starting at a tool result. `tail_start` 0 means the
+        // whole history would fit in it: that's no tail here (the caller decided there's something to compact).
+        let keep = self.summary_head(history);
+        let start = match tail {
+            0 => history.len(),
+            tail => match marv_agent::compact::tail_start(history, tail) {
+                0 => history.len(),
+                start => (start.max(keep)..history.len())
+                    .find(|&i| !matches!(history[i], ChatTurn::Tool { .. }))
+                    .unwrap_or(history.len()),
+            },
+        };
+        // What's summarized away is saved before the summary is asked for (a page and the page table): if that
+        // fails, nothing is replaced. In overflow recovery the turn would be dead otherwise: it goes on without a page,
+        // and says so.
+        let paged: Vec<(usize, ChatTurn)> = history[..start].iter().cloned().enumerate().collect();
+        let (page, table) = match self.page_out(paged, trigger).await {
+            Ok(saved) => saved.unzip(),
+            Err(error) if matches!(trigger, CompactTrigger::Overflow { .. }) => {
+                if let Some(emit) = emit {
+                    emit(SessionEvent::Notice { text: format!("{error} The conversation is compacted without them.") });
+                }
+                (None, None)
+            }
+            Err(error) => return CompactResult::NotCompacted { reason: CompactFailure::Failed, error, trigger },
         };
         let kind = self.summary_kind();
         let tools = self.offered().0;
@@ -2365,22 +2403,17 @@ impl MarvSession {
                         level: trigger.level(),
                     });
                 }
+                // The history stays: so does what it would have replaced, and the page goes.
+                if let Some(page) = page {
+                    self.unpage(page).await;
+                }
                 return CompactResult::NotCompacted { reason, error, trigger };
             }
         };
-        // The tail (v2): never the old summary's own turns, never starting at a tool result.
-        let keep = self.summary_head(history);
-        let start = match tail {
-            0 => history.len(),
-            tail => {
-                let start = marv_agent::compact::tail_start(history, tail).max(keep);
-                (start..history.len()).find(|&i| !matches!(history[i], ChatTurn::Tool { .. })).unwrap_or(history.len())
-            }
-        };
-        // What's summarized away is saved first (a page and the page table): if that fails, nothing is replaced.
-        let (page, table) = match self.page_out(&history[..start], 0, trigger).await {
-            Ok(saved) => saved.unzip(),
-            Err(error) => return CompactResult::NotCompacted { reason: CompactFailure::Failed, error, trigger },
+        // The list of saved pages is Marv's: a summary that writes one (restating it, or making one up) loses it.
+        let summary = marv_agent::compact::Summary {
+            text: marv_tools::swap::strip_page_lists(&summary.text),
+            structured: summary.structured,
         };
         let plan = self.state().plan.clone().filter(|p| marv_tools::plan::plan_open(Some(p)));
         let kept: Vec<String> = plan.as_deref().map(marv_tools::plan::plan_text).into_iter().chain(table).collect();
@@ -2447,19 +2480,14 @@ impl MarvSession {
     /// Saves `turns` (the history from index `first`) as the next page of this conversation's swap, with its page
     /// table entry, before the history they're in is replaced. `Ok(Some((page, table text)))` when saved; `Ok(None)`
     /// with nothing to save or no store; `Err` when the write failed: the caller keeps the history.
-    async fn page_out(&self, turns: &[ChatTurn], first: usize, trigger: CompactTrigger) -> Result<Option<(u32, String)>, String> {
+    async fn page_out(&self, turns: Vec<(usize, ChatTurn)>, trigger: CompactTrigger) -> Result<Option<(u32, String)>, String> {
         let Some(dir) = self.swap_dir() else { return Ok(None) };
         if turns.is_empty() {
             return Ok(None);
         }
         let paged: Vec<marv_tools::swap::PagedTurn> = turns
-            .iter()
-            .enumerate()
-            .map(|(i, turn)| marv_tools::swap::PagedTurn {
-                index: first + i,
-                provenance: self.paged_provenance(turn),
-                turn: turn.clone(),
-            })
+            .into_iter()
+            .map(|(index, turn)| marv_tools::swap::PagedTurn { index, provenance: self.paged_provenance(&turn), turn })
             .collect();
         let page = marv_tools::swap::next_page(&dir);
         let saved_outputs = self.inner.init.tool_output_dir.as_ref().map(|d| d.join(self.id()));
@@ -2469,6 +2497,13 @@ impl MarvSession {
         })?;
         let table = marv_tools::swap::page_table_text(&marv_tools::swap::read_table(&dir)).unwrap_or_default();
         Ok(Some((page, table)))
+    }
+
+    /// Takes back a page whose compaction didn't happen (its summary failed): the history still holds its turns.
+    async fn unpage(&self, page: u32) {
+        if let Some(dir) = self.swap_dir() {
+            marv_tools::swap::remove_page(&dir, page).await;
+        }
     }
 
     /// Puts `new` in place of the conversation, in place: the loop holds this very history for the whole turn, so a
@@ -2517,12 +2552,13 @@ impl MarvSession {
         factory: &dyn ProviderFactory,
         info: Option<&ModelInfo>,
         stop: &CancellationToken,
+        emit: Option<&Emit>,
     ) -> (marv_agent::agent::OverflowOutcome, CompactResult) {
         use marv_agent::agent::OverflowOutcome;
         use marv_agent::compact::{
-            DROPPED_NOTE, MIN_HISTORY_BUDGET, V2_OVERFLOW_TARGETS, drop_to_fit, fit_for_summary, summary_instructions,
+            DROPPED_NOTE, MIN_HISTORY_BUDGET, V2_OVERFLOW_TARGETS, apply_drop, fit_for_summary, plan_drop, summary_instructions,
         };
-        use marv_core::{estimate_history_tokens, estimate_tokens};
+        use marv_core::{estimate_history_tokens, estimate_tokens, estimate_turn_tokens};
         let mut level = {
             let mut s = self.state();
             if attempt == 0 {
@@ -2541,11 +2577,17 @@ impl MarvSession {
         // upstreams reject a history with tool calls when no tools are defined).
         let fixed_step = estimate_tokens(&system) + estimate_tokens(&serde_json::to_string(&tools).unwrap_or_default());
         // A refusal that says the prompt's size calibrates the estimates (as the adapter's `tokens_per_byte` does).
-        let refusal = marv_provider::openai_compat::window_refusal(error);
+        let refusal = marv_provider::errors::overflow_numbers(error);
         let estimated = estimate_history_tokens(&history) + fixed_step;
-        let ratio = refusal.map_or(1.0, |(_, input)| input as f64 / estimated.max(1) as f64).clamp(0.25, 8.0);
-        let window =
-            self.context_length().filter(|w| *w > 0).or(refusal.map(|r| r.0)).unwrap_or((estimated as f64 * ratio) as u64);
+        let known = self.context_length().filter(|w| *w > 0).or(refusal.map(|r| r.0));
+        // Without numbers, the request was at least the window: the estimate can't have been more than that.
+        let ratio = match (refusal, known) {
+            (Some((_, input)), _) => input as f64 / estimated.max(1) as f64,
+            (None, Some(window)) => (window as f64 / estimated.max(1) as f64).max(1.0),
+            (None, None) => 1.0,
+        }
+        .clamp(0.25, 8.0);
+        let window = known.unwrap_or((estimated as f64 * ratio) as u64);
         let reserve = 8192.min(window / 8);
         // Budgets in estimated tokens (the history is measured by the estimate).
         let est = |real: f64| (real / ratio).max(0.0);
@@ -2599,26 +2641,47 @@ impl MarvSession {
                 // What's kept, then what's dropped: saved first, and listed after the note (the summary message
                 // isn't rewritten at this level).
                 let trigger = CompactTrigger::Overflow { level: 3 };
-                let kept = drop_to_fit(&history, budget as u64, keep, DROPPED_NOTE);
-                let start = history.len() - (kept.len() - keep - 1);
-                let (page, table) = match self.page_out(&history[keep..start], keep, trigger).await {
+                let announced = if mid_turn {
+                    let specs = self.state().turn_mcp_specs.clone();
+                    self.announce(&specs)
+                } else {
+                    None
+                };
+                // The note, the page list (capped) and the announcement are budgeted with the turns kept.
+                let note_tokens = estimate_tokens(DROPPED_NOTE)
+                    + marv_tools::swap::MAX_TABLE_CHARS as u64 / marv_core::CHARS_PER_TOKEN
+                    + announced.as_deref().map_or(0, estimate_tokens);
+                let plan = plan_drop(&history, budget as u64, keep, note_tokens);
+                // The person's own message is never dropped; one larger than the whole window can't be sent at all.
+                if let Some(u) = plan.user
+                    && plan.user_tokens.is_some()
+                    && estimate_turn_tokens(&history[u]) as f64 > window_est - fixed_est - reserve_est
+                {
+                    let size = (estimate_turn_tokens(&history[u]) as f64 * ratio) as u64;
+                    return failed(
+                        3,
+                        format!(
+                            "Your message (about {size} tokens) is larger than this model's context window ({window} tokens), so it can't be sent. Shorten it, or pick a model with a larger window (/model)."
+                        ),
+                    );
+                }
+                let dropped: Vec<(usize, ChatTurn)> = plan.dropped().into_iter().map(|i| (i, history[i].clone())).collect();
+                let (page, table) = match self.page_out(dropped, trigger).await {
                     Ok(saved) => saved.unzip(),
-                    Err(error) => return failed(3, error),
+                    // A dead turn is worse than dropping unsaved: go on, and say so.
+                    Err(error) => {
+                        if let Some(emit) = emit {
+                            emit(SessionEvent::Notice { text: format!("{error} The oldest messages are dropped without them.") });
+                        }
+                        (None, None)
+                    }
                 };
                 let mut note = DROPPED_NOTE.to_string();
-                if let Some(table) = table {
-                    note = format!("{note}\n\n{table}");
+                for extra in table.into_iter().chain(announced) {
+                    note = format!("{note}\n\n{extra}");
                 }
-                if mid_turn {
-                    let specs = self.state().turn_mcp_specs.clone();
-                    if let Some(announced) = self.announce(&specs) {
-                        note = format!("{note}\n\n{announced}");
-                    }
-                }
-                let mut new = kept;
-                new.pop();
-                new.push(ChatTurn::User { text: note });
-                let kept_turns = new.len() - keep - 1;
+                let new = apply_drop(&history, &plan, &note);
+                let kept_turns = new.len().saturating_sub(keep + 1);
                 self.install(new, None);
                 if let Some(log) = self.trajectory() {
                     log.write(&TrajectoryRecord::Compact {
@@ -2650,14 +2713,16 @@ impl MarvSession {
                 continue;
             }
             let request = fit_for_summary(&history, budget as u64, keep);
+            // The tail shrinks from the first level: the full one is what just overflowed.
             let level_tail = match level {
-                0 => tail,
-                1 => tail / 2,
+                0 => tail / 2,
+                1 => tail / 4,
                 _ => 0,
             };
             let trigger = CompactTrigger::Overflow { level };
-            let result =
-                self.summarize_level(&history, &request, level_tail, false, None, trigger, stop, provider, factory, info).await;
+            let result = self
+                .summarize_level(&history, &request, level_tail, false, None, trigger, stop, provider, factory, info, emit)
+                .await;
             match result {
                 CompactResult::Compacted { .. } => {
                     if mid_turn {
@@ -5069,6 +5134,17 @@ mod turn_tests {
 
     // ---- #63: overflow recovery ----
 
+    /// #63 review: every request alternates (a user turn first, never two user or two assistant turns in a row).
+    fn assert_alternating(requests: &[(Vec<ChatTurn>, StreamOptions)]) {
+        for (i, (history, _)) in requests.iter().enumerate() {
+            assert!(
+                marv_agent::compact::alternates(history),
+                "request {i}: {:?}",
+                history.iter().map(role_of).collect::<Vec<_>>()
+            );
+        }
+    }
+
     /// An overflow as it escapes the adapter's refit (no numbers: the estimates stay uncalibrated).
     fn overflowed() -> Vec<ProviderEvent> {
         vec![ProviderEvent::Error("OpenRouter returned 400.\nProvider returned error: Anthropic: prompt is too long".into())]
@@ -5076,7 +5152,7 @@ mod turn_tests {
     fn is_summary_request(history: &[ChatTurn]) -> bool {
         history.last().is_some_and(|t| {
             let text = text_of(t);
-            text.starts_with(marv_agent::compact::INSTRUCTIONS) || text.contains("## Important Context")
+            text.contains(marv_agent::compact::INSTRUCTIONS) || text.contains("## Important Context")
         })
     }
     fn overflow(level: u32) -> CompactTrigger {
@@ -5112,6 +5188,7 @@ mod turn_tests {
             assert!(text_of(&retried[0]).contains("SUMMARY of it all"));
             assert_eq!(text_of(retried.last().unwrap()), MID_TURN_NOTE);
             assert!(unanswered(retried).is_empty());
+            assert_alternating(&requests);
         }
     }
 
@@ -5145,7 +5222,8 @@ mod turn_tests {
         assert_eq!(session.state().compact_failures, 0, "reset when the turn ended");
         // The retried step ends with the drop note, its calls all answered.
         let retried = &requests.last().unwrap().0;
-        assert!(text_of(retried.last().unwrap()).starts_with(marv_agent::compact::DROPPED_NOTE));
+        // No summary to keep: the note leads.
+        assert!(text_of(&retried[0]).starts_with(marv_agent::compact::DROPPED_NOTE));
         assert!(unanswered(retried).is_empty());
         let log = records(&store, &dirs.project, &session).await;
         let failed: Vec<_> = log.iter().filter(|r| r["type"] == "compact_failed").collect();
@@ -5154,6 +5232,7 @@ mod turn_tests {
         let compact = log.iter().find(|r| r["type"] == "compact").unwrap();
         assert_eq!((compact["trigger"].as_str(), compact["level"].as_u64()), (Some("overflow"), Some(3)));
         assert!(compact.get("summary").is_none(), "level 3 writes no summary");
+        assert_alternating(&provider.requests());
     }
 
     #[tokio::test]
@@ -5175,6 +5254,7 @@ mod turn_tests {
         assert_eq!(end_reason(&events), TurnEndReason::Done(StopReason::End));
         assert_eq!(compactions(&events).last().unwrap().trigger(), overflow(3));
         assert_eq!(summaries(&provider.requests()), 3, "2 automatic + 1 recovery: never past #144's bound");
+        assert_alternating(&provider.requests());
     }
 
     #[tokio::test]
@@ -5188,6 +5268,7 @@ mod turn_tests {
             events.iter().find_map(|e| if let SessionEvent::Loop(LoopEvent::Error(m)) = e { Some(m.clone()) } else { None });
         assert!(error.unwrap().contains("larger than this model's context window (1000 tokens)"));
         assert_eq!(provider.requests().len(), 1);
+        assert_alternating(&provider.requests());
     }
 
     #[tokio::test]
@@ -5203,6 +5284,7 @@ mod turn_tests {
             events.iter().find_map(|e| if let SessionEvent::Loop(LoopEvent::Error(m)) = e { Some(m.clone()) } else { None });
         assert!(error.unwrap().contains("too little to go on"));
         assert_eq!(provider.requests().len(), 1, "no summary request, no drop");
+        assert_alternating(&provider.requests());
     }
 
     #[tokio::test]
@@ -5212,12 +5294,25 @@ mod turn_tests {
         let fixed = fixed_step(&probe);
         let window = fixed + 4_000 + 8192.min((fixed + 4_000) / 8);
         assert!(0.70 * window as f64 - (fixed + 8192.min(window / 8)) as f64 - 300.0 < 1024.0, "levels 0–2 are skipped");
-        let provider = Scripted::new(vec![overflowed(), say("Answer.")]).with_context(window);
+        // A big result makes the request really larger than the window (the estimates then need no scaling up).
+        let lines: String = (0..600).map(|i| format!("line {i:04} of a long file, read in full\n")).collect();
+        std::fs::write(dirs.project.join("big.txt"), lines).unwrap();
+        let provider = Scripted::new(vec![
+            use_tools(vec![call("c1", "read_file", serde_json::json!({ "path": "big.txt" }))]),
+            overflowed(),
+            say("Answer."),
+        ])
+        .with_context(window);
         let session = scripted(&dirs, &provider, |_| {});
         let events = collect(go(&session, "first")).await;
-        assert_eq!(end_reason(&events), TurnEndReason::Done(StopReason::End));
+        let errors: Vec<String> = events
+            .iter()
+            .filter_map(|e| if let SessionEvent::Loop(LoopEvent::Error(m)) = e { Some(m.clone()) } else { None })
+            .collect();
+        assert_eq!(end_reason(&events), TurnEndReason::Done(StopReason::End), "{errors:?}");
         assert_eq!(compactions(&events)[0].trigger(), overflow(3));
-        assert_eq!(provider.requests().len(), 2, "no summary request");
+        assert_eq!(provider.requests().len(), 3, "no summary request");
+        assert_alternating(&provider.requests());
         // A step that keeps overflowing after that has nothing left: 5 agent requests at most, then the error.
         let provider = Scripted::new((0..6).map(|_| overflowed()).collect()).with_context(window);
         let session = scripted(&dirs, &provider, |_| {});
@@ -5227,6 +5322,7 @@ mod turn_tests {
         let error =
             events.iter().find_map(|e| if let SessionEvent::Loop(LoopEvent::Error(m)) = e { Some(m.clone()) } else { None });
         assert!(error.unwrap().contains("too little to go on"));
+        assert_alternating(&provider.requests());
     }
 
     #[tokio::test]
@@ -5238,6 +5334,7 @@ mod turn_tests {
         assert_eq!(end_reason(&events), TurnEndReason::Done(StopReason::Error));
         assert!(events.iter().any(|e| matches!(e, SessionEvent::Loop(LoopEvent::Error(m)) if m == "Rate limited")));
         assert_eq!(provider.requests().len(), 2);
+        assert_alternating(&provider.requests());
     }
 
     #[tokio::test]
@@ -5299,6 +5396,7 @@ mod turn_tests {
         assert_eq!(role_of(&after[1]), "assistant");
         assert_eq!(text_of(after.last().unwrap()), MID_TURN_NOTE);
         assert!(unanswered(after).is_empty());
+        assert_alternating(&provider.requests());
     }
 
     #[tokio::test]
@@ -5336,6 +5434,7 @@ mod turn_tests {
         let rolling = &provider.requests()[4].0;
         assert!(text_of(rolling.last().unwrap()).starts_with(marv_agent::compact::ROLLING_INSTRUCTIONS));
         assert!(resumed.state().saved.summary.as_deref().is_some_and(|s| s.contains("second")));
+        assert_alternating(&provider.requests());
     }
 
     #[tokio::test]
@@ -5367,6 +5466,7 @@ mod turn_tests {
         let touch = |pkg: &str| session.inner.nested.note_for(&root, &root.join(pkg).join("b.txt"), "read_file");
         assert!(touch("new").is_none(), "its note is still in the history");
         assert!(touch("old").is_some_and(|n| n.contains("old rules")), "summarized away: given again");
+        assert_alternating(&provider.requests());
     }
 
     // ---- saved pages ----
@@ -5398,6 +5498,7 @@ mod turn_tests {
             assert_eq!(std::fs::metadata(swap.join("1.jsonl")).unwrap().permissions().mode() & 0o777, 0o600);
             assert_eq!(std::fs::metadata(&swap).unwrap().permissions().mode() & 0o777, 0o700);
         }
+        assert_alternating(&provider.requests());
     }
 
     #[tokio::test]
@@ -5418,6 +5519,7 @@ mod turn_tests {
         );
         assert_eq!(lock(&session.state().conversation.clone()).clone(), before);
         assert_eq!(session.state().saved.summary, None);
+        assert_alternating(&provider.requests());
     }
 
     #[tokio::test]

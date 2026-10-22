@@ -124,7 +124,7 @@ At most 15 paths, one per line, each with what it is and what changed in it.
 ## Important Context
 Anything else needed to continue: names, numbers, error messages, URLs, exactly.
 
-Write it as notes for yourself. Keep names, paths, numbers and error messages exact. Don't call any tools, and don't do anything else.";
+Write it as notes for yourself. Keep names, paths, numbers and error messages exact. Don't restate the plan or the list of saved pages: Marv adds both after your summary. Don't call any tools, and don't do anything else.";
 
 /// #63: asked once after a good text reply that ignored the template.
 pub const TEMPLATE_NUDGE: &str = "Rewrite that summary using exactly the sections asked for, as Markdown headings in this order: ## Objective, ## Requirements, ## Decisions, ## Work State, ## Next Move, ## Relevant Files, ## Important Context. Return only the summary.";
@@ -188,10 +188,87 @@ pub struct Summary {
 
 /// The summary request's history: the same history plus one instruction message (#63: the prefix is the history, so
 /// the prompt cache hits).
+/// A history that ends with a user turn gets the instruction merged into it (two user turns in a row are refused by
+/// some upstreams).
 pub fn summary_request(history: &[ChatTurn], focus: Option<&str>, kind: SummaryKind) -> Vec<ChatTurn> {
     let mut request = history.to_vec();
-    request.push(ChatTurn::User { text: summary_instructions(kind, focus) });
+    push_user(&mut request, &summary_instructions(kind, focus));
     request
+}
+
+// ---- Role alternation (#63 review): every history compaction writes goes through these ----
+
+/// Appends a user message, merged into a trailing user turn (`"\n\n"` between): never two user turns in a row.
+pub fn push_user(history: &mut Vec<ChatTurn>, text: &str) {
+    match history.last_mut() {
+        Some(ChatTurn::User { text: last }) => {
+            last.push_str("\n\n");
+            last.push_str(text);
+        }
+        _ => history.push(ChatTurn::User { text: text.to_string() }),
+    }
+}
+
+/// Whether a turn is the acknowledgement of a summary ([`COMPACTED_ACK`]).
+pub fn is_ack(turn: &ChatTurn) -> bool {
+    matches!(turn, ChatTurn::Assistant { text, tool_calls, .. } if text == COMPACTED_ACK && tool_calls.is_empty())
+}
+
+/// What leads a history that would otherwise start with an assistant turn.
+pub const LEADING_NOTE: &str = "(Automatic note from Marv) Earlier messages were left out to fit the context window.";
+
+/// A history with alternating roles: adjacent user turns merged, an ACK (or another plain assistant turn) right before
+/// an assistant turn dropped or merged into it, and a user turn first ([`LEADING_NOTE`] when it would start
+/// otherwise). Tool results stay after the assistant turn that called them.
+pub fn normalize(turns: Vec<ChatTurn>) -> Vec<ChatTurn> {
+    let mut out: Vec<ChatTurn> = Vec::with_capacity(turns.len() + 1);
+    for turn in turns {
+        let plain_assistant_last = matches!(out.last(), Some(ChatTurn::Assistant { tool_calls, .. }) if tool_calls.is_empty());
+        match turn {
+            ChatTurn::User { text } if matches!(out.last(), Some(ChatTurn::User { .. })) => push_user(&mut out, &text),
+            ChatTurn::Assistant { text, tool_calls, reasoning } if plain_assistant_last => {
+                let last = out.pop().expect("an assistant turn");
+                let ack = is_ack(&last);
+                let ChatTurn::Assistant { text: before, .. } = last else { unreachable!() };
+                let text = if ack || before.trim().is_empty() { text } else { format!("{before}\n\n{text}") };
+                out.push(ChatTurn::Assistant { text, tool_calls, reasoning });
+            }
+            turn => out.push(turn),
+        }
+    }
+    if !matches!(out.first(), None | Some(ChatTurn::User { .. })) {
+        out.insert(0, ChatTurn::User { text: LEADING_NOTE.into() });
+    }
+    out
+}
+
+/// `head` (the summary and its ACK, or nothing) followed by `rest`, alternating: the ACK goes when `rest` starts with
+/// an assistant turn, and one is added when `head` ends with the summary and `rest` starts with a user turn.
+pub fn join_head(mut head: Vec<ChatTurn>, rest: Vec<ChatTurn>) -> Vec<ChatTurn> {
+    match (head.last(), rest.first()) {
+        (Some(last), Some(ChatTurn::Assistant { .. })) if is_ack(last) => {
+            head.pop();
+        }
+        (Some(ChatTurn::User { .. }), Some(ChatTurn::User { .. })) => {
+            head.push(ChatTurn::Assistant { text: COMPACTED_ACK.into(), tool_calls: vec![], reasoning: None })
+        }
+        _ => {}
+    }
+    head.extend(rest);
+    normalize(head)
+}
+
+/// Whether a history alternates as every request must: a user turn first, never two user or two assistant turns in
+/// a row, and every tool result right after an assistant turn or another result.
+pub fn alternates(history: &[ChatTurn]) -> bool {
+    matches!(history.first(), Some(ChatTurn::User { .. }))
+        && history.windows(2).all(|w| {
+            !matches!(
+                (&w[0], &w[1]),
+                (ChatTurn::User { .. }, ChatTurn::User { .. } | ChatTurn::Tool { .. })
+                    | (ChatTurn::Assistant { .. }, ChatTurn::Assistant { .. })
+            )
+        })
 }
 
 /// The error when the model called a tool instead of summarizing (after the retry with `tool_choice: "none"`).
@@ -307,12 +384,10 @@ pub fn compacted_history(summary: &str, plan: Option<&str>) -> Vec<ChatTurn> {
 /// only when the tail is empty or starts with a user turn (never two user or two assistant turns in a row), then the
 /// tail, the same `ChatTurn` values moved (arguments, reasoning and fenced results keep their bytes).
 pub fn compacted_history_with_tail(summary: &str, kept: Option<&str>, tail: Vec<ChatTurn>) -> Vec<ChatTurn> {
-    let mut history = compacted_history(summary, kept);
-    if matches!(tail.first(), Some(ChatTurn::Assistant { .. })) {
-        history.pop();
+    if tail.is_empty() {
+        return compacted_history(summary, kept);
     }
-    history.extend(tail);
-    history
+    join_head(compacted_history(summary, kept), tail)
 }
 
 /// Whether the last request filled the window past [`COMPACT_AT`].
@@ -396,6 +471,11 @@ fn steps(history: &[ChatTurn], from: usize) -> Vec<std::ops::Range<usize>> {
 
 /// #63: `text` cut to about `tokens` tokens, its head and tail kept (the saved tool outputs' shape).
 fn head_and_tail(text: &str, tokens: u64) -> String {
+    cut_with(text, tokens, "[… cut for the summary …]")
+}
+
+/// [`head_and_tail`] with its own note in the middle.
+pub fn cut_with(text: &str, tokens: u64, note: &str) -> String {
     let keep = (tokens * marv_core::CHARS_PER_TOKEN / 2) as usize;
     let chars: Vec<char> = text.chars().collect();
     if chars.len() <= 2 * keep {
@@ -403,13 +483,23 @@ fn head_and_tail(text: &str, tokens: u64) -> String {
     }
     let head: String = chars[..keep].iter().collect();
     let tail: String = chars[chars.len() - keep..].iter().collect();
-    format!("{head}\n[… cut for the summary …]\n{tail}")
+    format!("{head}\n{note}\n{tail}")
+}
+
+/// The note in the middle of a message that was cut to fit the window.
+pub const MESSAGE_CUT: &str = "[… the middle of this message was cut to fit the context window …]";
+
+/// The newest user turn at or after `from`: the person's latest message, never dropped by overflow recovery.
+pub fn newest_user(history: &[ChatTurn], from: usize) -> Option<usize> {
+    (from..history.len()).rev().find(|&i| matches!(history[i], ChatTurn::User { .. }))
 }
 
 /// #63, overflow recovery: the history a recovery summary is asked over, at most about `budget` tokens. The first
 /// `keep` turns (the previous summary and its ACK) stay; the task (the first user turn after them) stays while
-/// anything else can go; then the oldest steps go first, whole (a call is never split from its result). A tool result
-/// still larger than `budget / 4` is cut to head and tail. Never a cache hit; that's accepted on the error path.
+/// anything else can go; then the oldest steps go first, whole (a call is never split from its result). The newest
+/// user turn is never dropped: past half the budget it's cut to head and tail with a note. A tool result still larger
+/// than `budget / 4` is cut to head and tail. The result alternates ([`normalize`]). Never a cache hit; that's
+/// accepted on the error path.
 pub fn fit_for_summary(history: &[ChatTurn], budget: u64, keep: usize) -> Vec<ChatTurn> {
     let keep = keep.min(history.len());
     let mut turns: Vec<ChatTurn> = history.to_vec();
@@ -420,16 +510,26 @@ pub fn fit_for_summary(history: &[ChatTurn], budget: u64, keep: usize) -> Vec<Ch
             *text = head_and_tail(text, budget / 4);
         }
     }
+    let newest = newest_user(&turns, keep);
+    if let Some(i) = newest
+        && let ChatTurn::User { text } = &mut turns[i]
+        && marv_core::estimate_tokens(text) > budget / 2
+    {
+        *text = cut_with(text, budget / 2, MESSAGE_CUT);
+    }
     let units = steps(&turns, keep);
     let task = units.first().filter(|u| matches!(turns[u.start], ChatTurn::User { .. })).cloned();
     let size = |r: &std::ops::Range<usize>| marv_core::estimate_history_tokens(&turns[r.clone()]);
     let mut total = marv_core::estimate_history_tokens(&turns);
     let mut dropped = vec![false; units.len()];
-    // The oldest steps after the task first, then the task itself.
+    // The oldest steps after the task first, then the task itself; never the newest user turn.
     let order = (usize::from(task.is_some())..units.len()).chain(task.iter().map(|_| 0));
     for i in order {
         if total <= budget {
             break;
+        }
+        if newest.is_some_and(|n| units[i].contains(&n)) {
+            continue;
         }
         total -= size(&units[i]);
         dropped[i] = true;
@@ -440,21 +540,50 @@ pub fn fit_for_summary(history: &[ChatTurn], budget: u64, keep: usize) -> Vec<Ch
             out.extend_from_slice(&turns[unit.clone()]);
         }
     }
-    out
+    normalize(out)
 }
 
 /// #63, level 3: the note that replaces the history dropped to fit the window. No asking: a headless run has no one.
 pub const DROPPED_NOTE: &str = "(Automatic note from Marv) Older messages were dropped to fit the context window; ask the user if you need something from them.";
 
-/// #63, level 3: the first `keep` turns (the previous summary and its ACK, if any), then the newest turns that fit in
-/// `budget` tokens, starting where a history may start (never at a tool result), then [`DROPPED_NOTE`] (`note`, with
-/// any MCP announcement). No request is sent for it.
-pub fn drop_to_fit(history: &[ChatTurn], budget: u64, keep: usize, note: &str) -> Vec<ChatTurn> {
+/// #63, level 3: what stays when the oldest turns are dropped to fit: the first `keep` turns (the previous summary and
+/// its ACK), the newest user turn (`user`; `user_cut` when it must be cut to `user_tokens`), and the turns from `start`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DropPlan {
+    pub keep: usize,
+    pub user: Option<usize>,
+    pub user_tokens: Option<u64>,
+    pub start: usize,
+}
+
+impl DropPlan {
+    /// The indexes dropped (to be saved before the history is replaced).
+    pub fn dropped(&self) -> Vec<usize> {
+        let before_user = self.user.unwrap_or(self.start).min(self.start);
+        let after_user = self.user.map_or(self.start, |u| u + 1);
+        (self.keep..before_user).chain(after_user..self.start).collect()
+    }
+}
+
+/// #63, level 3: which turns fit in `budget` tokens with a note of `note_tokens`: the head, then the newest user turn
+/// (never dropped; cut to half of what's left when it's larger), then the newest turns after it that fit, starting
+/// where a history may start (never at a tool result). No request is sent for it.
+pub fn plan_drop(history: &[ChatTurn], budget: u64, keep: usize, note_tokens: u64) -> DropPlan {
     let keep = keep.min(history.len());
-    let mut room = budget.saturating_sub(marv_core::estimate_history_tokens(&history[..keep]));
-    room = room.saturating_sub(marv_core::estimate_tokens(note));
+    let mut room = budget.saturating_sub(marv_core::estimate_history_tokens(&history[..keep])).saturating_sub(note_tokens);
+    let user = newest_user(history, keep);
+    let mut user_tokens = None;
+    if let Some(u) = user {
+        let size = marv_core::estimate_turn_tokens(&history[u]);
+        let cost = size.min(room / 2);
+        if cost < size {
+            user_tokens = Some(cost);
+        }
+        room -= cost;
+    }
+    let floor = user.map_or(keep, |u| u + 1);
     let mut start = history.len();
-    while start > keep {
+    while start > floor {
         let size = marv_core::estimate_turn_tokens(&history[start - 1]);
         if size > room {
             break;
@@ -462,11 +591,35 @@ pub fn drop_to_fit(history: &[ChatTurn], budget: u64, keep: usize, note: &str) -
         room -= size;
         start -= 1;
     }
-    let start = next_safe(history, start.max(keep));
-    let mut out = history[..keep].to_vec();
-    out.extend_from_slice(&history[start..]);
-    out.push(ChatTurn::User { text: note.to_string() });
+    DropPlan { keep, user, user_tokens, start: next_safe(history, start.max(floor)) }
+}
+
+/// #63, level 3: the history `plan` keeps, with `note` (the drop note, any page list and MCP announcement): first when
+/// nothing is kept before it, otherwise last (merged into a trailing user turn). Alternates.
+pub fn apply_drop(history: &[ChatTurn], plan: &DropPlan, note: &str) -> Vec<ChatTurn> {
+    let mut rest: Vec<ChatTurn> = Vec::new();
+    if let Some(u) = plan.user {
+        let mut turn = history[u].clone();
+        if let (Some(tokens), ChatTurn::User { text }) = (plan.user_tokens, &mut turn) {
+            *text = cut_with(text, tokens, MESSAGE_CUT);
+        }
+        rest.push(turn);
+    }
+    rest.extend_from_slice(&history[plan.start..]);
+    if plan.keep == 0 {
+        let mut out = vec![ChatTurn::User { text: note.to_string() }];
+        out.extend(rest);
+        return normalize(out);
+    }
+    let mut out = join_head(history[..plan.keep].to_vec(), rest);
+    push_user(&mut out, note);
     out
+}
+
+/// [`plan_drop`] then [`apply_drop`].
+pub fn drop_to_fit(history: &[ChatTurn], budget: u64, keep: usize, note: &str) -> Vec<ChatTurn> {
+    let plan = plan_drop(history, budget, keep, marv_core::estimate_tokens(note));
+    apply_drop(history, &plan, note)
 }
 
 #[cfg(test)]
@@ -838,17 +991,75 @@ mod tests {
 
     #[test]
     fn drop_to_fit_keeps_the_summary_and_the_newest_turns_then_the_note() {
-        let mut h = vec![user("SUMMARY"), answer(4)];
+        let ack = ChatTurn::Assistant { text: COMPACTED_ACK.into(), tool_calls: vec![], reasoning: None };
+        let mut h = vec![user("SUMMARY"), ack];
         for i in 0..10 {
             h.push(calls(&format!("c{i}"), 4));
             h.push(result(&format!("c{i}"), 400));
         }
         let dropped = drop_to_fit(&h, 400, 2, DROPPED_NOTE);
-        assert_eq!(&dropped[..2], &h[..2]);
-        assert!(!matches!(dropped[2], ChatTurn::Tool { .. }), "never starts at a result");
+        assert_eq!(dropped[0], h[0]);
+        assert!(matches!(&dropped[1], ChatTurn::Assistant { tool_calls, .. } if !tool_calls.is_empty()), "no ACK before calls");
+        assert!(alternates(&dropped), "{dropped:?}");
         assert!(marv_core::estimate_history_tokens(&dropped) <= 400);
         assert!(matches!(dropped.last(), Some(ChatTurn::User { text }) if text == DROPPED_NOTE));
         assert_eq!(dropped[dropped.len() - 2], h[h.len() - 1]);
+    }
+
+    #[test]
+    fn the_drop_note_merges_into_a_trailing_user_turn_and_leads_without_a_summary() {
+        // Mid-turn, after the user's message: the note joins it.
+        let h = vec![user(&"a".repeat(4000)), answer(4), user("now this")];
+        let dropped = drop_to_fit(&h, 600, 0, DROPPED_NOTE);
+        assert!(alternates(&dropped), "{dropped:?}");
+        assert!(matches!(&dropped[0], ChatTurn::User { text } if text.starts_with(DROPPED_NOTE) && text.ends_with("now this")));
+        // No summary, the kept turns start with an assistant: the note goes first.
+        let mut h = vec![user(&"a".repeat(4000))];
+        for i in 0..4 {
+            h.push(calls(&format!("c{i}"), 4));
+            h.push(result(&format!("c{i}"), 40));
+        }
+        let dropped = drop_to_fit(&h, 600, 0, DROPPED_NOTE);
+        assert!(alternates(&dropped), "{dropped:?}");
+        assert!(matches!(&dropped[0], ChatTurn::User { text } if text.starts_with(DROPPED_NOTE)));
+        // The summary without its ACK, then the user's message: an ACK between them.
+        let h = vec![user("SUMMARY"), user("go on"), answer(4), user("and this")];
+        let dropped = drop_to_fit(&h, 600, 1, DROPPED_NOTE);
+        assert!(alternates(&dropped), "{dropped:?}");
+    }
+
+    #[test]
+    fn the_newest_user_turn_is_never_dropped_only_cut() {
+        let mut h = vec![user("task")];
+        for i in 0..6 {
+            h.push(calls(&format!("c{i}"), 4));
+            h.push(result(&format!("c{i}"), 400));
+        }
+        h.push(user(&"m".repeat(8000)));
+        let fitted = fit_for_summary(&h, 1000, 0);
+        assert!(alternates(&fitted), "{fitted:?}");
+        let ChatTurn::User { text } = fitted.last().unwrap() else { panic!() };
+        assert!(text.contains(MESSAGE_CUT) && text.starts_with("mmm"));
+        let dropped = drop_to_fit(&h, 1000, 0, DROPPED_NOTE);
+        assert!(alternates(&dropped), "{dropped:?}");
+        assert!(dropped.iter().any(|t| matches!(t, ChatTurn::User { text } if text.contains(MESSAGE_CUT))));
+    }
+
+    #[test]
+    fn alternation_helpers() {
+        let mut h = vec![user("a")];
+        push_user(&mut h, "b");
+        assert_eq!(h, [user("a\n\nb")]);
+        let ack = ChatTurn::Assistant { text: COMPACTED_ACK.into(), tool_calls: vec![], reasoning: None };
+        let joined = join_head(vec![user("S"), ack.clone()], vec![calls("c1", 4), result("c1", 4)]);
+        assert_eq!(joined.len(), 3);
+        let joined = join_head(vec![user("S")], vec![user("go")]);
+        assert_eq!(joined, [user("S"), ack, user("go")]);
+        assert!(alternates(&normalize(vec![answer(4), user("x"), user("y")])));
+        // A summary request after a trailing user turn merges the instruction into it.
+        let request = summary_request(&[user("hi")], None, SummaryKind::V1);
+        assert_eq!(request.len(), 1);
+        assert!(alternates(&request));
     }
 
     #[test]

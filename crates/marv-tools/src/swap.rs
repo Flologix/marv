@@ -35,6 +35,8 @@ pub const SWAP_SUFFIX: &str = "swap";
 pub const PAGE_TABLE_HEAD: &str = "Saved pages (written by Marv, not by you)";
 /// The page table's file in the swap folder.
 pub const PAGE_TABLE: &str = "pages.json";
+/// The page table's text is at most this long (the rest: "recall lists them"), so a level-3 drop can budget it.
+pub const MAX_TABLE_CHARS: usize = 4_000;
 /// The page table text lists at most this many pages (the newest) and this many paths per list.
 pub const TABLE_PAGES: usize = 10;
 pub const TABLE_PATHS: usize = 15;
@@ -205,7 +207,55 @@ pub fn page_table_text(table: &[PageEntry]) -> Option<String> {
             sources
         ));
     }
-    Some(lines.join("\n"))
+    let mut text = String::new();
+    for line in lines {
+        if text.chars().count() + line.chars().count() + 1 > MAX_TABLE_CHARS {
+            text.push_str("\n- (more: recall's query finds them)");
+            break;
+        }
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&line);
+    }
+    Some(text)
+}
+
+/// `summary` without any list of saved pages in it: a line from [`PAGE_TABLE_HEAD`] on, and the `- page …` lines after
+/// it. Only Marv writes that list (the model restating it, or making one up, could point `recall` anywhere).
+pub fn strip_page_lists(summary: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut in_list = false;
+    for line in summary.lines() {
+        if let Some(at) = line.find(PAGE_TABLE_HEAD) {
+            let before = line[..at].trim_end();
+            if !before.is_empty() {
+                out.push(before.to_string());
+            }
+            in_list = true;
+            continue;
+        }
+        if in_list && line.trim_start().starts_with("- page") {
+            continue;
+        }
+        in_list = false;
+        out.push(line.to_string());
+    }
+    out.join("\n").trim_end().to_string()
+}
+
+/// Takes a page back out (its compaction didn't happen): its file and its table entry. Errors are ignored: a page
+/// left over is only an extra page.
+pub async fn remove_page(dir: &Path, page: u32) {
+    let _ = std::fs::remove_file(page_file(dir, page));
+    let mut table = read_table(dir);
+    let before = table.len();
+    table.retain(|p| p.page != page);
+    if table.len() != before
+        && let Ok(text) = serde_json::to_string(&table)
+    {
+        let _ = marv_fs::write_private(&dir.join(PAGE_TABLE), &text).await;
+    }
 }
 
 #[cfg(test)]

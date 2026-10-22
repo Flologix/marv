@@ -43,6 +43,7 @@ pub fn to_json(event: &SessionEvent) -> Option<Value> {
         SessionEvent::Compaction(result) => Some(marv_session::compaction_json(result)),
         SessionEvent::Tainted { source } => Some(json!({"type": "tainted", "source": source})),
         SessionEvent::CheckpointFailed { message } => Some(json!({"type": "notice", "text": message})),
+        SessionEvent::Notice { text } => Some(json!({"type": "notice", "text": text})),
         SessionEvent::TurnEnd { reason, .. } => Some(json!({"type": "turn_end", "reason": reason.as_str()})),
         _ => None,
     }

@@ -395,6 +395,7 @@ pub fn map_event(
         SessionEvent::Tainted { source } => vec![system(tainted_text(source), false)],
         // #124: Marv's line about a radio report it sent (checked names and fixed words; printable anyway).
         SessionEvent::RadioNote { text } => vec![system(printable(&format!("✻ {text}")), false)],
+        SessionEvent::Notice { text } => vec![system(printable(&format!("✻ {text}")), false)],
         SessionEvent::CheckpointFailed { message } => {
             vec![system(format!("This turn can't be undone: its checkpoint failed ({message})."), true)]
         }

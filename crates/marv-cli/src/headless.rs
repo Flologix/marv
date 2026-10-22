@@ -281,6 +281,7 @@ impl Collector {
                 Some(json!({"type": "status", "status": status}))
             }
             E::Compaction(result) => Some(marv_session::compaction_json(result)),
+            E::Notice { text } => Some(json!({"type": "notice", "text": text})),
             E::TurnEnd { reason, .. } => {
                 self.reason = reason.as_str().into();
                 None
