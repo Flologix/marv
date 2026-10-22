@@ -107,7 +107,7 @@ pub fn read_skill(dir: &Path, folder: &str, source: SkillSource, shown: &str) ->
     }
     let body = cap_body(parsed.body, "SKILL.md");
     Ok(LoadedSkill {
-        skill: Skill { name, description, dir: dir.to_path_buf(), body, files: list_files(dir) },
+        skill: Skill { name, description, dir: dir.to_path_buf(), body, files: list_files(dir), trusted_files: None },
         source,
         link: None,
     })

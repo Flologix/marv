@@ -246,6 +246,7 @@ impl Approver for SessionApprover {
 pub fn step_limit_request(steps: u32, every: u32) -> ApprovalRequest {
     ApprovalRequest {
         reason: false,
+        persists: false,
         tool: "continue".into(),
         label: format!("{steps} steps"),
         preview: Preview {
@@ -279,8 +280,8 @@ pub struct SessionAgentHost {
     pub instructions: Option<String>,
     /// Each subagent gets nested instruction files on its own (a fresh `NestedInstructions`: its context starts empty).
     pub nested_instructions: bool,
-    /// Whether they come as the project's instructions (a trusted project) or quoted as its data.
-    pub nested_trusted: bool,
+    /// Which of them count as the person's (the main agent's, shared).
+    pub nested_trust: Arc<crate::project_trust::NestedTrust>,
     /// `~/.marv/worktrees/<project>`; without it, no worktrees.
     pub worktrees_dir: Option<PathBuf>,
     /// The turn's factory and provider: a type naming another model gets it from the same factory.
@@ -502,7 +503,8 @@ mod tests {
         std::fs::write(root.join("pkg/a.ts"), "a").unwrap();
         std::fs::write(root.join("pkg/b.ts"), "b").unwrap();
         let mut runner = SessionToolRunner::new(ToolContext::new(&root), Arc::new(marv_tools::builtin_tools().to_vec()));
-        runner.nested = Some(Arc::new(crate::instructions::NestedInstructions::new(true)));
+        runner.nested =
+            Some(Arc::new(crate::instructions::NestedInstructions::new(Arc::new(crate::project_trust::NestedTrust::all()))));
         let call = |id: &str, args: &str| ToolCall { id: id.into(), name: "read_file".into(), arguments: args.into() };
         let run = |c: ToolCall| runner.run(c, CancellationToken::new());
         let first = run(call("1", r#"{"path": "pkg/a.ts"}"#)).await.unwrap().result.output;

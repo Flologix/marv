@@ -70,11 +70,10 @@ use marv_session::config::{
     needs_setup, preset, resolve_config,
 };
 use marv_session::diagnostics::check_notice;
-use marv_session::instructions::load_instructions_as;
 use marv_session::mcp_tools::McpHandle;
 use marv_session::memory::{Memories, MemoryPaths, load_memory, memory_paths};
 use marv_session::paths::{home_dir, project_key, shorten_home};
-use marv_session::project_trust::{ProjectFiles, ProjectTrust, TrustStatus, project_files, untrusted_notice};
+use marv_session::project_trust::{ProjectFiles, TrustStatus, load_project, untrusted_notice};
 use marv_session::prompt::{InstructionSource, Instructions, instruction_sources_item, instructions_cut_item};
 use marv_session::sessions::SessionStore;
 use marv_session::skills::LoadedSkill;
@@ -882,6 +881,8 @@ pub struct Startup {
     /// them (`marv_session::project_trust`): `instructions`, `skills` and `agents` were loaded to match.
     pub project_files: ProjectFiles,
     pub project_trust: TrustStatus,
+    /// Which subfolder instruction files count as the person's.
+    pub nested_trust: Arc<marv_session::project_trust::NestedTrust>,
     pub memory: Option<(MemoryPaths, Memories)>,
     pub mcp: Option<McpHandle>,
     pub mcp_problems: Vec<String>,
@@ -1007,7 +1008,7 @@ impl Bridge {
         init.version = s.version.clone();
         init.instructions = s.instructions.as_ref().map(|i| i.text.clone());
         init.nested_instructions = true;
-        init.project_trusted = s.project_trust.trusted();
+        init.nested_trust = s.nested_trust.clone();
         init.skills = s.skills.clone();
         init.agents = s.agents.clone();
         init.memory = s.memory.clone();
@@ -2228,25 +2229,23 @@ impl Bridge {
         result
     }
 
-    /// /trust: the project's instruction files, skills and agent types as startup showed them, trusted (for exactly
-    /// those contents) from the next start: the system prompt and the tool list stay as they are in this session.
+    /// /trust: the project's instruction files, skills and agent types as startup loaded them, and the subfolder
+    /// instruction files this session quoted, trusted (for exactly those contents) from the next start: the system
+    /// prompt and the tool list stay as they are in this session.
     async fn trust_project(&self) {
-        if self.project_files.is_empty() {
-            return self.emit(system("This project has no instruction files, skills or agent types to trust.", false));
-        }
-        if self.project_trust == TrustStatus::Trusted {
-            return self.emit(system("You trusted this project's instructions already: they're used as yours.", false));
-        }
-        let key = marv_session::paths::project_key(&self.root);
-        match ProjectTrust::in_config(&self.config_dir).trust(&key, &self.project_files).await {
-            Ok(()) => self.emit(system(
-                format!(
-                    "Trusted this project's instructions ({}): they're used as yours from the next start of Marv here. A change to any of them asks again.",
-                    printable(&self.project_files.summary())
-                ),
-                false,
-            )),
-            Err(e) => self.emit(system(format!("Couldn't trust them: {e}"), true)),
+        let quoted = self.session.nested_quoted();
+        let result = marv_session::project_trust::trust_project(
+            &self.config_dir,
+            &self.root,
+            &self.project_files,
+            &self.project_trust,
+            &quoted,
+            "the next start of Marv here",
+        )
+        .await;
+        match result {
+            Ok(text) => self.emit(system(text, false)),
+            Err(text) => self.emit(system(text, true)),
         }
     }
 
@@ -2788,13 +2787,13 @@ pub async fn run(resume: Option<bool>, approve: Vec<String>) -> anyhow::Result<i
     let config_dir = default_config_dir(&env, &home);
     // The project's instructions, skills and agent types are the person's only once they trusted exactly these files
     // here (docs/SECURITY.md): a cloned repository's are quoted as its data, and its skills and agents aren't loaded.
-    let project_files = project_files(&root, &home);
-    let project_trust = ProjectTrust::in_config(&config_dir).status(&marv_session::paths::project_key(&root), &project_files);
-    let trusted = project_trust.trusted();
-    let loaded_instructions = load_instructions_as(&root, &home, true, true, trusted);
-    let instructions = loaded_instructions.instructions;
-    let (skills, skill_problems) = marv_session::skills::load_skills(trusted.then_some(root.as_path()), Some(&home));
-    let (agents, agent_problems) = marv_session::agents::load_agents(trusted.then_some(root.as_path()), Some(&home));
+    // Each file is read once and hashed as read (`load_project`).
+    let read = load_project(&root, &home, &config_dir, true, true, None);
+    let (project_files, project_trust, nested_trust) = (read.files, read.status, read.nested);
+    let instructions = read.instructions;
+    let instruction_problems = read.instruction_problems;
+    let (skills, skill_problems) = (read.skills, read.skill_problems);
+    let (agents, agent_problems) = (read.agents, read.agent_problems);
     // MCP servers start now, in the background; the first request waits for them.
     let (mcp, mcp_problems) = start_mcp(&root, &home, &config_dir, &env);
     let paths = memory_paths(&config_dir, &root);
@@ -2875,13 +2874,14 @@ pub async fn run(resume: Option<bool>, approve: Vec<String>) -> anyhow::Result<i
         env,
         version: env!("CARGO_PKG_VERSION").into(),
         instructions,
-        instruction_problems: loaded_instructions.problems,
+        instruction_problems,
         skills,
         skill_problems,
         agents,
         agent_problems,
         project_files,
         project_trust,
+        nested_trust,
         memory: Some((paths, memories)),
         mcp: Some(mcp.clone()),
         mcp_problems,
@@ -3131,6 +3131,7 @@ mod tests {
             agent_problems: Vec::new(),
             project_files: ProjectFiles::default(),
             project_trust: TrustStatus::Nothing,
+            nested_trust: Arc::default(),
             memory: Some((memory_paths(&dirs.config, &dirs.project), Memories::default())),
             mcp: None,
             mcp_problems: Vec::new(),
@@ -4183,6 +4184,7 @@ mod tests {
     fn approvals_carry_the_protected_paths_reason() {
         let request = marv_tools::ApprovalRequest {
             reason: false,
+            persists: false,
             tool: "write_file".into(),
             label: ".envrc".into(),
             preview: marv_tools::Preview { title: "Create .envrc".into(), ..Default::default() },
@@ -4227,6 +4229,7 @@ mod tests {
         use marv_session::checkpoints::store::{Checkpoint, CheckpointKind};
         let model_call = marv_tools::ApprovalRequest {
             reason: true,
+            persists: false,
             tool: "bash".into(),
             label: "bun test".into(),
             preview: marv_tools::Preview {

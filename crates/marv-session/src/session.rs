@@ -271,17 +271,20 @@ pub struct SessionInit {
     pub reasoning_effort: Option<marv_provider::ReasoningEffort>,
     /// Marv's version, for trajectories.
     pub version: String,
-    /// The instruction files, as they go into the prompt (`instructions::load_instructions`, which gives each its
+    /// The instruction files, as they go into the prompt (`project_trust::load_project`, which gives each its
     /// heading); plain text of your own goes under "# Project instructions (from AGENTS.md)".
     pub instructions: Option<String>,
     /// Append a folder's own `AGENTS.md`/`CLAUDE.md` (below the root) to the first read_file, edit_file or write_file
     /// result there, once per conversation (#62; `crate::instructions::NestedInstructions`). Default false: an SDK
     /// session reads the project's files only when it asks for the `Project` source; the CLI sets it.
     pub nested_instructions: bool,
-    /// The person trusted this project's instructions (`crate::project_trust`): nested instruction files come as the
-    /// project's instructions, not quoted as its data. Default false. The caller loads `instructions`, `skills` and
-    /// `agents` to match (`crate::instructions::load_instructions_as`, `crate::sources::load_sources`).
-    pub project_trusted: bool,
+    /// Which of the project's subfolder instruction files count as the person's (`crate::project_trust`): any other
+    /// is quoted as the project's data. Default: none. The caller loads `instructions`, `skills` and `agents` with the
+    /// root's trust applied (`crate::project_trust::load_project`).
+    pub nested_trust: Arc<crate::project_trust::NestedTrust>,
+    /// The project's root files as loaded and where they stood (`crate::project_trust::load_project`), for `/trust`;
+    /// `None`: the project's files weren't loaded.
+    pub project_files: Option<(crate::project_trust::ProjectFiles, crate::project_trust::TrustStatus)>,
     pub skills: Vec<LoadedSkill>,
     /// Agent types the agent tool can start (default: general-purpose).
     pub agents: Vec<AgentType>,
@@ -396,7 +399,8 @@ impl SessionInit {
             version: env!("CARGO_PKG_VERSION").into(),
             instructions: None,
             nested_instructions: false,
-            project_trusted: false,
+            nested_trust: Arc::default(),
+            project_files: None,
             skills: Vec::new(),
             agents: vec![general_purpose()],
             memory: None,
@@ -1089,13 +1093,15 @@ impl MarvSession {
                 init.pre_approved.clear();
             }
         }
+        // A subfolder instruction file quoted for the first time is a notice (the session's warnings).
+        init.nested_trust.set_warn(init.on_warning.clone());
         let inner = Inner {
             specs,
             always,
             taint: Arc::new(TaintState::new()),
             skills: Arc::new(init.skills.iter().map(|s| s.skill.clone()).collect()),
             loaded: Arc::default(),
-            nested: Arc::new(crate::instructions::NestedInstructions::new(init.project_trusted)),
+            nested: Arc::new(crate::instructions::NestedInstructions::new(init.nested_trust.clone())),
             typecheck: Arc::new(Checker::new(Arc::new(crate::diagnostics::turn::Typecheck), None)),
             project_checks: Arc::new(Checker::new(Arc::new(crate::checks::kind::ProjectChecksKind), None)),
             process_on,
@@ -1737,7 +1743,7 @@ impl MarvSession {
             cwd: self.cwd(),
             instructions: init.instructions.clone(),
             nested_instructions: init.nested_instructions,
-            nested_trusted: init.project_trusted,
+            nested_trust: init.nested_trust.clone(),
             worktrees_dir: init.worktrees_dir.clone(),
             factory: factory.clone(),
             provider: provider.clone(),
@@ -2727,6 +2733,21 @@ impl MarvSession {
         if let Some(processes) = &self.inner.processes {
             processes.close_all().await;
         }
+    }
+
+    /// The project's root files as this session loaded them, and where they stood, for `/trust`.
+    pub fn project_files(&self) -> Option<(crate::project_trust::ProjectFiles, crate::project_trust::TrustStatus)> {
+        self.inner.init.project_files.clone()
+    }
+
+    /// The skills this session loaded (the person's, and a trusted project's), as the model is offered them.
+    pub fn skills(&self) -> Vec<LoadedSkill> {
+        self.inner.init.skills.clone()
+    }
+
+    /// The project's subfolder instruction files this session quoted (see above).
+    pub fn nested_quoted(&self) -> std::collections::BTreeMap<String, String> {
+        self.inner.init.nested_trust.quoted()
     }
 
     /// The background processes (Marv #51): name, command, ports, state.
@@ -5455,7 +5476,7 @@ mod turn_tests {
             i.tool_output_dir = Some(dirs.dir.join("tool-output"));
             i.trajectories = Some(store.clone());
         });
-        let saved = dirs.dir.join("tool-output").join(session.id()).join("b1.txt");
+        let saved = dirs.dir.join("tool-output").join(session.id()).join("b1.network.txt") /* unsandboxed: it had the network */;
         let grep = call("g1", "grep", serde_json::json!({"pattern": "FAILED", "path": saved}));
         lock(&provider.steps).extend([use_tools(vec![grep]), say("parser::quotes fails.")]);
         let events = collect(go(&session, "run the tests")).await;
@@ -5468,9 +5489,11 @@ mod turn_tests {
             .collect();
 
         assert!(results[0].contains(&format!("characters omitted; full output: {} — read_file it, or grep it", saved.display())));
-        assert!(!results[0].contains("FAILED") && results[0].ends_with("test case_10000 ... ok\n\n[exit code 1]"));
+        // Unsandboxed, the command had the network: its output (and the saved file read back) is quoted as data.
+        let body = results[0].split_once('\n').map_or("", |(_, b)| b); // after the fence's opening tag (the command)
+        assert!(!body.contains("FAILED") && body.ends_with("test case_10000 ... ok\n\n[exit code 1]\n</untrusted-data>"));
         assert!(results[0].chars().count() < 31_000);
-        assert_eq!(results[1], format!("{}:5000:test parser::quotes FAILED", saved.display()));
+        assert!(results[1].contains(&format!("\n{}:5000:test parser::quotes FAILED\n", saved.display())), "{}", results[1]);
 
         // The trajectory has what the model saw: the path, not the saved content.
         let log = records(&store, &dirs.project, &session).await;
@@ -5494,7 +5517,7 @@ mod turn_tests {
             i.approve = Some(answer(Decision::Yes));
             i.tool_output_dir = Some(relative.clone());
         });
-        let saved = dirs.dir.join("tool-output").join(session.id()).join("b1.txt");
+        let saved = dirs.dir.join("tool-output").join(session.id()).join("b1.network.txt") /* unsandboxed: it had the network */;
         let read = call("r1", "read_file", serde_json::json!({"path": saved, "offset": 15000, "limit": 1}));
         lock(&provider.steps).extend([use_tools(vec![read]), say("done")]);
         let events = collect(go(&session, "count")).await;

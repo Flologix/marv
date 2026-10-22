@@ -158,6 +158,10 @@ pub struct ApprovalRequest {
     /// result (`Decision::Declined`). Only `run_tool`'s own request sets it: not the step-limit question, a mesh
     /// wire, /undo or /mcp add, where no model would read a reason.
     pub reason: bool,
+    /// What it writes is loaded into every later conversation as the person's own (a memory) and the conversation is
+    /// tainted (`Tool::persists`): only a person may answer it. An approver answering from a policy (`marv -p`'s)
+    /// refuses it whatever it was told.
+    pub persists: bool,
 }
 
 /// The doors this agent may use where a door is gated by who's running, not by the approver (an approver can be told
@@ -300,6 +304,10 @@ pub struct Skill {
     pub body: String,
     /// The other files in its folder, relative ("reference.md", "scripts/extract.py").
     pub files: Vec<String>,
+    /// A trusted project skill's files as the person trusted them, by name: their hashes (`skill::content_hash`).
+    /// A file read later that doesn't match (changed, or new) is quoted as the project's data. `None`: the person's
+    /// own skill, whose files are theirs.
+    pub trusted_files: Option<std::collections::BTreeMap<String, String>>,
 }
 
 /// Where the memory tool reads and writes (`~/.marv/memory/personal.md`, `~/.marv/memory/projects/<project>.md`).

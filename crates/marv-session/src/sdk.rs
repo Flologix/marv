@@ -299,19 +299,13 @@ pub async fn create_session(options: SessionOptions) -> Result<MarvSession, Sess
     let env: Env = std::env::vars().collect();
     let config_dir = options.config_dir.clone().unwrap_or_else(|| default_config_dir(&env, &home));
     // A project's instructions are the person's only once trusted (docs/SECURITY.md): a cloned repository's aren't.
-    let mut trust_notice = None;
-    let trusted = if options.sources.contains(&Source::Project) {
-        let files = crate::project_trust::project_files(&root, &home);
-        let status = crate::project_trust::ProjectTrust::in_config(&config_dir).status(&project_key(&root), &files);
-        let trusted = options.trust_project.unwrap_or_else(|| status.trusted());
-        if !trusted {
-            trust_notice = crate::project_trust::untrusted_notice(&status, &files, TRUST_HINT);
-        }
-        trusted
-    } else {
-        false
+    let loaded = load_sources(&root, &options.sources, &config_dir, &home, &env, options.trust_project).await;
+    let trust_notice = match &loaded.project_status {
+        Some(status) if !loaded.trusted => crate::project_trust::untrusted_notice(status, &loaded.project_files, TRUST_HINT),
+        _ => None,
     };
-    let loaded = load_sources(&root, &options.sources, &config_dir, &home, &env, trusted).await;
+    let nested_trust = loaded.nested.clone();
+    let project_files = loaded.project_status.clone().map(|status| (loaded.project_files.clone(), status));
     let mut problems = loaded.problems;
     match (&options.on_warning, trust_notice) {
         (Some(warn), Some(notice)) => warn(notice),
@@ -374,7 +368,8 @@ pub async fn create_session(options: SessionOptions) -> Result<MarvSession, Sess
     init.instructions = loaded.instructions.map(|i| i.text);
     // Nested AGENTS.md files are the project's too (#62).
     init.nested_instructions = options.sources.contains(&Source::Project);
-    init.project_trusted = trusted;
+    init.nested_trust = nested_trust;
+    init.project_files = project_files;
     init.skills = loaded.skills;
     init.agents = loaded.agents;
     init.memory = loaded.memory;

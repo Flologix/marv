@@ -61,30 +61,6 @@ pub struct ChatSpec {
 const TRUST_COMMAND: (&str, &str) =
     ("trust", "Use this folder's instructions, skills and agent types as yours (from the next chat)");
 
-/// `/trust`: the project's files as this chat found them, trusted for exactly those contents, from the next chat (this
-/// one's system prompt and tools stay as they are).
-async fn trust_project(
-    spec: &ChatSpec,
-    files: &marv_session::project_trust::ProjectFiles,
-    status: &marv_session::project_trust::TrustStatus,
-) -> String {
-    use marv_session::project_trust::{ProjectTrust, TrustStatus};
-    if files.is_empty() {
-        return "This folder has no instruction files, skills or agent types to trust.".into();
-    }
-    if *status == TrustStatus::Trusted {
-        return "You trusted this folder's instructions already: they're used as yours.".into();
-    }
-    let key = marv_session::paths::project_key(&spec.root);
-    match ProjectTrust::in_config(&spec.config_dir).trust(&key, files).await {
-        Ok(()) => format!(
-            "Trusted this folder's instructions ({}): they're used as yours from the next chat. A change to any of them asks again.",
-            marv_core::printable(&files.summary())
-        ),
-        Err(e) => format!("Couldn't trust them: {e}"),
-    }
-}
-
 /// The commands the page offers in its `/` menu (besides the skills), and what they do here.
 const COMMANDS: &[(&str, &str)] = &[
     ("help", "Show the commands"),
@@ -183,22 +159,10 @@ pub async fn run_chat(spec: ChatSpec, mut incoming: UnboundedReceiver<ClientMess
     if let Some(handle) = session.mesh() {
         tokio::spawn(watch_mesh(handle, session.clone(), approver.clone(), out.clone(), watching.clone()));
     }
-    let home = marv_session::paths::home_dir();
-    // The project's instructions, skills and agent types, as this chat found them, and whether the person trusted
-    // them (the session loaded them to match): an untrusted project's skills aren't offered here either.
-    let project_trust = spec.sources.contains(&Source::Project).then(|| {
-        let files = marv_session::project_trust::project_files(&spec.root, &home);
-        let key = marv_session::paths::project_key(&spec.root);
-        let status = marv_session::project_trust::ProjectTrust::in_config(&spec.config_dir).status(&key, &files);
-        (files, status)
-    });
-    let trusted = project_trust.as_ref().is_some_and(|(_, status)| status.trusted());
-    let skills: Vec<LoadedSkill> = if spec.sources.is_empty() {
-        Vec::new()
-    } else {
-        let (project, user) = (spec.sources.contains(&Source::Project) && trusted, spec.sources.contains(&Source::User));
-        marv_session::skills::load_skills(project.then_some(spec.root.as_path()), user.then_some(home.as_path())).0
-    };
+    // The skills and the project's files exactly as the session loaded them (one read, with the trust applied): an
+    // untrusted project's skills aren't offered, and /trust trusts what was loaded.
+    let project_trust = session.project_files();
+    let skills: Vec<LoadedSkill> = session.skills();
     let menu: Vec<Value> = COMMANDS
         .iter()
         .copied()
@@ -268,7 +232,17 @@ pub async fn run_chat(spec: ChatSpec, mut incoming: UnboundedReceiver<ClientMess
                     }
                     "trust" if project_trust.is_some() => {
                         let Some((files, status)) = &project_trust else { continue };
-                        print(trust_project(&spec, files, status).await)
+                        let quoted = session.nested_quoted();
+                        let said = marv_session::project_trust::trust_project(
+                            &spec.config_dir,
+                            &spec.root,
+                            files,
+                            status,
+                            &quoted,
+                            "the next chat",
+                        )
+                        .await;
+                        print(said.unwrap_or_else(|e| e))
                     }
                     "memory" => print(match session.memory() {
                         Some(m) if !m.personal.is_empty() || !m.project.is_empty() => {

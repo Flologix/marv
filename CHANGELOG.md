@@ -6,6 +6,14 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+### Changed
+
+- **A project's instructions count as yours only once you trust them.** A project's `AGENTS.md`/`CLAUDE.md` (and its parent folders' up to the git root, and the ones in its subfolders), its `.marv/skills` and its `.marv/agents` are used as your own instructions only after `/trust` (in the TUI and the desktop), for exactly the contents you trusted: a changed file asks again, and the startup notice names it. Until then the model reads the instruction files as the project's data, and the project's skills and agent types aren't offered. `marv -p` uses a trust you stored, or `--trust-project` for that run. Trusting takes effect at the next start (the desktop: the next chat).
+- **More output counts as untrusted text.** What the GitHub tool returns, the output of a command run with the network (`network: true`, on your machine, or a background process started with the network), and every command's output when the sandbox is off or unavailable are now quoted to the model as data and make the conversation untrusted, so anything that can send data out asks first, even in yolo. With the sandbox off, a command in an untrusted conversation asks every time.
+- **Saving a memory in an untrusted conversation asks every time** (no "always", no yolo, no pre-approved scope), and the approval says why; `marv -p` refuses it.
+- **`/clear` ends the cleared conversation's untrusted state**, unless a background process started with the network is still running. A compaction of an untrusted conversation says so to the model.
+- **More text from outside sources is quoted as data:** error results and errors from MCP servers, web pages, GitHub and networked commands, failed mesh calls, mesh receptacle descriptions, MCP tool descriptions in Marv's notes and in `tool_search`, and a report from a subagent that read outside text.
+
 ## [0.8.0] - 2026-10-21
 
 ### Added

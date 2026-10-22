@@ -36,7 +36,8 @@ use serde_json::{Value, json};
 
 use crate::output::spill_whole;
 use crate::types::{Preview, Scope, Tool, ToolContext, ToolError, ToolOutput};
-use crate::web::address::{CheckOptions, check_address};
+pub use crate::web::address::Resolver;
+use crate::web::address::{CheckOptions, check_address_unresolved};
 use crate::web::convert::{ConvertOptions, Converter};
 use crate::web::fetch::{GetOptions, Page, fetch_page, parse_url};
 use crate::web::github::{GithubOptions, fetch_github, parse_github};
@@ -228,6 +229,8 @@ pub struct WebOptions {
     pub token: Option<String>,
     /// Tests only: the page converter (default: this binary's `__html-convert`).
     pub converter: Option<Converter>,
+    /// Tests only: the resolver the fetch looks names up with (default: the system's).
+    pub resolver: Option<Resolver>,
 }
 
 struct Cached {
@@ -293,6 +296,7 @@ impl WebFetch {
             allow_http: self.options.allow_http,
             follow_redirect: Some(std::sync::Arc::new(move |_from: &url::Url, to: &url::Url| domain_of(to.as_str()) == site)),
             convert: ConvertOptions { converter: self.options.converter.clone(), ..ConvertOptions::default() },
+            resolver: self.options.resolver.as_ref().map(|r| r.0.clone()),
             ..GetOptions::default()
         }
     }
@@ -377,9 +381,12 @@ impl Tool for WebFetch {
 
     async fn preview(&self, input: &WebFetchInput, ctx: &ToolContext) -> Result<Preview, ToolError> {
         let parsed = parse_url(&input.url)?;
-        // A private address fails here, so nobody is asked to approve it.
+        // A private address literal or localhost fails here, so nobody is asked to approve it. A name isn't looked up
+        // until the fetch runs, after the approval (and before it connects): a lookup here would reach DNS, with
+        // whatever the name carries, before anyone said yes.
         let check = CheckOptions { allow_private: self.options.allow_private, ..CheckOptions::default() };
-        check_address(&parsed, &check, &ctx.cancel).await?;
+        check_address_unresolved(&parsed, &check)?;
+        let _ = ctx;
         Ok(Preview {
             title: "Fetch a web page".into(),
             text: Some(parsed.to_string()),
@@ -810,6 +817,7 @@ mod tests {
             raw_base: Some(format!("{}/raw", api.base())),
             token: Some("from-option".into()),
             converter: None,
+            resolver: None,
         }));
         let asked = Asked::new(Decision::Yes);
         let out = fetch(&tool, "github.com/o/r/blob/main/a.txt", None, &ctx(&asked)).await;

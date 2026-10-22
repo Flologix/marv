@@ -90,6 +90,7 @@ mod tests {
         );
         assert_eq!(fenced.matches("</untrusted-data>").count(), 1);
         assert_eq!(escape_attribute("a & b"), "a &amp; b");
+        assert_eq!(escape_attribute("x\u{2028}y\u{FF02} ＞z\u{200B}"), "x y&quot; &gt;z ");
     }
 
     #[test]

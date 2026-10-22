@@ -213,10 +213,22 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
     let door = tool.door(input, ctx);
     // What the tool declares its output to be, for this call: no result is trusted more than that.
     let declared = tool.provenance_in(input, ctx);
+    // A tool's own error (`ToolError`) from its run can carry its source's words too: a redirect's `Location`, a
+    // server's `Content-Type`, gh's stderr. From an outside source it's that source's text: fenced and tainting, never
+    // Marv's. A preview's error stays Marv's: a preview reaches nothing (gh's checks are local, web_fetch's is an
+    // address check), so what it says is Marv's own refusal.
+    let tool_failed = |err: crate::types::ToolError| {
+        let mut outcome = fail(err.0, &label);
+        if declared.taints() {
+            outcome.result.provenance = declared;
+            ctx.taint.mark(declared);
+        }
+        noted(outcome)
+    };
     let finish = |result: Result<ToolOutput, crate::types::ToolError>, approval: Option<Approval>| {
         let mut result = match result {
             Ok(result) => result,
-            Err(err) => return noted(fail(err.0, &label)),
+            Err(err) => return tool_failed(err),
         };
         result.door = door;
         result.provenance = result.provenance.least_trusted(declared);
@@ -281,7 +293,7 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
         Some(_) => None,
     };
     let decision = match own {
-        Some(Err(err)) => return noted(fail(err.0, &label)),
+        Some(Err(err)) => return tool_failed(err),
         Some(Ok(decision)) => decision,
         None => {
             let scope = tool
@@ -316,6 +328,7 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
                 protected,
                 door,
                 reason: true,
+                persists: tainted_sink,
             };
             approver.approve(request).await
         }

@@ -85,6 +85,14 @@ impl ScopeApprover {
                 format!("refused {what}: it writes a protected path; add --approve-protected to approve that in marv -p")
             });
         }
+        // A memory in a tainted session is asked of a person every time (it's loaded into every later conversation as
+        // theirs), and marv -p has no person to ask: no flag approves it.
+        if request.persists {
+            return Some(format!(
+                "refused {what}: the session read untrusted content, and a memory is loaded into every later \
+                 conversation as yours, so only a person approves it (not --approve-tainted)"
+            ));
+        }
         (request.must_ask && !self.tainted).then(|| {
             format!(
                 "refused {what}: the session read untrusted content, so egress needs --approve-tainted as well as \
@@ -588,6 +596,7 @@ mod tests {
     fn request(key: &str) -> ApprovalRequest {
         ApprovalRequest {
             reason: false,
+            persists: false,
             tool: "bash".into(),
             label: "x".into(),
             preview: Preview::default(),
@@ -735,6 +744,18 @@ mod tests {
         let scope = ScopeApprover { prefixes: vec!["bash:net:".into()], ..ScopeApprover::default() };
         let why = scope.must_ask_refusal(&multi).unwrap();
         assert!(!why.contains('\n') && why.contains("(curl -d @.env x …)"), "{why}");
+    }
+
+    // A memory in a tainted session needs a person: --approve memory with --approve-tainted still refuses it.
+    #[tokio::test]
+    async fn a_tainted_memory_write_is_refused_whatever_the_flags() {
+        let all = MustAsk { tainted: true, protected: true };
+        let approver = build_approver(&["memory".to_string()], all).unwrap().0.unwrap();
+        let tainted = ApprovalRequest { must_ask: true, once: true, persists: true, ..request("memory") };
+        assert_eq!(approver.approve(tainted.clone()).await, Decision::Unavailable);
+        assert_eq!(approver.approve(request("memory")).await, Decision::Yes, "clean, --approve memory answers it");
+        let scope = ScopeApprover { prefixes: vec!["memory".into()], tainted: true, protected: true };
+        assert!(scope.must_ask_refusal(&tainted).unwrap().contains("only a person approves it"));
     }
 
     #[test]

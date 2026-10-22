@@ -456,12 +456,12 @@ mod tests {
         run_tool(&call("Prefers tabs."), &ctx, builtin_tools()).await;
         let asked = std::mem::take(&mut *approver.asked.lock().unwrap());
         assert_eq!(asked.len(), 1);
-        assert!(asked[0].once && asked[0].must_ask, "never a remembered always, never yolo");
+        assert!(asked[0].once && asked[0].must_ask && asked[0].persists, "never a remembered always, never yolo");
         assert_eq!(asked[0].preview.warning.as_deref(), Some(TAINTED_MEMORY_WARNING));
         // Clean, it's an ordinary approval with no warning.
         let (_, clean) =
             run_memory(&dir, json!({"action": "add", "scope": "personal", "text": "Uses vim."}), Decision::Yes).await;
-        assert!(!clean[0].once && !clean[0].must_ask && clean[0].preview.warning.is_none());
+        assert!(!clean[0].once && !clean[0].must_ask && !clean[0].persists && clean[0].preview.warning.is_none());
     }
 
     #[tokio::test]
