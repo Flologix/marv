@@ -1191,11 +1191,21 @@ impl MarvSession {
     /// after making it, and a cleanup started before then could take the resumed conversation's folder. On a thread
     /// of its own, so a big store never delays the turn.
     fn clean_tool_output_once(&self) {
-        let Some(dir) = self.inner.init.tool_output_dir.clone() else { return };
         if self.inner.tool_output_cleaned.swap(true, std::sync::atomic::Ordering::Relaxed) {
             return;
         }
         let id = self.id();
+        // #63: the project's swap folders follow the same age rule, and go with a session file that's gone.
+        if let Some(store) = &self.inner.init.sessions
+            && let Some(folder) = store.file(&self.inner.init.root, &id).parent().map(std::path::Path::to_path_buf)
+        {
+            let id = id.clone();
+            std::thread::spawn(move || {
+                let keep = std::time::Duration::from_secs(marv_tools::output::KEEP_DAYS * 86_400);
+                marv_tools::swap::clean_swaps(&folder, keep, Some(&id), std::time::SystemTime::now());
+            });
+        }
+        let Some(dir) = self.inner.init.tool_output_dir.clone() else { return };
         std::thread::spawn(move || {
             let keep = std::time::Duration::from_secs(marv_tools::output::KEEP_DAYS * 86_400);
             let max = marv_tools::output::MAX_TOTAL_BYTES;

@@ -321,6 +321,37 @@ pub fn strip_page_lists(summary: &str) -> String {
     out.join("\n").trim_end().to_string()
 }
 
+/// Startup cleanup of a project's swap folders (`folder` holds its sessions' files), with the saved tool outputs'
+/// rule ([`crate::output::KEEP_DAYS`]): a swap folder whose session file is gone goes, and so does one untouched for
+/// `keep`, but never `current`'s (the session starting). A symlink is never followed or removed. Errors are skipped.
+pub fn clean_swaps(folder: &Path, keep: std::time::Duration, current: Option<&str>, now: std::time::SystemTime) {
+    let Ok(entries) = std::fs::read_dir(folder) else { return };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let Some(id) = path.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_suffix(&format!(".{SWAP_SUFFIX}"))) else {
+            continue;
+        };
+        if current == Some(id) {
+            continue;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+        if !meta.is_dir() {
+            continue;
+        }
+        let orphan = !folder.join(format!("{id}.json")).exists();
+        let newest = std::fs::read_dir(&path)
+            .map(|files| files.filter_map(Result::ok).filter_map(|f| f.metadata().ok()?.modified().ok()).max())
+            .ok()
+            .flatten()
+            .or(meta.modified().ok())
+            .unwrap_or(now);
+        let old = now.duration_since(newest).is_ok_and(|age| age > keep);
+        if orphan || old {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+}
+
 /// Takes a page back out (its compaction didn't happen): its file and its table entry. Errors are ignored: a page
 /// left over is only an extra page.
 pub async fn remove_page(dir: &Path, page: u32) {
@@ -458,6 +489,30 @@ pub(crate) mod tests {
         pages.sort();
         assert_eq!(pages, [1, 2, 3, 4]);
         assert_eq!(read_table(&swap).len(), 4);
+    }
+
+    #[test]
+    fn old_and_orphaned_swap_folders_go_but_never_the_current_one() {
+        let dir = TempDir::new("swap-clean");
+        for id in ["live", "kept", "orphan", "old"] {
+            std::fs::create_dir_all(dir.path().join(format!("{id}.swap"))).unwrap();
+            std::fs::write(dir.path().join(format!("{id}.swap/1.jsonl")), "{}").unwrap();
+        }
+        for id in ["live", "kept", "old"] {
+            std::fs::write(dir.path().join(format!("{id}.json")), "{}").unwrap();
+        }
+        let day = std::time::Duration::from_secs(86_400);
+        let now = std::time::SystemTime::now();
+        // "old" is old by the clock, "live" too but it's the current session.
+        clean_swaps(dir.path(), day, Some("live"), now + 2 * day);
+        let left: Vec<bool> =
+            ["live", "kept", "orphan", "old"].iter().map(|id| dir.path().join(format!("{id}.swap")).exists()).collect();
+        assert_eq!(left, [true, false, false, false]);
+        let dir = TempDir::new("swap-clean-fresh");
+        std::fs::create_dir_all(dir.path().join("a.swap")).unwrap();
+        std::fs::write(dir.path().join("a.json"), "{}").unwrap();
+        clean_swaps(dir.path(), day, None, now);
+        assert!(dir.path().join("a.swap").exists(), "fresh, with its session");
     }
 
     #[test]
