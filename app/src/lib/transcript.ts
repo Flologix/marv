@@ -56,8 +56,8 @@ export type Item =
     }
   /**
    * `restored`: undecided in a transcript loaded from storage, and not yet known to still wait (its chat may have
-   * restarted since): shown without buttons until the session says (`settle`). `decision` "expired": its session
-   * ended before it was answered (the app quit or the chat restarted), so there's nothing left to answer.
+   * restarted since): shown without buttons until the session says (`settle`). `decision` "expired": its request no
+   * longer waits (the app quit or the chat restarted), so there's nothing left to answer.
    */
   | { kind: "approval"; request: ApprovalRequest; decision?: string; reason?: string; restored?: boolean }
   | { kind: "notice"; text: string; tone: "info" | "warn" | "error" }
@@ -127,8 +127,11 @@ export function apply(items: Item[], e: ServerEvent): Item[] {
       next.push({ kind: "approval", request: e as unknown as ApprovalRequest });
       return next;
     case "approval_done": {
-      // The card still waiting for this answer: never one decided already.
-      const i = next.findIndex((it) => it.kind === "approval" && it.request.id === e.id && !it.decision);
+      // The card still waiting for this answer, never one decided already; else one `settle` gave up on (answered
+      // while the page was away, the answer replayed after `ready`).
+      const card = (expired: boolean) => next.findIndex((it) => it.kind === "approval" && it.request.id === e.id && (expired ? it.decision === "expired" : !it.decision));
+      const waiting = card(false);
+      const i = waiting >= 0 ? waiting : card(true);
       if (i < 0) return items;
       next[i] = { ...(next[i] as Extract<Item, { kind: "approval" }>), decision: String(e.decision), reason: typeof e.reason === "string" ? e.reason : undefined };
       return next;
@@ -183,15 +186,16 @@ export function restore(items: Item[]): Item[] {
 }
 
 /**
- * The session is ready: `sameRun` when it's the one the transcript was saved from (a chat still running in the
- * background), whose waiting approvals are live again. Otherwise (the app or the chat restarted) their requests are
- * gone, and their cards say so.
+ * The session is ready, and says which approvals still wait (`waiting`: their ids). A restored card is live again
+ * only if its request is among them (a chat still running in the background). Any other's request is gone (the app
+ * or the chat restarted, or it was answered while the page was away): its card says it wasn't answered here, and an
+ * `approval_done` replayed after this still marks it.
  */
-export function settle(items: Item[], sameRun: boolean): Item[] {
+export function settle(items: Item[], waiting: readonly number[]): Item[] {
   if (!items.some((it) => it.kind === "approval" && it.restored)) return items;
   return items.map((it) => {
     if (it.kind !== "approval" || !it.restored) return it;
     const { restored: _, ...card } = it;
-    return sameRun || card.decision ? card : { ...card, decision: "expired" };
+    return card.decision || waiting.includes(card.request.id) ? card : { ...card, decision: "expired" };
   });
 }

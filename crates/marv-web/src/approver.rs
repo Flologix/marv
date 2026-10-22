@@ -25,21 +25,22 @@ const MAX_ID: u64 = (1 << 53) - 1;
 /// new card's `approval_done` marked an old card, and Allow on the new card did nothing.
 static NEXT_ID: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(first_id()));
 
-/// Somewhere in [1, 2^52): room for 2^52 ids after it before reaching `MAX_ID`.
+/// Somewhere in [1, 2^52): room for 2^52 ids after it before reaching `MAX_ID`. The low 52 bits of a v4 UUID's
+/// low half are all random (its version and variant bits are elsewhere).
 fn first_id() -> u64 {
-    let random = uuid::Uuid::new_v4().as_u64_pair().0;
-    (random >> 12).max(1)
+    let random = uuid::Uuid::new_v4().as_u64_pair().1;
+    (random & ((1 << 52) - 1)).max(1)
+}
+
+/// The id after `id`: back to 1 past `MAX_ID` (2^52 approvals on; unreachable in practice), never an id the page
+/// can't read exactly.
+fn after(id: u64) -> u64 {
+    if id >= MAX_ID { 1 } else { id + 1 }
 }
 
 fn next_id() -> u64 {
-    match NEXT_ID.fetch_add(1, Ordering::Relaxed) {
-        id if id == 0 || id > MAX_ID => {
-            // Unreachable in practice (2^52 approvals); start over low rather than send an id the page can't read.
-            NEXT_ID.store(2, Ordering::Relaxed);
-            1
-        }
-        id => id,
-    }
+    // One atomic step: callers at the same moment never get the same id, even at the wrap.
+    NEXT_ID.update(Ordering::Relaxed, Ordering::Relaxed, after)
 }
 
 pub struct WebApprover {
@@ -248,7 +249,14 @@ mod tests {
                 page.recv().await.unwrap();
             }
         }
-        assert_ne!(first_id(), 0);
+    }
+
+    #[test]
+    fn ids_start_below_2_52_and_wrap_to_1_past_2_53() {
+        for _ in 0..100 {
+            assert!((1..1 << 52).contains(&first_id()));
+        }
+        assert_eq!((after(41), after(MAX_ID - 1), after(MAX_ID)), (42, MAX_ID, 1));
     }
 
     /// An answer for an id that isn't waiting (from an earlier run, another chat, or answered already) is ignored:
@@ -262,7 +270,11 @@ mod tests {
             async move { approver.approve(request(false)).await }
         });
         let id = page.recv().await.unwrap()["id"].as_u64().unwrap();
-        for other in [1, 2, id.wrapping_add(1), id.wrapping_sub(1)] {
+        // Ids that aren't this request's: ones taken from the counter and never asked with (so no other test's
+        // request has them either), and one far from it.
+        let others = [next_id(), next_id(), (id ^ (1 << 51)) & MAX_ID];
+        for other in others {
+            assert_ne!(other, id);
             approver.answer(other, Decision::Always);
         }
         tokio::task::yield_now().await;

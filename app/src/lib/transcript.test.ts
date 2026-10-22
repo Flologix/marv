@@ -26,6 +26,9 @@ test("an approval_done with no waiting card changes nothing", () => {
   const items = fold([], ask(3), done(3, "yes"));
   assert.equal(apply(items, { type: "approval_done", id: 3, decision: "no" }), items);
   assert.equal(apply(items, { type: "approval_done", id: 4, decision: "no" }), items);
+  // An answer for a request that's still live never lands on an expired card with another id.
+  const both = fold(settle(restore(fold([], ask(8))), []), ask(9), done(9, "yes"));
+  assert.deepEqual(cards(both).map((c) => c.decision), ["expired", "yes"]);
 });
 
 test("a restored transcript's undecided cards wait for the session, then expire after a restart", () => {
@@ -36,20 +39,31 @@ test("a restored transcript's undecided cards wait for the session, then expire 
     { id: 11, decision: undefined, restored: true },
   ]);
   // Another session: the request is gone.
-  const restarted = settle(loaded, false);
+  const restarted = settle(loaded, []);
   assert.deepEqual(cards(restarted), [
     { id: 10, decision: "always", restored: undefined },
     { id: 11, decision: "expired", restored: undefined },
   ]);
-  // A late answer for it (or the new run's request reusing nothing) can't revive it.
-  assert.equal(apply(restarted, done(11, "yes")), restarted);
   // The new run's own request is a new, live card.
   assert.deepEqual(cards(fold(restarted, ask(900)))[2], { id: 900, decision: undefined, restored: undefined });
 });
 
+test("at ready, a restored card is live only if its id is among the approvals still waiting", () => {
+  const loaded = restore(fold([], ask(4), ask(5)));
+  assert.deepEqual(cards(settle(loaded, [5, 9])), [
+    { id: 4, decision: "expired", restored: undefined },
+    { id: 5, decision: undefined, restored: undefined },
+  ]);
+});
+
+test("a restored card answered while the page was away: its replayed answer marks it", () => {
+  const settled = settle(restore(fold([], ask(6))), []);
+  assert.deepEqual(cards(fold(settled, done(6, "always"))), [{ id: 6, decision: "always", restored: undefined }]);
+});
+
 test("in the same session (a chat still running in the background) a restored card is live again", () => {
   const loaded = restore(fold([], ask(5)));
-  const same = settle(loaded, true);
+  const same = settle(loaded, [5]);
   assert.deepEqual(cards(same), [{ id: 5, decision: undefined, restored: undefined }]);
   // Replayed on reattach: still one card, and its answer lands on it.
   assert.deepEqual(cards(fold(same, ask(5), done(5, "yes"))), [{ id: 5, decision: "yes", restored: undefined }]);
@@ -57,5 +71,5 @@ test("in the same session (a chat still running in the background) a restored ca
 
 test("settle leaves a transcript with nothing restored as it is", () => {
   const items = fold([], ask(1), done(1, "yes"));
-  assert.equal(settle(items, false), items);
+  assert.equal(settle(items, []), items);
 });
