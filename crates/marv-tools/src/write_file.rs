@@ -92,6 +92,18 @@ pub async fn plan(input: &WriteFileInput, ctx: &ToolContext) -> Result<Plan, Too
     Ok(Plan { absolute, shown, before, body, after, diff, new_line_missing, crlf })
 }
 
+/// Writes the plan: a new file is created only if it still doesn't exist (`AlreadyExists` otherwise), so a file someone
+/// made since the plan looked is never written over.
+async fn write_planned(planned: &Plan) -> std::io::Result<()> {
+    if planned.before.is_some() {
+        return tokio::fs::write(&planned.absolute, &planned.after).await;
+    }
+    use tokio::io::AsyncWriteExt;
+    let mut file = tokio::fs::OpenOptions::new().write(true).create_new(true).open(&planned.absolute).await?;
+    file.write_all(planned.after.as_bytes()).await?;
+    file.flush().await
+}
+
 /// Lines in a text, not counting a final newline.
 pub fn line_count(text: &str) -> usize {
     if text.is_empty() { 0 } else { text.strip_suffix('\n').unwrap_or(text).split('\n').count() }
@@ -170,11 +182,22 @@ impl Tool for WriteFile {
             if let Some(dir) = planned.absolute.parent() {
                 tokio::fs::create_dir_all(dir).await.map_err(failed)?;
             }
-            tokio::fs::write(&planned.absolute, &planned.after).await.map_err(failed)?;
+            match write_planned(&planned).await {
+                Ok(()) => {}
+                // Created by someone else since the plan looked (outside Marv's locks): theirs, never read here.
+                Err(e) if planned.before.is_none() && e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Err(ToolError(crate::file_versions::never_read(&planned.shown)));
+                }
+                Err(e) => {
+                    // It may have been cut short: the next write is refused until the file is read again.
+                    ctx.file_versions.unsure(&planned.absolute, planned.after.as_bytes());
+                    return Err(failed(e));
+                }
+            }
             // #67: the project's formatter runs before anything is said; its failure is a note, not an error.
             let formatted = crate::formatter::after_write(ctx, &planned.shown, &planned.absolute, &planned.after).await;
-            // The file as written and formatted is the version this session has now seen.
-            ctx.file_versions.saw(&planned.absolute, formatted.content.as_bytes());
+            // The file as written (and formatted, when the formatter ran on this write) is this session's version now.
+            ctx.file_versions.wrote(&planned.absolute, &planned.after, &formatted);
             Ok::<_, ToolError>((planned, formatted))
         })
         .await?;
@@ -997,5 +1020,80 @@ mod tests {
         let formatted = f.read("new.js");
         assert_eq!(formatted, "const a = 'x';\n");
         assert!(ctx.file_versions.is_current(&f.root.path().join("new.js"), formatted.as_bytes()), "{formatted}");
+    }
+
+    #[tokio::test]
+    async fn the_sessions_own_edit_is_its_version_so_the_next_edit_lands() {
+        let f = Fixture::new("w-own-edit");
+        for (old, new) in [("Hello", "Hi"), ("Hi", "Hey")] {
+            let out = f.run("edit_file", json!({"path": "greet.ts", "old_string": old, "new_string": new})).await.result;
+            assert!(!out.is_error, "{}", out.output);
+        }
+        assert!(f.read("greet.ts").contains("`Hey, ${name}!`"));
+    }
+
+    #[tokio::test]
+    async fn after_the_formatter_ran_on_an_edit_the_next_edit_lands() {
+        let (f, ctx) = formatting_fixture("w-fmt-twice", true);
+        f.write("a.js", "const a = 1;\n");
+        for (old, new) in [("const a = 1;", "const a = \"x\";"), ("const a = 'x';", "const a = 'y';")] {
+            let out = run_with(&ctx, "edit_file", json!({"path": "a.js", "old_string": old, "new_string": new})).await.result;
+            assert!(!out.is_error, "{}", out.output);
+        }
+        assert_eq!(f.read("a.js"), "const a = 'y';\n");
+    }
+
+    #[tokio::test]
+    async fn a_formatter_that_failed_after_changing_the_file_leaves_it_unsure() {
+        let f = Fixture::new("w-fmt-fail-changed");
+        crate::formatter::testing::bin(
+            &f.root,
+            "prettier",
+            "#!/bin/sh\nfor f in \"$@\"; do case \"$f\" in --*) ;; *) printf 'half\\n' > \"$f\" ;; esac; done\nexit 2\n",
+        );
+        f.write(".prettierrc", "{}");
+        let mut ctx = f.ctx.clone();
+        ctx.formatter = Some(Arc::new(crate::formatter::ProjectFormatter::new(
+            crate::formatter::FormatterSetting::Auto,
+            true,
+            Some(crate::formatter::testing::run_unsandboxed()),
+        )));
+        f.write("a.js", "one\n");
+        let out = run_with(&ctx, "edit_file", json!({"path": "a.js", "old_string": "one", "new_string": "two"})).await.result;
+        assert!(!out.is_error, "{}", out.output);
+        assert_eq!(f.read("a.js"), "half\n");
+        // What's there now isn't recorded as seen, and the refusal doesn't blame another session.
+        let out = run_with(&ctx, "write_file", json!({"path": "a.js", "content": "three\n"})).await.result;
+        assert_eq!(out.output, crate::file_versions::not_as_you_left_it("a.js"));
+    }
+
+    #[tokio::test]
+    async fn an_edit_changed_while_the_user_decides_is_caught_at_apply_time() {
+        struct ChangesIt(std::path::PathBuf);
+        #[async_trait]
+        impl Approver for ChangesIt {
+            async fn approve(&self, _request: ApprovalRequest) -> Decision {
+                std::fs::write(&self.0, "export function greet(name: string) {\n  return `Hello there`;\n}\n").unwrap();
+                Decision::Yes
+            }
+        }
+        let f = Fixture::new("w-stale-edit-apply");
+        let ctx = ToolContext { approver: Some(Arc::new(ChangesIt(f.root.path().join("greet.ts")))), ..f.ctx.clone() };
+        let edit = json!({"path": "greet.ts", "old_string": "export function", "new_string": "function"});
+        let out = run_with(&ctx, "edit_file", edit).await.result;
+        assert_eq!(out.output, crate::file_versions::changed_since_read("greet.ts"));
+        assert!(f.read("greet.ts").starts_with("export function"));
+    }
+
+    #[tokio::test]
+    async fn a_new_file_someone_created_since_the_plan_isnt_written_over() {
+        let f = Fixture::new("w-create-new");
+        let input = WriteFileInput { path: "late.txt".into(), content: "mine\n".into(), append: None };
+        let planned = plan(&input, &f.ctx).await.unwrap();
+        assert!(planned.before.is_none());
+        f.root.write("late.txt", "theirs\n");
+        let err = write_planned(&planned).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(f.read("late.txt"), "theirs\n");
     }
 }

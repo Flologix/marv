@@ -212,13 +212,15 @@ impl Tool for EditFile {
         // step per file, so a parallel edit (or append) can't be lost, and the formatter can't be formatted over.
         let (planned, formatted) = with_file_lock(ctx, &input.path, || async {
             let planned = plan(input, ctx).await?;
-            tokio::fs::write(&planned.absolute, &planned.after)
-                .await
-                .map_err(|e| ToolError(format!("Couldn't write {}: {e}", planned.shown)))?;
+            if let Err(e) = tokio::fs::write(&planned.absolute, &planned.after).await {
+                // It may have been cut short: the next write is refused until the file is read again.
+                ctx.file_versions.unsure(&planned.absolute, planned.after.as_bytes());
+                return Err(ToolError(format!("Couldn't write {}: {e}", planned.shown)));
+            }
             // #67: the project's formatter runs before anything is said; its failure is a note, not an error.
             let formatted = crate::formatter::after_write(ctx, &planned.shown, &planned.absolute, &planned.after).await;
-            // The file as written and formatted is the version this session has now seen.
-            ctx.file_versions.saw(&planned.absolute, formatted.content.as_bytes());
+            // The file as written (and formatted, when the formatter ran on this write) is this session's version now.
+            ctx.file_versions.wrote(&planned.absolute, &planned.after, &formatted);
             Ok::<_, ToolError>((planned, formatted))
         })
         .await?;

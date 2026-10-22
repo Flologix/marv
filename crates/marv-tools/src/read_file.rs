@@ -13,7 +13,8 @@
 //! - Port note: lengths are `char` counts (Marv: UTF-16 units).
 //! - marv-rs (#61): it also reads the session's saved tool outputs, the one place outside the project
 //!   (`files::resolve_readable`); the omitted marker of a cut output names the file.
-//! - marv-rs: a read (any page, a binary file too) records the file's version for the session
+//! - marv-rs: a read (any page: a partial read counts, the hash being the whole file's; a binary file too) records the
+//!   file's version for the session
 //!   ([`crate::file_versions`]): `edit_file` and `write_file` write over an existing file only as last read or written.
 
 use async_trait::async_trait;

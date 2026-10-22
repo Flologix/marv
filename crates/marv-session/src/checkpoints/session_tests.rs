@@ -625,3 +625,27 @@ async fn what_a_turn_read_the_next_may_change_until_an_undo_or_a_clear() {
     collect(go(&session, "change it once more")).await;
     assert_eq!(a(), "four\n", "a new conversation wrote over a file it never read");
 }
+
+/// A resumed conversation has read only what it read: what the conversation left behind read doesn't carry over.
+#[tokio::test]
+async fn a_resumed_conversation_hasnt_read_what_the_one_it_replaced_read() {
+    let dirs = Dirs::new();
+    let provider = Scripted::new(vec![
+        use_tools(vec![write_call("w", "new.txt", "new\n")]),
+        say("made it"),
+        use_tools(vec![read_call("r", "a.txt")]),
+        say("read it"),
+        use_tools(vec![write_call("w2", "a.txt", "two\n")]),
+        say("refused"),
+    ]);
+    let session = scripted(&dirs, &provider, |init| init.sessions = Some(dirs.sessions()));
+    collect(go(&session, "make a file")).await;
+    let old = session.id();
+    session.flush().await;
+    session.clear().await.unwrap();
+    collect(go(&session, "read a.txt")).await;
+    session.flush().await;
+    session.resume(ResumeTarget::Id(old)).await.unwrap().unwrap();
+    collect(go(&session, "change a.txt")).await;
+    assert_eq!(std::fs::read_to_string(dirs.project.0.join("a.txt")).unwrap(), "one\n", "written unread");
+}
