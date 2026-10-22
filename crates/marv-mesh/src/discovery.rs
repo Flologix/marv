@@ -61,8 +61,16 @@ pub const CONNECT: &str = "marv/connect";
 pub const WIRE: &str = "marv/wire";
 
 /// How long a door gets to answer `marv/info` (`marv mesh ls`, finding a peer). Approvals wait as long as a person
-/// takes.
+/// takes, except the far end of a new wire ([`WIRE_ANSWER_WAIT`]).
 pub const DOOR_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a new wire to another Marv (`marv/wire`) waits for that Marv's person to answer (#201). A person's own
+/// prompt waits as long as they take: they're the one who'll answer it, and Esc ends it. But this wait holds the
+/// *other* Marv's turn, whose person can't answer it and once couldn't stop it either: someone who stepped away from
+/// the far Marv left the caller's turn hung. Three minutes is far longer than answering a prompt you're looking at
+/// takes (the radio calls a Marv silent at 45 s and drops it at 120 s, and lets `radio_tx` wait up to 300 s), yet
+/// short enough that a turn waiting on an empty chair ends while its person still remembers asking. Both ends keep
+/// it: the caller gives up with "didn't answer", and the far door withdraws its person's prompt.
+pub const WIRE_ANSWER_WAIT: Duration = Duration::from_secs(180);
 /// A remote plug is `peer-<session>`, one name segment: session names leave room for the prefix.
 pub const MAX_SESSION_NAME: usize = 43;
 const PEER_PLUG: &str = "peer-";
@@ -387,7 +395,7 @@ pub fn open_door(sb: Arc<Switchboard>, dir: &Path, info: DoorInfo, approver: Arc
     listener.set_nonblocking(true).map_err(|e| io("the door", e))?;
     let listener = UnixListener::from_std(listener).map_err(|e| io("the door", e))?;
     sb.set_peer_dir(dir.to_path_buf());
-    sb.add_resolver(Arc::new(PeerResolver { dir: dir.to_path_buf(), own: name }));
+    sb.add_resolver(Arc::new(PeerResolver { dir: dir.to_path_buf(), own: name, wait: sb.wire_wait() }));
     let door = Arc::new(Door { sb, dir: dir.to_path_buf(), info, approver });
     let cancel = CancellationToken::new();
     tokio::spawn(door.accept(listener, cancel.clone()));
@@ -452,7 +460,14 @@ impl Door {
                     }
                 }
             }
-            let response = self.handle(request, caller, &mut made).await;
+            // #201: a request can wait on this Marv's person (`marv/wire`, `marv/connect`). A caller that hangs up
+            // (it gave up, or its turn was stopped) or the door closing ends that wait, which withdraws the prompt:
+            // the approver's future is dropped. `fill_buf` only peeks, so a next request already sent stays read.
+            let response = tokio::select! {
+                response = self.handle(request, caller, &mut made) => response,
+                () = hung_up(&mut read) => break,
+                _ = cancel.cancelled() => break,
+            };
             if write.write_all(encode_line(&Message::Response(response)).as_bytes()).await.is_err() {
                 break;
             }
@@ -549,7 +564,10 @@ impl Door {
         }
         let plug_id = peer_plug(from)?;
         let request = WireRequest { from: plug_id.clone(), to, mode, asked_by: plug_id.clone() };
-        let Some(by_here) = self.approver.approve_wire(request.clone()).await else {
+        // Bounded like the caller's wait (#201): a prompt nobody answers is withdrawn, not left for later.
+        let answer = tokio::time::timeout(self.sb.wire_wait(), self.approver.approve_wire(request.clone())).await;
+        let Ok(answer) = answer else { return Ok(json!({"granted": false, "unanswered": true})) };
+        let Some(by_here) = answer else {
             return Ok(json!({"granted": false}));
         };
         let plug = self.sb.plug(plug_id)?;
@@ -581,11 +599,34 @@ impl Door {
     }
 }
 
+/// Resolves once `read` is at its end: the caller hung up (or its connection broke). Never while it's still there,
+/// even with a request already sent: that's left in the buffer for the next read.
+async fn hung_up(read: &mut BufReader<OwnedReadHalf>) {
+    match read.fill_buf().await {
+        Ok([]) | Err(_) => {}
+        Ok(_) => std::future::pending().await,
+    }
+}
+
+/// A wait in words, for a message: "3 minutes", "1 minute", "45 seconds", "200 ms".
+fn words(wait: Duration) -> String {
+    let secs = wait.as_secs();
+    match secs {
+        0 => format!("{} ms", wait.as_millis()),
+        60 => "1 minute".into(),
+        s if s % 60 == 0 => format!("{} minutes", s / 60),
+        1 => "1 second".into(),
+        s => format!("{s} seconds"),
+    }
+}
+
 /// Finds `peer.<session>.agent.<agent>.inbox`: a live Marv named `<session>` in the folder that has that agent.
 pub struct PeerResolver {
     pub dir: PathBuf,
     /// This switchboard's own name: never a peer of itself.
     pub own: String,
+    /// How long a new wire waits for the far Marv's person ([`WIRE_ANSWER_WAIT`]).
+    pub wait: Duration,
 }
 
 #[async_trait]
@@ -611,7 +652,8 @@ impl Resolve for PeerResolver {
             modes: vec![WireMode::Send],
             input_schema: template.input_schema,
         };
-        let link = PeerLink { dir: self.dir.clone(), own: self.own.clone(), session, remote, socket: Mutex::default() };
+        let link =
+            PeerLink { dir: self.dir.clone(), own: self.own.clone(), session, remote, wait: self.wait, socket: Mutex::default() };
         Some((receptacle, Arc::new(link)))
     }
 }
@@ -623,6 +665,8 @@ pub struct PeerLink {
     pub own: String,
     pub session: String,
     pub remote: ReceptacleName,
+    /// How long the far Marv's person gets to answer a new wire ([`WIRE_ANSWER_WAIT`]).
+    pub wait: Duration,
     /// The far end's plug socket for this Marv, once its user approved.
     socket: Mutex<Option<PathBuf>>,
 }
@@ -641,12 +685,25 @@ impl Service for PeerLink {
     }
 
     /// Asks the far Marv's door; its user decides. Every plug of this Marv reaches it as `peer-<own>`: which of them
-    /// may is this end's wire table's business.
+    /// may is this end's wire table's business. Waits [`Self::wait`] at most (#201): then the connection is dropped,
+    /// which withdraws the far prompt, and the caller reads that nobody answered. Dropped sooner (the turn stopped),
+    /// the same happens.
     async fn approve_remote(&self, _from: &PlugId, mode: WireMode, local: Approver) -> Option<Result<Approver>> {
+        let unanswered = || {
+            MeshError::Io(format!(
+                "the Marv \"{}\"'s person didn't answer within {}: no wire was made",
+                self.session,
+                words(self.wait)
+            ))
+        };
         let ask = async {
             let socket = session_socket(&self.dir, &self.session).ok_or_else(|| MeshError::BadName(self.session.clone()))?;
             let mut door = DoorClient::connect(&socket).await?;
-            let answer = door.request(WIRE, json!({"from": self.own, "to": self.remote, "mode": mode, "by": local})).await?;
+            let request = door.request(WIRE, json!({"from": self.own, "to": self.remote, "mode": mode, "by": local}));
+            let answer = tokio::time::timeout(self.wait, request).await.map_err(|_| unanswered())??;
+            if answer.get("unanswered").and_then(Value::as_bool) == Some(true) {
+                return Err(unanswered());
+            }
             if answer.get("granted").and_then(Value::as_bool) != Some(true) {
                 return Err(MeshError::Io(format!("the Marv \"{}\" didn't wire it: its user said no", self.session)));
             }
@@ -946,6 +1003,93 @@ mod tests {
         assert!(door.request(CONNECT, json!({"from": "parent", "to": "peer.beta.agent.x.inbox", "mode": "send"})).await.is_err());
         assert!(door.request(CONNECT, json!({"from": "parent", "to": "agent.worker-1.inbox", "mode": "call"})).await.is_err());
         assert_eq!(pa.asked().len(), 2);
+    }
+
+    /// A person who's away (#201): asked, never answers; counts the asks and the ones withdrawn (the wait dropped).
+    #[derive(Default)]
+    struct Away {
+        asked: tokio::sync::Notify,
+        withdrawn: Arc<tokio::sync::Notify>,
+        count: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    struct Withdrawn(Arc<tokio::sync::Notify>, Arc<std::sync::atomic::AtomicUsize>);
+    impl Drop for Withdrawn {
+        fn drop(&mut self) {
+            self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.0.notify_one();
+        }
+    }
+    #[async_trait]
+    impl PeerApprover for Away {
+        async fn approve_wire(&self, _request: WireRequest) -> Option<Approver> {
+            let _gone = Withdrawn(self.withdrawn.clone(), self.count.clone());
+            self.asked.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    fn away_marv(session: &str, mesh: &Path, away: Arc<Away>, wait: Duration) -> (Arc<Switchboard>, DoorGuard, Runtime) {
+        let runtime = Runtime::new();
+        let sb = Arc::new(Switchboard::new(session, runtime.0.clone(), Arc::new(Log::default())));
+        sb.plug(id("parent")).unwrap();
+        sb.set_wire_wait(wait);
+        let info = DoorInfo { cwd: PathBuf::from("/work"), pane: None };
+        let door = open_door(sb.clone(), mesh, info, away).unwrap();
+        (sb, door, runtime)
+    }
+
+    /// #201: a caller that hangs up while the far person's prompt waits (its turn was stopped, or it gave up) takes
+    /// the prompt with it: the door stops waiting, and nothing is plugged or wired there.
+    #[tokio::test]
+    async fn a_caller_hanging_up_withdraws_the_far_prompt() {
+        let mesh = Runtime::new();
+        let _alpha = marv("alpha", &mesh.0, Person::new(Some(Approver::Tui)));
+        let away = Arc::new(Away::default());
+        let (beta, _door, _rt) = away_marv("beta", &mesh.0, away.clone(), Duration::from_secs(3600));
+        let mut door = DoorClient::connect(&mesh.0.join("beta.sock")).await.unwrap();
+        let (asked, withdrawn) = (away.asked.notified(), away.withdrawn.notified());
+        let ask = json!({"from": "alpha", "to": "agent.parent.inbox", "mode": "send", "by": "tui"});
+        tokio::select! {
+            _ = door.request(WIRE, ask) => panic!("nobody answered"),
+            () = asked => {}
+        }
+        drop(door);
+        tokio::time::timeout(Duration::from_secs(30), withdrawn).await.expect("withdrawn when the caller hung up");
+        assert_eq!(away.count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(beta.table().all().is_empty());
+        assert!(!beta.has_plug(&id("peer-alpha")));
+    }
+
+    /// #201: the far door doesn't wait for its person forever either. After the wait, the prompt is withdrawn and the
+    /// caller reads that nobody answered (not that the person said no).
+    #[tokio::test]
+    async fn the_far_door_withdraws_a_prompt_nobody_answers() {
+        let mesh = Runtime::new();
+        let alpha = marv("alpha", &mesh.0, Person::new(Some(Approver::Tui)));
+        let away = Arc::new(Away::default());
+        let (beta, _door, _rt) = away_marv("beta", &mesh.0, away.clone(), Duration::from_millis(200));
+        // The far door answers first: its "unanswered" reads as nobody answering.
+        let mut door = DoorClient::connect(&mesh.0.join("beta.sock")).await.unwrap();
+        let ask = json!({"from": "alpha", "to": "agent.parent.inbox", "mode": "send", "by": "tui"});
+        let answer = tokio::time::timeout(Duration::from_secs(30), door.request(WIRE, ask)).await.unwrap().unwrap();
+        assert_eq!(answer, json!({"granted": false, "unanswered": true}));
+        assert_eq!(away.count.load(std::sync::atomic::Ordering::SeqCst), 1, "withdrawn");
+        // Through alpha's switchboard (whose own wait is minutes): the far door's answer ends it, in the same words.
+        let to_b = name("peer.beta.agent.parent.inbox");
+        alpha.sb.lookup(&to_b).await.unwrap();
+        let ask = WireRequest { from: id("parent"), to: to_b, mode: WireMode::Send, asked_by: id("parent") };
+        let err = tokio::time::timeout(Duration::from_secs(30), alpha.sb.grant(ask, Approver::Tui)).await.unwrap().unwrap_err();
+        assert!(err.to_string().starts_with("the Marv \"beta\"'s person didn't answer within "), "{err}");
+        assert!(alpha.sb.table().all().is_empty() && beta.table().all().is_empty());
+        assert!(!beta.has_plug(&id("peer-alpha")));
+    }
+
+    #[test]
+    fn waits_in_words() {
+        assert_eq!(words(WIRE_ANSWER_WAIT), "3 minutes");
+        assert_eq!(words(Duration::from_secs(60)), "1 minute");
+        assert_eq!(words(Duration::from_secs(45)), "45 seconds");
+        assert_eq!(words(Duration::from_millis(200)), "200 ms");
     }
 
     #[tokio::test]

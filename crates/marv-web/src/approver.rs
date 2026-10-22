@@ -75,6 +75,7 @@ impl Approver for WebApprover {
             self.pending().remove(&id);
             return Decision::Unavailable;
         }
+        let _withdraw = Withdraw(self, id);
         let decision = answered.await.unwrap_or(Decision::No);
         // A decline with a reason (#185) is "declined" on the page, the reason with it (the person's own text).
         let done = match &decision {
@@ -83,6 +84,17 @@ impl Approver for WebApprover {
         };
         let _ = self.out.send(done);
         decision
+    }
+}
+
+/// #201: the wait for request `id` was dropped unanswered (another Marv asked for a wire, then hung up; a stopped
+/// turn): the page is told it's `withdrawn`, so no card is left waiting for an answer nobody reads.
+struct Withdraw<'a>(&'a WebApprover, u64);
+impl Drop for Withdraw<'_> {
+    fn drop(&mut self) {
+        if self.0.pending().remove(&self.1).is_some() {
+            let _ = self.0.out.send(json!({"type": "approval_done", "id": self.1, "decision": "withdrawn"}));
+        }
     }
 }
 
@@ -143,6 +155,26 @@ mod tests {
         approver.answer(shown["id"].as_u64().unwrap(), Decision::Always);
         assert_eq!(asking.await.unwrap(), Decision::Always);
         assert_eq!(page.recv().await.unwrap()["type"], "approval_done");
+    }
+
+    /// #201: a request whose wait is dropped unanswered (another Marv asked for a wire, then hung up) is withdrawn on
+    /// the page, and nothing is left waiting; a late answer to it is ignored.
+    #[tokio::test]
+    async fn a_dropped_request_is_withdrawn_on_the_page() {
+        let (out, mut page) = tokio::sync::mpsc::unbounded_channel();
+        let approver = Arc::new(WebApprover::new(out));
+        let asking = tokio::spawn({
+            let approver = approver.clone();
+            async move { approver.approve(request(true)).await }
+        });
+        let id = page.recv().await.unwrap()["id"].as_u64().unwrap();
+        assert!(approver.waiting());
+        asking.abort();
+        let done = page.recv().await.unwrap();
+        assert_eq!(done, json!({"type": "approval_done", "id": id, "decision": "withdrawn"}));
+        assert!(!approver.waiting(), "nothing left waiting");
+        approver.answer(id, Decision::Yes);
+        assert!(page.try_recv().is_err(), "a late answer changes nothing");
     }
 
     #[tokio::test]

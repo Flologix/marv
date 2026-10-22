@@ -516,11 +516,16 @@ impl MeshTool {
     }
 
     async fn grant(&self, request: WireRequest, by: WireBy) -> Result<(), String> {
+        let mode = request.mode;
         match self.mesh.grant(request, by).await {
             Ok(()) => Ok(()),
-            // A self-wire leaves it unwired, and the switchboard says so; the far end saying no is said here.
+            // A self-wire leaves it unwired, and the switchboard says so; the far end saying no (or not answering,
+            // #201) is said here, and that nothing went.
             Err(marv_mesh::MeshError::SelfWire(_)) => Ok(()),
-            Err(err) => Err(err.to_string()),
+            Err(err) => Err(match mode {
+                WireMode::Send => format!("{err}, so the message wasn't sent."),
+                _ => format!("{err}, so the call wasn't made."),
+            }),
         }
     }
 }
@@ -645,16 +650,27 @@ impl Tool for MeshTool {
             _ = ctx.cancel.cancelled() => return Some(Ok(Decision::No)),
         };
         Some(match answer {
-            CallWire::Granted(by) => self.grant(request, by).await.map(|()| Decision::Yes).map_err(ToolError::new),
+            // #201: granting a wire to another Marv waits for that Marv's person, who may be away. A stop ends that
+            // wait too (dropping it hangs up on the far door, which withdraws its prompt): no, and the registry reads
+            // the stop as an interrupt.
+            CallWire::Granted(by) => tokio::select! {
+                granted = self.grant(request, by) => granted.map(|()| Decision::Yes).map_err(ToolError::new),
+                _ = ctx.cancel.cancelled() => Ok(Decision::No),
+            },
             CallWire::Refused(decision) => Ok(decision),
         })
     }
     async fn run(&self, input: &Self::Input, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let target = self.target(input);
-        if let Some((receptacle, mode)) = &target
-            && let Err(err) = self.ask_for_wire(receptacle, *mode).await
-        {
-            return Ok(ToolOutput::error(err));
+        if let Some((receptacle, mode)) = &target {
+            // #201: the far end's person may never answer; a stop ends the wait (and withdraws their prompt).
+            let asked = tokio::select! {
+                asked = self.ask_for_wire(receptacle, *mode) => asked,
+                _ = ctx.cancel.cancelled() => Err(marv_tools::INTERRUPTED.to_string()),
+            };
+            if let Err(err) = asked {
+                return Ok(ToolOutput::error(err));
+            }
         }
         let wireable = if self.name == MESH_LIST {
             self.wireable(&ctx.cancel).await
@@ -998,13 +1014,19 @@ mod tests {
     }
 
     fn marv_on(name: &str, folder: &std::path::Path, person: &Arc<Person>) -> Marv {
+        marv_on_waiting(name, folder, person.clone(), marv_mesh::discovery::WIRE_ANSWER_WAIT)
+    }
+
+    /// [`marv_on`] with any person, and new wires to or from it waiting `wait` for the far person (#201).
+    fn marv_on_waiting(name: &str, folder: &std::path::Path, person: Arc<dyn Approver>, wait: std::time::Duration) -> Marv {
         use marv_mesh::discovery::{DoorInfo, open_door};
         let rt = Runtime(std::env::temp_dir().join(format!("ms-{name}-{}-{}", std::process::id(), marv_fs::random_hex())));
         let mesh = Arc::new(Switchboard::new(name, rt.0.clone(), Arc::new(Log::default())));
+        mesh.set_wire_wait(wait);
         let cancel = CancellationToken::new();
         tokio::spawn(Arc::clone(&mesh).serve(cancel.clone()));
         let parent = mesh.plug(parent_id()).unwrap();
-        let wires = wire_approver(None, Some(&(person.clone() as Arc<dyn Approver>))).unwrap();
+        let wires = wire_approver(None, Some(&person)).unwrap();
         let info = DoorInfo { cwd: format!("/{name}").into(), pane: None };
         let door = open_door(mesh.clone(), folder, info, Arc::new(DoorWires(wires.clone()))).unwrap();
         let mut ctx = ToolContext::new(std::env::temp_dir());
@@ -1062,6 +1084,93 @@ mod tests {
         send_as(&alpha, "peer.beta.agent.parent.inbox", "ok").await;
         assert_eq!(titles(&pa)[2], "Send a message to peer.beta.agent.parent.inbox");
         assert_eq!((pa.1.lock().unwrap().len(), pb.1.lock().unwrap().len()), (3, 3));
+    }
+
+    /// A person who's away (#201): every prompt is shown and never answered. It counts the prompts shown and the ones
+    /// withdrawn (the wait for its answer dropped), and says when each happens.
+    #[derive(Default)]
+    struct Away {
+        shown: AtomicUsize,
+        withdrawn: Arc<AtomicUsize>,
+        asked: tokio::sync::Notify,
+        gone: Arc<tokio::sync::Notify>,
+    }
+    struct Withdrawn(Arc<AtomicUsize>, Arc<tokio::sync::Notify>);
+    impl Drop for Withdrawn {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            self.1.notify_one();
+        }
+    }
+    #[async_trait]
+    impl Approver for Away {
+        async fn approve(&self, _request: ApprovalRequest) -> Decision {
+            let _withdrawn = Withdrawn(self.withdrawn.clone(), self.gone.clone());
+            self.shown.fetch_add(1, Ordering::SeqCst);
+            self.asked.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    /// alpha (whose person says yes) and beta (whose person is away), on one mesh folder; beta's door waits `wait`.
+    fn alpha_and_away_beta(tag: &str, wait: std::time::Duration) -> (Runtime, Marv, Arc<Away>, Marv) {
+        let folder = Runtime(std::env::temp_dir().join(format!("ms-{tag}-{}-{}", std::process::id(), marv_fs::random_hex())));
+        let pa = Arc::new(Person(Decision::Yes, Mutex::default()));
+        let away = Arc::new(Away::default());
+        let alpha = marv_on_waiting("alpha", &folder.0, pa as Arc<dyn Approver>, wait);
+        let beta = marv_on_waiting("beta", &folder.0, away.clone() as Arc<dyn Approver>, wait);
+        (folder, alpha, away, beta)
+    }
+
+    /// #201: the user approved the one prompt, and the far Marv's person never answers. A stop ends the wait at once:
+    /// the call is interrupted (not left hanging until the app is force-quit), nothing is wired or sent, and the far
+    /// end's prompt is withdrawn.
+    #[tokio::test]
+    async fn a_stop_while_the_far_person_is_away_interrupts_the_send_and_withdraws_their_prompt() {
+        let (_folder, alpha, away, beta) = alpha_and_away_beta("stop201", std::time::Duration::from_secs(3600));
+        let stop = alpha.ctx.cancel.clone();
+        let asked = away.asked.notified();
+        let gone = away.gone.notified();
+        let out = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            tokio::join!(send_as(&alpha, "peer.beta.agent.parent.inbox", "are you there?"), async {
+                asked.await;
+                stop.cancel();
+            })
+            .0
+        })
+        .await
+        .expect("a stop ends the wait for the far end");
+        assert!(out.result.declined, "{}", out.result.output);
+        assert_eq!(out.result.output, marv_tools::INTERRUPTED);
+        assert!(alpha.mesh.table().all().is_empty() && beta.mesh.table().all().is_empty());
+        assert!(beta.mesh.drain_inbox(&parent_id()).is_empty());
+        // alpha hung up: beta's door stops waiting, and its person's prompt goes.
+        tokio::time::timeout(std::time::Duration::from_secs(30), gone).await.expect("the far prompt is withdrawn");
+        assert_eq!((away.shown.load(Ordering::SeqCst), away.withdrawn.load(Ordering::SeqCst)), (1, 1));
+        assert!(!beta.mesh.has_plug(&marv_mesh::PlugId::new("peer-alpha").unwrap()));
+    }
+
+    /// #201: nobody answers at the far end within the wait. The model reads, in Marv's words, that the other Marv's
+    /// person didn't answer and the message wasn't sent; the far prompt is withdrawn and nothing is wired.
+    #[tokio::test]
+    async fn a_far_person_who_never_answers_ends_the_send_after_the_wait() {
+        let (_folder, alpha, away, beta) = alpha_and_away_beta("wait201", std::time::Duration::from_millis(300));
+        let gone = away.gone.notified();
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            send_as(&alpha, "peer.beta.agent.parent.inbox", "are you there?"),
+        )
+        .await
+        .expect("the wait is bounded");
+        assert!(out.result.is_error && !out.result.declined, "{}", out.result.output);
+        assert_eq!(
+            out.result.output,
+            "the Marv \"beta\"'s person didn't answer within 300 ms: no wire was made, so the message wasn't sent."
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(30), gone).await.expect("the far prompt is withdrawn");
+        assert_eq!((away.shown.load(Ordering::SeqCst), away.withdrawn.load(Ordering::SeqCst)), (1, 1));
+        assert!(alpha.mesh.table().all().is_empty() && beta.mesh.table().all().is_empty());
+        assert!(beta.mesh.drain_inbox(&parent_id()).is_empty());
     }
 
     /// #77: saying no to the one prompt approves neither the call nor the wire: nothing is wired or sent, and the model

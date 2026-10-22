@@ -269,8 +269,10 @@ function Approval({
   // (`reason`): the engine says which.
   const [why, setWhy] = useState<string | null>(null);
   if (decision) {
-    const no = decision === "no" || decision === "declined";
-    const word = no ? "declined" : decision === "always" ? "allowed for this chat" : "allowed";
+    // #201: "withdrawn" is a request nobody waits for any more (another Marv asked for a wire, then hung up).
+    const no = decision === "no" || decision === "declined" || decision === "withdrawn";
+    const word =
+      decision === "withdrawn" ? "no longer asked" : no ? "declined" : decision === "always" ? "allowed for this chat" : "allowed";
     return (
       <p className={`decided${no ? " no" : ""}`}>
         {word} · <span>{r.command ?? r.label}</span>
