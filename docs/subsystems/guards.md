@@ -52,6 +52,15 @@ Each guard's doc comment says how it was proven: the guard was reverted, and the
 | A tainted compaction's summary says so in fixed words | `untrusted_text.rs::a_tainted_compaction_says_so_in_fixed_words` | Proven |
 | `/clear` ends the cleared conversation's taint | `untrusted_text.rs::clear_ends_the_cleared_conversations_taint` | Proven |
 | No suggestion after GitHub or networked output | `untrusted_text.rs::suggestions_stay_off_after_github_or_network_output` | Proven |
+| An unsandboxed command's output is network output | `untrusted_text.rs::an_unsandboxed_commands_output_is_network_output` | Proven (two locks: both reverted) |
+| An outside tool's own error is fenced and taints | `untrusted_text.rs::an_outside_tools_own_error_is_fenced_and_taints` | Proven |
+| Closing tags with invisible or lookalike characters are defused | `untrusted_text.rs::closing_tags_hidden_by_invisible_characters_are_defused` | Proven |
+| A subfolder instruction file counts only once its contents are trusted | `untrusted_text.rs::a_subfolder_instruction_file_counts_only_once_its_contents_are_trusted` | Proven |
+| A trusted skill's changed file is quoted | `untrusted_text.rs::a_trusted_skills_file_that_changed_since_is_quoted` | Proven |
+| A resumed conversation is tainted by what its calls show | `untrusted_text.rs::a_resumed_conversation_is_tainted_by_what_its_calls_show` | Proven |
+| A subagent's taint reaches its parent; its report is fenced | `untrusted_text.rs::a_subagents_taint_reaches_its_parent_and_its_report_is_fenced` | Proven (two reverts) |
+| The session's own tools declare their sources | `untrusted_text.rs::the_session_tools_declare_their_sources_too` | Proven |
+| `marv -p` never writes a memory in a tainted run | `headless_taint.rs::headless_never_writes_a_memory_in_a_tainted_run` | Proven |
 | Tainted: network bash asks | `provenance.rs::tainted_network_bash_must_ask` | Proven |
 | Tainted: every MCP call asks, `readOnlyHint` too | `provenance.rs::tainted_mcp_calls_ask_even_read_only_ones` | Proven (two locks: both reverted) |
 | Tainted: web requests to a new prefix; "always" covers a prefix, not the site | `provenance.rs::tainted_web_fetch_to_a_new_prefix_asks` | Proven (#5; three reverts) |
