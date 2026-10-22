@@ -64,9 +64,9 @@ is asked every time, even in yolo, and so is any call to the network once the co
 | `edit_file {"new_string":"b","old_string":"a","path":"src/main.rs"}` | asks | asks | every time | every time | asks | no | project (workspace) | no | - |
 | `write_file {"content":"hi","path":"notes.txt"}` | asks | asks | every time | every time | asks | no | project (workspace) | no | - |
 | `write_file {"content":"true","path":".git/hooks/pre-commit"}` | asks | asks | every time | every time | asks | no | project (workspace) | no | - |
-| `bash {"command":"cargo test"}` | asks | asks | every time | every time | asks | no | project (workspace) | no | - |
+| `bash {"command":"cargo test"}` | asks | asks | every time | every time | asks | yes | network (outside) | no | - |
 | `bash {"command":"cargo fetch","network":true}` | asks | asks | every time | every time | asks | yes | network (outside) | no | - |
-| `bash {"command":"git commit -m x","git_write":true}` | asks | asks | every time | every time | asks | no | project (workspace) | no | - |
+| `bash {"command":"git commit -m x","git_write":true}` | asks | asks | every time | every time | asks | yes | network (outside) | no | - |
 | `process {"action":"start","command":"npm run dev"}` | asks | asks | every time | every time | refused | no | project (workspace) | no | process |
 | `process {"action":"start","command":"npm run dev","network":true}` | asks | asks | every time | every time | refused | yes | network (outside) | no | process |
 | `process {"action":"list"}` | never | never | never | never | refused | no | project (workspace) | no | - |

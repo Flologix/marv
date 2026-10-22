@@ -100,12 +100,12 @@ write_file {"content":"true","path":".git/hooks/pre-commit"}
   subagent of woken  must once must once must once must once
 
 bash {"command":"cargo test"}
-  person             ask       ask       ask       ask
-  headless           ask       ask       ask       ask
-  woken              once      once      once      once
-  radio              once      once      once      once
-  subagent           ask       ask       ask       ask
-  subagent of woken  once      once      once      once
+  person             ask       ask       must      must
+  headless           ask       ask       must      must
+  woken              once      once      must once must once
+  radio              once      once      must once must once
+  subagent           ask       ask       must      must
+  subagent of woken  once      once      must once must once
 
 bash {"command":"cargo fetch","network":true}
   person             ask       ask       must      must
@@ -116,12 +116,12 @@ bash {"command":"cargo fetch","network":true}
   subagent of woken  once      once      must once must once
 
 bash {"command":"git commit -m x","git_write":true}
-  person             ask       ask       ask       ask
-  headless           ask       ask       ask       ask
-  woken              once      once      once      once
-  radio              once      once      once      once
-  subagent           ask       ask       ask       ask
-  subagent of woken  once      once      once      once
+  person             ask       ask       must      must
+  headless           ask       ask       must      must
+  woken              once      once      must once must once
+  radio              once      once      must once must once
+  subagent           ask       ask       must      must
+  subagent of woken  once      once      must once must once
 
 process {"action":"start","command":"npm run dev"}
   person             ask       ask       ask       ask
