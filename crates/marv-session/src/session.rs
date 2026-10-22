@@ -2294,8 +2294,9 @@ impl MarvSession {
         let s = self.state();
         match (s.compaction, &s.saved.summary) {
             (Version::V1, _) => SummaryKind::V1,
-            (Version::V2, Some(_)) => SummaryKind::Rolling,
-            (Version::V2, None) => SummaryKind::Full,
+            // Only a v2 summary is updated: a v1 one (v2 just switched on) has none of the template's sections.
+            (Version::V2, Some(_)) if s.saved.summary_v2 => SummaryKind::Rolling,
+            (Version::V2, _) => SummaryKind::Full,
         }
     }
 
@@ -2573,6 +2574,7 @@ impl MarvSession {
             s.last = None;
             if let Some(summary) = summary {
                 s.saved.summary = Some(summary);
+                s.saved.summary_v2 = s.compaction == marv_agent::compact::Version::V2;
             }
         }
         lock(&self.inner.loaded).clear();
@@ -5480,6 +5482,31 @@ mod turn_tests {
         assert!(text_of(rolling.last().unwrap()).starts_with(marv_agent::compact::ROLLING_INSTRUCTIONS));
         assert!(resumed.state().saved.summary.as_deref().is_some_and(|s| s.contains("second")));
         assert_alternating(&provider.requests());
+    }
+
+    #[tokio::test]
+    async fn switching_from_v1_to_v2_starts_with_a_full_summary() {
+        let dirs = Dirs::new();
+        let sessions = Arc::new(SessionStore::new(dirs.dir.join("sessions")));
+        let provider = Scripted::new(vec![say("Answer."), say("V1 SUMMARY"), say("Answer two."), say(&structured("v2"))]);
+        let v1 = scripted(&dirs, &provider, |i| i.sessions = Some(sessions.clone()));
+        collect(go(&v1, "first")).await;
+        assert!(matches!(v1.compact(None).await.unwrap(), CompactResult::Compacted { .. }));
+        v1.flush().await;
+        let switched = scripted(&dirs, &provider, |i| {
+            v2(i);
+            i.compact_tail_tokens = Some(0);
+            i.sessions = Some(sessions.clone());
+        });
+        switched.resume(ResumeTarget::Id(v1.id())).await.unwrap().unwrap();
+        collect(go(&switched, "second")).await;
+        switched.compact(None).await.unwrap();
+        let request = &provider.requests()[3].0;
+        let last = text_of(request.last().unwrap());
+        assert!(
+            last.contains(marv_agent::compact::FULL_INSTRUCTIONS) && !last.contains(marv_agent::compact::ROLLING_INSTRUCTIONS)
+        );
+        assert!(switched.state().saved.summary_v2);
     }
 
     #[tokio::test]

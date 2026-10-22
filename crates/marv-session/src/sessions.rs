@@ -70,6 +70,10 @@ pub struct SavedSession {
     /// from the conversation's text).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    /// #63 review: the summary follows the v2 template, so a v2 compaction may update it (rolling). A v1 summary (or one
+    /// from an older file) is summarized from scratch when v2 is switched on.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub summary_v2: bool,
 }
 
 /// A saved session's checkpoint chain and its turns' reported paths (#16).
@@ -162,6 +166,7 @@ pub fn new_session(root: &Path, provider: &str, model: &str, now_ms: u64) -> Sav
         taint: None,
         radio_requests: None,
         summary: None,
+        summary_v2: false,
     }
 }
 
