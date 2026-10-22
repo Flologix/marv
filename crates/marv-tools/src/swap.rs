@@ -346,8 +346,10 @@ pub fn clean_swaps(folder: &Path, keep: std::time::Duration, current: Option<&st
             .or(meta.modified().ok())
             .unwrap_or(now);
         let old = now.duration_since(newest).is_ok_and(|age| age > keep);
+        // A live session holds its folder (`output::hold`): its pages stay, even before its first save (no session
+        // file yet) and however long it's been idle.
         if orphan || old {
-            let _ = std::fs::remove_dir_all(&path);
+            crate::output::remove_unless_held(&path);
         }
     }
 }
@@ -355,15 +357,23 @@ pub fn clean_swaps(folder: &Path, keep: std::time::Duration, current: Option<&st
 /// Takes a page back out (its compaction didn't happen): its file and its table entry. Errors are ignored: a page
 /// left over is only an extra page.
 pub async fn remove_page(dir: &Path, page: u32) {
-    let _ = std::fs::remove_file(page_file(dir, page));
-    let mut table = read_table(dir);
-    let before = table.len();
-    table.retain(|p| p.page != page);
-    if table.len() != before
-        && let Ok(text) = serde_json::to_string(&table)
-    {
-        let _ = marv_fs::write_private(&dir.join(PAGE_TABLE), &text).await;
+    if check_dir(dir).is_err() {
+        return;
     }
+    let table_file = dir.join(PAGE_TABLE);
+    // Under the same lock as `save_page`: another Marv's page saved meanwhile stays in the table.
+    let work = || async {
+        let _ = std::fs::remove_file(page_file(dir, page));
+        let mut table = read_table(dir);
+        let before = table.len();
+        table.retain(|p| p.page != page);
+        if table.len() != before
+            && let Ok(text) = serde_json::to_string(&table)
+        {
+            let _ = marv_fs::write_private(&table_file, &text).await;
+        }
+    };
+    let _ = marv_fs::with_file_lock(&table_file, marv_fs::LockOptions::default(), work).await;
 }
 
 #[cfg(test)]
@@ -508,6 +518,12 @@ pub(crate) mod tests {
         let left: Vec<bool> =
             ["live", "kept", "orphan", "old"].iter().map(|id| dir.path().join(format!("{id}.swap")).exists()).collect();
         assert_eq!(left, [true, false, false, false]);
+        // A held folder stays, orphaned or old: a live session's (before its first save, or idle for days).
+        let dir = TempDir::new("swap-clean-held");
+        std::fs::create_dir_all(dir.path().join("first.swap")).unwrap();
+        let _hold = crate::output::hold(&dir.path().join("first.swap")).unwrap();
+        clean_swaps(dir.path(), day, None, now + 30 * day);
+        assert!(dir.path().join("first.swap").exists());
         let dir = TempDir::new("swap-clean-fresh");
         std::fs::create_dir_all(dir.path().join("a.swap")).unwrap();
         std::fs::write(dir.path().join("a.json"), "{}").unwrap();

@@ -778,6 +778,9 @@ struct Inner {
     /// The hold on this session's saved-outputs folder (#61): the store's cleanup, here or in another Marv, never
     /// deletes it while the session lives. Moved to the resumed session's folder on a resume.
     tool_output_hold: Mutex<Option<marv_tools::output::LiveFolder>>,
+    /// The hold on this conversation's swap folder (#63 review): taken at its first page, and on a resume of a
+    /// conversation that has pages, so another Marv's cleanup never deletes a live session's pages.
+    swap_hold: Mutex<Option<(PathBuf, marv_tools::output::LiveFolder)>>,
     /// The store's cleanup has run (#61): once, at the first turn, when a resume has already set the id.
     tool_output_cleaned: std::sync::atomic::AtomicBool,
     /// Built once: every request sends byte-identical tool definitions.
@@ -1171,6 +1174,7 @@ impl MarvSession {
             radio_hop: Arc::default(),
             state: Mutex::new(state),
             tool_output_hold: Mutex::default(),
+            swap_hold: Mutex::default(),
             tool_output_cleaned: Default::default(),
             init,
         };
@@ -1216,6 +1220,11 @@ impl MarvSession {
     /// Holds the current id's saved-outputs folder (#61), letting go of the one held before (a resume's). A hold that
     /// fails only leaves the folder to the usual cleanup.
     fn hold_tool_output(&self) {
+        // The swap folder too: let go of the one left behind, hold the current one if it has pages.
+        *lock(&self.inner.swap_hold) = None;
+        if self.swap_dir().is_some_and(|d| std::fs::symlink_metadata(&d).is_ok_and(|m| m.is_dir())) {
+            self.hold_swap();
+        }
         let Some(dir) = &self.inner.init.tool_output_dir else { return };
         let held = marv_tools::output::hold(&dir.join(self.id())).ok();
         *lock(&self.inner.tool_output_hold) = held;
@@ -2505,6 +2514,8 @@ impl MarvSession {
             .into_iter()
             .map(|(index, turn)| marv_tools::swap::PagedTurn { index, provenance: self.paged_provenance(&turn), turn })
             .collect();
+        // Held before the first page goes in, so no cleanup takes it before the session file exists.
+        self.hold_swap();
         let facts = self.page_facts(&paged);
         let entry =
             marv_tools::swap::save_page(&dir, &paged, |page| marv_tools::swap::page_entry(page, &paged, trigger.as_str(), facts))
@@ -2552,6 +2563,19 @@ impl MarvSession {
             }
         }
         facts
+    }
+
+    /// Holds this conversation's swap folder (made if missing; never through a symlink) for as long as it's current.
+    fn hold_swap(&self) {
+        let Some(dir) = self.swap_dir() else { return };
+        let mut held = lock(&self.inner.swap_hold);
+        if held.as_ref().is_some_and(|(d, _)| *d == dir) {
+            return;
+        }
+        if std::fs::symlink_metadata(&dir).is_ok_and(|m| !m.is_dir()) {
+            return;
+        }
+        *held = marv_tools::output::hold(&dir).ok().map(|h| (dir, h));
     }
 
     /// Takes back a page whose compaction didn't happen (its summary failed): the history still holds its turns.
@@ -5643,6 +5667,23 @@ mod turn_tests {
             assert_eq!(std::fs::metadata(&swap).unwrap().permissions().mode() & 0o777, 0o700);
         }
         assert_alternating(&provider.requests());
+    }
+
+    #[tokio::test]
+    async fn a_live_sessions_pages_are_held_against_another_marvs_cleanup() {
+        let dirs = Dirs::new();
+        let sessions = Arc::new(SessionStore::new(dirs.dir.join("sessions")));
+        let provider = Scripted::new(vec![say("Answer."), say("THE SUMMARY")]);
+        let session = scripted(&dirs, &provider, |i| i.sessions = Some(sessions.clone()));
+        collect(go(&session, "first")).await;
+        assert!(matches!(session.compact(None).await.unwrap(), CompactResult::Compacted { .. }));
+        let swap = marv_tools::swap::swap_dir(&sessions.file(&dirs.project, &session.id()));
+        // As another Marv's cleanup would, with the session file not written yet and the pages "old".
+        let _ = std::fs::remove_file(sessions.file(&dirs.project, &session.id()));
+        let day = std::time::Duration::from_secs(86_400);
+        marv_tools::swap::clean_swaps(swap.parent().unwrap(), day, None, std::time::SystemTime::now() + 30 * day);
+        assert!(marv_tools::swap::read_page(&swap, 1).is_some(), "held: kept");
+        session.close().await;
     }
 
     #[tokio::test]

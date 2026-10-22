@@ -204,7 +204,8 @@ pub fn hold(dir: &Path) -> std::io::Result<LiveFolder> {
 
 /// Deletes a session's folder unless a live session holds it ([`hold`]); the exclusive lock is kept while deleting,
 /// so a session starting to hold it waits and makes it again. Whether it was deleted.
-fn remove_unless_held(dir: &Path) -> bool {
+/// Removes `dir` unless a live session holds it ([`hold`]); `true` when it's gone. Also for saved pages' folders.
+pub fn remove_unless_held(dir: &Path) -> bool {
     let live = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
