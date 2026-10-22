@@ -271,7 +271,7 @@ pub struct SessionInit {
     pub reasoning_effort: Option<marv_provider::ReasoningEffort>,
     /// Marv's version, for trajectories.
     pub version: String,
-    /// The instruction files, as they go into the prompt (`instructions::load_instructions`, which gives each its
+    /// The instruction files, as they go into the prompt (`project_trust::load_project`, which gives each its
     /// heading); plain text of your own goes under "# Project instructions (from AGENTS.md)".
     pub instructions: Option<String>,
     /// Append a folder's own `AGENTS.md`/`CLAUDE.md` (below the root) to the first read_file, edit_file or write_file

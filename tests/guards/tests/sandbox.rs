@@ -1019,7 +1019,7 @@ fn instruction_files_stay_inside_after_realpath() {
         std::os::unix::fs::symlink(&key, link).unwrap();
     }
 
-    let loaded = marv_session::instructions::load_instructions(&root, home.path(), true, true);
+    let loaded = marv_session::instructions::load_instructions_as(&root, home.path(), true, true, true);
     assert!(loaded.instructions.is_none(), "{:?}", loaded.instructions);
     assert_eq!(loaded.problems.len(), 2, "{:?}", loaded.problems);
     let nested = marv_session::instructions::NestedInstructions::default();
@@ -1046,7 +1046,7 @@ fn instruction_files_never_read_secrets_or_skipped_folders() {
     std::os::unix::fs::symlink(root.join(".env"), root.join("AGENTS.md")).unwrap();
     std::os::unix::fs::symlink(root.join("node_modules/dep/rules.md"), root.join("pkg/AGENTS.md")).unwrap();
 
-    let loaded = marv_session::instructions::load_instructions(&root, home.path(), false, true);
+    let loaded = marv_session::instructions::load_instructions_as(&root, home.path(), false, true, true);
     assert!(loaded.instructions.is_none(), "{:?}", loaded.instructions);
     assert!(loaded.problems.iter().any(|p| p.contains("secret")), "{:?}", loaded.problems);
     let nested = marv_session::instructions::NestedInstructions::default();
