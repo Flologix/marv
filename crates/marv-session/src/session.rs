@@ -57,6 +57,7 @@ use crate::checkpoints::store::{CheckpointKind, CheckpointStore, SnapshotResult,
 use crate::checkpoints::turn::CheckpointTurn;
 use crate::checkpoints::undo::{UndoPlan, UndoRefusal, UndoResult, apply_undo, plan_undo, undo_note};
 use crate::checks::{ProjectCheckResult, Violation};
+use crate::cut_off::{OpenTurn, SavingApprover, cut_off_note, cut_off_notice};
 use crate::diagnostics::turn::{CheckOutcome, Checker, FailReason, OffReason, TurnChecks, TurnOptions, combine_checks};
 use crate::diagnostics::{CheckResult, TsError};
 use crate::event_queue::EventQueue;
@@ -238,6 +239,8 @@ pub struct Resumed {
     pub totals: Totals,
     /// The plan tool's list as it was saved (#15), or `None`.
     pub plan: Option<Vec<PlanItem>>,
+    /// #202: its last turn was cut off (Marv quit mid-turn): the notice, also the transcript's last entry.
+    pub cut_off: Option<String>,
 }
 
 /// A built-in provider by option, or a factory (the TUI makes one from its config: `ConfigFactory`).
@@ -664,6 +667,15 @@ struct State {
     /// What the running turn's end needs for its automatic radio reports: its number, its last reply, and the tool
     /// the user declined.
     radio_turn: RadioTurnFacts,
+    /// #202: the running turn, from its user message to its end: saved with it (`SavedSession::cut_off`).
+    turn_open: Option<OpenTurn>,
+    /// Snapshots, numbered; `written` is the last one on disk, per session file: a write that lost the race to a newer
+    /// one of the same file is skipped.
+    save_seq: u64,
+    written: Arc<tokio::sync::Mutex<HashMap<String, u64>>>,
+    /// #202: the resumed conversation's last turn was cut off: the notice, for a client that resumed through the
+    /// builder (`take_cut_off_notice`).
+    cut_off_notice: Option<String>,
 }
 
 /// What a turn's automatic radio report is built from (#124, §7.3): no model call, only what the session has.
@@ -1056,6 +1068,10 @@ impl MarvSession {
             radio_offered: init.radio == Some(true) && init.mesh.is_some(),
             radio_requests: Vec::new(),
             radio_turn: RadioTurnFacts::default(),
+            turn_open: None,
+            save_seq: 0,
+            written: Arc::default(),
+            cut_off_notice: None,
         };
         // The config's pre-approved scopes (#98) seed the "always" layer: they mean "always, for this session",
         // through the same path a person's "always" takes, so must_ask and taint still win. An unknown name is a
@@ -1397,6 +1413,7 @@ impl MarvSession {
             let mut s = self.state();
             s.current = None;
             s.running = false;
+            s.turn_open = None;
         }
         self.schedule_save();
         emit(SessionEvent::TurnEnd { turn, reason });
@@ -1659,6 +1676,9 @@ impl MarvSession {
         lock(&history).push(ChatTurn::User { text: message });
         // A woken turn (#78): who woke it is Marv's line in the transcript; the user said nothing.
         self.note(if woken.is_woken() { Role::System } else { Role::User }, text);
+        // #202: saved as it goes from here, so a Marv that quits mid-turn keeps the message and the calls.
+        self.state().turn_open = Some(OpenTurn::default());
+        self.save_soon();
         emit(SessionEvent::Status(TurnStatus::Running));
 
         // The turn's checkpoint pair (#16): the before is taken by the first call that can change files.
@@ -1691,11 +1711,13 @@ impl MarvSession {
         let unattended = woken.is_woken() || handles_requests;
         let why = if radio_turn { crate::radio::RADIO_TURN_WARNING } else { crate::radio::RADIO_REQUEST_WARNING };
         let client: Option<Arc<dyn Approver>> = init.approve.clone().map(|inner| {
-            if radio_turn || handles_requests {
+            let inner = if radio_turn || handles_requests {
                 Arc::new(crate::radio::RadioTurnApprover(inner, why)) as Arc<dyn Approver>
             } else {
                 inner
-            }
+            };
+            // #202: the turn is saved before each question a person is asked (the main agent's and subagents').
+            Arc::new(SavingApprover { session: self.clone(), inner }) as Arc<dyn Approver>
         });
         let always = if unattended { AlwaysScopes::default() } else { self.inner.always.clone() };
         let approve: Option<Arc<dyn Approver>> = client
@@ -1862,6 +1884,7 @@ impl MarvSession {
                 main.event(&event);
             }
             self.state().note_changed(number, &event);
+            self.turn_progress(&event);
             // After a call's result, or the mesh inbox read before the turn or between steps: anything but a delta.
             let check_taint =
                 !matches!(event, LoopEvent::TextDelta(_) | LoopEvent::ThinkingDelta(_) | LoopEvent::ToolCallDelta { .. });
@@ -2346,16 +2369,30 @@ impl MarvSession {
                     s.radio_requests.push(open.clone());
                 }
             }
+            // #202: its last turn never ended (Marv quit mid-turn): the transcript says so, and the model hears it at
+            // the start of the next message (every call already has a result: the file was saved valid).
+            let cut_off = saved.cut_off.clone().filter(|d| !d.is_empty());
+            let notice = cut_off.as_deref().map(cut_off_notice);
+            if let Some(notice) = &notice {
+                let id = s.messages.last().map_or(0, |m| m.id) + 1;
+                s.messages.push(Message::new(id, Role::System, notice.clone()));
+            }
+            s.cut_off_notice = notice.clone();
             let resumed = Resumed {
                 id: saved.id.clone(),
                 updated_at: saved.updated_at,
                 model: saved.model.clone(),
-                transcript: saved.transcript.clone(),
+                transcript: s.messages.clone(),
                 totals: saved.totals.clone(),
                 plan: s.plan.clone(),
+                cut_off: notice,
             };
             let (saved_checkpoints, pending_note, id) = (saved.saved_checkpoints(), saved.pending_note(), saved.id.clone());
-            s.saved = saved;
+            let pending_note = match (pending_note, cut_off.as_deref().map(cut_off_note)) {
+                (Some(earlier), Some(note)) => Some(format!("{earlier}\n\n{note}")),
+                (earlier, note) => note.or(earlier),
+            };
+            s.saved = SavedSession { cut_off: None, ..saved };
             s.new_chain(&self.inner.checkpoints);
             // Its chain (the saved one: a recovery below may have replaced the session's own), if it still exists:
             // numbering goes on after its last checkpointed turn, and an undo preview still knows what each turn reported.
@@ -2387,6 +2424,10 @@ impl MarvSession {
         drop(s);
         // The resumed conversation goes on now: its next message gets the hooks' output as of now (#108).
         self.restart_hooks();
+        // #202: marked once: the file now has the notice and the note, and no cut-off turn.
+        if resumed.cut_off.is_some() {
+            self.save_at_once();
+        }
         Ok(Some(resumed))
     }
 
@@ -2557,9 +2598,55 @@ impl MarvSession {
             return Ok(());
         };
         let transcript = self.transcript();
-        let saved = self.snapshot(&mut self.state(), transcript);
-        store.save(&saved).await?;
+        let (saved, seq, written) = {
+            let mut s = self.state();
+            let saved = self.snapshot(&mut s, transcript);
+            s.save_seq += 1;
+            (saved, s.save_seq, s.written.clone())
+        };
+        let mut written = written.lock().await;
+        if written.get(&saved.id).is_none_or(|last| seq > *last) {
+            store.save(&saved).await?;
+            written.insert(saved.id.clone(), seq);
+        }
         Ok(())
+    }
+
+    /// #202: the open turn's progress (a reply, a call started or ended): saved soon.
+    fn turn_progress(&self, event: &LoopEvent) {
+        {
+            let mut s = self.state();
+            let Some(open) = s.turn_open.as_mut() else { return };
+            match event {
+                LoopEvent::ToolStart { call, .. } => open.started(call),
+                LoopEvent::ToolEnd { call, run } => open.finished(call, &run.result.output),
+                LoopEvent::ToolSkipped { call, output } => open.finished(call, output),
+                LoopEvent::Assistant { .. } | LoopEvent::Compacted => {}
+                _ => return,
+            }
+        }
+        self.save_soon();
+    }
+
+    /// #202: an approval is being asked in the open turn: saved now, since no one may ever answer it. `None` outside a
+    /// turn (/undo's, a mesh wire's).
+    pub(crate) fn asking(&self, request: &marv_tools::ApprovalRequest) -> Option<u64> {
+        let id = self.state().turn_open.as_mut().map(|open| open.ask(request))?;
+        self.save_at_once();
+        Some(id)
+    }
+
+    /// The question `asking` returned this id for has its answer (or its wait ended).
+    pub(crate) fn answered(&self, id: u64) {
+        if let Some(open) = self.state().turn_open.as_mut() {
+            open.answered(id);
+        }
+    }
+
+    /// #202: the resumed conversation's last turn was cut off: the notice for the client to show, once. A client
+    /// that resumed with `resume()` has it in `Resumed` (and the transcript) already.
+    pub fn take_cut_off_notice(&self) -> Option<String> {
+        self.state().cut_off_notice.take()
     }
 
     /// The client's transcript, read without the session's lock held (its callback may read the session).
@@ -2569,8 +2656,19 @@ impl MarvSession {
 
     /// What `save()` writes: every tool call answered (a run winding down may still have unanswered calls).
     fn snapshot(&self, s: &mut State, transcript: Option<Vec<Message>>) -> SavedSession {
-        let conversation = marv_agent::agent::answer_all_calls(&s.conversation.lock().unwrap_or_else(|e| e.into_inner()));
+        // #202: mid-turn, a waiting call gets its own result (its output, or why there is none), and the file says
+        // what a quit now cuts off.
+        let (conversation, cut_off) = {
+            let history = s.conversation.lock().unwrap_or_else(|e| e.into_inner());
+            match &s.turn_open {
+                None => (marv_agent::agent::answer_all_calls(&history), None),
+                Some(open) => {
+                    (marv_agent::agent::answer_all_calls_with(&history, |c| open.result(c)), Some(open.detail(&history)))
+                }
+            }
+        };
         let mut saved = s.saved.clone();
+        saved.cut_off = cut_off;
         saved.provider = s.factory.id().into();
         saved.model = s.factory.model().into();
         saved.conversation = conversation;
@@ -2605,10 +2703,37 @@ impl MarvSession {
             return;
         };
         let saved = self.snapshot(s, transcript);
+        s.save_seq += 1;
+        let (seq, written) = (s.save_seq, s.written.clone());
         s.flushing.retain(|h| !h.is_finished());
         s.flushing.push(handle.spawn(async move {
-            let _ = store.save(&saved).await;
+            // Saves overlap now (#202: mid-turn ones): an older snapshot never lands after a newer one.
+            let mut written = written.lock().await;
+            if written.get(&saved.id).is_none_or(|last| seq > *last) {
+                let _ = store.save(&saved).await;
+                written.insert(saved.id.clone(), seq);
+            }
         }));
+    }
+
+    /// #202: saves within [`SAVE_DELAY`] (a waiting save isn't pushed back, so a busy turn still gets saved).
+    fn save_soon(&self) {
+        if self.state().save_timer.is_none() {
+            self.schedule_save();
+        }
+    }
+
+    /// #202: saves now (the write starts; `flush()` waits for it): before an approval nobody may answer.
+    fn save_at_once(&self) {
+        if self.inner.init.sessions.is_none() {
+            return;
+        }
+        let transcript = self.transcript();
+        let mut s = self.state();
+        if let Some(timer) = s.save_timer.take() {
+            timer.abort();
+        }
+        self.start_save(&mut s, transcript);
     }
 
     /// Saves shortly (a burst of turns is one write). When the timer fires it's `save_now`, so flush() waits for it.
@@ -4726,6 +4851,105 @@ mod turn_tests {
         assert_eq!(b.id(), a.id());
         collect(go(&b, "what was it?")).await;
         assert_eq!(provider.requests()[0].0.iter().map(text_of).collect::<Vec<_>>(), ["remember 42", "Noted.", "what was it?"]);
+    }
+
+    /// Never answers: the person never got to it (Marv was force-quit). Says when it was asked.
+    #[derive(Default)]
+    struct Stuck(tokio::sync::Notify);
+    #[async_trait::async_trait]
+    impl Approver for Stuck {
+        async fn approve(&self, _request: ApprovalRequest) -> Decision {
+            self.0.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    /// The session file once `ready` says it holds what's wanted (a save is a background write).
+    async fn saved_when(sessions: &SessionStore, dirs: &Dirs, id: &str, ready: impl Fn(&SavedSession) -> bool) -> SavedSession {
+        for _ in 0..500 {
+            if let Some(saved) = sessions.load(&dirs.project, id).await
+                && ready(&saved)
+            {
+                return saved;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("the session was never saved as wanted");
+    }
+
+    // #202: Marv quit (force-quit, a crash) while a call waited for approval: the file kept the message, the calls and
+    // the finished result, every call answered; a resume marks the turn as cut off, for the person and the model.
+    #[tokio::test]
+    async fn a_turn_cut_off_while_an_approval_waits_is_saved_and_comes_back_marked() {
+        let dirs = Dirs::new();
+        let sessions = Arc::new(SessionStore::new(&dirs.dir));
+        let stuck = Arc::new(Stuck::default());
+        let write = call("c2", "write_file", serde_json::json!({ "path": "a.txt", "content": "hi\n" }));
+        let notes = call("c1", "read_file", serde_json::json!({ "path": "notes.txt" }));
+        let provider = Scripted::new(vec![use_tools(vec![notes, write])]);
+        let a = scripted(&dirs, &provider, |i| {
+            i.sessions = Some(sessions.clone());
+            i.approve = Some(stuck.clone());
+            i.yolo = false;
+        });
+        // The turn is left as it is, never finished nor dropped: Marv quit. What's on disk is all that's left.
+        let turn = go(&a, "save it");
+        tokio::time::timeout(std::time::Duration::from_secs(10), stuck.0.notified()).await.expect("the write is asked");
+        let detail = "Marv quit while `write_file` waited for approval";
+        // The read's end may reach the session just after the question: the save after it has its result.
+        let saved = saved_when(&sessions, &dirs, &a.id(), |s| {
+            s.cut_off.is_some() && s.conversation.get(2).is_some_and(|t| text_of(t).contains("remember the milk"))
+        })
+        .await;
+        assert_eq!(saved.cut_off.as_deref(), Some(detail));
+        let turns: Vec<(&str, &str)> = saved.conversation.iter().map(|t| (role_of(t), text_of(t))).collect();
+        assert_eq!(turns[..2], [("user", "save it"), ("assistant", "")]);
+        assert!(matches!(&saved.conversation[1], ChatTurn::Assistant { tool_calls, .. } if tool_calls.len() == 2));
+        assert_eq!(saved.conversation.len(), 4);
+        assert!(text_of(&saved.conversation[2]).contains("remember the milk"), "the finished read's result");
+        assert_eq!(text_of(&saved.conversation[3]), marv_agent::agent::not_run::QUIT_APPROVAL);
+        assert_eq!(unanswered(&saved.conversation), Vec::<String>::new());
+        assert_eq!(saved.transcript.iter().map(|m| (m.role, m.text.as_str())).collect::<Vec<_>>(), [(Role::User, "save it")]);
+
+        let next = Scripted::new(vec![say("It wasn't written.")]);
+        let b = scripted(&dirs, &next, |i| i.sessions = Some(sessions.clone()));
+        let resumed = b.resume(ResumeTarget::Latest).await.unwrap().unwrap();
+        let notice = crate::cut_off::cut_off_notice(detail);
+        assert_eq!(resumed.cut_off.as_deref(), Some(notice.as_str()));
+        let shown: Vec<(Role, &str)> = resumed.transcript.iter().map(|m| (m.role, m.text.as_str())).collect();
+        assert_eq!(shown, [(Role::User, "save it"), (Role::System, notice.as_str())]);
+        assert_eq!(b.take_cut_off_notice(), Some(notice.clone()));
+        assert_eq!(b.take_cut_off_notice(), None, "once");
+        // Marked once: the file no longer has a cut-off turn, but has the notice and the model's note.
+        let marked = saved_when(&sessions, &dirs, &b.id(), |s| s.cut_off.is_none()).await;
+        assert_eq!(marked.transcript.last().map(|m| m.text.as_str()), Some(notice.as_str()));
+        assert_eq!(marked.pending_note(), Some(crate::cut_off::cut_off_note(detail)));
+
+        collect(go(&b, "did you write it?")).await;
+        let sent = &next.requests()[0].0;
+        assert_eq!(sent[..4], saved.conversation[..], "the history as saved: append-only");
+        assert_eq!(unanswered(sent), Vec::<String>::new());
+        assert_eq!(text_of(&sent[4]), format!("{}\n\ndid you write it?", crate::cut_off::cut_off_note(detail)));
+        drop(turn);
+    }
+
+    // #202: a turn that ended is saved without a cut-off mark.
+    #[tokio::test]
+    async fn a_finished_turn_is_saved_unmarked() {
+        let dirs = Dirs::new();
+        let sessions = Arc::new(SessionStore::new(&dirs.dir));
+        let a = scripted(&dirs, &Scripted::new(vec![use_tools(vec![read("c1")]), say("Read it.")]), |i| {
+            i.sessions = Some(sessions.clone());
+        });
+        collect(go(&a, "read it")).await;
+        a.flush().await;
+        let saved = sessions.load(&dirs.project, &a.id()).await.unwrap();
+        assert_eq!(saved.cut_off, None);
+        assert_eq!(saved.conversation.len(), 4);
+        let b = scripted(&dirs, &Scripted::new(vec![]), |i| i.sessions = Some(sessions.clone()));
+        let resumed = b.resume(ResumeTarget::Latest).await.unwrap().unwrap();
+        assert_eq!(resumed.cut_off, None);
+        assert_eq!(resumed.transcript.len(), 2);
     }
 
     #[tokio::test]

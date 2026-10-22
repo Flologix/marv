@@ -65,6 +65,11 @@ pub struct SavedSession {
     /// radio reports on them. Absent when there are none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub radio_requests: Option<Vec<marv_mesh::radio::OpenRequest>>,
+    /// marv-rs #202: saved while a turn ran (a turn is saved as it goes), so a Marv that quit mid-turn left it like
+    /// this: what cut it off ("Marv quit while `bash` waited for approval"). A resume marks the turn as cut off (a
+    /// notice, a note for the model) and clears it. Absent once the turn ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cut_off: Option<String>,
 }
 
 /// A saved session's checkpoint chain and its turns' reported paths (#16).
@@ -156,6 +161,7 @@ pub fn new_session(root: &Path, provider: &str, model: &str, now_ms: u64) -> Sav
         pending_note: None,
         taint: None,
         radio_requests: None,
+        cut_off: None,
     }
 }
 

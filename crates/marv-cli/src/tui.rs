@@ -3820,6 +3820,36 @@ mod tests {
         assert!(list.iter().all(|s| s.id != bridge.session.id()));
     }
 
+    /// #202: Marv quit while an approval waited (the first bridge is never answered, flushed nor closed): `marv -c`
+    /// brings the turn back, with a notice that it was cut off.
+    #[tokio::test]
+    async fn a_turn_cut_off_mid_approval_comes_back_marked() {
+        let dirs = Dirs::new();
+        let (tx, mut rx) = unbounded_channel();
+        let first = Bridge::start(startup(&dirs, Some(asks()), vec![write("w", "a.txt", "hi\n")], None), tx).unwrap();
+        Port(first.clone()).send("write a.txt".into());
+        until(&mut rx, |e| matches!(e, UiEvent::Approval { .. })).await;
+        // The save before the question is a background write: wait for it to land.
+        let store = SessionStore::new(dirs.config.join("sessions"));
+        let mut landed = false;
+        for _ in 0..500 {
+            if store.load(&dirs.project, &first.session.id()).await.is_some_and(|s| s.cut_off.is_some()) {
+                landed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(landed, "saved before the approval");
+
+        let (tx, mut rx) = unbounded_channel();
+        let bridge = Bridge::start(startup(&dirs, Some(asks()), vec![], None), tx).unwrap();
+        bridge.resume_latest().await;
+        let UiEvent::Resumed(resumed) = next(&mut rx).await else { panic!("not resumed") };
+        let shown: Vec<(Role, &str)> = resumed.transcript.iter().map(|m| (m.role, m.text.as_str())).collect();
+        let notice = marv_session::cut_off::cut_off_notice("Marv quit while `write_file` waited for approval");
+        assert_eq!(shown, [(Role::User, "write a.txt"), (Role::System, notice.as_str())]);
+    }
+
     /// #74: in a Marv started with MARV_YOLO=off, /yolo on says it stays off, names the variable, and writes nothing.
     #[tokio::test]
     async fn yolo_on_is_refused_under_marv_yolo_off() {
