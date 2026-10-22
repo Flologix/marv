@@ -135,8 +135,11 @@ export function useChat(id: string | null, settings: ChatSettings, reload = 0) {
         // Another numbering than the saved one (the app restarted): this page's numbers start over with it, and the
         // app sends every event it kept.
         if (e.type === "ready") {
-          // Approvals restored undecided: live again only if the session says their request still waits.
-          const waiting = Array.isArray(e.waiting) ? e.waiting.filter((w): w is number => typeof w === "number") : [];
+          // Approvals restored undecided: live again only in the same run (the epoch the page saved) and only if the
+          // session says their request still waits; after a restart none is, whatever its id.
+          const sameRun = typeof e.epoch === "string" && e.epoch === loadEpoch(id);
+          const waiting =
+            sameRun && Array.isArray(e.waiting) ? e.waiting.filter((w): w is number => typeof w === "number") : [];
           setItems((items) => settle(items, waiting));
         }
         if (e.type === "ready" && typeof e.epoch === "string" && e.epoch !== loadEpoch(id)) {
