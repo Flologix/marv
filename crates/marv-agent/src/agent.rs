@@ -812,8 +812,9 @@ enum Phase {
     Tools(Tools),
     /// The step's calls are all answered: `on_full`.
     Full(Vec<ToolRun>),
-    /// Marv #63: the request overflowed the window: `on_overflow`, with the provider's error.
-    Overflow(String),
+    /// Marv #63: the request overflowed the window: `on_overflow`, with the provider's error (and the #59 wrap-up's
+    /// message when it was the wrap-up request).
+    Overflow(String, Option<String>),
     AfterStep(Vec<ToolRun>),
 }
 
@@ -987,7 +988,7 @@ impl LoopState {
                 }
                 self.phase = Phase::AfterStep(runs);
             }
-            Phase::Overflow(message) => self.overflow(message).await,
+            Phase::Overflow(message, wrap_up) => self.overflow(message, wrap_up).await,
             Phase::AfterStep(runs) => {
                 if let Some(after_step) = self.options.after_step.clone() {
                     let note = after_step(runs).await;
@@ -1051,18 +1052,19 @@ impl LoopState {
                 }
             }
         }
-        if let Some(message) = wrap_up {
-            return self.wrap_up(reply, aborted, message);
-        }
         let outcome = reply.outcome(aborted);
         // Marv #63: a request too long for the window. Checked before anything of the reply enters the history: it has
-        // no text or calls, and any partial text is dropped as for a retry.
+        // no text or calls, and any partial text is dropped as for a retry. The #59 wrap-up request too: it's sent
+        // again, still the wrap-up, once the history fits.
         if let StepOutcome::Error(message) = &outcome
             && self.options.on_overflow.is_some()
             && marv_provider::errors::is_context_overflow(message)
         {
-            self.phase = Phase::Overflow(message.clone());
+            self.phase = Phase::Overflow(message.clone(), wrap_up);
             return;
+        }
+        if let Some(message) = wrap_up {
+            return self.wrap_up(reply, aborted, message);
         }
         self.overflows = 0;
         match outcome {
@@ -1121,7 +1123,7 @@ impl LoopState {
 
     /// Marv #63: the request overflowed the window. The hook makes the history fit (or gives up); the same step is sent
     /// again, at most [`MAX_OVERFLOW_RECOVERIES`] times.
-    async fn overflow(&mut self, message: String) {
+    async fn overflow(&mut self, message: String, wrap_up: Option<String>) {
         let attempt = self.overflows;
         self.emit(LoopEvent::Overflow { attempt });
         let Some(on_overflow) = self.options.on_overflow.clone() else {
@@ -1135,7 +1137,8 @@ impl LoopState {
         match outcome {
             OverflowOutcome::Recovered if attempt < MAX_OVERFLOW_RECOVERIES => {
                 self.overflows += 1;
-                self.phase = Phase::Request { tool_choice: ToolChoice::Auto, wrap_up: None };
+                let tool_choice = if wrap_up.is_some() { ToolChoice::None } else { ToolChoice::Auto };
+                self.phase = Phase::Request { tool_choice, wrap_up };
             }
             // A hook that would go on past the cap: the provider's error stands.
             OverflowOutcome::Recovered => {
@@ -2950,6 +2953,26 @@ mod tests {
         assert!(
             matches!(&events[events.len() - 2..], [LoopEvent::Error(m), LoopEvent::Done(StopReason::Error)] if m == OVERFLOW)
         );
+    }
+
+    #[tokio::test]
+    async fn the_wrap_up_request_is_recovered_too_and_sent_again_as_the_wrap_up() {
+        // max_steps 1, no on_limit: the step limit's tools-off wrap-up (#59) overflows, recovers, and is sent again.
+        let provider = Arc::new(ScriptedProvider::new(vec![use_tools(&[call("c1", "a.ts")]), overflow(), say("Wrapped up.")]));
+        let h = history(vec![user("go")]);
+        let (hook, attempts) = on_overflow(&h, vec![OverflowOutcome::Recovered]);
+        let opts = AgentOptions {
+            max_steps: 1,
+            wrap_up_at_limit: true,
+            on_overflow: Some(hook),
+            ..options(provider.clone(), &h, plain())
+        };
+        let events = collect(opts).await;
+        assert_eq!(*attempts.lock().unwrap(), [0]);
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[2].1.tool_choice, ToolChoice::None, "still the wrap-up");
+        assert_eq!(end(&events), Some(StopReason::MaxSteps));
     }
 
     #[tokio::test]
