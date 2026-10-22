@@ -1,0 +1,2 @@
+OpenRouter returned 400.
+This endpoint's maximum context length is 131072 tokens. However, you requested about 140000 tokens (100000 of text input, 40000 in the output).

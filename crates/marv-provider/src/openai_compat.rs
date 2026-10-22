@@ -116,8 +116,19 @@ static WINDOW_REFUSAL: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r"(?is)context length is (\d+) tokens.*?requested about (\d+) tokens.*?(\d+) in the output").unwrap()
 });
 
+/// DeepInfra's refusal: "maximum context length of N tokens. You requested a total of T tokens: I tokens from the input
+/// messages and O tokens for the completion."
+static DEEPINFRA_REFUSAL: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?is)maximum context length of (\d+) tokens.*?(\d+) tokens from the input messages").unwrap()
+});
+
 /// #116: what a refusal like [`WINDOW_REFUSAL`] says: the window, and how many tokens the prompt was.
 pub fn window_refusal(detail: &str) -> Option<(u64, u64)> {
+    // Marv #63 review: DeepInfra (through OpenRouter) says the same with its own words.
+    if let Some(caps) = DEEPINFRA_REFUSAL.captures(detail) {
+        let number = |i: usize| caps.get(i)?.as_str().parse::<u64>().ok();
+        return Some((number(1)?, number(2)?)).filter(|(_, input)| *input > 0);
+    }
     let caps = WINDOW_REFUSAL.captures(detail)?;
     let number = |i: usize| caps.get(i)?.as_str().parse::<u64>().ok();
     let (window, total, output) = (number(1)?, number(2)?, number(3)?);

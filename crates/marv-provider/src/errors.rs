@@ -243,13 +243,45 @@ pub fn is_context_overflow(message: &str) -> bool {
             r"|exceeds the context window",
             r"|prompt is too long",
             r"|input token count.*exceeds the maximum",
+            r"|exceeds the available context size",
             r"|context (length|window).{0,80}(exceed|too long|too large)",
             r"|(exceed|too long|too large).{0,80}context (length|window)",
             r"|returned 413\b",
         ))
         .unwrap()
     });
-    PATTERNS.is_match(message)
+    // About the output, not the prompt: the adapter refits `max_tokens` for these (#116).
+    static OUTPUT: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)max_(completion_)?tokens.{0,40}exceed").unwrap());
+    // A refusal that tells the prompt from the completion: only a prompt that alone doesn't fit is an overflow.
+    if let Some((window, input)) = crate::openai_compat::window_refusal(message) {
+        return input >= window;
+    }
+    PATTERNS.is_match(message) && !OUTPUT.is_match(message)
+}
+
+/// Marv #63 review: what an overflow error says about the window and the prompt, `(window, prompt tokens)`, for
+/// calibrating the recovery's estimates. OpenRouter's and DeepInfra's wording ([`crate::openai_compat::window_refusal`]),
+/// OpenAI's ("maximum context length is N tokens. However, your messages resulted in M tokens"), Anthropic's ("prompt
+/// is too long: M tokens > N maximum") and Gemini's ("input token count (M) exceeds the maximum number of tokens
+/// allowed (N)"). `None` when it says neither.
+pub fn overflow_numbers(message: &str) -> Option<(u64, u64)> {
+    static OPENAI: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?is)maximum context length is (\d+) tokens.*?resulted in (\d+) tokens").unwrap()
+    });
+    static ANTHROPIC: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)prompt is too long: (\d+) tokens > (\d+) maximum").unwrap());
+    static GEMINI: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?is)input token count \(?(\d+)\)? exceeds the maximum number of tokens allowed \(?(\d+)\)?").unwrap()
+    });
+    if let Some(found) = crate::openai_compat::window_refusal(message) {
+        return Some(found);
+    }
+    let pair = |re: &regex::Regex, window: usize, input: usize| -> Option<(u64, u64)> {
+        let caps = re.captures(message)?;
+        Some((caps.get(window)?.as_str().parse().ok()?, caps.get(input)?.as_str().parse().ok()?))
+    };
+    pair(&OPENAI, 1, 2).or_else(|| pair(&ANTHROPIC, 2, 1)).or_else(|| pair(&GEMINI, 2, 1)).filter(|(w, i)| *w > 0 && *i > 0)
 }
 
 #[cfg(test)]
@@ -376,6 +408,21 @@ mod tests {
             assert!(!is_context_overflow(&text), "{file}");
         }
         assert!(is_context_overflow(r#"{"error":{"code":"context_length_exceeded"}}"#));
+        // The numbers each wording carries, for calibration.
+        let numbers: Vec<_> = read("overflow")
+            .iter()
+            .map(|(file, text)| (file.rsplit('/').next().unwrap().to_string(), overflow_numbers(text)))
+            .collect();
+        for (file, expected) in [
+            ("anthropic.txt", Some((200_000, 208_437))),
+            ("deepinfra.txt", Some((163_840, 170_012))),
+            ("gemini.txt", Some((1_048_576, 1_196_032))),
+            ("openai.txt", Some((128_000, 131_245))),
+            ("openrouter.txt", Some((131_072, 140_000))),
+            ("openai-responses.txt", None),
+        ] {
+            assert!(numbers.contains(&(file.to_string(), expected)), "{file}: {numbers:?}");
+        }
         assert!(!is_context_overflow("Your OpenRouter account is out of credits."));
     }
 
