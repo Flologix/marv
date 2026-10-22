@@ -76,7 +76,7 @@ Narrow, named ways out, each asked for and each with its own rule for what it ca
 - **A session becomes tainted** once web, MCP, mesh or image content, a session-start hook's output (unless the user marked that hook `trusted`), what the Herdr door read from a pane (#74), the GitHub door's output, or a networked command's output enters its context. From then on, every `ToolKind::Egress` call asks, even in yolo:
   - network bash;
   - every MCP call, including tools marked `readOnlyHint`;
-  - web requests to a new URL prefix;
+  - web requests to a new URL prefix (and a fetch's name reaches DNS only after its approval: the approval's preview refuses a private address literal or `localhost` without a lookup, and the lookup, with its check for a private answer, happens when the approved fetch runs, before it connects; a name can carry data, so a declined fetch must make no lookup at all. Guard: `web.rs::a_fetchs_name_is_looked_up_only_after_its_approved`);
   - mesh calls on unapproved wires;
   - writes to protected paths.
 - **A mesh message that wakes an idle Marv (#78, opt-in `mesh.wake`) is read the same way:** only on a wire the user granted, fenced as another agent's data, tainting the session before the woken turn's first request, never as a user message. So that turn's egress asks like any tainted turn's, in yolo too, and (#74) **it runs with automatic approval off**, like a radio turn: no yolo, no remembered or pre-approved "always", no approved URL prefix, every request `once` (`ToolContext::no_auto_approval`; guard `mesh.rs::an_inbox_woken_turn_asks_for_what_yolo_would_allow`). Never while an approval waits, at most 3 wake-ups a minute per wire, and never in `marv -p`.
