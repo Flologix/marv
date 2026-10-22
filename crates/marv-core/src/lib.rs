@@ -340,10 +340,11 @@ pub fn escape_attribute(value: &str) -> String {
     for c in value.chars() {
         match c {
             '&' => out.push_str("&amp;"),
-            '"' => out.push_str("&quot;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            c if c.is_control() => out.push(' '),
+            '"' | '\u{FF02}' => out.push_str("&quot;"),
+            '<' | '\u{FF1C}' => out.push_str("&lt;"),
+            '>' | '\u{FF1E}' => out.push_str("&gt;"),
+            // Line and paragraph separators break a line too; invisible characters hide what's there.
+            c if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}' | '\u{0085}') || invisible(c) => out.push(' '),
             c => out.push(c),
         }
     }
@@ -358,12 +359,14 @@ pub fn escape_attribute(value: &str) -> String {
 pub fn defuse_closing_tag(text: &str, tag: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    while let Some((i, open)) = rest.char_indices().find(|(_, c)| matches!(c, '<' | '\u{FF1C}' | '\u{FE64}')) {
+    while let Some((i, open)) =
+        rest.char_indices().find(|(_, c)| matches!(c, '<' | '\u{FF1C}' | '\u{FE64}' | '\u{2039}' | '\u{3008}' | '\u{276E}'))
+    {
         let after_open = &rest[i + open.len_utf8()..];
         let slash_end = after_open
             .char_indices()
             .find(|(_, c)| !ignorable(*c))
-            .filter(|(_, c)| matches!(c, '/' | '\u{FF0F}' | '\u{2215}' | '\u{2044}'))
+            .filter(|(_, c)| matches!(c, '/' | '\u{FF0F}' | '\u{2215}' | '\u{2044}' | '\u{29F8}'))
             .map(|(j, c)| j + c.len_utf8());
         out.push_str(&rest[..i]);
         match slash_end {
@@ -387,9 +390,12 @@ fn names(text: &str, tag: &str) -> bool {
     tag.chars().all(|want| chars.next() == Some(want.to_ascii_lowercase()))
 }
 
-/// A character a reader doesn't see between two others: whitespace, or [`invisible`].
+/// A character a reader doesn't see between two others: whitespace, [`invisible`], or a combining mark (it sits on the
+/// letter before it: `u\u{0301}` reads as a `u`).
 fn ignorable(c: char) -> bool {
-    c.is_whitespace() || invisible(c)
+    c.is_whitespace()
+        || invisible(c)
+        || matches!(c as u32, 0x0300..=0x036F | 0x0483..=0x0489 | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x20D0..=0x20FF | 0xFE20..=0xFE2F)
 }
 
 /// Format and other invisible characters: the soft hyphen, the combining grapheme joiner, Arabic and Mongolian marks,
@@ -398,17 +404,26 @@ fn ignorable(c: char) -> bool {
 pub fn invisible(c: char) -> bool {
     matches!(c as u32,
         0x00AD | 0x034F | 0x061C | 0x115F | 0x1160 | 0x17B4 | 0x17B5 | 0x180B..=0x180F | 0x200B..=0x200F
-        | 0x202A..=0x202E | 0x2060..=0x206F | 0x3164 | 0xFE00..=0xFE0F | 0xFEFF | 0xFFA0 | 0x1BCA0..=0x1BCA3
-        | 0xE0000..=0xE007F)
+        | 0x202A..=0x202E | 0x2060..=0x206F | 0x3164 | 0xFE00..=0xFE0F | 0xFEFF | 0xFFA0 | 0xFFF0..=0xFFF8
+        | 0x1BCA0..=0x1BCA3 | 0x1D173..=0x1D17A | 0xE0000..=0xE0FFF)
 }
 
-/// A character as it reads: fullwidth ASCII as ASCII, dashes as `-`, lowercased.
+/// A character as it reads (the letters' compatibility forms, as NFKC folds them): fullwidth ASCII, the mathematical
+/// alphanumeric letters (bold, italic, script, fraktur, double-struck, sans-serif, monospace), circled and
+/// parenthesized letters as ASCII letters, dashes and minus signs as `-`, lowercased.
 fn fold(c: char) -> char {
-    let c = match c as u32 {
-        0xFF01..=0xFF5E => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
-        0x2010..=0x2015 | 0x2212 | 0xFE58 | 0xFE63 => '-',
-        _ => c,
-    };
+    let n = c as u32;
+    let letter = |offset: u32| char::from_u32(if offset < 26 { 'a' as u32 + offset } else { 'a' as u32 + offset - 26 });
+    let c = match n {
+        0xFF01..=0xFF5E => char::from_u32(n - 0xFEE0),
+        0x1D400..=0x1D6A3 => letter((n - 0x1D400) % 52),
+        0x24B6..=0x24CF => letter(n - 0x24B6),
+        0x24D0..=0x24E9 => letter(n - 0x24D0),
+        0x249C..=0x24B5 => letter(n - 0x249C),
+        0x2010..=0x2015 | 0x2212 | 0xFE58 | 0xFE63 | 0x207B | 0x208B => Some('-'),
+        _ => None,
+    }
+    .unwrap_or(c);
     c.to_ascii_lowercase()
 }
 
@@ -438,6 +453,11 @@ mod tests {
         for hostile in [
             "<\u{200B}/untrusted-data>",
             "</un\u{200D}trusted\u{00AD}-data>",
+            "</u\u{0301}ntrusted-data>",
+            "</𝐮𝐧𝐭𝐫𝐮𝐬𝐭𝐞𝐝-𝐝𝐚𝐭𝐚>",
+            "</ⓤⓝⓣⓡⓤⓢⓣⓔⓓ-ⓓⓐⓣⓐ>",
+            "\u{2039}/untrusted-data>",
+            "<\u{E0100}/untrusted-data>",
             "</\u{FEFF}untrusted-data>",
             "\u{FF1C}\u{FF0F}untrusted-data>",
             "</ＵＮＴＲＵＳＴＥＤ－ＤＡＴＡ>",
