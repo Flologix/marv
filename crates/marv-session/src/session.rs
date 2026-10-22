@@ -664,6 +664,9 @@ struct State {
     /// Where each of this conversation's tool results came from (by call id), and whether the call worked, for its
     /// saved pages (their sources, and the page table's lists of files); cleared with the conversation.
     provenance: HashMap<String, (Provenance, bool)>,
+    /// The person's latest message as it went into the history (#63 review): overflow recovery never drops the turn
+    /// that holds it, whatever Marv's own notes follow it.
+    person_message: Option<String>,
     current: Option<CancellationToken>,
     running: bool,
     closed: bool,
@@ -1092,6 +1095,7 @@ impl MarvSession {
             overflow_level: None,
             overflow_last_attempt: false,
             provenance: HashMap::new(),
+            person_message: None,
             current: None,
             running: false,
             closed: false,
@@ -1753,6 +1757,7 @@ impl MarvSession {
         tainted = sources.len();
         // After an overflow's drop note (its level 3) the history can end with a user turn: never two in a row.
         marv_agent::compact::push_user(&mut lock(&history), &message);
+        self.state().person_message = Some(message.clone());
         // A woken turn (#78): who woke it is Marv's line in the transcript; the user said nothing.
         self.note(if woken.is_woken() { Role::System } else { Role::User }, text);
         emit(SessionEvent::Status(TurnStatus::Running));
@@ -2675,6 +2680,11 @@ impl MarvSession {
         let kind = self.summary_kind();
         let instruction = estimate_tokens(&summary_instructions(kind, None)) as f64;
         let keep = self.summary_head(&history);
+        // The turn holding the person's latest message: the newest user turn that contains it (Marv's notes may
+        // follow it, or be merged into it).
+        let person = self.state().person_message.clone().and_then(|message| {
+            history.iter().rposition(|t| matches!(t, ChatTurn::User { text } if text.contains(message.as_str())))
+        });
         let tail = self.tail_tokens();
         let tokens_before = before.map(|b| b.prompt_tokens + b.completion_tokens);
         let failed = |level: u32, error: String| {
@@ -2731,7 +2741,7 @@ impl MarvSession {
                 let note_tokens = estimate_tokens(DROPPED_NOTE)
                     + marv_tools::swap::MAX_TABLE_CHARS as u64 / marv_core::CHARS_PER_TOKEN
                     + announced.as_deref().map_or(0, estimate_tokens);
-                let plan = plan_drop(&history, budget as u64, keep, note_tokens);
+                let plan = plan_drop(&history, budget as u64, keep, note_tokens, person);
                 // The person's own message is never dropped; one larger than the whole window can't be sent at all.
                 if let Some(u) = plan.user
                     && plan.user_tokens.is_some()
@@ -2792,7 +2802,7 @@ impl MarvSession {
                 level += 1;
                 continue;
             }
-            let request = fit_for_summary(&history, budget as u64, keep);
+            let request = fit_for_summary(&history, budget as u64, keep, person);
             // The tail shrinks from the first level: the full one is what just overflowed.
             let level_tail = match level {
                 0 => tail / 2,
@@ -2915,6 +2925,7 @@ impl MarvSession {
             s.listing = None; // a new conversation decides its MCP mode again
             s.plan = None; // a new conversation, a new plan
             s.provenance.clear();
+            s.person_message = None;
             // #124: the new conversation offers radio_tx if it starts with the radio on (fixed until the next clear).
             s.radio_offered = self.radio_on_now();
         }
@@ -2971,6 +2982,7 @@ impl MarvSession {
             s.last = None;
             s.listing = saved.mcp_listing();
             s.provenance.clear();
+            s.person_message = None;
             // The model needs nothing extra: its last plan call (or the summary holding the plan) is still in the
             // conversation. A session without the plan tool restores none: compaction would tell the model to keep
             // updating it.

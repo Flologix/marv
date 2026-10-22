@@ -489,7 +489,8 @@ pub fn cut_with(text: &str, tokens: u64, note: &str) -> String {
 /// The note in the middle of a message that was cut to fit the window.
 pub const MESSAGE_CUT: &str = "[… the middle of this message was cut to fit the context window …]";
 
-/// The newest user turn at or after `from`: the person's latest message, never dropped by overflow recovery.
+/// The newest user turn at or after `from`: the stand-in for the person's message when the caller doesn't know which
+/// turn holds it (the session does: it may be followed by Marv's own notes).
 pub fn newest_user(history: &[ChatTurn], from: usize) -> Option<usize> {
     (from..history.len()).rev().find(|&i| matches!(history[i], ChatTurn::User { .. }))
 }
@@ -500,7 +501,8 @@ pub fn newest_user(history: &[ChatTurn], from: usize) -> Option<usize> {
 /// user turn is never dropped: past half the budget it's cut to head and tail with a note. A tool result still larger
 /// than `budget / 4` is cut to head and tail. The result alternates ([`normalize`]). Never a cache hit; that's
 /// accepted on the error path.
-pub fn fit_for_summary(history: &[ChatTurn], budget: u64, keep: usize) -> Vec<ChatTurn> {
+/// `person`: the turn holding the person's latest message (never dropped), if it's still in the history.
+pub fn fit_for_summary(history: &[ChatTurn], budget: u64, keep: usize, person: Option<usize>) -> Vec<ChatTurn> {
     let keep = keep.min(history.len());
     let mut turns: Vec<ChatTurn> = history.to_vec();
     for turn in &mut turns[keep..] {
@@ -510,7 +512,7 @@ pub fn fit_for_summary(history: &[ChatTurn], budget: u64, keep: usize) -> Vec<Ch
             *text = head_and_tail(text, budget / 4);
         }
     }
-    let newest = newest_user(&turns, keep);
+    let newest = person.filter(|&i| i >= keep && matches!(turns.get(i), Some(ChatTurn::User { .. })));
     if let Some(i) = newest
         && let ChatTurn::User { text } = &mut turns[i]
         && marv_core::estimate_tokens(text) > budget / 2
@@ -557,21 +559,24 @@ pub struct DropPlan {
 }
 
 impl DropPlan {
-    /// The indexes dropped (to be saved before the history is replaced).
+    /// The indexes dropped (to be saved before the history is replaced): the person's message too when it's cut, so
+    /// its whole text is saved.
     pub fn dropped(&self) -> Vec<usize> {
         let before_user = self.user.unwrap_or(self.start).min(self.start);
         let after_user = self.user.map_or(self.start, |u| u + 1);
-        (self.keep..before_user).chain(after_user..self.start).collect()
+        let cut = self.user.filter(|_| self.user_tokens.is_some());
+        (self.keep..before_user).chain(cut).chain(after_user..self.start).collect()
     }
 }
 
 /// #63, level 3: which turns fit in `budget` tokens with a note of `note_tokens`: the head, then the newest user turn
 /// (never dropped; cut to half of what's left when it's larger), then the newest turns after it that fit, starting
 /// where a history may start (never at a tool result). No request is sent for it.
-pub fn plan_drop(history: &[ChatTurn], budget: u64, keep: usize, note_tokens: u64) -> DropPlan {
+/// `person`: the turn holding the person's latest message, as for [`fit_for_summary`].
+pub fn plan_drop(history: &[ChatTurn], budget: u64, keep: usize, note_tokens: u64, person: Option<usize>) -> DropPlan {
     let keep = keep.min(history.len());
     let mut room = budget.saturating_sub(marv_core::estimate_history_tokens(&history[..keep])).saturating_sub(note_tokens);
-    let user = newest_user(history, keep);
+    let user = person.filter(|&i| i >= keep && matches!(history.get(i), Some(ChatTurn::User { .. })));
     let mut user_tokens = None;
     if let Some(u) = user {
         let size = marv_core::estimate_turn_tokens(&history[u]);
@@ -618,7 +623,7 @@ pub fn apply_drop(history: &[ChatTurn], plan: &DropPlan, note: &str) -> Vec<Chat
 
 /// [`plan_drop`] then [`apply_drop`].
 pub fn drop_to_fit(history: &[ChatTurn], budget: u64, keep: usize, note: &str) -> Vec<ChatTurn> {
-    let plan = plan_drop(history, budget, keep, marv_core::estimate_tokens(note));
+    let plan = plan_drop(history, budget, keep, marv_core::estimate_tokens(note), newest_user(history, keep));
     apply_drop(history, &plan, note)
 }
 
@@ -972,7 +977,7 @@ mod tests {
             h.push(calls(&format!("c{i}"), 4));
             h.push(result(&format!("c{i}"), 400));
         }
-        let fitted = fit_for_summary(&h, 400, 2);
+        let fitted = fit_for_summary(&h, 400, 2, newest_user(&h, 2));
         assert_eq!(&fitted[..3], &h[..3], "the summary and the task stay");
         assert!(marv_core::estimate_history_tokens(&fitted) <= 400);
         assert_eq!(fitted.last(), h.last(), "the newest steps stay");
@@ -984,7 +989,7 @@ mod tests {
         }
         // One giant result is cut to head and tail.
         let h = vec![user("go"), calls("c1", 4), result("c1", 40_000)];
-        let fitted = fit_for_summary(&h, 2_000, 0);
+        let fitted = fit_for_summary(&h, 2_000, 0, newest_user(&h, 0));
         let ChatTurn::Tool { text, .. } = &fitted[2] else { panic!("{fitted:?}") };
         assert!(text.contains("[… cut for the summary …]") && marv_core::estimate_tokens(text) <= 520);
     }
@@ -1036,13 +1041,24 @@ mod tests {
             h.push(result(&format!("c{i}"), 400));
         }
         h.push(user(&"m".repeat(8000)));
-        let fitted = fit_for_summary(&h, 1000, 0);
+        let fitted = fit_for_summary(&h, 1000, 0, newest_user(&h, 0));
         assert!(alternates(&fitted), "{fitted:?}");
         let ChatTurn::User { text } = fitted.last().unwrap() else { panic!() };
         assert!(text.contains(MESSAGE_CUT) && text.starts_with("mmm"));
         let dropped = drop_to_fit(&h, 1000, 0, DROPPED_NOTE);
         assert!(alternates(&dropped), "{dropped:?}");
         assert!(dropped.iter().any(|t| matches!(t, ChatTurn::User { text } if text.contains(MESSAGE_CUT))));
+        // Cut, it's saved whole with what's dropped.
+        let plan = plan_drop(&h, 1000, 0, 40, newest_user(&h, 0));
+        assert!(plan.dropped().contains(&(h.len() - 1)));
+        // Marv's own note after the person's message isn't taken for it.
+        let mut h = h;
+        let person = h.len() - 1;
+        h.push(calls("c9", 4));
+        h.push(result("c9", 40));
+        h.push(user(MID_TURN_NOTE));
+        let plan = plan_drop(&h, 1000, 0, 40, Some(person));
+        assert_eq!(plan.user, Some(person));
     }
 
     #[test]
