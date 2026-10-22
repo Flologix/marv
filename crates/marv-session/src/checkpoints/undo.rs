@@ -155,6 +155,12 @@ pub async fn plan_undo(
         return Err(UndoRefusal::failed(format!("git diff-tree failed: {}", listed.out.trim())));
     }
     let fields: Vec<&str> = listed.out.split('\0').collect();
+    // #203: the folders either snapshot left out as other repositories. A turn that removed one's `.git` makes its
+    // files look new in the after snapshot (and one that made a repository makes them look deleted): they are the
+    // other repository's files, never Marv's to delete or write.
+    let mut nested: Vec<String> = before.nested.iter().chain(&after.nested).cloned().collect();
+    nested.sort();
+    nested.dedup();
     let mut files = Vec::new();
     let mut targets = HashMap::new();
     let mut not_restored: Vec<String> = Vec::new();
@@ -166,8 +172,8 @@ pub async fn plan_undo(
         let parts: Vec<&str> = meta.trim_start_matches(':').split(' ').collect();
         let [old_mode, new_mode, old_sha, new_sha, status] = parts[..] else { continue };
         let path = top_path.strip_prefix(where_.prefix.as_str()).unwrap_or(top_path).to_string();
-        // A submodule's commit isn't a file Marv can write back.
-        if old_mode == "160000" || new_mode == "160000" {
+        // A submodule's commit isn't a file Marv can write back; another repository's files aren't Marv's (#203).
+        if old_mode == "160000" || new_mode == "160000" || crate::checkpoints::store::under_any(top_path, &nested) {
             not_restored.push(path);
             continue;
         }
@@ -601,6 +607,7 @@ mod tests {
         )
         .await;
         // After the turn, pkg/ became a repository of its own: its file is no longer Marv's to delete.
+        // (Made after the turn: neither snapshot knows it, so it's apply_undo's check that keeps the file.)
         git(&d.join("pkg"), &["init", "-q"]);
         let plan = plan(&s).await;
         let mut paths: Vec<&str> = plan.files.iter().map(|f| f.path.as_str()).collect();
@@ -617,6 +624,38 @@ mod tests {
         }
         assert_eq!(git(&d.join("full"), &["rev-parse", "HEAD"]), full_head);
         assert!(d.join("empty/.git/HEAD").exists() && d.join("wt/.git").is_file());
+    }
+
+    // #203 review: a turn that removed a repository's `.git` (a folder, and a worktree's `.git` file) makes its files
+    // look new in the after snapshot; /undo must not delete them (the only copy).
+    #[tokio::test]
+    async fn a_turn_that_removed_a_nested_repositorys_git_doesnt_get_its_files_deleted() {
+        let folder = folder_of_repos();
+        let d = folder.0.clone();
+        let own = temp("cp-own");
+        let s = store(&d, &own);
+        turn(
+            &s,
+            1,
+            || {
+                write(d.join("outer.txt"), "changed\n");
+                std::fs::remove_dir_all(d.join("full/.git")).unwrap();
+                std::fs::remove_file(d.join("wt/.git")).unwrap();
+            },
+            "",
+        )
+        .await;
+        let plan = plan(&s).await;
+        let paths: Vec<&str> = plan.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["outer.txt"]);
+        let mut kept = plan.not_restored.clone();
+        kept.sort();
+        assert_eq!(kept, ["full/z.txt", "wt/r.txt"]);
+        let result = apply_undo(&s, &plan, None).await.unwrap();
+        assert!(result.deleted.is_empty(), "{:?}", result.deleted);
+        assert_eq!(read(d.join("outer.txt")), "outer\n");
+        assert_eq!(read(d.join("full/z.txt")), "theirs\n");
+        assert_eq!(read(d.join("wt/r.txt")), "theirs\n");
     }
 
     // The working file's own bytes, not what git's filters store (Greptile on Marv #71).
@@ -858,7 +897,14 @@ mod tests {
     }
 
     fn a_plan(files: Vec<UndoFile>, not_restored: Vec<String>) -> UndoPlan {
-        let c = |kind| Checkpoint { sha: "s".into(), tree: "t".into(), turn: 3, kind, label: "add the parser\nmore".into() };
+        let c = |kind| Checkpoint {
+            sha: "s".into(),
+            tree: "t".into(),
+            turn: 3,
+            kind,
+            label: "add the parser\nmore".into(),
+            nested: Vec::new(),
+        };
         UndoPlan {
             turn: 3,
             label: "add the parser\nmore".into(),

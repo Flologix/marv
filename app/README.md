@@ -89,6 +89,8 @@ npx tauri build      # .deb and .AppImage in target/release/bundle
 
 This mode is one chat in a fresh workspace on the server, with no folder tree.
 
+**What the server keeps.** Every visitor's chat is saved, and (#204) its trajectory is written to the server's `<data>/marv/trajectories/` whenever `trajectories` is on in `<data>/marv/config.json` (the default; there's no config file until you write one). Trajectories hold each turn's prompts, tool calls and the code they read or wrote, for every chat on that server (files 0600 in 0700 folders, the server user's). To keep none, set `{"trajectories": false}` in that config.
+
 ## Next
 
 - Accounts, and a hosted `marv-web` with a workspace per user in a container.
