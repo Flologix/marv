@@ -33,6 +33,11 @@ pub fn to_json(event: &SessionEvent) -> Option<Value> {
             }
             _ => None,
         },
+        // A running call's status line (#201: a mesh send waiting for another Marv's person; a subagent's progress),
+        // shown on its card until it ends.
+        SessionEvent::SubagentProgress { call_id, progress } => {
+            Some(json!({"type": "tool_progress", "id": call_id, "line": printable(&progress.line)}))
+        }
         SessionEvent::Status(status) => Some(json!({"type": "status", "status": match status {
             TurnStatus::WaitingForMcp => "waiting_for_mcp",
             TurnStatus::Compacting => "compacting",
@@ -91,4 +96,23 @@ fn loop_json(event: &LoopEvent, agent: Option<&String>) -> Option<Value> {
         line["agent"] = json!(agent);
     }
     Some(line)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #201: a running call's status line (a mesh send waiting for another Marv's person) reaches the page, printable.
+    #[test]
+    fn a_calls_status_line_reaches_the_page() {
+        let event = SessionEvent::SubagentProgress {
+            call_id: "c1".into(),
+            progress: marv_tools::AgentProgress { line: "waiting for beta to accept the wire\u{1b}[2J".into(), steps: vec![] },
+        };
+        let shown = to_json(&event).unwrap();
+        assert_eq!(shown["type"], "tool_progress");
+        assert_eq!(shown["id"], "c1");
+        assert!(shown["line"].as_str().unwrap().starts_with("waiting for beta to accept the wire"));
+        assert!(!shown["line"].as_str().unwrap().contains('\u{1b}'));
+    }
 }

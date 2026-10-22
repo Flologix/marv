@@ -924,6 +924,15 @@ struct TurnSink {
     turn_number: u32,
 }
 
+/// [`marv_tools::ToolProgress`] through the turn's sink: a call's status line is shown on its card like a subagent's
+/// progress, with no steps.
+struct CallProgress(Arc<dyn SubagentSink>);
+impl marv_tools::ToolProgress for CallProgress {
+    fn progress(&self, call_id: &str, line: String) {
+        self.0.progress(call_id, AgentProgress { line, steps: Vec::new() });
+    }
+}
+
 impl SubagentSink for TurnSink {
     fn usage(&self, usage: &Usage) {
         self.session.count(usage, self.factory.as_ref(), self.info.as_ref());
@@ -1722,7 +1731,7 @@ impl MarvSession {
             provider: provider.clone(),
             approver: client.clone(),
             always: always.clone(),
-            sink,
+            sink: sink.clone(),
             mesh: init.mesh.clone().map(|mesh| MeshAccess { mesh, approver: self.wire_approver() }),
         });
         let mut ctx = ToolContext::new(&init.root);
@@ -1742,6 +1751,8 @@ impl MarvSession {
         ctx.tool_output = init.tool_output_dir.as_ref().map(|dir| dir.join(self.id()));
         self.clean_tool_output_once();
         ctx.agent_host = Some(host);
+        // A running call's status line (#201: a mesh send waiting for another Marv's person) goes out as its progress.
+        ctx.progress = Some(Arc::new(CallProgress(sink)));
         // Where the plan tool writes; only the main agent gets it (as it does agent_host), so subagents have no plan.
         if init.plan {
             ctx.plan = Some(Arc::new(SessionPlan(self.clone())));

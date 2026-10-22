@@ -10,6 +10,10 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 - **macOS builds (#167).** Releases now carry `marv-aarch64-apple-darwin.tar.gz` and `marv-x86_64-apple-darwin.tar.gz` (with their `.sha256`, in `SHA256SUMS`), and npm gets `@flologixai/marv-darwin-arm64` and `@flologixai/marv-darwin-x64`, which `npm install -g @flologixai/marv` picks on a Mac. `install.sh` installs the macOS build instead of stopping with a note (the arm64 one on Apple silicon, even from a shell under Rosetta). Commands run in the Seatbelt sandbox (`sandbox-exec`, built into macOS); the `process` tool isn't on macOS yet (#152). macOS 14 or newer; CI runs the tests and the sandbox guards on macOS 14 and 15 (arm64) and macOS 15 on Intel, as a required check. A smoke test (`packaging/smoke.sh`) installs each build through `install.sh` and through npm and runs a sandboxed `marv -p` turn against a local stub model, in CI and before every release; a release isn't created if it fails.
 
+### Fixed
+
+- **A message to another Marv over a new wire no longer hangs the turn when nobody answers there (#201).** After you approved the send, Marv waited for the other Marv's person to accept the wire with no limit, and Stop couldn't end it (the app had to be force-quit). Now Stop ends the wait at once (the call is interrupted, nothing is wired or sent); otherwise Marv gives up after 3 minutes and tells the model the other Marv's person didn't answer, so the message wasn't sent. Either way the other Marv's prompt is withdrawn, in the TUI and the desktop app, instead of waiting for an answer nobody reads. Meanwhile the call's card says "waiting for <marv> to accept the wire" (in the TUI and the desktop app).
+
 ## [0.8.0] - 2026-10-21
 
 ### Added

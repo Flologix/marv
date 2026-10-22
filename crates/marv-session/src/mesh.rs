@@ -186,6 +186,12 @@ pub fn call_wire_approval(request: &WireRequest, call: Preview) -> ApprovalReque
     }
 }
 
+/// What a call's card says while a new wire waits for another Marv's person (#201). `peer` is a mesh name (one name
+/// segment: letters, digits, `-`), never free text.
+pub fn waiting_for(peer: &str) -> String {
+    format!("waiting for {peer} to accept the wire")
+}
+
 /// A person approves wires through the client's approver (the TUI's approval queue).
 pub struct PersonWires {
     /// The client's own approver, never the session's wrapper: "always" scopes and yolo don't answer for a wire.
@@ -497,10 +503,10 @@ impl MeshTool {
     /// mesh v2: the receptacle may be found on demand (another Marv's inbox, a Herdr pane), and a wire to another
     /// Marv is granted only once that Marv's user approves too (`Switchboard::grant`). If they don't, the message
     /// goes on and is refused; the far end's answer is what the agent reads (`Err` from here).
-    async fn ask_for_wire(&self, receptacle: &ReceptacleName, mode: WireMode) -> Result<(), String> {
+    async fn ask_for_wire(&self, receptacle: &ReceptacleName, mode: WireMode, ctx: &ToolContext) -> Result<(), String> {
         let Some((request, approver)) = self.wire_request(receptacle, mode).await else { return Ok(()) };
         let Some(by) = approver.approve_wire(request.clone()).await else { return Ok(()) };
-        self.grant(request, by).await
+        self.grant(request, by, ctx).await
     }
 
     /// The wire this call would need asked for, and who to ask: `None` when it's wired already, or can't be wired
@@ -515,8 +521,12 @@ impl MeshTool {
         Some((WireRequest { from: self.plug.clone(), to: receptacle.clone(), mode, asked_by: self.plug.clone() }, approver))
     }
 
-    async fn grant(&self, request: WireRequest, by: WireBy) -> Result<(), String> {
+    async fn grant(&self, request: WireRequest, by: WireBy, ctx: &ToolContext) -> Result<(), String> {
         let mode = request.mode;
+        // #201: a wire to another Marv waits for that Marv's person: the call's card says so meanwhile.
+        if let Some((peer, _)) = marv_mesh::discovery::parse_peer(&request.to) {
+            ctx.report_progress(waiting_for(&peer));
+        }
         match self.mesh.grant(request, by).await {
             Ok(()) => Ok(()),
             // A self-wire leaves it unwired, and the switchboard says so; the far end saying no (or not answering,
@@ -654,7 +664,7 @@ impl Tool for MeshTool {
             // wait too (dropping it hangs up on the far door, which withdraws its prompt): no, and the registry reads
             // the stop as an interrupt.
             CallWire::Granted(by) => tokio::select! {
-                granted = self.grant(request, by) => granted.map(|()| Decision::Yes).map_err(ToolError::new),
+                granted = self.grant(request, by, ctx) => granted.map(|()| Decision::Yes).map_err(ToolError::new),
                 _ = ctx.cancel.cancelled() => Ok(Decision::No),
             },
             CallWire::Refused(decision) => Ok(decision),
@@ -665,7 +675,7 @@ impl Tool for MeshTool {
         if let Some((receptacle, mode)) = &target {
             // #201: the far end's person may never answer; a stop ends the wait (and withdraws their prompt).
             let asked = tokio::select! {
-                asked = self.ask_for_wire(receptacle, *mode) => asked,
+                asked = self.ask_for_wire(receptacle, *mode, ctx) => asked,
                 _ = ctx.cancel.cancelled() => Err(marv_tools::INTERRUPTED.to_string()),
             };
             if let Err(err) = asked {
@@ -1112,6 +1122,15 @@ mod tests {
         }
     }
 
+    /// The status lines a call's card showed (#201), with their call ids.
+    #[derive(Default)]
+    struct Shown(Mutex<Vec<(String, String)>>);
+    impl marv_tools::ToolProgress for Shown {
+        fn progress(&self, call_id: &str, line: String) {
+            self.0.lock().unwrap().push((call_id.into(), line));
+        }
+    }
+
     /// alpha (whose person says yes) and beta (whose person is away), on one mesh folder; beta's door waits `wait`.
     fn alpha_and_away_beta(tag: &str, wait: std::time::Duration) -> (Runtime, Marv, Arc<Away>, Marv) {
         let folder = Runtime(std::env::temp_dir().join(format!("ms-{tag}-{}-{}", std::process::id(), marv_fs::random_hex())));
@@ -1127,7 +1146,9 @@ mod tests {
     /// end's prompt is withdrawn.
     #[tokio::test]
     async fn a_stop_while_the_far_person_is_away_interrupts_the_send_and_withdraws_their_prompt() {
-        let (_folder, alpha, away, beta) = alpha_and_away_beta("stop201", std::time::Duration::from_secs(3600));
+        let (_folder, mut alpha, away, beta) = alpha_and_away_beta("stop201", std::time::Duration::from_secs(3600));
+        let shown = Arc::new(Shown::default());
+        alpha.ctx.progress = Some(shown.clone());
         let stop = alpha.ctx.cancel.clone();
         let asked = away.asked.notified();
         let gone = away.gone.notified();
@@ -1142,6 +1163,8 @@ mod tests {
         .expect("a stop ends the wait for the far end");
         assert!(out.result.declined, "{}", out.result.output);
         assert_eq!(out.result.output, marv_tools::INTERRUPTED);
+        // Meanwhile the call's card said who it waited for.
+        assert_eq!(*shown.0.lock().unwrap(), [("c1".to_string(), "waiting for beta to accept the wire".to_string())]);
         assert!(alpha.mesh.table().all().is_empty() && beta.mesh.table().all().is_empty());
         assert!(beta.mesh.drain_inbox(&parent_id()).is_empty());
         // alpha hung up: beta's door stops waiting, and its person's prompt goes.
