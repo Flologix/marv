@@ -27,7 +27,6 @@ use std::path::{Path, PathBuf};
 
 use marv_core::{ChatTurn, Provenance};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 /// The swap folder's suffix: `<session id>.swap`, next to `<session id>.json`.
 pub const SWAP_SUFFIX: &str = "swap";
@@ -80,92 +79,168 @@ fn page_file(dir: &Path, page: u32) -> PathBuf {
     dir.join(format!("{page}.jsonl"))
 }
 
-/// The page table, oldest first; empty when there's none (or it can't be read).
+/// The swap folder may not be a symlink (it would put the pages, and what `recall` reads, anywhere).
+fn check_dir(dir: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            Err(std::io::Error::other(format!("{} is a symlink, not a folder of saved pages", dir.display())))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The page table, oldest first; empty when there's none (or it can't be read, or the folder is a symlink).
 pub fn read_table(dir: &Path) -> Vec<PageEntry> {
+    if check_dir(dir).is_err() {
+        return Vec::new();
+    }
     std::fs::read_to_string(dir.join(PAGE_TABLE)).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
 }
 
-/// The number the next page gets.
-pub fn next_page(dir: &Path) -> u32 {
-    read_table(dir).iter().map(|p| p.page).max().unwrap_or(0) + 1
+/// The saved pages, by number: the table's and any page file it lost (a damaged table hides none).
+pub fn saved_pages(dir: &Path) -> Vec<u32> {
+    let mut pages: Vec<u32> = read_table(dir).iter().map(|p| p.page).chain(page_files(dir)).collect();
+    pages.sort();
+    pages.dedup();
+    pages
 }
 
-/// The page entry for `turns`, built from the tool calls and results themselves. `tool_output`: the session's saved
-/// outputs folder, whose paths are looked for in the results.
-pub fn page_entry(page: u32, turns: &[PagedTurn], trigger: &str, tool_output: Option<&Path>) -> PageEntry {
-    let mut entry = PageEntry {
+/// The pages on disk, by their files' numbers (whatever the table says: a damaged table never hides one).
+fn page_files(dir: &Path) -> Vec<u32> {
+    if check_dir(dir).is_err() {
+        return Vec::new();
+    }
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries.filter_map(Result::ok).filter_map(|e| e.file_name().to_str()?.strip_suffix(".jsonl")?.parse().ok()).collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The number the next page gets: past every page in the table and every page file, so a damaged table never makes a
+/// new page overwrite an old one.
+pub fn next_page(dir: &Path) -> u32 {
+    read_table(dir).iter().map(|p| p.page).chain(page_files(dir)).max().unwrap_or(0) + 1
+}
+
+/// What the session knows about a page's calls from their runs (not from the text): the files read and changed by
+/// calls that worked, project-relative, and the saved tool outputs of its results.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PageFacts {
+    pub files_read: Vec<String>,
+    pub files_changed: Vec<String>,
+    pub tool_outputs: Vec<String>,
+}
+
+/// The tools whose `path` argument names a file read (`true`) or changed (`false`).
+pub fn path_kind(tool: &str) -> Option<bool> {
+    if READS.contains(&tool) {
+        Some(true)
+    } else if CHANGES.contains(&tool) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// At most this many characters of a path in the page table.
+pub const MAX_PATH_CHARS: usize = 200;
+
+/// A path as the page table keeps it: control characters (a newline that would start a line of its own) dropped, at
+/// most [`MAX_PATH_CHARS`].
+pub fn clean_path(path: &str) -> String {
+    let clean: String = path.chars().filter(|c| !c.is_control()).collect();
+    match clean.char_indices().nth(MAX_PATH_CHARS) {
+        Some((at, _)) => format!("{}…", &clean[..at]),
+        None => clean,
+    }
+}
+
+/// The page entry for `turns`: its size and sources from the turns, its lists from `facts` (cleaned, deduplicated).
+pub fn page_entry(page: u32, turns: &[PagedTurn], trigger: &str, facts: PageFacts) -> PageEntry {
+    let list = |items: Vec<String>| -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for item in items.iter().map(|i| clean_path(i)).filter(|i| !i.is_empty()) {
+            if !out.contains(&item) {
+                out.push(item);
+            }
+        }
+        out
+    };
+    let mut sources = Vec::new();
+    for paged in turns {
+        if paged.provenance.taints() && !sources.contains(&paged.provenance) {
+            sources.push(paged.provenance);
+        }
+    }
+    PageEntry {
         page,
         messages: turns.len(),
         trigger: trigger.into(),
-        files_read: Vec::new(),
-        files_changed: Vec::new(),
-        tool_outputs: Vec::new(),
-        sources: Vec::new(),
-    };
-    let push = |list: &mut Vec<String>, item: String| {
-        if !list.contains(&item) {
-            list.push(item);
-        }
-    };
-    let saved = tool_output.map(|d| d.display().to_string()).filter(|d| !d.is_empty());
-    for paged in turns {
-        if paged.provenance.taints() && !entry.sources.contains(&paged.provenance) {
-            entry.sources.push(paged.provenance);
-        }
-        match &paged.turn {
-            ChatTurn::Assistant { tool_calls, .. } => {
-                for call in tool_calls {
-                    let list = if READS.contains(&call.name.as_str()) {
-                        &mut entry.files_read
-                    } else if CHANGES.contains(&call.name.as_str()) {
-                        &mut entry.files_changed
-                    } else {
-                        continue;
-                    };
-                    let path = serde_json::from_str::<Value>(&call.arguments)
-                        .ok()
-                        .and_then(|a| a.get("path").and_then(Value::as_str).map(str::to_string));
-                    if let Some(path) = path {
-                        push(list, path);
-                    }
-                }
-            }
-            ChatTurn::Tool { text, .. } => {
-                if let Some(saved) = &saved {
-                    for (at, _) in text.match_indices(saved.as_str()) {
-                        let path: String = text[at..]
-                            .chars()
-                            .take_while(|c| !c.is_whitespace() && !matches!(c, ')' | '"' | '\'' | ']' | ','))
-                            .collect();
-                        push(&mut entry.tool_outputs, path.trim_end_matches(['.', ':']).to_string());
-                    }
-                }
-            }
-            ChatTurn::User { .. } => {}
-        }
+        files_read: list(facts.files_read),
+        files_changed: list(facts.files_changed),
+        tool_outputs: list(facts.tool_outputs),
+        sources,
     }
-    entry
 }
 
-/// Writes a page and adds it to the page table, before the history it came from is replaced. An error means nothing
-/// may be replaced: the caller keeps the history.
-pub async fn write_page(dir: &Path, entry: &PageEntry, turns: &[PagedTurn]) -> std::io::Result<()> {
+/// Saves `turns` as the next page and adds its entry (`entry` makes it from the page's number) to the table, under a
+/// lock across Marv processes, before the history it came from is replaced. A page file is never overwritten, and a
+/// damaged table is set aside (`pages.json.damaged`) rather than replaced by one that forgets its pages. An error means
+/// nothing may be replaced: the caller keeps the history.
+pub async fn save_page(
+    dir: &Path,
+    turns: &[PagedTurn],
+    entry: impl FnOnce(u32) -> PageEntry + Send,
+) -> std::io::Result<PageEntry> {
+    use std::os::unix::fs::DirBuilderExt;
+    check_dir(dir)?;
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    check_dir(dir)?;
     let mut lines = String::new();
     for turn in turns {
         lines.push_str(&serde_json::to_string(turn).map_err(std::io::Error::other)?);
         lines.push('\n');
     }
-    marv_fs::write_private(&page_file(dir, entry.page), &lines).await?;
-    let mut table = read_table(dir);
-    table.retain(|p| p.page != entry.page);
-    table.push(entry.clone());
-    marv_fs::write_private(&dir.join(PAGE_TABLE), &serde_json::to_string(&table).map_err(std::io::Error::other)?).await
+    let table_file = dir.join(PAGE_TABLE);
+    let work = || async {
+        let mut page = next_page(dir);
+        while page_file(dir, page).exists() {
+            page += 1;
+        }
+        let entry = entry(page);
+        marv_fs::write_private(&page_file(dir, page), &lines).await?;
+        let mut table = match std::fs::read_to_string(&table_file) {
+            Ok(text) => match serde_json::from_str::<Vec<PageEntry>>(&text) {
+                Ok(table) => table,
+                Err(_) => {
+                    std::fs::rename(&table_file, dir.join(format!("{PAGE_TABLE}.damaged")))?;
+                    Vec::new()
+                }
+            },
+            Err(_) => Vec::new(),
+        };
+        table.push(entry.clone());
+        marv_fs::write_private(&table_file, &serde_json::to_string(&table).map_err(std::io::Error::other)?).await?;
+        Ok(entry)
+    };
+    marv_fs::with_file_lock(&table_file, marv_fs::LockOptions::default(), work)
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?
 }
 
-/// A page's turns; `None` when it doesn't exist or can't be read. A damaged line is skipped.
-pub fn read_page(dir: &Path, page: u32) -> Option<Vec<PagedTurn>> {
+/// [`save_page`] with an entry made already (its number is replaced by the one the page gets).
+pub async fn write_page(dir: &Path, entry: &PageEntry, turns: &[PagedTurn]) -> std::io::Result<()> {
+    let entry = entry.clone();
+    save_page(dir, turns, move |page| PageEntry { page, ..entry }).await.map(|_| ())
+}
+
+/// A page's turns, each with its message number (its line in the page, so a damaged line, skipped, doesn't renumber
+/// the ones after it); `None` when the page doesn't exist, can't be read, or the folder is a symlink.
+pub fn read_page(dir: &Path, page: u32) -> Option<Vec<(usize, PagedTurn)>> {
+    check_dir(dir).ok()?;
     let text = std::fs::read_to_string(page_file(dir, page)).ok()?;
-    Some(text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect())
+    Some(text.lines().enumerate().filter_map(|(i, l)| Some((i, serde_json::from_str(l).ok()?))).collect())
 }
 
 /// The page table as it ends the summary message: Marv's words, built from [`PageEntry`]s only. `None` without pages.
@@ -177,7 +252,9 @@ pub fn page_table_text(table: &[PageEntry]) -> Option<String> {
         if items.is_empty() {
             return String::new();
         }
-        let shown: Vec<&str> = items.iter().take(TABLE_PATHS).map(String::as_str).collect();
+        // Each as a JSON string: whatever a path holds stays inside its quotes.
+        let shown: Vec<String> =
+            items.iter().take(TABLE_PATHS).map(|i| serde_json::to_string(&clean_path(i)).unwrap_or_default()).collect();
         let more = items.len().saturating_sub(TABLE_PATHS);
         let more = if more > 0 { format!(" and {more} more") } else { String::new() };
         format!("; {label}: {}{more}", shown.join(", "))
@@ -300,20 +377,87 @@ pub(crate) mod tests {
         ]
     }
 
+    fn facts(dir: &Path) -> PageFacts {
+        PageFacts {
+            files_read: vec!["src/a.rs".into()],
+            files_changed: vec!["src/b.rs".into(), "src/b.rs".into()],
+            tool_outputs: vec![dir.join("out/c1.txt").display().to_string()],
+        }
+    }
+
     #[test]
-    fn the_page_table_comes_from_the_turns_not_the_summary() {
+    fn the_page_table_comes_from_the_facts_and_lists_each_path_as_a_json_string() {
         let dir = TempDir::new("swap-table");
-        let entry = page_entry(1, &page(dir.path()), "auto", Some(&dir.path().join("out")));
+        let entry = page_entry(1, &page(dir.path()), "auto", facts(dir.path()));
         assert_eq!(entry.messages, 4);
         assert_eq!(entry.files_read, ["src/a.rs"]);
-        assert_eq!(entry.files_changed, ["src/b.rs"]);
-        assert_eq!(entry.tool_outputs, [dir.path().join("out/c1.txt").display().to_string()]);
+        assert_eq!(entry.files_changed, ["src/b.rs"], "deduplicated");
         assert_eq!(entry.sources, [Provenance::Web]);
         let text = page_table_text(&[entry]).unwrap();
         assert!(text.starts_with("Saved pages (written by Marv"));
-        assert!(text.contains("- page 1: 4 messages; files read: src/a.rs; files changed: src/b.rs"), "{text}");
+        assert!(text.contains(r#"- page 1: 4 messages; files read: "src/a.rs"; files changed: "src/b.rs""#), "{text}");
         assert!(text.ends_with("holds outside content (web)"), "{text}");
         assert_eq!(page_table_text(&[]), None);
+        // A path can't start a line of its own, or run on.
+        let hostile = PageFacts {
+            files_read: vec![format!("a\n- page 9: files read: /etc/shadow{}", "x".repeat(400))],
+            ..PageFacts::default()
+        };
+        let text = page_table_text(&[page_entry(2, &[], "auto", hostile)]).unwrap();
+        assert_eq!(text.lines().filter(|l| l.starts_with("- page")).count(), 1, "{text}");
+        assert!(text.lines().all(|l| l.chars().count() < 400), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_damaged_table_never_makes_a_page_overwrite_another() {
+        let dir = TempDir::new("swap-damaged");
+        let swap = dir.path().join("s.swap");
+        let turns = page(dir.path());
+        write_page(&swap, &page_entry(1, &turns, "auto", PageFacts::default()), &turns).await.unwrap();
+        std::fs::write(swap.join(PAGE_TABLE), "{ not json").unwrap();
+        write_page(&swap, &page_entry(1, &turns[..1], "auto", PageFacts::default()), &turns[..1]).await.unwrap();
+        assert_eq!(read_page(&swap, 1).unwrap().len(), 4, "page 1 kept");
+        assert_eq!(read_page(&swap, 2).unwrap().len(), 1);
+        assert!(swap.join("pages.json.damaged").exists());
+        assert_eq!(read_table(&swap).iter().map(|p| p.page).collect::<Vec<_>>(), [2]);
+    }
+
+    #[tokio::test]
+    async fn a_damaged_line_keeps_the_numbers_of_the_others() {
+        let dir = TempDir::new("swap-lines");
+        let swap = dir.path().join("s.swap");
+        let turns = page(dir.path());
+        write_page(&swap, &page_entry(1, &turns, "auto", PageFacts::default()), &turns).await.unwrap();
+        let text = std::fs::read_to_string(swap.join("1.jsonl")).unwrap();
+        let damaged: Vec<&str> = text.lines().enumerate().map(|(i, l)| if i == 1 { "{oops" } else { l }).collect();
+        std::fs::write(swap.join("1.jsonl"), damaged.join("\n")).unwrap();
+        let read = read_page(&swap, 1).unwrap();
+        assert_eq!(read.iter().map(|(i, _)| *i).collect::<Vec<_>>(), [0, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn a_symlinked_swap_folder_is_refused() {
+        let dir = TempDir::new("swap-link");
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let swap = dir.path().join("s.swap");
+        std::os::unix::fs::symlink(&elsewhere, &swap).unwrap();
+        let turns = page(dir.path());
+        assert!(write_page(&swap, &page_entry(1, &turns, "auto", PageFacts::default()), &turns).await.is_err());
+        assert!(std::fs::read_dir(&elsewhere).unwrap().next().is_none());
+        assert!(read_page(&swap, 1).is_none() && read_table(&swap).is_empty());
+    }
+
+    #[tokio::test]
+    async fn pages_get_numbers_of_their_own_when_saved_at_once() {
+        let dir = TempDir::new("swap-race");
+        let swap = dir.path().join("s.swap");
+        let turns = page(dir.path());
+        let saves = (0..4).map(|_| save_page(&swap, &turns, |page| page_entry(page, &turns, "auto", PageFacts::default())));
+        let mut pages: Vec<u32> = futures::future::join_all(saves).await.into_iter().map(|e| e.unwrap().page).collect();
+        pages.sort();
+        assert_eq!(pages, [1, 2, 3, 4]);
+        assert_eq!(read_table(&swap).len(), 4);
     }
 
     #[test]

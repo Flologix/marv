@@ -661,8 +661,9 @@ struct State {
     /// was the whole-window last attempt. Reset by an overflow's first attempt.
     overflow_level: Option<u32>,
     overflow_last_attempt: bool,
-    /// Where each of this conversation's tool results came from (by call id), for its saved pages; cleared with it.
-    provenance: HashMap<String, Provenance>,
+    /// Where each of this conversation's tool results came from (by call id), and whether the call worked, for its
+    /// saved pages (their sources, and the page table's lists of files); cleared with the conversation.
+    provenance: HashMap<String, (Provenance, bool)>,
     current: Option<CancellationToken>,
     running: bool,
     closed: bool,
@@ -1991,7 +1992,8 @@ impl MarvSession {
                 }
                 LoopEvent::ToolEnd { call, run } => {
                     // Where the result came from, for its saved page (#63) if a compaction pages it out.
-                    self.state().provenance.insert(call.id.clone(), run.provenance);
+                    let worked = !run.result.is_error && !run.declined;
+                    self.state().provenance.insert(call.id.clone(), (run.provenance, worked));
                     if run.declined {
                         self.state().radio_turn.declined = Some(call.name.clone());
                     }
@@ -2461,7 +2463,7 @@ impl MarvSession {
         };
         match turn {
             ChatTurn::Tool { call_id, name, text } => {
-                if let Some(run) = self.state().provenance.get(call_id).copied().filter(|p| p.taints()) {
+                if let Some(run) = self.state().provenance.get(call_id).map(|(p, _)| *p).filter(|p| p.taints()) {
                     return run;
                 }
                 fenced(text).unwrap_or(match name.as_str() {
@@ -2489,14 +2491,57 @@ impl MarvSession {
             .into_iter()
             .map(|(index, turn)| marv_tools::swap::PagedTurn { index, provenance: self.paged_provenance(&turn), turn })
             .collect();
-        let page = marv_tools::swap::next_page(&dir);
-        let saved_outputs = self.inner.init.tool_output_dir.as_ref().map(|d| d.join(self.id()));
-        let entry = marv_tools::swap::page_entry(page, &paged, trigger.as_str(), saved_outputs.as_deref());
-        marv_tools::swap::write_page(&dir, &entry, &paged).await.map_err(|e| {
-            format!("Couldn't save the messages a compaction would replace ({e}), so the conversation was kept as it was.")
-        })?;
+        let facts = self.page_facts(&paged);
+        let entry =
+            marv_tools::swap::save_page(&dir, &paged, |page| marv_tools::swap::page_entry(page, &paged, trigger.as_str(), facts))
+                .await
+                .map_err(|e| {
+                    format!(
+                        "Couldn't save the messages a compaction would replace ({e}), so the conversation was kept as it was."
+                    )
+                })?;
         let table = marv_tools::swap::page_table_text(&marv_tools::swap::read_table(&dir)).unwrap_or_default();
-        Ok(Some((page, table)))
+        Ok(Some((entry.page, table)))
+    }
+
+    /// What a page's table entry lists, from the calls' runs rather than any text: the files read and changed by calls
+    /// that worked (their `path`, resolved inside the project, project-relative) and the saved outputs of its results
+    /// (the session's saved-outputs folder, by call id).
+    fn page_facts(&self, paged: &[marv_tools::swap::PagedTurn]) -> marv_tools::swap::PageFacts {
+        let root = marv_sandbox::paths::normalize(&self.inner.init.root);
+        let runs = self.state().provenance.clone();
+        let saved = self.inner.init.tool_output_dir.as_ref().map(|d| d.join(self.id()));
+        let mut facts = marv_tools::swap::PageFacts::default();
+        for turn in paged.iter().map(|p| &p.turn) {
+            match turn {
+                ChatTurn::Assistant { tool_calls, .. } => {
+                    for call in tool_calls {
+                        let Some(read) = marv_tools::swap::path_kind(&call.name) else { continue };
+                        if !runs.get(&call.id).is_some_and(|(_, worked)| *worked) {
+                            continue;
+                        }
+                        let args: serde_json::Value = serde_json::from_str(&call.arguments).unwrap_or_default();
+                        let Some(path) = args.get("path").and_then(serde_json::Value::as_str) else { continue };
+                        let (path, _) = marv_tools::repair::repair_project_path(&root, path);
+                        let abs = marv_sandbox::paths::normalize(&root.join(&path));
+                        let Ok(rel) = abs.strip_prefix(&root) else { continue };
+                        let rel = rel.to_string_lossy().into_owned();
+                        if rel.is_empty() {
+                            continue;
+                        }
+                        if read { facts.files_read.push(rel) } else { facts.files_changed.push(rel) }
+                    }
+                }
+                ChatTurn::Tool { call_id, .. } => {
+                    if let Some(dir) = &saved {
+                        let found = marv_tools::output::saved_outputs(dir, call_id);
+                        facts.tool_outputs.extend(found.iter().map(|p| p.display().to_string()));
+                    }
+                }
+                ChatTurn::User { .. } => {}
+            }
+        }
+        facts
     }
 
     /// Takes back a page whose compaction didn't happen (its summary failed): the history still holds its turns.
@@ -5482,7 +5527,8 @@ mod turn_tests {
         let before = lock(&session.state().conversation.clone()).clone();
         assert!(matches!(session.compact(None).await.unwrap(), CompactResult::Compacted { .. }));
         let swap = marv_tools::swap::swap_dir(&sessions.file(&dirs.project, &session.id()));
-        let page = marv_tools::swap::read_page(&swap, 1).expect("page 1");
+        let page: Vec<marv_tools::swap::PagedTurn> =
+            marv_tools::swap::read_page(&swap, 1).expect("page 1").into_iter().map(|(_, t)| t).collect();
         assert_eq!(page.iter().map(|p| p.turn.clone()).collect::<Vec<_>>(), before, "byte for byte");
         let web_result = page.iter().find(|p| matches!(&p.turn, ChatTurn::Tool { name, .. } if name == "web_fetch")).unwrap();
         assert_eq!(web_result.provenance, Provenance::Web);

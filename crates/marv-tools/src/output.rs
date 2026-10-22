@@ -122,16 +122,39 @@ pub fn saved_provenance(path: &Path) -> Provenance {
     }
 }
 
+/// The start of a call's saved outputs' names (`<stem>[-n][.<source>].txt`): a provider's id is the model's text as far
+/// as a file name goes, so only what's safe in one.
+pub fn saved_stem(call_id: &str) -> String {
+    let name: String =
+        call_id.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' }).take(100).collect();
+    if name.is_empty() { "call".into() } else { name }
+}
+
+/// The saved outputs of call `call_id` in `dir` (a session's folder), by name: what a page lists, from the files
+/// themselves rather than from the result's text.
+pub fn saved_outputs(dir: &Path, call_id: &str) -> Vec<PathBuf> {
+    let stem = saved_stem(call_id);
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut found: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .filter(|e| {
+            let name = e.file_name();
+            let Some(name) = name.to_str().and_then(|n| n.strip_suffix(".txt")) else { return false };
+            let Some(rest) = name.strip_prefix(&stem) else { return false };
+            let rest = rest.strip_prefix('-').map_or(rest, |r| r.trim_start_matches(|c: char| c.is_ascii_digit()));
+            rest.is_empty() || (rest.starts_with('.') && !rest[1..].contains('.'))
+        })
+        .map(|e| e.path())
+        .collect();
+    found.sort();
+    found
+}
+
 /// Writes `text` to a new `<call id>[.<source>].txt` in `dir` (0600; `-1`, `-2`… when the name is taken). Returns its
 /// path.
 fn save(text: &str, dir: &Path, call_id: &str, source: Provenance) -> std::io::Result<PathBuf> {
     std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
-    // A provider's id is the model's text as far as a file name goes: only what's safe in one.
-    let mut name: String =
-        call_id.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' }).take(100).collect();
-    if name.is_empty() {
-        name = "call".into();
-    }
+    let name = saved_stem(call_id);
     let tag = source_tag(source).map_or(String::new(), |t| format!(".{t}"));
     for n in 0.. {
         let path = if n == 0 { dir.join(format!("{name}{tag}.txt")) } else { dir.join(format!("{name}-{n}{tag}.txt")) };
