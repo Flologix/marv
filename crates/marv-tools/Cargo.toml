@@ -36,6 +36,8 @@ dom_smoothie = "0.18.2"
 dom_query = "0.28"
 flate2 = "1"
 brotli = "8"
+# A trusted project skill's files are checked against their hashes when read (`skill::content_hash`).
+sha2 = "0.10"
 encoding_rs = "0.8"
 
 [lints]

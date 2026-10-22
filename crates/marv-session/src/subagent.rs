@@ -400,7 +400,7 @@ async fn drive(
     run.tainted = child_taint.is_tainted();
     let mut runner = SessionToolRunner::new(sub_ctx, Arc::new(available));
     if host.nested_instructions {
-        runner.nested = Some(Arc::new(crate::instructions::NestedInstructions::new(host.nested_trusted)));
+        runner.nested = Some(Arc::new(crate::instructions::NestedInstructions::new(host.nested_trust.clone())));
     }
     let runner = Arc::new(runner);
     let history: History = Arc::new(Mutex::new(vec![ChatTurn::User { text: input.prompt.clone() }]));
@@ -718,7 +718,7 @@ mod run_tests {
                 cwd: "~/proj".into(),
                 instructions: None,
                 nested_instructions: false,
-                nested_trusted: false,
+                nested_trust: Arc::default(),
                 worktrees_dir: worktrees.then(|| self.trees.0.clone()),
                 factory: Arc::new(Factory { provider: provider.clone(), models: seen.models.clone() }),
                 provider,

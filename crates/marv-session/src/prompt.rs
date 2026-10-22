@@ -529,7 +529,7 @@ pub fn render_instructions(files: &[InstructionFile]) -> Option<Instructions> {
             };
             sections.push(format!(
                 "{QUOTED_HEADING}{})\n\n{}\n\n{fenced}{after}",
-                file.shown,
+                marv_core::printable(&file.shown),
                 crate::project_trust::UNTRUSTED_NOTE
             ));
         } else {
@@ -538,7 +538,7 @@ pub fn render_instructions(files: &[InstructionFile]) -> Option<Instructions> {
                 InstructionKind::Parent => PARENT_HEADING,
                 InstructionKind::Personal => PERSONAL_HEADING,
             };
-            sections.push(format!("{heading}{})\n\n{body}", file.shown));
+            sections.push(format!("{heading}{})\n\n{body}", marv_core::printable(&file.shown)));
         }
         if file.kind == InstructionKind::Project {
             project_cut = cut.map(|cut| InstructionsCut { file: file.shown.clone(), ..cut });

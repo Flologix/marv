@@ -278,10 +278,10 @@ pub struct SessionInit {
     /// result there, once per conversation (#62; `crate::instructions::NestedInstructions`). Default false: an SDK
     /// session reads the project's files only when it asks for the `Project` source; the CLI sets it.
     pub nested_instructions: bool,
-    /// The person trusted this project's instructions (`crate::project_trust`): nested instruction files come as the
-    /// project's instructions, not quoted as its data. Default false. The caller loads `instructions`, `skills` and
-    /// `agents` to match (`crate::instructions::load_instructions_as`, `crate::sources::load_sources`).
-    pub project_trusted: bool,
+    /// Which of the project's subfolder instruction files count as the person's (`crate::project_trust`): any other
+    /// is quoted as the project's data. Default: none. The caller loads `instructions`, `skills` and `agents` with the
+    /// root's trust applied (`crate::project_trust::load_project`).
+    pub nested_trust: Arc<crate::project_trust::NestedTrust>,
     pub skills: Vec<LoadedSkill>,
     /// Agent types the agent tool can start (default: general-purpose).
     pub agents: Vec<AgentType>,
@@ -396,7 +396,7 @@ impl SessionInit {
             version: env!("CARGO_PKG_VERSION").into(),
             instructions: None,
             nested_instructions: false,
-            project_trusted: false,
+            nested_trust: Arc::default(),
             skills: Vec::new(),
             agents: vec![general_purpose()],
             memory: None,
@@ -1089,13 +1089,15 @@ impl MarvSession {
                 init.pre_approved.clear();
             }
         }
+        // A subfolder instruction file quoted for the first time is a notice (the session's warnings).
+        init.nested_trust.set_warn(init.on_warning.clone());
         let inner = Inner {
             specs,
             always,
             taint: Arc::new(TaintState::new()),
             skills: Arc::new(init.skills.iter().map(|s| s.skill.clone()).collect()),
             loaded: Arc::default(),
-            nested: Arc::new(crate::instructions::NestedInstructions::new(init.project_trusted)),
+            nested: Arc::new(crate::instructions::NestedInstructions::new(init.nested_trust.clone())),
             typecheck: Arc::new(Checker::new(Arc::new(crate::diagnostics::turn::Typecheck), None)),
             project_checks: Arc::new(Checker::new(Arc::new(crate::checks::kind::ProjectChecksKind), None)),
             process_on,
@@ -1737,7 +1739,7 @@ impl MarvSession {
             cwd: self.cwd(),
             instructions: init.instructions.clone(),
             nested_instructions: init.nested_instructions,
-            nested_trusted: init.project_trusted,
+            nested_trust: init.nested_trust.clone(),
             worktrees_dir: init.worktrees_dir.clone(),
             factory: factory.clone(),
             provider: provider.clone(),
@@ -2716,6 +2718,12 @@ impl MarvSession {
         if let Some(processes) = &self.inner.processes {
             processes.close_all().await;
         }
+    }
+
+    /// The project's subfolder instruction files this session quoted as data, not trusted (shown → hash), for
+    /// `/trust` to record (`crate::project_trust::ProjectTrust::trust`).
+    pub fn nested_quoted(&self) -> std::collections::BTreeMap<String, String> {
+        self.inner.init.nested_trust.quoted()
     }
 
     /// The background processes (Marv #51): name, command, ports, state.

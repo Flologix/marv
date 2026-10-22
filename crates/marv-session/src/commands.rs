@@ -1380,6 +1380,7 @@ mod tests {
                 dir: "/x".into(),
                 body: String::new(),
                 files: vec![],
+                trusted_files: None,
             },
             source,
             link: link.map(Into::into),
