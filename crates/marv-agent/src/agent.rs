@@ -885,8 +885,10 @@ impl LoopState {
         self.options.history.lock().unwrap_or_else(|e| e.into_inner()).push(turn);
     }
 
+    /// Marv's notes go in as user turns, merged into a trailing one (a mid-turn compaction's note, the turn's own
+    /// message): never two user turns in a row (#63 review).
     fn push_note(&self, text: &str) {
-        self.push_turn(ChatTurn::User { text: text.to_string() });
+        crate::compact::push_user(&mut self.options.history.lock().unwrap_or_else(|e| e.into_inner()), text);
     }
 
     fn push_result(&self, call: &ToolCall, text: &str) {
@@ -2151,7 +2153,7 @@ mod tests {
         let events = collect(options(provider.clone(), &h, plain())).await;
         let requests = provider.requests();
         assert_eq!(requests.len(), 3);
-        assert_eq!(requests[2].0.last(), Some(&user(EMPTY_REPLY_NOTE)));
+        assert_eq!(requests[2].0.last(), Some(&user(&format!("go\n\n{EMPTY_REPLY_NOTE}"))));
         assert_eq!(empties(&events), [EmptyNext::Retry, EmptyNext::Nudge, EmptyNext::Stop]);
         assert_eq!(end(&events), Some(StopReason::End));
     }
@@ -2165,7 +2167,7 @@ mod tests {
         ]));
         let h = history(vec![user("go")]);
         collect(options(provider, &h, plain())).await;
-        assert_eq!(snapshot(&h), [user("go"), user(EMPTY_REPLY_NOTE), said("Done.")]);
+        assert_eq!(snapshot(&h), [user(&format!("go\n\n{EMPTY_REPLY_NOTE}")), said("Done.")]);
     }
 
     #[tokio::test]
@@ -2279,7 +2281,8 @@ mod tests {
             collect(AgentOptions { max_steps: 2, wrap_up_at_limit: true, ..options(provider.clone(), &h, runner) }).await;
         let requests = provider.requests();
         assert_eq!(requests.len(), 3, "the continue used the last step; then only the wrap-up");
-        assert_eq!(requests[2].0.last(), Some(&user(STEP_LIMIT_NOTE)));
+        assert!(matches!(requests[2].0.last(), Some(ChatTurn::User { text }) if text.ends_with(STEP_LIMIT_NOTE)));
+        assert!(crate::compact::alternates(&requests[2].0));
         assert_eq!(requests[2].1.tool_choice, ToolChoice::None);
         assert_eq!(announced_steps(&events), [true]);
         assert_eq!(end(&events), Some(StopReason::MaxSteps));
@@ -2390,7 +2393,11 @@ mod tests {
         ]));
         let h = history(vec![user("go")]);
         collect(options(provider.clone(), &h, plain())).await;
-        assert_eq!(provider.requests()[1].0.last(), Some(&user(CUT_OFF_REASONING_NOTE)));
+        assert_eq!(
+            provider.requests()[1].0.last(),
+            Some(&user(&format!("go\n\n{CUT_OFF_REASONING_NOTE}"))),
+            "joined, not a second user turn"
+        );
     }
 
     #[tokio::test]
@@ -2996,6 +3003,29 @@ mod tests {
         let events = collect(AgentOptions { on_overflow: Some(hook), ..options(provider, &h, plain()) }).await;
         assert_eq!(end(&events), Some(StopReason::Aborted));
         assert!(!events.iter().any(|e| matches!(e, LoopEvent::Error(_))));
+    }
+
+    #[tokio::test]
+    async fn a_note_after_a_mid_turn_compaction_joins_its_note_and_every_request_alternates() {
+        let provider = Arc::new(ScriptedProvider::new(vec![use_tools(&[call("c1", "a.ts")]), say("Done.")]));
+        let h = history(vec![user("go")]);
+        let swapped = h.clone();
+        let on_full: OnFull = Arc::new(move || {
+            let ack = ChatTurn::Assistant { text: crate::compact::COMPACTED_ACK.into(), tool_calls: vec![], reasoning: None };
+            *swapped.lock().unwrap() = vec![user("summary"), ack, user(crate::compact::MID_TURN_NOTE)];
+            Box::pin(async { true })
+        });
+        let opts = AgentOptions {
+            on_full: Some(on_full),
+            after_step: after_step(|_| Some("Marv: the typecheck found 1 new error".into())),
+            ..options(provider.clone(), &h, plain())
+        };
+        collect(opts).await;
+        for (sent, _) in provider.requests() {
+            assert!(crate::compact::alternates(&sent), "{sent:?}");
+        }
+        let last = provider.requests()[1].0.last().cloned().unwrap();
+        assert_eq!(last, user(&format!("{}\n\nMarv: the typecheck found 1 new error", crate::compact::MID_TURN_NOTE)));
     }
 
     #[tokio::test]

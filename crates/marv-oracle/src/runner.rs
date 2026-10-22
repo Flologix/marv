@@ -309,6 +309,24 @@ pub fn canonical_request(body: &str) -> String {
         tools.iter_mut().filter_map(|t| t.pointer_mut("/function/description")).for_each(unword);
     }
     strip_cache_control(&mut value);
+    // marv-rs (#63 review) merges Marv's notes into a trailing user message instead of sending a second one: compare
+    // with Marv's two as one.
+    if let Some(messages) = value.get_mut("messages").and_then(Value::as_array_mut) {
+        let mut merged: Vec<Value> = Vec::with_capacity(messages.len());
+        for message in messages.drain(..) {
+            let user_text = |m: &Value| {
+                (m.get("role") == Some(&json!("user"))).then(|| m.get("content")?.as_str().map(str::to_string)).flatten()
+            };
+            match (merged.last_mut(), user_text(&message)) {
+                (Some(last), Some(text)) if user_text(last).is_some() => {
+                    let joined = format!("{}\n\n{text}", user_text(last).unwrap_or_default());
+                    last["content"] = Value::String(joined);
+                }
+                _ => merged.push(message),
+            }
+        }
+        *messages = merged;
+    }
     if let Some(body) = value.as_object_mut() {
         body.remove("max_tokens");
     }
@@ -513,6 +531,13 @@ mod tests {
         let canonical: Value = serde_json::from_str(&canonical_request(&body)).unwrap();
         assert_eq!(canonical["messages"][0]["content"], "You are Marv.\n\n# Sandbox limits\n\nEnds.\n\n# MCP servers\n\nSetup.");
         assert_eq!(canonical["messages"][1]["content"], "# Your situation");
+    }
+
+    #[test]
+    fn two_user_messages_in_a_row_compare_as_marv_rs_s_merged_one() {
+        let marvs = json!({"messages": [{"role": "user", "content": "go"}, {"role": "user", "content": "note"}]});
+        let ours = json!({"messages": [{"role": "user", "content": "go\n\nnote"}]});
+        assert_eq!(canonical_request(&ours.to_string()), canonical_request(&marvs.to_string()));
     }
 
     #[test]
