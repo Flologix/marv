@@ -9,9 +9,10 @@
 //! Most properties are per call (bash with `network: true`, a GitHub write), so the table has two parts: the tools,
 //! and a set of example calls ([`examples`]) with what each one does. Every built-in tool has at least one example.
 //!
-//! The examples are evaluated in a fixed context ([`example_context`]): the sandbox off (so the table doesn't depend
-//! on whether this machine can run it), no doors, nothing tainted. What taint and protected paths add on top is
-//! described below the table, not computed: they depend on the session, not on the call.
+//! The examples are evaluated in fixed contexts ([`Setting`], [`example_context`]): the sandbox on (assumed to work,
+//! `Sandbox::assume_backend`, so the table doesn't depend on whether this machine can run it) with every door open,
+//! and the sandbox off with none; nothing tainted. What taint and protected paths add on top is described below the
+//! table, not computed: they depend on the session, not on the call.
 //!
 //! [`Tool`]: crate::Tool
 
@@ -56,6 +57,7 @@ pub fn examples() -> Vec<Example> {
         ex("bash", json!({"command": "cargo test"})),
         ex("bash", json!({"command": "cargo fetch", "network": true})),
         ex("bash", json!({"command": "git commit -m x", "git_write": true})),
+        ex("bash", json!({"command": "ls ~", "sandbox": false})),
         ex("process", json!({"action": "start", "command": "npm run dev"})),
         ex("process", json!({"action": "start", "command": "npm run dev", "network": true})),
         ex("process", json!({"action": "list"})),
@@ -67,15 +69,64 @@ pub fn examples() -> Vec<Example> {
     ]
 }
 
-/// The fixed context the examples are evaluated in: a project at `/project`, a home at `/home/person` (not holding
-/// the project), the sandbox off, no doors, no approver, nothing tainted.
-pub fn example_context() -> ToolContext {
+/// The fixed contexts the examples are evaluated in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Setting {
+    /// The sandbox on (assumed to work here: `Sandbox::assume_backend`) and every door open: host commands, the
+    /// process door, GitHub, Herdr. What a terminal session usually has.
+    Sandboxed,
+    /// The sandbox off (`/sandbox off`, or no backend), no doors.
+    Unsandboxed,
+}
+
+impl Setting {
+    pub const ALL: [Setting; 2] = [Setting::Sandboxed, Setting::Unsandboxed];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Sandboxed => "sandbox on, every door open",
+            Self::Unsandboxed => "sandbox off, no doors",
+        }
+    }
+}
+
+/// A fixed context the examples are evaluated in: a project at `/project`, a home at `/home/person` (not holding the
+/// project), the sandbox and doors of `setting`, no approver, nothing tainted.
+pub fn example_context(setting: Setting) -> ToolContext {
     let mut ctx = ToolContext::new("/project");
-    let mut sandbox = marv_sandbox::Sandbox::from_env(false);
+    let sandboxed = setting == Setting::Sandboxed;
+    let mut sandbox = marv_sandbox::Sandbox::from_env(sandboxed);
+    sandbox.assume_backend = sandboxed;
     sandbox.home = PathBuf::from("/home/person");
     ctx.home = sandbox.home.clone();
     ctx.sandbox = Arc::new(sandbox);
+    if sandboxed {
+        ctx.doors = crate::types::Doors { host: true, process: true, github: true, herdr: true };
+    }
     ctx
+}
+
+/// One example's row of the calls table in `ctx`.
+fn example_row(example: &Example, ctx: &ToolContext) -> String {
+    let tool = example_tool(example);
+    let parsed = tool.parse(example.input.clone()).expect("an example that parses");
+    let input = parsed.as_ref();
+    let floors: Vec<&str> = MODES
+        .iter()
+        .map(|mode| floor_name(approval_floor(tool.as_ref(), input, &ToolContext { mode: *mode, ..ctx.clone() })))
+        .collect();
+    let source = tool.provenance_in(input, ctx);
+    let door = tool.door(input, ctx).map(name_of).unwrap_or_else(|| "-".into());
+    format!(
+        "| `{}` | {} | {} | {} ({}) | {} | {} |",
+        example_label(example),
+        floors.join(" | "),
+        yes(tool.uses_network(input, ctx)),
+        name_of(source),
+        name_of(source.class()),
+        yes(tool.persists(input, ctx)),
+        door,
+    )
 }
 
 /// The built-in tool an example calls.
@@ -113,7 +164,6 @@ fn yes(b: bool) -> &'static str {
 
 /// `docs/TOOLS.md`: the built-in tools and their example calls, from the code.
 pub fn tools_table() -> String {
-    let ctx = example_context();
     let mut out = String::new();
     out.push_str(
         "# Marv's built-in tools\n\n\
@@ -147,44 +197,44 @@ pub fn tools_table() -> String {
     }
     out.push_str(
         "\n## Example calls\n\n\
-         What each call does by itself, evaluated with the sandbox off and nothing tainted:\n\n\
+         What each call does by itself, nothing tainted, with the sandbox on and every door open (the calls that differ\n\
+         with the sandbox off are listed after):\n\n\
          - **Person** to **Subagent**: the least the call asks in each kind of turn: `never` (it runs without asking),\n  \
          `asks` (yolo or \"don't ask again\" may answer), `every time` (no yolo, no \"don't ask again\"), `refused` (not\n  \
-         offered). `person`: the person typed it; `headless`: `marv -p`; `woken`: another agent's message woke the\n  \
-         session; `radio`: a radio message, or a turn handling radio requests; `subagent`: a subagent of the person's\n  \
-         turn (a subagent of a woken or radio turn asks as that turn does).\n\
+         offered). `person`: the person typed it; `headless`: `marv -p` or an SDK one-shot session; `woken`: another\n  \
+         agent's message woke the session; `radio`: a radio message, or a turn handling radio requests; `subagent`: a\n  \
+         subagent of the person's turn (a subagent of a woken or radio turn asks as that turn does).\n\
          - **Network**: whether it can reach the network.\n\
          - **Source**: where this call's output comes from (its class in brackets).\n\
          - **Persists**: whether it writes something later conversations load as the person's own. In a conversation\n  \
          holding outside text, such a call is asked every time.\n\
          - **Door**: the door out of the sandbox it goes through, if any.\n\n\
          On top of this, a write to a protected path (docs/SECURITY.md: `.git`, a lifecycle script in `package.json`, ...)\n\
-         is asked every time, even in yolo, and so is any call to the network once the conversation holds outside text.\n\n\
+         is asked every time, even in yolo, and so is any call to the network once the conversation holds outside text.\n\
+         One exception lowers a call below its floor: in a tainted conversation, a web_fetch under a URL prefix the\n\
+         person approved (\"always\" on a tainted fetch) runs without asking, in a turn with automatic approval only.\n\n\
          | Call | Person | Headless | Woken | Radio | Subagent | Network | Source | Persists | Door |\n\
          |---|---|---|---|---|---|---|---|---|---|\n",
     );
+    let header = "| Call | Person | Headless | Woken | Radio | Subagent | Network | Source | Persists | Door |\n\
+                  |---|---|---|---|---|---|---|---|---|---|\n";
+    let sandboxed = example_context(Setting::Sandboxed);
+    let unsandboxed = example_context(Setting::Unsandboxed);
+    let mut differ = String::new();
     for example in examples() {
-        let tool = example_tool(&example);
-        let parsed = tool.parse(example.input.clone()).expect("an example that parses");
-        let input = parsed.as_ref();
-        let floors: Vec<&str> = MODES
-            .iter()
-            .map(|mode| floor_name(approval_floor(tool.as_ref(), input, &ToolContext { mode: *mode, ..ctx.clone() })))
-            .collect();
-        let source = tool.provenance_in(input, &ctx);
-        let door = tool.door(input, &ctx).map(name_of).unwrap_or_else(|| "-".into());
-        let _ = writeln!(
-            out,
-            "| `{}` | {} | {} | {} ({}) | {} | {} |",
-            example_label(&example),
-            floors.join(" | "),
-            yes(tool.uses_network(input, &ctx)),
-            name_of(source),
-            name_of(source.class()),
-            yes(tool.persists(input, &ctx)),
-            door,
-        );
+        let on = example_row(&example, &sandboxed);
+        let off = example_row(&example, &unsandboxed);
+        let _ = writeln!(out, "{on}");
+        if off != on {
+            let _ = writeln!(differ, "{off}");
+        }
     }
+    let _ = write!(
+        out,
+        "\n### With the sandbox off\n\n\
+         With the sandbox off (and so no doors), a command runs on this machine as it is: nothing stops it reaching\n\
+         the network, so its output is outside text. These calls differ:\n\n{header}{differ}"
+    );
     out
 }
 

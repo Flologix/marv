@@ -252,31 +252,43 @@ impl marv_tools::DynTool for Probe {
 enum Turn {
     /// The person typed it.
     Person,
-    /// `marv -p` or the SDK.
+    /// `marv -p` or an SDK one-shot session.
     Headless,
     /// Another agent's message woke the session (the mesh inbox).
     Woken,
     /// A radio message, or the person's turn that handles radio requests.
     Radio,
-    /// A subagent of a turn the person started.
-    SubagentOfPerson,
-    /// A subagent of a turn another agent's message started.
-    SubagentOfWoken,
+    /// A subagent of a turn of each kind.
+    SubagentOf(Started),
 }
 
-const TURNS: [(Turn, &str); 6] = [
+/// Who started the turn a subagent runs in.
+#[derive(Debug, Clone, Copy)]
+enum Started {
+    Person,
+    Headless,
+    Woken,
+    Radio,
+}
+
+const TURNS: [(Turn, &str); 8] = [
     (Turn::Person, "person"),
     (Turn::Headless, "headless"),
     (Turn::Woken, "woken"),
     (Turn::Radio, "radio"),
-    (Turn::SubagentOfPerson, "subagent"),
-    (Turn::SubagentOfWoken, "subagent of woken"),
+    (Turn::SubagentOf(Started::Person), "subagent"),
+    (Turn::SubagentOf(Started::Headless), "subagent of headless"),
+    (Turn::SubagentOf(Started::Woken), "subagent of woken"),
+    (Turn::SubagentOf(Started::Radio), "subagent of radio"),
 ];
 
 /// The context and tool list a call in `turn` runs with, built as the session builds them (`run_turn`,
-/// `subagent_context`): yolo only where the person started the turn, no automatic approval in a turn they didn't.
+/// `subagent_context`), in `setting`'s sandbox and doors. Unlike the session, yolo is left as the person set it in
+/// every kind of turn, so the golden shows the mode alone keeping it off where the person didn't start the turn. A
+/// subagent gets the full tool list: `run_tool` refuses the main agent's tools there by itself.
 fn turn_context(
     root: &Path,
+    setting: marv_tools::table::Setting,
     turn: Turn,
     yolo: bool,
     tainted: bool,
@@ -284,31 +296,35 @@ fn turn_context(
 ) -> (marv_tools::ToolContext, Vec<marv_tools::ToolRef>) {
     let all: Vec<marv_tools::ToolRef> =
         marv_tools::builtin_tools().iter().map(|t| Arc::new(Probe(t.clone())) as marv_tools::ToolRef).collect();
-    let mut ctx = marv_tools::table::example_context();
+    let mut ctx = marv_tools::table::example_context(setting);
     // A real folder, so the path rules (`.git`, protected paths) resolve as in a project; nothing is written to it.
     ctx.root = root.to_path_buf();
     ctx.taint = Arc::new(marv_sandbox::TaintState::new());
     if tainted {
         ctx.taint.mark(marv_core::Provenance::Web);
     }
-    let unattended = matches!(turn, Turn::Woken | Turn::Radio | Turn::SubagentOfWoken);
-    ctx.yolo = yolo && !unattended;
-    ctx.mode = match turn {
-        Turn::Person | Turn::SubagentOfPerson => marv_tools::CallMode::Person,
-        Turn::Headless => marv_tools::CallMode::Headless,
-        Turn::Woken | Turn::SubagentOfWoken => marv_tools::CallMode::Woken,
-        Turn::Radio => marv_tools::CallMode::Radio,
+    ctx.yolo = yolo;
+    let started = match turn {
+        Turn::Person => Started::Person,
+        Turn::Headless => Started::Headless,
+        Turn::Woken => Started::Woken,
+        Turn::Radio => Started::Radio,
+        Turn::SubagentOf(started) => started,
     };
-    ctx.approver = Some(match turn {
-        Turn::Radio => Arc::new(marv_session::radio::RadioTurnApprover(approver, marv_session::radio::RADIO_TURN_WARNING)),
+    ctx.mode = match started {
+        Started::Person => marv_tools::CallMode::Person,
+        Started::Headless => marv_tools::CallMode::Headless,
+        Started::Woken => marv_tools::CallMode::Woken,
+        Started::Radio => marv_tools::CallMode::Radio,
+    };
+    ctx.approver = Some(match started {
+        Started::Radio => Arc::new(marv_session::radio::RadioTurnApprover(approver, marv_session::radio::RADIO_TURN_WARNING)),
         _ => approver,
     });
     match turn {
-        Turn::SubagentOfPerson | Turn::SubagentOfWoken => {
+        Turn::SubagentOf(_) => {
             let parent_approver = ctx.approver.clone();
-            let sub = marv_session::subagent::subagent_context(&ctx, "general", None, parent_approver);
-            let offered = all.into_iter().filter(|t| marv_session::agents::SUBAGENT_TOOLS.contains(&t.name())).collect();
-            (sub, offered)
+            (marv_session::subagent::subagent_context(&ctx, "general", None, parent_approver), all)
         }
         _ => (ctx, all),
     }
@@ -317,9 +333,16 @@ fn turn_context(
 /// What `run_tool` did with one call: `-` not offered, `runs` without asking, `yolo` ran by yolo, else asked:
 /// `ask` (an "always" can answer it), `once` (asked every time), `must` (a person must answer: tainted egress, a
 /// protected path), `must once`.
-async fn decided(root: &Path, example: &marv_tools::table::Example, turn: Turn, yolo: bool, tainted: bool) -> String {
+async fn decided(
+    root: &Path,
+    setting: marv_tools::table::Setting,
+    example: &marv_tools::table::Example,
+    turn: Turn,
+    yolo: bool,
+    tainted: bool,
+) -> String {
     let recorder = marv_guards::Recorder::new(marv_tools::Decision::No);
-    let (ctx, available) = turn_context(root, turn, yolo, tainted, recorder.clone());
+    let (ctx, available) = turn_context(root, setting, turn, yolo, tainted, recorder.clone());
     let call = marv_guards::call(example.tool, example.input.clone());
     let outcome = marv_tools::run_tool(&call, &ctx, &available).await;
     if outcome.result.output.starts_with("Unknown tool") {
@@ -349,25 +372,31 @@ async fn approval_decisions() -> String {
          # yolo, `ask` asked (an \"always\" can answer), `once` asked every time, `must` a person must answer.\n\
          # Written by UPDATE_GOLDEN=1 cargo test -p marv-guards --test tools\n",
     );
-    for example in marv_tools::table::examples() {
-        out.push_str(&format!("\n{}\n", marv_tools::table::example_label(&example)));
-        for (turn, name) in TURNS {
-            let mut cells = Vec::new();
-            for (tainted, yolo) in [(false, false), (false, true), (true, false), (true, true)] {
-                cells.push(decided(root, &example, turn, yolo, tainted).await);
+    for setting in marv_tools::table::Setting::ALL {
+        out.push_str(&format!("\n## {}\n", setting.name()));
+        for example in marv_tools::table::examples() {
+            out.push_str(&format!("\n{}\n", marv_tools::table::example_label(&example)));
+            for (turn, name) in TURNS {
+                let mut cells = Vec::new();
+                for (tainted, yolo) in [(false, false), (false, true), (true, false), (true, true)] {
+                    cells.push(decided(root, setting, &example, turn, yolo, tainted).await);
+                }
+                let cells = cells.iter().map(|c| format!("{c:<10}")).collect::<String>();
+                out.push_str(&format!("  {name:<21} {}\n", cells.trim_end()));
             }
-            out.push_str(&format!("  {name:<18} {}\n", cells.iter().map(|c| format!("{c:<10}")).collect::<String>().trim_end()));
         }
     }
     out
 }
 
 /// **Who started a turn changes approvals only as it did.** The golden holds what `run_tool` decides for every
-/// example call of every built-in tool, in every kind of turn, clean and tainted, with yolo off and on. A change to
-/// how a turn's kind reaches the approval flow must leave it as it is.
+/// example call of every built-in tool, in every kind of turn (subagents of each), clean and tainted, with yolo off
+/// and on, with the sandbox on and every door open and with the sandbox off. A change to how a turn's kind reaches
+/// the approval flow must leave it as it is.
 ///
 /// Proven: dropped `|| ctx.no_auto_approval` from `once` in `run_tool` → this failed (woken `ask` for `once`). Unchanged
-/// by the move of the turn's kind onto `ToolContext::mode` (`marv_tools::floor`).
+/// by the move of the turn's kind onto `ToolContext::mode` (`marv_tools::floor`). Since yolo is left on in every
+/// kind of turn: dropped `ctx.mode.auto_approval() &&` from the yolo check in `run_tool` → failed (woken `yolo`).
 #[tokio::test]
 async fn approvals_per_turn_match_the_golden() {
     golden("tests/guards/golden/approvals.txt", &approval_decisions().await);
@@ -383,28 +412,30 @@ async fn approvals_per_turn_match_the_golden() {
 #[tokio::test]
 async fn the_floor_matches_todays_answers_per_mode() {
     let project = marv_guards::TempDir::new("floor-golden");
-    for example in marv_tools::table::examples() {
-        for (turn, name) in TURNS {
-            let recorder = marv_guards::Recorder::new(marv_tools::Decision::No);
-            let (ctx, _) = turn_context(project.path(), turn, false, false, recorder);
-            let tool = marv_tools::table::example_tool(&example);
-            let input = tool.parse(example.input.clone()).expect("an example that parses");
-            let floor = marv_tools::approval_floor(tool.as_ref(), input.as_ref(), &ctx);
-            let expected = match floor {
-                marv_tools::Floor::NeverAsks => "runs",
-                marv_tools::Floor::Asks => "ask",
-                marv_tools::Floor::AsksEveryTime => "once",
-                marv_tools::Floor::Refused => "-",
-            };
-            let label = marv_tools::table::example_label(&example);
-            // A protected path raises the call to `must` (a person answers): the floor still decides `once`.
-            let decided = decided(project.path(), &example, turn, false, false).await;
-            let decided = match decided.as_str() {
-                "must" => "ask",
-                "must once" => "once",
-                other => other,
-            };
-            assert_eq!(decided, expected, "{label} in a {name} turn");
+    for setting in marv_tools::table::Setting::ALL {
+        for example in marv_tools::table::examples() {
+            for (turn, name) in TURNS {
+                let recorder = marv_guards::Recorder::new(marv_tools::Decision::No);
+                let (ctx, _) = turn_context(project.path(), setting, turn, false, false, recorder);
+                let tool = marv_tools::table::example_tool(&example);
+                let input = tool.parse(example.input.clone()).expect("an example that parses");
+                let floor = marv_tools::approval_floor(tool.as_ref(), input.as_ref(), &ctx);
+                let expected = match floor {
+                    marv_tools::Floor::NeverAsks => "runs",
+                    marv_tools::Floor::Asks => "ask",
+                    marv_tools::Floor::AsksEveryTime => "once",
+                    marv_tools::Floor::Refused => "-",
+                };
+                let label = marv_tools::table::example_label(&example);
+                // A protected path raises the call to `must` (a person answers): the floor still decides `once`.
+                let decided = decided(project.path(), setting, &example, turn, false, false).await;
+                let decided = match decided.as_str() {
+                    "must" => "ask",
+                    "must once" => "once",
+                    other => other,
+                };
+                assert_eq!(decided, expected, "{label} in a {name} turn, {}", setting.name());
+            }
         }
     }
 }
