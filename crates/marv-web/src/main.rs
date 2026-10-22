@@ -130,9 +130,12 @@ async fn chat(app: Arc<App>, socket: WebSocket) {
     {
         let _ = out.send(json!({"type": "fatal", "message": format!("Couldn't make the workspace: {e}")}));
     } else {
+        let config_dir = app.data.join("marv");
         let spec = ChatSpec {
             root,
-            config_dir: app.data.join("marv"),
+            // #204: as `marv -p`, the config's `trajectories` (in the server's own Marv folder).
+            trajectories: marv_web::host::trajectories_on(&config_dir),
+            config_dir,
             api_key: app.api_key.clone(),
             // A server for others: no one's plan.
             zai_api_key: None,
