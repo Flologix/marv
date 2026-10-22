@@ -10,6 +10,11 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 - **macOS builds (#167).** Releases now carry `marv-aarch64-apple-darwin.tar.gz` and `marv-x86_64-apple-darwin.tar.gz` (with their `.sha256`, in `SHA256SUMS`), and npm gets `@flologixai/marv-darwin-arm64` and `@flologixai/marv-darwin-x64`, which `npm install -g @flologixai/marv` picks on a Mac. `install.sh` installs the macOS build instead of stopping with a note (the arm64 one on Apple silicon, even from a shell under Rosetta). Commands run in the Seatbelt sandbox (`sandbox-exec`, built into macOS); the `process` tool isn't on macOS yet (#152). macOS 14 or newer; CI runs the tests and the sandbox guards on macOS 14 and 15 (arm64) and macOS 15 on Intel, as a required check. A smoke test (`packaging/smoke.sh`) installs each build through `install.sh` and through npm and runs a sandboxed `marv -p` turn against a local stub model, in CI and before every release; a release isn't created if it fails.
 
+### Fixed
+
+- **Checkpoints and /undo work in a folder that holds other repositories (#203).** In a folder that isn't a git repository itself (like `~/Projects`), Marv's checkpoints now leave out every folder with a `.git` in it. Before, a nested repository with no commit made every checkpoint fail, so no turn there could be undone, and the others were stored as embedded repositories. /undo never writes or deletes a file inside another repository. A folder that is a repository works as before. Marv desktop now shows a failed checkpoint as a warning in the terminal's words ("This turn can't be undone: its checkpoint failed (…)"), with git's message cut to its first line, instead of git's whole output as a plain note.
+- **Marv desktop chats write trajectories (#204).** Like the terminal and `marv -p`, each desktop chat now writes `~/.marv/trajectories/<project>/<session>.jsonl` unless `trajectories` is off in `~/.marv/config.json`, so a turn that goes wrong can be looked at afterwards.
+
 ## [0.8.0] - 2026-10-21
 
 ### Added

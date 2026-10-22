@@ -1035,7 +1035,8 @@ mod tests {
     async fn own_git_dir_leaves_nested_repositories_out_even_one_with_no_commit() {
         let folder = folder_of_repos();
         let d = &folder.0;
-        let theirs = |repo: &str| (git(&d.join(repo), &["status", "--porcelain"]), git(&d.join(repo), &["rev-parse", "--git-dir"]));
+        let theirs =
+            |repo: &str| (git(&d.join(repo), &["status", "--porcelain"]), git(&d.join(repo), &["rev-parse", "--git-dir"]));
         let full_before = (git(&d.join("full"), &["rev-parse", "HEAD"]), theirs("full"));
         let empty_before = theirs("empty");
         let own = temp("cp-own");
