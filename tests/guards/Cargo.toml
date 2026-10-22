@@ -23,5 +23,11 @@ tokio.workspace = true
 tokio-util.workspace = true
 nix = { version = "0.31.3", features = ["signal"] }
 
+[dev-dependencies]
+# The scan that only run_tool runs a tool (tests/tools.rs) parses the product's code.
+syn = { version = "2.0.119", features = ["full", "visit"] }
+proc-macro2 = { version = "1.0.107", features = ["span-locations"] }
+quote = "1.0.47"
+
 [lints]
 workspace = true

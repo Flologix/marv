@@ -440,71 +440,174 @@ async fn the_floor_matches_todays_answers_per_mode() {
     }
 }
 
-/// `text` without its `#[cfg(test)]` items (an inline `mod tests { … }` or any other item), and the names of the
-/// test-only module files it declares (`#[cfg(test)] mod tests;`). Braces are matched naively: enough for this tree.
-fn without_test_code(text: &str) -> (String, Vec<String>) {
-    let mut out = String::new();
-    let mut test_files = Vec::new();
-    let mut lines = text.lines().peekable();
-    while let Some(line) = lines.next() {
-        if line.trim() != "#[cfg(test)]" {
-            out.push_str(line);
-            out.push('\n');
-            continue;
-        }
-        // Skip further attributes, then the item.
-        let item = lines.by_ref().find(|next| !next.trim_start().starts_with("#[")).unwrap_or_default().to_string();
-        let trimmed = item.trim();
-        if trimmed.ends_with(';') {
-            if let Some(name) = trimmed.trim_end_matches(';').split_whitespace().last() {
-                test_files.push(name.to_string());
-            }
-            continue;
-        }
-        let mut depth = item.matches('{').count() as i64 - item.matches('}').count() as i64;
-        while depth > 0 {
-            let Some(next) = lines.next() else { break };
-            depth += next.matches('{').count() as i64 - next.matches('}').count() as i64;
-        }
-        out.push('\n');
-    }
-    (out, test_files)
+/// The trait methods that make a tool act or ask: what only `run_tool` may call. `(name, arguments)`.
+const TOOL_ENTRIES: [(&str, usize); 3] = [("run", 2), ("preview", 2), ("approve_itself", 3)];
+
+/// Calls of a tool entry's shape that run no tool, each with why: `(file, enclosing fn, the call as written)`.
+/// Keep it narrow: an entry names one call in one function.
+const NOT_A_TOOL: [(&str, &str, &str); 4] = [
+    // The agent tool's `run` and `preview` hand the call to the session's `AgentHost`, which starts the subagent (whose
+    // own calls go through `run_tool`).
+    ("crates/marv-tools/src/agent.rs", "run", "host . run (input , ctx)"),
+    ("crates/marv-tools/src/agent.rs", "preview", "host . preview (input , ctx)"),
+    // The agent loop's `ToolRunner::run(call, cancel)`: the session's runner, which calls `run_tool`.
+    ("crates/marv-agent/src/agent.rs", "tools", "runner . run (call , cancel)"),
+    // The oracle's fake-tool tracker answering a scripted call by name (a test harness's own function).
+    ("crates/marv-oracle/src/tracker.rs", "call", "self . run (name , args)"),
+];
+
+/// Whether `attrs` mark test-only code: `#[cfg(test)]`, `#[test]`, `#[tokio::test]`.
+fn is_test_only(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|a| {
+        let path = a.path();
+        path.is_ident("test")
+            || path.segments.last().is_some_and(|s| s.ident == "test")
+            || (path.is_ident("cfg") && a.parse_args::<syn::Ident>().is_ok_and(|i| i == "test"))
+    })
 }
 
-/// `text` with the body of `pub async fn run_tool` blanked out (the one place a tool is run).
-fn without_run_tool(text: &str) -> String {
-    let Some(start) = text.find("pub async fn run_tool(") else { return text.to_string() };
-    let mut depth = 0i64;
-    let mut end = text.len();
-    let mut opened = false;
-    for (i, c) in text[start..].char_indices() {
-        match c {
-            '{' => {
-                depth += 1;
-                opened = true;
-            }
-            '}' => depth -= 1,
-            _ => {}
-        }
-        if opened && depth == 0 {
-            end = start + i + 1;
-            break;
-        }
-    }
-    format!("{}{}", &text[..start], &text[end..])
+/// One finding: where, and the code as written.
+struct Finding {
+    file: String,
+    line: usize,
+    function: String,
+    implementing: String,
+    code: String,
 }
 
-/// Every non-test Rust file under `crates/`: its path and its code without test items.
-fn non_test_sources() -> Vec<(PathBuf, String)> {
-    fn walk(dir: &Path, files: &mut Vec<PathBuf>) {
+/// Finds every call (or mention, as a path: a function pointer, an alias's `X::run`) of a tool entry in one file's
+/// non-test code. Macro bodies are searched by token, since syn doesn't parse them.
+struct EntryFinder {
+    file: String,
+    function: Vec<String>,
+    /// The `impl` blocks around, as `Trait for Type` (or `Type`).
+    implementing: Vec<String>,
+    found: Vec<Finding>,
+    test_modules: Vec<String>,
+}
+
+impl EntryFinder {
+    fn push(&mut self, span: proc_macro2::Span, code: String) {
+        self.found.push(Finding {
+            file: self.file.clone(),
+            line: span.start().line,
+            function: self.function.last().cloned().unwrap_or_default(),
+            implementing: self.implementing.last().cloned().unwrap_or_default(),
+            code,
+        });
+    }
+
+    /// `.run(…)` and `Type::run` in a macro's tokens, nested groups included (syn leaves macro bodies unparsed).
+    fn scan_tokens(&mut self, tokens: proc_macro2::TokenStream) {
+        use proc_macro2::{Delimiter, TokenTree};
+        let trees: Vec<TokenTree> = tokens.into_iter().collect();
+        let punct = |i: usize, c: char| matches!(trees.get(i), Some(TokenTree::Punct(p)) if p.as_char() == c);
+        for (i, tree) in trees.iter().enumerate() {
+            match tree {
+                TokenTree::Group(group) => self.scan_tokens(group.stream()),
+                TokenTree::Ident(ident) if TOOL_ENTRIES.iter().any(|(name, _)| ident == name) => {
+                    let called = matches!(trees.get(i + 1), Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Parenthesis);
+                    let method = i > 0 && punct(i - 1, '.') && called;
+                    let by_type = i > 2
+                        && punct(i - 1, ':')
+                        && punct(i - 2, ':')
+                        && matches!(&trees[i - 3], TokenTree::Ident(t) if t.to_string().starts_with(char::is_uppercase))
+                        || i > 2 && punct(i - 1, ':') && punct(i - 2, ':') && punct(i - 3, '>');
+                    if method || by_type {
+                        self.push(ident.span(), format!("(in a macro) {ident}"));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+impl<'ast> syn::visit::Visit<'ast> for EntryFinder {
+    fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+        if is_test_only(&item.attrs) {
+            if item.content.is_none() {
+                self.test_modules.push(item.ident.to_string());
+            }
+            return;
+        }
+        syn::visit::visit_item_mod(self, item);
+    }
+    fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+        if is_test_only(&item.attrs) {
+            return;
+        }
+        self.function.push(item.sig.ident.to_string());
+        syn::visit::visit_item_fn(self, item);
+        self.function.pop();
+    }
+    fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+        if is_test_only(&item.attrs) {
+            return;
+        }
+        self.function.push(item.sig.ident.to_string());
+        syn::visit::visit_impl_item_fn(self, item);
+        self.function.pop();
+    }
+    fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+        if is_test_only(&item.attrs) {
+            return;
+        }
+        let ty = quote_tokens(&item.self_ty);
+        self.implementing.push(match &item.trait_ {
+            Some((_, path, _)) => format!("{} for {ty}", quote_tokens(path)),
+            None => ty,
+        });
+        syn::visit::visit_item_impl(self, item);
+        self.implementing.pop();
+    }
+    /// A `use` that renames the trait (`use marv_tools::Tool as T`) would hide `T::run` from a reader, and one that
+    /// brings a method in by name doesn't exist for trait methods; flag the rename.
+    fn visit_use_rename(&mut self, rename: &'ast syn::UseRename) {
+        if rename.ident == "Tool" || rename.ident == "DynTool" {
+            self.push(rename.ident.span(), quote_tokens(rename));
+        }
+    }
+    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+        if TOOL_ENTRIES.iter().any(|(name, args)| call.method == name && call.args.len() == *args) {
+            self.push(call.method.span(), quote_tokens(call));
+        }
+        syn::visit::visit_expr_method_call(self, call);
+    }
+    /// A path to a tool entry: `<T as Tool>::run`, or `Type::run` (a trait or a type: `Tool::run`, `Glob::run`, an
+    /// alias), called or taken as a function pointer. A lowercase module's free function (`tui::run`) isn't one.
+    fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+        let segments = &path.path.segments;
+        let last = segments.last().map(|s| s.ident.to_string()).unwrap_or_default();
+        let owner = segments.len().checked_sub(2).map(|i| segments[i].ident.to_string()).unwrap_or_default();
+        let by_type = path.qself.is_some() || owner.starts_with(char::is_uppercase);
+        if by_type && TOOL_ENTRIES.iter().any(|(name, _)| last == *name) {
+            self.push(syn::spanned::Spanned::span(&path.path), quote_tokens(path));
+        }
+        syn::visit::visit_expr_path(self, path);
+    }
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        self.scan_tokens(mac.tokens.clone());
+    }
+}
+
+/// The tokens of `node` as one line (`a . b (c)`), the way the allowlist names a call.
+fn quote_tokens(node: &impl quote::ToTokens) -> String {
+    node.to_token_stream().to_string()
+}
+
+/// Every Rust source of the product under `crates/`: everything but each crate's own `tests/`, `benches/` and
+/// `examples/` folders (integration tests, not code Marv runs) and `target/`.
+fn product_sources() -> Vec<PathBuf> {
+    fn walk(dir: &Path, top: bool, files: &mut Vec<PathBuf>) {
         let Ok(entries) = std::fs::read_dir(dir) else { return };
         for entry in entries.flatten() {
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
             if path.is_dir() {
-                // Integration tests, benches and examples aren't the product; `target` isn't source.
-                if !matches!(name.as_str(), "tests" | "benches" | "examples" | "target" | "node_modules") {
-                    walk(&path, files);
+                let skipped = name == "target" || (top && matches!(name.as_str(), "tests" | "benches" | "examples"));
+                if !skipped {
+                    walk(&path, false, files);
                 }
             } else if name.ends_with(".rs") {
                 files.push(path);
@@ -512,65 +615,83 @@ fn non_test_sources() -> Vec<(PathBuf, String)> {
         }
     }
     let mut files = Vec::new();
-    walk(&repo_root().join("crates"), &mut files);
+    for krate in std::fs::read_dir(repo_root().join("crates")).expect("crates/").flatten() {
+        walk(&krate.path(), true, &mut files);
+    }
     files.sort();
-    let mut skipped: Vec<PathBuf> = Vec::new();
-    let mut sources = Vec::new();
-    for file in &files {
-        let text = std::fs::read_to_string(file).expect("a source file");
-        let (code, test_files) = without_test_code(&text);
+    files
+}
+
+/// Every call of a tool entry in non-test code outside `run_tool`, and the allowlist entries that matched nothing.
+fn tool_entry_calls() -> (Vec<Finding>, Vec<String>) {
+    let root = repo_root();
+    let mut found = Vec::new();
+    let mut test_files: Vec<PathBuf> = Vec::new();
+    let mut parsed = Vec::new();
+    for file in product_sources() {
+        let text = std::fs::read_to_string(&file).expect("a source file");
+        let ast = syn::parse_file(&text).unwrap_or_else(|e| panic!("{} doesn't parse: {e}", file.display()));
+        let shown = file.strip_prefix(&root).unwrap_or(&file).display().to_string();
+        let mut finder = EntryFinder {
+            file: shown,
+            function: Vec::new(),
+            implementing: Vec::new(),
+            found: Vec::new(),
+            test_modules: Vec::new(),
+        };
+        syn::visit::Visit::visit_file(&mut finder, &ast);
         let dir = if file.file_name().is_some_and(|n| n == "mod.rs" || n == "lib.rs" || n == "main.rs") {
             file.parent().expect("a folder").to_path_buf()
         } else {
             file.with_extension("")
         };
-        for name in test_files {
-            skipped.push(dir.join(format!("{name}.rs")));
-            skipped.push(dir.join(&name).join("mod.rs"));
+        for name in &finder.test_modules {
+            test_files.push(dir.join(format!("{name}.rs")));
+            test_files.push(dir.join(name).join("mod.rs"));
         }
-        sources.push((file.clone(), code));
+        parsed.push((file, finder.found));
     }
-    sources.retain(|(file, _)| !skipped.contains(file));
-    sources
+    for (file, findings) in parsed {
+        if !test_files.contains(&file) {
+            found.extend(findings);
+        }
+    }
+    // The one place: run_tool's own body, and the blanket `impl<T: Tool> DynTool for T`, which only forwards.
+    found.retain(|f| {
+        let in_run_tool = f.file == "crates/marv-tools/src/registry.rs" && f.function == "run_tool";
+        let forwarding = f.file == "crates/marv-tools/src/types.rs"
+            && f.implementing == "DynTool for T"
+            && TOOL_ENTRIES.iter().any(|(name, _)| f.function == *name)
+            && f.code == format!("Tool :: {}", f.function);
+        !in_run_tool && !forwarding
+    });
+    let mut unused = Vec::new();
+    for (file, function, code) in NOT_A_TOOL {
+        let before = found.len();
+        found.retain(|f| !(f.file == file && f.function == function && f.code == code));
+        if found.len() == before {
+            unused.push(format!("{file} {function}: {code}"));
+        }
+    }
+    (found, unused)
 }
 
 /// **Only `run_tool` runs a tool.** It's the one place a call is checked (parsed, its floor, protected paths,
-/// taint, yolo, the approval, the checkpoint) before it runs, and its result is marked (the source, the fence, the
-/// taint). A tool's `run` called anywhere else would skip all of that, so outside `run_tool` and tests no code calls
-/// a tool's `run`: neither `Tool::run`, `DynTool::run` or `<T as Tool>::run` by path (except the blanket `impl DynTool for T`, which only
-/// forwards), nor a `.run(input, ctx)` with a tool context (the agent tool's hand-off to its host is listed by name).
+/// taint, yolo, the approval, the checkpoint) before it runs or asks, and its result is marked (the source, the
+/// fence, the taint). A tool's `run`, `preview` or `approve_itself` called anywhere else would skip all of that, so
+/// the product's code (every `.rs` under `crates/` but test code: `#[cfg(test)]` items and modules, `#[test]`
+/// functions, each crate's `tests/`) is parsed with syn and searched for: a method call of that name and arity,
+/// a path to one (`Tool::run`, `<T as Tool>::run`, an alias's `X::run`, a function pointer), a `use` of one, and
+/// `.run`/`::run` in a macro's tokens. The exceptions are `run_tool`'s body, the blanket `impl DynTool for T`
+/// (which forwards), and the narrow `NOT_A_TOOL` list, whose entries must each still match something.
 ///
-/// Proven: added `let _ = tool.run(input, ctx).await;` to `marv_tools::table::tools_table` → this failed (it named
-/// the file and line); a `<Glob as Tool>::run(&Glob, …)` there → failed too.
+/// Proven: added to `marv_tools::table::example_row` a `tool.run(input, ctx)`, a `<crate::glob::Glob as
+/// crate::Tool>::run` function pointer, a `tool.preview(…)` split over five lines, a `tool.run(…)` inside
+/// `assert!(…)`, and a `use crate::Tool as T;` → each was reported (file, line, function).
 #[test]
 fn only_run_tool_runs_a_tool() {
-    // `.run(<input>, <a ToolContext>)`: Tool::run's shape (the agent loop's runner and MCP's client take others).
-    let by_shape = |line: &str| {
-        let Some(at) = line.find(".run(") else { return false };
-        let args = &line[at + 5..];
-        let args = args.split(").await").next().unwrap_or(args);
-        let mut parts = args.rsplitn(2, ',');
-        let last = parts.next().unwrap_or("").trim().trim_end_matches(')').trim();
-        parts.next().is_some()
-            && ["ctx", "context", "per_call", "confined"].iter().any(|word| last.trim_start_matches('&').contains(word))
-    };
-    // Calls of the same shape that run no tool: the agent tool's `run` hands its call to the session's `AgentHost`
-    // (which starts the subagent; the subagent's own calls go through `run_tool`).
-    let not_a_tool = [("marv-tools/src/agent.rs", "host.run(input, ctx).await")];
-    let mut found = Vec::new();
-    for (file, code) in non_test_sources() {
-        let shown = file.strip_prefix(repo_root()).unwrap_or(&file).display().to_string();
-        let code = if shown.ends_with("marv-tools/src/registry.rs") { without_run_tool(&code) } else { code };
-        let blanket = shown.ends_with("marv-tools/src/types.rs");
-        for (n, line) in code.lines().enumerate() {
-            let code_part = line.split("//").next().unwrap_or("");
-            let by_path = (code_part.contains("Tool::run(") || code_part.contains("Tool>::run("))
-                && !(blanket && code_part.contains("Tool::run(self, typed::<T>(input), ctx)"));
-            let allowed = not_a_tool.iter().any(|(f, text)| shown.ends_with(f) && line.trim() == *text);
-            if (by_path || by_shape(code_part)) && !allowed {
-                found.push(format!("{shown}:{}: {}", n + 1, line.trim()));
-            }
-        }
-    }
-    assert!(found.is_empty(), "a tool is run outside run_tool (call it through marv_tools::run_tool):\n{}", found.join("\n"));
+    let (found, unused) = tool_entry_calls();
+    let lines: Vec<String> = found.iter().map(|f| format!("{}:{} (in fn {}): {}", f.file, f.line, f.function, f.code)).collect();
+    assert!(lines.is_empty(), "a tool is run outside run_tool (call it through marv_tools::run_tool):\n{}", lines.join("\n"));
+    assert!(unused.is_empty(), "NOT_A_TOOL entries that match nothing any more (remove them):\n{}", unused.join("\n"));
 }
