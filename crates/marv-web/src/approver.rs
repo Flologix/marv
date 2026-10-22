@@ -1,8 +1,8 @@
 //! The browser as Marv's approver: each request goes to the page, and the call waits for the person's answer.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
 
 use async_trait::async_trait;
 use marv_tools::types::{ApprovalRequest, Approver, Decision};
@@ -17,15 +17,39 @@ struct Pending {
     reason: bool,
 }
 
+/// Below 2^53, so the page (JavaScript numbers) reads every id exactly.
+const MAX_ID: u64 = (1 << 53) - 1;
+
+/// Approval ids for the whole process, from a random start: every chat and every run of the app numbers its
+/// approvals differently. A page keeps its transcript across restarts, so ids counted from 1 each time repeated: the
+/// new card's `approval_done` marked an old card, and Allow on the new card did nothing.
+static NEXT_ID: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(first_id()));
+
+/// Somewhere in [1, 2^52): room for 2^52 ids after it before reaching `MAX_ID`.
+fn first_id() -> u64 {
+    let random = uuid::Uuid::new_v4().as_u64_pair().0;
+    (random >> 12).max(1)
+}
+
+fn next_id() -> u64 {
+    match NEXT_ID.fetch_add(1, Ordering::Relaxed) {
+        id if id == 0 || id > MAX_ID => {
+            // Unreachable in practice (2^52 approvals); start over low rather than send an id the page can't read.
+            NEXT_ID.store(2, Ordering::Relaxed);
+            1
+        }
+        id => id,
+    }
+}
+
 pub struct WebApprover {
     out: UnboundedSender<Value>,
     pending: Mutex<HashMap<u64, Pending>>,
-    next: AtomicU64,
 }
 
 impl WebApprover {
     pub fn new(out: UnboundedSender<Value>) -> Self {
-        Self { out, pending: Mutex::new(HashMap::new()), next: AtomicU64::new(1) }
+        Self { out, pending: Mutex::new(HashMap::new()) }
     }
 
     fn pending(&self) -> std::sync::MutexGuard<'_, HashMap<u64, Pending>> {
@@ -66,7 +90,7 @@ impl WebApprover {
 #[async_trait]
 impl Approver for WebApprover {
     async fn approve(&self, request: ApprovalRequest) -> Decision {
-        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        let id = next_id();
         let (answer, answered) = oneshot::channel();
         // A person must answer `must_ask` every time, so there's no "always" for it either.
         let once = request.once || request.must_ask;
@@ -201,6 +225,53 @@ mod tests {
         assert_eq!(shown["reason"], false);
         approver.answer(shown["id"].as_u64().unwrap(), Decision::Declined("because".into()));
         assert_eq!(asking.await.unwrap(), Decision::No);
+    }
+
+    /// Ids never repeat between approvers (each chat, each run has its own): an answer meant for one card can't
+    /// match another chat's request. They stay exact as JavaScript numbers.
+    #[tokio::test]
+    async fn two_approvers_never_share_an_id() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..3 {
+            let (out, mut page) = tokio::sync::mpsc::unbounded_channel();
+            let approver = Arc::new(WebApprover::new(out));
+            for _ in 0..3 {
+                let asking = tokio::spawn({
+                    let approver = approver.clone();
+                    async move { approver.approve(request(false)).await }
+                });
+                let id = page.recv().await.unwrap()["id"].as_u64().unwrap();
+                assert!((1..=MAX_ID).contains(&id), "{id}");
+                assert!(seen.insert(id), "id {id} repeated");
+                approver.answer(id, Decision::Yes);
+                assert_eq!(asking.await.unwrap(), Decision::Yes);
+                page.recv().await.unwrap();
+            }
+        }
+        assert_ne!(first_id(), 0);
+    }
+
+    /// An answer for an id that isn't waiting (from an earlier run, another chat, or answered already) is ignored:
+    /// the request still waits for its own answer.
+    #[tokio::test]
+    async fn an_answer_with_an_unknown_id_is_ignored() {
+        let (out, mut page) = tokio::sync::mpsc::unbounded_channel();
+        let approver = Arc::new(WebApprover::new(out));
+        let asking = tokio::spawn({
+            let approver = approver.clone();
+            async move { approver.approve(request(false)).await }
+        });
+        let id = page.recv().await.unwrap()["id"].as_u64().unwrap();
+        for other in [1, 2, id.wrapping_add(1), id.wrapping_sub(1)] {
+            approver.answer(other, Decision::Always);
+        }
+        tokio::task::yield_now().await;
+        assert!(approver.waiting() && !asking.is_finished(), "still waiting");
+        approver.answer(id, Decision::No);
+        assert_eq!(asking.await.unwrap(), Decision::No);
+        // Answered: the same id again does nothing.
+        approver.answer(id, Decision::Yes);
+        assert!(!approver.waiting());
     }
 
     #[tokio::test]
