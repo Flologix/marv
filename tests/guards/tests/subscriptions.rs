@@ -58,8 +58,10 @@ mod sign_in_listener {
         assert!(get(port, "/auth/callback?code=real&state=the-state").await.unwrap().contains("200"));
         let callback = waiting.await.unwrap().unwrap();
         assert!(matches!(callback, Callback::Code { ref code, .. } if code == "real"), "{callback:?}");
-        // Single use: nothing listens any more.
-        assert!(get(port, "/auth/callback?code=late&state=the-state").await.is_err());
+        // Single use: this sign-in's callback isn't taken again. The port is free now, so another test's listener
+        // (they run side by side and all try the preferred port first) may answer, but never with this state's 200.
+        let late = get(port, "/auth/callback?code=late&state=the-state").await;
+        assert!(!matches!(late, Ok(ref status) if status.contains("200")), "{late:?}");
     }
 
     /// An idle local connection (any process can open one) doesn't hold the callback up: connections are answered side

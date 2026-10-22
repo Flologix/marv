@@ -78,6 +78,7 @@ cd app
 npm install
 npx tauri dev        # the app, with hot reload
 npx tauri build      # .deb and .AppImage in target/release/bundle
+npm test             # the transcript's tests (plain Node)
 ```
 
 **Linux note:** WebKitGTK's DMA-BUF renderer crashes on some Wayland + NVIDIA setups ("Error 71 (Protocol error)"). Marv desktop sets `WEBKIT_DISABLE_DMABUF_RENDERER=1` for itself. To keep the renderer, set the variable to `0`.

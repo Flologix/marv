@@ -1,176 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { type ChatSettings, type Connection, type ServerEvent, connect } from "./backend";
+import { type ChatSettings, type Connection, connect } from "./backend";
+import { type Answer, type Item, apply, restore, settle } from "./transcript";
 
-export interface DiffLine {
-  kind: "add" | "del" | "ctx" | "gap";
-  text: string;
-}
-
-export interface ApprovalRequest {
-  id: number;
-  tool: string;
-  label: string;
-  title: string;
-  command?: string | null;
-  diff?: DiffLine[] | null;
-  text?: string | null;
-  note?: string | null;
-  warning?: string | null;
-  scope: string;
-  agent?: string | null;
-  once: boolean;
-  /** #185: a model's call, which may be declined with a reason (not the step-limit question, a wire, /undo, /mcp add). */
-  reason?: boolean;
-}
-
-/** The person's answer to an approval. `declined` (#185): not run, the reason goes to the model and the turn goes on. */
-export type Answer = "yes" | "always" | "no" | { declined: string };
-
-export interface Usage {
-  promptTokens: number;
-  cachedTokens: number;
-  completionTokens: number;
-  cost: number;
-  context?: number | null;
-  contextLength?: number | null;
-}
-
-export type Item =
-  | { kind: "user"; text: string }
-  | { kind: "text"; text: string }
-  | { kind: "thinking"; text: string }
-  | {
-      kind: "tool";
-      id: string;
-      tool: string;
-      label: string;
-      agent?: string;
-      done: boolean;
-      result?: string;
-      summary?: string | null;
-      error?: boolean;
-      diff?: { lines: DiffLine[]; more: number };
-    }
-  | { kind: "approval"; request: ApprovalRequest; decision?: string; reason?: string }
-  | { kind: "notice"; text: string; tone: "info" | "warn" | "error" }
-  | { kind: "turn"; reason: string; usage?: Usage }
-  /** What a /command printed. */
-  | { kind: "output"; text: string };
+export type { Answer, ApprovalRequest, DiffLine, Item, Usage } from "./transcript";
 
 /** An entry of the / menu: a command, or one of the user's skills. */
 export interface Command {
   name: string;
   description: string;
   skill?: boolean;
-}
-
-const STOPS: Record<string, string> = {
-  step_limit: "Stopped at the step limit.",
-  cut_off: "The reply hit the output limit.",
-  text_loop: "The reply was repeating itself.",
-  tool_loop: "The same tool calls kept repeating.",
-};
-
-/** Folds one event into the transcript. */
-function apply(items: Item[], e: ServerEvent): Item[] {
-  const last = items[items.length - 1];
-  const next = items.slice();
-  const tool = (id: unknown) => next.findIndex((it) => it.kind === "tool" && it.id === id);
-  switch (e.type) {
-    case "text_delta":
-    case "thinking_delta": {
-      const kind = e.type === "text_delta" ? "text" : "thinking";
-      if (last?.kind === kind) next[next.length - 1] = { ...last, text: last.text + e.text };
-      else next.push({ kind, text: String(e.text) });
-      return next;
-    }
-    case "assistant": {
-      // The reply's whole text: already shown if it streamed in, even with tool calls after it in this step.
-      const text = String(e.text ?? "").trim();
-      for (let i = next.length - 1; i >= 0; i--) {
-        const it = next[i];
-        if (it.kind === "user" || it.kind === "turn") break;
-        if (it.kind === "text" && it.text.trim() === text) return items;
-      }
-      if (text) next.push({ kind: "text", text });
-      return next;
-    }
-    case "tool_start":
-      if (tool(e.id) < 0) next.push({ kind: "tool", id: String(e.id), tool: String(e.tool), label: String(e.label ?? ""), agent: e.agent as string | undefined, done: false });
-      return next;
-    case "tool_end":
-    case "tool_skipped": {
-      const i = tool(e.id);
-      const before = i >= 0 ? (next[i] as Extract<Item, { kind: "tool" }>) : undefined;
-      const done: Item = {
-        kind: "tool",
-        id: String(e.id),
-        tool: String(e.tool),
-        label: String(e.label ?? before?.label ?? ""),
-        agent: (e.agent as string | undefined) ?? before?.agent,
-        done: true,
-        result: String(e.result ?? e.reason ?? ""),
-        summary: (e.summary as string | null) ?? (e.type === "tool_skipped" ? "skipped" : null),
-        error: e.type === "tool_skipped" || e.error === true,
-        diff: e.diff as { lines: DiffLine[]; more: number } | undefined,
-      };
-      if (i >= 0) next[i] = done;
-      else next.push(done);
-      return next;
-    }
-    case "approval":
-      next.push({ kind: "approval", request: e as unknown as ApprovalRequest });
-      return next;
-    case "approval_done": {
-      const i = next.findIndex((it) => it.kind === "approval" && it.request.id === e.id);
-      if (i >= 0) next[i] = { ...(next[i] as Extract<Item, { kind: "approval" }>), decision: String(e.decision), reason: typeof e.reason === "string" ? e.reason : undefined };
-      return next;
-    }
-    case "compaction":
-      next.push({ kind: "notice", text: e.compacted ? "Conversation compacted to save context." : `Compaction failed (${e.reason}).`, tone: e.compacted ? "info" : "warn" });
-      return next;
-    case "tainted":
-      next.push({ kind: "notice", text: `Read untrusted content (${e.source}): anything that sends data out now asks first.`, tone: "info" });
-      return next;
-    case "step_limit":
-    case "cut_off":
-    case "text_loop":
-    case "tool_loop":
-      if (e.continued) return items;
-      next.push({ kind: "notice", text: STOPS[e.type], tone: "warn" });
-      return next;
-    case "notice":
-      next.push({ kind: "notice", text: String(e.text), tone: "info" });
-      return next;
-    case "checkpoint_failed":
-      next.push({ kind: "notice", text: String(e.text), tone: "warn" });
-      return next;
-    case "error":
-      next.push({ kind: "notice", text: String(e.message), tone: "error" });
-      return next;
-    case "command_output":
-      next.push({ kind: "output", text: String(e.text) });
-      return next;
-    case "turn_end":
-      // A tool that never reported back (an interrupt, a dropped call) stops spinning with its turn.
-      for (let i = 0; i < next.length; i++) {
-        const it = next[i];
-        if (it.kind === "tool" && !it.done) next[i] = { ...it, done: true };
-      }
-      next.push({ kind: "turn", reason: String(e.reason) });
-      return next;
-    case "usage":
-      for (let i = next.length - 1; i >= 0; i--) {
-        const it = next[i];
-        if (it.kind === "turn") {
-          next[i] = { ...it, usage: e as unknown as Usage };
-          break;
-        }
-      }
-      return next;
-    default:
-      return items;
-  }
 }
 
 const storageKey = (id: string) => `marv-transcript-${id}`;
@@ -198,9 +36,10 @@ function loadSeq(id: string): number {
 /** What the page sends for a line: a /command runs in Marv, anything else is a message to the model. */
 const message = (text: string) => (text.startsWith("/") ? { type: "command", line: text } : { type: "send", text });
 
+/** The saved transcript; its undecided approvals wait for the session to say whether they're still live. */
 function load(id: string): Item[] {
   try {
-    return JSON.parse(localStorage.getItem(storageKey(id)) ?? "[]");
+    return restore(JSON.parse(localStorage.getItem(storageKey(id)) ?? "[]"));
   } catch {
     return [];
   }
@@ -295,6 +134,14 @@ export function useChat(id: string | null, settings: ChatSettings, reload = 0) {
         if (!live) return;
         // Another numbering than the saved one (the app restarted): this page's numbers start over with it, and the
         // app sends every event it kept.
+        if (e.type === "ready") {
+          // Approvals restored undecided: live again only in the same run (the epoch the page saved) and only if the
+          // session says their request still waits; after a restart none is, whatever its id.
+          const sameRun = typeof e.epoch === "string" && e.epoch === loadEpoch(id);
+          const waiting =
+            sameRun && Array.isArray(e.waiting) ? e.waiting.filter((w): w is number => typeof w === "number") : [];
+          setItems((items) => settle(items, waiting));
+        }
         if (e.type === "ready" && typeof e.epoch === "string" && e.epoch !== loadEpoch(id)) {
           received.current = applied.current = 0;
           try {
