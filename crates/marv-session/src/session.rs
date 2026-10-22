@@ -282,6 +282,9 @@ pub struct SessionInit {
     /// is quoted as the project's data. Default: none. The caller loads `instructions`, `skills` and `agents` with the
     /// root's trust applied (`crate::project_trust::load_project`).
     pub nested_trust: Arc<crate::project_trust::NestedTrust>,
+    /// The project's root files as loaded and where they stood (`crate::project_trust::load_project`), for `/trust`;
+    /// `None`: the project's files weren't loaded.
+    pub project_files: Option<(crate::project_trust::ProjectFiles, crate::project_trust::TrustStatus)>,
     pub skills: Vec<LoadedSkill>,
     /// Agent types the agent tool can start (default: general-purpose).
     pub agents: Vec<AgentType>,
@@ -397,6 +400,7 @@ impl SessionInit {
             instructions: None,
             nested_instructions: false,
             nested_trust: Arc::default(),
+            project_files: None,
             skills: Vec::new(),
             agents: vec![general_purpose()],
             memory: None,
@@ -2720,8 +2724,17 @@ impl MarvSession {
         }
     }
 
-    /// The project's subfolder instruction files this session quoted as data, not trusted (shown → hash), for
-    /// `/trust` to record (`crate::project_trust::ProjectTrust::trust`).
+    /// The project's root files as this session loaded them, and where they stood, for `/trust`.
+    pub fn project_files(&self) -> Option<(crate::project_trust::ProjectFiles, crate::project_trust::TrustStatus)> {
+        self.inner.init.project_files.clone()
+    }
+
+    /// The skills this session loaded (the person's, and a trusted project's), as the model is offered them.
+    pub fn skills(&self) -> Vec<LoadedSkill> {
+        self.inner.init.skills.clone()
+    }
+
+    /// The project's subfolder instruction files this session quoted (see above).
     pub fn nested_quoted(&self) -> std::collections::BTreeMap<String, String> {
         self.inner.init.nested_trust.quoted()
     }

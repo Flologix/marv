@@ -159,14 +159,10 @@ pub async fn run_chat(spec: ChatSpec, mut incoming: UnboundedReceiver<ClientMess
     if let Some(handle) = session.mesh() {
         tokio::spawn(watch_mesh(handle, session.clone(), approver.clone(), out.clone(), watching.clone()));
     }
-    let home = marv_session::paths::home_dir();
-    // The project's instructions, skills and agent types, as this chat found them (read once and hashed as read), and
-    // whether the person trusted them (the session applied the same): an untrusted project's skills aren't offered.
-    let (project, user) = (spec.sources.contains(&Source::Project), spec.sources.contains(&Source::User));
-    let read = (!spec.sources.is_empty())
-        .then(|| marv_session::project_trust::load_project(&spec.root, &home, &spec.config_dir, user, project, None));
-    let project_trust = read.as_ref().filter(|_| project).map(|r| (r.files.clone(), r.status.clone()));
-    let skills: Vec<LoadedSkill> = read.map(|r| r.skills).unwrap_or_default();
+    // The skills and the project's files exactly as the session loaded them (one read, with the trust applied): an
+    // untrusted project's skills aren't offered, and /trust trusts what was loaded.
+    let project_trust = session.project_files();
+    let skills: Vec<LoadedSkill> = session.skills();
     let menu: Vec<Value> = COMMANDS
         .iter()
         .copied()

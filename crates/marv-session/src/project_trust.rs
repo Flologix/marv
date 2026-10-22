@@ -109,8 +109,15 @@ fn skill_folder(skill: &marv_tools::Skill) -> String {
 
 /// The hashes of what was loaded: the project's and parents' instruction files (as read), its skills (their
 /// instructions as loaded, and each other file) and agent types (as parsed).
-fn hash_loaded(instructions: &[InstructionFile], skills: &[LoadedSkill], agents: &[AgentType]) -> ProjectFiles {
+///
+/// Also returns each skill's other files' hashes (in `skills`' order): the same read, kept for the skill tool's check.
+fn hash_loaded(
+    instructions: &[InstructionFile],
+    skills: &[LoadedSkill],
+    agents: &[AgentType],
+) -> (ProjectFiles, Vec<BTreeMap<String, String>>) {
     let mut out = ProjectFiles::default();
+    let mut skill_files = Vec::new();
     for file in instructions.iter().filter(|f| f.kind != InstructionKind::Personal) {
         out.files.insert(file.shown.clone(), content_hash(&file.raw));
         out.instructions += 1;
@@ -120,9 +127,11 @@ fn hash_loaded(instructions: &[InstructionFile], skills: &[LoadedSkill], agents:
         let folder = skill_folder(skill);
         let text = serde_json::json!([skill.name, skill.description, skill.body, skill.files]).to_string();
         out.files.insert(format!(".marv/skills/{folder}/SKILL.md"), content_hash(&text));
-        for (name, hash) in skill_file_hashes(skill) {
-            out.files.insert(format!(".marv/skills/{folder}/{name}"), hash);
+        let hashes = skill_file_hashes(skill);
+        for (name, hash) in &hashes {
+            out.files.insert(format!(".marv/skills/{folder}/{name}"), hash.clone());
         }
+        skill_files.push(hashes);
         out.skills += 1;
     }
     for agent in agents {
@@ -130,7 +139,7 @@ fn hash_loaded(instructions: &[InstructionFile], skills: &[LoadedSkill], agents:
         out.files.insert(format!(".marv/agents/{}.md", agent.name), content_hash(&text));
         out.agents += 1;
     }
-    out
+    (out, skill_files)
 }
 
 fn same_dir(a: &Path, b: &Path) -> bool {
@@ -183,7 +192,7 @@ fn gather(root: &Path, home: &Path, personal: bool, project: bool) -> Gathered {
 /// The project's instruction files, skills and agent types, each hashed as loaded.
 pub fn project_files(root: &Path, home: &Path) -> ProjectFiles {
     let g = gather(root, home, false, true);
-    hash_loaded(&g.instructions, &g.project_skills, &g.project_agents)
+    hash_loaded(&g.instructions, &g.project_skills, &g.project_agents).0
 }
 
 /// Where a project stands.
@@ -359,7 +368,7 @@ pub fn load_project(
     trust: Option<bool>,
 ) -> ProjectLoad {
     let g = gather(root, home, personal, project);
-    let files = hash_loaded(&g.instructions, &g.project_skills, &g.project_agents);
+    let (files, skill_files) = hash_loaded(&g.instructions, &g.project_skills, &g.project_agents);
     let stored = ProjectTrust::in_config(config_dir).read().remove(&crate::paths::project_key(root));
     let status = status_of(stored.as_ref(), &files);
     let trusted = project && trust.unwrap_or_else(|| status.trusted());
@@ -375,8 +384,9 @@ pub fn load_project(
     let (mut skills, mut agents) = (g.personal_skills, g.personal_agents);
     if trusted {
         let mut by_name: BTreeMap<String, LoadedSkill> = skills.into_iter().map(|s| (s.skill.name.clone(), s)).collect();
-        for mut loaded in g.project_skills {
-            loaded.skill.trusted_files = Some(skill_file_hashes(&loaded.skill));
+        // Their files as hashed above (one read): the skill tool checks a later read against these.
+        for (mut loaded, hashes) in g.project_skills.into_iter().zip(skill_files) {
+            loaded.skill.trusted_files = Some(hashes);
             by_name.insert(loaded.skill.name.clone(), loaded);
         }
         skills = by_name.into_values().collect();

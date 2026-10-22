@@ -305,6 +305,7 @@ pub async fn create_session(options: SessionOptions) -> Result<MarvSession, Sess
         _ => None,
     };
     let nested_trust = loaded.nested.clone();
+    let project_files = loaded.project_status.clone().map(|status| (loaded.project_files.clone(), status));
     let mut problems = loaded.problems;
     match (&options.on_warning, trust_notice) {
         (Some(warn), Some(notice)) => warn(notice),
@@ -368,6 +369,7 @@ pub async fn create_session(options: SessionOptions) -> Result<MarvSession, Sess
     // Nested AGENTS.md files are the project's too (#62).
     init.nested_instructions = options.sources.contains(&Source::Project);
     init.nested_trust = nested_trust;
+    init.project_files = project_files;
     init.skills = loaded.skills;
     init.agents = loaded.agents;
     init.memory = loaded.memory;
