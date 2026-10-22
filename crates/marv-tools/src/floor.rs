@@ -4,7 +4,12 @@
 //! subagent's filtered tool list. It is now one value on [`ToolContext`], set by the session for each turn
 //! (`run_turn`, `subagent_context`) and by nothing else: no tool, no model text. [`approval_floor`] turns it and the
 //! call into the least the call must ask; `run_tool` starts there, and the later checks (taint, protected paths, a
-//! file change in the home folder) can only raise it, never lower it.
+//! file change in the home folder) can only raise it.
+//!
+//! One exception lowers a call below its floor, on purpose: in a tainted conversation, a web request under a URL
+//! prefix the person approved ("always" on a tainted fetch, `TaintState::approve_prefix`) runs without asking. It's a
+//! remembered answer, like an "always", so it applies only in a turn with automatic approval
+//! ([`CallMode::auto_approval`]), never in a woken or radio turn.
 //!
 //! The change was a refactor with no change in behaviour: `tests/guards/golden/approvals.txt` (every example call ×
 //! kind of turn, clean and tainted, yolo off and on) was written before it and is unchanged by it.
@@ -24,7 +29,8 @@ pub enum CallMode {
     /// The person typed it, at a terminal, in the desktop app or over the SDK.
     #[default]
     Person,
-    /// `marv -p`: one prompt, no one at a prompt (what asks is answered by `--approve`).
+    /// A one-shot session: `marv -p`, or an SDK session made `one_shot`. No one at a prompt: what asks is answered by
+    /// the client's approver (`--approve` for `marv -p`). Its approvals are a person's turn's.
     Headless,
     /// Another agent's message woke the session (the mesh inbox, #78): automatic approval is off.
     Woken,
@@ -84,6 +90,7 @@ pub fn asked_every_time(tool: &dyn DynTool, input: &(dyn std::any::Any + Send + 
 /// The least this call must ask in `ctx.mode`. The table in `docs/TOOLS.md` is this function, printed per mode.
 ///
 /// Calls `needs_approval` once: `run_tool` takes its answer from here (web_fetch's records a cached read it allows).
+/// The approved-URL-prefix exception (module docs) is `run_tool`'s, after this.
 pub fn approval_floor(tool: &dyn DynTool, input: &(dyn std::any::Any + Send + Sync), ctx: &ToolContext) -> Floor {
     if !offered_in_mode(tool.name(), ctx.mode) {
         return Floor::Refused;
