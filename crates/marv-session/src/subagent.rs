@@ -844,13 +844,14 @@ mod run_tests {
         let out = run(agent_call(serde_json::json!({"description": "x", "prompt": "p"}), "a1"), &ctx).await;
 
         // Its own bash output: cut for it, saved where the main agent's are.
-        assert!(provider.results(1)[0].contains(&format!("full output: {}", store.join("s/b1.txt").display())));
-        assert!(std::fs::read_to_string(store.join("s/b1.txt")).unwrap().ends_with("\n20000"));
+        assert!(provider.results(1)[0].contains(&format!("full output: {}", store.join("s/b1.network.txt").display())));
+        assert!(std::fs::read_to_string(store.join("s/b1.network.txt")).unwrap().ends_with("\n20000"));
         // Its report: cut for the parent, saved under the agent call's id.
         let saved = store.join("s/a1.subagent.txt");
-        assert!(out.result.output.starts_with("Report start.") && out.result.output.ends_with("Report end."));
+        // Its unsandboxed bash had the network, so it was tainted: its report comes quoted as a subagent's data.
+        assert!(out.result.output.contains("\nReport start.") && out.result.output.ends_with("Report end.\n</untrusted-data>"));
         assert!(out.result.output.contains(&format!("full output: {}", saved.display())));
-        assert_eq!(std::fs::read_to_string(&saved).unwrap(), report);
+        assert!(std::fs::read_to_string(&saved).unwrap().contains(&report));
     }
 
     #[tokio::test]

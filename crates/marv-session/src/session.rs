@@ -5444,7 +5444,7 @@ mod turn_tests {
             i.tool_output_dir = Some(dirs.dir.join("tool-output"));
             i.trajectories = Some(store.clone());
         });
-        let saved = dirs.dir.join("tool-output").join(session.id()).join("b1.txt");
+        let saved = dirs.dir.join("tool-output").join(session.id()).join("b1.network.txt") /* unsandboxed: it had the network */;
         let grep = call("g1", "grep", serde_json::json!({"pattern": "FAILED", "path": saved}));
         lock(&provider.steps).extend([use_tools(vec![grep]), say("parser::quotes fails.")]);
         let events = collect(go(&session, "run the tests")).await;
@@ -5457,9 +5457,11 @@ mod turn_tests {
             .collect();
 
         assert!(results[0].contains(&format!("characters omitted; full output: {} — read_file it, or grep it", saved.display())));
-        assert!(!results[0].contains("FAILED") && results[0].ends_with("test case_10000 ... ok\n\n[exit code 1]"));
+        // Unsandboxed, the command had the network: its output (and the saved file read back) is quoted as data.
+        let body = results[0].split_once('\n').map_or("", |(_, b)| b); // after the fence's opening tag (the command)
+        assert!(!body.contains("FAILED") && body.ends_with("test case_10000 ... ok\n\n[exit code 1]\n</untrusted-data>"));
         assert!(results[0].chars().count() < 31_000);
-        assert_eq!(results[1], format!("{}:5000:test parser::quotes FAILED", saved.display()));
+        assert!(results[1].contains(&format!("\n{}:5000:test parser::quotes FAILED\n", saved.display())), "{}", results[1]);
 
         // The trajectory has what the model saw: the path, not the saved content.
         let log = records(&store, &dirs.project, &session).await;
@@ -5483,7 +5485,7 @@ mod turn_tests {
             i.approve = Some(answer(Decision::Yes));
             i.tool_output_dir = Some(relative.clone());
         });
-        let saved = dirs.dir.join("tool-output").join(session.id()).join("b1.txt");
+        let saved = dirs.dir.join("tool-output").join(session.id()).join("b1.network.txt") /* unsandboxed: it had the network */;
         let read = call("r1", "read_file", serde_json::json!({"path": saved, "offset": 15000, "limit": 1}));
         lock(&provider.steps).extend([use_tools(vec![read]), say("done")]);
         let events = collect(go(&session, "count")).await;
