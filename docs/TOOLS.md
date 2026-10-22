@@ -36,8 +36,11 @@ approved and how its output is treated. A tool change shows up here as a diff.
 
 What each call does by itself, evaluated with the sandbox off and nothing tainted:
 
-- **Asks**: whether it needs the person's approval (`no`: it runs without asking).
-- **Every time**: asked every time, never answered by "don't ask again".
+- **Person** to **Subagent**: the least the call asks in each kind of turn: `never` (it runs without asking),
+  `asks` (yolo or "don't ask again" may answer), `every time` (no yolo, no "don't ask again"), `refused` (not
+  offered). `person`: the person typed it; `headless`: `marv -p`; `woken`: another agent's message woke the
+  session; `radio`: a radio message, or a turn handling radio requests; `subagent`: a subagent of the person's
+  turn (a subagent of a woken or radio turn asks as that turn does).
 - **Network**: whether it can reach the network.
 - **Source**: where this call's output comes from (its class in brackets).
 - **Persists**: whether it writes something later conversations load as the person's own. In a conversation
@@ -47,28 +50,28 @@ What each call does by itself, evaluated with the sandbox off and nothing tainte
 On top of this, a write to a protected path (docs/SECURITY.md: `.git`, a lifecycle script in `package.json`, ...)
 is asked every time, even in yolo, and so is any call to the network once the conversation holds outside text.
 
-| Call | Asks | Every time | Network | Source | Persists | Door |
-|---|---|---|---|---|---|---|
-| `read_file {"path":"src/main.rs"}` | no | no | no | project (workspace) | no | - |
-| `glob {"pattern":"**/*.rs"}` | no | no | no | project (workspace) | no | - |
-| `grep {"pattern":"fn main"}` | no | no | no | project (workspace) | no | - |
-| `web_fetch {"url":"https://example.com/"}` | yes | no | yes | web (outside) | no | - |
-| `web_fetch {"offset":2000,"url":"https://example.com/"}` | yes | no | yes | web (outside) | no | - |
-| `github {"args":["issue","list"]}` | no | no | yes | github (outside) | no | github |
-| `github {"args":["api","repos/o/r/actions/secrets"]}` | yes | yes | yes | github (outside) | no | github |
-| `github {"args":["issue","comment","1","--body","done"]}` | yes | no | yes | github (outside) | no | github |
-| `skill {"name":"release"}` | no | no | no | project (workspace) | no | - |
-| `edit_file {"new_string":"b","old_string":"a","path":"src/main.rs"}` | yes | no | no | project (workspace) | no | - |
-| `write_file {"content":"hi","path":"notes.txt"}` | yes | no | no | project (workspace) | no | - |
-| `write_file {"content":"true","path":".git/hooks/pre-commit"}` | yes | no | no | project (workspace) | no | - |
-| `bash {"command":"cargo test"}` | yes | no | no | project (workspace) | no | - |
-| `bash {"command":"cargo fetch","network":true}` | yes | no | yes | network (outside) | no | - |
-| `bash {"command":"git commit -m x","git_write":true}` | yes | no | no | project (workspace) | no | - |
-| `process {"action":"start","command":"npm run dev"}` | yes | no | no | project (workspace) | no | process |
-| `process {"action":"start","command":"npm run dev","network":true}` | yes | no | yes | network (outside) | no | process |
-| `process {"action":"list"}` | no | no | no | project (workspace) | no | - |
-| `memory {"action":"add","scope":"project","text":"Tests run with cargo nextest."}` | yes | no | no | marv (authority) | yes | - |
-| `memory {"action":"remove","scope":"project","text":"nextest"}` | yes | no | no | marv (authority) | no | - |
-| `plan {"items":[{"status":"in_progress","text":"Write the test"}]}` | no | no | no | marv (authority) | no | - |
-| `agent {"description":"find the bug","prompt":"Find it."}` | no | no | no | subagent (workspace) | no | - |
-| `agent {"description":"fix the bug","isolation":"worktree","prompt":"Fix it."}` | yes | no | no | subagent (workspace) | no | - |
+| Call | Person | Headless | Woken | Radio | Subagent | Network | Source | Persists | Door |
+|---|---|---|---|---|---|---|---|---|---|
+| `read_file {"path":"src/main.rs"}` | never | never | never | never | never | no | project (workspace) | no | - |
+| `glob {"pattern":"**/*.rs"}` | never | never | never | never | never | no | project (workspace) | no | - |
+| `grep {"pattern":"fn main"}` | never | never | never | never | never | no | project (workspace) | no | - |
+| `web_fetch {"url":"https://example.com/"}` | asks | asks | every time | every time | asks | yes | web (outside) | no | - |
+| `web_fetch {"offset":2000,"url":"https://example.com/"}` | asks | asks | every time | every time | asks | yes | web (outside) | no | - |
+| `github {"args":["issue","list"]}` | never | never | never | never | never | yes | github (outside) | no | github |
+| `github {"args":["api","repos/o/r/actions/secrets"]}` | every time | every time | every time | every time | every time | yes | github (outside) | no | github |
+| `github {"args":["issue","comment","1","--body","done"]}` | asks | asks | every time | every time | asks | yes | github (outside) | no | github |
+| `skill {"name":"release"}` | never | never | never | never | never | no | project (workspace) | no | - |
+| `edit_file {"new_string":"b","old_string":"a","path":"src/main.rs"}` | asks | asks | every time | every time | asks | no | project (workspace) | no | - |
+| `write_file {"content":"hi","path":"notes.txt"}` | asks | asks | every time | every time | asks | no | project (workspace) | no | - |
+| `write_file {"content":"true","path":".git/hooks/pre-commit"}` | asks | asks | every time | every time | asks | no | project (workspace) | no | - |
+| `bash {"command":"cargo test"}` | asks | asks | every time | every time | asks | no | project (workspace) | no | - |
+| `bash {"command":"cargo fetch","network":true}` | asks | asks | every time | every time | asks | yes | network (outside) | no | - |
+| `bash {"command":"git commit -m x","git_write":true}` | asks | asks | every time | every time | asks | no | project (workspace) | no | - |
+| `process {"action":"start","command":"npm run dev"}` | asks | asks | every time | every time | refused | no | project (workspace) | no | process |
+| `process {"action":"start","command":"npm run dev","network":true}` | asks | asks | every time | every time | refused | yes | network (outside) | no | process |
+| `process {"action":"list"}` | never | never | never | never | refused | no | project (workspace) | no | - |
+| `memory {"action":"add","scope":"project","text":"Tests run with cargo nextest."}` | asks | asks | every time | every time | refused | no | marv (authority) | yes | - |
+| `memory {"action":"remove","scope":"project","text":"nextest"}` | asks | asks | every time | every time | refused | no | marv (authority) | no | - |
+| `plan {"items":[{"status":"in_progress","text":"Write the test"}]}` | never | never | never | never | refused | no | marv (authority) | no | - |
+| `agent {"description":"find the bug","prompt":"Find it."}` | never | never | never | never | refused | no | subagent (workspace) | no | - |
+| `agent {"description":"fix the bug","isolation":"worktree","prompt":"Fix it."}` | asks | asks | every time | every time | refused | no | subagent (workspace) | no | - |

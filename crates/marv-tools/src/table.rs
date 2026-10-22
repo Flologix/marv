@@ -19,10 +19,10 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use marv_core::ToolKind;
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use crate::floor::{CallMode, Floor, approval_floor};
 use crate::registry::{ToolRef, builtin_tools};
 use crate::types::ToolContext;
 
@@ -93,6 +93,20 @@ fn name_of(value: impl Serialize) -> String {
     serde_json::to_value(value).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default()
 }
 
+/// The kinds of turn the table has a column for, in its order.
+pub const MODES: [CallMode; 5] =
+    [CallMode::Person, CallMode::Headless, CallMode::Woken, CallMode::Radio, CallMode::Subagent { unattended: false }];
+
+/// A floor as the table shows it.
+pub fn floor_name(floor: Floor) -> &'static str {
+    match floor {
+        Floor::NeverAsks => "never",
+        Floor::Asks => "asks",
+        Floor::AsksEveryTime => "every time",
+        Floor::Refused => "refused",
+    }
+}
+
 fn yes(b: bool) -> &'static str {
     if b { "yes" } else { "no" }
 }
@@ -134,8 +148,11 @@ pub fn tools_table() -> String {
     out.push_str(
         "\n## Example calls\n\n\
          What each call does by itself, evaluated with the sandbox off and nothing tainted:\n\n\
-         - **Asks**: whether it needs the person's approval (`no`: it runs without asking).\n\
-         - **Every time**: asked every time, never answered by \"don't ask again\".\n\
+         - **Person** to **Subagent**: the least the call asks in each kind of turn: `never` (it runs without asking),\n  \
+         `asks` (yolo or \"don't ask again\" may answer), `every time` (no yolo, no \"don't ask again\"), `refused` (not\n  \
+         offered). `person`: the person typed it; `headless`: `marv -p`; `woken`: another agent's message woke the\n  \
+         session; `radio`: a radio message, or a turn handling radio requests; `subagent`: a subagent of the person's\n  \
+         turn (a subagent of a woken or radio turn asks as that turn does).\n\
          - **Network**: whether it can reach the network.\n\
          - **Source**: where this call's output comes from (its class in brackets).\n\
          - **Persists**: whether it writes something later conversations load as the person's own. In a conversation\n  \
@@ -143,22 +160,24 @@ pub fn tools_table() -> String {
          - **Door**: the door out of the sandbox it goes through, if any.\n\n\
          On top of this, a write to a protected path (docs/SECURITY.md: `.git`, a lifecycle script in `package.json`, ...)\n\
          is asked every time, even in yolo, and so is any call to the network once the conversation holds outside text.\n\n\
-         | Call | Asks | Every time | Network | Source | Persists | Door |\n\
-         |---|---|---|---|---|---|---|\n",
+         | Call | Person | Headless | Woken | Radio | Subagent | Network | Source | Persists | Door |\n\
+         |---|---|---|---|---|---|---|---|---|---|\n",
     );
     for example in examples() {
         let tool = example_tool(&example);
         let parsed = tool.parse(example.input.clone()).expect("an example that parses");
         let input = parsed.as_ref();
-        let asks = tool.needs_approval(input).unwrap_or(tool.kind() != ToolKind::Read);
+        let floors: Vec<&str> = MODES
+            .iter()
+            .map(|mode| floor_name(approval_floor(tool.as_ref(), input, &ToolContext { mode: *mode, ..ctx.clone() })))
+            .collect();
         let source = tool.provenance_in(input, &ctx);
         let door = tool.door(input, &ctx).map(name_of).unwrap_or_else(|| "-".into());
         let _ = writeln!(
             out,
-            "| `{}` | {} | {} | {} | {} ({}) | {} | {} |",
+            "| `{}` | {} | {} | {} ({}) | {} | {} |",
             example_label(&example),
-            yes(asks),
-            yes(asks && tool.once(input, &ctx)),
+            floors.join(" | "),
             yes(tool.uses_network(input, &ctx)),
             name_of(source),
             name_of(source.class()),

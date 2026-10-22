@@ -33,6 +33,7 @@ use std::any::Any;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::floor::CallMode;
 use crate::formatter::Formatter;
 use async_trait::async_trait;
 pub use marv_core::Door;
@@ -369,11 +370,13 @@ pub struct ToolContext {
     pub sandbox: Arc<Sandbox>,
     /// Yolo mode: calls whose tool says they're safe (`auto_safe`) run without asking.
     pub yolo: bool,
-    /// Automatic approval is off: a turn the person at this Marv didn't start (a mesh wake, #78; the radio, #124).
-    /// Yolo doesn't apply, a URL prefix approved earlier doesn't either, and every call that asks is asked `once`, so
-    /// neither a remembered "always" nor a worktree subagent's automatic yes answers it (the Herdr door's light actions
-    /// included, #74). Only a person at this Marv does. Subagents inherit it.
-    pub no_auto_approval: bool,
+    /// Who started the turn this call runs in ([`CallMode`]), set by the session and nothing else. In a turn the person
+    /// at this Marv didn't start (a mesh wake, #78; the radio, #124) automatic approval is off
+    /// ([`CallMode::auto_approval`]): yolo doesn't apply, a URL prefix approved earlier doesn't either, and every call
+    /// that asks is asked `once`, so neither a remembered "always" nor a worktree subagent's automatic yes answers it
+    /// (the Herdr door's light actions included, #74). Only a person at this Marv does. Subagents inherit it
+    /// ([`CallMode::subagent`]).
+    pub mode: CallMode,
     /// Set by `run_tool` for a call that runs without asking: bash then sees the project's `.git` read-only, and the
     /// edit tools re-check `.git` at apply time.
     pub confined: bool,
@@ -439,7 +442,7 @@ impl ToolContext {
             approver: None,
             sandbox: Arc::new(sandbox),
             yolo: false,
-            no_auto_approval: false,
+            mode: CallMode::Person,
             confined: false,
             skills: Arc::new(Vec::new()),
             memory: None,

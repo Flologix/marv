@@ -20,6 +20,7 @@ pub mod edit_file;
 pub mod edit_match;
 pub mod file_lock;
 pub mod files;
+pub mod floor;
 pub mod formatter;
 pub mod github;
 pub mod glob;
@@ -42,6 +43,7 @@ pub mod web;
 pub mod web_fetch;
 pub mod write_file;
 
+pub use floor::{CallMode, Floor, MAIN_AGENT_ONLY, approval_floor, offered};
 pub use formatter::{FormatOutcome, Formatter, FormatterSetting, ProjectFormatter};
 pub use marv_core::MAX_DECLINE_REASON;
 pub use registry::{

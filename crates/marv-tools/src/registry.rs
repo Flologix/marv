@@ -33,6 +33,7 @@ use std::sync::{Arc, OnceLock};
 use marv_core::{Provenance, ToolCall, ToolKind, ToolSpec};
 use serde_json::Value;
 
+use crate::floor::{Floor, approval_floor, asked_every_time};
 use crate::repair::{repair_json_args, with_note};
 use crate::schema_repair::{RepairMode, repair_args, repair_note};
 use crate::types::{Approval, ApprovalRequest, Decision, DynTool, ToolContext, ToolOutput};
@@ -228,17 +229,19 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
         noted(ToolOutcome { result, label: label.clone() })
     };
 
+    // What the call asks starts at its floor (`floor.rs`: `approval_floor`, `asked_every_time`); the checks below only
+    // raise it. Whether a tool is offered at all is the tool list's (`available`, built with `floor::offered`).
     let network = tool.uses_network(input, ctx);
     let protected = tool.protected_target(input, ctx);
     // A web request under a URL prefix the user approved after the taint (docs/SECURITY.md) runs as approved.
     let egress_url = tool.egress_url(input).filter(|_| ctx.taint.is_tainted());
     // Not in a turn without automatic approval (#124): that prefix is a remembered answer too.
-    let prefix_approved = !ctx.no_auto_approval && egress_url.as_deref().is_some_and(|url| ctx.taint.prefix_approved(url));
+    let prefix_approved = ctx.mode.auto_approval() && egress_url.as_deref().is_some_and(|url| ctx.taint.prefix_approved(url));
     // A write that later conversations load as the person's own (memory), once outside text is in this one: a person
     // answers it every time.
     let tainted_sink = ctx.taint.is_tainted() && tool.persists(input, ctx);
     let must_ask = protected.is_some() || tainted_sink || (ctx.taint.must_ask(tool.kind(), network) && !prefix_approved);
-    let gated = must_ask || (!prefix_approved && tool.needs_approval(input).unwrap_or(tool.kind() != ToolKind::Read));
+    let gated = must_ask || (!prefix_approved && approval_floor(tool.as_ref(), input, ctx) != Floor::NeverAsks);
     let interrupted = |approval: Approval| {
         let mut result = ToolOutput::ok(INTERRUPTED, "interrupted");
         result.declined = true;
@@ -291,9 +294,9 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
             let home_write = home_file_write(tool.kind(), &scope.key, ctx);
             // A turn without automatic approval (#124, a turn the radio started) asks every call `once`: no
             // remembered "always" and no worktree subagent's automatic yes answers it.
-            let once = tool.once(input, ctx) || home_write || ctx.no_auto_approval || tainted_sink;
+            let once = asked_every_time(tool.as_ref(), input, ctx) || home_write || tainted_sink;
             // Yolo: a call the tool vouches for runs without asking, confined (bash then can't touch .git).
-            if ctx.yolo && !ctx.no_auto_approval && !must_ask && !home_write && tool.auto_safe(input, ctx) {
+            if ctx.yolo && ctx.mode.auto_approval() && !must_ask && !home_write && tool.auto_safe(input, ctx) {
                 if !checkpointed().await {
                     return interrupted(Approval::Interrupted);
                 }
@@ -670,7 +673,7 @@ mod tests {
     #[tokio::test]
     async fn without_automatic_approval_yolo_asks_once() {
         let approver = Arc::new(Answer(Decision::Yes, Mutex::new(vec![])));
-        let off = ToolContext { yolo: true, no_auto_approval: true, approver: Some(approver.clone()), ..ctx() };
+        let off = ToolContext { yolo: true, mode: crate::CallMode::Woken, approver: Some(approver.clone()), ..ctx() };
         let asked = run_tool(&call(r#"{"text": "x"}"#), &off, &tools(ToolKind::Write, true)).await;
         assert_eq!(asked.result.output, "x", "approved by the person, not confined by yolo");
         assert_eq!(asked.result.approval, Some(Approval::Decided(Decision::Yes)));

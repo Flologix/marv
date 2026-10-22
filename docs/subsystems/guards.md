@@ -169,6 +169,7 @@ Each guard's doc comment says how it was proven: the guard was reverted, and the
 | A session's tool list keeps the specs' order | `tools.rs::every_tool_list_keeps_the_specs_order` | Holds by construction (`tool_specs_for` filters) |
 | A tool name is never reused; a removed tool has a tombstone | `tools.rs::a_removed_tool_keeps_its_name_and_tombstone` | Proven (two reverts: `memory` removed without a tombstone; a `glob` tombstone) |
 | Who started a turn (the person, headless, a mesh wake, the radio, a subagent of each) changes approvals only as it did | `tools.rs::approvals_per_turn_match_the_golden` (`golden/approvals.txt`: every example call × kind of turn, clean and tainted, yolo off and on, through `run_tool` with each tool's effects stubbed) | Proven (`\|\| ctx.no_auto_approval` dropped from `once`) |
+| The floor (`approval_floor`, `docs/TOOLS.md`'s per-mode columns) is what `run_tool` decides | `tools.rs::the_floor_matches_todays_answers_per_mode` | Proven (`approval_floor` answering `Asks` for every-time calls) |
 
 ## Notes
 

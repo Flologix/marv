@@ -11,7 +11,7 @@
 //!   back is other programs' text (a pane's screen, names and titles anyone can set): the result is
 //!   [`Provenance::Herdr`], so the session's runner fences it as data and the session is tainted from then on.
 //! - **Light actions ask, "always" allowed:** `focus`, `rename`, and `prompt` (a prompt typed into an idle agent's
-//!   pane: never a command, the #128 rule). In a turn another agent started (`ToolContext::no_auto_approval`: a mesh
+//!   pane: never a command, the #128 rule). In a turn another agent started (`ToolContext::mode` without automatic approval: a mesh
 //!   wake now, the radio from #124's phase 2) they're asked `once`, so no remembered "always" answers them.
 //! - **Running anything asks every time:** `run` (a command in a new pane) and `spawn` (a Marv or another agent kind,
 //!   optionally in a new git worktree). `once` (never remembered: not by "always", the config's pre-approved scopes or
@@ -309,7 +309,7 @@ pub fn marv_command(marv: &std::path::Path, ctx: &ToolContext) -> String {
     if ctx.taint.is_tainted() {
         line.push_str("MARV_TAINTED=1 ");
     }
-    if !ctx.yolo || ctx.no_auto_approval {
+    if !ctx.yolo || !ctx.mode.auto_approval() {
         line.push_str("MARV_YOLO=off ");
     }
     line + &shell_quote(&marv.to_string_lossy())
@@ -718,7 +718,7 @@ impl Tool for HerdrDoor {
     }
     /// Running anything is asked every time; a light action too in a turn another agent started.
     fn once(&self, input: &HerdrInput, ctx: &ToolContext) -> bool {
-        input.runs() || ctx.no_auto_approval
+        input.runs() || !ctx.mode.auto_approval()
     }
     fn scope(&self, input: &HerdrInput) -> Option<Scope> {
         let (key, description) = match input.action {

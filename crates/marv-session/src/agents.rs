@@ -18,7 +18,8 @@ use crate::frontmatter::parse_frontmatter;
 use crate::skills::{cap_body, valid_name};
 
 /// What subagents may use. Never `agent` (no subagents of subagents: no runaway recursion) or `memory` (memory
-/// outlives the session, so only the main agent changes it, with the user's approval).
+/// outlives the session, so only the main agent changes it, with the user's approval). Every other built-in tool is
+/// in `marv_tools::MAIN_AGENT_ONLY`, which `run_tool` refuses in a subagent's call (`marv_tools::floor`).
 pub const SUBAGENT_TOOLS: [&str; 9] =
     ["read_file", "glob", "grep", "web_fetch", "github", "skill", "edit_file", "write_file", "bash"];
 
@@ -173,6 +174,18 @@ pub fn find_agent<'a>(agents: &'a [AgentType], name: &str) -> Option<&'a AgentTy
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Every built-in tool is either a subagent's or the main agent's alone, never both.
+    #[test]
+    fn every_builtin_tool_is_a_subagents_or_the_main_agents_alone() {
+        for tool in marv_tools::builtin_tools() {
+            let name = tool.name();
+            assert!(
+                SUBAGENT_TOOLS.contains(&name) != marv_tools::MAIN_AGENT_ONLY.contains(&name),
+                "{name}: in both lists or neither"
+            );
+        }
+    }
 
     #[test]
     fn claude_code_files_work_unchanged() {

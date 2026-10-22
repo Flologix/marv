@@ -270,7 +270,12 @@ fn turn_context(
     }
     let unattended = matches!(turn, Turn::Woken | Turn::Radio | Turn::SubagentOfWoken);
     ctx.yolo = yolo && !unattended;
-    ctx.no_auto_approval = unattended;
+    ctx.mode = match turn {
+        Turn::Person | Turn::SubagentOfPerson => marv_tools::CallMode::Person,
+        Turn::Headless => marv_tools::CallMode::Headless,
+        Turn::Woken | Turn::SubagentOfWoken => marv_tools::CallMode::Woken,
+        Turn::Radio => marv_tools::CallMode::Radio,
+    };
     ctx.approver = Some(match turn {
         Turn::Radio => Arc::new(marv_session::radio::RadioTurnApprover(approver, marv_session::radio::RADIO_TURN_WARNING)),
         _ => approver,
@@ -338,8 +343,45 @@ async fn approval_decisions() -> String {
 /// example call of every built-in tool, in every kind of turn, clean and tainted, with yolo off and on. A change to
 /// how a turn's kind reaches the approval flow must leave it as it is.
 ///
-/// Proven: dropped `|| ctx.no_auto_approval` from `once` in `run_tool` → this failed (woken `ask` for `once`).
+/// Proven: dropped `|| ctx.no_auto_approval` from `once` in `run_tool` → this failed (woken `ask` for `once`). Unchanged
+/// by the move of the turn's kind onto `ToolContext::mode` (`marv_tools::floor`).
 #[tokio::test]
 async fn approvals_per_turn_match_the_golden() {
     golden("tests/guards/golden/approvals.txt", &approval_decisions().await);
+}
+
+/// **The floor is what `run_tool` does.** For every example call and kind of turn, clean and without yolo,
+/// `approval_floor` (the per-mode columns of `docs/TOOLS.md`) names what `run_tool` decided: `never` ran without
+/// asking, `asks` asked with "always" allowed, `every time` asked once, `refused` wasn't offered. (A protected path
+/// raises a call to "a person must answer" on top: the later check, never lower.)
+///
+/// Proven: made `approval_floor` answer `Asks` where `asked_every_time` holds → this failed (woken `once`, floor
+/// `asks`).
+#[tokio::test]
+async fn the_floor_matches_todays_answers_per_mode() {
+    let project = marv_guards::TempDir::new("floor-golden");
+    for example in marv_tools::table::examples() {
+        for (turn, name) in TURNS {
+            let recorder = marv_guards::Recorder::new(marv_tools::Decision::No);
+            let (ctx, _) = turn_context(project.path(), turn, false, false, recorder);
+            let tool = marv_tools::table::example_tool(&example);
+            let input = tool.parse(example.input.clone()).expect("an example that parses");
+            let floor = marv_tools::approval_floor(tool.as_ref(), input.as_ref(), &ctx);
+            let expected = match floor {
+                marv_tools::Floor::NeverAsks => "runs",
+                marv_tools::Floor::Asks => "ask",
+                marv_tools::Floor::AsksEveryTime => "once",
+                marv_tools::Floor::Refused => "-",
+            };
+            let label = marv_tools::table::example_label(&example);
+            // A protected path raises the call to `must` (a person answers): the floor still decides `once`.
+            let decided = decided(project.path(), &example, turn, false, false).await;
+            let decided = match decided.as_str() {
+                "must" => "ask",
+                "must once" => "once",
+                other => other,
+            };
+            assert_eq!(decided, expected, "{label} in a {name} turn");
+        }
+    }
 }

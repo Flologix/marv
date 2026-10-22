@@ -105,7 +105,7 @@ pub fn subagent_context(
     ctx.formatter = parent.formatter.clone();
     ctx.yolo = parent.yolo;
     // A turn the radio started (#124) has no automatic approval, and neither have its subagents.
-    ctx.no_auto_approval = parent.no_auto_approval;
+    ctx.mode = parent.mode.subagent();
     ctx.skills = parent.skills.clone();
     ctx.taint = Arc::new(parent.taint.for_subagent());
     // Its sandboxed bash reaches the session's background processes like the main agent's (curl localhost:<port>);
@@ -359,6 +359,7 @@ async fn drive(
         .filter(|t| {
             let name = t.name();
             SUBAGENT_TOOLS.contains(&name)
+                && marv_tools::offered(name, ctx.mode.subagent())
                 && agent_type.tools.iter().any(|n| n == name)
                 && (name != "skill" || has_skills)
                 && (name != "github" || ctx.doors.github)

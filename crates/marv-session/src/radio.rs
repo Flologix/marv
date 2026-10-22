@@ -15,7 +15,7 @@
 //!   [`RADIO_WAKES_PER_MINUTE`] a minute per sender and one every [`RADIO_WAKE_GAP_MS`]; across all senders
 //!   [`RADIO_WAKES_OVERALL`] in [`RADIO_WAKES_WINDOW_MS`], after which radio wakes pause until the person types.
 //! - **A turn the radio started asks for everything that would ask** (§8.4): yolo, remembered "always" answers, a URL
-//!   prefix approved earlier and a worktree subagent's automatic yes don't apply in it (`ToolContext::no_auto_approval`),
+//!   prefix approved earlier and a worktree subagent's automatic yes don't apply in it (`ToolContext::mode`, `CallMode::Radio`),
 //!   and its approvals say why ([`RadioTurnApprover`]). Read-only tools run as usual.
 //! - Nothing here reaches an approver: a frame is data, read by a model, and only a person answers an approval.
 
