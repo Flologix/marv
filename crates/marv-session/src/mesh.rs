@@ -28,8 +28,9 @@
 //!   The woken turn has no user message: it drains the inbox the same way (fenced, tainting), then [`WAKE_NOTE`].
 //!   `marv -p` and SDK sessions never wake.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use marv_agent::agent::AfterStep;
@@ -466,6 +467,9 @@ pub struct MeshTool {
     pub socket: PathBuf,
     pub mesh: MeshHandle,
     pub approver: Option<Arc<dyn WireApprover>>,
+    /// A wire the person granted in this call's own prompt that the switchboard then couldn't make (the far end's
+    /// refusal, say), by call id: the run reports it, quoted ([`mesh_error`]).
+    failed_grants: Mutex<HashMap<String, String>>,
 }
 
 impl MeshTool {
@@ -479,6 +483,7 @@ impl MeshTool {
                 socket: plug.host_socket.clone(),
                 mesh: mesh.clone(),
                 approver: approver.clone(),
+                failed_grants: Mutex::default(),
             })
             .collect()
     }
@@ -647,16 +652,30 @@ impl Tool for MeshTool {
             _ = ctx.cancel.cancelled() => return Some(Ok(Decision::No)),
         };
         Some(match answer {
-            CallWire::Granted(by) => self.grant(request, by).await.map(|()| Decision::Yes).map_err(ToolError::new),
+            // A grant that fails can carry the far end's words: the run reports it as mesh data, not this prompt as
+            // Marv's error.
+            CallWire::Granted(by) => {
+                if let Err(err) = self.grant(request, by).await {
+                    let id = ctx.call_id.clone().unwrap_or_default();
+                    self.failed_grants.lock().unwrap_or_else(|e| e.into_inner()).insert(id, err);
+                }
+                Ok(Decision::Yes)
+            }
             CallWire::Refused(decision) => Ok(decision),
         })
     }
     async fn run(&self, input: &Self::Input, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let target = self.target(input);
+        let failed =
+            self.failed_grants.lock().unwrap_or_else(|e| e.into_inner()).remove(&ctx.call_id.clone().unwrap_or_default());
+        // Wiring failures can be the far end's words too (another Marv's switchboard refusing): quoted as mesh data.
+        if let (Some(err), Some((receptacle, _))) = (failed, &target) {
+            return Ok(mesh_error(Some(receptacle), &err));
+        }
         if let Some((receptacle, mode)) = &target
             && let Err(err) = self.ask_for_wire(receptacle, *mode).await
         {
-            return Ok(ToolOutput::error(err));
+            return Ok(mesh_error(Some(receptacle), &err));
         }
         let wireable = if self.name == MESH_LIST {
             self.wireable(&ctx.cancel).await

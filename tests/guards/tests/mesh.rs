@@ -521,3 +521,38 @@ async fn an_inbox_woken_turn_asks_for_what_yolo_would_allow() {
     cancel.cancel();
     session.close().await;
 }
+
+/// **A failed mesh call or send is read as mesh data:** its text can be the far end's (an error result, another
+/// Marv's switchboard refusing a wire), and arrives as the local switchboard's own refusal does, so every one is
+/// quoted (the closing tag defused), marked `Provenance::Mesh`, and taints.
+///
+/// Proven: made the mesh tool's run return the error as it is (`ToolOutput::error`) → it came unfenced and nothing
+/// tainted.
+#[tokio::test]
+async fn a_failed_mesh_call_is_quoted_as_mesh_data_and_taints() {
+    use marv_session::mesh::MeshTool;
+    use marv_tools::ToolRef;
+    let runtime = TempDir::short("mesh-fail");
+    let mesh = Arc::new(Switchboard::new("g", runtime.path().join("plugs"), Arc::new(Log::default())));
+    let cancel = CancellationToken::new();
+    tokio::spawn(Arc::clone(&mesh).serve(cancel.clone()));
+    mesh.plug(parent_id()).unwrap();
+    let worker = mesh.plug_next("worker").unwrap();
+    let tools: Vec<ToolRef> = MeshTool::all(&worker, &mesh, None).into_iter().map(|t| Arc::new(t) as ToolRef).collect();
+    let call = marv_core::ToolCall {
+        id: "f1".into(),
+        name: "mesh_send".into(),
+        arguments: r#"{"receptacle": "agent.parent.inbox", "text": "hi"}"#.into(),
+    };
+    let mut ctx = marv_tools::ToolContext::new(std::env::temp_dir());
+    ctx.yolo = true;
+    ctx.approver = Some(Arc::new(Person(marv_tools::Decision::Yes, Mutex::default())));
+    let out = marv_tools::run_tool(&call, &ctx, &tools).await;
+    assert!(out.result.is_error, "{}", out.result.output);
+    assert_eq!(out.result.provenance, marv_core::Provenance::Mesh);
+    let fence =
+        out.result.output.find("<mesh-message receptacle=\"agent.parent.inbox\" part=\"error\">").expect(&out.result.output);
+    assert!(out.result.output.find("not wired").unwrap() > fence, "{}", out.result.output);
+    assert!(ctx.taint.is_tainted());
+    cancel.cancel();
+}
