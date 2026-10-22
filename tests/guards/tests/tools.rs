@@ -1,7 +1,7 @@
 //! The built-in tools as a contract: what the model and saved sessions depend on can't change by accident.
 //!
 //! - `docs/TOOLS.md` is generated from the code (`marv_tools::table`) and must match it.
-//! - The built-in specs' bytes (names, order, descriptions, schemas) match `golden/tool_specs.jsonl`: the prompt
+//! - The built-in specs' bytes (names, order, descriptions, schemas) match `golden/tool_specs.<os>.jsonl`: the prompt
 //!   cache and saved sessions depend on them.
 //! - A tool name is never reused: every name ever offered is a tool today or has a tombstone.
 //! - Who started a turn changes approvals only as it did (`golden/approvals.txt`), and the floor is what `run_tool`
@@ -56,11 +56,25 @@ fn tools_md_matches_the_code() {
     golden("docs/TOOLS.md", &marv_tools::table::tools_table());
 }
 
-/// The built-in specs exactly as the model gets them (`tool_specs`, every switch on): one compact JSON line each,
-/// in the order sent. The bytes the prompt cache keys on.
-fn spec_bytes() -> String {
-    marv_tools::tool_specs().iter().map(|s| serde_json::to_string(s).expect("a spec") + "\n").collect()
+/// The built-in specs exactly as the model gets them on `os` (`tool_specs`, every switch on): one compact JSON line
+/// each, in the order sent. The bytes the prompt cache keys on. The platforms differ only in bash's description
+/// (what its sandbox does), and both are compiled everywhere, so this builds either platform's from any.
+fn spec_bytes(os: &str) -> String {
+    let bash = if os == "macos" { marv_tools::bash::SEATBELT_DESCRIPTION } else { marv_tools::bash::BUBBLEWRAP_DESCRIPTION };
+    marv_tools::tool_specs()
+        .iter()
+        .map(|s| {
+            let mut spec = s.clone();
+            if spec.name == "bash" {
+                spec.description = bash.to_string();
+            }
+            serde_json::to_string(&spec).expect("a spec") + "\n"
+        })
+        .collect()
 }
+
+/// This build's platform, as the spec goldens are named.
+const THIS_OS: &str = if cfg!(target_os = "macos") { "macos" } else { "linux" };
 
 /// **The specs the model gets change only on purpose.** A tool's name, order, description or schema is what the
 /// model and every saved session depend on, and the prompt cache keys on their bytes: any change to them, even a
@@ -71,7 +85,13 @@ fn spec_bytes() -> String {
 /// Proven: added a word to `Glob`'s description → this failed (line of `glob`).
 #[test]
 fn builtin_specs_match_the_golden() {
-    golden("tests/guards/golden/tool_specs.jsonl", &spec_bytes());
+    // What this build really sends is the derived spec for its platform (else the derivation is wrong).
+    let sent: String = marv_tools::tool_specs().iter().map(|s| serde_json::to_string(s).expect("a spec") + "\n").collect();
+    assert_eq!(sent, spec_bytes(THIS_OS), "the {THIS_OS} specs aren't what this build sends");
+    // Both platforms' goldens, from either: macOS CI checks the same files Linux writes.
+    for os in ["linux", "macos"] {
+        golden(&format!("tests/guards/golden/tool_specs.{os}.jsonl"), &spec_bytes(os));
+    }
 }
 
 /// **A session's specs are what `tool_specs_for` filters, never reordered.** Every switch combination keeps the

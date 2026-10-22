@@ -485,13 +485,17 @@ fn command_summary(result: &CommandResult, timeout: u64) -> String {
 
 pub struct Bash;
 
-/// The tool's description, fixed per build (the tool spec stays byte-stable): what the platform's sandbox does with
+/// The tool's description with bubblewrap (every platform but macOS), fixed per build (the tool spec stays byte-stable): what the platform's sandbox does with
 /// the home folder and the network differs (bubblewrap shows an empty stand-in home and has a loopback of its own;
 /// Seatbelt, on macOS, refuses the home and every IP connection, loopback included, #166).
+pub const BUBBLEWRAP_DESCRIPTION: &str = "Run a shell command in the project folder, e.g. to run tests, a build, git status, or wc -l. It runs in a sandbox: only the project folder is writable, the home folder is an empty stand-in (toolchains like ~/.bun, ~/.local/share/mise, ~/.asdf, git config and ~/.marv/skills show through, read-only; nothing else in it is visible), and there's no network unless you set network: true. The user may be asked to approve a command; they always are for network: true or git_write: true. Not interactive: commands can't prompt for input. Don't write files with it (no heredocs or echo >): use write_file or edit_file. Output (stdout and stderr together) is cut in the middle if very long.";
+/// The description on macOS (Seatbelt). Both are compiled everywhere, so the spec goldens of either platform can be
+/// checked from the other (`tests/guards/tests/tools.rs`).
+pub const SEATBELT_DESCRIPTION: &str = "Run a shell command in the project folder, e.g. to run tests, a build, git status, or wc -l. It runs in a sandbox: only the project folder and $TMPDIR (the command's own, emptied after it; /tmp can't be used) are writable, the home folder can't be read or written (toolchains like ~/.bun, ~/.cargo, ~/.local/share/mise, git config and ~/.marv/skills can be read; nothing else in it), and there's no network, not even localhost, unless you set network: true. The user may be asked to approve a command; they always are for network: true or git_write: true. Not interactive: commands can't prompt for input. Don't write files with it (no heredocs or echo >): use write_file or edit_file. Output (stdout and stderr together) is cut in the middle if very long.";
 #[cfg(not(target_os = "macos"))]
-const DESCRIPTION: &str = "Run a shell command in the project folder, e.g. to run tests, a build, git status, or wc -l. It runs in a sandbox: only the project folder is writable, the home folder is an empty stand-in (toolchains like ~/.bun, ~/.local/share/mise, ~/.asdf, git config and ~/.marv/skills show through, read-only; nothing else in it is visible), and there's no network unless you set network: true. The user may be asked to approve a command; they always are for network: true or git_write: true. Not interactive: commands can't prompt for input. Don't write files with it (no heredocs or echo >): use write_file or edit_file. Output (stdout and stderr together) is cut in the middle if very long.";
+const DESCRIPTION: &str = BUBBLEWRAP_DESCRIPTION;
 #[cfg(target_os = "macos")]
-const DESCRIPTION: &str = "Run a shell command in the project folder, e.g. to run tests, a build, git status, or wc -l. It runs in a sandbox: only the project folder and $TMPDIR (the command's own, emptied after it; /tmp can't be used) are writable, the home folder can't be read or written (toolchains like ~/.bun, ~/.cargo, ~/.local/share/mise, git config and ~/.marv/skills can be read; nothing else in it), and there's no network, not even localhost, unless you set network: true. The user may be asked to approve a command; they always are for network: true or git_write: true. Not interactive: commands can't prompt for input. Don't write files with it (no heredocs or echo >): use write_file or edit_file. Output (stdout and stderr together) is cut in the middle if very long.";
+const DESCRIPTION: &str = SEATBELT_DESCRIPTION;
 
 #[async_trait]
 impl Tool for Bash {
