@@ -298,6 +298,7 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
                 protected,
                 door,
                 reason: true,
+                persists: tainted_sink,
             };
             approver.approve(request).await
         }

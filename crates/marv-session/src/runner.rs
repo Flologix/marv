@@ -246,6 +246,7 @@ impl Approver for SessionApprover {
 pub fn step_limit_request(steps: u32, every: u32) -> ApprovalRequest {
     ApprovalRequest {
         reason: false,
+        persists: false,
         tool: "continue".into(),
         label: format!("{steps} steps"),
         preview: Preview {

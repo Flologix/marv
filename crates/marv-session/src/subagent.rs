@@ -1453,6 +1453,7 @@ mod run_tests {
         let sub = subagent_context(&parent(), "general-purpose · x", Some(&wt()), Some(asker.clone()));
         let request = ApprovalRequest {
             reason: false,
+            persists: false,
             tool: "write_file".into(),
             label: "a.txt".into(),
             preview: Preview { title: "Write a.txt".into(), ..Preview::default() },

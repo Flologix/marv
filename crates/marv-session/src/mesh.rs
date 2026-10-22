@@ -150,6 +150,7 @@ pub fn wire_approval(request: &WireRequest) -> ApprovalRequest {
     let (from, to, mode) = (&request.from, &request.to, request.mode);
     ApprovalRequest {
         reason: false,
+        persists: false,
         tool: "mesh_wire".into(),
         label: request.title(),
         preview: Preview {

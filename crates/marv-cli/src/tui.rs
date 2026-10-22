@@ -4184,6 +4184,7 @@ mod tests {
     fn approvals_carry_the_protected_paths_reason() {
         let request = marv_tools::ApprovalRequest {
             reason: false,
+            persists: false,
             tool: "write_file".into(),
             label: ".envrc".into(),
             preview: marv_tools::Preview { title: "Create .envrc".into(), ..Default::default() },
@@ -4228,6 +4229,7 @@ mod tests {
         use marv_session::checkpoints::store::{Checkpoint, CheckpointKind};
         let model_call = marv_tools::ApprovalRequest {
             reason: true,
+            persists: false,
             tool: "bash".into(),
             label: "bun test".into(),
             preview: marv_tools::Preview {
