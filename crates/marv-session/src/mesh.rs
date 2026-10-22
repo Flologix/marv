@@ -1029,6 +1029,17 @@ mod tests {
 
     /// [`marv_on`] with any person, and new wires to or from it waiting `wait` for the far person (#201).
     fn marv_on_waiting(name: &str, folder: &std::path::Path, person: Arc<dyn Approver>, wait: std::time::Duration) -> Marv {
+        marv_on_with(name, folder, person, wait, None)
+    }
+
+    /// [`marv_on_waiting`] with its own wire approver for its tools (`None`: its person's, as the session makes it).
+    fn marv_on_with(
+        name: &str,
+        folder: &std::path::Path,
+        person: Arc<dyn Approver>,
+        wait: std::time::Duration,
+        own_wires: Option<Arc<dyn WireApprover>>,
+    ) -> Marv {
         use marv_mesh::discovery::{DoorInfo, open_door};
         let rt = Runtime(std::env::temp_dir().join(format!("ms-{name}-{}-{}", std::process::id(), marv_fs::random_hex())));
         let mesh = Arc::new(Switchboard::new(name, rt.0.clone(), Arc::new(Log::default())));
@@ -1041,7 +1052,8 @@ mod tests {
         let door = open_door(mesh.clone(), folder, info, Arc::new(DoorWires(wires.clone()))).unwrap();
         let mut ctx = ToolContext::new(std::env::temp_dir());
         ctx.approver = Some(person.clone());
-        let tools = MeshTool::all(&parent, &mesh, Some(wires)).into_iter().map(|t| Arc::new(t) as ToolRef).collect();
+        let tools =
+            MeshTool::all(&parent, &mesh, Some(own_wires.unwrap_or(wires))).into_iter().map(|t| Arc::new(t) as ToolRef).collect();
         Marv { mesh, ctx, tools, cancel, _door: door, _rt: rt }
     }
 
@@ -1171,6 +1183,40 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(30), gone).await.expect("the far prompt is withdrawn");
         assert_eq!((away.shown.load(Ordering::SeqCst), away.withdrawn.load(Ordering::SeqCst)), (1, 1));
         assert!(!beta.mesh.has_plug(&marv_mesh::PlugId::new("peer-alpha").unwrap()));
+    }
+
+    /// #201, the other path: a wire approver that can't show the call and the wire in one prompt (`--approve mesh:`,
+    /// an SDK client's) is asked for the wire in `run`, after the call was approved. A stop ends that wait for the far
+    /// person too, and the far prompt is withdrawn.
+    #[tokio::test]
+    async fn a_stop_while_run_waits_for_the_far_person_ends_the_call() {
+        let folder = Runtime(std::env::temp_dir().join(format!("ms-run201-{}-{}", std::process::id(), marv_fs::random_hex())));
+        let hour = std::time::Duration::from_secs(3600);
+        let pa = Arc::new(Person(Decision::Yes, Mutex::default()));
+        let wires: Arc<dyn WireApprover> =
+            Arc::new(HeadlessWires(vec![ReceptacleName::new("peer.beta.agent.parent.inbox").unwrap()]));
+        let alpha = marv_on_with("alpha", &folder.0, pa.clone() as Arc<dyn Approver>, hour, Some(wires));
+        let away = Arc::new(Away::default());
+        let beta = marv_on_waiting("beta", &folder.0, away.clone() as Arc<dyn Approver>, hour);
+        let stop = alpha.ctx.cancel.clone();
+        let (asked, gone) = (away.asked.notified(), away.gone.notified());
+        let out = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            tokio::join!(send_as(&alpha, "peer.beta.agent.parent.inbox", "are you there?"), async {
+                asked.await;
+                stop.cancel();
+            })
+            .0
+        })
+        .await
+        .expect("a stop ends run's wait for the far end");
+        // The call itself was approved (the registry's prompt), then run asked for the wire apart.
+        assert_eq!(pa.1.lock().unwrap()[0].preview.title, "Send a message to peer.beta.agent.parent.inbox");
+        assert!(out.result.is_error, "{}", out.result.output);
+        assert_eq!(out.result.output, marv_tools::INTERRUPTED);
+        tokio::time::timeout(std::time::Duration::from_secs(30), gone).await.expect("the far prompt is withdrawn");
+        assert_eq!(away.withdrawn.load(Ordering::SeqCst), 1);
+        assert!(alpha.mesh.table().all().is_empty() && beta.mesh.table().all().is_empty());
+        assert!(beta.mesh.drain_inbox(&parent_id()).is_empty());
     }
 
     /// #201: nobody answers at the far end within the wait. The model reads, in Marv's words, that the other Marv's

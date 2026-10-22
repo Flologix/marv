@@ -215,6 +215,9 @@ async fn serve(mut socket: TcpStream, handler: Arc<Handler>, seen: Arc<Mutex<Vec
         }
         End::Hang => tokio::time::sleep(Duration::from_secs(600)).await,
         End::Reset => {
+            // macOS throws away what the client hasn't read yet when the RST arrives, so the chunks sent above could
+            // vanish and the test would see a reset with no partial reply. Give the client time to read them first.
+            tokio::time::sleep(Duration::from_millis(300)).await;
             // Dropping a socket with a zero linger sends RST instead of FIN.
             let _ = socket.set_zero_linger();
         }

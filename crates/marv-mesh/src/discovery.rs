@@ -600,7 +600,9 @@ impl Door {
 }
 
 /// Resolves once `read` is at its end: the caller hung up (or its connection broke). Never while it's still there,
-/// even with a request already sent: that's left in the buffer for the next read.
+/// even with a request already sent: that's left in the buffer for the next read. So a caller that sends a second
+/// request before the first is answered isn't seen hanging up until then: Marv's own clients (`DoorClient`, `marv mesh
+/// wire`) never do, and `marv/wire`'s wait is bounded anyway (`WIRE_ANSWER_WAIT`, as is the door closing).
 async fn hung_up(read: &mut BufReader<OwnedReadHalf>) {
     match read.fill_buf().await {
         Ok([]) | Err(_) => {}
