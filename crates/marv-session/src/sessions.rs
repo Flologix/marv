@@ -70,6 +70,10 @@ pub struct SavedSession {
     /// notice, a note for the model) and clears it. Absent once the turn ended.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cut_off: Option<String>,
+    /// marv-rs #202: the process that saved `cut_off`; a resume while it's alive (another Marv still in that turn)
+    /// doesn't mark the turn. Absent without `cut_off`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
 }
 
 /// A saved session's checkpoint chain and its turns' reported paths (#16).
@@ -162,6 +166,7 @@ pub fn new_session(root: &Path, provider: &str, model: &str, now_ms: u64) -> Sav
         taint: None,
         radio_requests: None,
         cut_off: None,
+        pid: None,
     }
 }
 

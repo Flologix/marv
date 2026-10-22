@@ -52,16 +52,18 @@ impl OpenTurn {
         self.asking.retain(|(k, ..)| *k != id);
     }
 
-    /// The saved result of a call still waiting: its output if it finished, otherwise why it has none.
-    pub(crate) fn result(&self, call: &ToolCall) -> String {
+    /// The saved result of a call still waiting (`waiting`: [`OpenTurn::waiting`]): its output if it finished,
+    /// otherwise why it has none. "Not run" only where that's certain: the main agent is asking about this tool and
+    /// no other waiting call has its name (an approval doesn't carry its call's id), and the call isn't `agent` (its
+    /// subagent may have done work before it asked). Anything else may have run in part ([`not_run::QUIT`]), so the
+    /// model checks before it repeats it.
+    pub(crate) fn result(&self, call: &ToolCall, waiting: &[&ToolCall]) -> String {
         if let Some(output) = self.results.get(&call.id) {
             return output.clone();
         }
-        let asked = self.asking.iter().any(|(_, agent, tool)| match agent {
-            None => *tool == call.name,
-            // A subagent's approval holds up the main agent's `agent` call.
-            Some(_) => call.name == "agent",
-        });
+        let asked = call.name != "agent"
+            && self.asking.iter().any(|(_, agent, tool)| agent.is_none() && *tool == call.name)
+            && waiting.iter().filter(|c| c.name == call.name).count() == 1;
         if asked { not_run::QUIT_APPROVAL } else { not_run::QUIT }.into()
     }
 
@@ -89,7 +91,7 @@ impl OpenTurn {
     }
 
     /// The last reply's calls with no result, in the history or here.
-    fn waiting<'a>(&self, history: &'a [ChatTurn]) -> Vec<&'a ToolCall> {
+    pub(crate) fn waiting<'a>(&self, history: &'a [ChatTurn]) -> Vec<&'a ToolCall> {
         let answered: HashSet<&str> = history
             .iter()
             .filter_map(|t| match t {
@@ -109,6 +111,22 @@ impl OpenTurn {
             .filter(|c| !answered.contains(c.id.as_str()) && !self.results.contains_key(&c.id))
             .collect()
     }
+}
+
+/// The turn was saved by another process that's still running: that Marv is still in the turn, not cut off. Its pid
+/// may have been reused by an unrelated process since (then the mark is left out: a known limit, the safe side).
+/// The same process (a desktop chat reopened, a test) is never "another".
+pub fn saved_by_another_live_marv(pid: Option<u32>) -> bool {
+    let Some(pid) = pid.filter(|p| *p != std::process::id() && *p != 0) else { return false };
+    if cfg!(target_os = "linux") {
+        return std::path::Path::new(&format!("/proc/{pid}")).exists();
+    }
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 /// The transcript's line on a resumed turn that was cut off.
@@ -179,15 +197,28 @@ mod tests {
     }
 
     #[test]
+    fn only_another_live_process_holds_a_turn_open() {
+        assert!(!saved_by_another_live_marv(None));
+        assert!(!saved_by_another_live_marv(Some(std::process::id())), "this process: not another");
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        assert!(saved_by_another_live_marv(Some(child.id())));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(!saved_by_another_live_marv(Some(child.id())), "it quit");
+    }
+
+    #[test]
     fn a_waiting_call_gets_its_output_or_why_it_has_none() {
         let mut open = OpenTurn::default();
         open.finished(&call("c1", "read_file"), "contents");
         let id = open.ask(&request("mesh_send", None));
-        assert_eq!(open.result(&call("c1", "read_file")), "contents");
-        assert_eq!(open.result(&call("c2", "mesh_send")), not_run::QUIT_APPROVAL);
-        assert_eq!(open.detail(&history()), "Marv quit while `mesh_send` waited for approval");
+        let h = history();
+        let waiting = open.waiting(&h);
+        assert_eq!(open.result(&call("c1", "read_file"), &waiting), "contents");
+        assert_eq!(open.result(&call("c2", "mesh_send"), &waiting), not_run::QUIT_APPROVAL);
+        assert_eq!(open.detail(&h), "Marv quit while `mesh_send` waited for approval");
         open.answered(id);
-        assert_eq!(open.result(&call("c2", "mesh_send")), not_run::QUIT);
+        assert_eq!(open.result(&call("c2", "mesh_send"), &waiting), not_run::QUIT);
     }
 
     #[test]
@@ -201,6 +232,45 @@ mod tests {
         assert_eq!(open.detail(&history()), "Marv quit before the turn finished");
         open.ask(&request("bash", Some("explore · Find it")));
         assert_eq!(open.detail(&history()), "Marv quit while `bash` (subagent explore · Find it) waited for approval");
-        assert_eq!(open.result(&call("c3", "agent")), not_run::QUIT_APPROVAL);
+    }
+
+    // Review of #212: a subagent waiting for approval at the quit may have changed files already: its `agent` call
+    // (and the other `agent` calls beside it) "may have run in part", never "not run".
+    #[test]
+    fn an_agent_call_whose_subagent_waits_may_have_run_in_part() {
+        let calls = vec![call("a1", "agent"), call("a2", "agent")];
+        let h = vec![
+            ChatTurn::User { text: "go".into() },
+            ChatTurn::Assistant { text: String::new(), tool_calls: calls.clone(), reasoning: None },
+        ];
+        let mut open = OpenTurn::default();
+        open.ask(&request("write_file", Some("implementer · Task 1")));
+        let waiting = open.waiting(&h);
+        assert_eq!(open.result(&calls[0], &waiting), not_run::QUIT);
+        assert_eq!(open.result(&calls[1], &waiting), not_run::QUIT);
+        // Even the main agent asking about a tool named `agent` can't tell which.
+        open.ask(&request("agent", None));
+        assert_eq!(open.result(&calls[0], &waiting), not_run::QUIT);
+    }
+
+    // Two parallel calls of one tool, one asking: the approval can't say which, so neither is "not run".
+    #[test]
+    fn two_waiting_calls_of_one_tool_may_each_have_run() {
+        let calls = vec![call("w1", "write_file"), call("w2", "write_file"), call("r1", "read_file")];
+        let h = vec![
+            ChatTurn::User { text: "go".into() },
+            ChatTurn::Assistant { text: String::new(), tool_calls: calls.clone(), reasoning: None },
+        ];
+        let mut open = OpenTurn::default();
+        open.ask(&request("write_file", None));
+        let waiting = open.waiting(&h);
+        assert_eq!(open.result(&calls[0], &waiting), not_run::QUIT);
+        assert_eq!(open.result(&calls[1], &waiting), not_run::QUIT);
+        assert_eq!(open.result(&calls[2], &waiting), not_run::QUIT);
+        // Once one has finished, the one left is the one asking.
+        open.finished(&calls[0], "written");
+        let waiting = open.waiting(&h);
+        assert_eq!(open.result(&calls[0], &waiting), "written");
+        assert_eq!(open.result(&calls[1], &waiting), not_run::QUIT_APPROVAL);
     }
 }

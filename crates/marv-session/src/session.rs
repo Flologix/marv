@@ -1415,7 +1415,8 @@ impl MarvSession {
             s.running = false;
             s.turn_open = None;
         }
-        self.schedule_save();
+        // At once (#212 review): a quit just after the turn ended mustn't resume it as cut off, without its reply.
+        self.save_at_once();
         emit(SessionEvent::TurnEnd { turn, reason });
         ended.store(true, Ordering::SeqCst);
     }
@@ -2371,7 +2372,12 @@ impl MarvSession {
             }
             // #202: its last turn never ended (Marv quit mid-turn): the transcript says so, and the model hears it at
             // the start of the next message (every call already has a result: the file was saved valid).
-            let cut_off = saved.cut_off.clone().filter(|d| !d.is_empty());
+            // A turn still running in another Marv (its process alive) isn't cut off: left as it is (#212 review).
+            let cut_off = saved
+                .cut_off
+                .clone()
+                .filter(|d| !d.is_empty())
+                .filter(|_| !crate::cut_off::saved_by_another_live_marv(saved.pid));
             let notice = cut_off.as_deref().map(cut_off_notice);
             if let Some(notice) = &notice {
                 let id = s.messages.last().map_or(0, |m| m.id) + 1;
@@ -2392,7 +2398,7 @@ impl MarvSession {
                 (Some(earlier), Some(note)) => Some(format!("{earlier}\n\n{note}")),
                 (earlier, note) => note.or(earlier),
             };
-            s.saved = SavedSession { cut_off: None, ..saved };
+            s.saved = SavedSession { cut_off: None, pid: None, conversation: Vec::new(), ..saved };
             s.new_chain(&self.inner.checkpoints);
             // Its chain (the saved one: a recovery below may have replaced the session's own), if it still exists:
             // numbering goes on after its last checkpointed turn, and an undo preview still knows what each turn reported.
@@ -2663,12 +2669,18 @@ impl MarvSession {
             match &s.turn_open {
                 None => (marv_agent::agent::answer_all_calls(&history), None),
                 Some(open) => {
-                    (marv_agent::agent::answer_all_calls_with(&history, |c| open.result(c)), Some(open.detail(&history)))
+                    let waiting = open.waiting(&history);
+                    let answered = marv_agent::agent::answer_all_calls_with(&history, |c| open.result(c, &waiting));
+                    (answered, Some(open.detail(&history)))
                 }
             }
         };
+        // `s.saved` keeps no conversation (nothing reads it there): cloning it doesn't copy the history again.
+        s.saved.conversation = Vec::new();
         let mut saved = s.saved.clone();
         saved.cut_off = cut_off;
+        // #212 review: the process that saved a cut-off turn, so a resume elsewhere can tell it's still alive.
+        saved.pid = saved.cut_off.is_some().then(std::process::id);
         saved.provider = s.factory.id().into();
         saved.model = s.factory.model().into();
         saved.conversation = conversation;
@@ -2684,7 +2696,9 @@ impl MarvSession {
         saved.pending_note = s.pending_note.clone().map(serde_json::Value::String);
         saved.taint = Some(self.inner.taint.sources());
         saved.radio_requests = (!s.radio_requests.is_empty()).then(|| s.radio_requests.clone());
+        let conversation = std::mem::take(&mut saved.conversation);
         s.saved = saved.clone();
+        saved.conversation = conversation;
         saved
     }
 
