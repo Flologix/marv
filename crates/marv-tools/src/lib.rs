@@ -43,7 +43,7 @@ pub mod web;
 pub mod web_fetch;
 pub mod write_file;
 
-pub use floor::{CallMode, Floor, MAIN_AGENT_ONLY, approval_floor, offered};
+pub use floor::{CallMode, Floor, MAIN_AGENT_ONLY, approval_floor, offered_in_mode};
 pub use formatter::{FormatOutcome, Formatter, FormatterSetting, ProjectFormatter};
 pub use marv_core::MAX_DECLINE_REASON;
 pub use registry::{

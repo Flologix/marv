@@ -242,7 +242,14 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
     };
 
     // What the call asks starts at its floor (`floor.rs`: `approval_floor`, `asked_every_time`); the checks below only
-    // raise it. Whether a tool is offered at all is the tool list's (`available`, built with `floor::offered`).
+    // raise it. A tool this mode isn't offered (the floor's `Refused`: a main-agent tool in a subagent's context) is
+    // unknown here, whatever list it came in: the list is the session's, this is the second check. Asked by name, so
+    // the tool's `needs_approval` runs once, below, as before.
+    if !crate::floor::offered_in_mode(tool.name(), ctx.mode) {
+        let offered: Vec<ToolRef> =
+            available.iter().filter(|t| crate::floor::offered_in_mode(t.name(), ctx.mode)).cloned().collect();
+        return noted(fail(unknown_tool(&call.name, &offered, REMOVED_TOOLS), &call.name));
+    }
     let network = tool.uses_network(input, ctx);
     let protected = tool.protected_target(input, ctx);
     // A web request under a URL prefix the user approved after the taint (docs/SECURITY.md) runs as approved.

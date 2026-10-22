@@ -264,7 +264,8 @@ async fn a_start_asks_even_in_yolo_and_a_no_starts_nothing() {
 /// outlive its report; the door is the context's to open (the main agent's), not the approver's.
 ///
 /// Proven: copied `doors` and `processes` onto the subagent's context in `subagent_context` → failed (asked, and the
-/// process started).
+/// process started). Since run_tool refuses a main-agent tool in a subagent's context (`marv_tools::floor`), the
+/// tool's own refusal is checked by calling it directly; dropping run_tool's check → the first assert fails.
 #[tokio::test]
 async fn a_subagents_context_cant_start_one() {
     require_bwrap!();
@@ -279,8 +280,14 @@ async fn a_subagents_context_cant_start_one() {
     let manager = decoys.manager(300);
     let parent = door_ctx(&decoys, &manager, &recorder);
     let sub = marv_session::subagent::subagent_context(&parent, "general-purpose · x", None, parent.approver.clone());
+    // Handed the full list, run_tool refuses it first: process is the main agent's alone (`marv_tools::floor`).
     let outcome = run_tool(&start, &sub, builtin_tools()).await;
-    assert_eq!(outcome.result.output, NO_PROCESS_DOOR);
+    assert!(outcome.result.output.starts_with("Unknown tool \"process\""), "{}", outcome.result.output);
+    // And the tool refuses it by itself too: a subagent's context has no process door.
+    let input: marv_tools::process::ProcessInput =
+        serde_json::from_value(json!({"action": "start", "command": "sleep 100"})).unwrap();
+    let own = marv_tools::Tool::run(&marv_tools::process::ProcessTool, &input, &sub).await;
+    assert_eq!(own.unwrap_err().0, NO_PROCESS_DOOR);
     assert_eq!(recorder.requests().len(), 1); // only the parent's
     assert!(manager.list().is_empty());
     manager.close_all().await;

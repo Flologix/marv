@@ -68,10 +68,10 @@ pub enum Floor {
 }
 
 /// Whether a built-in tool named `name` is offered in `mode`. Tools that aren't built in (MCP, mesh, doors) are
-/// offered as the session decides. The session builds each agent's tool list with it (`subagent.rs`); `run_tool`
-/// takes the list it's given (a subagent's context handed the full list still meets each tool's own refusal: no
-/// process door, no agent host).
-pub fn offered(name: &str, mode: CallMode) -> bool {
+/// offered as the session decides. The session builds each agent's tool list with it (`subagent.rs`), and `run_tool`
+/// refuses a call it says no to whatever list the call came in (the floor's [`Floor::Refused`]): a main-agent tool
+/// in a subagent's context is unknown there, before the tool's own refusal (no process door, no agent host).
+pub fn offered_in_mode(name: &str, mode: CallMode) -> bool {
     !(mode.is_subagent() && MAIN_AGENT_ONLY.contains(&name))
 }
 
@@ -85,7 +85,7 @@ pub fn asked_every_time(tool: &dyn DynTool, input: &(dyn std::any::Any + Send + 
 ///
 /// Calls `needs_approval` once: `run_tool` takes its answer from here (web_fetch's records a cached read it allows).
 pub fn approval_floor(tool: &dyn DynTool, input: &(dyn std::any::Any + Send + Sync), ctx: &ToolContext) -> Floor {
-    if !offered(tool.name(), ctx.mode) {
+    if !offered_in_mode(tool.name(), ctx.mode) {
         return Floor::Refused;
     }
     if !tool.needs_approval(input).unwrap_or(tool.kind() != ToolKind::Read) {
@@ -110,8 +110,8 @@ mod tests {
     #[test]
     fn a_subagent_is_never_offered_the_main_agents_tools() {
         for name in MAIN_AGENT_ONLY {
-            assert!(offered(name, CallMode::Person) && !offered(name, CallMode::Person.subagent()));
+            assert!(offered_in_mode(name, CallMode::Person) && !offered_in_mode(name, CallMode::Person.subagent()));
         }
-        assert!(offered("bash", CallMode::Woken.subagent()) && offered("mesh_send", CallMode::Person.subagent()));
+        assert!(offered_in_mode("bash", CallMode::Woken.subagent()) && offered_in_mode("mesh_send", CallMode::Person.subagent()));
     }
 }

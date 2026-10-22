@@ -376,7 +376,7 @@ async fn drive(
         .filter(|t| {
             let name = t.name();
             SUBAGENT_TOOLS.contains(&name)
-                && marv_tools::offered(name, ctx.mode.subagent())
+                && marv_tools::offered_in_mode(name, ctx.mode.subagent())
                 && agent_type.tools.iter().any(|n| n == name)
                 && (name != "skill" || has_skills)
                 && (name != "github" || ctx.doors.github)
@@ -993,10 +993,15 @@ mod run_tests {
         let ctx = ctx_with(host, &Asker::yes(), &f.root.0);
         let out = run(agent_call(serde_json::json!({"type": "nope", "description": "x", "prompt": "p"}), "a1"), &ctx).await;
         assert!(out.result.output.contains("no agent type \"nope\". Available: general-purpose"), "{}", out.result.output);
-        // A subagent's context has no host.
+        // No nesting: handed the full list, run_tool refuses agent in a subagent's context (main agent only)...
         let sub = subagent_context(&ctx, "general-purpose · x", None, None);
         let out = run(agent_call(serde_json::json!({"description": "x", "prompt": "p"}), "a1"), &sub).await;
-        assert!(out.result.output.contains("Subagents aren't available here."));
+        assert!(out.result.output.starts_with("Unknown tool \"agent\""), "{}", out.result.output);
+        // ...and the tool refuses by itself too: a subagent's context has no host.
+        let input: marv_tools::agent::AgentInput =
+            serde_json::from_value(serde_json::json!({"description": "x", "prompt": "p"})).unwrap();
+        let own = marv_tools::Tool::run(&marv_tools::agent::Agent, &input, &sub).await;
+        assert!(own.is_err_and(|e| e.0.contains("Subagents aren't available here.")));
     }
 
     #[tokio::test]
