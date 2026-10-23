@@ -1004,15 +1004,27 @@ mod tests {
         let sample = "Some text with `code` and **bold**.\n\n- a list item\n- another one\n\n";
         let text = sample.repeat(300); // ~20 KB
         let mut lexer = StreamLexer::new();
-        let mut slowest = std::time::Duration::ZERO;
+        let mut times = Vec::new();
         let mut i = 50;
         while i <= text.len() {
             let t0 = std::time::Instant::now();
             lexer.render(&text[..i], 80);
-            slowest = slowest.max(t0.elapsed());
+            times.push(t0.elapsed());
             i += 50;
         }
-        // Re-parsing (and re-wrapping) the whole reply on each update grows with it.
-        assert!(slowest < std::time::Duration::from_millis(30), "slowest update took {slowest:?}");
+        // Re-parsing (and re-wrapping) the whole reply on each update grows with it: a typical update near the end
+        // would cost about 9 times one near the start. Medians, not the slowest update, and no fixed time: one
+        // scheduler hiccup on a busy CI runner (a 70 ms update on macOS Intel) shouldn't fail it.
+        let median = |part: &[std::time::Duration]| {
+            let mut part = part.to_vec();
+            part.sort();
+            part[part.len() / 2]
+        };
+        let fifth = times.len() / 5;
+        let (start, end) = (median(&times[..fifth]), median(&times[times.len() - fifth..]));
+        assert!(
+            end < start * 4 + std::time::Duration::from_millis(1),
+            "a typical update took {start:?} at the start, {end:?} at the end"
+        );
     }
 }
