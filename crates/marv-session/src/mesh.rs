@@ -1281,9 +1281,14 @@ mod tests {
         .await
         .expect("the wait is bounded");
         assert!(out.result.is_error && !out.result.declined, "{}", out.result.output);
-        assert_eq!(
-            out.result.output,
-            "the Marv \"beta\"'s person didn't answer within 300 ms: no wire was made, so the message wasn't sent."
+        // A failed wiring is quoted as mesh data, as every one is (it can be the far end's words).
+        assert!(
+            out.result.output.starts_with("Marv: the mesh call to peer.beta.agent.parent.inbox failed.")
+                && out.result.output.contains(
+                    "\nthe Marv \"beta\"'s person didn't answer within 300 ms: no wire was made, so the message wasn't sent.\n"
+                ),
+            "{}",
+            out.result.output
         );
         tokio::time::timeout(std::time::Duration::from_secs(30), gone).await.expect("the far prompt is withdrawn");
         assert_eq!((away.shown.load(Ordering::SeqCst), away.withdrawn.load(Ordering::SeqCst)), (1, 1));
