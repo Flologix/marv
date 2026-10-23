@@ -419,6 +419,15 @@ pub struct ToolContext {
     /// This session's folder of saved outputs (#61, `~/.marv/tool-output/<session>`): a cut result is saved there
     /// whole, and `read_file` and `grep` may read it (only it, read-only). None: cuts aren't saved.
     pub tool_output: Option<PathBuf>,
+    /// Where a running call says what it's waiting for (#201: "waiting for beta to accept the wire"), shown on its
+    /// card. The main agent's only; None: nothing is shown.
+    pub progress: Option<Arc<dyn ToolProgress>>,
+}
+
+/// A running call's one-line status on its card (the session sends it the way it sends a subagent's progress).
+pub trait ToolProgress: Send + Sync {
+    /// `line` is Marv's own words, never model or mesh text.
+    fn progress(&self, call_id: &str, line: String);
 }
 
 /// Sandboxed commands, by [`marv_core::command::command_key`], whose failure without network looked like the missing
@@ -465,6 +474,14 @@ impl ToolContext {
             formatter: None,
             network_failures: Arc::default(),
             tool_output: None,
+            progress: None,
+        }
+    }
+
+    /// Shows `line` on this call's card while it runs (see [`ToolProgress`]); nothing without a sink or a call id.
+    pub fn report_progress(&self, line: impl Into<String>) {
+        if let (Some(progress), Some(call_id)) = (&self.progress, &self.call_id) {
+            progress.progress(call_id, line.into());
         }
     }
 

@@ -47,12 +47,24 @@ pub fn random_hex() -> String {
 
 /// Writes `content` to `path` privately and atomically. Writes to one path from this process are queued.
 pub async fn write_private(path: &Path, content: &str) -> std::io::Result<()> {
+    write_queued(path, content, None).await
+}
+
+/// [`write_private`], creating folders only below `anchor`, which must exist (it is never created): a write that
+/// lands after its folder was removed (a session's last save, after a test removed its temp folder) fails instead of
+/// making the folders again. Each folder below it is made one level at a time, never recursively.
+pub async fn write_private_under(anchor: &Path, path: &Path, content: &str) -> std::io::Result<()> {
+    write_queued(path, content, Some(anchor)).await
+}
+
+async fn write_queued(path: &Path, content: &str, anchor: Option<&Path>) -> std::io::Result<()> {
     let lock = QUEUES.lock().unwrap_or_else(|e| e.into_inner()).entry(path.to_path_buf()).or_default().clone();
     let result = {
         let _held = lock.lock().await;
         let path = path.to_path_buf();
         let content = content.to_string();
-        tokio::task::spawn_blocking(move || write(&path, &content)).await.map_err(std::io::Error::other)?
+        let anchor = anchor.map(Path::to_path_buf);
+        tokio::task::spawn_blocking(move || write(&path, &content, anchor.as_deref())).await.map_err(std::io::Error::other)?
     };
     // Forget the file once nobody else queues on it, so the map doesn't grow.
     let mut queues = QUEUES.lock().unwrap_or_else(|e| e.into_inner());
@@ -62,10 +74,25 @@ pub async fn write_private(path: &Path, content: &str) -> std::io::Result<()> {
     result
 }
 
-fn write(path: &Path, content: &str) -> std::io::Result<()> {
+fn write(path: &Path, content: &str, anchor: Option<&Path>) -> std::io::Result<()> {
     use std::io::Write;
-    if let Some(dir) = path.parent() {
-        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    match (path.parent(), anchor) {
+        (Some(dir), None) => std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?,
+        (Some(dir), Some(anchor)) => {
+            let below = dir.strip_prefix(anchor).map_err(|_| std::io::Error::other("the file isn't under its anchor"))?;
+            if !anchor.is_dir() {
+                return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "the anchor folder is gone"));
+            }
+            let mut at = anchor.to_path_buf();
+            for part in below.components() {
+                at.push(part);
+                match std::fs::DirBuilder::new().mode(0o700).create(&at) {
+                    Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e),
+                    _ => {}
+                }
+            }
+        }
+        (None, _) => {}
     }
     let temp = PathBuf::from(format!("{}.{}.{}.tmp", path.display(), std::process::id(), random_hex()));
     let attempt = (|| {
@@ -95,6 +122,20 @@ mod tests {
 
     fn names(dir: &Path) -> Vec<String> {
         std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect()
+    }
+
+    // A write landing after its folders were removed (marv-rs #212's CI: a session's last save after the test's temp
+    // folder was gone) fails, and makes nothing; with the anchor there, the folders below it are made.
+    #[tokio::test]
+    async fn a_write_under_a_missing_anchor_makes_no_folders() {
+        let tmp = temp_dir("anchor");
+        let gone = tmp.path().join("gone");
+        let file = gone.join("store").join("project").join("s.json");
+        assert!(write_private_under(&gone.join("store"), &file, "x").await.is_err());
+        assert!(!gone.exists());
+        std::fs::create_dir(&gone).unwrap();
+        write_private_under(&gone, &file, "x").await.unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "x");
     }
 
     #[test]

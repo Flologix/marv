@@ -166,6 +166,9 @@ pub const SITUATION_HEADING: &str = "# Your situation";
 /// #81: local first for where/how-big questions. Asked how many lines Marv has, GLM found the GitHub URL in the
 /// installed binary and spent 20 steps on a clone the sandbox couldn't make and an estimate from the GitHub API, while
 /// the checkout was on disk (opencode ran `find` first: 6 steps, the exact count). Fixed text, so the cache holds.
+/// #205: questions about Marv itself go to its docs (asked whether Marv ran on macOS, a model ran `marv --help` and
+/// said it couldn't tell, with the README on disk), where its records are, and that a turn cut off by a quit is missing
+/// from the history (the model then flatly denied a send the user had approved).
 /// `herdr`: None outside Herdr, else whether the Herdr door's run and spawn work here (#74).
 pub fn situation_section(home: bool, pre_approved: &[String], writable: &[String], herdr: Option<bool>) -> String {
     let home = if home {
@@ -192,7 +195,7 @@ pub fn situation_section(home: bool, pre_approved: &[String], writable: &[String
         None => "",
     };
     format!(
-        "\n\n{SITUATION_HEADING}\n\nYou work only through your tools. You have no screen: you can't open a window, a terminal, a tab or a pane, or show the user anything live. The user sees your messages and a one-line summary of each tool call, not its output, so quote what matters. A program that draws (a TUI, an animation, a game) shows nothing here: to check that it runs, run it briefly with timeout; for the user to see it, give them the command to run in their own terminal. Commands don't run inside the user's terminal or its multiplexer (Herdr, tmux): those variables and sockets aren't in the sandbox, so a script that needs them fails here.{herdr}{home}\n\nKnow your limits before you start. When none of your tools can do what's asked, say so in a sentence and give the user the exact command to run, instead of trying tools that weren't made for it: a tool does only what its description says, and is never a way around a limit. Keep replies short: answer first, don't narrate what you're about to do, and don't end with a menu of options or offers. Ask a question only when you need the answer to go on. To find or measure something (where is X, how big is X, how many lines), look on this machine first (find, du, wc -l): a copy is often already on disk, and an exact local count beats an estimate from the network.{approved}{folders}"
+        "\n\n{SITUATION_HEADING}\n\nYou work only through your tools. You have no screen: you can't open a window, a terminal, a tab or a pane, or show the user anything live. The user sees your messages and a one-line summary of each tool call, not its output, so quote what matters. A program that draws (a TUI, an animation, a game) shows nothing here: to check that it runs, run it briefly with timeout; for the user to see it, give them the command to run in their own terminal. Commands don't run inside the user's terminal or its multiplexer (Herdr, tmux): those variables and sockets aren't in the sandbox, so a script that needs them fails here.{herdr}{home}\n\nKnow your limits before you start. When none of your tools can do what's asked, say so in a sentence and give the user the exact command to run, instead of trying tools that weren't made for it: a tool does only what its description says, and is never a way around a limit. Keep replies short: answer first, don't narrate what you're about to do, and don't end with a menu of options or offers. Ask a question only when you need the answer to go on. To find or measure something (where is X, how big is X, how many lines), look on this machine first (find, du, wc -l): a copy is often already on disk, and an exact local count beats an estimate from the network. Questions about Marv itself (its features, platforms, settings, why it did something) are answered by its README and docs/: read them (a checkout on disk, else github.com/FlologixAI/marv) before saying you can't tell, and don't guess how its interface behaves. Marv keeps its records in ~/.marv, out of your sandbox's reach: sessions/<project>/ and trajectories/<project>/. Your history can lack a turn that was cut off (Marv quit or crashed during it): when the user says you did something you can't see, say it isn't in your history, not that it didn't happen.{approved}{folders}"
     )
 }
 
@@ -740,6 +743,9 @@ mod tests {
         assert!(!p.contains("home folder itself"));
         // #81: local first, before the network.
         assert!(p.contains("look on this machine first (find, du, wc -l)"));
+        // #205: Marv's own docs before "can't tell", and a missing turn isn't a denied one.
+        assert!(p.contains("answered by its README and docs/"));
+        assert!(p.contains("say it isn't in your history, not that it didn't happen"));
         // Before memory, skills and the rest, and only with bash for the limits.
         assert!(p.find("# Your situation").unwrap() < p.find("# MCP servers").unwrap());
         let no_bash = system_prompt(&PromptInput { tools: vec!["read_file".into()], ..input() });
