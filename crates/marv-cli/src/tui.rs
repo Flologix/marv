@@ -4244,7 +4244,8 @@ mod tests {
         let view = marv_tui::ui::approval::ApprovalView::new(shown, 0, true);
         assert!(view.select.items.iter().any(|i| i.label.starts_with("No, and say why")));
 
-        let checkpoint = |kind| Checkpoint { sha: "a".into(), tree: "b".into(), turn: 1, kind, label: "x".into() };
+        let checkpoint =
+            |kind| Checkpoint { sha: "a".into(), tree: "b".into(), turn: 1, kind, label: "x".into(), nested: Vec::new() };
         let undo = marv_session::UndoPlan {
             turn: 1,
             label: "add the parser".into(),

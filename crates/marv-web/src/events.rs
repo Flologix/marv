@@ -22,6 +22,22 @@ fn clip(text: &str) -> String {
     format!("{}\n… ({} more bytes)", &text[..end], text.len() - end)
 }
 
+/// The most of a checkpoint failure's own text the page gets.
+const MAX_DETAIL: usize = 160;
+
+/// `text`'s first non-empty line, printable, at most `max` bytes (cut on a character, with "…").
+fn first_line(text: &str, max: usize) -> String {
+    let line = printable(text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("no reason given"));
+    if line.len() <= max {
+        return line;
+    }
+    let mut end = max;
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", line[..end].trim_end())
+}
+
 pub fn to_json(event: &SessionEvent) -> Option<Value> {
     match event {
         SessionEvent::TurnStart { .. } => Some(json!({"type": "turn_start"})),
@@ -52,7 +68,12 @@ pub fn to_json(event: &SessionEvent) -> Option<Value> {
             }
         }),
         SessionEvent::Tainted { source } => Some(json!({"type": "tainted", "source": source})),
-        SessionEvent::CheckpointFailed { message } => Some(json!({"type": "notice", "text": message})),
+        // #203: the TUI's sentence, as a warning; git's own text cut to its first line (it can run to a page of hints,
+        // and as a plain notice above the turn's tool cards it read like a command's output).
+        SessionEvent::CheckpointFailed { message } => Some(json!({
+            "type": "checkpoint_failed",
+            "text": format!("This turn can't be undone: its checkpoint failed ({}).", first_line(message, MAX_DETAIL)),
+        })),
         SessionEvent::TurnEnd { reason, .. } => Some(json!({"type": "turn_end", "reason": reason.as_str()})),
         _ => None,
     }
@@ -114,5 +135,21 @@ mod tests {
         assert_eq!(shown["id"], "c1");
         assert!(shown["line"].as_str().unwrap().starts_with("waiting for beta to accept the wire"));
         assert!(!shown["line"].as_str().unwrap().contains('\u{1b}'));
+    }
+
+    // #203: a warning in the TUI's words, with git's text cut to its first line and bounded.
+    #[test]
+    fn a_failed_checkpoint_is_a_typed_warning_with_gits_first_line() {
+        let message = "error: 'kernel-lab-out/' does not have a commit checked out\nerror: unable to index file\nfatal: adding files failed";
+        let line = to_json(&SessionEvent::CheckpointFailed { message: message.into() }).unwrap();
+        assert_eq!(
+            line,
+            json!({"type": "checkpoint_failed", "text": "This turn can't be undone: its checkpoint failed (error: 'kernel-lab-out/' does not have a commit checked out)."})
+        );
+        let long = format!("\n\n  {}\u{1b}[31m\nmore", "é".repeat(200));
+        let text = to_json(&SessionEvent::CheckpointFailed { message: long }).unwrap()["text"].as_str().unwrap().to_string();
+        assert!(!text.contains('\u{1b}') && !text.contains("more") && text.contains('…'), "{text}");
+        assert!(text.len() < 260, "{}", text.len());
+        assert_eq!(first_line(" \n", 40), "no reason given");
     }
 }
