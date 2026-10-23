@@ -161,7 +161,8 @@ impl Tool for WriteFile {
 
     async fn preview(&self, input: &WriteFileInput, ctx: &ToolContext) -> Result<Preview, ToolError> {
         start_before_change(ctx);
-        let plan = plan(input, ctx).await?;
+        // Under the file lock, like `edit_file`'s preview: a parallel call's write isn't taken for someone else's.
+        let plan = with_file_lock(ctx, &input.path, || plan(input, ctx)).await?;
         let verb = match (&plan.before, input.append.unwrap_or(false)) {
             (None, _) => "Create",
             (Some(_), true) => "Append",
@@ -1095,5 +1096,49 @@ mod tests {
         let err = write_planned(&planned).await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(f.read("late.txt"), "theirs\n");
+    }
+
+    #[tokio::test]
+    async fn a_preview_waits_for_the_sessions_own_write_in_progress_instead_of_refusing_it() {
+        // The first append is held inside its formatter run: written, not yet recorded as the session's version. The
+        // second append's preview must not take that write for someone else's change.
+        struct Held {
+            started: Arc<Notify>,
+            release: Arc<Notify>,
+        }
+        #[async_trait]
+        impl crate::formatter::Formatter for Held {
+            async fn format(
+                &self,
+                _root: &std::path::Path,
+                _path: &str,
+                _cancel: &CancellationToken,
+            ) -> crate::formatter::FormatOutcome {
+                self.started.notify_one();
+                self.release.notified().await;
+                crate::formatter::FormatOutcome::Skipped
+            }
+        }
+        let f = Fixture::new("w-preview-own-write");
+        f.write("log.txt", "start\n");
+        let (started, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        let held = ToolContext {
+            formatter: Some(Arc::new(Held { started: started.clone(), release: release.clone() })),
+            ..f.ctx.clone()
+        };
+        let first = run_with(&held, "write_file", json!({"path": "log.txt", "content": "one\n", "append": true}));
+        let second = async {
+            started.notified().await;
+            let second = run_with(&f.ctx, "write_file", json!({"path": "log.txt", "content": "two\n", "append": true}));
+            let unblock = async {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                release.notify_one();
+            };
+            tokio::join!(second, unblock).0
+        };
+        let (first, second) = tokio::join!(first, second);
+        assert!(!first.result.is_error, "{}", first.result.output);
+        assert!(!second.result.is_error, "{}", second.result.output);
+        assert_eq!(f.read("log.txt"), "start\none\ntwo\n");
     }
 }

@@ -196,7 +196,9 @@ impl Tool for EditFile {
 
     async fn preview(&self, input: &EditFileInput, ctx: &ToolContext) -> Result<Preview, ToolError> {
         start_before_change(ctx);
-        let plan = plan(input, ctx).await?;
+        // Under the file lock too: another call of this session may have written the file and not yet recorded it as
+        // its version (it does so after the formatter), and the check would take that for someone else's change.
+        let plan = with_file_lock(ctx, &input.path, || plan(input, ctx)).await?;
         Ok(Preview {
             title: format!("Edit {}", plan.shown),
             diff: Some(diff_text(&plan.before, &plan.after, 3).lines),
