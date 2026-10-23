@@ -635,6 +635,9 @@ pub enum UiEvent {
         id: ApprovalId,
         request: ApprovalRequest,
     },
+    /// Nobody waits for that approval's answer any more (#201: another Marv asked for a wire and hung up, or gave up):
+    /// it leaves the queue unanswered.
+    ApprovalWithdrawn(ApprovalId),
 
     // --- transcript and status from outside a turn ---
     /// A message for the transcript: command output, a notice (startup, MCP, checks)...
