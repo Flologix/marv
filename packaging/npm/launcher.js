@@ -9,6 +9,8 @@ const { spawn } = require("node:child_process");
 const PACKAGES = {
   "linux x64": "@flologixai/marv-linux-x64",
   "linux arm64": "@flologixai/marv-linux-arm64",
+  "darwin x64": "@flologixai/marv-darwin-x64",
+  "darwin arm64": "@flologixai/marv-darwin-arm64",
 };
 
 // Where the README says how to run Marv on Windows (in WSL).
@@ -25,10 +27,7 @@ function unsupported(platform, arch) {
       WSL_HELP
     );
   }
-  if (platform === "darwin") {
-    return "marv: there's no macOS build yet. Marv runs on Linux (x64 and arm64) for now.";
-  }
-  return `marv: there's no build for ${platform} ${arch}. Marv runs on Linux (x64 and arm64): its sandbox is bubblewrap.`;
+  return `marv: there's no build for ${platform} ${arch}. Marv runs on Linux and macOS (x64 and arm64).`;
 }
 
 function main() {

@@ -402,7 +402,7 @@ Each step is one PR, green on Linux, and adds what it fixes to the macOS job.
 4. **The profile builder** (#151): `seatbelt::profile` with §9.1's tests, run on Linux CI.
 5. **`marv __guard`** (#151): session, parent watch, `killpg`; unit-tested on both platforms outside a sandbox.
 6. **Wire Seatbelt in** (#151): `Seatbelt` backend on macOS, private TMPDIR lifecycle, the probes of §9.2, then the guards of §9.3 with `MARV_REQUIRE_SANDBOX=1`. The process door isn't offered on macOS (§8, C).
-7. **Make the macOS job required** and add the release targets (`release.yml:76-82`, commented out today).
+7. **Make the macOS job required** (`macos-14`, `macos-15`, `macos-15-intel`) and add the release targets (`release.yml`'s `build-macos`, #167), with a smoke test of each build (`packaging/smoke.sh`) in place of a check on a real Mac.
 8. **Processes on macOS** (#152): option A of §8 with its guards (`tests/guards/tests/process.rs` on both).
 9. **Docs** with each step: `docs/SECURITY.md` (the §6.12 table, the runtime folder rule on line 59 per platform), `docs/subsystems/sandbox.md`, `docs/MESH.md` (the runtime folder), `PORTING.md`, the bash tool's description per platform.
 
@@ -417,7 +417,7 @@ The open questions were settled on 2026-10-19 by taking every recommendation:
 5. **Escapees from the process group:** a documented limit for now (no process-tree sweep).
 6. **Secrets in the project:** masked later, on both backends together.
 7. **No `sandbox-exec`:** same as Linux without bwrap. Commands run unsandboxed, with the warning.
-8. **macOS versions:** CI runs `macos-14` and `macos-15` (arm64), plus `macos-13` (Intel) for the x86_64 build.
+8. **macOS versions:** CI runs `macos-14` and `macos-15` (arm64), plus `macos-15-intel` (Intel) for the x86_64 build (the spec first named `macos-13`, which GitHub has retired).
 9. **The desktop app:** never App Sandboxed while it runs the agent in-process.
 
 The first macOS launch is the terminal app (arm64 and x86_64, npm and `install.sh`). The desktop bundle follows in #154.
