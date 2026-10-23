@@ -6,6 +6,10 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+### Changed
+
+- **The agent answers questions about Marv from its docs, and says when something isn't in its history (#205).** `# Your situation` now says to read Marv's README and docs (a checkout on disk, else the GitHub repository) before saying it can't tell, where Marv keeps its records in `~/.marv` (sessions and trajectories), and that a turn cut off by a quit may be missing from its history: when the user says it did something it can't see, it says so instead of denying it. `mesh_send`'s description says that a send with no wire yet asks the user itself (so a named peer gets the message without asking first; mesh_list only when the exact inbox name isn't known), and that a sent message isn't proof it was read. Measured as #147 was (SWE-bench Verified, the same 30 issues, GLM-5.3-flash, sandbox on): 23/30 resolved before and after (two issues swapped each way), and the median cost per issue unchanged; the total ($0.27 → $0.38) moved with a few long runs on issues where both arms wander.
+
 ### Fixed
 
 - **Marv desktop: after a restart, Allow on a new approval card could do nothing.** Approval ids started at 1 again in every chat and every run, while a chat's transcript keeps its old cards, so ids repeated: the answer was shown on an old card and the new one stayed waiting. Ids now never repeat across chats or restarts, and an answer only marks the card still waiting for it. A card left unanswered when Marv quit or the chat restarted now reads "not answered (Marv restarted)", with no buttons, instead of showing Allow and Decline for a request that no longer exists. The app has its first tests (`npm test` in `app/`).
