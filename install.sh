@@ -4,7 +4,8 @@
 #   curl -fsSL https://github.com/FlologixAI/marv/releases/latest/download/install.sh | sh
 #   sh install.sh [--prefix DIR] [--version vX.Y.Z] [--from FILE] [--uninstall]
 #
-# The binary goes to $PREFIX/bin/marv (default prefix: ~/.local). It's a static musl build, so nothing else is needed.
+# The binary goes to $PREFIX/bin/marv (default prefix: ~/.local). On Linux it's a static musl build and on macOS a
+# native one (arm64 or x86_64), so nothing else is needed.
 #
 # The command switch: TS Marv's launcher is a bash script that is also called `marv`, usually in ~/.local/bin. A `marv`
 # there that isn't marv-rs is moved to `marv-ts` first (and the move is reported), so the TypeScript Marv keeps working
@@ -96,7 +97,7 @@ MARV="$BIN_DIR/marv"
 MARV_TS="$BIN_DIR/marv-ts"
 
 # Whether a file is a marv-rs binary, decided without running it (it could be anything). A native executable (ELF, or
-# Mach-O for the macOS builds to come) that contains the name of one of marv-rs's crates: the panic locations keep
+# Mach-O for the macOS builds) that contains the name of one of marv-rs's crates: the panic locations keep
 # the source paths (crates/marv-session/src/...) even in a stripped release build. TS Marv's launcher is a script.
 is_marv_rs() {
 	[ -f "$1" ] || return 1
@@ -139,15 +140,19 @@ detect_target() {
 	os=$(uname -s)
 	arch=$(uname -m)
 	case $os in
-	Linux) ;;
-	Darwin) die "there's no macOS build yet; build from source: cargo install --path crates/marv-cli --root ~/.local" ;;
+	Linux) suffix=unknown-linux-musl ;;
+	Darwin) suffix=apple-darwin ;;
 	# Git Bash, MSYS2, Cygwin (#153): Windows itself has no build, but Marv runs in WSL, sandbox and all.
 	MINGW* | MSYS* | CYGWIN* | Windows_NT) die "Marv doesn't run on Windows itself: use WSL. In PowerShell run \`wsl --install\` (it sets up Ubuntu), then run this installer inside WSL. See $WSL_HELP" ;;
-	*) die "no build for $os: Marv runs on Linux (on Windows, inside WSL: $WSL_HELP)" ;;
+	*) die "no build for $os: Marv runs on Linux and macOS (on Windows, inside WSL: $WSL_HELP)" ;;
 	esac
+	# A shell under Rosetta says x86_64 on Apple silicon; the arm64 build is the one to install there.
+	if [ "$os" = Darwin ] && [ "$arch" = x86_64 ] && [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = 1 ]; then
+		arch=arm64
+	fi
 	case $arch in
-	x86_64 | amd64) printf 'x86_64-unknown-linux-musl\n' ;;
-	aarch64 | arm64) printf 'aarch64-unknown-linux-musl\n' ;;
+	x86_64 | amd64) printf 'x86_64-%s\n' "$suffix" ;;
+	aarch64 | arm64) printf 'aarch64-%s\n' "$suffix" ;;
 	*) die "no build for $os on $arch" ;;
 	esac
 }

@@ -49,7 +49,8 @@ jobs:
       - name: Build the desktop app's page
         working-directory: app
         run: npm ci && npm run build
-      # install.sh and the npm launcher (#153: the messages on Windows and macOS). Quick: no real build needed.
+      # install.sh and the npm launcher (#153: the messages on Windows; #167: the macOS targets and packages). Quick: no
+      # real build needed.
       - name: Installer and npm launcher
         run: sh -n install.sh && packaging/test-install.sh && node --test packaging/npm/launcher.test.js
       # Fail here, with bwrap's own error, rather than let the sandbox tests skip.
@@ -83,14 +84,24 @@ jobs:
             printf '%s\n' "$left" | while read -r d; do echo "== $d"; find "$d" -printf '%TT %M %s %p\n' 2>/dev/null | sort | head -40; done
             exit 1
           fi
+      # The release smoke test on this build: install.sh and npm from a packed asset, a sandboxed turn with each.
+      - name: Smoke test install.sh and npm
+        run: |
+          cargo build -p marv-cli
+          packaging/package.sh x86_64-unknown-linux-musl target/debug/marv "$RUNNER_TEMP/assets"
+          packaging/smoke.sh x86_64-unknown-linux-musl "$RUNNER_TEMP/assets"
 
-  # macOS (#150): not required yet: it shows what fails until it's green, then it becomes a required check. The sandbox
-  # is Seatbelt (#166: `sandbox-exec` with `marv __guard`), and as on Linux its guards must run, not skip:
+  # macOS (#150, #167): a required check, on arm64 (macos-14, macos-15) and Intel (macos-15-intel; GitHub retired the
+  # macos-13 image the spec named).
+  # The sandbox is Seatbelt (#166: `sandbox-exec` with `marv __guard`), and as on Linux its guards must run, not skip:
   # MARV_REQUIRE_SANDBOX=1, and a broken `sandbox-exec` fails the job before the tests.
   macos:
-    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-14, macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
-    continue-on-error: true
     env:
       MARV_REQUIRE_SANDBOX: "1"
     steps:
@@ -101,3 +112,12 @@ jobs:
         run: /usr/bin/sandbox-exec -p '(version 1)(allow default)' /usr/bin/true
       - run: cargo check --workspace --all-targets
       - run: cargo test --workspace --no-fail-fast
+      # The release smoke test on this build, in place of a release candidate tried by hand on a Mac: install.sh and
+      # npm from a packed asset, and a sandboxed `marv -p` turn with each, in which Seatbelt must refuse a write
+      # outside the project.
+      - name: Smoke test install.sh, npm and a sandboxed turn
+        run: |
+          case $(uname -m) in arm64) target=aarch64-apple-darwin ;; *) target=x86_64-apple-darwin ;; esac
+          cargo build -p marv-cli
+          packaging/package.sh "$target" target/debug/marv "$RUNNER_TEMP/assets"
+          packaging/smoke.sh "$target" "$RUNNER_TEMP/assets"
