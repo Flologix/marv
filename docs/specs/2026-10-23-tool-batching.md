@@ -40,8 +40,9 @@ Measured on 9,002 steps in 533 turns: ~/.marv trajectories (TUI and headless), t
 - The tool descriptions never mention combining calls.
 
 **What runs together today** (`crates/marv-agent/src/agent.rs` `call_groups`, `MAX_PARALLEL` = 4; `crates/marv-session/src/runner.rs`):
-- Consecutive `ToolKind::Read` calls that don't need approval: `read_file`, `grep`, `glob`, `plan`, `skill`, `mesh_list`, and MCP tools with `readOnlyHint` while the session is untainted.
-- `agent` calls.
+- Consecutive `ToolKind::Read` calls that don't need approval: `read_file`, `grep`, `glob`, `plan`, `skill`, `mesh_list`, `github`'s reads (its writes ask), and MCP tools with `readOnlyHint` while the session is untainted.
+- `agent` calls: they're `Execute`, but `parallel()` is true.
+- `read_file`, `grep` and `glob` never ask (no `needs_approval`, no protected target), so they always qualify. Only `github` and MCP reads can fall out of a group by asking.
 - `bash` is `Execute` and never runs in parallel. Neither do `web_fetch`, the edit tools or `process`.
 - Results go into the history in call order, so the prompt cache holds.
 
@@ -73,17 +74,23 @@ The cheapest lever, and the one with the most reach: most of the waste is models
 
 1. **`BASE_TOOLS_TEXT`** (prompt.rs). Keep "start narrow" for *what* to read, and add *how*. Proposed replacement:
 
-   > Look at the actual code before answering questions about it, and don't guess what a file contains. Start narrow: grep for a name or glob for a file pattern, then read the relevant part of a file rather than whole large files. Read-only calls sent together in one reply (read_file, grep, glob) run at the same time: when you already know the next few files, searches or pages you need, send them in one reply instead of one per step, and read a range that's big enough (a page is 400 lines) rather than a few lines at a time. Paths are relative to the project root.
+   > Look at the actual code before answering questions about it, and don't guess what a file contains. Start narrow: grep for a name or glob for a file pattern, then read the relevant part of a file rather than whole large files. When you already know the next few files, searches or pages you need (up to about four), send those calls together in one reply: read_file, grep and glob calls in one reply run at the same time. When paging through a file, continue from the offset the result gives rather than a few lines at a time; still read only the parts you need. Paths are relative to the project root.
+
+   The cap ("up to about four") matches `MAX_PARALLEL` and keeps one reply from pulling in 1,600+ lines, which would bring compaction early. "Still read only the parts you need" keeps "start narrow" in force.
 
 2. **`read_file`'s description**, adding: "To read several files or several parts of one, send the calls together in one reply: they run at the same time."
-3. **`bash`'s description**, adding: "Combine read-only checks into one command (e.g. `git log -3 --stat; git show abc123 | head -50`) rather than one command per step."
+3. **`bash`'s description**, adding: "Combine read-only checks into one command with `&&` or `;` (e.g. `git log -3 --stat; git show abc123 | head -50`) rather than one command per step."
+
+   An "always" answer is remembered for the exact command (bash.rs), so a combined command won't match one remembered alone. That only matters for commands that ask, and read-only checks in the sandbox don't.
 
 **Fixed per build:** the prompt and specs stay byte-stable within a session, so it costs one cache break per release, as with any prompt change.
 
-**Oracle:** `BASE_TOOLS_TEXT` is shared with TypeScript Marv's prompt. Map the new sentence back in `marv_oracle::runner::MARV_RS_TEXT`, as #85's plan sentence is mapped. The description additions may need the same treatment; check the oracle's tool comparison.
+**Oracle:** `unword` rewrites both the system prompt and the tool descriptions before comparing with TypeScript Marv. Add three `MARV_RS_TEXT` entries, each mapping a new sentence to `""` as `process`'s is mapped: the `BASE_TOOLS_TEXT` sentences, and the `read_file` and `bash` additions.
+
+**Subagents:** `BASE_TOOLS_TEXT` is only in the main agent's prompt, so subagents don't get phase 1 (§7).
 
 **Measure.** Each arm is run twice (the 0.9.0 eval showed ±2 issues and ±40% total cost between single runs):
-- SWE-bench Verified, the same 30 issues, GLM-5.3-flash, sandbox on: base vs phase 1. About $0.30 per run, so about $1.20 for the four runs.
+- SWE-bench Verified, the same 30 issues, GLM-5.3-flash, sandbox on: base vs phase 1. The 0.9.0 runs cost $0.27 and $0.38, so about $1.50 for the four runs.
 - The bench (21 tasks × 2, GLM-5.3-flash). About $0.01 a run.
 
 Report:
@@ -92,19 +99,30 @@ Report:
 - total and median cost;
 - request time.
 
-**Ship rule:** fewer steps per turn (median and mean) and lower median cost, with resolved within 1 of base on both runs and the bench pass rate unchanged.
+**Ship rule.** Single runs vary by ±40% in total cost, so two runs can't detect a saving near 16%. The deciding metric is steps per turn, pooled across both runs of each arm.
+- **Steps:** fewer steps per turn than base, median and mean.
+- **Resolved:** the sum of resolved over the two runs is within 2 of base's sum.
+- **Bench:** no task fails on both runs that passed on base.
+
+Cost and request time are reported but don't decide.
 
 ## 5. Phase 2: notice it (a once-per-turn nudge)
 
 Only if phase 1 leaves long runs.
 
-**Trigger:** after `BATCH_NUDGE_AFTER` (proposed 4) consecutive steps that each made one read-only call, the loop adds one note through the existing `after_step` hook (agent.rs; the session wires it), the way #90's announced-step note works. Proposed text:
+**Trigger:** after `BATCH_NUDGE_AFTER` (proposed 4) consecutive steps that each made one read-only call, the loop adds one note.
+
+It lives in the loop's own `Phase::AfterStep` (agent.rs), not in the session's `after_step` hook. Notes from that hook are fenced as untrusted project text (provenance.rs), and this one is Marv's own. The switch is an `AgentOptions.batch_nudge` bool, which the session sets for the main agent only, since subagents wire their own `after_step`. Proposed text:
 
 > Marv: the last few steps each read one thing. If you already know the next files, searches or pages you need, send them together in one reply: read-only calls run at the same time.
 
 - **Once per turn** (a `LoopState` flag, like `announced`), so it can't loop.
-- **It costs no extra step:** it rides along with the next request, after the tool results, and is appended, so the prompt cache holds.
-- **Not counted as untrusted:** it's Marv's own text.
+- **It costs no extra step:** unlike #90's note, which follows a reply with no calls and forces one more request, this one comes after tool results, and the next request goes out anyway. It's appended, so the prompt cache holds.
+- **One user turn:** if another note is due at the same point, both go in the same user message, never two user turns in a row.
+- **The count resets** on compaction, and on any step that isn't a single read-only call.
+- **Steps that don't count:** steps answered with a tool-loop note, or with a #81 "not run" record.
+- **Never together with a tool-loop note:** the repeated-read runs (the same file nine times) also trip the tool-cycle detector. In that step, the cycle note wins.
+- **Approval-free turns:** `no_auto_approval` turns don't change it, since these reads never ask.
 - **Logged** to the trajectory (`batch_nudge`), and shown in the TUI as a dim `✻` line, like #90's.
 - **Off switch:** `"batchNudge": false` in the user's config, for comparing.
 - **Read-only** here uses the same rule as phase 0.
@@ -129,11 +147,11 @@ Only if the data still shows one file paged through in small steps.
   - It would need a strict allowlist parser: a single simple command from a short list; no redirections, `;`, `&&`, subshells or `$(…)`; no `find -exec`.
   - It must never cover `network: true`, `sandbox: false` or anything that asks.
   - The #81 failing-command guard would have to record calls in order.
-- **Subagents:** apply phase 1 to the subagent prompt if phase 1 shows gains.
+- **Subagents:** they don't get `BASE_TOOLS_TEXT`. Apply phase 1 to the subagent prompt, and phase 2 through `batch_nudge`, if phase 1 shows gains.
 
 ## 8. Decisions
 
-1. **Phase 1 now:** prompt plus two description sentences, measured with two runs per arm (about $1.20 SWE-bench plus the bench).
+1. **Phase 1 now:** prompt plus two description sentences, measured with two runs per arm (about $1.50 SWE-bench plus the bench). Steps per turn decides.
 2. **Phase 2 trigger:** after 4 single read-only steps, once per turn, on by default if it passes the ship rule. Alternatives: 3, or 5.
 3. **Phase 3:** decide after phase 2's numbers.
 4. **Parallel bash:** stays out of scope until multi-call replies are common (§7).
@@ -141,5 +159,11 @@ Only if the data still shows one file paged through in small steps.
 ## 9. PRs
 
 1. Phase 0 + phase 1: `evals/batching_stats.py`, the prompt and descriptions, oracle mapping, tests that pin the new sentences, CHANGELOG with the measurement.
-2. Phase 2 (if needed): `after_step` nudge, config switch, trajectory record, TUI line, tests (fires after 4, once per turn, not for subagents, not after a non-read call).
+2. Phase 2 (if needed): the loop's nudge (`AgentOptions.batch_nudge`), config switch, trajectory record, TUI line. Tests:
+   - fires after 4;
+   - once per turn;
+   - not for subagents;
+   - resets on a non-read call and on compaction;
+   - never with a tool-loop note;
+   - shares the user turn with other notes.
 3. Phase 3 (if needed): `read_file` `ranges`.
