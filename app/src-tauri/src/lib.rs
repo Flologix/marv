@@ -630,6 +630,9 @@ fn open_chat(
         mcp_off,
         manage_mcp: true,
         host_commands: true,
+        // #204: each turn's trajectory in ~/.marv/trajectories, as the TUI and `marv -p` write it, unless the
+        // config turns them off. Background chats are this same session.
+        trajectories: marv_web::host::trajectories_on(&marv_dir()),
     };
     let (to_chat, from_page) = mpsc::unbounded_channel();
     let (out, mut events) = mpsc::unbounded_channel::<Value>();

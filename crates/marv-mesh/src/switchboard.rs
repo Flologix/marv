@@ -149,6 +149,9 @@ pub struct Switchboard {
     /// The radio (#124), when this Marv has one ([`crate::radio::Radio::new`]): the door answers joins with it while
     /// it's on, and `mesh_list` lists who's on it.
     radio: Mutex<Option<Arc<crate::radio::Radio>>>,
+    /// How long a new wire to another Marv waits for that Marv's person (#201): [`crate::discovery::WIRE_ANSWER_WAIT`],
+    /// shorter in tests ([`Self::set_wire_wait`]).
+    wire_wait: Mutex<std::time::Duration>,
 }
 
 /// What changes: one short lock, never held across an await.
@@ -195,7 +198,18 @@ impl Switchboard {
             peer_dir: Mutex::default(),
             herdr: Mutex::default(),
             radio: Mutex::default(),
+            wire_wait: Mutex::new(crate::discovery::WIRE_ANSWER_WAIT),
         }
+    }
+
+    /// How long a new wire to another Marv waits for that Marv's person, on both ends (#201).
+    pub fn wire_wait(&self) -> std::time::Duration {
+        *self.wire_wait.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Changes [`Self::wire_wait`] (tests: a short wait instead of minutes). Set it before the door opens.
+    pub fn set_wire_wait(&self, wait: std::time::Duration) {
+        *self.wire_wait.lock().unwrap_or_else(|e| e.into_inner()) = wait;
     }
 
     /// Marks `runtime_dir` as made for this switchboard alone (`marv_session::mesh::start`'s `p/<pid>-<hex>`): dropped,
