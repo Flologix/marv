@@ -56,6 +56,7 @@ impl Shared {
         match event["type"].as_str() {
             Some("ready") => {
                 event["epoch"] = json!(self.epoch());
+                event["waiting"] = json!(self.waiting);
                 self.ready = Some(event.clone());
                 self.send(event);
                 return;
@@ -102,6 +103,8 @@ impl Shared {
         self.sink = Some(sink);
         if let Some(mut ready) = self.ready.clone() {
             ready["busy"] = json!(self.busy);
+            // The approvals still waiting: a page's restored cards are live only for these.
+            ready["waiting"] = json!(self.waiting);
             if !self.send(ready) {
                 return;
             }
@@ -251,6 +254,7 @@ mod tests {
         assert_eq!(types(&again), ["ready", "text_delta", "text_delta", "approval"]);
         let again = again.lock().unwrap();
         assert_eq!(again[0]["busy"], true);
+        assert_eq!(again[0]["waiting"], json!([7]));
         assert_eq!((again[1]["seq"].as_u64(), again[1]["text"].as_str()), (Some(3), Some("b")));
         drop(again);
 
