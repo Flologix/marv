@@ -1435,7 +1435,7 @@ impl App {
                 self.palette = None;
                 // What was typed stays reachable with ↑, unless it's a login callback: it holds an authorization
                 // code and never goes in the history.
-                let typed = self.prompt.value.trim().to_string();
+                let typed = self.prompt.text().trim().to_string();
                 if !typed.is_empty() && typed != text.trim() && !self.port.is_login_callback(&typed) {
                     self.prompt.remember(&typed);
                 }
@@ -3039,6 +3039,41 @@ mod tests {
         assert!(!h.frame().contains("code-secret"));
         h.key(KeyCode::Up);
         assert!(!h.frame().contains("code-secret"), "not in the prompt history");
+    }
+
+    // #214: a multi-line paste never sends; Enter sends all of it, the transcript shows its lines, ↑ brings it back.
+    #[test]
+    fn a_multi_line_paste_waits_for_enter_and_the_transcript_shows_every_line() {
+        let mut h = harness();
+        h.app.on_event(Event::Paste("cargo build\ncargo test\n".into()), h.now);
+        assert!(h.calls().is_empty(), "a paste never submits");
+        assert!(h.frame().contains("[Pasted text #1, 2 lines]"), "{}", h.frame());
+        h.key(ENTER);
+        assert_eq!(h.calls(), [Call::Send("cargo build\ncargo test".into())]);
+        let frame = h.frame();
+        assert!(frame.contains("> cargo build\n  cargo test"), "{frame}");
+        h.events([UiEvent::Done(StopReason::End), turn_end()]);
+        h.key(KeyCode::Up);
+        assert_eq!(h.app.prompt.text(), "cargo build\ncargo test\n");
+        assert!(h.frame().contains("[Pasted text #1, 2 lines]"));
+    }
+
+    #[test]
+    fn a_multi_line_paste_into_a_reason_or_the_palette_stays_one_line() {
+        let mut h = harness();
+        h.typed("make a file");
+        h.events([UiEvent::Approval { id: ApprovalId(1), request: write_request("made.txt", None) }]);
+        h.arm();
+        h.key(KeyCode::Tab);
+        h.app.on_event(Event::Paste("too\nbig".into()), h.now);
+        h.key(ENTER);
+        assert_eq!(h.calls().last(), Some(&Call::Answer(1, Decision::Declined("too big".into()))));
+        assert_eq!(h.app.prompt.text(), "");
+        h.events([UiEvent::Done(StopReason::End), turn_end()]);
+        h.ctrl('k');
+        h.app.on_event(Event::Paste("yo\nlo".into()), h.now);
+        assert_eq!(h.app.palette.as_ref().unwrap().query, "yo lo");
+        assert_eq!(h.app.prompt.text(), "");
     }
 
     #[test]
