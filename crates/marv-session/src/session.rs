@@ -3699,7 +3699,15 @@ mod turn_tests {
     }
     impl Drop for Dirs {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(self.project.parent().unwrap());
+            // A save of a session the test didn't close may still be landing (a file made mid-removal fails it once):
+            // removed again. It can't make the folders again once they're gone (`write_private_under`).
+            let base = self.project.parent().unwrap();
+            for _ in 0..5 {
+                if std::fs::remove_dir_all(base).is_ok() || !base.exists() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
         }
     }
 
@@ -6300,6 +6308,9 @@ mod turn_tests {
         let last = text_of(history.last().unwrap());
         assert!(last.contains("queue run 2") && last.ends_with("\n\ngo on"), "{last}");
         assert!(!last.contains("queue run 1"), "the replaced round's output is dropped");
+        // Their saves land before the folders go (#212's CI: a late save left the temp folder behind).
+        session.close().await;
+        old.close().await;
     }
 
     #[tokio::test]
