@@ -58,6 +58,9 @@ pub struct Checkpoint {
     pub kind: CheckpointKind,
     /// The turn's request, first line ("add the parser").
     pub label: String,
+    /// #203: the folders this snapshot left out as other repositories (Marv's own git dir only; empty for an older
+    /// checkpoint). /undo never writes or deletes anything at or under one of them.
+    pub nested: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,12 +130,22 @@ const STALE_REF_LOCK: Duration = Duration::from_secs(60);
 
 /// A checkpoint's commit message: "marv checkpoint: turn 3 before", then the turn's request on its own line.
 pub fn checkpoint_message(turn: u32, kind: CheckpointKind, label: &str) -> String {
-    let line: String = label.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(80).collect();
-    let body = if line.is_empty() { String::new() } else { format!("\n\n{line}") };
-    format!("marv checkpoint: turn {turn} {}{body}\n", kind.as_str())
+    checkpoint_message_with(turn, kind, label, &[])
 }
 
-/// Turn, kind and label of a checkpoint's message; None for anything else.
+/// The line that names a folder a snapshot left out as another repository (#203), one per folder, after the label.
+const NESTED_LINE: &str = "Nested-Repository: ";
+
+/// [`checkpoint_message`] plus a [`NESTED_LINE`] for each of `nested` (escaped: one line each, whatever the name).
+pub fn checkpoint_message_with(turn: u32, kind: CheckpointKind, label: &str, nested: &[String]) -> String {
+    let line: String = label.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(80).collect();
+    let body = if line.is_empty() { String::new() } else { format!("\n\n{line}") };
+    let nested: String = nested.iter().map(|dir| format!("{NESTED_LINE}{}\n", escape_line(dir))).collect();
+    let nested = if nested.is_empty() { nested } else { format!("\n{nested}") };
+    format!("marv checkpoint: turn {turn} {}{body}\n{nested}", kind.as_str())
+}
+
+/// Turn, kind and label of a checkpoint's message; None for anything else. The label stops at the nested lines.
 pub fn parse_message(message: &str) -> Option<(u32, CheckpointKind, String)> {
     let (subject, rest) = message.split_once('\n').unwrap_or((message, ""));
     let words = subject.trim().strip_prefix("marv checkpoint: turn ")?;
@@ -140,7 +153,58 @@ pub fn parse_message(message: &str) -> Option<(u32, CheckpointKind, String)> {
     if turn.is_empty() || !turn.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    Some((turn.parse().ok()?, CheckpointKind::parse(kind)?, rest.trim().to_string()))
+    let label: Vec<&str> = rest.lines().take_while(|l| !l.starts_with(NESTED_LINE)).collect();
+    Some((turn.parse().ok()?, CheckpointKind::parse(kind)?, label.join("\n").trim().to_string()))
+}
+
+/// The folders a checkpoint's message names as left out (#203); none for a checkpoint made before that.
+pub fn parse_nested(message: &str) -> Vec<String> {
+    message.lines().filter_map(|l| l.strip_prefix(NESTED_LINE)).map(unescape_line).collect()
+}
+
+/// A path on one line that survives a commit message: `\\`, `\n`, `\r`, `\t`, other control characters and a last
+/// space as `\xHH`.
+fn escape_line(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    let count = path.chars().count();
+    for (i, c) in path.chars().enumerate() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ' ' if i + 1 == count => out.push_str("\\x20"),
+            c if (c as u32) < 0x20 || c == '\x7f' => out.push_str(&format!("\\x{:02x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn unescape_line(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('x') => {
+                let hex: String = chars.by_ref().take(2).collect();
+                match u8::from_str_radix(&hex, 16) {
+                    Ok(b) => out.push(b as char),
+                    Err(_) => out.push_str(&format!("\\x{hex}")),
+                }
+            }
+            Some(other) => out.push(other),
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 pub struct StoreOptions {
@@ -384,6 +448,7 @@ impl CheckpointStore {
         let reference = self.reference();
         clear_stale_locks(&where_, &reference);
         let mut temp = TempFolder(None);
+        let mut nested: Vec<String> = Vec::new();
         let index = if where_.kind == LocationKind::Repo {
             // A copy of the user's index: its stat cache makes `add -A` rehash only what changed, and it's what says a
             // force-added or skip-worktree file is tracked (from an empty index those would look new, and /undo would
@@ -406,14 +471,33 @@ impl CheckpointStore {
             index
         } else {
             let index = where_.git_dir.join("marv-index"); // Marv's own: kept, for its stat cache
-            if let Some(big) = self.too_large(&index, cancel).await {
-                *lock(&self.off) = Some(big.clone());
-                return fail(&big, SnapshotFailure::TooLarge);
+            match self.too_large(&where_.top, &index, cancel).await {
+                Ok(found) => nested = found,
+                Err(big) => {
+                    *lock(&self.off) = Some(big.clone());
+                    return fail(&big, SnapshotFailure::TooLarge);
+                }
+            }
+            // Other repositories in the folder (~/Projects holds many) are theirs, not this project's files: `add -A`
+            // would store each as a gitlink ("adding embedded git repository"), and one with no commit yet fails the
+            // whole snapshot, so no turn there could be undone (#203). They're left out, and any entry an earlier
+            // snapshot kept for them leaves Marv's index (only the index: the files are never touched).
+            if !nested.is_empty() {
+                let mut args = vec!["rm", "--cached", "-r", "-q", "-f", "--ignore-unmatch", "--"];
+                let specs: Vec<String> = nested.iter().map(|dir| format!(":(literal){dir}")).collect();
+                args.extend(specs.iter().map(String::as_str));
+                let removed = self.git(&args, Some(&index), cancel, None).await;
+                if !removed.ok {
+                    return failed(&removed, "git rm --cached");
+                }
             }
             index
         };
         let spec = self.pathspec().await;
-        let added = self.git(&["add", "-A", "--", &spec], Some(&index), cancel, None).await;
+        let excludes: Vec<String> = nested.iter().map(|dir| format!(":(exclude,literal){dir}")).collect();
+        let mut add = vec!["add", "-A", "--", spec.as_str()];
+        add.extend(excludes.iter().map(String::as_str));
+        let added = self.git(&add, Some(&index), cancel, None).await;
         if !added.ok {
             return failed(&added, "git add");
         }
@@ -428,7 +512,7 @@ impl CheckpointStore {
         let listed = self.git(&["ls-files", "-z", "--", &spec], Some(&index), cancel, None).await;
         let files = if listed.ok { listed.out.split('\0').filter(|p| !p.is_empty()).count() } else { 0 };
         let previous = self.head().await;
-        let message = checkpoint_message(turn, kind, label);
+        let message = checkpoint_message_with(turn, kind, label, &nested);
         let mut args = vec!["commit-tree", "--no-gpg-sign", tree.as_str()];
         if let Some(previous) = &previous {
             args.extend(["-p", previous.as_str()]);
@@ -676,8 +760,10 @@ impl CheckpointStore {
         for chunk in listed.out.split('\x1e').skip(1) {
             let mut parts = chunk.splitn(3, '\0');
             let (sha, tree, message) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""), parts.next().unwrap_or(""));
-            if let Some((turn, kind, label)) = parse_message(&trailer.replace(message, "")) {
-                chain.push(Checkpoint { sha: sha.trim().into(), tree: tree.trim().into(), turn, kind, label });
+            let message = trailer.replace(message, "");
+            if let Some((turn, kind, label)) = parse_message(&message) {
+                let nested = parse_nested(&message);
+                chain.push(Checkpoint { sha: sha.trim().into(), tree: tree.trim().into(), turn, kind, label, nested });
             }
         }
         Ok(chain)
@@ -761,43 +847,97 @@ impl CheckpointStore {
         Ok(Location { kind: LocationKind::Own, git_dir, top, prefix: String::new() })
     }
 
-    /// Outside a repository: why this project is too large to snapshot (files, or new content), or None.
-    async fn too_large(&self, index: &Path, cancel: Option<&CancellationToken>) -> Option<String> {
+    /// Outside a repository: why this project is too large to snapshot (files, or new content) as the error, else
+    /// the nested repositories to leave out (see [`nested_repositories`]), found in the same listing.
+    async fn too_large(&self, top: &Path, index: &Path, cancel: Option<&CancellationToken>) -> Result<Vec<String>, String> {
         let Limits { files, bytes } = self.options.limits.unwrap_or(OWN_LIMITS);
         let all = self.git(&["ls-files", "-z", "--cached", "--others", "--exclude-standard"], Some(index), cancel, None).await;
         if !all.ok {
-            return None; // add -A reports what's wrong
+            return Ok(Vec::new()); // add -A reports what's wrong
         }
-        let count = all.out.split('\0').filter(|p| !p.is_empty()).count();
+        let listed: Vec<&str> = all.out.split('\0').filter(|p| !p.is_empty()).collect();
+        let count = listed.len();
         if count > files {
-            return Some(format!(
+            return Err(format!(
                 "the project is too large for checkpoints outside a git repository ({count} files, the limit is {files})"
             ));
         }
+        let nested = nested_repositories(top, &listed);
         let changed =
             self.git(&["ls-files", "-z", "--others", "--modified", "--exclude-standard"], Some(index), cancel, None).await;
         if !changed.ok {
-            return None;
+            return Ok(nested);
         }
         let mut total = 0;
-        for path in changed.out.split('\0').filter(|p| !p.is_empty()) {
+        for path in changed.out.split('\0').filter(|p| !p.is_empty() && !under_any(p, &nested)) {
             total += std::fs::metadata(self.options.root.join(path)).map(|m| if m.is_file() { m.len() } else { 0 }).unwrap_or(0);
             if total > bytes {
-                return Some(format!(
+                return Err(format!(
                     "the project is too large for checkpoints outside a git repository (over {} MB of new content)",
                     (bytes as f64 / 1024.0 / 1024.0).round() as u64
                 ));
             }
         }
-        None
+        Ok(nested)
     }
+}
+
+/// The folders under `top` that hold a `.git` (a folder, or a worktree's or submodule's `.git` file), outermost only,
+/// as paths relative to `top` without a trailing slash. `listed` is git's own listing of the folder (bounded by the
+/// file limit, so nothing beyond it is walked): git names a repository it recognises as `dir/`, and lists the files of
+/// one it doesn't (a `.git` that's broken or half made), so each listed file's folders are checked too, each once,
+/// and each entry itself (a gitlink an older snapshot stored is listed as `dir`, without the slash).
+pub(crate) fn nested_repositories(top: &Path, listed: &[&str]) -> Vec<String> {
+    let mut checked: HashMap<String, bool> = HashMap::new();
+    let mut found: Vec<String> = Vec::new();
+    for path in listed {
+        if let Some(dir) = path.strip_suffix('/') {
+            found.push(dir.to_string()); // git saw a repository there
+        } else if holds_git(&top.join(path)) {
+            found.push(path.to_string());
+        }
+        let mut end = 0;
+        // Each folder above the entry, outermost first, never `top` itself.
+        while let Some(slash) = path[end..].find('/').map(|i| end + i) {
+            let dir = &path[..slash];
+            end = slash + 1;
+            if dir.is_empty() || end == path.len() {
+                break;
+            }
+            let has_git = *checked.entry(dir.to_string()).or_insert_with(|| holds_git(&top.join(dir)));
+            if has_git {
+                found.push(dir.to_string());
+                break;
+            }
+        }
+    }
+    found.sort();
+    found.dedup();
+    // Outermost only: a repository inside another one is already left out with it.
+    let mut outermost: Vec<String> = Vec::new();
+    for dir in found {
+        if !under_any(&dir, &outermost) {
+            outermost.push(dir);
+        }
+    }
+    outermost
+}
+
+/// Whether `folder` holds a `.git` (a folder or a file; a symlink counts too).
+pub(crate) fn holds_git(folder: &Path) -> bool {
+    std::fs::symlink_metadata(folder.join(".git")).is_ok()
+}
+
+/// Whether `path` is one of `dirs` or inside one.
+pub(crate) fn under_any(path: &str, dirs: &[String]) -> bool {
+    dirs.iter().any(|dir| path.strip_prefix(dir.as_str()).is_some_and(|rest| rest.is_empty() || rest.starts_with('/')))
 }
 
 #[cfg(test)]
 mod tests {
     // Ports tests/checkpoints.test.ts: locate, snapshot, stale locks, the chain.
     use super::*;
-    use crate::checkpoints::test_support::{Temp, git, make_repo, read, temp, tree_files, write};
+    use crate::checkpoints::test_support::{Temp, folder_of_repos, git, make_repo, read, temp, tree_files, write};
 
     pub(crate) fn store_in(root: &Path, session: &str, own: &Temp) -> CheckpointStore {
         CheckpointStore::new(StoreOptions::new(root, Some(own.0.clone()), session))
@@ -959,6 +1099,44 @@ mod tests {
         ));
     }
 
+    // #203: other repositories in the folder are left out, so one with no commit no longer fails every snapshot.
+    #[tokio::test]
+    async fn own_git_dir_leaves_nested_repositories_out_even_one_with_no_commit() {
+        let folder = folder_of_repos();
+        let d = &folder.0;
+        let theirs =
+            |repo: &str| (git(&d.join(repo), &["status", "--porcelain"]), git(&d.join(repo), &["rev-parse", "--git-dir"]));
+        let full_before = (git(&d.join("full"), &["rev-parse", "HEAD"]), theirs("full"));
+        let empty_before = theirs("empty");
+        let own = temp("cp-own");
+        let s = store_in(d, "s1", &own);
+        let first = snap(&s, 1, CheckpointKind::Before, "").await;
+        assert_eq!(tree_files(&own.0.join("git"), &sha_of(&first)), ["a/b/f.txt", "outer.txt"]);
+        assert!(matches!(first, SnapshotResult::Ok { files: 2, .. }), "{first:?}");
+        assert_eq!((git(&d.join("full"), &["rev-parse", "HEAD"]), theirs("full")), full_before);
+        assert_eq!(theirs("empty"), empty_before);
+
+        // A folder an earlier snapshot stored that has since become a repository leaves Marv's index too.
+        write(d.join("later/x.txt"), "x\n");
+        let with_later = sha_of(&snap(&s, 1, CheckpointKind::After, "").await);
+        assert!(tree_files(&own.0.join("git"), &with_later).contains(&"later/x.txt".to_string()));
+        git(&d.join("later"), &["init", "-q"]);
+        let without = sha_of(&snap(&s, 2, CheckpointKind::Before, "").await);
+        assert_eq!(tree_files(&own.0.join("git"), &without), ["a/b/f.txt", "outer.txt"]);
+        assert_eq!(read(d.join("later/x.txt")), "x\n");
+    }
+
+    #[test]
+    fn nested_repositories_outermost_from_gits_listing_and_dot_git_files() {
+        let folder = folder_of_repos();
+        let listed = ["a/b/deep/", "a/b/f.txt", "empty/", "full/", "outer.txt", "wt/r.txt", "full/inner/"];
+        assert_eq!(nested_repositories(&folder.0, &listed), ["a/b/deep", "empty", "full", "wt"]);
+        // An older snapshot's gitlink is listed without the slash.
+        assert_eq!(nested_repositories(&folder.0, &["full", "outer.txt"]), ["full"]);
+        assert!(nested_repositories(&folder.0, &["outer.txt", "a/b/f.txt"]).is_empty());
+        assert!(under_any("full/x", &["full".into()]) && !under_any("fuller/x", &["full".into()]));
+    }
+
     #[tokio::test]
     async fn stale_locks_this_sessions_ref_lock_and_an_old_marv_index_lock_go_a_fresh_index_lock_stays() {
         let plain = temp("cp-plain");
@@ -1025,6 +1203,16 @@ mod tests {
             "marv checkpoint: turn 2 before\n\nadd the parser\n"
         );
         assert_eq!(checkpoint_message(2, CheckpointKind::Undo, ""), "marv checkpoint: turn 2 undo\n");
+        // #203: the folders left out follow the label, escaped, and aren't part of it.
+        let nested = vec!["full".to_string(), "odd\nname\\ x ".to_string(), "Nested-Repository: x".to_string()];
+        let message = checkpoint_message_with(4, CheckpointKind::After, "fix it", &nested);
+        assert_eq!(parse_message(&message), Some((4, CheckpointKind::After, "fix it".into())));
+        assert_eq!(parse_nested(&message), nested);
+        assert_eq!(message.lines().count(), 7, "{message:?}");
+        let no_label = checkpoint_message_with(1, CheckpointKind::Before, "", &nested[..1]);
+        assert_eq!(parse_message(&no_label), Some((1, CheckpointKind::Before, String::new())));
+        assert_eq!(parse_nested(&no_label), ["full"]);
+        assert!(parse_nested("marv checkpoint: turn 2 undo\n\nfix it\n").is_empty());
     }
 
     #[tokio::test]

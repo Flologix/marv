@@ -308,16 +308,19 @@ function Approval({
   if (decision || restored) {
     // "expired": the session that asked ended first (Marv restarted), so there's nothing left to answer.
     const idle = !decision || decision === "expired";
-    const no = decision === "no" || decision === "declined";
+    // #201: "withdrawn": nobody waits for an answer any more (another Marv asked for a wire, then hung up).
+    const no = decision === "no" || decision === "declined" || decision === "withdrawn";
     const word = !decision
       ? "waiting for Marv"
       : decision === "expired"
         ? "not answered (Marv restarted)"
-        : decision === "no" || decision === "declined"
-          ? "declined"
-          : decision === "always"
-            ? "allowed for this chat"
-            : "allowed";
+        : decision === "withdrawn"
+          ? "no longer asked"
+          : decision === "no" || decision === "declined"
+            ? "declined"
+            : decision === "always"
+              ? "allowed for this chat"
+              : "allowed";
     return (
       <p className={`decided${idle ? " idle" : no ? " no" : ""}`}>
         {word} · <span>{r.command ?? r.label}</span>

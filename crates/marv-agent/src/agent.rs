@@ -129,6 +129,10 @@ pub mod not_run {
     pub const TEXT_LOOP: &str = "Not run: your reply was stuck repeating the same text, so it was dropped.";
     /// #59: a call the wrap-up reply made anyway (it was asked not to).
     pub const STEP_LIMIT: &str = "Not run: the step limit was reached.";
+    /// #202: a call that waited for approval when Marv quit (a crash, a force-quit): the saved session answers it so.
+    pub const QUIT_APPROVAL: &str = "Not run: Marv quit while this call waited for approval.";
+    /// #202: a call with no result when Marv quit: it may not have started, or stopped part-way.
+    pub const QUIT: &str = "No result: Marv quit before this call finished, so it may not have run, or only in part.";
 }
 
 /// Told to the model (a user message from Marv) when a reply with nothing to run was cut off at
@@ -166,6 +170,13 @@ pub use marv_provider::openai_compat::DROPPED_STREAM_NOTE;
 /// (a run cut short, e.g. by quitting while it wound down) get "not run". Without one the API
 /// rejects every request made from this history, so a session saved this way couldn't continue.
 pub fn answer_all_calls(history: &[ChatTurn]) -> Vec<ChatTurn> {
+    answer_all_calls_with(history, |_| not_run::ABORTED.into())
+}
+
+/// [`answer_all_calls`] with each waiting call's own result: a session saved mid-turn (#202) gives a call that has
+/// finished its output (a parallel group's results go into the history only once all of them are done), and one that
+/// hasn't a "Marv quit" text.
+pub fn answer_all_calls_with(history: &[ChatTurn], result: impl Fn(&ToolCall) -> String) -> Vec<ChatTurn> {
     let answered: HashSet<&str> = history
         .iter()
         .filter_map(|t| match t {
@@ -183,7 +194,7 @@ pub fn answer_all_calls(history: &[ChatTurn]) -> Vec<ChatTurn> {
         .into_iter()
         .flatten()
         .filter(|c| !answered.contains(c.id.as_str()))
-        .map(|c| ChatTurn::Tool { call_id: c.id.clone(), name: c.name.clone(), text: not_run::ABORTED.into() })
+        .map(|c| ChatTurn::Tool { call_id: c.id.clone(), name: c.name.clone(), text: result(c) })
         .collect();
     let mut out = history.to_vec();
     out.extend(waiting);
@@ -1465,6 +1476,24 @@ mod tests {
             ChatTurn::Assistant { text: "hello".into(), tool_calls: vec![], reasoning: None },
         ];
         assert_eq!(answer_all_calls(&done), done);
+    }
+
+    // #202: a mid-turn save gives each waiting call its own text, in call order.
+    #[test]
+    fn answer_all_calls_with_gives_each_waiting_call_its_own_result() {
+        let history = vec![
+            ChatTurn::User { text: "go".into() },
+            ChatTurn::Assistant { text: "".into(), tool_calls: vec![call("c1", "a.ts"), call("c2", "b.ts")], reasoning: None },
+        ];
+        let answered = answer_all_calls_with(&history, |c| if c.id == "c1" { "contents".into() } else { not_run::QUIT.into() });
+        let texts: Vec<&str> = answered[2..]
+            .iter()
+            .map(|t| match t {
+                ChatTurn::Tool { text, .. } => text.as_str(),
+                _ => "",
+            })
+            .collect();
+        assert_eq!(texts, ["contents", not_run::QUIT]);
     }
 
     #[test]

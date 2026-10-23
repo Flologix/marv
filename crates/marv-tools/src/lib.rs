@@ -52,7 +52,7 @@ pub use types::{
     AgentHost, AgentProgress, Approval, ApprovalRequest, Approver, BeforeChange, Checkpoint, Decision, DiffKind, DiffLine,
     DiffShown, DynTool, MemoryPaths, NetworkFailures, PlanHost, PlanItem, PlanStatus, Preview, PreviewFile, ProcessForward,
     ProcessForwards, ProcessHost, ProcessInfo, ProcessState, Repaired, Scope, Skill, StartResult, Tool, ToolContext, ToolError,
-    ToolOutput,
+    ToolOutput, ToolProgress,
 };
 
 #[cfg(test)]

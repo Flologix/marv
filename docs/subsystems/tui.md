@@ -58,7 +58,7 @@ pub trait SessionPort: Send + Sync {          // every method returns at once; r
 // App::new(port: Arc<dyn SessionPort>, events: UnboundedReceiver<UiEvent>, options: AppOptions)
 ```
 
-`UiEvent` mirrors Marv's `SessionEvent` (the turn and its `LoopEvent`s, `Subagent { call_id, title, event }`, `SubagentProgress`, `Compaction`, `TurnEnd`) and adds `Approval { id, request }` plus the results of port calls (`Message`, `StatusInfo`, `Welcome`, `Clear`, `OpenSetup`, `Sessions`, `Models`, `Resumed`, `Flash`, `Busy`, `Exit`). The engine maps project checks and diagnostics to `Message`s with a `Notice`. The approval queue lives in the TUI as in Marv: each request has an `ApprovalId`, the head is shown with "N more waiting", and Esc answers `No` to the whole queue and then calls `abort()`.
+`UiEvent` mirrors Marv's `SessionEvent` (the turn and its `LoopEvent`s, `Subagent { call_id, title, event }`, `SubagentProgress`, `Compaction`, `TurnEnd`) and adds `Approval { id, request }` (and, marv-rs #201, `ApprovalWithdrawn(id)`: the request's wait was dropped, e.g. another Marv's wire whose caller hung up, so it leaves the queue unanswered) plus the results of port calls (`Message`, `StatusInfo`, `Welcome`, `Clear`, `OpenSetup`, `Sessions`, `Models`, `Resumed`, `Flash`, `Busy`, `Exit`). The engine maps project checks and diagnostics to `Message`s with a `Notice`. The approval queue lives in the TUI as in Marv: each request has an `ApprovalId`, the head is shown with "N more waiting", and Esc answers `No` to the whole queue and then calls `abort()`.
 
 ## Port notes
 

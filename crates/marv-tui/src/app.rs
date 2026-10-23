@@ -718,6 +718,10 @@ impl App {
                 self.approvals.push_back(Pending { id, request });
                 self.show_approvals(now);
             }
+            UiEvent::ApprovalWithdrawn(id) => {
+                self.approvals.retain(|p| p.id != id);
+                self.show_approvals(now);
+            }
             UiEvent::Message(message) => {
                 self.add_message(message);
             }
@@ -2633,6 +2637,25 @@ mod tests {
         h.arm();
         h.key(ENTER);
         assert_eq!(&h.calls()[1..], [Call::Answer(1, Decision::No), Call::Answer(2, Decision::Yes)]);
+    }
+
+    /// #201: an approval nobody waits for any more (another Marv asked for a wire and hung up) leaves the screen
+    /// unanswered; the next one in the queue shows, and with none left the prompt is back.
+    #[test]
+    fn a_withdrawn_approval_leaves_the_queue_unanswered() {
+        let mut h = harness();
+        h.events([
+            UiEvent::Approval { id: ApprovalId(1), request: write_request("one.txt", None) },
+            UiEvent::Approval { id: ApprovalId(2), request: write_request("two.txt", None) },
+        ]);
+        assert!(h.frame().contains("1 more waiting"));
+        h.events([UiEvent::ApprovalWithdrawn(ApprovalId(1))]);
+        let frame = h.frame();
+        assert!(frame.contains("Do you want to proceed?") && frame.contains("two.txt"), "{frame}");
+        assert!(!frame.contains("more waiting"));
+        h.events([UiEvent::ApprovalWithdrawn(ApprovalId(2)), UiEvent::ApprovalWithdrawn(ApprovalId(9))]);
+        assert!(!h.frame().contains("Do you want to proceed?"));
+        assert!(h.calls().iter().all(|c| !matches!(c, Call::Answer(..))), "nothing was answered");
     }
 
     #[test]
