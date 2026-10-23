@@ -155,6 +155,11 @@ pub async fn run_chat(spec: ChatSpec, mut incoming: UnboundedReceiver<ClientMess
             return;
         }
     };
+    // #202: the chat's last turn was cut off by Marv quitting (a force-quit during an approval): the window's own
+    // transcript still shows the turn as it was, so it gets the session's notice.
+    if let Some(text) = session.take_cut_off_notice() {
+        let _ = out.send(json!({"type": "notice", "text": text}));
+    }
     // Its door: other Marvs find it and ask for wires, which its person answers here.
     let as_approver: Arc<dyn marv_tools::types::Approver> = approver.clone();
     if let Some(mesh) = mesh.as_mut()
