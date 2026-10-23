@@ -2192,7 +2192,8 @@ mod tests {
         h.events([UiEvent::Done(StopReason::End), turn_end()]);
         let frame = h.frame();
         let at = |text: &str| {
-            let (y, line) = frame.lines().enumerate().find(|(_, l)| l.contains(text)).unwrap_or_else(|| panic!("{text}:\n{frame}"));
+            let (y, line) =
+                frame.lines().enumerate().find(|(_, l)| l.contains(text)).unwrap_or_else(|| panic!("{text}:\n{frame}"));
             (unicode_width::UnicodeWidthStr::width(&line[..line.find(text).unwrap()]) as u16, y as u16)
         };
         let (x0, y0) = at("first pasted line");

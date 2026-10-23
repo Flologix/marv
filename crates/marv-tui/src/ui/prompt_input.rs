@@ -283,8 +283,11 @@ impl PromptInput {
                 self.dismissed_at = None;
                 // With the menu open, Enter runs the highlighted command ("/se" → "/setup").
                 let text = highlighted.map_or_else(|| self.text(), |c| format!("/{}", c.name));
-                self.submitted = (highlighted.is_none() && !self.pastes.is_empty())
-                    .then(|| Recall { text: text.clone(), value: self.value.clone(), pastes: self.pastes.clone() });
+                self.submitted = (highlighted.is_none() && !self.pastes.is_empty()).then(|| Recall {
+                    text: text.clone(),
+                    value: self.value.clone(),
+                    pastes: self.pastes.clone(),
+                });
                 return Some(PromptOutcome::Submit(text));
             }
             KeyCode::Up if !self.history.is_empty() => {
