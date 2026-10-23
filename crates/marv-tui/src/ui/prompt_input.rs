@@ -136,7 +136,8 @@ impl PromptInput {
         let value = value.into();
         // Text from outside with several lines (the palette's prefill never has any) is one chip, so the box stays
         // one line high; otherwise it's typed in.
-        if value.contains('\n') { self.add_chip(value) } else { self.type_text(&no_chips(&value)) }
+        let value = no_chips(&value);
+        if value.contains('\n') { self.add_chip(value) } else { self.type_text(&value) }
     }
 
     /// The text with every chip replaced by what was pasted: what Enter submits.
@@ -196,6 +197,21 @@ impl PromptInput {
         if self.history.last().map(String::as_str) != Some(text) {
             self.history.push(text.to_string());
         }
+        // At most one per distinct history entry (deduped above); never more entries than the history has.
+        let extra = self.recalls.len().saturating_sub(self.history.len());
+        self.recalls.drain(..extra);
+    }
+
+    /// Forgets the last submission's chips without remembering it: a login callback holds an authorization code,
+    /// and nothing of it is kept.
+    pub fn forget_submission(&mut self) {
+        self.submitted = None;
+    }
+
+    /// Whether the last submission's chips are still held (tests: a login callback never is).
+    #[cfg(test)]
+    pub(crate) fn holds_submission(&self) -> bool {
+        self.submitted.is_some()
     }
 
     /// Puts history entry `i` back in the line, with its chips if it had any.
@@ -856,5 +872,23 @@ mod tests {
         h.prompt.paste(&format!("a{fake}"));
         h.key(KeyCode::Char(fake), KeyModifiers::NONE);
         assert_eq!(h.prompt.text(), "a\u{FFFD}\u{FFFD}");
+        // Multi-line text set from outside too.
+        h.prompt.set(format!("x{fake}\ny"));
+        assert_eq!(h.prompt.text(), "x\u{FFFD}\ny");
+    }
+
+    #[test]
+    fn recalled_chips_are_kept_once_per_history_entry() {
+        let mut h = Harness::new(&[]);
+        for _ in 0..3 {
+            for text in ["a\nb", "c\nd"] {
+                h.prompt.paste(text);
+                h.press(&[KeyCode::Enter]);
+                let last = h.submitted.last().unwrap().clone();
+                h.prompt.remember(last.trim());
+            }
+        }
+        assert_eq!(h.prompt.recalls.len(), 2);
+        assert!(h.prompt.recalls.len() <= h.prompt.history.len());
     }
 }

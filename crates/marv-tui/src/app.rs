@@ -1455,6 +1455,7 @@ impl App {
         // prompt history or the saved transcript. Even during a turn.
         if self.port.login_callback(text) {
             self.prompt.set("");
+            self.prompt.forget_submission();
             return;
         }
         if self.busy() {
@@ -3062,6 +3063,16 @@ mod tests {
         assert!(!h.frame().contains("code-secret"));
         h.key(KeyCode::Up);
         assert!(!h.frame().contains("code-secret"), "not in the prompt history");
+        // #214 review: one long enough to be pasted as a chip goes to the engine too, and its chip isn't kept.
+        let long = format!("http://127.0.0.1:5555/callback?code=code-long&state={}", "s".repeat(1000));
+        h.app.prompt.set(""); // ↑ above brought back "hello"
+        h.app.on_event(Event::Paste(long.clone()), h.now);
+        assert!(h.frame().contains("[Pasted text #1"), "{}", h.frame());
+        h.key(ENTER);
+        assert_eq!(h.calls().last(), Some(&Call::LoginCallback(long)));
+        assert!(!h.app.prompt.holds_submission(), "the callback's chip isn't held for the history");
+        h.key(KeyCode::Up);
+        assert!(!h.app.prompt.text().contains("code-long"), "not in the prompt history");
     }
 
     // #214: a multi-line paste never sends; Enter sends all of it, the transcript shows its lines, ↑ brings it back.
