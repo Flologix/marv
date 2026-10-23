@@ -99,6 +99,13 @@ export function apply(items: Item[], e: ServerEvent): Item[] {
     case "tool_start":
       if (tool(e.id) < 0) next.push({ kind: "tool", id: String(e.id), tool: String(e.tool), label: String(e.label ?? ""), agent: e.agent as string | undefined, done: false });
       return next;
+    case "tool_progress": {
+      // A running call's status line (#201: "waiting for beta to accept the wire"); tool_end replaces it.
+      const i = tool(e.id);
+      if (i < 0 || (next[i] as Extract<Item, { kind: "tool" }>).done) return items;
+      next[i] = { ...(next[i] as Extract<Item, { kind: "tool" }>), summary: String(e.line ?? "") };
+      return next;
+    }
     case "tool_end":
     case "tool_skipped": {
       const i = tool(e.id);
