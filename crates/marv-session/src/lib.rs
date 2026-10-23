@@ -22,6 +22,7 @@ pub mod checkpoints;
 pub mod checks;
 pub mod commands;
 pub mod config;
+pub mod cut_off;
 pub mod diagnostics;
 pub mod event_queue;
 pub mod feedback;

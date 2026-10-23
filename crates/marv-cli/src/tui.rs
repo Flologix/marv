@@ -804,8 +804,18 @@ impl Activity {
         self.report();
     }
 
+    /// The ask `id` is over. Still unanswered (its wait was dropped: a stopped turn, or #201 a door whose caller hung
+    /// up), the App takes it off the screen too.
     fn forget(&self, id: u64) {
-        self.asks.lock().unwrap_or_else(|e| e.into_inner()).retain(|a| a.id != id);
+        let unanswered = {
+            let mut asks = self.asks.lock().unwrap_or_else(|e| e.into_inner());
+            let before = asks.len();
+            asks.retain(|a| a.id != id);
+            asks.len() != before
+        };
+        if unanswered {
+            self.emit(UiEvent::ApprovalWithdrawn(ApprovalId(id)));
+        }
         self.report();
     }
 
@@ -3467,6 +3477,43 @@ mod tests {
             assert_eq!(waiting.await.unwrap(), marv_tools::Decision::No);
         }
 
+        /// #201: a wire asked for from another process whose caller hung up (the door drops the wait) leaves the
+        /// screen: the App is told it's withdrawn, and the Marv isn't blocked at an approval any more. An answered one
+        /// isn't "withdrawn".
+        #[tokio::test]
+        async fn a_wire_prompt_whose_caller_hung_up_is_withdrawn() {
+            let (dirs, mesh) = (Dirs::new(), mesh());
+            let (bridge, mut rx) = bridge(&dirs, wakes(), vec![say("x")], &mesh);
+            let ask = WireRequest {
+                from: marv_mesh::PlugId::new("peer-alpha").unwrap(),
+                to: inbox(),
+                mode: WireMode::Send,
+                asked_by: marv_mesh::PlugId::new("peer-alpha").unwrap(),
+            };
+            let ask_once = |ask: WireRequest| {
+                let approver = TuiApprover(bridge.activity.clone());
+                tokio::spawn(
+                    async move { marv_tools::Approver::approve(&approver, marv_session::mesh::wire_approval(&ask)).await },
+                )
+            };
+            let waiting = ask_once(ask.clone());
+            let seen = until(&mut rx, |e| matches!(e, UiEvent::Approval { .. })).await;
+            let Some(UiEvent::Approval { id, .. }) = seen.last() else { unreachable!() };
+            let id = *id;
+            assert!(bridge.activity.waiting());
+            waiting.abort();
+            let seen = until(&mut rx, |e| matches!(e, UiEvent::ApprovalWithdrawn(_))).await;
+            assert!(matches!(seen.last(), Some(UiEvent::ApprovalWithdrawn(w)) if *w == id));
+            assert!(!bridge.activity.waiting(), "nothing left waiting");
+
+            let answered = ask_once(ask);
+            let seen = until(&mut rx, |e| matches!(e, UiEvent::Approval { .. })).await;
+            let Some(UiEvent::Approval { id, .. }) = seen.last() else { unreachable!() };
+            Port(bridge.clone()).answer(*id, view::Decision::No);
+            assert_eq!(answered.await.unwrap(), marv_tools::Decision::No);
+            assert!(!quiet(&mut rx).await.iter().any(|e| matches!(e, UiEvent::ApprovalWithdrawn(_))));
+        }
+
         #[tokio::test]
         async fn over_the_rate_limit_messages_wait_and_the_user_is_told_once() {
             let (dirs, mesh) = (Dirs::new(), mesh());
@@ -3871,6 +3918,36 @@ mod tests {
         assert!(list.iter().all(|s| s.id != bridge.session.id()));
     }
 
+    /// #202: Marv quit while an approval waited (the first bridge is never answered, flushed nor closed): `marv -c`
+    /// brings the turn back, with a notice that it was cut off.
+    #[tokio::test]
+    async fn a_turn_cut_off_mid_approval_comes_back_marked() {
+        let dirs = Dirs::new();
+        let (tx, mut rx) = unbounded_channel();
+        let first = Bridge::start(startup(&dirs, Some(asks()), vec![write("w", "a.txt", "hi\n")], None), tx).unwrap();
+        Port(first.clone()).send("write a.txt".into());
+        until(&mut rx, |e| matches!(e, UiEvent::Approval { .. })).await;
+        // The save before the question is a background write: wait for it to land.
+        let store = SessionStore::new(dirs.config.join("sessions"));
+        let mut landed = false;
+        for _ in 0..500 {
+            if store.load(&dirs.project, &first.session.id()).await.is_some_and(|s| s.cut_off.is_some()) {
+                landed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(landed, "saved before the approval");
+
+        let (tx, mut rx) = unbounded_channel();
+        let bridge = Bridge::start(startup(&dirs, Some(asks()), vec![], None), tx).unwrap();
+        bridge.resume_latest().await;
+        let UiEvent::Resumed(resumed) = next(&mut rx).await else { panic!("not resumed") };
+        let shown: Vec<(Role, &str)> = resumed.transcript.iter().map(|m| (m.role, m.text.as_str())).collect();
+        let notice = marv_session::cut_off::cut_off_notice("Marv quit while `write_file` waited for approval");
+        assert_eq!(shown, [(Role::User, "write a.txt"), (Role::System, notice.as_str())]);
+    }
+
     /// #74: in a Marv started with MARV_YOLO=off, /yolo on says it stays off, names the variable, and writes nothing.
     #[tokio::test]
     async fn yolo_on_is_refused_under_marv_yolo_off() {
@@ -4250,7 +4327,8 @@ mod tests {
         let view = marv_tui::ui::approval::ApprovalView::new(shown, 0, true);
         assert!(view.select.items.iter().any(|i| i.label.starts_with("No, and say why")));
 
-        let checkpoint = |kind| Checkpoint { sha: "a".into(), tree: "b".into(), turn: 1, kind, label: "x".into() };
+        let checkpoint =
+            |kind| Checkpoint { sha: "a".into(), tree: "b".into(), turn: 1, kind, label: "x".into(), nested: Vec::new() };
         let undo = marv_session::UndoPlan {
             turn: 1,
             label: "add the parser".into(),

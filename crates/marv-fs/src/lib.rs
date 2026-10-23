@@ -8,4 +8,4 @@ pub mod file_lock;
 pub mod private_file;
 
 pub use file_lock::{LockError, LockOptions, STALE_LOCK, with_file_lock};
-pub use private_file::{random_hex, write_private};
+pub use private_file::{random_hex, write_private, write_private_under};

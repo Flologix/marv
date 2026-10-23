@@ -55,6 +55,18 @@ pub struct ChatSpec {
     /// Let bash run a command on this machine outside the sandbox, asked every time (never yolo, never "always"):
     /// only where the person approving is at this machine.
     pub host_commands: bool,
+    /// #204: write each turn's trajectory (`config_dir/trajectories/<project>/<session>.jsonl`), as the TUI and
+    /// `marv -p` do: the config's `trajectories` ([`trajectories_on`]).
+    pub trajectories: bool,
+}
+
+/// #204: the config's `trajectories` in `config_dir` (on by default), resolved as `marv -p` resolves it. A config file
+/// that can't be read leaves the default: the chat still opens (`marv -p` would stop and say why).
+pub fn trajectories_on(config_dir: &std::path::Path) -> bool {
+    use marv_session::config::{ConfigStore, Env, resolve_config};
+    let env: Env = std::env::vars().collect();
+    let file = ConfigStore::new(config_dir).load().ok().flatten();
+    resolve_config(file.as_ref(), &env).trajectories
 }
 
 /// `/trust`, offered where the chat loads the project's files (the person's own machine).
@@ -147,6 +159,11 @@ pub async fn run_chat(spec: ChatSpec, mut incoming: UnboundedReceiver<ClientMess
             return;
         }
     };
+    // #202: the chat's last turn was cut off by Marv quitting (a force-quit during an approval): the window's own
+    // transcript still shows the turn as it was, so it gets the session's notice.
+    if let Some(text) = session.take_cut_off_notice() {
+        let _ = out.send(json!({"type": "notice", "text": text}));
+    }
     // Its door: other Marvs find it and ask for wires, which its person answers here.
     let as_approver: Arc<dyn marv_tools::types::Approver> = approver.clone();
     if let Some(mesh) = mesh.as_mut()
@@ -465,21 +482,11 @@ async fn open(
     mesh: Option<marv_session::mesh::MeshHandle>,
 ) -> Result<MarvSession, String> {
     let build = |resume: Option<ResumeTarget>| {
-        let mut builder = SessionBuilder::new(&spec.root, provider_option(spec, &spec.model))
-            .approve(approver.clone())
-            .max_steps(spec.max_steps)
-            .yolo(spec.yolo)
-            .persist(Store::Default)
-            .processes(spec.processes)
-            .sources(&spec.sources);
+        let mut builder = session_builder(spec, approver.clone());
         if let Some(resume) = resume {
             builder = builder.resume(resume);
         }
-        // No `sources`: none of the user's skills, memory, MCP servers or instructions from ~/.marv.
-        builder.options.config_dir = Some(spec.config_dir.clone());
         builder.options.mesh = mesh.clone();
-        builder.options.mcp_skip = spec.mcp_off.clone();
-        builder.options.host_commands = spec.host_commands;
         let out = out.clone();
         builder.options.on_warning = Some(Arc::new(move |text: String| {
             let _ = out.send(json!({"type": "notice", "text": marv_core::printable(&text)}));
@@ -492,6 +499,23 @@ async fn open(
         Err(_) if matches!(spec.resume, Some(ResumeTarget::Id(_))) => build(None).await.map_err(|e| e.to_string()),
         Err(e) => Err(e.to_string()),
     }
+}
+
+/// The chat's session as `spec` says: saved, and its trajectory written where the config has them on (#204).
+fn session_builder(spec: &ChatSpec, approver: Arc<WebApprover>) -> SessionBuilder {
+    let mut builder = SessionBuilder::new(&spec.root, provider_option(spec, &spec.model))
+        .approve(approver)
+        .max_steps(spec.max_steps)
+        .yolo(spec.yolo)
+        .persist(Store::Default)
+        .trajectories(if spec.trajectories { Store::Default } else { Store::Off })
+        .processes(spec.processes)
+        .sources(&spec.sources);
+    // No `sources`: none of the user's skills, memory, MCP servers or instructions from ~/.marv.
+    builder.options.config_dir = Some(spec.config_dir.clone());
+    builder.options.mcp_skip = spec.mcp_off.clone();
+    builder.options.host_commands = spec.host_commands;
+    builder
 }
 
 /// Sends a turn's events, then its usage.
@@ -539,7 +563,30 @@ mod tests {
             mcp_off: Vec::new(),
             manage_mcp: false,
             host_commands: false,
+            trajectories: true,
         }
+    }
+
+    /// #204: desktop chats write trajectories as the TUI and `marv -p` do, unless the config turns them off.
+    #[test]
+    fn the_session_writes_trajectories_as_the_config_says() {
+        let approver = || Arc::new(WebApprover::new(tokio::sync::mpsc::unbounded_channel().0));
+        let on = session_builder(&spec(), approver());
+        assert!(matches!(on.options.trajectories, Store::Default));
+        assert!(matches!(on.options.persist, Store::Default));
+        let off = session_builder(&ChatSpec { trajectories: false, ..spec() }, approver());
+        assert!(matches!(off.options.trajectories, Store::Off));
+
+        let dir = PathBuf::from(format!("/tmp/mx-web-traj-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(trajectories_on(&dir), "on by default, with no config file");
+        let store = marv_session::config::ConfigStore::new(&dir);
+        let config = marv_session::config::FileConfig { trajectories: Some(false), ..Default::default() };
+        store.save(&config).unwrap();
+        assert!(!trajectories_on(&dir));
+        store.save(&marv_session::config::FileConfig { trajectories: Some(true), ..config }).unwrap();
+        assert!(trajectories_on(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #159: the model id's prefix picks the provider, and each gets only its own credential.

@@ -73,3 +73,21 @@ test("settle leaves a transcript with nothing restored as it is", () => {
   const items = fold([], ask(1), done(1, "yes"));
   assert.equal(settle(items, []), items);
 });
+
+test("#201: approval_done withdrawn marks the card, and nothing answers it afterwards", () => {
+  const items = fold([], ask(20), done(20, "withdrawn"));
+  assert.deepEqual(cards(items), [{ id: 20, decision: "withdrawn", restored: undefined }]);
+  assert.equal(apply(items, done(20, "yes") as { type: string }), items);
+});
+
+test("#201: tool_progress shows on a running tool card, and tool_end replaces it", () => {
+  const start = { type: "tool_start", id: "c1", tool: "mesh_send", label: "peer.beta.agent.parent.inbox" };
+  const waiting = fold([], start, { type: "tool_progress", id: "c1", line: "waiting for beta to accept the wire" });
+  assert.equal(waiting.length, 1);
+  assert.deepEqual(waiting[0], { kind: "tool", id: "c1", tool: "mesh_send", label: "peer.beta.agent.parent.inbox", agent: undefined, done: false, summary: "waiting for beta to accept the wire" });
+  const ended = fold(waiting, { type: "tool_end", id: "c1", tool: "mesh_send", result: "sent", summary: "sent" });
+  assert.equal((ended[0] as { summary?: string | null }).summary, "sent");
+  // Late, or for a card that isn't there: nothing changes.
+  assert.equal(apply(ended, { type: "tool_progress", id: "c1", line: "late" } as { type: string }), ended);
+  assert.equal(apply(ended, { type: "tool_progress", id: "c9", line: "x" } as { type: string }), ended);
+});
