@@ -41,6 +41,26 @@ pub(crate) mod test_support {
         dir
     }
 
+    /// A folder that isn't a repository but holds others, as ~/Projects does (#203): `outer.txt`; `full/`, a
+    /// repository with a commit; `empty/`, one with no commit (what made `add -A` fail); `wt/`, a `.git` file that
+    /// leads nowhere; `a/b/deep/`, one with no commit further down; `a/b/f.txt`, a plain file beside it.
+    pub(crate) fn folder_of_repos() -> Temp {
+        let dir = temp("cp-repos");
+        let d = &dir.0;
+        write(d.join("outer.txt"), "outer\n");
+        write(d.join("a/b/f.txt"), "f\n");
+        for (repo, file) in [("full", "z.txt"), ("empty", "k.txt"), ("a/b/deep", "q.txt")] {
+            std::fs::create_dir_all(d.join(repo)).unwrap();
+            git(&d.join(repo), &["init", "-q", "-b", "main"]);
+            write(d.join(repo).join(file), "theirs\n");
+        }
+        git(&d.join("full"), &["add", "-A"]);
+        git(&d.join("full"), &["-c", "user.email=t@example.com", "-c", "user.name=T", "commit", "-q", "-m", "first"]);
+        write(d.join("wt/.git"), "gitdir: /nonexistent/marv-test\n");
+        write(d.join("wt/r.txt"), "theirs\n");
+        dir
+    }
+
     pub(crate) fn write(path: impl AsRef<Path>, content: impl AsRef<[u8]>) {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
