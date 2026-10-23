@@ -99,6 +99,10 @@ Each guard's doc comment says how it was proven: the guard was reverted, and the
 | `recall`: a recalled web result is fenced and taints again | `compaction.rs::a_recalled_page_keeps_its_provenance` | Proven |
 | `recall`: only the conversation's own pages; no id or path; none for a subagent | `compaction.rs::recall_reads_only_its_own_conversation` | Proven |
 | `recall`: the tool list is byte-stable across a page-out | `compaction.rs::the_tool_list_is_byte_stable_across_a_page_out` | Proven |
+| Saved pages: a symlinked swap folder is refused | `compaction.rs::a_symlinked_swap_folder_is_refused` | Proven |
+| Saved pages: never overwritten, numbered under the lock | `compaction.rs::pages_are_never_overwritten` | Proven (the lock removed; `next_page` from the table only) |
+| Saved pages: a path in the table is at most 200 characters | `compaction.rs::a_page_table_path_is_capped_at_200_characters` | Proven |
+| Saved pages: aged out, but never a live session's | `compaction.rs::saved_pages_age_out_but_never_a_live_sessions` | Proven (no hold; no cleanup) |
 | Subagents don't inherit network/web/mesh approvals | `provenance.rs::subagents_inherit_taint_but_no_egress_approvals` | Proven |
 | … the config's pre-approved scopes too (#98) | `approvals.rs::subagents_dont_inherit_config_scopes` | Proven |
 | Pre-approved scopes answer their own scopes (#98) | `approvals.rs::config_approve_answers_its_scopes_without_asking` | Proven (session level) |
