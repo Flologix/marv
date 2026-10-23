@@ -357,6 +357,8 @@ pub const MARV_RS_TEXT: &[(&str, &str)] = &[
         "Keep a checklist for a task of three or more steps, or when the user asks for several things. Write the plan before starting; mark an item in_progress before working on it and done as soon as it is; add items you discover and remove ones that turn out unnecessary. Send the whole list every time (it replaces the previous one). Skip it for a one-step task or a question.",
     ),
     (" start always needs command; a command that finishes on its own belongs in bash.", ""),
+    // `recall` (after Marv #63), last in the tool list the prompt names.
+    (", recall. Look at the actual code", ". Look at the actual code"),
     // The sandbox's empty `.git` named in a project without one (`marv_session::prompt::GIT_PLACEHOLDER`).
     (
         "\n\nThis folder has no .git of its own. Commands that run without asking, and background processes, may see an empty, read-only .git folder here: it's the sandbox's placeholder, not a broken or empty repository, and git still finds a repository in a parent folder if there is one. Don't report it as a problem. To create a repository here, run git init with git_write: true.",

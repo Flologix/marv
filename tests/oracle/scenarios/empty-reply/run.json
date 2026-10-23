@@ -1,4 +1,11 @@
 {
   "description": "An empty reply is retried as the same request, a second one gets a nudge, and the third reply answers.",
-  "prompt": "What does add() return?"
+  "prompt": "What does add() return?",
+  "prefix_resets": [
+    3
+  ],
+  "deliberate": {
+    "issue": 63,
+    "why": "marv-rs never sends two user messages in a row (#63 review: some upstreams refuse them): Marv's note after a reply that added nothing to the history is merged into the user's message before it instead of sent as a message of its own. That message was already sent, so the request after it starts the cache over (prefix_resets). Files, tool calls, events and the exit code are Marv's."
+  }
 }
