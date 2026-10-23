@@ -1,9 +1,11 @@
-# Release (issue #19): on a v* tag, static musl binaries for Linux x86_64 and aarch64, their SHA-256 sums and
-# install.sh, attached to a GitHub Release.
+# Release (issues #19, #167): on a v* tag, static musl binaries for Linux x86_64 and aarch64, native binaries for
+# macOS arm64 and x86_64, their SHA-256 sums and install.sh, attached to a GitHub Release.
 #
 # Assets (the names carry no version, so releases/latest/download/<asset> always names the newest):
 #   marv-x86_64-unknown-linux-musl.tar.gz   (+ .sha256)
 #   marv-aarch64-unknown-linux-musl.tar.gz  (+ .sha256)
+#   marv-x86_64-apple-darwin.tar.gz         (+ .sha256)
+#   marv-aarch64-apple-darwin.tar.gz        (+ .sha256)
 #   SHA256SUMS                              all of the above, which install.sh checks against
 #   install.sh
 #   flologixai-marv-*.tgz                   the npm packages (packaging/npm), published by hand
@@ -28,6 +30,7 @@ jobs:
       - run: packaging/test-install.sh
 
   build:
+    timeout-minutes: 30
     strategy:
       fail-fast: true
       matrix:
@@ -64,33 +67,64 @@ jobs:
           packaging/npm/test.sh target/${{ matrix.target }}/release/marv
       - name: Package
         run: packaging/package.sh ${{ matrix.target }} target/${{ matrix.target }}/release/marv dist
+      # bubblewrap for the sandboxed turn (the runners' AppArmor rule lifted, as in CI).
+      - name: Smoke test the asset
+        if: startsWith(matrix.target, 'x86_64')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          packaging/smoke.sh ${{ matrix.target }} dist
       - uses: actions/upload-artifact@v4
         with:
           name: marv-${{ matrix.target }}
           path: dist/*
           if-no-files-found: error
 
-  # macOS comes later (issue #19 leaves it out). Sketch: native runners, no zig needed; install.sh's
-  # detect_target then needs a Darwin case for these names.
-  #
-  # build-macos:
-  #   strategy:
-  #     matrix:
-  #       include:
-  #         - { target: aarch64-apple-darwin, runner: macos-14 }
-  #         - { target: x86_64-apple-darwin, runner: macos-13 }
-  #   runs-on: ${{ matrix.runner }}
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - uses: dtolnay/rust-toolchain@stable
-  #     - run: rustup target add ${{ matrix.target }}
-  #     - run: cargo build --release --locked -p marv-cli --target ${{ matrix.target }}
-  #     - run: packaging/package.sh ${{ matrix.target }} target/${{ matrix.target }}/release/marv dist  # needs gtar
-  #     - uses: actions/upload-artifact@v4
-  #       with: { name: "marv-${{ matrix.target }}", path: "dist/*" }
+  # macOS (#167): native runners, no zig; arm64 on Apple silicon, x86_64 on Intel, so each build is smoke-tested on
+  # its own CPU. Rust's linker signs the arm64 binary ad hoc, which is all macOS needs to run it (it's never
+  # quarantined: curl and npm don't set the flag).
+  build-macos:
+    timeout-minutes: 30
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin, runner: macos-14, arch: arm64 }
+          - { target: x86_64-apple-darwin, runner: macos-15-intel, arch: x86_64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked -p marv-cli --target ${{ matrix.target }}
+      - name: Check its CPU
+        run: |
+          bin=target/${{ matrix.target }}/release/marv
+          file "$bin"
+          [ "$(lipo -archs "$bin")" = "${{ matrix.arch }}" ]
+      - name: Package
+        run: packaging/package.sh ${{ matrix.target }} target/${{ matrix.target }}/release/marv dist
+      # In place of a release candidate tried by hand on a Mac: install.sh and npm from the packed asset, and a
+      # sandboxed `marv -p` turn (Seatbelt must refuse a write outside the project) with each. If it fails, the
+      # release job doesn't run.
+      - name: Smoke test
+        run: |
+          target/${{ matrix.target }}/release/marv --version
+          packaging/smoke.sh ${{ matrix.target }} dist
+          packaging/npm/test.sh target/${{ matrix.target }}/release/marv
+      - uses: actions/upload-artifact@v4
+        with:
+          name: marv-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
 
   release:
-    needs: [install-test, build]
+    needs: [install-test, build, build-macos]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -106,6 +140,9 @@ jobs:
         run: |
           cp install.sh dist/
           cd dist
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl x86_64-apple-darwin aarch64-apple-darwin; do
+            [ -f "marv-$target.tar.gz" ] || { echo "marv-$target.tar.gz is missing"; exit 1; }
+          done
           cat marv-*.tar.gz.sha256 > SHA256SUMS
           sha256sum -c SHA256SUMS
           cat SHA256SUMS

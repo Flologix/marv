@@ -66,7 +66,7 @@ export function ChatView({
   const cost = chat.items.reduce((sum, it) => sum + (it.kind === "turn" ? (it.usage?.cost ?? 0) : 0), 0);
   const last = [...chat.items].reverse().find((it) => it.kind === "turn" && it.usage);
   const usage = last?.kind === "turn" ? last.usage : undefined;
-  const asking = chat.items.some((it) => it.kind === "approval" && !it.decision);
+  const asking = chat.items.some((it) => it.kind === "approval" && !it.decision && !it.restored);
 
   function submit() {
     const text = input.trim();
@@ -235,7 +235,7 @@ function ItemView({ item, onAnswer }: { item: Item; onAnswer: (id: number, d: An
         </details>
       );
     case "approval":
-      return <Approval request={item.request} decision={item.decision} reason={item.reason} onAnswer={onAnswer} />;
+      return <Approval request={item.request} decision={item.decision} reason={item.reason} restored={item.restored} onAnswer={onAnswer} />;
     case "notice":
       return <p className={`notice ${item.tone}`}>{item.text}</p>;
     case "output":
@@ -258,21 +258,34 @@ function Approval({
   request: r,
   decision,
   reason,
+  restored,
   onAnswer,
 }: {
   request: ApprovalRequest;
   decision?: string;
   reason?: string;
+  /** From the saved transcript, not yet known to still wait: no buttons until the session says. */
+  restored?: boolean;
   onAnswer: (id: number, d: Answer) => void;
 }) {
   // #185: "Decline and say why" opens a one-line reason; the turn goes on with it. Only for a model's call
   // (`reason`): the engine says which.
   const [why, setWhy] = useState<string | null>(null);
-  if (decision) {
+  if (decision || restored) {
+    // "expired": the session that asked ended first (Marv restarted), so there's nothing left to answer.
+    const idle = !decision || decision === "expired";
     const no = decision === "no" || decision === "declined";
-    const word = no ? "declined" : decision === "always" ? "allowed for this chat" : "allowed";
+    const word = !decision
+      ? "waiting for Marv"
+      : decision === "expired"
+        ? "not answered (Marv restarted)"
+        : decision === "no" || decision === "declined"
+          ? "declined"
+          : decision === "always"
+            ? "allowed for this chat"
+            : "allowed";
     return (
-      <p className={`decided${no ? " no" : ""}`}>
+      <p className={`decided${idle ? " idle" : no ? " no" : ""}`}>
         {word} · <span>{r.command ?? r.label}</span>
         {reason && <span> · “{reason}”</span>}
       </p>

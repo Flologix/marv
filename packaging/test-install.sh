@@ -192,6 +192,23 @@ out=$(MARV_TARGET=riscv64-unknown-linux-musl "$install" --prefix "$prefix" 2>&1)
 check "a missing asset says what it tried" grep -q "couldn't download .*marv-riscv64-unknown-linux-musl.tar.gz" <<<"$out"
 end
 
+# --- the target from uname (a fake uname and sysctl on PATH; the asset it asks for names the target) ---
+begin targets
+fakes="$work/fakes"
+mkdir -p "$fakes"
+detected() { # detected <uname -s> <uname -m> [<sysctl hw.optional.arm64>]
+	printf '#!/bin/sh\ncase $1 in -s) echo %s ;; -m) echo %s ;; esac\n' "$1" "$2" >"$fakes/uname"
+	printf '#!/bin/sh\necho %s\n' "${3:-}" >"$fakes/sysctl"
+	chmod 755 "$fakes/uname" "$fakes/sysctl"
+	env -u MARV_TARGET PATH="$fakes:$PATH" "$install" --prefix "$prefix" 2>&1 | grep -o 'marv-[a-z0-9_-]*\.tar\.gz' | head -1 || true
+}
+check "Linux x86_64" test "$(detected Linux x86_64)" = marv-x86_64-unknown-linux-musl.tar.gz
+check "Linux aarch64" test "$(detected Linux aarch64)" = marv-aarch64-unknown-linux-musl.tar.gz
+check "macOS arm64" test "$(detected Darwin arm64)" = marv-aarch64-apple-darwin.tar.gz
+check "macOS Intel" test "$(detected Darwin x86_64 0)" = marv-x86_64-apple-darwin.tar.gz
+check "macOS under Rosetta gets arm64" test "$(detected Darwin x86_64 1)" = marv-aarch64-apple-darwin.tar.gz
+end
+
 # --- an OS without a build (#153): Windows shells point to WSL ---
 begin os
 fake_uname() { # a uname on PATH that says $1 for -s
@@ -204,12 +221,9 @@ for os in MINGW64_NT-10.0-22631 MSYS_NT-10.0 CYGWIN_NT-10.0; do
 	out=$(env -u MARV_TARGET PATH="$prefix/fake:$PATH" "$install" --prefix "$prefix" 2>&1) && fail "$os installed"
 	check "$os: use WSL" grep -q "use WSL.*wsl --install.*#requirements" <<<"$out"
 done
-fake_uname Darwin
-out=$(env -u MARV_TARGET PATH="$prefix/fake:$PATH" "$install" --prefix "$prefix" 2>&1) && fail "macOS installed"
-check "macOS: no build yet" grep -q "no macOS build yet" <<<"$out"
 fake_uname FreeBSD
 out=$(env -u MARV_TARGET PATH="$prefix/fake:$PATH" "$install" --prefix "$prefix" 2>&1) && fail "FreeBSD installed"
-check "another OS: Linux, or WSL" grep -q "no build for FreeBSD: Marv runs on Linux (on Windows, inside WSL" <<<"$out"
+check "another OS: Linux and macOS, or WSL" grep -q "no build for FreeBSD: Marv runs on Linux and macOS (on Windows, inside WSL" <<<"$out"
 check "nothing installed" test ! -e "$bin/marv"
 end
 
