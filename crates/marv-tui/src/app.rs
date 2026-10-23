@@ -2183,6 +2183,28 @@ mod tests {
         assert_eq!(h.app.prompt.value, "/help");
     }
 
+    // #214: a multi-line user message (a paste) selects and copies with its newlines.
+    #[test]
+    fn dragging_across_a_multi_line_user_message_copies_its_lines() {
+        let mut h = harness();
+        h.app.on_event(Event::Paste("first pasted line\nsecond pasted line\nthird one".into()), h.now);
+        h.key(ENTER);
+        h.events([UiEvent::Done(StopReason::End), turn_end()]);
+        let frame = h.frame();
+        let at = |text: &str| {
+            let (y, line) = frame.lines().enumerate().find(|(_, l)| l.contains(text)).unwrap_or_else(|| panic!("{text}:\n{frame}"));
+            (unicode_width::UnicodeWidthStr::width(&line[..line.find(text).unwrap()]) as u16, y as u16)
+        };
+        let (x0, y0) = at("first pasted line");
+        let (x1, y1) = at("third one");
+        h.app.on_mouse(MouseEvent::Press { x: x0, y: y0 }, h.now);
+        h.app.on_mouse(MouseEvent::Drag { x: x1 + 8, y: y1 }, h.now);
+        assert!(h.buffer()[(x0 + 3, y0 + 1)].modifier.contains(ratatui::style::Modifier::REVERSED));
+        h.app.on_mouse(MouseEvent::Release { x: x1 + 8, y: y1 }, h.now);
+        futures::executor::block_on(h.app.settle_copies(h.now));
+        assert_eq!(*h.copied.lock().unwrap(), ["first pasted line\n  second pasted line\n  third one"]);
+    }
+
     #[test]
     fn dragging_over_text_copies_it_and_says_so() {
         let mut h = harness();
