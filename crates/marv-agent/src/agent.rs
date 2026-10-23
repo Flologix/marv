@@ -1149,6 +1149,9 @@ impl LoopState {
         }
         match outcome {
             OverflowOutcome::Recovered if attempt < MAX_OVERFLOW_RECOVERIES => {
+                // NOTE for send-now (feat/send-now, not on main yet): the hook rewrote the history, so the loop's
+                // `sent_len` (how much of it a request already carried) must be reset here, before this step is sent
+                // again, or a "send now" message could join a user turn that was already sent.
                 self.overflows += 1;
                 let tool_choice = if wrap_up.is_some() { ToolChoice::None } else { ToolChoice::Auto };
                 // The rewritten history may have lost the step limit's note: the wrap-up asks for it again.
