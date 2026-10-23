@@ -1,15 +1,16 @@
 //! Saved sessions: every conversation is kept so it can be picked up again. Ports Marv's `src/sessions.ts`.
 //!
 //! `~/.marv/sessions/<project>/<id>.json`, 0600 (it holds your code and prompts), written atomically through
-//! [`write_private`]. A session holds both histories, kept separate as in the App: the transcript the user saw and the
+//! [`write_private_under`]. A session holds both histories, kept separate as in the App: the transcript the user saw and the
 //! conversation the model saw, plus the model and what it cost. Files are shape-checked on load: an old format or a
 //! hand edit is skipped like a damaged file, never a crash. Sessions under the old project key are still found, but
 //! only if their recorded `root` matches (the old key collided), and move on their next save.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use marv_core::ChatTurn;
-use marv_fs::{random_hex, write_private};
+use marv_fs::{random_hex, write_private, write_private_under};
 use marv_mcp::deferred::McpMode;
 use serde::{Deserialize, Serialize};
 
@@ -65,6 +66,15 @@ pub struct SavedSession {
     /// radio reports on them. Absent when there are none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub radio_requests: Option<Vec<marv_mesh::radio::OpenRequest>>,
+    /// marv-rs #202: saved while a turn ran (a turn is saved as it goes), so a Marv that quit mid-turn left it like
+    /// this: what cut it off ("Marv quit while `bash` waited for approval"). A resume marks the turn as cut off (a
+    /// notice, a note for the model) and clears it. Absent once the turn ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cut_off: Option<String>,
+    /// marv-rs #202: the process that saved `cut_off`; a resume while it's alive (another Marv still in that turn)
+    /// doesn't mark the turn. Absent without `cut_off`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
 }
 
 /// A saved session's checkpoint chain and its turns' reported paths (#16).
@@ -156,6 +166,8 @@ pub fn new_session(root: &Path, provider: &str, model: &str, now_ms: u64) -> Sav
         pending_note: None,
         taint: None,
         radio_requests: None,
+        cut_off: None,
+        pid: None,
     }
 }
 
@@ -190,11 +202,15 @@ pub fn time_ago(then: u64, now: u64) -> String {
 #[derive(Debug, Clone)]
 pub struct SessionStore {
     pub dir: PathBuf,
+    /// marv-rs #212: this store has saved once (making its folders as needed). From then on a save makes only the
+    /// project's folder, inside a store folder that still exists: a save that lands late (a session dropped without
+    /// `close()`, or its folders removed meanwhile) fails instead of making the tree again.
+    made: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl SessionStore {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into() }
+        Self { dir: dir.into(), made: Arc::default() }
     }
 
     fn folder(&self, root: &Path) -> PathBuf {
@@ -218,7 +234,14 @@ impl SessionStore {
         }
         let root = PathBuf::from(&session.root);
         let stamped = SavedSession { updated_at: crate::time::now_ms(), ..session.clone() };
-        write_private(&self.file(&root, &session.id), &serde_json::to_string(&stamped).map_err(std::io::Error::other)?).await?;
+        let text = serde_json::to_string(&stamped).map_err(std::io::Error::other)?;
+        let file = self.file(&root, &session.id);
+        if self.made.load(std::sync::atomic::Ordering::SeqCst) {
+            write_private_under(&self.dir, &file, &text).await?;
+        } else {
+            write_private(&file, &text).await?;
+            self.made.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         // Saved under the old key before: it lives in the new folder from now on.
         let _ = tokio::fs::remove_file(self.legacy_folder(&root).join(format!("{}.json", session.id))).await;
         Ok(())
@@ -303,6 +326,20 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(std::fs::metadata(store.file(root, &s.id)).unwrap().permissions().mode() & 0o777, 0o600);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // #212's CI: a save landing after the store's folder was removed fails and makes nothing again; another
+    // project's folder inside a store that's still there is made.
+    #[tokio::test]
+    async fn a_late_save_never_makes_the_store_again() {
+        let base = std::env::temp_dir().join(format!("marv-sessions-late-{}-{}", std::process::id(), random_hex()));
+        let store = SessionStore::new(base.join("store"));
+        store.save(&with_user(Path::new("/home/me/proj"), "hi", 1)).await.unwrap();
+        store.save(&with_user(Path::new("/home/me/other"), "hi", 2)).await.unwrap();
+        assert!(store.file(Path::new("/home/me/other"), "x").parent().unwrap().is_dir());
+        std::fs::remove_dir_all(&base).unwrap();
+        assert!(store.save(&with_user(Path::new("/home/me/proj"), "late", 3)).await.is_err());
+        assert!(!base.exists());
     }
 
     #[test]
