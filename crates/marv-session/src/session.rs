@@ -2859,6 +2859,11 @@ impl MarvSession {
                     }
                 };
                 let mut note = DROPPED_NOTE.to_string();
+                // What's left of a tainted conversation may still hold outside text that's no longer fenced (an older
+                // summary of it): Marv's fixed words say so, as a tainted summary's do.
+                if self.inner.taint.is_tainted() {
+                    note = format!("{}\n\n{note}", marv_agent::compact::TAINTED_DROP_NOTE);
+                }
                 if let Some(table) = table {
                     note = format!("{note}\n\n{table}");
                 }

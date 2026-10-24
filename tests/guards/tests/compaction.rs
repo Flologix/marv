@@ -93,8 +93,12 @@ fn structured() -> String {
 /// a v2 summary, an overflow recovery's summary or its level-3 drop is still tainted after it, in memory and in the
 /// saved session.
 ///
+/// The model is told so too, in Marv's fixed words: the summary's message starts with `TAINTED_SUMMARY_NOTE` (v1, v2,
+/// an overflow's summary), and a level-3 drop's note with `TAINTED_DROP_NOTE`.
+///
 /// Proven: added `self.inner.taint.restore(&[])` to `MarvSession::install` → failed (all four); saved `taint: None`
-/// in `snapshot` → failed (the saved file, then inferred from a conversation the summary replaced).
+/// in `snapshot` → failed (the saved file, then inferred from a conversation the summary replaced); passed `false`
+/// for the summary's taint, then dropped the drop note's → failed (the summaries, then the drop).
 #[tokio::test]
 async fn taint_survives_compaction() {
     let page = || use_tools(vec![tool_call("p1", "fetch_page", json!({}))]);
@@ -119,6 +123,12 @@ async fn taint_survives_compaction() {
             assert!(events.iter().any(|e| matches!(e, SessionEvent::Compaction(CompactResult::Compacted { .. }))), "{case}");
         }
         assert_eq!(s.tainted(), [Provenance::Web], "{case}: still tainted after compacting");
+        // And the model is told so in Marv's fixed words, wherever the compaction left a summary or a drop's note.
+        let told = s.conversation().iter().any(|t| {
+            matches!(t, ChatTurn::User { text } if text.contains(marv_agent::compact::TAINTED_SUMMARY_NOTE)
+                || text.contains(marv_agent::compact::TAINTED_DROP_NOTE))
+        });
+        assert!(told, "{case}: no fixed-words note in {:#?}", s.conversation());
         s.flush().await;
         let saved = store.load(&root.path().canonicalize().unwrap(), &s.id()).await.expect("saved");
         assert_eq!(saved.taint_sources(), [Provenance::Web], "{case}: still tainted when resumed");
