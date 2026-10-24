@@ -2015,9 +2015,8 @@ impl MarvSession {
         });
         // #63: a request too long for the window: make it fit (a summary of a cut-down history, or dropping the oldest
         // turns) and retry the step, instead of ending the turn with the provider's error.
-        // NOTE for send-now (feat/send-now, not on main yet): this rewrites the history under the loop like `on_full`,
-        // so whatever tracks how much of it was already sent (its `sent_len`) must be reset here too, as it is after a
-        // mid-turn compaction.
+        // This rewrites the history under the loop like `on_full`: the loop resets what it counts as already sent
+        // (`sent_len`, for "send now") on `Recovered`, as it does after a mid-turn compaction.
         options.on_overflow = Some({
             let (session, provider, factory, info, stop, emit) =
                 (self.clone(), provider.clone(), factory.clone(), info.clone(), stop.clone(), emit.clone());

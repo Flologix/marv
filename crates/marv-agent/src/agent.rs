@@ -1179,9 +1179,9 @@ impl LoopState {
         }
         match outcome {
             OverflowOutcome::Recovered if attempt < MAX_OVERFLOW_RECOVERIES => {
-                // NOTE for send-now (feat/send-now, not on main yet): the hook rewrote the history, so the loop's
-                // `sent_len` (how much of it a request already carried) must be reset here, before this step is sent
-                // again, or a "send now" message could join a user turn that was already sent.
+                // The hook rewrote the history (as a mid-turn compaction does): none of it was carried by a request
+                // that got through, so "send now" may join its last user turn until the resend below carries it.
+                self.sent_len = 0;
                 self.overflows += 1;
                 let tool_choice = if wrap_up.is_some() { ToolChoice::None } else { ToolChoice::Auto };
                 // The rewritten history may have lost the step limit's note: the wrap-up asks for it again.
@@ -4028,5 +4028,40 @@ mod tests {
         assert_eq!(provider.requests().len(), 1);
         assert_eq!(end(&events), Some(StopReason::End));
         assert_eq!(q.close(), ["and b"]);
+    }
+
+    #[tokio::test]
+    async fn sent_now_during_an_overflow_recovery_goes_in_once_and_requests_keep_alternating() {
+        let provider =
+            Arc::new(ScriptedProvider::new(vec![use_tools(&[call("c1", "a.ts")]), overflow(), say("Done."), say("And b.")]));
+        let h = history(vec![user("go")]);
+        let q = SendNow::new();
+        // The person types while the history is being made to fit.
+        let (hook, attempts) = on_overflow(&h, vec![OverflowOutcome::Recovered]);
+        let typed = q.clone();
+        let hook: OnOverflow = Arc::new(move |error, attempt| {
+            typed.push("and b".into()).unwrap();
+            hook(error, attempt)
+        });
+        let events = collect(AgentOptions {
+            on_overflow: Some(hook),
+            send_now: Some(q.clone()),
+            ..options(provider.clone(), &h, plain())
+        })
+        .await;
+        assert_eq!(*attempts.lock().unwrap(), [0]);
+        let requests = provider.requests();
+        // The resend is the fitted history as the hook left it: the message waits for the next boundary.
+        assert_eq!(requests[2].0, [user("fitted")]);
+        // Then it goes in once, as its own turn after the reply: never merged into "fitted", which the resend carried.
+        assert_eq!(requests[3].0, [user("fitted"), said("Done."), user("and b")]);
+        for (n, (sent, _)) in requests.iter().enumerate() {
+            let roles: Vec<bool> =
+                sent.iter().filter(|t| !matches!(t, ChatTurn::Tool { .. })).map(|t| matches!(t, ChatTurn::User { .. })).collect();
+            assert!(roles.windows(2).all(|w| !(w[0] && w[1])), "request {n}: {sent:?}");
+        }
+        assert_eq!(count(&events, |e| matches!(e, LoopEvent::SentNow { .. })), 1);
+        assert_eq!(end(&events), Some(StopReason::End));
+        assert!(q.close().is_empty());
     }
 }
