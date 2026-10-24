@@ -12,6 +12,13 @@
 //!   instead of the placeholder. Tab or → takes it into the line; typing anything drops it. Enter on the empty line
 //!   still sends nothing: a suggestion is only ever sent after the user took it and pressed Enter.
 //! - The user's own text is drawn as typed, but pasted text can carry escapes: `printable()` it too.
+//! - Pastes (marv-rs #214; bracketed paste, `render_options`). A paste never submits, and its newlines are kept.
+//!   One of several lines, or longer than [`PASTE_CHIP_CHARS`], shows as a chip, `[Pasted text #1, 4 lines]`
+//!   (Claude Code's `[Pasted text #1 +4 lines]`, kept simple): one placeholder char in `value` (from
+//!   [`CHIP_BASE`], a private-use plane nobody types; typed or pasted chars from that plane become U+FFFD) that
+//!   stands for its text in `pastes`. So ←/→ step over a chip, and Backspace/Delete remove it, as one char. The
+//!   submitted text has every chip replaced by what was pasted ([`PromptInput::text`]); ↑ brings a submission
+//!   back with its chips. A short one-line paste is typed in as before.
 //! - Editing is ink-text-input's: ←/→ move the cursor (also with ctrl held), Backspace deletes
 //!   before it; ctrl/alt + a letter types nothing (ctrl+o, ctrl+a). Home/End and Delete are extras.
 //!
@@ -32,6 +39,39 @@ use super::theme;
 use crate::view::CommandInfo;
 
 pub const PLACEHOLDER: &str = "Type a message, or / for commands";
+
+/// A one-line paste longer than this shows as a chip too. Long enough that a pasted login callback address (the
+/// App's `login_callback`) or a path stays plain text.
+pub const PASTE_CHIP_CHARS: usize = 1000;
+/// The first chip placeholder: Supplementary Private Use Area-B (plane 16). Nerd Fonts' icons live in the BMP's
+/// private area and plane 15, never here.
+pub const CHIP_BASE: u32 = 0x10_0000;
+const CHIP_LAST: u32 = 0x10_FFFD;
+
+fn is_chip(c: char) -> bool {
+    (CHIP_BASE..=CHIP_LAST).contains(&(c as u32))
+}
+
+/// Text from the user with any char that would read as a chip replaced.
+fn no_chips(text: &str) -> String {
+    text.chars().map(|c| if is_chip(c) { char::REPLACEMENT_CHARACTER } else { c }).collect()
+}
+
+/// What a chip shows: `[Pasted text #1, 4 lines]`, or the length for one long line.
+fn chip_label(number: usize, text: &str) -> String {
+    match text.lines().count() {
+        0 | 1 => format!("[Pasted text #{number}, {} chars]", text.chars().count()),
+        lines => format!("[Pasted text #{number}, {lines} lines]"),
+    }
+}
+
+/// A submission with chips, so ↑ can bring it back as it was typed.
+#[derive(Debug, Clone)]
+struct Recall {
+    text: String,
+    value: String,
+    pastes: Vec<String>,
+}
 
 /// Commands matching what's typed so far ("/se" → setup), prefix matches first. Once there's a space
 /// the user is typing arguments, and only argument completions match: entries whose name has words
@@ -78,14 +118,51 @@ pub struct PromptInput {
     /// The user typed, pasted or pressed Esc since the last turn ended ([`Self::expect_suggestion`]): a suggestion
     /// that arrives now is dropped, even if the line is empty again.
     pub suggestion_closed: bool,
+    /// What each chip in `value` stands for: chip `CHIP_BASE + i` is `pastes[i]`, shown as `#i+1`. Emptied with the
+    /// line ([`Self::set`]).
+    pastes: Vec<String>,
+    /// The last submission's chips (taken by [`Self::remember`]) and the history entries that had chips.
+    submitted: Option<Recall>,
+    recalls: Vec<Recall>,
 }
 
 impl PromptInput {
     /// Replaces the text from outside (history, Tab, the App clearing it): the cursor goes to the end.
     pub fn set(&mut self, value: impl Into<String>) {
-        self.value = value.into();
-        self.cursor = self.value.chars().count();
+        self.value = String::new();
+        self.pastes.clear();
+        self.cursor = 0;
         self.menu_index = 0;
+        let value = value.into();
+        // Text from outside with several lines (the palette's prefill never has any) is one chip, so the box stays
+        // one line high; otherwise it's typed in.
+        let value = no_chips(&value);
+        if value.contains('\n') { self.add_chip(value) } else { self.type_text(&value) }
+    }
+
+    /// The text with every chip replaced by what was pasted: what Enter submits.
+    pub fn text(&self) -> String {
+        self.expand(&self.value, &self.pastes)
+    }
+
+    fn expand(&self, value: &str, pastes: &[String]) -> String {
+        let mut out = String::with_capacity(value.len());
+        for c in value.chars() {
+            match pastes.get((c as u32).wrapping_sub(CHIP_BASE) as usize).filter(|_| is_chip(c)) {
+                Some(text) => out.push_str(text),
+                None => out.push(c),
+            }
+        }
+        out
+    }
+
+    /// Puts a chip for `text` at the cursor.
+    fn add_chip(&mut self, text: String) {
+        let Some(chip) = char::from_u32(CHIP_BASE + self.pastes.len() as u32).filter(|&c| is_chip(c)) else {
+            return self.type_text(&no_chips(&text));
+        };
+        self.pastes.push(text);
+        self.type_text(&chip.to_string());
     }
 
     /// Offers `text` as the next message, while the line is empty and the user hasn't typed, pasted or pressed Esc
@@ -113,8 +190,41 @@ impl PromptInput {
 
     /// Adds a submission to the history (not twice in a row), as the App does on submit.
     pub fn remember(&mut self, text: &str) {
+        if let Some(recall) = self.submitted.take().filter(|r| r.text.trim() == text) {
+            self.recalls.retain(|r| r.text.trim() != text);
+            self.recalls.push(recall);
+        }
         if self.history.last().map(String::as_str) != Some(text) {
             self.history.push(text.to_string());
+        }
+        // At most one per distinct history entry (deduped above); never more entries than the history has.
+        let extra = self.recalls.len().saturating_sub(self.history.len());
+        self.recalls.drain(..extra);
+    }
+
+    /// Forgets the last submission's chips without remembering it: a login callback holds an authorization code,
+    /// and nothing of it is kept.
+    pub fn forget_submission(&mut self) {
+        self.submitted = None;
+    }
+
+    /// Whether the last submission's chips are still held (tests: a login callback never is).
+    #[cfg(test)]
+    pub(crate) fn holds_submission(&self) -> bool {
+        self.submitted.is_some()
+    }
+
+    /// Puts history entry `i` back in the line, with its chips if it had any.
+    fn recall(&mut self, i: usize) {
+        let text = self.history[i].clone();
+        match self.recalls.iter().rev().find(|r| r.text.trim() == text).cloned() {
+            Some(recall) => {
+                self.set("");
+                self.value = recall.value;
+                self.pastes = recall.pastes;
+                self.cursor = self.value.chars().count();
+            }
+            None => self.set(text),
         }
     }
 
@@ -188,13 +298,18 @@ impl PromptInput {
                 self.history_index = None;
                 self.dismissed_at = None;
                 // With the menu open, Enter runs the highlighted command ("/se" → "/setup").
-                let text = highlighted.map_or_else(|| self.value.clone(), |c| format!("/{}", c.name));
+                let text = highlighted.map_or_else(|| self.text(), |c| format!("/{}", c.name));
+                self.submitted = (highlighted.is_none() && !self.pastes.is_empty()).then(|| Recall {
+                    text: text.clone(),
+                    value: self.value.clone(),
+                    pastes: self.pastes.clone(),
+                });
                 return Some(PromptOutcome::Submit(text));
             }
             KeyCode::Up if !self.history.is_empty() => {
                 let next = self.history_index.map_or(self.history.len() - 1, |i| i.saturating_sub(1));
                 self.history_index = Some(next);
-                self.set(self.history[next].clone());
+                self.recall(next);
             }
             KeyCode::Down => {
                 if let Some(i) = self.history_index {
@@ -203,7 +318,7 @@ impl PromptInput {
                         self.set("");
                     } else {
                         self.history_index = Some(i + 1);
-                        self.set(self.history[i + 1].clone());
+                        self.recall(i + 1);
                     }
                 }
             }
@@ -222,19 +337,26 @@ impl PromptInput {
                 self.value.remove(at);
                 self.menu_index = 0;
             }
-            KeyCode::Char(c) if !ctrl_or_alt => self.type_text(&c.to_string()),
+            KeyCode::Char(c) if !ctrl_or_alt => self.type_text(&no_chips(&c.to_string())),
             _ => {}
         }
         None
     }
 
-    /// Pasted text (bracketed paste): typed in one go, newlines kept as spaces so a paste can't submit.
+    /// Pasted text (bracketed paste): never submits. Several lines, or a long line, go in as a chip with the
+    /// newlines kept (CRLF and CR read as LF); a short line is typed in (without a trailing newline).
     pub fn paste(&mut self, text: &str) {
-        let text: String = text.chars().map(|c| if c == '\n' || c == '\r' { ' ' } else { c }).collect();
-        self.type_text(&text);
-        if !text.is_empty() {
-            self.close_suggestion();
+        let text = no_chips(&text.replace("\r\n", "\n").replace('\r', "\n"));
+        if text.is_empty() {
+            return;
         }
+        let line = text.trim_end_matches('\n');
+        if line.contains('\n') || line.chars().count() > PASTE_CHIP_CHARS {
+            self.add_chip(text);
+        } else {
+            self.type_text(line);
+        }
+        self.close_suggestion();
     }
 
     /// The text rows inside the box: `> ` then the text, wrapped by cell with a hanging indent,
@@ -258,23 +380,44 @@ impl PromptInput {
         let width = inner_width.saturating_sub(2).max(1) as usize;
         let mut rows: Vec<Vec<Span<'static>>> = vec![Vec::new()];
         let mut used = 0;
-        let clean: Vec<String> = self.value.chars().map(|c| printable(&c.to_string())).collect();
+        let chip_style = Style::new().fg(theme::DIM);
+        // Each char of the value as the cells it shows (a chip as its label) and their style.
+        let clean: Vec<(Vec<String>, Style)> = self
+            .value
+            .chars()
+            .map(|c| match self.pastes.get((c as u32).wrapping_sub(CHIP_BASE) as usize).filter(|_| is_chip(c)) {
+                Some(text) => {
+                    let number = (c as u32 - CHIP_BASE) as usize + 1;
+                    (chip_label(number, text).chars().map(String::from).collect(), chip_style)
+                }
+                None => (vec![printable(&c.to_string())], Style::new()),
+            })
+            .collect();
         for i in 0..=clean.len() {
-            let (text, w) = match clean.get(i) {
-                Some(t) => (t.clone(), t.width()),
-                None => (" ".to_string(), 1), // the cursor past the end
+            let (cells, style) = match clean.get(i) {
+                Some((cells, style)) => (cells.clone(), *style),
+                None => (vec![" ".to_string()], Style::new()), // the cursor past the end
             };
-            if w == 0 && i != self.cursor {
-                continue;
-            }
-            let (text, w) = if w == 0 { (" ".to_string(), 1) } else { (text, w) };
-            if used + w > width {
+            let style = if i == self.cursor { style.patch(cursor_style) } else { style };
+            // A chip that fits on a row isn't split across two.
+            let total: usize = cells.iter().map(|c| c.width()).sum();
+            if cells.len() > 1 && used > 0 && used + total > width && total <= width {
                 rows.push(Vec::new());
                 used = 0;
             }
-            let style = if i == self.cursor { cursor_style } else { Style::new() };
-            rows.last_mut().expect("never empty").push(Span::styled(text, style));
-            used += w;
+            for text in cells {
+                let w = text.width();
+                if w == 0 && i != self.cursor {
+                    continue;
+                }
+                let (text, w) = if w == 0 { (" ".to_string(), 1) } else { (text, w) };
+                if used + w > width {
+                    rows.push(Vec::new());
+                    used = 0;
+                }
+                rows.last_mut().expect("never empty").push(Span::styled(text, style));
+                used += w;
+            }
         }
         rows.into_iter()
             .enumerate()
@@ -633,8 +776,119 @@ mod tests {
     #[test]
     fn pasted_escapes_are_not_drawn() {
         let mut h = Harness::new(&[]);
-        h.prompt.paste("hi\x1b[2Jthere\nnext");
-        assert_eq!(h.prompt.value, "hi\x1b[2Jthere next");
+        h.prompt.paste("hi\x1b[2Jthere next\n");
+        assert_eq!(h.prompt.value, "hi\x1b[2Jthere next", "a short line goes in as typed, its newline dropped");
         assert!(h.frame().contains("> hi[2Jthere next"));
+    }
+
+    // #214: a multi-line paste keeps its newlines, shows as one chip, and never submits.
+    #[test]
+    fn a_multi_line_paste_is_a_chip_and_enter_sends_the_whole_text() {
+        let mut h = Harness::new(&[]);
+        h.typed("look at ");
+        h.prompt.paste("line 1\r\nline 2\rline 3\nline 4\n");
+        assert!(h.submitted.is_empty(), "a paste never submits");
+        assert_eq!(h.prompt.value.chars().count(), "look at ".len() + 1, "the chip is one char");
+        assert!(h.frame().contains("> look at [Pasted text #1, 4 lines]"), "{}", h.frame());
+        assert_eq!(h.prompt.text(), "look at line 1\nline 2\nline 3\nline 4\n");
+        h.typed(" please");
+        h.press(&[KeyCode::Enter]);
+        assert_eq!(h.submitted, ["look at line 1\nline 2\nline 3\nline 4\n please"]);
+    }
+
+    #[test]
+    fn a_long_line_is_a_chip_and_a_short_one_isnt() {
+        let mut h = Harness::new(&[]);
+        let long = "y".repeat(PASTE_CHIP_CHARS + 1);
+        h.prompt.paste(&long);
+        assert!(h.frame().contains(&format!("[Pasted text #1, {} chars]", PASTE_CHIP_CHARS + 1)), "{}", h.frame());
+        assert_eq!(h.prompt.text(), long);
+        h.prompt.set("");
+        h.prompt.paste("http://127.0.0.1:5555/callback?code=c&state=s");
+        assert_eq!(h.prompt.value, "http://127.0.0.1:5555/callback?code=c&state=s");
+    }
+
+    #[test]
+    fn the_cursor_backspace_and_delete_treat_a_chip_as_one_unit() {
+        let mut h = Harness::new(&[]);
+        h.typed("a");
+        h.prompt.paste("one\ntwo");
+        h.typed("b");
+        h.press(&[KeyCode::Left, KeyCode::Left]); // over b, then over the whole chip
+        h.typed("<");
+        assert_eq!(h.prompt.text(), "a<one\ntwob");
+        h.press(&[KeyCode::Delete]); // the chip after the cursor, at once
+        assert_eq!(h.prompt.text(), "a<b");
+        h.prompt.paste("three\nfour");
+        assert_eq!(h.prompt.text(), "a<three\nfourb");
+        h.press(&[KeyCode::Backspace]); // the chip before the cursor
+        assert_eq!(h.prompt.text(), "a<b");
+        assert!(!h.frame().contains("Pasted"), "{}", h.frame());
+    }
+
+    #[test]
+    fn several_chips_are_numbered_and_each_expands_to_its_own_text() {
+        let mut h = Harness::new(&[]);
+        h.prompt.paste("a\nb");
+        h.typed(" and ");
+        h.prompt.paste("c\nd\ne");
+        let frame = h.frame();
+        assert!(frame.contains("> [Pasted text #1, 2 lines] and"), "{frame}");
+        assert!(frame.contains("│   [Pasted text #2, 3 lines]"), "a chip isn't split across rows: {frame}");
+        h.press(&[KeyCode::Enter]);
+        assert_eq!(h.submitted, ["a\nb and c\nd\ne"]);
+        // An emptied line starts counting again.
+        h.prompt.paste("f\ng");
+        assert!(h.frame().contains("[Pasted text #1, 2 lines]"), "{}", h.frame());
+    }
+
+    #[test]
+    fn up_brings_a_submission_back_with_its_chips() {
+        let mut h = Harness::new(&[]);
+        h.typed("see ");
+        h.prompt.paste("x\ny");
+        let Some(PromptOutcome::Submit(text)) = h.prompt.on_key(KeyEvent::from(KeyCode::Enter), false, &h.commands) else {
+            panic!("no submit")
+        };
+        // As the App does: clear, then remember the trimmed text.
+        h.prompt.set("");
+        h.prompt.remember(text.trim());
+        h.prompt.remember("plain");
+        h.press(&[KeyCode::Up, KeyCode::Up]);
+        assert!(h.frame().contains("> see [Pasted text #1, 2 lines]"), "{}", h.frame());
+        assert_eq!(h.prompt.text(), "see x\ny");
+        h.press(&[KeyCode::Down]);
+        assert_eq!(h.prompt.text(), "plain");
+        // Multi-line text with no chips recorded (set from outside) is one chip, not raw newlines in the box.
+        h.prompt.set("p\nq");
+        assert!(h.frame().contains("> [Pasted text #1, 2 lines]"), "{}", h.frame());
+        assert_eq!(h.prompt.text(), "p\nq");
+    }
+
+    #[test]
+    fn typed_or_pasted_chip_placeholders_are_not_chips() {
+        let mut h = Harness::new(&[]);
+        let fake = char::from_u32(CHIP_BASE).unwrap();
+        h.prompt.paste(&format!("a{fake}"));
+        h.key(KeyCode::Char(fake), KeyModifiers::NONE);
+        assert_eq!(h.prompt.text(), "a\u{FFFD}\u{FFFD}");
+        // Multi-line text set from outside too.
+        h.prompt.set(format!("x{fake}\ny"));
+        assert_eq!(h.prompt.text(), "x\u{FFFD}\ny");
+    }
+
+    #[test]
+    fn recalled_chips_are_kept_once_per_history_entry() {
+        let mut h = Harness::new(&[]);
+        for _ in 0..3 {
+            for text in ["a\nb", "c\nd"] {
+                h.prompt.paste(text);
+                h.press(&[KeyCode::Enter]);
+                let last = h.submitted.last().unwrap().clone();
+                h.prompt.remember(last.trim());
+            }
+        }
+        assert_eq!(h.prompt.recalls.len(), 2);
+        assert!(h.prompt.recalls.len() <= h.prompt.history.len());
     }
 }
