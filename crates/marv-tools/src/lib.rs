@@ -21,6 +21,7 @@ pub mod edit_match;
 pub mod file_lock;
 pub mod file_versions;
 pub mod files;
+pub mod floor;
 pub mod formatter;
 pub mod github;
 pub mod glob;
@@ -39,17 +40,19 @@ pub mod schema_repair;
 pub mod skill;
 pub mod swap;
 pub mod syntax;
+pub mod table;
 pub mod types;
 pub mod web;
 pub mod web_fetch;
 pub mod write_file;
 
 pub use file_versions::FileVersions;
+pub use floor::{CallMode, Floor, MAIN_AGENT_ONLY, approval_floor, offered_in_mode};
 pub use formatter::{FormatOutcome, Formatter, FormatterSetting, ProjectFormatter};
 pub use marv_core::MAX_DECLINE_REASON;
 pub use registry::{
-    DECLINED, INTERRUPTED, ToolOutcome, ToolRef, builtin_tools, declined_because, is_parallel_call, run_tool, schema_repaired,
-    tool_specs, tool_specs_for,
+    DECLINED, INTERRUPTED, REMOVED_TOOLS, Tombstone, ToolOutcome, ToolRef, builtin_tools, declined_because, is_parallel_call,
+    run_tool, schema_repaired, tool_specs, tool_specs_for, unknown_tool,
 };
 pub use schema_repair::RepairMode;
 pub use types::{

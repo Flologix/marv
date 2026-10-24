@@ -2921,7 +2921,10 @@ dependencies = [
  "marv-session",
  "marv-tools",
  "nix 0.31.3",
+ "proc-macro2",
+ "quote",
  "serde_json",
+ "syn 2.0.119",
  "tokio",
  "tokio-util",
 ]

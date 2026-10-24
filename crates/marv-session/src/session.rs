@@ -1894,7 +1894,7 @@ impl MarvSession {
 
         // #124: a turn the radio started runs with automatic approval off (§8.4): its approvals are asked once each,
         // say why, and are never answered from the session's remembered "always" (nor are its subagents'); yolo and an
-        // approved URL prefix don't apply (`no_auto_approval` below). Its hop was set before its first read, above.
+        // approved URL prefix don't apply (`ctx.mode` below: `CallMode::Radio`). Its hop was set before its first read, above.
         // #74: so does any turn the person didn't start, a mesh wake (#78) too: another agent's message is never a
         // reason to approve anything automatically.
         // #124, phase 3: so does a turn that handles a radio request, the person's own included (a deliberate step past
@@ -1951,7 +1951,18 @@ impl MarvSession {
         ctx.cancel = stop.clone();
         ctx.approver = approve.clone();
         ctx.yolo = yolo && !unattended;
-        ctx.no_auto_approval = unattended;
+        // Who started the turn, as one value (`marv_tools::floor`): a radio turn or one handling radio requests, a
+        // wake, `marv -p`, or the person.
+        ctx.mode = if radio_turn || handles_requests {
+            marv_tools::CallMode::Radio
+        } else if woken.is_woken() {
+            marv_tools::CallMode::Woken
+        } else if init.one_shot {
+            marv_tools::CallMode::Headless
+        } else {
+            marv_tools::CallMode::Person
+        };
+        debug_assert_eq!(ctx.mode.auto_approval(), !unattended);
         ctx.skills = self.inner.skills.clone();
         ctx.memory = init.memory.as_ref().map(|(paths, _)| paths.for_tools());
         // The session's id now (a resume changes it): its cut outputs are saved, and readable, there (#61).

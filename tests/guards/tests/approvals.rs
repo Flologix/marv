@@ -174,7 +174,7 @@ async fn an_escalated_retry_is_asked_in_a_turn_without_automatic_approval_and_in
     run_tool(&bash, &ctx, builtin_tools()).await; // the first failure, no network: auto_safe in yolo
     std::fs::remove_file(project.path().join("ran")).unwrap();
     // The retry comes in a woken turn.
-    ctx.no_auto_approval = true;
+    ctx.mode = marv_tools::CallMode::Radio;
     let out = run_tool(&bash, &ctx, builtin_tools()).await;
     let asked = approver.requests();
     assert_eq!(asked.len(), 1, "{asked:?}");

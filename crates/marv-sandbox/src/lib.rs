@@ -160,6 +160,11 @@ pub struct Sandbox {
     /// Marv's config folder (`$MARV_CONFIG_DIR` from the real environment, else `~/.marv`): hidden in every sandbox,
     /// wherever it is (`SandboxOptions::config_dir`).
     pub config_dir: Option<PathBuf>,
+    /// For tables and goldens only (`marv_tools::table`, the guards): [`Sandbox::active`] answers as if this
+    /// platform's backend worked here, so what they print doesn't depend on the machine. The session never sets it;
+    /// a command still can't start without the backend.
+    #[doc(hidden)]
+    pub assume_backend: bool,
 }
 
 /// One command's mounts beyond the session's: see [`SandboxOptions`] for what each means.
@@ -187,6 +192,7 @@ impl Sandbox {
             hidden: runtime_paths(&runtime_env()),
             writable: Vec::new(),
             config_dir: Some(config_dir(std::env::var_os("MARV_CONFIG_DIR"), std::env::current_dir().ok().as_deref(), &home)),
+            assume_backend: false,
         }
     }
 
@@ -197,7 +203,7 @@ impl Sandbox {
 
     /// Whether commands really run sandboxed: on, and the backend works here.
     pub fn active(&self) -> bool {
-        self.enabled && self.backend().available()
+        self.enabled && (self.assume_backend || self.backend().available())
     }
 
     /// `inner` in the project, sandboxed by the backend: spawn [`SandboxCommand::to_command`] (only the backend's

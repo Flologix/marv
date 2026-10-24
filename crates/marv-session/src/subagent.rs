@@ -105,7 +105,7 @@ pub fn subagent_context(
     ctx.formatter = parent.formatter.clone();
     ctx.yolo = parent.yolo;
     // A turn the radio started (#124) has no automatic approval, and neither have its subagents.
-    ctx.no_auto_approval = parent.no_auto_approval;
+    ctx.mode = parent.mode.subagent();
     ctx.skills = parent.skills.clone();
     ctx.taint = Arc::new(parent.taint.for_subagent());
     // Its sandboxed bash reaches the session's background processes like the main agent's (curl localhost:<port>);
@@ -379,6 +379,7 @@ async fn drive(
         .filter(|t| {
             let name = t.name();
             SUBAGENT_TOOLS.contains(&name)
+                && marv_tools::offered_in_mode(name, ctx.mode.subagent())
                 && agent_type.tools.iter().any(|n| n == name)
                 && (name != "skill" || has_skills)
                 && (name != "github" || ctx.doors.github)
@@ -995,10 +996,15 @@ mod run_tests {
         let ctx = ctx_with(host, &Asker::yes(), &f.root.0);
         let out = run(agent_call(serde_json::json!({"type": "nope", "description": "x", "prompt": "p"}), "a1"), &ctx).await;
         assert!(out.result.output.contains("no agent type \"nope\". Available: general-purpose"), "{}", out.result.output);
-        // A subagent's context has no host.
+        // No nesting: handed the full list, run_tool refuses agent in a subagent's context (main agent only)...
         let sub = subagent_context(&ctx, "general-purpose · x", None, None);
         let out = run(agent_call(serde_json::json!({"description": "x", "prompt": "p"}), "a1"), &sub).await;
-        assert!(out.result.output.contains("Subagents aren't available here."));
+        assert!(out.result.output.starts_with("Unknown tool \"agent\""), "{}", out.result.output);
+        // ...and the tool refuses by itself too: a subagent's context has no host.
+        let input: marv_tools::agent::AgentInput =
+            serde_json::from_value(serde_json::json!({"description": "x", "prompt": "p"})).unwrap();
+        let own = marv_tools::Tool::run(&marv_tools::agent::Agent, &input, &sub).await;
+        assert!(own.is_err_and(|e| e.0.contains("Subagents aren't available here.")));
     }
 
     #[tokio::test]

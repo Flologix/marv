@@ -191,6 +191,13 @@ Each guard's doc comment says how it was proven: the guard was reverted, and the
 | File changes: every spelling of a file (`~/…` included) is one lock | `stale_writes.rs::a_home_spelling_of_a_file_waits_for_the_same_lock` | Proven |
 | Images: any image taints | `images.rs::an_image_taints` | Proven |
 | Images: sources, quarantined reader, sandboxed decoding | `images.rs::*` | Ignored: needs vision |
+| `docs/TOOLS.md` is generated from the tools' code and current | `tools.rs::tools_md_matches_the_code` | Proven (`Glob::kind` changed to `Write`) |
+| The built-in specs' bytes (names, order, descriptions, schemas) change only on purpose | `tools.rs::builtin_specs_match_the_golden` | Proven (a word added to `glob`'s description) |
+| A session's tool list keeps the specs' order | `tools.rs::every_tool_list_keeps_the_specs_order` | Holds by construction (`tool_specs_for` filters) |
+| A tool name is never reused; a removed tool has a tombstone | `tools.rs::a_removed_tool_keeps_its_name_and_tombstone` | Proven (two reverts: `memory` removed without a tombstone; a `glob` tombstone) |
+| Who started a turn (the person, headless, a mesh wake, the radio, and a subagent of each of those four) changes approvals only as it did | `tools.rs::approvals_per_turn_match_the_golden` (`golden/approvals.txt`: every example call × 8 kinds of turn, clean and tainted, yolo off and on (left on in every kind of turn, so the mode alone gates it), with the sandbox on and every door open and with it off, through `run_tool` with each tool's effects stubbed) | Proven (`\|\| ctx.no_auto_approval` dropped from `once`; `ctx.mode.auto_approval() &&` dropped from the yolo check) |
+| The floor (`approval_floor`, `docs/TOOLS.md`'s per-mode columns) is what `run_tool` decides | `tools.rs::the_floor_matches_todays_answers_per_mode` | Proven (`approval_floor` answering `Asks` for every-time calls) |
+| Only `run_tool` runs a tool: no other non-test code calls a tool's `run`, `preview` or `approve_itself` | `tools.rs::only_run_tool_runs_a_tool` (the product's code under `crates/` parsed with syn, without `#[cfg(test)]` items and modules, `#[test]` functions and each crate's `tests/`: method calls of that name and arity, paths to one (`Tool::run`, `<T as Tool>::run`, an alias, a function pointer), a rename of the trait, `.run(…)`/`Type::run` in macro tokens; allowed: `run_tool`'s body, the blanket `impl DynTool for T`, and four named calls that run no tool, each of which must still match) | Proven (five kinds of call added to `table.rs`, each reported) |
 
 ## Notes
 

@@ -1432,7 +1432,7 @@ async fn an_approved_url_prefix_still_asks_in_a_turn_the_radio_started() {
     ctx.taint.approve_prefix("http://203.0.113.7/docs/");
     ctx.approver = Some(person.clone());
     ctx.yolo = false;
-    ctx.no_auto_approval = true;
+    ctx.mode = marv_tools::CallMode::Radio;
     let fetch = marv_guards::call("web_fetch", json!({"url": "http://203.0.113.7/docs/b"}));
     let ran = tokio::time::timeout(Duration::from_secs(10), marv_tools::run_tool(&fetch, &ctx, marv_tools::builtin_tools()))
         .await

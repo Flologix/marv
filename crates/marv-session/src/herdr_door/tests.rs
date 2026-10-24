@@ -144,7 +144,7 @@ async fn light_actions_ask_with_the_door_and_may_be_remembered_except_in_a_turn_
         assert!(log.contains(&line.to_string()), "{line}: {log:?}");
     }
     // A woken turn: asked once, so no "always" answers it.
-    let woken = ToolContext { no_auto_approval: true, ..r.ctx.clone() };
+    let woken = ToolContext { mode: marv_tools::CallMode::Woken, ..r.ctx.clone() };
     run_tool(&call(json!({"action": "focus", "target": "w1"})), &woken, &r.tools).await;
     assert!(r.approver.asked().last().unwrap().once);
 }
@@ -216,7 +216,7 @@ async fn a_spawned_marv_gets_no_yolo_unless_its_parent_has_it_and_its_task_after
     // A parent in yolo starts its worker in yolo (the config's setting), and nothing more.
     let yolo = ToolContext { yolo: true, ..r.ctx.clone() };
     assert_eq!(marv_command(Path::new("/opt/marv/bin/marv"), &yolo), "/opt/marv/bin/marv");
-    let woken = ToolContext { no_auto_approval: true, ..yolo };
+    let woken = ToolContext { mode: marv_tools::CallMode::Woken, ..yolo };
     assert_eq!(marv_command(Path::new("/opt/marv/bin/marv"), &woken), "MARV_YOLO=off /opt/marv/bin/marv");
     assert_eq!(r.peers.list()[0].name, "fixer");
 }

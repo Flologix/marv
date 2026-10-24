@@ -1,0 +1,508 @@
+# What run_tool decides for each example call (marv_tools::table::examples), by the kind of turn.
+# Columns: clean, clean + yolo, tainted, tainted + yolo. `-` not offered, `runs` without asking, `yolo` ran by
+# yolo, `ask` asked (an "always" can answer), `once` asked every time, `must` a person must answer.
+# Written by UPDATE_GOLDEN=1 cargo test -p marv-guards --test tools
+
+## sandbox on, every door open
+
+read_file {"path":"src/main.rs"}
+  person                runs      runs      runs      runs
+  headless              runs      runs      runs      runs
+  woken                 runs      runs      runs      runs
+  radio                 runs      runs      runs      runs
+  subagent              runs      runs      runs      runs
+  subagent of headless  runs      runs      runs      runs
+  subagent of woken     runs      runs      runs      runs
+  subagent of radio     runs      runs      runs      runs
+
+glob {"pattern":"**/*.rs"}
+  person                runs      runs      runs      runs
+  headless              runs      runs      runs      runs
+  woken                 runs      runs      runs      runs
+  radio                 runs      runs      runs      runs
+  subagent              runs      runs      runs      runs
+  subagent of headless  runs      runs      runs      runs
+  subagent of woken     runs      runs      runs      runs
+  subagent of radio     runs      runs      runs      runs
+
+grep {"pattern":"fn main"}
+  person                runs      runs      runs      runs
+  headless              runs      runs      runs      runs
+  woken                 runs      runs      runs      runs
+  radio                 runs      runs      runs      runs
+  subagent              runs      runs      runs      runs
+  subagent of headless  runs      runs      runs      runs
+  subagent of woken     runs      runs      runs      runs
+  subagent of radio     runs      runs      runs      runs
+
+web_fetch {"url":"https://example.com/"}
+  person                ask       ask       must      must
+  headless              ask       ask       must      must
+  woken                 once      once      must once must once
+  radio                 once      once      must once must once
+  subagent              ask       ask       must      must
+  subagent of headless  ask       ask       must      must
+  subagent of woken     once      once      must once must once
+  subagent of radio     once      once      must once must once
+
+web_fetch {"offset":2000,"url":"https://example.com/"}
+  person                ask       ask       must      must
+  headless              ask       ask       must      must
+  woken                 once      once      must once must once
+  radio                 once      once      must once must once
+  subagent              ask       ask       must      must
+  subagent of headless  ask       ask       must      must
+  subagent of woken     once      once      must once must once
+  subagent of radio     once      once      must once must once
+
+github {"args":["issue","list"]}
+  person                runs      runs      must      must
+  headless              runs      runs      must      must
+  woken                 runs      runs      must once must once
+  radio                 runs      runs      must once must once
+  subagent              runs      runs      must      must
+  subagent of headless  runs      runs      must      must
+  subagent of woken     runs      runs      must once must once
+  subagent of radio     runs      runs      must once must once
+
+github {"args":["api","repos/o/r/actions/secrets"]}
+  person                once      once      must once must once
+  headless              once      once      must once must once
+  woken                 once      once      must once must once
+  radio                 once      once      must once must once
+  subagent              once      once      must once must once
+  subagent of headless  once      once      must once must once
+  subagent of woken     once      once      must once must once
+  subagent of radio     once      once      must once must once
+
+github {"args":["issue","comment","1","--body","done"]}
+  person                ask       ask       must      must
+  headless              ask       ask       must      must
+  woken                 once      once      must once must once
+  radio                 once      once      must once must once
+  subagent              ask       ask       must      must
+  subagent of headless  ask       ask       must      must
+  subagent of woken     once      once      must once must once
+  subagent of radio     once      once      must once must once
+
+skill {"name":"release"}
+  person                runs      runs      runs      runs
+  headless              runs      runs      runs      runs
+  woken                 runs      runs      runs      runs
+  radio                 runs      runs      runs      runs
+  subagent              runs      runs      runs      runs
+  subagent of headless  runs      runs      runs      runs
+  subagent of woken     runs      runs      runs      runs
+  subagent of radio     runs      runs      runs      runs
+
+edit_file {"new_string":"b","old_string":"a","path":"src/main.rs"}
+  person                ask       yolo      ask       yolo
+  headless              ask       yolo      ask       yolo
+  woken                 once      once      once      once
+  radio                 once      once      once      once
+  subagent              ask       yolo      ask       yolo
+  subagent of headless  ask       yolo      ask       yolo
+  subagent of woken     once      once      once      once
+  subagent of radio     once      once      once      once
+
+write_file {"content":"hi","path":"notes.txt"}
+  person                ask       yolo      ask       yolo
+  headless              ask       yolo      ask       yolo
+  woken                 once      once      once      once
+  radio                 once      once      once      once
+  subagent              ask       yolo      ask       yolo
+  subagent of headless  ask       yolo      ask       yolo
+  subagent of woken     once      once      once      once
+  subagent of radio     once      once      once      once
+
+write_file {"content":"true","path":".git/hooks/pre-commit"}
+  person                must      must      must      must
+  headless              must      must      must      must
+  woken                 must once must once must once must once
+  radio                 must once must once must once must once
+  subagent              must      must      must      must
+  subagent of headless  must      must      must      must
+  subagent of woken     must once must once must once must once
+  subagent of radio     must once must once must once must once
+
+bash {"command":"cargo test"}
+  person                ask       yolo      ask       yolo
+  headless              ask       yolo      ask       yolo
+  woken                 once      once      once      once
+  radio                 once      once      once      once
+  subagent              ask       yolo      ask       yolo
+  subagent of headless  ask       yolo      ask       yolo
+  subagent of woken     once      once      once      once
+  subagent of radio     once      once      once      once
+
+bash {"command":"cargo fetch","network":true}
+  person                ask       ask       must      must
+  headless              ask       ask       must      must
+  woken                 once      once      must once must once
+  radio                 once      once      must once must once
+  subagent              ask       ask       must      must
+  subagent of headless  ask       ask       must      must
+  subagent of woken     once      once      must once must once
+  subagent of radio     once      once      must once must once
+
+bash {"command":"git commit -m x","git_write":true}
+  person                ask       ask       ask       ask
+  headless              ask       ask       ask       ask
+  woken                 once      once      once      once
+  radio                 once      once      once      once
+  subagent              ask       ask       ask       ask
+  subagent of headless  ask       ask       ask       ask
+  subagent of woken     once      once      once      once
+  subagent of radio     once      once      once      once
+
+bash {"command":"ls ~","sandbox":false}
+  person                once      once      must once must once
+  headless              once      once      must once must once
+  woken                 once      once      must once must once
+  radio                 once      once      must once must once
+  subagent              once      once      must once must once
+  subagent of headless  once      once      must once must once
+  subagent of woken     once      once      must once must once
+  subagent of radio     once      once      must once must once
+
+process {"action":"start","command":"npm run dev"}
+  person                ask       ask       ask       ask
+  headless              ask       ask       ask       ask
+  woken                 once      once      once      once
+  radio                 once      once      once      once
+  subagent              -         -         -         -
+  subagent of headless  -         -         -         -
+  subagent of woken     -         -         -         -
+  subagent of radio     -         -         -         -
+
+process {"action":"start","command":"npm run dev","network":true}
+  person                ask       ask       must      must
+  headless              ask       ask       must      must
+  woken                 once      once      must once must once
+  radio                 once      once      must once must once
+  subagent              -         -         -         -
+  subagent of headless  -         -         -         -
+  subagent of woken     -         -         -         -
+  subagent of radio     -         -         -         -
+
+process {"action":"list"}
+  person                runs      runs      runs      runs
+  headless              runs      runs      runs      runs
+  woken                 runs      runs      runs      runs
+  radio                 runs      runs      runs      runs
+  subagent              -         -         -         -
+  subagent of headless  -         -         -         -
+  subagent of woken     -         -         -         -
+  subagent of radio     -         -         -         -
+
+memory {"action":"add","scope":"project","text":"Tests run with cargo nextest."}
+  person                ask       ask       must once must once
+  headless              ask       ask       must once must once
+  woken                 once      once      must once must once
+  radio                 once      once      must once must once
+  subagent              -         -         -         -
+  subagent of headless  -         -         -         -
+  subagent of woken     -         -         -         -
+  subagent of radio     -         -         -         -
+
+memory {"action":"remove","scope":"project","text":"nextest"}
+  person                ask       ask       ask       ask
+  headless              ask       ask       ask       ask
+  woken                 once      once      once      once
+  radio                 once      once      once      once
+  subagent              -         -         -         -
+  subagent of headless  -         -         -         -
+  subagent of woken     -         -         -         -
+  subagent of radio     -         -         -         -
+
+plan {"items":[{"status":"in_progress","text":"Write the test"}]}
+  person                runs      runs      runs      runs
+  headless              runs      runs      runs      runs
+  woken                 runs      runs      runs      runs
+  radio                 runs      runs      runs      runs
+  subagent              -         -         -         -
+  subagent of headless  -         -         -         -
+  subagent of woken     -         -         -         -
+  subagent of radio     -         -         -         -
+
+agent {"description":"find the bug","prompt":"Find it."}
+  person                runs      runs      runs      runs
+  headless              runs      runs      runs      runs
+  woken                 runs      runs      runs      runs
+  radio                 runs      runs      runs      runs
+  subagent              -         -         -         -
+  subagent of headless  -         -         -         -
+  subagent of woken     -         -         -         -
+  subagent of radio     -         -         -         -
+
+agent {"description":"fix the bug","isolation":"worktree","prompt":"Fix it."}
+  person                ask       yolo      ask       yolo
+  headless              ask       yolo      ask       yolo
+  woken                 once      once      once      once
+  radio                 once      once      once      once
+  subagent              -         -         -         -
+  subagent of headless  -         -         -         -
+  subagent of woken     -         -         -         -
+  subagent of radio     -         -         -         -
+
+recall {"page":1}
+  person                runs      runs      runs      runs
+  headless              runs      runs      runs      runs
+  woken                 runs      runs      runs      runs
+  radio                 runs      runs      runs      runs
+  subagent              -         -         -         -
+  subagent of headless  -         -         -         -
+  subagent of woken     -         -         -         -
+  subagent of radio     -         -         -         -
+
+## sandbox off, no doors
+
+read_file {"path":"src/main.rs"}
+  person                runs      runs      runs      runs
+  headless              runs      runs      runs      runs
+  woken                 runs      runs      runs      runs
+  radio                 runs      runs      runs      runs
+  subagent              runs      runs      runs      runs
+  subagent of headless  runs      runs      runs      runs
+  subagent of woken     runs      runs      runs      runs
+  subagent of radio     runs      runs      runs      runs
+
+glob {"pattern":"**/*.rs"}
+  person                runs      runs      runs      runs
+  headless              runs      runs      runs      runs
+  woken                 runs      runs      runs      runs
+  radio                 runs      runs      runs      runs
+  subagent              runs      runs      runs      runs
+  subagent of headless  runs      runs      runs      runs
+  subagent of woken     runs      runs      runs      runs
+  subagent of radio     runs      runs      runs      runs
+
+grep {"pattern":"fn main"}
+  person                runs      runs      runs      runs
+  headless              runs      runs      runs      runs
+  woken                 runs      runs      runs      runs
+  radio                 runs      runs      runs      runs
+  subagent              runs      runs      runs      runs
+  subagent of headless  runs      runs      runs      runs
+  subagent of woken     runs      runs      runs      runs
+  subagent of radio     runs      runs      runs      runs
+
+web_fetch {"url":"https://example.com/"}
+  person                ask       ask       must      must
+  headless              ask       ask       must      must
+  woken                 once      once      must once must once
+  radio                 once      once      must once must once
+  subagent              ask       ask       must      must
+  subagent of headless  ask       ask       must      must
+  subagent of woken     once      once      must once must once
+  subagent of radio     once      once      must once must once
+
+web_fetch {"offset":2000,"url":"https://example.com/"}
+  person                ask       ask       must      must
+  headless              ask       ask       must      must
+  woken                 once      once      must once must once
+  radio                 once      once      must once must once
+  subagent              ask       ask       must      must
+  subagent of headless  ask       ask       must      must
+  subagent of woken     once      once      must once must once
+  subagent of radio     once      once      must once must once
+
+github {"args":["issue","list"]}
+  person                runs      runs      must      must
+  headless              runs      runs      must      must
+  woken                 runs      runs      must once must once
+  radio                 runs      runs      must once must once
+  subagent              runs      runs      must      must
+  subagent of headless  runs      runs      must      must
+  subagent of woken     runs      runs      must once must once
+  subagent of radio     runs      runs      must once must once
+
+github {"args":["api","repos/o/r/actions/secrets"]}
+  person                once      once      must once must once
+  headless              once      once      must once must once
+  woken                 once      once      must once must once
+  radio                 once      once      must once must once
+  subagent              once      once      must once must once
+  subagent of headless  once      once      must once must once
+  subagent of woken     once      once      must once must once
+  subagent of radio     once      once      must once must once
+
+github {"args":["issue","comment","1","--body","done"]}
+  person                ask       ask       must      must
+  headless              ask       ask       must      must
+  woken                 once      once      must once must once
+  radio                 once      once      must once must once
+  subagent              ask       ask       must      must
+  subagent of headless  ask       ask       must      must
+  subagent of woken     once      once      must once must once
+  subagent of radio     once      once      must once must once
+
+skill {"name":"release"}
+  person                runs      runs      runs      runs
+  headless              runs      runs      runs      runs
+  woken                 runs      runs      runs      runs
+  radio                 runs      runs      runs      runs
+  subagent              runs      runs      runs      runs
+  subagent of headless  runs      runs      runs      runs
+  subagent of woken     runs      runs      runs      runs
+  subagent of radio     runs      runs      runs      runs
+
+edit_file {"new_string":"b","old_string":"a","path":"src/main.rs"}
+  person                ask       yolo      ask       yolo
+  headless              ask       yolo      ask       yolo
+  woken                 once      once      once      once
+  radio                 once      once      once      once
+  subagent              ask       yolo      ask       yolo
+  subagent of headless  ask       yolo      ask       yolo
+  subagent of woken     once      once      once      once
+  subagent of radio     once      once      once      once
+
+write_file {"content":"hi","path":"notes.txt"}
+  person                ask       yolo      ask       yolo
+  headless              ask       yolo      ask       yolo
+  woken                 once      once      once      once
+  radio                 once      once      once      once
+  subagent              ask       yolo      ask       yolo
+  subagent of headless  ask       yolo      ask       yolo
+  subagent of woken     once      once      once      once
+  subagent of radio     once      once      once      once
+
+write_file {"content":"true","path":".git/hooks/pre-commit"}
+  person                must      must      must      must
+  headless              must      must      must      must
+  woken                 must once must once must once must once
+  radio                 must once must once must once must once
+  subagent              must      must      must      must
+  subagent of headless  must      must      must      must
+  subagent of woken     must once must once must once must once
+  subagent of radio     must once must once must once must once
+
+bash {"command":"cargo test"}
+  person                ask       ask       must      must
+  headless              ask       ask       must      must
+  woken                 once      once      must once must once
+  radio                 once      once      must once must once
+  subagent              ask       ask       must      must
+  subagent of headless  ask       ask       must      must
+  subagent of woken     once      once      must once must once
+  subagent of radio     once      once      must once must once
+
+bash {"command":"cargo fetch","network":true}
+  person                ask       ask       must      must
+  headless              ask       ask       must      must
+  woken                 once      once      must once must once
+  radio                 once      once      must once must once
+  subagent              ask       ask       must      must
+  subagent of headless  ask       ask       must      must
+  subagent of woken     once      once      must once must once
+  subagent of radio     once      once      must once must once
+
+bash {"command":"git commit -m x","git_write":true}
+  person                ask       ask       must      must
+  headless              ask       ask       must      must
+  woken                 once      once      must once must once
+  radio                 once      once      must once must once
+  subagent              ask       ask       must      must
+  subagent of headless  ask       ask       must      must
+  subagent of woken     once      once      must once must once
+  subagent of radio     once      once      must once must once
+
+bash {"command":"ls ~","sandbox":false}
+  person                ask       ask       must      must
+  headless              ask       ask       must      must
+  woken                 once      once      must once must once
+  radio                 once      once      must once must once
+  subagent              ask       ask       must      must
+  subagent of headless  ask       ask       must      must
+  subagent of woken     once      once      must once must once
+  subagent of radio     once      once      must once must once
+
+process {"action":"start","command":"npm run dev"}
+  person                ask       ask       ask       ask
+  headless              ask       ask       ask       ask
+  woken                 once      once      once      once
+  radio                 once      once      once      once
+  subagent              -         -         -         -
+  subagent of headless  -         -         -         -
+  subagent of woken     -         -         -         -
+  subagent of radio     -         -         -         -
+
+process {"action":"start","command":"npm run dev","network":true}
+  person                ask       ask       must      must
+  headless              ask       ask       must      must
+  woken                 once      once      must once must once
+  radio                 once      once      must once must once
+  subagent              -         -         -         -
+  subagent of headless  -         -         -         -
+  subagent of woken     -         -         -         -
+  subagent of radio     -         -         -         -
+
+process {"action":"list"}
+  person                runs      runs      runs      runs
+  headless              runs      runs      runs      runs
+  woken                 runs      runs      runs      runs
+  radio                 runs      runs      runs      runs
+  subagent              -         -         -         -
+  subagent of headless  -         -         -         -
+  subagent of woken     -         -         -         -
+  subagent of radio     -         -         -         -
+
+memory {"action":"add","scope":"project","text":"Tests run with cargo nextest."}
+  person                ask       ask       must once must once
+  headless              ask       ask       must once must once
+  woken                 once      once      must once must once
+  radio                 once      once      must once must once
+  subagent              -         -         -         -
+  subagent of headless  -         -         -         -
+  subagent of woken     -         -         -         -
+  subagent of radio     -         -         -         -
+
+memory {"action":"remove","scope":"project","text":"nextest"}
+  person                ask       ask       ask       ask
+  headless              ask       ask       ask       ask
+  woken                 once      once      once      once
+  radio                 once      once      once      once
+  subagent              -         -         -         -
+  subagent of headless  -         -         -         -
+  subagent of woken     -         -         -         -
+  subagent of radio     -         -         -         -
+
+plan {"items":[{"status":"in_progress","text":"Write the test"}]}
+  person                runs      runs      runs      runs
+  headless              runs      runs      runs      runs
+  woken                 runs      runs      runs      runs
+  radio                 runs      runs      runs      runs
+  subagent              -         -         -         -
+  subagent of headless  -         -         -         -
+  subagent of woken     -         -         -         -
+  subagent of radio     -         -         -         -
+
+agent {"description":"find the bug","prompt":"Find it."}
+  person                runs      runs      runs      runs
+  headless              runs      runs      runs      runs
+  woken                 runs      runs      runs      runs
+  radio                 runs      runs      runs      runs
+  subagent              -         -         -         -
+  subagent of headless  -         -         -         -
+  subagent of woken     -         -         -         -
+  subagent of radio     -         -         -         -
+
+agent {"description":"fix the bug","isolation":"worktree","prompt":"Fix it."}
+  person                ask       ask       ask       ask
+  headless              ask       ask       ask       ask
+  woken                 once      once      once      once
+  radio                 once      once      once      once
+  subagent              -         -         -         -
+  subagent of headless  -         -         -         -
+  subagent of woken     -         -         -         -
+  subagent of radio     -         -         -         -
+
+recall {"page":1}
+  person                runs      runs      runs      runs
+  headless              runs      runs      runs      runs
+  woken                 runs      runs      runs      runs
+  radio                 runs      runs      runs      runs
+  subagent              -         -         -         -
+  subagent of headless  -         -         -         -
+  subagent of woken     -         -         -         -
+  subagent of radio     -         -         -         -

@@ -9,7 +9,8 @@
 //!   session has it (#47) (`tool_specs_for`).
 //! - `run_tool` never fails: bad JSON, invalid input and `ToolError`s become error results the model can recover from.
 //!   `available` is what this agent was offered (a subagent gets fewer tools); anything else is unknown, even if the
-//!   model names it.
+//!   model names it. marv-rs: a removed built-in tool's name answers with its tombstone ([`REMOVED_TOOLS`]), not the
+//!   list; names are never reused, and the built-in specs' bytes are a golden (`tests/guards/tests/tools.rs`).
 //! - Flow: parse JSON (else `repair_json_args`) → schema-guided repair (#65, [`schema_repaired`]) → the tool's
 //!   `repair` → validate → label → if gated: preview (a
 //!   `ToolError` fails the call before anyone is asked) → aborted? interrupted → the tool's own prompt
@@ -32,6 +33,7 @@ use std::sync::{Arc, OnceLock};
 use marv_core::{Provenance, ToolCall, ToolKind, ToolSpec};
 use serde_json::Value;
 
+use crate::floor::{Floor, approval_floor, asked_every_time};
 use crate::repair::{repair_json_args, with_note};
 use crate::schema_repair::{RepairMode, repair_args, repair_note};
 use crate::types::{Approval, ApprovalRequest, Decision, DynTool, ToolContext, ToolOutput};
@@ -107,6 +109,33 @@ pub fn tool_specs_for(has_skills: bool, plan: bool, github: bool) -> Vec<ToolSpe
         .collect()
 }
 
+/// A built-in tool that was removed (marv-rs). Its name is never given to another tool (a saved session's calls of
+/// it would then mean something else), and a call to it, from a session saved before it went, gets
+/// [`unknown_tool`]'s "was removed" answer instead of the list of available tools, which invites the model to retry
+/// under another name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tombstone {
+    pub name: &'static str,
+    /// The Marv version that no longer has it, e.g. "0.9.0".
+    pub removed_in: &'static str,
+}
+
+/// Every built-in tool removed so far. Never take one out: the guard `tests/guards/tests/tools.rs` checks every name
+/// Marv ever offered is either a built-in tool or here, and that none here is offered again.
+pub const REMOVED_TOOLS: &[Tombstone] = &[];
+
+/// What the model reads for a call of a tool it wasn't offered: a removed tool's tombstone, else the tools it has.
+pub fn unknown_tool(name: &str, available: &[ToolRef], removed: &[Tombstone]) -> String {
+    if let Some(gone) = removed.iter().find(|t| t.name == name) {
+        return format!(
+            "The tool \"{name}\" was removed in Marv {}, and nothing replaces it under that name. Don't call it again.",
+            gone.removed_in
+        );
+    }
+    let names: Vec<&str> = available.iter().map(|t| t.name()).collect();
+    format!("Unknown tool \"{name}\". Available tools: {}.", names.join(", "))
+}
+
 /// A finished call: the result and the transcript label.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolOutcome {
@@ -148,8 +177,7 @@ pub fn home_file_write(kind: ToolKind, scope_key: &str, ctx: &ToolContext) -> bo
 pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef]) -> ToolOutcome {
     let fail = |output: String, label: &str| ToolOutcome { result: ToolOutput::error(output), label: label.to_string() };
     let Some(tool) = available.iter().find(|t| t.name() == call.name) else {
-        let names: Vec<&str> = available.iter().map(|t| t.name()).collect();
-        return fail(format!("Unknown tool \"{}\". Available tools: {}.", call.name, names.join(", ")), &call.name);
+        return fail(unknown_tool(&call.name, available, REMOVED_TOOLS), &call.name);
     };
 
     let args = if call.arguments.is_empty() { "{}" } else { call.arguments.as_str() };
@@ -216,17 +244,26 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
         noted(ToolOutcome { result, label: label.clone() })
     };
 
+    // What the call asks starts at its floor (`floor.rs`: `approval_floor`, `asked_every_time`); the checks below only
+    // raise it. A tool this mode isn't offered (the floor's `Refused`: a main-agent tool in a subagent's context) is
+    // unknown here, whatever list it came in: the list is the session's, this is the second check. Asked by name, so
+    // the tool's `needs_approval` runs once, below, as before.
+    if !crate::floor::offered_in_mode(tool.name(), ctx.mode) {
+        let offered: Vec<ToolRef> =
+            available.iter().filter(|t| crate::floor::offered_in_mode(t.name(), ctx.mode)).cloned().collect();
+        return noted(fail(unknown_tool(&call.name, &offered, REMOVED_TOOLS), &call.name));
+    }
     let network = tool.uses_network(input, ctx);
     let protected = tool.protected_target(input, ctx);
     // A web request under a URL prefix the user approved after the taint (docs/SECURITY.md) runs as approved.
     let egress_url = tool.egress_url(input).filter(|_| ctx.taint.is_tainted());
     // Not in a turn without automatic approval (#124): that prefix is a remembered answer too.
-    let prefix_approved = !ctx.no_auto_approval && egress_url.as_deref().is_some_and(|url| ctx.taint.prefix_approved(url));
+    let prefix_approved = ctx.mode.auto_approval() && egress_url.as_deref().is_some_and(|url| ctx.taint.prefix_approved(url));
     // A write that later conversations load as the person's own (memory), once outside text is in this one: a person
     // answers it every time.
     let tainted_sink = ctx.taint.is_tainted() && tool.persists(input, ctx);
     let must_ask = protected.is_some() || tainted_sink || (ctx.taint.must_ask(tool.kind(), network) && !prefix_approved);
-    let gated = must_ask || (!prefix_approved && tool.needs_approval(input).unwrap_or(tool.kind() != ToolKind::Read));
+    let gated = must_ask || (!prefix_approved && approval_floor(tool.as_ref(), input, ctx) != Floor::NeverAsks);
     let interrupted = |approval: Approval| {
         let mut result = ToolOutput::ok(INTERRUPTED, "interrupted");
         result.declined = true;
@@ -279,9 +316,9 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
             let home_write = home_file_write(tool.kind(), &scope.key, ctx);
             // A turn without automatic approval (#124, a turn the radio started) asks every call `once`: no
             // remembered "always" and no worktree subagent's automatic yes answers it.
-            let once = tool.once(input, ctx) || home_write || ctx.no_auto_approval || tainted_sink;
+            let once = asked_every_time(tool.as_ref(), input, ctx) || home_write || tainted_sink;
             // Yolo: a call the tool vouches for runs without asking, confined (bash then can't touch .git).
-            if ctx.yolo && !ctx.no_auto_approval && !must_ask && !home_write && tool.auto_safe(input, ctx) {
+            if ctx.yolo && ctx.mode.auto_approval() && !must_ask && !home_write && tool.auto_safe(input, ctx) {
                 if !checkpointed().await {
                     return interrupted(Approval::Interrupted);
                 }
@@ -461,6 +498,18 @@ mod tests {
         assert!(run_tool(&call("{not json"), &ctx(), &t).await.result.output.contains("not valid JSON"));
         let invalid = run_tool(&call(r#"{"text": 1}"#), &ctx(), &t).await;
         assert!(invalid.result.is_error && invalid.result.output.starts_with("Invalid input for echo:"));
+    }
+
+    /// A removed tool's name answers with its tombstone, never the list (which invites a retry under another name).
+    #[test]
+    fn a_removed_tool_answers_with_its_tombstone() {
+        let t = tools(ToolKind::Read, false);
+        let removed = [Tombstone { name: "todo", removed_in: "0.9.0" }];
+        assert_eq!(
+            unknown_tool("todo", &t, &removed),
+            "The tool \"todo\" was removed in Marv 0.9.0, and nothing replaces it under that name. Don't call it again."
+        );
+        assert_eq!(unknown_tool("nope", &t, &removed), "Unknown tool \"nope\". Available tools: echo.");
     }
 
     #[tokio::test]
@@ -647,7 +696,7 @@ mod tests {
     #[tokio::test]
     async fn without_automatic_approval_yolo_asks_once() {
         let approver = Arc::new(Answer(Decision::Yes, Mutex::new(vec![])));
-        let off = ToolContext { yolo: true, no_auto_approval: true, approver: Some(approver.clone()), ..ctx() };
+        let off = ToolContext { yolo: true, mode: crate::CallMode::Woken, approver: Some(approver.clone()), ..ctx() };
         let asked = run_tool(&call(r#"{"text": "x"}"#), &off, &tools(ToolKind::Write, true)).await;
         assert_eq!(asked.result.output, "x", "approved by the person, not confined by yolo");
         assert_eq!(asked.result.approval, Some(Approval::Decided(Decision::Yes)));
