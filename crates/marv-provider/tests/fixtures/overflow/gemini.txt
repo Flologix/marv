@@ -1,0 +1,2 @@
+OpenRouter returned 400.
+Provider returned error: Google: {"error":{"code":400,"message":"The input token count (1196032) exceeds the maximum number of tokens allowed (1048576).","status":"INVALID_ARGUMENT"}}

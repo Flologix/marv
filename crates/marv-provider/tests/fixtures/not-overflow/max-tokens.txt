@@ -1,0 +1,2 @@
+OpenRouter returned 400.
+max_tokens exceeds the remaining context

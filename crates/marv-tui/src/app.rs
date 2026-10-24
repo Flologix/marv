@@ -311,6 +311,8 @@ pub struct App {
     flush_at: Option<Instant>,
     tools_running: usize,
     agents_running: usize,
+    /// "Send now" messages sent into the running turn and not in it yet (the status bar counts them).
+    sending: usize,
     /// The plan tool's list (#15), pinned above the prompt while it has something left to do.
     plan: Option<Vec<PlanItem>>,
     waiting_for: Option<String>,
@@ -403,6 +405,7 @@ impl App {
             flush_at: None,
             tools_running: 0,
             agents_running: 0,
+            sending: 0,
             plan: None,
             waiting_for: None,
             compacting: false,
@@ -831,6 +834,15 @@ impl App {
                     self.dirty = true;
                 }
             }
+            // "Send now" messages the turn never read: back into the prompt, ahead of anything typed since, to send
+            // (or change) with Enter. Never sent on their own.
+            UiEvent::NotSent { texts } => {
+                self.sending = 0;
+                // Each message on its own line, as sent (the prompt shows the breaks, and Enter sends them), ahead of
+                // anything typed since, its paste chips kept.
+                self.prompt.give_back(&texts.join("\n"));
+                self.system("✻ Not sent: the turn ended before its next step. Your message is back in the prompt.");
+            }
             // A request outside a turn (the suggestion's) still counts.
             UiEvent::Usage { last, totals } if self.turn.is_none() => {
                 self.last_usage = Some(last);
@@ -949,6 +961,15 @@ impl App {
                 self.add_message(message(Role::Assistant, text));
                 t.reply.clear();
                 self.streaming = Some(String::new());
+            }
+            // "Send now": the person's message is in the turn now, after the step's reply and results.
+            UiEvent::SentNow { text } => {
+                self.turn = Some(t);
+                self.flush();
+                t = self.turn.take().expect("put back above");
+                self.sending = self.sending.saturating_sub(1);
+                self.add_message(message(Role::User, text));
+                t.step_started = now;
             }
             UiEvent::ToolStart { call_id, name, label } => {
                 self.turn = Some(t);
@@ -1108,6 +1129,7 @@ impl App {
         self.compacting = false;
         self.tools_running = 0;
         self.agents_running = 0;
+        self.sending = 0;
         self.dirty = true;
     }
 
@@ -1173,8 +1195,13 @@ impl App {
                 }),
                 _ => self.system_error(format!("Couldn't compact the conversation: {error}")),
             },
-            CompactOutcome::Compacted { summary, tokens_before } => {
+            CompactOutcome::Compacted { summary, tokens_before, overflow } => {
                 let why = match (automatic, tokens_before, self.status.context_length) {
+                    // #63: the request was refused as too long; level 3 dropped the oldest messages.
+                    _ if overflow == Some(3) => {
+                        " (the last request was too long for the model's window, so the oldest messages were dropped)".into()
+                    }
+                    _ if overflow.is_some() => " (the last request was too long for the model's window)".into(),
                     (true, Some(used), Some(context)) if used > 0 && context > 0 => {
                         format!(" (the context was {}% full)", (200 * used + context) / (2 * context))
                     }
@@ -1185,7 +1212,7 @@ impl App {
                         format!(
                             ": {} → about {} tokens",
                             status_bar::tokens(used),
-                            status_bar::tokens((summary.chars().count() as u64 + 2) / 4)
+                            status_bar::tokens(marv_core::estimate_tokens(&summary))
                         )
                     }
                     _ => String::new(),
@@ -1393,8 +1420,10 @@ impl App {
             }
         } else if !matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
             let busy = self.busy();
-            if let Some(PromptOutcome::Submit(text)) = self.prompt.on_key(key, busy, &self.commands) {
-                self.submit(&text, now);
+            match self.prompt.on_key(key, busy, &self.commands) {
+                Some(PromptOutcome::Submit(text)) => self.submit(&text, now),
+                Some(PromptOutcome::SendNow(text)) => self.send_now(&text, now),
+                None => {}
             }
         }
     }
@@ -1435,7 +1464,7 @@ impl App {
                 self.palette = None;
                 // What was typed stays reachable with ↑, unless it's a login callback: it holds an authorization
                 // code and never goes in the history.
-                let typed = self.prompt.value.trim().to_string();
+                let typed = self.prompt.text().trim().to_string();
                 if !typed.is_empty() && typed != text.trim() && !self.port.is_login_callback(&typed) {
                     self.prompt.remember(&typed);
                 }
@@ -1455,6 +1484,7 @@ impl App {
         // prompt history or the saved transcript. Even during a turn.
         if self.port.login_callback(text) {
             self.prompt.set("");
+            self.prompt.forget_submission();
             return;
         }
         if self.busy() {
@@ -1475,6 +1505,31 @@ impl App {
             self.start_turn(now);
             self.port.send(text);
         }
+    }
+
+    /// Alt+Enter: while a turn runs, the message goes into it at its next step ("send now"); it joins the transcript
+    /// when it does ([`UiEvent::SentNow`]). Idle, or a command, or a subagent's view open: as Enter.
+    fn send_now(&mut self, raw: &str, now: Instant) {
+        let text = raw.trim();
+        if !self.busy()
+            || self.turn.is_none()
+            || text.starts_with('/')
+            || self.viewing.is_some()
+            || self.port.is_login_callback(text)
+        {
+            return self.submit(raw, now);
+        }
+        if text.is_empty() {
+            return;
+        }
+        let text = text.to_string();
+        self.prompt.set("");
+        self.scroll.follow();
+        self.prompt.remember(&text);
+        self.prompt.history_index = None;
+        self.sending += 1;
+        self.dirty = true;
+        self.port.send_now(text);
     }
 
     /// An approval listing files (/undo) is up: PgUp/PgDn and the wheel scroll the list, not the transcript.
@@ -1662,6 +1717,7 @@ impl App {
             busy,
             agents: self.agents_running,
             viewing: self.viewing.is_some(),
+            sending: self.sending,
         };
         if strip_height == 1 {
             let flashing =
@@ -1875,6 +1931,7 @@ mod tests {
         CompleteSetup(SetupAnswer),
         Resume(Option<String>),
         LoginCallback(String),
+        SendNow(String),
     }
 
     #[derive(Default)]
@@ -1911,6 +1968,9 @@ mod tests {
         }
         fn send(&self, text: String) {
             self.calls.lock().unwrap().push(Call::Send(text));
+        }
+        fn send_now(&self, text: String) {
+            self.calls.lock().unwrap().push(Call::SendNow(text));
         }
         fn run_command(&self, line: String) {
             self.calls.lock().unwrap().push(Call::Command(line));
@@ -2173,6 +2233,69 @@ mod tests {
         assert!(frame.contains("/help · PgUp/PgDn · ctrl+c exit"));
     }
 
+    fn alt_enter(h: &mut Harness, text: &str) {
+        for c in text.chars() {
+            h.key(KeyCode::Char(c));
+        }
+        h.app.on_key(KeyEvent::new(ENTER, KeyModifiers::ALT), h.now);
+    }
+
+    #[test]
+    fn alt_enter_while_a_turn_runs_sends_now_and_the_message_shows_where_the_turn_read_it() {
+        let mut h = harness();
+        h.typed("fix the build");
+        h.events([UiEvent::TurnStart { turn: "t".into() }, tool_start("c1", "bash", "cargo build")]);
+        assert!(h.frame().contains("alt+enter send now"));
+        // Plain Enter while busy: as before, nothing is sent and the text stays.
+        h.typed("also the tests");
+        assert_eq!(h.calls(), [Call::Send("fix the build".into())]);
+        h.app.prompt.set("");
+        alt_enter(&mut h, "also the tests");
+        assert_eq!(h.calls(), [Call::Send("fix the build".into()), Call::SendNow("also the tests".into())]);
+        assert_eq!(h.app.prompt.value, "");
+        // Not in the transcript until the turn read it; the bar says one is waiting.
+        assert!(!h.frame().contains("> also the tests"));
+        assert!(h.frame().contains("1 for the next step"));
+        h.events([tool_end("c1", "bash", "cargo build", "ok"), UiEvent::SentNow { text: "also the tests".into() }]);
+        let frame = h.frame();
+        let (build, sent) = (frame.find("cargo build").unwrap(), frame.find("> also the tests").unwrap());
+        assert!(sent > build, "after the tool's entry:\n{frame}");
+        assert!(!frame.contains("for the next step"));
+        // ctrl+s does the same (where the terminal keeps Alt+Enter).
+        for c in "and lint".chars() {
+            h.key(KeyCode::Char(c));
+        }
+        h.ctrl('s');
+        assert_eq!(h.calls().last(), Some(&Call::SendNow("and lint".into())));
+        h.event(UiEvent::SentNow { text: "and lint".into() });
+        // Idle, Alt+Enter is Enter.
+        h.events([UiEvent::Done(StopReason::End), turn_end()]);
+        alt_enter(&mut h, "thanks");
+        assert_eq!(h.calls().last(), Some(&Call::Send("thanks".into())));
+    }
+
+    #[test]
+    fn a_message_the_turn_never_read_comes_back_to_the_prompt() {
+        let mut h = harness();
+        h.typed("go");
+        h.events([UiEvent::TurnStart { turn: "t".into() }]);
+        alt_enter(&mut h, "wait, use pnpm");
+        for c in "and".chars() {
+            h.key(KeyCode::Char(c));
+        }
+        h.events([UiEvent::NotSent { texts: vec!["wait, use pnpm".into()] }, UiEvent::Done(StopReason::Aborted), turn_end()]);
+        assert_eq!(h.app.prompt.value, "wait, use pnpm\nand");
+        let frame = h.frame();
+        assert!(frame.contains("> wait, use pnpm") && frame.contains("  and"), "{frame}");
+        assert!(h.frame().contains("Not sent: the turn ended before its next step"));
+        // A command with Alt+Enter is a command: it waits for the turn like Enter.
+        h.app.prompt.set("");
+        h.typed("again");
+        h.events([UiEvent::TurnStart { turn: "t2".into() }]);
+        alt_enter(&mut h, "/undo");
+        assert!(!h.calls().iter().any(|c| matches!(c, Call::SendNow(t) if t == "/undo")));
+    }
+
     #[test]
     fn slash_lines_go_to_the_engine_as_commands_and_the_history_keeps_them() {
         let mut h = harness();
@@ -2181,6 +2304,29 @@ mod tests {
         assert!(!h.app.busy());
         h.key(KeyCode::Up);
         assert_eq!(h.app.prompt.value, "/help");
+    }
+
+    // #214: a multi-line user message (a paste) selects and copies with its newlines.
+    #[test]
+    fn dragging_across_a_multi_line_user_message_copies_its_lines() {
+        let mut h = harness();
+        h.app.on_event(Event::Paste("first pasted line\nsecond pasted line\nthird one".into()), h.now);
+        h.key(ENTER);
+        h.events([UiEvent::Done(StopReason::End), turn_end()]);
+        let frame = h.frame();
+        let at = |text: &str| {
+            let (y, line) =
+                frame.lines().enumerate().find(|(_, l)| l.contains(text)).unwrap_or_else(|| panic!("{text}:\n{frame}"));
+            (unicode_width::UnicodeWidthStr::width(&line[..line.find(text).unwrap()]) as u16, y as u16)
+        };
+        let (x0, y0) = at("first pasted line");
+        let (x1, y1) = at("third one");
+        h.app.on_mouse(MouseEvent::Press { x: x0, y: y0 }, h.now);
+        h.app.on_mouse(MouseEvent::Drag { x: x1 + 8, y: y1 }, h.now);
+        assert!(h.buffer()[(x0 + 3, y0 + 1)].modifier.contains(ratatui::style::Modifier::REVERSED));
+        h.app.on_mouse(MouseEvent::Release { x: x1 + 8, y: y1 }, h.now);
+        futures::executor::block_on(h.app.settle_copies(h.now));
+        assert_eq!(*h.copied.lock().unwrap(), ["first pasted line\n  second pasted line\n  third one"]);
     }
 
     #[test]
@@ -2392,13 +2538,16 @@ mod tests {
         h.typed("next");
         h.events([UiEvent::Status(TurnStatus::Compacting)]);
         assert!(h.frame().contains("Compacting the conversation…"));
-        let outcome = CompactOutcome::Compacted { summary: "x".repeat(4000), tokens_before: Some(30_000) };
+        let outcome = CompactOutcome::Compacted { summary: "x".repeat(4000), tokens_before: Some(30_000), overflow: None };
         h.events([UiEvent::Compaction { automatic: true, outcome }]);
         assert!(
             h.frame().contains("✻ Compacted the conversation (the context was 92% full): 30k → about 1k tokens."),
             "{}",
             h.frame()
         );
+        let overflow = CompactOutcome::Compacted { summary: "x".repeat(400), tokens_before: Some(30_000), overflow: Some(1) };
+        h.events([UiEvent::Compaction { automatic: true, outcome: overflow }]);
+        assert!(h.frame().contains("(the last request was too long for the model's window): 30k"), "{}", h.frame());
         let stopped = CompactOutcome::NotCompacted { reason: "stopped".into(), error: String::new() };
         h.events([
             UiEvent::Compaction { automatic: true, outcome: stopped },
@@ -3039,6 +3188,51 @@ mod tests {
         assert!(!h.frame().contains("code-secret"));
         h.key(KeyCode::Up);
         assert!(!h.frame().contains("code-secret"), "not in the prompt history");
+        // #214 review: one long enough to be pasted as a chip goes to the engine too, and its chip isn't kept.
+        let long = format!("http://127.0.0.1:5555/callback?code=code-long&state={}", "s".repeat(1000));
+        h.app.prompt.set(""); // ↑ above brought back "hello"
+        h.app.on_event(Event::Paste(long.clone()), h.now);
+        assert!(h.frame().contains("[Pasted text #1"), "{}", h.frame());
+        h.key(ENTER);
+        assert_eq!(h.calls().last(), Some(&Call::LoginCallback(long)));
+        assert!(!h.app.prompt.holds_submission(), "the callback's chip isn't held for the history");
+        h.key(KeyCode::Up);
+        assert!(!h.app.prompt.text().contains("code-long"), "not in the prompt history");
+    }
+
+    // #214: a multi-line paste never sends; Enter sends all of it, the transcript shows its lines, ↑ brings it back.
+    #[test]
+    fn a_multi_line_paste_waits_for_enter_and_the_transcript_shows_every_line() {
+        let mut h = harness();
+        h.app.on_event(Event::Paste("cargo build\ncargo test\n".into()), h.now);
+        assert!(h.calls().is_empty(), "a paste never submits");
+        assert!(h.frame().contains("[Pasted text #1, 2 lines]"), "{}", h.frame());
+        h.key(ENTER);
+        assert_eq!(h.calls(), [Call::Send("cargo build\ncargo test".into())]);
+        let frame = h.frame();
+        assert!(frame.contains("> cargo build\n  cargo test"), "{frame}");
+        h.events([UiEvent::Done(StopReason::End), turn_end()]);
+        h.key(KeyCode::Up);
+        assert_eq!(h.app.prompt.text(), "cargo build\ncargo test\n");
+        assert!(h.frame().contains("[Pasted text #1, 2 lines]"));
+    }
+
+    #[test]
+    fn a_multi_line_paste_into_a_reason_or_the_palette_stays_one_line() {
+        let mut h = harness();
+        h.typed("make a file");
+        h.events([UiEvent::Approval { id: ApprovalId(1), request: write_request("made.txt", None) }]);
+        h.arm();
+        h.key(KeyCode::Tab);
+        h.app.on_event(Event::Paste("too\nbig".into()), h.now);
+        h.key(ENTER);
+        assert_eq!(h.calls().last(), Some(&Call::Answer(1, Decision::Declined("too big".into()))));
+        assert_eq!(h.app.prompt.text(), "");
+        h.events([UiEvent::Done(StopReason::End), turn_end()]);
+        h.ctrl('k');
+        h.app.on_event(Event::Paste("yo\nlo".into()), h.now);
+        assert_eq!(h.app.palette.as_ref().unwrap().query, "yo lo");
+        assert_eq!(h.app.prompt.text(), "");
     }
 
     #[test]

@@ -18,7 +18,7 @@ Spec: `tests/oracle/README.md`; Marv's `evals/run.ts` (the workspace setup), `ev
 | `evals/mcp/tracker.ts` | `tracker.rs` | **Done and tested:** all 25 tools, the specs byte for byte from the TypeScript's `tools/list`, answers as `JSON.stringify(…, null, 2)` in its key order, comments to `out.json` |
 | (new) | `lib.rs`, `main.rs`, `tests/oracle.rs` | **Done:** `check_all` (parallel), the `marv-oracle check\|record\|tracker` CLI, the ignored `oracle` test (`MARV_ORACLE_BIN`, `MARV_ORACLE_RECORD`, `MARV_ORACLE_TARGET`), and checks that every recording (`expect.marv-rs/` too) is complete, keeps the prefix rule and holds no `.gitignore` |
 
-30 scenarios are recorded from TypeScript Marv 0.4.0 (`9bb4a34`), which passes all of them: all 17 of Marv's eval tasks, the loop edge cases, the MCP scenarios and `worktree-subagent` (#12). **marv-rs passes 30 of 30**; four scenarios declare a deliberate difference and have their own `expect.marv-rs/`. The `SECURITY.md` guards are in `tests/guards/` (#8, guards.md). TypeScript Marv passes all 30 against `expect/` (`MARV_ORACLE_TARGET=marv`).
+30 scenarios are recorded from TypeScript Marv 0.4.0 (`9bb4a34`), which passes all of them: all 17 of Marv's eval tasks, the loop edge cases, the MCP scenarios and `worktree-subagent` (#12). **marv-rs passes 30 of 30**; six scenarios declare a deliberate difference (`empty-reply` and `text-loop` for #63: the loop's note joins the user's message instead of a second user message, and the request after it starts the cache over) and have their own `expect.marv-rs/`. The `SECURITY.md` guards are in `tests/guards/` (#8, guards.md). TypeScript Marv passes all 30 against `expect/` (`MARV_ORACLE_TARGET=marv`).
 
 ## Port notes
 

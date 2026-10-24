@@ -71,9 +71,9 @@ pub const SEARCH_DESCRIPTION: &str = "Loads MCP tools' parameters: by exact name
 pub const CALL_DESCRIPTION: &str = "Runs an MCP tool: tool is its name (mcp__<server>__<tool>), arguments an object matching its parameters. Load them with tool_search first. MCP tools run outside the sandbox; the user may be asked first.";
 pub const DEFERRED_NAMES: [&str; 2] = ["tool_search", "mcp_call"];
 
-/// Marv's 4-chars-a-token estimate (`estimateTokens` in `src/usage.ts`).
+/// Marv's 4-chars-a-token estimate (`estimateTokens` in `src/usage.ts`): `marv_core::estimate_tokens` (Marv #63).
 pub fn estimate_tokens(text: &str) -> usize {
-    text.chars().count().div_ceil(4)
+    marv_core::estimate_tokens(text) as usize
 }
 
 /// What a deferred conversation is offered in place of the MCP specs: the same bytes all session.

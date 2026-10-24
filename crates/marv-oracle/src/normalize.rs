@@ -52,7 +52,21 @@ impl Normalizer {
         for line in stdout.lines().filter(|l| !l.trim().is_empty()) {
             let line = self.text(line);
             match serde_json::from_str::<Value>(&line) {
-                Ok(value) => out.push_str(&value.to_string()),
+                Ok(mut value) => {
+                    // marv-rs #63: a compaction says what started it; Marv's event doesn't.
+                    if value.get("type").and_then(Value::as_str) == Some("compaction")
+                        && let Some(event) = value.as_object_mut()
+                    {
+                        event.remove("trigger");
+                        event.remove("level");
+                    }
+                    // marv-rs quotes MCP tool descriptions as data (`runner::unfence_mcp_descriptions`): a result
+                    // that lists them, as Marv's does without the fence.
+                    if let Some(Value::String(result)) = value.get_mut("result") {
+                        crate::runner::unfence_mcp_descriptions(result);
+                    }
+                    out.push_str(&value.to_string())
+                }
                 Err(_) => out.push_str(&line),
             }
             out.push('\n');
@@ -107,6 +121,11 @@ mod tests {
         assert_eq!(
             n.events("{\"type\":\"done\",\"reason\":\"end\"}\n\nnot json\n"),
             "{\"reason\":\"end\",\"type\":\"done\"}\nnot json\n"
+        );
+        // marv-rs #63's trigger isn't Marv's.
+        assert_eq!(
+            n.events("{\"type\":\"compaction\",\"compacted\":true,\"trigger\":\"overflow\",\"level\":1}\n"),
+            "{\"compacted\":true,\"type\":\"compaction\"}\n"
         );
     }
 }

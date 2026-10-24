@@ -98,6 +98,9 @@ Each guard's doc comment says how it was proven: the guard was reverted, and the
 | Radio: `marv -p` is never on the radio | `radio.rs::marv_p_is_never_on_the_radio` | Proven (the real binary) |
 | Radio: `radio_tx`'s spec is constant and stays after the radio goes off | `radio.rs::radio_tx_spec_is_constant_and_stays_after_radio_off` | Proven |
 | Radio: history stays append-only when radio notes arrive | `radio.rs::history_stays_append_only_when_radio_notes_arrive` | Proven |
+| "Send now": the person's message during a turn never lands between a tool call and its result | `messages.rs::a_message_sent_during_a_turn_never_lands_between_a_tool_call_and_its_result`, `messages.rs::a_history_that_ends_mid_call_keeps_the_message_waiting` | Proven (the `at_step_boundary` check in `can_deliver` removed: the second fails) |
+| … and never makes two user turns in a row | `messages.rs::a_message_sent_now_never_makes_two_user_turns_in_a_row` | Proven (the merge into an unsent last user turn replaced by a push) |
+| Radio: a turn its person joined with "send now" never quotes its reply in the report | `radio.rs::a_turn_its_person_joined_never_quotes_its_reply_in_the_report` | Proven (`person_joined` passed as false) |
 | Radio: oversize messages are refused, not cut | `radio.rs::oversize_messages_are_refused_not_cut` | Proven (two reverts) |
 | Radio: per-sender rates apply at the receiver | `radio.rs::per_sender_rates_apply_at_the_receiver` | Proven |
 | Radio: broadcasts never wake | `radio.rs::broadcasts_never_wake` | Proven |
@@ -116,6 +119,16 @@ Each guard's doc comment says how it was proven: the guard was reverted, and the
 | Radio: a turn that handles a request asks for what yolo would have allowed (marv-rs's decision, past spec §8.4) | `radio.rs::a_turn_that_handles_a_request_asks_even_in_yolo` | Proven |
 | Radio: `radio_tx`'s wait returns the report fenced, tainting first | `radio.rs::radio_tx_waits_for_the_report_fenced_and_tainting` | Proven |
 | Radio: a pane send to a Marv on the radio is refused, with the radio hint | `radio.rs::pane_send_to_a_marv_on_the_radio_is_refused_with_the_radio_hint` | Proven (a fake `herdr`) |
+| Compaction (#63): taint survives the v1 and v2 summaries, overflow recovery and its level-3 drop, in memory and saved | `compaction.rs::taint_survives_compaction` | Proven (a taint reset in `install`; the saved taint dropped) |
+| Saved pages: written before the history is replaced; a failed write keeps it | `compaction.rs::a_page_out_writes_swap_before_replacing_the_history` | Proven |
+| Saved pages: the page table comes from the turns, not the summary | `compaction.rs::the_page_table_is_written_by_marv` | Proven |
+| `recall`: a recalled web result is fenced and taints again | `compaction.rs::a_recalled_page_keeps_its_provenance` | Proven |
+| `recall`: only the conversation's own pages; no id or path; none for a subagent | `compaction.rs::recall_reads_only_its_own_conversation` | Proven |
+| `recall`: the tool list is byte-stable across a page-out | `compaction.rs::the_tool_list_is_byte_stable_across_a_page_out` | Proven |
+| Saved pages: a symlinked swap folder is refused | `compaction.rs::a_symlinked_swap_folder_is_refused` | Proven |
+| Saved pages: never overwritten, numbered under the lock | `compaction.rs::pages_are_never_overwritten` | Proven (the lock removed; `next_page` from the table only) |
+| Saved pages: a path in the table is at most 200 characters | `compaction.rs::a_page_table_path_is_capped_at_200_characters` | Proven |
+| Saved pages: aged out, but never a live session's | `compaction.rs::saved_pages_age_out_but_never_a_live_sessions` | Proven (no hold; no cleanup) |
 | Subagents don't inherit network/web/mesh approvals | `provenance.rs::subagents_inherit_taint_but_no_egress_approvals` | Proven |
 | … the config's pre-approved scopes too (#98) | `approvals.rs::subagents_dont_inherit_config_scopes` | Proven |
 | Pre-approved scopes answer their own scopes (#98) | `approvals.rs::config_approve_answers_its_scopes_without_asking` | Proven (session level) |

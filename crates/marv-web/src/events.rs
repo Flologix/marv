@@ -3,7 +3,7 @@
 
 use marv_agent::agent::LoopEvent;
 use marv_core::printable;
-use marv_session::{CompactResult, SessionEvent, TurnStatus};
+use marv_session::{SessionEvent, TurnStatus};
 use marv_tools::types::DiffShown;
 use serde_json::{Value, json};
 
@@ -61,12 +61,7 @@ pub fn to_json(event: &SessionEvent) -> Option<Value> {
             TurnStatus::Checkpointing => "checkpointing",
             TurnStatus::Running => "running",
         }})),
-        SessionEvent::Compaction(result) => Some(match result {
-            CompactResult::Compacted { .. } => json!({"type": "compaction", "compacted": true}),
-            CompactResult::NotCompacted { reason, error } => {
-                json!({"type": "compaction", "compacted": false, "reason": reason.as_str(), "error": error})
-            }
-        }),
+        SessionEvent::Compaction(result) => Some(marv_session::compaction_json(result)),
         SessionEvent::Tainted { source } => Some(json!({"type": "tainted", "source": source})),
         // #203: the TUI's sentence, as a warning; git's own text cut to its first line (it can run to a page of hints,
         // and as a plain notice above the turn's tool cards it read like a command's output).
@@ -74,6 +69,9 @@ pub fn to_json(event: &SessionEvent) -> Option<Value> {
             "type": "checkpoint_failed",
             "text": format!("This turn can't be undone: its checkpoint failed ({}).", first_line(message, MAX_DETAIL)),
         })),
+        // "Send now" messages the turn never read: the page puts them back in the composer.
+        SessionEvent::NotSent { texts } => Some(json!({"type": "not_sent", "texts": texts})),
+        SessionEvent::Notice { text } => Some(json!({"type": "notice", "text": text})),
         SessionEvent::TurnEnd { reason, .. } => Some(json!({"type": "turn_end", "reason": reason.as_str()})),
         _ => None,
     }
@@ -84,6 +82,8 @@ fn loop_json(event: &LoopEvent, agent: Option<&String>) -> Option<Value> {
         LoopEvent::TextDelta(text) => json!({"type": "text_delta", "text": text}),
         LoopEvent::ThinkingDelta(text) => json!({"type": "thinking_delta", "text": text}),
         LoopEvent::Assistant { text } => json!({"type": "assistant", "text": text}),
+        // "Send now": the person's message went in here, after the step's tool results.
+        LoopEvent::SentNow { text } => json!({"type": "sent_now", "text": text}),
         LoopEvent::ToolStart { call, label } => {
             json!({"type": "tool_start", "id": call.id, "tool": call.name, "label": printable(label)})
         }

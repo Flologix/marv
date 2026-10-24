@@ -15,7 +15,11 @@ fn the_oracles_reworded_text_matches_what_marv_rs_sends() {
     // #81: Marv's process description is marv-rs's without its last sentence.
     let (process_sentence, nothing) = MARV_RS_TEXT[2];
     assert!(marv_tools::process::PROCESS_DESCRIPTION.ends_with(process_sentence) && nothing.is_empty());
+    // `recall` (after Marv #63), last in the tool list the prompt names.
+    let recall = system_prompt(&PromptInput { tools: vec!["read_file".into(), "recall".into()], ..Default::default() });
+    let (recall_listed, _) = MARV_RS_TEXT[3];
+    assert!(recall.contains(recall_listed), "MARV_RS_TEXT[3] isn't how the prompt names recall last:\n{recall}");
     // The `.git` placeholder sentence, which Marv doesn't have.
-    let (placeholder, nothing) = MARV_RS_TEXT[3];
+    let (placeholder, nothing) = MARV_RS_TEXT[4];
     assert!(placeholder == marv_session::prompt::GIT_PLACEHOLDER && nothing.is_empty());
 }

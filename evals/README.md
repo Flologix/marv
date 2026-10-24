@@ -24,6 +24,13 @@ Options: `--tasks a,b`, `--marv-model` (default `anthropic/claude-haiku-5.5`), `
 `--timeout` (300 s per run), `--budget` (stops starting runs once that many dollars are spent), `--opencode-bin`
 (default: what `mise which opencode` finds, else `opencode` on PATH).
 
+`--marv-config key=value` (repeatable) puts a key into Marv's throwaway `config.json` (the value is JSON when it parses,
+else a string), e.g. `--marv-config compaction=v2` for #63's comparison. A `compactTokens` below Marv's 40k minimum goes
+to `MARV_EVAL_COMPACT_TOKENS` instead, an eval-only bypass (at least 4k), so short tasks compact more than once. The
+report then counts compactions and **repeated reads**: `read_file` calls within 10 steps after a compaction, of a path
+and an overlapping line range read before it. `long-haul` is the task made for it: 15 converters to change one at a
+time with the tests run in between.
+
 ## What a run is
 
 1. The task's `repo/` is copied to a temp folder and committed. A TypeScript task gets the compiler in `node_modules`.

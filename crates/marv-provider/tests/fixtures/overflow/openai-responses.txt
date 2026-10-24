@@ -1,0 +1,2 @@
+OpenAI returned 400.
+Your input exceeds the context window of this model. Please adjust your input and try again.

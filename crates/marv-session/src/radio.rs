@@ -372,9 +372,7 @@ pub fn report_of(
     use marv_core::StopReason;
     let paragraph = reply.map(first_paragraph).filter(|p| !p.is_empty());
     let (kind, mut text) = match reason {
-        TurnEndReason::Done(StopReason::End) => {
-            (Kind::Done, paragraph.clone().unwrap_or_else(|| "finished, without a reply".to_string()))
-        }
+        TurnEndReason::Done(StopReason::End) => (Kind::Done, paragraph.clone().unwrap_or_else(|| NO_REPLY.to_string())),
         TurnEndReason::Interrupted | TurnEndReason::Done(StopReason::Aborted) => {
             (Kind::Failed, format!("stopped by {me}'s user"))
         }
@@ -413,6 +411,30 @@ pub fn report_of(
     }
     (kind, format!("{text}{facts}"))
 }
+
+/// [`report_of`] for a turn the person joined with "send now": its reply answered them too, so the report never quotes
+/// it. A finished turn says so in fixed words; the other endings are as `report_of` says them, without the reply.
+pub fn report_for(
+    reason: crate::session::TurnEndReason,
+    me: &str,
+    reply: Option<&str>,
+    declined: Option<&str>,
+    changed: usize,
+    person_joined: bool,
+) -> (Kind, String) {
+    if !person_joined {
+        return report_of(reason, me, reply, declined, changed);
+    }
+    let (kind, text) = report_of(reason, me, None, declined, changed);
+    let text = match kind {
+        Kind::Done => text.replacen(NO_REPLY, &format!("finished; {me}'s user joined the turn, so its reply stays with them"), 1),
+        _ => text,
+    };
+    (kind, text)
+}
+
+/// A finished turn's report with no reply to quote.
+const NO_REPLY: &str = "finished, without a reply";
 
 /// At most this many radio wakes a minute per sender (§8.6, 4: the `WakeLimit` of #78, keyed by the radio sender).
 pub const RADIO_WAKES_PER_MINUTE: usize = 3;
@@ -628,6 +650,26 @@ mod tests {
         let (_, text) = report_of(TurnEndReason::Done(StopReason::End), "b", Some(&wide), None, 0);
         assert!(text.len() <= marv_mesh::radio::MAX_REPORT_BYTES && text.ends_with('…'));
         assert!(!report_of(TurnEndReason::Done(StopReason::End), "b", Some("\x1b[2Jhi"), None, 0).1.contains('\x1b'));
+    }
+
+    #[test]
+    fn a_turn_the_person_joined_never_quotes_its_reply() {
+        use crate::session::TurnEndReason;
+        use marv_core::StopReason;
+        let reply = Some("Here's my answer to you, about your private notes.");
+        assert_eq!(
+            report_for(TurnEndReason::Done(StopReason::End), "b", reply, None, 2, true),
+            (Kind::Done, "finished; b's user joined the turn, so its reply stays with them (2 files changed)".into())
+        );
+        assert_eq!(
+            report_for(TurnEndReason::Done(StopReason::MaxSteps), "b", reply, None, 0, true),
+            (Kind::Failed, "the turn ended: the step limit".into())
+        );
+        // Not joined: as before.
+        assert_eq!(
+            report_for(TurnEndReason::Done(StopReason::End), "b", reply, None, 0, false),
+            report_of(TurnEndReason::Done(StopReason::End), "b", reply, None, 0)
+        );
     }
 
     #[test]

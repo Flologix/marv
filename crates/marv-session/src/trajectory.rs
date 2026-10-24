@@ -186,6 +186,12 @@ pub enum TrajectoryRecord {
         #[serde(skip_serializing_if = "Option::is_none")]
         thinking: Option<String>,
     },
+    /// "Send now": the person's message, read by the running turn at a step boundary (as `turn_start`'s text).
+    SentNow {
+        #[serde(flatten)]
+        who: Who,
+        text: String,
+    },
     /// A tool call and exactly what the model got back. `ms` of a write includes waiting for the typecheck baseline.
     Tool {
         #[serde(flatten)]
@@ -301,14 +307,27 @@ pub enum TrajectoryRecord {
     },
     /// /undo (Marv #16): the turn it took back (its number in the checkpoints), the paths written, those left alone.
     Undo { turn: u32, paths: Vec<String>, skipped: Vec<String> },
-    /// The conversation was replaced by a summary.
+    /// The conversation was replaced by a summary. #63: `trigger` ("auto", "manual", "overflow"), `level` (overflow
+    /// only), `tail_turns` (turns kept verbatim after it), `structured` (the reply followed the v2 template), `rolling`
+    /// (it updated the previous summary), `page` (the saved page holding what it replaced). An overflow's level 3 drops
+    /// old turns without a summary: no `summary` then.
     Compact {
         #[serde(skip_serializing_if = "Option::is_none")]
         turn: Option<String>,
-        summary: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+        trigger: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        level: Option<u32>,
+        tail_turns: usize,
+        structured: bool,
+        rolling: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        page: Option<u32>,
     },
     /// marv-rs #144: a summary that failed, and why: `reason` "failed", "stopped" or "empty", `error` the message (a
     /// tool call, a cut-off or empty summary, the provider's error), `tokens` the context's size when it was asked for.
+    /// #63: `trigger` and `level` as for `compact`.
     CompactFailed {
         #[serde(skip_serializing_if = "Option::is_none")]
         turn: Option<String>,
@@ -316,6 +335,9 @@ pub enum TrajectoryRecord {
         error: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         tokens: Option<u64>,
+        trigger: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        level: Option<u32>,
     },
     /// 1 good, -1 bad, 0 just labeled.
     Feedback {
@@ -577,6 +599,7 @@ impl AgentRecorder {
                 let thinking = self.take_thinking();
                 (self.sink)(TrajectoryRecord::Assistant { who, text: text.clone(), thinking });
             }
+            LoopEvent::SentNow { text } => (self.sink)(TrajectoryRecord::SentNow { who, text: text.clone() }),
             LoopEvent::ToolStart { call, .. } => {
                 // Reasoning that led straight to a tool call, with no text.
                 if let Some(thinking) = self.take_thinking() {
@@ -650,7 +673,7 @@ impl AgentRecorder {
                 self.finish(&reason);
             }
             // The whole reply comes with Assistant; deltas, retries and compactions aren't records.
-            LoopEvent::TextDelta(_) | LoopEvent::ToolCallDelta { .. } | LoopEvent::Compacted => {}
+            LoopEvent::TextDelta(_) | LoopEvent::ToolCallDelta { .. } | LoopEvent::Compacted | LoopEvent::Overflow { .. } => {}
         }
     }
 

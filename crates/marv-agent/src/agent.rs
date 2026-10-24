@@ -56,6 +56,21 @@
 //!   final answer; a cancel during it ends `Aborted` and drops the note), then the next step.
 //! - A `Retry` from the provider means it starts over: this step's text, calls and reasoning are
 //!   discarded so the retry doesn't duplicate them.
+//! - **"Send now"** (`send_now`, [`crate::send_now`]; new in marv-rs): the person's messages sent while the run
+//!   goes go in as one user message (joined by blank lines) at the next step boundary: at the top of a step that
+//!   goes on to an ordinary request (after `after_step`'s note, so the person has the last word; at the step limit
+//!   only after a "continue"), or in place of ending the run on a plain answer (one more step reads them, unless
+//!   that step would be at the limit). Only where every call has its result ([`crate::send_now::at_step_boundary`]).
+//!   Never two user turns in a row: a user turn no request has carried yet (`sent_len`) takes them after a blank
+//!   line; one a request already carried (an empty reply's retry resends it) is never rewritten, so they wait. Each
+//!   yields a `SentNow` once it's in the history. Nothing is stopped for one. Not during a cancel, and not after the
+//!   run ended: the session hands those back.
+//! - Marv #63 **overflow recovery**: a reply that failed because the request was longer than the window
+//!   (`marv_provider::errors::is_context_overflow`) goes to `on_overflow` when it's set: nothing of the failed reply
+//!   enters the history, an [`LoopEvent::Overflow`] replaces the `Error`, and `Recovered` sends the same step again
+//!   (the session made the history fit). At most [`MAX_OVERFLOW_RECOVERIES`] a step, so at most 5 requests; the count
+//!   resets after a step that got a reply. `Failed(text)` ends `Error` with the hook's text, `Stopped` (or a cancel
+//!   during the hook) ends `Aborted`. Unset, an overflow ends the run like any provider error.
 //!
 //! marv-rs changes and planned work:
 //! - **#90 announced next step, no tool call**: a plain answer that ends by announcing what it
@@ -103,6 +118,7 @@ pub use crate::announce::{ANNOUNCED_STEP_NOTE, announces_next_step};
 use crate::repetition::{
     FailureLoopState, ToolCallKey, ToolLoopState, detect_text_repetition, failing_command_note, make_tool_key, tool_loop_detected,
 };
+pub use crate::send_now::{SendNow, at_step_boundary};
 
 pub const DEFAULT_MAX_STEPS: u32 = 25;
 /// Subagents' own hard limit (Marv `SUBAGENT_MAX_STEPS`, in `src/subagent.ts`).
@@ -443,6 +459,15 @@ pub enum LoopEvent {
     },
     /// A mid-run compaction swapped the history for the summary (`on_full`).
     Compacted,
+    /// "Send now": the person's message went into the history as a user message, at a step boundary.
+    SentNow {
+        text: String,
+    },
+    /// Marv #63: the request didn't fit the context window, and `on_overflow` is making it fit. `attempt` counts from 0
+    /// within the step.
+    Overflow {
+        attempt: u32,
+    },
     Done(StopReason),
     /// The provider threw the reply away without retrying (#96: it degenerated again); an `Error` follows.
     Discarded {
@@ -490,6 +515,21 @@ pub type History = Arc<Mutex<Vec<ChatTurn>>>;
 pub type OnLimit = Arc<dyn Fn(u32) -> BoxFuture<'static, LimitAnswer> + Send + Sync>;
 /// True when the context was nearly full and the history was just compacted. Never fails.
 pub type OnFull = Arc<dyn Fn() -> BoxFuture<'static, bool> + Send + Sync>;
+/// Marv #63: what `on_overflow` did about a request that didn't fit the window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OverflowOutcome {
+    /// The history was made to fit: retry the step.
+    Recovered,
+    /// Recovery gave up. The message is what the user should read: the session's own explanation, or the provider
+    /// error that stopped it.
+    Failed(String),
+    /// Esc during recovery.
+    Stopped,
+}
+/// Marv #63: called with the provider's error and the attempt (from 0, per step) when a request overflowed the window.
+pub type OnOverflow = Arc<dyn Fn(String, u32) -> BoxFuture<'static, OverflowOutcome> + Send + Sync>;
+/// Marv #63: recoveries a step may have (overflow levels 0–3), so at most 5 requests a step.
+pub const MAX_OVERFLOW_RECOVERIES: u32 = 4;
 /// A note for the model after a step (the typecheck), or `None`. Never fails.
 pub type AfterStep = Arc<dyn Fn(Vec<ToolRun>) -> BoxFuture<'static, Option<String>> + Send + Sync>;
 /// A call to record and run instead, or `None` to keep it.
@@ -515,6 +555,8 @@ pub struct AgentOptions {
     pub rewrite_call: Option<RewriteCall>,
     /// Checked after a step's calls are all answered, before `after_step`.
     pub on_full: Option<OnFull>,
+    /// Marv #63: a request that overflowed the window; `None` ends the run with the provider's error, as before.
+    pub on_overflow: Option<OnOverflow>,
     pub after_step: Option<AfterStep>,
     /// #59: one tools-off wrap-up reply before a hard stop at the step limit (no `on_limit`, or it answered
     /// `Unavailable`). The session sets it for the main agent and subagents.
@@ -522,6 +564,9 @@ pub struct AgentOptions {
     /// #90: providers collect the raw response payloads (the trajectory's `request` record
     /// carries them). The session sets this from `MARV_DEBUG_RAW`.
     pub debug_raw: bool,
+    /// The person's "send now" messages, appended at the next step boundary ([`crate::send_now`]). The session sets
+    /// it for the main agent only.
+    pub send_now: Option<SendNow>,
 }
 
 impl AgentOptions {
@@ -546,9 +591,11 @@ impl AgentOptions {
             on_limit: None,
             rewrite_call: None,
             on_full: None,
+            on_overflow: None,
             after_step: None,
             wrap_up_at_limit: false,
             debug_raw: false,
+            send_now: None,
         }
     }
 }
@@ -794,6 +841,9 @@ enum Phase {
     Tools(Tools),
     /// The step's calls are all answered: `on_full`.
     Full(Vec<ToolRun>),
+    /// Marv #63: the request overflowed the window: `on_overflow`, with the provider's error (and the #59 wrap-up's
+    /// message when it was the wrap-up request).
+    Overflow(String, Option<String>),
     AfterStep(Vec<ToolRun>),
 }
 
@@ -833,6 +883,11 @@ pub struct LoopState {
     /// A failing command was tried again after the warning: the step's remaining calls don't run, the run ends `Loop`.
     failure_stop: bool,
     in_flight: InFlight,
+    /// The history's length when the last request was sent: a turn below it was carried by a request and is never
+    /// rewritten (a "send now" message joins only a user turn above it).
+    sent_len: usize,
+    /// Marv #63: overflow recoveries in this step (`on_overflow`'s `attempt`); reset by a step that got a reply.
+    overflows: u32,
 }
 
 impl LoopState {
@@ -854,6 +909,8 @@ impl LoopState {
             failures: FailureLoopState::default(),
             failure_stop: false,
             in_flight: InFlight::default(),
+            sent_len: 0,
+            overflows: 0,
         }
     }
 
@@ -861,8 +918,10 @@ impl LoopState {
         self.options.history.lock().unwrap_or_else(|e| e.into_inner()).push(turn);
     }
 
+    /// Marv's notes go in as user turns, merged into a trailing one (a mid-turn compaction's note, the turn's own
+    /// message): never two user turns in a row (#63 review).
     fn push_note(&self, text: &str) {
-        self.push_turn(ChatTurn::User { text: text.to_string() });
+        crate::compact::push_user(&mut self.options.history.lock().unwrap_or_else(|e| e.into_inner()), text);
     }
 
     fn push_result(&self, call: &ToolCall, text: &str) {
@@ -921,6 +980,7 @@ impl LoopState {
             Phase::Request { tool_choice, wrap_up } => {
                 // The lock is never held across an await: the adapter serializes the snapshot at once.
                 let snapshot = self.options.history.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                self.sent_len = snapshot.len();
                 let options = StreamOptions {
                     system: Some(self.options.system.clone()),
                     tools: self.options.tools.clone(),
@@ -957,6 +1017,8 @@ impl LoopState {
                 if let Some(on_full) = self.options.on_full.clone()
                     && on_full().await
                 {
+                    // A fresh history (the summary and a note): none of it was sent yet.
+                    self.sent_len = 0;
                     self.emit(LoopEvent::Compacted);
                     if self.aborted() {
                         return self.finish(StopReason::Aborted);
@@ -964,6 +1026,7 @@ impl LoopState {
                 }
                 self.phase = Phase::AfterStep(runs);
             }
+            Phase::Overflow(message, wrap_up) => self.overflow(message, wrap_up).await,
             Phase::AfterStep(runs) => {
                 if let Some(after_step) = self.options.after_step.clone() {
                     let note = after_step(runs).await;
@@ -983,6 +1046,9 @@ impl LoopState {
     /// at each multiple whether it goes on. `max_steps` 0 (the guard off) never matches.
     async fn top(&mut self) {
         if !at_step_limit(self.step, self.options.max_steps) {
+            // The step boundary: the person's "send now" messages go in before this step's request. Only before an
+            // ordinary request: at the limit they wait for a "continue", or go back to the person with the turn.
+            self.deliver_sent_now();
             self.phase = Phase::Request { tool_choice: ToolChoice::Auto, wrap_up: None };
             return;
         }
@@ -998,6 +1064,8 @@ impl LoopState {
             return self.finish(StopReason::Aborted);
         }
         if continued {
+            // Including what was typed while the limit was asked.
+            self.deliver_sent_now();
             self.phase = Phase::Request { tool_choice: ToolChoice::Auto, wrap_up: None };
             return;
         }
@@ -1027,10 +1095,22 @@ impl LoopState {
                 }
             }
         }
+        let outcome = reply.outcome(aborted);
+        // Marv #63: a request too long for the window. Checked before anything of the reply enters the history: it has
+        // no text or calls, and any partial text is dropped as for a retry. The #59 wrap-up request too: it's sent
+        // again, still the wrap-up, once the history fits.
+        if let StepOutcome::Error(message) = &outcome
+            && self.options.on_overflow.is_some()
+            && marv_provider::errors::is_context_overflow(message)
+        {
+            self.phase = Phase::Overflow(message.clone(), wrap_up);
+            return;
+        }
         if let Some(message) = wrap_up {
             return self.wrap_up(reply, aborted, message);
         }
-        match reply.outcome(aborted) {
+        self.overflows = 0;
+        match outcome {
             // A reply stuck repeating itself (caught while it streamed, or at its end): it's dropped, so
             // none of it reaches the history (its tool calls never ran and aren't in it either), and the
             // model is told. Twice in a row ends the run.
@@ -1081,6 +1161,48 @@ impl LoopState {
                     }
                 }
             }
+        }
+    }
+
+    /// Marv #63: the request overflowed the window. The hook makes the history fit (or gives up); the same step is sent
+    /// again, at most [`MAX_OVERFLOW_RECOVERIES`] times.
+    async fn overflow(&mut self, message: String, wrap_up: Option<String>) {
+        let attempt = self.overflows;
+        self.emit(LoopEvent::Overflow { attempt });
+        let Some(on_overflow) = self.options.on_overflow.clone() else {
+            self.emit(LoopEvent::Error(message));
+            return self.finish(StopReason::Error);
+        };
+        let outcome = on_overflow(message.clone(), attempt).await;
+        if self.aborted() {
+            return self.finish(StopReason::Aborted);
+        }
+        match outcome {
+            OverflowOutcome::Recovered if attempt < MAX_OVERFLOW_RECOVERIES => {
+                // The hook rewrote the history (as a mid-turn compaction does): none of it was carried by a request
+                // that got through, so "send now" may join its last user turn until the resend below carries it.
+                self.sent_len = 0;
+                self.overflows += 1;
+                let tool_choice = if wrap_up.is_some() { ToolChoice::None } else { ToolChoice::Auto };
+                // The rewritten history may have lost the step limit's note: the wrap-up asks for it again.
+                if wrap_up.is_some() {
+                    let last = self.options.history.lock().unwrap_or_else(|e| e.into_inner()).last().cloned();
+                    if !matches!(last, Some(ChatTurn::User { text }) if text.ends_with(STEP_LIMIT_NOTE)) {
+                        self.push_note(STEP_LIMIT_NOTE);
+                    }
+                }
+                self.phase = Phase::Request { tool_choice, wrap_up };
+            }
+            // A hook that would go on past the cap: the provider's error stands.
+            OverflowOutcome::Recovered => {
+                self.emit(LoopEvent::Error(message));
+                self.finish(StopReason::Error);
+            }
+            OverflowOutcome::Failed(text) => {
+                self.emit(LoopEvent::Error(text));
+                self.finish(StopReason::Error);
+            }
+            OverflowOutcome::Stopped => self.finish(StopReason::Aborted),
         }
     }
 
@@ -1148,6 +1270,12 @@ impl LoopState {
             return self.finish(StopReason::Loop);
         }
         if calls.is_empty() {
+            // "Send now": a message that came while this reply streamed is read by one more step, rather than left
+            // for after the turn. It's what the person said last, so it goes ahead of #90's "continue".
+            // Not when the next step is at the step limit: then the turn ends and they go back to the person.
+            if !aborted && self.can_deliver() && !at_step_limit(self.step + 1, self.options.max_steps) {
+                return self.next_step();
+            }
             // #90: a plain answer that announces its next step ("Now checking issue #7 before
             // commenting:") is how a turn dies halfway. Once per turn, say "continue" like a
             // user would; a second announcement just ends the run, still logged.
@@ -1195,6 +1323,49 @@ impl LoopState {
         }
         self.emit(LoopEvent::Error(message));
         self.finish(StopReason::MaxSteps);
+    }
+
+    /// "Send now": appends the person's waiting messages as user messages, if the history is at a step boundary
+    /// (every call answered: never between a call and its result), and says so. True when any went in. Not while
+    /// the run is being stopped: they stay waiting, and the session hands them back.
+    fn deliver_sent_now(&mut self) -> bool {
+        let Some(send_now) = self.options.send_now.clone() else { return false };
+        if !self.can_deliver() {
+            return false;
+        }
+        let texts = {
+            let mut history = self.options.history.lock().unwrap_or_else(|e| e.into_inner());
+            let texts = send_now.take();
+            let joined = texts.join("\n\n");
+            // Never two user turns in a row: a user turn that no request has carried yet (the turn's own message, a
+            // check's note, a nudge) takes the person's words after a blank line. One already sent is never rewritten.
+            match history.last_mut() {
+                Some(ChatTurn::User { text }) => {
+                    text.push_str("\n\n");
+                    text.push_str(&joined);
+                }
+                _ => history.push(ChatTurn::User { text: joined }),
+            }
+            texts
+        };
+        for text in texts {
+            self.emit(LoopEvent::SentNow { text });
+        }
+        true
+    }
+
+    /// Whether waiting "send now" messages can go in now: some wait, the run isn't being stopped, every call has its
+    /// result ([`at_step_boundary`]), and the history doesn't end with a user turn a request already carried (the
+    /// same request again after an empty reply: appending would make two user turns in a row, rewriting it would
+    /// break the cache). Then they wait for the next boundary.
+    fn can_deliver(&self) -> bool {
+        let Some(send_now) = &self.options.send_now else { return false };
+        if send_now.is_empty() || self.aborted() {
+            return false;
+        }
+        let history = self.options.history.lock().unwrap_or_else(|e| e.into_inner());
+        let sent_user = matches!(history.last(), Some(ChatTurn::User { .. })) && history.len() <= self.sent_len;
+        at_step_boundary(&history) && !sent_user
     }
 
     /// One transition of running the step's calls. True when they're all answered and the phase moved on.
@@ -2100,7 +2271,7 @@ mod tests {
         let events = collect(options(provider.clone(), &h, plain())).await;
         let requests = provider.requests();
         assert_eq!(requests.len(), 3);
-        assert_eq!(requests[2].0.last(), Some(&user(EMPTY_REPLY_NOTE)));
+        assert_eq!(requests[2].0.last(), Some(&user(&format!("go\n\n{EMPTY_REPLY_NOTE}"))));
         assert_eq!(empties(&events), [EmptyNext::Retry, EmptyNext::Nudge, EmptyNext::Stop]);
         assert_eq!(end(&events), Some(StopReason::End));
     }
@@ -2114,7 +2285,7 @@ mod tests {
         ]));
         let h = history(vec![user("go")]);
         collect(options(provider, &h, plain())).await;
-        assert_eq!(snapshot(&h), [user("go"), user(EMPTY_REPLY_NOTE), said("Done.")]);
+        assert_eq!(snapshot(&h), [user(&format!("go\n\n{EMPTY_REPLY_NOTE}")), said("Done.")]);
     }
 
     #[tokio::test]
@@ -2228,7 +2399,8 @@ mod tests {
             collect(AgentOptions { max_steps: 2, wrap_up_at_limit: true, ..options(provider.clone(), &h, runner) }).await;
         let requests = provider.requests();
         assert_eq!(requests.len(), 3, "the continue used the last step; then only the wrap-up");
-        assert_eq!(requests[2].0.last(), Some(&user(STEP_LIMIT_NOTE)));
+        assert!(matches!(requests[2].0.last(), Some(ChatTurn::User { text }) if text.ends_with(STEP_LIMIT_NOTE)));
+        assert!(crate::compact::alternates(&requests[2].0));
         assert_eq!(requests[2].1.tool_choice, ToolChoice::None);
         assert_eq!(announced_steps(&events), [true]);
         assert_eq!(end(&events), Some(StopReason::MaxSteps));
@@ -2339,7 +2511,11 @@ mod tests {
         ]));
         let h = history(vec![user("go")]);
         collect(options(provider.clone(), &h, plain())).await;
-        assert_eq!(provider.requests()[1].0.last(), Some(&user(CUT_OFF_REASONING_NOTE)));
+        assert_eq!(
+            provider.requests()[1].0.last(),
+            Some(&user(&format!("go\n\n{CUT_OFF_REASONING_NOTE}"))),
+            "joined, not a second user turn"
+        );
     }
 
     #[tokio::test]
@@ -2832,6 +3008,143 @@ mod tests {
         assert!(events.iter().any(|e| matches!(e, LoopEvent::Compacted)));
         assert_eq!(provider.requests()[1].0, [user("summary"), user(crate::compact::MID_TURN_NOTE)]);
         assert_eq!(end(&events), Some(StopReason::End));
+    }
+
+    // ---- Marv #63: overflow recovery ----
+
+    const OVERFLOW: &str = "OpenRouter returned 400.\nThis endpoint's maximum context length is 1000 tokens. However, you requested about 1200 tokens (1200 of text input, 0 in the output).";
+
+    fn overflow() -> Vec<ProviderEvent> {
+        vec![ProviderEvent::TextDelta("partial".into()), ProviderEvent::Error(OVERFLOW.into())]
+    }
+
+    /// A hook answering from a list, recording each attempt; it swaps the history for `[user("fitted")]`.
+    fn on_overflow(h: &History, answers: Vec<OverflowOutcome>) -> (OnOverflow, Arc<Mutex<Vec<u32>>>) {
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let (seen, h, answers) = (attempts.clone(), h.clone(), Arc::new(Mutex::new(VecDeque::from(answers))));
+        let hook: OnOverflow = Arc::new(move |error, attempt| {
+            assert!(error.contains("maximum context length"));
+            seen.lock().unwrap().push(attempt);
+            *h.lock().unwrap() = vec![user("fitted")];
+            let answer = answers.lock().unwrap().pop_front().unwrap_or(OverflowOutcome::Failed("gave up".into()));
+            Box::pin(async move { answer })
+        });
+        (hook, attempts)
+    }
+
+    #[tokio::test]
+    async fn an_overflow_with_the_hook_retries_the_same_step_with_nothing_of_the_failed_reply() {
+        let provider = Arc::new(ScriptedProvider::new(vec![overflow(), say("Done.")]));
+        let h = history(vec![user("go")]);
+        let (hook, attempts) = on_overflow(&h, vec![OverflowOutcome::Recovered]);
+        let events = collect(AgentOptions { on_overflow: Some(hook), ..options(provider.clone(), &h, plain()) }).await;
+        assert!(events.iter().any(|e| matches!(e, LoopEvent::Overflow { attempt: 0 })));
+        assert!(!events.iter().any(|e| matches!(e, LoopEvent::Error(_))));
+        assert_eq!(*attempts.lock().unwrap(), [0]);
+        assert_eq!(provider.requests()[1].0, [user("fitted")], "the failed reply's partial text never entered it");
+        assert_eq!(end(&events), Some(StopReason::End));
+    }
+
+    #[tokio::test]
+    async fn an_overflow_hook_that_fails_ends_with_its_text_and_none_ends_as_before() {
+        let provider = Arc::new(ScriptedProvider::new(vec![overflow()]));
+        let h = history(vec![user("go")]);
+        let (hook, _) = on_overflow(&h, vec![OverflowOutcome::Failed("too big".into())]);
+        let events = collect(AgentOptions { on_overflow: Some(hook), ..options(provider, &h, plain()) }).await;
+        assert!(
+            matches!(&events[events.len() - 2..], [LoopEvent::Error(m), LoopEvent::Done(StopReason::Error)] if m == "too big")
+        );
+
+        let provider = Arc::new(ScriptedProvider::new(vec![overflow()]));
+        let h = history(vec![user("go")]);
+        let events = collect(options(provider, &h, plain())).await;
+        assert!(!events.iter().any(|e| matches!(e, LoopEvent::Overflow { .. })));
+        assert!(
+            matches!(&events[events.len() - 2..], [LoopEvent::Error(m), LoopEvent::Done(StopReason::Error)] if m == OVERFLOW)
+        );
+    }
+
+    #[tokio::test]
+    async fn at_most_four_recoveries_a_step_and_the_count_resets_after_a_good_step() {
+        let mut script = vec![overflow(), use_tools(&[call("c1", "a.ts")])];
+        script.extend((0..5).map(|_| overflow()));
+        let provider = Arc::new(ScriptedProvider::new(script));
+        let h = history(vec![user("go")]);
+        let (hook, attempts) = on_overflow(&h, vec![OverflowOutcome::Recovered; 10]);
+        let events = collect(AgentOptions { on_overflow: Some(hook), ..options(provider.clone(), &h, plain()) }).await;
+        // Step 1: one recovery; step 2: four, then the fifth overflow gives up.
+        assert_eq!(*attempts.lock().unwrap(), [0, 0, 1, 2, 3, 4]);
+        assert_eq!(provider.requests().len(), 2 + 5);
+        assert!(
+            matches!(&events[events.len() - 2..], [LoopEvent::Error(m), LoopEvent::Done(StopReason::Error)] if m == OVERFLOW)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_wrap_up_request_is_recovered_too_and_sent_again_as_the_wrap_up() {
+        // max_steps 1, no on_limit: the step limit's tools-off wrap-up (#59) overflows, recovers, and is sent again.
+        let provider = Arc::new(ScriptedProvider::new(vec![use_tools(&[call("c1", "a.ts")]), overflow(), say("Wrapped up.")]));
+        let h = history(vec![user("go")]);
+        let (hook, attempts) = on_overflow(&h, vec![OverflowOutcome::Recovered]);
+        let opts = AgentOptions {
+            max_steps: 1,
+            wrap_up_at_limit: true,
+            on_overflow: Some(hook),
+            ..options(provider.clone(), &h, plain())
+        };
+        let events = collect(opts).await;
+        assert_eq!(*attempts.lock().unwrap(), [0]);
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[2].1.tool_choice, ToolChoice::None, "still the wrap-up");
+        assert_eq!(requests[2].0.last(), Some(&user(&format!("fitted\n\n{STEP_LIMIT_NOTE}"))), "its note again");
+        assert_eq!(end(&events), Some(StopReason::MaxSteps));
+    }
+
+    #[tokio::test]
+    async fn esc_during_the_overflow_hook_ends_aborted() {
+        let provider = Arc::new(ScriptedProvider::new(vec![overflow(), say("never")]));
+        let h = history(vec![user("go")]);
+        let opts = options(provider.clone(), &h, plain());
+        let cancel = opts.cancel.clone();
+        let hook: OnOverflow = Arc::new(move |_, _| {
+            cancel.cancel();
+            Box::pin(async { OverflowOutcome::Recovered })
+        });
+        let events = collect(AgentOptions { on_overflow: Some(hook), ..opts }).await;
+        assert_eq!(end(&events), Some(StopReason::Aborted));
+        assert!(!events.iter().any(|e| matches!(e, LoopEvent::Error(_))));
+        assert_eq!(provider.requests().len(), 1);
+
+        let provider = Arc::new(ScriptedProvider::new(vec![overflow()]));
+        let h = history(vec![user("go")]);
+        let hook: OnOverflow = Arc::new(|_, _| Box::pin(async { OverflowOutcome::Stopped }));
+        let events = collect(AgentOptions { on_overflow: Some(hook), ..options(provider, &h, plain()) }).await;
+        assert_eq!(end(&events), Some(StopReason::Aborted));
+        assert!(!events.iter().any(|e| matches!(e, LoopEvent::Error(_))));
+    }
+
+    #[tokio::test]
+    async fn a_note_after_a_mid_turn_compaction_joins_its_note_and_every_request_alternates() {
+        let provider = Arc::new(ScriptedProvider::new(vec![use_tools(&[call("c1", "a.ts")]), say("Done.")]));
+        let h = history(vec![user("go")]);
+        let swapped = h.clone();
+        let on_full: OnFull = Arc::new(move || {
+            let ack = ChatTurn::Assistant { text: crate::compact::COMPACTED_ACK.into(), tool_calls: vec![], reasoning: None };
+            *swapped.lock().unwrap() = vec![user("summary"), ack, user(crate::compact::MID_TURN_NOTE)];
+            Box::pin(async { true })
+        });
+        let opts = AgentOptions {
+            on_full: Some(on_full),
+            after_step: after_step(|_| Some("Marv: the typecheck found 1 new error".into())),
+            ..options(provider.clone(), &h, plain())
+        };
+        collect(opts).await;
+        for (sent, _) in provider.requests() {
+            assert!(crate::compact::alternates(&sent), "{sent:?}");
+        }
+        let last = provider.requests()[1].0.last().cloned().unwrap();
+        assert_eq!(last, user(&format!("{}\n\nMarv: the typecheck found 1 new error", crate::compact::MID_TURN_NOTE)));
     }
 
     #[tokio::test]
@@ -3481,5 +3794,274 @@ mod tests {
                 reasoning: None
             }
         );
+    }
+
+    // "Send now": the person's message at the next step boundary.
+
+    /// A runner whose calls each push `text` into `q` while they run (the person typed it then).
+    fn sending(q: &SendNow, text: &'static str) -> FakeRunner {
+        let q = q.clone();
+        let run: RunFn = Arc::new(move |c, cancel| {
+            let _ = q.push(text.to_string());
+            fake_tool()(c, cancel)
+        });
+        FakeRunner { run, parallel: |_| true }
+    }
+
+    #[tokio::test]
+    async fn sent_now_while_tools_run_goes_in_after_every_result_of_the_step_before_the_next_request() {
+        let provider = Arc::new(ScriptedProvider::new(vec![use_tools(&[call("c1", "a.ts"), call("c2", "b.ts")]), say("Done.")]));
+        let q = SendNow::new();
+        let h = history(vec![user("go")]);
+        let events =
+            collect(AgentOptions { send_now: Some(q.clone()), ..options(provider.clone(), &h, sending(&q, "also b")) }).await;
+        let requests = provider.requests();
+        let second = &requests[1].0;
+        // Both calls ran (nothing was stopped for it), their results first, in call order, then the person's words.
+        // Each call pushed it once: two messages, one user turn (never two in a row), in order.
+        assert!(matches!(
+            &second[second.len() - 3..],
+            [ChatTurn::Tool { call_id: a, .. }, ChatTurn::Tool { call_id: b, .. }, ChatTurn::User { text }]
+                if a == "c1" && b == "c2" && text == "also b\n\nalso b"
+        ));
+        // Appended, not inserted: the second request starts with the first one (prompt cache).
+        assert_eq!(second[..requests[0].0.len()], requests[0].0[..]);
+        // The event comes once it's in the history, after the step's tool ends.
+        let last_end = events.iter().rposition(|e| matches!(e, LoopEvent::ToolEnd { .. })).unwrap();
+        let first_sent = events.iter().position(|e| matches!(e, LoopEvent::SentNow { .. })).unwrap();
+        assert!(first_sent > last_end);
+        assert_eq!(count(&events, |e| matches!(e, LoopEvent::SentNow { text } if text == "also b")), 2);
+        assert_eq!(end(&events), Some(StopReason::End));
+        assert!(q.close().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sent_now_follows_after_steps_note() {
+        let provider = Arc::new(ScriptedProvider::new(vec![use_tools(&[call("c1", "a.ts")]), say("Fixed.")]));
+        let q = SendNow::new();
+        let mut runner = sending(&q, "and the tests");
+        runner.parallel = |_| false;
+        collect(AgentOptions {
+            send_now: Some(q.clone()),
+            after_step: after_step(|_| Some("Marv: 1 new error".into())),
+            ..options(provider.clone(), &history(vec![user("go")]), runner)
+        })
+        .await;
+        let second = &provider.requests()[1].0;
+        // The note was never sent: the person's words join it, after a blank line.
+        assert_eq!(second.last(), Some(&user("Marv: 1 new error\n\nand the tests")));
+        assert!(!matches!(&second[second.len() - 2], ChatTurn::User { .. }));
+    }
+
+    #[tokio::test]
+    async fn sent_now_during_a_plain_answer_is_read_by_one_more_step() {
+        let provider = Arc::new(ScriptedProvider::new(vec![say("Done."), say("Sure, b too.")]));
+        let q = SendNow::new();
+        let h = history(vec![user("go")]);
+        let mut events = Vec::new();
+        let mut stream =
+            std::pin::pin!(run_agent(AgentOptions { send_now: Some(q.clone()), ..options(provider.clone(), &h, plain()) }));
+        while let Some(event) = stream.next().await {
+            // Typed while the reply streams: the run would end after it.
+            if matches!(event, LoopEvent::TextDelta(_)) && events.is_empty() {
+                q.push("and b".into()).unwrap();
+            }
+            events.push(event);
+        }
+        assert_eq!(provider.requests().len(), 2);
+        assert_eq!(snapshot(&h), [user("go"), said("Done."), user("and b"), said("Sure, b too.")]);
+        assert_eq!(count(&events, |e| matches!(e, LoopEvent::SentNow { .. })), 1);
+        // Ahead of #90's "continue": no announced-step event either way here, and the run ends normally.
+        assert_eq!(end(&events), Some(StopReason::End));
+    }
+
+    #[tokio::test]
+    async fn sent_now_before_the_first_request_goes_right_after_the_turns_message() {
+        let provider = Arc::new(ScriptedProvider::new(vec![say("Ok.")]));
+        let q = SendNow::new();
+        q.push("in Rust".into()).unwrap();
+        collect(AgentOptions { send_now: Some(q.clone()), ..options(provider.clone(), &history(vec![user("go")]), plain()) })
+            .await;
+        assert_eq!(provider.requests()[0].0, [user("go\n\nin Rust")]);
+    }
+
+    #[tokio::test]
+    async fn sent_now_is_never_delivered_after_a_stop_or_a_decline_it_stays_for_the_session() {
+        // A decline ends the run: the message isn't read, and the session gets it back.
+        let provider = Arc::new(ScriptedProvider::new(vec![use_tools(&[call("c1", "a.ts")]), say("never asked")]));
+        let q = SendNow::new();
+        let q2 = q.clone();
+        let run: RunFn = Arc::new(move |c, cancel| {
+            let _ = q2.push("do it this way".into());
+            Box::pin(async move { Ok(ToolRun { declined: true, ..fake_tool()(c, cancel).await? }) })
+        });
+        let h = history(vec![user("go")]);
+        let events = collect(AgentOptions {
+            send_now: Some(q.clone()),
+            ..options(provider.clone(), &h, FakeRunner { run, parallel: |_| false })
+        })
+        .await;
+        assert_eq!(end(&events), Some(StopReason::Declined));
+        assert_eq!(count(&events, |e| matches!(e, LoopEvent::SentNow { .. })), 0);
+        assert!(!snapshot(&h).contains(&user("do it this way")));
+        assert_eq!(q.close(), ["do it this way"]);
+
+        // A stop while a tool runs: the call is answered "interrupted", the message stays waiting.
+        let provider = Arc::new(ScriptedProvider::new(vec![use_tools(&[call("c1", "a.ts")]), say("never asked")]));
+        let q = SendNow::new();
+        let (q2, stop) = (q.clone(), CancellationToken::new());
+        let stopper = stop.clone();
+        let run: RunFn = Arc::new(move |c, cancel| {
+            let _ = q2.push("wait".into());
+            stopper.cancel();
+            fake_tool()(c, cancel)
+        });
+        let h = history(vec![user("go")]);
+        let events = collect(AgentOptions {
+            send_now: Some(q.clone()),
+            cancel: stop,
+            ..options(provider.clone(), &h, FakeRunner { run, parallel: |_| false })
+        })
+        .await;
+        assert_eq!(end(&events), Some(StopReason::Aborted));
+        assert_eq!(provider.requests().len(), 1);
+        assert!(!snapshot(&h).contains(&user("wait")));
+        assert_eq!(q.close(), ["wait"]);
+    }
+
+    #[tokio::test]
+    async fn a_history_that_isnt_at_a_step_boundary_keeps_the_message_waiting() {
+        // Whatever the phase: with a call still unanswered at the end of the history, nothing is appended.
+        let h = history(vec![
+            user("go"),
+            ChatTurn::Assistant { text: String::new(), tool_calls: vec![call("c1", "a")], reasoning: None },
+        ]);
+        let q = SendNow::new();
+        q.push("now".into()).unwrap();
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let mut state = LoopState::new(AgentOptions { send_now: Some(q.clone()), ..options(provider, &h, plain()) });
+        assert!(!state.deliver_sent_now());
+        assert!(state.queue.is_empty());
+        assert_eq!(snapshot(&h).len(), 2);
+        h.lock().unwrap().push(tool("c1", "ok"));
+        assert!(state.deliver_sent_now());
+        assert_eq!(snapshot(&h).last(), Some(&user("now")));
+        assert!(matches!(state.queue.pop_front(), Some(LoopEvent::SentNow { text }) if text == "now"));
+    }
+
+    #[tokio::test]
+    async fn sent_now_after_an_empty_reply_waits_rather_than_follow_or_rewrite_the_sent_message() {
+        let empty = vec![ProviderEvent::Done { reason: Some("stop".into()) }];
+        let provider = Arc::new(ScriptedProvider::new(vec![empty, say("Ok."), say("And b.")]));
+        let q = SendNow::new();
+        let h = history(vec![user("go")]);
+        let mut stream =
+            std::pin::pin!(run_agent(AgentOptions { send_now: Some(q.clone()), ..options(provider.clone(), &h, plain()) }));
+        while let Some(event) = stream.next().await {
+            if matches!(event, LoopEvent::EmptyReply { .. }) {
+                q.push("and b".into()).unwrap();
+            }
+        }
+        let requests = provider.requests();
+        // The retry is the same request (cached): "go" was sent, so it isn't rewritten and nothing follows it.
+        assert_eq!(requests[1].0, requests[0].0);
+        assert_eq!(requests[2].0, [user("go"), said("Ok."), user("and b")]);
+    }
+
+    /// A run with `max_steps` 1 whose only step's call runs while the person sends "and b"; `on_limit` answers.
+    async fn at_the_limit(answer: Option<LimitAnswer>) -> (Arc<ScriptedProvider>, SendNow, Vec<LoopEvent>) {
+        let provider = Arc::new(ScriptedProvider::new(vec![use_tools(&[call("c1", "a.ts")]), say("Wrapped up.")]));
+        let q = SendNow::new();
+        let mut runner = sending(&q, "and b");
+        runner.parallel = |_| false;
+        let on_limit: Option<OnLimit> = answer.map(|a| -> OnLimit { Arc::new(move |_| Box::pin(async move { a })) });
+        let events = collect(AgentOptions {
+            send_now: Some(q.clone()),
+            max_steps: 1,
+            on_limit,
+            wrap_up_at_limit: true,
+            ..options(provider.clone(), &history(vec![user("go")]), runner)
+        })
+        .await;
+        (provider, q, events)
+    }
+
+    #[tokio::test]
+    async fn sent_now_waits_at_the_step_limit_goes_in_on_continue_and_comes_back_on_a_stop() {
+        let mentions = |p: &ScriptedProvider| {
+            p.requests().iter().any(|(h, _)| h.iter().any(|t| matches!(t, ChatTurn::User { text } if text.contains("and b"))))
+        };
+        // "Continue": read by the next request.
+        let (provider, q, _) = at_the_limit(Some(LimitAnswer::Continue)).await;
+        assert!(mentions(&provider));
+        assert!(q.close().is_empty());
+        // "Stop": not read, and back to the person.
+        let (provider, q, events) = at_the_limit(Some(LimitAnswer::Stop)).await;
+        assert!(!mentions(&provider));
+        assert_eq!(end(&events), Some(StopReason::MaxSteps));
+        assert_eq!(q.close(), ["and b"]);
+        // A hard stop's wrap-up reply doesn't get it either.
+        let (provider, q, events) = at_the_limit(None).await;
+        assert_eq!(provider.requests().len(), 2);
+        assert!(!mentions(&provider));
+        assert_eq!(end(&events), Some(StopReason::MaxSteps));
+        assert_eq!(q.close(), ["and b"]);
+    }
+
+    #[tokio::test]
+    async fn sent_now_during_a_plain_answer_at_the_limit_ends_the_turn_and_comes_back() {
+        let provider = Arc::new(ScriptedProvider::new(vec![say("Done.")]));
+        let q = SendNow::new();
+        let h = history(vec![user("go")]);
+        let mut events = Vec::new();
+        let mut stream = std::pin::pin!(run_agent(AgentOptions {
+            send_now: Some(q.clone()),
+            max_steps: 1,
+            ..options(provider.clone(), &h, plain())
+        }));
+        while let Some(event) = stream.next().await {
+            if matches!(event, LoopEvent::TextDelta(_)) && events.is_empty() {
+                q.push("and b".into()).unwrap();
+            }
+            events.push(event);
+        }
+        assert_eq!(provider.requests().len(), 1);
+        assert_eq!(end(&events), Some(StopReason::End));
+        assert_eq!(q.close(), ["and b"]);
+    }
+
+    #[tokio::test]
+    async fn sent_now_during_an_overflow_recovery_goes_in_once_and_requests_keep_alternating() {
+        let provider =
+            Arc::new(ScriptedProvider::new(vec![use_tools(&[call("c1", "a.ts")]), overflow(), say("Done."), say("And b.")]));
+        let h = history(vec![user("go")]);
+        let q = SendNow::new();
+        // The person types while the history is being made to fit.
+        let (hook, attempts) = on_overflow(&h, vec![OverflowOutcome::Recovered]);
+        let typed = q.clone();
+        let hook: OnOverflow = Arc::new(move |error, attempt| {
+            typed.push("and b".into()).unwrap();
+            hook(error, attempt)
+        });
+        let events = collect(AgentOptions {
+            on_overflow: Some(hook),
+            send_now: Some(q.clone()),
+            ..options(provider.clone(), &h, plain())
+        })
+        .await;
+        assert_eq!(*attempts.lock().unwrap(), [0]);
+        let requests = provider.requests();
+        // The resend is the fitted history as the hook left it: the message waits for the next boundary.
+        assert_eq!(requests[2].0, [user("fitted")]);
+        // Then it goes in once, as its own turn after the reply: never merged into "fitted", which the resend carried.
+        assert_eq!(requests[3].0, [user("fitted"), said("Done."), user("and b")]);
+        for (n, (sent, _)) in requests.iter().enumerate() {
+            let roles: Vec<bool> =
+                sent.iter().filter(|t| !matches!(t, ChatTurn::Tool { .. })).map(|t| matches!(t, ChatTurn::User { .. })).collect();
+            assert!(roles.windows(2).all(|w| !(w[0] && w[1])), "request {n}: {sent:?}");
+        }
+        assert_eq!(count(&events, |e| matches!(e, LoopEvent::SentNow { .. })), 1);
+        assert_eq!(end(&events), Some(StopReason::End));
+        assert!(q.close().is_empty());
     }
 }
