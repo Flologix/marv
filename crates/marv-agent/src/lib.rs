@@ -6,10 +6,12 @@
 //! - [`repetition`]: text and tool-call loop detection.
 //! - [`compact`]: the summary request and the compacted history (and, planned, compaction v2, #63).
 //! - [`announce`]: #90, marv-rs only — the announced-next-step detector and its continue note.
+//! - [`batch_nudge`]: #215, marv-rs only — the once-per-turn nudge to batch single reads.
 //! - [`send_now`]: marv-rs only — the person's messages delivered at the next step boundary.
 
 pub mod agent;
 pub mod announce;
+pub mod batch_nudge;
 pub mod compact;
 pub mod repetition;
 pub mod send_now;

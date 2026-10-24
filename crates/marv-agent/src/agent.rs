@@ -83,6 +83,13 @@
 //!   The continue is an ordinary step: it counts toward `max_steps`, so at the limit the #59
 //!   wrap-up (or `on_limit`) comes next, and the wrap-up reply is never continued. The #81
 //!   failure-loop guard only sees tool calls, so the two never feed each other.
+//! - **#215 batching nudge** ([`crate::batch_nudge`], with `batch_nudge`): after [`BATCH_NUDGE_AFTER`] steps in a row
+//!   that each made exactly one read-only call that ran, `AfterStep` adds [`BATCH_NUDGE_NOTE`] once per turn (a
+//!   [`LoopEvent::BatchNudge`]), after `after_step`'s note and in the same user message. No extra request: the next
+//!   step's goes out anyway. Any other step (several calls, a write, none, a loop or cut-off note, a "not run"
+//!   record) and a mid-turn compaction start the count over. A step answered with a tool-loop note never reaches
+//!   `AfterStep`, so the loop note wins and the nudge stays due. In the loop, not the session's `after_step`, whose
+//!   notes are fenced as project text: this note is Marv's own.
 //! - **#58 parallel read-only tools**: Marv runs only consecutive `agent` calls together
 //!   (`isParallel`). Here [`ToolRunner::concurrent`] decides, defaulting to `ToolKind::Read`; the
 //!   session also returns true for `agent`. Anything else is a barrier.
@@ -115,6 +122,7 @@ use marv_provider::{EventStream, Provider, StreamOptions};
 use tokio_util::sync::CancellationToken;
 
 pub use crate::announce::{ANNOUNCED_STEP_NOTE, announces_next_step};
+pub use crate::batch_nudge::{BATCH_NUDGE_AFTER, BATCH_NUDGE_NOTE};
 use crate::repetition::{
     FailureLoopState, ToolCallKey, ToolLoopState, detect_text_repetition, failing_command_note, make_tool_key, tool_loop_detected,
 };
@@ -453,6 +461,11 @@ pub enum LoopEvent {
     AnnouncedStep {
         continued: bool,
     },
+    /// #215 (marv-rs): `steps` steps in a row each made one read-only call, so the model was told (once a turn) that
+    /// reads it already knows it needs can go together in one reply.
+    BatchNudge {
+        steps: u32,
+    },
     /// The same tool calls repeated without progress: the model was told (once), or the run stopped.
     ToolLoop {
         continued: bool,
@@ -567,6 +580,9 @@ pub struct AgentOptions {
     /// The person's "send now" messages, appended at the next step boundary ([`crate::send_now`]). The session sets
     /// it for the main agent only.
     pub send_now: Option<SendNow>,
+    /// #215: the once-per-turn nudge to batch reads after [`BATCH_NUDGE_AFTER`] single-read steps
+    /// ([`crate::batch_nudge`]). The session sets it for the main agent only (and the user's `batchNudge`).
+    pub batch_nudge: bool,
 }
 
 impl AgentOptions {
@@ -596,6 +612,7 @@ impl AgentOptions {
             wrap_up_at_limit: false,
             debug_raw: false,
             send_now: None,
+            batch_nudge: false,
         }
     }
 }
@@ -844,7 +861,11 @@ enum Phase {
     /// Marv #63: the request overflowed the window: `on_overflow`, with the provider's error (and the #59 wrap-up's
     /// message when it was the wrap-up request).
     Overflow(String, Option<String>),
-    AfterStep(Vec<ToolRun>),
+    /// `after_step`, then the #215 nudge. `compacted`: `on_full` swapped the history this step.
+    AfterStep {
+        runs: Vec<ToolRun>,
+        compacted: bool,
+    },
 }
 
 /// The loop's state between pulls. A resumable state machine instead of Marv's generator:
@@ -888,6 +909,13 @@ pub struct LoopState {
     sent_len: usize,
     /// Marv #63: overflow recoveries in this step (`on_overflow`'s `attempt`); reset by a step that got a reply.
     overflows: u32,
+    /// #215: steps in a row that each made exactly one read-only call that ran ([`crate::batch_nudge`]). Every step
+    /// that doesn't (another call, several, none, a loop note, a "not run" record, a compaction) starts it over.
+    single_reads: u32,
+    /// #215: the step whose calls just finished made exactly one read-only call that ran (set when they're done).
+    step_single_read: bool,
+    /// #215: the batching nudge was given this turn (once per turn, like `announced`).
+    batch_nudged: bool,
 }
 
 impl LoopState {
@@ -911,6 +939,9 @@ impl LoopState {
             in_flight: InFlight::default(),
             sent_len: 0,
             overflows: 0,
+            single_reads: 0,
+            step_single_read: false,
+            batch_nudged: false,
         }
     }
 
@@ -941,10 +972,12 @@ impl LoopState {
         self.finished = true;
     }
 
-    /// On to the next step (every `continue` of Marv's `for (step…)`).
+    /// On to the next step (every `continue` of Marv's `for (step…)`). A step that ends anywhere but after its calls
+    /// ran (`AfterStep`, which sets the count again) breaks a run of single reads (#215).
     fn next_step(&mut self) {
         self.step += 1;
         self.phase = Phase::Top;
+        self.single_reads = 0;
     }
 
     fn call_key(call: &ToolCall) -> (String, String) {
@@ -1014,9 +1047,11 @@ impl LoopState {
                 // A long turn can fill the context by itself: compaction can't wait for the next user
                 // message. If it compacted, the history was swapped under this loop for the summary plus
                 // a "continue" note (a fresh, valid history), and the next request simply starts from it.
+                        let mut compacted = false;
                 if let Some(on_full) = self.options.on_full.clone()
                     && on_full().await
                 {
+                    compacted = true;
                     // A fresh history (the summary and a note): none of it was sent yet.
                     self.sent_len = 0;
                     self.emit(LoopEvent::Compacted);
@@ -1024,10 +1059,10 @@ impl LoopState {
                         return self.finish(StopReason::Aborted);
                     }
                 }
-                self.phase = Phase::AfterStep(runs);
+                self.phase = Phase::AfterStep { runs, compacted };
             }
             Phase::Overflow(message, wrap_up) => self.overflow(message, wrap_up).await,
-            Phase::AfterStep(runs) => {
+            Phase::AfterStep { runs, compacted } => {
                 if let Some(after_step) = self.options.after_step.clone() {
                     let note = after_step(runs).await;
                     if self.aborted() {
@@ -1037,9 +1072,27 @@ impl LoopState {
                         self.push_note(&note);
                     }
                 }
+                // #215: a compaction starts the count over (the summary replaced the reads it counted).
+                let single_reads = if self.step_single_read && !compacted { self.single_reads + 1 } else { 0 };
+                self.batch_nudge(single_reads);
                 self.next_step();
+                self.single_reads = single_reads;
             }
         }
+    }
+
+    /// #215: after [`BATCH_NUDGE_AFTER`] single-read steps in a row, once per turn, tell the model reads can go
+    /// together. After `after_step`'s note, merged into the same user message ([`Self::push_note`]): never two user
+    /// turns in a row. Nothing extra is requested: the next step's request goes out anyway. A step answered with a
+    /// tool-loop note never gets here (and #81's note is a "not run" record, which doesn't count), so the loop note
+    /// always wins and the nudge stays due for later in the turn.
+    fn batch_nudge(&mut self, single_reads: u32) {
+        if !self.options.batch_nudge || self.batch_nudged || single_reads < BATCH_NUDGE_AFTER {
+            return;
+        }
+        self.batch_nudged = true;
+        self.push_note(BATCH_NUDGE_NOTE);
+        self.emit(LoopEvent::BatchNudge { steps: single_reads });
     }
 
     /// The step limit guards against a model that never finishes. With `on_limit`, the user decides
@@ -1506,7 +1559,8 @@ impl LoopState {
 
     /// Every call of the step is answered.
     fn tools_done(&mut self, tools: &mut Tools) -> bool {
-        self.in_flight = InFlight::default();
+        let in_flight = std::mem::take(&mut self.in_flight);
+        self.step_single_read = crate::batch_nudge::is_single_read(&in_flight.calls, &tools.runs);
         if self.aborted() {
             self.finish(StopReason::Aborted);
         } else if tools.declined {
@@ -4063,5 +4117,189 @@ mod tests {
         assert_eq!(count(&events, |e| matches!(e, LoopEvent::SentNow { .. })), 1);
         assert_eq!(end(&events), Some(StopReason::End));
         assert!(q.close().is_empty());
+    }
+
+    // ---- #215: the once-per-turn nudge to batch single reads ----
+
+    fn nudges(events: &[LoopEvent]) -> Vec<u32> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                LoopEvent::BatchNudge { steps } => Some(*steps),
+                _ => None,
+            })
+            .collect()
+    }
+    /// One step per path, each reading that file alone.
+    fn single_reads(paths: &[&str]) -> Vec<Vec<ProviderEvent>> {
+        paths.iter().enumerate().map(|(i, p)| use_tools(&[call(&format!("r{i}-{p}"), p)])).collect()
+    }
+    /// The user turns of a request's history that carry the nudge.
+    fn nudged_requests(provider: &ScriptedProvider) -> Vec<usize> {
+        provider
+            .requests()
+            .iter()
+            .enumerate()
+            .filter(|(_, (h, _))| h.iter().any(|t| matches!(t, ChatTurn::User { text } if text.contains(BATCH_NUDGE_NOTE))))
+            .map(|(i, _)| i)
+            .collect()
+    }
+    async fn nudge_run(script: Vec<Vec<ProviderEvent>>, runner: FakeRunner) -> (Vec<LoopEvent>, Arc<ScriptedProvider>, History) {
+        let provider = Arc::new(ScriptedProvider::new(script));
+        let h = history(vec![user("go")]);
+        let events = collect(AgentOptions { batch_nudge: true, ..options(provider.clone(), &h, runner) }).await;
+        (events, provider, h)
+    }
+
+    #[tokio::test]
+    async fn the_nudge_comes_after_exactly_four_single_reads_with_the_next_request() {
+        let mut script = single_reads(&["a", "b", "c"]);
+        script.push(say("Done."));
+        let (events, provider, _) = nudge_run(script, plain()).await;
+        assert!(nudges(&events).is_empty(), "not after 3");
+        assert!(nudged_requests(&provider).is_empty());
+
+        let mut script = single_reads(&["a", "b", "c", "d"]);
+        script.push(say("Done."));
+        let (events, provider, h) = nudge_run(script, plain()).await;
+        assert_eq!(nudges(&events), [4]);
+        // No extra request: 4 reads and the answer, the nudge riding on the 5th, right after the 4th result.
+        assert_eq!(provider.requests().len(), 5);
+        assert_eq!(nudged_requests(&provider), [4]);
+        let sent = &provider.requests()[4].0;
+        assert_eq!(sent[sent.len() - 2..], [tool("r3-d", "contents of d"), user(BATCH_NUDGE_NOTE)]);
+        // Appended: the request before it is a prefix of this one (the cache holds).
+        assert!(sent.starts_with(&provider.requests()[3].0));
+        assert_eq!(end(&events), Some(StopReason::End));
+        assert_eq!(snapshot(&h).last(), Some(&said("Done.")));
+    }
+
+    #[tokio::test]
+    async fn the_nudge_fires_once_per_turn() {
+        let mut script = single_reads(&["a", "b", "c", "d", "e", "f", "g", "h", "i"]);
+        script.push(say("Done."));
+        let (events, provider, _) = nudge_run(script, plain()).await;
+        assert_eq!(nudges(&events), [4]);
+        let user_notes = provider.requests().last().unwrap().0.iter().filter(|t| *t == &user(BATCH_NUDGE_NOTE)).count();
+        assert_eq!(user_notes, 1);
+    }
+
+    #[tokio::test]
+    async fn no_nudge_when_it_is_off_as_for_subagents() {
+        let mut script = single_reads(&["a", "b", "c", "d", "e"]);
+        script.push(say("Done."));
+        let provider = Arc::new(ScriptedProvider::new(script));
+        let events = collect(options(provider.clone(), &history(vec![user("go")]), plain())).await;
+        assert!(nudges(&events).is_empty());
+        assert!(nudged_requests(&provider).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_step_that_isnt_one_read_starts_the_count_over() {
+        let write = ToolCall { id: "w".into(), name: "write_file".into(), arguments: r#"{"path":"x","content":"y"}"#.into() };
+        let both = use_tools(&[call("p1", "p"), call("p2", "q")]);
+        let mut script = single_reads(&["a", "b", "c"]);
+        script.push(use_tools(&[write]));
+        script.extend(single_reads(&["d", "e", "f"]));
+        script.push(both);
+        script.extend(single_reads(&["g", "h", "i"]));
+        script.push(say("Done."));
+        let (events, _, _) = nudge_run(script, plain()).await;
+        assert!(nudges(&events).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_compaction_starts_the_count_over() {
+        let mut script = single_reads(&["a", "b", "c", "d", "e"]);
+        script.push(say("Done."));
+        let provider = Arc::new(ScriptedProvider::new(script));
+        let h = history(vec![user("go")]);
+        let swapped = h.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let on_full: OnFull = Arc::new(move || {
+            let compact = calls.fetch_add(1, Ordering::SeqCst) == 1;
+            if compact {
+                *swapped.lock().unwrap() = vec![user("summary"), user(crate::compact::MID_TURN_NOTE)];
+            }
+            Box::pin(async move { compact })
+        });
+        let events = collect(AgentOptions { batch_nudge: true, on_full: Some(on_full), ..options(provider.clone(), &h, plain()) }).await;
+        assert!(events.iter().any(|e| matches!(e, LoopEvent::Compacted)));
+        // Compacted after b: c, d and e are only 3.
+        assert!(nudges(&events).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_step_answered_with_a_tool_loop_note_never_gets_the_nudge_and_it_stays_due() {
+        // a four times: the 4th is answered with the tool-loop note (it would have been the 4th single read).
+        let mut script = single_reads(&["a", "a", "a", "a", "b", "c", "d"]);
+        script.push(single_reads(&["e"]).remove(0));
+        script.push(say("Done."));
+        let (events, provider, _) = nudge_run(script, plain()).await;
+        assert_eq!(tool_loops(&events), [true]);
+        let loop_at = events.iter().position(|e| matches!(e, LoopEvent::ToolLoop { .. })).unwrap();
+        let nudge_at = events.iter().position(|e| matches!(e, LoopEvent::BatchNudge { .. })).unwrap();
+        assert!(loop_at < nudge_at);
+        assert_eq!(nudges(&events), [4]);
+        // Not with the loop note's step (request 4), but after b, c, d and e (request 8).
+        assert_eq!(nudged_requests(&provider)[0], 8);
+    }
+
+    #[tokio::test]
+    async fn a_not_run_record_doesnt_count() {
+        // cat of a missing file fails twice the same way; the third try is answered with #81's note, not run.
+        let run: RunFn = Arc::new(|c, _| {
+            let out = if c.name == "bash" {
+                "cat: missing.txt: No such file or directory\n\n[exit code 1]".to_string()
+            } else {
+                format!("contents of {}", arg(&c, "path").as_str().unwrap_or_default())
+            };
+            Box::pin(async move { Ok(ok(out, c.id.clone())) })
+        });
+        let script = vec![
+            use_tools(&[call("r1", "a")]),
+            use_tools(&[bash_call("c1", "cat missing.txt")]),
+            use_tools(&[bash_call("c2", "cat missing.txt")]),
+            use_tools(&[bash_call("c3", "cat missing.txt")]),
+            use_tools(&[call("r2", "b")]),
+            say("Done."),
+        ];
+        let (events, _, h) = nudge_run(script, FakeRunner { run, parallel: |_| false }).await;
+        assert_eq!(tool_loops(&events), [true]);
+        assert!(tool_texts(&h).iter().any(|t| t.starts_with("Marv: not run.")));
+        assert!(nudges(&events).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_read_only_bash_command_counts_and_rm_doesnt() {
+        let reads = |cmd: &str| {
+            let mut script = single_reads(&["a", "b", "c"]);
+            script.push(use_tools(&[bash_call("b1", cmd)]));
+            script.push(say("Done."));
+            script
+        };
+        let (events, _, _) = nudge_run(reads("ls src && git status"), plain()).await;
+        assert_eq!(nudges(&events), [4]);
+        let (events, _, _) = nudge_run(reads("rm -rf target"), plain()).await;
+        assert!(nudges(&events).is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_nudge_shares_one_user_message_with_after_steps_note() {
+        let mut script = single_reads(&["a", "b", "c", "d"]);
+        script.push(say("Done."));
+        let provider = Arc::new(ScriptedProvider::new(script));
+        let h = history(vec![user("go")]);
+        let events = collect(AgentOptions {
+            batch_nudge: true,
+            after_step: after_step(|_| Some("Marv: note".into())),
+            ..options(provider.clone(), &h, plain())
+        })
+        .await;
+        assert_eq!(nudges(&events), [4]);
+        let sent = &provider.requests()[4].0;
+        assert_eq!(sent[sent.len() - 2..], [tool("r3-d", "contents of d"), user(&format!("Marv: note\n\n{BATCH_NUDGE_NOTE}"))]);
+        // Never two user turns in a row.
+        assert!(sent.windows(2).all(|w| !matches!(w, [ChatTurn::User { .. }, ChatTurn::User { .. }])));
     }
 }
