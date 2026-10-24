@@ -122,16 +122,49 @@ pub fn saved_provenance(path: &Path) -> Provenance {
     }
 }
 
+/// The start of a call's saved outputs' names (`<stem>[-n][.<source>].txt`): a provider's id is the model's text as far
+/// as a file name goes, so only what's safe in one.
+pub fn saved_stem(call_id: &str) -> String {
+    let name: String =
+        call_id.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' }).take(100).collect();
+    if name.is_empty() { "call".into() } else { name }
+}
+
+/// The saved outputs of call `call_id` in `dir` (a session's folder), by name: what a page lists, from the files
+/// themselves rather than from the result's text.
+pub fn saved_outputs(dir: &Path, call_id: &str) -> Vec<PathBuf> {
+    let stem = saved_stem(call_id);
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut found: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .filter(|e| {
+            let name = e.file_name();
+            let Some(name) = name.to_str().and_then(|n| n.strip_suffix(".txt")) else { return false };
+            let Some(rest) = name.strip_prefix(&stem) else { return false };
+            // Exactly `<stem>`, or `<stem>-<n>` (a taken name), then `.<source>` or nothing.
+            let rest = match rest.strip_prefix('-') {
+                Some(numbered) => {
+                    let digits = numbered.len() - numbered.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+                    if digits == 0 {
+                        return false;
+                    }
+                    &numbered[digits..]
+                }
+                None => rest,
+            };
+            rest.is_empty() || (rest.starts_with('.') && !rest[1..].contains('.'))
+        })
+        .map(|e| e.path())
+        .collect();
+    found.sort();
+    found
+}
+
 /// Writes `text` to a new `<call id>[.<source>].txt` in `dir` (0600; `-1`, `-2`… when the name is taken). Returns its
 /// path.
 fn save(text: &str, dir: &Path, call_id: &str, source: Provenance) -> std::io::Result<PathBuf> {
     std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
-    // A provider's id is the model's text as far as a file name goes: only what's safe in one.
-    let mut name: String =
-        call_id.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' }).take(100).collect();
-    if name.is_empty() {
-        name = "call".into();
-    }
+    let name = saved_stem(call_id);
     let tag = source_tag(source).map_or(String::new(), |t| format!(".{t}"));
     for n in 0.. {
         let path = if n == 0 { dir.join(format!("{name}{tag}.txt")) } else { dir.join(format!("{name}-{n}{tag}.txt")) };
@@ -181,7 +214,8 @@ pub fn hold(dir: &Path) -> std::io::Result<LiveFolder> {
 
 /// Deletes a session's folder unless a live session holds it ([`hold`]); the exclusive lock is kept while deleting,
 /// so a session starting to hold it waits and makes it again. Whether it was deleted.
-fn remove_unless_held(dir: &Path) -> bool {
+/// Removes `dir` unless a live session holds it ([`hold`]); `true` when it's gone. Also for saved pages' folders.
+pub fn remove_unless_held(dir: &Path) -> bool {
     let live = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -244,6 +278,17 @@ mod tests {
     use super::*;
     use crate::test_support::TempDir;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn a_calls_saved_outputs_are_found_by_its_exact_name() {
+        let dir = TempDir::new("saved-outputs");
+        for name in ["c1.txt", "c1-2.mcp.txt", "c1-.txt", "c10.txt", "c1x.txt", "c1.mcp.extra.txt"] {
+            std::fs::write(dir.path().join(name), "x").unwrap();
+        }
+        let found: Vec<String> =
+            saved_outputs(dir.path(), "c1").iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(found, ["c1-2.mcp.txt", "c1.txt"]);
+    }
 
     #[test]
     fn keeps_the_start_and_the_end_of_very_long_output() {

@@ -419,6 +419,9 @@ pub struct ToolContext {
     /// This session's folder of saved outputs (#61, `~/.marv/tool-output/<session>`): a cut result is saved there
     /// whole, and `read_file` and `grep` may read it (only it, read-only). None: cuts aren't saved.
     pub tool_output: Option<PathBuf>,
+    /// This conversation's saved pages (`crate::swap`), which `recall` reads: the main agent's only. None: nothing to
+    /// recall (a subagent, or no session store).
+    pub swap: Option<PathBuf>,
     /// Where a running call says what it's waiting for (#201: "waiting for beta to accept the wire"), shown on its
     /// card. The main agent's only; None: nothing is shown.
     pub progress: Option<Arc<dyn ToolProgress>>,
@@ -474,6 +477,7 @@ impl ToolContext {
             formatter: None,
             network_failures: Arc::default(),
             tool_output: None,
+            swap: None,
             progress: None,
         }
     }

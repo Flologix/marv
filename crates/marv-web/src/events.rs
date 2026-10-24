@@ -3,7 +3,7 @@
 
 use marv_agent::agent::LoopEvent;
 use marv_core::printable;
-use marv_session::{CompactResult, SessionEvent, TurnStatus};
+use marv_session::{SessionEvent, TurnStatus};
 use marv_tools::types::DiffShown;
 use serde_json::{Value, json};
 
@@ -61,12 +61,7 @@ pub fn to_json(event: &SessionEvent) -> Option<Value> {
             TurnStatus::Checkpointing => "checkpointing",
             TurnStatus::Running => "running",
         }})),
-        SessionEvent::Compaction(result) => Some(match result {
-            CompactResult::Compacted { .. } => json!({"type": "compaction", "compacted": true}),
-            CompactResult::NotCompacted { reason, error } => {
-                json!({"type": "compaction", "compacted": false, "reason": reason.as_str(), "error": error})
-            }
-        }),
+        SessionEvent::Compaction(result) => Some(marv_session::compaction_json(result)),
         SessionEvent::Tainted { source } => Some(json!({"type": "tainted", "source": source})),
         // #203: the TUI's sentence, as a warning; git's own text cut to its first line (it can run to a page of hints,
         // and as a plain notice above the turn's tool cards it read like a command's output).
@@ -74,6 +69,7 @@ pub fn to_json(event: &SessionEvent) -> Option<Value> {
             "type": "checkpoint_failed",
             "text": format!("This turn can't be undone: its checkpoint failed ({}).", first_line(message, MAX_DETAIL)),
         })),
+        SessionEvent::Notice { text } => Some(json!({"type": "notice", "text": text})),
         SessionEvent::TurnEnd { reason, .. } => Some(json!({"type": "turn_end", "reason": reason.as_str()})),
         _ => None,
     }

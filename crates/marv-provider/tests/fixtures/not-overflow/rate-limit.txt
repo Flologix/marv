@@ -1,0 +1,2 @@
+Rate limited by OpenRouter. Wait a moment and try again.
+Rate limit exceeded: free-models-per-min.

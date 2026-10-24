@@ -64,7 +64,7 @@ async fn every_tool_declares_a_source_class() {
             "read_file" | "glob" | "grep" | "edit_file" | "write_file" | "bash" | "process" | "skill" | "agent" => {
                 SourceClass::Workspace
             }
-            "memory" | "plan" => SourceClass::Authority,
+            "memory" | "plan" | "recall" => SourceClass::Authority,
             other => panic!("{other} is a new tool: add it here with the source of what it returns"),
         };
         assert_eq!(tool.provenance().class(), expected, "{}", tool.name());

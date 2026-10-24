@@ -33,7 +33,8 @@ pub struct SuggestOptions<'a> {
 /// The suggestion request's history: the same history plus the instruction.
 pub fn suggestion_request(history: &[ChatTurn]) -> Vec<ChatTurn> {
     let mut request = history.to_vec();
-    request.push(ChatTurn::User { text: INSTRUCTIONS.into() });
+    // Merged into a trailing user turn (#63 review): never two in a row.
+    crate::compact::push_user(&mut request, INSTRUCTIONS);
     request
 }
 
@@ -91,6 +92,13 @@ pub async fn suggest(options: SuggestOptions<'_>) -> Option<String> {
 mod tests {
     use super::*;
     use crate::testing::ScriptedProvider;
+
+    #[test]
+    fn the_instruction_joins_a_trailing_user_turn() {
+        let request = suggestion_request(&[ChatTurn::User { text: "hi".into() }]);
+        assert_eq!(request.len(), 1);
+        assert!(crate::compact::alternates(&request));
+    }
 
     fn history() -> Vec<ChatTurn> {
         vec![
