@@ -2560,7 +2560,10 @@ impl MarvSession {
                     return run;
                 }
                 fenced(text).unwrap_or(match name.as_str() {
-                    "web_fetch" | "github" | "agent" => Provenance::Web,
+                    // As `SavedSession::taint_sources` reads an old file: GitHub's text is GitHub's (a networked
+                    // command's output carries its own `network` fence, read above).
+                    "web_fetch" | "agent" => Provenance::Web,
+                    "github" => Provenance::Github,
                     n if n.starts_with("mcp") => Provenance::Mcp,
                     n if n.starts_with("mesh") || n.starts_with("radio") => Provenance::Mesh,
                     "herdr" => Provenance::Herdr,
