@@ -828,19 +828,31 @@ impl CheckpointStore {
         }
         // Not a repository (or an unusable one): Marv's own bare git dir, with the project as its work tree.
         let own_dir = self.options.own_dir.as_ref().ok_or_else(|| NOT_A_REPOSITORY.to_string())?;
+        // A project folder that's gone (rev-parse failed for that) has nothing to snapshot: no git dir is made for it.
+        // A session dropped without close() still had a prune here when its test removed the project and config
+        // folders, and made `config/checkpoints/<key>/git` again (CI's leftover-folder check).
+        if !root.is_dir() {
+            return Err(format!("the project folder {} is gone", root.display()));
+        }
         let git_dir = own_dir.join("git");
         std::fs::create_dir_all(&git_dir).map_err(|e| e.to_string())?;
+        // Run in the git dir with no path: `git init <path>` makes the path's missing folders, so one still running
+        // when the folder was removed made the tree again; in a removed working folder it fails instead.
         let init = run_git_async(
-            own_dir,
-            &["init", "--bare", "-q", &git_dir.to_string_lossy()],
+            &git_dir,
+            &["init", "--bare", "-q"],
             GitOptions { timeout: Duration::from_secs(10), ..Default::default() },
         )
         .await;
         if !init.ok {
             return Err(if init.out.trim().is_empty() { "git init failed".into() } else { init.out.trim().into() });
         }
-        // No .gitignore applies here: the file listing's skip list keeps dependencies and build output out.
-        std::fs::create_dir_all(git_dir.join("info")).map_err(|e| e.to_string())?;
+        // No .gitignore applies here: the file listing's skip list keeps dependencies and build output out. Only
+        // `info` is made (not its parents), for the same reason.
+        match std::fs::create_dir(git_dir.join("info")) {
+            Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e.to_string()),
+            _ => {}
+        }
         let exclude: String = marv_tools::files::IGNORED_DIRS.iter().map(|name| format!("{name}/\n")).collect();
         std::fs::write(git_dir.join("info").join("exclude"), exclude).map_err(|e| e.to_string())?;
         let top = std::path::absolute(root).unwrap_or_else(|_| root.clone());
@@ -968,6 +980,19 @@ mod tests {
     fn age(path: &Path, secs: u64) {
         let file = std::fs::File::options().write(true).open(path).unwrap();
         file.set_modified(SystemTime::now() - Duration::from_secs(secs)).unwrap();
+    }
+
+    // CI's leftover-folder check: a store whose project folder was removed (a test's cleanup ran before a prune of a
+    // session it didn't close) makes no git dir of its own.
+    #[tokio::test]
+    async fn a_removed_project_gets_no_git_dir() {
+        let plain = temp("cp-gone");
+        let own = temp("cp-own");
+        let own_dir = own.0.join("checkpoints").join("key");
+        let store = CheckpointStore::new(StoreOptions::new(plain.0.clone(), Some(own_dir.clone()), "s1"));
+        std::fs::remove_dir_all(&plain.0).unwrap();
+        assert!(store.locate().await.unwrap_err().contains("is gone"));
+        assert!(!own.0.join("checkpoints").exists());
     }
 
     #[tokio::test]

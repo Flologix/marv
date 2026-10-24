@@ -258,11 +258,17 @@ pub struct SessionStore {
     /// project's folder, inside a store folder that still exists: a save that lands late (a session dropped without
     /// `close()`, or its folders removed meanwhile) fails instead of making the tree again.
     made: Arc<std::sync::atomic::AtomicBool>,
+    /// The nearest folder at or above `dir` that existed when the store was made: the first save makes its folders
+    /// below this one only. A first save that landed after a test removed the store's folder made the whole tree
+    /// again (`write_private` makes every missing parent), and CI's leftover-folder check failed on it.
+    first_anchor: Option<PathBuf>,
 }
 
 impl SessionStore {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into(), made: Arc::default() }
+        let dir = dir.into();
+        let first_anchor = dir.ancestors().find(|a| !a.as_os_str().is_empty() && a.is_dir()).map(Path::to_path_buf);
+        Self { dir, made: Arc::default(), first_anchor }
     }
 
     fn folder(&self, root: &Path) -> PathBuf {
@@ -291,7 +297,10 @@ impl SessionStore {
         if self.made.load(std::sync::atomic::Ordering::SeqCst) {
             write_private_under(&self.dir, &file, &text).await?;
         } else {
-            write_private(&file, &text).await?;
+            match &self.first_anchor {
+                Some(anchor) => write_private_under(anchor, &file, &text).await?,
+                None => write_private(&file, &text).await?,
+            }
             self.made.store(true, std::sync::atomic::Ordering::SeqCst);
         }
         // Saved under the old key before: it lives in the new folder from now on.
@@ -421,6 +430,22 @@ mod tests {
         std::fs::remove_dir_all(&base).unwrap();
         assert!(store.save(&with_user(Path::new("/home/me/proj"), "late", 3)).await.is_err());
         assert!(!base.exists());
+    }
+
+    // The same for a store's first save: one landing after its folder was removed (a test's cleanup ran first) fails
+    // and makes nothing again; a store whose folder doesn't exist yet still makes it on its first save.
+    #[tokio::test]
+    async fn a_late_first_save_never_makes_the_store_again() {
+        let base = std::env::temp_dir().join(format!("marv-sessions-first-{}-{}", std::process::id(), random_hex()));
+        std::fs::create_dir_all(base.join("store")).unwrap();
+        let store = SessionStore::new(base.join("store"));
+        std::fs::remove_dir_all(&base).unwrap();
+        assert!(store.save(&with_user(Path::new("/home/me/proj"), "late", 1)).await.is_err());
+        assert!(!base.exists());
+        let fresh = SessionStore::new(base.join("a/b/store"));
+        fresh.save(&with_user(Path::new("/home/me/proj"), "hi", 2)).await.unwrap();
+        assert!(base.join("a/b/store").is_dir());
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
