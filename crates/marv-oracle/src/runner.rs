@@ -283,6 +283,7 @@ pub fn canonical_request(body: &str) -> String {
             let system = message.get("role") == Some(&json!("system"));
             let user = message.get("role") == Some(&json!("user"));
             let Some(content) = message.get_mut("content") else { continue };
+            unfence_content(content);
             if system {
                 strip_sections(content);
                 unword(content);
@@ -365,6 +366,32 @@ pub const MARV_RS_TEXT: &[(&str, &str)] = &[
         "",
     ),
 ];
+
+/// marv-rs quotes MCP tool descriptions as the servers' data (in the deferred-tools note and in `tool_search`'s answer;
+/// `marv_mcp::deferred::DESCRIPTIONS_FROM`), where Marv lists them as they are: the note's sentence and the fence.
+const MCP_DESCRIPTIONS_SENTENCE: (&str, &str) = ("). Their descriptions are the servers' own words, quoted as data:\n", "):\n");
+const MCP_DESCRIPTIONS_OPEN: &str = "<untrusted-data source=\"mcp\" from=\"MCP tool descriptions\">\n";
+const MCP_DESCRIPTIONS_CLOSE: &str = "\n</untrusted-data>";
+
+/// Takes the fence around MCP tool descriptions back out (each opening line and the closing tag after it).
+pub fn unfence_mcp_descriptions(text: &mut String) {
+    *text = text.replace(MCP_DESCRIPTIONS_SENTENCE.0, MCP_DESCRIPTIONS_SENTENCE.1);
+    while let Some(start) = text.find(MCP_DESCRIPTIONS_OPEN) {
+        let after = start + MCP_DESCRIPTIONS_OPEN.len();
+        let Some(close) = text[after..].find(MCP_DESCRIPTIONS_CLOSE).map(|i| after + i) else { break };
+        text.replace_range(close..close + MCP_DESCRIPTIONS_CLOSE.len(), "");
+        text.replace_range(start..after, "");
+    }
+}
+
+/// [`unfence_mcp_descriptions`] in a message's content, plain or in parts.
+fn unfence_content(content: &mut Value) {
+    match content {
+        Value::String(text) => unfence_mcp_descriptions(text),
+        Value::Array(parts) => parts.iter_mut().filter_map(|p| p.get_mut("text")).for_each(unfence_content),
+        _ => {}
+    }
+}
 
 /// Puts Marv's wording back for each of [`MARV_RS_TEXT`] in a string, plain or in parts.
 fn unword(content: &mut Value) {
@@ -508,6 +535,17 @@ fn worktree_names(project: &Path, config_dir: &Path) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_description_fences_come_out_as_marv_lists_them() {
+        let mut note = "Marv: MCP tools you can use (not loaded: x). Their descriptions are the servers' own words, quoted as data:\n<untrusted-data source=\"mcp\" from=\"MCP tool descriptions\">\n- a: b\n</untrusted-data>\n\nDo it.".to_string();
+        unfence_mcp_descriptions(&mut note);
+        assert_eq!(note, "Marv: MCP tools you can use (not loaded: x):\n- a: b\n\nDo it.");
+        let mut other = "<untrusted-data source=\"mcp\" from=\"mcp__t__get\">\nx\n</untrusted-data>".to_string();
+        let before = other.clone();
+        unfence_mcp_descriptions(&mut other);
+        assert_eq!(other, before, "a server's result keeps its fence");
+    }
 
     #[test]
     fn tree_round_trips_and_skips_git() {
