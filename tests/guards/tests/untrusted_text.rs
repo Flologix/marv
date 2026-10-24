@@ -408,6 +408,10 @@ impl Chat {
         let mut turn = self.session.send(text, marv_session::SendOptions::default()).expect("a turn");
         while turn.next().await.is_some() {}
     }
+    /// Waits for what the session still runs (the checkpoint prune of its first turn) before the folder goes.
+    async fn close(self) {
+        self.session.close().await;
+    }
 }
 
 /// A tainted conversation's summary starts with Marv's fixed words: it may repeat outside text unfenced.
@@ -423,10 +427,14 @@ async fn a_tainted_compaction_says_so_in_fixed_words() {
     assert!(!chat.session.tainted().is_empty());
     chat.session.compact(None).await.unwrap();
     chat.say("go on").await;
-    let requests = chat.model.requests.lock().unwrap();
-    let marv_core::ChatTurn::User { text } = &requests.last().unwrap().0[0] else { panic!("the summary first") };
+    let text = {
+        let requests = chat.model.requests.lock().unwrap();
+        let marv_core::ChatTurn::User { text } = &requests.last().unwrap().0[0] else { panic!("the summary first") };
+        text.clone()
+    };
     assert!(text.starts_with(marv_agent::compact::TAINTED_SUMMARY_NOTE), "{text}");
     assert!(text.contains("SUMMARY"));
+    chat.close().await;
 }
 
 /// `/clear` ends the taint of the conversation it clears: its outside text is gone.
@@ -440,6 +448,7 @@ async fn clear_ends_the_cleared_conversations_taint() {
     assert_eq!(chat.session.tainted(), [Provenance::Web]);
     chat.session.clear().await.unwrap();
     assert!(chat.session.tainted().is_empty());
+    chat.close().await;
 }
 
 /// After GitHub's text or a networked command's output, the next-message suggestion stays off (one key would send
@@ -455,6 +464,7 @@ async fn suggestions_stay_off_after_github_or_network_output() {
         let asked = chat.model.requests.lock().unwrap().len();
         assert_eq!(chat.session.suggest(CancellationToken::new()).await, None, "{source:?}");
         assert_eq!(chat.model.requests.lock().unwrap().len(), asked, "no suggestion was asked for after {source:?}");
+        chat.close().await;
     }
 }
 
