@@ -78,6 +78,7 @@ async fn the_formatter_never_rewrites_protected_paths_or_package_json() {
     let asker = Recorder::new(Decision::Yes);
     ctx.approver = Some(asker.clone());
     ctx.formatter = Some(Arc::new(ProjectFormatter::new(FormatterSetting::Auto, true, None)));
+    marv_guards::have_read(&ctx, &["package.json", ".vscode/settings.json", "src/a.ts"]);
     let edit = |path: &str, old: &str, new: &str| call("edit_file", json!({"path": path, "old_string": old, "new_string": new}));
 
     // A plain package.json edit (no lifecycle script changed) runs in yolo and lands as approved.
@@ -135,6 +136,7 @@ async fn in_the_sandbox_the_formatter_rewrites_only_the_file_it_was_given() {
     ctx.sandbox = Arc::new(Sandbox::from_env(true));
     ctx.yolo = true;
     ctx.formatter = Some(Arc::new(ProjectFormatter::new(FormatterSetting::Auto, true, None)));
+    marv_guards::have_read(&ctx, &["src/a.ts"]);
     let call = marv_core::ToolCall {
         id: "c".into(),
         name: "edit_file".into(),
@@ -169,6 +171,7 @@ async fn a_failing_formatters_output_is_fenced_as_project_data() {
     ctx.sandbox = Arc::new(Sandbox::from_env(true));
     ctx.yolo = true;
     ctx.formatter = Some(Arc::new(ProjectFormatter::new(FormatterSetting::Auto, true, None)));
+    marv_guards::have_read(&ctx, &["a.ts"]);
     let out =
         run_tool(&call("edit_file", json!({"path": "a.ts", "old_string": "hi", "new_string": "yo"})), &ctx, builtin_tools())
             .await

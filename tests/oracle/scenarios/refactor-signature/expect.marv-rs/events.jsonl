@@ -1,0 +1,27 @@
+{"status":"running","type":"status"}
+{"label":"createServer\\(","tool":"grep","type":"tool_start"}
+{"label":"src/server.js","tool":"read_file","type":"tool_start"}
+{"label":"src/main.js","tool":"read_file","type":"tool_start"}
+{"label":"src/dev.js","tool":"read_file","type":"tool_start"}
+{"label":"src/server.js","result":"    1→// A pretend server: just enough to show where it would listen.\n    2→export function createServer(port, host = \"localhost\") {\n    3→  if (!Number.isInteger(port)) throw new TypeError(\"port must be an integer\");\n    4→  return { port, host, url: `http://${host}:${port}` };\n    5→}","tool":"read_file","type":"tool_end"}
+{"label":"scripts/smoke.js","tool":"read_file","type":"tool_start"}
+{"label":"src/main.js","result":"    1→import { createServer } from \"./server.js\";\n    2→\n    3→export function start(env = {}) {\n    4→  return createServer(Number(env.PORT ?? 3000), env.HOST ?? \"0.0.0.0\");\n    5→}","tool":"read_file","type":"tool_end"}
+{"label":"src/dev.js","result":"    1→import { createServer } from \"./server.js\";\n    2→\n    3→// The dev server always runs locally.\n    4→export const devServer = () => createServer(5173);","tool":"read_file","type":"tool_end"}
+{"label":"\"createServer\\(\"","result":"scripts/smoke.js:4:  const servers = [createServer(8080), createServer(8443, \"example.test\")];\nsrc/dev.js:4:export const devServer = () => createServer(5173);\nsrc/main.js:4:  return createServer(Number(env.PORT ?? 3000), env.HOST ?? \"0.0.0.0\");\nsrc/server.js:2:export function createServer(port, host = \"localhost\") {","tool":"grep","type":"tool_end"}
+{"label":"scripts/smoke.js","result":"    1→import { createServer } from \"../src/server.js\";\n    2→\n    3→export function smoke() {\n    4→  const servers = [createServer(8080), createServer(8443, \"example.test\")];\n    5→  return servers.map((s) => s.url);\n    6→}","tool":"read_file","type":"tool_end"}
+{"label":"src/server.js","tool":"edit_file","type":"tool_start"}
+{"approval":"auto","label":"src/server.js","result":"Edited src/server.js: replaced 1 occurrence (+1 −1 lines).","tool":"edit_file","type":"tool_end"}
+{"label":"src/main.js","tool":"edit_file","type":"tool_start"}
+{"approval":"auto","label":"src/main.js","result":"Edited src/main.js: replaced 1 occurrence (+1 −1 lines).","tool":"edit_file","type":"tool_end"}
+{"label":"src/dev.js","tool":"edit_file","type":"tool_start"}
+{"approval":"auto","label":"src/dev.js","result":"Edited src/dev.js: replaced 1 occurrence (+1 −1 lines).","tool":"edit_file","type":"tool_end"}
+{"label":"scripts/smoke.js","tool":"edit_file","type":"tool_start"}
+{"approval":"auto","label":"scripts/smoke.js","result":"Edited scripts/smoke.js: replaced 1 occurrence (+1 −1 lines).","tool":"edit_file","type":"tool_end"}
+{"label":"git diff --stat","tool":"bash","type":"tool_start"}
+{"approval":"auto","label":"git diff --stat","result":" scripts/smoke.js | 2 +-\n src/dev.js       | 2 +-\n src/main.js      | 2 +-\n src/server.js    | 2 +-\n 4 files changed, 4 insertions(+), 4 deletions(-)\n\n[exit code 0]","tool":"bash","type":"tool_end"}
+{"text":"`createServer` takes `{ port, host }` (host still ","type":"text_delta"}
+{"text":"defaults to \"localhost\"); `main`, `dev` and `scrip","type":"text_delta"}
+{"text":"ts/smoke.js` pass an object.","type":"text_delta"}
+{"text":"`createServer` takes `{ port, host }` (host still defaults to \"localhost\"); `main`, `dev` and `scripts/smoke.js` pass an object.","type":"assistant"}
+{"reason":"end","type":"done"}
+{"reason":"end","reply":"`createServer` takes `{ port, host }` (host still defaults to \"localhost\"); `main`, `dev` and `scripts/smoke.js` pass an object.","steps":4,"type":"result","usage":{"cachedTokens":0,"completionTokens":200,"cost":0.004,"promptTokens":4000}}

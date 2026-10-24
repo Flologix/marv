@@ -245,6 +245,16 @@ agent {"description":"fix the bug","isolation":"worktree","prompt":"Fix it."}
   subagent of woken     -         -         -         -
   subagent of radio     -         -         -         -
 
+recall {"page":1}
+  person                runs      runs      runs      runs
+  headless              runs      runs      runs      runs
+  woken                 runs      runs      runs      runs
+  radio                 runs      runs      runs      runs
+  subagent              -         -         -         -
+  subagent of headless  -         -         -         -
+  subagent of woken     -         -         -         -
+  subagent of radio     -         -         -         -
+
 ## sandbox off, no doors
 
 read_file {"path":"src/main.rs"}
@@ -482,6 +492,16 @@ agent {"description":"fix the bug","isolation":"worktree","prompt":"Fix it."}
   headless              ask       ask       ask       ask
   woken                 once      once      once      once
   radio                 once      once      once      once
+  subagent              -         -         -         -
+  subagent of headless  -         -         -         -
+  subagent of woken     -         -         -         -
+  subagent of radio     -         -         -         -
+
+recall {"page":1}
+  person                runs      runs      runs      runs
+  headless              runs      runs      runs      runs
+  woken                 runs      runs      runs      runs
+  radio                 runs      runs      runs      runs
   subagent              -         -         -         -
   subagent of headless  -         -         -         -
   subagent of woken     -         -         -         -

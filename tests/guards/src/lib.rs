@@ -246,6 +246,18 @@ pub fn in_child_with_env(name: &str, env: &[(&str, &str)]) -> bool {
     false
 }
 
+/// The session has read these files (relative to `ctx.root`, or absolute) as they are now; missing ones are skipped.
+/// The edit tools change an existing file only once the session has read it (`docs/SECURITY.md`, "File changes"), so
+/// a guard about something else starts from files the model has seen.
+pub fn have_read(ctx: &marv_tools::ToolContext, files: &[&str]) {
+    for file in files {
+        let path = ctx.root.join(file);
+        if let Ok(content) = std::fs::read(&path) {
+            ctx.file_versions.saw(&path, &content);
+        }
+    }
+}
+
 /// A model that replays one scripted reply per request (Marv's `ScriptedProvider`) and records each request.
 #[derive(Default)]
 pub struct Scripted {

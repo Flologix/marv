@@ -113,6 +113,9 @@ pub fn subagent_context(
     ctx.forwards = parent.forwards.clone();
     // Its cut outputs are saved with the session's (#61), so it can read them back as the main agent can.
     ctx.tool_output = parent.tool_output.clone();
+    // Its edits lock against other processes like the parent's; what it has read is its own (`file_versions` stays
+    // fresh), so the parent's next write to a file it changed is refused until the parent reads it again.
+    ctx.file_locks = parent.file_locks.clone();
     // A shared-folder subagent edits the same files in the same turn: the turn's one checkpoint covers it (#16). A
     // worktree's changes land on its branch, which is already the way back.
     ctx.checkpoint = if worktree.is_some() { None } else { parent.checkpoint.clone() };

@@ -21,7 +21,7 @@ use crate::types::{DynTool, ToolContext};
 /// The built-in tools only the main agent has: a subagent never gets them, whatever its type lists. Never `agent` (no
 /// subagents of subagents: no runaway recursion) or `memory` (memory outlives the session, so only the main agent
 /// changes it, with the user's approval); the plan and the background processes are the main agent's.
-pub const MAIN_AGENT_ONLY: [&str; 4] = ["process", "memory", "plan", "agent"];
+pub const MAIN_AGENT_ONLY: [&str; 5] = ["process", "memory", "plan", "agent", "recall"];
 
 /// Who started the turn a call runs in. Set by the session; nothing a tool or the model sends changes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]

@@ -1,4 +1,8 @@
 {
   "description": "A signature change and its callers in other folders (scripts/ too): grep, four edits in one step, git diff --stat.",
-  "prompt": "Change createServer in src/server.js to take one options object, createServer({ port, host }), with host still defaulting to \"localhost\", and update every caller."
+  "prompt": "Change createServer in src/server.js to take one options object, createServer({ port, host }), with host still defaulting to \"localhost\", and update every caller.",
+  "deliberate": {
+    "security": "File changes",
+    "why": "marv-rs refuses edit_file and write_file on an existing file the session hasn't read, or that changed since it read it: the scripted model also reads `src/server.js`, `src/main.js`, `src/dev.js`, `scripts/smoke.js` before editing (script.marv-rs.jsonl), and nothing else changes. The files and exit code are Marv's."
+  }
 }

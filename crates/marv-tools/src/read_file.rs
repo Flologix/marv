@@ -13,6 +13,9 @@
 //! - Port note: lengths are `char` counts (Marv: UTF-16 units).
 //! - marv-rs (#61): it also reads the session's saved tool outputs, the one place outside the project
 //!   (`files::resolve_readable`); the omitted marker of a cut output names the file.
+//! - marv-rs: a read (any page: a partial read counts, the hash being the whole file's; a binary file too) records the
+//!   file's version for the session
+//!   ([`crate::file_versions`]): `edit_file` and `write_file` write over an existing file only as last read or written.
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -143,10 +146,13 @@ impl Tool for ReadFile {
         require_regular_file(&absolute, &shown)?;
         let bytes = tokio::fs::read(&absolute).await.map_err(|e| ToolError(format!("Couldn't read {shown}: {e}")))?;
         if looks_binary(&bytes) {
+            ctx.file_versions.saw(&absolute, &bytes);
             return Ok(ToolOutput::ok(format!("Binary file ({} bytes), not shown.", bytes.len()), "binary file"));
         }
         let out =
             render(&String::from_utf8_lossy(&bytes), input.offset.unwrap_or(1), input.limit.unwrap_or(DEFAULT_LIMIT), &shown)?;
+        // marv-rs: this version is the one the edit tools may now write over (`file_versions`), whichever page was read.
+        ctx.file_versions.saw(&absolute, &bytes);
         // A saved MCP output is still the server's text (#61).
         Ok(with_saved_source(ctx, &absolute, out))
     }

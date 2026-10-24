@@ -66,6 +66,7 @@ pub fn examples() -> Vec<Example> {
         ex("plan", json!({"items": [{"text": "Write the test", "status": "in_progress"}]})),
         ex("agent", json!({"description": "find the bug", "prompt": "Find it."})),
         ex("agent", json!({"description": "fix the bug", "prompt": "Fix it.", "isolation": "worktree"})),
+        ex("recall", json!({"page": 1})),
     ]
 }
 

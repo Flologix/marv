@@ -184,6 +184,11 @@ Each guard's doc comment says how it was proven: the guard was reverted, and the
 | Hidden web text: off-screen and zero-size styles | `web.rs::text_hidden_off_screen_or_in_a_zero_size_box_is_dropped` | Proven (#5) |
 | Hidden web text: zero-width and tag characters | `web.rs::invisible_characters_never_reach_the_model` | Proven (#5) |
 | Hidden web text: HTML comments in raw Markdown | `web.rs::html_comments_in_raw_markdown_are_dropped` | Proven (#5) |
+| File changes: an edit after another session's write is refused until the file is read again (two processes) | `stale_writes.rs::an_edit_after_another_sessions_write_is_refused_until_reread` | Proven |
+| File changes: an existing file the session never read can't be overwritten or edited; a new file can | `stale_writes.rs::an_existing_file_never_read_cant_be_overwritten` | Proven |
+| File changes: the check and the write are one step under a cross-process lock | `stale_writes.rs::the_check_and_write_are_atomic_across_processes` | Proven |
+| File changes: no lock outlives one call | `stale_writes.rs::no_lock_outlives_one_call` | Proven |
+| File changes: every spelling of a file (`~/…` included) is one lock | `stale_writes.rs::a_home_spelling_of_a_file_waits_for_the_same_lock` | Proven |
 | Images: any image taints | `images.rs::an_image_taints` | Proven |
 | Images: sources, quarantined reader, sandboxed decoding | `images.rs::*` | Ignored: needs vision |
 | `docs/TOOLS.md` is generated from the tools' code and current | `tools.rs::tools_md_matches_the_code` | Proven (`Glob::kind` changed to `Write`) |

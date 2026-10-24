@@ -80,6 +80,7 @@ person approved ("always" on a tainted fetch) runs without asking, in a turn wit
 | `plan {"items":[{"status":"in_progress","text":"Write the test"}]}` | never | never | never | never | refused | no | marv (authority) | no | - |
 | `agent {"description":"find the bug","prompt":"Find it."}` | never | never | never | never | refused | no | subagent (workspace) | no | - |
 | `agent {"description":"fix the bug","isolation":"worktree","prompt":"Fix it."}` | asks | asks | every time | every time | refused | no | subagent (workspace) | no | - |
+| `recall {"page":1}` | never | never | never | never | refused | no | marv (authority) | no | - |
 
 ### With the sandbox off
 

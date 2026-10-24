@@ -841,6 +841,7 @@ mod tests {
             assert_eq!(*order.lock().unwrap(), ["approve", "checkpoint"]);
             order.lock().unwrap().clear();
             let yolo = ToolContext { yolo: true, approver: None, ..ctx.clone() };
+            run_tool(&named("read_file", serde_json::json!({"path": "src/app.ts"})), &yolo, builtin_tools()).await;
             let edit = named("edit_file", serde_json::json!({"path": "src/app.ts", "old_string": "main", "new_string": "start"}));
             let edited = run_tool(&edit, &yolo, builtin_tools()).await;
             assert_eq!(edited.result.approval, Some(Approval::Auto), "{}", edited.result.output);

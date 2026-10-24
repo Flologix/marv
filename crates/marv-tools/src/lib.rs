@@ -19,6 +19,7 @@ pub mod diff;
 pub mod edit_file;
 pub mod edit_match;
 pub mod file_lock;
+pub mod file_versions;
 pub mod files;
 pub mod floor;
 pub mod formatter;
@@ -45,6 +46,7 @@ pub mod web;
 pub mod web_fetch;
 pub mod write_file;
 
+pub use file_versions::FileVersions;
 pub use floor::{CallMode, Floor, MAIN_AGENT_ONLY, approval_floor, offered_in_mode};
 pub use formatter::{FormatOutcome, Formatter, FormatterSetting, ProjectFormatter};
 pub use marv_core::MAX_DECLINE_REASON;

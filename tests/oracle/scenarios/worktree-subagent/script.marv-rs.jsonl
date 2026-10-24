@@ -1,0 +1,10 @@
+// the main agent hands the task to a subagent in a worktree
+{"tool_calls": [{"name": "agent", "arguments": {"description": "Say goodbye", "prompt": "In greeting.txt, change \"hello\" to \"goodbye\". Report what you changed.", "isolation": "worktree"}}]}
+// the subagent reads its worktree's copy, then edits it (marv-rs: read before editing)
+{"tool_calls": [{"name": "read_file", "arguments": {"path": "greeting.txt"}}, {"name": "edit_file", "arguments": {"path": "greeting.txt", "old_string": "hello", "new_string": "goodbye"}}]}
+// the subagent's report
+{"text": "Changed greeting.txt: \"hello, world\" is now \"goodbye, world\"."}
+// the main agent checks Marv's commit on the branch, and its checkpoint (two logs, each one line of history: one `git log --all` sorts commits by time, and the checkpoint and Marv's commit can land in the same second or not)
+{"tool_calls": [{"name": "bash", "arguments": {"command": "git log --branches --format=%s && git log --glob=refs/marv --format=%s && git diff --stat main...$(git for-each-ref --format='%(refname:short)' refs/heads/marv/)"}}]}
+// done
+{"text": "The subagent changed the greeting on its own branch; review and merge it."}

@@ -1,4 +1,8 @@
 {
   "description": "An old_string that isn't in the file (wrong quotes) gets the closest lines back; the retry lands. Edits across six files.",
-  "prompt": "Add a required `email: string` field to the User interface in src/types.ts, and show it in greet: \"Hi Ada Lovelace <ada@example.com>\". makeUser (src/factory.ts) takes the email as a third argument. Wherever a user is created without a known address, use `<id>@example.com`."
+  "prompt": "Add a required `email: string` field to the User interface in src/types.ts, and show it in greet: \"Hi Ada Lovelace <ada@example.com>\". makeUser (src/factory.ts) takes the email as a third argument. Wherever a user is created without a known address, use `<id>@example.com`.",
+  "deliberate": {
+    "security": "File changes",
+    "why": "marv-rs refuses edit_file and write_file on an existing file the session hasn't read, or that changed since it read it: the scripted model also reads `src/greet.ts`, `src/seed.ts`, `src/csv.ts` before editing (script.marv-rs.jsonl), and nothing else changes. The files and exit code are Marv's."
+  }
 }
