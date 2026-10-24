@@ -144,6 +144,19 @@ impl PromptInput {
         if value.contains('\n') { self.add_chip(value) } else { self.type_text(&value) }
     }
 
+    /// "Send now" text the turn never read, given back: at the start of the line, ahead of what's there (chips
+    /// included, untouched), one message per line. Its line breaks stay as typed text (each draws as a new row), not
+    /// a chip as [`Self::set`] would make: it's the person's own message, back to change or send.
+    pub fn give_back(&mut self, text: &str) {
+        let text = no_chips(text);
+        if text.is_empty() {
+            return;
+        }
+        self.value = if self.value.trim().is_empty() { text } else { format!("{text}\n{}", self.value) };
+        self.cursor = self.value.chars().count();
+        self.menu_index = 0;
+    }
+
     /// The text with every chip replaced by what was pasted: what Enter submits.
     pub fn text(&self) -> String {
         self.expand(&self.value, &self.pastes)
@@ -817,6 +830,33 @@ mod tests {
     }
 
     // #214: a multi-line paste keeps its newlines, shows as one chip, and never submits.
+    #[test]
+    fn send_now_with_a_paste_chip_sends_the_pasted_text_and_given_back_lines_show_as_rows() {
+        let mut h = Harness::new(&[]);
+        h.typed("also ");
+        h.prompt.paste("line 1\nline 2\n");
+        for modifiers in [KeyModifiers::ALT, KeyModifiers::NONE] {
+            let key = if modifiers == KeyModifiers::ALT {
+                KeyEvent::new(KeyCode::Enter, modifiers)
+            } else {
+                KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)
+            };
+            let outcome = h.prompt.on_key(key, true, &h.commands);
+            assert_eq!(outcome, Some(PromptOutcome::SendNow("also line 1\nline 2\n".into())), "{modifiers:?}");
+        }
+        // Text given back by "send now" (one message per line), ahead of a chip already there: each line its own row,
+        // and the chip still stands for its paste.
+        h.prompt.set("");
+        h.prompt.paste("a\nb");
+        h.prompt.give_back("wait, use pnpm\nand the lint");
+        assert_eq!(h.prompt.text(), "wait, use pnpm\nand the lint\na\nb");
+        let frame = h.frame();
+        let rows: Vec<&str> = frame.lines().map(|l| l.trim_matches(|c: char| c == '│' || c == ' ')).collect();
+        assert!(rows.contains(&"> wait, use pnpm"), "{frame}");
+        assert!(rows.contains(&"and the lint"), "{frame}");
+        assert!(rows.iter().any(|r| r.starts_with("[Pasted text #1, 2 lines]")), "{frame}");
+    }
+
     #[test]
     fn a_multi_line_paste_is_a_chip_and_enter_sends_the_whole_text() {
         let mut h = Harness::new(&[]);

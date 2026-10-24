@@ -838,10 +838,9 @@ impl App {
             // (or change) with Enter. Never sent on their own.
             UiEvent::NotSent { texts } => {
                 self.sending = 0;
-                // Each message on its own line, as sent (the prompt shows the breaks, and Enter sends them).
-                let back = texts.join("\n");
-                let typed = self.prompt.value.trim().to_string();
-                self.prompt.set(if typed.is_empty() { back } else { format!("{back}\n{typed}") });
+                // Each message on its own line, as sent (the prompt shows the breaks, and Enter sends them), ahead of
+                // anything typed since, its paste chips kept.
+                self.prompt.give_back(&texts.join("\n"));
                 self.system("✻ Not sent: the turn ended before its next step. Your message is back in the prompt.");
             }
             // A request outside a turn (the suggestion's) still counts.
