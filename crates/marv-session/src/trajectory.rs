@@ -307,14 +307,27 @@ pub enum TrajectoryRecord {
     },
     /// /undo (Marv #16): the turn it took back (its number in the checkpoints), the paths written, those left alone.
     Undo { turn: u32, paths: Vec<String>, skipped: Vec<String> },
-    /// The conversation was replaced by a summary.
+    /// The conversation was replaced by a summary. #63: `trigger` ("auto", "manual", "overflow"), `level` (overflow
+    /// only), `tail_turns` (turns kept verbatim after it), `structured` (the reply followed the v2 template), `rolling`
+    /// (it updated the previous summary), `page` (the saved page holding what it replaced). An overflow's level 3 drops
+    /// old turns without a summary: no `summary` then.
     Compact {
         #[serde(skip_serializing_if = "Option::is_none")]
         turn: Option<String>,
-        summary: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+        trigger: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        level: Option<u32>,
+        tail_turns: usize,
+        structured: bool,
+        rolling: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        page: Option<u32>,
     },
     /// marv-rs #144: a summary that failed, and why: `reason` "failed", "stopped" or "empty", `error` the message (a
     /// tool call, a cut-off or empty summary, the provider's error), `tokens` the context's size when it was asked for.
+    /// #63: `trigger` and `level` as for `compact`.
     CompactFailed {
         #[serde(skip_serializing_if = "Option::is_none")]
         turn: Option<String>,
@@ -322,6 +335,9 @@ pub enum TrajectoryRecord {
         error: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         tokens: Option<u64>,
+        trigger: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        level: Option<u32>,
     },
     /// 1 good, -1 bad, 0 just labeled.
     Feedback {
@@ -657,7 +673,7 @@ impl AgentRecorder {
                 self.finish(&reason);
             }
             // The whole reply comes with Assistant; deltas, retries and compactions aren't records.
-            LoopEvent::TextDelta(_) | LoopEvent::ToolCallDelta { .. } | LoopEvent::Compacted => {}
+            LoopEvent::TextDelta(_) | LoopEvent::ToolCallDelta { .. } | LoopEvent::Compacted | LoopEvent::Overflow { .. } => {}
         }
     }
 

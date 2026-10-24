@@ -1,4 +1,11 @@
 {
   "description": "A reply repeating one sentence is stopped while it streams: dropped from the history, the model is told once, and the next reply finishes.",
-  "prompt": "Is there a configuration file?"
+  "prompt": "Is there a configuration file?",
+  "prefix_resets": [
+    2
+  ],
+  "deliberate": {
+    "issue": 63,
+    "why": "marv-rs never sends two user messages in a row (#63 review: some upstreams refuse them): Marv's note after a reply that added nothing to the history is merged into the user's message before it instead of sent as a message of its own. That message was already sent, so the request after it starts the cache over (prefix_resets). Files, tool calls, events and the exit code are Marv's."
+  }
 }

@@ -1196,8 +1196,13 @@ impl App {
                 }),
                 _ => self.system_error(format!("Couldn't compact the conversation: {error}")),
             },
-            CompactOutcome::Compacted { summary, tokens_before } => {
+            CompactOutcome::Compacted { summary, tokens_before, overflow } => {
                 let why = match (automatic, tokens_before, self.status.context_length) {
+                    // #63: the request was refused as too long; level 3 dropped the oldest messages.
+                    _ if overflow == Some(3) => {
+                        " (the last request was too long for the model's window, so the oldest messages were dropped)".into()
+                    }
+                    _ if overflow.is_some() => " (the last request was too long for the model's window)".into(),
                     (true, Some(used), Some(context)) if used > 0 && context > 0 => {
                         format!(" (the context was {}% full)", (200 * used + context) / (2 * context))
                     }
@@ -1208,7 +1213,7 @@ impl App {
                         format!(
                             ": {} → about {} tokens",
                             status_bar::tokens(used),
-                            status_bar::tokens((summary.chars().count() as u64 + 2) / 4)
+                            status_bar::tokens(marv_core::estimate_tokens(&summary))
                         )
                     }
                     _ => String::new(),
@@ -1460,7 +1465,7 @@ impl App {
                 self.palette = None;
                 // What was typed stays reachable with ↑, unless it's a login callback: it holds an authorization
                 // code and never goes in the history.
-                let typed = self.prompt.value.trim().to_string();
+                let typed = self.prompt.text().trim().to_string();
                 if !typed.is_empty() && typed != text.trim() && !self.port.is_login_callback(&typed) {
                     self.prompt.remember(&typed);
                 }
@@ -1480,6 +1485,7 @@ impl App {
         // prompt history or the saved transcript. Even during a turn.
         if self.port.login_callback(text) {
             self.prompt.set("");
+            self.prompt.forget_submission();
             return;
         }
         if self.busy() {
@@ -2301,6 +2307,29 @@ mod tests {
         assert_eq!(h.app.prompt.value, "/help");
     }
 
+    // #214: a multi-line user message (a paste) selects and copies with its newlines.
+    #[test]
+    fn dragging_across_a_multi_line_user_message_copies_its_lines() {
+        let mut h = harness();
+        h.app.on_event(Event::Paste("first pasted line\nsecond pasted line\nthird one".into()), h.now);
+        h.key(ENTER);
+        h.events([UiEvent::Done(StopReason::End), turn_end()]);
+        let frame = h.frame();
+        let at = |text: &str| {
+            let (y, line) =
+                frame.lines().enumerate().find(|(_, l)| l.contains(text)).unwrap_or_else(|| panic!("{text}:\n{frame}"));
+            (unicode_width::UnicodeWidthStr::width(&line[..line.find(text).unwrap()]) as u16, y as u16)
+        };
+        let (x0, y0) = at("first pasted line");
+        let (x1, y1) = at("third one");
+        h.app.on_mouse(MouseEvent::Press { x: x0, y: y0 }, h.now);
+        h.app.on_mouse(MouseEvent::Drag { x: x1 + 8, y: y1 }, h.now);
+        assert!(h.buffer()[(x0 + 3, y0 + 1)].modifier.contains(ratatui::style::Modifier::REVERSED));
+        h.app.on_mouse(MouseEvent::Release { x: x1 + 8, y: y1 }, h.now);
+        futures::executor::block_on(h.app.settle_copies(h.now));
+        assert_eq!(*h.copied.lock().unwrap(), ["first pasted line\n  second pasted line\n  third one"]);
+    }
+
     #[test]
     fn dragging_over_text_copies_it_and_says_so() {
         let mut h = harness();
@@ -2510,13 +2539,16 @@ mod tests {
         h.typed("next");
         h.events([UiEvent::Status(TurnStatus::Compacting)]);
         assert!(h.frame().contains("Compacting the conversation…"));
-        let outcome = CompactOutcome::Compacted { summary: "x".repeat(4000), tokens_before: Some(30_000) };
+        let outcome = CompactOutcome::Compacted { summary: "x".repeat(4000), tokens_before: Some(30_000), overflow: None };
         h.events([UiEvent::Compaction { automatic: true, outcome }]);
         assert!(
             h.frame().contains("✻ Compacted the conversation (the context was 92% full): 30k → about 1k tokens."),
             "{}",
             h.frame()
         );
+        let overflow = CompactOutcome::Compacted { summary: "x".repeat(400), tokens_before: Some(30_000), overflow: Some(1) };
+        h.events([UiEvent::Compaction { automatic: true, outcome: overflow }]);
+        assert!(h.frame().contains("(the last request was too long for the model's window): 30k"), "{}", h.frame());
         let stopped = CompactOutcome::NotCompacted { reason: "stopped".into(), error: String::new() };
         h.events([
             UiEvent::Compaction { automatic: true, outcome: stopped },
@@ -3157,6 +3189,51 @@ mod tests {
         assert!(!h.frame().contains("code-secret"));
         h.key(KeyCode::Up);
         assert!(!h.frame().contains("code-secret"), "not in the prompt history");
+        // #214 review: one long enough to be pasted as a chip goes to the engine too, and its chip isn't kept.
+        let long = format!("http://127.0.0.1:5555/callback?code=code-long&state={}", "s".repeat(1000));
+        h.app.prompt.set(""); // ↑ above brought back "hello"
+        h.app.on_event(Event::Paste(long.clone()), h.now);
+        assert!(h.frame().contains("[Pasted text #1"), "{}", h.frame());
+        h.key(ENTER);
+        assert_eq!(h.calls().last(), Some(&Call::LoginCallback(long)));
+        assert!(!h.app.prompt.holds_submission(), "the callback's chip isn't held for the history");
+        h.key(KeyCode::Up);
+        assert!(!h.app.prompt.text().contains("code-long"), "not in the prompt history");
+    }
+
+    // #214: a multi-line paste never sends; Enter sends all of it, the transcript shows its lines, ↑ brings it back.
+    #[test]
+    fn a_multi_line_paste_waits_for_enter_and_the_transcript_shows_every_line() {
+        let mut h = harness();
+        h.app.on_event(Event::Paste("cargo build\ncargo test\n".into()), h.now);
+        assert!(h.calls().is_empty(), "a paste never submits");
+        assert!(h.frame().contains("[Pasted text #1, 2 lines]"), "{}", h.frame());
+        h.key(ENTER);
+        assert_eq!(h.calls(), [Call::Send("cargo build\ncargo test".into())]);
+        let frame = h.frame();
+        assert!(frame.contains("> cargo build\n  cargo test"), "{frame}");
+        h.events([UiEvent::Done(StopReason::End), turn_end()]);
+        h.key(KeyCode::Up);
+        assert_eq!(h.app.prompt.text(), "cargo build\ncargo test\n");
+        assert!(h.frame().contains("[Pasted text #1, 2 lines]"));
+    }
+
+    #[test]
+    fn a_multi_line_paste_into_a_reason_or_the_palette_stays_one_line() {
+        let mut h = harness();
+        h.typed("make a file");
+        h.events([UiEvent::Approval { id: ApprovalId(1), request: write_request("made.txt", None) }]);
+        h.arm();
+        h.key(KeyCode::Tab);
+        h.app.on_event(Event::Paste("too\nbig".into()), h.now);
+        h.key(ENTER);
+        assert_eq!(h.calls().last(), Some(&Call::Answer(1, Decision::Declined("too big".into()))));
+        assert_eq!(h.app.prompt.text(), "");
+        h.events([UiEvent::Done(StopReason::End), turn_end()]);
+        h.ctrl('k');
+        h.app.on_event(Event::Paste("yo\nlo".into()), h.now);
+        assert_eq!(h.app.palette.as_ref().unwrap().query, "yo lo");
+        assert_eq!(h.app.prompt.text(), "");
     }
 
     #[test]

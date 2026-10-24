@@ -61,9 +61,9 @@ pub use checkpoints::undo::{UndoFile, UndoPlan, UndoRefusal, UndoResult, undo_re
 pub use runner::{AlwaysScopes, ApprovalRecord, SessionAgentHost, SessionApprover, SessionToolRunner, ToolDisplay};
 pub use sdk::{SessionBuilder, SessionOptions, create_session};
 pub use session::{
-    CheckpointProblem, CompactFailure, CompactResult, Configure, Feedback, MarvSession, ProviderChoice, RateOutcome,
-    ResumeTarget, Resumed, SendOptions, SessionError, SessionEvent, SessionInit, SystemPrompt, Turn, TurnEndReason, TurnStatus,
-    UsageSnapshot,
+    CheckpointProblem, CompactFailure, CompactResult, CompactTrigger, Configure, Feedback, MarvSession, ProviderChoice,
+    RateOutcome, ResumeTarget, Resumed, SendOptions, SessionError, SessionEvent, SessionInit, SystemPrompt, Turn, TurnEndReason,
+    TurnStatus, UsageSnapshot, compaction_json,
 };
 pub use types::{Message, Role};
 pub use usage::Totals;

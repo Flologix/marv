@@ -216,7 +216,11 @@ impl SelectionStore {
     /// Mouse moved with the button held: extend, and start auto-scroll while past an edge.
     pub fn drag(&mut self, x: u16, y: u16, now: Instant) -> SelectionEffect {
         let (Some(selection), Some(vp)) = (self.selection, self.viewport) else { return SelectionEffect::None };
-        let direction: i8 = if y < vp.top {
+        // A transcript at the top of the screen (the main view) has no row above it to drag into, so its top row is
+        // the edge for a drag that started below it, while there's more above (#214: a pasted message taller than
+        // the window couldn't be selected upwards past what was shown). A drag within the top row still selects.
+        let at_top_edge = vp.top == 0 && y == 0 && vp.scroll_top > 0 && selection.anchor.y > vp.scroll_top;
+        let direction: i8 = if y < vp.top || at_top_edge {
             -1
         } else if y >= vp.top.saturating_add(vp.height) {
             1
@@ -288,6 +292,17 @@ impl SelectionStore {
             self.auto_scroll = None;
             return SelectionEffect::None;
         };
+        // Nothing more past the edge: extend to the edge row and stop, or the loop would wake every step for nothing.
+        let at_end = if direction < 0 { vp.scroll_top == 0 } else { vp.scroll_top + vp.height as usize >= vp.content_height };
+        if at_end {
+            self.auto_scroll = None;
+            let focus = if direction < 0 {
+                Point { x: 0, y: vp.scroll_top }
+            } else {
+                Point { x: vp.width.saturating_sub(1), y: vp.content_height.saturating_sub(1) }
+            };
+            return self.set(Some(Selection { anchor: selection.anchor, focus }));
+        }
         let row = if direction < 0 {
             vp.scroll_top.saturating_sub(1)
         } else {
@@ -507,6 +522,62 @@ mod tests {
         assert_eq!(store.selection().unwrap().focus, Point { x: 0, y: 9 });
         // Row 9 was never seen on screen, so the copy starts at row 10.
         assert_eq!(store.release(), SelectionEffect::Copy("line 10\nline 11\nl".into()));
+    }
+
+    // #214: the main transcript starts at the screen's first row, so nothing lies above it to drag into. Its top row
+    // scrolls up while there's more above, or a message taller than the window can't be selected upwards.
+    #[test]
+    fn dragging_onto_the_top_row_of_a_transcript_at_the_screen_top_scrolls_up_while_theres_more() {
+        let mut store = SelectionStore::new();
+        let t0 = Instant::now();
+        draw(&mut store, 10);
+        store.press(0, 3);
+        assert_eq!(store.drag(2, 0, t0), SelectionEffect::ScrollBy(-1));
+        assert_eq!(store.selection().unwrap().focus, Point { x: 0, y: 9 });
+        assert_eq!(store.tick(t0 + AUTO_SCROLL_MS), SelectionEffect::ScrollBy(-1));
+        store.release();
+        // A drag that starts on the top row selects on it.
+        draw(&mut store, 10);
+        store.press(0, 0);
+        assert_eq!(store.drag(4, 0, t0), SelectionEffect::Redraw);
+        store.release();
+        // Scrolled to the very top: the top row is just a row.
+        draw(&mut store, 0);
+        store.press(0, 3);
+        assert_eq!(store.drag(2, 0, t0), SelectionEffect::Redraw);
+        assert_eq!(store.deadline(), None);
+    }
+
+    // #214 review: auto-scroll stops once there's nothing more past the edge, instead of waking every step.
+    #[test]
+    fn auto_scroll_stops_at_the_top_and_the_bottom() {
+        let mut store = SelectionStore::new();
+        let t0 = Instant::now();
+        // Above the view (a subagent's header row above it): one row left above, then the top.
+        let mut buf = screen_for(&mut store, 1, 5, 2);
+        store.transform_buffer(&mut buf);
+        store.press(0, 4);
+        assert_eq!(store.drag(0, 0, t0), SelectionEffect::ScrollBy(-1));
+        screen_for(&mut store, 0, 5, 2);
+        store.tick(t0 + AUTO_SCROLL_MS); // already on row 0: nothing to redraw
+        assert_eq!(store.selection().unwrap().focus, Point { x: 0, y: 0 });
+        assert_eq!(store.deadline(), None);
+        assert_eq!(store.tick(t0 + 5 * AUTO_SCROLL_MS), SelectionEffect::None);
+        store.release();
+        // The main view's top row, scrolled to the top while dragging.
+        draw(&mut store, 1);
+        store.press(0, 3);
+        assert_eq!(store.drag(0, 0, t0), SelectionEffect::ScrollBy(-1));
+        draw(&mut store, 0);
+        store.tick(t0 + AUTO_SCROLL_MS);
+        assert_eq!(store.deadline(), None);
+        store.release();
+        // Below, at the end of the transcript.
+        draw(&mut store, 25);
+        store.press(0, 1);
+        assert_eq!(store.drag(0, 5, t0), SelectionEffect::Redraw);
+        assert_eq!(store.selection().unwrap().focus, Point { x: 39, y: 29 });
+        assert_eq!(store.deadline(), None);
     }
 
     #[test]

@@ -1,0 +1,15 @@
+{"status":"running","type":"status"}
+{"text":"Let me think. I will check the configuration file ","type":"text_delta"}
+{"text":"now. I will check the configuration file now. I wi","type":"text_delta"}
+{"text":"ll check the configuration file now. I will check ","type":"text_delta"}
+{"text":"the configuration file now. I will check the confi","type":"text_delta"}
+{"text":"guration file now. I will check the configuration ","type":"text_delta"}
+{"text":"file now. I will check the configuration file now.","type":"text_delta"}
+{"text":" I will check the configuration file now. I will c","type":"text_delta"}
+{"continued":true,"type":"text_loop"}
+{"label":"**/config*","tool":"glob","type":"tool_start"}
+{"label":"**/config*","result":"No files match.","tool":"glob","type":"tool_end"}
+{"text":"No, there's no configuration file in this project.","type":"text_delta"}
+{"text":"No, there's no configuration file in this project.","type":"assistant"}
+{"reason":"end","type":"done"}
+{"reason":"end","reply":"No, there's no configuration file in this project.","steps":2,"type":"result","usage":{"cachedTokens":0,"completionTokens":100,"cost":0.002,"promptTokens":2000}}

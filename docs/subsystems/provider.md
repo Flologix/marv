@@ -12,7 +12,7 @@ Spec: Marv `CLAUDE.md` bullets **Provider seam** and **createProvider**, `src/pr
 | `src/provider/index.ts` | `lib.rs` (`reasoning_for`, `create_provider`, `ProviderConfig`, `ProviderKind`) | ported; `provider-index.test.ts` ported in `tests/factory.rs` |
 | `src/provider/sse.ts` | `sse.rs` (`SseDecoder`, `parse_sse`) | ported, tests ported |
 | `src/provider/retry.ts` | `retry.rs` | ported, tests ported (`sleep_abortable` on a `CancellationToken`); `drop_recovery` (#64), `retriable_failure` (#107) and `idle_guard` (#88) added. The loops' shared pieces (jittered `backoff`, `status_wait`, `keep_or_restart`) live in `openai_compat.rs` for now |
-| `src/provider/errors.ts` | `errors.rs` | ported and tested (`error_message` is pure: the caller reads the body first); `is_context_overflow` (#63) todo |
+| `src/provider/errors.ts` | `errors.rs` | ported and tested (`error_message` is pure: the caller reads the body first); `is_context_overflow` (#63): fixtures in `tests/fixtures/overflow/` and `not-overflow/` |
 | `src/provider/models.ts` | `models.rs` | ported; `list_models(kind, base_url, api_key)` owns its client (`list_models_with` takes one); `models.test.ts` ported in `tests/models.rs` |
 | `src/provider/openai-compat.ts` | `openai_compat.rs` | ported: wire types, `to_messages`, `request_body`, `ReplyAssembler`, and the HTTP/retry loop with #64; `openai-compat.test.ts` ported in `tests/openai_compat.rs` |
 | `src/provider/ollama.ts` | `ollama.rs` | ported, including `ask_trained` and the HTTP/retry loop with #64; `ollama.test.ts` ported in `tests/ollama.rs` |
@@ -22,7 +22,7 @@ Spec: Marv `CLAUDE.md` bullets **Provider seam** and **createProvider**, `src/pr
 | — (marv-rs only, #159) | `offered.rs` | Whether setup offers the Z.ai Coding Plan and Sign in with ChatGPT: one switch each (`MARV_OFFER_ZAI_CODING_PLAN=1`, `MARV_OFFER_CHATGPT_SIGN_IN=1` at build time), off until the vendor clears Marv |
 | `src/provider/factory.ts` | `factory.rs` | ported (`ConfigFactory`, `CustomFactory`); `providerFactory` moves to `marv-session`; `provider-factory.test.ts` ported in `tests/factory.rs` (the SDK hint cases through `create_provider`) |
 
-`grep -rn 'todo!("port' crates/marv-provider` lists what's left (only `is_context_overflow`, #63).
+`grep -rn 'todo!("port' crates/marv-provider` lists what's left (nothing).
 
 Try it: `OPENROUTER_API_KEY=… cargo run -p marv-provider --example chat -- "hi"`, or `MARV_PROVIDER=ollama MARV_MODEL=qwen3.5:9b` for a local Ollama.
 
@@ -71,7 +71,7 @@ Try it: `OPENROUTER_API_KEY=… cargo run -p marv-provider --example chat -- "hi
   - `to_messages` re-sends it as `reasoning_details` on the assistant message.
   - OpenRouter streams one block over many chunks (same `index` and `type`, often a token each). `merge_reasoning_block` joins them as they arrive (strings concatenated, `signature`/`id`/`format` filled in once), so a turn keeps and re-sends one block, not one per chunk (a DeepSeek run had 2,387). Sessions saved before keep their pieces: history is sent back unchanged (the prompt cache).
 - **#59 `tool_choice: "none"`** is in `ChatRequest` and is sent only for `ToolChoice::None`. Auto requests keep their bytes. Ollama has no equivalent, so it relies on the note.
-- **#63 overflow recovery:** `errors::is_context_overflow` is a stub. Collect real OpenRouter and Ollama overflow messages first.
+- **#63 overflow detection (done):** `errors::is_context_overflow` matches, case-insensitively, the wordings that escape #116's `max_tokens` refit: "maximum context length", `context_length_exceeded`, "exceeds the context window", Anthropic's "prompt is too long", Gemini's "input token count … exceeds the maximum", "context length/window" next to "exceed/too long/too large", and an HTTP 413. The fixtures are the providers' published error texts and #116's captured OpenRouter refusal; more captured ones get added as they turn up. Ollama's native API truncates past `num_ctx` instead of failing, so the compaction trigger covers it. `tests/openai_compat.rs`: a refusal the adapter refits never reaches the loop; one that escapes it matches. The one token estimate is `marv_core::estimate_tokens` (`ASSUMED_TOKENS_PER_BYTE` is defined from `CHARS_PER_TOKEN`).
 - **#64 continue after a dropped stream (done in both adapters):**
   - `retry::drop_recovery` decides: a drop after text arrived, with no tool call in progress (`ReplyAssembler::tool_call_in_progress`; Ollama: a call already arrived), continues; anything else restarts.
   - Continue: the next attempt sends the history, then the partial text as an assistant turn, then `openai_compat::DROPPED_STREAM_NOTE`. Its `Retry` event says `continued: true`, so the loop keeps the text and appends the rest. Partial text accumulates over several continued drops.
