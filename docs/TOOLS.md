@@ -31,6 +31,7 @@ approved and how its output is treated. A tool change shows up here as a diff.
 | `memory` | write | marv | authority | no | no |
 | `plan` | read | marv | authority | no | no |
 | `agent` | execute | subagent | workspace | no | yes |
+| `recall` | read | marv | authority | no | no |
 
 ## Example calls
 
