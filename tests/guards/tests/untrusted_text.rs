@@ -69,13 +69,15 @@ async fn every_tool_declares_a_source_class() {
         };
         assert_eq!(tool.provenance().class(), expected, "{}", tool.name());
     }
-    // Per call: a command with the network is outside text; offline it's the project's.
+    // Per call: a command with the network is outside text; offline it's the project's, but only inside a working
+    // sandbox (without one every command has the network: see the two sandbox guards below).
     let ctx = ToolContext::new("/tmp/marv-guard-sources");
     let bash = builtin_tools().iter().find(|t| t.name() == "bash").unwrap();
     let online = bash.parse(json!({"command": "curl x", "network": true})).unwrap();
     let offline = bash.parse(json!({"command": "ls"})).unwrap();
     assert_eq!(bash.provenance_in(online.as_ref(), &ctx), Provenance::Network);
-    assert_eq!(bash.provenance_in(offline.as_ref(), &ctx), Provenance::Project);
+    let offline_source = if ctx.sandbox.active() { Provenance::Project } else { Provenance::Network };
+    assert_eq!(bash.provenance_in(offline.as_ref(), &ctx), offline_source);
 
     let ctx = ToolContext::new("/tmp/marv-guard-sources");
     let tools: Vec<ToolRef> = vec![Arc::new(Declares("issue", Provenance::Github))];
