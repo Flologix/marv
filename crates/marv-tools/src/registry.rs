@@ -19,9 +19,11 @@
 //!   (`Tool::checkpoint`); a stop while it's taken returns "interrupted" instead of running.
 //! - Every repaired call's result carries the repair notes, however the call ended.
 //!
-//! marv-rs additions (docs/SECURITY.md): a tainted session's egress (`ToolKind::Egress` or `uses_network`) and any
-//! write to a protected path are gated, skip yolo, and reach the approver with `must_ask` set; a result whose
-//! provenance taints marks the session. A web request (`egress_url`) under a URL prefix the user approved after the
+//! marv-rs additions (docs/SECURITY.md): a tainted session's egress (`ToolKind::Egress` or `uses_network`) and its
+//! writes that later conversations load (`Tool::persists`: memory, asked `once` too), and any write to a protected
+//! path are gated, skip yolo, and reach the approver with `must_ask` set; a result whose
+//! provenance taints marks the session; a result's provenance is raised to the tool's declared one
+//! (`Tool::provenance_in`), so a tool can't hand outside text over as the project's by leaving it unset. A web request (`egress_url`) under a URL prefix the user approved after the
 //! taint runs as approved; "always" on a tainted one approves its prefix (`web_fetch::url_prefix`), not the site.
 
 use std::path::MAIN_SEPARATOR;
@@ -184,12 +186,27 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
     // A door out of the sandbox (Marv #47, #51, #52): the prompt shows its warning, the result and trajectory name
     // it, and a `once` call is never remembered (the session's approver holds that, whatever the client answers).
     let door = tool.door(input, ctx);
+    // What the tool declares its output to be, for this call: no result is trusted more than that.
+    let declared = tool.provenance_in(input, ctx);
+    // A tool's own error (`ToolError`) from its run can carry its source's words too: a redirect's `Location`, a
+    // server's `Content-Type`, gh's stderr. From an outside source it's that source's text: fenced and tainting, never
+    // Marv's. A preview's error stays Marv's: a preview reaches nothing (gh's checks are local, web_fetch's is an
+    // address check), so what it says is Marv's own refusal.
+    let tool_failed = |err: crate::types::ToolError| {
+        let mut outcome = fail(err.0, &label);
+        if declared.taints() {
+            outcome.result.provenance = declared;
+            ctx.taint.mark(declared);
+        }
+        noted(outcome)
+    };
     let finish = |result: Result<ToolOutput, crate::types::ToolError>, approval: Option<Approval>| {
         let mut result = match result {
             Ok(result) => result,
-            Err(err) => return noted(fail(err.0, &label)),
+            Err(err) => return tool_failed(err),
         };
         result.door = door;
+        result.provenance = result.provenance.least_trusted(declared);
         if result.provenance.taints() {
             ctx.taint.mark(result.provenance);
         }
@@ -205,7 +222,10 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
     let egress_url = tool.egress_url(input).filter(|_| ctx.taint.is_tainted());
     // Not in a turn without automatic approval (#124): that prefix is a remembered answer too.
     let prefix_approved = !ctx.no_auto_approval && egress_url.as_deref().is_some_and(|url| ctx.taint.prefix_approved(url));
-    let must_ask = protected.is_some() || (ctx.taint.must_ask(tool.kind(), network) && !prefix_approved);
+    // A write that later conversations load as the person's own (memory), once outside text is in this one: a person
+    // answers it every time.
+    let tainted_sink = ctx.taint.is_tainted() && tool.persists(input, ctx);
+    let must_ask = protected.is_some() || tainted_sink || (ctx.taint.must_ask(tool.kind(), network) && !prefix_approved);
     let gated = must_ask || (!prefix_approved && tool.needs_approval(input).unwrap_or(tool.kind() != ToolKind::Read));
     let interrupted = |approval: Approval| {
         let mut result = ToolOutput::ok(INTERRUPTED, "interrupted");
@@ -246,7 +266,7 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
         Some(_) => None,
     };
     let decision = match own {
-        Some(Err(err)) => return noted(fail(err.0, &label)),
+        Some(Err(err)) => return tool_failed(err),
         Some(Ok(decision)) => decision,
         None => {
             let scope = tool
@@ -259,7 +279,7 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
             let home_write = home_file_write(tool.kind(), &scope.key, ctx);
             // A turn without automatic approval (#124, a turn the radio started) asks every call `once`: no
             // remembered "always" and no worktree subagent's automatic yes answers it.
-            let once = tool.once(input, ctx) || home_write || ctx.no_auto_approval;
+            let once = tool.once(input, ctx) || home_write || ctx.no_auto_approval || tainted_sink;
             // Yolo: a call the tool vouches for runs without asking, confined (bash then can't touch .git).
             if ctx.yolo && !ctx.no_auto_approval && !must_ask && !home_write && tool.auto_safe(input, ctx) {
                 if !checkpointed().await {
@@ -281,6 +301,7 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
                 protected,
                 door,
                 reason: true,
+                persists: tainted_sink,
             };
             approver.approve(request).await
         }
@@ -646,6 +667,50 @@ mod tests {
         assert!(c.taint.is_tainted());
     }
 
+    /// A tool that declares an outside source but leaves its results at `ToolOutput::ok`'s project default.
+    struct Forgetful;
+    #[async_trait]
+    impl Tool for Forgetful {
+        type Input = Value;
+        fn name(&self) -> &str {
+            "forgetful"
+        }
+        fn description(&self) -> &str {
+            ""
+        }
+        fn schema(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn kind(&self) -> ToolKind {
+            ToolKind::Read
+        }
+        fn provenance(&self) -> Provenance {
+            Provenance::Github
+        }
+        fn label(&self, _input: &Value) -> String {
+            "x".into()
+        }
+        async fn run(&self, _input: &Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::ok("someone else's words", "ok"))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_result_is_raised_to_its_tools_declared_source_never_lowered() {
+        let c = ctx();
+        let call = ToolCall { id: "f".into(), name: "forgetful".into(), arguments: "{}".into() };
+        let out = run_tool(&call, &c, &[Arc::new(Forgetful) as ToolRef]).await;
+        assert_eq!(out.result.provenance, Provenance::Github);
+        assert!(c.taint.is_tainted());
+        // A tool that declares its own words keeps a less trusted source it set on the result (a mesh answer).
+        let t: Vec<ToolRef> = vec![Arc::new(Echo { kind: ToolKind::Read, safe: false, provenance: Provenance::Mcp })];
+        assert_eq!(run_tool(&call_named("echo"), &ctx(), &t).await.result.provenance, Provenance::Mcp);
+    }
+
+    fn call_named(name: &str) -> ToolCall {
+        ToolCall { id: "n".into(), name: name.into(), arguments: r#"{"text": "x"}"#.into() }
+    }
+
     #[test]
     fn builtin_specs_are_in_marvs_order_and_skill_and_plan_are_optional() {
         let names: Vec<&str> = tool_specs().iter().map(|s| s.name.as_str()).collect();
@@ -773,6 +838,9 @@ mod tests {
             }
             fn kind(&self) -> ToolKind {
                 ToolKind::Execute
+            }
+            fn provenance(&self) -> Provenance {
+                Provenance::Project
             }
             fn checkpoint(&self) -> bool {
                 false

@@ -154,6 +154,7 @@ mod tests {
     fn request(once: bool) -> ApprovalRequest {
         ApprovalRequest {
             reason: true,
+            persists: false,
             tool: "bash".into(),
             label: "git commit".into(),
             preview: Preview { title: "Run a command".into(), command: Some("git commit".into()), ..Preview::default() },

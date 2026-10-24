@@ -66,6 +66,9 @@ pub enum CommandAction {
         every: u32,
     },
     McpTrust,
+    /// `/trust`: use the project's instruction files, skills and agent types as the person's own
+    /// (`crate::project_trust`), from the next start.
+    TrustProject,
     McpAdd {
         args: String,
     },
@@ -571,6 +574,12 @@ pub fn commands() -> &'static [Command] {
                 }
                 print(steps_status(ctx.config))
             },
+        },
+        Command {
+            name: "trust",
+            while_busy: false,
+            description: "Use this project's instructions, skills and agent types as yours (from the next start)",
+            run: |_, _| CommandAction::TrustProject,
         },
         Command { name: "clear", while_busy: false, description: "Clear the conversation", run: |_, _| CommandAction::Clear },
         Command { name: "exit", while_busy: false, description: "Quit Marv", run: |_, _| CommandAction::Exit },
@@ -1371,6 +1380,7 @@ mod tests {
                 dir: "/x".into(),
                 body: String::new(),
                 files: vec![],
+                trusted_files: None,
             },
             source,
             link: link.map(Into::into),

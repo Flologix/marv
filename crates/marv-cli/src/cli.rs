@@ -83,6 +83,13 @@ pub struct Cli {
     #[arg(long = "approve-protected")]
     pub approve_protected: bool,
 
+    /// In -p: use this project's instruction files (AGENTS.md, CLAUDE.md), skills and agent types as yours for this
+    /// run, as if you'd trusted them (/trust in the TUI). Without it, they count only where you trusted exactly these
+    /// files; otherwise the model reads the instruction files as the project's data, and its skills and agent types
+    /// aren't offered.
+    #[arg(long = "trust-project")]
+    pub trust_project: bool,
+
     /// Steps before the turn stops (0 never stops; default: your config's maxSteps).
     #[arg(long = "max-steps", value_name = "N")]
     pub max_steps: Option<u32>,
@@ -288,6 +295,7 @@ mod tests {
         assert!(!cli.approve_tainted && !cli.approve_protected);
         let opted = parse(&["-p", "x", "--approve", "web", "--approve-tainted", "--approve-protected"]);
         assert!(opted.approve_tainted && opted.approve_protected);
+        assert!(!opted.trust_project && parse(&["-p", "x", "--trust-project"]).trust_project);
         assert_eq!((cli.max_steps, cli.model.as_deref(), cli.continue_), (Some(0), Some("m"), true));
     }
 

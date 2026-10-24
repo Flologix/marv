@@ -49,6 +49,13 @@ impl Tool for Glob {
             "additionalProperties": false
         })
     }
+    fn kind(&self) -> marv_core::ToolKind {
+        marv_core::ToolKind::Read
+    }
+    /// The project's file names.
+    fn provenance(&self) -> marv_core::Provenance {
+        marv_core::Provenance::Project
+    }
     fn label(&self, input: &GlobInput) -> String {
         match &input.path {
             Some(path) => format!("{} in {path}", input.pattern),

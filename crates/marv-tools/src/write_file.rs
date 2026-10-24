@@ -136,6 +136,10 @@ impl Tool for WriteFile {
     fn kind(&self) -> marv_core::ToolKind {
         marv_core::ToolKind::Write
     }
+    /// The project's files (and its formatter's output, quoted).
+    fn provenance(&self) -> marv_core::Provenance {
+        marv_core::Provenance::Project
+    }
     fn label(&self, input: &WriteFileInput) -> String {
         input.path.clone()
     }

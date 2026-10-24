@@ -38,6 +38,29 @@ Each guard's doc comment says how it was proven: the guard was reverted, and the
 | Saved tool outputs: read_file/grep read only the session's folder; no writes, bash can't see it | `sandbox.rs::only_reading_tools_reach_the_sessions_saved_outputs_and_nothing_else_outside` | Proven (#61; two reverts; bash part real bwrap) |
 | Results tagged; outside text fenced, never Marv's voice | `provenance.rs::outside_text_is_tagged_and_fenced_as_data` | Proven |
 | Web/MCP/mesh/image content taints | `provenance.rs::outside_content_taints_the_session` | Proven |
+| Authority from the person and Marv only: every tool declares its source; results raised to it | `untrusted_text.rs::every_tool_declares_a_source_class` | Proven |
+| The GitHub door's output is outside text (fenced, taints) | `untrusted_text.rs::github_door_output_is_fenced_and_taints` | Proven (fake gh) |
+| A networked command's output taints; offline it's the project's | `untrusted_text.rs::network_command_output_taints_and_sandboxed_offline_output_doesnt` | Proven (two locks: both reverted) |
+| An untrusted project's instructions are quoted; its skills and agents aren't offered | `untrusted_text.rs::an_untrusted_projects_instructions_load_fenced_and_offer_no_skills` | Proven (two reverts) |
+| A changed instruction file asks for trust again | `untrusted_text.rs::a_changed_instruction_file_asks_for_trust_again` | Proven |
+| An outside source's error results are fenced (MCP errors are the server's) | `untrusted_text.rs::tainting_error_results_are_fenced` | Proven (two reverts) |
+| Fence attributes are escaped | `untrusted_text.rs::fence_attributes_are_escaped` | Proven |
+| MCP descriptions in the deferred note and tool_search are fenced | `untrusted_text.rs::mcp_descriptions_in_announce_and_tool_search_are_fenced` | Proven |
+| mesh_list's receptacle descriptions are fenced | `untrusted_text.rs::mesh_list_descriptions_are_fenced` | Proven |
+| A tainted subagent's report is fenced | `untrusted_text.rs::a_tainted_subagents_report_is_fenced` | Proven |
+| Tainted: a memory write asks every time | `untrusted_text.rs::a_tainted_conversation_asks_once_for_a_memory_write` | Proven |
+| A tainted compaction's summary says so in fixed words | `untrusted_text.rs::a_tainted_compaction_says_so_in_fixed_words` | Proven |
+| `/clear` ends the cleared conversation's taint | `untrusted_text.rs::clear_ends_the_cleared_conversations_taint` | Proven |
+| No suggestion after GitHub or networked output | `untrusted_text.rs::suggestions_stay_off_after_github_or_network_output` | Proven |
+| An unsandboxed command's output is network output | `untrusted_text.rs::an_unsandboxed_commands_output_is_network_output` | Proven (two locks: both reverted) |
+| An outside tool's own error is fenced and taints | `untrusted_text.rs::an_outside_tools_own_error_is_fenced_and_taints` | Proven |
+| Closing tags with invisible or lookalike characters are defused | `untrusted_text.rs::closing_tags_hidden_by_invisible_characters_are_defused` | Proven |
+| A subfolder instruction file counts only once its contents are trusted | `untrusted_text.rs::a_subfolder_instruction_file_counts_only_once_its_contents_are_trusted` | Proven |
+| A trusted skill's changed file is quoted | `untrusted_text.rs::a_trusted_skills_file_that_changed_since_is_quoted` | Proven |
+| A resumed conversation is tainted by what its calls show | `untrusted_text.rs::a_resumed_conversation_is_tainted_by_what_its_calls_show` | Proven |
+| A subagent's taint reaches its parent; its report is fenced | `untrusted_text.rs::a_subagents_taint_reaches_its_parent_and_its_report_is_fenced` | Proven (two reverts) |
+| The session's own tools declare their sources | `untrusted_text.rs::the_session_tools_declare_their_sources_too` | Proven |
+| `marv -p` never writes a memory in a tainted run | `headless_taint.rs::headless_never_writes_a_memory_in_a_tainted_run` | Proven |
 | Tainted: network bash asks | `provenance.rs::tainted_network_bash_must_ask` | Proven |
 | Tainted: every MCP call asks, `readOnlyHint` too | `provenance.rs::tainted_mcp_calls_ask_even_read_only_ones` | Proven (two locks: both reverted) |
 | Tainted: web requests to a new prefix; "always" covers a prefix, not the site | `provenance.rs::tainted_web_fetch_to_a_new_prefix_asks` | Proven (#5; three reverts) |

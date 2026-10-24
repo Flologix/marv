@@ -12,9 +12,10 @@
 //!   text only; images are a taint and exfiltration risk, docs/SECURITY.md),
 //!   structured content as JSON, capped at 30k chars (head and tail kept). The session's adapter runs
 //!   [`McpTool::run_whole`] and cuts it itself, saving a cut result whole (#61).
-//! - A server error or a dead connection becomes a tool error; a
-//!   [`crate::oauth::LoginNeeded`] passes Marv's own sentence through as is, so
-//!   the model tells the user to log in rather than retrying.
+//! - A server error or a dead connection becomes an error result (`is_error`),
+//!   since its text can be the server's own; a
+//!   [`crate::oauth::LoginNeeded`] passes Marv's own sentence through as is (an
+//!   `Err`), so the model tells the user to log in rather than retrying.
 //!
 //! **Difference from Marv (security fix, 2026-10-12 audit):** a `readOnlyHint`
 //! tool is [`ToolKind::Read`] only while the session is untainted. Once web,
@@ -342,7 +343,8 @@ impl McpTool {
         }
     }
 
-    /// Runs the call. `Err` is the tool error text the model reads.
+    /// Runs the call. `Err` is Marv's own sentence (a login is needed); a failure that can carry the server's text is
+    /// an `is_error` result.
     pub async fn run(&self, args: Map<String, Value>, cancel: CancellationToken) -> Result<ToolResult, String> {
         let mut result = self.run_whole(args, cancel).await?;
         result.output = cut_mcp_output(&result.output);
@@ -355,7 +357,12 @@ impl McpTool {
             Ok(r) => r,
             // Marv's own sentence, as it is: the model should tell the user to log in, not retry.
             Err(McpError::LoginNeeded(e)) => return Err(e.to_string()),
-            Err(e) => return Err(format!("{}'s {} failed: {e}", self.server, self.info.name)),
+            // Anything else can carry the server's own words (a JSON-RPC error's message): an error *result*, so the
+            // caller handles it as the server's text (fenced as data, tainting), not as Marv's.
+            Err(e) => {
+                let output = format!("{}'s {} failed: {e}", self.server, self.info.name);
+                return Ok(ToolResult { output, summary: Some("error".into()), is_error: true });
+            }
         };
         let output = mcp_result_text(&result);
         if result.is_error {

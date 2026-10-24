@@ -8,6 +8,8 @@
 //!   (`~/.marv/memory/personal.md`, `~/.marv/memory/projects/<project>.md`).
 //! - `kind: Write` and no `auto_safe`: every change is approved, even in yolo. Memory persists, and an instruction
 //!   planted by a malicious file and saved there would return in every session.
+//! - marv-rs: in a tainted conversation, adding a memory asks a person every time (`Tool::persists`: `must_ask` and
+//!   `once`, never a remembered "always" or a pre-approved scope), and the approval warns that outside text was read.
 //! - A removal must match exactly one memory, or it fails in the preview, before anyone is asked.
 //! - Approval previews show the memory as plain text, with the file (home shortened to `~`) as the note.
 //! - A memory is one line (whitespace runs become one space) of at most [`MAX_ENTRY_CHARS`]; a file holds at most
@@ -25,6 +27,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::types::{Preview, Scope, Tool, ToolContext, ToolError, ToolOutput};
+
+/// The warning on a memory's approval in a tainted conversation.
+pub const TAINTED_MEMORY_WARNING: &str = "This conversation has read outside text (a web page, GitHub, an MCP server, another agent or a networked command), and a memory is loaded into every future conversation as yours: approve it only if it's something you want remembered.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -210,6 +215,10 @@ impl Tool for Memory {
     fn checkpoint(&self) -> bool {
         false
     }
+    /// Marv's own sentence about what it saved (the text is the model's own).
+    fn provenance(&self) -> marv_core::Provenance {
+        marv_core::Provenance::Marv
+    }
     fn check(&self, input: &MemoryInput) -> Result<(), String> {
         if input.text.is_empty() { Err("text: must not be empty".into()) } else { Ok(()) }
     }
@@ -220,6 +229,11 @@ impl Tool for Memory {
     fn scope(&self, _input: &MemoryInput) -> Option<Scope> {
         Some(Scope { key: "memory".into(), description: "memory changes".into() })
     }
+    /// A memory is loaded into every later conversation as the person's own: in a tainted one, adding one is asked
+    /// every time (`run_tool`). Removing one plants nothing.
+    fn persists(&self, input: &MemoryInput, _ctx: &ToolContext) -> bool {
+        input.action == MemoryAction::Add
+    }
 
     async fn preview(&self, input: &MemoryInput, ctx: &ToolContext) -> Result<Preview, ToolError> {
         let path = path_for(input.scope, ctx)?;
@@ -229,6 +243,7 @@ impl Tool for Memory {
                 title: format!("Remember ({})", input.scope.where_()),
                 text: Some(input.text.clone()),
                 note,
+                warning: ctx.taint.is_tainted().then(|| TAINTED_MEMORY_WARNING.to_string()),
                 ..Default::default()
             });
         }
@@ -420,6 +435,33 @@ mod tests {
         assert_eq!(asked[0].scope, Scope { key: "memory".into(), description: "memory changes".into() });
         assert_eq!(out.result.summary, "saved to personal memory");
         assert_eq!(read_entries(&paths(&dir).personal).await, ["Prefers tabs."]);
+    }
+
+    #[tokio::test]
+    async fn in_a_tainted_conversation_adding_a_memory_asks_a_person_every_time_and_says_why() {
+        let dir = TempDir::new("memory-tainted");
+        let approver = Arc::new(Recording { answer: Decision::Always, asked: Mutex::new(Vec::new()) });
+        let ctx = ToolContext {
+            memory: Some(paths(&dir)),
+            approver: Some(approver.clone()),
+            yolo: true,
+            ..ToolContext::new("/home/me/proj")
+        };
+        ctx.taint.mark(marv_core::Provenance::Web);
+        let call = |text: &str| ToolCall {
+            id: "1".into(),
+            name: "memory".into(),
+            arguments: json!({"action": "add", "scope": "personal", "text": text}).to_string(),
+        };
+        run_tool(&call("Prefers tabs."), &ctx, builtin_tools()).await;
+        let asked = std::mem::take(&mut *approver.asked.lock().unwrap());
+        assert_eq!(asked.len(), 1);
+        assert!(asked[0].once && asked[0].must_ask && asked[0].persists, "never a remembered always, never yolo");
+        assert_eq!(asked[0].preview.warning.as_deref(), Some(TAINTED_MEMORY_WARNING));
+        // Clean, it's an ordinary approval with no warning.
+        let (_, clean) =
+            run_memory(&dir, json!({"action": "add", "scope": "personal", "text": "Uses vim."}), Decision::Yes).await;
+        assert!(!clean[0].once && !clean[0].must_ask && !clean[0].persists && clean[0].preview.warning.is_none());
     }
 
     #[tokio::test]

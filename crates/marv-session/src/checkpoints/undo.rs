@@ -454,6 +454,7 @@ pub fn undo_request(plan: &UndoPlan) -> ApprovalRequest {
     let quoted = if label.is_empty() { String::new() } else { format!(" (\"{label}\")") };
     ApprovalRequest {
         reason: false,
+        persists: false,
         tool: "undo".into(),
         label: format!("turn {}", plan.turn),
         preview: Preview {

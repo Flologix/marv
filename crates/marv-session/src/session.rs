@@ -339,13 +339,20 @@ pub struct SessionInit {
     pub reasoning_effort: Option<marv_provider::ReasoningEffort>,
     /// Marv's version, for trajectories.
     pub version: String,
-    /// The instruction files, as they go into the prompt (`instructions::load_instructions`, which gives each its
+    /// The instruction files, as they go into the prompt (`project_trust::load_project`, which gives each its
     /// heading); plain text of your own goes under "# Project instructions (from AGENTS.md)".
     pub instructions: Option<String>,
     /// Append a folder's own `AGENTS.md`/`CLAUDE.md` (below the root) to the first read_file, edit_file or write_file
     /// result there, once per conversation (#62; `crate::instructions::NestedInstructions`). Default false: an SDK
     /// session reads the project's files only when it asks for the `Project` source; the CLI sets it.
     pub nested_instructions: bool,
+    /// Which of the project's subfolder instruction files count as the person's (`crate::project_trust`): any other
+    /// is quoted as the project's data. Default: none. The caller loads `instructions`, `skills` and `agents` with the
+    /// root's trust applied (`crate::project_trust::load_project`).
+    pub nested_trust: Arc<crate::project_trust::NestedTrust>,
+    /// The project's root files as loaded and where they stood (`crate::project_trust::load_project`), for `/trust`;
+    /// `None`: the project's files weren't loaded.
+    pub project_files: Option<(crate::project_trust::ProjectFiles, crate::project_trust::TrustStatus)>,
     pub skills: Vec<LoadedSkill>,
     /// Agent types the agent tool can start (default: general-purpose).
     pub agents: Vec<AgentType>,
@@ -467,6 +474,8 @@ impl SessionInit {
             version: env!("CARGO_PKG_VERSION").into(),
             instructions: None,
             nested_instructions: false,
+            nested_trust: Arc::default(),
+            project_files: None,
             skills: Vec::new(),
             agents: vec![general_purpose()],
             memory: None,
@@ -846,6 +855,21 @@ struct Inner {
     state: Mutex<State>,
 }
 
+/// What a `/clear` keeps of the taint: a background process started with the network, while it runs (it keeps
+/// reaching out, and what it prints is outside text), and the taint of a Marv spawned from a tainted conversation
+/// (`MARV_TAINTED`: its pane can be typed into by the one that spawned it). Everything else ends with the conversation
+/// that held the outside text.
+pub fn taint_kept_by_clear(processes: &[ProcessInfo], tainted_at_start: bool) -> Vec<Provenance> {
+    let mut kept = Vec::new();
+    if processes.iter().any(|p| p.network && p.state == marv_tools::ProcessState::Running) {
+        kept.push(Provenance::Network);
+    }
+    if tainted_at_start {
+        kept.push(Provenance::Herdr);
+    }
+    kept
+}
+
 /// The engine. Cheap to clone (an `Arc`): the TUI keeps one for `interrupt()` while a [`Turn`] streams.
 #[derive(Clone)]
 pub struct MarvSession {
@@ -1198,6 +1222,8 @@ impl MarvSession {
                 init.pre_approved.clear();
             }
         }
+        // A subfolder instruction file quoted for the first time is a notice (the session's warnings).
+        init.nested_trust.set_warn(init.on_warning.clone());
         let inner = Inner {
             specs,
             always,
@@ -1205,7 +1231,7 @@ impl MarvSession {
             file_versions: Arc::default(),
             skills: Arc::new(init.skills.iter().map(|s| s.skill.clone()).collect()),
             loaded: Arc::default(),
-            nested: Arc::default(),
+            nested: Arc::new(crate::instructions::NestedInstructions::new(init.nested_trust.clone())),
             typecheck: Arc::new(Checker::new(Arc::new(crate::diagnostics::turn::Typecheck), None)),
             project_checks: Arc::new(Checker::new(Arc::new(crate::checks::kind::ProjectChecksKind), None)),
             process_on,
@@ -1906,6 +1932,7 @@ impl MarvSession {
             cwd: self.cwd(),
             instructions: init.instructions.clone(),
             nested_instructions: init.nested_instructions,
+            nested_trust: init.nested_trust.clone(),
             worktrees_dir: init.worktrees_dir.clone(),
             factory: factory.clone(),
             provider: provider.clone(),
@@ -2551,7 +2578,10 @@ impl MarvSession {
         let plan = self.state().plan.clone().filter(|p| marv_tools::plan::plan_open(Some(p)));
         let kept: Vec<String> = plan.as_deref().map(marv_tools::plan::plan_text).into_iter().chain(table).collect();
         let kept = (!kept.is_empty()).then(|| kept.join("\n\n"));
-        let new = marv_agent::compact::compacted_history_with_tail(&summary.text, kept.as_deref(), history[start..].to_vec());
+        // A tainted conversation's summary says so in Marv's fixed words: it may repeat the outside text, unfenced.
+        let tainted = self.inner.taint.is_tainted();
+        let new =
+            marv_agent::compact::compacted_history_with_tail(&summary.text, kept.as_deref(), history[start..].to_vec(), tainted);
         let tail_turns = history.len() - start;
         self.install(new, Some(summary.text.clone()));
         // From here the model sees the summary, not the turns before it: the trajectory needs it to say what the model
@@ -2598,7 +2628,10 @@ impl MarvSession {
                     return run;
                 }
                 fenced(text).unwrap_or(match name.as_str() {
-                    "web_fetch" | "github" | "agent" => Provenance::Web,
+                    // As `SavedSession::taint_sources` reads an old file: GitHub's text is GitHub's (a networked
+                    // command's output carries its own `network` fence, read above).
+                    "web_fetch" | "agent" => Provenance::Web,
+                    "github" => Provenance::Github,
                     n if n.starts_with("mcp") => Provenance::Mcp,
                     n if n.starts_with("mesh") || n.starts_with("radio") => Provenance::Mesh,
                     "herdr" => Provenance::Herdr,
@@ -2894,6 +2927,11 @@ impl MarvSession {
                     }
                 };
                 let mut note = DROPPED_NOTE.to_string();
+                // What's left of a tainted conversation may still hold outside text that's no longer fenced (an older
+                // summary of it): Marv's fixed words say so, as a tainted summary's do.
+                if self.inner.taint.is_tainted() {
+                    note = format!("{}\n\n{note}", marv_agent::compact::TAINTED_DROP_NOTE);
+                }
                 if let Some(table) = table {
                     note = format!("{note}\n\n{table}");
                 }
@@ -3044,7 +3082,8 @@ impl MarvSession {
     }
 
     /// `/clear`: a new conversation (and session file), with memory reloaded for the new system prompt. Totals stay.
-    /// Saves the previous conversation first.
+    /// Saves the previous conversation first. Its taint ends with it (but for a networked process still running, or a
+    /// Marv started tainted).
     pub async fn clear(&self) -> Result<(), SessionError> {
         {
             let transcript = self.transcript();
@@ -3068,6 +3107,9 @@ impl MarvSession {
         lock(&self.inner.loaded).clear();
         self.inner.file_versions.forget_all(); // the new conversation has read nothing yet
         self.inner.nested.reset();
+        // Taint lasts as long as the text does: the cleared conversation's outside text is gone, so its taint (and
+        // the URL prefixes approved under it) goes too, but for what outlives the clear (`taint_kept_by_clear`).
+        self.inner.taint.restore(&taint_kept_by_clear(&self.processes(), self.inner.init.tainted_at_start));
         if let Some((paths, _)) = &self.inner.init.memory
             && let Ok(memories) = crate::memory::load_memory(paths).await
         {
@@ -3595,6 +3637,21 @@ impl MarvSession {
         if let Some(processes) = &self.inner.processes {
             processes.close_all().await;
         }
+    }
+
+    /// The project's root files as this session loaded them, and where they stood, for `/trust`.
+    pub fn project_files(&self) -> Option<(crate::project_trust::ProjectFiles, crate::project_trust::TrustStatus)> {
+        self.inner.init.project_files.clone()
+    }
+
+    /// The skills this session loaded (the person's, and a trusted project's), as the model is offered them.
+    pub fn skills(&self) -> Vec<LoadedSkill> {
+        self.inner.init.skills.clone()
+    }
+
+    /// The project's subfolder instruction files this session quoted (see above).
+    pub fn nested_quoted(&self) -> std::collections::BTreeMap<String, String> {
+        self.inner.init.nested_trust.quoted()
     }
 
     /// The background processes (Marv #51): name, command, ports, state.
@@ -4145,6 +4202,12 @@ mod tests {
         }
         fn schema(&self) -> serde_json::Value {
             serde_json::json!({"type": "object"})
+        }
+        fn kind(&self) -> marv_core::ToolKind {
+            marv_core::ToolKind::Read
+        }
+        fn provenance(&self) -> marv_core::Provenance {
+            marv_core::Provenance::Project
         }
         fn label(&self, _input: &Self::Input) -> String {
             String::new()
@@ -5385,6 +5448,59 @@ mod turn_tests {
         assert!(text_of(provider.requests()[1].0.last().unwrap()).contains("Focus especially on: the plan"));
         collect(go(&session, "next")).await;
         assert!(text_of(&provider.requests()[2].0[0]).contains("THE SUMMARY"));
+    }
+
+    #[tokio::test]
+    async fn a_tainted_conversations_summary_starts_with_marvs_note_and_a_clean_ones_doesnt() {
+        for tainted in [false, true] {
+            let dirs = Dirs::new();
+            let provider = Scripted::new(vec![say("Answer."), say("THE SUMMARY"), say("Next.")]);
+            let session = scripted(&dirs, &provider, |_| {});
+            collect(go(&session, "first")).await;
+            if tainted {
+                session.inner.taint.mark(Provenance::Github);
+            }
+            session.compact(None).await.unwrap();
+            collect(go(&session, "next")).await;
+            let requests = provider.requests();
+            let summary = text_of(&requests[2].0[0]);
+            assert_eq!(summary.starts_with(marv_agent::compact::TAINTED_SUMMARY_NOTE), tainted, "{summary}");
+            assert!(summary.contains("THE SUMMARY"));
+            assert_eq!(session.tainted().is_empty(), !tainted, "the summary still holds what tainted it");
+        }
+    }
+
+    #[test]
+    fn a_clear_keeps_a_running_networked_processs_taint_and_a_marv_started_tainted() {
+        let process = |network, state| ProcessInfo {
+            name: "p".into(),
+            command: "x".into(),
+            network,
+            state,
+            exit_code: None,
+            ports: vec![],
+            notes: vec![],
+            started_at: 0,
+        };
+        use marv_tools::ProcessState::{Exited, Running};
+        assert!(taint_kept_by_clear(&[process(false, Running), process(true, Exited)], false).is_empty());
+        assert_eq!(taint_kept_by_clear(&[process(true, Running)], false), [Provenance::Network]);
+        assert_eq!(taint_kept_by_clear(&[], true), [Provenance::Herdr]);
+    }
+
+    #[tokio::test]
+    async fn clear_ends_the_cleared_conversations_taint() {
+        let dirs = Dirs::new();
+        let provider = Scripted::new(vec![say("One."), say("Two.")]);
+        let session = scripted(&dirs, &provider, |_| {});
+        collect(go(&session, "one")).await;
+        session.inner.taint.mark(Provenance::Web);
+        session.inner.taint.approve_prefix("https://docs.rs/");
+        session.clear().await.unwrap();
+        assert!(session.tainted().is_empty());
+        assert!(session.inner.taint.approved_prefixes().is_empty());
+        collect(go(&session, "two")).await;
+        assert!(session.tainted().is_empty());
     }
 
     #[tokio::test]
@@ -6766,6 +6882,12 @@ mod turn_tests {
         fn schema(&self) -> serde_json::Value {
             serde_json::json!({"type": "object"})
         }
+        fn kind(&self) -> marv_core::ToolKind {
+            marv_core::ToolKind::Read
+        }
+        fn provenance(&self) -> marv_core::Provenance {
+            marv_core::Provenance::Project
+        }
         fn label(&self, _input: &Self::Input) -> String {
             "probe".into()
         }
@@ -6836,6 +6958,9 @@ mod turn_tests {
         }
         fn kind(&self) -> marv_core::ToolKind {
             marv_core::ToolKind::Execute
+        }
+        fn provenance(&self) -> marv_core::Provenance {
+            marv_core::Provenance::Project
         }
         fn label(&self, _input: &Self::Input) -> String {
             "d".into()
@@ -6960,7 +7085,7 @@ mod turn_tests {
             i.tool_output_dir = Some(dirs.dir.join("tool-output"));
             i.trajectories = Some(store.clone());
         });
-        let saved = dirs.dir.join("tool-output").join(session.id()).join("b1.txt");
+        let saved = dirs.dir.join("tool-output").join(session.id()).join("b1.network.txt") /* unsandboxed: it had the network */;
         let grep = call("g1", "grep", serde_json::json!({"pattern": "FAILED", "path": saved}));
         lock(&provider.steps).extend([use_tools(vec![grep]), say("parser::quotes fails.")]);
         let events = collect(go(&session, "run the tests")).await;
@@ -6973,9 +7098,11 @@ mod turn_tests {
             .collect();
 
         assert!(results[0].contains(&format!("characters omitted; full output: {} — read_file it, or grep it", saved.display())));
-        assert!(!results[0].contains("FAILED") && results[0].ends_with("test case_10000 ... ok\n\n[exit code 1]"));
+        // Unsandboxed, the command had the network: its output (and the saved file read back) is quoted as data.
+        let body = results[0].split_once('\n').map_or("", |(_, b)| b); // after the fence's opening tag (the command)
+        assert!(!body.contains("FAILED") && body.ends_with("test case_10000 ... ok\n\n[exit code 1]\n</untrusted-data>"));
         assert!(results[0].chars().count() < 31_000);
-        assert_eq!(results[1], format!("{}:5000:test parser::quotes FAILED", saved.display()));
+        assert!(results[1].contains(&format!("\n{}:5000:test parser::quotes FAILED\n", saved.display())), "{}", results[1]);
 
         // The trajectory has what the model saw: the path, not the saved content.
         let log = records(&store, &dirs.project, &session).await;
@@ -6999,7 +7126,7 @@ mod turn_tests {
             i.approve = Some(answer(Decision::Yes));
             i.tool_output_dir = Some(relative.clone());
         });
-        let saved = dirs.dir.join("tool-output").join(session.id()).join("b1.txt");
+        let saved = dirs.dir.join("tool-output").join(session.id()).join("b1.network.txt") /* unsandboxed: it had the network */;
         let read = call("r1", "read_file", serde_json::json!({"path": saved, "offset": 15000, "limit": 1}));
         lock(&provider.steps).extend([use_tools(vec![read]), say("done")]);
         let events = collect(go(&session, "count")).await;
@@ -7603,7 +7730,7 @@ mod turn_tests {
         let requests = provider.requests();
         let first = text_of(&requests[0].0[0]);
         assert!(first.starts_with("(Automatic note from Marv"), "{first}");
-        assert!(first.contains("<untrusted-data source=\"hook\" from=\"session-start hook: echo x >>"), "{first}");
+        assert!(first.contains("<untrusted-data source=\"hook\" from=\"session-start hook: echo x &gt;&gt;"), "{first}");
         assert!(first.contains("queue run 1\n[exit code 0]"), "{first}");
         assert!(first.ends_with("</untrusted-data>\n\none"), "{first}");
         // Once: the second message is only what was typed, and the first stays as it was sent (append-only history).

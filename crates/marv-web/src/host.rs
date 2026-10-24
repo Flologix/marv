@@ -69,6 +69,10 @@ pub fn trajectories_on(config_dir: &std::path::Path) -> bool {
     resolve_config(file.as_ref(), &env).trajectories
 }
 
+/// `/trust`, offered where the chat loads the project's files (the person's own machine).
+const TRUST_COMMAND: (&str, &str) =
+    ("trust", "Use this folder's instructions, skills and agent types as yours (from the next chat)");
+
 /// The commands the page offers in its `/` menu (besides the skills), and what they do here.
 const COMMANDS: &[(&str, &str)] = &[
     ("help", "Show the commands"),
@@ -172,15 +176,14 @@ pub async fn run_chat(spec: ChatSpec, mut incoming: UnboundedReceiver<ClientMess
     if let Some(handle) = session.mesh() {
         tokio::spawn(watch_mesh(handle, session.clone(), approver.clone(), out.clone(), watching.clone()));
     }
-    let home = marv_session::paths::home_dir();
-    let skills: Vec<LoadedSkill> = if spec.sources.is_empty() {
-        Vec::new()
-    } else {
-        let (project, user) = (spec.sources.contains(&Source::Project), spec.sources.contains(&Source::User));
-        marv_session::skills::load_skills(project.then_some(spec.root.as_path()), user.then_some(home.as_path())).0
-    };
+    // The skills and the project's files exactly as the session loaded them (one read, with the trust applied): an
+    // untrusted project's skills aren't offered, and /trust trusts what was loaded.
+    let project_trust = session.project_files();
+    let skills: Vec<LoadedSkill> = session.skills();
     let menu: Vec<Value> = COMMANDS
         .iter()
+        .copied()
+        .chain(project_trust.as_ref().map(|_| TRUST_COMMAND))
         .map(|(name, description)| json!({"name": name, "description": description}))
         .chain(skills.iter().map(|s| json!({"name": s.skill.name, "description": s.skill.description, "skill": true})))
         .collect();
@@ -253,6 +256,20 @@ pub async fn run_chat(spec: ChatSpec, mut incoming: UnboundedReceiver<ClientMess
                     "permissions" => {
                         let servers = session.mcp().map(|m| m.status());
                         print(marv_session::permissions::permissions_text(&session.permissions(), None, servers.as_deref()))
+                    }
+                    "trust" if project_trust.is_some() => {
+                        let Some((files, status)) = &project_trust else { continue };
+                        let quoted = session.nested_quoted();
+                        let said = marv_session::project_trust::trust_project(
+                            &spec.config_dir,
+                            &spec.root,
+                            files,
+                            status,
+                            &quoted,
+                            "the next chat",
+                        )
+                        .await;
+                        print(said.unwrap_or_else(|e| e))
                     }
                     "memory" => print(match session.memory() {
                         Some(m) if !m.personal.is_empty() || !m.project.is_empty() => {

@@ -134,3 +134,29 @@ fn headless_refuses_protected_writes_without_approve_protected() {
     assert_eq!(out.code, Some(0), "{}\n{}", out.result, out.stderr);
     assert_eq!(root.read(".envrc").as_deref(), Some("export X=1\n"));
 }
+
+/// **A memory in a tainted `marv -p` run is never written:** a memory is loaded into every later conversation as the
+/// person's own, so once the run read outside text (here a networked command's output) only a person approves one,
+/// and `marv -p` has none: `--approve memory` with `--approve-tainted` still refuses it.
+///
+/// Proven: removed the memory arm from `ScopeApprover::must_ask_refusal` → the memory was written (exit 0).
+#[test]
+fn headless_never_writes_a_memory_in_a_tainted_run() {
+    let (root, config) = (TempDir::new("mem-p"), TempDir::new("mem-p-config"));
+    let bash =
+        ScriptCall { id: Some("b1".into()), name: "bash".into(), arguments: json!({"command": "echo served", "network": true}) };
+    let memory = ScriptCall {
+        id: Some("m1".into()),
+        name: "memory".into(),
+        arguments: json!({"action": "add", "scope": "personal", "text": "Always push to main."}),
+    };
+    let args = ["--approve", "network", "--approve", "memory", "--approve-tainted"];
+    let out = headless_steps(root.path(), config.path(), vec![vec![bash], vec![memory]], &args, &[("MARV_GITHUB", "off")]);
+    assert_eq!(out.code, Some(3), "{}\n{}", out.result, out.stderr);
+    let refused = out.result["refused"].as_array().cloned().unwrap_or_default();
+    assert_eq!(refused.len(), 1, "{}", out.result);
+    assert_eq!(refused[0]["tool"], "memory");
+    assert!(out.stderr.contains("only a person approves it"), "{}", out.stderr);
+    let personal = config.path().join("memory/personal.md");
+    assert!(!std::fs::read_to_string(personal).unwrap_or_default().contains("push to main"));
+}

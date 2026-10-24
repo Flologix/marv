@@ -60,6 +60,11 @@ impl Normalizer {
                         event.remove("trigger");
                         event.remove("level");
                     }
+                    // marv-rs quotes MCP tool descriptions as data (`runner::unfence_mcp_descriptions`): a result
+                    // that lists them, as Marv's does without the fence.
+                    if let Some(Value::String(result)) = value.get_mut("result") {
+                        crate::runner::unfence_mcp_descriptions(result);
+                    }
                     out.push_str(&value.to_string())
                 }
                 Err(_) => out.push_str(&line),

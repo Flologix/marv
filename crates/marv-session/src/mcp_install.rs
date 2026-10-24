@@ -70,6 +70,7 @@ impl ResolveDeps for LiveDeps {
 pub fn add_request(approval: &AddApproval) -> ApprovalRequest {
     ApprovalRequest {
         reason: false,
+        persists: false,
         tool: approval.tool.into(),
         label: approval.label.clone(),
         preview: Preview {

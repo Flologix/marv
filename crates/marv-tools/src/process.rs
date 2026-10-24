@@ -170,6 +170,23 @@ impl Tool for ProcessTool {
     fn needs_approval(&self, input: &ProcessInput) -> Option<bool> {
         Some(input.action == ProcessAction::Start)
     }
+    /// A process's output and Marv's lines about it: the project's.
+    fn provenance(&self) -> marv_core::Provenance {
+        marv_core::Provenance::Project
+    }
+    /// What a process with the network prints (its first output on start, its logs) can be whatever a server sent
+    /// it: outside text, fenced, and it taints the conversation.
+    fn provenance_in(&self, input: &ProcessInput, ctx: &ToolContext) -> marv_core::Provenance {
+        let networked = match input.action {
+            ProcessAction::Start => input.network.unwrap_or(false),
+            ProcessAction::Logs => ctx
+                .processes
+                .as_ref()
+                .is_some_and(|p| p.list().iter().any(|info| Some(info.name.as_str()) == input.name.as_deref() && info.network)),
+            ProcessAction::List | ProcessAction::Stop => false,
+        };
+        if networked { marv_core::Provenance::Network } else { marv_core::Provenance::Project }
+    }
     fn uses_network(&self, input: &ProcessInput) -> bool {
         input.action == ProcessAction::Start && input.network.unwrap_or(false)
     }
@@ -380,8 +397,12 @@ mod tests {
         );
         assert!(started.output.ends_with("First output:\nready"));
         assert_eq!(started.summary, "running · localhost:4789");
+        assert_eq!(started.provenance, marv_core::Provenance::Project, "offline: the project's");
         let net = call(&ctx, json!({"action": "start", "command": "sleep 9", "network": true, "name": "n"})).await;
         assert!(net.output.contains("It shares the user's network, so it listens on their machine directly"));
+        // With the network, what it prints can be anything a server sent it: outside text, its logs too.
+        assert_eq!(net.provenance, marv_core::Provenance::Network);
+        assert_eq!(call(&ctx, json!({"action": "logs", "name": "n"})).await.provenance, marv_core::Provenance::Network);
         {
             let asked = asked.0.lock().unwrap();
             let keys: Vec<_> = asked.iter().map(|r| (r.door, r.scope.key.clone(), r.once, r.network)).collect();
@@ -401,6 +422,7 @@ mod tests {
         let logs = call(&ctx, json!({"action": "logs", "name": "bun-run-dev", "lines": 2})).await;
         assert_eq!(logs.output, "Logs of bun-run-dev (running · http://localhost:4789), last 2 lines:\nline 1\nline 2");
         assert_eq!(logs.approval, None);
+        assert_eq!(logs.provenance, marv_core::Provenance::Project);
         let list = call(&ctx, json!({"action": "list"})).await;
         assert!(
             list.output.starts_with("- bun-run-dev: running · http://localhost:4789 · up 0s · $ bun run dev"),

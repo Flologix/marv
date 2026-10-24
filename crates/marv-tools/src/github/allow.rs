@@ -168,6 +168,13 @@ static SCP: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(?:[^@/\s]+@)?([^:/
 
 /// The host an `origin` URL names, as gh reads it (https, ssh://, scp-like git@host:path); None for a local path.
 pub fn origin_host(url: &str) -> Option<String> {
+    // The project's own file says it: only a plain host name counts (`[a-z0-9.-]`); anything else is unknown, never
+    // text that would reach gh's arguments or Marv's sentences as a host.
+    origin_host_any(url)
+        .filter(|h| !h.is_empty() && h.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-'))
+}
+
+fn origin_host_any(url: &str) -> Option<String> {
     let trimmed = url.trim();
     if trimmed.is_empty() {
         return None;
@@ -784,6 +791,9 @@ mod tests {
         assert_eq!(origin_host("ssh://git@GHE.corp:22/o/r").as_deref(), Some("ghe.corp"));
         assert_eq!(origin_host("https://user:pw@ghe.corp/o/r").as_deref(), Some("ghe.corp"));
         assert_eq!(origin_host("/local/path"), None);
+        assert_eq!(origin_host("https://[::1]/o/r"), None);
+        assert_eq!(origin_host("git@evil\u{202e}host:o/r"), None);
+        assert_eq!(origin_host("git@a\"b`c:o/r"), None);
         assert_eq!(origin_host(""), None);
     }
 }

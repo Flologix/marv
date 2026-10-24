@@ -139,7 +139,16 @@ pub struct SessionOptions {
     /// Start tainted (#74, `MARV_TAINTED=1`): this session's first message came from a conversation that held
     /// untrusted text. Default false.
     pub tainted_at_start: bool,
+    /// With the `Project` source: whether the project's instruction files, skills and agent types are used as the
+    /// person's own (`crate::project_trust`). `None` (the default): only when the person trusted exactly these files
+    /// here (stored beside MCP trust); `Some(true)`: trusted for this session (`marv -p --trust-project`), nothing
+    /// stored; `Some(false)`: never. Not trusted, the instruction files are quoted to the model as the project's data,
+    /// and its skills and agent types aren't loaded.
+    pub trust_project: Option<bool>,
 }
+
+/// How an SDK session's notice says a project's instructions get trusted.
+pub const TRUST_HINT: &str = "Trusting them (/trust in the TUI, or --trust-project for marv -p)";
 
 /// Builds a [`MarvSession`] (Marv's `createSession`).
 pub struct SessionBuilder {
@@ -190,6 +199,7 @@ impl SessionBuilder {
                 one_shot: false,
                 herdr: None,
                 tainted_at_start: false,
+                trust_project: None,
             },
         }
     }
@@ -294,8 +304,20 @@ pub async fn create_session(options: SessionOptions) -> Result<MarvSession, Sess
     // The real environment only: never a project file (docs/SECURITY.md).
     let env: Env = std::env::vars().collect();
     let config_dir = options.config_dir.clone().unwrap_or_else(|| default_config_dir(&env, &home));
-    let loaded = load_sources(&root, &options.sources, &config_dir, &home, &env).await;
+    // A project's instructions are the person's only once trusted (docs/SECURITY.md): a cloned repository's aren't.
+    let loaded = load_sources(&root, &options.sources, &config_dir, &home, &env, options.trust_project).await;
+    let trust_notice = match &loaded.project_status {
+        Some(status) if !loaded.trusted => crate::project_trust::untrusted_notice(status, &loaded.project_files, TRUST_HINT),
+        _ => None,
+    };
+    let nested_trust = loaded.nested.clone();
+    let project_files = loaded.project_status.clone().map(|status| (loaded.project_files.clone(), status));
     let mut problems = loaded.problems;
+    match (&options.on_warning, trust_notice) {
+        (Some(warn), Some(notice)) => warn(notice),
+        (None, notice) => problems.extend(notice),
+        (Some(_), None) => {}
+    }
     let given = if options.mcp_servers.is_empty() {
         marv_mcp::config::LoadedConfig::default()
     } else {
@@ -352,6 +374,8 @@ pub async fn create_session(options: SessionOptions) -> Result<MarvSession, Sess
     init.instructions = loaded.instructions.map(|i| i.text);
     // Nested AGENTS.md files are the project's too (#62).
     init.nested_instructions = options.sources.contains(&Source::Project);
+    init.nested_trust = nested_trust;
+    init.project_files = project_files;
     init.skills = loaded.skills;
     init.agents = loaded.agents;
     init.memory = loaded.memory;

@@ -92,6 +92,16 @@ pub trait Resolve: Send + Sync {
     async fn lookup(&self, host: &str) -> Result<Vec<IpAddr>, LookupError>;
 }
 
+/// A resolver held in settings that print themselves (`Debug`).
+#[derive(Clone)]
+pub struct Resolver(pub Arc<dyn Resolve>);
+
+impl std::fmt::Debug for Resolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Resolver")
+    }
+}
+
 /// The system's resolver (getaddrinfo, through tokio).
 pub struct SystemResolver;
 
@@ -125,6 +135,37 @@ impl Default for CheckOptions {
     fn default() -> Self {
         Self { allow_private: false, dns_timeout: Duration::from_millis(DNS_TIMEOUT_MS), resolver: None }
     }
+}
+
+/// What can be refused without asking DNS: anything but http(s), a private address literal, `localhost`. A name is
+/// left for [`check_address`] when the fetch runs: looking it up sooner (in the approval's preview) would send the
+/// name to DNS before anyone said yes, and a name can carry data (`<secret>.example.com`).
+pub fn check_address_unresolved(url: &Url, options: &CheckOptions) -> Result<(), ToolError> {
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return Err(ToolError(format!("Only http and https links can be fetched, not {}.", url.scheme())));
+    }
+    if options.allow_private {
+        return Ok(());
+    }
+    let host = match url.host() {
+        Some(Host::Ipv4(ip)) => ip.to_string(),
+        Some(Host::Ipv6(ip)) => ip.to_string(),
+        Some(Host::Domain(name)) => {
+            let host = name.trim_end_matches('.').to_ascii_lowercase();
+            if host != "localhost" && !host.ends_with(".localhost") {
+                return Ok(());
+            }
+            host
+        }
+        None => return Err(ToolError(format!("Not a valid URL: {url}. Give the full address, e.g. https://example.com/page."))),
+    };
+    let address = if url.host().is_some_and(|h| matches!(h, Host::Domain(_))) { "127.0.0.1".to_string() } else { host.clone() };
+    if is_private_address(&address) {
+        return Err(ToolError(format!(
+            "Refused: {host} is a private address (this machine or its network). To reach a local server, use bash with network: true (it asks first)."
+        )));
+    }
+    Ok(())
 }
 
 /// Refuses a URL web_fetch mustn't fetch: anything but http(s), or a host that is, or resolves to, a private address.
@@ -185,6 +226,19 @@ pub async fn check_address(url: &Url, options: &CheckOptions, cancel: &Cancellat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn without_a_lookup_only_literals_and_localhost_are_refused() {
+        let check = |u: &str| check_address_unresolved(&Url::parse(u).unwrap(), &CheckOptions::default());
+        assert!(check("http://127.0.0.1/").is_err());
+        assert!(check("http://[::1]/").is_err());
+        assert!(check("http://10.0.0.5/x").is_err());
+        assert!(check("http://localhost:3000/").is_err());
+        assert!(check("http://a.localhost/").is_err());
+        assert!(check("file:///etc/passwd").is_err());
+        assert!(check("https://secret-data.example.com/").is_ok(), "a name waits for the fetch's own lookup");
+        assert!(check("https://93.184.215.14/").is_ok());
+    }
 
     #[test]
     fn private_addresses() {

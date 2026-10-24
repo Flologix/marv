@@ -96,28 +96,69 @@ pub struct SavedCheckpoints {
 
 impl SavedSession {
     /// The taint to restore on resume. Saved files say it; an older file (or one from TypeScript Marv) is judged by
-    /// its conversation, erring on the tainted side: a web or github call counts as web content, an MCP, mesh or herdr
-    /// call as theirs, and a subagent's report (which could carry either) as web content.
+    /// its conversation, erring on the tainted side: a web call counts as web content, a github, MCP, mesh or herdr
+    /// call as theirs, and a subagent's report (which could carry any) as web content. Either way, what the
+    /// conversation's calls show for sure is added ([`SavedSession::taint_shown`]): a file saved before GitHub's and
+    /// networked commands' output tainted still holds that text.
     pub fn taint_sources(&self) -> Vec<marv_core::Provenance> {
         use marv_core::Provenance;
-        if let Some(saved) = &self.taint {
-            return saved.clone();
-        }
-        let mut sources = Vec::new();
-        for turn in &self.conversation {
-            let marv_core::ChatTurn::Tool { name, .. } = turn else { continue };
-            let source = match name.as_str() {
-                "web_fetch" | "github" | "agent" => Provenance::Web,
-                n if n.starts_with("mcp") => Provenance::Mcp,
-                n if n.starts_with("mesh") => Provenance::Mesh,
-                "herdr" => Provenance::Herdr,
-                _ => continue,
-            };
+        let mut sources = match &self.taint {
+            Some(saved) => saved.clone(),
+            None => {
+                let mut sources = Vec::new();
+                for turn in &self.conversation {
+                    let marv_core::ChatTurn::Tool { name, .. } = turn else { continue };
+                    let source = match name.as_str() {
+                        "web_fetch" | "agent" => Provenance::Web,
+                        "github" => Provenance::Github,
+                        n if n.starts_with("mcp") => Provenance::Mcp,
+                        n if n.starts_with("mesh") => Provenance::Mesh,
+                        "herdr" => Provenance::Herdr,
+                        _ => continue,
+                    };
+                    if !sources.contains(&source) {
+                        sources.push(source);
+                    }
+                }
+                sources
+            }
+        };
+        for source in self.taint_shown() {
             if !sources.contains(&source) {
                 sources.push(source);
             }
         }
         sources
+    }
+
+    /// The outside sources the conversation's own calls show it read, whatever the file says: a github call, a bash
+    /// command with the network (`"network": true`, or on the host: `"sandbox": false`), a background process started
+    /// with the network.
+    pub fn taint_shown(&self) -> Vec<marv_core::Provenance> {
+        use marv_core::Provenance;
+        let mut shown = Vec::new();
+        for turn in &self.conversation {
+            let marv_core::ChatTurn::Assistant { tool_calls, .. } = turn else { continue };
+            for call in tool_calls {
+                let args: serde_json::Value = serde_json::from_str(&call.arguments).unwrap_or_default();
+                let flag = |key: &str| args.get(key).and_then(serde_json::Value::as_bool);
+                let source = match call.name.as_str() {
+                    "github" => Some(Provenance::Github),
+                    "bash" if flag("network") == Some(true) || flag("sandbox") == Some(false) => Some(Provenance::Network),
+                    "process"
+                        if args.get("action").and_then(serde_json::Value::as_str) == Some("start")
+                            && flag("network") == Some(true) =>
+                    {
+                        Some(Provenance::Network)
+                    }
+                    _ => None,
+                };
+                if let Some(source) = source.filter(|s| !shown.contains(s)) {
+                    shown.push(source);
+                }
+            }
+        }
+        shown
     }
 
     /// The saved plan, or `None` for none, an old file or a hand edit (the plan is dropped, the session still loads).
@@ -380,6 +421,39 @@ mod tests {
         std::fs::remove_dir_all(&base).unwrap();
         assert!(store.save(&with_user(Path::new("/home/me/proj"), "late", 3)).await.is_err());
         assert!(!base.exists());
+    }
+
+    #[test]
+    fn a_saved_taint_gets_what_the_calls_show_added() {
+        use marv_core::{ChatTurn, Provenance, ToolCall};
+        let mut s = with_user(Path::new("/p"), "x", 0);
+        s.taint = Some(vec![]);
+        let call = |name: &str, args: &str| ToolCall { id: "c".into(), name: name.into(), arguments: args.into() };
+        s.conversation.push(ChatTurn::Assistant {
+            text: String::new(),
+            tool_calls: vec![call("bash", r#"{"command":"ls"}"#), call("read_file", r#"{"path":"a"}"#)],
+            reasoning: None,
+        });
+        assert!(s.taint_sources().is_empty(), "offline and local: nothing shown");
+        s.conversation.push(ChatTurn::Assistant {
+            text: String::new(),
+            tool_calls: vec![
+                call("bash", r#"{"command":"curl x","network":true}"#),
+                call("github", r#"{"args":["pr","view","1"]}"#),
+            ],
+            reasoning: None,
+        });
+        assert_eq!(s.taint_sources(), [Provenance::Network, Provenance::Github]);
+        s.taint = Some(vec![Provenance::Web]);
+        assert_eq!(s.taint_sources(), [Provenance::Web, Provenance::Network, Provenance::Github]);
+        let mut p = with_user(Path::new("/p"), "x", 0);
+        p.taint = Some(vec![]);
+        p.conversation.push(ChatTurn::Assistant {
+            text: String::new(),
+            tool_calls: vec![call("process", r#"{"action":"start","command":"npm i","network":true}"#)],
+            reasoning: None,
+        });
+        assert_eq!(p.taint_sources(), [Provenance::Network]);
     }
 
     #[test]

@@ -532,11 +532,22 @@ impl Tool for Bash {
     fn label(&self, input: &BashInput) -> String {
         input.command.clone()
     }
+    /// A command's output: the project's.
+    fn provenance(&self) -> marv_core::Provenance {
+        marv_core::Provenance::Project
+    }
+    /// A command that ran with the network (`network: true`, on the host, or anywhere the sandbox is off or unavailable:
+    /// it has the network then too) can print whatever a server sent it: outside text, fenced, and it taints the
+    /// conversation. Offline in the sandbox, it's the project's.
+    fn provenance_in(&self, input: &BashInput, ctx: &ToolContext) -> marv_core::Provenance {
+        if self.uses_network_in(input, ctx) { marv_core::Provenance::Network } else { marv_core::Provenance::Project }
+    }
     fn uses_network(&self, input: &BashInput) -> bool {
         input.network.unwrap_or(false)
     }
+    /// With the sandbox off or unavailable, every command has the network (nothing takes it away).
     fn uses_network_in(&self, input: &BashInput, ctx: &ToolContext) -> bool {
-        input.network.unwrap_or(false) || through_host(input, ctx)
+        input.network.unwrap_or(false) || through_host(input, ctx) || !ctx.sandbox.active()
     }
     /// `bash:<flags>:<command>`: the flag segment is always there (empty without network or git_write) and never
     /// holds a `:`, so the command's own text can't read as a flag (`bash::net:x` is the command `net:x`).
@@ -662,10 +673,12 @@ impl Tool for Bash {
             let note = if shown.count > 0 { format!("\n{}", redacted_note(shown.count)) } else { String::new() };
             let redacted = if shown.count > 0 { format!(" · {} redacted", shown.count) } else { String::new() };
             let summary = format!("{} · on your machine{redacted}", command_summary(&result, timeout));
-            return Ok(ToolOutput::ok(
-                format_output_with(&result, |t| cut_for_call(t, ctx, marv_core::Provenance::Project)) + &note,
+            let mut out = ToolOutput::ok(
+                format_output_with(&result, |t| cut_for_call(t, ctx, marv_core::Provenance::Network)) + &note,
                 summary,
-            ));
+            );
+            out.provenance = marv_core::Provenance::Network;
+            return Ok(out);
         }
         // A command that runs without asking sees .git read-only: git runs hooks and config from it outside any
         // sandbox (the user's next commit, their editor), so a planted hook would escape. Without a .git, it can't
@@ -754,7 +767,11 @@ impl Tool for Bash {
                 result.output.push_str(&format!("\n{gh}\n"));
             }
         }
-        Ok(ToolOutput::ok(format_output_with(&result, |t| cut_for_call(t, ctx, marv_core::Provenance::Project)), summary))
+        // Unsandboxed, it had the network whatever it asked for.
+        let source = if network || !sandboxed { marv_core::Provenance::Network } else { marv_core::Provenance::Project };
+        let mut out = ToolOutput::ok(format_output_with(&result, |t| cut_for_call(t, ctx, source)), summary);
+        out.provenance = source;
+        Ok(out)
     }
 }
 
@@ -1201,6 +1218,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_networked_commands_output_is_outside_text_an_offline_ones_the_projects() {
+        let root = TempDir::new("bash-network-source");
+        // Without the sandbox, every command has the network: its output is outside text, network asked for or not.
+        let open = tool_ctx(&root, false);
+        for input in [BashInput { network: Some(true), ..bash("echo hi") }, bash("echo hi")] {
+            assert_eq!(Bash.provenance_in(&input, &open), marv_core::Provenance::Network);
+            assert!(Bash.uses_network_in(&input, &open));
+            assert_eq!(Bash.run(&input, &open).await.unwrap().provenance, marv_core::Provenance::Network);
+        }
+        require_bwrap!();
+        let sandboxed = tool_ctx(&root, true);
+        let online = BashInput { network: Some(true), ..bash("echo hi") };
+        assert_eq!(Bash.provenance_in(&online, &sandboxed), marv_core::Provenance::Network);
+        assert_eq!(Bash.run(&online, &sandboxed).await.unwrap().provenance, marv_core::Provenance::Network);
+        assert_eq!(Bash.provenance_in(&bash("echo hi"), &sandboxed), marv_core::Provenance::Project);
+        assert_eq!(Bash.run(&bash("echo hi"), &sandboxed).await.unwrap().provenance, marv_core::Provenance::Project);
+    }
+
+    #[tokio::test]
     async fn the_hidden_home_note_is_added_in_the_sandbox_after_the_output_without_counting_as_output() {
         require_bwrap!();
         let root = TempDir::new("bash-note-home");
@@ -1400,7 +1436,8 @@ mod tests {
         ctx.tool_output = Some(store.path().join("s1"));
         ctx.call_id = Some("b1".into());
         let out = Bash.run(&bash("seq 1 20000"), &ctx).await.unwrap();
-        let saved = store.path().join("s1/b1.txt");
+        // Without the sandbox the command had the network: saved as that source.
+        let saved = store.path().join("s1/b1.network.txt");
         assert!(out.output.contains(&format!("full output: {} — read_file it, or grep it", saved.display())));
         assert_eq!(std::fs::read_to_string(&saved).unwrap(), (1..=20000).map(|n| n.to_string()).collect::<Vec<_>>().join("\n"));
         assert!(out.output.ends_with("20000\n\n[exit code 0]"));
@@ -1411,9 +1448,13 @@ mod tests {
         ctx.tool_output = Some(store.path().join("s1"));
         let command = format!("echo {token}; seq 1 20000");
         let out = crate::run_tool(&host_call(&command, json!({})), &ctx, &tools()).await;
-        let saved = std::fs::read_to_string(store.path().join("s1/h1.txt")).unwrap();
+        // A host command has the network: its output is outside text, saved under that source so a read gives it back.
+        let path = store.path().join("s1/h1.network.txt");
+        let saved = std::fs::read_to_string(&path).unwrap();
         assert!(saved.starts_with("[redacted token]\n1\n") && !saved.contains(&token));
         assert!(out.result.output.contains("Marv: 1 token was redacted from this output."));
+        assert_eq!(out.result.provenance, marv_core::Provenance::Network);
+        assert_eq!(crate::output::saved_provenance(&path), marv_core::Provenance::Network);
     }
 
     #[tokio::test]
@@ -1476,7 +1517,8 @@ mod tests {
         assert!(out.result.output.contains("hi"), "{}", out.result.output);
         let asked = answer.1.lock().unwrap().clone();
         let r = &asked[0];
-        assert_eq!((r.door, r.once, r.network), (None, false, false));
+        // Not the host door, but unsandboxed the command has the network: the request says so.
+        assert_eq!((r.door, r.once, r.network), (None, false, true));
         assert!(r.preview.warning.as_deref().unwrap().contains("the sandbox is off"));
         assert_eq!(r.scope.key, "bash::echo hi");
     }
@@ -1576,10 +1618,15 @@ mod tests {
         open.sandbox = std::sync::Arc::new(Sandbox::from_env(false));
         open.network_failures = Default::default();
         open.yolo = false;
+        let before = answer.1.lock().unwrap().len();
         crate::run_tool(&sandboxed_call(OFFLINE), &open, &tools()).await;
         crate::run_tool(&sandboxed_call(OFFLINE), &open, &tools()).await;
         let asked = answer.1.lock().unwrap().clone();
-        assert!(asked.iter().all(|r| !r.network), "{asked:?}");
+        assert!(asked[..before].iter().all(|r| !r.network), "{asked:?}");
+        // Unsandboxed it had the network all along (the request says so), and nothing was retried with it: the same
+        // command, once per call, with no escalation note's repair.
+        assert_eq!(asked.len(), before + 2, "{asked:?}");
+        assert!(asked[before..].iter().all(|r| r.network && r.scope.key == asked[before].scope.key), "{asked:?}");
     }
 
     #[test]
