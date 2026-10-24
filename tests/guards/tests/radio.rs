@@ -1779,6 +1779,32 @@ async fn the_report_is_built_without_a_model_call() {
     assert!(done.elapsed_ms.is_some());
 }
 
+/// **A turn its person joined with "send now" never quotes its reply in the report**: that reply answered the person
+/// too. The report says so in fixed words.
+///
+/// Proven: passed `false` for `person_joined` in `MarvSession::radio_reports` → this test failed (the reply was quoted).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_turn_its_person_joined_never_quotes_its_reply_in_the_report() {
+    let mesh = mesh_folder();
+    let (alpha, beta) = pair(mesh.path()).await;
+    let id = ask(&alpha, &beta, By::User, 0, "run the tests").await;
+    let pb = TempDir::new("radio-sent-now");
+    let model = Watched::new(vec![
+        use_tools(vec![tool_call("r1", "read_file", json!({"path": "missing.txt"}))]),
+        say("Done. And about your private notes: they say the launch slips a week."),
+    ]);
+    let b = session(&beta, pb.path(), model.clone(), None, false, |_| {});
+    let typer = b.clone();
+    *model.hook.lock().unwrap() = Some((0, Box::new(move || typer.send_now("and what do my notes say?").unwrap())));
+    finish(b.send("go", Default::default()).unwrap()).await;
+    assert!(users(&model.requests()[1].0).iter().any(|u| u.contains("and what do my notes say?")));
+    until("the report", 5, || reports_for(&alpha, &id).len() == 1).await;
+    let done = reports_for(&alpha, &id).pop().unwrap();
+    assert_eq!(done.kind, Kind::Done);
+    assert_eq!(done.text, "finished; beta's user joined the turn, so its reply stays with them");
+    assert!(!done.text.contains("launch"));
+}
+
 /// **Failed reports for stopped, declined and errored turns** (§7.3): each says why in Marv's words.
 ///
 /// Proven: made `radio::report_of` say `done` whatever the turn's end → this test failed.

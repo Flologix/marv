@@ -126,6 +126,13 @@ export function apply(items: Item[], e: ServerEvent): Item[] {
       else next.push(done);
       return next;
     }
+    case "sent_now":
+      // "Send now": the message went into the running turn here, after the step's tool results.
+      next.push({ kind: "user", text: String(e.text) });
+      return next;
+    case "not_sent":
+      next.push({ kind: "notice", text: "Not sent: the turn ended before its next step. Your message is back in the composer.", tone: "info" });
+      return next;
     case "approval":
       // Sent again (a reattach replaying what it kept): one card per request, as with `tool_start`. Only a card still
       // waiting counts, so a decided card with the same id (a transcript from before ids were unique) never hides a

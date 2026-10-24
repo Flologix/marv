@@ -555,6 +555,14 @@ pub enum UiEvent {
     Assistant {
         text: String,
     },
+    /// "Send now": the person's message went into the running turn, at a step boundary. It joins the transcript here.
+    SentNow {
+        text: String,
+    },
+    /// "Send now" messages that were never delivered (the turn ended first): they go back into the prompt.
+    NotSent {
+        texts: Vec<String>,
+    },
     ToolStart {
         call_id: String,
         name: String,
@@ -768,6 +776,13 @@ pub trait SessionPort: Send + Sync {
     /// Starts a turn with the user's message. A message while busy is the engine's to refuse
     /// (it answers with a system [`UiEvent::Message`]); the UI also doesn't send one.
     fn send(&self, text: String);
+
+    /// Alt+Enter while a turn runs ("send now"): `text` goes to the running turn at its next step boundary (after the
+    /// current reply and tool calls, before the next request), as the person's message. [`UiEvent::SentNow`] says
+    /// when it went in; [`UiEvent::NotSent`] gives back what never did.
+    fn send_now(&self, text: String) {
+        let _ = text;
+    }
 
     /// Runs a slash command line (`"/model"`, `"/mcp login github"`). Marv's commands are pure
     /// functions returning an action; the engine applies the engine-side part (config, yolo,

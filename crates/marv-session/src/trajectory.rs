@@ -186,6 +186,12 @@ pub enum TrajectoryRecord {
         #[serde(skip_serializing_if = "Option::is_none")]
         thinking: Option<String>,
     },
+    /// "Send now": the person's message, read by the running turn at a step boundary (as `turn_start`'s text).
+    SentNow {
+        #[serde(flatten)]
+        who: Who,
+        text: String,
+    },
     /// A tool call and exactly what the model got back. `ms` of a write includes waiting for the typecheck baseline.
     Tool {
         #[serde(flatten)]
@@ -593,6 +599,7 @@ impl AgentRecorder {
                 let thinking = self.take_thinking();
                 (self.sink)(TrajectoryRecord::Assistant { who, text: text.clone(), thinking });
             }
+            LoopEvent::SentNow { text } => (self.sink)(TrajectoryRecord::SentNow { who, text: text.clone() }),
             LoopEvent::ToolStart { call, .. } => {
                 // Reasoning that led straight to a tool call, with no text.
                 if let Some(thinking) = self.take_thinking() {

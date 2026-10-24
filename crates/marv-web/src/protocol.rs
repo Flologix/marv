@@ -17,6 +17,11 @@ pub enum ClientMessage {
     Send {
         text: String,
     },
+    /// "Send now": into the running turn, at its next step (after the current reply and tool calls), as the person's
+    /// message. `sent_now` says when it went in; `not_sent` gives back what never did (no turn, or it ended first).
+    SendNow {
+        text: String,
+    },
     /// A `/command` line, run by Marv (not sent to the model as text): `/help`, `/skills`, `/<skill> request`…
     Command {
         line: String,
@@ -80,5 +85,7 @@ mod tests {
             serde_json::from_str(r#"{"type":"approval","id":4,"decision":{"declined":"use pnpm"}}"#).unwrap();
         assert!(matches!(reason, ClientMessage::Approval { id: 4, decision: Decision::Declined(r) } if r == "use pnpm"));
         assert!(matches!(serde_json::from_str(r#"{"type":"interrupt"}"#).unwrap(), ClientMessage::Interrupt));
+        let now: ClientMessage = serde_json::from_str(r#"{"type":"send_now","text":"and b"}"#).unwrap();
+        assert!(matches!(now, ClientMessage::SendNow { text } if text == "and b"));
     }
 }
