@@ -140,6 +140,9 @@ pub struct FileConfig {
     pub hooks: Option<crate::hooks::Hooks>,
     /// After a turn, suggest the next message in the empty prompt (default on; Tab takes it).
     pub suggestions: Option<bool>,
+    /// `batchNudge` (#215): after four steps that each read one thing, tell the main agent once a turn that reads can
+    /// go together in one reply (default on; `false` for comparing).
+    pub batch_nudge: Option<bool>,
     pub mcp_tools: Option<McpToolsSetting>,
     pub max_steps: Option<MaxStepsSetting>,
     /// The formatter the edit tools run after a change (#67): `false` (off), `true` (detect), or extension → command.
@@ -472,6 +475,7 @@ impl FileConfig {
             checkpoints: boolean("checkpoints", &mut problems),
             hooks,
             suggestions: boolean("suggestions", &mut problems),
+            batch_nudge: boolean("batchNudge", &mut problems),
             mcp_tools,
             max_steps,
             formatter,
@@ -511,6 +515,7 @@ impl FileConfig {
         put("checkpoints", self.checkpoints.map(Value::from));
         put("hooks", self.hooks.as_ref().map(crate::hooks::Hooks::to_value));
         put("suggestions", self.suggestions.map(Value::from));
+        put("batchNudge", self.batch_nudge.map(Value::from));
         put("mcpTools", self.mcp_tools.and_then(|m| serde_json::to_value(m).ok()));
         put("approve", self.approve.clone().map(Value::from));
         put("writable", self.writable.clone().map(Value::from));
@@ -573,6 +578,8 @@ pub struct Config {
     pub checks: bool,
     pub checkpoints: bool,
     pub suggestions: bool,
+    /// `batchNudge` (#215): the main agent's once-per-turn nudge to batch single reads (default on).
+    pub batch_nudge: bool,
     pub mcp_tools: McpToolsSetting,
     /// 0 never asks; 1 can't happen. Subagents' own hard limit (50) is not touched by 0.
     pub max_steps: u32,
@@ -713,6 +720,7 @@ pub fn resolve_config(file: Option<&FileConfig>, env: &Env) -> Config {
         checks: file.and_then(|f| f.checks).unwrap_or(true),
         checkpoints: file.and_then(|f| f.checkpoints).unwrap_or(true),
         suggestions: file.and_then(|f| f.suggestions).unwrap_or(true),
+        batch_nudge: file.and_then(|f| f.batch_nudge).unwrap_or(true),
         mcp_tools: file.and_then(|f| f.mcp_tools).unwrap_or_default(),
         max_steps: max_steps_from_env(env.get("MARV_MAX_STEPS").map(String::as_str), file_steps),
         formatter: file.and_then(|f| f.formatter.clone()).unwrap_or(FormatterSetting::Auto),
@@ -874,6 +882,16 @@ mod tests {
     }
     fn env(pairs: &[(&str, &str)]) -> Env {
         pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    // #215: on unless the file says `"batchNudge": false`; saved under that name.
+    #[test]
+    fn batch_nudge_defaults_on_and_false_turns_it_off() {
+        assert!(resolve_config(None, &Env::new()).batch_nudge);
+        let off = FileConfig::from_value(&json!({ "batchNudge": false })).unwrap();
+        assert!(!resolve_config(Some(&off), &Env::new()).batch_nudge);
+        assert_eq!(off.to_value()["batchNudge"], json!(false));
+        assert!(FileConfig::from_value(&json!({ "batchNudge": "no" })).unwrap_err().contains("batchNudge"));
     }
 
     #[test]

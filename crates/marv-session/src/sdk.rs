@@ -80,6 +80,8 @@ pub struct SessionOptions {
     pub compaction: marv_agent::compact::Version,
     /// `compactTailTokens` (#63): v2's verbatim tail; `None`: the default.
     pub compact_tail_tokens: Option<u64>,
+    /// `batchNudge` (#215): the main agent's once-per-turn nudge to batch single reads. Default true.
+    pub batch_nudge: bool,
     /// The formatter the edit tools run after a change (#67). Default on (detect from the project's config).
     pub formatter: FormatterSetting,
     /// Before a turn's first change, snapshot the project (git commits under a hidden ref,
@@ -174,6 +176,7 @@ impl SessionBuilder {
                 compact_tokens: Some(crate::config::DEFAULT_COMPACT_TOKENS),
                 compaction: marv_agent::compact::Version::V1,
                 compact_tail_tokens: None,
+                batch_nudge: true,
                 formatter: FormatterSetting::Auto,
                 checkpoints: true,
                 mcp_tools: McpToolsSetting::Auto,
@@ -392,6 +395,7 @@ pub async fn create_session(options: SessionOptions) -> Result<MarvSession, Sess
     init.checks = options.checks;
     init.compact_tokens = options.compact_tokens;
     (init.compaction, init.compact_tail_tokens) = (options.compaction, options.compact_tail_tokens);
+    init.batch_nudge = options.batch_nudge;
     init.formatter = options.formatter;
     init.checkpoints = options.checkpoints;
     init.checkpoints_dir = Some(config_dir.join("checkpoints").join(project_key(&root)));

@@ -602,6 +602,10 @@ pub enum UiEvent {
     AnnouncedStep {
         continued: bool,
     },
+    /// #215: `steps` steps in a row each read one thing; Marv told the model (once per turn) reads can go together.
+    BatchNudge {
+        steps: u32,
+    },
     ToolLoop {
         continued: bool,
     },

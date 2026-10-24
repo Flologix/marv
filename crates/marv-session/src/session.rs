@@ -384,6 +384,9 @@ pub struct SessionInit {
     pub compaction: marv_agent::compact::Version,
     /// `compactTailTokens` (#63): the v2 verbatim tail's budget; `None`: `min(15k, 15% of the threshold)`; 0: no tail.
     pub compact_tail_tokens: Option<u64>,
+    /// `batchNudge` (#215): the main agent's once-per-turn nudge to batch single reads (`AgentOptions::batch_nudge`).
+    /// Default true; subagents never get it.
+    pub batch_nudge: bool,
     /// The formatter the edit tools run after a change (#67). Default on (detect from the project's config).
     pub formatter: FormatterSetting,
     /// Snapshot the project before each turn's first change and after the turn (git commits under a hidden ref, #16),
@@ -493,6 +496,7 @@ impl SessionInit {
             compact_tokens: Some(crate::config::DEFAULT_COMPACT_TOKENS),
             compaction: marv_agent::compact::Version::V1,
             compact_tail_tokens: None,
+            batch_nudge: true,
             formatter: FormatterSetting::Auto,
             checkpoints: true,
             checkpoints_dir: None,
@@ -2100,6 +2104,8 @@ impl MarvSession {
         options.wrap_up_at_limit = true;
         // The person's "send now" messages: the main agent's alone, at its step boundaries.
         options.send_now = self.state().send_now.clone();
+        // #215: the batching nudge, the main agent's alone (subagents keep `AgentOptions::new`'s false).
+        options.batch_nudge = self.inner.init.batch_nudge;
 
         let mut reason = TurnEndReason::Done(StopReason::Error);
         let mut subagents = 0;
@@ -6292,6 +6298,40 @@ mod turn_tests {
                 .iter()
                 .any(|t| matches!(t, ChatTurn::User { text } if text == marv_agent::agent::ANNOUNCED_STEP_NOTE))
         );
+    }
+
+    // #215: four steps that each read one thing get the batching nudge once, in Marv's voice: a `batch_nudge` record,
+    // the note in the conversation, and the session stays untainted. `batchNudge: false` turns it off.
+    #[tokio::test]
+    async fn four_single_reads_get_the_batching_nudge_and_a_batch_nudge_record() {
+        for on in [true, false] {
+            let dirs = Dirs::new();
+            let store = Arc::new(TrajectoryStore::new(&dirs.dir));
+            let mut script: Vec<_> = ["r1", "r2", "r3", "r4", "r5"].iter().map(|id| use_tools(vec![read(id)])).collect();
+            script.push(say("Read them."));
+            let provider = Scripted::new(script);
+            let session = scripted(&dirs, &provider, |i| {
+                i.trajectories = Some(store.clone());
+                i.batch_nudge = on;
+            });
+            collect(go(&session, "read the files")).await;
+            let log = records(&store, &dirs.project, &session).await;
+            let nudges: Vec<_> = log.iter().filter(|r| r["type"] == "batch_nudge").collect();
+            let noted = session
+                .conversation()
+                .iter()
+                .filter(|t| matches!(t, ChatTurn::User { text } if text.contains(marv_agent::agent::BATCH_NUDGE_NOTE)))
+                .count();
+            if on {
+                assert_eq!(nudges.len(), 1, "{log:?}");
+                assert_eq!(nudges[0]["steps"], 4);
+                assert_eq!(noted, 1);
+            } else {
+                assert!(nudges.is_empty());
+                assert_eq!(noted, 0);
+            }
+            assert!(session.tainted().is_empty());
+        }
     }
 
     #[tokio::test]

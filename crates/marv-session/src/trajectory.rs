@@ -239,6 +239,13 @@ pub enum TrajectoryRecord {
         who: Who,
         continued: bool,
     },
+    /// #215: `steps` steps in a row each made one read-only call, so Marv told the model (once per turn) that reads
+    /// can go together in one reply.
+    BatchNudge {
+        #[serde(flatten)]
+        who: Who,
+        steps: u32,
+    },
     ToolLoop {
         #[serde(flatten)]
         who: Who,
@@ -659,6 +666,7 @@ impl AgentRecorder {
             LoopEvent::CutOff { continued } => (self.sink)(TrajectoryRecord::CutOff { who, continued: *continued }),
             LoopEvent::TextLoop { continued } => (self.sink)(TrajectoryRecord::TextLoop { who, continued: *continued }),
             LoopEvent::AnnouncedStep { continued } => (self.sink)(TrajectoryRecord::AnnouncedStep { who, continued: *continued }),
+            LoopEvent::BatchNudge { steps } => (self.sink)(TrajectoryRecord::BatchNudge { who, steps: *steps }),
             LoopEvent::ToolLoop { continued } => (self.sink)(TrajectoryRecord::ToolLoop { who, continued: *continued }),
             LoopEvent::EmptyReply { next } => {
                 let next = match next {

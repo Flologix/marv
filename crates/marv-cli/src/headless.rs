@@ -274,6 +274,7 @@ impl Collector {
                     L::CutOff { continued } => Some(json!({"type": "cut_off", "continued": continued})),
                     L::TextLoop { continued } => Some(json!({"type": "text_loop", "continued": continued})),
                     L::AnnouncedStep { continued } => Some(json!({"type": "announced_step", "continued": continued})),
+                    L::BatchNudge { steps } => Some(json!({"type": "batch_nudge", "steps": steps})),
                     L::ToolLoop { continued } => Some(json!({"type": "tool_loop", "continued": continued})),
                     _ => None,
                 }
@@ -512,6 +513,7 @@ pub async fn run_headless(options: HeadlessOptions) -> ExitCode {
     builder.options.trust_project = options.trust_project.then_some(true);
     builder.options.compact_tokens = config.compact_tokens;
     (builder.options.compaction, builder.options.compact_tail_tokens) = (config.compaction, config.compact_tail_tokens);
+    builder.options.batch_nudge = config.batch_nudge;
     // The mesh, when asked for (`--approve mesh:<r>` or `MARV_MESH_NAME`): otherwise a one-off `marv -p` isn't on it
     // and its model isn't offered the mesh tools. Wires are granted only for the listed receptacles, from this run's
     // own agents or from another Marv (its door).

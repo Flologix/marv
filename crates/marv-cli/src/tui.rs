@@ -295,6 +295,7 @@ pub fn map_loop(event: &LoopEvent, totals: &dyn Fn() -> view::Totals) -> Option<
         L::CutOff { continued } => UiEvent::CutOff { continued: *continued },
         L::TextLoop { continued } => UiEvent::TextLoop { continued: *continued },
         L::AnnouncedStep { continued } => UiEvent::AnnouncedStep { continued: *continued },
+        L::BatchNudge { steps } => UiEvent::BatchNudge { steps: *steps },
         L::ToolLoop { continued } => UiEvent::ToolLoop { continued: *continued },
         L::Compacted => UiEvent::Compacted,
         L::Done(reason) => UiEvent::Done(*reason),
@@ -1043,6 +1044,7 @@ impl Bridge {
         init.formatter = config.formatter;
         init.compact_tokens = config.compact_tokens;
         (init.compaction, init.compact_tail_tokens) = (config.compaction, config.compact_tail_tokens);
+        init.batch_nudge = config.batch_nudge;
         // #98: the config's "approve" and this run's --approve seed the session's "always" scopes; the writable
         // folders are resolved and checked already (refused ones are in approval_problems, not here).
         init.pre_approved = s.pre_approved.clone();

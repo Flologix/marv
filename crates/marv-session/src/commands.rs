@@ -742,6 +742,7 @@ fn config_text(ctx: &CommandContext) -> String {
         format!("Checkpoints: {} (/checkpoints, /undo)", if c.checkpoints { "on" } else { "off" }),
         format!("Steps: {}", steps_status(c)),
         format!("Compact:   {}", compact_status(c)),
+        format!("Batch nudge: {} (batchNudge in the config file)", if c.batch_nudge { "on" } else { "off" }),
         format!("Mesh wake: {} (/mesh)", if c.mesh_wake { "on" } else { "off" }),
         format!("Radio:     {} (/radio)", if c.mesh_radio { "on" } else { "off" }),
         format!("Endpoint:  {}", c.base_url),

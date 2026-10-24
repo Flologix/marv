@@ -1048,6 +1048,10 @@ impl App {
                     self.system("✻ The reply announced its next step but made no tool call, so Marv told the model to continue.");
                 }
             }
+            // #215: dim, like #90's line: nothing went wrong, Marv only suggested batching.
+            UiEvent::BatchNudge { steps } => {
+                self.system(format!("✻ The last {steps} steps each read one thing, so Marv suggested sending reads together."));
+            }
             UiEvent::ToolLoop { continued } => {
                 if continued {
                     self.system("✻ The model kept making the same tool call and getting the same result, so Marv answered with a note instead of running it again.");
@@ -2479,6 +2483,15 @@ mod tests {
         assert!(!h.frame().contains("commit this"), "{}", h.frame());
         h.key(ENTER);
         assert_eq!(h.calls().iter().filter(|c| matches!(c, Call::Send(_))).count(), 2, "nothing was sent");
+    }
+
+    // #215: the batching nudge is one dim line, like #90's.
+    #[test]
+    fn the_batching_nudge_shows_one_line() {
+        let mut h = harness();
+        h.typed("go");
+        h.events([UiEvent::BatchNudge { steps: 4 }]);
+        assert!(h.frame().contains("✻ The last 4 steps each read one thing"), "{}", h.frame());
     }
 
     #[test]
