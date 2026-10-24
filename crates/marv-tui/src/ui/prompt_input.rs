@@ -8,6 +8,8 @@
 //!   menu until the text changes. Hidden while busy. ctrl+k opens the App's command palette over it
 //!   (`command_palette`, #44), built from the same commands; the text here stays as it was.
 //! - Placeholder "Type a message, or / for commands"; the border dims while busy.
+//! - New in marv-rs: Alt+Enter (or ctrl+s) is [`PromptOutcome::SendNow`] ("send now": while a turn runs, the App sends the line
+//!   into it at its next step instead of waiting for it to end). Enter is unchanged.
 //! - New in marv-rs: after a turn, a suggested next message ([`PromptInput::suggest`]) shows in the empty prompt
 //!   instead of the placeholder. Tab or → takes it into the line; typing anything drops it. Enter on the empty line
 //!   still sends nothing: a suggestion is only ever sent after the user took it and pressed Enter.
@@ -99,6 +101,8 @@ pub fn match_commands<'a>(value: &str, commands: &'a [CommandInfo]) -> Vec<&'a C
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromptOutcome {
     Submit(String),
+    /// Alt+Enter: "send now" (the App sends it into the running turn, at its next step; idle, it's a plain submit).
+    SendNow(String),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -138,6 +142,19 @@ impl PromptInput {
         // one line high; otherwise it's typed in.
         let value = no_chips(&value);
         if value.contains('\n') { self.add_chip(value) } else { self.type_text(&value) }
+    }
+
+    /// "Send now" text the turn never read, given back: at the start of the line, ahead of what's there (chips
+    /// included, untouched), one message per line. Its line breaks stay as typed text (each draws as a new row), not
+    /// a chip as [`Self::set`] would make: it's the person's own message, back to change or send.
+    pub fn give_back(&mut self, text: &str) {
+        let text = no_chips(text);
+        if text.is_empty() {
+            return;
+        }
+        self.value = if self.value.trim().is_empty() { text } else { format!("{text}\n{}", self.value) };
+        self.cursor = self.value.chars().count();
+        self.menu_index = 0;
     }
 
     /// The text with every chip replaced by what was pasted: what Enter submits.
@@ -304,7 +321,28 @@ impl PromptInput {
                     value: self.value.clone(),
                     pastes: self.pastes.clone(),
                 });
+                // Alt+Enter on a message: send it now (the pastes expanded, as Enter sends them). A command is a
+                // command either way.
+                if key.modifiers.contains(KeyModifiers::ALT) && highlighted.is_none() {
+                    return Some(PromptOutcome::SendNow(text));
+                }
                 return Some(PromptOutcome::Submit(text));
+            }
+            // ctrl+s: the same as Alt+Enter, for terminals that keep Alt+Enter (Windows Terminal: full screen). Raw
+            // mode turns off XON/XOFF, so it arrives as a key.
+            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.history_index = None;
+                self.dismissed_at = None;
+                if let Some(c) = highlighted {
+                    return Some(PromptOutcome::Submit(format!("/{}", c.name)));
+                }
+                let text = self.text();
+                self.submitted = (!self.pastes.is_empty()).then(|| Recall {
+                    text: text.clone(),
+                    value: self.value.clone(),
+                    pastes: self.pastes.clone(),
+                });
+                return Some(PromptOutcome::SendNow(text));
             }
             KeyCode::Up if !self.history.is_empty() => {
                 let next = self.history_index.map_or(self.history.len() - 1, |i| i.saturating_sub(1));
@@ -381,11 +419,11 @@ impl PromptInput {
         let mut rows: Vec<Vec<Span<'static>>> = vec![Vec::new()];
         let mut used = 0;
         let chip_style = Style::new().fg(theme::DIM);
+        let chars: Vec<char> = self.value.chars().collect();
         // Each char of the value as the cells it shows (a chip as its label) and their style.
-        let clean: Vec<(Vec<String>, Style)> = self
-            .value
-            .chars()
-            .map(|c| match self.pastes.get((c as u32).wrapping_sub(CHIP_BASE) as usize).filter(|_| is_chip(c)) {
+        let clean: Vec<(Vec<String>, Style)> = chars
+            .iter()
+            .map(|&c| match self.pastes.get((c as u32).wrapping_sub(CHIP_BASE) as usize).filter(|_| is_chip(c)) {
                 Some(text) => {
                     let number = (c as u32 - CHIP_BASE) as usize + 1;
                     (chip_label(number, text).chars().map(String::from).collect(), chip_style)
@@ -394,6 +432,16 @@ impl PromptInput {
             })
             .collect();
         for i in 0..=clean.len() {
+            // A line break (only text given back by "send now" has one: typing never makes one, and a paste's stay
+            // inside its chip) starts a new row; the cursor on it shows as a space at the end of its line.
+            if chars.get(i) == Some(&'\n') {
+                if i == self.cursor {
+                    rows.last_mut().expect("never empty").push(Span::styled(" ", cursor_style));
+                }
+                rows.push(Vec::new());
+                used = 0;
+                continue;
+            }
             let (cells, style) = match clean.get(i) {
                 Some((cells, style)) => (cells.clone(), *style),
                 None => (vec![" ".to_string()], Style::new()), // the cursor past the end
@@ -782,6 +830,33 @@ mod tests {
     }
 
     // #214: a multi-line paste keeps its newlines, shows as one chip, and never submits.
+    #[test]
+    fn send_now_with_a_paste_chip_sends_the_pasted_text_and_given_back_lines_show_as_rows() {
+        let mut h = Harness::new(&[]);
+        h.typed("also ");
+        h.prompt.paste("line 1\nline 2\n");
+        for modifiers in [KeyModifiers::ALT, KeyModifiers::NONE] {
+            let key = if modifiers == KeyModifiers::ALT {
+                KeyEvent::new(KeyCode::Enter, modifiers)
+            } else {
+                KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)
+            };
+            let outcome = h.prompt.on_key(key, true, &h.commands);
+            assert_eq!(outcome, Some(PromptOutcome::SendNow("also line 1\nline 2\n".into())), "{modifiers:?}");
+        }
+        // Text given back by "send now" (one message per line), ahead of a chip already there: each line its own row,
+        // and the chip still stands for its paste.
+        h.prompt.set("");
+        h.prompt.paste("a\nb");
+        h.prompt.give_back("wait, use pnpm\nand the lint");
+        assert_eq!(h.prompt.text(), "wait, use pnpm\nand the lint\na\nb");
+        let frame = h.frame();
+        let rows: Vec<&str> = frame.lines().map(|l| l.trim_matches(|c: char| c == '│' || c == ' ')).collect();
+        assert!(rows.contains(&"> wait, use pnpm"), "{frame}");
+        assert!(rows.contains(&"and the lint"), "{frame}");
+        assert!(rows.iter().any(|r| r.starts_with("[Pasted text #1, 2 lines]")), "{frame}");
+    }
+
     #[test]
     fn a_multi_line_paste_is_a_chip_and_enter_sends_the_whole_text() {
         let mut h = Harness::new(&[]);

@@ -69,6 +69,8 @@ pub fn to_json(event: &SessionEvent) -> Option<Value> {
             "type": "checkpoint_failed",
             "text": format!("This turn can't be undone: its checkpoint failed ({}).", first_line(message, MAX_DETAIL)),
         })),
+        // "Send now" messages the turn never read: the page puts them back in the composer.
+        SessionEvent::NotSent { texts } => Some(json!({"type": "not_sent", "texts": texts})),
         SessionEvent::Notice { text } => Some(json!({"type": "notice", "text": text})),
         SessionEvent::TurnEnd { reason, .. } => Some(json!({"type": "turn_end", "reason": reason.as_str()})),
         _ => None,
@@ -80,6 +82,8 @@ fn loop_json(event: &LoopEvent, agent: Option<&String>) -> Option<Value> {
         LoopEvent::TextDelta(text) => json!({"type": "text_delta", "text": text}),
         LoopEvent::ThinkingDelta(text) => json!({"type": "thinking_delta", "text": text}),
         LoopEvent::Assistant { text } => json!({"type": "assistant", "text": text}),
+        // "Send now": the person's message went in here, after the step's tool results.
+        LoopEvent::SentNow { text } => json!({"type": "sent_now", "text": text}),
         LoopEvent::ToolStart { call, label } => {
             json!({"type": "tool_start", "id": call.id, "tool": call.name, "label": printable(label)})
         }

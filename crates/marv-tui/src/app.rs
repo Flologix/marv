@@ -311,6 +311,8 @@ pub struct App {
     flush_at: Option<Instant>,
     tools_running: usize,
     agents_running: usize,
+    /// "Send now" messages sent into the running turn and not in it yet (the status bar counts them).
+    sending: usize,
     /// The plan tool's list (#15), pinned above the prompt while it has something left to do.
     plan: Option<Vec<PlanItem>>,
     waiting_for: Option<String>,
@@ -403,6 +405,7 @@ impl App {
             flush_at: None,
             tools_running: 0,
             agents_running: 0,
+            sending: 0,
             plan: None,
             waiting_for: None,
             compacting: false,
@@ -831,6 +834,15 @@ impl App {
                     self.dirty = true;
                 }
             }
+            // "Send now" messages the turn never read: back into the prompt, ahead of anything typed since, to send
+            // (or change) with Enter. Never sent on their own.
+            UiEvent::NotSent { texts } => {
+                self.sending = 0;
+                // Each message on its own line, as sent (the prompt shows the breaks, and Enter sends them), ahead of
+                // anything typed since, its paste chips kept.
+                self.prompt.give_back(&texts.join("\n"));
+                self.system("✻ Not sent: the turn ended before its next step. Your message is back in the prompt.");
+            }
             // A request outside a turn (the suggestion's) still counts.
             UiEvent::Usage { last, totals } if self.turn.is_none() => {
                 self.last_usage = Some(last);
@@ -949,6 +961,15 @@ impl App {
                 self.add_message(message(Role::Assistant, text));
                 t.reply.clear();
                 self.streaming = Some(String::new());
+            }
+            // "Send now": the person's message is in the turn now, after the step's reply and results.
+            UiEvent::SentNow { text } => {
+                self.turn = Some(t);
+                self.flush();
+                t = self.turn.take().expect("put back above");
+                self.sending = self.sending.saturating_sub(1);
+                self.add_message(message(Role::User, text));
+                t.step_started = now;
             }
             UiEvent::ToolStart { call_id, name, label } => {
                 self.turn = Some(t);
@@ -1108,6 +1129,7 @@ impl App {
         self.compacting = false;
         self.tools_running = 0;
         self.agents_running = 0;
+        self.sending = 0;
         self.dirty = true;
     }
 
@@ -1398,8 +1420,10 @@ impl App {
             }
         } else if !matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
             let busy = self.busy();
-            if let Some(PromptOutcome::Submit(text)) = self.prompt.on_key(key, busy, &self.commands) {
-                self.submit(&text, now);
+            match self.prompt.on_key(key, busy, &self.commands) {
+                Some(PromptOutcome::Submit(text)) => self.submit(&text, now),
+                Some(PromptOutcome::SendNow(text)) => self.send_now(&text, now),
+                None => {}
             }
         }
     }
@@ -1481,6 +1505,31 @@ impl App {
             self.start_turn(now);
             self.port.send(text);
         }
+    }
+
+    /// Alt+Enter: while a turn runs, the message goes into it at its next step ("send now"); it joins the transcript
+    /// when it does ([`UiEvent::SentNow`]). Idle, or a command, or a subagent's view open: as Enter.
+    fn send_now(&mut self, raw: &str, now: Instant) {
+        let text = raw.trim();
+        if !self.busy()
+            || self.turn.is_none()
+            || text.starts_with('/')
+            || self.viewing.is_some()
+            || self.port.is_login_callback(text)
+        {
+            return self.submit(raw, now);
+        }
+        if text.is_empty() {
+            return;
+        }
+        let text = text.to_string();
+        self.prompt.set("");
+        self.scroll.follow();
+        self.prompt.remember(&text);
+        self.prompt.history_index = None;
+        self.sending += 1;
+        self.dirty = true;
+        self.port.send_now(text);
     }
 
     /// An approval listing files (/undo) is up: PgUp/PgDn and the wheel scroll the list, not the transcript.
@@ -1668,6 +1717,7 @@ impl App {
             busy,
             agents: self.agents_running,
             viewing: self.viewing.is_some(),
+            sending: self.sending,
         };
         if strip_height == 1 {
             let flashing =
@@ -1881,6 +1931,7 @@ mod tests {
         CompleteSetup(SetupAnswer),
         Resume(Option<String>),
         LoginCallback(String),
+        SendNow(String),
     }
 
     #[derive(Default)]
@@ -1917,6 +1968,9 @@ mod tests {
         }
         fn send(&self, text: String) {
             self.calls.lock().unwrap().push(Call::Send(text));
+        }
+        fn send_now(&self, text: String) {
+            self.calls.lock().unwrap().push(Call::SendNow(text));
         }
         fn run_command(&self, line: String) {
             self.calls.lock().unwrap().push(Call::Command(line));
@@ -2177,6 +2231,69 @@ mod tests {
         assert_eq!(frame.matches("You said: hello world").count(), 1, "{frame}");
         assert!(!h.app.busy());
         assert!(frame.contains("/help · PgUp/PgDn · ctrl+c exit"));
+    }
+
+    fn alt_enter(h: &mut Harness, text: &str) {
+        for c in text.chars() {
+            h.key(KeyCode::Char(c));
+        }
+        h.app.on_key(KeyEvent::new(ENTER, KeyModifiers::ALT), h.now);
+    }
+
+    #[test]
+    fn alt_enter_while_a_turn_runs_sends_now_and_the_message_shows_where_the_turn_read_it() {
+        let mut h = harness();
+        h.typed("fix the build");
+        h.events([UiEvent::TurnStart { turn: "t".into() }, tool_start("c1", "bash", "cargo build")]);
+        assert!(h.frame().contains("alt+enter send now"));
+        // Plain Enter while busy: as before, nothing is sent and the text stays.
+        h.typed("also the tests");
+        assert_eq!(h.calls(), [Call::Send("fix the build".into())]);
+        h.app.prompt.set("");
+        alt_enter(&mut h, "also the tests");
+        assert_eq!(h.calls(), [Call::Send("fix the build".into()), Call::SendNow("also the tests".into())]);
+        assert_eq!(h.app.prompt.value, "");
+        // Not in the transcript until the turn read it; the bar says one is waiting.
+        assert!(!h.frame().contains("> also the tests"));
+        assert!(h.frame().contains("1 for the next step"));
+        h.events([tool_end("c1", "bash", "cargo build", "ok"), UiEvent::SentNow { text: "also the tests".into() }]);
+        let frame = h.frame();
+        let (build, sent) = (frame.find("cargo build").unwrap(), frame.find("> also the tests").unwrap());
+        assert!(sent > build, "after the tool's entry:\n{frame}");
+        assert!(!frame.contains("for the next step"));
+        // ctrl+s does the same (where the terminal keeps Alt+Enter).
+        for c in "and lint".chars() {
+            h.key(KeyCode::Char(c));
+        }
+        h.ctrl('s');
+        assert_eq!(h.calls().last(), Some(&Call::SendNow("and lint".into())));
+        h.event(UiEvent::SentNow { text: "and lint".into() });
+        // Idle, Alt+Enter is Enter.
+        h.events([UiEvent::Done(StopReason::End), turn_end()]);
+        alt_enter(&mut h, "thanks");
+        assert_eq!(h.calls().last(), Some(&Call::Send("thanks".into())));
+    }
+
+    #[test]
+    fn a_message_the_turn_never_read_comes_back_to_the_prompt() {
+        let mut h = harness();
+        h.typed("go");
+        h.events([UiEvent::TurnStart { turn: "t".into() }]);
+        alt_enter(&mut h, "wait, use pnpm");
+        for c in "and".chars() {
+            h.key(KeyCode::Char(c));
+        }
+        h.events([UiEvent::NotSent { texts: vec!["wait, use pnpm".into()] }, UiEvent::Done(StopReason::Aborted), turn_end()]);
+        assert_eq!(h.app.prompt.value, "wait, use pnpm\nand");
+        let frame = h.frame();
+        assert!(frame.contains("> wait, use pnpm") && frame.contains("  and"), "{frame}");
+        assert!(h.frame().contains("Not sent: the turn ended before its next step"));
+        // A command with Alt+Enter is a command: it waits for the turn like Enter.
+        h.app.prompt.set("");
+        h.typed("again");
+        h.events([UiEvent::TurnStart { turn: "t2".into() }]);
+        alt_enter(&mut h, "/undo");
+        assert!(!h.calls().iter().any(|c| matches!(c, Call::SendNow(t) if t == "/undo")));
     }
 
     #[test]

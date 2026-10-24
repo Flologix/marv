@@ -90,6 +90,10 @@ export function useChat(id: string | null, settings: ChatSettings, reload = 0) {
   /** This chat's name on the machine's mesh, when it's on it. */
   const [meshName, setMeshName] = useState<string | null>(null);
   const [servers, setServers] = useState<ServerStatus[]>([]);
+  /** "Send now" messages sent into the running turn and not in it yet. */
+  const [sending, setSending] = useState(0);
+  /** Who takes back "send now" text the turn never read: the composer. */
+  const returnTo = useRef<((text: string) => void) | null>(null);
   // The session's tool list is fixed when it starts: switching a server on or off reopens the chat (it continues).
   const sessionKey = `${id}|${[...settings.mcpOff].sort().join(",")}|${reload}`;
   const connection = useRef<Connection | null>(null);
@@ -178,6 +182,13 @@ export function useChat(id: string | null, settings: ChatSettings, reload = 0) {
         } else {
           if (e.type === "turn_start") setBusy(true);
           if (e.type === "usage") setBusy(false);
+          if (e.type === "sent_now") setSending((n) => Math.max(0, n - 1));
+          if (e.type === "turn_end") setSending(0);
+          if (e.type === "not_sent") {
+            setSending(0);
+            const texts = Array.isArray(e.texts) ? (e.texts as unknown[]).map(String) : [];
+            if (texts.length) returnTo.current?.(texts.join("\n"));
+          }
           setItems((items) => {
             if (typeof e.seq === "number") applied.current = e.seq;
             return apply(items, e);
@@ -241,8 +252,21 @@ export function useChat(id: string | null, settings: ChatSettings, reload = 0) {
 
   const mcp = useCallback((action: string, name?: string) => connection.current?.send({ type: "mcp", action, name }), []);
 
+  /** "Send now": into the running turn at its next step (after the current reply and tool calls), not after it. */
+  /** False when nothing was sent (the chat isn't connected and ready): the composer keeps the text. */
+  const sendNow = useCallback((text: string): boolean => {
+    if (!ready.current || !connection.current) return false;
+    connection.current.send({ type: "send_now", text });
+    setSending((n) => n + 1);
+    return true;
+  }, []);
+  /** The composer: where "send now" text the turn never read goes back. */
+  const onReturn = useCallback((take: ((text: string) => void) | null) => {
+    returnTo.current = take;
+  }, []);
+
   const interrupt = useCallback(() => connection.current?.send({ type: "interrupt" }), []);
   const answer = useCallback((rid: number, decision: Answer) => connection.current?.send({ type: "approval", id: rid, decision }), []);
 
-  return { items, status, busy, error, commands, meshName, servers, mcp, send, startWith, interrupt, answer };
+  return { items, status, busy, error, commands, meshName, servers, mcp, send, sendNow, sending, onReturn, startWith, interrupt, answer };
 }

@@ -79,6 +79,8 @@ use crate::usage::{Prices, Totals, add_usage};
 pub const SAVE_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
 pub const BUSY: &str = "Marv is working on a turn: wait for it to end, or interrupt() it, first.";
 pub const CLOSED: &str = "This session is closed.";
+/// `send_now()` with no turn to deliver to.
+pub const NOT_RUNNING: &str = "No turn is running: send it as a message instead.";
 
 /// What a turn is doing between the model's replies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -273,6 +275,11 @@ pub enum SessionEvent {
     /// turn's end). Checked names and fixed words only.
     RadioNote {
         text: String,
+    },
+    /// "Send now" messages the turn never delivered (it was stopped, declined, hit a limit, or ended before its next
+    /// step), in the order they were sent: the person's again, never sent later on their own. Just before `TurnEnd`.
+    NotSent {
+        texts: Vec<String>,
     },
     /// A line in Marv's own words for the transcript (#63: saved pages that couldn't be written during an overflow's
     /// recovery). Fixed text and Marv's own errors only, never the model's.
@@ -699,6 +706,8 @@ struct State {
     flushing: Vec<tokio::task::JoinHandle<()>>,
     /// The running turn's or compaction's work, until it has fully ended (cancelled then): close() waits for it.
     working: Option<CancellationToken>,
+    /// The running turn's "send now" messages (`send_now()`), until the turn closes it at its end.
+    send_now: Option<marv_agent::agent::SendNow>,
     /// The running turn's MCP specs: what a mid-turn compaction announces again.
     turn_mcp_specs: Arc<Vec<ToolSpec>>,
     /// The plan tool's list (#15): set only by its calls, saved with the conversation, re-injected after compaction.
@@ -762,6 +771,8 @@ struct RadioTurnFacts {
     handles: bool,
     reply: Option<String>,
     declined: Option<String>,
+    /// The person joined the turn with "send now": its reply answered them too, and the report never quotes it.
+    sent_now: bool,
 }
 
 impl State {
@@ -1141,6 +1152,7 @@ impl MarvSession {
             save_timer: None,
             flushing: Vec::new(),
             working: None,
+            send_now: None,
             turn_mcp_specs: Arc::default(),
             mcp_waited: false,
             plan: None,
@@ -1368,6 +1380,29 @@ impl MarvSession {
         self.start(text, options, Woken::No)
     }
 
+    /// "Send now": the person's `text` for the running turn, delivered at its next step boundary (after the current
+    /// reply and its tool calls, before the next request) as an ordinary user message, instead of after the turn.
+    /// Nothing running is stopped for it. Fails when no turn runs (or it has just ended): send it as a turn then.
+    /// What the turn never delivers comes back in [`SessionEvent::NotSent`]; one delivered is a
+    /// [`LoopEvent::SentNow`] and joins the transcript there. `marv -p` never calls this.
+    pub fn send_now(&self, text: &str) -> Result<(), SessionError> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Err(SessionError::Invalid("Nothing to send.".into()));
+        }
+        let s = self.state();
+        if s.closed {
+            return Err(SessionError::Closed);
+        }
+        let Some(queue) = s.send_now.as_ref() else { return Err(SessionError::Invalid(NOT_RUNNING.into())) };
+        queue.push(text.to_string()).map_err(|_| SessionError::Invalid(NOT_RUNNING.into()))?;
+        // As `send`: sites the person pasted are theirs to fetch.
+        for key in marv_tools::web_fetch::pasted_scopes(text) {
+            self.inner.always.add(key);
+        }
+        Ok(())
+    }
+
     /// marv-rs #78 (`mesh.wake`, the TUI's opt-in): a turn started by a message on a wired inbox, not by the user.
     /// `None` when the main agent's inbox has nothing unread (no turn). Refused like `send` during a turn.
     ///
@@ -1422,6 +1457,7 @@ impl MarvSession {
             s.running = true;
             s.current = Some(stop.clone());
             s.working = Some(done.clone());
+            s.send_now = Some(marv_agent::agent::SendNow::new());
         }
         if let Some(outer) = options.cancel.clone() {
             let stop = stop.clone();
@@ -1519,14 +1555,20 @@ impl MarvSession {
         }
         // The session is free before TurnEnd goes out, so a client can send the next message as soon as it sees it,
         // and a turn nobody reads frees it too. (A newer turn can't have started yet: send() refuses while running.)
-        {
+        // "Send now" closes with the turn (under the same lock `send_now()` takes, so nothing slips in after): what it
+        // never delivered goes back to the client.
+        let not_sent = {
             let mut s = self.state();
             s.current = None;
             s.running = false;
             s.turn_open = None;
-        }
+            s.send_now.take().map(|q| q.close()).unwrap_or_default()
+        };
         // At once (#212 review): a quit just after the turn ended mustn't resume it as cut off, without its reply.
         self.save_at_once();
+        if !not_sent.is_empty() {
+            emit(SessionEvent::NotSent { texts: not_sent });
+        }
         emit(SessionEvent::TurnEnd { turn, reason });
         ended.store(true, Ordering::SeqCst);
     }
@@ -1544,8 +1586,14 @@ impl MarvSession {
             (std::mem::take(&mut s.radio_requests), s.radio_turn.clone(), changed)
         };
         let Some(radio) = self.inner.init.mesh.as_ref().and_then(|m| m.radio()) else { return };
-        let (kind, text) =
-            crate::radio::report_of(reason, &radio.name, facts.reply.as_deref(), facts.declined.as_deref(), changed);
+        let (kind, text) = crate::radio::report_for(
+            reason,
+            &radio.name,
+            facts.reply.as_deref(),
+            facts.declined.as_deref(),
+            changed,
+            facts.sent_now,
+        );
         let hop = self.inner.radio_hop.get();
         let now = crate::radio::now_ms();
         for open in open {
@@ -1967,9 +2015,8 @@ impl MarvSession {
         });
         // #63: a request too long for the window: make it fit (a summary of a cut-down history, or dropping the oldest
         // turns) and retry the step, instead of ending the turn with the provider's error.
-        // NOTE for send-now (feat/send-now, not on main yet): this rewrites the history under the loop like `on_full`,
-        // so whatever tracks how much of it was already sent (its `sent_len`) must be reset here too, as it is after a
-        // mid-turn compaction.
+        // This rewrites the history under the loop like `on_full`: the loop resets what it counts as already sent
+        // (`sent_len`, for "send now") on `Recovered`, as it does after a mid-turn compaction.
         options.on_overflow = Some({
             let (session, provider, factory, info, stop, emit) =
                 (self.clone(), provider.clone(), factory.clone(), info.clone(), stop.clone(), emit.clone());
@@ -2010,6 +2057,8 @@ impl MarvSession {
         // --approve`), the limit first gets one tools-off wrap-up reply (#59), the headless reply. After the user's "no"
         // the loop stops without it.
         options.wrap_up_at_limit = true;
+        // The person's "send now" messages: the main agent's alone, at its step boundaries.
+        options.send_now = self.state().send_now.clone();
 
         let mut reason = TurnEndReason::Done(StopReason::Error);
         let mut subagents = 0;
@@ -2027,6 +2076,11 @@ impl MarvSession {
                 LoopEvent::Usage(usage, _) => {
                     self.state().last = Some(*usage);
                     self.count(usage, factory.as_ref(), info.as_ref());
+                }
+                // "Send now": in the transcript where the model read it, as the person's.
+                LoopEvent::SentNow { text } => {
+                    self.note(Role::User, text);
+                    self.state().radio_turn.sent_now = true;
                 }
                 LoopEvent::Assistant { text } => {
                     self.note(Role::Assistant, text);
@@ -4524,6 +4578,76 @@ mod turn_tests {
         assert!(!session.busy());
         collect(go(&session, "two")).await;
         assert_eq!(provider.last_texts(), ["one", "two"]);
+    }
+
+    // ---- send now ----
+
+    #[tokio::test]
+    async fn send_now_reaches_the_running_turn_at_its_next_step_as_the_persons_message() {
+        /// The person types "and b" while the first reply (a tool call) streams: before the call has even run.
+        struct TypesDuringTheReply(Scripted, Mutex<Option<MarvSession>>);
+        impl Provider for TypesDuringTheReply {
+            fn name(&self) -> &str {
+                "scripted"
+            }
+            fn context_length(&self) -> Option<u64> {
+                None
+            }
+            fn stream(&self, history: &[ChatTurn], options: StreamOptions) -> EventStream {
+                if self.0.requests().is_empty() {
+                    lock(&self.1).clone().unwrap().send_now("and b").unwrap();
+                }
+                self.0.stream(history, options)
+            }
+        }
+        let dirs = Dirs::new();
+        let scripted_provider = Scripted::new(vec![use_tools(vec![read("c1")]), say("Done, b too.")]);
+        let provider = Arc::new(TypesDuringTheReply(scripted_provider.clone(), Mutex::default()));
+        let session = make(&dirs, fixed(provider.clone()), |_| {});
+        *lock(&provider.1) = Some(session.clone());
+        // No turn: nothing to send into.
+        assert!(session.send_now("and b").is_err());
+        let events = collect(go(&session, "read it")).await;
+        assert_eq!(end_reason(&events), TurnEndReason::Done(StopReason::End));
+        // The call ran (nothing was stopped for it), its result first, then the person's words.
+        let second = &scripted_provider.requests()[1].0;
+        assert!(
+            matches!(&second[second.len() - 2..], [ChatTurn::Tool { call_id, .. }, ChatTurn::User { text }] if call_id == "c1" && text == "and b"),
+            "{second:?}"
+        );
+        let at = |k: &str| events.iter().position(|e| kind(e) == k).unwrap();
+        let sent =
+            events.iter().position(|e| matches!(e, SessionEvent::Loop(LoopEvent::SentNow { text }) if text == "and b")).unwrap();
+        assert!(at("tool_end") < sent);
+        assert!(!events.iter().any(|e| matches!(e, SessionEvent::NotSent { .. })));
+        // The person's words in the transcript, between the tool and the reply that read them.
+        let messages = session.state().messages.clone();
+        let roles: Vec<(Role, &str)> = messages.iter().map(|m| (m.role, m.text.as_str())).collect();
+        assert_eq!(roles, [(Role::User, "read it"), (Role::User, "and b"), (Role::Assistant, "Done, b too.")]);
+        // A radio report on this turn wouldn't quote the reply that answered the person too.
+        assert!(session.state().radio_turn.sent_now);
+        // Over: refused again.
+        assert!(session.send_now("late").is_err());
+    }
+
+    #[tokio::test]
+    async fn send_now_the_turn_never_read_comes_back_before_turn_end() {
+        let dirs = Dirs::new();
+        let session = make(&dirs, fixed(Arc::new(Hanging::default())), |_| {});
+        let mut turn = go(&session, "go");
+        let mut events = Vec::new();
+        while let Some(e) = turn.next().await {
+            if kind(&e) == "text_delta" && !events.iter().any(|e| kind(e) == "text_delta") {
+                session.send_now("wait").unwrap();
+                session.send_now("use pnpm").unwrap();
+                session.interrupt();
+            }
+            events.push(e);
+        }
+        let n = events.len();
+        assert!(matches!(&events[n - 2], SessionEvent::NotSent { texts } if texts == &["wait", "use pnpm"]), "{events:?}");
+        assert_eq!(end_reason(&events), TurnEndReason::Done(StopReason::Aborted));
+        assert!(!session.conversation().iter().any(|t| matches!(t, ChatTurn::User { text } if text == "wait")));
     }
 
     #[tokio::test]
