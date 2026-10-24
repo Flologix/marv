@@ -40,7 +40,6 @@ brotli = "8"
 sha2 = "0.10"
 encoding_rs = "0.8"
 # Content hashes of the files a session has seen (`file_versions`).
-sha2 = "0.10"
 
 [lints]
 workspace = true
