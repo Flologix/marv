@@ -15,8 +15,10 @@
 //!   ([`plan_limit`]): never retried (it's a 429, which is otherwise retried) and never answered by switching to
 //!   another key or provider.
 //!
-//! Planned (Marv #63): recognize context-length overflow errors (OpenRouter and Ollama wording),
-//! so the loop can compact and retry the step ([`is_context_overflow`]). Planned (Marv #64):
+//! - Marv #63: context-length overflow errors are recognized ([`is_context_overflow`]), so the loop can compact and
+//!   retry the step instead of ending the turn.
+//!
+//! Planned (Marv #64):
 //! classify OpenRouter's `overloaded` / provider errors as retriable where they are.
 
 use serde::Deserialize;
@@ -218,11 +220,72 @@ pub fn unreachable(label: &str, base_url: &str, err: &str, hint: Option<&str>) -
     format!("Can't reach {label} at {origin}.{hint} ({err})")
 }
 
-/// Marv #63 (planned): whether an error says the request was longer than the context window
-/// (OpenRouter: "maximum context length…"/"prompt is too long"; Ollama's wording), so the loop
-/// can compact and retry the step once, then shrink the target (70%, 50%, 35%).
-pub fn is_context_overflow(_message: &str) -> bool {
-    todo!("port: #63 context-overflow detection (collect real OpenRouter/Ollama messages first)")
+/// Marv #63: whether an error says the prompt alone was longer than the context window, so the loop can compact and
+/// retry the step (the session's overflow recovery: 70%, 50%, 35% of the window, then dropping the oldest exchanges).
+/// A case-insensitive match over the whole message the loop sees (`http_error`'s reason plus the detail).
+///
+/// It builds on #116: the OpenAI-compatible adapter recognizes OpenRouter's "maximum context length is N tokens …
+/// X of text input" refusal ([`crate::openai_compat::window_refusal`]) and refits `max_tokens` first, so only a refusal
+/// that still fails after that (the prompt alone doesn't fit) ever reaches here. A refusal about the output alone
+/// ("max_tokens exceeds the remaining context") is the adapter's, and isn't matched.
+///
+/// The wordings (fixtures in `tests/fixtures/overflow/`): OpenRouter's and OpenAI's "maximum context length",
+/// `context_length_exceeded`, "exceeds the context window" (the Responses API), Anthropic's "prompt is too long",
+/// Gemini's "input token count … exceeds the maximum", "context length/window" with "exceed/too long/too large", and an
+/// HTTP 413. Ollama's native API truncates past `num_ctx` instead of failing, so it is covered by the compaction
+/// trigger, not by this.
+///
+/// A 413 counts as the prompt's length: marv-rs sends no image parts (an image reaches the model as the quarantined
+/// reader's text, `docs/SECURITY.md`), so a request body is text. When image parts are added, a 413 on a body that's
+/// mostly images must not go to the overflow recovery, which can't make an image smaller.
+pub fn is_context_overflow(message: &str) -> bool {
+    static PATTERNS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(concat!(
+            r"(?is)",
+            r"maximum context length",
+            r"|context_length_exceeded",
+            r"|exceeds the context window",
+            r"|prompt is too long",
+            r"|input token count.*exceeds the maximum",
+            r"|exceeds the available context size",
+            r"|context (length|window).{0,80}(exceed|too long|too large)",
+            r"|(exceed|too long|too large).{0,80}context (length|window)",
+            r"|returned 413\b",
+        ))
+        .unwrap()
+    });
+    // About the output, not the prompt: the adapter refits `max_tokens` for these (#116).
+    static OUTPUT: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)max_(completion_)?tokens.{0,40}exceed").unwrap());
+    // A refusal that tells the prompt from the completion: only a prompt that alone doesn't fit is an overflow.
+    if let Some((window, input)) = crate::openai_compat::window_refusal(message) {
+        return input >= window;
+    }
+    PATTERNS.is_match(message) && !OUTPUT.is_match(message)
+}
+
+/// Marv #63 review: what an overflow error says about the window and the prompt, `(window, prompt tokens)`, for
+/// calibrating the recovery's estimates. OpenRouter's and DeepInfra's wording ([`crate::openai_compat::window_refusal`]),
+/// OpenAI's ("maximum context length is N tokens. However, your messages resulted in M tokens"), Anthropic's ("prompt
+/// is too long: M tokens > N maximum") and Gemini's ("input token count (M) exceeds the maximum number of tokens
+/// allowed (N)"). `None` when it says neither.
+pub fn overflow_numbers(message: &str) -> Option<(u64, u64)> {
+    static OPENAI: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?is)maximum context length is (\d+) tokens.*?resulted in (\d+) tokens").unwrap()
+    });
+    static ANTHROPIC: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)prompt is too long: (\d+) tokens > (\d+) maximum").unwrap());
+    static GEMINI: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?is)input token count \(?(\d+)\)? exceeds the maximum number of tokens allowed \(?(\d+)\)?").unwrap()
+    });
+    if let Some(found) = crate::openai_compat::window_refusal(message) {
+        return Some(found);
+    }
+    let pair = |re: &regex::Regex, window: usize, input: usize| -> Option<(u64, u64)> {
+        let caps = re.captures(message)?;
+        Some((caps.get(window)?.as_str().parse().ok()?, caps.get(input)?.as_str().parse().ok()?))
+    };
+    pair(&OPENAI, 1, 2).or_else(|| pair(&ANTHROPIC, 2, 1)).or_else(|| pair(&GEMINI, 2, 1)).filter(|(w, i)| *w > 0 && *i > 0)
 }
 
 #[cfg(test)]
@@ -328,6 +391,49 @@ mod tests {
         assert_eq!(plan_limit("Z.ai", r#"{"error":{"code":"1302","message":"Rate limit reached"}}"#), None);
         assert_eq!(plan_limit("OpenRouter", r#"{"error":{"code":429,"message":"Rate limited"}}"#), None);
         assert_eq!(plan_limit("X", "<html>"), None);
+    }
+
+    /// Marv #63: every overflow wording matches, and the errors that look close don't.
+    #[test]
+    fn context_overflow_matches_each_providers_wording_and_nothing_else() {
+        let dir = |d: &str| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(d);
+        let read = |d: &str| {
+            let mut all: Vec<_> = std::fs::read_dir(dir(d)).unwrap().map(|e| e.unwrap().path()).collect();
+            all.sort();
+            all.into_iter().map(|p| (p.display().to_string(), std::fs::read_to_string(&p).unwrap())).collect::<Vec<_>>()
+        };
+        let overflows = read("overflow");
+        assert!(overflows.len() >= 7);
+        for (file, text) in overflows {
+            assert!(is_context_overflow(&text), "{file}");
+            assert!(is_context_overflow(&text.to_uppercase()), "case-insensitive: {file}");
+        }
+        for (file, text) in read("not-overflow") {
+            assert!(!is_context_overflow(&text), "{file}");
+        }
+        assert!(is_context_overflow(r#"{"error":{"code":"context_length_exceeded"}}"#));
+        // vLLM and older OpenAI: the messages against the completion; a window of 0 says nothing.
+        let vllm = "This model's maximum context length is 4096 tokens. However, you requested 5000 tokens (4000 in the messages, 1000 in the completion).";
+        assert_eq!(crate::openai_compat::window_refusal(vllm), Some((4096, 4000)));
+        assert!(!is_context_overflow(vllm), "the prompt alone fits: the adapter refits max_tokens");
+        assert!(is_context_overflow(&vllm.replace("4000 in the messages", "4500 in the messages")));
+        assert_eq!(crate::openai_compat::window_refusal(&vllm.replace("4096", "0")), None);
+        // The numbers each wording carries, for calibration.
+        let numbers: Vec<_> = read("overflow")
+            .iter()
+            .map(|(file, text)| (file.rsplit('/').next().unwrap().to_string(), overflow_numbers(text)))
+            .collect();
+        for (file, expected) in [
+            ("anthropic.txt", Some((200_000, 208_437))),
+            ("deepinfra.txt", Some((163_840, 170_012))),
+            ("gemini.txt", Some((1_048_576, 1_196_032))),
+            ("openai.txt", Some((128_000, 131_245))),
+            ("openrouter.txt", Some((131_072, 140_000))),
+            ("openai-responses.txt", None),
+        ] {
+            assert!(numbers.contains(&(file.to_string(), expected)), "{file}: {numbers:?}");
+        }
+        assert!(!is_context_overflow("Your OpenRouter account is out of credits."));
     }
 
     #[test]

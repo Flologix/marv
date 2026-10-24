@@ -66,6 +66,15 @@ pub struct SavedSession {
     /// radio reports on them. Absent when there are none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub radio_requests: Option<Vec<marv_mesh::radio::OpenRequest>>,
+    /// #63: the last compaction's summary, which the conversation starts with: the next v2 compaction updates it
+    /// (rolling) rather than starting over. Absent in older files: the next summary is a full one (nothing is guessed
+    /// from the conversation's text).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// #63 review: the summary follows the v2 template, so a v2 compaction may update it (rolling). A v1 summary (or one
+    /// from an older file) is summarized from scratch when v2 is switched on.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub summary_v2: bool,
     /// marv-rs #202: saved while a turn ran (a turn is saved as it goes), so a Marv that quit mid-turn left it like
     /// this: what cut it off ("Marv quit while `bash` waited for approval"). A resume marks the turn as cut off (a
     /// notice, a note for the model) and clears it. Absent once the turn ended.
@@ -166,6 +175,8 @@ pub fn new_session(root: &Path, provider: &str, model: &str, now_ms: u64) -> Sav
         pending_note: None,
         taint: None,
         radio_requests: None,
+        summary: None,
+        summary_v2: false,
         cut_off: None,
         pid: None,
     }
@@ -247,6 +258,19 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Deletes a saved session and its saved pages (#63: a swap folder never outlives its session).
+    pub async fn remove(&self, root: &Path, id: &str) -> std::io::Result<()> {
+        let file = self.file(root, id);
+        let swap = marv_tools::swap::swap_dir(&file);
+        if std::fs::symlink_metadata(&swap).is_ok_and(|m| m.is_dir()) {
+            tokio::fs::remove_dir_all(&swap).await?;
+        }
+        match tokio::fs::remove_file(&file).await {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    }
+
     pub async fn load(&self, root: &Path, id: &str) -> Option<SavedSession> {
         match Self::read(&self.file(root, id), root).await {
             Some(s) => Some(s),
@@ -325,6 +349,22 @@ mod tests {
         assert!(store.latest(Path::new("/nowhere")).await.is_none());
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(std::fs::metadata(store.file(root, &s.id)).unwrap().permissions().mode() & 0o777, 0o600);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn removing_a_session_removes_its_saved_pages() {
+        let dir = std::env::temp_dir().join(format!("marv-sessions-rm-{}-{}", std::process::id(), random_hex()));
+        let store = SessionStore::new(&dir);
+        let root = Path::new("/tmp/project-rm");
+        let session = with_user(root, "hi", 1);
+        store.save(&session).await.unwrap();
+        let swap = marv_tools::swap::swap_dir(&store.file(root, &session.id));
+        std::fs::create_dir_all(&swap).unwrap();
+        std::fs::write(swap.join("1.jsonl"), "{}").unwrap();
+        store.remove(root, &session.id).await.unwrap();
+        assert!(!swap.exists() && !store.file(root, &session.id).exists());
+        store.remove(root, &session.id).await.unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
 

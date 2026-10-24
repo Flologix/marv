@@ -43,6 +43,15 @@ pub const DEFAULT_COMPACT_TOKENS: u64 = 100_000;
 /// seen), the summary and the next tool outputs: a threshold close to that would compact again every step or two.
 pub const MIN_COMPACT_TOKENS: u64 = 40_000;
 
+/// #63, eval only: `MARV_EVAL_COMPACT_TOKENS` sets the trigger below [`MIN_COMPACT_TOKENS`] (at least
+/// [`MIN_EVAL_COMPACT_TOKENS`]), so the bench's short tasks compact more than once. Not a config key on purpose: a
+/// trigger that low would compact every step or two in real use.
+pub fn eval_compact_tokens(env: &Env) -> Option<u64> {
+    env.get("MARV_EVAL_COMPACT_TOKENS").and_then(|v| v.parse::<u64>().ok()).filter(|n| *n >= MIN_EVAL_COMPACT_TOKENS)
+}
+/// The lowest trigger `MARV_EVAL_COMPACT_TOKENS` takes.
+pub const MIN_EVAL_COMPACT_TOKENS: u64 = 4_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Preset {
     pub label: &'static str,
@@ -116,6 +125,10 @@ pub struct FileConfig {
     /// `compactTokens` (#140): compact at this many tokens of context, or at 85% of the window if that comes first.
     /// `Some(0)` (written `0` or `false`) turns it off: only the window rule is left.
     pub compact_tokens: Option<u64>,
+    /// `compaction` (#63): `"v1"` or `"v2"`. Temporary, for the A/B; removed one release after v2 becomes the default.
+    pub compaction: Option<marv_agent::compact::Version>,
+    /// `compactTailTokens` (#63): tokens of the newest history v2 keeps verbatim after the summary; `0`: none.
+    pub compact_tail_tokens: Option<u64>,
     pub sandbox: Option<bool>,
     pub yolo: Option<bool>,
     pub trajectories: Option<bool>,
@@ -322,6 +335,26 @@ impl FileConfig {
                 }
             },
         };
+        let compaction = match map.get("compaction") {
+            None | Some(Value::Null) => None,
+            Some(v) => match v.as_str().and_then(marv_agent::compact::Version::parse) {
+                Some(version) => Some(version),
+                None => {
+                    problems.push("compaction: expected v1 or v2".into());
+                    None
+                }
+            },
+        };
+        let compact_tail_tokens = match map.get("compactTailTokens") {
+            None | Some(Value::Null) => None,
+            Some(v) => match v.as_u64() {
+                Some(n) => Some(n),
+                None => {
+                    problems.push("compactTailTokens: expected a whole number of tokens (0: no tail)".into());
+                    None
+                }
+            },
+        };
         let mcp_tools = match map.get("mcpTools") {
             None | Some(Value::Null) => None,
             Some(v) => match serde_json::from_value::<McpToolsSetting>(v.clone()) {
@@ -429,6 +462,8 @@ impl FileConfig {
             reasoning_effort,
             context_length,
             compact_tokens,
+            compaction,
+            compact_tail_tokens,
             sandbox: boolean("sandbox", &mut problems),
             yolo: boolean("yolo", &mut problems),
             trajectories: boolean("trajectories", &mut problems),
@@ -466,6 +501,8 @@ impl FileConfig {
         put("reasoningEffort", self.reasoning_effort.map(|e| Value::from(e.map_or("default", |e| e.as_str()))));
         put("contextLength", self.context_length.map(Value::from));
         put("compactTokens", self.compact_tokens.map(Value::from));
+        put("compaction", self.compaction.map(|v| Value::from(v.as_str())));
+        put("compactTailTokens", self.compact_tail_tokens.map(Value::from));
         put("sandbox", self.sandbox.map(Value::from));
         put("yolo", self.yolo.map(Value::from));
         put("trajectories", self.trajectories.map(Value::from));
@@ -525,6 +562,10 @@ pub struct Config {
     pub context_length: u64,
     /// `compactTokens` (#140): compact at this many tokens of context (or at 85% of the window if sooner); `None`: off.
     pub compact_tokens: Option<u64>,
+    /// `compaction` (#63): v1 (default) or v2.
+    pub compaction: marv_agent::compact::Version,
+    /// `compactTailTokens` (#63); `None`: the default, `min(15k, 15% of the threshold)`.
+    pub compact_tail_tokens: Option<u64>,
     pub sandbox: bool,
     pub yolo: bool,
     pub trajectories: bool,
@@ -656,10 +697,13 @@ pub fn resolve_config(file: Option<&FileConfig>, env: &Env) -> Config {
         thinking: file.and_then(|f| f.thinking).unwrap_or(false),
         reasoning_effort: file.and_then(|f| f.reasoning_effort).unwrap_or(DEFAULT_REASONING_EFFORT),
         context_length: file.and_then(|f| f.context_length).unwrap_or(DEFAULT_CONTEXT_LENGTH),
-        compact_tokens: match file.and_then(|f| f.compact_tokens) {
-            Some(0) => None,
-            n => Some(n.unwrap_or(DEFAULT_COMPACT_TOKENS)),
+        compact_tokens: match (eval_compact_tokens(env), file.and_then(|f| f.compact_tokens)) {
+            (Some(n), _) => Some(n),
+            (None, Some(0)) => None,
+            (None, n) => Some(n.unwrap_or(DEFAULT_COMPACT_TOKENS)),
         },
+        compaction: file.and_then(|f| f.compaction).unwrap_or_default(),
+        compact_tail_tokens: file.and_then(|f| f.compact_tail_tokens),
         sandbox: file.and_then(|f| f.sandbox).unwrap_or(true),
         // `MARV_YOLO=off` holds yolo off for this process whatever the file says (#74: how the Herdr door starts a Marv
         // that may have no more than the session that spawned it). It can only turn yolo off, never on.
@@ -971,6 +1015,18 @@ mod tests {
     }
 
     #[test]
+    fn compaction_and_the_tail_are_read_and_written_and_v1_is_the_default() {
+        assert_eq!(resolve_config(None, &Env::new()).compaction, marv_agent::compact::Version::V1);
+        let file = FileConfig::from_value(&json!({ "compaction": "v2", "compactTailTokens": 0 })).unwrap();
+        assert_eq!(file.to_value()["compaction"], json!("v2"));
+        assert_eq!(file.to_value()["compactTailTokens"], json!(0));
+        let config = resolve_config(Some(&file), &Env::new());
+        assert_eq!((config.compaction, config.compact_tail_tokens), (marv_agent::compact::Version::V2, Some(0)));
+        assert!(FileConfig::from_value(&json!({ "compaction": "v3" })).unwrap_err().contains("compaction"));
+        assert!(FileConfig::from_value(&json!({ "compactTailTokens": -1 })).unwrap_err().contains("compactTailTokens"));
+    }
+
+    #[test]
     fn compact_tokens_defaults_to_100k_and_0_or_false_turns_it_off() {
         assert_eq!(resolve_config(None, &Env::new()).compact_tokens, Some(DEFAULT_COMPACT_TOKENS));
         let file = |v: Value| FileConfig::from_value(&json!({ "compactTokens": v }));
@@ -984,6 +1040,11 @@ mod tests {
             assert_eq!(off.to_value()["compactTokens"], json!(0));
         }
         assert_eq!(file(json!(MIN_COMPACT_TOKENS)).unwrap().compact_tokens, Some(MIN_COMPACT_TOKENS));
+        // #63: the bench's bypass, below the minimum, from the environment only.
+        let env = Env::from([("MARV_EVAL_COMPACT_TOKENS".into(), "8000".into())]);
+        assert_eq!(resolve_config(Some(&set), &env).compact_tokens, Some(8_000));
+        let too_low = Env::from([("MARV_EVAL_COMPACT_TOKENS".into(), "10".into())]);
+        assert_eq!(resolve_config(Some(&set), &too_low).compact_tokens, Some(150_000));
         for bad in [json!(MIN_COMPACT_TOKENS - 1), json!(-5), json!("100k"), json!(true), json!(1.5)] {
             assert!(file(bad.clone()).unwrap_err().contains("compactTokens"), "{bad}");
         }

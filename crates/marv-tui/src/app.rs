@@ -1173,8 +1173,13 @@ impl App {
                 }),
                 _ => self.system_error(format!("Couldn't compact the conversation: {error}")),
             },
-            CompactOutcome::Compacted { summary, tokens_before } => {
+            CompactOutcome::Compacted { summary, tokens_before, overflow } => {
                 let why = match (automatic, tokens_before, self.status.context_length) {
+                    // #63: the request was refused as too long; level 3 dropped the oldest messages.
+                    _ if overflow == Some(3) => {
+                        " (the last request was too long for the model's window, so the oldest messages were dropped)".into()
+                    }
+                    _ if overflow.is_some() => " (the last request was too long for the model's window)".into(),
                     (true, Some(used), Some(context)) if used > 0 && context > 0 => {
                         format!(" (the context was {}% full)", (200 * used + context) / (2 * context))
                     }
@@ -1185,7 +1190,7 @@ impl App {
                         format!(
                             ": {} → about {} tokens",
                             status_bar::tokens(used),
-                            status_bar::tokens((summary.chars().count() as u64 + 2) / 4)
+                            status_bar::tokens(marv_core::estimate_tokens(&summary))
                         )
                     }
                     _ => String::new(),
@@ -2416,13 +2421,16 @@ mod tests {
         h.typed("next");
         h.events([UiEvent::Status(TurnStatus::Compacting)]);
         assert!(h.frame().contains("Compacting the conversation…"));
-        let outcome = CompactOutcome::Compacted { summary: "x".repeat(4000), tokens_before: Some(30_000) };
+        let outcome = CompactOutcome::Compacted { summary: "x".repeat(4000), tokens_before: Some(30_000), overflow: None };
         h.events([UiEvent::Compaction { automatic: true, outcome }]);
         assert!(
             h.frame().contains("✻ Compacted the conversation (the context was 92% full): 30k → about 1k tokens."),
             "{}",
             h.frame()
         );
+        let overflow = CompactOutcome::Compacted { summary: "x".repeat(400), tokens_before: Some(30_000), overflow: Some(1) };
+        h.events([UiEvent::Compaction { automatic: true, outcome: overflow }]);
+        assert!(h.frame().contains("(the last request was too long for the model's window): 30k"), "{}", h.frame());
         let stopped = CompactOutcome::NotCompacted { reason: "stopped".into(), error: String::new() };
         h.events([
             UiEvent::Compaction { automatic: true, outcome: stopped },

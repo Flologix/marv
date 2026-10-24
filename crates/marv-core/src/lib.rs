@@ -301,8 +301,45 @@ pub fn defuse_closing_tag(text: &str, tag: &str) -> String {
     out
 }
 
+/// Characters a token, for estimates before a provider counts (Marv's `estimateTokens`).
+pub const CHARS_PER_TOKEN: u64 = 4;
+
+/// Marv #63: the one token estimate, about four characters a token, rounded up. Counts `char`s (Marv counted UTF-16
+/// units; the TUI's thinking counter still does, to match Marv's display). Used for budgets before a request is sent
+/// (compaction's tail and overflow recovery) and for counts still streaming.
+pub fn estimate_tokens(text: &str) -> u64 {
+    (text.chars().count() as u64).div_ceil(CHARS_PER_TOKEN)
+}
+
+/// [`estimate_tokens`] for one history entry: its text, plus each tool call's name and arguments.
+pub fn estimate_turn_tokens(turn: &ChatTurn) -> u64 {
+    match turn {
+        ChatTurn::User { text } => estimate_tokens(text),
+        ChatTurn::Assistant { text, tool_calls, .. } => {
+            estimate_tokens(text)
+                + tool_calls.iter().map(|c| estimate_tokens(&c.name) + estimate_tokens(&c.arguments)).sum::<u64>()
+        }
+        ChatTurn::Tool { name, text, .. } => estimate_tokens(name) + estimate_tokens(text),
+    }
+}
+
+/// [`estimate_turn_tokens`] summed over a history.
+pub fn estimate_history_tokens(history: &[ChatTurn]) -> u64 {
+    history.iter().map(estimate_turn_tokens).sum()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn estimate_tokens_is_four_chars_a_token_rounded_up() {
+        assert_eq!(super::estimate_tokens(""), 0);
+        assert_eq!(super::estimate_tokens("abc"), 1);
+        assert_eq!(super::estimate_tokens(&"x".repeat(4800)), 1200);
+        let call = super::ToolCall { id: "c".into(), name: "read".into(), arguments: "12345678".into() };
+        let turn = super::ChatTurn::Assistant { text: "abcd".into(), tool_calls: vec![call], reasoning: None };
+        assert_eq!(super::estimate_turn_tokens(&turn), 1 + 1 + 2);
+    }
+
     #[test]
     fn a_decline_reason_is_one_trimmed_line_without_controls_and_cut() {
         assert_eq!(super::decline_reason("  use pnpm\n\tnot bun\x1b[2J \r\n"), "use pnpm  not bun[2J");

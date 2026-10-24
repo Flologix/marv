@@ -281,10 +281,16 @@ pub fn canonical_request(body: &str) -> String {
     if let Some(messages) = value.get_mut("messages").and_then(Value::as_array_mut) {
         for message in messages {
             let system = message.get("role") == Some(&json!("system"));
+            let user = message.get("role") == Some(&json!("user"));
             let Some(content) = message.get_mut("content") else { continue };
             if system {
                 strip_sections(content);
                 unword(content);
+            }
+            // marv-rs's saved pages (after Marv #63): the list Marv writes at the end of a summary message. Marv
+            // has none. Same text as `marv_tools::swap::PAGE_TABLE_HEAD`.
+            if user {
+                strip_from(content, &format!("\n\n{PAGE_TABLE_HEAD}"));
             }
             // A marked message carries its text as one part; unmarked it's the plain string.
             if let Some([part]) = content.as_array().map(Vec::as_slice)
@@ -298,14 +304,37 @@ pub fn canonical_request(body: &str) -> String {
         }
     }
     if let Some(tools) = value.get_mut("tools").and_then(Value::as_array_mut) {
+        // Tools marv-rs offers and Marv doesn't (`recall`, after Marv #63): left out of the comparison.
+        tools.retain(|t| !t.pointer("/function/name").and_then(Value::as_str).is_some_and(|n| MARV_RS_TOOLS.contains(&n)));
         tools.iter_mut().filter_map(|t| t.pointer_mut("/function/description")).for_each(unword);
     }
     strip_cache_control(&mut value);
+    // marv-rs (#63 review) merges Marv's notes into a trailing user message instead of sending a second one: compare
+    // with Marv's two as one.
+    if let Some(messages) = value.get_mut("messages").and_then(Value::as_array_mut) {
+        let mut merged: Vec<Value> = Vec::with_capacity(messages.len());
+        for message in messages.drain(..) {
+            let user_text = |m: &Value| {
+                (m.get("role") == Some(&json!("user"))).then(|| m.get("content")?.as_str().map(str::to_string)).flatten()
+            };
+            match (merged.last_mut(), user_text(&message)) {
+                (Some(last), Some(text)) if user_text(last).is_some() => {
+                    let joined = format!("{}\n\n{text}", user_text(last).unwrap_or_default());
+                    last["content"] = Value::String(joined);
+                }
+                _ => merged.push(message),
+            }
+        }
+        *messages = merged;
+    }
     if let Some(body) = value.as_object_mut() {
         body.remove("max_tokens");
     }
     value.to_string()
 }
+
+/// Built-in tools marv-rs offers and Marv doesn't: left out of both sides' tool lists before comparing.
+pub const MARV_RS_TOOLS: &[&str] = &["recall"];
 
 /// System-prompt sections marv-rs adds and Marv doesn't (deliberate differences, one place for all scenarios): the
 /// oracle drops them from both sides before comparing, so the rest of the prompt is still checked byte for byte. The
@@ -328,6 +357,8 @@ pub const MARV_RS_TEXT: &[(&str, &str)] = &[
         "Keep a checklist for a task of three or more steps, or when the user asks for several things. Write the plan before starting; mark an item in_progress before working on it and done as soon as it is; add items you discover and remove ones that turn out unnecessary. Send the whole list every time (it replaces the previous one). Skip it for a one-step task or a question.",
     ),
     (" start always needs command; a command that finishes on its own belongs in bash.", ""),
+    // `recall` (after Marv #63), last in the tool list the prompt names.
+    (", recall. Look at the actual code", ". Look at the actual code"),
     // The sandbox's empty `.git` named in a project without one (`marv_session::prompt::GIT_PLACEHOLDER`).
     (
         "\n\nThis folder has no .git of its own. Commands that run without asking, and background processes, may see an empty, read-only .git folder here: it's the sandbox's placeholder, not a broken or empty repository, and git still finds a repository in a parent folder if there is one. Don't report it as a problem. To create a repository here, run git init with git_write: true.",
@@ -365,6 +396,22 @@ fn strip_sections(content: &mut Value) {
             }
         }
         Value::Array(parts) => parts.iter_mut().filter_map(|p| p.get_mut("text")).for_each(strip_sections),
+        _ => {}
+    }
+}
+
+/// marv-rs's saved pages' list, as it starts (`marv_tools::swap::PAGE_TABLE_HEAD`).
+pub const PAGE_TABLE_HEAD: &str = "Saved pages (written by Marv, not by you)";
+
+/// Cuts a message's text (plain or in parts) from `marker` to its end.
+fn strip_from(content: &mut Value, marker: &str) {
+    match content {
+        Value::String(text) => {
+            if let Some(at) = text.find(marker) {
+                text.truncate(at);
+            }
+        }
+        Value::Array(parts) => parts.iter_mut().filter_map(|p| p.get_mut("text")).for_each(|t| strip_from(t, marker)),
         _ => {}
     }
 }
@@ -486,6 +533,27 @@ mod tests {
         let canonical: Value = serde_json::from_str(&canonical_request(&body)).unwrap();
         assert_eq!(canonical["messages"][0]["content"], "You are Marv.\n\n# Sandbox limits\n\nEnds.\n\n# MCP servers\n\nSetup.");
         assert_eq!(canonical["messages"][1]["content"], "# Your situation");
+    }
+
+    #[test]
+    fn two_user_messages_in_a_row_compare_as_marv_rs_s_merged_one() {
+        let marvs = json!({"messages": [{"role": "user", "content": "go"}, {"role": "user", "content": "note"}]});
+        let ours = json!({"messages": [{"role": "user", "content": "go\n\nnote"}]});
+        assert_eq!(canonical_request(&ours.to_string()), canonical_request(&marvs.to_string()));
+    }
+
+    #[test]
+    fn marv_rs_saved_pages_and_recall_are_left_out_of_the_comparison() {
+        let ours = json!({
+            "messages": [{"role": "user", "content": format!("summary\n\n{PAGE_TABLE_HEAD}: …\n- page 1: 3 messages")}],
+            "tools": [{"type": "function", "function": {"name": "read_file", "description": "d"}},
+                      {"type": "function", "function": {"name": "recall", "description": "r"}}]
+        });
+        let marvs = json!({
+            "messages": [{"role": "user", "content": "summary"}],
+            "tools": [{"type": "function", "function": {"name": "read_file", "description": "d"}}]
+        });
+        assert_eq!(canonical_request(&ours.to_string()), canonical_request(&marvs.to_string()));
     }
 
     #[test]
