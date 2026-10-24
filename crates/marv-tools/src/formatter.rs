@@ -232,11 +232,22 @@ pub struct Formatted {
     /// The file no longer matches what the tool wrote — the diff the model and the user get is the reformatted one.
     pub beyond: bool,
     pub failure: Option<String>,
+    /// The formatter ran, on exactly what the tool wrote (the file still held it when the formatter started): what's on
+    /// disk now is the tool's change, formatted. Otherwise `content` (read back after the run) may hold someone else's
+    /// change, and the edit tools don't record it as seen (`file_versions`).
+    pub ran_on_ours: bool,
 }
 
 impl Formatted {
     fn unchanged(wrote: &str) -> Self {
-        Self { content: wrote.into(), beyond: false, failure: None }
+        Self { content: wrote.into(), beyond: false, failure: None, ran_on_ours: false }
+    }
+
+    /// What the session may record as the file's version after a write of `wrote`, and whether that's sure: the
+    /// formatted file when the formatter ran on the write itself, the write when nothing changed it, else the write
+    /// (unsure: the file no longer matches it, and a later write is refused until it's read again).
+    pub fn seen<'a>(&'a self, wrote: &'a str) -> (&'a str, bool) {
+        if self.ran_on_ours { (&self.content, true) } else { (wrote, self.content == wrote) }
     }
 }
 
@@ -279,8 +290,10 @@ pub async fn after_write(ctx: &ToolContext, shown: &str, absolute: &Path, wrote:
     if protected {
         return Formatted::unchanged(wrote);
     }
+    let ours = tokio::fs::read(absolute).await.is_ok_and(|now| now == wrote.as_bytes());
     let outcome = formatter.format(&ctx.root, shown, &ctx.cancel).await;
     let content = tokio::fs::read_to_string(absolute).await.unwrap_or_else(|_| wrote.to_string());
+    let ran_on_ours = ours && matches!(outcome, FormatOutcome::Ran);
     let beyond = content != wrote;
     let failure = match outcome {
         FormatOutcome::Ran | FormatOutcome::Skipped => None,
@@ -289,7 +302,7 @@ pub async fn after_write(ctx: &ToolContext, shown: &str, absolute: &Path, wrote:
             Some(format!("the project's formatter failed ({keeps}): {why}"))
         }
     };
-    Formatted { content, beyond, failure }
+    Formatted { content, beyond, failure, ran_on_ours }
 }
 
 /// The command that formats `path` (project-relative) in the project at `root`, from the project's own config. Never
@@ -636,7 +649,7 @@ mod tests {
         // Nothing configured: what was written stands.
         let bare = ToolContext::new(root.path());
         let formatted = after_write(&bare, "a.js", &absolute, "unchanged").await;
-        assert_eq!(formatted, Formatted { content: "unchanged".into(), beyond: false, failure: None });
+        assert_eq!(formatted, Formatted { content: "unchanged".into(), beyond: false, failure: None, ran_on_ours: false });
     }
 
     #[tokio::test]
@@ -683,14 +696,20 @@ mod tests {
         root.write(".vscode/settings.json", "{ \"editor\": \"vscode\" }");
         let absolute = root.path().join(".vscode/settings.json");
         let formatted = after_write(&ctx, ".vscode/settings.json", &absolute, "{ \"editor\": \"vscode\" }").await;
-        assert_eq!(formatted, Formatted { content: "{ \"editor\": \"vscode\" }".into(), beyond: false, failure: None });
+        assert_eq!(
+            formatted,
+            Formatted { content: "{ \"editor\": \"vscode\" }".into(), beyond: false, failure: None, ran_on_ours: false }
+        );
         assert_eq!(fake.count(), 1);
 
         // package.json: the same, even though the path isn't a static protected rule (the scripts are a content rule).
         let absolute = root.path().join("package.json");
         std::fs::write(&absolute, "{ \"name\": \"a\" }").unwrap();
         let formatted = after_write(&ctx, "package.json", &absolute, "{ \"name\": \"a\" }").await;
-        assert_eq!(formatted, Formatted { content: "{ \"name\": \"a\" }".into(), beyond: false, failure: None });
+        assert_eq!(
+            formatted,
+            Formatted { content: "{ \"name\": \"a\" }".into(), beyond: false, failure: None, ran_on_ours: false }
+        );
         assert_eq!(fake.count(), 1);
     }
 
@@ -706,7 +725,7 @@ mod tests {
         let mut ctx = ToolContext::new(root.path());
         ctx.formatter = Some(hook(&FormatterSetting::Auto, true, &fake));
         let formatted = after_write(&ctx, "src/link.ts", &root.path().join("src/link.ts"), "x\n").await;
-        assert_eq!(formatted, Formatted { content: "x\n".into(), beyond: false, failure: None });
+        assert_eq!(formatted, Formatted { content: "x\n".into(), beyond: false, failure: None, ran_on_ours: false });
         assert_eq!(fake.count(), 0);
         // The control: the real file formats.
         after_write(&ctx, "src/real.ts", &root.path().join("src/real.ts"), "x\n").await;

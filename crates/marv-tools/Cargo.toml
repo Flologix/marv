@@ -37,6 +37,8 @@ dom_query = "0.28"
 flate2 = "1"
 brotli = "8"
 encoding_rs = "0.8"
+# Content hashes of the files a session has seen (`file_versions`).
+sha2 = "0.10"
 
 [lints]
 workspace = true

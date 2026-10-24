@@ -1,4 +1,8 @@
 {
   "description": "grep, then replace_all edits across five files in one step, then grep again to check.",
-  "prompt": "Rename fetchUserData to loadUser everywhere in the project: the code, error messages and the README."
+  "prompt": "Rename fetchUserData to loadUser everywhere in the project: the code, error messages and the README.",
+  "deliberate": {
+    "security": "File changes",
+    "why": "marv-rs refuses edit_file and write_file on an existing file the session hasn't read, or that changed since it read it: the scripted model also reads `README.md`, `src/admin.js`, `src/api.js`, `src/index.js`, `src/profile.js` before editing (script.marv-rs.jsonl), and nothing else changes. The files and exit code are Marv's."
+  }
 }

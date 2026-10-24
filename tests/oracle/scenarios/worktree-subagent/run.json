@@ -1,5 +1,9 @@
 {
   "description": "A subagent with isolation: \"worktree\" edits a file on its own branch: the dispatch runs without asking (yolo, sandboxed), its edit is auto-approved inside the worktree, Marv commits for it, and the main checkout is untouched. Requests 2-3 are the subagent's own conversation, so 2 (its first) and 4 (the main agent's next) don't extend the request before them.",
   "prompt": "Have a subagent in its own worktree change the greeting to say goodbye.",
-  "prefix_resets": [2, 4]
+  "prefix_resets": [2, 4],
+  "deliberate": {
+    "security": "File changes",
+    "why": "marv-rs refuses edit_file and write_file on an existing file the session hasn't read, or that changed since it read it: the scripted model also reads `greeting.txt` before editing (script.marv-rs.jsonl), and nothing else changes. The files and exit code are Marv's."
+  }
 }

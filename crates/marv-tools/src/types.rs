@@ -32,6 +32,7 @@ use std::any::Any;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::file_versions::FileVersions;
 use crate::formatter::Formatter;
 use async_trait::async_trait;
 pub use marv_core::Door;
@@ -410,6 +411,13 @@ pub struct ToolContext {
     /// This session's folder of saved outputs (#61, `~/.marv/tool-output/<session>`): a cut result is saved there
     /// whole, and `read_file` and `grep` may read it (only it, read-only). None: cuts aren't saved.
     pub tool_output: Option<PathBuf>,
+    /// The version of each file this agent has read or written (see [`crate::file_versions`]): `edit_file` and
+    /// `write_file` refuse to write over an existing file that changed since, or that it never read. The session
+    /// keeps one across its turns; a subagent gets its own.
+    pub file_versions: Arc<FileVersions>,
+    /// Where the edit tools' cross-process file locks live (the runtime folder's `file-locks/`, see
+    /// [`crate::file_lock`]). None: calls on one file are ordered within this process only.
+    pub file_locks: Option<PathBuf>,
     /// This conversation's saved pages (`crate::swap`), which `recall` reads: the main agent's only. None: nothing to
     /// recall (a subagent, or no session store).
     pub swap: Option<PathBuf>,
@@ -468,6 +476,8 @@ impl ToolContext {
             formatter: None,
             network_failures: Arc::default(),
             tool_output: None,
+            file_versions: Arc::default(),
+            file_locks: None,
             swap: None,
             progress: None,
         }

@@ -110,6 +110,10 @@ fn call(id: &str, name: &str, args: serde_json::Value) -> ToolCall {
 fn write_call(id: &str, path: &str, content: &str) -> ToolCall {
     call(id, "write_file", serde_json::json!({ "path": path, "content": content }))
 }
+/// A read of `path`: the edit tools write over an existing file only as the session last read it.
+fn read_call(id: &str, path: &str) -> ToolCall {
+    call(id, "read_file", serde_json::json!({ "path": path }))
+}
 fn bash(id: &str, command: &str) -> ToolCall {
     call(id, "bash", serde_json::json!({ "command": command }))
 }
@@ -287,8 +291,12 @@ async fn the_after_is_taken_on_esc_and_at_the_step_limit() {
 #[tokio::test]
 async fn undo_restores_the_next_message_tells_the_model_every_request_extends_the_previous_one() {
     let dirs = Dirs::new();
-    let provider =
-        Scripted::new(vec![use_tools(vec![write_call("w", "a.txt", "changed\n")]), say("changed it"), say("ok"), say("ok")]);
+    let provider = Scripted::new(vec![
+        use_tools(vec![read_call("r", "a.txt"), write_call("w", "a.txt", "changed\n")]),
+        say("changed it"),
+        say("ok"),
+        say("ok"),
+    ]);
     let session = scripted(&dirs, &provider, |_| {});
     collect(go(&session, "add the parser")).await;
     let plan = plan_of(&session).await;
@@ -432,7 +440,8 @@ async fn the_replacement_chain_is_saved_a_later_resume_finds_the_turns_made_afte
 async fn an_undos_note_for_the_model_survives_a_restart_before_the_next_message() {
     let dirs = Dirs::new();
     let sessions = dirs.sessions();
-    let first = Scripted::new(vec![use_tools(vec![write_call("w", "a.txt", "changed\n")]), say("changed it")]);
+    let first =
+        Scripted::new(vec![use_tools(vec![read_call("r", "a.txt"), write_call("w", "a.txt", "changed\n")]), say("changed it")]);
     let session = scripted(&dirs, &first, |init| init.sessions = Some(sessions.clone()));
     collect(go(&session, "add the parser")).await;
     let plan = plan_of(&session).await;
@@ -469,7 +478,7 @@ async fn a_resumed_undo_preview_still_names_the_reported_files_it_cant_restore()
     );
     let sessions = dirs.sessions();
     let provider = Scripted::new(vec![
-        use_tools(vec![write_call("w", "a.txt", "two\n"), write_call("w2", "ignored.txt", "x\n")]),
+        use_tools(vec![read_call("r", "a.txt"), write_call("w", "a.txt", "two\n"), write_call("w2", "ignored.txt", "x\n")]),
         say("done"),
     ]);
     let session = scripted(&dirs, &provider, |init| init.sessions = Some(sessions.clone()));
@@ -485,7 +494,7 @@ async fn a_resumed_undo_preview_still_names_the_reported_files_it_cant_restore()
 async fn an_old_session_file_without_the_checkpoint_fields_still_resumes() {
     let dirs = Dirs::new();
     let sessions = dirs.sessions();
-    let provider = Scripted::new(vec![use_tools(vec![write_call("w", "a.txt", "two\n")]), say("done")]);
+    let provider = Scripted::new(vec![use_tools(vec![read_call("r", "a.txt"), write_call("w", "a.txt", "two\n")]), say("done")]);
     let session = scripted(&dirs, &provider, |init| init.sessions = Some(sessions.clone()));
     collect(go(&session, "change it")).await;
     session.close().await;
@@ -506,8 +515,10 @@ async fn a_failing_snapshot_doesnt_stop_the_turn_and_says_so_once() {
     let store = Arc::new(CheckpointStore::new(StoreOptions::new(dirs.root(), None, "x")));
     lock(&store.fake).snapshot =
         Some(Arc::new(|_| Some(SnapshotResult::Failed { reason: SnapshotFailure::Failed, message: "disk full".into(), ms: 1 })));
-    let provider =
-        Scripted::new(vec![use_tools(vec![write_call("w", "a.txt", "two\n"), write_call("w2", "b.txt", "b\n")]), say("done")]);
+    let provider = Scripted::new(vec![
+        use_tools(vec![read_call("r", "a.txt"), write_call("w", "a.txt", "two\n"), write_call("w2", "b.txt", "b\n")]),
+        say("done"),
+    ]);
     let session = scripted(&dirs, &provider, |init| init.checkpoint_store = Some(store.clone()));
     let events = collect(go(&session, "go")).await;
     assert_eq!(read(dirs.root().join("a.txt")), "two\n");
@@ -575,4 +586,66 @@ async fn trajectories_get_checkpoint_and_undo_records() {
         (undo["turn"].clone(), undo["paths"].clone(), undo["skipped"].clone()),
         (1.into(), serde_json::json!(["t.txt"]), serde_json::json!([]))
     );
+}
+
+/// The files a conversation read stay read across its turns (`marv_tools::file_versions`): the next turn may edit
+/// a file this one read. /undo puts the file back, so the model must read it again (what its note asks); /clear starts
+/// a conversation that has read nothing.
+#[tokio::test]
+async fn what_a_turn_read_the_next_may_change_until_an_undo_or_a_clear() {
+    let dirs = Dirs::new();
+    let provider = Scripted::new(vec![
+        use_tools(vec![read_call("r", "a.txt")]),
+        say("read it"),
+        use_tools(vec![write_call("w", "a.txt", "two\n")]),
+        say("wrote it"),
+        use_tools(vec![write_call("w2", "a.txt", "three\n")]),
+        say("refused"),
+        use_tools(vec![read_call("r2", "a.txt")]),
+        use_tools(vec![write_call("w3", "a.txt", "four\n")]),
+        say("wrote it"),
+        use_tools(vec![write_call("w4", "a.txt", "five\n")]),
+        say("refused"),
+    ]);
+    let session = scripted(&dirs, &provider, |_| {});
+    let a = || std::fs::read_to_string(dirs.project.0.join("a.txt")).unwrap();
+    collect(go(&session, "read a.txt")).await;
+    collect(go(&session, "change it")).await;
+    assert_eq!(a(), "two\n");
+
+    let plan = plan_of(&session).await;
+    session.undo(&plan).await.unwrap();
+    assert_eq!(a(), "one\n");
+    collect(go(&session, "change it again")).await;
+    assert_eq!(a(), "one\n", "written over the undo without a read");
+    collect(go(&session, "read it and change it")).await;
+    assert_eq!(a(), "four\n");
+
+    session.clear().await.unwrap();
+    collect(go(&session, "change it once more")).await;
+    assert_eq!(a(), "four\n", "a new conversation wrote over a file it never read");
+}
+
+/// A resumed conversation has read only what it read: what the conversation left behind read doesn't carry over.
+#[tokio::test]
+async fn a_resumed_conversation_hasnt_read_what_the_one_it_replaced_read() {
+    let dirs = Dirs::new();
+    let provider = Scripted::new(vec![
+        use_tools(vec![write_call("w", "new.txt", "new\n")]),
+        say("made it"),
+        use_tools(vec![read_call("r", "a.txt")]),
+        say("read it"),
+        use_tools(vec![write_call("w2", "a.txt", "two\n")]),
+        say("refused"),
+    ]);
+    let session = scripted(&dirs, &provider, |init| init.sessions = Some(dirs.sessions()));
+    collect(go(&session, "make a file")).await;
+    let old = session.id();
+    session.flush().await;
+    session.clear().await.unwrap();
+    collect(go(&session, "read a.txt")).await;
+    session.flush().await;
+    session.resume(ResumeTarget::Id(old)).await.unwrap().unwrap();
+    collect(go(&session, "change a.txt")).await;
+    assert_eq!(std::fs::read_to_string(dirs.project.0.join("a.txt")).unwrap(), "one\n", "written unread");
 }
