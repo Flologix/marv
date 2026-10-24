@@ -55,7 +55,9 @@ pub fn declined_because(reason: &str) -> String {
 }
 
 /// Marv's built-in tools, in Marv's order (the order of the specs the model sees):
-/// read_file, glob, grep, web_fetch, github, skill, edit_file, write_file, bash, process, memory, plan, agent.
+/// read_file, glob, grep, web_fetch, github, skill, edit_file, write_file, bash, process, memory, plan, agent; then
+/// marv-rs's `recall` (after Marv #63), last so the specs before it keep their places, and always there (offering it
+/// only after a compaction would change the tool list mid-session: the prompt cache).
 /// `github` is offered only where the session has it ([`tool_specs_for`]). `apply_patch` (#66) isn't registered until
 /// it's built.
 pub fn builtin_tools() -> &'static [ToolRef] {
@@ -75,6 +77,7 @@ pub fn builtin_tools() -> &'static [ToolRef] {
             Arc::new(crate::memory::Memory),
             Arc::new(crate::plan::Plan),
             Arc::new(crate::agent::Agent),
+            Arc::new(crate::recall::Recall),
         ]
     })
 }
@@ -661,13 +664,15 @@ mod tests {
                 "process",
                 "memory",
                 "plan",
-                "agent"
+                "agent",
+                // marv-rs, after Marv #63: last, always offered.
+                "recall"
             ]
         );
         assert!(!tool_specs_for(false, true, true).iter().any(|s| s.name == "skill"));
-        assert_eq!(tool_specs_for(true, true, true).len(), 13);
+        assert_eq!(tool_specs_for(true, true, true).len(), 14);
         assert!(!tool_specs_for(true, false, true).iter().any(|s| s.name == "plan"));
-        assert_eq!(tool_specs_for(true, false, true).len(), 12);
+        assert_eq!(tool_specs_for(true, false, true).len(), 13);
         // github only where it's offered (#47), the same values every time (cache).
         assert!(!tool_specs_for(true, true, false).iter().any(|s| s.name == "github"));
         assert_eq!(tool_specs_for(true, true, true), tool_specs_for(true, true, true));

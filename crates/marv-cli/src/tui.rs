@@ -243,8 +243,10 @@ fn view_plan(items: &[marv_tools::PlanItem]) -> Vec<view::PlanItem> {
 
 fn compact_outcome(result: CompactResult) -> view::CompactOutcome {
     match result {
-        CompactResult::Compacted { summary, tokens_before } => view::CompactOutcome::Compacted { summary, tokens_before },
-        CompactResult::NotCompacted { reason, error } => view::CompactOutcome::NotCompacted {
+        CompactResult::Compacted { summary, tokens_before, trigger } => {
+            view::CompactOutcome::Compacted { summary, tokens_before, overflow: trigger.level() }
+        }
+        CompactResult::NotCompacted { reason, error, .. } => view::CompactOutcome::NotCompacted {
             reason: match reason {
                 CompactFailure::Empty => "empty",
                 CompactFailure::Stopped => "stopped",
@@ -262,6 +264,8 @@ pub fn map_loop(event: &LoopEvent, totals: &dyn Fn() -> view::Totals) -> Option<
     Some(match event {
         // #96: the error right after it says what happened.
         L::Discarded { .. } => return None,
+        // Marv #63: the session's compaction notice that follows says what was done about it.
+        L::Overflow { .. } => return None,
         L::TextDelta(text) => UiEvent::TextDelta(text.clone()),
         L::ThinkingDelta(text) => UiEvent::ThinkingDelta(text.clone()),
         L::Usage(usage, _) => UiEvent::Usage { last: *usage, totals: totals() },
@@ -391,6 +395,7 @@ pub fn map_event(
         SessionEvent::Tainted { source } => vec![system(tainted_text(source), false)],
         // #124: Marv's line about a radio report it sent (checked names and fixed words; printable anyway).
         SessionEvent::RadioNote { text } => vec![system(printable(&format!("✻ {text}")), false)],
+        SessionEvent::Notice { text } => vec![system(printable(&format!("✻ {text}")), false)],
         SessionEvent::CheckpointFailed { message } => {
             vec![system(format!("This turn can't be undone: its checkpoint failed ({message})."), true)]
         }
@@ -1023,6 +1028,7 @@ impl Bridge {
             (config.sandbox, config.yolo, config.diagnostics, config.checks, config.mcp_tools);
         init.formatter = config.formatter;
         init.compact_tokens = config.compact_tokens;
+        (init.compaction, init.compact_tail_tokens) = (config.compaction, config.compact_tail_tokens);
         // #98: the config's "approve" and this run's --approve seed the session's "always" scopes; the writable
         // folders are resolved and checked already (refused ones are in approval_problems, not here).
         init.pre_approved = s.pre_approved.clone();

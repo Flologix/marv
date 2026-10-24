@@ -1,0 +1,2 @@
+OpenRouter returned 400.
+Provider returned error: DeepInfra: Requested token count exceeds the model's maximum context length of 163840 tokens. You requested a total of 170012 tokens: 120000 tokens from the input messages and 50012 tokens for the completion.

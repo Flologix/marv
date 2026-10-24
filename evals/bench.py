@@ -106,6 +106,49 @@ def plan_only(trajectory):
     return count, ms
 
 
+REPEAT_WINDOW = 10
+
+
+def repeated_reads(trajectory):
+    """#63: (compactions, repeated reads): the main agent's read_file calls within REPEAT_WINDOW steps after a
+    `compact` record, of a path and an overlapping line range it had read before it. Mirrors
+    marv_session::trajectory_stats::repeated_reads."""
+    def span(args):
+        start = max(int(args.get("offset") or 1), 1)
+        limit = args.get("limit")
+        return start, (start + max(int(limit), 1) - 1) if limit else float("inf")
+    compactions, repeated, reads, before, window = 0, 0, [], [], None
+    for e in trajectory:
+        main = e.get("agent", "main") == "main"
+        if e.get("type") == "compact":
+            compactions, before, window = compactions + 1, list(reads), REPEAT_WINDOW
+        elif e.get("type") == "request" and main and window is not None:
+            window = window - 1 if window > 1 else None
+        elif e.get("type") == "tool" and main and (e.get("call") or {}).get("name") == "read_file":
+            try: args = json.loads(e["call"].get("arguments") or "{}")
+            except ValueError: continue
+            path = args.get("path")
+            if not isinstance(path, str): continue
+            a, b = span(args)
+            if window is not None and any(p == path and a <= end and start <= b for p, (start, end) in before): repeated += 1
+            reads.append((path, (a, b)))
+    return compactions, repeated
+
+
+def marv_config(pairs):
+    """--marv-config key=value pairs as config.json values (JSON when it parses, else a string), and the environment
+    for what the config file can't say: a compactTokens below Marv's 40k minimum goes to MARV_EVAL_COMPACT_TOKENS (#63:
+    the eval-only bypass, so short tasks compact more than once)."""
+    config, env = {}, {}
+    for pair in pairs or []:
+        key, _, raw = pair.partition("=")
+        try: value = json.loads(raw)
+        except ValueError: value = raw
+        if key == "compactTokens" and isinstance(value, int) and 0 < value < 40_000: env["MARV_EVAL_COMPACT_TOKENS"] = str(value)
+        else: config[key] = value
+    return config, env
+
+
 def claude_plan_only(stream):
     """Claude Code's replies whose only calls were TodoWrite (#85), from its stream-json output."""
     messages = defaultdict(set)
@@ -186,10 +229,12 @@ def run_claude(ws, prompt, servers, logdir, a):
 
 def run_marv(ws, prompt, servers, logdir, a):
     cfg = Path(tempfile.mkdtemp(prefix="marv-bench-config-"))
-    (cfg / "config.json").write_text(json.dumps({"provider": "openrouter", "model": a.marv_model, "apiKey": a.key}))
+    extra, extra_env = marv_config(a.marv_config)
+    (cfg / "config.json").write_text(json.dumps({**extra, "provider": "openrouter", "model": a.marv_model, "apiKey": a.key}))
     if servers: (cfg / "mcp.json").write_text(json.dumps({"mcpServers": servers}))
     env = {k: v for k, v in os.environ.items() if k not in ("OPENROUTER_API_KEY", "MARV_MODEL", "MARV_MAX_STEPS")}
     env["MARV_CONFIG_DIR"] = str(cfg)
+    env.update(extra_env)
     cmd = [a.marv_bin, "-p", prompt, "-m", a.marv_model, "--output", "stream-json", "--max-steps", "50",
            "--approve", "files", "--approve", "process", "--approve", "mcp"]
     try:
@@ -220,6 +265,7 @@ def run_marv(ws, prompt, servers, logdir, a):
             # A timed-out run has no result event: count its steps from the trajectory.
             if timed_out and e.get("type") == "request" and e.get("agent") == "main": r["requests"] = r.get("requests", 0) + 1
         r["planOnly"], r["planOnlyMs"] = plan_only(parse_lines(traj.read_text()))
+        r["compactions"], r["repeatedReads"] = repeated_reads(parse_lines(traj.read_text()))
     r["finishReasons"] = dict(r.get("finishReasons", {}))
     if timed_out: r["reason"] = "timeout"
     return r
@@ -416,6 +462,12 @@ def report(dirs):
             ms = sum(r.get("planOnlyMs") or 0 for r in rs)
             print(f"\n{h} {m}: {only} plan-only requests (a reply whose only calls were plan updates)"
                   + (f", {ms / 1000:.0f}s" if ms else ""))
+    # #63: what a compaction made the model read again (v1 vs v2: run with --marv-config compaction=v2).
+    for (h, m), rs in sorted(groups.items()):
+        compactions = sum(r.get("compactions") or 0 for r in rs)
+        if compactions:
+            print(f"\n{h} {m}: {compactions} compactions, {sum(r.get('repeatedReads') or 0 for r in rs)} repeated reads "
+                  f"within {REPEAT_WINDOW} steps after them")
     print("\nTool calls:")
     for (h, m), rs in sorted(groups.items()):
         c = Counter()
@@ -451,6 +503,8 @@ def main():
     ap.add_argument("--concurrency", type=int, default=4)
     ap.add_argument("--timeout", type=int, default=300)
     ap.add_argument("--marv-model", default="anthropic/claude-haiku-5.5")
+    ap.add_argument("--marv-config", action="append", metavar="KEY=VALUE",
+                    help="put this into Marv's throwaway config.json, e.g. compaction=v2 or compactTokens=40000 (#63)")
     ap.add_argument("--claude-model", default="claude-haiku-5-5")
     ap.add_argument("--marv-bin", default=str(ROOT / "target/release/marv") if (ROOT / "target/release/marv").exists() else "marv")
     ap.add_argument("--opencode-bin", default=opencode_bin())

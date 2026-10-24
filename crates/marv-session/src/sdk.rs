@@ -76,6 +76,10 @@ pub struct SessionOptions {
     pub checks: bool,
     /// `compactTokens` (#140): compact at this many tokens of context, or at 85% of the window if sooner; `None`: off.
     pub compact_tokens: Option<u64>,
+    /// `compaction` (#63): v1 (default) or v2; temporary, for the A/B.
+    pub compaction: marv_agent::compact::Version,
+    /// `compactTailTokens` (#63): v2's verbatim tail; `None`: the default.
+    pub compact_tail_tokens: Option<u64>,
     /// The formatter the edit tools run after a change (#67). Default on (detect from the project's config).
     pub formatter: FormatterSetting,
     /// Before a turn's first change, snapshot the project (git commits under a hidden ref,
@@ -159,6 +163,8 @@ impl SessionBuilder {
                 diagnostics: true,
                 checks: true,
                 compact_tokens: Some(crate::config::DEFAULT_COMPACT_TOKENS),
+                compaction: marv_agent::compact::Version::V1,
+                compact_tail_tokens: None,
                 formatter: FormatterSetting::Auto,
                 checkpoints: true,
                 mcp_tools: McpToolsSetting::Auto,
@@ -361,6 +367,7 @@ pub async fn create_session(options: SessionOptions) -> Result<MarvSession, Sess
     init.diagnostics = options.diagnostics;
     init.checks = options.checks;
     init.compact_tokens = options.compact_tokens;
+    (init.compaction, init.compact_tail_tokens) = (options.compaction, options.compact_tail_tokens);
     init.formatter = options.formatter;
     init.checkpoints = options.checkpoints;
     init.checkpoints_dir = Some(config_dir.join("checkpoints").join(project_key(&root)));

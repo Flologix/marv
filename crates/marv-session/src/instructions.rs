@@ -157,12 +157,38 @@ pub const NESTED_TOOLS: [&str; 3] = ["read_file", "edit_file", "write_file"];
 pub struct NestedInstructions {
     /// Folders (project-relative) whose file was given, or read by the model itself.
     seen: Mutex<HashSet<PathBuf>>,
+    /// #63: the folders each tool result delivered (by call id), so a compaction that keeps a result verbatim keeps
+    /// its folders as given ([`Self::keep_calls`]).
+    by_call: Mutex<std::collections::HashMap<String, Vec<PathBuf>>>,
 }
 
 impl NestedInstructions {
     /// Forgets what was given (a new conversation).
     pub fn reset(&self) {
         self.seen.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.by_call.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
+    /// #63: after a compaction, only what the kept results (`calls`, by id) delivered still counts as given: their
+    /// folders' notes are still in the history; the rest come again on the next touch.
+    pub fn keep_calls(&self, calls: &HashSet<String>) {
+        let mut by_call = self.by_call.lock().unwrap_or_else(|e| e.into_inner());
+        by_call.retain(|id, _| calls.contains(id));
+        let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        seen.clear();
+        seen.extend(by_call.values().flatten().cloned());
+    }
+
+    /// [`Self::note_for`], remembering which folders call `call_id`'s result delivered (#63).
+    pub fn note_for_call(&self, root: &Path, touched: &Path, tool: &str, call_id: &str) -> Option<String> {
+        let before: HashSet<PathBuf> = self.seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let note = self.note_for(root, touched, tool);
+        let added: Vec<PathBuf> =
+            self.seen.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|f| !before.contains(*f)).cloned().collect();
+        if !added.is_empty() {
+            self.by_call.lock().unwrap_or_else(|e| e.into_inner()).entry(call_id.to_string()).or_default().extend(added);
+        }
+        note
     }
 
     /// The note for a tool that touched `touched` (absolute, lexical, inside `root`): the instruction files of the

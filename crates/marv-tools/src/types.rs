@@ -418,6 +418,9 @@ pub struct ToolContext {
     /// Where the edit tools' cross-process file locks live (the runtime folder's `file-locks/`, see
     /// [`crate::file_lock`]). None: calls on one file are ordered within this process only.
     pub file_locks: Option<PathBuf>,
+    /// This conversation's saved pages (`crate::swap`), which `recall` reads: the main agent's only. None: nothing to
+    /// recall (a subagent, or no session store).
+    pub swap: Option<PathBuf>,
     /// Where a running call says what it's waiting for (#201: "waiting for beta to accept the wire"), shown on its
     /// card. The main agent's only; None: nothing is shown.
     pub progress: Option<Arc<dyn ToolProgress>>,
@@ -475,6 +478,7 @@ impl ToolContext {
             tool_output: None,
             file_versions: Arc::default(),
             file_locks: None,
+            swap: None,
             progress: None,
         }
     }

@@ -280,13 +280,8 @@ impl Collector {
                 };
                 Some(json!({"type": "status", "status": status}))
             }
-            E::Compaction(result) => Some(match result {
-                marv_session::CompactResult::Compacted { .. } => json!({"type": "compaction", "compacted": true}),
-                // #144: why it failed ("failed", "stopped", "empty") and the error, so a run's log says what happened.
-                marv_session::CompactResult::NotCompacted { reason, error } => {
-                    json!({"type": "compaction", "compacted": false, "reason": reason.as_str(), "error": error})
-                }
-            }),
+            E::Compaction(result) => Some(marv_session::compaction_json(result)),
+            E::Notice { text } => Some(json!({"type": "notice", "text": text})),
             E::TurnEnd { reason, .. } => {
                 self.reason = reason.as_str().into();
                 None
@@ -502,6 +497,7 @@ pub async fn run_headless(options: HeadlessOptions) -> ExitCode {
     // A worker the Herdr door spawned from a tainted conversation starts tainted (MARV_TAINTED=1: only adds taint).
     builder.options.tainted_at_start = marv_session::config::tainted_at_start(&env);
     builder.options.compact_tokens = config.compact_tokens;
+    (builder.options.compaction, builder.options.compact_tail_tokens) = (config.compaction, config.compact_tail_tokens);
     // The mesh, when asked for (`--approve mesh:<r>` or `MARV_MESH_NAME`): otherwise a one-off `marv -p` isn't on it
     // and its model isn't offered the mesh tools. Wires are granted only for the listed receptacles, from this run's
     // own agents or from another Marv (its door).
@@ -615,15 +611,33 @@ mod tests {
         let failed = marv_session::CompactResult::NotCompacted {
             reason: marv_session::CompactFailure::Failed,
             error: marv_agent::compact::TOOL_CALL_ERROR.into(),
+            trigger: marv_session::CompactTrigger::Auto,
         };
         assert_eq!(
             c.event(&SessionEvent::Compaction(failed)),
             Some(
-                serde_json::json!({"type": "compaction", "compacted": false, "reason": "failed", "error": marv_agent::compact::TOOL_CALL_ERROR})
+                serde_json::json!({"type": "compaction", "compacted": false, "reason": "failed", "error": marv_agent::compact::TOOL_CALL_ERROR, "trigger": "auto"})
             )
         );
-        let done = marv_session::CompactResult::Compacted { summary: "S".into(), tokens_before: Some(9) };
-        assert_eq!(c.event(&SessionEvent::Compaction(done)), Some(serde_json::json!({"type": "compaction", "compacted": true})));
+        let done = marv_session::CompactResult::Compacted {
+            summary: "S".into(),
+            tokens_before: Some(9),
+            trigger: marv_session::CompactTrigger::Auto,
+        };
+        assert_eq!(
+            c.event(&SessionEvent::Compaction(done)),
+            Some(serde_json::json!({"type": "compaction", "compacted": true, "trigger": "auto"}))
+        );
+        // #63: an overflow's recovery says how far it went.
+        let recovered = marv_session::CompactResult::Compacted {
+            summary: "S".into(),
+            tokens_before: None,
+            trigger: marv_session::CompactTrigger::Overflow { level: 2 },
+        };
+        assert_eq!(
+            c.event(&SessionEvent::Compaction(recovered)),
+            Some(serde_json::json!({"type": "compaction", "compacted": true, "trigger": "overflow", "level": 2}))
+        );
     }
 
     // #52: a command for the host is refused in -p whatever --approve says, and listed as refused (exit 3).
