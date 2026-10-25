@@ -1047,7 +1047,7 @@ impl LoopState {
                 // A long turn can fill the context by itself: compaction can't wait for the next user
                 // message. If it compacted, the history was swapped under this loop for the summary plus
                 // a "continue" note (a fresh, valid history), and the next request simply starts from it.
-                        let mut compacted = false;
+                let mut compacted = false;
                 if let Some(on_full) = self.options.on_full.clone()
                     && on_full().await
                 {
@@ -1086,8 +1086,14 @@ impl LoopState {
     /// turns in a row. Nothing extra is requested: the next step's request goes out anyway. A step answered with a
     /// tool-loop note never gets here (and #81's note is a "not run" record, which doesn't count), so the loop note
     /// always wins and the nudge stays due for later in the turn.
+    /// Not when the next step is at the step limit: its request may be the tools-off wrap-up (#59), and after a
+    /// "continue" the nudge is still due.
     fn batch_nudge(&mut self, single_reads: u32) {
-        if !self.options.batch_nudge || self.batch_nudged || single_reads < BATCH_NUDGE_AFTER {
+        if !self.options.batch_nudge
+            || self.batch_nudged
+            || single_reads < BATCH_NUDGE_AFTER
+            || at_step_limit(self.step + 1, self.options.max_steps)
+        {
             return;
         }
         self.batch_nudged = true;
@@ -4223,7 +4229,8 @@ mod tests {
             }
             Box::pin(async move { compact })
         });
-        let events = collect(AgentOptions { batch_nudge: true, on_full: Some(on_full), ..options(provider.clone(), &h, plain()) }).await;
+        let events =
+            collect(AgentOptions { batch_nudge: true, on_full: Some(on_full), ..options(provider.clone(), &h, plain()) }).await;
         assert!(events.iter().any(|e| matches!(e, LoopEvent::Compacted)));
         // Compacted after b: c, d and e are only 3.
         assert!(nudges(&events).is_empty());
@@ -4282,6 +4289,24 @@ mod tests {
         assert_eq!(nudges(&events), [4]);
         let (events, _, _) = nudge_run(reads("rm -rf target"), plain()).await;
         assert!(nudges(&events).is_empty());
+    }
+
+    #[tokio::test]
+    async fn no_nudge_right_before_the_step_limit_and_it_stays_due_after_a_continue() {
+        let mut script = single_reads(&["a", "b", "c", "d", "e"]);
+        script.push(say("Done."));
+        let provider = Arc::new(ScriptedProvider::new(script));
+        let h = history(vec![user("go")]);
+        let events = collect(AgentOptions {
+            batch_nudge: true,
+            max_steps: 4,
+            on_limit: on_limit(|_| LimitAnswer::Continue),
+            ..options(provider.clone(), &h, plain())
+        })
+        .await;
+        // Not with the 4th read (the next step is at the limit), but with the 5th, after the "continue".
+        assert_eq!(nudges(&events), [5]);
+        assert_eq!(nudged_requests(&provider)[0], 5);
     }
 
     #[tokio::test]
