@@ -1574,8 +1574,9 @@ impl Bridge {
                 gate.turn = false;
                 self.activity.set_busy(false);
             }
-            // Told once, by the end that held them (a later wake that finishes doesn't say it again).
-            let kept = (holds_now && next.is_none() && !gate.closing).then(|| gate.listed().len()).filter(|n| *n > 0);
+            // Told once, by the end that held them (a later wake that finishes doesn't say it again), also when input
+            // the App already showed runs now ahead of them.
+            let kept = (holds_now && !gate.closing).then(|| gate.listed().len()).filter(|n| *n > 0);
             let listed = next.as_ref().is_some_and(|q| !q.shown).then(|| gate.listed());
             (next, listed, kept)
         };
@@ -3916,6 +3917,31 @@ mod tests {
             mesh.wire().await;
             mesh.send("hi").await;
             until(rx, |e| matches!(e, UiEvent::TurnStart { .. })).await;
+        }
+
+        /// Review on #239 (round 2): a stop holds the queue while input the App already showed runs next: the hold is
+        /// said at once, and the held message still waits after that input's turn finishes.
+        #[tokio::test]
+        async fn a_stop_says_the_hold_even_when_shown_input_runs_next() {
+            let (dirs, mesh) = (Dirs::new(), mesh());
+            let model = Arc::new(Gated::default());
+            model.replies.lock().unwrap().extend([say("stopped"), say("Shown done.")]);
+            let (bridge, mut rx) = gated_bridge(&dirs, &mesh, model.clone());
+            let port = Port(bridge.clone());
+            port.send("go".into());
+            until(&mut rx, |e| matches!(e, UiEvent::TurnStart { .. })).await;
+            port.queue("held one".into());
+            // The App, thinking itself idle, sent this: shown, ahead of the queued message.
+            port.send("shown".into());
+            port.abort();
+            model.release.notify_one();
+            until(&mut rx, |e| matches!(e, UiEvent::TurnEnd { .. })).await;
+            let seen = until(&mut rx, |e| matches!(e, UiEvent::TurnEnd { .. })).await;
+            assert!(texts(&seen).iter().any(|t| t.contains("Stopped. Your queued message waits")), "{seen:?}");
+            assert!(seen.iter().any(|e| matches!(e, UiEvent::Assistant { text } if text == "Shown done.")), "{seen:?}");
+            let after = quiet(&mut rx).await;
+            assert!(!started(&after), "the held message waits: {after:?}");
+            assert_eq!(model.seen.lock().unwrap().last().map(String::as_str), Some("shown"));
         }
 
         /// Review on #239: input the App already showed (it sent it as if idle, racing the wake) runs after the wake

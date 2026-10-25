@@ -14,7 +14,7 @@ The terminal UI's other commands (`/undo`, `/mcp`, `/resume`…) aren't in the d
 
 ## While Marv works
 
-- **Enter queues your message** for after the turn: it's listed above the composer (edit puts it back to change, × drops it; ↑ in an empty composer edits the newest) and sent as the next turn once this one finishes. After Stop the queue is kept: Enter in an empty composer sends the next, or they follow your next message. Typing another message while Marv works counts as your next message, so a kept queue goes on again. If a mesh message wakes Marv just as a queued message is sent, the message goes back to the front of the queue and is sent when that turn ends. The queue is the page's (`src/lib/queue.ts`), one per chat, and no protocol message is needed; reloading the page drops it.
+- **Enter queues your message** for after the turn: it's listed above the composer (edit puts it back to change, × drops it; ↑ in an empty composer edits the newest) and sent as the next turn once this one finishes. After Stop the queue is kept: Enter in an empty composer sends the next, or they follow your next message. Typing another message while Marv works counts as your next message, so a kept queue goes on again. If a mesh message wakes Marv just as a queued message is sent, the host answers `send_refused` with the text, and the message goes back to the front of the queue to be sent when that turn ends. The queue is the page's (`src/lib/queue.ts`), one per chat, and no protocol message is needed; reloading the page drops it.
 - **Send now** (the button, or alt+enter) puts it in at Marv's next step instead.
 
 ## How it fits together

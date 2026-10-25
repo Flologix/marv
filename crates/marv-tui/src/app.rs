@@ -873,7 +873,8 @@ impl App {
             }
             // #184: the queue changed (a message queued, edited, dropped or started).
             UiEvent::Queued(list) => {
-                self.exit_warned &= !list.is_empty();
+                // A queue that changed since the warning is warned about again.
+                self.exit_warned &= list == self.queued;
                 self.queued = list;
                 self.dirty = true;
             }
@@ -1576,8 +1577,9 @@ impl App {
         self.prompt.set("");
         self.prompt.remember(&text);
         self.prompt.history_index = None;
-        // Shown at once; the engine's list replaces it.
+        // Shown at once; the engine's list replaces it. Leaving would drop it too: `/exit` warns again.
         self.queued.push(text.clone());
+        self.exit_warned = false;
         self.dirty = true;
         self.port.queue(text);
     }
@@ -2511,11 +2513,22 @@ mod tests {
         h.typed("/exit");
         assert!(!h.calls().contains(&Call::Command("/exit".into())));
         assert!(h.frame().contains("Leaving drops your 2 queued messages"));
+        // Queued more since the warning: warned again.
+        h.events([UiEvent::TurnStart { turn: "t2".into() }]);
+        enter(&mut h, "three");
+        h.events([
+            UiEvent::Queued(vec!["one".into(), "two".into(), "three".into()]),
+            UiEvent::Done(StopReason::Aborted),
+            turn_end(),
+        ]);
+        h.typed("/exit");
+        assert!(!h.calls().contains(&Call::Command("/exit".into())));
+        assert!(h.frame().contains("Leaving drops your 3 queued messages"));
         h.typed("/exit");
         assert_eq!(h.calls().last(), Some(&Call::Command("/exit".into())));
         // ctrl+c's confirm says it too.
         h.ctrl('c');
-        assert!(h.frame().contains("Press ctrl+c again to exit (2 queued messages will be dropped)"), "{}", h.frame());
+        assert!(h.frame().contains("Press ctrl+c again to exit (3 queued messages will be dropped)"), "{}", h.frame());
     }
 
     #[test]

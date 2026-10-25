@@ -1,7 +1,8 @@
 // `npm test`: plain Node (node:test), the TypeScript stripped.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { EMPTY, afterTurn, push, refused, release, take, unread } from "./queue.ts";
+import { EMPTY, afterTurn, push, refused, refusedSend, release, take, unread } from "./queue.ts";
+import type { Item } from "./transcript.ts";
 
 test("a finished turn sends the oldest queued message next, one per turn", () => {
   const q = push(push(EMPTY, "run the tests"), "then lint");
@@ -50,4 +51,17 @@ test("a queued message the host refused goes first again and is sent once the tu
   const back = refused(sent.queue, "one");
   assert.deepEqual(back, { texts: ["one", "two"], held: false });
   assert.equal(afterTurn(back, "end").next, "one");
+});
+
+test("send_refused requeues by the text it carries, whatever came before it (a wake's turn_start)", () => {
+  // The queue sent "one"; the wake's turn_start and notice may arrive before the refusal.
+  const sent = afterTurn(push(push(EMPTY, "one"), "two"), "end");
+  const items: Item[] = [{ kind: "user", text: "one" }, { kind: "notice", text: "worker-1 woke Marv", tone: "info" }];
+  const back = refusedSend(sent.queue, "one");
+  assert.deepEqual(back.queue.texts, ["one", "two"]);
+  assert.deepEqual(back.items(items), [{ kind: "notice", text: "worker-1 woke Marv", tone: "info" }]);
+  // Nothing of that text in the transcript: unchanged.
+  assert.deepEqual(back.items(items.slice(1)), items.slice(1));
+  // Once the wake ends, it goes.
+  assert.equal(afterTurn(back.queue, "end").next, "one");
 });

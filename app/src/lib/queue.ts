@@ -2,6 +2,8 @@
 // `npm test` covers it; `useChat` holds the state.
 
 /** The queue, oldest first, and whether a stop (or a failure) holds it for the person. */
+import type { Item } from "./transcript.ts";
+
 export type Queue = { texts: string[]; held: boolean };
 
 export const EMPTY: Queue = { texts: [], held: false };
@@ -19,6 +21,20 @@ export function unread(q: Queue, texts: string[]): Queue {
 /** A queued message the host refused (a mesh wake took the session first): first in line again, to go when idle. */
 export function refused(q: Queue, text: string): Queue {
   return { ...q, texts: [text, ...q.texts] };
+}
+
+/**
+ * The host's `send_refused` for `text`: first in the queue again, and its user item (the newest with that text) out of
+ * the transcript, since it was never sent. Returns the queue and a function of the items, for `setItems`.
+ */
+export function refusedSend(q: Queue, text: string): { queue: Queue; items: (items: Item[]) => Item[] } {
+  return {
+    queue: refused(q, text),
+    items: (items) => {
+      const at = items.findLastIndex((it) => it.kind === "user" && it.text === text);
+      return at < 0 ? items : [...items.slice(0, at), ...items.slice(at + 1)];
+    },
+  };
 }
 
 /** Takes entry `i` out (to edit it, to drop it, or the oldest to send now). An empty queue holds nothing. */
