@@ -41,5 +41,9 @@ sha2 = "0.10"
 encoding_rs = "0.8"
 # Content hashes of the files a session has seen (`file_versions`).
 
+[dev-dependencies]
+# The linearity test in `web::plain` times on the thread's CPU clock, which a busy runner can't inflate.
+nix = { version = "0.31.3", features = ["time"] }
+
 [lints]
 workspace = true
