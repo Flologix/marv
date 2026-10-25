@@ -375,14 +375,16 @@ impl SandboxBackend for Bwrap {
         crate::hidden_in_sandbox(dir, home)
     }
 
-    /// SIGKILL to bwrap: its own PID namespace goes with it, and everything the command started (`--unshare-pid`).
+    /// SIGKILL to bwrap, and to its PID namespace's first process first: everything the command started goes with
+    /// that one (`--unshare-pid`), at any moment after the spawn ([`end_sandbox`]).
     fn kill(&self, pid: u32) {
-        crate::backend::send(pid, nix::sys::signal::Signal::SIGKILL);
+        end_sandbox(pid, nix::sys::signal::Signal::SIGKILL);
     }
 
-    /// SIGTERM to bwrap: when it ends, its PID namespace and everything in it end too.
+    /// The same, with SIGTERM for bwrap itself. The command never got a gentler signal than SIGKILL here: bwrap's end
+    /// reached its PID namespace as `--die-with-parent`'s SIGKILL.
     fn terminate(&self, pid: u32) {
-        crate::backend::send(pid, nix::sys::signal::Signal::SIGTERM);
+        end_sandbox(pid, nix::sys::signal::Signal::SIGTERM);
     }
 
     /// bwrap leaves a placeholder's empty mount point; `remove_dir` only removes it while it's empty.
@@ -393,10 +395,147 @@ impl SandboxBackend for Bwrap {
     }
 }
 
+/// Ends bwrap (`pid`, an unreaped child of Marv's) with `signal`, and its sandbox with it, whenever it comes (#182).
+///
+/// The sandbox lives as long as its PID namespace's first process, bwrap's child: when that one dies, the kernel
+/// SIGKILLs everything else in the namespace (`--unshare-pid`). It ties itself to bwrap (`--die-with-parent`, i.e.
+/// `PR_SET_PDEATHSIG`) only late in its set-up (bwrap 0.12: in its init, after the mounts, `setsid` and the fork of the
+/// command), so a signal that ended bwrap in the first few ms orphaned it, and the command ran to its end. A group kill
+/// doesn't close that window (the child has left bwrap's group with `--new-session` by then), nor does waiting for
+/// `--info-fd` (bwrap writes it before the child even starts setting up). So the child is killed itself:
+/// 1. bwrap is stopped (SIGSTOP) and its stop seen without reaping it (`waitid(WSTOPPED | WNOWAIT)`): stopped, it can't
+///    start another child or reap one, so the pids of its children stay theirs;
+/// 2. each child of bwrap's gets SIGKILL, which even a namespace's first process gets when it's sent from outside;
+/// 3. bwrap gets `signal`, and SIGCONT so that a SIGTERM isn't left pending on a stopped process.
+///
+/// Where bwrap's stop can't be seen (it has exited already, or isn't Marv's child), only `signal` is sent.
+fn end_sandbox(pid: u32, signal: nix::sys::signal::Signal) {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if let Ok(raw) = i32::try_from(pid)
+        && raw > 1
+        && stop_child(nix::unistd::Pid::from_raw(raw))
+    {
+        for child in children(raw) {
+            crate::backend::send(child, nix::sys::signal::Signal::SIGKILL);
+        }
+        crate::backend::send(pid, signal);
+        crate::backend::send(pid, nix::sys::signal::Signal::SIGCONT);
+        return;
+    }
+    crate::backend::send(pid, signal);
+}
+
+/// Stops `pid`, a running child of this process, and waits (up to a second) until it has stopped: true once it has,
+/// false if it isn't a running child of ours (exited, reaped, someone else's) or didn't stop in time (then it's
+/// continued again).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn stop_child(pid: nix::unistd::Pid) -> bool {
+    use nix::sys::signal::{Signal, kill};
+    use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid};
+    let state = || {
+        let flags = WaitPidFlag::WEXITED | WaitPidFlag::WSTOPPED | WaitPidFlag::WNOWAIT | WaitPidFlag::WNOHANG;
+        loop {
+            match waitid(Id::Pid(pid), flags) {
+                Err(nix::errno::Errno::EINTR) => continue,
+                other => return other,
+            }
+        }
+    };
+    // Only a child of ours that hasn't exited: a pid that isn't ours could be anyone's.
+    match state() {
+        Ok(WaitStatus::StillAlive | WaitStatus::Stopped(..)) => {}
+        _ => return false,
+    }
+    if kill(pid, Signal::SIGSTOP).is_err() {
+        return false;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        match state() {
+            Ok(WaitStatus::Stopped(..)) => return true,
+            Ok(WaitStatus::StillAlive) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+            _ => {
+                let _ = kill(pid, Signal::SIGCONT);
+                return false;
+            }
+        }
+    }
+}
+
+/// The children of `pid`: `/proc/<pid>/task/*/children`, or where the kernel doesn't offer that file, every process
+/// whose parent `/proc/*/stat` names it.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn children(pid: i32) -> Vec<u32> {
+    let mut found = Vec::new();
+    let mut listed = false;
+    if let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) {
+        for task in tasks.flatten() {
+            if let Ok(text) = std::fs::read_to_string(task.path().join("children")) {
+                listed = true;
+                found.extend(text.split_whitespace().filter_map(|p| p.parse::<u32>().ok()));
+            }
+        }
+    }
+    if !listed && let Ok(procs) = std::fs::read_dir("/proc") {
+        for entry in procs.flatten() {
+            let Some(child) = entry.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else { continue };
+            let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else { continue };
+            if parent_in_stat(&stat) == Some(pid) {
+                found.push(child);
+            }
+        }
+    }
+    found.sort_unstable();
+    found.dedup();
+    found
+}
+
+/// The parent pid in a `/proc/<pid>/stat` line: the field after the state, after the command name's closing `)` (a
+/// name may hold spaces and parentheses itself).
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+fn parent_in_stat(stat: &str) -> Option<i32> {
+    stat.get(stat.rfind(')')? + 1..)?.split_whitespace().nth(1)?.parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_fs::Fake;
+
+    #[test]
+    fn the_parent_is_read_after_the_command_name() {
+        assert_eq!(parent_in_stat("4242 (bwrap) S 17 4242 17 0 -1"), Some(17));
+        assert_eq!(parent_in_stat("4243 (a) b (c) R 4242 1 1"), Some(4242));
+        assert_eq!(parent_in_stat("4244 (cut"), None);
+    }
+
+    /// bwrap stopped, its children found and SIGKILLed, and bwrap continued: with `sh` standing in for bwrap and a
+    /// child that ignores SIGTERM, the child goes and `sh` (ignoring it too) ends once it has, not left stopped.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn ending_a_sandbox_kills_the_programs_children_first() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut parent = std::process::Command::new("sh")
+            .args(["-c", "trap '' TERM HUP; sleep 600 & echo $!; wait"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(parent.stdout.take().unwrap()), &mut line).unwrap();
+        let child: u32 = line.trim().parse().unwrap();
+        assert!(children(parent.id() as i32).contains(&child));
+        end_sandbox(parent.id(), nix::sys::signal::Signal::SIGTERM);
+        let status = parent.wait().unwrap();
+        assert!(status.code().is_some() || status.signal().is_some(), "{status:?}");
+        let gone = (0..200).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::fs::read_to_string(format!("/proc/{child}/stat"))
+                .map_or(true, |s| parent_in_stat(&s) != Some(parent.id() as i32))
+        });
+        assert!(gone, "the child outlived the end of its sandbox");
+    }
 
     fn base() -> SandboxOptions {
         SandboxOptions { root: "/home/me/proj".into(), home: "/home/me".into(), path: "/usr/bin".into(), ..Default::default() }

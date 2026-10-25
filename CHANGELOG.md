@@ -6,6 +6,10 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+### Fixed
+
+- **A stop or a timeout right after a sandboxed command starts now ends it (Linux, #182).** A stop (Esc, a process's stop) or a timeout that reached bubblewrap within the first few milliseconds, while it was still setting the sandbox up, ended bubblewrap but not the command, which ran on (still sandboxed) until it finished by itself. Marv now pauses bubblewrap, ends the sandbox's first process (which takes everything in the sandbox with it), then ends bubblewrap, so a stop at any moment after the start ends the command, for bash commands, checks and background processes alike.
+
 ## [0.10.0] - 2026-10-24
 
 ### Added
