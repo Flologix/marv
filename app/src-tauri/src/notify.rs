@@ -92,9 +92,16 @@ fn one_line(text: &str, max: usize) -> String {
     format!("{}…", cut.trim_end())
 }
 
-/// `text` safe in a notification body that a server renders as markup: `&`, `<` and `>` escaped.
+/// `text` safe in a notification body that a server renders as markup: `&`, `<` and `>` escaped. macOS and Windows
+/// show the body as plain text, so there it stays as is (an escape would show).
+#[cfg(all(unix, not(target_os = "macos")))]
 fn markup(text: &str) -> String {
     text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+#[cfg(not(all(unix, not(target_os = "macos"))))]
+fn markup(text: &str) -> String {
+    text.to_string()
 }
 
 /// A notification's summary and body for an approval that asks `what` (a label from `asks`).
@@ -233,15 +240,26 @@ fn show(
     });
 }
 
+/// macOS: the notification is sent when its handle drops, without waiting for a click (clicking one brings the app
+/// up). It's sent as the app's bundle (`ai.flologix.marv`), so it shows Marv's name and icon and follows Marv's
+/// notification settings, rather than Finder's.
 #[cfg(not(all(unix, not(target_os = "macos"))))]
 fn show(
-    _app: &AppHandle,
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] app: &AppHandle,
     _id: &str,
     summary: String,
     body: String,
     _withdrawn: oneshot::Receiver<()>,
     done: impl FnOnce() + Send + 'static,
 ) {
+    #[cfg(target_os = "macos")]
+    {
+        static BUNDLE: std::sync::Once = std::sync::Once::new();
+        let identifier = app.config().identifier.clone();
+        BUNDLE.call_once(|| {
+            let _ = notify_rust::set_application(&identifier);
+        });
+    }
     tauri::async_runtime::spawn_blocking(move || {
         let _ = notify_rust::Notification::new().appname("Marv").summary(&summary).body(&body).show();
         done();
@@ -331,6 +349,7 @@ mod tests {
     }
 
     /// Chat names in the folded body are escaped: the body is markup on some servers.
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn chat_names_in_the_body_are_escaped() {
         let two = [("<b>a</b> & b".into(), "finished"), ("web".into(), "finished")];

@@ -6,6 +6,8 @@
 #   marv-aarch64-unknown-linux-musl.tar.gz  (+ .sha256)
 #   marv-x86_64-apple-darwin.tar.gz         (+ .sha256)
 #   marv-aarch64-apple-darwin.tar.gz        (+ .sha256)
+#   marv-desktop-x86_64-apple-darwin.dmg    (+ .sha256)  Marv desktop (app/), #208
+#   marv-desktop-aarch64-apple-darwin.dmg   (+ .sha256)
 #   SHA256SUMS                              all of the above, which install.sh checks against
 #   install.sh
 #   flologixai-marv-*.tgz                   the npm packages (packaging/npm), published by hand
@@ -84,8 +86,13 @@ jobs:
   # macOS (#167): native runners, no zig; arm64 on Apple silicon, x86_64 on Intel, so each build is smoke-tested on
   # its own CPU. Rust's linker signs the arm64 binary ad hoc, which is all macOS needs to run it (it's never
   # quarantined: curl and npm don't set the flag).
+  #
+  # #208: the same runners build Marv desktop's .dmg. It's signed ad hoc unless the signing secrets are set
+  # (APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY; and APPLE_ID, APPLE_PASSWORD, APPLE_TEAM_ID
+  # to notarize): then Tauri signs it with the Developer ID and notarizes it. Without them, people open it once with
+  # right-click → Open (README).
   build-macos:
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       fail-fast: true
       matrix:
@@ -117,6 +124,50 @@ jobs:
           target/${{ matrix.target }}/release/marv --version
           packaging/smoke.sh ${{ matrix.target }} dist
           packaging/npm/test.sh target/${{ matrix.target }}/release/marv
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - name: Build Marv desktop (.dmg)
+        working-directory: app
+        env:
+          MAC_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          MAC_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          MAC_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          MAC_ID: ${{ secrets.APPLE_ID }}
+          MAC_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          MAC_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          npm ci
+          # Only set secrets reach Tauri: an empty APPLE_CERTIFICATE would make it try to import nothing.
+          set -- --bundles app,dmg --target ${{ matrix.target }}
+          if [ -n "$MAC_SIGNING_IDENTITY" ] && [ -n "$MAC_CERTIFICATE" ]; then
+            echo "Signing with the Developer ID certificate"
+            export APPLE_CERTIFICATE="$MAC_CERTIFICATE" APPLE_CERTIFICATE_PASSWORD="$MAC_CERTIFICATE_PASSWORD" \
+              APPLE_SIGNING_IDENTITY="$MAC_SIGNING_IDENTITY"
+            set -- "$@" --config "{\"bundle\":{\"macOS\":{\"signingIdentity\":\"$MAC_SIGNING_IDENTITY\"}}}"
+            if [ -n "$MAC_ID" ] && [ -n "$MAC_PASSWORD" ] && [ -n "$MAC_TEAM_ID" ]; then
+              echo "and notarizing"
+              export APPLE_ID="$MAC_ID" APPLE_PASSWORD="$MAC_PASSWORD" APPLE_TEAM_ID="$MAC_TEAM_ID"
+            fi
+          else
+            echo "No signing secrets: an unsigned (ad hoc) build"
+          fi
+          npx tauri build "$@"
+      # The launch check CI runs (.github/workflows/desktop.yml), on the bundle that goes in the .dmg.
+      - name: Smoke test Marv desktop
+        run: |
+          app=target/${{ matrix.target }}/release/bundle/macos/Marv.app
+          bin=$(find "$app/Contents/MacOS" -type f -perm -u+x | head -n 1)
+          [ "$(lipo -archs "$bin")" = "${{ matrix.arch }}" ]
+          codesign --verify --deep --strict --verbose=2 "$app"
+          packaging/desktop/smoke-macos.sh "$app"
+      - name: Package Marv desktop
+        run: |
+          asset=marv-desktop-${{ matrix.target }}.dmg
+          cp target/${{ matrix.target }}/release/bundle/dmg/*.dmg "dist/$asset"
+          (cd dist && shasum -a 256 "$asset" >"$asset.sha256" && cat "$asset.sha256")
       - uses: actions/upload-artifact@v4
         with:
           name: marv-${{ matrix.target }}
@@ -143,7 +194,10 @@ jobs:
           for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl x86_64-apple-darwin aarch64-apple-darwin; do
             [ -f "marv-$target.tar.gz" ] || { echo "marv-$target.tar.gz is missing"; exit 1; }
           done
-          cat marv-*.tar.gz.sha256 > SHA256SUMS
+          for target in x86_64-apple-darwin aarch64-apple-darwin; do
+            [ -f "marv-desktop-$target.dmg" ] || { echo "marv-desktop-$target.dmg is missing"; exit 1; }
+          done
+          cat marv-*.tar.gz.sha256 marv-desktop-*.dmg.sha256 > SHA256SUMS
           sha256sum -c SHA256SUMS
           cat SHA256SUMS
       # The npm packages go up as release assets too; publishing them needs the maintainer's 2FA, so it's done by hand

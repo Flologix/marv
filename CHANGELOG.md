@@ -6,6 +6,10 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+### Added
+
+- **Marv desktop on macOS (#208).** Each release now has a .dmg of Marv desktop for Apple silicon and for Intel (`marv-desktop-aarch64-apple-darwin.dmg`, `marv-desktop-x86_64-apple-darwin.dmg`, in `SHA256SUMS` too), for macOS 14 or newer. It's signed ad hoc, not yet with an Apple Developer ID, so the first launch needs right-click → Open (or Open Anyway in Privacy & Security); the README has the steps. On macOS, links open with `open`, notifications are sent as Marv rather than as Finder (and their text is plain, not escaped markup), dictation points to the system's own, and `app/install-desktop.sh` builds Marv.app into /Applications. A Desktop workflow builds the app and the .dmg on both kinds of Mac for pull requests that touch the app, and checks that the built app starts and its page reaches the backend. The desktop's version now follows Marv's (it said 0.1.0).
+
 ## [0.10.0] - 2026-10-24
 
 ### Added
