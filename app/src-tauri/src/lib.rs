@@ -824,10 +824,43 @@ fn live_chats(desktop: State<'_, Desktop>) -> Vec<background::LiveState> {
     background::states(&desktop.live())
 }
 
+/// The window shows the app and nothing else: a link that would navigate it away (a reply's link to a dev server, a
+/// page the model named) opens in the person's browser instead, since the window has no back button.
+fn stay_in_the_app<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
+    tauri::plugin::Builder::new("stay-in-the-app")
+        .on_navigation(|_webview, url| {
+            if in_the_app(url) {
+                return true;
+            }
+            if matches!(url.scheme(), "http" | "https") {
+                let _ = open_url(url.to_string());
+            }
+            false
+        })
+        .build()
+}
+
+/// The app's own pages: the bundled frontend (tauri:// or the tauri.localhost host), IPC, about:/data: frames, and in a
+/// debug build the dev server.
+fn in_the_app(url: &tauri::Url) -> bool {
+    match url.scheme() {
+        "tauri" | "ipc" | "about" | "data" | "blob" | "asset" => true,
+        "http" | "https" => {
+            let host = url.host_str().unwrap_or_default();
+            host == "tauri.localhost"
+                || host == "ipc.localhost"
+                || host == "asset.localhost"
+                || (cfg!(debug_assertions) && (host == "localhost" || host == "127.0.0.1") && url.port() == Some(1420))
+        }
+        _ => false,
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(stay_in_the_app())
         .setup(|app| {
             let config = app.path().app_config_dir()?;
             let data = app.path().app_data_dir()?;
@@ -933,6 +966,25 @@ mod live {
                 Ok(Resolved::Choices(c)) => println!("CHOICES {source}: {:?}", c.choices),
                 Err(e) => println!("ERR {source}: {e}"),
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod stay_in_the_app_tests {
+    use super::in_the_app;
+
+    fn url(s: &str) -> tauri::Url {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn the_app_s_own_pages_stay_and_everything_else_goes_to_the_browser() {
+        for own in ["tauri://localhost/", "http://tauri.localhost/index.html", "ipc://localhost/x", "about:blank"] {
+            assert!(in_the_app(&url(own)), "{own}");
+        }
+        for away in ["http://localhost:3002/", "https://example.com/", "http://127.0.0.1:8080/", "file:///etc/passwd"] {
+            assert!(!in_the_app(&url(away)), "{away}");
         }
     }
 }
