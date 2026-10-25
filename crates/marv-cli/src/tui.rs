@@ -999,10 +999,47 @@ struct Gate {
     turn: bool,
     /// That turn is a wake-up: the App may not have seen it start yet.
     woken: bool,
-    /// Input submitted while a turn ran (the App hadn't seen it start, or had just seen it end): run in order next.
-    queued: std::collections::VecDeque<(String, Option<String>)>,
+    /// Input waiting for the running turn (#184), run in order next: the person's queued messages (Enter while a turn
+    /// runs, and "send now" text the turn ended before reading), and input the App sent without having seen the turn
+    /// start (a wake-up whose start hadn't reached it) or after seeing it end. One queue for all of it, so a mesh-woken
+    /// turn and the person's turn never race.
+    queued: std::collections::VecDeque<Queued>,
+    /// The last turn was stopped (or failed) with messages queued: they wait for the person, never start on their
+    /// own. Enter on an empty prompt sends the next; anything the person sends or queues releases the hold. Input the
+    /// App already showed is never held.
+    held: bool,
     /// The App has left: no wake-ups, no queued input.
     closing: bool,
+}
+
+/// One input waiting in [`Gate::queued`].
+struct Queued {
+    text: String,
+    for_model: Option<String>,
+    /// Already in the App's transcript (it sent it as if idle): starts whatever happens, never listed nor edited.
+    /// Otherwise the person queued it: listed above the prompt ([`UiEvent::Queued`]), and its line is shown when it
+    /// starts.
+    shown: bool,
+}
+
+/// How a gate's turn ended, for [`Bridge::finished`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ended {
+    /// The reply finished: the queue goes on, and once idle the next message may be suggested.
+    Done,
+    /// Nothing ran (a wake with nothing to do): the queue goes on.
+    Quiet,
+    /// The person stopped it: the queue waits for them.
+    Stopped,
+    /// An error, the step limit, a refused send: the queue waits too.
+    Failed,
+}
+
+impl Gate {
+    /// What the App lists above the prompt: the person's queued messages, oldest first.
+    fn listed(&self) -> Vec<String> {
+        self.queued.iter().filter(|q| !q.shown).map(|q| q.text.clone()).collect()
+    }
 }
 
 impl Drop for Bridge {
@@ -1403,23 +1440,98 @@ impl Bridge {
             // A turn is running that the App didn't know of when this was typed (a wake-up whose start hadn't reached
             // it, or the end just shown while the next one is being handed over): this goes next, never lost.
             if gate.turn {
-                gate.queued.push_back((text, for_model));
+                // Already in the App's transcript: ahead of the person's queued messages (behind other shown input),
+                // so it runs next, in the order the transcript shows. The person sent something: no hold.
+                let at = gate.queued.iter().position(|q| !q.shown).unwrap_or(gate.queued.len());
+                gate.queued.insert(at, Queued { text, for_model, shown: true });
+                gate.held = false;
                 if gate.woken {
                     self.emit(system("A mesh message woke Marv just now: yours goes next, when that turn ends.", false));
                 }
                 return;
             }
             gate.turn = true;
+            // The person sent: a queue a stop kept follows this turn.
+            gate.held = false;
             // Working from before the turn's task starts, so Herdr hears it before anything the turn asks.
             self.activity.set_busy(true);
         }
-        self.start_claimed(text, for_model);
+        self.start_claimed(text, for_model, false);
+    }
+
+    /// Enter while a turn runs (#184): the message waits for the turn, listed above the prompt. The person sent another
+    /// message, so a queue a stop held goes on again. The turn already over (the App hadn't seen its end): the oldest
+    /// queued message starts now, its line shown first.
+    fn queue(self: &Arc<Self>, text: String) {
+        self.radio_wake_limit.lock().unwrap_or_else(|e| e.into_inner()).person_typed();
+        let (listed, next) = {
+            let mut gate = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+            if gate.closing {
+                return;
+            }
+            gate.held = false;
+            gate.queued.push_back(Queued { text, for_model: None, shown: false });
+            let next = if gate.turn {
+                None
+            } else {
+                gate.turn = true;
+                self.activity.set_busy(true);
+                gate.queued.pop_front()
+            };
+            (gate.listed(), next)
+        };
+        // Always the list after the change: the App listed it already (it thought a turn ran).
+        self.emit(UiEvent::Queued(listed));
+        if let Some(Queued { text, for_model, shown }) = next {
+            if !shown {
+                self.emit(UiEvent::Message(message(Role::User, text.clone())));
+            }
+            self.start_claimed(text, for_model, !shown);
+        }
+    }
+
+    /// "Send now" text no turn read (it ended first): ahead of the person's other queued messages, behind input the
+    /// App already showed. The turn's end decides whether it goes on ([`Self::finished`]).
+    fn queue_unread(&self, texts: Vec<String>) {
+        if texts.is_empty() {
+            return;
+        }
+        let listed = {
+            let mut gate = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+            if gate.closing {
+                return;
+            }
+            let at = gate.queued.iter().position(|q| !q.shown).unwrap_or(gate.queued.len());
+            for (i, text) in texts.into_iter().enumerate() {
+                gate.queued.insert(at + i, Queued { text, for_model: None, shown: false });
+            }
+            gate.listed()
+        };
+        self.emit(system("✻ The turn ended before its next step: your message is queued instead.", false));
+        self.emit(UiEvent::Queued(listed));
+    }
+
+    /// Takes the person's newest (`newest`) or oldest queued message out of the queue, and lists what's left.
+    fn unqueue(&self, newest: bool) -> Option<String> {
+        let (text, listed) = {
+            let mut gate = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+            let at = if newest { gate.queued.iter().rposition(|q| !q.shown) } else { gate.queued.iter().position(|q| !q.shown) }?;
+            let text = gate.queued.remove(at).map(|q| q.text)?;
+            if gate.listed().is_empty() {
+                gate.held = false;
+            }
+            (text, gate.listed())
+        };
+        self.emit(UiEvent::Queued(listed));
+        Some(text)
     }
 
     /// Sends a message on a gate already taken for it.
-    fn start_claimed(self: &Arc<Self>, text: String, for_model: Option<String>) {
+    /// `queued`: the person's queued message (#184): refused, it goes back to the front of the queue (held, as any
+    /// failure holds it), never lost.
+    fn start_claimed(self: &Arc<Self>, text: String, for_model: Option<String>, queued: bool) {
         self.stop_suggesting();
-        let turn = match self.session.send(&text, SendOptions { for_model, cancel: None }) {
+        let turn = match self.session.send(&text, SendOptions { for_model: for_model.clone(), cancel: None }) {
             Ok(turn) => {
                 self.radio_title();
                 turn
@@ -1428,7 +1540,15 @@ impl Bridge {
                 // The App started its turn on submit: end it (this one, the rejected turn: no other turn's end).
                 self.emit(system(e.to_string(), true));
                 self.emit(UiEvent::TurnEnd { turn: String::new(), reason: view::TurnEndReason::Loop(StopReason::Error) });
-                self.finished(false);
+                if queued {
+                    let mut gate = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+                    let at = gate.queued.iter().position(|q| !q.shown).unwrap_or(gate.queued.len());
+                    gate.queued.insert(at, Queued { text, for_model, shown: false });
+                    let listed = gate.listed();
+                    drop(gate);
+                    self.emit(UiEvent::Queued(listed));
+                }
+                self.finished(Ended::Failed);
                 return;
             }
         };
@@ -1436,28 +1556,57 @@ impl Bridge {
     }
 
     /// The gate's turn is over: the next queued input starts on the same gate (nothing can slip in between), or the
-    /// bridge is free. `done`: the turn's reply finished normally, so once idle the next message may be suggested.
-    fn finished(self: &Arc<Self>, done: bool) {
-        let next = {
+    /// bridge is free. Input the App already showed always goes on; the person's queued messages go on only after a
+    /// turn that finished (#184): after a stop or a failure they wait, and the person is told.
+    fn finished(self: &Arc<Self>, ended: Ended) {
+        let (next, listed, kept) = {
             let mut gate = self.gate.lock().unwrap_or_else(|e| e.into_inner());
             gate.woken = false;
-            match gate.queued.pop_front().filter(|_| !gate.closing) {
-                Some(next) => Some(next),
-                None => {
-                    gate.turn = false;
-                    self.activity.set_busy(false);
-                    None
-                }
+            let holds_now = matches!(ended, Ended::Stopped | Ended::Failed) && gate.queued.iter().any(|q| !q.shown);
+            if holds_now {
+                gate.held = true;
             }
+            // Input the App already showed always goes on, wherever it waits; the person's queued messages only while
+            // nothing holds them.
+            let at = gate.queued.iter().position(|q| q.shown).or_else(|| (!gate.held && !gate.queued.is_empty()).then_some(0));
+            let next = at.filter(|_| !gate.closing).and_then(|at| gate.queued.remove(at));
+            if next.is_none() {
+                gate.turn = false;
+                self.activity.set_busy(false);
+            }
+            // Told once, by the end that held them (a later wake that finishes doesn't say it again), also when input
+            // the App already showed runs now ahead of them.
+            let kept = (holds_now && !gate.closing).then(|| gate.listed().len()).filter(|n| *n > 0);
+            let listed = next.as_ref().is_some_and(|q| !q.shown).then(|| gate.listed());
+            (next, listed, kept)
         };
+        if let Some(n) = kept {
+            let what = if n == 1 { "Your queued message waits".to_string() } else { format!("Your {n} queued messages wait") };
+            let why = if ended == Ended::Stopped { "Stopped" } else { "The turn didn't finish" };
+            self.emit(system(
+                format!(
+                    "✻ {why}. {what}: Enter on an empty prompt sends the next (↑ edits it, ctrl+x drops it), or they follow your next message."
+                ),
+                false,
+            ));
+        }
+        if let Some(listed) = listed {
+            self.emit(UiEvent::Queued(listed));
+        }
         match next {
-            Some((text, for_model)) => self.start_claimed(text, for_model),
+            Some(Queued { text, for_model, shown }) => {
+                if !shown {
+                    // As if typed now: the person's line, then the turn (the App starts it on its first event).
+                    self.emit(UiEvent::Message(message(Role::User, text.clone())));
+                }
+                self.start_claimed(text, for_model, !shown)
+            }
             // Idle again: a message that rang the mail bell while busy, after the turn's last inbox read (its final
             // reply runs no `after_step`), would otherwise wait for some later message. `wake` checks everything
             // again (on, closing, approvals, the rate limit, which also bounds a wake that keeps failing).
             None => {
                 // Only after a reply that finished: not after an error, a stop or the step limit.
-                if done {
+                if ended == Ended::Done {
                     self.suggest_next();
                 }
                 let me = self.clone();
@@ -1476,10 +1625,22 @@ impl Bridge {
             let totals_fn = move || totals(&usage_of.usage().totals);
             let last_of = me.session.clone();
             let last_fn = move || last_of.usage().last;
-            let mut finished = false;
+            let mut ended = Ended::Failed;
             while let Some(event) = turn.next().await {
                 let end = matches!(event, SessionEvent::TurnEnd { .. });
-                finished |= matches!(event, SessionEvent::TurnEnd { reason: TurnEndReason::Done(StopReason::End), .. });
+                if let SessionEvent::TurnEnd { reason, .. } = &event {
+                    ended = match reason {
+                        TurnEndReason::Done(StopReason::End) => Ended::Done,
+                        TurnEndReason::Done(StopReason::Aborted) | TurnEndReason::Interrupted => Ended::Stopped,
+                        TurnEndReason::Done(_) => Ended::Failed,
+                    };
+                }
+                // "Send now" text the turn ended before reading (#184): first in the queue, where the turn's end decides
+                // (it goes on after a finished turn, waits after a stop), rather than back in the prompt.
+                if let SessionEvent::NotSent { texts } = event {
+                    me.queue_unread(texts);
+                    continue;
+                }
                 for ui in map_event(event, &mut map, &totals_fn, &last_fn) {
                     me.emit(ui);
                 }
@@ -1491,7 +1652,7 @@ impl Bridge {
                 *me.last_checks.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
             }
             // After the end went out: input the App sends on seeing it is queued and starts here, in order.
-            me.finished(finished);
+            me.finished(ended);
         });
     }
 
@@ -1940,7 +2101,7 @@ impl Bridge {
                     self.emit(system(by.line(), false));
                     self.forward(turn);
                 }
-                Ok(None) | Err(_) => self.finished(false),
+                Ok(None) | Err(_) => self.finished(Ended::Quiet),
             }
             return;
         }
@@ -1985,7 +2146,7 @@ impl Bridge {
                 self.emit(system(format!("✻ {}", by.line()), false));
                 self.forward(turn);
             }
-            Ok(None) | Err(_) => self.finished(false),
+            Ok(None) | Err(_) => self.finished(Ended::Quiet),
         }
     }
 
@@ -2608,13 +2769,25 @@ impl SessionPort for Port {
         self.0.run_turn(text, None);
     }
 
-    /// "Send now" (Alt+Enter): into the running turn, at its next step. No turn to take it (it just ended): back to
-    /// the prompt, never started as a turn of its own.
+    /// "Send now" (Alt+Enter): into the running turn, at its next step. No turn to take it (it just ended): queued,
+    /// as Enter would have (#184).
     fn send_now(&self, text: String) {
         self.0.radio_wake_limit.lock().unwrap_or_else(|e| e.into_inner()).person_typed();
         if self.0.session.send_now(&text).is_err() {
-            self.0.emit(UiEvent::NotSent { texts: vec![text] });
+            self.0.queue(text);
         }
+    }
+
+    fn queue(&self, text: String) {
+        self.0.queue(text);
+    }
+
+    fn unqueue_last(&self) -> Option<String> {
+        self.0.unqueue(true)
+    }
+
+    fn take_queued(&self) -> Option<String> {
+        self.0.unqueue(false)
     }
 
     fn run_command(&self, line: String) {
@@ -3654,6 +3827,172 @@ mod tests {
             let seen = until(&mut rx, |e| matches!(e, UiEvent::TurnEnd { .. })).await;
             assert!(!texts(&seen).iter().any(|t| t == WOKEN));
             assert!(model.seen.lock().unwrap().len() <= 2);
+        }
+
+        fn queued_lists(events: &[UiEvent]) -> Vec<Vec<String>> {
+            events.iter().filter_map(|e| if let UiEvent::Queued(list) = e { Some(list.clone()) } else { None }).collect()
+        }
+
+        /// #184: Enter during a mesh-woken turn queues on the same gate the woken turn holds: listed for the App, run
+        /// after the turn finishes, its line shown first, never alongside it.
+        #[tokio::test]
+        async fn a_message_queued_during_a_woken_turn_starts_once_it_finishes() {
+            let (dirs, mesh) = (Dirs::new(), mesh());
+            let model = Arc::new(Gated::default());
+            model.replies.lock().unwrap().extend([say("worker-1 says hi."), say("Tests pass.")]);
+            let (bridge, mut rx) = gated_bridge(&dirs, &mesh, model.clone());
+            mesh.wire().await;
+            mesh.send("hi").await;
+            until(&mut rx, |e| matches!(e, UiEvent::TurnStart { .. })).await;
+            Port(bridge.clone()).queue("now run the tests".into());
+            let seen = quiet(&mut rx).await;
+            assert_eq!(queued_lists(&seen), [vec!["now run the tests".to_string()]]);
+            assert!(!started(&seen) && ends(&seen).is_empty(), "{seen:?}");
+            model.release.notify_one();
+            let first = until(&mut rx, |e| matches!(e, UiEvent::TurnEnd { .. })).await;
+            let next = until(&mut rx, |e| matches!(e, UiEvent::TurnEnd { .. })).await;
+            assert!(first.iter().any(|e| matches!(e, UiEvent::Assistant { text } if text == "worker-1 says hi.")));
+            // Listed empty, the person's line, then its turn.
+            let at = |f: &dyn Fn(&UiEvent) -> bool| next.iter().position(f).unwrap();
+            let emptied = at(&|e| matches!(e, UiEvent::Queued(l) if l.is_empty()));
+            let line = at(&|e| matches!(e, UiEvent::Message(m) if m.role == Role::User && m.text == "now run the tests"));
+            let start = at(&|e| matches!(e, UiEvent::TurnStart { .. }));
+            assert!(emptied < start && line < start, "{next:?}");
+            assert!(next.iter().any(|e| matches!(e, UiEvent::Assistant { text } if text == "Tests pass.")));
+            assert_eq!(model.seen.lock().unwrap().last().map(String::as_str), Some("now run the tests"));
+        }
+
+        /// #184: a stop keeps the queue (and says so): nothing starts on its own. The App takes the oldest to send and
+        /// the newest to edit; each change is listed.
+        #[tokio::test]
+        async fn a_stopped_turn_keeps_the_queue_for_the_person() {
+            let (dirs, mesh) = (Dirs::new(), mesh());
+            let model = Arc::new(Gated::default());
+            model.replies.lock().unwrap().extend([say("never"), say("ok")]);
+            let (bridge, mut rx) = gated_bridge(&dirs, &mesh, model.clone());
+            let port = Port(bridge.clone());
+            port.send("go".into());
+            until(&mut rx, |e| matches!(e, UiEvent::TurnStart { .. })).await;
+            port.queue("one".into());
+            port.queue("two".into());
+            port.abort();
+            // The held reply comes only now: the turn sees the stop either way.
+            model.release.notify_one();
+            let end = until(&mut rx, |e| matches!(e, UiEvent::TurnEnd { .. })).await;
+            assert!(matches!(end.last(), Some(UiEvent::TurnEnd { reason: view::TurnEndReason::Loop(StopReason::Aborted), .. })));
+            let seen = quiet(&mut rx).await;
+            assert!(!started(&seen), "{seen:?}");
+            assert!(texts(&seen).iter().any(|t| t.contains("Stopped. Your 2 queued messages wait")), "{seen:?}");
+            assert_eq!(port.unqueue_last().as_deref(), Some("two"));
+            assert_eq!(queued_lists(&quiet(&mut rx).await), [vec!["one".to_string()]]);
+            assert_eq!(port.take_queued().as_deref(), Some("one"));
+            assert_eq!(queued_lists(&quiet(&mut rx).await), [Vec::<String>::new()]);
+            assert_eq!(port.take_queued(), None);
+            // Idle with nothing queued: a queued message starts at once (the App hadn't seen the turn end, and listed
+            // it): the list it gets is empty, so nothing stale stays above the prompt.
+            port.queue("three".into());
+            let seen = until(&mut rx, |e| matches!(e, UiEvent::TurnEnd { .. })).await;
+            assert!(seen.iter().any(|e| matches!(e, UiEvent::Message(m) if m.role == Role::User && m.text == "three")));
+            assert_eq!(queued_lists(&seen), [Vec::<String>::new()], "{seen:?}");
+            assert_eq!(model.seen.lock().unwrap().last().map(String::as_str), Some("three"));
+            // "Send now" that finds no turn (it just ended) is queued the same way, never dropped nor sent elsewhere.
+            port.send_now("four".into());
+            let seen = until(&mut rx, |e| matches!(e, UiEvent::TurnEnd { .. })).await;
+            assert!(seen.iter().any(|e| matches!(e, UiEvent::Message(m) if m.role == Role::User && m.text == "four")));
+            assert!(!seen.iter().any(|e| matches!(e, UiEvent::NotSent { .. })));
+        }
+
+        /// A turn stopped with "one" queued: held. Then a mesh message wakes Marv, its reply held until `release`.
+        async fn held_then_woken(model: &Arc<Gated>, mesh: &Mesh, port: &Port, rx: &mut UnboundedReceiver<UiEvent>) {
+            port.send("go".into());
+            until(rx, |e| matches!(e, UiEvent::TurnStart { .. })).await;
+            port.queue("one".into());
+            port.abort();
+            model.release.notify_one();
+            until(rx, |e| matches!(e, UiEvent::TurnEnd { .. })).await;
+            let seen = quiet(rx).await;
+            assert!(texts(&seen).iter().any(|t| t.contains("Stopped. Your queued message waits")), "{seen:?}");
+            // The next request waits again: the wake is still running when the person acts.
+            model.held.store(false, Ordering::SeqCst);
+            mesh.wire().await;
+            mesh.send("hi").await;
+            until(rx, |e| matches!(e, UiEvent::TurnStart { .. })).await;
+        }
+
+        /// Review on #239 (round 2): a stop holds the queue while input the App already showed runs next: the hold is
+        /// said at once, and the held message still waits after that input's turn finishes.
+        #[tokio::test]
+        async fn a_stop_says_the_hold_even_when_shown_input_runs_next() {
+            let (dirs, mesh) = (Dirs::new(), mesh());
+            let model = Arc::new(Gated::default());
+            model.replies.lock().unwrap().extend([say("stopped"), say("Shown done.")]);
+            let (bridge, mut rx) = gated_bridge(&dirs, &mesh, model.clone());
+            let port = Port(bridge.clone());
+            port.send("go".into());
+            until(&mut rx, |e| matches!(e, UiEvent::TurnStart { .. })).await;
+            port.queue("held one".into());
+            // The App, thinking itself idle, sent this: shown, ahead of the queued message.
+            port.send("shown".into());
+            port.abort();
+            model.release.notify_one();
+            until(&mut rx, |e| matches!(e, UiEvent::TurnEnd { .. })).await;
+            let seen = until(&mut rx, |e| matches!(e, UiEvent::TurnEnd { .. })).await;
+            assert!(texts(&seen).iter().any(|t| t.contains("Stopped. Your queued message waits")), "{seen:?}");
+            assert!(seen.iter().any(|e| matches!(e, UiEvent::Assistant { text } if text == "Shown done.")), "{seen:?}");
+            let after = quiet(&mut rx).await;
+            assert!(!started(&after), "the held message waits: {after:?}");
+            assert_eq!(model.seen.lock().unwrap().last().map(String::as_str), Some("shown"));
+        }
+
+        /// Review on #239: input the App already showed (it sent it as if idle, racing the wake) runs after the wake
+        /// even with a held queue, ahead of it; the person sent something, so the held message follows.
+        #[tokio::test]
+        async fn input_shown_during_a_wake_runs_even_with_a_held_queue() {
+            let (dirs, mesh) = (Dirs::new(), mesh());
+            let model = Arc::new(Gated::default());
+            model.replies.lock().unwrap().extend([say("stopped"), say("worker-1 says hi."), say("News."), say("One.")]);
+            let (bridge, mut rx) = gated_bridge(&dirs, &mesh, model.clone());
+            let port = Port(bridge.clone());
+            held_then_woken(&model, &mesh, &port, &mut rx).await;
+            port.send("what's new?".into());
+            model.release.notify_one();
+            let mut ends = 0;
+            let mut seen = Vec::new();
+            while ends < 3 {
+                let e = next(&mut rx).await;
+                ends += usize::from(matches!(e, UiEvent::TurnEnd { .. }));
+                seen.push(e);
+            }
+            assert!(seen.iter().any(|e| matches!(e, UiEvent::Assistant { text } if text == "One.")), "{seen:?}");
+            let asked = model.seen.lock().unwrap().clone();
+            let n = asked.len();
+            assert!(asked[n - 2].ends_with("what's new?") && asked[n - 1] == "one", "{asked:?}");
+        }
+
+        /// Review on #239: Enter during a wake with a held queue is the person's next message: the hold ends, and once
+        /// the wake finishes the queue runs in order, with no "didn't finish" notice.
+        #[tokio::test]
+        async fn a_message_queued_during_a_wake_releases_a_held_queue() {
+            let (dirs, mesh) = (Dirs::new(), mesh());
+            let model = Arc::new(Gated::default());
+            model.replies.lock().unwrap().extend([say("stopped"), say("worker-1 says hi."), say("One."), say("Two.")]);
+            let (bridge, mut rx) = gated_bridge(&dirs, &mesh, model.clone());
+            let port = Port(bridge.clone());
+            held_then_woken(&model, &mesh, &port, &mut rx).await;
+            port.queue("two".into());
+            assert_eq!(queued_lists(&quiet(&mut rx).await), [vec!["one".to_string(), "two".to_string()]]);
+            model.release.notify_one();
+            let mut ends = 0;
+            let mut seen = Vec::new();
+            while ends < 3 {
+                let e = next(&mut rx).await;
+                ends += usize::from(matches!(e, UiEvent::TurnEnd { .. }));
+                seen.push(e);
+            }
+            assert!(seen.iter().any(|e| matches!(e, UiEvent::Assistant { text } if text == "Two.")), "{seen:?}");
+            assert!(!texts(&seen).iter().any(|t| t.contains("didn't finish") || t.contains("wait")), "{seen:?}");
+            let asked = model.seen.lock().unwrap().clone();
+            assert_eq!(&asked[asked.len() - 2..], ["one", "two"]);
         }
 
         /// A message that lands after a turn's last inbox read (here, during its final reply: no step follows, so it

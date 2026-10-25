@@ -161,7 +161,9 @@ Type `/` to open the command menu: ↑/↓ to choose, Enter to run, Tab or → t
 | Key | Action |
 |---|---|
 | Esc | Stop a reply or a running tool (in a subagent's view: go back) |
+| Enter (while Marv works) | Queue your message: it's listed above the prompt and sent as the next turn when this one finishes. Esc keeps the queue (Enter on an empty prompt then sends the next) |
 | alt+enter or ctrl+s (while Marv works) | Send now: your message goes in at Marv's next step (after the current reply and tool calls), instead of after the turn. Nothing running is stopped |
+| ↑ / ctrl+x (empty input, messages queued) | Take the newest queued message back to edit / drop it |
 | ctrl+c | Stop / clear the input / press twice to quit |
 | ctrl+k | Command palette: search commands, skills, settings (with their values) and keys; Enter flips a toggle |
 | ctrl+o | Show or hide details: what subagents did, and whole diffs |
@@ -366,7 +368,7 @@ model: inherit                       # optional; or a model id on the same provi
 You are a careful code reviewer. Read the diff, then the code around it…
 ```
 
-Put it in `.marv/agents/<name>.md` (this project) or `~/.marv/agents/<name>.md` (all projects); there's also a built-in `general-purpose` agent with every tool. A subagent starts with a fresh conversation that holds only the task it was given, and never gets the `agent`, `memory` or `plan` tools. Only names and descriptions go into the system prompt, so write descriptions that say when to use the agent. A reference like `superpowers:code-reviewer` finds `code-reviewer`, so skills written for Claude Code work unchanged. `/agents` lists what loaded, and why any file didn't.
+Put it in `.marv/agents/<name>.md` (this project) or `~/.marv/agents/<name>.md` (all projects); there are also two built-in agents: `general-purpose`, with every tool, and `explore`, which can only read and search (`read_file`, `grep`, `glob`, `web_fetch`; no edits, no `bash`, no mesh tools, even in yolo) and is the one Marv uses for searches. A file with the same name replaces a built-in one, so `.marv/agents/explore.md` with `model: <a cheaper model>` runs searches on that model (built-ins use the session's model). Keep such a replacement read-only: the agent tool tells the model that `explore` only reads and searches, whatever the file gives it. A subagent starts with a fresh conversation that holds only the task it was given, and never gets the `agent`, `memory` or `plan` tools. Only names and descriptions go into the system prompt, so write descriptions that say when to use the agent. A reference like `superpowers:code-reviewer` finds `code-reviewer`, so skills written for Claude Code work unchanged. `/agents` lists what loaded, and why any file didn't.
 
 ## Checks
 

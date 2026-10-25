@@ -394,7 +394,8 @@ async fn drive(
     let mut sub_ctx = subagent_context(ctx, who, worktree, approver);
     // marv-rs: a plug of its own (no wires), mounted in its sandbox, unplugged when it ends (docs/MESH.md). One that
     // can't be bound leaves it without the mesh, not without its task.
-    let plug = host.mesh.as_ref().and_then(|mesh| mesh.plug_subagent().ok());
+    // The read-only built-in explore gets none (`AgentType::gets_mesh`).
+    let plug = host.mesh.as_ref().filter(|_| agent_type.gets_mesh()).and_then(|mesh| mesh.plug_subagent().ok());
     if let Some(plug) = &plug {
         sub_ctx.sandbox = plug.sandbox(&sub_ctx.sandbox);
     }
@@ -1037,6 +1038,61 @@ mod run_tests {
         run(agent_call(serde_json::json!({"description": "make file", "prompt": "p"}), "a1"), &ctx).await;
         assert!(asker.asked().is_empty());
         assert!(f.root.0.join("made.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn explore_gets_only_the_read_tools_and_cant_change_anything_even_in_yolo() {
+        let f = Fixture::new();
+        let provider = Scripted::new(vec![
+            use_tool("r1", "read_file", serde_json::json!({"path": "notes.txt"})),
+            use_tool("w1", "write_file", serde_json::json!({"path": "made.txt", "content": "hi\n"})),
+            use_tool("e1", "edit_file", serde_json::json!({"path": "notes.txt", "old_string": "milk", "new_string": "eggs"})),
+            use_tool("b1", "bash", serde_json::json!({"command": "touch ran.txt"})),
+            say("The milk."),
+        ]);
+        let (host, _) = f.host(provider.clone(), crate::agents::builtin_agents(), true);
+        let asker = Asker::yes();
+        let mut ctx = ctx_with(host, &asker, &f.root.0);
+        ctx.yolo = true;
+        let out =
+            run(agent_call(serde_json::json!({"type": "explore", "description": "find milk", "prompt": "p"}), "a1"), &ctx).await;
+        assert!(out.result.output.contains("The milk."), "{}", out.result.output);
+        assert_eq!(provider.tool_names(0), ["read_file", "glob", "grep", "web_fetch"]);
+        assert!(!provider.system(0).contains("write_file"), "{}", provider.system(0));
+        let results = provider.results(4);
+        assert!(results[0].contains("remember the milk"), "{results:?}");
+        for refused in &results[1..] {
+            assert!(refused.contains("Unknown tool"), "{results:?}");
+        }
+        assert!(!f.root.0.join("made.txt").exists() && !f.root.0.join("ran.txt").exists());
+        assert_eq!(std::fs::read_to_string(f.root.0.join("notes.txt")).unwrap(), "remember the milk\n");
+        assert!(asker.asked().is_empty());
+    }
+
+    #[tokio::test]
+    async fn with_the_mesh_on_explore_gets_no_mesh_tools_but_other_types_do() {
+        struct NoLog;
+        impl marv_mesh::switchboard::TrajectorySink for NoLog {
+            fn mesh(&self, _record: marv_mesh::switchboard::MeshRecord) {}
+        }
+        let dir = std::env::temp_dir().join(format!("ms-explore-{}-{}", std::process::id(), marv_fs::random_hex()));
+        let mesh = Arc::new(marv_mesh::switchboard::Switchboard::new("s", dir.clone(), Arc::new(NoLog)));
+        let cancel = CancellationToken::new();
+        tokio::spawn(Arc::clone(&mesh).serve(cancel.clone()));
+        let f = Fixture::new();
+        let mut offered = Vec::new();
+        for agent in ["explore", "general-purpose"] {
+            let provider = Scripted::new(vec![say("ok")]);
+            let (host, _) = f.host(provider.clone(), crate::agents::builtin_agents(), true);
+            let mut host = Arc::try_unwrap(host).unwrap_or_else(|_| panic!("host is shared"));
+            host.mesh = Some(crate::mesh::MeshAccess { mesh: mesh.clone(), approver: None });
+            let ctx = ctx_with(Arc::new(host), &Asker::yes(), &f.root.0);
+            run(agent_call(serde_json::json!({"type": agent, "description": "x", "prompt": "p"}), "a1"), &ctx).await;
+            offered.push(provider.tool_names(0).iter().any(|t| t.starts_with("mesh_")));
+        }
+        cancel.cancel();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(offered, [false, true], "explore never gets mesh_list/mesh_call/mesh_send; general-purpose does");
     }
 
     #[tokio::test]

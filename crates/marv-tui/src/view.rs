@@ -563,6 +563,8 @@ pub enum UiEvent {
     NotSent {
         texts: Vec<String>,
     },
+    /// #184: the messages waiting for the running turn to finish, oldest first (all of them, after any change).
+    Queued(Vec<String>),
     ToolStart {
         call_id: String,
         name: String,
@@ -782,6 +784,24 @@ pub trait SessionPort: Send + Sync {
     /// when it went in; [`UiEvent::NotSent`] gives back what never did.
     fn send_now(&self, text: String) {
         let _ = text;
+    }
+
+    /// Enter while a turn runs (#184): `text` waits in the queue and starts its own turn when the running one finishes.
+    /// The engine owns the queue (mesh-woken turns share it) and reports it with [`UiEvent::Queued`]. A turn that
+    /// was stopped (or failed) keeps the queue: nothing starts on its own until the person sends.
+    fn queue(&self, text: String) {
+        let _ = text;
+    }
+
+    /// Takes the newest queued message back out (↑ to edit it, ctrl+x to drop it). None: nothing queued (or it just
+    /// started).
+    fn unqueue_last(&self) -> Option<String> {
+        None
+    }
+
+    /// Takes the oldest queued message out, to send it now (Enter on an empty prompt, idle: the queue a stop kept).
+    fn take_queued(&self) -> Option<String> {
+        None
     }
 
     /// Runs a slash command line (`"/model"`, `"/mcp login github"`). Marv's commands are pure

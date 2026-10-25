@@ -52,7 +52,7 @@ use marv_tools::{AgentProgress, Approver, Decision, PlanHost, PlanItem, ProcessI
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_util::sync::CancellationToken;
 
-use crate::agents::{AgentType, general_purpose};
+use crate::agents::{AgentType, builtin_agents};
 use crate::checkpoints::store::{CheckpointKind, CheckpointStore, SnapshotResult, StoreOptions};
 use crate::checkpoints::turn::CheckpointTurn;
 use crate::checkpoints::undo::{UndoPlan, UndoRefusal, UndoResult, apply_undo, plan_undo, undo_note};
@@ -354,7 +354,7 @@ pub struct SessionInit {
     /// `None`: the project's files weren't loaded.
     pub project_files: Option<(crate::project_trust::ProjectFiles, crate::project_trust::TrustStatus)>,
     pub skills: Vec<LoadedSkill>,
-    /// Agent types the agent tool can start (default: general-purpose).
+    /// Agent types the agent tool can start (default: the built-in ones, explore and general-purpose).
     pub agents: Vec<AgentType>,
     pub memory: Option<(MemoryPaths, Memories)>,
     /// MCP servers, already starting; their tools join once they're ready.
@@ -477,7 +477,7 @@ impl SessionInit {
             nested_trust: Arc::default(),
             project_files: None,
             skills: Vec::new(),
-            agents: vec![general_purpose()],
+            agents: builtin_agents(),
             memory: None,
             mcp: None,
             owns_mcp: false,
@@ -4721,6 +4721,56 @@ mod turn_tests {
         assert!(session.send_now("late").is_err());
     }
 
+    /// #184: steering (Alt+Enter) is the person's own text: it never taints the session, the trajectory logs it, and a
+    /// compaction at the step boundary where it goes in doesn't lose it.
+    #[tokio::test]
+    async fn send_now_doesnt_taint_is_logged_and_survives_a_mid_turn_compaction() {
+        struct TypesDuringTheReply(Scripted, Mutex<Option<MarvSession>>);
+        impl Provider for TypesDuringTheReply {
+            fn name(&self) -> &str {
+                "scripted"
+            }
+            fn context_length(&self) -> Option<u64> {
+                self.0.context_length()
+            }
+            fn stream(&self, history: &[ChatTurn], options: StreamOptions) -> EventStream {
+                if self.0.requests().is_empty() {
+                    lock(&self.1).clone().unwrap().send_now("use https://example.com instead").unwrap();
+                }
+                self.0.stream(history, options)
+            }
+        }
+        let dirs = Dirs::new();
+        let store = Arc::new(TrajectoryStore::new(dirs.dir.join("t")));
+        let scripted_provider =
+            Scripted::new(vec![with(used(900), use_tools(vec![read("c1")])), say("SUMMARY of it all"), say("Finished.")])
+                .with_context(1000);
+        let provider = Arc::new(TypesDuringTheReply(scripted_provider.clone(), Mutex::default()));
+        let session = make(&dirs, fixed(provider.clone()), |i| i.trajectories = Some(store.clone()));
+        *lock(&provider.1) = Some(session.clone());
+        let events = collect(go(&session, "read it")).await;
+        assert_eq!(end_reason(&events), TurnEndReason::Done(StopReason::End));
+        // The person's words, even with a link in them, are no outside text.
+        assert!(session.tainted().is_empty(), "{:?}", session.tainted());
+        assert!(!events.iter().any(|e| matches!(e, SessionEvent::Tainted { .. })));
+        // The step boundary compacted first (the summary is of what came before), then the person's words joined
+        // Marv's note to go on: one user turn, never two in a row, and in the conversation from then on.
+        let requests = scripted_provider.requests();
+        assert_eq!(requests.len(), 3);
+        assert_alternating(&requests);
+        assert!(kinds(&events).contains(&"compacted"));
+        let last = requests[2].0.last().unwrap();
+        assert_eq!(role_of(last), "user");
+        assert!(text_of(last).contains("Continue where you left off"));
+        assert!(text_of(last).ends_with("use https://example.com instead"), "{last:?}");
+        assert!(session.conversation().iter().any(|t| text_of(t).contains("use https://example.com instead")));
+        // Logged to the trajectory as the person's message.
+        let log = records(&store, &dirs.project, &session).await;
+        let sent = log.iter().find(|r| r["type"] == "sent_now").expect("a sent_now record");
+        assert_eq!(sent["text"], "use https://example.com instead");
+        assert!(log.iter().all(|r| r["type"] != "taint"));
+    }
+
     #[tokio::test]
     async fn send_now_the_turn_never_read_comes_back_before_turn_end() {
         let dirs = Dirs::new();
@@ -7803,6 +7853,9 @@ mod turn_tests {
             i.hooks = counting(&dirs);
         });
         session.run_start_hooks();
+        // The first round finishes before the resume replaces it (#228: had the resume killed it before its `echo`, the
+        // second round would count itself as run 1, and the check below couldn't tell the rounds apart).
+        assert_eq!(session.start_hooks_done().await.unwrap()[0].output, "queue run 1\n");
         session.resume(ResumeTarget::Id(old.id())).await.unwrap().unwrap();
         collect(go(&session, "go on")).await;
         let history = &provider.requests()[0].0;
@@ -7810,6 +7863,7 @@ mod turn_tests {
         let last = text_of(history.last().unwrap());
         assert!(last.contains("queue run 2") && last.ends_with("\n\ngo on"), "{last}");
         assert!(!last.contains("queue run 1"), "the replaced round's output is dropped");
+        assert_eq!(runs(&dirs), 2);
         // Their saves land before the folders go (#212's CI: a late save left the temp folder behind).
         session.close().await;
         old.close().await;
@@ -7984,13 +8038,26 @@ mod turn_tests {
         assert_eq!(runs(&dirs), 1);
     }
 
-    /// A hook still running after 3 s writes `late`: only killing its group stops that.
+    /// A hook still running after 3 s writes `late`: only killing its group stops that. It writes `started` once that
+    /// background job is under way.
     fn slow(dirs: &Dirs) -> HookCommand {
-        let late = dirs.dir.join("late");
+        let (late, started) = (dirs.dir.join("late"), dirs.dir.join("started"));
         HookCommand {
             timeout: std::time::Duration::from_secs(60),
-            ..hook(&format!("(sleep 3; touch '{}') >/dev/null 2>&1 & sleep 60", late.display()))
+            ..hook(&format!("(sleep 3; touch '{}') >/dev/null 2>&1 & touch '{}'; sleep 60", late.display(), started.display()))
         }
+    }
+    /// Until [`slow`]'s hook has started its background job (#228: a fixed 300 ms wasn't always enough on a busy
+    /// macOS runner, so close() could land before the hook had got that far).
+    async fn slow_started(dirs: &Dirs) {
+        let started = dirs.dir.join("started");
+        for _ in 0..200 {
+            if started.exists() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("the hook never started");
     }
 
     // Greptile on #115: close() stops session-start hooks still running, with what they started, and waits for them.
@@ -7999,7 +8066,7 @@ mod turn_tests {
         let dirs = Dirs::new();
         let session = scripted(&dirs, &Scripted::new(vec![]), |i| i.hooks = vec![slow(&dirs)]);
         session.run_start_hooks();
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        slow_started(&dirs).await;
         let started = std::time::Instant::now();
         session.close().await;
         assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
@@ -8014,7 +8081,7 @@ mod turn_tests {
         let dirs = Dirs::new();
         let session = scripted(&dirs, &Scripted::new(vec![]), |i| i.hooks = vec![slow(&dirs)]);
         session.run_start_hooks();
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        slow_started(&dirs).await;
         session.clear().await.unwrap(); // a new round: the first one's commands are killed
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         session.close().await;
