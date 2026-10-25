@@ -22,4 +22,18 @@ fn the_oracles_reworded_text_matches_what_marv_rs_sends() {
     // The `.git` placeholder sentence, which Marv doesn't have.
     let (placeholder, nothing) = MARV_RS_TEXT[4];
     assert!(placeholder == marv_session::prompt::GIT_PLACEHOLDER && nothing.is_empty());
+    // #186: the built-in explore type's line in the agent list, and the agent tool's sentence about it.
+    let agents = system_prompt(&PromptInput {
+        tools: vec!["read_file".into(), "agent".into()],
+        agents: marv_session::agents::builtin_agents()
+            .iter()
+            .map(|a| marv_session::prompt::Listed { name: a.name.clone(), description: a.description.clone() })
+            .collect(),
+        ..Default::default()
+    });
+    let (explore_listed, nothing) = MARV_RS_TEXT[5];
+    assert!(agents.contains(explore_listed) && nothing.is_empty(), "MARV_RS_TEXT[5] isn't explore's line:\n{agents}");
+    let (explore_sentence, nothing) = MARV_RS_TEXT[6];
+    assert!(explore_sentence == marv_tools::agent::EXPLORE_SENTENCE && nothing.is_empty());
+    assert!(marv_tools::agent::AGENT_DESCRIPTION.ends_with(explore_sentence));
 }

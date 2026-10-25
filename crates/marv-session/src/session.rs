@@ -52,7 +52,7 @@ use marv_tools::{AgentProgress, Approver, Decision, PlanHost, PlanItem, ProcessI
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_util::sync::CancellationToken;
 
-use crate::agents::{AgentType, general_purpose};
+use crate::agents::{AgentType, builtin_agents};
 use crate::checkpoints::store::{CheckpointKind, CheckpointStore, SnapshotResult, StoreOptions};
 use crate::checkpoints::turn::CheckpointTurn;
 use crate::checkpoints::undo::{UndoPlan, UndoRefusal, UndoResult, apply_undo, plan_undo, undo_note};
@@ -354,7 +354,7 @@ pub struct SessionInit {
     /// `None`: the project's files weren't loaded.
     pub project_files: Option<(crate::project_trust::ProjectFiles, crate::project_trust::TrustStatus)>,
     pub skills: Vec<LoadedSkill>,
-    /// Agent types the agent tool can start (default: general-purpose).
+    /// Agent types the agent tool can start (default: the built-in ones, explore and general-purpose).
     pub agents: Vec<AgentType>,
     pub memory: Option<(MemoryPaths, Memories)>,
     /// MCP servers, already starting; their tools join once they're ready.
@@ -477,7 +477,7 @@ impl SessionInit {
             nested_trust: Arc::default(),
             project_files: None,
             skills: Vec::new(),
-            agents: vec![general_purpose()],
+            agents: builtin_agents(),
             memory: None,
             mcp: None,
             owns_mcp: false,

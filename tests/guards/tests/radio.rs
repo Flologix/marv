@@ -1866,21 +1866,28 @@ async fn a_request_waits_while_busy_and_is_read_only_at_a_turns_start() {
         say("Handled alpha's request."),
     ]);
     let (asker, landed) = (alpha.radio.clone(), beta.sb.clone());
-    let id = Arc::new(Mutex::new(String::new()));
-    let keep = id.clone();
+    let sent = Arc::new(Mutex::new(None));
+    let keep = sent.clone();
     *model.hook.lock().unwrap() = Some((
         0,
         Box::new(move || {
-            *keep.lock().unwrap() = asker.send_request("beta", By::Model, 0, "while you're busy").unwrap();
+            // From a thread of its own: this hook blocks a runtime worker, and a send from it would wake the link's
+            // writer into that worker's LIFO slot, where no other worker takes it, so the frame would only go out
+            // after the hook gave up, racing the turn's end (#240).
+            let id = std::thread::spawn(move || asker.send_request("beta", By::Model, 0, "while you're busy").unwrap())
+                .join()
+                .unwrap();
             let deadline = Instant::now() + Duration::from_secs(5);
             while landed.unread_radio().is_empty() && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(10));
             }
+            *keep.lock().unwrap() = Some((id, !landed.unread_radio().is_empty()));
         }),
     ));
     let b = session(&beta, pb.path(), model.clone(), None, false, |_| {});
     finish(b.send("read the notes", Default::default()).unwrap()).await;
-    let id = id.lock().unwrap().clone();
+    let (id, landed_mid_turn) = sent.lock().unwrap().clone().expect("the hook ran");
+    assert!(landed_mid_turn, "the request landed while the turn ran");
     assert!(!format!("{:?}", model.requests()[1].0).contains("kind=\\\"request\\\""), "not read between steps");
     assert!(beta.sb.unread_radio().iter().any(|m| m.kind == Kind::Request), "still waiting");
     until("the ack", 5, || alpha.sb.unread_radio().iter().any(|m| m.kind == Kind::Ack)).await;

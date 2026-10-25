@@ -34,7 +34,7 @@ pub enum Source {
 pub struct Loaded {
     pub instructions: Option<Instructions>,
     pub skills: Vec<LoadedSkill>,
-    /// Always has the built-in general-purpose type.
+    /// Always has the built-in types (explore, general-purpose), unless an agent file replaces one.
     pub agents: Vec<AgentType>,
     pub memory: Option<(MemoryPaths, Memories)>,
     pub mcp_servers: Vec<McpServerConfig>,

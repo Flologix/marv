@@ -2079,12 +2079,13 @@ impl Radio {
             None,
             None,
         )?;
+        // `send_frame` opened the request before queueing its frame; refused, nothing went out: it's closed again.
         match report.refused.first() {
-            Some((_, why)) => Err(why.clone()),
-            None => {
-                self.outgoing().insert(report.id.clone(), Outgoing { peer, hop, acked: false });
-                Ok(report.id)
+            Some((_, why)) => {
+                self.outgoing().remove(&report.id);
+                Err(why.clone())
             }
+            None => Ok(report.id),
         }
     }
 
@@ -2266,6 +2267,12 @@ impl Radio {
                 "this message makes a {}-byte frame, over the radio's {MAX_FRAME_LINE}: nothing was sent (it's refused, never cut)",
                 line.len()
             ));
+        }
+        // A request is open before its frame is queued: the link's writer may send it at once, and the peer's ack (or
+        // refusal) can come back before this returns. Opened after, that ack was refused here as "for no open request"
+        // and the model never read it (#213). `send_request` closes it again when the frame isn't sent.
+        if let (Kind::Request, [peer]) = (kind, targets) {
+            self.outgoing().insert(id.clone(), Outgoing { peer: peer.clone(), hop, acked: false });
         }
         let chatter = !kind.is_reply();
         let mut report = SendReport { id: id.clone(), ..SendReport::default() };

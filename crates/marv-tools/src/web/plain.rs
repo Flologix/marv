@@ -626,15 +626,19 @@ mod tests {
 
     #[test]
     fn plain_text_stays_linear_on_input_built_to_make_a_scanner_backtrack() {
-        // The fastest of three runs, so a pause doesn't count.
+        // Wall-clock on a shared runner counts the time other jobs hold the core, and a long run loses more of it
+        // than a short one. So: time on this thread's CPU clock, compare 1x against 4x input (linear grows 4x,
+        // quadratic 16x), alternate the two sizes so a cache or frequency dip hits both, keep the fastest of five
+        // runs of each, and fail only past 8x, the midpoint between the two on a log scale.
+        use nix::time::{ClockId, clock_gettime};
+        let cpu_ms = || {
+            let t = clock_gettime(ClockId::CLOCK_THREAD_CPUTIME_ID).expect("thread CPU clock");
+            t.tv_sec() as f64 * 1000.0 + t.tv_nsec() as f64 / 1e6
+        };
         let time = |html: &str| {
-            (0..3)
-                .map(|_| {
-                    let start = std::time::Instant::now();
-                    plain_text(html, MAX_CHARS);
-                    start.elapsed().as_secs_f64() * 1000.0
-                })
-                .fold(f64::INFINITY, f64::min)
+            let start = cpu_ms();
+            plain_text(html, MAX_CHARS);
+            cpu_ms() - start
         };
         for unit in [
             "<script",
@@ -650,10 +654,15 @@ mod tests {
             "<p style='/*/*/*'>",
             "<p class='sr-only'>",
         ] {
-            let n = 50_000;
-            let once = time(&unit.repeat(n));
-            let twice = time(&unit.repeat(2 * n));
-            assert!(twice < once * 3.0 + 50.0, "{unit}: {once} ms, then {twice} ms"); // linear doubles; quadratic quadruples
+            let n = 20_000;
+            let (small, large) = (unit.repeat(n), unit.repeat(4 * n));
+            let (mut once, mut four) = (f64::INFINITY, f64::INFINITY);
+            for _ in 0..5 {
+                once = once.min(time(&small));
+                four = four.min(time(&large));
+            }
+            // The 1 ms floor keeps jitter on a sub-millisecond run from tripping the ratio.
+            assert!(four < once.max(1.0) * 8.0, "{unit}: {once:.1} ms for {n} repeats, then {four:.1} ms for 4x");
         }
     }
 
