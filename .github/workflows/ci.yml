@@ -108,6 +108,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: DEBUG ps sigignore (temporary, #196)
+        run: |
+          set -x
+          /bin/ps -o sigignore= -p $$ 2>&1 || echo "exit $?"
+          /bin/ps -o ignored= -p $$ 2>&1 || echo "exit $?"
+          /bin/ps -o pid,sigignore,sigcatch,sigmask -p $$ 2>&1 || echo "exit $?"
+          sh -c 'trap "" HUP; /bin/ps -o pid,sigignore,ignored,sigcatch -p $$ 2>&1; /bin/ps -L 2>&1 | tr "\n" " "' || echo "exit $?"
+          nohup sh -c '/bin/ps -o pid,sigignore -p $$ 2>&1' ; cat nohup.out || true
+          exit 1
       - name: Require a working sandbox
         run: /usr/bin/sandbox-exec -p '(version 1)(allow default)' /usr/bin/true
       - run: cargo check --workspace --all-targets
