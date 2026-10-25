@@ -121,4 +121,3 @@ jobs:
           cargo build -p marv-cli
           packaging/package.sh "$target" target/debug/marv "$RUNNER_TEMP/assets"
           packaging/smoke.sh "$target" "$RUNNER_TEMP/assets"
-
