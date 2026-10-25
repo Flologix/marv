@@ -142,7 +142,11 @@ impl StatusBar<'_> {
     /// The left side: yolo and the hint (never cut off).
     pub fn left(&self) -> Line<'static> {
         let hint = if self.confirm_exit {
-            "Press ctrl+c again to exit".to_string()
+            match self.queued {
+                0 => "Press ctrl+c again to exit".to_string(),
+                1 => "Press ctrl+c again to exit (1 queued message will be dropped)".to_string(),
+                n => format!("Press ctrl+c again to exit ({n} queued messages will be dropped)"),
+            }
         } else if let Some(flash) = self.flash {
             printable(flash)
         } else if self.busy {

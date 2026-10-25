@@ -6,14 +6,19 @@ export type Queue = { texts: string[]; held: boolean };
 
 export const EMPTY: Queue = { texts: [], held: false };
 
-/** Enter while a turn runs: last in line. */
+/** Enter while a turn runs: last in line. The person sent another message, so a held queue goes on again. */
 export function push(q: Queue, text: string): Queue {
-  return { ...q, texts: [...q.texts, text] };
+  return { texts: [...q.texts, text], held: false };
 }
 
 /** "Send now" text the turn never read (it ended first): ahead of what was queued after it. */
 export function unread(q: Queue, texts: string[]): Queue {
   return texts.length ? { ...q, texts: [...texts, ...q.texts] } : q;
+}
+
+/** A queued message the host refused (a mesh wake took the session first): first in line again, to go when idle. */
+export function refused(q: Queue, text: string): Queue {
+  return { ...q, texts: [text, ...q.texts] };
 }
 
 /** Takes entry `i` out (to edit it, to drop it, or the oldest to send now). An empty queue holds nothing. */

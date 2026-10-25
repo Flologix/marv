@@ -337,6 +337,8 @@ pub struct App {
     /// #184: the messages queued for after the running turn, oldest first, as the engine last listed them
     /// ([`UiEvent::Queued`]); shown above the prompt.
     queued: Vec<String>,
+    /// `/exit` with messages queued said they'd be dropped (#184): the next `/exit` leaves.
+    exit_warned: bool,
     /// The plan tool's list (#15), pinned above the prompt while it has something left to do.
     plan: Option<Vec<PlanItem>>,
     waiting_for: Option<String>,
@@ -431,6 +433,7 @@ impl App {
             agents_running: 0,
             sending: 0,
             queued: Vec::new(),
+            exit_warned: false,
             plan: None,
             waiting_for: None,
             compacting: false,
@@ -870,6 +873,7 @@ impl App {
             }
             // #184: the queue changed (a message queued, edited, dropped or started).
             UiEvent::Queued(list) => {
+                self.exit_warned &= !list.is_empty();
                 self.queued = list;
                 self.dirty = true;
             }
@@ -1587,6 +1591,13 @@ impl App {
         }
         self.prompt.remember(&text);
         self.prompt.history_index = None;
+        // Leaving drops the queue (#184): the first `/exit` with messages queued says so, the next one leaves.
+        if text.eq_ignore_ascii_case("/exit") && !self.queued.is_empty() && !self.exit_warned {
+            self.exit_warned = true;
+            let n = self.queued.len();
+            let what = if n == 1 { "1 queued message".to_string() } else { format!("{n} queued messages") };
+            return self.system(format!("✻ Leaving drops your {what}: /exit again to leave anyway."));
+        }
         if text.starts_with('/') {
             self.port.run_command(text);
         } else {
@@ -2486,6 +2497,25 @@ mod tests {
         assert_eq!(h.app.queued, ["two"]);
         assert!(h.app.busy());
         assert!(h.frame().contains("> one"));
+    }
+
+    /// Review on #239: leaving drops the queue, so the first `/exit` (or ctrl+c) says how many go; the next leaves.
+    #[test]
+    fn leaving_with_messages_queued_warns_first() {
+        let mut h = harness();
+        h.typed("go");
+        h.events([UiEvent::TurnStart { turn: "t".into() }]);
+        enter(&mut h, "one");
+        enter(&mut h, "two");
+        h.events([UiEvent::Done(StopReason::Aborted), turn_end()]);
+        h.typed("/exit");
+        assert!(!h.calls().contains(&Call::Command("/exit".into())));
+        assert!(h.frame().contains("Leaving drops your 2 queued messages"));
+        h.typed("/exit");
+        assert_eq!(h.calls().last(), Some(&Call::Command("/exit".into())));
+        // ctrl+c's confirm says it too.
+        h.ctrl('c');
+        assert!(h.frame().contains("Press ctrl+c again to exit (2 queued messages will be dropped)"), "{}", h.frame());
     }
 
     #[test]

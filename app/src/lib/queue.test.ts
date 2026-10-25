@@ -1,7 +1,7 @@
 // `npm test`: plain Node (node:test), the TypeScript stripped.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { EMPTY, afterTurn, push, release, take, unread } from "./queue.ts";
+import { EMPTY, afterTurn, push, refused, release, take, unread } from "./queue.ts";
 
 test("a finished turn sends the oldest queued message next, one per turn", () => {
   const q = push(push(EMPTY, "run the tests"), "then lint");
@@ -35,4 +35,19 @@ test("send-now text the turn never read goes first; take edits, drops or sends o
   // Emptied, a held queue holds nothing any more.
   const emptied = take({ texts: ["x"], held: true }, 0);
   assert.deepEqual(emptied, { text: "x", queue: EMPTY });
+});
+
+test("Enter during a turn releases a held queue: after a woken turn that finishes, it goes on in order", () => {
+  const held = afterTurn(push(EMPTY, "one"), "aborted").queue;
+  const q = push(held, "two");
+  assert.deepEqual(q, { texts: ["one", "two"], held: false });
+  assert.equal(afterTurn(q, "end").next, "one");
+});
+
+test("a queued message the host refused goes first again and is sent once the turn that took the session ends", () => {
+  const sent = afterTurn(push(push(EMPTY, "one"), "two"), "end");
+  assert.equal(sent.next, "one");
+  const back = refused(sent.queue, "one");
+  assert.deepEqual(back, { texts: ["one", "two"], held: false });
+  assert.equal(afterTurn(back, "end").next, "one");
 });

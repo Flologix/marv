@@ -95,16 +95,23 @@ export function useChat(id: string | null, settings: ChatSettings, reload = 0) {
   const [sending, setSending] = useState(0);
   /** #184: messages queued for after the running turn (`queue.ts`); the ref is what the event handler reads. */
   /** Kept with the chat it belongs to: another chat starts with none. */
-  const [owned, setOwned] = useState<{ id: string | null; queue: Q.Queue }>({ id, queue: Q.EMPTY });
-  const queue = owned.id === id ? owned.queue : Q.EMPTY;
-  const queueRef = useRef<{ id: string | null; queue: Q.Queue }>({ id, queue: Q.EMPTY });
+  /** One per chat id (the page's alone: a reload starts with none). Another chat's waits for its return. */
+  const [queues, setQueues] = useState<Record<string, Q.Queue>>({});
+  const queue = (id !== null && queues[id]) || Q.EMPTY;
+  const queuesRef = useRef<Record<string, Q.Queue>>({});
   const idRef = useRef(id);
   /** The open chat's queue, as the handlers see it. */
-  const currentQueue = useCallback(() => (queueRef.current.id === idRef.current ? queueRef.current.queue : Q.EMPTY), []);
+  const currentQueue = useCallback(() => (idRef.current !== null && queuesRef.current[idRef.current]) || Q.EMPTY, []);
   const setQueue = useCallback((q: Q.Queue) => {
-    queueRef.current = { id: idRef.current, queue: q };
-    setOwned(queueRef.current);
+    const key = idRef.current;
+    if (key === null) return;
+    queuesRef.current = { ...queuesRef.current, [key]: q };
+    setQueues(queuesRef.current);
   }, []);
+  /** A queued message sent and not started yet: refused (a mesh wake took the session first), it's queued again. */
+  const inFlight = useRef<string | null>(null);
+  /** A turn runs (from its turn_start to its usage). */
+  const running = useRef(false);
   /** How the last turn ended, until its usage closes it. */
   const lastEnd = useRef<string | null>(null);
   /** `send`, for the event handler (declared below it). */
@@ -199,8 +206,15 @@ export function useChat(id: string | null, settings: ChatSettings, reload = 0) {
           setStatus("failed");
           setBusy(false);
         } else {
-          if (e.type === "turn_start") setBusy(true);
-          if (e.type === "usage") setBusy(false);
+          if (e.type === "turn_start") {
+            setBusy(true);
+            running.current = true;
+            inFlight.current = null;
+          }
+          if (e.type === "usage") {
+            setBusy(false);
+            running.current = false;
+          }
           if (e.type === "sent_now") setSending((n) => Math.max(0, n - 1));
           if (e.type === "turn_end") setSending(0);
           // "Send now" text the turn never read: first in the queue, where the turn's end decides (#184).
@@ -213,6 +227,18 @@ export function useChat(id: string | null, settings: ChatSettings, reload = 0) {
             if (typeof e.seq === "number") applied.current = e.seq;
             return apply(items, e);
           });
+          // The host refused the queued message just sent (a mesh wake started first): back to the front of the queue
+          // and out of the transcript; it goes when that turn ends.
+          if (e.type === "error" && inFlight.current !== null) {
+            const text = inFlight.current;
+            inFlight.current = null;
+            setQueue(Q.refused(currentQueue(), text));
+            setItems((items) => {
+              const at = items.findLastIndex((it) => it.kind === "user" && it.text === text);
+              return at < 0 ? items : [...items.slice(0, at), ...items.slice(at + 1)];
+            });
+            if (!running.current) setBusy(false);
+          }
           // The turn is over once its usage came (the host sends it after turn_end, and it ends `busy`): after a turn
           // that finished the oldest queued message goes next; after a stop they wait.
           if (e.type === "turn_end") lastEnd.current = String(e.reason);
@@ -220,7 +246,10 @@ export function useChat(id: string | null, settings: ChatSettings, reload = 0) {
             const { next, queue } = Q.afterTurn(currentQueue(), lastEnd.current);
             lastEnd.current = null;
             setQueue(queue);
-            if (next !== undefined) sendRef.current(next);
+            if (next !== undefined) {
+              inFlight.current = next;
+              sendRef.current(next);
+            }
           }
         }
       })
@@ -310,7 +339,10 @@ export function useChat(id: string | null, settings: ChatSettings, reload = 0) {
   const sendQueued = useCallback(() => {
     const { text, queue } = Q.take(currentQueue(), 0);
     setQueue(queue);
-    if (text !== undefined) send(text);
+    if (text !== undefined) {
+      inFlight.current = text;
+      send(text);
+    }
   }, [currentQueue, send, setQueue]);
 
   const interrupt = useCallback(() => connection.current?.send({ type: "interrupt" }), []);
