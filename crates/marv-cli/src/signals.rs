@@ -151,30 +151,75 @@ mod tests {
         assert!(!ignored(nix::libc::SIGTERM));
     }
 
-    // The workspace lint is `deny`, not `forbid`, only so that `ignored` can allow its one call: any other
-    // `allow(unsafe_code)` in the workspace's sources fails here.
+    // The workspace lint is `deny`, not `forbid`, only so that `ignored` can allow its one call. The lint's name (built
+    // with concat! here, so this file holds it once) may appear nowhere else in the workspace's Rust sources: not in
+    // allow, expect or warn, a list of lints, a cfg_attr, or a crate-level attribute. And every member's Cargo.toml
+    // takes the workspace's lints and sets none of its own.
     #[test]
-    fn ignored_is_the_only_unsafe_code() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    fn ignored_holds_the_only_unsafe_allowance() {
+        let lint = concat!("unsafe", "_code");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
         let mut found = Vec::new();
-        let mut dirs = vec![root.join("crates"), root.join("app")];
+        let mut dirs = vec![root.join("crates"), root.join("app/src-tauri"), root.join("tests")];
         while let Some(dir) = dirs.pop() {
             let Ok(entries) = std::fs::read_dir(&dir) else { continue };
             for entry in entries.flatten() {
                 let path = entry.path();
                 let name = entry.file_name();
-                if path.is_dir() && name != "target" && name != "node_modules" {
-                    dirs.push(path);
-                } else if path.extension().is_some_and(|e| e == "rs")
-                    && std::fs::read_to_string(&path).is_ok_and(|t| t.contains(concat!("allow(", "unsafe_code)")))
-                {
-                    found.push(path.strip_prefix(&root).unwrap().display().to_string());
+                if path.is_dir() {
+                    if name != "target" && name != "node_modules" && name != "gen" {
+                        dirs.push(path);
+                    }
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else { continue };
+                let relative = path.strip_prefix(&root).unwrap().display().to_string();
+                let rust = path.extension().is_some_and(|e| e == "rs");
+                for (n, line) in text.lines().enumerate() {
+                    if (rust || name == "Cargo.toml") && line.contains(lint) {
+                        found.push((relative.clone(), n + 1, line.trim().to_string()));
+                    }
                 }
             }
         }
-        assert_eq!(found, ["crates/marv-cli/src/signals.rs"]);
+        let allowed = ("crates/marv-cli/src/signals.rs".to_string(), concat!("#[allow(", "unsafe", "_code)]").to_string());
+        assert_eq!(
+            found.iter().map(|(file, _, line)| (file.clone(), line.clone())).collect::<Vec<_>>(),
+            [allowed],
+            "the lint's name outside the one allowed site: {found:?}"
+        );
+        // The allowed attribute is on `ignored`, and that file has one unsafe block.
         let this = std::fs::read_to_string(root.join("crates/marv-cli/src/signals.rs")).unwrap();
-        assert_eq!(this.matches(concat!("#[allow(", "unsafe_code)]")).count(), 1, "one function");
+        let line = found[0].1;
+        let next = this.lines().skip(line).find(|l| !l.trim().is_empty()).unwrap_or_default();
+        assert!(next.starts_with("fn ignored("), "on {next:?}");
         assert_eq!(this.matches(concat!("unsafe", " {")).count(), 1, "one block");
+
+        // Every member takes the workspace's lints, and the workspace denies the lint.
+        let manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        assert!(manifest.contains("[workspace.lints.rust]\n"), "workspace lints");
+        assert!(manifest.lines().any(|l| l.trim() == format!("{lint} = \"deny\"")), "the workspace denies it");
+        let mut members = Vec::new();
+        for dir in ["crates", "tests", "app"] {
+            for entry in std::fs::read_dir(root.join(dir)).unwrap().flatten() {
+                let toml = entry.path().join("Cargo.toml");
+                if toml.is_file() {
+                    members.push(toml);
+                }
+            }
+        }
+        assert!(members.len() >= 15, "found the members: {members:?}");
+        for toml in members {
+            let text = std::fs::read_to_string(&toml).unwrap();
+            let lints: Vec<&str> = text
+                .lines()
+                .skip_while(|l| l.trim() != "[lints]")
+                .skip(1)
+                .take_while(|l| !l.starts_with('['))
+                .filter(|l| !l.trim().is_empty() && !l.trim().starts_with('#'))
+                .collect();
+            assert_eq!(lints, ["workspace = true"], "{}: [lints] must be just `workspace = true`", toml.display());
+            assert!(!text.contains("[lints."), "{}: no lint tables of its own", toml.display());
+        }
     }
 }
