@@ -4,5 +4,3 @@
 /evals/node_modules
 /evals/results
 
-# marv-web's default data folder (workspaces, sessions).
-/.marv-web/

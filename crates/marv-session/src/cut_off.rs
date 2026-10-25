@@ -115,7 +115,7 @@ impl OpenTurn {
 
 /// The turn was saved by another process that's still running: that Marv is still in the turn, not cut off. Its pid
 /// may have been reused by an unrelated process since (then the mark is left out: a known limit, the safe side).
-/// The same process (a desktop chat reopened, a test) is never "another".
+/// The same process (a session reopened by an SDK host, a test) is never "another".
 pub fn saved_by_another_live_marv(pid: Option<u32>) -> bool {
     let Some(pid) = pid.filter(|p| *p != std::process::id() && *p != 0) else { return false };
     if cfg!(target_os = "linux") {

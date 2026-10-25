@@ -160,14 +160,14 @@ mod tests {
         let lint = concat!("unsafe", "_code");
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
         let mut found = Vec::new();
-        let mut dirs = vec![root.join("crates"), root.join("app/src-tauri"), root.join("tests")];
+        let mut dirs = vec![root.join("crates"), root.join("tests")];
         while let Some(dir) = dirs.pop() {
             let Ok(entries) = std::fs::read_dir(&dir) else { continue };
             for entry in entries.flatten() {
                 let path = entry.path();
                 let name = entry.file_name();
                 if path.is_dir() {
-                    if name != "target" && name != "node_modules" && name != "gen" {
+                    if name != "target" {
                         dirs.push(path);
                     }
                     continue;
@@ -200,7 +200,7 @@ mod tests {
         assert!(manifest.contains("[workspace.lints.rust]\n"), "workspace lints");
         assert!(manifest.lines().any(|l| l.trim() == format!("{lint} = \"deny\"")), "the workspace denies it");
         let mut members = Vec::new();
-        for dir in ["crates", "tests", "app"] {
+        for dir in ["crates", "tests"] {
             for entry in std::fs::read_dir(root.join(dir)).unwrap().flatten() {
                 let toml = entry.path().join("Cargo.toml");
                 if toml.is_file() {
@@ -208,7 +208,7 @@ mod tests {
                 }
             }
         }
-        assert!(members.len() >= 15, "found the members: {members:?}");
+        assert!(members.len() >= 13, "found the members: {members:?}");
         for toml in members {
             let text = std::fs::read_to_string(&toml).unwrap();
             let lints: Vec<&str> = text

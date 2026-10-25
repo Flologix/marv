@@ -16,7 +16,7 @@ use marv_mcp::manager::{McpServerStatus, McpState};
 
 use crate::approvals::APPROVE_PREFIXES;
 
-/// `/permissions` with anything after it, in the TUI and the desktop alike.
+/// `/permissions` with anything after it, in the TUI.
 pub const PERMISSIONS_USAGE: &str = "Usage: /permissions (it only shows them)";
 
 /// The session's grants, as they are now.
@@ -42,7 +42,7 @@ pub struct Permissions {
     pub approved_urls: Vec<String>,
 }
 
-/// What the person's own config file saves (it outlasts the session). The desktop has none to show.
+/// What the person's own config file saves (it outlasts the session). An SDK host may have none to show.
 #[derive(Debug, Clone, Copy)]
 pub struct SavedGrants<'a> {
     /// As shown ("~/.marv/config.json").

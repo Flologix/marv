@@ -8,7 +8,7 @@
 //! later write would drop the earlier one's change: two appends would keep only one. Each file's read-change-write runs
 //! after the previous one on the same path has finished. Entries are forgotten once nothing is queued behind them.
 //!
-//! marv-rs: the same holds across processes (two Marv sessions in one folder, a TUI and the desktop). Inside the queue
+//! marv-rs: the same holds across processes (two Marv sessions in one folder, a TUI and `marv -p`). Inside the queue
 //! a call also takes an advisory lock (`flock`) on a per-file lock file in `ToolContext::file_locks` (the runtime
 //! folder's `file-locks/`, or `~/.marv/file-locks/` where there's no runtime folder), so the edit tools' check that
 //! the file is still as the session last saw it ([`crate::file_versions`]) and their write are one step: two writers

@@ -10,6 +10,10 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 - **Diagnostics per language (#187).** `"diagnostics"` in `~/.marv/config.json` still takes `true` or `false` (every language), and now also an object, like `{"typescript": true, "rust": false}`, where a language left out stays on. `/diagnostics rust off` (or `typescript`, `python`, `go`) switches one language and saves it; `/diagnostics on|off` still switches them all. `/diagnostics` lists each language and its checker's state. Only TypeScript has a checker so far (the project's own tsc, unchanged); the others are the groundwork for the coming cargo check, pyright and go vet checkers, along with `/diagnostics clear`, which deletes this project's check cache.
 
+### Removed
+
+- **The desktop app and the browser UI.** The desktop app (`app/`) and the browser UI (`marv-web`) are no longer part of Marv: Marv is the terminal coding agent. Releases up to 0.11.0 keep them in their source. The `marv` command, `marv -p` and the mesh are unchanged.
+
 ## [0.11.0] - 2026-10-25
 
 ### Added

@@ -7,7 +7,7 @@
 - Scope:
   - `crates/marv-session`: `diagnostics/` (the machinery, new check kinds, the check cache), `session.rs` (wiring), `config.rs` (the setting), `commands.rs` (`/diagnostics`);
   - `crates/marv-sandbox`: a Seatbelt test for the cache mount; possibly a `TOOLCHAINS` entry for uv's Pythons (§6.5, its own PR);
-  - `crates/marv-cli` (TUI) and `crates/marv-web`: showing the new results;
+  - `crates/marv-cli` (TUI): showing the new results;
   - phase 2 only: a long-lived sandboxed stdio child and a small LSP client.
 
 ## 1. Summary
@@ -206,7 +206,7 @@ My estimate is that phase 1 gets about 80% of the value for about 10–20% of th
    - gopls: hundreds of MB;
    - pyright: 200 MB–1 GB.
 
-   Often that's on top of the same servers in the user's editor. With several Marv sessions (mesh, desktop background chats) it multiplies.
+   Often that's on top of the same servers in the user's editor. With several Marv sessions (mesh, subagents) it multiplies.
 
 **Crates** (if phase 2 happens):
 
@@ -230,7 +230,7 @@ Neither beats `cargo check` or `go vet` for this use.
 
 ### 6.1 Machinery changes (`diagnostics/turn.rs`)
 
-1. **One problem type:** rename `TsError` to `Diagnostic { file, line, column, code, message }`, a struct that already fits all four tools. tsc's parser keeps returning it. `CheckResult` stays `CheckOutcome<Diagnostic>`. Each kind's `Checker` gets a `label` ("tsc", "cargo check", "pyright", "go vet") for notices, the note's intro and `check_record`'s `source`. The event becomes `SessionEvent::Check { label, result }`, and the TUI/web show "✻ cargo check: 2 new errors, told the model:".
+1. **One problem type:** rename `TsError` to `Diagnostic { file, line, column, code, message }`, a struct that already fits all four tools. tsc's parser keeps returning it. `CheckResult` stays `CheckOutcome<Diagnostic>`. Each kind's `Checker` gets a `label` ("tsc", "cargo check", "pyright", "go vet") for notices, the note's intro and `check_record`'s `source`. The event becomes `SessionEvent::Check { label, result }`, and the TUI shows "✻ cargo check: 2 new errors, told the model:".
 2. **Per-kind policy on `CheckKind`**, with defaults that keep tsc's behaviour:
    - `timeout()` (60 s);
    - `warm_up()` (none; §6.2);
@@ -445,7 +445,7 @@ The spike is its own spec. It needs:
    - `Pending`, the warm-up at first edit, the per-key `flock`, `MAX_UNREADABLE`;
    - the cache: key per repo, create, mount, caps, LRU, free-space guard, age and orphan pruning, clear;
    - the setting's object form and `/diagnostics` per language;
-   - the TUI/web notices.
+   - the TUI notices.
 
    No new language yet; tsc's behaviour is unchanged. Tests:
    - tsc's existing tests pass unchanged after the rename;
