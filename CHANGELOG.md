@@ -6,6 +6,10 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+### Fixed
+
+- **A stopped or timed-out command no longer leaves behind a process it was starting (#228).** When a command (a bash call, a session-start hook) is killed, Marv kills its process group once more as the command exits, before reaping it. On macOS a child still being forked when the first kill landed could miss it and go on running.
+
 ## [0.10.0] - 2026-10-24
 
 ### Added
