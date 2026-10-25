@@ -598,10 +598,11 @@ fn host_spawn_probe(markers: &Path) {
     assert_eq!(left(), ["git"], "the marker PATH doesn't work");
 }
 
-/// `low_priority` runs the whole command, pipes and all, niced, with its environment.
+/// `low_priority` runs the whole command, pipes and all, niced, with its environment. (`ps -o nice=`, since a bare
+/// `nice` doesn't print the niceness on macOS.)
 #[test]
 fn low_priority_wraps_the_whole_command() {
-    let command = low_priority(&[("GREETING", "it's me".to_string())], "echo \"$GREETING\" | tr a-z A-Z && nice");
+    let command = low_priority(&[("GREETING", "it's me".to_string())], "echo \"$GREETING\" | tr a-z A-Z && ps -o nice= -p $$");
     let out = std::process::Command::new("/bin/sh").arg("-c").arg(&command).output().unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
     let lines: Vec<&str> = text.lines().collect();
