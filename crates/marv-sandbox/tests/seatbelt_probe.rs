@@ -1088,15 +1088,161 @@ fn link_is_refused_from_a_source_denied_for_reads_or_writes() {
     let out = link("", &dst);
     assert!(out.code == Some(0) && dst.exists(), "control: {out}");
     let a_rule = |op: &str| format!("(deny {op} (subpath \"{}\"))", a.display());
+    let refused = |name: &str, rules: &str| {
+        let dst = b.join(name);
+        let out = link(rules, &dst);
+        assert!(out.code != Some(0) && out.err.contains("Operation not permitted") && !dst.exists(), "{name}: {out}");
+    };
     for (name, deny) in [("read", a_rule("file-read-data")), ("write", a_rule("file-write-data"))] {
-        for (allow_name, allow) in [("", ""), ("+allow_link", "(allow file-link)")] {
-            let dst = b.join(format!("{name}{allow_name}"));
-            let out = link(&format!("{deny}\n{allow}"), &dst);
-            assert!(
-                out.code != Some(0) && out.err.contains("Operation not permitted") && !dst.exists(),
-                "{name}{allow_name}: {out}"
-            );
+        refused(name, &deny);
+        refused(&format!("{name}+allow_link_A"), &format!("{deny}\n(allow file-link (subpath \"{}\"))", a.display()));
+    }
+    // Why the #178 proof's "links allowed anywhere" changed nothing: an allow with no filter doesn't override an
+    // earlier deny with one (#183 probe, macOS 14 and 15), so `(allow file-link)` left the home's link deny in force.
+    // An allow naming the path does override it. The profile's allows all name their paths.
+    let deny_a = a_rule("file-link");
+    refused("link_denied+allow_all", &format!("{deny_a}\n(allow file-link)"));
+    let dst = b.join("link_denied+allow_A");
+    let out = link(&format!("{deny_a}\n(allow file-link (subpath \"{}\"))", a.display()), &dst);
+    assert!(out.code == Some(0) && dst.exists(), "link_denied+allow_A: {out}");
+}
+
+/// **Each link rule of the shipped profile refuses a link on its own** (#183): with the read or write deny that
+/// refuses the link first taken out of the profile (see the test above: Seatbelt refuses `link()` from a source it
+/// can't read or write), the link rule alone must still refuse it, and with that rule taken out too the same link is
+/// made (the control: the edit reached the kernel, and nothing else held it). A regression in any one link rule, the
+/// home's and the shared temporary folder's deny, the protected names' regex or a protected path's literal deny,
+/// fails here, which no outcome guard can catch: with the whole profile in place the first layer refuses first.
+#[test]
+fn each_link_rule_refuses_on_its_own() {
+    let pid = std::process::id();
+    let home = PathBuf::from(format!("/private/var/tmp/mx-linkrules-{pid}"));
+    let shared = PathBuf::from(format!("/private/tmp/mx-linkrules-{pid}"));
+    let t = user_t();
+    let tmp = nix::unistd::mkdtemp(&t.join("marv-probe-XXXXXX")).unwrap();
+    struct Dirs(Vec<PathBuf>);
+    impl Drop for Dirs {
+        fn drop(&mut self) {
+            for d in &self.0 {
+                let _ = std::fs::remove_dir_all(d);
+            }
         }
+    }
+    let _dirs = Dirs(vec![home.clone(), shared.clone(), tmp.clone()]);
+    let proj = home.join("proj");
+    for d in [home.join(".ssh"), proj.join("sub"), shared.clone()] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    std::fs::write(home.join(".ssh/known_hosts"), "SECRET\n").unwrap();
+    std::fs::write(proj.join(".envrc"), "export SAFE=1\n").unwrap();
+    std::fs::write(proj.join("plain"), "plain\n").unwrap();
+    std::fs::write(shared.join("f"), "shared\n").unwrap();
+    let plan = {
+        let mut sb = Sandbox::from_env(true);
+        sb.home = home.clone();
+        sb.path = std::env::var("PATH").unwrap_or_default();
+        sb.plan(&proj, &CommandMounts::default())
+    };
+    let run = Invocation { tmp: tmp.clone(), user_temp: Some(t.parent().unwrap().to_path_buf()), exe: None, ports: vec![] };
+    let shipped = seatbelt::profile(&plan, &run, &RealFs).unwrap();
+    let text = &shipped.text;
+    // The rules this test takes out, each checked to be there as written.
+    let line_of = |start: &str| -> String {
+        let found: Vec<&str> = text.lines().filter(|l| l.starts_with(start)).collect();
+        assert_eq!(found.len(), 1, "one line starting {start:?} in:\n{text}");
+        format!("{}\n", found[0])
+    };
+    let home_read = line_of("(deny file-read* (subpath (param \"HOME\")))");
+    let shared_read = line_of("(deny file-read* (subpath \"/private/tmp\"))");
+    let broad_link = line_of("(deny file-link (subpath (param \"HOME\")) (subpath \"/private/tmp\")");
+    let names_link = line_of("(deny file-link (require-all");
+    let protected_links: Vec<String> = text
+        .lines()
+        .filter(|l| l.starts_with("(deny file-link (literal (param \"PROTECTED_"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    assert!(!protected_links.is_empty(), "no protected path's link deny in:\n{text}");
+    let home_write = "(allow file-write* (subpath (param \"HOME\")))\n";
+    let project_write = "(allow file-write* (subpath (param \"PROJECT\")))\n";
+    let shared_write = "(allow file-write* (subpath \"/private/tmp\"))\n";
+    let edit = |remove: &[&str], replace: &[(&str, &str)], append: &[&str]| {
+        let mut t = text.clone();
+        for r in remove {
+            assert!(t.contains(r), "{r}");
+            t = t.replace(r, "");
+        }
+        for (from, to) in replace {
+            assert!(t.contains(from), "{from}");
+            t = t.replace(from, to);
+        }
+        t.push_str(&append.concat());
+        Profile { text: t, params: shipped.params.clone() }
+    };
+    let ln = |profile: &Profile, src: &str, dst: &str| {
+        output(
+            Command::new(SANDBOX_EXEC)
+                .args(profile.args())
+                .args(["--", "/bin/ln", src, dst])
+                .current_dir(&proj)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("TMPDIR", &tmp),
+        )
+    };
+    let k = home.join(".ssh/known_hosts").to_string_lossy().into_owned();
+    let f = shared.join("f").to_string_lossy().into_owned();
+    let no_home_in_link = ("(deny file-link (subpath (param \"HOME\")) ", "(deny file-link ");
+    let no_shared_in_link = (" (subpath \"/private/tmp\")", "");
+    let protected: Vec<&str> = protected_links.iter().map(String::as_str).collect();
+    let mut names_and_protected: Vec<&str> = vec![names_link.as_str()];
+    names_and_protected.extend(&protected);
+    let cases: Vec<(&str, &str, &str, Profile, Profile)> = vec![
+        (
+            "the home's link deny",
+            k.as_str(),
+            "x1",
+            edit(&[&home_read], &[], &[home_write]),
+            edit(&[&home_read], &[no_home_in_link], &[home_write]),
+        ),
+        (
+            "the shared temporary folder's link deny",
+            f.as_str(),
+            "x2",
+            edit(&[&shared_read], &[], &[shared_write]),
+            edit(&[&shared_read], &[no_shared_in_link], &[shared_write]),
+        ),
+        (
+            "the protected names' link deny, on the new name",
+            "plain",
+            "sub/AGENTS.md",
+            edit(&[], &[], &[project_write]),
+            edit(&[&names_link], &[], &[project_write]),
+        ),
+        (
+            "the protected names' link deny, on the source",
+            ".envrc",
+            "x3",
+            edit(&protected, &[], &[project_write]),
+            edit(&names_and_protected, &[], &[project_write]),
+        ),
+        (
+            "a protected path's link deny",
+            ".envrc",
+            "x4",
+            edit(&[&names_link], &[], &[project_write]),
+            edit(&names_and_protected, &[], &[project_write]),
+        ),
+    ];
+    assert!(broad_link.contains("USER_TEMP"), "{broad_link}");
+    for (rule, src, dst, alone, without) in cases {
+        let out = ln(&alone, src, dst);
+        assert!(
+            out.code != Some(0) && out.err.contains("Operation not permitted") && !proj.join(dst).exists(),
+            "{rule} didn't refuse ln {src} {dst} on its own: {out}"
+        );
+        let out = ln(&without, src, dst);
+        assert!(out.code == Some(0) && proj.join(dst).exists(), "control, {rule} taken out: ln {src} {dst}: {out}");
+        std::fs::remove_file(proj.join(dst)).unwrap();
     }
 }
 
