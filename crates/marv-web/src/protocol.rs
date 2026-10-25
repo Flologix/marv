@@ -14,6 +14,8 @@ pub enum ClientMessage {
         max_steps: Option<u32>,
         yolo: Option<bool>,
     },
+    /// A message: starts a turn. Refused (a turn runs: a mesh wake took the session first), the reply is
+    /// `send_refused` with the text back, for the page to queue again (#184).
     Send {
         text: String,
     },

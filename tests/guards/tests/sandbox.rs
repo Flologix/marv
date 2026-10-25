@@ -115,6 +115,78 @@ fn no_network_cleared_environment_and_own_pid_namespace() {
     assert!(online.output.lines().count() > 3 || !Path::new("/sys/class/net").exists(), "{}", online.output);
 }
 
+/// How a sandboxed command is ended early in [`a_stop_before_the_sandbox_is_up_still_stops_the_command`].
+enum Early {
+    /// A stop: the token is already cancelled, or cancelled this many ms after the call starts.
+    Stop(Option<u64>),
+    /// A timeout of this many ms.
+    Timeout(u64),
+}
+
+/// A sandboxed command that runs `(sleep 2; touch late) & sleep 600`, ended by `early` right after (or before) the
+/// spawn: the call must return at once and leave nothing running (`late` never appears).
+async fn ended_early(tag: String, early: Early) -> (String, TempDir, marv_tools::bash::CommandResult) {
+    let (project, home) = (TempDir::new(&tag), TempDir::outside_tmp(&format!("{tag}-home")));
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let timeout = match early {
+        Early::Stop(None) => {
+            cancel.cancel();
+            60_000
+        }
+        Early::Stop(Some(ms)) => {
+            let stopper = cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                stopper.cancel();
+            });
+            60_000
+        }
+        Early::Timeout(ms) => ms,
+    };
+    let options = marv_tools::bash::RunOptions {
+        command: "(sleep 2; touch late) & sleep 600".into(),
+        root: project.path().to_path_buf(),
+        sandbox: true,
+        timeout: std::time::Duration::from_millis(timeout),
+        ..Default::default()
+    };
+    let started = std::time::Instant::now();
+    let result = marv_tools::bash::run_command(options, &sandbox_with_home(home.path()), &cancel).await;
+    assert!(result.aborted || result.timed_out, "{tag}: {result:?}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(10), "{tag}: the stop didn't hold: {:?}", started.elapsed());
+    (tag, project, result)
+}
+
+/// **A stop or a timeout that comes before the sandbox is set up still stops the command** (#166 review, #182), on
+/// both backends. Seatbelt's process group exists only once `marv __guard` has called `setsid`, so a group kill alone,
+/// sent earlier, reached nothing. bwrap's sandbox lives as long as its PID namespace's first process (bwrap's child),
+/// which ties itself to bwrap (`--die-with-parent`) only late in its set-up: a SIGKILL that reached bwrap in the first
+/// few ms orphaned it, and the command ran to its end. An already-cancelled token, stops and timeouts 0–20 ms after
+/// the spawn, run at once (the load makes the early moments longer).
+///
+/// Proven: `Seatbelt::kill` as `killpg` alone → failed on macOS (see #178's proof comment); `Bwrap::kill` as a plain
+/// SIGKILL to bwrap → failed on Linux (`late` appeared for a stop or timeout 1–5 ms after the spawn).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_before_the_sandbox_is_up_still_stops_the_command() {
+    require_sandbox!();
+    let mut cases = vec![ended_early("stop-early".into(), Early::Stop(None))];
+    for round in 0..3 {
+        for ms in [0, 1, 2, 3, 4, 5, 8, 12, 20] {
+            cases.push(ended_early(format!("stop-soon-{ms}-{round}"), Early::Stop(Some(ms))));
+            cases.push(ended_early(format!("timeout-{ms}-{round}"), Early::Timeout(ms.max(1))));
+        }
+    }
+    let ended: Vec<_> = futures::future::join_all(cases.into_iter().map(tokio::spawn)).await;
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let ran_on: Vec<String> = ended
+        .into_iter()
+        .map(|e| e.expect("a case panicked"))
+        .filter(|(_, project, _)| project.path().join("late").exists())
+        .map(|(tag, _, result)| format!("{tag} ({result:?})"))
+        .collect();
+    assert!(ran_on.is_empty(), "the stopped command went on running: {ran_on:#?}");
+}
+
 // ---- the stand-in home ---------------------------------------------------------------------------------------
 
 /// **A stand-in home, toolchains re-mounted read-only, credential files masked.** `~/.ssh` and `~/.marv` (the API
