@@ -25,14 +25,21 @@ export function refused(q: Queue, text: string): Queue {
 
 /**
  * The host's `send_refused` for `text`: first in the queue again, and its user item (the newest with that text) out of
- * the transcript, since it was never sent. Returns the queue and a function of the items, for `setItems`.
+ * the transcript, since it was never sent; `why` (given when no turn runs) adds the host's reason as a notice. Returns
+ * the queue and a function of the items, for `setItems`.
  */
-export function refusedSend(q: Queue, text: string): { queue: Queue; items: (items: Item[]) => Item[] } {
+export function refusedSend(
+  q: Queue,
+  text: string,
+  why?: string,
+): { queue: Queue; items: (items: Item[]) => Item[] } {
   return {
     queue: refused(q, text),
     items: (items) => {
       const at = items.findLastIndex((it) => it.kind === "user" && it.text === text);
-      return at < 0 ? items : [...items.slice(0, at), ...items.slice(at + 1)];
+      const kept = at < 0 ? items : [...items.slice(0, at), ...items.slice(at + 1)];
+      // No turn explains it (a wake's would): the host's reason says why the message waits in the queue.
+      return why ? [...kept, { kind: "notice", text: `Not sent, still queued: ${why}`, tone: "warn" }] : kept;
     },
   };
 }

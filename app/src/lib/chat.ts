@@ -231,7 +231,8 @@ export function useChat(id: string | null, settings: ChatSettings, reload = 0) {
           // front of the queue and out of the transcript, whatever order the wake's events came in. It goes when that
           // turn ends.
           if (e.type === "send_refused") {
-            const back = Q.refusedSend(currentQueue(), String(e.text));
+            const why = running.current ? undefined : String(e.message ?? "");
+            const back = Q.refusedSend(currentQueue(), String(e.text), why || undefined);
             setQueue(back.queue);
             setItems(back.items);
             if (!running.current) setBusy(false);

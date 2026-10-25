@@ -65,3 +65,10 @@ test("send_refused requeues by the text it carries, whatever came before it (a w
   // Once the wake ends, it goes.
   assert.equal(afterTurn(back.queue, "end").next, "one");
 });
+
+test("send_refused with no turn running says the host's reason, so the queued message isn't a mystery", () => {
+  const items: Item[] = [{ kind: "user", text: "one" }];
+  const back = refusedSend(EMPTY, "one", "the session is closed");
+  assert.deepEqual(back.queue.texts, ["one"]);
+  assert.deepEqual(back.items(items), [{ kind: "notice", text: "Not sent, still queued: the session is closed", tone: "warn" }]);
+});
