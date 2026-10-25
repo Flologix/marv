@@ -6,7 +6,8 @@
 //! start the manager in the background; memory; migrate `~/.ekko` (default location only); load the config file (a
 //! broken one exits 1 with "Fix the file, or delete it to run setup again."); hidden PATH folders for the startup
 //! notice; Herdr reporting in a Herdr pane; then the UI. On the way out: `session.flush()` (the App awaits it after
-//! restoring the terminal), MCP close (≤ 2 s), Herdr release (≤ 1 s).
+//! restoring the terminal), MCP close (≤ 2 s), Herdr release (≤ 1 s). SIGHUP (the terminal closed) and SIGTERM take the
+//! same way out (#196, `crate::signals`), its terminal writes bounded.
 //!
 //! The TUI (`marv-tui`) doesn't depend on marv-session: it drives a [`SessionPort`] and renders [`UiEvent`]s. The
 //! bridge is [`Bridge`]:
@@ -2978,7 +2979,7 @@ pub fn resolve_writable(config: &[String], home: &Path, root: &Path, config_dir:
     marv_sandbox::resolve_writable(config, home, root, &runtime, Some(config_dir))
 }
 
-pub async fn run(resume: Option<bool>, approve: Vec<String>) -> anyhow::Result<i32> {
+pub async fn run(resume: Option<bool>, approve: Vec<String>, quit: crate::signals::Quit) -> anyhow::Result<i32> {
     // The real environment only (docs/SECURITY.md): never a project's .env.
     let env: Env = std::env::vars().collect();
     let home = home_dir();
@@ -3153,10 +3154,28 @@ pub async fn run(resume: Option<bool>, approve: Vec<String>) -> anyhow::Result<i
     }
     let options = bridge.app_options(1200);
     // The App restores the terminal, then awaits `flush()` (the last turn and pending trajectory records).
-    let result = App::new(Arc::new(Port(bridge.clone())), rx, options).run().await;
+    // SIGHUP (the terminal closed) or SIGTERM: out as on /exit (#196), and on through the rest of this way out.
+    let result = if quit.signal().is_some() {
+        // It came during startup: no UI just to leave it (the terminal may be gone), but the session is saved.
+        let _ = tokio::time::timeout(marv_tui::app::QUIT_FLUSH_TIMEOUT, Port(bridge.clone()).flush()).await;
+        Ok(())
+    } else {
+        let on_quit = quit.clone();
+        let app =
+            App::new(Arc::new(Port(bridge.clone())), rx, options).with_quit(Box::pin(async move { on_quit.arrived().await }));
+        app.run().await
+    };
     if tty {
-        let _ = write!(std::io::stdout(), "\x1b[23;0t");
-        let _ = std::io::stdout().flush();
+        let pop = || {
+            let _ = write!(std::io::stdout(), "\x1b[23;0t");
+            let _ = std::io::stdout().flush();
+        };
+        // A terminal that's gone fails the write (ignored); one that stopped reading would block it (left behind).
+        if quit.signal().is_some() {
+            marv_tui::render_options::within(marv_tui::app::QUIT_RESTORE_TIMEOUT, pop);
+        } else {
+            pop();
+        }
     }
     // No wake-up from here on (the App's flush did this already, unless it failed first), then stop a turn still
     // running: its tools mustn't outlive the UI.

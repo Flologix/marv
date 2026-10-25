@@ -28,7 +28,7 @@
 //! [`restore`] on the way out and [`TerminalGuard::enter`] (or [`write_enter`]) on the way back.
 
 use std::io::{self, Write};
-use std::sync::Once;
+use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
 
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
@@ -72,6 +72,7 @@ impl TerminalGuard {
     /// installs a panic hook that undoes them before the panic message prints.
     pub fn enter(options: RenderOptions) -> io::Result<Self> {
         install_panic_hook();
+        ENTERED.store(true, std::sync::atomic::Ordering::SeqCst);
         enable_raw_mode()?;
         let guard = Self { options };
         write_enter(&mut io::stdout(), options)?;
@@ -114,10 +115,47 @@ pub fn write_restore(out: &mut impl Write) -> io::Result<()> {
     out.flush()
 }
 
+/// Whether [`TerminalGuard::enter`] ran (and [`restore`] hasn't since).
+static ENTERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// [`restore`], if the terminal was entered: for a forced exit that doesn't know whether a UI ran (#196).
+pub fn restore_if_entered() {
+    if ENTERED.load(std::sync::atomic::Ordering::SeqCst) {
+        restore();
+    }
+}
+
 /// Best-effort: everything off, whatever was on. Safe to call twice. Also what the panic hook runs.
 pub fn restore() {
+    ENTERED.store(false, std::sync::atomic::Ordering::SeqCst);
     let _ = write_restore(&mut io::stdout());
     let _ = disable_raw_mode();
+}
+
+/// Runs `work` (terminal writes) on a thread of its own and waits at most `limit` for it: `true` if it finished.
+/// For the way out after a hangup or SIGTERM (#196): a closed terminal fails writes with EIO, which [`restore`]
+/// ignores, but a terminal that stopped reading (XOFF, a frozen emulator) would block them for good. A write still
+/// blocked is left behind on its thread, which ends with the process.
+/// Without a thread (none could be started), `work` runs here, unbounded.
+pub fn within(limit: Duration, work: impl FnOnce() + Send + 'static) -> bool {
+    let (done, finished) = std::sync::mpsc::channel();
+    let work = Arc::new(Mutex::new(Some(work)));
+    let on_thread = work.clone();
+    let spawned = std::thread::Builder::new().name("marv-terminal".into()).spawn(move || {
+        if let Some(work) = on_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            work();
+        }
+        let _ = done.send(());
+    });
+    match spawned {
+        Ok(_) => finished.recv_timeout(limit).is_ok(),
+        Err(_) => {
+            if let Some(work) = work.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                work();
+            }
+            true
+        }
+    }
 }
 
 /// Chains a hook that restores the terminal before the previous hook prints the panic, so the

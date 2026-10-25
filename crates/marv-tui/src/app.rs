@@ -158,6 +158,10 @@ pub const REVEAL_MIN_CHARS: usize = 2;
 pub const REVEAL_CATCH_UP: usize = 2000;
 /// How long `run` waits for `SessionPort::flush` after the terminal is restored.
 pub const FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+/// After a quit signal ([`App::with_quit`], #196) or with the terminal gone: how long the terminal's restore may take
+/// (it's left behind if a terminal that stopped reading blocks it), and the flush.
+pub const QUIT_RESTORE_TIMEOUT: Duration = Duration::from_millis(500);
+pub const QUIT_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Events after which a streaming tool call is done streaming: complete, cut off, or abandoned.
 /// They also flush the stream buffer at once.
@@ -381,6 +385,8 @@ pub struct App {
     // --- the loop ---
     copy: CopyFn,
     copies: FuturesUnordered<BoxFuture<'static, (usize, String)>>,
+    /// Ends the loop like `/exit` when it completes: the host's SIGHUP or SIGTERM ([`Self::with_quit`]).
+    quit: Option<BoxFuture<'static, ()>>,
     /// What the last draw showed that animates on its own.
     welcome_visible: bool,
     spinner_visible: bool,
@@ -458,6 +464,7 @@ impl App {
             held_told: None,
             copy,
             copies: FuturesUnordered::new(),
+            quit: None,
             welcome_visible: true,
             spinner_visible: false,
             exit: false,
@@ -471,16 +478,36 @@ impl App {
         self
     }
 
+    /// Leaves as `/exit` does once `quit` completes (#196: the host's SIGHUP when the terminal closes, or a SIGTERM),
+    /// with a bounded restore ([`QUIT_RESTORE_TIMEOUT`]: the terminal may be gone) and flush ([`QUIT_FLUSH_TIMEOUT`]).
+    pub fn with_quit(mut self, quit: BoxFuture<'static, ()>) -> Self {
+        self.quit = Some(quit);
+        self
+    }
+
     /// Runs until exit: enters the terminal (`render_options::TerminalGuard`), loops as described
-    /// in the module docs, restores the terminal, then awaits `port.flush()` (bounded).
+    /// in the module docs, restores the terminal, then awaits `port.flush()` (bounded). A draw that fails (the
+    /// terminal is gone) ends the loop too: the flush still runs, and the error is returned after it.
     pub async fn run(mut self) -> anyhow::Result<()> {
-        let guard = TerminalGuard::enter(self.options.render)?;
+        let guard = match TerminalGuard::enter(self.options.render) {
+            Ok(guard) => guard,
+            Err(e) => {
+                // No terminal (it closed during startup, #196): nothing to show, but the session is still saved.
+                crate::render_options::within(QUIT_RESTORE_TIMEOUT, crate::render_options::restore);
+                let _ = tokio::time::timeout(QUIT_FLUSH_TIMEOUT, self.port.flush()).await;
+                return Err(e.into());
+            }
+        };
         // No `terminal.clear()`: it asks the terminal where the cursor is, and a terminal that never
         // answers would stop Marv starting. The alternate screen starts blank, and the first draw
         // writes every cell.
         let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
         let mut input = EventStream::new();
         let mut next_frame = Instant::now();
+        let mut quit = self.quit.take().unwrap_or_else(|| Box::pin(futures::future::pending()));
+        // A quit signal, or a terminal that went away (input ended, a draw failed).
+        let mut gone = false;
+        let mut failed = None;
 
         loop {
             let now = Instant::now();
@@ -489,7 +516,10 @@ impl App {
                 break;
             }
             if self.dirty && now >= next_frame {
-                draw_synchronized(&mut terminal, |frame| self.draw(frame))?;
+                if let Err(e) = draw_synchronized(&mut terminal, |frame| self.draw(frame)) {
+                    (gone, failed) = (true, Some(e));
+                    break;
+                }
                 self.dirty = false;
                 next_frame = now + FRAME_INTERVAL;
             }
@@ -504,7 +534,10 @@ impl App {
                 event = input.next() => match event {
                     Some(Ok(event)) => self.on_event(event, Instant::now()),
                     // The terminal went away: nothing more can be shown or typed.
-                    Some(Err(_)) | None => break,
+                    Some(Err(_)) | None => {
+                        gone = true;
+                        break;
+                    }
                 },
                 event = self.events.recv() => match event {
                     Some(event) => {
@@ -522,14 +555,30 @@ impl App {
                     self.copied(chars, &how, Instant::now());
                 }
                 _ = async { tokio::time::sleep_until(sleep.expect("guarded")).await }, if sleep.is_some() => {}
+                () = &mut quit => {
+                    gone = true;
+                    break;
+                }
             }
         }
 
-        drop(terminal);
-        drop(guard);
+        // Not ratatui's Drop: it shows the cursor (as `restore` does) and reports a failure with `eprintln!`, which
+        // panics when stderr is a terminal that's gone (#196).
+        std::mem::forget(terminal);
+        let flush = if gone {
+            // The terminal may be closed (writes fail with EIO, ignored) or stuck (the restore is left behind).
+            crate::render_options::within(QUIT_RESTORE_TIMEOUT, move || drop(guard));
+            QUIT_FLUSH_TIMEOUT
+        } else {
+            drop(guard);
+            FLUSH_TIMEOUT
+        };
         // On the way out: save the session and let pending trajectory records reach the disk.
-        let _ = tokio::time::timeout(FLUSH_TIMEOUT, self.port.flush()).await;
-        Ok(())
+        let _ = tokio::time::timeout(flush, self.port.flush()).await;
+        match failed {
+            Some(e) => Err(e.into()),
+            None => Ok(()),
+        }
     }
 
     /// Whether something other than an empty prompt has the keyboard ([`SessionPort::keyboard_held`]): what's typed
