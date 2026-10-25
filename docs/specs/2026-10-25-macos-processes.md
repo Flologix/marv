@@ -38,7 +38,7 @@ So on macOS today a model can only start a server inside one bash command, check
 Most of what the issue asked to check is already portable. It is required on the three macOS CI runners (`ci.yml:98-114`, `cargo test --workspace`):
 
 - **`relay.rs:131-161`**: `tokio::signal::unix` and `std::os::unix::process::ExitStatusExt` are Unix APIs, not Linux ones. The relay builds and its unit tests pass on macOS. `exit_code` is already used on macOS by the guard (`guard.rs`), and by the process watcher (`processes/mod.rs:516`). Only Windows would need `cfg` work, which is a separate issue.
-- **`git.rs:76-118`** (`GitGroup`, `process_group(0)`, `killpg`) and **`bash.rs:207-217`** (the unsandboxed path's `process_group(0)` and `marv_sandbox::kill_group`): `CommandExt::process_group` and `nix::sys::signal::killpg` are POSIX, and they behave the same on macOS. The sandboxed path already uses `backend.kill`, which is the guard's `killpg` on Seatbelt (`seatbelt_backend.rs:227-230`), plus the post-exit group kill (`ExitWatch`, `wait_exited` with kqueue `NOTE_EXIT`, `backend.rs:150-198`). Nothing to do here for macOS.
+- **`crates/marv-session/src/git.rs:76-118`** (`GitGroup`, `process_group(0)`, `killpg`) and **`crates/marv-tools/src/bash.rs`**, the unsandboxed path: `process_group(0)` at `:216` and `marv_sandbox::kill_group` at `:245`. `CommandExt::process_group` and `nix::sys::signal::killpg` are POSIX, and they behave the same on macOS. The sandboxed path already uses `backend.kill`, which is the guard's `killpg` on Seatbelt (`seatbelt_backend.rs:227-230`). It also has the post-exit group kill: `ExitWatch` in `bash.rs` (from `:359`), on top of `wait_exited` with kqueue `NOTE_EXIT` (`backend.rs:152-198`). Nothing to do here for macOS.
 - **The runtime folder** `/tmp/marv-<uid>` (`runtime.rs`, sandbox spec §7) exists, is checked with `private_folder`, and is hidden from every Seatbelt sandbox. `ProcessManager::parent_dir` (`:278-296`) already uses `runtime_dir_for` on both platforms. Process sockets fit `sun_path` (about 50 bytes).
 - **Lifetime**: the guard gives each sandbox its own group, polls `getppid()` and `killpg`s when Marv dies (G21). `kill_running` goes through `backend().kill`, so Marv's exit and a panic already take the groups down.
 - **The profile builder** already has the bash half of option A: `Invocation::ports` renders `(allow network-outbound (remote ip "localhost:<port>"))` per port (`seatbelt.rs:172`, `:587-592`). The backend still always passes `ports: Vec::new()` (`seatbelt_backend.rs:188`).
@@ -105,10 +105,36 @@ This is today's state, and it fails closed. It is a missing feature, and the mod
 
 A, as decided on 2026-10-19, plus five things the earlier spec didn't cover:
 
-1. **Wildcard binds refused, and the model told.** If probe 1 shows that `(local ip "localhost:*")` refuses `0.0.0.0`/`::` (expected: `EPERM`), the macOS process description and the start result say "listen on 127.0.0.1 or localhost (e.g. `--host 127.0.0.1`), not 0.0.0.0". The start result also gets a note when the log shows `EPERM`/"Operation not permitted" on a bind and no port opened. `python -m http.server` and some Next.js setups bind every interface by default. **If probe 1 shows that wildcard binds are allowed, A doesn't ship** (§10, decision 1).
+1. **Non-loopback binds refused, and the model told.** Probe 1 must show that `(local ip "localhost:*")` refuses every non-loopback local address (expected: `EPERM`):
+   - `0.0.0.0` and `::`;
+   - the machine's own interface addresses;
+   - the IPv4-mapped `::ffff:0.0.0.0`;
+   - `127.0.0.2`.
+
+   How SBPL's `localhost` matches a bind's local address isn't documented by Apple, so this is measured, not assumed. **If any of these binds passes, A doesn't ship** (§10, decision 1).
+
+   **The cost is real.** Node's `server.listen(port)` with no host binds `::` dual-stack. That covers Express, older Fastify defaults and many hand-written servers, as well as `python -m http.server` and some Next.js setups. All of them fail under A until told to bind loopback. So:
+   - the macOS process description says "listen on 127.0.0.1 (e.g. `--host 127.0.0.1`, `HOST=127.0.0.1`, `server.listen(port, '127.0.0.1')`), not 0.0.0.0 or ::";
+   - the door's prompt paragraph says the same;
+   - the start result gets a note when no port opened and the log shows `EPERM`/"Operation not permitted" or `listen EACCES`.
+
+   It says "127.0.0.1" rather than "localhost" unless probe 8 shows name resolution works in the sandbox. An end-to-end case with a plain Node `listen(port)` checks that the note fires (§9).
 2. **Low ports refused by rule.** Since macOS 10.14 a normal user may bind ports below 1024 (**to verify: probe 3**). On Linux, `MIN_PORT` only stops forwarding, because the bind stays inside the namespace. On macOS, `127.0.0.1:80` would be the host's. The profile adds `(deny network-bind (local ip "localhost:<n>"))` for 1-1023, after the allow. That's about 45 KB of rules, under `PROFILE_FILE_OVER` (256 KB); probe 4 measures the start time. SBPL has no port ranges.
-3. **The post-exit group kill, as bash has.** The process watcher sees the guard's exit with `wait_exited` (not reaping it), calls `backend.kill(pid)` for what is still in the group, and then `child.wait()`s. Without this, a leftover listener keeps a port open on the host's loopback with no entry in Marv. On Linux, bwrap's namespace already did this, and the extra kill is a no-op.
-4. **The other address family held by Marv** (§5.1). For each port the process listens on, Marv binds the *other* loopback address (`::1` for `127.0.0.1` and the reverse) and holds it while the port is listed. If that bind fails, someone else is there: the port is listed for the user, but bash commands don't get a rule for it, and a note says why.
+3. **The post-exit group kill, as bash has, always before the reap.** The process watcher:
+   1. sees the guard's exit with `wait_exited` (not reaping it);
+   2. calls `backend.kill(pid)` for what is still in the group;
+   3. only then calls `child.wait()`.
+
+   While the guard is an unreaped zombie, its pid, and so its group id, can't be another process's. That makes both halves of Seatbelt's `kill` (the `send(pid)` and the `killpg`) safe.
+
+   `stop` follows the same rule. Its grace-timeout `kill` runs only while the entry's child hasn't been reaped, so after the watcher has waited, `stop` never signals the pid. Today the watcher reaps first, so this ordering is part of the change.
+
+   This matters more for processes than for bash. The command can SIGKILL or SIGSTOP its guard (`guard.rs`), and today the group would then keep its loopback port while Marv lists the process as exited. Without the kill, any leftover listener keeps a port open on the host's loopback with no entry in Marv. On Linux, bwrap's namespace already did this, and the extra kill is a no-op.
+4. **The other address family held by Marv** (§5.1). For each port the process listens on, Marv binds the *other* loopback address (`::1` for `127.0.0.1` and the reverse) and holds it while the port is listed.
+   - The held socket **binds but doesn't listen**: a connection to it is refused at once rather than hanging.
+   - The `::1` socket is single-stack (`IPV6_V6ONLY`), so it never covers IPv4.
+   - If that bind fails, someone else is there. The port is listed for the user, but bash commands don't get a rule for it, and a note says why.
+   - **When the poll sees a listed port close, or the process ends,** Marv at once binds both families of that port (bind only) and holds them until every bash command started with a rule for it has ended. A bash command's rules are fixed when it starts, so without this hold, a host program that took the port could be reached for the rest of that command's run, up to its timeout. If Marv can't take the port back (another program bound it between the close and Marv's poll), that window is the residual (§5.1).
 5. **No relay and no socket folder on macOS.** The process's own sandbox runs `bash -c` under the guard, with no binds. `ProcessManager` doesn't make `<pid>-<hex>/p<n>/` on macOS. `ProcessForward.dir` isn't used, and bash gets ports instead of binds.
 
 ### 4.1 The profile
@@ -157,13 +183,12 @@ Either one runs in Marv, outside the sandbox. Seatbelt limits what the sandboxed
 | Reaches the user's loopback services | No | No (no outbound IP rule) | None |
 | Reachable from the host's loopback | Yes, through Marv's forwarder | Yes, directly | Same: any local process, the browser too, can connect. A page it serves can try DNS rebinding or CSRF against other local services from the user's browser, as on Linux |
 | Reachable from the LAN | No (forwarder on `127.0.0.1`) | No, **if probe 1 holds** | A ships only if it does |
-| Can take a port the user's software expects (squatting, e.g. 11434 before Ollama starts) | Yes: Marv forwards any free port of 1024+ | Yes, on the same terms | Same. Documented |
 | Ports below 1024 | Bound only inside the namespace, never forwarded | Denied by rule (addition 2) | Only after probe 3/4 |
 | More than `MAX_PORTS` | Forwarded only up to 4 | All open on loopback, 4 listed | Extra ports are reachable from the host, not refused (decision 3) |
 | Unix sockets | Only the relay's | Only its private `TMPDIR` (the profile as for bash) | None |
-| Stale port in a bash rule | The relay reaches only the process's netns | A port the process closed, which another program then took, is reachable by a bash command started before Marv's next poll (≤500 ms) | Small window. The rule lists ports, not processes |
+| Stale port in a bash rule | The relay reaches only the process's netns | A bash command's rules are fixed when it starts, so a port that closes while the command runs stays allowed until the command ends (up to its timeout). Marv takes the closed port back at once, binding both families (addition 4) | Only if another program binds the port between its close and Marv's next poll (≤500 ms). That program is then reachable by bash commands already running, for the rest of their run. Documented |
 | Same port, other address family | n/a | `localhost:<p>` in SBPL matches both `127.0.0.1` and `::1` (to verify, probe 2). A process binding `::1:5432` while the user's Postgres has `127.0.0.1:5432` would make Marv open `localhost:5432` to bash commands, reaching Postgres | Closed by addition 4: Marv holds the other family, or withholds the rule |
-| Escapees (`setsid` + double fork) | Die with the namespace | Survive the command, still sandboxed. Their ports aren't in the group, so they aren't listed but stay open on loopback until they exit | Sandbox spec decision 5, and now a port too. Documented |
+| Escapees (`setsid`, or `setpgid(0, 0)` into a new group in the same session; with a double fork) | Die with the namespace | Survive the command, still sandboxed. A `setpgid` escape leaves the group, so it is missed by `ByProgramGroup` discovery and by the `killpg`. Its ports aren't listed but stay open on loopback until it exits. If libproc gives the session id cheaply (`proc_pidinfo` BSD info), discovery and the kill go by session instead, which catches `setpgid` (not `setsid`) | Sandbox spec decision 5, and now a port too. Documented |
 | Dies on stop / exit / panic / SIGKILL | bwrap | Guard `killpg` + post-exit kill (addition 3) + parent watch | The guard limits of sandbox spec §6.10 |
 
 **Seatbelt outbound to localhost:** A gives a process without network **no** `network-outbound` IP rule at all. Accepted connections are inbound and need nothing more. The one thing it loses is connecting to itself (§5.3). Giving it `(remote ip "localhost:*")` would undo sandbox decision 1, so this spec doesn't.
@@ -185,13 +210,32 @@ Nothing changes for A. With no relay, macOS makes no per-process socket folder, 
 
 Each item is a probe in `crates/marv-sandbox` tests (macOS only), the way #166's probes were.
 
-1. With `listen_localhost`: a bind to `127.0.0.1:0` and to `[::1]:0` works, and a bind to `0.0.0.0:0` and `[::]:0` is refused. **Blocking:** if wildcard binds pass, A doesn't ship (decision 1).
+1. **Binds under `listen_localhost` (blocking).**
+   - Must work: a bind to `127.0.0.1:0` and to `[::1]:0`.
+   - Must be refused:
+     - `0.0.0.0:0` and `[::]:0`;
+     - the runner's own interface addresses (`en0`'s IPv4 and IPv6);
+     - `[::ffff:0.0.0.0]:0`;
+     - `127.0.0.2:0`, with an `lo0` alias added for the test where the runner allows it.
+   - Recorded either way: `[::ffff:127.0.0.1]:0`.
+
+   SBPL's matching of `localhost` against a bind's local address (the wildcard, IPv4-mapped addresses, the rest of 127/8) is undocumented, so every case is measured on each runner (`macos-14`, `macos-15`, `macos-15-intel`). If any must-refuse case binds, A doesn't ship (decision 1).
 2. `(remote ip "localhost:<p>")` reaches both `127.0.0.1:<p>` and `[::1]:<p>`. This decides addition 4's exact form.
 3. An unsandboxed user process can bind `127.0.0.1:80` on macOS 14 and 15. If it can't, addition 2 is defence in depth only.
-4. The 1023 per-port denies work, and `sandbox-exec` start time with them stays under +20 ms (median of 50).
+4. The 1023 per-port denies work. `sandbox-exec` start time with and without them (median of 50, in the same job) is **reported** in the test output rather than asserted: shared runners are too noisy for a hard limit. The maintainer judges the number (decision 2).
 5. Marv (outside) can read a sandboxed child's descriptors through `proc_pidfdinfo` (or `lsof -g`), and the process can't read Marv's.
-6. An accepted connection needs only `network-inbound` (a `curl` from the host to the process works). The process's own `connect` to its port is refused.
+6. **Inbound.**
+   - An accepted connection needs only `network-inbound`: a `curl` from the host to the process works.
+   - A connection from a non-loopback source can't reach it: from the runner's own interface address to the port.
+   - The process's own `connect` to its port is refused.
+
+   GitHub's macOS runners have the application firewall off. On a developer's Mac with the firewall on, the probes that bind non-loopback addresses may raise the "accept incoming connections?" prompt. The probes say so when run locally.
 7. `clean-tmps` (sandbox spec §7.2) is unaffected: there are no socket folders now.
+8. **`localhost` by name, without network.** The profile without network gives no `mach-lookup` to the resolver services, and on macOS `getaddrinfo("localhost")` may go through mDNSResponder. Two checks:
+   - in a process sandbox, a server binds by name (`--host localhost`, Vite's default; a Node `listen(port, 'localhost')`);
+   - in a bash sandbox with `loopback_ports`, a client connects by name (`node -e "fetch('http://localhost:<p>')"`, Python's `urllib`). curl resolves `localhost` itself, so it doesn't count.
+
+   If either fails, the description, the prompt and the notes say "127.0.0.1", never "localhost" (decision 8).
 
 ## 8. Later, on both platforms
 
@@ -206,12 +250,19 @@ Each item is a probe in `crates/marv-sandbox` tests (macOS only), the way #166's
   - `loopback_ports` renders one outbound rule per port;
   - bubblewrap ignores both;
   - with `network: true`, the profile is unchanged.
-- **Unit (`processes`):** the port parser for the chosen source (libproc rows, or `lsof -F` text from a fixture), `MAX_PORTS` notes, the other-family hold and its note.
+- **Unit (`processes`):**
+  - the port parser for the chosen source (libproc rows, or `lsof -F` text from a fixture);
+  - `MAX_PORTS` notes;
+  - the other-family hold and its note;
+  - the hold of a closed port, released only after the bash commands started with its rule have ended;
+  - the watcher killing the group before it reaps the guard.
 - **Guards** (`tests/guards/tests/process.rs`, today `require_bwrap!()`): run on both platforms with a `require_sandbox!()` and one body per guarantee:
   - can't write outside the project, can't change `.git`, can't read the home: as today;
   - **can't reach the host's localhost without network**: as today, plus, on macOS, can't reach a host listener on the *same port number* in the other family;
   - **a port is on loopback only**: on macOS the server binding `0.0.0.0` fails, and binding `127.0.0.1` is reachable from the host but not on another interface;
-  - **a sandboxed bash command reaches it** (`curl localhost:<p>`), and doesn't reach a host port that isn't listed;
+  - **a sandboxed bash command reaches it** (`curl 127.0.0.1:<p>`), and doesn't reach a host port that isn't listed;
+  - **a plain Node `listen(port)`** fails on macOS with the start note that says to bind 127.0.0.1;
+  - **a port that closes is taken back:** a host listener started on it after the close can't be reached from a bash command that was already running;
   - **dies on stop**, including a child left in the group after the main command exited (addition 3);
   - **dies when Marv is SIGKILLed** (the fixture parent, as today).
 
@@ -220,13 +271,14 @@ Each item is a probe in `crates/marv-sandbox` tests (macOS only), the way #166's
 
 ## 10. Decisions for the maintainer
 
-1. **Option A, conditional on probe 1.** A ships only if Seatbelt refuses wildcard binds under `(local ip "localhost:*")`. If it doesn't, C stays and this spec comes back. *Recommended: yes.*
-2. **Low ports denied by profile rule** (1023 `deny network-bind` lines), if probe 4's cost is acceptable. *Recommended: yes.* The alternative is to note them only, as for ports over the limit.
+1. **Option A, conditional on probe 1.** A ships only if Seatbelt refuses every non-loopback bind under `(local ip "localhost:*")`: the wildcard, interface addresses, IPv4-mapped and `127.0.0.2`. Accepting it also means accepting the cost of refusing `::`: Node's default `listen(port)` fails until the model passes a host, guided by the description and the start note. If it doesn't, C stays and this spec comes back. *Recommended: yes.*
+2. **Low ports denied by profile rule** (1023 `deny network-bind` lines), if probe 4's reported start-time cost is acceptable. *Recommended: yes.* The alternative is to note them only, as for ports over the limit.
 3. **Ports over `MAX_PORTS`:** listed as "open but not listed" with a note (recommended), or the process stopped. Stopping is stricter, but it kills a dev server that opens an extra debug or HMR port.
-4. **The other address family:** Marv holds the other loopback address for each listed port, or withholds the bash rule if it can't (recommended). The alternative is no bash rule for any port whose other family is taken, without holding it.
+4. **The other address family and closed ports:** Marv holds the other loopback address for each listed port (bind only), or withholds the bash rule if it can't. It also takes back both families of a port that closes, until the bash commands started with its rule have ended (recommended). The alternative is no bash rule for any port whose other family is taken, without holding it.
 5. **Port discovery:** the `libproc` crate (recommended: in-process, cheap, a new macOS-only dependency) or `lsof` (no dependency, a spawn per poll).
 6. **Self-connection** stays a documented limit, with `network: true` as the way out, and the `ports` hint deferred to §8. *Recommended: yes.*
 7. **`SANDBOX_LIMITS` wording on macOS** ("its `localhost` is its own" is wrong there) gets fixed in PR 1 even though it's a prompt change: one cache break, macOS only. *Recommended: yes.*
+8. **"localhost" or "127.0.0.1" in the model's text:** decided by probe 8. *Recommended: "127.0.0.1" unless probe 8 passes on every runner.*
 
 ## 11. PRs
 
