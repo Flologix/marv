@@ -702,7 +702,9 @@ impl<E: Clone + Send + Sync + 'static> Turn<E> {
                 return None;
             }
             let waited = Instant::now();
-            lock = if baseline { cache.lock(&at.key, checker.baseline_wait, cancel).await } else { cache.try_lock(&at.key) };
+            // A step's check only bridges the moment a just-released lock can look held (`LOCK_GRACE`).
+            let wait = if baseline { checker.baseline_wait } else { super::cache::LOCK_GRACE };
+            lock = cache.lock(&at.key, wait, cancel).await;
             if lock.is_none() {
                 if !cancel.is_cancelled() {
                     self.pending(waited.elapsed().as_millis() as u64, baseline);

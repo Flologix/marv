@@ -45,6 +45,9 @@ pub const MIN_FREE_PERCENT: u64 = 5;
 pub const MAX_AGE: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 /// A key folder is sized at most this often (a big target dir has hundreds of thousands of files).
 pub const SIZE_EVERY: Duration = Duration::from_secs(60);
+/// How long "the lock is free" may take to show after its holder let go: a process forked elsewhere in Marv keeps a
+/// copy of the lock's file until it execs (the file is close-on-exec), and that copy holds the `flock`.
+pub const LOCK_GRACE: Duration = Duration::from_millis(200);
 /// The project roots a key's record remembers (for orphan pruning).
 const MAX_ROOTS: usize = 32;
 
@@ -228,6 +231,21 @@ impl CheckCache {
         Some(KeyLock(file))
     }
 
+    /// [`CheckCache::try_lock`], tried again for up to [`LOCK_GRACE`]: a lock just released can look held for a moment
+    /// (a process forked elsewhere in Marv holds the file until it execs). For the blocking deletes.
+    pub fn try_lock_briefly(&self, key: &str) -> Option<KeyLock> {
+        let deadline = std::time::Instant::now() + LOCK_GRACE;
+        loop {
+            if let Some(lock) = self.try_lock(key) {
+                return Some(lock);
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// The key's lock, waiting at most `wait` for it (or until `cancel`).
     pub async fn lock(&self, key: &str, wait: Duration, cancel: &CancellationToken) -> Option<KeyLock> {
         let deadline = tokio::time::Instant::now() + wait;
@@ -388,7 +406,7 @@ impl CheckCache {
             Ok(_) => {}
         }
         let size = size_of(&dir);
-        let Some(_lock) = self.try_lock(key) else {
+        let Some(_lock) = self.try_lock_briefly(key) else {
             return Err("a check is using it right now; try again when it's done".into());
         };
         self.remove_locked(key).map(|()| Some(size))
@@ -396,7 +414,7 @@ impl CheckCache {
 
     /// Deletes the key's folder and record if its lock is free; whether it did.
     fn remove(&self, key: &str) -> bool {
-        match self.try_lock(key) {
+        match self.try_lock_briefly(key) {
             Some(_lock) => self.remove_locked(key).is_ok(),
             None => false,
         }
@@ -539,7 +557,7 @@ mod tests {
         let held = cache.try_lock("k").unwrap();
         assert!(cache.try_lock("k").is_none());
         drop(held);
-        assert!(cache.try_lock("k").is_some());
+        assert!(cache.try_lock_briefly("k").is_some());
     }
 
     #[tokio::test]
