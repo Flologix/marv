@@ -361,6 +361,10 @@ fn protected_names_cant_be_created_and_the_scan_finds_nothing() {
 /// can't be unlinked), and no hard link to it (or to the home's files) can be made, into the project or the
 /// `TMPDIR`. `link()` is checked against both paths (#166 probe), so hard links are allowed between the project's and
 /// the TMPDIR's own files.
+///
+/// This guards the outcome: with the whole profile in place, Seatbelt refuses these links before any link rule is
+/// consulted (a source it can't read or write, a protected name it can't create), so it can't catch a regression in one
+/// link rule. `marv-sandbox`'s `each_link_rule_refuses_on_its_own` does that, one rule at a time (#183).
 #[test]
 fn protected_files_cant_be_renamed_away_or_hard_linked() {
     require_sandbox!();
