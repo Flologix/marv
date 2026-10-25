@@ -5,7 +5,8 @@
 //! one turn with no UI, and writes the final reply to stdout. Warnings go to stderr, so stdout stays the reply.
 //!
 //! SIGHUP or SIGTERM (#196, `crate::signals`) stops the turn and closes the session as the end of a turn does (≤ 2 s);
-//! the exit code is then 128 + the signal's number.
+//! one during startup or a session-start hook means no turn. The exit code is then 128 + the signal's number, also
+//! when the signal came after the reply was written, during the close. An ignored SIGHUP (`nohup`) stays ignored.
 //!
 //! Exit codes ([`ExitCode`]):
 //! - 0: finished (the model answered normally);
@@ -567,8 +568,19 @@ pub async fn run_headless(options: HeadlessOptions, quit: crate::signals::Quit) 
     };
     // The hooks (started by a resume already, else now) go with this prompt; one that failed is a line on stderr.
     session.run_start_hooks();
-    for run in session.start_hooks_done().await.unwrap_or_default().iter().filter(|r| !r.ok()) {
+    // A quit signal (#196) doesn't wait for a slow hook: close() below kills it.
+    let hooks = tokio::select! {
+        runs = session.start_hooks_done() => runs.unwrap_or_default(),
+        () = quit.arrived() => Default::default(),
+    };
+    for run in hooks.iter().filter(|r| !r.ok()) {
         eprintln!("marv: session-start hook {}", printable(&run.line()));
+    }
+    if quit.signal().is_some() {
+        // No turn after a signal: the session closes, and main sets the exit code.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), session.close()).await;
+        drop(mesh);
+        return ExitCode::Error;
     }
     // With -c the totals include the resumed conversation's: the turn's usage is what this turn added.
     let before = session.usage().totals;

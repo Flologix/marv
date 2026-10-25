@@ -2982,9 +2982,16 @@ pub async fn run(resume: Option<bool>, approve: Vec<String>, quit: crate::signal
     let options = bridge.app_options(1200);
     // The App restores the terminal, then awaits `flush()` (the last turn and pending trajectory records).
     // SIGHUP (the terminal closed) or SIGTERM: out as on /exit (#196), and on through the rest of this way out.
-    let on_quit = quit.clone();
-    let app = App::new(Arc::new(Port(bridge.clone())), rx, options).with_quit(Box::pin(async move { on_quit.arrived().await }));
-    let result = app.run().await;
+    let result = if quit.signal().is_some() {
+        // It came during startup: no UI just to leave it (the terminal may be gone), but the session is saved.
+        let _ = tokio::time::timeout(marv_tui::app::QUIT_FLUSH_TIMEOUT, Port(bridge.clone()).flush()).await;
+        Ok(())
+    } else {
+        let on_quit = quit.clone();
+        let app =
+            App::new(Arc::new(Port(bridge.clone())), rx, options).with_quit(Box::pin(async move { on_quit.arrived().await }));
+        app.run().await
+    };
     if tty {
         let pop = || {
             let _ = write!(std::io::stdout(), "\x1b[23;0t");

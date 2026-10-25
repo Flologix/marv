@@ -80,11 +80,41 @@ struct GitGroup {
     pgid: Option<nix::unistd::Pid>,
 }
 
+/// The groups of the gits running now, for [`kill_running`].
+static RUNNING: std::sync::Mutex<Vec<nix::unistd::Pid>> = std::sync::Mutex::new(Vec::new());
+
+fn running() -> std::sync::MutexGuard<'static, Vec<nix::unistd::Pid>> {
+    RUNNING.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl GitGroup {
+    fn new(pgid: Option<nix::unistd::Pid>) -> Self {
+        running().extend(pgid);
+        Self { pgid }
+    }
+
+    /// git exited (and was reaped): its group is gone or no longer its own to kill.
+    fn finished(&mut self) {
+        if let Some(pgid) = self.pgid.take() {
+            running().retain(|&p| p != pgid);
+        }
+    }
+}
+
 impl Drop for GitGroup {
     fn drop(&mut self) {
         if let Some(pgid) = self.pgid {
             let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
+            running().retain(|&p| p != pgid);
         }
+    }
+}
+
+/// SIGKILLs the process group of every git still running: for an exit that can't wait for the runtime to drop their
+/// tasks (#196: the forced exit after a quit signal, when the way out is stuck).
+pub fn kill_running() {
+    for pgid in running().drain(..) {
+        let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
     }
 }
 
@@ -115,7 +145,7 @@ pub async fn run_git_async(cwd: &Path, args: &[&str], options: GitOptions<'_>) -
         Ok(child) => child,
         Err(err) => return GitAsyncResult { out: err.to_string(), ..killed },
     };
-    let mut group = GitGroup { pgid: child.id().map(|pid| nix::unistd::Pid::from_raw(pid as i32)) };
+    let mut group = GitGroup::new(child.id().map(|pid| nix::unistd::Pid::from_raw(pid as i32)));
     // Written beside the reads: a large input and a large output would otherwise wait for each other.
     if let (Some(input), Some(mut stdin)) = (options.input, child.stdin.take()) {
         let input = input.to_vec();
@@ -130,8 +160,7 @@ pub async fn run_git_async(cwd: &Path, args: &[&str], options: GitOptions<'_>) -
         output = child.wait_with_output() => match output {
             Err(err) => GitAsyncResult { out: err.to_string(), ..killed },
             Ok(output) => {
-                // git exited (and was reaped): its group is gone or no longer its own to kill.
-                group.pgid = None;
+                group.finished();
                 let ok = output.status.success();
                 let out = String::from_utf8_lossy(if ok { &output.stdout } else { &output.stderr }).into_owned();
                 GitAsyncResult { ok, out, bytes: output.stdout, timed_out: false }

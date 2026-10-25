@@ -461,7 +461,15 @@ impl App {
     /// in the module docs, restores the terminal, then awaits `port.flush()` (bounded). A draw that fails (the
     /// terminal is gone) ends the loop too: the flush still runs, and the error is returned after it.
     pub async fn run(mut self) -> anyhow::Result<()> {
-        let guard = TerminalGuard::enter(self.options.render)?;
+        let guard = match TerminalGuard::enter(self.options.render) {
+            Ok(guard) => guard,
+            Err(e) => {
+                // No terminal (it closed during startup, #196): nothing to show, but the session is still saved.
+                crate::render_options::within(QUIT_RESTORE_TIMEOUT, crate::render_options::restore);
+                let _ = tokio::time::timeout(QUIT_FLUSH_TIMEOUT, self.port.flush()).await;
+                return Err(e.into());
+            }
+        };
         // No `terminal.clear()`: it asks the terminal where the cursor is, and a terminal that never
         // answers would stop Marv starting. The alternate screen starts blank, and the first draw
         // writes every cell.

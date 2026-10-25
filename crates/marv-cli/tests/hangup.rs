@@ -146,6 +146,84 @@ fn a_sigterm_during_a_prune_leaves_nothing_running_and_restores_the_terminal() {
     }
 }
 
+/// A test's folder (home, project, config, a `bin` first on PATH) and what it started: on drop, even after a failed
+/// assertion, the processes are SIGKILLed and the folder removed.
+struct Machine {
+    dir: PathBuf,
+    /// marv, the stand-in gc, a hook.
+    pids: Vec<i32>,
+    children: Vec<std::process::Child>,
+}
+
+impl Machine {
+    /// `name` keeps the tests' folders apart (they run at once); `config` is merged into the fake server's config.
+    fn new(name: &str, server: &FakeServer, config: serde_json::Value) -> Self {
+        // A short folder on macOS, as tests/radio.rs: the runtime folder's sockets need room in sun_path.
+        let base = if cfg!(target_os = "macos") { PathBuf::from("/tmp") } else { std::env::temp_dir() };
+        let dir = base.join(format!("mx-h{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for sub in ["run", "home", "proj", "config", "bin"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        let machine = Self { dir: dir.canonicalize().unwrap(), pids: Vec::new(), children: Vec::new() };
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(machine.dir.join("run"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut settings = serde_json::Value::Object(marv_oracle::runner::default_config(&server.base_url()));
+        if let serde_json::Value::Object(extra) = config {
+            settings.as_object_mut().unwrap().extend(extra);
+        }
+        std::fs::write(machine.dir.join("config/config.json"), settings.to_string()).unwrap();
+        machine
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        self.dir.join(name)
+    }
+
+    /// `program` in the project, with only this machine's environment.
+    fn command(&self, program: &str) -> Command {
+        let mut path = vec![self.dir.join("bin")];
+        path.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
+        let (runtime_var, runtime_dir) = if cfg!(target_os = "macos") {
+            let run = self.dir.join("run");
+            let run = run.strip_prefix("/private").map_or_else(|_| run.clone(), |r| Path::new("/").join(r));
+            ("MARV_RUNTIME_DIR", run.join("marv"))
+        } else {
+            ("XDG_RUNTIME_DIR", self.dir.join("run"))
+        };
+        let mut command = Command::new(program);
+        command
+            .current_dir(self.dir.join("proj"))
+            .env_clear()
+            .env("PATH", std::env::join_paths(path).unwrap())
+            .env("HOME", self.dir.join("home"))
+            .env("MARV_CONFIG_DIR", self.dir.join("config"))
+            .env(runtime_var, runtime_dir)
+            .env("MARV_GITHUB", "off")
+            .env("TERM", "xterm-256color")
+            .env("LANG", "C.UTF-8");
+        command
+    }
+
+    /// The pid a script wrote to `file` (once it has).
+    fn pid_in(&self, file: &str) -> Option<i32> {
+        std::fs::read_to_string(self.path(file)).ok()?.trim().parse().ok()
+    }
+}
+
+impl Drop for Machine {
+    fn drop(&mut self) {
+        for pid in &self.pids {
+            let _ = Command::new("kill").args(["-KILL", &pid.to_string()]).stderr(Stdio::null()).status();
+        }
+        for child in &mut self.children {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
 /// Starts marv in a pty, runs a turn whose prune's gc hangs, then sends `how` (a helper line) and checks marv exited
 /// with `code` and left nothing running. Returns what marv wrote to the terminal.
 fn quit_during_a_prune(how: &str, code: &str) -> Vec<u8> {
@@ -153,20 +231,12 @@ fn quit_during_a_prune(how: &str, code: &str) -> Vec<u8> {
         eprintln!("skipped: no python3 with pty, or no git");
         return Vec::new();
     };
-    // A short folder on macOS, as tests/radio.rs: the runtime folder's sockets need room in sun_path.
-    let base = if cfg!(target_os = "macos") { PathBuf::from("/tmp") } else { std::env::temp_dir() };
-    let dir = base.join(format!("mx-h{}-{}", how.to_lowercase(), std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    for sub in ["run", "home", "proj", "config", "bin"] {
-        std::fs::create_dir_all(dir.join(sub)).unwrap();
-    }
-    let dir = dir.canonicalize().unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(dir.join("run"), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let server = FakeServer::start(vec![Reply { text: "hello there".into(), ..Reply::default() }], vec![]).unwrap();
+    let mut machine = Machine::new(&how.to_lowercase(), &server, serde_json::Value::Null);
 
     // The stand-in git: a gc writes its pid and hangs (it stays git's process, in git's group); anything else is git.
-    let marker = dir.join("gc.pid");
-    let shim = dir.join("bin/git");
+    let marker = machine.path("gc.pid");
+    let shim = machine.path("bin/git");
     std::fs::write(
         &shim,
         format!(
@@ -176,35 +246,16 @@ fn quit_during_a_prune(how: &str, code: &str) -> Vec<u8> {
         ),
     )
     .unwrap();
+    use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    let server = FakeServer::start(vec![Reply { text: "hello there".into(), ..Reply::default() }], vec![]).unwrap();
-    let settings = serde_json::Value::Object(marv_oracle::runner::default_config(&server.base_url()));
-    std::fs::write(dir.join("config/config.json"), settings.to_string()).unwrap();
-    let mut path = vec![dir.join("bin")];
-    path.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
-    let (runtime_var, runtime_dir) = if cfg!(target_os = "macos") {
-        let run = dir.join("run");
-        let run = run.strip_prefix("/private").map_or_else(|_| run.clone(), |r| Path::new("/").join(r));
-        ("MARV_RUNTIME_DIR", run.join("marv"))
-    } else {
-        ("XDG_RUNTIME_DIR", dir.join("run"))
-    };
-    let log = dir.join("screen.log");
-    let mut helper = Command::new("python3")
+    let log = machine.path("screen.log");
+    let mut helper = machine
+        .command("python3")
         .arg("-c")
         .arg(PTY)
         .arg(&log)
         .arg(env!("CARGO_BIN_EXE_marv"))
-        .current_dir(dir.join("proj"))
-        .env_clear()
-        .env("PATH", std::env::join_paths(path).unwrap())
-        .env("HOME", dir.join("home"))
-        .env("MARV_CONFIG_DIR", dir.join("config"))
-        .env(runtime_var, runtime_dir)
-        .env("MARV_GITHUB", "off")
-        .env("TERM", "xterm-256color")
-        .env("LANG", "C.UTF-8")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -212,15 +263,18 @@ fn quit_during_a_prune(how: &str, code: &str) -> Vec<u8> {
         .unwrap();
     let mut stdout = BufReader::new(helper.stdout.take().unwrap());
     let mut stdin = helper.stdin.take().unwrap();
+    machine.children.push(helper);
     let mut line = String::new();
     stdout.read_line(&mut line).unwrap();
     let marv: i32 = line.trim().parse().unwrap();
+    machine.pids.push(marv);
 
     wait_for("the prompt", || screen(&log).contains(PROMPT));
     stdin.write_all(b"hi\n").unwrap();
     stdin.flush().unwrap();
-    wait_for("the prune's gc", || std::fs::read_to_string(&marker).is_ok_and(|s| s.trim().parse::<i32>().is_ok()));
-    let gc: i32 = std::fs::read_to_string(&marker).unwrap().trim().parse().unwrap();
+    wait_for("the prune's gc", || machine.pid_in("gc.pid").is_some());
+    let gc = machine.pid_in("gc.pid").unwrap();
+    machine.pids.push(gc);
     assert!(running(gc), "the stand-in gc is running");
 
     let hung_up = Instant::now();
@@ -229,21 +283,76 @@ fn quit_during_a_prune(how: &str, code: &str) -> Vec<u8> {
     drop(stdin);
     let mut report = String::new();
     stdout.read_to_string(&mut report).unwrap();
-    let _ = helper.wait();
     let field = |prefix: &str| report.lines().find_map(|l| l.strip_prefix(prefix)).map(str::trim).map(String::from);
     let exit = field("exit").unwrap_or_else(|| panic!("the helper didn't finish: {report:?}"));
     let left = field("left").unwrap_or_else(|| panic!("the helper didn't sweep: {report:?}"));
-    let still_gc = running(gc);
-    if still_gc {
-        let _ = Command::new("kill").args(["-KILL", &gc.to_string()]).status();
-    }
-    let drawn = std::fs::read(&log).unwrap_or_default();
-    let _ = std::fs::remove_dir_all(&dir);
 
     assert_eq!(exit, code, "marv {marv} ended by the signal's default (-n), or not through its way out: {report:?}");
     assert!(left.is_empty(), "still running 10 s after marv {marv} exited: {left:?}");
-    assert!(!still_gc, "the prune's gc {gc} outlived marv");
-    // Well within the 5 s deadline plus the helper's 10 s sweep: marv didn't wait for the 600 s gc.
+    assert!(!running(gc), "the prune's gc {gc} outlived marv");
+    // Well within the 10 s deadline plus the helper's 10 s sweep: marv didn't wait for the 600 s gc.
     assert!(hung_up.elapsed() < Duration::from_secs(14), "took {:?}", hung_up.elapsed());
-    drawn
+    std::fs::read(&log).unwrap_or_default()
+}
+
+/// `marv -p` with a session-start hook that writes its pid to `hook.pid` and then sleeps `sleep` seconds, started by
+/// `sh -c '<prefix> exec marv -p hi'` (so marv keeps the shell's pid and its ignored signals). Waits for the hook,
+/// sends marv SIGHUP, and returns marv's exit code, its stdout, how long it took after the signal, and the hook's pid.
+fn sighup_during_a_hook(name: &str, prefix: &str, sleep: u32) -> (Option<i32>, String, Duration, i32, Machine) {
+    let server = FakeServer::start(vec![Reply { text: "hello there".into(), ..Reply::default() }], vec![]).unwrap();
+    let hook = format!("echo $$ > hook.pid; sleep {sleep}");
+    let mut machine =
+        Machine::new(name, &server, serde_json::json!({"hooks": {"sessionStart": [{"command": hook, "timeout": 60}]}}));
+    let script = format!("{prefix} exec '{}' -p hi", env!("CARGO_BIN_EXE_marv"));
+    let child = machine
+        .command("sh")
+        .args(["-c", &script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let marv = child.id() as i32;
+    machine.pids.push(marv);
+    machine.children.push(child);
+    wait_for("the hook", || machine.pid_in("proj/hook.pid").is_some());
+    let hook = machine.pid_in("proj/hook.pid").unwrap();
+    machine.pids.push(hook);
+    let signalled = Instant::now();
+    let _ = Command::new("kill").args(["-HUP", &marv.to_string()]).status();
+    let child = machine.children.last_mut().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "marv -p didn't exit");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let took = signalled.elapsed();
+    let mut out = String::new();
+    let _ = child.stdout.take().unwrap().read_to_string(&mut out);
+    (status.code(), out, took, hook, machine)
+}
+
+/// `marv -p` gets SIGHUP during a slow session-start hook: it starts no turn, kills the hook, and exits 129 at once.
+#[test]
+fn marv_p_leaves_at_once_on_sighup_during_a_hook() {
+    let (code, out, took, hook, _machine) = sighup_during_a_hook("p", "", 30);
+    assert_eq!(code, Some(129), "stdout: {out:?}");
+    assert!(!out.contains("hello there"), "no turn: {out:?}");
+    assert!(took < Duration::from_secs(5), "took {took:?}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while running(hook) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!running(hook), "the hook {hook} outlived marv");
+}
+
+/// Under `nohup` (SIGHUP inherited as ignored), SIGHUP stays ignored: the run finishes and answers.
+#[test]
+fn marv_p_under_an_ignored_sighup_finishes_its_run() {
+    let (code, out, _, _, _machine) = sighup_during_a_hook("n", "trap '' HUP;", 2);
+    assert_eq!(code, Some(0), "stdout: {out:?}");
+    assert!(out.contains("hello there"), "{out:?}");
 }

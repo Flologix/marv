@@ -28,7 +28,7 @@
 //! [`restore`] on the way out and [`TerminalGuard::enter`] (or [`write_enter`]) on the way back.
 
 use std::io::{self, Write};
-use std::sync::Once;
+use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
 
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
@@ -124,13 +124,26 @@ pub fn restore() {
 /// For the way out after a hangup or SIGTERM (#196): a closed terminal fails writes with EIO, which [`restore`]
 /// ignores, but a terminal that stopped reading (XOFF, a frozen emulator) would block them for good. A write still
 /// blocked is left behind on its thread, which ends with the process.
+/// Without a thread (none could be started), `work` runs here, unbounded.
 pub fn within(limit: Duration, work: impl FnOnce() + Send + 'static) -> bool {
     let (done, finished) = std::sync::mpsc::channel();
+    let work = Arc::new(Mutex::new(Some(work)));
+    let on_thread = work.clone();
     let spawned = std::thread::Builder::new().name("marv-terminal".into()).spawn(move || {
-        work();
+        if let Some(work) = on_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            work();
+        }
         let _ = done.send(());
     });
-    spawned.is_ok() && finished.recv_timeout(limit).is_ok()
+    match spawned {
+        Ok(_) => finished.recv_timeout(limit).is_ok(),
+        Err(_) => {
+            if let Some(work) = work.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                work();
+            }
+            true
+        }
+    }
 }
 
 /// Chains a hook that restores the terminal before the previous hook prints the panic, so the
