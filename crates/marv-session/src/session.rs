@@ -4721,6 +4721,56 @@ mod turn_tests {
         assert!(session.send_now("late").is_err());
     }
 
+    /// #184: steering (Alt+Enter) is the person's own text: it never taints the session, the trajectory logs it, and a
+    /// compaction at the step boundary where it goes in doesn't lose it.
+    #[tokio::test]
+    async fn send_now_doesnt_taint_is_logged_and_survives_a_mid_turn_compaction() {
+        struct TypesDuringTheReply(Scripted, Mutex<Option<MarvSession>>);
+        impl Provider for TypesDuringTheReply {
+            fn name(&self) -> &str {
+                "scripted"
+            }
+            fn context_length(&self) -> Option<u64> {
+                self.0.context_length()
+            }
+            fn stream(&self, history: &[ChatTurn], options: StreamOptions) -> EventStream {
+                if self.0.requests().is_empty() {
+                    lock(&self.1).clone().unwrap().send_now("use https://example.com instead").unwrap();
+                }
+                self.0.stream(history, options)
+            }
+        }
+        let dirs = Dirs::new();
+        let store = Arc::new(TrajectoryStore::new(dirs.dir.join("t")));
+        let scripted_provider =
+            Scripted::new(vec![with(used(900), use_tools(vec![read("c1")])), say("SUMMARY of it all"), say("Finished.")])
+                .with_context(1000);
+        let provider = Arc::new(TypesDuringTheReply(scripted_provider.clone(), Mutex::default()));
+        let session = make(&dirs, fixed(provider.clone()), |i| i.trajectories = Some(store.clone()));
+        *lock(&provider.1) = Some(session.clone());
+        let events = collect(go(&session, "read it")).await;
+        assert_eq!(end_reason(&events), TurnEndReason::Done(StopReason::End));
+        // The person's words, even with a link in them, are no outside text.
+        assert!(session.tainted().is_empty(), "{:?}", session.tainted());
+        assert!(!events.iter().any(|e| matches!(e, SessionEvent::Tainted { .. })));
+        // The step boundary compacted first (the summary is of what came before), then the person's words joined
+        // Marv's note to go on: one user turn, never two in a row, and in the conversation from then on.
+        let requests = scripted_provider.requests();
+        assert_eq!(requests.len(), 3);
+        assert_alternating(&requests);
+        assert!(kinds(&events).contains(&"compacted"));
+        let last = requests[2].0.last().unwrap();
+        assert_eq!(role_of(last), "user");
+        assert!(text_of(last).contains("Continue where you left off"));
+        assert!(text_of(last).ends_with("use https://example.com instead"), "{last:?}");
+        assert!(session.conversation().iter().any(|t| text_of(t).contains("use https://example.com instead")));
+        // Logged to the trajectory as the person's message.
+        let log = records(&store, &dirs.project, &session).await;
+        let sent = log.iter().find(|r| r["type"] == "sent_now").expect("a sent_now record");
+        assert_eq!(sent["text"], "use https://example.com instead");
+        assert!(log.iter().all(|r| r["type"] != "taint"));
+    }
+
     #[tokio::test]
     async fn send_now_the_turn_never_read_comes_back_before_turn_end() {
         let dirs = Dirs::new();

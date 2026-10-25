@@ -2,7 +2,7 @@
 //!
 //! Left (never cut off): `yolo · ` when yolo is on (so the user always knows what runs without
 //! asking; hidden while a confirm or a flash shows), then the hint: "Press ctrl+c again to exit"
-//! (warning) / a flash ("Copied 3 lines") / busy: "esc to interrupt · alt+enter send now" or, in a subagent's
+//! (warning) / a flash ("Copied 3 lines") / busy: "esc to interrupt · enter queues · alt+enter send now" or, in a subagent's
 //! view, "esc to go back", plus "· 2 agents running" and "· 1 for the next step" (send now, waiting) / idle:
 //! "/help · PgUp/PgDn · ctrl+c exit".
 //! Right (cut from the *start* on a narrow terminal): usage · cost · model · cwd.
@@ -134,6 +134,8 @@ pub struct StatusBar<'a> {
     pub viewing: bool,
     /// "Send now" messages waiting for the turn's next step.
     pub sending: usize,
+    /// #184: messages queued for after the turn (listed above the prompt).
+    pub queued: usize,
 }
 
 impl StatusBar<'_> {
@@ -144,7 +146,7 @@ impl StatusBar<'_> {
         } else if let Some(flash) = self.flash {
             printable(flash)
         } else if self.busy {
-            let esc = if self.viewing { "esc to go back" } else { "esc to interrupt · alt+enter send now" };
+            let esc = if self.viewing { "esc to go back" } else { "esc to interrupt · enter queues · alt+enter send now" };
             let mut hint = match self.agents {
                 0 => esc.to_string(),
                 1 => format!("{esc} · 1 agent running"),
@@ -153,7 +155,13 @@ impl StatusBar<'_> {
             if self.sending > 0 {
                 hint.push_str(&format!(" · {} for the next step", self.sending));
             }
+            if self.queued > 0 {
+                hint.push_str(" · ↑ edit queued · ctrl+x drop");
+            }
             hint
+        } else if self.queued > 0 {
+            // A stop kept the queue (#184).
+            "enter sends queued · ↑ edit · ctrl+x drop".to_string()
         } else {
             "/help · PgUp/PgDn · ctrl+c exit".to_string()
         };
@@ -264,11 +272,11 @@ mod tests {
         let idle = StatusBar { info: Some(&info), ..Default::default() };
         assert_eq!(idle.left().to_string(), "yolo · /help · PgUp/PgDn · ctrl+c exit");
         let busy = StatusBar { busy: true, agents: 2, ..idle.clone() };
-        assert_eq!(busy.left().to_string(), "yolo · esc to interrupt · alt+enter send now · 2 agents running");
+        assert_eq!(busy.left().to_string(), "yolo · esc to interrupt · enter queues · alt+enter send now · 2 agents running");
         let sending = StatusBar { sending: 1, ..busy.clone() };
         assert_eq!(
             sending.left().to_string(),
-            "yolo · esc to interrupt · alt+enter send now · 2 agents running · 1 for the next step"
+            "yolo · esc to interrupt · enter queues · alt+enter send now · 2 agents running · 1 for the next step"
         );
         let viewing = StatusBar { busy: true, agents: 1, viewing: true, ..idle.clone() };
         assert_eq!(viewing.left().to_string(), "yolo · esc to go back · 1 agent running");
@@ -287,7 +295,7 @@ mod tests {
         assert_eq!(idle.left().spans[2].style.fg, Some(theme::ACCENT));
         let two = StatusInfo { processes: 2, ..Default::default() };
         let busy = StatusBar { info: Some(&two), busy: true, ..Default::default() };
-        assert_eq!(busy.left().to_string(), "2 running · esc to interrupt · alt+enter send now");
+        assert_eq!(busy.left().to_string(), "2 running · esc to interrupt · enter queues · alt+enter send now");
         // Not over the exit confirmation or a flash, and not at all with none.
         assert_eq!(StatusBar { confirm_exit: true, ..busy.clone() }.left().to_string(), "Press ctrl+c again to exit");
         assert_eq!(StatusBar { flash: Some("Copied"), ..busy.clone() }.left().to_string(), "Copied");
