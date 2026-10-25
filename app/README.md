@@ -72,7 +72,7 @@ Your home folder and anything above it are refused.
 
 ## Install it on macOS
 
-Download `marv-desktop-<arch>-apple-darwin.dmg` from the release and drag Marv to Applications: the app bundle is the launcher entry (Launchpad, Spotlight, the Dock). It's signed ad hoc, not with a Developer ID, so open it the first time with right-click → **Open** (or System Settings → Privacy & Security → **Open Anyway**, or `xattr -dr com.apple.quarantine /Applications/Marv.app`). From a clone, `app/install-desktop.sh` builds Marv.app and copies it to /Applications instead (`--uninstall` removes it); a local build isn't quarantined. Open a folder from a terminal with `open -a Marv --args "$PWD"` (an absolute path, since the app starts in `/`; if Marv is already open, it only comes to the front).
+Download `marv-desktop-<arch>-apple-darwin.dmg` from the release and drag Marv to Applications: the app bundle is the launcher entry (Launchpad, Spotlight, the Dock). It's signed ad hoc, not with a Developer ID, so open it the first time with System Settings → Privacy & Security → **Open Anyway**, or run `xattr -dr com.apple.quarantine /Applications/Marv.app` (on macOS 14 only, right-click → **Open** works too). From a clone, `app/install-desktop.sh` builds Marv.app and copies it to /Applications instead (`--uninstall` removes it); a local build isn't quarantined. Open a folder from a terminal with `open -a Marv --args "$PWD"` (an absolute path, since the app starts in `/`; if Marv is already open, it only comes to the front).
 
 On macOS a notification is sent as Marv (its name and icon, its settings in System Settings → Notifications); clicking one brings the window up but doesn't switch to the chat. Dictation is the system's (Globe key twice); links open with `open`.
 

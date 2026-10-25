@@ -14,8 +14,13 @@ ENTRY="$HOME/.local/share/applications/marv-desktop.desktop"
 if [ "$(uname -s)" = Darwin ]; then
   if [ -w /Applications ]; then APPS=/Applications; else APPS="$HOME/Applications"; fi
   if [ "${1:-}" = "--uninstall" ]; then
-    rm -rf "${APPS:?}/Marv.app"
-    echo "Removed Marv desktop from $APPS."
+    # Wherever an earlier run put it.
+    for dir in /Applications "$HOME/Applications"; do
+      if [ -d "${dir:?}/Marv.app" ]; then
+        rm -rf "${dir:?}/Marv.app"
+        echo "Removed Marv desktop from $dir."
+      fi
+    done
     exit 0
   fi
   npm install --silent

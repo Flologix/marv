@@ -354,13 +354,13 @@ struct Launch {
 
 /// `marv-desktop <dir>`, once: a folder inside the Marv folder is selected; any other becomes the Marv folder.
 ///
-/// The page asks for it first thing, so with `MARV_DESKTOP_SMOKE` set (CI's launch check of a built bundle) this is
+/// The page asks for it first thing, so with `MARV_DESKTOP_SMOKE_TEST=1` (CI's launch check of a built bundle) this is
 /// where the app is known to be up: the window opened, the bundled page ran and reached the backend. It prints
 /// `marv-desktop: ready` (or why the launch folder was refused) and quits.
 #[tauri::command]
 fn take_launch(app: tauri::AppHandle, desktop: State<'_, Desktop>) -> Result<Option<Launch>, String> {
     let launch = launch_folder(&desktop);
-    if std::env::var_os("MARV_DESKTOP_SMOKE").is_some() {
+    if std::env::var_os("MARV_DESKTOP_SMOKE_TEST").is_some_and(|v| v == "1") {
         match &launch {
             Ok(Some(l)) => println!("marv-desktop: ready, root {}", l.info.root.as_deref().unwrap_or("(none)")),
             Ok(None) => println!("marv-desktop: ready"),

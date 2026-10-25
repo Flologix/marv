@@ -202,11 +202,11 @@ It loads what the CLI loads (your `~/.marv` skills, memory, MCP servers and inst
 
 **On macOS** (14 or newer, Apple silicon or Intel), download the .dmg for your Mac from the [latest release](https://github.com/FlologixAI/marv/releases/latest) (releases after 0.10.0 have one): `marv-desktop-aarch64-apple-darwin.dmg` for Apple silicon, `marv-desktop-x86_64-apple-darwin.dmg` for Intel. Open it and drag **Marv** to Applications; then it's in Launchpad and Spotlight like any app, and there's no launcher entry to add.
 
-The app isn't signed with an Apple Developer ID yet, so the first time macOS says it can't check it for malicious software. Open it once anyway, in one of these ways:
+The app isn't signed with an Apple Developer ID or notarized yet, so the first time macOS refuses to open it ("Apple could not verify…"). Open it once anyway:
 
-- In Finder, right-click (or Control-click) **Marv** in Applications, choose **Open**, then **Open** again.
-- Or try to open it, then go to **System Settings → Privacy & Security**, scroll to the message about Marv and click **Open Anyway**.
-- Or in a terminal: `xattr -dr com.apple.quarantine /Applications/Marv.app`.
+1. Try to open **Marv**, then go to **System Settings → Privacy & Security**, scroll to the message about Marv, click **Open Anyway** and confirm.
+2. Or in a terminal: `xattr -dr com.apple.quarantine /Applications/Marv.app`, then open it as usual.
+3. On macOS 14 only, right-click (or Control-click) **Marv** in Applications, choose **Open**, then **Open** again also works; macOS 15 removed that shortcut.
 
 After that it opens normally. To open a specific folder from a terminal: `open -a Marv --args "$PWD"` (an absolute path; when Marv is already open, it only comes to the front). A notification's click brings the window up (on Linux it also opens the chat). Dictation is macOS's own: press the Globe (fn) key twice in the prompt.
 

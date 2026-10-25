@@ -1,6 +1,6 @@
 #!/bin/sh
 # Launches a built Marv.app's binary and waits for it to say it's up (#208): the window opened, the bundled page ran
-# and asked the backend for the launch folder (`MARV_DESKTOP_SMOKE`, see take_launch in app/src-tauri/src/lib.rs).
+# and asked the backend for the launch folder (`MARV_DESKTOP_SMOKE_TEST=1`, see take_launch in app/src-tauri/src/lib.rs).
 # Fails if it doesn't say so within the time limit, or exits without it.
 #
 #   packaging/desktop/smoke-macos.sh path/to/Marv.app
@@ -16,7 +16,7 @@ log="$work/log"
 
 # A HOME of its own, so the app's settings and chats land in the temp folder; the launch folder is outside it (the
 # Marv folder can't be HOME or above it).
-HOME="$work/home" MARV_DESKTOP_SMOKE=1 "$bin" "$work/folder" >"$log" 2>&1 &
+HOME="$work/home" MARV_DESKTOP_SMOKE_TEST=1 "$bin" "$work/folder" >"$log" 2>&1 &
 pid=$!
 waited=0
 while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt "$limit" ]; do

@@ -6,19 +6,25 @@
 #   marv-aarch64-unknown-linux-musl.tar.gz  (+ .sha256)
 #   marv-x86_64-apple-darwin.tar.gz         (+ .sha256)
 #   marv-aarch64-apple-darwin.tar.gz        (+ .sha256)
-#   marv-desktop-x86_64-apple-darwin.dmg    (+ .sha256)  Marv desktop (app/), #208
+#   marv-desktop-x86_64-apple-darwin.dmg    (+ .sha256)  Marv desktop (app/), #208, when its build succeeded
 #   marv-desktop-aarch64-apple-darwin.dmg   (+ .sha256)
 #   SHA256SUMS                              all of the above, which install.sh checks against
 #   install.sh
 #   flologixai-marv-*.tgz                   the npm packages (packaging/npm), published by hand
 #
-# Run it by hand (workflow_dispatch) for a dry run: everything but the release.
+# Run it by hand (workflow_dispatch) for a dry run: everything but creating the release (the assets it would attach
+# are uploaded as the `release-assets` artifact). `desktop: false` leaves the .dmg out, as when its build fails.
 name: Release
 
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      desktop:
+        description: Build Marv desktop's .dmg
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -86,13 +92,8 @@ jobs:
   # macOS (#167): native runners, no zig; arm64 on Apple silicon, x86_64 on Intel, so each build is smoke-tested on
   # its own CPU. Rust's linker signs the arm64 binary ad hoc, which is all macOS needs to run it (it's never
   # quarantined: curl and npm don't set the flag).
-  #
-  # #208: the same runners build Marv desktop's .dmg. It's signed ad hoc unless the signing secrets are set
-  # (APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY; and APPLE_ID, APPLE_PASSWORD, APPLE_TEAM_ID
-  # to notarize): then Tauri signs it with the Developer ID and notarizes it. Without them, people open it once with
-  # right-click → Open (README).
   build-macos:
-    timeout-minutes: 60
+    timeout-minutes: 30
     strategy:
       fail-fast: true
       matrix:
@@ -124,6 +125,34 @@ jobs:
           target/${{ matrix.target }}/release/marv --version
           packaging/smoke.sh ${{ matrix.target }} dist
           packaging/npm/test.sh target/${{ matrix.target }}/release/marv
+      - uses: actions/upload-artifact@v4
+        with:
+          name: marv-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  # Marv desktop's .dmg (#208), on the same macOS runners, in a job of its own: if it fails, the release goes out
+  # without it (the CLI and npm assets never depend on the desktop). It's signed ad hoc unless the signing secrets are
+  # set (APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY; and APPLE_ID, APPLE_PASSWORD,
+  # APPLE_TEAM_ID to notarize): then Tauri signs it with the Developer ID and notarizes it. Without them, people open
+  # it once with Open Anyway (README).
+  build-desktop-macos:
+    if: github.event_name != 'workflow_dispatch' || inputs.desktop
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin, runner: macos-14, arch: arm64 }
+          - { target: x86_64-apple-darwin, runner: macos-15-intel, arch: x86_64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: desktop-${{ matrix.target }}
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -140,13 +169,12 @@ jobs:
           MAC_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           npm ci
-          # Only set secrets reach Tauri: an empty APPLE_CERTIFICATE would make it try to import nothing.
-          set -- --bundles app,dmg --target ${{ matrix.target }}
+          # Only set secrets reach Tauri: an empty APPLE_CERTIFICATE would make it try to import nothing. A set
+          # APPLE_SIGNING_IDENTITY takes the place of the config's ad hoc identity.
           if [ -n "$MAC_SIGNING_IDENTITY" ] && [ -n "$MAC_CERTIFICATE" ]; then
             echo "Signing with the Developer ID certificate"
             export APPLE_CERTIFICATE="$MAC_CERTIFICATE" APPLE_CERTIFICATE_PASSWORD="$MAC_CERTIFICATE_PASSWORD" \
               APPLE_SIGNING_IDENTITY="$MAC_SIGNING_IDENTITY"
-            set -- "$@" --config "{\"bundle\":{\"macOS\":{\"signingIdentity\":\"$MAC_SIGNING_IDENTITY\"}}}"
             if [ -n "$MAC_ID" ] && [ -n "$MAC_PASSWORD" ] && [ -n "$MAC_TEAM_ID" ]; then
               echo "and notarizing"
               export APPLE_ID="$MAC_ID" APPLE_PASSWORD="$MAC_PASSWORD" APPLE_TEAM_ID="$MAC_TEAM_ID"
@@ -154,29 +182,33 @@ jobs:
           else
             echo "No signing secrets: an unsigned (ad hoc) build"
           fi
-          npx tauri build "$@"
+          npx tauri build --bundles app,dmg --target ${{ matrix.target }}
       # The launch check CI runs (.github/workflows/desktop.yml), on the bundle that goes in the .dmg.
-      - name: Smoke test Marv desktop
+      - name: Smoke test
         run: |
           app=target/${{ matrix.target }}/release/bundle/macos/Marv.app
           bin=$(find "$app/Contents/MacOS" -type f -perm -u+x | head -n 1)
           [ "$(lipo -archs "$bin")" = "${{ matrix.arch }}" ]
           codesign --verify --deep --strict --verbose=2 "$app"
           packaging/desktop/smoke-macos.sh "$app"
-      - name: Package Marv desktop
+      - name: Package
         run: |
           asset=marv-desktop-${{ matrix.target }}.dmg
+          mkdir -p dist
           cp target/${{ matrix.target }}/release/bundle/dmg/*.dmg "dist/$asset"
           (cd dist && shasum -a 256 "$asset" >"$asset.sha256" && cat "$asset.sha256")
       - uses: actions/upload-artifact@v4
         with:
-          name: marv-${{ matrix.target }}
+          name: desktop-${{ matrix.target }}
           path: dist/*
           if-no-files-found: error
 
+  # On a tag, the release; by hand, everything up to it. It waits for the desktop build but needs only the CLI's.
   release:
-    needs: [install-test, build, build-macos]
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [install-test, build, build-macos, build-desktop-macos]
+    if: >-
+      !cancelled() && needs.install-test.result == 'success' && needs.build.result == 'success' &&
+      needs.build-macos.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -187,6 +219,13 @@ jobs:
           path: dist
           pattern: marv-*
           merge-multiple: true
+      # Whichever .dmg built (none if the desktop job failed or was skipped).
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          path: dist
+          pattern: desktop-*
+          merge-multiple: true
       - name: SHA256SUMS
         run: |
           cp install.sh dist/
@@ -195,18 +234,32 @@ jobs:
             [ -f "marv-$target.tar.gz" ] || { echo "marv-$target.tar.gz is missing"; exit 1; }
           done
           for target in x86_64-apple-darwin aarch64-apple-darwin; do
-            [ -f "marv-desktop-$target.dmg" ] || { echo "marv-desktop-$target.dmg is missing"; exit 1; }
+            [ -f "marv-desktop-$target.dmg" ] || echo "::warning::marv-desktop-$target.dmg didn't build: the release goes out without it"
           done
-          cat marv-*.tar.gz.sha256 marv-desktop-*.dmg.sha256 > SHA256SUMS
+          cat marv-*.tar.gz.sha256 $(ls marv-desktop-*.dmg.sha256 2>/dev/null) > SHA256SUMS
           sha256sum -c SHA256SUMS
           cat SHA256SUMS
       # The npm packages go up as release assets too; publishing them needs the maintainer's 2FA, so it's done by hand
       # (packaging/npm/build.sh says the order).
       - name: npm packages
         run: |
-          packaging/npm/build.sh "${GITHUB_REF_NAME#v}" dist npm
+          # A dry run has no tag: the workspace's version stands in.
+          case $GITHUB_REF in
+            refs/tags/v*) version=${GITHUB_REF_NAME#v} ;;
+            *) version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1) ;;
+          esac
+          packaging/npm/build.sh "$version" dist npm
           mv npm/*.tgz dist/
+          ls -l dist
+      - name: Keep the dry run's assets
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: dist/*
+          retention-days: 3
       - name: Create the release
+        if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
