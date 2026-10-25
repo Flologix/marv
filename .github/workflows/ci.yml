@@ -121,3 +121,31 @@ jobs:
           cargo build -p marv-cli
           packaging/package.sh "$target" target/debug/marv "$RUNNER_TEMP/assets"
           packaging/smoke.sh "$target" "$RUNNER_TEMP/assets"
+
+  # TEMPORARY (#183): the link-rule proof with `log stream`, and Go's net.Interfaces() with a Go outside the home.
+  probe-183:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-14, macos-15]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - name: Where Go is, and a copy outside the home
+        run: |
+          echo "HOME=$HOME RUNNER_TOOL_CACHE=$RUNNER_TOOL_CACHE"
+          toolcache_go=$(dirname "$(command -v go)")
+          echo "toolcache go: $toolcache_go"
+          sudo mkdir -p /usr/local/go-probe
+          sudo cp -R "$(go env GOROOT)/." /usr/local/go-probe/
+          sudo chmod -R a+rX /usr/local/go-probe
+          echo "MARV_PROBE_GO=$toolcache_go:/usr/local/go-probe/bin" >> "$GITHUB_ENV"
+      - run: cargo test -p marv-sandbox --test seatbelt_probe -- --nocapture link_is_refused
+      - run: cargo test -p marv-sandbox --test seatbelt_probe -- --ignored --nocapture probe_round6

@@ -943,3 +943,159 @@ fn probe_round5() {
     }
     println!("\n===== REPORT =====\n{}\n===== END =====", report.join("\n"));
 }
+
+/// What `sender == "Sandbox"` logs while `f` runs: `log stream`'s lines with a denial in them (#183).
+fn sandbox_denials<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let path = std::env::temp_dir().join(format!("mx-log-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
+    let file = std::fs::File::create(&path).unwrap();
+    let mut stream = Command::new("/usr/bin/log")
+        .args(["stream", "--style", "compact", "--predicate", "sender == \"Sandbox\""])
+        .stdin(Stdio::null())
+        .stdout(file)
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let got = f();
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let _ = stream.kill();
+    let _ = stream.wait();
+    let lines = std::fs::read_to_string(&path).unwrap_or_default();
+    let _ = std::fs::remove_file(&path);
+    (got, lines.lines().filter(|l| l.contains("deny")).map(|l| l.trim().to_string()).collect())
+}
+
+/// Round 6 (#183): which rule refuses `ln ~/.ssh/known_hosts x` once the home's read deny is gone, links are allowed
+/// anywhere and the home is writable (the #178 proof), with `log stream` naming each denied operation; and Go's
+/// `net.Interfaces()` under the profile, with a Go outside the home (`MARV_PROBE_GO`: its `bin` folder).
+#[test]
+#[ignore = "a report for #183: run with --ignored --nocapture on macOS"]
+fn probe_round6() {
+    let mut report: Vec<String> = Vec::new();
+    let mut note = |name: &str, what: String| {
+        println!("PROBE {name}: {what}");
+        report.push(format!("{name}: {what}"));
+    };
+    let mut fx = Fx::new("r6");
+    // The guards' fixture: a fake home outside the user's temporary folder, a project in it.
+    let home = PathBuf::from(format!("/private/var/tmp/mx-probe-{}-r6home", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(home.join(".ssh")).unwrap();
+    std::fs::create_dir_all(home.join("proj")).unwrap();
+    std::fs::write(home.join(".ssh/known_hosts"), "SECRET-SSH\n").unwrap();
+    fx.extra.push(home.clone());
+    let proj = home.join("proj");
+    let plan = {
+        let mut sb = Sandbox::from_env(true);
+        sb.home = home.clone();
+        sb.path = std::env::var("PATH").unwrap_or_default();
+        sb.plan(&proj, &CommandMounts::default())
+    };
+    let shipped = seatbelt::profile(&plan, &fx.run(), &RealFs).unwrap();
+    note("rules.link", shipped.text.lines().filter(|l| l.contains("file-link")).collect::<Vec<_>>().join(" ;; "));
+    const HOME_READ: &str = "(deny file-read* (subpath (param \"HOME\")))\n";
+    assert!(shipped.text.contains(HOME_READ));
+    let edit = |remove: &[&str], append: &[&str]| {
+        let mut text = shipped.text.clone();
+        for r in remove {
+            text = text.replace(r, "");
+        }
+        for a in append {
+            text.push_str(a);
+            text.push('\n');
+        }
+        Profile { text, params: shipped.params.clone() }
+    };
+    const LINKS: &str = "(allow file-link)";
+    const HOME_WRITE: &str = "(allow file-write* (subpath (param \"HOME\")))";
+    let variants = [
+        ("shipped", edit(&[], &[])),
+        ("no_home_read", edit(&[HOME_READ], &[])),
+        ("no_home_read.links_anywhere", edit(&[HOME_READ], &[LINKS])),
+        ("no_home_read.links_anywhere.home_writable", edit(&[HOME_READ], &[LINKS, HOME_WRITE])),
+        ("shipped.allow_file_all_last", edit(&[], &["(allow file*)"])),
+        ("shipped.allow_file_link_and_data_last", edit(&[], &["(allow file-link file-read* file-write*)"])),
+        ("minimal_allow_default", Profile { text: "(version 1)\n(allow default)\n".into(), params: vec![] }),
+    ];
+    let k = home.join(".ssh/known_hosts");
+    for (name, prof) in &variants {
+        let script = format!(
+            "K='{k}'; cat \"$K\" && echo read-ok; echo w >> \"$K\" && echo write-ok; \
+             ln \"$K\" ln-{name} && echo ln-ok; \
+             python3 -c 'import os,sys; os.link(sys.argv[1], sys.argv[2]); print(\"pylink-ok\")' \"$K\" py-{name}; \
+             echo p > plain-{name} && ln plain-{name} plain2-{name} && echo plain-ln-ok",
+            k = k.display()
+        );
+        let (out, denials) = sandbox_denials(|| fx.sh(prof, &proj, &script));
+        note(&format!("link6.{name}"), out.to_string());
+        note(&format!("link6.{name}.denials"), denials.join(" || "));
+    }
+
+    // Go's net.Interfaces(), with a Go outside the home (the runner's toolcache Go lives under it).
+    let gos = std::env::var("MARV_PROBE_GO").unwrap_or_default();
+    std::fs::write(
+        fx.root.join("ifaces.go"),
+        "package main\nimport (\"fmt\"; \"net\")\nfunc main() { i, err := net.Interfaces(); fmt.Println(len(i), err) }\n",
+    )
+    .unwrap();
+    for go in gos.split(':').filter(|g| !g.is_empty()) {
+        note(&format!("ifaces6.go[{go}].host"), output(Command::new(format!("{go}/go")).args(["env", "GOROOT"])).to_string());
+        for (name, prof) in [("network_off", fx.profile(false)), ("network_on", fx.profile(true))] {
+            let script = format!(
+                "PATH='{go}':$PATH; go version && echo GOROOT=$(go env GOROOT) && ls \"$(go env GOROOT)/src/net\" | head -1 && go run ifaces.go"
+            );
+            let (out, denials) = sandbox_denials(|| fx.sh(&prof, &fx.root, &script));
+            note(&format!("ifaces6.go[{go}].{name}"), out.to_string());
+            note(&format!("ifaces6.go[{go}].{name}.denials"), denials.join(" || "));
+        }
+    }
+    if gos.is_empty() {
+        note("ifaces6.go", "MARV_PROBE_GO not set".into());
+    }
+    println!("\n===== REPORT =====\n{}\n===== END =====", report.join("\n"));
+}
+
+/// **Seatbelt refuses `link()` from a source it denies for reading or writing the file's data, whatever the
+/// `file-link` rules say** (#166 review probe, #183). The profile's link denies are a second layer on top of this
+/// (`HARD_LINK_OP` in `seatbelt.rs`); not a probe but a test, so an OS that stops doing it fails here.
+#[test]
+fn link_is_refused_from_a_source_denied_for_reads_or_writes() {
+    struct Dir(PathBuf);
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let dir = Dir(PathBuf::from(format!("/private/var/tmp/mx-link-{}", std::process::id())));
+    let (a, b) = (dir.0.join("A"), dir.0.join("B"));
+    for d in [&a, &b] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let src = a.join("f");
+    std::fs::write(&src, "a").unwrap();
+    let link = |rules: &str, dst: &Path| {
+        output(
+            Command::new(SANDBOX_EXEC)
+                .args(["-p", &format!("(version 1)\n(allow default)\n{rules}\n"), "/bin/ln"])
+                .arg(&src)
+                .arg(dst),
+        )
+    };
+    // The control: with nothing denied, the link is made.
+    let dst = b.join("control");
+    let out = link("", &dst);
+    assert!(out.code == Some(0) && dst.exists(), "control: {out}");
+    let a_rule = |op: &str| format!("(deny {op} (subpath \"{}\"))", a.display());
+    for (name, deny) in [("read", a_rule("file-read-data")), ("write", a_rule("file-write-data"))] {
+        for (allow_name, allow) in [("", ""), ("+allow_link", "(allow file-link)")] {
+            let dst = b.join(format!("{name}{allow_name}"));
+            let out = link(&format!("{deny}\n{allow}"), &dst);
+            assert!(
+                out.code != Some(0) && out.err.contains("Operation not permitted") && !dst.exists(),
+                "{name}{allow_name}: {out}"
+            );
+        }
+    }
+}
