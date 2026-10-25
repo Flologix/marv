@@ -63,6 +63,13 @@ runs), tool calls by name, tool errors, tokens (prompt, cached, completion), cos
 keeps the stream, Marv's trajectory, stderr and the diff. Marv's cost is what OpenRouter charged; Claude Code's is its
 own estimate at API prices, opencode's its own estimate from its price list.
 
+## How the model batches its calls
+
+`python3 -I evals/batching_stats.py <folder> […]` prints, per run, the main agent's steps per turn, calls per step,
+the share of steps that made one call and of those that only read, and how many steps were runs of single read-only
+calls that could have been one step (#215). A folder is a bench run (`evals/results/<run>`), a SWE-bench run's `logs/`,
+or `~/.marv/trajectories`.
+
 ## Adding a task
 
 A folder in `evals/tasks/` with `task.md`, `repo/`, `check/__eval__.test.js` and `solution/` (plus `mcp.json`,
