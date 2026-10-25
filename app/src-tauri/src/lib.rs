@@ -353,8 +353,25 @@ struct Launch {
 }
 
 /// `marv-desktop <dir>`, once: a folder inside the Marv folder is selected; any other becomes the Marv folder.
+///
+/// The page asks for it first thing, so with `MARV_DESKTOP_SMOKE_TEST=1` (CI's launch check of a built bundle) this is
+/// where the app is known to be up: the window opened, the bundled page ran and reached the backend. It prints
+/// `marv-desktop: ready` (or why the launch folder was refused) and quits.
 #[tauri::command]
-fn take_launch(desktop: State<'_, Desktop>) -> Result<Option<Launch>, String> {
+fn take_launch(app: tauri::AppHandle, desktop: State<'_, Desktop>) -> Result<Option<Launch>, String> {
+    let launch = launch_folder(&desktop);
+    if std::env::var_os("MARV_DESKTOP_SMOKE_TEST").is_some_and(|v| v == "1") {
+        match &launch {
+            Ok(Some(l)) => println!("marv-desktop: ready, root {}", l.info.root.as_deref().unwrap_or("(none)")),
+            Ok(None) => println!("marv-desktop: ready"),
+            Err(e) => println!("marv-desktop: launch folder refused: {e}"),
+        }
+        app.exit(if launch.is_ok() { 0 } else { 1 });
+    }
+    launch
+}
+
+fn launch_folder(desktop: &Desktop) -> Result<Option<Launch>, String> {
     let Some(path) = desktop.launch.lock().unwrap_or_else(|e| e.into_inner()).take() else { return Ok(None) };
     let dir = std::fs::canonicalize(&path).map_err(|e| format!("Couldn't open {path}: {e}"))?;
     if !dir.is_dir() {
@@ -363,9 +380,9 @@ fn take_launch(desktop: State<'_, Desktop>) -> Result<Option<Launch>, String> {
     if let Some(root) = desktop.store.settings().root
         && let Ok(rel) = dir.strip_prefix(&root)
     {
-        return Ok(Some(Launch { info: info(&desktop), folder: rel.to_string_lossy().into_owned() }));
+        return Ok(Some(Launch { info: info(desktop), folder: rel.to_string_lossy().into_owned() }));
     }
-    let info = save_root(&desktop, check_root(&path)?)?;
+    let info = save_root(desktop, check_root(&path)?)?;
     Ok(Some(Launch { info, folder: String::new() }))
 }
 
@@ -782,12 +799,20 @@ fn open_url(url: String) -> Result<(), String> {
     if !(url.starts_with("https://") || url.starts_with("http://")) {
         return Err("Only web links open here.".into());
     }
-    std::process::Command::new("xdg-open").arg(&url).spawn().map(|_| ()).map_err(|e| e.to_string())
+    // macOS's `open`; elsewhere the freedesktop opener.
+    let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    std::process::Command::new(opener).arg(&url).spawn().map(|_| ()).map_err(|e| e.to_string())
 }
 
 /// Starts or stops dictation with Voxtype (Omarchy's; Super+Ctrl+X does the same): it types into the focused field.
 #[tauri::command]
 fn dictate() -> Result<(), String> {
+    if cfg!(target_os = "macos") {
+        return Err(
+            "On macOS, use the system's dictation: press the Globe (fn) key twice, or turn it on in System Settings → Keyboard."
+                .into(),
+        );
+    }
     std::process::Command::new("voxtype")
         .args(["record", "toggle"])
         .spawn()
