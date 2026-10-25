@@ -1,7 +1,7 @@
 # macOS: background processes without Linux namespaces
 
 - Issue: FlologixAI/marv #152 (part of the macOS port, #150; follows #166, the Seatbelt backend)
-- Status: **draft, awaiting maintainer approval.** The decisions are in §10.
+- Status: **approved 2026-10-25** (the maintainer: "approve both specs"), with every decision in §10 as recommended. Option A ships only if the blocking probes pass.
 - Date: 2026-10-25, against `main` at `3a31512` (after 0.10.0).
 - Builds on: `docs/specs/2026-10-17-macos-sandbox.md` (approved 2026-10-19). Its §8 and decision 4 already chose "off until #152, then option A". This spec works A out in detail, checks B again, and lists what must be proven on the macOS runner before A ships.
 - Scope:
