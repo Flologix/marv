@@ -1,4 +1,4 @@
-//! A process's place on the mesh (moved from marv-cli's `mesh_cmd` so Marv desktop can use it too): its switchboard,
+//! A process's place on the mesh (moved from marv-cli's `mesh_cmd` so any SDK host can use it): its switchboard,
 //! named by `marv_mesh::discovery::mesh_name`, with Herdr's agent panes as receptacles when Marv runs in a Herdr
 //! pane, and its door ([`Mesh::open_door`]) at `<runtime>/mesh/<name>.sock`. No runtime folder, no
 //! mesh (never a `/tmp` fallback).

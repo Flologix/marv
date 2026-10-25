@@ -26,7 +26,7 @@ pub const MAIN_AGENT_ONLY: [&str; 5] = ["process", "memory", "plan", "agent", "r
 /// Who started the turn a call runs in. Set by the session; nothing a tool or the model sends changes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum CallMode {
-    /// The person typed it, at a terminal, in the desktop app or over the SDK.
+    /// The person typed it, at a terminal or over the SDK.
     #[default]
     Person,
     /// A one-shot session: `marv -p`, or an SDK session made `one_shot`. No one at a prompt: what asks is answered by

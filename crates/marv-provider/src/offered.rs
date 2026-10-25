@@ -1,7 +1,7 @@
 //! Which subscriptions setup offers (#159): one switch each, in this one place.
 //!
-//! Both are built and work when a config names them; these only decide whether the setup screen, `/setup` and the
-//! desktop's onboarding offer them. Each is off until the vendor has cleared Marv:
+//! Both are built and work when a config names them; these only decide whether the setup screen and `/setup` offer
+//! them. Each is off until the vendor has cleared Marv:
 //! - Z.ai's GLM Coding Plan may only be used from tools Z.ai lists (docs.z.ai/devpack/faq), and Marv isn't listed yet.
 //! - Sign in with ChatGPT: OpenAI's program for open-source agents registers each person's client dynamically, but
 //!   whether Marv takes part is the maintainer's call with OpenAI.

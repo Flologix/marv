@@ -1,6 +1,6 @@
 //! The session's side of the mesh (new in marv-rs; `docs/MESH.md`, `docs/subsystems/mesh.md` v1).
 //!
-//! - The session (the TUI's, `marv -p`'s, or each of Marv desktop's chats) owns the [`MeshHandle`]: one
+//! - The session (the TUI's, `marv -p`'s, or an SDK host's) owns the [`MeshHandle`]: one
 //!   `Switchboard`, on the host, outside every sandbox ([`start`] makes one and serves it). Its trajectory sink is
 //!   [`crate::trajectory::MeshSink`] on the conversation's current log ([`log_to`]; rule 3: every message logged).
 //! - The main agent's plug is [`PARENT`]. Each subagent gets a plug of its own ([`SubagentPlug`], `worker-N`) with
@@ -81,7 +81,7 @@ pub fn start(
 }
 
 /// A new plug folder of this switchboard's own: `<runtime>/p/<pid>-<4 hex>`, made exclusively (0700). A process can
-/// run several switchboards (Marv desktop's chats): sharing a folder, a second `parent` plug would replace the first's
+/// run several switchboards (an SDK host with several sessions): sharing a folder, a second `parent` plug would replace the first's
 /// socket. And a folder a dead process with the same pid left is never taken over.
 fn plug_folder(runtime: &std::path::Path) -> std::io::Result<PathBuf> {
     use std::os::unix::fs::DirBuilderExt;
@@ -819,7 +819,7 @@ mod tests {
         MeshTool::all(plug, mesh, approver).into_iter().find(|t| t.name == name).unwrap()
     }
 
-    /// Two switchboards in one process (Marv desktop's chats) get plug folders of their own: the second `parent` never
+    /// Two switchboards in one process get plug folders of their own: the second `parent` never
     /// replaces the first's socket.
     #[tokio::test]
     async fn two_switchboards_in_one_process_keep_their_own_plugs() {

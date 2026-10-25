@@ -65,7 +65,7 @@ pub struct SessionOptions {
     /// `.mcp.json`'s format, `{ name: entry }`, in order.
     pub mcp_servers: Vec<(String, Value)>,
     /// Servers from the config files (or `mcp_servers`) this session leaves out, by name: switched off for one
-    /// conversation (Marv desktop's per-chat switches) without touching the files.
+    /// conversation without touching the files.
     pub mcp_skip: Vec<String>,
     pub approve: Option<Arc<dyn Approver>>,
     pub max_steps: Option<u32>,
