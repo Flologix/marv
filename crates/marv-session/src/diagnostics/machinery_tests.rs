@@ -300,7 +300,7 @@ async fn a_baseline_waits_for_another_sessions_lock_and_the_wait_is_never_a_time
     let other = CheckCache::new(cache.root.clone());
     let runs = Runs::checks(vec![]);
     let checker = checker(plain(), &runs, &cache);
-    let held = other.try_lock(&key).unwrap();
+    let held = other.try_lock_briefly(&key).unwrap();
     for _ in 0..3 {
         let t = turn(&checker, &project);
         assert!(t.checks.is_some(), "a lock wait turned checking off");
@@ -329,7 +329,7 @@ async fn a_steps_check_skips_quietly_while_another_session_holds_the_lock() {
     let t = turn(&checker, &project);
     t.before_change().await;
     let other = CheckCache::new(cache.root.clone());
-    let held = other.try_lock(&repo_key(&project)).unwrap();
+    let held = other.try_lock_briefly(&repo_key(&project)).unwrap();
     assert_eq!(t.after_step(vec![edited(Some("src/a.rs"))]).await, None);
     assert!(pending(&t.results()[0], false), "{:?}", t.results());
     assert_eq!(runs.checks_run(), 1);
@@ -625,7 +625,7 @@ async fn the_key_folder_is_checked_again_under_the_lock() {
     let runs = Runs::checks(vec![]);
     let checker = checker(plain(), &runs, &cache);
     for swap in [true, false] {
-        let held = other.try_lock(&key).unwrap();
+        let held = other.try_lock_briefly(&key).unwrap();
         let t = turn(&checker, &project);
         let hook = t.checks.clone().unwrap().before_change;
         let waiting = tokio::spawn(async move { hook.before_change().await });
