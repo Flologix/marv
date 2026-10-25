@@ -7,15 +7,17 @@
 //! [`RUNTIME_SHUTDOWN`] (its tasks dropped: a git still running is killed with its group). The exit code is
 //! 128 + the signal's number, as a shell reports a process that signal ended.
 //!
-//! - **An ignored SIGHUP stays ignored** (`nohup marv -p …`): catching it would end a run its caller meant to outlive
-//!   the terminal. The disposition is read without `unsafe`: `/proc/self/status`'s `SigIgn` on Linux, `ps -o
-//!   sigignore=` elsewhere (macOS).
+//! - **An ignored signal stays ignored** (`nohup marv -p …` leaves SIGHUP ignored): catching it would end a run its
+//!   caller meant to outlive the terminal. The disposition is read once at the start with `sigaction(sig, NULL, &old)`
+//!   ([`ignored`]), Marv's one `unsafe` call (the workspace lint is `deny`, and only this function allows it, which a
+//!   test checks): there's no safe query in nix, `/proc` is Linux-only, and macOS's `ps` has no `sigignore` column.
 //! - **A hard bound** ([`backstop`]): `main`'s deadline needs its future polled, and a draw blocked writing to a
 //!   terminal that stopped reading holds that thread. So the first signal also starts a thread of its own which, after
 //!   [`DEADLINE`] + [`RUNTIME_SHUTDOWN`] + [`BACKSTOP_MARGIN`], or at once on a second signal, kills what Marv started
-//!   (background processes, gits, HTML converters) and exits with 128 + n. Through `std::process::exit`, not a reset
-//!   to SIG_DFL and a re-raise (which would show a parent a real signal death): changing a disposition needs
-//!   `unsafe`, which marv-rs forbids, and 128 + n is what Marv reports for every signal it handles.
+//!   (background processes, gits, HTML converters), gives the terminal's restore 200 ms (bounded: the thread stuck
+//!   writing may hold stdout) and exits with 128 + n. Through `std::process::exit`, not a reset to SIG_DFL and a
+//!   re-raise (which would show a parent a real signal death): that would be more `unsafe`, and 128 + n is what Marv
+//!   reports on every path it handles a signal.
 
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -112,35 +114,21 @@ fn backstop(again: &std::sync::mpsc::Receiver<()>, signal: i32) {
     marv_session::git::kill_running();
     marv_session::processes::kill_running();
     marv_tools::web::convert::kill_running();
+    marv_tui::render_options::within(Duration::from_millis(200), marv_tui::render_options::restore_if_entered);
     std::process::exit(128 + signal);
 }
 
-/// Whether `signal` is ignored in this process (inherited as SIG_IGN, as `nohup` leaves SIGHUP). Unknown: not ignored.
+/// Whether `signal` is ignored in this process (inherited as SIG_IGN, as `nohup` leaves SIGHUP). A query that fails
+/// (it can't, for these signals) counts as not ignored.
+#[allow(unsafe_code)]
 fn ignored(signal: i32) -> bool {
-    let mask = match std::fs::read_to_string("/proc/self/status") {
-        Ok(status) => proc_ignored(&status),
-        Err(_) => ps_ignored(std::process::id()),
-    };
-    mask.is_some_and(|mask| (1..=64).contains(&signal) && mask >> (signal - 1) & 1 == 1)
-}
-
-/// The ignored-signal mask from a `/proc/<pid>/status` (`SigIgn:`, hex; bit n-1 for signal n).
-fn proc_ignored(status: &str) -> Option<u64> {
-    let line = status.lines().find_map(|l| l.strip_prefix("SigIgn:"))?;
-    u64::from_str_radix(line.trim(), 16).ok()
-}
-
-/// The ignored-signal mask of process `pid`, from `ps -o sigignore=` (hex on Linux and macOS).
-fn ps_ignored(pid: u32) -> Option<u64> {
-    let out = std::process::Command::new("ps")
-        .args(["-o", "sigignore=", "-p", &pid.to_string()])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let text = text.trim();
-    u64::from_str_radix(text.strip_prefix("0x").unwrap_or(text), 16).ok()
+    use nix::libc;
+    let mut old = std::mem::MaybeUninit::<libc::sigaction>::zeroed();
+    // SAFETY: with a null new action, sigaction(2) changes nothing and only writes the current one into `old`, which is
+    // valid and writable for a whole `sigaction`. `old` starts zeroed (all its fields are integers, a mask or a
+    // function address, for which zero is valid), so it's initialized whether or not the call wrote it.
+    let (status, old) = unsafe { (libc::sigaction(signal, std::ptr::null(), old.as_mut_ptr()), old.assume_init()) };
+    status == 0 && old.sa_sigaction == libc::SIG_IGN
 }
 
 #[cfg(test)]
@@ -156,35 +144,37 @@ mod tests {
         assert_eq!(quit.exit_code(), Some(143));
     }
 
+    // Under the test harness neither is ignored (and nothing here may change that: it's the one process).
     #[test]
-    fn the_ignored_mask_is_read_from_proc_status() {
-        let status = "Name:\tmarv\nSigBlk:\t0000000000000000\nSigIgn:\t0000000000001001\nSigCgt:\t0000000000000000\n";
-        let mask = proc_ignored(status).unwrap();
-        assert_eq!(mask & 1, 1, "SIGHUP (1)");
-        assert_eq!(mask >> 12 & 1, 1, "SIGPIPE (13)");
-        assert_eq!(mask >> 14 & 1, 0, "SIGTERM (15)");
-        assert_eq!(proc_ignored("Name:\tmarv\n"), None);
+    fn hup_and_term_are_not_ignored_by_default() {
+        assert!(!ignored(nix::libc::SIGHUP));
+        assert!(!ignored(nix::libc::SIGTERM));
     }
 
-    // The path macOS takes (no /proc), on whatever runs the tests: a shell that ignores SIGHUP, as nohup leaves it.
+    // The workspace lint is `deny`, not `forbid`, only so that `ignored` can allow its one call: any other
+    // `allow(unsafe_code)` in the workspace's sources fails here.
     #[test]
-    fn ps_reports_an_ignored_sighup() {
-        let mut shell = std::process::Command::new("sh").args(["-c", "trap '' HUP; exec sleep 30"]).spawn().unwrap();
-        // The trap is set before exec: wait until sleep runs (ps then names it).
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let mut mask = None;
-        while Instant::now() < deadline {
-            let comm = std::process::Command::new("ps").args(["-o", "comm=", "-p", &shell.id().to_string()]).output();
-            if comm.is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("sleep")) {
-                mask = ps_ignored(shell.id());
-                break;
+    fn ignored_is_the_only_unsafe_code() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut found = Vec::new();
+        let mut dirs = vec![root.join("crates"), root.join("app")];
+        while let Some(dir) = dirs.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = entry.file_name();
+                if path.is_dir() && name != "target" && name != "node_modules" {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs")
+                    && std::fs::read_to_string(&path).is_ok_and(|t| t.contains(concat!("allow(", "unsafe_code)")))
+                {
+                    found.push(path.strip_prefix(&root).unwrap().display().to_string());
+                }
             }
-            std::thread::sleep(Duration::from_millis(20));
         }
-        let _ = shell.kill();
-        let _ = shell.wait();
-        let mask = mask.expect("ps gave a mask");
-        assert_eq!(mask & 1, 1, "SIGHUP ignored: {mask:x}");
-        assert_eq!(mask >> 14 & 1, 0, "SIGTERM not: {mask:x}");
+        assert_eq!(found, ["crates/marv-cli/src/signals.rs"]);
+        let this = std::fs::read_to_string(root.join("crates/marv-cli/src/signals.rs")).unwrap();
+        assert_eq!(this.matches(concat!("#[allow(", "unsafe_code)]")).count(), 1, "one function");
+        assert_eq!(this.matches(concat!("unsafe", " {")).count(), 1, "one block");
     }
 }

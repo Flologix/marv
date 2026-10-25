@@ -72,6 +72,7 @@ impl TerminalGuard {
     /// installs a panic hook that undoes them before the panic message prints.
     pub fn enter(options: RenderOptions) -> io::Result<Self> {
         install_panic_hook();
+        ENTERED.store(true, std::sync::atomic::Ordering::SeqCst);
         enable_raw_mode()?;
         let guard = Self { options };
         write_enter(&mut io::stdout(), options)?;
@@ -114,8 +115,19 @@ pub fn write_restore(out: &mut impl Write) -> io::Result<()> {
     out.flush()
 }
 
+/// Whether [`TerminalGuard::enter`] ran (and [`restore`] hasn't since).
+static ENTERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// [`restore`], if the terminal was entered: for a forced exit that doesn't know whether a UI ran (#196).
+pub fn restore_if_entered() {
+    if ENTERED.load(std::sync::atomic::Ordering::SeqCst) {
+        restore();
+    }
+}
+
 /// Best-effort: everything off, whatever was on. Safe to call twice. Also what the panic hook runs.
 pub fn restore() {
+    ENTERED.store(false, std::sync::atomic::Ordering::SeqCst);
     let _ = write_restore(&mut io::stdout());
     let _ = disable_raw_mode();
 }

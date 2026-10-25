@@ -87,9 +87,19 @@ fn running() -> std::sync::MutexGuard<'static, Vec<nix::unistd::Pid>> {
     RUNNING.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Set by [`kill_running`]: a git started after it (a prune still running on the runtime) is killed at once.
+static CLOSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 impl GitGroup {
     fn new(pgid: Option<nix::unistd::Pid>) -> Self {
-        running().extend(pgid);
+        let mut list = running();
+        if CLOSED.load(std::sync::atomic::Ordering::SeqCst) {
+            if let Some(pgid) = pgid {
+                let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
+            }
+        } else {
+            list.extend(pgid);
+        }
         Self { pgid }
     }
 
@@ -113,7 +123,9 @@ impl Drop for GitGroup {
 /// SIGKILLs the process group of every git still running: for an exit that can't wait for the runtime to drop their
 /// tasks (#196: the forced exit after a quit signal, when the way out is stuck).
 pub fn kill_running() {
-    for pgid in running().drain(..) {
+    let mut list = running();
+    CLOSED.store(true, std::sync::atomic::Ordering::SeqCst);
+    for pgid in list.drain(..) {
         let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
     }
 }

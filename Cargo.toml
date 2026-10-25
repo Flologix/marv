@@ -38,7 +38,9 @@ tracing = "0.1"
 tempfile = "3"
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+# `deny`, not `forbid`, for one audited function: `marv-cli`'s `signals::ignored` (sigaction query, #196), which a
+# test keeps the only `allow(unsafe_code)` in the workspace.
+unsafe_code = "deny"
 
 [workspace.lints.clippy]
 todo = "allow"
