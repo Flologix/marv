@@ -4,6 +4,9 @@
 //! Built on the SDK path (`marv_session::SessionBuilder`): it loads what the TUI loads (user + project sources), runs
 //! one turn with no UI, and writes the final reply to stdout. Warnings go to stderr, so stdout stays the reply.
 //!
+//! SIGHUP or SIGTERM (#196, `crate::signals`) stops the turn and closes the session as the end of a turn does (≤ 2 s);
+//! the exit code is then 128 + the signal's number.
+//!
 //! Exit codes ([`ExitCode`]):
 //! - 0: finished (the model answered normally);
 //! - 1: an error (bad config, provider failure, bad arguments, unknown `--approve`);
@@ -380,7 +383,7 @@ pub struct HeadlessOptions {
 }
 
 /// Runs one headless turn and writes the result to stdout. Returns the exit code.
-pub async fn run_headless(options: HeadlessOptions) -> ExitCode {
+pub async fn run_headless(options: HeadlessOptions, quit: crate::signals::Quit) -> ExitCode {
     use marv_session::config::{ConfigStore, Env, default_config_dir, migrate_legacy_config, resolve_config};
     let (approve, mesh_grants) = match build_approver(&options.approve, options.must_ask) {
         Ok(a) => a,
@@ -572,7 +575,12 @@ pub async fn run_headless(options: HeadlessOptions) -> ExitCode {
     let code = match session.send(&options.prompt, marv_session::SendOptions::default()) {
         Ok(turn) => {
             let after_session = session.clone();
-            collect_and_output(turn, options.output, before, move || after_session.usage().totals).await
+            let collected = collect_and_output(turn, options.output, before, move || after_session.usage().totals);
+            tokio::select! {
+                code = collected => code,
+                // SIGHUP or SIGTERM (#196): the turn stops, and the session closes below (main sets the exit code).
+                () = quit.arrived() => ExitCode::Error,
+            }
         }
         Err(e) => {
             eprintln!("{}", printable(&e.to_string()));

@@ -120,6 +120,19 @@ pub fn restore() {
     let _ = disable_raw_mode();
 }
 
+/// Runs `work` (terminal writes) on a thread of its own and waits at most `limit` for it: `true` if it finished.
+/// For the way out after a hangup or SIGTERM (#196): a closed terminal fails writes with EIO, which [`restore`]
+/// ignores, but a terminal that stopped reading (XOFF, a frozen emulator) would block them for good. A write still
+/// blocked is left behind on its thread, which ends with the process.
+pub fn within(limit: Duration, work: impl FnOnce() + Send + 'static) -> bool {
+    let (done, finished) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new().name("marv-terminal".into()).spawn(move || {
+        work();
+        let _ = done.send(());
+    });
+    spawned.is_ok() && finished.recv_timeout(limit).is_ok()
+}
+
 /// Chains a hook that restores the terminal before the previous hook prints the panic, so the
 /// message lands on the user's normal screen instead of vanishing with the alternate one.
 fn install_panic_hook() {

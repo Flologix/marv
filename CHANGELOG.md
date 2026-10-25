@@ -6,6 +6,10 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+### Fixed
+
+- **Closing the terminal (or a SIGTERM) no longer skips Marv's exit cleanup (#196).** The TUI ended on the spot when its terminal window closed (SIGHUP) or it got SIGTERM: the terminal wasn't restored, the session wasn't saved, background processes weren't stopped, and a checkpoint prune's `git gc` kept running after Marv had gone. Both signals now end the TUI as `/exit` does, with a short deadline (5 s) and without hanging on a terminal that's gone. `marv -p` does the same: it stops its turn and closes the session. Either way the exit code is 128 + the signal's number (129 for SIGHUP, 143 for SIGTERM).
+
 ## [0.10.0] - 2026-10-24
 
 ### Added
