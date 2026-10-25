@@ -10,6 +10,11 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 - **A built-in read-only `explore` agent (#186).** Next to `general-purpose`, the agent tool now has an `explore` type that can only read and search (`read_file`, `grep`, `glob`, `web_fetch`): no edits, no `bash` and no mesh tools, whatever the mode, yolo included. The agent tool's description tells the model to use it for searches and questions about the code. It runs on the session's model; a `.marv/agents/explore.md` (project) or `~/.marv/agents/explore.md` (personal) replaces it, as agent files with a built-in's name always have, for example to give it a cheaper `model:`.
 
+### Fixed
+
+- **A radio request's ack could be lost (#213).** When the other Marv acked very quickly, the ack could arrive before the request was recorded as open on the sending side, and was refused there as an ack for no open request: the model never read it (the `done` that followed still arrived). The same applied to a quick refusal, which then didn't close the request with a `failed`. A request is now open before its frame is sent.
+- **A stop or a timeout right after a sandboxed command starts now ends it (Linux, #182).** A stop (Esc, a process's stop) or a timeout that reached bubblewrap within the first few milliseconds, while it was still setting the sandbox up, ended bubblewrap but not the command, which ran on (still sandboxed) until it finished by itself. Marv now pauses bubblewrap, ends the sandbox's first process (which takes everything in the sandbox with it), then ends bubblewrap, so a stop at any moment after the start ends the command, for bash commands, checks and background processes alike.
+
 ## [0.10.0] - 2026-10-24
 
 ### Added
