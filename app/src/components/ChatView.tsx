@@ -1,11 +1,27 @@
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import type { Components } from "react-markdown";
 import { type ChatSettings, type Model, desktop, isDesktop } from "../lib/backend";
 import { type Answer, type ApprovalRequest, type Command, type DiffLine, type Item, knownCommands, type useChat } from "../lib/chat";
 import { tokens } from "../lib/format";
 import { Martian } from "./Martian";
 import { Settings } from "./Settings";
+
+/** A link in a reply opens in the person's browser, never inside the app's window (which has no way back). */
+const MARKDOWN_COMPONENTS: Components = {
+  a: ({ href, children }) => (
+    <a
+      href={href}
+      onClick={(e) => {
+        e.preventDefault();
+        if (href && /^https?:\/\//i.test(href)) void desktop.openUrl(href);
+      }}
+    >
+      {children}
+    </a>
+  ),
+};
 
 type Chat = ReturnType<typeof useChat>;
 
@@ -241,7 +257,7 @@ function ItemView({ item, onAnswer }: { item: Item; onAnswer: (id: number, d: An
     case "text":
       return (
         <div className="reply">
-          <Markdown remarkPlugins={[remarkGfm]}>{item.text}</Markdown>
+          <Markdown remarkPlugins={[remarkGfm]} components={MARKDOWN_COMPONENTS}>{item.text}</Markdown>
           <CopyButton text={item.text} />
         </div>
       );
@@ -275,7 +291,7 @@ function ItemView({ item, onAnswer }: { item: Item; onAnswer: (id: number, d: An
     case "output":
       return (
         <div className="output">
-          <Markdown remarkPlugins={[remarkGfm]}>{item.text}</Markdown>
+          <Markdown remarkPlugins={[remarkGfm]} components={MARKDOWN_COMPONENTS}>{item.text}</Markdown>
         </div>
       );
     case "turn":
