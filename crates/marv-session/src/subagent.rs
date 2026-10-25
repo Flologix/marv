@@ -1040,6 +1040,35 @@ mod run_tests {
     }
 
     #[tokio::test]
+    async fn explore_gets_only_the_read_tools_and_cant_change_anything_even_in_yolo() {
+        let f = Fixture::new();
+        let provider = Scripted::new(vec![
+            use_tool("r1", "read_file", serde_json::json!({"path": "notes.txt"})),
+            use_tool("w1", "write_file", serde_json::json!({"path": "made.txt", "content": "hi\n"})),
+            use_tool("e1", "edit_file", serde_json::json!({"path": "notes.txt", "old_string": "milk", "new_string": "eggs"})),
+            use_tool("b1", "bash", serde_json::json!({"command": "touch ran.txt"})),
+            say("The milk."),
+        ]);
+        let (host, _) = f.host(provider.clone(), crate::agents::builtin_agents(), true);
+        let asker = Asker::yes();
+        let mut ctx = ctx_with(host, &asker, &f.root.0);
+        ctx.yolo = true;
+        let out =
+            run(agent_call(serde_json::json!({"type": "explore", "description": "find milk", "prompt": "p"}), "a1"), &ctx).await;
+        assert!(out.result.output.contains("The milk."), "{}", out.result.output);
+        assert_eq!(provider.tool_names(0), ["read_file", "glob", "grep", "web_fetch"]);
+        assert!(!provider.system(0).contains("write_file"), "{}", provider.system(0));
+        let results = provider.results(4);
+        assert!(results[0].contains("remember the milk"), "{results:?}");
+        for refused in &results[1..] {
+            assert!(refused.contains("Unknown tool"), "{results:?}");
+        }
+        assert!(!f.root.0.join("made.txt").exists() && !f.root.0.join("ran.txt").exists());
+        assert_eq!(std::fs::read_to_string(f.root.0.join("notes.txt")).unwrap(), "remember the milk\n");
+        assert!(asker.asked().is_empty());
+    }
+
+    #[tokio::test]
     async fn in_yolo_mode_what_isnt_safe_still_asks_labeled_with_who_asks() {
         let f = Fixture::new();
         let provider =

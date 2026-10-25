@@ -83,6 +83,34 @@ pub fn general_purpose() -> AgentType {
     }
 }
 
+/// The built-in `explore` type's tools: reading and searching only. No edits, no bash, so nothing it does changes the
+/// project, whatever the parent's mode (yolo included): the tools it isn't given aren't offered to it, and a call to
+/// one is an unknown tool. web_fetch taints it as it does any agent (`TaintState::for_subagent`).
+pub const EXPLORE_TOOLS: [&str; 4] = ["read_file", "grep", "glob", "web_fetch"];
+
+/// How the system prompt lists `explore`. The oracle drops its line (`marv_oracle::runner::MARV_RS_TEXT`).
+pub const EXPLORE_DESCRIPTION: &str = "Read-only search: finding where something is defined or used, how a part of the code works, or answering a question across many files. Can't change files or run commands. Prefer it to general-purpose for any search.";
+
+const EXPLORE_BODY: &str = "You are a read-only exploration agent. Find what the task asks for (where something is defined or used, how a part of the code works, which files matter) and report it with file paths and line numbers, quoting only the lines that matter. You can't change files or run commands: if the task needs a change, say what and where instead.";
+
+/// marv-rs (#186, not in Marv): a read-only agent for searches. Defaults to the session's model; a project or personal
+/// `.marv/agents/explore.md` replaces it whole (with its own `model:` for a cheaper one, say), as for general-purpose.
+pub fn explore() -> AgentType {
+    AgentType {
+        name: "explore".into(),
+        description: EXPLORE_DESCRIPTION.into(),
+        body: EXPLORE_BODY.into(),
+        tools: EXPLORE_TOOLS.iter().map(|t| t.to_string()).collect(),
+        model: None,
+        source: AgentSource::BuiltIn,
+    }
+}
+
+/// The built-in types, sorted by name: what every session starts with before its agent files.
+pub fn builtin_agents() -> Vec<AgentType> {
+    vec![explore(), general_purpose()]
+}
+
 pub fn agents_dir(base: &Path) -> PathBuf {
     base.join(".marv").join("agents")
 }
@@ -132,7 +160,8 @@ pub fn parse_agent(text: &str, file: &str, source: AgentSource, shown: &str) -> 
 
 /// Built-in, then personal (under `home`), then project agents (under `root`; later wins). Sorted by name.
 pub fn load_agents(root: Option<&Path>, home: Option<&Path>) -> (Vec<AgentType>, Vec<String>) {
-    let mut by_name = std::collections::BTreeMap::from([("general-purpose".to_string(), general_purpose())]);
+    let mut by_name: std::collections::BTreeMap<String, AgentType> =
+        builtin_agents().into_iter().map(|a| (a.name.clone(), a)).collect();
     let mut problems = Vec::new();
     for (base, source, prefix) in [(home, AgentSource::Personal, "~/"), (root, AgentSource::Project, "")] {
         let Some(base) = base else { continue };
@@ -218,5 +247,49 @@ mod tests {
         assert!(find_agent(&agents, "superpowers:code-reviewer").is_some());
         assert!(find_agent(&agents, "general-purpose").is_some());
         assert!(find_agent(&agents, "nope").is_none());
+    }
+
+    #[test]
+    fn explore_is_built_in_with_only_the_read_tools() {
+        let (agents, problems) = load_agents(None, None);
+        assert!(problems.is_empty());
+        let names: Vec<&str> = agents.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["explore", "general-purpose"]);
+        let explore = find_agent(&agents, "explore").unwrap();
+        assert_eq!(explore.tools, ["read_file", "grep", "glob", "web_fetch"]);
+        assert_eq!(explore.source, AgentSource::BuiltIn);
+        assert_eq!(explore.model, None, "the session's model unless an agent file says otherwise");
+        assert!(!explore.body.is_empty());
+        for tool in &explore.tools {
+            assert!(SUBAGENT_TOOLS.contains(&tool.as_str()));
+            assert!(!["edit_file", "write_file", "bash"].contains(&tool.as_str()));
+        }
+    }
+
+    #[test]
+    fn an_explore_file_replaces_the_built_in_project_over_personal() {
+        let dir = std::env::temp_dir().join(format!("marv-explore-{}-{}", std::process::id(), line!()));
+        let (root, home) = (dir.join("root"), dir.join("home"));
+        for base in [&root, &home] {
+            std::fs::create_dir_all(agents_dir(base)).unwrap();
+        }
+        std::fs::write(
+            agents_dir(&home).join("explore.md"),
+            "---\nname: explore\ndescription: Mine.\ntools: Read, Grep\nmodel: small-model\n---\nSearch.",
+        )
+        .unwrap();
+        let (agents, _) = load_agents(None, Some(&home));
+        let explore = find_agent(&agents, "explore").unwrap();
+        assert_eq!(
+            (explore.source, explore.description.as_str(), explore.model.as_deref()),
+            (AgentSource::Personal, "Mine.", Some("small-model"))
+        );
+        assert_eq!(explore.tools, ["read_file", "grep"]);
+        std::fs::write(agents_dir(&root).join("explore.md"), "---\ndescription: The project's.\n---\n").unwrap();
+        let (agents, _) = load_agents(Some(&root), Some(&home));
+        let explore = find_agent(&agents, "explore").unwrap();
+        assert_eq!((explore.source, explore.description.as_str()), (AgentSource::Project, "The project's."));
+        assert_eq!(agents.iter().filter(|a| a.name == "explore").count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

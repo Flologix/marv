@@ -47,6 +47,15 @@ pub fn agent_label(agent_type: Option<&str>, description: &str) -> String {
     format!("{} · {description}", agent_type.unwrap_or("general-purpose"))
 }
 
+/// marv-rs (#186): the sentence that points searches at the built-in read-only `explore` type, which Marv doesn't have.
+/// The oracle drops it (`marv_oracle::runner::MARV_RS_TEXT`).
+pub const EXPLORE_SENTENCE: &str = " To search the code or answer a question about it, use type \"explore\": it reads and searches only, so its results come back without filling your context.";
+
+pub const AGENT_DESCRIPTION: &str = concat!(
+    "Hand a self-contained task to a subagent: a separate agent with a fresh context and its own tools, which does the task and returns only its final report. Several agent calls in a row run in parallel (up to 4 at once). The available types are listed in the system prompt.",
+    " To search the code or answer a question about it, use type \"explore\": it reads and searches only, so its results come back without filling your context."
+);
+
 pub struct Agent;
 
 #[async_trait]
@@ -57,7 +66,7 @@ impl Tool for Agent {
         "agent"
     }
     fn description(&self) -> &str {
-        "Hand a self-contained task to a subagent: a separate agent with a fresh context and its own tools, which does the task and returns only its final report. Several agent calls in a row run in parallel (up to 4 at once). The available types are listed in the system prompt."
+        AGENT_DESCRIPTION
     }
     fn schema(&self) -> Value {
         json!({

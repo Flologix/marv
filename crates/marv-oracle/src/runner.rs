@@ -346,8 +346,9 @@ pub const MARV_RS_SECTIONS: &[&str] = &["# Your situation", "# Fixing bugs"];
 /// and the tool descriptions before comparing, so everything around it is still checked. The raw requests (the prefix
 /// rule) keep marv-rs's. Keep these in step with the sources: #85's plan sentence (`marv_session::prompt`'s
 /// `PLAN_SENTENCE`) and plan tool description (`marv_tools::plan::PLAN_DESCRIPTION`), and #81's sentence at the end of
-/// the process tool's description (`marv_tools::process::PROCESS_DESCRIPTION`), which Marv doesn't have, and the
-/// `.git` placeholder sentence, which Marv doesn't have either.
+/// the process tool's description (`marv_tools::process::PROCESS_DESCRIPTION`), which Marv doesn't have, the `.git`
+/// placeholder sentence, which Marv doesn't have either, and #186's built-in `explore` type (its line in the agent list
+/// and the agent tool's sentence about it).
 pub const MARV_RS_TEXT: &[(&str, &str)] = &[
     (
         " For a task of four or more steps, keep a plan with the plan tool; send each update in the same reply as your next tool call; only the final one, marking the plan done, may go alone.",
@@ -363,6 +364,16 @@ pub const MARV_RS_TEXT: &[(&str, &str)] = &[
     // The sandbox's empty `.git` named in a project without one (`marv_session::prompt::GIT_PLACEHOLDER`).
     (
         "\n\nThis folder has no .git of its own. Commands that run without asking, and background processes, may see an empty, read-only .git folder here: it's the sandbox's placeholder, not a broken or empty repository, and git still finds a repository in a parent folder if there is one. Don't report it as a problem. To create a repository here, run git init with git_write: true.",
+        "",
+    ),
+    // #186: the built-in read-only `explore` agent type, listed first (`marv_session::agents::EXPLORE_DESCRIPTION`),
+    // and the agent tool's sentence pointing searches at it (`marv_tools::agent::EXPLORE_SENTENCE`).
+    (
+        "- explore: Read-only search: finding where something is defined or used, how a part of the code works, or answering a question across many files. Can't change files or run commands. Prefer it to general-purpose for any search.\n",
+        "",
+    ),
+    (
+        " To search the code or answer a question about it, use type \"explore\": it reads and searches only, so its results come back without filling your context.",
         "",
     ),
 ];
