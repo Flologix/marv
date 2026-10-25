@@ -9,7 +9,8 @@
 //!   (`command_palette`, #44), built from the same commands; the text here stays as it was.
 //! - Placeholder "Type a message, or / for commands"; the border dims while busy.
 //! - New in marv-rs: Alt+Enter (or ctrl+s) is [`PromptOutcome::SendNow`] ("send now": while a turn runs, the App sends the line
-//!   into it at its next step instead of waiting for it to end). Enter is unchanged.
+//!   into it at its next step instead of waiting for it to end). Enter while a turn runs queues the line for after it
+//!   (#184, the App's): [`queue_rows`] lists the queue above the box.
 //! - New in marv-rs: after a turn, a suggested next message ([`PromptInput::suggest`]) shows in the empty prompt
 //!   instead of the placeholder. Tab or → takes it into the line; typing anything drops it. Enter on the empty line
 //!   still sends nothing: a suggestion is only ever sent after the user took it and pressed Enter.
@@ -96,6 +97,28 @@ pub fn match_commands<'a>(value: &str, commands: &'a [CommandInfo]) -> Vec<&'a C
     let prefix = single.iter().filter(|c| c.name.starts_with(&typed));
     let other = single.iter().filter(|c| !c.name.starts_with(&typed) && c.name.contains(&typed));
     prefix.chain(other).copied().collect()
+}
+
+/// At most this many queued messages are listed above the prompt (#184); the rest are counted.
+pub const QUEUE_SHOWN: usize = 3;
+
+/// The queued messages above the prompt (#184): oldest first, one row each (its first line, cut to the width), then
+/// "+N more" past [`QUEUE_SHOWN`]. Empty when nothing is queued.
+pub fn queue_rows(queued: &[String], width: u16) -> Vec<Line<'static>> {
+    let dim = Style::new().fg(theme::DIM);
+    let mut rows: Vec<Line<'static>> = queued
+        .iter()
+        .take(QUEUE_SHOWN)
+        .map(|text| {
+            let first = printable(text.trim().lines().next().unwrap_or(""));
+            let more = if text.trim().lines().nth(1).is_some() { " …" } else { "" };
+            truncate_end(Line::from(vec![Span::styled("  queued › ", dim), Span::raw(format!("{first}{more}"))]), width)
+        })
+        .collect();
+    if queued.len() > QUEUE_SHOWN {
+        rows.push(Line::from(Span::styled(format!("  +{} more queued", queued.len() - QUEUE_SHOWN), dim)));
+    }
+    rows
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

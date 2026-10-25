@@ -12,6 +12,11 @@ Type `/` in the prompt for the menu (↑/↓, then Tab or Enter):
 
 The terminal UI's other commands (`/undo`, `/mcp`, `/resume`…) aren't in the desktop yet.
 
+## While Marv works
+
+- **Enter queues your message** for after the turn: it's listed above the composer (edit puts it back to change, × drops it; ↑ in an empty composer edits the newest) and sent as the next turn once this one finishes. After Stop the queue is kept: Enter in an empty composer sends the next, or they follow your next message. Typing another message while Marv works counts as your next message, so a kept queue goes on again. If a mesh message wakes Marv just as a queued message is sent, the host answers `send_refused` with the text, and the message goes back to the front of the queue to be sent when that turn ends. The queue is the page's (`src/lib/queue.ts`), one per chat, and no protocol message is needed; reloading the page drops it.
+- **Send now** (the button, or alt+enter) puts it in at Marv's next step instead.
+
 ## How it fits together
 
 ```
@@ -35,6 +40,7 @@ browser (same app/)  ── WebSocket ──▶  crates/marv-web ───┘
 |---|---|
 | `~/.config/ai.flologix.marv/settings.json` (0600) | The Marv folder, and the OpenRouter key if you pasted one |
 | `~/.local/share/ai.flologix.marv/chats.json` | Each chat's folder, title and Marv session id |
+| (macOS: both in `~/Library/Application Support/ai.flologix.marv/`) | |
 | `~/.marv/` (the CLI's own) | Saved sessions and undo checkpoints, next to your memory, skills and MCP servers |
 | The window's local storage | Transcripts as shown, and the model, step limit and yolo setting |
 
@@ -69,15 +75,23 @@ It builds the release binary into `~/.local/bin/marv-desktop`, and adds an icon 
 
 Your home folder and anything above it are refused.
 
+## Install it on macOS
+
+Download `marv-desktop-<arch>-apple-darwin.dmg` from the release and drag Marv to Applications: the app bundle is the launcher entry (Launchpad, Spotlight, the Dock). It's signed ad hoc, not with a Developer ID, so open it the first time with System Settings → Privacy & Security → **Open Anyway**, or run `xattr -dr com.apple.quarantine /Applications/Marv.app` (on macOS 14 only, right-click → **Open** works too). From a clone, `app/install-desktop.sh` builds Marv.app and copies it to /Applications instead (`--uninstall` removes it); a local build isn't quarantined. Open a folder from a terminal with `open -a Marv --args "$PWD"` (an absolute path, since the app starts in `/`; if Marv is already open, it only comes to the front).
+
+On macOS a notification is sent as Marv (its name and icon, its settings in System Settings → Notifications); clicking one brings the window up but doesn't switch to the chat. Dictation is the system's (Globe key twice); links open with `open`.
+
+**Signing and notarization (not set up yet).** The release workflow signs and notarizes the .dmg once these repository secrets exist, and builds it ad hoc while they don't: `APPLE_CERTIFICATE` (the Developer ID Application certificate, a base64 .p12), `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY` (e.g. `Developer ID Application: … (TEAMID)`), and for notarization `APPLE_ID`, `APPLE_PASSWORD` (an app-specific password) and `APPLE_TEAM_ID`. All need an Apple Developer account.
+
 ## Develop
 
-You need Rust, Node and bubblewrap. On Linux you also need WebKitGTK 4.1 (`webkit2gtk-4.1`).
+You need Rust and Node; on Linux also bubblewrap and WebKitGTK 4.1 (`webkit2gtk-4.1`). macOS needs nothing more (the Xcode command line tools, which Rust needs anyway).
 
 ```sh
 cd app
 npm install
 npx tauri dev        # the app, with hot reload
-npx tauri build      # .deb and .AppImage in target/release/bundle
+npx tauri build      # .deb and .AppImage (macOS: Marv.app and a .dmg) in target/release/bundle
 npm test             # the transcript's tests (plain Node)
 ```
 

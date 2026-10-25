@@ -267,9 +267,23 @@ pub async fn run_command(
         if timed_out || aborted {
             // Killed already; the kill is sent again every KILL_GRACE until it has exited, so a kill that came too
             // early to reach everything (a sandbox still starting) can't leave the call waiting on a stopped command.
+            // Its exit is seen before it's reaped, and the kill sent once more then: a process it was forking as the
+            // first kill landed can miss that kill (macOS delivers a group kill to the members it finds, and a child
+            // still being created isn't one yet), and while the killed program is a zombie its group's id can't be
+            // another's.
+            if !exit.watching() {
+                exit = ExitWatch::spawn(child.id());
+            }
             let status = loop {
                 tokio::select! {
-                    status = child.wait() => break status.ok(),
+                    seen = exit.exited(), if exit.watching() => {
+                        if seen {
+                            kill(&mut child);
+                            break child.wait().await.ok();
+                        }
+                        exit = ExitWatch::none();
+                    }
+                    status = child.wait(), if !exit.watching() => break status.ok(),
                     () = tokio::time::sleep(KILL_GRACE) => kill(&mut child),
                 }
             };
@@ -1030,6 +1044,24 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
         assert!(result.aborted);
         assert_eq!(format_output(&result), "(no output)\n\n[stopped by the user]");
+    }
+
+    // #228: a stop that lands while the command is forking still takes down what it was starting.
+    #[tokio::test]
+    async fn a_stop_while_the_command_keeps_forking_leaves_nothing_behind() {
+        let root = TempDir::new("bash-forking-stop");
+        let cancel = CancellationToken::new();
+        let stop = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            stop.cancel();
+        });
+        let command = "while :; do (sleep 1; touch late) >/dev/null 2>&1 & sleep 0.01; done";
+        let options = RunOptions { sandbox: false, timeout: Duration::from_secs(60), ..options(command, root.path()) };
+        let result = run_command(options, &Sandbox::from_env(false), &cancel).await;
+        assert!(result.aborted, "{result:?}");
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(!root.path().join("late").exists(), "a background job outlived the stop");
     }
 
     #[tokio::test]

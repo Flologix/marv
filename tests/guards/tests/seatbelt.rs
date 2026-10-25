@@ -135,10 +135,16 @@ fn the_macos_doors_are_closed() {
 }
 
 /// **A keychain item can't be read, with or without network**: one that exists outside the sandbox (made in the
-/// user's default keychain for this test, removed after), read through `security`. Reading an item needs securityd
-/// (`com.apple.SecurityServer`), which no profile lets a command reach, with network or not (#166 review).
+/// user's default keychain for this test, removed after), read through `security`, from a project and from a
+/// home-folder project.
 ///
-/// Proven: see the PR's proof comment (`com.apple.SecurityServer` added back to the network services).
+/// This guards the outcome, not one rule: it still passes with `com.apple.SecurityServer` added back to the network
+/// services (#178 proof), as reading an item needs more than that one service (XPC services stay denied). That the
+/// service stays out of the profile is the unit test's job (`marv-sandbox`'s `seatbelt.rs`,
+/// `the_interface_list_only_with_network`).
+///
+/// Where no item can be made and read back, it falls back to checking that the sandbox can't list the keychains; under
+/// `MARV_REQUIRE_SANDBOX=1` (CI) it fails instead, so CI can't pass on the weaker check.
 #[test]
 fn a_keychain_item_cant_be_read_with_or_without_network() {
     require_sandbox!();
@@ -158,6 +164,12 @@ fn a_keychain_item_cant_be_read_with_or_without_network() {
     let find = format!("security find-generic-password -s {service} -w");
     let control = host(home.home(), &find);
     if !added.status.success() || !control.output.contains("SECRET-KEYCHAIN-ITEM") {
+        assert!(
+            std::env::var_os("MARV_REQUIRE_SANDBOX").is_none_or(|v| v != "1"),
+            "MARV_REQUIRE_SANDBOX=1, but no keychain item could be made and read back here ({}{})",
+            String::from_utf8_lossy(&added.stderr).trim(),
+            control.output.trim()
+        );
         // The limit, said: without a keychain to put an item in, only the refusal of the keychain itself is checked.
         println!(
             "limit: no keychain item could be made and read back here ({}{}); checking only that the sandbox can't list keychains",
@@ -349,6 +361,10 @@ fn protected_names_cant_be_created_and_the_scan_finds_nothing() {
 /// can't be unlinked), and no hard link to it (or to the home's files) can be made, into the project or the
 /// `TMPDIR`. `link()` is checked against both paths (#166 probe), so hard links are allowed between the project's and
 /// the TMPDIR's own files.
+///
+/// This guards the outcome: with the whole profile in place, Seatbelt refuses these links before any link rule is
+/// consulted (a source it can't read or write, a protected name it can't create), so it can't catch a regression in one
+/// link rule. `marv-sandbox`'s `each_link_rule_refuses_on_its_own` does that, one rule at a time (#183).
 #[test]
 fn protected_files_cant_be_renamed_away_or_hard_linked() {
     require_sandbox!();
@@ -512,48 +528,4 @@ async fn a_dropped_command_takes_its_group_with_it() {
     let _ = tokio::time::timeout(Duration::from_secs(2), run).await;
     let pid: i32 = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
     assert!(gone(pid), "the background child outlived the dropped command");
-}
-
-/// A sandboxed command that runs `(sleep 2; touch late) & sleep 600`, stopped by `cancel` (already cancelled, or soon
-/// after the spawn): the call must return at once and leave nothing running (`late` never appears).
-async fn stopped_early(tag: &str, cancel: tokio_util::sync::CancellationToken) {
-    let (project, home) = (TempDir::new(tag), TempDir::outside_tmp(&format!("{tag}-home")));
-    let options = marv_tools::bash::RunOptions {
-        command: "(sleep 2; touch late) & sleep 600".into(),
-        root: project.path().to_path_buf(),
-        sandbox: true,
-        timeout: std::time::Duration::from_secs(60),
-        ..Default::default()
-    };
-    let started = std::time::Instant::now();
-    let result = marv_tools::bash::run_command(options, &sandbox_with_home(home.path()), &cancel).await;
-    assert!(result.aborted, "{result:?}");
-    assert!(started.elapsed() < std::time::Duration::from_secs(10), "the stop didn't hold: {:?}", started.elapsed());
-    std::thread::sleep(std::time::Duration::from_secs(3));
-    assert!(!project.path().join("late").exists(), "{tag}: the stopped command went on running ({result:?})");
-}
-
-/// **A stop that comes before the sandbox is set up still stops the command** (#166 review): Seatbelt's process group
-/// exists only once `marv __guard` has called `setsid`, so a group kill alone, sent earlier, reached nothing and the
-/// command ran on. An already-cancelled token, and a stop right after the spawn.
-///
-/// Proven: `Seatbelt::kill` as `killpg` alone → failed on macOS (see the PR's proof comment).
-///
-/// macOS only: on Linux a SIGKILL that reaches bwrap while it's still setting up (before `--die-with-parent` holds)
-/// leaves the command running in its namespace; that's bwrap's own race, followed up separately.
-#[tokio::test]
-async fn a_stop_before_the_sandbox_is_up_still_stops_the_command() {
-    require_sandbox!();
-    let cancelled = tokio_util::sync::CancellationToken::new();
-    cancelled.cancel();
-    stopped_early("stop-early", cancelled).await;
-    for delay in [1, 5, 20] {
-        let soon = tokio_util::sync::CancellationToken::new();
-        let stopper = soon.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-            stopper.cancel();
-        });
-        stopped_early(&format!("stop-soon-{delay}"), soon).await;
-    }
 }

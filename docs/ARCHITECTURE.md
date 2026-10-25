@@ -58,5 +58,5 @@ marv-rs is a from-scratch Rust rebuild of [Marv](https://github.com/FlologixAI/m
 - **Comments explain *why*.** Port Marv's comments with the code: they record bugs that were really hit.
 - **Every module starts with a `//!` header** saying what it owns and which Marv file it ports.
 - `todo!("port: <what>")` marks unported bodies. `grep -rn 'todo!("port' crates` is the remaining work.
-- **No `unsafe`** (workspace lint).
+- **No `unsafe`** (workspace lint, `deny`), but for one audited function: `marv-cli`'s `signals::ignored`, a read-only `sigaction` query (#196), the only `allow(unsafe_code)` (a test checks).
 - **Each crate's tests port the matching TS tests.** The oracle covers behaviour end to end.

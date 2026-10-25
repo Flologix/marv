@@ -106,7 +106,7 @@ use crate::ui::markdown::StreamLexer;
 use crate::ui::martian::MartianAnimation;
 use crate::ui::message_view;
 use crate::ui::plan_view::{self, PLAN_MIN_WINDOW};
-use crate::ui::prompt_input::{PromptInput, PromptOutcome};
+use crate::ui::prompt_input::{self, PromptInput, PromptOutcome};
 use crate::ui::radio_view::{self, RadioPanel};
 use crate::ui::scroll_view::ScrollView;
 use crate::ui::session_picker::{PickerOutcome, SessionPicker};
@@ -120,6 +120,27 @@ use crate::view::{
     Role, SessionPort, SetupStart, StatusInfo, ToolState, ToolStatus, Totals, TurnEndReason, TurnStatus, UiEvent, WelcomeInfo,
 };
 use marv_core::{StopReason, Usage};
+
+/// The App's copy of the queue (#184), changed at once on a key and replaced by the engine's next list.
+trait QueueMirror {
+    /// Removes the first entry equal to `text` (the oldest: what Enter on the empty prompt took).
+    fn retain_first(&mut self, text: &str);
+    /// Removes the last entry equal to `text` (the newest: what ↑ or ctrl+x took).
+    fn retain_last(&mut self, text: &str);
+}
+
+impl QueueMirror for Vec<String> {
+    fn retain_first(&mut self, text: &str) {
+        if let Some(at) = self.iter().position(|t| t == text) {
+            self.remove(at);
+        }
+    }
+    fn retain_last(&mut self, text: &str) {
+        if let Some(at) = self.iter().rposition(|t| t == text) {
+            self.remove(at);
+        }
+    }
+}
 
 /// How long "Press ctrl+c again to exit" waits for the second ctrl+c.
 pub const EXIT_CONFIRM_MS: Duration = Duration::from_millis(1500);
@@ -137,6 +158,10 @@ pub const REVEAL_MIN_CHARS: usize = 2;
 pub const REVEAL_CATCH_UP: usize = 2000;
 /// How long `run` waits for `SessionPort::flush` after the terminal is restored.
 pub const FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+/// After a quit signal ([`App::with_quit`], #196) or with the terminal gone: how long the terminal's restore may take
+/// (it's left behind if a terminal that stopped reading blocks it), and the flush.
+pub const QUIT_RESTORE_TIMEOUT: Duration = Duration::from_millis(500);
+pub const QUIT_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Events after which a streaming tool call is done streaming: complete, cut off, or abandoned.
 /// They also flush the stream buffer at once.
@@ -313,6 +338,11 @@ pub struct App {
     agents_running: usize,
     /// "Send now" messages sent into the running turn and not in it yet (the status bar counts them).
     sending: usize,
+    /// #184: the messages queued for after the running turn, oldest first, as the engine last listed them
+    /// ([`UiEvent::Queued`]); shown above the prompt.
+    queued: Vec<String>,
+    /// `/exit` with messages queued said they'd be dropped (#184): the next `/exit` leaves.
+    exit_warned: bool,
     /// The plan tool's list (#15), pinned above the prompt while it has something left to do.
     plan: Option<Vec<PlanItem>>,
     waiting_for: Option<String>,
@@ -355,6 +385,8 @@ pub struct App {
     // --- the loop ---
     copy: CopyFn,
     copies: FuturesUnordered<BoxFuture<'static, (usize, String)>>,
+    /// Ends the loop like `/exit` when it completes: the host's SIGHUP or SIGTERM ([`Self::with_quit`]).
+    quit: Option<BoxFuture<'static, ()>>,
     /// What the last draw showed that animates on its own.
     welcome_visible: bool,
     spinner_visible: bool,
@@ -406,6 +438,8 @@ impl App {
             tools_running: 0,
             agents_running: 0,
             sending: 0,
+            queued: Vec::new(),
+            exit_warned: false,
             plan: None,
             waiting_for: None,
             compacting: false,
@@ -430,6 +464,7 @@ impl App {
             held_told: None,
             copy,
             copies: FuturesUnordered::new(),
+            quit: None,
             welcome_visible: true,
             spinner_visible: false,
             exit: false,
@@ -443,16 +478,36 @@ impl App {
         self
     }
 
+    /// Leaves as `/exit` does once `quit` completes (#196: the host's SIGHUP when the terminal closes, or a SIGTERM),
+    /// with a bounded restore ([`QUIT_RESTORE_TIMEOUT`]: the terminal may be gone) and flush ([`QUIT_FLUSH_TIMEOUT`]).
+    pub fn with_quit(mut self, quit: BoxFuture<'static, ()>) -> Self {
+        self.quit = Some(quit);
+        self
+    }
+
     /// Runs until exit: enters the terminal (`render_options::TerminalGuard`), loops as described
-    /// in the module docs, restores the terminal, then awaits `port.flush()` (bounded).
+    /// in the module docs, restores the terminal, then awaits `port.flush()` (bounded). A draw that fails (the
+    /// terminal is gone) ends the loop too: the flush still runs, and the error is returned after it.
     pub async fn run(mut self) -> anyhow::Result<()> {
-        let guard = TerminalGuard::enter(self.options.render)?;
+        let guard = match TerminalGuard::enter(self.options.render) {
+            Ok(guard) => guard,
+            Err(e) => {
+                // No terminal (it closed during startup, #196): nothing to show, but the session is still saved.
+                crate::render_options::within(QUIT_RESTORE_TIMEOUT, crate::render_options::restore);
+                let _ = tokio::time::timeout(QUIT_FLUSH_TIMEOUT, self.port.flush()).await;
+                return Err(e.into());
+            }
+        };
         // No `terminal.clear()`: it asks the terminal where the cursor is, and a terminal that never
         // answers would stop Marv starting. The alternate screen starts blank, and the first draw
         // writes every cell.
         let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
         let mut input = EventStream::new();
         let mut next_frame = Instant::now();
+        let mut quit = self.quit.take().unwrap_or_else(|| Box::pin(futures::future::pending()));
+        // A quit signal, or a terminal that went away (input ended, a draw failed).
+        let mut gone = false;
+        let mut failed = None;
 
         loop {
             let now = Instant::now();
@@ -461,7 +516,10 @@ impl App {
                 break;
             }
             if self.dirty && now >= next_frame {
-                draw_synchronized(&mut terminal, |frame| self.draw(frame))?;
+                if let Err(e) = draw_synchronized(&mut terminal, |frame| self.draw(frame)) {
+                    (gone, failed) = (true, Some(e));
+                    break;
+                }
                 self.dirty = false;
                 next_frame = now + FRAME_INTERVAL;
             }
@@ -476,7 +534,10 @@ impl App {
                 event = input.next() => match event {
                     Some(Ok(event)) => self.on_event(event, Instant::now()),
                     // The terminal went away: nothing more can be shown or typed.
-                    Some(Err(_)) | None => break,
+                    Some(Err(_)) | None => {
+                        gone = true;
+                        break;
+                    }
                 },
                 event = self.events.recv() => match event {
                     Some(event) => {
@@ -494,14 +555,30 @@ impl App {
                     self.copied(chars, &how, Instant::now());
                 }
                 _ = async { tokio::time::sleep_until(sleep.expect("guarded")).await }, if sleep.is_some() => {}
+                () = &mut quit => {
+                    gone = true;
+                    break;
+                }
             }
         }
 
-        drop(terminal);
-        drop(guard);
+        // Not ratatui's Drop: it shows the cursor (as `restore` does) and reports a failure with `eprintln!`, which
+        // panics when stderr is a terminal that's gone (#196).
+        std::mem::forget(terminal);
+        let flush = if gone {
+            // The terminal may be closed (writes fail with EIO, ignored) or stuck (the restore is left behind).
+            crate::render_options::within(QUIT_RESTORE_TIMEOUT, move || drop(guard));
+            QUIT_FLUSH_TIMEOUT
+        } else {
+            drop(guard);
+            FLUSH_TIMEOUT
+        };
         // On the way out: save the session and let pending trajectory records reach the disk.
-        let _ = tokio::time::timeout(FLUSH_TIMEOUT, self.port.flush()).await;
-        Ok(())
+        let _ = tokio::time::timeout(flush, self.port.flush()).await;
+        match failed {
+            Some(e) => Err(e.into()),
+            None => Ok(()),
+        }
     }
 
     /// Whether something other than an empty prompt has the keyboard ([`SessionPort::keyboard_held`]): what's typed
@@ -842,6 +919,13 @@ impl App {
                 // anything typed since, its paste chips kept.
                 self.prompt.give_back(&texts.join("\n"));
                 self.system("✻ Not sent: the turn ended before its next step. Your message is back in the prompt.");
+            }
+            // #184: the queue changed (a message queued, edited, dropped or started).
+            UiEvent::Queued(list) => {
+                // A queue that changed since the warning is warned about again.
+                self.exit_warned &= list == self.queued;
+                self.queued = list;
+                self.dirty = true;
             }
             // A request outside a turn (the suggestion's) still counts.
             UiEvent::Usage { last, totals } if self.turn.is_none() => {
@@ -1419,12 +1503,42 @@ impl App {
                 None => {}
             }
         } else if !matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
+            if self.on_queue_key(key) {
+                return;
+            }
             let busy = self.busy();
             match self.prompt.on_key(key, busy, &self.commands) {
                 Some(PromptOutcome::Submit(text)) => self.submit(&text, now),
                 Some(PromptOutcome::SendNow(text)) => self.send_now(&text, now),
                 None => {}
             }
+        }
+    }
+
+    /// #184: the queue's keys at the prompt. ↑ on an empty line (not browsing the history) takes the newest queued
+    /// message back into the line to edit (Enter queues it again); ctrl+x drops it. Whether the key was used.
+    fn on_queue_key(&mut self, key: KeyEvent) -> bool {
+        if self.queued.is_empty() {
+            return false;
+        }
+        let plain = key.modifiers.difference(KeyModifiers::SHIFT).is_empty();
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Up if plain && self.prompt.value.is_empty() && self.prompt.history_index.is_none() => {
+                if let Some(text) = self.port.unqueue_last() {
+                    self.queued.retain_last(&text);
+                    self.prompt.set(text);
+                }
+                true
+            }
+            KeyCode::Char('x') if ctrl => {
+                if let Some(text) = self.port.unqueue_last() {
+                    self.queued.retain_last(&text);
+                    self.flash = Some(("Dropped a queued message".into(), Instant::now() + NOTICE_MS));
+                }
+                true
+            }
+            _ => false,
         }
     }
 
@@ -1478,6 +1592,14 @@ impl App {
     fn submit(&mut self, raw: &str, now: Instant) {
         let text = raw.trim();
         if text.is_empty() {
+            // #184: idle with messages a stop kept queued, Enter on the empty prompt sends the oldest.
+            if !self.busy()
+                && !self.queued.is_empty()
+                && let Some(next) = self.port.take_queued()
+            {
+                self.queued.retain_first(&next);
+                self.submit_now(next, now);
+            }
             return;
         }
         // A login's callback address holds the authorization code: it goes to the login, never to the model, the
@@ -1488,9 +1610,31 @@ impl App {
             return;
         }
         if self.busy() {
+            // #184: a message while a turn runs is queued for after it (a command waits in the prompt, as before;
+            // so does anything while work outside a turn runs).
+            if self.turn.is_some() && !text.starts_with('/') {
+                self.queue(text.to_string());
+            }
             return;
         }
-        let text = text.to_string();
+        self.submit_now(text.to_string(), now);
+    }
+
+    /// Enter while a turn runs (#184): the line leaves the prompt for the queue, listed above it, and goes when the turn
+    /// finishes. ↑ on the empty prompt takes the newest back to edit; ctrl+x drops it.
+    fn queue(&mut self, text: String) {
+        self.prompt.set("");
+        self.prompt.remember(&text);
+        self.prompt.history_index = None;
+        // Shown at once; the engine's list replaces it. Leaving would drop it too: `/exit` warns again.
+        self.queued.push(text.clone());
+        self.exit_warned = false;
+        self.dirty = true;
+        self.port.queue(text);
+    }
+
+    /// Sends `text` (trimmed, not empty) as a new turn or a command: the prompt empties and remembers it.
+    fn submit_now(&mut self, text: String, now: Instant) {
         self.prompt.set("");
         self.scroll.follow();
         if self.viewing.is_some() {
@@ -1498,6 +1642,13 @@ impl App {
         }
         self.prompt.remember(&text);
         self.prompt.history_index = None;
+        // Leaving drops the queue (#184): the first `/exit` with messages queued says so, the next one leaves.
+        if text.eq_ignore_ascii_case("/exit") && !self.queued.is_empty() && !self.exit_warned {
+            self.exit_warned = true;
+            let n = self.queued.len();
+            let what = if n == 1 { "1 queued message".to_string() } else { format!("{n} queued messages") };
+            return self.system(format!("✻ Leaving drops your {what}: /exit again to leave anyway."));
+        }
         if text.starts_with('/') {
             self.port.run_command(text);
         } else {
@@ -1674,6 +1825,12 @@ impl App {
         } else {
             self.prompt.height(width, busy, &self.commands) + status_height
         };
+        // #184: the queued messages, above the prompt (only where the prompt shows).
+        let prompt_shown =
+            self.picker.is_none() && !radio_panel && self.approval.is_none() && self.setup.is_none() && self.palette.is_none();
+        let queue = if prompt_shown { prompt_input::queue_rows(&self.queued, width) } else { Vec::new() };
+        let queue_height = (queue.len() as u16).min(area.height.saturating_sub(header + panel_height + 2));
+        let panel_height = panel_height + queue_height;
         let panel_height = panel_height.min(area.height.saturating_sub(header + 1));
         // The radio's strip (#124): one line above the prompt while the radio is on (not over setup or a picker).
         let strip_height = u16::from(
@@ -1718,6 +1875,7 @@ impl App {
             agents: self.agents_running,
             viewing: self.viewing.is_some(),
             sending: self.sending,
+            queued: self.queued.len(),
         };
         if strip_height == 1 {
             let flashing =
@@ -1729,6 +1887,11 @@ impl App {
             buf.set_line(panel.x, panel.y, &line, panel.width);
         }
         let panel = Rect { y: panel.y + strip_height, height: panel.height - strip_height, ..panel };
+        let queue_height = queue_height.min(panel.height.saturating_sub(1));
+        for (row, line) in queue.iter().take(queue_height as usize).enumerate() {
+            buf.set_line(panel.x, panel.y + row as u16, line, panel.width);
+        }
+        let panel = Rect { y: panel.y + queue_height, height: panel.height - queue_height, ..panel };
         let status_area = Rect { y: panel.bottom().saturating_sub(1), height: 1.min(panel.height), ..panel };
         let above_status = Rect { height: panel.height.saturating_sub(1), ..panel };
         if let Some(picker) = self.picker.as_ref().filter(|_| self.setup.is_none() && self.approval.is_none()) {
@@ -1932,11 +2095,14 @@ mod tests {
         Resume(Option<String>),
         LoginCallback(String),
         SendNow(String),
+        Queue(String),
     }
 
     #[derive(Default)]
     struct FakePort {
         calls: Mutex<Vec<Call>>,
+        /// The engine's queue (#184): `queue` pushes, `unqueue_last` / `take_queued` take.
+        queue: Mutex<VecDeque<String>>,
         /// What `keyboard_held` was told, in order.
         held: Mutex<Vec<bool>>,
     }
@@ -1971,6 +2137,16 @@ mod tests {
         }
         fn send_now(&self, text: String) {
             self.calls.lock().unwrap().push(Call::SendNow(text));
+        }
+        fn queue(&self, text: String) {
+            self.calls.lock().unwrap().push(Call::Queue(text.clone()));
+            self.queue.lock().unwrap().push_back(text);
+        }
+        fn unqueue_last(&self) -> Option<String> {
+            self.queue.lock().unwrap().pop_back()
+        }
+        fn take_queued(&self) -> Option<String> {
+            self.queue.lock().unwrap().pop_front()
         }
         fn run_command(&self, line: String) {
             self.calls.lock().unwrap().push(Call::Command(line));
@@ -2245,11 +2421,7 @@ mod tests {
         let mut h = harness();
         h.typed("fix the build");
         h.events([UiEvent::TurnStart { turn: "t".into() }, tool_start("c1", "bash", "cargo build")]);
-        assert!(h.frame().contains("alt+enter send now"));
-        // Plain Enter while busy: as before, nothing is sent and the text stays.
-        h.typed("also the tests");
-        assert_eq!(h.calls(), [Call::Send("fix the build".into())]);
-        h.app.prompt.set("");
+        assert!(h.frame().contains("enter queues · alt+enter send now"));
         alt_enter(&mut h, "also the tests");
         assert_eq!(h.calls(), [Call::Send("fix the build".into()), Call::SendNow("also the tests".into())]);
         assert_eq!(h.app.prompt.value, "");
@@ -2272,6 +2444,148 @@ mod tests {
         h.events([UiEvent::Done(StopReason::End), turn_end()]);
         alt_enter(&mut h, "thanks");
         assert_eq!(h.calls().last(), Some(&Call::Send("thanks".into())));
+    }
+
+    // --- #184: the queue ---
+
+    /// Types `text` and presses Enter (queued while a turn runs).
+    fn enter(h: &mut Harness, text: &str) {
+        for c in text.chars() {
+            h.key(KeyCode::Char(c));
+        }
+        h.key(ENTER);
+    }
+
+    #[test]
+    fn enter_while_a_turn_runs_queues_the_message_and_shows_it_above_the_prompt() {
+        let mut h = harness();
+        h.typed("fix the build");
+        h.events([UiEvent::TurnStart { turn: "t".into() }, tool_start("c1", "bash", "cargo build")]);
+        enter(&mut h, "then run the tests");
+        enter(&mut h, "and lint");
+        assert_eq!(
+            h.calls(),
+            [Call::Send("fix the build".into()), Call::Queue("then run the tests".into()), Call::Queue("and lint".into())]
+        );
+        // Out of the prompt, listed above it, not in the transcript yet; the bar says how to change them.
+        assert_eq!(h.app.prompt.value, "");
+        let frame = h.frame();
+        assert!(frame.contains("queued › then run the tests") && frame.contains("queued › and lint"), "{frame}");
+        assert!(!frame.contains("> then run the tests"));
+        assert!(frame.contains("↑ edit queued · ctrl+x drop"), "{frame}");
+        // The engine's list is what's shown: it started the first one when the turn ended.
+        h.events([UiEvent::Done(StopReason::End), turn_end()]);
+        h.events([
+            UiEvent::Queued(vec!["and lint".into()]),
+            UiEvent::Message(message(Role::User, "then run the tests".into())),
+            UiEvent::TurnStart { turn: "t2".into() },
+        ]);
+        let frame = h.frame();
+        assert!(frame.contains("> then run the tests") && !frame.contains("queued › then run"), "{frame}");
+        assert!(frame.contains("queued › and lint"));
+        assert!(h.app.busy());
+        // A command while a turn runs isn't queued: it waits in the prompt, as before.
+        enter(&mut h, "/undo");
+        assert_eq!(h.app.prompt.value, "/undo");
+        assert!(!h.calls().contains(&Call::Queue("/undo".into())));
+    }
+
+    #[test]
+    fn up_takes_the_newest_queued_message_back_to_edit_and_ctrl_x_drops_one() {
+        let mut h = harness();
+        h.typed("go");
+        h.events([UiEvent::TurnStart { turn: "t".into() }]);
+        enter(&mut h, "first");
+        enter(&mut h, "secnd");
+        // ↑ on the empty prompt: the newest is back in the line (and out of the queue), to fix and queue again.
+        h.key(KeyCode::Up);
+        assert_eq!(h.app.prompt.value, "secnd");
+        assert!(!h.frame().contains("queued › secnd"));
+        assert_eq!(h.port.queue.lock().unwrap().iter().cloned().collect::<Vec<_>>(), ["first"]);
+        h.app.prompt.set("second");
+        h.key(ENTER);
+        assert_eq!(h.port.queue.lock().unwrap().iter().cloned().collect::<Vec<_>>(), ["first", "second"]);
+        // With text in the line, ↑ is the history, as always.
+        h.key(KeyCode::Char('x'));
+        h.key(KeyCode::Up);
+        assert_eq!(h.app.queued, ["first", "second"]);
+        h.app.prompt.set("");
+        h.app.prompt.history_index = None;
+        // ctrl+x drops the newest.
+        h.ctrl('x');
+        assert_eq!(h.app.queued, ["first"]);
+        assert_eq!(h.port.queue.lock().unwrap().iter().cloned().collect::<Vec<_>>(), ["first"]);
+        assert!(h.frame().contains("Dropped a queued message"));
+        h.ctrl('x');
+        assert!(h.app.queued.is_empty() && h.port.queue.lock().unwrap().is_empty());
+        // Nothing queued: ↑ is the history again.
+        h.key(KeyCode::Up);
+        assert_eq!(h.app.prompt.value, "second");
+    }
+
+    #[test]
+    fn esc_stops_the_turn_and_keeps_the_queue_enter_on_the_empty_prompt_sends_the_next() {
+        let mut h = harness();
+        h.typed("go");
+        h.events([UiEvent::TurnStart { turn: "t".into() }]);
+        enter(&mut h, "one");
+        enter(&mut h, "two");
+        h.key(KeyCode::Esc);
+        assert!(h.calls().contains(&Call::Abort));
+        // The engine keeps them (and says so): still listed, nothing started.
+        h.events([
+            UiEvent::Done(StopReason::Aborted),
+            turn_end(),
+            UiEvent::Message(system_message("✻ Stopped. Your 2 queued messages wait: …".into(), false)),
+        ]);
+        assert!(!h.app.busy());
+        let frame = h.frame();
+        assert!(frame.contains("queued › one") && frame.contains("queued › two"), "{frame}");
+        assert!(frame.contains("enter sends queued · ↑ edit · ctrl+x drop"), "{frame}");
+        // Enter on the empty prompt: the oldest goes now, as if typed.
+        h.key(ENTER);
+        assert_eq!(h.calls().last(), Some(&Call::Send("one".into())));
+        assert_eq!(h.app.queued, ["two"]);
+        assert!(h.app.busy());
+        assert!(h.frame().contains("> one"));
+    }
+
+    /// Review on #239: leaving drops the queue, so the first `/exit` (or ctrl+c) says how many go; the next leaves.
+    #[test]
+    fn leaving_with_messages_queued_warns_first() {
+        let mut h = harness();
+        h.typed("go");
+        h.events([UiEvent::TurnStart { turn: "t".into() }]);
+        enter(&mut h, "one");
+        enter(&mut h, "two");
+        h.events([UiEvent::Done(StopReason::Aborted), turn_end()]);
+        h.typed("/exit");
+        assert!(!h.calls().contains(&Call::Command("/exit".into())));
+        assert!(h.frame().contains("Leaving drops your 2 queued messages"));
+        // Queued more since the warning: warned again.
+        h.events([UiEvent::TurnStart { turn: "t2".into() }]);
+        enter(&mut h, "three");
+        h.events([
+            UiEvent::Queued(vec!["one".into(), "two".into(), "three".into()]),
+            UiEvent::Done(StopReason::Aborted),
+            turn_end(),
+        ]);
+        h.typed("/exit");
+        assert!(!h.calls().contains(&Call::Command("/exit".into())));
+        assert!(h.frame().contains("Leaving drops your 3 queued messages"));
+        h.typed("/exit");
+        assert_eq!(h.calls().last(), Some(&Call::Command("/exit".into())));
+        // ctrl+c's confirm says it too.
+        h.ctrl('c');
+        assert!(h.frame().contains("Press ctrl+c again to exit (3 queued messages will be dropped)"), "{}", h.frame());
+    }
+
+    #[test]
+    fn a_long_queue_lists_three_and_counts_the_rest() {
+        let rows = prompt_input::queue_rows(&["a".into(), "b\nmore".into(), "c".into(), "d".into(), "e".into()], 40);
+        let text: Vec<String> = rows.iter().map(|l| l.to_string()).collect();
+        assert_eq!(text, ["  queued › a", "  queued › b …", "  queued › c", "  +2 more queued"]);
+        assert!(prompt_input::queue_rows(&[], 40).is_empty());
     }
 
     #[test]
@@ -2795,12 +3109,18 @@ mod tests {
     }
 
     #[test]
-    fn a_message_while_busy_isnt_sent_and_stays_in_the_prompt() {
+    fn a_message_while_a_turn_runs_is_queued_and_while_other_work_runs_stays_in_the_prompt() {
         let mut h = harness();
         h.typed("first");
         h.typed("second");
-        assert_eq!(h.calls(), [Call::Send("first".into())]);
-        assert_eq!(h.app.prompt.value, "second");
+        assert_eq!(h.calls(), [Call::Send("first".into()), Call::Queue("second".into())]);
+        assert_eq!(h.app.prompt.value, "");
+        h.events([UiEvent::Done(StopReason::End), turn_end()]);
+        // Work outside a turn (`/mcp add`'s lookup): nothing to queue behind, so the text waits in the prompt.
+        h.event(UiEvent::Busy(Some("Looking it up…".into())));
+        h.typed("third");
+        assert_eq!(h.calls().len(), 2);
+        assert_eq!(h.app.prompt.value, "third");
     }
 
     #[test]

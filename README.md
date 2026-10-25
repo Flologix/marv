@@ -35,7 +35,7 @@ There's also [Marv desktop](#marv-desktop): the same agent in a window, with a f
 - **No dead stops.** After 25 steps without finishing, Marv asks whether to keep going instead of giving up. Raise the interval with `/steps 40` (or `maxSteps` in the config), or turn the asking off with `/steps off` (subagents still stop at their own 50).
 - **Cost tracking.** OpenRouter's actual charge per request, plus context and cache use, in the status bar; `/cost` for the breakdown.
 - **Herdr aware.** Run Marv in a [Herdr](https://herdr.dev) pane and Herdr's sidebar shows whether it's working, waiting for your approval, or done, with nothing to set up. There the model also gets a `herdr` tool: it lists and reads panes without asking (what it reads counts as untrusted), asks before focusing or renaming a pane or typing a prompt into an idle agent's pane, and asks every time before running a command in a new pane or starting a worker (another Marv, or an agent such as Claude Code or Codex, optionally in its own git worktree). `/peers` lists the panes it opened.
-- **Marv desktop.** A window for Marv on Linux: pick a folder, chat about it, approve what leaves the sandbox with a click. Chats keep running in the background, and a desktop notification tells you when one needs you or is done. See [Marv desktop](#marv-desktop).
+- **Marv desktop.** A window for Marv on Linux and macOS: pick a folder, chat about it, approve what leaves the sandbox with a click. Chats keep running in the background, and a desktop notification tells you when one needs you or is done. See [Marv desktop](#marv-desktop).
 - **A comfortable, light TUI.** Streaming Markdown replies revealed at an even pace, a live preview of the model's reasoning, mouse-wheel scrolling, drag-to-copy with auto-scroll, a `/` command menu, and Esc to interrupt. It uses next to no CPU while idle.
 
 ## Requirements
@@ -43,6 +43,7 @@ There's also [Marv desktop](#marv-desktop): the same agent in a window, with a f
 - Linux on x86_64 or aarch64, or macOS 14 (Sonoma) or newer on Apple silicon or Intel. **On Windows, use [WSL](https://learn.microsoft.com/windows/wsl/install)**: install Marv inside your WSL distribution (e.g. Ubuntu) and run `marv` there.
 - On Linux, `bubblewrap` (`bwrap`) for the command sandbox (e.g. `sudo apt install bubblewrap`). Without it Marv still works, but every command asks first and warns that it runs unsandboxed, and what needs the sandbox is off: the typecheck after edits, the project's checks and the `process` tool. On macOS the sandbox is Seatbelt (`/usr/bin/sandbox-exec`, built in), so there's nothing to install; the `process` tool isn't on macOS yet (#152).
 - `git`, for `/undo` and for subagents' worktrees.
+- Marv desktop: macOS 14 or newer (the .dmg; nothing else to install), or Linux with WebKitGTK 4.1 (built from a clone, see [Marv desktop](#marv-desktop)).
 - One of:
   - an [OpenRouter API key](https://openrouter.ai/settings/keys), or
   - [Ollama](https://ollama.com) running locally, with a model that supports tool calling (e.g. `ollama pull qwen3.5:9b`).
@@ -65,7 +66,7 @@ Download `install.sh` to pass it options:
 
 ```sh
 sh install.sh --prefix /opt/marv       # into /opt/marv/bin instead of ~/.local/bin
-sh install.sh --version v0.10.0        # a given release instead of the latest
+sh install.sh --version v0.11.0        # a given release instead of the latest
 sh install.sh --from target/release/marv   # a binary you built yourself
 sh install.sh --uninstall              # remove it again
 ```
@@ -90,7 +91,7 @@ marv
 
 The first run opens a short setup: pick OpenRouter or Ollama, pick a model, and (for OpenRouter) paste your key. Settings are saved to `~/.marv/config.json`, readable only by you. Run `/setup` to change them later.
 
-Marv desktop has no download yet: build it from a clone with `app/install-desktop.sh` (see [Marv desktop](#marv-desktop)).
+Marv desktop: on macOS, download the .dmg from the release (see [Marv desktop](#marv-desktop)); on Linux, build it from a clone with `app/install-desktop.sh`.
 
 ### A plan you already pay for (coming)
 
@@ -160,7 +161,9 @@ Type `/` to open the command menu: ↑/↓ to choose, Enter to run, Tab or → t
 | Key | Action |
 |---|---|
 | Esc | Stop a reply or a running tool (in a subagent's view: go back) |
+| Enter (while Marv works) | Queue your message: it's listed above the prompt and sent as the next turn when this one finishes. Esc keeps the queue (Enter on an empty prompt then sends the next) |
 | alt+enter or ctrl+s (while Marv works) | Send now: your message goes in at Marv's next step (after the current reply and tool calls), instead of after the turn. Nothing running is stopped |
+| ↑ / ctrl+x (empty input, messages queued) | Take the newest queued message back to edit / drop it |
 | ctrl+c | Stop / clear the input / press twice to quit |
 | ctrl+k | Command palette: search commands, skills, settings (with their values) and keys; Enter flips a toggle |
 | ctrl+o | Show or hide details: what subagents did, and whole diffs |
@@ -199,7 +202,17 @@ Marv desktop (`app/`, a [Tauri](https://tauri.app) app) runs the same engine as 
 
 It loads what the CLI loads (your `~/.marv` skills, memory, MCP servers and instructions, and the folder's own) and keeps its sessions in `~/.marv` too.
 
-**Build and install it** (Linux; you need Rust, Node, bubblewrap and WebKitGTK 4.1, `webkit2gtk-4.1`):
+**On macOS** (14 or newer, Apple silicon or Intel), download the .dmg for your Mac from the [latest release](https://github.com/FlologixAI/marv/releases/latest) (since 0.11.0): `marv-desktop-aarch64-apple-darwin.dmg` for Apple silicon, `marv-desktop-x86_64-apple-darwin.dmg` for Intel. Open it and drag **Marv** to Applications; then it's in Launchpad and Spotlight like any app, and there's no launcher entry to add.
+
+The app isn't signed with an Apple Developer ID or notarized yet, so the first time macOS refuses to open it ("Apple could not verify…"). Open it once anyway:
+
+1. Try to open **Marv**, then go to **System Settings → Privacy & Security**, scroll to the message about Marv, click **Open Anyway** and confirm.
+2. Or in a terminal: `xattr -dr com.apple.quarantine /Applications/Marv.app`, then open it as usual.
+3. On macOS 14 only, right-click (or Control-click) **Marv** in Applications, choose **Open**, then **Open** again also works; macOS 15 removed that shortcut.
+
+After that it opens normally. To open a specific folder from a terminal: `open -a Marv --args "$PWD"` (an absolute path; when Marv is already open, it only comes to the front). A notification's click brings the window up (on Linux it also opens the chat). Dictation is macOS's own: press the Globe (fn) key twice in the prompt.
+
+**On Linux, build and install it** (you need Rust, Node, bubblewrap and WebKitGTK 4.1, `webkit2gtk-4.1`):
 
 ```sh
 git clone https://github.com/FlologixAI/marv.git
@@ -208,7 +221,7 @@ app/install-desktop.sh                # builds it, then installs ~/.local/bin/ma
 app/install-desktop.sh --uninstall    # removes them again
 ```
 
-Open **Marv** from your app launcher, or run `marv-desktop` (`marv-desktop <dir>` opens that folder). Run the script again after pulling to update. [`app/README.md`](app/README.md) has the details, including the browser mode with `marv-web`.
+Open **Marv** from your app launcher, or run `marv-desktop` (`marv-desktop <dir>` opens that folder). Run the script again after pulling to update. On a Mac the same script builds Marv.app from the clone and puts it in /Applications (a build of your own isn't quarantined, so there's no Gatekeeper step). [`app/README.md`](app/README.md) has the details, including the browser mode with `marv-web`.
 
 ## Safety model
 
@@ -355,7 +368,7 @@ model: inherit                       # optional; or a model id on the same provi
 You are a careful code reviewer. Read the diff, then the code around it…
 ```
 
-Put it in `.marv/agents/<name>.md` (this project) or `~/.marv/agents/<name>.md` (all projects); there's also a built-in `general-purpose` agent with every tool. A subagent starts with a fresh conversation that holds only the task it was given, and never gets the `agent`, `memory` or `plan` tools. Only names and descriptions go into the system prompt, so write descriptions that say when to use the agent. A reference like `superpowers:code-reviewer` finds `code-reviewer`, so skills written for Claude Code work unchanged. `/agents` lists what loaded, and why any file didn't.
+Put it in `.marv/agents/<name>.md` (this project) or `~/.marv/agents/<name>.md` (all projects); there are also two built-in agents: `general-purpose`, with every tool, and `explore`, which can only read and search (`read_file`, `grep`, `glob`, `web_fetch`; no edits, no `bash`, no mesh tools, even in yolo) and is the one Marv uses for searches. A file with the same name replaces a built-in one, so `.marv/agents/explore.md` with `model: <a cheaper model>` runs searches on that model (built-ins use the session's model). Keep such a replacement read-only: the agent tool tells the model that `explore` only reads and searches, whatever the file gives it. A subagent starts with a fresh conversation that holds only the task it was given, and never gets the `agent`, `memory` or `plan` tools. Only names and descriptions go into the system prompt, so write descriptions that say when to use the agent. A reference like `superpowers:code-reviewer` finds `code-reviewer`, so skills written for Claude Code work unchanged. `/agents` lists what loaded, and why any file didn't.
 
 ## Checks
 
@@ -548,7 +561,7 @@ CI runs those last four on every pull request, with bubblewrap installed so the 
 - **The oracle** (`tests/oracle/`, the `marv-oracle` crate) proves Marv behaves as it did: 30 scenarios recorded from the TypeScript Marv, each replayed against a fake model server and compared with what Marv did then (files, tool calls, requests, exit code), plus a check that every request extends the one before it, so the prompt cache holds. No run reaches a real model. Build the binary, then check it: `cargo build -p marv-cli && cargo run -p marv-oracle -- check` (or name a few scenarios). [`tests/oracle/README.md`](tests/oracle/README.md) has the rest.
 - **The guard suite** (`tests/guards/`, `cargo test -p marv-guards`) has one test per rule in [`docs/SECURITY.md`](docs/SECURITY.md), with the real bubblewrap where it matters. Each was proven by removing its guard and watching it fail.
 - Try the UI without a model: `cargo run -p marv-tui --example martian` (the martian, q to quit) and `cargo run -p marv-tui --example fake_session` (the whole TUI on a scripted engine).
-- Marv desktop: `cd app && npm install && npx tauri dev` runs it with hot reload ([`app/README.md`](app/README.md)).
+- Marv desktop: `cd app && npm install && npx tauri dev` runs it with hot reload ([`app/README.md`](app/README.md)). The Desktop workflow builds Marv.app and the .dmg on macOS for pull requests that touch `app/` or `crates/marv-web`, and checks that the built app starts.
 - The README's screenshots come from [`scripts/screenshots/`](scripts/screenshots/README.md): headless, against a stub model, no key needed.
 
 Read first: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) (the crates and how they fit), [`docs/SECURITY.md`](docs/SECURITY.md) (the security rules), [`docs/MESH.md`](docs/MESH.md) (the mesh's design), and [`AGENTS.md`](AGENTS.md) (how to work in this repository, for people and agents). Each crate has its notes in `docs/subsystems/`.
@@ -556,16 +569,16 @@ Read first: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) (the crates and how t
 ### Releasing
 
 1. Move `CHANGELOG.md`'s entries under the new version (patch for fixes, minor for features or anything breaking while below 1.0), and bump `version` under `[workspace.package]` in `Cargo.toml` to match (a version can only be published once).
-2. Tag and push: `git tag v0.10.0 && git push origin v0.10.0`. The release workflow (`.github/workflows/release.yml`) builds static musl binaries for Linux x86_64 and aarch64 and native ones for macOS arm64 and x86_64, tests the installer and the npm packages against them, and creates the GitHub release with `marv-<target>.tar.gz`, `SHA256SUMS`, `install.sh` and the npm packages as `.tgz` files. Run it by hand (workflow_dispatch) for a dry run without the release.
+2. Tag and push: `git tag v0.11.0 && git push origin v0.11.0`. The release workflow (`.github/workflows/release.yml`) builds static musl binaries for Linux x86_64 and aarch64 and native ones for macOS arm64 and x86_64, tests the installer and the npm packages against them, and creates the GitHub release with `marv-<target>.tar.gz`, `SHA256SUMS`, `install.sh`, the npm packages as `.tgz` files and, when its build succeeds, Marv desktop for macOS as `marv-desktop-<target>.dmg`. Run it by hand (workflow_dispatch) for a dry run without the release.
 3. Publish the npm packages by hand (npm wants your 2FA), platform packages first, since the launcher names them:
 
 ```sh
-gh release download v0.10.0 -p 'flologixai-marv-*.tgz' -D npm
-npm publish ./npm/flologixai-marv-linux-x64-0.10.0.tgz --access public
-npm publish ./npm/flologixai-marv-linux-arm64-0.10.0.tgz --access public
-npm publish ./npm/flologixai-marv-darwin-arm64-0.10.0.tgz --access public
-npm publish ./npm/flologixai-marv-darwin-x64-0.10.0.tgz --access public
-npm publish ./npm/flologixai-marv-0.10.0.tgz --access public
+gh release download v0.11.0 -p 'flologixai-marv-*.tgz' -D npm
+npm publish ./npm/flologixai-marv-linux-x64-0.11.0.tgz --access public
+npm publish ./npm/flologixai-marv-linux-arm64-0.11.0.tgz --access public
+npm publish ./npm/flologixai-marv-darwin-arm64-0.11.0.tgz --access public
+npm publish ./npm/flologixai-marv-darwin-x64-0.11.0.tgz --access public
+npm publish ./npm/flologixai-marv-0.11.0.tgz --access public
 ```
 
 `packaging/npm/build.sh` builds those packages from the release's tarballs, if you need them again.

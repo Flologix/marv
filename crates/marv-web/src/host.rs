@@ -207,7 +207,7 @@ pub async fn run_chat(spec: ChatSpec, mut incoming: UnboundedReceiver<ClientMess
                         turn = Some((cancel, tokio::spawn(forward(events, before, session.clone(), out.clone()))));
                     }
                     Err(e) => {
-                        let _ = out.send(json!({"type": "error", "message": e.to_string()}));
+                        let _ = out.send(send_refused(text, &e.to_string()));
                     }
                 }
             }
@@ -438,6 +438,12 @@ async fn watch_mesh(
     }
 }
 
+/// A `send` the session refused (#184: a mesh wake took it first, say): the text comes back with the reason, so the
+/// page puts it back in its queue by this reply, whatever order it gets the wake's events in.
+fn send_refused(text: &str, message: &str) -> Value {
+    json!({"type": "send_refused", "text": text, "message": message})
+}
+
 fn state_name(state: marv_mcp::manager::McpState) -> &'static str {
     use marv_mcp::manager::McpState as S;
     match state {
@@ -618,6 +624,15 @@ mod tests {
             matches!(provider_option(&none, "zai/glm-5.3"), ProviderOption::Zai { ref api_key, .. } if api_key.is_empty()),
             "never the OpenRouter key"
         );
+    }
+
+    /// #184: a refused send is a typed reply that carries the text back (not a bare error), like `not_sent`.
+    #[test]
+    fn a_refused_send_gives_its_text_back() {
+        let reply = send_refused("run the tests", "Marv is working");
+        assert_eq!(reply["type"], "send_refused");
+        assert_eq!(reply["text"], "run the tests");
+        assert_eq!(reply["message"], "Marv is working");
     }
 
     #[test]

@@ -28,3 +28,6 @@ uuid = { version = "1", features = ["v4"] }
 # Deleting from the tree moves to the desktop's trash, never rm -rf.
 trash = "5"
 notify-rust = "4"
+
+[lints]
+workspace = true
