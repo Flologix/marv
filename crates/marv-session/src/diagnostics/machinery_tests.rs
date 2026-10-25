@@ -597,3 +597,57 @@ fn host_spawn_probe(markers: &Path) {
     let _ = std::process::Command::new("git").arg("--version").status();
     assert_eq!(left(), ["git"], "the marker PATH doesn't work");
 }
+
+/// `low_priority` runs the whole command, pipes and all, niced, with its environment.
+#[test]
+fn low_priority_wraps_the_whole_command() {
+    let command = low_priority(&[("GREETING", "it's me".to_string())], "echo \"$GREETING\" | tr a-z A-Z && nice");
+    let out = std::process::Command::new("/bin/sh").arg("-c").arg(&command).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.first().copied(), Some("IT'S ME"), "{text}");
+    let niceness: i32 = lines.get(1).and_then(|n| n.trim().parse().ok()).unwrap_or_else(|| panic!("{text}"));
+    assert!(niceness >= 10, "{text}");
+    assert!(build_jobs() >= 1);
+}
+
+/// The key folder is checked again once the lock is held, right before it's mounted: one swapped for a symlink while
+/// the check waited is refused, and one evicted meanwhile is made again.
+#[tokio::test]
+async fn the_key_folder_is_checked_again_under_the_lock() {
+    let (dir, project, cache) = setup();
+    let key = repo_key(&project);
+    let key_dir = cache.key_dir(&key).unwrap();
+    let other = CheckCache::new(cache.root.clone());
+    let runs = Runs::checks(vec![]);
+    let checker = checker(plain(), &runs, &cache);
+    for swap in [true, false] {
+        let held = other.try_lock(&key).unwrap();
+        let t = turn(&checker, &project);
+        let hook = t.checks.clone().unwrap().before_change;
+        let waiting = tokio::spawn(async move { hook.before_change().await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        std::fs::remove_dir_all(&key_dir).unwrap();
+        if swap {
+            let elsewhere = dir.0.join("elsewhere");
+            std::fs::create_dir_all(&elsewhere).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, &key_dir).unwrap();
+        }
+        drop(held);
+        waiting.await.unwrap();
+        if swap {
+            assert!(
+                matches!(&t.results()[..], [CheckOutcome::Failed { reason: FailReason::CacheRefused, .. }]),
+                "{:?}",
+                t.results()
+            );
+            assert_eq!(runs.all().len(), 0);
+            std::fs::remove_file(&key_dir).unwrap();
+            checker.reset();
+        } else {
+            assert_eq!(runs.all().len(), 1);
+            assert_eq!(runs.all()[0].writable, vec![key_dir.clone()]);
+            assert!(std::fs::symlink_metadata(&key_dir).unwrap().is_dir());
+        }
+    }
+}

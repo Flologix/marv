@@ -319,6 +319,8 @@ impl CheckCache {
         self.write_record(key, &record);
         let too_big = size > self.key_cap;
         if too_big {
+            // A check holding the lock right now keeps it this time; the kind is off for the session anyway, and the
+            // total cap's eviction or a later prune takes the folder.
             self.remove(key);
         }
         (size, too_big)
@@ -438,7 +440,8 @@ impl CheckCache {
     }
 }
 
-/// Refuses a path that is a symlink, not a folder, or not the user's.
+/// Refuses a path that is a symlink, not a folder, or not the user's; one of the user's that others can reach is
+/// tightened to 0700 (a root or key folder made before Marv, or by a looser umask).
 fn plain_own_dir(path: &Path) -> Result<(), String> {
     let meta = std::fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
     if meta.file_type().is_symlink() {
@@ -449,6 +452,11 @@ fn plain_own_dir(path: &Path) -> Result<(), String> {
     }
     if meta.uid() != nix::unistd::getuid().as_raw() {
         return Err(format!("{} isn't yours", path.display()));
+    }
+    if meta.mode() & 0o077 != 0 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("couldn't make {} private: {e}", path.display()))?;
     }
     Ok(())
 }
@@ -530,8 +538,12 @@ mod tests {
         assert_eq!(made, cache.root.join("k1"));
         assert_eq!(std::fs::metadata(&made).unwrap().mode() & 0o777, 0o700);
         assert_eq!(std::fs::metadata(&cache.root).unwrap().mode() & 0o777, 0o700);
-        // Again: fine.
+        // Again: fine. A folder of ours that others can reach is tightened.
+        std::fs::set_permissions(&made, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&cache.root, std::os::unix::fs::PermissionsExt::from_mode(0o775)).unwrap();
         assert_eq!(cache.key_dir("k1").unwrap(), made);
+        assert_eq!(std::fs::metadata(&made).unwrap().mode() & 0o777, 0o700);
+        assert_eq!(std::fs::metadata(&cache.root).unwrap().mode() & 0o777, 0o700);
         // A symlink in its place (to another key's folder, or anywhere): refused.
         std::os::unix::fs::symlink(&made, cache.root.join("k2")).unwrap();
         assert!(cache.key_dir("k2").unwrap_err().contains("symlink"));

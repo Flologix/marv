@@ -1951,15 +1951,16 @@ impl Bridge {
                 self.save_config(self.with_file(|f| f.diagnostics = Some(next)), format!("Diagnostics {status}"));
             }
             CommandAction::ClearCheckCache => {
-                let (text, is_error) = match self.session.clear_check_cache() {
-                    Ok(Some(bytes)) => (
-                        format!("Deleted this project's check cache ({}).", marv_session::diagnostics::cache::human_size(bytes)),
-                        false,
-                    ),
-                    Ok(None) => ("This project has no check cache.".to_string(), false),
-                    Err(e) => (format!("Couldn't delete this project's check cache: {}", printable(&e)), true),
-                };
-                self.emit(system(text, is_error));
+                // Deleting a big cache takes a while: off the UI thread, with a notice when it's done.
+                self.emit(system("Deleting this project's check cache…", false));
+                let me = self.clone();
+                tokio::spawn(async move {
+                    let session = me.session.clone();
+                    let cleared = tokio::task::spawn_blocking(move || session.clear_check_cache())
+                        .await
+                        .unwrap_or_else(|e| Err(e.to_string()));
+                    me.emit(cleared_notice(cleared));
+                });
             }
             CommandAction::Checks { on } => {
                 let status = commands::checks_status(&Config { checks: on, ..config.clone() });
@@ -2737,6 +2738,18 @@ impl Bridge {
         };
         commands::run_command(line, &ctx)
     }
+}
+
+/// What `/diagnostics clear` (#187) says when it's done.
+fn cleared_notice(cleared: Result<Option<u64>, String>) -> UiEvent {
+    let (text, is_error) = match cleared {
+        Ok(Some(bytes)) => {
+            (format!("Deleted this project's check cache ({}).", marv_session::diagnostics::cache::human_size(bytes)), false)
+        }
+        Ok(None) => ("This project has no check cache.".to_string(), false),
+        Err(e) => (format!("Couldn't delete this project's check cache: {}", printable(&e)), true),
+    };
+    system(text, is_error)
 }
 
 /// The palette's settings (#44) from the settings table, with their values in `config`.

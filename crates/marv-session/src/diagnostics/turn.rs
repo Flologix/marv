@@ -47,7 +47,7 @@ use marv_tools::bash::{MAX_CAPTURE, RunOptions};
 use tokio_util::sync::CancellationToken;
 
 use super::Diagnostic;
-use super::cache::{CheckCache, repo_key};
+use super::cache::{CheckCache, KeyLock, repo_key};
 use super::tsc::format_error;
 
 pub const CHECK_TIMEOUT: Duration = Duration::from_secs(60);
@@ -169,12 +169,15 @@ pub fn sandboxed() -> RunCheck {
     })
 }
 
-/// A command at low priority (#187 §6.1): `nice -n 10`, plus `ionice -c3` where the sandbox has it (Linux; resolved
-/// inside the sandbox, never on the host). `env` is set in the command, since the sandbox's environment is built from
-/// scratch.
+/// A command at low priority (#187 §6.1): the whole of it (pipes, `&&`, redirections and all) run by `sh -c` under
+/// `nice -n 10`, plus `ionice -c3` where the sandbox has it (Linux; resolved inside the sandbox, never on the host).
+/// `env` is exported first, since the sandbox's environment is built from scratch.
 pub fn low_priority(env: &[(&str, String)], command: &str) -> String {
     let exports: String = env.iter().map(|(k, v)| format!("export {k}={}; ", shell_quote(v))).collect();
-    format!("{exports}if command -v ionice >/dev/null 2>&1; then nice -n 10 ionice -c3 {command}; else nice -n 10 {command}; fi")
+    let inner = shell_quote(command);
+    format!(
+        "{exports}if command -v ionice >/dev/null 2>&1; then exec nice -n 10 ionice -c3 sh -c {inner}; else exec nice -n 10 sh -c {inner}; fi"
+    )
 }
 
 /// `s` as one shell word.
@@ -559,11 +562,13 @@ struct CacheAt {
     dir: PathBuf,
 }
 
-/// After a run that used a key: its record, then (at most once a minute, off the step's path) its size, the per-key
-/// cap and the total cap.
-fn after_cache_run(cache: &Arc<CheckCache>, shared: &Arc<Shared>, key: &str, root: &Path) {
+/// After a run that used a key: its record, written while the run's lock is still held (so an eviction never sees a
+/// stale last use), then the lock let go, then (at most once a minute, off the step's path) its size, the per-key cap
+/// and the total cap.
+fn after_cache_run(cache: &Arc<CheckCache>, shared: &Arc<Shared>, key: &str, root: &Path, lock: KeyLock) {
     let now = crate::time::now_ms();
     cache.touch(key, root, now);
+    drop(lock);
     if !cache.due_for_sizing(key, now) {
         return;
     }
@@ -641,13 +646,18 @@ impl<E: Clone + Send + Sync + 'static> Turn<E> {
             let started = Instant::now();
             // Another session's check or warm-up of this key: wait for it (it fills the same cache).
             let Some(lock) = cache.lock(&key, limit, &cancel).await else { return };
+            // Checked again under the lock, right before it's mounted: evicted meanwhile (made again), or swapped for
+            // a symlink (refused).
+            let Ok(checked) = cache.key_dir(&key) else { return };
+            debug_assert_eq!(checked, dir);
             let timeout = limit.saturating_sub(started.elapsed());
-            let writable = vec![dir];
+            let writable = vec![checked];
             // Its output is thrown away: its only job is the cache.
             let _ = run(CheckRun { command, root: root.clone(), read_only, writable, timeout }, cancel.clone()).await;
-            drop(lock);
-            if !cancel.is_cancelled() {
-                after_cache_run(&cache, &shared, &key, &root);
+            if cancel.is_cancelled() {
+                drop(lock);
+            } else {
+                after_cache_run(&cache, &shared, &key, &root, lock);
             }
             let _ = done.send(true);
         });
@@ -695,6 +705,7 @@ impl<E: Clone + Send + Sync + 'static> Turn<E> {
     async fn check(&self, pass: &CheckPass<E>, at: Option<&CacheAt>, baseline: bool) -> Option<(Vec<E>, u64)> {
         let (checker, cancel) = (&self.checker, &self.options.cancel);
         let mut lock = None;
+        let mut writable = Vec::new();
         if let (Some(at), Some(cache)) = (at, checker.cache.as_ref()) {
             if cache.low_on_space().is_some() {
                 let notify = !checker.told_low_disk.swap(true, Ordering::SeqCst);
@@ -711,6 +722,17 @@ impl<E: Clone + Send + Sync + 'static> Turn<E> {
                 }
                 return None;
             }
+            // Checked again under the lock, right before it's mounted: a folder evicted since `cache_at` is made
+            // again, and one swapped for a symlink or someone else's is refused.
+            match cache.key_dir(&at.key) {
+                Ok(dir) => writable.push(dir),
+                Err(why) => {
+                    self.unavailable.store(true, Ordering::SeqCst);
+                    let notify = self.notify_once();
+                    self.tell(CheckOutcome::Failed { ms: 0, reason: FailReason::CacheRefused, tool: Some(why), notify });
+                    return None;
+                }
+            }
         }
         // The timeout starts here, once the lock is held: a wait for it never counts as one.
         let started = Instant::now();
@@ -718,14 +740,13 @@ impl<E: Clone + Send + Sync + 'static> Turn<E> {
             command: pass.command.clone(),
             root: self.options.root.clone(),
             read_only: pass.read_only.clone(),
-            writable: at.map(|a| vec![a.dir.clone()]).unwrap_or_default(),
+            writable,
             timeout: checker.timeout,
         };
         let result = (self.run)(run, cancel.clone()).await;
         let ms = started.elapsed().as_millis() as u64;
         if let (Some(at), Some(cache), Some(lock)) = (at, checker.cache.as_ref(), lock.take()) {
-            drop(lock);
-            after_cache_run(cache, &checker.shared, &at.key, &self.options.root);
+            after_cache_run(cache, &checker.shared, &at.key, &self.options.root, lock);
         }
         if result.aborted || cancel.is_cancelled() {
             return None; // Esc: the turn is ending, nothing to say
