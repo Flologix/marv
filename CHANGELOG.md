@@ -6,6 +6,8 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-24
+
 ### Added
 
 - **Send now: a message for the turn that's running.** While Marv works, Alt+Enter in the TUI (or ctrl+s, where the terminal keeps Alt+Enter for itself), or **Send now** in the desktop composer, sends your message into the running turn: it goes in at Marv's next step, after the current reply and its tool calls and before the next request, instead of waiting for the turn to end. Nothing running is stopped for it (Esc still does that), and it's an ordinary message of yours, added to the conversation like any other (the prompt cache holds; several sent at once go in as one). It shows in the transcript where Marv read it. At the step limit it waits for your "continue". If the turn ends first (you stopped it, declined a call, or it hit a limit), the message comes back to the prompt for you to send; it's never sent on its own. A radio request's automatic report on a turn you joined this way doesn't quote the reply. Enter keeps working as before, and `marv -p` is unchanged.
@@ -306,7 +308,8 @@ The first public release, on npm as `@flologixai/marv`.
 - The SDK: `createSession()` from `@flologixai/marv/sdk` runs Marv from code, without the UI.
 - Evals: `bun run eval` runs real models on small tasks with hidden checks.
 
-[Unreleased]: https://github.com/FlologixAI/marv/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/FlologixAI/marv/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/FlologixAI/marv/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/FlologixAI/marv/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/FlologixAI/marv/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/FlologixAI/marv/compare/v0.6.0...v0.7.0

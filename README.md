@@ -65,7 +65,7 @@ Download `install.sh` to pass it options:
 
 ```sh
 sh install.sh --prefix /opt/marv       # into /opt/marv/bin instead of ~/.local/bin
-sh install.sh --version v0.9.0         # a given release instead of the latest
+sh install.sh --version v0.10.0        # a given release instead of the latest
 sh install.sh --from target/release/marv   # a binary you built yourself
 sh install.sh --uninstall              # remove it again
 ```
@@ -556,16 +556,16 @@ Read first: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) (the crates and how t
 ### Releasing
 
 1. Move `CHANGELOG.md`'s entries under the new version (patch for fixes, minor for features or anything breaking while below 1.0), and bump `version` under `[workspace.package]` in `Cargo.toml` to match (a version can only be published once).
-2. Tag and push: `git tag v0.9.0 && git push origin v0.9.0`. The release workflow (`.github/workflows/release.yml`) builds static musl binaries for Linux x86_64 and aarch64 and native ones for macOS arm64 and x86_64, tests the installer and the npm packages against them, and creates the GitHub release with `marv-<target>.tar.gz`, `SHA256SUMS`, `install.sh` and the npm packages as `.tgz` files. Run it by hand (workflow_dispatch) for a dry run without the release.
+2. Tag and push: `git tag v0.10.0 && git push origin v0.10.0`. The release workflow (`.github/workflows/release.yml`) builds static musl binaries for Linux x86_64 and aarch64 and native ones for macOS arm64 and x86_64, tests the installer and the npm packages against them, and creates the GitHub release with `marv-<target>.tar.gz`, `SHA256SUMS`, `install.sh` and the npm packages as `.tgz` files. Run it by hand (workflow_dispatch) for a dry run without the release.
 3. Publish the npm packages by hand (npm wants your 2FA), platform packages first, since the launcher names them:
 
 ```sh
-gh release download v0.9.0 -p 'flologixai-marv-*.tgz' -D npm
-npm publish ./npm/flologixai-marv-linux-x64-0.9.0.tgz --access public
-npm publish ./npm/flologixai-marv-linux-arm64-0.9.0.tgz --access public
-npm publish ./npm/flologixai-marv-darwin-arm64-0.9.0.tgz --access public
-npm publish ./npm/flologixai-marv-darwin-x64-0.9.0.tgz --access public
-npm publish ./npm/flologixai-marv-0.9.0.tgz --access public
+gh release download v0.10.0 -p 'flologixai-marv-*.tgz' -D npm
+npm publish ./npm/flologixai-marv-linux-x64-0.10.0.tgz --access public
+npm publish ./npm/flologixai-marv-linux-arm64-0.10.0.tgz --access public
+npm publish ./npm/flologixai-marv-darwin-arm64-0.10.0.tgz --access public
+npm publish ./npm/flologixai-marv-darwin-x64-0.10.0.tgz --access public
+npm publish ./npm/flologixai-marv-0.10.0.tgz --access public
 ```
 
 `packaging/npm/build.sh` builds those packages from the release's tarballs, if you need them again.
