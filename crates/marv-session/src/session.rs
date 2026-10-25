@@ -7853,6 +7853,9 @@ mod turn_tests {
             i.hooks = counting(&dirs);
         });
         session.run_start_hooks();
+        // The first round finishes before the resume replaces it (#228: had the resume killed it before its `echo`, the
+        // second round would count itself as run 1, and the check below couldn't tell the rounds apart).
+        assert_eq!(session.start_hooks_done().await.unwrap()[0].output, "queue run 1\n");
         session.resume(ResumeTarget::Id(old.id())).await.unwrap().unwrap();
         collect(go(&session, "go on")).await;
         let history = &provider.requests()[0].0;
@@ -7860,6 +7863,7 @@ mod turn_tests {
         let last = text_of(history.last().unwrap());
         assert!(last.contains("queue run 2") && last.ends_with("\n\ngo on"), "{last}");
         assert!(!last.contains("queue run 1"), "the replaced round's output is dropped");
+        assert_eq!(runs(&dirs), 2);
         // Their saves land before the folders go (#212's CI: a late save left the temp folder behind).
         session.close().await;
         old.close().await;
@@ -8034,13 +8038,26 @@ mod turn_tests {
         assert_eq!(runs(&dirs), 1);
     }
 
-    /// A hook still running after 3 s writes `late`: only killing its group stops that.
+    /// A hook still running after 3 s writes `late`: only killing its group stops that. It writes `started` once that
+    /// background job is under way.
     fn slow(dirs: &Dirs) -> HookCommand {
-        let late = dirs.dir.join("late");
+        let (late, started) = (dirs.dir.join("late"), dirs.dir.join("started"));
         HookCommand {
             timeout: std::time::Duration::from_secs(60),
-            ..hook(&format!("(sleep 3; touch '{}') >/dev/null 2>&1 & sleep 60", late.display()))
+            ..hook(&format!("(sleep 3; touch '{}') >/dev/null 2>&1 & touch '{}'; sleep 60", late.display(), started.display()))
         }
+    }
+    /// Until [`slow`]'s hook has started its background job (#228: a fixed 300 ms wasn't always enough on a busy
+    /// macOS runner, so close() could land before the hook had got that far).
+    async fn slow_started(dirs: &Dirs) {
+        let started = dirs.dir.join("started");
+        for _ in 0..200 {
+            if started.exists() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("the hook never started");
     }
 
     // Greptile on #115: close() stops session-start hooks still running, with what they started, and waits for them.
@@ -8049,7 +8066,7 @@ mod turn_tests {
         let dirs = Dirs::new();
         let session = scripted(&dirs, &Scripted::new(vec![]), |i| i.hooks = vec![slow(&dirs)]);
         session.run_start_hooks();
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        slow_started(&dirs).await;
         let started = std::time::Instant::now();
         session.close().await;
         assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
@@ -8064,7 +8081,7 @@ mod turn_tests {
         let dirs = Dirs::new();
         let session = scripted(&dirs, &Scripted::new(vec![]), |i| i.hooks = vec![slow(&dirs)]);
         session.run_start_hooks();
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        slow_started(&dirs).await;
         session.clear().await.unwrap(); // a new round: the first one's commands are killed
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         session.close().await;
