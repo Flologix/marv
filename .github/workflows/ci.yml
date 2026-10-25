@@ -148,4 +148,4 @@ jobs:
           sudo chmod -R a+rX /usr/local/go-probe
           echo "MARV_PROBE_GO=$toolcache_go:/usr/local/go-probe/bin" >> "$GITHUB_ENV"
       - run: cargo test -p marv-sandbox --test seatbelt_probe -- --nocapture link_is_refused
-      - run: cargo test -p marv-sandbox --test seatbelt_probe -- --ignored --nocapture probe_round6
+      - run: cargo test -p marv-sandbox --test seatbelt_probe -- --ignored --nocapture probe_round7

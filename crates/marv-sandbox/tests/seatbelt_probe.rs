@@ -1099,3 +1099,97 @@ fn link_is_refused_from_a_source_denied_for_reads_or_writes() {
         }
     }
 }
+
+/// Round 7 (#183): round 6 showed `ln` refused for `file-link` on the source even with `(allow file-link)` last. Does an
+/// unfiltered allow lose to an earlier filtered deny (then the home's link deny is what held the #178 proof)? And does
+/// a link *named* like a protected entry need the protected-name link rule, or is it a write too?
+#[test]
+#[ignore = "a report for #183: run with --ignored --nocapture on macOS"]
+fn probe_round7() {
+    let mut report: Vec<String> = Vec::new();
+    let mut note = |name: &str, what: String| {
+        println!("PROBE {name}: {what}");
+        report.push(format!("{name}: {what}"));
+    };
+    let mut fx = Fx::new("r7");
+    // Minimal profiles: a filtered deny, then an unfiltered or a filtered allow after it.
+    let base = fx.shared.join("links");
+    let (a, b) = (base.join("A"), base.join("B"));
+    for d in [&a, &b] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    std::fs::write(a.join("f"), "a").unwrap();
+    let deny_a = format!("(deny file-link (subpath \"{}\"))", a.display());
+    for (i, (name, rules)) in [
+        ("deny_A", deny_a.clone()),
+        ("deny_A.allow_all", format!("{deny_a}\n(allow file-link)")),
+        ("deny_A.allow_A", format!("{deny_a}\n(allow file-link (subpath \"{}\"))", a.display())),
+        (
+            "deny_A.allow_A_and_B",
+            format!("{deny_a}\n(allow file-link (subpath \"{}\") (subpath \"{}\"))", a.display(), b.display()),
+        ),
+        ("deny_read_A.allow_read_all", format!("(deny file-read-data (subpath \"{}\"))\n(allow file-read-data)", a.display())),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let p = Profile { text: format!("(version 1)\n(allow default)\n{rules}\n"), params: vec![] };
+        let script = format!(
+            "cat '{}' && echo read-ok; ln '{}' '{}' && echo ln-ok",
+            a.join("f").display(),
+            a.join("f").display(),
+            b.join(format!("g{i}")).display()
+        );
+        note(&format!("prec.{name}"), fx.sh(&p, &fx.shared, &script).to_string());
+    }
+
+    // The guards' fixture again (a fake home outside the user's temporary folder).
+    let home = PathBuf::from(format!("/private/var/tmp/mx-probe-{}-r7home", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(home.join(".ssh")).unwrap();
+    std::fs::create_dir_all(home.join("proj/sub")).unwrap();
+    std::fs::write(home.join(".ssh/known_hosts"), "SECRET-SSH\n").unwrap();
+    std::fs::write(home.join("proj/plain"), "plain\n").unwrap();
+    fx.extra.push(home.clone());
+    let proj = home.join("proj");
+    let plan = {
+        let mut sb = Sandbox::from_env(true);
+        sb.home = home.clone();
+        sb.path = std::env::var("PATH").unwrap_or_default();
+        sb.plan(&proj, &CommandMounts::default())
+    };
+    let shipped = seatbelt::profile(&plan, &fx.run(), &RealFs).unwrap();
+    let home_read = "(deny file-read* (subpath (param \"HOME\")))\n";
+    let home_link = "(deny file-link (subpath (param \"HOME\")) ";
+    let names_link = shipped.text.lines().find(|l| l.starts_with("(deny file-link (require-all")).unwrap_or_default().to_string();
+    assert!(shipped.text.contains(home_read) && shipped.text.contains(home_link) && !names_link.is_empty());
+    let edit = |f: &dyn Fn(String) -> String| Profile { text: f(shipped.text.clone()), params: shipped.params.clone() };
+    let home_write = "(allow file-write* (subpath (param \"HOME\")))\n";
+    let variants = [
+        ("shipped", edit(&|t| t)),
+        ("no_home_read.home_writable", edit(&|t| t.replace(home_read, "") + home_write)),
+        (
+            "no_home_read.no_home_link.home_writable",
+            edit(&|t| t.replace(home_read, "").replace(home_link, "(deny file-link ") + home_write),
+        ),
+        (
+            "no_home_read.allow_home_link_last.home_writable",
+            edit(&|t| t.replace(home_read, "") + home_write + "(allow file-link (subpath (param \"HOME\")))\n"),
+        ),
+        ("no_names_link", edit(&|t| t.replace(&format!("{names_link}\n"), ""))),
+    ];
+    let k = home.join(".ssh/known_hosts");
+    for (name, prof) in &variants {
+        let script = format!(
+            "cat '{k}' >/dev/null && echo read-ok; ln '{k}' ln-{name} && echo ln-home-ok; \
+             ln plain sub/AGENTS.md && echo ln-to-agents-ok; ln plain .envrc && echo ln-to-envrc-ok; \
+             ln plain \"$TMPDIR/AGENTS.md\" && echo ln-to-tmp-agents-ok; rm -f sub/AGENTS.md .envrc",
+            k = k.display()
+        );
+        let (out, denials) = sandbox_denials(|| fx.sh(prof, &proj, &script));
+        note(&format!("link7.{name}"), out.to_string());
+        let denials: Vec<&String> = denials.iter().filter(|l| l.contains("file-")).collect();
+        note(&format!("link7.{name}.denials"), denials.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" || "));
+    }
+    println!("\n===== REPORT =====\n{}\n===== END =====", report.join("\n"));
+}
