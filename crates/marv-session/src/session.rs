@@ -52,7 +52,7 @@ use marv_tools::{AgentProgress, Approver, Decision, PlanHost, PlanItem, ProcessI
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_util::sync::CancellationToken;
 
-use crate::agents::{AgentType, general_purpose};
+use crate::agents::{AgentType, builtin_agents};
 use crate::checkpoints::store::{CheckpointKind, CheckpointStore, SnapshotResult, StoreOptions};
 use crate::checkpoints::turn::CheckpointTurn;
 use crate::checkpoints::undo::{UndoPlan, UndoRefusal, UndoResult, apply_undo, plan_undo, undo_note};
@@ -354,7 +354,7 @@ pub struct SessionInit {
     /// `None`: the project's files weren't loaded.
     pub project_files: Option<(crate::project_trust::ProjectFiles, crate::project_trust::TrustStatus)>,
     pub skills: Vec<LoadedSkill>,
-    /// Agent types the agent tool can start (default: general-purpose).
+    /// Agent types the agent tool can start (default: the built-in ones, explore and general-purpose).
     pub agents: Vec<AgentType>,
     pub memory: Option<(MemoryPaths, Memories)>,
     /// MCP servers, already starting; their tools join once they're ready.
@@ -477,7 +477,7 @@ impl SessionInit {
             nested_trust: Arc::default(),
             project_files: None,
             skills: Vec::new(),
-            agents: vec![general_purpose()],
+            agents: builtin_agents(),
             memory: None,
             mcp: None,
             owns_mcp: false,
@@ -4719,6 +4719,56 @@ mod turn_tests {
         assert!(session.state().radio_turn.sent_now);
         // Over: refused again.
         assert!(session.send_now("late").is_err());
+    }
+
+    /// #184: steering (Alt+Enter) is the person's own text: it never taints the session, the trajectory logs it, and a
+    /// compaction at the step boundary where it goes in doesn't lose it.
+    #[tokio::test]
+    async fn send_now_doesnt_taint_is_logged_and_survives_a_mid_turn_compaction() {
+        struct TypesDuringTheReply(Scripted, Mutex<Option<MarvSession>>);
+        impl Provider for TypesDuringTheReply {
+            fn name(&self) -> &str {
+                "scripted"
+            }
+            fn context_length(&self) -> Option<u64> {
+                self.0.context_length()
+            }
+            fn stream(&self, history: &[ChatTurn], options: StreamOptions) -> EventStream {
+                if self.0.requests().is_empty() {
+                    lock(&self.1).clone().unwrap().send_now("use https://example.com instead").unwrap();
+                }
+                self.0.stream(history, options)
+            }
+        }
+        let dirs = Dirs::new();
+        let store = Arc::new(TrajectoryStore::new(dirs.dir.join("t")));
+        let scripted_provider =
+            Scripted::new(vec![with(used(900), use_tools(vec![read("c1")])), say("SUMMARY of it all"), say("Finished.")])
+                .with_context(1000);
+        let provider = Arc::new(TypesDuringTheReply(scripted_provider.clone(), Mutex::default()));
+        let session = make(&dirs, fixed(provider.clone()), |i| i.trajectories = Some(store.clone()));
+        *lock(&provider.1) = Some(session.clone());
+        let events = collect(go(&session, "read it")).await;
+        assert_eq!(end_reason(&events), TurnEndReason::Done(StopReason::End));
+        // The person's words, even with a link in them, are no outside text.
+        assert!(session.tainted().is_empty(), "{:?}", session.tainted());
+        assert!(!events.iter().any(|e| matches!(e, SessionEvent::Tainted { .. })));
+        // The step boundary compacted first (the summary is of what came before), then the person's words joined
+        // Marv's note to go on: one user turn, never two in a row, and in the conversation from then on.
+        let requests = scripted_provider.requests();
+        assert_eq!(requests.len(), 3);
+        assert_alternating(&requests);
+        assert!(kinds(&events).contains(&"compacted"));
+        let last = requests[2].0.last().unwrap();
+        assert_eq!(role_of(last), "user");
+        assert!(text_of(last).contains("Continue where you left off"));
+        assert!(text_of(last).ends_with("use https://example.com instead"), "{last:?}");
+        assert!(session.conversation().iter().any(|t| text_of(t).contains("use https://example.com instead")));
+        // Logged to the trajectory as the person's message.
+        let log = records(&store, &dirs.project, &session).await;
+        let sent = log.iter().find(|r| r["type"] == "sent_now").expect("a sent_now record");
+        assert_eq!(sent["text"], "use https://example.com instead");
+        assert!(log.iter().all(|r| r["type"] != "taint"));
     }
 
     #[tokio::test]
