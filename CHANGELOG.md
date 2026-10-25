@@ -6,6 +6,8 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-10-25
+
 ### Added
 
 - **A built-in read-only `explore` agent (#186).** Next to `general-purpose`, the agent tool now has an `explore` type that can only read and search (`read_file`, `grep`, `glob`, `web_fetch`): no edits, no `bash` and no mesh tools, whatever the mode, yolo included. The agent tool's description tells the model to use it for searches and questions about the code. It runs on the session's model; a `.marv/agents/explore.md` (project) or `~/.marv/agents/explore.md` (personal) replaces it, as agent files with a built-in's name always have, for example to give it a cheaper `model:`.
@@ -325,7 +327,8 @@ The first public release, on npm as `@flologixai/marv`.
 - The SDK: `createSession()` from `@flologixai/marv/sdk` runs Marv from code, without the UI.
 - Evals: `bun run eval` runs real models on small tasks with hidden checks.
 
-[Unreleased]: https://github.com/FlologixAI/marv/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/FlologixAI/marv/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/FlologixAI/marv/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/FlologixAI/marv/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/FlologixAI/marv/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/FlologixAI/marv/compare/v0.7.0...v0.8.0
