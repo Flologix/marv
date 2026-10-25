@@ -51,6 +51,8 @@ pub fn agent_label(agent_type: Option<&str>, description: &str) -> String {
 /// The oracle drops it (`marv_oracle::runner::MARV_RS_TEXT`).
 pub const EXPLORE_SENTENCE: &str = " To search the code or answer a question about it, use type \"explore\": it reads and searches only, so its results come back without filling your context.";
 
+/// `concat!` takes only literals, so its last sentence repeats [`EXPLORE_SENTENCE`]: keep the two the same
+/// (`crates/marv-cli/tests/oracle_rewording.rs` checks that this ends with it).
 pub const AGENT_DESCRIPTION: &str = concat!(
     "Hand a self-contained task to a subagent: a separate agent with a fresh context and its own tools, which does the task and returns only its final report. Several agent calls in a row run in parallel (up to 4 at once). The available types are listed in the system prompt.",
     " To search the code or answer a question about it, use type \"explore\": it reads and searches only, so its results come back without filling your context."

@@ -56,6 +56,15 @@ pub struct AgentType {
     pub source: AgentSource,
 }
 
+impl AgentType {
+    /// Whether it gets a mesh plug (`mesh_list`, `mesh_call`, `mesh_send`) where the session has the mesh. Not the
+    /// built-in `explore`: it reads and searches only, and over the mesh it could ask a writing agent to act for it.
+    /// Agent files keep the plug (a file named `explore.md` replaces the built-in, so it's the file's call).
+    pub fn gets_mesh(&self) -> bool {
+        !(self.source == AgentSource::BuiltIn && self.name == "explore")
+    }
+}
+
 /// Claude Code's tool names, so agent files written for it work here.
 fn alias(name: &str) -> &str {
     match name {

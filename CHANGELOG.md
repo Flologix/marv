@@ -8,7 +8,7 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ### Added
 
-- **A built-in read-only `explore` agent (#186).** Next to `general-purpose`, the agent tool now has an `explore` type that can only read and search (`read_file`, `grep`, `glob`, `web_fetch`): no edits and no `bash`, whatever the mode, yolo included. The agent tool's description tells the model to use it for searches and questions about the code. It runs on the session's model; a `.marv/agents/explore.md` (project) or `~/.marv/agents/explore.md` (personal) replaces it, as agent files with a built-in's name always have, for example to give it a cheaper `model:`.
+- **A built-in read-only `explore` agent (#186).** Next to `general-purpose`, the agent tool now has an `explore` type that can only read and search (`read_file`, `grep`, `glob`, `web_fetch`): no edits, no `bash` and no mesh tools, whatever the mode, yolo included. The agent tool's description tells the model to use it for searches and questions about the code. It runs on the session's model; a `.marv/agents/explore.md` (project) or `~/.marv/agents/explore.md` (personal) replaces it, as agent files with a built-in's name always have, for example to give it a cheaper `model:`.
 
 ## [0.10.0] - 2026-10-24
 
