@@ -135,10 +135,16 @@ fn the_macos_doors_are_closed() {
 }
 
 /// **A keychain item can't be read, with or without network**: one that exists outside the sandbox (made in the
-/// user's default keychain for this test, removed after), read through `security`. Reading an item needs securityd
-/// (`com.apple.SecurityServer`), which no profile lets a command reach, with network or not (#166 review).
+/// user's default keychain for this test, removed after), read through `security`, from a project and from a
+/// home-folder project.
 ///
-/// Proven: see the PR's proof comment (`com.apple.SecurityServer` added back to the network services).
+/// This guards the outcome, not one rule: it still passes with `com.apple.SecurityServer` added back to the network
+/// services (#178 proof), as reading an item needs more than that one service (XPC services stay denied). That the
+/// service stays out of the profile is the unit test's job (`marv-sandbox`'s `seatbelt.rs`,
+/// `the_interface_list_only_with_network`).
+///
+/// Where no item can be made and read back, it falls back to checking that the sandbox can't list the keychains; under
+/// `MARV_REQUIRE_SANDBOX=1` (CI) it fails instead, so CI can't pass on the weaker check.
 #[test]
 fn a_keychain_item_cant_be_read_with_or_without_network() {
     require_sandbox!();
@@ -158,6 +164,12 @@ fn a_keychain_item_cant_be_read_with_or_without_network() {
     let find = format!("security find-generic-password -s {service} -w");
     let control = host(home.home(), &find);
     if !added.status.success() || !control.output.contains("SECRET-KEYCHAIN-ITEM") {
+        assert!(
+            std::env::var_os("MARV_REQUIRE_SANDBOX").is_none_or(|v| v != "1"),
+            "MARV_REQUIRE_SANDBOX=1, but no keychain item could be made and read back here ({}{})",
+            String::from_utf8_lossy(&added.stderr).trim(),
+            control.output.trim()
+        );
         // The limit, said: without a keychain to put an item in, only the refusal of the keychain itself is checked.
         println!(
             "limit: no keychain item could be made and read back here ({}{}); checking only that the sandbox can't list keychains",
@@ -349,6 +361,10 @@ fn protected_names_cant_be_created_and_the_scan_finds_nothing() {
 /// can't be unlinked), and no hard link to it (or to the home's files) can be made, into the project or the
 /// `TMPDIR`. `link()` is checked against both paths (#166 probe), so hard links are allowed between the project's and
 /// the TMPDIR's own files.
+///
+/// This guards the outcome: with the whole profile in place, Seatbelt refuses these links before any link rule is
+/// consulted (a source it can't read or write, a protected name it can't create), so it can't catch a regression in one
+/// link rule. `marv-sandbox`'s `each_link_rule_refuses_on_its_own` does that, one rule at a time (#183).
 #[test]
 fn protected_files_cant_be_renamed_away_or_hard_linked() {
     require_sandbox!();
