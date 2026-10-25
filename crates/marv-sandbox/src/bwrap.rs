@@ -418,29 +418,52 @@ fn end_sandbox(pid: u32, signal: nix::sys::signal::Signal) {
         for child in children(raw) {
             crate::backend::send(child, nix::sys::signal::Signal::SIGKILL);
         }
+        // Still stopped, so not reapable: the signal reaches bwrap and nothing else.
         crate::backend::send(pid, signal);
-        crate::backend::send(pid, nix::sys::signal::Signal::SIGCONT);
+        // SIGKILL ends a stopped process as it is. A SIGTERM is fatal at once too where bwrap doesn't handle it (0.12
+        // doesn't), and then a watcher may have reaped bwrap already: SIGCONT only while it's still our stopped child.
+        // That one can't end until continued (a fatal signal would have ended its stop), so the pid is still bwrap's.
+        if signal != nix::sys::signal::Signal::SIGKILL
+            && matches!(child_state(nix::unistd::Pid::from_raw(raw)), Ok(nix::sys::wait::WaitStatus::Stopped(..)))
+        {
+            crate::backend::send(pid, nix::sys::signal::Signal::SIGCONT);
+        }
         return;
     }
     crate::backend::send(pid, signal);
 }
 
+/// What `pid`, a child of ours, is doing now (running, stopped, exited), seen without reaping it or waiting.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn child_state(pid: nix::unistd::Pid) -> nix::Result<nix::sys::wait::WaitStatus> {
+    use nix::sys::wait::{Id, WaitPidFlag, waitid};
+    let flags = WaitPidFlag::WEXITED | WaitPidFlag::WSTOPPED | WaitPidFlag::WNOWAIT | WaitPidFlag::WNOHANG;
+    loop {
+        match waitid(Id::Pid(pid), flags) {
+            Err(nix::errno::Errno::EINTR) => continue,
+            other => return other,
+        }
+    }
+}
+
 /// Stops `pid`, a running child of this process, and waits (up to a second) until it has stopped: true once it has,
 /// false if it isn't a running child of ours (exited, reaped, someone else's) or didn't stop in time (then it's
 /// continued again).
+///
+/// The wait is a short poll on the caller's thread, often an async worker (bash's kill, a drop, a process's stop):
+/// the stop is seen within microseconds, and only a bwrap stuck in uninterruptible sleep holds the thread longer, a
+/// second at most.
+///
+/// Between the first check and the SIGSTOP, bwrap could exit and be reaped by a task waiting on it (a process's
+/// watcher), and only then could its pid be another process's: Linux hands pids out in turn, so that would take the
+/// whole pid range wrapping round within microseconds. Every signal to a child that another task may reap has that
+/// window (it's the one [`crate::backend::send`] always had). A pidfd would close it, but nix doesn't offer one (it would
+/// take a new dependency or `unsafe`), and the kernels without `pidfd_open` (before 5.3) would still need this path.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn stop_child(pid: nix::unistd::Pid) -> bool {
     use nix::sys::signal::{Signal, kill};
-    use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid};
-    let state = || {
-        let flags = WaitPidFlag::WEXITED | WaitPidFlag::WSTOPPED | WaitPidFlag::WNOWAIT | WaitPidFlag::WNOHANG;
-        loop {
-            match waitid(Id::Pid(pid), flags) {
-                Err(nix::errno::Errno::EINTR) => continue,
-                other => return other,
-            }
-        }
-    };
+    use nix::sys::wait::WaitStatus;
+    let state = || child_state(pid);
     // Only a child of ours that hasn't exited: a pid that isn't ours could be anyone's.
     match state() {
         Ok(WaitStatus::StillAlive | WaitStatus::Stopped(..)) => {}
@@ -527,7 +550,21 @@ mod tests {
         let child: u32 = line.trim().parse().unwrap();
         assert!(children(parent.id() as i32).contains(&child));
         end_sandbox(parent.id(), nix::sys::signal::Signal::SIGTERM);
-        let status = parent.wait().unwrap();
+        // A regression must fail fast and leave nothing behind, not hang on `sh` (it ignores SIGTERM) or its sleep.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = parent.try_wait().unwrap() {
+                break Some(status);
+            }
+            if std::time::Instant::now() > deadline {
+                crate::backend::send(child, nix::sys::signal::Signal::SIGKILL);
+                let _ = parent.kill();
+                let _ = parent.wait();
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let status = status.expect("the stand-in for bwrap didn't end: its child wasn't killed, or it was left stopped");
         assert!(status.code().is_some() || status.signal().is_some(), "{status:?}");
         let gone = (0..200).any(|_| {
             std::thread::sleep(std::time::Duration::from_millis(10));
