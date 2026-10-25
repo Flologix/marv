@@ -22,7 +22,7 @@
 //! third uid every runtime folder is refused, the Linux default too (that uid could swap anything under `/`).
 //!
 //! Inside it: `mesh/<name>.sock` (doors), `p/<pid>-<hex>/<plug>.sock` (one switchboard's plugs; a process can have
-//! several, Marv desktop's chats) and `<pid>-<hex>/p<n>/` (the process door's sockets). The plug folder isn't named
+//! several) and `<pid>-<hex>/p<n>/` (the process door's sockets). The plug folder isn't named
 //! after the session: the session name is up to 43 bytes and the plug id up to 48, which together overflowed
 //! `sun_path` on both platforms.
 

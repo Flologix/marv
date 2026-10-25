@@ -6,6 +6,10 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+### Removed
+
+- **The desktop app and the browser UI.** The desktop app (`app/`) and the browser UI (`marv-web`) are no longer part of Marv: Marv is the terminal coding agent. Releases up to 0.11.0 keep them in their source. The `marv` command, `marv -p` and the mesh are unchanged.
+
 ## [0.11.0] - 2026-10-25
 
 ### Added
