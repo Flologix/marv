@@ -16,10 +16,28 @@
 //! Port notes: Marv's `RunCheck` took `{root, signal, timeoutMs}`; here it takes a [`CheckRun`], which also carries
 //! the pass's extra read-only mounts (the `marv` binary for the project checks' runner). A runner that throws (Marv)
 //! is one whose output can't be read (here): a spawn failure comes back as `[couldn't start the command: …]`.
+//!
+//! New in marv-rs (#187, `docs/specs/2026-10-25-lsp-checker.md` §6.1–§6.3), for the command-line checkers that keep
+//! a build cache (cargo check, go vet); tsc and the project checks keep the defaults, so they behave as before:
+//! - **Per-kind policy** on [`CheckKind`]: a `label` for notices, a `timeout`, whether it needs a `cache` folder
+//!   ([`super::cache`]) and a `warm_up`, and after how many unreadable runs in a row it turns off
+//!   (`max_unreadable`, [`MAX_UNREADABLE`] for the kinds that opt in).
+//! - **The cache folder** is mounted writable for that check only, exactly the key's folder ([`CheckRun::writable`]);
+//!   a key folder that isn't Marv's plain folder is refused (`CacheRefused`, said once), and nothing starts with too
+//!   little free disk (`LowDisk`, said once).
+//! - **The warm-up**: at the session's first change (never in a session that doesn't edit, so a read-only session
+//!   never runs the project's build scripts), one background run of the baseline fills the cache, for up to
+//!   [`WARM_UP_TIMEOUT`], not counted as a timeout, its output thrown away. It lasts for the session: `stop()` (a
+//!   switch to off, the session's end) cancels it, the turn's Esc doesn't. A baseline due while it runs waits up to
+//!   [`BASELINE_WAIT`], then the turn is `Pending`: it says nothing, and the session's first such turn says why.
+//! - **The per-key lock** (`flock` on `<cache root>/<key>.lock`, outside the mount) is taken before each check and
+//!   warm-up, so worktrees and sessions sharing a key never contend inside cargo, and lock waits never count as
+//!   timeouts: the check's own timeout starts once it holds the lock. A baseline waits up to [`BASELINE_WAIT`] for
+//!   it (then `Pending`); a step's check skips silently when another session holds it.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures::FutureExt;
@@ -28,13 +46,24 @@ use marv_agent::ToolRun;
 use marv_tools::bash::{MAX_CAPTURE, RunOptions};
 use tokio_util::sync::CancellationToken;
 
-use super::tsc::{TsError, format_error};
+use super::Diagnostic;
+use super::cache::{CheckCache, repo_key};
+use super::tsc::format_error;
 
 pub const CHECK_TIMEOUT: Duration = Duration::from_secs(60);
 /// Timeouts after which a session stops checking: a huge project would otherwise add a minute to every step.
 pub const MAX_TIMEOUTS: u32 = 2;
+/// Unreadable runs in a row after which a kind that opts in stops for the session: an output past `MAX_CAPTURE`
+/// (thousands of baseline errors) would otherwise rerun a slow check on every step and never say anything.
+pub const MAX_UNREADABLE: u32 = 2;
+/// How long the session's warm-up run may take (its lock wait included).
+pub const WARM_UP_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// How long a baseline waits for the warm-up, or for another session's lock, before the turn is pending.
+pub const BASELINE_WAIT: Duration = Duration::from_secs(10);
 /// Errors the transcript shows (the model gets up to `MAX_REPORTED`).
 const NOTICE_LINES: usize = 5;
+/// The typecheck's label: its notices keep their words from before #187.
+pub const TSC_LABEL: &str = "tsc";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailReason {
@@ -42,12 +71,22 @@ pub enum FailReason {
     Unreadable,
     /// The checker's interpreter isn't in the sandbox (tsc's `node` from a hidden toolchain folder).
     MissingInterpreter,
+    /// The warm-up is still filling the cache, or another session holds the key's lock: nothing was checked.
+    Pending,
+    /// Less free disk than the guard: nothing was started.
+    LowDisk,
+    /// The cache folder isn't Marv's plain folder (a symlink, someone else's): nothing was started. `tool` says why.
+    CacheRefused,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OffReason {
     NoSandbox,
     Timeouts,
+    /// [`MAX_UNREADABLE`] unreadable runs in a row.
+    Unreadable,
+    /// The kind's cache folder passed its cap, and was deleted.
+    CacheTooBig,
 }
 
 /// How a check went, for one kind of problem `E`.
@@ -61,8 +100,8 @@ pub enum CheckOutcome<E> {
     Off { reason: OffReason },
 }
 
-/// The typecheck's result.
-pub type CheckResult = CheckOutcome<TsError>;
+/// A diagnostics checker's result (tsc's today).
+pub type CheckResult = CheckOutcome<Diagnostic>;
 
 /// A finished check command.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -81,6 +120,9 @@ pub struct CheckRun {
     pub root: PathBuf,
     /// Extra paths the command may read (the pass's [`CheckPass::read_only`]).
     pub read_only: Vec<PathBuf>,
+    /// The one path it may write besides its throwaway temp: the kind's cache key folder, exactly, for a kind with a
+    /// cache; empty otherwise.
+    pub writable: Vec<PathBuf>,
     pub timeout: Duration,
 }
 
@@ -88,7 +130,8 @@ pub struct CheckRun {
 pub type RunCheck = Arc<dyn Fn(CheckRun, CancellationToken) -> BoxFuture<'static, CommandResult> + Send + Sync>;
 
 /// How a check command runs: in the sandbox, the project read-only, no network, and the repository's `.git` (a
-/// worktree's common one too) read-only, so a check can ask git what changed. The guard test holds this to it.
+/// worktree's common one too) read-only, so a check can ask git what changed. Writable: only the run's cache key
+/// folder (none for tsc). The guard test holds this to it.
 pub fn sandboxed_options(run: &CheckRun) -> RunOptions {
     let mut read_only = marv_sandbox::git_guard::worktree_git(&run.root);
     read_only.extend(run.read_only.iter().cloned());
@@ -99,7 +142,7 @@ pub fn sandboxed_options(run: &CheckRun) -> RunOptions {
         network: false,
         timeout: run.timeout,
         read_only,
-        writable: Vec::new(),
+        writable: run.writable.clone(),
         placeholders: Vec::new(),
         project_read_only: true,
         env: None,
@@ -126,6 +169,24 @@ pub fn sandboxed() -> RunCheck {
     })
 }
 
+/// A command at low priority (#187 §6.1): `nice -n 10`, plus `ionice -c3` where the sandbox has it (Linux; resolved
+/// inside the sandbox, never on the host). `env` is set in the command, since the sandbox's environment is built from
+/// scratch.
+pub fn low_priority(env: &[(&str, String)], command: &str) -> String {
+    let exports: String = env.iter().map(|(k, v)| format!("export {k}={}; ", shell_quote(v))).collect();
+    format!("{exports}if command -v ionice >/dev/null 2>&1; then nice -n 10 ionice -c3 {command}; else nice -n 10 {command}; fi")
+}
+
+/// `s` as one shell word.
+pub fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Half the logical cores, at least one: the build jobs a checker may use, since several can run side by side.
+pub fn build_jobs() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).max(1))
+}
+
 /// Which problems a pass re-checks (the rest of the baseline stands).
 pub type Covers<E> = Box<dyn Fn(&E) -> bool + Send + Sync>;
 
@@ -137,13 +198,37 @@ pub struct CheckPass<E> {
     pub read_only: Vec<PathBuf>,
 }
 
-/// What one kind of check is.
+/// What one kind of check is. The policy methods' defaults are tsc's: 60 s, no cache, no warm-up, and unreadable
+/// runs never turn it off.
 pub trait CheckKind<E>: Send + Sync {
-    /// Whether anything can run in this project this turn (a compiler, some checks).
+    /// Its name in notices and `/diagnostics`: "tsc", "cargo check".
+    fn label(&self) -> &'static str;
+    /// Its trajectory records' `source` (`None`: the typecheck's, as before #187).
+    fn source(&self) -> Option<&'static str> {
+        None
+    }
+    /// Each check's timeout, counted from when it holds its lock.
+    fn timeout(&self) -> Duration {
+        CHECK_TIMEOUT
+    }
+    /// Whether it needs a writable cache folder ([`super::cache`]), mounted for each of its runs.
+    fn cache(&self) -> bool {
+        false
+    }
+    /// Whether the session's first change starts a warm-up of its cache (only asked of a kind with a cache); `cache` is
+    /// its key folder, so a kind can warm up only when that's empty.
+    fn warm_up(&self, _cache: &Path) -> bool {
+        false
+    }
+    /// After how many unreadable runs in a row it's off for the session (`None`: never).
+    fn max_unreadable(&self) -> Option<u32> {
+        None
+    }
+    /// Whether anything can run in this project this turn (a compiler, some checks). Only looks at files.
     fn prepare(&self, root: &Path) -> bool;
     /// `None` = the baseline (everything); `Some(files)` = a step that changed those (project-relative). `None` back:
-    /// nothing it checks could have changed, which costs nothing.
-    fn pass(&self, root: &Path, changed: Option<&[String]>) -> Option<CheckPass<E>>;
+    /// nothing it checks could have changed, which costs nothing. `cache`: the key folder, for a kind with one.
+    fn pass(&self, root: &Path, cache: Option<&Path>, changed: Option<&[String]>) -> Option<CheckPass<E>>;
     fn parse(&self, output: &str, exit_code: Option<i32>) -> Option<Vec<E>>;
     fn missing(&self, output: &str, exit_code: Option<i32>) -> Option<String>;
     fn key(&self, problem: &E) -> String;
@@ -200,6 +285,43 @@ pub struct TurnOptions<E> {
     pub on_result: Arc<dyn Fn(CheckOutcome<E>) + Send + Sync>,
 }
 
+/// Locks a std mutex, through a poisoning (a panicked holder left nothing half-done here).
+fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The session's warm-up: not started, running (the receiver turns true when it's done; a dropped sender is done
+/// too), or done.
+enum Warm {
+    NotStarted,
+    Running(tokio::sync::watch::Receiver<bool>),
+    Done,
+}
+
+/// What lasts for the session until `stop()`: the warm-up and what cancels it.
+struct Scope {
+    cancel: CancellationToken,
+    warm: Warm,
+}
+
+impl Scope {
+    fn new() -> Self {
+        Self { cancel: CancellationToken::new(), warm: Warm::NotStarted }
+    }
+}
+
+/// What background tasks (the warm-up, sizing) share with their checker without keeping it alive.
+#[derive(Default)]
+struct Shared {
+    /// Off for the session for a reason told at the next turn's first change (`CacheTooBig`) or right away
+    /// (`Unreadable`).
+    off: Mutex<Option<OffReason>>,
+    told_off: AtomicBool,
+    /// The last sizing task, for [`Checker::settle`].
+    sizing: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    warm_ups: AtomicU32,
+}
+
 /// One per kind of check and session: survives `clear()` and `resume()`.
 pub struct Checker<E> {
     pub kind: Arc<dyn CheckKind<E>>,
@@ -208,35 +330,124 @@ pub struct Checker<E> {
     pub timeout: Duration,
     /// Whether the sandbox works here; `None`: the backend's `available()`. Tests pass a stand-in.
     pub sandbox_works: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    /// Where a kind with a cache keeps its folder; without one, such a kind doesn't run (quietly).
+    pub cache: Option<Arc<CheckCache>>,
+    /// [`BASELINE_WAIT`] and [`WARM_UP_TIMEOUT`]; tests shorten them.
+    pub baseline_wait: Duration,
+    pub warm_up_timeout: Duration,
     timeouts: AtomicU32,
+    unreadable: AtomicU32,
     told_no_sandbox: AtomicBool,
     told_unreadable: AtomicBool,
+    told_pending: AtomicBool,
+    told_low_disk: AtomicBool,
+    shared: Arc<Shared>,
+    scope: Mutex<Scope>,
+}
+
+impl<E> Drop for Checker<E> {
+    /// The session is gone: so is its warm-up.
+    fn drop(&mut self) {
+        locked(&self.scope).cancel.cancel();
+    }
 }
 
 impl<E: Clone + Send + Sync + 'static> Checker<E> {
     pub fn new(kind: Arc<dyn CheckKind<E>>, run: Option<RunCheck>) -> Self {
         Self {
+            timeout: kind.timeout(),
             kind,
             run,
-            timeout: CHECK_TIMEOUT,
             sandbox_works: None,
+            cache: None,
+            baseline_wait: BASELINE_WAIT,
+            warm_up_timeout: WARM_UP_TIMEOUT,
             timeouts: Default::default(),
+            unreadable: Default::default(),
             told_no_sandbox: Default::default(),
             told_unreadable: Default::default(),
+            told_pending: Default::default(),
+            told_low_disk: Default::default(),
+            shared: Default::default(),
+            scope: Mutex::new(Scope::new()),
         }
     }
 
     /// Checking was turned off and on again: forget what made the session give up, and the notices given.
     pub fn reset(&self) {
         self.timeouts.store(0, Ordering::SeqCst);
+        self.unreadable.store(0, Ordering::SeqCst);
         self.told_no_sandbox.store(false, Ordering::SeqCst);
         self.told_unreadable.store(false, Ordering::SeqCst);
+        self.told_pending.store(false, Ordering::SeqCst);
+        self.told_low_disk.store(false, Ordering::SeqCst);
+        *locked(&self.shared.off) = None;
+        self.shared.told_off.store(false, Ordering::SeqCst);
+        self.stop();
+    }
+
+    /// Checking was turned off, or the session ends: the warm-up stops (the next first change starts a new one).
+    pub fn stop(&self) {
+        let mut scope = locked(&self.scope);
+        scope.cancel.cancel();
+        *scope = Scope::new();
+    }
+
+    /// How many warm-ups this checker started (tests, `/diagnostics`).
+    pub fn warm_ups(&self) -> u32 {
+        self.shared.warm_ups.load(Ordering::SeqCst)
+    }
+
+    /// Whether the warm-up is running now.
+    pub fn warming(&self) -> bool {
+        matches!(&locked(&self.scope).warm, Warm::Running(rx) if !*rx.borrow() && rx.has_changed().is_ok())
+    }
+
+    /// Waits for the last background sizing to finish (tests; the session never needs to).
+    pub async fn settle(&self) {
+        let task = locked(&self.shared.sizing).take();
+        if let Some(task) = task {
+            let _ = task.await;
+        }
+    }
+
+    /// Its state for `/diagnostics`, in a few words.
+    pub fn state(&self) -> String {
+        match *locked(&self.shared.off) {
+            Some(OffReason::Unreadable) => return "off for this session: its output couldn't be read twice in a row".into(),
+            Some(OffReason::CacheTooBig) => return "off for this session: its cache passed the size limit".into(),
+            _ => {}
+        }
+        if self.timeouts.load(Ordering::SeqCst) >= MAX_TIMEOUTS {
+            return "off for this session: it timed out twice".into();
+        }
+        if self.warming() {
+            return "building its cache for this project (first run)".into();
+        }
+        "ready".into()
     }
 
     /// This turn's hooks; `None` when nothing can run (no compiler, no checks, two timeouts already).
     pub fn turn(self: &Arc<Self>, options: TurnOptions<E>) -> Option<TurnChecks> {
         if self.timeouts.load(Ordering::SeqCst) >= MAX_TIMEOUTS || !self.kind.prepare(&options.root) {
             return None;
+        }
+        if self.kind.cache() && self.cache.is_none() {
+            return None;
+        }
+        if let Some(reason) = *locked(&self.shared.off) {
+            if self.shared.told_off.load(Ordering::SeqCst) {
+                return None;
+            }
+            // Said at the first change, like the sandbox's notice.
+            return Some(TurnChecks {
+                before_change: Arc::new(Tell {
+                    told: self.shared.clone(),
+                    outcome: CheckOutcome::Off { reason },
+                    on_result: options.on_result,
+                }),
+                after_step: Arc::new(|_| async { None }.boxed()),
+            });
         }
         let works = self.sandbox_works.as_ref().map_or_else(|| marv_sandbox::backend().available(), |f| f());
         if !options.sandbox || !works {
@@ -284,6 +495,22 @@ impl<E: Send + Sync + 'static> marv_tools::BeforeChange for NoSandbox<E> {
     }
 }
 
+/// A kind that went off between turns: the first change says so, once per session.
+struct Tell<E> {
+    told: Arc<Shared>,
+    outcome: CheckOutcome<E>,
+    on_result: Arc<dyn Fn(CheckOutcome<E>) + Send + Sync>,
+}
+
+#[async_trait::async_trait]
+impl<E: Clone + Send + Sync + 'static> marv_tools::BeforeChange for Tell<E> {
+    async fn before_change(&self) {
+        if !self.told.told_off.swap(true, Ordering::SeqCst) {
+            quietly(|| (self.on_result)(self.outcome.clone()));
+        }
+    }
+}
+
 /// The turn's baseline: not taken yet, or taken (`None`: it couldn't be, so this turn says nothing).
 enum Baseline<E> {
     NotTaken,
@@ -305,16 +532,14 @@ struct BaselineHook<E>(Arc<Turn<E>>);
 
 #[async_trait::async_trait]
 impl<E: Clone + Send + Sync + 'static> marv_tools::BeforeChange for BaselineHook<E> {
-    /// Takes the baseline before the turn's first change; later calls wait for the same one. Never fails.
+    /// Takes the baseline before the turn's first change; later calls wait for the same one. Never fails. The
+    /// session's first change also starts the warm-up, for a kind that has one.
     async fn before_change(&self) {
         let turn = &self.0;
+        turn.start_warm_up();
         let mut baseline = turn.baseline.lock().await;
         if let Baseline::NotTaken = *baseline {
-            let taken = match turn.checker.kind.pass(&turn.options.root, None) {
-                Some(pass) => turn.check(&pass).await.map(|(errors, _)| errors),
-                None => Some(Vec::new()),
-            };
-            *baseline = Baseline::Taken(taken);
+            *baseline = Baseline::Taken(turn.take_baseline().await);
         }
     }
 }
@@ -328,6 +553,32 @@ impl Drop for Checking<'_> {
     }
 }
 
+/// Where a kind with a cache runs: its key and folder.
+struct CacheAt {
+    key: String,
+    dir: PathBuf,
+}
+
+/// After a run that used a key: its record, then (at most once a minute, off the step's path) its size, the per-key
+/// cap and the total cap.
+fn after_cache_run(cache: &Arc<CheckCache>, shared: &Arc<Shared>, key: &str, root: &Path) {
+    let now = crate::time::now_ms();
+    cache.touch(key, root, now);
+    if !cache.due_for_sizing(key, now) {
+        return;
+    }
+    let Ok(handle) = tokio::runtime::Handle::try_current() else { return };
+    let (cache, sized, key) = (cache.clone(), shared.clone(), key.to_string());
+    let task = handle.spawn_blocking(move || {
+        let (_, too_big) = cache.measure(&key, crate::time::now_ms());
+        if too_big {
+            locked(&sized.off).get_or_insert(OffReason::CacheTooBig);
+        }
+        cache.evict(&key, crate::time::now_ms());
+    });
+    *locked(&shared.sizing) = Some(task);
+}
+
 impl<E: Clone + Send + Sync + 'static> Turn<E> {
     fn tell(&self, result: CheckOutcome<E>) {
         quietly(|| (self.options.on_result)(result));
@@ -338,18 +589,142 @@ impl<E: Clone + Send + Sync + 'static> Turn<E> {
         !self.checker.told_unreadable.swap(true, Ordering::SeqCst)
     }
 
-    /// Runs a pass's command: its problems and how long it took, or `None` (stopped, failed: then it was told).
-    async fn check(&self, pass: &CheckPass<E>) -> Option<(Vec<E>, u64)> {
+    /// The kind's cache key folder: `Ok(None)` for a kind without a cache; `Err` when it was refused (then it was told
+    /// and the rest of the turn is unchecked).
+    fn cache_at(&self) -> Result<Option<CacheAt>, ()> {
+        let checker = &self.checker;
+        let Some(cache) = checker.cache.as_ref().filter(|_| checker.kind.cache()) else { return Ok(None) };
+        let key = repo_key(&self.options.root);
+        match cache.key_dir(&key) {
+            Ok(dir) => Ok(Some(CacheAt { key, dir })),
+            Err(why) => {
+                self.unavailable.store(true, Ordering::SeqCst);
+                self.tell(CheckOutcome::Failed {
+                    ms: 0,
+                    reason: FailReason::CacheRefused,
+                    tool: Some(why),
+                    notify: self.notify_once(),
+                });
+                Err(())
+            }
+        }
+    }
+
+    /// The session's first change: one background run of the baseline, to fill the kind's cache.
+    fn start_warm_up(&self) {
+        let checker = &self.checker;
+        let Some(cache) = checker.cache.clone().filter(|_| checker.kind.cache()) else { return };
+        let mut scope = locked(&checker.scope);
+        if !matches!(scope.warm, Warm::NotStarted) {
+            return;
+        }
+        let root = self.options.root.clone();
+        let key = repo_key(&root);
+        cache.prune_once(&key);
+        // Refused or out of disk: the baseline says so; a later turn tries again.
+        let Ok(dir) = cache.key_dir(&key) else { return };
+        if cache.low_on_space().is_some() {
+            return;
+        }
+        let pass = if checker.kind.warm_up(&dir) { checker.kind.pass(&root, Some(&dir), None) } else { None };
+        let Some(pass) = pass else {
+            scope.warm = Warm::Done;
+            return;
+        };
+        let (done, waiting) = tokio::sync::watch::channel(false);
+        scope.warm = Warm::Running(waiting);
+        checker.shared.warm_ups.fetch_add(1, Ordering::SeqCst);
+        let (run, cancel, shared, limit) =
+            (self.run.clone(), scope.cancel.clone(), checker.shared.clone(), checker.warm_up_timeout);
+        let (command, read_only) = (pass.command, pass.read_only);
+        tokio::spawn(async move {
+            let started = Instant::now();
+            // Another session's check or warm-up of this key: wait for it (it fills the same cache).
+            let Some(lock) = cache.lock(&key, limit, &cancel).await else { return };
+            let timeout = limit.saturating_sub(started.elapsed());
+            let writable = vec![dir];
+            // Its output is thrown away: its only job is the cache.
+            let _ = run(CheckRun { command, root: root.clone(), read_only, writable, timeout }, cancel.clone()).await;
+            drop(lock);
+            if !cancel.is_cancelled() {
+                after_cache_run(&cache, &shared, &key, &root);
+            }
+            let _ = done.send(true);
+        });
+    }
+
+    /// The warm-up, if it's running: waits up to `baseline_wait` for it. `false`: it's still running.
+    async fn wait_for_warm_up(&self) -> bool {
+        let waiting = match &locked(&self.checker.scope).warm {
+            Warm::Running(rx) => rx.clone(),
+            _ => return true,
+        };
+        let mut waiting = waiting;
+        let wait = tokio::time::timeout(self.checker.baseline_wait, waiting.wait_for(|done| *done));
+        tokio::select! {
+            // Done, or its sender is gone (cancelled, panicked): either way, not running.
+            r = wait => r.is_ok(),
+            _ = self.options.cancel.cancelled() => true,
+        }
+    }
+
+    fn pending(&self, ms: u64, notify: bool) {
+        let notify = notify && !self.checker.told_pending.swap(true, Ordering::SeqCst);
+        self.tell(CheckOutcome::Failed { ms, reason: FailReason::Pending, tool: None, notify });
+    }
+
+    /// The turn's baseline: its problems, or `None` when it couldn't be taken (then this turn says nothing).
+    async fn take_baseline(&self) -> Option<Vec<E>> {
+        let started = Instant::now();
+        if !self.wait_for_warm_up().await {
+            if !self.options.cancel.is_cancelled() {
+                self.pending(started.elapsed().as_millis() as u64, true);
+            }
+            return None;
+        }
+        let at = self.cache_at().ok()?;
+        match self.checker.kind.pass(&self.options.root, at.as_ref().map(|a| a.dir.as_path()), None) {
+            Some(pass) => self.check(&pass, at.as_ref(), true).await.map(|(errors, _)| errors),
+            None => Some(Vec::new()),
+        }
+    }
+
+    /// Runs a pass's command: its problems and how long it took, or `None` (stopped, failed: then it was told). With a
+    /// cache: the free-space guard, then the key's lock (a baseline waits for it; a step skips when it's held), and
+    /// the key folder mounted writable for this run only.
+    async fn check(&self, pass: &CheckPass<E>, at: Option<&CacheAt>, baseline: bool) -> Option<(Vec<E>, u64)> {
         let (checker, cancel) = (&self.checker, &self.options.cancel);
+        let mut lock = None;
+        if let (Some(at), Some(cache)) = (at, checker.cache.as_ref()) {
+            if cache.low_on_space().is_some() {
+                let notify = !checker.told_low_disk.swap(true, Ordering::SeqCst);
+                self.tell(CheckOutcome::Failed { ms: 0, reason: FailReason::LowDisk, tool: None, notify });
+                return None;
+            }
+            let waited = Instant::now();
+            lock = if baseline { cache.lock(&at.key, checker.baseline_wait, cancel).await } else { cache.try_lock(&at.key) };
+            if lock.is_none() {
+                if !cancel.is_cancelled() {
+                    self.pending(waited.elapsed().as_millis() as u64, baseline);
+                }
+                return None;
+            }
+        }
+        // The timeout starts here, once the lock is held: a wait for it never counts as one.
         let started = Instant::now();
         let run = CheckRun {
             command: pass.command.clone(),
             root: self.options.root.clone(),
             read_only: pass.read_only.clone(),
+            writable: at.map(|a| vec![a.dir.clone()]).unwrap_or_default(),
             timeout: checker.timeout,
         };
         let result = (self.run)(run, cancel.clone()).await;
         let ms = started.elapsed().as_millis() as u64;
+        if let (Some(at), Some(cache), Some(lock)) = (at, checker.cache.as_ref(), lock.take()) {
+            drop(lock);
+            after_cache_run(cache, &checker.shared, &at.key, &self.options.root);
+        }
         if result.aborted || cancel.is_cancelled() {
             return None; // Esc: the turn is ending, nothing to say
         }
@@ -378,8 +753,18 @@ impl<E: Clone + Send + Sync + 'static> Turn<E> {
             self.unavailable.store(true, Ordering::SeqCst);
             let reason = if missing.is_some() { FailReason::MissingInterpreter } else { FailReason::Unreadable };
             self.tell(CheckOutcome::Failed { ms, reason, tool: missing, notify: self.notify_once() });
+            if reason == FailReason::Unreadable {
+                let streak = checker.unreadable.fetch_add(1, Ordering::SeqCst) + 1;
+                if checker.kind.max_unreadable().is_some_and(|max| streak >= max) {
+                    *locked(&checker.shared.off) = Some(OffReason::Unreadable);
+                    if !checker.shared.told_off.swap(true, Ordering::SeqCst) {
+                        self.tell(CheckOutcome::Off { reason: OffReason::Unreadable });
+                    }
+                }
+            }
             return None;
         };
+        checker.unreadable.store(0, Ordering::SeqCst);
         Some((errors, ms))
     }
 
@@ -398,16 +783,18 @@ impl<E: Clone + Send + Sync + 'static> Turn<E> {
         if self.unavailable.load(Ordering::SeqCst)
             || self.options.cancel.is_cancelled()
             || checker.timeouts.load(Ordering::SeqCst) >= MAX_TIMEOUTS
+            || locked(&checker.shared.off).is_some()
         {
             return None;
         }
         let kind = &checker.kind;
+        let at = self.cache_at().ok()?;
         // Nothing this kind checks could have changed.
-        let pass = kind.pass(&self.options.root, changed_files(&runs).as_deref())?;
+        let pass = kind.pass(&self.options.root, at.as_ref().map(|a| a.dir.as_path()), changed_files(&runs).as_deref())?;
         // The status goes back after the result is told, so the client sees checking, the check, then running.
         quietly(|| (self.options.on_status)(true));
         let _checking = Checking(&*self.options.on_status);
-        let (now, ms) = self.check(&pass).await?;
+        let (now, ms) = self.check(&pass, at.as_ref(), false).await?;
         if self.options.cancel.is_cancelled() {
             return None;
         }
@@ -431,27 +818,30 @@ impl<E: Clone + Send + Sync + 'static> Turn<E> {
 /// The typecheck: the project's own tsgo or tsc (Marv's `typecheck` kind).
 pub struct Typecheck;
 
-impl CheckKind<TsError> for Typecheck {
+impl CheckKind<Diagnostic> for Typecheck {
+    fn label(&self) -> &'static str {
+        TSC_LABEL
+    }
     fn prepare(&self, root: &Path) -> bool {
         super::tsc::detect_checker(root).is_some()
     }
-    fn pass(&self, root: &Path, _changed: Option<&[String]>) -> Option<CheckPass<TsError>> {
+    fn pass(&self, root: &Path, _cache: Option<&Path>, _changed: Option<&[String]>) -> Option<CheckPass<Diagnostic>> {
         super::tsc::detect_checker(root).map(|bin| CheckPass {
             command: super::tsc::check_command(&bin),
             covers: None,
             read_only: Vec::new(),
         })
     }
-    fn parse(&self, output: &str, exit_code: Option<i32>) -> Option<Vec<TsError>> {
+    fn parse(&self, output: &str, exit_code: Option<i32>) -> Option<Vec<Diagnostic>> {
         super::tsc::parse_tsc(output, exit_code)
     }
     fn missing(&self, output: &str, exit_code: Option<i32>) -> Option<String> {
         super::tsc::missing_interpreter(output, exit_code)
     }
-    fn key(&self, problem: &TsError) -> String {
+    fn key(&self, problem: &Diagnostic) -> String {
         super::tsc::ts_error_key(problem)
     }
-    fn note(&self, added: &[TsError]) -> String {
+    fn note(&self, added: &[Diagnostic]) -> String {
         super::tsc::diagnostics_note(added)
     }
 }
@@ -490,17 +880,74 @@ impl marv_tools::BeforeChange for Together {
     }
 }
 
+/// What the transcript shows for a checker's result, by its label: tsc's words as before (#187 kept them), the same
+/// shape for the others ("✻ cargo check: 2 new errors, told the model:"). Error messages quote the project: printable.
+pub fn notice(label: &str, result: &CheckResult) -> Option<String> {
+    if label == TSC_LABEL { check_notice(result) } else { generic_notice(label, result) }
+}
+
+/// [`notice`] for any checker but tsc (and for tsc's results that didn't exist before #187).
+fn generic_notice(label: &str, result: &CheckResult) -> Option<String> {
+    use marv_core::printable;
+    match result {
+        CheckOutcome::Off { reason: OffReason::NoSandbox } => Some(format!(
+            "✻ Marv runs {label} after the model's edits only in the sandbox (it runs the project's own toolchain), so it won't here."
+        )),
+        CheckOutcome::Off { reason: OffReason::Timeouts } => {
+            Some(format!("✻ {label} timed out twice, so Marv stopped running it for this session."))
+        }
+        CheckOutcome::Off { reason: OffReason::Unreadable } => {
+            Some(format!("✻ Marv couldn't read {label}'s output twice in a row, so it stopped running it for this session."))
+        }
+        CheckOutcome::Off { reason: OffReason::CacheTooBig } => Some(format!(
+            "✻ {label}'s cache for this project passed its size limit, so Marv deleted it and stopped running {label} for this session."
+        )),
+        CheckOutcome::Failed { notify: false, .. } => None,
+        CheckOutcome::Failed { reason: FailReason::Pending, .. } => Some(format!(
+            "✻ {label} is still building its cache for this project (first run); Marv will tell the model about new errors once it's ready."
+        )),
+        CheckOutcome::Failed { reason: FailReason::LowDisk, .. } => {
+            Some(format!("✻ Less than 5 GB free; Marv isn't running {label}."))
+        }
+        CheckOutcome::Failed { reason: FailReason::CacheRefused, tool, .. } => Some(format!(
+            "✻ Marv won't use {label}'s cache folder ({}), so it isn't running {label}.",
+            printable(tool.as_deref().unwrap_or("refused"))
+        )),
+        CheckOutcome::Failed { reason: FailReason::MissingInterpreter, tool, .. } => Some(format!(
+            "✻ {label} needs {}, which the sandbox can't see (Marv's sandbox hides the home folder except known toolchains). Marv can't tell the model about new errors.",
+            printable(tool.as_deref().unwrap_or("its interpreter"))
+        )),
+        CheckOutcome::Failed { .. } => {
+            Some(format!("✻ Marv couldn't read {label}'s output here, so it can't tell the model about new errors."))
+        }
+        CheckOutcome::Done { added, .. } if added.is_empty() => None,
+        CheckOutcome::Done { added, .. } => {
+            let n = added.len();
+            let mut lines = vec![format!("✻ {label}: {n} new error{}, told the model:", if n == 1 { "" } else { "s" })];
+            lines.extend(added.iter().take(NOTICE_LINES).map(|e| printable(&format_error(e))));
+            if n > NOTICE_LINES {
+                lines.push(format!("… and {} more", n - NOTICE_LINES));
+            }
+            Some(lines.join("\n"))
+        }
+    }
+}
+
 /// What the transcript shows for a typecheck, or `None`. Error messages quote the project's code: printable.
 pub fn check_notice(result: &CheckResult) -> Option<String> {
     use marv_core::printable;
     match result {
         CheckOutcome::Off { reason: OffReason::NoSandbox } => Some("✻ Marv typechecks after the model's edits only in the sandbox (it runs the project's own compiler), so it won't here.".into()),
         CheckOutcome::Off { reason: OffReason::Timeouts } => Some("✻ The typecheck timed out twice, so Marv stopped running it for this session.".into()),
+        CheckOutcome::Off { .. } => generic_notice(TSC_LABEL, result),
         CheckOutcome::Failed { reason: FailReason::MissingInterpreter, tool, notify: true, .. } => Some(format!(
             "✻ tsc needs {}, which the sandbox can't see (Marv's sandbox hides the home folder except known toolchains). Marv can't tell the model about new type errors.",
             printable(tool.as_deref().unwrap_or("node"))
         )),
         CheckOutcome::Failed { reason: FailReason::Unreadable, notify: true, .. } => Some("✻ Marv couldn't read the typecheck's output here, so it can't tell the model about new errors.".into()),
+        CheckOutcome::Failed { reason: FailReason::Pending | FailReason::LowDisk | FailReason::CacheRefused, notify: true, .. } => {
+            generic_notice(TSC_LABEL, result)
+        }
         CheckOutcome::Failed { .. } => None,
         CheckOutcome::Done { added, .. } if added.is_empty() => None,
         CheckOutcome::Done { added, .. } => {
@@ -638,13 +1085,13 @@ mod tests {
         dir
     }
 
-    fn diagnostics(run: &Fake, works: bool) -> Arc<Checker<TsError>> {
+    fn diagnostics(run: &Fake, works: bool) -> Arc<Checker<Diagnostic>> {
         let mut checker = Checker::new(Arc::new(Typecheck), Some(run.run.clone()));
         checker.sandbox_works = Some(Arc::new(move || works));
         Arc::new(checker)
     }
 
-    fn turn(checker: &Arc<Checker<TsError>>, dir: &Scratch) -> TurnLog<TsError> {
+    fn turn(checker: &Arc<Checker<Diagnostic>>, dir: &Scratch) -> TurnLog<Diagnostic> {
         TurnLog::new(checker, &dir.0, true, CancellationToken::new())
     }
 
@@ -660,8 +1107,13 @@ mod tests {
     #[tokio::test]
     async fn a_check_command_runs_without_the_pipe_check() {
         let dir = Scratch::new();
-        let run =
-            CheckRun { command: "false | true".into(), root: dir.0.clone(), read_only: vec![], timeout: Duration::from_secs(10) };
+        let run = CheckRun {
+            command: "false | true".into(),
+            root: dir.0.clone(),
+            read_only: vec![],
+            writable: vec![],
+            timeout: Duration::from_secs(10),
+        };
         assert!(!sandboxed_options(&run).pipe_check);
         if marv_sandbox::sandbox_available() {
             let result = sandboxed()(run, CancellationToken::new()).await;
@@ -1013,6 +1465,7 @@ mod tests {
             command: "tsc".into(),
             root: "/project".into(),
             read_only: vec!["/opt/marv".into()],
+            writable: vec![],
             timeout: CHECK_TIMEOUT,
         };
         let options = sandboxed_options(&run);
@@ -1028,8 +1481,8 @@ mod tests {
         assert!(new_problems(&["a"], &["a"], key).is_empty());
     }
 
-    fn ts(i: u64) -> TsError {
-        TsError {
+    fn ts(i: u64) -> Diagnostic {
+        Diagnostic {
             file: Some("a.ts".into()),
             line: Some(i + 1),
             column: Some(1),
@@ -1075,7 +1528,7 @@ mod tests {
     #[test]
     fn notices() {
         assert!(check_notice(&CheckOutcome::Done { ms: 1, before: 0, errors: 0, added: vec![] }).is_none());
-        let e = TsError { file: None, line: None, column: None, code: "TS1".into(), message: "m\u{1b}[2J".into() };
+        let e = Diagnostic { file: None, line: None, column: None, code: "TS1".into(), message: "m\u{1b}[2J".into() };
         let n = check_notice(&CheckOutcome::Done { ms: 1, before: 0, errors: 1, added: vec![e] }).unwrap();
         assert!(n.starts_with("✻ Typecheck: 1 new error, told the model:"));
         assert!(!n.contains('\u{1b}'));

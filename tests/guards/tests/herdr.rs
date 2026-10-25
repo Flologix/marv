@@ -299,7 +299,7 @@ async fn a_light_action_in_a_woken_turn_gets_no_always() {
         project.path(),
         marv_session::ProviderChoice::Option(marv_provider::ProviderOption::Custom(model.clone())),
     );
-    (init.diagnostics, init.checks) = (false, false);
+    (init.diagnostics, init.checks) = (false.into(), false);
     init.mesh = Some(mesh.clone());
     init.approve = Some(person.clone());
     init.herdr = Some(fake_setup(herdr.path(), 4));

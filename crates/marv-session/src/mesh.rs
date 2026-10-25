@@ -1755,7 +1755,7 @@ mod tests {
             });
             let model = Arc::new(Model { hook, seen: Arc::default() });
             let mut init = SessionInit::new(&project, ProviderChoice::Factory(Arc::new(Factory(model.clone()))));
-            init.diagnostics = false;
+            init.diagnostics = false.into();
             init.checks = false;
             init.mesh = Some(mesh.clone());
             init.approve = Some(person.clone());

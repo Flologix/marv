@@ -436,7 +436,7 @@ async fn a_woken_turn_reads_its_message_fenced_and_tainted_and_egress_asks() {
         project.path(),
         marv_session::ProviderChoice::Option(marv_provider::ProviderOption::Custom(model.clone())),
     );
-    (init.diagnostics, init.checks, init.yolo) = (false, false, true);
+    (init.diagnostics, init.checks, init.yolo) = (false.into(), false, true);
     init.mesh = Some(mesh.clone());
     init.approve = Some(person.clone());
     let session = marv_session::MarvSession::new(init).unwrap();
@@ -502,7 +502,7 @@ async fn an_inbox_woken_turn_asks_for_what_yolo_would_allow() {
         project.path(),
         marv_session::ProviderChoice::Option(marv_provider::ProviderOption::Custom(model.clone())),
     );
-    (init.diagnostics, init.checks, init.yolo, init.checkpoints) = (false, false, true, false);
+    (init.diagnostics, init.checks, init.yolo, init.checkpoints) = (false.into(), false, true, false);
     init.mesh = Some(mesh.clone());
     init.approve = Some(person.clone());
     let session = marv_session::MarvSession::new(init).unwrap();

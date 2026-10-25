@@ -66,10 +66,10 @@ use marv_provider::factory::{ConfigFactory, LoadModels, MakeProvider};
 use marv_session::checks::{ProjectCheckResult, project_check_notice};
 use marv_session::commands::{self, CommandAction, CommandContext, MemoryTarget};
 use marv_session::config::{
-    Config, ConfigStore, Env, FileConfig, MaxStepsSetting, RadioSetting, default_config_dir, mask_key, migrate_legacy_config,
-    needs_setup, preset, resolve_config,
+    Config, ConfigStore, DiagnosticsSetting, Env, FileConfig, MaxStepsSetting, RadioSetting, default_config_dir, mask_key,
+    migrate_legacy_config, needs_setup, preset, resolve_config,
 };
-use marv_session::diagnostics::check_notice;
+use marv_session::diagnostics::notice as check_notice;
 use marv_session::mcp_tools::McpHandle;
 use marv_session::memory::{Memories, MemoryPaths, load_memory, memory_paths};
 use marv_session::paths::{home_dir, project_key, shorten_home};
@@ -389,7 +389,9 @@ pub fn map_event(
             progress: view::AgentProgress { line: progress.line, steps: progress.steps },
         }],
         SessionEvent::Compaction(result) => vec![UiEvent::Compaction { automatic: true, outcome: compact_outcome(result) }],
-        SessionEvent::Check(result) => check_notice(&result).map(|text| system(text, false)).into_iter().collect(),
+        SessionEvent::Check { label, result } => {
+            check_notice(label, &result).map(|text| system(text, false)).into_iter().collect()
+        }
         SessionEvent::Checks(result) => {
             let notice = project_check_notice(&result);
             map.last_checks = Some(result);
@@ -1781,9 +1783,21 @@ impl Bridge {
                 let status = commands::trajectories_status(&Config { trajectories: on, ..config.clone() }, path.as_deref());
                 self.save_config(self.with_file(|f| f.trajectories = Some(on)), format!("Trajectories {status}"));
             }
-            CommandAction::Diagnostics { on } => {
-                let status = commands::diagnostics_status(&Config { diagnostics: on, ..config.clone() });
-                self.save_config(self.with_file(|f| f.diagnostics = Some(on)), format!("Diagnostics {status}"));
+            CommandAction::Diagnostics { language, on } => {
+                let next = DiagnosticsSetting::switched(self.file().and_then(|f| f.diagnostics), language, on);
+                let status = commands::diagnostics_status(&Config { diagnostics: next.resolve(), ..config.clone() });
+                self.save_config(self.with_file(|f| f.diagnostics = Some(next)), format!("Diagnostics {status}"));
+            }
+            CommandAction::ClearCheckCache => {
+                let (text, is_error) = match self.session.clear_check_cache() {
+                    Ok(Some(bytes)) => (
+                        format!("Deleted this project's check cache ({}).", marv_session::diagnostics::cache::human_size(bytes)),
+                        false,
+                    ),
+                    Ok(None) => ("This project has no check cache.".to_string(), false),
+                    Err(e) => (format!("Couldn't delete this project's check cache: {}", printable(&e)), true),
+                };
+                self.emit(system(text, is_error));
             }
             CommandAction::Checks { on } => {
                 let status = commands::checks_status(&Config { checks: on, ..config.clone() });
@@ -2525,6 +2539,8 @@ impl Bridge {
         let processes = self.session.processes();
         let checkpoint_problem = self.session.checkpoint_problem();
         let permissions = self.session.permissions();
+        let wants_diagnostics = line.trim().strip_prefix("/diagnostics").is_some_and(|r| r.trim().is_empty());
+        let diagnostics = wants_diagnostics.then(|| self.session.diagnostics_info());
         let mesh = self.session.mesh().map(|mesh| {
             let inbox = marv_mesh::ReceptacleName::inbox(&marv_session::mesh::parent_id());
             commands::MeshStatus {
@@ -2555,6 +2571,7 @@ impl Bridge {
             processes: self.session.processes_offered().then_some(&processes[..]),
             mesh: mesh.as_ref(),
             permissions: Some(&permissions),
+            diagnostics: diagnostics.as_ref(),
         };
         commands::run_command(line, &ctx)
     }
@@ -3133,7 +3150,7 @@ mod tests {
             provider: Some(ProviderKind::Ollama),
             model: Some("qwen3.5:9b".into()),
             yolo: Some(false),
-            diagnostics: Some(false),
+            diagnostics: Some(DiagnosticsSetting::All(false)),
             checks: Some(false),
             // A suggestion is one more request after each turn: off, so each test's scripted replies stay its turns'.
             suggestions: Some(false),

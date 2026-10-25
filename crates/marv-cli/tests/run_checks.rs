@@ -45,6 +45,7 @@ async fn run_all(root: &Path) -> (String, Option<Vec<marv_session::checks::Viola
         command: runner_command(&binary, &checks, 30_000),
         root: root.to_path_buf(),
         read_only: vec![binary],
+        writable: vec![],
         timeout: CHECK_TIMEOUT,
     };
     let result = sandboxed()(run, CancellationToken::new()).await;

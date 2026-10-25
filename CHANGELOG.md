@@ -6,6 +6,10 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+### Added
+
+- **Diagnostics per language (#187).** `"diagnostics"` in `~/.marv/config.json` still takes `true` or `false` (every language), and now also an object, like `{"typescript": true, "rust": false}`, where a language left out stays on. `/diagnostics rust off` (or `typescript`, `python`, `go`) switches one language and saves it; `/diagnostics on|off` still switches them all. `/diagnostics` lists each language and its checker's state. Only TypeScript has a checker so far (the project's own tsc, unchanged); the others are the groundwork for the coming cargo check, pyright and go vet checkers, along with `/diagnostics clear`, which deletes this project's check cache.
+
 ### Fixed
 
 - **A radio request's ack could be lost (#213).** When the other Marv acked very quickly, the ack could arrive before the request was recorded as open on the sending side, and was refused there as an ack for no open request: the model never read it (the `done` that followed still arrived). The same applied to a quick refusal, which then didn't close the request with a `failed`. A request is now open before its frame is sent.

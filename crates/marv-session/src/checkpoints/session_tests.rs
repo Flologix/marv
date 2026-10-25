@@ -157,7 +157,7 @@ fn make(dirs: &Dirs, provider: Arc<dyn Provider>, edit: impl FnOnce(&mut Session
     let mut init = SessionInit::new(dirs.root(), ProviderChoice::Factory(Arc::new(Fixed(provider))));
     init.sandbox = false;
     init.approve = Some(Arc::new(Yes));
-    init.diagnostics = false;
+    init.diagnostics = false.into();
     init.checks = false;
     edit(&mut init);
     MarvSession::new(init).unwrap()

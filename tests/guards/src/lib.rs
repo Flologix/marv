@@ -318,7 +318,7 @@ pub async fn sdk_turn(
     use futures::StreamExt;
     let mut builder = marv_session::SessionBuilder::new(root, marv_provider::ProviderOption::Custom(model));
     builder.options.config_dir = Some(config_dir.to_path_buf());
-    builder.options.diagnostics = false;
+    builder.options.diagnostics = false.into();
     builder.options.checks = false;
     edit(&mut builder.options);
     let session = builder.build().await.expect("a session");

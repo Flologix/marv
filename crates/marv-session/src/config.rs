@@ -132,7 +132,8 @@ pub struct FileConfig {
     pub sandbox: Option<bool>,
     pub yolo: Option<bool>,
     pub trajectories: Option<bool>,
-    pub diagnostics: Option<bool>,
+    /// `diagnostics` (#187): a bool for every language, or one per language.
+    pub diagnostics: Option<DiagnosticsSetting>,
     pub checks: Option<bool>,
     /// Snapshot the project before each turn's changes, so /undo can put them back (default on). #16.
     pub checkpoints: Option<bool>,
@@ -160,6 +161,147 @@ pub struct FileConfig {
     /// `herdr.peers` (#74): how many panes the Herdr door may open (commands and spawned workers) per session
     /// (default [`DEFAULT_HERDR_PEERS`], at most [`MAX_HERDR_PEERS`]; 0: none). The user's own file only.
     pub herdr_peers: Option<u32>,
+}
+
+/// A language a diagnostics checker covers (#187): the keys of `"diagnostics": {…}` and `/diagnostics <language>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Language {
+    TypeScript,
+    Rust,
+    Python,
+    Go,
+}
+
+impl Language {
+    pub const ALL: [Language; 4] = [Language::TypeScript, Language::Rust, Language::Python, Language::Go];
+
+    /// As the config and `/diagnostics` spell it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Language::TypeScript => "typescript",
+            Language::Rust => "rust",
+            Language::Python => "python",
+            Language::Go => "go",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|l| l.name().eq_ignore_ascii_case(name))
+    }
+
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Which languages' checkers run after the model's edits (#187). Every one is on by default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Diagnostics([bool; 4]);
+
+impl Diagnostics {
+    pub const ON: Self = Self([true; 4]);
+    pub const OFF: Self = Self([false; 4]);
+
+    pub fn get(self, language: Language) -> bool {
+        self.0[language.index()]
+    }
+
+    pub fn with(mut self, language: Language, on: bool) -> Self {
+        self.0[language.index()] = on;
+        self
+    }
+
+    /// Any language on.
+    pub fn any(self) -> bool {
+        self.0.contains(&true)
+    }
+
+    /// "on", "off", or "on for typescript, go (off for rust, python)".
+    pub fn summary(self) -> String {
+        let names = |on: bool| Language::ALL.into_iter().filter(|l| self.get(*l) == on).map(Language::name).collect::<Vec<_>>();
+        match (names(true), names(false)) {
+            (_, off) if off.is_empty() => "on".into(),
+            (on, _) if on.is_empty() => "off".into(),
+            (on, off) => format!("on for {} (off for {})", on.join(", "), off.join(", ")),
+        }
+    }
+}
+
+impl Default for Diagnostics {
+    fn default() -> Self {
+        Self::ON
+    }
+}
+
+impl From<bool> for Diagnostics {
+    fn from(on: bool) -> Self {
+        if on { Self::ON } else { Self::OFF }
+    }
+}
+
+/// `"diagnostics"` as saved (#187): `true`/`false` for every language, or `{"typescript": true, "rust": false, …}`,
+/// where a missing key takes its default (on).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosticsSetting {
+    All(bool),
+    Each([Option<bool>; 4]),
+}
+
+impl DiagnosticsSetting {
+    pub fn resolve(self) -> Diagnostics {
+        match self {
+            DiagnosticsSetting::All(on) => on.into(),
+            DiagnosticsSetting::Each(each) => {
+                Language::ALL.into_iter().fold(Diagnostics::ON, |d, l| d.with(l, each[l.index()].unwrap_or(true)))
+            }
+        }
+    }
+
+    fn from_value(value: &Value) -> Result<Option<Self>, String> {
+        match value {
+            Value::Null => Ok(None),
+            Value::Bool(on) => Ok(Some(Self::All(*on))),
+            Value::Object(entries) => {
+                let mut each = [None; 4];
+                let mut problems = Vec::new();
+                for (key, v) in entries {
+                    match (Language::ALL.into_iter().find(|l| l.name() == key), v) {
+                        (None, _) => problems.push(format!(
+                            "diagnostics: unknown key \"{key}\" (only \"typescript\", \"rust\", \"python\" and \"go\")"
+                        )),
+                        (Some(_), Value::Null) => {}
+                        (Some(l), Value::Bool(on)) => each[l.index()] = Some(*on),
+                        (Some(_), _) => problems.push(format!("diagnostics.{key}: expected a boolean")),
+                    }
+                }
+                if problems.is_empty() { Ok(Some(Self::Each(each))) } else { Err(problems.join("\n")) }
+            }
+            _ => Err("diagnostics: expected true, false or an object like {\"rust\": false}".into()),
+        }
+    }
+
+    fn to_value(self) -> Value {
+        match self {
+            DiagnosticsSetting::All(on) => Value::from(on),
+            DiagnosticsSetting::Each(each) => Value::Object(
+                Language::ALL
+                    .into_iter()
+                    .filter_map(|l| each[l.index()].map(|on| (l.name().to_string(), Value::from(on))))
+                    .collect(),
+            ),
+        }
+    }
+
+    /// What `/diagnostics on|off` (`language` `None`) or `/diagnostics <language> on|off` saves over `saved`: a plain
+    /// bool when every language ends up the same, otherwise every language spelled out.
+    pub fn switched(saved: Option<Self>, language: Option<Language>, on: bool) -> Self {
+        let Some(language) = language else { return Self::All(on) };
+        let next = saved.map_or(Diagnostics::ON, Self::resolve).with(language, on);
+        match Language::ALL.map(|l| next.get(l)) {
+            all if all.iter().all(|v| *v == all[0]) => Self::All(all[0]),
+            each => Self::Each(each.map(Some)),
+        }
+    }
 }
 
 /// `MARV_YOLO=off` (or 0, false, no): yolo stays off for this process (#74).
@@ -448,6 +590,10 @@ impl FileConfig {
                 None
             }
         };
+        let diagnostics = DiagnosticsSetting::from_value(map.get("diagnostics").unwrap_or(&Value::Null))
+            .map_err(|e| problems.push(e))
+            .ok()
+            .flatten();
         let hooks = match map.get("hooks") {
             None | Some(Value::Null) => None,
             Some(v) => crate::hooks::Hooks::from_value(v).map_err(|e| problems.push(e)).ok(),
@@ -467,7 +613,7 @@ impl FileConfig {
             sandbox: boolean("sandbox", &mut problems),
             yolo: boolean("yolo", &mut problems),
             trajectories: boolean("trajectories", &mut problems),
-            diagnostics: boolean("diagnostics", &mut problems),
+            diagnostics,
             checks: boolean("checks", &mut problems),
             checkpoints: boolean("checkpoints", &mut problems),
             hooks,
@@ -506,7 +652,7 @@ impl FileConfig {
         put("sandbox", self.sandbox.map(Value::from));
         put("yolo", self.yolo.map(Value::from));
         put("trajectories", self.trajectories.map(Value::from));
-        put("diagnostics", self.diagnostics.map(Value::from));
+        put("diagnostics", self.diagnostics.map(DiagnosticsSetting::to_value));
         put("checks", self.checks.map(Value::from));
         put("checkpoints", self.checkpoints.map(Value::from));
         put("hooks", self.hooks.as_ref().map(crate::hooks::Hooks::to_value));
@@ -569,7 +715,8 @@ pub struct Config {
     pub sandbox: bool,
     pub yolo: bool,
     pub trajectories: bool,
-    pub diagnostics: bool,
+    /// Which languages' checkers run after the model's edits (#187).
+    pub diagnostics: Diagnostics,
     pub checks: bool,
     pub checkpoints: bool,
     pub suggestions: bool,
@@ -709,7 +856,7 @@ pub fn resolve_config(file: Option<&FileConfig>, env: &Env) -> Config {
         // that may have no more than the session that spawned it). It can only turn yolo off, never on.
         yolo: file.and_then(|f| f.yolo).unwrap_or(true) && !yolo_held_off(env.get("MARV_YOLO").map(String::as_str)),
         trajectories: file.and_then(|f| f.trajectories).unwrap_or(true),
-        diagnostics: file.and_then(|f| f.diagnostics).unwrap_or(true),
+        diagnostics: file.and_then(|f| f.diagnostics).map_or(Diagnostics::ON, DiagnosticsSetting::resolve),
         checks: file.and_then(|f| f.checks).unwrap_or(true),
         checkpoints: file.and_then(|f| f.checkpoints).unwrap_or(true),
         suggestions: file.and_then(|f| f.suggestions).unwrap_or(true),
@@ -883,10 +1030,48 @@ mod tests {
         assert_eq!(c.api_key_source, Some(KeySource::File));
         assert_eq!(
             (c.thinking, c.context_length, c.sandbox, c.yolo, c.trajectories, c.diagnostics, c.checks),
-            (false, 32768, true, true, true, true, true)
+            (false, 32768, true, true, true, Diagnostics::ON, true)
         );
         assert!(c.checkpoints && c.suggestions);
         assert_eq!((c.max_steps, c.mcp_tools), (25, McpToolsSetting::Auto));
+    }
+
+    /// #187: `diagnostics` is a bool for every language or an object per language (missing keys on); unknown keys and
+    /// non-bools are problems; `false` (the oracle's) turns every kind off.
+    #[test]
+    fn diagnostics_is_a_bool_or_an_object_per_language() {
+        let read = |v: Value| FileConfig::from_value(&serde_json::json!({ "diagnostics": v }));
+        let resolved = |v: Value| resolve_config(Some(&read(v).unwrap()), &Env::new()).diagnostics;
+        assert_eq!(resolved(Value::Bool(false)), Diagnostics::OFF);
+        assert!(!resolved(Value::Bool(false)).any());
+        assert_eq!(resolved(Value::Bool(true)), Diagnostics::ON);
+        assert_eq!(resolve_config(None, &Env::new()).diagnostics, Diagnostics::ON);
+        let some = resolved(serde_json::json!({"rust": false, "go": false}));
+        assert!(some.get(Language::TypeScript) && some.get(Language::Python));
+        assert!(!some.get(Language::Rust) && !some.get(Language::Go));
+        assert_eq!(some.summary(), "on for typescript, python (off for rust, go)");
+        assert!(read(serde_json::json!({"ruby": true})).unwrap_err().contains("unknown key \"ruby\""));
+        assert!(read(serde_json::json!({"rust": "yes"})).unwrap_err().contains("diagnostics.rust: expected a boolean"));
+        assert!(read(serde_json::json!("on")).is_err());
+        // Saved as read.
+        for v in [Value::Bool(false), serde_json::json!({"rust": false})] {
+            assert_eq!(read(v.clone()).unwrap().to_value()["diagnostics"], v);
+        }
+    }
+
+    #[test]
+    fn diagnostics_switched_by_language_saves_a_bool_when_they_agree() {
+        use DiagnosticsSetting::{All, Each};
+        assert_eq!(DiagnosticsSetting::switched(None, None, false), All(false));
+        let rust_off = DiagnosticsSetting::switched(None, Some(Language::Rust), false);
+        assert_eq!(rust_off, Each([Some(true), Some(false), Some(true), Some(true)]));
+        assert_eq!(DiagnosticsSetting::switched(Some(rust_off), Some(Language::Rust), true), All(true));
+        assert_eq!(
+            DiagnosticsSetting::switched(Some(All(false)), Some(Language::Go), true).resolve().summary(),
+            "on for go (off for typescript, rust, python)"
+        );
+        assert_eq!(Language::parse("Rust"), Some(Language::Rust));
+        assert_eq!(Language::parse("ruby"), None);
     }
 
     #[test]

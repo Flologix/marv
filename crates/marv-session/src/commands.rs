@@ -14,8 +14,8 @@ use marv_mcp::manager::{McpServerStatus, McpState};
 
 use crate::agents::{AgentType, SUBAGENT_TOOLS};
 use crate::checks::{CHECKS_DIR, ProjectCheck, ProjectCheckResult};
-use crate::config::{Config, KeySource, mask_key, preset};
-use crate::session::CheckpointProblem;
+use crate::config::{Config, KeySource, Language, mask_key, preset};
+use crate::session::{CheckpointProblem, DiagnosticsInfo};
 use crate::skills::{LoadedSkill, SkillSource};
 use crate::usage::{Totals, usage_report};
 
@@ -50,9 +50,13 @@ pub enum CommandAction {
     Trajectories {
         on: bool,
     },
+    /// `/diagnostics on|off` (`language` `None`: every language) or `/diagnostics <language> on|off` (#187).
     Diagnostics {
+        language: Option<Language>,
         on: bool,
     },
+    /// `/diagnostics clear` (#187): delete this project's check cache folder.
+    ClearCheckCache,
     Checks {
         on: bool,
     },
@@ -190,6 +194,8 @@ pub struct CommandContext<'a> {
     pub mesh: Option<&'a MeshStatus>,
     /// The session's grants for `/permissions` (#82); None: the client has none to show.
     pub permissions: Option<&'a crate::permissions::Permissions>,
+    /// The diagnostics checkers' states and this project's check cache, for `/diagnostics` (#187).
+    pub diagnostics: Option<&'a DiagnosticsInfo>,
 }
 
 pub struct Command {
@@ -545,12 +551,8 @@ pub fn commands() -> &'static [Command] {
         Command {
             name: "diagnostics",
             while_busy: true,
-            description: "Typecheck after the model's edits (/diagnostics on, /diagnostics off)",
-            run: |args, ctx| match on_off(args, "Usage: /diagnostics, /diagnostics on, or /diagnostics off") {
-                Ok(Some(on)) => CommandAction::Diagnostics { on },
-                Ok(None) => print(format!("Diagnostics: {}", diagnostics_status(ctx.config))),
-                Err(e) => e,
-            },
+            description: "Typecheck after the model's edits (/diagnostics on, /diagnostics off, /diagnostics rust off, /diagnostics clear)",
+            run: |args, ctx| diagnostics_command(args, ctx),
         },
         Command {
             name: "steps",
@@ -626,7 +628,7 @@ pub fn settings() -> &'static [Setting] {
         Setting { name: "Yolo", command: "yolo", edit: Toggle(|c| c.yolo) },
         Setting { name: "Sandbox", command: "sandbox", edit: Toggle(|c| c.sandbox) },
         Setting { name: "Thinking", command: "think", edit: Toggle(|c| c.thinking) },
-        Setting { name: "Diagnostics", command: "diagnostics", edit: Toggle(|c| c.diagnostics) },
+        Setting { name: "Diagnostics", command: "diagnostics", edit: Toggle(|c| c.diagnostics.any()) },
         Setting { name: "Checks", command: "checks", edit: Toggle(|c| c.checks) },
         Setting { name: "Checkpoints", command: "checkpoints", edit: Toggle(|c| c.checkpoints) },
         Setting { name: "Trajectories", command: "trajectories", edit: Toggle(|c| c.trajectories) },
@@ -737,7 +739,7 @@ fn config_text(ctx: &CommandContext) -> String {
         format!("Sandbox:   {}", sandbox_status(c, ctx.sandbox_available, &[])),
         format!("Yolo:      {} (/yolo)", if c.yolo { "on" } else { "off" }),
         format!("Trajectories: {} (/trajectories)", if c.trajectories { "on" } else { "off" }),
-        format!("Diagnostics: {} (/diagnostics)", if c.diagnostics { "on" } else { "off" }),
+        format!("Diagnostics: {} (/diagnostics)", c.diagnostics.summary()),
         format!("Checks:    {} (/checks)", if c.checks { "on" } else { "off" }),
         format!("Checkpoints: {} (/checkpoints, /undo)", if c.checkpoints { "on" } else { "off" }),
         format!("Steps: {}", steps_status(c)),
@@ -766,11 +768,64 @@ pub fn compact_status(config: &Config) -> String {
 }
 
 pub fn diagnostics_status(config: &Config) -> String {
-    if config.diagnostics {
-        "on: after the model changes files in a TypeScript project, Marv runs the project's typecheck (in the sandbox, read-only) and tells the model about new errors".into()
-    } else {
-        "off".into()
+    let d = config.diagnostics;
+    if !d.any() {
+        return "off".into();
     }
+    let what = if d.get(Language::TypeScript) {
+        "on: after the model changes files in a TypeScript project, Marv runs the project's typecheck (in the sandbox, read-only) and tells the model about new errors"
+    } else {
+        "on, but not for TypeScript: Marv won't run the project's typecheck after the model's edits"
+    };
+    if d.summary() == "on" { what.into() } else { format!("{what} ({})", d.summary()) }
+}
+
+const DIAGNOSTICS_USAGE: &str =
+    "Usage: /diagnostics, /diagnostics on|off, /diagnostics <typescript|rust|python|go> on|off, or /diagnostics clear";
+
+/// `/diagnostics` (#187): the status (the setting, each checker's state, this project's cache), `on|off` for every
+/// language or one, and `clear`.
+fn diagnostics_command(args: &str, ctx: &CommandContext) -> CommandAction {
+    let words: Vec<String> = args.split_whitespace().map(str::to_lowercase).collect();
+    let words: Vec<&str> = words.iter().map(String::as_str).collect();
+    let on = |w: &str| match w {
+        "on" => Some(true),
+        "off" => Some(false),
+        _ => None,
+    };
+    match words.as_slice() {
+        [] => print(diagnostics_text(ctx.config, ctx.diagnostics)),
+        ["clear"] => CommandAction::ClearCheckCache,
+        [w] if on(w).is_some() => CommandAction::Diagnostics { language: None, on: on(w).unwrap_or(true) },
+        [l, w] if Language::parse(l).is_some() && on(w).is_some() => {
+            CommandAction::Diagnostics { language: Language::parse(l), on: on(w).unwrap_or(true) }
+        }
+        _ => error(DIAGNOSTICS_USAGE),
+    }
+}
+
+/// What `/diagnostics` shows.
+pub fn diagnostics_text(config: &Config, info: Option<&DiagnosticsInfo>) -> String {
+    let mut lines = vec![format!("Diagnostics: {}", diagnostics_status(config))];
+    for language in Language::ALL {
+        let on = config.diagnostics.get(language);
+        let checker = info.and_then(|i| i.checkers.iter().find(|c| c.language == language));
+        let state = match (on, checker) {
+            (false, _) => "off".to_string(),
+            (true, Some(c)) => format!("on ({}: {})", c.label, c.state),
+            (true, None) if language == Language::TypeScript => "on (tsc)".to_string(),
+            (true, None) => "on (no checker for it in this version yet)".to_string(),
+        };
+        lines.push(format!("- {}: {state}", language.name()));
+    }
+    if let Some((dir, size)) = info.and_then(|i| i.cache.as_ref()) {
+        let size = size.map_or("not measured yet".to_string(), crate::diagnostics::cache::human_size);
+        lines.push(format!(
+            "Check cache for this project: {} ({size}; /diagnostics clear deletes it)",
+            printable(&dir.display().to_string())
+        ));
+    }
+    lines.join("\n")
 }
 
 /// `/radio` with the radio off (#124).
@@ -887,6 +942,10 @@ fn last_checks_text(last: Option<&ProjectCheckResult>) -> String {
         None => "none yet this session (checks run after a step that changed a file they concern).".into(),
         Some(CheckOutcome::Off { reason: OffReason::NoSandbox }) => "off: they run only in the sandbox.".into(),
         Some(CheckOutcome::Off { reason: OffReason::Timeouts }) => "off: they timed out twice this session.".into(),
+        Some(CheckOutcome::Off { reason: OffReason::Unreadable }) => {
+            "off: their output couldn't be read twice in a row this session.".into()
+        }
+        Some(CheckOutcome::Off { reason: OffReason::CacheTooBig }) => "off: their cache passed its size limit.".into(),
         Some(CheckOutcome::Failed { reason: FailReason::MissingInterpreter, tool, .. }) => {
             format!("failed: {} isn't in the sandbox.", tool.as_deref().unwrap_or("bun"))
         }
@@ -1184,8 +1243,51 @@ mod tests {
             processes: None,
             mesh: None,
             permissions: None,
+            diagnostics: None,
         };
         f(&ctx)
+    }
+
+    /// #187: `/diagnostics` per language, `clear`, and the status with each checker's state and the cache.
+    #[test]
+    fn diagnostics_takes_a_language_and_clear_and_shows_each_checker() {
+        use crate::session::{CheckerInfo, DiagnosticsInfo};
+        with(|ctx| {
+            assert_eq!(run_command("/diagnostics off", ctx), CommandAction::Diagnostics { language: None, on: false });
+            assert_eq!(
+                run_command("/diagnostics rust off", ctx),
+                CommandAction::Diagnostics { language: Some(Language::Rust), on: false }
+            );
+            assert_eq!(
+                run_command("/diagnostics Go ON", ctx),
+                CommandAction::Diagnostics { language: Some(Language::Go), on: true }
+            );
+            assert_eq!(run_command("/diagnostics clear", ctx), CommandAction::ClearCheckCache);
+            for bad in ["/diagnostics ruby off", "/diagnostics rust", "/diagnostics on off", "/diagnostics clear all"] {
+                assert!(matches!(run_command(bad, ctx), CommandAction::Print { is_error: true, .. }), "{bad}");
+            }
+            let CommandAction::Print { text, .. } = run_command("/diagnostics", ctx) else { panic!() };
+            assert!(text.starts_with("Diagnostics: on: after the model changes files in a TypeScript project"), "{text}");
+            assert!(
+                text.contains("\n- typescript: on (tsc)\n")
+                    && text.contains("\n- rust: on (no checker for it in this version yet)"),
+                "{text}"
+            );
+            let info = DiagnosticsInfo {
+                checkers: vec![CheckerInfo {
+                    language: Language::TypeScript,
+                    label: "tsc",
+                    state: "off for this session: it timed out twice".into(),
+                }],
+                cache: Some(("/home/me/.cache/marv/checks/repo-abc".into(), Some(3 * 1024 * 1024 * 1024))),
+            };
+            let mut config = ctx.config.clone();
+            config.diagnostics = config.diagnostics.with(Language::Go, false);
+            let text = diagnostics_text(&config, Some(&info));
+            assert!(text.contains("- typescript: on (tsc: off for this session: it timed out twice)"), "{text}");
+            assert!(text.contains("- go: off") && text.contains("(off for go)"), "{text}");
+            assert!(text.contains("/home/me/.cache/marv/checks/repo-abc (3.0 GB;"), "{text}");
+        });
     }
 
     // #82: /permissions only shows; without the session's grants it says so, with them it renders them as markdown.
@@ -1323,7 +1425,7 @@ mod tests {
                     "yolo" => c.yolo = on,
                     "sandbox" => c.sandbox = on,
                     "think" => c.thinking = on,
-                    "diagnostics" => c.diagnostics = on,
+                    "diagnostics" => c.diagnostics = on.into(),
                     "checks" => c.checks = on,
                     "checkpoints" => c.checkpoints = on,
                     "trajectories" => c.trajectories = on,
@@ -1336,7 +1438,7 @@ mod tests {
                     CommandAction::Yolo { on }
                     | CommandAction::Sandbox { on }
                     | CommandAction::Thinking { on }
-                    | CommandAction::Diagnostics { on }
+                    | CommandAction::Diagnostics { on, language: None }
                     | CommandAction::Checks { on }
                     | CommandAction::Checkpoints { on }
                     | CommandAction::Trajectories { on } => on,

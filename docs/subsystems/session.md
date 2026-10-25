@@ -31,6 +31,7 @@ Spec: the **Config**, **Session**, **SDK**, **Skills**, **Memory**, **Subagents*
 | `src/checks/runner.ts` | `checks/runner.rs` | **Ported and tested** (#13): `run_checks` and `main`, run by the hidden `marv __run-checks <spec>` (see the notes). A sandboxed run: `crates/marv-cli/tests/run_checks.rs` |
 | `src/diagnostics/tsc.ts` | `diagnostics/tsc.rs` | **Ported and tested** (`parse_tsc`, `new_errors` via `new_problems`, `format_error`, `missing_interpreter`, `diagnostics_note` (fenced), `detect_checker`, `check_command`; all of `diagnostics-tsc.test.ts`) |
 | `src/diagnostics/turn.ts` | `diagnostics/turn.rs` | **Ported and tested** (#13): `CheckOutcome`, `CheckKind`, `Typecheck`, `new_problems`, `changed_files`, `TurnChecks`, `Checker::turn`/`reset`, the sandboxed runner (`sandboxed`, `sandboxed_options`), `combine_checks`, `check_notice`; all of `diagnostics-turn.test.ts`. The `diagnostics-e2e.test.ts` path (real tsc in the sandbox) is the oracle's `ts-new-type-error` |
+| — (new, #187) | `diagnostics/turn.rs`, `diagnostics/cache.rs`, `diagnostics/machinery_tests.rs` | **New in marv-rs** (`docs/specs/2026-10-25-lsp-checker.md`, PR 1): `TsError` is now `Diagnostic`; `CheckKind` gains `label`/`source`/`timeout`/`cache`/`warm_up`/`max_unreadable` (tsc keeps the defaults); the warm-up at the session's first change, `Pending`, the per-key `flock`, `MAX_UNREADABLE`; the check cache (`repo_key` from `.git`/`commondir` without git, `key_dir` refusing symlinked or foreign folders, the mount of exactly `<root>/<key>`, total/per-key caps, LRU, the free-space guard, age and orphan pruning, `clear`); `notice(label, result)`; the `diagnostics` setting per language (`config::Diagnostics`) and `/diagnostics <language> on\|off`, `/diagnostics clear`. No new language yet |
 | `src/feedback.ts` | `feedback.rs` | **Ported and tested** (`classify_reply`; the lookarounds are emulated) |
 | `src/file-lock.ts`, `src/private-file.ts` | — | Moved to marv-fs (`docs/subsystems/fs.md`): marv-mcp needs them too |
 | `src/paths.ts` | `paths.rs` | **Ported and tested** (`project_key`, `legacy_project_key`, `shorten_home`, `home_or_above`) |
@@ -80,14 +81,14 @@ pub enum SessionEvent {
     Subagent { call_id: String, event: LoopEvent },
     SubagentProgress { call_id: String, progress: marv_tools::AgentProgress },
     Compaction(CompactResult),                           // Compacted { summary, tokens_before } | NotCompacted { reason, error }
-    Check(CheckResult),                                  // the typecheck: CheckOutcome<TsError>
+    Check { label, result },                             // a diagnostics checker (tsc): CheckOutcome<Diagnostic>
     Checks(ProjectCheckResult),                          // project checks: CheckOutcome<Violation>
     Tainted { source: Provenance },                      // marv-rs: show it in the status bar
     NotSent { texts: Vec<String> },                      // "send now" messages the turn never read; just before TurnEnd
     TurnEnd { turn: String, reason: TurnEndReason },     // always last; Done(StopReason) | Interrupted
 }
 // ToolRun::approval is an ApprovalRecord; ToolRun::display downcasts to marv_session::ToolDisplay { diff: Option<DiffShown> }.
-// Notices: diagnostics::check_notice(&CheckResult), checks::project_check_notice(&ProjectCheckResult) (both printable).
+// Notices: diagnostics::notice(label, &CheckResult), checks::project_check_notice(&ProjectCheckResult) (both printable).
 
 // Between turns
 session.compact(Option<&str>).await -> Result<CompactResult, SessionError>

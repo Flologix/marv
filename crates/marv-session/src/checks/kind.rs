@@ -140,11 +140,22 @@ pub fn checks_note(added: &[Violation]) -> String {
 pub struct ProjectChecksKind;
 
 impl crate::diagnostics::turn::CheckKind<Violation> for ProjectChecksKind {
+    fn label(&self) -> &'static str {
+        "checks"
+    }
+    fn source(&self) -> Option<&'static str> {
+        Some("checks")
+    }
     fn prepare(&self, root: &Path) -> bool {
         !load_checks(root).0.is_empty()
     }
     /// The checks a step's changes concern (all of them for the baseline); `covers` is theirs, by name.
-    fn pass(&self, root: &Path, changed: Option<&[String]>) -> Option<crate::diagnostics::turn::CheckPass<Violation>> {
+    fn pass(
+        &self,
+        root: &Path,
+        _cache: Option<&Path>,
+        changed: Option<&[String]>,
+    ) -> Option<crate::diagnostics::turn::CheckPass<Violation>> {
         let (checks, _) = load_checks(root);
         let run: Vec<ProjectCheck> = match changed {
             None => checks,
@@ -187,6 +198,11 @@ pub fn project_check_notice(result: &ProjectCheckResult) -> Option<String> {
         CheckOutcome::Off { reason: OffReason::Timeouts } => {
             Some("✻ The project's checks timed out twice, so Marv stopped running them for this session.".into())
         }
+        CheckOutcome::Off { reason: OffReason::Unreadable } => Some(
+            "✻ Marv couldn't read the project checks' output twice in a row, so it stopped running them for this session.".into(),
+        ),
+        // The project checks keep no cache.
+        CheckOutcome::Off { reason: OffReason::CacheTooBig } => None,
         CheckOutcome::Failed { notify: false, .. } => None,
         CheckOutcome::Failed { reason: FailReason::MissingInterpreter, tool, .. } => Some(format!(
             "✻ The project's checks need {}, which the sandbox can't see, so Marv can't run them.",

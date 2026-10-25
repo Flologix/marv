@@ -71,6 +71,14 @@ pub fn to_json(event: &SessionEvent) -> Option<Value> {
         })),
         // "Send now" messages the turn never read: the page puts them back in the composer.
         SessionEvent::NotSent { texts } => Some(json!({"type": "not_sent", "texts": texts})),
+        // #187: a checker's result in the TUI's words ("✻ tsc: …", "✻ cargo check: 2 new errors, told the model:"), as
+        // a notice; nothing for a clean check or a failure already told.
+        SessionEvent::Check { label, result } => {
+            marv_session::diagnostics::notice(label, result).map(|text| json!({"type": "notice", "text": text}))
+        }
+        SessionEvent::Checks(result) => {
+            marv_session::checks::project_check_notice(result).map(|text| json!({"type": "notice", "text": text}))
+        }
         SessionEvent::Notice { text } => Some(json!({"type": "notice", "text": text})),
         SessionEvent::TurnEnd { reason, .. } => Some(json!({"type": "turn_end", "reason": reason.as_str()})),
         _ => None,
@@ -135,6 +143,28 @@ mod tests {
         assert_eq!(shown["id"], "c1");
         assert!(shown["line"].as_str().unwrap().starts_with("waiting for beta to accept the wire"));
         assert!(!shown["line"].as_str().unwrap().contains('\u{1b}'));
+    }
+
+    /// #187: a checker's result reaches the page as the TUI's notice; a clean check says nothing.
+    #[test]
+    fn a_checkers_result_is_a_notice() {
+        use marv_session::diagnostics::{CheckOutcome, Diagnostic};
+        let error = Diagnostic {
+            file: Some("src/a.ts".into()),
+            line: Some(1),
+            column: Some(2),
+            code: "TS2304".into(),
+            message: "Cannot find name 'x'.\u{1b}[2J".into(),
+        };
+        let event =
+            SessionEvent::Check { label: "tsc", result: CheckOutcome::Done { ms: 3, before: 0, errors: 1, added: vec![error] } };
+        let shown = to_json(&event).unwrap();
+        assert_eq!(shown["type"], "notice");
+        let text = shown["text"].as_str().unwrap();
+        assert!(text.starts_with("✻ Typecheck: 1 new error, told the model:") && !text.contains('\u{1b}'), "{text}");
+        let clean =
+            SessionEvent::Check { label: "tsc", result: CheckOutcome::Done { ms: 3, before: 0, errors: 0, added: vec![] } };
+        assert_eq!(to_json(&clean), None);
     }
 
     // #203: a warning in the TUI's words, with git's text cut to its first line and bounded.
