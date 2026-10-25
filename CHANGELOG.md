@@ -16,10 +16,11 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ### Changed
 
-- **Send-now text a turn never read is queued, not put back in the prompt.** If the turn ends before its next step, your Alt+Enter message joins the queue: it goes next after a turn that finished, and waits for you after a stop.
+- **Send-now text a turn never read is queued, not put back in the prompt (#184).** If the turn ends before its next step, your Alt+Enter message joins the queue: it goes next after a turn that finished, and waits for you after a stop.
 
 ### Fixed
 
+- **Desktop: links in a reply open in your browser, never inside Marv's window (#229).** Before, clicking a link opened the page in the app's own window, which has no back button, so the only way back was to restart the app.
 - **A radio request's ack could be lost (#213).** When the other Marv acked very quickly, the ack could arrive before the request was recorded as open on the sending side, and was refused there as an ack for no open request: the model never read it (the `done` that followed still arrived). The same applied to a quick refusal, which then didn't close the request with a `failed`. A request is now open before its frame is sent.
 - **A stop or a timeout right after a sandboxed command starts now ends it (Linux, #182).** A stop (Esc, a process's stop) or a timeout that reached bubblewrap within the first few milliseconds, while it was still setting the sandbox up, ended bubblewrap but not the command, which ran on (still sandboxed) until it finished by itself. Marv now pauses bubblewrap, ends the sandbox's first process (which takes everything in the sandbox with it), then ends bubblewrap, so a stop at any moment after the start ends the command, for bash commands, checks and background processes alike.
 - **A stopped or timed-out command no longer leaves behind a process it was starting (#228).** When a command (a bash call, a session-start hook) is killed, Marv kills its process group once more as the command exits, before reaping it. On macOS a child still being forked when the first kill landed could miss it and go on running.
