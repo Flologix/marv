@@ -112,10 +112,7 @@ pub fn queue_rows(queued: &[String], width: u16) -> Vec<Line<'static>> {
         .map(|text| {
             let first = printable(text.trim().lines().next().unwrap_or(""));
             let more = if text.trim().lines().nth(1).is_some() { " …" } else { "" };
-            truncate_end(
-                Line::from(vec![Span::styled("  queued › ", dim), Span::raw(format!("{first}{more}"))]),
-                width,
-            )
+            truncate_end(Line::from(vec![Span::styled("  queued › ", dim), Span::raw(format!("{first}{more}"))]), width)
         })
         .collect();
     if queued.len() > QUEUE_SHOWN {

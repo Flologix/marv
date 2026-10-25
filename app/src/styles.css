@@ -1033,6 +1033,41 @@ details > summary::-webkit-details-marker {
   color: var(--tx-3);
 }
 
+/* #184: messages queued for after the running turn, above the composer. */
+.queued {
+  list-style: none;
+  margin: 0 auto 6px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.queued li {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 4px 8px;
+  border-radius: var(--r);
+  background: var(--bg-2);
+  font-size: 13px;
+  color: var(--tx-2);
+}
+
+.queued .label {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--tx-3);
+}
+
+.queued .text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .hint {
   max-width: 780px;
   margin: 6px auto 0;

@@ -12,6 +12,11 @@ Type `/` in the prompt for the menu (↑/↓, then Tab or Enter):
 
 The terminal UI's other commands (`/undo`, `/mcp`, `/resume`…) aren't in the desktop yet.
 
+## While Marv works
+
+- **Enter queues your message** for after the turn: it's listed above the composer (edit puts it back to change, × drops it; ↑ in an empty composer edits the newest) and sent as the next turn once this one finishes. After Stop the queue is kept: Enter in an empty composer sends the next, or they follow your next message. The queue is the page's (`src/lib/queue.ts`); no protocol message is needed.
+- **Send now** (the button, or alt+enter) puts it in at Marv's next step instead.
+
 ## How it fits together
 
 ```

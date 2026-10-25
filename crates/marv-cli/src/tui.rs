@@ -1506,11 +1506,7 @@ impl Bridge {
     fn unqueue(&self, newest: bool) -> Option<String> {
         let (text, listed) = {
             let mut gate = self.gate.lock().unwrap_or_else(|e| e.into_inner());
-            let at = if newest {
-                gate.queued.iter().rposition(|q| !q.shown)
-            } else {
-                gate.queued.iter().position(|q| !q.shown)
-            }?;
+            let at = if newest { gate.queued.iter().rposition(|q| !q.shown) } else { gate.queued.iter().position(|q| !q.shown) }?;
             let text = gate.queued.remove(at).map(|q| q.text)?;
             if gate.listed().is_empty() {
                 gate.held = false;

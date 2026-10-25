@@ -86,9 +86,29 @@ export function ChatView({
 
   function submit() {
     const text = input.trim();
-    if (!text || chat.busy) return;
+    // Idle with a queue a stop kept (#184): Enter on the empty composer sends the oldest.
+    if (!text) {
+      if (!chat.busy && chat.queued.length > 0) chat.sendQueued();
+      return;
+    }
+    if (chat.busy) {
+      // While a turn runs a message is queued for after it; a /command waits in the composer for the turn.
+      if (text.startsWith("/") || chat.status !== "ready") return;
+      chat.enqueue(text);
+      setInput("");
+      return;
+    }
     onSend(text);
     setInput("");
+  }
+
+  /** Takes queued message `i` back into the composer to change it (Enter queues it again). */
+  function editQueued(i?: number) {
+    const text = chat.unqueue(i);
+    if (text !== undefined) {
+      setInput(text);
+      promptRef.current?.focus();
+    }
   }
 
   /** "Send now": while a turn runs, the message goes in at its next step. A /command waits for the turn. */
@@ -97,13 +117,6 @@ export function ChatView({
     if (!canSendNow) return;
     if (chat.sendNow(input.trim())) setInput("");
   }
-
-  // What the turn never read comes back here, ahead of anything typed since.
-  const { onReturn } = chat;
-  useEffect(() => {
-    onReturn((text) => setInput((typed) => (typed.trim() ? `${text}\n${typed}` : text)));
-    return () => onReturn(null);
-  }, [onReturn]);
 
   return (
     <div className="main">
@@ -138,6 +151,22 @@ export function ChatView({
 
       <footer className="dock">
         <div className="composer-wrap">
+        {chat.queued.length > 0 && (
+          <ul className="queued" aria-label="Queued messages">
+            {chat.queued.map((text, i) => (
+              <li key={i}>
+                <span className="label">queued</span>
+                <span className="text">{text}</span>
+                <button type="button" className="link" title="Back into the composer to change it" onClick={() => editQueued(i)}>
+                  edit
+                </button>
+                <button type="button" className="link" title="Drop it" onClick={() => chat.unqueue(i)}>
+                  ×
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
         {matches.length > 0 && (
           <div className="slash" role="listbox">
             {matches.map((c, i) => (
@@ -194,6 +223,12 @@ export function ChatView({
                   return;
                 }
               }
+              // ↑ on the empty composer: the newest queued message back to edit (#184).
+              if (e.key === "ArrowUp" && input === "" && chat.queued.length > 0) {
+                e.preventDefault();
+                editQueued();
+                return;
+              }
               if (e.key === "Enter" && e.altKey && chat.busy) {
                 e.preventDefault();
                 sendNow();
@@ -231,7 +266,7 @@ export function ChatView({
               Stop
             </button>
           ) : (
-            <button type="submit" className="btn primary" disabled={!input.trim()}>
+            <button type="submit" className="btn primary" disabled={!input.trim() && chat.queued.length === 0}>
               Send
             </button>
           )}
@@ -240,8 +275,10 @@ export function ChatView({
         <div className="hint">
           <span>
             {chat.busy
-              ? `alt+enter or Send now: in at Marv's next step${chat.sending ? ` · ${chat.sending} waiting` : ""} · shift+enter for a new line`
-              : "enter to send · shift+enter for a new line · / for commands and skills"}
+              ? `enter queues for after this turn · alt+enter or Send now: in at Marv's next step${chat.sending ? ` · ${chat.sending} waiting` : ""}${chat.queued.length ? " · ↑ edits the last queued" : ""}`
+              : chat.held && chat.queued.length > 0
+                ? "stopped: your queued messages wait · enter on an empty composer sends the next · ↑ edits it"
+                : "enter to send · shift+enter for a new line · / for commands and skills"}
           </span>
           {usage?.context && usage.contextLength ? <span>context {tokens(usage.context)} / {tokens(usage.contextLength)}</span> : null}
         </div>

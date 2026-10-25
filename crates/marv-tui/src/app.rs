@@ -1764,11 +1764,8 @@ impl App {
             self.prompt.height(width, busy, &self.commands) + status_height
         };
         // #184: the queued messages, above the prompt (only where the prompt shows).
-        let prompt_shown = self.picker.is_none()
-            && !radio_panel
-            && self.approval.is_none()
-            && self.setup.is_none()
-            && self.palette.is_none();
+        let prompt_shown =
+            self.picker.is_none() && !radio_panel && self.approval.is_none() && self.setup.is_none() && self.palette.is_none();
         let queue = if prompt_shown { prompt_input::queue_rows(&self.queued, width) } else { Vec::new() };
         let queue_height = (queue.len() as u16).min(area.height.saturating_sub(header + panel_height + 2));
         let panel_height = panel_height + queue_height;

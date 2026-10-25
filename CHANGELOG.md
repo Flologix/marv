@@ -6,6 +6,14 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+### Added
+
+- **Type while Marv works: Enter queues your message for after the turn (#184).** While a turn runs, Enter no longer ignores what you typed: the message is queued and listed above the prompt, and it starts its own turn when the running one finishes (several go one turn each, in order). ↑ on an empty prompt takes the newest queued message back to edit (Enter queues it again), and ctrl+x drops it. Esc still stops the turn, and the queue is kept: Marv says so, nothing starts on its own, and Enter on an empty prompt sends the next one (or they follow your next message). The same holds after a turn that fails or hits the step limit. Alt+Enter (or ctrl+s) still adds the message at Marv's next step instead. A message you type while a mesh message has woken Marv joins the same queue. The desktop app does the same: Enter while Marv works queues the message above the composer, each with edit and drop, and ↑ edits the newest. A `/command` typed during a turn still waits in the prompt.
+
+### Changed
+
+- **Send-now text a turn never read is queued, not put back in the prompt.** If the turn ends before its next step, your Alt+Enter message joins the queue: it goes next after a turn that finished, and waits for you after a stop.
+
 ## [0.10.0] - 2026-10-24
 
 ### Added

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { type ChatSettings, type Connection, connect } from "./backend";
+import * as Q from "./queue";
 import { type Answer, type Item, apply, restore, settle } from "./transcript";
 
 export type { Answer, ApprovalRequest, DiffLine, Item, Usage } from "./transcript";
@@ -92,8 +93,22 @@ export function useChat(id: string | null, settings: ChatSettings, reload = 0) {
   const [servers, setServers] = useState<ServerStatus[]>([]);
   /** "Send now" messages sent into the running turn and not in it yet. */
   const [sending, setSending] = useState(0);
-  /** Who takes back "send now" text the turn never read: the composer. */
-  const returnTo = useRef<((text: string) => void) | null>(null);
+  /** #184: messages queued for after the running turn (`queue.ts`); the ref is what the event handler reads. */
+  /** Kept with the chat it belongs to: another chat starts with none. */
+  const [owned, setOwned] = useState<{ id: string | null; queue: Q.Queue }>({ id, queue: Q.EMPTY });
+  const queue = owned.id === id ? owned.queue : Q.EMPTY;
+  const queueRef = useRef<{ id: string | null; queue: Q.Queue }>({ id, queue: Q.EMPTY });
+  const idRef = useRef(id);
+  /** The open chat's queue, as the handlers see it. */
+  const currentQueue = useCallback(() => (queueRef.current.id === idRef.current ? queueRef.current.queue : Q.EMPTY), []);
+  const setQueue = useCallback((q: Q.Queue) => {
+    queueRef.current = { id: idRef.current, queue: q };
+    setOwned(queueRef.current);
+  }, []);
+  /** How the last turn ended, until its usage closes it. */
+  const lastEnd = useRef<string | null>(null);
+  /** `send`, for the event handler (declared below it). */
+  const sendRef = useRef<(text: string) => void>(() => {});
   // The session's tool list is fixed when it starts: switching a server on or off reopens the chat (it continues).
   const sessionKey = `${id}|${[...settings.mcpOff].sort().join(",")}|${reload}`;
   const connection = useRef<Connection | null>(null);
@@ -109,6 +124,10 @@ export function useChat(id: string | null, settings: ChatSettings, reload = 0) {
   useEffect(() => {
     settingsRef.current = settings;
   }, [settings]);
+
+  useEffect(() => {
+    idRef.current = id;
+  }, [id]);
 
   useEffect(() => {
     if (!id) {
@@ -184,15 +203,25 @@ export function useChat(id: string | null, settings: ChatSettings, reload = 0) {
           if (e.type === "usage") setBusy(false);
           if (e.type === "sent_now") setSending((n) => Math.max(0, n - 1));
           if (e.type === "turn_end") setSending(0);
+          // "Send now" text the turn never read: first in the queue, where the turn's end decides (#184).
           if (e.type === "not_sent") {
             setSending(0);
             const texts = Array.isArray(e.texts) ? (e.texts as unknown[]).map(String) : [];
-            if (texts.length) returnTo.current?.(texts.join("\n"));
+            setQueue(Q.unread(currentQueue(), texts));
           }
           setItems((items) => {
             if (typeof e.seq === "number") applied.current = e.seq;
             return apply(items, e);
           });
+          // The turn is over once its usage came (the host sends it after turn_end, and it ends `busy`): after a turn
+          // that finished the oldest queued message goes next; after a stop they wait.
+          if (e.type === "turn_end") lastEnd.current = String(e.reason);
+          if (e.type === "usage" && lastEnd.current !== null) {
+            const { next, queue } = Q.afterTurn(currentQueue(), lastEnd.current);
+            lastEnd.current = null;
+            setQueue(queue);
+            if (next !== undefined) sendRef.current(next);
+          }
         }
       })
         .then((c) => {
@@ -238,12 +267,14 @@ export function useChat(id: string | null, settings: ChatSettings, reload = 0) {
   }, [id, items]);
 
   const send = useCallback((text: string) => {
+    // The person sent: a queue a stop held follows this turn.
+    setQueue(Q.release(currentQueue()));
     setItems((items) => [...items, { kind: "user", text }]);
     // A /command only turns busy if it starts a turn (a skill): turn_start says so.
     if (!text.startsWith("/")) setBusy(true);
     if (ready.current && connection.current) connection.current.send(message(text));
     else pending.current.push(message(text));
-  }, []);
+  }, [currentQueue, setQueue]);
 
   /** A new chat's first message: call just before switching to `chatId`; it's sent once the session is ready. */
   const startWith = useCallback((chatId: string, text: string) => {
@@ -260,13 +291,50 @@ export function useChat(id: string | null, settings: ChatSettings, reload = 0) {
     setSending((n) => n + 1);
     return true;
   }, []);
-  /** The composer: where "send now" text the turn never read goes back. */
-  const onReturn = useCallback((take: ((text: string) => void) | null) => {
-    returnTo.current = take;
-  }, []);
+  useEffect(() => {
+    sendRef.current = send;
+  }, [send]);
+
+  /** Enter while a turn runs (#184): queued, sent when the turn finishes. */
+  const enqueue = useCallback((text: string) => setQueue(Q.push(currentQueue(), text)), [currentQueue, setQueue]);
+  /** Takes queued message `i` out (to edit or drop it); the newest when `i` is left out. */
+  const unqueue = useCallback(
+    (i?: number): string | undefined => {
+      const { text, queue } = Q.take(currentQueue(), i ?? currentQueue().texts.length - 1);
+      setQueue(queue);
+      return text;
+    },
+    [currentQueue, setQueue],
+  );
+  /** Idle, with a queue a stop held: sends the oldest now. */
+  const sendQueued = useCallback(() => {
+    const { text, queue } = Q.take(currentQueue(), 0);
+    setQueue(queue);
+    if (text !== undefined) send(text);
+  }, [currentQueue, send, setQueue]);
 
   const interrupt = useCallback(() => connection.current?.send({ type: "interrupt" }), []);
   const answer = useCallback((rid: number, decision: Answer) => connection.current?.send({ type: "approval", id: rid, decision }), []);
 
-  return { items, status, busy, error, commands, meshName, servers, mcp, send, sendNow, sending, onReturn, startWith, interrupt, answer };
+  return {
+    items,
+    status,
+    busy,
+    error,
+    commands,
+    meshName,
+    servers,
+    mcp,
+    send,
+    sendNow,
+    sending,
+    queued: queue.texts,
+    held: queue.held,
+    enqueue,
+    unqueue,
+    sendQueued,
+    startWith,
+    interrupt,
+    answer,
+  };
 }
