@@ -1,7 +1,7 @@
 # macOS: background processes without Linux namespaces
 
 - Issue: FlologixAI/marv #152 (part of the macOS port, #150; follows #166, the Seatbelt backend)
-- Status: **approved 2026-10-25** (the maintainer: "approve both specs"), with every decision in §10 as recommended. Option A ships only if the blocking probes pass.
+- Status: **option A blocked by the 2026-10-25 probes (PR #242); the door stays off on macOS (option C).** The spec was approved on 2026-10-25 (the maintainer: "approve both specs"), with every decision in §10 as recommended and A conditional on probe 1. Probe 1 failed on every runner (§12).
 - Date: 2026-10-25, against `main` at `3a31512` (after 0.10.0).
 - Builds on: `docs/specs/2026-10-17-macos-sandbox.md` (approved 2026-10-19). Its §8 and decision 4 already chose "off until #152, then option A". This spec works A out in detail, checks B again, and lists what must be proven on the macOS runner before A ships.
 - Scope:
@@ -291,3 +291,47 @@ Each item is a probe in `crates/marv-sandbox` tests (macOS only), the way #166's
    - the CHANGELOG.
 
 The issue closes with PR 2.
+
+## 12. Probe results (2026-10-25, PR #242)
+
+The probes ran on `macos-14` (14.8.9, arm64), `macos-15` (15.7.9, arm64) and `macos-15-intel` (15.7.9, x86_64). All three gave the same results. **Probe 1 failed, so A doesn't ship (decision 1), and the door stays off on macOS (option C).**
+
+The probes now live in `crates/marv-sandbox/tests/seatbelt_probe.rs` as `loopback_probe_report`. The macOS CI job runs it for the record, and it never fails on Seatbelt's behaviour. The rules it measures exist only in that test. No command's profile has them.
+
+**Probe 1, binds.** Each bind ran under the closed profile plus `(allow network-bind (local ip "localhost:*"))` and `(allow network-inbound (local ip "localhost:*"))`:
+
+| Bind | Outside the sandbox | Under the rules | Needed for A |
+|---|---|---|---|
+| `127.0.0.1:0`, `[::1]:0` | ok | ok | bind |
+| `0.0.0.0:0` | ok | **ok** | refuse |
+| `[::]:0` (dual-stack, and `IPV6_V6ONLY`) | ok | **ok** | refuse |
+| `127.0.0.2:0` (lo0 alias) | ok | **ok** | refuse |
+| the runner's `en0` IPv4 (LAN) | ok | **ok** | refuse |
+| `[::ffff:0.0.0.0]:0`, `[::ffff:127.0.0.1]:0` | ok | EPERM | refuse / either |
+
+Node's `listen(port)` with no host binds `::` and succeeds. A server under these rules would therefore be reachable from the LAN.
+
+**Probe 2, SBPL's `localhost` covers every address of the machine.** A bash profile with `(remote ip "localhost:<p>")` reaches `<p>` on all of these:
+- `127.0.0.1` and `::1`;
+- `127.0.0.2`;
+- the runner's `en0` address.
+
+Another port is refused (EPERM). So `localhost` in a Seatbelt `ip` filter means "this host", not loopback, in both the `local` and the `remote` forms. A per-port outbound rule for bash would also reach a host program on that port at any of the machine's addresses.
+
+**Probe 3:** outside the sandbox, `127.0.0.1:80`, `[::1]:80` and `127.0.0.1:1023` fail with `EACCES` on macOS 14 and 15, while `0.0.0.0:80` binds.
+
+**Probe 4, low-port denies.** The 1023 `deny network-bind` rules work: ports 1, 80 and 1023 are refused on both families, and 1024 binds. The profile grows from about 5 KB to 53 KB. `sandbox-exec … /usr/bin/true` start time, median of 50 runs:
+
+| Runner | Without the denies | With the denies |
+|---|---|---|
+| macos-14 | 9.7 ms | 35.8 ms |
+| macos-15 | 14.4 ms | 44.2 ms |
+| macos-15-intel | 33.6 ms | 91.9 ms |
+
+**The other probes:**
+- **Probe 5:** Marv sees a sandboxed server's listening socket with `lsof -g`/`lsof -p`. From inside, `lsof -p <marv>` is refused Marv's cwd but still lists its binary path.
+- **Probe 6:** the host reaches the server, and the server can't connect to its own port (EPERM).
+- **Probe 7:** not applicable, since there are no socket folders.
+- **Probe 8:** `localhost` by name resolves and works in both sandboxes: Python and Node binding by name, and Node `fetch`, Python `urllib` and curl connecting by name.
+
+**What shipped from PR 1:** the macOS `# Sandbox limits` text (decision 7) and the probe report. Nothing else: no `listen_localhost`, no `loopback_ports`, no rule that lets a sandboxed command bind or reach loopback. A later attempt needs a way to limit a bind to loopback that Seatbelt can enforce. An SBPL filter on the literal address doesn't exist in the forms probed here. #152 stays open, blocked by Seatbelt.
