@@ -29,8 +29,9 @@
 //!    written and where it leads (G11, G12), the protected names at any depth as regexes, which also stop a command
 //!    *creating* `.envrc` or `pkg/AGENTS.md` (G13), and unlinking an ancestor of a protected path (a rename of the
 //!    parent can't carry the protected entry away); and no hard link to anything denied (bwrap's `EXDEV`);
-//! 8. **network** (G18): nothing without it but the forwarded process ports on `localhost` and the mesh plug; with
-//!    it, IP, DNS and the TLS-trust services. Unix sockets stay closed either way, except the plug and sockets in the
+//! 8. **network** (G18): nothing without it but the mesh plug, not even loopback (SBPL's `localhost` matches every
+//!    address of the machine, so no `localhost:<port>` rule may open a port of it); with it, IP, DNS and the
+//!    TLS-trust services. Unix sockets stay closed either way, except the plug and sockets in the
 //!    private `TMPDIR`;
 //! 9. **last**: no XPC service by any name, and two `fcntl`s that change a file through a read-only descriptor.
 //!
@@ -169,8 +170,6 @@ pub struct Invocation {
     /// Marv's own binary, which `sandbox-exec` runs as `marv __guard` around the command: readable and executable
     /// even under the closed home.
     pub exe: Option<PathBuf>,
-    /// The ports of the user's background processes a command without network may still reach, on `localhost`.
-    pub ports: Vec<u16>,
 }
 
 /// An SBPL profile and the parameters its `(param "KEY")`s read.
@@ -584,13 +583,10 @@ fn build_profile(plan: &Plan, run: &Invocation, fs: &dyn FsProbe, allow_links: b
         let services: Vec<String> = NETWORK_MACH_SERVICES.iter().map(|s| format!("(global-name {})", quoted(s))).collect();
         b.line(&format!("(allow mach-lookup {})", services.join(" ")));
         b.line(&format!("(allow sysctl-read (sysctl-name-prefix {}))", quoted(NETWORK_SYSCTL_PREFIX)));
-    } else {
-        // The host's loopback is the user's (databases, dev servers, a local proxy): closed, but for the forwarded
-        // ports of the user's own background processes.
-        for port in &run.ports {
-            b.line(&format!("(allow network-outbound (remote ip \"localhost:{port}\"))"));
-        }
     }
+    // Without network, no IP rule at all: the host's loopback is the user's (databases, dev servers, a local proxy).
+    // There is no per-port opening either. `(remote ip "localhost:<port>")` reaches that port on every address of the
+    // machine, its LAN address included, not just on loopback (#242's probe 2, macOS 14 and 15).
     // Unix sockets: the private TMPDIR is the command's own; nothing else on the machine is reachable.
     let p = b.param("TMP".into(), &tmp);
     b.line(&format!("(allow network-bind (local unix-socket (subpath {p})))"));
@@ -733,7 +729,6 @@ mod tests {
             tmp: "/var/folders/ab/xyz/T/marv-1".into(),
             user_temp: Some("/var/folders/ab/xyz".into()),
             exe: Some("/Users/me/.local/bin/marv".into()),
-            ports: vec![],
         }
     }
     fn build(plan: &Plan, fs: &Fake) -> Profile {
@@ -1117,32 +1112,24 @@ mod tests {
     }
 
     #[test]
-    fn network_off_closes_ip_and_loopback_but_for_forwarded_ports() {
+    fn network_off_closes_ip_and_loopback_without_a_port_rule() {
         let fs = mac_fs(|_| false);
         let t = build(&base(), &fs).text;
         assert!(!t.contains("remote ip") && !t.contains("local ip") && !t.contains("mDNSResponder"));
-        let forwarded = profile(&base(), &Invocation { ports: vec![3000, 5173], ..run() }, &fs).unwrap().text;
-        let ip: Vec<&str> = forwarded.lines().filter(|l| l.contains(" ip ")).collect();
-        assert_eq!(
-            ip,
-            [
-                "(allow network-outbound (remote ip \"localhost:3000\"))",
-                "(allow network-outbound (remote ip \"localhost:5173\"))"
-            ]
-        );
+        // No line names an IP at all: a `localhost:<port>` rule would open that port on every address of the machine.
+        assert!(!t.lines().any(|l| l.contains(" ip ") || l.contains("localhost")), "{t}");
     }
 
     #[test]
     fn network_on_opens_ip_dns_and_tls_but_no_unix_socket() {
         let fs = mac_fs(|_| false);
-        let t = profile(&Plan { network: true, ..base() }, &Invocation { ports: vec![3000], ..run() }, &fs).unwrap().text;
+        let t = profile(&Plan { network: true, ..base() }, &run(), &fs).unwrap().text;
         assert!(t.contains("(allow network-outbound (remote ip))"));
         assert!(t.contains("(allow network-inbound (local ip \"localhost:*\"))"));
         assert!(t.contains("(path-literal \"/private/var/run/mDNSResponder\")"));
         for service in NETWORK_MACH_SERVICES {
             assert!(t.contains(service), "{service}");
         }
-        assert!(!t.contains("localhost:3000"), "every port is open anyway");
         // Unix sockets: the DNS socket and the private TMPDIR's, nothing else.
         assert_eq!(t.matches("unix-socket").count(), 3);
         assert!(at(&t, "(allow network-outbound (remote ip))") > at(&t, "; 8."));

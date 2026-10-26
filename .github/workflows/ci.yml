@@ -104,6 +104,7 @@ jobs:
       # #152: the loopback report binds 127.0.0.2, to see whether Seatbelt refuses the rest of 127/8 (lo0 has only
       # 127.0.0.1).
       - name: Add a loopback alias for the sandbox probes
+        continue-on-error: true
         run: sudo ifconfig lo0 alias 127.0.0.2 up
       - run: cargo check --workspace --all-targets
       # #152: what Seatbelt does with loopback rules on this runner, for the record. The process door stays off on
@@ -112,6 +113,11 @@ jobs:
       - name: Seatbelt loopback probes (report)
         continue-on-error: true
         run: cargo test -p marv-sandbox --test seatbelt_probe -- --ignored --nocapture --exact loopback_probe_report
+      # #246: which reads of another process's info Seatbelt still lets through, rule by rule. A report only, like
+      # the one above; the guards pin what the profile must refuse.
+      - name: Seatbelt process-info probes (report)
+        continue-on-error: true
+        run: cargo test -p marv-sandbox --test seatbelt_probe -- --ignored --nocapture --exact process_info_probe_report
       - run: cargo test --workspace --no-fail-fast
       # The release smoke test on this build, in place of a release candidate tried by hand on a Mac: install.sh and
       # npm from a packed asset, and a sandboxed `marv -p` turn with each, in which Seatbelt must refuse a write

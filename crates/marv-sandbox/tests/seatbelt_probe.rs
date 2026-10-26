@@ -94,7 +94,7 @@ impl Fx {
     }
 
     fn run(&self) -> Invocation {
-        Invocation { tmp: self.tmp.clone(), user_temp: Some(self.user_temp.clone()), exe: None, ports: vec![] }
+        Invocation { tmp: self.tmp.clone(), user_temp: Some(self.user_temp.clone()), exe: None }
     }
 
     fn profile(&self, network: bool) -> Profile {
@@ -443,7 +443,7 @@ fn probe_report() {
     let p4 = tcp_listener("127.0.0.1:0").unwrap();
     let p6 = tcp_listener(&format!("[::1]:{p4}"));
     let q = tcp_listener("127.0.0.1:0").unwrap();
-    let forwarded = seatbelt::profile(&fx.plan(&fx.root, false), &Invocation { ports: vec![p4], ..fx.run() }, &RealFs).unwrap();
+    let forwarded = fx.bash_profile(&[p4]);
     let tcp = |host: &str, port: u16| format!("exec 3<>/dev/tcp/{host}/{port} && echo connected");
     note("localhost.forwarded.127", fx.sh(&forwarded, &fx.root, &tcp("127.0.0.1", p4)).to_string());
     note("localhost.forwarded.localhost_name", fx.sh(&forwarded, &fx.root, &tcp("localhost", p4)).to_string());
@@ -1143,7 +1143,7 @@ fn each_link_rule_refuses_on_its_own() {
         sb.path = std::env::var("PATH").unwrap_or_default();
         sb.plan(&proj, &CommandMounts::default())
     };
-    let run = Invocation { tmp: tmp.clone(), user_temp: Some(t.parent().unwrap().to_path_buf()), exe: None, ports: vec![] };
+    let run = Invocation { tmp: tmp.clone(), user_temp: Some(t.parent().unwrap().to_path_buf()), exe: None };
     let shipped = seatbelt::profile(&plan, &run, &RealFs).unwrap();
     let text = &shipped.text;
     // The rules this test takes out, each checked to be there as written.
@@ -1439,10 +1439,15 @@ impl Fx {
         Profile { text, params: closed.params }
     }
 
-    /// A bash command's closed profile with an outbound rule for each of `ports` (`Invocation::ports`).
+    /// A bash command's closed profile with an outbound rule for each of `ports` on top: the per-port rule the
+    /// profile builder once had, kept here only to measure it (#242's probe 2 is why the builder has none).
     fn bash_profile(&self, ports: &[u16]) -> Profile {
-        let run = Invocation { ports: ports.to_vec(), ..self.run() };
-        seatbelt::profile(&self.plan(&self.root, false), &run, &RealFs).unwrap()
+        let closed = self.profile(false);
+        let mut text = closed.text.clone();
+        for port in ports {
+            text.push_str(&format!("(allow network-outbound (remote ip \"localhost:{port}\"))\n"));
+        }
+        Profile { text, params: closed.params }
     }
 
     /// Writes the probe scripts into the project (readable in every sandbox).
@@ -1823,5 +1828,167 @@ fn loopback_probe_report() {
         .to_string(),
     );
     note("8.bash.curl_localhost", fx.sh(&bash, &fx.root, &format!("curl -sS -m 5 http://localhost:{h}")).to_string());
+    println!("\n===== REPORT =====\n{}\n===== END =====", report.join("\n"));
+}
+
+// --- #246: what a sandboxed command can learn about other processes.
+
+/// For each `label=pid` given, every libproc and sysctl read `lsof`, `ps` and friends use, one line each:
+/// `label.read ok <detail>` or `label.read err <ERRNO>`. `self`, `parent` and `sibling` are filled in by the script.
+const PINFO_PY: &str = r#"import ctypes, errno, os, subprocess, sys
+libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+def err():
+    e = ctypes.get_errno()
+    return "err " + str(errno.errorcode.get(e, e))
+def pidinfo(pid, flavor, size, arg=0):
+    buf = ctypes.create_string_buffer(size)
+    n = libc.proc_pidinfo(pid, flavor, ctypes.c_uint64(arg), buf, size)
+    return ("ok %d" % n) if n > 0 else err()
+def pidpath(pid):
+    buf = ctypes.create_string_buffer(4096)
+    n = libc.proc_pidpath(pid, buf, 4096)
+    return ("ok " + buf.value.decode(errors="replace")) if n > 0 else err()
+def name(pid):
+    buf = ctypes.create_string_buffer(256)
+    n = libc.proc_name(pid, buf, 256)
+    return ("ok " + buf.value.decode(errors="replace")) if n > 0 else err()
+def fdinfo(pid):
+    buf = ctypes.create_string_buffer(2048)
+    n = libc.proc_pidfdinfo(pid, 0, 2, buf, 2048)
+    return ("ok %d" % n) if n > 0 else err()
+def sysctl(mib, size=65536):
+    arr = (ctypes.c_int * len(mib))(*mib)
+    buf = ctypes.create_string_buffer(size)
+    n = ctypes.c_size_t(size)
+    r = libc.sysctl(arr, len(mib), buf, ctypes.byref(n), None, 0)
+    return ("ok %d" % n.value) if r == 0 else err()
+def listpids():
+    buf = ctypes.create_string_buffer(4 * 8192)
+    n = libc.proc_listpids(1, 0, buf, 4 * 8192)
+    return ("ok %d" % (n // 4)) if n > 0 else err()
+sib = subprocess.Popen(["/bin/sleep", "5"])
+targets = [("self", os.getpid()), ("parent", os.getppid()), ("sibling", sib.pid)]
+targets += [(a.split("=")[0], int(a.split("=")[1])) for a in sys.argv[1:]]
+print("all.listpids", listpids(), flush=True)
+print("all.sysctl_kern_proc_all", sysctl([1, 14, 0]), flush=True)
+for label, pid in targets:
+    for read, f in [
+        ("pidpath", lambda: pidpath(pid)),
+        ("name", lambda: name(pid)),
+        ("pidinfo_listfds", lambda: pidinfo(pid, 1, 8192)),
+        ("pidinfo_taskallinfo", lambda: pidinfo(pid, 2, 4096)),
+        ("pidinfo_bsdinfo", lambda: pidinfo(pid, 3, 1024)),
+        ("pidinfo_taskinfo", lambda: pidinfo(pid, 4, 1024)),
+        ("pidinfo_regionpathinfo", lambda: pidinfo(pid, 8, 4096)),
+        ("pidinfo_vnodepathinfo", lambda: pidinfo(pid, 9, 4096)),
+        ("pidinfo_shortbsdinfo", lambda: pidinfo(pid, 13, 1024)),
+        ("pidinfo_uniqidentifierinfo", lambda: pidinfo(pid, 17, 1024)),
+        ("pidinfo_bsdinfowithuniqid", lambda: pidinfo(pid, 18, 1024)),
+        ("pidfdinfo_fd0", lambda: fdinfo(pid)),
+        ("sysctl_kern_proc_pid", lambda: sysctl([1, 14, 1, pid])),
+        ("sysctl_kern_procargs2", lambda: sysctl([1, 49, pid])),
+    ]:
+        print("%s.%s" % (label, read), f(), flush=True)
+sib.kill()
+"#;
+
+/// The tools a command must keep, each printing `tool ok` when it works.
+const PINFO_TOOLS: &[(&str, &str)] = &[
+    ("bash_jobs", "sleep 2 & jobs -l >/dev/null && kill %1 && wait; echo tool ok"),
+    ("bash_pipe_subshell", "(echo a; echo b) | (read x; echo $x) >/dev/null && echo $(echo tool) ok"),
+    ("lsof_self", "/usr/sbin/lsof -p $$ -Fn >/dev/null && echo tool ok"),
+    ("python_subprocess", "python3 -c 'import subprocess; subprocess.run([\"true\"], check=True); print(\"tool ok\")'"),
+    (
+        "python_multiprocessing",
+        "python3 -c 'import multiprocessing as m\nif __name__==\"__main__\":\n  p=m.Pool(2); assert p.map(abs,[-1,-2])==[1,2]; print(\"tool ok\")'",
+    ),
+    ("python_psutil_self", "python3 -c 'import os, resource; resource.getrusage(resource.RUSAGE_CHILDREN); print(\"tool ok\")'"),
+    ("node_child_process", "node -e 'require(\"child_process\").execSync(\"true\"); console.log(\"tool ok\")'"),
+    (
+        "node_process_info",
+        "node -e 'process.memoryUsage(); process.cpuUsage(); process.resourceUsage(); require(\"os\").cpus(); console.log(\"tool ok\")'",
+    ),
+    ("cargo_version", "cargo --version >/dev/null && echo tool ok"),
+    ("git_version_status", "git init -q gitprobe && git -C gitprobe status >/dev/null && rm -rf gitprobe && echo tool ok"),
+    ("pgrep_own", "sleep 3 & pgrep -P $$ >/dev/null; r=$?; kill %1; echo tool rc=$r"),
+];
+
+/// The base section's process-info rule replaced by `rules` (None: the rule as it ships).
+fn pinfo_profile(fx: &Fx, rules: Option<&str>) -> Profile {
+    let closed = fx.profile(false);
+    let shipped = "(allow process-info* (target same-sandbox))";
+    assert!(closed.text.contains(shipped), "the profile no longer has {shipped}");
+    let text = match rules {
+        Some(r) => closed.text.replace(shipped, r),
+        None => closed.text.clone(),
+    };
+    Profile { text, params: closed.params }
+}
+
+#[test]
+#[ignore = "a report for #246: run with --ignored --nocapture on macOS"]
+fn process_info_probe_report() {
+    let mut report: Vec<String> = Vec::new();
+    let mut note = |name: &str, what: String| {
+        println!("PROBE {name}: {what}");
+        report.push(format!("{name}: {what}"));
+    };
+    note("sw_vers", output(&mut Command::new("/usr/bin/sw_vers")).to_string().replace("err=[]", ""));
+    note("uname_m", output(Command::new("/usr/bin/uname").arg("-m")).out.trim().to_string());
+    // Which `target` filters SBPL accepts on this macOS.
+    for filter in ["self", "same-sandbox", "others", "children", "pid 1", "parent"] {
+        note(&format!("0.accepts.target_{filter}"), accepts(&format!("(allow process-info* (target {filter}))")).to_string());
+    }
+    for op in [
+        "process-info-pidinfo",
+        "process-info-pidfdinfo",
+        "process-info-pidfileportinfo",
+        "process-info-listpids",
+        "process-info-rusage",
+        "process-info-codesignature",
+        "process-info-setcontrol",
+        "process-info-dirtycontrol",
+        "process-info-ledger",
+    ] {
+        note(&format!("0.accepts.{op}"), accepts(&format!("(deny {op})")).to_string());
+    }
+    let fx = Fx::new("pinfo");
+    std::fs::write(fx.root.join("pinfo.py"), PINFO_PY).unwrap();
+    // Another process of the same user, outside every sandbox, that isn't the test itself.
+    let mut outsider = Command::new("/bin/sleep").arg("60").spawn().unwrap();
+    let args = format!("marv={} outsider={} launchd=1", std::process::id(), outsider.id());
+    let control = output(Command::new("python3").arg(fx.root.join("pinfo.py")).args(args.split(' ')).current_dir(&fx.root));
+    for line in control.out.lines() {
+        let (k, v) = line.split_once(' ').unwrap_or((line, ""));
+        note(&format!("control.{k}"), v.to_string());
+    }
+    let variants: &[(&str, Option<&str>)] = &[
+        ("shipped", None),
+        ("none", Some("")),
+        ("self", Some("(allow process-info* (target self))")),
+        ("same_sandbox_deny_others", Some("(allow process-info* (target same-sandbox))\n(deny process-info* (target others))")),
+        ("same_sandbox_deny_pidinfo_all", Some("(allow process-info* (target same-sandbox))\n(deny process-info-pidinfo)")),
+        ("deny_all_explicitly", Some("(deny process-info*)")),
+    ];
+    for (name, rules) in variants {
+        let profile = pinfo_profile(&fx, *rules);
+        let ran = fx.sh(&profile, &fx.root, &format!("python3 pinfo.py {args}"));
+        if ran.out.trim().is_empty() {
+            note(&format!("{name}.run"), ran.to_string());
+        }
+        for line in ran.out.lines() {
+            let (k, v) = line.split_once(' ').unwrap_or((line, ""));
+            note(&format!("{name}.{k}"), v.to_string());
+        }
+        note(
+            &format!("{name}.lsof_p_marv"),
+            fx.sh(&profile, &fx.root, &format!("/usr/sbin/lsof -p {} -Fn -P -n | head -6", std::process::id())).to_string(),
+        );
+        for (tool, script) in PINFO_TOOLS {
+            note(&format!("{name}.tool.{tool}"), fx.sh(&profile, &fx.root, script).to_string());
+        }
+    }
+    let _ = outsider.kill();
+    let _ = outsider.wait();
     println!("\n===== REPORT =====\n{}\n===== END =====", report.join("\n"));
 }
