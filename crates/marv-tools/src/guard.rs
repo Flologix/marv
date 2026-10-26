@@ -123,7 +123,8 @@ async fn supervise(parent: Pid, program: &OsString, args: &[OsString]) -> i32 {
             }
             _ = watch.tick() => {
                 if getppid() != parent {
-                    // Marv is gone: nothing it started may outlive it. This ends the guard too.
+                    // Marv is gone: nothing it started may outlive it. This ends the guard too. Not stopped first, as
+                    // Marv's kill is: a SIGSTOP to the group would stop the guard itself before its SIGKILL.
                     let _ = killpg(group, Signal::SIGKILL);
                     return 137;
                 }

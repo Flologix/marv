@@ -228,6 +228,9 @@ pub async fn run_command(
         Err(e) => return started(format!("[couldn't start the command: {e}]\n")),
     };
     let pid = child.id();
+    // While true the child is ours and unreaped, so its group's id can't be another's: the sweep (below) stops when it
+    // turns false. Declared after the child, so it's cleared before the child is dropped (and reaped by Tokio).
+    let held = Held(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)));
     let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
         return started("[couldn't start the command: no output pipes]\n".into());
     };
@@ -240,7 +243,15 @@ pub async fn run_command(
     // which such leftovers would hold open, and while the group's id can't be reused.
     let mut exit = if sandboxed { ExitWatch::spawn(pid) } else { ExitWatch::none() };
 
+    // The sweep, once started (see `start_sweep`).
+    type Sweep = (Option<tokio::sync::oneshot::Receiver<()>>, bool);
+    let swept: std::sync::Mutex<Option<Sweep>> = std::sync::Mutex::new(None);
+    // Set by a kill sent before the program's exit was seen (a timeout, a stop, a resend).
+    let killed = std::sync::atomic::AtomicBool::new(false);
     let kill = |child: &mut tokio::process::Child| {
+        if !swept.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+            killed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         match pid {
             Some(pid) if !sandboxed => marv_sandbox::kill_group(pid),
             // The backend takes the whole sandbox down (bwrap: its PID namespace; Seatbelt: the guard's group). Only
@@ -252,15 +263,55 @@ pub async fn run_command(
             }
         }
     };
+    // Once the program has exited, not reaped yet (its pid and group id are still its own), the backend ends everything
+    // it left, on a thread (Seatbelt: kills the guard's group again and again, #247: for seconds after a kill,
+    // for a process that was being created as the kill landed). Started once, the first time the exit is seen; holds
+    // the sweep and whether it lingers (then the call doesn't wait for it, see below).
+    let start_sweep = || {
+        let mut sweep = swept.lock().unwrap_or_else(|e| e.into_inner());
+        if sweep.is_some() {
+            return;
+        }
+        let killed = killed.load(std::sync::atomic::Ordering::SeqCst);
+        *sweep = Some(match pid {
+            // A thread of its own, not Tokio's blocking pool: a runtime shutting down (Marv exiting) waits for the
+            // pool, and a sweep after a kill takes seconds.
+            Some(pid) if sandboxed => {
+                let (done, sweeping) = tokio::sync::oneshot::channel();
+                let flag = held.0.clone();
+                let spawned = std::thread::Builder::new().name("marv-sweep".into()).spawn(move || {
+                    backend.sweep(pid, killed, &flag);
+                    let _ = done.send(());
+                });
+                if spawned.is_ok() {
+                    (Some(sweeping), killed && backend.lingers())
+                } else {
+                    // No thread to be had: swept here, holding this task up, rather than not at all.
+                    backend.sweep(pid, killed, &held.0);
+                    (None, false)
+                }
+            }
+            Some(pid) => {
+                marv_sandbox::kill_group(pid);
+                (None, false)
+            }
+            None => (None, false),
+        });
+    };
     let deadline = tokio::time::sleep(timeout);
     tokio::pin!(deadline);
+    // Watched even after a timeout or a stop has killed the command: a process it was forking as that kill landed can
+    // miss it (macOS), and holds the pipes, so waiting for them to close (up to KILL_GRACE) would leave it running.
     let ended = async {
         if !exit.exited().await {
             std::future::pending::<()>().await;
         }
+        start_sweep();
     };
     let Captured { output, errors, mut timed_out, mut aborted } =
         capture_until(stdout, stderr, deadline.as_mut(), cancel, ended, || kill(&mut child)).await;
+    // Set when the loop below ends on the program's exit, seen and not reaped: it's reaped after the sweep.
+    let mut reap_after_sweep = false;
     // The pipes can close long before the command ends (`exec >/dev/null 2>&1; sleep 60`): the timeout and the stop
     // stay armed until it has exited, or such a command would hold the turn (or a hook) past its timeout.
     let status = loop {
@@ -278,8 +329,9 @@ pub async fn run_command(
                 tokio::select! {
                     seen = exit.exited(), if exit.watching() => {
                         if seen {
-                            kill(&mut child);
-                            break child.wait().await.ok();
+                            start_sweep();
+                            reap_after_sweep = true;
+                            break None;
                         }
                         exit = ExitWatch::none();
                     }
@@ -293,8 +345,9 @@ pub async fn run_command(
             seen = exit.exited(), if exit.watching() => {
                 if seen {
                     // Exited, not reaped yet: what it left in its group goes first, then it's reaped.
-                    kill(&mut child);
-                    break child.wait().await.ok();
+                    start_sweep();
+                    reap_after_sweep = true;
+                    break None;
                 }
                 // Its exit can't be seen here: wait for it as usual.
                 exit = ExitWatch::none();
@@ -305,6 +358,35 @@ pub async fn run_command(
             () = cancel.cancelled() => aborted = true,
         }
         kill(&mut child);
+    };
+    // Exited and seen: reaped once the sweep is done. A sweep that lingers (Seatbelt, after a kill) isn't
+    // waited for: a killed command has no exit code to report, so the program is reaped and its sandbox cleaned up in
+    // the background, still unreaped while the sweep runs, so the group's id can't be another's.
+    let sweep = swept.into_inner().unwrap_or_else(|e| e.into_inner());
+    let status = match (reap_after_sweep, sweep) {
+        (false, _) => status,
+        (true, Some((Some(sweeping), true))) => {
+            group.pid = None;
+            // Dropped with the runtime (Marv exiting) before the sweep is done: `held` is cleared, then the child goes
+            // (Tokio reaps it), then the command's clean-up runs (`Prepared`'s drop).
+            let mut reap = Reap { held, child, prepared: prepared.take() };
+            tokio::spawn(async move {
+                let _ = sweeping.await;
+                reap.held.release();
+                let _ = reap.child.wait().await;
+                if let Some(command) = &mut reap.prepared {
+                    command.finish();
+                }
+            });
+            None
+        }
+        (true, sweep) => {
+            if let Some((Some(sweeping), _)) = sweep {
+                let _ = sweeping.await;
+            }
+            held.release();
+            child.wait().await.ok()
+        }
     };
     group.pid = None;
     // Before the caller's scan for created protected files: a placeholder's mount point left behind would read as one.
@@ -335,7 +417,9 @@ pub(crate) struct Captured {
 /// Reads both pipes at once (so neither fills up and blocks the other) until they close. At `deadline` or `cancel`,
 /// calls `kill` once, then reads for at most [`KILL_GRACE`] more and returns what it has. When `ended` (the command
 /// exited, but something it started may still hold the pipes) it calls `kill` too, for those leftovers, and reads for
-/// at most [`KILL_GRACE`] more; neither the deadline nor a stop counts after that.
+/// at most [`KILL_GRACE`] more; neither the deadline nor a stop counts after that. `ended` is watched after a deadline
+/// or a stop too (#247): a process that missed their kill is ended as soon as the command has exited, not after the
+/// grace.
 pub(crate) async fn capture_until(
     stdout: impl AsyncRead + Unpin,
     stderr: impl AsyncRead + Unpin,
@@ -358,7 +442,7 @@ pub(crate) async fn capture_until(
                 _ = &mut io => break,
                 () = &mut deadline, if ending => timed_out = true,
                 () = cancel.cancelled(), if ending => aborted = true,
-                () = &mut ended, if ending => done = true,
+                () = &mut ended, if !done => done = true,
                 () = &mut grace => break,
             }
             kill();
@@ -399,6 +483,28 @@ impl ExitWatch {
         let mut rx = rx.clone();
         rx.wait_for(Option::is_some).await.ok().and_then(|v| *v).unwrap_or(false)
     }
+}
+
+/// The sweep's `held` flag (see `run_command`): cleared by [`Held::release`] before the child is reaped, and on drop.
+struct Held(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Held {
+    fn release(&self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// A killed command left to its sweep: reaped and cleaned up when the sweep is done. Dropped in field order.
+struct Reap {
+    held: Held,
+    child: tokio::process::Child,
+    prepared: Option<marv_sandbox::Prepared>,
 }
 
 /// Kills the backend's whole sandbox on drop while `pid` is set (see `run_command`).

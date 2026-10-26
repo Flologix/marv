@@ -10,6 +10,8 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::SandboxError;
 use crate::fs::FsProbe;
@@ -110,6 +112,22 @@ pub trait SandboxBackend: Send + Sync + std::fmt::Debug {
     fn hides(&self, dir: &Path, home: &Path) -> bool;
     /// Ends a running sandboxed command and everything it started, at once (`pid`: the spawned sandbox program's).
     fn kill(&self, pid: u32);
+    /// After the sandbox program has exited (seen, not reaped yet, so its pid and the id of the group it led are still
+    /// its own): ends everything the command left running, before the caller reaps it. `killed`: a timeout or a stop
+    /// killed it first, so a process being created as that kill landed may still appear. `held`: true while the caller
+    /// still holds the program unreaped; the sweep stops as soon as it's false (the group's id may then be another's).
+    /// [`Self::kill`] unless the backend needs more (Seatbelt: the group is killed again and again, for seconds after a
+    /// kill).
+    fn sweep(&self, pid: u32, _killed: bool, held: &AtomicBool) {
+        if held.load(Ordering::SeqCst) {
+            self.kill(pid);
+        }
+    }
+    /// Whether [`Self::sweep`] after a kill takes long (Seatbelt: [`GROUP_LINGER`]). The caller then doesn't wait for
+    /// it: it returns at once, and reaps the program and cleans up when the sweep is done.
+    fn lingers(&self) -> bool {
+        false
+    }
     /// Asks a running sandboxed command and everything it started to end (a process's stop, before [`Self::kill`]).
     fn terminate(&self, pid: u32);
     /// After the command has ended: removes what the sandbox left behind ([`SandboxCommand::leftovers`]).
@@ -137,13 +155,61 @@ pub fn backend() -> &'static dyn SandboxBackend {
     }
 }
 
-/// SIGKILL to the process group `pid` leads (nothing for a pid that doesn't fit or a group that's gone). Never for a
-/// pid of 1 or below: `killpg(0)` is the caller's own group, and `killpg(1)` init's.
+/// Kills the process group `pid` leads: SIGSTOP to the group, then SIGKILL (nothing for a pid that doesn't fit or a
+/// group that's gone). Never for a pid of 1 or below: `killpg(0)` is the caller's own group, and `killpg(1)` init's.
+///
+/// Stopped first (#247): macOS delivers a group signal to one member after another, so a SIGKILL alone can end a
+/// child before its parent, and the parent, woken by that on another core, runs on until its own SIGKILL comes: long
+/// enough for a shell to start its next command (`(sleep 2; touch late)` touched `late`), which the kill, already
+/// past, then misses. A stopped process can't run on, and SIGKILL ends it all the same.
 pub fn kill_group(pid: u32) {
     if let Ok(pid) = i32::try_from(pid)
         && pid > 1
     {
-        let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pid), nix::sys::signal::Signal::SIGKILL);
+        let _ = stop_and_kill(nix::unistd::Pid::from_raw(pid));
+    }
+}
+
+/// [`kill_group`]'s signals: what the SIGKILL `killpg` returned.
+fn stop_and_kill(group: nix::unistd::Pid) -> nix::Result<()> {
+    let _ = nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGSTOP);
+    nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL)
+}
+
+/// How long [`kill_group_for`] keeps killing a group whose leader exited by itself, for what it left running: a few
+/// rounds, so a process its jobs were forking as the first round landed is reached by the next.
+pub const GROUP_SWEEP: Duration = Duration::from_millis(5);
+
+/// How long [`kill_group_for`] keeps killing a group after a timeout or a stop killed its leader (#247): a process the
+/// leader (or the command's shell) was creating as the kill landed appears only once its creation is done, and on a
+/// loaded Intel Mac that was seen to take well over 50 ms after its parent had died.
+pub const GROUP_LINGER: Duration = Duration::from_secs(3);
+
+/// [`kill_group`] on the process group `pid` leads, again and again for `window` (every ms for the first 30 ms, then
+/// every 10 ms), until the group is gone or `held` turns false; refused for a pid of 1 or below, as [`kill_group`].
+///
+/// One group kill isn't enough on macOS (#247): it reaches the members it finds, and a process still being created
+/// isn't found (`ps` doesn't list it either). When the kill lands on a process in the middle of a `fork` or a
+/// `posix_spawn` (the guard starting the command, the command's shell starting a job), the parent dies but the child
+/// is still created, and goes on running in the sandbox with no one left to stop it. Once created it's a member, and
+/// the next round gets it.
+///
+/// **A bounded window, not a guarantee.** macOS has no PID namespace to take everything down at once, nor a way to see
+/// a process before its creation is done: one that takes longer than `window` to appear escapes the sweep (still
+/// inside the sandbox). [`GROUP_LINGER`] is well beyond what was seen. Not "until empty" either: on macOS the unreaped
+/// leader (a zombie) still counts as a member, so a group never looks empty while it's held.
+///
+/// `held` is the caller's: true while it holds the leader unreaped, so the group's id can't be another's. Each round
+/// checks it first.
+pub fn kill_group_for(pid: u32, window: Duration, held: &AtomicBool) {
+    let Some(group) = i32::try_from(pid).ok().filter(|p| *p > 1).map(nix::unistd::Pid::from_raw) else { return };
+    let started = Instant::now();
+    while started.elapsed() < window && held.load(Ordering::SeqCst) {
+        if stop_and_kill(group) == Err(nix::errno::Errno::ESRCH) {
+            return;
+        }
+        let pause = if started.elapsed() < Duration::from_millis(30) { 1 } else { 10 };
+        std::thread::sleep(Duration::from_millis(pause));
     }
 }
 
@@ -296,6 +362,31 @@ mod tests {
         kill_group(1);
         kill_group(u32::MAX);
         assert!(!wait_exited(0) && !wait_exited(1));
+    }
+
+    /// A group whose leader has exited (unreaped), with a job still running and another one forking all the time:
+    /// nothing in it survives the sweep, which takes about [`GROUP_SWEEP`].
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_group_is_killed_again_and_again_until_nothing_in_it_survives() {
+        use std::os::unix::process::CommandExt;
+        let dir = std::env::temp_dir().join(format!("marv-sweep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut leader = std::process::Command::new("bash")
+            .args(["-c", "(while :; do (sleep 0.5; touch late) & sleep 0.01; done) & (sleep 0.5; touch late) & sleep 0.3"])
+            .current_dir(&dir)
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        assert!(wait_exited(leader.id()));
+        let started = Instant::now();
+        kill_group_for(leader.id(), GROUP_SWEEP, &AtomicBool::new(true));
+        assert!(started.elapsed() < GROUP_SWEEP * 10, "{:?}", started.elapsed());
+        leader.wait().unwrap();
+        std::thread::sleep(Duration::from_millis(800));
+        let survived = dir.join("late").exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!survived, "something in the group survived the sweep");
     }
 
     /// The exit is seen while the child is still a zombie: it hasn't been reaped, so its pid stays taken.

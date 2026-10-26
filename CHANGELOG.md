@@ -17,6 +17,7 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ### Fixed
 
+- **A stop or a timeout right after a sandboxed command starts now ends it on macOS too (#247).** macOS signals a process group one member at a time, so a shell could start its next command before its own kill arrived, and a process being created as the kill landed escaped it. Marv now stops the group before killing it, and keeps killing it for a few seconds after a timeout or a stop (in the background: the call still returns at once).
 - **On macOS, the system prompt no longer says a sandboxed command has a `localhost` of its own.** That is true on Linux, where each command has its own network namespace, but Seatbelt has none: without `network: true` a command can neither listen on nor connect to `localhost`, and `# Sandbox limits` now says so. Linux's text is unchanged (#152).
 
 ## [0.11.0] - 2026-10-25

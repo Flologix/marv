@@ -15,11 +15,13 @@
 //!   removed after the command ([`SandboxBackend::after`]). The profile refuses any other `TMPDIR`. `/tmp` is shared
 //!   with the host on macOS, so it's closed (spec §11.2).
 //! - **The guard** (`marv_tools::guard`) is what `sandbox-exec` execs, so the pid Marv spawned is the guard's, which
-//!   leads a process group of its own. [`SandboxBackend::kill`] is `killpg(pid, SIGKILL)`: the guard, the command and
-//!   everything left in the group. [`SandboxBackend::terminate`] is SIGTERM to the guard alone, which passes it on to
-//!   the group (a `killpg(SIGTERM)` would reach the command twice). There's no PID namespace: after the guard has
-//!   exited (before it's reaped, so its pid can't be reused) the caller kills the group once more, for what the
-//!   command left running in the background (bwrap's namespace took those).
+//!   leads a process group of its own. [`SandboxBackend::kill`] is `killpg(pid, SIGSTOP)`, then `SIGKILL`: the guard,
+//!   the command and everything left in the group (stopped first, as macOS signals a group one member at a time).
+//!   [`SandboxBackend::terminate`] is SIGTERM to the guard alone, which passes it on to the group (a
+//!   `killpg(SIGTERM)` would reach the command twice). There's no PID namespace: after the guard has
+//!   exited (before it's reaped, so its pid can't be reused) the caller sweeps the group ([`SandboxBackend::sweep`]:
+//!   killed again and again), for what the command left running in the background (bwrap's namespace took those),
+//!   and, for seconds after a timeout or a stop, for a process that was being created as that kill landed (#247).
 //! - **Availability** is probed once per process ([`Seatbelt::available`]): the real base rules on `sandbox-exec`, and
 //!   the guard echoing a line back. With no `sandbox-exec`, a profile the kernel no longer accepts, a Marv that's
 //!   already inside a Seatbelt sandbox, or a binary that doesn't answer `__guard` (a test harness), commands run
@@ -219,14 +221,28 @@ impl SandboxBackend for Seatbelt {
         seatbelt_hides(dir, home, user_temp_dir().as_deref().and_then(Path::parent))
     }
 
-    /// `kill(pid, SIGKILL)`, then `killpg(pid, SIGKILL)`. The group exists only once the guard has called `setsid`;
-    /// before that (while `sandbox-exec` compiles the profile and execs the guard) a `killpg` alone finds nothing, and
-    /// the guard would go on to start the command. Killing the pid first ends a guard that hasn't forked yet; one that
-    /// has already made its session, so the group kill then reaches the command and everything it left. `pid` is an
-    /// unreaped child of Marv's, so neither signal can reach another process.
+    /// The guard's group killed ([`crate::backend::kill_group`]: stopped first, so no member can run on while the
+    /// kill goes round, #247), then `kill(pid, SIGKILL)`. The group exists only once the guard has called `setsid`;
+    /// before that (while `sandbox-exec` compiles the profile and execs the guard) a `killpg` finds nothing, and the
+    /// guard would go on to start the command: the pid kill ends it. The group goes first so the guard doesn't die
+    /// before the rest is stopped (its group, orphaned, would get SIGCONT). `pid` is an unreaped child of Marv's, so
+    /// no signal can reach another process.
     fn kill(&self, pid: u32) {
-        crate::backend::send(pid, nix::sys::signal::Signal::SIGKILL);
         crate::backend::kill_group(pid);
+        crate::backend::send(pid, nix::sys::signal::Signal::SIGKILL);
+    }
+
+    /// The guard has exited (a zombie, so its group's id is still its own): its group is killed again and again
+    /// ([`crate::backend::kill_group_for`]), for [`crate::backend::GROUP_SWEEP`], or [`crate::backend::GROUP_LINGER`]
+    /// after a kill (#247): a process being forked or spawned as the kill landed (the command, by the guard; a job, by
+    /// the command's shell) is created after its parent has died, and only a group kill sent after that reaches it.
+    fn sweep(&self, pid: u32, killed: bool, held: &std::sync::atomic::AtomicBool) {
+        let window = if killed { crate::backend::GROUP_LINGER } else { crate::backend::GROUP_SWEEP };
+        crate::backend::kill_group_for(pid, window, held);
+    }
+
+    fn lingers(&self) -> bool {
+        true
     }
 
     /// SIGTERM to the guard alone: it passes it on to its group (sent to the group, the command would get it twice).
