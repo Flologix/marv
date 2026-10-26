@@ -6,6 +6,10 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+### Fixed
+
+- **A stop or a timeout right after a sandboxed command starts now ends it on macOS too (#247).** macOS signals a process group one member at a time, so a kill could end a command's child before the shell that started it, and the shell, woken by that, had time to run its next command before its own kill came (a timeout a few milliseconds after the start was enough). Marv now stops the whole group before killing it, so nothing in it can run on while the kill goes round. A process still being created as the kill landed (the command itself, or a job its shell was starting) is created after its parent has died, and only a later kill reaches it: once the sandbox's guard has exited, Marv kills its group again and again, for a few milliseconds after a normal exit and for 3 seconds in the background after a timeout or a stop (the call still returns at once; the command's temporary folder is removed after that). The guard stops its group first too when Marv itself goes away.
+
 ## [0.11.0] - 2026-10-25
 
 ### Added
