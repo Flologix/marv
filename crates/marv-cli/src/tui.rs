@@ -422,6 +422,9 @@ fn provider_id(kind: ProviderKind) -> ProviderId {
         ProviderKind::Ollama => ProviderId::Ollama,
         ProviderKind::Zai => ProviderId::Zai,
         ProviderKind::ChatGpt => ProviderId::ChatGpt,
+        ProviderKind::Kimi => ProviderId::Kimi,
+        ProviderKind::DeepSeek => ProviderId::DeepSeek,
+        ProviderKind::Qwen => ProviderId::Qwen,
     }
 }
 
@@ -431,6 +434,9 @@ fn provider_kind(id: ProviderId) -> ProviderKind {
         ProviderId::Ollama => ProviderKind::Ollama,
         ProviderId::Zai => ProviderKind::Zai,
         ProviderId::ChatGpt => ProviderKind::ChatGpt,
+        ProviderId::Kimi => ProviderKind::Kimi,
+        ProviderId::DeepSeek => ProviderKind::DeepSeek,
+        ProviderId::Qwen => ProviderKind::Qwen,
     }
 }
 
@@ -451,12 +457,16 @@ fn model_info(m: marv_provider::ModelInfo) -> view::ModelInfo {
     }
 }
 
-/// The providers setup offers: OpenRouter and Ollama, and (#159) the Z.ai Coding Plan and Sign in with ChatGPT when
-/// their switch is on (`marv_provider::offered`) or the config already uses them.
+/// The providers setup offers: OpenRouter, the plans, and Ollama. The Z.ai Coding Plan and Sign in with ChatGPT (#159)
+/// when their switch is on (`marv_provider::offered`, on by default) or the config already uses them; Kimi Code,
+/// DeepSeek and Qwen's Coding Plan always.
 fn offered_kinds(current: Option<ProviderKind>) -> Vec<ProviderKind> {
     let plans = [
         (ProviderKind::Zai, marv_provider::offered::ZAI_CODING_PLAN),
         (ProviderKind::ChatGpt, marv_provider::offered::CHATGPT_SIGN_IN),
+        (ProviderKind::Kimi, true),
+        (ProviderKind::Qwen, true),
+        (ProviderKind::DeepSeek, true),
     ];
     let mut kinds = vec![ProviderKind::OpenRouter];
     kinds.extend(plans.into_iter().filter(|&(kind, on)| on || current == Some(kind)).map(|(kind, _)| kind));
@@ -4649,8 +4659,8 @@ mod tests {
         assert!(!format!("{ctx:?}").contains("fromtheenvironment"), "keys reach the UI masked");
     }
 
-    /// #159: the plans are offered only when their switch is on (both off until the vendors clear Marv), or when the
-    /// config already uses one; a plan's key goes to its own field.
+    /// #159: Z.ai and ChatGPT are offered when their switch is on (both on by default), or when the config already uses
+    /// one; Kimi, Qwen and DeepSeek always. A plan's key goes to its own field.
     #[test]
     fn setup_offers_the_plans_behind_their_switches_and_keeps_keys_apart() {
         let ids = |file: Option<&FileConfig>| {
@@ -4665,7 +4675,7 @@ mod tests {
         if marv_provider::offered::CHATGPT_SIGN_IN {
             expected.push(ProviderId::ChatGpt);
         }
-        expected.push(ProviderId::Ollama);
+        expected.extend([ProviderId::Kimi, ProviderId::Qwen, ProviderId::DeepSeek, ProviderId::Ollama]);
         assert_eq!(ids(None), expected);
         let zai = FileConfig { provider: Some(ProviderKind::Zai), ..FileConfig::default() };
         assert!(ids(Some(&zai)).contains(&ProviderId::Zai), "a config that uses it keeps it in setup");

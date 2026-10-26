@@ -64,6 +64,24 @@ pub enum ProviderOption {
         model: Option<String>,
         base_url: Option<String>,
     },
+    /// Kimi Code, with a Kimi membership's API key.
+    Kimi {
+        api_key: String,
+        model: Option<String>,
+        base_url: Option<String>,
+    },
+    /// DeepSeek's API, with a DeepSeek key.
+    DeepSeek {
+        api_key: String,
+        model: Option<String>,
+        base_url: Option<String>,
+    },
+    /// Alibaba Cloud's Coding Plan (Qwen models), with the plan's own key.
+    Qwen {
+        api_key: String,
+        model: Option<String>,
+        base_url: Option<String>,
+    },
     /// #159: Sign in with ChatGPT, with the sign-in's token file (`<config dir>/chatgpt.json`).
     ChatGpt {
         model: String,
@@ -105,11 +123,11 @@ impl ProviderFactory for ConfigFactory {
     }
 
     /// OpenRouter's list has every model's context window, prices and reasoning; Ollama's knows
-    /// none of that. A list that fails to load says nothing about the model (`None`). Z.ai's plan
-    /// models come from Marv's own table ([`crate::models::zai_models`]), so no request is made.
+    /// none of that. A list that fails to load says nothing about the model (`None`). Z.ai's, Kimi's,
+    /// DeepSeek's and Qwen's models come from Marv's own tables ([`crate::models::table_for`]), so no request is made.
     fn lookup(&self) -> Option<BoxFuture<'static, Option<ModelInfo>>> {
-        if self.config.provider == ProviderKind::Zai {
-            let found = crate::models::zai_models().into_iter().find(|m| m.id == self.config.model);
+        if let Some(table) = crate::models::table_for(self.config.provider) {
+            let found = table.into_iter().find(|m| m.id == self.config.model);
             return Some(Box::pin(async move { found }));
         }
         if self.config.provider != ProviderKind::OpenRouter {

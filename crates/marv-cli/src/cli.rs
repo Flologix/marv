@@ -30,6 +30,9 @@ pub const AFTER_HELP: &str = "Config:
   ~/.marv/worktrees/    subagents' worktrees while they run
   OPENROUTER_API_KEY    overrides the saved OpenRouter key
   ZAI_API_KEY           overrides the saved Z.ai Coding Plan key
+  KIMI_API_KEY          overrides the saved Kimi Code key
+  DEEPSEEK_API_KEY      overrides the saved DeepSeek key
+  QWEN_API_KEY          overrides the saved Qwen Coding Plan key
   OLLAMA_HOST           where Ollama runs (default localhost:11434)
   MARV_MODEL            overrides the saved model
   MARV_MAX_STEPS        overrides the saved step limit (0 or off: never ask)

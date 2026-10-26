@@ -6,6 +6,11 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+### Added
+
+- **Kimi Code, Qwen Coding Plan and DeepSeek providers.** Setup and `/setup` now offer Kimi Code (a Kimi membership: `kimi-for-coding`, `k3`, `k3-256k`), Alibaba Cloud's Coding Plan (Qwen3.7-Plus, Qwen3.6-Plus, Qwen3.5-Plus) and DeepSeek's API (`deepseek-flash`, `deepseek-v4-pro`), each OpenAI-compatible on its own endpoint with its own key: `"provider"` `kimi`, `qwen` or `deepseek` in `~/.marv/config.json`, keys in `kimiApiKey`, `qwenApiKey`, `deepseekApiKey` or `KIMI_API_KEY`, `QWEN_API_KEY`, `DEEPSEEK_API_KEY`. `baseUrl` picks another region. The SDK takes `ProviderOption::{Kimi, Qwen, DeepSeek}`.
+- **Sign in with ChatGPT and the Z.ai GLM Coding Plan are offered in setup.** Both were built but hidden (#159); their switches are now on by default, and a build turns one off with `MARV_OFFER_CHATGPT_SIGN_IN=0` or `MARV_OFFER_ZAI_CODING_PLAN=0`.
+
 ### Fixed
 
 - **Pasting an API key in setup.** The setup wizard's API key field dropped a paste, so a key had to be typed out by hand. It now takes the paste, without the trailing newline or a line break the copy brought along.

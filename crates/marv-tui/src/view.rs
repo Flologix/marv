@@ -341,6 +341,12 @@ pub enum ProviderId {
     Zai,
     /// #159: Sign in with ChatGPT.
     ChatGpt,
+    /// Kimi Code (a Kimi membership).
+    Kimi,
+    /// DeepSeek's API.
+    DeepSeek,
+    /// Alibaba Cloud's Coding Plan (Qwen models).
+    Qwen,
 }
 
 /// What setup needs to know about a provider (Marv `PRESETS[provider]`).

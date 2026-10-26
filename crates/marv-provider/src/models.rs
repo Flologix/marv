@@ -9,6 +9,8 @@
 //!   (a failed `/api/show` leaves `tools` unknown rather than failing the list).
 //! - Z.ai's GLM Coding Plan (#159): Marv's own table ([`ZAI_CODING_MODELS`]), no request. The coding endpoint
 //!   documents no model list, and the plan offers a handful of models: the table is the one place to update.
+//! - Kimi Code, DeepSeek and Qwen's Coding Plan: Marv's own tables too ([`KIMI_MODELS`], [`DEEPSEEK_MODELS`],
+//!   [`QWEN_CODING_MODELS`]), for the same reason: a handful of models, and no list Marv can read without a key.
 //! - `reasoning`: "optional" can be turned off, "mandatory" can't (OpenRouter rejects trying):
 //!   `crate::reasoning_for` depends on this.
 
@@ -64,17 +66,69 @@ pub const ZAI_DEFAULT_MODEL: &str = ZAI_CODING_MODELS[0].0;
 
 /// [`ZAI_CODING_MODELS`] as model infos: tools, always reasoning, no per-token price (the plan is a subscription).
 pub fn zai_models() -> Vec<ModelInfo> {
-    ZAI_CODING_MODELS
+    table_models(ZAI_CODING_MODELS, Some(ReasoningSupport::Mandatory))
+}
+
+/// Kimi Code's OpenAI-compatible endpoint for a Kimi membership's API key (kimi.com/help/kimi-code/membership-guide).
+/// The overseas host `https://api.kimi.ai/coding/v1` serves the same keys; `baseUrl` picks it.
+pub const KIMI_CODING_BASE_URL: &str = "https://api.kimi.com/coding/v1";
+
+/// The models a Kimi Code membership offers to other tools (2026-10): K3 (up to 1M tokens on the higher tiers, so the
+/// table says 256K, what every tier gets), its 256K variant, and `kimi-for-coding` (K2.8 Preview, up to 1M; 256K here
+/// for the same reason). Kimi doesn't say the output limit: 32K, on the safe side. The first entry is the default.
+pub const KIMI_MODELS: &[ZaiModel] = &[
+    ("kimi-for-coding", Some(262_144), Some(32_768)),
+    ("k3", Some(262_144), Some(32_768)),
+    ("k3-256k", Some(262_144), Some(32_768)),
+];
+
+/// DeepSeek's own API (api-docs.deepseek.com): OpenAI-compatible, pay as you go with a DeepSeek key.
+pub const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com";
+
+/// DeepSeek's models (2026-10): `deepseek-flash` (V4.1 Flash) and `deepseek-v4-pro`, both with a 1M-token window and
+/// 384K of output. DeepSeek bills by time of day, so no price is shown. The first entry is the default.
+pub const DEEPSEEK_MODELS: &[ZaiModel] =
+    &[("deepseek-flash", Some(1_000_000), Some(393_216)), ("deepseek-v4-pro", Some(1_000_000), Some(393_216))];
+
+/// Alibaba Cloud Model Studio's Coding Plan, international (alibabacloud.com/help/en/model-studio/coding-plan). Only a
+/// Coding Plan key (`sk-sp-…`) works here; mainland China's plan is `https://coding.dashscope.aliyuncs.com/v1`
+/// (`baseUrl`).
+pub const QWEN_CODING_BASE_URL: &str = "https://coding-intl.dashscope.aliyuncs.com/v1";
+
+/// The Coding Plan's Qwen models (2026-10; the plan also serves GLM, Kimi and MiniMax models, which Marv reaches through
+/// their own plans). Windows: 1M for Qwen3.6/3.7-Plus, 256K for Qwen3.5-Plus; output 64K. The first entry is the default.
+pub const QWEN_CODING_MODELS: &[ZaiModel] = &[
+    ("qwen3.7-plus", Some(1_000_000), Some(65_536)),
+    ("qwen3.6-plus", Some(1_000_000), Some(65_536)),
+    ("qwen3.5-plus", Some(262_144), Some(65_536)),
+];
+
+/// A subscription's or vendor's own table as model infos (tools; no price, the plan is paid for), reasoning as given.
+fn table_models(table: &[ZaiModel], reasoning: Option<ReasoningSupport>) -> Vec<ModelInfo> {
+    table
         .iter()
         .map(|&(id, context, max_output)| ModelInfo {
             id: id.into(),
             tools: Some(true),
             context,
             max_output,
-            reasoning: Some(ReasoningSupport::Mandatory),
+            reasoning,
             ..Default::default()
         })
         .collect()
+}
+
+/// The models of a provider whose list is Marv's own table: Z.ai, Kimi, DeepSeek and Qwen. `None` for the others.
+/// Kimi's, DeepSeek's and Qwen's reasoning is left unknown, so Marv sends no reasoning switch and each model uses its
+/// own default.
+pub fn table_for(provider: ProviderKind) -> Option<Vec<ModelInfo>> {
+    match provider {
+        ProviderKind::Zai => Some(zai_models()),
+        ProviderKind::Kimi => Some(table_models(KIMI_MODELS, None)),
+        ProviderKind::DeepSeek => Some(table_models(DEEPSEEK_MODELS, None)),
+        ProviderKind::Qwen => Some(table_models(QWEN_CODING_MODELS, None)),
+        ProviderKind::OpenRouter | ProviderKind::Ollama | ProviderKind::ChatGpt => None,
+    }
 }
 
 /// One entry of OpenRouter's `/models` list (only the fields Marv reads).
@@ -167,8 +221,10 @@ pub async fn list_models_with(
             let list: OpenRouterList = get_json(client, &format!("{base_url}/models"), api_key, None).await?;
             Ok(from_openrouter(list.data))
         }
-        // #159: Marv's own table; the coding endpoint documents no model list.
-        ProviderKind::Zai => Ok(zai_models()),
+        // #159: Marv's own tables; these endpoints document no model list Marv can read without a key.
+        ProviderKind::Zai | ProviderKind::Kimi | ProviderKind::DeepSeek | ProviderKind::Qwen => {
+            Ok(table_for(provider).unwrap_or_default())
+        }
         // #159: the signed-in account's models (`api_key` is the sign-in's access token): the entries listed for
         // display, by slug.
         ProviderKind::ChatGpt => {
