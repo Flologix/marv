@@ -3396,7 +3396,11 @@ impl MarvSession {
             .inner
             .diagnostics
             .iter()
-            .map(|(language, checker)| CheckerInfo { language: *language, label: checker.kind.label(), state: checker.state() })
+            .map(|(language, checker)| CheckerInfo {
+                language: *language,
+                label: checker.kind.label(),
+                state: checker.state_at(&self.inner.init.root),
+            })
             .collect();
         let cache = self.inner.check_cache.as_ref().and_then(|cache| {
             let key = crate::diagnostics::cache::repo_key(&self.inner.init.root);

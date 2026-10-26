@@ -151,7 +151,8 @@ async fn cargo_check_tells_a_new_error_once_and_never_touches_the_projects_targe
 
 /// **A malicious `build.rs` runs sandboxed** (#187: cargo check runs the project's build scripts at the session's
 /// first edit): it can't write into the project, the real home, the cache root or another project's key folder,
-/// can't read a hidden home path, and can't reach the network; and the check still reports the project's error.
+/// can't read a hidden home path, and can't reach the network or a listener on the host's loopback; and the check
+/// still reports the project's error.
 ///
 /// Proven (Linux): made `sandboxed_options` drop `project_read_only` → failed ("project: ALLOWED"); made it mount the
 /// key folder's parent → failed (the other key's folder was writable); `network: true` → failed (the connection was
@@ -170,6 +171,9 @@ async fn a_malicious_build_script_runs_sandboxed_and_the_check_still_reports() {
     std::fs::write(&secret, "HIDDEN-HOME-SECRET\n").unwrap();
     let real_home = std::fs::canonicalize(std::env::var("HOME").unwrap()).unwrap();
     let in_home = real_home.join(format!("marv-guard-planted-{}", std::process::id()));
+    // A listener on the host's loopback: the network attempt can't pass just because a runner has no route out.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
     let project = TempDir::new("cargo-hostile");
     let targets = [
         ("project", project.path().join("planted.txt")),
@@ -196,6 +200,8 @@ fn main() {{
 {writes}    attempt(&mut report, "read secret", std::fs::read_to_string({secret:?}).is_ok());
     let addr = "1.1.1.1:80".parse().unwrap();
     attempt(&mut report, "network", std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(3)).is_ok());
+    let local = "127.0.0.1:{port}".parse().unwrap();
+    attempt(&mut report, "loopback", std::net::TcpStream::connect_timeout(&local, Duration::from_secs(3)).is_ok());
     let out = std::env::var("OUT_DIR").unwrap();
     std::fs::write(format!("{{out}}/report.txt"), report).unwrap();
 }}
@@ -210,7 +216,7 @@ fn main() {{
     // The build script ran (in the key folder's target dir), and everything it tried was refused.
     let key_dir = cache.dir(&repo_key(project.path()));
     let report = find_report(&key_dir.join("target")).unwrap_or_else(|| panic!("the build script didn't run: {runs:?}"));
-    for line in ["project: denied", "other key: denied", "read secret: denied", "network: denied"] {
+    for line in ["project: denied", "other key: denied", "read secret: denied", "network: denied", "loopback: denied"] {
         assert!(report.lines().any(|l| l == line), "{line:?} not in:\n{report}");
     }
     // The home and the cache root around the key folder are the sandbox's own throwaway stand-ins under bwrap (a

@@ -19,7 +19,20 @@
 //!   any line that isn't JSON makes the run unreadable. Each message carries its primary span's label ("mismatched
 //!   types: expected `u32`, found `&str`"), cut at [`MAX_MESSAGE`] characters.
 //! - **Not installed:** cargo missing in the sandbox (exit 127, nothing printed) turns the kind off for the session
-//!   quietly, as the formatter skips a missing rustfmt.
+//!   quietly, as the formatter skips a missing rustfmt. A project can fake that (a `rust-toolchain.toml` `path =`
+//!   toolchain whose `cargo` exits 127), as it can fake a clean build: the checker helps the model, it isn't a
+//!   security boundary, and either way nothing leaves the sandbox.
+//! - **Skipped, said only in `/diagnostics`** ([`skip_reason`]): a project without a `Cargo.lock` at its root (the
+//!   project is read-only, so cargo can't write one, and every run would be unreadable), or one inside a workspace
+//!   whose root is above it (cargo would need the parent's files, which the sandbox may hide). A `stat`, on the host.
+//! - **Strict output:** a line on stdout that isn't JSON makes the run unreadable (spec rule 6), and a proc macro or
+//!   build tool that prints to stdout puts such lines there: such a project gets "couldn't read", then no Rust checks
+//!   for the session after two runs. That fails safe; skipping stray lines would be the change if it proves common.
+//! - **Wrappers:** `RUSTC_WRAPPER` is set empty, which cargo takes as "no wrapper", over `build.rustc-wrapper` in the
+//!   user's or the project's cargo config: an sccache would find its cache hidden or read-only in the sandbox and
+//!   make every check cold.
+//! - **Shared lock:** worktrees of one repository share a cache key and its lock, so with several sessions editing
+//!   one repository at once a step's check often skips silently (`Pending`) while another holds it.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -40,6 +53,21 @@ pub fn applies(root: &Path) -> bool {
     root.join("Cargo.toml").is_file()
 }
 
+/// Why a Rust project can't be checked, if it can't: no `Cargo.lock` at its root (a workspace member's is at the
+/// workspace root, above it). Only looks.
+pub fn skip_reason(root: &Path) -> Option<&'static str> {
+    if root.join("Cargo.lock").is_file() {
+        return None;
+    }
+    let parent_workspace =
+        root.ancestors().skip(1).any(|dir| dir.join("Cargo.lock").is_file() || dir.join("Cargo.toml").is_file());
+    Some(if parent_workspace {
+        "skipped: this project is inside a Cargo workspace whose root is above it (start Marv in the workspace root)"
+    } else {
+        "skipped: no Cargo.lock (rust checks need a committed lockfile: the check can't write one)"
+    })
+}
+
 /// The command, run in the sandbox with the project as its folder; `cache` is the kind's key folder.
 pub fn check_command(cache: &Path) -> String {
     let target = cache.join("target");
@@ -51,6 +79,7 @@ pub fn check_command(cache: &Path) -> String {
         &[
             ("CARGO_TERM_COLOR", "never".into()),
             ("RUSTUP_AUTO_INSTALL", "0".into()),
+            ("RUSTC_WRAPPER", String::new()),
             ("CARGO_BUILD_JOBS", build_jobs().to_string()),
         ],
         &cargo,
@@ -163,10 +192,14 @@ impl CheckKind<Diagnostic> for Cargo {
     fn prepare(&self, root: &Path) -> bool {
         applies(root)
     }
+    fn skip(&self, root: &Path) -> Option<&'static str> {
+        skip_reason(root)
+    }
     /// Every pass is the whole workspace (a changed signature breaks callers in other files), so the whole baseline is
-    /// re-checked.
+    /// re-checked. A cache folder whose path isn't UTF-8 can't be named exactly in the command: nothing runs.
     fn pass(&self, _root: &Path, cache: Option<&Path>, _changed: Option<&[String]>) -> Option<CheckPass<Diagnostic>> {
-        Some(CheckPass { command: check_command(cache?), covers: None, read_only: Vec::new() })
+        let cache = cache.filter(|c| c.to_str().is_some())?;
+        Some(CheckPass { command: check_command(cache), covers: None, read_only: Vec::new() })
     }
     fn parse(&self, output: &str, exit_code: Option<i32>) -> Option<Vec<Diagnostic>> {
         parse_cargo(output, exit_code)
@@ -299,6 +332,7 @@ mod tests {
             assert!(command.contains(part), "{command}");
         }
         assert!(command.contains("export RUSTUP_AUTO_INSTALL='0';"), "{command}");
+        assert!(command.contains("export RUSTC_WRAPPER='';"), "{command}");
         assert!(command.contains("export CARGO_TERM_COLOR='never';"), "{command}");
         assert!(command.contains(&format!("export CARGO_BUILD_JOBS='{}';", build_jobs())), "{command}");
         assert!(command.contains("nice -n 10"), "{command}");
@@ -316,6 +350,14 @@ mod tests {
         assert!(!Cargo.prepare(&dir.0));
         dir.put("Cargo.toml", "[workspace]\n");
         assert!(Cargo.prepare(&dir.0));
+        assert_eq!(
+            Cargo.skip(&dir.0),
+            Some("skipped: no Cargo.lock (rust checks need a committed lockfile: the check can't write one)")
+        );
+        // A member of a workspace whose root (and lockfile) is above the project.
+        assert!(Cargo.skip(&dir.0.join("crates/a")).unwrap().contains("workspace whose root is above it"));
+        dir.put("Cargo.lock", "version = 3\n");
+        assert_eq!(Cargo.skip(&dir.0), None);
         assert!(Cargo.not_installed("", Some(127)));
         assert!(!Cargo.not_installed("", Some(101)));
         assert!(!Cargo.not_installed(FAILED, Some(127)));

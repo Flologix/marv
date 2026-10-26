@@ -574,6 +574,7 @@ fn host_spawn_probe(markers: &Path) {
                 std::fs::write(project.join(marker), "").unwrap();
                 std::fs::write(project.join("Fake.toml"), "").unwrap();
                 std::fs::write(project.join("rust-toolchain.toml"), "[toolchain]\nchannel = \"nightly\"\n").unwrap();
+                std::fs::write(project.join("Cargo.lock"), "version = 3\n").unwrap();
             }
             assert_eq!(repo_key(&repo), repo_key(&tree));
             let mut cache = CheckCache::new(dir.0.join("cache"));
@@ -615,23 +616,32 @@ fn host_spawn_probe(markers: &Path) {
     assert_eq!(left(), ["git"], "the marker PATH doesn't work");
 }
 
-/// `low_priority` runs its command with bash, not `sh` (dash on Debian and Ubuntu), and an `ionice` that's there but
-/// refused (some containers) falls back to `nice` alone instead of failing the check.
+/// `low_priority` runs its command with bash, not `sh` (dash on Debian and Ubuntu), and a `nice` or `ionice` that's
+/// refused or talks is left out instead of putting a line in the check's output (stdout and stderr are one output in
+/// a check): macOS's `nice` under Seatbelt prints "setpriority: Operation not permitted" and runs the command anyway;
+/// some containers refuse `ionice`.
 ///
-/// Proven: put `sh -c` back → failed (bash as `sh` runs in POSIX mode; dash has no `[[ ]]`); dropped the `ionice -c3 true` probe → the refusing
-/// `ionice` ran the check and its "refused" came out instead.
+/// Proven: put `sh -c` back → failed (bash as `sh` runs in POSIX mode; dash has no `[[ ]]`); dropped the `nice` probe
+/// → the talking `nice`'s warning came out; dropped the `ionice` probe → the refusing `ionice`'s "refused" came out.
 #[test]
-fn low_priority_runs_bash_and_survives_a_refused_ionice() {
-    let dir = Scratch::new();
-    let refusing = dir.0.join("bin/ionice");
-    dir.put("bin/ionice", "#!/bin/sh\necho 'ionice: refused'\nexit 1\n");
-    std::fs::set_permissions(&refusing, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    let command = low_priority(&[], "[[ -n \"$BASH_VERSION\" ]] && ! shopt -oq posix && echo bash-ran");
-    let path = format!("{}:{}", dir.0.join("bin").display(), std::env::var("PATH").unwrap_or_default());
-    let out = std::process::Command::new("/bin/sh").arg("-c").arg(&command).env("PATH", path).output().unwrap();
-    let text = String::from_utf8_lossy(&out.stdout);
-    assert_eq!(text.trim(), "bash-ran", "{text}{}", String::from_utf8_lossy(&out.stderr));
-    assert!(out.status.success());
+fn low_priority_runs_bash_and_survives_a_refused_nice_or_ionice() {
+    let stand_ins = [
+        // BSD's nice under Seatbelt: warns, then runs the command.
+        ("nice", "#!/bin/sh\necho 'nice: setpriority: Operation not permitted' >&2\nshift 2\nexec \"$@\"\n"),
+        ("nice", "#!/bin/sh\necho 'nice: refused' >&2\nexit 1\n"),
+        ("ionice", "#!/bin/sh\necho 'ionice: refused'\nexit 1\n"),
+    ];
+    for (tool, script) in stand_ins {
+        let dir = Scratch::new();
+        dir.put(&format!("bin/{tool}"), script);
+        std::fs::set_permissions(dir.0.join("bin").join(tool), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let command = low_priority(&[], "[[ -n \"$BASH_VERSION\" ]] && ! shopt -oq posix && echo bash-ran");
+        let path = format!("{}:{}", dir.0.join("bin").display(), std::env::var("PATH").unwrap_or_default());
+        let out = std::process::Command::new("/bin/sh").arg("-c").arg(&command).env("PATH", path).output().unwrap();
+        let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert_eq!((stdout.as_ref(), stderr.as_ref()), ("bash-ran\n", ""), "{tool}: {script}");
+        assert!(out.status.success(), "{tool}");
+    }
 }
 
 /// `low_priority` runs the whole command, pipes and all, niced, with its environment.
@@ -697,7 +707,23 @@ async fn the_key_folder_is_checked_again_under_the_lock() {
 fn rust_setup() -> (Scratch, PathBuf, Arc<CheckCache>) {
     let (dir, project, cache) = setup();
     dir.put("project/Cargo.toml", "[package]\nname = \"fixture\"\n");
+    dir.put("project/Cargo.lock", "version = 3\n");
     (dir, project, cache)
+}
+
+/// A Rust project the kind can't check (no `Cargo.lock`) runs nothing and says why in `/diagnostics` only.
+#[tokio::test]
+async fn a_rust_project_without_a_lockfile_runs_nothing_and_says_why_in_diagnostics() {
+    let (_dir, project, cache) = rust_setup();
+    std::fs::remove_file(project.join("Cargo.lock")).unwrap();
+    let runs = Runs::checks(vec![]);
+    let checker = checker_of(Arc::new(super::cargo::Cargo), &runs, &cache);
+    assert!(turn(&checker, &project).checks.is_none());
+    assert_eq!(runs.all().len(), 0);
+    assert!(checker.state_at(&project).starts_with("skipped: no Cargo.lock"), "{}", checker.state_at(&project));
+    std::fs::write(project.join("Cargo.lock"), "version = 3\n").unwrap();
+    assert_eq!(checker.state_at(&project), "ready");
+    assert!(turn(&checker, &project).checks.is_some());
 }
 
 /// The kind warms up at the first change, runs in its key folder (target dir there, never the project's), and tells

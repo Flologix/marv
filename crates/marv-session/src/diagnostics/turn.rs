@@ -176,15 +176,20 @@ pub fn sandboxed() -> RunCheck {
 }
 
 /// A command at low priority (#187 §6.1): the whole of it (pipes, `&&`, redirections and all) run by `bash -c` (as
-/// the bash tool runs commands: `sh` is dash on Debian and Ubuntu) under `nice -n 10`, plus `ionice -c3` where the
-/// sandbox has it and it's allowed (Linux; resolved inside the sandbox, never on the host). An `ionice` that's there
-/// but refused (some containers forbid I/O classes) falls back to `nice` alone, rather than failing the check. `env`
-/// is exported first, since the sandbox's environment is built from scratch.
+/// the bash tool runs commands: `sh` is dash on Debian and Ubuntu) under `nice -n 10` and, where the sandbox has it,
+/// `ionice -c3` (Linux; both resolved inside the sandbox, never on the host). Each is probed first and left out when
+/// it's refused or says anything: under Seatbelt, macOS's `nice` prints "setpriority: Operation not permitted" and
+/// runs the command anyway, and that line in the output would make every check unreadable; some containers refuse
+/// I/O classes. A check without priority beats no check. `env` is exported first, since the sandbox's environment is
+/// built from scratch.
 pub fn low_priority(env: &[(&str, String)], command: &str) -> String {
     let exports: String = env.iter().map(|(k, v)| format!("export {k}={}; ", shell_quote(v))).collect();
     let inner = shell_quote(command);
     format!(
-        "{exports}if command -v ionice >/dev/null 2>&1 && ionice -c3 true >/dev/null 2>&1; then exec nice -n 10 ionice -c3 bash -c {inner}; else exec nice -n 10 bash -c {inner}; fi"
+        "{exports}marv_nice=; marv_ionice=; \
+         marv_out=$(nice -n 10 true 2>&1) && [ -z \"$marv_out\" ] && marv_nice='nice -n 10'; \
+         command -v ionice >/dev/null 2>&1 && marv_out=$(ionice -c3 true 2>&1) && [ -z \"$marv_out\" ] && marv_ionice='ionice -c3'; \
+         exec $marv_nice $marv_ionice bash -c {inner}"
     )
 }
 
@@ -243,6 +248,11 @@ pub trait CheckKind<E>: Send + Sync {
     }
     /// Whether anything can run in this project this turn (a compiler, some checks). Only looks at files.
     fn prepare(&self, root: &Path) -> bool;
+    /// For a project `prepare` accepts, why this kind still can't check it, said in `/diagnostics` and nowhere else
+    /// (cargo check without a `Cargo.lock`: the read-only project can't get one). Only looks at files.
+    fn skip(&self, _root: &Path) -> Option<&'static str> {
+        None
+    }
     /// `None` = the baseline (everything); `Some(files)` = a step that changed those (project-relative). `None` back:
     /// nothing it checks could have changed, which costs nothing. `cache`: the key folder, for a kind with one.
     fn pass(&self, root: &Path, cache: Option<&Path>, changed: Option<&[String]>) -> Option<CheckPass<E>>;
@@ -445,9 +455,21 @@ impl<E: Clone + Send + Sync + 'static> Checker<E> {
         "ready".into()
     }
 
-    /// This turn's hooks; `None` when nothing can run (no compiler, no checks, two timeouts already).
+    /// Its state in this project, for `/diagnostics`: why it can't check it, if it can't ([`CheckKind::skip`]).
+    pub fn state_at(&self, root: &Path) -> String {
+        match self.kind.prepare(root).then(|| self.kind.skip(root)).flatten() {
+            Some(why) => why.into(),
+            None => self.state(),
+        }
+    }
+
+    /// This turn's hooks; `None` when nothing can run (no compiler, no checks, two timeouts already, a project the
+    /// kind skips).
     pub fn turn(self: &Arc<Self>, options: TurnOptions<E>) -> Option<TurnChecks> {
-        if self.timeouts.load(Ordering::SeqCst) >= MAX_TIMEOUTS || !self.kind.prepare(&options.root) {
+        if self.timeouts.load(Ordering::SeqCst) >= MAX_TIMEOUTS
+            || !self.kind.prepare(&options.root)
+            || self.kind.skip(&options.root).is_some()
+        {
             return None;
         }
         if self.kind.cache() && self.cache.is_none() {
