@@ -97,8 +97,9 @@ pub enum OffReason {
 /// How a check went, for one kind of problem `E`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CheckOutcome<E> {
-    /// It ran. `added`: the problems the model was told about.
-    Done { ms: u64, before: usize, errors: usize, added: Vec<E> },
+    /// It ran. `added`: the new problems; `told`: how many of them the model's note lists (a step's kinds share one
+    /// budget, so a kind can get none; the note still counts them).
+    Done { ms: u64, before: usize, errors: usize, added: Vec<E>, told: usize },
     /// It couldn't tell what's new, so nothing was said. `notify`: the session's first such result.
     Failed { ms: u64, reason: FailReason, tool: Option<String>, notify: bool },
     /// No checks from here on (said once per session).
@@ -266,6 +267,11 @@ pub trait CheckKind<E>: Send + Sync {
     /// links on the host, never by running anything (a uv venv's `python` linking into the hidden
     /// `~/.local/share/uv/python`, #187 §6.5). Then nothing runs, and the session's first such turn says so.
     fn hidden(&self, _root: &Path) -> Option<String> {
+        None
+    }
+    /// For `/diagnostics` when the sandbox found no tool: where the host has one the sandbox hides (under the home,
+    /// e.g. `~/.local/bin`), found by looking at paths only, never by running it.
+    fn hidden_install(&self) -> Option<String> {
         None
     }
     fn key(&self, problem: &E) -> String;
@@ -470,7 +476,14 @@ impl<E: Clone + Send + Sync + 'static> Checker<E> {
         match *locked(&self.shared.off) {
             Some(OffReason::Unreadable) => return "off for this session: its output couldn't be read twice in a row".into(),
             Some(OffReason::CacheTooBig) => return "off for this session: its cache passed the size limit".into(),
-            Some(OffReason::NotInstalled) => return "not installed (Marv doesn't install toolchains)".into(),
+            Some(OffReason::NotInstalled) => {
+                return match self.kind.hidden_install() {
+                    Some(at) => {
+                        format!("installed at {at}, under your home, which the sandbox hides (Marv doesn't install toolchains)")
+                    }
+                    None => "not installed (Marv doesn't install toolchains)".into(),
+                };
+            }
             _ => {}
         }
         if self.timeouts.load(Ordering::SeqCst) >= MAX_TIMEOUTS {
@@ -538,9 +551,10 @@ impl<E: Clone + Send + Sync + 'static> Checker<E> {
         let notes: StepNotes = Arc::new(move |runs| {
             let (turn, kind) = (turn.clone(), kind.clone());
             async move {
-                let added = turn.step_added(runs).await?;
+                let (added, tell) = turn.step_added(runs).await?;
                 let count = added.len();
                 let note = Box::new(move |limit: usize| {
+                    tell(limit.min(count));
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| kind.note_within(&added, limit))).ok()
                 });
                 Some(StepNote { count, note: note as Box<dyn FnOnce(usize) -> Option<String> + Send> })
@@ -890,7 +904,25 @@ impl<E: Clone + Send + Sync + 'static> Turn<E> {
     }
 
     /// After a step: the problems its file changes added (never empty), otherwise `None`.
-    async fn step_added(&self, runs: Vec<ToolRun>) -> Option<Vec<E>> {
+    /// Nothing is told for them yet: the caller tells the [`CheckOutcome::Done`] once it knows how many its note lists
+    /// (an empty step is told here).
+    async fn step_added(&self, runs: Vec<ToolRun>) -> Option<(Vec<E>, Box<dyn FnOnce(usize) + Send>)> {
+        let (added, ms, before, errors) = self.step_checked(runs).await?;
+        if added.is_empty() {
+            self.tell(CheckOutcome::Done { ms, before, errors, added, told: 0 });
+            return None;
+        }
+        let options = self.options.on_result.clone();
+        let kept = added.clone();
+        Some((
+            added,
+            Box::new(move |told: usize| quietly(|| options(CheckOutcome::Done { ms, before, errors, added: kept, told }))),
+        ))
+    }
+
+    /// [`Self::step_added`] before anything is told: the new problems, the check's time, and the baseline's and the
+    /// new run's sizes.
+    async fn step_checked(&self, runs: Vec<ToolRun>) -> Option<(Vec<E>, u64, usize, usize)> {
         if !runs.iter().any(has_diff) {
             return None;
         }
@@ -928,8 +960,7 @@ impl<E: Clone + Send + Sync + 'static> Turn<E> {
         next.extend(now);
         let errors = next.len();
         *baseline = Baseline::Taken(Some(next));
-        self.tell(CheckOutcome::Done { ms, before: count, errors, added: added.clone() });
-        (!added.is_empty()).then_some(added)
+        Some((added, ms, count, errors))
     }
 }
 
@@ -1105,12 +1136,17 @@ fn generic_notice(label: &str, result: &CheckResult) -> Option<String> {
             Some(format!("✻ Marv couldn't read {label}'s output here, so it can't tell the model about new errors."))
         }
         CheckOutcome::Done { added, .. } if added.is_empty() => None,
-        CheckOutcome::Done { added, .. } => {
+        CheckOutcome::Done { added, told, .. } => {
             let n = added.len();
-            let mut lines = vec![format!("✻ {label}: {n} new error{}, told the model:", if n == 1 { "" } else { "s" })];
-            lines.extend(added.iter().take(NOTICE_LINES).map(|e| printable(&format_error(e))));
-            if n > NOTICE_LINES {
-                lines.push(format!("… and {} more", n - NOTICE_LINES));
+            let s = if n == 1 { "" } else { "s" };
+            if *told == 0 {
+                return Some(format!("✻ {label}: {n} new error{s}, not listed to the model (this step's note was full)."));
+            }
+            let shown = (*told).min(NOTICE_LINES);
+            let mut lines = vec![format!("✻ {label}: {n} new error{s}, told the model:")];
+            lines.extend(added.iter().take(shown).map(|e| printable(&format_error(e))));
+            if n > shown {
+                lines.push(format!("… and {} more", n - shown));
             }
             Some(lines.join("\n"))
         }
@@ -1134,12 +1170,17 @@ pub fn check_notice(result: &CheckResult) -> Option<String> {
         }
         CheckOutcome::Failed { .. } => None,
         CheckOutcome::Done { added, .. } if added.is_empty() => None,
-        CheckOutcome::Done { added, .. } => {
+        CheckOutcome::Done { added, told, .. } => {
             let n = added.len();
-            let mut lines = vec![format!("✻ Typecheck: {n} new error{}, told the model:", if n == 1 { "" } else { "s" })];
-            lines.extend(added.iter().take(NOTICE_LINES).map(|e| printable(&format_error(e))));
-            if n > NOTICE_LINES {
-                lines.push(format!("… and {} more", n - NOTICE_LINES));
+            let s = if n == 1 { "" } else { "s" };
+            if *told == 0 {
+                return Some(format!("✻ Typecheck: {n} new error{s}, not listed to the model (this step's note was full)."));
+            }
+            let shown = (*told).min(NOTICE_LINES);
+            let mut lines = vec![format!("✻ Typecheck: {n} new error{s}, told the model:")];
+            lines.extend(added.iter().take(shown).map(|e| printable(&format_error(e))));
+            if n > shown {
+                lines.push(format!("… and {} more", n - shown));
             }
             Some(lines.join("\n"))
         }
@@ -1681,6 +1722,17 @@ mod tests {
     }
 
     #[test]
+    fn a_kind_with_no_share_of_the_budget_is_counted_not_listed_in_the_transcript() {
+        let added: Vec<Diagnostic> = (0..3).map(ts).collect();
+        let none = generic_notice("pyright", &CheckOutcome::Done { ms: 1, before: 0, errors: 3, added: added.clone(), told: 0 });
+        let none = none.unwrap();
+        assert!(!none.contains("told the model") && !none.contains("TS2304") && none.contains("3 new errors"), "{none}");
+        let two = generic_notice("pyright", &CheckOutcome::Done { ms: 1, before: 0, errors: 3, added, told: 2 }).unwrap();
+        assert_eq!(two.lines().count(), 1 + 2 + 1, "{two}");
+        assert!(two.contains("told the model:") && two.contains("… and 1 more"), "{two}");
+    }
+
+    #[test]
     fn checks_run_sandboxed_read_only_without_network() {
         let run = CheckRun {
             command: "tsc".into(),
@@ -1714,7 +1766,8 @@ mod tests {
 
     #[test]
     fn new_errors_the_first_five_then_how_many_more() {
-        let text = check_notice(&CheckOutcome::Done { ms: 5, before: 0, errors: 7, added: (0..7).map(ts).collect() }).unwrap();
+        let text =
+            check_notice(&CheckOutcome::Done { ms: 5, before: 0, errors: 7, added: (0..7).map(ts).collect(), told: 7 }).unwrap();
         let lines: Vec<&str> = text.split('\n').collect();
         assert_eq!(lines[0], "✻ Typecheck: 7 new errors, told the model:");
         assert_eq!(lines.len(), 1 + 5 + 1);
@@ -1748,9 +1801,9 @@ mod tests {
 
     #[test]
     fn notices() {
-        assert!(check_notice(&CheckOutcome::Done { ms: 1, before: 0, errors: 0, added: vec![] }).is_none());
+        assert!(check_notice(&CheckOutcome::Done { ms: 1, before: 0, errors: 0, added: vec![], told: 0 }).is_none());
         let e = Diagnostic { file: None, line: None, column: None, code: "TS1".into(), message: "m\u{1b}[2J".into() };
-        let n = check_notice(&CheckOutcome::Done { ms: 1, before: 0, errors: 1, added: vec![e] }).unwrap();
+        let n = check_notice(&CheckOutcome::Done { ms: 1, before: 0, errors: 1, added: vec![e], told: 1 }).unwrap();
         assert!(n.starts_with("✻ Typecheck: 1 new error, told the model:"));
         assert!(!n.contains('\u{1b}'));
     }

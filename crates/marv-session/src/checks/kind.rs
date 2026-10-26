@@ -472,9 +472,10 @@ mod tests {
     fn notices_quote_the_project_printably() {
         let mut evil = v("c", "m\u{1b}]52;c;aGk=\u{7}", None);
         evil.file = Some("a.ts".into());
-        let notice = project_check_notice(&CheckOutcome::Done { ms: 1, before: 0, errors: 1, added: vec![evil] }).unwrap();
+        let notice =
+            project_check_notice(&CheckOutcome::Done { ms: 1, before: 0, errors: 1, added: vec![evil], told: 1 }).unwrap();
         assert!(notice.starts_with("✻ Checks: 1 new problem, told the model:"));
         assert!(!notice.contains('\u{1b}'));
-        assert_eq!(project_check_notice(&CheckOutcome::Done { ms: 1, before: 0, errors: 0, added: vec![] }), None);
+        assert_eq!(project_check_notice(&CheckOutcome::Done { ms: 1, before: 0, errors: 0, added: vec![], told: 0 }), None);
     }
 }

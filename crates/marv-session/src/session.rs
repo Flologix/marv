@@ -1032,7 +1032,7 @@ fn check_record<E>(
 ) -> TrajectoryRecord {
     let who = Who { turn: turn.into(), agent: "main".into() };
     let (status, ms, before, errors, added, reason, told) = match result {
-        CheckOutcome::Done { ms, before, errors, added } => (
+        CheckOutcome::Done { ms, before, errors, added, .. } => (
             CheckStatus::Done,
             Some(*ms),
             Some(*before),
@@ -4774,7 +4774,7 @@ mod turn_tests {
     /// installed" is recorded.
     #[test]
     fn a_check_record_carries_the_cache_size() {
-        let done: CheckResult = CheckOutcome::Done { ms: 3, before: 0, errors: 0, added: vec![] };
+        let done: CheckResult = CheckOutcome::Done { ms: 3, before: 0, errors: 0, added: vec![], told: 0 };
         let record = serde_json::to_value(check_record("t1", Some("cargo"), &done, |_| String::new(), Some(42))).unwrap();
         assert_eq!((record["source"].as_str(), record["cacheBytes"].as_u64()), (Some("cargo"), Some(42)), "{record}");
         let off: CheckResult = CheckOutcome::Off { reason: OffReason::NotInstalled };

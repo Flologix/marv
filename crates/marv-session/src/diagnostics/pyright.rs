@@ -17,7 +17,9 @@
 //!   it's made relative to the root, and a file outside the root is dropped; lines and columns from 1. The run is
 //!   unreadable unless it exited 0 or 1 (2 is a fatal error, 3 a config file it couldn't parse), its JSON is the last
 //!   thing in the output (text before it, such as a node warning on stderr, is skipped; anything after it isn't),
-//!   and the summary's `errorCount` matches the errors listed. Messages are cut at [`super::cargo::MAX_MESSAGE`]
+//!   and the summary's `errorCount` matches the errors listed (and nothing is listed under exit 0). Exit 1 with no errors is a
+//!   clean check: basedpyright's default mode exits 1 on warnings alone. Both are run with `--level error`, so warnings
+//!   aren't printed and don't count toward the output cap. Messages are cut at [`super::cargo::MAX_MESSAGE`]
 //!   (basedpyright's no-break-space indents made plain spaces first).
 //! - **Not installed:** none of the four in the sandbox (the command exits 127 having printed nothing) turns the kind
 //!   off for the session quietly: most Python projects don't have pyright installed, and that isn't worth a notice.
@@ -53,10 +55,10 @@ pub fn applies(root: &Path) -> bool {
 /// The command, run in the sandbox with the project as its folder: the first checker there, in the module doc's order,
 /// or exit 127 with nothing printed when there's none. Resolved by the sandbox's shell, never on the host.
 pub fn check_command() -> String {
-    let cmd = "if [ -x .venv/bin/basedpyright ]; then exec .venv/bin/basedpyright --outputjson; \
-               elif [ -x node_modules/.bin/pyright ]; then exec node_modules/.bin/pyright --outputjson; \
-               elif command -v basedpyright >/dev/null 2>&1; then exec basedpyright --outputjson; \
-               elif command -v pyright >/dev/null 2>&1; then exec pyright --outputjson; \
+    let cmd = "if [ -x .venv/bin/basedpyright ]; then exec .venv/bin/basedpyright --level error --outputjson; \
+               elif [ -x node_modules/.bin/pyright ]; then exec node_modules/.bin/pyright --level error --outputjson; \
+               elif command -v basedpyright >/dev/null 2>&1; then exec basedpyright --level error --outputjson; \
+               elif command -v pyright >/dev/null 2>&1; then exec pyright --level error --outputjson; \
                else exit 127; fi";
     low_priority(&[], cmd)
 }
@@ -107,8 +109,9 @@ pub fn parse_pyright(root: &Path, output: &str, exit_code: Option<i32>) -> Optio
             message: cut(message.replace('\u{a0}', " ")),
         });
     }
-    // The summary disagreeing with the list, or the exit code with both: something else is going on.
-    if counted != error_count || (exit_code == Some(1)) != (counted > 0) {
+    // The summary disagreeing with the list, or errors listed under a clean exit: something else is going on. Exit 1
+    // with no errors is fine: basedpyright's default mode exits 1 on warnings alone.
+    if counted != error_count || (exit_code == Some(0) && counted > 0) {
         return None;
     }
     Some(errors)
@@ -144,6 +147,24 @@ pub fn missing(output: &str, exit_code: Option<i32>) -> Option<String> {
     REQUIRED_FILE.captures(output).map(|c| format!("the interpreter of {}", tilde(c[1].trim())))
 }
 
+/// `path` with `.` and `..` resolved by text (the files needn't exist), so a relative link out of the project
+/// is compared by where it lands.
+fn normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir if matches!(out.components().next_back(), Some(Component::Normal(_))) => {
+                out.pop();
+            }
+            Component::ParentDir if out.has_root() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// A `.venv/bin/python` in the project that links (through any chain of links) into a folder the sandbox hides,
 /// written for the notice: "this project's Python (~/.local/share/uv/python/…)". Reads links only; never runs it. A
 /// link inside the project is followed on, since the project itself is shown.
@@ -153,13 +174,24 @@ pub fn hidden_venv_python(root: &Path, hides: &dyn Fn(&Path) -> bool) -> Option<
     let mut at: PathBuf = root.join(".venv/bin/python");
     for _ in 0..16 {
         let target = std::fs::read_link(&at).ok()?;
-        let next = at.parent()?.join(target);
+        let next = normalize(&at.parent()?.join(target));
         if !inside(&next) && hides(&next) {
             return Some(format!("this project's Python ({})", tilde(&next.to_string_lossy())));
         }
         at = next;
     }
     None
+}
+
+/// Where a basedpyright or pyright sits in a home folder place the sandbox hides (pipx and uv tool put theirs in
+/// `~/.local/bin`), written with `~`. Only looks at paths; never runs it.
+pub fn installed_under_home(home: &Path, hides: &dyn Fn(&Path) -> bool) -> Option<String> {
+    ["bin", "share/mise/shims"]
+        .iter()
+        .map(|d| home.join(".local").join(d))
+        .flat_map(|dir| ["basedpyright", "pyright"].map(|b| dir.join(b)))
+        .find(|p| std::fs::symlink_metadata(p).is_ok() && hides(p))
+        .map(|p| tilde(&p.to_string_lossy()))
 }
 
 /// What the model is told: Marv's sentence, then the new errors fenced as the project's data.
@@ -217,6 +249,11 @@ impl CheckKind<Diagnostic> for Pyright {
         let backend = marv_sandbox::backend();
         hidden_venv_python(root, &|p| backend.hides(p, &home))
     }
+    fn hidden_install(&self) -> Option<String> {
+        let home = std::env::var_os("HOME").map(PathBuf::from)?;
+        let backend = marv_sandbox::backend();
+        installed_under_home(&home, &|p| backend.hides(p, &home))
+    }
     /// None of the four is in the sandbox: the command's own `exit 127`, with nothing printed.
     fn not_installed(&self, output: &str, exit_code: Option<i32>) -> bool {
         exit_code == Some(127) && output.trim().is_empty()
@@ -246,6 +283,8 @@ mod tests {
     const PYRIGHT: &str = include_str!("fixtures/pyright-errors.json");
     /// pyright on the project once fixed (real path left in: no file is named).
     const CLEAN: &str = include_str!("fixtures/pyright-clean.json");
+    /// basedpyright (1.40.2) in default mode on a project with only warnings: exit 1, `errorCount` 0.
+    const WARNINGS: &str = include_str!("fixtures/basedpyright-warnings.json");
 
     fn root() -> &'static Path {
         Path::new("/work/fixture")
@@ -301,7 +340,7 @@ mod tests {
         assert_eq!(parse_pyright(root(), PYRIGHT, None), None);
         // Errors listed with a clean exit, or a failed exit with none.
         assert_eq!(parse_pyright(root(), PYRIGHT, Some(0)), None);
-        assert_eq!(parse_pyright(root(), CLEAN, Some(1)), None);
+        assert_eq!(parse_pyright(root(), CLEAN, Some(1)), Some(vec![]));
         let miscounted = PYRIGHT.replace("\"errorCount\": 5", "\"errorCount\": 6");
         assert_eq!(parse_pyright(root(), &miscounted, Some(1)), None);
     }
@@ -423,6 +462,52 @@ mod tests {
         assert_eq!(missing("bash: line 1: pyright: command not found\n", Some(127)), None);
         assert_eq!(missing("", Some(127)), None);
         assert!(!Pyright.not_installed("env: ‘node’: No such file or directory\n", Some(127)));
+    }
+
+    #[test]
+    fn a_relative_link_out_of_the_project_into_a_hidden_folder_is_found() {
+        let dir = crate::checks::Scratch::new();
+        let hidden = dir.0.join("hidden-home/uv/python");
+        std::fs::create_dir_all(&hidden).unwrap();
+        std::fs::write(hidden.join("python3.12"), "").unwrap();
+        let project = dir.0.join("project");
+        std::fs::create_dir_all(project.join(".venv/bin")).unwrap();
+        std::os::unix::fs::symlink("../../../hidden-home/uv/python/python3.12", project.join(".venv/bin/python")).unwrap();
+        let root = std::fs::canonicalize(&project).unwrap();
+        let hides = |p: &Path| p.starts_with(root.parent().unwrap().join("hidden-home"));
+        let found = hidden_venv_python(&root, &hides).unwrap();
+        assert!(found.contains("hidden-home/uv/python/python3.12") && !found.contains(".."), "{found}");
+        assert_eq!(normalize(Path::new("/a/b/../c/./d")), PathBuf::from("/a/c/d"));
+        assert_eq!(normalize(Path::new("/../a")), PathBuf::from("/a"));
+    }
+
+    #[test]
+    fn a_checker_under_a_hidden_home_folder_is_found_by_looking_at_paths() {
+        let dir = crate::checks::Scratch::new();
+        let hides = |p: &Path| p.starts_with(dir.0.join(".local"));
+        assert_eq!(installed_under_home(&dir.0, &hides), None);
+        std::fs::create_dir_all(dir.0.join(".local/bin")).unwrap();
+        std::fs::write(dir.0.join(".local/bin/basedpyright"), "").unwrap();
+        let found = installed_under_home(&dir.0, &hides).unwrap();
+        assert!(found.ends_with(".local/bin/basedpyright"), "{found}");
+        assert_eq!(installed_under_home(&dir.0, &|_| false), None);
+    }
+
+    #[test]
+    fn a_warnings_only_run_exits_1_with_no_errors_and_is_a_clean_check() {
+        // Real basedpyright 1.40.2 default mode on a file with two unused imports: two warnings, exit 1.
+        assert!(WARNINGS.contains("\"warningCount\": 2") && WARNINGS.contains("\"errorCount\": 0"));
+        assert_eq!(parse_pyright(root(), WARNINGS, Some(1)), Some(vec![]));
+        // `--level error` lists none of them; the exit code is still 1.
+        let quiet = WARNINGS.replace("\"severity\": \"warning\"", "\"severity\": \"information\"");
+        assert_eq!(parse_pyright(root(), &quiet, Some(1)), Some(vec![]));
+        // Errors listed under exit 0 stay unreadable.
+        assert_eq!(parse_pyright(root(), PYRIGHT, Some(0)), None);
+    }
+
+    #[test]
+    fn the_commands_list_errors_only() {
+        assert_eq!(check_command().matches("--level error --outputjson").count(), 4);
     }
 
     #[test]

@@ -172,3 +172,36 @@ async fn a_projects_own_checker_runs_sandboxed() {
     let options = sandboxed_options(&runs[0].0);
     assert!(options.sandbox && options.project_read_only && !options.network && options.writable.is_empty());
 }
+
+/// **A project with only warnings is a clean check, not an unreadable one** (basedpyright exits 1 on warnings in its
+/// default mode, with `errorCount` 0): no notice, no failure, and a later real error is still told.
+///
+/// Proven: made `parse_pyright` read exit 1 with no errors as unreadable → failed (the warnings-only baseline
+/// failed, so the later error was never told).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_project_with_only_warnings_is_a_clean_check() {
+    marv_guards::require_sandbox!();
+    if !host_has_pyright() {
+        eprintln!("skipped: no basedpyright or pyright here");
+        return;
+    }
+    let project = project();
+    // An unused import is a warning under this config, for both checkers.
+    project.write("pyrightconfig.json", "{\"reportUnusedImport\": \"warning\"}\n");
+    project.write("pkg/use.py", "import os\nfrom pkg.lib import answer\n\nx: int = answer()\n");
+    let seen: Arc<Mutex<Vec<(CheckRun, CommandResult)>>> = Default::default();
+    let (checks, told) = turn(project.path(), recording(&seen));
+    checks.before_change.before_change().await;
+    let runs = || seen.lock().unwrap().clone();
+    assert!(
+        matches!(told.lock().unwrap().as_slice(), []),
+        "the warnings-only baseline wasn't read: {:?} {:?}",
+        told.lock().unwrap(),
+        runs()
+    );
+    project.write("pkg/use.py", "import os\nfrom pkg.lib import answer\n\nx: str = answer()\n");
+    let note = (checks.after_step)(vec![edited("pkg/use.py")]).await;
+    let note = note.unwrap_or_else(|| panic!("nothing told: {:?} {:?}", told.lock().unwrap(), runs()));
+    assert!(note.contains("pyright found 1 error that wasn't in the previous check."), "{note}");
+    assert!(!note.contains("reportUnusedImport"), "{note}");
+}
