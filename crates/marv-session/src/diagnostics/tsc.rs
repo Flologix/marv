@@ -109,16 +109,28 @@ pub fn missing_interpreter(output: &str, exit_code: Option<i32>) -> Option<Strin
 
 /// What the model is told: Marv's sentence, then the new errors fenced as the project's data.
 pub fn diagnostics_note(added: &[Diagnostic]) -> String {
-    let mut body: Vec<String> = added.iter().take(MAX_REPORTED).map(format_error).collect();
-    if added.len() > MAX_REPORTED {
-        body.push(format!("and {} more.", added.len() - MAX_REPORTED));
-    }
+    diagnostics_note_within(added, MAX_REPORTED)
+}
+
+/// [`diagnostics_note`] listing at most `limit` errors (and never more than [`MAX_REPORTED`]): a step's kinds share
+/// one budget (#187).
+pub fn diagnostics_note_within(added: &[Diagnostic], limit: usize) -> String {
     let n = added.len();
     crate::provenance::project_note(
         &format!("The typecheck (tsc) found {n} new error{} after your changes.", if n == 1 { "" } else { "s" }),
         "typecheck",
-        &body.join("\n"),
+        &error_list(added, limit),
     )
+}
+
+/// The errors a note lists: at most `limit` (and [`MAX_REPORTED`]) of them, one per line, then how many more.
+pub fn error_list(added: &[Diagnostic], limit: usize) -> String {
+    let shown = limit.min(MAX_REPORTED);
+    let mut body: Vec<String> = added.iter().take(shown).map(format_error).collect();
+    if added.len() > shown {
+        body.push(format!("and {} more.", added.len() - shown));
+    }
+    body.join("\n")
 }
 
 #[cfg(test)]

@@ -40,7 +40,7 @@ use std::path::Path;
 use serde_json::Value;
 
 use super::Diagnostic;
-use super::tsc::{MAX_REPORTED, format_error, ts_error_key};
+use super::tsc::{MAX_REPORTED, error_list, ts_error_key};
 use super::turn::{CheckKind, CheckPass, MAX_UNREADABLE, build_jobs, low_priority, shell_quote};
 
 /// Its name in notices, `/diagnostics` and the note.
@@ -87,7 +87,7 @@ pub fn check_command(cache: &Path) -> String {
 }
 
 /// `s`, cut at [`MAX_MESSAGE`] characters (an ellipsis marks the cut).
-fn cut(s: String) -> String {
+pub(super) fn cut(s: String) -> String {
     match s.char_indices().nth(MAX_MESSAGE) {
         Some((at, _)) => format!("{}…", &s[..at]),
         None => s,
@@ -154,10 +154,11 @@ pub fn not_installed(output: &str, exit_code: Option<i32>) -> bool {
 
 /// What the model is told: Marv's sentence, then the new errors fenced as the project's data.
 pub fn cargo_note(added: &[Diagnostic]) -> String {
-    let mut body: Vec<String> = added.iter().take(MAX_REPORTED).map(format_error).collect();
-    if added.len() > MAX_REPORTED {
-        body.push(format!("and {} more.", added.len() - MAX_REPORTED));
-    }
+    cargo_note_within(added, MAX_REPORTED)
+}
+
+/// [`cargo_note`] listing at most `limit` errors: a step's kinds share one budget.
+pub fn cargo_note_within(added: &[Diagnostic], limit: usize) -> String {
     let n = added.len();
     crate::provenance::project_note(
         &if n == 1 {
@@ -166,7 +167,7 @@ pub fn cargo_note(added: &[Diagnostic]) -> String {
             format!("cargo check found {n} errors that weren't in the previous check.")
         },
         LABEL,
-        &body.join("\n"),
+        &error_list(added, limit),
     )
 }
 
@@ -217,10 +218,14 @@ impl CheckKind<Diagnostic> for Cargo {
     fn note(&self, added: &[Diagnostic]) -> String {
         cargo_note(added)
     }
+    fn note_within(&self, added: &[Diagnostic], limit: usize) -> String {
+        cargo_note_within(added, limit)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::tsc::format_error;
     use super::*;
 
     /// Real `cargo check --workspace --all-targets` output (cargo 1.9x) on a crate with two errors in `src/lib.rs` and

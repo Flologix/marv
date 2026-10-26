@@ -61,8 +61,7 @@ pub const WARM_UP_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// How long a baseline waits for the warm-up, or for another session's lock, before the turn is pending.
 pub const BASELINE_WAIT: Duration = Duration::from_secs(10);
 /// Errors one step's joined diagnostics note may list, all kinds together (#187 §6.7; each kind lists up to
-/// `tsc::MAX_REPORTED`). With tsc and cargo check that holds by construction (20 each); a session test keeps it so,
-/// and a third language's kind has to bring the shared budget with it.
+/// `tsc::MAX_REPORTED`): [`combine_checks_within`] fills the kinds in order, each keeping its count ("and 12 more").
 pub const MAX_REPORTED_PER_STEP: usize = 40;
 /// Errors the transcript shows (the model gets up to `MAX_REPORTED`).
 const NOTICE_LINES: usize = 5;
@@ -257,9 +256,25 @@ pub trait CheckKind<E>: Send + Sync {
     /// nothing it checks could have changed, which costs nothing. `cache`: the key folder, for a kind with one.
     fn pass(&self, root: &Path, cache: Option<&Path>, changed: Option<&[String]>) -> Option<CheckPass<E>>;
     fn parse(&self, output: &str, exit_code: Option<i32>) -> Option<Vec<E>>;
+    /// [`Self::parse`], for a kind whose tool names files by their absolute paths (pyright): `root` is the project
+    /// the run was in, so they can be made relative (and files outside it dropped).
+    fn parse_in(&self, _root: &Path, output: &str, exit_code: Option<i32>) -> Option<Vec<E>> {
+        self.parse(output, exit_code)
+    }
     fn missing(&self, output: &str, exit_code: Option<i32>) -> Option<String>;
+    /// An interpreter the project's checker needs that the sandbox hides, found before anything runs by reading
+    /// links on the host, never by running anything (a uv venv's `python` linking into the hidden
+    /// `~/.local/share/uv/python`, #187 §6.5). Then nothing runs, and the session's first such turn says so.
+    fn hidden(&self, _root: &Path) -> Option<String> {
+        None
+    }
     fn key(&self, problem: &E) -> String;
     fn note(&self, added: &[E]) -> String;
+    /// [`Self::note`] listing at most `limit` problems (counting the rest), for a step whose kinds share
+    /// [`MAX_REPORTED_PER_STEP`]. The default ignores the limit.
+    fn note_within(&self, added: &[E], _limit: usize) -> String {
+        self.note(added)
+    }
 }
 
 /// The problems in `now` that `before` didn't have, matched by `key`; counted, so a second copy of an old one is new.
@@ -299,7 +314,19 @@ pub fn changed_files(runs: &[ToolRun]) -> Option<Vec<String>> {
 pub struct TurnChecks {
     pub before_change: Arc<dyn marv_tools::BeforeChange>,
     pub after_step: marv_agent::agent::AfterStep,
+    /// `after_step` before its note is written, for [`combine_checks_within`] (`None`: only `after_step`).
+    pub notes: Option<StepNotes>,
 }
+
+/// A step's new problems for one kind: how many, and its note listing at most the given number of them (the rest
+/// counted). `None` from the note: writing it failed.
+pub struct StepNote {
+    pub count: usize,
+    pub note: Box<dyn FnOnce(usize) -> Option<String> + Send>,
+}
+
+/// A step's [`StepNote`], or `None` when it added nothing (or nothing was checked).
+pub type StepNotes = Arc<dyn Fn(Vec<ToolRun>) -> BoxFuture<'static, Option<StepNote>> + Send + Sync>;
 
 /// Turn options: the session's sandbox setting, the turn's stop (must cancel when the turn ends, however it ends: a
 /// baseline started by a declined call's preview would otherwise run on and its timeout count against the session),
@@ -487,6 +514,7 @@ impl<E: Clone + Send + Sync + 'static> Checker<E> {
                     on_result: options.on_result,
                 }),
                 after_step: Arc::new(|_| async { None }.boxed()),
+                notes: None,
             });
         }
         let works = self.sandbox_works.as_ref().map_or_else(|| marv_sandbox::backend().available(), |f| f());
@@ -495,6 +523,7 @@ impl<E: Clone + Send + Sync + 'static> Checker<E> {
             return Some(TurnChecks {
                 before_change: Arc::new(NoSandbox { checker: self.clone(), on_result: options.on_result }),
                 after_step: Arc::new(|_| async { None }.boxed()),
+                notes: None,
             });
         }
         let turn = Arc::new(Turn {
@@ -504,13 +533,28 @@ impl<E: Clone + Send + Sync + 'static> Checker<E> {
             unavailable: AtomicBool::new(false),
             baseline: tokio::sync::Mutex::new(Baseline::NotTaken),
         });
-        let after = turn.clone();
+        let before = turn.clone();
+        let kind = self.kind.clone();
+        let notes: StepNotes = Arc::new(move |runs| {
+            let (turn, kind) = (turn.clone(), kind.clone());
+            async move {
+                let added = turn.step_added(runs).await?;
+                let count = added.len();
+                let note = Box::new(move |limit: usize| {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| kind.note_within(&added, limit))).ok()
+                });
+                Some(StepNote { count, note: note as Box<dyn FnOnce(usize) -> Option<String> + Send> })
+            }
+            .boxed()
+        });
+        let after = notes.clone();
         Some(TurnChecks {
-            before_change: Arc::new(BaselineHook(turn)),
+            before_change: Arc::new(BaselineHook(before)),
             after_step: Arc::new(move |runs| {
-                let turn = after.clone();
-                async move { turn.after_step(runs).await }.boxed()
+                let notes = after.clone();
+                async move { notes(runs).await.and_then(|n| (n.note)(super::tsc::MAX_REPORTED)) }.boxed()
             }),
+            notes: Some(notes),
         })
     }
 }
@@ -723,6 +767,13 @@ impl<E: Clone + Send + Sync + 'static> Turn<E> {
     /// The turn's baseline: its problems, or `None` when it couldn't be taken (then this turn says nothing).
     async fn take_baseline(&self) -> Option<Vec<E>> {
         let started = Instant::now();
+        // An interpreter the sandbox hides: running would only fail (or check against the wrong Python).
+        if let Some(tool) = self.checker.kind.hidden(&self.options.root) {
+            self.unavailable.store(true, Ordering::SeqCst);
+            let notify = self.notify_once();
+            self.tell(CheckOutcome::Failed { ms: 0, reason: FailReason::MissingInterpreter, tool: Some(tool), notify });
+            return None;
+        }
         if !self.wait_for_warm_up().await {
             if !self.options.cancel.is_cancelled() {
                 self.pending(started.elapsed().as_millis() as u64, true);
@@ -811,9 +862,11 @@ impl<E: Clone + Send + Sync + 'static> Turn<E> {
         // Output at the capture limit was cut off, maybe mid-list: what's left would make problems look fixed or new.
         let errors = if missing.is_none() && result.output.len() < MAX_CAPTURE {
             // A bug in reading the output must never end the turn.
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| checker.kind.parse(&result.output, result.exit_code)))
-                .ok()
-                .flatten()
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                checker.kind.parse_in(&self.options.root, &result.output, result.exit_code)
+            }))
+            .ok()
+            .flatten()
         } else {
             None
         };
@@ -836,8 +889,8 @@ impl<E: Clone + Send + Sync + 'static> Turn<E> {
         Some((errors, ms))
     }
 
-    /// After a step: the note for the model when its file changes added problems, otherwise `None`.
-    async fn after_step(&self, runs: Vec<ToolRun>) -> Option<String> {
+    /// After a step: the problems its file changes added (never empty), otherwise `None`.
+    async fn step_added(&self, runs: Vec<ToolRun>) -> Option<Vec<E>> {
         if !runs.iter().any(has_diff) {
             return None;
         }
@@ -876,10 +929,7 @@ impl<E: Clone + Send + Sync + 'static> Turn<E> {
         let errors = next.len();
         *baseline = Baseline::Taken(Some(next));
         self.tell(CheckOutcome::Done { ms, before: count, errors, added: added.clone() });
-        if added.is_empty() {
-            return None;
-        }
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| kind.note(&added))).ok()
+        (!added.is_empty()).then_some(added)
     }
 }
 
@@ -912,6 +962,9 @@ impl CheckKind<Diagnostic> for Typecheck {
     fn note(&self, added: &[Diagnostic]) -> String {
         super::tsc::diagnostics_note(added)
     }
+    fn note_within(&self, added: &[Diagnostic], limit: usize) -> String {
+        super::tsc::diagnostics_note_within(added, limit)
+    }
 }
 
 /// Several kinds as one: their baselines taken together, their after-step checks side by side, their notes joined
@@ -933,9 +986,70 @@ pub fn combine_checks(parts: Vec<TurnChecks>) -> Option<TurnChecks> {
                     }
                     .boxed()
                 }),
+                notes: None,
             })
         }
     }
+}
+
+/// [`combine_checks`] for the diagnostics kinds, whose notes share one budget (#187 §6.7): a step's joined note lists
+/// at most `budget` problems in all. The kinds run side by side, then are filled in order, each listing what's left
+/// of the budget (at most its own `tsc::MAX_REPORTED`) and counting the rest, so every kind's count is kept even when
+/// the budget is spent. A part without `notes` adds its note as it is.
+pub fn combine_checks_within(parts: Vec<TurnChecks>, budget: usize) -> Option<TurnChecks> {
+    if parts.is_empty() {
+        return None;
+    }
+    let befores: Vec<_> = parts.iter().map(|p| p.before_change.clone()).collect();
+    let befores: Arc<dyn marv_tools::BeforeChange> =
+        if befores.len() == 1 { befores.into_iter().next().unwrap() } else { Arc::new(Together(befores)) };
+    enum Part {
+        Budgeted(StepNotes),
+        Plain(marv_agent::agent::AfterStep),
+    }
+    let parts: Arc<Vec<Part>> = Arc::new(
+        parts
+            .into_iter()
+            .map(|p| match p.notes {
+                Some(notes) => Part::Budgeted(notes),
+                None => Part::Plain(p.after_step),
+            })
+            .collect(),
+    );
+    Some(TurnChecks {
+        before_change: befores,
+        after_step: Arc::new(move |runs: Vec<ToolRun>| {
+            enum Got {
+                Budgeted(Option<StepNote>),
+                Plain(Option<String>),
+            }
+            let steps: Vec<BoxFuture<'static, Got>> = parts
+                .iter()
+                .map(|part| match part {
+                    Part::Budgeted(notes) => notes(runs.clone()).map(Got::Budgeted).boxed(),
+                    Part::Plain(after) => after(runs.clone()).map(Got::Plain).boxed(),
+                })
+                .collect();
+            async move {
+                let mut left = budget;
+                let mut notes = Vec::new();
+                for got in futures::future::join_all(steps).await {
+                    match got {
+                        Got::Budgeted(Some(step)) => {
+                            let limit = left.min(super::tsc::MAX_REPORTED);
+                            left -= limit.min(step.count);
+                            notes.extend((step.note)(limit));
+                        }
+                        Got::Plain(Some(note)) => notes.push(note),
+                        Got::Budgeted(None) | Got::Plain(None) => {}
+                    }
+                }
+                (!notes.is_empty()).then(|| notes.join("\n\n"))
+            }
+            .boxed()
+        }),
+        notes: None,
+    })
 }
 
 /// Several baselines, taken together.
@@ -1527,6 +1641,43 @@ mod tests {
         let parts: Vec<&str> = note.split("\n\n").collect();
         assert!(parts.len() >= 2 && note.contains("'x'") && note.contains("'y'"), "{note}");
         assert!(combine_checks(vec![]).is_none());
+    }
+
+    /// #187 §6.7: three kinds each adding 25 errors in one step share 40: the first lists 20, the second the 20 left,
+    /// the third none, and each keeps its count. A kind's own note (alone) still lists 20.
+    #[tokio::test]
+    async fn a_steps_kinds_share_the_budget_in_order_each_keeping_its_count() {
+        let dir = project();
+        let errors: String =
+            (0..25).map(|i| format!("src/a.ts({},1): error TS2304: Cannot find name 'v{i}'.\n", i + 1)).collect();
+        let fakes: Vec<Fake> = (0..3).map(|_| Fake::answers(vec![ok(""), failed(&errors)])).collect();
+        let turns: Vec<_> = fakes.iter().map(|f| turn(&diagnostics(f, true), &dir)).collect();
+        let all =
+            combine_checks_within(turns.iter().map(|t| t.checks.clone().unwrap()).collect(), MAX_REPORTED_PER_STEP).unwrap();
+        all.before_change.before_change().await;
+        let note = (all.after_step)(vec![edited(None)]).await.unwrap();
+        let notes: Vec<&str> = note.split("(Automatic note from Marv").skip(1).collect();
+        assert_eq!(notes.len(), 3, "{note}");
+        let listed = |n: &str| n.matches(" TS2304 ").count();
+        assert_eq!(notes.iter().map(|n| listed(n)).collect::<Vec<_>>(), [20, 20, 0], "{note}");
+        assert_eq!(notes.iter().filter(|n| n.contains("found 25 new errors")).count(), 3, "{note}");
+        assert_eq!(notes.iter().filter(|n| n.contains("\nand 5 more.\n")).count(), 2, "{note}");
+        assert!(notes[2].contains("\nand 25 more.\n"), "{note}");
+        // One kind alone, through its own `after_step`: its 20.
+        let one = Fake::answers(vec![ok(""), failed(&errors)]);
+        let alone = turn(&diagnostics(&one, true), &dir);
+        alone.before_change().await;
+        let note = alone.after_step(vec![edited(None)]).await.unwrap();
+        assert_eq!(note.matches(" TS2304 ").count(), 20, "{note}");
+        // A smaller budget is spent part-way through a kind.
+        let fakes: Vec<Fake> = (0..2).map(|_| Fake::answers(vec![ok(""), failed(&errors)])).collect();
+        let turns: Vec<_> = fakes.iter().map(|f| turn(&diagnostics(f, true), &dir)).collect();
+        let two = combine_checks_within(turns.iter().map(|t| t.checks.clone().unwrap()).collect(), 23).unwrap();
+        two.before_change.before_change().await;
+        let note = (two.after_step)(vec![edited(None)]).await.unwrap();
+        assert_eq!(note.matches(" TS2304 ").count(), 23, "{note}");
+        assert!(note.contains("\nand 22 more.\n"), "{note}");
+        assert!(combine_checks_within(vec![], 40).is_none());
     }
 
     #[test]
