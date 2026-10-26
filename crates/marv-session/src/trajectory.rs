@@ -250,7 +250,8 @@ pub enum TrajectoryRecord {
         who: Who,
         next: &'static str,
     },
-    /// A check after a step's file changes: the typecheck, or with `source: "checks"` the project's checks.
+    /// A check after a step's file changes: the typecheck, with `source: "cargo"` cargo check, or with
+    /// `source: "checks"` the project's checks.
     Check {
         #[serde(flatten)]
         who: Who,
@@ -270,6 +271,10 @@ pub enum TrajectoryRecord {
         /// Exactly what the model was told.
         #[serde(skip_serializing_if = "Option::is_none")]
         note: Option<String>,
+        /// For a checker with a check cache (#187: cargo check): this project's cache folder's size in bytes, as last
+        /// measured (sizing runs after a run, off the step's path, at most once a minute, so it may trail by a run).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_bytes: Option<u64>,
     },
     SubagentStart {
         #[serde(flatten)]

@@ -125,7 +125,11 @@ fn setup() -> (Scratch, PathBuf, Arc<CheckCache>) {
 }
 
 fn checker(kind: Cached, runs: &Runs, cache: &Arc<CheckCache>) -> Arc<Checker<Diagnostic>> {
-    let mut checker = Checker::new(Arc::new(kind), Some(runs.run.clone()));
+    checker_of(Arc::new(kind), runs, cache)
+}
+
+fn checker_of(kind: Arc<dyn CheckKind<Diagnostic>>, runs: &Runs, cache: &Arc<CheckCache>) -> Arc<Checker<Diagnostic>> {
+    let mut checker = Checker::new(kind, Some(runs.run.clone()));
     checker.sandbox_works = Some(Arc::new(|| true));
     checker.cache = Some(cache.clone());
     checker.baseline_wait = Duration::from_millis(200);
@@ -590,12 +594,44 @@ fn host_spawn_probe(markers: &Path) {
             cache.evict("none", crate::time::now_ms());
             let _ = cache.clear(&key);
             let _ = super::tsc::detect_checker(&tree);
+            // The real Rust kind: detection, its command, the warm-up and a step's check (the runner a stand-in).
+            assert_eq!(super::cargo::Cargo.prepare(&tree), name == "rust");
+            if name == "rust" {
+                let runs = Runs::checks(vec![ok(""), CommandResult { exit_code: Some(127), ..Default::default() }]);
+                let checker = checker_of(Arc::new(super::cargo::Cargo), &runs, &cache);
+                let t = turn(&checker, &tree);
+                t.before_change().await;
+                until(|| !checker.warming()).await;
+                let _ = t.after_step(vec![edited(Some("src/lib.rs"))]).await;
+                checker.settle().await;
+                let _ = checker.state();
+                assert!(runs.all().iter().any(|r| r.command.contains("cargo check")));
+            }
         }
     });
     assert!(left().is_empty(), "ran on the host: {:?}", left());
     // The control: the fakes do leave a marker when something runs them.
     let _ = std::process::Command::new("git").arg("--version").status();
     assert_eq!(left(), ["git"], "the marker PATH doesn't work");
+}
+
+/// `low_priority` runs its command with bash, not `sh` (dash on Debian and Ubuntu), and an `ionice` that's there but
+/// refused (some containers) falls back to `nice` alone instead of failing the check.
+///
+/// Proven: put `sh -c` back → failed (bash as `sh` runs in POSIX mode; dash has no `[[ ]]`); dropped the `ionice -c3 true` probe → the refusing
+/// `ionice` ran the check and its "refused" came out instead.
+#[test]
+fn low_priority_runs_bash_and_survives_a_refused_ionice() {
+    let dir = Scratch::new();
+    let refusing = dir.0.join("bin/ionice");
+    dir.put("bin/ionice", "#!/bin/sh\necho 'ionice: refused'\nexit 1\n");
+    std::fs::set_permissions(&refusing, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let command = low_priority(&[], "[[ -n \"$BASH_VERSION\" ]] && ! shopt -oq posix && echo bash-ran");
+    let path = format!("{}:{}", dir.0.join("bin").display(), std::env::var("PATH").unwrap_or_default());
+    let out = std::process::Command::new("/bin/sh").arg("-c").arg(&command).env("PATH", path).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(text.trim(), "bash-ran", "{text}{}", String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success());
 }
 
 /// `low_priority` runs the whole command, pipes and all, niced, with its environment.
@@ -653,4 +689,62 @@ async fn the_key_folder_is_checked_again_under_the_lock() {
             assert!(std::fs::symlink_metadata(&key_dir).unwrap().is_dir());
         }
     }
+}
+
+// --- the Rust kind (cargo check) through the machinery
+
+/// A Rust project (the stand-in runner answers with real cargo output).
+fn rust_setup() -> (Scratch, PathBuf, Arc<CheckCache>) {
+    let (dir, project, cache) = setup();
+    dir.put("project/Cargo.toml", "[package]\nname = \"fixture\"\n");
+    (dir, project, cache)
+}
+
+/// The kind warms up at the first change, runs in its key folder (target dir there, never the project's), and tells
+/// an error once: baseline clean, then an edit adds errors (lib and lib-test copies folded), the same output again
+/// tells nothing, and fixing them tells nothing.
+#[tokio::test]
+async fn cargo_check_tells_new_errors_once_from_its_key_folder() {
+    let (_dir, project, cache) = rust_setup();
+    let warnings = include_str!("fixtures/cargo-warnings.jsonl");
+    let errors = include_str!("fixtures/cargo-errors.jsonl");
+    let runs = Runs::checks(vec![ok(warnings), failed(errors), failed(errors), ok(warnings)]);
+    let checker = checker_of(Arc::new(super::cargo::Cargo), &runs, &cache);
+    let t = turn(&checker, &project);
+    t.before_change().await;
+    assert_eq!(checker.warm_ups(), 1);
+    let note = t.after_step(vec![edited(Some("src/lib.rs"))]).await.unwrap();
+    assert!(note.contains("cargo check found 3 errors that weren't in the previous check."), "{note}");
+    assert!(note.contains("src/lib.rs:2:5 E0308 mismatched types: expected `u32`, found `&str`"), "{note}");
+    assert_eq!(t.after_step(vec![edited(Some("src/lib.rs"))]).await, None);
+    assert_eq!(t.after_step(vec![edited(Some("src/lib.rs"))]).await, None);
+    let key_dir = cache.root.join(repo_key(&project));
+    for run in runs.all() {
+        assert_eq!(run.writable, vec![key_dir.clone()]);
+        let command = run.command.replace("'\\''", "'");
+        assert!(command.contains(&format!("--target-dir '{}/target'", key_dir.display())), "{command}");
+    }
+    let notice = notice(super::cargo::LABEL, &t.results()[0]).unwrap();
+    assert!(notice.starts_with("✻ cargo check: 3 new errors, told the model:"), "{notice}");
+}
+
+/// No cargo in the sandbox: the kind goes off for the session quietly (recorded, no notice), `/diagnostics` says
+/// so, and switching diagnostics off and on tries again.
+#[tokio::test]
+async fn a_missing_cargo_turns_the_kind_off_quietly() {
+    let (_dir, project, cache) = rust_setup();
+    let missing = CommandResult { exit_code: Some(127), ..Default::default() };
+    let runs = Runs::checks(vec![missing, ok("")]);
+    let checker = checker_of(Arc::new(super::cargo::Cargo), &runs, &cache);
+    let t = turn(&checker, &project);
+    t.before_change().await;
+    assert_eq!(t.results(), [CheckOutcome::Off { reason: OffReason::NotInstalled }]);
+    assert_eq!(notice(super::cargo::LABEL, &t.results()[0]), None);
+    assert_eq!(checker.state(), "not installed (Marv doesn't install toolchains)");
+    assert!(turn(&checker, &project).checks.is_none());
+    assert_eq!(runs.checks_run(), 1);
+    checker.reset();
+    let again = turn(&checker, &project);
+    again.before_change().await;
+    assert_eq!(runs.checks_run(), 2);
 }

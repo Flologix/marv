@@ -1,13 +1,15 @@
-//! Diagnostics (`src/diagnostics/`): a project's own checker (tsc today) after a step that changed files, telling
+//! Diagnostics (`src/diagnostics/`): a project's own checker (tsc, and cargo check in marv-rs) after a step that changed files, telling
 //! the model only the errors that are new since the turn's baseline. The machinery ([`turn`]) is generic, so the
 //! project checks ([`crate::checks`]) reuse it.
 //!
 //! - [`tsc`]: reading tsc's output, the note for the model (`tsc.ts`);
 //! - [`turn`]: `Checker`, `TurnChecks`, `CheckOutcome`, `combine_checks`, notices (`turn.ts`), plus (marv-rs, #187)
 //!   the per-kind policy: timeout, warm-up, cache, turning off after unreadable runs;
-//! - [`cache`] (marv-rs, #187): the check cache, a writable folder per repository for checkers that keep a build cache.
+//! - [`cache`] (marv-rs, #187): the check cache, a writable folder per repository for checkers that keep a build cache;
+//! - [`cargo`] (marv-rs, #187): Rust's `cargo check`, with its build in the check cache.
 
 pub mod cache;
+pub mod cargo;
 pub mod tsc;
 pub mod turn;
 

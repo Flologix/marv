@@ -985,10 +985,13 @@ fn recorder(record: &Record, turn: &str, agent: &str) -> AgentRecorder {
     AgentRecorder::new(move |r| record(r), Who { turn: turn.into(), agent: agent.into() }, crate::time::now_ms)
 }
 
-/// The diagnostics checkers, one per language that has one (#187: tsc so far), sharing the check cache.
+/// The diagnostics checkers, one per language that has one (#187: tsc and cargo check so far), sharing the check
+/// cache. Their order is the order of their notes in a step's message.
 fn diagnostic_checkers(cache: &Option<Arc<crate::diagnostics::cache::CheckCache>>) -> Vec<(Language, Arc<Checker<Diagnostic>>)> {
-    let kinds: Vec<(Language, Arc<dyn crate::diagnostics::turn::CheckKind<Diagnostic>>)> =
-        vec![(Language::TypeScript, Arc::new(crate::diagnostics::turn::Typecheck))];
+    let kinds: Vec<(Language, Arc<dyn crate::diagnostics::turn::CheckKind<Diagnostic>>)> = vec![
+        (Language::TypeScript, Arc::new(crate::diagnostics::turn::Typecheck)),
+        (Language::Rust, Arc::new(crate::diagnostics::cargo::Cargo)),
+    ];
     kinds
         .into_iter()
         .map(|(language, kind)| {
@@ -1015,12 +1018,14 @@ pub struct DiagnosticsInfo {
     pub cache: Option<(PathBuf, Option<u64>)>,
 }
 
-/// A check's trajectory record: `note` is exactly what the model was told.
+/// A check's trajectory record: `note` is exactly what the model was told; `cache_bytes` the project's check cache
+/// size as last measured, for a kind with one.
 fn check_record<E>(
     turn: &str,
     source: Option<&'static str>,
     result: &CheckOutcome<E>,
     note: impl Fn(&[E]) -> String,
+    cache_bytes: Option<u64>,
 ) -> TrajectoryRecord {
     let who = Who { turn: turn.into(), agent: "main".into() };
     let (status, ms, before, errors, added, reason, told) = match result {
@@ -1050,11 +1055,12 @@ fn check_record<E>(
                 OffReason::Timeouts => "timeouts",
                 OffReason::Unreadable => "unreadable",
                 OffReason::CacheTooBig => "cache-too-big",
+                OffReason::NotInstalled => "not-installed",
             };
             (CheckStatus::Off, None, None, None, None, Some(reason.to_string()), None)
         }
     };
-    TrajectoryRecord::Check { who, source, status, ms, before, errors, added, reason, note: told }
+    TrajectoryRecord::Check { who, source, status, ms, before, errors, added, reason, note: told, cache_bytes }
 }
 
 /// A checkpoint snapshot's trajectory record.
@@ -2272,13 +2278,17 @@ impl MarvSession {
         let mut parts = Vec::new();
         for (_, checker) in self.inner.diagnostics.iter().filter(|(language, _)| diagnostics.get(*language)) {
             let (emit, record, turn, kind) = (emit.clone(), record.clone(), turn.to_string(), checker.kind.clone());
+            // A kind with a cache: its folder's last measured size goes with each record (read from the record file).
+            let cache = checker.cache.clone().filter(|_| kind.cache());
+            let key = cache.as_ref().map(|_| crate::diagnostics::cache::repo_key(&root));
             parts.extend(checker.turn(TurnOptions {
                 root: root.clone(),
                 sandbox,
                 cancel: stop.clone(),
                 on_status: on_status.clone(),
                 on_result: Arc::new(move |result: CheckResult| {
-                    record(check_record(&turn, kind.source(), &result, |added| kind.note(added)));
+                    let size = cache.as_ref().zip(key.as_ref()).and_then(|(cache, key)| cache.recorded_size(key));
+                    record(check_record(&turn, kind.source(), &result, |added| kind.note(added), size));
                     emit(SessionEvent::Check { label: kind.label(), result });
                 }),
             }));
@@ -2292,7 +2302,7 @@ impl MarvSession {
                 cancel: stop.clone(),
                 on_status,
                 on_result: Arc::new(move |result: ProjectCheckResult| {
-                    record(check_record(&turn, kind.source(), &result, |added| kind.note(added)));
+                    record(check_record(&turn, kind.source(), &result, |added| kind.note(added), None));
                     emit(SessionEvent::Checks(result));
                 }),
             }));
@@ -4741,6 +4751,26 @@ mod turn_tests {
         assert_eq!((start, *reason), (end, TurnEndReason::Done(StopReason::End)));
     }
 
+    /// #187 §6.7: a step's diagnostics notes together list at most `MAX_REPORTED_PER_STEP` errors (20 per kind).
+    #[test]
+    fn a_steps_diagnostics_notes_stay_within_the_per_step_budget() {
+        let kinds = diagnostic_checkers(&None).len();
+        assert!(kinds * crate::diagnostics::tsc::MAX_REPORTED <= crate::diagnostics::turn::MAX_REPORTED_PER_STEP);
+    }
+
+    /// #187 §6.2: a cargo check's record carries its source and the cache's last measured size; a quiet "not
+    /// installed" is recorded.
+    #[test]
+    fn a_check_record_carries_the_cache_size() {
+        let done: CheckResult = CheckOutcome::Done { ms: 3, before: 0, errors: 0, added: vec![] };
+        let record = serde_json::to_value(check_record("t1", Some("cargo"), &done, |_| String::new(), Some(42))).unwrap();
+        assert_eq!((record["source"].as_str(), record["cacheBytes"].as_u64()), (Some("cargo"), Some(42)), "{record}");
+        let off: CheckResult = CheckOutcome::Off { reason: OffReason::NotInstalled };
+        let record = serde_json::to_value(check_record("t1", Some("cargo"), &off, |_| String::new(), None)).unwrap();
+        assert_eq!(record["reason"].as_str(), Some("not-installed"), "{record}");
+        assert!(record.get("cacheBytes").is_none(), "{record}");
+    }
+
     /// #187: `/diagnostics` sees each checker and this project's check cache; `/diagnostics clear` deletes only that
     /// folder; a switch per language reaches its checker.
     #[tokio::test]
@@ -4750,11 +4780,8 @@ mod turn_tests {
         let provider = Scripted::new(vec![]);
         let session = scripted(&dirs, &provider, |init| init.check_cache = Some(root.clone()));
         let info = session.diagnostics_info();
-        assert_eq!(info.checkers.len(), 1);
-        assert_eq!(
-            (info.checkers[0].language, info.checkers[0].label, info.checkers[0].state.as_str()),
-            (Language::TypeScript, "tsc", "ready")
-        );
+        let checkers: Vec<_> = info.checkers.iter().map(|c| (c.language, c.label, c.state.as_str())).collect();
+        assert_eq!(checkers, [(Language::TypeScript, "tsc", "ready"), (Language::Rust, "cargo check", "ready")]);
         assert_eq!(info.cache, None);
         assert_eq!(session.clear_check_cache(), Ok(None));
         let cache = crate::diagnostics::cache::CheckCache::new(&root);

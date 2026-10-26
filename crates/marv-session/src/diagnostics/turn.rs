@@ -60,6 +60,10 @@ pub const MAX_UNREADABLE: u32 = 2;
 pub const WARM_UP_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// How long a baseline waits for the warm-up, or for another session's lock, before the turn is pending.
 pub const BASELINE_WAIT: Duration = Duration::from_secs(10);
+/// Errors one step's joined diagnostics note may list, all kinds together (#187 §6.7; each kind lists up to
+/// `tsc::MAX_REPORTED`). With tsc and cargo check that holds by construction (20 each); a session test keeps it so,
+/// and a third language's kind has to bring the shared budget with it.
+pub const MAX_REPORTED_PER_STEP: usize = 40;
 /// Errors the transcript shows (the model gets up to `MAX_REPORTED`).
 const NOTICE_LINES: usize = 5;
 /// The typecheck's label: its notices keep their words from before #187.
@@ -87,6 +91,8 @@ pub enum OffReason {
     Unreadable,
     /// The kind's cache folder passed its cap, and was deleted.
     CacheTooBig,
+    /// Its tool isn't in the sandbox (cargo on a machine without Rust): off quietly, as the formatter skips (#187).
+    NotInstalled,
 }
 
 /// How a check went, for one kind of problem `E`.
@@ -169,14 +175,16 @@ pub fn sandboxed() -> RunCheck {
     })
 }
 
-/// A command at low priority (#187 §6.1): the whole of it (pipes, `&&`, redirections and all) run by `sh -c` under
-/// `nice -n 10`, plus `ionice -c3` where the sandbox has it (Linux; resolved inside the sandbox, never on the host).
-/// `env` is exported first, since the sandbox's environment is built from scratch.
+/// A command at low priority (#187 §6.1): the whole of it (pipes, `&&`, redirections and all) run by `bash -c` (as
+/// the bash tool runs commands: `sh` is dash on Debian and Ubuntu) under `nice -n 10`, plus `ionice -c3` where the
+/// sandbox has it and it's allowed (Linux; resolved inside the sandbox, never on the host). An `ionice` that's there
+/// but refused (some containers forbid I/O classes) falls back to `nice` alone, rather than failing the check. `env`
+/// is exported first, since the sandbox's environment is built from scratch.
 pub fn low_priority(env: &[(&str, String)], command: &str) -> String {
     let exports: String = env.iter().map(|(k, v)| format!("export {k}={}; ", shell_quote(v))).collect();
     let inner = shell_quote(command);
     format!(
-        "{exports}if command -v ionice >/dev/null 2>&1; then exec nice -n 10 ionice -c3 sh -c {inner}; else exec nice -n 10 sh -c {inner}; fi"
+        "{exports}if command -v ionice >/dev/null 2>&1 && ionice -c3 true >/dev/null 2>&1; then exec nice -n 10 ionice -c3 bash -c {inner}; else exec nice -n 10 bash -c {inner}; fi"
     )
 }
 
@@ -226,6 +234,12 @@ pub trait CheckKind<E>: Send + Sync {
     /// After how many unreadable runs in a row it's off for the session (`None`: never).
     fn max_unreadable(&self) -> Option<u32> {
         None
+    }
+    /// Whether a run says its tool isn't installed in the sandbox: then the kind is off for the session, quietly (a
+    /// trajectory record, no notice), since Marv never installs a toolchain. Learned from the sandboxed run, never by
+    /// looking on the host.
+    fn not_installed(&self, _output: &str, _exit_code: Option<i32>) -> bool {
+        false
     }
     /// Whether anything can run in this project this turn (a compiler, some checks). Only looks at files.
     fn prepare(&self, root: &Path) -> bool;
@@ -419,6 +433,7 @@ impl<E: Clone + Send + Sync + 'static> Checker<E> {
         match *locked(&self.shared.off) {
             Some(OffReason::Unreadable) => return "off for this session: its output couldn't be read twice in a row".into(),
             Some(OffReason::CacheTooBig) => return "off for this session: its cache passed the size limit".into(),
+            Some(OffReason::NotInstalled) => return "not installed (Marv doesn't install toolchains)".into(),
             _ => {}
         }
         if self.timeouts.load(Ordering::SeqCst) >= MAX_TIMEOUTS {
@@ -760,6 +775,14 @@ impl<E: Clone + Send + Sync + 'static> Turn<E> {
             }
             return None;
         }
+        // The tool isn't in the sandbox: quietly off for the session (recorded, never a notice).
+        if checker.kind.not_installed(&result.output, result.exit_code) {
+            self.unavailable.store(true, Ordering::SeqCst);
+            *locked(&checker.shared.off) = Some(OffReason::NotInstalled);
+            checker.shared.told_off.store(true, Ordering::SeqCst);
+            self.tell(CheckOutcome::Off { reason: OffReason::NotInstalled });
+            return None;
+        }
         // A `#!/usr/bin/env node` launcher whose node the sandbox can't see (hidden home, e.g. mise's): that's worth
         // saying plainly, not as an unreadable output.
         let missing = checker.kind.missing(&result.output, result.exit_code);
@@ -925,6 +948,8 @@ fn generic_notice(label: &str, result: &CheckResult) -> Option<String> {
         CheckOutcome::Off { reason: OffReason::CacheTooBig } => Some(format!(
             "✻ {label}'s cache for this project passed its size limit, so Marv deleted it and stopped running {label} for this session."
         )),
+        // Quiet: most projects of a language the machine has no toolchain for aren't worth a line (`/diagnostics` says).
+        CheckOutcome::Off { reason: OffReason::NotInstalled } => None,
         CheckOutcome::Failed { notify: false, .. } => None,
         CheckOutcome::Failed { reason: FailReason::Pending, .. } => Some(format!(
             "✻ {label} is still building its cache for this project (first run); Marv will tell the model about new errors once it's ready."

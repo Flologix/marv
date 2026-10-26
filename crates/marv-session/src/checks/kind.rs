@@ -202,7 +202,7 @@ pub fn project_check_notice(result: &ProjectCheckResult) -> Option<String> {
             "✻ Marv couldn't read the project checks' output twice in a row, so it stopped running them for this session.".into(),
         ),
         // The project checks keep no cache.
-        CheckOutcome::Off { reason: OffReason::CacheTooBig } => None,
+        CheckOutcome::Off { reason: OffReason::CacheTooBig | OffReason::NotInstalled } => None,
         CheckOutcome::Failed { notify: false, .. } => None,
         CheckOutcome::Failed { reason: FailReason::MissingInterpreter, tool, .. } => Some(format!(
             "✻ The project's checks need {}, which the sandbox can't see, so Marv can't run them.",

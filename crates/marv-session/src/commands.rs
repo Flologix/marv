@@ -772,10 +772,17 @@ pub fn diagnostics_status(config: &Config) -> String {
     if !d.any() {
         return "off".into();
     }
-    let what = if d.get(Language::TypeScript) {
-        "on: after the model changes files in a TypeScript project, Marv runs the project's typecheck (in the sandbox, read-only) and tells the model about new errors"
-    } else {
-        "on, but not for TypeScript: Marv won't run the project's typecheck after the model's edits"
+    let what = match (d.get(Language::TypeScript), d.get(Language::Rust)) {
+        (true, true) => {
+            "on: after the model changes files in a TypeScript or Rust project, Marv runs the project's typecheck or cargo check (in the sandbox, read-only) and tells the model about new errors"
+        }
+        (true, false) => {
+            "on: after the model changes files in a TypeScript project, Marv runs the project's typecheck (in the sandbox, read-only) and tells the model about new errors"
+        }
+        (false, true) => {
+            "on: after the model changes files in a Rust project, Marv runs cargo check (in the sandbox, read-only) and tells the model about new errors"
+        }
+        (false, false) => "on, but not for TypeScript or Rust: Marv won't run a checker after the model's edits",
     };
     if d.summary() == "on" { what.into() } else { format!("{what} ({})", d.summary()) }
 }
@@ -814,6 +821,7 @@ pub fn diagnostics_text(config: &Config, info: Option<&DiagnosticsInfo>) -> Stri
             (false, _) => "off".to_string(),
             (true, Some(c)) => format!("on ({}: {})", c.label, c.state),
             (true, None) if language == Language::TypeScript => "on (tsc)".to_string(),
+            (true, None) if language == Language::Rust => "on (cargo check)".to_string(),
             (true, None) => "on (no checker for it in this version yet)".to_string(),
         };
         lines.push(format!("- {}: {state}", language.name()));
@@ -946,6 +954,7 @@ fn last_checks_text(last: Option<&ProjectCheckResult>) -> String {
             "off: their output couldn't be read twice in a row this session.".into()
         }
         Some(CheckOutcome::Off { reason: OffReason::CacheTooBig }) => "off: their cache passed its size limit.".into(),
+        Some(CheckOutcome::Off { reason: OffReason::NotInstalled }) => "off: their runner isn't in the sandbox.".into(),
         Some(CheckOutcome::Failed { reason: FailReason::MissingInterpreter, tool, .. }) => {
             format!("failed: {} isn't in the sandbox.", tool.as_deref().unwrap_or("bun"))
         }
@@ -1267,24 +1276,33 @@ mod tests {
                 assert!(matches!(run_command(bad, ctx), CommandAction::Print { is_error: true, .. }), "{bad}");
             }
             let CommandAction::Print { text, .. } = run_command("/diagnostics", ctx) else { panic!() };
-            assert!(text.starts_with("Diagnostics: on: after the model changes files in a TypeScript project"), "{text}");
+            assert!(text.starts_with("Diagnostics: on: after the model changes files in a TypeScript or Rust project"), "{text}");
             assert!(
                 text.contains("\n- typescript: on (tsc)\n")
-                    && text.contains("\n- rust: on (no checker for it in this version yet)"),
+                    && text.contains("\n- rust: on (cargo check)\n")
+                    && text.contains("\n- python: on (no checker for it in this version yet)"),
                 "{text}"
             );
             let info = DiagnosticsInfo {
-                checkers: vec![CheckerInfo {
-                    language: Language::TypeScript,
-                    label: "tsc",
-                    state: "off for this session: it timed out twice".into(),
-                }],
+                checkers: vec![
+                    CheckerInfo {
+                        language: Language::TypeScript,
+                        label: "tsc",
+                        state: "off for this session: it timed out twice".into(),
+                    },
+                    CheckerInfo {
+                        language: Language::Rust,
+                        label: "cargo check",
+                        state: "not installed (Marv doesn't install toolchains)".into(),
+                    },
+                ],
                 cache: Some(("/home/me/.cache/marv/checks/repo-abc".into(), Some(3 * 1024 * 1024 * 1024))),
             };
             let mut config = ctx.config.clone();
             config.diagnostics = config.diagnostics.with(Language::Go, false);
             let text = diagnostics_text(&config, Some(&info));
             assert!(text.contains("- typescript: on (tsc: off for this session: it timed out twice)"), "{text}");
+            assert!(text.contains("- rust: on (cargo check: not installed (Marv doesn't install toolchains))"), "{text}");
             assert!(text.contains("- go: off") && text.contains("(off for go)"), "{text}");
             assert!(text.contains("/home/me/.cache/marv/checks/repo-abc (3.0 GB;"), "{text}");
         });
