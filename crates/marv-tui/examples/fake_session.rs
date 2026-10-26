@@ -370,6 +370,9 @@ impl SessionPort for Fake {
                 ProviderId::Ollama => vec![m("qwen3.5:9b", None, true, true), m("tiny:1b", None, true, false)],
                 ProviderId::Zai => vec![m("glm-5.3", None, false, true)],
                 ProviderId::ChatGpt => vec![m("gpt-6.1-sol", None, false, true)],
+                ProviderId::Kimi => vec![m("kimi-for-coding", None, false, true)],
+                ProviderId::DeepSeek => vec![m("deepseek-flash", None, false, true)],
+                ProviderId::Qwen => vec![m("qwen3.7-plus", None, false, true)],
             };
             let _ = tx.send(UiEvent::Models(Ok(models)));
         });
@@ -381,6 +384,9 @@ impl SessionPort for Fake {
             ProviderId::Ollama => "Ollama",
             ProviderId::Zai => "Z.ai",
             ProviderId::ChatGpt => "ChatGPT",
+            ProviderId::Kimi => "Kimi",
+            ProviderId::DeepSeek => "DeepSeek",
+            ProviderId::Qwen => "Qwen",
         };
         self.system(&format!("Saved to ~/.marv/config.json · {label} · {}", answer.model));
         self.emit(UiEvent::StatusInfo(status(&format!("{}/{}", label.to_lowercase(), answer.model))));

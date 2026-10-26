@@ -107,6 +107,9 @@ fn provider_hint(id: ProviderId) -> &'static str {
         ProviderId::Ollama => "models running on this machine, free",
         ProviderId::Zai => "GLM models on the Z.ai GLM Coding Plan you pay for",
         ProviderId::ChatGpt => "sign in and use your ChatGPT Plus or Pro plan",
+        ProviderId::Kimi => "Kimi K3 and K2.8 on the Kimi Code membership you pay for",
+        ProviderId::DeepSeek => "DeepSeek V4 models with a DeepSeek API key",
+        ProviderId::Qwen => "Qwen models on the Alibaba Cloud Coding Plan you pay for",
     }
 }
 
@@ -481,6 +484,9 @@ mod tests {
             ProviderId::Ollama => vec![m("qwen3.5:9b", true, None, true), m("tiny:1b", false, None, true)],
             ProviderId::Zai => vec![m("glm-5.3", true, None, false), m("glm-5.3-flash", true, None, false)],
             ProviderId::ChatGpt => vec![m("gpt-6.1-sol", true, None, false)],
+            ProviderId::Kimi => vec![m("kimi-for-coding", true, None, false)],
+            ProviderId::DeepSeek => vec![m("deepseek-flash", true, None, false)],
+            ProviderId::Qwen => vec![m("qwen3.7-plus", true, None, false)],
         }
     }
 

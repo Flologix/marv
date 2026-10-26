@@ -458,6 +458,21 @@ pub async fn run_headless(options: HeadlessOptions, quit: crate::signals::Quit) 
             model: Some(config.model.clone()),
             base_url: Some(config.base_url.clone()),
         },
+        marv_provider::ProviderKind::Kimi => marv_provider::ProviderOption::Kimi {
+            api_key: config.api_key.clone().unwrap_or_default(),
+            model: Some(config.model.clone()),
+            base_url: Some(config.base_url.clone()),
+        },
+        marv_provider::ProviderKind::DeepSeek => marv_provider::ProviderOption::DeepSeek {
+            api_key: config.api_key.clone().unwrap_or_default(),
+            model: Some(config.model.clone()),
+            base_url: Some(config.base_url.clone()),
+        },
+        marv_provider::ProviderKind::Qwen => marv_provider::ProviderOption::Qwen {
+            api_key: config.api_key.clone().unwrap_or_default(),
+            model: Some(config.model.clone()),
+            base_url: Some(config.base_url.clone()),
+        },
     };
     let root = match std::env::current_dir() {
         Ok(r) => r,
