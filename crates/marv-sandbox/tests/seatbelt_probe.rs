@@ -94,7 +94,7 @@ impl Fx {
     }
 
     fn run(&self) -> Invocation {
-        Invocation { tmp: self.tmp.clone(), user_temp: Some(self.user_temp.clone()), exe: None, ports: vec![] }
+        Invocation { tmp: self.tmp.clone(), user_temp: Some(self.user_temp.clone()), exe: None }
     }
 
     fn profile(&self, network: bool) -> Profile {
@@ -443,7 +443,7 @@ fn probe_report() {
     let p4 = tcp_listener("127.0.0.1:0").unwrap();
     let p6 = tcp_listener(&format!("[::1]:{p4}"));
     let q = tcp_listener("127.0.0.1:0").unwrap();
-    let forwarded = seatbelt::profile(&fx.plan(&fx.root, false), &Invocation { ports: vec![p4], ..fx.run() }, &RealFs).unwrap();
+    let forwarded = fx.bash_profile(&[p4]);
     let tcp = |host: &str, port: u16| format!("exec 3<>/dev/tcp/{host}/{port} && echo connected");
     note("localhost.forwarded.127", fx.sh(&forwarded, &fx.root, &tcp("127.0.0.1", p4)).to_string());
     note("localhost.forwarded.localhost_name", fx.sh(&forwarded, &fx.root, &tcp("localhost", p4)).to_string());
@@ -1143,7 +1143,7 @@ fn each_link_rule_refuses_on_its_own() {
         sb.path = std::env::var("PATH").unwrap_or_default();
         sb.plan(&proj, &CommandMounts::default())
     };
-    let run = Invocation { tmp: tmp.clone(), user_temp: Some(t.parent().unwrap().to_path_buf()), exe: None, ports: vec![] };
+    let run = Invocation { tmp: tmp.clone(), user_temp: Some(t.parent().unwrap().to_path_buf()), exe: None };
     let shipped = seatbelt::profile(&plan, &run, &RealFs).unwrap();
     let text = &shipped.text;
     // The rules this test takes out, each checked to be there as written.
@@ -1439,10 +1439,15 @@ impl Fx {
         Profile { text, params: closed.params }
     }
 
-    /// A bash command's closed profile with an outbound rule for each of `ports` (`Invocation::ports`).
+    /// A bash command's closed profile with an outbound rule for each of `ports` on top: the per-port rule the
+    /// profile builder once had, kept here only to measure it (#242's probe 2 is why the builder has none).
     fn bash_profile(&self, ports: &[u16]) -> Profile {
-        let run = Invocation { ports: ports.to_vec(), ..self.run() };
-        seatbelt::profile(&self.plan(&self.root, false), &run, &RealFs).unwrap()
+        let closed = self.profile(false);
+        let mut text = closed.text.clone();
+        for port in ports {
+            text.push_str(&format!("(allow network-outbound (remote ip \"localhost:{port}\"))\n"));
+        }
+        Profile { text, params: closed.params }
     }
 
     /// Writes the probe scripts into the project (readable in every sandbox).

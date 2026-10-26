@@ -187,7 +187,7 @@ impl SandboxBackend for Seatbelt {
         let tmp = make_private_tmp(&t)
             .map_err(|e| SandboxError::Mount(format!("Couldn't make the command's temporary folder in {}: {e}", t.display())))?;
         let built = (|| {
-            let run = Invocation { tmp: tmp.clone(), user_temp, exe: Some(exe.clone()), ports: Vec::new() };
+            let run = Invocation { tmp: tmp.clone(), user_temp, exe: Some(exe.clone()) };
             let profile = profile(plan, &run, fs)?;
             let file = if profile.text.len() > PROFILE_FILE_OVER {
                 let file = tmp.join("sandbox.sb");

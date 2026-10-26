@@ -104,6 +104,7 @@ jobs:
       # #152: the loopback report binds 127.0.0.2, to see whether Seatbelt refuses the rest of 127/8 (lo0 has only
       # 127.0.0.1).
       - name: Add a loopback alias for the sandbox probes
+        continue-on-error: true
         run: sudo ifconfig lo0 alias 127.0.0.2 up
       - run: cargo check --workspace --all-targets
       # #152: what Seatbelt does with loopback rules on this runner, for the record. The process door stays off on

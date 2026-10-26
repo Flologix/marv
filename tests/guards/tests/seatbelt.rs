@@ -441,6 +441,100 @@ fn host_processes_cant_be_reached_and_setuid_programs_dont_run() {
     assert!(!ran.output.contains("wrote"), "/dev/tty: {}", ran.output);
 }
 
+/// Reads each process's info as `lsof`, `ps` and friends do, one line per read: `label.read ok` or `label.read err
+/// <ERRNO>`. The labels: `self`, `child` (a `sleep` it starts) and each `label=pid` given.
+const PINFO_PY: &str = r#"import ctypes, errno, os, subprocess, sys
+libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+def res(ok):
+    if ok:
+        return "ok"
+    e = ctypes.get_errno()
+    return "err " + str(errno.errorcode.get(e, e))
+def pidinfo(pid, flavor):
+    buf = ctypes.create_string_buffer(8192)
+    return res(libc.proc_pidinfo(pid, flavor, ctypes.c_uint64(0), buf, 8192) > 0)
+def pidpath(pid):
+    buf = ctypes.create_string_buffer(4096)
+    return res(libc.proc_pidpath(pid, buf, 4096) > 0)
+def sysctl(mib):
+    arr = (ctypes.c_int * len(mib))(*mib)
+    buf = ctypes.create_string_buffer(65536)
+    n = ctypes.c_size_t(65536)
+    return res(libc.sysctl(arr, len(mib), buf, ctypes.byref(n), None, 0) == 0)
+child = subprocess.Popen(["/bin/sleep", "5"])
+targets = [("self", os.getpid()), ("child", child.pid)]
+targets += [(a.split("=")[0], int(a.split("=")[1])) for a in sys.argv[1:]]
+for label, pid in targets:
+    for read, f in [
+        ("pidpath", lambda: pidpath(pid)),
+        ("listfds", lambda: pidinfo(pid, 1)),
+        ("taskallinfo", lambda: pidinfo(pid, 2)),
+        ("regionpathinfo", lambda: pidinfo(pid, 8)),
+        ("shortbsdinfo", lambda: pidinfo(pid, 13)),
+        ("kern_proc_pid", lambda: sysctl([1, 14, 1, pid])),
+        ("kern_procargs2", lambda: sysctl([1, 49, pid])),
+    ]:
+        print("%s.%s" % (label, read), f(), flush=True)
+child.kill()
+"#;
+
+/// The reads [`PINFO_PY`] makes.
+const PINFO_READS: &[&str] =
+    &["pidpath", "listfds", "taskallinfo", "regionpathinfo", "shortbsdinfo", "kern_proc_pid", "kern_procargs2"];
+
+/// **Other processes' info can't be read** (G20, #246): not Marv's path, descriptors, arguments or environment, nor
+/// another process of the user's, nor launchd's; the command's own processes still can be (`lsof -p $$`, job control).
+/// Seatbelt's deny-default doesn't close process info on its own, so this pins the explicit deny.
+#[test]
+fn other_processes_info_cant_be_read_but_the_commands_own_can() {
+    require_sandbox!();
+    require_tools(&["python3"]);
+    let home = Home::new("sb-pinfo");
+    home.dir.write("proj/pinfo.py", PINFO_PY);
+    let mut outsider = std::process::Command::new("/bin/sleep").arg("60").spawn().unwrap();
+    let marv = std::process::id();
+    let args = format!("marv={marv} outsider={} launchd=1", outsider.id());
+    let line = |ran: &Ran, key: &str| -> String {
+        ran.output.lines().find_map(|l| l.strip_prefix(&format!("{key} "))).map(str::to_string).unwrap_or_else(|| {
+            panic!("no {key} in {}", ran.output);
+        })
+    };
+    // Controls: outside the sandbox each read of Marv and the other process works, and launchd's path and short info.
+    let control = host(&home.proj(), &format!("python3 pinfo.py {args}"));
+    for label in ["self", "child", "marv", "outsider"] {
+        for read in PINFO_READS {
+            let key = format!("{label}.{read}");
+            assert_eq!(line(&control, &key), "ok", "control {key}: {}", control.output);
+        }
+    }
+    for read in ["pidpath", "shortbsdinfo", "kern_proc_pid"] {
+        assert_eq!(line(&control, &format!("launchd.{read}")), "ok", "control launchd.{read}: {}", control.output);
+    }
+    let ran = home.run(&format!("python3 pinfo.py {args}"));
+    let _ = outsider.kill();
+    let _ = outsider.wait();
+    for label in ["self", "child"] {
+        for read in PINFO_READS {
+            let key = format!("{label}.{read}");
+            assert_eq!(line(&ran, &key), "ok", "the command's own {key}: {}", ran.output);
+        }
+    }
+    for label in ["marv", "outsider", "launchd"] {
+        for read in PINFO_READS {
+            let key = format!("{label}.{read}");
+            assert!(line(&ran, &key).starts_with("err"), "{key} must be refused: {}", ran.output);
+        }
+    }
+    // `lsof -p <Marv>` lists nothing of Marv's, not even its binary; `lsof` of the command's own shell works.
+    let exe = std::env::current_exe().unwrap();
+    let lsof = home.run(&format!("/usr/sbin/lsof -p {marv} -Fn"));
+    assert!(!lsof.output.contains(&*exe.to_string_lossy()), "lsof -p marv: {}", lsof.output);
+    let own = home.run(
+        "sleep 5 & /usr/sbin/lsof -p $$ -Fn | grep -q '^n' && echo lsof-ok; jobs -l | grep -q sleep && kill %1 && echo jobs-ok",
+    );
+    assert!(own.output.contains("lsof-ok") && own.output.contains("jobs-ok"), "own processes: {}", own.output);
+}
+
 /// **Nothing of Marv's environment reaches the command** (G19): only the plan's variables, the caches in the private
 /// `TMPDIR`. `sandbox-exec` passes its environment on, so Marv spawns it with the plan's alone.
 #[tokio::test]
