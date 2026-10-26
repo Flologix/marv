@@ -1913,6 +1913,35 @@ const PINFO_TOOLS: &[(&str, &str)] = &[
     ("pgrep_own", "sleep 3 & pgrep -P $$ >/dev/null; r=$?; kill %1; echo tool rc=$r"),
 ];
 
+/// What `sender == "Sandbox"` logs about process info and sysctls while `f` runs, allows with a report included.
+fn sandbox_log<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+    let path = std::env::temp_dir().join(format!("mx-plog-{}", std::process::id()));
+    let file = std::fs::File::create(&path).unwrap();
+    let mut stream = Command::new("/usr/bin/log")
+        .args(["stream", "--style", "compact", "--predicate", "sender == \"Sandbox\""])
+        .stdin(Stdio::null())
+        .stdout(file)
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let got = f();
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let _ = stream.kill();
+    let _ = stream.wait();
+    let lines = std::fs::read_to_string(&path).unwrap_or_default();
+    let _ = std::fs::remove_file(&path);
+    let mut seen: Vec<String> = Vec::new();
+    for l in lines.lines().filter(|l| l.contains("process-info") || l.contains("sysctl")) {
+        // One line per distinct operation and target, without the timestamp and pids that make each unique.
+        let key = l.split_once("Sandbox:").map_or(l, |(_, r)| r).trim().to_string();
+        if !seen.contains(&key) {
+            seen.push(key);
+        }
+    }
+    (got, seen)
+}
+
 /// The base section's process-info rule replaced by `rules` (None: the rule as it ships).
 fn pinfo_profile(fx: &Fx, rules: Option<&str>) -> Profile {
     let closed = fx.profile(false);
@@ -1962,23 +1991,40 @@ fn process_info_probe_report() {
         let (k, v) = line.split_once(' ').unwrap_or((line, ""));
         note(&format!("control.{k}"), v.to_string());
     }
-    let variants: &[(&str, Option<&str>)] = &[
+    // Round 1 (2026-10-26): the shipped rule, no rule, `(target self)` and a `(target others)` deny all let every
+    // same-user read through but the cwd (a file-read check); an explicit `(deny process-info*)` kills bash. So
+    // deny-default doesn't cover process-info here: only an explicit deny does.
+    let deny = "(deny process-info*)";
+    let variants: Vec<(&str, Option<String>)> = vec![
         ("shipped", None),
-        ("none", Some("")),
-        ("self", Some("(allow process-info* (target self))")),
-        ("same_sandbox_deny_others", Some("(allow process-info* (target same-sandbox))\n(deny process-info* (target others))")),
-        ("same_sandbox_deny_pidinfo_all", Some("(allow process-info* (target same-sandbox))\n(deny process-info-pidinfo)")),
-        ("deny_all_explicitly", Some("(deny process-info*)")),
+        ("report_all", Some("(allow process-info* (with report))".into())),
+        ("deny_all_allow_same_sandbox", Some(format!("{deny}\n(allow process-info* (target same-sandbox))"))),
+        ("deny_all_allow_self", Some(format!("{deny}\n(allow process-info* (target self))"))),
+        (
+            "deny_all_allow_self_children",
+            Some(format!("{deny}\n(allow process-info* (target self))\n(allow process-info* (target children))")),
+        ),
+        (
+            "deny_reads_allow_same_sandbox",
+            Some(
+                "(deny process-info-pidinfo process-info-pidfdinfo process-info-pidfileportinfo process-info-listpids \
+                 process-info-rusage process-info-codesignature)\n(allow process-info* (target same-sandbox))"
+                    .into(),
+            ),
+        ),
     ];
-    for (name, rules) in variants {
-        let profile = pinfo_profile(&fx, *rules);
-        let ran = fx.sh(&profile, &fx.root, &format!("python3 pinfo.py {args}"));
+    for (name, rules) in &variants {
+        let profile = pinfo_profile(&fx, rules.as_deref());
+        let (ran, log) = sandbox_log(|| fx.sh(&profile, &fx.root, &format!("python3 pinfo.py {args}")));
         if ran.out.trim().is_empty() {
             note(&format!("{name}.run"), ran.to_string());
         }
         for line in ran.out.lines() {
             let (k, v) = line.split_once(' ').unwrap_or((line, ""));
             note(&format!("{name}.{k}"), v.to_string());
+        }
+        for (i, line) in log.iter().take(40).enumerate() {
+            note(&format!("{name}.log.{i}"), line.clone());
         }
         note(
             &format!("{name}.lsof_p_marv"),
