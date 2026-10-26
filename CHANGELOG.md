@@ -10,6 +10,10 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 - **The desktop app and the browser UI.** The desktop app (`app/`) and the browser UI (`marv-web`) are no longer part of Marv: Marv is the terminal coding agent. Releases up to 0.11.0 keep them in their source. The `marv` command, `marv -p` and the mesh are unchanged.
 
+### Fixed
+
+- **On macOS, the system prompt no longer says a sandboxed command has a `localhost` of its own.** That is true on Linux, where each command has its own network namespace, but Seatbelt has none: without `network: true` a command can neither listen on nor connect to `localhost`, and `# Sandbox limits` now says so. Linux's text is unchanged (#152).
+
 ## [0.11.0] - 2026-10-25
 
 ### Added
