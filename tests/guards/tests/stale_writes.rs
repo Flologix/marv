@@ -1,7 +1,7 @@
 //! `docs/SECURITY.md`, "File changes": `edit_file` and `write_file` never write over a change the session
 //! hasn't seen. Each session remembers a content hash of every file it read or wrote
-//! (`marv_tools::file_versions`); an existing file that changed since, or that it never read, is refused with "read
-//! it again", and nothing is written. The check and the write are one step under a short cross-process lock
+//! (`marv_tools::file_versions`); an existing file that changed since is refused with "read it again", one it never
+//! read is refused with its current text (which then counts as read), and nothing is written. The check and the write are one step under a short cross-process lock
 //! (`marv_tools::file_lock`, an advisory `flock` in the runtime folder), held for that call only.
 //!
 //! The other writer is a real second process where it can be: the real `marv -p` binary against the oracle's fake
@@ -66,16 +66,18 @@ async fn an_edit_after_another_sessions_write_is_refused_until_reread() {
 }
 
 /// **An existing file the session never read can't be overwritten** (nor edited), in `marv -p` as in any session;
-/// a new file needs no read, and once written the session may write it again.
+/// a new file needs no read, and once written the session may write it again. marv-rs: the refusal shows the file as
+/// it is now, and only that shown version counts as seen: a change after it is refused like any stale write.
 ///
-/// Proven: let `FileVersions::check` pass a file it has no hash for → failed (`marv -p` overwrote `keep.txt`).
+/// Proven: let `FileVersions::check` pass a file it has no hash for → failed (`marv -p` overwrote `keep.txt`); let
+/// `FileVersions::check_showing` show and record a file whatever its verdict → failed (the write after the other
+/// change went through).
 #[test]
 fn an_existing_file_never_read_cant_be_overwritten() {
     let (root, config) = (TempDir::new("stale-unread"), TempDir::new("stale-unread-config"));
     root.write("keep.txt", "the user's text\n");
     let steps = vec![
         vec![script("w1", "write_file", json!({"path": "keep.txt", "content": "clobbered\n"}))],
-        vec![script("e1", "edit_file", json!({"path": "keep.txt", "old_string": "user", "new_string": "model"}))],
         vec![script("w2", "write_file", json!({"path": "new.txt", "content": "first\n"}))],
         vec![script("w3", "write_file", json!({"path": "new.txt", "content": "second\n"}))],
     ];
@@ -83,6 +85,27 @@ fn an_existing_file_never_read_cant_be_overwritten() {
     assert_eq!(out.code, Some(0), "{}\n{}", out.result, out.stderr);
     assert_eq!(root.read("keep.txt").as_deref(), Some("the user's text\n"), "the unread file is untouched");
     assert_eq!(root.read("new.txt").as_deref(), Some("second\n"), "a new file, then its own write again");
+
+    // In one session: the refusal shows the file; someone changes it; the next write is still refused.
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    runtime.block_on(async {
+        let ctx = session(root.path());
+        for (tool, args) in [
+            ("write_file", json!({"path": "keep.txt", "content": "clobbered\n"})),
+            ("edit_file", json!({"path": "keep.txt", "old_string": "user", "new_string": "model"})),
+        ] {
+            let ctx = session(root.path());
+            let refused = run(&ctx, tool, args).await;
+            assert!(refused.is_error && refused.output.contains("1→the user's text"), "{tool}: {}", refused.output);
+            assert_eq!(root.read("keep.txt").as_deref(), Some("the user's text\n"), "{tool}: nothing written");
+        }
+        assert!(run(&ctx, "write_file", json!({"path": "keep.txt", "content": "clobbered\n"})).await.is_error);
+        root.write("keep.txt", "the user's newer text\n");
+        let refused = run(&ctx, "write_file", json!({"path": "keep.txt", "content": "clobbered\n"})).await;
+        assert!(refused.is_error && refused.output.contains("changed since you last read it"), "{}", refused.output);
+        assert!(!refused.output.contains("newer text"), "a stale write gets no text: it must read the file again");
+        assert_eq!(root.read("keep.txt").as_deref(), Some("the user's newer text\n"), "the newer text stays");
+    });
 }
 
 /// **The check and the write are one step across processes.** While another process holds the lock on `new.txt`
