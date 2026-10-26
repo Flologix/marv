@@ -62,7 +62,7 @@ impl Tool for Page {
 fn session(root: &Path, store: &Arc<SessionStore>, model: Arc<dyn marv_provider::Provider>, v2: bool) -> MarvSession {
     let mut init =
         marv_session::SessionInit::new(root, marv_session::ProviderChoice::Option(marv_provider::ProviderOption::Custom(model)));
-    (init.diagnostics, init.checks, init.checkpoints) = (false, false, false);
+    (init.diagnostics, init.checks, init.checkpoints) = (false.into(), false, false);
     init.sessions = Some(store.clone());
     init.tools = vec![Arc::new(Page) as ToolRef];
     if v2 {

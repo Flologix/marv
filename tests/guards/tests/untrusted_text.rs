@@ -398,7 +398,7 @@ impl Chat {
         let model = Scripted::new(replies);
         let mut builder = marv_session::SessionBuilder::new(dir.path(), marv_provider::ProviderOption::Custom(model.clone()));
         builder.options.config_dir = Some(dir.path().join("config"));
-        builder.options.diagnostics = false;
+        builder.options.diagnostics = false.into();
         builder.options.checks = false;
         builder.options.tools = vec![Arc::new(tool)];
         let session = builder.build().await.expect("a session");
@@ -550,7 +550,7 @@ async fn session_in(
 ) -> marv_session::MarvSession {
     let mut builder = marv_session::SessionBuilder::new(root, marv_provider::ProviderOption::Custom(model));
     builder.options.config_dir = Some(config.to_path_buf());
-    builder.options.diagnostics = false;
+    builder.options.diagnostics = false.into();
     builder.options.checks = false;
     edit(&mut builder.options);
     builder.build().await.expect("a session")

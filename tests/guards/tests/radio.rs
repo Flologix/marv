@@ -412,7 +412,7 @@ async fn presence_never_reaches_a_model_and_doesnt_taint() {
         project.path(),
         marv_session::ProviderChoice::Option(marv_provider::ProviderOption::Custom(model.clone())),
     );
-    (init.diagnostics, init.checks) = (false, false);
+    (init.diagnostics, init.checks) = (false.into(), false);
     init.mesh = Some(alpha.sb.clone());
     let session = marv_session::MarvSession::new(init).unwrap();
     let mut turn = session.send("who else is up?", Default::default()).unwrap();
@@ -590,7 +590,7 @@ fn session(
         project,
         marv_session::ProviderChoice::Option(marv_provider::ProviderOption::Custom(model)),
     );
-    (init.diagnostics, init.checks, init.yolo, init.checkpoints) = (false, false, yolo, false);
+    (init.diagnostics, init.checks, init.yolo, init.checkpoints) = (false.into(), false, yolo, false);
     init.mesh = Some(marv.sb.clone());
     init.radio = Some(marv.radio.is_on());
     init.approve = approve;

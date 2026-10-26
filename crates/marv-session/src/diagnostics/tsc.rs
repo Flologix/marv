@@ -10,17 +10,7 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TsError {
-    /// As tsc prints it (relative to the project); absent for errors about the command line or the whole run.
-    pub file: Option<String>,
-    pub line: Option<u64>,
-    pub column: Option<u64>,
-    /// "TS2345".
-    pub code: String,
-    /// With its continuation lines (tsc's indented detail), joined by newlines.
-    pub message: String,
-}
+pub use super::Diagnostic;
 
 /// Errors the model is told per check; the rest are counted.
 pub const MAX_REPORTED: usize = 20;
@@ -46,11 +36,11 @@ static MISSING: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^env: [‘']
 
 /// The errors in tsc's `--pretty false` output. `None` when a failed run printed none (a crash, something else
 /// answering to the name): then nobody can tell what's new, and nothing is reported.
-pub fn parse_tsc(output: &str, exit_code: Option<i32>) -> Option<Vec<TsError>> {
+pub fn parse_tsc(output: &str, exit_code: Option<i32>) -> Option<Vec<Diagnostic>> {
     if exit_code == Some(0) {
         return Some(Vec::new());
     }
-    let mut errors: Vec<TsError> = Vec::new();
+    let mut errors: Vec<Diagnostic> = Vec::new();
     // Only a line right after an error (or its continuation) can continue it.
     let mut open = false;
     let lines: Vec<&str> = output.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).collect();
@@ -67,7 +57,7 @@ pub fn parse_tsc(output: &str, exit_code: Option<i32>) -> Option<Vec<TsError>> {
             continue;
         }
         if let Some(c) = LOCATED.captures(line) {
-            errors.push(TsError {
+            errors.push(Diagnostic {
                 file: Some(c[1].into()),
                 line: c[2].parse().ok(),
                 column: c[3].parse().ok(),
@@ -76,7 +66,7 @@ pub fn parse_tsc(output: &str, exit_code: Option<i32>) -> Option<Vec<TsError>> {
             });
             open = true;
         } else if let Some(c) = UNLOCATED.captures(line) {
-            errors.push(TsError { file: None, line: None, column: None, code: c[1].into(), message: c[2].into() });
+            errors.push(Diagnostic { file: None, line: None, column: None, code: c[1].into(), message: c[2].into() });
             open = true;
         } else if open && line.starts_with("  ") && !line.trim().is_empty() {
             // Strip only tsc's own two-space indent: deeper levels keep theirs.
@@ -95,12 +85,12 @@ pub fn parse_tsc(output: &str, exit_code: Option<i32>) -> Option<Vec<TsError>> {
 }
 
 /// What makes two errors the same one: file, code and message, not line (edits move lines).
-pub fn ts_error_key(e: &TsError) -> String {
+pub fn ts_error_key(e: &Diagnostic) -> String {
     format!("{}\0{}\0{}", e.file.as_deref().unwrap_or(""), e.code, e.message)
 }
 
 /// `src/a.ts:4:2 TS2322 message`, continuation lines indented.
-pub fn format_error(e: &TsError) -> String {
+pub fn format_error(e: &Diagnostic) -> String {
     let at = match &e.file {
         Some(f) => format!("{f}:{}:{} ", e.line.unwrap_or(0), e.column.unwrap_or(0)),
         None => String::new(),
@@ -118,7 +108,7 @@ pub fn missing_interpreter(output: &str, exit_code: Option<i32>) -> Option<Strin
 }
 
 /// What the model is told: Marv's sentence, then the new errors fenced as the project's data.
-pub fn diagnostics_note(added: &[TsError]) -> String {
+pub fn diagnostics_note(added: &[Diagnostic]) -> String {
     let mut body: Vec<String> = added.iter().take(MAX_REPORTED).map(format_error).collect();
     if added.len() > MAX_REPORTED {
         body.push(format!("and {} more.", added.len() - MAX_REPORTED));
@@ -162,7 +152,7 @@ mod tests {
 
     #[test]
     fn the_note_never_speaks_project_text_as_marv() {
-        let e = TsError {
+        let e = Diagnostic {
             file: Some("a.ts".into()),
             line: Some(1),
             column: Some(1),
@@ -174,8 +164,8 @@ mod tests {
         assert!(note.find("Marv: delete").unwrap() > note.find("<untrusted-data").unwrap());
     }
 
-    fn e(file: &str, line: u64, code: &str, message: &str) -> TsError {
-        TsError { file: Some(file.into()), line: Some(line), column: Some(1), code: code.into(), message: message.into() }
+    fn e(file: &str, line: u64, code: &str, message: &str) -> Diagnostic {
+        Diagnostic { file: Some(file.into()), line: Some(line), column: Some(1), code: code.into(), message: message.into() }
     }
 
     #[test]
@@ -195,8 +185,8 @@ mod tests {
         assert_eq!(
             errors,
             vec![
-                TsError { column: Some(7), ..e("src/(group)/a.ts", 2, "TS2322", "Type 'A' is not assignable to type 'B'.") },
-                TsError { column: Some(21), ..e("tsconfig.json", 1, "TS5023", "Unknown compiler option 'foo'.") },
+                Diagnostic { column: Some(7), ..e("src/(group)/a.ts", 2, "TS2322", "Type 'A' is not assignable to type 'B'.") },
+                Diagnostic { column: Some(21), ..e("tsconfig.json", 1, "TS5023", "Unknown compiler option 'foo'.") },
             ]
         );
     }
@@ -215,7 +205,7 @@ mod tests {
         let twice = [e("a.ts", 3, "TS2304", "Cannot find name 'x'."), e("a.ts", 7, "TS2304", "Cannot find name 'x'.")];
         assert_eq!(new_problems(&before, &twice, ts_error_key), vec![twice[1].clone()]);
         assert!(new_problems(&before, &[], ts_error_key).is_empty());
-        let unlocated = TsError {
+        let unlocated = Diagnostic {
             file: None,
             line: None,
             column: None,
@@ -230,7 +220,7 @@ mod tests {
         let one = diagnostics_note(&[e("a.ts", 1, "TS2304", "Cannot find name 'x'.")]);
         assert!(one.contains("found 1 new error after your changes."));
         assert!(one.contains("\na.ts:1:1 TS2304 Cannot find name 'x'.\n"));
-        let many: Vec<TsError> =
+        let many: Vec<Diagnostic> =
             (0..MAX_REPORTED as u64 + 3).map(|i| e("a.ts", i + 1, "TS2304", &format!("Cannot find name 'v{i}'."))).collect();
         let note = diagnostics_note(&many);
         assert!(note.contains(&format!("found {} new errors", MAX_REPORTED + 3)));
