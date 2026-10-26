@@ -107,7 +107,7 @@ fn serve(port: u16, text: &str) -> String {
 
 fn session(dirs: &Dirs, provider: &Arc<Scripted>, manager: &ProcessManager, edit: impl FnOnce(&mut SessionInit)) -> MarvSession {
     let mut init = SessionInit::new(&dirs.root, ProviderChoice::Factory(Arc::new(Fixed(provider.clone()))));
-    init.diagnostics = false;
+    init.diagnostics = false.into();
     init.checks = false;
     init.yolo = true;
     init.process_manager = Some(manager.clone());

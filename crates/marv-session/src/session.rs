@@ -57,9 +57,10 @@ use crate::checkpoints::store::{CheckpointKind, CheckpointStore, SnapshotResult,
 use crate::checkpoints::turn::CheckpointTurn;
 use crate::checkpoints::undo::{UndoPlan, UndoRefusal, UndoResult, apply_undo, plan_undo, undo_note};
 use crate::checks::{ProjectCheckResult, Violation};
+use crate::config::{Diagnostics, Language};
 use crate::cut_off::{OpenTurn, SavingApprover, cut_off_note, cut_off_notice};
 use crate::diagnostics::turn::{CheckOutcome, Checker, FailReason, OffReason, TurnChecks, TurnOptions, combine_checks};
-use crate::diagnostics::{CheckResult, TsError};
+use crate::diagnostics::{CheckResult, Diagnostic};
 use crate::event_queue::EventQueue;
 use crate::feedback::classify_reply;
 use crate::hooks::{HookCommand, HookRun};
@@ -259,8 +260,12 @@ pub enum SessionEvent {
     },
     /// An automatic compaction (the context was nearly full), and how it went.
     Compaction(CompactResult),
-    /// The typecheck after a step's file changes: new errors, a failure, or that it's off.
-    Check(CheckResult),
+    /// A diagnostics checker after a step's file changes (tsc; `label` names it): new errors, a failure, or that
+    /// it's off.
+    Check {
+        label: &'static str,
+        result: CheckResult,
+    },
     /// The project's own checks after a step's file changes.
     Checks(ProjectCheckResult),
     /// The turn's checkpoint (#16) couldn't be saved: the turn goes on, but /undo can't take it back. Once per turn.
@@ -375,7 +380,10 @@ pub struct SessionInit {
     /// Offer the plan tool (#15): a checklist the main agent keeps for a long task. Default true. Fixed for the
     /// session's life, since it changes the tool list (prompt cache).
     pub plan: bool,
-    pub diagnostics: bool,
+    /// Which languages' checkers run after the model's edits (#187).
+    pub diagnostics: Diagnostics,
+    /// The check cache's root (#187), for checkers that keep a build cache; `None`: those don't run.
+    pub check_cache: Option<PathBuf>,
     pub checks: bool,
     /// `compactTokens` (#140): compact once the context passes this many tokens, or at 85% of the window if that comes
     /// first. Default [`crate::config::DEFAULT_COMPACT_TOKENS`]; `None`: only the window rule.
@@ -488,7 +496,8 @@ impl SessionInit {
             approve: None,
             max_steps: None,
             plan: true,
-            diagnostics: true,
+            diagnostics: Diagnostics::ON,
+            check_cache: Some(crate::diagnostics::cache::default_root_from_env()),
             checks: true,
             compact_tokens: Some(crate::config::DEFAULT_COMPACT_TOKENS),
             compaction: marv_agent::compact::Version::V1,
@@ -534,7 +543,7 @@ pub struct Configure {
     pub sandbox: Option<bool>,
     pub yolo: Option<bool>,
     pub trajectories: Option<bool>,
-    pub diagnostics: Option<bool>,
+    pub diagnostics: Option<Diagnostics>,
     pub checks: Option<bool>,
     /// Checkpoints before each turn's changes (#16), for `undo()`.
     pub checkpoints: Option<bool>,
@@ -697,7 +706,7 @@ struct State {
     system: String,
     sandbox: bool,
     yolo: bool,
-    diagnostics: bool,
+    diagnostics: Diagnostics,
     checks: bool,
     compact_tokens: Option<u64>,
     compaction: marv_agent::compact::Version,
@@ -833,7 +842,11 @@ struct Inner {
     skills: Arc<Vec<marv_tools::Skill>>,
     /// MCP tools whose schema this conversation has seen (tool_search, or a rejected call): their errors don't repeat it.
     loaded: Arc<Mutex<HashSet<String>>>,
-    typecheck: Arc<Checker<TsError>>,
+    /// The diagnostics checkers, one per language that has one (#187: tsc so far); each keeps its own timeouts and
+    /// turns off on its own.
+    diagnostics: Vec<(Language, Arc<Checker<Diagnostic>>)>,
+    /// The check cache (#187) the checkers that keep a build cache share.
+    check_cache: Option<Arc<crate::diagnostics::cache::CheckCache>>,
     project_checks: Arc<Checker<Violation>>,
     /// Whether this session offers the process tool (Marv #51; decided at construction: it changes the tool list and
     /// the prompt).
@@ -972,6 +985,36 @@ fn recorder(record: &Record, turn: &str, agent: &str) -> AgentRecorder {
     AgentRecorder::new(move |r| record(r), Who { turn: turn.into(), agent: agent.into() }, crate::time::now_ms)
 }
 
+/// The diagnostics checkers, one per language that has one (#187: tsc so far), sharing the check cache.
+fn diagnostic_checkers(cache: &Option<Arc<crate::diagnostics::cache::CheckCache>>) -> Vec<(Language, Arc<Checker<Diagnostic>>)> {
+    let kinds: Vec<(Language, Arc<dyn crate::diagnostics::turn::CheckKind<Diagnostic>>)> =
+        vec![(Language::TypeScript, Arc::new(crate::diagnostics::turn::Typecheck))];
+    kinds
+        .into_iter()
+        .map(|(language, kind)| {
+            let mut checker = Checker::new(kind, None);
+            checker.cache = cache.clone();
+            (language, Arc::new(checker))
+        })
+        .collect()
+}
+
+/// A diagnostics checker as `/diagnostics` shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckerInfo {
+    pub language: Language,
+    pub label: &'static str,
+    pub state: String,
+}
+
+/// What `/diagnostics` shows besides the setting (#187): each checker's state, and this project's cache folder with
+/// its last measured size.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiagnosticsInfo {
+    pub checkers: Vec<CheckerInfo>,
+    pub cache: Option<(PathBuf, Option<u64>)>,
+}
+
 /// A check's trajectory record: `note` is exactly what the model was told.
 fn check_record<E>(
     turn: &str,
@@ -995,6 +1038,9 @@ fn check_record<E>(
                 FailReason::Timeout => "timeout",
                 FailReason::Unreadable => "unreadable",
                 FailReason::MissingInterpreter => "missing-interpreter",
+                FailReason::Pending => "pending",
+                FailReason::LowDisk => "low-disk",
+                FailReason::CacheRefused => "cache-refused",
             };
             (CheckStatus::Failed, Some(*ms), None, None, None, Some(reason.to_string()), None)
         }
@@ -1002,6 +1048,8 @@ fn check_record<E>(
             let reason = match reason {
                 OffReason::NoSandbox => "no-sandbox",
                 OffReason::Timeouts => "timeouts",
+                OffReason::Unreadable => "unreadable",
+                OffReason::CacheTooBig => "cache-too-big",
             };
             (CheckStatus::Off, None, None, None, None, Some(reason.to_string()), None)
         }
@@ -1224,6 +1272,7 @@ impl MarvSession {
         }
         // A subfolder instruction file quoted for the first time is a notice (the session's warnings).
         init.nested_trust.set_warn(init.on_warning.clone());
+        let check_cache = init.check_cache.clone().map(|root| Arc::new(crate::diagnostics::cache::CheckCache::new(root)));
         let inner = Inner {
             specs,
             always,
@@ -1232,7 +1281,8 @@ impl MarvSession {
             skills: Arc::new(init.skills.iter().map(|s| s.skill.clone()).collect()),
             loaded: Arc::default(),
             nested: Arc::new(crate::instructions::NestedInstructions::new(init.nested_trust.clone())),
-            typecheck: Arc::new(Checker::new(Arc::new(crate::diagnostics::turn::Typecheck), None)),
+            diagnostics: diagnostic_checkers(&check_cache),
+            check_cache,
             project_checks: Arc::new(Checker::new(Arc::new(crate::checks::kind::ProjectChecksKind), None)),
             process_on,
             processes: init.process_manager.clone().or_else(|| {
@@ -2191,14 +2241,14 @@ impl MarvSession {
         &self,
         turn: &str,
         sandbox: bool,
-        diagnostics: bool,
+        diagnostics: Diagnostics,
         checks_on: bool,
         stop: &CancellationToken,
         emit: &Emit,
         main: &Recorder,
         record: &Record,
     ) -> Option<TurnChecks> {
-        if !diagnostics && !checks_on {
+        if !diagnostics.any() && !checks_on {
             return None;
         }
         let checking = Arc::new(AtomicI32::new(0));
@@ -2220,16 +2270,16 @@ impl MarvSession {
         };
         let root = self.inner.init.root.clone();
         let mut parts = Vec::new();
-        if diagnostics {
-            let (emit, record, turn, kind) = (emit.clone(), record.clone(), turn.to_string(), self.inner.typecheck.kind.clone());
-            parts.extend(self.inner.typecheck.turn(TurnOptions {
+        for (_, checker) in self.inner.diagnostics.iter().filter(|(language, _)| diagnostics.get(*language)) {
+            let (emit, record, turn, kind) = (emit.clone(), record.clone(), turn.to_string(), checker.kind.clone());
+            parts.extend(checker.turn(TurnOptions {
                 root: root.clone(),
                 sandbox,
                 cancel: stop.clone(),
                 on_status: on_status.clone(),
                 on_result: Arc::new(move |result: CheckResult| {
-                    record(check_record(&turn, None, &result, |added| kind.note(added)));
-                    emit(SessionEvent::Check(result));
+                    record(check_record(&turn, kind.source(), &result, |added| kind.note(added)));
+                    emit(SessionEvent::Check { label: kind.label(), result });
                 }),
             }));
         }
@@ -2242,7 +2292,7 @@ impl MarvSession {
                 cancel: stop.clone(),
                 on_status,
                 on_result: Arc::new(move |result: ProjectCheckResult| {
-                    record(check_record(&turn, Some("checks"), &result, |added| kind.note(added)));
+                    record(check_record(&turn, kind.source(), &result, |added| kind.note(added)));
                     emit(SessionEvent::Checks(result));
                 }),
             }));
@@ -3329,6 +3379,30 @@ impl MarvSession {
     }
 
     /// For /checkpoints: why the last checkpoint failed, or why checkpoints are off for this project.
+    /// What `/diagnostics` shows (#187): each checker's state, and this project's cache folder with its last measured
+    /// size (read from its record: a big cache is never walked here). Only reads files.
+    pub fn diagnostics_info(&self) -> DiagnosticsInfo {
+        let checkers = self
+            .inner
+            .diagnostics
+            .iter()
+            .map(|(language, checker)| CheckerInfo { language: *language, label: checker.kind.label(), state: checker.state() })
+            .collect();
+        let cache = self.inner.check_cache.as_ref().and_then(|cache| {
+            let key = crate::diagnostics::cache::repo_key(&self.inner.init.root);
+            let dir = cache.dir(&key);
+            std::fs::symlink_metadata(&dir).is_ok().then(|| (dir, cache.recorded_size(&key)))
+        });
+        DiagnosticsInfo { checkers, cache }
+    }
+
+    /// `/diagnostics clear` (#187): deletes this project's check cache folder. `Ok(Some(bytes))` freed, `Ok(None)`
+    /// when there was none; an error when a check is using it.
+    pub fn clear_check_cache(&self) -> Result<Option<u64>, String> {
+        let Some(cache) = &self.inner.check_cache else { return Ok(None) };
+        cache.clear(&crate::diagnostics::cache::repo_key(&self.inner.init.root))
+    }
+
     pub fn checkpoint_problem(&self) -> CheckpointProblem {
         CheckpointProblem { failure: self.state().checkpoint_failure.clone(), off: self.inner.checkpoints.off() }
     }
@@ -3364,9 +3438,14 @@ impl MarvSession {
             s.logging = v;
         }
         if let Some(v) = changes.diagnostics {
-            // Turned back on: forget what made checking give up, so /diagnostics on really does.
-            if v && !s.diagnostics {
-                self.inner.typecheck.reset();
+            for (language, checker) in &self.inner.diagnostics {
+                match (s.diagnostics.get(*language), v.get(*language)) {
+                    // Turned back on: forget what made checking give up, so /diagnostics on really does.
+                    (false, true) => checker.reset(),
+                    // Turned off: its warm-up stops too.
+                    (true, false) => checker.stop(),
+                    _ => {}
+                }
             }
             s.diagnostics = v;
         }
@@ -3621,6 +3700,10 @@ impl MarvSession {
             (s.working.take(), s.hook_stop.take(), s.hook_task.take(), s.prune_task.take())
         };
         let (working, hook_stop, hook_task, prune_task) = working;
+        // The checkers' warm-ups belong to the session (#187).
+        for (_, checker) in &self.inner.diagnostics {
+            checker.stop();
+        }
         // Session-start hooks still running are killed (with what they started) and waited for (Greptile on #115).
         if let Some(stop) = hook_stop {
             stop.cancel();
@@ -3935,7 +4018,7 @@ impl MarvSession {
                     // A turn the person didn't start (the radio, #124; a mesh wake, #74) runs without yolo.
                     yolo: s.yolo && !woken.is_woken(),
                     sandbox: s.sandbox,
-                    diagnostics: s.diagnostics,
+                    diagnostics: s.diagnostics.any(),
                     checks: s.checks,
                     mcp_tools: mcp_choice,
                     radio_wake: match woken {
@@ -4553,7 +4636,8 @@ mod turn_tests {
 
     fn make(dirs: &Dirs, factory: TestFactory, edit: impl FnOnce(&mut SessionInit)) -> MarvSession {
         let mut init = SessionInit::new(&dirs.project, ProviderChoice::Factory(Arc::new(factory)));
-        init.diagnostics = false; // off unless a test turns them on (checks have their own tests, #13)
+        init.diagnostics = Diagnostics::OFF; // off unless a test turns them on (checks have their own tests, #13)
+        init.check_cache = None;
         init.checks = false;
         edit(&mut init);
         MarvSession::new(init).unwrap()
@@ -4655,6 +4739,36 @@ mod turn_tests {
             panic!()
         };
         assert_eq!((start, *reason), (end, TurnEndReason::Done(StopReason::End)));
+    }
+
+    /// #187: `/diagnostics` sees each checker and this project's check cache; `/diagnostics clear` deletes only that
+    /// folder; a switch per language reaches its checker.
+    #[tokio::test]
+    async fn diagnostics_info_switches_per_language_and_clears_this_projects_cache() {
+        let dirs = Dirs::new();
+        let root = dirs.dir.join("checks");
+        let provider = Scripted::new(vec![]);
+        let session = scripted(&dirs, &provider, |init| init.check_cache = Some(root.clone()));
+        let info = session.diagnostics_info();
+        assert_eq!(info.checkers.len(), 1);
+        assert_eq!(
+            (info.checkers[0].language, info.checkers[0].label, info.checkers[0].state.as_str()),
+            (Language::TypeScript, "tsc", "ready")
+        );
+        assert_eq!(info.cache, None);
+        assert_eq!(session.clear_check_cache(), Ok(None));
+        let cache = crate::diagnostics::cache::CheckCache::new(&root);
+        let key = crate::diagnostics::cache::repo_key(&dirs.project);
+        let dir = cache.key_dir(&key).unwrap();
+        std::fs::write(dir.join("artifact"), "1234").unwrap();
+        let other = cache.key_dir("another-project").unwrap();
+        assert_eq!(session.diagnostics_info().cache, Some((dir.clone(), None)));
+        assert_eq!(session.clear_check_cache(), Ok(Some(4)));
+        assert!(!dir.exists() && other.exists());
+        for d in [Diagnostics::ON, Diagnostics::OFF.with(Language::Rust, true), Diagnostics::OFF] {
+            session.configure(Configure { diagnostics: Some(d), ..Configure::default() }).unwrap();
+            assert_eq!(session.state().diagnostics, d);
+        }
     }
 
     #[tokio::test]

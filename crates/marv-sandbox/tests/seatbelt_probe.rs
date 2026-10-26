@@ -943,3 +943,885 @@ fn probe_round5() {
     }
     println!("\n===== REPORT =====\n{}\n===== END =====", report.join("\n"));
 }
+
+/// What `sender == "Sandbox"` logs while `f` runs: `log stream`'s lines with a denial in them (#183).
+fn sandbox_denials<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let path = std::env::temp_dir().join(format!("mx-log-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
+    let file = std::fs::File::create(&path).unwrap();
+    let mut stream = Command::new("/usr/bin/log")
+        .args(["stream", "--style", "compact", "--predicate", "sender == \"Sandbox\""])
+        .stdin(Stdio::null())
+        .stdout(file)
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let got = f();
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let _ = stream.kill();
+    let _ = stream.wait();
+    let lines = std::fs::read_to_string(&path).unwrap_or_default();
+    let _ = std::fs::remove_file(&path);
+    (got, lines.lines().filter(|l| l.contains("deny")).map(|l| l.trim().to_string()).collect())
+}
+
+/// Round 6 (#183): which rule refuses `ln ~/.ssh/known_hosts x` once the home's read deny is gone, links are allowed
+/// anywhere and the home is writable (the #178 proof), with `log stream` naming each denied operation; and Go's
+/// `net.Interfaces()` under the profile, with a Go outside the home (`MARV_PROBE_GO`: its `bin` folder).
+#[test]
+#[ignore = "a report for #183: run with --ignored --nocapture on macOS"]
+fn probe_round6() {
+    let mut report: Vec<String> = Vec::new();
+    let mut note = |name: &str, what: String| {
+        println!("PROBE {name}: {what}");
+        report.push(format!("{name}: {what}"));
+    };
+    let mut fx = Fx::new("r6");
+    // The guards' fixture: a fake home outside the user's temporary folder, a project in it.
+    let home = PathBuf::from(format!("/private/var/tmp/mx-probe-{}-r6home", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(home.join(".ssh")).unwrap();
+    std::fs::create_dir_all(home.join("proj")).unwrap();
+    std::fs::write(home.join(".ssh/known_hosts"), "SECRET-SSH\n").unwrap();
+    fx.extra.push(home.clone());
+    let proj = home.join("proj");
+    let plan = {
+        let mut sb = Sandbox::from_env(true);
+        sb.home = home.clone();
+        sb.path = std::env::var("PATH").unwrap_or_default();
+        sb.plan(&proj, &CommandMounts::default())
+    };
+    let shipped = seatbelt::profile(&plan, &fx.run(), &RealFs).unwrap();
+    note("rules.link", shipped.text.lines().filter(|l| l.contains("file-link")).collect::<Vec<_>>().join(" ;; "));
+    const HOME_READ: &str = "(deny file-read* (subpath (param \"HOME\")))\n";
+    assert!(shipped.text.contains(HOME_READ));
+    let edit = |remove: &[&str], append: &[&str]| {
+        let mut text = shipped.text.clone();
+        for r in remove {
+            text = text.replace(r, "");
+        }
+        for a in append {
+            text.push_str(a);
+            text.push('\n');
+        }
+        Profile { text, params: shipped.params.clone() }
+    };
+    const LINKS: &str = "(allow file-link)";
+    const HOME_WRITE: &str = "(allow file-write* (subpath (param \"HOME\")))";
+    let variants = [
+        ("shipped", edit(&[], &[])),
+        ("no_home_read", edit(&[HOME_READ], &[])),
+        ("no_home_read.links_anywhere", edit(&[HOME_READ], &[LINKS])),
+        ("no_home_read.links_anywhere.home_writable", edit(&[HOME_READ], &[LINKS, HOME_WRITE])),
+        ("shipped.allow_file_all_last", edit(&[], &["(allow file*)"])),
+        ("shipped.allow_file_link_and_data_last", edit(&[], &["(allow file-link file-read* file-write*)"])),
+        ("minimal_allow_default", Profile { text: "(version 1)\n(allow default)\n".into(), params: vec![] }),
+    ];
+    let k = home.join(".ssh/known_hosts");
+    for (name, prof) in &variants {
+        let script = format!(
+            "K='{k}'; cat \"$K\" && echo read-ok; echo w >> \"$K\" && echo write-ok; \
+             ln \"$K\" ln-{name} && echo ln-ok; \
+             python3 -c 'import os,sys; os.link(sys.argv[1], sys.argv[2]); print(\"pylink-ok\")' \"$K\" py-{name}; \
+             echo p > plain-{name} && ln plain-{name} plain2-{name} && echo plain-ln-ok",
+            k = k.display()
+        );
+        let (out, denials) = sandbox_denials(|| fx.sh(prof, &proj, &script));
+        note(&format!("link6.{name}"), out.to_string());
+        note(&format!("link6.{name}.denials"), denials.join(" || "));
+    }
+
+    // Go's net.Interfaces(), with a Go outside the home (the runner's toolcache Go lives under it).
+    let gos = std::env::var("MARV_PROBE_GO").unwrap_or_default();
+    std::fs::write(
+        fx.root.join("ifaces.go"),
+        "package main\nimport (\"fmt\"; \"net\")\nfunc main() { i, err := net.Interfaces(); fmt.Println(len(i), err) }\n",
+    )
+    .unwrap();
+    for go in gos.split(':').filter(|g| !g.is_empty()) {
+        note(&format!("ifaces6.go[{go}].host"), output(Command::new(format!("{go}/go")).args(["env", "GOROOT"])).to_string());
+        for (name, prof) in [("network_off", fx.profile(false)), ("network_on", fx.profile(true))] {
+            let script = format!(
+                "PATH='{go}':$PATH; go version && echo GOROOT=$(go env GOROOT) && ls \"$(go env GOROOT)/src/net\" | head -1 && go run ifaces.go"
+            );
+            let (out, denials) = sandbox_denials(|| fx.sh(&prof, &fx.root, &script));
+            note(&format!("ifaces6.go[{go}].{name}"), out.to_string());
+            note(&format!("ifaces6.go[{go}].{name}.denials"), denials.join(" || "));
+        }
+    }
+    if gos.is_empty() {
+        note("ifaces6.go", "MARV_PROBE_GO not set".into());
+    }
+    println!("\n===== REPORT =====\n{}\n===== END =====", report.join("\n"));
+}
+
+/// **Seatbelt refuses `link()` from a source it denies for reading or writing the file's data, whatever the
+/// `file-link` rules say** (#166 review probe, #183). The profile's link denies are a second layer on top of this
+/// (`HARD_LINK_OP` in `seatbelt.rs`); not a probe but a test, so an OS that stops doing it fails here.
+#[test]
+fn link_is_refused_from_a_source_denied_for_reads_or_writes() {
+    struct Dir(PathBuf);
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let dir = Dir(PathBuf::from(format!("/private/var/tmp/mx-link-{}", std::process::id())));
+    let (a, b) = (dir.0.join("A"), dir.0.join("B"));
+    for d in [&a, &b] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let src = a.join("f");
+    std::fs::write(&src, "a").unwrap();
+    let link = |rules: &str, dst: &Path| {
+        output(
+            Command::new(SANDBOX_EXEC)
+                .args(["-p", &format!("(version 1)\n(allow default)\n{rules}\n"), "/bin/ln"])
+                .arg(&src)
+                .arg(dst),
+        )
+    };
+    // The control: with nothing denied, the link is made.
+    let dst = b.join("control");
+    let out = link("", &dst);
+    assert!(out.code == Some(0) && dst.exists(), "control: {out}");
+    let a_rule = |op: &str| format!("(deny {op} (subpath \"{}\"))", a.display());
+    let refused = |name: &str, rules: &str| {
+        let dst = b.join(name);
+        let out = link(rules, &dst);
+        assert!(out.code != Some(0) && out.err.contains("Operation not permitted") && !dst.exists(), "{name}: {out}");
+    };
+    for (name, deny) in [("read", a_rule("file-read-data")), ("write", a_rule("file-write-data"))] {
+        refused(name, &deny);
+        refused(&format!("{name}+allow_link_A"), &format!("{deny}\n(allow file-link (subpath \"{}\"))", a.display()));
+    }
+    // Why the #178 proof's "links allowed anywhere" changed nothing: an allow with no filter doesn't override an
+    // earlier deny with one (#183 probe, macOS 14 and 15), so `(allow file-link)` left the home's link deny in force.
+    // An allow naming the path does override it. The profile's allows all name their paths.
+    let deny_a = a_rule("file-link");
+    refused("link_denied+allow_all", &format!("{deny_a}\n(allow file-link)"));
+    let dst = b.join("link_denied+allow_A");
+    let out = link(&format!("{deny_a}\n(allow file-link (subpath \"{}\"))", a.display()), &dst);
+    assert!(out.code == Some(0) && dst.exists(), "link_denied+allow_A: {out}");
+}
+
+/// **Each link rule of the shipped profile refuses a link on its own** (#183): with the read or write deny that
+/// refuses the link first taken out of the profile (see the test above: Seatbelt refuses `link()` from a source it
+/// can't read or write), the link rule alone must still refuse it, and with that rule taken out too the same link is
+/// made (the control: the edit reached the kernel, and nothing else held it). A regression in any one link rule, the
+/// home's and the shared temporary folder's deny, the protected names' regex or a protected path's literal deny,
+/// fails here, which no outcome guard can catch: with the whole profile in place the first layer refuses first.
+#[test]
+fn each_link_rule_refuses_on_its_own() {
+    let pid = std::process::id();
+    let home = PathBuf::from(format!("/private/var/tmp/mx-linkrules-{pid}"));
+    let shared = PathBuf::from(format!("/private/tmp/mx-linkrules-{pid}"));
+    let t = user_t();
+    let tmp = nix::unistd::mkdtemp(&t.join("marv-probe-XXXXXX")).unwrap();
+    struct Dirs(Vec<PathBuf>);
+    impl Drop for Dirs {
+        fn drop(&mut self) {
+            for d in &self.0 {
+                let _ = std::fs::remove_dir_all(d);
+            }
+        }
+    }
+    let _dirs = Dirs(vec![home.clone(), shared.clone(), tmp.clone()]);
+    let proj = home.join("proj");
+    for d in [home.join(".ssh"), proj.join("sub"), shared.clone()] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    std::fs::write(home.join(".ssh/known_hosts"), "SECRET\n").unwrap();
+    std::fs::write(proj.join(".envrc"), "export SAFE=1\n").unwrap();
+    std::fs::write(proj.join("plain"), "plain\n").unwrap();
+    std::fs::write(shared.join("f"), "shared\n").unwrap();
+    let plan = {
+        let mut sb = Sandbox::from_env(true);
+        sb.home = home.clone();
+        sb.path = std::env::var("PATH").unwrap_or_default();
+        sb.plan(&proj, &CommandMounts::default())
+    };
+    let run = Invocation { tmp: tmp.clone(), user_temp: Some(t.parent().unwrap().to_path_buf()), exe: None, ports: vec![] };
+    let shipped = seatbelt::profile(&plan, &run, &RealFs).unwrap();
+    let text = &shipped.text;
+    // The rules this test takes out, each checked to be there as written.
+    let line_of = |start: &str| -> String {
+        let found: Vec<&str> = text.lines().filter(|l| l.starts_with(start)).collect();
+        assert_eq!(found.len(), 1, "one line starting {start:?} in:\n{text}");
+        format!("{}\n", found[0])
+    };
+    let home_read = line_of("(deny file-read* (subpath (param \"HOME\")))");
+    let shared_read = line_of("(deny file-read* (subpath \"/private/tmp\"))");
+    let broad_link = line_of("(deny file-link (subpath (param \"HOME\")) (subpath \"/private/tmp\")");
+    let names_link = line_of("(deny file-link (require-all");
+    let protected_links: Vec<String> = text
+        .lines()
+        .filter(|l| l.starts_with("(deny file-link (literal (param \"PROTECTED_"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    assert!(!protected_links.is_empty(), "no protected path's link deny in:\n{text}");
+    let home_write = "(allow file-write* (subpath (param \"HOME\")))\n";
+    let project_write = "(allow file-write* (subpath (param \"PROJECT\")))\n";
+    let shared_write = "(allow file-write* (subpath \"/private/tmp\"))\n";
+    let edit = |remove: &[&str], replace: &[(&str, &str)], append: &[&str]| {
+        let mut t = text.clone();
+        for r in remove {
+            assert!(t.contains(r), "{r}");
+            t = t.replace(r, "");
+        }
+        for (from, to) in replace {
+            assert!(t.contains(from), "{from}");
+            t = t.replace(from, to);
+        }
+        t.push_str(&append.concat());
+        Profile { text: t, params: shipped.params.clone() }
+    };
+    let ln = |profile: &Profile, src: &str, dst: &str| {
+        output(
+            Command::new(SANDBOX_EXEC)
+                .args(profile.args())
+                .args(["--", "/bin/ln", src, dst])
+                .current_dir(&proj)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("TMPDIR", &tmp),
+        )
+    };
+    let k = home.join(".ssh/known_hosts").to_string_lossy().into_owned();
+    let f = shared.join("f").to_string_lossy().into_owned();
+    let no_home_in_link = ("(deny file-link (subpath (param \"HOME\")) ", "(deny file-link ");
+    let no_shared_in_link = (" (subpath \"/private/tmp\")", "");
+    let protected: Vec<&str> = protected_links.iter().map(String::as_str).collect();
+    let mut names_and_protected: Vec<&str> = vec![names_link.as_str()];
+    names_and_protected.extend(&protected);
+    let cases: Vec<(&str, &str, &str, Profile, Profile)> = vec![
+        (
+            "the home's link deny",
+            k.as_str(),
+            "x1",
+            edit(&[&home_read], &[], &[home_write]),
+            edit(&[&home_read], &[no_home_in_link], &[home_write]),
+        ),
+        (
+            "the shared temporary folder's link deny",
+            f.as_str(),
+            "x2",
+            edit(&[&shared_read], &[], &[shared_write]),
+            edit(&[&shared_read], &[no_shared_in_link], &[shared_write]),
+        ),
+        (
+            "the protected names' link deny, on the new name",
+            "plain",
+            "sub/AGENTS.md",
+            edit(&[], &[], &[project_write]),
+            edit(&[&names_link], &[], &[project_write]),
+        ),
+        (
+            "the protected names' link deny, on the source",
+            ".envrc",
+            "x3",
+            edit(&protected, &[], &[project_write]),
+            edit(&names_and_protected, &[], &[project_write]),
+        ),
+        (
+            "a protected path's link deny",
+            ".envrc",
+            "x4",
+            edit(&[&names_link], &[], &[project_write]),
+            edit(&names_and_protected, &[], &[project_write]),
+        ),
+    ];
+    assert!(broad_link.contains("USER_TEMP"), "{broad_link}");
+    for (rule, src, dst, alone, without) in cases {
+        let out = ln(&alone, src, dst);
+        assert!(
+            out.code != Some(0) && out.err.contains("Operation not permitted") && !proj.join(dst).exists(),
+            "{rule} didn't refuse ln {src} {dst} on its own: {out}"
+        );
+        let out = ln(&without, src, dst);
+        assert!(out.code == Some(0) && proj.join(dst).exists(), "control, {rule} taken out: ln {src} {dst}: {out}");
+        std::fs::remove_file(proj.join(dst)).unwrap();
+    }
+}
+
+/// Round 7 (#183): round 6 showed `ln` refused for `file-link` on the source even with `(allow file-link)` last. Does an
+/// unfiltered allow lose to an earlier filtered deny (then the home's link deny is what held the #178 proof)? And does
+/// a link *named* like a protected entry need the protected-name link rule, or is it a write too?
+#[test]
+#[ignore = "a report for #183: run with --ignored --nocapture on macOS"]
+fn probe_round7() {
+    let mut report: Vec<String> = Vec::new();
+    let mut note = |name: &str, what: String| {
+        println!("PROBE {name}: {what}");
+        report.push(format!("{name}: {what}"));
+    };
+    let mut fx = Fx::new("r7");
+    // Minimal profiles: a filtered deny, then an unfiltered or a filtered allow after it.
+    let base = fx.shared.join("links");
+    let (a, b) = (base.join("A"), base.join("B"));
+    for d in [&a, &b] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    std::fs::write(a.join("f"), "a").unwrap();
+    let deny_a = format!("(deny file-link (subpath \"{}\"))", a.display());
+    for (i, (name, rules)) in [
+        ("deny_A", deny_a.clone()),
+        ("deny_A.allow_all", format!("{deny_a}\n(allow file-link)")),
+        ("deny_A.allow_A", format!("{deny_a}\n(allow file-link (subpath \"{}\"))", a.display())),
+        (
+            "deny_A.allow_A_and_B",
+            format!("{deny_a}\n(allow file-link (subpath \"{}\") (subpath \"{}\"))", a.display(), b.display()),
+        ),
+        ("deny_read_A.allow_read_all", format!("(deny file-read-data (subpath \"{}\"))\n(allow file-read-data)", a.display())),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let p = Profile { text: format!("(version 1)\n(allow default)\n{rules}\n"), params: vec![] };
+        let script = format!(
+            "cat '{}' && echo read-ok; ln '{}' '{}' && echo ln-ok",
+            a.join("f").display(),
+            a.join("f").display(),
+            b.join(format!("g{i}")).display()
+        );
+        note(&format!("prec.{name}"), fx.sh(&p, &fx.shared, &script).to_string());
+    }
+
+    // The guards' fixture again (a fake home outside the user's temporary folder).
+    let home = PathBuf::from(format!("/private/var/tmp/mx-probe-{}-r7home", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(home.join(".ssh")).unwrap();
+    std::fs::create_dir_all(home.join("proj/sub")).unwrap();
+    std::fs::write(home.join(".ssh/known_hosts"), "SECRET-SSH\n").unwrap();
+    std::fs::write(home.join("proj/plain"), "plain\n").unwrap();
+    fx.extra.push(home.clone());
+    let proj = home.join("proj");
+    let plan = {
+        let mut sb = Sandbox::from_env(true);
+        sb.home = home.clone();
+        sb.path = std::env::var("PATH").unwrap_or_default();
+        sb.plan(&proj, &CommandMounts::default())
+    };
+    let shipped = seatbelt::profile(&plan, &fx.run(), &RealFs).unwrap();
+    let home_read = "(deny file-read* (subpath (param \"HOME\")))\n";
+    let home_link = "(deny file-link (subpath (param \"HOME\")) ";
+    let names_link = shipped.text.lines().find(|l| l.starts_with("(deny file-link (require-all")).unwrap_or_default().to_string();
+    assert!(shipped.text.contains(home_read) && shipped.text.contains(home_link) && !names_link.is_empty());
+    let edit = |f: &dyn Fn(String) -> String| Profile { text: f(shipped.text.clone()), params: shipped.params.clone() };
+    let home_write = "(allow file-write* (subpath (param \"HOME\")))\n";
+    let variants = [
+        ("shipped", edit(&|t| t)),
+        ("no_home_read.home_writable", edit(&|t| t.replace(home_read, "") + home_write)),
+        (
+            "no_home_read.no_home_link.home_writable",
+            edit(&|t| t.replace(home_read, "").replace(home_link, "(deny file-link ") + home_write),
+        ),
+        (
+            "no_home_read.allow_home_link_last.home_writable",
+            edit(&|t| t.replace(home_read, "") + home_write + "(allow file-link (subpath (param \"HOME\")))\n"),
+        ),
+        ("no_names_link", edit(&|t| t.replace(&format!("{names_link}\n"), ""))),
+    ];
+    let k = home.join(".ssh/known_hosts");
+    for (name, prof) in &variants {
+        let script = format!(
+            "cat '{k}' >/dev/null && echo read-ok; ln '{k}' ln-{name} && echo ln-home-ok; \
+             ln plain sub/AGENTS.md && echo ln-to-agents-ok; ln plain .envrc && echo ln-to-envrc-ok; \
+             ln plain \"$TMPDIR/AGENTS.md\" && echo ln-to-tmp-agents-ok; rm -f sub/AGENTS.md .envrc",
+            k = k.display()
+        );
+        let (out, denials) = sandbox_denials(|| fx.sh(prof, &proj, &script));
+        note(&format!("link7.{name}"), out.to_string());
+        let denials: Vec<&String> = denials.iter().filter(|l| l.contains("file-")).collect();
+        note(&format!("link7.{name}.denials"), denials.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" || "));
+    }
+    println!("\n===== REPORT =====\n{}\n===== END =====", report.join("\n"));
+}
+
+// ===== #152: a background process on the host's loopback (`docs/specs/2026-10-25-macos-processes.md` §7) =====
+//
+// What option A of the spec would have relied on, measured on the kernel: a profile that lets a process without network
+// bind and accept on `localhost:*` (with or without a deny for each port below 1024), and a bash profile with one
+// outbound rule per port. The 2026-10-25 probes (PR #242) showed that `(local ip "localhost:*")` doesn't keep a bind on
+// loopback (the wildcard, the rest of 127/8 and the machine's own addresses all bind), so the process door stays off on
+// macOS and no command's profile has these rules: they exist only here, built on top of the closed profile.
+//
+// `loopback_probe_report` (ignored, run by the macOS CI job with `--nocapture`) prints every probe, one `PROBE name: …`
+// line each, and never fails on a result: an OS update that tightens Seatbelt shows up in the log.
+//
+// Run locally, the probes that bind the machine's own interface addresses may raise the application firewall's
+// "accept incoming connections?" prompt when it's on (GitHub's runners have it off). `127.0.0.2` is probed only where
+// lo0 has that alias (`sudo ifconfig lo0 alias 127.0.0.2 up`; CI adds it).
+
+/// Binds each `addr@port` given (TCP, then `listen`), one line each: `addr@port ok <port>` or `addr@port err <ERRNO>`.
+/// IPv6 sockets are dual-stack (`IPV6_V6ONLY` off, Node's default for `::`).
+const BIND_PY: &str = r#"import errno, socket, sys
+for spec in sys.argv[1:]:
+    host, _, port = spec.rpartition("@")
+    fam = socket.AF_INET6 if ":" in host else socket.AF_INET
+    s = socket.socket(fam, socket.SOCK_STREAM)
+    try:
+        if fam == socket.AF_INET6:
+            s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        s.bind((host, int(port)))
+        s.listen(1)
+        print(spec, "ok", s.getsockname()[1], flush=True)
+    except OSError as e:
+        print(spec, "err", errno.errorcode.get(e.errno, e.errno), flush=True)
+    finally:
+        s.close()
+"#;
+
+/// Connects to each `addr@port` given, from `--from <addr>` if given first: `addr@port ok` or `addr@port err <ERRNO>`.
+const CONNECT_PY: &str = r#"import errno, socket, sys
+args = sys.argv[1:]
+src = None
+if args and args[0] == "--from":
+    src, args = args[1], args[2:]
+for spec in args:
+    host, _, port = spec.rpartition("@")
+    fam = socket.AF_INET6 if ":" in host else socket.AF_INET
+    s = socket.socket(fam, socket.SOCK_STREAM)
+    s.settimeout(5)
+    try:
+        if src:
+            s.bind((src, 0))
+        s.connect((host, int(port)))
+        print(spec, "ok", flush=True)
+    except OSError as e:
+        print(spec, "err", errno.errorcode.get(e.errno, e.errno) if e.errno else type(e).__name__, flush=True)
+    finally:
+        s.close()
+"#;
+
+/// A server on `127.0.0.1:0`: prints `port <n>`, then whether it can connect to itself (`self ok` / `self err <ERRNO>`),
+/// then answers `hi` to every connection for 30 seconds.
+const SERVE_PY: &str = r#"import errno, socket, time
+l = socket.socket()
+l.bind(("127.0.0.1", 0))
+l.listen(8)
+port = l.getsockname()[1]
+print("port", port, flush=True)
+c = socket.socket()
+c.settimeout(5)
+try:
+    c.connect(("127.0.0.1", port))
+    print("self ok", flush=True)
+    l.accept()[0].close()
+except OSError as e:
+    print("self err", errno.errorcode.get(e.errno, e.errno) if e.errno else type(e).__name__, flush=True)
+c.close()
+l.settimeout(1)
+end = time.time() + 30
+while time.time() < end:
+    try:
+        a, _ = l.accept()
+        a.sendall(b"hi\n")
+        a.close()
+    except socket.timeout:
+        pass
+"#;
+
+impl Fx {
+    /// The rules option A would have given a process without network, on top of the closed profile (the last
+    /// matching rule wins): bind and accept on `localhost:*`, and with `low_denies`, each port below 1024 refused.
+    fn listen_profile(&self, low_denies: bool) -> Profile {
+        let closed = self.profile(false);
+        let mut text = closed.text.clone();
+        text.push_str("(allow network-bind (local ip \"localhost:*\"))\n(allow network-inbound (local ip \"localhost:*\"))\n");
+        if low_denies {
+            for port in 1..1024 {
+                text.push_str(&format!("(deny network-bind (local ip \"localhost:{port}\"))\n"));
+            }
+        }
+        Profile { text, params: closed.params }
+    }
+
+    /// A bash command's closed profile with an outbound rule for each of `ports` (`Invocation::ports`).
+    fn bash_profile(&self, ports: &[u16]) -> Profile {
+        let run = Invocation { ports: ports.to_vec(), ..self.run() };
+        seatbelt::profile(&self.plan(&self.root, false), &run, &RealFs).unwrap()
+    }
+
+    /// Writes the probe scripts into the project (readable in every sandbox).
+    fn scripts(&self) {
+        for (name, text) in [("bind.py", BIND_PY), ("connect.py", CONNECT_PY), ("serve.py", SERVE_PY)] {
+            std::fs::write(self.root.join(name), text).unwrap();
+        }
+    }
+
+    /// `script` with `args`, sandboxed by `profile` (or not, with None), one result per line: `spec -> rest`.
+    fn per_line(&self, profile: Option<&Profile>, script: &str, args: &[String]) -> Vec<(String, String)> {
+        let out = match profile {
+            Some(p) => {
+                let quoted: Vec<String> = args.iter().map(|a| format!("'{a}'")).collect();
+                self.sh(p, &self.root, &format!("python3 {script} {}", quoted.join(" ")))
+            }
+            None => output(Command::new("python3").arg(self.root.join(script)).args(args).current_dir(&self.root)),
+        };
+        let mut lines: Vec<(String, String)> =
+            out.out.lines().filter_map(|l| l.split_once(' ').map(|(spec, rest)| (spec.to_string(), rest.to_string()))).collect();
+        if lines.is_empty() {
+            lines.push(("(none)".into(), out.to_string()));
+        }
+        lines
+    }
+
+    /// A sandboxed `python3 <script>` running in the background, in its own process group, stdout piped.
+    fn spawn(&self, profile: &Profile, script: &str) -> std::process::Child {
+        use std::os::unix::process::CommandExt as _;
+        Command::new(SANDBOX_EXEC)
+            .args(profile.args())
+            .args(["--", "/bin/bash", "-c", &format!("exec python3 {script}")])
+            .current_dir(&self.root)
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", &self.home)
+            .env("TMPDIR", &self.tmp)
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+}
+
+/// The machine's own addresses on interfaces other than lo0, from `ifconfig` (IPv6 link-local ones with their
+/// `%scope`), and lo0's addresses other than 127.0.0.1 and ::1.
+fn interface_addresses() -> (Vec<String>, Vec<String>) {
+    let out = output(&mut Command::new("/sbin/ifconfig"));
+    let (mut others, mut lo0) = (Vec::new(), Vec::new());
+    let mut iface = String::new();
+    for line in out.out.lines() {
+        if !line.starts_with(char::is_whitespace) {
+            iface = line.split(':').next().unwrap_or_default().to_string();
+            continue;
+        }
+        let mut words = line.split_whitespace();
+        let addr = match (words.next(), words.next()) {
+            (Some("inet" | "inet6"), Some(addr)) => addr.to_string(),
+            _ => continue,
+        };
+        if iface == "lo0" {
+            if addr != "127.0.0.1" && addr != "::1" {
+                lo0.push(addr);
+            }
+        } else {
+            others.push(addr);
+        }
+    }
+    (others, lo0)
+}
+
+/// Probe 1's cases: (must bind, must be refused, recorded either way), as `addr@0`.
+fn bind_cases() -> (Vec<String>, Vec<String>, Vec<String>) {
+    let at0 = |a: &str| format!("{a}@0");
+    let (others, lo0) = interface_addresses();
+    let must_work = ["127.0.0.1", "::1"].map(at0).to_vec();
+    let mut refused: Vec<String> = ["0.0.0.0", "::", "::ffff:0.0.0.0", "127.0.0.2"].map(at0).to_vec();
+    refused.extend(others.iter().map(|a| at0(a)));
+    let mut recorded: Vec<String> = vec![at0("::ffff:127.0.0.1")];
+    recorded.extend(lo0.iter().filter(|a| *a != "127.0.0.2").map(|a| at0(a)));
+    (must_work, refused, recorded)
+}
+
+/// A host listener on `addr` answering a fixed HTTP response, until the test ends.
+fn http_listener(addr: &str) -> Option<u16> {
+    use std::io::Read as _;
+    let l = std::net::TcpListener::bind(addr).ok()?;
+    let port = l.local_addr().ok()?.port();
+    std::thread::spawn(move || {
+        for s in l.incoming().flatten() {
+            let mut s = s;
+            let mut buf = [0u8; 1024];
+            let _ = s.read(&mut buf);
+            let _ = s.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi");
+        }
+    });
+    Some(port)
+}
+
+/// A port free on both 127.0.0.1 and ::1 with a listener on each (of `make`), or on 127.0.0.1 alone.
+fn dual_listener(make: fn(&str) -> Option<u16>) -> (u16, bool) {
+    for _ in 0..20 {
+        let Some(p) = make("127.0.0.1:0") else { continue };
+        if make(&format!("[::1]:{p}")).is_some() {
+            return (p, true);
+        }
+    }
+    (make("127.0.0.1:0").unwrap(), false)
+}
+
+/// `sandbox-exec -p <profile> -- /usr/bin/true`'s median start-to-exit time over `n` runs, in milliseconds, and how
+/// many runs failed (a profile the kernel refused).
+fn median_start_ms(profiles: &[&Profile], n: usize) -> Vec<(f64, usize)> {
+    let mut times: Vec<Vec<f64>> = vec![Vec::new(); profiles.len()];
+    let mut failed = vec![0usize; profiles.len()];
+    // Interleaved, so drift on a shared runner hits each profile alike.
+    for _ in 0..n {
+        for (i, p) in profiles.iter().enumerate() {
+            let start = std::time::Instant::now();
+            let ok = Command::new(SANDBOX_EXEC).args(p.args()).args(["--", "/usr/bin/true"]).status().is_ok_and(|s| s.success());
+            times[i].push(start.elapsed().as_secs_f64() * 1000.0);
+            failed[i] += usize::from(!ok);
+        }
+    }
+    times
+        .into_iter()
+        .zip(failed)
+        .map(|(mut t, failed)| {
+            t.sort_by(|a, b| a.total_cmp(b));
+            (t[t.len() / 2], failed)
+        })
+        .collect()
+}
+
+/// The first line of a running child's stdout that starts with `prefix`, within 15 seconds.
+fn read_line(lines: &mut impl Iterator<Item = std::io::Result<String>>, prefix: &str) -> Option<String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while std::time::Instant::now() < deadline {
+        match lines.next() {
+            Some(Ok(line)) if line.starts_with(prefix) => return Some(line),
+            Some(Ok(_)) => continue,
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Connects from the host to `127.0.0.1:port` and reads the server's line.
+fn host_reads(port: u16) -> String {
+    use std::io::Read as _;
+    match std::net::TcpStream::connect(("127.0.0.1", port)) {
+        Ok(mut s) => {
+            let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+            let mut buf = String::new();
+            match s.read_to_string(&mut buf) {
+                Ok(_) => format!("ok {:?}", buf.trim()),
+                Err(e) => format!("read err {e}"),
+            }
+        }
+        Err(e) => format!("err {e}"),
+    }
+}
+
+#[test]
+#[ignore = "a report for #152: run with --ignored --nocapture on macOS"]
+fn loopback_probe_report() {
+    let mut report: Vec<String> = Vec::new();
+    let mut note = |name: &str, what: String| {
+        println!("PROBE {name}: {what}");
+        report.push(format!("{name}: {what}"));
+    };
+    note("sw_vers", output(&mut Command::new("/usr/bin/sw_vers")).to_string().replace("err=[]", ""));
+    note("uname_m", output(Command::new("/usr/bin/uname").arg("-m")).out.trim().to_string());
+    let fx = Fx::new("lo-report");
+    fx.scripts();
+    let process = fx.listen_profile(true);
+    let closed = fx.profile(false);
+    note("profile.process.accepted", fx.sh(&process, &fx.root, "echo ok").to_string());
+    note("profile.process.size_bytes", process.text.len().to_string());
+    let (others, lo0) = interface_addresses();
+    note("ifaces.non_lo0", format!("{others:?}"));
+    note("ifaces.lo0_extra", format!("{lo0:?}"));
+
+    // --- 1. Binds under the listen rules: control (unsandboxed), the listen profile, and the closed profile.
+    let (must_work, refused, recorded) = bind_cases();
+    let all: Vec<String> = must_work.iter().chain(&refused).chain(&recorded).cloned().collect();
+    let control = fx.per_line(None, "bind.py", &all);
+    let sandboxed = fx.per_line(Some(&process), "bind.py", &all);
+    let without = fx.per_line(Some(&closed), "bind.py", &all);
+    let find = |rows: &[(String, String)], spec: &str| {
+        rows.iter().find(|(s, _)| s == spec).map(|(_, r)| r.clone()).unwrap_or_else(|| format!("missing {rows:?}"))
+    };
+    for (group, specs) in [("must_bind", &must_work), ("must_refuse", &refused), ("recorded", &recorded)] {
+        for spec in specs.iter() {
+            note(
+                &format!("1.bind.{group}.{spec}"),
+                format!(
+                    "unsandboxed=[{}] process=[{}] no_listen=[{}]",
+                    find(&control, spec),
+                    find(&sandboxed, spec),
+                    find(&without, spec)
+                ),
+            );
+        }
+    }
+    // IPv6-only sockets for the wildcard too (dual-stack above).
+    note(
+        "1.bind.v6only_wildcard",
+        fx.sh(
+            &process,
+            &fx.root,
+            "python3 -c 'import socket; s=socket.socket(socket.AF_INET6); s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1); s.bind((\"::\", 0)); print(\"bound\")'",
+        )
+        .to_string(),
+    );
+    // Node's `listen(port)` with no host (binds `::`), and with 127.0.0.1.
+    let node_listen = |host: &str| {
+        format!(
+            "node -e 's=require(\"net\").createServer();s.on(\"error\",e=>{{console.log(\"err\",e.code,e.message);process.exit(1)}});s.listen({{port:0{host}}},()=>{{console.log(\"listening\",JSON.stringify(s.address()));process.exit(0)}})'"
+        )
+    };
+    note("1.node.listen_no_host", fx.sh(&process, &fx.root, &node_listen("")).to_string());
+    note("1.node.listen_127", fx.sh(&process, &fx.root, &node_listen(",host:\"127.0.0.1\"")).to_string());
+
+    // --- 2. `(remote ip "localhost:<p>")` reaches both families, and nothing else.
+    let (p, both) = dual_listener(tcp_listener);
+    let q = tcp_listener("127.0.0.1:0").unwrap();
+    let bash = fx.bash_profile(&[p]);
+    note("2.listeners", format!("port={p} v6_too={both} unlisted={q}"));
+    let mut targets = vec![format!("127.0.0.1@{p}"), format!("::1@{p}"), format!("127.0.0.1@{q}")];
+    let alias_listener = tcp_listener(&format!("127.0.0.2:{p}")).is_some();
+    note("2.alias_listener_127.0.0.2", alias_listener.to_string());
+    if alias_listener {
+        targets.push(format!("127.0.0.2@{p}"));
+    }
+    if let Some(v4) = others.iter().find(|a| !a.contains(':'))
+        && tcp_listener(&format!("{v4}:{p}")).is_some()
+    {
+        targets.push(format!("{v4}@{p}"));
+    }
+    for (spec, result) in fx.per_line(Some(&bash), "connect.py", &targets) {
+        note(&format!("2.bash_connect.{spec}"), result);
+    }
+    for (spec, result) in fx.per_line(None, "connect.py", &targets) {
+        note(&format!("2.host_connect.{spec}"), result);
+    }
+
+    // --- 3. An unsandboxed user process binds below 1024.
+    for spec in ["127.0.0.1@80", "::1@80", "127.0.0.1@1023", "0.0.0.0@80"] {
+        note(&format!("3.unsandboxed.{spec}"), find(&fx.per_line(None, "bind.py", &[spec.to_string()]), spec));
+    }
+
+    // --- 4. The per-port denies, and what they cost at start.
+    let low = ["127.0.0.1@80", "::1@80", "127.0.0.1@1", "127.0.0.1@1023", "::1@1023", "127.0.0.1@1024", "::1@1024"]
+        .map(String::from)
+        .to_vec();
+    for (spec, result) in fx.per_line(Some(&process), "bind.py", &low) {
+        note(&format!("4.process_bind.{spec}"), result);
+    }
+    let no_denies = fx.listen_profile(false);
+    note("4.no_denies.size_bytes", no_denies.text.len().to_string());
+    for (spec, result) in fx.per_line(Some(&no_denies), "bind.py", &low[..2]) {
+        note(&format!("4.no_denies_bind.{spec}"), result);
+    }
+    let medians = median_start_ms(&[&closed, &no_denies, &process], 50);
+    note(
+        "4.start_ms_median_of_50",
+        format!(
+            "closed={:.1} listen_without_denies={:.1} listen_with_denies={:.1} (failed runs: {}/{}/{})",
+            medians[0].0, medians[1].0, medians[2].0, medians[0].1, medians[1].1, medians[2].1
+        ),
+    );
+
+    // --- 5 and 6. A sandboxed server: Marv reads its descriptors, the host reaches it, it can't reach itself.
+    let mut server = fx.spawn(&process, "serve.py");
+    let pid = server.id();
+    let mut lines = std::io::BufRead::lines(std::io::BufReader::new(server.stdout.take().unwrap()));
+    match read_line(&mut lines, "port ").and_then(|l| l[5..].trim().parse::<u16>().ok()) {
+        Some(port) => {
+            note("6.self_connect", read_line(&mut lines, "self ").unwrap_or_else(|| "no line".into()));
+            note("6.host_connect_127", host_reads(port));
+            note("6.host_connect_v6", find(&fx.per_line(None, "connect.py", &[format!("::1@{port}")]), &format!("::1@{port}")));
+            for src in others.iter().filter(|a| !a.contains(':')).take(2) {
+                let spec = format!("127.0.0.1@{port}");
+                let r = fx.per_line(None, "connect.py", &["--from".into(), src.clone(), spec.clone()]);
+                note(&format!("6.host_connect_from.{src}"), find(&r, &spec));
+                let spec = format!("{src}@{port}");
+                note(
+                    &format!("6.host_connect_to.{src}"),
+                    find(&fx.per_line(None, "connect.py", std::slice::from_ref(&spec)), &spec),
+                );
+            }
+            let lsof_g = output(Command::new("/usr/sbin/lsof").args([
+                "-a",
+                "-g",
+                &pid.to_string(),
+                "-iTCP",
+                "-sTCP:LISTEN",
+                "-Fn",
+                "-P",
+                "-n",
+            ]));
+            note("5.marv_reads_child.lsof_g", lsof_g.to_string());
+            let lsof_p = output(Command::new("/usr/sbin/lsof").args([
+                "-a",
+                "-p",
+                &pid.to_string(),
+                "-iTCP",
+                "-sTCP:LISTEN",
+                "-Fn",
+                "-P",
+                "-n",
+            ]));
+            note("5.marv_reads_child.lsof_p", lsof_p.to_string());
+            note(
+                "5.child_reads_marv.lsof_p",
+                fx.sh(&process, &fx.root, &format!("/usr/sbin/lsof -p {} -Fn -P -n | head -5", std::process::id())).to_string(),
+            );
+            note(
+                "5.child_reads_marv.lsof_g",
+                fx.sh(&process, &fx.root, &format!("/usr/sbin/lsof -a -g {pid} -iTCP -Fn -P -n | head -5")).to_string(),
+            );
+        }
+        None => note("6.server", "didn't start".into()),
+    }
+    let _ = server.kill();
+    let _ = server.wait();
+
+    // --- 7. No socket folders under option A: nothing to probe.
+    note("7.clean_tmps", "n/a: option A makes no per-process socket folder".into());
+
+    // --- 8. `localhost` by name, without network.
+    note(
+        "8.process.getaddrinfo_localhost",
+        fx.sh(
+            &process,
+            &fx.root,
+            "python3 -c 'import socket; print(sorted({a[4][0] for a in socket.getaddrinfo(\"localhost\", 0)}))'",
+        )
+        .to_string(),
+    );
+    note(
+        "8.process.python_bind_localhost",
+        fx.sh(&process, &fx.root, "python3 -c 'import socket; s=socket.socket(); s.bind((\"localhost\", 0)); s.listen(1); print(\"bound\", s.getsockname())'")
+            .to_string(),
+    );
+    note("8.process.node_listen_localhost", fx.sh(&process, &fx.root, &node_listen(",host:\"localhost\"")).to_string());
+    let (h, h_both) = dual_listener(http_listener);
+    let bash = fx.bash_profile(&[h]);
+    note("8.http_listener", format!("port={h} v6_too={h_both}"));
+    note(
+        "8.bash.node_fetch_localhost",
+        fx.sh(
+            &bash,
+            &fx.root,
+            &format!("node -e 'fetch(\"http://localhost:{h}\").then(r=>r.text()).then(t=>console.log(\"fetched\",t)).catch(e=>console.log(\"err\",e.cause&&e.cause.code,e.message))'"),
+        )
+        .to_string(),
+    );
+    note(
+        "8.bash.python_urllib_localhost",
+        fx.sh(
+            &bash,
+            &fx.root,
+            &format!("python3 -c 'import urllib.request; print(\"fetched\", urllib.request.urlopen(\"http://localhost:{h}\", timeout=5).read())'"),
+        )
+        .to_string(),
+    );
+    note(
+        "8.bash.python_urllib_127",
+        fx.sh(
+            &bash,
+            &fx.root,
+            &format!("python3 -c 'import urllib.request; print(\"fetched\", urllib.request.urlopen(\"http://127.0.0.1:{h}\", timeout=5).read())'"),
+        )
+        .to_string(),
+    );
+    note("8.bash.curl_localhost", fx.sh(&bash, &fx.root, &format!("curl -sS -m 5 http://localhost:{h}")).to_string());
+    println!("\n===== REPORT =====\n{}\n===== END =====", report.join("\n"));
+}

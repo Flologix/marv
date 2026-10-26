@@ -65,14 +65,15 @@ pub struct SessionOptions {
     /// `.mcp.json`'s format, `{ name: entry }`, in order.
     pub mcp_servers: Vec<(String, Value)>,
     /// Servers from the config files (or `mcp_servers`) this session leaves out, by name: switched off for one
-    /// conversation (Marv desktop's per-chat switches) without touching the files.
+    /// conversation without touching the files.
     pub mcp_skip: Vec<String>,
     pub approve: Option<Arc<dyn Approver>>,
     pub max_steps: Option<u32>,
     /// Offer the plan tool: a checklist the model keeps for a long task (`session.plan()` reads it, each change also
     /// arrives as a tool end's `result.plan`). Default true. Fixed for the session, since it changes the tool list.
     pub plan: bool,
-    pub diagnostics: bool,
+    /// Which languages' checkers run after the model's edits (#187); `false.into()` turns them all off.
+    pub diagnostics: crate::config::Diagnostics,
     pub checks: bool,
     /// `compactTokens` (#140): compact at this many tokens of context, or at 85% of the window if sooner; `None`: off.
     pub compact_tokens: Option<u64>,
@@ -169,7 +170,7 @@ impl SessionBuilder {
                 approve: None,
                 max_steps: None,
                 plan: true,
-                diagnostics: true,
+                diagnostics: crate::config::Diagnostics::ON,
                 checks: true,
                 compact_tokens: Some(crate::config::DEFAULT_COMPACT_TOKENS),
                 compaction: marv_agent::compact::Version::V1,

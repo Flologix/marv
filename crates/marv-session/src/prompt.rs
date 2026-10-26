@@ -119,7 +119,13 @@ pub const FIXING_BUGS: &str = "\n\n# Fixing bugs\n\n- Find the root cause before
 // Fixed text, only with bash: the sandbox kills every process a command starts and hides its localhost, so a model
 // claimed a server was "up" and handed the user a dead link (Marv issue #50). With the process door (#51), the door's
 // own paragraph in "# Outside the sandbox" says this and where to go instead.
-pub const SANDBOX_LIMITS: &str = "\n\n# Sandbox limits\n\nEvery process a bash command starts ends when the command ends: nothing keeps running behind it. And a sandboxed command's `localhost` is its own, not the user's (with `network: true` it is the host's) — the user can't reach a server started inside the sandbox. So never start a dev server or a service \"for the user\", and don't say a server is running: to try one, run it yourself in your own terminal within the command, check it there, and stop it; to let the user try one, give them the command to run in their own terminal.";
+// Both platforms' texts are compiled everywhere, so the tests check each; the prompt uses this build's (fixed per build,
+// so it stays byte-stable). On macOS there's no namespace with a loopback of its own: Seatbelt closes the host's
+// loopback to a command without network (#152, spec decision 7).
+pub const SANDBOX_LIMITS_LINUX: &str = "\n\n# Sandbox limits\n\nEvery process a bash command starts ends when the command ends: nothing keeps running behind it. And a sandboxed command's `localhost` is its own, not the user's (with `network: true` it is the host's) — the user can't reach a server started inside the sandbox. So never start a dev server or a service \"for the user\", and don't say a server is running: to try one, run it yourself in your own terminal within the command, check it there, and stop it; to let the user try one, give them the command to run in their own terminal.";
+pub const SANDBOX_LIMITS_MACOS: &str = "\n\n# Sandbox limits\n\nEvery process a bash command starts ends when the command ends: nothing keeps running behind it. And a sandboxed command has no `localhost` at all: it can't listen on it or connect to it (with `network: true` it uses the host's) — the user can't reach a server started inside the sandbox. So never start a dev server or a service \"for the user\", and don't say a server is running: to try one, run it yourself in your own terminal within the command, check it there, and stop it; to let the user try one, give them the command to run in their own terminal.";
+/// This platform's [`SANDBOX_LIMITS_LINUX`] or [`SANDBOX_LIMITS_MACOS`].
+pub const SANDBOX_LIMITS: &str = if cfg!(target_os = "macos") { SANDBOX_LIMITS_MACOS } else { SANDBOX_LIMITS_LINUX };
 
 /// Whether a session has one door.
 type DoorIsOpen = fn(&PromptDoors) -> bool;
@@ -698,6 +704,21 @@ mod tests {
         // The same doors give the same prompt (built once per conversation: the cache).
         let doors = PromptDoors { host: true, github: true, ..Default::default() };
         assert_eq!(with_doors(doors), with_doors(doors));
+    }
+
+    /// #152: the limits say what each platform's sandbox does with `localhost`: its own on Linux (a network namespace),
+    /// none at all on macOS (Seatbelt closes the host's).
+    #[test]
+    fn the_sandbox_limits_say_what_localhost_is_on_each_platform() {
+        assert!(SANDBOX_LIMITS_LINUX.contains("a sandboxed command's `localhost` is its own, not the user's"));
+        assert!(
+            SANDBOX_LIMITS_MACOS
+                .contains("a sandboxed command has no `localhost` at all: it can't listen on it or connect to it")
+        );
+        assert!(!SANDBOX_LIMITS_MACOS.contains("is its own"));
+        let expected = if cfg!(target_os = "macos") { SANDBOX_LIMITS_MACOS } else { SANDBOX_LIMITS_LINUX };
+        assert_eq!(SANDBOX_LIMITS, expected);
+        assert!(system_prompt(&input()).contains(expected));
     }
 
     #[test]
