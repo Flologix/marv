@@ -12,9 +12,10 @@
 //! plan says, and the network is closed unless the call asked. The last matching rule wins, so the sections come in a
 //! fixed order (§6.2), each overriding the ones before it:
 //!
-//! 1. **base**: `(deny default)`, fork and exec, signals and process info for this sandbox only, a short `sysctl-read`
-//!    list without `kern.proc.all` (G20), two Mach services, POSIX semaphores, Unix and IP sockets may be created
-//!    (connecting and binding are separate rules), the harmless devices. No `pseudo-tty` (G22);
+//! 1. **base**: `(deny default)`, fork and exec, signals and process info for this sandbox only (process info denied
+//!    explicitly first: deny-default doesn't close it, #246), a short `sysctl-read` list without `kern.proc.all`
+//!    (G20), two Mach services, POSIX semaphores, Unix and IP sockets may be created (connecting and binding are
+//!    separate rules), the harmless devices. No `pseudo-tty` (G22);
 //! 2. **reads, broad**: `file-read*` and `file-map-executable` everywhere (G1);
 //! 3. **closed**: the home (only its own entry's metadata stays readable, so `cd ~` works), or in a home-folder
 //!    project every hidden top-level entry of it by one regex, and `~/Library` (G6, G16); `/private/tmp` and the user's
@@ -66,6 +67,15 @@ pub const SHARED_TMP: &str = "/private/tmp";
 /// install writes `node_modules/pkg/AGENTS.md` and that must work. Matched case-sensitively, as the walker matches
 /// them: `Node_Modules/AGENTS.md` is still denied, which is stricter than the scan and intended.
 const SKIPPED: &str = "(node_modules|target|\\.git)";
+
+/// Process info for this sandbox's own processes only (#246). `(deny default)` doesn't close process info: without
+/// an explicit deny, a command reads any same-user process that shares its process group, its children and launchd
+/// (path, arguments and environment through `kern.procargs2`, descriptors), whatever the allows say (#246 probe on
+/// macOS 14 and 15). So it's denied outright, then opened again for `same-sandbox` (the command, its children and
+/// everything else under the same profile). `listpids` gives bare pids, which can be guessed anyway; `lsof` needs it
+/// even for the command's own process.
+pub const PROCESS_INFO: &[&str] =
+    &["(deny process-info*)", "(allow process-info* (target same-sandbox))", "(allow process-info-listpids)"];
 
 /// The sysctls any process reads (Codex's list, from Chromium's). Not `kern.proc.all` or `kern.proc.pid.`: listing or
 /// inspecting the user's other processes is what G20 keeps out.
@@ -617,7 +627,9 @@ fn base(b: &mut Builder) {
     b.line("(allow process-fork)");
     b.line("(allow process-exec)");
     b.line("(allow signal (target same-sandbox))");
-    b.line("(allow process-info* (target same-sandbox))");
+    for rule in PROCESS_INFO {
+        b.line(rule);
+    }
     let mut sysctls: Vec<String> = SYSCTLS.iter().map(|s| format!("(sysctl-name {})", quoted(s))).collect();
     sysctls.extend(SYSCTL_PREFIXES.iter().map(|s| format!("(sysctl-name-prefix {})", quoted(s))));
     b.line(&format!("(allow sysctl-read {})", sysctls.join(" ")));
@@ -804,10 +816,11 @@ mod tests {
             assert!(looked_up[0].contains(service));
         }
         assert_eq!(looked_up[0].matches("global-name").count(), MACH_SERVICES.len());
-        // Signals and process info reach this sandbox only.
-        assert!(
-            text.contains("(allow signal (target same-sandbox))") && text.contains("(allow process-info* (target same-sandbox))")
-        );
+        // Signals and process info reach this sandbox only: process info denied first (deny-default doesn't close
+        // it), then this sandbox's, in that order, right after the signal rule.
+        let base = format!("(allow signal (target same-sandbox))\n{}\n", PROCESS_INFO.join("\n"));
+        assert!(text.contains(&base), "{text}");
+        assert_eq!(text.matches("process-info").count(), 3);
         // Section order.
         let mut last = 0;
         for n in 1..=9 {

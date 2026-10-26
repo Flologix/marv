@@ -1866,6 +1866,9 @@ def listpids():
     buf = ctypes.create_string_buffer(4 * 8192)
     n = libc.proc_listpids(1, 0, buf, 4 * 8192)
     return ("ok %d" % (n // 4)) if n > 0 else err()
+if sys.argv[1:2] == ["--setsid"]:
+    os.setsid()
+    sys.argv.pop(1)
 sib = subprocess.Popen(["/bin/sleep", "5"])
 targets = [("self", os.getpid()), ("parent", os.getppid()), ("sibling", sib.pid)]
 targets += [(a.split("=")[0], int(a.split("=")[1])) for a in sys.argv[1:]]
@@ -1942,13 +1945,13 @@ fn sandbox_log<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
     (got, seen)
 }
 
-/// The base section's process-info rule replaced by `rules` (None: the rule as it ships).
+/// The base section's process-info rules ([`seatbelt::PROCESS_INFO`]) replaced by `rules` (None: as they ship).
 fn pinfo_profile(fx: &Fx, rules: Option<&str>) -> Profile {
     let closed = fx.profile(false);
-    let shipped = "(allow process-info* (target same-sandbox))";
-    assert!(closed.text.contains(shipped), "the profile no longer has {shipped}");
+    let shipped = seatbelt::PROCESS_INFO.join("\n");
+    assert!(closed.text.contains(&shipped), "the profile no longer has {shipped}");
     let text = match rules {
-        Some(r) => closed.text.replace(shipped, r),
+        Some(r) => closed.text.replace(&shipped, r),
         None => closed.text.clone(),
     };
     Profile { text, params: closed.params }
@@ -1991,31 +1994,25 @@ fn process_info_probe_report() {
         let (k, v) = line.split_once(' ').unwrap_or((line, ""));
         note(&format!("control.{k}"), v.to_string());
     }
-    // Round 1 (2026-10-26): the shipped rule, no rule, `(target self)` and a `(target others)` deny all let every
-    // same-user read through but the cwd (a file-read check); an explicit `(deny process-info*)` kills bash. So
-    // deny-default doesn't cover process-info here: only an explicit deny does.
-    let deny = "(deny process-info*)";
+    // Round 1 (2026-10-26, macOS 14.8 and 15.7, arm64 and Intel): the rule before #246 (`(allow process-info*
+    // (target same-sandbox))` alone), no rule, `(target self)` or a `(target others)` deny all let a command read
+    // every process in its process group, its children and launchd (path, `kern.proc.pid`, `kern.procargs2`,
+    // descriptors); only the cwd was refused, by the file rules. Round 2: Sandbox logs those allows as `pgrp`,
+    // `children` and `initproc`, so deny-default doesn't close process info; an explicit `(deny process-info*)` does,
+    // and `(allow process-info* (target same-sandbox))` after it gives back the command's own processes. `lsof` then
+    // needs `process-info-listpids`, even for its own pid. bash, python, node, cargo and git work either way.
     let variants: Vec<(&str, Option<String>)> = vec![
         ("shipped", None),
+        ("before_246", Some("(allow process-info* (target same-sandbox))".into())),
+        // As Marv runs a command: `marv __guard` puts it in a session of its own, so Marv isn't in its group.
+        ("before_246_setsid", Some("(allow process-info* (target same-sandbox))".into())),
         ("report_all", Some("(allow process-info* (with report))".into())),
-        ("deny_all_allow_same_sandbox", Some(format!("{deny}\n(allow process-info* (target same-sandbox))"))),
-        ("deny_all_allow_self", Some(format!("{deny}\n(allow process-info* (target self))"))),
-        (
-            "deny_all_allow_self_children",
-            Some(format!("{deny}\n(allow process-info* (target self))\n(allow process-info* (target children))")),
-        ),
-        (
-            "deny_reads_allow_same_sandbox",
-            Some(
-                "(deny process-info-pidinfo process-info-pidfdinfo process-info-pidfileportinfo process-info-listpids \
-                 process-info-rusage process-info-codesignature)\n(allow process-info* (target same-sandbox))"
-                    .into(),
-            ),
-        ),
+        ("deny_all_allow_self", Some("(deny process-info*)\n(allow process-info* (target self))".into())),
     ];
     for (name, rules) in &variants {
         let profile = pinfo_profile(&fx, rules.as_deref());
-        let (ran, log) = sandbox_log(|| fx.sh(&profile, &fx.root, &format!("python3 pinfo.py {args}")));
+        let setsid = if name.ends_with("_setsid") { "--setsid " } else { "" };
+        let (ran, log) = sandbox_log(|| fx.sh(&profile, &fx.root, &format!("python3 pinfo.py {setsid}{args}")));
         if ran.out.trim().is_empty() {
             note(&format!("{name}.run"), ran.to_string());
         }
