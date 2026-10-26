@@ -115,8 +115,14 @@ pub fn check(scenario: &Scenario, bin: &Path, record: bool, target: Target) -> V
     };
     let (expected, outcome) = match target {
         // #58: marv-rs's parallel reads, compared in call order (see `compare::calls_in_order`).
+        // The recordings go through the same canonical form as marv-rs's requests, so what the comparison leaves out
+        // of both (web_fetch in a `marv -p` run without the web scope, `runner::WEB_SECTION_HEADING`) is out of both.
         Target::MarvRs => (
-            compare::Expected { events: compare::calls_in_order(&expected.events), ..expected },
+            compare::Expected {
+                events: compare::calls_in_order(&expected.events),
+                requests: expected.requests.lines().map(|line| runner::canonical_request(line) + "\n").collect(),
+                ..expected
+            },
             runner::Outcome { events: compare::calls_in_order(&outcome.events), ..outcome },
         ),
         Target::Marv => (expected, outcome),

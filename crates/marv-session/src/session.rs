@@ -415,6 +415,11 @@ pub struct SessionInit {
     /// exists, since the tool list is fixed for the session (the prompt cache). Default false. Subagents get it for
     /// reads only.
     pub github: bool,
+    /// Offer `web_fetch`. Default true. `marv -p` turns it off when nothing approves the `web` scope (no `--approve
+    /// web`, no config `"approve": ["web"]`): there every fetch would be refused, and each try costs the model a step
+    /// (10 refused fetches of the upstream fix in 6 SWE-bench instances in a benchmark run). Decided once, before
+    /// the session exists: the tool list is fixed for the session (the prompt cache). Subagents follow it.
+    pub web: bool,
     pub yolo: bool,
     /// Yolo isn't allowed here, and why (the project is the home folder or above it).
     pub no_yolo: Option<String>,
@@ -530,6 +535,7 @@ impl SessionInit {
             writable: Vec::new(),
             hooks: Vec::new(),
             one_shot: false,
+            web: true,
             herdr: None,
             tainted_at_start: false,
             radio: None,
@@ -1183,6 +1189,8 @@ impl MarvSession {
         // skills, the plan tool unless it's off, github only where gh is logged in).
         let mut specs = marv_tools::tool_specs_for(has_skills, init.plan, init.github);
         specs.retain(|s| process_on || s.name != "process");
+        // web_fetch only where a fetch can be approved (`marv -p` without the web scope leaves it out); fixed here.
+        specs.retain(|s| init.web || s.name != "web_fetch");
         specs.extend(init.tools.iter().map(|t| t.spec()));
         // The Herdr door (#74), after the caller's tools: fixed for the session (the cache).
         if let Some(setup) = &init.herdr {
@@ -1993,6 +2001,7 @@ impl MarvSession {
             nested_instructions: init.nested_instructions,
             nested_trust: init.nested_trust.clone(),
             worktrees_dir: init.worktrees_dir.clone(),
+            web: init.web,
             factory: factory.clone(),
             provider: provider.clone(),
             approver: client.clone(),
@@ -3929,6 +3938,7 @@ impl MarvSession {
                 (init.plan || t.name() != "plan")
                     && (self.inner.process_on || t.name() != "process")
                     && (init.github || t.name() != "github")
+                    && (init.web || t.name() != "web_fetch")
             })
             .cloned()
             .collect();
@@ -7161,6 +7171,38 @@ mod turn_tests {
         let options = &without.requests()[0].1;
         assert!(!options.tools.iter().any(|t| t.name == "github"));
         assert!(!options.system.as_deref().unwrap().contains("github runs the GitHub CLI"));
+    }
+
+    /// `web: false` (`marv -p` with nothing approving the web scope): web_fetch isn't offered, the prompt has no web
+    /// section, the same specs go with every request, and a call by name is an unknown tool, not a refusal.
+    #[tokio::test]
+    async fn a_session_without_web_never_offers_web_fetch() {
+        let dirs = Dirs::new();
+        let provider = Scripted::new(vec![
+            use_tools(vec![call("w1", "web_fetch", serde_json::json!({"url": "https://example.com"}))]),
+            say("a"),
+            say("b"),
+        ]);
+        let session = scripted(&dirs, &provider, |i| i.web = false);
+        collect(go(&session, "one")).await;
+        collect(go(&session, "two")).await;
+        let requests = provider.requests();
+        assert!(requests.iter().all(|r| !r.1.tools.iter().any(|t| t.name == "web_fetch")));
+        assert_eq!(requests[0].1.tools, requests[2].1.tools, "the tool list is fixed for the session");
+        assert!(!requests[0].1.system.as_deref().unwrap().contains("# Web"));
+        let answer = requests[1].0.iter().find_map(|t| match t {
+            ChatTurn::Tool { text, .. } => Some(text.clone()),
+            _ => None,
+        });
+        assert!(answer.as_deref().is_some_and(|a| a.starts_with("Unknown tool \"web_fetch\"")), "{answer:?}");
+
+        // The default offers it, and the web section with it.
+        let dirs = Dirs::new();
+        let with = Scripted::new(vec![say("a")]);
+        collect(go(&scripted(&dirs, &with, |_| {}), "one")).await;
+        let options = &with.requests()[0].1;
+        assert!(options.tools.iter().any(|t| t.name == "web_fetch"));
+        assert!(options.system.as_deref().unwrap().contains("# Web"));
     }
 
     /// A door of any kind, as the github and host doors are: it asks, once.

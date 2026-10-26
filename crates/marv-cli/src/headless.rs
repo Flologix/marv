@@ -144,6 +144,13 @@ pub fn build_approver(names: &[String], must_ask: MustAsk) -> Result<HeadlessApp
     Ok((approver, mesh))
 }
 
+/// Whether `marv -p` offers web_fetch: when `--approve` or the config's `"approve"` names the `web` scope. A fetch is
+/// always asked (yolo doesn't run it), and nothing else in `marv -p` could say yes, so without it every call would be
+/// refused.
+pub fn offers_web(approve: &[String], config_approve: &[String]) -> bool {
+    approve.iter().chain(config_approve).any(|name| name == "web")
+}
+
 /// The exit code for how a turn ended and how many calls were refused.
 pub fn exit_code_for(reason: &str, refused: usize) -> ExitCode {
     if refused > 0 {
@@ -505,6 +512,9 @@ pub async fn run_headless(options: HeadlessOptions, quit: crate::signals::Quit) 
         marv_tools::github::github_available(&pairs, &door_outside, marv_tools::github::AUTH_CHECK).await
     };
     (builder.options.github, builder.options.github_known) = (github, Some(github));
+    // web_fetch only where a fetch can be approved: every call is asked, and with no `web` scope (`--approve web` or
+    // the config's "approve") marv -p refuses it, so offering it only invites wasted steps. Fixed for the session.
+    builder.options.web = offers_web(&options.approve, &seeds);
     // In a Herdr pane, the herdr tool reads panes (#74); without host_commands its commands and spawns are refused
     // before anything is asked, whatever --approve says.
     builder.options.herdr = marv_session::herdr_door::setup_from_env(&env, config.herdr_peers, &door_outside);
@@ -704,6 +714,8 @@ mod tests {
         let (both, _) = build_approver(&["git_write".into(), "network".into()], MustAsk::default()).unwrap();
         assert_eq!(both.unwrap().approve(request("bash:net+git:git push")).await, Decision::Yes);
         let (a, _) = build_approver(&["files".into(), "web".into()], MustAsk::default()).unwrap();
+        assert!(offers_web(&["files".into(), "web".into()], &[]) && offers_web(&[], &["web".into()]));
+        assert!(!offers_web(&["files".into(), "network".into()], &["process".into()]), "network isn't web");
         let a = a.unwrap();
         assert_eq!(a.approve(request("files")).await, Decision::Yes);
         assert_eq!(a.approve(request("web:docs.rs")).await, Decision::Yes);
