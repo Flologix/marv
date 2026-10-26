@@ -228,6 +228,9 @@ pub async fn run_command(
         Err(e) => return started(format!("[couldn't start the command: {e}]\n")),
     };
     let pid = child.id();
+    // While true the child is ours and unreaped, so its group's id can't be another's: the sweep (below) stops when it
+    // turns false. Declared after the child, so it's cleared before the child is dropped (and reaped by Tokio).
+    let held = Held(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)));
     let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
         return started("[couldn't start the command: no output pipes]\n".into());
     };
@@ -275,11 +278,18 @@ pub async fn run_command(
             // pool, and a sweep after a kill takes seconds.
             Some(pid) if sandboxed => {
                 let (done, sweeping) = tokio::sync::oneshot::channel();
-                let _ = std::thread::Builder::new().name("marv-sweep".into()).spawn(move || {
-                    backend.sweep(pid, killed);
+                let flag = held.0.clone();
+                let spawned = std::thread::Builder::new().name("marv-sweep".into()).spawn(move || {
+                    backend.sweep(pid, killed, &flag);
                     let _ = done.send(());
                 });
-                (Some(sweeping), killed && backend.lingers())
+                if spawned.is_ok() {
+                    (Some(sweeping), killed && backend.lingers())
+                } else {
+                    // No thread to be had: swept here, holding this task up, rather than not at all.
+                    backend.sweep(pid, killed, &held.0);
+                    (None, false)
+                }
             }
             Some(pid) => {
                 marv_sandbox::kill_group(pid);
@@ -357,11 +367,14 @@ pub async fn run_command(
         (false, _) => status,
         (true, Some((Some(sweeping), true))) => {
             group.pid = None;
-            let mut prepared = prepared.take();
+            // Dropped with the runtime (Marv exiting) before the sweep is done: `held` is cleared, then the child goes
+            // (Tokio reaps it), then the command's clean-up runs (`Prepared`'s drop).
+            let mut reap = Reap { held, child, prepared: prepared.take() };
             tokio::spawn(async move {
                 let _ = sweeping.await;
-                let _ = child.wait().await;
-                if let Some(command) = &mut prepared {
+                reap.held.release();
+                let _ = reap.child.wait().await;
+                if let Some(command) = &mut reap.prepared {
                     command.finish();
                 }
             });
@@ -371,6 +384,7 @@ pub async fn run_command(
             if let Some((Some(sweeping), _)) = sweep {
                 let _ = sweeping.await;
             }
+            held.release();
             child.wait().await.ok()
         }
     };
@@ -469,6 +483,28 @@ impl ExitWatch {
         let mut rx = rx.clone();
         rx.wait_for(Option::is_some).await.ok().and_then(|v| *v).unwrap_or(false)
     }
+}
+
+/// The sweep's `held` flag (see `run_command`): cleared by [`Held::release`] before the child is reaped, and on drop.
+struct Held(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Held {
+    fn release(&self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// A killed command left to its sweep: reaped and cleaned up when the sweep is done. Dropped in field order.
+struct Reap {
+    held: Held,
+    child: tokio::process::Child,
+    prepared: Option<marv_sandbox::Prepared>,
 }
 
 /// Kills the backend's whole sandbox on drop while `pid` is set (see `run_command`).

@@ -10,6 +10,7 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::SandboxError;
@@ -113,10 +114,14 @@ pub trait SandboxBackend: Send + Sync + std::fmt::Debug {
     fn kill(&self, pid: u32);
     /// After the sandbox program has exited (seen, not reaped yet, so its pid and the id of the group it led are still
     /// its own): ends everything the command left running, before the caller reaps it. `killed`: a timeout or a stop
-    /// killed it first, so a process being created as that kill landed may still appear. [`Self::kill`] unless the
-    /// backend needs more (Seatbelt: the group is killed again and again, for seconds after a kill).
-    fn sweep(&self, pid: u32, _killed: bool) {
-        self.kill(pid);
+    /// killed it first, so a process being created as that kill landed may still appear. `held`: true while the caller
+    /// still holds the program unreaped; the sweep stops as soon as it's false (the group's id may then be another's).
+    /// [`Self::kill`] unless the backend needs more (Seatbelt: the group is killed again and again, for seconds after a
+    /// kill).
+    fn sweep(&self, pid: u32, _killed: bool, held: &AtomicBool) {
+        if held.load(Ordering::SeqCst) {
+            self.kill(pid);
+        }
     }
     /// Whether [`Self::sweep`] after a kill takes long (Seatbelt: [`GROUP_LINGER`]). The caller then doesn't wait for
     /// it: it returns at once, and reaps the program and cleans up when the sweep is done.
@@ -171,31 +176,39 @@ fn stop_and_kill(group: nix::unistd::Pid) -> nix::Result<()> {
     nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL)
 }
 
-/// How long [`kill_group_for`] keeps killing a group whose leader exited by itself: for what it left running.
-pub const GROUP_SWEEP: Duration = Duration::from_millis(30);
+/// How long [`kill_group_for`] keeps killing a group whose leader exited by itself, for what it left running: a few
+/// rounds, so a process its jobs were forking as the first round landed is reached by the next.
+pub const GROUP_SWEEP: Duration = Duration::from_millis(5);
 
 /// How long [`kill_group_for`] keeps killing a group after a timeout or a stop killed its leader (#247): a process the
 /// leader (or the command's shell) was creating as the kill landed appears only once its creation is done, and on a
 /// loaded Intel Mac that was seen to take well over 50 ms after its parent had died.
 pub const GROUP_LINGER: Duration = Duration::from_secs(3);
 
-/// [`kill_group`] on the process group `pid` leads, again and again for `window` (every ms for the first [`GROUP_SWEEP`],
-/// then every 10 ms), or until the group is gone; refused for a pid of 1 or below, as [`kill_group`].
+/// [`kill_group`] on the process group `pid` leads, again and again for `window` (every ms for the first 30 ms, then
+/// every 10 ms), until the group is gone or `held` turns false; refused for a pid of 1 or below, as [`kill_group`].
 ///
 /// One group kill isn't enough on macOS (#247): it reaches the members it finds, and a process still being created
 /// isn't found (`ps` doesn't list it either). When the kill lands on a process in the middle of a `fork` or a
 /// `posix_spawn` (the guard starting the command, the command's shell starting a job), the parent dies but the child
 /// is still created, and goes on running in the sandbox with no one left to stop it. Once created it's a member, and
-/// the next round gets it. Call it only while the group can't be another's: its leader is an unreaped child of this
-/// process. Not "until empty": on macOS the unreaped leader (a zombie) still counts as a member.
-pub fn kill_group_for(pid: u32, window: Duration) {
+/// the next round gets it.
+///
+/// **A bounded window, not a guarantee.** macOS has no PID namespace to take everything down at once, nor a way to see
+/// a process before its creation is done: one that takes longer than `window` to appear escapes the sweep (still
+/// inside the sandbox). [`GROUP_LINGER`] is well beyond what was seen. Not "until empty" either: on macOS the unreaped
+/// leader (a zombie) still counts as a member, so a group never looks empty while it's held.
+///
+/// `held` is the caller's: true while it holds the leader unreaped, so the group's id can't be another's. Each round
+/// checks it first.
+pub fn kill_group_for(pid: u32, window: Duration, held: &AtomicBool) {
     let Some(group) = i32::try_from(pid).ok().filter(|p| *p > 1).map(nix::unistd::Pid::from_raw) else { return };
     let started = Instant::now();
-    while started.elapsed() < window {
+    while started.elapsed() < window && held.load(Ordering::SeqCst) {
         if stop_and_kill(group) == Err(nix::errno::Errno::ESRCH) {
             return;
         }
-        let pause = if started.elapsed() < GROUP_SWEEP { 1 } else { 10 };
+        let pause = if started.elapsed() < Duration::from_millis(30) { 1 } else { 10 };
         std::thread::sleep(Duration::from_millis(pause));
     }
 }
@@ -367,7 +380,7 @@ mod tests {
             .unwrap();
         assert!(wait_exited(leader.id()));
         let started = Instant::now();
-        kill_group_for(leader.id(), GROUP_SWEEP);
+        kill_group_for(leader.id(), GROUP_SWEEP, &AtomicBool::new(true));
         assert!(started.elapsed() < GROUP_SWEEP * 10, "{:?}", started.elapsed());
         leader.wait().unwrap();
         std::thread::sleep(Duration::from_millis(800));

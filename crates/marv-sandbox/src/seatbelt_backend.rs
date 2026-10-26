@@ -236,9 +236,9 @@ impl SandboxBackend for Seatbelt {
     /// ([`crate::backend::kill_group_for`]), for [`crate::backend::GROUP_SWEEP`], or [`crate::backend::GROUP_LINGER`]
     /// after a kill (#247): a process being forked or spawned as the kill landed (the command, by the guard; a job, by
     /// the command's shell) is created after its parent has died, and only a group kill sent after that reaches it.
-    fn sweep(&self, pid: u32, killed: bool) {
+    fn sweep(&self, pid: u32, killed: bool, held: &std::sync::atomic::AtomicBool) {
         let window = if killed { crate::backend::GROUP_LINGER } else { crate::backend::GROUP_SWEEP };
-        crate::backend::kill_group_for(pid, window);
+        crate::backend::kill_group_for(pid, window, held);
     }
 
     fn lingers(&self) -> bool {
