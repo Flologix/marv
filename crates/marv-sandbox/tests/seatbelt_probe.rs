@@ -1998,7 +1998,9 @@ fn process_info_probe_report() {
     // (target same-sandbox))` alone), no rule, `(target self)` or a `(target others)` deny all let a command read
     // every process in its process group, its children and launchd (path, `kern.proc.pid`, `kern.procargs2`,
     // descriptors); only the cwd was refused, by the file rules. Round 2: Sandbox logs those allows as `pgrp`,
-    // `children` and `initproc`, so deny-default doesn't close process info; an explicit `(deny process-info*)` does,
+    // `children` and `initproc`, and round 3 found the same after `setsid` (as `marv __guard` runs a command) for
+    // Marv and any other process of the user's, unlogged. Deny-default doesn't close process info; an explicit
+    // `(deny process-info*)` does,
     // and `(allow process-info* (target same-sandbox))` after it gives back the command's own processes. `lsof` then
     // needs `process-info-listpids`, even for its own pid. bash, python, node, cargo and git work either way.
     let variants: Vec<(&str, Option<String>)> = vec![

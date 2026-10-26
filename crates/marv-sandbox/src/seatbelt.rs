@@ -69,8 +69,8 @@ pub const SHARED_TMP: &str = "/private/tmp";
 const SKIPPED: &str = "(node_modules|target|\\.git)";
 
 /// Process info for this sandbox's own processes only (#246). `(deny default)` doesn't close process info: without
-/// an explicit deny, a command reads any same-user process that shares its process group, its children and launchd
-/// (path, arguments and environment through `kern.procargs2`, descriptors), whatever the allows say (#246 probe on
+/// an explicit deny, a command reads any process of the same user, in its session or not (path, arguments and
+/// environment through `kern.procargs2`, descriptors), and launchd's path, whatever the allows say (#246 probe on
 /// macOS 14 and 15). So it's denied outright, then opened again for `same-sandbox` (the command, its children and
 /// everything else under the same profile). `listpids` gives bare pids, which can be guessed anyway; `lsof` needs it
 /// even for the command's own process.
