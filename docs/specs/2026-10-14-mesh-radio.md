@@ -1,6 +1,6 @@
 # Mesh radio: a live channel every Marv on the mesh is on
 
-- Issue: FlologixAI/marv #124
+- Issue: Flologix/marv #124
 - Status: **approved 2026-10-15**, with every recommendation in §12 taken as the decision. Implement in the phases of §10.
 - Date: 2026-10-14
 - Scope: `crates/marv-mesh` (radio frames, door methods, links), `crates/marv-session` (config, model tool, rx notes, reports, wake), `crates/marv-tui` (strip and `/radio` view), `crates/marv-cli` (bridge, `/tx`, `/ask`, `marv mesh ls`), `tests/guards`.

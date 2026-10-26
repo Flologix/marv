@@ -28,7 +28,7 @@ test("Windows points to WSL, with the README's link", () => {
     assert.match(message, /install and run it inside WSL/);
     assert.match(message, /wsl --install/);
     assert.match(message, /npm install -g @flologixai\/marv/);
-    assert.match(message, /https:\/\/github\.com\/FlologixAI\/marv#requirements/);
+    assert.match(message, /https:\/\/github\.com\/Flologix\/marv#requirements/);
   }
 });
 

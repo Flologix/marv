@@ -11,6 +11,10 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 - **cargo check after edits in a Rust project (#187).** After the model changes files in a project with a `Cargo.toml` at its root, Marv runs `cargo check --workspace --all-targets --offline` in the sandbox (the project read-only, no network, at low CPU and I/O priority, half the cores) and tells the model about errors that weren't in the previous check, as it does with tsc: errors only, tests included, each told once, fenced as the project's data, 20 at most. The build goes to Marv's check cache, never the project's `target/`, and is filled in the background at a session's first edit, so a session that never edits never runs the project's build scripts; until it's ready a turn gets no Rust checks, and Marv says so once. The project's `build.rs` and proc macros run only in the sandbox, with only the cache's key folder writable. A machine without cargo just gets no Rust checks; a `rust-toolchain.toml` naming a toolchain that isn't installed isn't installed (`RUSTUP_AUTO_INSTALL=0`). On by default; `/diagnostics rust off` turns it off. A project without a `Cargo.lock` at its root, or inside a workspace whose root is above it, isn't checked (the project is read-only, so cargo can't write a lockfile); `/diagnostics` says why. cargo check runs with `RUSTC_WRAPPER` empty, so a configured sccache isn't used. Nice and ionice are left out where the sandbox refuses them (macOS's Seatbelt refuses `nice`). Trajectory check records now carry `cacheBytes`, the check cache's last measured size.
 - **Diagnostics per language (#187).** `"diagnostics"` in `~/.marv/config.json` still takes `true` or `false` (every language), and now also an object, like `{"typescript": true, "rust": false}`, where a language left out stays on. `/diagnostics rust off` (or `typescript`, `python`, `go`) switches one language and saves it; `/diagnostics on|off` still switches them all. `/diagnostics` lists each language and its checker's state. TypeScript (the project's own tsc, unchanged) and Rust (cargo check, above) have checkers; Python and Go are the groundwork for the coming pyright and go vet checkers. `/diagnostics clear` deletes this project's check cache.
 
+### Changed
+
+- The project moved to github.com/Flologix/marv; install.sh, the npm package metadata and the docs point there. Old links redirect.
+
 ### Removed
 
 - **The desktop app and the browser UI.** The desktop app (`app/`) and the browser UI (`marv-web`) are no longer part of Marv: Marv is the terminal coding agent. Releases up to 0.11.0 keep them in their source. The `marv` command, `marv -p` and the mesh are unchanged.
@@ -237,7 +241,7 @@ Marv, rebuilt in Rust. The version goes from 0.3.0 straight to 0.4.0: this relea
 
 ### Security
 
-**Upgrade from 0.3.0 and earlier:** they could run code from an untrusted project folder outside the sandbox ([GHSA-46rh-hh68-rhv9](https://github.com/FlologixAI/marv/security/advisories/GHSA-46rh-hh68-rhv9)). 0.4.0 fixes this; the older versions are deprecated on npm.
+**Upgrade from 0.3.0 and earlier:** they could run code from an untrusted project folder outside the sandbox ([GHSA-46rh-hh68-rhv9](https://github.com/Flologix/marv/security/advisories/GHSA-46rh-hh68-rhv9)). 0.4.0 fixes this; the older versions are deprecated on npm.
 
 Hardening from a review of 0.3.0, kept as rules with a test each (`tests/guards/`, one test per rule in `docs/SECURITY.md`, each shown to fail when its guard is removed):
 
@@ -342,16 +346,16 @@ The first public release, on npm as `@flologixai/marv`.
 - The SDK: `createSession()` from `@flologixai/marv/sdk` runs Marv from code, without the UI.
 - Evals: `bun run eval` runs real models on small tasks with hidden checks.
 
-[Unreleased]: https://github.com/FlologixAI/marv/compare/v0.11.0...HEAD
-[0.11.0]: https://github.com/FlologixAI/marv/compare/v0.10.0...v0.11.0
-[0.10.0]: https://github.com/FlologixAI/marv/compare/v0.9.0...v0.10.0
-[0.9.0]: https://github.com/FlologixAI/marv/compare/v0.8.0...v0.9.0
-[0.8.0]: https://github.com/FlologixAI/marv/compare/v0.7.0...v0.8.0
-[0.7.0]: https://github.com/FlologixAI/marv/compare/v0.6.0...v0.7.0
-[0.6.0]: https://github.com/FlologixAI/marv/compare/v0.5.0...v0.6.0
-[0.5.0]: https://github.com/FlologixAI/marv/compare/v0.4.0...v0.5.0
-[0.4.0]: https://github.com/FlologixAI/marv/releases/tag/v0.4.0
-[0.3.0]: https://github.com/FlologixAI/marv/compare/v0.1.2...v0.3.0
-[0.1.2]: https://github.com/FlologixAI/marv/compare/v0.1.1...v0.1.2
-[0.1.1]: https://github.com/FlologixAI/marv/compare/v0.1.0...v0.1.1
-[0.1.0]: https://github.com/FlologixAI/marv/releases/tag/v0.1.0
+[Unreleased]: https://github.com/Flologix/marv/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/Flologix/marv/compare/v0.10.0...v0.11.0
+[0.10.0]: https://github.com/Flologix/marv/compare/v0.9.0...v0.10.0
+[0.9.0]: https://github.com/Flologix/marv/compare/v0.8.0...v0.9.0
+[0.8.0]: https://github.com/Flologix/marv/compare/v0.7.0...v0.8.0
+[0.7.0]: https://github.com/Flologix/marv/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/Flologix/marv/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/Flologix/marv/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/Flologix/marv/releases/tag/v0.4.0
+[0.3.0]: https://github.com/Flologix/marv/compare/v0.1.2...v0.3.0
+[0.1.2]: https://github.com/Flologix/marv/compare/v0.1.1...v0.1.2
+[0.1.1]: https://github.com/Flologix/marv/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/Flologix/marv/releases/tag/v0.1.0

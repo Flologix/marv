@@ -532,7 +532,7 @@ mod tests {
     fn bash(command: &str) -> String {
         serde_json::json!({ "command": command }).to_string()
     }
-    const OFFLINE: &str = "Cloning into 'marv'...\nfatal: unable to access 'https://github.com/FlologixAI/marv/': Could not resolve host: github.com\n\n[exit code 128]";
+    const OFFLINE: &str = "Cloning into 'marv'...\nfatal: unable to access 'https://github.com/Flologix/marv/': Could not resolve host: github.com\n\n[exit code 128]";
 
     #[test]
     fn the_signature_is_the_first_line_that_says_what_failed() {
@@ -565,20 +565,20 @@ mod tests {
     #[test]
     fn the_same_failure_twice_makes_the_next_try_a_loop_whatever_its_tail() {
         let mut state = FailureLoopState::default();
-        state.record("bash", &bash("git clone https://github.com/FlologixAI/marv 2>&1 | tail -2"), OFFLINE);
-        assert!(state.repeated("bash", &bash("git clone https://github.com/FlologixAI/marv")).is_none());
+        state.record("bash", &bash("git clone https://github.com/Flologix/marv 2>&1 | tail -2"), OFFLINE);
+        assert!(state.repeated("bash", &bash("git clone https://github.com/Flologix/marv")).is_none());
         // A probe in between neither counts nor resets.
         state.record("bash", &bash("echo test"), "test\n\n[exit code 0]");
-        state.record("bash", &bash("git clone https://github.com/FlologixAI/marv && du -sh marv"), OFFLINE);
-        let (count, shown) = state.repeated("bash", &bash("git clone https://github.com/FlologixAI/marv || true")).unwrap();
+        state.record("bash", &bash("git clone https://github.com/Flologix/marv && du -sh marv"), OFFLINE);
+        let (count, shown) = state.repeated("bash", &bash("git clone https://github.com/Flologix/marv || true")).unwrap();
         assert_eq!(count, 2);
         assert!(shown.contains("Could not resolve host"));
         assert!(failing_command_note(count, &shown).starts_with("Marv: not run. This command already failed 2 times"));
         // With network it's another command; so is another clone.
         assert!(
-            state.repeated("bash", r#"{"command": "git clone https://github.com/FlologixAI/marv", "network": true}"#).is_none()
+            state.repeated("bash", r#"{"command": "git clone https://github.com/Flologix/marv", "network": true}"#).is_none()
         );
-        assert!(state.repeated("bash", &bash("git clone https://github.com/FlologixAI/other")).is_none());
+        assert!(state.repeated("bash", &bash("git clone https://github.com/Flologix/other")).is_none());
         assert!(state.repeated("read_file", r#"{"path": "a"}"#).is_none());
     }
 

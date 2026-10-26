@@ -6,8 +6,8 @@ members = ["crates/*", "tests/guards"]
 version = "0.11.0"
 edition = "2024"
 license = "MIT"
-authors = ["FlologixAI"]
-repository = "https://github.com/FlologixAI/marv"
+authors = ["Flologix"]
+repository = "https://github.com/Flologix/marv"
 rust-version = "1.99"
 
 [workspace.dependencies]

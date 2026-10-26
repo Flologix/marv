@@ -3,7 +3,7 @@
 //! (what runs, what asks, what never runs); this module spawns gh without a shell, keeps Marv's own keys out of its
 //! environment, and redacts tokens from what comes back before anything sees it ([`redact`]).
 //!
-//! Ports Marv's `src/tools/github/github.ts`, with the TS review's fixes (FlologixAI/marv#71): GH_HOST is pinned to
+//! Ports Marv's `src/tools/github/github.ts`, with the TS review's fixes (Flologix/marv#71): GH_HOST is pinned to
 //! the project's host (github.com when origin names none, never the user's own default), sensitive API reads are
 //! asked every time (`once`), and a failed lookup of the repository's name isn't remembered.
 //!

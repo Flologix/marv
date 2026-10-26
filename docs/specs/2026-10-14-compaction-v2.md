@@ -1,6 +1,6 @@
 # Compaction v2: structured rolling summary, verbatim tail, overflow recovery
 
-- Issue: FlologixAI/marv #63 (tracked privately as marv-rs #17)
+- Issue: Flologix/marv #63 (tracked privately as marv-rs #17)
 - Status: **approved 2026-10-20 with amendments.** The amendments are folded into the text below; the decisions are in §9, the PRs in §8.
 - Date: 2026-10-14 (draft), revised against `main` 2026-10-20 (after #116, #140, #144, #62)
 - Scope: `crates/marv-agent` (compaction, loop hook), `crates/marv-provider` (overflow detection), `crates/marv-core` (`estimate_tokens`), `crates/marv-session` (wiring, state, config, trajectory).

@@ -84,7 +84,7 @@ At sprint start, the orchestrator may set the sprint's issues to In progress in 
 
 **Never:**
 - Set Status to Done by hand. The project's "Auto-close issue" workflow closes the issue; in Sprint 1 that closed five issues whose code wasn't on `main`.
-- Create projects, fields or labels without asking. List first (`gh project list --owner FlologixAI`); the roadmap is project #1.
+- Create projects, fields or labels without asking. List first (`gh project list --owner Flologix`); the roadmap is project #1.
 - Re-list the board to find one item: GitHub's GraphQL limit (5,000/hour) is shared by every agent on the account, and Sprint 1 exhausted it doing that.
 
 **File a new issue only with evidence:** something observed in a run, with numbers or output to show for it. Prefer extending an existing issue to opening a near-duplicate. Fix small things in place instead of filing them.

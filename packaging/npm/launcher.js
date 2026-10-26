@@ -14,7 +14,7 @@ const PACKAGES = {
 };
 
 // Where the README says how to run Marv on Windows (in WSL).
-const WSL_HELP = "https://github.com/FlologixAI/marv#requirements";
+const WSL_HELP = "https://github.com/Flologix/marv#requirements";
 
 /** Why there's no build to run on `platform`/`arch`, or null when there is one. */
 function unsupported(platform, arch) {

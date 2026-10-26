@@ -564,10 +564,10 @@ mod tests {
     fn a_door_shows_its_warning_line_above_the_previews_own() {
         let mut request = command();
         request.door = Some(marv_core::Door::Github);
-        request.preview.warning = Some("on FlologixAI/marv".into());
+        request.preview.warning = Some("on Flologix/marv".into());
         let f = frame(&ApprovalView::new(request, 0, true));
         let door = f.find("⚠ Visible to other people on GitHub.").expect("door line");
-        assert!(door < f.find("⚠ on FlologixAI/marv").expect("preview warning"), "{f}");
+        assert!(door < f.find("⚠ on Flologix/marv").expect("preview warning"), "{f}");
     }
 
     #[test]
