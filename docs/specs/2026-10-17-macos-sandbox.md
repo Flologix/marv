@@ -1,6 +1,6 @@
 # macOS sandbox: a Seatbelt backend next to bubblewrap
 
-- Issues: FlologixAI/marv #150 (macOS port), #151 (Seatbelt backend), #152 (processes and the port relay)
+- Issues: Flologix/marv #150 (macOS port), #151 (Seatbelt backend), #152 (processes and the port relay)
 - Status: **approved 2026-10-19**, with every recommendation taken (§11 records the decisions).
 - Date: 2026-10-17
 - Scope: `crates/marv-sandbox` (a backend trait, the Seatbelt profile builder, the runtime folder), `crates/marv-tools` (bash, the relay), `crates/marv-session` (processes, mesh start), `crates/marv-mesh` (discovery, switchboard, plug), `crates/marv-cli` (messages, a `__guard` subcommand), `tests/guards`, `.github/workflows/ci.yml`, `docs/SECURITY.md`.

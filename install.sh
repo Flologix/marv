@@ -1,7 +1,7 @@
 #!/bin/sh
 # Installs marv-rs as `marv` (issue #19).
 #
-#   curl -fsSL https://github.com/FlologixAI/marv/releases/latest/download/install.sh | sh
+#   curl -fsSL https://github.com/Flologix/marv/releases/latest/download/install.sh | sh
 #   sh install.sh [--prefix DIR] [--version vX.Y.Z] [--from FILE] [--uninstall]
 #
 # The binary goes to $PREFIX/bin/marv (default prefix: ~/.local). On Linux it's a static musl build and on macOS a
@@ -15,18 +15,18 @@
 # or replaced until the new binary has been downloaded and its SHA-256 checked, so a failed download changes nothing.
 #
 # Environment (mostly for tests and mirrors):
-#   MARV_RELEASE_URL  the releases base URL (default https://github.com/FlologixAI/marv/releases); file:// works
+#   MARV_RELEASE_URL  the releases base URL (default https://github.com/Flologix/marv/releases); file:// works
 #   MARV_TARGET       the target triple to download, instead of the one detected from uname
 set -eu
 
-RELEASE_URL=${MARV_RELEASE_URL:-https://github.com/FlologixAI/marv/releases}
+RELEASE_URL=${MARV_RELEASE_URL:-https://github.com/Flologix/marv/releases}
 PREFIX="${HOME}/.local"
 VERSION=latest
 FROM=
 UNINSTALL=0
 
 # Where the README says how to run Marv on Windows (in WSL).
-WSL_HELP=https://github.com/FlologixAI/marv#requirements
+WSL_HELP=https://github.com/Flologix/marv#requirements
 
 say() { printf 'marv install: %s\n' "$*"; }
 die() {

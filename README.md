@@ -55,7 +55,7 @@ npm installs the prebuilt binary for your machine (`@flologixai/marv-linux-x64`,
 Or, without npm, the installer from the GitHub release. It downloads the binary for your machine, checks its SHA-256 against the release's `SHA256SUMS`, and puts it at `~/.local/bin/marv`:
 
 ```sh
-curl -fsSL https://github.com/FlologixAI/marv/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/Flologix/marv/releases/latest/download/install.sh | sh
 ```
 
 Download `install.sh` to pass it options:
@@ -72,7 +72,7 @@ Nothing is replaced until the new binary has been downloaded and checked, so a f
 Or from source (stable Rust 1.99 or newer):
 
 ```sh
-git clone https://github.com/FlologixAI/marv.git
+git clone https://github.com/Flologix/marv.git
 cd marv
 cargo build --release -p marv-cli
 sh install.sh --from target/release/marv     # or: cargo install --path crates/marv-cli --root ~/.local

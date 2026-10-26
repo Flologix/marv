@@ -1,6 +1,6 @@
 # Porting plan
 
-The skeleton maps the TypeScript Marv (`FlologixAI/marv` at `7df450f`, 0.3.0) onto the crates. Each module's `//!` header names the Marv file it ports. Each `docs/subsystems/<crate>.md` has the file-by-file table, status and port notes.
+The skeleton maps the TypeScript Marv (`Flologix/marv` at `7df450f`, 0.3.0) onto the crates. Each module's `//!` header names the Marv file it ports. Each `docs/subsystems/<crate>.md` has the file-by-file table, status and port notes.
 
 ```sh
 grep -rn 'todo!("port' crates | wc -l             # what's left
@@ -35,7 +35,7 @@ None open. Issue #1 closed the skeleton's: marv-fs (`private_file`, `file_lock`)
 - **Draft labels:** `tool_draft` lives in marv-session; the TUI's draft view uses it through `UiEvent::ToolCallDelta`.
 
 ## Sprint 4 features (Marv 0.4.0): ported
-Marv's Sprint 4 (FlologixAI/marv#71, 9bb4a34) is in, and the oracle is recorded from it (30/30):
+Marv's Sprint 4 (Flologix/marv#71, 9bb4a34) is in, and the oracle is recorded from it (30/30):
 - the plan tool (#15, marv-rs #21);
 - checkpoints and `/undo` (#16, #22);
 - the doors (#23, #24): the `github` tool (#47), host bash `sandbox: false` (#52) and the `process` tool (#51), with Marv's door warnings, `once` approvals and guards for each. They are tools as in Marv; exposing them as mesh receptacles (`github.read`, `process.<name>`) is later work.

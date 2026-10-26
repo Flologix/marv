@@ -1,6 +1,6 @@
 # Tool batching: fewer, bigger tool calls
 
-- Issue: FlologixAI/marv #215
+- Issue: Flologix/marv #215
 - Status: **phase 1 approved 2026-10-24** (the maintainer: "let's do the eval"); phases 2 and 3 are decided on phase 1's numbers. The decisions are in §8.
 - Date: 2026-10-23, against `main` after 0.9.0 and #201–#205.
 - Scope:

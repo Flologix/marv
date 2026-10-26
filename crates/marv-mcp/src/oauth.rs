@@ -40,7 +40,7 @@ use crate::McpError;
 use crate::config::McpOAuthConfig;
 use crate::oauth_store::{Login, McpTokenStore, StoredClient, StoredDiscovery, StoredTokens};
 
-pub const REPOSITORY: &str = "https://github.com/FlologixAI/marv";
+pub const REPOSITORY: &str = "https://github.com/Flologix/marv";
 pub const LOOPBACK: [&str; 3] = ["127.0.0.1", "localhost", "[::1]"];
 /// `probe_login` and `revoke` give up after this long.
 pub const NETWORK_TIMEOUT: Duration = Duration::from_secs(5);

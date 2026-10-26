@@ -1,6 +1,6 @@
 # Model profiles: apply_patch for GPT models, per-family prompt addenda
 
-- Issue: FlologixAI/marv #66
+- Issue: Flologix/marv #66
 - Status: **approved 2026-10-20 with amendments.** The amendments are folded into the text below; the decisions are in §9, the PRs in §8.
 - Date: 2026-10-14 (draft), revised against `main` 2026-10-20 (after #147, #143, #67 and the 0.7.0 home-folder rules)
 - Scope:

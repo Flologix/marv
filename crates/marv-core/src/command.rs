@@ -209,7 +209,7 @@ fn is_display_stage(part: &str) -> bool {
 mod tests {
     use super::*;
 
-    const CLONE: &str = "git clone https://github.com/FlologixAI/marv /tmp/marv";
+    const CLONE: &str = "git clone https://github.com/Flologix/marv /tmp/marv";
 
     #[test]
     fn the_tails_from_issue_81_all_have_the_clones_key() {

@@ -1,6 +1,6 @@
 # marv-rs architecture
 
-marv-rs is a from-scratch Rust rebuild of [Marv](https://github.com/FlologixAI/marv), the TypeScript terminal coding agent. It keeps Marv's shape, its behaviour and its hard-won edge cases, and drops Bun and Ink. The TypeScript repo is the **spec**:
+marv-rs is a from-scratch Rust rebuild of [Marv](https://github.com/Flologix/marv), the TypeScript terminal coding agent. It keeps Marv's shape, its behaviour and its hard-won edge cases, and drops Bun and Ink. The TypeScript repo is the **spec**:
 - its `CLAUDE.md`, one bullet per subsystem;
 - its tests and its `evals/`.
 

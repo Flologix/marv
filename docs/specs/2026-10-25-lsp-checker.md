@@ -1,6 +1,6 @@
 # Checkers for Rust, Python and Go: new errors after edits
 
-- Issue: FlologixAI/marv #187 (split out of #69)
+- Issue: Flologix/marv #187 (split out of #69)
 - Status: **approved 2026-10-25** (the maintainer: "approve both specs"), with every decision in §9 as recommended. Revised after the first review on #236.
 - Date: 2026-10-25, against `main` after #216.
 - New in marv-rs: TypeScript Marv has only the tsc checker (`src/diagnostics/`). The new kinds' module docs say they port nothing; the shared machinery keeps `turn.ts`'s shape.
