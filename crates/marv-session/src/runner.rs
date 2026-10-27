@@ -294,6 +294,8 @@ pub struct SessionAgentHost {
     pub sink: Arc<dyn SubagentSink>,
     /// The switchboard: each subagent gets a plug of its own (`crate::mesh::SubagentPlug`). None: no mesh.
     pub mesh: Option<crate::mesh::MeshAccess>,
+    /// The session offers web_fetch (`SessionOptions::web`): a subagent never gets it where its parent doesn't.
+    pub web: bool,
 }
 
 impl SessionAgentHost {

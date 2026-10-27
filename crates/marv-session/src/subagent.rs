@@ -372,8 +372,9 @@ async fn drive(
     tally: &mut Tally,
     run: &mut SubagentRun,
 ) {
-    // Only subagent tools (never agent or memory, whatever the type lists), skill only when there are skills, and
-    // github only where the session offers it (its main agent has the door; the subagent only reads, #47).
+    // Only subagent tools (never agent or memory, whatever the type lists), skill only when there are skills,
+    // github only where the session offers it (its main agent has the door; the subagent only reads, #47), and
+    // web_fetch only where the session offers it (`marv -p` without the web scope doesn't).
     let has_skills = !ctx.skills.is_empty();
     let available: Vec<ToolRef> = marv_tools::builtin_tools()
         .iter()
@@ -384,6 +385,7 @@ async fn drive(
                 && agent_type.tools.iter().any(|n| n == name)
                 && (name != "skill" || has_skills)
                 && (name != "github" || ctx.doors.github)
+                && (name != "web_fetch" || host.web)
         })
         .cloned()
         .collect();
@@ -775,6 +777,7 @@ mod run_tests {
                 always: AlwaysScopes::default(),
                 sink: Arc::new(Sink(seen.clone())),
                 mesh: None,
+                web: true,
             };
             (Arc::new(host), seen)
         }
@@ -1068,6 +1071,21 @@ mod run_tests {
         assert!(!f.root.0.join("made.txt").exists() && !f.root.0.join("ran.txt").exists());
         assert_eq!(std::fs::read_to_string(f.root.0.join("notes.txt")).unwrap(), "remember the milk\n");
         assert!(asker.asked().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_subagent_never_gets_web_fetch_where_the_session_doesnt_offer_it() {
+        // `marv -p` without the web scope (`SessionOptions::web`): the parent has no web_fetch, nor its subagents.
+        let f = Fixture::new();
+        let provider = Scripted::new(vec![say("The milk.")]);
+        let (host, _) = f.host(provider.clone(), crate::agents::builtin_agents(), true);
+        let mut host = Arc::try_unwrap(host).unwrap_or_else(|_| panic!("host is shared"));
+        host.web = false;
+        let asker = Asker::yes();
+        let ctx = ctx_with(Arc::new(host), &asker, &f.root.0);
+        run(agent_call(serde_json::json!({"type": "explore", "description": "find milk", "prompt": "p"}), "a1"), &ctx).await;
+        assert_eq!(provider.tool_names(0), ["read_file", "glob", "grep"]);
+        assert!(!provider.system(0).contains("web_fetch"), "{}", provider.system(0));
     }
 
     #[tokio::test]

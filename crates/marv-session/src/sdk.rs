@@ -101,6 +101,9 @@ pub struct SessionOptions {
     /// Whether gh is there and logged in, when the caller already asked (`marv -p` asks before it joins the mesh);
     /// None: asked here, when `github` is set.
     pub github_known: Option<bool>,
+    /// Offer `web_fetch` (`SessionInit::web`). Default true; `marv -p` turns it off when nothing approves the web
+    /// scope, since every fetch would be refused there.
+    pub web: bool,
     pub yolo: bool,
     pub thinking: bool,
     /// `reasoningEffort` (#143): how hard an OpenRouter reasoning model reasons; `None`: the model's default.
@@ -182,6 +185,7 @@ impl SessionBuilder {
                 host_commands: false,
                 github: false,
                 github_known: None,
+                web: true,
                 yolo: true,
                 thinking: false,
                 reasoning_effort: None,
@@ -400,6 +404,7 @@ pub async fn create_session(options: SessionOptions) -> Result<MarvSession, Sess
     init.sandbox = options.sandbox;
     init.host_commands = options.host_commands;
     init.github = github;
+    init.web = options.web;
     init.yolo = options.yolo;
     init.no_yolo = no_yolo;
     init.sessions = store_for(&options.persist, || SessionStore::new(config_dir.join("sessions")));

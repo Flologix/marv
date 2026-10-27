@@ -19,6 +19,8 @@
 //! - Right before any run (ungated, yolo or approved), the turn's checkpoint (#16) when the tool takes one
 //!   (`Tool::checkpoint`); a stop while it's taken returns "interrupted" instead of running.
 //! - Every repaired call's result carries the repair notes, however the call ended.
+//! - marv-rs: an unknown name that is a tool's name with leaked markup or prose before it (`…<|tool_call>call:read_file`)
+//!   runs that tool, with a note (`repair::repair_tool_name`); anything else is still unknown.
 //!
 //! marv-rs additions (docs/SECURITY.md): a tainted session's egress (`ToolKind::Egress` or `uses_network`) and its
 //! writes that later conversations load (`Tool::persists`: memory, asked `once` too), and any write to a protected
@@ -176,8 +178,17 @@ pub fn home_file_write(kind: ToolKind, scope_key: &str, ctx: &ToolContext) -> bo
 /// Runs a call. Never fails: every failure becomes a result the model can read and recover from.
 pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef]) -> ToolOutcome {
     let fail = |output: String, label: &str| ToolOutcome { result: ToolOutput::error(output), label: label.to_string() };
-    let Some(tool) = available.iter().find(|t| t.name() == call.name) else {
-        return fail(unknown_tool(&call.name, available, REMOVED_TOOLS), &call.name);
+    // marv-rs: a name with leaked markup around a tool's name (`…<|tool_call>call:read_file`) runs that tool, with a
+    // note; the call itself is never rewritten (prompt cache).
+    let (tool, name_note) = match available.iter().find(|t| t.name() == call.name) {
+        Some(tool) => (tool, None),
+        None => match crate::repair::repair_tool_name(&call.name, available.iter().map(|t| t.name())) {
+            Some((fixed, note)) => match available.iter().find(|t| t.name() == fixed) {
+                Some(tool) => (tool, Some(note)),
+                None => return fail(unknown_tool(&call.name, available, REMOVED_TOOLS), &call.name),
+            },
+            None => return fail(unknown_tool(&call.name, available, REMOVED_TOOLS), &call.name),
+        },
     };
 
     let args = if call.arguments.is_empty() { "{}" } else { call.arguments.as_str() };
@@ -197,7 +208,7 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
         Some(repaired) => (repaired.input, repaired.note),
         None => (raw, None),
     };
-    let note = [json_note, schema_note, tool_note].into_iter().flatten().collect::<Vec<_>>().join("\n\n");
+    let note = [name_note, json_note, schema_note, tool_note].into_iter().flatten().collect::<Vec<_>>().join("\n\n");
     let note = (!note.is_empty()).then_some(note);
     let noted = |mut outcome: ToolOutcome| {
         outcome.result.output = with_note(&outcome.result.output, note.as_deref());
@@ -504,6 +515,23 @@ mod tests {
         assert!(run_tool(&call("{not json"), &ctx(), &t).await.result.output.contains("not valid JSON"));
         let invalid = run_tool(&call(r#"{"text": 1}"#), &ctx(), &t).await;
         assert!(invalid.result.is_error && invalid.result.output.starts_with("Invalid input for echo:"));
+    }
+
+    /// marv-rs: a name with leaked markup before a tool's name runs that tool, with a note; the call isn't touched.
+    #[tokio::test]
+    async fn a_tool_name_with_leaked_markup_runs_the_tool_it_ends_with() {
+        let t = tools(ToolKind::Read, false);
+        let garbled =
+            ToolCall { id: "1".into(), name: "Let me echo.<|tool_call>call:echo".into(), arguments: r#"{"text": "hi"}"#.into() };
+        let out = run_tool(&garbled, &ctx(), &t).await;
+        assert!(!out.result.is_error, "{}", out.result.output);
+        assert!(out.result.output.starts_with("hi\n\nMarv: the tool name"), "{}", out.result.output);
+        assert!(out.result.output.contains("it was run as echo"));
+        let other = ToolCall { id: "2".into(), name: "<|tool_call>call:nope".into(), arguments: "{}".into() };
+        assert_eq!(
+            run_tool(&other, &ctx(), &t).await.result.output,
+            "Unknown tool \"<|tool_call>call:nope\". Available tools: echo."
+        );
     }
 
     /// A removed tool's name answers with its tombstone, never the list (which invites a retry under another name).

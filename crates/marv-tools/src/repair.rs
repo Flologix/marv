@@ -10,6 +10,11 @@
 //! - a tool's `repair(raw, ctx)`: bash's `timeout` given in milliseconds ([`repair_timeout_seconds`]) and a project
 //!   path written with a leading slash ([`repair_path_field`]).
 //!
+//! - marv-rs: [`repair_tool_name`], a tool name with the model's chat-template markup or prose leaked into it (GLM
+//!   in a benchmark run called `"\nThe existing routes.json has … <|tool_call>call:read_file"`):
+//!   the known tool name at its end, after a markup boundary, is the call it meant. `run_tool` runs that tool with a
+//!   note; the call in the history keeps the name the model sent (prompt cache).
+//!
 //! Schema-guided repair (#65: a number sent as a string, a single value where the schema wants an array, an unknown
 //! field) is generic, not a tool's own: [`crate::schema_repair`], run by `run_tool` before the tool's `repair`.
 
@@ -144,6 +149,47 @@ pub fn with_note(output: &str, note: Option<&str>) -> String {
     }
 }
 
+/// The tool a garbled name meant (marv-rs): `name` ends with exactly one of `known` after leaked markup or prose
+/// (`…<|tool_call>call:read_file`, `functions.bash`, `edit_file<|tool_call_end|>`, `\nSome text read_file`), and
+/// the note that says so. Only that shape: the name must end with the tool's whole name, right after `call:`, `>`,
+/// whitespace, `functions.`/`tools.`, or before markup tags that were stripped from the end. Anything else (a
+/// misspelling, a prefix like `my_read_file`) stays unknown: guessing would run a tool the model didn't name.
+pub fn repair_tool_name<'a>(name: &str, known: impl IntoIterator<Item = &'a str>) -> Option<(String, String)> {
+    let mut rest = name.trim_end();
+    // Trailing tags (`<|tool_call_end|>`, `</tool_call>`, DeepSeek's `<｜tool▁call▁end｜>`).
+    let mut stripped = false;
+    while rest.ends_with('>') {
+        let Some(open) = rest.rfind('<') else { break };
+        rest = rest[..open].trim_end();
+        stripped = true;
+    }
+    let tail_len: usize =
+        rest.chars().rev().take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').map(char::len_utf8).sum();
+    let (prefix, candidate) = rest.split_at(rest.len() - tail_len);
+    if candidate.is_empty() || candidate == name {
+        return None;
+    }
+    let boundary = stripped && prefix.is_empty()
+        || prefix.ends_with("call:")
+        || prefix.ends_with('>')
+        || prefix.ends_with(char::is_whitespace)
+        || prefix.ends_with("functions.")
+        || prefix.ends_with("tools.");
+    if !boundary {
+        return None;
+    }
+    let tool = known.into_iter().find(|k| *k == candidate)?;
+    let shown: String = {
+        let chars: Vec<char> = name.chars().filter(|c| !c.is_control()).collect();
+        let tail: String = chars[chars.len().saturating_sub(60)..].iter().collect();
+        if chars.len() > 60 { format!("…{tail}") } else { tail }
+    };
+    let note = format!(
+        "Marv: the tool name {shown:?} had other text in it; it was run as {tool}. Next time, send only the tool's name as the name, and nothing else."
+    );
+    Some((tool.to_string(), note))
+}
+
 /// The `repair` of the tools that take a project `path` (read_file, glob, grep, edit_file, write_file). No object,
 /// or no string path (glob and grep's is optional), is nothing to repair.
 pub fn repair_path_field(raw: &Value, root: &Path) -> Option<Repaired> {
@@ -236,5 +282,36 @@ mod tests {
     fn notes_are_appended_after_a_blank_line() {
         assert_eq!(with_note("out", Some("Marv: x")), "out\n\nMarv: x");
         assert_eq!(with_note("out", None), "out");
+    }
+
+    // marv-rs: a tool name with leaked markup or prose.
+
+    const KNOWN: &[&str] = &["read_file", "edit_file", "bash", "glob"];
+
+    #[test]
+    fn a_tool_name_with_leaked_markup_is_the_tool_at_its_end() {
+        let glm = "\nThe existing routes.json has two routes; let me read it.<|tool_call>call:read_file";
+        let (tool, note) = repair_tool_name(glm, KNOWN.iter().copied()).unwrap();
+        assert_eq!(tool, "read_file");
+        assert!(note.starts_with("Marv: the tool name") && note.contains("it was run as read_file"), "{note}");
+        assert!(!note.contains('\n'), "control characters stay out of the note");
+        for (name, tool) in [
+            ("functions.bash", "bash"),
+            ("edit_file<|tool_call_end|>", "edit_file"),
+            ("glob</tool_call>", "glob"),
+            ("<tool_call>read_file", "read_file"),
+            ("Now reading it read_file", "read_file"),
+        ] {
+            assert_eq!(repair_tool_name(name, KNOWN.iter().copied()).map(|r| r.0).as_deref(), Some(tool), "{name}");
+        }
+    }
+
+    #[test]
+    fn anything_else_stays_unknown() {
+        for name in
+            ["read_file", "readfile", "my_read_file", "read_files", "call:write_file", "<|tool_call>call:deploy", "", "  "]
+        {
+            assert_eq!(repair_tool_name(name, KNOWN.iter().copied()), None, "{name:?}");
+        }
     }
 }
