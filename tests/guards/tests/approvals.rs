@@ -625,7 +625,7 @@ async fn a_woken_turns_unasked_sandboxed_commands_can_read_the_project_but_not_c
     let approver = Recorder::new(Decision::No);
     let ctx = sandboxed_ctx(project.path(), &approver, marv_tools::CallMode::Woken);
     let read = run_tool(
-        &call("bash", json!({"command": "cat kept.txt && echo built > /tmp/out && cat /tmp/out"})),
+        &call("bash", json!({"command": r#"cat kept.txt && echo built > "${TMPDIR:-/tmp}/out" && cat "${TMPDIR:-/tmp}/out""#})),
         &ctx,
         builtin_tools(),
     )
@@ -636,7 +636,9 @@ async fn a_woken_turns_unasked_sandboxed_commands_can_read_the_project_but_not_c
     let write =
         run_tool(&call("bash", json!({"command": "echo evil > Makefile; echo changed > kept.txt"})), &ctx, builtin_tools()).await;
     assert!(approver.requests().is_empty(), "a refused write asks nobody either");
-    assert!(write.result.output.contains("Read-only file system"), "{}", write.result.output);
+    // Seatbelt refuses with EPERM where bubblewrap's read-only mount says "Read-only file system".
+    let refused = if cfg!(target_os = "macos") { "Operation not permitted" } else { "Read-only file system" };
+    assert!(write.result.output.contains(refused), "{}", write.result.output);
     assert!(write.result.output.contains("git_write"), "it says how to ask: {}", write.result.output);
     assert_eq!(project.read("Makefile"), None);
     assert_eq!(project.read("kept.txt"), Some("kept\n".into()));

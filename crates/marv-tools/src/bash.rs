@@ -867,7 +867,10 @@ impl Tool for Bash {
                 result.output.push_str(&format!("\n{note}\n"));
             }
         }
-        if ctx.project_read_only && result.output.contains("Read-only file system") {
+        // bubblewrap's read-only mount says "Read-only file system"; Seatbelt has no write rule and says EPERM.
+        let refused = result.output.contains("Read-only file system")
+            || (cfg!(target_os = "macos") && sandboxed && result.output.contains("Operation not permitted"));
+        if ctx.project_read_only && refused {
             result.output.push_str(&format!("\n{WOKEN_READ_ONLY_NOTE}\n"));
         }
         if ctx.confined && GIT_READ_ONLY.is_match(&result.output) {

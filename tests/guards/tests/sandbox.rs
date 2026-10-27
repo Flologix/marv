@@ -1133,7 +1133,10 @@ fn instruction_files_never_read_secrets_or_skipped_folders() {
 /// `/tmp` in one `bash` call is there in the next call of the same chat (the scratch folder, `<id>.swap/tmp`, 0700),
 /// not in another chat's, and it goes with the saved session.
 ///
+/// Linux only (bubblewrap): on macOS each command has its own private `TMPDIR`.
+///
 /// Proven: dropped `sandbox.scratch = self.scratch_dir()` in `session.rs` → the second call found no file.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_chats_tmp_survives_between_commands_and_isnt_shared() {
     use marv_guards::{Scripted, TempDir, say, sdk_turn, tool_call, use_tools};

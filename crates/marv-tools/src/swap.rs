@@ -100,7 +100,7 @@ pub fn scratch_dir(swap: &Path) -> std::io::Result<PathBuf> {
 /// ([`trim_scratch`]), so a chat's `/tmp` can't grow without bound across sessions.
 pub const SCRATCH_CAP_BYTES: u64 = 512 * 1024 * 1024;
 
-/// The size of what a folder holds, links counted as themselves (never followed). Stops counting past `limit`.
+/// The summed length of the files a folder holds, links counted as themselves (never followed). Stops counting past `limit`.
 fn folder_size(dir: &Path, limit: u64) -> u64 {
     let mut total = 0u64;
     let mut stack = vec![dir.to_path_buf()];
@@ -108,9 +108,11 @@ fn folder_size(dir: &Path, limit: u64) -> u64 {
         let Ok(entries) = std::fs::read_dir(&next) else { continue };
         for entry in entries.flatten() {
             let Ok(meta) = entry.metadata() else { continue };
-            total += meta.len();
+            // File lengths only: a folder's own size is filesystem-dependent (4096 on ext4, 0 on btrfs).
             if meta.is_dir() {
                 stack.push(entry.path());
+            } else {
+                total += meta.len();
             }
             if total > limit {
                 return total;
