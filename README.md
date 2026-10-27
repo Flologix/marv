@@ -31,7 +31,7 @@ Marv is written in Rust and ships as one static binary. Nothing else runs it: no
 - **A plan for long tasks.** For a task of four or more steps (or a request with several asks in one paragraph), the model writes a checklist with its `plan` tool and ticks it off as it works, updating it alongside its other tool calls rather than in requests of its own. Marv pins it above the prompt (`Plan 2/5`, the current item highlighted) until every item is done, saves it with the session, and hands it back to the model after the conversation is compacted.
 - **Undo a turn.** Before a turn's first change Marv snapshots the project's files, and `/undo` shows what that turn changed (each file's diff) and, on a yes, puts those files back: edits, new files and deleted ones, whether a tool or a `bash` command made them. Your branch, index and stash are never touched. See [Undo](#undo).
 - **No dead stops.** After 25 steps without finishing, Marv asks whether to keep going instead of giving up. Raise the interval with `/steps 40` (or `maxSteps` in the config), or turn the asking off with `/steps off` (subagents still stop at their own 50).
-- **Cost tracking.** OpenRouter's actual charge per request, plus context and cache use, in the status bar; `/cost` for the breakdown.
+- **Cost tracking.** OpenRouter's actual charge per request, plus context and cache use, in the status bar; `/cost` for the breakdown, per model when the session used more than one (a `/model` switch, a subagent's own model).
 - **Herdr aware.** Run Marv in a [Herdr](https://herdr.dev) pane and Herdr's sidebar shows whether it's working, waiting for your approval, or done, with nothing to set up. There the model also gets a `herdr` tool: it lists and reads panes without asking (what it reads counts as untrusted), asks before focusing or renaming a pane or typing a prompt into an idle agent's pane, and asks every time before running a command in a new pane or starting a worker (another Marv, or an agent such as Claude Code or Codex, optionally in its own git worktree). `/peers` lists the panes it opened.
 - **A comfortable, light TUI.** Streaming Markdown replies revealed at an even pace, a live preview of the model's reasoning, mouse-wheel scrolling, drag-to-copy with auto-scroll, a `/` command menu, and Esc to interrupt. It uses next to no CPU while idle.
 
@@ -126,7 +126,7 @@ Sandboxed reads, edits and test runs go ahead on their own; a commit, the networ
 | `/forget` | Remove a memory (`/forget <text from it>`) |
 | `/resume` | Pick up an earlier session in this project |
 | `/compact` | Summarize the conversation to free up context (`/compact <what to keep>`) |
-| `/cost` | Tokens used and cost so far |
+| `/cost` | Tokens used and cost so far, per model when more than one served the session |
 | `/sandbox` | Show or set the command sandbox (`/sandbox on`, `/sandbox off`) |
 | `/yolo` | Run edits and sandboxed commands without asking (`/yolo on`, `/yolo off`) |
 | `/permissions` | What Marv may do without asking: this session's "always" answers, pre-approved scopes, yolo, the sandbox and doors, and what's saved in your config |

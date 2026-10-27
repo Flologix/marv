@@ -12,6 +12,7 @@
 
 use marv_core::Usage;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// The whole session's requests. Saved with sessions in Marv's field names.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -30,6 +31,27 @@ pub struct Totals {
     /// A local model (Ollama): no cost.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local: Option<bool>,
+    /// The same counts per model that served the requests (the session's model changes with `/model`, and a
+    /// subagent can name its own), by model id. Absent in sessions saved before this was kept: their totals above
+    /// still load, and the breakdown starts from the next request.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub models: BTreeMap<String, ModelTotals>,
+}
+
+/// One model's share of [`Totals`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelTotals {
+    pub requests: u64,
+    pub prompt_tokens: u64,
+    pub cached_tokens: u64,
+    pub completion_tokens: u64,
+    /// USD; `None` when neither reported nor estimable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<f64>,
+    /// Some of the cost was estimated from prices rather than reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated: Option<bool>,
 }
 
 /// $ per million tokens.
@@ -70,7 +92,25 @@ pub fn add_usage(totals: &Totals, usage: &Usage, prices: &Prices) -> Totals {
         },
         estimated: Some(totals.estimated.unwrap_or(false) || (reported.is_none() && cost.is_some())),
         local: totals.local,
+        models: totals.models.clone(),
     }
+}
+
+/// [`add_usage`], and the request is also counted under `model`, the one that served it.
+pub fn add_model_usage(totals: &Totals, model: &str, usage: &Usage, prices: &Prices) -> Totals {
+    let mut next = add_usage(totals, usage, prices);
+    let reported = usage.cost;
+    let cost = reported.or_else(|| estimate_cost(usage, prices));
+    let share = next.models.entry(model.to_string()).or_default();
+    share.requests += 1;
+    share.prompt_tokens += usage.prompt_tokens;
+    share.cached_tokens += usage.cached_tokens.unwrap_or(0);
+    share.completion_tokens += usage.completion_tokens;
+    if let Some(c) = cost {
+        share.cost = Some(share.cost.unwrap_or(0.0) + c);
+    }
+    share.estimated = Some(share.estimated.unwrap_or(false) || (reported.is_none() && cost.is_some()));
+    next
 }
 
 /// Tokens in text that's still streaming, before the provider counts them: about four characters a token. One
@@ -157,6 +197,25 @@ pub fn usage_report(totals: &Totals, last: Option<&Usage>, context_length: Optio
         };
         lines.push(format!("Context: {}{of}", tokens(used)));
     }
+    // More than one model served the session (a /model switch, a subagent's own): where the requests went.
+    if totals.models.len() > 1 {
+        lines.push("By model:".into());
+        let mut models: Vec<_> = totals.models.iter().collect();
+        models.sort_by(|a, b| b.1.requests.cmp(&a.1.requests).then(a.0.cmp(b.0)));
+        for (model, m) in models {
+            let as_totals = Totals { requests: m.requests, cost: m.cost, estimated: m.estimated, ..Totals::default() };
+            let cost = cost_text(&as_totals);
+            lines.push(format!(
+                "  {model}: {} request{}, {} in ({} cached), {} out{}",
+                m.requests,
+                if m.requests == 1 { "" } else { "s" },
+                tokens(m.prompt_tokens),
+                tokens(m.cached_tokens),
+                tokens(m.completion_tokens),
+                if cost.is_empty() { String::new() } else { format!(", {cost}") }
+            ));
+        }
+    }
     lines.join("\n")
 }
 
@@ -226,6 +285,30 @@ mod tests {
         assert!(report.contains("1.2k output tokens"));
         assert!(report.contains("$0.031"));
         assert!(report.contains("9.4k of 1M tokens"), "{report}");
+    }
+
+    #[test]
+    fn per_model_totals_split_the_requests_save_back_compatibly_and_show_in_the_report() {
+        let mut t = Totals::default();
+        for _ in 0..2 {
+            t = add_model_usage(&t, "nemotron:free", &usage(1000, 100, Some(500), Some(0.0)), &Prices::default());
+        }
+        t = add_model_usage(&t, "deepseek-v4", &usage(2000, 50, None, Some(0.004)), &Prices::default());
+        assert_eq!((t.requests, t.prompt_tokens), (3, 4000));
+        assert_eq!(t.models["nemotron:free"].requests, 2);
+        assert_eq!(t.models["deepseek-v4"].cost, Some(0.004));
+        assert_eq!(t.models["deepseek-v4"].estimated, Some(false));
+        let report = usage_report(&t, None, None);
+        assert!(report.contains("By model:"), "{report}");
+        assert!(report.contains("nemotron:free: 2 requests, 2k in (1k cached), 200 out"), "{report}");
+        assert!(report.contains("deepseek-v4: 1 request, 2k in (0 cached), 50 out, $0.004"), "{report}");
+        // One model: no breakdown. An old file (no `models`) loads; the key is written only when there is one.
+        let one = add_model_usage(&Totals::default(), "m", &usage(10, 1, None, None), &Prices::default());
+        assert!(!usage_report(&one, None, None).contains("By model"));
+        let old: Totals = serde_json::from_str(r#"{"requests":4,"promptTokens":9,"cachedTokens":0,"completionTokens":1}"#).unwrap();
+        assert!(old.models.is_empty() && old.requests == 4);
+        assert!(!serde_json::to_string(&old).unwrap().contains("models"));
+        assert_eq!(serde_json::from_str::<Totals>(&serde_json::to_string(&t).unwrap()).unwrap(), t);
     }
 
     #[test]

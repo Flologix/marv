@@ -76,7 +76,7 @@ use crate::sessions::{McpListing, SavedCheckpoints, SavedSession, SessionStore, 
 use crate::skills::LoadedSkill;
 use crate::trajectory::{AgentRecorder, CheckStatus, Trajectory, TrajectoryRecord, TrajectoryStore, Who};
 use crate::types::{Message, Role};
-use crate::usage::{Prices, Totals, add_usage};
+use crate::usage::{Prices, Totals, add_model_usage};
 
 /// Saved this long after a turn ends (and again on flush), so a burst of turns is one write.
 pub const SAVE_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
@@ -1129,8 +1129,8 @@ impl marv_tools::ToolProgress for CallProgress {
 }
 
 impl SubagentSink for TurnSink {
-    fn usage(&self, usage: &Usage) {
-        self.session.count(usage, self.factory.as_ref(), self.info.as_ref());
+    fn usage(&self, usage: &Usage, model: Option<&str>) {
+        self.session.count(usage, self.factory.as_ref(), self.info.as_ref(), model);
     }
     fn progress(&self, call_id: &str, progress: AgentProgress) {
         (self.emit)(SessionEvent::SubagentProgress { call_id: call_id.into(), progress });
@@ -2193,7 +2193,7 @@ impl MarvSession {
             match &event {
                 LoopEvent::Usage(usage, _) => {
                     self.state().last = Some(*usage);
-                    self.count(usage, factory.as_ref(), info.as_ref());
+                    self.count(usage, factory.as_ref(), info.as_ref(), None);
                 }
                 // "Send now": in the transcript where the model read it, as the person's.
                 LoopEvent::SentNow { text } => {
@@ -2394,7 +2394,7 @@ impl MarvSession {
             return None;
         }
         let tools = self.offered().0;
-        let on_usage = |usage: Usage| self.count(&usage, factory.as_ref(), info.as_ref());
+        let on_usage = |usage: Usage| self.count(&usage, factory.as_ref(), info.as_ref(), None);
         marv_agent::suggest::suggest(marv_agent::suggest::SuggestOptions {
             provider: provider.as_ref(),
             history: &history,
@@ -2619,7 +2619,7 @@ impl MarvSession {
         };
         let kind = self.summary_kind();
         let tools = self.offered().0;
-        let on_usage = |usage: Usage| self.count(&usage, factory, info);
+        let on_usage = |usage: Usage| self.count(&usage, factory, info, None);
         let result = marv_agent::compact::summarize(SummarizeOptions {
             provider: provider.as_ref(),
             history: request,
@@ -4123,12 +4123,20 @@ impl MarvSession {
 
     /// Adds a request's tokens and cost to the totals. `factory` made the provider; `info` is what the list said
     /// about its model when the turn started (another model's prices would make the estimate wrong).
-    pub(crate) fn count(&self, usage: &Usage, factory: &dyn ProviderFactory, info: Option<&ModelInfo>) {
+    ///
+    /// `model` is the one that served the request when it isn't the factory's own (a subagent's type named another
+    /// model); the per-model totals count it under that name, and without its prices the cost is only the reported one.
+    pub(crate) fn count(&self, usage: &Usage, factory: &dyn ProviderFactory, info: Option<&ModelInfo>, model: Option<&str>) {
         let mut s = self.state();
+        let served = model.unwrap_or_else(|| factory.model());
         let same = factory.id() == s.factory.id() && factory.model() == s.factory.model();
-        let prices = info.or(if same { s.info.as_ref() } else { None }).map(Prices::from).unwrap_or_default();
+        let own_prices = model.is_none_or(|m| m == factory.model());
+        let prices = match info.or(if same { s.info.as_ref() } else { None }) {
+            Some(info) if own_prices => Prices::from(info),
+            _ => Prices::default(),
+        };
         let local = (s.totals.requests == 0 || s.totals.local == Some(true)) && factory.local();
-        let mut totals = add_usage(&s.totals, usage, &prices);
+        let mut totals = add_model_usage(&s.totals, served, usage, &prices);
         totals.local = Some(local);
         s.totals = totals;
     }
@@ -4369,8 +4377,16 @@ mod tests {
             &Usage { prompt_tokens: 900, completion_tokens: 10, cached_tokens: None, cost: Some(0.01) },
             factory.as_ref(),
             None,
+            None,
         );
         assert_eq!(s.usage().totals.requests, 1);
+        // Per model: the turn's own model, then a subagent whose type named another one (counted under that name).
+        let own = factory.model().to_string();
+        let usage = Usage { prompt_tokens: 10, completion_tokens: 1, cached_tokens: None, cost: Some(0.5) };
+        s.count(&usage, factory.as_ref(), None, Some("other/model"));
+        let totals = s.usage().totals;
+        assert_eq!((totals.requests, totals.models[&own].requests, totals.models["other/model"].requests), (2, 1, 1));
+        assert_eq!(totals.models["other/model"].cost, Some(0.5));
         s.state().last = Some(Usage { prompt_tokens: 900, completion_tokens: 10, cached_tokens: None, cost: None });
         assert!(s.nearly_full());
     }
