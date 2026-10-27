@@ -59,7 +59,9 @@ use crate::checkpoints::undo::{UndoPlan, UndoRefusal, UndoResult, apply_undo, pl
 use crate::checks::{ProjectCheckResult, Violation};
 use crate::config::{Diagnostics, Language};
 use crate::cut_off::{OpenTurn, SavingApprover, cut_off_note, cut_off_notice};
-use crate::diagnostics::turn::{CheckOutcome, Checker, FailReason, OffReason, TurnChecks, TurnOptions, combine_checks};
+use crate::diagnostics::turn::{
+    CheckOutcome, Checker, FailReason, OffReason, TurnChecks, TurnOptions, combine_checks, combine_checks_within,
+};
 use crate::diagnostics::{CheckResult, Diagnostic};
 use crate::event_queue::EventQueue;
 use crate::feedback::classify_reply;
@@ -985,12 +987,13 @@ fn recorder(record: &Record, turn: &str, agent: &str) -> AgentRecorder {
     AgentRecorder::new(move |r| record(r), Who { turn: turn.into(), agent: agent.into() }, crate::time::now_ms)
 }
 
-/// The diagnostics checkers, one per language that has one (#187: tsc and cargo check so far), sharing the check
-/// cache. Their order is the order of their notes in a step's message.
+/// The diagnostics checkers, one per language that has one (#187: tsc, cargo check and pyright so far), sharing the
+/// check cache. Their order is the order of their notes in a step's message, and of their share of its budget.
 fn diagnostic_checkers(cache: &Option<Arc<crate::diagnostics::cache::CheckCache>>) -> Vec<(Language, Arc<Checker<Diagnostic>>)> {
     let kinds: Vec<(Language, Arc<dyn crate::diagnostics::turn::CheckKind<Diagnostic>>)> = vec![
         (Language::TypeScript, Arc::new(crate::diagnostics::turn::Typecheck)),
         (Language::Rust, Arc::new(crate::diagnostics::cargo::Cargo)),
+        (Language::Python, Arc::new(crate::diagnostics::pyright::Pyright)),
     ];
     kinds
         .into_iter()
@@ -1029,7 +1032,7 @@ fn check_record<E>(
 ) -> TrajectoryRecord {
     let who = Who { turn: turn.into(), agent: "main".into() };
     let (status, ms, before, errors, added, reason, told) = match result {
-        CheckOutcome::Done { ms, before, errors, added } => (
+        CheckOutcome::Done { ms, before, errors, added, .. } => (
             CheckStatus::Done,
             Some(*ms),
             Some(*before),
@@ -2275,13 +2278,13 @@ impl MarvSession {
             })
         };
         let root = self.inner.init.root.clone();
-        let mut parts = Vec::new();
+        let mut diagnostic_parts = Vec::new();
         for (_, checker) in self.inner.diagnostics.iter().filter(|(language, _)| diagnostics.get(*language)) {
             let (emit, record, turn, kind) = (emit.clone(), record.clone(), turn.to_string(), checker.kind.clone());
             // A kind with a cache: its folder's last measured size goes with each record (read from the record file).
             let cache = checker.cache.clone().filter(|_| kind.cache());
             let key = cache.as_ref().map(|_| crate::diagnostics::cache::repo_key(&root));
-            parts.extend(checker.turn(TurnOptions {
+            diagnostic_parts.extend(checker.turn(TurnOptions {
                 root: root.clone(),
                 sandbox,
                 cancel: stop.clone(),
@@ -2293,6 +2296,9 @@ impl MarvSession {
                 }),
             }));
         }
+        // The languages' notes share one step's budget (#187 §6.7); the project checks keep their own.
+        let mut parts: Vec<TurnChecks> =
+            combine_checks_within(diagnostic_parts, crate::diagnostics::turn::MAX_REPORTED_PER_STEP).into_iter().collect();
         if checks_on {
             let (emit, record, turn, kind) =
                 (emit.clone(), record.clone(), turn.to_string(), self.inner.project_checks.kind.clone());
@@ -4755,18 +4761,20 @@ mod turn_tests {
         assert_eq!((start, *reason), (end, TurnEndReason::Done(StopReason::End)));
     }
 
-    /// #187 §6.7: a step's diagnostics notes together list at most `MAX_REPORTED_PER_STEP` errors (20 per kind).
+    /// #187 §6.7: the session's diagnostics kinds are three, more than one step's budget holds at 20 each, so their
+    /// notes go through the shared budget (`combine_checks_within`, tested in `diagnostics::turn`).
     #[test]
-    fn a_steps_diagnostics_notes_stay_within_the_per_step_budget() {
-        let kinds = diagnostic_checkers(&None).len();
-        assert!(kinds * crate::diagnostics::tsc::MAX_REPORTED <= crate::diagnostics::turn::MAX_REPORTED_PER_STEP);
+    fn the_session_has_more_diagnostics_kinds_than_the_step_budget_holds_in_full() {
+        let labels: Vec<_> = diagnostic_checkers(&None).iter().map(|(_, c)| c.kind.label()).collect();
+        assert_eq!(labels, ["tsc", "cargo check", "pyright"]);
+        assert!(labels.len() * crate::diagnostics::tsc::MAX_REPORTED > crate::diagnostics::turn::MAX_REPORTED_PER_STEP);
     }
 
     /// #187 §6.2: a cargo check's record carries its source and the cache's last measured size; a quiet "not
     /// installed" is recorded.
     #[test]
     fn a_check_record_carries_the_cache_size() {
-        let done: CheckResult = CheckOutcome::Done { ms: 3, before: 0, errors: 0, added: vec![] };
+        let done: CheckResult = CheckOutcome::Done { ms: 3, before: 0, errors: 0, added: vec![], told: 0 };
         let record = serde_json::to_value(check_record("t1", Some("cargo"), &done, |_| String::new(), Some(42))).unwrap();
         assert_eq!((record["source"].as_str(), record["cacheBytes"].as_u64()), (Some("cargo"), Some(42)), "{record}");
         let off: CheckResult = CheckOutcome::Off { reason: OffReason::NotInstalled };
@@ -4785,7 +4793,14 @@ mod turn_tests {
         let session = scripted(&dirs, &provider, |init| init.check_cache = Some(root.clone()));
         let info = session.diagnostics_info();
         let checkers: Vec<_> = info.checkers.iter().map(|c| (c.language, c.label, c.state.as_str())).collect();
-        assert_eq!(checkers, [(Language::TypeScript, "tsc", "ready"), (Language::Rust, "cargo check", "ready")]);
+        assert_eq!(
+            checkers,
+            [
+                (Language::TypeScript, "tsc", "ready"),
+                (Language::Rust, "cargo check", "ready"),
+                (Language::Python, "pyright", "ready")
+            ]
+        );
         assert_eq!(info.cache, None);
         assert_eq!(session.clear_check_cache(), Ok(None));
         let cache = crate::diagnostics::cache::CheckCache::new(&root);

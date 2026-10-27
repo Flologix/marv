@@ -1,4 +1,4 @@
-//! Diagnostics (`src/diagnostics/`): a project's own checker (tsc, and cargo check in marv-rs) after a step that changed files, telling
+//! Diagnostics (`src/diagnostics/`): a project's own checker (tsc, and cargo check and pyright in marv-rs) after a step that changed files, telling
 //! the model only the errors that are new since the turn's baseline. The machinery ([`turn`]) is generic, so the
 //! project checks ([`crate::checks`]) reuse it.
 //!
@@ -6,10 +6,12 @@
 //! - [`turn`]: `Checker`, `TurnChecks`, `CheckOutcome`, `combine_checks`, notices (`turn.ts`), plus (marv-rs, #187)
 //!   the per-kind policy: timeout, warm-up, cache, turning off after unreadable runs;
 //! - [`cache`] (marv-rs, #187): the check cache, a writable folder per repository for checkers that keep a build cache;
-//! - [`cargo`] (marv-rs, #187): Rust's `cargo check`, with its build in the check cache.
+//! - [`cargo`] (marv-rs, #187): Rust's `cargo check`, with its build in the check cache;
+//! - [`pyright`] (marv-rs, #187): Python's basedpyright or pyright.
 
 pub mod cache;
 pub mod cargo;
+pub mod pyright;
 pub mod tsc;
 pub mod turn;
 
@@ -17,7 +19,7 @@ pub mod turn;
 mod machinery_tests;
 
 pub use tsc::diagnostics_note;
-pub use turn::{CheckOutcome, CheckResult, Checker, TurnChecks, check_notice, combine_checks, notice};
+pub use turn::{CheckOutcome, CheckResult, Checker, TurnChecks, check_notice, combine_checks, combine_checks_within, notice};
 
 /// One problem a checker reported: tsc's error today, and the shape every command-line checker's fits (#187).
 #[derive(Debug, Clone, PartialEq, Eq)]

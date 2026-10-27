@@ -772,19 +772,31 @@ pub fn diagnostics_status(config: &Config) -> String {
     if !d.any() {
         return "off".into();
     }
-    let what = match (d.get(Language::TypeScript), d.get(Language::Rust)) {
-        (true, true) => {
-            "on: after the model changes files in a TypeScript or Rust project, Marv runs the project's typecheck or cargo check (in the sandbox, read-only) and tells the model about new errors"
-        }
-        (true, false) => {
-            "on: after the model changes files in a TypeScript project, Marv runs the project's typecheck (in the sandbox, read-only) and tells the model about new errors"
-        }
-        (false, true) => {
-            "on: after the model changes files in a Rust project, Marv runs cargo check (in the sandbox, read-only) and tells the model about new errors"
-        }
-        (false, false) => "on, but not for TypeScript or Rust: Marv won't run a checker after the model's edits",
+    // The languages with a checker in this version, and what runs for each.
+    let checkers = [
+        (Language::TypeScript, "TypeScript", "the project's typecheck"),
+        (Language::Rust, "Rust", "cargo check"),
+        (Language::Python, "Python", "pyright"),
+    ];
+    let or = |words: Vec<&str>| match words.split_last() {
+        Some((last, [])) => last.to_string(),
+        Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
+        None => String::new(),
     };
-    if d.summary() == "on" { what.into() } else { format!("{what} ({})", d.summary()) }
+    let on: Vec<_> = checkers.iter().filter(|(language, _, _)| d.get(*language)).collect();
+    let what = if on.is_empty() {
+        format!(
+            "on, but not for {}: Marv won't run a checker after the model's edits",
+            or(checkers.iter().map(|c| c.1).collect())
+        )
+    } else {
+        format!(
+            "on: after the model changes files in a {} project, Marv runs {} (in the sandbox, read-only) and tells the model about new errors",
+            or(on.iter().map(|c| c.1).collect()),
+            or(on.iter().map(|c| c.2).collect())
+        )
+    };
+    if d.summary() == "on" { what } else { format!("{what} ({})", d.summary()) }
 }
 
 const DIAGNOSTICS_USAGE: &str =
@@ -822,6 +834,7 @@ pub fn diagnostics_text(config: &Config, info: Option<&DiagnosticsInfo>) -> Stri
             (true, Some(c)) => format!("on ({}: {})", c.label, c.state),
             (true, None) if language == Language::TypeScript => "on (tsc)".to_string(),
             (true, None) if language == Language::Rust => "on (cargo check)".to_string(),
+            (true, None) if language == Language::Python => "on (pyright)".to_string(),
             (true, None) => "on (no checker for it in this version yet)".to_string(),
         };
         lines.push(format!("- {}: {state}", language.name()));
@@ -1276,11 +1289,17 @@ mod tests {
                 assert!(matches!(run_command(bad, ctx), CommandAction::Print { is_error: true, .. }), "{bad}");
             }
             let CommandAction::Print { text, .. } = run_command("/diagnostics", ctx) else { panic!() };
-            assert!(text.starts_with("Diagnostics: on: after the model changes files in a TypeScript or Rust project"), "{text}");
+            assert!(
+                text.starts_with(
+                    "Diagnostics: on: after the model changes files in a TypeScript, Rust or Python project, Marv runs the project's typecheck, cargo check or pyright (in the sandbox, read-only)"
+                ),
+                "{text}"
+            );
             assert!(
                 text.contains("\n- typescript: on (tsc)\n")
                     && text.contains("\n- rust: on (cargo check)\n")
-                    && text.contains("\n- python: on (no checker for it in this version yet)"),
+                    && text.contains("\n- python: on (pyright)\n")
+                    && text.contains("\n- go: on (no checker for it in this version yet)"),
                 "{text}"
             );
             let info = DiagnosticsInfo {

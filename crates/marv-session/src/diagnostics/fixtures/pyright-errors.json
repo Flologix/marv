@@ -1,0 +1,94 @@
+{
+    "version": "1.1.414",
+    "time": "1793030751547",
+    "generalDiagnostics": [
+        {
+            "file": "/work/fixture/pkg/lib.py",
+            "severity": "error",
+            "message": "Type \"Literal['forty-two']\" is not assignable to return type \"int\"\n  \"Literal['forty-two']\" is not assignable to \"int\"",
+            "range": {
+                "start": {
+                    "line": 4,
+                    "character": 11
+                },
+                "end": {
+                    "line": 4,
+                    "character": 22
+                }
+            },
+            "rule": "reportReturnType"
+        },
+        {
+            "file": "/work/fixture/pkg/use.py",
+            "severity": "error",
+            "message": "\"missing_fn\" is unknown import symbol",
+            "range": {
+                "start": {
+                    "line": 0,
+                    "character": 27
+                },
+                "end": {
+                    "line": 0,
+                    "character": 37
+                }
+            },
+            "rule": "reportAttributeAccessIssue"
+        },
+        {
+            "file": "/work/fixture/pkg/use.py",
+            "severity": "error",
+            "message": "Type \"str\" is not assignable to declared type \"int\"\n  \"str\" is not assignable to \"int\"",
+            "range": {
+                "start": {
+                    "line": 2,
+                    "character": 9
+                },
+                "end": {
+                    "line": 2,
+                    "character": 17
+                }
+            },
+            "rule": "reportAssignmentType"
+        },
+        {
+            "file": "/work/fixture/pkg/use.py",
+            "severity": "error",
+            "message": "Argument of type \"Literal[3]\" cannot be assigned to parameter \"name\" of type \"str\" in function \"greet\"\n  \"Literal[3]\" is not assignable to \"str\"",
+            "range": {
+                "start": {
+                    "line": 2,
+                    "character": 15
+                },
+                "end": {
+                    "line": 2,
+                    "character": 16
+                }
+            },
+            "rule": "reportArgumentType"
+        },
+        {
+            "file": "/work/fixture/pkg/use.py",
+            "severity": "error",
+            "message": "\"undefined_name\" is not defined",
+            "range": {
+                "start": {
+                    "line": 3,
+                    "character": 4
+                },
+                "end": {
+                    "line": 3,
+                    "character": 18
+                }
+            },
+            "rule": "reportUndefinedVariable"
+        }
+    ],
+    "summary": {
+        "filesAnalyzed": 3,
+        "errorCount": 5,
+        "warningCount": 0,
+        "informationCount": 0,
+        "timeInSec": 0.284
+    }
+}
+

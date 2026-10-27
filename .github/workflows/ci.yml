@@ -51,6 +51,14 @@ jobs:
       # this fails loudly if that ever changes.
       - name: Check the tools the tests need
         run: git --version && python3 --version
+      # #187: basedpyright for the real-sandbox pyright guard (tests/guards/tests/pyright_check.rs). Installed outside the
+      # home and /tmp, which the sandbox hides, with the system Python, so the check can run it.
+      - name: Install basedpyright for the pyright guard
+        run: |
+          sudo /usr/bin/python3 -m venv /opt/basedpyright
+          sudo /opt/basedpyright/bin/pip install --quiet basedpyright
+          sudo ln -sf /opt/basedpyright/bin/basedpyright /usr/local/bin/basedpyright
+          basedpyright --version
       - run: cargo fmt --all --check
       - run: cargo check --workspace --all-targets
       - run: cargo clippy --workspace --all-targets -- -D warnings
@@ -106,6 +114,15 @@ jobs:
       - name: Add a loopback alias for the sandbox probes
         continue-on-error: true
         run: sudo ifconfig lo0 alias 127.0.0.2 up
+      # #187: basedpyright for the real-sandbox pyright guard, outside the home (Seatbelt hides its dot folders and
+      # ~/Library; setup-* toolcaches live under /Users/runner), with the system Python.
+      - name: Install basedpyright for the pyright guard
+        run: |
+          sudo /usr/bin/python3 -m venv /opt/basedpyright
+          sudo /opt/basedpyright/bin/pip install --quiet basedpyright
+          sudo mkdir -p /usr/local/bin
+          sudo ln -sf /opt/basedpyright/bin/basedpyright /usr/local/bin/basedpyright
+          basedpyright --version
       - run: cargo check --workspace --all-targets
       # #152: what Seatbelt does with loopback rules on this runner, for the record. The process door stays off on
       # macOS because `localhost` rules don't keep a bind on loopback (2026-10-25); a change shows up in this log. It

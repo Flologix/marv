@@ -608,6 +608,27 @@ fn host_spawn_probe(markers: &Path) {
                 let _ = checker.state();
                 assert!(runs.all().iter().any(|r| r.command.contains("cargo check")));
             }
+            // The real Python kind, with project-local checkers that would leave a marker if anything ran them here,
+            // and a venv whose `python` links to one of them: detection, the venv link check, a turn and a step.
+            assert_eq!(super::pyright::Pyright.prepare(&tree), name == "python");
+            if name == "python" {
+                for local in [".venv/bin/basedpyright", "node_modules/.bin/pyright", ".venv/bin/python3"] {
+                    let path = tree.join(local);
+                    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    let marker = local.replace('/', "_");
+                    std::fs::write(&path, format!("#!/bin/sh\n: > '{}/{marker}'\n", markers.display())).unwrap();
+                    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+                }
+                std::os::unix::fs::symlink("python3", tree.join(".venv/bin/python")).unwrap();
+                let _ = super::pyright::Pyright.hidden(&tree);
+                let runs = Runs::checks(vec![ok(""), failed("")]);
+                let checker = checker_of(Arc::new(super::pyright::Pyright), &runs, &cache);
+                let t = turn(&checker, &tree);
+                t.before_change().await;
+                let _ = t.after_step(vec![edited(Some("pkg/a.py"))]).await;
+                let _ = checker.state_at(&tree);
+                assert!(runs.all().iter().any(|r| r.command.contains("--outputjson")));
+            }
         }
     });
     assert!(left().is_empty(), "ran on the host: {:?}", left());
@@ -773,4 +794,155 @@ async fn a_missing_cargo_turns_the_kind_off_quietly() {
     let again = turn(&checker, &project);
     again.before_change().await;
     assert_eq!(runs.checks_run(), 2);
+}
+
+// --- the Python kind (pyright) through the machinery
+
+/// A Python project (the stand-in runner answers with real pyright output, its paths moved to the project).
+fn python_setup() -> (Scratch, PathBuf, Arc<CheckCache>) {
+    let (dir, project, cache) = setup();
+    dir.put("project/pyproject.toml", "[project]\nname = \"fixture\"\n");
+    (dir, project, cache)
+}
+
+fn pyright_output(project: &Path, fixture: &str) -> String {
+    fixture.replace("/work/fixture", &project.display().to_string())
+}
+
+/// pyright tells new errors once, by project-relative path: baseline clean, an edit adds five (one of them in
+/// another file than the one edited), the same output again tells nothing, and fixing them tells nothing.
+#[tokio::test]
+async fn pyright_tells_new_errors_once_relative_to_the_project() {
+    let (_dir, project, cache) = python_setup();
+    let clean = include_str!("fixtures/pyright-clean.json");
+    let errors = pyright_output(&project, include_str!("fixtures/basedpyright-errors.json"));
+    let failed1 = |out: &str| CommandResult { output: out.into(), exit_code: Some(1), ..Default::default() };
+    let runs = Runs::checks(vec![ok(clean), failed1(&errors), failed1(&errors), ok(clean)]);
+    let checker = checker_of(Arc::new(super::pyright::Pyright), &runs, &cache);
+    let t = turn(&checker, &project);
+    t.before_change().await;
+    // No cache, no warm-up, nothing writable.
+    assert_eq!(checker.warm_ups(), 0);
+    let note = t.after_step(vec![edited(Some("pkg/lib.py"))]).await.unwrap();
+    assert!(note.contains("pyright found 5 errors that weren't in the previous check."), "{note}");
+    assert!(note.contains("\npkg/use.py:4:5 reportUndefinedVariable \"undefined_name\" is not defined\n"), "{note}");
+    assert!(!note.contains(&project.display().to_string()), "{note}");
+    assert_eq!(t.after_step(vec![edited(Some("pkg/lib.py"))]).await, None);
+    assert_eq!(t.after_step(vec![edited(Some("pkg/lib.py"))]).await, None);
+    for run in runs.all() {
+        assert!(run.writable.is_empty(), "{run:?}");
+    }
+    let notice = notice(super::pyright::LABEL, &t.results()[0]).unwrap();
+    assert!(notice.starts_with("✻ pyright: 5 new errors, told the model:"), "{notice}");
+}
+
+/// No pyright or basedpyright in the sandbox: off for the session, quietly; `/diagnostics` says so.
+#[tokio::test]
+async fn a_missing_pyright_turns_the_kind_off_quietly() {
+    let (_dir, project, cache) = python_setup();
+    let runs = Runs::checks(vec![CommandResult { exit_code: Some(127), ..Default::default() }]);
+    let checker = checker_of(Arc::new(super::pyright::Pyright), &runs, &cache);
+    let t = turn(&checker, &project);
+    t.before_change().await;
+    assert_eq!(t.results(), [CheckOutcome::Off { reason: OffReason::NotInstalled }]);
+    assert_eq!(notice(super::pyright::LABEL, &t.results()[0]), None);
+    assert_eq!(checker.state_at(&project), "not installed (Marv doesn't install toolchains)");
+    assert!(turn(&checker, &project).checks.is_none());
+}
+
+/// npm's pyright with a node the sandbox hides, and a venv launcher whose Python it hides: named once a session,
+/// as a hidden interpreter, not an unreadable output; they don't count toward turning the kind off.
+#[tokio::test]
+async fn a_hidden_node_or_python_is_named_once() {
+    let (_dir, project, cache) = python_setup();
+    let node =
+        CommandResult {
+            output: "env: ‘node’: No such file or directory\n".into(), exit_code: Some(127), ..Default::default()
+        };
+    let bad = CommandResult {
+        output:
+            "bash: line 1: .venv/bin/basedpyright: /opt/uv/python/bin/python3.12: bad interpreter: No such file or directory\n"
+                .into(),
+        exit_code: Some(126),
+        ..Default::default()
+    };
+    let runs = Runs::checks(vec![node.clone(), bad.clone(), bad]);
+    let checker = checker_of(Arc::new(super::pyright::Pyright), &runs, &cache);
+    let mut told = Vec::new();
+    for _ in 0..3 {
+        let t = turn(&checker, &project);
+        t.before_change().await;
+        told.extend(t.results());
+    }
+    let tools: Vec<_> = told
+        .iter()
+        .map(|r| match r {
+            CheckOutcome::Failed { reason: FailReason::MissingInterpreter, tool, notify, .. } => (tool.clone().unwrap(), *notify),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        tools,
+        [("node".into(), true), ("/opt/uv/python/bin/python3.12".into(), false), ("/opt/uv/python/bin/python3.12".into(), false)]
+    );
+    let notice = notice(super::pyright::LABEL, &told[0]).unwrap();
+    assert!(notice.starts_with("✻ pyright needs node, which the sandbox can't see"), "{notice}");
+    assert_eq!(checker.state(), "ready");
+}
+
+/// A uv venv (`.venv/bin/python` linking into `~/.local/share/uv/python`, which the sandbox hides): found by reading
+/// the link before anything runs, said once a session, and nothing runs.
+#[tokio::test]
+async fn a_uv_venv_is_named_once_and_nothing_runs() {
+    let (_dir, project, cache) = python_setup();
+    let home = std::env::var("HOME").unwrap();
+    std::fs::create_dir_all(project.join(".venv/bin")).unwrap();
+    std::os::unix::fs::symlink(
+        format!("{home}/.local/share/uv/python/cpython-3.12-linux-x86_64-gnu/bin/python3.12"),
+        project.join(".venv/bin/python"),
+    )
+    .unwrap();
+    let runs = Runs::checks(vec![]);
+    let checker = checker_of(Arc::new(super::pyright::Pyright), &runs, &cache);
+    let (first, second) = (turn(&checker, &project), turn(&checker, &project));
+    first.before_change().await;
+    second.before_change().await;
+    assert_eq!(runs.all().len(), 0);
+    let results = [first.results(), second.results()].concat();
+    assert!(
+        matches!(&results[..], [
+            CheckOutcome::Failed { reason: FailReason::MissingInterpreter, notify: true, tool: Some(t), .. },
+            CheckOutcome::Failed { reason: FailReason::MissingInterpreter, notify: false, .. },
+        ] if t == "this project's Python (~/.local/share/uv/python/cpython-3.12-linux-x86_64-gnu/bin/python3.12)"),
+        "{results:?}"
+    );
+    let notice = notice(super::pyright::LABEL, &results[0]).unwrap();
+    assert!(
+        notice.starts_with("✻ pyright needs this project's Python (~/.local/share/uv/python/cpython-3.12-linux-x86_64-gnu/bin/python3.12), which the sandbox can't see"),
+        "{notice}"
+    );
+    assert_eq!(first.after_step(vec![edited(Some("a.py"))]).await, None);
+}
+
+/// Output past `MAX_CAPTURE` (thousands of baseline errors in an unconfigured project) is unreadable, and two such
+/// runs in a row turn pyright off for the session instead of rerunning a slow check on every step.
+#[tokio::test]
+async fn pyright_output_over_the_capture_limit_is_unreadable_and_twice_turns_it_off() {
+    let (_dir, project, cache) = python_setup();
+    let huge = CommandResult {
+        output: "x\n".repeat(marv_tools::bash::MAX_CAPTURE / 2) + include_str!("fixtures/pyright-clean.json"),
+        exit_code: Some(0),
+        ..Default::default()
+    };
+    // The same output under the limit reads fine (text before the JSON is skipped).
+    assert_eq!(super::pyright::parse_pyright(&project, &huge.output, Some(0)), Some(vec![]));
+    let runs = Runs::checks(vec![huge.clone(), huge]);
+    let checker = checker_of(Arc::new(super::pyright::Pyright), &runs, &cache);
+    for _ in 0..2 {
+        turn(&checker, &project).before_change().await;
+    }
+    assert_eq!(checker.state(), "off for this session: its output couldn't be read twice in a row");
+    let t = turn(&checker, &project);
+    t.before_change().await;
+    assert_eq!(runs.all().len(), 2);
 }
