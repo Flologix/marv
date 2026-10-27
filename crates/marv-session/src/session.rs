@@ -6050,6 +6050,7 @@ mod turn_tests {
         let session = scripted(&dirs, &provider, |i| i.sessions = Some(sessions.clone()));
         let swap = marv_tools::swap::swap_dir(&sessions.file(&dirs.project, &session.id()));
         std::fs::create_dir_all(swap.parent().unwrap()).unwrap();
+        let _ = std::fs::remove_dir_all(&swap); // the chat's /tmp made the folder at its first turn
         std::fs::write(&swap, "in the way").unwrap();
         let events = collect(go(&session, "first")).await;
         assert_eq!(end_reason(&events), TurnEndReason::Done(StopReason::End));
@@ -6426,6 +6427,7 @@ mod turn_tests {
         collect(go(&session, "first")).await;
         let swap = marv_tools::swap::swap_dir(&sessions.file(&dirs.project, &session.id()));
         std::fs::create_dir_all(swap.parent().unwrap()).unwrap();
+        let _ = std::fs::remove_dir_all(&swap); // the chat's /tmp made the folder at its first turn
         std::fs::write(&swap, "not a folder").unwrap();
         let before = lock(&session.state().conversation.clone()).clone();
         let result = session.compact(None).await.unwrap();

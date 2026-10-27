@@ -149,6 +149,7 @@ async fn a_page_out_writes_swap_before_replacing_the_history() {
     finish(s.send("first", Default::default()).unwrap()).await;
     let swap = marv_tools::swap::swap_dir(&store.file(&root.path().canonicalize().unwrap(), &s.id()));
     std::fs::create_dir_all(swap.parent().unwrap()).unwrap();
+    let _ = std::fs::remove_dir_all(&swap); // the chat's /tmp made the folder at its first turn
     std::fs::write(&swap, "in the way").unwrap();
     let before = s.conversation();
     assert!(matches!(s.compact(None).await.unwrap(), CompactResult::NotCompacted { .. }));
@@ -339,6 +340,7 @@ async fn a_symlinked_swap_folder_is_refused() {
     finish(s.send("first", Default::default()).unwrap()).await;
     let swap = marv_tools::swap::swap_dir(&store.file(&root.path().canonicalize().unwrap(), &s.id()));
     std::fs::create_dir_all(swap.parent().unwrap()).unwrap();
+    let _ = std::fs::remove_dir_all(&swap); // the chat's /tmp made the folder at its first turn
     std::os::unix::fs::symlink(elsewhere.path(), &swap).unwrap();
     let before = s.conversation();
     assert!(matches!(s.compact(None).await.unwrap(), CompactResult::NotCompacted { .. }));
