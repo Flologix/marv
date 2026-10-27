@@ -447,6 +447,8 @@ mod tests {
         let swap = marv_tools::swap::swap_dir(&store.file(root, &session.id));
         std::fs::create_dir_all(&swap).unwrap();
         std::fs::write(swap.join("1.jsonl"), "{}").unwrap();
+        std::fs::create_dir_all(swap.join("tmp")).unwrap(); // the chat's /tmp (marv_tools::swap::scratch_dir)
+        std::fs::write(swap.join("tmp/err.txt"), "x").unwrap();
         store.remove(root, &session.id).await.unwrap();
         assert!(!swap.exists() && !store.file(root, &session.id).exists());
         store.remove(root, &session.id).await.unwrap();

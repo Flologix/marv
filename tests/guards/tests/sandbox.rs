@@ -1128,3 +1128,35 @@ fn instruction_files_never_read_secrets_or_skipped_folders() {
     let note = nested.note_for(&root, &root.join("pkg/a.rs"), "read_file");
     assert!(!note.is_some_and(|n| n.contains("example.com")));
 }
+
+/// **A session's `/tmp` keeps its files from one command to the next, and is its own.** A file the model writes in
+/// `/tmp` in one `bash` call is there in the next call of the same chat (the scratch folder, `<id>.swap/tmp`, 0700),
+/// not in another chat's, and it goes with the saved session.
+///
+/// Proven: dropped `sandbox.scratch = self.scratch_dir()` in `session.rs` → the second call found no file.
+#[tokio::test]
+async fn a_chats_tmp_survives_between_commands_and_isnt_shared() {
+    use marv_guards::{Scripted, TempDir, say, sdk_turn, tool_call, use_tools};
+    use std::os::unix::fs::PermissionsExt;
+    require_sandbox!();
+    let project = TempDir::new("scratch-project");
+    let config = TempDir::new("scratch-config");
+    let write = tool_call("1", "bash", json!({"command": "echo kept > /tmp/err-390.txt"}));
+    let read = tool_call("2", "bash", json!({"command": "cat /tmp/err-390.txt"}));
+    let script = || Scripted::new(vec![use_tools(vec![write.clone()]), use_tools(vec![read.clone()]), say("Done.")]);
+    let run = sdk_turn(project.path(), config.path(), script(), |o| o.persist = marv_session::sdk::Store::Default).await;
+    assert!(run.results[1].output.contains("kept"), "the next command saw it: {}", run.results[1].output);
+    // On disk, private, inside the chat's swap folder under the config's sessions.
+    let scratch = std::fs::read_dir(config.path().join("sessions"))
+        .unwrap()
+        .flat_map(|project| std::fs::read_dir(project.unwrap().path()).unwrap())
+        .map(|e| e.unwrap().path().join("tmp"))
+        .find(|p| p.join("err-390.txt").exists())
+        .expect("the file is in a chat's scratch folder");
+    assert_eq!(std::fs::metadata(&scratch).unwrap().permissions().mode() & 0o777, 0o700);
+    assert!(scratch.parent().unwrap().to_string_lossy().ends_with(".swap"));
+    // Another chat (a new session) starts with an empty /tmp.
+    let other = Scripted::new(vec![use_tools(vec![read.clone()]), say("Done.")]);
+    let run = sdk_turn(project.path(), config.path(), other, |o| o.persist = marv_session::sdk::Store::Default).await;
+    assert!(!run.results[0].output.contains("kept"), "not shared: {}", run.results[0].output);
+}

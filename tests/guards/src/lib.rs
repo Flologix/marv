@@ -148,6 +148,7 @@ pub fn sandbox_with_home(home: &Path) -> Sandbox {
         hidden: Vec::new(),
         writable: Vec::new(),
         config_dir: Some(home.join(".marv")),
+        scratch: None,
         assume_backend: false,
     }
 }

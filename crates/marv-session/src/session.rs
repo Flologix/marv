@@ -2011,6 +2011,8 @@ impl MarvSession {
         // The config's extra writable folders (#98) ride in every command's sandbox (an approved command's own
         // writable mounts, e.g. a worktree's .git, still go on top).
         sandbox.writable = init.writable.clone();
+        // The conversation's own /tmp, kept between its commands and gone with the conversation.
+        sandbox.scratch = self.scratch_dir();
         ctx.sandbox = Arc::new(sandbox);
         ctx.home = ctx.sandbox.home.clone();
         ctx.cancel = stop.clone();
@@ -2788,6 +2790,15 @@ impl MarvSession {
             }
         }
         facts
+    }
+
+    /// The conversation's scratch folder (`/tmp` in its sandbox), inside its swap folder: held like the pages (so the
+    /// startup cleanup leaves it alone) and removed with the saved session. `None` without a session store, or when it
+    /// can't be made: `/tmp` is then empty for each command, as before.
+    fn scratch_dir(&self) -> Option<PathBuf> {
+        let dir = self.swap_dir()?;
+        self.hold_swap();
+        marv_tools::swap::scratch_dir(&dir).ok()
     }
 
     /// Holds this conversation's swap folder (made if missing; never through a symlink) for as long as it's current.

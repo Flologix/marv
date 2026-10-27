@@ -108,7 +108,12 @@ pub fn sandbox_args(opts: &SandboxOptions, fs: &dyn FsProbe) -> Result<Vec<OsStr
         "--proc".as_ref(),
         "/proc".as_ref(),
     ]);
-    push(&["--tmpfs".as_ref(), "/tmp".as_ref(), "--tmpfs".as_ref(), home]);
+    // /tmp: the session's scratch folder when it has one (first, while its real path is still shown), else empty.
+    match &opts.scratch {
+        Some(scratch) => push(&["--bind".as_ref(), scratch.as_os_str(), "/tmp".as_ref()]),
+        None => push(&["--tmpfs".as_ref(), "/tmp".as_ref()]),
+    }
+    push(&["--tmpfs".as_ref(), home]);
     args.extend(run_mounts(&opts.path, opts.network, fs));
     // The mesh plug (marv-rs): after the empty /run, which would hide it otherwise. A read-only bind wouldn't stop
     // connect() anyway, and the plug only speaks the switchboard's protocol (docs/MESH.md).
@@ -585,6 +590,20 @@ mod tests {
     }
     fn strings(opts: &SandboxOptions, fs: &dyn FsProbe) -> Vec<String> {
         sandbox_args(opts, fs).unwrap().into_iter().map(|s| s.to_string_lossy().into_owned()).collect()
+    }
+
+    #[test]
+    fn tmp_is_the_sessions_scratch_folder_when_it_has_one_else_an_empty_tmpfs() {
+        let fs = default_fs();
+        let plain = joined(&base(), &fs);
+        assert!(plain.contains("--tmpfs /tmp "), "{plain}");
+        let opts = SandboxOptions { scratch: Some("/home/me/.marv/sessions/p/s.swap/tmp".into()), ..base() };
+        let args = joined(&opts, &fs);
+        assert!(args.contains("--bind /home/me/.marv/sessions/p/s.swap/tmp /tmp "), "{args}");
+        assert!(!args.contains("--tmpfs /tmp "), "{args}");
+        // Before the hidden folders, so the real path is still there to bind; the TMPDIR is /tmp either way.
+        assert!(args.find("--bind /home/me/.marv/sessions").unwrap() < args.find("--tmpfs /home/me ").unwrap(), "{args}");
+        assert!(args.contains("--setenv TMPDIR /tmp"), "{args}");
     }
 
     #[test]

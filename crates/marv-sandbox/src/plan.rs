@@ -67,6 +67,10 @@ pub struct Plan {
     /// Marv's config folder (`~/.marv` or `MARV_CONFIG_DIR`): an empty tmpfs in the sandbox wherever it is, its
     /// `skills/` shown again read-only (marv-rs). Inside the stand-in home it's hidden already.
     pub config_dir: Option<PathBuf>,
+    /// The session's scratch folder, bound read-write at `/tmp` in place of the empty tmpfs, so what a command writes
+    /// there is still there for the next one (marv-rs; bubblewrap only: Seatbelt's `TMPDIR` is per command). It's
+    /// mounted before anything is hidden, so a path of it under a hidden folder still works.
+    pub scratch: Option<PathBuf>,
 }
 
 /// One of [`Plan::binds`]: `source` on the host, at `dest` in the sandbox (for bubblewrap; a backend without mounts

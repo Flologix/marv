@@ -75,6 +75,27 @@ pub fn swap_dir(session_file: &Path) -> PathBuf {
     session_file.with_extension(SWAP_SUFFIX)
 }
 
+/// The scratch folder inside a swap folder: the session's `/tmp` in the sandbox.
+pub const SCRATCH: &str = "tmp";
+
+/// A session's scratch folder (`<id>.swap/tmp`), made 0700 if missing: what the session's commands see as `/tmp`, so a
+/// file one command writes there is there for the next, and it goes with the session (`SessionStore::remove`, the
+/// swap cleanup). Never through a symlink. Per session: another chat has its own.
+pub fn scratch_dir(swap: &Path) -> std::io::Result<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    check_dir(swap)?;
+    let dir = swap.join(SCRATCH);
+    match std::fs::symlink_metadata(&dir) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+            return Err(std::io::Error::other(format!("{} is not a folder", dir.display())));
+        }
+        Ok(_) => {}
+        Err(_) => std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir)?,
+    }
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    Ok(dir)
+}
+
 fn page_file(dir: &Path, page: u32) -> PathBuf {
     dir.join(format!("{page}.jsonl"))
 }
@@ -389,6 +410,29 @@ pub(crate) mod tests {
 
     fn user(text: &str) -> ChatTurn {
         ChatTurn::User { text: text.into() }
+    }
+
+    #[test]
+    fn the_scratch_folder_is_private_made_once_and_never_a_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new("scratch");
+        let swap = dir.path().join("s1.swap");
+        let scratch = scratch_dir(&swap).unwrap();
+        assert_eq!(scratch, swap.join("tmp"));
+        assert_eq!(std::fs::metadata(&scratch).unwrap().permissions().mode() & 0o777, 0o700);
+        std::fs::write(scratch.join("err.txt"), "kept").unwrap();
+        assert_eq!(scratch_dir(&swap).unwrap(), scratch, "the same folder next time");
+        assert_eq!(std::fs::read_to_string(scratch.join("err.txt")).unwrap(), "kept");
+        // Another session's is its own.
+        assert_ne!(scratch_dir(&dir.path().join("s2.swap")).unwrap(), scratch);
+        // A symlink in its place is refused, not followed.
+        let other = dir.path().join("s3.swap");
+        std::fs::create_dir_all(&other).unwrap();
+        std::os::unix::fs::symlink(dir.path(), other.join("tmp")).unwrap();
+        assert!(scratch_dir(&other).is_err());
+        assert!(scratch_dir(&dir.path().join("s4.swap").with_file_name("s5.swap")).is_ok());
+        // It isn't a page.
+        assert!(saved_pages(&swap).is_empty());
     }
 
     /// A page with a user message, a read, a web fetch and an edit (shared with `swap`'s tests).
