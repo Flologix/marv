@@ -1080,6 +1080,7 @@ impl Bridge {
         init.max_steps = Some(config.max_steps);
         (init.sandbox, init.yolo, init.diagnostics, init.checks, init.mcp_tools) =
             (config.sandbox, config.yolo, config.diagnostics, config.checks, config.mcp_tools);
+        init.approve_sandboxed = config.approve_sandboxed;
         init.formatter = config.formatter;
         init.compact_tokens = config.compact_tokens;
         (init.compaction, init.compact_tail_tokens) = (config.compaction, config.compact_tail_tokens);

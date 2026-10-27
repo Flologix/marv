@@ -14,7 +14,7 @@
 //! - Flow: parse JSON (else `repair_json_args`) → schema-guided repair (#65, [`schema_repaired`]) → the tool's
 //!   `repair` → validate → label → if gated: preview (a
 //!   `ToolError` fails the call before anyone is asked) → aborted? interrupted → the tool's own prompt
-//!   (`approve_itself`, #77; never for a protected path) → else yolo + `auto_safe`: run confined → no approver: "no
+//!   (`approve_itself`, #77; never for a protected path) → else yolo + `auto_safe` (or `approveSandboxed` + `auto_sandboxed`: bash in the sandbox): run confined → no approver: "no
 //!   one to ask" → approve → either answer: unavailable / no (aborted → interrupted) / yes / always → run.
 //! - Right before any run (ungated, yolo or approved), the turn's checkpoint (#16) when the tool takes one
 //!   (`Tool::checkpoint`); a stop while it's taken returns "interrupted" instead of running.
@@ -318,7 +318,11 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
             // remembered "always" and no worktree subagent's automatic yes answers it.
             let once = asked_every_time(tool.as_ref(), input, ctx) || home_write || tainted_sink;
             // Yolo: a call the tool vouches for runs without asking, confined (bash then can't touch .git).
-            if ctx.yolo && ctx.mode.auto_approval() && !must_ask && !home_write && tool.auto_safe(input, ctx) {
+            // `approveSandboxed` (the default): bash in the sandbox without network runs the same way, in a turn the
+            // person started or a wake; yolo or not.
+            let yolo_runs = ctx.yolo && ctx.mode.auto_approval() && tool.auto_safe(input, ctx);
+            let sandboxed_runs = ctx.approve_sandboxed && ctx.mode.runs_sandboxed_unasked() && tool.auto_sandboxed(input, ctx);
+            if (yolo_runs || sandboxed_runs) && !must_ask && !home_write {
                 if !checkpointed().await {
                     return interrupted(Approval::Interrupted);
                 }

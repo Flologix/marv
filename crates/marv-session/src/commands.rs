@@ -327,7 +327,7 @@ pub fn commands() -> &'static [Command] {
         Command {
             name: "yolo",
             while_busy: true,
-            description: "Run what the sandbox confines without asking (/yolo on, /yolo off)",
+            description: "Run edits and sandboxed commands without asking (/yolo on, /yolo off)",
             run: |args, ctx| match on_off(args, "Usage: /yolo, /yolo on, or /yolo off") {
                 Ok(on) => CommandAction::Yolo { on: on.unwrap_or(!ctx.config.yolo) },
                 Err(e) => e,
@@ -1009,10 +1009,14 @@ pub fn trajectories_status(config: &Config, path: Option<&str>) -> String {
 /// What yolo mode does with this config, for the notice when it's turned on.
 pub fn yolo_status(config: &Config, sandbox_available: bool) -> String {
     if !config.yolo {
-        return "Yolo off: every change asks first.".into();
+        return if config.approve_sandboxed && config.sandbox && sandbox_available {
+            "Yolo off: file changes ask first. Sandboxed commands without network still run without asking (set approveSandboxed to \"ask\" in ~/.marv/config.json to be asked).".into()
+        } else {
+            "Yolo off: every change asks first.".into()
+        };
     }
     if config.sandbox && sandbox_available {
-        "Yolo on: sandboxed commands and file edits run without asking. Network access, git changes (git_write), edits inside .git, and memory still ask.".into()
+        "Yolo on: sandboxed commands and file edits run without asking. Network access, git changes (git_write), edits inside .git, and memory still ask. (Sandboxed commands run without asking even with yolo off, unless approveSandboxed is \"ask\" in ~/.marv/config.json.)".into()
     } else {
         format!(
             "Yolo on: file edits run without asking. Commands still ask: {}, so nothing confines them.",

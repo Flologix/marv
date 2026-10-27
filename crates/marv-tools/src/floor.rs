@@ -49,6 +49,13 @@ impl CallMode {
         matches!(self, Self::Person | Self::Headless | Self::Subagent { unattended: false })
     }
 
+    /// Whether `approveSandboxed` applies: the person's turn, or one a mesh wake started (the sandbox is what makes
+    /// it safe to run what another agent's message led to). Not `marv -p` (its `--approve` flags are the contract),
+    /// and not the radio's turns.
+    pub fn runs_sandboxed_unasked(self) -> bool {
+        matches!(self, Self::Person | Self::Woken | Self::Subagent { unattended: false })
+    }
+
     /// The mode of a subagent started in this mode (subagents don't nest).
     pub fn subagent(self) -> Self {
         Self::Subagent { unattended: !self.auto_approval() }

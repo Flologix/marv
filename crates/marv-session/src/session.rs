@@ -416,6 +416,10 @@ pub struct SessionInit {
     /// reads only.
     pub github: bool,
     pub yolo: bool,
+    /// `approveSandboxed` (config; default off here, on in the TUI): a sandboxed command without network runs without
+    /// asking in a person's turn or a wake, yolo or not. Never where `no_yolo` holds, and never in `marv -p`
+    /// (`one_shot`): its `--approve` flags stay the contract.
+    pub approve_sandboxed: bool,
     /// Yolo isn't allowed here, and why (the project is the home folder or above it).
     pub no_yolo: Option<String>,
     pub sessions: Option<Arc<SessionStore>>,
@@ -513,6 +517,7 @@ impl SessionInit {
             host_commands: false,
             github: false,
             yolo: true,
+            approve_sandboxed: false,
             no_yolo: None,
             sessions: None,
             trajectories: None,
@@ -1414,6 +1419,7 @@ impl MarvSession {
             .collect();
         crate::permissions::Permissions {
             yolo,
+            approve_sandboxed: init.approve_sandboxed && init.no_yolo.is_none() && !init.one_shot,
             no_yolo: init.no_yolo.clone(),
             sandbox,
             host_commands: init.host_commands,
@@ -2010,6 +2016,7 @@ impl MarvSession {
         ctx.cancel = stop.clone();
         ctx.approver = approve.clone();
         ctx.yolo = yolo && !unattended;
+        ctx.approve_sandboxed = init.approve_sandboxed && init.no_yolo.is_none() && !init.one_shot;
         // Who started the turn, as one value (`marv_tools::floor`): a radio turn or one handling radio requests, a
         // wake, `marv -p`, or the person.
         ctx.mode = if radio_turn || handles_requests {

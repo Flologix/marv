@@ -15,6 +15,7 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ### Changed
 
+- **Sandboxed commands run without asking by default.** A `bash` command that runs in the sandbox without network (no `network`, `git_write` or `sandbox: false`) no longer asks in a turn you typed or one a mesh message woke, with yolo on or off. Network commands, git changes, `.git`, protected paths, memory, and anything that asks once the conversation holds outside text still ask; with no working sandbox every command asks. File edits and `process start` keep their rules, and `marv -p` still goes by `--approve`. Set `"approveSandboxed": "ask"` in `~/.marv/config.json` to be asked for each command again.
 - The project moved to github.com/Flologix/marv; install.sh, the npm package metadata and the docs point there. Old links redirect.
 
 ### Removed

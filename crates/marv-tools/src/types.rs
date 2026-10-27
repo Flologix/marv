@@ -379,6 +379,10 @@ pub struct ToolContext {
     pub sandbox: Arc<Sandbox>,
     /// Yolo mode: calls whose tool says they're safe (`auto_safe`) run without asking.
     pub yolo: bool,
+    /// `approveSandboxed` (default on in the TUI): a sandboxed command without network runs without asking
+    /// ([`Tool::auto_sandboxed`]), in a turn the person started or a mesh wake ([`CallMode::runs_sandboxed_unasked`]),
+    /// yolo or not. Taint, `must_ask` and the other asks still apply.
+    pub approve_sandboxed: bool,
     /// Who started the turn this call runs in ([`CallMode`]), set by the session and nothing else. In a turn the person
     /// at this Marv didn't start (a mesh wake, #78; the radio, #124) automatic approval is off
     /// ([`CallMode::auto_approval`]): yolo doesn't apply, a URL prefix approved earlier doesn't either, and every call
@@ -470,6 +474,7 @@ impl ToolContext {
             approver: None,
             sandbox: Arc::new(sandbox),
             yolo: false,
+            approve_sandboxed: false,
             mode: CallMode::Person,
             confined: false,
             skills: Arc::new(Vec::new()),
@@ -635,6 +640,12 @@ pub trait Tool: Send + Sync + 'static {
     fn auto_safe(&self, _input: &Self::Input, _ctx: &ToolContext) -> bool {
         false
     }
+    /// Whether the call may run without asking when `ToolContext::approve_sandboxed` is on (default for a person's
+    /// or a woken turn), with or without yolo: only bash says yes, for a command confined to the sandbox. Default:
+    /// no, so edits, processes and everything else keep their own rules.
+    fn auto_sandboxed(&self, _input: &Self::Input, _ctx: &ToolContext) -> bool {
+        false
+    }
     /// The protected path this call would change, if any (marv-rs): it then asks even in yolo.
     fn protected_target(&self, _input: &Self::Input, _ctx: &ToolContext) -> Option<ProtectedRule> {
         None
@@ -706,6 +717,7 @@ pub trait DynTool: Send + Sync {
     async fn preview(&self, input: In<'_>, ctx: &ToolContext) -> Result<Preview, ToolError>;
     fn scope(&self, input: In<'_>, ctx: &ToolContext) -> Option<Scope>;
     fn auto_safe(&self, input: In<'_>, ctx: &ToolContext) -> bool;
+    fn auto_sandboxed(&self, input: In<'_>, ctx: &ToolContext) -> bool;
     fn protected_target(&self, input: In<'_>, ctx: &ToolContext) -> Option<ProtectedRule>;
     fn repair(&self, raw: &Value, ctx: &ToolContext) -> Option<Repaired>;
     fn repair_mode(&self) -> RepairMode;
@@ -770,6 +782,9 @@ impl<T: Tool> DynTool for T {
     }
     fn auto_safe(&self, input: In<'_>, ctx: &ToolContext) -> bool {
         Tool::auto_safe(self, typed::<T>(input), ctx)
+    }
+    fn auto_sandboxed(&self, input: In<'_>, ctx: &ToolContext) -> bool {
+        Tool::auto_sandboxed(self, typed::<T>(input), ctx)
     }
     fn protected_target(&self, input: In<'_>, ctx: &ToolContext) -> Option<ProtectedRule> {
         Tool::protected_target(self, typed::<T>(input), ctx)

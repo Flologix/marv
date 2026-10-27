@@ -708,6 +708,11 @@ impl Tool for Bash {
             && !input.git_write.unwrap_or(false)
             && input.sandbox != Some(false)
     }
+    /// `approveSandboxed`: the same confinement yolo needs. The registry still asks for taint's network and egress
+    /// rules first.
+    fn auto_sandboxed(&self, input: &BashInput, ctx: &ToolContext) -> bool {
+        self.auto_safe(input, ctx)
+    }
     /// The timeout given in milliseconds (#10), and the escalation of #81: a sandboxed command without network whose
     /// key ([`marv_core::command::command_key`]) already failed like the missing network runs with `network: true`
     /// instead, so it goes through the approval for network like any network command (asked, or an "always" for its
