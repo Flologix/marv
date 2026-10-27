@@ -305,7 +305,8 @@ mod tests {
         // One model: no breakdown. An old file (no `models`) loads; the key is written only when there is one.
         let one = add_model_usage(&Totals::default(), "m", &usage(10, 1, None, None), &Prices::default());
         assert!(!usage_report(&one, None, None).contains("By model"));
-        let old: Totals = serde_json::from_str(r#"{"requests":4,"promptTokens":9,"cachedTokens":0,"completionTokens":1}"#).unwrap();
+        let old: Totals =
+            serde_json::from_str(r#"{"requests":4,"promptTokens":9,"cachedTokens":0,"completionTokens":1}"#).unwrap();
         assert!(old.models.is_empty() && old.requests == 4);
         assert!(!serde_json::to_string(&old).unwrap().contains("models"));
         assert_eq!(serde_json::from_str::<Totals>(&serde_json::to_string(&t).unwrap()).unwrap(), t);

@@ -295,8 +295,8 @@ impl SessionStore {
     /// and no request. A chat that only ever ran turns a mesh message woke has no user message, but its history and
     /// cost are worth keeping.
     pub async fn save(&self, session: &SavedSession) -> std::io::Result<()> {
-        let had_a_turn = session.transcript.iter().any(|m| matches!(m.role, Role::User | Role::Assistant))
-            || session.totals.requests > 0;
+        let had_a_turn =
+            session.transcript.iter().any(|m| matches!(m.role, Role::User | Role::Assistant)) || session.totals.requests > 0;
         if !had_a_turn {
             return Ok(());
         }
