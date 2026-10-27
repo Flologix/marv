@@ -549,6 +549,8 @@ pub struct Configure {
     pub thinking: Option<bool>,
     pub sandbox: Option<bool>,
     pub yolo: Option<bool>,
+    /// `approveSandboxed`: from the next turn (it is still never on where `no_yolo` holds, or for `marv -p`).
+    pub approve_sandboxed: Option<bool>,
     pub trajectories: Option<bool>,
     pub diagnostics: Option<Diagnostics>,
     pub checks: Option<bool>,
@@ -713,6 +715,7 @@ struct State {
     system: String,
     sandbox: bool,
     yolo: bool,
+    approve_sandboxed: bool,
     diagnostics: Diagnostics,
     checks: bool,
     compact_tokens: Option<u64>,
@@ -1228,6 +1231,7 @@ impl MarvSession {
             system: String::new(),
             sandbox: init.sandbox,
             yolo: init.yolo,
+            approve_sandboxed: init.approve_sandboxed,
             diagnostics: init.diagnostics,
             checks: init.checks,
             compact_tokens: init.compact_tokens,
@@ -1408,9 +1412,9 @@ impl MarvSession {
     }
     /// What the session may do without asking, now (`/permissions`, #82): a copy, for showing only.
     pub fn permissions(&self) -> crate::permissions::Permissions {
-        let (yolo, sandbox) = {
+        let (yolo, sandbox, approve_sandboxed) = {
             let s = self.state();
-            (s.yolo, s.sandbox)
+            (s.yolo, s.sandbox, s.approve_sandboxed)
         };
         let init = &self.inner.init;
         let doors = [("github", init.github), ("process", self.inner.process_on), ("herdr", init.herdr.is_some())]
@@ -1419,7 +1423,11 @@ impl MarvSession {
             .collect();
         crate::permissions::Permissions {
             yolo,
-            approve_sandboxed: init.approve_sandboxed && init.no_yolo.is_none() && !init.one_shot,
+            // What's in effect: also off where the sandbox isn't working, as for the call itself (`auto_safe`).
+            approve_sandboxed: approve_sandboxed
+                && init.no_yolo.is_none()
+                && !init.one_shot
+                && marv_sandbox::Sandbox::from_env(sandbox).active(),
             no_yolo: init.no_yolo.clone(),
             sandbox,
             host_commands: init.host_commands,
@@ -1786,11 +1794,25 @@ impl MarvSession {
         let turn_specs = init.mcp.as_ref().map(|m| m.specs()).unwrap_or_default();
         self.state().turn_mcp_specs = turn_specs.clone();
         let (specs, tools) = self.offered();
-        let (sandbox, yolo, factory, provider, info, diagnostics, checks_on, formatter, max_steps, history, system) = {
+        let (
+            sandbox,
+            yolo,
+            approve_sandboxed,
+            factory,
+            provider,
+            info,
+            diagnostics,
+            checks_on,
+            formatter,
+            max_steps,
+            history,
+            system,
+        ) = {
             let s = self.state();
             (
                 s.sandbox,
                 s.yolo,
+                s.approve_sandboxed,
                 s.factory.clone(),
                 s.provider.clone(),
                 s.info.clone(),
@@ -2018,7 +2040,7 @@ impl MarvSession {
         ctx.cancel = stop.clone();
         ctx.approver = approve.clone();
         ctx.yolo = yolo && !unattended;
-        ctx.approve_sandboxed = init.approve_sandboxed && init.no_yolo.is_none() && !init.one_shot;
+        ctx.approve_sandboxed = approve_sandboxed && init.no_yolo.is_none() && !init.one_shot;
         // Who started the turn, as one value (`marv_tools::floor`): a radio turn or one handling radio requests, a
         // wake, `marv -p`, or the person.
         ctx.mode = if radio_turn || handles_requests {
@@ -2811,6 +2833,8 @@ impl MarvSession {
         if std::fs::symlink_metadata(&dir).is_ok_and(|m| !m.is_dir()) {
             return;
         }
+        // Once per session start or resume: a chat's /tmp that has grown past the cap starts empty.
+        marv_tools::swap::trim_scratch(&dir, marv_tools::swap::SCRATCH_CAP_BYTES);
         *held = marv_tools::output::hold(&dir).ok().map(|h| (dir, h));
     }
 
@@ -3471,6 +3495,9 @@ impl MarvSession {
         }
         if let Some(v) = changes.yolo {
             s.yolo = v;
+        }
+        if let Some(v) = changes.approve_sandboxed {
+            s.approve_sandboxed = v;
         }
         if let Some(v) = changes.trajectories {
             s.logging = v;

@@ -161,7 +161,7 @@ pub fn permissions_text(p: &Permissions, saved: Option<SavedGrants>, mcp: Option
     let mut basics = vec![format!("- **Yolo**: {yolo}"), format!("- **Sandbox**: {sandbox}")];
     if p.approve_sandboxed && p.sandbox {
         basics.push(
-            "- **Sandboxed commands**: run without asking when they need no network, even with yolo off (`approveSandboxed: \"ask\"` in your config turns this off)"
+            "- **Sandboxed commands**: run without asking when they need no network, even with yolo off (`approveSandboxed: \"ask\"` in your config turns this off; `/yolo off` does too unless `approveSandboxed` is set)"
                 .into(),
         );
     }
@@ -226,7 +226,7 @@ pub fn permissions_text(p: &Permissions, saved: Option<SavedGrants>, mcp: Option
     always.push(
         format!(
             "- a turn you didn't start (a mesh or radio message woke it) uses none of this: no yolo, no \"always\", nothing pre-approved; everything asks{}",
-            if p.approve_sandboxed && p.sandbox { ", except that a mesh wake still runs sandboxed commands without network" } else { "" }
+            if p.approve_sandboxed && p.sandbox { ", except that a mesh wake still runs sandboxed commands without network, with the project read-only" } else { "" }
         ),
     );
     parts.push(always.join("\n"));
