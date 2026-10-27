@@ -17,6 +17,10 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 - The project moved to github.com/Flologix/marv; install.sh, the npm package metadata and the docs point there. Old links redirect.
 
+### Changed
+
+- **An edit of a file Marv hadn't read no longer costs an extra step.** `edit_file` and `write_file` still refuse to change an existing file the conversation never read, but the refusal now shows the file as it is now (the whole file up to 400 lines, else 400 lines around `old_string`), and that counts as reading it, so the model's next call can go through without a `read_file` first. Models often read files with `bash` (`cat`, `sed -n`), which Marv doesn't track: in a benchmark run on GLM-5.3-flash and DeepSeek-v4.1-flash, this refusal was 50 of the 86 tool errors in Marv's evals. A file that changed since the conversation last saw it is refused exactly as before, with no text: it must be read again. Secrets (`.env*`, `*.pem`, `id_*`) and binary files are never shown.
+
 ### Removed
 
 - **The desktop app and the browser UI.** The desktop app (`app/`) and the browser UI (`marv-web`) are no longer part of Marv: Marv is the terminal coding agent. Releases up to 0.11.0 keep them in their source. The `marv` command, `marv -p` and the mesh are unchanged.

@@ -79,7 +79,8 @@ pub async fn plan(input: &WriteFileInput, ctx: &ToolContext) -> Result<Plan, Too
         require_regular_file(&absolute, &shown)?;
         let before = tokio::fs::read_to_string(&absolute).await.map_err(|e| ToolError(format!("Couldn't read {shown}: {e}")))?;
         // marv-rs: an existing file only as this session last read or wrote it (`file_versions`); a new one is fine.
-        ctx.file_versions.check(&absolute, &shown, before.as_bytes())?;
+        // Never read at all: the refusal shows the file, and the next call can succeed (marv-rs).
+        ctx.file_versions.check_showing(&absolute, &shown, &before, None)?;
         Some(before)
     } else {
         None
@@ -985,12 +986,30 @@ mod tests {
     async fn an_existing_file_never_read_is_refused_and_a_new_one_isnt() {
         let f = Fixture::new("w-unread");
         f.root.write("theirs.txt", "keep\n");
-        let out = f.run("write_file", json!({"path": "theirs.txt", "content": "x\n"})).await.result;
-        assert_eq!(out.output, crate::file_versions::never_read("theirs.txt"));
+        // Refused, nothing written and no one asked; the refusal shows the file as it is now (marv-rs), which counts
+        // as reading it, so the next call works without a read_file.
+        for (tool, args) in [
+            ("write_file", json!({"path": "theirs.txt", "content": "x\n"})),
+            ("edit_file", json!({"path": "theirs.txt", "old_string": "keep", "new_string": "x"})),
+        ] {
+            let f = Fixture::new("w-unread-shown");
+            f.root.write("theirs.txt", "keep\n");
+            let out = f.run(tool, args.clone()).await.result;
+            assert!(out.is_error, "{tool}");
+            assert_eq!(out.output, crate::file_versions::never_read_shown("theirs.txt", "    1→keep"), "{tool}");
+            assert_eq!(f.read("theirs.txt"), "keep\n", "{tool}");
+            assert!(f.asked().is_empty(), "{tool}");
+            let out = f.run(tool, args).await.result;
+            assert!(!out.is_error, "{tool}: {}", out.output);
+            assert_eq!(f.read("theirs.txt"), "x\n", "{tool}");
+        }
+        // Changed by someone else after it was shown: refused as any stale write, without its text.
         let out = f.run("edit_file", json!({"path": "theirs.txt", "old_string": "keep", "new_string": "x"})).await.result;
-        assert_eq!(out.output, crate::file_versions::never_read("theirs.txt"));
-        assert_eq!(f.read("theirs.txt"), "keep\n");
-        assert!(f.asked().is_empty());
+        assert!(out.is_error);
+        f.root.write("theirs.txt", "theirs now\n");
+        let out = f.run("edit_file", json!({"path": "theirs.txt", "old_string": "theirs", "new_string": "x"})).await.result;
+        assert_eq!(out.output, crate::file_versions::changed_since_read("theirs.txt"));
+        assert_eq!(f.read("theirs.txt"), "theirs now\n");
         // A new file, then the session's own writes over it: each is the version it has seen.
         assert!(!f.run("write_file", json!({"path": "mine.txt", "content": "one\n"})).await.result.is_error);
         assert!(!f.run("write_file", json!({"path": "mine.txt", "content": "two\n", "append": true})).await.result.is_error);

@@ -114,7 +114,8 @@ pub async fn plan(input: &EditFileInput, ctx: &ToolContext) -> Result<Plan, Tool
     require_regular_file(&absolute, &shown)?;
     let before = tokio::fs::read_to_string(&absolute).await.map_err(|e| ToolError(format!("Couldn't read {shown}: {e}")))?;
     // marv-rs: only over the version this session last read or wrote (`file_versions`): old_string came from it.
-    ctx.file_versions.check(&absolute, &shown, before.as_bytes())?;
+    // Never read at all: the refusal shows the file around old_string, and the next call can succeed (marv-rs).
+    ctx.file_versions.check_showing(&absolute, &shown, &before, Some(&input.old_string))?;
     match apply_edit(&before, &input.old_string, &input.new_string, input.replace_all.unwrap_or(false)) {
         EditResult::Ambiguous { count } => Err(ToolError(format!(
             "old_string appears {count} times in {shown}. Include more of the surrounding lines so it matches exactly once, or set replace_all to change all {count}."

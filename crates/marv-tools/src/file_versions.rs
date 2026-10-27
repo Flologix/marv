@@ -14,7 +14,16 @@
 //!   preview (so a stale call fails before anyone is asked) and again at apply time under the file lock, which also
 //!   locks across processes, so two writers can't both pass the check. A file the session never read is refused the
 //!   same way. A new file needs no read;
-//! - a refusal writes nothing and tells the model to read the file again. When the session's own last write may not
+//! - a refusal writes nothing and tells the model to read the file again. marv-rs: when the session never read the
+//!   file at all, the edit tools' refusal ([`FileVersions::check_showing`]) shows it as it is now instead (the whole
+//!   file up to [`crate::read_file::DEFAULT_LIMIT`] lines, else that many around `old_string`), numbered like
+//!   `read_file`, and that shown version is recorded as seen: the model now has it, as if it had called `read_file`,
+//!   so its next call can succeed without one. In a benchmark run, 50 of 86 tool errors in Marv's
+//!   evals were this refusal, for files the model had read with `bash` (`cat`, `sed -n`), each costing a step plus a
+//!   `read_file`. Only the never-read case: a file that changed since the session saw it is still refused with no
+//!   text, and must be read again. A secret's name (`.env*`, `*.pem`, `id_*`, which need approval to read) and a
+//!   binary file are never shown: the plain refusal stands. Counting a `bash` read as seen was the other option; it
+//!   was left out because proving what a command printed is harder than recording what Marv itself shows. When the session's own last write may not
 //!   have landed as planned (it failed, or the file changed right after it), the refusal says so instead of blaming
 //!   someone else ([`FileVersions::unsure`]).
 //!
@@ -34,6 +43,7 @@ use std::sync::Mutex;
 
 use sha2::{Digest, Sha256};
 
+use crate::read_file::DEFAULT_LIMIT;
 use crate::types::ToolError;
 
 type Hash = [u8; 32];
@@ -137,20 +147,86 @@ impl FileVersions {
         self.inner().files.get(&key(path)).is_some_and(|e| e.hash == content_hash(current))
     }
 
-    /// Ok when the session may write over `path` (shown as `shown`), which exists and holds `current`; otherwise
-    /// the refusal the model reads.
-    pub fn check(&self, path: &Path, shown: &str, current: &[u8]) -> Result<(), ToolError> {
+    /// Whether the session may write over `path`, which holds `current`.
+    fn verdict(&self, path: &Path, current: &[u8]) -> Verdict {
         let mut inner = self.inner();
         inner.clock += 1;
         let now = inner.clock;
-        let Some(entry) = inner.files.get_mut(&key(path)) else { return Err(ToolError(never_read(shown))) };
+        let Some(entry) = inner.files.get_mut(&key(path)) else { return Verdict::NeverRead };
         entry.used = now;
         match (entry.hash == content_hash(current), entry.origin) {
-            (true, _) => Ok(()),
-            (false, Origin::Seen) => Err(ToolError(changed_since_read(shown))),
-            (false, Origin::Unsure) => Err(ToolError(not_as_you_left_it(shown))),
+            (true, _) => Verdict::Current,
+            (false, Origin::Seen) => Verdict::Changed,
+            (false, Origin::Unsure) => Verdict::Unsure,
         }
     }
+
+    /// Ok when the session may write over `path` (shown as `shown`), which exists and holds `current`; otherwise
+    /// the refusal the model reads.
+    pub fn check(&self, path: &Path, shown: &str, current: &[u8]) -> Result<(), ToolError> {
+        match self.verdict(path, current) {
+            Verdict::Current => Ok(()),
+            Verdict::NeverRead => Err(ToolError(never_read(shown))),
+            Verdict::Changed => Err(ToolError(changed_since_read(shown))),
+            Verdict::Unsure => Err(ToolError(not_as_you_left_it(shown))),
+        }
+    }
+
+    /// [`Self::check`] for the edit tools: a file the session never read is refused all the same (nothing is written),
+    /// but the refusal shows it as it is now ([`unread_page`]: around `near`, edit_file's `old_string`, when the file
+    /// is long), and that version counts as seen, as a `read_file` of it would. Only what is shown is recorded, from the
+    /// same `current` the check looked at, so a change after this is still refused. A secret or a binary file isn't
+    /// shown, and a file that changed since the session saw it gets the ordinary refusal: the stale-write rule is
+    /// unchanged (docs/SECURITY.md).
+    pub fn check_showing(&self, path: &Path, shown: &str, current: &str, near: Option<&str>) -> Result<(), ToolError> {
+        if self.verdict(path, current.as_bytes()) != Verdict::NeverRead {
+            return self.check(path, shown, current.as_bytes());
+        }
+        match unread_page(path, shown, current, near) {
+            Some(page) => {
+                self.saw(path, current.as_bytes());
+                Err(ToolError(never_read_shown(shown, &page)))
+            }
+            None => Err(ToolError(never_read(shown))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    Current,
+    NeverRead,
+    Changed,
+    Unsure,
+}
+
+/// The page of a never-read file its refusal shows, numbered like `read_file`: the whole file up to
+/// [`DEFAULT_LIMIT`] lines; a longer one from a quarter page before `near` (its exact match, else its closest lines),
+/// or from the top. None for a secret's name or a binary file: those get the plain refusal.
+fn unread_page(path: &Path, shown: &str, current: &str, near: Option<&str>) -> Option<String> {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    if marv_sandbox::protected::is_secret_name(&name) || current.contains('\0') {
+        return None;
+    }
+    let total = crate::write_file::line_count(current);
+    let line = near.filter(|s| !s.is_empty()).and_then(|near| match current.find(near) {
+        Some(at) => Some(current[..at].matches('\n').count() + 1),
+        None => crate::edit_match::closest_lines(current, near).map(|(start, _)| start),
+    });
+    let offset = match line {
+        Some(line) if total > DEFAULT_LIMIT => {
+            line.saturating_sub(DEFAULT_LIMIT / 4).clamp(1, total.saturating_sub(DEFAULT_LIMIT) + 1)
+        }
+        _ => 1,
+    };
+    crate::read_file::render(current, offset, DEFAULT_LIMIT, shown).ok().map(|out| out.output)
+}
+
+/// The refusal for an existing file the session never read, with the file as it is now (marv-rs).
+pub fn never_read_shown(shown: &str, page: &str) -> String {
+    format!(
+        "{shown} already exists and you hadn't read it in this conversation, so nothing was written. Here it is as it is now (this counts as reading it):\n{page}\n\nMake your change on this text: if your call already matches it, send the same call again."
+    )
 }
 
 /// The refusal for an existing file the session never read (or read so long ago it was forgotten).
@@ -212,6 +288,63 @@ mod tests {
         seen.unsure(&path, b"planned\n");
         assert!(seen.check(&path, "a.txt", b"planned\n").is_ok(), "it landed after all");
         assert_eq!(seen.check(&path, "a.txt", b"half\n").unwrap_err().0, not_as_you_left_it("a.txt"));
+    }
+
+    #[test]
+    fn a_never_read_file_is_refused_with_its_text_and_then_counts_as_seen() {
+        let root = TempDir::new("versions-shown");
+        root.write("a.txt", "one\ntwo\n");
+        let path = root.path().join("a.txt");
+        let seen = FileVersions::default();
+        let err = seen.check_showing(&path, "a.txt", "one\ntwo\n", Some("two")).unwrap_err().0;
+        assert_eq!(err, never_read_shown("a.txt", "    1→one\n    2→two"));
+        // What was shown is the version the session has now: the retry passes.
+        assert!(seen.check_showing(&path, "a.txt", "one\ntwo\n", Some("two")).is_ok());
+    }
+
+    #[test]
+    fn a_file_changed_after_it_was_shown_or_read_is_still_refused_without_its_text() {
+        // The stale-write rule is unchanged: only the never-read case shows the file.
+        let root = TempDir::new("versions-shown-stale");
+        let path = root.path().join("a.txt");
+        let seen = FileVersions::default();
+        assert!(seen.check_showing(&path, "a.txt", "one\n", None).is_err());
+        assert_eq!(seen.check_showing(&path, "a.txt", "theirs\n", None).unwrap_err().0, changed_since_read("a.txt"));
+        seen.unsure(&path, b"planned\n");
+        assert_eq!(seen.check_showing(&path, "a.txt", "half\n", None).unwrap_err().0, not_as_you_left_it("a.txt"));
+    }
+
+    #[test]
+    fn a_secret_or_a_binary_file_is_never_shown() {
+        let root = TempDir::new("versions-shown-secret");
+        let seen = FileVersions::default();
+        for name in [".env", ".env.local", "server.pem", "id_ed25519"] {
+            let path = root.path().join(name);
+            let err = seen.check_showing(&path, name, "TOKEN=abc\n", None).unwrap_err().0;
+            assert_eq!(err, never_read(name));
+            assert!(!err.contains("TOKEN"));
+            assert_eq!(seen.check_showing(&path, name, "TOKEN=abc\n", None).unwrap_err().0, never_read(name), "not seen");
+        }
+        let path = root.path().join("blob.bin");
+        assert_eq!(seen.check_showing(&path, "blob.bin", "a\0b", None).unwrap_err().0, never_read("blob.bin"));
+    }
+
+    #[test]
+    fn a_long_file_is_shown_around_old_string() {
+        let root = TempDir::new("versions-shown-long");
+        let path = root.path().join("long.txt");
+        let text: String = (1..=1000).map(|n| format!("line {n}\n")).collect();
+        let seen = FileVersions::default();
+        let err = seen.check_showing(&path, "long.txt", &text, Some("line 700\n")).unwrap_err().0;
+        assert!(err.contains("  700→line 700") && err.contains("  600→line 600"), "{err}");
+        assert!(!err.contains("    1→line 1\n") && err.contains("(Showing lines 600-999 of 1000."), "{err}");
+        // Near the end the page still holds DEFAULT_LIMIT lines; with nothing to go by, the top.
+        let seen = FileVersions::default();
+        let err = seen.check_showing(&path, "long.txt", &text, Some("line 1000")).unwrap_err().0;
+        assert!(err.contains("(Showing lines 601-1000 of 1000.)"), "{err}");
+        let seen = FileVersions::default();
+        let err = seen.check_showing(&path, "long.txt", &text, None).unwrap_err().0;
+        assert!(err.contains("(Showing lines 1-400 of 1000."), "{err}");
     }
 
     #[test]
