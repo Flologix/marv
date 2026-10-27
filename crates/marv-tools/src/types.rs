@@ -398,6 +398,9 @@ pub struct ToolContext {
     /// Set by `run_tool` for a call that runs without asking: bash then sees the project's `.git` read-only, and the
     /// edit tools re-check `.git` at apply time.
     pub confined: bool,
+    /// Set by `run_tool` with `confined`, for a call that runs unasked in a turn whose unasked commands may not change
+    /// the project ([`CallMode::sandboxed_unasked_project_read_only`]: a mesh wake): bash then mounts it read-only.
+    pub project_read_only: bool,
     /// Skills the `skill` tool can load.
     pub skills: Arc<Vec<Skill>>,
     pub memory: Option<MemoryPaths>,
@@ -482,6 +485,7 @@ impl ToolContext {
             approve_sandboxed: false,
             mode: CallMode::Person,
             confined: false,
+            project_read_only: false,
             skills: Arc::new(Vec::new()),
             memory: None,
             call_id: None,

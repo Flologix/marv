@@ -49,10 +49,12 @@ with the sandbox off are listed after):
   holding outside text, such a call is asked every time.
 - **Door**: the door out of the sandbox it goes through, if any.
 
-The setting `approveSandboxed` (default `auto`, `~/.marv/config.json`) sits on top too: a `bash` call that runs in the
-working sandbox without network, `git_write` or `sandbox: false` runs without asking in a person's turn and in a woken
-one, yolo or not (`Tool::auto_sandboxed`; never in `marv -p` or a radio turn). `"ask"` turns it off. Edits and processes
-are unchanged.
+The setting `approveSandboxed` (default `auto`, unless the config sets `yolo` to `false`; `~/.marv/config.json`) sits on
+top too: a `bash` call that runs in the working sandbox without network, `git_write` or `sandbox: false` runs without
+asking in a person's turn, yolo or not (`Tool::auto_sandboxed`), and in a woken turn **with the project mounted
+read-only** (`CallMode::sandboxed_unasked_project_read_only`: it can read, and build into the sandbox's `/tmp`, but a
+command that has to change the project asks, as `git_write`). Never in `marv -p` or a radio turn. `"ask"` turns it
+off. Edits and processes are unchanged.
 
 On top of this, a write to a protected path (docs/SECURITY.md: `.git`, a lifecycle script in `package.json`, ...)
 is asked every time, even in yolo, and so is any call to the network once the conversation holds outside text.

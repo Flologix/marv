@@ -539,6 +539,9 @@ fn real_or_self(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// A command that ran unasked in a woken turn failed on the read-only project.
+const WOKEN_READ_ONLY_NOTE: &str = "Marv: this turn was started by another agent's message, so a command that runs without asking sees the project read-only (it can still build into /tmp). To change project files use edit_file or write_file, or set git_write: true on a command that has to write (the user is asked first).";
+
 /// A confined command that failed on the read-only `.git`.
 static GIT_READ_ONLY: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"\.git\b.*Read-only file system").unwrap());
 
@@ -845,7 +848,7 @@ impl Tool for Bash {
             read_only,
             writable: approved_git,
             placeholders: guard.placeholders.clone(),
-            project_read_only: false,
+            project_read_only: ctx.project_read_only,
             env: None,
             forwards: ctx.forwards.as_ref().map(|f| f.forwards()).unwrap_or_default(),
             pipe_check: true,
@@ -863,6 +866,9 @@ impl Tool for Bash {
             if let Some(note) = created_note(&created) {
                 result.output.push_str(&format!("\n{note}\n"));
             }
+        }
+        if ctx.project_read_only && result.output.contains("Read-only file system") {
+            result.output.push_str(&format!("\n{WOKEN_READ_ONLY_NOTE}\n"));
         }
         if ctx.confined && GIT_READ_ONLY.is_match(&result.output) {
             result.output.push_str(&format!("\n{GIT_HINT}\n"));

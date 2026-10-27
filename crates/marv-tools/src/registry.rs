@@ -326,7 +326,9 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
                 if !checkpointed().await {
                     return interrupted(Approval::Interrupted);
                 }
-                let confined = ToolContext { confined: true, ..per_call };
+                // Yolo's turns are a person's; only `approveSandboxed` alone can run in a turn that mustn't change the project.
+                let project_read_only = !yolo_runs && ctx.mode.sandboxed_unasked_project_read_only();
+                let confined = ToolContext { confined: true, project_read_only, ..per_call };
                 return finish(tool.run(input, &confined).await, Some(Approval::Auto));
             }
             let Some(approver) = &ctx.approver else { return no_one_to_ask() };

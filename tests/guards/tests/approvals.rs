@@ -603,15 +603,46 @@ fn sandboxed_ctx(root: &std::path::Path, approver: &Arc<Recorder>, mode: marv_to
 async fn sandboxed_commands_without_network_run_unasked_in_person_and_woken_turns() {
     marv_guards::require_sandbox!();
     let project = TempDir::new("approvals-sandboxed");
-    for mode in [marv_tools::CallMode::Person, marv_tools::CallMode::Woken] {
-        let approver = Recorder::new(Decision::No);
-        let ctx = sandboxed_ctx(project.path(), &approver, mode);
-        let out = run_tool(&call("bash", json!({"command": "echo hi > made.txt"})), &ctx, builtin_tools()).await;
-        assert!(approver.requests().is_empty(), "{mode:?}: nobody was asked");
-        assert!(!out.result.declined && !out.result.is_error, "{mode:?}: {}", out.result.output);
-        assert_eq!(out.result.approval, Some(marv_tools::Approval::Auto));
-        assert_eq!(project.read("made.txt"), Some("hi\n".into()), "{mode:?}: it ran");
-    }
+    project.write("kept.txt", "kept\n");
+    // The person's turn: unasked, and the project is writable.
+    let approver = Recorder::new(Decision::No);
+    let ctx = sandboxed_ctx(project.path(), &approver, marv_tools::CallMode::Person);
+    let out = run_tool(&call("bash", json!({"command": "echo hi > made.txt"})), &ctx, builtin_tools()).await;
+    assert!(approver.requests().is_empty(), "nobody was asked");
+    assert!(!out.result.declined && !out.result.is_error, "{}", out.result.output);
+    assert_eq!(out.result.approval, Some(marv_tools::Approval::Auto));
+    assert_eq!(project.read("made.txt"), Some("hi\n".into()), "it ran");
+}
+
+/// **A woken turn's unasked sandboxed commands see the project read-only (#74):** they read it and build into the
+/// sandbox's /tmp unasked, a write to the project fails (and says why) without asking, and a command that says it
+/// writes (`git_write`) asks.
+#[tokio::test]
+async fn a_woken_turns_unasked_sandboxed_commands_can_read_the_project_but_not_change_it() {
+    marv_guards::require_sandbox!();
+    let project = TempDir::new("approvals-woken-ro");
+    project.write("kept.txt", "kept\n");
+    let approver = Recorder::new(Decision::No);
+    let ctx = sandboxed_ctx(project.path(), &approver, marv_tools::CallMode::Woken);
+    let read = run_tool(
+        &call("bash", json!({"command": "cat kept.txt && echo built > /tmp/out && cat /tmp/out"})),
+        &ctx,
+        builtin_tools(),
+    )
+    .await;
+    assert!(approver.requests().is_empty(), "reading and building into /tmp ask nobody");
+    assert_eq!(read.result.approval, Some(marv_tools::Approval::Auto));
+    assert!(read.result.output.contains("kept") && read.result.output.contains("built"), "{}", read.result.output);
+    let write =
+        run_tool(&call("bash", json!({"command": "echo evil > Makefile; echo changed > kept.txt"})), &ctx, builtin_tools()).await;
+    assert!(approver.requests().is_empty(), "a refused write asks nobody either");
+    assert!(write.result.output.contains("Read-only file system"), "{}", write.result.output);
+    assert!(write.result.output.contains("git_write"), "it says how to ask: {}", write.result.output);
+    assert_eq!(project.read("Makefile"), None);
+    assert_eq!(project.read("kept.txt"), Some("kept\n".into()));
+    let asked = run_tool(&call("bash", json!({"command": "echo x > made.txt", "git_write": true})), &ctx, builtin_tools()).await;
+    assert_eq!(approver.requests().len(), 1, "a command that writes asks");
+    assert!(asked.result.declined && project.read("made.txt").is_none());
 }
 
 /// **The setting never reaches a radio turn, `marv -p`, a woken turn's subagent, nor an `ask` config.**
