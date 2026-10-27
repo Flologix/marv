@@ -266,7 +266,8 @@ pub fn step_limit_request(steps: u32, every: u32) -> ApprovalRequest {
 
 /// Where a subagent's progress, events and usage go (the session turns them into `SessionEvent`s and totals).
 pub trait SubagentSink: Send + Sync {
-    fn usage(&self, usage: &Usage);
+    /// `model`: the model the subagent's type named, when it isn't the turn's.
+    fn usage(&self, usage: &Usage, model: Option<&str>);
     fn progress(&self, call_id: &str, progress: AgentProgress);
     fn event(&self, call_id: &str, event: &LoopEvent);
 }

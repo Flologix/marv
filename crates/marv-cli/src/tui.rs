@@ -1080,6 +1080,7 @@ impl Bridge {
         init.max_steps = Some(config.max_steps);
         (init.sandbox, init.yolo, init.diagnostics, init.checks, init.mcp_tools) =
             (config.sandbox, config.yolo, config.diagnostics, config.checks, config.mcp_tools);
+        init.approve_sandboxed = config.approve_sandboxed;
         init.formatter = config.formatter;
         init.compact_tokens = config.compact_tokens;
         (init.compaction, init.compact_tail_tokens) = (config.compaction, config.compact_tail_tokens);
@@ -1771,6 +1772,7 @@ impl Bridge {
             thinking: Some(config.thinking),
             sandbox: Some(config.sandbox),
             yolo: Some(config.yolo && self.session_yolo_allowed()),
+            approve_sandboxed: Some(config.approve_sandboxed),
             trajectories: Some(config.trajectories),
             diagnostics: Some(config.diagnostics),
             checks: Some(config.checks),
@@ -1937,8 +1939,11 @@ impl Bridge {
                 self.emit(system(YOLO_HELD_OFF, true));
             }
             CommandAction::Yolo { on } => {
-                let notice = commands::yolo_status(&Config { yolo: on, ..config.clone() }, self.sandbox_available);
-                self.save_config(self.with_file(|f| f.yolo = Some(on)), notice);
+                // What's in effect afterwards: `yolo: false` in the file also stops `approveSandboxed` defaulting to auto.
+                let next = self.with_file(|f| f.yolo = Some(on));
+                let after = resolve_config(Some(&next), &self.env);
+                let notice = commands::yolo_status(&after, self.sandbox_available, self.session_yolo_allowed());
+                self.save_config(next, notice);
             }
             CommandAction::Trajectories { on } => {
                 let path = self.trajectories_dir.as_ref().map(|d| shorten_home(d, &self.home));

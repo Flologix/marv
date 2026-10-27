@@ -148,6 +148,11 @@ pub fn name_from(command: &str) -> String {
     if name.is_empty() { "process".into() } else { name.into() }
 }
 
+/// `'text'` for a shell, with a quote in it closed and escaped.
+fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
 /// `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`
 fn valid_name(name: &str) -> bool {
     let mut chars = name.chars();
@@ -345,7 +350,48 @@ impl ProcessManager {
         Ok(all[all.len().saturating_sub(keep)..].join("\n"))
     }
 
+    /// Marv's static file server on `dir` (absolute, inside the project) as a process without network: `marv __serve`
+    /// from Marv's own binary, which the relay's sandbox shows read-only. Named `serve-<folder>`, a free host port
+    /// unless `port` says (the sandbox has a network of its own, so only the user's side can be taken).
+    pub async fn serve(&self, dir: &Path, port: Option<u16>) -> Result<StartResult, ToolError> {
+        let exe =
+            marv_tools::relay::exe_bind().ok_or_else(|| ToolError::new("Couldn't find Marv's own binary to serve with."))?;
+        let port = match port {
+            Some(port) => port,
+            None => std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .and_then(|l| l.local_addr())
+                .map_err(|e| ToolError::new(format!("Couldn't find a free port: {e}")))?
+                .port(),
+        };
+        let guest = self.shared.sandbox.backend().guest_path(&exe);
+        let command = format!(
+            "exec {} {} {} {port}",
+            shell_quote(&guest.to_string_lossy()),
+            marv_tools::serve::SERVE_SUBCOMMAND,
+            shell_quote(&dir.to_string_lossy())
+        );
+        let label: String = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')).collect())
+            .unwrap_or_default();
+        let base = if label.is_empty() { "serve".to_string() } else { format!("serve-{label}") };
+        let name = unique_name(&self.state(), &base.chars().take(60).collect::<String>());
+        // The server only reads: the project is read-only for it.
+        self.start_with(&command, Some(&name), false, true).await
+    }
+
     pub async fn start(&self, command: &str, name: Option<&str>, network: bool) -> Result<StartResult, ToolError> {
+        self.start_with(command, name, network, false).await
+    }
+
+    /// `start`; `project_read_only`: the process sees the project read-only (a process that only reads it: `serve`).
+    async fn start_with(
+        &self,
+        command: &str,
+        name: Option<&str>,
+        network: bool,
+        project_read_only: bool,
+    ) -> Result<StartResult, ToolError> {
         let taken = {
             let state = self.state();
             if state.closed {
@@ -379,7 +425,7 @@ impl ProcessManager {
         if let Some(taken) = taken {
             self.stop(&taken).await;
         }
-        let id = self.launch(command, name, network)?;
+        let id = self.launch(command, name, network, project_read_only)?;
 
         // Up to 10 s for the first port (or the end), checked more often than the steady poll.
         let deadline = tokio::time::Instant::now() + self.shared.options.start_wait;
@@ -405,7 +451,7 @@ impl ProcessManager {
     }
 
     /// Spawns its sandbox and the tasks that watch it; its id.
-    fn launch(&self, command: &str, name: Option<&str>, network: bool) -> Result<String, ToolError> {
+    fn launch(&self, command: &str, name: Option<&str>, network: bool, project_read_only: bool) -> Result<String, ToolError> {
         let options = &self.shared.options;
         let root = &options.root;
         let mut state = self.state();
@@ -444,14 +490,8 @@ impl ProcessManager {
             let argv = marv_tools::relay::sandbox_argv_at(&backend.guest_path(&exe), &spec);
             (vec![exe, socket_dir], argv)
         };
-        let mounts = CommandMounts {
-            network,
-            read_only,
-            writable: vec![],
-            placeholders: guard.placeholders,
-            project_read_only: false,
-            binds,
-        };
+        let mounts =
+            CommandMounts { network, read_only, writable: vec![], placeholders: guard.placeholders, project_read_only, binds };
         let mut sandboxed = self.shared.sandbox.prepare(root, &mounts, &inner).map_err(ToolError::from)?;
         let protected = Some(protected_snapshot(root));
         // Only the backend's environment, never Marv's. A spawn that fails drops `sandboxed`, which cleans up.
@@ -785,6 +825,9 @@ async fn capture(mut stream: impl AsyncRead + Unpin, log: Arc<Mutex<Vec<u8>>>) {
 impl ProcessHost for ProcessManager {
     async fn start(&self, command: &str, name: Option<&str>, network: bool) -> Result<StartResult, ToolError> {
         ProcessManager::start(self, command, name, network).await
+    }
+    async fn serve(&self, dir: &Path, port: Option<u16>) -> Result<StartResult, ToolError> {
+        ProcessManager::serve(self, dir, port).await
     }
     fn logs(&self, name: &str, lines: usize) -> Result<String, ToolError> {
         ProcessManager::logs(self, name, lines)

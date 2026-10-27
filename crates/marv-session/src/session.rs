@@ -76,7 +76,7 @@ use crate::sessions::{McpListing, SavedCheckpoints, SavedSession, SessionStore, 
 use crate::skills::LoadedSkill;
 use crate::trajectory::{AgentRecorder, CheckStatus, Trajectory, TrajectoryRecord, TrajectoryStore, Who};
 use crate::types::{Message, Role};
-use crate::usage::{Prices, Totals, add_usage};
+use crate::usage::{Prices, Totals, add_model_usage};
 
 /// Saved this long after a turn ends (and again on flush), so a burst of turns is one write.
 pub const SAVE_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
@@ -416,6 +416,10 @@ pub struct SessionInit {
     /// reads only.
     pub github: bool,
     pub yolo: bool,
+    /// `approveSandboxed` (config; default off here, on in the TUI): a sandboxed command without network runs without
+    /// asking in a person's turn or a wake, yolo or not. Never where `no_yolo` holds, and never in `marv -p`
+    /// (`one_shot`): its `--approve` flags stay the contract.
+    pub approve_sandboxed: bool,
     /// Yolo isn't allowed here, and why (the project is the home folder or above it).
     pub no_yolo: Option<String>,
     pub sessions: Option<Arc<SessionStore>>,
@@ -513,6 +517,7 @@ impl SessionInit {
             host_commands: false,
             github: false,
             yolo: true,
+            approve_sandboxed: false,
             no_yolo: None,
             sessions: None,
             trajectories: None,
@@ -544,6 +549,8 @@ pub struct Configure {
     pub thinking: Option<bool>,
     pub sandbox: Option<bool>,
     pub yolo: Option<bool>,
+    /// `approveSandboxed`: from the next turn (it is still never on where `no_yolo` holds, or for `marv -p`).
+    pub approve_sandboxed: Option<bool>,
     pub trajectories: Option<bool>,
     pub diagnostics: Option<Diagnostics>,
     pub checks: Option<bool>,
@@ -708,6 +715,7 @@ struct State {
     system: String,
     sandbox: bool,
     yolo: bool,
+    approve_sandboxed: bool,
     diagnostics: Diagnostics,
     checks: bool,
     compact_tokens: Option<u64>,
@@ -1124,8 +1132,8 @@ impl marv_tools::ToolProgress for CallProgress {
 }
 
 impl SubagentSink for TurnSink {
-    fn usage(&self, usage: &Usage) {
-        self.session.count(usage, self.factory.as_ref(), self.info.as_ref());
+    fn usage(&self, usage: &Usage, model: Option<&str>) {
+        self.session.count(usage, self.factory.as_ref(), self.info.as_ref(), model);
     }
     fn progress(&self, call_id: &str, progress: AgentProgress) {
         (self.emit)(SessionEvent::SubagentProgress { call_id: call_id.into(), progress });
@@ -1223,6 +1231,7 @@ impl MarvSession {
             system: String::new(),
             sandbox: init.sandbox,
             yolo: init.yolo,
+            approve_sandboxed: init.approve_sandboxed,
             diagnostics: init.diagnostics,
             checks: init.checks,
             compact_tokens: init.compact_tokens,
@@ -1403,9 +1412,9 @@ impl MarvSession {
     }
     /// What the session may do without asking, now (`/permissions`, #82): a copy, for showing only.
     pub fn permissions(&self) -> crate::permissions::Permissions {
-        let (yolo, sandbox) = {
+        let (yolo, sandbox, approve_sandboxed) = {
             let s = self.state();
-            (s.yolo, s.sandbox)
+            (s.yolo, s.sandbox, s.approve_sandboxed)
         };
         let init = &self.inner.init;
         let doors = [("github", init.github), ("process", self.inner.process_on), ("herdr", init.herdr.is_some())]
@@ -1414,6 +1423,11 @@ impl MarvSession {
             .collect();
         crate::permissions::Permissions {
             yolo,
+            // What's in effect: also off where the sandbox isn't working, as for the call itself (`auto_safe`).
+            approve_sandboxed: approve_sandboxed
+                && init.no_yolo.is_none()
+                && !init.one_shot
+                && marv_sandbox::Sandbox::from_env(sandbox).active(),
             no_yolo: init.no_yolo.clone(),
             sandbox,
             host_commands: init.host_commands,
@@ -1780,11 +1794,25 @@ impl MarvSession {
         let turn_specs = init.mcp.as_ref().map(|m| m.specs()).unwrap_or_default();
         self.state().turn_mcp_specs = turn_specs.clone();
         let (specs, tools) = self.offered();
-        let (sandbox, yolo, factory, provider, info, diagnostics, checks_on, formatter, max_steps, history, system) = {
+        let (
+            sandbox,
+            yolo,
+            approve_sandboxed,
+            factory,
+            provider,
+            info,
+            diagnostics,
+            checks_on,
+            formatter,
+            max_steps,
+            history,
+            system,
+        ) = {
             let s = self.state();
             (
                 s.sandbox,
                 s.yolo,
+                s.approve_sandboxed,
                 s.factory.clone(),
                 s.provider.clone(),
                 s.info.clone(),
@@ -2005,11 +2033,14 @@ impl MarvSession {
         // The config's extra writable folders (#98) ride in every command's sandbox (an approved command's own
         // writable mounts, e.g. a worktree's .git, still go on top).
         sandbox.writable = init.writable.clone();
+        // The conversation's own /tmp, kept between its commands and gone with the conversation.
+        sandbox.scratch = self.scratch_dir();
         ctx.sandbox = Arc::new(sandbox);
         ctx.home = ctx.sandbox.home.clone();
         ctx.cancel = stop.clone();
         ctx.approver = approve.clone();
         ctx.yolo = yolo && !unattended;
+        ctx.approve_sandboxed = approve_sandboxed && init.no_yolo.is_none() && !init.one_shot;
         // Who started the turn, as one value (`marv_tools::floor`): a radio turn or one handling radio requests, a
         // wake, `marv -p`, or the person.
         ctx.mode = if radio_turn || handles_requests {
@@ -2186,7 +2217,7 @@ impl MarvSession {
             match &event {
                 LoopEvent::Usage(usage, _) => {
                     self.state().last = Some(*usage);
-                    self.count(usage, factory.as_ref(), info.as_ref());
+                    self.count(usage, factory.as_ref(), info.as_ref(), None);
                 }
                 // "Send now": in the transcript where the model read it, as the person's.
                 LoopEvent::SentNow { text } => {
@@ -2387,7 +2418,7 @@ impl MarvSession {
             return None;
         }
         let tools = self.offered().0;
-        let on_usage = |usage: Usage| self.count(&usage, factory.as_ref(), info.as_ref());
+        let on_usage = |usage: Usage| self.count(&usage, factory.as_ref(), info.as_ref(), None);
         marv_agent::suggest::suggest(marv_agent::suggest::SuggestOptions {
             provider: provider.as_ref(),
             history: &history,
@@ -2612,7 +2643,7 @@ impl MarvSession {
         };
         let kind = self.summary_kind();
         let tools = self.offered().0;
-        let on_usage = |usage: Usage| self.count(&usage, factory, info);
+        let on_usage = |usage: Usage| self.count(&usage, factory, info, None);
         let result = marv_agent::compact::summarize(SummarizeOptions {
             provider: provider.as_ref(),
             history: request,
@@ -2783,6 +2814,15 @@ impl MarvSession {
         facts
     }
 
+    /// The conversation's scratch folder (`/tmp` in its sandbox), inside its swap folder: held like the pages (so the
+    /// startup cleanup leaves it alone) and removed with the saved session. `None` without a session store, or when it
+    /// can't be made: `/tmp` is then empty for each command, as before.
+    fn scratch_dir(&self) -> Option<PathBuf> {
+        let dir = self.swap_dir()?;
+        self.hold_swap();
+        marv_tools::swap::scratch_dir(&dir).ok()
+    }
+
     /// Holds this conversation's swap folder (made if missing; never through a symlink) for as long as it's current.
     fn hold_swap(&self) {
         let Some(dir) = self.swap_dir() else { return };
@@ -2793,6 +2833,8 @@ impl MarvSession {
         if std::fs::symlink_metadata(&dir).is_ok_and(|m| !m.is_dir()) {
             return;
         }
+        // Once per session start or resume: a chat's /tmp that has grown past the cap starts empty.
+        marv_tools::swap::trim_scratch(&dir, marv_tools::swap::SCRATCH_CAP_BYTES);
         *held = marv_tools::output::hold(&dir).ok().map(|h| (dir, h));
     }
 
@@ -3453,6 +3495,9 @@ impl MarvSession {
         }
         if let Some(v) = changes.yolo {
             s.yolo = v;
+        }
+        if let Some(v) = changes.approve_sandboxed {
+            s.approve_sandboxed = v;
         }
         if let Some(v) = changes.trajectories {
             s.logging = v;
@@ -4116,12 +4161,20 @@ impl MarvSession {
 
     /// Adds a request's tokens and cost to the totals. `factory` made the provider; `info` is what the list said
     /// about its model when the turn started (another model's prices would make the estimate wrong).
-    pub(crate) fn count(&self, usage: &Usage, factory: &dyn ProviderFactory, info: Option<&ModelInfo>) {
+    ///
+    /// `model` is the one that served the request when it isn't the factory's own (a subagent's type named another
+    /// model); the per-model totals count it under that name, and without its prices the cost is only the reported one.
+    pub(crate) fn count(&self, usage: &Usage, factory: &dyn ProviderFactory, info: Option<&ModelInfo>, model: Option<&str>) {
         let mut s = self.state();
+        let served = model.unwrap_or_else(|| factory.model());
         let same = factory.id() == s.factory.id() && factory.model() == s.factory.model();
-        let prices = info.or(if same { s.info.as_ref() } else { None }).map(Prices::from).unwrap_or_default();
+        let own_prices = model.is_none_or(|m| m == factory.model());
+        let prices = match info.or(if same { s.info.as_ref() } else { None }) {
+            Some(info) if own_prices => Prices::from(info),
+            _ => Prices::default(),
+        };
         let local = (s.totals.requests == 0 || s.totals.local == Some(true)) && factory.local();
-        let mut totals = add_usage(&s.totals, usage, &prices);
+        let mut totals = add_model_usage(&s.totals, served, usage, &prices);
         totals.local = Some(local);
         s.totals = totals;
     }
@@ -4362,8 +4415,16 @@ mod tests {
             &Usage { prompt_tokens: 900, completion_tokens: 10, cached_tokens: None, cost: Some(0.01) },
             factory.as_ref(),
             None,
+            None,
         );
         assert_eq!(s.usage().totals.requests, 1);
+        // Per model: the turn's own model, then a subagent whose type named another one (counted under that name).
+        let own = factory.model().to_string();
+        let usage = Usage { prompt_tokens: 10, completion_tokens: 1, cached_tokens: None, cost: Some(0.5) };
+        s.count(&usage, factory.as_ref(), None, Some("other/model"));
+        let totals = s.usage().totals;
+        assert_eq!((totals.requests, totals.models[&own].requests, totals.models["other/model"].requests), (2, 1, 1));
+        assert_eq!(totals.models["other/model"].cost, Some(0.5));
         s.state().last = Some(Usage { prompt_tokens: 900, completion_tokens: 10, cached_tokens: None, cost: None });
         assert!(s.nearly_full());
     }
@@ -6016,6 +6077,7 @@ mod turn_tests {
         let session = scripted(&dirs, &provider, |i| i.sessions = Some(sessions.clone()));
         let swap = marv_tools::swap::swap_dir(&sessions.file(&dirs.project, &session.id()));
         std::fs::create_dir_all(swap.parent().unwrap()).unwrap();
+        let _ = std::fs::remove_dir_all(&swap); // the chat's /tmp made the folder at its first turn
         std::fs::write(&swap, "in the way").unwrap();
         let events = collect(go(&session, "first")).await;
         assert_eq!(end_reason(&events), TurnEndReason::Done(StopReason::End));
@@ -6392,6 +6454,7 @@ mod turn_tests {
         collect(go(&session, "first")).await;
         let swap = marv_tools::swap::swap_dir(&sessions.file(&dirs.project, &session.id()));
         std::fs::create_dir_all(swap.parent().unwrap()).unwrap();
+        let _ = std::fs::remove_dir_all(&swap); // the chat's /tmp made the folder at its first turn
         std::fs::write(&swap, "not a folder").unwrap();
         let before = lock(&session.state().conversation.clone()).clone();
         let result = session.compact(None).await.unwrap();

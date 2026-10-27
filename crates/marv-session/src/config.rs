@@ -131,6 +131,9 @@ pub struct FileConfig {
     pub compact_tail_tokens: Option<u64>,
     pub sandbox: Option<bool>,
     pub yolo: Option<bool>,
+    /// `approveSandboxed`: `"auto"` (default, unless `yolo` is `false`) runs a sandboxed command without network without asking; `"ask"` asks
+    /// for every command unless yolo vouches for it.
+    pub approve_sandboxed: Option<bool>,
     pub trajectories: Option<bool>,
     /// `diagnostics` (#187): a bool for every language, or one per language.
     pub diagnostics: Option<DiagnosticsSetting>,
@@ -487,6 +490,17 @@ impl FileConfig {
                 }
             },
         };
+        let approve_sandboxed = match map.get("approveSandboxed") {
+            None | Some(Value::Null) => None,
+            Some(v) => match v.as_str() {
+                Some("auto") => Some(true),
+                Some("ask") => Some(false),
+                _ => {
+                    problems.push("approveSandboxed: expected auto or ask".into());
+                    None
+                }
+            },
+        };
         let compact_tail_tokens = match map.get("compactTailTokens") {
             None | Some(Value::Null) => None,
             Some(v) => match v.as_u64() {
@@ -612,6 +626,7 @@ impl FileConfig {
             compact_tail_tokens,
             sandbox: boolean("sandbox", &mut problems),
             yolo: boolean("yolo", &mut problems),
+            approve_sandboxed,
             trajectories: boolean("trajectories", &mut problems),
             diagnostics,
             checks: boolean("checks", &mut problems),
@@ -651,6 +666,7 @@ impl FileConfig {
         put("compactTailTokens", self.compact_tail_tokens.map(Value::from));
         put("sandbox", self.sandbox.map(Value::from));
         put("yolo", self.yolo.map(Value::from));
+        put("approveSandboxed", self.approve_sandboxed.map(|auto| Value::from(if auto { "auto" } else { "ask" })));
         put("trajectories", self.trajectories.map(Value::from));
         put("diagnostics", self.diagnostics.map(DiagnosticsSetting::to_value));
         put("checks", self.checks.map(Value::from));
@@ -714,6 +730,9 @@ pub struct Config {
     pub compact_tail_tokens: Option<u64>,
     pub sandbox: bool,
     pub yolo: bool,
+    /// `approveSandboxed`: a sandboxed command without network runs without asking (default, unless the file sets `yolo`
+    /// to `false`, or `MARV_YOLO=off`); `false`: it asks.
+    pub approve_sandboxed: bool,
     pub trajectories: bool,
     /// Which languages' checkers run after the model's edits (#187).
     pub diagnostics: Diagnostics,
@@ -855,6 +874,11 @@ pub fn resolve_config(file: Option<&FileConfig>, env: &Env) -> Config {
         // `MARV_YOLO=off` holds yolo off for this process whatever the file says (#74: how the Herdr door starts a Marv
         // that may have no more than the session that spawned it). It can only turn yolo off, never on.
         yolo: file.and_then(|f| f.yolo).unwrap_or(true) && !yolo_held_off(env.get("MARV_YOLO").map(String::as_str)),
+        // Auto unless the file says otherwise: `approveSandboxed` itself wins; else an explicit `yolo: false` (a person who
+        // turned yolo off wants to be asked, and mustn't be upgraded silently) keeps asking. `MARV_YOLO=off` holds it
+        // off like yolo: a Marv a parent spawned never runs more unasked than its parent.
+        approve_sandboxed: file.and_then(|f| f.approve_sandboxed).unwrap_or(file.is_none_or(|f| f.yolo != Some(false)))
+            && !yolo_held_off(env.get("MARV_YOLO").map(String::as_str)),
         trajectories: file.and_then(|f| f.trajectories).unwrap_or(true),
         diagnostics: file.and_then(|f| f.diagnostics).map_or(Diagnostics::ON, DiagnosticsSetting::resolve),
         checks: file.and_then(|f| f.checks).unwrap_or(true),
@@ -1197,6 +1221,35 @@ mod tests {
         for bad in [json!("max"), json!(2), json!(true)] {
             assert!(FileConfig::from_value(&json!({ "reasoningEffort": bad })).unwrap_err().contains("reasoningEffort"), "{bad}");
         }
+    }
+
+    #[test]
+    fn approve_sandboxed_is_auto_or_ask_and_auto_is_the_default() {
+        assert!(resolve_config(None, &Env::new()).approve_sandboxed);
+        let ask = FileConfig::from_value(&json!({ "approveSandboxed": "ask" })).unwrap();
+        assert_eq!(ask.to_value()["approveSandboxed"], json!("ask"));
+        assert!(!resolve_config(Some(&ask), &Env::new()).approve_sandboxed);
+        let auto = FileConfig::from_value(&json!({ "approveSandboxed": "auto" })).unwrap();
+        assert!(resolve_config(Some(&auto), &Env::new()).approve_sandboxed);
+        assert!(FileConfig::from_value(&json!({ "approveSandboxed": true })).unwrap_err().contains("approveSandboxed"));
+    }
+
+    #[test]
+    fn approve_sandboxed_is_held_off_by_marv_yolo_off_and_by_an_explicit_yolo_false_unless_set_itself() {
+        let off: Env = [("MARV_YOLO".to_string(), "off".to_string())].into();
+        let on: Env = [("MARV_YOLO".to_string(), "on".to_string())].into();
+        let auto = FileConfig { approve_sandboxed: Some(true), ..FileConfig::default() };
+        assert!(!resolve_config(None, &off).approve_sandboxed, "a spawned worker never exceeds its parent");
+        assert!(!resolve_config(Some(&auto), &off).approve_sandboxed, "not even with auto in the file");
+        assert!(resolve_config(None, &on).approve_sandboxed);
+        // `yolo: false` in the file: no silent upgrade; an explicit approveSandboxed always wins.
+        let no_yolo = FileConfig { yolo: Some(false), ..FileConfig::default() };
+        assert!(!resolve_config(Some(&no_yolo), &Env::new()).approve_sandboxed);
+        let both = FileConfig { yolo: Some(false), approve_sandboxed: Some(true), ..FileConfig::default() };
+        assert!(resolve_config(Some(&both), &Env::new()).approve_sandboxed);
+        let yolo_on = FileConfig { yolo: Some(true), ..FileConfig::default() };
+        assert!(resolve_config(Some(&yolo_on), &Env::new()).approve_sandboxed);
+        assert!(resolve_config(Some(&FileConfig::default()), &Env::new()).approve_sandboxed, "a file without yolo");
     }
 
     #[test]

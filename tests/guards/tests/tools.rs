@@ -209,6 +209,9 @@ impl marv_tools::DynTool for Probe {
     fn auto_safe(&self, input: Input<'_>, ctx: &marv_tools::ToolContext) -> bool {
         self.0.auto_safe(input, ctx)
     }
+    fn auto_sandboxed(&self, input: Input<'_>, ctx: &marv_tools::ToolContext) -> bool {
+        self.0.auto_sandboxed(input, ctx)
+    }
     fn protected_target(&self, input: Input<'_>, ctx: &marv_tools::ToolContext) -> Option<marv_sandbox::ProtectedRule> {
         self.0.protected_target(input, ctx)
     }

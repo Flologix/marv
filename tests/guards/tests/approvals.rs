@@ -588,3 +588,128 @@ async fn a_decline_with_a_reason_never_runs_the_call_and_isnt_remembered() {
         marv_session::session::SessionEvent::Loop(marv_agent::LoopEvent::Done(marv_core::StopReason::End))
     )));
 }
+
+/// A context in `mode` with `approveSandboxed` on (the TUI's default) and yolo off, so only that setting can run
+/// anything unasked.
+fn sandboxed_ctx(root: &std::path::Path, approver: &Arc<Recorder>, mode: marv_tools::CallMode) -> ToolContext {
+    ToolContext { approve_sandboxed: true, mode, approver: Some(approver.clone()), ..ToolContext::new(root) }
+}
+
+/// **`approveSandboxed` (default): bash in the sandbox without network runs without asking, yolo off, in a person's
+/// turn and a woken one.** Nothing else about the call changes: it runs confined, and the approver is never asked.
+///
+/// Proven: dropped `sandboxed_runs` in `run_tool` → this failed (the recorder was asked and said no).
+#[tokio::test]
+async fn sandboxed_commands_without_network_run_unasked_in_person_and_woken_turns() {
+    marv_guards::require_sandbox!();
+    let project = TempDir::new("approvals-sandboxed");
+    project.write("kept.txt", "kept\n");
+    // The person's turn: unasked, and the project is writable.
+    let approver = Recorder::new(Decision::No);
+    let ctx = sandboxed_ctx(project.path(), &approver, marv_tools::CallMode::Person);
+    let out = run_tool(&call("bash", json!({"command": "echo hi > made.txt"})), &ctx, builtin_tools()).await;
+    assert!(approver.requests().is_empty(), "nobody was asked");
+    assert!(!out.result.declined && !out.result.is_error, "{}", out.result.output);
+    assert_eq!(out.result.approval, Some(marv_tools::Approval::Auto));
+    assert_eq!(project.read("made.txt"), Some("hi\n".into()), "it ran");
+}
+
+/// **A woken turn's unasked sandboxed commands see the project read-only (#74):** they read it and build into the
+/// sandbox's /tmp unasked, a write to the project fails (and says why) without asking, and a command that says it
+/// writes (`git_write`) asks.
+#[tokio::test]
+async fn a_woken_turns_unasked_sandboxed_commands_can_read_the_project_but_not_change_it() {
+    marv_guards::require_sandbox!();
+    let project = TempDir::new("approvals-woken-ro");
+    project.write("kept.txt", "kept\n");
+    let approver = Recorder::new(Decision::No);
+    let ctx = sandboxed_ctx(project.path(), &approver, marv_tools::CallMode::Woken);
+    let read = run_tool(
+        &call("bash", json!({"command": r#"cat kept.txt && echo built > "${TMPDIR:-/tmp}/out" && cat "${TMPDIR:-/tmp}/out""#})),
+        &ctx,
+        builtin_tools(),
+    )
+    .await;
+    assert!(approver.requests().is_empty(), "reading and building into /tmp ask nobody");
+    assert_eq!(read.result.approval, Some(marv_tools::Approval::Auto));
+    assert!(read.result.output.contains("kept") && read.result.output.contains("built"), "{}", read.result.output);
+    let write =
+        run_tool(&call("bash", json!({"command": "echo evil > Makefile; echo changed > kept.txt"})), &ctx, builtin_tools()).await;
+    assert!(approver.requests().is_empty(), "a refused write asks nobody either");
+    // Seatbelt refuses with EPERM where bubblewrap's read-only mount says "Read-only file system".
+    let refused = if cfg!(target_os = "macos") { "Operation not permitted" } else { "Read-only file system" };
+    assert!(write.result.output.contains(refused), "{}", write.result.output);
+    assert!(write.result.output.contains("git_write"), "it says how to ask: {}", write.result.output);
+    assert_eq!(project.read("Makefile"), None);
+    assert_eq!(project.read("kept.txt"), Some("kept\n".into()));
+    let asked = run_tool(&call("bash", json!({"command": "echo x > made.txt", "git_write": true})), &ctx, builtin_tools()).await;
+    assert_eq!(approver.requests().len(), 1, "a command that writes asks");
+    assert!(asked.result.declined && project.read("made.txt").is_none());
+}
+
+/// **The setting never reaches a radio turn, `marv -p`, a woken turn's subagent, nor an `ask` config.**
+#[tokio::test]
+async fn approve_sandboxed_ask_headless_and_radio_turns_still_ask() {
+    marv_guards::require_sandbox!();
+    let project = TempDir::new("approvals-sandboxed-ask");
+    let echo = call("bash", json!({"command": "echo hi"}));
+    for mode in [marv_tools::CallMode::Radio, marv_tools::CallMode::Headless, marv_tools::CallMode::Woken.subagent()] {
+        let approver = Recorder::new(Decision::No);
+        let out = run_tool(&echo, &sandboxed_ctx(project.path(), &approver, mode), builtin_tools()).await;
+        assert_eq!(approver.requests().len(), 1, "{mode:?}");
+        assert!(out.result.declined, "{mode:?}");
+    }
+    let approver = Recorder::new(Decision::No);
+    let ask = ToolContext { approve_sandboxed: false, ..sandboxed_ctx(project.path(), &approver, marv_tools::CallMode::Person) };
+    let out = run_tool(&echo, &ask, builtin_tools()).await;
+    assert_eq!(approver.requests().len(), 1, "the ask setting asks");
+    assert!(out.result.declined);
+}
+
+/// **What the sandbox doesn't contain still asks, with the setting on:** network, a git write, a command on the
+/// host (`sandbox: false`, refused here), and, with no working sandbox, every command.
+#[tokio::test]
+async fn approve_sandboxed_still_asks_for_network_git_write_the_host_and_without_a_sandbox() {
+    marv_guards::require_sandbox!();
+    let project = TempDir::new("approvals-sandboxed-more");
+    let person = marv_tools::CallMode::Person;
+    for (what, args) in [
+        ("network", json!({"command": "echo hi", "network": true})),
+        ("git_write", json!({"command": "echo hi", "git_write": true})),
+    ] {
+        let approver = Recorder::new(Decision::No);
+        let out = run_tool(&call("bash", args), &sandboxed_ctx(project.path(), &approver, person), builtin_tools()).await;
+        assert_eq!(approver.requests().len(), 1, "{what} asks");
+        assert!(out.result.declined, "{what}");
+    }
+    // On the host (`sandbox: false`) nothing runs unasked either: here, without the host door, it's refused outright.
+    let approver = Recorder::new(Decision::Yes);
+    let host = json!({"command": "touch ran-on-host", "sandbox": false});
+    run_tool(&call("bash", host), &sandboxed_ctx(project.path(), &approver, person), builtin_tools()).await;
+    assert!(project.read("ran-on-host").is_none(), "a host command never runs on the setting");
+    let approver = Recorder::new(Decision::No);
+    let ctx = ToolContext {
+        sandbox: Arc::new(marv_sandbox::Sandbox::from_env(false)),
+        ..sandboxed_ctx(project.path(), &approver, person)
+    };
+    let out = run_tool(&call("bash", json!({"command": "echo hi"})), &ctx, builtin_tools()).await;
+    assert_eq!(approver.requests().len(), 1, "no sandbox: it asks");
+    assert!(out.result.declined);
+}
+
+/// **Taint is unchanged.** A tainted session's sandboxed command without network still runs unasked (as in yolo),
+/// but its network command asks with `must_ask`, and no setting answers that.
+#[tokio::test]
+async fn approve_sandboxed_leaves_taint_rules_alone() {
+    marv_guards::require_sandbox!();
+    let project = TempDir::new("approvals-sandboxed-taint");
+    let approver = Recorder::new(Decision::No);
+    let ctx = sandboxed_ctx(project.path(), &approver, marv_tools::CallMode::Person);
+    ctx.taint.mark(marv_core::Provenance::Web);
+    let quiet = run_tool(&call("bash", json!({"command": "echo hi"})), &ctx, builtin_tools()).await;
+    assert!(approver.requests().is_empty() && !quiet.result.declined, "{}", quiet.result.output);
+    let net = run_tool(&call("bash", json!({"command": "echo hi", "network": true})), &ctx, builtin_tools()).await;
+    let asked = approver.requests();
+    assert!(asked.len() == 1 && asked[0].must_ask, "tainted network asks with must_ask");
+    assert!(net.result.declined);
+}

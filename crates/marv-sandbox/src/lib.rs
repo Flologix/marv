@@ -160,6 +160,9 @@ pub struct Sandbox {
     /// Marv's config folder (`$MARV_CONFIG_DIR` from the real environment, else `~/.marv`): hidden in every sandbox,
     /// wherever it is (`SandboxOptions::config_dir`).
     pub config_dir: Option<PathBuf>,
+    /// The session's scratch folder (`marv_tools::swap::scratch_dir`), `/tmp` in every command of the session when
+    /// the backend can mount it ([`Plan::scratch`]). None: `/tmp` is an empty tmpfs per command.
+    pub scratch: Option<PathBuf>,
     /// For tables and goldens only (`marv_tools::table`, the guards): [`Sandbox::active`] answers as if this
     /// platform's backend worked here, so what they print doesn't depend on the machine. The session never sets it;
     /// a command still can't start without the backend.
@@ -192,6 +195,7 @@ impl Sandbox {
             hidden: runtime_paths(&runtime_env()),
             writable: Vec::new(),
             config_dir: Some(config_dir(std::env::var_os("MARV_CONFIG_DIR"), std::env::current_dir().ok().as_deref(), &home)),
+            scratch: None,
             assume_backend: false,
         }
     }
@@ -241,6 +245,7 @@ impl Sandbox {
             binds: mounts.binds.clone(),
             hidden: self.hidden.clone(),
             config_dir: self.config_dir.clone(),
+            scratch: self.scratch.clone(),
         }
     }
 }

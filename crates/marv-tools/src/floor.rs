@@ -49,6 +49,22 @@ impl CallMode {
         matches!(self, Self::Person | Self::Headless | Self::Subagent { unattended: false })
     }
 
+    /// Whether `approveSandboxed` applies: the person's turn, or one a mesh wake started (read-only there, see
+    /// [`Self::sandboxed_unasked_project_read_only`]). Not `marv -p` (its `--approve` flags are the contract), and not
+    /// the radio's turns.
+    pub fn runs_sandboxed_unasked(self) -> bool {
+        matches!(self, Self::Person | Self::Woken | Self::Subagent { unattended: false })
+    }
+
+    /// Whether a command that runs unasked under `approveSandboxed` sees the project read-only in this mode. The one
+    /// place that decides it (a downstream fork with its own task turns overrides it here). A woken turn is not a
+    /// person's: another agent's message led to it (#74), so it may inspect, build into the sandbox's /tmp and run
+    /// read-only checks unasked, and a command that has to change the project asks like it did before
+    /// `approveSandboxed` (`git_write`, or `edit_file`/`write_file`, which ask). The person's turn keeps it writable.
+    pub fn sandboxed_unasked_project_read_only(self) -> bool {
+        matches!(self, Self::Woken)
+    }
+
     /// The mode of a subagent started in this mode (subagents don't nest).
     pub fn subagent(self) -> Self {
         Self::Subagent { unattended: !self.auto_approval() }
@@ -120,5 +136,13 @@ mod tests {
             assert!(offered_in_mode(name, CallMode::Person) && !offered_in_mode(name, CallMode::Person.subagent()));
         }
         assert!(offered_in_mode("bash", CallMode::Woken.subagent()) && offered_in_mode("mesh_send", CallMode::Person.subagent()));
+    }
+
+    #[test]
+    fn only_a_woken_turns_unasked_sandboxed_commands_see_the_project_read_only() {
+        assert!(CallMode::Woken.runs_sandboxed_unasked() && CallMode::Woken.sandboxed_unasked_project_read_only());
+        assert!(CallMode::Person.runs_sandboxed_unasked() && !CallMode::Person.sandboxed_unasked_project_read_only());
+        assert!(!CallMode::Woken.subagent().runs_sandboxed_unasked() && !CallMode::Radio.runs_sandboxed_unasked());
+        assert!(!CallMode::Headless.runs_sandboxed_unasked());
     }
 }

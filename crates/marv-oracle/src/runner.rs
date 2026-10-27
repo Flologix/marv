@@ -308,6 +308,7 @@ pub fn canonical_request(body: &str) -> String {
         // Tools marv-rs offers and Marv doesn't (`recall`, after Marv #63): left out of the comparison.
         tools.retain(|t| !t.pointer("/function/name").and_then(Value::as_str).is_some_and(|n| MARV_RS_TOOLS.contains(&n)));
         tools.iter_mut().filter_map(|t| t.pointer_mut("/function/description")).for_each(unword);
+        tools.iter_mut().filter(|t| t.pointer("/function/name") == Some(&json!("process"))).for_each(unserve);
     }
     strip_cache_control(&mut value);
     // marv-rs (#63 review) merges Marv's notes into a trailing user message instead of sending a second one: compare
@@ -348,7 +349,7 @@ pub const MARV_RS_SECTIONS: &[&str] = &["# Your situation", "# Fixing bugs"];
 /// `PLAN_SENTENCE`) and plan tool description (`marv_tools::plan::PLAN_DESCRIPTION`), and #81's sentence at the end of
 /// the process tool's description (`marv_tools::process::PROCESS_DESCRIPTION`), which Marv doesn't have, the `.git`
 /// placeholder sentence, which Marv doesn't have either, and #186's built-in `explore` type (its line in the agent list
-/// and the agent tool's sentence about it).
+/// and the agent tool's sentence about it), and the `/tmp` clause and `serve` text added to the prompt and the process tool.
 pub const MARV_RS_TEXT: &[(&str, &str)] = &[
     (
         " For a task of four or more steps, keep a plan with the plan tool; send each update in the same reply as your next tool call; only the final one, marking the plan done, may go alone.",
@@ -376,6 +377,10 @@ pub const MARV_RS_TEXT: &[(&str, &str)] = &[
         " To search the code or answer a question about it, use type \"explore\": it reads and searches only, so its results come back without filling your context.",
         "",
     ),
+    // A chat's `/tmp` is its own scratch folder (`marv_session::prompt`'s sandbox text).
+    (" (and /tmp, which is private to this chat and keeps its files from one command to the next)", ""),
+    // The process tool's `serve` action (`marv_tools::process::SERVE_SENTENCE`); its schema is taken back by `unserve`.
+    (" serve (with path, and optionally port) serves a project folder such as dist as a static website, no command needed.", ""),
 ];
 
 /// marv-rs quotes MCP tool descriptions as the servers' data (in the deferred-tools note and in `tool_search`'s answer;
@@ -401,6 +406,18 @@ fn unfence_content(content: &mut Value) {
         Value::String(text) => unfence_mcp_descriptions(text),
         Value::Array(parts) => parts.iter_mut().filter_map(|p| p.get_mut("text")).for_each(unfence_content),
         _ => {}
+    }
+}
+
+/// Takes marv-rs's `serve` action out of the process tool's schema (the `serve` enum value, `path` and `port`), as Marv's
+/// has none.
+fn unserve(tool: &mut Value) {
+    if let Some(actions) = tool.pointer_mut("/function/parameters/properties/action/enum").and_then(Value::as_array_mut) {
+        actions.retain(|a| a != "serve");
+    }
+    if let Some(properties) = tool.pointer_mut("/function/parameters/properties").and_then(Value::as_object_mut) {
+        properties.remove("path");
+        properties.remove("port");
     }
 }
 

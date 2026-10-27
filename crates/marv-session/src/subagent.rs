@@ -104,6 +104,7 @@ pub fn subagent_context(
     // The subagent's edits format like the main agent's (#67); the hook takes each root per call (a worktree's own).
     ctx.formatter = parent.formatter.clone();
     ctx.yolo = parent.yolo;
+    ctx.approve_sandboxed = parent.approve_sandboxed;
     // A turn the radio started (#124) has no automatic approval, and neither have its subagents.
     ctx.mode = parent.mode.subagent();
     ctx.skills = parent.skills.clone();
@@ -446,7 +447,7 @@ async fn drive(
         match event {
             LoopEvent::Usage(usage, _) => {
                 tally.used += usage.prompt_tokens + usage.completion_tokens;
-                host.sink.usage(&usage);
+                host.sink.usage(&usage, agent_type.model.as_deref());
             }
             LoopEvent::Assistant { text } => run.text = text,
             LoopEvent::ToolStart { call, label } => {
@@ -692,7 +693,7 @@ mod run_tests {
     }
     struct Sink(Arc<Seen>);
     impl SubagentSink for Sink {
-        fn usage(&self, usage: &Usage) {
+        fn usage(&self, usage: &Usage, _model: Option<&str>) {
             lock(&self.0.usage).push(*usage);
         }
         fn progress(&self, _call_id: &str, progress: AgentProgress) {

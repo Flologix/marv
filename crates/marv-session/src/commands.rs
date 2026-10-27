@@ -327,7 +327,7 @@ pub fn commands() -> &'static [Command] {
         Command {
             name: "yolo",
             while_busy: true,
-            description: "Run what the sandbox confines without asking (/yolo on, /yolo off)",
+            description: "Run edits and sandboxed commands without asking (/yolo on; /yolo off asks for all, unless approveSandboxed is set)",
             run: |args, ctx| match on_off(args, "Usage: /yolo, /yolo on, or /yolo off") {
                 Ok(on) => CommandAction::Yolo { on: on.unwrap_or(!ctx.config.yolo) },
                 Err(e) => e,
@@ -1006,13 +1006,37 @@ pub fn trajectories_status(config: &Config, path: Option<&str>) -> String {
     }
 }
 
-/// What yolo mode does with this config, for the notice when it's turned on.
-pub fn yolo_status(config: &Config, sandbox_available: bool) -> String {
-    if !config.yolo {
-        return "Yolo off: every change asks first.".into();
+/// What yolo mode does with this config, for the notice when it's changed. `config` is the config in effect after the
+/// change (`approve_sandboxed` as it resolves from the file, `MARV_YOLO` included); `yolo_allowed` is false where the
+/// project is the home folder or above it, where neither yolo nor `approveSandboxed` apply (`sdk::no_yolo_reason`).
+/// The same state `/permissions` shows: sandboxed commands run unasked only with the setting, the sandbox on and
+/// working here, and yolo allowed.
+pub fn yolo_status(config: &Config, sandbox_available: bool, yolo_allowed: bool) -> String {
+    if !yolo_allowed {
+        return "Yolo is off in this folder (it is your home folder or above it): every change asks first.".into();
     }
-    if config.sandbox && sandbox_available {
-        "Yolo on: sandboxed commands and file edits run without asking. Network access, git changes (git_write), edits inside .git, and memory still ask.".into()
+    let confined = config.sandbox && sandbox_available;
+    let unasked = config.approve_sandboxed && confined;
+    // A turn a mesh message woke: unasked sandboxed commands only see the project read-only (docs/SECURITY.md).
+    let woken = " In a turn a mesh message woke they see the project read-only.";
+    if !config.yolo {
+        return if unasked {
+            format!(
+                "Yolo off: file changes ask first. Sandboxed commands without network still run without asking (approveSandboxed is auto in ~/.marv/config.json; set it to \"ask\" to be asked).{woken}"
+            )
+        } else {
+            "Yolo off: every change asks first, sandboxed commands too (approveSandboxed is ask).".into()
+        };
+    }
+    if confined {
+        let rest = if unasked {
+            format!(" (Sandboxed commands also run without asking with yolo off, while approveSandboxed is auto.{woken})")
+        } else {
+            String::new()
+        };
+        format!(
+            "Yolo on: sandboxed commands and file edits run without asking. Network access, git changes (git_write), edits inside .git, and memory still ask.{rest}"
+        )
     } else {
         format!(
             "Yolo on: file edits run without asking. Commands still ask: {}, so nothing confines them.",
@@ -1435,6 +1459,33 @@ mod tests {
         assert!(compact_status(&config).starts_with("at 100,000 tokens or 85% of the window"));
         let off = Config { compact_tokens: None, ..config };
         assert_eq!(compact_status(&off), "at 85% of the window (compactTokens is off in the config file)");
+    }
+
+    #[test]
+    fn yolo_status_says_what_is_in_effect() {
+        let config = |yolo: bool, approve: bool, sandbox: bool| {
+            let mut c = resolve_config(None, &Env::new());
+            (c.yolo, c.approve_sandboxed, c.sandbox) = (yolo, approve, sandbox);
+            c
+        };
+        // Held off (MARV_YOLO=off, `ask`): never claims sandboxed commands run unasked.
+        assert!(!yolo_status(&config(false, false, true), true, true).contains("still run without asking"));
+        assert!(yolo_status(&config(false, false, true), true, true).contains("sandboxed commands too"));
+        assert!(yolo_status(&config(false, true, true), true, true).contains("still run without asking"));
+        assert!(yolo_status(&config(false, true, true), true, true).contains("read-only"));
+        // No working sandbox, or the sandbox off: nothing runs unasked.
+        assert_eq!(
+            yolo_status(&config(false, true, true), false, true),
+            "Yolo off: every change asks first, sandboxed commands too (approveSandboxed is ask)."
+        );
+        assert!(!yolo_status(&config(false, true, false), true, true).contains("still run without asking"));
+        assert!(!yolo_status(&config(true, true, true), false, true).contains("also run without asking"));
+        // Yolo on.
+        assert!(yolo_status(&config(true, true, true), true, true).contains("also run without asking"));
+        assert!(!yolo_status(&config(true, false, true), true, true).contains("also run without asking"));
+        // The home folder: neither applies.
+        let home = yolo_status(&config(true, true, true), true, false);
+        assert!(home.contains("every change asks first") && !home.contains("without asking"), "{home}");
     }
 
     #[test]

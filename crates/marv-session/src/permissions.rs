@@ -23,6 +23,8 @@ pub const PERMISSIONS_USAGE: &str = "Usage: /permissions (it only shows them)";
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Permissions {
     pub yolo: bool,
+    /// `approveSandboxed` is in effect: a sandboxed command without network runs without asking.
+    pub approve_sandboxed: bool,
     /// Yolo isn't allowed here, and why (the project is the home folder or above it).
     pub no_yolo: Option<String>,
     pub sandbox: bool,
@@ -156,10 +158,16 @@ pub fn permissions_text(p: &Permissions, saved: Option<SavedGrants>, mcp: Option
         format!("yes, by {by}: network and egress calls ask every time, whatever is granted below (even yolo)")
     };
     let doors = if p.doors.is_empty() { "none".to_string() } else { p.doors.join(", ") };
+    let mut basics = vec![format!("- **Yolo**: {yolo}"), format!("- **Sandbox**: {sandbox}")];
+    if p.approve_sandboxed && p.sandbox {
+        basics.push(
+            "- **Sandboxed commands**: run without asking when they need no network, even with yolo off (`approveSandboxed: \"ask\"` in your config turns this off; `/yolo off` does too unless `approveSandboxed` is set)"
+                .into(),
+        );
+    }
     parts.push(
         [
-            format!("- **Yolo**: {yolo}"),
-            format!("- **Sandbox**: {sandbox}"),
+            basics.join("\n"),
             format!("- **Network**: {network}"),
             format!("- **Doors**: {doors} (each asks, unless granted below)"),
             format!("- **Tainted**: {taint}"),
@@ -216,8 +224,10 @@ pub fn permissions_text(p: &Permissions, saved: Option<SavedGrants>, mcp: Option
             .into(),
     );
     always.push(
-        "- a turn you didn't start (a mesh or radio message woke it) uses none of this: no yolo, no \"always\", nothing pre-approved; everything asks"
-            .into(),
+        format!(
+            "- a turn you didn't start (a mesh or radio message woke it) uses none of this: no yolo, no \"always\", nothing pre-approved; everything asks{}",
+            if p.approve_sandboxed && p.sandbox { ", except that a mesh wake still runs sandboxed commands without network, with the project read-only" } else { "" }
+        ),
     );
     parts.push(always.join("\n"));
 

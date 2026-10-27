@@ -210,6 +210,13 @@ pub fn tools_table() -> String {
          - **Persists**: whether it writes something later conversations load as the person's own. In a conversation\n  \
          holding outside text, such a call is asked every time.\n\
          - **Door**: the door out of the sandbox it goes through, if any.\n\n\
+         The setting `approveSandboxed` (default `auto`, unless the config sets `yolo` to `false`; `~/.marv/config.json`) sits on\n\
+         top too: a `bash` call that runs in the working sandbox without network, `git_write` or `sandbox: false` runs without\n\
+         asking in a person's turn, yolo or not (`Tool::auto_sandboxed`), and in a woken turn **with the project mounted\n\
+         read-only** (`CallMode::sandboxed_unasked_project_read_only`: it can read, and build into the sandbox's `/tmp`, but a\n\
+         command that has to change the project asks, as `git_write`). Never in `marv -p` or a radio turn. `\"ask\"` turns it\n\
+         off. Edits and processes are unchanged.\n\
+         \n\
          On top of this, a write to a protected path (docs/SECURITY.md: `.git`, a lifecycle script in `package.json`, ...)\n\
          is asked every time, even in yolo, and so is any call to the network once the conversation holds outside text.\n\
          One exception lowers a call below its floor: in a tainted conversation, a web_fetch under a URL prefix the\n\

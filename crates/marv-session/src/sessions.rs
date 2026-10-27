@@ -223,9 +223,19 @@ pub fn new_session(root: &Path, provider: &str, model: &str, now_ms: u64) -> Sav
     }
 }
 
-/// The first user message, on one line, at most 56 characters.
+/// Marv's line that says who woke a turn (`mesh::WakeBy::line`).
+const WOKEN_PREFIX: &str = "Woken by a message from ";
+
+/// The first user message, on one line, at most 56 characters. A chat only a wake started (no user message) takes
+/// Marv's line that says who woke it ("Woken by a message from …"), else its first notice.
 pub fn title_of(session: &SavedSession) -> String {
-    let first = session.transcript.iter().find(|m| m.role == Role::User).map_or("(empty)", |m| m.text.as_str());
+    let first = session
+        .transcript
+        .iter()
+        .find(|m| m.role == Role::User)
+        .or_else(|| session.transcript.iter().find(|m| m.role == Role::System && m.text.starts_with(WOKEN_PREFIX)))
+        .or_else(|| session.transcript.iter().find(|m| m.role == Role::System))
+        .map_or("(empty)", |m| m.text.as_str());
     let line = first.split_whitespace().collect::<Vec<_>>().join(" ");
     if line.chars().count() > TITLE_CHARS {
         format!("{}…", line.chars().take(TITLE_CHARS - 1).collect::<String>().trim_end())
@@ -280,14 +290,18 @@ impl SessionStore {
         self.dir.join(legacy_project_key(root))
     }
 
-    /// Where a session is (or will be, once it has a user message) saved.
+    /// Where a session is (or will be, once it has had a turn) saved.
     pub fn file(&self, root: &Path, id: &str) -> PathBuf {
         self.folder(root).join(format!("{id}.json"))
     }
 
-    /// Saves (or overwrites) a session. Sessions without a user message aren't saved.
+    /// Saves (or overwrites) a session. A session that has had no turn yet isn't saved: no user message, no reply
+    /// and no request. A chat that only ever ran turns a mesh message woke has no user message, but its history and
+    /// cost are worth keeping.
     pub async fn save(&self, session: &SavedSession) -> std::io::Result<()> {
-        if !session.transcript.iter().any(|m| m.role == Role::User) {
+        let had_a_turn =
+            session.transcript.iter().any(|m| matches!(m.role, Role::User | Role::Assistant)) || session.totals.requests > 0;
+        if !had_a_turn {
             return Ok(());
         }
         let root = PathBuf::from(&session.root);
@@ -337,6 +351,21 @@ impl SessionStore {
 
     /// This project's sessions, newest first (a tie in the same millisecond: the one started later first, #42).
     pub async fn list(&self, root: &Path) -> Vec<SessionSummary> {
+        self.sorted(root)
+            .await
+            .iter()
+            .map(|s| SessionSummary {
+                id: s.id.clone(),
+                title: title_of(s),
+                updated_at: s.updated_at,
+                messages: s.transcript.iter().filter(|m| matches!(m.role, Role::User | Role::Assistant)).count(),
+                model: s.model.clone(),
+            })
+            .collect()
+    }
+
+    /// This project's sessions in full, newest first.
+    async fn sorted(&self, root: &Path) -> Vec<SavedSession> {
         let mut ids = std::collections::BTreeSet::new();
         for folder in [self.folder(root), self.legacy_folder(root)] {
             let Ok(mut entries) = tokio::fs::read_dir(&folder).await else {
@@ -356,20 +385,12 @@ impl SessionStore {
         }
         sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(b.created_at.cmp(&a.created_at)));
         sessions
-            .iter()
-            .map(|s| SessionSummary {
-                id: s.id.clone(),
-                title: title_of(s),
-                updated_at: s.updated_at,
-                messages: s.transcript.iter().filter(|m| matches!(m.role, Role::User | Role::Assistant)).count(),
-                model: s.model.clone(),
-            })
-            .collect()
     }
 
+    /// The newest chat the person took part in (`marv -c`, `/resume` of the latest): one only mesh wakes ran, with no
+    /// message of theirs, is left out, so continuing picks up the chat they last typed in.
     pub async fn latest(&self, root: &Path) -> Option<SavedSession> {
-        let newest = self.list(root).await.into_iter().next()?;
-        self.load(root, &newest.id).await
+        self.sorted(root).await.into_iter().find(|s| s.transcript.iter().any(|m| m.role == Role::User))
     }
 }
 
@@ -391,6 +412,9 @@ mod tests {
         let s = with_user(root, "fix   the\nbug", 1);
         store.save(&s).await.unwrap();
         store.save(&new_session(root, "openrouter", "m", 2)).await.unwrap(); // nothing in it: not saved
+        let mut notice_only = new_session(root, "openrouter", "m", 3);
+        notice_only.transcript.push(Message::new(1, Role::System, "a notice"));
+        store.save(&notice_only).await.unwrap(); // no turn yet: not saved
         tokio::fs::write(store.file(root, "broken"), "{").await.unwrap();
         let list = store.list(root).await;
         assert_eq!(list.len(), 1);
@@ -399,6 +423,46 @@ mod tests {
         assert!(store.latest(Path::new("/nowhere")).await.is_none());
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(std::fs::metadata(store.file(root, &s.id)).unwrap().permissions().mode() & 0o777, 0o600);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_chat_that_only_ran_woken_turns_is_saved_and_titled_by_the_wake() {
+        let dir = std::env::temp_dir().join(format!("marv-sessions-woken-{}-{}", std::process::id(), random_hex()));
+        let store = SessionStore::new(&dir);
+        let root = Path::new("/home/me/proj");
+        let mut woken = new_session(root, "openrouter", "m", 1);
+        woken.transcript.push(Message::new(1, Role::System, "Woken by a message from worker on agent.parent.inbox"));
+        woken.transcript.push(Message::new(2, Role::Assistant, "Merged."));
+        woken.totals.requests = 2;
+        store.save(&woken).await.unwrap();
+        // Only its cost survived (a turn that ended before any text): still kept.
+        let mut costed = new_session(root, "openrouter", "m", 2);
+        costed.transcript.push(Message::new(1, Role::System, "Woken by a message from worker on agent.parent.inbox"));
+        costed.totals.requests = 1;
+        store.save(&costed).await.unwrap();
+        let list = store.list(root).await;
+        assert_eq!(list.len(), 2);
+        assert!(list.iter().all(|s| s.title == "Woken by a message from worker on agent.parent.inbox"), "{list:?}");
+        assert_eq!(store.load(root, &woken.id).await.unwrap().totals.requests, 2);
+        // `marv -c` skips them: with only woken chats there is nothing of the person's to continue.
+        assert!(store.latest(root).await.is_none());
+        let typed = with_user(root, "fix the bug", 0);
+        store.save(&typed).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        let mut later = new_session(root, "openrouter", "m", 5);
+        later.transcript.push(Message::new(1, Role::System, "Woken by a message from worker on agent.parent.inbox"));
+        later.totals.requests = 1;
+        store.save(&later).await.unwrap();
+        assert_eq!(store.latest(root).await.unwrap().id, typed.id, "a newer woken chat is skipped");
+        // The title is the wake's line even after a notice (a resume, a radio note) came first.
+        let mut noted = new_session(root, "openrouter", "m", 3);
+        noted.transcript.push(Message::new(1, Role::System, "Resumed from an earlier chat"));
+        noted.transcript.push(Message::new(2, Role::System, "Woken by a message from worker on agent.parent.inbox"));
+        assert_eq!(title_of(&noted), "Woken by a message from worker on agent.parent.inbox");
+        let mut only_notice = new_session(root, "openrouter", "m", 4);
+        only_notice.transcript.push(Message::new(1, Role::System, "Resumed from an earlier chat"));
+        assert_eq!(title_of(&only_notice), "Resumed from an earlier chat");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -412,6 +476,8 @@ mod tests {
         let swap = marv_tools::swap::swap_dir(&store.file(root, &session.id));
         std::fs::create_dir_all(&swap).unwrap();
         std::fs::write(swap.join("1.jsonl"), "{}").unwrap();
+        std::fs::create_dir_all(swap.join("tmp")).unwrap(); // the chat's /tmp (marv_tools::swap::scratch_dir)
+        std::fs::write(swap.join("tmp/err.txt"), "x").unwrap();
         store.remove(root, &session.id).await.unwrap();
         assert!(!swap.exists() && !store.file(root, &session.id).exists());
         store.remove(root, &session.id).await.unwrap();

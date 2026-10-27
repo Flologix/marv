@@ -36,4 +36,12 @@ fn the_oracles_reworded_text_matches_what_marv_rs_sends() {
     let (explore_sentence, nothing) = MARV_RS_TEXT[6];
     assert!(explore_sentence == marv_tools::agent::EXPLORE_SENTENCE && nothing.is_empty());
     assert!(marv_tools::agent::AGENT_DESCRIPTION.ends_with(explore_sentence));
+    // A chat's /tmp, in the sandbox text of the system prompt; and the process tool's serve sentence.
+    let (tmp_clause, nothing) = MARV_RS_TEXT[7];
+    assert!(nothing.is_empty());
+    if cfg!(target_os = "linux") {
+        assert!(prompt.contains(tmp_clause), "MARV_RS_TEXT[7] isn't the prompt's /tmp clause:\n{prompt}");
+    }
+    let (serve_sentence, nothing) = MARV_RS_TEXT[8];
+    assert!(marv_tools::process::PROCESS_DESCRIPTION.contains(serve_sentence) && nothing.is_empty());
 }

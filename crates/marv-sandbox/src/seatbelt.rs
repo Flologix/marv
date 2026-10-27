@@ -1571,6 +1571,7 @@ mod tests {
             binds: vec![],
             hidden: vec!["/srv/marv-run".into()],
             config_dir: Some("/srv/marv-config".into()),
+            scratch: None,
         };
         let Plan {
             root,
@@ -1587,6 +1588,7 @@ mod tests {
             binds, // refused on macOS until #152 (binds_are_refused_until_the_process_door_comes_to_macos)
             hidden,
             config_dir,
+            scratch: _, // bubblewrap's /tmp only: Seatbelt's TMPDIR is made per command (seatbelt_backend.rs)
         } = &plan;
         assert!(binds.is_empty());
         let bwrap = crate::bwrap::sandbox_args(&plan, &fs)

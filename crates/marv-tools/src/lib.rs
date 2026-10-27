@@ -37,6 +37,7 @@ pub mod registry;
 pub mod relay;
 pub mod repair;
 pub mod schema_repair;
+pub mod serve;
 pub mod skill;
 pub mod swap;
 pub mod syntax;

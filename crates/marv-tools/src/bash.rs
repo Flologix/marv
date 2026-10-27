@@ -539,6 +539,9 @@ fn real_or_self(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// A command that ran unasked in a woken turn failed on the read-only project.
+const WOKEN_READ_ONLY_NOTE: &str = "Marv: this turn was started by another agent's message, so a command that runs without asking sees the project read-only (it can still build into /tmp). To change project files use edit_file or write_file, or set git_write: true on a command that has to write (the user is asked first).";
+
 /// A confined command that failed on the read-only `.git`.
 static GIT_READ_ONLY: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"\.git\b.*Read-only file system").unwrap());
 
@@ -708,6 +711,11 @@ impl Tool for Bash {
             && !input.git_write.unwrap_or(false)
             && input.sandbox != Some(false)
     }
+    /// `approveSandboxed`: the same confinement yolo needs. The registry still asks for taint's network and egress
+    /// rules first.
+    fn auto_sandboxed(&self, input: &BashInput, ctx: &ToolContext) -> bool {
+        self.auto_safe(input, ctx)
+    }
     /// The timeout given in milliseconds (#10), and the escalation of #81: a sandboxed command without network whose
     /// key ([`marv_core::command::command_key`]) already failed like the missing network runs with `network: true`
     /// instead, so it goes through the approval for network like any network command (asked, or an "always" for its
@@ -840,7 +848,7 @@ impl Tool for Bash {
             read_only,
             writable: approved_git,
             placeholders: guard.placeholders.clone(),
-            project_read_only: false,
+            project_read_only: ctx.project_read_only,
             env: None,
             forwards: ctx.forwards.as_ref().map(|f| f.forwards()).unwrap_or_default(),
             pipe_check: true,
@@ -858,6 +866,12 @@ impl Tool for Bash {
             if let Some(note) = created_note(&created) {
                 result.output.push_str(&format!("\n{note}\n"));
             }
+        }
+        // bubblewrap's read-only mount says "Read-only file system"; Seatbelt has no write rule and says EPERM.
+        let refused = result.output.contains("Read-only file system")
+            || (cfg!(target_os = "macos") && sandboxed && result.output.contains("Operation not permitted"));
+        if ctx.project_read_only && refused {
+            result.output.push_str(&format!("\n{WOKEN_READ_ONLY_NOTE}\n"));
         }
         if ctx.confined && GIT_READ_ONLY.is_match(&result.output) {
             result.output.push_str(&format!("\n{GIT_HINT}\n"));
