@@ -35,10 +35,15 @@ fn get(port: u16) -> Option<String> {
 }
 
 fn get_path(port: u16, path: &str) -> Option<String> {
+    get_as(port, path, &format!("localhost:{port}"))
+}
+
+/// A GET with the given `Host` header (the built-in server answers only for the loopback names).
+fn get_as(port: u16, path: &str, host: &str) -> Option<String> {
     use std::io::{Read, Write};
     let mut conn = std::net::TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), Duration::from_secs(2)).ok()?;
     conn.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-    conn.write_all(format!("GET {path} HTTP/1.0\r\n\r\n").as_bytes()).ok()?;
+    conn.write_all(format!("GET {path} HTTP/1.0\r\nHost: {host}\r\n\r\n").as_bytes()).ok()?;
     let mut reply = String::new();
     conn.read_to_string(&mut reply).ok()?;
     Some(reply)
@@ -188,6 +193,7 @@ fn marv_p_serves_a_project_folder_with_the_built_in_server_and_nothing_outlives_
     assert!(js.contains("text/javascript") && js.contains("SERVED-JS"), "{js}");
     assert!(get_path(port, "/users/7").unwrap().contains("SERVED-INDEX"), "an app route falls back to the index");
     assert!(get_path(port, "/assets/nope.js").unwrap().starts_with("HTTP/1.1 404"));
+    assert!(get_as(port, "/", "rebind.example").unwrap().starts_with("HTTP/1.1 403"), "a foreign Host is refused");
     let escape = get_path(port, "/../secret.txt").unwrap();
     assert!(!escape.contains("OUTSIDE-DIST"), "{escape}");
     assert!(!get_path(port, "/%2e%2e/secret.txt").unwrap().contains("OUTSIDE-DIST"));

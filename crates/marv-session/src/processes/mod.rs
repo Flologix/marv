@@ -376,10 +376,22 @@ impl ProcessManager {
             .unwrap_or_default();
         let base = if label.is_empty() { "serve".to_string() } else { format!("serve-{label}") };
         let name = unique_name(&self.state(), &base.chars().take(60).collect::<String>());
-        self.start(&command, Some(&name), false).await
+        // The server only reads: the project is read-only for it.
+        self.start_with(&command, Some(&name), false, true).await
     }
 
     pub async fn start(&self, command: &str, name: Option<&str>, network: bool) -> Result<StartResult, ToolError> {
+        self.start_with(command, name, network, false).await
+    }
+
+    /// `start`; `project_read_only`: the process sees the project read-only (a process that only reads it: `serve`).
+    async fn start_with(
+        &self,
+        command: &str,
+        name: Option<&str>,
+        network: bool,
+        project_read_only: bool,
+    ) -> Result<StartResult, ToolError> {
         let taken = {
             let state = self.state();
             if state.closed {
@@ -413,7 +425,7 @@ impl ProcessManager {
         if let Some(taken) = taken {
             self.stop(&taken).await;
         }
-        let id = self.launch(command, name, network)?;
+        let id = self.launch(command, name, network, project_read_only)?;
 
         // Up to 10 s for the first port (or the end), checked more often than the steady poll.
         let deadline = tokio::time::Instant::now() + self.shared.options.start_wait;
@@ -439,7 +451,7 @@ impl ProcessManager {
     }
 
     /// Spawns its sandbox and the tasks that watch it; its id.
-    fn launch(&self, command: &str, name: Option<&str>, network: bool) -> Result<String, ToolError> {
+    fn launch(&self, command: &str, name: Option<&str>, network: bool, project_read_only: bool) -> Result<String, ToolError> {
         let options = &self.shared.options;
         let root = &options.root;
         let mut state = self.state();
@@ -478,14 +490,8 @@ impl ProcessManager {
             let argv = marv_tools::relay::sandbox_argv_at(&backend.guest_path(&exe), &spec);
             (vec![exe, socket_dir], argv)
         };
-        let mounts = CommandMounts {
-            network,
-            read_only,
-            writable: vec![],
-            placeholders: guard.placeholders,
-            project_read_only: false,
-            binds,
-        };
+        let mounts =
+            CommandMounts { network, read_only, writable: vec![], placeholders: guard.placeholders, project_read_only, binds };
         let mut sandboxed = self.shared.sandbox.prepare(root, &mounts, &inner).map_err(ToolError::from)?;
         let protected = Some(protected_snapshot(root));
         // Only the backend's environment, never Marv's. A spawn that fails drops `sandboxed`, which cleans up.

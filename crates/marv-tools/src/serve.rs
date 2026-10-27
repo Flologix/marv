@@ -14,14 +14,23 @@
 //!   app's fallback). One with an extension that isn't a file is a 404 (a missing script mustn't answer with HTML).
 //! - Content types for html, js, css, svg, json, png, jpg, gif, webp, ico, wasm, maps, fonts, txt and xml; anything
 //!   else `application/octet-stream`. `Cache-Control: no-cache`, so a rebuilt `dist/` shows on reload.
+//! - A request whose `Host` isn't `localhost`, `127.0.0.1` or `[::1]` (with or without a port) is a 403, so a page the
+//!   user has open in their browser can't read the site through a name it controls that resolves to 127.0.0.1 (DNS
+//!   rebinding).
+//! - A hidden entry is never served, whatever the URL says: a link inside the folder that leads to one (`a -> .env`) is
+//!   a 404 too (the check is on the real path).
 //! - One request per connection (`Connection: close`), headers read up to [`MAX_HEAD`] bytes within [`HEAD_TIMEOUT`].
+//!   At most [`MAX_CONNECTIONS`] at once, each write within [`WRITE_TIMEOUT`], a file streamed (up to [`MAX_FILE`]).
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
+use std::sync::Arc;
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 
 /// `marv __serve <folder> <port>`.
 pub const SERVE_SUBCOMMAND: &str = "__serve";
@@ -30,19 +39,88 @@ pub const MAX_HEAD: usize = 16 * 1024;
 /// How long a client has to send its request head.
 pub const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How many connections are served at once; the rest wait to be accepted.
+pub const MAX_CONNECTIONS: usize = 64;
+/// How long one write to a client may take: a client that stops reading doesn't hold a connection.
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the accept loop rests after an error (no free descriptors) instead of spinning.
+pub const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+/// The largest file served (a bigger one is a 413): the server's job is a site's `dist/`.
+pub const MAX_FILE: u64 = 256 * 1024 * 1024;
+
+/// What an answer carries.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Body {
+    Bytes(Vec<u8>),
+    /// A file, streamed from disk: its path and its length when it was found.
+    File {
+        path: PathBuf,
+        len: u64,
+    },
+}
+
 /// One answer: status line text, content type, body.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Reply {
     pub status: u16,
     pub reason: &'static str,
     pub content_type: &'static str,
-    pub body: Vec<u8>,
+    pub body: Body,
 }
 
 impl Reply {
     fn text(status: u16, reason: &'static str) -> Self {
-        Self { status, reason, content_type: "text/plain; charset=utf-8", body: format!("{status} {reason}\n").into_bytes() }
+        Self {
+            status,
+            reason,
+            content_type: "text/plain; charset=utf-8",
+            body: Body::Bytes(format!("{status} {reason}\n").into_bytes()),
+        }
     }
+
+    pub fn len(&self) -> u64 {
+        match &self.body {
+            Body::Bytes(bytes) => bytes.len() as u64,
+            Body::File { len, .. } => *len,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The body's bytes, a file read whole (the tests').
+    pub fn bytes(&self) -> Vec<u8> {
+        match &self.body {
+            Body::Bytes(bytes) => bytes.clone(),
+            Body::File { path, .. } => std::fs::read(path).unwrap_or_default(),
+        }
+    }
+}
+
+/// Whether a `Host` header names this machine's loopback: `localhost`, `127.0.0.1` or `[::1]`, with or without a port.
+/// Anything else (a name an attacker's page resolves to 127.0.0.1) is refused.
+pub fn host_is_local(host: Option<&str>) -> bool {
+    let Some(host) = host.map(str::trim) else { return false };
+    let (name, port) = if host.starts_with('[') {
+        let Some(end) = host.find(']') else { return false };
+        let rest = &host[end + 1..];
+        let port = if rest.is_empty() {
+            None
+        } else if let Some(port) = rest.strip_prefix(':') {
+            Some(port)
+        } else {
+            return false;
+        };
+        (&host[..=end], port)
+    } else {
+        match host.split_once(':') {
+            Some((name, port)) => (name, Some(port)),
+            None => (host, None),
+        }
+    };
+    let port_ok = port.is_none_or(|p| !p.is_empty() && p.len() <= 5 && p.bytes().all(|b| b.is_ascii_digit()));
+    port_ok && (name.eq_ignore_ascii_case("localhost") || name == "127.0.0.1" || name == "[::1]")
 }
 
 /// The `Content-Type` for a file name, by extension.
@@ -105,7 +183,8 @@ fn segments(target: &str) -> Option<Vec<String>> {
     Some(out)
 }
 
-/// A file under `root` (already canonical), after following symlinks: `None` when it isn't a file there.
+/// A file under `root` (already canonical), after following symlinks: `None` when it isn't a file there, or when the
+/// real path under `root` has a hidden component (`dist/a -> .env`: the URL said nothing hidden).
 fn file_under(root: &Path, relative: &[String]) -> Option<PathBuf> {
     let mut path = root.to_path_buf();
     path.extend(relative);
@@ -113,7 +192,9 @@ fn file_under(root: &Path, relative: &[String]) -> Option<PathBuf> {
     if real.is_dir() {
         real = std::fs::canonicalize(real.join("index.html")).ok()?;
     }
-    (real.starts_with(root) && real.is_file()).then_some(real)
+    let inside = real.strip_prefix(root).ok()?;
+    let hidden = inside.components().any(|c| c.as_os_str().to_string_lossy().starts_with('.'));
+    (!hidden && real.is_file()).then_some(real)
 }
 
 /// What `method target` answers, for a folder `root` (canonical).
@@ -128,9 +209,46 @@ pub fn respond(root: &Path, method: &str, target: &str) -> Reply {
         (!has_extension).then(|| file_under(root, &[])).flatten()
     });
     let Some(file) = found else { return Reply::text(404, "Not Found") };
-    match std::fs::read(&file) {
-        Ok(body) => Reply { status: 200, reason: "OK", content_type: content_type(&file), body },
+    match std::fs::metadata(&file) {
+        Ok(meta) if meta.len() > MAX_FILE => Reply::text(413, "Payload Too Large"),
+        Ok(meta) => Reply {
+            status: 200,
+            reason: "OK",
+            content_type: content_type(&file),
+            body: Body::File { path: file, len: meta.len() },
+        },
         Err(_) => Reply::text(404, "Not Found"),
+    }
+}
+
+/// The value of the `Host` header in a request head, if there is one.
+fn host_of(head: &str) -> Option<&str> {
+    head.lines().skip(1).take_while(|l| !l.is_empty()).find_map(|l| {
+        let (name, value) = l.split_once(':')?;
+        name.eq_ignore_ascii_case("host").then_some(value.trim())
+    })
+}
+
+/// A write that gives up after [`WRITE_TIMEOUT`].
+async fn write_in_time(stream: &mut TcpStream, bytes: &[u8]) -> bool {
+    matches!(tokio::time::timeout(WRITE_TIMEOUT, stream.write_all(bytes)).await, Ok(Ok(())))
+}
+
+/// Streams `len` bytes of `path` to `stream`: a chunk at a time, each write within [`WRITE_TIMEOUT`].
+async fn stream_file(stream: &mut TcpStream, path: &Path, len: u64) -> bool {
+    let Ok(file) = tokio::fs::File::open(path).await else { return false };
+    let mut file = file.take(len);
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        match file.read(&mut chunk).await {
+            Ok(0) => return true,
+            Ok(n) => {
+                if !write_in_time(stream, &chunk[..n]).await {
+                    return false;
+                }
+            }
+            Err(_) => return false,
+        }
     }
 }
 
@@ -149,27 +267,51 @@ async fn handle(mut stream: TcpStream, root: PathBuf) {
     let text = String::from_utf8_lossy(&head);
     let mut line = text.lines().next().unwrap_or("").split(' ');
     let (method, target) = (line.next().unwrap_or(""), line.next().unwrap_or(""));
-    let reply = if target.is_empty() { Reply::text(400, "Bad Request") } else { respond(&root, method, target) };
+    let reply = if target.is_empty() {
+        Reply::text(400, "Bad Request")
+    } else if !host_is_local(host_of(&text)) {
+        Reply::text(403, "Forbidden")
+    } else {
+        respond(&root, method, target)
+    };
     let mut out = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
         reply.status,
         reply.reason,
         reply.content_type,
-        reply.body.len()
+        reply.len()
     )
     .into_bytes();
-    if method != "HEAD" {
-        out.extend_from_slice(&reply.body);
+    let wrote = match (&reply.body, method) {
+        (Body::Bytes(bytes), m) if m != "HEAD" => {
+            out.extend_from_slice(bytes);
+            write_in_time(&mut stream, &out).await
+        }
+        (Body::File { path, len }, m) if m != "HEAD" => {
+            write_in_time(&mut stream, &out).await && stream_file(&mut stream, path, *len).await
+        }
+        _ => write_in_time(&mut stream, &out).await,
+    };
+    if wrote {
+        let _ = tokio::time::timeout(WRITE_TIMEOUT, stream.shutdown()).await;
     }
-    let _ = stream.write_all(&out).await;
-    let _ = stream.shutdown().await;
 }
 
 /// Serves `root` (canonical) on `listener` until the task ends.
 pub async fn serve(listener: TcpListener, root: PathBuf) {
+    let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     loop {
-        let Ok((stream, _)) = listener.accept().await else { continue };
-        tokio::spawn(handle(stream, root.clone()));
+        // A free slot first: past the limit, connections wait in the listener's backlog.
+        let Ok(slot) = slots.clone().acquire_owned().await else { return };
+        let Ok((stream, _)) = listener.accept().await else {
+            tokio::time::sleep(ACCEPT_BACKOFF).await;
+            continue;
+        };
+        let root = root.clone();
+        tokio::spawn(async move {
+            handle(stream, root).await;
+            drop(slot);
+        });
     }
 }
 
@@ -229,9 +371,9 @@ mod tests {
     #[test]
     fn root_and_folders_answer_their_index_and_files_their_content_type() {
         let dir = site();
-        assert_eq!(get(&dir, "/").body, b"<h1>app</h1>");
-        assert_eq!(get(&dir, "/docs/").body, b"<h1>docs</h1>");
-        assert_eq!(get(&dir, "/docs").body, b"<h1>docs</h1>");
+        assert_eq!(get(&dir, "/").bytes(), b"<h1>app</h1>");
+        assert_eq!(get(&dir, "/docs/").bytes(), b"<h1>docs</h1>");
+        assert_eq!(get(&dir, "/docs").bytes(), b"<h1>docs</h1>");
         for (target, kind) in [
             ("/", "text/html; charset=utf-8"),
             ("/assets/app.js", "text/javascript; charset=utf-8"),
@@ -252,7 +394,7 @@ mod tests {
         ] {
             assert_eq!(content_type(Path::new(name)), kind, "{name}");
         }
-        assert_eq!(get(&dir, "/assets/app.js?v=3#x").body, b"console.log(1)", "the query is dropped");
+        assert_eq!(get(&dir, "/assets/app.js?v=3#x").bytes(), b"console.log(1)", "the query is dropped");
         assert_eq!(get(&dir, "/assets/a%70p.js").status, 200, "percent-decoded");
     }
 
@@ -260,7 +402,7 @@ mod tests {
     fn a_route_without_an_extension_falls_back_to_the_index_and_a_missing_file_is_a_404() {
         let dir = site();
         let route = get(&dir, "/users/42/settings");
-        assert_eq!((route.status, route.body.as_slice()), (200, b"<h1>app</h1>".as_slice()));
+        assert_eq!((route.status, route.bytes().as_slice()), (200, b"<h1>app</h1>".as_slice()));
         assert_eq!(get(&dir, "/assets/missing.js").status, 404, "a missing script isn't HTML");
         assert_eq!(get(&dir, "/nothing.html").status, 404);
         // No index.html: a route is a 404 too.
@@ -285,9 +427,9 @@ mod tests {
             "/%zz",
             "no-slash",
         ] {
-            assert_ne!(get(&dir, target).body, b"SECRET=1", "{target}");
+            assert_ne!(get(&dir, target).bytes(), b"SECRET=1", "{target}");
             let reply = get(&dir, target);
-            assert!(reply.status == 404 || reply.body == b"<h1>app</h1>", "{target}: {reply:?}");
+            assert!(reply.status == 404 || reply.bytes() == b"<h1>app</h1>", "{target}: {reply:?}");
         }
         assert_eq!(get(&dir, "/.env").status, 404);
         // A symlink that leads out of the folder is a 404.
@@ -299,6 +441,85 @@ mod tests {
         assert_eq!(get(&dir, "/out/key.txt").status, 404);
         // Only GET and HEAD.
         assert_eq!(respond(&std::fs::canonicalize(dir.path()).unwrap(), "POST", "/").status, 405);
+    }
+
+    #[test]
+    fn only_the_loopback_names_are_local_hosts() {
+        for host in ["localhost", "LocalHost:4173", "127.0.0.1", "127.0.0.1:80", "[::1]", "[::1]:4173", " localhost "] {
+            assert!(host_is_local(Some(host)), "{host}");
+        }
+        for host in [
+            "",
+            "evil.example",
+            "localhost.evil.example",
+            "evil.example:80",
+            "127.0.0.2",
+            "0.0.0.0",
+            "[::2]",
+            "[::1",
+            "[::1]x",
+            "localhost:",
+            "localhost:abc",
+            "localhost:123456",
+            "[::1]:",
+            "::1",
+            "localhost@evil",
+            "127.0.0.1.evil.example",
+        ] {
+            assert!(!host_is_local(Some(host)), "{host:?}");
+        }
+        assert!(!host_is_local(None));
+        assert_eq!(host_of("GET / HTTP/1.1\r\nAccept: */*\r\nHOST: localhost:1\r\n\r\n"), Some("localhost:1"));
+        assert_eq!(host_of("GET / HTTP/1.1\r\n\r\nHost: localhost\r\n"), None, "a header after the head isn't one");
+    }
+
+    #[test]
+    fn a_link_to_a_hidden_file_inside_the_folder_and_a_file_over_the_cap_are_not_served() {
+        let dir = site();
+        std::fs::create_dir_all(dir.path().join("dist")).unwrap();
+        std::fs::create_dir_all(dir.path().join("dist/.git")).unwrap();
+        std::fs::write(dir.path().join("dist/index.html"), "<h1>dist</h1>").unwrap();
+        std::fs::write(dir.path().join("dist/.env"), "SECRET").unwrap();
+        std::fs::write(dir.path().join("dist/.git/config.txt"), "TOKEN").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("dist/.env"), dir.path().join("dist/a.txt")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("dist/.git"), dir.path().join("dist/g")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("logo.svg"), dir.path().join("dist/logo.svg")).unwrap();
+        let root = std::fs::canonicalize(dir.path().join("dist")).unwrap();
+        let root_get = |target: &str| respond(&root, "GET", target);
+        assert_eq!(root_get("/.env").status, 404, "the URL itself");
+        assert_eq!(root_get("/a.txt").status, 404, "a.txt -> .env");
+        assert_eq!(root_get("/g/config.txt").status, 404, "g -> .git");
+        assert_eq!(root_get("/logo.svg").status, 404, "a link out of the folder (to a visible file)");
+        assert_eq!(root_get("/").bytes(), b"<h1>dist</h1>");
+        // A folder under a hidden one (the served folder itself) is fine: only what's below the root counts.
+        let hidden_root = TempDir::new(".serve-hidden-root");
+        std::fs::write(hidden_root.path().join("index.html"), "ok").unwrap();
+        assert_eq!(get(&hidden_root, "/").bytes(), b"ok");
+        // A sparse file over the cap is a 413, not read.
+        let big = std::fs::File::create(dir.path().join("big.bin")).unwrap();
+        big.set_len(MAX_FILE + 1).unwrap();
+        assert_eq!(get(&dir, "/big.bin").status, 413);
+    }
+
+    #[tokio::test]
+    async fn a_big_file_is_streamed_whole_and_a_stuck_client_doesnt_stop_the_others() {
+        let dir = site();
+        let body: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(dir.path().join("big.bin"), &body).unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let task = tokio::spawn(serve(listener, root));
+        // A client that connects and says nothing holds one slot, not the server.
+        let _idle = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).await.unwrap();
+        let mut stream = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).await.unwrap();
+        stream.write_all(b"GET /big.bin HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
+        let mut got = Vec::new();
+        stream.read_to_end(&mut got).await.unwrap();
+        let split = got.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        assert!(String::from_utf8_lossy(&got[..split]).contains("Content-Length: 3000000\r\n"));
+        assert_eq!(&got[split..], body.as_slice());
+        task.abort();
     }
 
     #[tokio::test]
@@ -319,12 +540,23 @@ mod tests {
         assert!(got.starts_with("HTTP/1.1 200 OK\r\n"), "{got}");
         assert!(got.contains("Content-Type: text/javascript; charset=utf-8\r\n") && got.contains("Content-Length: 14\r\n"));
         assert!(got.ends_with("\r\n\r\nconsole.log(1)"), "{got}");
-        let head = ask("HEAD / HTTP/1.1\r\n\r\n").await;
+        let head = ask("HEAD / HTTP/1.1\r\nHost: 127.0.0.1:4173\r\n\r\n").await;
         assert!(head.starts_with("HTTP/1.1 200 OK") && head.ends_with("\r\n\r\n"), "{head}");
-        let missing = ask("GET /x.png HTTP/1.1\r\n\r\n").await;
+        let missing = ask("GET /x.png HTTP/1.1\r\nhost: [::1]\r\n\r\n").await;
         assert!(missing.starts_with("HTTP/1.1 404 Not Found"), "{missing}");
         let bad = ask("\r\n\r\n").await;
         assert!(bad.starts_with("HTTP/1.1 400"), "{bad}");
+        // DNS rebinding: a name that isn't the machine's loopback (or no Host at all) is a 403, whatever it asks for.
+        for request in [
+            "GET / HTTP/1.1\r\nHost: evil.example\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: evil.example:4173\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: localhost.evil.example\r\n\r\n",
+            "GET / HTTP/1.1\r\n\r\n",
+        ] {
+            let refused = ask(request).await;
+            assert!(refused.starts_with("HTTP/1.1 403 Forbidden"), "{request}: {refused}");
+            assert!(!refused.contains("<h1>app</h1>"));
+        }
         task.abort();
     }
 }

@@ -82,6 +82,21 @@ pub struct ProcessInput {
 fn serve_folder(input: &ProcessInput, ctx: &ToolContext) -> Result<PathBuf, ToolError> {
     let given = input.path.as_deref().unwrap_or("");
     let path = marv_sandbox::resolve_in_project(&ctx.root, given, &ctx.home).map_err(|e| ToolError::new(e.to_string()))?;
+    // Not the whole project (its `.git`, `.env`, sources and notes are not a website) and not a hidden folder (`.git`,
+    // `.marv`, `.cache`): a page the user opens could be fetched from by any site they browse (the server also checks
+    // `Host`, and hides dot entries inside the folder).
+    let real = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+    let project = std::fs::canonicalize(&ctx.root).unwrap_or_else(|_| ctx.root.clone());
+    let hidden = |p: &std::path::Path| {
+        p.strip_prefix(&project).is_ok_and(|rel| {
+            rel.components().any(|c| matches!(c, std::path::Component::Normal(n) if n.to_string_lossy().starts_with('.')))
+        })
+    };
+    if real == project || hidden(&real) || hidden(&path) {
+        return Err(ToolError::new(format!(
+            "path: {given} can't be served: serve takes a build folder inside the project (e.g. dist), not the project itself or a hidden folder like .git."
+        )));
+    }
     match std::fs::metadata(&path) {
         Ok(meta) if meta.is_dir() => Ok(path),
         Ok(_) => Err(ToolError::new(format!("path: {given} is a file, not a folder: serve takes a folder (e.g. dist)."))),
@@ -253,7 +268,7 @@ impl Tool for ProcessTool {
                 title: "Serve a folder as a website".into(),
                 command: Some(format!("marv serve {shown}")),
                 note: Some(format!(
-                    "{} · its own sandbox · no network · read-only files, nothing else · its port forwarded to your 127.0.0.1",
+                    "{} · its own sandbox · no network · the project read-only, nothing else visible · its port forwarded to your 127.0.0.1",
                     folder.display()
                 )),
                 ..Preview::default()
@@ -565,7 +580,9 @@ mod tests {
     #[tokio::test]
     async fn serve_asks_like_start_and_stays_inside_the_project() {
         let dir = crate::test_support::TempDir::new("process-serve");
-        std::fs::create_dir_all(dir.path().join("dist")).unwrap();
+        for hidden in ["dist", ".git", ".marv/site", "dist/.cache"] {
+            std::fs::create_dir_all(dir.path().join(hidden)).unwrap();
+        }
         std::fs::write(dir.path().join("index.html"), "x").unwrap();
         let host = Arc::new(Fake::default());
         let asked = Arc::new(Asked(Mutex::default(), Decision::Yes));
@@ -590,6 +607,12 @@ mod tests {
             (json!({"action": "serve", "path": "../outside"}), ""),
             (json!({"action": "serve", "path": "/etc"}), ""),
             (json!({"action": "serve", "path": "index.html"}), "is a file, not a folder"),
+            (json!({"action": "serve", "path": "."}), "can't be served"),
+            (json!({"action": "serve", "path": "./"}), "can't be served"),
+            (json!({"action": "serve", "path": "dist/.."}), "can't be served"),
+            (json!({"action": "serve", "path": ".git"}), "can't be served"),
+            (json!({"action": "serve", "path": ".marv/site"}), "can't be served"),
+            (json!({"action": "serve", "path": "dist/.cache"}), "can't be served"),
             (json!({"action": "serve", "path": "nope"}), "doesn't exist"),
             (json!({"action": "serve", "path": "dist", "port": 80}), "port: must be between"),
         ] {
