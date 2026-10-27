@@ -96,6 +96,49 @@ pub fn scratch_dir(swap: &Path) -> std::io::Result<PathBuf> {
     Ok(dir)
 }
 
+/// How much a session's scratch folder may hold when the session starts or resumes (512 MB): over it, it is emptied
+/// ([`trim_scratch`]), so a chat's `/tmp` can't grow without bound across sessions.
+pub const SCRATCH_CAP_BYTES: u64 = 512 * 1024 * 1024;
+
+/// The size of what a folder holds, links counted as themselves (never followed). Stops counting past `limit`.
+fn folder_size(dir: &Path, limit: u64) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(next) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&next) else { continue };
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else { continue };
+            total += meta.len();
+            if meta.is_dir() {
+                stack.push(entry.path());
+            }
+            if total > limit {
+                return total;
+            }
+        }
+    }
+    total
+}
+
+/// Empties the scratch folder of the swap folder `swap` when it holds more than `cap` bytes. Returns whether it did.
+/// Its entries are removed, never followed (a link goes, not what it points at); the folder stays.
+pub fn trim_scratch(swap: &Path, cap: u64) -> bool {
+    let dir = swap.join(SCRATCH);
+    if !std::fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) || folder_size(&dir, cap) <= cap {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(&dir) else { return false };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            let _ = std::fs::remove_dir_all(&path);
+        } else {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    true
+}
+
 fn page_file(dir: &Path, page: u32) -> PathBuf {
     dir.join(format!("{page}.jsonl"))
 }
@@ -433,6 +476,23 @@ pub(crate) mod tests {
         assert!(scratch_dir(&dir.path().join("s4.swap").with_file_name("s5.swap")).is_ok());
         // It isn't a page.
         assert!(saved_pages(&swap).is_empty());
+    }
+
+    #[test]
+    fn a_scratch_folder_over_the_cap_is_emptied_and_one_under_it_is_kept() {
+        let dir = TempDir::new("scratch-cap");
+        let swap = dir.path().join("s1.swap");
+        assert!(!trim_scratch(&swap, 10), "no scratch folder: nothing to do");
+        let scratch = scratch_dir(&swap).unwrap();
+        std::fs::create_dir_all(scratch.join("nested")).unwrap();
+        std::fs::write(scratch.join("nested/big.bin"), vec![0u8; 100]).unwrap();
+        let outside = dir.path().join("outside.txt");
+        std::fs::write(&outside, "mine").unwrap();
+        std::os::unix::fs::symlink(&outside, scratch.join("link")).unwrap();
+        assert!(!trim_scratch(&swap, 1_000) && scratch.join("nested/big.bin").exists());
+        assert!(trim_scratch(&swap, 50));
+        assert!(scratch.is_dir() && std::fs::read_dir(&scratch).unwrap().next().is_none());
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "mine");
     }
 
     /// A page with a user message, a read, a web fetch and an edit (shared with `swap`'s tests).

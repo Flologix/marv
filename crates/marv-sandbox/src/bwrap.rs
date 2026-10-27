@@ -20,7 +20,8 @@
 //!   `/dev/null` (a read-only mount doesn't stop a `connect()` or a write into a FIFO). See `home_masks`;
 //! - Marv's config folder (`MARV_CONFIG_DIR`) is an empty tmpfs wherever it is, except inside the stand-in home,
 //!   which hides it already;
-//! - bun's download cache is a throwaway one in that `/tmp` (`BUN_INSTALL_CACHE_DIR=/tmp/bun-cache`): a shared or
+//! - bun's download cache is a throwaway one in that `/tmp` (`BUN_INSTALL_CACHE_DIR=/tmp/bun-cache`; its own tmpfs
+//!   per command even where `/tmp` is the chat's persistent scratch folder): a shared or
 //!   host cache would let one sandboxed command (an install's lifecycle scripts) plant packages for another context;
 //! - no network unless the call asked (`--unshare-net`); known limit: with network the sandbox shares the host's
 //!   network namespace, so abstract Unix sockets (X11's) are reachable, which is why such calls always ask;
@@ -43,6 +44,9 @@ pub use crate::plan::{Bind, Plan};
 
 /// One bwrap invocation's mounts: the [`Plan`], under the name it had before there was a second backend.
 pub type SandboxOptions = Plan;
+
+/// bun's download cache inside the sandbox (`BUN_INSTALL_CACHE_DIR`, `Plan::env`): always a per-command tmpfs.
+const BUN_CACHE_DIR: &str = "/tmp/bun-cache";
 
 /// Where the mesh plug's socket appears inside the sandbox: the one thing in the otherwise empty `/run`.
 pub const MESH_SOCKET: &str = "/run/marv/mesh.sock";
@@ -110,7 +114,15 @@ pub fn sandbox_args(opts: &SandboxOptions, fs: &dyn FsProbe) -> Result<Vec<OsStr
     ]);
     // /tmp: the session's scratch folder when it has one (first, while its real path is still shown), else empty.
     match &opts.scratch {
-        Some(scratch) => push(&["--bind".as_ref(), scratch.as_os_str(), "/tmp".as_ref()]),
+        Some(scratch) => push(&[
+            "--bind".as_ref(),
+            scratch.as_os_str(),
+            "/tmp".as_ref(),
+            // bun's download cache stays a per-command tmpfs: a cache that outlived the command would let one
+            // command plant packages for the next, and it would grow without bound.
+            "--tmpfs".as_ref(),
+            BUN_CACHE_DIR.as_ref(),
+        ]),
         None => push(&["--tmpfs".as_ref(), "/tmp".as_ref()]),
     }
     push(&["--tmpfs".as_ref(), home]);
@@ -604,6 +616,10 @@ mod tests {
         // Before the hidden folders, so the real path is still there to bind; the TMPDIR is /tmp either way.
         assert!(args.find("--bind /home/me/.marv/sessions").unwrap() < args.find("--tmpfs /home/me ").unwrap(), "{args}");
         assert!(args.contains("--setenv TMPDIR /tmp"), "{args}");
+        // bun's cache is not kept with it.
+        assert!(args.contains("--tmpfs /tmp/bun-cache "), "{args}");
+        assert!(args.find("--bind /home/me/.marv/sessions").unwrap() < args.find("--tmpfs /tmp/bun-cache").unwrap(), "{args}");
+        assert!(!plain.contains("--tmpfs /tmp/bun-cache"), "{plain}");
     }
 
     #[test]
