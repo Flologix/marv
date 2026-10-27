@@ -197,12 +197,39 @@ pub fn usage_report(totals: &Totals, last: Option<&Usage>, context_length: Optio
         };
         lines.push(format!("Context: {}{of}", tokens(used)));
     }
-    // More than one model served the session (a /model switch, a subagent's own): where the requests went.
-    if totals.models.len() > 1 {
+    // More than one model served the session (a /model switch, a subagent's own): where the requests went. A session
+    // saved before the breakdown was kept has requests no model row holds: they are the "earlier" row, so the rows add
+    // up to the totals.
+    let sum = totals.models.values().fold(ModelTotals::default(), |acc, m| ModelTotals {
+        requests: acc.requests + m.requests,
+        prompt_tokens: acc.prompt_tokens + m.prompt_tokens,
+        cached_tokens: acc.cached_tokens + m.cached_tokens,
+        completion_tokens: acc.completion_tokens + m.completion_tokens,
+        cost: match (acc.cost, m.cost) {
+            (Some(a), Some(b)) => Some(a + b),
+            (None, b) => b,
+            (a, None) => a,
+        },
+        estimated: None,
+    });
+    let earlier = (totals.requests > sum.requests).then(|| ModelTotals {
+        requests: totals.requests - sum.requests,
+        prompt_tokens: totals.prompt_tokens.saturating_sub(sum.prompt_tokens),
+        cached_tokens: totals.cached_tokens.saturating_sub(sum.cached_tokens),
+        completion_tokens: totals.completion_tokens.saturating_sub(sum.completion_tokens),
+        cost: match (totals.cost, sum.cost) {
+            (Some(t), Some(s)) => Some((t - s).max(0.0)),
+            (Some(t), None) => Some(t),
+            _ => None,
+        },
+        estimated: totals.estimated,
+    });
+    if totals.models.len() > 1 || (!totals.models.is_empty() && earlier.is_some()) {
         lines.push("By model:".into());
-        let mut models: Vec<_> = totals.models.iter().collect();
+        let mut models: Vec<_> = totals.models.iter().map(|(k, v)| (k.as_str(), v)).collect();
         models.sort_by(|a, b| b.1.requests.cmp(&a.1.requests).then(a.0.cmp(b.0)));
-        for (model, m) in models {
+        let earlier = earlier.as_ref().map(|e| ("earlier (before the per-model breakdown)", e));
+        for (model, m) in models.into_iter().chain(earlier) {
             let as_totals = Totals { requests: m.requests, cost: m.cost, estimated: m.estimated, ..Totals::default() };
             let cost = cost_text(&as_totals);
             lines.push(format!(
@@ -310,6 +337,27 @@ mod tests {
         assert!(old.models.is_empty() && old.requests == 4);
         assert!(!serde_json::to_string(&old).unwrap().contains("models"));
         assert_eq!(serde_json::from_str::<Totals>(&serde_json::to_string(&t).unwrap()).unwrap(), t);
+    }
+
+    #[test]
+    fn a_model_switch_on_an_old_session_shows_the_requests_before_it_as_earlier() {
+        let mut t: Totals =
+            serde_json::from_str(r#"{"requests":4,"promptTokens":9000,"cachedTokens":1000,"completionTokens":400,"cost":0.02}"#)
+                .unwrap();
+        t = add_model_usage(&t, "new-model", &usage(1000, 100, Some(0), Some(0.005)), &Prices::default());
+        assert_eq!((t.requests, t.prompt_tokens), (5, 10_000));
+        let report = usage_report(&t, None, None);
+        assert!(report.contains("By model:"), "{report}");
+        assert!(report.contains("new-model: 1 request, 1k in (0 cached), 100 out, $0.005"), "{report}");
+        assert!(report.contains("earlier (before the per-model breakdown): 4 requests, 9k in (1k cached), 400 out"), "{report}");
+        // Rows that add up (a new session) have no such row.
+        let fresh = add_model_usage(
+            &add_model_usage(&Totals::default(), "a", &usage(1, 1, None, None), &Prices::default()),
+            "b",
+            &usage(1, 1, None, None),
+            &Prices::default(),
+        );
+        assert!(!usage_report(&fresh, None, None).contains("earlier"));
     }
 
     #[test]
