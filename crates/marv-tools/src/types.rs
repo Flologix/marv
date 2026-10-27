@@ -235,6 +235,11 @@ pub trait ProcessHost: Send + Sync {
     /// Stops it and forgets it; false when there's none of that name.
     async fn stop(&self, name: &str) -> bool;
     fn list(&self) -> Vec<ProcessInfo>;
+    /// Starts Marv's own static file server on `dir` (an existing folder inside the project, absolute) in its own
+    /// sandbox, like `start` without network: the `serve` action. `port`: the one to listen on (else a free one).
+    async fn serve(&self, _dir: &std::path::Path, _port: Option<u16>) -> Result<StartResult, ToolError> {
+        Err(ToolError::new("This session can't serve a folder."))
+    }
     /// A one-shot session (`marv -p`): Marv stops every process when it exits after the reply (#86).
     fn one_shot(&self) -> bool {
         false

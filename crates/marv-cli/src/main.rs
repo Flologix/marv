@@ -6,6 +6,7 @@
 //! - `__html-convert` (hidden): the web reader's converter process (`marv_tools::web::html_convert_cli::main`);
 //! - `__run-checks <spec>` (hidden): the project checks' runner, inside the sandbox (`marv_session::checks::runner`);
 //! - `__relay <spec>` (hidden): the process door's relay, inside a sandbox (`marv_tools::relay`, Marv #51);
+//! - `__serve <folder> <port>` (hidden): the process tool's static file server, inside a sandbox (`marv_tools::serve`);
 //! - `__guard <parent-pid> -- <command…>` (hidden): runs a sandboxed command in a session of its own and kills its
 //!   process group when Marv dies, for a backend without a PID namespace (`marv_tools::guard`, #165).
 //!
@@ -70,6 +71,9 @@ fn main() -> ExitCode {
     }
     if let Mode::Relay { spec } = &mode {
         return marv_tools::relay::main(spec);
+    }
+    if let Mode::Serve { folder, port } = &mode {
+        return marv_tools::serve::main(folder, *port);
     }
     if let Mode::Guard { parent, command } = &mode {
         return marv_tools::guard::main(*parent, command);
@@ -136,7 +140,7 @@ async fn run_mode(cli: Cli, mode: Mode, quit: signals::Quit) -> i32 {
                 1
             }
         },
-        Mode::HtmlConvert | Mode::RunChecks { .. } | Mode::Relay { .. } | Mode::Guard { .. } => {
+        Mode::HtmlConvert | Mode::RunChecks { .. } | Mode::Relay { .. } | Mode::Serve { .. } | Mode::Guard { .. } => {
             unreachable!("handled before the runtime starts")
         }
     }

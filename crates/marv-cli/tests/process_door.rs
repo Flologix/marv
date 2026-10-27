@@ -31,10 +31,14 @@ fn free_port() -> u16 {
 
 /// `GET /hello.txt` on the host's 127.0.0.1:<port>, as a browser would; None when nothing answers.
 fn get(port: u16) -> Option<String> {
+    get_path(port, "/hello.txt")
+}
+
+fn get_path(port: u16, path: &str) -> Option<String> {
     use std::io::{Read, Write};
     let mut conn = std::net::TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), Duration::from_secs(2)).ok()?;
     conn.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-    conn.write_all(b"GET /hello.txt HTTP/1.0\r\n\r\n").ok()?;
+    conn.write_all(format!("GET {path} HTTP/1.0\r\n\r\n").as_bytes()).ok()?;
     let mut reply = String::new();
     conn.read_to_string(&mut reply).ok()?;
     Some(reply)
@@ -124,6 +128,76 @@ fn marv_p_starts_a_dev_server_bash_curls_it_the_host_reaches_it_and_nothing_outl
     let left = Command::new("pgrep").args(["-f", &marker]).output().unwrap();
     assert_eq!(String::from_utf8_lossy(&left.stdout).trim(), "");
     assert!(get(port).is_none());
+}
+
+#[test]
+fn marv_p_serves_a_project_folder_with_the_built_in_server_and_nothing_outlives_marv() {
+    if !bwrap_works() {
+        eprintln!("skipped: needs bubblewrap");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("marv-serve-door-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for sub in ["proj/dist/assets", "home", "config", "run"] {
+        std::fs::create_dir_all(dir.join(sub)).unwrap();
+    }
+    let dir = Dir(dir.canonicalize().unwrap());
+    let project = dir.0.join("proj");
+    std::fs::write(project.join("dist/index.html"), "<h1>SERVED-INDEX</h1>").unwrap();
+    std::fs::write(project.join("dist/assets/app.js"), "console.log('SERVED-JS')").unwrap();
+    std::fs::write(project.join("secret.txt"), "OUTSIDE-DIST").unwrap();
+    let port = free_port();
+    let wait = "for i in $(seq 1 300); do [ -e checked ] && break; sleep 0.1; done; echo waited";
+    let server = FakeServer::start(
+        vec![
+            call("c1", "process", json!({"action": "serve", "path": "dist", "port": port})),
+            call("c2", "bash", json!({"command": wait})),
+            reply(json!({"text": "Done."})),
+        ],
+        Vec::new(),
+    )
+    .unwrap();
+    let settings = Value::Object(marv_oracle::runner::default_config(&server.base_url()));
+    std::fs::write(dir.0.join("config/config.json"), settings.to_string()).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_marv"))
+        .args(["-p", "serve dist", "--approve", "process", "--output", "json"])
+        .current_dir(&project)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", dir.0.join("home"))
+        .env("MARV_CONFIG_DIR", dir.0.join("config"))
+        .env("XDG_RUNTIME_DIR", dir.0.join("run"))
+        .env("MARV_GITHUB", "off")
+        .env("TERM", "dumb")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut child = Guard(Some(child));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let index = loop {
+        if let Some(page) = get_path(port, "/").filter(|p| p.contains("SERVED-INDEX")) {
+            break page;
+        }
+        assert!(Instant::now() < deadline, "the served folder never answered");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(index.starts_with("HTTP/1.1 200") && index.contains("text/html"), "{index}");
+    let js = get_path(port, "/assets/app.js").unwrap();
+    assert!(js.contains("text/javascript") && js.contains("SERVED-JS"), "{js}");
+    assert!(get_path(port, "/users/7").unwrap().contains("SERVED-INDEX"), "an app route falls back to the index");
+    assert!(get_path(port, "/assets/nope.js").unwrap().starts_with("HTTP/1.1 404"));
+    let escape = get_path(port, "/../secret.txt").unwrap();
+    assert!(!escape.contains("OUTSIDE-DIST"), "{escape}");
+    assert!(!get_path(port, "/%2e%2e/secret.txt").unwrap().contains("OUTSIDE-DIST"));
+    std::fs::write(project.join("checked"), "").unwrap();
+    let out = child.0.take().unwrap().wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    let bodies: Vec<String> = server.requests().into_iter().filter(|r| r.method == "POST").map(|r| r.body).collect();
+    assert!(bodies.last().unwrap().contains(&format!("http://localhost:{port}")), "{}", bodies.last().unwrap());
+    assert!(get_path(port, "/").is_none(), "nothing outlives Marv");
 }
 
 /// Kills the child if an assertion fails midway.

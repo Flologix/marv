@@ -16,6 +16,7 @@
 //! - `--version`/`-v` and `--help`/`-h` exit 0, as in Marv.
 //! - `__html-convert` is hidden: the web reader re-executes `marv __html-convert` to convert a page in a process of
 //!   its own (a conversion that crashes is an answer, not a crash).
+//! - `__serve <folder> <port>` is hidden: the process tool's static file server (`marv_tools::serve`).
 //! - `__guard <parent-pid> -- <command…>` is hidden: Seatbelt's process supervisor (#165, `marv_tools::guard`).
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
@@ -129,6 +130,9 @@ pub enum Command {
     /// The process door's relay, inside a sandbox (Marv #51): `marv_tools::relay`.
     #[command(name = "__relay", hide = true)]
     Relay { spec: String },
+    /// The process tool's static file server for a project folder, inside a sandbox: `marv_tools::serve`.
+    #[command(name = marv_tools::serve::SERVE_SUBCOMMAND, hide = true)]
+    Serve { folder: String, port: u16 },
     /// Runs a command in a session of its own and kills its process group when `parent` dies (#165): `guard`.
     #[command(name = marv_sandbox::seatbelt_backend::GUARD_SUBCOMMAND, hide = true)]
     Guard {
@@ -186,6 +190,10 @@ pub enum Mode {
     Relay {
         spec: String,
     },
+    Serve {
+        folder: String,
+        port: u16,
+    },
     Guard {
         parent: u32,
         command: Vec<std::ffi::OsString>,
@@ -207,6 +215,7 @@ impl Cli {
             Some(Command::HtmlConvert) => Mode::HtmlConvert,
             Some(Command::RunChecks { spec }) => Mode::RunChecks { spec: spec.clone() },
             Some(Command::Relay { spec }) => Mode::Relay { spec: spec.clone() },
+            Some(Command::Serve { folder, port }) => Mode::Serve { folder: folder.clone(), port: *port },
             Some(Command::Guard { parent, command }) => Mode::Guard { parent: *parent, command: command.clone() },
             None => match &self.prompt {
                 Some(prompt) => Mode::Headless { prompt: prompt.clone() },
@@ -258,6 +267,7 @@ mod tests {
         assert_eq!(parse(&["__html-convert"]).mode(), Mode::HtmlConvert);
         assert_eq!(parse(&["__run-checks", "{}"]).mode(), Mode::RunChecks { spec: "{}".into() });
         assert_eq!(parse(&["__relay", "{}"]).mode(), Mode::Relay { spec: "{}".into() });
+        assert_eq!(parse(&["__serve", "dist", "4173"]).mode(), Mode::Serve { folder: "dist".into(), port: 4173 });
         assert_eq!(
             parse(&["__guard", "42", "--", "bash", "-c", "--x"]).mode(),
             Mode::Guard { parent: 42, command: vec!["bash".into(), "-c".into(), "--x".into()] }

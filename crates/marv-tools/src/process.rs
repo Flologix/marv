@@ -5,11 +5,15 @@
 //!
 //! - Starting one asks (a door out of the sandbox: it outlives the turn and the user can reach it), even in yolo (no
 //!   `auto_safe`); reading its logs, listing and stopping don't (stopping your own process can't hurt).
+//! - `serve` (marv-rs) is a start of Marv's own static file server (`crate::serve`, `marv __serve`) on a folder of the
+//!   project: the same door, the same ask (scope `process:serve:<folder>`), the same sandbox without network, the same
+//!   port forwarding. It needs no command, so a machine without `serve` or `python` can still show `dist/`.
 //! - Scope `process:[net:]<command>` ("starting this exact command in the background"); `door` is `process` for a
 //!   start. A start with `network: true` uses the network (it shares the user's).
 //! - The door is the context's to open (set for the main agent only), not the approver's: without it a start is
 //!   refused in `preview`, before anyone is asked, and again in `run`, so no path skips it ([`NO_PROCESS_DOOR`]).
 
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -21,6 +25,9 @@ use crate::types::{Preview, ProcessInfo, ProcessState, Scope, Tool, ToolContext,
 /// Said when a call has no process door: subagents (their process would outlive their report), or a session without
 /// one.
 pub const NO_PROCESS_DOOR: &str = "Background processes can only be started by the main agent, in a session that offers them.";
+/// What the description says about `serve`, one sentence the oracle takes back out (`marv_oracle::runner::MARV_RS_TEXT`).
+pub const SERVE_SENTENCE: &str =
+    " serve (with path, and optionally port) serves a project folder such as dist as a static website, no command needed.";
 /// The most lines `logs` returns.
 pub const MAX_LOG_LINES: usize = 400;
 /// What `logs` returns without `lines`.
@@ -29,7 +36,7 @@ pub const DEFAULT_LOG_LINES: usize = 50;
 /// Deliberate difference (marv-rs #81): Marv's ends at "network: true". GLM reached for `start` to run a one-off
 /// clone-and-count (it sent no command, see [`missing_command`]): the last sentence says what start is not for. The
 /// oracle maps it back to Marv's (`marv_oracle::runner::MARV_RS_TEXT`).
-pub const PROCESS_DESCRIPTION: &str = "Run something that should keep running (a dev server, a watcher) in its own sandbox, across turns, until stopped or Marv exits. start runs a shell command and waits up to 10 s for it to listen on a port: the ports it listens on (1024 and up) are forwarded to the user's localhost, and your bash commands can reach them too (curl localhost:<port>). logs reads its output, stop ends it and everything it started, list shows them all. The user is asked before each start. Like bash's sandbox: only the project folder is writable, no network unless network: true. start always needs command; a command that finishes on its own belongs in bash.";
+pub const PROCESS_DESCRIPTION: &str = "Run something that should keep running (a dev server, a watcher) in its own sandbox, across turns, until stopped or Marv exits. start runs a shell command and waits up to 10 s for it to listen on a port: the ports it listens on (1024 and up) are forwarded to the user's localhost, and your bash commands can reach them too (curl localhost:<port>). logs reads its output, stop ends it and everything it started, list shows them all. The user is asked before each start. serve (with path, and optionally port) serves a project folder such as dist as a static website, no command needed. Like bash's sandbox: only the project folder is writable, no network unless network: true. start always needs command; a command that finishes on its own belongs in bash.";
 
 /// #81: a start without `command` says what to send and what did arrive. On GLM via OpenRouter the call came as
 /// `{"action": "start"}` although the model's reasoning had written a command too; "start needs a command" alone
@@ -53,6 +60,8 @@ pub enum ProcessAction {
     Logs,
     Stop,
     List,
+    /// marv-rs: Marv's own static file server on a project folder.
+    Serve,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -63,6 +72,21 @@ pub struct ProcessInput {
     pub name: Option<String>,
     pub network: Option<bool>,
     pub lines: Option<u64>,
+    /// serve: the project folder to serve.
+    pub path: Option<String>,
+    /// serve: the port to listen on (1024 and up); a free one when absent.
+    pub port: Option<u64>,
+}
+
+/// The folder a `serve` call names: inside the project (symlinks included), existing, and a folder.
+fn serve_folder(input: &ProcessInput, ctx: &ToolContext) -> Result<PathBuf, ToolError> {
+    let given = input.path.as_deref().unwrap_or("");
+    let path = marv_sandbox::resolve_in_project(&ctx.root, given, &ctx.home).map_err(|e| ToolError::new(e.to_string()))?;
+    match std::fs::metadata(&path) {
+        Ok(meta) if meta.is_dir() => Ok(path),
+        Ok(_) => Err(ToolError::new(format!("path: {given} is a file, not a folder: serve takes a folder (e.g. dist)."))),
+        Err(_) => Err(ToolError::new(format!("path: {given} doesn't exist in the project (build it first, or check the name)."))),
+    }
 }
 
 fn url(port: u16) -> String {
@@ -125,11 +149,13 @@ impl Tool for ProcessTool {
         json!({
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["start", "logs", "stop", "list"], "description": "start a process, read its logs, stop it, or list them all."},
+                "action": {"type": "string", "enum": ["start", "logs", "stop", "list", "serve"], "description": "start a process, read its logs, stop it, or list them all."},
                 "command": {"description": "start: the shell command (bash), run in the project folder, e.g. bun run dev.", "type": "string", "minLength": 1},
                 "name": {"description": "start: a short name for it (default: from the command). logs, stop: which process.", "type": "string", "minLength": 1},
                 "network": {"description": "start: share the user's network (it can reach out, and its ports are the user's own, not forwarded). Off by default.", "type": "boolean"},
-                "lines": {"description": format!("logs: how many of the last lines (default {DEFAULT_LOG_LINES}, at most {MAX_LOG_LINES})."), "type": "integer", "minimum": 1, "maximum": MAX_LOG_LINES}
+                "lines": {"description": format!("logs: how many of the last lines (default {DEFAULT_LOG_LINES}, at most {MAX_LOG_LINES})."), "type": "integer", "minimum": 1, "maximum": MAX_LOG_LINES},
+                "path": {"description": "serve: the project folder to serve as a static website, e.g. dist (index.html for /, unknown routes without an extension fall back to it).", "type": "string", "minLength": 1},
+                "port": {"description": "serve: the port to listen on, 1024 and up (default: a free one).", "type": "integer", "minimum": 1024, "maximum": 65535}
             },
             "required": ["action"],
             "additionalProperties": false
@@ -148,8 +174,14 @@ impl Tool for ProcessTool {
         if input.lines.is_some_and(|l| !(1..=MAX_LOG_LINES as u64).contains(&l)) {
             return Err(format!("lines: must be between 1 and {MAX_LOG_LINES}"));
         }
+        if input.port.is_some_and(|p| !(1024..=65535).contains(&p)) {
+            return Err("port: must be between 1024 and 65535".into());
+        }
         match input.action {
             ProcessAction::Start if input.command.is_none() => Err(missing_command(input)),
+            ProcessAction::Serve if input.path.is_none() => {
+                Err("path: serve needs the project folder to serve: {\"action\": \"serve\", \"path\": \"dist\"}".into())
+            }
             ProcessAction::Logs | ProcessAction::Stop if input.name.is_none() => {
                 let action = if input.action == ProcessAction::Logs { "logs" } else { "stop" };
                 Err(format!("name: {action} needs the process's name (list shows them)"))
@@ -161,6 +193,7 @@ impl Tool for ProcessTool {
         match input.action {
             ProcessAction::Start => input.command.clone().unwrap_or_else(|| "start".into()),
             ProcessAction::List => "list".into(),
+            ProcessAction::Serve => format!("serve {}", input.path.as_deref().unwrap_or("")).trim().to_string(),
             ProcessAction::Logs => format!("logs {}", input.name.as_deref().unwrap_or("")).trim().to_string(),
             ProcessAction::Stop => format!("stop {}", input.name.as_deref().unwrap_or("")).trim().to_string(),
         }
@@ -168,7 +201,7 @@ impl Tool for ProcessTool {
     /// Only starting asks: a door out of the sandbox. Logs, list and stop touch nothing but the session's own
     /// processes.
     fn needs_approval(&self, input: &ProcessInput) -> Option<bool> {
-        Some(input.action == ProcessAction::Start)
+        Some(matches!(input.action, ProcessAction::Start | ProcessAction::Serve))
     }
     /// A process's output and Marv's lines about it: the project's.
     fn provenance(&self) -> marv_core::Provenance {
@@ -183,7 +216,7 @@ impl Tool for ProcessTool {
                 .processes
                 .as_ref()
                 .is_some_and(|p| p.list().iter().any(|info| Some(info.name.as_str()) == input.name.as_deref() && info.network)),
-            ProcessAction::List | ProcessAction::Stop => false,
+            ProcessAction::List | ProcessAction::Stop | ProcessAction::Serve => false,
         };
         if networked { marv_core::Provenance::Network } else { marv_core::Provenance::Project }
     }
@@ -191,6 +224,12 @@ impl Tool for ProcessTool {
         input.action == ProcessAction::Start && input.network.unwrap_or(false)
     }
     fn scope(&self, input: &ProcessInput) -> Option<Scope> {
+        if input.action == ProcessAction::Serve {
+            return Some(Scope {
+                key: format!("process:serve:{}", input.path.as_deref().unwrap_or("")),
+                description: "serving this folder in the background".into(),
+            });
+        }
         let net = if input.network.unwrap_or(false) { "net:" } else { "" };
         Some(Scope {
             key: format!("process:{net}{}", input.command.as_deref().unwrap_or("")),
@@ -198,7 +237,7 @@ impl Tool for ProcessTool {
         })
     }
     fn door(&self, input: &ProcessInput, _ctx: &ToolContext) -> Option<marv_core::Door> {
-        (input.action == ProcessAction::Start).then_some(marv_core::Door::Process)
+        matches!(input.action, ProcessAction::Start | ProcessAction::Serve).then_some(marv_core::Door::Process)
     }
     // No auto_safe: yolo never starts one unasked (it keeps running, and the user can reach it).
 
@@ -206,6 +245,19 @@ impl Tool for ProcessTool {
         // Refused before any ask: the door is the context's to open (set for the main agent only), not the approver's.
         if !ctx.doors.process || ctx.processes.is_none() {
             return Err(ToolError::new(NO_PROCESS_DOOR));
+        }
+        if input.action == ProcessAction::Serve {
+            let folder = serve_folder(input, ctx)?;
+            let shown = input.path.clone().unwrap_or_default();
+            return Ok(Preview {
+                title: "Serve a folder as a website".into(),
+                command: Some(format!("marv serve {shown}")),
+                note: Some(format!(
+                    "{} · its own sandbox · no network · read-only files, nothing else · its port forwarded to your 127.0.0.1",
+                    folder.display()
+                )),
+                ..Preview::default()
+            });
         }
         let note = if input.network.unwrap_or(false) {
             "its own sandbox · shares your network: it can reach out, and its ports are your machine's"
@@ -257,6 +309,14 @@ impl Tool for ProcessTool {
                     return Err(ToolError::new(format!("No process named \"{name}\".{rest}")));
                 }
                 Ok(ToolOutput::ok(format!("Stopped {name} and everything it started."), "stopped"))
+            }
+            ProcessAction::Serve => {
+                if !ctx.doors.process {
+                    return Err(ToolError::new(NO_PROCESS_DOOR));
+                }
+                let folder = serve_folder(input, ctx)?;
+                let started = processes.serve(&folder, input.port.map(|p| p as u16)).await?;
+                Ok(start_output(&started.info, &started.output, processes.one_shot()))
             }
             ProcessAction::Start => {
                 // Checked again here, so no path to run() skips the door (preview refuses first).
@@ -329,6 +389,7 @@ mod tests {
     struct Fake {
         started: Mutex<Vec<(String, Option<String>, bool)>>,
         running: Mutex<Vec<ProcessInfo>>,
+        served: Mutex<Vec<(std::path::PathBuf, Option<u16>)>>,
     }
 
     #[async_trait]
@@ -339,6 +400,12 @@ mod tests {
             info.network = network;
             self.running.lock().unwrap().push(info.clone());
             Ok(StartResult { info, output: "ready".into() })
+        }
+        async fn serve(&self, dir: &std::path::Path, port: Option<u16>) -> Result<StartResult, ToolError> {
+            self.served.lock().unwrap().push((dir.to_path_buf(), port));
+            let info = info("serve-dist", ProcessState::Running, vec![port.unwrap_or(4173)]);
+            self.running.lock().unwrap().push(info.clone());
+            Ok(StartResult { info, output: "Serving".into() })
         }
         fn logs(&self, name: &str, lines: usize) -> Result<String, ToolError> {
             if self.running.lock().unwrap().iter().any(|p| p.name == name) {
@@ -448,8 +515,15 @@ mod tests {
         assert!(asked.0.lock().unwrap().is_empty());
         assert!(host.started.lock().unwrap().is_empty());
         // And run() checks it again, whatever reached it.
-        let input =
-            ProcessInput { action: ProcessAction::Start, command: Some("x".into()), name: None, network: None, lines: None };
+        let input = ProcessInput {
+            action: ProcessAction::Start,
+            command: Some("x".into()),
+            name: None,
+            network: None,
+            lines: None,
+            path: None,
+            port: None,
+        };
         assert_eq!(ProcessTool.run(&input, &ctx(&host, false, &asked)).await.unwrap_err().0, NO_PROCESS_DOOR);
         // No host at all: every action is refused.
         let mut bare = ToolContext::new("/project");
@@ -486,6 +560,47 @@ mod tests {
             let result = call(&ctx, args).await;
             assert!(result.is_error && result.output.contains(error), "{}", result.output);
         }
+    }
+
+    #[tokio::test]
+    async fn serve_asks_like_start_and_stays_inside_the_project() {
+        let dir = crate::test_support::TempDir::new("process-serve");
+        std::fs::create_dir_all(dir.path().join("dist")).unwrap();
+        std::fs::write(dir.path().join("index.html"), "x").unwrap();
+        let host = Arc::new(Fake::default());
+        let asked = Arc::new(Asked(Mutex::default(), Decision::Yes));
+        let mut ctx = ctx(&host, true, &asked);
+        ctx.root = dir.path().to_path_buf();
+        let served = call(&ctx, json!({"action": "serve", "path": "dist", "port": 4321})).await;
+        assert!(!served.is_error, "{}", served.output);
+        assert_eq!(served.door, Some(Door::Process));
+        assert!(served.output.contains("http://localhost:4321"), "{}", served.output);
+        assert_eq!(host.served.lock().unwrap().len(), 1);
+        assert_eq!(host.served.lock().unwrap()[0].1, Some(4321));
+        {
+            let asked = asked.0.lock().unwrap();
+            assert_eq!(asked.len(), 1, "serve asks, even in yolo");
+            assert_eq!(
+                (asked[0].door, asked[0].scope.key.as_str(), asked[0].network),
+                (Some(Door::Process), "process:serve:dist", false)
+            );
+        }
+        for (args, error) in [
+            (json!({"action": "serve"}), "serve needs the project folder"),
+            (json!({"action": "serve", "path": "../outside"}), ""),
+            (json!({"action": "serve", "path": "/etc"}), ""),
+            (json!({"action": "serve", "path": "index.html"}), "is a file, not a folder"),
+            (json!({"action": "serve", "path": "nope"}), "doesn't exist"),
+            (json!({"action": "serve", "path": "dist", "port": 80}), "port: must be between"),
+        ] {
+            let result = call(&ctx, args.clone()).await;
+            assert!(result.is_error && result.output.contains(error), "{args}: {}", result.output);
+        }
+        assert_eq!(host.served.lock().unwrap().len(), 1, "none of the refused ones started");
+        // Without the door: refused before anyone is asked.
+        let mut closed = ctx;
+        closed.doors.process = false;
+        assert_eq!(call(&closed, json!({"action": "serve", "path": "dist"})).await.output, NO_PROCESS_DOOR);
     }
 
     #[test]

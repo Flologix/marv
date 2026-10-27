@@ -148,6 +148,11 @@ pub fn name_from(command: &str) -> String {
     if name.is_empty() { "process".into() } else { name.into() }
 }
 
+/// `'text'` for a shell, with a quote in it closed and escaped.
+fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
 /// `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`
 fn valid_name(name: &str) -> bool {
     let mut chars = name.chars();
@@ -343,6 +348,35 @@ impl ProcessManager {
         let all: Vec<&str> = log.strip_suffix('\n').unwrap_or(&log).split('\n').collect();
         let keep = lines.clamp(1, MAX_LOG_LINES);
         Ok(all[all.len().saturating_sub(keep)..].join("\n"))
+    }
+
+    /// Marv's static file server on `dir` (absolute, inside the project) as a process without network: `marv __serve`
+    /// from Marv's own binary, which the relay's sandbox shows read-only. Named `serve-<folder>`, a free host port
+    /// unless `port` says (the sandbox has a network of its own, so only the user's side can be taken).
+    pub async fn serve(&self, dir: &Path, port: Option<u16>) -> Result<StartResult, ToolError> {
+        let exe =
+            marv_tools::relay::exe_bind().ok_or_else(|| ToolError::new("Couldn't find Marv's own binary to serve with."))?;
+        let port = match port {
+            Some(port) => port,
+            None => std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .and_then(|l| l.local_addr())
+                .map_err(|e| ToolError::new(format!("Couldn't find a free port: {e}")))?
+                .port(),
+        };
+        let guest = self.shared.sandbox.backend().guest_path(&exe);
+        let command = format!(
+            "exec {} {} {} {port}",
+            shell_quote(&guest.to_string_lossy()),
+            marv_tools::serve::SERVE_SUBCOMMAND,
+            shell_quote(&dir.to_string_lossy())
+        );
+        let label: String = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')).collect())
+            .unwrap_or_default();
+        let base = if label.is_empty() { "serve".to_string() } else { format!("serve-{label}") };
+        let name = unique_name(&self.state(), &base.chars().take(60).collect::<String>());
+        self.start(&command, Some(&name), false).await
     }
 
     pub async fn start(&self, command: &str, name: Option<&str>, network: bool) -> Result<StartResult, ToolError> {
@@ -785,6 +819,9 @@ async fn capture(mut stream: impl AsyncRead + Unpin, log: Arc<Mutex<Vec<u8>>>) {
 impl ProcessHost for ProcessManager {
     async fn start(&self, command: &str, name: Option<&str>, network: bool) -> Result<StartResult, ToolError> {
         ProcessManager::start(self, command, name, network).await
+    }
+    async fn serve(&self, dir: &Path, port: Option<u16>) -> Result<StartResult, ToolError> {
+        ProcessManager::serve(self, dir, port).await
     }
     fn logs(&self, name: &str, lines: usize) -> Result<String, ToolError> {
         ProcessManager::logs(self, name, lines)
