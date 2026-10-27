@@ -34,6 +34,18 @@ impl Scratch {
 #[cfg(test)]
 impl Drop for Scratch {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        // A test that ends while a background blocking task (the check cache's sizing, say) is still writing into the
+        // folder gets the folder back after the removal: inside a runtime, look again a moment later until it stays gone.
+        let in_runtime = tokio::runtime::Handle::try_current().is_ok();
+        for _ in 0..20 {
+            let _ = std::fs::remove_dir_all(&self.0);
+            if !in_runtime {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            if !self.0.exists() {
+                return;
+            }
+        }
     }
 }
