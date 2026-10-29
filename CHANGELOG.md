@@ -6,6 +6,10 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+### Fixed
+
+- **Pasting an API key in setup.** The setup wizard's API key field dropped a paste, so a key had to be typed out by hand. It now takes the paste, without the trailing newline or a line break the copy brought along.
+
 ## [0.12.0] - 2026-10-27
 
 ### Added

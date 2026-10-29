@@ -618,8 +618,13 @@ impl App {
                 }
             }
             Event::Paste(text) => {
-                // A reason being typed at an approval (#185) takes the paste; nothing else under it does.
-                if self.approval.is_some() {
+                // Setup's API key field takes the paste (it sits over everything, like in on_key); a reason
+                // being typed at an approval (#185) takes it; nothing else under either does.
+                if let Some(setup) = &mut self.setup {
+                    if setup.paste(&text) {
+                        self.dirty = true;
+                    }
+                } else if self.approval.is_some() {
                     if self.setup.is_none()
                         && let Some((_, view)) = &mut self.approval
                         && view.paste(&text)
@@ -4008,6 +4013,42 @@ mod tests {
         let told = held(&h).len();
         h.advance(1);
         assert_eq!(held(&h).len(), told, "told only when it changes");
+    }
+
+    #[test]
+    fn a_paste_goes_to_the_setup_key_field_not_the_prompt() {
+        let mut h = harness();
+        let presets = vec![crate::view::ProviderPreset {
+            id: ProviderId::OpenRouter,
+            label: "OpenRouter".into(),
+            key_env: Some("OPENROUTER_API_KEY".into()),
+            key_url: None,
+            default_model: "z-ai/glm-5.3".into(),
+            sign_in: false,
+        }];
+        let context = crate::view::SetupContext {
+            start: SetupStart::FirstRun,
+            presets,
+            current: None,
+            saved_keys: vec![],
+            accounts: vec![],
+            env_keys: vec![],
+        };
+        h.event(UiEvent::OpenSetup(context));
+        h.key(ENTER);
+        h.event(UiEvent::Models(Ok(vec![crate::view::ModelInfo { id: "z-ai/glm-5.3".into(), ..Default::default() }])));
+        h.key(ENTER);
+        h.app.on_event(Event::Paste("sk-or-v1-pasted\n".into()), h.now);
+        h.key(ENTER);
+        assert_eq!(
+            h.calls().last(),
+            Some(&Call::CompleteSetup(SetupAnswer {
+                provider: ProviderId::OpenRouter,
+                model: "z-ai/glm-5.3".into(),
+                api_key: Some("sk-or-v1-pasted".into())
+            }))
+        );
+        assert_eq!(h.app.prompt.value, "");
     }
 
     #[test]
