@@ -326,6 +326,20 @@ impl Setup {
         }
     }
 
+    /// A paste (bracketed, so one event): only the API key field takes it. A key has no whitespace, so a
+    /// trailing newline or a line break from the copy is dropped rather than refused. False if not taken.
+    pub fn paste(&mut self, text: &str) -> bool {
+        if self.step != SetupStep::ApiKey {
+            return false;
+        }
+        let key: String = text.chars().filter(|c| !c.is_whitespace() && !c.is_control()).collect();
+        if !key.is_empty() {
+            self.key_input.push_str(&key);
+            self.error = None;
+        }
+        true
+    }
+
     fn steps(&self) -> Vec<SetupStep> {
         let mut steps = vec![SetupStep::Provider];
         if self.signs_in() {
@@ -614,6 +628,20 @@ mod tests {
         assert!(!frame(&setup).contains("Paste your API key, or")); // typing clears the error
         assert_eq!(press(&mut setup, &[KeyCode::Enter]), None);
         assert!(frame(&setup).contains("That doesn't look like a key (it contains spaces)."));
+    }
+
+    #[test]
+    fn a_pasted_key_fills_the_field_without_its_newline() {
+        let mut setup = Setup::new(context(SetupStart::FirstRun));
+        assert!(!setup.paste("sk-or-early")); // the provider list doesn't take a paste
+        press(&mut setup, &[KeyCode::Enter, KeyCode::Enter]);
+        assert_eq!(press(&mut setup, &[KeyCode::Enter]), None);
+        assert!(setup.paste("sk-or-v1-abc\r\n123\n"));
+        assert!(!frame(&setup).contains("Paste your API key, or")); // the paste clears the error
+        assert_eq!(
+            press(&mut setup, &[KeyCode::Enter]),
+            answer(ProviderId::OpenRouter, "anthropic/claude-sonnet-5.5", Some("sk-or-v1-abc123"))
+        );
     }
 
     #[test]
