@@ -1584,8 +1584,10 @@ dependencies = [
  "marv-tools",
  "marv-tui",
  "nix 0.31.3",
+ "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-util",
 ]

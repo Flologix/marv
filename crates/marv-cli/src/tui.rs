@@ -1395,6 +1395,19 @@ impl Bridge {
         });
     }
 
+    /// Checks for a newer Marv in the background (at most once a day, `crate::update`) and says so in one line. Never
+    /// holds startup up; nothing is shown when it's off, up to date, or offline.
+    pub fn show_update(self: &Arc<Self>) {
+        let on = self.config().update_check;
+        let env = self.env.clone();
+        let bridge = self.clone();
+        tokio::spawn(async move {
+            if let Some(text) = crate::update::startup_notice(on, &env, &marv_session::paths::home_dir()).await {
+                bridge.emit(system(text, false));
+            }
+        });
+    }
+
     /// Herdr's first state: idle.
     pub fn report_state(&self) {
         self.activity.report();
@@ -3188,6 +3201,7 @@ pub async fn run(resume: Option<bool>, approve: Vec<String>, quit: crate::signal
     }
     // After `-c`'s resume, which starts its own round: the hooks run once here, not twice.
     bridge.show_hooks();
+    bridge.show_update();
     bridge.report_state();
     bridge.report_session().await;
 
