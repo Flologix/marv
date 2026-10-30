@@ -6,6 +6,8 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-10-30
+
 ### Added
 
 - **Kimi Code, Qwen Coding Plan and DeepSeek providers.** Setup and `/setup` now offer Kimi Code (a Kimi membership: `kimi-for-coding`, `k3`, `k3-256k`), Alibaba Cloud's Coding Plan (Qwen3.7-Plus, Qwen3.6-Plus, Qwen3.5-Plus) and DeepSeek's API (`deepseek-flash`, `deepseek-v4-pro`), each OpenAI-compatible on its own endpoint with its own key: `"provider"` `kimi`, `qwen` or `deepseek` in `~/.marv/config.json`, keys in `kimiApiKey`, `qwenApiKey`, `deepseekApiKey` or `KIMI_API_KEY`, `QWEN_API_KEY`, `DEEPSEEK_API_KEY`. `baseUrl` picks another region. The SDK takes `ProviderOption::{Kimi, Qwen, DeepSeek}`.
@@ -372,7 +374,9 @@ The first public release, on npm as `@flologixai/marv`.
 - The SDK: `createSession()` from `@flologixai/marv/sdk` runs Marv from code, without the UI.
 - Evals: `bun run eval` runs real models on small tasks with hidden checks.
 
-[Unreleased]: https://github.com/Flologix/marv/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/Flologix/marv/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/Flologix/marv/compare/v0.12.0...v0.13.0
+[0.12.0]: https://github.com/Flologix/marv/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/Flologix/marv/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/Flologix/marv/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/Flologix/marv/compare/v0.8.0...v0.9.0
