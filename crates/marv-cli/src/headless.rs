@@ -391,6 +391,17 @@ pub struct HeadlessOptions {
 }
 
 /// Runs one headless turn and writes the result to stdout. Returns the exit code.
+/// A provider whose terms rule out a non-interactive turn, with why. Alibaba Cloud's Coding Plan is for interactive
+/// coding tools only: its FAQ says a plan key used from "automated scripts" or "non-interactive" calls breaks its terms
+/// and can get the subscription suspended (alibabacloud.com/help/en/model-studio/coding-plan-faq).
+fn headless_refusal(kind: marv_provider::ProviderKind) -> Option<&'static str> {
+    (kind == marv_provider::ProviderKind::Qwen).then_some(
+        "The Qwen Coding Plan is for interactive use only: Alibaba Cloud's terms don't allow its key in non-interactive \
+         runs like marv -p, and can suspend the plan. Use it in an interactive marv session, or pick another \
+         provider with /setup for marv -p.",
+    )
+}
+
 pub async fn run_headless(options: HeadlessOptions, quit: crate::signals::Quit) -> ExitCode {
     use marv_session::config::{ConfigStore, Env, default_config_dir, migrate_legacy_config, resolve_config};
     let (approve, mesh_grants) = match build_approver(&options.approve, options.must_ask) {
@@ -418,6 +429,10 @@ pub async fn run_headless(options: HeadlessOptions, quit: crate::signals::Quit) 
         env.insert("MARV_MODEL".into(), model.clone());
     }
     let config = resolve_config(file.as_ref(), &env);
+    if let Some(why) = headless_refusal(config.provider) {
+        eprintln!("{why}");
+        return ExitCode::Error;
+    }
     // The config's pre-approved scopes (#98) seed the session's "always" layer (never the headless approver, so a
     // subagent doesn't inherit them, as the guards require), and its writable folders (#98) are bound read-write
     // into every sandbox. Both go on stderr with the rest of the startup notice (stdout stays the reply).
@@ -461,6 +476,21 @@ pub async fn run_headless(options: HeadlessOptions, quit: crate::signals::Quit) 
             }
         },
         marv_provider::ProviderKind::Zai => marv_provider::ProviderOption::Zai {
+            api_key: config.api_key.clone().unwrap_or_default(),
+            model: Some(config.model.clone()),
+            base_url: Some(config.base_url.clone()),
+        },
+        marv_provider::ProviderKind::Kimi => marv_provider::ProviderOption::Kimi {
+            api_key: config.api_key.clone().unwrap_or_default(),
+            model: Some(config.model.clone()),
+            base_url: Some(config.base_url.clone()),
+        },
+        marv_provider::ProviderKind::DeepSeek => marv_provider::ProviderOption::DeepSeek {
+            api_key: config.api_key.clone().unwrap_or_default(),
+            model: Some(config.model.clone()),
+            base_url: Some(config.base_url.clone()),
+        },
+        marv_provider::ProviderKind::Qwen => marv_provider::ProviderOption::Qwen {
             api_key: config.api_key.clone().unwrap_or_default(),
             model: Some(config.model.clone()),
             base_url: Some(config.base_url.clone()),
@@ -802,6 +832,15 @@ mod tests {
         assert_eq!(approver.approve(request("memory")).await, Decision::Yes, "clean, --approve memory answers it");
         let scope = ScopeApprover { prefixes: vec!["memory".into()], tainted: true, protected: true };
         assert!(scope.must_ask_refusal(&tainted).unwrap().contains("only a person approves it"));
+    }
+
+    #[test]
+    fn the_qwen_coding_plan_is_refused_and_no_other_provider_is() {
+        use marv_provider::ProviderKind::*;
+        assert!(headless_refusal(Qwen).is_some_and(|why| why.contains("interactive use only")));
+        for kind in [OpenRouter, Ollama, Zai, ChatGpt, Kimi, DeepSeek] {
+            assert_eq!(headless_refusal(kind), None, "{kind:?}");
+        }
     }
 
     #[test]

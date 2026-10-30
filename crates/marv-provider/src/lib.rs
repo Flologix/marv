@@ -10,7 +10,8 @@
 //! - Errors never surface as `Err`: an adapter yields [`ProviderEvent::Error`] with a message the
 //!   user can act on ([`errors`]), and SDK sessions name the option to change ([`errors::SDK_HINTS`]).
 //! - Z.ai's GLM Coding Plan (#159) goes through [`openai_compat`] too, on the plan's coding endpoint
-//!   ([`models::ZAI_CODING_BASE_URL`]) with the plan's own key.
+//!   ([`models::ZAI_CODING_BASE_URL`]) with the plan's own key; so do Kimi Code, DeepSeek and Qwen's Coding Plan, each
+//!   on its own endpoint with its own key.
 //! - `/think` on OpenRouter is its unified `reasoning: { enabled }` switch, decided by
 //!   [`reasoning_for`] from what the model list says ([`models::ReasoningSupport`]).
 //! - Marv's `Config`/`PRESETS`/`resolveConfig` live in `marv-session`; this crate only takes the
@@ -86,6 +87,13 @@ pub enum ProviderKind {
     /// #159: Sign in with ChatGPT: the person's ChatGPT plan, through the Responses API ([`chatgpt`]).
     #[serde(rename = "chatgpt")]
     ChatGpt,
+    /// Kimi Code: a Kimi membership, through its OpenAI-compatible coding endpoint.
+    Kimi,
+    /// DeepSeek's own API, pay as you go.
+    #[serde(rename = "deepseek")]
+    DeepSeek,
+    /// Alibaba Cloud Model Studio's Coding Plan: Qwen models on the plan's own endpoint.
+    Qwen,
 }
 
 impl ProviderKind {
@@ -96,6 +104,9 @@ impl ProviderKind {
             Self::Ollama => "ollama",
             Self::Zai => "zai",
             Self::ChatGpt => "chatgpt",
+            Self::Kimi => "kimi",
+            Self::DeepSeek => "deepseek",
+            Self::Qwen => "qwen",
         }
     }
 
@@ -106,6 +117,9 @@ impl ProviderKind {
             Self::Ollama => "Ollama",
             Self::Zai => "Z.ai",
             Self::ChatGpt => "ChatGPT",
+            Self::Kimi => "Kimi",
+            Self::DeepSeek => "DeepSeek",
+            Self::Qwen => "Qwen",
         }
     }
 }
@@ -294,6 +308,27 @@ pub fn create_provider(config: &ProviderConfig, model: Option<&ModelInfo>, hints
                 api_key: config.api_key.clone(),
                 headers: Vec::new(),
                 body,
+                offline_hint: None,
+                hints,
+                timing: Default::default(),
+                idle_timeout: Some(openai_compat::STREAM_IDLE_TIMEOUT),
+                max_tokens: Some(openai_compat::max_tokens_for(info.and_then(|m| m.max_output))),
+                context_length: info.and_then(|m| m.context),
+            }))
+        }
+        // Kimi Code, DeepSeek and Qwen's Coding Plan: OpenAI-compatible, each with its own key, and nothing sent about
+        // reasoning (each model uses its own default). Kimi asks tools to name themselves, hence the User-Agent.
+        ProviderKind::Kimi | ProviderKind::DeepSeek | ProviderKind::Qwen => {
+            let known = models::table_for(config.provider).and_then(|t| t.into_iter().find(|m| m.id == config.model));
+            let info = model.or(known.as_ref());
+            Arc::new(openai_compat::OpenAiCompatProvider::new(openai_compat::OpenAiCompatOptions {
+                name: format!("{} · {}", config.provider.id(), config.model),
+                label: config.provider.label().into(),
+                base_url: config.base_url.clone(),
+                model: config.model.clone(),
+                api_key: config.api_key.clone(),
+                headers: vec![("User-Agent".into(), concat!("Marv/", env!("CARGO_PKG_VERSION")).into())],
+                body: serde_json::Map::new(),
                 offline_hint: None,
                 hints,
                 timing: Default::default(),

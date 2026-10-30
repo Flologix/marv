@@ -107,6 +107,9 @@ fn provider_hint(id: ProviderId) -> &'static str {
         ProviderId::Ollama => "models running on this machine, free",
         ProviderId::Zai => "GLM models on the Z.ai GLM Coding Plan you pay for",
         ProviderId::ChatGpt => "sign in and use your ChatGPT Plus or Pro plan",
+        ProviderId::Kimi => "Kimi K3 and K2.8 on the Kimi Code membership you pay for",
+        ProviderId::DeepSeek => "DeepSeek V4 models with a DeepSeek API key",
+        ProviderId::Qwen => "Qwen models on the Alibaba Cloud Coding Plan you pay for",
     }
 }
 
@@ -373,7 +376,8 @@ impl Setup {
                 lines.extend(self.providers.render());
             }
             SetupStep::SignIn => {
-                lines.push(Line::raw(format!("Sign in with {}", self.label())));
+                // OpenAI's UI guidelines for its sign-in name the action "Continue with ChatGPT".
+                lines.push(Line::raw(format!("Continue with {}", self.label())));
                 lines.push(Line::styled(
                     "Your plan pays for Marv's requests, within its usage limits. The sign-in is saved to ~/.marv/chatgpt.json, readable only by you.",
                     dim,
@@ -385,7 +389,7 @@ impl Setup {
                         }
                         lines.extend(self.sign_in_choices.render());
                     }
-                    SignInState::Ready => lines.push(Line::raw("Press Enter to open your browser and sign in.")),
+                    SignInState::Ready => lines.push(Line::raw("Press Enter to continue with ChatGPT in your browser.")),
                     SignInState::Waiting { url: None } => lines.push(Line::styled("Opening your browser…", dim)),
                     SignInState::Waiting { url: Some(url) } => {
                         lines.push(Line::raw("Finish signing in in your browser. If it didn't open, go to:"));
@@ -426,7 +430,7 @@ impl Setup {
         lines.push(Line::default());
         let keys = match (self.step, &self.sign_in) {
             (SetupStep::ApiKey, _) => "Enter to save",
-            (SetupStep::SignIn, SignInState::Ready) => "Enter to sign in",
+            (SetupStep::SignIn, SignInState::Ready) => "Enter to continue with ChatGPT",
             (SetupStep::SignIn, SignInState::Waiting { .. }) => "Waiting for the browser",
             _ => "↑/↓ to move · Enter to choose",
         };
@@ -495,6 +499,9 @@ mod tests {
             ProviderId::Ollama => vec![m("qwen3.5:9b", true, None, true), m("tiny:1b", false, None, true)],
             ProviderId::Zai => vec![m("glm-5.3", true, None, false), m("glm-5.3-flash", true, None, false)],
             ProviderId::ChatGpt => vec![m("gpt-6.1-sol", true, None, false)],
+            ProviderId::Kimi => vec![m("kimi-for-coding", true, None, false)],
+            ProviderId::DeepSeek => vec![m("deepseek-flash", true, None, false)],
+            ProviderId::Qwen => vec![m("qwen3.7-plus", true, None, false)],
         }
     }
 
@@ -709,7 +716,7 @@ mod tests {
     fn chatgpt_signs_in_before_the_model() {
         let mut setup = Setup::new(with_plans(SetupStart::FirstRun));
         assert_eq!(press(&mut setup, &[KeyCode::Down, KeyCode::Down, KeyCode::Enter]), None);
-        assert!(frame(&setup).contains("Press Enter to open your browser and sign in."));
+        assert!(frame(&setup).contains("Press Enter to continue with ChatGPT in your browser."));
         assert!(frame(&setup).contains("step 2 of 3"));
         assert_eq!(setup.on_key(key(KeyCode::Enter)), Some(SetupOutcome::SignIn(ProviderId::ChatGpt, SignInTarget::Current)));
         assert_eq!(setup.on_key(key(KeyCode::Enter)), None, "waiting: Enter does nothing");

@@ -174,7 +174,9 @@ async fn a_model_list_that_fails_to_load_says_nothing_about_the_model() {
 async fn error_of(status: u16, config: ProviderConfig, hints: Option<ErrorHints>) -> String {
     let server = FakeServer::start(move |_| Reply::json(status, json!({"error": {"message": "nope"}}))).await;
     let base_url = match config.provider {
-        ProviderKind::OpenRouter | ProviderKind::Zai => format!("{}/v1", server.url()),
+        ProviderKind::OpenRouter | ProviderKind::Zai | ProviderKind::Kimi | ProviderKind::DeepSeek | ProviderKind::Qwen => {
+            format!("{}/v1", server.url())
+        }
         ProviderKind::Ollama => server.url(),
         ProviderKind::ChatGpt => unreachable!("signs in"),
     };
@@ -249,4 +251,45 @@ async fn the_zai_plan_sends_its_key_and_no_reasoning_switch() {
         load: Arc::new(|_, _| Box::pin(async { Err("never asked".to_string()) })),
     };
     assert_eq!(factory.lookup().unwrap().await.map(|m| m.context), Some(Some(1_000_000)));
+}
+
+/// Kimi Code, DeepSeek and Qwen's Coding Plan each go to their endpoint with their own key, name Marv in the
+/// User-Agent (Kimi asks tools to), send nothing about reasoning, and read Marv's own table for the model.
+#[tokio::test]
+async fn kimi_deepseek_and_qwen_send_their_key_and_name_marv() {
+    for (kind, model, context) in [
+        (ProviderKind::Kimi, "kimi-for-coding", 262_144),
+        (ProviderKind::DeepSeek, "deepseek-flash", 1_000_000),
+        (ProviderKind::Qwen, "qwen3.7-plus", 1_000_000),
+    ] {
+        let server =
+            FakeServer::start(|_| Reply::sse(&[json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}), json!("[DONE]")]))
+                .await;
+        let config = ProviderConfig {
+            provider: kind,
+            model: model.into(),
+            base_url: format!("{}/v1", server.url()),
+            api_key: Some("plan-key".into()),
+            context_length: 32768,
+            thinking: true,
+            reasoning_effort: Some(marv_provider::ReasoningEffort::Medium),
+            auth_file: None,
+        };
+        let provider = create_provider(&config, None, None);
+        assert_eq!(provider.name(), format!("{} · {model}", kind.id()));
+        provider.stream(&hi(), StreamOptions::default()).collect::<Vec<_>>().await;
+        let request = server.last();
+        assert_eq!(request.path, "/v1/chat/completions");
+        assert_eq!(request.header("authorization"), Some("Bearer plan-key"));
+        assert!(request.header("user-agent").is_some_and(|ua| ua.starts_with("Marv/")), "{kind:?}");
+        assert_eq!(request.header("x-title"), None);
+        let body = request.json();
+        assert_eq!((body.get("reasoning"), body.get("thinking")), (None, None), "{kind:?}");
+        let factory = ConfigFactory {
+            config,
+            make: Arc::new(|c: &ProviderConfig, info| create_provider(c, info, None)),
+            load: Arc::new(|_, _| Box::pin(async { Err("never asked".to_string()) })),
+        };
+        assert_eq!(factory.lookup().unwrap().await.map(|m| m.context), Some(Some(context)), "{kind:?}");
+    }
 }

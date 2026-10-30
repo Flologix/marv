@@ -2,7 +2,7 @@
 //! `src/config/config.ts` (and `providerFactory` from `src/provider/factory.ts`, which needs `resolve_config`).
 //!
 //! Two layers, later wins: `~/.marv/config.json` (validated, written 0600 because it can hold the API keys), then env
-//! vars (`OPENROUTER_API_KEY`, `ZAI_API_KEY`, `MARV_MODEL`, `OLLAMA_HOST`, `MARV_MAX_STEPS`). [`FileConfig`] is what's on disk;
+//! vars (`OPENROUTER_API_KEY`, `ZAI_API_KEY`, `KIMI_API_KEY`, `DEEPSEEK_API_KEY`, `QWEN_API_KEY`, `MARV_MODEL`, `OLLAMA_HOST`, `MARV_MAX_STEPS`). [`FileConfig`] is what's on disk;
 //! [`resolve_config`] produces the [`Config`] the app runs on.
 //!
 //! **Security (docs/SECURITY.md):** the config folder comes only from `~/.marv` or `MARV_CONFIG_DIR` *in the real
@@ -94,6 +94,27 @@ pub fn preset(kind: ProviderKind) -> Preset {
             key_url: None,
             default_model: "",
         },
+        ProviderKind::Kimi => Preset {
+            label: "Kimi Code",
+            base_url: marv_provider::models::KIMI_CODING_BASE_URL,
+            key_env: Some("KIMI_API_KEY"),
+            key_url: Some("kimi.com/code"),
+            default_model: marv_provider::models::KIMI_MODELS[0].0,
+        },
+        ProviderKind::DeepSeek => Preset {
+            label: "DeepSeek",
+            base_url: marv_provider::models::DEEPSEEK_BASE_URL,
+            key_env: Some("DEEPSEEK_API_KEY"),
+            key_url: Some("platform.deepseek.com/api_keys"),
+            default_model: marv_provider::models::DEEPSEEK_MODELS[0].0,
+        },
+        ProviderKind::Qwen => Preset {
+            label: "Qwen Coding Plan",
+            base_url: marv_provider::models::QWEN_CODING_BASE_URL,
+            key_env: Some("QWEN_API_KEY"),
+            key_url: Some("modelstudio.console.alibabacloud.com"),
+            default_model: marv_provider::models::QWEN_CODING_MODELS[0].0,
+        },
     }
 }
 
@@ -114,6 +135,12 @@ pub struct FileConfig {
     /// `zaiApiKey` (#159): the Z.ai Coding Plan key. Its own field, so switching providers never sends one vendor's key
     /// to another.
     pub zai_api_key: Option<String>,
+    /// `kimiApiKey`: the Kimi Code key.
+    pub kimi_api_key: Option<String>,
+    /// `deepseekApiKey`: the DeepSeek key.
+    pub deepseek_api_key: Option<String>,
+    /// `qwenApiKey`: the Qwen Coding Plan key (`sk-sp-…`).
+    pub qwen_api_key: Option<String>,
     /// Overrides the preset endpoint, e.g. Ollama on another machine.
     pub base_url: Option<String>,
     pub thinking: Option<bool>,
@@ -374,6 +401,9 @@ impl FileConfig {
         match kind {
             ProviderKind::OpenRouter => self.api_key.as_deref(),
             ProviderKind::Zai => self.zai_api_key.as_deref(),
+            ProviderKind::Kimi => self.kimi_api_key.as_deref(),
+            ProviderKind::DeepSeek => self.deepseek_api_key.as_deref(),
+            ProviderKind::Qwen => self.qwen_api_key.as_deref(),
             ProviderKind::Ollama | ProviderKind::ChatGpt => None,
         }
     }
@@ -383,6 +413,9 @@ impl FileConfig {
         match kind {
             ProviderKind::OpenRouter => self.api_key = Some(key),
             ProviderKind::Zai => self.zai_api_key = Some(key),
+            ProviderKind::Kimi => self.kimi_api_key = Some(key),
+            ProviderKind::DeepSeek => self.deepseek_api_key = Some(key),
+            ProviderKind::Qwen => self.qwen_api_key = Some(key),
             ProviderKind::Ollama | ProviderKind::ChatGpt => {}
         }
     }
@@ -435,6 +468,9 @@ impl FileConfig {
             Some("ollama") => Some(ProviderKind::Ollama),
             Some("zai") => Some(ProviderKind::Zai),
             Some("chatgpt") => Some(ProviderKind::ChatGpt),
+            Some("kimi") => Some(ProviderKind::Kimi),
+            Some("deepseek") => Some(ProviderKind::DeepSeek),
+            Some("qwen") => Some(ProviderKind::Qwen),
             _ => None, // a provider Marv no longer has is dropped, so setup opens
         };
         let base_url = string("baseUrl", &mut problems);
@@ -617,6 +653,9 @@ impl FileConfig {
             model: string("model", &mut problems),
             api_key: string("apiKey", &mut problems),
             zai_api_key: string("zaiApiKey", &mut problems),
+            kimi_api_key: string("kimiApiKey", &mut problems),
+            deepseek_api_key: string("deepseekApiKey", &mut problems),
+            qwen_api_key: string("qwenApiKey", &mut problems),
             base_url,
             thinking: boolean("thinking", &mut problems),
             reasoning_effort,
@@ -657,6 +696,9 @@ impl FileConfig {
         put("model", self.model.clone().map(Value::from));
         put("apiKey", self.api_key.clone().map(Value::from));
         put("zaiApiKey", self.zai_api_key.clone().map(Value::from));
+        put("kimiApiKey", self.kimi_api_key.clone().map(Value::from));
+        put("deepseekApiKey", self.deepseek_api_key.clone().map(Value::from));
+        put("qwenApiKey", self.qwen_api_key.clone().map(Value::from));
         put("baseUrl", self.base_url.clone().map(Value::from));
         put("thinking", self.thinking.map(Value::from));
         put("reasoningEffort", self.reasoning_effort.map(|e| Value::from(e.map_or("default", |e| e.as_str()))));
@@ -850,7 +892,12 @@ pub fn resolve_config(file: Option<&FileConfig>, env: &Env) -> Config {
             .unwrap_or_else(|| preset.default_model.into()),
         base_url: file.and_then(|f| f.base_url.clone()).unwrap_or_else(|| match provider {
             ProviderKind::Ollama => ollama_url(env.get("OLLAMA_HOST").map(String::as_str)),
-            ProviderKind::OpenRouter | ProviderKind::Zai | ProviderKind::ChatGpt => preset.base_url.into(),
+            ProviderKind::OpenRouter
+            | ProviderKind::Zai
+            | ProviderKind::ChatGpt
+            | ProviderKind::Kimi
+            | ProviderKind::DeepSeek
+            | ProviderKind::Qwen => preset.base_url.into(),
         }),
         api_key_source: if env_key.is_some() {
             Some(KeySource::Env)
@@ -1016,6 +1063,36 @@ pub fn provider_factory(
             },
             Env::new(),
         ),
+        ProviderOption::Kimi { api_key, model, base_url } => (
+            FileConfig {
+                provider: Some(ProviderKind::Kimi),
+                kimi_api_key: Some(api_key),
+                model,
+                base_url,
+                ..FileConfig::default()
+            },
+            Env::new(),
+        ),
+        ProviderOption::DeepSeek { api_key, model, base_url } => (
+            FileConfig {
+                provider: Some(ProviderKind::DeepSeek),
+                deepseek_api_key: Some(api_key),
+                model,
+                base_url,
+                ..FileConfig::default()
+            },
+            Env::new(),
+        ),
+        ProviderOption::Qwen { api_key, model, base_url } => (
+            FileConfig {
+                provider: Some(ProviderKind::Qwen),
+                qwen_api_key: Some(api_key),
+                model,
+                base_url,
+                ..FileConfig::default()
+            },
+            Env::new(),
+        ),
     };
     config_factory(Config { thinking, reasoning_effort, ..resolve_config(Some(&file), &env) })
 }
@@ -1025,7 +1102,7 @@ fn config_factory(config: Config) -> Arc<dyn ProviderFactory> {
     Arc::new(ConfigFactory {
         config: config.provider_config(),
         make: Arc::new(|config, info| marv_provider::create_provider(config, info, Some(marv_provider::errors::SDK_HINTS))),
-        // Marv's model lists need no key (OpenRouter's is public, Ollama's local, Z.ai's plan models Marv's own table).
+        // Marv's model lists need no key (OpenRouter's is public, Ollama's local, the plans' Marv's own tables).
         load: Arc::new(|kind, base_url| Box::pin(async move { marv_provider::models::list_models(kind, &base_url, None).await })),
     })
 }
@@ -1373,6 +1450,41 @@ mod tests {
         assert_eq!(resolve_config(Some(&m), &env(&[("OLLAMA_HOST", "https://box.lan/")])).base_url, "https://box.lan");
         let gpu = FileConfig { base_url: Some("http://gpu:11434".into()), ..m };
         assert_eq!(resolve_config(Some(&gpu), &Env::new()).base_url, "http://gpu:11434");
+    }
+
+    /// Kimi, DeepSeek and Qwen: each key has its own field and variable; each provider its endpoint and default model.
+    #[test]
+    fn kimi_deepseek_and_qwen_have_their_own_keys_endpoints_and_models() {
+        for (kind, id, field, var, url, model) in [
+            (ProviderKind::Kimi, "kimi", "kimiApiKey", "KIMI_API_KEY", "https://api.kimi.com/coding/v1", "kimi-for-coding"),
+            (
+                ProviderKind::DeepSeek,
+                "deepseek",
+                "deepseekApiKey",
+                "DEEPSEEK_API_KEY",
+                "https://api.deepseek.com",
+                "deepseek-flash",
+            ),
+            (
+                ProviderKind::Qwen,
+                "qwen",
+                "qwenApiKey",
+                "QWEN_API_KEY",
+                "https://coding-intl.dashscope.aliyuncs.com/v1",
+                "qwen3.7-plus",
+            ),
+        ] {
+            let f = FileConfig::from_value(&json!({"provider": id, field: "file-key", "apiKey": "sk-or"})).unwrap();
+            assert_eq!((f.provider, f.key_for(kind)), (Some(kind), Some("file-key")));
+            assert_eq!(f.to_value()[field], json!("file-key"));
+            let c = resolve_config(Some(&f), &Env::new());
+            assert_eq!((c.api_key.as_deref(), c.base_url.as_str(), c.model.as_str()), (Some("file-key"), url, model));
+            let c = resolve_config(Some(&f), &env(&[(var, "env-key"), ("ZAI_API_KEY", "zai")]));
+            assert_eq!((c.api_key.as_deref(), c.api_key_source), (Some("env-key"), Some(KeySource::Env)));
+            let mut g = FileConfig::default();
+            g.set_key(kind, "k".into());
+            assert_eq!((g.api_key.as_deref(), g.key_for(kind)), (None, Some("k")));
+        }
     }
 
     /// #159: the Coding Plan's key has its own field and variable, and is saved under `zaiApiKey`.
