@@ -6,6 +6,8 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-10-30
+
 ### Added
 
 - **`marv update` and a notice when a new version is out.** `marv update` updates the way Marv was installed: `npm install -g` for the npm package, or the release's `install.sh` (SHA-256 checked) into the same folder. `marv update --check` only says whether there's a newer release. Once a day the TUI asks npm's registry for the newest version in the background, and when there's a newer one it shows one line saying so. It never runs in `marv -p`, never delays startup and says nothing offline. It sends no identifier or usage data, and only a version number from the answer is shown. Turn it off with `"updateCheck": false` or `MARV_NO_UPDATE_CHECK=1` (`NO_UPDATE_NOTIFIER` and `CI` turn it off too). Marv never updates itself without you running `marv update`.
@@ -379,7 +381,8 @@ The first public release, on npm as `@flologixai/marv`.
 - The SDK: `createSession()` from `@flologixai/marv/sdk` runs Marv from code, without the UI.
 - Evals: `bun run eval` runs real models on small tasks with hidden checks.
 
-[Unreleased]: https://github.com/Flologix/marv/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/Flologix/marv/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/Flologix/marv/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/Flologix/marv/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/Flologix/marv/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/Flologix/marv/compare/v0.10.0...v0.11.0
