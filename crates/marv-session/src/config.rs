@@ -171,6 +171,8 @@ pub struct FileConfig {
     pub hooks: Option<crate::hooks::Hooks>,
     /// After a turn, suggest the next message in the empty prompt (default on; Tab takes it).
     pub suggestions: Option<bool>,
+    /// `updateCheck`: the TUI checks once a day for a newer Marv and says so (default on; marv-cli's `update`).
+    pub update_check: Option<bool>,
     pub mcp_tools: Option<McpToolsSetting>,
     pub max_steps: Option<MaxStepsSetting>,
     /// The formatter the edit tools run after a change (#67): `false` (off), `true` (detect), or extension → command.
@@ -672,6 +674,7 @@ impl FileConfig {
             checkpoints: boolean("checkpoints", &mut problems),
             hooks,
             suggestions: boolean("suggestions", &mut problems),
+            update_check: boolean("updateCheck", &mut problems),
             mcp_tools,
             max_steps,
             formatter,
@@ -715,6 +718,7 @@ impl FileConfig {
         put("checkpoints", self.checkpoints.map(Value::from));
         put("hooks", self.hooks.as_ref().map(crate::hooks::Hooks::to_value));
         put("suggestions", self.suggestions.map(Value::from));
+        put("updateCheck", self.update_check.map(Value::from));
         put("mcpTools", self.mcp_tools.and_then(|m| serde_json::to_value(m).ok()));
         put("approve", self.approve.clone().map(Value::from));
         put("writable", self.writable.clone().map(Value::from));
@@ -781,6 +785,8 @@ pub struct Config {
     pub checks: bool,
     pub checkpoints: bool,
     pub suggestions: bool,
+    /// `updateCheck`: on unless the file turns it off (the environment's opt-outs are marv-cli's `update::enabled`).
+    pub update_check: bool,
     pub mcp_tools: McpToolsSetting,
     /// 0 never asks; 1 can't happen. Subagents' own hard limit (50) is not touched by 0.
     pub max_steps: u32,
@@ -931,6 +937,7 @@ pub fn resolve_config(file: Option<&FileConfig>, env: &Env) -> Config {
         checks: file.and_then(|f| f.checks).unwrap_or(true),
         checkpoints: file.and_then(|f| f.checkpoints).unwrap_or(true),
         suggestions: file.and_then(|f| f.suggestions).unwrap_or(true),
+        update_check: file.and_then(|f| f.update_check).unwrap_or(true),
         mcp_tools: file.and_then(|f| f.mcp_tools).unwrap_or_default(),
         max_steps: max_steps_from_env(env.get("MARV_MAX_STEPS").map(String::as_str), file_steps),
         formatter: file.and_then(|f| f.formatter.clone()).unwrap_or(FormatterSetting::Auto),
@@ -1135,6 +1142,16 @@ mod tests {
         );
         assert!(c.checkpoints && c.suggestions);
         assert_eq!((c.max_steps, c.mcp_tools), (25, McpToolsSetting::Auto));
+    }
+
+    /// `updateCheck`: on by default, `false` turns it off and is saved back as written; a non-bool is a problem.
+    #[test]
+    fn update_check_is_on_unless_the_file_turns_it_off() {
+        assert!(resolve_config(None, &Env::new()).update_check);
+        let off = FileConfig::from_value(&serde_json::json!({ "updateCheck": false })).unwrap();
+        assert!(!resolve_config(Some(&off), &Env::new()).update_check);
+        assert_eq!(off.to_value()["updateCheck"], Value::Bool(false));
+        assert!(FileConfig::from_value(&serde_json::json!({ "updateCheck": "no" })).unwrap_err().contains("updateCheck"));
     }
 
     /// #187: `diagnostics` is a bool for every language or an object per language (missing keys on); unknown keys and

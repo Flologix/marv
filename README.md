@@ -88,6 +88,17 @@ marv
 
 The first run opens a short setup: pick a provider (OpenRouter, a plan you pay for, or Ollama), pick a model, and paste your key (or sign in, for ChatGPT). Settings are saved to `~/.marv/config.json`, readable only by you. Run `/setup` to change them later.
 
+### Updating
+
+```sh
+marv update            # update to the newest release
+marv update --check    # only say whether there's one (exits 1 if there is)
+```
+
+`marv update` updates the way you installed: `npm install -g @flologixai/marv@<version>` for the npm package, or the release's `install.sh` (which checks the binary's SHA-256) into the same folder for an install.sh install. A build from source isn't touched: rebuild it. Marv never updates itself without you running this.
+
+Once a day, `marv` (the TUI, never `marv -p`) asks npm's registry for the newest version in the background, and when there's a newer one it says so in one line: `✻ Marv 0.14.0 is out (you have 0.13.0): run marv update to update.` It's a plain request for a public version number, with no identifier or usage data, and it's cached in `~/.cache/marv/update-check.json` (`~/Library/Caches/marv` on macOS). Startup never waits for it, and when you're offline it says nothing. Only a version number from the answer is ever shown. To turn it off, set `"updateCheck": false` in `~/.marv/config.json`, or `MARV_NO_UPDATE_CHECK=1`. `NO_UPDATE_NOTIFIER` and `CI` turn it off too.
+
 ### A plan you already pay for
 
 Marv can also run on a subscription, or another vendor's own key, instead of OpenRouter. Setup and `/setup` offer them all but Z.ai's (below); each key is saved in its own field, so switching providers never sends one vendor's key to another.
@@ -183,6 +194,7 @@ marv -p <prompt>     run one turn without the UI (see "Using Marv from scripts")
 marv mesh ls         list the Marvs on this machine you can wire to (see "The mesh")
 marv mesh wire …     ask for a wire between agents
 marv mesh plug …     plug another agent into a Marv over stdin/stdout
+marv update          update to the newest release (--check: only say whether there is one)
 marv --version       print the version (-v)
 marv --help          show the help
 ```
@@ -427,7 +439,7 @@ The radio is a live channel between your Marvs on this machine. It's **off unles
 | `$XDG_RUNTIME_DIR/marv/` | The runtime folder: the mesh's sockets and background processes' relays, while Marv runs (private, 0700; `MARV_RUNTIME_DIR` moves it) |
 | `AGENTS.md` | Project instructions, read into the system prompt at startup |
 
-`~/.marv/config.json` also takes `approveSandboxed` (`auto`, the default unless `yolo` is `false`: a sandboxed command without network runs without asking even with yolo off, and in a turn a mesh message woke with the project read-only; `ask`: it asks), `sandbox`, `yolo`, `thinking`, `trajectories`, `diagnostics`, `checks`, `checkpoints`, `suggestions` (each `true` or `false`; `diagnostics` also per language, like `{"typescript": false}`), `maxSteps`, `mcpTools` (`auto`, `deferred` or `eager`), `contextLength` (Ollama), `reasoningEffort` (`minimal`, `low`, `medium` or `high`: how hard an OpenRouter model that reasons does so, default `medium`; `default` lets the model pick its own), `compactTokens` (compact once the conversation passes this many tokens, default `100000`, at least `40000`; `0` or `false` compacts only at 85% of the window), `baseUrl` (e.g. Ollama on another machine) and `mesh` (`{"wake": true}` for mesh wake, `{"radio": true}` or `{"radio": {"titles": false}}` for [the radio](#the-radio-who-else-is-up); only from your own file, never a project's). The slash commands write most of them for you.
+`~/.marv/config.json` also takes `approveSandboxed` (`auto`, the default unless `yolo` is `false`: a sandboxed command without network runs without asking even with yolo off, and in a turn a mesh message woke with the project read-only; `ask`: it asks), `sandbox`, `yolo`, `thinking`, `trajectories`, `diagnostics`, `checks`, `checkpoints`, `suggestions`, `updateCheck` (each `true` or `false`; `diagnostics` also per language, like `{"typescript": false}`), `maxSteps`, `mcpTools` (`auto`, `deferred` or `eager`), `contextLength` (Ollama), `reasoningEffort` (`minimal`, `low`, `medium` or `high`: how hard an OpenRouter model that reasons does so, default `medium`; `default` lets the model pick its own), `compactTokens` (compact once the conversation passes this many tokens, default `100000`, at least `40000`; `0` or `false` compacts only at 85% of the window), `baseUrl` (e.g. Ollama on another machine) and `mesh` (`{"wake": true}` for mesh wake, `{"radio": true}` or `{"radio": {"titles": false}}` for [the radio](#the-radio-who-else-is-up); only from your own file, never a project's). The slash commands write most of them for you.
 
 **Session-start hooks.** `"hooks": {"sessionStart": ["bd ready", {"command": "git status -s", "timeout": 5}]}` runs those commands, in order, whenever a conversation starts: when Marv starts (the TUI and `marv -p`), after `/clear` and on a resume (never in subagents). They run like your own shell command: bash, in the project folder, outside the sandbox, with your environment minus Marv's keys and secret-looking variables. Each has a timeout in seconds (default 15) and its output is cut to 8 KB. Their output goes to the model once, at the start of your first message, labelled with each command and quoted as data; the TUI shows one line per hook. Like a web page or an MCP result, hook output **taints the conversation**: from then on anything that can send data out asks first, even in yolo, because what a command prints (issue titles in `bd ready`, say) can come from anyone. Add `"trusted": true` to a hook (`{"command": "date", "trusted": true}`) when you vouch for its output; a hook that prints nothing taints nothing. A hook that fails or times out is a one-line note and never stops Marv from starting. Hooks are read **only from your own `~/.marv/config.json`**: a project's `.marv/config.json` naming `hooks` is refused with a startup note and never run, so cloning a repository can't make Marv run its commands.
 
@@ -442,6 +454,7 @@ The radio is a live channel between your Marvs on this machine. It's **off unles
 | `MARV_MAX_STEPS` | Overrides the saved step limit (`0` or `off` never asks; `/steps`) |
 | `OLLAMA_HOST` | Where Ollama runs (default `localhost:11434`) |
 | `MARV_CONFIG_DIR` | Use a different folder instead of `~/.marv` (read from the environment only, never from a project file) |
+| `MARV_NO_UPDATE_CHECK` | `1`: don't check for a newer Marv at startup ([Updating](#updating)) |
 | `MARV_GITHUB` | `off` hides the `github` tool |
 | `MARV_MESH_NAME` | This Marv's name on the mesh |
 | `MARV_RUNTIME_DIR` | Where the runtime folder goes instead (an absolute path to a private folder of yours, outside every project; refused, with the reason, otherwise) |

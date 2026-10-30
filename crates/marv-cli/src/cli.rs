@@ -7,6 +7,7 @@
 //! marv mesh ls      the live Marvs on this machine (mesh v2)
 //! marv mesh wire 'alpha -> beta:inbox'
 //! marv mesh plug alpha --as claude   (an MCP server command: another agent plugs into alpha's switchboard)
+//! marv update       update this install to the newest release (`--check`: only say whether there is one)
 //! ```
 //!
 //! Port notes:
@@ -37,6 +38,7 @@ pub const AFTER_HELP: &str = "Config:
   MARV_MODEL            overrides the saved model
   MARV_MAX_STEPS        overrides the saved step limit (0 or off: never ask)
   MARV_CONFIG_DIR       use a different config directory (read from the environment only)
+  MARV_NO_UPDATE_CHECK  1: don't check for a newer Marv at startup (or \"updateCheck\": false in the config)
 
 Exit codes for -p: 0 finished, 1 error, 2 stopped (step limit, output limit, loop), 3 an approval it couldn't get";
 
@@ -124,6 +126,12 @@ pub enum Command {
     /// The mesh: wires between sandboxed agents.
     #[command(subcommand)]
     Mesh(MeshCommand),
+    /// Update Marv to the newest release (npm or install.sh, however this one was installed).
+    Update {
+        /// Only say whether there's a newer release (exit 1 if there is), without updating.
+        #[arg(long)]
+        check: bool,
+    },
     /// Converts one web page: `{html, url}` JSON on stdin, the result on stdout (the web reader's own process).
     #[command(name = "__html-convert", hide = true)]
     HtmlConvert,
@@ -179,6 +187,10 @@ pub enum Mode {
         prompt: String,
     },
     MeshLs,
+    /// `marv update [--check]`.
+    Update {
+        check: bool,
+    },
     MeshWire {
         spec: String,
     },
@@ -211,6 +223,7 @@ impl Cli {
                 Mode::Headless { prompt: if prompt.is_empty() { "-".into() } else { prompt.join(" ") } }
             }
             Some(Command::Mesh(MeshCommand::Ls)) => Mode::MeshLs,
+            Some(Command::Update { check }) => Mode::Update { check: *check },
             Some(Command::Mesh(MeshCommand::Wire { spec })) => Mode::MeshWire { spec: spec.join(" ") },
             Some(Command::Mesh(MeshCommand::Plug { session, name })) => {
                 Mode::MeshPlug { session: session.clone(), name: name.clone() }
@@ -267,6 +280,8 @@ mod tests {
             parse(&["mesh", "plug", "alpha", "--as", "claude"]).mode(),
             Mode::MeshPlug { session: "alpha".into(), name: Some("claude".into()) }
         );
+        assert_eq!(parse(&["update"]).mode(), Mode::Update { check: false });
+        assert_eq!(parse(&["update", "--check"]).mode(), Mode::Update { check: true });
         assert_eq!(parse(&["__html-convert"]).mode(), Mode::HtmlConvert);
         assert_eq!(parse(&["__run-checks", "{}"]).mode(), Mode::RunChecks { spec: "{}".into() });
         assert_eq!(parse(&["__relay", "{}"]).mode(), Mode::Relay { spec: "{}".into() });
