@@ -6,6 +6,12 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+### Fixed
+
+- **The ChatGPT plan's usage limit said "ChatGPT: unknown error" (#264).** OpenAI sends the limit as an error event with its details nested under `error`, and Marv read only the older top-level fields. It now says the plan's limit is reached, with OpenAI's own message and where to check usage (chatgpt.com/settings/usage), and stops without retrying.
+- **Models on ChatGPT filled every optional tool field (#265).** Marv sent its tools to the Responses API without `strict`, which the API treats as strict, so every field became required. Models padded the optional ones with empty strings, and the Herdr tool refused calls like a `list` with an empty `branch`, again and again. Tools are now sent with `"strict": false`, and the Herdr tool treats an empty field as not sent.
+- **ChatGPT plans ran out faster than they should (#266).** Marv didn't send `prompt_cache_key`, so OpenAI's prompt cache hit only by chance: 36% of one session's input was cached, and uncached input counts in full against the plan. Each session now sends a random key of its own (a new one after `/model`), so its requests reach the same cache.
+
 ## [0.14.0] - 2026-10-30
 
 ### Added

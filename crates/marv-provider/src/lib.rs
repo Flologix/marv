@@ -234,6 +234,8 @@ pub fn chatgpt_options(config: &ProviderConfig, hints: ErrorHints) -> Result<res
         hints,
         timing: Default::default(),
         idle_timeout: Some(openai_compat::STREAM_IDLE_TIMEOUT),
+        // #266: one per provider (a session, or a /model switch), random: names no person or machine.
+        prompt_cache_key: Some(format!("marv-{}", chatgpt::random_token())),
     })
 }
 
@@ -409,6 +411,10 @@ mod tests {
             auth_file: Some("/home/u/.marv/chatgpt.json".into()),
         };
         let options = chatgpt_options(&config, ErrorHints::default()).unwrap();
+        // #266: a prompt cache key, the same for this provider's requests and different for the next provider.
+        let key = options.prompt_cache_key.clone().unwrap();
+        assert!(key.starts_with("marv-") && key.len() <= 64, "{key}");
+        assert_ne!(chatgpt_options(&config, ErrorHints::default()).unwrap().prompt_cache_key, Some(key));
         assert_eq!(options.base_url, chatgpt::API_BASE_URL);
         assert_eq!(options.tool_namespace, Some(responses::MARV_TOOLS));
         for bad in [None, Some(std::path::PathBuf::new()), Some("chatgpt.json".into())] {

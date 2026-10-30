@@ -371,3 +371,19 @@ fn each_session_names_its_peers_with_its_own_prefix() {
     let (a, b) = (Peers::default(), Peers::default());
     assert_ne!(a.free_name("peer"), b.free_name("peer"));
 }
+
+/// #265: a model on the Responses API pads every optional field with `""`. The exact call from a real session (a
+/// `list` with `branch`, `base` and `task` empty) is a plain list, not "only for action spawn"; a real spawn option on
+/// a list is still refused, and an empty pane is still missing where it's needed.
+#[tokio::test]
+async fn empty_optional_fields_count_as_not_sent() {
+    let r = rig("padded", 4, Decision::No);
+    let padded = json!({"action":"list","base":"","branch":"","command":"","cwd":"","kind":"","lines":50,"name":"",
+        "pane":"w1:p1","place":"right","target":"w1:p1","task":"","text":"","what":"panes","workspace":"w1"});
+    let out = r.run(padded).await;
+    assert!(!out.result.is_error, "{}", out.result.output);
+    let out = r.run(json!({"action": "list", "branch": "feature"})).await;
+    assert!(out.result.output.contains("only for action spawn"), "{}", out.result.output);
+    let out = r.run(json!({"action": "read", "pane": ""})).await;
+    assert!(out.result.output.contains("pane: required for action read"), "{}", out.result.output);
+}
