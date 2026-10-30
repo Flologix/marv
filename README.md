@@ -4,7 +4,7 @@
 
 A terminal coding agent. Marv reads your code, edits files and runs commands (sandboxed, and asking for your approval wherever the sandbox can't contain what it does), inside a full-screen terminal UI with a little martian for company.
 
-Marv is written in Rust and ships as one static binary. Nothing else runs it: no Bun, no Node, no interpreter that could read a project's `.env` or `bunfig.toml` when it starts (npm is only one way to install it). It talks to models through [OpenRouter](https://openrouter.ai) (hundreds of cloud models with one API key) or [Ollama](https://ollama.com) (models running on your own machine).
+Marv is written in Rust and ships as one static binary. Nothing else runs it: no Bun, no Node, no interpreter that could read a project's `.env` or `bunfig.toml` when it starts (npm is only one way to install it). It talks to models through [OpenRouter](https://openrouter.ai) (hundreds of cloud models with one API key), [Ollama](https://ollama.com) (models running on your own machine), or a plan you already pay for: ChatGPT Plus or Pro, the Z.ai GLM Coding Plan, Kimi Code or the Qwen Coding Plan, or a DeepSeek key ([below](#a-plan-you-already-pay-for)).
 
 ![Marv's welcome screen in the terminal: the pixel-art martian, the version, the project folder, and the status bar with yolo mode, the provider and the model](docs/images/screenshot.png)
 
@@ -41,7 +41,8 @@ Marv is written in Rust and ships as one static binary. Nothing else runs it: no
 - On Linux, `bubblewrap` (`bwrap`) for the command sandbox (e.g. `sudo apt install bubblewrap`). Without it Marv still works, but every command asks first and warns that it runs unsandboxed, and what needs the sandbox is off: the typecheck, cargo check and pyright after edits, the project's checks and the `process` tool. On macOS the sandbox is Seatbelt (`/usr/bin/sandbox-exec`, built in), so there's nothing to install; the `process` tool isn't on macOS yet (#152).
 - `git`, for `/undo` and for subagents' worktrees.
 - One of:
-  - an [OpenRouter API key](https://openrouter.ai/settings/keys), or
+  - an [OpenRouter API key](https://openrouter.ai/settings/keys),
+  - a ChatGPT Plus or Pro plan (sign in from setup), a Z.ai GLM Coding Plan, Kimi Code or Qwen Coding Plan key, or a DeepSeek API key ([details](#a-plan-you-already-pay-for)), or
   - [Ollama](https://ollama.com) running locally, with a model that supports tool calling (e.g. `ollama pull qwen3.5:9b`).
 
 ## Install
@@ -119,7 +120,7 @@ Sandboxed reads, edits and test runs go ahead on their own; a commit, the networ
 |---|---|
 | `/help` | Show available commands and shortcuts |
 | `/model` | Pick a model (`/model <id>` to set one directly) |
-| `/setup` | Change provider, model, or API key |
+| `/setup` | Change provider, model, or API key, or sign in to (or out of) ChatGPT |
 | `/config` | Show the current configuration |
 | `/think` | Let thinking models reason before answering (`/think on`, `/think off`) |
 | `/skills` | List available skills; run one with `/<skill-name> <request>` |
