@@ -458,7 +458,7 @@ fn model_info(m: marv_provider::ModelInfo) -> view::ModelInfo {
 }
 
 /// The providers setup offers: OpenRouter, the plans, and Ollama. The Z.ai Coding Plan and Sign in with ChatGPT (#159)
-/// when their switch is on (`marv_provider::offered`, on by default) or the config already uses them; Kimi Code,
+/// when their switch is on (`marv_provider::offered`: ChatGPT's on, Z.ai's off) or the config already uses them; Kimi Code,
 /// DeepSeek and Qwen's Coding Plan always.
 fn offered_kinds(current: Option<ProviderKind>) -> Vec<ProviderKind> {
     let plans = [
@@ -4659,8 +4659,8 @@ mod tests {
         assert!(!format!("{ctx:?}").contains("fromtheenvironment"), "keys reach the UI masked");
     }
 
-    /// #159: Z.ai and ChatGPT are offered when their switch is on (both on by default), or when the config already uses
-    /// one; Kimi, Qwen and DeepSeek always. A plan's key goes to its own field.
+    /// #159: Z.ai and ChatGPT are offered when their switch is on (ChatGPT's on and Z.ai's off by default), or when the
+    /// config already uses one; Kimi, Qwen and DeepSeek always. A plan's key goes to its own field.
     #[test]
     fn setup_offers_the_plans_behind_their_switches_and_keeps_keys_apart() {
         let ids = |file: Option<&FileConfig>| {

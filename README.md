@@ -4,7 +4,7 @@
 
 A terminal coding agent. Marv reads your code, edits files and runs commands (sandboxed, and asking for your approval wherever the sandbox can't contain what it does), inside a full-screen terminal UI with a little martian for company.
 
-Marv is written in Rust and ships as one static binary. Nothing else runs it: no Bun, no Node, no interpreter that could read a project's `.env` or `bunfig.toml` when it starts (npm is only one way to install it). It talks to models through [OpenRouter](https://openrouter.ai) (hundreds of cloud models with one API key) or [Ollama](https://ollama.com) (models running on your own machine).
+Marv is written in Rust and ships as one static binary. Nothing else runs it: no Bun, no Node, no interpreter that could read a project's `.env` or `bunfig.toml` when it starts (npm is only one way to install it). It talks to models through [OpenRouter](https://openrouter.ai) (hundreds of cloud models with one API key), [Ollama](https://ollama.com) (models running on your own machine), or a plan you already pay for: ChatGPT Plus or Pro, Kimi Code or the Qwen Coding Plan, or a DeepSeek key ([below](#a-plan-you-already-pay-for)).
 
 ![Marv's welcome screen in the terminal: the pixel-art martian, the version, the project folder, and the status bar with yolo mode, the provider and the model](docs/images/screenshot.png)
 
@@ -16,7 +16,7 @@ Marv is written in Rust and ships as one static binary. Nothing else runs it: no
 - **Web pages.** `web_fetch` reads a page as text, asking per site. A page longer than one 30,000-character part is also saved whole on the first read, so the model can `grep` it or read just the part it needs instead of paging through it.
 - **Guarded against prompt injection.** Once a web page, an MCP result or a message from another agent is in the conversation, anything that could send data out asks you, even in yolo and even after "don't ask again". Text from outside is shown to the model as data, never in Marv's voice. See [Safety model](#safety-model).
 - **Dev servers you can open.** A command's processes end with it, and its `localhost` isn't yours, so Marv starts servers and watchers with its `process` tool instead: each keeps running in its own sandbox (same rules: only the project writable, no network unless asked) across turns until it's stopped or Marv exits, and the ports it listens on are forwarded to your `127.0.0.1`, so `http://localhost:5173` just works. You're asked before each start; `/processes` lists them, `/processes stop <name>` stops one, and the status bar shows how many run.
-- **Any model.** OpenRouter or a local Ollama model, with a searchable model picker showing prices. Switch with `/model`. A ChatGPT, Z.ai GLM, Kimi Code or Qwen Coding Plan subscription can pay instead, or a DeepSeek key ([below](#a-plan-you-already-pay-for)). Models that reason do so at medium effort by default, which saves tokens on coding work (`reasoningEffort` in the config).
+- **Any model.** OpenRouter or a local Ollama model, with a searchable model picker showing prices. Switch with `/model`. A ChatGPT, Kimi Code or Qwen Coding Plan subscription can pay instead, or a DeepSeek key ([below](#a-plan-you-already-pay-for)). Models that reason do so at medium effort by default, which saves tokens on coding work (`reasoningEffort` in the config).
 - **MCP servers.** Connect any [Model Context Protocol](https://modelcontextprotocol.io) server, local or remote, in `~/.marv/mcp.json` or `.mcp.json` (Claude Code's format). Its tools join Marv's; calls ask first unless the server marks a tool read-only, since servers run outside the sandbox. With many tools connected, the model sees only their names and loads a tool's parameters when it needs one, so they don't cost thousands of tokens on every request. A project's servers only start once you trust them (`/mcp trust`). `/mcp add <npm package | URL | GitHub repo>` sets one up for you: it pins the version, shows you exactly what it will write, and starts it without a restart (see [Add an MCP server](#add-an-mcp-server)).
 - **Skills.** Drop a `SKILL.md` into `.marv/skills/` (or `~/.marv/skills/`) and Marv loads it when a task matches, or run it yourself with `/<skill-name>`.
 - **GitHub with your `gh` login.** If you use the GitHub CLI, Marv runs it for you, outside the sandbox: reading PRs, CI runs and issues just works, anything that changes GitHub asks first, and `gh auth` and friends never run. See [Connect GitHub](#connect-github).
@@ -41,7 +41,8 @@ Marv is written in Rust and ships as one static binary. Nothing else runs it: no
 - On Linux, `bubblewrap` (`bwrap`) for the command sandbox (e.g. `sudo apt install bubblewrap`). Without it Marv still works, but every command asks first and warns that it runs unsandboxed, and what needs the sandbox is off: the typecheck, cargo check and pyright after edits, the project's checks and the `process` tool. On macOS the sandbox is Seatbelt (`/usr/bin/sandbox-exec`, built in), so there's nothing to install; the `process` tool isn't on macOS yet (#152).
 - `git`, for `/undo` and for subagents' worktrees.
 - One of:
-  - an [OpenRouter API key](https://openrouter.ai/settings/keys), or
+  - an [OpenRouter API key](https://openrouter.ai/settings/keys),
+  - a ChatGPT Plus or Pro plan (Continue with ChatGPT in setup), a Kimi Code or Qwen Coding Plan key, or a DeepSeek API key ([details](#a-plan-you-already-pay-for)), or
   - [Ollama](https://ollama.com) running locally, with a model that supports tool calling (e.g. `ollama pull qwen3.5:9b`).
 
 ## Install
@@ -89,15 +90,15 @@ The first run opens a short setup: pick a provider (OpenRouter, a plan you pay f
 
 ### A plan you already pay for
 
-Marv can also run on a subscription, or another vendor's own key, instead of OpenRouter. Setup and `/setup` offer them all; each key is saved in its own field, so switching providers never sends one vendor's key to another.
+Marv can also run on a subscription, or another vendor's own key, instead of OpenRouter. Setup and `/setup` offer them all but Z.ai's (below); each key is saved in its own field, so switching providers never sends one vendor's key to another.
 
-- **Sign in with ChatGPT.** Your ChatGPT Plus or Pro plan pays for Marv, through OpenAI's program for open-source agents: setup opens your browser to sign in, and requests go to OpenAI's Responses API. The sign-in is saved to `~/.marv/chatgpt.json`, readable only by you; `/setup` can sign in again or sign out.
-- **Z.ai GLM Coding Plan.** GLM-5.3 and GLM-5.3-Flash on the plan's own endpoint (`https://api.z.ai/api/coding/paas/v4`), with your plan's key from [z.ai/manage-apikey/apikey-list](https://z.ai/manage-apikey/apikey-list) (saved as `zaiApiKey`, or `ZAI_API_KEY`). Z.ai's terms say the Coding Plan may only be used from tools Z.ai lists; check them before you use it.
+- **Sign in with ChatGPT.** Your ChatGPT Plus or Pro plan pays for Marv, through OpenAI's program for open-source agents: setup's **Continue with ChatGPT** opens your browser to sign in, and requests go to OpenAI's Responses API. The sign-in is saved to `~/.marv/chatgpt.json`, readable only by you; `/setup` can sign in again or sign out.
+- **Z.ai GLM Coding Plan.** GLM-5.3 and GLM-5.3-Flash on the plan's own endpoint (`https://api.z.ai/api/coding/paas/v4`), with your plan's key from [z.ai/manage-apikey/apikey-list](https://z.ai/manage-apikey/apikey-list) (saved as `zaiApiKey`, or `ZAI_API_KEY`). **Not offered in setup yet:** Z.ai's [subscription terms](https://docs.z.ai/legal-agreement/subscription-terms) (§4.2) allow the plan only in [the tools Z.ai lists](https://docs.z.ai/devpack/tool/others), and Marv isn't one of them, so using it from Marv risks your plan. Marv will offer it once Z.ai lists it. A config that already names `"provider": "zai"` keeps working.
 - **Kimi Code.** `kimi-for-coding` (K2.8), `k3` and `k3-256k` on your Kimi membership, through `https://api.kimi.com/coding/v1`, with a key from the Kimi Code console (saved as `kimiApiKey`, or `KIMI_API_KEY`). Overseas accounts can set `"baseUrl": "https://api.kimi.ai/coding/v1"`.
-- **Qwen Coding Plan.** Qwen3.7-Plus, Qwen3.6-Plus and Qwen3.5-Plus on Alibaba Cloud Model Studio's Coding Plan (`https://coding-intl.dashscope.aliyuncs.com/v1`), with the plan's own key (`sk-sp-…`, saved as `qwenApiKey`, or `QWEN_API_KEY`). Mainland China's plan: `"baseUrl": "https://coding.dashscope.aliyuncs.com/v1"`.
+- **Qwen Coding Plan.** Qwen3.7-Plus, Qwen3.6-Plus and Qwen3.5-Plus on Alibaba Cloud Model Studio's Coding Plan (`https://coding-intl.dashscope.aliyuncs.com/v1`), with the plan's own key (`sk-sp-…`, saved as `qwenApiKey`, or `QWEN_API_KEY`). Mainland China's plan: `"baseUrl": "https://coding.dashscope.aliyuncs.com/v1"`. **Interactive use only:** Alibaba Cloud's [terms](https://www.alibabacloud.com/help/en/model-studio/coding-plan-faq) don't allow the plan's key in automated or non-interactive runs, and can suspend the plan. So `marv -p` refuses it. Don't let mesh messages wake a session on it either (`mesh.wake`): a woken turn runs with nobody typing.
 - **DeepSeek.** `deepseek-flash` and `deepseek-v4-pro` on DeepSeek's own API (`https://api.deepseek.com`), pay as you go, with a key from [platform.deepseek.com/api_keys](https://platform.deepseek.com/api_keys) (saved as `deepseekApiKey`, or `DEEPSEEK_API_KEY`). Marv doesn't show DeepSeek's prices: they change with the time of day.
 
-A build can leave Z.ai or ChatGPT out of setup with `MARV_OFFER_ZAI_CODING_PLAN=0` or `MARV_OFFER_CHATGPT_SIGN_IN=0` set when it's compiled (`marv_provider::offered`). When a plan's usage limit is reached, Marv stops with a message saying so: it never switches to another key or provider by itself.
+A build can offer Z.ai with `MARV_OFFER_ZAI_CODING_PLAN=1`, or leave ChatGPT out with `MARV_OFFER_CHATGPT_SIGN_IN=0`, set when it's compiled (`marv_provider::offered`). When a plan's usage limit is reached, Marv stops with a message saying so: it never switches to another key or provider by itself.
 
 ## Using Marv
 
@@ -119,7 +120,7 @@ Sandboxed reads, edits and test runs go ahead on their own; a commit, the networ
 |---|---|
 | `/help` | Show available commands and shortcuts |
 | `/model` | Pick a model (`/model <id>` to set one directly) |
-| `/setup` | Change provider, model, or API key |
+| `/setup` | Change provider, model, or API key, or sign in to (or out of) ChatGPT |
 | `/config` | Show the current configuration |
 | `/think` | Let thinking models reason before answering (`/think on`, `/think off`) |
 | `/skills` | List available skills; run one with `/<skill-name> <request>` |
