@@ -6,6 +6,8 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-10-30
+
 ### Fixed
 
 - **The ChatGPT plan's usage limit said "ChatGPT: unknown error" (#264).** OpenAI sends the limit as an error event with its details nested under `error`, and Marv read only the older top-level fields. It now says the plan's limit is reached, with OpenAI's own message and where to check usage (chatgpt.com/settings/usage), and stops without retrying.
@@ -390,7 +392,8 @@ The first public release, on npm as `@flologixai/marv`.
 - The SDK: `createSession()` from `@flologixai/marv/sdk` runs Marv from code, without the UI.
 - Evals: `bun run eval` runs real models on small tasks with hidden checks.
 
-[Unreleased]: https://github.com/Flologix/marv/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/Flologix/marv/compare/v0.14.1...HEAD
+[0.14.1]: https://github.com/Flologix/marv/compare/v0.14.0...v0.14.1
 [0.14.0]: https://github.com/Flologix/marv/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/Flologix/marv/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/Flologix/marv/compare/v0.11.0...v0.12.0
