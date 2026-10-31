@@ -6,6 +6,10 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+### Fixed
+
+- **On macOS, a process a finished command left behind could escape the sandbox's clean-up (#269).** After a command ends, Marv kills what it left running again and again for a short window, to reach a process that was being forked as the first kill landed. On a busy Mac that window could pass in a single round, and the process then ran on (still sandboxed). The clean-up now makes at least five rounds, however long they take.
+
 ## [0.14.0] - 2026-10-30
 
 ### Added
