@@ -44,4 +44,8 @@ fn the_oracles_reworded_text_matches_what_marv_rs_sends() {
     }
     let (serve_sentence, nothing) = MARV_RS_TEXT[8];
     assert!(marv_tools::process::PROCESS_DESCRIPTION.contains(serve_sentence) && nothing.is_empty());
+    // #268: the access facts' first line, by which the oracle drops the block.
+    assert_eq!(marv_oracle::runner::MARV_RS_BLOCKS, [marv_session::prompt::ACCESS_HEADING]);
+    let bash = system_prompt(&PromptInput { tools: vec!["read_file".into(), "bash".into()], ..Default::default() });
+    assert!(bash.contains(&format!("\n\n{}\n", marv_session::prompt::ACCESS_HEADING)), "{bash}");
 }

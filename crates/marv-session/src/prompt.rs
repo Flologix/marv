@@ -66,6 +66,9 @@ pub struct PromptInput {
     /// The project has no `.git` of its own (none, or an empty folder), so confined commands see the sandbox's empty
     /// read-only stand-in (`git_guard`).
     pub git_placeholder: bool,
+    /// The project is the user's home folder or holds it (`marv_sandbox::home_project`, on the session's root): the
+    /// sandbox shows it read-only with its dot-entries hidden. Fixed per session (#268's access facts).
+    pub home_project: bool,
 }
 
 /// Said when the project has no `.git` (and bash is offered). A session in ~/Projects (no repository) ran `ls -la`,
@@ -74,6 +77,51 @@ pub struct PromptInput {
 /// can be toggled mid-conversation, it has to hold in every mode: only confined commands (yolo's auto-run ones, the
 /// process tool) get the placeholder, and an approved `git_write` command may create a `.git` (`git init`).
 pub const GIT_PLACEHOLDER: &str = "\n\nThis folder has no .git of its own. Commands that run without asking, and background processes, may see an empty, read-only .git folder here: it's the sandbox's placeholder, not a broken or empty repository, and git still finds a repository in a parent folder if there is one. Don't report it as a problem. To create a repository here, run git init with git_write: true.";
+
+/// The first line of [`access_facts`]. marv-rs only (#268): the oracle drops the block from both sides by this line
+/// (`marv_oracle::runner::MARV_RS_BLOCKS` holds the same text: keep them in step).
+pub const ACCESS_HEADING: &str = "Your access (fixed for this session):";
+
+/// Where a sandboxed command can write besides the project: this build's sandbox's (fixed per build).
+const SCRATCH: &str = if cfg!(target_os = "macos") { "$TMPDIR" } else { "/tmp" };
+
+/// #268: what the model can reach, as a few short facts right under the working directory. In a session in the home
+/// folder the model kept telling the user it couldn't inspect their files: an empty sandboxed `find ~/.marv` read as
+/// "can't", although the project was readable and `sandbox: false` (approved) later read `~/.marv/config.json`. Its
+/// own audit: it took "hidden by the sandbox" for "impossible", and the facts were buried in a long paragraph.
+///
+/// Only what holds for the whole session, whatever is toggled in it, so the prompt stays byte-stable (the cache):
+/// the project (a home-folder project or not: the session's root), whether bash can leave the sandbox (the host
+/// door: `host_commands`, someone approving each command at a terminal; never in `marv -p`, a subagent or an SDK
+/// session without it), and this build's sandbox. Not yolo, taint or what's been approved, which change mid-session:
+/// the network line says "may ask". Empty without bash: then nothing runs in a sandbox to begin with.
+pub fn access_facts(input: &PromptInput) -> String {
+    if !input.tools.iter().any(|t| t == "bash") {
+        return String::new();
+    }
+    let extra = if input.writable.is_empty() { "" } else { " (and the extra writable folders listed below)" };
+    let (project, hidden) = if input.home_project {
+        (
+            format!(
+                "- Project: the user's home folder (or a folder that holds it). Sandboxed commands can read it but not change it; they can write only to {SCRATCH}{extra}. Change files with edit_file or write_file (the user is asked)."
+            ),
+            "- Hidden from sandboxed commands: the home folder's dot-entries (~/.marv, ~/.ssh, ~/.config, ~/.local and the like; toolchain folders and git config aside) and any socket. A hidden path reads as empty, missing or refused, which says nothing about the real one.",
+        )
+    } else {
+        (
+            format!("- Project: the working directory. Sandboxed commands can write only there and in {SCRATCH}{extra}."),
+            "- Hidden from sandboxed commands: the home folder outside the project, ~/.marv included (toolchain folders, git config and ~/.marv/skills aside, read-only). A hidden path reads as empty, missing or refused, which says nothing about the real one.",
+        )
+    };
+    let outside = if input.doors.host {
+        "- Outside the sandbox: bash with sandbox: false runs one command on the user's machine, where hidden paths can be read; the user is asked to approve each one. So a hidden path is within reach: don't tell the user you can't read it."
+    } else {
+        "- Outside the sandbox: not in this session (nobody is here to approve each command), so hidden paths can't be read: say they're hidden from you, not missing, and give the user the command to run themselves."
+    };
+    format!(
+        "\n\n{ACCESS_HEADING}\n{project}\n{hidden}\n{outside}\n- Network: none for sandboxed commands unless you set network: true (which may ask the user)."
+    )
+}
 
 /// Which doors a session offers the model (decided once per session, before its first request: the cache). Marv's
 /// `PromptDoors`.
@@ -178,7 +226,7 @@ pub const SITUATION_HEADING: &str = "# Your situation";
 /// `herdr`: None outside Herdr, else whether the Herdr door's run and spawn work here (#74).
 pub fn situation_section(home: bool, pre_approved: &[String], writable: &[String], herdr: Option<bool>) -> String {
     let home = if home {
-        " The working directory is the user's home folder itself, so here the home folder is the project: its files are visible and writable, and a path like ~/notes.txt is notes.txt."
+        " The working directory is the user's home folder itself, so here the home folder is the project, and a path like ~/notes.txt is notes.txt."
     } else {
         ""
     };
@@ -262,9 +310,10 @@ fn project_section(instructions: Option<&str>) -> String {
 /// The main agent's system prompt.
 pub fn system_prompt(input: &PromptInput) -> String {
     let base = format!(
-        "You are Marv, a coding agent running in the user's terminal.\n\nWorking directory: {}\nToday's date: {}\n\nYou can explore the project with these tools: {}. {BASE_TOOLS_TEXT}{}{BASE_REST_TEXT}",
+        "You are Marv, a coding agent running in the user's terminal.\n\nWorking directory: {}\nToday's date: {}{}\n\nYou can explore the project with these tools: {}. {BASE_TOOLS_TEXT}{}{BASE_REST_TEXT}",
         input.cwd,
         input.date,
+        access_facts(input),
         input.tools.join(", "),
         if input.tools.iter().any(|t| t == "plan") { PLAN_SENTENCE } else { "" },
     );
@@ -699,8 +748,8 @@ mod tests {
         let all = outside(&with_doors(PromptDoors { github: true, process: true, host: true, herdr: false, herdr_runs: false }));
         let starts: Vec<String> = all.split("\n\n").map(|p| p.split(' ').take(2).collect::<Vec<_>>().join(" ")).collect();
         assert_eq!(starts, ["github runs", "Each bash", "bash with"]);
-        // sandbox: false once, and only where the host door is open.
-        assert_eq!(with_doors(PromptDoors { host: true, ..Default::default() }).matches("sandbox: false").count(), 1);
+        // sandbox: false only where the host door is open: in its paragraph and in the access facts (#268).
+        assert_eq!(with_doors(PromptDoors { host: true, ..Default::default() }).matches("sandbox: false").count(), 2);
         // The same doors give the same prompt (built once per conversation: the cache).
         let doors = PromptDoors { host: true, github: true, ..Default::default() };
         assert_eq!(with_doors(doors), with_doors(doors));
@@ -794,6 +843,62 @@ mod tests {
         assert!(edits.find("# Fixing bugs").unwrap() < edits.find("# Sandbox limits").unwrap());
         let reads = system_prompt(&PromptInput { tools: vec!["read_file".into(), "bash".into()], ..input() });
         assert!(!reads.contains("# Fixing bugs"));
+    }
+
+    /// #268: the access facts, word for word, for a home-folder session and a project folder, each with and without
+    /// the host door.
+    #[test]
+    fn the_access_facts_say_what_is_hidden_and_how_to_reach_it() {
+        let facts = |home_project: bool, host: bool| {
+            access_facts(&PromptInput { home_project, doors: PromptDoors { host, ..Default::default() }, ..input() })
+        };
+        let hidden_home = "- Hidden from sandboxed commands: the home folder's dot-entries (~/.marv, ~/.ssh, ~/.config, ~/.local and the like; toolchain folders and git config aside) and any socket. A hidden path reads as empty, missing or refused, which says nothing about the real one.";
+        let hidden_project = "- Hidden from sandboxed commands: the home folder outside the project, ~/.marv included (toolchain folders, git config and ~/.marv/skills aside, read-only). A hidden path reads as empty, missing or refused, which says nothing about the real one.";
+        let open = "- Outside the sandbox: bash with sandbox: false runs one command on the user's machine, where hidden paths can be read; the user is asked to approve each one. So a hidden path is within reach: don't tell the user you can't read it.";
+        let closed = "- Outside the sandbox: not in this session (nobody is here to approve each command), so hidden paths can't be read: say they're hidden from you, not missing, and give the user the command to run themselves.";
+        let network = "- Network: none for sandboxed commands unless you set network: true (which may ask the user).";
+        let home_line = format!(
+            "- Project: the user's home folder (or a folder that holds it). Sandboxed commands can read it but not change it; they can write only to {SCRATCH}. Change files with edit_file or write_file (the user is asked)."
+        );
+        let project_line = format!("- Project: the working directory. Sandboxed commands can write only there and in {SCRATCH}.");
+        let block = |lines: [&str; 4]| format!("\n\n{ACCESS_HEADING}\n{}", lines.join("\n"));
+        assert_eq!(facts(true, true), block([&home_line, hidden_home, open, network]));
+        assert_eq!(facts(true, false), block([&home_line, hidden_home, closed, network]));
+        assert_eq!(facts(false, true), block([&project_line, hidden_project, open, network]));
+        assert_eq!(facts(false, false), block([&project_line, hidden_project, closed, network]));
+        assert_eq!(ACCESS_HEADING, "Your access (fixed for this session):");
+        // Short, and without a blank line inside: the oracle drops it from its first line to the next blank line.
+        for (home_project, host) in [(true, true), (true, false), (false, true), (false, false)] {
+            let text = facts(home_project, host);
+            assert!(!text[2..].contains("\n\n") && text.lines().count() == 7, "{text}");
+        }
+        // The extra writable folders (#98) are named where there are some.
+        let writable = access_facts(&PromptInput { writable: vec!["~/x".into()], ..input() });
+        assert!(writable.contains(&format!("write only there and in {SCRATCH} (and the extra writable folders listed below).")));
+        // Nothing runs in a sandbox without bash: no facts.
+        assert_eq!(access_facts(&PromptInput { tools: vec!["read_file".into()], home_project: true, ..input() }), "");
+    }
+
+    /// #268: near the top, right under the working directory and the date, and the same for the same session.
+    #[test]
+    fn the_access_facts_come_right_after_the_date() {
+        let home = PromptInput {
+            cwd: "~".into(),
+            home_project: true,
+            doors: PromptDoors { host: true, ..Default::default() },
+            ..input()
+        };
+        let p = system_prompt(&home);
+        assert!(
+            p.starts_with(&format!(
+                "You are Marv, a coding agent running in the user's terminal.\n\nWorking directory: ~\nToday's date: 2026-10-13{}\n\nYou can explore the project",
+                access_facts(&home)
+            )),
+            "{p}"
+        );
+        assert_eq!(p, system_prompt(&home));
+        let none = system_prompt(&PromptInput { tools: vec!["read_file".into()], ..input() });
+        assert!(none.contains("Today's date: 2026-10-13\n\nYou can explore") && !none.contains(ACCESS_HEADING));
     }
 
     #[test]
