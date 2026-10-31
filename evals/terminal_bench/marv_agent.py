@@ -31,6 +31,8 @@ REPO = Path(__file__).resolve().parents[2]
 REMOTE_BIN = "/installed-agent/marv"
 REMOTE_CONFIG_DIR = "/installed-agent/marv-config"
 LOGS = "/logs/agent"
+# Sent with -c after a dropped connection: the conversation so far is intact, only the last request failed.
+CONTINUE_PROMPT = "The connection to the model dropped and has been restored. Continue the task from where you left off."
 
 
 def _api_key() -> str:
@@ -100,11 +102,24 @@ class MarvAgent(BaseInstalledAgent):
         # 2 of 5 smoke-test tasks stopped mid-work at the limit (2026-10-31).
         steps = int(os.environ.get("MARV_MAX_STEPS") or 0)
         approve = " ".join(f"--approve {s}" for s in ("files", "process", "network", "git_write", "web"))
+        marv = (
+            f"MARV_CONFIG_DIR={REMOTE_CONFIG_DIR} {REMOTE_BIN} --output stream-json --max-steps {steps} "
+            f"--trust-project --dangerously-run-unsandboxed --approve-tainted {approve}"
+        )
         command = (
             f"mkdir -p {LOGS}; "
-            f"MARV_CONFIG_DIR={REMOTE_CONFIG_DIR} {REMOTE_BIN} -p {shlex.quote(instruction)} "
-            f"--output stream-json --max-steps {steps} --trust-project --dangerously-run-unsandboxed --approve-tainted {approve} "
-            f"2> {LOGS}/stderr.txt | tee {LOGS}/stream.jsonl; status=${{PIPESTATUS[0]}}; "
+            # Each run's stream goes to last.jsonl (judged alone), then onto stream.jsonl (all of them).
+            f"{marv} -p {shlex.quote(instruction)} 2>> {LOGS}/stderr.txt > {LOGS}/last.jsonl; "
+            f"status=$?; cat {LOGS}/last.jsonl >> {LOGS}/stream.jsonl; "
+            # A dropped connection (DNS, Wi-Fi) ends a run after the provider's own retries (about 5 s). Wait and continue
+            # the same conversation (-c: its history intact), at most 5 times; only for that error, never for the
+            # model's own ending.
+            "for retry in 1 2 3 4 5; do "
+            f"  grep -q \"Can't reach\" {LOGS}/last.jsonl || break; "
+            f"  echo \"marv-agent: the connection dropped; continuing ($retry/5)\" >> {LOGS}/stderr.txt; sleep 30; "
+            f"  {marv} -c -p {shlex.quote(CONTINUE_PROMPT)} 2>> {LOGS}/stderr.txt > {LOGS}/last.jsonl; "
+            f"  status=$?; cat {LOGS}/last.jsonl >> {LOGS}/stream.jsonl; "
+            "done; "
             # Marv's trajectory, for failures.py and the trajectory stats; never the config folder itself (the key).
             f"cat {REMOTE_CONFIG_DIR}/trajectories/*/*.jsonl {REMOTE_CONFIG_DIR}/trajectories/*.jsonl > {LOGS}/trajectory.jsonl 2>/dev/null; "
             # Exit 2 (step limit, loop) and 3 (an approval it couldn't get) are results, not crashes: the verifier
@@ -118,16 +133,21 @@ class MarvAgent(BaseInstalledAgent):
         stream = self.logs_dir / "stream.jsonl"
         if not stream.exists():
             return
-        for line in reversed(stream.read_text(errors="replace").splitlines()):
+        # One result per marv run: the first, and one per continuation after a dropped connection. Summed.
+        totals = {"promptTokens": 0, "cachedTokens": 0, "completionTokens": 0, "cost": 0.0}
+        found = False
+        for line in stream.read_text(errors="replace").splitlines():
             try:
                 event = json.loads(line)
             except ValueError:
                 continue
             if event.get("type") != "result":
                 continue
-            usage = event.get("usage") or {}
-            context.n_input_tokens = usage.get("promptTokens")
-            context.n_cache_tokens = usage.get("cachedTokens")
-            context.n_output_tokens = usage.get("completionTokens")
-            context.cost_usd = usage.get("cost")
-            return
+            found = True
+            for key in totals:
+                totals[key] += (event.get("usage") or {}).get(key) or 0
+        if found:
+            context.n_input_tokens = totals["promptTokens"]
+            context.n_cache_tokens = totals["cachedTokens"]
+            context.n_output_tokens = totals["completionTokens"]
+            context.cost_usd = totals["cost"]
