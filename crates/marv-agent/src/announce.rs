@@ -10,7 +10,10 @@
 //! - a dangling `:` at the very end of the reply (the observed form),
 //! - a last sentence starting "let me …", optionally after "now"/"next"/"first"/"then" (but
 //!   not "let me know/summarize/recap…", which address the user),
-//! - a last sentence starting "now " with a known progressive verb ("now checking …").
+//! - a last sentence starting "now " with a known progressive verb ("now checking …"),
+//! - a last sentence that starts the work: "starting with …", "proceeding to …", "I'll start
+//!   by …" ([`START_PHRASES`]; DeepSeek V4.1 Flash ended a `rename-across-files` run on "Starting
+//!   with step 1." after a numbered plan and no tool call, 2026-10-31).
 //!
 //! Questions (`?`), code blocks, long sentences (a summary, not an announcement) and
 //! everything else never fire. Misses are fine: the finish_reason in the request record is
@@ -66,6 +69,24 @@ const NOW_VERBS: &[&str] = &[
     "writing",
 ];
 
+/// A last sentence starting with one of these starts the work it names. Lower case, matched at the
+/// sentence's start only; a closed list for the same reason as [`NOW_VERBS`].
+const START_PHRASES: &[&str] = &[
+    "starting with ",
+    "starting on ",
+    "starting by ",
+    "beginning with ",
+    "proceeding with ",
+    "proceeding to ",
+    "moving on to ",
+    "i'll start ",
+    "i will start ",
+    "i'll begin ",
+    "i will begin ",
+    "i'll now ",
+    "i will now ",
+];
+
 /// Whether a finished reply (no tool calls) ends by announcing its next action.
 pub fn announces_next_step(text: &str) -> bool {
     // A reply cut off inside a code block ends wherever the code stopped; its last line isn't
@@ -88,8 +109,10 @@ pub fn announces_next_step(text: &str) -> bool {
     }
     let lower = sentence.trim_start_matches(['*', '_', '`', '#', '>', '-', ' ', '\t']).to_lowercase();
     // A question to the user ("Shall I comment on #7?", "Let me know if …?") is never a step.
-    // Trailing emphasis must not hide the mark ("…, shall I continue?**").
-    if sentence.trim_end_matches(['*', '_', '`', ' ', '\t']).ends_with('?') {
+    // Trailing emphasis must not hide the mark ("…, shall I continue?**"). Judged on the line:
+    // `last_sentence` has already trimmed the sentence's own `?` (until 2026-10-31 this looked at
+    // the trimmed sentence and never fired; "Let me check the build?" nudged).
+    if line.trim_end_matches(['*', '_', '`', ' ', '\t', '"', '\'', ')']).ends_with('?') {
         return false;
     }
     // "Now let me …" / "Next, let me …" is the same announcement with a lead-in (the GLM form
@@ -101,6 +124,9 @@ pub fn announces_next_step(text: &str) -> bool {
         .unwrap_or(&lower);
     if let Some(rest) = let_me.strip_prefix("let me ") {
         return !["know", "summarize", "summarise", "recap"].iter().any(|w| rest.starts_with(w));
+    }
+    if START_PHRASES.iter().any(|p| lower.starts_with(p)) {
+        return true;
     }
     match lower.strip_prefix("now ").and_then(|rest| rest.split(|c: char| !c.is_ascii_alphabetic()).next()) {
         Some(word) => NOW_VERBS.contains(&word),
@@ -145,6 +171,20 @@ mod tests {
         assert!(announces_next_step("…so the fix is in. I'll now update the changelog:"));
         // The colon form needs no known verb: a dangling colon IS the announcement.
         assert!(announces_next_step("Files to change: a.rs, b.rs:"));
+    }
+
+    #[test]
+    fn fires_on_a_last_sentence_that_starts_the_work() {
+        // The DeepSeek V4.1 Flash reply that ended a rename-across-files run (2026-10-31).
+        let plan = "I will start by searching for all occurrences of `fetchUserData` across the project files using `grep`.\n\nPlan:\n1. Search for all occurrences of `fetchUserData` in the project.\n2. Rename it in the identified files.\n\nStarting with step 1.";
+        assert!(announces_next_step(plan));
+        assert!(announces_next_step("Plan is clear. Proceeding to edit src/a.ts."));
+        assert!(announces_next_step("I'll start by reading the failing test."));
+        assert!(announces_next_step("Moving on to the README."));
+        // A summary that merely mentions starting isn't one.
+        assert!(!announces_next_step("Done. I started with the parser and finished with the tests."));
+        assert!(!announces_next_step("I'll start on the docs if you want me to?"));
+        assert!(!announces_next_step("Let me check the build?"));
     }
 
     #[test]
