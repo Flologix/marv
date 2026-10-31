@@ -44,9 +44,9 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 
 use marv_sandbox::git_guard::{GitGuard, git_guard, worktree_git};
 use marv_sandbox::notes::{
-    BACKGROUND_NOTE, BACKGROUND_NOTE_PROCESS, ESCALATED_NOTE, GH_NOTE, GH_TOOL_NOTE, GIT_HINT, HOME_NOTE, HOME_PROJECT_NOTE,
-    NETWORK_NOTE, backgrounds_process, hidden_network_failure, looks_like_network_failure, needs_home_project_note, runs_gh,
-    touches_hidden_home,
+    BACKGROUND_NOTE, BACKGROUND_NOTE_PROCESS, ESCALATED_NOTE, GH_NOTE, GH_TOOL_NOTE, GIT_HINT, HIDDEN_NEXT_STEP, HOME_NOTE,
+    HOME_PROJECT_NOTE, NETWORK_NOTE, backgrounds_process, hidden_network_failure, looks_like_network_failure,
+    needs_home_project_note, runs_gh, touches_hidden_home,
 };
 use marv_sandbox::paths::is_inside;
 use marv_sandbox::protected::{ProtectedRule, created_note, nested_git_dirs, protected_snapshot, revert_created, scan_created};
@@ -580,7 +580,8 @@ pub struct BashInput {
 /// Said when a call asks for the host where no one approves each command (marv -p, the SDK without hostCommands,
 /// subagents).
 pub const NO_HOST_DOOR: &str = "Commands outside the sandbox can only run in Marv's terminal, with the user approving each one.";
-/// Added to the network and hidden-home notes where the host door is open: the last resort, which asks.
+/// Added to the network note where the host door is open: the last resort, which asks. The hidden-home notes end with
+/// `HIDDEN_NEXT_STEP` instead (#268): for a hidden path, the sandbox can't work at all, so it's the next step.
 const HOST_LAST_RESORT: &str =
     "If this can't work in the sandbox at all, bash with sandbox: false asks the user to run it on their machine.";
 
@@ -878,8 +879,10 @@ impl Tool for Bash {
         }
         let summary = command_summary(&result, timeout);
         let last_resort = if ctx.doors.host { format!(" {HOST_LAST_RESORT}") } else { String::new() };
+        // A hidden path isn't out of reach where the host door is open: the note ends with the step to it (#268).
+        let next_step = if ctx.doors.host { format!(" {HIDDEN_NEXT_STEP}") } else { String::new() };
         if sandboxed && touches_hidden_home(&input.command, &ctx.root, &ctx.sandbox.home) {
-            result.output.push_str(&format!("\n{HOME_NOTE}{last_resort}\n"));
+            result.output.push_str(&format!("\n{HOME_NOTE}{next_step}\n"));
         }
         // Everything a command backgrounds dies with it (Marv #50); with the process door, that's the way instead (#51).
         if sandboxed && backgrounds_process(&input.command) {
@@ -891,7 +894,7 @@ impl Tool for Bash {
         // `|| true` hides a failure like a pipe does (#81): a network command that printed a network error counts.
         let hidden = !failed && !result.aborted && hidden_network_failure(&input.command, &result.output);
         if home_project && needs_home_project_note(&input.command, &ctx.sandbox.home, failed) {
-            result.output.push_str(&format!("\n{HOME_PROJECT_NOTE}{last_resort}\n"));
+            result.output.push_str(&format!("\n{HOME_PROJECT_NOTE}{next_step}\n"));
         }
         if sandboxed && !network && (failed && looks_like_network_failure(&input.command, &result.output) || hidden) {
             result.output.push_str(&format!("\n{NETWORK_NOTE}{last_resort}\n"));
@@ -1687,8 +1690,38 @@ mod tests {
         open.doors.host = true;
         let last_resort = "bash with sandbox: false asks the user to run it on their machine";
         assert!(Bash.run(&bash(FAILING), &open).await.unwrap().output.contains(last_resort));
-        assert!(Bash.run(&bash("ls ~/.marv"), &open).await.unwrap().output.contains(last_resort));
+        // #268: the hidden-home note ends with the next step instead of the last resort.
+        let hidden = Bash.run(&bash("ls ~/.marv"), &open).await.unwrap().output;
+        assert!(hidden.contains(&format!("{HOME_NOTE} {HIDDEN_NEXT_STEP}\n")), "{hidden}");
+        assert!(!hidden.contains(last_resort), "{hidden}");
         assert!(!Bash.run(&bash(FAILING), &tool_ctx(&root, true)).await.unwrap().output.contains("sandbox: false"));
+        assert!(!Bash.run(&bash("ls ~/.marv"), &tool_ctx(&root, true)).await.unwrap().output.contains("sandbox: false"));
+    }
+
+    /// #268: in a home-folder project, the note on a sandboxed look at a hidden entry ends with the step that reaches
+    /// it, `sandbox: false`, where the host door is open (someone approves each command); nowhere else, since there
+    /// `sandbox: false` is refused before anyone is asked.
+    #[tokio::test]
+    async fn the_home_project_note_ends_with_the_next_step_only_where_the_host_door_is_open() {
+        require_bwrap!();
+        let home = TempDir::new("bash-home-project");
+        std::fs::create_dir_all(home.path().join(".marv")).unwrap();
+        std::fs::write(home.path().join(".marv/config.json"), "{}").unwrap();
+        let ctx = |host: bool| {
+            let mut ctx = tool_ctx(&home, true);
+            let mut sandbox = Sandbox::from_env(true);
+            sandbox.home = home.path().to_path_buf();
+            ctx.sandbox = std::sync::Arc::new(sandbox);
+            ctx.home = home.path().to_path_buf();
+            ctx.doors.host = host;
+            ctx
+        };
+        let open = Bash.run(&bash("cat ~/.marv/config.json"), &ctx(true)).await.unwrap().output;
+        assert!(open.contains(&format!("{HOME_PROJECT_NOTE} {HIDDEN_NEXT_STEP}\n")), "{open}");
+        assert!(HIDDEN_NEXT_STEP.contains("run the same command again with sandbox: false (the user is asked to approve it)"));
+        let closed = Bash.run(&bash("cat ~/.marv/config.json"), &ctx(false)).await.unwrap().output;
+        assert!(closed.contains(&format!("{HOME_PROJECT_NOTE}\n")), "{closed}");
+        assert!(!closed.contains("sandbox: false"), "{closed}");
     }
 
     /// Marv's tests/github-tool.test.ts, "bash's gh note".

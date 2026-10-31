@@ -36,6 +36,14 @@ pub const HOME_NOTE: &str = "Marv: in the sandbox the home folder can't be read 
 /// fails with "Read-only file system" and `~/.ssh` reads as empty, and a model that doesn't know why retries.
 pub const HOME_PROJECT_NOTE: &str = "Marv: the project is your home folder, so in the sandbox it is read-only, and its hidden entries (~/.marv, ~/.ssh, ~/.config, ~/.local and the like, apart from toolchain folders and git config) and any socket in it are hidden: an empty or missing one there says nothing about the real home folder. Commands can write only to /tmp. To change a file, use edit_file or write_file (the user is asked); for more, ask the user to start Marv in a project folder.";
 
+/// Ends [`HOME_NOTE`] and [`HOME_PROJECT_NOTE`] where bash can leave the sandbox (the host door: someone approves each
+/// command at a terminal), #268: told only that a path was hidden, a model in a home-folder session took an empty
+/// `find ~/.marv` for "I can't inspect your files", though an approved `sandbox: false` read it later. So the note ends
+/// with the step that reaches it. Nowhere else: in `marv -p`, a subagent or an SDK session without host commands,
+/// `sandbox: false` is refused before anyone is asked.
+pub const HIDDEN_NEXT_STEP: &str =
+    "To read a hidden path, run the same command again with sandbox: false (the user is asked to approve it).";
+
 /// Appended when a sandboxed command without network fails in a way that looks like the network's missing.
 pub const NETWORK_NOTE: &str = "Marv: this command ran in the sandbox without network, and its failure looks like it may come from that: there, every connection and DNS lookup fails, so logins look invalid and servers look down. Before drawing conclusions, run it again with network: true.";
 

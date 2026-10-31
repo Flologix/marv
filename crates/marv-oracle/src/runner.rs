@@ -379,6 +379,11 @@ pub const MARV_RS_TOOLS: &[&str] = &["recall"];
 /// raw requests (the prefix rule) keep them.
 pub const MARV_RS_SECTIONS: &[&str] = &["# Your situation", "# Fixing bugs"];
 
+/// Blocks marv-rs adds without a heading of their own, by their first line: each is dropped from the blank line
+/// before it to the next blank line. #268's access facts (`marv_session::prompt::ACCESS_HEADING`: keep them in step),
+/// right under the date, before the tools paragraph, so a heading section's "to the next `# `" would take too much.
+pub const MARV_RS_BLOCKS: &[&str] = &["Your access (fixed for this session):"];
+
 /// Text marv-rs rewords on purpose, as (marv-rs, Marv) pairs: the oracle puts Marv's text back in the system prompt
 /// and the tool descriptions before comparing, so everything around it is still checked. The raw requests (the prefix
 /// rule) keep marv-rs's. Keep these in step with the sources: #85's plan sentence (`marv_session::prompt`'s
@@ -472,8 +477,9 @@ fn unword(content: &mut Value) {
     }
 }
 
-/// Removes each of [`MARV_RS_SECTIONS`] (from its `\n\n<heading>\n\n` to the next `\n\n# ` heading, or the end) from a
-/// system message's text, plain or in parts.
+/// Removes each of [`MARV_RS_SECTIONS`] (from its `\n\n<heading>\n\n` to the next `\n\n# ` heading, or the end) and of
+/// [`MARV_RS_BLOCKS`] (from its `\n\n<first line>\n` to the next blank line) from a system message's text, plain or in
+/// parts.
 fn strip_sections(content: &mut Value) {
     match content {
         Value::String(text) => {
@@ -482,6 +488,14 @@ fn strip_sections(content: &mut Value) {
                 if let Some(start) = text.find(&marker) {
                     let after = start + marker.len();
                     let end = text[after..].find("\n\n# ").map_or(text.len(), |i| after + i);
+                    text.replace_range(start..end, "");
+                }
+            }
+            for first in MARV_RS_BLOCKS {
+                let marker = format!("\n\n{first}\n");
+                if let Some(start) = text.find(&marker) {
+                    let after = start + marker.len();
+                    let end = text[after..].find("\n\n").map_or(text.len(), |i| after + i);
                     text.replace_range(start..end, "");
                 }
             }
@@ -635,6 +649,15 @@ mod tests {
         let canonical: Value = serde_json::from_str(&canonical_request(&body)).unwrap();
         assert_eq!(canonical["messages"][0]["content"], "You are Marv.\n\n# Sandbox limits\n\nEnds.\n\n# MCP servers\n\nSetup.");
         assert_eq!(canonical["messages"][1]["content"], "# Your situation");
+    }
+
+    /// #268: the access facts sit under the date, before the tools paragraph: only the block goes, up to the blank line.
+    #[test]
+    fn marv_rs_access_facts_are_left_out_of_the_comparison() {
+        let block = format!("\n\n{}\n- Project: here.\n- Network: none.", MARV_RS_BLOCKS[0]);
+        let ours = json!({"messages": [{"role": "system", "content": format!("Today's date: x{block}\n\nYou can explore.")}]});
+        let marvs = json!({"messages": [{"role": "system", "content": "Today's date: x\n\nYou can explore."}]});
+        assert_eq!(canonical_request(&ours.to_string()), canonical_request(&marvs.to_string()));
     }
 
     #[test]

@@ -3949,6 +3949,8 @@ impl MarvSession {
             date: crate::time::iso_date(crate::time::now_ms()),
             // Checked per conversation, so the cache holds.
             git_placeholder: no_git_of_its_own(&init.root),
+            // #268: the session's root against the home folder, both fixed for the session, so the cache holds.
+            home_project: marv_sandbox::home_project(&init.root, &crate::paths::home_dir()),
         });
         // #124: one fixed section while this conversation offers radio_tx (never a roster, a name or a state).
         let base = if radio { format!("{base}{}", crate::radio::RADIO_PROMPT) } else { base };
