@@ -217,24 +217,43 @@ pub enum PlaceInput {
     Tab,
 }
 
+/// The herdr tool's arguments. A text field sent empty counts as not sent (#265): models on the Responses API pad
+/// every optional field with `""`, and an empty `branch` on a `list` is no spawn option.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HerdrInput {
     pub action: Action,
     pub what: Option<ListWhat>,
+    #[serde(default, deserialize_with = "blank_is_none")]
     pub workspace: Option<String>,
+    #[serde(default, deserialize_with = "blank_is_none")]
     pub pane: Option<String>,
+    #[serde(default, deserialize_with = "blank_is_none")]
     pub target: Option<String>,
     pub lines: Option<u64>,
+    #[serde(default, deserialize_with = "blank_is_none")]
     pub name: Option<String>,
+    #[serde(default, deserialize_with = "blank_is_none")]
     pub text: Option<String>,
+    #[serde(default, deserialize_with = "blank_is_none")]
     pub command: Option<String>,
+    #[serde(default, deserialize_with = "blank_is_none")]
     pub cwd: Option<String>,
     pub place: Option<PlaceInput>,
+    #[serde(default, deserialize_with = "blank_is_none")]
     pub kind: Option<String>,
+    #[serde(default, deserialize_with = "blank_is_none")]
     pub task: Option<String>,
+    #[serde(default, deserialize_with = "blank_is_none")]
     pub branch: Option<String>,
+    #[serde(default, deserialize_with = "blank_is_none")]
     pub base: Option<String>,
+}
+
+/// `""` as `None`, for [`HerdrInput`]'s optional text fields (a space is kept: `send` may mean it).
+fn blank_is_none<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Option<String>, D::Error> {
+    let value = Option::<String>::deserialize(de)?;
+    Ok(value.filter(|v| !v.is_empty()))
 }
 
 impl HerdrInput {

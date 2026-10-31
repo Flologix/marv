@@ -31,6 +31,15 @@
 //!   when it's about to expire. A 401 asks it for a fresh token once, then ends with its message.
 //! - `max_output_tokens` and sampling fields are sent only when set ([`ResponsesOptions`]): the ChatGPT route
 //!   refuses them.
+//! - **Tools are sent with `strict: false`** (#265). Without the field the Responses API treats a function tool as
+//!   strict, which makes every property required: models then pad each optional field (mostly with `""`), and a tool
+//!   that checks its fields refuses the call. Marv's schemas list only what's really required.
+//! - **`prompt_cache_key`** (#266), when the options carry one: a value fixed for the provider's life (a session, until
+//!   `/model` makes a new one), which OpenAI uses to route a session's requests to the same prompt cache. Without it
+//!   cache hits were left to chance (36% of a session's input in one run), and on a plan uncached input runs the
+//!   allowance down faster.
+//! - **Stream errors** come as `{"type":"error","error":{"code","message"}}` (#264: a plan's usage limit is sent this
+//!   way, after the 200); the older top-level `code`/`message` is still read.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -102,6 +111,8 @@ pub struct ResponsesOptions {
     pub timing: RetryTiming,
     /// A stream silent for this long is retried (#88).
     pub idle_timeout: Option<Duration>,
+    /// #266: sent as `prompt_cache_key`, so the session's requests reach the same prompt cache. Made once per provider.
+    pub prompt_cache_key: Option<String>,
 }
 
 // ---- Request (wire) types. Field order here is the byte order on the wire: don't reorder. ----
@@ -151,6 +162,8 @@ pub struct WireTool<'a> {
     pub name: &'a str,
     pub description: &'a str,
     pub parameters: &'a Value,
+    /// Always `false` (#265): strict would make every property required.
+    pub strict: bool,
 }
 
 /// One entry of `tools`: a function, or a namespace holding them.
@@ -203,6 +216,8 @@ pub struct ResponsesRequest<'a> {
     pub stream: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub include: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u64>,
 }
@@ -258,6 +273,7 @@ fn wire_tools(tools: &[ToolSpec], namespace: Option<ToolNamespace>) -> Vec<ToolE
         name: &t.name,
         description: &t.description,
         parameters: &t.parameters,
+        strict: false,
     });
     match namespace {
         Some(_) if tools.is_empty() => Vec::new(),
@@ -286,6 +302,7 @@ pub fn request_body<'a>(
         store: false,
         stream: true,
         include: if options.encrypted_reasoning { vec!["reasoning.encrypted_content"] } else { Vec::new() },
+        prompt_cache_key: options.prompt_cache_key.as_deref(),
         max_output_tokens: options.max_output_tokens,
     }
 }
@@ -304,7 +321,10 @@ pub struct StreamEvent {
     pub item: Option<Value>,
     #[serde(default)]
     pub response: Option<ResponseObject>,
-    /// An `error` event's own fields.
+    /// An `error` event's details (#264): `{"type":"error","error":{"code","message"}}`.
+    #[serde(default)]
+    pub error: Option<ErrorObject>,
+    /// An `error` event's own fields, in the older form with them at the top level.
     #[serde(default)]
     pub code: Option<Value>,
     #[serde(default)]
@@ -505,11 +525,11 @@ impl ReplyAssembler {
                 return Flow::Done;
             }
             "response.failed" => {
-                let error = event.response.and_then(|r| r.error).unwrap_or_default();
+                let error = event.response.and_then(|r| r.error).or(event.error).unwrap_or_default();
                 return self.error(&error, out);
             }
             "error" => {
-                let error = ErrorObject { code: event.code, message: event.message, metadata: None };
+                let error = event.error.unwrap_or(ErrorObject { code: event.code, message: event.message, metadata: None });
                 return self.error(&error, out);
             }
             _ => {}
@@ -784,6 +804,7 @@ mod tests {
             hints: ErrorHints::default(),
             timing: RetryTiming::default(),
             idle_timeout: None,
+            prompt_cache_key: None,
         }
     }
 
@@ -830,7 +851,7 @@ mod tests {
         assert_eq!(
             body["tools"],
             serde_json::json!([{"type": "namespace", "name": "marv", "description": MARV_TOOLS.description,
-                "tools": [{"type": "function", "name": "t", "description": "d", "parameters": {}}]}])
+                "tools": [{"type": "function", "name": "t", "description": "d", "parameters": {}, "strict": false}]}])
         );
         let call = body["input"].as_array().unwrap().iter().find(|i| i["type"] == "function_call").unwrap();
         assert_eq!(call["namespace"], "marv");
@@ -848,17 +869,18 @@ mod tests {
         let body = serde_json::to_string(&request_body(&o, &[], Some("SYS"), &tools, ToolChoice::Auto)).unwrap();
         assert_eq!(
             body,
-            r#"{"model":"gpt-x","instructions":"SYS","input":[],"tools":[{"type":"function","name":"t","description":"d","parameters":{}}],"store":false,"stream":true}"#
+            r#"{"model":"gpt-x","instructions":"SYS","input":[],"tools":[{"type":"function","name":"t","description":"d","parameters":{},"strict":false}],"store":false,"stream":true}"#
         );
         let o = ResponsesOptions {
             reasoning_effort: Some(ReasoningEffort::Medium),
             encrypted_reasoning: true,
             max_output_tokens: Some(100),
+            prompt_cache_key: Some("marv-k".into()),
             ..options()
         };
         let body = serde_json::to_string(&request_body(&o, &[], None, &tools, ToolChoice::None)).unwrap();
         assert!(
-            body.ends_with(r#""tool_choice":"none","reasoning":{"effort":"medium","summary":"auto"},"store":false,"stream":true,"include":["reasoning.encrypted_content"],"max_output_tokens":100}"#),
+            body.ends_with(r#""tool_choice":"none","reasoning":{"effort":"medium","summary":"auto"},"store":false,"stream":true,"include":["reasoning.encrypted_content"],"prompt_cache_key":"marv-k","max_output_tokens":100}"#),
             "{body}"
         );
         assert!(!body.contains("instructions") && !body.contains("temperature"));
@@ -960,6 +982,9 @@ mod tests {
         assert_eq!(events.last(), Some(&ProviderEvent::Error("TestAI: Bad input".into())));
         let (events, _) = run(&[r#"{"type":"error","code":"bad","message":"Nope"}"#]);
         assert_eq!(events.last(), Some(&ProviderEvent::Error("TestAI: Nope".into())));
+        // #264: the current form nests the details under `error`.
+        let (events, _) = run(&[r#"{"type":"error","error":{"type":"invalid_request_error","code":"bad","message":"Nope"}}"#]);
+        assert_eq!(events.last(), Some(&ProviderEvent::Error("TestAI: Nope".into())));
         // #159: the plan's limit is a hard stop even though its message says to try again.
         let (events, result) = run(&[
             r#"{"type":"response.failed","response":{"error":{"code":"subscription_sharing_usage_limit_exceeded","message":"Usage limit reached, try again later"}}}"#,
@@ -973,5 +998,39 @@ mod tests {
         ]);
         assert_eq!(result, Err(Incomplete));
         assert!(!events.iter().any(|e| matches!(e, ProviderEvent::Error(_))));
+    }
+
+    /// #264: the plan's usage limit as the ChatGPT route really sends it (captured on 0.13.0): an `error` event, after
+    /// the 200, with the details nested. It was "ChatGPT: unknown error"; now it's the plan-limit message, not retried.
+    #[test]
+    fn the_plans_limit_in_a_nested_error_event_is_the_plan_limit_message() {
+        let (events, result) = run(&[
+            r#"{"type":"error","error":{"type":"invalid_request_error","code":"subscription_sharing_usage_limit_exceeded","message":"The ChatGPT user has reached their Subscription Sharing usage limit. Ask the user to try again after their usage limit resets or use an API key instead.","param":null},"sequence_number":3}"#,
+        ]);
+        assert_eq!(result, Ok(()), "a hard stop, not a retry");
+        assert!(
+            matches!(events.last(), Some(ProviderEvent::Error(m)) if m.starts_with("TestAI: the usage limit for Marv on your ChatGPT plan is reached")),
+            "{events:?}"
+        );
+        assert!(!events.iter().any(|e| matches!(e, ProviderEvent::Error(m) if m.contains("unknown error"))));
+    }
+
+    /// #265: every function tool says `strict: false`, flat or in a namespace, so optional fields stay optional.
+    #[test]
+    fn every_tool_is_sent_not_strict() {
+        let tools = vec![
+            ToolSpec { name: "a".into(), description: "d".into(), parameters: serde_json::json!({"type": "object"}) },
+            ToolSpec { name: "b".into(), description: "d".into(), parameters: serde_json::json!({"type": "object"}) },
+        ];
+        for ns in [None, Some(MARV_TOOLS)] {
+            let o = ResponsesOptions { tool_namespace: ns, ..options() };
+            let body = serde_json::to_value(request_body(&o, &[], None, &tools, ToolChoice::Auto)).unwrap();
+            let fns: Vec<&Value> = match ns {
+                None => body["tools"].as_array().unwrap().iter().collect(),
+                Some(_) => body["tools"][0]["tools"].as_array().unwrap().iter().collect(),
+            };
+            assert_eq!(fns.len(), 2);
+            assert!(fns.iter().all(|f| f["strict"] == Value::Bool(false)), "{body}");
+        }
     }
 }

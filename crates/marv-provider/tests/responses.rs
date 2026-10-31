@@ -32,6 +32,7 @@ fn options(base_url: &str, credentials: Arc<dyn Credentials>) -> ResponsesOption
         hints: ErrorHints::default(),
         timing: RetryTiming { scale: 0.001 },
         idle_timeout: None,
+        prompt_cache_key: None,
     }
 }
 
