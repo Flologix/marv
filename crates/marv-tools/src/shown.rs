@@ -9,7 +9,8 @@
 //!
 //! The rule only adds a way to have read a file; the check is the same:
 //! - Judged on the text the model was shown (after Marv's cut of long output): a file the cut left out wasn't seen.
-//! - The file's **whole** current content must appear verbatim (CRLF read as LF, a final newline optional). A partial
+//! - The file's **whole** current content must appear verbatim (CRLF read as LF, a final newline optional), or with
+//!   each line numbered as `cat -n` and `nl` number them (Claude Haiku 5.5 read with `cat -n`, 2026-10-31). A partial
 //!   view (`head`, `grep`, `sed -n`) doesn't count, unlike a partial `read_file`: there's no telling which part.
 //! - Read after the command, so it's the version on disk that the model saw; a change after this is refused as before.
 //! - Candidates are paths named in the command or its output, inside the project (`resolve_in_project`: no symlink out),
@@ -53,17 +54,26 @@ fn words(text: &str, path_like_only: bool) -> impl Iterator<Item = &str> {
         })
 }
 
-/// Whether `shown` holds `content` whole (CRLF as LF; a final newline optional).
-fn holds(shown: &str, content: &str) -> bool {
+/// Whether `shown` holds `content` whole (CRLF as LF; a final newline optional), as it is or line-numbered.
+fn holds(shown: &str, content: &str, unnumbered: &str) -> bool {
     let content = content.replace("\r\n", "\n");
     let body = content.strip_suffix('\n').unwrap_or(&content);
-    !body.trim().is_empty() && shown.contains(body)
+    !body.trim().is_empty() && (shown.contains(body) || unnumbered.contains(body))
+}
+
+/// `shown` with the line numbers `cat -n` and `nl` put in front of each line (`     12\t`) taken off; other lines as
+/// they are.
+fn without_line_numbers(shown: &str) -> String {
+    static NUMBERED: OnceLock<Regex> = OnceLock::new();
+    let re = NUMBERED.get_or_init(|| Regex::new(r"^ *\d+\t").unwrap());
+    shown.split('\n').map(|line| re.replace(line, "")).collect::<Vec<_>>().join("\n")
 }
 
 /// Records as seen each project file whose whole current content `shown` (what the model was shown of `command`'s
 /// output) holds. Returns the files recorded, project-relative (for tests and the trajectory).
 pub fn record_files_shown(ctx: &ToolContext, command: &str, shown: &str) -> Vec<String> {
     let shown = shown.replace("\r\n", "\n");
+    let unnumbered = without_line_numbers(&shown);
     let mut bases: Vec<PathBuf> = vec![PathBuf::new()];
     bases.extend(cd_dirs(command).into_iter().map(PathBuf::from));
     let mut tried: HashSet<PathBuf> = HashSet::new();
@@ -80,7 +90,7 @@ pub fn record_files_shown(ctx: &ToolContext, command: &str, shown: &str) -> Vec<
             if !tried.insert(absolute.clone()) {
                 continue;
             }
-            if let Some(shown_path) = shown_whole(ctx, &absolute, &shown, in_command) {
+            if let Some(shown_path) = shown_whole(ctx, &absolute, &shown, &unnumbered, in_command) {
                 recorded.push(shown_path);
             }
         }
@@ -90,7 +100,7 @@ pub fn record_files_shown(ctx: &ToolContext, command: &str, shown: &str) -> Vec<
 
 /// The file's project path when `shown` holds its whole current content (and it's one that may count); it's then
 /// recorded as seen.
-fn shown_whole(ctx: &ToolContext, absolute: &Path, shown: &str, in_command: bool) -> Option<String> {
+fn shown_whole(ctx: &ToolContext, absolute: &Path, shown: &str, unnumbered: &str, in_command: bool) -> Option<String> {
     let name = absolute.file_name()?.to_string_lossy().into_owned();
     if !is_regular_file(absolute) || marv_sandbox::protected::is_secret_name(&name) {
         return None;
@@ -106,7 +116,7 @@ fn shown_whole(ctx: &ToolContext, absolute: &Path, shown: &str, in_command: bool
     if !in_command && content.trim().len() < MIN_OUTPUT_ONLY_BYTES {
         return None;
     }
-    if !holds(shown, &content) {
+    if !holds(shown, &content, unnumbered) {
         return None;
     }
     ctx.file_versions.saw(absolute, content.as_bytes());
@@ -186,6 +196,16 @@ mod tests {
         assert!(record_files_shown(&ctx, "cat out/x.js", A).is_empty());
         let absolute = format!("cat {}/x.js", outside.path().display());
         assert!(record_files_shown(&ctx, &absolute, A).is_empty());
+    }
+
+    #[test]
+    fn a_line_numbered_cat_counts_but_numbered_part_of_it_doesnt() {
+        let root = TempDir::new("shown-numbered");
+        root.write("src/a.js", A);
+        let ctx = ctx(&root);
+        let numbered = "     1\texport function a() {\n     2\t  return 1;\n     3\t}\n";
+        assert!(record_files_shown(&ctx, "cat -n src/a.js", &numbered[..numbered.find("     3").unwrap()]).is_empty());
+        assert_eq!(record_files_shown(&ctx, "cat -n src/a.js", numbered), ["src/a.js"]);
     }
 
     #[test]
