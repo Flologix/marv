@@ -14,7 +14,7 @@ repository in a temp folder. The check is `bun test ./__eval__.test.js`, only ev
 environment, an empty home, only the workspace writable): it runs code the model wrote.
 
 Marv runs with a throwaway MARV_CONFIG_DIR (provider OpenRouter, the key from OPENROUTER_API_KEY or ~/.marv), so your
-own MCP servers, skills and settings stay out; `--approve files,process,mcp`. Claude Code runs with project settings
+own MCP servers, skills and settings stay out; `--approve files,process,mcp --approve-tainted`. Claude Code runs with project settings
 only and no MCP servers but the task's. The MCP tasks get the tracker server (`marv-oracle tracker`, built by
 `cargo build -p marv-oracle`) on tests/oracle/mcp/<data>. A TypeScript task's repo gets the compiler from
 evals/node_modules (`bun install` in evals/, done here when it's missing).
@@ -236,7 +236,10 @@ def run_marv(ws, prompt, servers, logdir, a):
     env["MARV_CONFIG_DIR"] = str(cfg)
     env.update(extra_env)
     cmd = [a.marv_bin, "-p", prompt, "-m", a.marv_model, "--output", "stream-json", "--max-steps", "50",
-           "--approve", "files", "--approve", "process", "--approve", "mcp"]
+           "--approve", "files", "--approve", "process", "--approve", "mcp",
+           # Since 9cfcf81, --approve no longer answers egress once the run read untrusted text (an MCP result):
+           # mcp-comment reads issue #7, then comments on it. The tracker is the bench's own local fake server.
+           "--approve-tainted"]
     try:
         p, timed_out = agent_run(cmd, ws, logdir, a.timeout, env)
         for t in (cfg / "trajectories").rglob("*.jsonl"): shutil.copy(t, logdir / "trajectory.jsonl")
