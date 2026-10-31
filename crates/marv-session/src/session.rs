@@ -824,14 +824,16 @@ impl State {
         self.checkpoint_failure = None;
     }
 
-    /// A path a turn's tool reported changing (`ToolOutput::changed`), main agent or subagent.
+    /// The paths a turn's tool reported changing (`ToolOutput::changed`), main agent or subagent.
     fn note_changed(&mut self, turn: u32, event: &LoopEvent) {
         if let LoopEvent::ToolEnd { run, .. } = event
-            && let Some(changed) = &run.changed
+            && !run.changed.is_empty()
         {
             let paths = self.reported.entry(turn).or_default();
-            if !paths.contains(changed) {
-                paths.push(changed.clone());
+            for changed in &run.changed {
+                if !paths.contains(changed) {
+                    paths.push(changed.clone());
+                }
             }
         }
     }

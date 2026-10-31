@@ -533,8 +533,8 @@ pub struct ToolOutput {
     /// The plan tool's list after the call, for the screen only (like `diff`: never sent to the model or a
     /// trajectory; the call already holds it).
     pub plan: Option<Vec<PlanItem>>,
-    /// The file a change wrote (with `diff`), project-relative: which project checks run after the step.
-    pub changed: Option<String>,
+    /// The files a change wrote (with `diff`), project-relative (empty: none): which project checks run after the step.
+    pub changed: Vec<String>,
     pub is_error: bool,
     /// The user said no (or the run was interrupted): the agent stops so they can say what to do instead.
     pub declined: bool,
@@ -557,7 +557,7 @@ impl ToolOutput {
             summary: summary.into(),
             diff: None,
             plan: None,
-            changed: None,
+            changed: Vec::new(),
             is_error: false,
             declined: false,
             approval: None,

@@ -346,8 +346,8 @@ pub struct ToolRun {
     /// Where `output` came from: anything but `User`/`Marv` is fenced as data, and a tainting
     /// source taints the session (`docs/SECURITY.md`).
     pub provenance: Provenance,
-    /// The file a change wrote (project-relative): which project checks/diagnostics `after_step` runs.
-    pub changed: Option<String>,
+    /// The files a change wrote (project-relative; empty: none): which project checks/diagnostics `after_step` runs.
+    pub changed: Vec<String>,
     /// How it was approved (trajectories, `marv -p`'s `tool_end` and refusals). Never sent to the model.
     pub approval: ApprovalRecord,
     /// The door out of the sandbox the call went through (Marv #47, #51, #52), for trajectories; None for an
@@ -369,7 +369,7 @@ impl ToolRun {
             label: label.into(),
             declined: false,
             provenance: Provenance::Project,
-            changed: None,
+            changed: Vec::new(),
             approval: ApprovalRecord::None,
             door: None,
             invalid: None,

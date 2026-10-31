@@ -248,7 +248,7 @@ impl Tool for EditFile {
             summary,
         );
         result.diff = Some(shown_diff(&diff.lines));
-        result.changed = Some(planned.shown.clone());
+        result.changed = vec![planned.shown.clone()];
         Ok(result)
     }
 }

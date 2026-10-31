@@ -63,7 +63,7 @@ fn turn(project: &Path, run: RunCheck) -> (TurnChecks, Arc<Mutex<Vec<CheckOutcom
 fn edited(path: &str) -> marv_agent::ToolRun {
     let mut run =
         marv_agent::ToolRun::new(marv_core::ToolResult { output: "Edited".into(), summary: None, is_error: false }, path);
-    run.changed = Some(path.into());
+    run.changed = vec![path.into()];
     run.display = Some(Arc::new(marv_session::runner::ToolDisplay { diff: Some(Default::default()), plan: None }));
     run
 }
