@@ -9,6 +9,7 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 ### Fixed
 
 - **The model no longer says it can't read your files when the sandbox only hides them (#268).** In a session started in the home folder, an empty sandboxed `find ~/.marv` was reported as "I can't inspect your PC's local files", though the home folder was readable and an approved unsandboxed command could read `~/.marv`. The system prompt now starts, right under the working directory, with a few short facts for the session: what the project is and whether sandboxed commands can change it, which home paths the sandbox hides (an empty or missing path there says nothing about the real one), whether `sandbox: false` reaches them with your approval (in Marv's terminal) or isn't available (`marv -p`, an SDK session without host commands), and the network. When a sandboxed command looks at a hidden home path, its note now ends with the next step: run the same command again with `sandbox: false`, which asks you; only where that's possible.
+- **On macOS, a process a finished command left behind could escape the sandbox's clean-up (#269).** After a command ends, Marv kills what it left running again and again for a short window, to reach a process that was being forked as the first kill landed. On a busy Mac that window could pass in a single round, and the process then ran on (still sandboxed). The clean-up now makes at least five rounds, however long they take.
 
 ## [0.14.0] - 2026-10-30
 

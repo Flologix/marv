@@ -180,13 +180,19 @@ fn stop_and_kill(group: nix::unistd::Pid) -> nix::Result<()> {
 /// rounds, so a process its jobs were forking as the first round landed is reached by the next.
 pub const GROUP_SWEEP: Duration = Duration::from_millis(5);
 
+/// The fewest rounds [`kill_group_for`] makes, however long they take (#269): a window counted in time alone can pass
+/// in one round when the sweeping thread isn't scheduled (a loaded macOS runner), and a process being forked as that
+/// round landed then escapes. Counted in rounds, a slow machine gets a longer sweep, which is when creation is slow.
+const GROUP_MIN_ROUNDS: u32 = 5;
+
 /// How long [`kill_group_for`] keeps killing a group after a timeout or a stop killed its leader (#247): a process the
 /// leader (or the command's shell) was creating as the kill landed appears only once its creation is done, and on a
 /// loaded Intel Mac that was seen to take well over 50 ms after its parent had died.
 pub const GROUP_LINGER: Duration = Duration::from_secs(3);
 
 /// [`kill_group`] on the process group `pid` leads, again and again for `window` (every ms for the first 30 ms, then
-/// every 10 ms), until the group is gone or `held` turns false; refused for a pid of 1 or below, as [`kill_group`].
+/// every 10 ms) and at least [`GROUP_MIN_ROUNDS`] times, until the group is gone or `held` turns false; refused for a
+/// pid of 1 or below, as [`kill_group`].
 ///
 /// One group kill isn't enough on macOS (#247): it reaches the members it finds, and a process still being created
 /// isn't found (`ps` doesn't list it either). When the kill lands on a process in the middle of a `fork` or a
@@ -204,10 +210,12 @@ pub const GROUP_LINGER: Duration = Duration::from_secs(3);
 pub fn kill_group_for(pid: u32, window: Duration, held: &AtomicBool) {
     let Some(group) = i32::try_from(pid).ok().filter(|p| *p > 1).map(nix::unistd::Pid::from_raw) else { return };
     let started = Instant::now();
-    while started.elapsed() < window && held.load(Ordering::SeqCst) {
+    let mut rounds = 0;
+    while (rounds < GROUP_MIN_ROUNDS || started.elapsed() < window) && held.load(Ordering::SeqCst) {
         if stop_and_kill(group) == Err(nix::errno::Errno::ESRCH) {
             return;
         }
+        rounds += 1;
         let pause = if started.elapsed() < Duration::from_millis(30) { 1 } else { 10 };
         std::thread::sleep(Duration::from_millis(pause));
     }
@@ -381,12 +389,34 @@ mod tests {
         assert!(wait_exited(leader.id()));
         let started = Instant::now();
         kill_group_for(leader.id(), GROUP_SWEEP, &AtomicBool::new(true));
-        assert!(started.elapsed() < GROUP_SWEEP * 10, "{:?}", started.elapsed());
+        // Short, as a sweep after a normal exit must be (it holds the call up), but not bounded tightly: a loaded runner
+        // stretches the rounds, which is the point (#269).
+        assert!(started.elapsed() < GROUP_LINGER / 3, "{:?}", started.elapsed());
         leader.wait().unwrap();
         std::thread::sleep(Duration::from_millis(800));
         let survived = dir.join("late").exists();
         let _ = std::fs::remove_dir_all(&dir);
         assert!(!survived, "something in the group survived the sweep");
+    }
+
+    /// A window that has passed before the first round still gets [`GROUP_MIN_ROUNDS`] rounds (#269): the thread
+    /// sweeping may not be scheduled for the whole window.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_sweep_makes_its_rounds_even_when_its_window_has_passed() {
+        use std::os::unix::process::CommandExt;
+        let mut leader = std::process::Command::new("sleep").arg("5").process_group(0).spawn().unwrap();
+        let (pid, started) = (leader.id(), Instant::now());
+        // Held by this test, unreaped: a zombie leader keeps the group alive, so no round ends it early.
+        kill_group(pid);
+        assert!(wait_exited(pid));
+        let started_sweep = Instant::now();
+        kill_group_for(pid, Duration::ZERO, &AtomicBool::new(true));
+        let took = started_sweep.elapsed();
+        leader.wait().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // One pause of at least 1 ms after each round but the last.
+        assert!(took >= Duration::from_millis(u64::from(GROUP_MIN_ROUNDS - 1)), "{took:?}");
     }
 
     /// The exit is seen while the child is still a zombie: it hasn't been reaped, so its pid stays taken.
