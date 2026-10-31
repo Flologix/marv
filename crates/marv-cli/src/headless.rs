@@ -139,6 +139,11 @@ pub struct MustAsk {
 /// With the sandbox off (as the flag turns it) each of them runs unsandboxed.
 pub const COMMANDS: &str = "bash:";
 
+/// Appended to the system prompt in `marv -p`, where nobody reads a reply until the run ends: a question ends the
+/// run. On Terminal-Bench a run ended at its 99th step on "Want me to keep going…?" (2026-10-31). Subagents have the
+/// same rule in their own prompt; the TUI and the desktop, where a person answers, don't get this.
+pub const HEADLESS_NOTE: &str = "# Running unattended\n\nThis is a non-interactive run (marv -p): nobody reads your replies until it ends, and nobody can answer a question, so a question ends the run unanswered. Don't stop to ask whether to continue or which option to take: make reasonable assumptions, say what they were, and keep going until the task is done, or you're truly blocked and can't go on without something only the user has. Then say what you did, how you checked it, and anything left undone.";
+
 /// What `marv -p --dangerously-run-unsandboxed` says on stderr before anything runs.
 pub const UNSANDBOXED_NOTICE: &str = "marv: --dangerously-run-unsandboxed: commands run without a sandbox and without asking, with everything this user can reach. Use it only in a disposable container or CI machine.";
 
@@ -608,6 +613,8 @@ pub async fn run_headless(options: HeadlessOptions, quit: crate::signals::Quit) 
         o.sandbox = false;
     }
     o.reasoning_effort = config.reasoning_effort;
+    // Fixed for the run, so the prompt cache holds; after Marv's own prompt (the cached prefix stays the TUI's).
+    o.system_prompt = Some(marv_session::SystemPrompt::Append(HEADLESS_NOTE.into()));
     o.formatter = config.formatter;
     o.checkpoints = config.checkpoints;
     // Session-start hooks (#108): from the user's own config file only; a project's naming some is told, never run.
