@@ -7,7 +7,8 @@ Each trial's container gets the static build under test (MARV_BIN, default targe
 `cargo zigbuild --release -p marv-cli --target x86_64-unknown-linux-musl`, as the release does), a private config with the
 OpenRouter key, and runs `marv -p` in the task's working folder with `--dangerously-run-unsandboxed`: the container is the
 sandbox, and bubblewrap can't run inside it. Files, processes and the network are approved too, as a benchmark run has no
-one to ask. The stream (`stream.jsonl`), Marv's trajectory (`trajectory.jsonl`) and stderr land in the trial's agent log
+one to ask, and `--approve-tainted`: an unsandboxed command's output is untrusted (it had the network), so after the first
+one every command counts as egress from a tainted session, and without it the run stalls (0/5 on the first smoke test). The stream (`stream.jsonl`), Marv's trajectory (`trajectory.jsonl`) and stderr land in the trial's agent log
 folder; the config (it holds the key) never does.
 
 Environment: OPENROUTER_API_KEY (else ~/.marv/config.json's apiKey), MARV_BIN, MARV_MAX_STEPS (default 100),
@@ -100,7 +101,7 @@ class MarvAgent(BaseInstalledAgent):
         command = (
             f"mkdir -p {LOGS}; "
             f"MARV_CONFIG_DIR={REMOTE_CONFIG_DIR} {REMOTE_BIN} -p {shlex.quote(instruction)} "
-            f"--output stream-json --max-steps {steps} --trust-project --dangerously-run-unsandboxed {approve} "
+            f"--output stream-json --max-steps {steps} --trust-project --dangerously-run-unsandboxed --approve-tainted {approve} "
             f"2> {LOGS}/stderr.txt | tee {LOGS}/stream.jsonl; status=${{PIPESTATUS[0]}}; "
             # Marv's trajectory, for failures.py and the trajectory stats; never the config folder itself (the key).
             f"cat {REMOTE_CONFIG_DIR}/trajectories/*/*.jsonl {REMOTE_CONFIG_DIR}/trajectories/*.jsonl > {LOGS}/trajectory.jsonl 2>/dev/null; "

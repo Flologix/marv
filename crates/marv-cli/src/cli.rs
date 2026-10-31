@@ -91,7 +91,8 @@ pub struct Cli {
 
     /// In -p only, for a disposable container or CI machine: run commands without the sandbox and approve each one
     /// (with access to everything this user can reach). Protected paths and egress after untrusted content still
-    /// need their own flags. Never from the config, and refused in the TUI.
+    /// need their own flags: an unsandboxed command's output taints the session, so a container run needs
+    /// --approve-tainted too. Never from the config, and refused in the TUI.
     #[arg(long = "dangerously-run-unsandboxed")]
     pub dangerously_run_unsandboxed: bool,
 
