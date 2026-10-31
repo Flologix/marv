@@ -64,6 +64,7 @@ pub fn tool_run_from(outcome: ToolOutcome, note: Option<&str>) -> ToolRun {
     let ToolOutcome { result, label } = outcome;
     let display = ToolDisplay { diff: result.diff.clone(), plan: result.plan.clone() };
     let (declined, provenance, changed, door) = (result.declined, result.provenance, result.changed.clone(), result.door);
+    let invalid = result.invalid.clone();
     let approval = approval_record(result.approval.clone());
     let mut core = result.into_core();
     // Tainting sources are data, fenced (docs/SECURITY.md); mesh envelopes are fenced by the switchboard already. An
@@ -74,7 +75,7 @@ pub fn tool_run_from(outcome: ToolOutcome, note: Option<&str>) -> ToolRun {
     if let Some(note) = note {
         core.output = marv_tools::repair::with_note(&core.output, Some(note));
     }
-    ToolRun { result: core, label, declined, provenance, changed, approval, door, display: Some(Arc::new(display)) }
+    ToolRun { result: core, label, declined, provenance, changed, approval, door, invalid, display: Some(Arc::new(display)) }
 }
 
 /// The loop's tool runner for one turn (main agent or subagent).
@@ -495,6 +496,17 @@ mod tests {
         // Marv's own error (an unknown tool, invalid input) is the default source: not fenced.
         let marvs = tool_run_from(ToolOutcome { result: ToolOutput::error("Unknown tool"), label: "x".into() }, None);
         assert_eq!(marvs.result.output, "Unknown tool");
+    }
+
+    /// #267: the loop refuses a repeat of a call that failed validation only if it hears about it.
+    #[test]
+    fn a_validation_failure_reaches_the_loop() {
+        let mut out = ToolOutput::error("Invalid input for herdr:\nbranch, base and task: only for action spawn");
+        out.invalid = Some("branch, base and task: only for action spawn".into());
+        let run = tool_run_from(ToolOutcome { result: out, label: "herdr".into() }, None);
+        assert_eq!(run.invalid.as_deref(), Some("branch, base and task: only for action spawn"));
+        let ran = tool_run_from(ToolOutcome { result: ToolOutput::error("failed"), label: "x".into() }, None);
+        assert_eq!(ran.invalid, None);
     }
 
     #[tokio::test]

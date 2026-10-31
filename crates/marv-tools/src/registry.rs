@@ -8,6 +8,7 @@
 //! - `skill` is offered only when skills exist, `plan` unless the session turned it off (#15), `github` only where the
 //!   session has it (#47) (`tool_specs_for`).
 //! - `run_tool` never fails: bad JSON, invalid input and `ToolError`s become error results the model can recover from.
+//!   Bad JSON and invalid input (the tool never ran) also set `ToolOutput::invalid` (#267).
 //!   `available` is what this agent was offered (a subagent gets fewer tools); anything else is unknown, even if the
 //!   model names it. marv-rs: a removed built-in tool's name answers with its tombstone ([`REMOVED_TOOLS`]), not the
 //!   list; names are never reused, and the built-in specs' bytes are a golden (`tests/guards/tests/tools.rs`).
@@ -198,7 +199,12 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
         // unambiguous; anything else stays an error the model can recover from.
         Err(_) => match repair_json_args(args) {
             Some(repaired) => (repaired.value, repaired.note),
-            None => return fail(format!("The arguments for {} are not valid JSON: {}", call.name, call.arguments), &call.name),
+            None => {
+                let mut outcome =
+                    fail(format!("The arguments for {} are not valid JSON: {}", call.name, call.arguments), &call.name);
+                outcome.result.invalid = Some("the arguments are not valid JSON".into());
+                return outcome;
+            }
         },
     };
     // Generic schema mistakes (a number as a string, another harness's field), then the tool's own repair of what
@@ -217,7 +223,12 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
 
     let input = match tool.parse(input_value) {
         Ok(input) => input,
-        Err(err) => return noted(fail(format!("Invalid input for {}:\n{err}", call.name), &call.name)),
+        Err(err) => {
+            // #267: a validation failure, marked so the loop can refuse the identical call next time.
+            let mut outcome = fail(format!("Invalid input for {}:\n{err}", call.name), &call.name);
+            outcome.result.invalid = Some(err);
+            return noted(outcome);
+        }
     };
     let input = input.as_ref();
     let label = short_label(tool.label(input), ctx);
@@ -515,6 +526,21 @@ mod tests {
         assert!(run_tool(&call("{not json"), &ctx(), &t).await.result.output.contains("not valid JSON"));
         let invalid = run_tool(&call(r#"{"text": 1}"#), &ctx(), &t).await;
         assert!(invalid.result.is_error && invalid.result.output.starts_with("Invalid input for echo:"));
+    }
+
+    /// #267: a call refused before the tool ran is marked invalid, with the reason; one that ran never is, nor is an
+    /// unknown tool (no arguments were checked).
+    #[tokio::test]
+    async fn bad_json_and_invalid_input_are_marked_invalid_with_their_reason() {
+        let t = tools(ToolKind::Read, false);
+        let bad_json = run_tool(&call("{not json"), &ctx(), &t).await;
+        assert_eq!(bad_json.result.invalid.as_deref(), Some("the arguments are not valid JSON"));
+        let invalid = run_tool(&call(r#"{"text": 1}"#), &ctx(), &t).await;
+        let reason = invalid.result.invalid.expect("invalid input is marked");
+        assert!(invalid.result.output.ends_with(&reason), "{}", invalid.result.output);
+        assert_eq!(run_tool(&call(r#"{"text": "hi"}"#), &ctx(), &t).await.result.invalid, None);
+        let unknown = run_tool(&ToolCall { id: "1".into(), name: "nope".into(), arguments: "{}".into() }, &ctx(), &t).await;
+        assert_eq!(unknown.result.invalid, None);
     }
 
     /// marv-rs: a name with leaked markup before a tool's name runs that tool, with a note; the call isn't touched.
