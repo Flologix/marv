@@ -806,10 +806,10 @@ impl Tool for Bash {
             let note = if shown.count > 0 { format!("\n{}", redacted_note(shown.count)) } else { String::new() };
             let redacted = if shown.count > 0 { format!(" · {} redacted", shown.count) } else { String::new() };
             let summary = format!("{} · on your machine{redacted}", command_summary(&result, timeout));
-            let mut out = ToolOutput::ok(
-                format_output_with(&result, |t| cut_for_call(t, ctx, marv_core::Provenance::Network)) + &note,
-                summary,
-            );
+            let text = format_output_with(&result, |t| cut_for_call(t, ctx, marv_core::Provenance::Network)) + &note;
+            // A file it showed whole counts as read (`crate::shown`), as in the sandbox.
+            crate::shown::record_files_shown(ctx, &input.command, &text);
+            let mut out = ToolOutput::ok(text, summary);
             out.provenance = marv_core::Provenance::Network;
             return Ok(out);
         }
@@ -910,7 +910,10 @@ impl Tool for Bash {
         }
         // Unsandboxed, it had the network whatever it asked for.
         let source = if network || !sandboxed { marv_core::Provenance::Network } else { marv_core::Provenance::Project };
-        let mut out = ToolOutput::ok(format_output_with(&result, |t| cut_for_call(t, ctx, source)), summary);
+        let text = format_output_with(&result, |t| cut_for_call(t, ctx, source));
+        // A file the model was shown whole (`cat src/a.js`) counts as read, so its first edit isn't refused and retried.
+        crate::shown::record_files_shown(ctx, &input.command, &text);
+        let mut out = ToolOutput::ok(text, summary);
         out.provenance = source;
         Ok(out)
     }

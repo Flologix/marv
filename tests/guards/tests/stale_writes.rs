@@ -218,3 +218,35 @@ async fn a_home_spelling_of_a_file_waits_for_the_same_lock() {
     assert!(!out.is_error, "{}", out.output);
     assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "two\n");
 }
+
+/// **A file a command showed whole counts as read, and only then** (`marv_tools::shown`). `cat` of the whole file:
+/// the edit goes through. A partial view (`head`) leaves it unread: the edit is refused as before. And once read, a
+/// change by someone else is refused as before, whatever the command printed earlier.
+///
+/// Proven: dropped the `record_files_shown` call from bash's sandboxed path → failed (the edit after `cat` was
+/// refused); made `holds` accept any line of the file → failed (the edit after `head` went through).
+#[tokio::test]
+async fn a_file_a_command_showed_whole_counts_as_read_and_only_then() {
+    let root = TempDir::new("stale-shown");
+    let text = "export function a() {\n  return 1;\n}\n";
+    root.write("src/a.js", text);
+    root.write("src/b.js", text);
+    let ctx = ToolContext { approve_sandboxed: true, ..session(root.path()) };
+
+    let catted = run(&ctx, "bash", json!({"command": "cat src/a.js"})).await;
+    assert!(!catted.is_error, "{}", catted.output);
+    let edit = |path: &str| json!({"path": path, "old_string": "return 1", "new_string": "return 2"});
+    let out = run(&ctx, "edit_file", edit("src/a.js")).await;
+    assert!(!out.is_error, "the edit after cat was refused: {}", out.output);
+    assert_eq!(root.read("src/a.js").as_deref(), Some("export function a() {\n  return 2;\n}\n"));
+
+    assert!(!run(&ctx, "bash", json!({"command": "head -n 2 src/b.js"})).await.is_error);
+    let out = run(&ctx, "edit_file", edit("src/b.js")).await;
+    assert!(out.is_error && out.output.contains("hadn't read it"), "a partial view counted as read: {}", out.output);
+    assert_eq!(root.read("src/b.js").as_deref(), Some(text));
+
+    std::fs::write(root.path().join("src/a.js"), "theirs\n").unwrap();
+    let out = run(&ctx, "edit_file", json!({"path": "src/a.js", "old_string": "theirs", "new_string": "mine"})).await;
+    assert!(out.is_error, "a change after the command was written over: {}", out.output);
+    assert_eq!(root.read("src/a.js").as_deref(), Some("theirs\n"));
+}
