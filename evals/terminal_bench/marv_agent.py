@@ -11,7 +11,7 @@ one to ask, and `--approve-tainted`: an unsandboxed command's output is untruste
 one every command counts as egress from a tainted session, and without it the run stalls (0/5 on the first smoke test). The stream (`stream.jsonl`), Marv's trajectory (`trajectory.jsonl`) and stderr land in the trial's agent log
 folder; the config (it holds the key) never does.
 
-Environment: OPENROUTER_API_KEY (else ~/.marv/config.json's apiKey), MARV_BIN, MARV_MAX_STEPS (default 100),
+Environment: OPENROUTER_API_KEY (else ~/.marv/config.json's apiKey), MARV_BIN, MARV_MAX_STEPS (default 0: none, the task's timeout governs),
 MARV_CONFIG_JSON (extra config keys as a JSON object, e.g. '{"editTools": "patch"}' for an A/B).
 
 Model: `-m deepseek/deepseek-v4.1-flash` (an OpenRouter id; a leading `openrouter/` is dropped).
@@ -96,7 +96,9 @@ class MarvAgent(BaseInstalledAgent):
     @override
     @with_prompt_template
     async def run(self, instruction: str, environment: BaseEnvironment, context: AgentContext) -> None:
-        steps = int(os.environ.get("MARV_MAX_STEPS") or 100)
+        # 0: no step limit, the task's own timeout (15 to 60 minutes) ends a run, as for the other agents. At 100,
+        # 2 of 5 smoke-test tasks stopped mid-work at the limit (2026-10-31).
+        steps = int(os.environ.get("MARV_MAX_STEPS") or 0)
         approve = " ".join(f"--approve {s}" for s in ("files", "process", "network", "git_write", "web"))
         command = (
             f"mkdir -p {LOGS}; "
