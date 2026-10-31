@@ -89,6 +89,12 @@ pub struct Cli {
     #[arg(long = "approve-protected")]
     pub approve_protected: bool,
 
+    /// In -p only, for a disposable container or CI machine: run commands without the sandbox and approve each one
+    /// (with access to everything this user can reach). Protected paths and egress after untrusted content still
+    /// need their own flags. Never from the config, and refused in the TUI.
+    #[arg(long = "dangerously-run-unsandboxed")]
+    pub dangerously_run_unsandboxed: bool,
+
     /// In -p: use this project's instruction files (AGENTS.md, CLAUDE.md), skills and agent types as yours for this
     /// run, as if you'd trusted them (/trust in the TUI). Without it, they count only where you trusted exactly these
     /// files; otherwise the model reads the instruction files as the project's data, and its skills and agent types
