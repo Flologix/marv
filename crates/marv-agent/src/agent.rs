@@ -34,6 +34,11 @@
 //!   twice since the last change, whatever its tail, isn't run again ([`crate::repetition::FailureLoopState`]),
 //!   checked as each call is about to run, so an edit earlier in the same reply counts: the note the first time,
 //!   the run ends `Loop` (the step's remaining calls not run) the next.
+//! - **Repeated invalid calls** (marv-rs, #267): a call that failed validation (`ToolRun::invalid`: its arguments
+//!   aren't JSON or the tool's parse refused them, so it never ran) is remembered by tool and normalized arguments.
+//!   An identical call refused for the same reason is answered with [`refused_call_note`] from its 2nd try, not the
+//!   tool-loop guard's 4th: a validation error is deterministic. Nothing is skipped or stopped; the #37 guard still
+//!   backs it, and calls that ran are left to it.
 //! - **Empty replies** (no text, whitespace doesn't count, no calls; not failed, cut off or
 //!   cancelled): the first is asked for again unchanged (nothing enters the history, so the cache
 //!   holds; OpenRouter's upstream hosts sometimes bill for a reply and send nothing, a third of
@@ -162,6 +167,16 @@ pub const TEXT_LOOP_NOTE: &str = "(Automatic note from Marv, the program running
 pub fn tool_loop_note(repeat_count: usize, _call_name: &str) -> String {
     format!(
         "Marv: you have made this exact call {repeat_count} times in a row and it returned the same result; use what it returned, or try something else."
+    )
+}
+
+/// marv-rs #267: the result of a call identical to one that failed validation the same way earlier in the run. A
+/// validation error is deterministic, so the #37 guard's four tries were three too many (the ChatGPT provider resent
+/// one `herdr` `list` call refused for `branch, base and task: only for action spawn` until that guard stopped it).
+pub fn refused_call_note(reason: &str) -> String {
+    let reason = reason.trim().trim_end_matches('.');
+    format!(
+        "Marv: not run. This exact call was refused for: {reason}. Change the arguments (only send the fields this action uses), or tell the user it can't be done."
     )
 }
 
@@ -338,6 +353,9 @@ pub struct ToolRun {
     /// The door out of the sandbox the call went through (Marv #47, #51, #52), for trajectories; None for an
     /// ordinary call.
     pub door: Option<marv_core::Door>,
+    /// The call failed validation and the tool never ran (#267: marv-tools' `ToolOutput::invalid`): the reason. The
+    /// same call will fail the same way, so the loop refuses an identical repeat with [`refused_call_note`].
+    pub invalid: Option<String>,
     /// Display-only payload the loop never reads (marv-tools' `DiffShown`); the UI downcasts it.
     /// Never sent to the model.
     pub display: Option<Arc<dyn std::any::Any + Send + Sync>>,
@@ -354,6 +372,7 @@ impl ToolRun {
             changed: None,
             approval: ApprovalRecord::None,
             door: None,
+            invalid: None,
             display: None,
         }
     }
@@ -882,6 +901,10 @@ pub struct LoopState {
     failures: FailureLoopState,
     /// A failing command was tried again after the warning: the step's remaining calls don't run, the run ends `Loop`.
     failure_stop: bool,
+    /// #267: (tool, normalized args) → why that call failed validation (the tool never ran). An identical call that
+    /// fails for the same reason is answered with [`refused_call_note`]: the #37 guard waits for four identical
+    /// results, but a validation error repeats for certain. Calls that ran stay with the #37 guard alone.
+    invalid: std::collections::HashMap<(String, String), String>,
     in_flight: InFlight,
     /// The history's length when the last request was sent: a turn below it was carried by a request and is never
     /// rewritten (a "send now" message joins only a user turn above it).
@@ -908,6 +931,7 @@ impl LoopState {
             last_result: Default::default(),
             failures: FailureLoopState::default(),
             failure_stop: false,
+            invalid: Default::default(),
             in_flight: InFlight::default(),
             sent_len: 0,
             overflows: 0,
@@ -1417,7 +1441,20 @@ impl LoopState {
             } else {
                 let runner = self.options.runner.clone();
                 let cancel = self.options.cancel.clone();
-                group.running.push(Box::pin(async move { (k, runner.run(call, cancel).await) }));
+                // #267: an identical call that failed validation before still goes to the runner (validating is all
+                // it does, and if the call passes now it should run), but the same refusal again is answered with
+                // the direct note: the arguments are what's wrong, and another identical try won't change that.
+                let refused_before = self.invalid.get(&Self::call_key(&call)).cloned();
+                group.running.push(Box::pin(async move {
+                    let mut result = runner.run(call, cancel).await;
+                    if let Ok(run) = &mut result
+                        && run.invalid.is_some()
+                        && run.invalid == refused_before
+                    {
+                        run.result.output = refused_call_note(run.invalid.as_deref().unwrap_or_default());
+                    }
+                    (k, result)
+                }));
             }
             // Polled once right away, so whatever the tool does first (asking for approval, say)
             // happens before the next call is considered.
@@ -1432,6 +1469,9 @@ impl LoopState {
             for (k, run) in group.results.into_iter().enumerate() {
                 let run = run.expect("every call of a finished group is settled");
                 let call = self.in_flight.calls[group.range.start + k].clone();
+                if let Some(reason) = &run.invalid {
+                    self.invalid.insert(Self::call_key(&call), reason.clone());
+                }
                 self.answer(&call, &run.result.output);
                 tools.runs.push(run);
             }
@@ -3609,6 +3649,108 @@ mod tests {
         let events = collect(options(Arc::new(ScriptedProvider::new(script)), &history(vec![user("go")]), plain())).await;
         assert_eq!(tool_loops(&events), [true, false]);
         assert_eq!(end(&events), Some(StopReason::Loop));
+    }
+
+    // #267: repeated calls that failed validation.
+
+    const HERDR_REASON: &str = "branch, base and task: only for action spawn";
+
+    fn herdr_call(id: &str, args: serde_json::Value) -> ToolCall {
+        ToolCall { id: id.into(), name: "herdr".into(), arguments: args.to_string() }
+    }
+    /// Refuses `branch` outside `spawn` before running, as the herdr tool's `check` does (marked `invalid`, the way
+    /// the session's runner passes marv-tools' `ToolOutput::invalid` on); anything else runs.
+    fn validating_runner(ran: Arc<AtomicUsize>) -> FakeRunner {
+        let run: RunFn = Arc::new(move |c, _| {
+            let ran = ran.clone();
+            Box::pin(async move {
+                if arg(&c, "branch").is_string() && arg(&c, "action") != "spawn" {
+                    let output = format!("Invalid input for herdr:\n{HERDR_REASON}");
+                    let result = ToolResult { output, summary: Some("error".into()), is_error: true };
+                    return Ok(ToolRun { invalid: Some(HERDR_REASON.into()), ..ToolRun::new(result, "herdr") });
+                }
+                ran.fetch_add(1, Ordering::SeqCst);
+                Ok(ok("agents: none", "list agents"))
+            })
+        });
+        FakeRunner { run, parallel: |_| false }
+    }
+
+    #[tokio::test]
+    async fn an_identical_invalid_call_is_refused_on_the_2nd_try_and_a_corrected_call_goes_through() {
+        let bad = serde_json::json!({"action": "list", "branch": "x"});
+        let script = vec![
+            use_tools(&[herdr_call("c1", bad.clone())]),
+            use_tools(&[herdr_call("c2", bad.clone())]),
+            use_tools(&[herdr_call("c3", serde_json::json!({"action": "list"}))]),
+            say("No agents."),
+        ];
+        let ran = Arc::new(AtomicUsize::new(0));
+        let history = history(vec![user("go")]);
+        let events = collect(options(Arc::new(ScriptedProvider::new(script)), &history, validating_runner(ran.clone()))).await;
+        let refused = format!(
+            "Marv: not run. This exact call was refused for: {HERDR_REASON}. Change the arguments (only send the fields this action uses), or tell the user it can't be done."
+        );
+        assert_eq!(refused_call_note(HERDR_REASON), refused);
+        assert_eq!(tool_texts(&history), [format!("Invalid input for herdr:\n{HERDR_REASON}"), refused, "agents: none".into()]);
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+        assert!(tool_loops(&events).is_empty());
+        assert_eq!(end(&events), Some(StopReason::End));
+        // The model read the refusal as sent: its arguments untouched (prompt cache).
+        let ChatTurn::Assistant { tool_calls, .. } = &snapshot(&history)[3] else { panic!("the 2nd call's turn") };
+        assert_eq!(tool_calls[0].arguments, bad.to_string());
+    }
+
+    #[tokio::test]
+    async fn an_invalid_call_with_other_arguments_is_not_refused_as_a_repeat() {
+        // Only the identical call is refused: a different invalid call gets its own validation error first.
+        let script = vec![
+            use_tools(&[herdr_call("c1", serde_json::json!({"action": "list", "branch": "x"}))]),
+            use_tools(&[herdr_call("c2", serde_json::json!({"action": "list", "branch": "y"}))]),
+            say("Stuck."),
+        ];
+        let history = history(vec![user("go")]);
+        collect(options(Arc::new(ScriptedProvider::new(script)), &history, validating_runner(Arc::default()))).await;
+        let invalid = format!("Invalid input for herdr:\n{HERDR_REASON}");
+        assert_eq!(tool_texts(&history), [invalid.clone(), invalid]);
+    }
+
+    #[tokio::test]
+    async fn a_model_that_keeps_sending_the_refused_call_is_still_stopped_by_the_loop_guard() {
+        // The refusals are identical results, so #37's guard backs this one up: it warns once the refusal has come
+        // back three times in a row (the 5th call) and ends the run on the 6th.
+        let bad = serde_json::json!({"action": "list", "branch": "x"});
+        let script = (1..=6).map(|i| use_tools(&[herdr_call(&format!("c{i}"), bad.clone())])).collect();
+        let history = history(vec![user("go")]);
+        let events = collect(options(Arc::new(ScriptedProvider::new(script)), &history, validating_runner(Arc::default()))).await;
+        assert_eq!(tool_loops(&events), [true, false]);
+        assert_eq!(end(&events), Some(StopReason::Loop));
+        let texts = tool_texts(&history);
+        assert!(texts[1..4].iter().all(|t| t.starts_with("Marv: not run. This exact call was refused")), "{texts:?}");
+        assert!(texts[4].starts_with("Marv: you have made this exact call"), "{}", texts[4]);
+    }
+
+    #[tokio::test]
+    async fn a_call_that_ran_and_failed_is_still_left_to_the_4_call_rule() {
+        // A failure from a tool that ran (not marked invalid) is never refused early: warned on the 4th, stopped on
+        // the 5th, as #37.
+        let failing: RunFn = Arc::new(|c, _| {
+            Box::pin(async move {
+                let result = ToolResult { output: "ENOENT: a.ts".into(), summary: Some("error".into()), is_error: true };
+                Ok(ToolRun::new(result, c.id.clone()))
+            })
+        });
+        let script = (1..=5).map(|i| use_tools(&[read_call(&format!("c{i}"), "a.ts", serde_json::json!({}))])).collect();
+        let history = history(vec![user("go")]);
+        let events =
+            collect(options(Arc::new(ScriptedProvider::new(script)), &history, FakeRunner { run: failing, parallel: |_| false }))
+                .await;
+        assert_eq!(tool_loops(&events), [true, false]);
+        assert_eq!(end(&events), Some(StopReason::Loop));
+        let texts = tool_texts(&history);
+        assert_eq!(texts[..3], ["ENOENT: a.ts", "ENOENT: a.ts", "ENOENT: a.ts"]);
+        assert!(texts[3].starts_with("Marv: you have made this exact call 4 times in a row"), "{}", texts[3]);
+        assert!(!texts.iter().any(|t| t.contains("This exact call was refused")));
     }
 
     #[tokio::test]
