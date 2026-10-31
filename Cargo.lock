@@ -1551,7 +1551,7 @@ dependencies = [
 
 [[package]]
 name = "marv-agent"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "async-trait",
  "futures",
@@ -1567,7 +1567,7 @@ dependencies = [
 
 [[package]]
 name = "marv-cli"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1594,7 +1594,7 @@ dependencies = [
 
 [[package]]
 name = "marv-core"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1603,7 +1603,7 @@ dependencies = [
 
 [[package]]
 name = "marv-fs"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "futures",
  "serde_json",
@@ -1614,7 +1614,7 @@ dependencies = [
 
 [[package]]
 name = "marv-guards"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "async-trait",
  "futures",
@@ -1638,7 +1638,7 @@ dependencies = [
 
 [[package]]
 name = "marv-mcp"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1661,7 +1661,7 @@ dependencies = [
 
 [[package]]
 name = "marv-mesh"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "async-trait",
  "futures",
@@ -1680,7 +1680,7 @@ dependencies = [
 
 [[package]]
 name = "marv-oracle"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "anyhow",
  "marv-core",
@@ -1691,7 +1691,7 @@ dependencies = [
 
 [[package]]
 name = "marv-provider"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1713,7 +1713,7 @@ dependencies = [
 
 [[package]]
 name = "marv-sandbox"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "marv-core",
  "nix 0.31.3",
@@ -1725,7 +1725,7 @@ dependencies = [
 
 [[package]]
 name = "marv-session"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1755,7 +1755,7 @@ dependencies = [
 
 [[package]]
 name = "marv-tools"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "async-trait",
  "brotli",
@@ -1793,7 +1793,7 @@ dependencies = [
 
 [[package]]
 name = "marv-tui"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
