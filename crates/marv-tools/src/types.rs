@@ -544,6 +544,10 @@ pub struct ToolOutput {
     pub provenance: Provenance,
     /// The door the call went through (for trajectories); None for an ordinary call. Set by `run_tool`.
     pub door: Option<Door>,
+    /// The call failed validation and the tool never ran (#267): its arguments aren't JSON, or the tool's `parse`
+    /// (serde, then `Tool::check`) refused them. The reason, as it follows "Invalid input for <tool>:". Set by
+    /// `run_tool` only: the same arguments will always fail the same way, so the agent loop refuses a repeat.
+    pub invalid: Option<String>,
 }
 
 impl ToolOutput {
@@ -559,6 +563,7 @@ impl ToolOutput {
             approval: None,
             provenance: Provenance::Project,
             door: None,
+            invalid: None,
         }
     }
 

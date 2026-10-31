@@ -6,6 +6,10 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+### Fixed
+
+- **An identical call that failed validation is refused on its second try, not its fourth (#267).** When a tool call's arguments were refused before the tool ran (bad JSON, a missing field, a field the action doesn't take), a model could send the very same call again and again, each refused the same way, until the repetition guard stopped it on the fourth. Now the second identical call refused for the same reason gets a direct answer: "This exact call was refused for: <reason>. Change the arguments (only send the fields this action uses), or tell the user it can't be done." A corrected call goes through as before, and calls that actually ran keep the old four-call rule.
+
 ## [0.14.0] - 2026-10-30
 
 ### Added
