@@ -1,4 +1,4 @@
-<p align="center"><img src="docs/images/marv.svg" alt="Marv, a pixel-art martian" width="144"></p>
+<p align="center"><img src="docs/images/marv-banner.png" alt="Marv, a coding agent from Mars: the pixel-art martian next to the MARV wordmark"></p>
 
 # Marv
 
