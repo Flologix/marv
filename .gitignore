@@ -4,3 +4,6 @@
 /evals/node_modules
 /evals/results
 
+
+# Python bytecode (bench.py, the Terminal-Bench adapter)
+__pycache__/
