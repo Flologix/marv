@@ -62,6 +62,8 @@ pub struct SessionOptions {
     pub system_prompt: Option<SystemPrompt>,
     /// When the run must be done (`marv -p --time-limit`); see `SessionInit::deadline`.
     pub deadline: Option<std::time::Instant>,
+    /// See `SessionInit::files_anywhere`.
+    pub files_anywhere: bool,
     /// Offered to the main agent next to the built-in ones; names must be their own.
     pub tools: Vec<ToolRef>,
     /// `.mcp.json`'s format, `{ name: entry }`, in order.
@@ -170,6 +172,7 @@ impl SessionBuilder {
                 sources: Vec::new(),
                 system_prompt: None,
                 deadline: None,
+                files_anywhere: false,
                 tools: Vec::new(),
                 mcp_servers: Vec::new(),
                 mcp_skip: Vec::new(),
@@ -392,6 +395,7 @@ pub async fn create_session(options: SessionOptions) -> Result<MarvSession, Sess
     init.tools = options.tools;
     init.system_prompt = options.system_prompt;
     init.deadline = options.deadline;
+    init.files_anywhere = options.files_anywhere;
     init.approve = options.approve;
     init.mesh = options.mesh;
     init.wire_approver = options.wire_approver;

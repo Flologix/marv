@@ -622,6 +622,9 @@ pub async fn run_headless(options: HeadlessOptions, quit: crate::signals::Quit) 
     if options.must_ask.unsandboxed {
         eprintln!("{UNSANDBOXED_NOTICE}");
         o.sandbox = false;
+        // The file tools reach what its commands reach: in a container the work is often outside the project
+        // (/usr/local/bin, /tmp), and 12 write_file calls were refused there on Terminal-Bench.
+        o.files_anywhere = true;
     }
     o.reasoning_effort = config.reasoning_effort;
     // Fixed for the run, so the prompt cache holds; after Marv's own prompt (the cached prefix stays the TUI's).

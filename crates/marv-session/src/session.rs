@@ -376,6 +376,8 @@ pub struct SessionInit {
     pub system_prompt: Option<SystemPrompt>,
     /// When the run must be done (`marv -p --time-limit`), for the tools ([`ToolContext::deadline`]). None: no limit.
     pub deadline: Option<std::time::Instant>,
+    /// `marv -p --dangerously-run-unsandboxed`: the file tools may reach outside the project ([`ToolContext::files_anywhere`]).
+    pub files_anywhere: bool,
     /// Asked for every call that needs a yes; without it only what yolo vouches for runs. Wrapped by the session
     /// (`SessionApprover`): "always" scopes, `must_ask`, a stop answers "no".
     pub approve: Option<Arc<dyn Approver>>,
@@ -507,6 +509,7 @@ impl SessionInit {
             tools: Vec::new(),
             system_prompt: None,
             deadline: None,
+            files_anywhere: false,
             approve: None,
             max_steps: None,
             plan: true,
@@ -2090,6 +2093,7 @@ impl MarvSession {
         ctx.taint = self.inner.taint.clone();
         ctx.file_versions = self.inner.file_versions.clone();
         ctx.deadline = init.deadline;
+        ctx.files_anywhere = init.files_anywhere;
         // The edit tools' check-and-write locks against other Marv processes in this folder: in the runtime folder,
         // else in Marv's own folder (`file_locks_dir`); with neither, within this process only.
         ctx.file_locks = marv_sandbox::runtime_dir_for(&marv_sandbox::runtime_env(), Some(&init.root))

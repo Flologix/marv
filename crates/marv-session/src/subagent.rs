@@ -119,6 +119,7 @@ pub fn subagent_context(
     ctx.file_locks = parent.file_locks.clone();
     // The run's time limit is the subagent's too (`marv -p --time-limit`).
     ctx.deadline = parent.deadline;
+    ctx.files_anywhere = parent.files_anywhere;
     // A shared-folder subagent edits the same files in the same turn: the turn's one checkpoint covers it (#16). A
     // worktree's changes land on its branch, which is already the way back.
     ctx.checkpoint = if worktree.is_some() { None } else { parent.checkpoint.clone() };

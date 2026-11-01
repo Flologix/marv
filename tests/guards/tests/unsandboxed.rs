@@ -67,3 +67,37 @@ fn the_config_cant_turn_it_on() {
     let out = headless_configured(root.path(), config.path(), make_file(), &[], &env, extra);
     assert!(root.read("made.txt").is_none(), "ran from the config: {}\n{}", out.result, out.stderr);
 }
+
+/// **With the flag the file tools write outside the project, as its commands can; without it they don't.** A protected
+/// file inside the project still needs `--approve-protected` with the flag.
+///
+/// Proven: dropped `o.files_anywhere = true` from headless → failed (the flagged write outside was refused); made
+/// `files::resolve_in_project` ignore `files_anywhere` → failed the same way.
+#[test]
+fn only_the_flag_lets_the_file_tools_write_outside_the_project() {
+    let path = std::env::var("PATH").unwrap_or_default();
+    let env = [("PATH", path.as_str())];
+    let outside = TempDir::new("anywhere-out");
+    let target = outside.path().join("made.txt");
+    let write = |path: &str| {
+        vec![vec![ScriptCall {
+            id: Some("w1".into()),
+            name: "write_file".into(),
+            arguments: json!({"path": path, "content": "hi\n"}),
+        }]]
+    };
+    let target_str = target.display().to_string();
+
+    let (root, config) = (TempDir::new("anywhere-no"), TempDir::new("anywhere-no-config"));
+    headless_configured(root.path(), config.path(), write(&target_str), &["--approve", "files"], &env, json!({}));
+    assert!(!target.exists(), "written outside without the flag");
+
+    let (root, config) = (TempDir::new("anywhere-yes"), TempDir::new("anywhere-yes-config"));
+    let args = ["--dangerously-run-unsandboxed", "--approve", "files"];
+    let out = headless_configured(root.path(), config.path(), write(&target_str), &args, &env, json!({}));
+    assert_eq!(std::fs::read_to_string(&target).ok().as_deref(), Some("hi\n"), "{}\n{}", out.result, out.stderr);
+
+    let (root, config) = (TempDir::new("anywhere-protected"), TempDir::new("anywhere-protected-config"));
+    headless_configured(root.path(), config.path(), write("AGENTS.md"), &args, &env, json!({}));
+    assert!(root.read("AGENTS.md").is_none(), "a protected file was written without --approve-protected");
+}

@@ -451,6 +451,9 @@ pub struct ToolContext {
     /// When this run must be done (`marv -p --time-limit`): bash caps each command at the time left and says how much
     /// is left after it. None: no limit.
     pub deadline: Option<std::time::Instant>,
+    /// `marv -p --dangerously-run-unsandboxed` (a disposable container): the file tools may read and write outside the
+    /// project too, as its commands can. Inside the project every rule holds as ever. False everywhere else.
+    pub files_anywhere: bool,
 }
 
 /// A running call's one-line status on its card (the session sends it the way it sends a subagent's progress).
@@ -510,6 +513,7 @@ impl ToolContext {
             swap: None,
             progress: None,
             deadline: None,
+            files_anywhere: false,
         }
     }
 
