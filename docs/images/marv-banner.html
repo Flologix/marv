@@ -1,0 +1,134 @@
+<!doctype html><html><head><meta charset="utf-8">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600&family=JetBrains+Mono:wght@400;500&display=block" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:1280px;height:470px;background:#050807;overflow:hidden}
+.wrap{position:relative;width:1280px;height:470px;
+ background:
+  radial-gradient(ellipse 420px 260px at 300px 300px, rgba(45,212,191,.10), transparent 70%),
+  radial-gradient(ellipse 600px 300px at 1000px 0px, rgba(194,65,12,.07), transparent 70%),
+  #050807}
+.grid{position:absolute;inset:40px 70px;border:1px solid rgba(94,234,212,.06);
+ background-image:linear-gradient(rgba(94,234,212,.035) 1px,transparent 1px),linear-gradient(90deg,rgba(94,234,212,.035) 1px,transparent 1px);
+ background-size:56px 56px}
+.mascot{position:absolute;left:150px;top:60px}
+.glow{position:absolute;left:190px;top:338px;width:240px;height:28px;border-radius:50%;
+ background:radial-gradient(ellipse at center,rgba(45,212,191,.45),transparent 70%);filter:blur(6px)}
+.right{position:absolute;left:590px;top:62px;width:560px}
+.rule{height:2px;margin:26px 0 30px;background:linear-gradient(90deg,transparent,#2dd4bf 30%,#f97316 75%,transparent)}
+h1{white-space:nowrap;font:600 44px/1.1 'Space Grotesk',sans-serif;color:#eefcf8;letter-spacing:-.5px}
+.sub{margin-top:18px;font:400 21px 'JetBrains Mono',monospace;color:#7c8b87}
+.caps{margin-top:20px;font:500 14px 'JetBrains Mono',monospace;letter-spacing:1.6px;color:#2dd4bf}
+.caps b{color:#f97316;font-weight:500}
+.hr{position:absolute;left:150px;right:110px;top:370px;height:1px;background:rgba(238,252,248,.08)}
+.stats{position:absolute;left:150px;top:392px;display:flex;gap:64px}
+.stat .n{font:600 30px 'Space Grotesk',sans-serif;color:#eefcf8}
+.stat .l{margin-top:4px;font:400 12px 'JetBrains Mono',monospace;letter-spacing:1.6px;color:#5f6d69}
+</style></head><body><div class="wrap">
+<div class="grid"></div>
+<div class="glow"></div>
+<svg class="mascot" width="330" height="300" viewBox="1.5 2 12 13" shape-rendering="crispEdges">
+ <defs><linearGradient id="g" x1="0" x2="1" y1="0" y2="1">
+  <stop offset="0" stop-color="#99f6e4"/><stop offset=".45" stop-color="#2dd4bf"/><stop offset="1" stop-color="#0e7490"/></linearGradient></defs>
+ <g fill="url(#g)"><rect x="4" y="4" width="1.0" height="1.0"/>
+<rect x="5" y="5" width="1.0" height="1.0"/>
+<rect x="9" y="5" width="1.0" height="1.0"/>
+<rect x="10" y="4" width="1.0" height="1.0"/>
+<rect x="3" y="7" width="1.0" height="1.0"/>
+<rect x="4" y="6" width="1.0" height="1.0"/>
+<rect x="4" y="7" width="1.0" height="1.0"/>
+<rect x="5" y="6" width="1.0" height="1.0"/>
+<rect x="5" y="7" width="1.0" height="1.0"/>
+<rect x="6" y="6" width="1.0" height="1.0"/>
+<rect x="6" y="7" width="1.0" height="1.0"/>
+<rect x="7" y="6" width="1.0" height="1.0"/>
+<rect x="7" y="7" width="1.0" height="1.0"/>
+<rect x="8" y="6" width="1.0" height="1.0"/>
+<rect x="8" y="7" width="1.0" height="1.0"/>
+<rect x="9" y="6" width="1.0" height="1.0"/>
+<rect x="9" y="7" width="1.0" height="1.0"/>
+<rect x="10" y="6" width="1.0" height="1.0"/>
+<rect x="10" y="7" width="1.0" height="1.0"/>
+<rect x="11" y="7" width="1.0" height="1.0"/>
+<rect x="2" y="9" width="1.0" height="1.0"/>
+<rect x="3" y="8" width="1.0" height="1.0"/>
+<rect x="3" y="9" width="1.0" height="1.0"/>
+<rect x="4" y="8" width="1.0" height="1.0"/>
+<rect x="4" y="9" width="1.0" height="1.0"/>
+<rect x="6" y="8" width="1.0" height="1.0"/>
+<rect x="6" y="9" width="1.0" height="1.0"/>
+<rect x="7" y="8" width="1.0" height="1.0"/>
+<rect x="7" y="9" width="1.0" height="1.0"/>
+<rect x="8" y="8" width="1.0" height="1.0"/>
+<rect x="8" y="9" width="1.0" height="1.0"/>
+<rect x="10" y="8" width="1.0" height="1.0"/>
+<rect x="10" y="9" width="1.0" height="1.0"/>
+<rect x="11" y="8" width="1.0" height="1.0"/>
+<rect x="11" y="9" width="1.0" height="1.0"/>
+<rect x="12" y="9" width="1.0" height="1.0"/>
+<rect x="3" y="10" width="1.0" height="1.0"/>
+<rect x="3" y="11" width="1.0" height="1.0"/>
+<rect x="4" y="10" width="1.0" height="1.0"/>
+<rect x="4" y="11" width="1.0" height="1.0"/>
+<rect x="5" y="10" width="1.0" height="1.0"/>
+<rect x="5" y="11" width="1.0" height="1.0"/>
+<rect x="6" y="10" width="1.0" height="1.0"/>
+<rect x="7" y="10" width="1.0" height="1.0"/>
+<rect x="8" y="10" width="1.0" height="1.0"/>
+<rect x="9" y="10" width="1.0" height="1.0"/>
+<rect x="9" y="11" width="1.0" height="1.0"/>
+<rect x="10" y="10" width="1.0" height="1.0"/>
+<rect x="10" y="11" width="1.0" height="1.0"/>
+<rect x="11" y="10" width="1.0" height="1.0"/>
+<rect x="11" y="11" width="1.0" height="1.0"/>
+<rect x="3" y="12" width="1.0" height="1.0"/>
+<rect x="4" y="12" width="1.0" height="1.0"/>
+<rect x="4" y="13" width="1.0" height="1.0"/>
+<rect x="5" y="12" width="1.0" height="1.0"/>
+<rect x="5" y="13" width="1.0" height="1.0"/>
+<rect x="6" y="12" width="1.0" height="1.0"/>
+<rect x="6" y="13" width="1.0" height="1.0"/>
+<rect x="7" y="12" width="1.0" height="1.0"/>
+<rect x="7" y="13" width="1.0" height="1.0"/>
+<rect x="8" y="12" width="1.0" height="1.0"/>
+<rect x="8" y="13" width="1.0" height="1.0"/>
+<rect x="9" y="12" width="1.0" height="1.0"/>
+<rect x="9" y="13" width="1.0" height="1.0"/>
+<rect x="10" y="12" width="1.0" height="1.0"/>
+<rect x="10" y="13" width="1.0" height="1.0"/>
+<rect x="11" y="12" width="1.0" height="1.0"/>
+<rect x="4" y="14" width="1.0" height="1.0"/>
+<rect x="5" y="14" width="1.0" height="1.0"/>
+<rect x="9" y="14" width="1.0" height="1.0"/>
+<rect x="10" y="14" width="1.0" height="1.0"/>
+  <circle cx="3.5" cy="3" r="0.45" shape-rendering="geometricPrecision"/><circle cx="11.5" cy="3" r="0.45" shape-rendering="geometricPrecision"/></g>
+ <g fill="#050807" opacity=".35">
+ </g>
+</svg>
+<div class="right">
+ <svg width="380" height="84" viewBox="-12 -24 500 132" fill="none" stroke="#eefcf8" stroke-width="13" stroke-linecap="round" stroke-linejoin="round">
+  <!-- M: antenna-tipped peaks -->
+  <path d="M0 100 V22 L40 72 L80 22 V100"/>
+  <circle cx="0" cy="-8" r="7.5" fill="#2dd4bf" stroke="none"/><circle cx="80" cy="-8" r="7.5" fill="#2dd4bf" stroke="none"/>
+  <!-- A: open apex, broken crossbar -->
+  <path d="M130 100 L168 8 M180 8 L218 100"/>
+  <path d="M152 66 H172"/>
+  <!-- R: angular bowl -->
+  <path d="M268 100 V0 H318 L344 25 L318 50 H268 M312 50 L348 100"/>
+  <!-- V: beam with core -->
+  <path d="M398 0 L438 100 L478 0"/>
+  <circle cx="438" cy="34" r="7.5" fill="#f97316" stroke="none"/>
+ </svg>
+ <div class="rule"></div>
+ <h1>A coding agent from Mars</h1>
+ <div class="sub">One binary · Rust · Sandboxed by default</div>
+ <div class="caps">SAFE YOLO <b>·</b> INJECTION-GUARDED <b>·</b> AGENT MESH</div>
+</div>
+<div class="hr"></div>
+<div class="stats">
+ <div class="stat"><div class="n">~10 MB</div><div class="l">COMPRESSED BINARY</div></div>
+ <div class="stat"><div class="n">0</div><div class="l">RUNTIMES NEEDED</div></div>
+ <div class="stat"><div class="n">100s</div><div class="l">OF MODELS</div></div>
+ <div class="stat"><div class="n">MIT</div><div class="l">OPEN SOURCE</div></div>
+</div>
+</div></body></html>
