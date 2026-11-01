@@ -108,17 +108,18 @@ class MarvAgent(BaseInstalledAgent):
         )
         command = (
             f"mkdir -p {LOGS}; "
-            # Each run's stream goes to last.jsonl (judged alone), then onto stream.jsonl (all of them).
-            f"{marv} -p {shlex.quote(instruction)} 2>> {LOGS}/stderr.txt > {LOGS}/last.jsonl; "
-            f"status=$?; cat {LOGS}/last.jsonl >> {LOGS}/stream.jsonl; "
+            # Each run's stream goes to last.jsonl (judged alone) and onto stream.jsonl (all of them) as it comes, so a
+            # run the task's timeout kills is in both (copying after the run lost the timed-out runs' streams).
+            f"{marv} -p {shlex.quote(instruction)} 2>> {LOGS}/stderr.txt | tee {LOGS}/last.jsonl >> {LOGS}/stream.jsonl; "
+            "status=${PIPESTATUS[0]}; "
             # A dropped connection (DNS, Wi-Fi) ends a run after the provider's own retries (about 5 s). Wait and continue
             # the same conversation (-c: its history intact), at most 5 times; only for that error, never for the
             # model's own ending.
             "for retry in 1 2 3 4 5; do "
             f"  grep -q \"Can't reach\" {LOGS}/last.jsonl || break; "
             f"  echo \"marv-agent: the connection dropped; continuing ($retry/5)\" >> {LOGS}/stderr.txt; sleep 30; "
-            f"  {marv} -c -p {shlex.quote(CONTINUE_PROMPT)} 2>> {LOGS}/stderr.txt > {LOGS}/last.jsonl; "
-            f"  status=$?; cat {LOGS}/last.jsonl >> {LOGS}/stream.jsonl; "
+            f"  {marv} -c -p {shlex.quote(CONTINUE_PROMPT)} 2>> {LOGS}/stderr.txt | tee {LOGS}/last.jsonl >> {LOGS}/stream.jsonl; "
+            "  status=${PIPESTATUS[0]}; "
             "done; "
             # Marv's trajectory, for failures.py and the trajectory stats; never the config folder itself (the key).
             f"cat {REMOTE_CONFIG_DIR}/trajectories/*/*.jsonl {REMOTE_CONFIG_DIR}/trajectories/*.jsonl > {LOGS}/trajectory.jsonl 2>/dev/null; "
