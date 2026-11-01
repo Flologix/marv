@@ -20,6 +20,7 @@ Model: `-m deepseek/deepseek-v4.1-flash` (an OpenRouter id; a leading `openroute
 import json
 import os
 import shlex
+import tomllib
 from pathlib import Path
 from typing import override
 
@@ -45,6 +46,20 @@ def _api_key() -> str:
     if not key:
         raise RuntimeError("No OpenRouter key: set OPENROUTER_API_KEY or run marv's /setup.")
     return key
+
+
+def task_time_limit(logs_dir: Path) -> int | None:
+    """The task's agent timeout in seconds, for `marv -p --time-limit`: Harbor passes it only to its oracle agent, so
+    it's read from the task's `task.toml` in Harbor's cache, found by the name and hash in the trial's `config.json`
+    (the trial folder holds the agent's log folder). None when it can't be found (then Marv runs without a limit)."""
+    try:
+        task = json.loads((logs_dir.parent / "config.json").read_text())["task"]
+        digest = task["ref"].removeprefix("sha256:")
+        toml = Path.home() / ".cache/harbor/tasks/packages" / task["name"] / digest / "task.toml"
+        timeout = tomllib.loads(toml.read_text())["agent"]["timeout_sec"]
+        return int(timeout)
+    except (OSError, KeyError, ValueError, TypeError):
+        return None
 
 
 class MarvAgent(BaseInstalledAgent):
@@ -102,8 +117,11 @@ class MarvAgent(BaseInstalledAgent):
         # 2 of 5 smoke-test tasks stopped mid-work at the limit (2026-10-31).
         steps = int(os.environ.get("MARV_MAX_STEPS") or 0)
         approve = " ".join(f"--approve {s}" for s in ("files", "process", "network", "git_write", "web"))
+        # The task's own time limit, less a little for Marv's start and the logs (MARV_TIME_LIMIT overrides it).
+        limit = int(os.environ.get("MARV_TIME_LIMIT") or 0) or (task_time_limit(self.logs_dir) or 0)
+        time_limit = f"--time-limit {max(limit - 20, 60)} " if limit else ""
         marv = (
-            f"MARV_CONFIG_DIR={REMOTE_CONFIG_DIR} {REMOTE_BIN} --output stream-json --max-steps {steps} "
+            f"MARV_CONFIG_DIR={REMOTE_CONFIG_DIR} {REMOTE_BIN} --output stream-json --max-steps {steps} {time_limit}"
             f"--trust-project --dangerously-run-unsandboxed --approve-tainted {approve}"
         )
         command = (
