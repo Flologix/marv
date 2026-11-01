@@ -296,7 +296,10 @@ pub fn create_provider(config: &ProviderConfig, model: Option<&ModelInfo>, hints
                 timing: Default::default(),
                 idle_timeout: Some(openai_compat::STREAM_IDLE_TIMEOUT),
                 // #96: so the provider ends a runaway reply. Ollama has its own cap (`num_predict`).
-                max_tokens: Some(openai_compat::max_tokens_for(model.and_then(|m| m.max_output))),
+                max_tokens: Some(openai_compat::max_tokens_for_reasoning(
+                    model.and_then(|m| m.max_output),
+                    config.reasoning_effort,
+                )),
                 // #116: so max_tokens is clamped to the room the prompt leaves in the window.
                 context_length: model.and_then(|m| m.context),
             }))
