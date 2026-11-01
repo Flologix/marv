@@ -132,6 +132,7 @@ async fn run_mode(cli: Cli, mode: Mode, quit: signals::Quit) -> i32 {
                     unsandboxed: cli.dangerously_run_unsandboxed,
                 },
                 trust_project: cli.trust_project,
+                time_limit: cli.time_limit,
             };
             headless::run_headless(options, quit).await as i32
         }

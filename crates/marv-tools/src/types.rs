@@ -448,6 +448,9 @@ pub struct ToolContext {
     /// Where a running call says what it's waiting for (#201: "waiting for beta to accept the wire"), shown on its
     /// card. The main agent's only; None: nothing is shown.
     pub progress: Option<Arc<dyn ToolProgress>>,
+    /// When this run must be done (`marv -p --time-limit`): bash caps each command at the time left and says how much
+    /// is left after it. None: no limit.
+    pub deadline: Option<std::time::Instant>,
 }
 
 /// A running call's one-line status on its card (the session sends it the way it sends a subagent's progress).
@@ -506,6 +509,7 @@ impl ToolContext {
             file_locks: None,
             swap: None,
             progress: None,
+            deadline: None,
         }
     }
 

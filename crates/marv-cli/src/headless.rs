@@ -144,6 +144,15 @@ pub const COMMANDS: &str = "bash:";
 /// same rule in their own prompt; the TUI and the desktop, where a person answers, don't get this.
 pub const HEADLESS_NOTE: &str = "# Running unattended\n\nThis is a non-interactive run (marv -p): nobody reads your replies until it ends, and nobody can answer a question, so a question ends the run unanswered. Don't stop to ask whether to continue or which option to take: make reasonable assumptions, say what they were, and keep going until the task is done, or you're truly blocked and can't go on without something only the user has. Then say what you did, how you checked it, and anything left undone.";
 
+/// The system prompt's line for `--time-limit` (fixed for the run, so the cache holds). On Terminal-Bench a model ran
+/// `timeout 580 …` in a 750 s task, not knowing it had a budget, and the task ended mid-command (2026-10-31).
+pub fn time_limit_note(seconds: u64) -> String {
+    let minutes = seconds as f64 / 60.0;
+    format!(
+        "# Time limit\n\nThis run has {minutes:.0} minutes in all ({seconds} s), counted from its start, and it's stopped at the limit whatever state the work is in. Plan for it: make progress in steps that each leave something that works, keep every long command well inside the time left (each command result says how much is left, and a command's timeout is cut to fit), and leave a few minutes to check the result and finish."
+    )
+}
+
 /// What `marv -p --dangerously-run-unsandboxed` says on stderr before anything runs.
 pub const UNSANDBOXED_NOTICE: &str = "marv: --dangerously-run-unsandboxed: commands run without a sandbox and without asking, with everything this user can reach. Use it only in a disposable container or CI machine.";
 
@@ -408,6 +417,8 @@ pub struct HeadlessOptions {
     pub must_ask: MustAsk,
     /// `--trust-project`: the project's instructions, skills and agent types are used as the person's for this run.
     pub trust_project: bool,
+    /// `--time-limit`: seconds for the whole run.
+    pub time_limit: Option<u64>,
 }
 
 /// Runs one headless turn and writes the result to stdout. Returns the exit code.
@@ -614,7 +625,11 @@ pub async fn run_headless(options: HeadlessOptions, quit: crate::signals::Quit) 
     }
     o.reasoning_effort = config.reasoning_effort;
     // Fixed for the run, so the prompt cache holds; after Marv's own prompt (the cached prefix stays the TUI's).
-    o.system_prompt = Some(marv_session::SystemPrompt::Append(HEADLESS_NOTE.into()));
+    o.system_prompt = Some(marv_session::SystemPrompt::Append(match options.time_limit {
+        Some(seconds) => format!("{HEADLESS_NOTE}\n\n{}", time_limit_note(seconds)),
+        None => HEADLESS_NOTE.into(),
+    }));
+    o.deadline = options.time_limit.map(|seconds| std::time::Instant::now() + std::time::Duration::from_secs(seconds));
     o.formatter = config.formatter;
     o.checkpoints = config.checkpoints;
     // Session-start hooks (#108): from the user's own config file only; a project's naming some is told, never run.

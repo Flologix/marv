@@ -103,6 +103,11 @@ pub struct Cli {
     #[arg(long = "trust-project")]
     pub trust_project: bool,
 
+    /// In -p: the run's time limit in seconds. The model is told its budget, each command is capped at the time left,
+    /// and command results say how much is left. Nothing stops the run at the limit: the caller does.
+    #[arg(long = "time-limit", value_name = "SECONDS")]
+    pub time_limit: Option<u64>,
+
     /// Steps before the turn stops (0 never stops; default: your config's maxSteps).
     #[arg(long = "max-steps", value_name = "N")]
     pub max_steps: Option<u32>,

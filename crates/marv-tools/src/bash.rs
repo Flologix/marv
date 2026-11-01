@@ -58,6 +58,30 @@ use crate::types::{Door, Preview, Repaired, Scope, Tool, ToolContext, ToolError,
 
 pub const DEFAULT_TIMEOUT_S: u64 = 120;
 pub const MAX_TIMEOUT_S: u64 = 600;
+/// Under a time limit (`ToolContext::deadline`), the time a command leaves the run, at least, for the model to read
+/// its output and finish: its timeout is cut to what's left minus this.
+pub const DEADLINE_MARGIN_S: u64 = 30;
+
+/// A command's timeout under the run's time limit: the time left, minus [`DEADLINE_MARGIN_S`], when that's shorter
+/// (at least 1 s). On Terminal-Bench a model ran `timeout 580 …` in a 750 s task and the task ended mid-command.
+pub fn timeout_within_deadline(timeout: u64, deadline: Option<std::time::Instant>) -> u64 {
+    match deadline {
+        Some(at) => timeout
+            .min(at.saturating_duration_since(std::time::Instant::now()).as_secs().saturating_sub(DEADLINE_MARGIN_S).max(1)),
+        None => timeout,
+    }
+}
+
+/// What a command's result says under the run's time limit: the time left, so the model can plan the rest.
+pub fn time_left_note(deadline: Option<std::time::Instant>) -> String {
+    match deadline {
+        Some(at) => {
+            let left = at.saturating_duration_since(std::time::Instant::now()).as_secs();
+            format!("\n[time left in this run: {}m {:02}s]", left / 60, left % 60)
+        }
+        None => String::new(),
+    }
+}
 /// Kept in memory per command; anything beyond is dropped (the middle is cut for the model anyway).
 pub const MAX_CAPTURE: usize = 2_000_000;
 
@@ -782,7 +806,7 @@ impl Tool for Bash {
 
     async fn run(&self, input: &BashInput, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let network = input.network.unwrap_or(false);
-        let timeout = input.timeout.unwrap_or(DEFAULT_TIMEOUT_S);
+        let timeout = timeout_within_deadline(input.timeout.unwrap_or(DEFAULT_TIMEOUT_S), ctx.deadline);
         if through_host(input, ctx) {
             // Checked again here, so no path to run() skips the door (preview refuses first).
             if !ctx.doors.host {
@@ -806,7 +830,9 @@ impl Tool for Bash {
             let note = if shown.count > 0 { format!("\n{}", redacted_note(shown.count)) } else { String::new() };
             let redacted = if shown.count > 0 { format!(" · {} redacted", shown.count) } else { String::new() };
             let summary = format!("{} · on your machine{redacted}", command_summary(&result, timeout));
-            let text = format_output_with(&result, |t| cut_for_call(t, ctx, marv_core::Provenance::Network)) + &note;
+            let text = format_output_with(&result, |t| cut_for_call(t, ctx, marv_core::Provenance::Network))
+                + &note
+                + &time_left_note(ctx.deadline);
             // A file it showed whole counts as read (`crate::shown`), as in the sandbox.
             crate::shown::record_files_shown(ctx, &input.command, &text);
             let mut out = ToolOutput::ok(text, summary);
@@ -910,7 +936,7 @@ impl Tool for Bash {
         }
         // Unsandboxed, it had the network whatever it asked for.
         let source = if network || !sandboxed { marv_core::Provenance::Network } else { marv_core::Provenance::Project };
-        let text = format_output_with(&result, |t| cut_for_call(t, ctx, source));
+        let text = format_output_with(&result, |t| cut_for_call(t, ctx, source)) + &time_left_note(ctx.deadline);
         // A file the model was shown whole (`cat src/a.js`) counts as read, so its first edit isn't refused and retried.
         crate::shown::record_files_shown(ctx, &input.command, &text);
         let mut out = ToolOutput::ok(text, summary);
@@ -922,6 +948,19 @@ impl Tool for Bash {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_time_limit_caps_the_timeout_and_the_result_says_whats_left() {
+        use std::time::{Duration, Instant};
+        assert_eq!(timeout_within_deadline(580, None), 580);
+        let soon = Instant::now() + Duration::from_secs(300);
+        let capped = timeout_within_deadline(580, Some(soon));
+        assert!((268..=270).contains(&capped), "{capped}");
+        assert_eq!(timeout_within_deadline(60, Some(soon)), 60, "a shorter timeout stands");
+        assert_eq!(timeout_within_deadline(60, Some(Instant::now())), 1, "past the deadline: at least 1 s");
+        assert!(time_left_note(Some(soon)).starts_with("\n[time left in this run: 4m 5"), "{}", time_left_note(Some(soon)));
+        assert_eq!(time_left_note(None), "");
+    }
 
     fn result(output: &str, exit_code: Option<i32>) -> CommandResult {
         CommandResult { output: output.into(), exit_code, ..Default::default() }
