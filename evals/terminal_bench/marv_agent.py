@@ -17,9 +17,11 @@ MARV_CONFIG_JSON (extra config keys as a JSON object, e.g. '{"editTools": "patch
 Model: `-m deepseek/deepseek-v4.1-flash` (an OpenRouter id; a leading `openrouter/` is dropped).
 """
 
+import functools
 import json
 import os
 import shlex
+import subprocess
 import tomllib
 from pathlib import Path
 from typing import override
@@ -46,6 +48,23 @@ def _api_key() -> str:
     if not key:
         raise RuntimeError("No OpenRouter key: set OPENROUTER_API_KEY or run marv's /setup.")
     return key
+
+
+def local_binary() -> Path:
+    """The Marv build under test, on this machine (uploaded into each task's container)."""
+    return Path(os.environ.get("MARV_BIN") or REPO / "target/x86_64-unknown-linux-musl/release/marv")
+
+
+@functools.cache
+def supports(binary: str, flag: str) -> bool:
+    """Whether this Marv build takes `flag`, from its --help (it's static, so it runs here too). An older build, kept to
+    re-run a baseline, doesn't know the newer flags: passing one fails every run with 'unexpected argument' (all 7
+    baseline re-runs on 2026-10-31)."""
+    try:
+        out = subprocess.run([binary, "--help"], capture_output=True, text=True, timeout=30)
+        return flag in out.stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def task_time_limit(logs_dir: Path) -> int | None:
@@ -85,7 +104,7 @@ class MarvAgent(BaseInstalledAgent):
 
     @override
     async def install(self, environment: BaseEnvironment) -> None:
-        local = Path(os.environ.get("MARV_BIN") or REPO / "target/x86_64-unknown-linux-musl/release/marv")
+        local = local_binary()
         if not local.is_file():
             raise RuntimeError(f"No Marv build at {local}: build the static binary (see this file's header) or set MARV_BIN")
         await environment.upload_file(local, REMOTE_BIN)
@@ -119,7 +138,9 @@ class MarvAgent(BaseInstalledAgent):
         approve = " ".join(f"--approve {s}" for s in ("files", "process", "network", "git_write", "web"))
         # The task's own time limit, less a little for Marv's start and the logs (MARV_TIME_LIMIT overrides it).
         limit = int(os.environ.get("MARV_TIME_LIMIT") or 0) or (task_time_limit(self.logs_dir) or 0)
-        time_limit = f"--time-limit {max(limit - 20, 60)} " if limit else ""
+        time_limit = (
+            f"--time-limit {max(limit - 20, 60)} " if limit and supports(str(local_binary()), "--time-limit") else ""
+        )
         marv = (
             f"MARV_CONFIG_DIR={REMOTE_CONFIG_DIR} {REMOTE_BIN} --output stream-json --max-steps {steps} {time_limit}"
             f"--trust-project --dangerously-run-unsandboxed --approve-tainted {approve}"
