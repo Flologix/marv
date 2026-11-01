@@ -19,6 +19,33 @@
 //! everything else never fire. Misses are fine: the finish_reason in the request record is
 //! the reliable diagnosis, and the list of `now`-verbs can grow when the bench shows one.
 
+/// What the model is told after a reply that summarized the conversation unasked and called no tool.
+pub const SELF_SUMMARY_NOTE: &str = "(Automatic note from Marv, the program running you) Your last reply was a summary of the conversation, which nobody asked for: nothing was compacted, the conversation goes on, and the task isn't finished. Don't summarize; continue the task with your next step.";
+
+/// How many self-summaries a turn continues past: long tasks showed the quirk more than once.
+pub const MAX_SELF_SUMMARY_CONTINUES: u32 = 3;
+
+/// Whether a finished reply (no tool calls) is the model summarizing the conversation on its own, in the shape of a
+/// compaction summary ("<analysis>\nLet me work through the conversation chronologically…"). DeepSeek V4.1 Flash did
+/// it mid-task in 9 of its 46 failed Terminal-Bench runs and in none of its 36 passes (2026-10-31), with no compaction
+/// asked for: the reply has no tool call, so it ended the run. Judged on how the reply starts only, so a report that
+/// mentions a summary further down never fires.
+pub fn summarizes_itself(text: &str) -> bool {
+    let start = text.trim_start();
+    if start.starts_with("<analysis>") || start.starts_with("<summary>") {
+        return true;
+    }
+    let first = start.lines().next().unwrap_or("").trim().to_lowercase();
+    [
+        "let me work through the conversation",
+        "let me chronologically",
+        "let me go through the conversation chronologically",
+        "让我按时间顺序",
+    ]
+    .iter()
+    .any(|p| first.starts_with(p))
+}
+
 /// What the model is told after a reply that announced a step but called no tool (#90).
 pub const ANNOUNCED_STEP_NOTE: &str = "(Automatic note from Marv, the program running you) Your last reply announced your next step but made no tool call, so the run stopped. Take the step you announced now.";
 
@@ -231,5 +258,18 @@ mod tests {
     fn a_long_last_line_is_a_summary_not_an_announcement() {
         let long = format!("Now checking {}:", "x".repeat(300));
         assert!(!announces_next_step(&long));
+    }
+
+    #[test]
+    fn self_summaries_fire_and_reports_dont() {
+        assert!(summarizes_itself(
+            "<analysis>\nLet me work through the conversation chronologically.\n\n**The user's single task message:**"
+        ));
+        assert!(summarizes_itself("  <summary>\n1. Primary request"));
+        assert!(summarizes_itself("Let me chronologically analyze this conversation.\n\n**Message 1**"));
+        assert!(summarizes_itself("让我按时间顺序梳理一下这段对话。"));
+        assert!(!summarizes_itself("Done. `/app/run.py` provides run_tasks.\n\n## Summary\n- added the cancel path"));
+        assert!(!summarizes_itself("Here's a summary of what I changed: a.rs, b.rs."));
+        assert!(!summarizes_itself("Let me check the failing test."));
     }
 }
