@@ -161,7 +161,10 @@ impl ReasoningSwitch {
     }
 }
 
-/// OpenRouter's reasoning effort levels (marv-rs #143).
+/// OpenRouter's reasoning effort levels (marv-rs #143). `xhigh` and `max` are the levels above `high` that some
+/// models take (OpenRouter lists DeepSeek V4.1 Flash's as max, high, low and none, 2026-11-01): sent as named, so a
+/// model that doesn't take one may refuse the request. Which a model takes is in OpenRouter's model list
+/// (`reasoning.supported_efforts`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
@@ -169,16 +172,20 @@ pub enum ReasoningEffort {
     Low,
     Medium,
     High,
+    Xhigh,
+    Max,
 }
 
 impl ReasoningEffort {
-    pub const NAMES: [&str; 4] = ["minimal", "low", "medium", "high"];
+    pub const NAMES: [&str; 6] = ["minimal", "low", "medium", "high", "xhigh", "max"];
     pub fn parse(name: &str) -> Option<Self> {
         match name {
             "minimal" => Some(Self::Minimal),
             "low" => Some(Self::Low),
             "medium" => Some(Self::Medium),
             "high" => Some(Self::High),
+            "xhigh" => Some(Self::Xhigh),
+            "max" => Some(Self::Max),
             _ => None,
         }
     }
@@ -429,6 +436,11 @@ mod tests {
     fn reasoning_switch_serializes_like_openrouter_expects() {
         assert_eq!(serde_json::to_string(&ReasoningSwitch::OFF).unwrap(), r#"{"enabled":false}"#);
         assert_eq!(serde_json::to_string(&ReasoningSwitch::effort(ReasoningEffort::Medium)).unwrap(), r#"{"effort":"medium"}"#);
+        assert_eq!(serde_json::to_string(&ReasoningSwitch::effort(ReasoningEffort::Max)).unwrap(), r#"{"effort":"max"}"#);
+        assert_eq!(serde_json::to_string(&ReasoningSwitch::effort(ReasoningEffort::Xhigh)).unwrap(), r#"{"effort":"xhigh"}"#);
+        for name in ReasoningEffort::NAMES {
+            assert_eq!(ReasoningEffort::parse(name).map(ReasoningEffort::as_str), Some(name), "{name}");
+        }
         for name in ReasoningEffort::NAMES {
             assert_eq!(ReasoningEffort::parse(name).unwrap().as_str(), name);
         }

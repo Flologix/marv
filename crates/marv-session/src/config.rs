@@ -144,7 +144,7 @@ pub struct FileConfig {
     /// Overrides the preset endpoint, e.g. Ollama on another machine.
     pub base_url: Option<String>,
     pub thinking: Option<bool>,
-    /// `reasoningEffort` (#143): `minimal`, `low`, `medium` or `high`, sent to OpenRouter models that reason;
+    /// `reasoningEffort` (#143): `minimal`, `low`, `medium`, `high`, `xhigh` or `max` (the last two only where the model takes them), sent to OpenRouter models that reason;
     /// `Some(None)` is `"default"` (the model picks). Unset: [`DEFAULT_REASONING_EFFORT`].
     pub reasoning_effort: Option<Option<marv_provider::ReasoningEffort>>,
     /// Ollama's context window (num_ctx), at least 2048.
@@ -1312,7 +1312,10 @@ mod tests {
         let own = FileConfig::from_value(&json!({"reasoningEffort": "default"})).unwrap();
         assert_eq!(own.to_value()["reasoningEffort"], json!("default"));
         assert_eq!(resolve_config(Some(&own), &Env::new()).reasoning_effort, None);
-        for bad in [json!("max"), json!(2), json!(true)] {
+        // xhigh and max: the levels above high some models take (DeepSeek V4.1 Flash: max).
+        let max = FileConfig::from_value(&json!({"reasoningEffort": "max"})).unwrap();
+        assert_eq!(resolve_config(Some(&max), &Env::new()).reasoning_effort, Some(marv_provider::ReasoningEffort::Max));
+        for bad in [json!("ultra"), json!(2), json!(true)] {
             assert!(FileConfig::from_value(&json!({ "reasoningEffort": bad })).unwrap_err().contains("reasoningEffort"), "{bad}");
         }
     }
