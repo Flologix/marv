@@ -922,8 +922,11 @@ pub fn ollama_url(host: Option<&str>) -> String {
 pub fn resolve_config(file: Option<&FileConfig>, env: &Env) -> Config {
     // #278: `marv --local-model <gguf>` (or `MARV_LOCAL_MODEL`): llama.cpp with that file, for this run only.
     let local_model = env.get("MARV_LOCAL_MODEL").map(|m| m.trim().to_string()).filter(|m| !m.is_empty());
-    let provider =
-        if local_model.is_some() { ProviderKind::LlamaCpp } else { file.and_then(|f| f.provider).unwrap_or(ProviderKind::OpenRouter) };
+    let provider = if local_model.is_some() {
+        ProviderKind::LlamaCpp
+    } else {
+        file.and_then(|f| f.provider).unwrap_or(ProviderKind::OpenRouter)
+    };
     let preset = preset(provider);
     // #275: the chosen endpoint, from the user's own file only (there is no project layer).
     let custom = (provider == ProviderKind::Custom)
@@ -943,9 +946,8 @@ pub fn resolve_config(file: Option<&FileConfig>, env: &Env) -> Config {
     // #278: its server is started here the first time (once per model and settings, per process); it loads while
     // the session starts, and each request waits for it.
     let endpoint = endpoint.or_else(|| {
-        (provider == ProviderKind::LlamaCpp && !model.is_empty()).then(|| {
-            Arc::new(crate::local_model::endpoint(&model, file.and_then(|f| f.llama_cpp.as_ref()), context_length, env))
-        })
+        (provider == ProviderKind::LlamaCpp && !model.is_empty())
+            .then(|| Arc::new(crate::local_model::endpoint(&model, file.and_then(|f| f.llama_cpp.as_ref()), context_length, env)))
     });
     let env_key = preset.key_env.and_then(|k| env.get(k)).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
     // #159: only this provider's own key, from its own variable or field: never another vendor's.
@@ -967,16 +969,16 @@ pub fn resolve_config(file: Option<&FileConfig>, env: &Env) -> Config {
             .and_then(|f| f.base_url.clone())
             .filter(|_| custom.is_none() && provider != ProviderKind::LlamaCpp)
             .unwrap_or_else(|| match provider {
-            ProviderKind::Ollama => ollama_url(env.get("OLLAMA_HOST").map(String::as_str)),
-            ProviderKind::OpenRouter
-            | ProviderKind::Zai
-            | ProviderKind::ChatGpt
-            | ProviderKind::Kimi
-            | ProviderKind::DeepSeek
-            | ProviderKind::Qwen => preset.base_url.into(),
-            ProviderKind::Custom => custom.map(|(_, entry)| entry.base_url.clone()).unwrap_or_default(),
-            ProviderKind::LlamaCpp => endpoint.as_ref().map(|e| e.base_url.clone()).unwrap_or_default(),
-        }),
+                ProviderKind::Ollama => ollama_url(env.get("OLLAMA_HOST").map(String::as_str)),
+                ProviderKind::OpenRouter
+                | ProviderKind::Zai
+                | ProviderKind::ChatGpt
+                | ProviderKind::Kimi
+                | ProviderKind::DeepSeek
+                | ProviderKind::Qwen => preset.base_url.into(),
+                ProviderKind::Custom => custom.map(|(_, entry)| entry.base_url.clone()).unwrap_or_default(),
+                ProviderKind::LlamaCpp => endpoint.as_ref().map(|e| e.base_url.clone()).unwrap_or_default(),
+            }),
         api_key_source: if env_key.is_some() {
             Some(KeySource::Env)
         } else if api_key.is_some() {
@@ -1318,7 +1320,10 @@ mod tests {
         let config = resolve_config(Some(&file), &Env::new());
         assert!(config.endpoint.as_ref().unwrap().problem.as_deref().is_some_and(|p| p.contains("llama-server")));
         assert!(!needs_setup(Some(&file), &config));
-        assert!(needs_setup(Some(&FileConfig { model: None, ..file.clone() }), &resolve_config(Some(&FileConfig { model: None, ..file }), &Env::new())));
+        assert!(needs_setup(
+            Some(&FileConfig { model: None, ..file.clone() }),
+            &resolve_config(Some(&FileConfig { model: None, ..file }), &Env::new())
+        ));
         let openrouter = FileConfig::from_value(&json!({"provider": "openrouter", "model": "z-ai/glm-5.3"})).unwrap();
         let config = resolve_config(Some(&openrouter), &env(&[("MARV_LOCAL_MODEL", "/models/x.gguf")]));
         assert_eq!((config.provider, config.model.as_str()), (ProviderKind::LlamaCpp, "/models/x.gguf"));

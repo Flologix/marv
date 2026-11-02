@@ -137,7 +137,8 @@ impl ProviderFactory for ConfigFactory {
         // #278: an endpoint whose window Marv set itself (a llama-server it started with `-c`): that's the window,
         // so the session compacts before it fills.
         if let Some(context) = self.config.endpoint.as_ref().and_then(|e| e.context_length) {
-            let found = ModelInfo { id: self.config.model.clone(), context: Some(context), tools: Some(true), ..Default::default() };
+            let found =
+                ModelInfo { id: self.config.model.clone(), context: Some(context), tools: Some(true), ..Default::default() };
             return Some(Box::pin(async move { Some(found) }));
         }
         if let Some(table) = crate::models::table_for(self.config.provider) {

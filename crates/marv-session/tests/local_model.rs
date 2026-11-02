@@ -53,15 +53,10 @@ async fn a_local_model_runs_through_the_llama_server_marv_starts_and_stops() {
 
     let provider = create_provider(&config.provider_config(), None, None);
     assert_eq!(provider.name(), "llamacpp · tiny-q4", "the file's name, not its path");
-    let events: Vec<_> =
-        provider.stream(&[ChatTurn::User { text: "hi".into() }], StreamOptions::default()).collect().await;
-    assert!(
-        events.iter().any(|e| matches!(e, ProviderEvent::TextDelta(t) if t == "hello from llama")),
-        "{events:?}"
-    );
+    let events: Vec<_> = provider.stream(&[ChatTurn::User { text: "hi".into() }], StreamOptions::default()).collect().await;
+    assert!(events.iter().any(|e| matches!(e, ProviderEvent::TextDelta(t) if t == "hello from llama")), "{events:?}");
 
-    let args: Vec<String> =
-        serde_json::from_str(&std::fs::read_to_string(dir.join("tiny-q4.gguf.args")).unwrap()).unwrap();
+    let args: Vec<String> = serde_json::from_str(&std::fs::read_to_string(dir.join("tiny-q4.gguf.args")).unwrap()).unwrap();
     let after = |flag: &str| args.iter().position(|a| a == flag).map(|i| args[i + 1].clone());
     assert_eq!(after("-m"), Some(std::fs::canonicalize(&model).unwrap().display().to_string()));
     assert_eq!(after("--host").as_deref(), Some("127.0.0.1"));

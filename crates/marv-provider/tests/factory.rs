@@ -328,9 +328,10 @@ fn endpoint(base_url: String, wire: marv_provider::endpoint::Wire) -> ProviderCo
 
 #[tokio::test]
 async fn a_custom_chat_endpoint_gets_its_key_headers_and_extra_body() {
-    let server =
-        FakeServer::start(|_| Reply::sse(&[json!({"choices": [{"delta": {"content": "hi"}, "finish_reason": "stop"}]}), json!("[DONE]")]))
-            .await;
+    let server = FakeServer::start(|_| {
+        Reply::sse(&[json!({"choices": [{"delta": {"content": "hi"}, "finish_reason": "stop"}]}), json!("[DONE]")])
+    })
+    .await;
     let config = endpoint(format!("{}/v1", server.url()), marv_provider::endpoint::Wire::OpenAiChat);
     let provider = create_provider(&config, None, None);
     assert_eq!(provider.name(), "acme-gateway · acme-large");
@@ -426,9 +427,10 @@ fn local(base_url: String, ready: Result<(), String>) -> ProviderConfig {
 
 #[tokio::test]
 async fn a_local_servers_request_waits_until_it_is_ready() {
-    let server =
-        FakeServer::start(|_| Reply::sse(&[json!({"choices": [{"delta": {"content": "hi"}, "finish_reason": "stop"}]}), json!("[DONE]")]))
-            .await;
+    let server = FakeServer::start(|_| {
+        Reply::sse(&[json!({"choices": [{"delta": {"content": "hi"}, "finish_reason": "stop"}]}), json!("[DONE]")])
+    })
+    .await;
     let config = local(format!("{}/v1", server.url()), Ok(()));
     let factory = ConfigFactory {
         config: config.clone(),

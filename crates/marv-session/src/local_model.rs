@@ -98,7 +98,10 @@ pub fn find_server(setting: Option<&LlamaCppSetting>, env: &Env) -> Result<PathB
         return if path.is_file() {
             Ok(path)
         } else {
-            Err(format!("llama.cpp: there is no llama-server at {} (\"llamaCpp\": {{\"server\"}} in ~/.marv/config.json).", path.display()))
+            Err(format!(
+                "llama.cpp: there is no llama-server at {} (\"llamaCpp\": {{\"server\"}} in ~/.marv/config.json).",
+                path.display()
+            ))
         };
     }
     env.get("PATH")
@@ -250,10 +253,8 @@ impl Server {
 /// `GET /health`'s status code, or None when nothing answers yet.
 async fn health(port: u16) -> Option<u16> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut stream = tokio::time::timeout(Duration::from_secs(2), tokio::net::TcpStream::connect(("127.0.0.1", port)))
-        .await
-        .ok()?
-        .ok()?;
+    let mut stream =
+        tokio::time::timeout(Duration::from_secs(2), tokio::net::TcpStream::connect(("127.0.0.1", port))).await.ok()?.ok()?;
     stream.write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").await.ok()?;
     let mut head = [0u8; 64];
     let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut head)).await.ok()?.ok()?;
@@ -323,10 +324,8 @@ pub fn endpoint(model: &str, setting: Option<&LlamaCppSetting>, context: u64, en
     let model = match std::fs::canonicalize(&path) {
         Ok(model) if model.is_file() => model,
         _ => {
-            endpoint.problem = Some(format!(
-                "llama.cpp: there's no model file at {}: give a .gguf file's path with /model.",
-                path.display()
-            ));
+            endpoint.problem =
+                Some(format!("llama.cpp: there's no model file at {}: give a .gguf file's path with /model.", path.display()));
             return endpoint;
         }
     };

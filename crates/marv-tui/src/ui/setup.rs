@@ -121,11 +121,8 @@ impl Setup {
     pub fn new(context: SetupContext) -> Self {
         let first = context.presets.first().map_or(ProviderId::OpenRouter, |p| p.id.clone());
         let provider = context.current.as_ref().map_or(first, |(p, _)| p.clone());
-        let items = context
-            .presets
-            .iter()
-            .map(|p| SelectItem::new(p.id.clone(), p.label.clone()).hint(provider_hint(&p.id)))
-            .collect();
+        let items =
+            context.presets.iter().map(|p| SelectItem::new(p.id.clone(), p.label.clone()).hint(provider_hint(&p.id))).collect();
         let step = if context.start == SetupStart::Model { SetupStep::Model } else { SetupStep::Provider };
         let mut setup = Self {
             providers: Select::new(items, Some(&provider)),

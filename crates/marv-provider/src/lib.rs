@@ -435,7 +435,9 @@ pub fn create_provider(config: &ProviderConfig, model: Option<&ModelInfo>, hints
         // the endpoint's models take.
         ProviderKind::Custom | ProviderKind::LlamaCpp => match config.endpoint.as_deref() {
             Some(endpoint) => match &endpoint.problem {
-                Some(why) => Arc::new(FailingProvider { name: format!("{} · {}", endpoint.name, config.model), message: why.clone() }),
+                Some(why) => {
+                    Arc::new(FailingProvider { name: format!("{} · {}", endpoint.name, config.model), message: why.clone() })
+                }
                 None => {
                     // #278: a local model is a file's path; the status bar shows its name.
                     let shown = match config.provider {
