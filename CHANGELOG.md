@@ -10,6 +10,10 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 - **Your own endpoint as a provider (#275).** Name a company gateway, LiteLLM, vLLM or any OpenAI-compatible server under `"providers"` in `~/.marv/config.json`, with its `baseUrl`, `wire` (`openai-chat` or `openai-responses`), `key` (`env:NAME`, `command:...` or the key itself), extra `headers` and `extraBody`, and optional `models`. It's listed in `/setup` after the built-in providers, `/model` lists its models (its `GET /models` when the config lists none), and `marv -p` uses it like any other. Read only from your own config, never a project's; its key goes only to its own URL. See the README's "Your own endpoint".
 
+### Fixed
+
+- **A tool call with its optional fields sent empty works on every built-in tool.** On the ChatGPT plan (Responses API) models fill every field of a tool's schema, mostly with `""`, and some tools refused that: `read_file` with `"limit": ""`, `process` with `"name": ""`, `recall` with a page and `"query": ""`. An optional field sent as `""` is now read as not given. A test sends every action of every built-in tool padded this way (#265).
+
 ## [0.15.0] - 2026-11-01
 
 ### Changed
