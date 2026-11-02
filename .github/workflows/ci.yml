@@ -16,9 +16,11 @@ name: CI
 permissions:
   contents: read
 
+# A newer push to a pull request replaces its run; every commit on main runs to the end, since a release is gated on
+# its commit's CI (release.yml) and a cancelled run there leaves that commit without a result.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   check:

@@ -23,7 +23,45 @@ permissions:
   contents: read
 
 jobs:
+  # Before anything is built: a tag must name the workspace's version (the npm packages take theirs from the tag, the
+  # binary from Cargo.toml), and CI must have passed on the tagged commit (0.12.0, 0.14.0 and 0.14.1 were released
+  # from commits whose CI on main was red). CI on main usually still runs when the tag is pushed, so this waits for it.
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: The tag names the workspace's version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          case $GITHUB_REF in
+            refs/tags/v*) [ "${GITHUB_REF_NAME#v}" = "$version" ] || {
+              echo "tag $GITHUB_REF_NAME doesn't match Cargo.toml's version $version"; exit 1; } ;;
+          esac
+          echo "version $version"
+      - name: CI passed on this commit
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The push run on main: a tag on a commit main never had has none, and isn't released.
+          for _ in $(seq 70); do
+            run=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$GITHUB_SHA&event=push" \
+              --jq '.workflow_runs | sort_by(.created_at) | last | select(.) | "\(.status) \(.conclusion) \(.html_url)"')
+            case $run in
+              "") echo "no CI run on main for $GITHUB_SHA: tag a commit on main"; exit 1 ;;
+              "completed success "*) echo "CI passed: ${run##* }"; exit 0 ;;
+              completed*) echo "CI didn't pass on $GITHUB_SHA ($run): fix or re-run it, then re-run this"; exit 1 ;;
+            esac
+            echo "waiting for CI: $run"; sleep 60
+          done
+          echo "CI still hasn't finished on $GITHUB_SHA"; exit 1
+
   install-test:
+    needs: gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -31,6 +69,7 @@ jobs:
       - run: packaging/test-install.sh
 
   build:
+    needs: gate
     timeout-minutes: 30
     strategy:
       fail-fast: true
@@ -86,6 +125,7 @@ jobs:
   # its own CPU. Rust's linker signs the arm64 binary ad hoc, which is all macOS needs to run it (it's never
   # quarantined: curl and npm don't set the flag).
   build-macos:
+    needs: gate
     timeout-minutes: 30
     strategy:
       fail-fast: true

@@ -654,7 +654,13 @@ mod tests {
             "<p style='/*/*/*'>",
             "<p class='sr-only'>",
         ] {
-            let n = 20_000;
+            // A run of a couple of milliseconds is noise-sized (CI saw `<script` go 1.8 ms -> 14.9 ms: first-touch
+            // page faults on the larger input), so grow each unit until its small run takes 20 ms. Quadratic input
+            // gets there sooner, which only makes the 4x run's growth plainer.
+            let mut n = 20_000;
+            while n < 640_000 && time(&unit.repeat(n)) < 20.0 {
+                n *= 2;
+            }
             let (small, large) = (unit.repeat(n), unit.repeat(4 * n));
             let (mut once, mut four) = (f64::INFINITY, f64::INFINITY);
             for _ in 0..5 {
