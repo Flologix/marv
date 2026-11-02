@@ -34,6 +34,11 @@ REPO = Path(__file__).resolve().parents[2]
 REMOTE_BIN = "/installed-agent/marv"
 REMOTE_CONFIG_DIR = "/installed-agent/marv-config"
 LOGS = "/logs/agent"
+BLOCKED_HOSTS = (
+    "tbench.ai", "www.tbench.ai", "harborframework.com", "hub.harborframework.com", "www.harborframework.com",
+    "duckduckgo.com", "html.duckduckgo.com", "lite.duckduckgo.com", "api.duckduckgo.com", "www.google.com", "google.com",
+    "www.bing.com", "bing.com", "search.brave.com", "search.yahoo.com", "www.startpage.com", "searx.be", "kagi.com",
+)
 # Sent with -c after a dropped connection: the conversation so far is intact, only the last request failed.
 CONTINUE_PROMPT = "The connection to the model dropped and has been restored. Continue the task from where you left off."
 
@@ -114,6 +119,10 @@ class MarvAgent(BaseInstalledAgent):
             environment,
             command=f"chmod 755 {REMOTE_BIN} && mkdir -p {REMOTE_CONFIG_DIR} && chmod 700 {REMOTE_CONFIG_DIR}{chown}",
         )
+        # The benchmark's own sites and the search engines don't resolve in the container: no looking up the answers.
+        # Hosts only (GitHub stays, for packages); leaks.py flags whatever still reaches the benchmark's sources.
+        hosts = "".join(f"0.0.0.0 {h}\n:: {h}\n" for h in BLOCKED_HOSTS)
+        await self.exec_as_root(environment, command=f"printf {shlex.quote(hosts)} >> /etc/hosts")
         config = {
             "provider": "openrouter",
             "model": self._model(),
@@ -135,7 +144,9 @@ class MarvAgent(BaseInstalledAgent):
         # 0: no step limit, the task's own timeout (15 to 60 minutes) ends a run, as for the other agents. At 100,
         # 2 of 5 smoke-test tasks stopped mid-work at the limit (2026-10-31).
         steps = int(os.environ.get("MARV_MAX_STEPS") or 0)
-        approve = " ".join(f"--approve {s}" for s in ("files", "process", "network", "git_write", "web"))
+        # No `web` scope, so no web_fetch: with it, Marv searched for the benchmark and fetched tasks' solutions and
+        # tests (5 passes of the 2026-11-01 TB 2.1 run). The network stays for packages, as for the other agents.
+        approve = " ".join(f"--approve {s}" for s in ("files", "process", "network", "git_write"))
         # The task's own time limit, less a little for Marv's start and the logs (MARV_TIME_LIMIT overrides it).
         limit = int(os.environ.get("MARV_TIME_LIMIT") or 0) or (task_time_limit(self.logs_dir) or 0)
         time_limit = (
