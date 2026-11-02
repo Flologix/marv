@@ -60,6 +60,17 @@ pub fn repair_note(fixes: &[String]) -> Option<String> {
     ))
 }
 
+/// `args` without the optional top-level fields sent as `""` (#265). On the Responses API a model fills every field
+/// of a tool's schema, mostly with empty strings; none of Marv's own tools takes `""` to mean something in an optional
+/// field, and some refuse it (an integer, an enum, a `minLength`). Required fields are kept as sent.
+pub fn without_empty_optionals(schema: &Value, args: Value) -> Value {
+    let Value::Object(mut object) = args else { return args };
+    let required: Vec<&str> =
+        schema.get("required").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
+    object.retain(|name, field| required.contains(&name.as_str()) || field.as_str() != Some(""));
+    Value::Object(object)
+}
+
 /// Before an MCP server is called: every required field present (and not null), every string at least its
 /// `minLength`, in the arguments and in the objects inside them. The error names each field.
 pub fn check_required(schema: &Value, args: &Value) -> Result<(), String> {
@@ -504,4 +515,15 @@ mod tests {
         // An open schema has nothing to check.
         assert_eq!(check_required(&json!({"type": "object", "properties": {}}), &json!({})), Ok(()));
     }
+
+    #[test]
+    fn empty_optional_fields_are_left_out_and_required_ones_kept() {
+        let schema = json!({"type": "object", "properties": {"path": {"type": "string"}, "glob": {"type": "string"},
+            "limit": {"type": "integer"}}, "required": ["path"]});
+        let args = json!({"path": "", "glob": "", "limit": 5});
+        assert_eq!(without_empty_optionals(&schema, args), json!({"path": "", "limit": 5}));
+        // Not an object: left as it came.
+        assert_eq!(without_empty_optionals(&schema, json!("x")), json!("x"));
+    }
 }
+

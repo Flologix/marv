@@ -158,6 +158,13 @@ fn short_label(label: String, ctx: &ToolContext) -> String {
 /// `raw` repaired against `tool`'s schema (#65), and the repairs' `Marv:` note. The value to parse, never the call's
 /// stored arguments: `ToolCall::arguments` stays as the model sent it (prompt cache).
 pub fn schema_repaired(tool: &dyn DynTool, raw: Value) -> (Value, Option<String>) {
+    // #265: an optional field sent as "" is one the model was made to fill, not a value. Left out silently, before
+    // the parse: what the API forced on the model isn't its mistake.
+    let raw = if tool.repair_mode() == RepairMode::Builtin {
+        crate::schema_repair::without_empty_optionals(&tool.spec().parameters, raw)
+    } else {
+        raw
+    };
     // What a built-in tool already accepts isn't a mistake, even where it strays from the schema (`null` for an
     // `Option` field): a note there would be noise. An MCP tool's input is any object, so its parse can't tell.
     if tool.repair_mode() == RepairMode::Builtin && tool.parse(raw.clone()).is_ok() {
@@ -1008,4 +1015,49 @@ mod tests {
             assert!(!root.path().join("b.txt").exists());
         }
     }
+
+    /// #265's contract: for every action of every built-in tool, the minimal call parses, and so does the same call
+    /// with every other field sent as `""` (what a model on the Responses API sends), read as the minimal one.
+    #[test]
+    fn a_minimal_call_padded_with_empty_strings_reads_as_the_minimal_call() {
+        use serde_json::json;
+        let calls = [
+            ("read_file", json!({"path": "a.txt"})),
+            ("glob", json!({"pattern": "*.rs"})),
+            ("grep", json!({"pattern": "x"})),
+            ("web_fetch", json!({"url": "https://example.com"})),
+            ("github", json!({"args": ["pr", "list"]})),
+            ("skill", json!({"name": "s"})),
+            ("edit_file", json!({"path": "a.txt", "old_string": "a", "new_string": ""})),
+            ("write_file", json!({"path": "a.txt", "content": ""})),
+            ("bash", json!({"command": "ls"})),
+            ("process", json!({"action": "start", "command": "ls"})),
+            ("process", json!({"action": "logs", "name": "dev"})),
+            ("process", json!({"action": "stop", "name": "dev"})),
+            ("process", json!({"action": "list"})),
+            ("process", json!({"action": "serve", "path": "dist"})),
+            ("memory", json!({"action": "add", "scope": "project", "text": "t"})),
+            ("memory", json!({"action": "remove", "scope": "personal", "text": "t"})),
+            ("plan", json!({"items": []})),
+            ("agent", json!({"description": "d", "prompt": "p"})),
+            ("recall", json!({"query": "q"})),
+            ("recall", json!({"page": 1})),
+        ];
+        for tool in builtin_tools() {
+            assert!(calls.iter().any(|(name, _)| *name == tool.name()), "no minimal call for {}", tool.name());
+        }
+        for (name, minimal) in calls {
+            let tool = builtin_tools().iter().find(|t| t.name() == name).unwrap();
+            assert!(tool.parse(minimal.clone()).is_ok(), "{name} {minimal}");
+            let mut padded = minimal.as_object().unwrap().clone();
+            for field in tool.spec().parameters["properties"].as_object().unwrap().keys() {
+                padded.entry(field.clone()).or_insert(json!(""));
+            }
+            let (repaired, note) = schema_repaired(tool.as_ref(), Value::Object(padded));
+            assert_eq!(repaired, minimal, "{name}");
+            assert_eq!(note, None, "{name}");
+            assert!(tool.parse(repaired).is_ok(), "{name}");
+        }
+    }
 }
+
