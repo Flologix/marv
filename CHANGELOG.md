@@ -6,6 +6,31 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-01
+
+### Changed
+
+- **Models reason by default, at the highest effort each one takes.** Marv turned reasoning off for models where it's optional unless `/think` was on, and sent effort `medium` where it did reason, a level some models (DeepSeek V4.1 Flash) don't take. Now `thinking` is on by default and `reasoningEffort` defaults to `max`, fitted to each model: the highest level OpenRouter's model list says it takes at or below that, `high` where the list doesn't say. On Terminal-Bench 2.1, DeepSeek V4.1 Flash went from 49% with reasoning off to 76% at max; Claude Code also reasons by default. It costs more tokens per reply: lower it with `reasoningEffort` in `~/.marv/config.json`, or `/think off` for a model whose reasoning is optional. The ChatGPT plan's requests are capped at `high`, and an Ollama model gets `think` only when it lists the thinking capability.
+
+### Added
+
+- **`reasoningEffort` takes `xhigh` and `max`,** the levels above `high` that some models take. At either, a reply may run to 64,000 tokens (never more than the model can write), since the reasoning alone can fill the usual 32,000.
+- **`marv -p --time-limit <seconds>`.** The model is told its budget, each command's timeout is cut to the time left (less 30 s), and each command result says how much is left. Subagents inherit it. Nothing stops the run at the limit: the caller does.
+- **`marv -p --dangerously-run-unsandboxed`, for a disposable container or CI machine.** It turns the sandbox off for the run, approves every command and lets the file tools reach outside the project, as its commands can. Protected paths and egress after untrusted content keep their own flags (a container run usually needs `--approve-tainted` too). It's a flag only: no config key or `--approve` name does it, and the TUI refuses it. See `docs/SECURITY.md`.
+- **`marv -p` tells the model it runs unattended:** nobody can answer a question, so it makes reasonable assumptions, says what they were, and keeps going until the task is done or it's truly blocked. A run used to end on "Want me to keep going?".
+
+### Fixed
+
+- **A run no longer ends halfway when the model summarizes the conversation on its own.** Some models (DeepSeek V4.1 Flash) write a summary in a compaction summary's shape mid-task, with no tool call, and the run ended there: 9 of 46 failed Terminal-Bench runs, none of the passes. Marv now tells the model nothing was compacted and goes on, up to three times a turn.
+- **A reply cut off while only reasoning gets more tries.** At high effort a reply could spend its whole output budget reasoning and do nothing, and two in a row ended the run. Such a reply now gets up to three more tries; any other cut-off is continued once, as before.
+- **A file the model read with a shell command counts as read.** Models often read with `cat` (or a `for … cat` loop, or `cat -n`), and the edit tools refused each such file's first edit as never read, a wasted step every time. When a command's output, as the model saw it, holds a project file's whole current content, that version now counts as read. Partial views (`head`, `grep`), secrets and files outside the project never count, and a change made after it is refused as before.
+- **An announced next step like "Starting with step 1." is continued** instead of ending the run, and a question to the user is never mistaken for one (that check never held).
+
+### Evals
+
+- `evals/terminal_bench/`: Marv as a Harbor agent for Terminal-Bench 2.0 and 2.1 (`run.sh`, `TB_DATASET`), with the task's own time limit passed to `--time-limit`, a retry after a dropped connection, and `prepull.sh` for big task images on a flaky connection.
+- `evals/failures.py` sorts every failed bench run by cause, with the line that shows it. `bench.py` records each harness's peak memory and CPU time, works with opencode 2.x again, and passes `--approve-tainted` so `mcp-comment` can comment after reading its issue.
+
 ## [0.14.1] - 2026-10-30
 
 ### Fixed
