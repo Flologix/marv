@@ -416,7 +416,8 @@ pub fn map_event(
     }
 }
 
-fn provider_id(kind: ProviderKind) -> ProviderId {
+/// `custom`: a custom provider's name (#275), for [`ProviderKind::Custom`].
+fn provider_id(kind: ProviderKind, custom: Option<&str>) -> ProviderId {
     match kind {
         ProviderKind::OpenRouter => ProviderId::OpenRouter,
         ProviderKind::Ollama => ProviderId::Ollama,
@@ -425,10 +426,12 @@ fn provider_id(kind: ProviderKind) -> ProviderId {
         ProviderKind::Kimi => ProviderId::Kimi,
         ProviderKind::DeepSeek => ProviderId::DeepSeek,
         ProviderKind::Qwen => ProviderId::Qwen,
+        ProviderKind::LlamaCpp => ProviderId::LlamaCpp,
+        ProviderKind::Custom => ProviderId::Custom(custom.unwrap_or_default().to_string()),
     }
 }
 
-fn provider_kind(id: ProviderId) -> ProviderKind {
+fn provider_kind(id: &ProviderId) -> ProviderKind {
     match id {
         ProviderId::OpenRouter => ProviderKind::OpenRouter,
         ProviderId::Ollama => ProviderKind::Ollama,
@@ -437,6 +440,16 @@ fn provider_kind(id: ProviderId) -> ProviderKind {
         ProviderId::Kimi => ProviderKind::Kimi,
         ProviderId::DeepSeek => ProviderKind::DeepSeek,
         ProviderId::Qwen => ProviderKind::Qwen,
+        ProviderId::LlamaCpp => ProviderKind::LlamaCpp,
+        ProviderId::Custom(_) => ProviderKind::Custom,
+    }
+}
+
+/// What a provider is called in "Saved to …" lines: its preset's label, a custom one's name (#275).
+fn provider_label(id: &ProviderId) -> String {
+    match id {
+        ProviderId::Custom(name) => name.clone(),
+        id => preset(provider_kind(id)).label.into(),
     }
 }
 
@@ -460,7 +473,8 @@ fn model_info(m: marv_provider::ModelInfo) -> view::ModelInfo {
 /// The providers setup offers: OpenRouter, the plans, and Ollama. The Z.ai Coding Plan and Sign in with ChatGPT (#159)
 /// when their switch is on (`marv_provider::offered`: ChatGPT's on, Z.ai's off) or the config already uses them; Kimi Code,
 /// DeepSeek and Qwen's Coding Plan always.
-fn offered_kinds(current: Option<ProviderKind>) -> Vec<ProviderKind> {
+/// #278: llama.cpp after Ollama, when a llama-server is found (or the config already uses it).
+fn offered_kinds(current: Option<ProviderKind>, llama_cpp: bool) -> Vec<ProviderKind> {
     let plans = [
         (ProviderKind::Zai, marv_provider::offered::ZAI_CODING_PLAN),
         (ProviderKind::ChatGpt, marv_provider::offered::CHATGPT_SIGN_IN),
@@ -471,6 +485,9 @@ fn offered_kinds(current: Option<ProviderKind>) -> Vec<ProviderKind> {
     let mut kinds = vec![ProviderKind::OpenRouter];
     kinds.extend(plans.into_iter().filter(|&(kind, on)| on || current == Some(kind)).map(|(kind, _)| kind));
     kinds.push(ProviderKind::Ollama);
+    if llama_cpp || current == Some(ProviderKind::LlamaCpp) {
+        kinds.push(ProviderKind::LlamaCpp);
+    }
     kinds
 }
 
@@ -482,13 +499,14 @@ fn auth_store(config: &Config, config_dir: &Path) -> marv_provider::chatgpt::Aut
 
 /// What the setup screen starts from. Keys go to the UI masked.
 pub fn setup_context(start: SetupStart, file: Option<&FileConfig>, config: &Config, env: &Env) -> SetupContext {
-    let kinds = offered_kinds(file.and_then(|f| f.provider));
-    let presets = kinds
+    let llama_cpp = marv_session::local_model::find_server(file.and_then(|f| f.llama_cpp.as_ref()), env).is_ok();
+    let kinds = offered_kinds(file.and_then(|f| f.provider), llama_cpp);
+    let mut presets: Vec<view::ProviderPreset> = kinds
         .iter()
         .map(|&kind| {
             let p = preset(kind);
             view::ProviderPreset {
-                id: provider_id(kind),
+                id: provider_id(kind, None),
                 label: p.label.into(),
                 key_env: p.key_env.map(Into::into),
                 key_url: p.key_url.map(Into::into),
@@ -497,18 +515,28 @@ pub fn setup_context(start: SetupStart, file: Option<&FileConfig>, config: &Conf
             }
         })
         .collect();
+    // #275: the user's own endpoints, after the built-in ones. Their keys are in the config, so setup asks none.
+    presets.extend(file.and_then(|f| f.providers.as_ref()).into_iter().flatten().map(|(name, entry)| view::ProviderPreset {
+        id: ProviderId::Custom(name.clone()),
+        label: printable(name),
+        key_env: None,
+        key_url: None,
+        default_model: entry.models.first().cloned().unwrap_or_default(),
+        sign_in: false,
+    }));
     let env_keys = kinds
         .iter()
         .filter_map(|&kind| {
             let value = env.get(preset(kind).key_env?)?.trim();
-            (!value.is_empty()).then(|| (provider_id(kind), mask_key(value)))
+            (!value.is_empty()).then(|| (provider_id(kind, None), mask_key(value)))
         })
         .collect();
     SetupContext {
         start,
         presets,
-        current: file.and_then(|f| f.provider).map(|kind| (provider_id(kind), config.model.clone())),
-        saved_keys: kinds.iter().filter_map(|&kind| Some((provider_id(kind), mask_key(file?.key_for(kind)?)))).collect(),
+        current: file
+            .and_then(|f| f.provider.map(|kind| (provider_id(kind, f.custom_provider.as_deref()), config.model.clone()))),
+        saved_keys: kinds.iter().filter_map(|&kind| Some((provider_id(kind, None), mask_key(file?.key_for(kind)?)))).collect(),
         accounts: config
             .auth_file
             .clone()
@@ -530,12 +558,17 @@ pub fn setup_context(start: SetupStart, file: Option<&FileConfig>, config: &Conf
 /// Setup's answer as the file to save. A custom endpoint only applies to the provider it was saved with; `api_key:
 /// None` keeps the saved key.
 pub fn setup_file(file: Option<&FileConfig>, answer: &SetupAnswer) -> FileConfig {
-    let kind = provider_kind(answer.provider);
+    let kind = provider_kind(&answer.provider);
     let mut next = file.cloned().unwrap_or_default();
     if next.provider != Some(kind) {
         next.base_url = None;
     }
     next.provider = Some(kind);
+    // #275: which endpoint, for a custom provider; none for a built-in one.
+    next.custom_provider = match &answer.provider {
+        ProviderId::Custom(name) => Some(name.clone()),
+        _ => None,
+    };
     next.model = Some(answer.model.clone());
     if let Some(key) = &answer.api_key {
         // #159: into the chosen provider's own field, never another's.
@@ -1955,8 +1988,10 @@ impl Bridge {
                 }) {
                     return self.emit(system(e.to_string(), true));
                 }
-                let label = preset(config.provider).label;
-                let saved = resolve_config(self.file().as_ref(), &self.env).model;
+                let file = self.file();
+                let label =
+                    provider_label(&provider_id(config.provider, file.as_ref().and_then(|f| f.custom_provider.as_deref())));
+                let saved = resolve_config(file.as_ref(), &self.env).model;
                 self.emit(UiEvent::StatusInfo(self.status_info()));
                 self.emit(system(
                     format!("{label} · {id}, for this session. Your default stays {saved} (/model without a name picks and saves one)."),
@@ -2921,7 +2956,32 @@ impl SessionPort for Port {
 
     fn load_models(&self, provider: ProviderId) {
         let b = &self.0;
-        let kind = provider_kind(provider);
+        let kind = provider_kind(&provider);
+        // #278: the GGUF files in the usual places; any other path can be typed.
+        if provider == ProviderId::LlamaCpp {
+            let files = marv_session::local_model::gguf_files(&b.env);
+            let models = files
+                .into_iter()
+                .map(|id| marv_provider::ModelInfo { id, local: true, tools: Some(true), ..Default::default() })
+                .map(model_info)
+                .collect();
+            let _ = b.activity.tx.send(UiEvent::Models(Ok(models)));
+            return;
+        }
+        // #275: a custom provider's list, from its endpoint with its key and headers (or the config's list).
+        if let ProviderId::Custom(name) = &provider {
+            let entry = b.file().and_then(|f| f.providers?.get(name).cloned());
+            let endpoint = entry.map(|entry| marv_session::providers::endpoint(name, &entry, &b.env));
+            let tx = b.activity.tx.clone();
+            tokio::spawn(async move {
+                let result = match endpoint {
+                    Some(endpoint) => marv_provider::endpoint::list_models(&reqwest::Client::new(), &endpoint).await,
+                    None => Err("It isn't in ~/.marv/config.json's \"providers\" any more.".into()),
+                };
+                let _ = tx.send(UiEvent::Models(result.map(|list| list.into_iter().map(model_info).collect())));
+            });
+            return;
+        }
         // A custom endpoint (baseUrl) only applies to the provider it was saved with.
         let file = b.file();
         let base_url = file.as_ref().filter(|f| f.provider == Some(kind)).and_then(|f| f.base_url.clone());
@@ -2951,7 +3011,7 @@ impl SessionPort for Port {
         let next = setup_file(b.file().as_ref(), &answer);
         // The picker saves the default: a session's own model (`-m`, `/model <id>`) gives way to it.
         *b.model.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        let label = preset(provider_kind(answer.provider)).label;
+        let label = provider_label(&answer.provider);
         b.save_config(next, format!("Saved to {} · {label} · {}", shorten_home(&b.store.path, &b.home), answer.model));
     }
 
@@ -3074,10 +3134,17 @@ pub async fn run(
     resume: Option<bool>,
     approve: Vec<String>,
     model: Option<String>,
+    local_model: Option<String>,
     quit: crate::signals::Quit,
 ) -> anyhow::Result<i32> {
     // The real environment only (docs/SECURITY.md): never a project's .env.
-    let env: Env = std::env::vars().collect();
+    let mut env: Env = std::env::vars().collect();
+    // #278: `--local-model`: llama.cpp with that file for this run (the config file isn't changed).
+    // It picks the model too, so `-m` gives way to it.
+    let model = if local_model.is_some() { None } else { model };
+    if let Some(model) = local_model {
+        env.insert("MARV_LOCAL_MODEL".into(), model);
+    }
     let home = home_dir();
     // The project is wherever Marv was started; the tools can't reach outside it.
     let cwd = std::env::current_dir()?;
@@ -4736,6 +4803,31 @@ mod tests {
         assert!(!format!("{ctx:?}").contains("fromtheenvironment"), "keys reach the UI masked");
     }
 
+    /// #275: the user's endpoints are offered after the built-in providers, without a key step; choosing one saves its
+    /// name and keeps every endpoint, and choosing a built-in one again clears the name.
+    #[test]
+    fn setup_offers_custom_providers_and_saves_the_choice_by_name() {
+        let file = FileConfig::from_value(&serde_json::json!({
+            "provider": "openrouter", "model": "z-ai/glm-5.3",
+            "providers": {"acme-gateway": {"baseUrl": "https://llm.acme.internal/v1", "models": ["acme-large"]}}
+        }))
+        .unwrap();
+        let env = Env::new();
+        let ctx = setup_context(SetupStart::Reconfigure, Some(&file), &resolve_config(Some(&file), &env), &env);
+        let acme = ctx.presets.last().unwrap();
+        assert_eq!(acme.id, ProviderId::Custom("acme-gateway".into()));
+        assert_eq!((acme.key_env.as_ref(), acme.default_model.as_str(), acme.sign_in), (None, "acme-large", false));
+        let answer = SetupAnswer { provider: acme.id.clone(), model: "acme-large".into(), api_key: None };
+        let chosen = setup_file(Some(&file), &answer);
+        assert_eq!((chosen.provider, chosen.custom_provider.as_deref()), (Some(ProviderKind::Custom), Some("acme-gateway")));
+        assert_eq!(chosen.to_value()["provider"], "acme-gateway");
+        assert_eq!(chosen.providers, file.providers);
+        let ctx = setup_context(SetupStart::Model, Some(&chosen), &resolve_config(Some(&chosen), &env), &env);
+        assert_eq!(ctx.current, Some((ProviderId::Custom("acme-gateway".into()), "acme-large".into())));
+        let back = setup_file(Some(&chosen), &SetupAnswer { provider: ProviderId::OpenRouter, model: "m".into(), api_key: None });
+        assert_eq!((back.provider, back.custom_provider), (Some(ProviderKind::OpenRouter), None));
+    }
+
     /// #159: Z.ai and ChatGPT are offered when their switch is on (ChatGPT's on and Z.ai's off by default), or when the
     /// config already uses one; Kimi, Qwen and DeepSeek always. A plan's key goes to its own field.
     #[test]
@@ -4743,7 +4835,7 @@ mod tests {
         let ids = |file: Option<&FileConfig>| {
             let env = Env::new();
             let ctx = setup_context(SetupStart::Reconfigure, file, &resolve_config(file, &env), &env);
-            ctx.presets.iter().map(|p| p.id).collect::<Vec<_>>()
+            ctx.presets.iter().map(|p| p.id.clone()).collect::<Vec<_>>()
         };
         let mut expected = vec![ProviderId::OpenRouter];
         if marv_provider::offered::ZAI_CODING_PLAN {

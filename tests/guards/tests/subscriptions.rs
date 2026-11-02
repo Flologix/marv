@@ -26,6 +26,33 @@ fn a_providers_key_never_goes_to_another_provider() {
     assert_eq!(config.api_key, None, "the plan's key must never reach OpenRouter");
 }
 
+/// #275: a custom provider gets only the key in its own entry, never a built-in provider's (saved or in the
+/// environment), and a built-in provider never gets an endpoint's.
+#[test]
+fn a_custom_providers_key_is_its_own() {
+    let raw = serde_json::json!({
+        "provider": "acme-gateway",
+        "apiKey": "sk-or-saved",
+        "providers": {
+            "acme-gateway": {"baseUrl": "https://llm.acme.internal/v1"},
+            "keyed": {"baseUrl": "https://other.example/v1", "key": "env:ACME_LLM_KEY"}
+        }
+    });
+    let env = Env::from([
+        ("OPENROUTER_API_KEY".to_string(), "sk-or-env".to_string()),
+        ("ACME_LLM_KEY".to_string(), "sk-acme".to_string()),
+    ]);
+    let file = FileConfig::from_value(&raw).unwrap();
+    let config = resolve_config(Some(&file), &env);
+    let endpoint = config.endpoint.clone().unwrap();
+    assert_eq!((endpoint.api_key.clone(), config.api_key.clone()), (None, None), "no key in its entry: none sent");
+    let keyed = FileConfig { custom_provider: Some("keyed".into()), ..file.clone() };
+    assert_eq!(resolve_config(Some(&keyed), &env).endpoint.unwrap().api_key.as_deref(), Some("sk-acme"));
+    let openrouter = FileConfig { provider: Some(ProviderKind::OpenRouter), custom_provider: None, api_key: None, ..file };
+    let config = resolve_config(Some(&openrouter), &Env::from([("ACME_LLM_KEY".to_string(), "sk-acme".to_string())]));
+    assert_eq!((config.api_key, config.endpoint), (None, None), "the endpoint's key must never reach OpenRouter");
+}
+
 mod sign_in_listener {
     use std::time::Duration;
 
@@ -149,6 +176,7 @@ mod plan_limit {
             thinking: false,
             reasoning_effort: None,
             auth_file: None,
+            endpoint: None,
         };
         let events: Vec<_> = create_provider(&config, None, None)
             .stream(&[ChatTurn::User { text: "hi".into() }], StreamOptions::default())
@@ -174,6 +202,7 @@ fn the_chatgpt_token_is_never_sent_to_another_host() {
         thinking: false,
         reasoning_effort: None,
         auth_file: Some("/home/u/.marv/chatgpt.json".into()),
+        endpoint: None,
     };
     let options = marv_provider::chatgpt_options(&config, Default::default()).unwrap();
     assert_eq!(options.base_url, "https://api.openai.com/v1");

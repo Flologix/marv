@@ -109,6 +109,39 @@ Marv can also run on a subscription, or another vendor's own key, instead of Ope
 - **Qwen Coding Plan.** Qwen3.7-Plus, Qwen3.6-Plus and Qwen3.5-Plus on Alibaba Cloud Model Studio's Coding Plan (`https://coding-intl.dashscope.aliyuncs.com/v1`), with the plan's own key (`sk-sp-…`, saved as `qwenApiKey`, or `QWEN_API_KEY`). Mainland China's plan: `"baseUrl": "https://coding.dashscope.aliyuncs.com/v1"`. **Interactive use only:** Alibaba Cloud's [terms](https://www.alibabacloud.com/help/en/model-studio/coding-plan-faq) don't allow the plan's key in automated or non-interactive runs, and can suspend the plan. So `marv -p` refuses it. Don't let mesh messages wake a session on it either (`mesh.wake`): a woken turn runs with nobody typing.
 - **DeepSeek.** `deepseek-flash` and `deepseek-v4-pro` on DeepSeek's own API (`https://api.deepseek.com`), pay as you go, with a key from [platform.deepseek.com/api_keys](https://platform.deepseek.com/api_keys) (saved as `deepseekApiKey`, or `DEEPSEEK_API_KEY`). Marv doesn't show DeepSeek's prices: they change with the time of day.
 
+### Your own endpoint
+
+A company gateway, [LiteLLM](https://docs.litellm.ai/docs/simple_proxy), vLLM, llama.cpp's `llama-server` or any other OpenAI-compatible server can be a provider of its own. Name it under `providers` in `~/.marv/config.json`, then pick it in `/setup` (it's listed after the built-in providers) or set `"provider"` to its name:
+
+```json
+{
+  "provider": "litellm",
+  "model": "claude-sonnet",
+  "providers": {
+    "litellm": {
+      "baseUrl": "http://localhost:4000/v1",
+      "key": "env:LITELLM_API_KEY"
+    },
+    "acme-gateway": {
+      "baseUrl": "https://llm.acme.internal/v1",
+      "wire": "openai-responses",
+      "key": "command:pass show acme/llm-key",
+      "headers": { "X-Team": "platform" },
+      "extraBody": { "service_tier": "priority" },
+      "models": ["acme-large", "acme-small"]
+    }
+  }
+}
+```
+
+- `baseUrl`: the API's address, up to and including `/v1`.
+- `wire`: the API it speaks. `openai-chat` (Chat Completions, the default) or `openai-responses` (OpenAI's Responses API).
+- `key`: `env:NAME` reads it from that environment variable; `command:...` runs a command on your machine once per Marv process and uses the first line it prints (a password manager, `gcloud auth print-access-token`); anything else is the key itself. Leave it out for a server that takes none. It's sent as `Authorization: Bearer …`, only to `baseUrl`. Sandboxed commands never see it, and commands that run outside the sandbox don't get variables whose names look like keys (`…_KEY`, `…_TOKEN`), so give your variable such a name.
+- `headers`, `extraBody`: added to every request.
+- `models`: what `/model` lists. Without it, Marv reads the endpoint's `GET /models`, and you can always type a model id into `/model`.
+
+As with `hooks`, providers are read only from your own `~/.marv/config.json`. A project's `.marv/config.json` can't add one or point one elsewhere. A LiteLLM proxy for a quick start: `litellm --model anthropic/claude-sonnet-5.5 --alias claude-sonnet`, then the `litellm` entry above.
+
 A build can offer Z.ai with `MARV_OFFER_ZAI_CODING_PLAN=1`, or leave ChatGPT out with `MARV_OFFER_CHATGPT_SIGN_IN=0`, set when it's compiled (`marv_provider::offered`). When a plan's usage limit is reached, Marv stops with a message saying so: it never switches to another key or provider by itself.
 
 ## Using Marv
@@ -439,7 +472,7 @@ The radio is a live channel between your Marvs on this machine. It's **off unles
 | `$XDG_RUNTIME_DIR/marv/` | The runtime folder: the mesh's sockets and background processes' relays, while Marv runs (private, 0700; `MARV_RUNTIME_DIR` moves it) |
 | `AGENTS.md` | Project instructions, read into the system prompt at startup |
 
-`~/.marv/config.json` also takes `approveSandboxed` (`auto`, the default unless `yolo` is `false`: a sandboxed command without network runs without asking even with yolo off, and in a turn a mesh message woke with the project read-only; `ask`: it asks), `sandbox`, `yolo`, `thinking`, `trajectories`, `diagnostics`, `checks`, `checkpoints`, `suggestions`, `updateCheck` (each `true` or `false`; `diagnostics` also per language, like `{"typescript": false}`), `maxSteps`, `mcpTools` (`auto`, `deferred` or `eager`), `contextLength` (Ollama), `reasoningEffort` (`minimal`, `low`, `medium`, `high`, `xhigh` or `max`: how hard an OpenRouter model that reasons does so, default `max`, fitted to each model as the highest level it takes at or below it (OpenRouter's list says which), `high` where the list doesn't say; `default` lets the model pick its own), `compactTokens` (compact once the conversation passes this many tokens, default `100000`, at least `40000`; `0` or `false` compacts only at 85% of the window), `baseUrl` (e.g. Ollama on another machine) and `mesh` (`{"wake": true}` for mesh wake, `{"radio": true}` or `{"radio": {"titles": false}}` for [the radio](#the-radio-who-else-is-up); only from your own file, never a project's). The slash commands write most of them for you.
+`~/.marv/config.json` also takes `approveSandboxed` (`auto`, the default unless `yolo` is `false`: a sandboxed command without network runs without asking even with yolo off, and in a turn a mesh message woke with the project read-only; `ask`: it asks), `sandbox`, `yolo`, `thinking`, `trajectories`, `diagnostics`, `checks`, `checkpoints`, `suggestions`, `updateCheck` (each `true` or `false`; `diagnostics` also per language, like `{"typescript": false}`), `maxSteps`, `mcpTools` (`auto`, `deferred` or `eager`), `contextLength` (Ollama and llama.cpp), `llamaCpp` (`{"server": …, "args": […]}`), `reasoningEffort` (`minimal`, `low`, `medium`, `high`, `xhigh` or `max`: how hard an OpenRouter model that reasons does so, default `max`, fitted to each model as the highest level it takes at or below it (OpenRouter's list says which), `high` where the list doesn't say; `default` lets the model pick its own), `compactTokens` (compact once the conversation passes this many tokens, default `100000`, at least `40000`; `0` or `false` compacts only at 85% of the window), `baseUrl` (e.g. Ollama on another machine) and `mesh` (`{"wake": true}` for mesh wake, `{"radio": true}` or `{"radio": {"titles": false}}` for [the radio](#the-radio-who-else-is-up); only from your own file, never a project's). The slash commands write most of them for you.
 
 **Session-start hooks.** `"hooks": {"sessionStart": ["bd ready", {"command": "git status -s", "timeout": 5}]}` runs those commands, in order, whenever a conversation starts: when Marv starts (the TUI and `marv -p`), after `/clear` and on a resume (never in subagents). They run like your own shell command: bash, in the project folder, outside the sandbox, with your environment minus Marv's keys and secret-looking variables. Each has a timeout in seconds (default 15) and its output is cut to 8 KB. Their output goes to the model once, at the start of your first message, labelled with each command and quoted as data; the TUI shows one line per hook. Like a web page or an MCP result, hook output **taints the conversation**: from then on anything that can send data out asks first, even in yolo, because what a command prints (issue titles in `bd ready`, say) can come from anyone. Add `"trusted": true` to a hook (`{"command": "date", "trusted": true}`) when you vouch for its output; a hook that prints nothing taints nothing. A hook that fails or times out is a one-line note and never stops Marv from starting. Hooks are read **only from your own `~/.marv/config.json`**: a project's `.marv/config.json` naming `hooks` is refused with a startup note and never run, so cloning a repository can't make Marv run its commands.
 
@@ -453,6 +486,7 @@ The radio is a live channel between your Marvs on this machine. It's **off unles
 | `MARV_MODEL` | Overrides the saved model |
 | `MARV_MAX_STEPS` | Overrides the saved step limit (`0` or `off` never asks; `/steps`) |
 | `OLLAMA_HOST` | Where Ollama runs (default `localhost:11434`) |
+| `MARV_LOCAL_MODEL` | A GGUF file to run with llama.cpp for this run (as `--local-model`) |
 | `MARV_CONFIG_DIR` | Use a different folder instead of `~/.marv` (read from the environment only, never from a project file) |
 | `MARV_NO_UPDATE_CHECK` | `1`: don't check for a newer Marv at startup ([Updating](#updating)) |
 | `MARV_GITHUB` | `off` hides the `github` tool |
@@ -461,6 +495,8 @@ The radio is a live channel between your Marvs on this machine. It's **off unles
 | `MARV_YOLO` | `off` keeps yolo off for this Marv, whatever the config says (it can't turn yolo on) |
 | `MARV_TAINTED` | `1` starts the conversation as untrusted, so anything that can send data out asks first |
 | `GITHUB_TOKEN`, `GH_TOKEN` | Used by `web_fetch` for GitHub links (sent to GitHub's API only) |
+
+**llama.cpp (experimental).** Marv can run a GGUF model with [llama.cpp](https://github.com/ggml-org/llama.cpp) instead of Ollama: `marv --local-model ~/models/qwen3.5-9b-q4_k_m.gguf` (the TUI or `-p`, for that run only), or pick **llama.cpp (local)** in `/setup` and give the file's path in `/model` (it lists the `.gguf` files in `~/.cache/llama.cpp` and `~/models`). That saves `"provider": "llamacpp"` with the path as the model. Marv starts the `llama-server` on your `PATH` (or `"llamaCpp": {"server": "/path/to/llama-server"}`) with the model, `contextLength` as its window (default 32k), `--jinja` for the model's tool-call format and your `"args"` after them (`"llamaCpp": {"args": ["-ngl", "99"]}` for the GPU), and stops it when Marv exits. Requests wait while the model loads; if the server exits instead, Marv shows its last lines, and its whole log is in `~/.cache/marv/llama-server-<port>.log`. It listens on 127.0.0.1 only, with a random API key, so other programs on the machine (sandboxed commands included) can't use it. Setup lists llama.cpp once it finds a `llama-server`. Ollama keeps working as before.
 
 Ollama's context window defaults to 32k tokens (`contextLength` in the config file). That is large enough for an agent to read code, and fits in 12 GB of VRAM for 9-12B models. Marv never sets it past what the model was trained for (`/api/show`'s context length), so a model trained on 8k isn't run at 32k; the config value is only ever the upper bound.
 

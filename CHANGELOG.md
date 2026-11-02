@@ -6,6 +6,11 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+### Added
+
+- **Local models with llama.cpp (#278), experimental.** `marv --local-model <gguf>` runs a GGUF model for that run, or pick **llama.cpp (local)** in `/setup` (`"provider": "llamacpp"`, the model being the file's path). Marv starts the `llama-server` on your `PATH` (or `"llamaCpp": {"server"}`) on 127.0.0.1 with a random API key, `contextLength` as its window and `--jinja`, waits while the model loads, and stops it when it exits. `"llamaCpp": {"args": […]}` adds arguments (`-ngl 99`). Ollama is unchanged. Experimental: tested against a stand-in server, not yet with a real `llama-server` and model; please report what you hit.
+- **Your own endpoint as a provider (#275).** Name a company gateway, LiteLLM, vLLM or any OpenAI-compatible server under `"providers"` in `~/.marv/config.json`, with its `baseUrl`, `wire` (`openai-chat` or `openai-responses`), `key` (`env:NAME`, `command:...` or the key itself), extra `headers` and `extraBody`, and optional `models`. It's listed in `/setup` after the built-in providers, `/model` lists its models (its `GET /models` when the config lists none), and `marv -p` uses it like any other. Read only from your own config, never a project's; its key goes only to its own URL. See the README's "Your own endpoint".
+
 ### Changed
 
 - **Started in your home folder, Marv no longer asks before every command.** Sandboxed commands without network ran unasked everywhere but there (`approveSandboxed`), so a question about your desktop took 10 to 13 approvals of `ls` and `cat`. The sandbox shows the home read-only there, so such a command can only write to `/tmp`; they now run unasked in the home folder too. File changes there still ask each time, and yolo stays off there.
@@ -16,6 +21,7 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 - **Reading GitHub no longer asks once the conversation holds GitHub's text.** After the first `gh` result every later read (`gh pr list`, `gh pr checks`, `gh api` GETs) asked, titled "Change something on GitHub", and "don't ask again" didn't hold: about 40 prompts to list a repository's pull requests and their CI. A read only reaches GitHub's API, so it runs unasked again; writes (`gh pr merge`, comments) still ask every time.
 - **`marv -m <model>` works in the TUI.** It only reached `marv -p`; the TUI started with the saved model. It's for that run, never saved.
+- **A tool call with its optional fields sent empty works on every built-in tool.** On the ChatGPT plan (Responses API) models fill every field of a tool's schema, mostly with `""`, and some tools refused that: `read_file` with `"limit": ""`, `process` with `"name": ""`, `recall` with a page and `"query": ""`. An optional field sent as `""` is now read as not given. A test sends every action of every built-in tool padded this way (#265).
 
 ## [0.15.0] - 2026-11-01
 

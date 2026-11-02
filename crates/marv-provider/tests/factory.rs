@@ -25,6 +25,7 @@ fn openrouter(base_url: &str, thinking: bool) -> ProviderConfig {
         thinking,
         reasoning_effort: None,
         auth_file: None,
+        endpoint: None,
     }
 }
 
@@ -117,6 +118,7 @@ fn ollama_has_its_context_window() {
         thinking: false,
         reasoning_effort: None,
         auth_file: None,
+        endpoint: None,
     };
     let provider = create_provider(&config, None, None);
     assert_eq!(provider.name(), "ollama · qwen3.5:9b");
@@ -179,6 +181,7 @@ async fn error_of(status: u16, config: ProviderConfig, hints: Option<ErrorHints>
         }
         ProviderKind::Ollama => server.url(),
         ProviderKind::ChatGpt => unreachable!("signs in"),
+        ProviderKind::Custom | ProviderKind::LlamaCpp => unreachable!("its base URL is the endpoint's"),
     };
     let provider = create_provider(&ProviderConfig { base_url, ..config }, None, hints);
     let events: Vec<_> = provider.stream(&hi(), StreamOptions::default()).collect().await;
@@ -231,6 +234,7 @@ async fn the_zai_plan_sends_its_key_and_no_reasoning_switch() {
         thinking: true,
         reasoning_effort: Some(marv_provider::ReasoningEffort::Medium),
         auth_file: None,
+        endpoint: None,
     };
     let provider = create_provider(&config, None, None);
     assert_eq!(provider.name(), "zai · glm-5.3");
@@ -274,6 +278,7 @@ async fn kimi_deepseek_and_qwen_send_their_key_and_name_marv() {
             thinking: true,
             reasoning_effort: Some(marv_provider::ReasoningEffort::Medium),
             auth_file: None,
+            endpoint: None,
         };
         let provider = create_provider(&config, None, None);
         assert_eq!(provider.name(), format!("{} · {model}", kind.id()));
@@ -292,4 +297,160 @@ async fn kimi_deepseek_and_qwen_send_their_key_and_name_marv() {
         };
         assert_eq!(factory.lookup().unwrap().await.map(|m| m.context), Some(Some(context)), "{kind:?}");
     }
+}
+
+// #275: a custom provider from the config. Requests go to its URL with its key, headers and extra body.
+
+fn endpoint(base_url: String, wire: marv_provider::endpoint::Wire) -> ProviderConfig {
+    let mut extra_body = serde_json::Map::new();
+    extra_body.insert("service_tier".into(), json!("priority"));
+    ProviderConfig {
+        provider: ProviderKind::Custom,
+        model: "acme-large".into(),
+        // A built-in provider's leftovers are never used: the endpoint carries its own.
+        base_url: "https://openrouter.ai/api/v1".into(),
+        api_key: Some("sk-or-not-this".into()),
+        endpoint: Some(Arc::new(marv_provider::endpoint::Endpoint {
+            name: "acme-gateway".into(),
+            wire,
+            base_url,
+            api_key: Some("acme-key".into()),
+            problem: None,
+            headers: vec![("X-Team".into(), "platform".into())],
+            extra_body,
+            models: Vec::new(),
+            context_length: None,
+            ready: None,
+        })),
+        ..openrouter("", false)
+    }
+}
+
+#[tokio::test]
+async fn a_custom_chat_endpoint_gets_its_key_headers_and_extra_body() {
+    let server = FakeServer::start(|_| {
+        Reply::sse(&[json!({"choices": [{"delta": {"content": "hi"}, "finish_reason": "stop"}]}), json!("[DONE]")])
+    })
+    .await;
+    let config = endpoint(format!("{}/v1", server.url()), marv_provider::endpoint::Wire::OpenAiChat);
+    let provider = create_provider(&config, None, None);
+    assert_eq!(provider.name(), "acme-gateway · acme-large");
+    let events: Vec<_> = provider.stream(&hi(), StreamOptions::default()).collect().await;
+    assert!(!events.iter().any(|e| matches!(e, ProviderEvent::Error(_))), "{events:?}");
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+    assert_eq!(request.path, "/v1/chat/completions");
+    assert_eq!(request.header("authorization"), Some("Bearer acme-key"));
+    assert_eq!(request.header("x-team"), Some("platform"));
+    let body = request.json();
+    assert_eq!((body["model"].clone(), body["service_tier"].clone()), (json!("acme-large"), json!("priority")));
+}
+
+#[tokio::test]
+async fn a_custom_responses_endpoint_gets_its_key_headers_and_extra_body() {
+    let server = FakeServer::start(|_| {
+        Reply::sse(&[json!({"type": "response.completed", "response": {"usage": {"input_tokens": 1, "output_tokens": 1}}})])
+    })
+    .await;
+    let config = endpoint(format!("{}/v1", server.url()), marv_provider::endpoint::Wire::OpenAiResponses);
+    let provider = create_provider(&config, None, None);
+    provider.stream(&hi(), StreamOptions::default()).collect::<Vec<_>>().await;
+    let request = server.last();
+    assert_eq!(request.path, "/v1/responses");
+    assert_eq!(request.header("authorization"), Some("Bearer acme-key"));
+    assert_eq!(request.header("x-team"), Some("platform"));
+    let body = request.json();
+    assert_eq!((body["model"].clone(), body["service_tier"].clone()), (json!("acme-large"), json!("priority")));
+}
+
+#[tokio::test]
+async fn a_custom_endpoints_models_come_from_the_config_or_its_list() {
+    let server = FakeServer::start(|_| Reply::json(200, json!({"data": [{"id": "acme-large", "context_length": 128000}]}))).await;
+    let config = endpoint(format!("{}/v1", server.url()), marv_provider::endpoint::Wire::OpenAiChat);
+    let mut endpoint = (*config.endpoint.unwrap()).clone();
+    let client = reqwest::Client::new();
+    let listed = marv_provider::endpoint::list_models(&client, &endpoint).await.unwrap();
+    assert_eq!((listed[0].id.as_str(), listed[0].context), ("acme-large", Some(128000)));
+    let request = server.last();
+    assert_eq!((request.path.as_str(), request.header("authorization")), ("/v1/models", Some("Bearer acme-key")));
+    assert_eq!(request.header("x-team"), Some("platform"));
+    // A list in the config: no request.
+    endpoint.models = vec!["a".into(), "b".into()];
+    let ids: Vec<_> = marv_provider::endpoint::list_models(&client, &endpoint).await.unwrap().into_iter().map(|m| m.id).collect();
+    assert_eq!(ids, ["a", "b"]);
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn a_custom_key_that_cant_be_read_sends_nothing() {
+    let server = FakeServer::start(|_| Reply::json(200, json!({}))).await;
+    let mut config = endpoint(format!("{}/v1", server.url()), marv_provider::endpoint::Wire::OpenAiChat);
+    let mut e = (*config.endpoint.take().unwrap()).clone();
+    (e.api_key, e.problem) = (None, Some("acme-gateway: its key is read from $ACME_LLM_KEY, which isn't set.".into()));
+    config.endpoint = Some(Arc::new(e));
+    let events: Vec<_> = create_provider(&config, None, None).stream(&hi(), StreamOptions::default()).collect().await;
+    assert!(matches!(&events[..], [ProviderEvent::Error(m)] if m.contains("$ACME_LLM_KEY")), "{events:?}");
+    assert!(server.requests().is_empty());
+}
+
+#[tokio::test]
+async fn a_custom_provider_missing_from_the_config_says_so() {
+    let config = ProviderConfig { endpoint: None, ..endpoint(String::new(), marv_provider::endpoint::Wire::OpenAiChat) };
+    let events: Vec<_> = create_provider(&config, None, None).stream(&hi(), StreamOptions::default()).collect().await;
+    assert!(matches!(&events[..], [ProviderEvent::Error(m)] if m.contains("\"providers\"")), "{events:?}");
+}
+
+// #278: a local server's endpoint: each request waits until the server answers, and a server that never will is the
+// request's error, with nothing sent.
+
+struct Gate(Result<(), String>);
+impl marv_provider::endpoint::Readiness for Gate {
+    fn wait(&self, _cancel: tokio_util::sync::CancellationToken) -> futures::future::BoxFuture<'static, Result<(), String>> {
+        let result = self.0.clone();
+        Box::pin(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            result
+        })
+    }
+}
+
+fn local(base_url: String, ready: Result<(), String>) -> ProviderConfig {
+    let mut config = endpoint(base_url, marv_provider::endpoint::Wire::OpenAiChat);
+    let mut e = (*config.endpoint.take().unwrap()).clone();
+    e.ready = Some(marv_provider::endpoint::Ready(Arc::new(Gate(ready))));
+    e.context_length = Some(32768);
+    config.provider = ProviderKind::LlamaCpp;
+    config.endpoint = Some(Arc::new(e));
+    config
+}
+
+#[tokio::test]
+async fn a_local_servers_request_waits_until_it_is_ready() {
+    let server = FakeServer::start(|_| {
+        Reply::sse(&[json!({"choices": [{"delta": {"content": "hi"}, "finish_reason": "stop"}]}), json!("[DONE]")])
+    })
+    .await;
+    let config = local(format!("{}/v1", server.url()), Ok(()));
+    let factory = ConfigFactory {
+        config: config.clone(),
+        make: Arc::new(|config, info| create_provider(config, info, None)),
+        load: Arc::new(|_, _| Box::pin(async { Err("never asked".to_string()) })),
+    };
+    let info = factory.lookup().unwrap().await.unwrap();
+    assert_eq!(info.context, Some(32768), "the -c Marv started it with");
+    let provider = create_provider(&config, Some(&info), None);
+    let events: Vec<_> = provider.stream(&hi(), StreamOptions::default()).collect().await;
+    assert!(events.iter().any(|e| matches!(e, ProviderEvent::TextDelta(t) if t == "hi")), "{events:?}");
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn a_local_server_that_never_gets_ready_sends_nothing() {
+    let server = FakeServer::start(|_| Reply::json(200, json!({}))).await;
+    let why = "llama-server exited while loading the model: out of memory".to_string();
+    let provider = create_provider(&local(format!("{}/v1", server.url()), Err(why.clone())), None, None);
+    let events: Vec<_> = provider.stream(&hi(), StreamOptions::default()).collect().await;
+    assert_eq!(events, [ProviderEvent::Error(why)]);
+    assert!(server.requests().is_empty());
 }

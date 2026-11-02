@@ -35,6 +35,7 @@ pub const AFTER_HELP: &str = "Config:
   DEEPSEEK_API_KEY      overrides the saved DeepSeek key
   QWEN_API_KEY          overrides the saved Qwen Coding Plan key
   OLLAMA_HOST           where Ollama runs (default localhost:11434)
+  MARV_LOCAL_MODEL      a GGUF file to run with llama.cpp (as --local-model)
   MARV_MODEL            overrides the saved model
   MARV_MAX_STEPS        overrides the saved step limit (0 or off: never ask)
   MARV_CONFIG_DIR       use a different config directory (read from the environment only)
@@ -115,6 +116,11 @@ pub struct Cli {
     /// Use a different model.
     #[arg(short = 'm', long)]
     pub model: Option<String>,
+
+    /// Run a GGUF model on this machine with llama.cpp, for this run: Marv starts llama-server (from your PATH, or
+    /// "llamaCpp": {"server"} in the config) and stops it when it exits. Nothing is saved.
+    #[arg(long = "local-model", value_name = "GGUF")]
+    pub local_model: Option<String>,
 
     /// Continue the latest session in this folder.
     #[arg(short = 'c', long = "continue")]

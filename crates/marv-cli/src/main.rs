@@ -124,6 +124,7 @@ async fn run_mode(cli: Cli, mode: Mode, quit: signals::Quit) -> i32 {
                 output: cli.output,
                 resume_latest: cli.continue_,
                 model: cli.model,
+                local_model: cli.local_model,
                 max_steps: cli.max_steps,
                 approve: cli.approve,
                 must_ask: headless::MustAsk {
@@ -145,7 +146,7 @@ async fn run_mode(cli: Cli, mode: Mode, quit: signals::Quit) -> i32 {
             eprintln!("marv: --dangerously-run-unsandboxed works only with -p (marv -p \"<prompt>\").");
             1
         }
-        Mode::Interactive { resume, approve } => match tui::run(resume, approve, cli.model, quit).await {
+        Mode::Interactive { resume, approve } => match tui::run(resume, approve, cli.model, cli.local_model, quit).await {
             Ok(code) => code,
             Err(e) => {
                 // Not eprintln!, which panics when stderr is a terminal that's gone (#196: it closed).
@@ -165,5 +166,7 @@ struct StopProcesses;
 impl Drop for StopProcesses {
     fn drop(&mut self) {
         marv_session::processes::kill_running();
+        // #278: the llama-servers this Marv started.
+        marv_session::local_model::stop_all();
     }
 }
