@@ -526,4 +526,3 @@ mod tests {
         assert_eq!(without_empty_optionals(&schema, json!("x")), json!("x"));
     }
 }
-
