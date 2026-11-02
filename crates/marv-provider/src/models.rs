@@ -132,7 +132,7 @@ pub fn table_for(provider: ProviderKind) -> Option<Vec<ModelInfo>> {
         ProviderKind::Kimi => Some(table_models(KIMI_MODELS, None)),
         ProviderKind::DeepSeek => Some(table_models(DEEPSEEK_MODELS, None)),
         ProviderKind::Qwen => Some(table_models(QWEN_CODING_MODELS, None)),
-        ProviderKind::OpenRouter | ProviderKind::Ollama | ProviderKind::ChatGpt => None,
+        ProviderKind::OpenRouter | ProviderKind::Ollama | ProviderKind::ChatGpt | ProviderKind::Custom => None,
     }
 }
 
@@ -282,6 +282,8 @@ pub async fn list_models_with(
             });
             Ok(futures::future::join_all(models).await)
         }
+        // #275: its list needs the endpoint's key and headers: `endpoint::list_models`.
+        ProviderKind::Custom => Err("A custom provider's models are listed with its endpoint (endpoint::list_models).".into()),
     }
 }
 

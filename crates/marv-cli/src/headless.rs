@@ -521,6 +521,14 @@ pub async fn run_headless(options: HeadlessOptions, quit: crate::signals::Quit) 
             model: Some(config.model.clone()),
             base_url: Some(config.base_url.clone()),
         },
+        // #275: the endpoint from the user's config, its key read.
+        marv_provider::ProviderKind::Custom => match config.endpoint.clone() {
+            Some(endpoint) => marv_provider::ProviderOption::Endpoint { endpoint, model: config.model.clone() },
+            None => {
+                eprintln!("The custom provider isn't in ~/.marv/config.json's \"providers\": pick another with /setup.");
+                return ExitCode::Error;
+            }
+        },
         marv_provider::ProviderKind::Qwen => marv_provider::ProviderOption::Qwen {
             api_key: config.api_key.clone().unwrap_or_default(),
             model: Some(config.model.clone()),

@@ -109,6 +109,39 @@ Marv can also run on a subscription, or another vendor's own key, instead of Ope
 - **Qwen Coding Plan.** Qwen3.7-Plus, Qwen3.6-Plus and Qwen3.5-Plus on Alibaba Cloud Model Studio's Coding Plan (`https://coding-intl.dashscope.aliyuncs.com/v1`), with the plan's own key (`sk-sp-…`, saved as `qwenApiKey`, or `QWEN_API_KEY`). Mainland China's plan: `"baseUrl": "https://coding.dashscope.aliyuncs.com/v1"`. **Interactive use only:** Alibaba Cloud's [terms](https://www.alibabacloud.com/help/en/model-studio/coding-plan-faq) don't allow the plan's key in automated or non-interactive runs, and can suspend the plan. So `marv -p` refuses it. Don't let mesh messages wake a session on it either (`mesh.wake`): a woken turn runs with nobody typing.
 - **DeepSeek.** `deepseek-flash` and `deepseek-v4-pro` on DeepSeek's own API (`https://api.deepseek.com`), pay as you go, with a key from [platform.deepseek.com/api_keys](https://platform.deepseek.com/api_keys) (saved as `deepseekApiKey`, or `DEEPSEEK_API_KEY`). Marv doesn't show DeepSeek's prices: they change with the time of day.
 
+### Your own endpoint
+
+A company gateway, [LiteLLM](https://docs.litellm.ai/docs/simple_proxy), vLLM, llama.cpp's `llama-server` or any other OpenAI-compatible server can be a provider of its own. Name it under `providers` in `~/.marv/config.json`, then pick it in `/setup` (it's listed after the built-in providers) or set `"provider"` to its name:
+
+```json
+{
+  "provider": "litellm",
+  "model": "claude-sonnet",
+  "providers": {
+    "litellm": {
+      "baseUrl": "http://localhost:4000/v1",
+      "key": "env:LITELLM_API_KEY"
+    },
+    "acme-gateway": {
+      "baseUrl": "https://llm.acme.internal/v1",
+      "wire": "openai-responses",
+      "key": "command:pass show acme/llm-key",
+      "headers": { "X-Team": "platform" },
+      "extraBody": { "service_tier": "priority" },
+      "models": ["acme-large", "acme-small"]
+    }
+  }
+}
+```
+
+- `baseUrl`: the API's address, up to and including `/v1`.
+- `wire`: the API it speaks. `openai-chat` (Chat Completions, the default) or `openai-responses` (OpenAI's Responses API).
+- `key`: `env:NAME` reads it from that environment variable; `command:...` runs a command on your machine once per Marv process and uses the first line it prints (a password manager, `gcloud auth print-access-token`); anything else is the key itself. Leave it out for a server that takes none. It's sent as `Authorization: Bearer …`, only to `baseUrl`. Sandboxed commands never see it, and commands that run outside the sandbox don't get variables whose names look like keys (`…_KEY`, `…_TOKEN`), so give your variable such a name.
+- `headers`, `extraBody`: added to every request.
+- `models`: what `/model` lists. Without it, Marv reads the endpoint's `GET /models`, and you can always type a model id into `/model`.
+
+As with `hooks`, providers are read only from your own `~/.marv/config.json`. A project's `.marv/config.json` can't add one or point one elsewhere. A LiteLLM proxy for a quick start: `litellm --model anthropic/claude-sonnet-5.5 --alias claude-sonnet`, then the `litellm` entry above.
+
 A build can offer Z.ai with `MARV_OFFER_ZAI_CODING_PLAN=1`, or leave ChatGPT out with `MARV_OFFER_CHATGPT_SIGN_IN=0`, set when it's compiled (`marv_provider::offered`). When a plan's usage limit is reached, Marv stops with a message saying so: it never switches to another key or provider by itself.
 
 ## Using Marv

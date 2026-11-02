@@ -113,6 +113,8 @@ pub struct ResponsesOptions {
     pub idle_timeout: Option<Duration>,
     /// #266: sent as `prompt_cache_key`, so the session's requests reach the same prompt cache. Made once per provider.
     pub prompt_cache_key: Option<String>,
+    /// #275: extra request body fields (a custom provider's `extraBody`), after Marv's own.
+    pub body: serde_json::Map<String, Value>,
 }
 
 // ---- Request (wire) types. Field order here is the byte order on the wire: don't reorder. ----
@@ -220,6 +222,9 @@ pub struct ResponsesRequest<'a> {
     pub prompt_cache_key: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u64>,
+    /// #275: [`ResponsesOptions::body`], after Marv's own fields.
+    #[serde(flatten)]
+    pub extra: &'a serde_json::Map<String, Value>,
 }
 
 fn message(role: &'static str, kind: &'static str, text: &str) -> InputItem {
@@ -304,6 +309,7 @@ pub fn request_body<'a>(
         include: if options.encrypted_reasoning { vec!["reasoning.encrypted_content"] } else { Vec::new() },
         prompt_cache_key: options.prompt_cache_key.as_deref(),
         max_output_tokens: options.max_output_tokens,
+        extra: &options.body,
     }
 }
 
@@ -805,6 +811,7 @@ mod tests {
             timing: RetryTiming::default(),
             idle_timeout: None,
             prompt_cache_key: None,
+            body: Default::default(),
         }
     }
 
