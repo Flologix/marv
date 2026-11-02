@@ -333,7 +333,7 @@ pub enum PlanStatus {
 }
 
 /// The providers setup offers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ProviderId {
     OpenRouter,
     Ollama,
@@ -347,6 +347,8 @@ pub enum ProviderId {
     DeepSeek,
     /// Alibaba Cloud's Coding Plan (Qwen models).
     Qwen,
+    /// #275: one of the user's own endpoints (`"providers"` in the config), by name.
+    Custom(String),
 }
 
 /// What setup needs to know about a provider (Marv `PRESETS[provider]`).

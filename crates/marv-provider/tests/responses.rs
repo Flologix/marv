@@ -33,6 +33,7 @@ fn options(base_url: &str, credentials: Arc<dyn Credentials>) -> ResponsesOption
         timing: RetryTiming { scale: 0.001 },
         idle_timeout: None,
         prompt_cache_key: None,
+        body: Default::default(),
     }
 }
 

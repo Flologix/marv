@@ -101,7 +101,7 @@ pub struct Setup {
 }
 
 /// The hint beside each provider (Marv's `PROVIDER_ITEMS`).
-fn provider_hint(id: ProviderId) -> &'static str {
+fn provider_hint(id: &ProviderId) -> &'static str {
     match id {
         ProviderId::OpenRouter => "hundreds of cloud models, one API key",
         ProviderId::Ollama => "models running on this machine, free",
@@ -110,6 +110,7 @@ fn provider_hint(id: ProviderId) -> &'static str {
         ProviderId::Kimi => "Kimi K3 and K2.8 on the Kimi Code membership you pay for",
         ProviderId::DeepSeek => "DeepSeek V4 models with a DeepSeek API key",
         ProviderId::Qwen => "Qwen models on the Alibaba Cloud Coding Plan you pay for",
+        ProviderId::Custom(_) => "your own endpoint, from ~/.marv/config.json",
     }
 }
 
@@ -117,9 +118,10 @@ impl Setup {
     /// Starts at the provider step, or at the model step for `/model`. When it starts at the model
     /// step the caller asks for the list ([`Setup::needs_models`]).
     pub fn new(context: SetupContext) -> Self {
-        let first = context.presets.first().map_or(ProviderId::OpenRouter, |p| p.id);
-        let provider = context.current.as_ref().map_or(first, |(p, _)| *p);
-        let items = context.presets.iter().map(|p| SelectItem::new(p.id, p.label.clone()).hint(provider_hint(p.id))).collect();
+        let first = context.presets.first().map_or(ProviderId::OpenRouter, |p| p.id.clone());
+        let provider = context.current.as_ref().map_or(first, |(p, _)| p.clone());
+        let items =
+            context.presets.iter().map(|p| SelectItem::new(p.id.clone(), p.label.clone()).hint(provider_hint(&p.id))).collect();
         let step = if context.start == SetupStart::Model { SetupStep::Model } else { SetupStep::Provider };
         let mut setup = Self {
             providers: Select::new(items, Some(&provider)),
@@ -139,7 +141,7 @@ impl Setup {
 
     /// The provider whose models the model step shows, if it's waiting for them.
     pub fn needs_models(&self) -> Option<ProviderId> {
-        (self.step == SetupStep::Model && self.picker.models.is_none()).then_some(self.provider)
+        (self.step == SetupStep::Model && self.picker.models.is_none()).then(|| self.provider.clone())
     }
 
     pub fn models_loaded(&mut self, models: Result<Vec<ModelInfo>, String>) {
@@ -202,7 +204,7 @@ impl Setup {
     fn open_models(&mut self) -> SetupOutcome {
         self.step = SetupStep::Model;
         self.picker = ModelPicker::new(self.initial_model());
-        SetupOutcome::LoadModels(self.provider)
+        SetupOutcome::LoadModels(self.provider.clone())
     }
 
     /// #159: how the sign-in the engine started is going. `Some(LoadModels)` once signed in.
@@ -245,7 +247,7 @@ impl Setup {
     }
 
     fn finish(&self, api_key: Option<String>) -> SetupOutcome {
-        SetupOutcome::Complete(SetupAnswer { provider: self.provider, model: self.model.clone(), api_key })
+        SetupOutcome::Complete(SetupAnswer { provider: self.provider.clone(), model: self.model.clone(), api_key })
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Option<SetupOutcome> {
@@ -268,7 +270,7 @@ impl Setup {
                 SignInState::Choose => {
                     let choice = self.sign_in_choices.on_key(key)?;
                     self.error = None;
-                    let provider = self.provider;
+                    let provider = self.provider.clone();
                     match choice {
                         SignInChoice::Keep => return Some(self.open_models()),
                         SignInChoice::Out => return Some(SetupOutcome::SignOut(provider)),
@@ -284,7 +286,7 @@ impl Setup {
                 SignInState::Ready if key.code == KeyCode::Enter => {
                     self.error = None;
                     self.sign_in = SignInState::Waiting { url: None };
-                    Some(SetupOutcome::SignIn(self.provider, SignInTarget::Current))
+                    Some(SetupOutcome::SignIn(self.provider.clone(), SignInTarget::Current))
                 }
                 _ => None,
             },
@@ -502,6 +504,7 @@ mod tests {
             ProviderId::Kimi => vec![m("kimi-for-coding", true, None, false)],
             ProviderId::DeepSeek => vec![m("deepseek-flash", true, None, false)],
             ProviderId::Qwen => vec![m("qwen3.7-plus", true, None, false)],
+            ProviderId::Custom(_) => vec![m("acme-large", true, None, false)],
         }
     }
 
@@ -518,8 +521,8 @@ mod tests {
         let mut last = None;
         for &code in keys {
             last = setup.on_key(key(code));
-            if let Some(SetupOutcome::LoadModels(p)) = last {
-                setup.models_loaded(Ok(models(p)));
+            if let Some(SetupOutcome::LoadModels(p)) = &last {
+                setup.models_loaded(Ok(models(p.clone())));
             }
         }
         last

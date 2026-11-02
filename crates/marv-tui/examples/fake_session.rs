@@ -373,13 +373,14 @@ impl SessionPort for Fake {
                 ProviderId::Kimi => vec![m("kimi-for-coding", None, false, true)],
                 ProviderId::DeepSeek => vec![m("deepseek-flash", None, false, true)],
                 ProviderId::Qwen => vec![m("qwen3.7-plus", None, false, true)],
+                ProviderId::Custom(_) => vec![m("acme-large", None, false, true)],
             };
             let _ = tx.send(UiEvent::Models(Ok(models)));
         });
     }
 
     fn complete_setup(&self, answer: SetupAnswer) {
-        let label = match answer.provider {
+        let label = match &answer.provider {
             ProviderId::OpenRouter => "OpenRouter",
             ProviderId::Ollama => "Ollama",
             ProviderId::Zai => "Z.ai",
@@ -387,6 +388,7 @@ impl SessionPort for Fake {
             ProviderId::Kimi => "Kimi",
             ProviderId::DeepSeek => "DeepSeek",
             ProviderId::Qwen => "Qwen",
+            ProviderId::Custom(name) => name.as_str(),
         };
         self.system(&format!("Saved to ~/.marv/config.json · {label} · {}", answer.model));
         self.emit(UiEvent::StatusInfo(status(&format!("{}/{}", label.to_lowercase(), answer.model))));

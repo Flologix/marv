@@ -42,6 +42,7 @@ pub mod processes;
 pub mod project_trust;
 pub mod prompt;
 pub mod provenance;
+pub mod providers;
 pub mod radio;
 pub mod runner;
 pub mod sdk;

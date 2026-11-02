@@ -87,6 +87,11 @@ pub enum ProviderOption {
         model: String,
         auth_file: std::path::PathBuf,
     },
+    /// #275: an endpoint from the user's config ([`crate::endpoint::Endpoint`], its key read), and the model.
+    Endpoint {
+        endpoint: Arc<crate::endpoint::Endpoint>,
+        model: String,
+    },
     Custom(Arc<dyn Provider>),
 }
 
@@ -103,8 +108,9 @@ pub struct ConfigFactory {
 }
 
 impl ProviderFactory for ConfigFactory {
+    /// A custom provider (#275) is recorded by its name in the config, like "acme-gateway".
     fn id(&self) -> &str {
-        self.config.provider.id()
+        self.config.endpoint.as_deref().map_or(self.config.provider.id(), |e| e.name.as_str())
     }
 
     fn model(&self) -> &str {
