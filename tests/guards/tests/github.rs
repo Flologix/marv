@@ -211,6 +211,40 @@ async fn control_reads_run_unasked_and_an_approved_write_runs() {
     assert_eq!(write, Some(strings(&["pr", "comment", "1", "--body", "hi"])));
 }
 
+/// Once GitHub's text is in the conversation (the session is tainted), reads still run without asking: a read only
+/// sends its arguments to GitHub, which shows nobody else who read what. A write still asks, with `must_ask`, so no
+/// "always" or yolo answers it.
+///
+/// Proven: made `Github::uses_network` return true again → the reads after the first were asked (and refused).
+#[tokio::test]
+async fn after_githubs_text_reads_still_run_unasked_and_a_write_asks_every_time() {
+    let Some(s) = Setup::new("after_githubs_text_reads_still_run_unasked_and_a_write_asks_every_time", &[]) else { return };
+    let approver = Recorder::new(Decision::No);
+    let model = Scripted::new(vec![
+        use_tools(vec![gh("r1", &["issue", "view", "1"])]),
+        use_tools(vec![gh("r2", &["pr", "checks", "2"]), gh("r3", &["api", "repos/o/r/actions/runs"])]),
+        use_tools(vec![gh("w1", &["pr", "merge", "2"])]),
+        say("Done."),
+    ]);
+    let run = sdk_turn(&s.root, &s.config, model, |o| {
+        o.github = true;
+        o.approve = Some(approver.clone());
+    })
+    .await;
+    let tainted = run.events.iter().any(|e| matches!(e, marv_session::session::SessionEvent::Tainted { .. }));
+    assert!(tainted, "the first read tainted the session");
+    let asked = approver.requests();
+    assert_eq!(asked.iter().map(|r| r.scope.key.as_str()).collect::<Vec<_>>(), ["github:pr merge"]);
+    assert!(asked[0].must_ask, "a write in a tainted session is asked every time");
+    // The second step's reads run together (marv-rs #58), so in any order.
+    let mut runs: Vec<_> = s.gh_runs().into_iter().filter(|a| a[0] != "repo").collect();
+    runs[1..].sort();
+    assert_eq!(
+        runs,
+        [strings(&["issue", "view", "1"]), strings(&["api", "repos/o/r/actions/runs"]), strings(&["pr", "checks", "2"])]
+    );
+}
+
 /// A token in gh's output never reaches the model, the events, the saved session or the trajectory.
 ///
 /// Proven: replaced `redact(&format_output(..))` with the plain output in `Github::run` → the token showed up in the

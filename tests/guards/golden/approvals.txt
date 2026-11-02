@@ -56,14 +56,14 @@ web_fetch {"offset":2000,"url":"https://example.com/"}
   subagent of radio     once      once      must once must once
 
 github {"args":["issue","list"]}
-  person                runs      runs      must      must
-  headless              runs      runs      must      must
-  woken                 runs      runs      must once must once
-  radio                 runs      runs      must once must once
-  subagent              runs      runs      must      must
-  subagent of headless  runs      runs      must      must
-  subagent of woken     runs      runs      must once must once
-  subagent of radio     runs      runs      must once must once
+  person                runs      runs      runs      runs
+  headless              runs      runs      runs      runs
+  woken                 runs      runs      runs      runs
+  radio                 runs      runs      runs      runs
+  subagent              runs      runs      runs      runs
+  subagent of headless  runs      runs      runs      runs
+  subagent of woken     runs      runs      runs      runs
+  subagent of radio     runs      runs      runs      runs
 
 github {"args":["api","repos/o/r/actions/secrets"]}
   person                once      once      must once must once
@@ -308,14 +308,14 @@ web_fetch {"offset":2000,"url":"https://example.com/"}
   subagent of radio     once      once      must once must once
 
 github {"args":["issue","list"]}
-  person                runs      runs      must      must
-  headless              runs      runs      must      must
-  woken                 runs      runs      must once must once
-  radio                 runs      runs      must once must once
-  subagent              runs      runs      must      must
-  subagent of headless  runs      runs      must      must
-  subagent of woken     runs      runs      must once must once
-  subagent of radio     runs      runs      must once must once
+  person                runs      runs      runs      runs
+  headless              runs      runs      runs      runs
+  woken                 runs      runs      runs      runs
+  radio                 runs      runs      runs      runs
+  subagent              runs      runs      runs      runs
+  subagent of headless  runs      runs      runs      runs
+  subagent of woken     runs      runs      runs      runs
+  subagent of radio     runs      runs      runs      runs
 
 github {"args":["api","repos/o/r/actions/secrets"]}
   person                once      once      must once must once

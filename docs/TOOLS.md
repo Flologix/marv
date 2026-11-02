@@ -68,7 +68,7 @@ person approved ("always" on a tainted fetch) runs without asking, in a turn wit
 | `grep {"pattern":"fn main"}` | never | never | never | never | never | no | project (workspace) | no | - |
 | `web_fetch {"url":"https://example.com/"}` | asks | asks | every time | every time | asks | yes | web (outside) | no | - |
 | `web_fetch {"offset":2000,"url":"https://example.com/"}` | asks | asks | every time | every time | asks | yes | web (outside) | no | - |
-| `github {"args":["issue","list"]}` | never | never | never | never | never | yes | github (outside) | no | github |
+| `github {"args":["issue","list"]}` | never | never | never | never | never | no | github (outside) | no | github |
 | `github {"args":["api","repos/o/r/actions/secrets"]}` | every time | every time | every time | every time | every time | yes | github (outside) | no | github |
 | `github {"args":["issue","comment","1","--body","done"]}` | asks | asks | every time | every time | asks | yes | github (outside) | no | github |
 | `skill {"name":"release"}` | never | never | never | never | never | no | project (workspace) | no | - |

@@ -14,6 +14,7 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ### Fixed
 
+- **Reading GitHub no longer asks once the conversation holds GitHub's text.** After the first `gh` result every later read (`gh pr list`, `gh pr checks`, `gh api` GETs) asked, titled "Change something on GitHub", and "don't ask again" didn't hold: about 40 prompts to list a repository's pull requests and their CI. A read only reaches GitHub's API, so it runs unasked again; writes (`gh pr merge`, comments) still ask every time.
 - **`marv -m <model>` works in the TUI.** It only reached `marv -p`; the TUI started with the saved model. It's for that run, never saved.
 
 ## [0.15.0] - 2026-11-01
