@@ -133,23 +133,48 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<T, ToolError>>,
 {
-    let key = lock_key(&crate::files::resolve_in_project(ctx, path)?);
-    let lock = locks().lock().unwrap_or_else(|e| e.into_inner()).entry(key.clone()).or_default().clone();
-    let result = {
-        let _held = lock.lock().await;
-        match &ctx.file_locks {
-            Some(dir) => match lock_across_processes(ctx, dir, &key, path).await {
-                // Released when this arm ends: the call's check, write and format, and nothing after.
-                Ok(_across) => f().await,
-                Err(e) => Err(e),
-            },
-            None => f().await,
-        }
+    with_file_locks(ctx, &[path], f).await
+}
+
+/// [`with_file_lock`] for several files at once (`apply_patch`, #66): every path's locks are held while `f` runs.
+/// They are taken in the order of their [`lock_key`]s, in-process locks first and then the cross-process ones, so two
+/// calls over overlapping files can't each hold one and wait for the other. Two spellings of one file are one lock.
+pub async fn with_file_locks<T, F, Fut>(ctx: &ToolContext, paths: &[&str], f: F) -> Result<T, ToolError>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<T, ToolError>>,
+{
+    let mut keys = Vec::with_capacity(paths.len());
+    for path in paths {
+        keys.push((lock_key(&crate::files::resolve_in_project(ctx, path)?), *path));
+    }
+    keys.sort_by(|a, b| a.0.cmp(&b.0));
+    keys.dedup_by(|a, b| a.0 == b.0);
+    let held: Vec<Arc<tokio::sync::Mutex<()>>> = {
+        let mut map = locks().lock().unwrap_or_else(|e| e.into_inner());
+        keys.iter().map(|(key, _)| map.entry(key.clone()).or_default().clone()).collect()
     };
-    // Forget the path once nothing else holds or waits for it (the map's copy and ours).
+    let result = async {
+        let mut guards = Vec::with_capacity(held.len());
+        for lock in &held {
+            guards.push(lock.lock().await);
+        }
+        // Released when this block ends: the call's check, write and format, and nothing after.
+        let mut across = Vec::new();
+        if let Some(dir) = &ctx.file_locks {
+            for (key, path) in &keys {
+                across.push(lock_across_processes(ctx, dir, key, path).await?);
+            }
+        }
+        f().await
+    }
+    .await;
+    // Forget each path once nothing else holds or waits for it (the map's copy and ours).
     let mut map = locks().lock().unwrap_or_else(|e| e.into_inner());
-    if Arc::strong_count(&lock) == 2 {
-        map.remove(&key);
+    for ((key, _), lock) in keys.iter().zip(&held) {
+        if Arc::strong_count(lock) == 2 {
+            map.remove(key);
+        }
     }
     result
 }
@@ -267,5 +292,33 @@ mod tests {
     fn a_new_files_name_is_case_folded() {
         let root = TempDir::new("lock-case");
         assert_eq!(lock_key(&root.path().join("New.TXT")), lock_key(&root.path().join("new.txt")));
+    }
+
+    #[tokio::test]
+    async fn several_files_are_locked_together_and_forgotten_after() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let root = TempDir::new("locks-several");
+        let ctx = ToolContext::new(root.path());
+        // Opposite orders, overlapping files: sorted keys mean neither can hold one and wait on the other.
+        let a = {
+            let order = order.clone();
+            with_file_locks(&ctx, &["b.txt", "a.txt"], move || async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                order.lock().unwrap().push("first");
+                Ok(())
+            })
+        };
+        let b = {
+            let order = order.clone();
+            with_file_locks(&ctx, &["a.txt", "./b.txt", "b.txt"], move || async move {
+                order.lock().unwrap().push("second");
+                Ok(())
+            })
+        };
+        let (a, b) = tokio::join!(a, b);
+        assert!(a.is_ok() && b.is_ok());
+        assert_eq!(*order.lock().unwrap(), ["first", "second"]);
+        let map = locks().lock().unwrap();
+        assert!(!map.contains_key(&root.path().join("a.txt")) && !map.contains_key(&root.path().join("b.txt")));
     }
 }

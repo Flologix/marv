@@ -310,7 +310,10 @@ fn has_diff(run: &ToolRun) -> bool {
 pub fn changed_files(runs: &[ToolRun]) -> Option<Vec<String>> {
     let mut files = Vec::new();
     for run in runs.iter().filter(|r| has_diff(r)) {
-        files.push(run.changed.clone()?);
+        if run.changed.is_empty() {
+            return None;
+        }
+        files.extend(run.changed.iter().cloned());
     }
     Some(files)
 }
@@ -1198,7 +1201,7 @@ pub(crate) mod testing {
             marv_core::ToolResult { output: "Edited".into(), summary: Some("+1 −1".into()), is_error: false },
             "a.ts",
         );
-        run.changed = path.map(String::from);
+        run.changed = path.into_iter().map(String::from).collect();
         run.display = Some(Arc::new(crate::runner::ToolDisplay { diff: Some(Default::default()), plan: None }));
         run
     }

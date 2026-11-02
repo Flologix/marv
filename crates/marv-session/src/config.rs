@@ -33,10 +33,12 @@ pub type Env = BTreeMap<String, String>;
 pub const DEFAULT_MAX_STEPS: u32 = marv_agent::agent::DEFAULT_MAX_STEPS;
 /// 32k fits fully on a 12 GB GPU for 9-12B models and holds a fair amount of code.
 pub const DEFAULT_CONTEXT_LENGTH: u64 = 32_768;
-/// `reasoningEffort` (#143) when the file doesn't say: medium. On SWE-bench (10 Verified instances, GLM-5.3-flash)
-/// it resolved the same 7 as the model's own effort with 37% fewer output tokens and 30% less cost; low was no
-/// cheaper and slower.
-pub const DEFAULT_REASONING_EFFORT: Option<marv_provider::ReasoningEffort> = Some(marv_provider::ReasoningEffort::Medium);
+/// `reasoningEffort` when the file doesn't say: max, fitted per model to the highest level it takes
+/// (`marv_provider::effort_for_model`; `high` where its levels aren't known). 0.15.0: on Terminal-Bench 2.1, DeepSeek
+/// V4.1 Flash went from 49% with reasoning off to 76% at max, and Claude Code reasons at xhigh by default. Before, the
+/// default was medium (#143: on 10 SWE-bench Verified instances GLM-5.3-flash resolved the same 7 as at its own effort
+/// with 37% fewer output tokens), which DeepSeek V4.1 Flash doesn't even take.
+pub const DEFAULT_REASONING_EFFORT: Option<marv_provider::ReasoningEffort> = Some(marv_provider::ReasoningEffort::Max);
 /// `compactTokens` (#140): compact once the context passes this many tokens, even when the window is far larger.
 pub const DEFAULT_COMPACT_TOKENS: u64 = 100_000;
 /// The smallest `compactTokens`. After a compaction the context is the system prompt, tools and MCP list (7k–13k
@@ -144,7 +146,7 @@ pub struct FileConfig {
     /// Overrides the preset endpoint, e.g. Ollama on another machine.
     pub base_url: Option<String>,
     pub thinking: Option<bool>,
-    /// `reasoningEffort` (#143): `minimal`, `low`, `medium` or `high`, sent to OpenRouter models that reason;
+    /// `reasoningEffort` (#143): `minimal`, `low`, `medium`, `high`, `xhigh` or `max` (the last two only where the model takes them), sent to OpenRouter models that reason;
     /// `Some(None)` is `"default"` (the model picks). Unset: [`DEFAULT_REASONING_EFFORT`].
     pub reasoning_effort: Option<Option<marv_provider::ReasoningEffort>>,
     /// Ollama's context window (num_ctx), at least 2048.
@@ -913,7 +915,8 @@ pub fn resolve_config(file: Option<&FileConfig>, env: &Env) -> Config {
             None
         },
         api_key,
-        thinking: file.and_then(|f| f.thinking).unwrap_or(false),
+        // On by default (0.15.0): a model whose reasoning is optional reasons unless `/think off` or `"thinking": false`.
+        thinking: file.and_then(|f| f.thinking).unwrap_or(true),
         reasoning_effort: file.and_then(|f| f.reasoning_effort).unwrap_or(DEFAULT_REASONING_EFFORT),
         context_length: file.and_then(|f| f.context_length).unwrap_or(DEFAULT_CONTEXT_LENGTH),
         compact_tokens: match (eval_compact_tokens(env), file.and_then(|f| f.compact_tokens)) {
@@ -1138,7 +1141,7 @@ mod tests {
         assert_eq!(c.api_key_source, Some(KeySource::File));
         assert_eq!(
             (c.thinking, c.context_length, c.sandbox, c.yolo, c.trajectories, c.diagnostics, c.checks),
-            (false, 32768, true, true, true, Diagnostics::ON, true)
+            (true, 32768, true, true, true, Diagnostics::ON, true)
         );
         assert!(c.checkpoints && c.suggestions);
         assert_eq!((c.max_steps, c.mcp_tools), (25, McpToolsSetting::Auto));
@@ -1303,7 +1306,7 @@ mod tests {
 
     #[test]
     fn reasoning_effort_comes_from_the_file_and_reaches_the_provider_config() {
-        assert_eq!(resolve_config(None, &Env::new()).reasoning_effort, Some(marv_provider::ReasoningEffort::Medium));
+        assert_eq!(resolve_config(None, &Env::new()).reasoning_effort, Some(marv_provider::ReasoningEffort::Max));
         let file = FileConfig::from_value(&json!({"reasoningEffort": "high"})).unwrap();
         assert_eq!(file.to_value()["reasoningEffort"], json!("high"));
         let config = resolve_config(Some(&file), &Env::new());
@@ -1312,7 +1315,10 @@ mod tests {
         let own = FileConfig::from_value(&json!({"reasoningEffort": "default"})).unwrap();
         assert_eq!(own.to_value()["reasoningEffort"], json!("default"));
         assert_eq!(resolve_config(Some(&own), &Env::new()).reasoning_effort, None);
-        for bad in [json!("max"), json!(2), json!(true)] {
+        // xhigh and max: the levels above high some models take (DeepSeek V4.1 Flash: max).
+        let max = FileConfig::from_value(&json!({"reasoningEffort": "max"})).unwrap();
+        assert_eq!(resolve_config(Some(&max), &Env::new()).reasoning_effort, Some(marv_provider::ReasoningEffort::Max));
+        for bad in [json!("ultra"), json!(2), json!(true)] {
             assert!(FileConfig::from_value(&json!({ "reasoningEffort": bad })).unwrap_err().contains("reasoningEffort"), "{bad}");
         }
     }

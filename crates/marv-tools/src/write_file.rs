@@ -236,7 +236,7 @@ impl Tool for WriteFile {
             result.diff = Some(shown_diff(&diff.lines));
             result
         };
-        result.changed = Some(planned.shown.clone());
+        result.changed = vec![planned.shown.clone()];
         Ok(result)
     }
 }
@@ -332,7 +332,7 @@ mod tests {
         assert!(f.read("greet.ts").contains("`Hi, ${name}!`"));
         assert_eq!(out.summary, "+1 −1");
         assert_eq!(out.output, "Edited greet.ts: replaced 1 occurrence (+1 −1 lines).");
-        assert_eq!(out.changed.as_deref(), Some("greet.ts"));
+        assert_eq!(out.changed, ["greet.ts"]);
         let asked = f.asked();
         assert_eq!(asked.len(), 1);
         assert_eq!(asked[0].preview.title, "Edit greet.ts");

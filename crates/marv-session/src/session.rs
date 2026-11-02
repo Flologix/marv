@@ -374,6 +374,10 @@ pub struct SessionInit {
     /// Extra tools for the main agent, after the built-in ones; names must be their own.
     pub tools: Vec<ToolRef>,
     pub system_prompt: Option<SystemPrompt>,
+    /// When the run must be done (`marv -p --time-limit`), for the tools ([`ToolContext::deadline`]). None: no limit.
+    pub deadline: Option<std::time::Instant>,
+    /// `marv -p --dangerously-run-unsandboxed`: the file tools may reach outside the project ([`ToolContext::files_anywhere`]).
+    pub files_anywhere: bool,
     /// Asked for every call that needs a yes; without it only what yolo vouches for runs. Wrapped by the session
     /// (`SessionApprover`): "always" scopes, `must_ask`, a stop answers "no".
     pub approve: Option<Arc<dyn Approver>>,
@@ -504,6 +508,8 @@ impl SessionInit {
             wire_approver: None,
             tools: Vec::new(),
             system_prompt: None,
+            deadline: None,
+            files_anywhere: false,
             approve: None,
             max_steps: None,
             plan: true,
@@ -824,14 +830,16 @@ impl State {
         self.checkpoint_failure = None;
     }
 
-    /// A path a turn's tool reported changing (`ToolOutput::changed`), main agent or subagent.
+    /// The paths a turn's tool reported changing (`ToolOutput::changed`), main agent or subagent.
     fn note_changed(&mut self, turn: u32, event: &LoopEvent) {
         if let LoopEvent::ToolEnd { run, .. } = event
-            && let Some(changed) = &run.changed
+            && !run.changed.is_empty()
         {
             let paths = self.reported.entry(turn).or_default();
-            if !paths.contains(changed) {
-                paths.push(changed.clone());
+            for changed in &run.changed {
+                if !paths.contains(changed) {
+                    paths.push(changed.clone());
+                }
             }
         }
     }
@@ -2084,6 +2092,8 @@ impl MarvSession {
         ctx.checkpoint = checkpoint.map(|c| c as Arc<dyn marv_tools::Checkpoint>);
         ctx.taint = self.inner.taint.clone();
         ctx.file_versions = self.inner.file_versions.clone();
+        ctx.deadline = init.deadline;
+        ctx.files_anywhere = init.files_anywhere;
         // The edit tools' check-and-write locks against other Marv processes in this folder: in the runtime folder,
         // else in Marv's own folder (`file_locks_dir`); with neither, within this process only.
         ctx.file_locks = marv_sandbox::runtime_dir_for(&marv_sandbox::runtime_env(), Some(&init.root))

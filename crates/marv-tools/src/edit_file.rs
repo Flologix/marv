@@ -248,7 +248,7 @@ impl Tool for EditFile {
             summary,
         );
         result.diff = Some(shown_diff(&diff.lines));
-        result.changed = Some(planned.shown.clone());
+        result.changed = vec![planned.shown.clone()];
         Ok(result)
     }
 }
@@ -275,6 +275,11 @@ pub(crate) fn package_json(path: &str, ctx: &ToolContext) -> Option<std::path::P
 /// (`marv_sandbox::protected::home_rule`): this tool writes outside the sandbox.
 pub(crate) fn protected_target(path: &str, ctx: &ToolContext) -> Option<marv_sandbox::ProtectedRule> {
     let absolute = resolve_in_project(ctx, path).ok()?;
+    // Outside the project with `files_anywhere` (a disposable container): no project rule applies; the home folder's
+    // still does. Anywhere else an outside path never resolves this far.
+    if crate::files::outside_project(ctx, &absolute) {
+        return marv_sandbox::protected::home_rule(&ctx.root, &ctx.home, &absolute);
+    }
     marv_sandbox::protected_rule(&ctx.root, &absolute)
         .unwrap_or(Some(marv_sandbox::ProtectedRule::GitDir))
         .or_else(|| marv_sandbox::protected::home_rule(&ctx.root, &ctx.home, &absolute))
@@ -321,6 +326,21 @@ mod tests {
         ctx.file_versions.saw(&root.path().join("a.txt"), b"x\nx\n");
         let err = plan(&input("a.txt", "x", "y"), &ctx).await.unwrap_err();
         assert!(err.0.starts_with("old_string appears 2 times in a.txt."));
+    }
+
+    #[test]
+    fn outside_the_project_is_refused_unless_files_anywhere_and_then_unprotected() {
+        let root = TempDir::new("edit-anywhere");
+        let outside = TempDir::new("edit-anywhere-out");
+        let target = outside.path().join("tool.sh").display().to_string();
+        let mut ctx = ToolContext::new(root.path());
+        assert!(crate::files::resolve_in_project(&ctx, &target).is_err());
+        ctx.files_anywhere = true;
+        assert_eq!(crate::files::resolve_in_project(&ctx, &target).unwrap(), outside.path().join("tool.sh"));
+        assert_eq!(protected_target(&target, &ctx), None, "no project rule applies outside it");
+        // Inside the project every rule holds as ever.
+        assert_eq!(protected_target("AGENTS.md", &ctx), Some(marv_sandbox::ProtectedRule::AgentInstructions));
+        assert!(crate::files::resolve_in_project(&ctx, "../x").is_ok(), "relative paths out are taken as given too");
     }
 
     #[test]

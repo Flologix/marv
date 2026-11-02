@@ -13,6 +13,7 @@ python3 -I evals/bench.py --verify                                # every check 
 python3 -I evals/bench.py --harness marv,claude --repeat 5 --label haiku --budget 1.00
 python3 -I evals/bench.py --harness marv,opencode --repeat 3 --marv-model z-ai/glm-5.3-flash --label glm
 python3 -I evals/bench.py --report evals/results/<run> [<run> …]  # the tables again, or several runs side by side
+python3 -I evals/failures.py evals/results/<run> [<run> …]   # every failed run sorted by cause, with its evidence
 ```
 
 Needs Python 3.10+, Bun (it runs the checks, and `bun install` in `evals/` fetches the TypeScript compiler on first use),

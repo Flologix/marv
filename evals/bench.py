@@ -14,7 +14,7 @@ repository in a temp folder. The check is `bun test ./__eval__.test.js`, only ev
 environment, an empty home, only the workspace writable): it runs code the model wrote.
 
 Marv runs with a throwaway MARV_CONFIG_DIR (provider OpenRouter, the key from OPENROUTER_API_KEY or ~/.marv), so your
-own MCP servers, skills and settings stay out; `--approve files,process,mcp`. Claude Code runs with project settings
+own MCP servers, skills and settings stay out; `--approve files,process,mcp --approve-tainted`. Claude Code runs with project settings
 only and no MCP servers but the task's. The MCP tasks get the tracker server (`marv-oracle tracker`, built by
 `cargo build -p marv-oracle`) on tests/oracle/mcp/<data>. A TypeScript task's repo gets the compiler from
 evals/node_modules (`bun install` in evals/, done here when it's missing).
@@ -159,12 +159,94 @@ def claude_plan_only(stream):
     return sum(1 for calls in messages.values() if calls and calls <= PLAN_TOOLS)
 
 
+def fmt_med(xs, med, width, digits):
+    return f"{med(xs):{width}.{digits}f}" if xs else f"{'n/a':>{width}}"
+
+
+SHELLS = {"sh", "bash", "dash", "zsh"}
+
+
+class Resources:
+    """Samples a harness's processes every 100 ms while it runs, from /proc (Linux): its descendants (by parent pid:
+    opencode 2.x's server calls setsid, so its session alone would miss the process doing the work) and the members
+    of its session (it's started with start_new_session: an orphan keeps the session), those whose executable is the harness's own (the session leader's, or, when that's
+    a shell or shim, its children's): the agent itself, not the commands it runs (bun test, tsc, git), which differ by
+    task and would hide the harness. `peakRssMb` is the peak of their summed RSS (opencode 2.x is a client plus its
+    server: both count); `cpuSec` their user + system CPU time, which, unlike wall time, doesn't include waiting on
+    the model. `treePeakRssMb` is the whole session's peak, the agent's commands included."""
+    PAGE = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
+    TICK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+
+    def __init__(self, sid):
+        self.sid, self.exes, self.cpu = sid, set(), {}
+        self.peak = self.tree_peak = 0
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self.loop, daemon=True)
+        self.thread.start()
+
+    @staticmethod
+    def stat(pid):
+        """(ppid, session, utime + stime ticks, rss pages) of one process, from /proc/<pid>/stat."""
+        with open(f"/proc/{pid}/stat") as f:
+            fields = f.read().rsplit(")", 1)[1].split()
+        return int(fields[1]), int(fields[3]), int(fields[11]) + int(fields[12]), int(fields[21])
+
+    def sample(self):
+        every, children = {}, defaultdict(list)
+        for name in os.listdir("/proc"):
+            if not name.isdigit(): continue
+            try:
+                ppid, sid, ticks, rss = self.stat(name)
+            except (OSError, ValueError, IndexError):
+                continue
+            every[int(name)] = (ppid, sid, ticks, rss)
+            children[ppid].append(int(name))
+        mine, todo = set(), [self.sid] + [pid for pid, v in every.items() if v[1] == self.sid]
+        while todo:
+            pid = todo.pop()
+            if pid in mine or pid not in every: continue
+            mine.add(pid)
+            todo.extend(children.get(pid, ()))
+        procs = {}
+        for pid in mine:
+            try:
+                ppid, _, ticks, rss = every[pid]
+                procs[pid] = (ppid, ticks, rss, os.path.realpath(f"/proc/{pid}/exe"))
+            except OSError:
+                continue
+        if self.sid in procs and not self.exes:
+            leader = procs[self.sid][3]
+            if Path(leader).name not in SHELLS: self.exes.add(leader)
+        if not self.exes:
+            self.exes.update(exe for pid, (ppid, _, _, exe) in procs.items()
+                             if ppid == self.sid and Path(exe).name not in SHELLS)
+        own = {pid: v for pid, v in procs.items() if v[3] in self.exes}
+        for pid, (_, ticks, _, _) in own.items(): self.cpu[pid] = max(self.cpu.get(pid, 0), ticks)
+        self.peak = max(self.peak, sum(v[2] for v in own.values()))
+        self.tree_peak = max(self.tree_peak, sum(v[2] for v in procs.values()))
+
+    def loop(self):
+        while not self.stop.is_set():
+            try: self.sample()
+            except OSError: pass
+            self.stop.wait(0.1)
+
+    def finish(self):
+        self.stop.set()
+        self.thread.join(timeout=2)
+        mb = lambda pages: round(pages * self.PAGE / 2**20, 1)
+        return {"peakRssMb": mb(self.peak), "treePeakRssMb": mb(self.tree_peak),
+                "cpuSec": round(sum(self.cpu.values()) / self.TICK, 2)}
+
+
 def agent_run(cmd, ws, logdir, timeout, env=None):
     """Runs the agent and saves its stream and stderr, also when it times out: then its process group is killed and
     `timedOut` is set, and what it printed until then is still parsed (a stuck run is the one worth reading). The wait
     for output after the kill is bounded too: a child that left the group (a setsid'd command) may hold the pipes."""
-    proc = subprocess.Popen(cmd, cwd=ws, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                            start_new_session=True)
+    # stdin closed: opencode 2.x reads more of the prompt from an open stdin and waits on it until the timeout.
+    proc = subprocess.Popen(cmd, cwd=ws, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, start_new_session=True)
+    resources = Resources(proc.pid) if Path("/proc/self/stat").exists() else None
     try:
         out, err = proc.communicate(timeout=timeout)
         timed_out = False
@@ -181,6 +263,7 @@ def agent_run(cmd, ws, logdir, timeout, env=None):
             proc.wait()
     (logdir / "stream.jsonl").write_text(out or "")
     (logdir / "stderr.txt").write_text(err or "")
+    if resources: (logdir / "resources.json").write_text(json.dumps(resources.finish()))
     return subprocess.CompletedProcess(cmd, None if timed_out else proc.returncode, out or "", err or ""), timed_out
 
 
@@ -236,7 +319,10 @@ def run_marv(ws, prompt, servers, logdir, a):
     env["MARV_CONFIG_DIR"] = str(cfg)
     env.update(extra_env)
     cmd = [a.marv_bin, "-p", prompt, "-m", a.marv_model, "--output", "stream-json", "--max-steps", "50",
-           "--approve", "files", "--approve", "process", "--approve", "mcp"]
+           "--approve", "files", "--approve", "process", "--approve", "mcp",
+           # Since 9cfcf81, --approve no longer answers egress once the run read untrusted text (an MCP result):
+           # mcp-comment reads issue #7, then comments on it. The tracker is the bench's own local fake server.
+           "--approve-tainted"]
     try:
         p, timed_out = agent_run(cmd, ws, logdir, a.timeout, env)
         for t in (cfg / "trajectories").rglob("*.jsonl"): shutil.copy(t, logdir / "trajectory.jsonl")
@@ -280,13 +366,17 @@ def opencode_bin():
         if p.returncode == 0 and p.stdout.strip(): return p.stdout.strip()
     except FileNotFoundError:
         pass
-    return "opencode"
+    # `mise which` fails for an npm-backed install (opencode 2.x, `@opencode/cli`): its newest shim, if there is one.
+    def version(path): return tuple(int(x) for x in path.parts[-4].split(".") if x.isdigit())
+    shims = sorted((Path.home() / ".local/share/mise/installs/opencode").glob("*/node_modules/.bin/opencode"), key=version)
+    return str(shims[-1]) if shims else "opencode"
 
 
 def run_opencode(ws, prompt, servers, logdir, a):
     """opencode on the same OpenRouter model as Marv. Its config and data folders are throwaway (your own config,
-    plugins, MCP servers and sessions stay out), `--pure` skips external plugins and `--auto` approves everything: it has
-    no sandbox. The cost is opencode's own estimate from its price list."""
+    plugins, MCP servers and sessions stay out), `--standalone` gives each run its own server (opencode 2.x; no shared
+    background service between parallel runs) and `--auto` approves everything: it has no sandbox. It runs in the
+    workspace (2.x dropped `--dir`, and `--pure`). The cost is opencode's own estimate from its price list."""
     tmp = Path(tempfile.mkdtemp(prefix="marv-bench-opencode-"))
     env = {k: v for k, v in os.environ.items() if not k.startswith("OPENCODE")}
     env.update(OPENROUTER_API_KEY=a.key, XDG_CONFIG_HOME=str(tmp / "config"), XDG_DATA_HOME=str(tmp / "data"),
@@ -296,7 +386,7 @@ def run_opencode(ws, prompt, servers, logdir, a):
     if servers:
         config["mcp"] = {n: {"type": "local", "command": [s["command"], *s["args"]], "enabled": True} for n, s in servers.items()}
     env["OPENCODE_CONFIG_CONTENT"] = json.dumps(config)
-    cmd = [a.opencode_bin, "run", "--pure", "--auto", "--format", "json", "-m", f"openrouter/{a.marv_model}", "--dir", str(ws), prompt]
+    cmd = [a.opencode_bin, "run", "--standalone", "--auto", "--format", "json", "-m", f"openrouter/{a.marv_model}", prompt]
     try:
         p, timed_out = agent_run(cmd, ws, logdir, a.timeout, env)
     finally:
@@ -394,6 +484,7 @@ class Run:
         except subprocess.TimeoutExpired:
             res["reason"] = "timeout"
         res["ms"] = int((time.time() - started) * 1000)
+        if (logdir / "resources.json").exists(): res.update(json.loads((logdir / "resources.json").read_text()))
         # What the agent changed, new files too (staged), before the check runs anything. Git runs sandboxed: the
         # repository's config is the agent's to write (a core.fsmonitor or filter command would run on the host).
         git = str(Path(shutil.which("git")).resolve())
@@ -443,7 +534,7 @@ def report(dirs):
     for r in rows: groups[(r["harness"], r.get("model", ""))].append(r)
     med = lambda xs: sorted(xs)[len(xs) // 2] if xs else 0
     print(f"{'harness':8} {'model':28} {'runs':>4} {'pass':>5} {'med s':>6} {'req':>5} {'plan-only':>9} {'tools':>6} {'tool err':>8} "
-          f"{'ann step':>8} {'in tok':>8} {'cached':>7} {'out tok':>8} {'$/run':>7}")
+          f"{'ann step':>8} {'in tok':>8} {'cached':>7} {'out tok':>8} {'$/run':>7} {'peak MB':>8} {'cpu s':>6}")
     for (h, m), rs in sorted(groups.items()):
         n = len(rs)
         avg = lambda k: sum(r.get(k) or 0 for r in rs) / n
@@ -455,7 +546,10 @@ def report(dirs):
               f"{avg('requests'):5.1f} {plan_avg} {sum(sum(r['tools'].values()) for r in rs) / n:6.1f} {sum(r.get('toolErrors', 0) for r in rs):8} "
               f"{sum(r.get('announcedSteps', 0) for r in rs):8} "
               f"{avg('promptTokens'):8.0f} {(sum(r.get('cachedTokens') or 0 for r in rs) / prompt if prompt else 0):7.0%} "
-              f"{avg('completionTokens'):8.0f} {avg('cost'):7.4f}")
+              f"{avg('completionTokens'):8.0f} {avg('cost'):7.4f} "
+              # Medians of what Resources measured (n/a for runs from before it).
+              f"{fmt_med([r['peakRssMb'] for r in rs if 'peakRssMb' in r], med, 8, 0)} "
+              f"{fmt_med([r['cpuSec'] for r in rs if 'cpuSec' in r], med, 6, 1)}")
     for (h, m), rs in sorted(groups.items()):
         only = sum(r.get("planOnly") or 0 for r in rs)
         if only:

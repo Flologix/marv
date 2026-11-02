@@ -123,12 +123,38 @@ impl Approver for ScopeApprover {
 /// The approver (`None`: nobody approves) and the receptacles `--approve mesh:<r>` pre-approves.
 pub type HeadlessApprovals = (Option<Arc<dyn Approver>>, Vec<marv_mesh::ReceptacleName>);
 
-/// The opt-ins for what `--approve` alone never answers (`--approve-tainted`, `--approve-protected`).
+/// The opt-ins for what `--approve` alone never answers (`--approve-tainted`, `--approve-protected`), and
+/// `--dangerously-run-unsandboxed`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MustAsk {
     pub tainted: bool,
     pub protected: bool,
+    /// `--dangerously-run-unsandboxed`: the sandbox is off for the run and every command (scope [`COMMANDS`]) is
+    /// approved. For a disposable container (Terminal-Bench) or CI machine, where the machine
+    /// is the sandbox. No `--approve` name or config key does this: only the flag, in `marv -p`.
+    pub unsandboxed: bool,
 }
+
+/// The scope-key prefix of every bash command: `bash:<flags>:<command>`, and `bash:host:<command>` for the host door.
+/// With the sandbox off (as the flag turns it) each of them runs unsandboxed.
+pub const COMMANDS: &str = "bash:";
+
+/// Appended to the system prompt in `marv -p`, where nobody reads a reply until the run ends: a question ends the
+/// run. On Terminal-Bench a run ended at its 99th step on "Want me to keep going…?" (2026-10-31). Subagents have the
+/// same rule in their own prompt; the TUI and the desktop, where a person answers, don't get this.
+pub const HEADLESS_NOTE: &str = "# Running unattended\n\nThis is a non-interactive run (marv -p): nobody reads your replies until it ends, and nobody can answer a question, so a question ends the run unanswered. Don't stop to ask whether to continue or which option to take: make reasonable assumptions, say what they were, and keep going until the task is done, or you're truly blocked and can't go on without something only the user has. Then say what you did, how you checked it, and anything left undone.";
+
+/// The system prompt's line for `--time-limit` (fixed for the run, so the cache holds). On Terminal-Bench a model ran
+/// `timeout 580 …` in a 750 s task, not knowing it had a budget, and the task ended mid-command (2026-10-31).
+pub fn time_limit_note(seconds: u64) -> String {
+    let minutes = seconds as f64 / 60.0;
+    format!(
+        "# Time limit\n\nThis run has {minutes:.0} minutes in all ({seconds} s), counted from its start, and it's stopped at the limit whatever state the work is in. Plan for it: make progress in steps that each leave something that works, keep every long command well inside the time left (each command result says how much is left, and a command's timeout is cut to fit), and leave a few minutes to check the result and finish."
+    )
+}
+
+/// What `marv -p --dangerously-run-unsandboxed` says on stderr before anything runs.
+pub const UNSANDBOXED_NOTICE: &str = "marv: --dangerously-run-unsandboxed: commands run without a sandbox and without asking, with everything this user can reach. Use it only in a disposable container or CI machine.";
 
 /// The `--approve` list as an approver (`None` for an empty list) plus the pre-approved mesh receptacles. An
 /// unknown name is an error (exit 1), as Marv's `runHeadless` checked before anything ran. The scope names and
@@ -138,6 +164,9 @@ pub fn build_approver(names: &[String], must_ask: MustAsk) -> Result<HeadlessApp
     let (mesh, mut prefixes) = marv_session::approvals::parse_approvals(names)?;
     // A pre-approved receptacle's mesh tool calls are approved too (scope `mesh:<receptacle>:<mode>`).
     prefixes.extend(mesh.iter().map(|r| format!("mesh:{r}:")));
+    if must_ask.unsandboxed {
+        prefixes.push(COMMANDS.into());
+    }
     let approver = (!prefixes.is_empty()).then(|| {
         Arc::new(ScopeApprover { prefixes, tainted: must_ask.tainted, protected: must_ask.protected }) as Arc<dyn Approver>
     });
@@ -388,6 +417,8 @@ pub struct HeadlessOptions {
     pub must_ask: MustAsk,
     /// `--trust-project`: the project's instructions, skills and agent types are used as the person's for this run.
     pub trust_project: bool,
+    /// `--time-limit`: seconds for the whole run.
+    pub time_limit: Option<u64>,
 }
 
 /// Runs one headless turn and writes the result to stdout. Returns the exit code.
@@ -588,7 +619,20 @@ pub async fn run_headless(options: HeadlessOptions, quit: crate::signals::Quit) 
     let o = &mut builder.options;
     (o.sandbox, o.thinking, o.diagnostics, o.checks, o.mcp_tools, o.config_dir) =
         (config.sandbox, config.thinking, config.diagnostics, config.checks, config.mcp_tools, Some(config_dir));
+    if options.must_ask.unsandboxed {
+        eprintln!("{UNSANDBOXED_NOTICE}");
+        o.sandbox = false;
+        // The file tools reach what its commands reach: in a container the work is often outside the project
+        // (/usr/local/bin, /tmp), and 12 write_file calls were refused there on Terminal-Bench.
+        o.files_anywhere = true;
+    }
     o.reasoning_effort = config.reasoning_effort;
+    // Fixed for the run, so the prompt cache holds; after Marv's own prompt (the cached prefix stays the TUI's).
+    o.system_prompt = Some(marv_session::SystemPrompt::Append(match options.time_limit {
+        Some(seconds) => format!("{HEADLESS_NOTE}\n\n{}", time_limit_note(seconds)),
+        None => HEADLESS_NOTE.into(),
+    }));
+    o.deadline = options.time_limit.map(|seconds| std::time::Instant::now() + std::time::Duration::from_secs(seconds));
     o.formatter = config.formatter;
     o.checkpoints = config.checkpoints;
     // Session-start hooks (#108): from the user's own config file only; a project's naming some is told, never run.
@@ -664,6 +708,35 @@ mod tests {
             protected: None,
             door: None,
         }
+    }
+
+    /// `--dangerously-run-unsandboxed` approves commands, and nothing else; without it no `--approve` name approves a
+    /// plain or host command, and the flag doesn't lift the must-ask rules (a protected write still needs its flag).
+    #[tokio::test]
+    async fn the_unsandboxed_flag_approves_host_commands_and_nothing_more() {
+        let flag = MustAsk { unsandboxed: true, ..MustAsk::default() };
+        let (a, _) = build_approver(&[], flag).unwrap();
+        let a = a.expect("the flag alone makes an approver");
+        for command in ["bash::make test", "bash:host:make test", "bash:net:pip install x", "bash:git:git commit -m x"] {
+            assert_eq!(a.approve(request(command)).await, Decision::Yes, "{command}");
+        }
+        assert_eq!(a.approve(request("files")).await, Decision::Unavailable);
+        assert_eq!(a.approve(request("web:https://example.com/")).await, Decision::Unavailable);
+        assert_eq!(a.approve(request("process:dev")).await, Decision::Unavailable);
+        let tainted = ApprovalRequest { must_ask: true, ..request("bash:net:curl x") };
+        assert_eq!(a.approve(tainted).await, Decision::Unavailable, "egress after untrusted text needs its flag");
+        for names in [&["files", "network", "git_write", "process", "mcp", "web"][..], &[]] {
+            let (none, _) = build_approver(&names.iter().map(|n| n.to_string()).collect::<Vec<_>>(), MustAsk::default()).unwrap();
+            if let Some(none) = none {
+                assert_eq!(none.approve(request("bash::make test")).await, Decision::Unavailable, "{names:?}");
+                assert_eq!(none.approve(request("bash:host:make test")).await, Decision::Unavailable, "{names:?}");
+            }
+        }
+        let (both, _) = build_approver(&["files".into()], flag).unwrap();
+        let protected =
+            ApprovalRequest { must_ask: true, protected: Some(marv_sandbox::ProtectedRule::Envrc), ..request("files") };
+        assert_eq!(both.unwrap().approve(protected).await, Decision::Unavailable);
+        assert!(build_approver(&["host".into()], MustAsk::default()).is_err(), "no --approve name for it");
     }
 
     // Marv's tests/github-tool.test.ts, "marv -p".
@@ -804,13 +877,16 @@ mod tests {
             assert_eq!(plain.approve(request(key)).await, Decision::Yes, "{key}: untainted is unchanged");
         }
         assert_eq!(plain.approve(protected.clone()).await, Decision::Unavailable);
-        let opted = MustAsk { tainted: true, protected: true };
+        let opted = MustAsk { tainted: true, protected: true, ..MustAsk::default() };
         let both = build_approver(&names(&["web", "files"]), opted).unwrap().0.unwrap();
         assert_eq!(both.approve(tainted("web:https://e.com/", None)).await, Decision::Yes);
         assert_eq!(both.approve(protected.clone()).await, Decision::Yes);
         // The flags never stand in for a scope.
         assert_eq!(both.approve(tainted("bash:net:curl x", None)).await, Decision::Unavailable);
-        let only_tainted = build_approver(&names(&["files"]), MustAsk { tainted: true, protected: false }).unwrap().0.unwrap();
+        let only_tainted = build_approver(&names(&["files"]), MustAsk { tainted: true, protected: false, ..MustAsk::default() })
+            .unwrap()
+            .0
+            .unwrap();
         assert_eq!(only_tainted.approve(protected).await, Decision::Unavailable);
         let scope = ScopeApprover { prefixes: vec!["web:".into()], ..ScopeApprover::default() };
         let why = scope.must_ask_refusal(&tainted("web:https://e.com/", None)).unwrap();
@@ -825,7 +901,7 @@ mod tests {
     // A memory in a tainted session needs a person: --approve memory with --approve-tainted still refuses it.
     #[tokio::test]
     async fn a_tainted_memory_write_is_refused_whatever_the_flags() {
-        let all = MustAsk { tainted: true, protected: true };
+        let all = MustAsk { tainted: true, protected: true, ..MustAsk::default() };
         let approver = build_approver(&["memory".to_string()], all).unwrap().0.unwrap();
         let tainted = ApprovalRequest { must_ask: true, once: true, persists: true, ..request("memory") };
         assert_eq!(approver.approve(tainted.clone()).await, Decision::Unavailable);

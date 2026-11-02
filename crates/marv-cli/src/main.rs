@@ -126,8 +126,13 @@ async fn run_mode(cli: Cli, mode: Mode, quit: signals::Quit) -> i32 {
                 model: cli.model,
                 max_steps: cli.max_steps,
                 approve: cli.approve,
-                must_ask: headless::MustAsk { tainted: cli.approve_tainted, protected: cli.approve_protected },
+                must_ask: headless::MustAsk {
+                    tainted: cli.approve_tainted,
+                    protected: cli.approve_protected,
+                    unsandboxed: cli.dangerously_run_unsandboxed,
+                },
                 trust_project: cli.trust_project,
+                time_limit: cli.time_limit,
             };
             headless::run_headless(options, quit).await as i32
         }
@@ -135,6 +140,11 @@ async fn run_mode(cli: Cli, mode: Mode, quit: signals::Quit) -> i32 {
         Mode::Update { check } => update::run(check).await,
         Mode::MeshWire { spec } => mesh_cmd::wire(&spec).await,
         Mode::MeshPlug { session, name } => mesh_cmd::plug(&session, name.as_deref()).await,
+        // A person is at the TUI to approve each command; this flag would answer for them.
+        _ if cli.dangerously_run_unsandboxed => {
+            eprintln!("marv: --dangerously-run-unsandboxed works only with -p (marv -p \"<prompt>\").");
+            1
+        }
         Mode::Interactive { resume, approve } => match tui::run(resume, approve, quit).await {
             Ok(code) => code,
             Err(e) => {

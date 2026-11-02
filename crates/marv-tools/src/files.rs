@@ -31,9 +31,26 @@ pub const IGNORED_DIRS: &[&str] =
 /// Long enough for a big repository, short enough that a blocked git (a FIFO named `.gitignore`) gives up.
 pub const LIST_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// A path the model gave, resolved inside the project (see `marv_sandbox::resolve_in_project`).
+/// A path the model gave, resolved inside the project (see `marv_sandbox::resolve_in_project`). With
+/// `ToolContext::files_anywhere` (a disposable container), a path outside the project is taken as given (normalized,
+/// `~/` expanded) instead of refused; one inside still gets every check.
 pub fn resolve_in_project(ctx: &ToolContext, path: &str) -> Result<PathBuf, ToolError> {
-    Ok(marv_sandbox::resolve_in_project(&ctx.root, path, &ctx.home)?)
+    match marv_sandbox::resolve_in_project(&ctx.root, path, &ctx.home) {
+        Err(marv_sandbox::SandboxError::OutsideProject { .. }) if ctx.files_anywhere => Ok(outside_path(ctx, path)),
+        result => Ok(result?),
+    }
+}
+
+/// `path` as an absolute path (`~/` expanded, relative to the project, normalized), for `files_anywhere`.
+fn outside_path(ctx: &ToolContext, path: &str) -> PathBuf {
+    let expanded = marv_sandbox::paths::expand_home(path, &ctx.home);
+    let absolute = if expanded.is_absolute() { expanded } else { ctx.root.join(expanded) };
+    marv_sandbox::paths::normalize(&absolute)
+}
+
+/// Whether `absolute` (as [`resolve_in_project`] returned it) lies outside the project: only with `files_anywhere`.
+pub fn outside_project(ctx: &ToolContext, absolute: &Path) -> bool {
+    ctx.files_anywhere && marv_sandbox::resolve_in_project(&ctx.root, &absolute.to_string_lossy(), &ctx.home).is_err()
 }
 
 /// For the reading tools (`read_file`, `grep`): a path inside the project, or a file in this session's saved tool

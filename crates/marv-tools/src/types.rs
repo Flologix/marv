@@ -448,6 +448,12 @@ pub struct ToolContext {
     /// Where a running call says what it's waiting for (#201: "waiting for beta to accept the wire"), shown on its
     /// card. The main agent's only; None: nothing is shown.
     pub progress: Option<Arc<dyn ToolProgress>>,
+    /// When this run must be done (`marv -p --time-limit`): bash caps each command at the time left and says how much
+    /// is left after it. None: no limit.
+    pub deadline: Option<std::time::Instant>,
+    /// `marv -p --dangerously-run-unsandboxed` (a disposable container): the file tools may read and write outside the
+    /// project too, as its commands can. Inside the project every rule holds as ever. False everywhere else.
+    pub files_anywhere: bool,
 }
 
 /// A running call's one-line status on its card (the session sends it the way it sends a subagent's progress).
@@ -506,6 +512,8 @@ impl ToolContext {
             file_locks: None,
             swap: None,
             progress: None,
+            deadline: None,
+            files_anywhere: false,
         }
     }
 
@@ -533,8 +541,8 @@ pub struct ToolOutput {
     /// The plan tool's list after the call, for the screen only (like `diff`: never sent to the model or a
     /// trajectory; the call already holds it).
     pub plan: Option<Vec<PlanItem>>,
-    /// The file a change wrote (with `diff`), project-relative: which project checks run after the step.
-    pub changed: Option<String>,
+    /// The files a change wrote (with `diff`), project-relative (empty: none): which project checks run after the step.
+    pub changed: Vec<String>,
     pub is_error: bool,
     /// The user said no (or the run was interrupted): the agent stops so they can say what to do instead.
     pub declined: bool,
@@ -557,7 +565,7 @@ impl ToolOutput {
             summary: summary.into(),
             diff: None,
             plan: None,
-            changed: None,
+            changed: Vec::new(),
             is_error: false,
             declined: false,
             approval: None,

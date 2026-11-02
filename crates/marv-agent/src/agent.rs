@@ -88,6 +88,15 @@
 //!   The continue is an ordinary step: it counts toward `max_steps`, so at the limit the #59
 //!   wrap-up (or `on_limit`) comes next, and the wrap-up reply is never continued. The #81
 //!   failure-loop guard only sees tool calls, so the two never feed each other.
+//! - **Replies cut off while only reasoning** (marv-rs): at effort max a reply can spend its whole output budget
+//!   reasoning and do nothing; that's continued up to [`MAX_REASONING_CUT_OFFS`] times in a row (with
+//!   [`CUT_OFF_REASONING_NOTE`]), any other cut-off once, as before. With the provider's bigger cap at effort
+//!   `xhigh`/`max` (`openai_compat::max_tokens_for_reasoning`), this took 4 of 21 failed Terminal-Bench 2.1 runs.
+//! - **Unasked self-summary, no tool call** (marv-rs): a reply in a compaction summary's shape ("<analysis>\nLet me
+//!   work through the conversation chronologically…") when nothing was compacted ends the run halfway: DeepSeek V4.1
+//!   Flash did it in 9 of 46 failed Terminal-Bench runs and none of 36 passes. The loop tells the model so
+//!   ([`crate::announce::SELF_SUMMARY_NOTE`]) and goes on, up to three times a turn, logged as an `AnnouncedStep`.
+//!   Past that the run ends (never also continued as an announced step).
 //! - **#58 parallel read-only tools**: Marv runs only consecutive `agent` calls together
 //!   (`isParallel`). Here [`ToolRunner::concurrent`] decides, defaulting to `ToolKind::Read`; the
 //!   session also returns true for `agent`. Anything else is a barrier.
@@ -119,7 +128,9 @@ use marv_core::{
 use marv_provider::{EventStream, Provider, StreamOptions};
 use tokio_util::sync::CancellationToken;
 
-pub use crate::announce::{ANNOUNCED_STEP_NOTE, announces_next_step};
+pub use crate::announce::{
+    ANNOUNCED_STEP_NOTE, MAX_SELF_SUMMARY_CONTINUES, SELF_SUMMARY_NOTE, announces_next_step, summarizes_itself,
+};
 use crate::repetition::{
     FailureLoopState, ToolCallKey, ToolLoopState, detect_text_repetition, failing_command_note, make_tool_key, tool_loop_detected,
 };
@@ -153,6 +164,11 @@ pub const CUT_OFF_NOTE: &str = "(Automatic note from Marv, the program running y
 
 /// The same for a reply that reasoned and left nothing: it reasoned until the limit or started a
 /// tool call that was cut off and dropped; Marv can't tell which.
+/// How many replies in a row may be cut off while still only reasoning (no text, no call) before the run ends: deep
+/// reasoning (effort max) can fill a reply's whole budget and do nothing, and a second try usually acts. Any other
+/// cut-off is continued once, as before.
+pub const MAX_REASONING_CUT_OFFS: u32 = 3;
+
 pub const CUT_OFF_REASONING_NOTE: &str = "(Automatic note from Marv, the program running you) Your last reply used up the output limit, while reasoning or while writing a tool call (an unfinished call is dropped), so it did nothing. Reason briefly, and write a big file in parts (write_file the first part, then add the rest with append: true).";
 
 /// Told to the model after a second empty reply in a row. The first is asked for again unchanged:
@@ -346,8 +362,8 @@ pub struct ToolRun {
     /// Where `output` came from: anything but `User`/`Marv` is fenced as data, and a tainting
     /// source taints the session (`docs/SECURITY.md`).
     pub provenance: Provenance,
-    /// The file a change wrote (project-relative): which project checks/diagnostics `after_step` runs.
-    pub changed: Option<String>,
+    /// The files a change wrote (project-relative; empty: none): which project checks/diagnostics `after_step` runs.
+    pub changed: Vec<String>,
     /// How it was approved (trajectories, `marv -p`'s `tool_end` and refusals). Never sent to the model.
     pub approval: ApprovalRecord,
     /// The door out of the sandbox the call went through (Marv #47, #51, #52), for trajectories; None for an
@@ -369,7 +385,7 @@ impl ToolRun {
             label: label.into(),
             declined: false,
             provenance: Provenance::Project,
-            changed: None,
+            changed: Vec::new(),
             approval: ApprovalRecord::None,
             door: None,
             invalid: None,
@@ -892,6 +908,8 @@ pub struct LoopState {
     /// #90: whether this run already continued an announced next step (once per turn: the
     /// first is rescued, a second announcement ends the run, still logged as an event).
     announced: bool,
+    /// How many unasked self-summaries this turn continued past ([`summarizes_itself`]).
+    summarized: u32,
     tool_loop: ToolLoopState,
     /// (tool, normalized args) → hash of what it returned last time. A call repeated with the same
     /// result is a loop; one whose result changes each time (the next item from a queue) is new work.
@@ -927,6 +945,7 @@ impl LoopState {
             empties: 0,
             text_loops: 0,
             announced: false,
+            summarized: 0,
             tool_loop: ToolLoopState::default(),
             last_result: Default::default(),
             failures: FailureLoopState::default(),
@@ -1237,7 +1256,9 @@ impl LoopState {
     /// files in parts).
     fn cut_off(&mut self, reply: StepReply) {
         self.cut_offs += 1;
-        let continued = self.cut_offs == 1;
+        // A reply that was all reasoning did nothing: up to MAX_REASONING_CUT_OFFS in a row get another try.
+        let only_reasoning = reply.reasoned && reply.text.is_empty() && reply.calls.is_empty();
+        let continued = self.cut_offs == 1 || (only_reasoning && self.cut_offs <= MAX_REASONING_CUT_OFFS);
         // The history first, so it's valid even if the consumer stops at one of the events below.
         for call in &reply.calls {
             self.push_result(call, not_run::CUT_OFF);
@@ -1299,6 +1320,20 @@ impl LoopState {
             // Not when the next step is at the step limit: then the turn ends and they go back to the person.
             if !aborted && self.can_deliver() && !at_step_limit(self.step + 1, self.options.max_steps) {
                 return self.next_step();
+            }
+            // A reply that summarizes the conversation unasked (a compaction summary's shape, nothing compacted)
+            // ends the run halfway too: up to MAX_SELF_SUMMARY_CONTINUES times a turn, say so and go on. Logged as an
+            // announced step (the same kind of rescue; no new event for the clients to learn).
+            if !aborted && summarizes_itself(&reply.text) {
+                let continued = self.summarized < MAX_SELF_SUMMARY_CONTINUES;
+                self.summarized += 1;
+                self.emit(LoopEvent::AnnouncedStep { continued });
+                if continued {
+                    self.push_note(SELF_SUMMARY_NOTE);
+                    return self.next_step();
+                }
+                // Past the limit it ends the run: not also an announced step ("Let me work through…" reads as one).
+                return self.finish(StopReason::End);
             }
             // #90: a plain answer that announces its next step ("Now checking issue #7 before
             // commenting:") is how a turn dies halfway. Once per turn, say "continue" like a
@@ -2391,6 +2426,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_self_summary_with_no_tool_call_is_continued_up_to_three_times() {
+        let summary = "<analysis>\nLet me work through the conversation chronologically.";
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            announced(summary),
+            use_tools(&[call("c1", "a.ts")]),
+            announced(summary),
+            announced(summary),
+            announced(summary),
+            say("never asked"),
+        ]));
+        let h = history(vec![user("go")]);
+        let events = collect(options(provider.clone(), &h, plain())).await;
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 5, "three continues, then the fourth summary ends the run");
+        assert_eq!(requests[1].0.last(), Some(&user(SELF_SUMMARY_NOTE)));
+        assert_eq!(announced_steps(&events), [true, true, true, false]);
+        assert_eq!(end(&events), Some(StopReason::End));
+    }
+
+    #[tokio::test]
     async fn a_second_announced_step_after_the_rescue_only_ends_the_run() {
         let provider = Arc::new(ScriptedProvider::new(vec![
             announced("Now checking issue #7 before commenting:"),
@@ -2537,6 +2592,23 @@ mod tests {
             cut_off(vec![]),
             say("Done."),
         ]));
+        let h = history(vec![user("go")]);
+        let events = collect(options(provider, &h, plain())).await;
+        assert_eq!(cut_offs(&events), [true, true]);
+        assert_eq!(end(&events), Some(StopReason::End));
+    }
+
+    #[tokio::test]
+    async fn replies_cut_off_while_only_reasoning_get_three_tries_then_the_run_ends() {
+        let thinking = || cut_off(vec![ProviderEvent::ThinkingDelta("Let me consider every case…".into())]);
+        let provider = Arc::new(ScriptedProvider::new(vec![thinking(), thinking(), thinking(), thinking(), say("never")]));
+        let h = history(vec![user("go")]);
+        let events = collect(options(provider.clone(), &h, plain())).await;
+        assert_eq!(provider.requests().len(), 4, "three more tries after the first cut-off, then the run ends");
+        assert_eq!(cut_offs(&events), [true, true, true, false]);
+        assert_eq!(end(&events), Some(StopReason::Length));
+        // A second reasoning-only cut-off that then acts: the run goes on.
+        let provider = Arc::new(ScriptedProvider::new(vec![thinking(), thinking(), say("Done.")]));
         let h = history(vec![user("go")]);
         let events = collect(options(provider, &h, plain())).await;
         assert_eq!(cut_offs(&events), [true, true]);

@@ -733,8 +733,14 @@ fn config_text(ctx: &CommandContext) -> String {
         format!("Model:     {}", c.model),
         format!("Thinking:  {}", if c.thinking { "on" } else { "off" }),
         format!(
-            "Reasoning: {} (reasoningEffort in the config file)",
-            c.reasoning_effort.map_or("the model's default", |e| e.as_str())
+            "Reasoning: {}{} (reasoningEffort in the config file)",
+            c.reasoning_effort.map_or("the model's default", |e| e.as_str()),
+            // Fitted per model (`marv_provider::effort_for_model`): the highest level the model takes up to this.
+            if c.reasoning_effort.is_some_and(|e| e > marv_provider::ReasoningEffort::High) {
+                ", or the highest the model takes"
+            } else {
+                ""
+            }
         ),
         format!("Sandbox:   {}", sandbox_status(c, ctx.sandbox_available, &[])),
         format!("Yolo:      {} (/yolo)", if c.yolo { "on" } else { "off" }),
@@ -1449,7 +1455,10 @@ mod tests {
             let CommandAction::Print { text, .. } = run_command("/config", ctx) else { panic!() };
             assert!(text.contains("Radio:     off (/radio)"), "{text}");
             assert!(text.contains("Compact:   at 100,000 tokens or 85% of the window"), "{text}");
-            assert!(text.contains("Reasoning: medium (reasoningEffort in the config file)"), "{text}");
+            assert!(
+                text.contains("Reasoning: max, or the highest the model takes (reasoningEffort in the config file)"),
+                "{text}"
+            );
         });
     }
 
@@ -1652,7 +1661,8 @@ mod tests {
             assert_eq!(run_command("/CLEAR", ctx), CommandAction::Clear);
             assert_eq!(run_command("/model", ctx), CommandAction::Model { id: None });
             assert_eq!(run_command("/model a/b", ctx), CommandAction::Model { id: Some("a/b".into()) });
-            assert_eq!(run_command("/think", ctx), CommandAction::Thinking { on: true });
+            // Thinking is on by default (0.15.0): a bare /think turns it off.
+            assert_eq!(run_command("/think", ctx), CommandAction::Thinking { on: false });
             assert_eq!(run_command("/yolo off", ctx), CommandAction::Yolo { on: false });
             assert_eq!(
                 run_command("/remember project: uses tabs", ctx),

@@ -64,7 +64,7 @@ fn columns(indent: &str, width: usize) -> usize {
     indent.chars().fold(0, |col, ch| if ch == '\t' { col + width - (col % width) } else { col + 1 })
 }
 
-type Reindent = Box<dyn Fn(&str, usize) -> String>;
+pub type Reindent = Box<dyn Fn(&str, usize) -> String + Send + Sync>;
 
 /// A function that re-indents a line of `new_string` the way the file's lines differ from `old_string`'s, or None
 /// when no single rule explains every line.
@@ -193,6 +193,50 @@ pub fn apply_edit(text: &str, old_string: &str, new_string: &str, replace_all: b
         return EditResult::Applied { text: out, count: starts.len(), fuzzy: Some(fuzzy) };
     }
     EditResult::NotFound
+}
+
+/// Where [`find_from`] found a run of whole lines.
+pub struct LineMatch {
+    /// The index of the first matched line.
+    pub start: usize,
+    /// None: exact.
+    pub fuzzy: Option<Fuzzy>,
+    /// With `Fuzzy::Indentation`: re-indents an added line (its text, its index in the new block) the way the file's
+    /// matched lines differ from the old ones, as `apply_edit` re-indents `new_string`.
+    pub reindent: Option<Reindent>,
+}
+
+/// `apply_patch` (#66): the first run of `file_lines` at or after `from` that matches `old_lines` line by line, under
+/// the same tiers as `apply_edit`, in its order (exact, Unicode, trailing whitespace, indentation). Unlike
+/// `apply_edit`, the first match wins rather than a unique one: hunk order and `@@` headers disambiguate a patch
+/// (Codex's semantics, spec §9 decision 3). Whole lines only: a hunk's lines are lines. Indentation matches whose
+/// lines no single shift explains are skipped, as `apply_edit` refuses them.
+pub fn find_from(file_lines: &[&str], old_lines: &[&str], from: usize) -> Option<LineMatch> {
+    if old_lines.is_empty() || old_lines.len() > file_lines.len() {
+        return None;
+    }
+    let last = file_lines.len() - old_lines.len();
+    let stages: [(Option<Fuzzy>, LineEq); 4] = [
+        (None, |a, b| a == b),
+        (Some(Fuzzy::Unicode), unicode_equivalent),
+        (Some(Fuzzy::TrailingWhitespace), |a, b| a.trim_end() == b.trim_end()),
+        (Some(Fuzzy::Indentation), |a, b| a.trim() == b.trim()),
+    ];
+    for (fuzzy, same) in stages {
+        for start in from..=last {
+            let block = &file_lines[start..start + old_lines.len()];
+            if !block.iter().zip(old_lines).all(|(line, old)| same(line, old)) {
+                continue;
+            }
+            if fuzzy != Some(Fuzzy::Indentation) {
+                return Some(LineMatch { start, fuzzy, reindent: None });
+            }
+            if let Some(reindent) = reindenter(block, old_lines) {
+                return Some(LineMatch { start, fuzzy, reindent: Some(reindent) });
+            }
+        }
+    }
+    None
 }
 
 /// The ASCII a typographic character stands for, or None for any other character.
@@ -512,5 +556,26 @@ mod tests {
     fn closest_lines_nothing_close_or_empty() {
         assert_eq!(closest_lines(FILE, "SELECT * FROM users WHERE id = 1;"), None);
         assert_eq!(closest_lines("", "x"), None);
+    }
+
+    #[test]
+    fn find_from_takes_the_first_match_at_or_after_the_cursor() {
+        let file = ["a", "x", "b", "x", "c"];
+        assert_eq!(find_from(&file, &["x"], 0).map(|m| m.start), Some(1));
+        assert_eq!(find_from(&file, &["x"], 2).map(|m| m.start), Some(3));
+        assert!(find_from(&file, &["x"], 4).is_none());
+        assert!(find_from(&file, &["a", "b"], 0).is_none());
+    }
+
+    #[test]
+    fn find_from_forgives_in_apply_edits_order() {
+        let file = ["  say(\u{201C}hi\u{201D}); ", "\tif x {", "\t\ty();", "\t}"];
+        let m = find_from(&file, &["  say(\"hi\"); "], 0).unwrap();
+        assert_eq!((m.start, m.fuzzy), (0, Some(Fuzzy::Unicode)));
+        let m = find_from(&file, &["\tif x {   "], 0).unwrap();
+        assert_eq!((m.start, m.fuzzy), (1, Some(Fuzzy::TrailingWhitespace)));
+        let m = find_from(&file, &["    if x {", "        y();"], 0).unwrap();
+        assert_eq!((m.start, m.fuzzy), (1, Some(Fuzzy::Indentation)));
+        assert_eq!((m.reindent.unwrap())("        z();", 1), "\t\tz();");
     }
 }

@@ -89,12 +89,24 @@ pub struct Cli {
     #[arg(long = "approve-protected")]
     pub approve_protected: bool,
 
+    /// In -p only, for a disposable container or CI machine: run commands without the sandbox and approve each one
+    /// (with access to everything this user can reach). Protected paths and egress after untrusted content still
+    /// need their own flags: an unsandboxed command's output taints the session, so a container run needs
+    /// --approve-tainted too. Never from the config, and refused in the TUI.
+    #[arg(long = "dangerously-run-unsandboxed")]
+    pub dangerously_run_unsandboxed: bool,
+
     /// In -p: use this project's instruction files (AGENTS.md, CLAUDE.md), skills and agent types as yours for this
     /// run, as if you'd trusted them (/trust in the TUI). Without it, they count only where you trusted exactly these
     /// files; otherwise the model reads the instruction files as the project's data, and its skills and agent types
     /// aren't offered.
     #[arg(long = "trust-project")]
     pub trust_project: bool,
+
+    /// In -p: the run's time limit in seconds. The model is told its budget, each command is capped at the time left,
+    /// and command results say how much is left. Nothing stops the run at the limit: the caller does.
+    #[arg(long = "time-limit", value_name = "SECONDS")]
+    pub time_limit: Option<u64>,
 
     /// Steps before the turn stops (0 never stops; default: your config's maxSteps).
     #[arg(long = "max-steps", value_name = "N")]

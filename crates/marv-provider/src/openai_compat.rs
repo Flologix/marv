@@ -89,6 +89,22 @@ pub fn max_tokens_for(max_output: Option<u64>) -> u64 {
     max_output.map_or(DEFAULT_MAX_TOKENS, |n| n.min(DEFAULT_MAX_TOKENS))
 }
 
+/// The cap at reasoning effort `xhigh` or `max`, where the reasoning alone can fill [`DEFAULT_MAX_TOKENS`]: on
+/// Terminal-Bench 2.1, DeepSeek V4.1 Flash at max spent all 32000 tokens of a reply reasoning, twice in a row, and 4 of
+/// its 21 failed runs ended so (2026-11-01).
+pub const DEEP_REASONING_MAX_TOKENS: u64 = 64_000;
+
+/// [`max_tokens_for`], with room for deep reasoning at effort `xhigh` and `max` ([`DEEP_REASONING_MAX_TOKENS`]),
+/// still never more than the model can write.
+pub fn max_tokens_for_reasoning(max_output: Option<u64>, effort: Option<crate::ReasoningEffort>) -> u64 {
+    match effort {
+        Some(crate::ReasoningEffort::Xhigh | crate::ReasoningEffort::Max) => {
+            max_output.map_or(DEEP_REASONING_MAX_TOKENS, |n| n.min(DEEP_REASONING_MAX_TOKENS))
+        }
+        _ => max_tokens_for(max_output),
+    }
+}
+
 /// #96: how a provider says it won't take the `max_tokens` Marv sent: it names the field, or (OpenRouter) the prompt
 /// plus the requested output don't fit the window ("…, 32000 in the output").
 static MAX_TOKENS_REFUSED: LazyLock<regex::Regex> =
@@ -1277,6 +1293,12 @@ mod tests {
         assert!(body.ends_with(r#""tool_choice":"none","max_tokens":8192,"reasoning":{"enabled":true}}"#), "{body}");
         assert_eq!(max_tokens_for(None), DEFAULT_MAX_TOKENS);
         assert_eq!(max_tokens_for(Some(4096)), 4096);
+        use crate::ReasoningEffort::{High, Max, Xhigh};
+        assert_eq!(max_tokens_for_reasoning(Some(943_718), Some(Max)), DEEP_REASONING_MAX_TOKENS);
+        assert_eq!(max_tokens_for_reasoning(None, Some(Xhigh)), DEEP_REASONING_MAX_TOKENS);
+        assert_eq!(max_tokens_for_reasoning(Some(40_000), Some(Max)), 40_000, "never past the model's own cap");
+        assert_eq!(max_tokens_for_reasoning(Some(943_718), Some(High)), DEFAULT_MAX_TOKENS);
+        assert_eq!(max_tokens_for_reasoning(Some(943_718), None), DEFAULT_MAX_TOKENS);
         assert_eq!(max_tokens_for(Some(1_000_000)), DEFAULT_MAX_TOKENS);
     }
 
