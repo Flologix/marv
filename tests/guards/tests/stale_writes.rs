@@ -231,7 +231,9 @@ async fn a_file_a_command_showed_whole_counts_as_read_and_only_then() {
     let text = "export function a() {\n  return 1;\n}\n";
     root.write("src/a.js", text);
     root.write("src/b.js", text);
-    let ctx = ToolContext { approve_sandboxed: true, ..session(root.path()) };
+    // A person who says yes to the commands: on a machine where the test's sandbox isn't active (macOS CI), a
+    // sandboxed command isn't run unasked, and this is about what the command showed, not who approved it.
+    let ctx = ToolContext { approver: Some(marv_guards::Recorder::new(marv_tools::Decision::Yes)), ..session(root.path()) };
 
     let catted = run(&ctx, "bash", json!({"command": "cat src/a.js"})).await;
     assert!(!catted.is_error, "{}", catted.output);
