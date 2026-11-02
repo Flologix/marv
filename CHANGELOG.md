@@ -6,6 +6,8 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-11-02
+
 ### Added
 
 - **Local models with llama.cpp (#278), experimental.** `marv --local-model <gguf>` runs a GGUF model for that run, or pick **llama.cpp (local)** in `/setup` (`"provider": "llamacpp"`, the model being the file's path). Marv starts the `llama-server` on your `PATH` (or `"llamaCpp": {"server"}`) on 127.0.0.1 with a random API key, `contextLength` as its window and `--jinja`, waits while the model loads, and stops it when it exits. `"llamaCpp": {"args": […]}` adds arguments (`-ngl 99`). Ollama is unchanged. Experimental: tested against a stand-in server, not yet with a real `llama-server` and model; please report what you hit.
@@ -434,7 +436,9 @@ The first public release, on npm as `@flologixai/marv`.
 - The SDK: `createSession()` from `@flologixai/marv/sdk` runs Marv from code, without the UI.
 - Evals: `bun run eval` runs real models on small tasks with hidden checks.
 
-[Unreleased]: https://github.com/Flologix/marv/compare/v0.14.1...HEAD
+[Unreleased]: https://github.com/Flologix/marv/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/Flologix/marv/compare/v0.15.0...v0.16.0
+[0.15.0]: https://github.com/Flologix/marv/compare/v0.14.1...v0.15.0
 [0.14.1]: https://github.com/Flologix/marv/compare/v0.14.0...v0.14.1
 [0.14.0]: https://github.com/Flologix/marv/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/Flologix/marv/compare/v0.12.0...v0.13.0
