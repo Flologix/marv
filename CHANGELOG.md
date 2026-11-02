@@ -6,13 +6,23 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-11-02
+
 ### Added
 
 - **Local models with llama.cpp (#278), experimental.** `marv --local-model <gguf>` runs a GGUF model for that run, or pick **llama.cpp (local)** in `/setup` (`"provider": "llamacpp"`, the model being the file's path). Marv starts the `llama-server` on your `PATH` (or `"llamaCpp": {"server"}`) on 127.0.0.1 with a random API key, `contextLength` as its window and `--jinja`, waits while the model loads, and stops it when it exits. `"llamaCpp": {"args": […]}` adds arguments (`-ngl 99`). Ollama is unchanged. Experimental: tested against a stand-in server, not yet with a real `llama-server` and model; please report what you hit.
 - **Your own endpoint as a provider (#275).** Name a company gateway, LiteLLM, vLLM or any OpenAI-compatible server under `"providers"` in `~/.marv/config.json`, with its `baseUrl`, `wire` (`openai-chat` or `openai-responses`), `key` (`env:NAME`, `command:...` or the key itself), extra `headers` and `extraBody`, and optional `models`. It's listed in `/setup` after the built-in providers, `/model` lists its models (its `GET /models` when the config lists none), and `marv -p` uses it like any other. Read only from your own config, never a project's; its key goes only to its own URL. See the README's "Your own endpoint".
 
+### Changed
+
+- **Started in your home folder, Marv no longer asks before every command.** Sandboxed commands without network ran unasked everywhere but there (`approveSandboxed`), so a question about your desktop took 10 to 13 approvals of `ls` and `cat`. The sandbox shows the home read-only there, so such a command can only write to `/tmp`; they now run unasked in the home folder too. File changes there still ask each time, and yolo stays off there.
+- **In the home folder, the sandbox shows your desktop's and apps' settings** (`~/.config`, `~/.local/share`, `~/.local/state`, read-only; Linux), so questions about Hyprland, a theme or an app's config no longer need a command outside the sandbox. What's private in them stays hidden: browser profiles, password managers, chat apps, the logins of CLIs and agents, apps' web storage (`Local Storage`, `IndexedDB`), files named like secrets (`auth.json`, `*token*`, `*.pem`…), and every socket.
+- **`/model <name>` switches the model for this session only.** It used to save it as the default for every later Marv. `/model` without a name still opens the picker, which saves.
+
 ### Fixed
 
+- **Reading GitHub no longer asks once the conversation holds GitHub's text.** After the first `gh` result every later read (`gh pr list`, `gh pr checks`, `gh api` GETs) asked, titled "Change something on GitHub", and "don't ask again" didn't hold: about 40 prompts to list a repository's pull requests and their CI. A read only reaches GitHub's API, so it runs unasked again; writes (`gh pr merge`, comments) still ask every time.
+- **`marv -m <model>` works in the TUI.** It only reached `marv -p`; the TUI started with the saved model. It's for that run, never saved.
 - **A tool call with its optional fields sent empty works on every built-in tool.** On the ChatGPT plan (Responses API) models fill every field of a tool's schema, mostly with `""`, and some tools refused that: `read_file` with `"limit": ""`, `process` with `"name": ""`, `recall` with a page and `"query": ""`. An optional field sent as `""` is now read as not given. A test sends every action of every built-in tool padded this way (#265).
 
 ## [0.15.0] - 2026-11-01
@@ -426,7 +436,9 @@ The first public release, on npm as `@flologixai/marv`.
 - The SDK: `createSession()` from `@flologixai/marv/sdk` runs Marv from code, without the UI.
 - Evals: `bun run eval` runs real models on small tasks with hidden checks.
 
-[Unreleased]: https://github.com/Flologix/marv/compare/v0.14.1...HEAD
+[Unreleased]: https://github.com/Flologix/marv/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/Flologix/marv/compare/v0.15.0...v0.16.0
+[0.15.0]: https://github.com/Flologix/marv/compare/v0.14.1...v0.15.0
 [0.14.1]: https://github.com/Flologix/marv/compare/v0.14.0...v0.14.1
 [0.14.0]: https://github.com/Flologix/marv/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/Flologix/marv/compare/v0.12.0...v0.13.0

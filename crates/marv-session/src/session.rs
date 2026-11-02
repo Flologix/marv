@@ -426,8 +426,8 @@ pub struct SessionInit {
     pub web: bool,
     pub yolo: bool,
     /// `approveSandboxed` (config; default off here, on in the TUI): a sandboxed command without network runs without
-    /// asking in a person's turn or a wake, yolo or not. Never where `no_yolo` holds, and never in `marv -p`
-    /// (`one_shot`): its `--approve` flags stay the contract.
+    /// asking in a person's turn or a wake, yolo or not, the home folder included (its sandbox is read-only there).
+    /// Never in `marv -p` (`one_shot`): its `--approve` flags stay the contract.
     pub approve_sandboxed: bool,
     /// Yolo isn't allowed here, and why (the project is the home folder or above it).
     pub no_yolo: Option<String>,
@@ -561,7 +561,7 @@ pub struct Configure {
     pub thinking: Option<bool>,
     pub sandbox: Option<bool>,
     pub yolo: Option<bool>,
-    /// `approveSandboxed`: from the next turn (it is still never on where `no_yolo` holds, or for `marv -p`).
+    /// `approveSandboxed`: from the next turn (it is still never on for `marv -p`).
     pub approve_sandboxed: Option<bool>,
     pub trajectories: Option<bool>,
     pub diagnostics: Option<Diagnostics>,
@@ -1440,10 +1440,7 @@ impl MarvSession {
         crate::permissions::Permissions {
             yolo,
             // What's in effect: also off where the sandbox isn't working, as for the call itself (`auto_safe`).
-            approve_sandboxed: approve_sandboxed
-                && init.no_yolo.is_none()
-                && !init.one_shot
-                && marv_sandbox::Sandbox::from_env(sandbox).active(),
+            approve_sandboxed: approve_sandboxed && !init.one_shot && marv_sandbox::Sandbox::from_env(sandbox).active(),
             no_yolo: init.no_yolo.clone(),
             sandbox,
             host_commands: init.host_commands,
@@ -2057,7 +2054,9 @@ impl MarvSession {
         ctx.cancel = stop.clone();
         ctx.approver = approve.clone();
         ctx.yolo = yolo && !unattended;
-        ctx.approve_sandboxed = approve_sandboxed && init.no_yolo.is_none() && !init.one_shot;
+        // Also where yolo isn't allowed (the home folder or above it): the sandbox shows the project read-only there, so
+        // a command without network can write only to /tmp, and file changes still ask (`registry::home_file_write`).
+        ctx.approve_sandboxed = approve_sandboxed && !init.one_shot;
         // Who started the turn, as one value (`marv_tools::floor`): a radio turn or one handling radio requests, a
         // wake, `marv -p`, or the person.
         ctx.mode = if radio_turn || handles_requests {
@@ -7170,6 +7169,60 @@ mod turn_tests {
         let events = collect(go(&session, "write it")).await;
         assert!(events.iter().any(|e| matches!(e, SessionEvent::Loop(LoopEvent::Assistant { text }) if text == "Refused.")));
         assert!(!dirs.project.join("out.txt").exists());
+    }
+
+    /// Records whether each call's context runs sandboxed commands unasked.
+    struct SandboxedProbe(Arc<Mutex<Vec<bool>>>);
+    #[async_trait::async_trait]
+    impl marv_tools::Tool for SandboxedProbe {
+        type Input = serde_json::Value;
+        fn name(&self) -> &str {
+            "probe"
+        }
+        fn description(&self) -> &str {
+            "probe"
+        }
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn kind(&self) -> marv_core::ToolKind {
+            marv_core::ToolKind::Read
+        }
+        fn provenance(&self) -> marv_core::Provenance {
+            marv_core::Provenance::Project
+        }
+        fn label(&self, _input: &Self::Input) -> String {
+            "probe".into()
+        }
+        async fn run(
+            &self,
+            _input: &Self::Input,
+            ctx: &marv_tools::ToolContext,
+        ) -> Result<marv_tools::ToolOutput, marv_tools::ToolError> {
+            lock(&self.0).push(ctx.approve_sandboxed);
+            Ok(marv_tools::ToolOutput::ok("", ""))
+        }
+    }
+
+    /// The home folder (yolo refused there) still runs sandboxed commands without network unasked: the sandbox shows
+    /// the project read-only there, so they write only to /tmp. In a real session in `~`, a read-only `ls` asked
+    /// thirteen times for one question about the desktop. `marv -p` keeps its `--approve` contract.
+    #[tokio::test]
+    async fn approve_sandboxed_holds_in_the_home_folder_but_never_in_marv_p() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        for one_shot in [false, true] {
+            let dirs = Dirs::new();
+            let provider = Scripted::new(vec![use_tools(vec![call("p", "probe", serde_json::json!({}))]), say("Done.")]);
+            let session = scripted(&dirs, &provider, |i| {
+                i.tools = vec![Arc::new(SandboxedProbe(seen.clone()))];
+                i.no_yolo = Some("the home folder".into());
+                i.yolo = false;
+                i.approve_sandboxed = true;
+                i.one_shot = one_shot;
+            });
+            collect(go(&session, "go")).await;
+        }
+        assert_eq!(*lock(&seen), [true, false]);
     }
 
     // ---- the doors out of the sandbox (Marv #47, #52; tests/doors.test.ts, tests/github-tool.test.ts) ----

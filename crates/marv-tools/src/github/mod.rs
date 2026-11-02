@@ -400,8 +400,13 @@ impl Tool for Github {
     fn needs_approval(&self, input: &GithubInput) -> Option<bool> {
         Some(!classify(&input.args, &ClassifyContext::any()).is_read())
     }
-    fn uses_network(&self, _input: &GithubInput) -> bool {
-        true
+    /// A write or a sensitive read. A read (`allow::classify`: gh's own read commands and GET API paths, never a browser,
+    /// git, a file, an upload or another host than the project's) only sends its arguments to GitHub's API, which shows
+    /// nobody else who read what: in a tainted session it isn't a way out, so it isn't asked (docs/SECURITY.md). Its
+    /// output still taints. Every read in the conversation asked once it was tainted, and each prompt was
+    /// "Change something on GitHub", never remembered: about 40 prompts to list a repository's pull requests and their CI.
+    fn uses_network(&self, input: &GithubInput) -> bool {
+        !classify(&input.args, &ClassifyContext::any()).is_read()
     }
     fn door(&self, _input: &GithubInput, _ctx: &ToolContext) -> Option<Door> {
         Some(Door::Github)
@@ -418,6 +423,8 @@ impl Tool for Github {
         };
         let description = if key == "github:api sensitive" {
             "gh api sensitive reads".into()
+        } else if key == "github:" {
+            "gh reads".into()
         } else {
             format!("gh {}", &key["github:".len()..])
         };
@@ -440,7 +447,10 @@ impl Tool for Github {
                 });
             }
             Classified::Write { command, .. } => command,
-            _ => String::new(),
+            // Asked only where nothing is approved automatically (a turn the radio started, #124).
+            _ => {
+                return Ok(Preview { title: "Read from GitHub".into(), command, note, ..Default::default() });
+            }
         };
         let mut warnings = Vec::new();
         if NAMES_REPO.contains(&changed.as_str()) {

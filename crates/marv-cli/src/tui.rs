@@ -968,6 +968,8 @@ pub struct Startup {
     /// How a provider is made from the config (`create_provider`; tests: a scripted one).
     pub make_provider: MakeProvider,
     pub load_models: LoadModels,
+    /// `marv -m <model>`: the model for this run, never saved (the config's stays the default).
+    pub model: Option<String>,
     /// `/mcp add`'s lookup and `/mcp search` (live: [`marv_session::mcp_install::LiveDeps`]).
     pub mcp_deps: McpDeps,
     /// `/mcp login`: opens the authorization URL where a browser can open (tests: their own, so none ever opens).
@@ -1007,6 +1009,8 @@ pub struct Bridge {
     last_checks: Mutex<Option<ProjectCheckResult>>,
     make_provider: MakeProvider,
     load_models: LoadModels,
+    /// The model for this session only (`-m`, `/model <id>`), over the config's; `None`: the config's.
+    model: Mutex<Option<String>>,
     /// ~/.marv (or MARV_CONFIG_DIR): where config.json is, mcp.json is too.
     config_dir: PathBuf,
     mcp_deps: McpDeps,
@@ -1094,6 +1098,14 @@ impl Drop for Bridge {
     }
 }
 
+/// `config` with the session's model (`-m`, `/model <id>`) in place of the saved one, when there is one.
+fn with_model(mut config: Config, model: Option<&str>) -> Config {
+    if let Some(model) = model {
+        config.model = model.to_string();
+    }
+    config
+}
+
 fn factory(config: &Config, make: &MakeProvider, load: &LoadModels) -> ProviderChoice {
     ProviderChoice::Factory(Arc::new(ConfigFactory { config: config.provider_config(), make: make.clone(), load: load.clone() }))
 }
@@ -1102,7 +1114,7 @@ impl Bridge {
     /// Makes the session from what startup found; events go to `tx`.
     pub fn start(s: Startup, tx: UnboundedSender<UiEvent>) -> anyhow::Result<Arc<Self>> {
         let activity = Activity::new(tx.clone(), s.herdr);
-        let config = resolve_config(s.file.as_ref(), &s.env);
+        let config = with_model(resolve_config(s.file.as_ref(), &s.env), s.model.as_deref());
         let mut init = SessionInit::new(s.root.clone(), factory(&config, &s.make_provider, &s.load_models));
         init.cwd = Some(shorten_home(&s.root, &s.home));
         init.version = s.version.clone();
@@ -1198,6 +1210,7 @@ impl Bridge {
             last_checks: Mutex::default(),
             make_provider: s.make_provider,
             load_models: s.load_models,
+            model: Mutex::new(s.model.clone()),
             config_dir: s.config_dir,
             mcp_deps: s.mcp_deps,
             open_url: s.open_url,
@@ -1232,7 +1245,11 @@ impl Bridge {
     }
 
     pub fn config(&self) -> Config {
-        resolve_config(self.file().as_ref(), &self.env)
+        with_model(resolve_config(self.file().as_ref(), &self.env), self.session_model().as_deref())
+    }
+
+    fn session_model(&self) -> Option<String> {
+        self.model.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     fn cwd(&self) -> String {
@@ -1821,7 +1838,7 @@ impl Bridge {
             self.emit(system(format!("Could not save config: {e}"), true));
             return;
         }
-        let config = resolve_config(Some(&next), &self.env);
+        let config = with_model(resolve_config(Some(&next), &self.env), self.session_model().as_deref());
         *self.file.lock().unwrap_or_else(|e| e.into_inner()) = Some(next);
         let configured = self.session.configure(Configure {
             provider: Some(factory(&config, &self.make_provider, &self.load_models)),
@@ -1960,13 +1977,26 @@ impl Bridge {
                 let file = self.file();
                 self.emit(UiEvent::OpenSetup(setup_context(SetupStart::Model, file.as_ref(), &config, &self.env)));
             }
+            // For this session only: trying a model mustn't change the default every other Marv starts with (it
+            // used to save it). /model without an id opens the picker, which saves.
             CommandAction::Model { id: Some(id) } => {
-                let next = self.with_file(|f| f.model = Some(id.clone()));
-                let label = provider_label(&provider_id(
-                    next.provider.unwrap_or(ProviderKind::OpenRouter),
-                    next.custom_provider.as_deref(),
+                *self.model.lock().unwrap_or_else(|e| e.into_inner()) = Some(id.clone());
+                let config = self.config();
+                if let Err(e) = self.session.configure(Configure {
+                    provider: Some(factory(&config, &self.make_provider, &self.load_models)),
+                    ..Default::default()
+                }) {
+                    return self.emit(system(e.to_string(), true));
+                }
+                let file = self.file();
+                let label =
+                    provider_label(&provider_id(config.provider, file.as_ref().and_then(|f| f.custom_provider.as_deref())));
+                let saved = resolve_config(file.as_ref(), &self.env).model;
+                self.emit(UiEvent::StatusInfo(self.status_info()));
+                self.emit(system(
+                    format!("{label} · {id}, for this session. Your default stays {saved} (/model without a name picks and saves one)."),
+                    false,
                 ));
-                self.save_config(next, format!("Saved to {} · {label} · {id}", shorten_home(&self.store.path, &self.home)));
             }
             CommandAction::Thinking { on } => {
                 let mandatory = matches!(
@@ -2979,6 +3009,8 @@ impl SessionPort for Port {
     fn complete_setup(&self, answer: SetupAnswer) {
         let b = &self.0;
         let next = setup_file(b.file().as_ref(), &answer);
+        // The picker saves the default: a session's own model (`-m`, `/model <id>`) gives way to it.
+        *b.model.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let label = provider_label(&answer.provider);
         b.save_config(next, format!("Saved to {} · {label} · {}", shorten_home(&b.store.path, &b.home), answer.model));
     }
@@ -3101,12 +3133,15 @@ pub fn resolve_writable(config: &[String], home: &Path, root: &Path, config_dir:
 pub async fn run(
     resume: Option<bool>,
     approve: Vec<String>,
+    model: Option<String>,
     local_model: Option<String>,
     quit: crate::signals::Quit,
 ) -> anyhow::Result<i32> {
     // The real environment only (docs/SECURITY.md): never a project's .env.
     let mut env: Env = std::env::vars().collect();
     // #278: `--local-model`: llama.cpp with that file for this run (the config file isn't changed).
+    // It picks the model too, so `-m` gives way to it.
+    let model = if local_model.is_some() { None } else { model };
     if let Some(model) = local_model {
         env.insert("MARV_LOCAL_MODEL".into(), model);
     }
@@ -3141,7 +3176,7 @@ pub async fn run(
             return Ok(1);
         }
     };
-    let config = resolve_config(file.as_ref(), &env);
+    let config = with_model(resolve_config(file.as_ref(), &env), model.as_deref());
     // Pre-approved scopes (#98) and the writable folders, resolved once (refused ones are problems, not mounts).
     let (pre_approved, mut approval_problems) = merge_pre_approved(config.approve.clone(), &approve);
     let (writable, writable_problems) = resolve_writable(&config.writable, &home, &root, &config_dir);
@@ -3229,6 +3264,7 @@ pub async fn run(
         load_models: Arc::new(|kind, base_url| {
             Box::pin(async move { marv_provider::models::list_models(kind, &base_url, None).await })
         }),
+        model,
         mcp_deps,
         open_url,
     };
@@ -3500,6 +3536,7 @@ mod tests {
                     Ok(vec![marv_provider::ModelInfo { id: "qwen3.5:9b".into(), local: true, ..Default::default() }])
                 })
             }),
+            model: None,
             mcp_deps: Arc::new(|_| panic!("no network in tests")),
             open_url: Arc::new(|_| panic!("no browser in tests")),
         }
@@ -4477,6 +4514,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_model_flag_is_for_this_run_and_never_saved() {
+        let dirs = Dirs::new();
+        let (tx, _rx) = unbounded_channel();
+        let saved = asks().model;
+        let bridge =
+            Bridge::start(Startup { model: Some("flag:3b".into()), ..startup(&dirs, Some(asks()), vec![], None) }, tx).unwrap();
+        assert_eq!(bridge.config().model, "flag:3b");
+        assert_eq!(bridge.file().and_then(|f| f.model), saved);
+        // The picker saves a default, and the run's model gives way to it.
+        Port(bridge.clone()).complete_setup(SetupAnswer {
+            provider: ProviderId::Ollama,
+            model: "picked:1b".into(),
+            api_key: None,
+        });
+        assert_eq!(bridge.config().model, "picked:1b");
+        assert_eq!(ConfigStore::new(&dirs.config).load().unwrap().unwrap().model.as_deref(), Some("picked:1b"));
+    }
+
+    #[tokio::test]
     async fn commands_change_the_config_and_say_so() {
         let dirs = Dirs::new();
         let (tx, mut rx) = unbounded_channel();
@@ -4489,10 +4545,14 @@ mod tests {
         assert!(texts(&seen)[0].starts_with("Yolo on: file edits run without asking"));
         assert_eq!(ConfigStore::new(&dirs.config).load().unwrap().unwrap().yolo, Some(true));
 
+        // /model <id>: this session only, the saved default untouched.
+        let saved = ConfigStore::new(&dirs.config).load().unwrap().unwrap().model;
         port.run_command("/model other:7b".into());
         let seen = until(&mut rx, |e| matches!(e, UiEvent::Message(_))).await;
-        assert!(texts(&seen)[0].ends_with("· Ollama · other:7b"));
+        assert!(texts(&seen)[0].starts_with("Ollama · other:7b, for this session."), "{:?}", texts(&seen));
+        assert!(seen.iter().any(|e| matches!(e, UiEvent::StatusInfo(_))));
         assert_eq!(bridge.config().model, "other:7b");
+        assert_eq!(ConfigStore::new(&dirs.config).load().unwrap().unwrap().model, saved);
 
         port.run_command("/model".into());
         let UiEvent::OpenSetup(ctx) = next(&mut rx).await else { panic!("not setup") };

@@ -36,7 +36,7 @@ use std::sync::OnceLock;
 
 use crate::SandboxError;
 use crate::backend::{SandboxBackend, SandboxCommand};
-use crate::home::{TOOLCHAINS, contains};
+use crate::home::{HOME_SHOWN, TOOLCHAINS, contains, secret_dir_name, secret_name};
 use crate::protected::SKIPPED_DIRS;
 
 pub use crate::fs::{EntryKind, FileKind, FsProbe, RealFs};
@@ -246,12 +246,15 @@ fn mask(path: &Path, real_home: &Path, fs: &dyn FsProbe) -> Option<(Vec<OsString
 ///    `.cargo`, `.gitconfig`…): Marv's config, credentials (`.ssh`, `.gnupg`, cloud CLI folders), agent state
 ///    (`.claude`), and `.config`, `.local`, `.cache` where tools keep their sockets (Herdr's `.config/herdr`). This is
 ///    what the stand-in home hides in any other project. If the home can't be listed, the command doesn't run;
-/// 2. the toolchain folders inside those (`.local/bin`, `.config/git`, `.marv/skills`…), shown again read-only;
+/// 2. the toolchain folders inside those (`.local/bin`, `.config/git`, `.marv/skills`…) and the desktop's settings
+///    ([`HOME_SHOWN`]: `.config`, `.local/share`, `.local/state`), shown again read-only;
 /// 3. [`HOME_MASKS`], wherever step 2 (or a future toolchain) would show one again;
 /// 4. every Unix socket and FIFO in the visible part of the home, found by a breadth-first scan of at most
 ///    [`SOCKET_SCAN_LIMIT`] entries, [`SOCKET_SCAN_DEPTH`] levels deep, not following symlinks and skipping
 ///    `node_modules`, `target` and `.git/objects`: `/dev/null` on top of each. A read-only mount doesn't stop a
 ///    `connect()` on a socket or a write into a FIFO, and a service listening there may do anything its client asks.
+///    The settings shown again are scanned too (the toolchains aren't): a file in them named like a secret
+///    ([`secret_name`]) is `/dev/null` as well, and an app's web storage folder ([`secret_dir_name`]) an empty tmpfs.
 ///
 /// The credential masks ([`CREDENTIALS`]) still come after all of these.
 fn home_masks(
@@ -281,17 +284,28 @@ fn home_masks(
             masked.push(path);
         }
     }
-    // 2. Toolchains under them, shown again (bwrap makes their mount points in the tmpfs).
-    let shown_again: Vec<PathBuf> = TOOLCHAINS
-        .iter()
-        .map(|dir| real_home.join(dir))
-        .filter(|full| fs.exists(full) && masked.iter().any(|m| full.starts_with(m) && full != m))
-        .collect();
+    // 2. Toolchains and the desktop's settings (`HOME_SHOWN`) under them, shown again (bwrap makes their mount points
+    // in the tmpfs); one inside another shown again (`.config/git` in `.config`) needs no mount of its own.
+    let mut shown_again: Vec<PathBuf> = Vec::new();
+    for full in HOME_SHOWN.iter().chain(TOOLCHAINS).map(|dir| real_home.join(dir)) {
+        if fs.exists(&full)
+            && masked.iter().any(|m| full.starts_with(m) && (full != *m || HOME_SHOWN.iter().any(|h| real_home.join(h) == full)))
+            && !shown_again.iter().any(|s| full.starts_with(s))
+        {
+            shown_again.push(full);
+        }
+    }
     for full in &shown_again {
         args.extend(["--ro-bind".into(), full.clone().into_os_string(), full.clone().into_os_string()]);
     }
+    // The deepest rule over a path decides (a folder masked and shown again is shown: that mount comes later): under
+    // `.config` (shown again) but in `.config/chromium` (masked) is hidden.
     let visible = |path: &Path, masked: &[PathBuf]| {
-        !masked.iter().any(|m| path.starts_with(m)) || shown_again.iter().any(|t| path.starts_with(t))
+        let depth = |rules: &[PathBuf]| rules.iter().filter(|r| path.starts_with(r)).map(|r| r.components().count()).max();
+        match (depth(masked), depth(&shown_again)) {
+            (None, _) => true,
+            (Some(hidden), shown) => shown.is_some_and(|shown| shown >= hidden),
+        }
     };
     // 3. The named ones, wherever a toolchain shows them again.
     for path in opts.home_masks(fs) {
@@ -302,20 +316,38 @@ fn home_masks(
             masked.push(path);
         }
     }
-    // 4. Sockets and FIFOs in what's still visible.
+    // 4. Sockets and FIFOs in what's still visible, and secret-named files in the settings shown again.
     let mut queue: std::collections::VecDeque<(PathBuf, usize)> = std::collections::VecDeque::new();
     let mut seen = 0usize;
     let mut channels: Vec<PathBuf> = Vec::new();
+    let mut stores: Vec<PathBuf> = Vec::new();
+    let settings: Vec<PathBuf> = HOME_SHOWN
+        .iter()
+        .map(|dir| real_home.join(dir))
+        .filter(|full| shown_again.contains(full) && fs.entry_kind(full) == Some(EntryKind::Dir))
+        .collect();
+    // Toolchains are shown as in any project's sandbox, unscanned (mise's installs alone are tens of thousands of files).
+    let toolchains: Vec<PathBuf> = TOOLCHAINS.iter().map(|dir| real_home.join(dir)).collect();
     let mut visit =
         |dir: &Path, depth: usize, list: &[(OsString, EntryKind)], queue: &mut std::collections::VecDeque<(PathBuf, usize)>| {
             for (name, kind) in list {
                 let path = dir.join(name);
                 // The toolchains left whole at the top (`.cargo`, `.rustup`) are shown as in any project's sandbox, unscanned.
                 let skipped = SKIPPED_DIRS.iter().any(|s| *s != ".git" && name == *s)
+                    || toolchains.contains(&path)
                     || (name == "objects" && dir.file_name().is_some_and(|n| n == ".git"))
                     || (depth == 1 && name.to_string_lossy().starts_with('.'));
+                // Inside the desktop's settings shown again, a file named like a secret is hidden too.
+                let secret = *kind == EntryKind::File
+                    && settings.iter().any(|s| path.starts_with(s))
+                    && secret_name(&name.to_string_lossy());
+                let in_settings = settings.iter().any(|s| path.starts_with(s));
                 match kind {
                     EntryKind::Channel if visible(&path, &masked) => channels.push(path),
+                    EntryKind::File if secret && visible(&path, &masked) => channels.push(path),
+                    EntryKind::Dir if in_settings && secret_dir_name(&name.to_string_lossy()) && visible(&path, &masked) => {
+                        stores.push(path)
+                    }
                     EntryKind::Dir if depth < SOCKET_SCAN_DEPTH && !skipped && visible(&path, &masked) => {
                         queue.push_back((path, depth + 1))
                     }
@@ -324,6 +356,10 @@ fn home_masks(
             }
         };
     visit(real_home, 1, &entries, &mut queue);
+    // The top level's hidden entries aren't scanned, but the settings shown again in them are.
+    for dir in &settings {
+        queue.push_back((dir.clone(), dir.strip_prefix(real_home).map_or(1, |rel| rel.components().count())));
+    }
     while let Some((dir, depth)) = queue.pop_front() {
         if opts.hidden.iter().any(|h| dir.starts_with(h)) {
             continue;
@@ -334,6 +370,9 @@ fn home_masks(
         if seen >= SOCKET_SCAN_LIMIT {
             break;
         }
+    }
+    for path in stores {
+        args.extend(["--tmpfs".into(), path.into_os_string()]);
     }
     for path in channels {
         args.extend(["--ro-bind".into(), "/dev/null".into(), path.into_os_string()]);
@@ -882,16 +921,66 @@ mod tests {
         ] {
             assert!(last(&args, mask) > project, "{mask} must come after the home: {args}");
         }
-        // Toolchains: left whole, or shown again after their hidden parent.
+        // Toolchains: left whole, or shown again after their hidden parent; the desktop's settings too, with the
+        // toolchains inside them (`.local/share/mise`, `.config/git`) shown by those.
         assert!(!args.contains("--tmpfs /home/me/.cargo") && !args.contains("/dev/null /home/me/.gitconfig"), "{args}");
         for (parent, toolchain) in
-            [(".local", ".local/share/mise"), (".local", ".local/bin"), (".config", ".config/git"), (".marv", ".marv/skills")]
+            [(".local", ".local/share"), (".local", ".local/bin"), (".config", ".config"), (".marv", ".marv/skills")]
         {
             let shown = last(&args, &format!("--ro-bind /home/me/{toolchain} /home/me/{toolchain}"));
             assert!(shown > last(&args, &format!("--tmpfs /home/me/{parent} ")), "{toolchain}: {args}");
         }
         // Not node_modules (skipped), and nothing protected on top of a read-only project.
         assert!(!args.contains("x.sock") && !args.contains(".envrc") && !args.contains(".git "), "{args}");
+    }
+
+    #[test]
+    fn a_home_folder_project_shows_the_desktops_settings_without_their_secrets() {
+        let mut fs = a_home();
+        fs.dirs.insert(
+            "/home/me/.config".into(),
+            vec![
+                ("herdr".into(), Dir),
+                ("git".into(), Dir),
+                ("hypr".into(), Dir),
+                ("chromium".into(), Dir),
+                ("gh".into(), Dir),
+                ("Code".into(), Dir),
+            ],
+        );
+        fs.dirs.insert("/home/me/.config/hypr".into(), vec![("looknfeel.lua".into(), F), ("ipc.sock".into(), Channel)]);
+        fs.dirs.insert("/home/me/.config/chromium".into(), vec![("Default".into(), Dir), ("SingletonSocket".into(), Channel)]);
+        fs.dirs.insert("/home/me/.config/Code".into(), vec![("Local Storage".into(), Dir), ("settings.json".into(), F)]);
+        fs.dirs.insert("/home/me/.local/share".into(), vec![("mise".into(), Dir), ("keyrings".into(), Dir), ("app".into(), Dir)]);
+        fs.dirs.insert(
+            "/home/me/.local/share/app".into(),
+            vec![("settings.json".into(), F), ("auth.json".into(), F), ("api_token".into(), F), ("id.pem".into(), F)],
+        );
+        fs.dirs.insert("/home/me/.local/share/mise".into(), vec![("tool.sock".into(), Channel)]);
+        let args = joined(&at_home(), &fs);
+        let shown = last(&args, "--ro-bind /home/me/.config /home/me/.config");
+        assert!(shown > last(&args, "--tmpfs /home/me/.config "), "{args}");
+        assert!(last(&args, "--ro-bind /home/me/.local/share /home/me/.local/share") > last(&args, "--tmpfs /home/me/.local "));
+        // What's private in them is hidden again, after they're shown.
+        for mask in [
+            "--tmpfs /home/me/.config/chromium",
+            "--tmpfs /home/me/.config/gh",
+            "--tmpfs /home/me/.config/herdr",
+            "--tmpfs /home/me/.local/share/keyrings",
+            "--ro-bind /dev/null /home/me/.config/hypr/ipc.sock",
+            "--ro-bind /dev/null /home/me/.local/share/app/auth.json",
+            "--ro-bind /dev/null /home/me/.local/share/app/api_token",
+            "--ro-bind /dev/null /home/me/.local/share/app/id.pem",
+            "--tmpfs /home/me/.config/Code/Local Storage",
+        ] {
+            assert!(last(&args, mask) > shown, "{mask} must come after the settings: {args}");
+        }
+        // Ordinary settings stay readable; inside a masked folder nothing more is mounted; toolchains aren't scanned.
+        assert!(!args.contains("looknfeel.lua") && !args.contains("settings.json"), "{args}");
+        assert!(!args.contains("SingletonSocket") && !args.contains("tool.sock"), "{args}");
+        // Never in any other project: the stand-in home shows only the toolchains.
+        let args = joined(&SandboxOptions { root: "/home/me/Projects/app".into(), ..at_home() }, &fs);
+        assert!(!args.contains("--ro-bind /home/me/.config /home/me/.config"), "{args}");
     }
 
     #[test]

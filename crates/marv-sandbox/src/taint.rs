@@ -9,6 +9,8 @@
 //! What asks once tainted ([`TaintState::must_ask`]): `ToolKind::Egress` calls and any call that `uses_network`:
 //! network bash, every MCP call (including `readOnlyHint` tools), web requests to a new URL prefix, mesh calls on
 //! unapproved wires; and writes to protected paths (those ask regardless of taint).
+//! A GitHub door read doesn't `use_network` (it only reaches GitHub's API, which shows nobody who read what): it
+//! runs unasked, and its output taints.
 //!
 //! A subagent starts tainted if its parent is (its prompt was written by a tainted model), but inherits no network,
 //! web or mesh approvals (`for_subagent`).

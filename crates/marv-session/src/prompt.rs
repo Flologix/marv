@@ -95,6 +95,15 @@ const SCRATCH: &str = if cfg!(target_os = "macos") { "$TMPDIR" } else { "/tmp" }
 /// door: `host_commands`, someone approving each command at a terminal; never in `marv -p`, a subagent or an SDK
 /// session without it), and this build's sandbox. Not yolo, taint or what's been approved, which change mid-session:
 /// the network line says "may ask". Empty without bash: then nothing runs in a sandbox to begin with.
+/// In a home-folder project, what sandboxed commands can't see. On Linux the desktop's settings are shown read-only
+/// (`marv_sandbox::home::HOME_SHOWN`): asked about the window manager, a model left the sandbox just to read
+/// `~/.config/hypr`. Seatbelt (macOS) still hides every dot-entry.
+const HOME_HIDDEN: &str = if cfg!(target_os = "macos") {
+    "- Hidden from sandboxed commands: the home folder's dot-entries (~/.marv, ~/.ssh, ~/.config, ~/.local and the like; toolchain folders and git config aside) and any socket. A hidden path reads as empty, missing or refused, which says nothing about the real one."
+} else {
+    "- Readable by sandboxed commands: the home folder, and the desktop's and apps' settings in ~/.config, ~/.local/share and ~/.local/state. Hidden: the home's other dot-entries (~/.marv, ~/.ssh, ~/.cache and the like; toolchain folders and git config aside), browser, password-manager and chat-app folders, files named like secrets, and any socket. A hidden path reads as empty, missing or refused, which says nothing about the real one."
+};
+
 pub fn access_facts(input: &PromptInput) -> String {
     if !input.tools.iter().any(|t| t == "bash") {
         return String::new();
@@ -105,7 +114,7 @@ pub fn access_facts(input: &PromptInput) -> String {
             format!(
                 "- Project: the user's home folder (or a folder that holds it). Sandboxed commands can read it but not change it; they can write only to {SCRATCH}{extra}. Change files with edit_file or write_file (the user is asked)."
             ),
-            "- Hidden from sandboxed commands: the home folder's dot-entries (~/.marv, ~/.ssh, ~/.config, ~/.local and the like; toolchain folders and git config aside) and any socket. A hidden path reads as empty, missing or refused, which says nothing about the real one.",
+            HOME_HIDDEN,
         )
     } else {
         (
@@ -852,7 +861,8 @@ mod tests {
         let facts = |home_project: bool, host: bool| {
             access_facts(&PromptInput { home_project, doors: PromptDoors { host, ..Default::default() }, ..input() })
         };
-        let hidden_home = "- Hidden from sandboxed commands: the home folder's dot-entries (~/.marv, ~/.ssh, ~/.config, ~/.local and the like; toolchain folders and git config aside) and any socket. A hidden path reads as empty, missing or refused, which says nothing about the real one.";
+        let hidden_home = HOME_HIDDEN;
+        assert!(cfg!(target_os = "macos") || hidden_home.contains("~/.config, ~/.local/share and ~/.local/state"));
         let hidden_project = "- Hidden from sandboxed commands: the home folder outside the project, ~/.marv included (toolchain folders, git config and ~/.marv/skills aside, read-only). A hidden path reads as empty, missing or refused, which says nothing about the real one.";
         let open = "- Outside the sandbox: bash with sandbox: false runs one command on the user's machine, where hidden paths can be read; the user is asked to approve each one. So a hidden path is within reach: don't tell the user you can't read it.";
         let closed = "- Outside the sandbox: not in this session (nobody is here to approve each command), so hidden paths can't be read: say they're hidden from you, not missing, and give the user the command to run themselves.";

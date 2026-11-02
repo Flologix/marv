@@ -302,6 +302,45 @@ fn in_the_home_folder_credentials_and_marvs_config_are_hidden() {
     }
 }
 
+/// **In the home folder, the desktop's settings are readable and what's private in them isn't** (Linux): `~/.config`,
+/// `~/.local/share` and `~/.local/state` are shown again read-only (`HOME_SHOWN`), but a browser profile, a CLI's
+/// login folder (`HOME_MASKS`), a file named like a secret (`secret_name`) and a socket in them are hidden, and
+/// nothing there can be changed.
+///
+/// Proven: dropped step 3 of `home_masks` (the named masks) → failed (the cookie and gh's token showed); dropped the
+/// secret-name masks from step 4 → failed (`auth.json` showed).
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn in_the_home_folder_settings_show_and_their_secrets_dont() {
+    require_sandbox!();
+    let (home, _listeners) = home_project_fixture("home-settings");
+    home.write(".config/hypr/looknfeel.lua", "gaps_in = 5");
+    home.write(".local/state/omarchy/theme.name", "tokyo-night");
+    home.write(".local/share/app/settings.json", "{\"font\":12}");
+    home.write(".local/share/app/auth.json", "{\"token\":\"app-secret\"}");
+    home.write(".config/chromium/Default/Cookies", "chromium-cookie");
+    home.write(".config/gh/hosts.yml", "oauth_token: gh-secret");
+    home.write(".config/tool/api_token", "tool-secret");
+    let ran = run_sandboxed(
+        &sandbox_with_home(home.path()),
+        home.path(),
+        &CommandMounts::default(),
+        &format!(
+            "{CONNECT}; cat .config/hypr/looknfeel.lua .local/state/omarchy/theme.name .local/share/app/settings.json; \
+             cat .local/share/app/auth.json .config/chromium/Default/Cookies .config/gh/hosts.yml .config/tool/api_token 2>/dev/null; \
+             connect .config/herdr/herdr.sock; echo x > .config/hypr/planted.lua; echo"
+        ),
+        &[],
+    );
+    for shown in ["gaps_in = 5", "tokyo-night", "\"font\":12"] {
+        assert!(ran.output.contains(shown), "{shown} should show: {}", ran.output);
+    }
+    for secret in ["app-secret", "chromium-cookie", "gh-secret", "tool-secret", "CONNECTED"] {
+        assert!(!ran.output.contains(secret), "{secret}: {}", ran.output);
+    }
+    assert!(!home.path().join(".config/hypr/planted.lua").exists(), "{}", ran.output);
+}
+
 /// **In the home folder, nothing in the home is writable**: not Marv's config (its hooks run outside the sandbox),
 /// not a shell rc file, not a new file anywhere in the home. And the bash tool says why (the `Marv:` note).
 ///

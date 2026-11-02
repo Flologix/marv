@@ -146,7 +146,7 @@ async fn run_mode(cli: Cli, mode: Mode, quit: signals::Quit) -> i32 {
             eprintln!("marv: --dangerously-run-unsandboxed works only with -p (marv -p \"<prompt>\").");
             1
         }
-        Mode::Interactive { resume, approve } => match tui::run(resume, approve, cli.local_model, quit).await {
+        Mode::Interactive { resume, approve } => match tui::run(resume, approve, cli.model, cli.local_model, quit).await {
             Ok(code) => code,
             Err(e) => {
                 // Not eprintln!, which panics when stderr is a terminal that's gone (#196: it closed).
