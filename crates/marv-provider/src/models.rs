@@ -132,7 +132,11 @@ pub fn table_for(provider: ProviderKind) -> Option<Vec<ModelInfo>> {
         ProviderKind::Kimi => Some(table_models(KIMI_MODELS, None)),
         ProviderKind::DeepSeek => Some(table_models(DEEPSEEK_MODELS, None)),
         ProviderKind::Qwen => Some(table_models(QWEN_CODING_MODELS, None)),
-        ProviderKind::OpenRouter | ProviderKind::Ollama | ProviderKind::ChatGpt | ProviderKind::Custom => None,
+        ProviderKind::OpenRouter
+        | ProviderKind::Ollama
+        | ProviderKind::ChatGpt
+        | ProviderKind::Custom
+        | ProviderKind::LlamaCpp => None,
     }
 }
 
@@ -284,6 +288,8 @@ pub async fn list_models_with(
         }
         // #275: its list needs the endpoint's key and headers: `endpoint::list_models`.
         ProviderKind::Custom => Err("A custom provider's models are listed with its endpoint (endpoint::list_models).".into()),
+        // #278: the models are GGUF files on this machine (`marv-session`'s `local_model::gguf_files`).
+        ProviderKind::LlamaCpp => Err("llama.cpp's models are GGUF files: give one's path.".into()),
     }
 }
 

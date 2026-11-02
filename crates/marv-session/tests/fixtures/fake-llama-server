@@ -1,0 +1,37 @@
+#!/usr/bin/env python3
+# A stand-in for llama.cpp's llama-server (#278 tests): records its arguments next to the model file, answers
+# /health with 503 ("loading") for the first few calls and then 200, and streams one reply to an authorized
+# /v1/chat/completions. --api-key is required, as Marv always passes one.
+import json, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+args = sys.argv[1:]
+def arg(name):
+    return args[args.index(name) + 1]
+model = arg("-m")
+with open(model + ".args", "w") as f:
+    json.dump(args, f)
+key = arg("--api-key")
+health_calls = [0]
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+    def do_GET(self):
+        if self.path == "/health":
+            health_calls[0] += 1
+            code = 503 if health_calls[0] < 3 else 200
+            self.send_response(code); self.end_headers(); self.wfile.write(b"{}")
+        else:
+            self.send_response(404); self.end_headers()
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("content-length", 0)))
+        if self.headers.get("authorization") != "Bearer " + key:
+            self.send_response(401); self.end_headers(); self.wfile.write(b'{"error":{"message":"Invalid API Key"}}'); return
+        with open(model + ".request", "wb") as f:
+            f.write(body)
+        self.send_response(200); self.send_header("content-type", "text/event-stream"); self.end_headers()
+        chunk = {"choices": [{"delta": {"content": "hello from llama"}, "finish_reason": "stop"}]}
+        self.wfile.write(("data: " + json.dumps(chunk) + "\n\ndata: [DONE]\n\n").encode())
+
+HTTPServer((arg("--host"), int(arg("--port"))), Handler).serve_forever()

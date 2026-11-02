@@ -97,6 +97,10 @@ pub enum ProviderKind {
     Qwen,
     /// #275: an endpoint named in the user's config ([`endpoint::Endpoint`], in [`ProviderConfig::endpoint`]).
     Custom,
+    /// #278: a GGUF model on this machine, through a `llama-server` Marv starts and stops (`marv-session`'s
+    /// `local_model`), spoken to as an endpoint ([`ProviderConfig::endpoint`]).
+    #[serde(rename = "llamacpp")]
+    LlamaCpp,
 }
 
 impl ProviderKind {
@@ -112,6 +116,7 @@ impl ProviderKind {
             Self::Qwen => "qwen",
             // The endpoint's own name is what's recorded ([`factory::ConfigFactory::id`]); this is the kind.
             Self::Custom => "custom",
+            Self::LlamaCpp => "llamacpp",
         }
     }
 
@@ -126,6 +131,7 @@ impl ProviderKind {
             Self::DeepSeek => "DeepSeek",
             Self::Qwen => "Qwen",
             Self::Custom => "The custom provider",
+            Self::LlamaCpp => "llama.cpp",
         }
     }
 }
@@ -274,11 +280,12 @@ pub fn chatgpt_options(config: &ProviderConfig, hints: ErrorHints) -> Result<res
 fn custom_provider(
     endpoint: &endpoint::Endpoint,
     model: &str,
+    shown: &str,
     info: Option<&ModelInfo>,
     hints: ErrorHints,
 ) -> Arc<dyn Provider> {
-    let name = format!("{} · {model}", endpoint.name);
-    let context_length = info.and_then(|m| m.context);
+    let name = format!("{} · {shown}", endpoint.name);
+    let context_length = endpoint.context_length.or(info.and_then(|m| m.context));
     match endpoint.wire {
         endpoint::Wire::OpenAiChat => Arc::new(openai_compat::OpenAiCompatProvider::new(openai_compat::OpenAiCompatOptions {
             name,
@@ -426,10 +433,23 @@ pub fn create_provider(config: &ProviderConfig, model: Option<&ModelInfo>, hints
         // #275: an endpoint from the user's config, through the adapter for its wire, with its key, headers and extra
         // body fields. Nothing about reasoning is sent unless the config's extra body says so: Marv can't know what
         // the endpoint's models take.
-        ProviderKind::Custom => match config.endpoint.as_deref() {
-            Some(endpoint) => match &endpoint.key_problem {
+        ProviderKind::Custom | ProviderKind::LlamaCpp => match config.endpoint.as_deref() {
+            Some(endpoint) => match &endpoint.problem {
                 Some(why) => Arc::new(FailingProvider { name: format!("{} · {}", endpoint.name, config.model), message: why.clone() }),
-                None => custom_provider(endpoint, &config.model, model, hints),
+                None => {
+                    // #278: a local model is a file's path; the status bar shows its name.
+                    let shown = match config.provider {
+                        ProviderKind::LlamaCpp => {
+                            std::path::Path::new(&config.model).file_stem().and_then(|s| s.to_str()).unwrap_or(&config.model)
+                        }
+                        _ => &config.model,
+                    };
+                    let provider = custom_provider(endpoint, &config.model, shown, model, hints);
+                    match &endpoint.ready {
+                        Some(ready) => Arc::new(endpoint::ReadyFirst { ready: ready.clone(), inner: provider }),
+                        None => provider,
+                    }
+                }
             },
             None => Arc::new(FailingProvider {
                 name: format!("custom · {}", config.model),

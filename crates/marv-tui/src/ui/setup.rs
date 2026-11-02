@@ -110,6 +110,7 @@ fn provider_hint(id: &ProviderId) -> &'static str {
         ProviderId::Kimi => "Kimi K3 and K2.8 on the Kimi Code membership you pay for",
         ProviderId::DeepSeek => "DeepSeek V4 models with a DeepSeek API key",
         ProviderId::Qwen => "Qwen models on the Alibaba Cloud Coding Plan you pay for",
+        ProviderId::LlamaCpp => "a GGUF model on this machine with llama.cpp, free",
         ProviderId::Custom(_) => "your own endpoint, from ~/.marv/config.json",
     }
 }
@@ -507,6 +508,7 @@ mod tests {
             ProviderId::Kimi => vec![m("kimi-for-coding", true, None, false)],
             ProviderId::DeepSeek => vec![m("deepseek-flash", true, None, false)],
             ProviderId::Qwen => vec![m("qwen3.7-plus", true, None, false)],
+            ProviderId::LlamaCpp => vec![m("/models/qwen3.5-9b-q4_k_m.gguf", true, None, true)],
             ProviderId::Custom(_) => vec![m("acme-large", true, None, false)],
         }
     }

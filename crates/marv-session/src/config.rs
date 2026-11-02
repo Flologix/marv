@@ -117,6 +117,10 @@ pub fn preset(kind: ProviderKind) -> Preset {
             key_url: Some("modelstudio.console.alibabacloud.com"),
             default_model: marv_provider::models::QWEN_CODING_MODELS[0].0,
         },
+        // #278: a GGUF file on this machine, through a llama-server Marv starts; the model is the file's path.
+        ProviderKind::LlamaCpp => {
+            Preset { label: "llama.cpp (local)", base_url: "", key_env: None, key_url: None, default_model: "" }
+        }
         // #275: everything comes from the config's entry (`providers`); the model is its first listed, or picked.
         ProviderKind::Custom => {
             Preset { label: "Custom provider", base_url: "", key_env: None, key_url: None, default_model: "" }
@@ -139,6 +143,8 @@ pub struct FileConfig {
     pub custom_provider: Option<String>,
     /// #275: the user's own endpoints (`"providers"`), by name ([`crate::providers`]).
     pub providers: Option<BTreeMap<String, crate::providers::CustomProvider>>,
+    /// #278: `"llamaCpp"`, where `llama-server` is and what's added to its arguments ([`crate::local_model`]).
+    pub llama_cpp: Option<crate::local_model::LlamaCppSetting>,
     pub model: Option<String>,
     /// The OpenRouter key.
     pub api_key: Option<String>,
@@ -417,7 +423,7 @@ impl FileConfig {
             ProviderKind::DeepSeek => self.deepseek_api_key.as_deref(),
             ProviderKind::Qwen => self.qwen_api_key.as_deref(),
             // #275: a custom provider's key is in its own entry.
-            ProviderKind::Ollama | ProviderKind::ChatGpt | ProviderKind::Custom => None,
+            ProviderKind::Ollama | ProviderKind::ChatGpt | ProviderKind::Custom | ProviderKind::LlamaCpp => None,
         }
     }
 
@@ -429,7 +435,7 @@ impl FileConfig {
             ProviderKind::Kimi => self.kimi_api_key = Some(key),
             ProviderKind::DeepSeek => self.deepseek_api_key = Some(key),
             ProviderKind::Qwen => self.qwen_api_key = Some(key),
-            ProviderKind::Ollama | ProviderKind::ChatGpt | ProviderKind::Custom => {}
+            ProviderKind::Ollama | ProviderKind::ChatGpt | ProviderKind::Custom | ProviderKind::LlamaCpp => {}
         }
     }
 
@@ -480,6 +486,10 @@ impl FileConfig {
             None | Some(Value::Null) => None,
             Some(v) => crate::providers::parse(v).map_err(|e| problems.extend(e)).ok(),
         };
+        let llama_cpp = match map.get("llamaCpp") {
+            None | Some(Value::Null) => None,
+            Some(v) => crate::local_model::LlamaCppSetting::from_value(v).map_err(|e| problems.extend(e)).ok(),
+        };
         let mut custom_provider = None;
         let provider = match map.get("provider").and_then(Value::as_str) {
             Some("openrouter") => Some(ProviderKind::OpenRouter),
@@ -489,6 +499,7 @@ impl FileConfig {
             Some("kimi") => Some(ProviderKind::Kimi),
             Some("deepseek") => Some(ProviderKind::DeepSeek),
             Some("qwen") => Some(ProviderKind::Qwen),
+            Some("llamacpp") => Some(ProviderKind::LlamaCpp),
             // #275: one of the user's own endpoints.
             Some(name) if providers.as_ref().is_some_and(|p| p.contains_key(name)) => {
                 custom_provider = Some(name.to_string());
@@ -675,6 +686,7 @@ impl FileConfig {
             provider,
             custom_provider,
             providers,
+            llama_cpp,
             model: string("model", &mut problems),
             api_key: string("apiKey", &mut problems),
             zai_api_key: string("zaiApiKey", &mut problems),
@@ -776,6 +788,7 @@ impl FileConfig {
         put("mesh", (!mesh.is_empty()).then_some(Value::Object(mesh)));
         put("herdr", self.herdr_peers.map(|n| serde_json::json!({"peers": n})));
         put("providers", self.providers.as_ref().map(crate::providers::to_value));
+        put("llamaCpp", self.llama_cpp.as_ref().map(crate::local_model::LlamaCppSetting::to_value));
         Value::Object(map)
     }
 }
@@ -907,7 +920,10 @@ pub fn ollama_url(host: Option<&str>) -> String {
 }
 
 pub fn resolve_config(file: Option<&FileConfig>, env: &Env) -> Config {
-    let provider = file.and_then(|f| f.provider).unwrap_or(ProviderKind::OpenRouter);
+    // #278: `marv --local-model <gguf>` (or `MARV_LOCAL_MODEL`): llama.cpp with that file, for this run only.
+    let local_model = env.get("MARV_LOCAL_MODEL").map(|m| m.trim().to_string()).filter(|m| !m.is_empty());
+    let provider =
+        if local_model.is_some() { ProviderKind::LlamaCpp } else { file.and_then(|f| f.provider).unwrap_or(ProviderKind::OpenRouter) };
     let preset = preset(provider);
     // #275: the chosen endpoint, from the user's own file only (there is no project layer).
     let custom = (provider == ProviderKind::Custom)
@@ -918,6 +934,19 @@ pub fn resolve_config(file: Option<&FileConfig>, env: &Env) -> Config {
         })
         .flatten();
     let endpoint = custom.map(|(name, entry)| Arc::new(crate::providers::endpoint(name, entry, env)));
+    let model = local_model
+        .or_else(|| env.get("MARV_MODEL").map(|m| m.trim().to_string()).filter(|m| !m.is_empty()))
+        .or_else(|| file.and_then(|f| f.model.clone()))
+        .or_else(|| custom.and_then(|(_, entry)| entry.models.first().cloned()))
+        .unwrap_or_else(|| preset.default_model.into());
+    let context_length = file.and_then(|f| f.context_length).unwrap_or(DEFAULT_CONTEXT_LENGTH);
+    // #278: its server is started here the first time (once per model and settings, per process); it loads while
+    // the session starts, and each request waits for it.
+    let endpoint = endpoint.or_else(|| {
+        (provider == ProviderKind::LlamaCpp && !model.is_empty()).then(|| {
+            Arc::new(crate::local_model::endpoint(&model, file.and_then(|f| f.llama_cpp.as_ref()), context_length, env))
+        })
+    });
     let env_key = preset.key_env.and_then(|k| env.get(k)).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
     // #159: only this provider's own key, from its own variable or field: never another vendor's.
     let api_key = if preset.key_env.is_some() {
@@ -932,15 +961,12 @@ pub fn resolve_config(file: Option<&FileConfig>, env: &Env) -> Config {
     };
     Config {
         provider,
-        model: env
-            .get("MARV_MODEL")
-            .map(|m| m.trim().to_string())
-            .filter(|m| !m.is_empty())
-            .or_else(|| file.and_then(|f| f.model.clone()))
-            .or_else(|| custom.and_then(|(_, entry)| entry.models.first().cloned()))
-            .unwrap_or_else(|| preset.default_model.into()),
+        model,
         // A custom provider's URL is its entry's: a saved `baseUrl` was for a built-in one.
-        base_url: file.and_then(|f| f.base_url.clone()).filter(|_| custom.is_none()).unwrap_or_else(|| match provider {
+        base_url: file
+            .and_then(|f| f.base_url.clone())
+            .filter(|_| custom.is_none() && provider != ProviderKind::LlamaCpp)
+            .unwrap_or_else(|| match provider {
             ProviderKind::Ollama => ollama_url(env.get("OLLAMA_HOST").map(String::as_str)),
             ProviderKind::OpenRouter
             | ProviderKind::Zai
@@ -949,6 +975,7 @@ pub fn resolve_config(file: Option<&FileConfig>, env: &Env) -> Config {
             | ProviderKind::DeepSeek
             | ProviderKind::Qwen => preset.base_url.into(),
             ProviderKind::Custom => custom.map(|(_, entry)| entry.base_url.clone()).unwrap_or_default(),
+            ProviderKind::LlamaCpp => endpoint.as_ref().map(|e| e.base_url.clone()).unwrap_or_default(),
         }),
         api_key_source: if env_key.is_some() {
             Some(KeySource::Env)
@@ -961,7 +988,7 @@ pub fn resolve_config(file: Option<&FileConfig>, env: &Env) -> Config {
         // On by default (0.15.0): a model whose reasoning is optional reasons unless `/think off` or `"thinking": false`.
         thinking: file.and_then(|f| f.thinking).unwrap_or(true),
         reasoning_effort: file.and_then(|f| f.reasoning_effort).unwrap_or(DEFAULT_REASONING_EFFORT),
-        context_length: file.and_then(|f| f.context_length).unwrap_or(DEFAULT_CONTEXT_LENGTH),
+        context_length,
         compact_tokens: match (eval_compact_tokens(env), file.and_then(|f| f.compact_tokens)) {
             (Some(n), _) => Some(n),
             (None, Some(0)) => None,
@@ -1087,11 +1114,11 @@ pub fn provider_factory(
 ) -> Arc<dyn ProviderFactory> {
     let (file, env) = match option {
         ProviderOption::Custom(provider) => return Arc::new(CustomFactory::new(provider)),
-        ProviderOption::Endpoint { endpoint, model } => {
+        ProviderOption::Endpoint { kind, endpoint, model } => {
             let base = resolve_config(None, &Env::new());
             let base_url = endpoint.base_url.clone();
             return config_factory(Config {
-                provider: ProviderKind::Custom,
+                provider: kind,
                 model,
                 base_url,
                 endpoint: Some(endpoint),
@@ -1276,6 +1303,26 @@ mod tests {
         let other = FileConfig { provider: Some(ProviderKind::OpenRouter), custom_provider: None, ..file.clone() };
         assert_eq!(other.to_value()["providers"], file.to_value()["providers"]);
         assert_eq!(resolve_config(Some(&other), &Env::new()).endpoint, None);
+    }
+
+    /// #278: `"provider": "llamacpp"` with a GGUF path as the model, and `"llamaCpp"`, saved back as written;
+    /// `MARV_LOCAL_MODEL` (`--local-model`) picks llama.cpp for the run without touching the file. Nothing is started
+    /// here: there's no llama-server on this test's PATH, which is the endpoint's problem.
+    #[test]
+    fn llama_cpp_is_a_provider_and_local_model_is_for_one_run() {
+        let raw = json!({"provider": "llamacpp", "model": "/models/m.gguf", "llamaCpp": {"args": ["-ngl", "99"]}});
+        let file = FileConfig::from_value(&raw).unwrap();
+        assert_eq!(file.provider, Some(ProviderKind::LlamaCpp));
+        assert_eq!(file.to_value()["llamaCpp"], json!({"args": ["-ngl", "99"]}));
+        assert_eq!(file.to_value()["provider"], "llamacpp");
+        let config = resolve_config(Some(&file), &Env::new());
+        assert!(config.endpoint.as_ref().unwrap().problem.as_deref().is_some_and(|p| p.contains("llama-server")));
+        assert!(!needs_setup(Some(&file), &config));
+        assert!(needs_setup(Some(&FileConfig { model: None, ..file.clone() }), &resolve_config(Some(&FileConfig { model: None, ..file }), &Env::new())));
+        let openrouter = FileConfig::from_value(&json!({"provider": "openrouter", "model": "z-ai/glm-5.3"})).unwrap();
+        let config = resolve_config(Some(&openrouter), &env(&[("MARV_LOCAL_MODEL", "/models/x.gguf")]));
+        assert_eq!((config.provider, config.model.as_str()), (ProviderKind::LlamaCpp, "/models/x.gguf"));
+        assert_eq!(openrouter.to_value()["provider"], "openrouter", "the file is unchanged");
     }
 
     /// #275: a name that isn't in `providers` is dropped like a removed provider (setup opens); a bad entry is a

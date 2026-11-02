@@ -89,6 +89,8 @@ pub enum ProviderOption {
     },
     /// #275: an endpoint from the user's config ([`crate::endpoint::Endpoint`], its key read), and the model.
     Endpoint {
+        /// [`ProviderKind::Custom`], or (#278) [`ProviderKind::LlamaCpp`] for a llama-server Marv started.
+        kind: ProviderKind,
         endpoint: Arc<crate::endpoint::Endpoint>,
         model: String,
     },
@@ -118,7 +120,7 @@ impl ProviderFactory for ConfigFactory {
     }
 
     fn local(&self) -> bool {
-        self.config.provider == ProviderKind::Ollama
+        matches!(self.config.provider, ProviderKind::Ollama | ProviderKind::LlamaCpp)
     }
 
     fn make(&self, model: Option<&str>, info: Option<&ModelInfo>) -> Arc<dyn Provider> {
@@ -132,6 +134,12 @@ impl ProviderFactory for ConfigFactory {
     /// none of that. A list that fails to load says nothing about the model (`None`). Z.ai's, Kimi's,
     /// DeepSeek's and Qwen's models come from Marv's own tables ([`crate::models::table_for`]), so no request is made.
     fn lookup(&self) -> Option<BoxFuture<'static, Option<ModelInfo>>> {
+        // #278: an endpoint whose window Marv set itself (a llama-server it started with `-c`): that's the window,
+        // so the session compacts before it fills.
+        if let Some(context) = self.config.endpoint.as_ref().and_then(|e| e.context_length) {
+            let found = ModelInfo { id: self.config.model.clone(), context: Some(context), tools: Some(true), ..Default::default() };
+            return Some(Box::pin(async move { Some(found) }));
+        }
         if let Some(table) = crate::models::table_for(self.config.provider) {
             let found = table.into_iter().find(|m| m.id == self.config.model);
             return Some(Box::pin(async move { found }));

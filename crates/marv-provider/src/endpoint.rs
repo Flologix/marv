@@ -8,10 +8,17 @@
 //! - `marv-session` reads the config and resolves the key (`env:`, `command:` or the key itself); this crate gets the
 //!   resolved [`Endpoint`] in [`crate::ProviderConfig::endpoint`].
 
+use std::sync::Arc;
+
+use futures::StreamExt;
+use futures::future::BoxFuture;
+use marv_core::{ChatTurn, ProviderEvent};
 use serde::Deserialize;
 use serde_json::{Map, Value};
+use tokio_util::sync::CancellationToken;
 
 use crate::models::ModelInfo;
+use crate::{EventStream, Provider, StreamOptions};
 
 /// The API shape an endpoint speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,15 +57,73 @@ pub struct Endpoint {
     pub base_url: String,
     /// Sent as `Authorization: Bearer <key>`, to `base_url` only. `None`: no header (a local server).
     pub api_key: Option<String>,
-    /// Why the config's key couldn't be read (`$ACME_LLM_KEY` unset, a failed `command:`): every request ends with
-    /// it, rather than going out without the key.
-    pub key_problem: Option<String>,
+    /// Why it can't be used (its key couldn't be read: `$ACME_LLM_KEY` unset, a failed `command:`; #278: no
+    /// `llama-server`): every request ends with it, rather than going out without the key.
+    pub problem: Option<String>,
     /// Merged into every request, in the config's order.
     pub headers: Vec<(String, String)>,
     /// Merged into every request body, after Marv's own fields.
     pub extra_body: Map<String, Value>,
     /// The config's model list; empty: read `GET /models`, else any id typed into `/model`.
     pub models: Vec<String>,
+    /// The context window, when Marv knows it (#278: the `-c` it started `llama-server` with); else the model list's.
+    pub context_length: Option<u64>,
+    /// #278: what each request waits for first (a local server loading its model).
+    pub ready: Option<Ready>,
+}
+
+/// #278: something a request waits for before it's sent: a server Marv started, until it answers. `Err`: why it
+/// never will (it exited, with its last lines), as a sentence.
+pub trait Readiness: Send + Sync {
+    fn wait(&self, cancel: CancellationToken) -> BoxFuture<'static, Result<(), String>>;
+}
+
+/// A shared [`Readiness`]; equal only to itself (the same server).
+#[derive(Clone)]
+pub struct Ready(pub Arc<dyn Readiness>);
+
+impl PartialEq for Ready {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl std::fmt::Debug for Ready {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Ready(..)")
+    }
+}
+
+/// A provider whose requests wait for [`Ready`] first; a failed wait is the request's error.
+pub struct ReadyFirst {
+    pub ready: Ready,
+    pub inner: Arc<dyn Provider>,
+}
+
+impl Provider for ReadyFirst {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn context_length(&self) -> Option<u64> {
+        self.inner.context_length()
+    }
+
+    fn stream(&self, history: &[ChatTurn], options: StreamOptions) -> EventStream {
+        let wait = self.ready.0.wait(options.cancel.clone());
+        let inner = self.inner.clone();
+        // The history is serialized now, as the trait asks; the request goes once the wait is over.
+        let history = history.to_vec();
+        Box::pin(
+            futures::stream::once(async move {
+                match wait.await {
+                    Ok(()) => inner.stream(&history, options),
+                    Err(why) => Box::pin(futures::stream::iter([ProviderEvent::Error(why)])) as EventStream,
+                }
+            })
+            .flatten(),
+        )
+    }
 }
 
 #[derive(Deserialize)]
