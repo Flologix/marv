@@ -12,7 +12,9 @@
 //! - Kimi Code, DeepSeek and Qwen's Coding Plan: Marv's own tables too ([`KIMI_MODELS`], [`DEEPSEEK_MODELS`],
 //!   [`QWEN_CODING_MODELS`]), for the same reason: a handful of models, and no list Marv can read without a key.
 //! - `reasoning`: "optional" can be turned off, "mandatory" can't (OpenRouter rejects trying):
-//!   `crate::reasoning_for` depends on this.
+//!   `crate::reasoning_for` depends on this. An Ollama model that lists the `thinking` capability reasons (optional).
+//! - `efforts`: the reasoning levels OpenRouter says the model takes (`reasoning.supported_efforts`), so a request's
+//!   effort is fitted to them (`crate::effort_for_model`).
 
 use serde::Deserialize;
 
@@ -40,6 +42,9 @@ pub struct ModelInfo {
     /// Runs on this machine (Ollama).
     pub local: bool,
     pub reasoning: Option<ReasoningSupport>,
+    /// The reasoning levels the model takes, lowest first (OpenRouter's `reasoning.supported_efforts`); `None` when the
+    /// list doesn't say.
+    pub efforts: Option<Vec<crate::ReasoningEffort>>,
     /// Marv #96: the most tokens one reply may have (OpenRouter's `top_provider.max_completion_tokens`), when known.
     pub max_output: Option<u64>,
     /// #159: the name to show (ChatGPT's `display_name`); the id is what's sent.
@@ -164,6 +169,9 @@ pub struct OpenRouterPricing {
 pub struct OpenRouterReasoning {
     #[serde(default)]
     pub mandatory: Option<bool>,
+    /// e.g. `["max", "high", "low", "none"]` (DeepSeek V4.1 Flash, 2026-11-01).
+    #[serde(default)]
+    pub supported_efforts: Option<Vec<String>>,
 }
 
 /// OpenRouter's list → Marv's: only models that can call tools, no `:batch` variants.
@@ -181,7 +189,15 @@ pub fn from_openrouter(data: Vec<OpenRouterModel>) -> Vec<ModelInfo> {
                 local: false,
                 reasoning: m
                     .reasoning
+                    .as_ref()
                     .map(|r| if r.mandatory == Some(true) { ReasoningSupport::Mandatory } else { ReasoningSupport::Optional }),
+                efforts: m.reasoning.as_ref().and_then(|r| r.supported_efforts.as_ref()).map(|names| {
+                    let mut efforts: Vec<crate::ReasoningEffort> =
+                        names.iter().filter_map(|n| crate::ReasoningEffort::parse(n)).collect();
+                    efforts.sort();
+                    efforts.dedup();
+                    efforts
+                }),
                 max_output: m.top_provider.and_then(|t| t.max_completion_tokens).filter(|&n| n > 0),
                 name: None,
                 id: m.id,
@@ -254,8 +270,14 @@ pub async fn list_models_with(
                 async move {
                     let body = serde_json::json!({ "model": name });
                     let info: Option<OllamaShow> = get_json(client, show, api_key, Some(&body)).await.ok();
-                    let tools = info.and_then(|i| i.capabilities).map(|c| c.iter().any(|c| c == "tools"));
-                    ModelInfo { id: name, tools, local: true, ..Default::default() }
+                    let capabilities = info.and_then(|i| i.capabilities);
+                    let tools = capabilities.as_ref().map(|c| c.iter().any(|c| c == "tools"));
+                    // A model that can think: only then does Marv turn Ollama's `think` on (others refuse it).
+                    let reasoning = capabilities
+                        .as_ref()
+                        .is_some_and(|c| c.iter().any(|c| c == "thinking"))
+                        .then_some(ReasoningSupport::Optional);
+                    ModelInfo { id: name, tools, local: true, reasoning, ..Default::default() }
                 }
             });
             Ok(futures::future::join_all(models).await)
@@ -350,6 +372,21 @@ mod tests {
 
     fn priced(price_in: f64, price_out: f64) -> ModelInfo {
         ModelInfo { id: "x".into(), price_in: Some(price_in), price_out: Some(price_out), ..Default::default() }
+    }
+
+    #[test]
+    fn openrouters_reasoning_levels_are_read_lowest_first_and_unknown_ones_dropped() {
+        let data: Vec<OpenRouterModel> = serde_json::from_value(serde_json::json!([
+            {"id":"deepseek/deepseek-v4.1-flash","supported_parameters":["tools","reasoning"],
+             "reasoning":{"mandatory":false,"supported_efforts":["max","high","low","none"],"default_effort":"high"}},
+            {"id":"a/plain","supported_parameters":["tools"]}
+        ]))
+        .unwrap();
+        let models = from_openrouter(data);
+        use crate::ReasoningEffort::{High, Low, Max};
+        assert_eq!(models[0].efforts, Some(vec![Low, High, Max]));
+        assert_eq!(models[0].reasoning, Some(ReasoningSupport::Optional));
+        assert_eq!((models[1].efforts.clone(), models[1].reasoning), (None, None));
     }
 
     #[test]

@@ -165,7 +165,7 @@ impl ReasoningSwitch {
 /// models take (OpenRouter lists DeepSeek V4.1 Flash's as max, high, low and none, 2026-11-01): sent as named, so a
 /// model that doesn't take one may refuse the request. Which a model takes is in OpenRouter's model list
 /// (`reasoning.supported_efforts`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
     Minimal,
@@ -191,6 +191,20 @@ impl ReasoningEffort {
     }
     pub fn as_str(self) -> &'static str {
         Self::NAMES[self as usize]
+    }
+}
+
+/// The effort to send `model`: the highest level it takes at or below `requested` (the default is `max`: as high as
+/// each model goes), else its lowest; `high` when its levels aren't known, which nearly every reasoning model takes
+/// (sending one it doesn't take can get the request refused). DeepSeek V4.1 Flash takes max, high and low, not the
+/// old default medium.
+pub fn effort_for_model(requested: Option<ReasoningEffort>, efforts: Option<&[ReasoningEffort]>) -> Option<ReasoningEffort> {
+    let requested = requested?;
+    match efforts {
+        Some(levels) if !levels.is_empty() => {
+            Some(levels.iter().copied().filter(|&l| l <= requested).max().unwrap_or_else(|| levels[0]))
+        }
+        _ => Some(requested.min(ReasoningEffort::High)),
     }
 }
 
@@ -231,7 +245,8 @@ pub fn chatgpt_options(config: &ProviderConfig, hints: ErrorHints) -> Result<res
         model: config.model.clone(),
         credentials: chatgpt::ChatGptCredentials::new(chatgpt::AuthStore { path }),
         headers: Vec::new(),
-        reasoning_effort: config.reasoning_effort,
+        // OpenAI's Responses API takes up to high for these models: xhigh and max are sent as high.
+        reasoning_effort: config.reasoning_effort.map(|e| e.min(ReasoningEffort::High)),
         encrypted_reasoning: true,
         max_output_tokens: None,
         // The route's preview takes function tools only grouped in a namespace.
@@ -279,7 +294,8 @@ pub fn create_provider(config: &ProviderConfig, model: Option<&ModelInfo>, hints
     match config.provider {
         ProviderKind::OpenRouter => {
             let mut body = serde_json::Map::new();
-            if let Some(reasoning) = reasoning_for(config.thinking, config.reasoning_effort, model.and_then(|m| m.reasoning)) {
+            let effort = effort_for_model(config.reasoning_effort, model.and_then(|m| m.efforts.as_deref()));
+            if let Some(reasoning) = reasoning_for(config.thinking, effort, model.and_then(|m| m.reasoning)) {
                 body.insert("reasoning".into(), serde_json::json!(reasoning));
             }
             Arc::new(openai_compat::OpenAiCompatProvider::new(openai_compat::OpenAiCompatOptions {
@@ -296,10 +312,7 @@ pub fn create_provider(config: &ProviderConfig, model: Option<&ModelInfo>, hints
                 timing: Default::default(),
                 idle_timeout: Some(openai_compat::STREAM_IDLE_TIMEOUT),
                 // #96: so the provider ends a runaway reply. Ollama has its own cap (`num_predict`).
-                max_tokens: Some(openai_compat::max_tokens_for_reasoning(
-                    model.and_then(|m| m.max_output),
-                    config.reasoning_effort,
-                )),
+                max_tokens: Some(openai_compat::max_tokens_for_reasoning(model.and_then(|m| m.max_output), effort)),
                 // #116: so max_tokens is clamped to the room the prompt leaves in the window.
                 context_length: model.and_then(|m| m.context),
             }))
@@ -360,7 +373,9 @@ pub fn create_provider(config: &ProviderConfig, model: Option<&ModelInfo>, hints
             base_url: config.base_url.clone(),
             model: config.model.clone(),
             context_length: config.context_length,
-            thinking: config.thinking,
+            // Only a model that lists the thinking capability: Ollama refuses `think` from one that doesn't, and
+            // thinking is on by default (0.15.0).
+            thinking: config.thinking && model.is_some_and(|m| m.reasoning.is_some()),
             hints,
             timing: Default::default(),
         })),
@@ -440,6 +455,16 @@ mod tests {
         assert_eq!(serde_json::to_string(&ReasoningSwitch::OFF).unwrap(), r#"{"enabled":false}"#);
         assert_eq!(serde_json::to_string(&ReasoningSwitch::effort(ReasoningEffort::Medium)).unwrap(), r#"{"effort":"medium"}"#);
         assert_eq!(serde_json::to_string(&ReasoningSwitch::effort(ReasoningEffort::Max)).unwrap(), r#"{"effort":"max"}"#);
+        use ReasoningEffort::{High, Low, Max, Medium, Xhigh};
+        let deepseek = [Low, High, Max];
+        assert_eq!(effort_for_model(Some(Max), Some(&deepseek)), Some(Max));
+        assert_eq!(effort_for_model(Some(Medium), Some(&deepseek)), Some(Low), "the highest it takes at or below");
+        assert_eq!(effort_for_model(Some(Xhigh), Some(&deepseek)), Some(High));
+        assert_eq!(effort_for_model(Some(Max), Some(&[Low, High])), Some(High), "where max isn't offered");
+        assert_eq!(effort_for_model(Some(ReasoningEffort::Minimal), Some(&deepseek)), Some(Low), "else its lowest");
+        assert_eq!(effort_for_model(Some(Max), None), Some(High), "levels unknown: high");
+        assert_eq!(effort_for_model(Some(Low), None), Some(Low));
+        assert_eq!(effort_for_model(None, Some(&deepseek)), None);
         assert_eq!(serde_json::to_string(&ReasoningSwitch::effort(ReasoningEffort::Xhigh)).unwrap(), r#"{"effort":"xhigh"}"#);
         for name in ReasoningEffort::NAMES {
             assert_eq!(ReasoningEffort::parse(name).map(ReasoningEffort::as_str), Some(name), "{name}");
