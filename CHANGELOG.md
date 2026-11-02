@@ -6,6 +6,10 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+### Fixed
+
+- **A tool call with its optional fields sent empty works on every built-in tool.** On the ChatGPT plan (Responses API) models fill every field of a tool's schema, mostly with `""`, and some tools refused that: `read_file` with `"limit": ""`, `process` with `"name": ""`, `recall` with a page and `"query": ""`. An optional field sent as `""` is now read as not given. A test sends every action of every built-in tool padded this way (#265).
+
 ## [0.15.0] - 2026-11-01
 
 ### Changed
