@@ -237,7 +237,7 @@ pub fn endpoint(name: &str, provider: &CustomProvider, env: &Env) -> Endpoint {
 
 /// [`endpoint`] with a given helper runner (tests).
 pub fn endpoint_with(name: &str, provider: &CustomProvider, env: &Env, run: &RunKeyCommand) -> Endpoint {
-    let (api_key, key_problem) = match provider.key.as_deref().map(|key| resolve_key(name, key, env, run)) {
+    let (api_key, problem) = match provider.key.as_deref().map(|key| resolve_key(name, key, env, run)) {
         None => (None, None),
         Some(Ok(key)) => (Some(key), None),
         Some(Err(why)) => (None, Some(why)),
@@ -247,10 +247,12 @@ pub fn endpoint_with(name: &str, provider: &CustomProvider, env: &Env, run: &Run
         wire: provider.wire,
         base_url: provider.base_url.clone(),
         api_key,
-        key_problem,
+        problem,
         headers: provider.headers.clone(),
         extra_body: provider.extra_body.clone(),
         models: provider.models.clone(),
+        context_length: None,
+        ready: None,
     }
 }
 
@@ -320,6 +322,6 @@ mod tests {
         let never = |_: &str| -> Result<String, String> { Err("unused".into()) };
         let e = endpoint_with("acme-gateway", &providers["acme-gateway"], &Env::new(), &never);
         assert_eq!(e.api_key, None);
-        assert!(e.key_problem.as_deref().is_some_and(|p| p.contains("$ACME_LLM_KEY")));
+        assert!(e.problem.as_deref().is_some_and(|p| p.contains("$ACME_LLM_KEY")));
     }
 }

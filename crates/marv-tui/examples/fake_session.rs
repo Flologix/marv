@@ -373,6 +373,7 @@ impl SessionPort for Fake {
                 ProviderId::Kimi => vec![m("kimi-for-coding", None, false, true)],
                 ProviderId::DeepSeek => vec![m("deepseek-flash", None, false, true)],
                 ProviderId::Qwen => vec![m("qwen3.7-plus", None, false, true)],
+                ProviderId::LlamaCpp => vec![m("/models/qwen3.5-9b-q4_k_m.gguf", None, true, true)],
                 ProviderId::Custom(_) => vec![m("acme-large", None, false, true)],
             };
             let _ = tx.send(UiEvent::Models(Ok(models)));
@@ -388,6 +389,7 @@ impl SessionPort for Fake {
             ProviderId::Kimi => "Kimi",
             ProviderId::DeepSeek => "DeepSeek",
             ProviderId::Qwen => "Qwen",
+            ProviderId::LlamaCpp => "llama.cpp",
             ProviderId::Custom(name) => name.as_str(),
         };
         self.system(&format!("Saved to ~/.marv/config.json · {label} · {}", answer.model));

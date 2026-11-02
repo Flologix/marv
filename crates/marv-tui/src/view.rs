@@ -347,6 +347,8 @@ pub enum ProviderId {
     DeepSeek,
     /// Alibaba Cloud's Coding Plan (Qwen models).
     Qwen,
+    /// #278: a GGUF model on this machine, through llama.cpp.
+    LlamaCpp,
     /// #275: one of the user's own endpoints (`"providers"` in the config), by name.
     Custom(String),
 }

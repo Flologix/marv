@@ -411,6 +411,8 @@ pub struct HeadlessOptions {
     pub output: OutputFormat,
     pub resume_latest: bool,
     pub model: Option<String>,
+    /// #278: `--local-model`: a GGUF file, through llama.cpp, for this run.
+    pub local_model: Option<String>,
     pub max_steps: Option<u32>,
     pub approve: Vec<String>,
     /// `--approve-tainted` and `--approve-protected`.
@@ -458,6 +460,9 @@ pub async fn run_headless(options: HeadlessOptions, quit: crate::signals::Quit) 
     };
     if let Some(model) = &options.model {
         env.insert("MARV_MODEL".into(), model.clone());
+    }
+    if let Some(model) = &options.local_model {
+        env.insert("MARV_LOCAL_MODEL".into(), model.clone());
     }
     let config = resolve_config(file.as_ref(), &env);
     if let Some(why) = headless_refusal(config.provider) {
@@ -521,9 +526,9 @@ pub async fn run_headless(options: HeadlessOptions, quit: crate::signals::Quit) 
             model: Some(config.model.clone()),
             base_url: Some(config.base_url.clone()),
         },
-        // #275: the endpoint from the user's config, its key read.
-        marv_provider::ProviderKind::Custom => match config.endpoint.clone() {
-            Some(endpoint) => marv_provider::ProviderOption::Endpoint { endpoint, model: config.model.clone() },
+        // #275: the endpoint from the user's config, its key read; #278: the llama-server Marv started.
+        kind @ (marv_provider::ProviderKind::Custom | marv_provider::ProviderKind::LlamaCpp) => match config.endpoint.clone() {
+            Some(endpoint) => marv_provider::ProviderOption::Endpoint { kind, endpoint, model: config.model.clone() },
             None => {
                 eprintln!("The custom provider isn't in ~/.marv/config.json's \"providers\": pick another with /setup.");
                 return ExitCode::Error;

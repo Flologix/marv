@@ -31,6 +31,7 @@ pub mod git;
 pub mod herdr_door;
 pub mod hooks;
 pub mod instructions;
+pub mod local_model;
 pub mod mcp_install;
 pub mod mcp_tools;
 pub mod memory;
