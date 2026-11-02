@@ -271,12 +271,7 @@ pub fn chatgpt_options(config: &ProviderConfig, hints: ErrorHints) -> Result<res
 }
 
 /// #275: the provider for a custom endpoint and one of its models.
-fn custom_provider(
-    endpoint: &endpoint::Endpoint,
-    model: &str,
-    info: Option<&ModelInfo>,
-    hints: ErrorHints,
-) -> Arc<dyn Provider> {
+fn custom_provider(endpoint: &endpoint::Endpoint, model: &str, info: Option<&ModelInfo>, hints: ErrorHints) -> Arc<dyn Provider> {
     let name = format!("{} · {model}", endpoint.name);
     let context_length = info.and_then(|m| m.context);
     match endpoint.wire {
@@ -428,7 +423,9 @@ pub fn create_provider(config: &ProviderConfig, model: Option<&ModelInfo>, hints
         // the endpoint's models take.
         ProviderKind::Custom => match config.endpoint.as_deref() {
             Some(endpoint) => match &endpoint.key_problem {
-                Some(why) => Arc::new(FailingProvider { name: format!("{} · {}", endpoint.name, config.model), message: why.clone() }),
+                Some(why) => {
+                    Arc::new(FailingProvider { name: format!("{} · {}", endpoint.name, config.model), message: why.clone() })
+                }
                 None => custom_provider(endpoint, &config.model, model, hints),
             },
             None => Arc::new(FailingProvider {

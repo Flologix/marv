@@ -326,9 +326,10 @@ fn endpoint(base_url: String, wire: marv_provider::endpoint::Wire) -> ProviderCo
 
 #[tokio::test]
 async fn a_custom_chat_endpoint_gets_its_key_headers_and_extra_body() {
-    let server =
-        FakeServer::start(|_| Reply::sse(&[json!({"choices": [{"delta": {"content": "hi"}, "finish_reason": "stop"}]}), json!("[DONE]")]))
-            .await;
+    let server = FakeServer::start(|_| {
+        Reply::sse(&[json!({"choices": [{"delta": {"content": "hi"}, "finish_reason": "stop"}]}), json!("[DONE]")])
+    })
+    .await;
     let config = endpoint(format!("{}/v1", server.url()), marv_provider::endpoint::Wire::OpenAiChat);
     let provider = create_provider(&config, None, None);
     assert_eq!(provider.name(), "acme-gateway · acme-large");

@@ -509,15 +509,13 @@ pub fn setup_context(start: SetupStart, file: Option<&FileConfig>, config: &Conf
         })
         .collect();
     // #275: the user's own endpoints, after the built-in ones. Their keys are in the config, so setup asks none.
-    presets.extend(file.and_then(|f| f.providers.as_ref()).into_iter().flatten().map(|(name, entry)| {
-        view::ProviderPreset {
-            id: ProviderId::Custom(name.clone()),
-            label: printable(name),
-            key_env: None,
-            key_url: None,
-            default_model: entry.models.first().cloned().unwrap_or_default(),
-            sign_in: false,
-        }
+    presets.extend(file.and_then(|f| f.providers.as_ref()).into_iter().flatten().map(|(name, entry)| view::ProviderPreset {
+        id: ProviderId::Custom(name.clone()),
+        label: printable(name),
+        key_env: None,
+        key_url: None,
+        default_model: entry.models.first().cloned().unwrap_or_default(),
+        sign_in: false,
     }));
     let env_keys = kinds
         .iter()
@@ -531,10 +529,7 @@ pub fn setup_context(start: SetupStart, file: Option<&FileConfig>, config: &Conf
         presets,
         current: file
             .and_then(|f| f.provider.map(|kind| (provider_id(kind, f.custom_provider.as_deref()), config.model.clone()))),
-        saved_keys: kinds
-            .iter()
-            .filter_map(|&kind| Some((provider_id(kind, None), mask_key(file?.key_for(kind)?))))
-            .collect(),
+        saved_keys: kinds.iter().filter_map(|&kind| Some((provider_id(kind, None), mask_key(file?.key_for(kind)?)))).collect(),
         accounts: config
             .auth_file
             .clone()
@@ -2932,9 +2927,7 @@ impl SessionPort for Port {
             let tx = b.activity.tx.clone();
             tokio::spawn(async move {
                 let result = match endpoint {
-                    Some(endpoint) => {
-                        marv_provider::endpoint::list_models(&reqwest::Client::new(), &endpoint).await
-                    }
+                    Some(endpoint) => marv_provider::endpoint::list_models(&reqwest::Client::new(), &endpoint).await,
                     None => Err("It isn't in ~/.marv/config.json's \"providers\" any more.".into()),
                 };
                 let _ = tx.send(UiEvent::Models(result.map(|list| list.into_iter().map(model_info).collect())));

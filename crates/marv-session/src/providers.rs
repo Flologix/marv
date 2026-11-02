@@ -72,9 +72,7 @@ pub fn parse(raw: &Value) -> Result<BTreeMap<String, CustomProvider>, Vec<String
     for (name, entry) in entries {
         let at = format!("providers.{name}");
         if !valid_name(name) {
-            problems.push(format!(
-                "{at}: a name is letters, digits, \".\", \"_\" and \"-\", and not a built-in provider's"
-            ));
+            problems.push(format!("{at}: a name is letters, digits, \".\", \"_\" and \"-\", and not a built-in provider's"));
             continue;
         }
         let Value::Object(entry) = entry else {
@@ -299,7 +297,10 @@ mod tests {
         let env = Env::from([("ACME_LLM_KEY".to_string(), " sk-acme \n".to_string())]);
         let never = |_: &str| -> Result<String, String> { panic!("no command here") };
         assert_eq!(resolve_key("g", "env:ACME_LLM_KEY", &env, &never), Ok("sk-acme".into()));
-        assert_eq!(resolve_key("g", "env:MISSING", &env, &never), Err("g: its key is read from $MISSING, which isn't set.".into()));
+        assert_eq!(
+            resolve_key("g", "env:MISSING", &env, &never),
+            Err("g: its key is read from $MISSING, which isn't set.".into())
+        );
         assert_eq!(resolve_key("g", "sk-literal", &env, &never), Ok("sk-literal".into()));
         let helper = |c: &str| if c == "pass show acme" { Ok("sk-pass".into()) } else { Err("no".into()) };
         assert_eq!(resolve_key("g", "command: pass show acme", &env, &helper), Ok("sk-pass".into()));
