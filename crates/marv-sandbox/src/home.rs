@@ -36,6 +36,14 @@ pub const TOOLCHAINS: &[&str] = &[
     ".marv/skills",
 ];
 
+/// Desktop and app settings and state, shown again read-only (bubblewrap) when the project is the home folder (or
+/// holds it): asked about the desktop, the window manager or an app's settings, a model otherwise had to leave the
+/// sandbox (`sandbox: false`, asked each time) just to read `~/.config/hypr`. What's private in them stays hidden:
+/// [`HOME_MASKS`] names the folders (browsers, password managers, chat apps, agents' logins), and files named like a
+/// secret ([`secret_name`]) and every socket and FIFO found in them are `/dev/null` (`bwrap::home_masks`). Never in
+/// any other project, where the home is a stand-in.
+pub const HOME_SHOWN: &[&str] = &[".config", ".local/share", ".local/state"];
+
 /// Credential files inside the toolchain folders, replaced by `/dev/null`: an approved (or auto-approved) command
 /// could otherwise print them into the conversation, which goes to the model provider.
 pub const CREDENTIALS: &[&str] = &[".cargo/credentials", ".cargo/credentials.toml", ".config/git/credentials"];
@@ -61,7 +69,108 @@ pub const HOME_MASKS: &[&str] = &[
     ".docker",
     ".kube",
     ".local/share/keyrings",
+    // Inside HOME_SHOWN: logins, cookies, keys, message stores and shell history.
+    ".config/chromium",
+    ".config/google-chrome",
+    ".config/google-chrome-beta",
+    ".config/google-chrome-unstable",
+    ".config/BraveSoftware",
+    ".config/microsoft-edge",
+    ".config/vivaldi",
+    ".config/opera",
+    ".mozilla",
+    ".librewolf",
+    ".zen",
+    ".thunderbird",
+    ".config/1Password",
+    ".config/op",
+    ".config/Bitwarden",
+    ".config/bitwarden",
+    ".config/keepassxc",
+    ".local/share/keepassxc",
+    ".password-store",
+    ".config/Signal",
+    ".config/discord",
+    ".config/Slack",
+    ".config/Element",
+    ".local/share/TelegramDesktop",
+    ".config/rclone",
+    ".config/hub",
+    ".config/glab-cli",
+    ".config/doctl",
+    ".config/heroku",
+    ".config/netlify",
+    ".config/vercel",
+    ".config/configstore",
+    ".config/github-copilot",
+    ".config/opencode",
+    ".local/share/opencode",
+    ".config/marv",
+    ".local/share/marv",
+    ".local/state/marv",
+    ".config/Code/User/globalStorage",
+    ".config/Cursor/User/globalStorage",
+    ".config/zed/credentials",
+    ".local/share/zed/db",
+    ".local/share/atuin",
+    ".local/share/fish/fish_history",
+    ".local/state/zsh",
+    ".local/share/recently-used.xbel",
+    ".local/share/Trash",
+    ".config/Docker Desktop",
+    ".config/tailscale",
+    ".config/wireguard",
+    ".config/NetworkManager",
+    ".config/evolution",
+    ".local/share/evolution",
+    ".config/goa-1.0",
+    ".config/kwalletrc",
+    ".local/share/kwalletd",
+    ".config/chromium-headless",
+    ".config/microsoft-edge-dev",
+    ".config/microsoft-edge-beta",
+    ".config/ai.flologix.marv",
+    ".local/share/ai.flologix.marv",
+    ".config/harbor",
+    ".local/share/pki",
+    ".local/share/Steam/config/htmlcache",
 ];
+
+/// Folders found in a [`HOME_SHOWN`] folder that hold an app's web storage, where Electron apps (VS Code, Obsidian,
+/// Slack) and embedded browsers keep login tokens: hidden whole, by name (lowercase), wherever they are.
+pub fn secret_dir_name(name: &str) -> bool {
+    matches!(name.to_ascii_lowercase().as_str(), "local storage" | "session storage" | "indexeddb" | "databases" | "webstorage")
+}
+
+/// Whether a file found in a [`HOME_SHOWN`] folder is named like a secret, and is masked: a login token, a private
+/// key, a cookie jar, a password database, a dotenv file. Lowercase match on the name only, so it errs toward hiding
+/// (a `tokens.css` is hidden too).
+pub fn secret_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    const EXACT: &[&str] = &[
+        "auth.json",
+        "cookies",
+        "cookies.sqlite",
+        "login data",
+        "web data",
+        "hosts.yml",
+        "id_rsa",
+        "id_ed25519",
+        "id_ecdsa",
+        ".env",
+        ".netrc",
+        "netrc",
+        ".pgpass",
+        "keychain",
+    ];
+    const PARTS: &[&str] =
+        &["token", "secret", "credential", "password", "passwd", "apikey", "api_key", "api-key", "private", "oauth", "session"];
+    const EXTENSIONS: &[&str] = &[".pem", ".key", ".p12", ".pfx", ".kdbx", ".gpg", ".asc", ".age", ".jks", ".keystore"];
+    EXACT.contains(&name.as_str())
+        || name.starts_with(".env.")
+        || PARTS.iter().any(|p| name.contains(p))
+        || EXTENSIONS.iter().any(|e| name.ends_with(e))
+}
 
 /// Whether the project is the home folder or a parent of it (`/`, `/home`), judged on real paths. Then the sandbox
 /// can't hide the home behind a stand-in without hiding the project too: it shows it read-only, with Marv's config,

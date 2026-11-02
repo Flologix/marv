@@ -6,6 +6,16 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+### Changed
+
+- **Started in your home folder, Marv no longer asks before every command.** Sandboxed commands without network ran unasked everywhere but there (`approveSandboxed`), so a question about your desktop took 10 to 13 approvals of `ls` and `cat`. The sandbox shows the home read-only there, so such a command can only write to `/tmp`; they now run unasked in the home folder too. File changes there still ask each time, and yolo stays off there.
+- **In the home folder, the sandbox shows your desktop's and apps' settings** (`~/.config`, `~/.local/share`, `~/.local/state`, read-only; Linux), so questions about Hyprland, a theme or an app's config no longer need a command outside the sandbox. What's private in them stays hidden: browser profiles, password managers, chat apps, the logins of CLIs and agents, apps' web storage (`Local Storage`, `IndexedDB`), files named like secrets (`auth.json`, `*token*`, `*.pem`…), and every socket.
+- **`/model <name>` switches the model for this session only.** It used to save it as the default for every later Marv. `/model` without a name still opens the picker, which saves.
+
+### Fixed
+
+- **`marv -m <model>` works in the TUI.** It only reached `marv -p`; the TUI started with the saved model. It's for that run, never saved.
+
 ## [0.15.0] - 2026-11-01
 
 ### Changed

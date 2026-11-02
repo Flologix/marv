@@ -1014,15 +1014,22 @@ pub fn trajectories_status(config: &Config, path: Option<&str>) -> String {
 
 /// What yolo mode does with this config, for the notice when it's changed. `config` is the config in effect after the
 /// change (`approve_sandboxed` as it resolves from the file, `MARV_YOLO` included); `yolo_allowed` is false where the
-/// project is the home folder or above it, where neither yolo nor `approveSandboxed` apply (`sdk::no_yolo_reason`).
-/// The same state `/permissions` shows: sandboxed commands run unasked only with the setting, the sandbox on and
-/// working here, and yolo allowed.
+/// project is the home folder or above it, where yolo doesn't apply (`sdk::no_yolo_reason`) but `approveSandboxed`
+/// does: the sandbox shows the project read-only there. The same state `/permissions` shows: sandboxed commands run
+/// unasked only with the setting and the sandbox on and working here.
 pub fn yolo_status(config: &Config, sandbox_available: bool, yolo_allowed: bool) -> String {
-    if !yolo_allowed {
-        return "Yolo is off in this folder (it is your home folder or above it): every change asks first.".into();
-    }
     let confined = config.sandbox && sandbox_available;
     let unasked = config.approve_sandboxed && confined;
+    if !yolo_allowed {
+        let commands = if unasked {
+            " Sandboxed commands without network still run without asking: the sandbox shows this folder read-only."
+        } else {
+            ""
+        };
+        return format!(
+            "Yolo is off in this folder (it is your home folder or above it): every file change asks first.{commands}"
+        );
+    }
     // A turn a mesh message woke: unasked sandboxed commands only see the project read-only (docs/SECURITY.md).
     let woken = " In a turn a mesh message woke they see the project read-only.";
     if !config.yolo {
@@ -1492,9 +1499,11 @@ mod tests {
         // Yolo on.
         assert!(yolo_status(&config(true, true, true), true, true).contains("also run without asking"));
         assert!(!yolo_status(&config(true, false, true), true, true).contains("also run without asking"));
-        // The home folder: neither applies.
+        // The home folder: yolo doesn't apply, approveSandboxed does (the sandbox is read-only there).
         let home = yolo_status(&config(true, true, true), true, false);
-        assert!(home.contains("every change asks first") && !home.contains("without asking"), "{home}");
+        assert!(home.contains("every file change asks first") && home.contains("still run without asking"), "{home}");
+        let home = yolo_status(&config(true, true, false), true, false);
+        assert!(home.contains("every file change asks first") && !home.contains("without asking"), "{home}");
     }
 
     #[test]

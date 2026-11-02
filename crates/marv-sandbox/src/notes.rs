@@ -34,7 +34,15 @@ pub const HOME_NOTE: &str = "Marv: in the sandbox the home folder can't be read 
 /// Appended to a sandboxed command in a project that is the home folder (or holds it) when it failed or looked at a
 /// hidden part of the home (marv-rs): there the home is shown read-only with its private parts hidden, so a write
 /// fails with "Read-only file system" and `~/.ssh` reads as empty, and a model that doesn't know why retries.
-pub const HOME_PROJECT_NOTE: &str = "Marv: the project is your home folder, so in the sandbox it is read-only, and its hidden entries (~/.marv, ~/.ssh, ~/.config, ~/.local and the like, apart from toolchain folders and git config) and any socket in it are hidden: an empty or missing one there says nothing about the real home folder. Commands can write only to /tmp. To change a file, use edit_file or write_file (the user is asked); for more, ask the user to start Marv in a project folder.";
+///
+/// On Linux it names what is readable first: it used to list `~/.config` and `~/.local` as hidden, and after they were
+/// shown (`home::HOME_SHOWN`) a model that read `~/.config/hypr` fine still took that line for the truth and left the
+/// sandbox, asked each time, for the rest of the turn.
+#[cfg(not(target_os = "macos"))]
+pub const HOME_PROJECT_NOTE: &str = "Marv: the project is your home folder, so in the sandbox it is read-only. ~/.config, ~/.local/share and ~/.local/state are readable, but the home's other hidden entries (~/.marv, ~/.ssh, ~/.cache and the like, apart from toolchain folders and git config), browser, password-manager and chat-app folders, files named like secrets, and any socket are hidden: an empty or missing one of those says nothing about the real home folder, while a missing file elsewhere is really missing. Commands can write only to /tmp. To change a file, use edit_file or write_file (the user is asked).";
+/// [`HOME_PROJECT_NOTE`] for macOS's sandbox (Seatbelt), which still hides every hidden entry of the home.
+#[cfg(target_os = "macos")]
+pub const HOME_PROJECT_NOTE: &str = "Marv: the project is your home folder, so in the sandbox it is read-only, and its hidden entries (~/.marv, ~/.ssh, ~/.config, ~/.local and the like, apart from toolchain folders and git config) and any socket in it are hidden: an empty or missing one there says nothing about the real home folder. Commands can write only to /tmp. To change a file, use edit_file or write_file (the user is asked).";
 
 /// Ends [`HOME_NOTE`] and [`HOME_PROJECT_NOTE`] where bash can leave the sandbox (the host door: someone approves each
 /// command at a terminal), #268: told only that a path was hidden, a model in a home-folder session took an empty
