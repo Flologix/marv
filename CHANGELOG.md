@@ -6,6 +6,8 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+## [0.16.1] - 2026-11-02
+
 ### Changed
 
 - **Commits, branches and merges no longer ask (Linux).** A sandboxed `git_write` command (`git commit`, `checkout -b`, `merge`, `rebase`, `stash`, `tag`) used to ask every time, yolo or not, because the sandbox keeps `.git` read-only: a planted hook or `core.fsmonitor` would run on your machine at your next `git` command. Now it runs without asking (yolo or `approveSandboxed`), with `.git` writable but its config, hooks, `info/`, `modules/`, `worktrees/`, `config.worktree` and `commondir` still read-only, so it can change the history but nothing git runs a program from. A command that changes the repository's setup (`git config`, `git remote add`, upstream tracking, hook installers, submodules, worktrees) still asks, as does any git command on macOS. See `docs/SECURITY.md`.
@@ -440,7 +442,8 @@ The first public release, on npm as `@flologixai/marv`.
 - The SDK: `createSession()` from `@flologixai/marv/sdk` runs Marv from code, without the UI.
 - Evals: `bun run eval` runs real models on small tasks with hidden checks.
 
-[Unreleased]: https://github.com/Flologix/marv/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/Flologix/marv/compare/v0.16.1...HEAD
+[0.16.1]: https://github.com/Flologix/marv/compare/v0.16.0...v0.16.1
 [0.16.0]: https://github.com/Flologix/marv/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/Flologix/marv/compare/v0.14.1...v0.15.0
 [0.14.1]: https://github.com/Flologix/marv/compare/v0.14.0...v0.14.1
