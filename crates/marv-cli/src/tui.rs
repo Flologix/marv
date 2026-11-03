@@ -403,7 +403,13 @@ pub fn map_event(
         SessionEvent::RadioNote { text } => vec![system(printable(&format!("✻ {text}")), false)],
         SessionEvent::Notice { text } => vec![system(printable(&format!("✻ {text}")), false)],
         SessionEvent::CheckpointFailed { message } => {
-            vec![system(format!("This turn can't be undone: its checkpoint failed ({message})."), true)]
+            // Said once while the same failure lasts (`checkpoint_turn`), so it says what follows for later turns.
+            vec![system(
+                format!(
+                    "This turn can't be undone: its checkpoint failed ({message}). Until that changes, later turns can't be undone either; this isn't repeated."
+                ),
+                true,
+            )]
         }
         SessionEvent::NotSent { texts } => vec![UiEvent::NotSent { texts }],
         SessionEvent::TurnEnd { turn, reason } => vec![UiEvent::TurnEnd {
@@ -2944,6 +2950,35 @@ impl SessionPort for Port {
 
     fn keyboard_held(&self, held: bool) {
         self.0.activity.set_held(held);
+    }
+
+    /// The processes view (ctrl+p): every process, and the selected one's last lines of output.
+    fn load_processes(&self, output_of: Option<String>) {
+        let b = &self.0;
+        let now = marv_tools::process::now_ms();
+        let list = b.session.processes();
+        let rows = list
+            .iter()
+            .map(|p| view::ProcessRow {
+                name: p.name.clone(),
+                command: p.command.clone(),
+                status: marv_tools::process::process_status(p, now),
+                running: p.state == marv_tools::ProcessState::Running,
+            })
+            .collect::<Vec<_>>();
+        let name = output_of.or_else(|| rows.first().map(|r| r.name.clone()));
+        let output = name.and_then(|n| {
+            let text = b.session.process_logs(&n, marv_tui::ui::process_panel::OUTPUT_ROWS).ok()?;
+            Some((n, text))
+        });
+        b.emit(UiEvent::Processes(view::ProcessesView { rows, output }));
+        // The count on the status bar follows a process that exited on its own.
+        b.emit(UiEvent::StatusInfo(b.status_info()));
+    }
+
+    /// The processes view's stop: what `/processes stop <name>` does (its message, the status bar's count).
+    fn stop_process(&self, name: String) {
+        self.run_command(format!("/processes stop {name}"));
     }
 
     fn login_callback(&self, text: &str) -> bool {

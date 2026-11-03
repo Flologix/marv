@@ -174,13 +174,25 @@ pub fn schema_repaired(tool: &dyn DynTool, raw: Value) -> (Value, Option<String>
     (value, repair_note(&fixes))
 }
 
-/// Whether a call is a file change (a `Write` tool with the "files" scope: edit_file, write_file) in a project that is
-/// the home folder or holds it ([`marv_sandbox::home_project`]). Such a call is asked `once`, every time.
+/// The scope-key prefix of a file change in one visible two-level folder of the home (`files:home:Projects/shop`),
+/// in a home-folder project (`edit_file::files_scope`). A person's "always" covers that folder only; a pre-approved
+/// "files" (the config's `"approve"`, the TUI's `--approve`) never does (`AlwaysScopes`), while `marv -p --approve
+/// files` answers it per call as it answers every home-folder change.
+pub const HOME_FOLDER_FILES: &str = "files:home:";
+
+/// Whether a call is a file change (a `Write` tool with a "files" scope: edit_file, write_file, apply_patch) in a
+/// project that is the home folder or holds it ([`marv_sandbox::home_project`]). Such a call never runs on yolo.
 pub fn home_file_write(kind: ToolKind, scope_key: &str, ctx: &ToolContext) -> bool {
     kind == ToolKind::Write
-        && scope_key == "files"
+        && (scope_key == "files" || scope_key.starts_with(HOME_FOLDER_FILES))
         && !ctx.home.as_os_str().is_empty()
         && marv_sandbox::home_project(&ctx.root, &ctx.home)
+}
+
+/// A home-folder file change outside one visible folder of the home ([`HOME_FOLDER_FILES`]): asked `once`, every
+/// time, with no "always".
+pub fn home_file_write_once(kind: ToolKind, scope_key: &str, ctx: &ToolContext) -> bool {
+    scope_key == "files" && home_file_write(kind, scope_key, ctx)
 }
 
 /// Runs a call. Never fails: every failure becomes a result the model can read and recover from.
@@ -341,11 +353,14 @@ pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef])
             // In the home folder (the project is `~` or holds it), a file change asks each time: the edit tools write
             // outside the sandbox, and a plain file there (a script on PATH, another repository's Makefile) can run on
             // the host later. So no "always" is offered, no remembered or config-seeded "files" covers it, and yolo
-            // (which the session refuses there anyway) doesn't run it.
+            // (which the session refuses there anyway) doesn't run it. One exception: a change inside one visible
+            // two-level folder (`~/Projects/shop`, not on PATH) offers "always" for that folder alone; yolo still
+            // doesn't run it and the config's "files" still doesn't cover it.
             let home_write = home_file_write(tool.kind(), &scope.key, ctx);
             // A turn without automatic approval (#124, a turn the radio started) asks every call `once`: no
             // remembered "always" and no worktree subagent's automatic yes answers it.
-            let once = asked_every_time(tool.as_ref(), input, ctx) || home_write || tainted_sink;
+            let once =
+                asked_every_time(tool.as_ref(), input, ctx) || home_file_write_once(tool.kind(), &scope.key, ctx) || tainted_sink;
             // Yolo: a call the tool vouches for runs without asking, confined (bash then can't touch .git).
             // `approveSandboxed` (the default): bash in the sandbox without network runs the same way, in a turn the
             // person started or a wake; yolo or not.

@@ -147,6 +147,9 @@ impl Tool for WriteFile {
     fn scope(&self, _input: &WriteFileInput) -> Option<Scope> {
         Some(Scope { key: "files".into(), description: "file changes".into() })
     }
+    fn scope_in(&self, input: &WriteFileInput, ctx: &ToolContext) -> Option<Scope> {
+        Some(crate::edit_file::files_scope(&[input.path.as_str()], ctx))
+    }
     fn auto_safe(&self, input: &WriteFileInput, ctx: &ToolContext) -> bool {
         !touches_git(ctx, &input.path)
     }

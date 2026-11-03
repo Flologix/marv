@@ -719,7 +719,7 @@ impl Tool for Bash {
             "properties": {
                 "command": {"type": "string", "minLength": 1, "description": "The shell command (bash). Runs in the project folder."},
                 "timeout": {"type": "integer", "minimum": 1, "maximum": MAX_TIMEOUT_S, "description": format!("Seconds before it's stopped. Default {DEFAULT_TIMEOUT_S}.")},
-                "network": {"type": "boolean", "description": "Allow network access (e.g. to install packages). Off by default."},
+                "network": {"type": "boolean", "description": "Allow network access (e.g. to install packages). Off by default. Not needed to reach your background processes' ports (curl localhost:<port> works without it), and asking for it makes the user approve the command."},
                 "git_write": {"type": "boolean", "description": "Set when the command changes the git repository (commit, checkout, merge, rebase, stash, branch, tag, init…). Otherwise .git may be read-only."},
                 "sandbox": {"type": "boolean", "description": "false runs the command on the user's machine, outside the sandbox, with their permissions; always asks. Only for what can't work in the sandbox (a system service, a tool under the home folder, hardware), after a sandboxed attempt failed."}
             },

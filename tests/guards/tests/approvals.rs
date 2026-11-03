@@ -485,6 +485,59 @@ async fn a_subagents_automatic_yes_doesnt_cover_a_once_request() {
     assert_eq!(plain.approve(request).await, Decision::Yes);
 }
 
+/// **In the home folder, "always" covers file changes in one visible two-level folder (`~/Projects/shop`), and only
+/// there.** A change inside it offers "always" for that folder (`files:home:Projects/shop`, not `once`); once
+/// answered, the next write and edit there run unasked. A change in another folder, or higher up (`~/bin/x`), still
+/// asks, `once`; the config's `"approve": ["files"]` doesn't cover the folder; and yolo doesn't run it.
+///
+/// Proven: made `AlwaysScopes::contains` let seeds cover `files:home:` → failed (the seed answered the folder);
+/// made `home_file_write_once` true for the folder key → failed (asked `once`, the "always" wasn't remembered).
+#[tokio::test]
+async fn in_the_home_folder_always_covers_one_visible_folder() {
+    let home = TempDir::new("home-folder-always");
+    std::fs::create_dir_all(home.path().join("Projects/shop/site")).unwrap();
+    std::fs::create_dir_all(home.path().join("Projects/other")).unwrap();
+    let write = |path: &str| call("write_file", json!({"path": path, "content": "a\n"}));
+
+    // A seeded "files" doesn't answer it, and yolo doesn't run it: the person is asked, for that folder.
+    let person = Recorder::new(Decision::No);
+    let always = AlwaysScopes::default();
+    always.seed(&marv_session::approvals::seed_prefixes(&["files".to_string()]).unwrap());
+    let ctx = ToolContext { yolo: true, ..home_ctx(home.path(), home.path(), person.clone(), always) };
+    let out = run_tool(&write("Projects/shop/site/x.css"), &ctx, builtin_tools()).await;
+    assert!(out.result.declined, "{}", out.result.output);
+    let asked = person.requests();
+    assert_eq!(asked.len(), 1, "asked despite the seed and yolo");
+    assert_eq!(asked[0].scope.key, "files:home:Projects/shop");
+    assert_eq!(asked[0].scope.description, "file changes in ~/Projects/shop");
+    assert!(!asked[0].once, "\"always\" is offered");
+
+    // "Always" for the folder covers the next write and an edit there; nothing outside it.
+    let person = Recorder::new(Decision::Always);
+    let always = AlwaysScopes::default();
+    let ctx = home_ctx(home.path(), home.path(), person.clone(), always.clone());
+    for path in ["Projects/shop/site/index.html", "Projects/shop/site/styles.css"] {
+        let out = run_tool(&write(path), &ctx, builtin_tools()).await;
+        assert!(!out.result.declined && !out.result.is_error, "{}", out.result.output);
+    }
+    marv_guards::have_read(&ctx, &["Projects/shop/site/styles.css"]);
+    let edit = call("edit_file", json!({"path": "Projects/shop/site/styles.css", "old_string": "a", "new_string": "b"}));
+    let out = run_tool(&edit, &ctx, builtin_tools()).await;
+    assert!(!out.result.declined && !out.result.is_error, "{}", out.result.output);
+    assert_eq!(person.requests().len(), 1, "one \"always\" covered the write and the edit after it");
+    assert!(always.contains("files:home:Projects/shop"));
+
+    for (path, key, once) in [("Projects/other/a.txt", "files:home:Projects/other", false), ("bin/tool", "files", true)] {
+        let before = person.requests().len();
+        let out = run_tool(&write(path), &ctx, builtin_tools()).await;
+        assert!(!out.result.declined, "{}", out.result.output);
+        let asked = person.requests();
+        assert_eq!(asked.len(), before + 1, "{path} asked");
+        assert_eq!((asked[before].scope.key.as_str(), asked[before].once), (key, once), "{path}");
+    }
+    assert!(!always.contains("files"), "a change outside a folder is never remembered");
+}
+
 /// **A project in a subfolder of the home keeps "always" as before**: one "always" answer covers the next file
 /// change, and the request offers it (not `once`).
 ///

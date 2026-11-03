@@ -706,6 +706,7 @@ pub fn help_text() -> String {
             "  esc       stop a reply or tool",
             "  ctrl+k    command palette: commands, skills, settings and keys",
             "  ctrl+o    show subagents' steps and whole diffs",
+            "  ctrl+p    background processes: commands, addresses, live output (or click \"N running\")",
             "  ctrl+c    clear input · press twice to exit",
         ]
         .map(String::from),

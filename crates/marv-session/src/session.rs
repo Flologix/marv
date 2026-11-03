@@ -270,7 +270,8 @@ pub enum SessionEvent {
     },
     /// The project's own checks after a step's file changes.
     Checks(ProjectCheckResult),
-    /// The turn's checkpoint (#16) couldn't be saved: the turn goes on, but /undo can't take it back. Once per turn.
+    /// The turn's checkpoint (#16) couldn't be saved: the turn goes on, but /undo can't take it back. Once per turn,
+    /// and not again while the same failure lasts (`checkpoint_turn`).
     CheckpointFailed {
         message: String,
     },
@@ -817,6 +818,13 @@ struct RadioTurnFacts {
     declined: Option<String>,
     /// The person joined the turn with "send now": its reply answered them too, and the report never quotes it.
     sent_now: bool,
+}
+
+/// Whether two checkpoint failures are the same one, apart from the numbers in them (a file count that moves turn
+/// to turn).
+fn same_failure(a: &str, b: &str) -> bool {
+    let shape = |s: &str| s.chars().filter(|c| !c.is_ascii_digit()).collect::<String>();
+    shape(a) == shape(b)
 }
 
 impl State {
@@ -2366,7 +2374,9 @@ impl MarvSession {
     }
 
     /// The turn's checkpoint pair: its snapshots go to the trajectory, a failure is said once (and kept for
-    /// `undo_plan()` and /checkpoints), and a slow before shows as `Checkpointing`.
+    /// `undo_plan()` and /checkpoints), and a slow before shows as `Checkpointing`. A failure the last turn already
+    /// had (the same message, counts aside: a home folder's "too large" every turn) isn't said again until a
+    /// checkpoint works or another failure comes.
     fn checkpoint_turn(&self, number: u32, label: &str, turn: &str, emit: &Emit, record: &Record) -> CheckpointTurn {
         let (session, record, turn) = (self.clone(), record.clone(), turn.to_string());
         let on_snapshot = move |kind: CheckpointKind, r: &SnapshotResult| {
@@ -2377,7 +2387,10 @@ impl MarvSession {
         };
         let (session, failed_emit, said) = (self.clone(), emit.clone(), AtomicBool::new(false));
         let on_failed = move |message: String| {
-            session.state().checkpoint_failure = Some(message.clone());
+            let before = session.state().checkpoint_failure.replace(message.clone());
+            if before.is_some_and(|before| same_failure(&before, &message)) {
+                said.store(true, Ordering::SeqCst);
+            }
             if !said.swap(true, Ordering::SeqCst) {
                 failed_emit(SessionEvent::CheckpointFailed { message });
             }
@@ -3834,6 +3847,14 @@ impl MarvSession {
     /// The background processes (Marv #51): name, command, ports, state.
     pub fn processes(&self) -> Vec<ProcessInfo> {
         self.inner.processes.as_ref().map(ProcessManager::list).unwrap_or_default()
+    }
+
+    /// A background process's last `lines` lines of output (the TUI's processes view).
+    pub fn process_logs(&self, name: &str, lines: usize) -> Result<String, marv_tools::ToolError> {
+        match &self.inner.processes {
+            Some(processes) => processes.logs(name, lines),
+            None => Err(marv_tools::ToolError::new("This session has no background processes.")),
+        }
     }
 
     /// Stops a background process and everything it started; false when there's none of that name.

@@ -260,6 +260,45 @@ async fn a_start_asks_even_in_yolo_and_a_no_starts_nothing() {
     manager.close_all().await;
 }
 
+/// **With `approveSandboxed`, `serve` runs unasked in a person's turn; a `start`, and a `serve` in a woken turn,
+/// still ask.** `serve` is Marv's own server with the project read-only and no network: no more than a sandboxed
+/// command. A start runs the project's code; a wake is another agent's message, which opens no door (#74).
+///
+/// Proven: made `ProcessTool::auto_sandboxed` true for every action → failed (the start wasn't asked); dropped it →
+/// failed (the person's serve was asked).
+#[tokio::test]
+async fn approve_sandboxed_serves_a_folder_unasked_but_a_start_still_asks() {
+    require_bwrap!();
+    let decoys = Decoys::new("proc-serve-unasked");
+    std::fs::create_dir_all(decoys.root.join("site")).unwrap();
+    std::fs::write(decoys.root.join("site/index.html"), "<p>hi</p>").unwrap();
+    let manager = decoys.manager(300);
+    let ctx = |recorder: &Arc<Recorder>, mode: marv_tools::CallMode| ToolContext {
+        yolo: false,
+        approve_sandboxed: true,
+        mode,
+        ..door_ctx(&decoys, &manager, recorder)
+    };
+    let serve = call("process", json!({"action": "serve", "path": "site"}));
+    let recorder = Recorder::new(Decision::No);
+    let outcome = run_tool(&serve, &ctx(&recorder, marv_tools::CallMode::Person), builtin_tools()).await;
+    assert!(recorder.requests().is_empty(), "the person's serve wasn't asked: {}", outcome.result.output);
+    assert!(!outcome.result.declined);
+    manager.close_all().await;
+
+    let recorder = Recorder::new(Decision::No);
+    let outcome = run_tool(&serve, &ctx(&recorder, marv_tools::CallMode::Woken), builtin_tools()).await;
+    assert_eq!(recorder.requests().len(), 1, "a woken turn's serve asks");
+    assert!(outcome.result.declined);
+
+    let recorder = Recorder::new(Decision::No);
+    let start = call("process", json!({"action": "start", "command": "sleep 100"}));
+    let outcome = run_tool(&start, &ctx(&recorder, marv_tools::CallMode::Person), builtin_tools()).await;
+    assert_eq!(recorder.requests().len(), 1, "a start asks");
+    assert!(outcome.result.declined && manager.list().is_empty());
+    manager.close_all().await;
+}
+
 /// **A subagent's context can't start one, even when the parent's could: refused before any ask.** Its process would
 /// outlive its report; the door is the context's to open (the main agent's), not the approver's.
 ///

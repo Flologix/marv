@@ -180,6 +180,37 @@ pub fn home_project(root: &Path, home: &Path) -> bool {
     contains(&real(root), &real(home))
 }
 
+/// In a home-folder project, the visible two-level folder of the home (`Projects/shop`) a file the edit tools would
+/// change lies in, lexically and after realpath alike, so a person can answer "always" for that one folder. None
+/// (the change asks every time) for a file higher up (`~/notes.md`, `~/Desktop/a.txt`), under a hidden entry at
+/// either level, led elsewhere by a symlink, or in a folder that is on `path` or holds a folder that is (a script
+/// written there would run as a command).
+pub fn home_subfolder(root: &Path, home: &Path, absolute: &Path, path: &str) -> Option<PathBuf> {
+    if !home_project(root, home) {
+        return None;
+    }
+    let real_home = std::fs::canonicalize(home).ok()?;
+    let folder = |base: &Path, file: &Path| -> Option<PathBuf> {
+        let parts: Vec<_> = file.strip_prefix(base).ok()?.components().collect();
+        // Two folders and at least the file below them.
+        if parts.len() < 3 || parts[..2].iter().any(|p| p.as_os_str().to_string_lossy().starts_with('.')) {
+            return None;
+        }
+        Some(parts[..2].iter().collect())
+    };
+    let lexical = folder(&crate::paths::normalize(home), absolute)?;
+    let real = folder(&real_home, &crate::paths::real_with_missing(absolute).ok()?)?;
+    if lexical != real {
+        return None;
+    }
+    let full = real_home.join(&real);
+    let on_path = std::env::split_paths(path).any(|entry| {
+        let entry = std::fs::canonicalize(&entry).unwrap_or(entry);
+        entry.starts_with(&full)
+    });
+    (!on_path).then_some(real)
+}
+
 /// Whether `outer` is `inner` or a parent of it.
 pub(crate) fn contains(outer: &Path, inner: &Path) -> bool {
     inner.starts_with(outer)
@@ -257,5 +288,34 @@ mod tests {
             ),
             vec![PathBuf::from("/home/me/.tools/bin")]
         );
+    }
+
+    #[test]
+    fn a_home_file_change_gets_its_two_level_visible_folder_or_nothing() {
+        let home = crate::paths::test_dir::TempDir::new("home-subfolder");
+        let h = home.path();
+        std::fs::create_dir_all(h.join("Projects/shop/site")).unwrap();
+        std::fs::create_dir_all(h.join("Projects/.hidden")).unwrap();
+        std::fs::create_dir_all(h.join("go/bin")).unwrap();
+        std::fs::create_dir_all(h.join("Documents/other")).unwrap();
+        std::os::unix::fs::symlink(h.join("Documents/other"), h.join("Projects/shop/away")).unwrap();
+        std::os::unix::fs::symlink(h.join("Documents"), h.join("Projects/linked")).unwrap();
+        let at = |rel: &str, path: &str| home_subfolder(h, h, &h.join(rel), path);
+        assert_eq!(at("Projects/shop/site/index.html", ""), Some(PathBuf::from("Projects/shop")));
+        assert_eq!(at("Projects/shop/new/deeper/a.css", "/usr/bin"), Some(PathBuf::from("Projects/shop")));
+        // Too high up, hidden, through a symlink, or a folder on PATH.
+        assert_eq!(at("notes.md", ""), None);
+        assert_eq!(at("Projects/readme.md", ""), None);
+        assert_eq!(at("Projects/shop", ""), None);
+        assert_eq!(at("Projects/.hidden/x/a", ""), None);
+        assert_eq!(at(".config/app/a", ""), None);
+        assert_eq!(at("Projects/shop/away/a.txt", ""), None);
+        assert_eq!(at("Projects/linked/other/a.txt", ""), None);
+        let path = format!("/usr/bin:{}", h.join("go/bin").display());
+        assert_eq!(at("go/bin/tool", &path), None);
+        let path = format!("/usr/bin:{}", h.join("Projects/shop/site").display());
+        assert_eq!(at("Projects/shop/a.txt", &path), None);
+        // Not a home-folder project: nothing to scope.
+        assert_eq!(home_subfolder(&h.join("Projects/shop"), h, &h.join("Projects/shop/site/a"), ""), None);
     }
 }

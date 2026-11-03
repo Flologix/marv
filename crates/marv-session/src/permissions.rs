@@ -84,6 +84,7 @@ const GROUPS: &[(&str, &str)] = &[
     ("process:", "process door"),
     ("herdr:", "herdr door"),
     ("mesh:", "Mesh calls"),
+    ("files:home:", "File changes in a home folder"),
     ("files", "File changes"),
     ("memory", "Memory changes"),
     ("agent:worktree", "Subagents in worktrees"),
@@ -148,9 +149,11 @@ pub fn permissions_text(p: &Permissions, saved: Option<SavedGrants>, mcp: Option
         (false, false) => "a command that needs it asks each time (and while untrusted, always)".into(),
         (true, _) => network,
     };
-    // A project that is the home folder (or holds it): every file change asks, `files` or "always" or not.
+    // A project that is the home folder (or holds it): every file change asks, `files` or not, except in a folder a
+    // person answered "always" for (`files:home:`).
     let home = p.no_yolo.is_some();
-    let files_note = " (but in this folder every file change still asks)";
+    let files_note =
+        " (but in this folder every file change still asks, unless you answer \"always\" for one folder like ~/Projects/shop)";
     let taint = if p.tainted.is_empty() {
         "no".to_string()
     } else {
@@ -423,16 +426,17 @@ mod tests {
     fn home_folder_file_changes_and_turns_you_didnt_start_are_caveated() {
         let p = Permissions {
             no_yolo: Some("the project is your home folder".into()),
-            remembered: keys(&["files"]),
+            remembered: keys(&["files", "files:home:Projects/shop"]),
             pre_approved: keys(&["files"]),
             ..Permissions::default()
         };
         let text = permissions_text(&p, None, None);
-        assert!(text.contains("- File changes: (all) (but in this folder every file change still asks)"), "{text}");
-        assert!(text.contains("- `files`: file changes · `files` (but in this folder every file change still asks)"), "{text}");
+        assert!(text.contains("- File changes in a home folder: `Projects/shop`\n"), "{text}");
+        assert!(text.contains("- File changes: (all) (but in this folder every file change still asks, unless you answer \"always\" for one folder like ~/Projects/shop)"), "{text}");
+        assert!(text.contains("- `files`: file changes · `files` (but in this folder every file change still asks, unless you answer \"always\" for one folder like ~/Projects/shop)"), "{text}");
         assert!(text.contains("a turn you didn't start (a mesh or radio message woke it) uses none of this"), "{text}");
         let elsewhere = permissions_text(&Permissions { no_yolo: None, ..p }, None, None);
-        assert!(!elsewhere.contains("still asks)"), "{elsewhere}");
+        assert!(!elsewhere.contains("still asks,"), "{elsewhere}");
     }
 
     #[test]

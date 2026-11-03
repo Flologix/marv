@@ -106,6 +106,7 @@ use crate::ui::markdown::StreamLexer;
 use crate::ui::martian::MartianAnimation;
 use crate::ui::message_view;
 use crate::ui::plan_view::{self, PLAN_MIN_WINDOW};
+use crate::ui::process_panel::{ProcessKey, ProcessPanel};
 use crate::ui::prompt_input::{self, PromptInput, PromptOutcome};
 use crate::ui::radio_view::{self, RadioPanel};
 use crate::ui::scroll_view::ScrollView;
@@ -149,6 +150,10 @@ pub const EXIT_CONFIRM_MS: Duration = Duration::from_millis(1500);
 pub const APPROVAL_ARM_MS: Duration = Duration::from_millis(400);
 /// How long a status bar flash ("Copied 3 lines") stays.
 pub const NOTICE_MS: Duration = Duration::from_millis(2000);
+/// How often the open processes view asks for a fresh list and output.
+pub const PROCESSES_REFRESH: Duration = Duration::from_millis(1000);
+/// After a stop from the processes view, the list is asked for again this soon (the stop takes up to 2 s).
+pub const PROCESSES_AFTER_STOP: Duration = Duration::from_millis(300);
 /// A burst of streamed text is revealed over about this long (see the module docs): long enough to
 /// cover the gap between a provider's network reads, short enough that the reply never lags far.
 pub const REVEAL_MS: Duration = Duration::from_millis(120);
@@ -375,6 +380,12 @@ pub struct App {
     radio: RadioView,
     /// `/radio`'s roster view is open (Esc closes it).
     radio_panel: bool,
+    /// The processes view (ctrl+p, or a click on the status bar's "N running"), until Esc.
+    processes: Option<ProcessPanel>,
+    /// When the open processes view next asks for a fresh list ([`PROCESSES_REFRESH`]).
+    processes_due: Option<Instant>,
+    /// Where the status bar drew "N running" last frame (row, first column, past the last), for a click on it.
+    running_at: Option<(u16, u16, u16)>,
     /// A message just received flashes on the strip until then (#124): its id, and when the flash ends.
     radio_flash: Option<(String, Instant)>,
     /// The newest received message already seen (flashed or not), so a roster change doesn't flash it again.
@@ -459,6 +470,9 @@ impl App {
             setup: None,
             radio: RadioView::default(),
             radio_panel: false,
+            processes: None,
+            processes_due: None,
+            running_at: None,
             radio_flash: None,
             radio_seen: None,
             held_told: None,
@@ -589,6 +603,7 @@ impl App {
             || self.picker.is_some()
             || self.palette.is_some()
             || self.radio_panel
+            || self.processes.is_some()
             || self.prompt.value.trim_start().starts_with('/')
     }
 
@@ -692,6 +707,11 @@ impl App {
             self.radio_flash = None;
             self.dirty = true;
         }
+        if self.processes_due.is_some_and(|due| now >= due) {
+            let selected = self.processes.as_ref().and_then(ProcessPanel::selected);
+            self.port.load_processes(selected);
+            self.processes_due = Some(now + PROCESSES_REFRESH);
+        }
     }
 
     /// The earliest moment something on screen changes on its own.
@@ -712,6 +732,7 @@ impl App {
         d.add(self.confirm_exit);
         d.add(self.flash.as_ref().map(|(_, until)| *until));
         d.add(self.radio_flash.as_ref().map(|(_, until)| *until));
+        d.add(self.processes_due);
         d.next()
     }
 
@@ -889,6 +910,12 @@ impl App {
                 }
                 self.radio = view;
                 self.dirty = true;
+            }
+            UiEvent::Processes(view) => {
+                if let Some(panel) = &mut self.processes {
+                    panel.update(view);
+                    self.dirty = true;
+                }
             }
             UiEvent::OpenRadio => {
                 if self.radio.on {
@@ -1432,6 +1459,39 @@ impl App {
             return;
         }
 
+        // ctrl+p: the processes view (what "N running" is), from the prompt; again closes it. Never over an approval,
+        // the session picker or setup, which keep the keyboard.
+        if key.code == KeyCode::Char('p') && ctrl && self.approval.is_none() && self.picker.is_none() {
+            if self.processes.is_some() {
+                self.close_processes();
+            } else {
+                self.open_processes(now);
+            }
+            return;
+        }
+        // The processes view: its keys, Esc to close (it never stops a run); ctrl+c and paging still work.
+        if self.approval.is_none()
+            && self.picker.is_none()
+            && self.setup.is_none()
+            && let Some(panel) = &mut self.processes
+            && !(ctrl && key.code == KeyCode::Char('c'))
+            && !matches!(key.code, KeyCode::PageUp | KeyCode::PageDown)
+        {
+            match panel.on_key(key) {
+                ProcessKey::None => {}
+                ProcessKey::Close => self.close_processes(),
+                ProcessKey::Selected(name) => {
+                    self.port.load_processes(Some(name));
+                    self.processes_due = Some(now + PROCESSES_REFRESH);
+                }
+                ProcessKey::Stop(name) => {
+                    self.port.stop_process(name);
+                    self.processes_due = Some(now + PROCESSES_AFTER_STOP);
+                }
+            }
+            return;
+        }
+
         // `/radio`'s view: Esc closes it (it never stops a run); ctrl+c and paging still work, the rest waits.
         if self.radio_panel && self.approval.is_none() && self.picker.is_none() && self.setup.is_none() {
             if RadioPanel.on_key(key) {
@@ -1708,6 +1768,22 @@ impl App {
         self.dirty = true;
     }
 
+    /// Opens the processes view and asks for the list (a palette open goes, as for the radio's roster).
+    fn open_processes(&mut self, now: Instant) {
+        self.palette = None;
+        self.radio_panel = false;
+        self.processes = Some(ProcessPanel::default());
+        self.port.load_processes(None);
+        self.processes_due = Some(now + PROCESSES_REFRESH);
+        self.dirty = true;
+    }
+
+    fn close_processes(&mut self) {
+        self.processes = None;
+        self.processes_due = None;
+        self.dirty = true;
+    }
+
     // ------------------------------------------------------------------------------------------
     // Mouse
     // ------------------------------------------------------------------------------------------
@@ -1735,6 +1811,13 @@ impl App {
             MouseEvent::Drag { x, y } => self.selection.drag(x, y, now),
             MouseEvent::Release { x, y } => match self.selection.release() {
                 SelectionEffect::Copy(text) if !text.is_empty() => SelectionEffect::Copy(text),
+                effect if self.running_at.is_some_and(|(row, from, to)| y == row && (from..to).contains(&x)) => {
+                    // A click on the status bar's "N running": the processes view.
+                    if self.processes.is_none() {
+                        self.open_processes(now);
+                    }
+                    effect
+                }
                 effect => {
                     // A click: on a subagent's entry, open its view.
                     let row = if self.viewing.is_some() { None } else { self.selection.row_at(x, y) };
@@ -1816,9 +1899,16 @@ impl App {
         }
         let header = if self.viewing.is_some() { agent_view::HEADER_HEIGHT } else { 0 };
         let radio_panel = self.radio_panel && self.radio.on && self.picker.is_none();
+        let processes_height = self
+            .processes
+            .as_ref()
+            .filter(|_| self.picker.is_none() && self.setup.is_none() && self.approval.is_none())
+            .map(ProcessPanel::height);
         let panel_height = if let Some(picker) = self.picker.as_ref().filter(|_| self.setup.is_none() && self.approval.is_none())
         {
             picker.height()
+        } else if let Some(height) = processes_height {
+            height + status_height
         } else if radio_panel && self.setup.is_none() && self.approval.is_none() {
             RadioPanel::height(&self.radio)
         } else if let Some((_, view)) = self.approval.as_ref().filter(|_| self.setup.is_none()) {
@@ -1831,8 +1921,12 @@ impl App {
             self.prompt.height(width, busy, &self.commands) + status_height
         };
         // #184: the queued messages, above the prompt (only where the prompt shows).
-        let prompt_shown =
-            self.picker.is_none() && !radio_panel && self.approval.is_none() && self.setup.is_none() && self.palette.is_none();
+        let prompt_shown = self.picker.is_none()
+            && !radio_panel
+            && processes_height.is_none()
+            && self.approval.is_none()
+            && self.setup.is_none()
+            && self.palette.is_none();
         let queue = if prompt_shown { prompt_input::queue_rows(&self.queued, width) } else { Vec::new() };
         let queue_height = (queue.len() as u16).min(area.height.saturating_sub(header + panel_height + 2));
         let panel_height = panel_height + queue_height;
@@ -1899,8 +1993,17 @@ impl App {
         let panel = Rect { y: panel.y + queue_height, height: panel.height - queue_height, ..panel };
         let status_area = Rect { y: panel.bottom().saturating_sub(1), height: 1.min(panel.height), ..panel };
         let above_status = Rect { height: panel.height.saturating_sub(1), ..panel };
+        self.running_at = None;
+        let processes_shown =
+            self.processes.is_some() && self.picker.is_none() && self.setup.is_none() && self.approval.is_none();
         if let Some(picker) = self.picker.as_ref().filter(|_| self.setup.is_none() && self.approval.is_none()) {
             picker.render(panel, buf);
+        } else if processes_shown {
+            if let Some(view) = &self.processes {
+                view.render(above_status, buf);
+            }
+            self.running_at = bar.running_at(status_area);
+            bar.render(status_area, buf);
         } else if radio_panel && self.setup.is_none() && self.approval.is_none() {
             RadioPanel::render(&self.radio, unix_ms(), panel, buf);
         } else if let Some((_, view)) = self.approval.as_ref().filter(|_| self.setup.is_none()) {
@@ -1914,6 +2017,7 @@ impl App {
             bar.render(status_area, buf);
         } else {
             self.prompt.render(above_status, buf, busy, &self.commands);
+            self.running_at = bar.running_at(status_area);
             bar.render(status_area, buf);
         }
     }
@@ -2101,6 +2205,8 @@ mod tests {
         LoginCallback(String),
         SendNow(String),
         Queue(String),
+        LoadProcesses(Option<String>),
+        StopProcess(String),
     }
 
     #[derive(Default)]
@@ -2182,6 +2288,12 @@ mod tests {
         }
         fn keyboard_held(&self, held: bool) {
             self.held.lock().unwrap().push(held);
+        }
+        fn load_processes(&self, output_of: Option<String>) {
+            self.calls.lock().unwrap().push(Call::LoadProcesses(output_of));
+        }
+        fn stop_process(&self, name: String) {
+            self.calls.lock().unwrap().push(Call::StopProcess(name));
         }
         fn login_callback(&self, text: &str) -> bool {
             let taken = text.starts_with("http://127.0.0.1:5555/callback?");
@@ -3296,6 +3408,61 @@ mod tests {
         h.arm();
         h.key(ENTER);
         assert_eq!(h.calls().last(), Some(&Call::Answer(1, Decision::Yes)));
+    }
+
+    fn processes(names: &[&str]) -> UiEvent {
+        let rows = names
+            .iter()
+            .map(|n| crate::view::ProcessRow {
+                name: n.to_string(),
+                command: format!("serve {n}"),
+                status: "running · http://localhost:4173 · up 2m".into(),
+                running: true,
+            })
+            .collect();
+        let output = names.first().map(|n| (n.to_string(), "Serving on http://localhost:4173\nGET / 200".to_string()));
+        UiEvent::Processes(crate::view::ProcessesView { rows, output })
+    }
+
+    #[test]
+    fn ctrl_p_opens_the_processes_view_which_refreshes_and_stops_one() {
+        let mut h = harness();
+        h.event(UiEvent::StatusInfo(StatusInfo { processes: 1, ..options(0).status }));
+        assert!(h.frame().contains("1 running ctrl+p"));
+        h.ctrl('p');
+        assert_eq!(h.calls().last(), Some(&Call::LoadProcesses(None)));
+        h.event(processes(&["serve-site"]));
+        let frame = h.frame();
+        assert!(frame.contains("› serve-site  running · http://localhost:4173 · up 2m"), "{frame}");
+        assert!(frame.contains("$ serve serve-site") && frame.contains("GET / 200"), "{frame}");
+        // Every second while it's open: the list again, with the selected one's output.
+        h.advance(1_000);
+        assert_eq!(h.calls().last(), Some(&Call::LoadProcesses(Some("serve-site".into()))));
+        // Typing doesn't reach the prompt; s twice stops the selected one.
+        h.key(KeyCode::Char('s'));
+        assert!(h.frame().contains("Press s again to stop serve-site"));
+        h.key(KeyCode::Char('s'));
+        assert_eq!(h.calls().last(), Some(&Call::StopProcess("serve-site".into())));
+        assert!(!h.frame().contains("> s"));
+        h.key(KeyCode::Esc);
+        assert!(!h.frame().contains("Background processes"));
+        let before = h.calls().len();
+        h.advance(5_000);
+        assert_eq!(h.calls().len(), before, "closed: no more refreshes");
+    }
+
+    #[test]
+    fn a_click_on_n_running_opens_the_processes_view() {
+        let mut h = harness();
+        h.event(UiEvent::StatusInfo(StatusInfo { processes: 2, ..options(0).status }));
+        h.click_on("2 running");
+        assert_eq!(h.calls().last(), Some(&Call::LoadProcesses(None)));
+        h.event(processes(&["web", "worker"]));
+        assert!(h.frame().contains("Background processes"));
+        h.key(KeyCode::Down);
+        assert_eq!(h.calls().last(), Some(&Call::LoadProcesses(Some("worker".into()))));
+        h.ctrl('p');
+        assert!(!h.frame().contains("Background processes"), "ctrl+p again closes it");
     }
 
     #[test]
