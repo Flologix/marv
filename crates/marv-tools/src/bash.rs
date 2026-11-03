@@ -1659,7 +1659,8 @@ mod tests {
         let git = root.path().join(".git");
         let config = std::fs::read_to_string(git.join("config")).unwrap();
         let commit = "git checkout -q -b feature && echo b >> f && git -c user.email=a@b -c user.name=n commit -qam 2 \
-                      && git checkout -q main && git merge -q --no-ff -m merged feature && git log --oneline | wc -l";
+                      && git checkout -q main \
+                      && git -c user.email=a@b -c user.name=n merge -q --no-ff -m merged feature && git log --oneline | wc -l";
         let out = Bash.run(&git_bash(commit, true), &ctx).await.unwrap();
         assert!(out.output.starts_with("3\n"), "{}", out.output);
         // Every way to make git run a program outside, or to follow one somewhere else, fails.
