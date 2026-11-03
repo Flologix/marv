@@ -7,7 +7,9 @@
 //!   `auto_safe`); reading its logs, listing and stopping don't (stopping your own process can't hurt).
 //! - `serve` (marv-rs) is a start of Marv's own static file server (`crate::serve`, `marv __serve`) on a folder of the
 //!   project: the same door, the same ask (scope `process:serve:<folder>`), the same sandbox without network, the same
-//!   port forwarding. It needs no command, so a machine without `serve` or `python` can still show `dist/`.
+//!   port forwarding. It needs no command, so a machine without `serve` or `python` can still show `dist/`. It runs no
+//!   project code and sees the project read-only, so with `approveSandboxed` it runs unasked in a person's turn
+//!   (`auto_sandboxed`), like a sandboxed command; a woken turn still asks (another agent's message opens no door).
 //! - Scope `process:[net:]<command>` ("starting this exact command in the background"); `door` is `process` for a
 //!   start. A start with `network: true` uses the network (it shares the user's).
 //! - The door is the context's to open (set for the main agent only), not the approver's: without it a start is
@@ -138,6 +140,12 @@ pub fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
 
+/// "running · http://localhost:4789 · up 2m" (with "on the user's network" when it is): the TUI's processes view.
+pub fn process_status(info: &ProcessInfo, now: u64) -> String {
+    let net = if info.network { " · on the user's network" } else { "" };
+    format!("{}{net} · up {}", state(info), uptime(info, now))
+}
+
 /// One line per process, for list and `/processes`.
 pub fn process_line(info: &ProcessInfo, now: u64) -> String {
     let net = if info.network { " · on the user's network" } else { "" };
@@ -255,6 +263,12 @@ impl Tool for ProcessTool {
         matches!(input.action, ProcessAction::Start | ProcessAction::Serve).then_some(marv_core::Door::Process)
     }
     // No auto_safe: yolo never starts one unasked (it keeps running, and the user can reach it).
+    /// `approveSandboxed`: `serve` alone, in a person's turn. It runs Marv's own server, not the project's code, with
+    /// the project read-only and no network, and only its port reaches the user's 127.0.0.1: what a sandboxed command
+    /// without network already runs unasked. A `start` runs the project's code and keeps asking.
+    fn auto_sandboxed(&self, input: &ProcessInput, ctx: &ToolContext) -> bool {
+        input.action == ProcessAction::Serve && !ctx.mode.sandboxed_unasked_project_read_only()
+    }
 
     async fn preview(&self, input: &ProcessInput, ctx: &ToolContext) -> Result<Preview, ToolError> {
         // Refused before any ask: the door is the context's to open (set for the main agent only), not the approver's.
@@ -359,7 +373,7 @@ fn start_output(info: &ProcessInfo, output: &str, one_shot: bool) -> ToolOutput 
         parts.push(if info.network {
             format!("It shares the user's network, so it listens on their machine directly: {urls}.")
         } else {
-            format!("Forwarded to the user's machine: {urls} (your bash commands reach it there too).")
+            format!("Forwarded to the user's machine: {urls} (your bash commands reach it there too, without network: true).")
         });
     } else {
         parts.push("It's running but hasn't listened on a port yet (waited 10 s): check its logs, or list later.".into());
@@ -475,7 +489,7 @@ mod tests {
         assert!(
             started
                 .output
-                .contains("Forwarded to the user's machine: http://localhost:4789 (your bash commands reach it there too).")
+                .contains("Forwarded to the user's machine: http://localhost:4789 (your bash commands reach it there too, without network: true).")
         );
         assert!(started.output.ends_with("First output:\nready"));
         assert_eq!(started.summary, "running · localhost:4789");

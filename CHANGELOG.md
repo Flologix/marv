@@ -6,6 +6,14 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+### Changed
+
+- **In your home folder, "always" works for file changes inside one project folder.** Started in `~`, every edit and write asked, with no "always", because the edit tools write outside the sandbox there. A change inside one visible folder two levels down (`~/Projects/shop`) now offers "always" for that folder alone, and the next edits and writes there run unasked. Anything else in the home (`~/notes.md`, another folder, dotfiles, git hooks, a folder on your `PATH`) still asks every time; the config's `"approve": ["files"]` and yolo still don't cover the home folder.
+- **See what a background process is doing.** Click "N running" in the status bar, or press ctrl+p, to open the processes view: each dev server or watcher with its command, address and uptime, and the selected one's output, live. ↑/↓ picks one, `s` twice stops it, Esc closes the view and leaves them running.
+- **Previewing a static site no longer asks.** The `process` tool's `serve` runs Marv's own file server, with the project read-only, no network and only its port forwarded to your `127.0.0.1`, so it now runs without asking (`approveSandboxed`, the default), like a sandboxed command. Starting your own command (`npm run dev`) still asks.
+- **Fewer network approvals for local servers.** The model is now told that bash reaches its background processes' ports without `network: true`, so a `curl localhost:4173` doesn't turn into a network approval.
+- **A checkpoint that fails the same way every turn is said once.** In the home folder (too many files to snapshot) the "This turn can't be undone" notice came back every turn; now it's said on the first turn and again only when the failure changes.
+
 ## [0.16.1] - 2026-11-02
 
 ### Changed

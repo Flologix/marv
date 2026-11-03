@@ -14,6 +14,7 @@ pub mod message_view;
 pub mod model_picker;
 pub mod notice_view;
 pub mod plan_view;
+pub mod process_panel;
 pub mod prompt_input;
 pub mod radio_view;
 pub mod scroll_view;

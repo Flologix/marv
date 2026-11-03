@@ -879,6 +879,12 @@ impl Tool for ApplyPatch {
     fn scope(&self, _input: &ApplyPatchInput) -> Option<Scope> {
         Some(Scope { key: "files".into(), description: "file changes".into() })
     }
+    /// Every path the patch names, Move destinations included, must lie in the one home folder (`files_scope`).
+    fn scope_in(&self, input: &ApplyPatchInput, ctx: &ToolContext) -> Option<Scope> {
+        let paths = patch_paths(&input.patch).unwrap_or_default();
+        let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+        Some(crate::edit_file::files_scope(&paths, ctx))
+    }
     /// Yolo: only when every path, Move destinations included, is one `edit_file` would change unasked.
     fn auto_safe(&self, input: &ApplyPatchInput, ctx: &ToolContext) -> bool {
         patch_paths(&input.patch).is_some_and(|paths| paths.iter().all(|p| !touches_git(ctx, p)))

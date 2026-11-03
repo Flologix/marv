@@ -47,11 +47,13 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("↑ / ctrl+x", "With messages queued and an empty prompt: edit the newest / drop it"),
     ("ctrl+c", "Stop / clear the input / press twice to quit"),
     ("ctrl+o", "Show or hide details: what subagents did, and whole diffs"),
+    ("ctrl+p", "Background processes: what each runs, its address and live output; s stops one"),
     ("PgUp/PgDn", "Scroll the conversation (the mouse wheel too)"),
     ("↑/↓", "Previous inputs"),
     ("/", "The command menu: Enter runs, Tab or → completes"),
     ("Drag", "Select text; it's copied when you let go"),
     ("Click a subagent", "Open its own transcript, live"),
+    ("Click \"N running\"", "The background processes, as ctrl+p"),
 ];
 
 /// The palette's groups, in the order they're listed when nothing is typed.

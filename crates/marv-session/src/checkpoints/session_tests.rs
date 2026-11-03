@@ -532,6 +532,41 @@ async fn a_failing_snapshot_doesnt_stop_the_turn_and_says_so_once() {
     assert!(refusal_of(&session).await.contains("disk full"));
 }
 
+/// A failure every turn (a home folder too large to snapshot) is said on the first turn only, counts aside; a
+/// different failure is said again.
+#[tokio::test]
+async fn the_same_snapshot_failure_turn_after_turn_is_said_once() {
+    let dirs = Dirs::new();
+    let store = Arc::new(CheckpointStore::new(StoreOptions::new(dirs.root(), None, "x")));
+    let count = Arc::new(std::sync::atomic::AtomicUsize::new(144_000));
+    let counter = count.clone();
+    lock(&store.fake).snapshot = Some(Arc::new(move |_| {
+        let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let message = if n >= 144_002 { "disk full".to_string() } else { format!("too large ({n} files)") };
+        Some(SnapshotResult::Failed { reason: SnapshotFailure::Failed, message, ms: 1 })
+    }));
+    let provider = Scripted::new(vec![
+        use_tools(vec![write_call("w1", "a.txt", "1\n")]),
+        say("one"),
+        use_tools(vec![write_call("w2", "a.txt", "2\n")]),
+        say("two"),
+        use_tools(vec![write_call("w3", "a.txt", "3\n")]),
+        say("three"),
+        use_tools(vec![write_call("w4", "a.txt", "4\n")]),
+        say("four"),
+    ]);
+    let session = scripted(&dirs, &provider, |init| init.checkpoint_store = Some(store.clone()));
+    let mut failed = Vec::new();
+    for prompt in ["one", "two", "three", "four"] {
+        for event in collect(go(&session, prompt)).await {
+            if let SessionEvent::CheckpointFailed { message } = event {
+                failed.push(message);
+            }
+        }
+    }
+    assert_eq!(failed, ["too large (144000 files)", "disk full"], "the repeat wasn't said, the new one was");
+}
+
 #[tokio::test]
 async fn parallel_shared_folder_subagents_share_one_before() {
     let dirs = Dirs::new();

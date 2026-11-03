@@ -254,6 +254,26 @@ pub struct StatusInfo {
     pub processes: usize,
 }
 
+/// One background process for the processes view (ctrl+p, or a click on "N running"). The command and output are the
+/// project's and the model's words: drawn through `printable()`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProcessRow {
+    pub name: String,
+    /// The command it runs, as started.
+    pub command: String,
+    /// "running · http://localhost:4173 · up 2m", "exited (code 1) · up 5m".
+    pub status: String,
+    pub running: bool,
+}
+
+/// The answer to [`SessionPort::load_processes`]: every process, and the last lines of output of the one asked for.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProcessesView {
+    pub rows: Vec<ProcessRow>,
+    /// The process the output is from, and that output (newest last); None when none was asked for or it's gone.
+    pub output: Option<(String, String)>,
+}
+
 /// What the welcome banner says was loaded at startup.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WelcomeInfo {
@@ -688,6 +708,8 @@ pub enum UiEvent {
     Radio(RadioView),
     /// `/radio` with the radio on: the roster view, until Esc.
     OpenRadio,
+    /// The answer to [`SessionPort::load_processes`], for the processes view.
+    Processes(ProcessesView),
     /// `/exit`, or the engine is going away.
     Exit,
 }
@@ -848,6 +870,17 @@ pub trait SessionPort: Send + Sync {
 
     /// #159: setup's "sign out": revoke and forget the provider's sign-in.
     fn sign_out(&self, _provider: ProviderId) {}
+
+    /// The processes view is open: list the background processes, with the last lines of `output_of`'s output
+    /// ([`UiEvent::Processes`]). Asked again every second while the view stays open.
+    fn load_processes(&self, output_of: Option<String>) {
+        let _ = output_of;
+    }
+
+    /// The processes view's stop: stops that background process (the answer is a transcript message).
+    fn stop_process(&self, name: String) {
+        let _ = name;
+    }
 
     /// `/resume` picked a session, or `marv -c` (`None` = the latest here).
     fn resume(&self, id: Option<String>);

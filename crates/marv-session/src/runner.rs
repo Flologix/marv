@@ -169,9 +169,17 @@ pub struct AlwaysScopes {
 pub const NOT_INHERITED: [&str; 5] = ["bash:net:", "bash:net+git:", "web:", "mcp:", "mesh:"];
 
 impl AlwaysScopes {
+    /// A home folder's file changes in one folder (`files:home:<folder>`) are answered only by a person's "always" for
+    /// that folder: a pre-approved "files" means a project's files, and in the home folder it covers nothing.
     pub fn contains(&self, key: &str) -> bool {
+        if self.exact.lock().unwrap_or_else(|e| e.into_inner()).contains(key) {
+            return true;
+        }
+        if key.starts_with(marv_tools::registry::HOME_FOLDER_FILES) {
+            return false;
+        }
         let seeds = self.seeds.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect::<Vec<_>>();
-        self.exact.lock().unwrap_or_else(|e| e.into_inner()).contains(key) || approvals::prefix_covers(&seeds, key)
+        approvals::prefix_covers(&seeds, key)
     }
 
     /// A person's "always": the exact scope key, as today.

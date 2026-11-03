@@ -20,7 +20,7 @@
 use marv_core::{Usage, printable};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -177,13 +177,30 @@ impl StatusBar<'_> {
             spans.push(Span::styled("yolo", Style::new().fg(theme::ACCENT)));
             spans.push(Span::styled(" · ", Style::new().fg(color)));
         }
-        let running = self.info.map_or(0, |i| i.processes);
-        if running > 0 && !self.confirm_exit && self.flash.is_none() {
-            spans.push(Span::styled(format!("{running} running"), Style::new().fg(theme::ACCENT)));
-            spans.push(Span::styled(" · ", Style::new().fg(color)));
+        if let Some(running) = self.running_text() {
+            spans.push(Span::styled(running, Style::new().fg(theme::ACCENT).add_modifier(Modifier::UNDERLINED)));
+            spans.push(Span::styled(" ctrl+p · ", Style::new().fg(color)));
         }
         spans.push(Span::styled(hint, Style::new().fg(color)));
         Line::from(spans)
+    }
+
+    /// "1 running" while background processes run (and nothing hides it): clickable, like ctrl+p.
+    fn running_text(&self) -> Option<String> {
+        let running = self.info.map_or(0, |i| i.processes);
+        (running > 0 && !self.confirm_exit && self.flash.is_none()).then(|| format!("{running} running"))
+    }
+
+    /// Where [`render`](Self::render) in `area` draws "N running": its row, first column and the column past it.
+    pub fn running_at(&self, area: Rect) -> Option<(u16, u16, u16)> {
+        let text = self.running_text()?;
+        if area.height == 0 || area.width < 2 {
+            return None;
+        }
+        let show_yolo = self.info.is_some_and(|i| i.yolo) && !self.confirm_exit && self.flash.is_none();
+        let from = area.x + 1 + if show_yolo { "yolo · ".width() as u16 } else { 0 };
+        let to = (from + text.width() as u16).min(area.right().saturating_sub(1));
+        (from < to).then_some((area.y, from, to))
     }
 
     /// The right side, before truncation: usage · model · cwd.
@@ -295,16 +312,30 @@ mod tests {
         // Marv's StatusBar (#51): they keep running between turns, so idle or busy, after yolo and before the hint.
         let info = StatusInfo { yolo: true, processes: 1, ..Default::default() };
         let idle = StatusBar { info: Some(&info), ..Default::default() };
-        assert_eq!(idle.left().to_string(), "yolo · 1 running · /help · PgUp/PgDn · ctrl+c exit");
+        assert_eq!(idle.left().to_string(), "yolo · 1 running ctrl+p · /help · PgUp/PgDn · ctrl+c exit");
         assert_eq!(idle.left().spans[2].style.fg, Some(theme::ACCENT));
         let two = StatusInfo { processes: 2, ..Default::default() };
         let busy = StatusBar { info: Some(&two), busy: true, ..Default::default() };
-        assert_eq!(busy.left().to_string(), "2 running · esc to interrupt · enter queues · alt+enter send now");
+        assert_eq!(busy.left().to_string(), "2 running ctrl+p · esc to interrupt · enter queues · alt+enter send now");
         // Not over the exit confirmation or a flash, and not at all with none.
         assert_eq!(StatusBar { confirm_exit: true, ..busy.clone() }.left().to_string(), "Press ctrl+c again to exit");
         assert_eq!(StatusBar { flash: Some("Copied"), ..busy.clone() }.left().to_string(), "Copied");
         let none = StatusInfo::default();
         assert_eq!(StatusBar { info: Some(&none), ..Default::default() }.left().to_string(), "/help · PgUp/PgDn · ctrl+c exit");
+    }
+
+    #[test]
+    fn running_at_is_where_n_running_is_drawn() {
+        let info = StatusInfo { yolo: true, processes: 1, ..Default::default() };
+        let bar = StatusBar { info: Some(&info), ..Default::default() };
+        let area = Rect::new(0, 7, 80, 1);
+        let (row, from, to) = bar.running_at(area).unwrap();
+        let mut buf = Buffer::empty(area);
+        bar.render(area, &mut buf);
+        let drawn: String = (from..to).map(|x| buf[(x, row)].symbol().to_string()).collect();
+        assert_eq!((row, drawn.as_str()), (7, "1 running"));
+        let none = StatusInfo::default();
+        assert_eq!(StatusBar { info: Some(&none), ..Default::default() }.running_at(area), None);
     }
 
     #[test]

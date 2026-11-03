@@ -188,6 +188,9 @@ impl Tool for EditFile {
     fn scope(&self, _input: &EditFileInput) -> Option<Scope> {
         Some(Scope { key: "files".into(), description: "file changes".into() })
     }
+    fn scope_in(&self, input: &EditFileInput, ctx: &ToolContext) -> Option<Scope> {
+        Some(files_scope(&[input.path.as_str()], ctx))
+    }
     fn auto_safe(&self, input: &EditFileInput, ctx: &ToolContext) -> bool {
         !touches_git(ctx, &input.path)
     }
@@ -268,6 +271,29 @@ fn package_scripts_changed(input: &EditFileInput, ctx: &ToolContext) -> bool {
 pub(crate) fn package_json(path: &str, ctx: &ToolContext) -> Option<std::path::PathBuf> {
     let absolute = resolve_in_project(ctx, path).ok()?;
     (absolute.file_name()? == "package.json").then_some(absolute)
+}
+
+/// What "always" covers for a file change: every file change ("files"), or, when the project is the home folder (or
+/// holds it) and every path lies in one visible two-level folder of the home (`marv_sandbox::home::home_subfolder`),
+/// file changes in that folder only (`registry::HOME_FOLDER_FILES`). Any other home-folder change keeps "files", which
+/// is asked every time there (`registry::home_file_write`).
+pub(crate) fn files_scope(paths: &[&str], ctx: &ToolContext) -> Scope {
+    let everything = Scope { key: "files".into(), description: "file changes".into() };
+    if ctx.home.as_os_str().is_empty() || paths.is_empty() || !marv_sandbox::home_project(&ctx.root, &ctx.home) {
+        return everything;
+    }
+    let search = std::env::var("PATH").unwrap_or_default();
+    let folder = |path: &&str| {
+        let absolute = resolve_in_project(ctx, path).ok()?;
+        marv_sandbox::home::home_subfolder(&ctx.root, &ctx.home, &absolute, &search)
+    };
+    let mut folders = paths.iter().map(folder);
+    let Some(Some(first)) = folders.next() else { return everything };
+    if !folders.all(|f| f.as_ref() == Some(&first)) {
+        return everything;
+    }
+    let shown = first.to_string_lossy();
+    Scope { key: format!("{}{shown}", crate::registry::HOME_FOLDER_FILES), description: format!("file changes in ~/{shown}") }
 }
 
 /// The protected rule a project path falls under (marv-rs); a path outside the project is left to `resolve_in_project`.
