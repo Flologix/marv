@@ -6,6 +6,8 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+## [0.16.2] - 2026-11-03
+
 ### Changed
 
 - **In your home folder, "always" works for file changes inside one project folder.** Started in `~`, every edit and write asked, with no "always", because the edit tools write outside the sandbox there. A change inside one visible folder two levels down (`~/Projects/shop`) now offers "always" for that folder alone, and the next edits and writes there run unasked. Anything else in the home (`~/notes.md`, another folder, dotfiles, git hooks, a folder on your `PATH`) still asks every time; the config's `"approve": ["files"]` and yolo still don't cover the home folder.
@@ -450,7 +452,8 @@ The first public release, on npm as `@flologixai/marv`.
 - The SDK: `createSession()` from `@flologixai/marv/sdk` runs Marv from code, without the UI.
 - Evals: `bun run eval` runs real models on small tasks with hidden checks.
 
-[Unreleased]: https://github.com/Flologix/marv/compare/v0.16.1...HEAD
+[Unreleased]: https://github.com/Flologix/marv/compare/v0.16.2...HEAD
+[0.16.2]: https://github.com/Flologix/marv/compare/v0.16.1...v0.16.2
 [0.16.1]: https://github.com/Flologix/marv/compare/v0.16.0...v0.16.1
 [0.16.0]: https://github.com/Flologix/marv/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/Flologix/marv/compare/v0.14.1...v0.15.0
