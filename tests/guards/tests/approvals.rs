@@ -666,8 +666,10 @@ async fn approve_sandboxed_ask_headless_and_radio_turns_still_ask() {
     assert!(out.result.declined);
 }
 
-/// **What the sandbox doesn't contain still asks, with the setting on:** network, a git write, a command on the
-/// host (`sandbox: false`, refused here), and, with no working sandbox, every command.
+/// **What the sandbox doesn't contain still asks, with the setting on:** network, a git write where `.git` isn't a
+/// plain repository folder (none here) or that changes the repository's setup (`git remote add`; a commit runs
+/// unasked: `sandbox.rs::an_unasked_git_write_commits_but_cant_reach_what_git_runs`), a command on the host
+/// (`sandbox: false`, refused here), and, with no working sandbox, every command.
 #[tokio::test]
 async fn approve_sandboxed_still_asks_for_network_git_write_the_host_and_without_a_sandbox() {
     marv_guards::require_sandbox!();
@@ -682,6 +684,13 @@ async fn approve_sandboxed_still_asks_for_network_git_write_the_host_and_without
         assert_eq!(approver.requests().len(), 1, "{what} asks");
         assert!(out.result.declined, "{what}");
     }
+    let repo = TempDir::new("approvals-sandboxed-repo");
+    repo.write(".git/config", "[core]\n");
+    let approver = Recorder::new(Decision::No);
+    let setup = json!({"command": "git remote add origin https://example.com/r.git", "git_write": true});
+    let out = run_tool(&call("bash", setup), &sandboxed_ctx(repo.path(), &approver, person), builtin_tools()).await;
+    assert_eq!(approver.requests().len(), 1, "a setup change asks");
+    assert!(out.result.declined);
     // On the host (`sandbox: false`) nothing runs unasked either: here, without the host door, it's refused outright.
     let approver = Recorder::new(Decision::Yes);
     let host = json!({"command": "touch ran-on-host", "sandbox": false});

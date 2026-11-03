@@ -155,6 +155,10 @@ pub fn sandbox_args(opts: &SandboxOptions, fs: &dyn FsProbe) -> Result<Vec<OsStr
     for extra in opts.writable_extras(fs)? {
         args.extend(["--bind".into(), extra.real.into_os_string(), extra.given.into_os_string()]);
     }
+    // After the writable folders, which would cover them: what stays read-only inside one (a `.git`'s config and hooks).
+    for path in &opts.read_only_on_top {
+        args.extend(["--ro-bind".into(), path.clone().into_os_string(), path.clone().into_os_string()]);
+    }
     if !read_only {
         // Protected paths (marv-rs): read-only on top of the writable project.
         for path in &opts.protected {

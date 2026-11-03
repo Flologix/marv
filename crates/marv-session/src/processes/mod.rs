@@ -490,8 +490,15 @@ impl ProcessManager {
             let argv = marv_tools::relay::sandbox_argv_at(&backend.guest_path(&exe), &spec);
             (vec![exe, socket_dir], argv)
         };
-        let mounts =
-            CommandMounts { network, read_only, writable: vec![], placeholders: guard.placeholders, project_read_only, binds };
+        let mounts = CommandMounts {
+            network,
+            read_only,
+            writable: vec![],
+            read_only_on_top: vec![],
+            placeholders: guard.placeholders,
+            project_read_only,
+            binds,
+        };
         let mut sandboxed = self.shared.sandbox.prepare(root, &mounts, &inner).map_err(ToolError::from)?;
         let protected = Some(protected_snapshot(root));
         // Only the backend's environment, never Marv's. A spawn that fails drops `sandboxed`, which cleans up.

@@ -149,6 +149,7 @@ pub fn sandboxed_options(run: &CheckRun) -> RunOptions {
         timeout: run.timeout,
         read_only,
         writable: run.writable.clone(),
+        read_only_on_top: Vec::new(),
         placeholders: Vec::new(),
         project_read_only: true,
         env: None,

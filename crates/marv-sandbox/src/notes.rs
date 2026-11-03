@@ -24,6 +24,9 @@ use crate::paths::normalize;
 /// Appended when a confined command fails on the read-only `.git`, so the model learns how to do it.
 pub const GIT_HINT: &str = "Marv: .git is read-only for commands that run without asking. To change the repository, run the command again with git_write: true (the user is asked).";
 
+/// Appended when a git_write command that ran without asking failed on the parts of `.git` that stay read-only.
+pub const GIT_SETUP_HINT: &str = "Marv: commands that run without asking can commit, branch and merge, but .git's config, hooks, info, modules and worktrees stay read-only for them. This command needs to change those (a remote, upstream tracking, hooks, submodules, worktrees): tell the user what it does and ask them to run it.";
+
 /// Appended when a sandboxed command looks into the hidden home folder.
 #[cfg(not(target_os = "macos"))]
 pub const HOME_NOTE: &str = "Marv: in the sandbox the home folder is an empty stand-in: only toolchain folders (like ~/.bun, ~/.local/share/mise, ~/.asdf), git config and ~/.marv/skills show through, read-only. Anything else there (Marv's own config, sessions and trajectories in ~/.marv included) is invisible, so a missing file or an empty folder under ~ says nothing about the real home folder.";
