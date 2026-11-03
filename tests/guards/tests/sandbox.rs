@@ -567,6 +567,63 @@ fn the_project_is_writable_but_git_and_protected_paths_are_read_only() {
     assert_eq!(project.read("src.txt").unwrap(), "ok\n");
 }
 
+/// **A command that changes the repository without asking keeps git's program parts read-only.** With
+/// `approveSandboxed` (the default) and no one to say yes, a `git_write` command commits, branches and merges, but
+/// can't plant a hook, change `.git/config` (`core.hooksPath`, `core.fsmonitor`), point git elsewhere with a
+/// `commondir` or a `config.worktree`, or rename `.git` away to make a new one; the stand-ins are gone afterwards. A
+/// command that changes the repository's setup (`git remote add`) is asked, as before.
+///
+/// Proven: dropped the `read_only_on_top` binds in `sandbox_args` → failed (a hook planted); left `.git` out of the
+/// writable mounts → failed (`.git` renamed away); made `git_write_guard` create no stand-ins → failed (a `commondir`
+/// planted).
+#[tokio::test]
+async fn an_unasked_git_write_commits_but_cant_reach_what_git_runs() {
+    require_bwrap!();
+    let (project, home) = (TempDir::new("git-write"), TempDir::outside_tmp("git-write-home"));
+    let git = |args: &[&str]| {
+        assert!(std::process::Command::new("git").args(args).current_dir(project.path()).status().unwrap().success());
+    };
+    project.write("f", "a\n");
+    git(&["init", "-q", "-b", "main"]);
+    git(&["add", "f"]);
+    git(&["-c", "user.email=a@b", "-c", "user.name=n", "commit", "-qm", "1"]);
+    let config = project.read(".git/config").unwrap();
+    let approver = Recorder::new(Decision::No);
+    let mut ctx = ToolContext { approve_sandboxed: true, approver: Some(approver.clone()), ..ToolContext::new(project.path()) };
+    ctx.sandbox = Arc::new(sandbox_with_home(home.path()));
+    let run = |command: &str| {
+        let call = call("bash", json!({"command": command, "git_write": true}));
+        let ctx = ctx.clone();
+        async move { run_tool(&call, &ctx, builtin_tools()).await }
+    };
+    let out = run("git checkout -q -b feature && echo b >> f && git -c user.email=a@b -c user.name=n commit -qam 2 \
+                   && git checkout -q main && git -c user.email=a@b -c user.name=n merge -q --no-ff -m merged feature")
+    .await;
+    assert_eq!(out.result.approval, Some(Approval::Auto), "{}", out.result.output);
+    assert!(out.result.output.ends_with("[exit code 0]"), "{}", out.result.output);
+    // Past the guess at setup commands (`cd .git` first): the read-only mounts are what stop them.
+    for planted in [
+        "cd .git && echo evil > hooks/pre-commit",
+        "cd .git && printf '[core]\\n\\tfsmonitor = evil\\n' >> config",
+        "cd .git && echo /tmp/evil > commondir",
+        "cd .git && echo '[core]' > config.worktree",
+        "mv .git .git-old && mkdir .git",
+    ] {
+        let out = run(planted).await;
+        assert!(!out.result.output.ends_with("[exit code 0]"), "{planted}: {}", out.result.output);
+    }
+    assert!(approver.requests().is_empty(), "none of those asked");
+    assert_eq!(project.read(".git/config").unwrap(), config);
+    for gone in [".git/hooks/pre-commit", ".git/commondir", ".git/config.worktree", ".git-old"] {
+        assert!(!project.path().join(gone).exists(), "{gone}");
+    }
+    let log = std::process::Command::new("git").args(["log", "--oneline"]).current_dir(project.path()).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&log.stdout).lines().count(), 3);
+    // Changing the repository's setup is asked, as before.
+    run("git remote add origin https://example.com/r.git").await;
+    assert_eq!(approver.requests().len(), 1);
+}
+
 /// **Protected files a command creates** (bwrap can only mount what exists): a new `.envrc`, a nested `AGENTS.md`,
 /// a nested `.git` are found after the command by `protected::scan_created` and removed by `revert_created`.
 ///

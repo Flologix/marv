@@ -113,6 +113,13 @@ pub(crate) mod test_support {
         assert!(status.success(), "git {args:?}");
     }
 
+    /// Plain git's output (stdout).
+    pub fn git_output(cwd: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git").args(args).current_dir(cwd).output().unwrap();
+        assert!(out.status.success(), "git {args:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
     /// Runs the test `name` (its path in this crate, e.g. `bash::tests::x`) again in a child process with `env`
     /// added, asserts it passed there, and returns false; in that child it returns true, and the test's body runs.
     /// A test needs a variable in Marv's own environment (a provider key that must not leak), and Rust can't change

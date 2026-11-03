@@ -3,6 +3,9 @@
 //!
 //! Ports `gitGuard`, `worktreeGit` and `worktreeGitDirs` from Marv's `src/tools/bash.ts`.
 //!
+//! marv-rs: [`git_write_guard`], the mounts for a `git_write` command that runs without asking (bubblewrap): `.git`
+//! writable, with what git runs programs from read-only on top.
+//!
 //! - bwrap can't mount on a symlink, so for a `.git` that is one, what it points to is mounted, when that's inside
 //!   the project; outside, the sandbox already shows it read-only (or hides it, in the home folder).
 //! - In a git worktree `.git` is a file (`gitdir: <repo>/.git/worktrees/<name>`) and the repository's data lives
@@ -50,6 +53,122 @@ pub fn git_guard(root: &Path) -> GitGuard {
     GitGuard { read_only: vec![git_dir], ..Default::default() }
 }
 
+/// What stays read-only in a `.git` that a command changes without asking (`git_write` with yolo or
+/// `approveSandboxed`; bubblewrap only): everything git runs a program from, or follows to find one. `config` (hooksPath,
+/// fsmonitor, aliases, filter and diff drivers, sshCommand), `hooks/`, `info/` (attributes pick drivers), `modules/` and
+/// `worktrees/` (other repositories' config and hooks), `config.worktree` (read with `extensions.worktreeConfig`) and
+/// `commondir` (where git looks for all of those). The rest (objects, refs, the index, HEAD, logs, a merge's or rebase's
+/// state) is what commits, branches and merges write.
+pub const GIT_PROGRAM_DIRS: [&str; 4] = ["hooks", "info", "modules", "worktrees"];
+/// The files among them, with what stands in for one that isn't there (see [`git_write_guard`]). `config` must exist.
+pub const GIT_PROGRAM_FILES: [(&str, Option<&str>); 3] =
+    [("config", None), ("config.worktree", Some("")), ("commondir", Some(".\n"))];
+
+/// The mounts for a command that may change the repository without asking, while it runs: `.git` writable and itself
+/// a mount point (so it can't be renamed away and replaced by one with a planted config), and what
+/// [`GIT_PROGRAM_DIRS`] and [`GIT_PROGRAM_FILES`] name read-only on top. A missing folder gets an empty read-only
+/// placeholder (removed afterwards, like any placeholder). A missing file is created first with content that changes
+/// nothing (an empty `config.worktree`; `commondir` = `.`, the `.git` itself: git dies on an empty one), mounted
+/// read-only, and removed when this is dropped: created afterwards instead, git outside the sandbox (an editor's
+/// `git status` every few seconds) would follow it while the command runs. Holds an exclusive lock on `.git` until
+/// dropped, so two such commands (subagents, another Marv) never share the files: the first one's cleanup would take
+/// the second one's mount away.
+#[derive(Debug)]
+pub struct GitWrite {
+    pub writable: PathBuf,
+    pub read_only_on_top: Vec<PathBuf>,
+    pub placeholders: Vec<PathBuf>,
+    created: Vec<(PathBuf, &'static str)>,
+    _lock: std::fs::File,
+}
+
+/// Why a [`GitWrite`] couldn't be made.
+#[derive(Debug, PartialEq, Eq)]
+pub enum GitWriteBlocked {
+    /// Another such command holds `.git`: wait.
+    Busy,
+    /// Not a plain repository folder (no `.git`, a worktree's `.git` file, a symlink, a symlinked `config`…): the
+    /// command is asked, as before.
+    Unsupported,
+}
+
+/// Whether [`git_write_guard`] can work for this project (it may still be [`GitWriteBlocked::Busy`]).
+pub fn git_write_supported(root: &Path) -> bool {
+    plan_git_write(root).is_some()
+}
+
+/// What [`git_write_guard`] mounts and creates.
+struct GitWritePlan {
+    git: PathBuf,
+    read_only: Vec<PathBuf>,
+    placeholders: Vec<PathBuf>,
+    create: Vec<(PathBuf, &'static str)>,
+}
+
+/// What to mount and what to create, without changing anything.
+fn plan_git_write(root: &Path) -> Option<GitWritePlan> {
+    let git = root.join(".git");
+    if !std::fs::symlink_metadata(&git).ok()?.is_dir() {
+        return None;
+    }
+    let (mut read_only, mut placeholders, mut create) = (Vec::new(), Vec::new(), Vec::new());
+    for name in GIT_PROGRAM_DIRS {
+        let path = git.join(name);
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_dir() => read_only.push(path),
+            Ok(_) => return None,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => placeholders.push(path),
+            Err(_) => return None,
+        }
+    }
+    for (name, stand_in) in GIT_PROGRAM_FILES {
+        let path = git.join(name);
+        match (std::fs::symlink_metadata(&path), stand_in) {
+            (Ok(meta), _) if meta.is_file() => read_only.push(path),
+            (Err(e), Some(content)) if e.kind() == std::io::ErrorKind::NotFound => create.push((path, content)),
+            _ => return None,
+        }
+    }
+    Some(GitWritePlan { git, read_only, placeholders, create })
+}
+
+/// The [`GitWrite`] for this project: locks `.git` and creates the stand-ins.
+pub fn git_write_guard(root: &Path) -> Result<GitWrite, GitWriteBlocked> {
+    let GitWritePlan { git, mut read_only, placeholders, create } = plan_git_write(root).ok_or(GitWriteBlocked::Unsupported)?;
+    let lock = std::fs::File::open(&git).map_err(|_| GitWriteBlocked::Unsupported)?;
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => return Err(GitWriteBlocked::Busy),
+        Err(_) => return Err(GitWriteBlocked::Unsupported),
+    }
+    let mut guard = GitWrite { writable: git, read_only_on_top: Vec::new(), placeholders, created: Vec::new(), _lock: lock };
+    for (path, content) in create {
+        // Locked, and nothing runs yet: it's still missing (create_new fails rather than write over anything).
+        let made = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).and_then(|mut f| {
+            use std::io::Write;
+            f.write_all(content.as_bytes())
+        });
+        if made.is_err() {
+            return Err(GitWriteBlocked::Unsupported); // Dropping the guard removes what was made so far.
+        }
+        guard.created.push((path.clone(), content));
+        read_only.push(path);
+    }
+    guard.read_only_on_top = read_only;
+    Ok(guard)
+}
+
+impl Drop for GitWrite {
+    /// Removes the stand-ins it made, still as made (they were read-only to the command), then the lock goes.
+    fn drop(&mut self) {
+        for (path, content) in &self.created {
+            if std::fs::read_to_string(path).is_ok_and(|now| now == *content) {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+}
+
 /// For a project whose `.git` is a worktree's file: its trusted git folders; else none.
 pub fn worktree_git(root: &Path) -> Vec<PathBuf> {
     let git_file = root.join(".git");
@@ -95,6 +214,43 @@ mod tests {
         assert_eq!(git_guard(root.path()).placeholders, vec![root.path().join(".git")]);
         fs::create_dir(root.path().join(".git")).unwrap();
         assert_eq!(git_guard(root.path()).read_only, vec![root.path().join(".git")]);
+    }
+
+    #[test]
+    fn a_git_write_guard_locks_makes_its_stand_ins_and_removes_them() {
+        let root = TempDir::new("guard-write");
+        let git = root.path().join(".git");
+        fs::create_dir_all(git.join("hooks")).unwrap();
+        fs::write(git.join("config"), "[core]\n").unwrap();
+        let guard = git_write_guard(root.path()).unwrap();
+        assert_eq!(guard.writable, git);
+        assert_eq!(guard.placeholders, ["info", "modules", "worktrees"].map(|d| git.join(d)));
+        assert_eq!(guard.read_only_on_top, ["hooks", "config", "config.worktree", "commondir"].map(|f| git.join(f)));
+        assert_eq!(fs::read_to_string(git.join("commondir")).unwrap(), ".\n");
+        assert_eq!(fs::read_to_string(git.join("config.worktree")).unwrap(), "");
+        // A second one waits for the first.
+        assert_eq!(git_write_guard(root.path()).unwrap_err(), GitWriteBlocked::Busy);
+        drop(guard);
+        assert!(!git.join("commondir").exists() && !git.join("config.worktree").exists());
+        assert_eq!(fs::read_to_string(git.join("config")).unwrap(), "[core]\n");
+        drop(git_write_guard(root.path()).unwrap());
+    }
+
+    #[test]
+    fn a_git_write_guard_needs_a_plain_repository() {
+        let root = TempDir::new("guard-write-plain");
+        assert!(!git_write_supported(root.path()));
+        fs::write(root.path().join(".git"), "gitdir: /elsewhere\n").unwrap();
+        assert_eq!(git_write_guard(root.path()).unwrap_err(), GitWriteBlocked::Unsupported);
+        fs::remove_file(root.path().join(".git")).unwrap();
+        fs::create_dir(root.path().join(".git")).unwrap();
+        assert!(!git_write_supported(root.path()), "no config");
+        fs::write(root.path().join("elsewhere"), "").unwrap();
+        std::os::unix::fs::symlink(root.path().join("elsewhere"), root.path().join(".git/config")).unwrap();
+        assert!(!git_write_supported(root.path()), "a symlinked config can't be mounted on");
+        fs::remove_file(root.path().join(".git/config")).unwrap();
+        fs::write(root.path().join(".git/config"), "").unwrap();
+        assert!(git_write_supported(root.path()));
     }
 
     #[test]

@@ -17,10 +17,13 @@
 //!   `rmdir`ed afterwards, by the backend's `after`). A confined command that fails on the read-only `.git` gets
 //!   `GIT_HINT`. An approved command in a worktree gets the checked worktree folders writable, except folders the
 //!   caller made read-only.
+//! - marv-rs: a confined `git_write` command (bubblewrap, a plain `.git`, not a setup change: `git_write_unasked`)
+//!   gets `.git` writable with what git runs programs from read-only on top (`git_guard::git_write_guard`), so
+//!   commits, branches and merges don't ask. One that fails on those parts gets `GIT_SETUP_HINT`.
 //! - Notes after the output: the stand-in home (`touches_hidden_home`), the missing network (not for 126/127; a
 //!   timeout counts) and, for `gh`, the GitHub MCP server instead (#23, #27).
 //! - Scope `bash:[net:][git:]<command>` ("this exact command"); `auto_safe` only sandboxed, without network or
-//!   `git_write`. The description tells the model not to write files with heredocs: a model put the terminator on the
+//!   `git_write` (but see `git_write_unasked` below). The description tells the model not to write files with heredocs: a model put the terminator on the
 //!   same line as `&& …`, read bash's warning as truncation, and retried for 10 steps.
 //! - marv-rs: protected files (docs/SECURITY.md). Existing ones are mounted read-only by the sandbox at any level; a
 //!   command that runs without asking also sees nested `.git` folders read-only. bwrap can only mount what exists, so
@@ -42,10 +45,12 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-use marv_sandbox::git_guard::{GitGuard, git_guard, worktree_git};
+use marv_sandbox::git_guard::{
+    GitGuard, GitWrite, GitWriteBlocked, git_guard, git_write_guard, git_write_supported, worktree_git,
+};
 use marv_sandbox::notes::{
-    BACKGROUND_NOTE, BACKGROUND_NOTE_PROCESS, ESCALATED_NOTE, GH_NOTE, GH_TOOL_NOTE, GIT_HINT, HIDDEN_NEXT_STEP, HOME_NOTE,
-    HOME_PROJECT_NOTE, NETWORK_NOTE, backgrounds_process, hidden_network_failure, looks_like_network_failure,
+    BACKGROUND_NOTE, BACKGROUND_NOTE_PROCESS, ESCALATED_NOTE, GH_NOTE, GH_TOOL_NOTE, GIT_HINT, GIT_SETUP_HINT, HIDDEN_NEXT_STEP,
+    HOME_NOTE, HOME_PROJECT_NOTE, NETWORK_NOTE, backgrounds_process, hidden_network_failure, looks_like_network_failure,
     needs_home_project_note, runs_gh, touches_hidden_home,
 };
 use marv_sandbox::paths::is_inside;
@@ -106,6 +111,8 @@ pub struct RunOptions {
     pub timeout: Duration,
     pub read_only: Vec<PathBuf>,
     pub writable: Vec<PathBuf>,
+    /// Read-only inside a writable folder, mounted on top of it (`marv_sandbox::Plan::read_only_on_top`).
+    pub read_only_on_top: Vec<PathBuf>,
     pub placeholders: Vec<PathBuf>,
     pub project_read_only: bool,
     /// Not sandboxed: this environment instead of the minimal one (the host door's, `host_env`).
@@ -195,6 +202,7 @@ pub async fn run_command(
         timeout,
         read_only,
         writable,
+        read_only_on_top,
         placeholders,
         project_read_only,
         env,
@@ -211,8 +219,15 @@ pub async fn run_command(
     let mut prepared: Option<marv_sandbox::Prepared> = None;
     let mut cmd = if sandboxed {
         let relay = if network { None } else { relay_for(&forwards, &script, backend) };
-        let mut mounts =
-            marv_sandbox::CommandMounts { network, read_only, writable, placeholders, project_read_only, binds: vec![] };
+        let mut mounts = marv_sandbox::CommandMounts {
+            network,
+            read_only,
+            writable,
+            read_only_on_top,
+            placeholders,
+            project_read_only,
+            binds: vec![],
+        };
         let inner = match relay {
             Some((binds, inner)) => {
                 mounts.binds = binds;
@@ -567,7 +582,50 @@ fn real_or_self(path: &Path) -> PathBuf {
 const WOKEN_READ_ONLY_NOTE: &str = "Marv: this turn was started by another agent's message, so a command that runs without asking sees the project read-only (it can still build into /tmp). To change project files use edit_file or write_file, or set git_write: true on a command that has to write (the user is asked first).";
 
 /// A confined command that failed on the read-only `.git`.
-static GIT_READ_ONLY: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"\.git\b.*Read-only file system").unwrap());
+/// bwrap's read-only mount says "Read-only file system"; git's rename of `config.lock` onto the mounted `config`
+/// says "Device or resource busy".
+static GIT_READ_ONLY: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"\.git\b.*(Read-only file system|Device or resource busy)").unwrap());
+
+/// What git_write commands that change the repository's setup rather than its history look like: they write `.git`'s
+/// config, hooks, modules or worktrees, which stay read-only for one that runs without asking, or make a repository
+/// (`git init`, whose new `.git` would be removed afterwards). Asked as before, so they work. Only a guess at what the
+/// command needs, never the rule: the read-only mounts are.
+static GIT_SETUP: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(concat!(
+        r"\bgit\b[^|;&\n]*\b(config|remote|submodule|worktree|sparse-checkout|init|clone|maintenance|lfs\s+install|flow\s+init)\b",
+        r"|\bgit\b[^|;&\n]*\bbranch\b[^|;&\n]*(\s-u\b|--set-upstream|--unset-upstream|--track)",
+        r"|\b(husky|lefthook|overcommit|pre-commit\s+install)\b|core\.hooksPath|\.git/(config|hooks|info|modules|worktrees|commondir)",
+    ))
+    .unwrap()
+});
+
+/// Whether a `git_write` command can run without asking (yolo, `approveSandboxed`): bubblewrap (Seatbelt keeps asking),
+/// not in the home folder (shown read-only), a plain `.git` folder ([`git_write_supported`]), and not a command that
+/// changes the repository's setup ([`GIT_SETUP`]).
+fn git_write_unasked(input: &BashInput, ctx: &ToolContext) -> bool {
+    cfg!(target_os = "linux")
+        && !marv_sandbox::home_project(&ctx.root, &ctx.sandbox.home)
+        && !GIT_SETUP.is_match(&input.command)
+        && git_write_supported(&ctx.root)
+}
+
+/// [`git_write_guard`], waiting while another command holds the repository; None if it can't be made (the command
+/// then sees .git read-only, as any confined one) or the call was stopped.
+async fn wait_for_git_write(root: &Path, cancel: &tokio_util::sync::CancellationToken) -> Option<GitWrite> {
+    loop {
+        match git_write_guard(root) {
+            Ok(guard) => return Some(guard),
+            Err(GitWriteBlocked::Unsupported) => return None,
+            Err(GitWriteBlocked::Busy) => {
+                tokio::select! {
+                    _ = cancel.cancelled() => return None,
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                }
+            }
+        }
+    }
+}
 
 /// The command's result as the model sees it: output (start and end if long), then how it ended.
 pub fn format_output(result: &CommandResult) -> String {
@@ -636,7 +694,7 @@ pub struct Bash;
 /// The tool's description with bubblewrap (every platform but macOS), fixed per build (the tool spec stays byte-stable): what the platform's sandbox does with
 /// the home folder and the network differs (bubblewrap shows an empty stand-in home and has a loopback of its own;
 /// Seatbelt, on macOS, refuses the home and every IP connection, loopback included, #166).
-pub const BUBBLEWRAP_DESCRIPTION: &str = "Run a shell command in the project folder, e.g. to run tests, a build, git status, or wc -l. It runs in a sandbox: only the project folder is writable, the home folder is an empty stand-in (toolchains like ~/.bun, ~/.local/share/mise, ~/.asdf, git config and ~/.marv/skills show through, read-only; nothing else in it is visible), and there's no network unless you set network: true. The user may be asked to approve a command; they always are for network: true or git_write: true. Not interactive: commands can't prompt for input. Don't write files with it (no heredocs or echo >): use write_file or edit_file. Output (stdout and stderr together) is cut in the middle if very long.";
+pub const BUBBLEWRAP_DESCRIPTION: &str = "Run a shell command in the project folder, e.g. to run tests, a build, git status, or wc -l. It runs in a sandbox: only the project folder is writable, the home folder is an empty stand-in (toolchains like ~/.bun, ~/.local/share/mise, ~/.asdf, git config and ~/.marv/skills show through, read-only; nothing else in it is visible), and there's no network unless you set network: true. The user may be asked to approve a command; they always are for network: true, and for git_write: true when the command changes the repository's setup (config, remotes, upstream tracking, hooks, submodules, worktrees) rather than its history. Not interactive: commands can't prompt for input. Don't write files with it (no heredocs or echo >): use write_file or edit_file. Output (stdout and stderr together) is cut in the middle if very long.";
 /// The description on macOS (Seatbelt). Both are compiled everywhere, so the spec goldens of either platform can be
 /// checked from the other (`tests/guards/tests/tools.rs`).
 pub const SEATBELT_DESCRIPTION: &str = "Run a shell command in the project folder, e.g. to run tests, a build, git status, or wc -l. It runs in a sandbox: only the project folder and $TMPDIR (the command's own, emptied after it; /tmp can't be used) are writable, the home folder can't be read or written (toolchains like ~/.bun, ~/.cargo, ~/.local/share/mise, git config and ~/.marv/skills can be read; nothing else in it), and there's no network, not even localhost, unless you set network: true. The user may be asked to approve a command; they always are for network: true or git_write: true. Not interactive: commands can't prompt for input. Don't write files with it (no heredocs or echo >): use write_file or edit_file. Output (stdout and stderr together) is cut in the middle if very long.";
@@ -729,17 +787,18 @@ impl Tool for Bash {
         through_host(input, ctx)
     }
     /// In the sandbox, without network, and (as run_tool confines it) with .git read-only, a command can only change
-    /// the project's own files. Without the sandbox, nothing limits it; on the host, everything is in reach.
+    /// the project's own files. With `git_write`, also the repository's history, where git can keep its program parts
+    /// read-only ([`git_write_unasked`]). Without the sandbox, nothing limits it; on the host, everything is in reach.
     fn auto_safe(&self, input: &BashInput, ctx: &ToolContext) -> bool {
         ctx.sandbox.active()
             && !input.network.unwrap_or(false)
-            && !input.git_write.unwrap_or(false)
+            && (!input.git_write.unwrap_or(false) || git_write_unasked(input, ctx))
             && input.sandbox != Some(false)
     }
     /// `approveSandboxed`: the same confinement yolo needs. The registry still asks for taint's network and egress
-    /// rules first.
+    /// rules first. Not `git_write` in a turn that sees the project read-only (a wake): it couldn't write.
     fn auto_sandboxed(&self, input: &BashInput, ctx: &ToolContext) -> bool {
-        self.auto_safe(input, ctx)
+        self.auto_safe(input, ctx) && !(input.git_write.unwrap_or(false) && ctx.mode.sandboxed_unasked_project_read_only())
     }
     /// The timeout given in milliseconds (#10), and the escalation of #81: a sandboxed command without network whose
     /// key ([`marv_core::command::command_key`]) already failed like the missing network runs with `network: true`
@@ -843,7 +902,15 @@ impl Tool for Bash {
         // sandbox (the user's next commit, their editor), so a planted hook would escape. Without a .git, it can't
         // create one either (an empty read-only placeholder sits there), or `git status` in that folder would run its
         // config.
-        let guard = if ctx.confined { git_guard(&ctx.root) } else { GitGuard::default() };
+        // A git_write command that runs without asking ([`git_write_unasked`]) gets .git writable instead, with what
+        // git runs programs from still read-only (`git_write_guard`), held until the command has ended.
+        let home_project = ctx.sandbox.active() && marv_sandbox::home_project(&ctx.root, &ctx.sandbox.home);
+        let git_write = if ctx.confined && input.git_write.unwrap_or(false) && ctx.sandbox.active() && !home_project {
+            wait_for_git_write(&ctx.root, &ctx.cancel).await
+        } else {
+            None
+        };
+        let guard = if ctx.confined && git_write.is_none() { git_guard(&ctx.root) } else { GitGuard::default() };
         // An approved command (yolo off, git_write, network) in a git worktree: it may change the repository like any
         // approved command may change a .git inside the project, but it has to see it first. The same check as above
         // decides whether the worktree's records are trusted. A folder the caller made read-only stays that way: a
@@ -855,9 +922,9 @@ impl Tool for Bash {
             worktree_git(&ctx.root).into_iter().filter(|dir| !kept.iter().any(|ro| is_inside(ro, &real_or_self(dir)))).collect()
         };
         let sandboxed = ctx.sandbox.active();
-        // The project is the home folder (or holds it): the sandbox shows it read-only (marv_sandbox::bwrap), so a
-        // command can't change .git or create a protected file there, and nothing needs walking the whole home for.
-        let home_project = sandboxed && marv_sandbox::home_project(&ctx.root, &ctx.sandbox.home);
+        // The project is the home folder (or holds it) (`home_project` above): the sandbox shows it read-only
+        // (marv_sandbox::bwrap), so a command can't change .git or create a protected file there, and nothing needs
+        // walking the whole home for.
         let mut read_only = ctx.read_only.clone();
         read_only.extend(guard.read_only);
         // A vendored repository's .git runs its config and hooks when the user works there, like the project's own.
@@ -873,8 +940,14 @@ impl Tool for Bash {
             network,
             timeout: Duration::from_secs(timeout),
             read_only,
-            writable: approved_git,
-            placeholders: guard.placeholders.clone(),
+            writable: approved_git.into_iter().chain(git_write.as_ref().map(|g| g.writable.clone())).collect(),
+            read_only_on_top: git_write.as_ref().map(|g| g.read_only_on_top.clone()).unwrap_or_default(),
+            placeholders: guard
+                .placeholders
+                .iter()
+                .chain(git_write.as_ref().map(|g| &g.placeholders).into_iter().flatten())
+                .cloned()
+                .collect(),
             project_read_only: ctx.project_read_only,
             env: None,
             forwards: ctx.forwards.as_ref().map(|f| f.forwards()).unwrap_or_default(),
@@ -883,6 +956,8 @@ impl Tool for Bash {
         // run_command has removed the sandbox's leftovers (bwrap's placeholder mount points) by the time it returns:
         // an empty .git mount point left behind would read as created.
         let mut result = run_command(options, &ctx.sandbox, &ctx.cancel).await;
+        // The stand-ins go, then the lock (the placeholders went with run_command).
+        drop(git_write);
         if let Some(before) = &before {
             let mut created = scan_created(&ctx.root, before);
             // A repository an approved git_write command made (`git init`, a submodule) is the user's to keep.
@@ -901,7 +976,13 @@ impl Tool for Bash {
             result.output.push_str(&format!("\n{WOKEN_READ_ONLY_NOTE}\n"));
         }
         if ctx.confined && GIT_READ_ONLY.is_match(&result.output) {
-            result.output.push_str(&format!("\n{GIT_HINT}\n"));
+            // Where the host door is open, a command on the machine is the way (the user is asked first).
+            let hint = match (input.git_write.unwrap_or(false), ctx.doors.host) {
+                (false, _) => GIT_HINT.to_string(),
+                (true, false) => GIT_SETUP_HINT.to_string(),
+                (true, true) => format!("{GIT_SETUP_HINT} {HOST_LAST_RESORT}"),
+            };
+            result.output.push_str(&format!("\n{hint}\n"));
         }
         let summary = command_summary(&result, timeout);
         let last_resort = if ctx.doors.host { format!(" {HOST_LAST_RESORT}") } else { String::new() };
@@ -1554,6 +1635,99 @@ mod tests {
         // Approved (not confined), the same command may change .git.
         let approved = Bash.run(&bash("touch .git/approved"), &tool_ctx(&root, true)).await.unwrap();
         assert!(approved.output.ends_with("[exit code 0]"), "{}", approved.output);
+    }
+
+    /// A repository with one commit, for the git_write tests.
+    fn repo(name: &str) -> TempDir {
+        let root = TempDir::new(name);
+        root.write("f", "a\n");
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["add", "f"],
+            &["-c", "user.email=a@b", "-c", "user.name=n", "commit", "-qm", "1"],
+        ] {
+            crate::test_support::git(root.path(), args);
+        }
+        root
+    }
+
+    #[tokio::test]
+    async fn a_git_write_that_runs_unasked_commits_and_branches_but_cant_touch_what_git_runs() {
+        require_bwrap!();
+        let root = repo("bash-git-write");
+        let ctx = ToolContext { confined: true, ..tool_ctx(&root, true) };
+        let git = root.path().join(".git");
+        let config = std::fs::read_to_string(git.join("config")).unwrap();
+        let commit = "git checkout -q -b feature && echo b >> f && git -c user.email=a@b -c user.name=n commit -qam 2 \
+                      && git checkout -q main && git merge -q --no-ff -m merged feature && git log --oneline | wc -l";
+        let out = Bash.run(&git_bash(commit, true), &ctx).await.unwrap();
+        assert!(out.output.starts_with("3\n"), "{}", out.output);
+        // Every way to make git run a program outside, or to follow one somewhere else, fails.
+        for planted in [
+            "echo evil > .git/hooks/pre-commit",
+            "printf '[core]\\n\\tfsmonitor = evil\\n' >> .git/config",
+            "git config core.hooksPath /tmp",
+            "echo /tmp/evil > .git/commondir",
+            "echo '[core]' > .git/config.worktree",
+            "mkdir -p .git/modules/x",
+            "echo '* filter=x' > .git/info/attributes",
+            "mv .git .git-old",
+            "rm -rf .git/hooks",
+        ] {
+            let out = Bash.run(&git_bash(planted, true), &ctx).await.unwrap();
+            assert!(!out.output.ends_with("[exit code 0]"), "{planted}: {}", out.output);
+        }
+        assert_eq!(std::fs::read_to_string(git.join("config")).unwrap(), config);
+        assert!(!git.join("hooks/pre-commit").exists() && git.join("hooks").is_dir());
+        // The stand-ins and placeholders are gone again, and nothing else is left behind.
+        for gone in ["commondir", "config.worktree", "modules", "worktrees"] {
+            assert!(!git.join(gone).exists(), "{gone}");
+        }
+        assert!(!root.path().join(".git-old").exists());
+        assert_eq!(crate::test_support::git_output(root.path(), &["status", "--porcelain"]), "");
+    }
+
+    #[tokio::test]
+    async fn a_git_write_that_needs_the_config_says_how_to_get_it() {
+        require_bwrap!();
+        let root = repo("bash-git-write-setup");
+        let ctx = ToolContext { confined: true, ..tool_ctx(&root, true) };
+        let out = Bash.run(&git_bash("git config user.name x", true), &ctx).await.unwrap();
+        assert!(out.output.contains(GIT_SETUP_HINT), "{}", out.output);
+    }
+
+    #[test]
+    fn a_git_write_runs_unasked_only_in_a_plain_repository_and_not_to_change_its_setup() {
+        let root = repo("bash-git-write-unasked");
+        let ctx = ToolContext {
+            sandbox: std::sync::Arc::new(Sandbox { assume_backend: true, ..Sandbox::from_env(true) }),
+            ..ToolContext::new(root.path())
+        };
+        let unasked = |command: &str| Bash.auto_safe(&git_bash(command, true), &ctx);
+        for command in
+            ["git commit -am x", "git checkout -b feature", "git merge feature", "git stash", "git rebase main", "git tag v1"]
+        {
+            assert_eq!(unasked(command), cfg!(target_os = "linux"), "{command}");
+        }
+        for command in [
+            "git remote add origin x",
+            "git config user.name x",
+            "git branch -u origin/main",
+            "git submodule add x",
+            "git worktree add ../w",
+            "npx husky install",
+            "pre-commit install",
+            "git init sub",
+            "cp hook .git/hooks/pre-commit",
+        ] {
+            assert!(!unasked(command), "{command}");
+        }
+        // Not where .git is a worktree's file or missing: asked, as before.
+        let tree = TempDir::new("bash-git-write-worktree");
+        tree.write(".git", "gitdir: /elsewhere\n");
+        assert!(!Bash.auto_safe(&git_bash("git commit -am x", true), &ToolContext { root: tree.path().into(), ..ctx.clone() }));
+        let bare = TempDir::new("bash-git-write-none");
+        assert!(!Bash.auto_safe(&git_bash("git commit -am x", true), &ToolContext { root: bare.path().into(), ..ctx.clone() }));
     }
 
     #[tokio::test]

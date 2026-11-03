@@ -46,6 +46,9 @@ pub struct Plan {
     /// Extra folders outside the project the command may change, for an approved command: a git worktree's record
     /// and its repository's `.git` (in the hidden home), so an approved `git commit` works there.
     pub writable: Vec<PathBuf>,
+    /// Paths inside a writable folder that stay read-only on top of it, mounted after the writable extras: the parts
+    /// of a `.git` that a command changing the repository without asking may not touch (`git_guard::git_write_guard`).
+    pub read_only_on_top: Vec<PathBuf>,
     /// Paths inside the project that don't exist yet and must stay that way: each gets an empty read-only folder
     /// (a project without `.git`, so a command can't create a repository whose config git would run outside). bwrap
     /// leaves the empty mount point behind; [`SandboxBackend::after`] removes it.
