@@ -403,18 +403,20 @@ fn without_network_no_ip_not_even_loopback() {
     let home = Home::new("sb-net");
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    // Controls: the host reaches its own listener; with network, the sandbox reaches the internet and may bind.
+    // Controls: the host reaches its own listener; with network, the sandbox reaches the internet and may bind. curl
+    // runs with -k: what's tested is reaching the server, and the runners' system curl stopped trusting example.com's
+    // chain (SSL.com's 2022 ECC root, 2026-11-03), which failed the control though the network was there.
     let control = host(home.home(), &format!("exec 3<>/dev/tcp/127.0.0.1/{port} && echo reached"));
     assert!(control.output.contains("reached"), "control: {}", control.output);
     for script in [
-        "curl -sS -m 20 -o /dev/null https://example.com && echo reached",
+        "curl -sSk -m 20 -o /dev/null https://example.com && echo reached",
         "python3 -c 'import socket; s=socket.socket(); s.bind((\"0.0.0.0\", 0)); s.listen(1); print(\"reach\" \"ed\")'",
     ] {
         let ran = home.run_with(&home.sandbox(), &home.proj(), true, script);
         assert!(ran.output.contains("reached"), "control with network, {script}: {}", ran.output);
     }
     for script in [
-        "curl -sS -m 5 -o /dev/null https://example.com && echo reached".to_string(),
+        "curl -sSk -m 5 -o /dev/null https://example.com && echo reached".to_string(),
         format!("exec 3<>/dev/tcp/127.0.0.1/{port} && echo reached"),
         "python3 -c 'import socket; s=socket.socket(); s.bind((\"0.0.0.0\", 0)); s.listen(1); print(\"reach\" \"ed\")'"
             .to_string(),
