@@ -57,8 +57,8 @@ fn every_request_of_marv_p_says_nobody_can_answer() {
     assert_eq!(systems[0], systems[1], "the system prompt changed between requests");
 }
 
-/// `--time-limit` puts the budget in the system prompt (the same bytes on every request) and each command result says
-/// how much time is left.
+/// `--time-limit` puts the budget in the system prompt (the same bytes on every request) and each tool's result (a
+/// command's, and a file write's too) says how much time is left.
 #[test]
 fn a_time_limit_is_in_the_prompt_and_in_each_command_result() {
     let dir = std::env::temp_dir().join(format!("marv-time-limit-{}", std::process::id()));
@@ -70,6 +70,10 @@ fn a_time_limit_is_in_the_prompt_and_in_each_command_result() {
     let replies: Vec<Reply> = vec![
         serde_json::from_value(json!({"tool_calls": [{"id": "c1", "name": "bash", "arguments": {"command": "echo hi"}}]}))
             .unwrap(),
+        serde_json::from_value(
+            json!({"tool_calls": [{"id": "c2", "name": "write_file", "arguments": {"path": "out.txt", "content": "hi\n"}}]}),
+        )
+        .unwrap(),
         serde_json::from_value(json!({"text": "Done."})).unwrap(),
     ];
     let server = FakeServer::start(replies, Vec::new()).unwrap();
@@ -91,10 +95,13 @@ fn a_time_limit_is_in_the_prompt_and_in_each_command_result() {
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
     let bodies: Vec<Value> =
         server.requests().into_iter().filter(|r| r.method == "POST").map(|r| serde_json::from_str(&r.body).unwrap()).collect();
-    assert_eq!(bodies.len(), 2);
+    assert_eq!(bodies.len(), 3);
     let system = |b: &Value| b["messages"][0]["content"].to_string();
     assert!(system(&bodies[0]).contains("# Time limit") && system(&bodies[0]).contains("10 minutes"), "{}", system(&bodies[0]));
     assert_eq!(system(&bodies[0]), system(&bodies[1]));
-    let last = bodies[1]["messages"].as_array().unwrap().last().unwrap().to_string();
-    assert!(last.contains("time left in this run: 9m") || last.contains("time left in this run: 10m"), "{last}");
+    for body in &bodies[1..] {
+        let last = body["messages"].as_array().unwrap().last().unwrap().to_string();
+        assert!(last.contains("time left in this run: 9m") || last.contains("time left in this run: 10m"), "{last}");
+    }
+    assert!(bodies[2]["messages"].as_array().unwrap().last().unwrap()["role"] == "tool");
 }

@@ -108,6 +108,16 @@
 //! - **#64 continue after a dropped stream**: a `Retry` with `continued: true` keeps the partial
 //!   text as the assistant turn and sends [`DROPPED_STREAM_NOTE`] instead of starting over (needs a
 //!   `continued` flag on `marv_core::ProviderEvent::Retry`, see `docs/subsystems/agent.md`).
+//! - **Run deadline** (marv-rs, Terminal-Bench 0.15.0): `deadline` (`marv -p --time-limit`) used to reach only the
+//!   tools (bash trims each command to it), so five benchmark runs kept reasoning or calling tools past "time left: 0m
+//!   00s" and were killed from outside before they saved their work or `marv -p` printed its result. Now the loop
+//!   owns it: (1) every result of a call that ran ends with [`time_left_note`] (it was bash's alone); (2) at the top of
+//!   the first step within [`deadline_margin`] of the deadline, [`deadline_note`] goes into the history once (a user
+//!   message from Marv, like the step limit's note; tools stay on, because saving the deliverable takes a tool call);
+//!   (3) at the deadline the run's own stop (a child of `cancel`) fires: a reply still streaming is dropped (its text so
+//!   far is kept, its calls answered [`not_run::TIME_LIMIT`]), running tools see a stop as for ctrl+c, and the run
+//!   ends with an `Error` ([`TIME_LIMIT_MESSAGE`]) and `Done(TimeLimit)`, so the session and `marv -p` finish cleanly.
+//!   A person's own stop still ends `Aborted`. The note is appended, never edited in; the system prompt is untouched.
 //! - A tool's first poll happens right after launch (Marv: `runTool` is called synchronously), so
 //!   what it does first (an approval, a cancel) is seen before the next call of the group is shown.
 //! - The text-loop check position is reset on `Retry` too (Marv forgot it, so after a retry the
@@ -151,6 +161,8 @@ pub mod not_run {
     pub const TEXT_LOOP: &str = "Not run: your reply was stuck repeating the same text, so it was dropped.";
     /// #59: a call the wrap-up reply made anyway (it was asked not to).
     pub const STEP_LIMIT: &str = "Not run: the step limit was reached.";
+    /// marv-rs: a call left when the run's time limit (`AgentOptions::deadline`) ended it.
+    pub const TIME_LIMIT: &str = "Not run: the run's time limit was reached.";
     /// #202: a call that waited for approval when Marv quit (a crash, a force-quit): the saved session answers it so.
     pub const QUIT_APPROVAL: &str = "Not run: Marv quit while this call waited for approval.";
     /// #202: a call with no result when Marv quit: it may not have started, or stopped part-way.
@@ -198,6 +210,42 @@ pub fn refused_call_note(reason: &str) -> String {
 
 /// Marv #59: the wrap-up request's note at a hard step limit.
 pub const STEP_LIMIT_NOTE: &str = "(Automatic note from Marv, the program running you) You've reached the step limit. Don't call tools. Reply with what you finished, what's left, and the next step.";
+
+/// The most time before the run's deadline at which the model is told to finish ([`deadline_margin`]).
+pub const DEADLINE_WRAP_UP_MAX: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// How long before the deadline [`deadline_note`] goes in, for a run that had `budget` when it started: a quarter of
+/// it, at most [`DEADLINE_WRAP_UP_MAX`]. 90 s is about two steps of a slow reasoning model (one reply that saves the
+/// deliverable, one final reply), and bash already ends each command 30 s before the deadline
+/// (`marv_tools::bash::DEADLINE_MARGIN_S`), so a command started just before the note still leaves time to read its
+/// output. A quarter keeps a short limit (2 minutes: 30 s) mostly for the work itself.
+pub fn deadline_margin(budget: std::time::Duration) -> std::time::Duration {
+    (budget / 4).min(DEADLINE_WRAP_UP_MAX)
+}
+
+/// marv-rs: the note at [`deadline_margin`] before the deadline, once a run. Tools stay offered: writing the
+/// deliverable is a tool call, and a reply that can't make one can't save anything.
+pub fn deadline_note(left: std::time::Duration) -> String {
+    format!(
+        "(Automatic note from Marv, the program running you) About {} s are left before the time limit stops this run. Finish now: if your result isn't saved yet, make the one or two tool calls that save it, then give your final reply. Don't start anything new.",
+        left.as_secs()
+    )
+}
+
+/// marv-rs: the `Error` the run ends with at its deadline (`Done(TimeLimit)` follows).
+pub const TIME_LIMIT_MESSAGE: &str = "Stopped at the time limit: the run's time ran out before it finished.";
+
+/// What each result of a call that ran ends with while the run has a deadline: the time left, so the model can plan
+/// the rest (it was bash's alone; now every tool's). Empty without a deadline.
+pub fn time_left_note(deadline: Option<std::time::Instant>) -> String {
+    match deadline {
+        Some(at) => {
+            let left = at.saturating_duration_since(std::time::Instant::now()).as_secs();
+            format!("\n[time left in this run: {}m {:02}s]", left / 60, left % 60)
+        }
+        None => String::new(),
+    }
+}
 
 /// Marv #64: sent after a partial reply kept from a dropped stream. The provider owns the continue
 /// request (it owns retries), so the text lives there; re-exported for the loop's tests and docs.
@@ -602,6 +650,9 @@ pub struct AgentOptions {
     /// The person's "send now" messages, appended at the next step boundary ([`crate::send_now`]). The session sets
     /// it for the main agent only.
     pub send_now: Option<SendNow>,
+    /// marv-rs: when the run must be done (`marv -p --time-limit`): the time-left footer, the wrap-up note, and the
+    /// stop at the deadline (the module doc's "Run deadline"). None: no limit.
+    pub deadline: Option<std::time::Instant>,
 }
 
 impl AgentOptions {
@@ -631,6 +682,7 @@ impl AgentOptions {
             wrap_up_at_limit: false,
             debug_raw: false,
             send_now: None,
+            deadline: None,
         }
     }
 }
@@ -929,12 +981,29 @@ pub struct LoopState {
     sent_len: usize,
     /// Marv #63: overflow recoveries in this step (`on_overflow`'s `attempt`); reset by a step that got a reply.
     overflows: u32,
+    /// The caller's `cancel`. With a deadline, `options.cancel` is a child of it that the deadline fires too: a stop
+    /// from here is a person's (`Aborted`), one only there is the time limit (`TimeLimit`).
+    user_cancel: CancellationToken,
+    /// How long before the deadline the wrap-up note goes in ([`deadline_margin`]).
+    margin: std::time::Duration,
+    /// The wrap-up note went in (once a run).
+    deadline_warned: bool,
 }
 
 impl LoopState {
-    pub fn new(options: AgentOptions) -> Self {
+    pub fn new(mut options: AgentOptions) -> Self {
         let used_ids = used_ids(&options.history.lock().unwrap_or_else(|e| e.into_inner()));
+        let user_cancel = options.cancel.clone();
+        let mut margin = std::time::Duration::ZERO;
+        if let Some(deadline) = options.deadline {
+            // The run's own stop: the provider and the tools get it, so the deadline stops them as ctrl+c would.
+            options.cancel = user_cancel.child_token();
+            margin = deadline_margin(deadline.saturating_duration_since(std::time::Instant::now()));
+        }
         Self {
+            user_cancel,
+            margin,
+            deadline_warned: false,
             options,
             queue: VecDeque::new(),
             finished: false,
@@ -975,11 +1044,38 @@ impl LoopState {
         self.options.cancel.is_cancelled()
     }
 
+    /// The deadline passed and the person didn't stop the run themselves.
+    fn timed_out(&self) -> bool {
+        self.options.deadline.is_some_and(|at| std::time::Instant::now() >= at) && !self.user_cancel.is_cancelled()
+    }
+
+    /// What a call that won't run after a stop is answered: the time limit's text when that was the stop.
+    fn stop_text(&self) -> &'static str {
+        if self.timed_out() { not_run::TIME_LIMIT } else { not_run::ABORTED }
+    }
+
+    /// The wrap-up note, once, at the top of the first step within the margin of the deadline.
+    fn warn_deadline(&mut self) {
+        let Some(at) = self.options.deadline else { return };
+        let left = at.saturating_duration_since(std::time::Instant::now());
+        if !self.deadline_warned && left <= self.margin {
+            self.deadline_warned = true;
+            self.push_note(&deadline_note(left));
+        }
+    }
+
     fn emit(&mut self, event: LoopEvent) {
         self.queue.push_back(event);
     }
 
     fn finish(&mut self, reason: StopReason) {
+        // A stop that only the deadline fired is the time limit, not the person.
+        let reason = if reason == StopReason::Aborted && self.timed_out() {
+            self.emit(LoopEvent::Error(TIME_LIMIT_MESSAGE.into()));
+            StopReason::TimeLimit
+        } else {
+            reason
+        };
         self.emit(LoopEvent::Done(reason));
         self.finished = true;
     }
@@ -997,7 +1093,13 @@ impl LoopState {
 
     /// Appends a call's result (in call order) and remembers it for tool-loop detection.
     fn answer(&mut self, call: &ToolCall, text: &str) {
-        self.push_result(call, text);
+        self.answer_with(call, text, "");
+    }
+
+    /// [`Self::answer`], with `footer` (the time left) after the text in the history only: the loop guards compare
+    /// the tool's own text, which a ticking clock would make look new every time.
+    fn answer_with(&mut self, call: &ToolCall, text: &str, footer: &str) {
+        self.push_result(call, &format!("{text}{footer}"));
         self.last_result.insert(Self::call_key(call), result_hash(text));
         self.failures.record(&call.name, &call.arguments, text);
         self.in_flight.answered += 1;
@@ -1012,7 +1114,24 @@ impl LoopState {
             if self.finished {
                 return None;
             }
-            self.advance().await;
+            // With a deadline, the run's stop fires at it, whatever this transition is waiting for (a reply, a tool,
+            // a hook): it then winds down as after ctrl+c, and `finish` names the time limit.
+            match self.options.deadline {
+                Some(at) if !self.options.cancel.is_cancelled() => {
+                    let stop = self.options.cancel.clone();
+                    let advance = self.advance();
+                    tokio::pin!(advance);
+                    tokio::select! {
+                        biased;
+                        () = &mut advance => {}
+                        () = tokio::time::sleep_until(at.into()) => {
+                            stop.cancel();
+                            advance.await;
+                        }
+                    }
+                }
+                _ => self.advance().await,
+            }
         }
     }
 
@@ -1034,20 +1153,29 @@ impl LoopState {
                 let stream = self.options.provider.stream(&snapshot, options);
                 self.phase = Phase::Streaming { stream, reply: StepReply::default(), wrap_up };
             }
-            Phase::Streaming { mut stream, mut reply, wrap_up } => match stream.next().await {
-                Some(event) => {
-                    if let Some(out) = reply.apply(event) {
-                        self.emit(out);
-                    }
-                    // A reply stuck repeating itself is stopped while it streams, not after it ran its course.
-                    if reply.looped {
+            Phase::Streaming { mut stream, mut reply, wrap_up } => {
+                match next_provider_event(&mut stream, self.options.deadline).await {
+                    // The deadline came mid-reply: drop the request (a provider that doesn't watch the stop would
+                    // otherwise keep the run going) and end with what streamed so far.
+                    Err(()) => {
+                        self.options.cancel.cancel();
+                        drop(stream);
                         self.decide(reply, wrap_up);
-                    } else {
-                        self.phase = Phase::Streaming { stream, reply, wrap_up };
                     }
+                    Ok(Some(event)) => {
+                        if let Some(out) = reply.apply(event) {
+                            self.emit(out);
+                        }
+                        // A reply stuck repeating itself is stopped while it streams, not after it ran its course.
+                        if reply.looped {
+                            self.decide(reply, wrap_up);
+                        } else {
+                            self.phase = Phase::Streaming { stream, reply, wrap_up };
+                        }
+                    }
+                    Ok(None) => self.decide(reply, wrap_up),
                 }
-                None => self.decide(reply, wrap_up),
-            },
+            }
             Phase::Tools(mut tools) => {
                 if !self.tools(&mut tools).await {
                     self.phase = Phase::Tools(tools);
@@ -1088,6 +1216,10 @@ impl LoopState {
     /// The step limit guards against a model that never finishes. With `on_limit`, the user decides
     /// at each multiple whether it goes on. `max_steps` 0 (the guard off) never matches.
     async fn top(&mut self) {
+        if self.timed_out() {
+            return self.finish(StopReason::Aborted);
+        }
+        self.warn_deadline();
         if !at_step_limit(self.step, self.options.max_steps) {
             // The step boundary: the person's "send now" messages go in before this step's request. Only before an
             // ordinary request: at the limit they wait for a "continue", or go back to the person with the turn.
@@ -1431,7 +1563,7 @@ impl LoopState {
     async fn tools(&mut self, tools: &mut Tools) -> bool {
         // The abort first: Esc declines what's waiting *and* aborts, and that's an interrupt, not a "no".
         let stopped = if self.aborted() {
-            Some(not_run::ABORTED)
+            Some(self.stop_text())
         } else if tools.declined {
             Some(not_run::DECLINED)
         } else if self.failure_stop {
@@ -1507,7 +1639,7 @@ impl LoopState {
                 if let Some(reason) = &run.invalid {
                     self.invalid.insert(Self::call_key(&call), reason.clone());
                 }
-                self.answer(&call, &run.result.output);
+                self.answer_with(&call, &run.result.output, &time_left_note(self.options.deadline));
                 tools.runs.push(run);
             }
             return false;
@@ -1596,13 +1728,29 @@ impl LoopState {
     }
 }
 
+/// The provider's next event, or `Err` when the deadline came first.
+async fn next_provider_event(
+    stream: &mut EventStream,
+    deadline: Option<std::time::Instant>,
+) -> Result<Option<ProviderEvent>, ()> {
+    match deadline {
+        Some(at) => tokio::select! {
+            biased;
+            event = stream.next() => Ok(event),
+            () = tokio::time::sleep_until(at.into()) => Err(()),
+        },
+        None => Ok(stream.next().await),
+    }
+}
+
 impl Drop for LoopState {
     /// The consumer stopped mid-tools (it dropped the stream): the calls without a result would
     /// leave the history invalid and the API would reject every request from now on.
     fn drop(&mut self) {
         let InFlight { calls, answered } = std::mem::take(&mut self.in_flight);
+        let text = self.stop_text();
         for call in calls.into_iter().skip(answered) {
-            self.push_turn(ChatTurn::Tool { call_id: call.id, name: call.name, text: not_run::ABORTED.into() });
+            self.push_turn(ChatTurn::Tool { call_id: call.id, name: call.name, text: text.into() });
         }
     }
 }
@@ -4277,5 +4425,139 @@ mod tests {
         assert_eq!(count(&events, |e| matches!(e, LoopEvent::SentNow { .. })), 1);
         assert_eq!(end(&events), Some(StopReason::End));
         assert!(q.close().is_empty());
+    }
+
+    // marv-rs: the run's deadline (`marv -p --time-limit`), the module doc's "Run deadline".
+
+    #[test]
+    fn the_deadline_margin_is_a_quarter_of_the_budget_at_most_90_s() {
+        assert_eq!(deadline_margin(Duration::from_secs(120)), Duration::from_secs(30));
+        assert_eq!(deadline_margin(Duration::from_secs(600)), DEADLINE_WRAP_UP_MAX);
+        assert_eq!(deadline_margin(Duration::ZERO), Duration::ZERO);
+        let soon = std::time::Instant::now() + Duration::from_secs(300);
+        assert!(time_left_note(Some(soon)).starts_with("\n[time left in this run: 4m 5"), "{}", time_left_note(Some(soon)));
+        assert_eq!(time_left_note(None), "");
+        assert!(deadline_note(Duration::from_secs(42)).contains("About 42 s are left"));
+    }
+
+    fn notes_in(turns: &[ChatTurn]) -> usize {
+        turns
+            .iter()
+            .filter(|t| matches!(t, ChatTurn::User { text } if text.contains("before the time limit stops this run")))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn near_the_deadline_the_model_is_told_once_and_every_result_says_the_time_left() {
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            use_tools(&[call("c1", "a.ts")]),
+            use_tools(&[call("c2", "b.ts")]),
+            say("Saved."),
+        ]));
+        let h = history(vec![user("go")]);
+        let mut o = options(provider.clone(), &h, plain());
+        o.deadline = Some(std::time::Instant::now() + Duration::from_secs(60));
+        let mut state = LoopState::new(o);
+        // A margin wider than the time left: the first step is already within it (a real run reaches it later).
+        state.margin = Duration::from_secs(120);
+        let mut events = Vec::new();
+        while let Some(event) = state.next_event().await {
+            events.push(event);
+        }
+        assert_eq!(end(&events), Some(StopReason::End));
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 3);
+        // In from the first request on, once, appended (each request starts with the one before: the cache holds).
+        assert!(requests.iter().all(|(turns, _)| notes_in(turns) == 1));
+        assert!(requests[1].0.starts_with(&requests[0].0) && requests[2].0.starts_with(&requests[1].0));
+        assert!(requests.iter().all(|(_, o)| o.tool_choice == ToolChoice::Auto), "tools stay on: saving takes a call");
+        // Every tool's result (read_file here, not only bash) ends with the time left.
+        let texts = tool_texts(&h);
+        assert_eq!(texts.len(), 2);
+        for (text, path) in texts.iter().zip(["a.ts", "b.ts"]) {
+            assert!(text.starts_with(&format!("contents of {path}\n[time left in this run: 0m 5")), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn without_a_deadline_there_is_no_note_and_no_footer() {
+        let provider = Arc::new(ScriptedProvider::new(vec![use_tools(&[call("c1", "a.ts")]), say("Done.")]));
+        let h = history(vec![user("go")]);
+        let events = collect(options(provider.clone(), &h, plain())).await;
+        assert_eq!(end(&events), Some(StopReason::End));
+        assert_eq!(tool_texts(&h), ["contents of a.ts"]);
+        assert!(provider.requests().iter().all(|(turns, _)| notes_in(turns) == 0));
+    }
+
+    /// A reply that streams a little, then never ends (and ignores the stop), as a model deep in reasoning would.
+    struct Hanging;
+    impl Provider for Hanging {
+        fn name(&self) -> &str {
+            "hanging"
+        }
+        fn context_length(&self) -> Option<u64> {
+            None
+        }
+        fn stream(&self, _history: &[ChatTurn], _options: StreamOptions) -> EventStream {
+            let start = futures::stream::iter(vec![ProviderEvent::TextDelta("Writing the report".into())]);
+            Box::pin(start.chain(futures::stream::pending()))
+        }
+    }
+
+    #[tokio::test]
+    async fn at_the_deadline_a_reply_in_flight_is_dropped_and_the_run_ends_time_limit() {
+        let h = history(vec![user("go")]);
+        let mut o =
+            AgentOptions::new(Arc::new(Hanging), h.clone(), "S".into(), specs(), Arc::new(plain()), CancellationToken::new());
+        o.deadline = Some(std::time::Instant::now() + Duration::from_millis(300));
+        let events = tokio::time::timeout(Duration::from_secs(10), collect(o)).await.expect("the run ended at its deadline");
+        assert_eq!(end(&events), Some(StopReason::TimeLimit));
+        assert!(events.iter().any(|e| matches!(e, LoopEvent::Error(m) if m == TIME_LIMIT_MESSAGE)));
+        // What streamed so far is kept, so `marv -p` has a reply to print.
+        assert!(events.iter().any(|e| matches!(e, LoopEvent::Assistant { text } if text == "Writing the report")));
+        assert_eq!(snapshot(&h).last(), Some(&said("Writing the report")));
+    }
+
+    #[tokio::test]
+    async fn at_the_deadline_running_tools_are_stopped_and_the_rest_not_run() {
+        let provider = Arc::new(ScriptedProvider::new(vec![use_tools(&[call("c1", "slow"), call("c2", "next")])]));
+        let h = history(vec![user("go")]);
+        // The first call runs until it's stopped, as a long command would.
+        let run: RunFn = Arc::new(|_, cancel| {
+            Box::pin(async move {
+                cancel.cancelled().await;
+                Ok(ok("stopped", "slow"))
+            })
+        });
+        let mut o = options(provider, &h, FakeRunner { run, parallel: |_| false });
+        o.deadline = Some(std::time::Instant::now() + Duration::from_millis(300));
+        let events = tokio::time::timeout(Duration::from_secs(10), collect(o)).await.expect("the run ended at its deadline");
+        assert_eq!(end(&events), Some(StopReason::TimeLimit));
+        let texts = tool_texts(&h);
+        assert!(texts[0].starts_with("stopped\n[time left in this run: 0m 00s]"), "{}", texts[0]);
+        assert_eq!(texts[1], not_run::TIME_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn a_persons_stop_under_a_deadline_is_still_aborted() {
+        let provider = Arc::new(ScriptedProvider::new(vec![say("hi")]));
+        let h = history(vec![user("go")]);
+        let mut o = options(provider, &h, plain());
+        o.deadline = Some(std::time::Instant::now() + Duration::from_secs(60));
+        o.cancel.cancel();
+        let events = collect(o).await;
+        assert_eq!(end(&events), Some(StopReason::Aborted));
+        assert!(!events.iter().any(|e| matches!(e, LoopEvent::Error(m) if m == TIME_LIMIT_MESSAGE)));
+    }
+
+    #[tokio::test]
+    async fn a_run_that_starts_past_its_deadline_ends_without_a_request() {
+        let provider = Arc::new(ScriptedProvider::new(vec![say("hi")]));
+        let h = history(vec![user("go")]);
+        let mut o = options(provider.clone(), &h, plain());
+        o.deadline = Some(std::time::Instant::now());
+        let events = collect(o).await;
+        assert_eq!(end(&events), Some(StopReason::TimeLimit));
+        assert!(provider.requests().is_empty());
     }
 }

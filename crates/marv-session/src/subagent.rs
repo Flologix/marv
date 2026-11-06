@@ -51,6 +51,7 @@ pub fn stopped_text(reason: &str) -> String {
             "It hit its {SUBAGENT_MAX_STEPS}-step limit before finishing. To go on, start a new subagent with what remains."
         ),
         "length" => "Its last reply was cut off by the model's output limit.".into(),
+        "time_limit" => "The run's time limit was reached before it finished.".into(),
         "error" => "It stopped on an error:".into(),
         other => format!("It stopped ({other})."),
     }
@@ -440,6 +441,8 @@ async fn drive(
     options.wrap_up_at_limit = true;
     // #90: subagents' request records get the raw responses under debug recording too.
     options.debug_raw = crate::config::debug_raw();
+    // The parent's time limit holds for its subagents too (their tools had it already).
+    options.deadline = ctx.deadline;
     options.after_step = plug.as_ref().map(|p| p.after_step(None, taint));
 
     tally.report();

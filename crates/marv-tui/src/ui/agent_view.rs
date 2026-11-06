@@ -73,6 +73,7 @@ fn stopped(reason: StopReason) -> Option<&'static str> {
         StopReason::Declined => Some("Stopped: the user declined."),
         StopReason::Length => Some("The reply was cut off at the model's output limit, so nothing in it ran."),
         StopReason::MaxSteps => Some("It hit its step limit."),
+        StopReason::TimeLimit => Some("It hit the run's time limit."),
         _ => None,
     }
 }
