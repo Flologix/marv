@@ -32,11 +32,17 @@ clap = { version = "4.6", features = ["derive"] }
 # The mesh's switchboard is served until its token is cancelled (`mesh_cmd::Mesh`).
 tokio-util.workspace = true
 # `marv __guard` (#165): its session, its parent's pid and the signals it sends its process group.
-nix = { version = "0.31.3", features = ["signal", "process"] }
+# `marv login` names the device after the machine (`hostname`).
+nix = { version = "0.31.3", features = ["signal", "process", "hostname"] }
 # The update check and `marv update` (`update`): the same rustls-only reqwest marv-provider builds.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 # `marv update`'s downloaded installer, in a private temporary file.
 tempfile.workspace = true
+# The Marv plan (`plan`): the licence's Ed25519 check (the ring marv-provider and rustls already build) and its
+# base64url parts; plan.json is written privately and atomically.
+ring = "0.17"
+base64 = "0.22.1"
+marv-fs.workspace = true
 
 [dev-dependencies]
 # The two-Marv mesh test (tests/mesh.rs): the oracle's fake OpenAI-compatible server.

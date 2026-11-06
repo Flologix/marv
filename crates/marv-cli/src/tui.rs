@@ -2140,6 +2140,7 @@ impl Bridge {
                 self.emit(UiEvent::Message(message(Role::User, line)));
                 self.run_turn(line.to_string(), Some(for_model));
             }
+            CommandAction::Plan { manage } => self.show_plan(manage).await,
             CommandAction::McpTrust => self.trust_mcp().await,
             CommandAction::TrustProject => self.trust_project().await,
             CommandAction::McpAdd { args } => self.add_mcp(&args).await,
@@ -2686,6 +2687,23 @@ impl Bridge {
             }
             Err(e) => self.emit(system(format!("Couldn't search the MCP Registry: {e}"), true)),
         }
+    }
+
+    /// /plan: the Marv plan from its server (`crate::plan`), or its billing page opened (the link shown either way).
+    async fn show_plan(&self, manage: bool) {
+        let ctx = crate::plan::Ctx::new(&self.env, &self.config_dir);
+        if manage {
+            let url = self.busy_with("Asking for the billing page…".into(), async |_| crate::plan::portal_url(&ctx).await).await;
+            return match url {
+                Ok(url) => {
+                    self.emit(system(format!("Manage your Marv plan at:\n{}", printable(url.as_str())), false));
+                    (self.open_url)(url);
+                }
+                Err(e) => self.emit(system(e, true)),
+            };
+        }
+        let (text, is_error) = self.busy_with("Checking your Marv plan…".into(), async |_| crate::plan::status(&ctx).await).await;
+        self.emit(system(text, is_error));
     }
 
     /// /mcp remove: one of your servers out of ~/.marv/mcp.json, and stopped. No approval: the user typed it, and it

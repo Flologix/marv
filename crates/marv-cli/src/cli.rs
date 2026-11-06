@@ -8,6 +8,7 @@
 //! marv mesh wire 'alpha -> beta:inbox'
 //! marv mesh plug alpha --as claude   (an MCP server command: another agent plugs into alpha's switchboard)
 //! marv update       update this install to the newest release (`--check`: only say whether there is one)
+//! marv login        sign in to a paid Marv plan (`marv logout` signs out, `marv plan` shows it)
 //! ```
 //!
 //! Port notes:
@@ -29,6 +30,7 @@ pub const AFTER_HELP: &str = "Config:
   ~/.marv/agents/       your subagent types (a project's go in .marv/agents/)
   ~/.marv/mcp.json      your MCP servers (a project's go in .mcp.json; /mcp)
   ~/.marv/worktrees/    subagents' worktrees while they run
+  ~/.marv/plan.json     your Marv plan sign-in (marv login; marv logout removes it)
   OPENROUTER_API_KEY    overrides the saved OpenRouter key
   ZAI_API_KEY           overrides the saved Z.ai Coding Plan key
   KIMI_API_KEY          overrides the saved Kimi Code key
@@ -39,6 +41,7 @@ pub const AFTER_HELP: &str = "Config:
   MARV_MODEL            overrides the saved model
   MARV_MAX_STEPS        overrides the saved step limit (0 or off: never ask)
   MARV_CONFIG_DIR       use a different config directory (read from the environment only)
+  MARV_PLAN_URL         use a different Marv plan server (tests)
   MARV_NO_UPDATE_CHECK  1: don't check for a newer Marv at startup (or \"updateCheck\": false in the config)
 
 Exit codes for -p: 0 finished, 1 error, 2 stopped (step limit, output limit, loop), 3 an approval it couldn't get";
@@ -150,6 +153,20 @@ pub enum Command {
         #[arg(long)]
         check: bool,
     },
+    /// Sign in to your paid Marv plan with the code it emails you (Marv Free needs no account).
+    Login {
+        /// The email the plan was bought with (asked when not given).
+        #[arg(long)]
+        email: Option<String>,
+    },
+    /// Sign out of the Marv plan on this machine.
+    Logout,
+    /// Show your Marv plan: its status, and the model allowance used and left.
+    Plan {
+        /// Open the billing page to change or cancel the plan, or see invoices.
+        #[arg(long)]
+        manage: bool,
+    },
     /// Converts one web page: `{html, url}` JSON on stdin, the result on stdout (the web reader's own process).
     #[command(name = "__html-convert", hide = true)]
     HtmlConvert,
@@ -209,6 +226,15 @@ pub enum Mode {
     Update {
         check: bool,
     },
+    /// `marv login [--email <e>]`.
+    Login {
+        email: Option<String>,
+    },
+    Logout,
+    /// `marv plan [--manage]`.
+    Plan {
+        manage: bool,
+    },
     MeshWire {
         spec: String,
     },
@@ -242,6 +268,9 @@ impl Cli {
             }
             Some(Command::Mesh(MeshCommand::Ls)) => Mode::MeshLs,
             Some(Command::Update { check }) => Mode::Update { check: *check },
+            Some(Command::Login { email }) => Mode::Login { email: email.clone() },
+            Some(Command::Logout) => Mode::Logout,
+            Some(Command::Plan { manage }) => Mode::Plan { manage: *manage },
             Some(Command::Mesh(MeshCommand::Wire { spec })) => Mode::MeshWire { spec: spec.join(" ") },
             Some(Command::Mesh(MeshCommand::Plug { session, name })) => {
                 Mode::MeshPlug { session: session.clone(), name: name.clone() }
@@ -300,6 +329,11 @@ mod tests {
         );
         assert_eq!(parse(&["update"]).mode(), Mode::Update { check: false });
         assert_eq!(parse(&["update", "--check"]).mode(), Mode::Update { check: true });
+        assert_eq!(parse(&["login"]).mode(), Mode::Login { email: None });
+        assert_eq!(parse(&["login", "--email", "a@b.c"]).mode(), Mode::Login { email: Some("a@b.c".into()) });
+        assert_eq!(parse(&["logout"]).mode(), Mode::Logout);
+        assert_eq!(parse(&["plan"]).mode(), Mode::Plan { manage: false });
+        assert_eq!(parse(&["plan", "--manage"]).mode(), Mode::Plan { manage: true });
         assert_eq!(parse(&["__html-convert"]).mode(), Mode::HtmlConvert);
         assert_eq!(parse(&["__run-checks", "{}"]).mode(), Mode::RunChecks { spec: "{}".into() });
         assert_eq!(parse(&["__relay", "{}"]).mode(), Mode::Relay { spec: "{}".into() });

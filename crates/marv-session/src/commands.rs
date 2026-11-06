@@ -140,6 +140,10 @@ pub enum CommandAction {
         read: Option<String>,
         stop: Option<String>,
     },
+    /// `/plan`: the Marv plan's status from its server; `manage`: open its billing page (marv-cli's `plan`).
+    Plan {
+        manage: bool,
+    },
     /// The user ran a skill: `/<name> <args>`.
     Skill {
         name: String,
@@ -298,6 +302,17 @@ pub fn commands() -> &'static [Command] {
                     ctx.usage
                         .map_or_else(|| "No requests yet this session.".to_string(), |(t, last, c)| usage_report(t, last, c)),
                 )
+            },
+        },
+        Command {
+            name: "plan",
+            // It asks the plan server, with a busy line, so it waits for an idle session like /mcp search.
+            while_busy: false,
+            description: "Show your Marv plan and the model allowance left (/plan manage: open the billing page)",
+            run: |args, _| match args.trim() {
+                "" => CommandAction::Plan { manage: false },
+                "manage" | "--manage" => CommandAction::Plan { manage: true },
+                _ => error("Usage: /plan, or /plan manage"),
             },
         },
         Command {
@@ -1362,6 +1377,17 @@ mod tests {
             assert!(text.contains("- rust: on (cargo check: not installed (Marv doesn't install toolchains))"), "{text}");
             assert!(text.contains("- go: off") && text.contains("(off for go)"), "{text}");
             assert!(text.contains("/home/me/.cache/marv/checks/repo-abc (3.0 GB;"), "{text}");
+        });
+    }
+
+    /// `/plan` shows the Marv plan; `/plan manage` opens its billing page. The client does the asking.
+    #[test]
+    fn plan_takes_manage_and_nothing_else() {
+        with(|ctx| {
+            assert_eq!(run_command("/plan", ctx), CommandAction::Plan { manage: false });
+            assert_eq!(run_command("/plan manage", ctx), CommandAction::Plan { manage: true });
+            assert_eq!(run_command("/plan --manage", ctx), CommandAction::Plan { manage: true });
+            assert!(matches!(run_command("/plan cancel", ctx), CommandAction::Print { is_error: true, .. }));
         });
     }
 
