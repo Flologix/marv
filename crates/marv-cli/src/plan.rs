@@ -176,8 +176,25 @@ pub struct Me {
     pub plan: String,
     pub status: String,
     pub period_end: Option<u64>,
+    /// What the subscription costs, ready to print ("$20/month"); None from a server without the field, or a price
+    /// that isn't a plain amount, currency code and month/year.
+    pub price: Option<String>,
     pub licence: String,
     pub models: Option<Models>,
+}
+
+/// `/me`'s `price` as a line can show it: "$20/month", "$9.50/month", "20 EUR/year". Only digits, a three-letter
+/// code and our own words are printed, so nothing from the server reaches the terminal as is.
+fn price_label(price: &Value) -> Option<String> {
+    let amount = price.get("amount").and_then(Value::as_f64).filter(|a| a.is_finite() && *a >= 0.0)?;
+    let currency =
+        price.get("currency").and_then(Value::as_str).filter(|c| c.len() == 3 && c.bytes().all(|b| b.is_ascii_alphabetic()))?;
+    let interval = price.get("interval").and_then(Value::as_str).filter(|i| matches!(*i, "month" | "year"))?;
+    let number = if amount.fract() == 0.0 { format!("{amount:.0}") } else { format!("{amount:.2}") };
+    Some(match currency.to_ascii_lowercase().as_str() {
+        "usd" => format!("${number}/{interval}"),
+        _ => format!("{number} {}/{interval}", currency.to_ascii_uppercase()),
+    })
 }
 
 /// Something that can go into config.json as one value: no spaces, controls or anything outside visible ASCII.
@@ -206,6 +223,7 @@ impl Me {
             plan: text(value, "plan")?,
             status: text(value, "status").unwrap_or_default(),
             period_end: value.get("periodEnd").and_then(Value::as_u64),
+            price: value.get("price").and_then(price_label),
             licence: text(value, "licence").unwrap_or_default(),
             models,
         })
@@ -548,8 +566,9 @@ pub async fn status(ctx: &Ctx) -> (String, bool) {
     if me.licence != file.licence || me.plan != file.plan {
         let _ = PlanFile { plan: me.plan.clone(), licence: me.licence.clone(), ..file.clone() }.save(&ctx.config_dir).await;
     }
+    let price = me.price.as_deref().map(|p| format!(" at {p}")).unwrap_or_default();
     let mut lines =
-        vec![format!("Marv {} ({}), signed in as {}.", plan_name(&me.plan), printable(&me.status), printable(&me.email))];
+        vec![format!("Marv {}{price} ({}), signed in as {}.", plan_name(&me.plan), printable(&me.status), printable(&me.email))];
     if let Some(end) = me.period_end {
         lines.push(format!("Current period ends {}.", date(end)));
     }
@@ -795,6 +814,7 @@ mod tests {
     fn me(plan: &str, models: Value) -> String {
         json!({
             "email": "a@b.c", "plan": plan, "status": "active", "periodEnd": 1_767_225_600u64,
+            "price": { "amount": 20, "currency": "usd", "interval": "month" },
             "licence": licence(plan, NOW + 86_400), "models": models
         })
         .to_string()
@@ -1008,6 +1028,26 @@ mod tests {
         assert!(String::from_utf8(out).unwrap().contains("not signed in"));
     }
 
+    #[test]
+    fn the_price_is_printed_from_its_parts_only() {
+        let label = |v: Value| price_label(&v);
+        assert_eq!(label(json!({ "amount": 20, "currency": "usd", "interval": "month" })).as_deref(), Some("$20/month"));
+        assert_eq!(label(json!({ "amount": 96, "currency": "USD", "interval": "year" })).as_deref(), Some("$96/year"));
+        assert_eq!(label(json!({ "amount": 9.5, "currency": "usd", "interval": "month" })).as_deref(), Some("$9.50/month"));
+        assert_eq!(label(json!({ "amount": 20, "currency": "eur", "interval": "month" })).as_deref(), Some("20 EUR/month"));
+        for bad in [
+            json!({ "amount": 20, "currency": "us\u{1b}", "interval": "month" }),
+            json!({ "amount": 20, "currency": "usd", "interval": "week" }),
+            json!({ "amount": -1, "currency": "usd", "interval": "month" }),
+            json!({ "amount": "20", "currency": "usd", "interval": "month" }),
+        ] {
+            assert_eq!(label(bad.clone()), None, "{bad}");
+        }
+        // A server older than the field: no price, nothing else changes.
+        let old = json!({ "email": "a@b.c", "plan": "founding", "status": "active", "licence": "x" });
+        assert_eq!(Me::parse(&old).unwrap().price, None);
+    }
+
     #[tokio::test]
     async fn the_plan_shows_its_state_and_falls_back_to_the_licence_offline() {
         let dir = tempfile::tempdir().unwrap();
@@ -1018,7 +1058,7 @@ mod tests {
         signed_in(dir.path(), &base).await;
         let (text, is_error) = status(&ctx(&base, dir.path())).await;
         assert!(!is_error, "{text}");
-        assert!(text.contains("Marv Pro + models (active), signed in as a@b.c."), "{text}");
+        assert!(text.contains("Marv Pro + models at $20/month (active), signed in as a@b.c."), "{text}");
         assert!(text.contains("Current period ends 2026-01-01."), "{text}");
         assert!(text.contains("$6.77 left; it resets on 2026-12-01."), "{text}");
         assert!(!text.contains("isn't using the plan's key"), "{text}");
