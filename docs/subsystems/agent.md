@@ -8,7 +8,7 @@ Spec: Marv `CLAUDE.md` bullets **Agent loop** and **Compaction**, `src/agent.ts`
 
 | Marv (TS) | Rust module | Status |
 |---|---|---|
-| `src/agent.ts` | `agent.rs` | Constants and notes (verbatim) ported. ported, all of `tests/agent.test.ts` ported (against `ScriptedProvider` and a fake `ToolRunner`), plus tests for #58 default grouping, #59 wrap-up and `on_full`. marv-rs #267: `refused_call_note`, the repeated-invalid-call refusal (below) |
+| `src/agent.ts` | `agent.rs` | Constants and notes (verbatim) ported. ported, all of `tests/agent.test.ts` ported (against `ScriptedProvider` and a fake `ToolRunner`), plus tests for #58 default grouping, #59 wrap-up and `on_full`. marv-rs #267: `refused_call_note`, the repeated-invalid-call refusal (below). marv-rs: the run deadline (`AgentOptions::deadline`, `StopReason::TimeLimit`, below) with tests for the note, the footer, and the stop mid-reply and mid-tool |
 | — (marv-rs #90) | `announce.rs` | marv-rs only: the announced-next-step detector (`announces_next_step`) and `ANNOUNCED_STEP_NOTE`. A plain answer that announces its next step ("Now checking issue #7 before commenting:") but makes no tool call ends the run halfway; the loop says "continue" once per turn (a second announcement ends the run, still logged). Conservative on purpose: a dangling `:` at the reply's end, a last sentence starting "let me …" (never "let me know …"), or "now <verb>ing" from a closed verb list; questions, summaries and code blocks never fire. See the `agent.rs` header bullet |
 | (new) | `send_now.rs` | **Done, with tests.** marv-rs only: "send now". `SendNow` (the running turn's queue of the person's messages: `push`, `close` hands back what was never delivered) and `at_step_boundary` (every call of the last reply that made calls has its result). The loop puts them in as one user message, joined by blank lines (`AgentOptions::send_now`, `LoopEvent::SentNow` for each), at the top of a step that goes on to an ordinary request (after `after_step`'s note; at the step limit only after a "continue"), or in place of ending on a plain answer (one more step reads them, unless it would be at the limit). Never two user turns in a row: see the port note. See the `agent.rs` header bullet. Guard: `tests/guards/tests/messages.rs` |
 | `src/repetition.ts` | `repetition.rs` | ported, all tests ported |
@@ -41,7 +41,7 @@ pub struct ToolRun {
 
 pub fn run_agent(options: AgentOptions) -> impl Stream<Item = LoopEvent> + Send;
 // AgentOptions::new(provider, history, system, tools, runner, cancel), then set:
-//   max_steps (25), max_parallel (4), on_limit, rewrite_call, on_full, after_step, wrap_up_at_limit (#59)
+//   max_steps (25), max_parallel (4), on_limit, rewrite_call, on_full, after_step, wrap_up_at_limit (#59), deadline
 pub type OnLimit    = Arc<dyn Fn(u32) -> BoxFuture<'static, LimitAnswer> + Send + Sync>;
 pub type OnFull     = Arc<dyn Fn() -> BoxFuture<'static, bool> + Send + Sync>;
 pub type AfterStep  = Arc<dyn Fn(Vec<ToolRun>) -> BoxFuture<'static, Option<String>> + Send + Sync>;
@@ -86,6 +86,10 @@ pub type RewriteCall = Arc<dyn Fn(&ToolCall) -> Option<ToolCall> + Send + Sync>;
   - Any call the reply makes anyway is answered `not_run::STEP_LIMIT`. An `on_limit` "no" (`Stop`) gets no wrap-up.
   - The run still ends `Done(MaxSteps)`, so headless still exits 2.
   - Turned on by the session for the main agent and for subagents (`SUBAGENT_MAX_STEPS`): `marv -p` prints the wrap-up as its reply, and a subagent's report is the wrap-up followed by Marv's limit line. The TUI asks "Keep going?" (`on_limit`), so it never gets here unless the answer is `Unavailable`.
+- **Run deadline (marv-rs, done; Terminal-Bench 0.15.0):** `marv -p --time-limit` used to reach only the tools, so five runs kept reasoning or calling tools past "time left: 0m 00s" and were killed from outside with no deliverable and no `result` line. The session now sets `AgentOptions::deadline` (main agent and subagents):
+  - Every result of a call that ran ends with `time_left_note` (moved here from bash, so `read_file`, `edit_file`, `write_file`… get it too). It's added only to the history's text: the tool-loop and failure guards compare the tool's own text, which a ticking clock would make look new every time.
+  - At the top of the first step within `deadline_margin` of the deadline (a quarter of the time the run started with, at most `DEADLINE_WRAP_UP_MAX`, 90 s: about two steps of a slow reasoning model, and more than bash's 30 s command margin), `deadline_note` is appended once, as a user note like the step limit's. Tools stay on (`ToolChoice::Auto`): unlike the #59 wrap-up, the point is to save the deliverable, which takes a tool call.
+  - At the deadline the run's own stop (a child of `cancel`) fires, whatever the loop waits for. A reply still streaming is dropped (also for a provider that ignores the stop); its text so far is kept as the reply, its calls answered `not_run::TIME_LIMIT`. Running tools stop as for ctrl+c; queued ones get `not_run::TIME_LIMIT`. The run ends `Error(TIME_LIMIT_MESSAGE)` + `Done(TimeLimit)` ("time_limit"; `marv -p` exits 2, as for `max_steps`). A person's own stop is still `Aborted`.
 - **#64 continue after a dropped stream:**
   - `LoopEvent::Retry { continued }` is in place. When the provider signals a continuable drop, keep the partial text as the assistant turn and append `DROPPED_STREAM_NOTE` instead of discarding it.
   - **This needs `marv_core::ProviderEvent::Retry` to gain `continued: bool`** (a marv-core change, still to request).

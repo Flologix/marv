@@ -448,8 +448,8 @@ pub struct ToolContext {
     /// Where a running call says what it's waiting for (#201: "waiting for beta to accept the wire"), shown on its
     /// card. The main agent's only; None: nothing is shown.
     pub progress: Option<Arc<dyn ToolProgress>>,
-    /// When this run must be done (`marv -p --time-limit`): bash caps each command at the time left and says how much
-    /// is left after it. None: no limit.
+    /// When this run must be done (`marv -p --time-limit`): bash caps each command at the time left. (The agent loop
+    /// adds the time left to every result and stops the run at it: `AgentOptions::deadline`.) None: no limit.
     pub deadline: Option<std::time::Instant>,
     /// `marv -p --dangerously-run-unsandboxed` (a disposable container): the file tools may read and write outside the
     /// project too, as its commands can. Inside the project every rule holds as ever. False everywhere else.

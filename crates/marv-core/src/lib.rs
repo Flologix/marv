@@ -165,6 +165,8 @@ pub enum StopReason {
     MaxSteps,
     Error,
     Loop,
+    /// marv-rs: the run's deadline (`marv -p --time-limit`) came before it finished.
+    TimeLimit,
 }
 
 /// How much a tool hands back to the loop.

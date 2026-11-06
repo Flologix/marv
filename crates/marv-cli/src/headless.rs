@@ -193,7 +193,7 @@ pub fn exit_code_for(reason: &str, refused: usize) -> ExitCode {
     }
     match reason {
         "end" | "stop" => ExitCode::Finished,
-        "max_steps" | "length" | "loop" => ExitCode::Stopped,
+        "max_steps" | "length" | "loop" | "time_limit" => ExitCode::Stopped,
         "aborted" | "interrupted" | "declined" => ExitCode::NeedsApproval,
         _ => ExitCode::Error, // "error", or anything unknown
     }
@@ -943,7 +943,7 @@ mod tests {
         assert_eq!(exit_code_for("end", 0), ExitCode::Finished);
         assert_eq!(exit_code_for("error", 0), ExitCode::Error);
         assert_eq!(exit_code_for("something-new", 0), ExitCode::Error);
-        for r in ["max_steps", "length", "loop"] {
+        for r in ["max_steps", "length", "loop", "time_limit"] {
             assert_eq!(exit_code_for(r, 0), ExitCode::Stopped);
         }
         for r in ["aborted", "interrupted", "declined"] {

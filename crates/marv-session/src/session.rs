@@ -118,6 +118,7 @@ impl TurnEndReason {
             Self::Done(StopReason::MaxSteps) => "max_steps",
             Self::Done(StopReason::Error) => "error",
             Self::Done(StopReason::Loop) => "loop",
+            Self::Done(StopReason::TimeLimit) => "time_limit",
         }
     }
 }
@@ -2225,6 +2226,8 @@ impl MarvSession {
         // --approve`), the limit first gets one tools-off wrap-up reply (#59), the headless reply. After the user's "no"
         // the loop stops without it.
         options.wrap_up_at_limit = true;
+        // `marv -p --time-limit`: the loop adds the time left to each result, says "finish now" near it, and stops at it.
+        options.deadline = init.deadline;
         // The person's "send now" messages: the main agent's alone, at its step boundaries.
         options.send_now = self.state().send_now.clone();
 
