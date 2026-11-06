@@ -149,15 +149,17 @@ class MarvAgent(BaseInstalledAgent):
         approve = " ".join(f"--approve {s}" for s in ("files", "process", "network", "git_write"))
         # The task's own time limit, less a little for Marv's start and the logs (MARV_TIME_LIMIT overrides it).
         limit = int(os.environ.get("MARV_TIME_LIMIT") or 0) or (task_time_limit(self.logs_dir) or 0)
-        time_limit = (
-            f"--time-limit {max(limit - 20, 60)} " if limit and supports(str(local_binary()), "--time-limit") else ""
-        )
+        budget = max(limit - 20, 60) if limit and supports(str(local_binary()), "--time-limit") else 0
+        # The limit is shell code (`$left`): a continuation gets the time left of the budget, not the whole of it. With
+        # the whole, a run that reconnected thought it had time the task no longer gave it (install-windows was killed
+        # with 47 minutes left on Marv's clock, 2026-11-05).
+        time_limit = '--time-limit "$left" ' if budget else ""
         marv = (
             f"MARV_CONFIG_DIR={REMOTE_CONFIG_DIR} {REMOTE_BIN} --output stream-json --max-steps {steps} {time_limit}"
             f"--trust-project --dangerously-run-unsandboxed --approve-tainted {approve}"
         )
         command = (
-            f"mkdir -p {LOGS}; "
+            f"mkdir -p {LOGS}; start=$(date +%s); left={budget}; "
             # Each run's stream goes to last.jsonl (judged alone) and onto stream.jsonl (all of them) as it comes, so a
             # run the task's timeout kills is in both (copying after the run lost the timed-out runs' streams).
             f"{marv} -p {shlex.quote(instruction)} 2>> {LOGS}/stderr.txt | tee {LOGS}/last.jsonl >> {LOGS}/stream.jsonl; "
@@ -168,7 +170,9 @@ class MarvAgent(BaseInstalledAgent):
             "for retry in 1 2 3 4 5; do "
             f"  grep -q \"Can't reach\" {LOGS}/last.jsonl || break; "
             f"  echo \"marv-agent: the connection dropped; continuing ($retry/5)\" >> {LOGS}/stderr.txt; sleep 30; "
-            f"  {marv} -c -p {shlex.quote(CONTINUE_PROMPT)} 2>> {LOGS}/stderr.txt | tee {LOGS}/last.jsonl >> {LOGS}/stream.jsonl; "
+            # Less than a minute left isn't worth a continuation: the task's own timeout is about to end it.
+            + (f"  left=$(( {budget} - $(date +%s) + start )); [ \"$left\" -ge 60 ] || break; " if budget else "")
+            + f"  {marv} -c -p {shlex.quote(CONTINUE_PROMPT)} 2>> {LOGS}/stderr.txt | tee {LOGS}/last.jsonl >> {LOGS}/stream.jsonl; "
             "  status=${PIPESTATUS[0]}; "
             "done; "
             # Marv's trajectory, for failures.py and the trajectory stats; never the config folder itself (the key).
