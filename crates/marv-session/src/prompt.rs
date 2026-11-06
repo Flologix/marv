@@ -69,6 +69,11 @@ pub struct PromptInput {
     /// The project is the user's home folder or holds it (`marv_sandbox::home_project`, on the session's root): the
     /// sandbox shows it read-only with its dot-entries hidden. Fixed per session (#268's access facts).
     pub home_project: bool,
+    /// Commands run with no sandbox for the whole session: `marv -p --dangerously-run-unsandboxed` (a disposable
+    /// container), set by the session from `SessionInit::files_anywhere` with the sandbox off. Nothing toggles it there,
+    /// so it's fixed per session. The access facts then say so ([`UNSANDBOXED_FACTS`]) and `# Sandbox limits` is left
+    /// out.
+    pub unsandboxed: bool,
 }
 
 /// Said when the project has no `.git` (and bash is offered). A session in ~/Projects (no repository) ran `ls -la`,
@@ -104,9 +109,20 @@ const HOME_HIDDEN: &str = if cfg!(target_os = "macos") {
     "- Readable by sandboxed commands: the home folder, and the desktop's and apps' settings in ~/.config, ~/.local/share and ~/.local/state. Hidden: the home's other dot-entries (~/.marv, ~/.ssh, ~/.cache and the like; toolchain folders and git config aside), browser, password-manager and chat-app folders, files named like secrets, and any socket. A hidden path reads as empty, missing or refused, which says nothing about the real one."
 };
 
+/// The access facts' lines when commands run unsandboxed (`PromptInput::unsandboxed`). marv-rs, behaviour change
+/// (Terminal-Bench, 0.15.0): `marv -p --dangerously-run-unsandboxed` still got the sandboxed lines ("Sandboxed commands
+/// can write only there", "Outside the sandbox: not in this session … give the user the command"), so 3 of 5
+/// configure-git-webserver attempts said they were "sandboxed in /app" and delivered installer scripts instead of
+/// configuring the machine, and a pypi-server attempt told the user to start the server. The base text's sandbox
+/// sentence is shared with Marv (the oracle compares it), so these lines say it doesn't apply.
+pub const UNSANDBOXED_FACTS: &str = "- Sandbox: off for this run. Commands run directly on this machine with this user's permissions; what the text below says about a sandbox doesn't apply. Files outside the project and the network are reachable, as this run has approved them.\n- A process you start in the background (nohup … &, output redirected) keeps running after its command ends, so a service you set up can stay running.\n- Nobody is at a terminal to run commands for you: do the work on this machine yourself, rather than handing the user a script or a command to run.";
+
 pub fn access_facts(input: &PromptInput) -> String {
     if !input.tools.iter().any(|t| t == "bash") {
         return String::new();
+    }
+    if input.unsandboxed {
+        return format!("\n\n{ACCESS_HEADING}\n{UNSANDBOXED_FACTS}");
     }
     let extra = if input.writable.is_empty() { "" } else { " (and the extra writable folders listed below)" };
     let (project, hidden) = if input.home_project {
@@ -337,7 +353,9 @@ pub fn system_prompt(input: &PromptInput) -> String {
     let remembered = input.memory.as_ref().map(|m| format!("\n\n{}", memory_section(m))).unwrap_or_default();
     let web = if input.tools.iter().any(|t| t == "web_fetch") { WEB_SECTION } else { "" };
     // With the process door, its paragraph says what this one did (and where to go instead).
-    let limits = if input.tools.iter().any(|t| t == "bash") && !input.doors.process { SANDBOX_LIMITS } else { "" };
+    // Unsandboxed, a background process outlives its command and localhost is the machine's: the limits don't hold.
+    let limits =
+        if input.tools.iter().any(|t| t == "bash") && !input.doors.process && !input.unsandboxed { SANDBOX_LIMITS } else { "" };
     let fixing = if input.tools.iter().any(|t| t == "edit_file") { FIXING_BUGS } else { "" };
     let git = if input.git_placeholder && input.tools.iter().any(|t| t == "bash") { GIT_PLACEHOLDER } else { "" };
     let outside = outside_section(&input.doors);
@@ -887,6 +905,42 @@ mod tests {
         assert!(writable.contains(&format!("write only there and in {SCRATCH} (and the extra writable folders listed below).")));
         // Nothing runs in a sandbox without bash: no facts.
         assert_eq!(access_facts(&PromptInput { tools: vec!["read_file".into()], home_project: true, ..input() }), "");
+    }
+
+    /// An unsandboxed run (`marv -p --dangerously-run-unsandboxed`) is told so, in place of the sandboxed lines, in a
+    /// home-folder project or not and whatever the doors; `# Sandbox limits` goes. Sandboxed sessions keep theirs.
+    #[test]
+    fn an_unsandboxed_run_is_told_its_commands_run_on_the_machine() {
+        let expected = format!("\n\n{ACCESS_HEADING}\n{UNSANDBOXED_FACTS}");
+        for (home_project, host) in [(true, true), (true, false), (false, true), (false, false)] {
+            let doors = PromptDoors { host, ..Default::default() };
+            let facts = access_facts(&PromptInput { unsandboxed: true, home_project, doors, ..input() });
+            assert_eq!(facts, expected);
+            // One block without a blank line (the oracle drops it from its first line to the next blank line).
+            assert!(!facts[2..].contains("\n\n") && facts.lines().count() == 6, "{facts}");
+        }
+        assert!(
+            UNSANDBOXED_FACTS
+                .starts_with("- Sandbox: off for this run. Commands run directly on this machine with this user's permissions")
+        );
+        assert!(UNSANDBOXED_FACTS.contains("do the work on this machine yourself"));
+        for wrong in ["Sandboxed commands can write", "Hidden from sandboxed", "give the user the command", "Network: none"] {
+            assert!(!expected.contains(wrong), "{wrong}");
+        }
+        let prompt = system_prompt(&PromptInput { unsandboxed: true, ..input() });
+        assert!(prompt.contains(&expected));
+        assert!(!prompt.contains("# Sandbox limits"));
+        // Sandboxed: the sandboxed lines and the limits, as ever.
+        let sandboxed = system_prompt(&input());
+        assert!(!sandboxed.contains(UNSANDBOXED_FACTS));
+        assert!(
+            sandboxed.contains(&format!(
+                "{ACCESS_HEADING}\n- Project: the working directory. Sandboxed commands can write only there"
+            ))
+        );
+        assert!(sandboxed.contains("# Sandbox limits"));
+        // Without bash nothing runs at all: no facts either way.
+        assert_eq!(access_facts(&PromptInput { tools: vec!["read_file".into()], unsandboxed: true, ..input() }), "");
     }
 
     /// #268: near the top, right under the working directory and the date, and the same for the same session.
