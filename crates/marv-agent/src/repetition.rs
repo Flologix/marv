@@ -22,6 +22,13 @@
 //!   edit resets it (a model re-running tests after an edit is never caught), and other commands in between (probes
 //!   like `echo test`) neither count nor reset.
 //!
+//! - **Escalation** (marv-rs, Terminal-Bench 0.15.0; Marv warns once, then ends the run): a detected loop goes
+//!   [`LoopVerdict::Warn`], then [`LoopVerdict::FinalChance`] (one more turn to save the work), then
+//!   [`LoopVerdict::Stop`] ([`ToolLoopState::escalate`]). Marv's `warned` was never reset, so one early warning made
+//!   any later, unrelated loop end the run without a word; here [`TOOL_LOOP_PROGRESS`] distinct calls that ran and
+//!   succeeded since the warning reset it ([`ToolLoopState::progressed`]). The hard stop stays: at most
+//!   [`MAX_TOOL_LOOP_RESCUES`] final turns a run, and a loop right after one ends the run.
+//!
 //! Port note: Marv measures lengths in UTF-16 units; here the text thresholds count `char`s.
 
 use serde_json::Value;
@@ -108,13 +115,66 @@ pub struct ToolCallKey {
     pub args: String,
 }
 
+/// Distinct calls that ran and succeeded since a loop warning that count as progress: the warning (and a final
+/// turn) are forgotten, so a later, unrelated loop is warned about again rather than ending the run.
+pub const TOOL_LOOP_PROGRESS: usize = 5;
+/// Final turns a run may get after looping past a warning; past them the next loop past a warning ends the run.
+pub const MAX_TOOL_LOOP_RESCUES: u32 = 2;
+
+/// What to do about a detected loop ([`ToolLoopState::escalate`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopVerdict {
+    /// The first time: the calls aren't run, the model is told what it keeps sending.
+    Warn,
+    /// Again after the warning: not run, and the model gets one final turn to save its work and answer.
+    FinalChance,
+    /// Again after the final turn (or past [`MAX_TOOL_LOOP_RESCUES`]): the run ends.
+    Stop,
+}
+
 /// State kept across steps for tool-call loop detection.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ToolLoopState {
     /// Recent steps' calls (at most [`TOOL_HISTORY`]).
     pub history: Vec<Vec<ToolCallKey>>,
-    /// Whether the model was already warned about a loop.
+    /// Whether the model was already warned about a loop (since its last progress).
     pub warned: bool,
+    /// Whether the model was given its final turn after looping past the warning.
+    pub final_chance: bool,
+    /// Final turns given this run (never reset: the hard stop).
+    pub rescues: u32,
+    /// Distinct calls that ran and succeeded since the warning.
+    pub progress: std::collections::HashSet<ToolCallKey>,
+}
+
+impl ToolLoopState {
+    /// A loop was detected (by [`tool_loop_detected`] or the failing-command guard): what to do about it.
+    pub fn escalate(&mut self) -> LoopVerdict {
+        self.progress.clear();
+        if !self.warned {
+            self.warned = true;
+            return LoopVerdict::Warn;
+        }
+        if !self.final_chance && self.rescues < MAX_TOOL_LOOP_RESCUES {
+            self.final_chance = true;
+            self.rescues += 1;
+            return LoopVerdict::FinalChance;
+        }
+        LoopVerdict::Stop
+    }
+
+    /// A call ran and succeeded. After a warning, [`TOOL_LOOP_PROGRESS`] distinct ones forget it (and the final turn).
+    pub fn progressed(&mut self, key: ToolCallKey) {
+        if !self.warned {
+            return;
+        }
+        self.progress.insert(key);
+        if self.progress.len() >= TOOL_LOOP_PROGRESS {
+            self.warned = false;
+            self.final_chance = false;
+            self.progress.clear();
+        }
+    }
 }
 
 /// Prints `value` as compact JSON with every object's keys sorted, at every depth (nothing dropped).
@@ -435,6 +495,45 @@ mod tests {
             "Fix the test scripts now. ".repeat(10)
         );
         assert!(detect_text_repetition(&text));
+    }
+
+    #[test]
+    fn a_loop_escalates_warn_final_chance_stop() {
+        let mut state = ToolLoopState::default();
+        assert_eq!(state.escalate(), LoopVerdict::Warn);
+        assert_eq!(state.escalate(), LoopVerdict::FinalChance);
+        assert_eq!(state.escalate(), LoopVerdict::Stop);
+    }
+
+    #[test]
+    fn progress_forgets_the_warning_but_final_turns_are_capped() {
+        let mut state = ToolLoopState::default();
+        let progress = |state: &mut ToolLoopState, n: usize| {
+            for i in 0..n {
+                state.progressed(make_tool_key("read_file", &format!(r#"{{"path":"f{i}"}}"#)));
+            }
+        };
+        assert_eq!(state.escalate(), LoopVerdict::Warn);
+        // The same call over and over is not progress.
+        for _ in 0..10 {
+            state.progressed(make_tool_key("read_file", r#"{"path":"a"}"#));
+        }
+        assert!(state.warned);
+        // It counts once: with TOOL_LOOP_PROGRESS - 2 other calls, still short.
+        progress(&mut state, TOOL_LOOP_PROGRESS - 2);
+        assert!(state.warned);
+        progress(&mut state, TOOL_LOOP_PROGRESS);
+        assert!(!state.warned);
+        assert_eq!(state.escalate(), LoopVerdict::Warn);
+        assert_eq!(state.escalate(), LoopVerdict::FinalChance);
+        progress(&mut state, TOOL_LOOP_PROGRESS);
+        assert_eq!(state.escalate(), LoopVerdict::Warn);
+        assert_eq!(state.escalate(), LoopVerdict::FinalChance);
+        progress(&mut state, TOOL_LOOP_PROGRESS);
+        // Past MAX_TOOL_LOOP_RESCUES final turns, a loop past the warning ends the run.
+        assert_eq!(state.escalate(), LoopVerdict::Warn);
+        assert_eq!(state.escalate(), LoopVerdict::Stop);
+        assert_eq!(state.rescues, MAX_TOOL_LOOP_RESCUES);
     }
 
     #[test]

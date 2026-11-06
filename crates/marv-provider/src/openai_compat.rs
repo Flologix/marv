@@ -792,7 +792,7 @@ pub(crate) fn with_continuation<R>(
 
 /// #96: after a reply degenerated, retry once (`true`: the caller sends the next attempt at once) or end the stream.
 /// Either way what the attempt streamed is thrown away: the retry starts over, with [`DEGENERATE_NOTE`]; the second
-/// time a `Discard` goes before the error.
+/// time a `Discard` goes before the error (the agent loop reads that pair as a degenerate reply it can go on past).
 pub(crate) fn after_degenerate(
     label: &str,
     discarded: u64,
