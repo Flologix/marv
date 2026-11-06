@@ -7,7 +7,9 @@
 //! The adapters feed every text and reasoning delta to a [`DegenerateGuard`]. Once the last [`TAIL`] bytes of either
 //! one are (almost) only whitespace, or one short piece (at most [`MAX_PERIOD`] bytes) repeated over and over, the
 //! stream counts as degenerate: the adapter aborts the request and asks once more with [`DEGENERATE_NOTE`]; a second
-//! degenerate reply ends the turn with an error.
+//! degenerate reply ends the stream with a `Discard` and an error. marv-rs: the agent loop doesn't end the turn on that
+//! pair any more; it tells the model and goes on, a bounded number of times (`marv_agent::agent`,
+//! `StepOutcome::Degenerate`). Other callers (compaction, the oracle) still see the error.
 //!
 //! - "Almost" whitespace: at most 1% of the tail is anything else, so a few stray characters in a sea of newlines
 //!   (the GLM stream's 7,341) don't hide it. Real prose or code is never 99% whitespace over 16 KB.

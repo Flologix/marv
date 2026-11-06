@@ -263,7 +263,7 @@ fn compact_outcome(result: CompactResult) -> view::CompactOutcome {
 pub fn map_loop(event: &LoopEvent, totals: &dyn Fn() -> view::Totals) -> Option<UiEvent> {
     use LoopEvent as L;
     Some(match event {
-        // #96: the error right after it says what happened.
+        // #96: the error right after it says what happened (or the loop's `Retry`, when it goes on past it).
         L::Discarded { .. } => return None,
         // Marv #63: the session's compaction notice that follows says what was done about it.
         L::Overflow { .. } => return None,

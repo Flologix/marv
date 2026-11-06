@@ -33,7 +33,7 @@
 //!   calls are answered and the run ends `Loop`. marv-rs (#81): a bash command that already failed the same way
 //!   twice since the last change, whatever its tail, isn't run again ([`crate::repetition::FailureLoopState`]),
 //!   checked as each call is about to run, so an edit earlier in the same reply counts: the note the first time,
-//!   the run ends `Loop` (the step's remaining calls not run) the next.
+//!   the run ends `Loop` (the step's remaining calls not run) the next. **marv-rs changes this** (below).
 //! - **Repeated invalid calls** (marv-rs, #267): a call that failed validation (`ToolRun::invalid`: its arguments
 //!   aren't JSON or the tool's parse refused them, so it never ran) is remembered by tool and normalized arguments.
 //!   An identical call refused for the same reason is answered with [`refused_call_note`] from its 2nd try, not the
@@ -78,6 +78,23 @@
 //!   during the hook) ends `Aborted`. Unset, an overflow ends the run like any provider error.
 //!
 //! marv-rs changes and planned work:
+//! - **Tool loops get a final turn** (marv-rs; Terminal-Bench 0.15.0: two runs that had the fix, or a working
+//!   pipeline and 92 minutes left, were ended for re-sending `read_file {"path": …}` without the `offset` their own
+//!   reasoning named). The note now echoes the exact call (tool and arguments, cut at [`LOOP_ARGS_SHOWN`] chars) and
+//!   what's missing when that can be told ([`tool_loop_note`]: `read_file` without `offset`). A loop after the
+//!   warning isn't the end any more: its calls get [`tool_loop_final_note`] (not run; one final turn to save the
+//!   deliverable and answer, tools still allowed), and only a loop after that ends the run `Loop`. The failing-command
+//!   guard escalates the same way. Calls not run when the run ends get [`not_run::TOOL_LOOP`], not the false
+//!   [`not_run::CUT_OFF`] Marv uses. The warning is forgotten after progress
+//!   ([`crate::repetition::TOOL_LOOP_PROGRESS`] distinct calls that ran and succeeded), so an early warning no longer
+//!   makes a later, unrelated loop end the run unwarned; at most [`crate::repetition::MAX_TOOL_LOOP_RESCUES`] final
+//!   turns a run keep the hard stop ([`crate::repetition::ToolLoopState::escalate`]).
+//! - **A reply that degenerates twice** (marv-rs, #96 follow-up; Terminal-Bench 0.15.0 `gcode-to-text`: rendered
+//!   `#` art copied into the reasoning ended the run with 8 minutes left and nothing written). The provider asks once
+//!   more itself, then gives up with a `Discard` (cause `Degenerate`) and an `Error`. The loop treats that pair as
+//!   [`StepOutcome::Degenerate`]: nothing of the reply enters the history, a `Retry` event (cause `Degenerate`) says
+//!   so, and the conversation goes on with [`DEGENERATE_NOTE`], up to [`MAX_DEGENERATE_RECOVERIES`] times a turn (as
+//!   with reasoning-only cut-offs); past that the error ends the run as before.
 //! - **#90 announced next step, no tool call**: a plain answer that ends by announcing what it
 //!   will do next ("Now checking issue #7 before commenting:") is how a turn dies halfway (2 of
 //!   6 GLM runs of `mcp-comment`; opencode: 0 of 6). When such an answer is about to end the
@@ -142,7 +159,8 @@ pub use crate::announce::{
     ANNOUNCED_STEP_NOTE, MAX_SELF_SUMMARY_CONTINUES, SELF_SUMMARY_NOTE, announces_next_step, summarizes_itself,
 };
 use crate::repetition::{
-    FailureLoopState, ToolCallKey, ToolLoopState, detect_text_repetition, failing_command_note, make_tool_key, tool_loop_detected,
+    FailureLoopState, LoopVerdict, ToolCallKey, ToolLoopState, detect_text_repetition, failing_command_note, make_tool_key,
+    tool_loop_detected,
 };
 pub use crate::send_now::{SendNow, at_step_boundary};
 
@@ -159,6 +177,9 @@ pub mod not_run {
     pub const DECLINED: &str = "Not run: the user declined an earlier action.";
     pub const CUT_OFF: &str = "Not run: your reply hit the output limit before it finished, so this call may be incomplete. Redo it in smaller steps (for a big file: write_file the first part, then add the rest with append: true).";
     pub const TEXT_LOOP: &str = "Not run: your reply was stuck repeating the same text, so it was dropped.";
+    /// marv-rs: a call not run because the tool-loop guard ended the run (Marv answers it with [`CUT_OFF`], which
+    /// isn't what happened).
+    pub const TOOL_LOOP: &str = "Not run: Marv ended the run because the same calls kept repeating without progress.";
     /// #59: a call the wrap-up reply made anyway (it was asked not to).
     pub const STEP_LIMIT: &str = "Not run: the step limit was reached.";
     /// marv-rs: a call left when the run's time limit (`AgentOptions::deadline`) ended it.
@@ -191,12 +212,55 @@ pub const EMPTY_REPLY_NOTE: &str = "(Automatic note from Marv, the program runni
 /// Told to the model when its reply got stuck repeating one sentence. The reply is dropped entirely.
 pub const TEXT_LOOP_NOTE: &str = "(Automatic note from Marv, the program running you) Your last reply got stuck repeating one sentence and was stopped; nothing in it was used. Take the next concrete step.";
 
-/// The result of each repeated call when tool calls repeat without progress.
-pub fn tool_loop_note(repeat_count: usize, _call_name: &str) -> String {
+/// How many characters of a repeated call's arguments its loop note shows.
+pub const LOOP_ARGS_SHOWN: usize = 300;
+
+/// The call as the model sent it, its arguments cut at [`LOOP_ARGS_SHOWN`] chars (never re-serialized).
+fn shown_call(name: &str, arguments: &str) -> String {
+    let arguments = arguments.trim();
+    match arguments.char_indices().nth(LOOP_ARGS_SHOWN) {
+        Some((cut, _)) => format!("{name} {}…", &arguments[..cut]),
+        None => format!("{name} {arguments}"),
+    }
+}
+
+/// What the repeated call lacks to get something new, when that can be told from it.
+fn loop_hint(name: &str, arguments: &str) -> &'static str {
+    let args = serde_json::from_str::<serde_json::Value>(arguments).ok();
+    let has = |field: &str| args.as_ref().and_then(|a| a.get(field)).is_some_and(|v| !v.is_null());
+    if name == "read_file" && !has("offset") {
+        return " You sent no offset, so it returns the same first lines every time: to read further, pass offset (the result says which line comes next).";
+    }
+    ""
+}
+
+/// The result of each repeated call when tool calls repeat without progress. marv-rs: shows the exact call, and what
+/// it lacks when that can be told (TB 0.15.0: `read_file` resent without the `offset` the model meant to pass).
+pub fn tool_loop_note(repeat_count: usize, name: &str, arguments: &str) -> String {
     format!(
-        "Marv: you have made this exact call {repeat_count} times in a row and it returned the same result; use what it returned, or try something else."
+        "Marv: you have made this exact call {repeat_count} times in a row and it returned the same result: `{}`. Not run again.{} Use what it returned, or change the call.",
+        shown_call(name, arguments),
+        loop_hint(name, arguments),
     )
 }
+
+/// The final-turn note appended to a looping call's result after the warning (marv-rs).
+pub const FINAL_TURN_NOTE: &str = "You were warned and sent it again, so this is your final turn: save your work now (write the files or the report the task asks for) and give your final answer. Tools still work, but repeating this call again ends the run.";
+
+/// marv-rs: the result of each call of a loop after the warning: not run, and one final turn.
+pub fn tool_loop_final_note(repeat_count: usize, name: &str, arguments: &str) -> String {
+    format!(
+        "Marv: not run. You have made this exact call {repeat_count} times in a row and it returned the same result: `{}`.{} {FINAL_TURN_NOTE}",
+        shown_call(name, arguments),
+        loop_hint(name, arguments),
+    )
+}
+
+/// marv-rs: how many times a turn the loop goes on after the provider gave up on a degenerate reply (#96).
+pub const MAX_DEGENERATE_RECOVERIES: u32 = 2;
+
+/// marv-rs: told to the model when the provider gave up on its reply for degenerating twice (#96).
+pub const DEGENERATE_NOTE: &str = "(Automatic note from Marv, the program running you) Your last reply degenerated into repeated text (whitespace, or the same short piece over and over) and was cut; nothing in it was used. Don't reproduce rendered or bulk output (ASCII art, grids, long data) in your reply or your reasoning: analyse it with code and print short summaries. Keep going with the task.";
 
 /// marv-rs #267: the result of a call identical to one that failed validation the same way earlier in the run. A
 /// validation error is deterministic, so the #37 guard's four tries were three too many (the ChatGPT provider resent
@@ -552,7 +616,8 @@ pub enum LoopEvent {
         attempt: u32,
     },
     Done(StopReason),
-    /// The provider threw the reply away without retrying (#96: it degenerated again); an `Error` follows.
+    /// The provider threw the reply away without retrying (#96: it degenerated again); an `Error` follows from the
+    /// provider. marv-rs: the loop may then go on instead (a `Retry` with cause `Degenerate`, no `Error` event).
     Discarded {
         cause: marv_core::RetryCause,
     },
@@ -700,6 +765,8 @@ pub struct StepReply {
     pub reasoning: Option<Reasoning>,
     /// Stopped while streaming: stuck repeating itself (the rest isn't read).
     pub looped: bool,
+    /// The provider gave up on the reply for degenerating (#96): a `Discard` with cause `Degenerate`.
+    pub degenerated: bool,
     checked_at: usize,
 }
 
@@ -754,6 +821,7 @@ impl StepReply {
             // #96: the same, with no attempt after it (an error follows): nothing of it reaches the history.
             ProviderEvent::Discard { cause } => {
                 self.discard();
+                self.degenerated |= matches!(cause, marv_core::RetryCause::Degenerate { .. });
                 Some(LoopEvent::Discarded { cause })
             }
         }
@@ -782,6 +850,9 @@ impl StepReply {
             return StepOutcome::Empty;
         }
         if let Some(error) = &self.error {
+            if self.degenerated && !aborted {
+                return StepOutcome::Degenerate(error.clone());
+            }
             return StepOutcome::Error(error.clone());
         }
         if self.cut_off() && !aborted {
@@ -812,6 +883,9 @@ pub enum StepOutcome {
     Empty,
     /// The assistant turn (if any) goes in first, then `Error` and `Done(Error)`.
     Error(String),
+    /// marv-rs: the provider gave up on the reply for degenerating (a `Discard`, then this error): nothing of it
+    /// enters the history, and the loop goes on with [`DEGENERATE_NOTE`] (up to [`MAX_DEGENERATE_RECOVERIES`]).
+    Degenerate(String),
     CutOff,
     Tools,
     Answer,
@@ -957,6 +1031,8 @@ pub struct LoopState {
     empties: u32,
     /// Text loops in a row.
     text_loops: u32,
+    /// Degenerate replies the provider gave up on that this turn went on past (#96).
+    degenerates: u32,
     /// #90: whether this run already continued an announced next step (once per turn: the
     /// first is rescued, a second announcement ends the run, still logged as an event).
     announced: bool,
@@ -1013,6 +1089,7 @@ impl LoopState {
             cut_offs: 0,
             empties: 0,
             text_loops: 0,
+            degenerates: 0,
             announced: false,
             summarized: 0,
             tool_loop: ToolLoopState::default(),
@@ -1299,6 +1376,24 @@ impl LoopState {
                 self.push_note(TEXT_LOOP_NOTE);
                 self.next_step();
             }
+            // The provider gave up on a reply that degenerated twice (#96): it was discarded, so nothing of it reaches
+            // the history. Like a reasoning-only cut-off, the turn goes on with a note, a bounded number of times.
+            StepOutcome::Degenerate(message) => {
+                self.degenerates += 1;
+                if self.degenerates > MAX_DEGENERATE_RECOVERIES {
+                    self.emit(LoopEvent::Error(message));
+                    return self.finish(StopReason::Error);
+                }
+                self.emit(LoopEvent::Retry {
+                    attempt: self.degenerates,
+                    max: MAX_DEGENERATE_RECOVERIES,
+                    message: "the reply degenerated again and was thrown away; Marv told the model and goes on".into(),
+                    continued: false,
+                    cause: marv_core::RetryCause::Degenerate { discarded: 0 },
+                });
+                self.push_note(DEGENERATE_NOTE);
+                self.next_step();
+            }
             // Nothing came back: no text (whitespace doesn't count) and nothing to run. Not after an
             // error, a cut-off or an interrupt. Nothing goes into the history for it, so a retry is the
             // same request (cached).
@@ -1409,7 +1504,6 @@ impl LoopState {
     /// Tool-loop detection, then the calls (or the end of the run, for a plain answer).
     fn run_calls(&mut self, reply: StepReply, aborted: bool) {
         let calls = reply.calls;
-        let warned = self.tool_loop.warned;
         let hit = !aborted && !calls.is_empty() && {
             let keys = calls
                 .iter()
@@ -1421,30 +1515,29 @@ impl LoopState {
                 .collect();
             tool_loop_detected(&mut self.tool_loop, keys)
         };
-        // The first time: every call is answered with the note instead of running.
-        if hit && !warned {
-            self.tool_loop.warned = true;
-            let note = tool_loop_note(self.tool_loop.history.len(), &calls[0].name);
-            for call in &calls {
-                self.push_result(call, &note);
-            }
-            self.emit(LoopEvent::ToolLoop { continued: true });
-            for call in calls {
-                self.emit(LoopEvent::ToolSkipped { call, output: note.clone() });
-            }
-            return self.next_step();
-        }
-        // The second time: stop the turn, every call answered (the history must be valid). Marv
-        // answers them with the cut-off text; kept as is.
+        // The first time every call is answered with the note (showing the call) instead of running; after the
+        // warning, with the final-turn note; after that the turn stops, every call answered (the history must be
+        // valid) with what happened (Marv: the cut-off text, which misled the model).
         if hit {
-            for call in &calls {
-                self.push_result(call, not_run::CUT_OFF);
+            let verdict = self.tool_loop.escalate();
+            let repeats = self.tool_loop.history.len();
+            let outputs: Vec<String> = calls
+                .iter()
+                .map(|call| match verdict {
+                    LoopVerdict::Warn => tool_loop_note(repeats, &call.name, &call.arguments),
+                    LoopVerdict::FinalChance => tool_loop_final_note(repeats, &call.name, &call.arguments),
+                    LoopVerdict::Stop => not_run::TOOL_LOOP.to_string(),
+                })
+                .collect();
+            for (call, output) in calls.iter().zip(&outputs) {
+                self.push_result(call, output);
             }
-            self.emit(LoopEvent::ToolLoop { continued: false });
-            for call in calls {
-                self.emit(LoopEvent::ToolSkipped { call, output: not_run::CUT_OFF.into() });
+            let continued = verdict != LoopVerdict::Stop;
+            self.emit(LoopEvent::ToolLoop { continued });
+            for (call, output) in calls.into_iter().zip(outputs) {
+                self.emit(LoopEvent::ToolSkipped { call, output });
             }
-            return self.finish(StopReason::Loop);
+            return if continued { self.next_step() } else { self.finish(StopReason::Loop) };
         }
         if calls.is_empty() {
             // "Send now": a message that came while this reply streamed is read by one more step, rather than left
@@ -1567,7 +1660,7 @@ impl LoopState {
         } else if tools.declined {
             Some(not_run::DECLINED)
         } else if self.failure_stop {
-            Some(not_run::CUT_OFF)
+            Some(not_run::TOOL_LOOP)
         } else {
             None
         };
@@ -1596,14 +1689,18 @@ impl LoopState {
         // user quit) never sees a tool run that it can't show or stop.
         if let Some(k) = group.announced.take() {
             let call = self.in_flight.calls[group.range.start + k].clone();
-            // #81: a command that keeps failing the same way isn't run again: the note the first time, the end of
-            // the run the next (the tool-loop guard's `warned`).
+            // #81: a command that keeps failing the same way isn't run again: the note the first time, the final
+            // turn the next, then the end of the run (the tool-loop guard's escalation, shared).
             if let Some((count, shown)) = self.failures.repeated(&call.name, &call.arguments) {
-                let continued = !self.tool_loop.warned;
-                self.tool_loop.warned = true;
+                let verdict = self.tool_loop.escalate();
+                let continued = verdict != LoopVerdict::Stop;
                 self.failure_stop |= !continued;
                 self.emit(LoopEvent::ToolLoop { continued });
-                let run = not_run_record(&call, &failing_command_note(count, &shown));
+                let mut note = failing_command_note(count, &shown);
+                if verdict == LoopVerdict::FinalChance {
+                    note = format!("{note} {FINAL_TURN_NOTE}");
+                }
+                let run = not_run_record(&call, &note);
                 group.running.push(Box::pin(async move { (k, Ok(run)) }));
             } else {
                 let runner = self.options.runner.clone();
@@ -1638,6 +1735,14 @@ impl LoopState {
                 let call = self.in_flight.calls[group.range.start + k].clone();
                 if let Some(reason) = &run.invalid {
                     self.invalid.insert(Self::call_key(&call), reason.clone());
+                }
+                // Progress for the tool-loop guard: a call that ran and succeeded (not a guard's "not run" note).
+                if run.invalid.is_none()
+                    && !run.result.is_error
+                    && !run.declined
+                    && run.result.summary.as_deref() != Some("not run")
+                {
+                    self.tool_loop.progressed(make_tool_key(&call.name, &call.arguments));
                 }
                 self.answer_with(&call, &run.result.output, &time_left_note(self.options.deadline));
                 tools.runs.push(run);
@@ -1905,7 +2010,9 @@ mod tests {
         assert_eq!(reply.text, "");
         assert!(reply.calls.is_empty());
         assert!(events.iter().any(|e| matches!(e, LoopEvent::Discarded { .. })));
-        assert_eq!(reply.outcome(false), StepOutcome::Error("degenerated again".into()));
+        // marv-rs: the loop goes on past it (a bounded number of times); an interrupt is still an error.
+        assert_eq!(reply.outcome(false), StepOutcome::Degenerate("degenerated again".into()));
+        assert_eq!(reply.outcome(true), StepOutcome::Error("degenerated again".into()));
     }
 
     #[test]
@@ -1994,7 +2101,25 @@ mod tests {
 
     #[test]
     fn tool_loop_note_counts_the_repeats() {
-        assert!(tool_loop_note(4, "read_file").starts_with("Marv: you have made this exact call 4 times in a row"));
+        assert!(tool_loop_note(4, "read_file", "{}").starts_with("Marv: you have made this exact call 4 times in a row"));
+    }
+
+    #[test]
+    fn tool_loop_note_shows_the_exact_call_and_what_it_lacks() {
+        // TB 0.15.0: the model meant to pass offset=401 and kept sending only the path.
+        let note = tool_loop_note(3, "read_file", r#"{"path": "src/app.py"}"#);
+        assert!(note.contains(r#"`read_file {"path": "src/app.py"}`"#), "{note}");
+        assert!(note.contains("You sent no offset") && note.contains("pass offset"), "{note}");
+        // With an offset there's nothing to point out.
+        let paged = tool_loop_note(3, "read_file", r#"{"path": "a", "offset": 401}"#);
+        assert!(!paged.contains("no offset"), "{paged}");
+        assert!(!tool_loop_note(3, "grep", r#"{"pattern": "x"}"#).contains("offset"));
+        // Long arguments are cut, on a char boundary.
+        let long = format!(r#"{{"command": "{}"}}"#, "é".repeat(1000));
+        let note = tool_loop_note(3, "bash", &long);
+        assert!(note.contains("…`") && note.len() < 1000, "{}", note.len());
+        let last = tool_loop_final_note(5, "read_file", r#"{"path": "a"}"#);
+        assert!(last.starts_with("Marv: not run.") && last.contains("final turn") && last.contains("no offset"), "{last}");
     }
 
     // The loop itself, against the scripted provider and a fake runner (tests/agent.test.ts).
@@ -3842,6 +3967,66 @@ mod tests {
         assert_eq!(end(&events), Some(StopReason::End));
     }
 
+    // marv-rs: a reply the provider gave up on for degenerating twice (#96).
+
+    fn degenerated() -> Vec<ProviderEvent> {
+        vec![
+            ProviderEvent::ThinkingDelta("####\n####\n".into()),
+            ProviderEvent::Discard { cause: marv_core::RetryCause::Degenerate { discarded: 16_384 } },
+            ProviderEvent::Error("openrouter: the model's reply degenerated again".into()),
+        ]
+    }
+    fn degenerate_retries(events: &[LoopEvent]) -> Vec<(u32, u32)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                LoopEvent::Retry { attempt, max, cause: marv_core::RetryCause::Degenerate { .. }, .. } => Some((*attempt, *max)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_reply_the_provider_gave_up_on_for_degenerating_is_not_the_end_of_the_run() {
+        // TB 0.15.0 gcode-to-text: rendered '#' art in the reasoning, cut twice, and the run ended with 8 minutes left.
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            use_tools(&[call("c1", "a.ts")]),
+            degenerated(),
+            use_tools(&[call("c2", "out.txt")]),
+            say("Done."),
+        ]));
+        let history = history(vec![user("go")]);
+        let events = collect(options(provider.clone(), &history, plain())).await;
+        assert!(!events.iter().any(|e| matches!(e, LoopEvent::Error(_))), "{events:?}");
+        assert_eq!(degenerate_retries(&events), [(1, MAX_DEGENERATE_RECOVERIES)]);
+        assert_eq!(end(&events), Some(StopReason::End));
+        // Nothing of the degenerate reply reached the history; the model was told after the last tool result.
+        let requests = provider.requests();
+        let after = &requests[2].0;
+        assert_eq!(after[after.len() - 2..], [tool("c1", "contents of a.ts"), user(DEGENERATE_NOTE)]);
+        assert!(!format!("{:?}", snapshot(&history)).contains("####"));
+        assert_eq!(count(&events, |e| matches!(e, LoopEvent::ToolEnd { .. })), 2);
+    }
+
+    #[tokio::test]
+    async fn degenerate_replies_past_the_recoveries_end_the_run_with_the_providers_error() {
+        let script = (0..=MAX_DEGENERATE_RECOVERIES).map(|_| degenerated()).collect();
+        let provider = Arc::new(ScriptedProvider::new(script));
+        let events = collect(options(provider.clone(), &history(vec![user("go")]), plain())).await;
+        assert_eq!(degenerate_retries(&events), [(1, 2), (2, 2)]);
+        assert_eq!(provider.requests().len() as u32, MAX_DEGENERATE_RECOVERIES + 1);
+        assert!(events.iter().any(|e| matches!(e, LoopEvent::Error(m) if m.contains("degenerated again"))));
+        assert_eq!(end(&events), Some(StopReason::Error));
+    }
+
+    #[tokio::test]
+    async fn another_provider_error_still_ends_the_run() {
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![ProviderEvent::Error("401 unauthorized".into())]]));
+        let events = collect(options(provider, &history(vec![user("go")]), plain())).await;
+        assert!(degenerate_retries(&events).is_empty());
+        assert_eq!(end(&events), Some(StopReason::Error));
+    }
+
     // Tool loop detection.
 
     fn read_call(id: &str, path: &str, extra: serde_json::Value) -> ToolCall {
@@ -3862,13 +4047,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn period_1_the_same_call_with_the_same_result_warns_on_the_4th_and_stops_on_the_5th() {
+    async fn period_1_the_same_call_with_the_same_result_warns_on_the_4th_final_turn_on_the_5th_stops_on_the_6th() {
         // A call counts as a repeat when it also got the same result as last time, which the first call
         // can't have: calls 2, 3 and 4 are the three identical entries.
-        let script = (1..=5).map(|i| use_tools(&[read_call(&format!("c{i}"), "a.ts", serde_json::json!({}))])).collect();
-        let events = collect(options(Arc::new(ScriptedProvider::new(script)), &history(vec![user("go")]), plain())).await;
-        assert_eq!(tool_loops(&events), [true, false]);
+        let script = (1..=6).map(|i| use_tools(&[read_call(&format!("c{i}"), "a.ts", serde_json::json!({}))])).collect();
+        let history = history(vec![user("go")]);
+        let events = collect(options(Arc::new(ScriptedProvider::new(script)), &history, plain())).await;
+        assert_eq!(tool_loops(&events), [true, true, false]);
         assert_eq!(end(&events), Some(StopReason::Loop));
+        let texts = tool_texts(&history);
+        assert!(
+            texts[3].starts_with("Marv: you have made this exact call") && texts[3].contains(r#"read_file {"path":"a.ts"}"#),
+            "{}",
+            texts[3]
+        );
+        assert!(texts[4].contains("final turn"), "{}", texts[4]);
+        // Marv answered these with the cut-off text ("your reply hit the output limit"), which wasn't true.
+        assert_eq!(texts[5], not_run::TOOL_LOOP);
+        assert!(!texts.iter().any(|t| t == not_run::CUT_OFF));
+    }
+
+    #[tokio::test]
+    async fn the_final_turn_after_a_loop_can_save_the_work_and_answer() {
+        // TB 0.15.0: the run had the fix but not yet the report the task asked for when the guard ended it.
+        let read = |id: &str| use_tools(&[read_call(id, "a.py", serde_json::json!({}))]);
+        let write = ToolCall {
+            id: "w".into(),
+            name: "write_file".into(),
+            arguments: serde_json::json!({"path": "report.txt", "content": "fixed"}).to_string(),
+        };
+        let script =
+            vec![read("c1"), read("c2"), read("c3"), read("c4"), read("c5"), use_tools(&[write]), say("Done: report.txt.")];
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        let record = ran.clone();
+        let run: RunFn = Arc::new(move |c, _| {
+            record.lock().unwrap().push(c.name.clone());
+            Box::pin(async move { Ok(ok("same text", c.id.clone())) })
+        });
+        let events = collect(options(
+            Arc::new(ScriptedProvider::new(script)),
+            &history(vec![user("go")]),
+            FakeRunner { run, parallel: |_| false },
+        ))
+        .await;
+        assert_eq!(tool_loops(&events), [true, true]);
+        assert_eq!(ran.lock().unwrap().last().map(String::as_str), Some("write_file"));
+        assert_eq!(end(&events), Some(StopReason::End));
+    }
+
+    #[tokio::test]
+    async fn progress_after_a_warning_means_a_later_unrelated_loop_is_warned_about_again() {
+        // Marv never reset `warned`: one early warning made any later loop end the run without a word.
+        let read = |id: String, path: &str| use_tools(&[read_call(&id, path, serde_json::json!({}))]);
+        let mut script: Vec<_> = (1..=4).map(|i| read(format!("a{i}"), "a.ts")).collect();
+        // Genuine progress: distinct calls that ran and succeeded.
+        script.extend((0..crate::repetition::TOOL_LOOP_PROGRESS).map(|i| read(format!("p{i}"), &format!("f{i}.ts"))));
+        script.extend((1..=4).map(|i| read(format!("b{i}"), "b.ts")));
+        script.push(say("Done."));
+        let events = collect(options(Arc::new(ScriptedProvider::new(script)), &history(vec![user("go")]), plain())).await;
+        // Two warnings, never a stop or a final turn.
+        assert_eq!(tool_loops(&events), [true, true]);
+        assert_eq!(end(&events), Some(StopReason::End));
+    }
+
+    #[tokio::test]
+    async fn without_progress_a_later_loop_gets_the_final_turn_not_another_warning() {
+        let read = |id: String, path: &str| use_tools(&[read_call(&id, path, serde_json::json!({}))]);
+        let mut script: Vec<_> = (1..=4).map(|i| read(format!("a{i}"), "a.ts")).collect();
+        script.extend((1..=4).map(|i| read(format!("b{i}"), "b.ts")));
+        script.push(say("Done."));
+        let history = history(vec![user("go")]);
+        let events = collect(options(Arc::new(ScriptedProvider::new(script)), &history, plain())).await;
+        assert_eq!(tool_loops(&events), [true, true]);
+        assert!(tool_texts(&history)[7].contains("final turn"));
     }
 
     // #267: repeated calls that failed validation.
@@ -3943,8 +4194,8 @@ mod tests {
         let script = (1..=6).map(|i| use_tools(&[herdr_call(&format!("c{i}"), bad.clone())])).collect();
         let history = history(vec![user("go")]);
         let events = collect(options(Arc::new(ScriptedProvider::new(script)), &history, validating_runner(Arc::default()))).await;
-        assert_eq!(tool_loops(&events), [true, false]);
-        assert_eq!(end(&events), Some(StopReason::Loop));
+        assert_eq!(tool_loops(&events), [true, true]);
+        assert_eq!(end(&events), Some(StopReason::End)); // the script ran out during the final turn
         let texts = tool_texts(&history);
         assert!(texts[1..4].iter().all(|t| t.starts_with("Marv: not run. This exact call was refused")), "{texts:?}");
         assert!(texts[4].starts_with("Marv: you have made this exact call"), "{}", texts[4]);
@@ -3965,8 +4216,7 @@ mod tests {
         let events =
             collect(options(Arc::new(ScriptedProvider::new(script)), &history, FakeRunner { run: failing, parallel: |_| false }))
                 .await;
-        assert_eq!(tool_loops(&events), [true, false]);
-        assert_eq!(end(&events), Some(StopReason::Loop));
+        assert_eq!(tool_loops(&events), [true, true]);
         let texts = tool_texts(&history);
         assert_eq!(texts[..3], ["ENOENT: a.ts", "ENOENT: a.ts", "ENOENT: a.ts"]);
         assert!(texts[3].starts_with("Marv: you have made this exact call 4 times in a row"), "{}", texts[3]);
@@ -4044,7 +4294,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_command_failing_the_same_way_with_another_tail_each_time_warns_then_stops() {
-        let tails = ["2>&1 | tail -2", "&& du -sh y", "|| true", "&& command -v tokei", "; ls"];
+        let tails = ["2>&1 | tail -2", "&& du -sh y", "|| true", "&& command -v tokei", "; ls", "; pwd"];
         let mut script: Vec<_> =
             tails.iter().enumerate().map(|(i, t)| use_tools(&[bash_call(&format!("c{i}"), &format!("{CLONE} {t}"))])).collect();
         // A probe in between doesn't hide it.
@@ -4052,15 +4302,18 @@ mod tests {
         let ran = Arc::new(AtomicUsize::new(0));
         let history = history(vec![user("go")]);
         let events = collect(options(Arc::new(ScriptedProvider::new(script)), &history, offline(ran.clone()))).await;
-        assert_eq!(tool_loops(&events), [true, false]);
+        assert_eq!(tool_loops(&events), [true, true, false]);
         assert_eq!(end(&events), Some(StopReason::Loop));
-        // The two clones and the probe ran; the third clone got the note, the fourth stopped the run.
+        // The two clones and the probe ran; the third clone got the note, the fourth the final turn, the fifth
+        // stopped the run.
         assert_eq!(ran.load(Ordering::SeqCst), 3);
         let turns = history.lock().unwrap();
         let noted = turns.iter().any(|t| {
             matches!(t, ChatTurn::Tool { text, .. } if text.starts_with("Marv: not run. This command already failed 2 times"))
         });
         assert!(noted, "{turns:?}");
+        let final_turn = turns.iter().any(|t| matches!(t, ChatTurn::Tool { text, .. } if text.contains("final turn")));
+        assert!(final_turn, "{turns:?}");
     }
 
     // Greptile on #111: each call is checked when it's about to run, after the calls before it in the reply.
