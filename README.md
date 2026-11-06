@@ -109,6 +109,22 @@ Marv can also run on a subscription, or another vendor's own key, instead of Ope
 - **Qwen Coding Plan.** Qwen3.7-Plus, Qwen3.6-Plus and Qwen3.5-Plus on Alibaba Cloud Model Studio's Coding Plan (`https://coding-intl.dashscope.aliyuncs.com/v1`), with the plan's own key (`sk-sp-…`, saved as `qwenApiKey`, or `QWEN_API_KEY`). Mainland China's plan: `"baseUrl": "https://coding.dashscope.aliyuncs.com/v1"`. **Interactive use only:** Alibaba Cloud's [terms](https://www.alibabacloud.com/help/en/model-studio/coding-plan-faq) don't allow the plan's key in automated or non-interactive runs, and can suspend the plan. So `marv -p` refuses it. Don't let mesh messages wake a session on it either (`mesh.wake`): a woken turn runs with nobody typing.
 - **DeepSeek.** `deepseek-flash` and `deepseek-v4-pro` on DeepSeek's own API (`https://api.deepseek.com`), pay as you go, with a key from [platform.deepseek.com/api_keys](https://platform.deepseek.com/api_keys) (saved as `deepseekApiKey`, or `DEEPSEEK_API_KEY`). Marv doesn't show DeepSeek's prices: they change with the time of day.
 
+### Marv plan
+
+Marv is free and needs no account. A paid Marv plan, bought on [flologixai.com](https://www.flologixai.com), adds to it:
+
+- **Founding:** a licence for the plan; you keep using your own provider and key.
+- **Pro + models:** a monthly model allowance on OpenRouter, without a key of your own.
+
+```bash
+marv login            # your email, then the 6-digit code it's sent
+marv plan             # the plan, its status, the allowance used and left, when it resets (/plan in marv)
+marv plan --manage    # open the billing page: change or cancel the plan, invoices
+marv logout           # sign out on this machine
+```
+
+With Pro + models, signing in puts the plan's OpenRouter key in `~/.marv/config.json` and sets OpenRouter and the plan's default model, unless you already have an OpenRouter key there: yours is never replaced (`marv login` says how to switch). When the month's allowance is used up, Marv says so and when it resets; to keep going before then, enter your own OpenRouter key with `/setup`. The sign-in is saved to `~/.marv/plan.json`, readable only by you. Signing out removes the plan's key from your config (only if it's still the plan's) and that file. Nothing contacts the plan server unless you sign in.
+
 ### Your own endpoint
 
 A company gateway, [LiteLLM](https://docs.litellm.ai/docs/simple_proxy), vLLM, llama.cpp's `llama-server` or any other OpenAI-compatible server can be a provider of its own. Name it under `providers` in `~/.marv/config.json`, then pick it in `/setup` (it's listed after the built-in providers) or set `"provider"` to its name:
@@ -174,6 +190,7 @@ Sandboxed reads, edits and test runs go ahead on their own; a commit, the networ
 | `/forget` | Remove a memory (`/forget <text from it>`) |
 | `/resume` | Pick up an earlier session in this project |
 | `/compact` | Summarize the conversation to free up context (`/compact <what to keep>`) |
+| `/plan` | Your Marv plan and the model allowance left (`/plan manage` opens the billing page; [Marv plan](#marv-plan)) |
 | `/cost` | Tokens used and cost so far, per model when more than one served the session |
 | `/sandbox` | Show or set the command sandbox (`/sandbox on`, `/sandbox off`) |
 | `/yolo` | Run edits and sandboxed commands without asking (`/yolo on`, `/yolo off`) |
@@ -229,6 +246,7 @@ marv mesh ls         list the Marvs on this machine you can wire to (see "The me
 marv mesh wire …     ask for a wire between agents
 marv mesh plug …     plug another agent into a Marv over stdin/stdout
 marv update          update to the newest release (--check: only say whether there is one)
+marv login           sign in to a paid Marv plan (marv plan, marv logout; see "Marv plan")
 marv --version       print the version (-v)
 marv --help          show the help
 ```

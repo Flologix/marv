@@ -4,6 +4,7 @@
 //! - `-p <prompt>` / `run <prompt>`: one headless turn ([`headless`]), exit codes 0/1/2/3;
 //! - `mesh ls|wire|plug`: the mesh ([`mesh_cmd`]);
 //! - `update [--check]`: update this install to the newest release ([`update`]);
+//! - `login [--email]`, `logout`, `plan [--manage]`: the paid Marv plan ([`plan`]);
 //! - `__html-convert` (hidden): the web reader's converter process (`marv_tools::web::html_convert_cli::main`);
 //! - `__run-checks <spec>` (hidden): the project checks' runner, inside the sandbox (`marv_session::checks::runner`);
 //! - `__relay <spec>` (hidden): the process door's relay, inside a sandbox (`marv_tools::relay`, Marv #51);
@@ -23,6 +24,7 @@
 mod cli;
 mod headless;
 mod mesh_cmd;
+mod plan;
 mod signals;
 mod tui;
 mod update;
@@ -139,6 +141,9 @@ async fn run_mode(cli: Cli, mode: Mode, quit: signals::Quit) -> i32 {
         }
         Mode::MeshLs => mesh_cmd::ls().await,
         Mode::Update { check } => update::run(check).await,
+        Mode::Login { email } => plan::run_login(email).await,
+        Mode::Logout => plan::run_logout().await,
+        Mode::Plan { manage } => plan::run_plan(manage).await,
         Mode::MeshWire { spec } => mesh_cmd::wire(&spec).await,
         Mode::MeshPlug { session, name } => mesh_cmd::plug(&session, name.as_deref()).await,
         // A person is at the TUI to approve each command; this flag would answer for them.
