@@ -54,6 +54,10 @@ fn every_request_of_marv_p_says_nobody_can_answer() {
     assert_eq!(systems.len(), 2);
     assert!(systems[0].contains("# Running unattended"), "{}", systems[0]);
     assert!(systems[0].contains("nobody can answer a question"), "{}", systems[0]);
+    // The checklist before the final reply, and no unsandboxed facts in a sandboxed run.
+    assert!(systems[0].contains("Before your final reply, re-read the task and list every explicit requirement"));
+    assert!(systems[0].contains("Never look online for the task's own source, hidden tests or reference answers."));
+    assert!(!systems[0].contains(marv_session::prompt::UNSANDBOXED_FACTS), "{}", systems[0]);
     assert_eq!(systems[0], systems[1], "the system prompt changed between requests");
 }
 
@@ -97,4 +101,40 @@ fn a_time_limit_is_in_the_prompt_and_in_each_command_result() {
     assert_eq!(system(&bodies[0]), system(&bodies[1]));
     let last = bodies[1]["messages"].as_array().unwrap().last().unwrap().to_string();
     assert!(last.contains("time left in this run: 9m") || last.contains("time left in this run: 10m"), "{last}");
+}
+
+/// `--dangerously-run-unsandboxed`: the access facts say commands run on this machine, not in a sandbox (0.15.0 told
+/// such a run it was sandboxed, and on Terminal-Bench it handed the user scripts instead of configuring the machine).
+#[test]
+fn an_unsandboxed_run_is_told_it_is_not_sandboxed() {
+    let dir = std::env::temp_dir().join(format!("marv-unsandboxed-facts-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for sub in ["proj", "home", "config", "run"] {
+        std::fs::create_dir_all(dir.join(sub)).unwrap();
+    }
+    let dir = dir.canonicalize().unwrap();
+    let replies: Vec<Reply> = vec![serde_json::from_value(json!({"text": "Done."})).unwrap()];
+    let server = FakeServer::start(replies, Vec::new()).unwrap();
+    let settings = Value::Object(marv_oracle::runner::default_config(&server.base_url()));
+    std::fs::write(dir.join("config/config.json"), settings.to_string()).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_marv"))
+        .args(["-p", "say hi", "--dangerously-run-unsandboxed"])
+        .current_dir(dir.join("proj"))
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", dir.join("home"))
+        .env("MARV_CONFIG_DIR", dir.join("config"))
+        .env("XDG_RUNTIME_DIR", dir.join("run"))
+        .env("MARV_GITHUB", "off")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let body: Value =
+        server.requests().into_iter().find(|r| r.method == "POST").map(|r| serde_json::from_str(&r.body).unwrap()).unwrap();
+    let system = body["messages"][0]["content"].as_str().unwrap().to_string();
+    assert!(system.contains(marv_session::prompt::UNSANDBOXED_FACTS), "{system}");
+    assert!(!system.contains("Sandboxed commands can write only there"), "{system}");
+    assert!(!system.contains("# Sandbox limits"), "{system}");
 }

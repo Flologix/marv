@@ -3981,6 +3981,9 @@ impl MarvSession {
             git_placeholder: no_git_of_its_own(&init.root),
             // #268: the session's root against the home folder, both fixed for the session, so the cache holds.
             home_project: marv_sandbox::home_project(&init.root, &crate::paths::home_dir()),
+            // Only `marv -p --dangerously-run-unsandboxed` sets `files_anywhere`, with the sandbox off, and nothing
+            // toggles either there: fixed for the session (init, not the live `s.sandbox`), so the cache holds.
+            unsandboxed: init.files_anywhere && !init.sandbox,
         });
         // #124: one fixed section while this conversation offers radio_tx (never a roster, a name or a state).
         let base = if radio { format!("{base}{}", crate::radio::RADIO_PROMPT) } else { base };
@@ -4349,6 +4352,26 @@ mod tests {
         .unwrap();
         assert!(s.configure(Configure { yolo: Some(true), ..Configure::default() }).is_err());
         assert!(!s.state().yolo);
+    }
+
+    /// An unsandboxed run (`files_anywhere` with the sandbox off: `marv -p --dangerously-run-unsandboxed`) is told its
+    /// commands run on the machine; a sandboxed one, or the sandbox merely off (the TUI can turn it back on), keeps the
+    /// sandboxed facts. Turning the sandbox on mid-session doesn't change the prompt (the cache).
+    #[test]
+    fn an_unsandboxed_run_says_so_in_its_access_facts() {
+        let s = session(|i| {
+            i.sandbox = false;
+            i.files_anywhere = true;
+        })
+        .unwrap();
+        assert!(s.system_prompt().contains(crate::prompt::UNSANDBOXED_FACTS), "{}", s.system_prompt());
+        let before = s.build_system();
+        s.configure(Configure { sandbox: Some(true), ..Default::default() }).unwrap();
+        assert_eq!(s.build_system(), before);
+        for sandbox in [true, false] {
+            let other = session(|i| i.sandbox = sandbox).unwrap();
+            assert!(!other.system_prompt().contains(crate::prompt::UNSANDBOXED_FACTS));
+        }
     }
 
     /// #74: in a Herdr pane the session offers the herdr tool, after the caller's tools, and its situation says so;
