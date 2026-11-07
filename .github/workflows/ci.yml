@@ -92,15 +92,15 @@ jobs:
           packaging/package.sh x86_64-unknown-linux-musl target/debug/marv "$RUNNER_TEMP/assets"
           packaging/smoke.sh x86_64-unknown-linux-musl "$RUNNER_TEMP/assets"
 
-  # macOS (#150, #167): a required check, on arm64 (macos-14, macos-15) and Intel (macos-15-intel; GitHub retired the
-  # macos-13 image the spec named).
+  # macOS (#150, #167): a required check, on arm64 (macos-15) and Intel (macos-15-intel; GitHub retired the macos-13
+  # image the spec named, and macos-14 on 2026-11-07: "The configuration 'macos-14-arm64-us-default' is not supported").
   # The sandbox is Seatbelt (#166: `sandbox-exec` with `marv __guard`), and as on Linux its guards must run, not skip:
   # MARV_REQUIRE_SANDBOX=1, and a broken `sandbox-exec` fails the job before the tests.
   macos:
     strategy:
       fail-fast: false
       matrix:
-        runner: [macos-14, macos-15, macos-15-intel]
+        runner: [macos-15, macos-15-intel]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     env:

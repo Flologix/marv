@@ -6,6 +6,26 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+## [0.16.3] - 2026-11-07
+
+### Fixed
+
+- **`marv -p --time-limit` now stops at the limit.** The limit used to only shorten bash timeouts; a run could keep reasoning past "0m left" and never answer. Now the model is warned shortly before the deadline (even in the middle of a long reasoning reply), every tool result shows the time left, and at the deadline the run ends with `time_limit` (exit 2), the same as a step limit.
+- **Background jobs no longer hang a command outside the sandbox.** `cd app && npm run dev > log 2>&1 &` kept the command's output open, so the call waited for its full timeout and then killed the server it had just started. The call now returns as soon as the shell exits, and the job keeps running.
+- **Re-reading a long file no longer ends the run.** A model that asked for the same file again without an offset got the same first page, and the loop guard could stop the run seconds in. It now gets the next page, and repeated reads and searches get several warnings before anything is stopped. A run the guard does stop is told why, rather than "the output limit".
+- **A reply that spends its whole budget reasoning is retried with less reasoning**, rather than repeating the same reasoning until the run ends. A second unreadable reply no longer ends the run either.
+- **Outside the sandbox (`--dangerously-run-unsandboxed`), the model is told the truth about where it runs.** It was told it was sandboxed and the network was off, so it sometimes handed the user commands to run instead of running them, or didn't install a tool it needed. It's now told the machine is its to act on, and given the real CPU and memory limits.
+
+### Security
+
+- **Marv's own keys are removed from tool output.** If a command printed Marv's config (`cat ~/.marv/config.json`), the provider API key went to the model and into the session and its logs. Marv now replaces its provider keys, custom-provider headers and MCP tokens with `[redacted …]` in every tool result. Known limits are listed in `docs/SECURITY.md`.
+
+### Changed
+
+- **The note for unattended runs (`marv -p`) asks for more care before finishing:** check every requirement of the task literally; follow a tool's or model's documented usage; prefer installed libraries over hand-written parsers; copy input files aside before running anything that could change them; keep improving speed tasks after the first working version.
+- **`marv -p --output stream-json` logs Marv's notes to the model** as `note` events (time left, deadline, loop guard, cut-off), and the trajectory records them too. What the model sees is unchanged.
+- Tool output is shorter: the command repeated in each result's header is cut to 100 characters.
+
 ## [0.16.2] - 2026-11-03
 
 ### Changed
@@ -452,7 +472,8 @@ The first public release, on npm as `@flologixai/marv`.
 - The SDK: `createSession()` from `@flologixai/marv/sdk` runs Marv from code, without the UI.
 - Evals: `bun run eval` runs real models on small tasks with hidden checks.
 
-[Unreleased]: https://github.com/Flologix/marv/compare/v0.16.2...HEAD
+[Unreleased]: https://github.com/Flologix/marv/compare/v0.16.3...HEAD
+[0.16.3]: https://github.com/Flologix/marv/compare/v0.16.2...v0.16.3
 [0.16.2]: https://github.com/Flologix/marv/compare/v0.16.1...v0.16.2
 [0.16.1]: https://github.com/Flologix/marv/compare/v0.16.0...v0.16.1
 [0.16.0]: https://github.com/Flologix/marv/compare/v0.15.0...v0.16.0
