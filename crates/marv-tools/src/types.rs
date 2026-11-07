@@ -454,6 +454,9 @@ pub struct ToolContext {
     /// `marv -p --dangerously-run-unsandboxed` (a disposable container): the file tools may read and write outside the
     /// project too, as its commands can. Inside the project every rule holds as ever. False everywhere else.
     pub files_anywhere: bool,
+    /// Marv's own configured secrets (the provider keys, MCP servers' tokens): `run_tool` takes them out of every result
+    /// (docs/SECURITY.md). The session fills it; empty: nothing is redacted.
+    pub secrets: Arc<marv_core::Secrets>,
 }
 
 /// A running call's one-line status on its card (the session sends it the way it sends a subagent's progress).
@@ -514,6 +517,7 @@ impl ToolContext {
             progress: None,
             deadline: None,
             files_anywhere: false,
+            secrets: Arc::default(),
         }
     }
 

@@ -694,6 +694,32 @@ const DESCRIPTION: &str = BUBBLEWRAP_DESCRIPTION;
 #[cfg(target_os = "macos")]
 const DESCRIPTION: &str = SEATBELT_DESCRIPTION;
 
+/// marv-rs, behaviour change (Terminal-Bench, 2026-11-06): the description `marv -p --dangerously-run-unsandboxed`
+/// sends instead of the sandbox's, with the `network` and `sandbox` parameters described as already on and off
+/// ([`unsandboxed_spec`]). A run told "Network is off" by the `network` parameter ("Off by default") never tried to
+/// install the OCR tool it needed, although the container had the network. Decided once per session (the session builds
+/// its specs at start; nothing toggles the sandbox in `marv -p`), so the specs stay byte-stable.
+pub const UNSANDBOXED_DESCRIPTION: &str = "Run a shell command in the project folder, e.g. to run tests, a build, git status, or wc -l. The sandbox is off for this run: the command runs directly on this machine with this user's permissions, and it has the network (install a missing tool with the system package manager or pip). Not interactive: commands can't prompt for input. Don't write files with it (no heredocs or echo >): use write_file or edit_file. Output (stdout and stderr together) is cut in the middle if very long.";
+const UNSANDBOXED_NETWORK: &str = "Not needed in this run: the sandbox is off, so every command already has the network.";
+const UNSANDBOXED_SANDBOX: &str =
+    "Not needed in this run: the sandbox is off, so every command already runs directly on this machine.";
+
+/// Bash's spec (`spec`, as [`crate::tool_specs`] built it) as an unsandboxed run reads it: the same parameters (a call
+/// that sets `network` or `sandbox` still validates), with [`UNSANDBOXED_DESCRIPTION`] and the two flags described as
+/// what they are in this run. Any other spec is returned as it is.
+pub fn unsandboxed_spec(mut spec: marv_core::ToolSpec) -> marv_core::ToolSpec {
+    if spec.name != "bash" {
+        return spec;
+    }
+    spec.description = UNSANDBOXED_DESCRIPTION.into();
+    for (name, text) in [("network", UNSANDBOXED_NETWORK), ("sandbox", UNSANDBOXED_SANDBOX)] {
+        if let Some(property) = spec.parameters.pointer_mut(&format!("/properties/{name}")) {
+            property["description"] = Value::from(text);
+        }
+    }
+    spec
+}
+
 #[async_trait]
 impl Tool for Bash {
     type Input = BashInput;
@@ -1776,6 +1802,29 @@ mod tests {
                 "false runs the command on the user's machine, outside the sandbox, with their permissions; always asks."
             )
         );
+    }
+
+    /// An unsandboxed run's bash spec says the network is on and the sandbox off, in the description and the flags; the
+    /// parameters are the same, and the built spec is unchanged (the golden).
+    #[test]
+    fn an_unsandboxed_runs_bash_spec_says_the_network_is_on() {
+        let built = crate::DynTool::spec(&Bash);
+        let spec = unsandboxed_spec(built.clone());
+        assert_eq!(spec.description, UNSANDBOXED_DESCRIPTION);
+        assert!(!spec.description.contains("no network") && spec.description.contains("it has the network"));
+        let props = &spec.parameters["properties"];
+        assert_eq!(props["network"]["description"], UNSANDBOXED_NETWORK);
+        assert_eq!(props["sandbox"]["description"], UNSANDBOXED_SANDBOX);
+        for p in [&spec.parameters, &built.parameters] {
+            assert!(!p["properties"]["network"]["description"].as_str().unwrap().is_empty());
+        }
+        let keys = |v: &Value| v["properties"].as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+        assert_eq!(keys(&spec.parameters), keys(&built.parameters));
+        assert_eq!(props["command"], built.parameters["properties"]["command"]);
+        assert!(built.parameters["properties"]["network"]["description"].as_str().unwrap().contains("Off by default"));
+        assert_eq!(unsandboxed_spec(built.clone()), unsandboxed_spec(built), "deterministic");
+        let other = marv_core::ToolSpec { name: "read_file".into(), description: "d".into(), parameters: json!({}) };
+        assert_eq!(unsandboxed_spec(other.clone()), other);
     }
 
     #[tokio::test]

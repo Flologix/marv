@@ -57,6 +57,15 @@ fn every_request_of_marv_p_says_nobody_can_answer() {
     // The checklist before the final reply, and no unsandboxed facts in a sandboxed run.
     assert!(systems[0].contains("Before your final reply, re-read the task and list every explicit requirement"));
     assert!(systems[0].contains("Never look online for the task's own source, hidden tests or reference answers."));
+    // 2026-11-06: "conventional" is documented usage and training-time preprocessing, not "add nothing"; prefer an
+    // installed library to a hand-written parser; copy inputs aside before a tool can change them; keep improving a
+    // speed task.
+    assert!(systems[0].contains("including any prompt, prefix or instruction it requires"), "{}", systems[0]);
+    assert!(systems[0].contains("not whatever scores best on the data at hand"), "{}", systems[0]);
+    assert!(!systems[0].contains("add no processing nobody asked for"), "{}", systems[0]);
+    assert!(systems[0].contains("check what's installed"), "{}", systems[0]);
+    assert!(systems[0].contains("Copy the given input files aside"), "{}", systems[0]);
+    assert!(systems[0].contains("assume an unseen reference sets that bar"), "{}", systems[0]);
     assert!(!systems[0].contains(marv_session::prompt::UNSANDBOXED_FACTS), "{}", systems[0]);
     assert_eq!(systems[0], systems[1], "the system prompt changed between requests");
 }
