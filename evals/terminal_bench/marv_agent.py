@@ -175,8 +175,15 @@ class MarvAgent(BaseInstalledAgent):
             # A dropped connection (DNS, Wi-Fi) ends a run after the provider's own retries (about 5 s). Wait and continue
             # the same conversation (-c: its history intact), at most 5 times; only for that error, never for the
             # model's own ending.
+            # Only a run Marv ended on that error counts: exit 1, last line a result with reason "error", and an error
+            # event (its own line, keys sorted so it starts with "message") saying the provider can't be reached. Never
+            # a substring anywhere: `ps aux` output in a tool result carried this command line, so 5 normal endings
+            # were continued (2026-11-06). The pattern is split so this command line never holds it whole.
             "for retry in 1 2 3 4 5; do "
-            f"  grep -q \"Can't reach\" {LOGS}/last.jsonl || break; "
+            "  [ \"$status\" = 1 ] || break; "
+            f"  case \"$(tail -n 1 {LOGS}/last.jsonl)\" in '{{\"reason\":\"error\",'*'\"type\":\"result\"'*) ;; *) break ;; esac; "
+            "  dropped='^{\"message\":\"Can.t'; "
+            f"  grep -q \"$dropped re\"ach {LOGS}/last.jsonl || break; "
             f"  echo \"marv-agent: the connection dropped; continuing ($retry/5)\" >> {LOGS}/stderr.txt; sleep 30; "
             # Less than a minute left isn't worth a continuation: the task's own timeout is about to end it.
             + (f"  left=$(( {budget} - $(date +%s) + start )); [ \"$left\" -ge 60 ] || break; " if budget else "")
