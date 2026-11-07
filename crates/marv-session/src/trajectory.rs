@@ -244,6 +244,15 @@ pub enum TrajectoryRecord {
         who: Who,
         continued: bool,
     },
+    /// marv-rs: a note Marv gave the model (`LoopEvent::Note`), exactly as the model got it: the deadline's wrap-up
+    /// note, a tool result's time-left footer, a loop guard's note, a repeated read given the next page, and the other
+    /// notes the loop adds. `kind` is `NoteKind::as_str`.
+    Note {
+        #[serde(flatten)]
+        who: Who,
+        kind: &'static str,
+        text: String,
+    },
     /// `next`: "retry", "nudge" or "stop".
     EmptyReply {
         #[serde(flatten)]
@@ -665,6 +674,13 @@ impl AgentRecorder {
             LoopEvent::TextLoop { continued } => (self.sink)(TrajectoryRecord::TextLoop { who, continued: *continued }),
             LoopEvent::AnnouncedStep { continued } => (self.sink)(TrajectoryRecord::AnnouncedStep { who, continued: *continued }),
             LoopEvent::ToolLoop { continued } => (self.sink)(TrajectoryRecord::ToolLoop { who, continued: *continued }),
+            LoopEvent::Note { kind, text } => {
+                // Reasoning not yet recorded (a reply dropped for the deadline's note, a cut-off one) goes first.
+                if let Some(thinking) = self.take_thinking() {
+                    (self.sink)(TrajectoryRecord::Assistant { who: who.clone(), text: String::new(), thinking: Some(thinking) });
+                }
+                (self.sink)(TrajectoryRecord::Note { who, kind: kind.as_str(), text: text.clone() });
+            }
             LoopEvent::EmptyReply { next } => {
                 let next = match next {
                     EmptyNext::Retry => "retry",
@@ -749,6 +765,28 @@ mod tests {
         assert_eq!(tool["isError"], false);
         assert_eq!(tool["agent"], "main");
         assert_eq!(serde_json::to_value(&records[3]).unwrap()["reason"], "end");
+    }
+
+    // marv-rs: Marv's notes to the model are records, after any reasoning not yet recorded (a dropped reply's).
+    #[test]
+    fn notes_are_records_after_the_reasoning_before_them() {
+        use marv_agent::agent::NoteKind;
+        let (mut rec, out) = recorder();
+        rec.event(&LoopEvent::ThinkingDelta("still weighing the primers".into()));
+        rec.event(&LoopEvent::Note { kind: NoteKind::Deadline, text: "About 90 s are left".into() });
+        rec.event(&LoopEvent::Note { kind: NoteKind::TimeLeft, text: "[time left in this run: 1m 00s]".into() });
+        let records: Vec<serde_json::Value> = out.lock().unwrap().iter().map(|r| serde_json::to_value(r).unwrap()).collect();
+        assert_eq!(records.len(), 3);
+        assert_eq!(
+            (records[0]["type"].as_str(), records[0]["thinking"].as_str()),
+            (Some("assistant"), Some("still weighing the primers"))
+        );
+        assert_eq!(
+            (records[1]["type"].as_str(), records[1]["kind"].as_str(), records[1]["text"].as_str()),
+            (Some("note"), Some("deadline"), Some("About 90 s are left"))
+        );
+        assert_eq!(records[1]["agent"], "main");
+        assert_eq!(records[2]["kind"], "time_left");
     }
 
     #[test]

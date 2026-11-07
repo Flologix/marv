@@ -1046,6 +1046,79 @@ pub fn needs_setup(file: Option<&FileConfig>, config: &Config) -> bool {
     preset(config.provider).key_env.is_some() && config.api_key.is_none()
 }
 
+/// Marv's own configured secrets, for the tool-result redaction (docs/SECURITY.md, "Marv's own secrets never come back
+/// in a tool result"): every built-in provider's saved key and its environment variable, each custom provider's key
+/// (written in the entry, or the `env:` variable it names), and what `config` resolved (the current provider's key,
+/// a custom provider's key read by its `command:`, its headers' values). Values too short to be keys are dropped by
+/// [`marv_core::Secrets`].
+pub fn configured_secrets(file: Option<&FileConfig>, env: &Env, config: Option<&Config>) -> Vec<String> {
+    const KINDS: [ProviderKind; 5] =
+        [ProviderKind::OpenRouter, ProviderKind::Zai, ProviderKind::Kimi, ProviderKind::DeepSeek, ProviderKind::Qwen];
+    let mut out: Vec<String> = Vec::new();
+    for kind in KINDS {
+        out.extend(file.and_then(|f| f.key_for(kind)).map(str::to_string));
+        out.extend(preset(kind).key_env.and_then(|name| env.get(name)).cloned());
+    }
+    for custom in file.and_then(|f| f.providers.as_ref()).into_iter().flat_map(|p| p.values()) {
+        match custom.key.as_deref() {
+            Some(key) if key.starts_with("command:") => {}
+            Some(key) => out.extend(key.strip_prefix("env:").map_or(Some(key.to_string()), |var| env.get(var).cloned())),
+            None => {}
+        }
+        out.extend(custom.headers.iter().map(|(_, value)| value.clone()));
+    }
+    if let Some(config) = config {
+        out.extend(config.api_key.clone());
+        if let Some(endpoint) = &config.endpoint {
+            out.extend(endpoint.api_key.clone());
+            out.extend(endpoint.headers.iter().map(|(_, value)| value.clone()));
+        }
+    }
+    out
+}
+
+/// The key a provider option carries (an SDK caller's, or `marv -p`'s resolved one), for the same redaction.
+pub fn provider_option_secrets(option: &ProviderOption) -> Vec<String> {
+    match option {
+        ProviderOption::OpenRouter { api_key, .. }
+        | ProviderOption::Zai { api_key, .. }
+        | ProviderOption::Kimi { api_key, .. }
+        | ProviderOption::DeepSeek { api_key, .. }
+        | ProviderOption::Qwen { api_key, .. } => vec![api_key.clone()],
+        ProviderOption::Endpoint { endpoint, .. } => {
+            endpoint.api_key.iter().cloned().chain(endpoint.headers.iter().map(|(_, v)| v.clone())).collect()
+        }
+        ProviderOption::Ollama { .. } | ProviderOption::ChatGpt { .. } | ProviderOption::Custom(_) => Vec::new(),
+    }
+}
+
+/// The tokens in MCP servers' configs, for the same redaction: a stdio server's environment values whose names look
+/// secret (`marv_sandbox::host_env::secret_variable`: `GITHUB_TOKEN`, `API_KEY`…), and an HTTP server's header values whose
+/// names do, or `Authorization` (its credential too, without the scheme: `Bearer <token>`), and its OAuth client
+/// secret.
+pub fn mcp_secrets(servers: &[marv_mcp::config::McpServerConfig]) -> Vec<String> {
+    use marv_mcp::config::McpTransport;
+    let mut out = Vec::new();
+    for server in servers {
+        match &server.transport {
+            McpTransport::Stdio { env, .. } => {
+                out.extend(env.iter().filter(|(k, v)| marv_sandbox::host_env::secret_variable(k, v)).map(|(_, v)| v.clone()));
+            }
+            McpTransport::Http { headers, oauth, .. } => {
+                out.extend(oauth.as_ref().and_then(|o| o.client_secret.clone()));
+                for (name, value) in headers {
+                    let variable = name.to_ascii_uppercase().replace('-', "_");
+                    if variable == "AUTHORIZATION" || marv_sandbox::host_env::secret_variable(&variable, value) {
+                        out.push(value.clone());
+                        out.extend(value.split_once(' ').map(|(_, credential)| credential.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// `sk-or-v1-abc…wxyz`: enough to recognise a key without revealing it.
 pub fn mask_key(key: &str) -> String {
     let chars: Vec<char> = key.chars().collect();
@@ -1218,6 +1291,52 @@ mod tests {
     }
     fn env(pairs: &[(&str, &str)]) -> Env {
         pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    /// Every configured key is a secret to redact: each built-in provider's saved key and variable, a custom provider's
+    /// key (literal or `env:`), and what the config resolved. Fake keys only.
+    #[test]
+    fn configured_secrets_are_every_key_marv_was_given() {
+        let file = FileConfig::from_value(&json!({
+            "provider": "openrouter",
+            "apiKey": "sk-or-v1-fake-file-key",
+            "zaiApiKey": "zai-fake-file-key",
+            "providers": {
+                "lit": {"baseUrl": "https://x.example", "key": "lit-fake-key-123"},
+                "var": {"baseUrl": "https://y.example", "key": "env:ACME_FAKE_KEY"},
+                "cmd": {"baseUrl": "https://z.example", "key": "command:pass show x"}
+            }
+        }))
+        .unwrap();
+        let env = env(&[("KIMI_API_KEY", "kimi-fake-env-key"), ("ACME_FAKE_KEY", "acme-fake-env-key"), ("PATH", "/usr/bin")]);
+        let config = resolve_config(Some(&file), &env);
+        let got = configured_secrets(Some(&file), &env, Some(&config));
+        for key in ["sk-or-v1-fake-file-key", "zai-fake-file-key", "lit-fake-key-123", "acme-fake-env-key", "kimi-fake-env-key"] {
+            assert!(got.iter().any(|g| g == key), "{key} missing");
+        }
+        assert!(!got.iter().any(|g| g == "/usr/bin" || g.starts_with("command:")));
+        assert!(configured_secrets(None, &Env::new(), None).is_empty());
+    }
+
+    /// MCP servers' tokens: secret-looking environment values and auth headers (with and without the scheme).
+    #[test]
+    fn mcp_secrets_are_the_servers_tokens() {
+        let loaded = marv_mcp::config::parse_mcp_servers(
+            &[
+                ("s".into(), json!({"command": "srv", "env": {"GITHUB_TOKEN": "ghp-fake-token-1", "LOG_LEVEL": "debug"}})),
+                (
+                    "h".into(),
+                    json!({"type": "http", "url": "https://mcp.example", "oauth": {"clientSecret": "fake-client-secret-4"}, "headers": {"Authorization": "Bearer fake-bearer-2", "X-Api-Key": "fake-api-key-3", "Accept": "json"}}),
+                ),
+            ],
+            &Env::new(),
+        );
+        assert!(loaded.problems.is_empty(), "{:?}", loaded.problems);
+        let got = mcp_secrets(&loaded.servers);
+        for key in ["ghp-fake-token-1", "Bearer fake-bearer-2", "fake-bearer-2", "fake-api-key-3", "fake-client-secret-4"] {
+            assert!(got.iter().any(|g| g == key), "{key} missing: {got:?}");
+        }
+        assert!(!got.iter().any(|g| g == "debug" || g == "json"), "{got:?}");
     }
 
     #[test]

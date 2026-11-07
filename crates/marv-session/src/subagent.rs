@@ -51,6 +51,7 @@ pub fn stopped_text(reason: &str) -> String {
             "It hit its {SUBAGENT_MAX_STEPS}-step limit before finishing. To go on, start a new subagent with what remains."
         ),
         "length" => "Its last reply was cut off by the model's output limit.".into(),
+        "time_limit" => "The run's time limit was reached before it finished.".into(),
         "error" => "It stopped on an error:".into(),
         other => format!("It stopped ({other})."),
     }
@@ -120,6 +121,8 @@ pub fn subagent_context(
     // The run's time limit is the subagent's too (`marv -p --time-limit`).
     ctx.deadline = parent.deadline;
     ctx.files_anywhere = parent.files_anywhere;
+    // Marv's own secrets are redacted from its results as from the parent's (docs/SECURITY.md).
+    ctx.secrets = parent.secrets.clone();
     // A shared-folder subagent edits the same files in the same turn: the turn's one checkpoint covers it (#16). A
     // worktree's changes land on its branch, which is already the way back.
     ctx.checkpoint = if worktree.is_some() { None } else { parent.checkpoint.clone() };
@@ -420,7 +423,10 @@ async fn drive(
     });
     let mut available = available;
     available.extend(plug.iter().flat_map(|p| p.tools()));
-    let specs = available.iter().map(|t| t.spec()).collect();
+    // An unsandboxed run's subagents read bash's spec as the main agent does (fixed for the run).
+    let unsandboxed = ctx.files_anywhere && !ctx.sandbox.enabled;
+    let specs =
+        available.iter().map(|t| t.spec()).map(|s| if unsandboxed { marv_tools::bash::unsandboxed_spec(s) } else { s }).collect();
     let taint = sub_ctx.taint.clone();
     let child_taint = sub_ctx.taint.clone();
     // Kept current each step (a panic or a stop mid-run still reports it): a subagent that started from a tainted
@@ -440,6 +446,8 @@ async fn drive(
     options.wrap_up_at_limit = true;
     // #90: subagents' request records get the raw responses under debug recording too.
     options.debug_raw = crate::config::debug_raw();
+    // The parent's time limit holds for its subagents too (their tools had it already).
+    options.deadline = ctx.deadline;
     options.after_step = plug.as_ref().map(|p| p.after_step(None, taint));
 
     tally.report();

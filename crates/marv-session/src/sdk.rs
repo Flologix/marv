@@ -379,6 +379,7 @@ pub async fn create_session(options: SessionOptions) -> Result<MarvSession, Sess
                 marv_tools::github::github_available(&pairs, &outside, marv_tools::github::AUTH_CHECK).await
             }
         };
+    let given_key = crate::config::provider_option_secrets(&options.provider);
     let mut init = SessionInit::new(root.clone(), ProviderChoice::Option(options.provider));
     init.thinking = options.thinking;
     init.reasoning_effort = options.reasoning_effort;
@@ -396,6 +397,11 @@ pub async fn create_session(options: SessionOptions) -> Result<MarvSession, Sess
     init.system_prompt = options.system_prompt;
     init.deadline = options.deadline;
     init.files_anywhere = options.files_anywhere;
+    // Marv's own keys, redacted from every tool result (docs/SECURITY.md): the user's config file's, the environment's
+    // and the one this session was given. A config that can't be read adds none (loading it reports that elsewhere).
+    let file = crate::config::ConfigStore::new(&config_dir).load().ok().flatten();
+    init.secrets = crate::config::configured_secrets(file.as_ref(), &env, None);
+    init.secrets.extend(given_key);
     init.approve = options.approve;
     init.mesh = options.mesh;
     init.wire_approver = options.wire_approver;

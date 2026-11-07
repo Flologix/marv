@@ -105,6 +105,19 @@ pub fn max_tokens_for_reasoning(max_output: Option<u64>, effort: Option<crate::R
     }
 }
 
+/// marv-rs: `StreamOptions::effort_cap` for one request: an effort in the body's `reasoning` above `cap` goes down to it,
+/// so a retry after a reply that reasoned until the limit reasons less. `max_tokens` stays: dropping the 64k
+/// deep-reasoning cap to 32k with it left `regex-chess` reasoning past 32k at `high` until the run ended (TB
+/// 2026-11-06). A body without an effort is left alone.
+pub fn cap_effort(options: &mut OpenAiCompatOptions, cap: crate::ReasoningEffort) {
+    let Some(effort) = options.body.get_mut("reasoning").and_then(|r| r.get_mut("effort")) else { return };
+    let Some(current) = effort.as_str().and_then(crate::ReasoningEffort::parse) else { return };
+    if current <= cap {
+        return;
+    }
+    *effort = Value::from(cap.as_str());
+}
+
 /// #96: how a provider says it won't take the `max_tokens` Marv sent: it names the field, or (OpenRouter) the prompt
 /// plus the requested output don't fit the window ("…, 32000 in the output").
 static MAX_TOKENS_REFUSED: LazyLock<regex::Regex> =
@@ -715,6 +728,9 @@ impl Provider for OpenAiCompatProvider {
         if self.max_tokens_refused.load(Ordering::Relaxed) {
             adapter.max_tokens = None;
         }
+        if let Some(cap) = options.effort_cap {
+            cap_effort(&mut adapter, cap);
+        }
         let shared = Shared { refused: self.max_tokens_refused.clone(), room: self.room.clone() };
         channel_stream(move |emit| run(client, adapter, outgoing, shared, cancel, debug_raw, emit))
     }
@@ -792,7 +808,7 @@ pub(crate) fn with_continuation<R>(
 
 /// #96: after a reply degenerated, retry once (`true`: the caller sends the next attempt at once) or end the stream.
 /// Either way what the attempt streamed is thrown away: the retry starts over, with [`DEGENERATE_NOTE`]; the second
-/// time a `Discard` goes before the error.
+/// time a `Discard` goes before the error (the agent loop reads that pair as a degenerate reply it can go on past).
 pub(crate) fn after_degenerate(
     label: &str,
     discarded: u64,
@@ -1282,6 +1298,28 @@ mod tests {
         assert!(none.contains(r#""tool_choice":"none""#));
         let no_tools = serde_json::to_string(&request_body(&options, &[], None, &[], ToolChoice::Auto)).unwrap();
         assert!(!no_tools.contains("tools"));
+    }
+
+    #[test]
+    fn an_effort_cap_lowers_the_effort_but_not_the_output_cap_for_one_request() {
+        use crate::ReasoningEffort::{High, Low};
+        let mut options =
+            OpenAiCompatOptions { model: "acme/m".into(), max_tokens: Some(DEEP_REASONING_MAX_TOKENS), ..Default::default() };
+        options.body.insert("reasoning".into(), serde_json::json!({"effort": "max"}));
+        let mut capped = options.clone();
+        cap_effort(&mut capped, High);
+        assert_eq!(capped.body["reasoning"], serde_json::json!({"effort": "high"}));
+        assert_eq!(capped.max_tokens, Some(DEEP_REASONING_MAX_TOKENS));
+        // Never raised, and never added where no effort is sent.
+        let mut low = options.clone();
+        low.body.insert("reasoning".into(), serde_json::json!({"effort": "low"}));
+        cap_effort(&mut low, High);
+        assert_eq!(low.body["reasoning"], serde_json::json!({"effort": "low"}));
+        assert_eq!(low.max_tokens, Some(DEEP_REASONING_MAX_TOKENS));
+        let mut on = options.clone();
+        on.body.insert("reasoning".into(), serde_json::json!({"enabled": true}));
+        cap_effort(&mut on, Low);
+        assert_eq!(on.body["reasoning"], serde_json::json!({"enabled": true}));
     }
 
     #[test]

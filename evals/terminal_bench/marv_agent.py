@@ -33,6 +33,7 @@ from harbor.models.agent.context import AgentContext
 REPO = Path(__file__).resolve().parents[2]
 REMOTE_BIN = "/installed-agent/marv"
 REMOTE_CONFIG_DIR = "/installed-agent/marv-config"
+REMOTE_INSTRUCTION = "/installed-agent/instruction.txt"
 LOGS = "/logs/agent"
 BLOCKED_HOSTS = (
     "tbench.ai", "www.tbench.ai", "harborframework.com", "hub.harborframework.com", "www.harborframework.com",
@@ -149,26 +150,44 @@ class MarvAgent(BaseInstalledAgent):
         approve = " ".join(f"--approve {s}" for s in ("files", "process", "network", "git_write"))
         # The task's own time limit, less a little for Marv's start and the logs (MARV_TIME_LIMIT overrides it).
         limit = int(os.environ.get("MARV_TIME_LIMIT") or 0) or (task_time_limit(self.logs_dir) or 0)
-        time_limit = (
-            f"--time-limit {max(limit - 20, 60)} " if limit and supports(str(local_binary()), "--time-limit") else ""
+        budget = max(limit - 20, 60) if limit and supports(str(local_binary()), "--time-limit") else 0
+        # The limit is shell code (`$left`): a continuation gets the time left of the budget, not the whole of it. With
+        # the whole, a run that reconnected thought it had time the task no longer gave it (install-windows was killed
+        # with 47 minutes left on Marv's clock, 2026-11-05).
+        time_limit = '--time-limit "$left" ' if budget else ""
+        # The task goes in on stdin (`-p -`), never in argv: a process's argv is what `pkill -f` matches, and the task
+        # names its own scripts. With it in argv, `pkill -f pystan_analysis.py` killed Marv itself (and the bash -c
+        # around it): rstan-to-pystan, exit 143, 2026-11-06.
+        await self._upload_config_text(
+            environment, content=instruction, remote_path=REMOTE_INSTRUCTION, filename="instruction.txt"
         )
+        await self.exec_as_root(environment, command=f"chmod 644 {REMOTE_INSTRUCTION}")
         marv = (
             f"MARV_CONFIG_DIR={REMOTE_CONFIG_DIR} {REMOTE_BIN} --output stream-json --max-steps {steps} {time_limit}"
             f"--trust-project --dangerously-run-unsandboxed --approve-tainted {approve}"
         )
         command = (
-            f"mkdir -p {LOGS}; "
+            f"mkdir -p {LOGS}; start=$(date +%s); left={budget}; "
             # Each run's stream goes to last.jsonl (judged alone) and onto stream.jsonl (all of them) as it comes, so a
             # run the task's timeout kills is in both (copying after the run lost the timed-out runs' streams).
-            f"{marv} -p {shlex.quote(instruction)} 2>> {LOGS}/stderr.txt | tee {LOGS}/last.jsonl >> {LOGS}/stream.jsonl; "
+            f"{marv} -p - < {REMOTE_INSTRUCTION} 2>> {LOGS}/stderr.txt | tee {LOGS}/last.jsonl >> {LOGS}/stream.jsonl; "
             "status=${PIPESTATUS[0]}; "
             # A dropped connection (DNS, Wi-Fi) ends a run after the provider's own retries (about 5 s). Wait and continue
             # the same conversation (-c: its history intact), at most 5 times; only for that error, never for the
             # model's own ending.
+            # Only a run Marv ended on that error counts: exit 1, last line a result with reason "error", and an error
+            # event (its own line, keys sorted so it starts with "message") saying the provider can't be reached. Never
+            # a substring anywhere: `ps aux` output in a tool result carried this command line, so 5 normal endings
+            # were continued (2026-11-06). The pattern is split so this command line never holds it whole.
             "for retry in 1 2 3 4 5; do "
-            f"  grep -q \"Can't reach\" {LOGS}/last.jsonl || break; "
+            "  [ \"$status\" = 1 ] || break; "
+            f"  case \"$(tail -n 1 {LOGS}/last.jsonl)\" in '{{\"reason\":\"error\",'*'\"type\":\"result\"'*) ;; *) break ;; esac; "
+            "  dropped='^{\"message\":\"Can.t'; "
+            f"  grep -q \"$dropped re\"ach {LOGS}/last.jsonl || break; "
             f"  echo \"marv-agent: the connection dropped; continuing ($retry/5)\" >> {LOGS}/stderr.txt; sleep 30; "
-            f"  {marv} -c -p {shlex.quote(CONTINUE_PROMPT)} 2>> {LOGS}/stderr.txt | tee {LOGS}/last.jsonl >> {LOGS}/stream.jsonl; "
+            # Less than a minute left isn't worth a continuation: the task's own timeout is about to end it.
+            + (f"  left=$(( {budget} - $(date +%s) + start )); [ \"$left\" -ge 60 ] || break; " if budget else "")
+            + f"  {marv} -c -p {shlex.quote(CONTINUE_PROMPT)} 2>> {LOGS}/stderr.txt | tee {LOGS}/last.jsonl >> {LOGS}/stream.jsonl; "
             "  status=${PIPESTATUS[0]}; "
             "done; "
             # Marv's trajectory, for failures.py and the trajectory stats; never the config folder itself (the key).

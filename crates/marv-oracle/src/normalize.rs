@@ -53,6 +53,10 @@ impl Normalizer {
             let line = self.text(line);
             match serde_json::from_str::<Value>(&line) {
                 Ok(mut value) => {
+                    // marv-rs logs its notes to the model as `note` events; Marv has none (they're in the requests).
+                    if value.get("type").and_then(Value::as_str) == Some("note") {
+                        continue;
+                    }
                     // marv-rs #63: a compaction says what started it; Marv's event doesn't.
                     if value.get("type").and_then(Value::as_str) == Some("compaction")
                         && let Some(event) = value.as_object_mut()

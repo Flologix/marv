@@ -33,7 +33,7 @@
 //!   calls are answered and the run ends `Loop`. marv-rs (#81): a bash command that already failed the same way
 //!   twice since the last change, whatever its tail, isn't run again ([`crate::repetition::FailureLoopState`]),
 //!   checked as each call is about to run, so an edit earlier in the same reply counts: the note the first time,
-//!   the run ends `Loop` (the step's remaining calls not run) the next.
+//!   the run ends `Loop` (the step's remaining calls not run) the next. **marv-rs changes this** (below).
 //! - **Repeated invalid calls** (marv-rs, #267): a call that failed validation (`ToolRun::invalid`: its arguments
 //!   aren't JSON or the tool's parse refused them, so it never ran) is remembered by tool and normalized arguments.
 //!   An identical call refused for the same reason is answered with [`refused_call_note`] from its 2nd try, not the
@@ -78,6 +78,23 @@
 //!   during the hook) ends `Aborted`. Unset, an overflow ends the run like any provider error.
 //!
 //! marv-rs changes and planned work:
+//! - **Tool loops get a final turn** (marv-rs; Terminal-Bench 0.15.0: two runs that had the fix, or a working
+//!   pipeline and 92 minutes left, were ended for re-sending `read_file {"path": …}` without the `offset` their own
+//!   reasoning named). The note now echoes the exact call (tool and arguments, cut at [`LOOP_ARGS_SHOWN`] chars) and
+//!   what's missing when that can be told ([`tool_loop_note`]: `read_file` without `offset`). A loop after the
+//!   warning isn't the end any more: its calls get [`tool_loop_final_note`] (not run; one final turn to save the
+//!   deliverable and answer, tools still allowed), and only a loop after that ends the run `Loop`. The failing-command
+//!   guard escalates the same way. Calls not run when the run ends get [`not_run::TOOL_LOOP`], not the false
+//!   [`not_run::CUT_OFF`] Marv uses. The warning is forgotten after progress
+//!   ([`crate::repetition::TOOL_LOOP_PROGRESS`] distinct calls that ran and succeeded), so an early warning no longer
+//!   makes a later, unrelated loop end the run unwarned; at most [`crate::repetition::MAX_TOOL_LOOP_RESCUES`] final
+//!   turns a run keep the hard stop ([`crate::repetition::ToolLoopState::escalate`]).
+//! - **A reply that degenerates twice** (marv-rs, #96 follow-up; Terminal-Bench 0.15.0 `gcode-to-text`: rendered
+//!   `#` art copied into the reasoning ended the run with 8 minutes left and nothing written). The provider asks once
+//!   more itself, then gives up with a `Discard` (cause `Degenerate`) and an `Error`. The loop treats that pair as
+//!   [`StepOutcome::Degenerate`]: nothing of the reply enters the history, a `Retry` event (cause `Degenerate`) says
+//!   so, and the conversation goes on with [`DEGENERATE_NOTE`], up to [`MAX_DEGENERATE_RECOVERIES`] times a turn (as
+//!   with reasoning-only cut-offs); past that the error ends the run as before.
 //! - **#90 announced next step, no tool call**: a plain answer that ends by announcing what it
 //!   will do next ("Now checking issue #7 before commenting:") is how a turn dies halfway (2 of
 //!   6 GLM runs of `mcp-comment`; opencode: 0 of 6). When such an answer is about to end the
@@ -108,6 +125,49 @@
 //! - **#64 continue after a dropped stream**: a `Retry` with `continued: true` keeps the partial
 //!   text as the assistant turn and sends [`DROPPED_STREAM_NOTE`] instead of starting over (needs a
 //!   `continued` flag on `marv_core::ProviderEvent::Retry`, see `docs/subsystems/agent.md`).
+//! - **Run deadline** (marv-rs, Terminal-Bench 0.15.0): `deadline` (`marv -p --time-limit`) used to reach only the
+//!   tools (bash trims each command to it), so five benchmark runs kept reasoning or calling tools past "time left: 0m
+//!   00s" and were killed from outside before they saved their work or `marv -p` printed its result. Now the loop
+//!   owns it: (1) every result of a call that ran ends with [`time_left_note`] (it was bash's alone); (2) at the top of
+//!   the first step within [`deadline_margin`] of the deadline, [`deadline_note`] goes into the history once (a user
+//!   message from Marv, like the step limit's note; tools stay on, because saving the deliverable takes a tool call);
+//!   (3) at the deadline the run's own stop (a child of `cancel`) fires: a reply still streaming is dropped (its text so
+//!   far is kept, its calls answered [`not_run::TIME_LIMIT`]), running tools see a stop as for ctrl+c, and the run
+//!   ends with an `Error` ([`TIME_LIMIT_MESSAGE`]) and `Done(TimeLimit)`, so the session and `marv -p` finish cleanly.
+//!   A person's own stop still ends `Aborted`. The note is appended, never edited in; the system prompt is untouched.
+//!   **The note reaches a reply still reasoning** (marv-rs, Terminal-Bench 2026-11-06 `dna-insert`: a request started
+//!   317 s before the deadline reasoned until it, so the note, checked only at the top of a step, never went in). While
+//!   a reply streams, the start of the margin is watched too ([`LoopState::wrap_up_at`]): if by then the reply has
+//!   only reasoned (no text, no tool call started: [`StepReply::only_reasoning_so_far`]), that request alone is
+//!   stopped (each request has its own child of the run's stop), the note goes in, and the step is asked again.
+//!   Chosen over capping the request (`max_tokens` from the time left) because tokens don't map to seconds (provider
+//!   speed varies several-fold), and because this is sound: nothing of a reply enters the history before it ends, so
+//!   the dropped one leaves no trace, and the next request is the last one plus the note (the system prompt and tools
+//!   unchanged). The note joins a trailing user turn as every note does (never two user turns in a row), so the only
+//!   bytes that change are that last turn's, which the dropped request carried but never got a reply to; the cached
+//!   prefix before it holds. A reply already writing text or a call is left to finish (dropping it would lose the
+//!   deliverable it may be saving); the deadline itself still stops it. Not for the step limit's tools-off wrap-up.
+//! - **Retry after a reasoning-only cut-off reasons less** (marv-rs, same run: three replies in a row spent the whole
+//!   64k-token budget reasoning, about 400 s each, and each retry re-derived the same reasoning, which is discarded).
+//!   The requests after one go with `StreamOptions::effort_cap` = [`CUT_OFF_RETRY_EFFORT`] (`high`), and after a
+//!   second in a row [`CUT_OFF_LAST_RETRY_EFFORT`] (`low`), until a step finishes: the provider lowers an effort it
+//!   sends above that (OpenRouter's `reasoning.effort`, the Responses API's); it never adds one. The output cap stays:
+//!   a first version also dropped the 64k deep-reasoning cap to 32k, and `regex-chess` (5/5 before) then reasoned past
+//!   32k at `high` three times in a row and the run ended at step 5 with 53 minutes left (TB 2026-11-06, the second
+//!   k=1 run). Effort isn't part of the prompt, so the cached
+//!   prefix holds. [`CUT_OFF_REASONING_NOTE`] still says to reason briefly. Carrying the discarded reasoning as a note
+//!   was not chosen: it would put up to 64k tokens of unvetted text into the history for good.
+//! - **Notes are logged** (marv-rs; audits of the same run had to infer them): every note Marv gives the model is also
+//!   a [`LoopEvent::Note`] with its [`NoteKind`] and exact text: the deadline note and each tool result's time-left
+//!   footer, the tool-loop and failing-command guards' notes, a read given the next page, and the cut-off, empty-reply,
+//!   text-loop, degenerate, step-limit, announced-step, self-summary and `after_step` notes. Only an event (stream-json
+//!   `note`, the trajectory's `note` record): what the model sees is unchanged.
+//! - **Read-only loops and repeated truncated reads** (marv-rs, same run, `schemelike-metacircular-eval` ended 22 s
+//!   into 40 minutes with nothing written; `sam-cell-seg` the same way): a loop whose calls all only read is warned
+//!   about up to [`crate::repetition::MAX_READ_ONLY_LOOP_WARNINGS`] times before the final turn and the stop; the same
+//!   `read_file` again after a truncated page is run with the next page's offset (for the runner only: the history keeps
+//!   the call's own bytes) and its result starts with [`read_on_note`] ([`crate::repetition::ReadPages`]). read_file's
+//!   own text stays Marv's (`Use offset=N to read more.` ends every truncated page already).
 //! - A tool's first poll happens right after launch (Marv: `runTool` is called synchronously), so
 //!   what it does first (an approval, a cancel) is seen before the next call of the group is shown.
 //! - The text-loop check position is reset on `Retry` too (Marv forgot it, so after a retry the
@@ -132,7 +192,8 @@ pub use crate::announce::{
     ANNOUNCED_STEP_NOTE, MAX_SELF_SUMMARY_CONTINUES, SELF_SUMMARY_NOTE, announces_next_step, summarizes_itself,
 };
 use crate::repetition::{
-    FailureLoopState, ToolCallKey, ToolLoopState, detect_text_repetition, failing_command_note, make_tool_key, tool_loop_detected,
+    FailureLoopState, LoopVerdict, ReadPages, ToolCallKey, ToolLoopState, detect_text_repetition, failing_command_note,
+    make_tool_key, only_reads, read_on_note, tool_loop_detected, with_offset,
 };
 pub use crate::send_now::{SendNow, at_step_boundary};
 
@@ -149,8 +210,13 @@ pub mod not_run {
     pub const DECLINED: &str = "Not run: the user declined an earlier action.";
     pub const CUT_OFF: &str = "Not run: your reply hit the output limit before it finished, so this call may be incomplete. Redo it in smaller steps (for a big file: write_file the first part, then add the rest with append: true).";
     pub const TEXT_LOOP: &str = "Not run: your reply was stuck repeating the same text, so it was dropped.";
+    /// marv-rs: a call not run because the tool-loop guard ended the run (Marv answers it with [`CUT_OFF`], which
+    /// isn't what happened).
+    pub const TOOL_LOOP: &str = "Not run: Marv ended the run because the same calls kept repeating without progress.";
     /// #59: a call the wrap-up reply made anyway (it was asked not to).
     pub const STEP_LIMIT: &str = "Not run: the step limit was reached.";
+    /// marv-rs: a call left when the run's time limit (`AgentOptions::deadline`) ended it.
+    pub const TIME_LIMIT: &str = "Not run: the run's time limit was reached.";
     /// #202: a call that waited for approval when Marv quit (a crash, a force-quit): the saved session answers it so.
     pub const QUIT_APPROVAL: &str = "Not run: Marv quit while this call waited for approval.";
     /// #202: a call with no result when Marv quit: it may not have started, or stopped part-way.
@@ -171,6 +237,15 @@ pub const MAX_REASONING_CUT_OFFS: u32 = 3;
 
 pub const CUT_OFF_REASONING_NOTE: &str = "(Automatic note from Marv, the program running you) Your last reply used up the output limit, while reasoning or while writing a tool call (an unfinished call is dropped), so it did nothing. Reason briefly, and write a big file in parts (write_file the first part, then add the rest with append: true).";
 
+/// marv-rs: the most reasoning effort the request after a reply cut off while only reasoning may use
+/// (`StreamOptions::effort_cap`), until a step finishes. `high`: nearly every reasoning model takes it (DeepSeek V4.1
+/// Flash takes max, high and low), and below `xhigh` the provider's output cap drops back from 64k to 32k tokens.
+pub const CUT_OFF_RETRY_EFFORT: marv_provider::ReasoningEffort = marv_provider::ReasoningEffort::High;
+
+/// marv-rs: the effort cap after a second reasoning-only cut-off in a row: `high` can still reason past the whole
+/// budget (`regex-chess`, TB 2026-11-06), and the next one would end the run.
+pub const CUT_OFF_LAST_RETRY_EFFORT: marv_provider::ReasoningEffort = marv_provider::ReasoningEffort::Low;
+
 /// Told to the model after a second empty reply in a row. The first is asked for again unchanged:
 /// upstream hosts sometimes bill for a reply and send nothing, and a resample usually comes back
 /// whole. A second suggests the model itself stopped.
@@ -179,12 +254,55 @@ pub const EMPTY_REPLY_NOTE: &str = "(Automatic note from Marv, the program runni
 /// Told to the model when its reply got stuck repeating one sentence. The reply is dropped entirely.
 pub const TEXT_LOOP_NOTE: &str = "(Automatic note from Marv, the program running you) Your last reply got stuck repeating one sentence and was stopped; nothing in it was used. Take the next concrete step.";
 
-/// The result of each repeated call when tool calls repeat without progress.
-pub fn tool_loop_note(repeat_count: usize, _call_name: &str) -> String {
+/// How many characters of a repeated call's arguments its loop note shows.
+pub const LOOP_ARGS_SHOWN: usize = 300;
+
+/// The call as the model sent it, its arguments cut at [`LOOP_ARGS_SHOWN`] chars (never re-serialized).
+fn shown_call(name: &str, arguments: &str) -> String {
+    let arguments = arguments.trim();
+    match arguments.char_indices().nth(LOOP_ARGS_SHOWN) {
+        Some((cut, _)) => format!("{name} {}…", &arguments[..cut]),
+        None => format!("{name} {arguments}"),
+    }
+}
+
+/// What the repeated call lacks to get something new, when that can be told from it.
+fn loop_hint(name: &str, arguments: &str) -> &'static str {
+    let args = serde_json::from_str::<serde_json::Value>(arguments).ok();
+    let has = |field: &str| args.as_ref().and_then(|a| a.get(field)).is_some_and(|v| !v.is_null());
+    if name == "read_file" && !has("offset") {
+        return " You sent no offset, so it returns the same first lines every time: to read further, pass offset (the result says which line comes next).";
+    }
+    ""
+}
+
+/// The result of each repeated call when tool calls repeat without progress. marv-rs: shows the exact call, and what
+/// it lacks when that can be told (TB 0.15.0: `read_file` resent without the `offset` the model meant to pass).
+pub fn tool_loop_note(repeat_count: usize, name: &str, arguments: &str) -> String {
     format!(
-        "Marv: you have made this exact call {repeat_count} times in a row and it returned the same result; use what it returned, or try something else."
+        "Marv: you have made this exact call {repeat_count} times in a row and it returned the same result: `{}`. Not run again.{} Use what it returned, or change the call.",
+        shown_call(name, arguments),
+        loop_hint(name, arguments),
     )
 }
+
+/// The final-turn note appended to a looping call's result after the warning (marv-rs).
+pub const FINAL_TURN_NOTE: &str = "You were warned and sent it again, so this is your final turn: save your work now (write the files or the report the task asks for) and give your final answer. Tools still work, but repeating this call again ends the run.";
+
+/// marv-rs: the result of each call of a loop after the warning: not run, and one final turn.
+pub fn tool_loop_final_note(repeat_count: usize, name: &str, arguments: &str) -> String {
+    format!(
+        "Marv: not run. You have made this exact call {repeat_count} times in a row and it returned the same result: `{}`.{} {FINAL_TURN_NOTE}",
+        shown_call(name, arguments),
+        loop_hint(name, arguments),
+    )
+}
+
+/// marv-rs: how many times a turn the loop goes on after the provider gave up on a degenerate reply (#96).
+pub const MAX_DEGENERATE_RECOVERIES: u32 = 2;
+
+/// marv-rs: told to the model when the provider gave up on its reply for degenerating twice (#96).
+pub const DEGENERATE_NOTE: &str = "(Automatic note from Marv, the program running you) Your last reply degenerated into repeated text (whitespace, or the same short piece over and over) and was cut; nothing in it was used. Don't reproduce rendered or bulk output (ASCII art, grids, long data) in your reply or your reasoning: analyse it with code and print short summaries. Keep going with the task.";
 
 /// marv-rs #267: the result of a call identical to one that failed validation the same way earlier in the run. A
 /// validation error is deterministic, so the #37 guard's four tries were three too many (the ChatGPT provider resent
@@ -198,6 +316,42 @@ pub fn refused_call_note(reason: &str) -> String {
 
 /// Marv #59: the wrap-up request's note at a hard step limit.
 pub const STEP_LIMIT_NOTE: &str = "(Automatic note from Marv, the program running you) You've reached the step limit. Don't call tools. Reply with what you finished, what's left, and the next step.";
+
+/// The most time before the run's deadline at which the model is told to finish ([`deadline_margin`]).
+pub const DEADLINE_WRAP_UP_MAX: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// How long before the deadline [`deadline_note`] goes in, for a run that had `budget` when it started: a quarter of
+/// it, at most [`DEADLINE_WRAP_UP_MAX`]. 90 s is about two steps of a slow reasoning model (one reply that saves the
+/// deliverable, one final reply), and bash already ends each command 30 s before the deadline
+/// (`marv_tools::bash::DEADLINE_MARGIN_S`), so a command started just before the note still leaves time to read its
+/// output. A quarter keeps a short limit (2 minutes: 30 s) mostly for the work itself.
+pub fn deadline_margin(budget: std::time::Duration) -> std::time::Duration {
+    (budget / 4).min(DEADLINE_WRAP_UP_MAX)
+}
+
+/// marv-rs: the note at [`deadline_margin`] before the deadline, once a run. Tools stay offered: writing the
+/// deliverable is a tool call, and a reply that can't make one can't save anything.
+pub fn deadline_note(left: std::time::Duration) -> String {
+    format!(
+        "(Automatic note from Marv, the program running you) About {} s are left before the time limit stops this run. Finish now: if your result isn't saved yet, make the one or two tool calls that save it, then give your final reply. Don't start anything new.",
+        left.as_secs()
+    )
+}
+
+/// marv-rs: the `Error` the run ends with at its deadline (`Done(TimeLimit)` follows).
+pub const TIME_LIMIT_MESSAGE: &str = "Stopped at the time limit: the run's time ran out before it finished.";
+
+/// What each result of a call that ran ends with while the run has a deadline: the time left, so the model can plan
+/// the rest (it was bash's alone; now every tool's). Empty without a deadline.
+pub fn time_left_note(deadline: Option<std::time::Instant>) -> String {
+    match deadline {
+        Some(at) => {
+            let left = at.saturating_duration_since(std::time::Instant::now()).as_secs();
+            format!("\n[time left in this run: {}m {:02}s]", left / 60, left % 60)
+        }
+        None => String::new(),
+    }
+}
 
 /// Marv #64: sent after a partial reply kept from a dropped stream. The provider owns the continue
 /// request (it owns retries), so the text lives there; re-exported for the loop's tests and docs.
@@ -435,6 +589,47 @@ impl EmptyNext {
     }
 }
 
+/// marv-rs: which of Marv's own notes to the model a [`LoopEvent::Note`] logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoteKind {
+    /// [`deadline_note`]: the run's time is nearly up.
+    Deadline,
+    /// [`time_left_note`]: the footer after a tool's result.
+    TimeLeft,
+    /// The tool-loop or failing-command guard's note, the result of the calls it didn't run.
+    ToolLoop,
+    /// [`read_on_note`]: a repeated truncated read was given the next page.
+    ReadOn,
+    CutOff,
+    EmptyReply,
+    TextLoop,
+    Degenerate,
+    StepLimit,
+    AnnouncedStep,
+    SelfSummary,
+    /// `after_step`'s note (the typecheck, the project's checks).
+    AfterStep,
+}
+
+impl NoteKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Deadline => "deadline",
+            Self::TimeLeft => "time_left",
+            Self::ToolLoop => "tool_loop",
+            Self::ReadOn => "read_on",
+            Self::CutOff => "cut_off",
+            Self::EmptyReply => "empty_reply",
+            Self::TextLoop => "text_loop",
+            Self::Degenerate => "degenerate",
+            Self::StepLimit => "step_limit",
+            Self::AnnouncedStep => "announced_step",
+            Self::SelfSummary => "self_summary",
+            Self::AfterStep => "after_step",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum LoopEvent {
     TextDelta(String),
@@ -504,7 +699,14 @@ pub enum LoopEvent {
         attempt: u32,
     },
     Done(StopReason),
-    /// The provider threw the reply away without retrying (#96: it degenerated again); an `Error` follows.
+    /// marv-rs: a note Marv gave the model, exactly as the model got it (a user message from Marv, a tool result's
+    /// footer, or a guard's result), so logs show it without inferring it. Only a record: nothing is added for it.
+    Note {
+        kind: NoteKind,
+        text: String,
+    },
+    /// The provider threw the reply away without retrying (#96: it degenerated again); an `Error` follows from the
+    /// provider. marv-rs: the loop may then go on instead (a `Retry` with cause `Degenerate`, no `Error` event).
     Discarded {
         cause: marv_core::RetryCause,
     },
@@ -602,6 +804,9 @@ pub struct AgentOptions {
     /// The person's "send now" messages, appended at the next step boundary ([`crate::send_now`]). The session sets
     /// it for the main agent only.
     pub send_now: Option<SendNow>,
+    /// marv-rs: when the run must be done (`marv -p --time-limit`): the time-left footer, the wrap-up note, and the
+    /// stop at the deadline (the module doc's "Run deadline"). None: no limit.
+    pub deadline: Option<std::time::Instant>,
 }
 
 impl AgentOptions {
@@ -631,6 +836,7 @@ impl AgentOptions {
             wrap_up_at_limit: false,
             debug_raw: false,
             send_now: None,
+            deadline: None,
         }
     }
 }
@@ -648,7 +854,11 @@ pub struct StepReply {
     pub reasoning: Option<Reasoning>,
     /// Stopped while streaming: stuck repeating itself (the rest isn't read).
     pub looped: bool,
+    /// The provider gave up on the reply for degenerating (#96): a `Discard` with cause `Degenerate`.
+    pub degenerated: bool,
     checked_at: usize,
+    /// marv-rs: text or a tool call has started streaming (the reply is acting, not only reasoning).
+    wrote: bool,
 }
 
 impl StepReply {
@@ -658,6 +868,7 @@ impl StepReply {
     pub fn apply(&mut self, event: ProviderEvent) -> Option<LoopEvent> {
         match event {
             ProviderEvent::TextDelta(text) => {
+                self.wrote = true;
                 self.text.push_str(&text);
                 if self.text.len() - self.checked_at >= TEXT_CHECK_EVERY {
                     self.checked_at = self.text.len();
@@ -673,8 +884,12 @@ impl StepReply {
                 Some(LoopEvent::ThinkingDelta(text))
             }
             ProviderEvent::Usage(usage, end) => Some(LoopEvent::Usage(usage, end)),
-            ProviderEvent::ToolCallDelta { index, name, text } => Some(LoopEvent::ToolCallDelta { index, name, text }),
+            ProviderEvent::ToolCallDelta { index, name, text } => {
+                self.wrote = true;
+                Some(LoopEvent::ToolCallDelta { index, name, text })
+            }
             ProviderEvent::ToolCall(call) => {
+                self.wrote = true;
                 self.calls.push(call);
                 None
             }
@@ -702,6 +917,7 @@ impl StepReply {
             // #96: the same, with no attempt after it (an error follows): nothing of it reaches the history.
             ProviderEvent::Discard { cause } => {
                 self.discard();
+                self.degenerated |= matches!(cause, marv_core::RetryCause::Degenerate { .. });
                 Some(LoopEvent::Discarded { cause })
             }
         }
@@ -714,6 +930,12 @@ impl StepReply {
         self.reasoned = false;
         self.reasoning = None;
         self.calls.clear();
+        self.wrote = false;
+    }
+
+    /// Nothing but reasoning has streamed so far (or nothing at all): dropping it loses no text and no call.
+    pub fn only_reasoning_so_far(&self) -> bool {
+        !self.wrote
     }
 
     pub fn cut_off(&self) -> bool {
@@ -730,6 +952,9 @@ impl StepReply {
             return StepOutcome::Empty;
         }
         if let Some(error) = &self.error {
+            if self.degenerated && !aborted {
+                return StepOutcome::Degenerate(error.clone());
+            }
             return StepOutcome::Error(error.clone());
         }
         if self.cut_off() && !aborted {
@@ -760,6 +985,9 @@ pub enum StepOutcome {
     Empty,
     /// The assistant turn (if any) goes in first, then `Error` and `Done(Error)`.
     Error(String),
+    /// marv-rs: the provider gave up on the reply for degenerating (a `Discard`, then this error): nothing of it
+    /// enters the history, and the loop goes on with [`DEGENERATE_NOTE`] (up to [`MAX_DEGENERATE_RECOVERIES`]).
+    Degenerate(String),
     CutOff,
     Tools,
     Answer,
@@ -872,6 +1100,8 @@ enum Phase {
         stream: EventStream,
         reply: StepReply,
         wrap_up: Option<String>,
+        /// This request's own stop (a child of the run's), so the deadline's wrap-up can drop just it.
+        request: CancellationToken,
     },
     Tools(Tools),
     /// The step's calls are all answered: `on_full`.
@@ -905,6 +1135,8 @@ pub struct LoopState {
     empties: u32,
     /// Text loops in a row.
     text_loops: u32,
+    /// Degenerate replies the provider gave up on that this turn went on past (#96).
+    degenerates: u32,
     /// #90: whether this run already continued an announced next step (once per turn: the
     /// first is rescued, a second announcement ends the run, still logged as an event).
     announced: bool,
@@ -929,12 +1161,36 @@ pub struct LoopState {
     sent_len: usize,
     /// Marv #63: overflow recoveries in this step (`on_overflow`'s `attempt`); reset by a step that got a reply.
     overflows: u32,
+    /// The caller's `cancel`. With a deadline, `options.cancel` is a child of it that the deadline fires too: a stop
+    /// from here is a person's (`Aborted`), one only there is the time limit (`TimeLimit`).
+    user_cancel: CancellationToken,
+    /// How long before the deadline the wrap-up note goes in ([`deadline_margin`]).
+    margin: std::time::Duration,
+    /// The wrap-up note went in (once a run).
+    deadline_warned: bool,
+    /// The last reply was cut off while only reasoning: the next requests use at most [`CUT_OFF_RETRY_EFFORT`] until a
+    /// step finishes.
+    reasoning_cut_off: bool,
+    /// A repeated truncated `read_file` reads on ([`crate::repetition::ReadPages`]).
+    read_pages: ReadPages,
 }
 
 impl LoopState {
-    pub fn new(options: AgentOptions) -> Self {
+    pub fn new(mut options: AgentOptions) -> Self {
         let used_ids = used_ids(&options.history.lock().unwrap_or_else(|e| e.into_inner()));
+        let user_cancel = options.cancel.clone();
+        let mut margin = std::time::Duration::ZERO;
+        if let Some(deadline) = options.deadline {
+            // The run's own stop: the provider and the tools get it, so the deadline stops them as ctrl+c would.
+            options.cancel = user_cancel.child_token();
+            margin = deadline_margin(deadline.saturating_duration_since(std::time::Instant::now()));
+        }
         Self {
+            user_cancel,
+            margin,
+            deadline_warned: false,
+            reasoning_cut_off: false,
+            read_pages: ReadPages::default(),
             options,
             queue: VecDeque::new(),
             finished: false,
@@ -944,6 +1200,7 @@ impl LoopState {
             cut_offs: 0,
             empties: 0,
             text_loops: 0,
+            degenerates: 0,
             announced: false,
             summarized: 0,
             tool_loop: ToolLoopState::default(),
@@ -963,8 +1220,10 @@ impl LoopState {
 
     /// Marv's notes go in as user turns, merged into a trailing one (a mid-turn compaction's note, the turn's own
     /// message): never two user turns in a row (#63 review).
-    fn push_note(&self, text: &str) {
+    /// marv-rs: each is logged as a [`LoopEvent::Note`] too.
+    fn push_note(&mut self, kind: NoteKind, text: &str) {
         crate::compact::push_user(&mut self.options.history.lock().unwrap_or_else(|e| e.into_inner()), text);
+        self.emit(LoopEvent::Note { kind, text: text.to_string() });
     }
 
     fn push_result(&self, call: &ToolCall, text: &str) {
@@ -975,11 +1234,58 @@ impl LoopState {
         self.options.cancel.is_cancelled()
     }
 
+    /// The deadline passed and the person didn't stop the run themselves.
+    fn timed_out(&self) -> bool {
+        self.options.deadline.is_some_and(|at| std::time::Instant::now() >= at) && !self.user_cancel.is_cancelled()
+    }
+
+    /// What a call that won't run after a stop is answered: the time limit's text when that was the stop.
+    fn stop_text(&self) -> &'static str {
+        if self.timed_out() { not_run::TIME_LIMIT } else { not_run::ABORTED }
+    }
+
+    /// The wrap-up note, once, at the top of the first step within the margin of the deadline.
+    fn warn_deadline(&mut self) {
+        let Some(at) = self.options.deadline else { return };
+        let left = at.saturating_duration_since(std::time::Instant::now());
+        if !self.deadline_warned && left <= self.margin {
+            self.deadline_warned = true;
+            self.push_note(NoteKind::Deadline, &deadline_note(left));
+        }
+    }
+
+    /// When a reply still streaming should be dropped for the wrap-up note: the start of the margin, while the note
+    /// hasn't gone in, the reply has only reasoned so far, and it isn't the step limit's wrap-up (tools off already).
+    fn wrap_up_at(&self, reply: &StepReply, wrap_up: bool) -> Option<std::time::Instant> {
+        // No margin (a run with no time to speak of): the deadline itself is all there is.
+        if wrap_up || self.deadline_warned || self.margin.is_zero() || !reply.only_reasoning_so_far() {
+            return None;
+        }
+        self.options.deadline.and_then(|at| at.checked_sub(self.margin))
+    }
+
+    /// The margin began while the reply only reasoned: drop this request (and only it), put the wrap-up note in, and
+    /// ask again. Nothing of the dropped reply reached the history, so the next request starts with the one before
+    /// (plus the note).
+    fn interrupt_for_deadline(&mut self, stream: EventStream, request: CancellationToken) {
+        request.cancel();
+        drop(stream);
+        self.warn_deadline();
+        self.phase = Phase::Request { tool_choice: ToolChoice::Auto, wrap_up: None };
+    }
+
     fn emit(&mut self, event: LoopEvent) {
         self.queue.push_back(event);
     }
 
     fn finish(&mut self, reason: StopReason) {
+        // A stop that only the deadline fired is the time limit, not the person.
+        let reason = if reason == StopReason::Aborted && self.timed_out() {
+            self.emit(LoopEvent::Error(TIME_LIMIT_MESSAGE.into()));
+            StopReason::TimeLimit
+        } else {
+            reason
+        };
         self.emit(LoopEvent::Done(reason));
         self.finished = true;
     }
@@ -997,7 +1303,13 @@ impl LoopState {
 
     /// Appends a call's result (in call order) and remembers it for tool-loop detection.
     fn answer(&mut self, call: &ToolCall, text: &str) {
-        self.push_result(call, text);
+        self.answer_with(call, text, "");
+    }
+
+    /// [`Self::answer`], with `footer` (the time left) after the text in the history only: the loop guards compare
+    /// the tool's own text, which a ticking clock would make look new every time.
+    fn answer_with(&mut self, call: &ToolCall, text: &str, footer: &str) {
+        self.push_result(call, &format!("{text}{footer}"));
         self.last_result.insert(Self::call_key(call), result_hash(text));
         self.failures.record(&call.name, &call.arguments, text);
         self.in_flight.answered += 1;
@@ -1012,7 +1324,24 @@ impl LoopState {
             if self.finished {
                 return None;
             }
-            self.advance().await;
+            // With a deadline, the run's stop fires at it, whatever this transition is waiting for (a reply, a tool,
+            // a hook): it then winds down as after ctrl+c, and `finish` names the time limit.
+            match self.options.deadline {
+                Some(at) if !self.options.cancel.is_cancelled() => {
+                    let stop = self.options.cancel.clone();
+                    let advance = self.advance();
+                    tokio::pin!(advance);
+                    tokio::select! {
+                        biased;
+                        () = &mut advance => {}
+                        () = tokio::time::sleep_until(at.into()) => {
+                            stop.cancel();
+                            advance.await;
+                        }
+                    }
+                }
+                _ => self.advance().await,
+            }
         }
     }
 
@@ -1024,30 +1353,52 @@ impl LoopState {
                 // The lock is never held across an await: the adapter serializes the snapshot at once.
                 let snapshot = self.options.history.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 self.sent_len = snapshot.len();
+                let request = self.options.cancel.child_token();
                 let options = StreamOptions {
                     system: Some(self.options.system.clone()),
                     tools: self.options.tools.clone(),
                     tool_choice,
-                    cancel: self.options.cancel.clone(),
+                    cancel: request.clone(),
                     debug_raw: self.options.debug_raw,
+                    // After a reply that reasoned until the output limit, the retry reasons less (the module doc).
+                    effort_cap: self.reasoning_cut_off.then_some(if self.cut_offs >= 2 {
+                        CUT_OFF_LAST_RETRY_EFFORT
+                    } else {
+                        CUT_OFF_RETRY_EFFORT
+                    }),
                 };
                 let stream = self.options.provider.stream(&snapshot, options);
-                self.phase = Phase::Streaming { stream, reply: StepReply::default(), wrap_up };
+                self.phase = Phase::Streaming { stream, reply: StepReply::default(), wrap_up, request };
             }
-            Phase::Streaming { mut stream, mut reply, wrap_up } => match stream.next().await {
-                Some(event) => {
-                    if let Some(out) = reply.apply(event) {
-                        self.emit(out);
-                    }
-                    // A reply stuck repeating itself is stopped while it streams, not after it ran its course.
-                    if reply.looped {
-                        self.decide(reply, wrap_up);
-                    } else {
-                        self.phase = Phase::Streaming { stream, reply, wrap_up };
-                    }
+            Phase::Streaming { mut stream, mut reply, wrap_up, request } => {
+                // The wrap-up time came while the reply has only reasoned: drop it and ask again with the note.
+                let warn_at = self.wrap_up_at(&reply, wrap_up.is_some());
+                if warn_at.is_some_and(|at| std::time::Instant::now() >= at) {
+                    return self.interrupt_for_deadline(stream, request);
                 }
-                None => self.decide(reply, wrap_up),
-            },
+                match next_provider_event(&mut stream, self.options.deadline, warn_at).await {
+                    // The deadline came mid-reply: drop the request (a provider that doesn't watch the stop would
+                    // otherwise keep the run going) and end with what streamed so far.
+                    Next::Deadline => {
+                        self.options.cancel.cancel();
+                        drop(stream);
+                        self.decide(reply, wrap_up);
+                    }
+                    Next::WrapUp => self.interrupt_for_deadline(stream, request),
+                    Next::Event(Some(event)) => {
+                        if let Some(out) = reply.apply(event) {
+                            self.emit(out);
+                        }
+                        // A reply stuck repeating itself is stopped while it streams, not after it ran its course.
+                        if reply.looped {
+                            self.decide(reply, wrap_up);
+                        } else {
+                            self.phase = Phase::Streaming { stream, reply, wrap_up, request };
+                        }
+                    }
+                    Next::Event(None) => self.decide(reply, wrap_up),
+                }
+            }
             Phase::Tools(mut tools) => {
                 if !self.tools(&mut tools).await {
                     self.phase = Phase::Tools(tools);
@@ -1060,8 +1411,9 @@ impl LoopState {
                 if let Some(on_full) = self.options.on_full.clone()
                     && on_full().await
                 {
-                    // A fresh history (the summary and a note): none of it was sent yet.
+                    // A fresh history (the summary and a note): none of it was sent yet, and the pages read are gone.
                     self.sent_len = 0;
+                    self.read_pages.clear();
                     self.emit(LoopEvent::Compacted);
                     if self.aborted() {
                         return self.finish(StopReason::Aborted);
@@ -1077,7 +1429,7 @@ impl LoopState {
                         return self.finish(StopReason::Aborted);
                     }
                     if let Some(note) = note {
-                        self.push_note(&note);
+                        self.push_note(NoteKind::AfterStep, &note);
                     }
                 }
                 self.next_step();
@@ -1088,6 +1440,10 @@ impl LoopState {
     /// The step limit guards against a model that never finishes. With `on_limit`, the user decides
     /// at each multiple whether it goes on. `max_steps` 0 (the guard off) never matches.
     async fn top(&mut self) {
+        if self.timed_out() {
+            return self.finish(StopReason::Aborted);
+        }
+        self.warn_deadline();
         if !at_step_limit(self.step, self.options.max_steps) {
             // The step boundary: the person's "send now" messages go in before this step's request. Only before an
             // ordinary request: at the limit they wait for a "continue", or go back to the person with the turn.
@@ -1116,7 +1472,7 @@ impl LoopState {
         let message = step_limit_message(self.step, asked);
         // #59: a hard stop first asks for a wrap-up, tools off (but still sent: the cache holds).
         if self.options.wrap_up_at_limit && !asked {
-            self.push_note(STEP_LIMIT_NOTE);
+            self.push_note(NoteKind::StepLimit, STEP_LIMIT_NOTE);
             self.phase = Phase::Request { tool_choice: ToolChoice::None, wrap_up: Some(message) };
             return;
         }
@@ -1164,7 +1520,25 @@ impl LoopState {
                 if !continued {
                     return self.finish(StopReason::Loop);
                 }
-                self.push_note(TEXT_LOOP_NOTE);
+                self.push_note(NoteKind::TextLoop, TEXT_LOOP_NOTE);
+                self.next_step();
+            }
+            // The provider gave up on a reply that degenerated twice (#96): it was discarded, so nothing of it reaches
+            // the history. Like a reasoning-only cut-off, the turn goes on with a note, a bounded number of times.
+            StepOutcome::Degenerate(message) => {
+                self.degenerates += 1;
+                if self.degenerates > MAX_DEGENERATE_RECOVERIES {
+                    self.emit(LoopEvent::Error(message));
+                    return self.finish(StopReason::Error);
+                }
+                self.emit(LoopEvent::Retry {
+                    attempt: self.degenerates,
+                    max: MAX_DEGENERATE_RECOVERIES,
+                    message: "the reply degenerated again and was thrown away; Marv told the model and goes on".into(),
+                    continued: false,
+                    cause: marv_core::RetryCause::Degenerate { discarded: 0 },
+                });
+                self.push_note(NoteKind::Degenerate, DEGENERATE_NOTE);
                 self.next_step();
             }
             // Nothing came back: no text (whitespace doesn't count) and nothing to run. Not after an
@@ -1177,7 +1551,7 @@ impl LoopState {
                 match next {
                     EmptyNext::Retry => self.next_step(),
                     EmptyNext::Nudge => {
-                        self.push_note(EMPTY_REPLY_NOTE);
+                        self.push_note(NoteKind::EmptyReply, EMPTY_REPLY_NOTE);
                         self.next_step();
                     }
                     EmptyNext::Stop => self.finish(StopReason::End),
@@ -1200,6 +1574,7 @@ impl LoopState {
                     StepOutcome::CutOff => self.cut_off(reply),
                     _ => {
                         self.cut_offs = 0;
+                        self.reasoning_cut_off = false;
                         self.run_calls(reply, aborted);
                     }
                 }
@@ -1225,13 +1600,14 @@ impl LoopState {
                 // The hook rewrote the history (as a mid-turn compaction does): none of it was carried by a request
                 // that got through, so "send now" may join its last user turn until the resend below carries it.
                 self.sent_len = 0;
+                self.read_pages.clear();
                 self.overflows += 1;
                 let tool_choice = if wrap_up.is_some() { ToolChoice::None } else { ToolChoice::Auto };
                 // The rewritten history may have lost the step limit's note: the wrap-up asks for it again.
                 if wrap_up.is_some() {
                     let last = self.options.history.lock().unwrap_or_else(|e| e.into_inner()).last().cloned();
                     if !matches!(last, Some(ChatTurn::User { text }) if text.ends_with(STEP_LIMIT_NOTE)) {
-                        self.push_note(STEP_LIMIT_NOTE);
+                        self.push_note(NoteKind::StepLimit, STEP_LIMIT_NOTE);
                     }
                 }
                 self.phase = Phase::Request { tool_choice, wrap_up };
@@ -1259,13 +1635,14 @@ impl LoopState {
         // A reply that was all reasoning did nothing: up to MAX_REASONING_CUT_OFFS in a row get another try.
         let only_reasoning = reply.reasoned && reply.text.is_empty() && reply.calls.is_empty();
         let continued = self.cut_offs == 1 || (only_reasoning && self.cut_offs <= MAX_REASONING_CUT_OFFS);
+        self.reasoning_cut_off = only_reasoning && continued;
         // The history first, so it's valid even if the consumer stops at one of the events below.
         for call in &reply.calls {
             self.push_result(call, not_run::CUT_OFF);
         }
         // With calls, their results say it; with none, the model is told directly.
         if continued && reply.calls.is_empty() {
-            self.push_note(reply.cut_off_note());
+            self.push_note(NoteKind::CutOff, reply.cut_off_note());
         }
         self.emit(LoopEvent::CutOff { continued });
         for call in reply.calls {
@@ -1277,7 +1654,6 @@ impl LoopState {
     /// Tool-loop detection, then the calls (or the end of the run, for a plain answer).
     fn run_calls(&mut self, reply: StepReply, aborted: bool) {
         let calls = reply.calls;
-        let warned = self.tool_loop.warned;
         let hit = !aborted && !calls.is_empty() && {
             let keys = calls
                 .iter()
@@ -1289,30 +1665,34 @@ impl LoopState {
                 .collect();
             tool_loop_detected(&mut self.tool_loop, keys)
         };
-        // The first time: every call is answered with the note instead of running.
-        if hit && !warned {
-            self.tool_loop.warned = true;
-            let note = tool_loop_note(self.tool_loop.history.len(), &calls[0].name);
-            for call in &calls {
-                self.push_result(call, &note);
-            }
-            self.emit(LoopEvent::ToolLoop { continued: true });
-            for call in calls {
-                self.emit(LoopEvent::ToolSkipped { call, output: note.clone() });
-            }
-            return self.next_step();
-        }
-        // The second time: stop the turn, every call answered (the history must be valid). Marv
-        // answers them with the cut-off text; kept as is.
+        // The first time every call is answered with the note (showing the call) instead of running; after the
+        // warning, with the final-turn note; after that the turn stops, every call answered (the history must be
+        // valid) with what happened (Marv: the cut-off text, which misled the model).
         if hit {
-            for call in &calls {
-                self.push_result(call, not_run::CUT_OFF);
+            // A loop that only reads costs a step and changes nothing: warned about longer before it can end the run.
+            let names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
+            let verdict = if only_reads(&names) { self.tool_loop.escalate_read_only() } else { self.tool_loop.escalate() };
+            let repeats = self.tool_loop.history.len();
+            let outputs: Vec<String> = calls
+                .iter()
+                .map(|call| match verdict {
+                    LoopVerdict::Warn => tool_loop_note(repeats, &call.name, &call.arguments),
+                    LoopVerdict::FinalChance => tool_loop_final_note(repeats, &call.name, &call.arguments),
+                    LoopVerdict::Stop => not_run::TOOL_LOOP.to_string(),
+                })
+                .collect();
+            for (call, output) in calls.iter().zip(&outputs) {
+                self.push_result(call, output);
             }
-            self.emit(LoopEvent::ToolLoop { continued: false });
-            for call in calls {
-                self.emit(LoopEvent::ToolSkipped { call, output: not_run::CUT_OFF.into() });
+            let continued = verdict != LoopVerdict::Stop;
+            self.emit(LoopEvent::ToolLoop { continued });
+            if let Some(first) = outputs.first() {
+                self.emit(LoopEvent::Note { kind: NoteKind::ToolLoop, text: first.clone() });
             }
-            return self.finish(StopReason::Loop);
+            for (call, output) in calls.into_iter().zip(outputs) {
+                self.emit(LoopEvent::ToolSkipped { call, output });
+            }
+            return if continued { self.next_step() } else { self.finish(StopReason::Loop) };
         }
         if calls.is_empty() {
             // "Send now": a message that came while this reply streamed is read by one more step, rather than left
@@ -1329,7 +1709,7 @@ impl LoopState {
                 self.summarized += 1;
                 self.emit(LoopEvent::AnnouncedStep { continued });
                 if continued {
-                    self.push_note(SELF_SUMMARY_NOTE);
+                    self.push_note(NoteKind::SelfSummary, SELF_SUMMARY_NOTE);
                     return self.next_step();
                 }
                 // Past the limit it ends the run: not also an announced step ("Let me work through…" reads as one).
@@ -1343,7 +1723,7 @@ impl LoopState {
                 self.announced = true;
                 self.emit(LoopEvent::AnnouncedStep { continued });
                 if continued {
-                    self.push_note(ANNOUNCED_STEP_NOTE);
+                    self.push_note(NoteKind::AnnouncedStep, ANNOUNCED_STEP_NOTE);
                     return self.next_step();
                 }
             }
@@ -1431,11 +1811,11 @@ impl LoopState {
     async fn tools(&mut self, tools: &mut Tools) -> bool {
         // The abort first: Esc declines what's waiting *and* aborts, and that's an interrupt, not a "no".
         let stopped = if self.aborted() {
-            Some(not_run::ABORTED)
+            Some(self.stop_text())
         } else if tools.declined {
             Some(not_run::DECLINED)
         } else if self.failure_stop {
-            Some(not_run::CUT_OFF)
+            Some(not_run::TOOL_LOOP)
         } else {
             None
         };
@@ -1464,14 +1844,19 @@ impl LoopState {
         // user quit) never sees a tool run that it can't show or stop.
         if let Some(k) = group.announced.take() {
             let call = self.in_flight.calls[group.range.start + k].clone();
-            // #81: a command that keeps failing the same way isn't run again: the note the first time, the end of
-            // the run the next (the tool-loop guard's `warned`).
+            // #81: a command that keeps failing the same way isn't run again: the note the first time, the final
+            // turn the next, then the end of the run (the tool-loop guard's escalation, shared).
             if let Some((count, shown)) = self.failures.repeated(&call.name, &call.arguments) {
-                let continued = !self.tool_loop.warned;
-                self.tool_loop.warned = true;
+                let verdict = self.tool_loop.escalate();
+                let continued = verdict != LoopVerdict::Stop;
                 self.failure_stop |= !continued;
                 self.emit(LoopEvent::ToolLoop { continued });
-                let run = not_run_record(&call, &failing_command_note(count, &shown));
+                let mut note = failing_command_note(count, &shown);
+                if verdict == LoopVerdict::FinalChance {
+                    note = format!("{note} {FINAL_TURN_NOTE}");
+                }
+                self.emit(LoopEvent::Note { kind: NoteKind::ToolLoop, text: note.clone() });
+                let run = not_run_record(&call, &note);
                 group.running.push(Box::pin(async move { (k, Ok(run)) }));
             } else {
                 let runner = self.options.runner.clone();
@@ -1480,13 +1865,28 @@ impl LoopState {
                 // it does, and if the call passes now it should run), but the same refusal again is answered with
                 // the direct note: the arguments are what's wrong, and another identical try won't change that.
                 let refused_before = self.invalid.get(&Self::call_key(&call)).cloned();
+                // marv-rs: the same truncated read again reads on: the runner gets the call with the next page's
+                // offset (the history keeps the model's own bytes), and the result says so.
+                let mut call = call;
+                let read_on = self.read_pages.next(&call.name, &call.arguments).and_then(|offset| {
+                    let arguments = with_offset(&call.arguments, offset)?;
+                    call.arguments = arguments;
+                    Some(read_on_note(offset))
+                });
+                if let Some(note) = &read_on {
+                    self.emit(LoopEvent::Note { kind: NoteKind::ReadOn, text: note.trim_end().to_string() });
+                }
                 group.running.push(Box::pin(async move {
                     let mut result = runner.run(call, cancel).await;
-                    if let Ok(run) = &mut result
-                        && run.invalid.is_some()
-                        && run.invalid == refused_before
-                    {
-                        run.result.output = refused_call_note(run.invalid.as_deref().unwrap_or_default());
+                    if let Ok(run) = &mut result {
+                        if run.invalid.is_some() && run.invalid == refused_before {
+                            run.result.output = refused_call_note(run.invalid.as_deref().unwrap_or_default());
+                        } else if let Some(note) = read_on
+                            && run.invalid.is_none()
+                            && !run.result.is_error
+                        {
+                            run.result.output = format!("{note}{}", run.result.output);
+                        }
                     }
                     (k, result)
                 }));
@@ -1507,7 +1907,22 @@ impl LoopState {
                 if let Some(reason) = &run.invalid {
                     self.invalid.insert(Self::call_key(&call), reason.clone());
                 }
-                self.answer(&call, &run.result.output);
+                // Progress for the tool-loop guard: a call that ran and succeeded (not a guard's "not run" note).
+                if run.invalid.is_none()
+                    && !run.result.is_error
+                    && !run.declined
+                    && run.result.summary.as_deref() != Some("not run")
+                {
+                    self.tool_loop.progressed(make_tool_key(&call.name, &call.arguments));
+                }
+                if run.result.summary.as_deref() != Some("not run") && !run.declined {
+                    self.read_pages.record(&call.name, &call.arguments, &run.result.output);
+                }
+                let footer = time_left_note(self.options.deadline);
+                self.answer_with(&call, &run.result.output, &footer);
+                if !footer.is_empty() {
+                    self.emit(LoopEvent::Note { kind: NoteKind::TimeLeft, text: footer.trim().to_string() });
+                }
                 tools.runs.push(run);
             }
             return false;
@@ -1596,13 +2011,43 @@ impl LoopState {
     }
 }
 
+/// What came first while a reply streams.
+enum Next {
+    Event(Option<ProviderEvent>),
+    /// The run's deadline.
+    Deadline,
+    /// The start of the wrap-up margin, for a reply that has only reasoned ([`LoopState::wrap_up_at`]).
+    WrapUp,
+}
+
+/// The provider's next event, or the deadline or the wrap-up time, whichever comes first.
+async fn next_provider_event(
+    stream: &mut EventStream,
+    deadline: Option<std::time::Instant>,
+    wrap_up: Option<std::time::Instant>,
+) -> Next {
+    let until = |at: Option<std::time::Instant>| async move {
+        match at {
+            Some(at) => tokio::time::sleep_until(at.into()).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        biased;
+        event = stream.next() => Next::Event(event),
+        () = until(deadline) => Next::Deadline,
+        () = until(wrap_up) => Next::WrapUp,
+    }
+}
+
 impl Drop for LoopState {
     /// The consumer stopped mid-tools (it dropped the stream): the calls without a result would
     /// leave the history invalid and the API would reject every request from now on.
     fn drop(&mut self) {
         let InFlight { calls, answered } = std::mem::take(&mut self.in_flight);
+        let text = self.stop_text();
         for call in calls.into_iter().skip(answered) {
-            self.push_turn(ChatTurn::Tool { call_id: call.id, name: call.name, text: not_run::ABORTED.into() });
+            self.push_turn(ChatTurn::Tool { call_id: call.id, name: call.name, text: text.into() });
         }
     }
 }
@@ -1757,7 +2202,9 @@ mod tests {
         assert_eq!(reply.text, "");
         assert!(reply.calls.is_empty());
         assert!(events.iter().any(|e| matches!(e, LoopEvent::Discarded { .. })));
-        assert_eq!(reply.outcome(false), StepOutcome::Error("degenerated again".into()));
+        // marv-rs: the loop goes on past it (a bounded number of times); an interrupt is still an error.
+        assert_eq!(reply.outcome(false), StepOutcome::Degenerate("degenerated again".into()));
+        assert_eq!(reply.outcome(true), StepOutcome::Error("degenerated again".into()));
     }
 
     #[test]
@@ -1846,7 +2293,25 @@ mod tests {
 
     #[test]
     fn tool_loop_note_counts_the_repeats() {
-        assert!(tool_loop_note(4, "read_file").starts_with("Marv: you have made this exact call 4 times in a row"));
+        assert!(tool_loop_note(4, "read_file", "{}").starts_with("Marv: you have made this exact call 4 times in a row"));
+    }
+
+    #[test]
+    fn tool_loop_note_shows_the_exact_call_and_what_it_lacks() {
+        // TB 0.15.0: the model meant to pass offset=401 and kept sending only the path.
+        let note = tool_loop_note(3, "read_file", r#"{"path": "src/app.py"}"#);
+        assert!(note.contains(r#"`read_file {"path": "src/app.py"}`"#), "{note}");
+        assert!(note.contains("You sent no offset") && note.contains("pass offset"), "{note}");
+        // With an offset there's nothing to point out.
+        let paged = tool_loop_note(3, "read_file", r#"{"path": "a", "offset": 401}"#);
+        assert!(!paged.contains("no offset"), "{paged}");
+        assert!(!tool_loop_note(3, "grep", r#"{"pattern": "x"}"#).contains("offset"));
+        // Long arguments are cut, on a char boundary.
+        let long = format!(r#"{{"command": "{}"}}"#, "é".repeat(1000));
+        let note = tool_loop_note(3, "bash", &long);
+        assert!(note.contains("…`") && note.len() < 1000, "{}", note.len());
+        let last = tool_loop_final_note(5, "read_file", r#"{"path": "a"}"#);
+        assert!(last.starts_with("Marv: not run.") && last.contains("final turn") && last.contains("no offset"), "{last}");
     }
 
     // The loop itself, against the scripted provider and a fake runner (tests/agent.test.ts).
@@ -2596,6 +3061,26 @@ mod tests {
         let events = collect(options(provider, &h, plain())).await;
         assert_eq!(cut_offs(&events), [true, true]);
         assert_eq!(end(&events), Some(StopReason::End));
+    }
+
+    #[tokio::test]
+    async fn after_a_reply_cut_off_while_only_reasoning_the_retry_reasons_less_until_a_step_finishes() {
+        // TB 2026-11-06 dna-insert: three 64k-token reasoning-only replies in a row, about 400 s each.
+        let thinking = || cut_off(vec![ProviderEvent::ThinkingDelta("Let me reconsider the primers…".into())]);
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            thinking(),
+            thinking(),
+            use_tools(&[call("c1", "a.ts")]),
+            cut_off(vec![ProviderEvent::TextDelta("Here is the fi".into())]),
+            say("Done."),
+        ]));
+        let events = collect(options(provider.clone(), &history(vec![user("go")]), plain())).await;
+        assert_eq!(end(&events), Some(StopReason::End));
+        let caps: Vec<_> = provider.requests().iter().map(|(_, o)| o.effort_cap).collect();
+        let (high, low) = (Some(CUT_OFF_RETRY_EFFORT), Some(CUT_OFF_LAST_RETRY_EFFORT));
+        // A second in a row goes lower still; a cut-off that wrote text isn't reasoning too much: no cap after it.
+        assert_eq!(caps, [None, high, low, None, None]);
+        assert_eq!(notes(&events, NoteKind::CutOff).len(), 3);
     }
 
     #[tokio::test]
@@ -3694,6 +4179,66 @@ mod tests {
         assert_eq!(end(&events), Some(StopReason::End));
     }
 
+    // marv-rs: a reply the provider gave up on for degenerating twice (#96).
+
+    fn degenerated() -> Vec<ProviderEvent> {
+        vec![
+            ProviderEvent::ThinkingDelta("####\n####\n".into()),
+            ProviderEvent::Discard { cause: marv_core::RetryCause::Degenerate { discarded: 16_384 } },
+            ProviderEvent::Error("openrouter: the model's reply degenerated again".into()),
+        ]
+    }
+    fn degenerate_retries(events: &[LoopEvent]) -> Vec<(u32, u32)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                LoopEvent::Retry { attempt, max, cause: marv_core::RetryCause::Degenerate { .. }, .. } => Some((*attempt, *max)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_reply_the_provider_gave_up_on_for_degenerating_is_not_the_end_of_the_run() {
+        // TB 0.15.0 gcode-to-text: rendered '#' art in the reasoning, cut twice, and the run ended with 8 minutes left.
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            use_tools(&[call("c1", "a.ts")]),
+            degenerated(),
+            use_tools(&[call("c2", "out.txt")]),
+            say("Done."),
+        ]));
+        let history = history(vec![user("go")]);
+        let events = collect(options(provider.clone(), &history, plain())).await;
+        assert!(!events.iter().any(|e| matches!(e, LoopEvent::Error(_))), "{events:?}");
+        assert_eq!(degenerate_retries(&events), [(1, MAX_DEGENERATE_RECOVERIES)]);
+        assert_eq!(end(&events), Some(StopReason::End));
+        // Nothing of the degenerate reply reached the history; the model was told after the last tool result.
+        let requests = provider.requests();
+        let after = &requests[2].0;
+        assert_eq!(after[after.len() - 2..], [tool("c1", "contents of a.ts"), user(DEGENERATE_NOTE)]);
+        assert!(!format!("{:?}", snapshot(&history)).contains("####"));
+        assert_eq!(count(&events, |e| matches!(e, LoopEvent::ToolEnd { .. })), 2);
+    }
+
+    #[tokio::test]
+    async fn degenerate_replies_past_the_recoveries_end_the_run_with_the_providers_error() {
+        let script = (0..=MAX_DEGENERATE_RECOVERIES).map(|_| degenerated()).collect();
+        let provider = Arc::new(ScriptedProvider::new(script));
+        let events = collect(options(provider.clone(), &history(vec![user("go")]), plain())).await;
+        assert_eq!(degenerate_retries(&events), [(1, 2), (2, 2)]);
+        assert_eq!(provider.requests().len() as u32, MAX_DEGENERATE_RECOVERIES + 1);
+        assert!(events.iter().any(|e| matches!(e, LoopEvent::Error(m) if m.contains("degenerated again"))));
+        assert_eq!(end(&events), Some(StopReason::Error));
+    }
+
+    #[tokio::test]
+    async fn another_provider_error_still_ends_the_run() {
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![ProviderEvent::Error("401 unauthorized".into())]]));
+        let events = collect(options(provider, &history(vec![user("go")]), plain())).await;
+        assert!(degenerate_retries(&events).is_empty());
+        assert_eq!(end(&events), Some(StopReason::Error));
+    }
+
     // Tool loop detection.
 
     fn read_call(id: &str, path: &str, extra: serde_json::Value) -> ToolCall {
@@ -3713,14 +4258,204 @@ mod tests {
             .collect()
     }
 
+    /// A call with side effects (not one of `repetition::READ_ONLY_TOOLS`, not a write tool that resets the history).
+    fn side_call(id: &str, path: &str) -> ToolCall {
+        ToolCall { id: id.into(), name: "process".into(), arguments: serde_json::json!({ "path": path }).to_string() }
+    }
+
     #[tokio::test]
-    async fn period_1_the_same_call_with_the_same_result_warns_on_the_4th_and_stops_on_the_5th() {
+    async fn period_1_the_same_call_with_the_same_result_warns_on_the_4th_final_turn_on_the_5th_stops_on_the_6th() {
         // A call counts as a repeat when it also got the same result as last time, which the first call
         // can't have: calls 2, 3 and 4 are the three identical entries.
-        let script = (1..=5).map(|i| use_tools(&[read_call(&format!("c{i}"), "a.ts", serde_json::json!({}))])).collect();
-        let events = collect(options(Arc::new(ScriptedProvider::new(script)), &history(vec![user("go")]), plain())).await;
-        assert_eq!(tool_loops(&events), [true, false]);
+        let script = (1..=6).map(|i| use_tools(&[side_call(&format!("c{i}"), "a.ts")])).collect();
+        let history = history(vec![user("go")]);
+        let events = collect(options(Arc::new(ScriptedProvider::new(script)), &history, plain())).await;
+        assert_eq!(tool_loops(&events), [true, true, false]);
         assert_eq!(end(&events), Some(StopReason::Loop));
+        let texts = tool_texts(&history);
+        assert!(
+            texts[3].starts_with("Marv: you have made this exact call") && texts[3].contains(r#"process {"path":"a.ts"}"#),
+            "{}",
+            texts[3]
+        );
+        assert!(texts[4].contains("final turn"), "{}", texts[4]);
+        // Marv answered these with the cut-off text ("your reply hit the output limit"), which wasn't true.
+        assert_eq!(texts[5], not_run::TOOL_LOOP);
+        assert!(!texts.iter().any(|t| t == not_run::CUT_OFF));
+    }
+
+    #[tokio::test]
+    async fn the_final_turn_after_a_loop_can_save_the_work_and_answer() {
+        // TB 0.15.0: the run had the fix but not yet the report the task asked for when the guard ended it.
+        let read = |id: &str| use_tools(&[read_call(id, "a.py", serde_json::json!({}))]);
+        let write = ToolCall {
+            id: "w".into(),
+            name: "write_file".into(),
+            arguments: serde_json::json!({"path": "report.txt", "content": "fixed"}).to_string(),
+        };
+        let script =
+            vec![read("c1"), read("c2"), read("c3"), read("c4"), read("c5"), use_tools(&[write]), say("Done: report.txt.")];
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        let record = ran.clone();
+        let run: RunFn = Arc::new(move |c, _| {
+            record.lock().unwrap().push(c.name.clone());
+            Box::pin(async move { Ok(ok("same text", c.id.clone())) })
+        });
+        let events = collect(options(
+            Arc::new(ScriptedProvider::new(script)),
+            &history(vec![user("go")]),
+            FakeRunner { run, parallel: |_| false },
+        ))
+        .await;
+        assert_eq!(tool_loops(&events), [true, true]);
+        assert_eq!(ran.lock().unwrap().last().map(String::as_str), Some("write_file"));
+        assert_eq!(end(&events), Some(StopReason::End));
+    }
+
+    #[tokio::test]
+    async fn progress_after_a_warning_means_a_later_unrelated_loop_is_warned_about_again() {
+        // Marv never reset `warned`: one early warning made any later loop end the run without a word.
+        let read = |id: String, path: &str| use_tools(&[read_call(&id, path, serde_json::json!({}))]);
+        let mut script: Vec<_> = (1..=4).map(|i| read(format!("a{i}"), "a.ts")).collect();
+        // Genuine progress: distinct calls that ran and succeeded.
+        script.extend((0..crate::repetition::TOOL_LOOP_PROGRESS).map(|i| read(format!("p{i}"), &format!("f{i}.ts"))));
+        script.extend((1..=4).map(|i| read(format!("b{i}"), "b.ts")));
+        script.push(say("Done."));
+        let events = collect(options(Arc::new(ScriptedProvider::new(script)), &history(vec![user("go")]), plain())).await;
+        // Two warnings, never a stop or a final turn.
+        assert_eq!(tool_loops(&events), [true, true]);
+        assert_eq!(end(&events), Some(StopReason::End));
+    }
+
+    #[tokio::test]
+    async fn without_progress_a_later_loop_gets_the_final_turn_not_another_warning() {
+        let side = |id: String, path: &str| use_tools(&[side_call(&id, path)]);
+        let mut script: Vec<_> = (1..=4).map(|i| side(format!("a{i}"), "a.ts")).collect();
+        script.extend((1..=4).map(|i| side(format!("b{i}"), "b.ts")));
+        script.push(say("Done."));
+        let history = history(vec![user("go")]);
+        let events = collect(options(Arc::new(ScriptedProvider::new(script)), &history, plain())).await;
+        assert_eq!(tool_loops(&events), [true, true]);
+        assert!(tool_texts(&history)[7].contains("final turn"));
+    }
+
+    fn notes(events: &[LoopEvent], kind: NoteKind) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                LoopEvent::Note { kind: k, text } if *k == kind => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_read_only_loop_is_warned_about_five_times_and_only_a_truly_stuck_one_ends_the_run() {
+        // TB 2026-11-06 schemelike-metacircular-eval: warn, final turn, stop in three steps, 22 s into 40 minutes.
+        let script = (1..=10).map(|i| use_tools(&[read_call(&format!("c{i}"), "a.ts", serde_json::json!({}))])).collect();
+        let history = history(vec![user("go")]);
+        let events = collect(options(Arc::new(ScriptedProvider::new(script)), &history, plain())).await;
+        assert_eq!(tool_loops(&events), [true, true, true, true, true, true, false]);
+        assert_eq!(end(&events), Some(StopReason::Loop));
+        let texts = tool_texts(&history);
+        assert!(texts[3..8].iter().all(|t| t.starts_with("Marv: you have made this exact call") && !t.contains("final turn")));
+        assert!(texts[8].contains("final turn"), "{}", texts[8]);
+        // Each guard note is logged as it was given.
+        assert_eq!(notes(&events, NoteKind::ToolLoop), texts[3..10]);
+    }
+
+    #[tokio::test]
+    async fn a_read_only_loop_the_model_breaks_out_of_never_ends_the_run() {
+        let read = |i: usize| use_tools(&[read_call(&format!("c{i}"), "a.ts", serde_json::json!({}))]);
+        let mut script: Vec<_> = (1..=8).map(read).collect();
+        script.push(use_tools(&[read_call("d", "b.ts", serde_json::json!({}))]));
+        script.push(say("Done."));
+        let events = collect(options(Arc::new(ScriptedProvider::new(script)), &history(vec![user("go")]), plain())).await;
+        assert_eq!(tool_loops(&events), [true; 5]);
+        assert_eq!(end(&events), Some(StopReason::End));
+    }
+
+    /// `read_file` on a 586-line file, as marv-tools renders its pages (Marv's text).
+    fn interp_page(call: &ToolCall) -> String {
+        let offset = arg(call, "offset").as_u64().unwrap_or(1);
+        if offset == 1 {
+            "    1→#!/usr/bin/env python3\n  400→    return env\n\n(Showing lines 1-400 of 586. Use offset=401 to read more.)"
+                .into()
+        } else {
+            format!("  {offset}→def main():\n  586→    main()\n\n(Showing lines {offset}-586 of 586.)")
+        }
+    }
+
+    #[tokio::test]
+    async fn the_schemelike_sequence_a_repeated_truncated_read_gets_the_next_page_and_the_run_goes_on() {
+        // TB 2026-11-06 schemelike-metacircular-eval: `ls` and `read_file interp.py` (lines 1-400 of 586), then the
+        // same `read_file {"path": "interp.py"}` four more times, the reasoning saying "I need offset=401" each time.
+        let read = |id: &str| ToolCall { id: id.into(), name: "read_file".into(), arguments: r#"{"path": "interp.py"}"#.into() };
+        let ls = ToolCall { id: "ls".into(), name: "bash".into(), arguments: r#"{"command": "ls -la /app"}"#.into() };
+        let write = ToolCall {
+            id: "w".into(),
+            name: "write_file".into(),
+            arguments: r#"{"path": "eval.scm", "content": "(define (eval e) e)"}"#.into(),
+        };
+        let script = vec![
+            use_tools(&[ls, read("r1")]),
+            use_tools(&[read("r2")]),
+            use_tools(&[read("r3")]),
+            use_tools(&[read("r4")]),
+            use_tools(&[read("r5")]),
+            use_tools(&[write]),
+            say("Wrote eval.scm."),
+        ];
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        let record = ran.clone();
+        let run: RunFn = Arc::new(move |c, _| {
+            record.lock().unwrap().push((c.name.clone(), c.arguments.clone()));
+            let output = if c.name == "read_file" { interp_page(&c) } else { "ok".to_string() };
+            Box::pin(async move { Ok(ok(output, c.id.clone())) })
+        });
+        let provider = Arc::new(ScriptedProvider::new(script));
+        let history = history(vec![user("Write eval.scm, an evaluator for interp.py's language.")]);
+        let events = collect(options(provider.clone(), &history, FakeRunner { run, parallel: |_| false })).await;
+        // Never stopped: the deliverable got written and the run ended on its answer.
+        assert_eq!(end(&events), Some(StopReason::End), "{events:?}");
+        assert!(tool_loops(&events).iter().all(|c| *c));
+        let ran = ran.lock().unwrap().clone();
+        assert_eq!(ran.last().map(|(n, _)| n.as_str()), Some("write_file"));
+        // The first repeat read on from line 401, and its result says so (and where to go from there).
+        let texts = tool_texts(&history);
+        assert!(texts[1].ends_with("Use offset=401 to read more.)"));
+        assert!(texts[2].starts_with(&read_on_note(401)) && texts[2].contains("(Showing lines 401-586 of 586.)"), "{}", texts[2]);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&ran[2].1).unwrap()["offset"], 401);
+        assert_eq!(notes(&events, NoteKind::ReadOn).len(), 2, "pages 401+ twice: r2 and r4");
+        // The history keeps the call exactly as the model sent it (the prompt cache, and the record of what it did).
+        let sent: Vec<String> = snapshot(&history)
+            .into_iter()
+            .flat_map(|t| match t {
+                ChatTurn::Assistant { tool_calls, .. } => tool_calls.into_iter().map(|c| c.arguments).collect(),
+                _ => vec![],
+            })
+            .filter(|a| a.contains("interp.py"))
+            .collect();
+        assert_eq!(sent, vec![r#"{"path": "interp.py"}"#; 5]);
+        // Every request starts with the one before.
+        let requests = provider.requests();
+        assert!(requests.windows(2).all(|w| w[1].0.starts_with(&w[0].0)));
+    }
+
+    #[tokio::test]
+    async fn a_read_after_a_change_is_not_moved_on() {
+        let read = |id: &str| ToolCall { id: id.into(), name: "read_file".into(), arguments: r#"{"path": "interp.py"}"#.into() };
+        let edit = ToolCall { id: "e".into(), name: "edit_file".into(), arguments: r#"{"path": "interp.py"}"#.into() };
+        let script = vec![use_tools(&[read("r1")]), use_tools(&[edit]), use_tools(&[read("r2")]), say("Done.")];
+        let run: RunFn = Arc::new(move |c, _| {
+            let output = if c.name == "read_file" { interp_page(&c) } else { "ok".to_string() };
+            Box::pin(async move { Ok(ok(output, c.id.clone())) })
+        });
+        let history = history(vec![user("go")]);
+        let events =
+            collect(options(Arc::new(ScriptedProvider::new(script)), &history, FakeRunner { run, parallel: |_| false })).await;
+        assert!(notes(&events, NoteKind::ReadOn).is_empty());
+        assert!(tool_texts(&history)[2].starts_with("    1→"));
     }
 
     // #267: repeated calls that failed validation.
@@ -3795,8 +4530,8 @@ mod tests {
         let script = (1..=6).map(|i| use_tools(&[herdr_call(&format!("c{i}"), bad.clone())])).collect();
         let history = history(vec![user("go")]);
         let events = collect(options(Arc::new(ScriptedProvider::new(script)), &history, validating_runner(Arc::default()))).await;
-        assert_eq!(tool_loops(&events), [true, false]);
-        assert_eq!(end(&events), Some(StopReason::Loop));
+        assert_eq!(tool_loops(&events), [true, true]);
+        assert_eq!(end(&events), Some(StopReason::End)); // the script ran out during the final turn
         let texts = tool_texts(&history);
         assert!(texts[1..4].iter().all(|t| t.starts_with("Marv: not run. This exact call was refused")), "{texts:?}");
         assert!(texts[4].starts_with("Marv: you have made this exact call"), "{}", texts[4]);
@@ -3817,8 +4552,7 @@ mod tests {
         let events =
             collect(options(Arc::new(ScriptedProvider::new(script)), &history, FakeRunner { run: failing, parallel: |_| false }))
                 .await;
-        assert_eq!(tool_loops(&events), [true, false]);
-        assert_eq!(end(&events), Some(StopReason::Loop));
+        assert_eq!(tool_loops(&events), [true, true]);
         let texts = tool_texts(&history);
         assert_eq!(texts[..3], ["ENOENT: a.ts", "ENOENT: a.ts", "ENOENT: a.ts"]);
         assert!(texts[3].starts_with("Marv: you have made this exact call 4 times in a row"), "{}", texts[3]);
@@ -3896,7 +4630,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_command_failing_the_same_way_with_another_tail_each_time_warns_then_stops() {
-        let tails = ["2>&1 | tail -2", "&& du -sh y", "|| true", "&& command -v tokei", "; ls"];
+        let tails = ["2>&1 | tail -2", "&& du -sh y", "|| true", "&& command -v tokei", "; ls", "; pwd"];
         let mut script: Vec<_> =
             tails.iter().enumerate().map(|(i, t)| use_tools(&[bash_call(&format!("c{i}"), &format!("{CLONE} {t}"))])).collect();
         // A probe in between doesn't hide it.
@@ -3904,15 +4638,18 @@ mod tests {
         let ran = Arc::new(AtomicUsize::new(0));
         let history = history(vec![user("go")]);
         let events = collect(options(Arc::new(ScriptedProvider::new(script)), &history, offline(ran.clone()))).await;
-        assert_eq!(tool_loops(&events), [true, false]);
+        assert_eq!(tool_loops(&events), [true, true, false]);
         assert_eq!(end(&events), Some(StopReason::Loop));
-        // The two clones and the probe ran; the third clone got the note, the fourth stopped the run.
+        // The two clones and the probe ran; the third clone got the note, the fourth the final turn, the fifth
+        // stopped the run.
         assert_eq!(ran.load(Ordering::SeqCst), 3);
         let turns = history.lock().unwrap();
         let noted = turns.iter().any(|t| {
             matches!(t, ChatTurn::Tool { text, .. } if text.starts_with("Marv: not run. This command already failed 2 times"))
         });
         assert!(noted, "{turns:?}");
+        let final_turn = turns.iter().any(|t| matches!(t, ChatTurn::Tool { text, .. } if text.contains("final turn")));
+        assert!(final_turn, "{turns:?}");
     }
 
     // Greptile on #111: each call is checked when it's about to run, after the calls before it in the reply.
@@ -4277,5 +5014,229 @@ mod tests {
         assert_eq!(count(&events, |e| matches!(e, LoopEvent::SentNow { .. })), 1);
         assert_eq!(end(&events), Some(StopReason::End));
         assert!(q.close().is_empty());
+    }
+
+    // marv-rs: the run's deadline (`marv -p --time-limit`), the module doc's "Run deadline".
+
+    #[test]
+    fn the_deadline_margin_is_a_quarter_of_the_budget_at_most_90_s() {
+        assert_eq!(deadline_margin(Duration::from_secs(120)), Duration::from_secs(30));
+        assert_eq!(deadline_margin(Duration::from_secs(600)), DEADLINE_WRAP_UP_MAX);
+        assert_eq!(deadline_margin(Duration::ZERO), Duration::ZERO);
+        let soon = std::time::Instant::now() + Duration::from_secs(300);
+        assert!(time_left_note(Some(soon)).starts_with("\n[time left in this run: 4m 5"), "{}", time_left_note(Some(soon)));
+        assert_eq!(time_left_note(None), "");
+        assert!(deadline_note(Duration::from_secs(42)).contains("About 42 s are left"));
+    }
+
+    fn notes_in(turns: &[ChatTurn]) -> usize {
+        turns
+            .iter()
+            .filter(|t| matches!(t, ChatTurn::User { text } if text.contains("before the time limit stops this run")))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn near_the_deadline_the_model_is_told_once_and_every_result_says_the_time_left() {
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            use_tools(&[call("c1", "a.ts")]),
+            use_tools(&[call("c2", "b.ts")]),
+            say("Saved."),
+        ]));
+        let h = history(vec![user("go")]);
+        let mut o = options(provider.clone(), &h, plain());
+        o.deadline = Some(std::time::Instant::now() + Duration::from_secs(60));
+        let mut state = LoopState::new(o);
+        // A margin wider than the time left: the first step is already within it (a real run reaches it later).
+        state.margin = Duration::from_secs(120);
+        let mut events = Vec::new();
+        while let Some(event) = state.next_event().await {
+            events.push(event);
+        }
+        assert_eq!(end(&events), Some(StopReason::End));
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 3);
+        // In from the first request on, once, appended (each request starts with the one before: the cache holds).
+        assert!(requests.iter().all(|(turns, _)| notes_in(turns) == 1));
+        assert!(requests[1].0.starts_with(&requests[0].0) && requests[2].0.starts_with(&requests[1].0));
+        assert!(requests.iter().all(|(_, o)| o.tool_choice == ToolChoice::Auto), "tools stay on: saving takes a call");
+        // Every tool's result (read_file here, not only bash) ends with the time left.
+        let texts = tool_texts(&h);
+        assert_eq!(texts.len(), 2);
+        for (text, path) in texts.iter().zip(["a.ts", "b.ts"]) {
+            assert!(text.starts_with(&format!("contents of {path}\n[time left in this run: 0m 5")), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn without_a_deadline_there_is_no_note_and_no_footer() {
+        let provider = Arc::new(ScriptedProvider::new(vec![use_tools(&[call("c1", "a.ts")]), say("Done.")]));
+        let h = history(vec![user("go")]);
+        let events = collect(options(provider.clone(), &h, plain())).await;
+        assert_eq!(end(&events), Some(StopReason::End));
+        assert_eq!(tool_texts(&h), ["contents of a.ts"]);
+        assert!(provider.requests().iter().all(|(turns, _)| notes_in(turns) == 0));
+    }
+
+    #[tokio::test]
+    async fn the_deadline_note_and_the_time_left_footers_are_logged_as_the_model_got_them() {
+        let provider = Arc::new(ScriptedProvider::new(vec![use_tools(&[call("c1", "a.ts")]), say("Saved.")]));
+        let h = history(vec![user("go")]);
+        let mut o = options(provider, &h, plain());
+        o.deadline = Some(std::time::Instant::now() + Duration::from_secs(60));
+        let mut state = LoopState::new(o);
+        state.margin = Duration::from_secs(120);
+        let mut events = Vec::new();
+        while let Some(event) = state.next_event().await {
+            events.push(event);
+        }
+        let deadline = notes(&events, NoteKind::Deadline);
+        assert_eq!(deadline.len(), 1);
+        assert!(matches!(snapshot(&h)[0].clone(), ChatTurn::User { text } if text.ends_with(&deadline[0])));
+        let footers = notes(&events, NoteKind::TimeLeft);
+        assert_eq!(footers.len(), 1);
+        assert!(tool_texts(&h)[0].ends_with(&footers[0]), "{footers:?}");
+    }
+
+    /// The first request reasons and never ends (ignoring its stop, as a slow provider might); later ones answer.
+    struct ReasonsForever {
+        requests: Mutex<Vec<(Vec<ChatTurn>, CancellationToken)>>,
+        first: Vec<ProviderEvent>,
+    }
+    impl Provider for ReasonsForever {
+        fn name(&self) -> &str {
+            "reasons-forever"
+        }
+        fn context_length(&self) -> Option<u64> {
+            None
+        }
+        fn stream(&self, history: &[ChatTurn], options: StreamOptions) -> EventStream {
+            let mut requests = self.requests.lock().unwrap();
+            requests.push((history.to_vec(), options.cancel));
+            if requests.len() == 1 {
+                Box::pin(futures::stream::iter(self.first.clone()).chain(futures::stream::pending()))
+            } else {
+                Box::pin(futures::stream::iter(say("Saved; done.")))
+            }
+        }
+    }
+
+    async fn run_to_the_margin(first: Vec<ProviderEvent>) -> (Arc<ReasonsForever>, History, Vec<LoopEvent>) {
+        let provider = Arc::new(ReasonsForever { requests: Mutex::default(), first });
+        let h = history(vec![user("go")]);
+        let mut o =
+            AgentOptions::new(provider.clone(), h.clone(), "S".into(), specs(), Arc::new(plain()), CancellationToken::new());
+        o.deadline = Some(std::time::Instant::now() + Duration::from_millis(1500));
+        let mut state = LoopState::new(o);
+        // The margin starts 0.2 s in.
+        state.margin = Duration::from_millis(1300);
+        let events = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut events = Vec::new();
+            while let Some(event) = state.next_event().await {
+                events.push(event);
+            }
+            events
+        })
+        .await
+        .expect("the run ended");
+        (provider, h, events)
+    }
+
+    #[tokio::test]
+    async fn a_reply_still_only_reasoning_when_the_margin_starts_is_dropped_and_asked_again_with_the_note() {
+        // TB 2026-11-06 dna-insert: the last request started 317 s before the deadline and reasoned until it.
+        let (provider, h, events) = run_to_the_margin(vec![ProviderEvent::ThinkingDelta("Let me reconsider…".into())]).await;
+        assert_eq!(end(&events), Some(StopReason::End));
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].1.is_cancelled(), "only the dropped request was stopped");
+        assert!(!requests[1].1.is_cancelled());
+        // The second request is the first plus the note (nothing of the dropped reply), and the note is logged.
+        assert_eq!(notes_in(&requests[0].0), 0);
+        assert_eq!(notes_in(&requests[1].0), 1);
+        assert_eq!(notes(&events, NoteKind::Deadline).len(), 1);
+        assert!(!format!("{:?}", snapshot(&h)).contains("reconsider"));
+        assert!(events.iter().any(|e| matches!(e, LoopEvent::Assistant { text } if text == "Saved; done.")));
+    }
+
+    #[tokio::test]
+    async fn a_reply_already_writing_when_the_margin_starts_is_left_to_finish() {
+        // Its text (or the call saving the deliverable) would be lost: the deadline itself still stops it.
+        let (provider, _h, events) = run_to_the_margin(vec![ProviderEvent::TextDelta("Writing the report".into())]).await;
+        assert_eq!(end(&events), Some(StopReason::TimeLimit));
+        assert_eq!(provider.requests.lock().unwrap().len(), 1);
+        assert!(notes(&events, NoteKind::Deadline).is_empty());
+    }
+
+    /// A reply that streams a little, then never ends (and ignores the stop), as a model deep in reasoning would.
+    struct Hanging;
+    impl Provider for Hanging {
+        fn name(&self) -> &str {
+            "hanging"
+        }
+        fn context_length(&self) -> Option<u64> {
+            None
+        }
+        fn stream(&self, _history: &[ChatTurn], _options: StreamOptions) -> EventStream {
+            let start = futures::stream::iter(vec![ProviderEvent::TextDelta("Writing the report".into())]);
+            Box::pin(start.chain(futures::stream::pending()))
+        }
+    }
+
+    #[tokio::test]
+    async fn at_the_deadline_a_reply_in_flight_is_dropped_and_the_run_ends_time_limit() {
+        let h = history(vec![user("go")]);
+        let mut o =
+            AgentOptions::new(Arc::new(Hanging), h.clone(), "S".into(), specs(), Arc::new(plain()), CancellationToken::new());
+        o.deadline = Some(std::time::Instant::now() + Duration::from_millis(300));
+        let events = tokio::time::timeout(Duration::from_secs(10), collect(o)).await.expect("the run ended at its deadline");
+        assert_eq!(end(&events), Some(StopReason::TimeLimit));
+        assert!(events.iter().any(|e| matches!(e, LoopEvent::Error(m) if m == TIME_LIMIT_MESSAGE)));
+        // What streamed so far is kept, so `marv -p` has a reply to print.
+        assert!(events.iter().any(|e| matches!(e, LoopEvent::Assistant { text } if text == "Writing the report")));
+        assert_eq!(snapshot(&h).last(), Some(&said("Writing the report")));
+    }
+
+    #[tokio::test]
+    async fn at_the_deadline_running_tools_are_stopped_and_the_rest_not_run() {
+        let provider = Arc::new(ScriptedProvider::new(vec![use_tools(&[call("c1", "slow"), call("c2", "next")])]));
+        let h = history(vec![user("go")]);
+        // The first call runs until it's stopped, as a long command would.
+        let run: RunFn = Arc::new(|_, cancel| {
+            Box::pin(async move {
+                cancel.cancelled().await;
+                Ok(ok("stopped", "slow"))
+            })
+        });
+        let mut o = options(provider, &h, FakeRunner { run, parallel: |_| false });
+        o.deadline = Some(std::time::Instant::now() + Duration::from_millis(300));
+        let events = tokio::time::timeout(Duration::from_secs(10), collect(o)).await.expect("the run ended at its deadline");
+        assert_eq!(end(&events), Some(StopReason::TimeLimit));
+        let texts = tool_texts(&h);
+        assert!(texts[0].starts_with("stopped\n[time left in this run: 0m 00s]"), "{}", texts[0]);
+        assert_eq!(texts[1], not_run::TIME_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn a_persons_stop_under_a_deadline_is_still_aborted() {
+        let provider = Arc::new(ScriptedProvider::new(vec![say("hi")]));
+        let h = history(vec![user("go")]);
+        let mut o = options(provider, &h, plain());
+        o.deadline = Some(std::time::Instant::now() + Duration::from_secs(60));
+        o.cancel.cancel();
+        let events = collect(o).await;
+        assert_eq!(end(&events), Some(StopReason::Aborted));
+        assert!(!events.iter().any(|e| matches!(e, LoopEvent::Error(m) if m == TIME_LIMIT_MESSAGE)));
+    }
+
+    #[tokio::test]
+    async fn a_run_that_starts_past_its_deadline_ends_without_a_request() {
+        let provider = Arc::new(ScriptedProvider::new(vec![say("hi")]));
+        let h = history(vec![user("go")]);
+        let mut o = options(provider.clone(), &h, plain());
+        o.deadline = Some(std::time::Instant::now());
+        let events = collect(o).await;
+        assert_eq!(end(&events), Some(StopReason::TimeLimit));
+        assert!(provider.requests().is_empty());
     }
 }

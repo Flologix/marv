@@ -384,6 +384,7 @@ pub fn report_of(
                 StopReason::Length => "the reply hit the output limit",
                 StopReason::MaxSteps => "the step limit",
                 StopReason::Loop => "the same failing calls again and again",
+                StopReason::TimeLimit => "the time limit",
                 _ => "an error",
             };
             let mut text = format!("the turn ended: {words}");

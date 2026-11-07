@@ -576,6 +576,11 @@ impl McpManager {
         self.changed();
     }
 
+    /// Every server's config, as it is now (the session redacts their tokens from tool results: docs/SECURITY.md).
+    pub fn configs(&self) -> Vec<McpServerConfig> {
+        self.state().connections.iter().map(|c| c.config.clone()).collect()
+    }
+
     /// Project servers waiting for the user's trust.
     pub fn untrusted(&self) -> Vec<McpServerConfig> {
         self.state().connections.iter().filter(|c| c.state == McpState::Untrusted).map(|c| c.config.clone()).collect()

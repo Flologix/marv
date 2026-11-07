@@ -263,10 +263,12 @@ fn compact_outcome(result: CompactResult) -> view::CompactOutcome {
 pub fn map_loop(event: &LoopEvent, totals: &dyn Fn() -> view::Totals) -> Option<UiEvent> {
     use LoopEvent as L;
     Some(match event {
-        // #96: the error right after it says what happened.
+        // #96: the error right after it says what happened (or the loop's `Retry`, when it goes on past it).
         L::Discarded { .. } => return None,
         // Marv #63: the session's compaction notice that follows says what was done about it.
         L::Overflow { .. } => return None,
+        // marv-rs: Marv's notes to the model are for the logs (stream-json, the trajectory); the TUI shows what follows.
+        L::Note { .. } => return None,
         L::TextDelta(text) => UiEvent::TextDelta(text.clone()),
         L::ThinkingDelta(text) => UiEvent::ThinkingDelta(text.clone()),
         L::Usage(usage, _) => UiEvent::Usage { last: *usage, totals: totals() },
@@ -1131,6 +1133,8 @@ impl Bridge {
         init.agents = s.agents.clone();
         init.memory = s.memory.clone();
         init.mcp = s.mcp.clone();
+        // Marv's own keys, redacted from every tool result (docs/SECURITY.md; the MCP servers' tokens are added per turn).
+        init.secrets = marv_session::config::configured_secrets(s.file.as_ref(), &s.env, Some(&config));
         // The CLI started them, so the CLI closes them (on the way out).
         init.owns_mcp = false;
         init.approve = Some(Arc::new(TuiApprover(activity.clone())));

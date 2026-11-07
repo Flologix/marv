@@ -142,7 +142,20 @@ pub const COMMANDS: &str = "bash:";
 /// Appended to the system prompt in `marv -p`, where nobody reads a reply until the run ends: a question ends the
 /// run. On Terminal-Bench a run ended at its 99th step on "Want me to keep going…?" (2026-10-31). Subagents have the
 /// same rule in their own prompt; the TUI and the desktop, where a person answers, don't get this.
-pub const HEADLESS_NOTE: &str = "# Running unattended\n\nThis is a non-interactive run (marv -p): nobody reads your replies until it ends, and nobody can answer a question, so a question ends the run unanswered. Don't stop to ask whether to continue or which option to take: make reasonable assumptions, say what they were, and keep going until the task is done, or you're truly blocked and can't go on without something only the user has. Then say what you did, how you checked it, and anything left undone.";
+///
+/// The list after the first paragraph is from 0.15.0's Terminal-Bench failures: some 25–30 attempts claimed success
+/// after checking only their own reading of the task (a literal `:wq` written as `wq`, required text wrapped in HTML,
+/// a tag the task said to keep removed); others stopped with their own measurement under a threshold and time left,
+/// added processing nobody asked for, tested only the example input, left a required service stopped, put prose in an
+/// answer file, read text off an image by eye, or, when stuck, fetched the task's source and tests online.
+///
+/// 2026-11-06 (a later run's audit): "add no processing nobody asked for" was quoted as the reason to drop an
+/// embedding model's documented query instruction, and preprocessing was picked by accuracy on the data at hand
+/// instead of what the weights were trained with, so "conventional" now spells out documented usage and training-time
+/// preprocessing. Also from it: a hand-written HTML tokenizer with bs4 installed (prefer the established library), a
+/// database opened before copying it (its only WAL file was gone), and a speed task stopped at its first correct
+/// version while the slow original's timing ate the budget.
+pub const HEADLESS_NOTE: &str = "# Running unattended\n\nThis is a non-interactive run (marv -p): nobody reads your replies until it ends, and nobody can answer a question, so a question ends the run unanswered. Don't stop to ask whether to continue or which option to take: make reasonable assumptions, say what they were, and keep going until the task is done, or you're truly blocked and can't go on without something only the user has.\n\nThe result is checked against the task as written:\n- Prefer the conventional choice the task and its tools imply, and say what you chose. Conventional means the documented usage of the tool, model or library (its README or model card), including any prompt, prefix or instruction it requires; preprocessing that matches what the original code or weights were trained with, not whatever scores best on the data at hand; and exactly the parameters and units the output asks for. Beyond that, add nothing the task didn't ask for.\n- Before writing your own parser or algorithm, check what's installed (pip list and the like) and prefer the established library.\n- Copy the given input files aside before running anything that could change them (opening a database, repair or recovery tools).\n- Aim for a threshold with a clear margin. While time remains, don't finish with your own measurement showing a requirement unmet.\n- When the task asks for something as fast or efficient as possible, or to beat a bar, assume an unseen reference sets that bar: keep improving after the first correct version while time remains, and cap slow baseline runs with `timeout`.\n- Test the result the way it will be used: the edge cases the task implies, an input other than the example, the exact command, user, path and port it names. Leave services the task needs running when you finish, where your access allows it.\n- A file meant to hold an answer holds only the answer; explanation goes in your reply.\n- To recognise text in an image or a document, use tools (render it to an image, OCR, a decoding library) rather than reading it by eye, and don't fill gaps with guesses.\n- Never look online for the task's own source, hidden tests or reference answers.\n- Before your final reply, re-read the task and list every explicit requirement: each must and should, number, threshold, path, file name, exact string and output format. Check the result against each one literally, as a strict grader would (`:wq` is not `wq`, text asked for isn't text wrapped in HTML, a tag you were told to keep is still there).\n\nThen say what you did, how you checked it, and anything left undone.";
 
 /// The system prompt's line for `--time-limit` (fixed for the run, so the cache holds). On Terminal-Bench a model ran
 /// `timeout 580 …` in a 750 s task, not knowing it had a budget, and the task ended mid-command (2026-10-31).
@@ -187,7 +200,7 @@ pub fn exit_code_for(reason: &str, refused: usize) -> ExitCode {
     }
     match reason {
         "end" | "stop" => ExitCode::Finished,
-        "max_steps" | "length" | "loop" => ExitCode::Stopped,
+        "max_steps" | "length" | "loop" | "time_limit" => ExitCode::Stopped,
         "aborted" | "interrupted" | "declined" => ExitCode::NeedsApproval,
         _ => ExitCode::Error, // "error", or anything unknown
     }
@@ -315,6 +328,9 @@ impl Collector {
                     L::TextLoop { continued } => Some(json!({"type": "text_loop", "continued": continued})),
                     L::AnnouncedStep { continued } => Some(json!({"type": "announced_step", "continued": continued})),
                     L::ToolLoop { continued } => Some(json!({"type": "tool_loop", "continued": continued})),
+                    // marv-rs: Marv's notes to the model, as it got them (the deadline note, the time-left footer, the
+                    // loop guards'), so a run's log shows them.
+                    L::Note { kind, text } => Some(json!({"type": "note", "kind": kind.as_str(), "text": text})),
                     _ => None,
                 }
             }
@@ -801,6 +817,29 @@ mod tests {
         );
     }
 
+    // marv-rs: Marv's notes to the model reach stream-json as `note` events, text as the model got it.
+    #[test]
+    fn marvs_notes_are_note_events() {
+        use marv_agent::agent::NoteKind;
+        let mut c = Collector::default();
+        let note = |kind, text: &str| SessionEvent::Loop(LoopEvent::Note { kind, text: text.into() });
+        let text = marv_agent::agent::deadline_note(std::time::Duration::from_secs(80));
+        assert_eq!(
+            c.event(&note(NoteKind::Deadline, &text)),
+            Some(serde_json::json!({"type": "note", "kind": "deadline", "text": text}))
+        );
+        assert_eq!(
+            c.event(&note(NoteKind::TimeLeft, "[time left in this run: 1m 20s]")),
+            Some(serde_json::json!({"type": "note", "kind": "time_left", "text": "[time left in this run: 1m 20s]"}))
+        );
+        assert_eq!(
+            c.event(&note(NoteKind::ToolLoop, "Marv: …")).and_then(|v| v["kind"].as_str().map(String::from)),
+            Some("tool_loop".into())
+        );
+        // Not a step of the model's.
+        assert_eq!(c.steps, 0);
+    }
+
     // #52: a command for the host is refused in -p whatever --approve says, and listed as refused (exit 3).
     #[test]
     fn a_host_command_is_listed_as_refused() {
@@ -937,7 +976,7 @@ mod tests {
         assert_eq!(exit_code_for("end", 0), ExitCode::Finished);
         assert_eq!(exit_code_for("error", 0), ExitCode::Error);
         assert_eq!(exit_code_for("something-new", 0), ExitCode::Error);
-        for r in ["max_steps", "length", "loop"] {
+        for r in ["max_steps", "length", "loop", "time_limit"] {
             assert_eq!(exit_code_for(r, 0), ExitCode::Stopped);
         }
         for r in ["aborted", "interrupted", "declined"] {
