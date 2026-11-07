@@ -1133,6 +1133,8 @@ impl Bridge {
         init.agents = s.agents.clone();
         init.memory = s.memory.clone();
         init.mcp = s.mcp.clone();
+        // Marv's own keys, redacted from every tool result (docs/SECURITY.md; the MCP servers' tokens are added per turn).
+        init.secrets = marv_session::config::configured_secrets(s.file.as_ref(), &s.env, Some(&config));
         // The CLI started them, so the CLI closes them (on the way out).
         init.owns_mcp = false;
         init.approve = Some(Arc::new(TuiApprover(activity.clone())));

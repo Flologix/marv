@@ -71,6 +71,8 @@ Each guard's doc comment says how it was proven: the guard was reverted, and the
 | A network approval lists scripts written this session | `provenance.rs::a_network_approval_lists_the_scripts_it_runs` | Ignored: not built yet |
 | A mesh message that wakes an idle Marv is fenced and taints; its turn's egress asks (#78) | `mesh.rs::a_woken_turn_reads_its_message_fenced_and_tainted_and_egress_asks` | Proven |
 | Subscriptions (#159): a provider never gets another provider's key | `subscriptions.rs::a_providers_key_never_goes_to_another_provider` | Proven |
+| Marv's own secrets (provider keys, MCP tokens) are redacted from every tool result in `run_tool` | `secrets.rs::run_tool_redacts_configured_secrets_from_every_result` | Proven |
+| … end to end: an unsandboxed `marv -p` that `cat`s config.json and mcp.json sends, streams and saves neither | `secrets.rs::an_unsandboxed_run_that_cats_marvs_config_never_sends_its_keys` | Proven |
 | Subscriptions: a plan's usage limit is a hard stop (one request, never retried, no other key) | `subscriptions.rs::plan_limit::a_plans_limit_is_a_hard_stop` | Proven |
 | Sign in with ChatGPT: the loopback listener is 127.0.0.1 only, needs the state, takes one callback | `subscriptions.rs::sign_in_listener::the_sign_in_listener_is_loopback_only_needs_the_state_and_takes_one_callback` | Proven |
 | Sign in with ChatGPT: an idle local connection doesn't stall the callback | `subscriptions.rs::sign_in_listener::an_idle_connection_doesnt_stall_the_sign_in` | |

@@ -74,6 +74,9 @@ pub struct PromptInput {
     /// so it's fixed per session. The access facts then say so ([`UNSANDBOXED_FACTS`]) and `# Sandbox limits` is left
     /// out.
     pub unsandboxed: bool,
+    /// With `unsandboxed`: this machine's measured limits, one line ([`machine_limits`]: measured once, so the prompt
+    /// stays byte-stable). None: not said.
+    pub limits: Option<String>,
 }
 
 /// Said when the project has no `.git` (and bash is offered). A session in ~/Projects (no repository) ran `ls -la`,
@@ -115,14 +118,62 @@ const HOME_HIDDEN: &str = if cfg!(target_os = "macos") {
 /// configure-git-webserver attempts said they were "sandboxed in /app" and delivered installer scripts instead of
 /// configuring the machine, and a pypi-server attempt told the user to start the server. The base text's sandbox
 /// sentence is shared with Marv (the oracle compares it), so these lines say it doesn't apply.
-pub const UNSANDBOXED_FACTS: &str = "- Sandbox: off for this run. Commands run directly on this machine with this user's permissions; what the text below says about a sandbox doesn't apply. Files outside the project and the network are reachable, as this run has approved them.\n- A process you start in the background (nohup … &, output redirected) keeps running after its command ends, so a service you set up can stay running.\n- Nobody is at a terminal to run commands for you: do the work on this machine yourself, rather than handing the user a script or a command to run.";
+///
+/// 2026-11-06 (Terminal-Bench audit): a run that needed OCR never tried to install it ("Network is off"), and another
+/// ran `xargs -P 8` on a 1-CPU container because `nproc` said 16, so the last two lines say tools can be installed and
+/// where the real limits come from. [`machine_limits`] adds the numbers, measured once.
+pub const UNSANDBOXED_FACTS: &str = "- Sandbox: off for this run. Commands run directly on this machine with this user's permissions; what the text below says about a sandbox doesn't apply. Files outside the project and the network are reachable, as this run has approved them.\n- A process you start in the background (nohup … &, output redirected) keeps running after its command ends, so a service you set up can stay running.\n- Nobody is at a terminal to run commands for you: do the work on this machine yourself, rather than handing the user a script or a command to run.\n- A missing tool can be installed: with the system package manager (apt-get, apk, dnf…) or pip.\n- Real CPU and memory limits come from the container's cgroup, not from nproc or /proc/cpuinfo, which can show the host's: size parallel work (make -j, xargs -P, thread pools) to the cgroup's limits.";
+
+/// The line after [`UNSANDBOXED_FACTS`] with this machine's limits, as measured at the session's start: the CPUs this
+/// process may use (`std::thread::available_parallelism`, which counts the cgroup's CPU quota and the CPU affinity
+/// mask) and the cgroup v2 memory limit, when there is one. `None` when neither can be read. Measured once per process
+/// ([`machine_limits`]), so the system prompt stays byte-stable within a session.
+pub fn limits_line(cpus: Option<usize>, memory_bytes: Option<u64>) -> Option<String> {
+    let cpus = cpus.map(|n| format!("{n} CPU{}", if n == 1 { "" } else { "s" }));
+    let memory = memory_bytes.map(|b| format!("{:.1} GiB of memory", b as f64 / (1u64 << 30) as f64));
+    let both: Vec<String> = cpus.into_iter().chain(memory).collect();
+    (!both.is_empty()).then(|| format!("- Measured at the start of this run: {} available to it.", both.join(" and ")))
+}
+
+/// [`limits_line`] for this process, measured on first use and the same afterwards.
+pub fn machine_limits() -> Option<String> {
+    static LIMITS: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    LIMITS
+        .get_or_init(|| {
+            let cpus = std::thread::available_parallelism().ok().map(std::num::NonZeroUsize::get);
+            let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok();
+            let memory = cgroup.as_deref().and_then(|c| cgroup_memory_limit(c, |p| std::fs::read_to_string(p).ok()));
+            limits_line(cpus, memory)
+        })
+        .clone()
+}
+
+/// The tightest cgroup v2 `memory.max` on the way from this process's cgroup (`/proc/self/cgroup`'s `0::<path>` line)
+/// up to `/sys/fs/cgroup`, read with `read`. `None` without cgroup v2 or a numeric limit ("max" is none).
+pub fn cgroup_memory_limit(proc_cgroup: &str, read: impl Fn(&std::path::Path) -> Option<String>) -> Option<u64> {
+    let own = proc_cgroup.lines().find_map(|l| l.strip_prefix("0::"))?.trim();
+    let mut dir = std::path::PathBuf::from("/sys/fs/cgroup").join(own.trim_start_matches('/'));
+    let mut tightest: Option<u64> = None;
+    loop {
+        if let Some(limit) = read(&dir.join("memory.max")).and_then(|t| t.trim().parse::<u64>().ok()) {
+            tightest = Some(tightest.map_or(limit, |t| t.min(limit)));
+        }
+        if dir == std::path::Path::new("/sys/fs/cgroup") || !dir.pop() {
+            break;
+        }
+    }
+    tightest
+}
 
 pub fn access_facts(input: &PromptInput) -> String {
     if !input.tools.iter().any(|t| t == "bash") {
         return String::new();
     }
     if input.unsandboxed {
-        return format!("\n\n{ACCESS_HEADING}\n{UNSANDBOXED_FACTS}");
+        return match &input.limits {
+            Some(limits) => format!("\n\n{ACCESS_HEADING}\n{UNSANDBOXED_FACTS}\n{limits}"),
+            None => format!("\n\n{ACCESS_HEADING}\n{UNSANDBOXED_FACTS}"),
+        };
     }
     let extra = if input.writable.is_empty() { "" } else { " (and the extra writable folders listed below)" };
     let (project, hidden) = if input.home_project {
@@ -907,6 +958,33 @@ mod tests {
         assert_eq!(access_facts(&PromptInput { tools: vec!["read_file".into()], home_project: true, ..input() }), "");
     }
 
+    #[test]
+    fn the_limits_line_says_cpus_and_memory() {
+        assert_eq!(
+            limits_line(Some(1), Some(3 << 29)).as_deref(),
+            Some("- Measured at the start of this run: 1 CPU and 1.5 GiB of memory available to it.")
+        );
+        assert_eq!(limits_line(Some(4), None).as_deref(), Some("- Measured at the start of this run: 4 CPUs available to it."));
+        assert_eq!(limits_line(None, None), None);
+        // Measured once: the same text every time (the cache).
+        assert_eq!(machine_limits(), machine_limits());
+    }
+
+    #[test]
+    fn the_memory_limit_is_the_tightest_on_the_way_up() {
+        let files = std::collections::HashMap::from([
+            ("/sys/fs/cgroup/a/b/memory.max", "max\n"),
+            ("/sys/fs/cgroup/a/memory.max", "2147483648\n"),
+            ("/sys/fs/cgroup/memory.max", "4294967296\n"),
+        ]);
+        let read = |p: &std::path::Path| files.get(p.to_str().unwrap()).map(|s| s.to_string());
+        assert_eq!(cgroup_memory_limit("0::/a/b\n", read), Some(2147483648));
+        assert_eq!(cgroup_memory_limit("0::/\n", read), Some(4294967296));
+        // cgroup v1 only, or no limit anywhere: none.
+        assert_eq!(cgroup_memory_limit("12:memory:/x\n", read), None);
+        assert_eq!(cgroup_memory_limit("0::/a/b\n", |_: &std::path::Path| Some("max".to_string())), None);
+    }
+
     /// An unsandboxed run (`marv -p --dangerously-run-unsandboxed`) is told so, in place of the sandboxed lines, in a
     /// home-folder project or not and whatever the doors; `# Sandbox limits` goes. Sandboxed sessions keep theirs.
     #[test]
@@ -917,8 +995,17 @@ mod tests {
             let facts = access_facts(&PromptInput { unsandboxed: true, home_project, doors, ..input() });
             assert_eq!(facts, expected);
             // One block without a blank line (the oracle drops it from its first line to the next blank line).
-            assert!(!facts[2..].contains("\n\n") && facts.lines().count() == 6, "{facts}");
+            assert!(!facts[2..].contains("\n\n") && facts.lines().count() == 8, "{facts}");
         }
+        // Installing tools and the cgroup's limits (2026-11-06), and the measured limits as the block's last line.
+        assert!(UNSANDBOXED_FACTS.contains("A missing tool can be installed"));
+        assert!(UNSANDBOXED_FACTS.contains("not from nproc"));
+        let limits = limits_line(Some(1), Some(2 << 30)).unwrap();
+        let measured = access_facts(&PromptInput { unsandboxed: true, limits: Some(limits.clone()), ..input() });
+        assert_eq!(measured, format!("{expected}\n{limits}"));
+        assert!(!measured[2..].contains("\n\n"));
+        // A sandboxed session never says them.
+        assert!(!access_facts(&PromptInput { limits: Some(limits.clone()), ..input() }).contains(&limits));
         assert!(
             UNSANDBOXED_FACTS
                 .starts_with("- Sandbox: off for this run. Commands run directly on this machine with this user's permissions")

@@ -326,11 +326,78 @@ pub type Result<T, E = MarvError> = std::result::Result<T, E>;
 /// builds it for tool results; MCP tool descriptions in Marv's notes use it too ([`untrusted_block`]).
 pub const UNTRUSTED_TAG: &str = "untrusted-data";
 
+/// What a configured secret is replaced with in a tool result ([`Secrets::redact`]).
+pub const REDACTED_SECRET: &str = "[redacted: a secret from Marv's configuration]";
+
+/// A configured secret shorter than this isn't redacted: replacing every `abc` in every output would mangle it, and a
+/// key that short protects nothing anyway.
+pub const MIN_SECRET_CHARS: usize = 8;
+
+/// The secrets Marv itself was configured with (the provider API keys, a custom provider's key, MCP servers' tokens),
+/// which no tool result may carry to the model, the stream or a trajectory (docs/SECURITY.md, "Marv's own secrets
+/// never come back in a tool result"). marv-rs only: a model in a container `cat`ed Marv's config.json and the
+/// OpenRouter key went to the model and into the run's logs (Terminal-Bench, 2026-11-06). `Debug` shows only how
+/// many there are.
+#[derive(Clone, Default)]
+pub struct Secrets {
+    /// Longest first, so one secret that holds another is replaced whole.
+    values: Vec<String>,
+}
+
+impl Secrets {
+    /// The non-empty values (trimmed) of at least [`MIN_SECRET_CHARS`] characters, each once.
+    pub fn new(values: impl IntoIterator<Item = String>) -> Self {
+        let mut values: Vec<String> =
+            values.into_iter().map(|v| v.trim().to_string()).filter(|v| v.chars().count() >= MIN_SECRET_CHARS).collect();
+        values.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        values.dedup();
+        Self { values }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    /// `text` with every secret replaced by [`REDACTED_SECRET`]; `None` when it holds none (nothing to change).
+    pub fn redact(&self, text: &str) -> Option<String> {
+        let mut out: Option<String> = None;
+        for secret in &self.values {
+            let current = out.as_deref().unwrap_or(text);
+            if current.contains(secret.as_str()) {
+                out = Some(current.replace(secret.as_str(), REDACTED_SECRET));
+            }
+        }
+        out
+    }
+
+    /// [`Self::redact`], in place.
+    pub fn redact_in(&self, text: &mut String) {
+        if let Some(redacted) = self.redact(text) {
+            *text = redacted;
+        }
+    }
+}
+
+impl std::fmt::Debug for Secrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Secrets").field("count", &self.values.len()).finish()
+    }
+}
+
+/// At most this many characters of a fence's `from` (a call's label: often the whole command) are kept, then `…`.
+/// marv-rs (2026-11-06): repeating long commands there was 17% of a Terminal-Bench run's tool-output characters.
+pub const MAX_FROM_CHARS: usize = 100;
+
 /// `text` fenced as data: `<untrusted-data source="<source>" from="<from>">`, the text, the closing tag. The text
 /// can't close the fence (its closing tags are defused, [`defuse_closing_tag`]) and `source` and `from` can't end
-/// their attribute or the tag ([`escape_attribute`]).
+/// their attribute or the tag ([`escape_attribute`]). `from` is cut to [`MAX_FROM_CHARS`] (the same cut every time,
+/// so the bytes are stable for the prompt cache).
 pub fn untrusted_block(source: &str, from: &str, text: &str) -> String {
-    let (source, from) = (escape_attribute(source), escape_attribute(from));
+    let from = match from.char_indices().nth(MAX_FROM_CHARS) {
+        Some((end, _)) => format!("{}…", &from[..end]),
+        None => from.to_string(),
+    };
+    let (source, from) = (escape_attribute(source), escape_attribute(&from));
     let body = defuse_closing_tag(text, UNTRUSTED_TAG);
     format!("<{UNTRUSTED_TAG} source=\"{source}\" from=\"{from}\">\n{body}\n</{UNTRUSTED_TAG}>")
 }
@@ -458,6 +525,41 @@ pub fn estimate_history_tokens(history: &[ChatTurn]) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use super::{REDACTED_SECRET, Secrets};
+
+    #[test]
+    fn configured_secrets_are_redacted_whole_and_debug_hides_them() {
+        let key = "sk-or-v1-fake0000000000000000";
+        let secrets = Secrets::new([key.to_string(), format!("{key}-longer"), " short ".into(), String::new(), key.into()]);
+        assert_eq!(
+            secrets.redact(&format!("{{\"apiKey\": \"{key}\"}} and {key}-longer")).as_deref(),
+            Some(format!("{{\"apiKey\": \"{REDACTED_SECRET}\"}} and {REDACTED_SECRET}").as_str())
+        );
+        assert_eq!(secrets.redact("nothing here, short"), None);
+        let mut text = format!("x{key}y");
+        secrets.redact_in(&mut text);
+        assert_eq!(text, format!("x{REDACTED_SECRET}y"));
+        assert_eq!(format!("{secrets:?}"), "Secrets { count: 2 }");
+        assert!(Secrets::default().is_empty() && Secrets::new(["tiny".to_string()]).is_empty());
+    }
+
+    /// A long `from` (a whole command) is cut to `MAX_FROM_CHARS` characters and `…`, the same way every time; a short
+    /// one is kept whole; a cut never splits a character, and the cut text is still escaped.
+    #[test]
+    fn a_fences_from_is_cut_to_a_hundred_characters() {
+        let long = format!("cat <<'EOF' > x.py \"{}\"", "é".repeat(300));
+        let block = super::untrusted_block("network", &long, "out");
+        let from = block.split("from=\"").nth(1).unwrap().split("\">").next().unwrap();
+        assert!(from.ends_with('…'), "{from}");
+        assert!(from.starts_with("cat &lt;&lt;'EOF' &gt; x.py &quot;é"), "{from}");
+        assert_eq!(from.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").chars().count(), 101);
+        assert_eq!(block, super::untrusted_block("network", &long, "out"));
+        let short = super::untrusted_block("web", "https://example.com/a", "x");
+        assert!(short.starts_with("<untrusted-data source=\"web\" from=\"https://example.com/a\">\n"));
+        let exact = "a".repeat(super::MAX_FROM_CHARS);
+        assert!(super::untrusted_block("web", &exact, "x").contains(&format!("from=\"{exact}\">")));
+    }
+
     #[test]
     fn estimate_tokens_is_four_chars_a_token_rounded_up() {
         assert_eq!(super::estimate_tokens(""), 0);

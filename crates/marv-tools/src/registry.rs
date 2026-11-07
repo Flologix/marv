@@ -197,248 +197,272 @@ pub fn home_file_write_once(kind: ToolKind, scope_key: &str, ctx: &ToolContext) 
 
 /// Runs a call. Never fails: every failure becomes a result the model can read and recover from.
 pub async fn run_tool(call: &ToolCall, ctx: &ToolContext, available: &[ToolRef]) -> ToolOutcome {
-    let fail = |output: String, label: &str| ToolOutcome { result: ToolOutput::error(output), label: label.to_string() };
-    // marv-rs: a name with leaked markup around a tool's name (`…<|tool_call>call:read_file`) runs that tool, with a
-    // note; the call itself is never rewritten (prompt cache).
-    let (tool, name_note) = match available.iter().find(|t| t.name() == call.name) {
-        Some(tool) => (tool, None),
-        None => match crate::repair::repair_tool_name(&call.name, available.iter().map(|t| t.name())) {
-            Some((fixed, note)) => match available.iter().find(|t| t.name() == fixed) {
-                Some(tool) => (tool, Some(note)),
+    // Every return below ends here: the result is redacted once, whichever way the call ended.
+    let outcome = async {
+        let fail = |output: String, label: &str| ToolOutcome { result: ToolOutput::error(output), label: label.to_string() };
+        // marv-rs: a name with leaked markup around a tool's name (`…<|tool_call>call:read_file`) runs that tool, with a
+        // note; the call itself is never rewritten (prompt cache).
+        let (tool, name_note) = match available.iter().find(|t| t.name() == call.name) {
+            Some(tool) => (tool, None),
+            None => match crate::repair::repair_tool_name(&call.name, available.iter().map(|t| t.name())) {
+                Some((fixed, note)) => match available.iter().find(|t| t.name() == fixed) {
+                    Some(tool) => (tool, Some(note)),
+                    None => return fail(unknown_tool(&call.name, available, REMOVED_TOOLS), &call.name),
+                },
                 None => return fail(unknown_tool(&call.name, available, REMOVED_TOOLS), &call.name),
             },
-            None => return fail(unknown_tool(&call.name, available, REMOVED_TOOLS), &call.name),
-        },
-    };
-
-    let args = if call.arguments.is_empty() { "{}" } else { call.arguments.as_str() };
-    let (raw, json_note) = match serde_json::from_str::<Value>(args) {
-        Ok(raw) => (raw, None),
-        // A weaker model puts literal tabs or newlines inside JSON strings (issue #10). Escaping those is
-        // unambiguous; anything else stays an error the model can recover from.
-        Err(_) => match repair_json_args(args) {
-            Some(repaired) => (repaired.value, repaired.note),
-            None => {
-                let mut outcome =
-                    fail(format!("The arguments for {} are not valid JSON: {}", call.name, call.arguments), &call.name);
-                outcome.result.invalid = Some("the arguments are not valid JSON".into());
-                return outcome;
-            }
-        },
-    };
-    // Generic schema mistakes (a number as a string, another harness's field), then the tool's own repair of what
-    // it can read with certainty, before validation. Both repair this value: `call` is never touched (prompt cache).
-    let (raw, schema_note) = schema_repaired(tool.as_ref(), raw);
-    let (input_value, tool_note) = match tool.repair(&raw, ctx) {
-        Some(repaired) => (repaired.input, repaired.note),
-        None => (raw, None),
-    };
-    let note = [name_note, json_note, schema_note, tool_note].into_iter().flatten().collect::<Vec<_>>().join("\n\n");
-    let note = (!note.is_empty()).then_some(note);
-    let noted = |mut outcome: ToolOutcome| {
-        outcome.result.output = with_note(&outcome.result.output, note.as_deref());
-        outcome
-    };
-
-    let input = match tool.parse(input_value) {
-        Ok(input) => input,
-        Err(err) => {
-            // #267: a validation failure, marked so the loop can refuse the identical call next time.
-            let mut outcome = fail(format!("Invalid input for {}:\n{err}", call.name), &call.name);
-            outcome.result.invalid = Some(err);
-            return noted(outcome);
-        }
-    };
-    let input = input.as_ref();
-    let label = short_label(tool.label(input), ctx);
-    let per_call = ToolContext { call_id: Some(call.id.clone()), ..ctx.clone() };
-    // A door out of the sandbox (Marv #47, #51, #52): the prompt shows its warning, the result and trajectory name
-    // it, and a `once` call is never remembered (the session's approver holds that, whatever the client answers).
-    let door = tool.door(input, ctx);
-    // What the tool declares its output to be, for this call: no result is trusted more than that.
-    let declared = tool.provenance_in(input, ctx);
-    // A tool's own error (`ToolError`) from its run can carry its source's words too: a redirect's `Location`, a
-    // server's `Content-Type`, gh's stderr. From an outside source it's that source's text: fenced and tainting, never
-    // Marv's. A preview's error stays Marv's: a preview reaches nothing (gh's checks are local, web_fetch's is an
-    // address check), so what it says is Marv's own refusal.
-    let tool_failed = |err: crate::types::ToolError| {
-        let mut outcome = fail(err.0, &label);
-        if declared.taints() {
-            outcome.result.provenance = declared;
-            ctx.taint.mark(declared);
-        }
-        noted(outcome)
-    };
-    let finish = |result: Result<ToolOutput, crate::types::ToolError>, approval: Option<Approval>| {
-        let mut result = match result {
-            Ok(result) => result,
-            Err(err) => return tool_failed(err),
         };
-        result.door = door;
-        result.provenance = result.provenance.least_trusted(declared);
-        if result.provenance.taints() {
-            ctx.taint.mark(result.provenance);
-        }
-        if approval.is_some() {
-            result.approval = approval;
-        }
-        noted(ToolOutcome { result, label: label.clone() })
-    };
 
-    // What the call asks starts at its floor (`floor.rs`: `approval_floor`, `asked_every_time`); the checks below only
-    // raise it. A tool this mode isn't offered (the floor's `Refused`: a main-agent tool in a subagent's context) is
-    // unknown here, whatever list it came in: the list is the session's, this is the second check. Asked by name, so
-    // the tool's `needs_approval` runs once, below, as before.
-    if !crate::floor::offered_in_mode(tool.name(), ctx.mode) {
-        let offered: Vec<ToolRef> =
-            available.iter().filter(|t| crate::floor::offered_in_mode(t.name(), ctx.mode)).cloned().collect();
-        return noted(fail(unknown_tool(&call.name, &offered, REMOVED_TOOLS), &call.name));
-    }
-    let network = tool.uses_network(input, ctx);
-    let protected = tool.protected_target(input, ctx);
-    // A web request under a URL prefix the user approved after the taint (docs/SECURITY.md) runs as approved.
-    let egress_url = tool.egress_url(input).filter(|_| ctx.taint.is_tainted());
-    // Not in a turn without automatic approval (#124): that prefix is a remembered answer too.
-    let prefix_approved = ctx.mode.auto_approval() && egress_url.as_deref().is_some_and(|url| ctx.taint.prefix_approved(url));
-    // A write that later conversations load as the person's own (memory), once outside text is in this one: a person
-    // answers it every time.
-    let tainted_sink = ctx.taint.is_tainted() && tool.persists(input, ctx);
-    let must_ask = protected.is_some() || tainted_sink || (ctx.taint.must_ask(tool.kind(), network) && !prefix_approved);
-    let gated = must_ask || (!prefix_approved && approval_floor(tool.as_ref(), input, ctx) != Floor::NeverAsks);
-    let interrupted = |approval: Approval| {
-        let mut result = ToolOutput::ok(INTERRUPTED, "interrupted");
-        result.declined = true;
-        result.approval = Some(approval);
-        result.door = door;
-        noted(ToolOutcome { result, label: label.clone() })
-    };
-    // The turn's checkpoint, before anything that can change files runs (approved, yolo, or a tool that asks no one):
-    // whatever the call does, bash included, /undo can put back. It never fails the call; a stop meanwhile does.
-    let checkpointed = || async {
-        if let Some(checkpoint) = ctx.checkpoint.as_ref().filter(|_| tool.checkpoint()) {
-            checkpoint.checkpoint().await;
-        }
-        !ctx.aborted()
-    };
-    if !gated {
-        if !checkpointed().await {
-            return interrupted(Approval::Interrupted);
-        }
-        return finish(tool.run(input, &per_call).await, None);
-    }
-
-    // The preview runs first, so a call that can't succeed fails here instead of being approved.
-    let preview = match tool.preview(input, ctx).await {
-        Ok(preview) => preview,
-        Err(err) => return noted(fail(err.0, &label)),
-    };
-    // Stopped while the preview was being made: don't raise a prompt for a run that's over.
-    if ctx.aborted() {
-        return interrupted(Approval::Interrupted);
-    }
-    let no_one_to_ask = || noted(fail(format!("{} needs the user's approval, and there's no one to ask.", call.name), &label));
-    // #77: a call the tool asks a person about itself, in one prompt (a mesh call and the new wire it needs). Never
-    // for a protected path, whose warning only the registry's prompt carries.
-    let own = match protected {
-        None => tool.approve_itself(input, &per_call, &preview).await,
-        Some(_) => None,
-    };
-    let decision = match own {
-        Some(Err(err)) => return tool_failed(err),
-        Some(Ok(decision)) => decision,
-        None => {
-            let scope = tool
-                .scope(input, ctx)
-                .unwrap_or_else(|| crate::types::Scope { key: call.name.clone(), description: call.name.clone() });
-            // In the home folder (the project is `~` or holds it), a file change asks each time: the edit tools write
-            // outside the sandbox, and a plain file there (a script on PATH, another repository's Makefile) can run on
-            // the host later. So no "always" is offered, no remembered or config-seeded "files" covers it, and yolo
-            // (which the session refuses there anyway) doesn't run it. One exception: a change inside one visible
-            // two-level folder (`~/Projects/shop`, not on PATH) offers "always" for that folder alone; yolo still
-            // doesn't run it and the config's "files" still doesn't cover it.
-            let home_write = home_file_write(tool.kind(), &scope.key, ctx);
-            // A turn without automatic approval (#124, a turn the radio started) asks every call `once`: no
-            // remembered "always" and no worktree subagent's automatic yes answers it.
-            let once =
-                asked_every_time(tool.as_ref(), input, ctx) || home_file_write_once(tool.kind(), &scope.key, ctx) || tainted_sink;
-            // Yolo: a call the tool vouches for runs without asking, confined (bash then can't touch .git).
-            // `approveSandboxed` (the default): bash in the sandbox without network runs the same way, in a turn the
-            // person started or a wake; yolo or not.
-            let yolo_runs = ctx.yolo && ctx.mode.auto_approval() && tool.auto_safe(input, ctx);
-            let sandboxed_runs = ctx.approve_sandboxed && ctx.mode.runs_sandboxed_unasked() && tool.auto_sandboxed(input, ctx);
-            if (yolo_runs || sandboxed_runs) && !must_ask && !home_write {
-                if !checkpointed().await {
-                    return interrupted(Approval::Interrupted);
+        let args = if call.arguments.is_empty() { "{}" } else { call.arguments.as_str() };
+        let (raw, json_note) = match serde_json::from_str::<Value>(args) {
+            Ok(raw) => (raw, None),
+            // A weaker model puts literal tabs or newlines inside JSON strings (issue #10). Escaping those is
+            // unambiguous; anything else stays an error the model can recover from.
+            Err(_) => match repair_json_args(args) {
+                Some(repaired) => (repaired.value, repaired.note),
+                None => {
+                    let mut outcome =
+                        fail(format!("The arguments for {} are not valid JSON: {}", call.name, call.arguments), &call.name);
+                    outcome.result.invalid = Some("the arguments are not valid JSON".into());
+                    return outcome;
                 }
-                // Yolo's turns are a person's; only `approveSandboxed` alone can run in a turn that mustn't change the project.
-                let project_read_only = !yolo_runs && ctx.mode.sandboxed_unasked_project_read_only();
-                let confined = ToolContext { confined: true, project_read_only, ..per_call };
-                return finish(tool.run(input, &confined).await, Some(Approval::Auto));
+            },
+        };
+        // Generic schema mistakes (a number as a string, another harness's field), then the tool's own repair of what
+        // it can read with certainty, before validation. Both repair this value: `call` is never touched (prompt cache).
+        let (raw, schema_note) = schema_repaired(tool.as_ref(), raw);
+        let (input_value, tool_note) = match tool.repair(&raw, ctx) {
+            Some(repaired) => (repaired.input, repaired.note),
+            None => (raw, None),
+        };
+        let note = [name_note, json_note, schema_note, tool_note].into_iter().flatten().collect::<Vec<_>>().join("\n\n");
+        let note = (!note.is_empty()).then_some(note);
+        let noted = |mut outcome: ToolOutcome| {
+            outcome.result.output = with_note(&outcome.result.output, note.as_deref());
+            outcome
+        };
+
+        let input = match tool.parse(input_value) {
+            Ok(input) => input,
+            Err(err) => {
+                // #267: a validation failure, marked so the loop can refuse the identical call next time.
+                let mut outcome = fail(format!("Invalid input for {}:\n{err}", call.name), &call.name);
+                outcome.result.invalid = Some(err);
+                return noted(outcome);
             }
-            let Some(approver) = &ctx.approver else { return no_one_to_ask() };
-            let request = ApprovalRequest {
-                tool: call.name.clone(),
-                label: label.clone(),
-                preview,
-                scope,
-                agent: None,
-                network,
-                once,
-                must_ask,
-                protected,
-                door,
-                reason: true,
-                persists: tainted_sink,
+        };
+        let input = input.as_ref();
+        let label = short_label(tool.label(input), ctx);
+        let per_call = ToolContext { call_id: Some(call.id.clone()), ..ctx.clone() };
+        // A door out of the sandbox (Marv #47, #51, #52): the prompt shows its warning, the result and trajectory name
+        // it, and a `once` call is never remembered (the session's approver holds that, whatever the client answers).
+        let door = tool.door(input, ctx);
+        // What the tool declares its output to be, for this call: no result is trusted more than that.
+        let declared = tool.provenance_in(input, ctx);
+        // A tool's own error (`ToolError`) from its run can carry its source's words too: a redirect's `Location`, a
+        // server's `Content-Type`, gh's stderr. From an outside source it's that source's text: fenced and tainting, never
+        // Marv's. A preview's error stays Marv's: a preview reaches nothing (gh's checks are local, web_fetch's is an
+        // address check), so what it says is Marv's own refusal.
+        let tool_failed = |err: crate::types::ToolError| {
+            let mut outcome = fail(err.0, &label);
+            if declared.taints() {
+                outcome.result.provenance = declared;
+                ctx.taint.mark(declared);
+            }
+            noted(outcome)
+        };
+        let finish = |result: Result<ToolOutput, crate::types::ToolError>, approval: Option<Approval>| {
+            let mut result = match result {
+                Ok(result) => result,
+                Err(err) => return tool_failed(err),
             };
-            approver.approve(request).await
+            result.door = door;
+            result.provenance = result.provenance.least_trusted(declared);
+            if result.provenance.taints() {
+                ctx.taint.mark(result.provenance);
+            }
+            if approval.is_some() {
+                result.approval = approval;
+            }
+            noted(ToolOutcome { result, label: label.clone() })
+        };
+
+        // What the call asks starts at its floor (`floor.rs`: `approval_floor`, `asked_every_time`); the checks below only
+        // raise it. A tool this mode isn't offered (the floor's `Refused`: a main-agent tool in a subagent's context) is
+        // unknown here, whatever list it came in: the list is the session's, this is the second check. Asked by name, so
+        // the tool's `needs_approval` runs once, below, as before.
+        if !crate::floor::offered_in_mode(tool.name(), ctx.mode) {
+            let offered: Vec<ToolRef> =
+                available.iter().filter(|t| crate::floor::offered_in_mode(t.name(), ctx.mode)).cloned().collect();
+            return noted(fail(unknown_tool(&call.name, &offered, REMOVED_TOOLS), &call.name));
         }
-    };
-    match decision {
-        Decision::Unavailable => no_one_to_ask(),
-        // Esc at the prompt answers "no" and then aborts the run: an interrupt, not "don't retry".
-        Decision::No if ctx.aborted() => interrupted(Approval::Interrupted),
-        Decision::No => {
-            let mut result = ToolOutput::ok(DECLINED, "declined");
+        let network = tool.uses_network(input, ctx);
+        let protected = tool.protected_target(input, ctx);
+        // A web request under a URL prefix the user approved after the taint (docs/SECURITY.md) runs as approved.
+        let egress_url = tool.egress_url(input).filter(|_| ctx.taint.is_tainted());
+        // Not in a turn without automatic approval (#124): that prefix is a remembered answer too.
+        let prefix_approved = ctx.mode.auto_approval() && egress_url.as_deref().is_some_and(|url| ctx.taint.prefix_approved(url));
+        // A write that later conversations load as the person's own (memory), once outside text is in this one: a person
+        // answers it every time.
+        let tainted_sink = ctx.taint.is_tainted() && tool.persists(input, ctx);
+        let must_ask = protected.is_some() || tainted_sink || (ctx.taint.must_ask(tool.kind(), network) && !prefix_approved);
+        let gated = must_ask || (!prefix_approved && approval_floor(tool.as_ref(), input, ctx) != Floor::NeverAsks);
+        let interrupted = |approval: Approval| {
+            let mut result = ToolOutput::ok(INTERRUPTED, "interrupted");
             result.declined = true;
-            result.approval = Some(Approval::Decided(Decision::No));
+            result.approval = Some(approval);
             result.door = door;
             noted(ToolOutcome { result, label: label.clone() })
+        };
+        // The turn's checkpoint, before anything that can change files runs (approved, yolo, or a tool that asks no one):
+        // whatever the call does, bash included, /undo can put back. It never fails the call; a stop meanwhile does.
+        let checkpointed = || async {
+            if let Some(checkpoint) = ctx.checkpoint.as_ref().filter(|_| tool.checkpoint()) {
+                checkpoint.checkpoint().await;
+            }
+            !ctx.aborted()
+        };
+        if !gated {
+            if !checkpointed().await {
+                return interrupted(Approval::Interrupted);
+            }
+            return finish(tool.run(input, &per_call).await, None);
         }
-        // #185: declined with a reason. The call doesn't run and the turn goes on: the result is an ordinary tool
-        // result (history stays append-only) saying it was declined and why. The reason is the user's own words, so
-        // it's `Provenance::User`: not fenced, and it taints nothing.
-        Decision::Declined(_) if ctx.aborted() => interrupted(Approval::Interrupted),
-        Decision::Declined(reason) => {
-            // Read once, here: what's recorded and what the model reads are the same cut, one-line text.
-            let reason = marv_core::decline_reason(&reason);
-            if reason.is_empty() {
-                // No reason given: a plain no, which stops the run.
+
+        // The preview runs first, so a call that can't succeed fails here instead of being approved.
+        let preview = match tool.preview(input, ctx).await {
+            Ok(preview) => preview,
+            Err(err) => return noted(fail(err.0, &label)),
+        };
+        // Stopped while the preview was being made: don't raise a prompt for a run that's over.
+        if ctx.aborted() {
+            return interrupted(Approval::Interrupted);
+        }
+        let no_one_to_ask =
+            || noted(fail(format!("{} needs the user's approval, and there's no one to ask.", call.name), &label));
+        // #77: a call the tool asks a person about itself, in one prompt (a mesh call and the new wire it needs). Never
+        // for a protected path, whose warning only the registry's prompt carries.
+        let own = match protected {
+            None => tool.approve_itself(input, &per_call, &preview).await,
+            Some(_) => None,
+        };
+        let decision = match own {
+            Some(Err(err)) => return tool_failed(err),
+            Some(Ok(decision)) => decision,
+            None => {
+                let scope = tool
+                    .scope(input, ctx)
+                    .unwrap_or_else(|| crate::types::Scope { key: call.name.clone(), description: call.name.clone() });
+                // In the home folder (the project is `~` or holds it), a file change asks each time: the edit tools write
+                // outside the sandbox, and a plain file there (a script on PATH, another repository's Makefile) can run on
+                // the host later. So no "always" is offered, no remembered or config-seeded "files" covers it, and yolo
+                // (which the session refuses there anyway) doesn't run it. One exception: a change inside one visible
+                // two-level folder (`~/Projects/shop`, not on PATH) offers "always" for that folder alone; yolo still
+                // doesn't run it and the config's "files" still doesn't cover it.
+                let home_write = home_file_write(tool.kind(), &scope.key, ctx);
+                // A turn without automatic approval (#124, a turn the radio started) asks every call `once`: no
+                // remembered "always" and no worktree subagent's automatic yes answers it.
+                let once = asked_every_time(tool.as_ref(), input, ctx)
+                    || home_file_write_once(tool.kind(), &scope.key, ctx)
+                    || tainted_sink;
+                // Yolo: a call the tool vouches for runs without asking, confined (bash then can't touch .git).
+                // `approveSandboxed` (the default): bash in the sandbox without network runs the same way, in a turn the
+                // person started or a wake; yolo or not.
+                let yolo_runs = ctx.yolo && ctx.mode.auto_approval() && tool.auto_safe(input, ctx);
+                let sandboxed_runs =
+                    ctx.approve_sandboxed && ctx.mode.runs_sandboxed_unasked() && tool.auto_sandboxed(input, ctx);
+                if (yolo_runs || sandboxed_runs) && !must_ask && !home_write {
+                    if !checkpointed().await {
+                        return interrupted(Approval::Interrupted);
+                    }
+                    // Yolo's turns are a person's; only `approveSandboxed` alone can run in a turn that mustn't change the project.
+                    let project_read_only = !yolo_runs && ctx.mode.sandboxed_unasked_project_read_only();
+                    let confined = ToolContext { confined: true, project_read_only, ..per_call };
+                    return finish(tool.run(input, &confined).await, Some(Approval::Auto));
+                }
+                let Some(approver) = &ctx.approver else { return no_one_to_ask() };
+                let request = ApprovalRequest {
+                    tool: call.name.clone(),
+                    label: label.clone(),
+                    preview,
+                    scope,
+                    agent: None,
+                    network,
+                    once,
+                    must_ask,
+                    protected,
+                    door,
+                    reason: true,
+                    persists: tainted_sink,
+                };
+                approver.approve(request).await
+            }
+        };
+        match decision {
+            Decision::Unavailable => no_one_to_ask(),
+            // Esc at the prompt answers "no" and then aborts the run: an interrupt, not "don't retry".
+            Decision::No if ctx.aborted() => interrupted(Approval::Interrupted),
+            Decision::No => {
                 let mut result = ToolOutput::ok(DECLINED, "declined");
                 result.declined = true;
                 result.approval = Some(Approval::Decided(Decision::No));
                 result.door = door;
-                return noted(ToolOutcome { result, label: label.clone() });
+                noted(ToolOutcome { result, label: label.clone() })
             }
-            let mut result = ToolOutput::ok(declined_because(&reason), "declined");
-            result.provenance = Provenance::User;
-            result.approval = Some(Approval::Decided(Decision::Declined(reason)));
-            result.door = door;
-            noted(ToolOutcome { result, label: label.clone() })
-        }
-        decision @ (Decision::Yes | Decision::Always) => {
-            // "Always" on a tainted web request covers its URL prefix, not the whole site (marv-rs S6).
-            if decision == Decision::Always
-                && must_ask
-                && let Some(prefix) = egress_url.as_deref().and_then(crate::web_fetch::url_prefix)
-            {
-                ctx.taint.approve_prefix(&prefix);
+            // #185: declined with a reason. The call doesn't run and the turn goes on: the result is an ordinary tool
+            // result (history stays append-only) saying it was declined and why. The reason is the user's own words, so
+            // it's `Provenance::User`: not fenced, and it taints nothing.
+            Decision::Declined(_) if ctx.aborted() => interrupted(Approval::Interrupted),
+            Decision::Declined(reason) => {
+                // Read once, here: what's recorded and what the model reads are the same cut, one-line text.
+                let reason = marv_core::decline_reason(&reason);
+                if reason.is_empty() {
+                    // No reason given: a plain no, which stops the run.
+                    let mut result = ToolOutput::ok(DECLINED, "declined");
+                    result.declined = true;
+                    result.approval = Some(Approval::Decided(Decision::No));
+                    result.door = door;
+                    return noted(ToolOutcome { result, label: label.clone() });
+                }
+                let mut result = ToolOutput::ok(declined_because(&reason), "declined");
+                result.provenance = Provenance::User;
+                result.approval = Some(Approval::Decided(Decision::Declined(reason)));
+                result.door = door;
+                noted(ToolOutcome { result, label: label.clone() })
             }
-            if !checkpointed().await {
-                return interrupted(Approval::Decided(decision));
+            decision @ (Decision::Yes | Decision::Always) => {
+                // "Always" on a tainted web request covers its URL prefix, not the whole site (marv-rs S6).
+                if decision == Decision::Always
+                    && must_ask
+                    && let Some(prefix) = egress_url.as_deref().and_then(crate::web_fetch::url_prefix)
+                {
+                    ctx.taint.approve_prefix(&prefix);
+                }
+                if !checkpointed().await {
+                    return interrupted(Approval::Decided(decision));
+                }
+                finish(tool.run(input, &per_call).await, Some(Approval::Decided(decision)))
             }
-            finish(tool.run(input, &per_call).await, Some(Approval::Decided(decision)))
         }
     }
+    .await;
+    redacted(outcome, &ctx.secrets)
+}
+
+/// Marv's own configured secrets ([`ToolContext::secrets`]) taken out of a finished call's result and label, before it
+/// reaches the loop: the history, the stream, the transcript and the trajectory all take it from here
+/// (docs/SECURITY.md, "Marv's own secrets never come back in a tool result").
+fn redacted(mut outcome: ToolOutcome, secrets: &marv_core::Secrets) -> ToolOutcome {
+    if secrets.is_empty() {
+        return outcome;
+    }
+    secrets.redact_in(&mut outcome.result.output);
+    secrets.redact_in(&mut outcome.label);
+    secrets.redact_in(&mut outcome.result.summary);
+    if let Some(invalid) = outcome.result.invalid.as_mut() {
+        secrets.redact_in(invalid);
+    }
+    outcome
 }
 
 #[cfg(test)]

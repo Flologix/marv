@@ -380,6 +380,9 @@ pub struct SessionInit {
     pub deadline: Option<std::time::Instant>,
     /// `marv -p --dangerously-run-unsandboxed`: the file tools may reach outside the project ([`ToolContext::files_anywhere`]).
     pub files_anywhere: bool,
+    /// Marv's own configured secrets (the provider keys: [`crate::config::configured_secrets`]), redacted from every
+    /// tool result with the MCP servers' tokens (docs/SECURITY.md). Never sent, shown or saved.
+    pub secrets: Vec<String>,
     /// Asked for every call that needs a yes; without it only what yolo vouches for runs. Wrapped by the session
     /// (`SessionApprover`): "always" scopes, `must_ask`, a stop answers "no".
     pub approve: Option<Arc<dyn Approver>>,
@@ -512,6 +515,7 @@ impl SessionInit {
             system_prompt: None,
             deadline: None,
             files_anywhere: false,
+            secrets: Vec::new(),
             approve: None,
             max_steps: None,
             plan: true,
@@ -1213,6 +1217,11 @@ impl MarvSession {
         // Built once, so every request sends byte-identical tool definitions (the skill tool only when there are
         // skills, the plan tool unless it's off, github only where gh is logged in).
         let mut specs = marv_tools::tool_specs_for(has_skills, init.plan, init.github);
+        // An unsandboxed run (`marv -p --dangerously-run-unsandboxed`, fixed for the session) gets bash's spec saying the
+        // network is on and the sandbox off, not "off by default" (Terminal-Bench, 2026-11-06).
+        if init.files_anywhere && !init.sandbox {
+            specs = specs.into_iter().map(marv_tools::bash::unsandboxed_spec).collect();
+        }
         specs.retain(|s| process_on || s.name != "process");
         // web_fetch only where a fetch can be approved (`marv -p` without the web scope leaves it out); fixed here.
         specs.retain(|s| init.web || s.name != "web_fetch");
@@ -2102,6 +2111,10 @@ impl MarvSession {
         ctx.file_versions = self.inner.file_versions.clone();
         ctx.deadline = init.deadline;
         ctx.files_anywhere = init.files_anywhere;
+        // Marv's own secrets, taken out of every result (docs/SECURITY.md): the configured keys, and the MCP servers'
+        // tokens as they are now (a server added mid-session counts from its next turn).
+        let mcp_secrets = init.mcp.as_ref().map(|m| crate::config::mcp_secrets(&m.configs())).unwrap_or_default();
+        ctx.secrets = Arc::new(marv_core::Secrets::new(init.secrets.iter().cloned().chain(mcp_secrets)));
         // The edit tools' check-and-write locks against other Marv processes in this folder: in the runtime folder,
         // else in Marv's own folder (`file_locks_dir`); with neither, within this process only.
         ctx.file_locks = marv_sandbox::runtime_dir_for(&marv_sandbox::runtime_env(), Some(&init.root))
@@ -3987,6 +4000,8 @@ impl MarvSession {
             // Only `marv -p --dangerously-run-unsandboxed` sets `files_anywhere`, with the sandbox off, and nothing
             // toggles either there: fixed for the session (init, not the live `s.sandbox`), so the cache holds.
             unsandboxed: init.files_anywhere && !init.sandbox,
+            // Measured once per process (`machine_limits`), so the cache holds.
+            limits: (init.files_anywhere && !init.sandbox).then(crate::prompt::machine_limits).flatten(),
         });
         // #124: one fixed section while this conversation offers radio_tx (never a roster, a name or a state).
         let base = if radio { format!("{base}{}", crate::radio::RADIO_PROMPT) } else { base };
@@ -4368,12 +4383,17 @@ mod tests {
         })
         .unwrap();
         assert!(s.system_prompt().contains(crate::prompt::UNSANDBOXED_FACTS), "{}", s.system_prompt());
+        // Its bash spec says the network is on (2026-11-06), fixed for the session.
+        let bash = |s: &MarvSession| s.inner.specs.iter().find(|t| t.name == "bash").cloned().unwrap();
+        assert_eq!(bash(&s).description, marv_tools::bash::UNSANDBOXED_DESCRIPTION);
         let before = s.build_system();
         s.configure(Configure { sandbox: Some(true), ..Default::default() }).unwrap();
         assert_eq!(s.build_system(), before);
+        assert_eq!(bash(&s).description, marv_tools::bash::UNSANDBOXED_DESCRIPTION);
         for sandbox in [true, false] {
             let other = session(|i| i.sandbox = sandbox).unwrap();
             assert!(!other.system_prompt().contains(crate::prompt::UNSANDBOXED_FACTS));
+            assert_ne!(bash(&other).description, marv_tools::bash::UNSANDBOXED_DESCRIPTION);
         }
     }
 
