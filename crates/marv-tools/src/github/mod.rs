@@ -238,8 +238,8 @@ async fn run_gh(
     };
     let deadline = tokio::time::sleep(timeout);
     tokio::pin!(deadline);
-    let Captured { output: out, errors: err, timed_out, aborted } =
-        capture_until(stdout, stderr, deadline.as_mut(), cancel, std::future::pending(), || {
+    let Captured { output: out, errors: err, timed_out, aborted, .. } =
+        capture_until(stdout, stderr, deadline.as_mut(), cancel, std::future::pending(), false, || {
             let _ = child.start_kill();
         })
         .await;
@@ -252,7 +252,7 @@ async fn run_gh(
         out
     };
     let exit_code = if timed_out || aborted { None } else { status.and_then(|s| s.code()) };
-    Ok(CommandResult { output, exit_code, timed_out, aborted, timeout: Some(timeout) })
+    Ok(CommandResult { output, exit_code, timed_out, aborted, timeout: Some(timeout), ..Default::default() })
 }
 
 static PLAIN_ARG: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_@%+=:,./{}-]+$").unwrap());
