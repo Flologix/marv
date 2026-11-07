@@ -106,9 +106,9 @@ pub fn max_tokens_for_reasoning(max_output: Option<u64>, effort: Option<crate::R
 }
 
 /// marv-rs: `StreamOptions::effort_cap` for one request: an effort in the body's `reasoning` above `cap` goes down to it,
-/// and with it the bigger cap deep reasoning gets ([`DEEP_REASONING_MAX_TOKENS`] falls back to [`DEFAULT_MAX_TOKENS`]
-/// below `xhigh`), so a retry after a reply that reasoned until the limit can't spend as much again. A body without an
-/// effort is left alone.
+/// so a retry after a reply that reasoned until the limit reasons less. `max_tokens` stays: dropping the 64k
+/// deep-reasoning cap to 32k with it left `regex-chess` reasoning past 32k at `high` until the run ended (TB
+/// 2026-11-06). A body without an effort is left alone.
 pub fn cap_effort(options: &mut OpenAiCompatOptions, cap: crate::ReasoningEffort) {
     let Some(effort) = options.body.get_mut("reasoning").and_then(|r| r.get_mut("effort")) else { return };
     let Some(current) = effort.as_str().and_then(crate::ReasoningEffort::parse) else { return };
@@ -116,9 +116,6 @@ pub fn cap_effort(options: &mut OpenAiCompatOptions, cap: crate::ReasoningEffort
         return;
     }
     *effort = Value::from(cap.as_str());
-    if cap < crate::ReasoningEffort::Xhigh {
-        options.max_tokens = options.max_tokens.map(|n| n.min(DEFAULT_MAX_TOKENS));
-    }
 }
 
 /// #96: how a provider says it won't take the `max_tokens` Marv sent: it names the field, or (OpenRouter) the prompt
@@ -1304,7 +1301,7 @@ mod tests {
     }
 
     #[test]
-    fn an_effort_cap_lowers_the_effort_and_the_deep_reasoning_cap_for_one_request() {
+    fn an_effort_cap_lowers_the_effort_but_not_the_output_cap_for_one_request() {
         use crate::ReasoningEffort::{High, Low};
         let mut options =
             OpenAiCompatOptions { model: "acme/m".into(), max_tokens: Some(DEEP_REASONING_MAX_TOKENS), ..Default::default() };
@@ -1312,7 +1309,7 @@ mod tests {
         let mut capped = options.clone();
         cap_effort(&mut capped, High);
         assert_eq!(capped.body["reasoning"], serde_json::json!({"effort": "high"}));
-        assert_eq!(capped.max_tokens, Some(DEFAULT_MAX_TOKENS));
+        assert_eq!(capped.max_tokens, Some(DEEP_REASONING_MAX_TOKENS));
         // Never raised, and never added where no effort is sent.
         let mut low = options.clone();
         low.body.insert("reasoning".into(), serde_json::json!({"effort": "low"}));

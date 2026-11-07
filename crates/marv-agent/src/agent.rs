@@ -149,9 +149,12 @@
 //!   deliverable it may be saving); the deadline itself still stops it. Not for the step limit's tools-off wrap-up.
 //! - **Retry after a reasoning-only cut-off reasons less** (marv-rs, same run: three replies in a row spent the whole
 //!   64k-token budget reasoning, about 400 s each, and each retry re-derived the same reasoning, which is discarded).
-//!   The requests after one go with `StreamOptions::effort_cap` = [`CUT_OFF_RETRY_EFFORT`] (`high`) until a step
-//!   finishes: the provider lowers an effort it sends above that (OpenRouter's `reasoning.effort`, the Responses API's)
-//!   and with it the 64k deep-reasoning cap to 32k; it never adds one. Effort isn't part of the prompt, so the cached
+//!   The requests after one go with `StreamOptions::effort_cap` = [`CUT_OFF_RETRY_EFFORT`] (`high`), and after a
+//!   second in a row [`CUT_OFF_LAST_RETRY_EFFORT`] (`low`), until a step finishes: the provider lowers an effort it
+//!   sends above that (OpenRouter's `reasoning.effort`, the Responses API's); it never adds one. The output cap stays:
+//!   a first version also dropped the 64k deep-reasoning cap to 32k, and `regex-chess` (5/5 before) then reasoned past
+//!   32k at `high` three times in a row and the run ended at step 5 with 53 minutes left (TB 2026-11-06, the second
+//!   k=1 run). Effort isn't part of the prompt, so the cached
 //!   prefix holds. [`CUT_OFF_REASONING_NOTE`] still says to reason briefly. Carrying the discarded reasoning as a note
 //!   was not chosen: it would put up to 64k tokens of unvetted text into the history for good.
 //! - **Notes are logged** (marv-rs; audits of the same run had to infer them): every note Marv gives the model is also
@@ -238,6 +241,10 @@ pub const CUT_OFF_REASONING_NOTE: &str = "(Automatic note from Marv, the program
 /// (`StreamOptions::effort_cap`), until a step finishes. `high`: nearly every reasoning model takes it (DeepSeek V4.1
 /// Flash takes max, high and low), and below `xhigh` the provider's output cap drops back from 64k to 32k tokens.
 pub const CUT_OFF_RETRY_EFFORT: marv_provider::ReasoningEffort = marv_provider::ReasoningEffort::High;
+
+/// marv-rs: the effort cap after a second reasoning-only cut-off in a row: `high` can still reason past the whole
+/// budget (`regex-chess`, TB 2026-11-06), and the next one would end the run.
+pub const CUT_OFF_LAST_RETRY_EFFORT: marv_provider::ReasoningEffort = marv_provider::ReasoningEffort::Low;
 
 /// Told to the model after a second empty reply in a row. The first is asked for again unchanged:
 /// upstream hosts sometimes bill for a reply and send nothing, and a resample usually comes back
@@ -1354,7 +1361,11 @@ impl LoopState {
                     cancel: request.clone(),
                     debug_raw: self.options.debug_raw,
                     // After a reply that reasoned until the output limit, the retry reasons less (the module doc).
-                    effort_cap: self.reasoning_cut_off.then_some(CUT_OFF_RETRY_EFFORT),
+                    effort_cap: self.reasoning_cut_off.then_some(if self.cut_offs >= 2 {
+                        CUT_OFF_LAST_RETRY_EFFORT
+                    } else {
+                        CUT_OFF_RETRY_EFFORT
+                    }),
                 };
                 let stream = self.options.provider.stream(&snapshot, options);
                 self.phase = Phase::Streaming { stream, reply: StepReply::default(), wrap_up, request };
@@ -3066,9 +3077,9 @@ mod tests {
         let events = collect(options(provider.clone(), &history(vec![user("go")]), plain())).await;
         assert_eq!(end(&events), Some(StopReason::End));
         let caps: Vec<_> = provider.requests().iter().map(|(_, o)| o.effort_cap).collect();
-        let high = Some(CUT_OFF_RETRY_EFFORT);
-        // A cut-off that wrote text isn't reasoning too much: no cap after it.
-        assert_eq!(caps, [None, high, high, None, None]);
+        let (high, low) = (Some(CUT_OFF_RETRY_EFFORT), Some(CUT_OFF_LAST_RETRY_EFFORT));
+        // A second in a row goes lower still; a cut-off that wrote text isn't reasoning too much: no cap after it.
+        assert_eq!(caps, [None, high, low, None, None]);
         assert_eq!(notes(&events, NoteKind::CutOff).len(), 3);
     }
 
