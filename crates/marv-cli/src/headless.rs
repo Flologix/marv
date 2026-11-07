@@ -321,6 +321,9 @@ impl Collector {
                     L::TextLoop { continued } => Some(json!({"type": "text_loop", "continued": continued})),
                     L::AnnouncedStep { continued } => Some(json!({"type": "announced_step", "continued": continued})),
                     L::ToolLoop { continued } => Some(json!({"type": "tool_loop", "continued": continued})),
+                    // marv-rs: Marv's notes to the model, as it got them (the deadline note, the time-left footer, the
+                    // loop guards'), so a run's log shows them.
+                    L::Note { kind, text } => Some(json!({"type": "note", "kind": kind.as_str(), "text": text})),
                     _ => None,
                 }
             }
@@ -805,6 +808,29 @@ mod tests {
             c.event(&SessionEvent::Compaction(recovered)),
             Some(serde_json::json!({"type": "compaction", "compacted": true, "trigger": "overflow", "level": 2}))
         );
+    }
+
+    // marv-rs: Marv's notes to the model reach stream-json as `note` events, text as the model got it.
+    #[test]
+    fn marvs_notes_are_note_events() {
+        use marv_agent::agent::NoteKind;
+        let mut c = Collector::default();
+        let note = |kind, text: &str| SessionEvent::Loop(LoopEvent::Note { kind, text: text.into() });
+        let text = marv_agent::agent::deadline_note(std::time::Duration::from_secs(80));
+        assert_eq!(
+            c.event(&note(NoteKind::Deadline, &text)),
+            Some(serde_json::json!({"type": "note", "kind": "deadline", "text": text}))
+        );
+        assert_eq!(
+            c.event(&note(NoteKind::TimeLeft, "[time left in this run: 1m 20s]")),
+            Some(serde_json::json!({"type": "note", "kind": "time_left", "text": "[time left in this run: 1m 20s]"}))
+        );
+        assert_eq!(
+            c.event(&note(NoteKind::ToolLoop, "Marv: …")).and_then(|v| v["kind"].as_str().map(String::from)),
+            Some("tool_loop".into())
+        );
+        // Not a step of the model's.
+        assert_eq!(c.steps, 0);
     }
 
     // #52: a command for the host is refused in -p whatever --approve says, and listed as refused (exit 3).

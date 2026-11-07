@@ -267,6 +267,8 @@ pub fn map_loop(event: &LoopEvent, totals: &dyn Fn() -> view::Totals) -> Option<
         L::Discarded { .. } => return None,
         // Marv #63: the session's compaction notice that follows says what was done about it.
         L::Overflow { .. } => return None,
+        // marv-rs: Marv's notes to the model are for the logs (stream-json, the trajectory); the TUI shows what follows.
+        L::Note { .. } => return None,
         L::TextDelta(text) => UiEvent::TextDelta(text.clone()),
         L::ThinkingDelta(text) => UiEvent::ThinkingDelta(text.clone()),
         L::Usage(usage, _) => UiEvent::Usage { last: *usage, totals: totals() },
