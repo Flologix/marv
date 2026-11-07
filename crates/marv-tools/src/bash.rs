@@ -13,6 +13,11 @@
 //!   which takes its PID namespace down with it), spawned with the environment it gives. Not sandboxed: in a process
 //!   group of its own (Marv: `setsid`; here `process_group(0)`, same effect), so a timeout or ctrl+c kills everything
 //!   it started; still a minimal environment (no API keys).
+//! - marv-rs: not sandboxed, the call ends soon after the shell exits ([`DETACH_GRACE`]), not when the output pipes
+//!   close, and nothing is killed then. Marv waited for the pipes, so `cd dir && server > log 2>&1 &` (the whole `&&`
+//!   list backgrounded in a subshell that keeps the pipes) held the call to its timeout, whose group kill then took
+//!   the server down. What a background job prints after that isn't shown, and the result says so
+//!   ([`HELD_OPEN_NOTE`]); the pipes are still read, so it isn't killed by SIGPIPE.
 //! - Confined (yolo): `.git` read-only or an empty placeholder (`git_guard`; the placeholder's mount point is
 //!   `rmdir`ed afterwards, by the backend's `after`). A confined command that fails on the read-only `.git` gets
 //!   `GIT_HINT`. An approved command in a worktree gets the checked worktree folders writable, except folders the
@@ -90,6 +95,10 @@ pub struct CommandResult {
     pub timed_out: bool,
     pub aborted: bool,
     pub timeout: Option<Duration>,
+    /// Outside the sandbox: the shell exited while something it started in the background still held its output
+    /// (`cd dir && server > log 2>&1 &` backgrounds a subshell that keeps the pipe); the call returned without waiting
+    /// for it, and what it prints from then on isn't shown.
+    pub held_open: bool,
 }
 
 /// One command to run.
@@ -271,7 +280,11 @@ pub async fn run_command(
     // The sandbox program's exit, seen without reaping it: then the backend ends what the command left running in
     // the background (`sleep 600 &`; bwrap's PID namespace did that, Seatbelt has none) before the pipes are drained,
     // which such leftovers would hold open, and while the group's id can't be reused.
-    let mut exit = if sandboxed { ExitWatch::spawn(pid) } else { ExitWatch::none() };
+    // Outside the sandbox too: there, nothing is killed at the exit, but the call ends with it. The pipes alone can't
+    // say when: `cd dir && server > log 2>&1 &` backgrounds a subshell for the whole `&&` list, and that subshell keeps
+    // the pipes (only `server`'s own output is redirected), so waiting for them held the call to its timeout, whose
+    // group kill then took the server down (Terminal-Bench 2026-11-06: 20 of 110 background launches).
+    let mut exit = ExitWatch::spawn(pid);
 
     // The sweep, once started (see `start_sweep`).
     type Sweep = (Option<tokio::sync::oneshot::Receiver<()>>, bool);
@@ -321,8 +334,12 @@ pub async fn run_command(
                     (None, false)
                 }
             }
+            // Outside the sandbox, only after a kill (a timeout, a stop): a command that exited on its own leaves what it
+            // started in the background running (`nohup server > log 2>&1 &`), as the prompt promises.
             Some(pid) => {
-                marv_sandbox::kill_group(pid);
+                if killed {
+                    marv_sandbox::kill_group(pid);
+                }
                 (None, false)
             }
             None => (None, false),
@@ -338,8 +355,8 @@ pub async fn run_command(
         }
         start_sweep();
     };
-    let Captured { output, errors, mut timed_out, mut aborted } =
-        capture_until(stdout, stderr, deadline.as_mut(), cancel, ended, || kill(&mut child)).await;
+    let Captured { output, errors, mut timed_out, mut aborted, held_open } =
+        capture_until(stdout, stderr, deadline.as_mut(), cancel, ended, !sandboxed, || kill(&mut child)).await;
     // Set when the loop below ends on the program's exit, seen and not reaped: it's reaped after the sweep.
     let mut reap_after_sweep = false;
     // The pipes can close long before the command ends (`exec >/dev/null 2>&1; sleep 60`): the timeout and the stop
@@ -429,12 +446,16 @@ pub async fn run_command(
     if sandboxed && exit_code.is_some_and(|c| c != 0) && output.trim().is_empty() && !errors.trim().is_empty() {
         output = format!("[sandbox failed to start: {}]\n", errors.trim());
     }
-    CommandResult { output, exit_code, timed_out, aborted, timeout: Some(timeout) }
+    CommandResult { output, exit_code, timed_out, aborted, timeout: Some(timeout), held_open }
 }
 
 /// How long the output pipes are still read after a timeout or a stop killed the command: a process that left its
 /// group (`setsid`) can hold them open, and isn't waited for.
 pub const KILL_GRACE: Duration = Duration::from_secs(2);
+
+/// Outside the sandbox, how long the output pipes are still read after the shell exited while something it left
+/// running holds them: the call then returns (see [`capture_until`]'s `detach`).
+pub const DETACH_GRACE: Duration = Duration::from_millis(500);
 
 /// Both pipes' text, and whether `deadline` or `cancel` ended the command.
 pub(crate) struct Captured {
@@ -442,6 +463,8 @@ pub(crate) struct Captured {
     pub errors: String,
     pub timed_out: bool,
     pub aborted: bool,
+    /// See [`CommandResult::held_open`].
+    pub held_open: bool,
 }
 
 /// Reads both pipes at once (so neither fills up and blocks the other) until they close. At `deadline` or `cancel`,
@@ -450,18 +473,35 @@ pub(crate) struct Captured {
 /// at most [`KILL_GRACE`] more; neither the deadline nor a stop counts after that. `ended` is watched after a deadline
 /// or a stop too (#247): a process that missed their kill is ended as soon as the command has exited, not after the
 /// grace.
+///
+/// `detach` (a command outside the sandbox): `ended` kills nothing. What the command left running is its own (a
+/// server it started with `nohup … &`); the pipes are read for [`DETACH_GRACE`] more, then the call returns with what
+/// it has and `held_open` set, and the pipes go on being read (and dropped) until whatever holds them exits, so a
+/// background job that still prints isn't killed by SIGPIPE.
 pub(crate) async fn capture_until(
-    stdout: impl AsyncRead + Unpin,
-    stderr: impl AsyncRead + Unpin,
+    stdout: impl AsyncRead + Unpin + Send + 'static,
+    stderr: impl AsyncRead + Unpin + Send + 'static,
     mut deadline: std::pin::Pin<&mut tokio::time::Sleep>,
     cancel: &tokio_util::sync::CancellationToken,
     ended: impl std::future::Future<Output = ()>,
+    detach: bool,
     mut kill: impl FnMut(),
 ) -> Captured {
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let (mut timed_out, mut aborted, mut done) = (false, false, false);
+    // Each pipe read by a task of its own, so the reads can outlive this call (`detach`); stopped when they can't.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(bool, Vec<u8>)>(16);
+    let readers = [tokio::spawn(read_pipe(stdout, false, tx.clone())), tokio::spawn(read_pipe(stderr, true, tx))];
+    let mut closed = false;
     {
-        let io = async { tokio::join!(capture_into(stdout, &mut out), capture_into(stderr, &mut err)) };
+        let io = async {
+            while let Some((is_err, chunk)) = rx.recv().await {
+                let kept = if is_err { &mut err } else { &mut out };
+                if kept.len() < MAX_CAPTURE {
+                    kept.extend_from_slice(&chunk);
+                }
+            }
+        };
         tokio::pin!(io);
         tokio::pin!(ended);
         let grace = tokio::time::sleep(Duration::MAX);
@@ -469,21 +509,53 @@ pub(crate) async fn capture_until(
         loop {
             let ending = !timed_out && !aborted && !done;
             tokio::select! {
-                _ = &mut io => break,
+                () = &mut io => {
+                    closed = true;
+                    break;
+                }
                 () = &mut deadline, if ending => timed_out = true,
                 () = cancel.cancelled(), if ending => aborted = true,
-                () = &mut ended, if !done => done = true,
+                () = &mut ended, if !done => {
+                    done = true;
+                    if detach && ending {
+                        grace.as_mut().reset(tokio::time::Instant::now() + DETACH_GRACE);
+                        continue;
+                    }
+                }
                 () = &mut grace => break,
             }
             kill();
             grace.as_mut().reset(tokio::time::Instant::now() + KILL_GRACE);
         }
     }
+    let held_open = !closed && detach && done && !timed_out && !aborted;
+    if !held_open {
+        // Killed (or nothing left to read): the pipes are let go, as before.
+        for reader in &readers {
+            reader.abort();
+        }
+    }
     let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
-    Captured { output: text(&out), errors: text(&err), timed_out, aborted }
+    Captured { output: text(&out), errors: text(&err), timed_out, aborted, held_open }
 }
 
-/// Whether a sandboxed command's program has exited, seen without reaping it ([`marv_sandbox::wait_exited`], on a
+/// Reads `stream` to its end, sending each chunk on; once nobody takes them (the call returned, `detach`), what's
+/// read is dropped. Ends at the end of the stream.
+async fn read_pipe(mut stream: impl AsyncRead + Unpin, is_err: bool, chunks: tokio::sync::mpsc::Sender<(bool, Vec<u8>)>) {
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        match stream.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if !chunks.is_closed() {
+                    let _ = chunks.send((is_err, chunk[..n].to_vec())).await;
+                }
+            }
+        }
+    }
+}
+
+/// Whether a command's program (the sandbox program, or the shell outside the sandbox) has exited, seen without reaping it ([`marv_sandbox::wait_exited`], on a
 /// blocking thread). Where that can't be seen ([`ExitWatch::none`], or a platform without it), [`ExitWatch::exited`]
 /// says false at once, and the caller waits for the child as usual.
 struct ExitWatch(Option<tokio::sync::watch::Receiver<Option<bool>>>);
@@ -551,23 +623,14 @@ impl Drop for KillGroupOnDrop {
     }
 }
 
-/// Reads `stream` into `kept`, up to about [`MAX_CAPTURE`] (whole chunks are kept while under it; the rest is read
-/// and dropped). What's read stays in `kept` if the read is dropped.
-async fn capture_into(mut stream: impl AsyncRead + Unpin, kept: &mut Vec<u8>) {
-    let mut chunk = vec![0u8; 64 * 1024];
-    loop {
-        match stream.read(&mut chunk).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) if kept.len() < MAX_CAPTURE => kept.extend_from_slice(&chunk[..n]),
-            Ok(_) => {}
-        }
-    }
-}
-
 /// The real path, or the path itself when it doesn't resolve.
 fn real_or_self(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
+
+/// Outside the sandbox, after a command whose shell exited while something it started in the background still held its
+/// output ([`CommandResult::held_open`]).
+pub const HELD_OPEN_NOTE: &str = "Marv: the command ended while something it started in the background still held its output; that keeps running, but what it prints from now on isn't shown. To read a background job's output later, redirect it to a file (`( cd dir && cmd ) > log 2>&1 &`) and read the file.";
 
 /// A command that ran unasked in a woken turn failed on the read-only project.
 const WOKEN_READ_ONLY_NOTE: &str = "Marv: this turn was started by another agent's message, so a command that runs without asking sees the project read-only (it can still build into /tmp). To change project files use edit_file or write_file, or set git_write: true on a command that has to write (the user is asked first).";
@@ -985,6 +1048,9 @@ impl Tool for Bash {
             let note = if ctx.doors.process { BACKGROUND_NOTE_PROCESS } else { BACKGROUND_NOTE };
             result.output.push_str(&format!("\n{note}\n"));
         }
+        if result.held_open {
+            result.output.push_str(&format!("\n{HELD_OPEN_NOTE}\n"));
+        }
         // Not for a command that isn't there (127) or can't run (126): the network has nothing to do with those.
         let failed = result.timed_out || (!result.aborted && !matches!(result.exit_code, Some(0 | 126 | 127)));
         // `|| true` hides a failure like a pipe does (#81): a network command that printed a network error counts.
@@ -1261,6 +1327,76 @@ mod tests {
         let result = run_command(options, &Sandbox::from_env(true), &cancel).await;
         assert!(result.aborted && result.exit_code.is_none(), "{result:?}");
         assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+    }
+
+    /// Terminal-Bench 2026-11-06: `cd dir && server > log 2>&1 &` backgrounds a subshell for the whole `&&` list, which
+    /// keeps the call's output pipes (only `server`'s own output is redirected). Waiting for the pipes held 20 of 110
+    /// background launches to their timeout, and the timeout's group kill took the server down.
+    #[tokio::test]
+    async fn a_background_job_that_holds_the_pipes_doesnt_hold_the_call() {
+        let root = TempDir::new("bash-held");
+        let started = std::time::Instant::now();
+        let result = run("cd /tmp && sleep 30 > /dev/null 2>&1 &", root.path()).await;
+        assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+        assert_eq!((result.exit_code, result.timed_out, result.held_open), (Some(0), false, true), "{result:?}");
+        // What came before and after the launch is returned.
+        let result = run("echo before; cd /tmp && sleep 30 > /dev/null 2>&1 & echo after", root.path()).await;
+        assert_eq!(result.output, "before\nafter\n");
+        // A command whose pipes close at its exit isn't marked.
+        assert!(!run("(sleep 30 > /dev/null 2>&1 &); echo hi", root.path()).await.held_open);
+    }
+
+    /// The job keeps running after the call (nothing is killed at a normal exit outside the sandbox), and keeps
+    /// running when it prints after the call returned: its output is still read, so no SIGPIPE.
+    #[tokio::test]
+    async fn a_background_job_outlives_the_call_even_when_it_prints_afterwards() {
+        let root = TempDir::new("bash-held-lives");
+        let command =
+            "cd . && sh -c 'sleep 1; touch quiet' > /dev/null 2>&1 & sh -c 'sleep 1; echo late; echo later; touch loud' &";
+        let started = std::time::Instant::now();
+        let result = run(command, root.path()).await;
+        assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+        assert!(result.held_open && !result.output.contains("late"), "{result:?}");
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert!(root.path().join("quiet").exists(), "the background job was killed with the call");
+        assert!(root.path().join("loud").exists(), "the background job that printed was killed");
+    }
+
+    /// A foreground command that hangs still times out, with what it backgrounded first (its group is killed).
+    #[tokio::test]
+    async fn a_hung_command_after_a_background_launch_still_times_out() {
+        let root = TempDir::new("bash-held-hung");
+        let command = "cd . && sh -c 'sleep 2; touch late' > /dev/null 2>&1 & sleep 30";
+        let options = RunOptions { timeout: Duration::from_secs(1), ..options(command, root.path()) };
+        let started = std::time::Instant::now();
+        let result = run_command(options, &Sandbox::from_env(true), &CancellationToken::new()).await;
+        assert!(result.timed_out && !result.held_open, "{result:?}");
+        assert!(started.elapsed() < Duration::from_secs(4), "{:?}", started.elapsed());
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert!(!root.path().join("late").exists(), "the timeout left the group running");
+    }
+
+    /// In the sandbox nothing changes: what a command backgrounds ends with it, pipes held or not, and the call
+    /// returns at once.
+    #[tokio::test]
+    async fn in_the_sandbox_a_background_job_that_holds_the_pipes_ends_with_the_command() {
+        require_bwrap!();
+        let root = TempDir::new("bash-held-sandboxed");
+        let started = std::time::Instant::now();
+        let result = sandboxed("cd . && sh -c 'sleep 1; touch late' > /dev/null 2>&1 & echo started", root.path()).await;
+        assert!(started.elapsed() < Duration::from_secs(4), "{:?}", started.elapsed());
+        assert_eq!((result.output.as_str(), result.exit_code, result.held_open), ("started\n", Some(0), false), "{result:?}");
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(!root.path().join("late").exists(), "a sandboxed background job outlived the command");
+    }
+
+    #[tokio::test]
+    async fn the_held_open_note_is_added_by_the_bash_tool() {
+        let root = TempDir::new("bash-held-note");
+        let held = Bash.run(&bash("cd /tmp && sleep 30 > /dev/null 2>&1 &"), &tool_ctx(&root, false)).await.unwrap();
+        assert!(held.output.contains(HELD_OPEN_NOTE), "{}", held.output);
+        let plain = Bash.run(&bash("echo hi"), &tool_ctx(&root, false)).await.unwrap();
+        assert!(!plain.output.contains(HELD_OPEN_NOTE), "{}", plain.output);
     }
 
     #[tokio::test]

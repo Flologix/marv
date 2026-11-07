@@ -187,6 +187,34 @@ async fn a_stop_before_the_sandbox_is_up_still_stops_the_command() {
     assert!(ran_on.is_empty(), "the stopped command went on running: {ran_on:#?}");
 }
 
+/// **What a sandboxed command leaves running ends with it, also a job that holds its output pipes**, on both backends.
+/// Outside the sandbox the call now ends at the shell's exit and leaves such a job running (`cd dir && server > log
+/// 2>&1 &` backgrounds a subshell that keeps the pipes; Terminal-Bench 2026-11-06), which must not carry over: in the
+/// sandbox the call still ends at once and the job is gone.
+///
+/// Proven: sandboxed commands given the outside-the-sandbox ending (`detach`, no sweep at a normal exit) and run
+/// without the backend → failed (`late` appeared). With the backend still on, bubblewrap's PID namespace ends the job
+/// on its own; on Seatbelt the sweep at the guard's exit is what ends it.
+#[tokio::test]
+async fn a_sandboxed_background_job_that_holds_the_pipes_ends_with_the_command() {
+    require_sandbox!();
+    let (project, home) = (TempDir::new("held-pipes"), TempDir::outside_tmp("held-pipes-home"));
+    let options = marv_tools::bash::RunOptions {
+        command: "cd . && sh -c 'sleep 1; touch late' > /dev/null 2>&1 & echo started".into(),
+        root: project.path().to_path_buf(),
+        sandbox: true,
+        timeout: std::time::Duration::from_secs(30),
+        ..Default::default()
+    };
+    let started = std::time::Instant::now();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let result = marv_tools::bash::run_command(options, &sandbox_with_home(home.path()), &cancel).await;
+    assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+    assert_eq!((result.output.as_str(), result.exit_code, result.held_open), ("started\n", Some(0), false), "{result:?}");
+    tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+    assert!(!project.path().join("late").exists(), "a sandboxed background job outlived its command");
+}
+
 // ---- the stand-in home ---------------------------------------------------------------------------------------
 
 /// **A stand-in home, toolchains re-mounted read-only, credential files masked.** `~/.ssh` and `~/.marv` (the API
