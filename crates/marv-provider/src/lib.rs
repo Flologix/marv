@@ -62,6 +62,12 @@ pub struct StreamOptions {
     /// [`marv_core::ProviderEvent::Usage`] event, for the trajectory's `request` record. Off by
     /// default; the session turns it on from `MARV_DEBUG_RAW`.
     pub debug_raw: bool,
+    /// marv-rs: the most reasoning effort this one request may use, for a provider set to more (the agent loop's retry
+    /// after a reply that spent its whole output budget reasoning, Terminal-Bench 2026-11-06 `dna-insert`). Only ever
+    /// lowers an effort the provider sends: one it doesn't send isn't added, so no model gets a level it may refuse.
+    /// Effort is a request setting, not part of the prompt, so the cached prefix holds (the messages, the system prompt
+    /// and the tools keep their bytes). `None`: the provider's own setting. Ollama has no effort and ignores it.
+    pub effort_cap: Option<ReasoningEffort>,
 }
 
 pub trait Provider: Send + Sync {

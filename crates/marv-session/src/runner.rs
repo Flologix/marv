@@ -418,6 +418,16 @@ mod tests {
         assert!(marv_sandbox::notes::NETWORK_NOTE.starts_with(marv_agent::repetition::NETWORK_NOTE_START));
     }
 
+    // marv-rs: the loop reads on after a repeated truncated read from the offset read_file's page names.
+    #[test]
+    fn the_agent_reads_read_files_next_page_offset() {
+        let text: String = (1..=586).map(|i| format!("line {i}\n")).collect();
+        let page = marv_tools::read_file::render(&text, 1, marv_tools::read_file::DEFAULT_LIMIT, "interp.py").unwrap();
+        assert_eq!(marv_agent::repetition::next_page_offset(&page.output), Some(401));
+        let last = marv_tools::read_file::render(&text, 401, marv_tools::read_file::DEFAULT_LIMIT, "interp.py").unwrap();
+        assert_eq!(marv_agent::repetition::next_page_offset(&last.output), None);
+    }
+
     #[test]
     fn subagents_dont_inherit_egress_scopes() {
         let always = AlwaysScopes::default();

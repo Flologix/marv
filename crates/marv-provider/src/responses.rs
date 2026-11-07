@@ -604,7 +604,12 @@ impl Provider for ResponsesProvider {
             tool_choice: options.tool_choice,
             note: None,
         };
-        let (client, adapter, cancel, debug_raw) = (self.client.clone(), self.options.clone(), options.cancel, options.debug_raw);
+        let (client, mut adapter, cancel, debug_raw) =
+            (self.client.clone(), self.options.clone(), options.cancel, options.debug_raw);
+        // marv-rs: a lower effort for this one request (`StreamOptions::effort_cap`); never raised or added.
+        if let (Some(cap), Some(effort)) = (options.effort_cap, adapter.reasoning_effort) {
+            adapter.reasoning_effort = Some(effort.min(cap));
+        }
         channel_stream(move |emit| run(client, adapter, outgoing, cancel, debug_raw, emit))
     }
 }

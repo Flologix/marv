@@ -28,6 +28,17 @@
 //!   any later, unrelated loop end the run without a word; here [`TOOL_LOOP_PROGRESS`] distinct calls that ran and
 //!   succeeded since the warning reset it ([`ToolLoopState::progressed`]). The hard stop stays: at most
 //!   [`MAX_TOOL_LOOP_RESCUES`] final turns a run, and a loop right after one ends the run.
+//! - **Read-only loops don't end a run early** (marv-rs, Terminal-Bench 2026-11-06 `schemelike-metacircular-eval`:
+//!   a `read_file` re-sent without `offset` went warn, final turn, stop in three steps, 22 s into a 40-minute budget,
+//!   nothing written). Repeating a call that only reads ([`READ_ONLY_TOOLS`]) costs a step and harms nothing, so such a
+//!   loop is warned about up to [`MAX_READ_ONLY_LOOP_WARNINGS`] times in a row ([`ToolLoopState::escalate_read_only`])
+//!   before the escalation above applies; a loop with any other call (side effects) escalates as before.
+//! - **A truncated read repeated reads on** (marv-rs, same runs): [`ReadPages`] remembers, for each `read_file` call
+//!   (by its normalized arguments) whose last result was a page with more after it, the offset that page names
+//!   ([`next_page_offset`]: Marv's `Use offset=N to read more.`). The same call again, with nothing run in between
+//!   that may have changed the file, is run with that offset ([`with_offset`], for the runner only: the call in the
+//!   history stays as the model sent it) and its result says so ([`read_on_note`]). A call that may change things
+//!   (any tool not in [`READ_ONLY_TOOLS`], bash unless its command only reads) and a compaction forget the pages.
 //!
 //! Port note: Marv measures lengths in UTF-16 units; here the text thresholds count `char`s.
 
@@ -121,6 +132,10 @@ pub const TOOL_LOOP_PROGRESS: usize = 5;
 /// Final turns a run may get after looping past a warning; past them the next loop past a warning ends the run.
 pub const MAX_TOOL_LOOP_RESCUES: u32 = 2;
 
+/// Warnings in a row a loop of read-only calls ([`READ_ONLY_TOOLS`]) gets before the final turn and the stop: such a
+/// loop costs a step each time and changes nothing, so it only ends a run that is truly stuck.
+pub const MAX_READ_ONLY_LOOP_WARNINGS: u32 = 5;
+
 /// What to do about a detected loop ([`ToolLoopState::escalate`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoopVerdict {
@@ -145,6 +160,8 @@ pub struct ToolLoopState {
     pub rescues: u32,
     /// Distinct calls that ran and succeeded since the warning.
     pub progress: std::collections::HashSet<ToolCallKey>,
+    /// Warnings given in a row to loops of read-only calls (since the last progress).
+    pub read_only_warnings: u32,
 }
 
 impl ToolLoopState {
@@ -163,6 +180,18 @@ impl ToolLoopState {
         LoopVerdict::Stop
     }
 
+    /// A loop of read-only calls was detected: a warning, up to [`MAX_READ_ONLY_LOOP_WARNINGS`] times in a row, then
+    /// [`Self::escalate`] (the final turn, then the stop).
+    pub fn escalate_read_only(&mut self) -> LoopVerdict {
+        if self.read_only_warnings < MAX_READ_ONLY_LOOP_WARNINGS && !self.final_chance {
+            self.progress.clear();
+            self.warned = true;
+            self.read_only_warnings += 1;
+            return LoopVerdict::Warn;
+        }
+        self.escalate()
+    }
+
     /// A call ran and succeeded. After a warning, [`TOOL_LOOP_PROGRESS`] distinct ones forget it (and the final turn).
     pub fn progressed(&mut self, key: ToolCallKey) {
         if !self.warned {
@@ -172,6 +201,7 @@ impl ToolLoopState {
         if self.progress.len() >= TOOL_LOOP_PROGRESS {
             self.warned = false;
             self.final_chance = false;
+            self.read_only_warnings = 0;
             self.progress.clear();
         }
     }
@@ -398,6 +428,81 @@ impl FailureLoopState {
     pub fn repeated(&self, name: &str, arguments: &str) -> Option<(usize, String)> {
         let key = command_call_key(name, arguments)?;
         self.failures.get(&key).filter(|f| f.count >= FAILURE_REPEATS).map(|f| (f.count, f.shown.clone()))
+    }
+}
+
+/// Whether every call of a step only reads ([`READ_ONLY_TOOLS`]): a loop of them is escalated more gently.
+pub fn only_reads(names: &[&str]) -> bool {
+    !names.is_empty() && names.iter().all(|name| READ_ONLY_TOOLS.contains(name))
+}
+
+/// How `read_file`'s page ends when the file goes on (Marv's `read-file.ts`, byte for byte: `(Showing lines 1-400 of
+/// 586. Use offset=401 to read more.)`). marv-tools isn't a dependency, so marv-session's tests hold the two together.
+pub const READ_MORE_START: &str = " Use offset=";
+pub const READ_MORE_END: &str = " to read more.)";
+
+/// The offset a `read_file` result says to pass to read on, when the page it showed isn't the end of the file. Only
+/// when that's how the result ends, so a file whose own text says it is never mistaken for one.
+pub fn next_page_offset(output: &str) -> Option<usize> {
+    let rest = output.trim_end().strip_suffix(READ_MORE_END)?;
+    let at = rest.rfind(READ_MORE_START)?;
+    rest[at + READ_MORE_START.len()..].parse().ok().filter(|&n| n > 1)
+}
+
+/// `arguments` with `offset` set, for the runner only: the call in the history keeps the model's own bytes (prompt
+/// cache). `None` when they aren't a JSON object.
+pub fn with_offset(arguments: &str, offset: usize) -> Option<String> {
+    let mut value = serde_json::from_str::<Value>(arguments).ok()?;
+    value.as_object_mut()?.insert("offset".into(), Value::from(offset));
+    Some(value.to_string())
+}
+
+/// What a repeated truncated read's result starts with: it got the next page instead of the same one again.
+pub fn read_on_note(offset: usize) -> String {
+    format!(
+        "Marv: this exact call already returned the page before this one, so Marv read on from line {offset} (as if you had sent \"offset\": {offset}). To choose the lines yourself, pass offset.\n\n"
+    )
+}
+
+/// The next page for each `read_file` call whose last result had more after it (see the module notes).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ReadPages {
+    next: std::collections::HashMap<ToolCallKey, usize>,
+}
+
+impl ReadPages {
+    /// Notes a call that ran and its result (the tool's own text).
+    pub fn record(&mut self, name: &str, arguments: &str, output: &str) {
+        if name == "read_file" {
+            let key = make_tool_key(name, arguments);
+            match next_page_offset(output) {
+                Some(offset) => {
+                    self.next.insert(key, offset);
+                }
+                None => {
+                    self.next.remove(&key);
+                }
+            }
+            return;
+        }
+        let reads = READ_ONLY_TOOLS.contains(&name)
+            || (name == "bash" && command_of(arguments).is_some_and(|c| marv_core::command::is_read_only_command(&c)));
+        if !reads {
+            self.next.clear();
+        }
+    }
+
+    /// The offset to run this call with instead, when it repeats a read whose page had more after it.
+    pub fn next(&self, name: &str, arguments: &str) -> Option<usize> {
+        if name != "read_file" {
+            return None;
+        }
+        self.next.get(&make_tool_key(name, arguments)).copied()
+    }
+
+    /// The history no longer holds the pages (a compaction): a repeated read is a real one again.
+    pub fn clear(&mut self) {
+        self.next.clear();
     }
 }
 
@@ -763,5 +868,92 @@ mod tests {
         let mut failed = twice();
         failed.record("bash", &bash("npm install"), "npm ERR! network\n\n[exit code 1]");
         assert!(failed.repeated("bash", &test).is_some());
+    }
+
+    // marv-rs: read-only loops and repeated truncated reads (TB 2026-11-06 schemelike-metacircular-eval).
+
+    #[test]
+    fn a_read_only_loop_is_warned_about_five_times_before_the_final_turn_and_the_stop() {
+        let mut state = ToolLoopState::default();
+        for _ in 0..MAX_READ_ONLY_LOOP_WARNINGS {
+            assert_eq!(state.escalate_read_only(), LoopVerdict::Warn);
+        }
+        assert_eq!(state.escalate_read_only(), LoopVerdict::FinalChance);
+        assert_eq!(state.escalate_read_only(), LoopVerdict::Stop);
+        // A loop with side effects escalates as before.
+        let mut state = ToolLoopState::default();
+        assert_eq!(state.escalate(), LoopVerdict::Warn);
+        assert_eq!(state.escalate(), LoopVerdict::FinalChance);
+        assert_eq!(state.escalate(), LoopVerdict::Stop);
+    }
+
+    #[test]
+    fn progress_forgets_the_read_only_warnings() {
+        let mut state = ToolLoopState::default();
+        for _ in 0..MAX_READ_ONLY_LOOP_WARNINGS {
+            state.escalate_read_only();
+        }
+        for i in 0..TOOL_LOOP_PROGRESS {
+            state.progressed(make_tool_key("read_file", &format!(r#"{{"path":"f{i}"}}"#)));
+        }
+        assert_eq!(state.read_only_warnings, 0);
+        assert_eq!(state.escalate_read_only(), LoopVerdict::Warn);
+    }
+
+    #[test]
+    fn only_reads_is_every_call_read_only() {
+        assert!(only_reads(&["read_file", "grep", "glob"]));
+        assert!(!only_reads(&["read_file", "bash"]));
+        assert!(!only_reads(&["process"]));
+        assert!(!only_reads(&[]));
+    }
+
+    const PAGE_1: &str = "    1→#!/usr/bin/env python3\n  400→x\n\n(Showing lines 1-400 of 586. Use offset=401 to read more.)";
+    const PAGE_2: &str = "  401→y\n  586→z\n\n(Showing lines 401-586 of 586.)";
+
+    #[test]
+    fn the_next_page_offset_is_read_from_the_end_of_a_result_only() {
+        assert_eq!(next_page_offset(PAGE_1), Some(401));
+        assert_eq!(next_page_offset(&format!("{PAGE_1}\n")), Some(401));
+        assert_eq!(next_page_offset(PAGE_2), None);
+        // A file whose text says it, not at the end of the result.
+        assert_eq!(next_page_offset(&format!("    1→Use offset=9 to read more.)\n{PAGE_2}")), None);
+        assert_eq!(next_page_offset("(Showing lines 1-1 of 9. Use offset=x to read more.)"), None);
+    }
+
+    #[test]
+    fn with_offset_sets_the_field_and_keeps_the_rest() {
+        let args = with_offset(r#"{"path": "interp.py", "limit": 50}"#, 401).unwrap();
+        let value: Value = serde_json::from_str(&args).unwrap();
+        assert_eq!(value, serde_json::json!({"path": "interp.py", "limit": 50, "offset": 401}));
+        assert_eq!(with_offset("not json", 3), None);
+        assert!(read_on_note(401).contains(r#""offset": 401"#));
+    }
+
+    #[test]
+    fn a_repeated_truncated_read_reads_on_until_the_file_may_have_changed() {
+        let mut pages = ReadPages::default();
+        let call = r#"{"path": "interp.py"}"#;
+        assert_eq!(pages.next("read_file", call), None);
+        pages.record("read_file", call, PAGE_1);
+        // The same call, its keys in another order or spaced differently, is the same read.
+        assert_eq!(pages.next("read_file", r#"{"path":"interp.py"}"#), Some(401));
+        assert_eq!(pages.next("read_file", r#"{"path": "other.py"}"#), None);
+        // Reads and read-only commands keep it; the last page forgets it.
+        pages.record("grep", r#"{"pattern": "x"}"#, "1 match");
+        pages.record("bash", r#"{"command": "ls -la"}"#, "[exit code 0]");
+        assert_eq!(pages.next("read_file", call), Some(401));
+        pages.record("read_file", call, &format!("{}{PAGE_2}", read_on_note(401)));
+        assert_eq!(pages.next("read_file", call), None);
+        // A command that may change the file forgets every page.
+        pages.record("read_file", call, PAGE_1);
+        pages.record("bash", r#"{"command": "sed -i s/a/b/ interp.py"}"#, "[exit code 0]");
+        assert_eq!(pages.next("read_file", call), None);
+        pages.record("read_file", call, PAGE_1);
+        pages.record("edit_file", r#"{"path": "interp.py"}"#, "ok");
+        assert_eq!(pages.next("read_file", call), None);
+        pages.record("read_file", call, PAGE_1);
+        pages.clear();
+        assert_eq!(pages.next("read_file", call), None);
     }
 }
