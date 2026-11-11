@@ -459,7 +459,8 @@ pub async fn login(
             say!(out, "The code is the 6 digits in the email.");
             continue;
         }
-        let body = json!({ "email": email, "code": code, "device": device });
+        // `client`: the server's sign-up record. Product emails are only ever asked for in Marv OS, so never here.
+        let body = json!({ "email": email, "code": code, "device": device, "client": "marv-cli" });
         match call(&ctx.base, true, "/login/verify", None, Some(&body)).await {
             Ok(reply) => {
                 let found = reply.get("token").and_then(Value::as_str).filter(|t| is_token(t));
@@ -882,7 +883,7 @@ mod tests {
         let routes: Vec<&str> = seen.iter().map(|(r, _, _)| r.as_str()).collect();
         assert_eq!(routes, ["POST /login/start", "POST /login/verify", "GET /me"]);
         assert_eq!(seen[0].2, json!({"email": "a@b.c"}));
-        assert_eq!(seen[1].2, json!({"email": "a@b.c", "code": "123456", "device": "marv cli on box"}));
+        assert_eq!(seen[1].2, json!({"email": "a@b.c", "code": "123456", "device": "marv cli on box", "client": "marv-cli"}));
         assert_eq!(seen[2].1.as_deref(), Some(format!("Bearer {TOKEN}").as_str()));
 
         let file = PlanFile::load(dir.path()).unwrap();
