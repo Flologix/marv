@@ -58,8 +58,12 @@ pub fn base_url(env: &Env) -> String {
 }
 
 /// A plan's name as the person knows it.
+/// Where the plans are, for a free account.
+pub const PRICING_URL: &str = "https://www.flologixai.com/marv-os/pricing";
+
 pub fn plan_name(plan: &str) -> String {
     match plan {
+        "free" => "Free".into(),
         "founding" => "Founding".into(),
         "pro_models" => "Pro + models".into(),
         other => printable(other),
@@ -473,6 +477,10 @@ pub async fn login(
     let file = PlanFile { email: me.email.clone(), token, plan: me.plan.clone(), licence: me.licence.clone(), key_label };
     file.save(&ctx.config_dir).await.map_err(|e| format!("Couldn't save {}: {e}", PlanFile::path(&ctx.config_dir).display()))?;
 
+    if me.plan == "free" {
+        say!(out, "Signed in as {}: your free Marv account. Plans: {PRICING_URL}", printable(&me.email));
+        return Ok(());
+    }
     say!(out, "Signed in as {}: Marv {} ({}).", printable(&me.email), plan_name(&me.plan), printable(&me.status));
     if verify_licence(&me.licence, &public_key(), ctx.now).is_none() {
         say!(out, "The plan's licence didn't check out on this machine, so Marv counts as Free here for now.");
@@ -547,7 +555,10 @@ pub async fn logout(ctx: &Ctx, out: &mut dyn Write) -> Result<(), String> {
 /// What `marv plan` and `/plan` show, and whether it's an error.
 pub async fn status(ctx: &Ctx) -> (String, bool) {
     let Some(file) = PlanFile::load(&ctx.config_dir) else {
-        return ("You're on Marv Free: no account needed. `marv login` signs in to a paid Marv plan.".into(), false);
+        return (
+            "You're on Marv Free: no account needed. `marv login` signs in to your Marv account, free or paid.".into(),
+            false,
+        );
     };
     let me = match fetch_me(&ctx.base, &file.token).await {
         Ok(me) => me,
@@ -565,6 +576,9 @@ pub async fn status(ctx: &Ctx) -> (String, bool) {
     // The licence is renewed with each period: keep the newest one for the offline check.
     if me.licence != file.licence || me.plan != file.plan {
         let _ = PlanFile { plan: me.plan.clone(), licence: me.licence.clone(), ..file.clone() }.save(&ctx.config_dir).await;
+    }
+    if me.plan == "free" {
+        return (format!("Marv Free, signed in as {}.\nPlans: {PRICING_URL}", printable(&me.email)), false);
     }
     let price = me.price.as_deref().map(|p| format!(" at {p}")).unwrap_or_default();
     let mut lines =
@@ -1046,6 +1060,25 @@ mod tests {
         // A server older than the field: no price, nothing else changes.
         let old = json!({ "email": "a@b.c", "plan": "founding", "status": "active", "licence": "x" });
         assert_eq!(Me::parse(&old).unwrap().price, None);
+    }
+
+    /// A free account (anyone may sign in): no licence, no key; it says Free and where the plans are, never that a
+    /// licence failed.
+    #[tokio::test]
+    async fn a_free_account_signs_in_and_shows_as_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let free = json!({ "email": "a@b.c", "plan": "free", "status": "active", "periodEnd": null,
+                           "price": null, "licence": null, "models": null })
+        .to_string();
+        let (base, _) = stub(server(free)).await;
+        let (result, out) = run_login(&ctx(&base, dir.path()), Some("a@b.c"), &["123456"]).await;
+        result.unwrap();
+        assert!(out.contains("Signed in as a@b.c: your free Marv account."), "{out}");
+        assert!(!out.contains("licence"), "{out}");
+        assert_eq!(PlanFile::load(dir.path()).unwrap().plan, "free");
+        let (text, is_error) = status(&ctx(&base, dir.path())).await;
+        assert!(!is_error && text.starts_with("Marv Free, signed in as a@b.c."), "{text}");
+        assert!(!text.contains("licence") && !text.contains("--manage"), "{text}");
     }
 
     #[tokio::test]
