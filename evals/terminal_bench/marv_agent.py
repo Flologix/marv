@@ -39,6 +39,11 @@ BLOCKED_HOSTS = (
     "tbench.ai", "www.tbench.ai", "harborframework.com", "hub.harborframework.com", "www.harborframework.com",
     "duckduckgo.com", "html.duckduckgo.com", "lite.duckduckgo.com", "api.duckduckgo.com", "www.google.com", "google.com",
     "www.bing.com", "bing.com", "search.brave.com", "search.yahoo.com", "www.startpage.com", "searx.be", "kagi.com",
+    # Code search: with the engines blocked, the 2026-11-02 run went to grep.app (226 calls) and Sourcegraph (47).
+    "grep.app", "www.grep.app", "sourcegraph.com", "www.sourcegraph.com", "searchcode.com", "www.searchcode.com",
+    "publicwww.com", "s.jina.ai", "r.jina.ai", "api.search.brave.com", "www.google.co.uk", "www.googleapis.com",
+    "customsearch.googleapis.com", "yandex.com", "yandex.ru", "ya.ru", "www.ecosia.org", "www.mojeek.com", "www.qwant.com",
+    "search.marginalia.nu", "www.perplexity.ai", "api.perplexity.ai", "api.tavily.com", "serpapi.com", "google.serper.dev",
 )
 # Sent with -c after a dropped connection: the conversation so far is intact, only the last request failed.
 CONTINUE_PROMPT = "The connection to the model dropped and has been restored. Continue the task from where you left off."
