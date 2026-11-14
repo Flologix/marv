@@ -6,6 +6,8 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+## [0.16.4] - 2026-11-14
+
 ### Added
 
 - **The prompt is a real text editor.** Select with shift+arrows or by dragging over the text (the release copies it, as in the conversation); typing or pasting replaces the selection, ctrl+c copies it and ctrl+x cuts it. ctrl+z undoes and ctrl+y redoes, a word or a paste at a time. ctrl+←/→ (option+←/→ on a Mac) move by words, ctrl+w deletes a word and ctrl+u the line, and a click moves the cursor. In a message of several rows, ↑/↓ move between them before they reach the history.
@@ -476,7 +478,8 @@ The first public release, on npm as `@flologixai/marv`.
 - The SDK: `createSession()` from `@flologixai/marv/sdk` runs Marv from code, without the UI.
 - Evals: `bun run eval` runs real models on small tasks with hidden checks.
 
-[Unreleased]: https://github.com/Flologix/marv/compare/v0.16.3...HEAD
+[Unreleased]: https://github.com/Flologix/marv/compare/v0.16.4...HEAD
+[0.16.4]: https://github.com/Flologix/marv/compare/v0.16.3...v0.16.4
 [0.16.3]: https://github.com/Flologix/marv/compare/v0.16.2...v0.16.3
 [0.16.2]: https://github.com/Flologix/marv/compare/v0.16.1...v0.16.2
 [0.16.1]: https://github.com/Flologix/marv/compare/v0.16.0...v0.16.1
