@@ -1522,9 +1522,13 @@ impl App {
             }
             // ctrl+o: show or hide details under their entries: subagents' steps and whole diffs.
             KeyCode::Char('o') if ctrl => self.show_steps = !self.show_steps,
-            // ctrl+c: interrupt a reply → clear the prompt → ask to confirm → exit.
+            // ctrl+c: copy what's selected in the prompt → interrupt a reply → clear the prompt → ask to confirm → exit.
+            // A selection is copied first, as a terminal's ctrl+c would; it's dropped then, so the next ctrl+c stops.
             KeyCode::Char('c') if ctrl => {
-                if self.busy() {
+                let at_prompt = self.approval.is_none() && self.picker.is_none();
+                if let Some(text) = self.prompt.take_selection().filter(|_| at_prompt) {
+                    self.copy_text(text);
+                } else if self.busy() {
                     self.decline_all(); // pending approvals count as declined
                     self.port.abort();
                 } else if !self.prompt.value.is_empty() {
@@ -1575,6 +1579,7 @@ impl App {
             match self.prompt.on_key(key, busy, &self.commands) {
                 Some(PromptOutcome::Submit(text)) => self.submit(&text, now),
                 Some(PromptOutcome::SendNow(text)) => self.send_now(&text, now),
+                Some(PromptOutcome::Copy(text)) => self.copy_text(text),
                 None => {}
             }
         }
@@ -1596,7 +1601,8 @@ impl App {
                 }
                 true
             }
-            KeyCode::Char('x') if ctrl => {
+            // With text selected in the prompt, ctrl+x cuts it instead (the prompt's).
+            KeyCode::Char('x') if ctrl && !self.prompt.has_selection() => {
                 if let Some(text) = self.port.unqueue_last() {
                     self.queued.retain_last(&text);
                     self.flash = Some(("Dropped a queued message".into(), Instant::now() + NOTICE_MS));
@@ -1807,8 +1813,19 @@ impl App {
                 self.dirty = true;
                 SelectionEffect::None
             }
-            MouseEvent::Press { x, y } => self.selection.press(x, y),
+            // A press in the prompt's box is the prompt's: it moves its cursor, and a drag from it selects its text
+            // (the release copies it). Anywhere else it's the transcript's, and drops the prompt's selection.
+            MouseEvent::Press { x, y } => {
+                let effect = self.selection.press(x, y);
+                let had_selection = self.prompt.has_selection();
+                if self.prompt.press(x, y) || had_selection { SelectionEffect::Redraw } else { effect }
+            }
+            MouseEvent::Drag { x, y } if self.prompt.drag(x, y) => SelectionEffect::Redraw,
             MouseEvent::Drag { x, y } => self.selection.drag(x, y, now),
+            MouseEvent::Release { .. } if self.prompt.dragging() => match self.prompt.release() {
+                Some(text) => SelectionEffect::Copy(text),
+                None => SelectionEffect::Redraw,
+            },
             MouseEvent::Release { x, y } => match self.selection.release() {
                 SelectionEffect::Copy(text) if !text.is_empty() => SelectionEffect::Copy(text),
                 effect if self.running_at.is_some_and(|(row, from, to)| y == row && (from..to).contains(&x)) => {
@@ -1840,15 +1857,18 @@ impl App {
             SelectionEffect::None => {}
             SelectionEffect::Redraw => self.dirty = true,
             SelectionEffect::ScrollBy(rows) => self.scroll_active(rows),
-            SelectionEffect::Copy(text) => {
-                let chars = text.chars().count();
-                self.copies.push(Box::pin({
-                    let copy = (self.copy)(text);
-                    async move { (chars, copy.await) }
-                }));
-                self.dirty = true;
-            }
+            SelectionEffect::Copy(text) => self.copy_text(text),
         }
+    }
+
+    /// Sends `text` to the terminal's clipboard (the `copy` the App was built with); `copied` says how it went.
+    fn copy_text(&mut self, text: String) {
+        let chars = text.chars().count();
+        self.copies.push(Box::pin({
+            let copy = (self.copy)(text);
+            async move { (chars, copy.await) }
+        }));
+        self.dirty = true;
     }
 
     /// A copy finished: say how.
@@ -1996,6 +2016,8 @@ impl App {
         self.running_at = None;
         let processes_shown =
             self.processes.is_some() && self.picker.is_none() && self.setup.is_none() && self.approval.is_none();
+        // Drawing the prompt below records where its text is; with a panel in its place the mouse can't reach it.
+        self.prompt.hide();
         if let Some(picker) = self.picker.as_ref().filter(|_| self.setup.is_none() && self.approval.is_none()) {
             picker.render(panel, buf);
         } else if processes_shown {
@@ -2758,6 +2780,69 @@ mod tests {
         h.app.on_mouse(MouseEvent::Release { x: x1 + 8, y: y1 }, h.now);
         futures::executor::block_on(h.app.settle_copies(h.now));
         assert_eq!(*h.copied.lock().unwrap(), ["first pasted line\n  second pasted line\n  third one"]);
+    }
+
+    /// Types into the prompt without sending.
+    fn type_in(h: &mut Harness, text: &str) {
+        for c in text.chars() {
+            h.key(KeyCode::Char(c));
+        }
+    }
+
+    /// A drag in the prompt's box selects the prompt's text (the transcript doesn't see it), and the release copies
+    /// it; a click there only moves the cursor.
+    #[test]
+    fn dragging_over_the_prompt_selects_it_and_copies_it() {
+        let mut h = harness();
+        type_in(&mut h, "made up");
+        let frame = h.frame();
+        let (y, line) = frame.lines().enumerate().find(|(_, l)| l.contains("> made up")).expect("the prompt's line");
+        let x = unicode_width::UnicodeWidthStr::width(&line[..line.find("made").unwrap()]) as u16;
+        let y = y as u16;
+        h.app.on_mouse(MouseEvent::Press { x, y }, h.now);
+        h.app.on_mouse(MouseEvent::Drag { x: x + 4, y }, h.now);
+        assert_eq!(h.app.selection.selection(), None, "not the transcript's");
+        let buf = h.buffer();
+        assert_eq!(buf[(x + 1, y)].bg, crate::ui::theme::DIM, "drawn selected");
+        h.app.on_mouse(MouseEvent::Release { x: x + 4, y }, h.now);
+        futures::executor::block_on(h.app.settle_copies(h.now));
+        assert_eq!(*h.copied.lock().unwrap(), ["made"]);
+        assert!(h.frame().contains("Copied 4 chars"));
+        // Typing replaces it; a click puts the cursor where it lands.
+        type_in(&mut h, "fixed");
+        assert_eq!(h.app.prompt.value, "fixed up");
+        h.frame();
+        h.app.on_mouse(MouseEvent::Press { x, y }, h.now);
+        h.app.on_mouse(MouseEvent::Release { x, y }, h.now);
+        type_in(&mut h, "_");
+        assert_eq!(h.app.prompt.value, "_fixed up");
+        assert_eq!(h.copied.lock().unwrap().len(), 1, "a click copies nothing");
+    }
+
+    /// ctrl+c copies a selection in the prompt (and drops it) before it does anything else; ctrl+x then cuts rather
+    /// than dropping a queued message.
+    #[test]
+    fn ctrl_c_copies_a_prompt_selection_and_ctrl_x_cuts_it_even_with_a_queue() {
+        let mut h = harness();
+        type_in(&mut h, "keep this");
+        h.app.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL | KeyModifiers::SHIFT), h.now);
+        h.ctrl('c');
+        assert_eq!(h.app.prompt.value, "keep this", "copied, not cleared");
+        assert!(h.app.confirm_exit.is_none());
+        h.ctrl('c');
+        assert_eq!(h.app.prompt.value, "", "with nothing selected, the ladder as before");
+        h.typed("go");
+        h.events([UiEvent::TurnStart { turn: "t".into() }]);
+        enter(&mut h, "queued one");
+        type_in(&mut h, "cut me");
+        h.app.on_key(KeyEvent::new(KeyCode::Home, KeyModifiers::SHIFT), h.now);
+        h.ctrl('x');
+        assert_eq!(h.app.queued, ["queued one"], "the queue is untouched");
+        assert_eq!(h.app.prompt.value, "");
+        h.ctrl('c');
+        assert!(h.calls().contains(&Call::Abort), "ctrl+c still stops the turn once nothing is selected");
+        futures::executor::block_on(h.app.settle_copies(h.now));
+        assert_eq!(*h.copied.lock().unwrap(), ["this", "cut me"]);
     }
 
     #[test]

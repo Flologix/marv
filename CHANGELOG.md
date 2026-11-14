@@ -6,6 +6,10 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+### Added
+
+- **The prompt is a real text editor.** Select with shift+arrows or by dragging over the text (the release copies it, as in the conversation); typing or pasting replaces the selection, ctrl+c copies it and ctrl+x cuts it. ctrl+z undoes and ctrl+y redoes, a word or a paste at a time. ctrl+←/→ (option+←/→ on a Mac) move by words, ctrl+w deletes a word and ctrl+u the line, and a click moves the cursor. In a message of several rows, ↑/↓ move between them before they reach the history.
+
 ## [0.16.3] - 2026-11-07
 
 ### Fixed
