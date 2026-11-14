@@ -22,11 +22,25 @@
 //!   stands for its text in `pastes`. So ←/→ step over a chip, and Backspace/Delete remove it, as one char. The
 //!   submitted text has every chip replaced by what was pasted ([`PromptInput::text`]); ↑ brings a submission
 //!   back with its chips. A short one-line paste is typed in as before.
-//! - Editing is ink-text-input's: ←/→ move the cursor (also with ctrl held), Backspace deletes
-//!   before it; ctrl/alt + a letter types nothing (ctrl+o, ctrl+a). Home/End and Delete are extras.
+//! - Editing, as in a text field and readline: ←/→ move the cursor, by words with ctrl or alt (alt+b/alt+f too, what
+//!   a Mac's option+←/→ sends); Home/End and ctrl+a/ctrl+e go to the start and end of the line the cursor is on;
+//!   Backspace/Delete delete around it, a word with ctrl or alt (ctrl+w and alt+d too); ctrl+u deletes to the line's
+//!   start. ↑/↓ move between the text's rows (wrapped, or the lines "send now" gave back) and browse the history only
+//!   from its first and last row. Any other ctrl/alt + a letter types nothing (ctrl+o).
+//! - **Selecting:** shift with any of those moves selects; so does a drag over the text ([`PromptInput::press`],
+//!   `drag`, `release`, routed by the App), and its release copies what it covers, as the transcript's does. A click
+//!   moves the cursor. Typing or a paste replaces the selection; Backspace and Delete take it; ctrl+x cuts it
+//!   ([`PromptOutcome::Copy`]) and the App's ctrl+c copies it ([`PromptInput::take_selection`]). A chip is one char,
+//!   so a selection holds it whole, and what's copied is its text.
+//! - **ctrl+z** undoes, **ctrl+y** or ctrl+shift+z redoes: one edit at a time (a typed word, a paste, a cut), the last
+//!   [`UNDO_STEPS`] of them. A new line ([`PromptInput::set`]: submitted, recalled, cleared) starts over.
 //!
 //! What changes in Rust: the component owns its value (Marv's was controlled by the App); the App
-//! clears it after accepting a submission, like Marv's `handleSubmit` did.
+//! clears it after accepting a submission, like Marv's `handleSubmit` did. Marv's ink-text-input had no selection
+//! and no undo, and its ctrl+←/→ moved one char: the editing above is a deliberate difference; `prompt.test.tsx`'s
+//! cases all still hold except that one.
+
+use std::cell::RefCell;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use marv_core::printable;
@@ -65,6 +79,56 @@ fn chip_label(number: usize, text: &str) -> String {
     match text.lines().count() {
         0 | 1 => format!("[Pasted text #{number}, {} chars]", text.chars().count()),
         lines => format!("[Pasted text #{number}, {lines} lines]"),
+    }
+}
+
+/// How many edits ctrl+z can take back.
+pub const UNDO_STEPS: usize = 50;
+
+/// What ctrl+z goes back to: the line and its cursor before an edit. Chips stay valid: `pastes` only grows while
+/// the line lives, and a new line clears the undo with it.
+#[derive(Debug, Clone)]
+struct Snapshot {
+    value: String,
+    cursor: usize,
+}
+
+/// Where the last draw put the text, for the mouse and for ↑/↓ between rows. Empty when the prompt wasn't drawn
+/// (a panel over it).
+#[derive(Debug, Clone, Default)]
+struct Shown {
+    /// The box, its border included: a press inside it is the prompt's.
+    area: Rect,
+    /// The screen cell of the text's first row, first column (past the border, the padding and the gutter).
+    x: u16,
+    y: u16,
+    rows: Vec<RowMap>,
+}
+
+/// One drawn row of the text: the char each cell shows (a chip's label is all its one char), and where a click
+/// past its end puts the cursor.
+#[derive(Debug, Clone, Default)]
+struct RowMap {
+    cells: Vec<usize>,
+    end: usize,
+}
+
+impl RowMap {
+    fn holds(&self, cursor: usize) -> bool {
+        self.end == cursor || self.cells.contains(&cursor)
+    }
+}
+
+/// What a char is, for word moves: a word is a run of one kind. A chip is a word of its own kind.
+fn kind(c: char) -> u8 {
+    if c.is_whitespace() {
+        0
+    } else if is_chip(c) {
+        3
+    } else if c.is_alphanumeric() || c == '_' {
+        1
+    } else {
+        2
     }
 }
 
@@ -126,6 +190,8 @@ pub enum PromptOutcome {
     Submit(String),
     /// Alt+Enter: "send now" (the App sends it into the running turn, at its next step; idle, it's a plain submit).
     SendNow(String),
+    /// ctrl+x cut this (the chips expanded): it goes to the terminal's clipboard.
+    Copy(String),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -151,6 +217,15 @@ pub struct PromptInput {
     /// The last submission's chips (taken by [`Self::remember`]) and the history entries that had chips.
     submitted: Option<Recall>,
     recalls: Vec<Recall>,
+    /// The selection's other end (the cursor is one end): `None`, or the same place as the cursor, selects nothing.
+    anchor: Option<usize>,
+    undo: Vec<Snapshot>,
+    redo: Vec<Snapshot>,
+    /// The last edit was a typed word char: the next one joins its undo step.
+    typing: bool,
+    /// Where the press that started a drag in the box put the cursor, until the release.
+    dragging: Option<usize>,
+    shown: RefCell<Shown>,
 }
 
 impl PromptInput {
@@ -160,6 +235,10 @@ impl PromptInput {
         self.pastes.clear();
         self.cursor = 0;
         self.menu_index = 0;
+        self.anchor = None;
+        self.undo.clear();
+        self.redo.clear();
+        self.typing = false;
         let value = value.into();
         // Text from outside with several lines (the palette's prefill never has any) is one chip, so the box stays
         // one line high; otherwise it's typed in.
@@ -175,9 +254,170 @@ impl PromptInput {
         if text.is_empty() {
             return;
         }
+        let before = self.snapshot();
         self.value = if self.value.trim().is_empty() { text } else { format!("{text}\n{}", self.value) };
         self.cursor = self.value.chars().count();
         self.menu_index = 0;
+        self.anchor = None;
+        self.push_undo(before, false);
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        Snapshot { value: self.value.clone(), cursor: self.cursor }
+    }
+
+    /// An edit changed the line from `before`: ctrl+z goes back there. A typed word char right after another joins
+    /// its step, so ctrl+z takes back a word, not a letter.
+    fn push_undo(&mut self, before: Snapshot, typed: bool) {
+        self.redo.clear();
+        if !(typed && self.typing) {
+            self.undo.push(before);
+            if self.undo.len() > UNDO_STEPS {
+                self.undo.remove(0);
+            }
+        }
+        self.typing = typed;
+    }
+
+    /// ctrl+z (`back`) or ctrl+y: the line as it was before the last edit, or after the one undone.
+    fn undo_redo(&mut self, back: bool) {
+        let (from, to) = if back { (&mut self.undo, &mut self.redo) } else { (&mut self.redo, &mut self.undo) };
+        let Some(snapshot) = from.pop() else { return };
+        to.push(Snapshot { value: std::mem::replace(&mut self.value, snapshot.value), cursor: self.cursor });
+        self.cursor = snapshot.cursor.min(self.value.chars().count());
+        self.anchor = None;
+        self.typing = false;
+        self.menu_index = 0;
+    }
+
+    /// The selection, `[start, end)` in chars, when it holds something.
+    fn selection(&self) -> Option<(usize, usize)> {
+        let anchor = self.anchor.filter(|&a| a != self.cursor)?;
+        Some((anchor.min(self.cursor), anchor.max(self.cursor)))
+    }
+
+    /// Whether some text is selected (the App's ctrl+x cuts it rather than dropping a queued message).
+    pub fn has_selection(&self) -> bool {
+        self.selection().is_some()
+    }
+
+    /// The selected text with its chips expanded, and the selection dropped: the App's ctrl+c copies it.
+    pub fn take_selection(&mut self) -> Option<String> {
+        let text = self.selected_text();
+        self.anchor = None;
+        text
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        let (start, end) = self.selection()?;
+        let part: String = self.value.chars().skip(start).take(end - start).collect();
+        Some(self.expand(&part, &self.pastes))
+    }
+
+    /// Deletes `[start, end)` and puts the cursor there.
+    fn delete_range(&mut self, start: usize, end: usize) {
+        let (from, to) = (self.byte_at(start), self.byte_at(end));
+        self.value.replace_range(from..to, "");
+        self.cursor = start;
+        self.anchor = None;
+        self.menu_index = 0;
+    }
+
+    /// Deletes the selection, if there's one: whether there was.
+    fn delete_selection(&mut self) -> bool {
+        let Some((start, end)) = self.selection() else {
+            self.anchor = None;
+            return false;
+        };
+        self.delete_range(start, end);
+        true
+    }
+
+    /// Where a word move from the cursor lands: back (`-1`) to the start of the word before it, or on (`1`) to the
+    /// end of the word after it (spaces skipped first).
+    fn word_from(&self, direction: isize) -> usize {
+        let chars: Vec<char> = self.value.chars().collect();
+        let mut at = self.cursor.min(chars.len());
+        if direction < 0 {
+            while at > 0 && kind(chars[at - 1]) == 0 {
+                at -= 1;
+            }
+            let word = at.checked_sub(1).map(|i| kind(chars[i]));
+            while at > 0 && Some(kind(chars[at - 1])) == word {
+                at -= 1;
+            }
+        } else {
+            while at < chars.len() && kind(chars[at]) == 0 {
+                at += 1;
+            }
+            let word = chars.get(at).map(|&c| kind(c));
+            while at < chars.len() && Some(kind(chars[at])) == word {
+                at += 1;
+            }
+        }
+        at
+    }
+
+    /// The start of the run of non-spaces before the cursor (spaces right before it skipped first).
+    fn spaced_word_back(&self) -> usize {
+        let chars: Vec<char> = self.value.chars().collect();
+        let mut at = self.cursor.min(chars.len());
+        while at > 0 && chars[at - 1].is_whitespace() {
+            at -= 1;
+        }
+        while at > 0 && !chars[at - 1].is_whitespace() {
+            at -= 1;
+        }
+        at
+    }
+
+    /// The start (`false`) or end of the line the cursor is on: lines are split by the `\n`s "send now" gives back.
+    fn line_edge(&self, end: bool) -> usize {
+        let chars: Vec<char> = self.value.chars().collect();
+        let mut at = self.cursor.min(chars.len());
+        if end {
+            while at < chars.len() && chars[at] != '\n' {
+                at += 1;
+            }
+        } else {
+            while at > 0 && chars[at - 1] != '\n' {
+                at -= 1;
+            }
+        }
+        at
+    }
+
+    /// Where ↑ (`-1`) or ↓ takes the cursor: the same column of the drawn row above or below (a shorter row, its
+    /// end). `None` on the first or last row, or before the box was drawn: there ↑/↓ are the history's.
+    fn row_move(&self, direction: isize) -> Option<usize> {
+        let shown = self.shown.borrow();
+        let row = shown.rows.iter().position(|r| r.holds(self.cursor))?;
+        let target = shown.rows.get(row.checked_add_signed(direction)?)?;
+        let column = shown.rows[row].cells.iter().position(|&i| i == self.cursor).unwrap_or(shown.rows[row].cells.len());
+        Some(target.cells.get(column).copied().unwrap_or(target.end))
+    }
+
+    /// The cursor's place for a key that moves it, or `None` for a key that doesn't.
+    fn motion(&self, key: KeyEvent) -> Option<usize> {
+        let word = key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let len = self.value.chars().count();
+        match key.code {
+            KeyCode::Left if word => Some(self.word_from(-1)),
+            KeyCode::Right if word => Some(self.word_from(1)),
+            KeyCode::Char('b') if alt => Some(self.word_from(-1)),
+            KeyCode::Char('f') if alt => Some(self.word_from(1)),
+            KeyCode::Left => Some(self.cursor.saturating_sub(1)),
+            KeyCode::Right => Some((self.cursor + 1).min(len)),
+            KeyCode::Home => Some(self.line_edge(false)),
+            KeyCode::End => Some(self.line_edge(true)),
+            KeyCode::Char('a') if ctrl => Some(self.line_edge(false)),
+            KeyCode::Char('e') if ctrl => Some(self.line_edge(true)),
+            KeyCode::Up if !word => self.row_move(-1),
+            KeyCode::Down if !word => self.row_move(1),
+            _ => None,
+        }
     }
 
     /// The text with every chip replaced by what was pasted: what Enter submits.
@@ -297,9 +537,29 @@ impl PromptInput {
             self.close_suggestion();
             return None;
         }
-        let before = self.value.clone();
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        match key.code {
+            KeyCode::Char('z' | 'Z') if ctrl => {
+                self.undo_redo(!shift);
+                return None;
+            }
+            KeyCode::Char('y') if ctrl => {
+                self.undo_redo(false);
+                return None;
+            }
+            _ => {}
+        }
+        let before = self.snapshot();
+        let typed = matches!(key.code, KeyCode::Char(c) if !c.is_whitespace())
+            && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
         let outcome = self.edit(key, busy, commands);
-        if self.value != before || !self.value.is_empty() || key.code == KeyCode::Esc {
+        if self.value != before.value {
+            self.push_undo(before.clone(), typed);
+        } else {
+            self.typing = false;
+        }
+        if self.value != before.value || !self.value.is_empty() || key.code == KeyCode::Esc {
             self.close_suggestion();
         }
         outcome
@@ -333,7 +593,42 @@ impl PromptInput {
         }
 
         let ctrl_or_alt = key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        // A move: with shift it selects (from where the cursor was); without, ←/→ over a selection go to its edge
+        // and any other move just drops it.
+        if let Some(to) = self.motion(key) {
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                self.anchor.get_or_insert(self.cursor);
+                self.cursor = to;
+            } else {
+                self.cursor = match (self.selection(), key.code) {
+                    (Some((start, _)), KeyCode::Left) if !ctrl_or_alt => start,
+                    (Some((_, end)), KeyCode::Right) if !ctrl_or_alt => end,
+                    _ => to,
+                };
+                self.anchor = None;
+            }
+            return None;
+        }
         match key.code {
+            KeyCode::Esc if self.selection().is_some() => self.anchor = None,
+            KeyCode::Char('x') if ctrl => {
+                let text = self.selected_text()?;
+                self.delete_selection();
+                return Some(PromptOutcome::Copy(text));
+            }
+            KeyCode::Backspace | KeyCode::Delete if self.selection().is_some() => {
+                self.delete_selection();
+            }
+            // A word back (ctrl+w, alt or ctrl+Backspace), or on (alt+d, ctrl or alt+Delete); ctrl+u: to the line's
+            // start.
+            KeyCode::Backspace if ctrl_or_alt => self.delete_range(self.word_from(-1), self.cursor),
+            // ctrl+w as readline's: back to the space before (a path or `--flag=x` goes whole).
+            KeyCode::Char('w') if ctrl => self.delete_range(self.spaced_word_back(), self.cursor),
+            KeyCode::Char('u') if ctrl => self.delete_range(self.line_edge(false), self.cursor),
+            KeyCode::Delete if ctrl_or_alt => self.delete_range(self.cursor, self.word_from(1)),
+            KeyCode::Char('d') if alt => self.delete_range(self.cursor, self.word_from(1)),
             KeyCode::Enter => {
                 self.history_index = None;
                 self.dismissed_at = None;
@@ -383,10 +678,6 @@ impl PromptInput {
                     }
                 }
             }
-            KeyCode::Left => self.cursor = self.cursor.saturating_sub(1),
-            KeyCode::Right => self.cursor = (self.cursor + 1).min(self.value.chars().count()),
-            KeyCode::Home => self.cursor = 0,
-            KeyCode::End => self.cursor = self.value.chars().count(),
             KeyCode::Backspace if self.cursor > 0 => {
                 let at = self.byte_at(self.cursor - 1);
                 self.value.remove(at);
@@ -398,7 +689,10 @@ impl PromptInput {
                 self.value.remove(at);
                 self.menu_index = 0;
             }
-            KeyCode::Char(c) if !ctrl_or_alt => self.type_text(&no_chips(&c.to_string())),
+            KeyCode::Char(c) if !ctrl_or_alt => {
+                self.delete_selection();
+                self.type_text(&no_chips(&c.to_string()));
+            }
             _ => {}
         }
         None
@@ -411,20 +705,91 @@ impl PromptInput {
         if text.is_empty() {
             return;
         }
+        let before = self.snapshot();
+        self.delete_selection();
         let line = text.trim_end_matches('\n');
         if line.contains('\n') || line.chars().count() > PASTE_CHIP_CHARS {
             self.add_chip(text);
         } else {
             self.type_text(line);
         }
+        self.push_undo(before, false);
         self.close_suggestion();
+    }
+
+    /// A press at a screen cell: in the box it's the prompt's, and moves the cursor there (a drag from it selects).
+    /// Elsewhere it drops the prompt's selection and is the transcript's. Whether it was the prompt's.
+    pub fn press(&mut self, x: u16, y: u16) -> bool {
+        self.anchor = None;
+        self.dragging = None;
+        let Some(at) = self.index_at(x, y, true) else { return false };
+        self.cursor = at;
+        self.dragging = Some(at);
+        self.typing = false;
+        true
+    }
+
+    /// A drag after a press in the box: selects from the press to the cell under the pointer (above the box, to the
+    /// text's start; below it, to its end). Whether it was the prompt's.
+    pub fn drag(&mut self, x: u16, y: u16) -> bool {
+        let Some(start) = self.dragging else { return false };
+        if let Some(at) = self.index_at(x, y, false) {
+            // Forward onto a chip's label: the chip is in, whole (its label is all one char).
+            let on_chip = self.value.chars().nth(at).is_some_and(is_chip);
+            self.anchor = Some(start);
+            self.cursor = if on_chip && at >= start { at + 1 } else { at };
+        }
+        true
+    }
+
+    /// Whether a press in the box started what the mouse is doing (the release is the prompt's, not the transcript's).
+    pub fn dragging(&self) -> bool {
+        self.dragging.is_some()
+    }
+
+    /// The release after a press in the box: what the drag selected, to copy (the selection stays, for ctrl+x or
+    /// typing over it). A click selects nothing.
+    pub fn release(&mut self) -> Option<String> {
+        self.dragging.take()?;
+        self.selected_text()
+    }
+
+    /// The char a screen cell shows, as a cursor place. `inside`: only a cell in the box counts (a press); else a
+    /// point above or below the text clamps to its start or end (a drag).
+    fn index_at(&self, x: u16, y: u16, inside: bool) -> Option<usize> {
+        let shown = self.shown.borrow();
+        let area = shown.area;
+        let in_box = x >= area.x && x < area.right() && y >= area.y && y < area.bottom();
+        if (inside && !in_box) || shown.rows.is_empty() {
+            return None;
+        }
+        if y < shown.y {
+            return Some(0);
+        }
+        let Some(row) = shown.rows.get((y - shown.y) as usize) else {
+            return Some(self.value.chars().count());
+        };
+        let column = x.saturating_sub(shown.x) as usize;
+        Some(row.cells.get(column).copied().unwrap_or(row.end))
+    }
+
+    /// The prompt isn't drawn this frame (a panel is open over it): the mouse can't reach its text.
+    pub fn hide(&mut self) {
+        *self.shown.get_mut() = Shown::default();
     }
 
     /// The text rows inside the box: `> ` then the text, wrapped by cell with a hanging indent,
     /// the cursor in inverse video.
     fn text_rows(&self, inner_width: u16, busy: bool) -> Vec<Line<'static>> {
+        self.layout(inner_width, busy).0
+    }
+
+    /// [`Self::text_rows`], and the char each of their cells shows (past the gutter), for the mouse and ↑/↓.
+    fn layout(&self, inner_width: u16, busy: bool) -> (Vec<Line<'static>>, Vec<RowMap>) {
         let accent = Style::new().fg(theme::ACCENT);
         let cursor_style = Style::new().add_modifier(Modifier::REVERSED);
+        let selected_style = Style::new().bg(theme::DIM).fg(ratatui::style::Color::Black);
+        let selection = self.selection();
         if self.value.is_empty() {
             // The model's words: printable() like everything it writes.
             let suggested = self.suggestion.as_deref().map(|s| format!("{}  (tab)", printable(s)));
@@ -436,10 +801,17 @@ impl PromptInput {
                 Span::styled(first, cursor_style.fg(theme::DIM)),
                 Span::styled(chars.collect::<String>(), Style::new().fg(theme::DIM)),
             ]);
-            return vec![truncate_end(line, inner_width)];
+            return (vec![truncate_end(line, inner_width)], vec![RowMap { cells: vec![0], end: 0 }]);
         }
         let width = inner_width.saturating_sub(2).max(1) as usize;
         let mut rows: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+        let mut maps: Vec<RowMap> = vec![RowMap::default()];
+        // A row the text wrapped out of: a click past its end stays on it, at its last char.
+        let wrap = |maps: &mut Vec<RowMap>, at: usize| {
+            let last = maps.last_mut().expect("never empty");
+            last.end = last.cells.last().copied().unwrap_or(at);
+            maps.push(RowMap::default());
+        };
         let mut used = 0;
         let chip_style = Style::new().fg(theme::DIM);
         let chars: Vec<char> = self.value.chars().collect();
@@ -460,7 +832,10 @@ impl PromptInput {
             if chars.get(i) == Some(&'\n') {
                 if i == self.cursor {
                     rows.last_mut().expect("never empty").push(Span::styled(" ", cursor_style));
+                    maps.last_mut().expect("never empty").cells.push(i);
                 }
+                maps.last_mut().expect("never empty").end = i;
+                maps.push(RowMap::default());
                 rows.push(Vec::new());
                 used = 0;
                 continue;
@@ -469,11 +844,18 @@ impl PromptInput {
                 Some((cells, style)) => (cells.clone(), *style),
                 None => (vec![" ".to_string()], Style::new()), // the cursor past the end
             };
-            let style = if i == self.cursor { style.patch(cursor_style) } else { style };
+            let style = if i == self.cursor {
+                style.patch(cursor_style)
+            } else if selection.is_some_and(|(start, end)| (start..end).contains(&i)) {
+                style.patch(selected_style)
+            } else {
+                style
+            };
             // A chip that fits on a row isn't split across two.
             let total: usize = cells.iter().map(|c| c.width()).sum();
             if cells.len() > 1 && used > 0 && used + total > width && total <= width {
                 rows.push(Vec::new());
+                wrap(&mut maps, i);
                 used = 0;
             }
             for text in cells {
@@ -484,19 +866,24 @@ impl PromptInput {
                 let (text, w) = if w == 0 { (" ".to_string(), 1) } else { (text, w) };
                 if used + w > width {
                     rows.push(Vec::new());
+                    wrap(&mut maps, i);
                     used = 0;
                 }
                 rows.last_mut().expect("never empty").push(Span::styled(text, style));
+                maps.last_mut().expect("never empty").cells.extend(std::iter::repeat_n(i, w));
                 used += w;
             }
         }
-        rows.into_iter()
+        maps.last_mut().expect("never empty").end = chars.len();
+        let lines = rows
+            .into_iter()
             .enumerate()
             .map(|(i, spans)| {
                 let gutter = if i == 0 { Span::styled("> ", accent) } else { Span::raw("  ") };
                 Line::from([vec![gutter], spans].concat())
             })
-            .collect()
+            .collect();
+        (lines, maps)
     }
 
     /// The menu rows: `❯ /name  description`, then the keys.
@@ -537,7 +924,7 @@ impl PromptInput {
     }
 
     pub fn render(&self, area: Rect, buf: &mut Buffer, busy: bool, commands: &[CommandInfo]) {
-        let rows = self.text_rows(area.width.saturating_sub(4), busy);
+        let (rows, maps) = self.layout(area.width.saturating_sub(4), busy);
         let box_area = Rect { height: (rows.len() as u16 + 2).min(area.height), ..area };
         let border = if busy { theme::DIM } else { theme::ACCENT };
         let block = Block::bordered()
@@ -549,6 +936,10 @@ impl PromptInput {
         for (i, line) in rows.iter().enumerate().take(inner.height as usize) {
             buf.set_line(inner.x, inner.y + i as u16, line, inner.width);
         }
+        // The text's cells start past the gutter ("> "). An empty line shows the placeholder: a click there is at 0.
+        let maps = if self.value.is_empty() { vec![RowMap { cells: Vec::new(), end: 0 }] } else { maps };
+        *self.shown.borrow_mut() =
+            Shown { area: box_area, x: inner.x + 2, y: inner.y, rows: maps.into_iter().take(inner.height as usize).collect() };
         // The menu, paddingX 2.
         let menu_top = box_area.bottom();
         for (i, line) in self.menu_rows(area.width, busy, commands).iter().enumerate() {
@@ -752,16 +1143,166 @@ mod tests {
         assert_eq!(h.submitted, ["x"]);
     }
 
+    // Marv's ctrl+←/→ moved one char (ink-text-input); here they move by words, as in a text field.
     #[test]
-    fn ctrl_arrows_arent_typed_and_still_move_the_cursor() {
+    fn ctrl_arrows_arent_typed_and_move_by_words() {
         let mut h = Harness::new(&[]);
-        h.typed("ab");
+        h.typed("ab cd");
         h.key(KeyCode::Left, KeyModifiers::CONTROL);
         h.typed("x");
         h.key(KeyCode::Right, KeyModifiers::CONTROL);
         h.typed("y");
         h.press(&[KeyCode::Enter]);
-        assert_eq!(h.submitted, ["axby"]);
+        assert_eq!(h.submitted, ["ab xcdy"]);
+    }
+
+    #[test]
+    fn word_moves_and_word_and_line_deletes() {
+        let mut h = Harness::new(&[]);
+        h.typed("git commit --amend now");
+        h.key(KeyCode::Char('b'), KeyModifiers::ALT); // option+← on a Mac
+        h.key(KeyCode::Left, KeyModifiers::ALT);
+        assert_eq!(h.prompt.cursor, "git commit --".len(), "punctuation is a word of its own");
+        h.key(KeyCode::Char('w'), KeyModifiers::CONTROL);
+        assert_eq!(h.prompt.value, "git commit amend now");
+        h.key(KeyCode::Char('d'), KeyModifiers::ALT);
+        assert_eq!(h.prompt.value, "git commit  now");
+        h.key(KeyCode::Backspace, KeyModifiers::ALT);
+        assert_eq!(h.prompt.value, "git  now");
+        h.key(KeyCode::Char('f'), KeyModifiers::ALT);
+        h.key(KeyCode::Char('u'), KeyModifiers::CONTROL);
+        assert_eq!(h.prompt.value, "");
+        // Home/End and ctrl+a/e are the line's edges, not the text's.
+        h.prompt.give_back("one\ntwo");
+        h.key(KeyCode::Char('a'), KeyModifiers::CONTROL);
+        h.typed(">");
+        h.key(KeyCode::Up, KeyModifiers::NONE); // not drawn yet: ↑ is the history's (empty), nothing moves
+        assert_eq!(h.prompt.value, "one\n>two");
+        h.press(&[KeyCode::Left, KeyCode::Left, KeyCode::Home]);
+        h.typed("<");
+        h.key(KeyCode::Char('e'), KeyModifiers::CONTROL);
+        h.typed("!");
+        assert_eq!(h.prompt.value, "<one!\n>two");
+        // ctrl+w goes back to the space (readline's), alt+Backspace to the punctuation.
+        h.prompt.set("open src/ui/a.rs");
+        h.key(KeyCode::Backspace, KeyModifiers::ALT);
+        assert_eq!(h.prompt.value, "open src/ui/a.");
+        h.key(KeyCode::Char('w'), KeyModifiers::CONTROL);
+        assert_eq!(h.prompt.value, "open ");
+    }
+
+    #[test]
+    fn shift_selects_and_typing_backspace_and_ctrl_x_act_on_the_selection() {
+        let mut h = Harness::new(&[]);
+        h.typed("hello big world");
+        h.key(KeyCode::Left, KeyModifiers::CONTROL);
+        h.key(KeyCode::Left, KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        h.key(KeyCode::Left, KeyModifiers::SHIFT);
+        assert!(h.prompt.has_selection());
+        h.typed("_");
+        assert_eq!(h.prompt.value, "hello_world");
+        // ← over a selection goes to its start, → to its end, without moving past it.
+        h.key(KeyCode::Home, KeyModifiers::SHIFT);
+        h.press(&[KeyCode::Right]);
+        assert_eq!((h.prompt.cursor, h.prompt.has_selection()), (6, false));
+        h.key(KeyCode::End, KeyModifiers::SHIFT);
+        h.press(&[KeyCode::Backspace]);
+        assert_eq!(h.prompt.value, "hello_");
+        // ctrl+x cuts, chips expanded; with nothing selected it does nothing.
+        h.prompt.paste("a\nb");
+        h.key(KeyCode::Home, KeyModifiers::SHIFT);
+        let cut = h.prompt.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL), false, &h.commands);
+        assert_eq!(cut, Some(PromptOutcome::Copy("hello_a\nb".into())));
+        assert_eq!(h.prompt.value, "");
+        assert_eq!(h.prompt.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL), false, &h.commands), None);
+        // take_selection (the App's ctrl+c) copies and drops it, the text stays.
+        h.typed("keep");
+        h.key(KeyCode::Left, KeyModifiers::SHIFT);
+        assert_eq!(h.prompt.take_selection().as_deref(), Some("p"));
+        assert!(!h.prompt.has_selection());
+        assert_eq!(h.prompt.value, "keep");
+    }
+
+    #[test]
+    fn ctrl_z_takes_back_a_word_or_a_paste_and_ctrl_y_puts_it_again() {
+        let mut h = Harness::new(&[]);
+        h.typed("run the");
+        h.prompt.paste("x\ny");
+        h.typed("tests");
+        h.key(KeyCode::Char('z'), KeyModifiers::CONTROL);
+        assert_eq!(h.prompt.text(), "run thex\ny");
+        h.key(KeyCode::Char('z'), KeyModifiers::CONTROL);
+        assert_eq!(h.prompt.text(), "run the", "the paste is one step");
+        h.key(KeyCode::Char('z'), KeyModifiers::CONTROL);
+        assert_eq!(h.prompt.text(), "run ");
+        h.key(KeyCode::Char('y'), KeyModifiers::CONTROL);
+        h.key(KeyCode::Char('Z'), KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        assert_eq!(h.prompt.text(), "run thex\ny", "redo, and the chip still stands for its paste");
+        // A new edit drops what could be redone; a new line drops the undo.
+        h.typed("!");
+        h.key(KeyCode::Char('y'), KeyModifiers::CONTROL);
+        assert_eq!(h.prompt.text(), "run thex\ny!");
+        h.press(&[KeyCode::Enter]);
+        h.key(KeyCode::Char('z'), KeyModifiers::CONTROL);
+        assert_eq!(h.prompt.value, "");
+        // Only the last UNDO_STEPS edits are kept.
+        for i in 0..UNDO_STEPS + 5 {
+            h.typed(if i % 2 == 0 { "a" } else { " " });
+        }
+        for _ in 0..UNDO_STEPS + 5 {
+            h.key(KeyCode::Char('z'), KeyModifiers::CONTROL);
+        }
+        assert!(!h.prompt.value.is_empty());
+    }
+
+    #[test]
+    fn up_and_down_move_between_rows_and_reach_the_history_only_at_the_ends() {
+        let mut h = Harness::new(&["older"]);
+        h.prompt.give_back("first line\nsecond");
+        h.frame();
+        h.press(&[KeyCode::Up]);
+        h.frame();
+        assert_eq!(h.prompt.cursor, "first ".len(), "the same column on the row above");
+        h.press(&[KeyCode::Down]);
+        assert_eq!(h.prompt.cursor, "first line\nsecond".len(), "a shorter row: its end");
+        h.frame();
+        h.press(&[KeyCode::Up, KeyCode::Up]);
+        assert_eq!(h.prompt.value, "older", "from the first row, ↑ is the history's");
+        // A wrapped line's rows too.
+        h.prompt.set("x".repeat(80));
+        h.frame();
+        h.key(KeyCode::Up, KeyModifiers::SHIFT);
+        assert!(h.prompt.has_selection());
+        assert_eq!(h.prompt.value, "x".repeat(80));
+    }
+
+    #[test]
+    fn a_drag_in_the_box_selects_and_its_release_copies_and_a_click_moves_the_cursor() {
+        let mut h = Harness::new(&[]);
+        h.typed("see ");
+        h.prompt.paste("a\nb");
+        h.typed(" now");
+        let frame = h.frame();
+        let row = frame.lines().position(|l| l.contains("> see")).unwrap() as u16;
+        let x0 = frame.lines().nth(row as usize).unwrap().chars().position(|c| c == 's').unwrap() as u16;
+        assert!(!h.prompt.press(x0, row + 5), "below the box: not the prompt's");
+        assert!(h.prompt.press(x0 + 2, row));
+        assert_eq!(h.prompt.release(), None, "a click selects nothing");
+        assert_eq!(h.prompt.cursor, 2);
+        // From "e" in "see" to inside the chip's label: the chip comes whole.
+        assert!(h.prompt.press(x0 + 2, row));
+        assert!(h.prompt.drag(x0 + 9, row));
+        let frame = h.frame();
+        assert!(frame.contains("> see [Pasted text #1, 2 lines] now"), "{frame}");
+        assert_eq!(h.prompt.release().as_deref(), Some("e a\nb"));
+        assert!(h.prompt.press(x0 + 2, row));
+        h.prompt.drag(x0 + 40, row);
+        assert_eq!(h.prompt.release().as_deref(), Some("e a\nb now"), "past the end: to the end");
+        h.typed("!");
+        assert_eq!(h.prompt.text(), "se!", "typing replaces what the drag selected");
+        // Not drawn (a panel over it): the mouse can't reach it.
+        h.prompt.hide();
+        assert!(!h.prompt.press(x0, row));
     }
 
     #[test]
