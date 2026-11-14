@@ -231,8 +231,11 @@ fn main() {{
     let _ = std::fs::remove_file(&in_home);
 }
 
-/// The build script's report, under `target/debug/build/<pkg>-<hash>/out/`.
+/// The build script's report, under `target/debug/build/<pkg>-<hash>/out/`, or `<pkg>/<hash>/out/` since cargo 1.100
+/// (its new build-dir layout; looking only one level down failed CI with "the build script didn't run", 2026-11-13).
 fn find_report(target: &Path) -> Option<String> {
-    let build = target.join("debug/build");
-    std::fs::read_dir(build).ok()?.flatten().find_map(|e| std::fs::read_to_string(e.path().join("out/report.txt")).ok())
+    let dirs = |dir: &Path| std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path());
+    dirs(&target.join("debug/build"))
+        .flat_map(|pkg| std::iter::once(pkg.clone()).chain(dirs(&pkg).collect::<Vec<_>>()))
+        .find_map(|dir| std::fs::read_to_string(dir.join("out/report.txt")).ok())
 }
