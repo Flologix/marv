@@ -33,8 +33,14 @@ use serde_json::{Value, json};
 /// The plan server, unless `MARV_PLAN_URL` says otherwise.
 pub const DEFAULT_URL: &str = "https://www.flologixai.com/api/marv-plan";
 
-/// The licences' Ed25519 public key (32 raw bytes, base64). The development key pair for now: replaced before launch.
-pub const MARV_LICENCE_PUBLIC_KEY: &str = "22NbM1++70RAtG1ISq8TidaCvysmNL94IQ5ugEHH1vo=";
+/// The licences' Ed25519 public key (32 raw bytes, base64): the production pair, made 2026-11-16 (its private half is
+/// only on the server). Marv OS holds the same key.
+pub const MARV_LICENCE_PUBLIC_KEY: &str = "vl8WR97mT5ja+xjzMuZeU3iuBfgKVLY5bovUzOJoBeA=";
+
+/// The development pair's public key, whose private half is published in the site's runbook: this crate's tests sign
+/// their licences with it, so a test build checks with it. Never what a release checks with.
+#[cfg(test)]
+const DEV_LICENCE_PUBLIC_KEY: &str = "22NbM1++70RAtG1ISq8TidaCvysmNL94IQ5ugEHH1vo=";
 
 /// The sign-in, beside config.json. Shared with Marv OS.
 pub const PLAN_FILE: &str = "plan.json";
@@ -79,9 +85,14 @@ pub struct Licence {
     pub expires: u64,
 }
 
-/// The compiled-in public key's bytes.
+/// The public key licences are checked with: the production one ([`MARV_LICENCE_PUBLIC_KEY`]); in this crate's own
+/// test build, the dev pair's, which its tests sign with.
 fn public_key() -> Vec<u8> {
-    STANDARD.decode(MARV_LICENCE_PUBLIC_KEY).unwrap_or_default()
+    #[cfg(test)]
+    let key = DEV_LICENCE_PUBLIC_KEY;
+    #[cfg(not(test))]
+    let key = MARV_LICENCE_PUBLIC_KEY;
+    STANDARD.decode(key).unwrap_or_default()
 }
 
 /// `<base64url(payload)>.<base64url(signature over the payload's base64url text)>`, checked with `public_key` and
@@ -770,9 +781,15 @@ mod tests {
     }
 
     #[test]
-    fn the_compiled_in_key_is_the_dev_signing_keys_public_half() {
+    fn the_shipped_key_is_never_the_dev_pairs_whose_private_half_is_published() {
         use ring::signature::KeyPair as _;
+        // The test build checks with the dev pair (its tests sign with it)...
         assert_eq!(dev_key().public_key().as_ref(), public_key().as_slice());
+        // ...and a release with the production key, which is never the dev one: anyone could sign with that.
+        let shipped = STANDARD.decode(MARV_LICENCE_PUBLIC_KEY).unwrap();
+        assert_eq!(shipped.len(), 32, "an Ed25519 public key");
+        assert_ne!(shipped, public_key(), "MARV_LICENCE_PUBLIC_KEY is the dev key");
+        assert_eq!(verify_licence(&licence("founding", NOW + 1000), &shipped, NOW), None, "a dev licence isn't valid");
     }
 
     #[test]
