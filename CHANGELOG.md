@@ -6,6 +6,10 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+### Added
+
+- **Sign in to your Marv account.** `marv login` asks for your email, emails you a 6-digit code, and signs this machine in (a free account, or the plan you bought); `marv plan` shows the plan, its status and how much of the model allowance is used and left (`/plan` in marv too), `marv plan --manage` opens the billing page, and `marv logout` signs out. With **Pro + models**, the plan's OpenRouter key becomes your OpenRouter key (and its default model, DeepSeek V4.1 Flash, your model), unless you already have an OpenRouter key of your own: that one is never replaced. While the plan's key is in use, `/model` offers only the plan's models. When the month's allowance is used up, Marv says so, when it resets, and how to use your own key. The sign-in is kept in `~/.marv/plan.json`, readable only by you. Marv works without an account, and nothing contacts the account server unless you sign in.
+
 ## [0.16.4] - 2026-11-14
 
 ### Added

@@ -2144,6 +2144,7 @@ impl Bridge {
                 self.emit(UiEvent::Message(message(Role::User, line)));
                 self.run_turn(line.to_string(), Some(for_model));
             }
+            CommandAction::Plan { manage } => self.show_plan(manage).await,
             CommandAction::McpTrust => self.trust_mcp().await,
             CommandAction::TrustProject => self.trust_project().await,
             CommandAction::McpAdd { args } => self.add_mcp(&args).await,
@@ -2692,6 +2693,23 @@ impl Bridge {
         }
     }
 
+    /// /plan: the Marv plan from its server (`crate::plan`), or its billing page opened (the link shown either way).
+    async fn show_plan(&self, manage: bool) {
+        let ctx = crate::plan::Ctx::new(&self.env, &self.config_dir);
+        if manage {
+            let url = self.busy_with("Asking for the billing page…".into(), async |_| crate::plan::portal_url(&ctx).await).await;
+            return match url {
+                Ok(url) => {
+                    self.emit(system(format!("Manage your Marv plan at:\n{}", printable(url.as_str())), false));
+                    (self.open_url)(url);
+                }
+                Err(e) => self.emit(system(e, true)),
+            };
+        }
+        let (text, is_error) = self.busy_with("Checking your Marv plan…".into(), async |_| crate::plan::status(&ctx).await).await;
+        self.emit(system(text, is_error));
+    }
+
     /// /mcp remove: one of your servers out of ~/.marv/mcp.json, and stopped. No approval: the user typed it, and it
     /// takes capability away.
     async fn remove_mcp(&self, name: &str) {
@@ -3038,9 +3056,24 @@ impl SessionPort for Port {
         } else {
             (b.load_models)(kind, config.base_url)
         };
+        // On the Marv plan's key, only the plan's models (its guardrail refuses others): OPENROUTER_API_KEY, else the
+        // saved key.
+        let allowed = if kind == ProviderKind::OpenRouter {
+            let key = b
+                .env
+                .get("OPENROUTER_API_KEY")
+                .cloned()
+                .filter(|k| !k.trim().is_empty())
+                .or_else(|| file.as_ref().and_then(|f| f.api_key.clone()));
+            crate::plan::menu_models(&b.config_dir, key.as_deref())
+        } else {
+            Vec::new()
+        };
         let tx = b.activity.tx.clone();
         tokio::spawn(async move {
-            let result = models.await.map(|list| list.into_iter().map(model_info).collect());
+            let result = models
+                .await
+                .map(|list| list.into_iter().filter(|m| allowed.is_empty() || allowed.contains(&m.id)).map(model_info).collect());
             let _ = tx.send(UiEvent::Models(result));
         });
     }

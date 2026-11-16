@@ -15,6 +15,10 @@
 //!   ([`plan_limit`]): never retried (it's a 429, which is otherwise retried) and never answered by switching to
 //!   another key or provider.
 //!
+//! - The Marv plan's model allowance: its OpenRouter key has a monthly limit, and OpenRouter answers 402 with
+//!   `limit_source: "openrouter_key_limit"` once it's spent. That's said as the allowance being used up, when it resets
+//!   and how to use your own key ([`key_limit`]), not as "out of credits" (the person has credits; the key's cap is hit).
+//!
 //! - Marv #63: context-length overflow errors are recognized ([`is_context_overflow`]), so the loop can compact and
 //!   retry the step instead of ending the turn.
 //!
@@ -146,9 +150,28 @@ pub fn plan_limit_of(label: &str, code: Option<&serde_json::Value>, message: Opt
     Some(format!("{label}: {reason}{detail}. Marv stopped here and won't switch to another key or provider on its own. {advice}"))
 }
 
+/// What's said when an OpenRouter key's own spending limit is reached. On the Marv plan's key that's the monthly model
+/// allowance (it resets on the 1st, 00:00 UTC); a person's own key can have a limit too, so both are named.
+pub const KEY_LIMIT_MESSAGE: &str = "OpenRouter: this key's spending limit is reached. If it's your Marv plan's key, the \
+     monthly model allowance is used up: it resets on the 1st of next month (00:00 UTC; `marv plan` shows the date). To \
+     keep going now, use your own OpenRouter key: run /setup and enter it (signing out of the plan leaves it in place).";
+
+/// Whether an error body is OpenRouter's key-limit refusal: `limit_source` `openrouter_key_limit`, in the error's
+/// `metadata` or on the error itself.
+pub fn key_limit(body: &str) -> Option<&'static str> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let error = value.get("error")?;
+    let source = error.pointer("/metadata/limit_source").or_else(|| error.get("limit_source"))?;
+    (source.as_str() == Some("openrouter_key_limit")).then_some(KEY_LIMIT_MESSAGE)
+}
+
 /// #159: [`plan_limit_of`] for an error response's body (`{"error":{"code":…,"message":…}}`; OpenAI may put the code
 /// in `type`).
 pub fn plan_limit(label: &str, body: &str) -> Option<String> {
+    // A spent key limit is a hard stop too: retrying won't lift it until it resets.
+    if let Some(message) = key_limit(body) {
+        return Some(message.to_string());
+    }
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
     let error = value.get("error")?;
     let code = error.get("code").filter(|c| !c.is_null()).or_else(|| error.get("type"));
@@ -358,6 +381,20 @@ mod tests {
         };
         assert_eq!(describe_error(&err), "Provider returned error: Anthropic: tool_use ids must be unique");
         assert_eq!(describe_error(&ErrorObject::default()), "unknown error");
+    }
+
+    /// The Marv plan's allowance: OpenRouter's key-limit 402 says it's used up, when it resets and how to go on.
+    #[test]
+    fn an_openrouter_key_limit_is_the_allowance_used_up() {
+        let body = r#"{"error":{"code":402,"message":"Key limit exceeded","metadata":{"limit_source":"openrouter_key_limit"}}}"#;
+        let message = plan_limit("OpenRouter", body).unwrap();
+        assert!(message.contains("monthly model allowance is used up"), "{message}");
+        assert!(message.contains("resets on the 1st of next month") && message.contains("your own OpenRouter key"));
+        let flat = r#"{"error":{"code":402,"message":"Key limit exceeded","limit_source":"openrouter_key_limit"}}"#;
+        assert_eq!(key_limit(flat), Some(KEY_LIMIT_MESSAGE));
+        // Out of account credits is still that, and other limit sources aren't the key's.
+        assert_eq!(plan_limit("OpenRouter", r#"{"error":{"code":402,"message":"Insufficient credits"}}"#), None);
+        assert_eq!(key_limit(r#"{"error":{"metadata":{"limit_source":"something_else"}}}"#), None);
     }
 
     /// #159: a plan's limit is a hard stop with its own message; other errors aren't.
