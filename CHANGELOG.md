@@ -6,6 +6,15 @@ What counts as Marv's public API: the `marv` command's flags, subcommands and sl
 
 ## [Unreleased]
 
+### Fixed
+
+- **`/yolo` no longer says commits ask on Linux.** Since 0.16.1 a sandboxed `git_write` command (commit, branch, merge) runs without asking there, but the yolo notice still listed "git changes" among what asks. It now says git *setup* changes ask (config, remotes, hooks). On macOS, where every git change still asks, the notice is unchanged. The README's safety rules said the same old thing and are corrected too.
+
+### Changed
+
+- **The README says plainly what asks.** The "Safe yolo mode" bullet was one sentence stacking defaults and exceptions. It is now short and points to a new table, [What asks, and when](README.md#what-asks-and-when). The table lists each kind of action against yolo on and `/yolo off`, then the cases that ask anyway: after outside text, in your home folder, and in a turn a mesh message started.
+- **The largest source files are split up.** Nothing behaves differently. `session.rs` (8,500 lines) keeps the session's core, with its turn, compaction, lifecycle and saving code in `session/`. The TUI bridge in `marv-cli`'s `tui.rs` (5,700 lines) is split the same way into turns, settings, radio/mesh and MCP servers. The inline test modules of those two files, `agent.rs` and `marv-tui`'s `app.rs` moved to their own files. No production file is over 2,200 lines now.
+
 ## [0.16.4] - 2026-11-14
 
 ### Added
