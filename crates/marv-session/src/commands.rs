@@ -1043,13 +1043,16 @@ pub fn yolo_status(config: &Config, sandbox_available: bool, yolo_allowed: bool)
         };
     }
     if confined {
+        // Sandboxed commits, branches and merges run unasked under bubblewrap (`git_write_guard`); Seatbelt keeps asking.
+        let git =
+            if cfg!(target_os = "linux") { "git setup changes (config, remotes, hooks)" } else { "git changes (git_write)" };
         let rest = if unasked {
             format!(" (Sandboxed commands also run without asking with yolo off, while approveSandboxed is auto.{woken})")
         } else {
             String::new()
         };
         format!(
-            "Yolo on: sandboxed commands and file edits run without asking. Network access, git changes (git_write), edits inside .git, and memory still ask.{rest}"
+            "Yolo on: sandboxed commands and file edits run without asking. Network access, {git}, edits inside .git, and memory still ask.{rest}"
         )
     } else {
         format!(

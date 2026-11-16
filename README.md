@@ -11,7 +11,7 @@ Marv is written in Rust and ships as one static binary. Nothing else runs it: no
 ## Features
 
 - **An agent loop with tools.** It can read, search (`glob`, `grep`), edit, write, and run shell commands. The model decides which tools to use; Marv runs them and reports back. Read-only calls in a row run in parallel.
-- **Safe yolo mode (on by default).** Sandboxed commands and edits inside the project run without asking (sandboxed commands do so even with yolo off when `approveSandboxed` is set; by default it is, unless your config has `"yolo": false`; `/yolo off` turns it off, and `"approveSandboxed": "ask"` in your config does too); anything the sandbox can't contain (network access, git commits and other repository changes, `.git` itself, protected files like `.envrc` or `AGENTS.md`, memory) still shows you a colored diff or the exact command first: yes, yes for the rest of the session, no (which stops Marv so you can redirect it), or "no, and say why" (Tab), which skips that call and lets the turn carry on with your reason. `/yolo off` asks for every file change. `/permissions` shows everything Marv may currently do without asking.
+- **Safe yolo mode (on by default).** What the sandbox can contain runs without asking: commands without network, and edits inside the project. What it can't contain asks first and shows you the colored diff or the exact command. That covers network access, protected files like `.envrc` or `AGENTS.md`, git setup changes and memory. [What asks, and when](#what-asks-and-when) has the full table. `/yolo off` asks for everything, and `/permissions` shows what Marv may do right now without asking.
 - **Sandboxed commands.** Commands run in [bubblewrap](https://github.com/containers/bubblewrap): only the project folder is writable (plus a private `/tmp` that keeps its files from one command to the next in the same chat), your home folder (keys, SSH, Marv's own config) is hidden, there's no network unless a command asks for it, and API keys never reach the command. A retry of a command that failed for lack of network runs with the network, so it asks you like any network command.
 - **Web pages.** `web_fetch` reads a page as text, asking per site. A page longer than one 30,000-character part is also saved whole on the first read, so the model can `grep` it or read just the part it needs instead of paging through it.
 - **Guarded against prompt injection.** Once a web page, an MCP result or a message from another agent is in the conversation, anything that could send data out asks you, even in yolo and even after "don't ask again". Text from outside is shown to the model as data, never in Marv's voice. See [Safety model](#safety-model).
@@ -235,9 +235,41 @@ marv --help          show the help
 
 ## Safety model
 
-Marv is built so that you stay in control of what changes on your machine:
+Marv is built so that you stay in control of what changes on your machine.
 
-1. **Reading is free; what can't be contained needs approval.** Reading and searching files never asks. With yolo mode on (the default), commands that run in a working sandbox without network, and edits inside the project (but not in `.git` or a protected file), run without asking; everything else shows you exactly what will happen first: a command that wants the network or changes the git repository (it must say so with `git_write`), an edit to a protected file, any command when the sandbox is off or unavailable, and every memory change. With `/yolo off`, every edit asks, and so does every command unless `approveSandboxed` is `"auto"` in your config (by default a sandboxed command without network runs without asking in your turns, yolo or not, unless your config sets `"yolo": false`; `/yolo off` and `"approveSandboxed": "ask"` turn it off). In a turn a mesh message woke, such a command runs without asking with the project read-only: it can inspect and build into `/tmp`, and anything that has to change the project asks. "Don't ask again" covers the rest of the session only: all file edits, or one exact command. "No" (or Esc) stops the turn so you can say what to do instead; "No, and say why" (Tab at the prompt) takes a short reason instead: the call isn't run, the model reads your reason as the call's result, and the turn carries on.
+### What asks, and when
+
+| | Yolo on (the default) | `/yolo off` |
+|---|---|---|
+| Reading and searching files | runs | runs |
+| Edits inside the project | runs | asks |
+| Commands in the sandbox, without network | runs | asks¹ |
+| Commits, branches, merges, rebases (sandboxed `git_write`, Linux) | runs | asks¹ |
+| Git setup changes (`git config`, remotes, hooks, submodules, worktrees); any git change on macOS | asks | asks |
+| Commands that want the network | asks | asks |
+| Any command when the sandbox is off or unavailable | asks | asks |
+| Edits to protected files (`.git/`, `.env*`, `AGENTS.md`, `.mcp.json`, …) | asks every time² | asks every time² |
+| Memory changes | asks | asks |
+| Web pages | asks per site | asks per site |
+| GitHub with your `gh` login | reads run; anything that changes GitHub asks | same |
+| MCP tool calls | asks, unless the server marks the tool read-only | same |
+| Background processes (`process start`) | asks per command; serving a folder as a static site runs | same |
+| One command outside the sandbox (`sandbox: false`) | asks every time² | asks every time² |
+
+¹ Runs without asking if your config sets `"approveSandboxed": "auto"`. Without that setting, `/yolo off` asks.
+² "Don't ask again" never covers it.
+
+Some things ask even where the table says "runs":
+
+- **After outside text.** Once a web page, an MCP result, another agent's message or a hook's output is in the conversation, anything that could send data out asks every time. That includes network commands, web, MCP, mesh and GitHub writes, and no earlier "don't ask again" covers them.
+- **In your home folder.** Started in your home folder, every file change asks. Sandboxed commands still run, but they see the home folder read-only.
+- **In a turn a mesh message started.** Commands that run without asking see the project read-only.
+
+"Don't ask again" lasts for the rest of the session only. `marv -p` has nobody to ask, so it goes by `--approve` ([details](#using-marv-from-scripts-and-other-agents)).
+
+### The rules
+
+1. **Reading is free; what can't be contained needs approval.** Reading and searching files never asks. With yolo mode on (the default), commands that run in a working sandbox without network, and edits inside the project (but not in `.git` or a protected file), run without asking; everything else shows you exactly what will happen first: a command that wants the network or changes the repository's setup (`git config`, remotes, hooks; on macOS any `git_write` command), an edit to a protected file, any command when the sandbox is off or unavailable, and every memory change. With `/yolo off`, every edit asks, and so does every command unless `approveSandboxed` is `"auto"` in your config (by default a sandboxed command without network runs without asking in your turns, yolo or not, unless your config sets `"yolo": false`; `/yolo off` and `"approveSandboxed": "ask"` turn it off). In a turn a mesh message woke, such a command runs without asking with the project read-only: it can inspect and build into `/tmp`, and anything that has to change the project asks. "Don't ask again" covers the rest of the session only: all file edits, or one exact command. "No" (or Esc) stops the turn so you can say what to do instead; "No, and say why" (Tab at the prompt) takes a short reason instead: the call isn't run, the model reads your reason as the call's result, and the turn carries on.
 2. **Protected files always ask.** Some files run code or instructions outside the sandbox later: `.git/` (any level) and the `core.hooksPath` folder (git runs hooks and config from them on your next commit), `.env*` and `.envrc` (your shell's loaders read them), `bunfig.toml`, `.mcp.json`, `AGENTS.md` and `CLAUDE.md` at any level, `.marv/`, `.vscode/` and `.idea/`, and the lifecycle `scripts` in `package.json`. A change to one asks every time, in yolo too, and "don't ask again" never covers it. Inside the sandbox they're read-only, and one a command creates is found and taken back. Paths are checked after following symlinks, so a link named `innocent.sh` pointing at `.envrc` counts as `.envrc`. What this can't protect: other files you later run yourself, like a script or a `Makefile`; review with `git diff` before running them.
 3. **Paths are confined to the project.** Tools refuse anything outside the folder Marv was started in, including through symlinks (dangling ones too). Skills' files are checked the same way.
 4. **Commands run in a sandbox.** The system is read-only, `/run` (where your desktop's sockets live) is empty, and the home folder is a stand-in: toolchains like `~/.bun`, `~/.cargo`, `~/.local/share/mise` and your git config are mounted read-only, with credential files inside them masked. The project folder is the only writable place, and there's no network unless the command asks for it, which the approval prompt shows. The environment starts empty, so API keys can't leak into commands. Started in your home folder itself, Marv works there too, but the sandbox shows the home read-only and hides its hidden folders (Marv's config, credentials, `~/.cache`, agent sockets) and any socket in it, except your desktop's and apps' settings (`~/.config`, `~/.local/share`, `~/.local/state`, on Linux), shown read-only with browser profiles, password managers, chat apps, logins and files named like secrets still hidden. Commands write only to `/tmp`, so the ones without network run without asking there too; file changes go through Marv's edit tools, which ask you each time there, except that inside one project folder two levels down (`~/Projects/shop`) you can answer "always" for that folder alone. For undo and the rest, start Marv in the project folder itself.
