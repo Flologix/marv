@@ -153,7 +153,7 @@ pub enum Command {
         #[arg(long)]
         check: bool,
     },
-    /// Sign in to your paid Marv plan with the code it emails you (Marv Free needs no account).
+    /// Sign in to your Marv account (free or paid) with the code it emails you. Marv works without one.
     Login {
         /// The email the plan was bought with (asked when not given).
         #[arg(long)]

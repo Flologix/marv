@@ -120,6 +120,9 @@ pub struct PlanFile {
     pub licence: String,
     /// `sk-or-v1-abc…`: which key the plan gave, without the key. `None` for a plan without models.
     pub key_label: Option<String>,
+    /// `allowedModels`: the models the plan's key may call (the server's guardrail refuses others). `/model` offers
+    /// only these from OpenRouter while that key is in use. The desktop writes the same field.
+    pub allowed_models: Vec<String>,
 }
 
 impl PlanFile {
@@ -137,6 +140,11 @@ impl PlanFile {
             plan: text("plan").unwrap_or_default(),
             licence: text("licence").unwrap_or_default(),
             key_label: text("keyLabel"),
+            allowed_models: value
+                .get("allowedModels")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).filter(|m| plain_value(m)).map(str::to_string).collect())
+                .unwrap_or_default(),
         })
     }
 
@@ -145,6 +153,9 @@ impl PlanFile {
         let mut value = json!({ "email": self.email, "token": self.token, "plan": self.plan, "licence": self.licence });
         if let Some(label) = &self.key_label {
             value["keyLabel"] = Value::from(label.as_str());
+        }
+        if !self.allowed_models.is_empty() {
+            value["allowedModels"] = json!(self.allowed_models);
         }
         let text = serde_json::to_string_pretty(&value).map_err(std::io::Error::other)? + "\n";
         marv_fs::private_file::write_private(&Self::path(config_dir), &text).await
@@ -155,6 +166,16 @@ impl PlanFile {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
             _ => Ok(()),
         }
+    }
+}
+
+/// The models `/model` offers from OpenRouter: the plan's list while `key` (the OpenRouter key in use) is the plan's,
+/// by the label plan.json kept; empty (every model) otherwise.
+pub fn menu_models(config_dir: &Path, key: Option<&str>) -> Vec<String> {
+    let Some(file) = PlanFile::load(config_dir) else { return Vec::new() };
+    match (key, &file.key_label) {
+        (Some(key), Some(label)) if &key_label(key) == label => file.allowed_models,
+        _ => Vec::new(),
     }
 }
 
@@ -171,6 +192,7 @@ pub struct Models {
     pub limit_usd: f64,
     pub used_usd: f64,
     pub resets_at: Option<String>,
+    pub allowed_models: Vec<String>,
 }
 
 /// `GET /me`.
@@ -220,6 +242,11 @@ impl Me {
                 limit_usd: m.get("limitUsd").and_then(Value::as_f64).unwrap_or(0.0),
                 used_usd: m.get("usedUsd").and_then(Value::as_f64).unwrap_or(0.0),
                 resets_at: text(m, "resetsAt"),
+                allowed_models: m
+                    .get("allowedModels")
+                    .and_then(Value::as_array)
+                    .map(|a| a.iter().filter_map(Value::as_str).filter(|id| plain_value(id)).map(str::to_string).collect())
+                    .unwrap_or_default(),
             })
         });
         Some(Self {
@@ -475,7 +502,15 @@ pub async fn login(
     let token = token.ok_or("Not signed in. Run `marv login` again for a new code.")?;
     let me = fetch_me(&ctx.base, &token).await.map_err(|e| format!("Signed in, but couldn't read the plan: {}.", e.text()))?;
     let key_label = me.models.as_ref().map(|m| key_label(&m.api_key));
-    let file = PlanFile { email: me.email.clone(), token, plan: me.plan.clone(), licence: me.licence.clone(), key_label };
+    let allowed_models = me.models.as_ref().map(|m| m.allowed_models.clone()).unwrap_or_default();
+    let file = PlanFile {
+        email: me.email.clone(),
+        token,
+        plan: me.plan.clone(),
+        licence: me.licence.clone(),
+        key_label,
+        allowed_models,
+    };
     file.save(&ctx.config_dir).await.map_err(|e| format!("Couldn't save {}: {e}", PlanFile::path(&ctx.config_dir).display()))?;
 
     if me.plan == "free" {
@@ -549,7 +584,7 @@ pub async fn logout(ctx: &Ctx, out: &mut dyn Write) -> Result<(), String> {
     }
     PlanFile::remove(&ctx.config_dir)
         .map_err(|e| format!("Couldn't delete {}: {e}", PlanFile::path(&ctx.config_dir).display()))?;
-    say!(out, "Signed out of the Marv plan. Marv Free needs no account.");
+    say!(out, "Signed out of your Marv account. Marv keeps working without one.");
     Ok(())
 }
 
@@ -575,8 +610,10 @@ pub async fn status(ctx: &Ctx) -> (String, bool) {
         }
     };
     // The licence is renewed with each period: keep the newest one for the offline check.
-    if me.licence != file.licence || me.plan != file.plan {
-        let _ = PlanFile { plan: me.plan.clone(), licence: me.licence.clone(), ..file.clone() }.save(&ctx.config_dir).await;
+    let allowed_models = me.models.as_ref().map_or_else(|| file.allowed_models.clone(), |m| m.allowed_models.clone());
+    if me.licence != file.licence || me.plan != file.plan || allowed_models != file.allowed_models {
+        let next = PlanFile { plan: me.plan.clone(), licence: me.licence.clone(), allowed_models, ..file.clone() };
+        let _ = next.save(&ctx.config_dir).await;
     }
     if me.plan == "free" {
         return (format!("Marv Free, signed in as {}.\nPlans: {PRICING_URL}", printable(&me.email)), false);
@@ -688,6 +725,25 @@ pub fn open(env: &Env, url: &reqwest::Url) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `/model` narrows to the plan's models only while the key in use is the plan's (by the label plan.json kept),
+    /// and a file written by the desktop (camelCase `allowedModels`) is read the same.
+    #[test]
+    fn the_model_list_narrows_to_the_plans_models_only_on_the_plans_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan_key = "sk-or-v1-0123456789abcdef";
+        std::fs::write(
+            dir.path().join(PLAN_FILE),
+            json!({ "email": "a@b.co", "token": "t", "plan": "pro_models", "licence": "x.y",
+                    "keyLabel": key_label(plan_key), "allowedModels": ["deepseek/deepseek-v4.1-flash", "z-ai/glm-5.3-flash"] })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(menu_models(dir.path(), Some(plan_key)), ["deepseek/deepseek-v4.1-flash", "z-ai/glm-5.3-flash"]);
+        assert!(menu_models(dir.path(), Some("sk-or-v1-somebody-else")).is_empty(), "their own key: every model");
+        assert!(menu_models(dir.path(), None).is_empty());
+        assert_eq!(PlanFile::load(dir.path()).unwrap().allowed_models.len(), 2);
+    }
     use std::os::unix::fs::PermissionsExt;
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

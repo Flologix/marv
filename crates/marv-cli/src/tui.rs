@@ -3056,9 +3056,24 @@ impl SessionPort for Port {
         } else {
             (b.load_models)(kind, config.base_url)
         };
+        // On the Marv plan's key, only the plan's models (its guardrail refuses others): OPENROUTER_API_KEY, else the
+        // saved key.
+        let allowed = if kind == ProviderKind::OpenRouter {
+            let key = b
+                .env
+                .get("OPENROUTER_API_KEY")
+                .cloned()
+                .filter(|k| !k.trim().is_empty())
+                .or_else(|| file.as_ref().and_then(|f| f.api_key.clone()));
+            crate::plan::menu_models(&b.config_dir, key.as_deref())
+        } else {
+            Vec::new()
+        };
         let tx = b.activity.tx.clone();
         tokio::spawn(async move {
-            let result = models.await.map(|list| list.into_iter().map(model_info).collect());
+            let result = models
+                .await
+                .map(|list| list.into_iter().filter(|m| allowed.is_empty() || allowed.contains(&m.id)).map(model_info).collect());
             let _ = tx.send(UiEvent::Models(result));
         });
     }
