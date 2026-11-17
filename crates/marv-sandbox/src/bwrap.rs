@@ -10,7 +10,9 @@
 //!   D-Bus let `systemd-run --user` start programs outside the sandbox, plus the GPG/SSH agents, keyring, display and
 //!   docker; a read-only mount doesn't stop a `connect()`). Only `PATH` folders under `/run` (NixOS, fnm) and, with
 //!   network, the DNS config `/etc/resolv.conf` leads to are shown again, read-only;
-//! - the home folder is a stand-in (see [`crate::home`]);
+//! - the home folder is a stand-in (see [`crate::home`]). So is the user's home from the password database when `HOME`
+//!   names another folder or none (`Plan::other_home`, marv-rs): hiding only what `HOME` named left the real home
+//!   readable whenever Marv was started with `HOME` changed or unset;
 //! - the project is the only writable place (plus a private, RAM-backed `/tmp`), with protected paths read-only;
 //! - when the project is the home folder or a parent of it (Marv started in `~`), the stand-in can't hide the home
 //!   without hiding the project, so the project is shown **read-only** instead, and on top of it every hidden
@@ -125,6 +127,12 @@ pub fn sandbox_args(opts: &SandboxOptions, fs: &dyn FsProbe) -> Result<Vec<OsStr
         ]),
         None => push(&["--tmpfs".as_ref(), "/tmp".as_ref()]),
     }
+    // The other home (`Plan::other_home`: the account's when `HOME` names another folder) first, so a home inside
+    // it still gets its stand-in; its toolchains are shown again with the home's below.
+    if let Some(other) = opts.other_home_hidden(fs) {
+        args.extend(["--tmpfs".into(), other.into_os_string()]);
+    }
+    let mut push = |items: &[&std::ffi::OsStr]| args.extend(items.iter().map(|s| s.to_os_string()));
     push(&["--tmpfs".as_ref(), home]);
     args.extend(run_mounts(&opts.path, opts.network, fs));
     // The mesh plug (marv-rs): after the empty /run, which would hide it otherwise. A read-only bind wouldn't stop
@@ -1020,6 +1028,43 @@ mod tests {
         // The stand-in hides the config folder already (a tmpfs on it would hide ~/.marv/skills).
         assert!(!args.contains("--tmpfs /home/me/.marv") && !args.contains("--tmpfs /home/me/.ssh"), "{args}");
         assert!(!args.contains("/dev/null /home/me/Projects/run.sock"), "{args}");
+    }
+
+    /// `HOME` names another folder: the account's home is hidden too, before the stand-in and the project, with its
+    /// toolchains shown again and its credential files masked. Never `/`, the home itself, or a folder in the project.
+    #[test]
+    fn the_accounts_home_is_hidden_when_home_names_another_folder() {
+        let mut fs = Fake::new(|p| p.ends_with(".bun") || p.ends_with(".cargo") || p.starts_with("/home/me"));
+        fs.kinds.insert("/home/me/.cargo/credentials.toml".into(), FileKind::File);
+        let opts = SandboxOptions {
+            root: "/home/me/proj".into(),
+            home: "/srv/fake".into(),
+            other_home: Some("/home/me".into()),
+            ..base()
+        };
+        let args = joined(&opts, &fs);
+        let hidden = last(&args, "--tmpfs /home/me ");
+        assert!(hidden < last(&args, "--tmpfs /srv/fake"), "before the stand-in: {args}");
+        assert!(hidden < last(&args, "--bind /home/me/proj /home/me/proj"), "the project is mounted over it: {args}");
+        assert!(last(&args, "--ro-bind /home/me/.cargo /home/me/.cargo") > hidden, "{args}");
+        assert!(last(&args, "--ro-bind /dev/null /home/me/.cargo/credentials.toml") > hidden, "{args}");
+        assert!(args.contains("--setenv HOME /srv/fake"), "{args}");
+        // The same folder by another path, `/`, or a folder inside the project: nothing more.
+        fs.links.insert("/srv/fake".into(), "/home/me".into());
+        let same = joined(&SandboxOptions { home: "/srv/fake".into(), ..opts.clone() }, &fs);
+        assert!(!same.contains("--tmpfs /home/me "), "{same}");
+        fs.links.clear();
+        for other in ["/", "/home/me/proj", "/home/me/proj/sub"] {
+            let args = joined(&SandboxOptions { other_home: Some(other.into()), ..opts.clone() }, &fs);
+            assert_eq!(
+                args.matches("--tmpfs ").count(),
+                joined(&SandboxOptions { other_home: None, ..opts.clone() }, &fs).matches("--tmpfs ").count(),
+                "{other}: {args}"
+            );
+        }
+        // A project of `/` mounts nothing after it, so the other home is hidden there too.
+        let at_root = joined(&SandboxOptions { root: "/".into(), ..opts }, &fs);
+        assert!(at_root.contains("--tmpfs /home/me "), "{at_root}");
     }
 
     #[test]

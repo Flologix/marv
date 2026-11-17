@@ -244,6 +244,63 @@ fn the_home_is_a_stand_in_with_masked_credentials() {
     }
 }
 
+/// **The real home is hidden whatever `HOME` says.** The stand-in hid only the folder `HOME` named, so a Marv started
+/// with `HOME` pointing elsewhere (or unset) left the user's real home readable to every sandboxed command. The home
+/// from the password database (`marv_sandbox::account_home`) is hidden as well (`Plan::other_home`), its toolchains
+/// shown again; and where the project is that home, it is the plan's home, so the home-folder rules apply to it.
+/// Here `HOME` is a fake home (`sandbox_with_home`), as in every guard, and a file is planted in the real one.
+///
+/// Proven: removed the `--tmpfs` over `Plan::other_home_hidden` in `sandbox_args` → this test failed (the planted
+/// file printed, and the mount list check failed).
+#[test]
+fn the_accounts_home_is_hidden_when_home_names_another_folder() {
+    let Some(account) = marv_sandbox::account_home().and_then(|h| std::fs::canonicalize(h).ok()) else {
+        eprintln!("skipped: no home folder in the password database for this user");
+        return;
+    };
+    let (project, home) = (TempDir::new("acct-proj"), TempDir::outside_tmp("acct-home"));
+    let sandbox = sandbox_with_home(home.path());
+    // The plan and its mounts, deterministically: the real home is the other home, and bwrap hides it.
+    let plan = sandbox.plan(project.path(), &CommandMounts::default());
+    assert_eq!(plan.home, home.path());
+    let args: Vec<String> = marv_sandbox::sandbox_args(&plan, &marv_sandbox::RealFs)
+        .unwrap()
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    assert!(args.windows(2).any(|w| w[0] == "--tmpfs" && w[1] == *account.to_string_lossy()), "{args:?}");
+    // A project that is the real home: it's the plan's home (read-only, its private entries masked), never shown as an
+    // ordinary writable project because `HOME` names another folder.
+    let at_home = sandbox.plan(&account, &CommandMounts::default());
+    assert_eq!(at_home.home, account);
+    assert!(at_home.project_read_only(&marv_sandbox::RealFs));
+
+    require_bwrap!();
+    struct Planted(std::path::PathBuf);
+    impl Drop for Planted {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let planted = Planted(account.join(format!("marv-guards-account-{}", std::process::id())));
+    std::fs::create_dir_all(&planted.0).unwrap();
+    std::fs::write(planted.0.join("secret.txt"), "REAL HOME SECRET").unwrap();
+    let ran = run_sandboxed(
+        &sandbox,
+        project.path(),
+        &CommandMounts::default(),
+        &format!(
+            "cat {}/secret.txt 2>/dev/null; ls {} 2>/dev/null | grep -c marv-guards-account; echo done",
+            planted.0.display(),
+            account.display()
+        ),
+        &[],
+    );
+    assert!(ran.output.contains("done"), "{}", ran.output);
+    assert!(!ran.output.contains("REAL HOME SECRET"), "the real home is readable: {}", ran.output);
+    assert!(ran.output.lines().any(|l| l == "0"), "the real home is listed: {}", ran.output);
+}
+
 // ---- the home folder as the project: read-only, its private parts hidden --------------------------------------
 
 /// A fake home that is also the project (Marv started in `~`): Marv's config, an SSH key, a cargo token, an agent's

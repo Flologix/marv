@@ -143,8 +143,12 @@ pub enum SandboxError {
 pub struct Sandbox {
     /// `/sandbox on|off`. Off: commands run directly under `setsid` (still approved, with a warning).
     pub enabled: bool,
-    /// The real home folder, replaced by an empty tmpfs inside the sandbox.
+    /// The home folder (`HOME`; the password database's when `HOME` is unset, empty, relative or `/`), replaced by an
+    /// empty tmpfs inside the sandbox, and the command's `HOME`.
     pub home: PathBuf,
+    /// The user's home folder from the password database (by uid, whatever `HOME` says): hidden as well when it
+    /// isn't [`Sandbox::home`] ([`Plan::other_home`]). None where the database has no entry for the user.
+    pub account_home: Option<PathBuf>,
     /// `PATH` inside the sandbox (the host's).
     pub path: String,
     /// `LANG` inside the sandbox (the host's, else `C.UTF-8`).
@@ -184,12 +188,14 @@ pub struct CommandMounts {
 }
 
 impl Sandbox {
-    /// From the real environment (`HOME`, `PATH`, `LANG`), never from a file in the project.
+    /// From the real environment (`HOME`, `PATH`, `LANG`) and the password database, never from a file in the project.
     pub fn from_env(enabled: bool) -> Self {
-        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"));
+        let account_home = account_home();
+        let home = home_from(std::env::var_os("HOME"), account_home.as_deref());
         Self {
             enabled,
             home: home.clone(),
+            account_home,
             path: std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
             lang: std::env::var("LANG").unwrap_or_else(|_| "C.UTF-8".into()),
             mesh_socket: None,
@@ -222,9 +228,10 @@ impl Sandbox {
     /// The [`Plan`] for one command in the project: the session's sandbox merged with the command's own mounts, plus
     /// the protected paths that exist (`protected::protected_mounts`).
     pub fn plan(&self, root: &Path, mounts: &CommandMounts) -> Plan {
+        let (home, other_home) = self.homes_for(root);
         Plan {
             root: root.to_path_buf(),
-            home: self.home.clone(),
+            other_home,
             network: mounts.network,
             path: self.path.clone(),
             lang: self.lang.clone(),
@@ -242,13 +249,42 @@ impl Sandbox {
             project_read_only: mounts.project_read_only,
             // In the home folder the project is read-only (bwrap.rs), so there's nothing to protect on top of it, and
             // nothing to walk the whole home for.
-            protected: if home_project(root, &self.home) { Vec::new() } else { protected::protected_mounts(root) },
+            protected: if home_project(root, &home) { Vec::new() } else { protected::protected_mounts(root) },
             mesh_socket: self.mesh_socket.clone(),
             binds: mounts.binds.clone(),
             hidden: self.hidden.clone(),
             config_dir: self.config_dir.clone(),
             scratch: self.scratch.clone(),
+            home,
         }
+    }
+
+    /// The plan's home and the other home it hides ([`Plan::other_home`]). The home is [`Sandbox::home`], unless the
+    /// project is the account's home or a parent of it ([`home_project`]): then the account's home is the one the
+    /// home-folder project's rules (read-only, private entries masked) apply to, and `HOME`'s folder is the other.
+    /// Never the reverse: the real home inside the project would otherwise be shown with nothing in it masked.
+    fn homes_for(&self, root: &Path) -> (PathBuf, Option<PathBuf>) {
+        match &self.account_home {
+            Some(account) if home_project(root, account) => (account.clone(), Some(self.home.clone())),
+            account => (self.home.clone(), account.clone()),
+        }
+    }
+}
+
+/// The current user's home folder from the password database (`getpwuid_r` for the real uid), independent of `HOME`:
+/// what the sandbox must hide whatever the environment says. None if there's no entry or it names no absolute folder.
+pub fn account_home() -> Option<PathBuf> {
+    let user = nix::unistd::User::from_uid(nix::unistd::getuid()).ok().flatten()?;
+    (user.dir.is_absolute() && user.dir != Path::new("/")).then_some(user.dir)
+}
+
+/// The home folder from `HOME`, if it names one: absolute and not `/`. Otherwise the account's ([`account_home`]),
+/// else `/` (which hides nothing: [`hidden_in_sandbox`]). An unset or empty `HOME` must neither make `/` the home to
+/// hide nor leave the real one shown.
+fn home_from(value: Option<OsString>, account: Option<&Path>) -> PathBuf {
+    match value.map(PathBuf::from) {
+        Some(home) if home.is_absolute() && home != Path::new("/") => home,
+        _ => account.map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("/")),
     }
 }
 
@@ -264,6 +300,38 @@ mod hidden_tests {
         assert_eq!(config_dir(Some("cfg".into()), cwd, home), Path::new("/work/cfg"));
         assert_eq!(config_dir(Some("/srv/cfg".into()), cwd, home), Path::new("/srv/cfg"));
         assert_eq!(config_dir(None, cwd, home), Path::new("/home/me/.marv"));
+    }
+
+    /// `HOME` is used when it names a folder; unset, empty, relative or `/`, the account's home stands in.
+    #[test]
+    fn the_home_falls_back_to_the_accounts() {
+        let account = Some(Path::new("/home/me"));
+        assert_eq!(home_from(Some("/srv/other".into()), account), Path::new("/srv/other"));
+        for unusable in [None, Some(""), Some("/"), Some("relative")] {
+            assert_eq!(home_from(unusable.map(Into::into), account), Path::new("/home/me"), "{unusable:?}");
+        }
+        assert_eq!(home_from(None, None), Path::new("/"));
+    }
+
+    /// The account's home is the plan's home where the project is in it (or is it), else `HOME`'s; the other is hidden.
+    #[test]
+    fn the_account_home_is_the_plans_home_when_it_holds_the_project() {
+        let base = std::fs::canonicalize(std::env::temp_dir()).unwrap().join(format!("marv-homes-{}", std::process::id()));
+        let (account, other) = (base.join("account"), base.join("other"));
+        std::fs::create_dir_all(account.join("proj")).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let sandbox = Sandbox { home: other.clone(), account_home: Some(account.clone()), ..Sandbox::from_env(true) };
+        let mounts = CommandMounts::default();
+        let elsewhere = sandbox.plan(&base, &mounts);
+        assert_eq!((elsewhere.home, elsewhere.other_home), (account.clone(), Some(other.clone())), "a parent of both");
+        let plan = sandbox.plan(&account, &mounts);
+        assert_eq!((plan.home, plan.other_home), (account.clone(), Some(other.clone())));
+        let plan = sandbox.plan(&other, &mounts);
+        assert_eq!((plan.home, plan.other_home), (other.clone(), Some(account.clone())));
+        // In a subfolder of the account's home the project is mounted over it, so `HOME`'s stays the plan's home.
+        let plan = sandbox.plan(&account.join("proj"), &mounts);
+        assert_eq!((plan.home, plan.other_home), (other, Some(account)));
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
