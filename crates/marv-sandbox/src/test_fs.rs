@@ -1,5 +1,6 @@
 //! A fake file system for the sandbox's unit tests (bwrap's arguments, the plan's policy and, later, the Seatbelt
-//! profile): `exists` by predicate, `kind` by table, `realpath` by table (identity otherwise), folder listings.
+//! profile): `exists` by predicate, `kind` by table, `realpath` by table (followed through chains, identity otherwise),
+//! folder listings.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -85,6 +86,14 @@ impl FsProbe for Fake {
         if self.dangling && self.kinds.get(&*p) == Some(&FileKind::Symlink) {
             return Err(io::Error::from(io::ErrorKind::NotFound));
         }
-        Ok(PathBuf::from(self.links.get(&*p).cloned().unwrap_or_else(|| p.into_owned())))
+        // A link to a link is followed to its end (a chain), as `realpath` does; a loop leads nowhere.
+        let mut at = p.into_owned();
+        for _ in 0..40 {
+            match self.links.get(&at) {
+                Some(next) if *next != at => at = next.clone(),
+                _ => return Ok(PathBuf::from(at)),
+            }
+        }
+        Err(io::Error::other("too many levels of symbolic links"))
     }
 }
