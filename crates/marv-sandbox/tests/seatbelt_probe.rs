@@ -1154,7 +1154,10 @@ fn each_link_rule_refuses_on_its_own() {
     };
     let home_read = line_of("(deny file-read* (subpath (param \"HOME\")))");
     let shared_read = line_of("(deny file-read* (subpath \"/private/tmp\"))");
-    let broad_link = line_of("(deny file-link (subpath (param \"HOME\")) (subpath \"/private/tmp\")");
+    // The account's real home (OTHER_HOME) sits between the home and /private/tmp here: this test's home is a
+    // temporary folder, not the one the password database names.
+    let broad_link = line_of("(deny file-link (subpath (param \"HOME\")) ");
+    assert!(broad_link.contains(" (subpath \"/private/tmp\")"), "{broad_link}");
     let names_link = line_of("(deny file-link (require-all");
     let protected_links: Vec<String> = text
         .lines()
