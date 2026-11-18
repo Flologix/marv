@@ -79,9 +79,9 @@ fn is_socket_root(dir: &Path) -> bool {
 ///   ([`Plan::toolchains`]), where the home's agent sockets and secrets are;
 /// - inside or around Marv's runtime or config folders.
 ///
-/// So NixOS's `/run/current-system/sw/bin` (into `/nix/store`) and `/run/wrappers/bin` still show; fnm's
-/// `/run/user/<uid>/fnm_multishells/…` leads into `~/.local/share/fnm`, which isn't a toolchain folder, and no longer
-/// does (it showed that part of the hidden home through `/run`).
+/// So NixOS's `/run/current-system/sw/bin` (into `/nix/store`) and `/run/wrappers/bin` still show, and so does fnm's
+/// `/run/user/<uid>/fnm_multishells/…`: it leads into `~/.local/share/fnm`, a toolchain folder (it shows only because
+/// that folder is one, not because it's under `/run`).
 ///
 /// The DNS config is shown only when it's a file under `/run` outside Marv's folders.
 fn run_shown(opts: &SandboxOptions, fs: &dyn FsProbe) -> Vec<(PathBuf, PathBuf)> {
