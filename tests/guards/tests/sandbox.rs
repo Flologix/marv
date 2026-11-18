@@ -72,6 +72,77 @@ fn system_is_read_only_and_run_is_empty_but_for_the_mesh_plug() {
     assert!(ran.output.contains("the plug"), "{}", ran.output);
 }
 
+/// **A PATH folder under `/run` is shown by where it really leads, never by its name.** bwrap follows a symlinked
+/// source, so a PATH folder like `/run/user/<uid>/x` that leads to `/run/user/<uid>` passed the name test and showed
+/// the user's whole socket folder (D-Bus, the agents) in the empty `/run`. Here the user's runtime folder holds a
+/// link to itself and a link to an ordinary tools folder, both on PATH: only the tools folder shows, bound by its real
+/// path at the link's.
+///
+/// Proven: bound each kept PATH folder by its own path without resolving it in `run_shown` (the old name-only test)
+/// → this test failed (the planted file read through the link, and the mount list check failed).
+#[test]
+fn a_symlinked_path_folder_under_run_shows_only_what_it_leads_to() {
+    let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .filter(|d| d.starts_with("/run/user/") && std::fs::metadata(d).is_ok_and(|m| m.is_dir()))
+        .and_then(|d| std::fs::canonicalize(d).ok())
+    else {
+        eprintln!("skipped: no user runtime folder under /run/user");
+        return;
+    };
+    struct Cleanup(Vec<std::path::PathBuf>);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for p in &self.0 {
+                let _ = std::fs::remove_file(p).or_else(|_| std::fs::remove_dir_all(p));
+            }
+        }
+    }
+    let id = std::process::id();
+    let (planted, tools) = (runtime.join(format!("marv-guards-planted-{id}")), runtime.join(format!("marv-guards-tools-{id}")));
+    let (to_sockets, to_tools) = (runtime.join(format!("marv-guards-link-{id}")), runtime.join(format!("marv-guards-bin-{id}")));
+    let _cleanup = Cleanup(vec![to_sockets.clone(), to_tools.clone(), planted.clone(), tools.clone()]);
+    std::fs::write(&planted, "HOST RUNTIME FILE").unwrap();
+    std::fs::create_dir_all(tools.join("bin")).unwrap();
+    std::fs::write(tools.join("bin/marv-guard-tool"), "a tool").unwrap();
+    std::os::unix::fs::symlink(&runtime, &to_sockets).unwrap();
+    std::os::unix::fs::symlink(tools.join("bin"), &to_tools).unwrap();
+
+    let (project, home) = (TempDir::new("run-link"), TempDir::outside_tmp("run-link-home"));
+    let path = format!("{}:{}:/usr/bin:/bin", to_sockets.display(), to_tools.display());
+    let sandbox = Sandbox { path, ..sandbox_with_home(home.path()) };
+    // The mount list, deterministically: the socket folder is never a source, the tools folder by its real path.
+    let plan = sandbox.plan(project.path(), &CommandMounts::default());
+    let args: Vec<String> = marv_sandbox::sandbox_args(&plan, &marv_sandbox::RealFs)
+        .unwrap()
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let binds: Vec<(&str, &str)> =
+        args.windows(3).filter(|w| w[0] == "--ro-bind" || w[0] == "--bind").map(|w| (w[1].as_str(), w[2].as_str())).collect();
+    let (runtime_text, link_text) = (runtime.to_string_lossy(), to_sockets.to_string_lossy());
+    assert!(binds.iter().all(|(src, dest)| *src != runtime_text && *src != link_text && *dest != link_text), "{args:?}");
+    let tools_bin = tools.join("bin");
+    assert!(binds.contains(&(&*tools_bin.to_string_lossy(), &*to_tools.to_string_lossy())), "{args:?}");
+
+    require_bwrap!();
+    let ran = run_sandboxed(
+        &sandbox,
+        project.path(),
+        &CommandMounts::default(),
+        &format!(
+            "cat {}/marv-guards-planted-{id} 2>/dev/null; cat {}/marv-guard-tool; echo; ls -A {} 2>/dev/null | wc -l",
+            to_sockets.display(),
+            to_tools.display(),
+            to_sockets.display()
+        ),
+        &[],
+    );
+    assert!(!ran.output.contains("HOST RUNTIME FILE"), "the user's runtime folder shows: {}", ran.output);
+    assert!(ran.output.contains("a tool"), "the ordinary folder should show: {}", ran.output);
+    assert_eq!(ran.output.lines().last(), Some("0"), "{}", ran.output);
+}
+
 /// **A plugged command is told where its plug is (#163).** `MARV_MESH_SOCKET` names the plug where the sandbox shows
 /// it (bubblewrap: `/run/marv/mesh.sock`; Seatbelt can't mount, so a client can't assume that path), and only when the
 /// command is plugged. It's the guest path, never the host socket in Marv's runtime folder.
@@ -242,6 +313,63 @@ fn the_home_is_a_stand_in_with_masked_credentials() {
     for secret in ["PRIVATE KEY", "sk-or-secret", "cargo-secret", "cargo-writable"] {
         assert!(!ran.output.contains(secret), "{secret}: {}", ran.output);
     }
+}
+
+/// **The real home is hidden whatever `HOME` says.** The stand-in hid only the folder `HOME` named, so a Marv started
+/// with `HOME` pointing elsewhere (or unset) left the user's real home readable to every sandboxed command. The home
+/// from the password database (`marv_sandbox::account_home`) is hidden as well (`Plan::other_home`), its toolchains
+/// shown again; and where the project is that home, it is the plan's home, so the home-folder rules apply to it.
+/// Here `HOME` is a fake home (`sandbox_with_home`), as in every guard, and a file is planted in the real one.
+///
+/// Proven: removed the `--tmpfs` over `Plan::other_home_hidden` in `sandbox_args` → this test failed (the planted
+/// file printed, and the mount list check failed).
+#[test]
+fn the_accounts_home_is_hidden_when_home_names_another_folder() {
+    let Some(account) = marv_sandbox::account_home().and_then(|h| std::fs::canonicalize(h).ok()) else {
+        eprintln!("skipped: no home folder in the password database for this user");
+        return;
+    };
+    let (project, home) = (TempDir::new("acct-proj"), TempDir::outside_tmp("acct-home"));
+    let sandbox = sandbox_with_home(home.path());
+    // The plan and its mounts, deterministically: the real home is the other home, and bwrap hides it.
+    let plan = sandbox.plan(project.path(), &CommandMounts::default());
+    assert_eq!(plan.home, home.path());
+    let args: Vec<String> = marv_sandbox::sandbox_args(&plan, &marv_sandbox::RealFs)
+        .unwrap()
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    assert!(args.windows(2).any(|w| w[0] == "--tmpfs" && w[1] == *account.to_string_lossy()), "{args:?}");
+    // A project that is the real home: it's the plan's home (read-only, its private entries masked), never shown as an
+    // ordinary writable project because `HOME` names another folder.
+    let at_home = sandbox.plan(&account, &CommandMounts::default());
+    assert_eq!(at_home.home, account);
+    assert!(at_home.project_read_only(&marv_sandbox::RealFs));
+
+    require_bwrap!();
+    struct Planted(std::path::PathBuf);
+    impl Drop for Planted {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let planted = Planted(account.join(format!("marv-guards-account-{}", std::process::id())));
+    std::fs::create_dir_all(&planted.0).unwrap();
+    std::fs::write(planted.0.join("secret.txt"), "REAL HOME SECRET").unwrap();
+    let ran = run_sandboxed(
+        &sandbox,
+        project.path(),
+        &CommandMounts::default(),
+        &format!(
+            "cat {}/secret.txt 2>/dev/null; ls {} 2>/dev/null | grep -c marv-guards-account; echo done",
+            planted.0.display(),
+            account.display()
+        ),
+        &[],
+    );
+    assert!(ran.output.contains("done"), "{}", ran.output);
+    assert!(!ran.output.contains("REAL HOME SECRET"), "the real home is readable: {}", ran.output);
+    assert!(ran.output.lines().any(|l| l == "0"), "the real home is listed: {}", ran.output);
 }
 
 // ---- the home folder as the project: read-only, its private parts hidden --------------------------------------

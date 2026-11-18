@@ -137,11 +137,13 @@ pub fn runtime_var(dir: &Path) -> (&'static str, PathBuf) {
     }
 }
 
-/// A sandbox whose home is `home` (a fake one), with the host's PATH.
+/// A sandbox whose home is `home` (a fake one), with the host's PATH. The account's real home (password database) is
+/// hidden too, as `Sandbox::from_env` hides it when `HOME` names another folder.
 pub fn sandbox_with_home(home: &Path) -> Sandbox {
     Sandbox {
         enabled: true,
         home: home.to_path_buf(),
+        account_home: marv_sandbox::account_home(),
         path: std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
         lang: "C.UTF-8".into(),
         mesh_socket: None,

@@ -33,7 +33,14 @@ pub const MESH_SOCKET_ENV: &str = "MARV_MESH_SOCKET";
 #[derive(Debug, Clone, Default)]
 pub struct Plan {
     pub root: PathBuf,
+    /// The home folder the command gets (`HOME` inside), shown as a stand-in (or read-only, in a home-folder project).
     pub home: PathBuf,
+    /// A second home folder, hidden whole like the stand-in hides [`Plan::home`], its toolchains shown again and its
+    /// credential files masked ([`Plan::other_home_hidden`]): the user's home from the password database when `HOME`
+    /// names another folder, or `HOME` when the project is in the database's home (`crate::Sandbox::plan` picks).
+    /// Hiding only the folder `HOME` names left the real home readable to every sandboxed command whenever Marv ran
+    /// with `HOME` changed or unset (marv-rs).
+    pub other_home: Option<PathBuf>,
     pub network: bool,
     /// PATH inside the sandbox.
     pub path: String,
@@ -133,6 +140,22 @@ impl Plan {
         fs.realpath(&self.home).unwrap_or_else(|_| self.home.clone())
     }
 
+    /// [`Plan::other_home`] by its real path, when it's a folder to hide: it exists, it isn't `/` or [`Plan::home`],
+    /// and the project, mounted after it, doesn't sit inside it at or below its top (then hiding it would hide part of
+    /// the project). A project of `/` mounts nothing after it, so there it is hidden too.
+    pub fn other_home_hidden(&self, fs: &dyn FsProbe) -> Option<PathBuf> {
+        let real = fs.realpath(self.other_home.as_ref()?).ok()?;
+        let real_root = self.real_root(fs);
+        let inside_project = real_root != Path::new("/") && contains(&real_root, &real);
+        (real.is_absolute() && real != Path::new("/") && real != self.real_home(fs) && !inside_project).then_some(real)
+    }
+
+    /// Both home folders' paths as given: [`Plan::home`], and [`Plan::other_home`] when it's hidden.
+    fn homes(&self, fs: &dyn FsProbe) -> Vec<PathBuf> {
+        let other = self.other_home_hidden(fs).and(self.other_home.clone());
+        std::iter::once(self.home.clone()).chain(other).collect()
+    }
+
     /// Whether the project is the home folder or a parent of it, on real paths (`crate::home_project`). Then nothing
     /// of the project is writable: showing it writable would show the whole real home.
     pub fn home_project(&self, fs: &dyn FsProbe) -> bool {
@@ -155,9 +178,14 @@ impl Plan {
         HOME_MASKS.iter().map(|name| home.join(name)).collect()
     }
 
-    /// The [`TOOLCHAINS`] that exist under the home, as paths under the home (not resolved): shown again, read-only.
+    /// The [`TOOLCHAINS`] that exist under the home (and the hidden [`Plan::other_home`]), as paths under it (not
+    /// resolved): shown again, read-only.
     pub fn toolchains(&self, fs: &dyn FsProbe) -> Vec<PathBuf> {
-        TOOLCHAINS.iter().map(|dir| self.home.join(dir)).filter(|full| fs.exists(full)).collect()
+        self.homes(fs)
+            .iter()
+            .flat_map(|home| TOOLCHAINS.iter().map(move |dir| home.join(dir)))
+            .filter(|full| fs.exists(full))
+            .collect()
     }
 
     /// [`Plan::read_only`], each checked by [`resolve_extra`] (the first refusal stops the command).
@@ -201,10 +229,12 @@ impl Plan {
     /// (`home::credential_masks`).
     pub fn credentials(&self, shown: &[PathBuf], fs: &dyn FsProbe) -> Vec<PathBuf> {
         let mut masks: Vec<PathBuf> = Vec::new();
-        for file in CREDENTIALS {
-            for mask in credential_masks(&self.home.join(file), shown, fs) {
-                if !masks.contains(&mask) {
-                    masks.push(mask);
+        for home in self.homes(fs) {
+            for file in CREDENTIALS {
+                for mask in credential_masks(&home.join(file), shown, fs) {
+                    if !masks.contains(&mask) {
+                        masks.push(mask);
+                    }
                 }
             }
         }

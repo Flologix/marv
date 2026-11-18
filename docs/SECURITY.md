@@ -17,8 +17,8 @@ These rules are requirements for the Rust build from day one. They come from a s
 
 ## Sandbox (`marv-sandbox`)
 - **bubblewrap**, with:
-  - read-only system directories and an empty `/run` (except the mesh plug, `/run/marv/mesh.sock`, and the process door's relay: Marv's binary at `/run/marv-bin` and socket folders under `/run/marv`);
-  - a stand-in home, with toolchains re-mounted read-only and credential files masked;
+  - read-only system directories and an empty `/run` (except the mesh plug, `/run/marv/mesh.sock`, and the process door's relay: Marv's binary at `/run/marv-bin` and socket folders under `/run/marv`). `PATH` folders under `/run` (NixOS) and, with network, the DNS config are shown again read-only, each judged and bound by where it really leads (never `/run`, `/run/user`, a user's whole folder or a folder holding one, never a home, `/tmp` or Marv's folders; a home's part only inside a toolchain folder). Guard: `tests/guards/tests/sandbox.rs::a_symlinked_path_folder_under_run_shows_only_what_it_leads_to`;
+  - a stand-in home, with toolchains re-mounted read-only and credential files masked; both the folder `HOME` names and the user's home from the password database are hidden, whatever `HOME` says (changed, unset or `/`). Where the project is the database's home, that is the home the home-folder rules below apply to. Guard: `tests/guards/tests/sandbox.rs::the_accounts_home_is_hidden_when_home_names_another_folder`;
   - the project writable, with `.git` and **protected paths** read-only;
   - Marv's config folder (`~/.marv`, or `MARV_CONFIG_DIR` wherever it is) hidden;
   - no network unless approved (`--unshare-net`), a cleared environment, and its own PID namespace.

@@ -25,6 +25,7 @@ pub const TOOLCHAINS: &[&str] = &[
     ".local/bin",
     ".local/share/pnpm",
     ".local/share/mise",
+    ".local/share/fnm",
     ".asdf",
     ".nvm",
     ".volta",

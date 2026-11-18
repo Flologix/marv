@@ -9,8 +9,11 @@
 //! - the whole system is visible but read-only; `/run` is an empty folder (it holds the host's sockets: the user's
 //!   D-Bus let `systemd-run --user` start programs outside the sandbox, plus the GPG/SSH agents, keyring, display and
 //!   docker; a read-only mount doesn't stop a `connect()`). Only `PATH` folders under `/run` (NixOS, fnm) and, with
-//!   network, the DNS config `/etc/resolv.conf` leads to are shown again, read-only;
-//! - the home folder is a stand-in (see [`crate::home`]);
+//!   network, the DNS config `/etc/resolv.conf` leads to are shown again, read-only, each judged and bound by where it
+//!   really leads, never by its name (`run_shown`, marv-rs);
+//! - the home folder is a stand-in (see [`crate::home`]). So is the user's home from the password database when `HOME`
+//!   names another folder or none (`Plan::other_home`, marv-rs): hiding only what `HOME` named left the real home
+//!   readable whenever Marv was started with `HOME` changed or unset;
 //! - the project is the only writable place (plus a private, RAM-backed `/tmp`), with protected paths read-only;
 //! - when the project is the home folder or a parent of it (Marv started in `~`), the stand-in can't hide the home
 //!   without hiding the project, so the project is shown **read-only** instead, and on top of it every hidden
@@ -57,32 +60,76 @@ pub const MESH_SOCKET: &str = "/run/marv/mesh.sock";
 pub const SOCKET_SCAN_DEPTH: usize = 6;
 pub const SOCKET_SCAN_LIMIT: usize = 20_000;
 
-/// What the sandbox keeps of `/run`: an empty tmpfs, then PATH folders under it (never `/run`, `/run/user` or a
-/// user's whole folder, even if PATH names one: that's the sockets again) and, with network, the DNS config.
-fn run_mounts(path: &str, network: bool, fs: &dyn FsProbe) -> Vec<OsString> {
-    let is_socket_root = |dir: &str| {
-        let parts: Vec<&str> = dir.trim_end_matches('/').split('/').collect();
-        // ["", "run"], ["", "run", "user"], ["", "run", "user", "<uid>"]
-        parts.len() == 2 || (parts.get(2) == Some(&"user") && parts.len() <= 4)
+/// `/run`, `/run/user` or a user's whole folder (`/run/user/<uid>`): where the host's sockets are.
+fn is_socket_root(dir: &Path) -> bool {
+    let parts: Vec<&std::ffi::OsStr> = dir.components().map(|c| c.as_os_str()).collect();
+    // ["/", "run"], ["/", "run", "user"], ["/", "run", "user", "<uid>"]
+    parts.get(1).is_some_and(|p| *p == "run")
+        && (parts.len() == 2 || (parts.get(2).is_some_and(|p| *p == "user") && parts.len() <= 4))
+}
+
+/// What the sandbox shows again in its empty `/run`, as (what is bound, where): PATH folders under it (NixOS, fnm)
+/// and, with network, the DNS config `/etc/resolv.conf` leads to. Each is judged by where it really leads, and that
+/// real path is what's bound (at the PATH folder's own path, where the command looks for it), never the symlink:
+/// bwrap follows a symlinked source, so a PATH folder `/run/x` leading to `/run/user/<uid>` once passed a test on its
+/// name alone and bound the user's sockets (marv-rs). A PATH folder is refused when it isn't a folder, or leads to:
+/// - a socket root ([`is_socket_root`]) or anything holding one (`/`);
+/// - outside `/run`, anything the sandbox doesn't already show as it is: `/tmp`, `/dev`, `/proc`, a home folder (the
+///   plan's or the other one) or a folder holding one, or a folder in a home that isn't inside a toolchain shown again
+///   ([`Plan::toolchains`]), where the home's agent sockets and secrets are;
+/// - inside or around Marv's runtime or config folders.
+///
+/// So NixOS's `/run/current-system/sw/bin` (into `/nix/store`) and `/run/wrappers/bin` still show, and so does fnm's
+/// `/run/user/<uid>/fnm_multishells/…`: it leads into `~/.local/share/fnm`, a toolchain folder (it shows only because
+/// that folder is one, not because it's under `/run`).
+///
+/// The DNS config is shown only when it's a file under `/run` outside Marv's folders.
+fn run_shown(opts: &SandboxOptions, fs: &dyn FsProbe) -> Vec<(PathBuf, PathBuf)> {
+    let real = |p: &Path| fs.realpath(p).unwrap_or_else(|_| p.to_path_buf());
+    let homes: Vec<PathBuf> = std::iter::once(opts.real_home(fs)).chain(opts.other_home_hidden(fs)).collect();
+    let toolchains: Vec<PathBuf> = opts.toolchains(fs).iter().map(|t| real(t)).collect();
+    let marvs: Vec<PathBuf> = opts.hidden_dirs(fs).into_iter().chain(opts.config_dir_hidden(fs)).collect();
+    let near_marvs = |target: &Path| marvs.iter().any(|m| target.starts_with(m) || m.starts_with(target));
+    let shown_target = |target: &Path| {
+        if !target.is_absolute() || near_marvs(target) {
+            return false;
+        }
+        if target.starts_with("/run") {
+            return !is_socket_root(target);
+        }
+        let hidden = ["/tmp", "/dev", "/proc"].iter().any(|d| target.starts_with(d))
+            || homes.iter().any(|h| contains(target, h))
+            || target == Path::new("/");
+        let in_home = homes.iter().any(|h| target.starts_with(h));
+        !hidden && (!in_home || toolchains.iter().any(|t| target.starts_with(t)))
     };
-    let mut keep: Vec<PathBuf> = path
-        .split(':')
-        .filter(|dir| dir.starts_with("/run/") && !is_socket_root(dir) && fs.exists(Path::new(dir)))
-        .map(PathBuf::from)
-        .collect();
-    if network
+    let mut shown: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for dir in opts.path.split(':').map(Path::new) {
+        if !dir.starts_with("/run/") || is_socket_root(dir) || shown.iter().any(|(_, d)| d == dir) {
+            continue;
+        }
+        let Ok(target) = fs.realpath(dir) else { continue };
+        if fs.entry_kind(&target) == Some(EntryKind::Dir) && shown_target(&target) {
+            shown.push((target, dir.to_path_buf()));
+        }
+    }
+    if opts.network
         && let Ok(dns) = fs.realpath(Path::new("/etc/resolv.conf"))
         && dns.starts_with("/run/")
+        && fs.entry_kind(&dns) == Some(EntryKind::File)
+        && !near_marvs(&dns)
+        && !shown.iter().any(|(_, d)| *d == dns)
     {
-        keep.push(dns);
+        shown.push((dns.clone(), dns));
     }
-    let mut seen = Vec::new();
+    shown
+}
+
+/// What the sandbox keeps of `/run`: an empty tmpfs, then [`run_shown`] read-only on top.
+fn run_mounts(shown: &[(PathBuf, PathBuf)]) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec!["--tmpfs".into(), "/run".into()];
-    for p in keep {
-        if !seen.contains(&p) {
-            args.extend(["--ro-bind".into(), p.clone().into(), p.clone().into()]);
-            seen.push(p);
-        }
+    for (source, dest) in shown {
+        args.extend(["--ro-bind".into(), source.clone().into_os_string(), dest.clone().into_os_string()]);
     }
     args
 }
@@ -125,8 +172,15 @@ pub fn sandbox_args(opts: &SandboxOptions, fs: &dyn FsProbe) -> Result<Vec<OsStr
         ]),
         None => push(&["--tmpfs".as_ref(), "/tmp".as_ref()]),
     }
+    // The other home (`Plan::other_home`: the account's when `HOME` names another folder) first, so a home inside
+    // it still gets its stand-in; its toolchains are shown again with the home's below.
+    if let Some(other) = opts.other_home_hidden(fs) {
+        args.extend(["--tmpfs".into(), other.into_os_string()]);
+    }
+    let mut push = |items: &[&std::ffi::OsStr]| args.extend(items.iter().map(|s| s.to_os_string()));
     push(&["--tmpfs".as_ref(), home]);
-    args.extend(run_mounts(&opts.path, opts.network, fs));
+    let run_shown = run_shown(opts, fs);
+    args.extend(run_mounts(&run_shown));
     // The mesh plug (marv-rs): after the empty /run, which would hide it otherwise. A read-only bind wouldn't stop
     // connect() anyway, and the plug only speaks the switchboard's protocol (docs/MESH.md).
     if let Some(plug) = opts.mesh_bind() {
@@ -178,7 +232,7 @@ pub fn sandbox_args(opts: &SandboxOptions, fs: &dyn FsProbe) -> Result<Vec<OsStr
     let shown_again = |real: &Path| {
         real.starts_with(&opts.root)
             || opts.read_only.iter().chain(&opts.writable).any(|d| real.starts_with(d))
-            || opts.path.split(':').any(|d| d.starts_with("/run/") && real.starts_with(d))
+            || run_shown.iter().any(|(_, dest)| real.starts_with(dest))
     };
     for real in opts.hidden_dirs(fs) {
         if !real.starts_with("/run") || shown_again(&real) {
@@ -711,6 +765,7 @@ mod tests {
     fn run_is_empty_with_path_folders_and_dns_shown_again() {
         let mut fs = Fake::new(|p| p.starts_with("/run/") || p.ends_with(".bun"));
         fs.links.insert("/etc/resolv.conf".into(), "/run/systemd/resolve/stub-resolv.conf".into());
+        fs.kinds.insert("/run/systemd/resolve/stub-resolv.conf".into(), FileKind::File);
         let path = "/run/current-system/sw/bin:/usr/bin:/run/user/1000/fnm_multishells/42/bin:/run/user/1000";
         let offline = joined(&SandboxOptions { path: path.into(), ..base() }, &fs);
         assert!(offline.contains("--tmpfs /run"));
@@ -722,6 +777,59 @@ mod tests {
         assert!(online.contains("--ro-bind /run/systemd/resolve/stub-resolv.conf /run/systemd/resolve/stub-resolv.conf"));
         // The empty /run comes first: mounted after them, it would hide what it's meant to let through.
         assert!(online.find("--tmpfs /run").unwrap() < online.find("--ro-bind /run/systemd").unwrap());
+    }
+
+    /// A PATH folder (or the DNS config) is judged by where it really leads, and that is what's bound: a link to a
+    /// user's socket folder, through a chain or not, or into the hidden home, shows nothing; a link to an ordinary
+    /// folder under `/run` or to the Nix store is bound by its real path at the PATH folder's own path.
+    #[test]
+    fn run_folders_are_judged_and_bound_by_where_they_lead() {
+        let mut fs =
+            Fake::new(|p| p.starts_with("/run/") || p.starts_with("/nix/") || p.starts_with("/home/me") || p == "/tmp/x");
+        for (link, target) in [
+            ("/run/x", "/run/user/1000"),
+            ("/run/chain", "/run/hop"),
+            ("/run/hop", "/run/user"),
+            ("/run/up", "/"),
+            ("/run/home", "/home/me/.gnupg"),
+            ("/run/whole-home", "/home"),
+            ("/run/tmp", "/tmp/x"),
+            ("/run/marv-link", "/run/user/1000/marv/p"),
+            ("/run/sock", "/run/docker.sock"),
+            ("/run/bin", "/run/tools/bin"),
+            ("/run/current-system/sw/bin", "/nix/store/abc-system-path/bin"),
+            ("/run/mise", "/home/me/.local/share/mise/installs/node/bin"),
+        ] {
+            fs.links.insert(link.into(), target.into());
+        }
+        fs.kinds.insert("/run/docker.sock".into(), FileKind::File);
+        let refused =
+            ["/run/x", "/run/chain", "/run/up", "/run/home", "/run/whole-home", "/run/tmp", "/run/marv-link", "/run/sock"];
+        let shown = ["/run/bin", "/run/current-system/sw/bin", "/run/mise"];
+        let path = refused.iter().chain(&shown).copied().collect::<Vec<_>>().join(":");
+        let opts = SandboxOptions { path, hidden: vec!["/run/user/1000/marv".into()], ..base() };
+        let args = joined(&opts, &fs);
+        for dir in refused {
+            assert!(!args.contains(&format!(" {dir} ")), "{dir}: {args}");
+        }
+        for target in ["/run/user", "/home/me/.gnupg", "/tmp/x", "/run/docker.sock"] {
+            assert!(!args.contains(&format!("--ro-bind {target} ")), "{target}: {args}");
+        }
+        assert!(args.contains("--ro-bind /run/tools/bin /run/bin"), "{args}");
+        assert!(args.contains("--ro-bind /nix/store/abc-system-path/bin /run/current-system/sw/bin"), "{args}");
+        assert!(args.contains("--ro-bind /home/me/.local/share/mise/installs/node/bin /run/mise"), "a toolchain: {args}");
+        // The DNS config: by where it leads, and only a file under /run.
+        for (target, file, ok) in
+            [("/run/user/1000", false, false), ("/run/resolv/x.conf", true, true), ("/home/me/r.conf", true, false)]
+        {
+            let mut fs = Fake::new(|p| p.starts_with("/run/") || p.starts_with("/home/me"));
+            fs.links.insert("/etc/resolv.conf".into(), target.into());
+            if file {
+                fs.kinds.insert(target.into(), FileKind::File);
+            }
+            let args = joined(&SandboxOptions { network: true, ..base() }, &fs);
+            assert_eq!(args.contains(&format!("--ro-bind {target} {target}")), ok, "{target}: {args}");
+        }
     }
 
     #[test]
@@ -1020,6 +1128,43 @@ mod tests {
         // The stand-in hides the config folder already (a tmpfs on it would hide ~/.marv/skills).
         assert!(!args.contains("--tmpfs /home/me/.marv") && !args.contains("--tmpfs /home/me/.ssh"), "{args}");
         assert!(!args.contains("/dev/null /home/me/Projects/run.sock"), "{args}");
+    }
+
+    /// `HOME` names another folder: the account's home is hidden too, before the stand-in and the project, with its
+    /// toolchains shown again and its credential files masked. Never `/`, the home itself, or a folder in the project.
+    #[test]
+    fn the_accounts_home_is_hidden_when_home_names_another_folder() {
+        let mut fs = Fake::new(|p| p.ends_with(".bun") || p.ends_with(".cargo") || p.starts_with("/home/me"));
+        fs.kinds.insert("/home/me/.cargo/credentials.toml".into(), FileKind::File);
+        let opts = SandboxOptions {
+            root: "/home/me/proj".into(),
+            home: "/srv/fake".into(),
+            other_home: Some("/home/me".into()),
+            ..base()
+        };
+        let args = joined(&opts, &fs);
+        let hidden = last(&args, "--tmpfs /home/me ");
+        assert!(hidden < last(&args, "--tmpfs /srv/fake"), "before the stand-in: {args}");
+        assert!(hidden < last(&args, "--bind /home/me/proj /home/me/proj"), "the project is mounted over it: {args}");
+        assert!(last(&args, "--ro-bind /home/me/.cargo /home/me/.cargo") > hidden, "{args}");
+        assert!(last(&args, "--ro-bind /dev/null /home/me/.cargo/credentials.toml") > hidden, "{args}");
+        assert!(args.contains("--setenv HOME /srv/fake"), "{args}");
+        // The same folder by another path, `/`, or a folder inside the project: nothing more.
+        fs.links.insert("/srv/fake".into(), "/home/me".into());
+        let same = joined(&SandboxOptions { home: "/srv/fake".into(), ..opts.clone() }, &fs);
+        assert!(!same.contains("--tmpfs /home/me "), "{same}");
+        fs.links.clear();
+        for other in ["/", "/home/me/proj", "/home/me/proj/sub"] {
+            let args = joined(&SandboxOptions { other_home: Some(other.into()), ..opts.clone() }, &fs);
+            assert_eq!(
+                args.matches("--tmpfs ").count(),
+                joined(&SandboxOptions { other_home: None, ..opts.clone() }, &fs).matches("--tmpfs ").count(),
+                "{other}: {args}"
+            );
+        }
+        // A project of `/` mounts nothing after it, so the other home is hidden there too.
+        let at_root = joined(&SandboxOptions { root: "/".into(), ..opts }, &fs);
+        assert!(at_root.contains("--tmpfs /home/me "), "{at_root}");
     }
 
     #[test]

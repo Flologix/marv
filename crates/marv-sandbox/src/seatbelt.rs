@@ -18,8 +18,9 @@
 //!    separate rules), the harmless devices. No `pseudo-tty` (G22);
 //! 2. **reads, broad**: `file-read*` and `file-map-executable` everywhere (G1);
 //! 3. **closed**: the home (only its own entry's metadata stays readable, so `cd ~` works), or in a home-folder
-//!    project every hidden top-level entry of it by one regex, and `~/Library` (G6, G16); `/private/tmp` and the user's
-//!    `/private/var/folders/<xx>/<id>` (G2);
+//!    project every hidden top-level entry of it by one regex, and `~/Library` (G6, G16); the other home whole
+//!    (`Plan::other_home`: the account's home when `HOME` names another folder, marv-rs); `/private/tmp` and the
+//!    user's `/private/var/folders/<xx>/<id>` (G2);
 //! 4. **shown again**: the project, the toolchains (G7), the read-only and writable extras (G8, G10), the private
 //!    `TMPDIR`, Marv's binary;
 //! 5. **closed again**: `HOME_MASKS` (home project), Marv's config folder (G15, its `skills/` shown again after it),
@@ -358,6 +359,9 @@ fn build_profile(plan: &Plan, run: &Invocation, fs: &dyn FsProbe, allow_links: b
     let root = canon(&plan.root);
     let home = canon(&plan.home);
     let home_project = contains(&root, &home);
+    // The other home (`Plan::other_home`: the account's when `HOME` names another folder) is closed whole, like the
+    // home outside a home-folder project (marv-rs).
+    let other_home = plan.other_home_hidden(fs).map(|o| canon(&o));
     let read_only = plan.project_read_only || home_project;
     let toolchains: Vec<PathBuf> = plan.toolchains(fs);
     let ro_extras = plan.read_only_extras(fs)?;
@@ -372,6 +376,7 @@ fn build_profile(plan: &Plan, run: &Invocation, fs: &dyn FsProbe, allow_links: b
     // neither inside nor around anything the profile hides or limits.
     let others: Vec<PathBuf> = [home.clone(), root.clone(), PathBuf::from(SHARED_TMP)]
         .into_iter()
+        .chain(other_home.clone())
         .chain(runtime.iter().cloned())
         .chain(config.clone())
         .chain(ro_extras.iter().chain(&rw_extras).map(|e| canon(&e.real)))
@@ -408,6 +413,10 @@ fn build_profile(plan: &Plan, run: &Invocation, fs: &dyn FsProbe, allow_links: b
         let p = b.param("HOME".into(), &home);
         b.line(&format!("(deny file-read* (subpath {p}))"));
         b.line(&format!("(allow file-read-metadata (literal {p}))"));
+    }
+    if let Some(other) = &other_home {
+        let p = b.param("OTHER_HOME".into(), other);
+        b.line(&format!("(deny file-read* (subpath {p}))"));
     }
     b.line(&format!("(deny file-read* (subpath {}))", quoted(SHARED_TMP)));
     let p = b.param("USER_TEMP".into(), &user_temp);
@@ -447,7 +456,12 @@ fn build_profile(plan: &Plan, run: &Invocation, fs: &dyn FsProbe, allow_links: b
     let mut parents: Vec<PathBuf> = Vec::new();
     for path in &shown {
         // Only where section 3 closed them: elsewhere reads are open already.
-        let closed = |d: &Path| d.starts_with(&home) || d.starts_with(&user_temp) || d.starts_with(SHARED_TMP);
+        let closed = |d: &Path| {
+            d.starts_with(&home)
+                || other_home.as_ref().is_some_and(|o| d.starts_with(o))
+                || d.starts_with(&user_temp)
+                || d.starts_with(SHARED_TMP)
+        };
         for dir in path.ancestors().skip(1).filter(|d| closed(d)) {
             if !parents.iter().any(|p| p == dir) {
                 parents.push(dir.to_path_buf());
@@ -507,8 +521,10 @@ fn build_profile(plan: &Plan, run: &Invocation, fs: &dyn FsProbe, allow_links: b
     // ALLOW_LINKS_IN_PROJECT, allowed in the project and the private TMPDIR, which may sit inside those; what in them
     // may not be linked is denied again in section 7.
     let home_key = if home_project { None } else { Some("(param \"HOME\")".to_string()) };
+    let other_key = other_home.as_ref().map(|_| "(param \"OTHER_HOME\")".to_string());
     let broad: Vec<String> = home_key
         .into_iter()
+        .chain(other_key)
         .chain([quoted(SHARED_TMP), "(param \"USER_TEMP\")".to_string()])
         .map(|p| format!("(subpath {p})"))
         .collect();
@@ -698,11 +714,13 @@ fn written_and_real(path: &Path, fs: &dyn FsProbe) -> (PathBuf, Option<PathBuf>)
     (written, real)
 }
 
-/// The [`CREDENTIALS`] files under the home that exist (a file, or a symlink: denied by name and where it leads).
+/// The [`CREDENTIALS`] files under the home (and the hidden other home) that exist (a file, or a symlink: denied by
+/// name and where it leads).
 fn credentials(plan: &Plan, fs: &dyn FsProbe) -> Vec<(PathBuf, Option<PathBuf>)> {
-    CREDENTIALS
-        .iter()
-        .map(|file| plan.home.join(file))
+    let other = plan.other_home_hidden(fs).and(plan.other_home.clone());
+    std::iter::once(plan.home.clone())
+        .chain(other)
+        .flat_map(|home| CREDENTIALS.iter().map(move |file| home.join(file)))
         .filter(|file| matches!(fs.kind(file), Some(FileKind::File | FileKind::Symlink)))
         .map(|file| written_and_real(&file, fs))
         .collect()
@@ -852,6 +870,28 @@ mod tests {
         assert!(at(t, "(deny file-read* (literal (param \"CREDENTIAL_0\")))") > last_at(t, &format!("(param \"{toolchain}\")")));
         assert!(at(t, "(deny file-write* (literal (param \"CREDENTIAL_0\")))") > at(t, "; 6."));
         assert!(p.param("CREDENTIAL_0_REAL").is_none());
+    }
+
+    /// `HOME` names another folder: the account's home is closed whole too, its toolchains shown again after it, its
+    /// credential files denied, and nothing hard-linked out of it.
+    #[test]
+    fn the_accounts_home_is_closed_when_home_names_another_folder() {
+        let mut fs = mac_fs(|p| p.starts_with("/Users/me"));
+        fs.kinds.insert("/Users/me/.cargo/credentials.toml".into(), FileKind::File);
+        let plan = Plan { home: "/Users/fake".into(), other_home: Some("/Users/me".into()), ..base() };
+        let p = build(&plan, &fs);
+        let t = &p.text;
+        assert_eq!(p.param("OTHER_HOME"), Some(Path::new("/Users/me")));
+        let closed = at(t, "(deny file-read* (subpath (param \"OTHER_HOME\")))");
+        assert!(closed < at(t, "; 4."), "{t}");
+        let cargo = (0..4).find(|i| p.param(&format!("TOOLCHAIN_{i}")) == Some(Path::new("/Users/me/.cargo"))).unwrap();
+        assert!(at(t, &format!("(param \"TOOLCHAIN_{cargo}\")")) > closed, "{t}");
+        assert!((0..4).any(|i| p.param(&format!("CREDENTIAL_{i}")) == Some(Path::new("/Users/me/.cargo/credentials.toml"))));
+        assert!(t.contains(&format!("(deny {HARD_LINK_OP} (subpath (param \"HOME\")) (subpath (param \"OTHER_HOME\"))")), "{t}");
+        // The project inside it is shown again by section 4 as usual.
+        assert!(at(t, "(allow file-read* file-map-executable (subpath (param \"PROJECT\")))") > closed, "{t}");
+        // The same folder as the home: nothing more.
+        assert!(build(&Plan { other_home: Some("/Users/me".into()), ..base() }, &fs).param("OTHER_HOME").is_none());
     }
 
     #[test]
@@ -1563,6 +1603,7 @@ mod tests {
         let plan = Plan {
             root: "/Users/me/proj".into(),
             home: "/Users/me".into(),
+            other_home: Some("/srv/account".into()),
             network: false,
             path: "/usr/bin".into(),
             lang: "en_US.UTF-8".into(),
@@ -1581,6 +1622,7 @@ mod tests {
         let Plan {
             root,
             home,
+            other_home,
             network,
             path: _, // the environment, set on the spawn (#166), not in a profile
             lang: _, // the same
@@ -1608,6 +1650,7 @@ mod tests {
         for (key, value) in [
             ("PROJECT", root),
             ("HOME", home),
+            ("OTHER_HOME", other_home.as_ref().unwrap()),
             ("READ_ONLY_0", &read_only[0]),
             ("WRITABLE_0", &writable[0]),
             ("READ_ONLY_ON_TOP_0", &read_only_on_top[0]),
